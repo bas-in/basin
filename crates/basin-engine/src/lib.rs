@@ -105,6 +105,12 @@ pub(crate) struct EngineInner {
     /// pg_plan path (ADR 0014 Phase 1+). Tests assert this advances when
     /// they expect the new routing to engage.
     pub(crate) pg_plan_routing_count: AtomicU64,
+    /// Cumulative number of data files skipped by the bloom-filter probe in
+    /// `fast_select`. Incremented once per file where the bloom proves the
+    /// Eq-predicate value is definitely absent. Used by integration tests to
+    /// measure the empirical false-positive rate without a separate counter
+    /// store.
+    pub(crate) blooms_skipped: AtomicU64,
     /// Per-project noisy-project detector. Reads its bit when a session is
     /// opened (to choose `target_partitions`) and bumps it after every
     /// successful `ProjectSession::execute`. See `noisy_detector` module
@@ -138,6 +144,11 @@ pub(crate) struct EngineInner {
     /// `Arc` into its `CacheManagerConfig` so the cache outlives any single
     /// session. Capacity: 50 MiB (covers ~hundreds of Vortex/Parquet files).
     pub(crate) file_metadata_cache: Arc<dyn FileMetadataCache>,
+    /// Per-`(project, table)` query pattern history for adaptive sort
+    /// (Phase 5.14.D2).  Records ORDER BY / GROUP BY column tuples observed
+    /// at query time so the compactor (Phase 5.14.D1) can detect common
+    /// access patterns and pre-sort files accordingly.
+    pub(crate) query_history: Arc<crate::query_history::QueryHistory>,
 }
 
 impl Engine {
@@ -187,6 +198,7 @@ impl Engine {
             cfg,
             vector_routing_count: AtomicU64::new(0),
             pg_plan_routing_count: AtomicU64::new(0),
+            blooms_skipped: AtomicU64::new(0),
             noisy_detector: crate::noisy_detector::NoisyDetector::new(),
             project_counters,
             event_sinks: RwLock::new(registry),
@@ -194,6 +206,7 @@ impl Engine {
             webhook_registry: crate::webhook_registry::WebhookRegistry::new(),
             udf_cache,
             file_metadata_cache,
+            query_history: Arc::new(crate::query_history::QueryHistory::new()),
         });
         attach_reactor_sink(&inner, catalog);
         Self { inner }
@@ -315,6 +328,12 @@ impl Engine {
         &self.inner.webhook_registry
     }
 
+    /// Crate-private access to the process-wide query pattern history
+    /// (Phase 5.14.D2).  Returned `Arc` is cheap to clone.
+    pub(crate) fn query_history(&self) -> &Arc<crate::query_history::QueryHistory> {
+        &self.inner.query_history
+    }
+
     /// Crate-private hook bumped by `executor::execute` when a vector
     /// `ORDER BY <-> LIMIT k` query is dispatched to the HNSW fast path.
     pub(crate) fn note_vector_routed(&self) {
@@ -327,6 +346,20 @@ impl Engine {
     /// fast path since this `Engine` was built. Test-only.
     pub fn vector_routing_count(&self) -> u64 {
         self.inner.vector_routing_count.load(Ordering::Relaxed)
+    }
+
+    /// Crate-private hook bumped by `fast_select` each time a data file
+    /// is skipped because the per-file bloom filter proved the query
+    /// predicate value is definitively absent. One call per pruned file.
+    pub(crate) fn note_bloom_skipped(&self) {
+        self.inner.blooms_skipped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Cumulative count of data files that have been skipped by the
+    /// bloom-filter probe since this `Engine` was created. Exposed for
+    /// integration tests that verify the false-positive rate.
+    pub fn blooms_skipped_count(&self) -> u64 {
+        self.inner.blooms_skipped.load(Ordering::Relaxed)
     }
 
     /// Crate-private hook bumped when a statement is dispatched via the
@@ -574,6 +607,7 @@ mod advisory_lock;
 mod alter;
 mod any_all_rewrite;
 mod approx_count_distinct;
+mod approx_percentile;
 mod catalog_window_exec;
 mod constraints;
 mod convert;
@@ -618,6 +652,7 @@ mod pg_operators;
 pub mod pg_plan;
 mod pg_scalar_aliases;
 mod prepared;
+mod query_history;
 mod procedure_ddl;
 mod range_udf;
 pub mod reactor_ddl;
@@ -2724,5 +2759,48 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    // ── Phase 5.14.D2 integration test ──────────────────────────────────────
+
+    /// After 100 ORDER BY (b, id) queries the engine's query history returns
+    /// the dominant column tuple; a sub-threshold pattern returns None.
+    #[tokio::test]
+    async fn query_history_order_by_accumulates() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let project = ProjectId::new();
+        let sess = eng.open_session(project).await.unwrap();
+
+        // Seed a table so the SELECT does not fail.
+        sess.execute("CREATE TABLE hist_test (id BIGINT, b BIGINT)")
+            .await
+            .unwrap();
+        sess.execute("INSERT INTO hist_test VALUES (1, 10), (2, 20)")
+            .await
+            .unwrap();
+
+        // Issue 100 ORDER BY (b, id) queries.
+        for _ in 0..100 {
+            sess.execute("SELECT id FROM hist_test ORDER BY b, id")
+                .await
+                .unwrap();
+        }
+
+        let table = basin_common::TableName::new("hist_test").unwrap();
+        let pattern = eng
+            .query_history()
+            .top_pattern(&project, &table)
+            .expect("should have a dominant pattern after 100 queries");
+        // Columns stored in sorted order: ["b", "id"].
+        assert_eq!(pattern, vec!["b".to_string(), "id".to_string()]);
+
+        // A table that received only 10 queries returns None (below 100 floor).
+        let other = basin_common::TableName::new("hist_test").unwrap();
+        let small_proj = ProjectId::new();
+        assert!(
+            eng.query_history().top_pattern(&small_proj, &other).is_none(),
+            "unseen project must return None"
+        );
     }
 }
