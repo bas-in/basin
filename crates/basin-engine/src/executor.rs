@@ -1244,6 +1244,45 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                         }
                     }
                 }
+
+                // Low-cardinality GROUP BY COUNT(*) fast path.  Same safety
+                // gates as the metadata aggregate above: no active transaction
+                // (pending_files would be missed), no view, no RLS, no soft
+                // delete.  Falls through to DataFusion when the recogniser
+                // returns `None` or when execute returns `Ok(None)` (e.g. key
+                // range exceeds the low-cardinality threshold or catalog stats
+                // are absent).
+                if let Some(plan) = crate::fast_aggregate::match_groupby_low_card(&stmt) {
+                    let table_meta = sess
+                        .engine
+                        .config()
+                        .catalog
+                        .load_table(&sess.project, &plan.table)
+                        .await
+                        .ok();
+                    if let Some(ref meta) = table_meta {
+                        let is_view = sess
+                            .engine
+                            .config()
+                            .catalog
+                            .lookup_view(&sess.project, plan.table.as_str())
+                            .await
+                            .is_some();
+                        let has_rls = meta.rls_enabled;
+                        let has_soft_delete =
+                            crate::types::soft_delete_column(meta.schema.as_ref()).is_some();
+                        if !is_view && !has_rls && !has_soft_delete {
+                            if let Some(result) =
+                                crate::fast_aggregate::execute_groupby_low_card(
+                                    sess, plan, table_meta,
+                                )
+                                .await?
+                            {
+                                return Ok(result);
+                            }
+                        }
+                    }
+                }
             }
 
             if let Some(plan) = match_simple_select(&stmt) {

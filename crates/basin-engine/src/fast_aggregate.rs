@@ -25,13 +25,29 @@
 //! `None`, and we bail the WHOLE query to DataFusion (full scan, correct).
 //! Once population lands, the same query flips to the metadata path with
 //! no further code change here.
+//!
+//! ## Low-cardinality GROUP BY fast path
+//!
+//! `match_groupby_low_card` / `execute_groupby_low_card` handle:
+//!
+//!   `SELECT key, COUNT(*) FROM t GROUP BY key`
+//!
+//! for a single Int64 grouping column whose per-file catalog stats give a
+//! key-range ≤ `LOW_CARD_THRESHOLD` (32 by default).  The execution reads
+//! only the key column from each data file, accumulates per-key counts in a
+//! small HashMap, and returns a multi-row `RecordBatch` whose schema is
+//! byte-identical to DataFusion's output.  Bails to DataFusion for compound
+//! GROUP BY, HAVING, WHERE, CTE, transactions, views, RLS, or when the
+//! cardinality gate cannot be determined from catalog stats.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::TableMetadata;
 use basin_common::{BasinError, Result, TableName};
+use futures::StreamExt;
 use sqlparser::ast::{
     Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, ObjectName, Query,
     SelectItem, SetExpr, Statement, TableFactor,
@@ -39,6 +55,10 @@ use sqlparser::ast::{
 
 use crate::pg_ast::{ObjectNamePartExt, QueryClauseExt};
 use crate::{ExecResult, ProjectSession};
+
+/// Maximum distinct-value count for the low-cardinality GROUP BY fast path.
+/// Queries whose key range exceeds this threshold fall through to DataFusion.
+const LOW_CARD_THRESHOLD: i64 = 32;
 
 /// One recognised aggregate output column. `out_name` is the exact column
 /// name DataFusion 53 would have produced for this aggregate over this
@@ -634,6 +654,338 @@ fn fold_sum(
     }
 }
 
+// ─── Low-cardinality GROUP BY fast path ──────────────────────────────────────
+
+/// A recognised `SELECT key, COUNT(*) FROM t GROUP BY key` plan.
+///
+/// Only a single Int64 grouping column is supported; compound GROUP BY or
+/// non-Int64 keys fall back to DataFusion.  Output column names mirror what
+/// DataFusion 53 would emit for the same query:
+///   * `key_col` — same name as the grouping column
+///   * `"count(*)"` — the COUNT(*) aggregate
+#[derive(Debug)]
+pub(crate) struct GroupByCountStarPlan {
+    pub table: TableName,
+    /// Name of the single grouping column.
+    pub key_col: String,
+}
+
+/// Recognise `SELECT key, COUNT(*) FROM t GROUP BY key`.
+///
+/// Conservative recogniser: returns `None` (fall through to DataFusion) for
+/// any shape outside the strict pattern:
+/// * Exactly one Int64-compatible key column followed by `COUNT(*)`
+/// * Single bare (un-aliased) grouping expression equal to `key`
+/// * No WHERE / HAVING / ORDER BY / LIMIT / CTE / DISTINCT / joins
+/// * Single bare (un-aliased) table reference
+pub(crate) fn match_groupby_low_card(stmt: &Statement) -> Option<GroupByCountStarPlan> {
+    let query = match stmt {
+        Statement::Query(q) => q,
+        _ => return None,
+    };
+    // No CTE, ORDER BY, LIMIT, or other query-level clauses.
+    if query.with.is_some()
+        || query.order_by.is_some()
+        || !query.ext_limit_by().is_empty()
+        || query.ext_offset().is_some()
+        || query.ext_limit().is_some()
+        || query.fetch.is_some()
+        || !query.locks.is_empty()
+        || query.for_clause.is_some()
+        || query.settings.is_some()
+        || query.format_clause.is_some()
+    {
+        return None;
+    }
+
+    let select = match query.body.as_ref() {
+        SetExpr::Select(s) => s,
+        _ => return None,
+    };
+
+    // Reject every clause that changes aggregate semantics.
+    if select.distinct.is_some()
+        || select.top.is_some()
+        || select.into.is_some()
+        || !select.lateral_views.is_empty()
+        || select.prewhere.is_some()
+        || !select.cluster_by.is_empty()
+        || !select.distribute_by.is_empty()
+        || !select.sort_by.is_empty()
+        || select.having.is_some()
+        || !select.named_window.is_empty()
+        || select.qualify.is_some()
+        || select.value_table_mode.is_some()
+        || !select.connect_by.is_empty()
+    {
+        return None;
+    }
+
+    // No WHERE — filtered GROUP BY would need per-row predicate evaluation.
+    if select.selection.is_some() {
+        return None;
+    }
+
+    // FROM: exactly one bare table, no joins.
+    if select.from.len() != 1 {
+        return None;
+    }
+    let from = &select.from[0];
+    if !from.joins.is_empty() {
+        return None;
+    }
+    let table = match &from.relation {
+        TableFactor::Table {
+            name,
+            alias,
+            args,
+            with_hints,
+            version,
+            with_ordinality,
+            partitions,
+            ..
+        } => {
+            if alias.is_some()
+                || args.is_some()
+                || !with_hints.is_empty()
+                || version.is_some()
+                || *with_ordinality
+                || !partitions.is_empty()
+            {
+                return None;
+            }
+            gb_single_part_table(name)?
+        }
+        _ => return None,
+    };
+
+    // GROUP BY: exactly one bare identifier, no modifiers.
+    let key_col = match &select.group_by {
+        GroupByExpr::Expressions(exprs, mods) if exprs.len() == 1 && mods.is_empty() => {
+            match &exprs[0] {
+                Expr::Identifier(id) => id.value.clone(),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+
+    // Projection: exactly `key_col, COUNT(*)` — both un-aliased.
+    if select.projection.len() != 2 {
+        return None;
+    }
+    // First item: bare identifier matching the GROUP BY key.
+    match &select.projection[0] {
+        SelectItem::UnnamedExpr(Expr::Identifier(id)) if id.value == key_col => {}
+        _ => return None,
+    }
+    // Second item: un-aliased COUNT(*).
+    match &select.projection[1] {
+        SelectItem::UnnamedExpr(Expr::Function(f)) => {
+            if f.over.is_some()
+                || f.filter.is_some()
+                || !f.within_group.is_empty()
+                || f.null_treatment.is_some()
+                || !matches!(f.parameters, FunctionArguments::None)
+            {
+                return None;
+            }
+            if f.name.0.len() != 1 {
+                return None;
+            }
+            if f.name.0[0].id_val().to_ascii_lowercase() != "count" {
+                return None;
+            }
+            let list = match &f.args {
+                FunctionArguments::List(l) => l,
+                _ => return None,
+            };
+            if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+                return None;
+            }
+            if list.args.len() != 1 {
+                return None;
+            }
+            match &list.args[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {}
+                _ => return None,
+            }
+        }
+        _ => return None,
+    }
+
+    Some(GroupByCountStarPlan { table, key_col })
+}
+
+fn gb_single_part_table(name: &ObjectName) -> Option<TableName> {
+    if name.0.len() != 1 {
+        return None;
+    }
+    TableName::new(name.0[0].id_val().clone()).ok()
+}
+
+/// Execute a recognised low-cardinality GROUP BY COUNT(*) plan.
+///
+/// Returns:
+/// * `Ok(Some(result))` — a multi-row `RecordBatch` with schema `(key, count(*))`.
+/// * `Ok(None)` — cardinality gate failed or catalog stats insufficient; caller
+///   falls through to DataFusion for a correct full scan.
+///
+/// The output column names match DataFusion 53 exactly:
+/// * column 0: `key_col` (same name as the grouping column, same type)
+/// * column 1: `"count(*)"` (Int64, non-nullable)
+pub(crate) async fn execute_groupby_low_card(
+    sess: &ProjectSession,
+    plan: GroupByCountStarPlan,
+    prefetched_meta: Option<TableMetadata>,
+) -> Result<Option<ExecResult>> {
+    // Flush any in-RAM tail so the catalog snapshot is current.
+    if let Some(shard) = sess.engine.config().shard.as_ref() {
+        shard.flush_to_parquet().await?;
+    }
+
+    let meta = match prefetched_meta {
+        Some(m) => m,
+        None => {
+            sess.engine
+                .config()
+                .catalog
+                .load_table(&sess.project, &plan.table)
+                .await?
+        }
+    };
+
+    // Verify the key column exists and is Int64 (the only type we handle).
+    let key_field = match meta.schema.fields().iter().find(|f| f.name() == &plan.key_col) {
+        Some(f) => f.clone(),
+        None => return Ok(None),
+    };
+    if key_field.data_type() != &DataType::Int64 {
+        return Ok(None);
+    }
+
+    let files = meta.live_data_files();
+
+    // Cardinality gate: derive the global key range from per-file catalog stats.
+    // For each file, require both min_bytes and max_bytes for the key column.
+    // Global distinct count upper bound = max_global - min_global + 1.
+    let mut global_min: Option<i64> = None;
+    let mut global_max: Option<i64> = None;
+    for f in &files {
+        let cs = match f.column_stats.get(&plan.key_col) {
+            Some(c) => c,
+            None => return Ok(None), // stats absent — cannot gate
+        };
+        let file_min = match cs.min_bytes.as_deref().and_then(decode_i64) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        let file_max = match cs.max_bytes.as_deref().and_then(decode_i64) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        global_min = Some(global_min.map_or(file_min, |m| m.min(file_min)));
+        global_max = Some(global_max.map_or(file_max, |m| m.max(file_max)));
+    }
+
+    // Empty table — return empty result (DataFusion would return zero rows).
+    if files.is_empty() {
+        let key_schema = Arc::new(Schema::new(vec![
+            key_field.as_ref().clone(),
+            Field::new("count(*)", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::new_empty(key_schema.clone());
+        return Ok(Some(ExecResult::Rows {
+            schema: key_schema,
+            batches: vec![batch],
+        }));
+    }
+
+    let (gmin, gmax) = match (global_min, global_max) {
+        (Some(lo), Some(hi)) => (lo, hi),
+        _ => return Ok(None),
+    };
+
+    // Key range exceeds threshold — fall through to DataFusion.
+    let range = gmax.saturating_sub(gmin).saturating_add(1);
+    if range > LOW_CARD_THRESHOLD {
+        return Ok(None);
+    }
+
+    // Build live file paths.
+    let live_paths: Vec<object_store::path::Path> = files
+        .iter()
+        .map(|f| object_store::path::Path::from(f.path.as_str()))
+        .collect();
+
+    // Read ONLY the key column from all files.
+    let opts = basin_storage::ReadOptions {
+        projection: Some(vec![plan.key_col.clone()]),
+        filters: vec![],
+        partition: None,
+    };
+    let schema_ref = Some(meta.schema.clone());
+
+    let stream = sess
+        .engine
+        .config()
+        .storage
+        .read_paths_with_schema(&sess.project, live_paths, opts, schema_ref)
+        .await?;
+
+    // Accumulate per-key row counts across all batches.
+    let mut counts: HashMap<i64, i64> = HashMap::new();
+    let mut batches_stream = stream;
+    while let Some(batch_result) = batches_stream.next().await {
+        let batch = batch_result?;
+        let col = batch.column(0);
+        let arr = match col.as_any().downcast_ref::<Int64Array>() {
+            Some(a) => a,
+            None => return Ok(None), // unexpected type — bail
+        };
+        for i in 0..arr.len() {
+            if arr.is_null(i) {
+                // NULL keys: DataFusion includes NULL as its own group.
+                // To stay correct we would need a separate NULL counter.
+                // For now, bail to DataFusion when any NULL key is present.
+                return Ok(None);
+            }
+            *counts.entry(arr.value(i)).or_insert(0) += 1;
+        }
+    }
+
+    // Safety: actual distinct count after reading must not exceed threshold
+    // (the range-based gate is an upper bound, not exact).
+    if counts.len() as i64 > LOW_CARD_THRESHOLD {
+        return Ok(None);
+    }
+
+    // Sort by key ascending — DataFusion's hash-aggregate output order is
+    // non-deterministic, but the differential test normalises rows.  Sorting
+    // here matches the most common expectation and makes the result stable.
+    let mut sorted_pairs: Vec<(i64, i64)> = counts.into_iter().collect();
+    sorted_pairs.sort_unstable_by_key(|(k, _)| *k);
+
+    let key_vals: Vec<i64> = sorted_pairs.iter().map(|(k, _)| *k).collect();
+    let cnt_vals: Vec<i64> = sorted_pairs.iter().map(|(_, c)| *c).collect();
+
+    let out_schema = Arc::new(Schema::new(vec![
+        key_field.as_ref().clone(),
+        Field::new("count(*)", DataType::Int64, false),
+    ]));
+
+    let key_array: ArrayRef = Arc::new(Int64Array::from(key_vals));
+    let cnt_array: ArrayRef = Arc::new(Int64Array::from(cnt_vals));
+
+    let batch = RecordBatch::try_new(out_schema.clone(), vec![key_array, cnt_array])
+        .map_err(|e| BasinError::internal(format!("groupby_low_card result batch: {e}")))?;
+
+    Ok(Some(ExecResult::Rows {
+        schema: out_schema,
+        batches: vec![batch],
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -743,5 +1095,75 @@ mod tests {
     fn rejects_order_by_limit() {
         let stmt = parse_one("SELECT COUNT(*) FROM t ORDER BY 1 LIMIT 1");
         assert!(match_metadata_aggregate(&stmt).is_none());
+    }
+
+    // ── match_groupby_low_card unit tests ─────────────────────────────────
+
+    #[test]
+    fn groupby_matches_basic() {
+        let stmt = parse_one("SELECT k, COUNT(*) FROM t GROUP BY k");
+        let plan = match_groupby_low_card(&stmt).expect("should match");
+        assert_eq!(plan.table.as_str(), "t");
+        assert_eq!(plan.key_col, "k");
+    }
+
+    #[test]
+    fn groupby_rejects_compound_group_by() {
+        let stmt = parse_one("SELECT k, b, COUNT(*) FROM t GROUP BY k, b");
+        assert!(match_groupby_low_card(&stmt).is_none());
+    }
+
+    #[test]
+    fn groupby_rejects_having() {
+        let stmt =
+            parse_one("SELECT k, COUNT(*) FROM t GROUP BY k HAVING COUNT(*) > 10");
+        assert!(match_groupby_low_card(&stmt).is_none());
+    }
+
+    #[test]
+    fn groupby_rejects_order_by() {
+        let stmt = parse_one("SELECT k, COUNT(*) FROM t GROUP BY k ORDER BY k");
+        assert!(match_groupby_low_card(&stmt).is_none());
+    }
+
+    #[test]
+    fn groupby_rejects_where() {
+        let stmt = parse_one("SELECT k, COUNT(*) FROM t WHERE id > 0 GROUP BY k");
+        assert!(match_groupby_low_card(&stmt).is_none());
+    }
+
+    #[test]
+    fn groupby_rejects_aliased_count() {
+        let stmt = parse_one("SELECT k, COUNT(*) AS c FROM t GROUP BY k");
+        assert!(match_groupby_low_card(&stmt).is_none());
+    }
+
+    #[test]
+    fn groupby_rejects_cte() {
+        let stmt = parse_one(
+            "WITH cte AS (SELECT 1) SELECT k, COUNT(*) FROM t GROUP BY k",
+        );
+        assert!(match_groupby_low_card(&stmt).is_none());
+    }
+
+    #[test]
+    fn groupby_rejects_bare_aggregate_matches_metadata_not_groupby() {
+        // Plain COUNT(*) without GROUP BY → metadata aggregate path, not groupby path.
+        let stmt = parse_one("SELECT COUNT(*) FROM t");
+        assert!(match_groupby_low_card(&stmt).is_none());
+    }
+
+    #[test]
+    fn groupby_rejects_key_after_count() {
+        // Wrong projection order — COUNT(*) first.
+        let stmt = parse_one("SELECT COUNT(*), k FROM t GROUP BY k");
+        assert!(match_groupby_low_card(&stmt).is_none());
+    }
+
+    #[test]
+    fn groupby_rejects_join() {
+        let stmt =
+            parse_one("SELECT a.k, COUNT(*) FROM a JOIN b ON a.id = b.id GROUP BY a.k");
+        assert!(match_groupby_low_card(&stmt).is_none());
     }
 }
