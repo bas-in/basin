@@ -1,36 +1,36 @@
-//! LogicalPlan-level rewrite of `NULLIF(a, b)` to an equivalent `CASE` expression.
+//! LogicalPlan-level rewrite of `NULLIF(a, b) IS [NOT] NULL` to a plain
+//! conjunction of simple predicates that Vortex pushes down trivially.
 //!
-//! `NULLIF(a, b)` is semantically identical to
-//! `CASE WHEN a = b THEN NULL ELSE a END`, but DataFusion's Vortex
-//! integration does not push `NULLIF` calls down into the Vortex read path
-//! (the expression is opaque to the DefaultExpressionConvertor).  Rewriting
-//! to a `CASE` expression happens at the `LogicalPlan` layer, before
-//! physical planning, so the Vortex convertor sees the expanded form and can
-//! push the predicate down to the file-chunk level.
+//! The earlier generic NULLIF → CASE rewrite was correct but slower than
+//! leaving NULLIF alone: Vortex's `CaseWhen` evaluator decoded the column
+//! to evaluate the case, which cost more than DataFusion's residual filter
+//! over NULLIF.  The narrower rewrite below only fires for the specific
+//! null-test patterns the smoke benchmark cares about — `NULLIF(a, b) IS
+//! NOT NULL` and `NULLIF(a, b) IS NULL` — which decompose to two simple
+//! predicates each, all of which Vortex pushes natively.
 //!
-//! The rule is registered at position 0 in the optimizer pipeline so it runs
-//! before `SimplifyExpressions`, which would otherwise fold constant
-//! `NULLIF`s before we get a chance to see them in their original form.
+//! Semantics (PostgreSQL):
+//!   * `NULLIF(a, b)` returns NULL when `a = b`, else `a`.
+//!   * `NULLIF(a, b) IS NOT NULL` ≡ `a IS NOT NULL AND a != b`
+//!   * `NULLIF(a, b) IS NULL`     ≡ `a IS NULL OR a = b`
+//!
+//! Both equivalences preserve three-valued logic for NULL handling: when
+//! `a` is NULL, the LHS evaluates to UNKNOWN (NULL) and the RHS clauses
+//! produce the same UNKNOWN under SQL's standard 3VL truth tables.
+//!
+//! Bare NULLIF calls outside an `IS [NOT] NULL` wrapper are left
+//! untouched and handled by DataFusion as a residual filter.
 
-use datafusion::optimizer::{OptimizerConfig, OptimizerRule, optimizer::ApplyOrder};
 use datafusion::common::{Result, tree_node::{Transformed, TreeNode}};
-use datafusion::logical_expr::expr::Case;
 use datafusion::logical_expr::{Expr, LogicalPlan};
+use datafusion::optimizer::{OptimizerConfig, OptimizerRule, optimizer::ApplyOrder};
 
-/// Rewrites every `NULLIF(arg0, arg1)` in a `LogicalPlan` to
-/// `CASE WHEN arg0 <> arg1 THEN arg0 END` (no ELSE, so unmatched rows are NULL).
+/// Rewrites `NULLIF(a, b) IS NOT NULL` to `a IS NOT NULL AND a != b`,
+/// and `NULLIF(a, b) IS NULL` to `a IS NULL OR a = b`.
 ///
-/// This is a semantics-preserving identity: SQL defines `NULLIF(V, X)` as
-/// returning NULL when `V = X` and returning `V` otherwise — exactly what the
-/// no-ELSE CASE form delivers.  The rewrite makes the expression visible to
-/// DataFusion's Vortex expression convertor so it can be pushed down through
-/// the Vortex file-read path.
-///
-/// The no-ELSE form is used (rather than `CASE WHEN arg0 = arg1 THEN NULL ELSE
-/// arg0 END`) because Vortex's CaseWhen evaluator requires every THEN/ELSE
-/// branch to share the same base dtype.  An untyped-null THEN literal
-/// (`DataType::Null`) would not match the arg0 dtype (e.g. `Int64`), causing a
-/// runtime panic in Vortex's dtype-compatibility check.
+/// Registered at optimizer position 0 so it sees the original NULLIF
+/// before `SimplifyExpressions` folds anything.  Bare NULLIF calls
+/// (no `IS NULL`/`IS NOT NULL` wrapper) are left untouched.
 #[derive(Debug, Default)]
 pub(crate) struct NullifRewrite;
 
@@ -40,8 +40,6 @@ impl OptimizerRule for NullifRewrite {
     }
 
     fn apply_order(&self) -> Option<ApplyOrder> {
-        // Walk bottom-up: rewrite inner NULLIFs before outer ones so nested
-        // calls (unusual but legal) are handled correctly in a single pass.
         Some(ApplyOrder::BottomUp)
     }
 
@@ -50,47 +48,45 @@ impl OptimizerRule for NullifRewrite {
         plan: LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
-        plan.map_expressions(|expr: Expr| expr.transform_up(rewrite_nullif_expr))
+        plan.map_expressions(|expr: Expr| expr.transform_up(rewrite_nullif_is_null_expr))
     }
 }
 
-/// Rewrite a single `NULLIF(arg0, arg1)` call to an equivalent `CASE` expr.
-///
-/// Any expression that is not a two-argument `nullif` scalar function is
-/// returned unchanged (`Transformed::no`).
-fn rewrite_nullif_expr(expr: Expr) -> Result<Transformed<Expr>> {
+/// Pull the (a, b) args out of an expression iff it's a `NULLIF(a, b)`
+/// scalar function call.  Returns `None` otherwise.
+fn match_nullif(expr: &Expr) -> Option<(Expr, Expr)> {
+    let sf = match expr {
+        Expr::ScalarFunction(sf) => sf,
+        _ => return None,
+    };
+    if !sf.name().eq_ignore_ascii_case("nullif") {
+        return None;
+    }
+    if sf.args.len() != 2 {
+        return None;
+    }
+    Some((sf.args[0].clone(), sf.args[1].clone()))
+}
+
+fn rewrite_nullif_is_null_expr(expr: Expr) -> Result<Transformed<Expr>> {
     match &expr {
-        Expr::ScalarFunction(sf) if sf.name().eq_ignore_ascii_case("nullif") => {
-            // nullif is always called with exactly 2 arguments; guard anyway.
-            if sf.args.len() != 2 {
-                return Ok(Transformed::no(expr));
+        // NULLIF(a, b) IS NOT NULL  ≡  a IS NOT NULL AND a != b
+        Expr::IsNotNull(inner) => {
+            if let Some((a, b)) = match_nullif(inner) {
+                let lhs = a.clone().is_not_null();
+                let rhs = a.not_eq(b);
+                return Ok(Transformed::yes(lhs.and(rhs)));
             }
-            // Clone the args out of the borrowed expr before moving.
-            let arg0 = sf.args[0].clone();
-            let arg1 = sf.args[1].clone();
-
-            // CASE WHEN arg0 <> arg1 THEN arg0 END
-            //
-            // The no-ELSE form (implicit NULL for non-matching rows) is
-            // semantically identical to `NULLIF(arg0, arg1)` and avoids
-            // placing an untyped `NULL` literal in a THEN branch.  Vortex's
-            // CaseWhen evaluator requires every THEN/ELSE branch to share the
-            // same base dtype; an untyped-null THEN literal (DataType::Null)
-            // doesn't match the arg0 dtype (e.g. Int64) and causes a runtime
-            // panic inside Vortex's dtype-compatibility check.  Using the
-            // inverted condition with no ELSE sidesteps the issue entirely
-            // because the only typed branch is `arg0`, whose dtype Vortex can
-            // infer at expression-build time.
-            let when_expr = Box::new(arg0.clone().not_eq(arg1));
-            let then_expr = Box::new(arg0);
-
-            let case_expr = Expr::Case(Case {
-                expr: None,
-                when_then_expr: vec![(when_expr, then_expr)],
-                else_expr: None,
-            });
-
-            Ok(Transformed::yes(case_expr))
+            Ok(Transformed::no(expr))
+        }
+        // NULLIF(a, b) IS NULL  ≡  a IS NULL OR a = b
+        Expr::IsNull(inner) => {
+            if let Some((a, b)) = match_nullif(inner) {
+                let lhs = a.clone().is_null();
+                let rhs = a.eq(b);
+                return Ok(Transformed::yes(lhs.or(rhs)));
+            }
+            Ok(Transformed::no(expr))
         }
         _ => Ok(Transformed::no(expr)),
     }
@@ -106,57 +102,97 @@ mod tests {
 
     use std::sync::Arc;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::functions::core::nullif as make_nullif_udf;
-    use datafusion::optimizer::{OptimizerConfig, OptimizerContext};
     use datafusion::common::Result;
+    use datafusion::functions::core::nullif as make_nullif_udf;
     use datafusion::logical_expr::expr::ScalarFunction;
     use datafusion::logical_expr::logical_plan::builder::LogicalTableSource;
-    use datafusion::logical_expr::{col, lit, Filter, LogicalPlan, LogicalPlanBuilder};
+    use datafusion::logical_expr::{col, lit, Expr, Filter, LogicalPlan, LogicalPlanBuilder};
+    use datafusion::optimizer::OptimizerContext;
 
-    /// Build a simple `Filter(NULLIF(col_k, lit(0)) IS NOT NULL, Scan t)` plan,
-    /// apply the rule directly, and assert the NULLIF was expanded to CASE.
-    #[test]
-    fn nullif_in_filter_becomes_case() -> Result<()> {
+    fn schema_k() -> Arc<LogicalTableSource> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("k", DataType::Int64, true),
         ]));
-        let source = Arc::new(LogicalTableSource::new(Arc::clone(&schema)));
+        Arc::new(LogicalTableSource::new(schema))
+    }
 
-        // NULLIF(k, 0) IS NOT NULL — make_nullif_udf() returns Arc<ScalarUDF>
-        let nullif_udf = make_nullif_udf();
-        let nullif_sf = ScalarFunction {
-            func: nullif_udf,
+    fn nullif_k_0() -> Expr {
+        Expr::ScalarFunction(ScalarFunction {
+            func: make_nullif_udf(),
             args: vec![col("k"), lit(0_i64)],
-        };
-        let predicate = Expr::IsNotNull(Box::new(Expr::ScalarFunction(nullif_sf)));
+        })
+    }
 
-        let plan = LogicalPlanBuilder::scan("t", source, None)?
+    /// `NULLIF(k, 0) IS NOT NULL` must rewrite to `k IS NOT NULL AND k != 0`.
+    #[test]
+    fn is_not_null_rewrites_to_conjunction() -> Result<()> {
+        let predicate = Expr::IsNotNull(Box::new(nullif_k_0()));
+        let plan = LogicalPlanBuilder::scan("t", schema_k(), None)?
             .filter(predicate)?
             .build()?;
 
-        // Apply the rule directly without going through the full optimizer,
-        // to avoid check_invariants on a non-real table source.
-        let config = OptimizerContext::new();
-        let rule = NullifRewrite;
-        let result = rule.rewrite(plan, &config)?.data;
-
-        // The rewritten Filter's predicate must contain a Case, not a NULLIF call.
-        let filter_predicate = match &result {
-            LogicalPlan::Filter(Filter { predicate, .. }) => predicate.clone(),
+        let result = NullifRewrite.rewrite(plan, &OptimizerContext::new())?.data;
+        let pred = match &result {
+            LogicalPlan::Filter(Filter { predicate, .. }) => format!("{predicate:?}"),
             other => panic!("Expected Filter, got: {other:?}"),
         };
 
-        let pred_str = format!("{filter_predicate:?}");
         assert!(
-            !pred_str.to_lowercase().contains("nullif("),
-            "NULLIF should have been rewritten; predicate:\n{pred_str}"
+            !pred.to_lowercase().contains("nullif("),
+            "NULLIF should be gone; predicate:\n{pred}"
         );
         assert!(
-            pred_str.contains("CASE") || pred_str.contains("Case"),
-            "Expected CASE expression after rewrite; predicate:\n{pred_str}"
+            pred.contains("IsNotNull") && pred.contains("NotEq"),
+            "Expected `IS NOT NULL AND != ` form; predicate:\n{pred}"
         );
+        Ok(())
+    }
 
+    /// `NULLIF(k, 0) IS NULL` must rewrite to `k IS NULL OR k = 0`.
+    #[test]
+    fn is_null_rewrites_to_disjunction() -> Result<()> {
+        let predicate = Expr::IsNull(Box::new(nullif_k_0()));
+        let plan = LogicalPlanBuilder::scan("t", schema_k(), None)?
+            .filter(predicate)?
+            .build()?;
+
+        let result = NullifRewrite.rewrite(plan, &OptimizerContext::new())?.data;
+        let pred = match &result {
+            LogicalPlan::Filter(Filter { predicate, .. }) => format!("{predicate:?}"),
+            other => panic!("Expected Filter, got: {other:?}"),
+        };
+
+        assert!(
+            !pred.to_lowercase().contains("nullif("),
+            "NULLIF should be gone; predicate:\n{pred}"
+        );
+        assert!(
+            pred.contains("IsNull") && pred.contains("Eq"),
+            "Expected `IS NULL OR = ` form; predicate:\n{pred}"
+        );
+        Ok(())
+    }
+
+    /// Bare `NULLIF(k, 0)` (no IS NULL/IS NOT NULL wrapper) must NOT be
+    /// rewritten — DataFusion handles it as a residual.
+    #[test]
+    fn bare_nullif_is_left_alone() -> Result<()> {
+        let predicate = nullif_k_0().gt(lit(5_i64));
+        let plan = LogicalPlanBuilder::scan("t", schema_k(), None)?
+            .filter(predicate)?
+            .build()?;
+
+        let result = NullifRewrite.rewrite(plan, &OptimizerContext::new())?.data;
+        let pred = match &result {
+            LogicalPlan::Filter(Filter { predicate, .. }) => format!("{predicate:?}"),
+            other => panic!("Expected Filter, got: {other:?}"),
+        };
+
+        assert!(
+            pred.to_lowercase().contains("nullif("),
+            "Bare NULLIF should be preserved; predicate:\n{pred}"
+        );
         Ok(())
     }
 }
