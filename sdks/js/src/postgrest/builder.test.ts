@@ -570,7 +570,6 @@ describe("postgrest .stream()", () => {
   it("sets stream=true on the URL when .stream() is called", async () => {
     const captured: { request?: Request } = {};
     const basin = newClient(stubStreamFetch(makeNdjsonStream([]), captured));
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
     for await (const _ of basin.from("events").select().stream()) {
       /* drain */
     }
