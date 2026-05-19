@@ -1365,6 +1365,7 @@ fn sanitize_create_table_extensions(sql: &str) -> String {
                                 key != "basin.file_format"
                                     && key != "file_format"
                                     && key != "basin.sort_by"
+                                    && key != "basin.row_block_size"
                             }
                         })
                         .collect();
@@ -1778,6 +1779,124 @@ fn file_format_from_with_body(inside: &str) -> Option<basin_catalog::TableFileFo
     }
     handle_segment(&inside[start..], &mut found);
     found
+}
+
+/// Parse the per-table `basin.row_block_size` value out of a CREATE TABLE
+/// `WITH (...)` clause.
+///
+/// Accepted key (case-insensitive): `basin.row_block_size`.
+/// The value must be a plain integer — no quotes required, though bare
+/// integers without quotes are the expected spelling.
+///
+/// Returns `None` when the key is absent. Returns
+/// `Err(BasinError::InvalidSchema(...))` when the key is present but the
+/// value is 0, not a power of two, or outside [256, 65536].
+///
+/// Only the *first* top-level `WITH (...)` group is consulted; string
+/// literals / quoted identifiers / comments are skipped so a spoofed
+/// `basin.row_block_size` buried in a literal can't bypass validation.
+pub fn parse_create_table_row_block_size(
+    sql: &str,
+) -> basin_common::Result<Option<u32>> {
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'"' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < bytes.len() {
+                i += 2;
+            }
+            continue;
+        }
+        if matches_kw_at(bytes, i, b"WITH") {
+            let mut k = i + b"WITH".len();
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            if k < bytes.len() && bytes[k] == b'(' {
+                if let Some(close) = find_matching_paren(bytes, k) {
+                    let inside = &sql[k + 1..close];
+                    return row_block_size_from_with_body(inside);
+                }
+                return Ok(None);
+            }
+        }
+        i += 1;
+    }
+    Ok(None)
+}
+
+/// Validate `basin.row_block_size=N`: power of two in [256, 65536].
+pub fn validate_row_block_size(n: u32) -> basin_common::Result<()> {
+    if n == 0 || !n.is_power_of_two() || n < 256 || n > 65536 {
+        return Err(basin_common::BasinError::InvalidSchema(format!(
+            "basin.row_block_size={n} is invalid: must be a power of two in [256, 65536]"
+        )));
+    }
+    Ok(())
+}
+
+/// Scan the body of a `WITH (...)` clause for `basin.row_block_size`.
+fn row_block_size_from_with_body(inside: &str) -> basin_common::Result<Option<u32>> {
+    for seg in split_top_level_commas(inside) {
+        let seg = seg.trim();
+        let Some(eq) = seg.find('=') else { continue };
+        let key = unquote_with_token(seg[..eq].trim());
+        if key.to_ascii_lowercase() != "basin.row_block_size" {
+            continue;
+        }
+        let raw_val = seg[eq + 1..].trim();
+        let val = unquote_with_token(raw_val);
+        let n: u32 = val.parse().map_err(|_| {
+            basin_common::BasinError::InvalidSchema(format!(
+                "basin.row_block_size: expected integer, got {val:?}"
+            ))
+        })?;
+        validate_row_block_size(n)?;
+        return Ok(Some(n));
+    }
+    Ok(None)
 }
 
 /// Strip a single layer of surrounding `'...'` or `"..."` quoting from a
@@ -2568,5 +2687,89 @@ mod sort_by_tests {
             parse_create_table_sort_by(sql),
             Some(vec!["ts".to_string(), "id".to_string()])
         );
+    }
+}
+
+#[cfg(test)]
+mod row_block_size_tests {
+    use super::{parse_create_table_row_block_size, validate_row_block_size};
+
+    #[test]
+    fn accept_256() {
+        let sql = "CREATE TABLE foo (id BIGINT) WITH (basin.row_block_size=256)";
+        assert_eq!(parse_create_table_row_block_size(sql).unwrap(), Some(256));
+    }
+
+    #[test]
+    fn accept_1024() {
+        let sql = "CREATE TABLE foo (id BIGINT) WITH (basin.row_block_size=1024)";
+        assert_eq!(parse_create_table_row_block_size(sql).unwrap(), Some(1024));
+    }
+
+    #[test]
+    fn accept_8192() {
+        let sql = "CREATE TABLE foo (id BIGINT) WITH (basin.row_block_size=8192)";
+        assert_eq!(parse_create_table_row_block_size(sql).unwrap(), Some(8192));
+    }
+
+    #[test]
+    fn accept_65536() {
+        let sql = "CREATE TABLE foo (id BIGINT) WITH (basin.row_block_size=65536)";
+        assert_eq!(parse_create_table_row_block_size(sql).unwrap(), Some(65536));
+    }
+
+    #[test]
+    fn absent_returns_none() {
+        let sql = "CREATE TABLE foo (id BIGINT)";
+        assert_eq!(parse_create_table_row_block_size(sql).unwrap(), None);
+    }
+
+    #[test]
+    fn reject_zero() {
+        assert!(validate_row_block_size(0).is_err());
+    }
+
+    #[test]
+    fn reject_non_power_of_two() {
+        assert!(validate_row_block_size(100).is_err());
+    }
+
+    #[test]
+    fn reject_8193() {
+        assert!(validate_row_block_size(8193).is_err());
+    }
+
+    #[test]
+    fn reject_128_below_min() {
+        assert!(validate_row_block_size(128).is_err());
+    }
+
+    #[test]
+    fn reject_131072_above_max() {
+        assert!(validate_row_block_size(131072).is_err());
+    }
+
+    #[test]
+    fn rbs_combined_with_file_format() {
+        let sql = "CREATE TABLE foo (id BIGINT) WITH (basin.file_format='vortex', basin.row_block_size=1024)";
+        assert_eq!(parse_create_table_row_block_size(sql).unwrap(), Some(1024));
+    }
+
+    #[test]
+    fn rbs_case_insensitive_key() {
+        let sql = "CREATE TABLE foo (id BIGINT) WITH (BASIN.ROW_BLOCK_SIZE=4096)";
+        assert_eq!(parse_create_table_row_block_size(sql).unwrap(), Some(4096));
+    }
+
+    #[test]
+    fn parse_error_non_integer_value() {
+        let sql = "CREATE TABLE foo (id BIGINT) WITH (basin.row_block_size=abc)";
+        assert!(parse_create_table_row_block_size(sql).is_err());
+    }
+
+    #[test]
+    fn parse_error_out_of_range() {
+        let sql = "CREATE TABLE foo (id BIGINT) WITH (basin.row_block_size=100)";
+        assert!(parse_create_table_row_block_size(sql).is_err());
     }
 }

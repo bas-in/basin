@@ -47,6 +47,7 @@ struct TableState {
     continuous_aggregate: Option<CvDef>,
     cluster_columns: Vec<String>,
     file_format: TableFileFormat,
+    row_block_size: Option<u32>,
     home_region: Option<String>,
     indexes: Vec<SecondaryIndex>,
     pk_columns: Vec<String>,
@@ -87,6 +88,7 @@ impl TableState {
             continuous_aggregate: None,
             cluster_columns: Vec::new(),
             file_format: TableFileFormat::default(),
+            row_block_size: None,
             home_region: None,
             indexes: Vec::new(),
             pk_columns: Vec::new(),
@@ -247,6 +249,7 @@ impl InMemoryCatalog {
             continuous_aggregate: state.continuous_aggregate.clone(),
             cluster_columns: state.cluster_columns.clone(),
             file_format: state.file_format,
+            row_block_size: state.row_block_size,
             home_region: state.home_region.clone(),
             indexes: state.indexes.clone(),
             pk_columns: state.pk_columns.clone(),
@@ -563,6 +566,19 @@ impl Catalog for InMemoryCatalog {
         let qtable = QualifiedTableName::in_public(table.clone());
         self.set_cluster_columns_qualified(project, &qtable, columns)
             .await
+    }
+
+    async fn set_row_block_size(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        size: Option<u32>,
+    ) -> Result<()> {
+        let qtable = QualifiedTableName::in_public(table.clone());
+        let state_arc = self.get_table_qualified(project, &qtable).await?;
+        let mut state = state_arc.lock().await;
+        state.row_block_size = size;
+        Ok(())
     }
 
     /// #161: real impl — persist the table's on-disk data-file format
@@ -1367,6 +1383,7 @@ impl Catalog for InMemoryCatalog {
                 continuous_aggregate: s.continuous_aggregate.clone(),
                 cluster_columns: s.cluster_columns.clone(),
                 file_format: s.file_format,
+                row_block_size: s.row_block_size,
                 home_region: s.home_region.clone(),
                 indexes: s.indexes.clone(),
                 pk_columns: s.pk_columns.clone(),

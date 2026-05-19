@@ -622,6 +622,25 @@ pub trait Catalog: Send + Sync {
         Ok(())
     }
 
+    /// Per-table Vortex chunk / Parquet row-group size in rows.
+    ///
+    /// Declares the `basin.row_block_size` option set at `CREATE TABLE … WITH
+    /// (basin.row_block_size = N)`. The value is validated at DDL time (power
+    /// of two, in [256, 65536]); callers of this method receive an
+    /// already-validated value. `None` restores the writer's built-in default
+    /// for each format. Default impl is a no-op so the stub `RestCatalog` and
+    /// any future backends stay buildable; the in-memory and Postgres
+    /// implementations override this.
+    async fn set_row_block_size(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        size: Option<u32>,
+    ) -> Result<()> {
+        let _ = (project, table, size);
+        Ok(())
+    }
+
     /// Phase 6 multi-region scaffolding (ADR 0009). Pin `(project, table)`
     /// to a home region (or clear the pin with `None`). v0.1 only
     /// *records* the value; the cross-region routing / replication that

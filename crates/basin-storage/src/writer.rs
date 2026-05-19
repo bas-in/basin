@@ -135,6 +135,15 @@ pub struct WriteOptions {
     /// constructing `WriteOptions`, so a stray name here means
     /// schema-evolved-out and isn't worth a hard error on the hot path.
     pub cluster_columns: Vec<String>,
+    /// Per-table chunk / row-group size in rows (from `basin.row_block_size`).
+    ///
+    /// For Vortex tables this is forwarded to
+    /// `WriteStrategyBuilder::with_row_block_size`. For Parquet tables it
+    /// maps to `WriterProperties::max_row_group_size` (same knob as
+    /// `max_row_group_size`, but sourced from the `WITH` clause at CREATE
+    /// TABLE time). `None` keeps the writer's built-in default for each
+    /// format.
+    pub row_block_size: Option<u32>,
 }
 
 pub(crate) async fn write_batch(
@@ -202,7 +211,9 @@ pub(crate) async fn write_batch_with_options(
 
     let bytes = match opts.file_format {
         FileFormat::Parquet => encode_parquet(batch_to_write, opts)?,
-        FileFormat::Vortex => crate::vortex_format::encode(batch_to_write).await?,
+        FileFormat::Vortex => {
+            crate::vortex_format::encode(batch_to_write, opts.row_block_size).await?
+        }
     };
     let row_count = batch_to_write.num_rows() as u64;
 
@@ -339,8 +350,13 @@ fn encode_parquet(batch: &RecordBatch, opts: &WriteOptions) -> Result<Vec<u8>> {
     // write path (no WAL yet) doesn't crater. Once basin-wal lands and the
     // background compactor exists, the long-tail Parquet files can be
     // re-encoded at ZSTD-3 or ZSTD-9 for archival storage.
+    //
+    // Priority: `row_block_size` (from WITH clause) > `max_row_group_size`
+    // (from ALTER TABLE) > the built-in default.
     let max_row_group_size = opts
-        .max_row_group_size
+        .row_block_size
+        .map(|v| v as usize)
+        .or(opts.max_row_group_size)
         .unwrap_or(DEFAULT_MAX_ROW_GROUP_SIZE);
     let mut builder = WriterProperties::builder()
         .set_max_row_group_size(max_row_group_size)

@@ -217,6 +217,14 @@ impl PostgresCatalog {
                 "ALTER TABLE {schema}.tables
                  ADD COLUMN IF NOT EXISTS file_format TEXT"
             ),
+            // Per-table Vortex chunk / Parquet row-group size in rows.
+            // NULL / absent means "use writer default" — back-compat path.
+            // Validated at DDL time (power of two, 256–65536); stored as
+            // BIGINT for uniformity with row_group_rows.
+            format!(
+                "ALTER TABLE {schema}.tables
+                 ADD COLUMN IF NOT EXISTS row_block_size BIGINT"
+            ),
             // Constraint enforcement (PK / CHECK / FK). Each is a JSONB
             // payload — empty array / null means "no constraints"
             // (back-compat: old rows deserialise to empty vecs).
@@ -650,6 +658,7 @@ impl Catalog for PostgresCatalog {
             continuous_aggregate: None,
             cluster_columns: Vec::new(),
             file_format: TableFileFormat::default(),
+            row_block_size: None,
             // Phase 6 multi-region scaffolding (ADR 0009). New tables are
             // not pinned by default; `set_home_region` is the only mutator.
             home_region: None,
@@ -680,7 +689,8 @@ impl Catalog for PostgresCatalog {
                             continuous_aggregate_json, cluster_columns_json,
                             home_region,
                             pk_columns_json, check_constraints_json, foreign_keys_json,
-                            unique_constraints_json, indexes_json, file_format
+                            unique_constraints_json, indexes_json, file_format,
+                            row_block_size
                      FROM {sch}.tables
                      WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2"
                 ),
@@ -709,6 +719,7 @@ impl Catalog for PostgresCatalog {
         let unique_constraints_json: Option<serde_json::Value> = row.get(16);
         let indexes_json: Option<serde_json::Value> = row.get(17);
         let file_format_token: Option<String> = row.get(18);
+        let row_block_size_pg: Option<i64> = row.get(19);
         let arrow_schema: Schema = serde_json::from_value(schema_json)
             .map_err(|e| BasinError::catalog(format!("deserialise arrow schema: {e}")))?;
         let partition_spec = match partition_spec_json {
@@ -777,6 +788,8 @@ impl Catalog for PostgresCatalog {
                 .map_err(|e| BasinError::catalog(format!("deserialise indexes: {e}")))?,
             None => Vec::new(),
         };
+        let row_block_size: Option<u32> = row_block_size_pg
+            .and_then(|v| if v > 0 { u32::try_from(v).ok() } else { None });
 
         let snapshots = fetch_snapshots(&client, sch, &project_str, "public", &table_str).await?;
         Ok(TableMetadata {
@@ -796,6 +809,7 @@ impl Catalog for PostgresCatalog {
             continuous_aggregate,
             cluster_columns,
             file_format: file_format_from_token(file_format_token.as_deref()),
+            row_block_size,
             home_region,
             indexes,
             pk_columns,
@@ -1419,6 +1433,32 @@ impl Catalog for PostgresCatalog {
         Ok(())
     }
 
+    #[instrument(skip(self), fields(project = %project, table = %table))]
+    async fn set_row_block_size(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        size: Option<u32>,
+    ) -> Result<()> {
+        let sch = &self.schema;
+        let size_pg: Option<i64> = size.map(|v| v as i64);
+        let client = self.client.lock().await;
+        let n = client
+            .execute(
+                &format!(
+                    "UPDATE {sch}.tables SET row_block_size = $3
+                     WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2"
+                ),
+                &[&project.to_string(), &table.to_string(), &size_pg],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("set_row_block_size: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!("{project}/{table}")));
+        }
+        Ok(())
+    }
+
     /// #161: persist the table's on-disk data-file format. Mirrors
     /// `set_cluster_columns`' single-column UPDATE; the token is the serde
     /// snake_case representation and is read back by `load_table` /
@@ -1815,7 +1855,7 @@ impl Catalog for PostgresCatalog {
                         continuous_aggregate_json, cluster_columns_json,
                         home_region,
                         pk_columns_json, check_constraints_json, foreign_keys_json,
-                        file_format
+                        file_format, row_block_size
                      )
                      SELECT project_id, schema_name, $3, schema_json, current_snapshot,
                             format_version, partition_spec_json, rls_enabled,
@@ -1824,7 +1864,7 @@ impl Catalog for PostgresCatalog {
                             continuous_aggregate_json, cluster_columns_json,
                             home_region,
                             pk_columns_json, check_constraints_json, foreign_keys_json,
-                            file_format
+                            file_format, row_block_size
                      FROM {sch}.tables
                      WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2
                      ON CONFLICT (project_id, schema_name, table_name) DO NOTHING"
@@ -3252,6 +3292,7 @@ impl Catalog for PostgresCatalog {
             continuous_aggregate: None,
             cluster_columns: Vec::new(),
             file_format: TableFileFormat::default(),
+            row_block_size: None,
             home_region: None,
             indexes: Vec::new(),
             pk_columns: Vec::new(),
@@ -3284,7 +3325,8 @@ impl Catalog for PostgresCatalog {
                             continuous_aggregate_json, cluster_columns_json,
                             home_region,
                             pk_columns_json, check_constraints_json, foreign_keys_json,
-                            unique_constraints_json, indexes_json, file_format
+                            unique_constraints_json, indexes_json, file_format,
+                            row_block_size
                      FROM {sch}.tables
                      WHERE project_id = $1 AND schema_name = $2 AND table_name = $3"
                 ),
@@ -3315,6 +3357,7 @@ impl Catalog for PostgresCatalog {
         let unique_constraints_json: Option<serde_json::Value> = row.get(16);
         let indexes_json: Option<serde_json::Value> = row.get(17);
         let file_format_token: Option<String> = row.get(18);
+        let row_block_size_pg: Option<i64> = row.get(19);
 
         let arrow_schema: Schema = serde_json::from_value(schema_json)
             .map_err(|e| BasinError::catalog(format!("deserialise arrow schema: {e}")))?;
@@ -3378,6 +3421,8 @@ impl Catalog for PostgresCatalog {
                 .map_err(|e| BasinError::catalog(format!("deserialise indexes: {e}")))?,
             None => Vec::new(),
         };
+        let row_block_size: Option<u32> = row_block_size_pg
+            .and_then(|v| if v > 0 { u32::try_from(v).ok() } else { None });
 
         let snapshots =
             fetch_snapshots(&client, sch, &project_str, schema_name_str, &table_str).await?;
@@ -3398,6 +3443,7 @@ impl Catalog for PostgresCatalog {
             continuous_aggregate,
             cluster_columns,
             file_format: file_format_from_token(file_format_token.as_deref()),
+            row_block_size,
             home_region,
             indexes,
             pk_columns,

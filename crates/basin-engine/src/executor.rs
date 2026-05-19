@@ -1765,6 +1765,17 @@ async fn exec_create_table(
             .await?;
     }
 
+    // `basin.row_block_size` — optional per-table Vortex chunk / Parquet
+    // row-group override. Validated (power of two, [256, 65536]) at parse
+    // time; `None` means "use writer default".
+    if let Some(rbs) = crate::ddl::parse_create_table_row_block_size(raw_sql)? {
+        sess.engine
+            .config()
+            .catalog
+            .set_row_block_size(&sess.project, &table, Some(rbs))
+            .await?;
+    }
+
     if !constraints.pk_columns.is_empty()
         || !constraints.checks.is_empty()
         || !constraints.foreign_keys.is_empty()
@@ -3957,6 +3968,7 @@ fn write_options_for(meta: &TableMetadata) -> WriteOptions {
         // to Parquet (catalog default), keeping the legacy write path
         // byte-identical for every Parquet table.
         file_format: map_file_format(meta.file_format),
+        row_block_size: meta.row_block_size,
     }
 }
 

@@ -366,6 +366,19 @@ pub struct TableMetadata {
     /// path picks the format from here, the read path from each file's
     /// extension.
     pub file_format: TableFileFormat,
+    /// Per-table Vortex chunk / Parquet row-group size in rows.
+    ///
+    /// For Vortex tables this maps to `WriteStrategyBuilder::with_row_block_size`.
+    /// For Parquet tables this maps to `WriterProperties::max_row_group_size` —
+    /// the same as `row_group_rows` but controlled via the `WITH` clause at
+    /// CREATE TABLE time rather than a separate `ALTER TABLE` command.
+    ///
+    /// `None` (the default) keeps the writer's built-in default for each
+    /// format. Valid values are powers of two in [256, 65536]; the engine
+    /// rejects values outside this range at DDL time. Pre-existing catalog
+    /// rows without this column deserialise to `None` via the Postgres
+    /// `ADD COLUMN IF NOT EXISTS` migration and the `Option` default.
+    pub row_block_size: Option<u32>,
     /// Phase 6 multi-region scaffolding (ADR 0009). The region a project's
     /// writes for this table are *pinned* to — i.e. the home region for
     /// all writes; reads can come from any region (with the freshness

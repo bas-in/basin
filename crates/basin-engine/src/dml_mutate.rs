@@ -2219,6 +2219,7 @@ async fn write_replacement(
         // Defaults to Parquet (catalog default) — byte-identical to the
         // legacy rewrite path for every Parquet table.
         file_format: crate::executor::map_file_format(meta.file_format),
+        row_block_size: meta.row_block_size,
     };
     let df = sess
         .engine

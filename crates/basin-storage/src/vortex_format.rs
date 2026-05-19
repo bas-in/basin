@@ -44,7 +44,11 @@ fn session() -> &'static VortexSession {
 
 /// Encode one Arrow `RecordBatch` into a self-describing Vortex byte blob using
 /// the aggressive BtrBlocks cascade (zstd for strings/binary, pco for numerics).
-pub(crate) async fn encode(batch: &RecordBatch) -> Result<Vec<u8>> {
+///
+/// `row_block_size` – when `Some(n)`, forwards `n` to
+/// `WriteStrategyBuilder::with_row_block_size` to control Vortex chunk
+/// granularity. `None` keeps the Vortex default (8192 rows / chunk).
+pub(crate) async fn encode(batch: &RecordBatch, row_block_size: Option<u32>) -> Result<Vec<u8>> {
     // Arrow RecordBatch -> Vortex struct array. The top-level struct must be
     // NON-nullable: vortex 0.70's `FileStatsAccumulator` rejects nullable
     // top-level structs ("Use Validity::NonNullable"). Per-COLUMN nullability
@@ -55,9 +59,11 @@ pub(crate) async fn encode(batch: &RecordBatch) -> Result<Vec<u8>> {
 
     // BtrBlocks with `with_compact` = the proven aggressive strategy.
     let compressor = BtrBlocksCompressorBuilder::default().with_compact();
-    let strategy = WriteStrategyBuilder::default()
-        .with_btrblocks_builder(compressor)
-        .build();
+    let mut builder = WriteStrategyBuilder::default().with_btrblocks_builder(compressor);
+    if let Some(sz) = row_block_size {
+        builder = builder.with_row_block_size(sz as usize);
+    }
+    let strategy = builder.build();
 
     let mut buf = ByteBufferMut::empty();
     session()
@@ -580,7 +586,7 @@ mod tests {
     async fn round_trip_basin_shaped_schema() {
         let (schema, original) = sample_batch();
 
-        let bytes = encode(&original).await.expect("encode");
+        let bytes = encode(&original, None).await.expect("encode");
         assert!(!bytes.is_empty(), "encoded blob must be non-empty");
 
         let (decoded, _) = decode(bytes::Bytes::from(bytes), Some(schema.clone()), None, None)
@@ -728,7 +734,7 @@ mod tests {
     #[tokio::test]
     async fn self_describing_decode_without_schema() {
         let (_schema, original) = sample_batch();
-        let bytes = encode(&original).await.expect("encode");
+        let bytes = encode(&original, None).await.expect("encode");
 
         let (decoded, _) = decode(bytes::Bytes::from(bytes), None, None, None)
             .await
