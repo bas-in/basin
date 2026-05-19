@@ -33,7 +33,9 @@
 //!   `BasinError::FeatureNotSupported` until the integration PR lands).
 //! - [`WalConfig`]: object store + flush knobs for [`LocalWal`].
 //! - [`RaftWalConfig`]: peer + timing knobs for [`RaftWal`].
-//! - [`WalEntry`], [`Lsn`]: data shapes shared by all impls.
+//! - [`WalEntry`], [`WalEvent`], [`Lsn`]: data shapes shared by all impls.
+//! - [`replay_wal`] + [`WalReplayConfig`]: transaction-aware replay (Phase
+//!   5.14.C2 and later).
 
 #![forbid(unsafe_code)]
 
@@ -67,10 +69,14 @@ impl std::fmt::Display for Lsn {
     }
 }
 
-/// A single appended record.
+/// A single appended data record.
 ///
 /// `payload` is opaque to the WAL — typically an Arrow IPC-serialised
 /// `RecordBatch` from the shard owner. The WAL never inspects it.
+///
+/// Transaction marker records (`Begin`, `Rollback`) are represented separately
+/// via [`WalEvent`] and are never exposed as `WalEntry` values through the
+/// normal [`Wal::read_from`] path.
 #[derive(Clone, Debug)]
 pub struct WalEntry {
     pub project: ProjectId,
@@ -78,6 +84,129 @@ pub struct WalEntry {
     pub lsn: Lsn,
     pub payload: Bytes,
     pub appended_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// A WAL event as seen during replay. Extends the plain [`WalEntry`] data
+/// record with transaction lifecycle markers.
+///
+/// The normal `Wal::read_from` path returns `Vec<WalEntry>` (data only).
+/// Use [`Wal::read_events`] and [`replay_wal`] when transaction-aware replay
+/// is required (Phase 5.14.C2 and later).
+#[derive(Clone, Debug)]
+pub enum WalEvent {
+    /// A normal data record.
+    Entry(WalEntry),
+    /// Marks the start of a logical transaction with the given id.
+    Begin { tx_id: u64 },
+    /// Marks that all buffered entries for `tx_id` should be discarded.
+    Rollback { tx_id: u64 },
+}
+
+/// Configuration for [`replay_wal`].
+///
+/// `suppress_rolled_back` (default `true`) activates transaction-aware replay:
+/// entries enclosed by a `Begin`/`Rollback` pair are discarded. Set to `false`
+/// for v0.1-format WAL files that contain no transaction markers (all entries
+/// are emitted verbatim in that case anyway, but the flag makes the intent
+/// explicit).
+#[derive(Clone, Debug)]
+pub struct WalReplayConfig {
+    /// Suppress entries belonging to explicitly rolled-back transactions.
+    ///
+    /// When `true` (the default) a `Begin { tx_id }` / `Rollback { tx_id }`
+    /// pair causes all buffered entries for that `tx_id` to be discarded.
+    /// When `false` all entries are emitted regardless of transaction markers
+    /// (v0.1-compat mode).
+    pub suppress_rolled_back: bool,
+}
+
+impl Default for WalReplayConfig {
+    fn default() -> Self {
+        Self {
+            suppress_rolled_back: true,
+        }
+    }
+}
+
+/// Replay a sequence of [`WalEvent`]s, suppressing entries that belong to
+/// explicitly rolled-back transactions.
+///
+/// ## Behaviour
+///
+/// - Events with no surrounding `Begin`/`Rollback` markers are emitted
+///   verbatim (back-compat: pre-marker WAL files produce identical output).
+/// - A `Begin { tx_id }` starts collecting entries tagged with `tx_id`.
+/// - A `Rollback { tx_id }` discards all collected entries for that `tx_id`.
+/// - End-of-input with no matching `Rollback` is an **implicit commit**: all
+///   buffered entries for the open transaction are emitted in LSN order.
+/// - Multiple concurrent transactions (interleaved `Begin` markers) are
+///   tracked independently.
+///
+/// ## `WalReplayConfig::suppress_rolled_back = false`
+///
+/// Disables the suppression logic. Every `Entry` event in `events` is emitted
+/// regardless of surrounding markers. This is the v0.1-compat mode.
+pub fn replay_wal(events: Vec<WalEvent>, config: &WalReplayConfig) -> Vec<WalEntry> {
+    if !config.suppress_rolled_back {
+        // Fast path: emit all data entries, ignore markers.
+        return events
+            .into_iter()
+            .filter_map(|ev| match ev {
+                WalEvent::Entry(e) => Some(e),
+                WalEvent::Begin { .. } | WalEvent::Rollback { .. } => None,
+            })
+            .collect();
+    }
+
+    // tx_id -> buffered entries collected since the matching Begin.
+    let mut open_txs: std::collections::HashMap<u64, Vec<WalEntry>> =
+        std::collections::HashMap::new();
+    // Entries not inside any open transaction (or from implicit-commit tx).
+    let mut committed: Vec<WalEntry> = Vec::new();
+    // Track which tx_id is "current" for the most recent Begin, so that
+    // interleaved entries are routed correctly. An entry that arrives while
+    // any transaction is open is attributed to the *most recently opened*
+    // transaction whose Begin has not yet been resolved.
+    //
+    // Ordering: we track open tx_ids in insertion order.
+    let mut open_tx_order: Vec<u64> = Vec::new();
+
+    for event in events {
+        match event {
+            WalEvent::Begin { tx_id } => {
+                open_txs.entry(tx_id).or_default();
+                // Track insertion order (do not duplicate if already present).
+                if !open_tx_order.contains(&tx_id) {
+                    open_tx_order.push(tx_id);
+                }
+            }
+            WalEvent::Rollback { tx_id } => {
+                open_txs.remove(&tx_id);
+                open_tx_order.retain(|id| *id != tx_id);
+            }
+            WalEvent::Entry(entry) => {
+                if let Some(&current_tx) = open_tx_order.last() {
+                    // Inside an open transaction — buffer against it.
+                    open_txs.entry(current_tx).or_default().push(entry);
+                } else {
+                    // No open transaction — implicit commit immediately.
+                    committed.push(entry);
+                }
+            }
+        }
+    }
+
+    // End-of-input: implicit commit for any still-open transactions.
+    // Emit in the order the transactions were opened.
+    for tx_id in open_tx_order {
+        if let Some(mut buffered) = open_txs.remove(&tx_id) {
+            committed.append(&mut buffered);
+        }
+    }
+
+    // Final LSN sort preserves append order regardless of interleaving.
+    committed.sort_by_key(|e| e.lsn);
+    committed
 }
 
 /// Knobs for [`LocalWal::open`].
@@ -157,6 +286,61 @@ pub trait Wal: Send + Sync + std::fmt::Debug {
 
     /// Stop background tasks and drain. Idempotent.
     async fn close(&self) -> Result<()>;
+
+    /// Append a `BEGIN` transaction marker for `tx_id` to the log for
+    /// `(project, partition)`. Returns the LSN assigned to the marker.
+    ///
+    /// Default implementation returns
+    /// [`basin_common::BasinError::FeatureNotSupported`] — concrete backends
+    /// override this (e.g. [`LocalWal`]).
+    async fn append_tx_begin(
+        &self,
+        _project: &ProjectId,
+        _partition: &PartitionKey,
+        _tx_id: u64,
+    ) -> Result<Lsn> {
+        Err(basin_common::BasinError::feature_not_supported(
+            "append_tx_begin",
+        ))
+    }
+
+    /// Append a `ROLLBACK` transaction marker for `tx_id` to the log for
+    /// `(project, partition)`. Returns the LSN assigned to the marker.
+    ///
+    /// Default implementation returns
+    /// [`basin_common::BasinError::FeatureNotSupported`] — concrete backends
+    /// override this (e.g. [`LocalWal`]).
+    async fn append_tx_rollback(
+        &self,
+        _project: &ProjectId,
+        _partition: &PartitionKey,
+        _tx_id: u64,
+    ) -> Result<Lsn> {
+        Err(basin_common::BasinError::feature_not_supported(
+            "append_tx_rollback",
+        ))
+    }
+
+    /// Return all events (data entries **and** transaction markers) for
+    /// `(project, partition)` with LSN strictly greater than `since_lsn`, in
+    /// append order.
+    ///
+    /// Use this in combination with [`replay_wal`] when transaction-aware
+    /// replay is required. For plain data reads prefer [`Self::read_from`].
+    ///
+    /// Default implementation returns
+    /// [`basin_common::BasinError::FeatureNotSupported`] — concrete backends
+    /// override this (e.g. [`LocalWal`]).
+    async fn read_events(
+        &self,
+        _project: &ProjectId,
+        _partition: &PartitionKey,
+        _since_lsn: Lsn,
+    ) -> Result<Vec<WalEvent>> {
+        Err(basin_common::BasinError::feature_not_supported(
+            "read_events",
+        ))
+    }
 
     /// Attach a per-project counter registry so the WAL append path bumps the
     /// same per-project rollup as engine-side ops and storage-side bytes.
@@ -242,6 +426,35 @@ impl Wal for LocalWal {
         self.inner.close().await
     }
 
+    async fn append_tx_begin(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        tx_id: u64,
+    ) -> Result<Lsn> {
+        self.inner.append_tx_begin(project, partition, tx_id).await
+    }
+
+    async fn append_tx_rollback(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        tx_id: u64,
+    ) -> Result<Lsn> {
+        self.inner
+            .append_tx_rollback(project, partition, tx_id)
+            .await
+    }
+
+    async fn read_events(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        since_lsn: Lsn,
+    ) -> Result<Vec<WalEvent>> {
+        self.inner.read_events(project, partition, since_lsn).await
+    }
+
     fn attach_project_counters(&self, registry: Arc<ProjectCounterRegistry>) {
         // Idempotent (first attach wins).
         let _ = self.project_counters.set(registry);
@@ -279,6 +492,24 @@ pub(crate) trait WalImpl: Send + Sync {
         up_to: Lsn,
     ) -> Result<()>;
     async fn close(&self) -> Result<()>;
+    async fn append_tx_begin(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        tx_id: u64,
+    ) -> Result<Lsn>;
+    async fn append_tx_rollback(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        tx_id: u64,
+    ) -> Result<Lsn>;
+    async fn read_events(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        since_lsn: Lsn,
+    ) -> Result<Vec<WalEvent>>;
 }
 
 mod file_wal;

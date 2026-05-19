@@ -40,12 +40,24 @@ pub(crate) struct EntryRecord {
     pub appended_at: DateTime<Utc>,
 }
 
-/// Tagged wrapper so a segment can hold either a header or an entry. Bincode
-/// handles the discriminant.
+/// Tagged wrapper so a segment can hold a header, a data entry, or a
+/// transaction lifecycle marker. Bincode handles the discriminant.
+///
+/// Variants added in v0.2 (`TxBegin`, `TxRollback`) are forward-compatible:
+/// a v0.1 reader that encounters an unknown bincode discriminant will return a
+/// decode error (surfaced as a WAL read error — not silent data loss).
+/// The replay path in [`crate::replay_wal`] handles both.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum SegmentRecord {
     Header(SegmentHeader),
     Entry(EntryRecord),
+    /// Marks the start of a logical transaction. Must be paired with either a
+    /// matching `TxRollback` (discard) or end-of-WAL / next non-marker entry
+    /// (implicit commit).
+    TxBegin { tx_id: u64 },
+    /// Marks that all entries since the matching `TxBegin { tx_id }` should be
+    /// discarded during replay.
+    TxRollback { tx_id: u64 },
 }
 
 pub(crate) const FORMAT_VERSION: u16 = 1;
@@ -63,12 +75,26 @@ pub(crate) fn frame_into(buf: &mut Vec<u8>, record: &SegmentRecord) -> Result<()
     Ok(())
 }
 
-/// Parse a length-prefixed segment buffer into header + entries. Used by
-/// recovery and by `read_from`.
-pub(crate) fn decode_segment(buf: &[u8]) -> Result<(SegmentHeader, Vec<EntryRecord>)> {
+/// A decoded record from a segment, preserving transaction markers for the
+/// replay path.
+#[derive(Debug, Clone)]
+pub(crate) enum DecodedRecord {
+    Entry(EntryRecord),
+    TxBegin { tx_id: u64 },
+    TxRollback { tx_id: u64 },
+}
+
+/// Parse a length-prefixed segment buffer into header + decoded records.
+///
+/// Unlike [`decode_segment`], this variant preserves transaction marker records
+/// (`TxBegin`, `TxRollback`) so the replay path can filter rolled-back entries.
+/// Use this path whenever transaction-aware processing is required.
+pub(crate) fn decode_segment_full(
+    buf: &[u8],
+) -> Result<(SegmentHeader, Vec<DecodedRecord>)> {
     let mut cursor = 0usize;
     let mut header: Option<SegmentHeader> = None;
-    let mut entries: Vec<EntryRecord> = Vec::new();
+    let mut records: Vec<DecodedRecord> = Vec::new();
 
     while cursor < buf.len() {
         if cursor + 4 > buf.len() {
@@ -91,12 +117,46 @@ pub(crate) fn decode_segment(buf: &[u8]) -> Result<(SegmentHeader, Vec<EntryReco
                 }
                 header = Some(h);
             }
-            SegmentRecord::Entry(e) => entries.push(e),
+            SegmentRecord::Entry(e) => records.push(DecodedRecord::Entry(e)),
+            SegmentRecord::TxBegin { tx_id } => {
+                records.push(DecodedRecord::TxBegin { tx_id });
+            }
+            SegmentRecord::TxRollback { tx_id } => {
+                records.push(DecodedRecord::TxRollback { tx_id });
+            }
         }
     }
 
     let header = header.ok_or_else(|| BasinError::wal("segment: missing header"))?;
+    Ok((header, records))
+}
+
+/// Parse a length-prefixed segment buffer into header + entries. Used by
+/// recovery and by `read_from`.
+///
+/// Transaction marker records (`TxBegin`, `TxRollback`) are silently dropped
+/// by this path for back-compat. For transaction-aware replay use
+/// [`decode_segment_full`].
+pub(crate) fn decode_segment(buf: &[u8]) -> Result<(SegmentHeader, Vec<EntryRecord>)> {
+    let (header, records) = decode_segment_full(buf)?;
+    let entries = records
+        .into_iter()
+        .filter_map(|r| match r {
+            DecodedRecord::Entry(e) => Some(e),
+            DecodedRecord::TxBegin { .. } | DecodedRecord::TxRollback { .. } => None,
+        })
+        .collect();
     Ok((header, entries))
+}
+
+/// Construct a `TxBegin` segment record for the given transaction id.
+pub(crate) fn tx_begin_record(tx_id: u64) -> SegmentRecord {
+    SegmentRecord::TxBegin { tx_id }
+}
+
+/// Construct a `TxRollback` segment record for the given transaction id.
+pub(crate) fn tx_rollback_record(tx_id: u64) -> SegmentRecord {
+    SegmentRecord::TxRollback { tx_id }
 }
 
 /// Convenience for constructing the wire entry from the public type's pieces.

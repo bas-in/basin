@@ -43,11 +43,11 @@ use tokio::sync::{watch, Mutex, RwLock};
 use ulid::Ulid;
 
 use crate::segment::{
-    decode_segment, entry_record, frame_into, EntryRecord, SegmentHeader, SegmentRecord,
-    FORMAT_VERSION,
+    decode_segment, decode_segment_full, entry_record, frame_into, tx_begin_record,
+    tx_rollback_record, DecodedRecord, EntryRecord, SegmentHeader, SegmentRecord, FORMAT_VERSION,
 };
-use crate::state::{ClosedSegment, PartitionState};
-use crate::{Lsn, WalConfig, WalEntry, WalImpl};
+use crate::state::{BufferRecord, ClosedSegment, PartitionState};
+use crate::{Lsn, WalConfig, WalEntry, WalEvent, WalImpl};
 
 /// Top-level segment of the WAL key namespace. Lives directly under
 /// `{root_prefix}` (or the bucket root) so listing can scope a recovery scan
@@ -150,8 +150,8 @@ impl Inner {
             return Ok(());
         }
         let segment_id = Ulid::new();
-        let first_lsn = guard.buffer.first().expect("non-empty").lsn;
-        let last_lsn = guard.buffer.last().expect("non-empty").lsn;
+        let first_lsn = guard.buffer.first().expect("non-empty").lsn();
+        let last_lsn = guard.buffer.last().expect("non-empty").lsn();
         let header = SegmentHeader {
             format_version: FORMAT_VERSION,
             project: guard.project,
@@ -161,8 +161,18 @@ impl Inner {
         };
         let mut buf: Vec<u8> = Vec::with_capacity(guard.buffer_bytes as usize + 256);
         frame_into(&mut buf, &SegmentRecord::Header(header))?;
-        for entry in guard.buffer.iter() {
-            frame_into(&mut buf, &SegmentRecord::Entry(entry.clone()))?;
+        for record in guard.buffer.iter() {
+            match record {
+                BufferRecord::Entry(entry) => {
+                    frame_into(&mut buf, &SegmentRecord::Entry(entry.clone()))?;
+                }
+                BufferRecord::TxBegin { tx_id, .. } => {
+                    frame_into(&mut buf, &tx_begin_record(*tx_id))?;
+                }
+                BufferRecord::TxRollback { tx_id, .. } => {
+                    frame_into(&mut buf, &tx_rollback_record(*tx_id))?;
+                }
+            }
         }
 
         let path = closed_segment_path(
@@ -172,7 +182,7 @@ impl Inner {
             segment_id,
         );
 
-        let drained: Vec<EntryRecord> = guard.buffer.drain(..).collect();
+        let drained: Vec<BufferRecord> = guard.buffer.drain(..).collect();
         let drained_bytes = guard.buffer_bytes;
         guard.buffer_bytes = 0;
         // Drop the mutex across the network/disk round-trip so other appends
@@ -200,7 +210,7 @@ impl Inner {
                     partition = %guard.partition,
                     %first_lsn,
                     %last_lsn,
-                    entries = drained.len(),
+                    records = drained.len(),
                     "wal segment flushed",
                 );
                 Ok(())
@@ -352,7 +362,7 @@ impl WalImpl for FileWal {
             // timestamp. The actual flush serialises again; this counter is
             // only for the buffer-pressure heuristic.
             let approx = (payload.len() as u64) + 96;
-            guard.buffer.push(record);
+            guard.buffer.push(BufferRecord::Entry(record));
             guard.buffer_bytes += approx;
             let pressure = guard.buffer_bytes >= self.inner.flush_max_bytes;
             (lsn, pressure)
@@ -384,7 +394,7 @@ impl WalImpl for FileWal {
         let state = self.inner.get_or_create_partition(project, partition).await;
         // Snapshot the closed-segment list and the in-RAM buffer under the
         // lock; do the (potentially slow) GETs without holding it.
-        let (closed_paths, buffered): (Vec<ClosedSegment>, Vec<EntryRecord>) = {
+        let (closed_paths, buffered): (Vec<ClosedSegment>, Vec<BufferRecord>) = {
             let guard = state.lock().await;
             let segs: Vec<ClosedSegment> = guard
                 .closed
@@ -392,10 +402,10 @@ impl WalImpl for FileWal {
                 .filter(|s| s.last_lsn > since_lsn)
                 .cloned()
                 .collect();
-            let buf: Vec<EntryRecord> = guard
+            let buf: Vec<BufferRecord> = guard
                 .buffer
                 .iter()
-                .filter(|e| e.lsn > since_lsn)
+                .filter(|r| r.lsn() > since_lsn)
                 .cloned()
                 .collect();
             (segs, buf)
@@ -419,8 +429,10 @@ impl WalImpl for FileWal {
                 }
             }
         }
-        for e in buffered {
-            out.push(into_public_entry(e));
+        for record in buffered {
+            if let BufferRecord::Entry(e) = record {
+                out.push(into_public_entry(e));
+            }
         }
         // Closed segments were sorted by first_lsn and entries within a
         // segment are append-ordered, but if a buffer flush raced with a
@@ -484,6 +496,131 @@ impl WalImpl for FileWal {
         // Final synchronous drain in case any appends raced the shutdown
         // signal and landed after the task's last flush.
         self.inner.flush_all().await
+    }
+
+    #[tracing::instrument(skip(self), fields(project=%project, partition=%partition, tx_id))]
+    async fn append_tx_begin(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        tx_id: u64,
+    ) -> Result<Lsn> {
+        let state = self.inner.get_or_create_partition(project, partition).await;
+        let (lsn, should_flush) = {
+            let mut guard = state.lock().await;
+            let lsn = guard.next_lsn;
+            guard.next_lsn = lsn.next();
+            guard.buffer.push(BufferRecord::TxBegin { lsn, tx_id });
+            // Markers are tiny; use a fixed overhead for the pressure heuristic.
+            guard.buffer_bytes += 32;
+            let pressure = guard.buffer_bytes >= self.inner.flush_max_bytes;
+            (lsn, pressure)
+        };
+        if should_flush {
+            if let Err(e) = self.inner.flush_one(&state).await {
+                tracing::warn!(error = %e, "buffer-pressure flush failed (tx_begin)");
+            }
+        }
+        Ok(lsn)
+    }
+
+    #[tracing::instrument(skip(self), fields(project=%project, partition=%partition, tx_id))]
+    async fn append_tx_rollback(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        tx_id: u64,
+    ) -> Result<Lsn> {
+        let state = self.inner.get_or_create_partition(project, partition).await;
+        let (lsn, should_flush) = {
+            let mut guard = state.lock().await;
+            let lsn = guard.next_lsn;
+            guard.next_lsn = lsn.next();
+            guard.buffer.push(BufferRecord::TxRollback { lsn, tx_id });
+            guard.buffer_bytes += 32;
+            let pressure = guard.buffer_bytes >= self.inner.flush_max_bytes;
+            (lsn, pressure)
+        };
+        if should_flush {
+            if let Err(e) = self.inner.flush_one(&state).await {
+                tracing::warn!(error = %e, "buffer-pressure flush failed (tx_rollback)");
+            }
+        }
+        Ok(lsn)
+    }
+
+    #[tracing::instrument(skip(self), fields(project=%project, partition=%partition, %since_lsn))]
+    async fn read_events(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        since_lsn: Lsn,
+    ) -> Result<Vec<WalEvent>> {
+        let state = self.inner.get_or_create_partition(project, partition).await;
+        let (closed_paths, buffered): (Vec<ClosedSegment>, Vec<BufferRecord>) = {
+            let guard = state.lock().await;
+            let segs: Vec<ClosedSegment> = guard
+                .closed
+                .values()
+                .filter(|s| s.last_lsn > since_lsn)
+                .cloned()
+                .collect();
+            let buf: Vec<BufferRecord> = guard
+                .buffer
+                .iter()
+                .filter(|r| r.lsn() > since_lsn)
+                .cloned()
+                .collect();
+            (segs, buf)
+        };
+
+        // Build the event list in segment-append order. Closed segments are
+        // indexed by first_lsn (BTreeMap), so iterating values() is already
+        // LSN-ordered. Within each segment, decode_segment_full preserves
+        // on-disk order.
+        let mut events: Vec<WalEvent> = Vec::new();
+        for seg in closed_paths {
+            let body = self
+                .inner
+                .object_store
+                .get(&seg.path)
+                .await
+                .map_err(|e| {
+                    BasinError::storage(format!("wal read_events get {}: {e}", seg.path))
+                })?
+                .bytes()
+                .await
+                .map_err(|e| {
+                    BasinError::storage(format!("wal read_events body {}: {e}", seg.path))
+                })?;
+            let (_header, records) = decode_segment_full(&body)?;
+            for r in records {
+                match r {
+                    DecodedRecord::Entry(e) if e.lsn > since_lsn => {
+                        events.push(WalEvent::Entry(into_public_entry(e)));
+                    }
+                    DecodedRecord::TxBegin { tx_id } => {
+                        events.push(WalEvent::Begin { tx_id });
+                    }
+                    DecodedRecord::TxRollback { tx_id } => {
+                        events.push(WalEvent::Rollback { tx_id });
+                    }
+                    DecodedRecord::Entry(_) => {} // lsn <= since_lsn, skip
+                }
+            }
+        }
+
+        for record in buffered {
+            match record {
+                BufferRecord::Entry(e) => events.push(WalEvent::Entry(into_public_entry(e))),
+                BufferRecord::TxBegin { tx_id, .. } => events.push(WalEvent::Begin { tx_id }),
+                BufferRecord::TxRollback { tx_id, .. } => {
+                    events.push(WalEvent::Rollback { tx_id })
+                }
+            }
+        }
+
+        Ok(events)
     }
 }
 

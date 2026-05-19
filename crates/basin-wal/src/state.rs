@@ -22,10 +22,30 @@ pub(crate) struct ClosedSegment {
     pub segment_id: Ulid,
 }
 
+/// An in-RAM buffer record. Data entries and transaction markers are kept in
+/// the same ordered buffer so they are serialised to disk in the correct
+/// interleaved order.
+#[derive(Debug, Clone)]
+pub(crate) enum BufferRecord {
+    Entry(EntryRecord),
+    TxBegin { lsn: Lsn, tx_id: u64 },
+    TxRollback { lsn: Lsn, tx_id: u64 },
+}
+
+impl BufferRecord {
+    pub fn lsn(&self) -> Lsn {
+        match self {
+            BufferRecord::Entry(e) => e.lsn,
+            BufferRecord::TxBegin { lsn, .. } | BufferRecord::TxRollback { lsn, .. } => *lsn,
+        }
+    }
+}
+
 /// All mutable state for a single `(project, partition)`.
 ///
-/// The buffer holds entries that have been assigned an LSN but may not yet
-/// have been flushed to object storage. The flush task drains it.
+/// The buffer holds entries (and transaction markers) that have been assigned
+/// an LSN but may not yet have been flushed to object storage. The flush task
+/// drains it.
 #[derive(Debug)]
 pub(crate) struct PartitionState {
     pub project: ProjectId,
@@ -33,9 +53,10 @@ pub(crate) struct PartitionState {
     /// LSN to assign to the next [`crate::Wal::append`] call. Recovered on
     /// open from the maximum `last_lsn` across closed segments.
     pub next_lsn: Lsn,
-    /// In-RAM entries that have been ack'd to callers but not yet uploaded
-    /// to object storage. Kept in append order.
-    pub buffer: Vec<EntryRecord>,
+    /// In-RAM records that have been ack'd to callers but not yet uploaded
+    /// to object storage. Kept in append order. Holds both data entries and
+    /// transaction markers.
+    pub buffer: Vec<BufferRecord>,
     /// Approximate byte size of `buffer` once framed; used to decide whether
     /// to trigger an early flush.
     pub buffer_bytes: u64,
@@ -57,11 +78,11 @@ impl PartitionState {
         }
     }
 
-    /// Maximum LSN known to this partition: the last buffered entry, or the
-    /// last closed segment's `last_lsn`, or `Lsn::ZERO` if neither exists.
+    /// Maximum LSN known to this partition: the last buffered record's LSN, or
+    /// the last closed segment's `last_lsn`, or `Lsn::ZERO` if neither exists.
     pub fn high_water(&self) -> Lsn {
         if let Some(last) = self.buffer.last() {
-            return last.lsn;
+            return last.lsn();
         }
         self.closed
             .values()
