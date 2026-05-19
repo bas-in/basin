@@ -13,6 +13,9 @@ basin-catalog.workspace = true
 basin-vector.workspace = true
 basin-shard.workspace = true
 basin-wal.workspace = true
+basin-hottier.workspace = true
+basin-sketch.workspace = true
+xxhash-rust = { workspace = true }
 
 tokio.workspace = true
 futures.workspace = true

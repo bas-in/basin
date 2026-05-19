@@ -23,6 +23,7 @@ arrow-ipc = "58"
 parking_lot = "0.12"
 dashmap = "6"
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 crossbeam-skiplist = "0.1"

@@ -149,6 +149,13 @@ pub(crate) struct EngineInner {
     /// at query time so the compactor (Phase 5.14.D1) can detect common
     /// access patterns and pre-sort files accordingly.
     pub(crate) query_history: Arc<crate::query_history::QueryHistory>,
+    /// Process-wide HTAP hot-tier memtable registry (Phase 5.14.C5).
+    /// Constructed once at engine startup from the process-level
+    /// `MemTableConfig` (reads `BASIN_MEMTABLE_*` env vars).  Integration
+    /// with the write path (C2), read-merge path (C3), and flush task (C4)
+    /// lands in subsequent sub-items; this field is only constructed + exposed
+    /// here so the rest of the C-series can wire against it.
+    pub(crate) memtable_registry: Arc<basin_hottier::MemTableRegistry>,
 }
 
 impl Engine {
@@ -194,6 +201,13 @@ impl Engine {
             Arc::new(DefaultFilesMetadataCache::new(
                 CacheManagerConfig::default().metadata_cache_limit,
             ));
+        // Phase 5.14.C5: construct the process-wide memtable registry once.
+        // Reads BASIN_MEMTABLE_* env vars for per-process budget overrides.
+        // Integration with writes (C2), reads (C3), and flush (C4) is in
+        // subsequent sub-items.
+        let memtable_registry = Arc::new(basin_hottier::MemTableRegistry::new_with_config(
+            basin_hottier::MemTableConfig::from_env(),
+        ));
         let inner = Arc::new(EngineInner {
             cfg,
             vector_routing_count: AtomicU64::new(0),
@@ -207,6 +221,7 @@ impl Engine {
             udf_cache,
             file_metadata_cache,
             query_history: Arc::new(crate::query_history::QueryHistory::new()),
+            memtable_registry,
         });
         attach_reactor_sink(&inner, catalog);
         Self { inner }
@@ -332,6 +347,16 @@ impl Engine {
     /// (Phase 5.14.D2).  Returned `Arc` is cheap to clone.
     pub(crate) fn query_history(&self) -> &Arc<crate::query_history::QueryHistory> {
         &self.inner.query_history
+    }
+
+    /// Process-wide HTAP hot-tier memtable registry (Phase 5.14.C5).
+    ///
+    /// The returned `Arc` is cheap to clone.  Integration with the write path
+    /// (C2), read-merge path (C3), and flush task (C4) lands in subsequent
+    /// sub-items; this accessor is wired here so the rest of the C-series can
+    /// reference the registry via the engine handle.
+    pub fn memtable_registry(&self) -> Arc<basin_hottier::MemTableRegistry> {
+        self.inner.memtable_registry.clone()
     }
 
     /// Crate-private hook bumped by `executor::execute` when a vector
@@ -605,6 +630,7 @@ pub enum ExecResult {
 
 mod advisory_lock;
 mod alter;
+mod alter_project;
 mod any_all_rewrite;
 mod approx_count_distinct;
 mod approx_percentile;
@@ -653,6 +679,7 @@ pub mod pg_plan;
 mod pg_scalar_aliases;
 mod prepared;
 mod query_history;
+pub(crate) mod query_shape;
 mod procedure_ddl;
 mod range_udf;
 pub mod reactor_ddl;

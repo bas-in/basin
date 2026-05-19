@@ -15,6 +15,7 @@
 //! | [`memtable::MemTable`] | Per-`(project, table)` `BTreeMap` wrapped in `parking_lot::RwLock` |
 //! | [`memtable::MemRowValue`] | `Row { bytes, schema_version }` or `Tombstone` |
 //! | [`registry::MemTableRegistry`] | Process-wide `DashMap`; lazy allocation; per-project semaphore |
+//! | [`budget::MemTableConfig`] | Per-process memory budget configuration (Phase 5.14.C5) |
 //!
 //! ## Multi-tenant isolation
 //!
@@ -24,14 +25,20 @@
 //!
 //! ## Phase scope
 //!
-//! Phase 5.14.C1 ships this crate skeleton.  Integration with the write path
-//! (C2), read-merge path (C3), flush task (C4), and budget enforcement (C5)
-//! lands in subsequent sub-items.
+//! Phase 5.14.C1 ships the crate skeleton.  Phase 5.14.C5 adds the memory
+//! budget enforcement module (`budget.rs`) and extends `MemTableRegistry` with
+//! `try_reserve_bytes` / `release_bytes` / `largest_project`.  Integration with
+//! the write path (C2), read-merge path (C3), and flush task (C4) lands in
+//! subsequent sub-items.
 
+pub mod budget;
 pub mod memtable;
 pub mod registry;
 pub mod row_key;
 
+pub use budget::{FlushPolicy, MemTableConfig};
 pub use memtable::{MemRowValue, MemTable};
-pub use registry::{MemTableEntry, MemTableRegistry, ProjectMemState};
+pub use registry::{
+    FlushRequest, MemTableEntry, MemTableRegistry, ProjectMemState, ReservationOutcome,
+};
 pub use row_key::{RowKey, RowKeyBuilder};

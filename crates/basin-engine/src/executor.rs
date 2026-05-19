@@ -342,6 +342,21 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
         crate::pg_ast::reject_unsupported(&tree)?;
     }
 
+    // Phase 5.14.C5 — ALTER PROJECT <name> SET basin.memtable_hard_cap = <n>.
+    if let Some((project_name, hard_cap_bytes)) =
+        crate::alter_project::match_alter_project_memtable_cap(sql)?
+    {
+        crate::alter_project::exec_alter_project_memtable_cap(
+            sess,
+            &project_name,
+            hard_cap_bytes,
+        )
+        .await?;
+        return Ok(ExecResult::Empty {
+            tag: "ALTER PROJECT".into(),
+        });
+    }
+
     // Phase 5.8: Basin-specific ALTER TABLE extensions (`SET cold_after`,
     // `SET cold_age_column`, `SET BLOOM FILTERS ON (...)`, `CLUSTER BY`,
     // `RESET CLUSTER BY`).
@@ -2462,6 +2477,8 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
                 row_count: df.row_count,
                 column_stats: df.column_stats.clone(),
                 bloom_filters: df.bloom_filters.clone(),
+                hll_sketches: std::collections::BTreeMap::new(),
+                tdigest_sketches: std::collections::BTreeMap::new(),
             });
         }
 
@@ -2572,6 +2589,8 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
         row_count: df.row_count,
         column_stats: df.column_stats.clone(),
         bloom_filters: df.bloom_filters.clone(),
+        hll_sketches: std::collections::BTreeMap::new(),
+        tdigest_sketches: std::collections::BTreeMap::new(),
     };
 
     // ── Transaction-deferred path ────────────────────────────────────────
@@ -2891,6 +2910,8 @@ async fn exec_insert_select(
         row_count: written.row_count,
         column_stats: written.column_stats.clone(),
         bloom_filters: written.bloom_filters.clone(),
+        hll_sketches: std::collections::BTreeMap::new(),
+        tdigest_sketches: std::collections::BTreeMap::new(),
     };
 
     // Pre-commit: expose the new file to DataFusion so reactor hooks can
@@ -3057,6 +3078,8 @@ async fn exec_insert_default_values(
         row_count: df.row_count,
         column_stats: df.column_stats.clone(),
         bloom_filters: df.bloom_filters.clone(),
+        hll_sketches: std::collections::BTreeMap::new(),
+        tdigest_sketches: std::collections::BTreeMap::new(),
     };
 
     // Pre-commit: register the new file as "extra" so reactor hooks see it
@@ -4144,6 +4167,10 @@ async fn exec_select(
         .sql(sql_for_df)
         .await
         .map_err(|e| BasinError::internal(format!("plan: {e}")))?;
+
+    // Phase 5.16.A: compute query-shape hash (discarded here; 5.16.B routes it
+    // into the histogram registry).
+    let _shape = crate::query_shape::QueryShapeHash::of(df.logical_plan());
 
     // Phase 5.6: row-level security. The per-project policy lookup is gated
     // on the catalog's `rls_enabled` per table; tables with RLS off cost
