@@ -6,8 +6,9 @@
 
 <p align="center">
   <strong>Cheap Postgres on object storage.</strong><br>
-  A Postgres-compatible database that stores every byte as ZSTD-compressed Parquet on S3,
-  served by a single Apache DataFusion engine. Up to 12× smaller on disk, 47× less RAM
+  A Postgres-compatible database that stores every byte as Vortex-compressed
+  columnar files on S3 (Parquet is first-class selectable), served by a single
+  Apache DataFusion engine. Up to ~24× smaller on disk, 47× less RAM
   per connection, and spinning up a new project is a bucket-prefix away — no new VM,
   no per-DB minimum bill.
 </p>
@@ -30,7 +31,7 @@
 
 ## Why Basin
 
-**Storage is cheap because it lives on S3-compatible object storage.** Every table is columnar under a project prefix in your bucket of choice (Tigris, AWS S3, MinIO, local FS). The **default on-disk format is Vortex** (BtrBlocks compression cascade): **~1.95× smaller than ZSTD Parquet** on the audit-log dataset and ~59× smaller than a Postgres heap (see [`benchmark/RESULTS_vortex_migration.md`](./benchmark/RESULTS_vortex_migration.md)) — object storage at $0.015–$0.02/GB/mo means what costs $25/mo on Postgres-class block storage is well under $1/mo on Basin. The Vortex default is **correctness-verified**: zero regressions versus the prior Parquet baseline, validated by a Vortex⇆Parquet differential harness asserting byte-identical results across point / range / inequality / aggregate / GROUP BY / ORDER BY+LIMIT / IS NULL / compound / projection / DELETE / UPDATE on multi-file tables, plus the full SQL-support matrix and ORM-compat suite. **Verified perf vs Parquet** (`vortex_vs_parquet_smoke`, identical data in a Parquet and a Vortex table, median-of-5; debug build / LocalFS / audit-log schema — release + object-store would widen Vortex's edge): at 100k rows Vortex is **faster on 10 of 13 query shapes** — full-scan 1.11×, range 1.07×, inequality 1.19×, IS NULL 1.31×, string-eq 1.40×, compound 1.26×, filtered-aggregate 1.25×, ORDER BY+LIMIT 1.27× — and bare `COUNT/MIN/MAX/SUM` is answered from catalog stats with **zero file decode (~30–140×)**. Vortex's lead **grows with scale** (shapes at parity at 24k become wins at 100k). The two shapes where a mature Parquet reader still wins are single-row point lookups (~0.79×, a fixed per-file-open gap that shrinks with scale) and `GROUP BY` (~0.92×, near parity); for point-lookup-dominated tables **Parquet stays a first-class selectable format** via `CREATE TABLE … WITH (basin.file_format = 'parquet')` (also the Iceberg / Athena / Spark interchange path). See [ADR 0015](./docs/decisions/0015-vortex-storage-format.md).
+**Storage is cheap because it lives on S3-compatible object storage.** Every table is columnar under a project prefix in your bucket of choice (Tigris, AWS S3, MinIO, local FS). The **default on-disk format is Vortex** (BtrBlocks compression cascade): **~1.95× smaller than ZSTD Parquet** on the audit-log dataset and ~24× smaller than a Postgres heap — object storage at $0.015–$0.02/GB/mo means what costs $25/mo on Postgres-class block storage is well under $1/mo on Basin. The Vortex default is **correctness-verified**: a Vortex⇆Parquet differential harness asserts byte-identical results across the full 88-shape SQL battery (point / range / aggregate / GROUP BY / ORDER BY+LIMIT / IS NULL / windows / joins / set ops / DELETE / UPDATE / NULLIF / IS DISTINCT FROM / CTE / subquery / multi-file), plus the full SQL-support matrix and ORM-compat suite. **Release-mode perf vs Parquet** (`vortex_vs_parquet_smoke`, identical data, median-of-5, LocalFS): Vortex wins on **the majority of analytical shapes** including the huge `aggregate_full` metadata fast path (~15-40× via catalog stats, scaling up with data), four_way_join (~1.6×), three_way_join (~1.3×), inner_join (~1.4×), string_eq (~1.4×), is_null, math_chain, distinct_on, rollup, and percentile shapes. **Per-file catalog blooms** ([Phase 5.14.A](./TASK.md)) just flipped `point_eq` from a loss to a win at every scale (~1.05× at 100k, where it was ~0.49× pre-bloom). Remaining residuals — window-frame shapes, OR/IN/IS DISTINCT predicates, exact `COUNT(DISTINCT)`, raw substring-fn shapes — are documented as upstream-Vortex tracks or architectural (HTAP hot-tier in [Phase 5.14.C](./docs/decisions/0016-htap-hot-tier-architecture.md) closes the OLTP point-read floor on TB-scale tables). **Parquet stays a first-class selectable format** via `CREATE TABLE … WITH (basin.file_format = 'parquet')` (also the Iceberg / Athena / Spark interchange path). See [ADR 0015](./docs/decisions/0015-vortex-storage-format.md) and [ADR 0016](./docs/decisions/0016-htap-hot-tier-architecture.md).
 
 **Projects are essentially free to create.** A new project is a new bucket prefix. No fork-per-connection. No provisioned VM. No per-DB pricing minimum. Idle projects cost only their bytes. Spin up one project for a side app, or ten thousand for a SaaS — same architecture, same binary.
 
@@ -40,7 +41,7 @@
 
 **Object storage unlocks time travel.** Tables are Apache Iceberg snapshots; rollback to any prior snapshot is a metadata write. Forks are zero-copy. Point-in-time restore is a `rollback_to_snapshot` call. No WAL archive to manage, no base-backup-plus-replay dance.
 
-**One engine, one binary.** A single Apache DataFusion engine handles transactional point reads *and* analytical scans — the optional DuckDB analytical engine was removed; there is no second engine to coordinate with. Native vector search (`vector(N)` + `<->` / `<#>` / `<=>`, HNSW per Parquet segment — no `pg_vector` install). Analytical flexibility via Parquet projection/predicate pushdown with row-group + bloom-filter pruning, catalog-statistics file pruning (footer fetch skipped when the predicate prunes the file), and incremental pre-aggregation (`CREATE MATERIALIZED VIEW … WITH (basin.continuous)`). Signup / JWT / refresh-token auth and a PostgREST-shape HTTP API are part of the same server. `pg_cron`, `pg_net`, `pg_trgm`, `PostGIS` subset, `TimescaleDB`-style continuous aggregates, `pgcrypto`, `uuid-ossp` — all native crates, no extension install.
+**One engine, one binary.** A single Apache DataFusion engine handles transactional point reads *and* analytical scans. Native vector search (`vector(N)` + `<->` / `<#>` / `<=>`, HNSW per file segment — no `pg_vector` install). Analytical flexibility via Vortex (default) / Parquet projection + predicate pushdown, catalog-statistics file pruning (footer fetch skipped when the predicate prunes the file), per-file bloom filters on `basin.sort_by` columns (skips the file open entirely for absent literals), and incremental pre-aggregation (`CREATE MATERIALIZED VIEW … WITH (basin.continuous)`). Approximate-cardinality aggregates (`APPROX_COUNT_DISTINCT`) and approximate-quantile (`APPROX_PERCENTILE`) UDFs sit alongside their exact counterparts for dashboard workloads. Signup / JWT / refresh-token auth and a PostgREST-shape HTTP API are part of the same server. `pg_cron`, `pg_net`, `pg_trgm`, `PostGIS` subset, `TimescaleDB`-style continuous aggregates, `pgcrypto`, `uuid-ossp` — all native crates, no extension install.
 
 ---
 
@@ -135,8 +136,9 @@ SELECT id FROM docs ORDER BY embedding <-> '[...]' LIMIT 10;
 Confirm the data hit object storage under the project prefix:
 
 ```sh
-find /tmp/basin/projects -name '*.parquet'
-# /tmp/basin/projects/01HABCD…/tables/events/data/2026/05/01/01HEFG….parquet
+find /tmp/basin/projects -name '*.vortex'   # default format
+# /tmp/basin/projects/01HABCD…/tables/events/data/2026/05/01/01HEFG….vortex
+# Tables created with WITH (basin.file_format='parquet') write *.parquet instead.
 ```
 
 That's a real bucket-native database. The prefix is the IAM boundary; one bucket policy revokes all access to a project's data even if every other layer is bypassed.
@@ -160,13 +162,13 @@ Four layers, each with one job:
    WAL                        durable append path; flushes to object storage
           │
           ▼
-   Object storage + catalog   /projects/{id}/... Parquet + Iceberg-style metadata
+   Object storage + catalog   /projects/{id}/... Vortex (default) or Parquet + Iceberg-style metadata
                               local FS, S3, Tigris (S3-compatible) — same binary, different bucket
 ```
 
 The full architecture document is in [`docs/architecture.md`](./docs/architecture.md). Every "no" we've recorded is in [`docs/decisions/`](./docs/decisions/).
 
-**Built on:** Apache Arrow · Apache Iceberg (table format) · Apache Parquet · Apache DataFusion (SQL planner) · Tokio · pgwire-rs · openraft (single-process Raft WAL simulation today; cross-process distributed WAL is v0.2). Pure Rust, `#![forbid(unsafe_code)]` across every crate.
+**Built on:** Apache Arrow · Apache Iceberg (table format) · Vortex (default columnar format, LFAI incubation) · Apache Parquet (opt-in, interchange) · Apache DataFusion (SQL planner) · Tokio · pgwire-rs · openraft (single-process Raft WAL simulation today; cross-process distributed WAL is v0.2). Pure Rust, `#![forbid(unsafe_code)]` across every crate.
 
 Basin's query engine is built on [Apache DataFusion](https://datafusion.apache.org/), the open-source SQL query engine from the Apache Software Foundation. Basin does not fork DataFusion — every query plan runs through upstream operators with Basin-shaped rules layered on top (RLS injection, project isolation, partition pruning).
 
@@ -179,13 +181,13 @@ Basin's query engine is built on [Apache DataFusion](https://datafusion.apache.o
 - **Honest enforcement, not silent no-ops** — `CREATE UNIQUE INDEX` actually enforces uniqueness, `VARCHAR(n)`/`CHAR(n)` length is enforced, RLS `WITH CHECK` is enforced on write, `TABLESAMPLE` actually samples, advisory locks are real, and unsupported `CREATE TRIGGER` / `MERGE` honest-reject with a SQLSTATE instead of silently doing nothing. A wave of silent-corruption CRITICALs surfaced by the differential harness were fixed.
 - **Expanded SQL surface** — JSONPath (`jsonb_path_query`, `@?`, `@@`, `jsonb_path_query_array`); JSONB mutators (`jsonb_set`/`insert`/`strip_nulls`/`pretty`/`typeof`); `json_build_object`/`json_build_array`; INET/CIDR containment; `regexp_match`/`matches`/`split_to_array`/`split_to_table`, `format`, `encode`/`decode`; datetime `age`/`to_char`/`to_date`/`date_bin`; window `IGNORE NULLS`; `SAVEPOINT` / `ROLLBACK TO`; data-modifying CTEs; correlated + `LATERAL` joins (incl. `CROSS JOIN LATERAL generate_series`); bounded full-text search (`tsvector`/`tsquery`/`@@`); ordered-set aggregates (`percentile_disc`, `mode() WITHIN GROUP`); range/multirange arithmetic; real transaction semantics (deferred commits, `ROLLBACK` undo, SAVEPOINT stack, aborted state).
 - **Time travel** — Iceberg-style snapshots. `Catalog::rollback_to_snapshot(project, table, snapshot_id)` rewinds; `Catalog::fork_table(project, src, dst)` clones a table's metadata + snapshot history into a new sibling that diverges on next commit. Zero data copy until divergence.
-- **Native vector search** — `vector(N)` + `<->` / `<#>` / `<=>` operators, HNSW per Parquet segment. No `pg_vector`.
+- **Native vector search** — `vector(N)` + `<->` / `<#>` / `<=>` operators, HNSW per file segment. No `pg_vector`.
 - **Postgres-extension equivalents** — `pg_cron` (basin-cron), `pg_net` + `http` (basin-net), `pg_trgm` (basin-trgm), `PostGIS` subset (basin-geo), `TimescaleDB` continuous aggregates (basin-cv), `pgcrypto` + `uuid-ossp` UDFs.
 - **Auth + REST in the OSS bundle** — basin-auth (signup, JWT, refresh-token rotation, email-link login, per-project API keys) + basin-rest (PostgREST-shape CRUD, cursor pagination + NDJSON streaming, OpenAPI 3.0 schema generation at `GET /rest/v1/_openapi.json`). **`auth.uid()`**, **`auth.role()`**, **`auth.jwt()`** SQL session functions let you write Supabase-style RLS policies.
 - **Per-project connection URLs** — `POST /admin/v1/projects` returns `postgres://<user>:<password>@host:5433/<db>`. Password bcrypt-validated on every pgwire startup; mismatch → SQLSTATE `28P01`. Rotate via `POST /admin/v1/projects/{user}/rotate`.
 - **Durable catalog** — Iceberg-style catalog backed by Postgres when `BASIN_CATALOG=postgres://...`; tables, snapshots, project credentials, and `basin-auth`'s identity tables survive process restart.
-- **Cheap retention** — ZSTD-1 Parquet, 12.5× smaller than Postgres heap on audit-log data; A4 catalog `column_stats` skips footer fetches when the predicate prunes the file.
-- **Analytical path** — a single DataFusion engine (the optional DuckDB engine was removed) with Parquet projection/predicate pushdown, row-group + bloom-filter pruning, catalog-statistics file pruning (skips footer fetches when the predicate prunes the file), and incremental continuous materialized views. Heavy scans use stateless pooled compute over shared object storage — elastic scale-out without a second engine.
+- **Cheap retention** — Vortex (default, ~1.95× smaller than ZSTD Parquet) or Parquet, ~24× smaller than Postgres heap on audit-log data; per-file catalog `column_stats` + per-file bloom filters on `basin.sort_by` columns skip footer fetches and file opens when the predicate prunes the file.
+- **Analytical path** — a single DataFusion engine with Vortex/Parquet projection + predicate pushdown, catalog-statistics file pruning, per-file blooms, and incremental continuous materialized views. Approximate-cardinality and approximate-quantile UDFs (`APPROX_COUNT_DISTINCT`, `APPROX_PERCENTILE`) sit alongside exact counterparts for dashboard workloads. Heavy scans use stateless pooled compute over shared object storage — elastic scale-out without a second engine.
 - **Multi-schema isolation (phase A)** — `SchemaName` / `QualifiedTableName` types, a schema-aware in-memory *and* Postgres-backed catalog, a `basin_schemas` table, and `CREATE/DROP SCHEMA` + cross-schema queries with differential coverage. Phases B–E (full name resolution / search_path semantics / wider DDL) are still in progress — see Status.
 - **Operations** — connection pooling, per-project pgwire rate limiting (token-bucket via `governor`), cost-based query rejection (`BASIN_QUERY_COST_LIMIT_ROWS`), per-project counters (ops / bytes_read / bytes_written / errors / p99), OpenTelemetry traces wired through router → engine → shard → storage → WAL.
 
@@ -220,13 +222,15 @@ The header line of [`docs/sql-support.md`](./docs/sql-support.md) reports **697 
 | Phase | Description | Status |
 |---|---|---|
 | **0** | Validate the wedge — customer interviews, design partners | **open** (the gate; engineering is mature enough to need customer signal next) |
-| **1** | Storage substrate — Parquet on object_store, Iceberg-style catalog | **shipped** |
+| **1** | Storage substrate — Vortex (default) / Parquet on object_store, Iceberg-style catalog | **shipped** |
 | **2** | WAL service — sub-5 ms write acks | **v0.1 shipped** (single-node; Raft is v0.2) |
 | **3** | Shard owners — per-project state, eviction, compactor | **v0.1 shipped** (in-process; placement service is v0.2) |
 | **4** | Routers + SQL — pgwire v3, extended query, TLS, COPY, native JSONB / UUID binding | **shipped** — real single-shard transaction semantics (deferred commits, `ROLLBACK` undo, `SAVEPOINT` stack, aborted state) landed; cross-shard 2PC remains v0.2 (ADR 0011) |
 | **4.5** | PostgreSQL SQL-compatibility push — silent-corruption CRITICAL fixes, JSONPath / JSONB-mutating / INET-CIDR / regexp / datetime function families, correct NUMERIC + ARRAY binary wire formats, PG-oracle differential harness (`differential_pg.rs`) | **shipped** — Default config at ~91% / ~94% non-excluded (629/667); long-tail exotic-DDL parser gaps remain v0.2 |
-| **5** | Analytical path — single DataFusion engine (DuckDB removed), Parquet pushdown + bloom/row-group + catalog pruning, continuous pre-aggregation | **v0.1 shipped** |
-| **5.0a** | Vortex storage format — ~1.95× smaller than ZSTD Parquet; faster on 10/13 query shapes at 100k, `COUNT/MIN/MAX/SUM` ~30–140× via catalog-stats metadata path | **shipped as the DEFAULT**, zero-regression vs the Parquet baseline (Vortex⇆Parquet differential + full SQL-matrix + ORM-compat green). Vortex's lead grows with scale; only point-lookup (~0.79×) and GROUP BY (~0.92×) still favour Parquet. Parquet first-class per-table via `WITH (basin.file_format='parquet')` ([ADR 0015](./docs/decisions/0015-vortex-storage-format.md)) |
+| **5** | Analytical path — single DataFusion engine, Vortex/Parquet pushdown + per-file bloom + catalog pruning, continuous pre-aggregation, `APPROX_COUNT_DISTINCT`/`APPROX_PERCENTILE` UDFs | **v0.1 shipped** |
+| **5.0a** | Vortex storage format — ~1.95× smaller than ZSTD Parquet; `aggregate_full` ~15–40× via catalog-stats metadata path; per-file blooms flip `point_eq` from a loss to a win at every scale; majority of analytical shapes win in release-mode smoke | **shipped as the DEFAULT** ([ADR 0015](./docs/decisions/0015-vortex-storage-format.md)), zero-regression vs Parquet baseline (Vortex⇆Parquet differential + full SQL-matrix + ORM-compat green). Parquet first-class per-table via `WITH (basin.file_format='parquet')` (Iceberg / Athena / Spark interchange path). HTAP hot-tier ([ADR 0016](./docs/decisions/0016-htap-hot-tier-architecture.md)) is Phase 5.14.C — closes the residual OLTP point-read floor on TB-scale tables. |
+| **5.14** | Durable Basin moat — per-file catalog blooms (shipped), `APPROX_COUNT_DISTINCT` + `APPROX_PERCENTILE` UDFs (shipped), catalog-aware `WindowExec` sort-elision (shipped), HTAP hot-tier ([ADR 0016](./docs/decisions/0016-htap-hot-tier-architecture.md), in progress), adaptive multi-sort + query history (in progress). The 3-month investment that is **not** subsumed by upstream Vortex / DataFusion improvements. | **in flight** — A/B3/D3 sub-items shipped 2026-05-19; HTAP C1-C6 next |
+| **5.15** | Unified docs platform — OSS-repo markdown with YAML frontmatter ([spec](./docs/frontmatter-spec.md)), `basin-cloud` webapp consumes via `npm run dev:docs` build-time fetch | **OSS side shipped** (5.15.A/B/C, frontmatter spec + 24-doc migration + top-level index + CI gate); `basin-cloud` webapp side (5.15.E–I) deferred to that repo |
 | **5.5** | Sharding axes — partitioning, compute sharding, tiered storage | **shipped** |
 | **5.6** | RLS with `CREATE POLICY` (UNION / CTE coverage) | **shipped** |
 | **5.7** | Caches + bloom + A4 catalog stats + B2 cluster-by + B3 row-group sizing | **shipped**; B1 secondary indexes is the biggest open perf win (~8 weeks) |
@@ -254,7 +258,7 @@ Neon is serverless Postgres with branching — terrific for **single-DB workload
 
 ### vs Supabase
 
-Supabase is "BaaS in a box" — Postgres + Auth + Edge Functions + Storage + Realtime. Basin covers the same SQL + Auth + REST surface in one binary, with `auth.uid()` / `auth.role()` / `auth.jwt()` working identically. Where Basin differs is the data-layer economics: Parquet on S3 instead of Postgres heap on block storage. Multi-project SaaS that has outgrown Supabase's per-project pricing can migrate the database to Basin via pgwire and keep Supabase Auth, Edge Functions, and Realtime for the parts of the stack they handle well — or run entirely on Basin using basin-auth and basin-rest. Edge Functions / Realtime / Storage are out of scope per ADRs 0005/0006.
+Supabase is "BaaS in a box" — Postgres + Auth + Edge Functions + Storage + Realtime. Basin covers the same SQL + Auth + REST surface in one binary, with `auth.uid()` / `auth.role()` / `auth.jwt()` working identically. Where Basin differs is the data-layer economics: Vortex/Parquet on S3 instead of Postgres heap on block storage. Multi-project SaaS that has outgrown Supabase's per-project pricing can migrate the database to Basin via pgwire and keep Supabase Auth, Edge Functions, and Realtime for the parts of the stack they handle well — or run entirely on Basin using basin-auth and basin-rest. Edge Functions / Realtime / Storage are out of scope per ADRs 0005/0006.
 
 ### vs Turso / libSQL
 
@@ -262,7 +266,7 @@ Turso is the right answer for **edge-distributed apps** with many tiny SQLite-cl
 
 ### vs ClickHouse / DuckDB / data-warehouse
 
-ClickHouse and DuckDB are analytical engines — phenomenal at OLAP scans, not designed for transactional point reads or per-row inserts. Basin handles analytics on a single DataFusion engine (the optional DuckDB analytical engine was removed): Parquet projection/predicate pushdown with row-group + bloom-filter pruning skips data before the object-store GET, catalog-statistics file pruning skips irrelevant files entirely, and incremental continuous materialized views make expensive aggregations nearly free at query time. Stateless pooled compute over shared object storage adds elastic scale-out for the residual heavy scans — enabled precisely because there is no embedded second engine to coordinate with.
+ClickHouse and DuckDB are analytical engines — phenomenal at OLAP scans, not designed for transactional point reads or per-row inserts. Basin handles analytics on a single DataFusion engine: Vortex (default) / Parquet projection + predicate pushdown skips data before the object-store GET, catalog-statistics file pruning + per-file blooms on `basin.sort_by` columns skip irrelevant files entirely, and incremental continuous materialized views make expensive aggregations nearly free at query time. Approximate-cardinality / quantile UDFs (`APPROX_COUNT_DISTINCT`, `APPROX_PERCENTILE`) cover the dashboard-workload shapes. Stateless pooled compute over shared object storage adds elastic scale-out for the residual heavy scans. The HTAP hot-tier ([ADR 0016](./docs/decisions/0016-htap-hot-tier-architecture.md)) is what closes the OLTP point-read floor on TB-scale tables — the missing piece that lets Basin span both OLAP and OLTP without a second engine.
 
 ### Where Basin is *not* the answer
 
@@ -280,9 +284,9 @@ Per the ADRs:
 ## Use cases
 
 - **Multi-environment apps** — dev / staging / prod / per-region as cheap projects on one cluster. See [`docs/multi-project.md`](./docs/multi-project.md) for the multi-project SaaS story (per-customer-project isolation, noisy-neighbor scheduler, RLS with `auth.uid()`, cost math at 10k projects).
-- **Audit / event logs** — ZSTD-Parquet compression makes append-mostly workloads dramatically cheaper than Postgres heap.
+- **Audit / event logs** — Vortex BtrBlocks compression (~1.95× smaller than ZSTD Parquet, ~24× smaller than Postgres heap) makes append-mostly workloads dramatically cheaper than Postgres heap.
 - **AI agent / RAG platforms** — native `vector(N)` + HNSW alongside transactional rows in the same database.
-- **Document / activity stores** — write-cheap, analytical-read-occasionally workloads where Parquet pushdown pruning and continuous pre-aggregation keep analytical queries fast without a second engine.
+- **Document / activity stores** — write-cheap, analytical-read-occasionally workloads where Vortex/Parquet pushdown pruning, catalog blooms, and continuous pre-aggregation keep analytical queries fast without a second engine.
 - **Projected SaaS** — one Basin cluster replaces hundreds of separate Postgres / Neon / Supabase projects with their per-project minimums. See [`docs/multi-project.md`](./docs/multi-project.md).
 
 If you're a single-app developer building a side project, **use Postgres or the Free tier above**. The cost math doesn't show its full effect until you have multiple projects or multi-GB tables.
@@ -307,10 +311,10 @@ Basin (this repo) is the data plane. Three sibling repos sit around it:
 ```
 crates/
   basin-common      shared types, errors, telemetry
-  basin-storage     Parquet + object_store under project prefixes
+  basin-storage     Vortex (default) / Parquet + object_store under project prefixes
   basin-catalog     Iceberg-style catalog (in-memory + Postgres-backed durable)
   basin-wal         file-backed WAL (Raft-backed in v0.2)
-  basin-shard       in-process shard owner with WAL → Parquet compactor
+  basin-shard       in-process shard owner with WAL → Vortex/Parquet compactor
   basin-engine      single DataFusion engine — point reads + analytical pool, per-project sessions
   basin-router      pgwire v3 (simple + extended query)
   basin-vector      native HNSW vector search
@@ -356,4 +360,4 @@ Contributions welcome. The project is opinionated about scope ([`docs/decisions/
 
 ## Keywords for search
 
-Basin is a **Postgres-compatible database on object storage**, with **ZSTD-compressed Apache Parquet** storage, an **Apache Iceberg** catalog, a file-backed WAL with a Raft WAL simulation toward distributed v0.2, **native vector search** (HNSW), and **pgwire** protocol support that works with `psql`, `tokio-postgres`, `asyncpg`, JDBC, Diesel, SeaORM, and any other Postgres driver. Basin compares to **Postgres**, **Neon**, **Supabase**, **Turso**, **PlanetScale**, **Aurora**, and **CockroachDB** for cheap-storage SaaS, audit-log, RAG / vector, and multi-project use cases. Self-hostable, **Apache-2.0** licensed, written in **Rust**.
+Basin is a **Postgres-compatible database on object storage**, with **Vortex** (default columnar, LFAI) and **Apache Parquet** (opt-in, interchange) storage, an **Apache Iceberg** catalog, a file-backed WAL with a Raft WAL simulation toward distributed v0.2, **native vector search** (HNSW), per-file **catalog bloom filters** for point-query pruning, **HTAP hot tier** on the roadmap ([ADR 0016](./docs/decisions/0016-htap-hot-tier-architecture.md)), and **pgwire** protocol support that works with `psql`, `tokio-postgres`, `asyncpg`, JDBC, Diesel, SeaORM, and any other Postgres driver. Basin compares to **Postgres**, **Neon**, **Supabase**, **Turso**, **PlanetScale**, **Aurora**, **ClickHouse**, **SingleStore**, **DuckDB**, and **CockroachDB** for cheap-storage SaaS, audit-log, RAG / vector, HTAP, and multi-project use cases. Self-hostable, **Apache-2.0** licensed, written in **Rust**.
