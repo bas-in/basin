@@ -6,6 +6,28 @@ that would let someone re-litigate it later.
 
 ---
 
+## 2026-05-19 — Worktree base divergence: merge --no-ff handles it, but watch for conflicts
+
+**Observation:** Worker agents launched in worktree isolation get a working
+tree based on the parent agent's HEAD at Agent() invocation time, but the
+underlying branch may parent off an earlier commit than current main. T-002's
+branch parented directly off the initial commit (`1141f75`) rather than
+post-T-001 main, despite being dispatched after T-001 merged. The merge
+worked cleanly because T-001 and T-002 modified non-overlapping regions of
+the same files.
+
+**What to do:** Keep dispatching agents normally (the `--no-ff` 3-way merge
+handles non-overlapping edits even when bases diverge), but if two tasks
+modify the same region of the same file, serialise them (wait for one to
+merge before dispatching the next). The TASKS.md file-conflict guard is
+working — keep using it.
+
+**Gotcha:** the main checkout's pwd can silently switch to a worktree
+directory after a merge. Always use `git -C /Users/pc/code/exo/basin-js …`
+or explicit `cd` to ensure operations land on main.
+
+---
+
 ## 2026-05-19 — Autonomous v0.2 execution: 2 sonnet agents in worktrees, 15-min loop, 4-hour window
 
 **Choice:** Run forward-task execution autonomously: launch up to 2 Sonnet

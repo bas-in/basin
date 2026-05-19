@@ -60,7 +60,12 @@ break today.
 
 ---
 
-### T-002 — `.stream()` modifier returning `AsyncIterable<Row>`
+### T-002 — `.stream()` modifier returning `AsyncIterable<Row>` ✅
+
+**Status:** done 2026-05-19. `stream()` method ships on `PostgrestQueryBuilder`,
+returns `AsyncIterable<T>` (NOT PromiseLike). 4 new tests in
+`src/postgrest/builder.test.ts`. Merged cleanly with T-001's `#execute()`
+NDJSON branch despite worktree base divergence.
 
 **Files:** `src/postgrest/builder.ts`, `src/postgrest/builder.test.ts`,
 `src/postgrest/types.ts`
