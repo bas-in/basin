@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use datafusion::common::{Result, tree_node::{Transformed, TreeNode}};
 use datafusion::logical_expr::{
-    Expr, Filter, LogicalPlan,
+    Expr, Filter, LogicalPlan, Projection,
     logical_plan::Union,
 };
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
@@ -201,6 +201,36 @@ fn try_collapse(union: Union) -> Result<Transformed<LogicalPlan>> {
 
             let filter = Filter::try_new(combined, scan)?;
             Arc::new(LogicalPlan::Filter(filter))
+        };
+
+        // Re-wrap with the original projection if the first branch had one.
+        //
+        // DataFusion's optimizer asserts that a rule preserves the output
+        // schema of the node it rewrites.  When each Union branch is
+        // `Projection([id], Filter(Scan t, pred))`, collapsing to
+        // `Filter(Scan t, pred_a OR pred_b)` widens the schema from
+        // `{id}` to all columns — triggering the invariant check and
+        // failing with a schema-mismatch error.
+        //
+        // If `inputs[first_idx]` has a narrower schema than `merged_plan`
+        // (the full-table scan), that narrowing came from an outer
+        // Projection in the original branch.  We restore it here so the
+        // final plan still outputs only the columns the query requested.
+        //
+        // `Projection::new_from_schema` is used (rather than `try_new`)
+        // because it preserves the exact output qualifier from the branch
+        // schema (e.g. `qualifier: None` for an unqualified `id`).  A plain
+        // `try_new` with unqualified column refs would inherit the qualifier
+        // from the input scan (`Some(Bare{"tp"})`), causing a second schema
+        // mismatch.
+        let merged_plan: Arc<LogicalPlan> = {
+            let branch_schema = Arc::clone(inputs[first_idx].schema());
+            if *branch_schema != **merged_plan.schema() {
+                let proj = Projection::new_from_schema(merged_plan, branch_schema);
+                Arc::new(LogicalPlan::Projection(proj))
+            } else {
+                merged_plan
+            }
         };
 
         // Mark all group members as consumed.

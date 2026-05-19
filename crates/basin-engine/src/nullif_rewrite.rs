@@ -13,17 +13,24 @@
 //! `NULLIF`s before we get a chance to see them in their original form.
 
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule, optimizer::ApplyOrder};
-use datafusion::common::{DFSchema, Result, ScalarValue, tree_node::{Transformed, TreeNode}};
+use datafusion::common::{Result, tree_node::{Transformed, TreeNode}};
 use datafusion::logical_expr::expr::Case;
-use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan};
+use datafusion::logical_expr::{Expr, LogicalPlan};
 
 /// Rewrites every `NULLIF(arg0, arg1)` in a `LogicalPlan` to
-/// `CASE WHEN arg0 = arg1 THEN NULL ELSE arg0 END`.
+/// `CASE WHEN arg0 <> arg1 THEN arg0 END` (no ELSE, so unmatched rows are NULL).
 ///
 /// This is a semantics-preserving identity: SQL defines `NULLIF(V, X)` as
-/// returning NULL when `V = X` and returning `V` otherwise.  The rewrite
-/// makes the expression visible to DataFusion's Vortex expression convertor
-/// so it can be pushed down through the Vortex file-read path.
+/// returning NULL when `V = X` and returning `V` otherwise — exactly what the
+/// no-ELSE CASE form delivers.  The rewrite makes the expression visible to
+/// DataFusion's Vortex expression convertor so it can be pushed down through
+/// the Vortex file-read path.
+///
+/// The no-ELSE form is used (rather than `CASE WHEN arg0 = arg1 THEN NULL ELSE
+/// arg0 END`) because Vortex's CaseWhen evaluator requires every THEN/ELSE
+/// branch to share the same base dtype.  An untyped-null THEN literal
+/// (`DataType::Null`) would not match the arg0 dtype (e.g. `Int64`), causing a
+/// runtime panic in Vortex's dtype-compatibility check.
 #[derive(Debug, Default)]
 pub(crate) struct NullifRewrite;
 
@@ -43,24 +50,15 @@ impl OptimizerRule for NullifRewrite {
         plan: LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
-        // Build the merged schema from all inputs so column references resolve.
-        let input_schema = datafusion::logical_expr::utils::merge_schema(&plan.inputs());
-        plan.map_expressions(|expr: Expr| {
-            expr.transform_up(|e| rewrite_nullif_expr(e, &input_schema))
-        })
+        plan.map_expressions(|expr: Expr| expr.transform_up(rewrite_nullif_expr))
     }
 }
 
 /// Rewrite a single `NULLIF(arg0, arg1)` call to an equivalent `CASE` expr.
 ///
-/// `NULLIF(arg0, arg1)` rewrites to `CASE WHEN arg0 = arg1 THEN <null> ELSE arg0 END`
-/// where `<null>` is a typed null whose type matches `arg0`.  The typed null is
-/// needed because the CASE expression may reach the Vortex expression convertor
-/// before DataFusion's type-coercion pass can resolve untyped `ScalarValue::Null`.
-///
 /// Any expression that is not a two-argument `nullif` scalar function is
 /// returned unchanged (`Transformed::no`).
-fn rewrite_nullif_expr(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
+fn rewrite_nullif_expr(expr: Expr) -> Result<Transformed<Expr>> {
     match &expr {
         Expr::ScalarFunction(sf) if sf.name().eq_ignore_ascii_case("nullif") => {
             // nullif is always called with exactly 2 arguments; guard anyway.
@@ -71,24 +69,25 @@ fn rewrite_nullif_expr(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr
             let arg0 = sf.args[0].clone();
             let arg1 = sf.args[1].clone();
 
-            // Derive the return type of NULLIF — same as arg0's type — so the
-            // THEN-branch null is typed.  This prevents the Vortex expression
-            // convertor from seeing a bare `null` alongside a typed ELSE branch
-            // and panicking on a type mismatch.
-            let null_scalar = match arg0.get_type(schema) {
-                Ok(dt) => ScalarValue::try_from(&dt).unwrap_or(ScalarValue::Null),
-                Err(_) => ScalarValue::Null,
-            };
-
-            // CASE WHEN arg0 = arg1 THEN NULL::<type> ELSE arg0 END
-            let when_expr = Box::new(arg0.clone().eq(arg1));
-            let then_expr = Box::new(Expr::Literal(null_scalar, None));
-            let else_expr = Some(Box::new(arg0));
+            // CASE WHEN arg0 <> arg1 THEN arg0 END
+            //
+            // The no-ELSE form (implicit NULL for non-matching rows) is
+            // semantically identical to `NULLIF(arg0, arg1)` and avoids
+            // placing an untyped `NULL` literal in a THEN branch.  Vortex's
+            // CaseWhen evaluator requires every THEN/ELSE branch to share the
+            // same base dtype; an untyped-null THEN literal (DataType::Null)
+            // doesn't match the arg0 dtype (e.g. Int64) and causes a runtime
+            // panic inside Vortex's dtype-compatibility check.  Using the
+            // inverted condition with no ELSE sidesteps the issue entirely
+            // because the only typed branch is `arg0`, whose dtype Vortex can
+            // infer at expression-build time.
+            let when_expr = Box::new(arg0.clone().not_eq(arg1));
+            let then_expr = Box::new(arg0);
 
             let case_expr = Expr::Case(Case {
                 expr: None,
                 when_then_expr: vec![(when_expr, then_expr)],
-                else_expr,
+                else_expr: None,
             });
 
             Ok(Transformed::yes(case_expr))
@@ -108,14 +107,14 @@ mod tests {
     use std::sync::Arc;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::functions::core::nullif as make_nullif_udf;
-    use datafusion::optimizer::OptimizerContext;
+    use datafusion::optimizer::{OptimizerConfig, OptimizerContext};
     use datafusion::common::Result;
     use datafusion::logical_expr::expr::ScalarFunction;
     use datafusion::logical_expr::logical_plan::builder::LogicalTableSource;
     use datafusion::logical_expr::{col, lit, Filter, LogicalPlan, LogicalPlanBuilder};
 
     /// Build a simple `Filter(NULLIF(col_k, lit(0)) IS NOT NULL, Scan t)` plan,
-    /// apply the rule directly, and assert the NULLIF was expanded to a typed CASE.
+    /// apply the rule directly, and assert the NULLIF was expanded to CASE.
     #[test]
     fn nullif_in_filter_becomes_case() -> Result<()> {
         let schema = Arc::new(Schema::new(vec![
