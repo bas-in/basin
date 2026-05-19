@@ -1,0 +1,16 @@
+[package]
+name = "basin-sketch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# basin-sketch carries no Basin-internal deps so it can be consumed by
+# basin-storage (writer-side, Phase 5.14.B2) and basin-engine
+# (query-time merge, Phase 5.14.B5) without any dependency-direction
+# inversion.  External deps only.

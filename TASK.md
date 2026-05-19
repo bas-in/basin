@@ -1115,20 +1115,20 @@ metadata + footer open + decode.
 Design spec is complete (was task #23 in an earlier sweep). Storage
 layer lives in `crates/basin-catalog/src/metadata.rs` (`DataFileRef`).
 
-- [ ] **5.14.A1** Add `bloom_filters: HashMap<ColumnName, SerializedBloom>`
+- [x] **5.14.A1** Add `bloom_filters: BTreeMap<String, Vec<u8>>` (shipped `ae6460a`)
       field to `DataFileRef`. Files: `crates/basin-catalog/src/metadata.rs`.
       Acceptance gate: round-trip serialise/deserialise via InMemory +
       Postgres impls.
-- [ ] **5.14.A2** Writer-side bloom computation for declared
+- [x] **5.14.A2** Writer-side bloom computation for declared (shipped `50b9306`)
       `basin.sort_by` columns. Files: `crates/basin-storage/src/writer.rs`.
       Acceptance gate: every committed file with `basin.sort_by` set
       carries blooms for those columns.
-- [ ] **5.14.A3** Probe in `execute_simple_select` before file open.
+- [x] **5.14.A3** Probe in `execute_simple_select` before file open (shipped `50b9306`).
       Files: `crates/basin-engine/src/fast_select.rs`. Acceptance gate:
       the `point_eq` miss shape in `vortex_vs_parquet_smoke` drops file
       opens to zero (count via a perf counter exported through
       `Engine::project_counters`).
-- [ ] **5.14.A4** Differential test: bloom false-negative rate is zero
+- [x] **5.14.A4** Differential test: bloom false-negative rate is zero (shipped `c5739a6` — CRITICAL: closed the fastbloom random-seed false-negative bug)
       (a bloom that says "definitely not present" must never be wrong);
       bloom false-positive rate is bounded by configured target.
       Files: `tests/integration/tests/catalog_blooms.rs`. Acceptance
@@ -1180,12 +1180,12 @@ approximation alternative. Sketches merge across files at query time.
       with `basin.sort_by` set carries sketches for those columns;
       writer overhead ≤ 5 % of total write time on a 100 k-row insert;
       `vortex_parquet_differential` continues to pass.  Depends on B1.
-- [ ] **5.14.B3** `APPROX_COUNT_DISTINCT(col)` UDF — merges HLLs from
+- [x] **5.14.B3** `APPROX_COUNT_DISTINCT(col)` UDF (shipped `fc00a41`; inline HLL — Phase 5.14.B1 hoists into basin-sketch; query-time fast path is B5)
       catalog-pruned files and returns estimate. Files:
       `crates/basin-engine/src/udfs/approx.rs` (new module).
       Acceptance gate: ≤2% error vs exact `COUNT(DISTINCT col)` on the
       88-shape battery.
-- [ ] **5.14.B4** `APPROX_PERCENTILE(col, p)` UDF — merges t-digests
+- [x] **5.14.B4** `APPROX_PERCENTILE(col, p)` UDF (shipped `4935115`; inline t-digest — Phase 5.14.B1 hoists into basin-sketch; query-time fast path is B5)
       and returns quantile. Files: `crates/basin-engine/src/udfs/approx.rs`.
       Acceptance gate: ≤1% absolute error vs exact `percentile_cont(p)`
       on the 88-shape battery.
@@ -1355,7 +1355,7 @@ planning input that upstream cannot see. Closes `order_by_multi`,
       shape in `vortex_vs_parquet_smoke` improves ≥ 2× after a
       compaction sweep on a table with `adaptive_sort_override=true`
       and no `cluster_columns`.
-- [ ] **5.14.D3** Catalog-aware `WindowExec` — custom DataFusion
+- [x] **5.14.D3** Catalog-aware `WindowExec` (shipped `ee80b36` + `1b86751`) — custom DataFusion
       `ExecutionPlan` that consults `basin.sort_by` / discovered
       file-sort-order via the catalog and skips the full sort when the
       window's `PARTITION BY` matches. Files:

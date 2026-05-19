@@ -20,6 +20,7 @@ members = [
     "crates/basin-geo",
     "crates/basin-trgm",
     "crates/basin-iceberg-rest",
+    "crates/basin-sketch",
     "services/basin-server",
     "services/basinctl",
     "tests/integration",
@@ -42,6 +43,11 @@ basin-shard = { path = "crates/basin-shard" }
 basin-router = { path = "crates/basin-router" }
 basin-placement = { path = "crates/basin-placement" }
 basin-engine = { path = "crates/basin-engine" }
+# Phase 5.14.B1 lock-in (2026-05-19) — hoisted HLL + t-digest types.
+# Depended on by basin-storage (writer-side sketch computation, B2)
+# AND basin-engine (query-time merge fast path, B5).  See
+# docs/decisions/0017-query-shape-privacy.md and TASK.md 5.14.B1.
+basin-sketch = { path = "crates/basin-sketch" }
 basin-cron = { path = "crates/basin-cron" }
 basin-vector = { path = "crates/basin-vector" }
 basin-pool = { path = "crates/basin-pool" }
@@ -145,6 +151,12 @@ clap = { version = "4", features = ["derive"] }
 rand = "0.8"
 # Regex engine used by regexp_match / regexp_split_to_array UDFs in basin-engine.
 regex = "1"
+# Phase 5.16.A lock-in (2026-05-19, ADR 0017).  Cross-process / cross-
+# Rust-version stable 64-bit hash function used by QueryShape.  Seeded
+# with the fixed BASIN_QUERY_SHAPE_SEED constant.  Rejected
+# std::DefaultHasher (unstable across Rust versions) and fnv1a-64
+# (too weak at cloud-scale).
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 # Test-config file parsing for tests/integration/src/test_config.rs.
 # Tiny, well-maintained, default features off to keep build minimal.
 toml = { version = "0.8", default-features = false, features = ["parse"] }
