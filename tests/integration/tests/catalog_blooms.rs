@@ -186,6 +186,8 @@ async fn write_and_commit(
         row_count: df.row_count,
         column_stats: df.column_stats,
         bloom_filters: df.bloom_filters,
+        hll_sketches: ::std::collections::BTreeMap::new(),
+        tdigest_sketches: ::std::collections::BTreeMap::new(),
     };
     let updated = engine
         .config()

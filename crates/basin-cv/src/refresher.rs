@@ -388,6 +388,8 @@ impl CvRefresher {
             row_count: written.row_count,
             column_stats: written.column_stats.clone(),
             bloom_filters: ::std::collections::BTreeMap::new(),
+            hll_sketches: ::std::collections::BTreeMap::new(),
+            tdigest_sketches: ::std::collections::BTreeMap::new(),
         }];
         catalog
             .replace_data_files(
@@ -540,6 +542,8 @@ impl CvRefresher {
             row_count: written.row_count,
             column_stats: written.column_stats.clone(),
             bloom_filters: ::std::collections::BTreeMap::new(),
+            hll_sketches: ::std::collections::BTreeMap::new(),
+            tdigest_sketches: ::std::collections::BTreeMap::new(),
         }];
         catalog
             .replace_data_files(

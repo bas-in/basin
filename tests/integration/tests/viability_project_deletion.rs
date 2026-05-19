@@ -101,6 +101,8 @@ async fn viability_4_project_deletion() {
             size_bytes: f.size_bytes,
             row_count: f.row_count,
             column_stats: f.column_stats.clone(),
+            hll_sketches: ::std::collections::BTreeMap::new(),
+            tdigest_sketches: ::std::collections::BTreeMap::new(),
         });
     }
     // Register every file with the catalog in one append so the

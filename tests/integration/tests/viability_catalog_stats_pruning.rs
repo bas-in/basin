@@ -252,12 +252,16 @@ async fn viability_catalog_stats_prunes_file_without_footer_fetch() {
             size_bytes: df_a.size_bytes,
             row_count: df_a.row_count,
             column_stats: df_a.column_stats.clone(),
+            hll_sketches: ::std::collections::BTreeMap::new(),
+            tdigest_sketches: ::std::collections::BTreeMap::new(),
         },
         DataFileRef {
             path: df_b.path.as_ref().to_string(),
             size_bytes: df_b.size_bytes,
             row_count: df_b.row_count,
             column_stats: df_b.column_stats.clone(),
+            hll_sketches: ::std::collections::BTreeMap::new(),
+            tdigest_sketches: ::std::collections::BTreeMap::new(),
         },
     ];
     catalog

@@ -466,6 +466,8 @@ fn extract_added_files(snapshot: &IcebergSnapshot) -> Result<Vec<DataFileRef>, I
             row_count: row_counts.get(i).copied().unwrap_or(0),
             column_stats: Default::default(),
             bloom_filters: ::std::collections::BTreeMap::new(),
+            hll_sketches: ::std::collections::BTreeMap::new(),
+            tdigest_sketches: ::std::collections::BTreeMap::new(),
         });
     }
     Ok(out)

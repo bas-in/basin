@@ -113,6 +113,8 @@ async fn scaling_4_noisy_neighbor() {
                     size_bytes: q_df.size_bytes,
                     row_count: q_df.row_count,
                     column_stats: q_df.column_stats.clone(),
+                    hll_sketches: ::std::collections::BTreeMap::new(),
+                    tdigest_sketches: ::std::collections::BTreeMap::new(),
                 }],
             )
             .await
@@ -139,6 +141,8 @@ async fn scaling_4_noisy_neighbor() {
             size_bytes: df.size_bytes,
             row_count: df.row_count,
             column_stats: df.column_stats.clone(),
+            hll_sketches: ::std::collections::BTreeMap::new(),
+            tdigest_sketches: ::std::collections::BTreeMap::new(),
         });
     }
     {

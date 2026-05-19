@@ -172,6 +172,8 @@ async fn s3_large_dataset_pointquery() {
             size_bytes: df.size_bytes,
             row_count: df.row_count,
             column_stats: df.column_stats.clone(),
+            hll_sketches: ::std::collections::BTreeMap::new(),
+            tdigest_sketches: ::std::collections::BTreeMap::new(),
         });
     }
     let seed_elapsed = seed_started.elapsed();

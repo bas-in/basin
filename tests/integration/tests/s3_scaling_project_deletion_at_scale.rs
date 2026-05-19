@@ -171,6 +171,8 @@ async fn measure_basin_ms(
             size_bytes: f.size_bytes,
             row_count: f.row_count,
             column_stats: f.column_stats.clone(),
+            hll_sketches: ::std::collections::BTreeMap::new(),
+            tdigest_sketches: ::std::collections::BTreeMap::new(),
         });
     }
     catalog

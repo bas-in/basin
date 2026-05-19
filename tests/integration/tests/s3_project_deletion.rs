@@ -139,6 +139,8 @@ async fn s3_project_deletion() {
             size_bytes: f.size_bytes,
             row_count: f.row_count,
             column_stats: f.column_stats.clone(),
+            hll_sketches: ::std::collections::BTreeMap::new(),
+            tdigest_sketches: ::std::collections::BTreeMap::new(),
         });
     }
     // Single catalog append registers every file in one snapshot —

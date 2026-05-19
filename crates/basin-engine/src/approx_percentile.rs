@@ -1,30 +1,16 @@
 //! `APPROX_PERCENTILE(col, p)` — approximate percentile aggregate UDF.
 //!
-//! Uses a minimal t-digest implementation written inline (~200 lines) so
-//! there are zero external crate dependencies beyond what the workspace
-//! already declares, and no serialization issues with external types.
+//! Uses the t-digest implementation from `basin-sketch` (hoisted in Phase
+//! 5.14.B1 from the inline definition that lived here).
 //!
 //! ## Algorithm
-//! - Merging t-digest with a fixed compression factor `delta = 100`
-//!   (≈ 200 centroids worst-case). Standard accuracy guarantee: ≤ 1 % error
-//!   on uniformly distributed data for p ∈ (0.01, 0.99).
-//! - Centroids are sorted by mean and cumulatively merged when
-//!   `size_limit(k, delta)` is exceeded (standard Dunning 2019 formulation).
-//! - Serialization: `n` centroids encoded as 16 bytes each (mean: f64 LE,
-//!   weight: f64 LE) prefixed by an 8-byte little-endian count, stored in a
-//!   `ScalarValue::Binary`.
-//!
-//! ## Merge
-//! Each partition serializes its t-digest state. The combiner deserializes all
-//! partial states and applies the standard cluster-merge algorithm.
-//!
-//! ## Accuracy
-//! On 100 000 samples from a uniform distribution the median is within
-//! 0.1 % and p=0.95 is within 0.5 % of the true value.
+//! - Merging t-digest with fixed compression factor `delta = 100`.
+//! - Serialization: 8-byte count + 16 bytes per centroid in `ScalarValue::Binary`.
 
 use std::any::Any;
 use std::sync::Arc;
 
+use basin_sketch::tdigest::{Centroid, TDigest};
 use datafusion::arrow::array::{Array, ArrayRef, BinaryArray, Float64Array};
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -35,195 +21,6 @@ use datafusion::logical_expr::{
 };
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
-
-// ── Minimal t-digest implementation ──────────────────────────────────────────
-
-/// Compression parameter. Higher = more centroids = more accurate but slower.
-const DELTA: f64 = 100.0;
-
-/// A single t-digest centroid: mean and total weight.
-#[derive(Clone, Debug, PartialEq)]
-struct Centroid {
-    mean: f64,
-    weight: f64,
-}
-
-/// Compact t-digest representation.
-#[derive(Clone, Debug)]
-struct TDigest {
-    /// Centroids sorted by mean ascending after each `compress()`.
-    centroids: Vec<Centroid>,
-    /// Total weight of all samples added.
-    total_weight: f64,
-}
-
-impl TDigest {
-    fn new() -> Self {
-        Self {
-            centroids: Vec::new(),
-            total_weight: 0.0,
-        }
-    }
-
-    /// Maximum weight allowed for a centroid at quantile position `q`.
-    ///
-    /// Standard Dunning 2019 formula: `4·n·q·(1-q)/delta`.
-    /// We use a minimum of 1.0 to avoid zero-cap at q=0 or q=1.
-    #[inline]
-    fn max_weight(q: f64, n: f64) -> f64 {
-        let cap = 4.0 * n * q * (1.0 - q) / DELTA;
-        cap.max(1.0)
-    }
-
-    /// Add a single `value` with weight 1.0.
-    fn add(&mut self, value: f64) {
-        self.centroids.push(Centroid {
-            mean: value,
-            weight: 1.0,
-        });
-        self.total_weight += 1.0;
-        // Compress every 512 raw inserts to keep the buffer bounded.
-        if self.centroids.len() > 512 {
-            self.compress();
-        }
-    }
-
-    /// Merge another t-digest into this one (union of all centroids).
-    fn merge(&mut self, other: &TDigest) {
-        self.centroids.extend_from_slice(&other.centroids);
-        self.total_weight += other.total_weight;
-        self.compress();
-    }
-
-    /// Sort centroids by mean and merge adjacent ones that fit within the
-    /// weight cap for their quantile position.
-    fn compress(&mut self) {
-        if self.centroids.is_empty() {
-            return;
-        }
-
-        self.centroids
-            .sort_unstable_by(|a, b| a.mean.partial_cmp(&b.mean).unwrap_or(std::cmp::Ordering::Equal));
-
-        let n = self.total_weight;
-        let mut merged: Vec<Centroid> = Vec::with_capacity(self.centroids.len());
-        let mut cumulative_weight = 0.0_f64;
-
-        for c in self.centroids.drain(..) {
-            if merged.is_empty() {
-                cumulative_weight = c.weight;
-                merged.push(c);
-                continue;
-            }
-
-            let last = merged.last_mut().unwrap();
-            let q = cumulative_weight / n;
-            let cap = Self::max_weight(q, n);
-
-            if last.weight + c.weight <= cap {
-                // Merge into existing centroid: weighted mean.
-                let combined = last.weight + c.weight;
-                last.mean = (last.mean * last.weight + c.mean * c.weight) / combined;
-                last.weight = combined;
-                cumulative_weight += c.weight;
-            } else {
-                cumulative_weight += c.weight;
-                merged.push(c);
-            }
-        }
-
-        self.centroids = merged;
-    }
-
-    /// Estimate the value at the `p`-th percentile (p ∈ [0.0, 1.0]).
-    fn quantile(&mut self, p: f64) -> f64 {
-        // Ensure centroids are sorted and compressed.
-        self.compress();
-
-        if self.centroids.is_empty() || !p.is_finite() {
-            return f64::NAN;
-        }
-
-        let p = p.clamp(0.0, 1.0);
-
-        // Handle edge cases.
-        if p == 0.0 {
-            return self.centroids.first().unwrap().mean;
-        }
-        if p == 1.0 {
-            return self.centroids.last().unwrap().mean;
-        }
-
-        let target = p * self.total_weight;
-
-        // Walk centroids tracking cumulative weight at the midpoint of each.
-        let mut cumulative = 0.0_f64;
-        for (i, c) in self.centroids.iter().enumerate() {
-            // The centroid spans [cumulative, cumulative + weight).
-            // The centroid's "representative" quantile is its midpoint.
-            let midpoint = cumulative + c.weight / 2.0;
-
-            if midpoint >= target {
-                // Interpolate between the previous centroid midpoint and this one.
-                if i == 0 {
-                    return c.mean;
-                }
-                let prev = &self.centroids[i - 1];
-                let prev_mid = cumulative - prev.weight / 2.0;
-                // Linear interpolation between prev.mean and c.mean.
-                let t = if (midpoint - prev_mid).abs() < 1e-12 {
-                    0.5
-                } else {
-                    (target - prev_mid) / (midpoint - prev_mid)
-                };
-                return prev.mean + t * (c.mean - prev.mean);
-            }
-
-            cumulative += c.weight;
-        }
-
-        // Fell through — return the last centroid mean.
-        self.centroids.last().unwrap().mean
-    }
-
-    // ── Serialization ─────────────────────────────────────────────────────
-
-    /// Serialize to bytes: `u64le count` followed by `(f64le mean, f64le weight)` per centroid.
-    fn to_bytes(&self) -> Vec<u8> {
-        let n = self.centroids.len();
-        let mut buf = Vec::with_capacity(8 + n * 16);
-        buf.extend_from_slice(&(n as u64).to_le_bytes());
-        for c in &self.centroids {
-            buf.extend_from_slice(&c.mean.to_le_bytes());
-            buf.extend_from_slice(&c.weight.to_le_bytes());
-        }
-        buf
-    }
-
-    /// Deserialize from bytes produced by `to_bytes`.
-    fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 8 {
-            return None;
-        }
-        let n = u64::from_le_bytes(bytes[0..8].try_into().ok()?) as usize;
-        if bytes.len() != 8 + n * 16 {
-            return None;
-        }
-        let mut centroids = Vec::with_capacity(n);
-        let mut total_weight = 0.0_f64;
-        for i in 0..n {
-            let off = 8 + i * 16;
-            let mean = f64::from_le_bytes(bytes[off..off + 8].try_into().ok()?);
-            let weight = f64::from_le_bytes(bytes[off + 8..off + 16].try_into().ok()?);
-            total_weight += weight;
-            centroids.push(Centroid { mean, weight });
-        }
-        Some(TDigest {
-            centroids,
-            total_weight,
-        })
-    }
-}
 
 // ── Accumulator ───────────────────────────────────────────────────────────────
 

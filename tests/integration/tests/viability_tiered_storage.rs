@@ -183,6 +183,8 @@ async fn viability_tiered_storage_compactor_moves_old_files() {
                 size_bytes: old_file.size_bytes,
                 row_count: old_file.row_count,
                 column_stats: old_file.column_stats.clone(),
+                hll_sketches: ::std::collections::BTreeMap::new(),
+                tdigest_sketches: ::std::collections::BTreeMap::new(),
             }],
         )
         .await
@@ -198,6 +200,8 @@ async fn viability_tiered_storage_compactor_moves_old_files() {
                 size_bytes: new_file.size_bytes,
                 row_count: new_file.row_count,
                 column_stats: new_file.column_stats.clone(),
+                hll_sketches: ::std::collections::BTreeMap::new(),
+                tdigest_sketches: ::std::collections::BTreeMap::new(),
             }],
         )
         .await

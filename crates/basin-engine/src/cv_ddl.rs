@@ -639,6 +639,8 @@ pub(crate) async fn exec_create_materialized_view(
                 row_count: written.row_count,
                 column_stats: written.column_stats.clone(),
                 bloom_filters: ::std::collections::BTreeMap::new(),
+                hll_sketches: ::std::collections::BTreeMap::new(),
+                tdigest_sketches: ::std::collections::BTreeMap::new(),
             }],
         )
         .await?;
@@ -732,6 +734,8 @@ pub(crate) async fn exec_create_snapshot_materialized_view(
                     row_count: written.row_count,
                     column_stats: written.column_stats.clone(),
                     bloom_filters: ::std::collections::BTreeMap::new(),
+                    hll_sketches: ::std::collections::BTreeMap::new(),
+                    tdigest_sketches: ::std::collections::BTreeMap::new(),
                 }],
             )
             .await?;
@@ -868,6 +872,8 @@ async fn do_refresh_full(
         row_count: written.row_count,
         column_stats: written.column_stats.clone(),
         bloom_filters: ::std::collections::BTreeMap::new(),
+        hll_sketches: ::std::collections::BTreeMap::new(),
+        tdigest_sketches: ::std::collections::BTreeMap::new(),
     }];
     catalog
         .replace_data_files(
@@ -997,6 +1003,8 @@ async fn do_refresh_incremental(
         row_count: written.row_count,
         column_stats: written.column_stats.clone(),
         bloom_filters: ::std::collections::BTreeMap::new(),
+        hll_sketches: ::std::collections::BTreeMap::new(),
+        tdigest_sketches: ::std::collections::BTreeMap::new(),
     }];
     catalog
         .replace_data_files(

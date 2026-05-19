@@ -245,6 +245,12 @@ pub struct DataFileRef {
     /// existing open + decode path (no correctness risk).
     #[serde(default)]
     pub bloom_filters: BTreeMap<String, Vec<u8>>,
+    /// Phase 5.14.B1 — per-column HyperLogLog sketches.
+    #[serde(default)]
+    pub hll_sketches: BTreeMap<String, Vec<u8>>,
+    /// Phase 5.14.B1 — per-column t-digest sketches.
+    #[serde(default)]
+    pub tdigest_sketches: BTreeMap<String, Vec<u8>>,
 }
 
 /// Definition of a TimescaleDB-style continuous aggregate ("CV").

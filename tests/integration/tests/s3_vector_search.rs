@@ -149,6 +149,8 @@ async fn s3_vector_search() {
                 size_bytes: df.size_bytes,
                 row_count: df.row_count,
                 column_stats: df.column_stats.clone(),
+                hll_sketches: ::std::collections::BTreeMap::new(),
+                tdigest_sketches: ::std::collections::BTreeMap::new(),
             }],
         )
         .await

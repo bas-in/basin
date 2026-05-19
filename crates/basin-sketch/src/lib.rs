@@ -20,23 +20,8 @@
 
 #![forbid(unsafe_code)]
 
-// Phase 5.14.B1 fills in these modules with the hoisted impls from
-// basin-engine/src/{approx_count_distinct,approx_percentile}.rs.
-// Today they are placeholders so the crate compiles and basin-storage
-// + basin-engine can both declare a dependency on it ahead of the
-// hoist landing.
-
-pub mod hll {
-    //! Placeholder for the HLL type to be hoisted in Phase 5.14.B1.
-    //!
-    //! Source-of-truth today: `basin-engine/src/approx_count_distinct.rs`.
-}
-
-pub mod tdigest {
-    //! Placeholder for the t-digest type to be hoisted in Phase 5.14.B1.
-    //!
-    //! Source-of-truth today: `basin-engine/src/approx_percentile.rs`.
-}
+pub mod hll;
+pub mod tdigest;
 
 /// `BASIN_QUERY_SHAPE_SEED` — fixed 64-bit seed for the xxh3_64 hash
 /// used by `QueryShape` (Phase 5.16.A).  Not a sketch, but lives here

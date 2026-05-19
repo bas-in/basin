@@ -186,6 +186,8 @@ async fn compare_lifecycle_ops() {
             size_bytes: f.size_bytes,
             row_count: f.row_count,
             column_stats: f.column_stats.clone(),
+            hll_sketches: ::std::collections::BTreeMap::new(),
+            tdigest_sketches: ::std::collections::BTreeMap::new(),
         });
     }
     // One catalog append registers every file in a single snapshot — the

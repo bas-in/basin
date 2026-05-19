@@ -786,6 +786,8 @@ pub(crate) async fn write_audit_rows(
         row_count: df.row_count,
         column_stats: df.column_stats.clone(),
         bloom_filters: ::std::collections::BTreeMap::new(),
+        hll_sketches: ::std::collections::BTreeMap::new(),
+        tdigest_sketches: ::std::collections::BTreeMap::new(),
     };
     // Audit-table commits use the same optimistic-retry policy as the
     // engine's own INSERT path.

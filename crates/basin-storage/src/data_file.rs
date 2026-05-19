@@ -40,6 +40,12 @@ pub struct DataFile {
     /// min/max pruning.
     #[serde(default)]
     pub bloom_filters: BTreeMap<String, Vec<u8>>,
+    /// Phase 5.14.B1 — per-column HyperLogLog sketches.
+    #[serde(default)]
+    pub hll_sketches: BTreeMap<String, Vec<u8>>,
+    /// Phase 5.14.B1 — per-column t-digest sketches.
+    #[serde(default)]
+    pub tdigest_sketches: BTreeMap<String, Vec<u8>>,
 }
 
 mod object_path_str {

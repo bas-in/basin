@@ -154,6 +154,8 @@ async fn s3_viability_tiered_storage() {
                 size_bytes: old_file.size_bytes,
                 row_count: old_file.row_count,
                 column_stats: old_file.column_stats.clone(),
+                hll_sketches: ::std::collections::BTreeMap::new(),
+                tdigest_sketches: ::std::collections::BTreeMap::new(),
             }],
         )
         .await
@@ -169,6 +171,8 @@ async fn s3_viability_tiered_storage() {
                 size_bytes: new_file.size_bytes,
                 row_count: new_file.row_count,
                 column_stats: new_file.column_stats.clone(),
+                hll_sketches: ::std::collections::BTreeMap::new(),
+                tdigest_sketches: ::std::collections::BTreeMap::new(),
             }],
         )
         .await

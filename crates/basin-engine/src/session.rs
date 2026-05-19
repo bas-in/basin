@@ -1408,6 +1408,8 @@ mod tests {
             row_count: 1,
             column_stats: std::collections::BTreeMap::new(),
             bloom_filters: ::std::collections::BTreeMap::new(),
+            hll_sketches: ::std::collections::BTreeMap::new(),
+            tdigest_sketches: ::std::collections::BTreeMap::new(),
         }
     }
 
