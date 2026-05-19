@@ -915,7 +915,90 @@ gated on Phase 2 completion.
       lands. Acceptance gate: env var removed; sqlparser dependency
       gated to translator-only.
 
-## Phase 5.15 — Unified docs platform (HIGHEST PRIORITY — blocks 5.14)
+## Phase 5.16 — Query insights (per-shape stats; OSS data collection + cloud aggregation)
+
+**Why.** Basin today exposes per-project counters (ops / bytes / p99 / errors)
+and OpenTelemetry traces, but no **shape-aware** telemetry — there is no
+"which query *shape* is killing me?" view.  pg_stat_statements is the
+canonical reference; CockroachDB's Statements page is the polished version.
+We need our own, with two properties Postgres doesn't have:
+
+1. **Scale-dependent regression tracking** — track latency by table-size
+   bucket so we surface shapes whose p99 grows monotonically with data.
+   (This is the pattern the `point_eq` 0.94 → 0.85 → 0.49 release smoke
+   exposed for Phase 5.14.A blooms.)
+2. **Anonymised cross-customer aggregates** in basin-cloud — Basin engineers
+   see "X% of customers run shape Y at >100GB table size" without seeing any
+   specific customer's data.  Drives roadmap evidence, not guesswork.
+
+OSS side ships the data-collection layer.  Cloud side
+([basin-cloud-roadmap.md](./docs/basin-cloud-roadmap.md)) ships the ingest
+pipeline + UI + cross-customer roll-ups.
+
+Privacy invariant: literals are stripped at the LogicalPlan layer before
+anything is persisted or exported.  Plan-shape hash is over operator tree
++ column refs + literal type slots, never literal values.
+
+ADR 0017 (planned) records the privacy / anonymisation model.
+
+- [ ] **5.16.A** Plan-shape canonical hash.  Files:
+      `crates/basin-engine/src/query_shape.rs` (new); hooks into
+      `executor.rs::exec_select` and the fast-path entry points.
+      Acceptance gate: `WHERE id = 5` and `WHERE id = 99` hash to the same
+      shape; `WHERE id = $1` (parameterised) hashes to the same shape;
+      `WHERE id = 5 AND k = 3` hashes to a different shape; benchmark
+      `query_shape_hash` ≤ 5 µs/query on a representative LogicalPlan.
+      Estimate: ~1 week.
+- [ ] **5.16.B** Per-shape rolling histograms.  Files:
+      `crates/basin-engine/src/query_stats.rs` (new); `QueryStatRegistry`
+      with HDR histograms (use the `hdrhistogram` crate) for latency, rows
+      scanned, files opened, bytes decoded, cache hits, fast-path-engaged
+      enum, p50/p95/p99 readouts.  Per-project + per-table breakdown.
+      Multi-tenant isolation pattern: shared registry + per-project
+      bounded LRU of shapes (max 500 distinct shapes/project), counter
+      O(bytes).
+      Acceptance gate: 10k QPS workload → registry overhead ≤ 1% p99;
+      memory bounded at 500 shapes × ~2 KiB histogram ≈ 1 MiB/project.
+      Estimate: ~1 week. Depends on 5.16.A.
+- [ ] **5.16.C** Scale-dependent regression tracking.  Files:
+      `crates/basin-engine/src/query_stats.rs` (extend).  Bucket each
+      query by `log2(table_row_count)` (8 buckets covering 1k → 1B rows)
+      and store per-(shape, bucket) histograms.  Expose
+      `top_regressions(project, table)` returning shapes whose ratio
+      `bucket[N].p99 / bucket[N-1].p99` exceeds 1.3 (configurable).
+      Acceptance gate: a synthetic test with a shape's latency growing
+      monotonically with row count flags the shape correctly; a shape
+      with flat latency does not.
+      Estimate: ~1 week. Depends on 5.16.B.
+- [ ] **5.16.D** OTLP export schema.  Files:
+      `crates/basin-engine/src/query_stats_export.rs` (new); extends the
+      existing OpenTelemetry pipeline with `basin.query_shape.*` metrics
+      (Counter + Histogram per shape).  Plus a `basin_stat_statements`
+      view exposed via SQL (Postgres-style) so self-hosted users see
+      shape stats without standing up an OTLP collector.
+      Acceptance gate: `SELECT * FROM basin_stat_statements` returns rows;
+      OTLP export at 1k QPS does not block the query hot path.
+      Estimate: ~1 week. Depends on 5.16.B + 5.16.C.
+
+Sub-items 5.16.E – 5.16.H live in the basin-cloud repo
+(see [`docs/basin-cloud-roadmap.md`](./docs/basin-cloud-roadmap.md)
+Phase 5.16-cloud):
+
+- 5.16.E — Cloud ingest pipeline (OTLP receiver → ClickHouse / VictoriaMetrics)
+- 5.16.F — Cloud Query Insights UI (per-customer "your slowest queries" view)
+- 5.16.G — Anti-pattern detection + suggestion engine
+- 5.16.H — Anonymised cross-customer aggregates (k-anonymity ≥ 5, Basin engineers only)
+
+ADR 0017 will record the privacy / anonymisation design.
+
+**Acceptance gate (composite, OSS side):** at 10k QPS the `QueryStatRegistry`
+overhead is ≤ 1% p99; per-shape stats survive a process restart via OTLP
+re-export (in-memory only — restart loses pre-restart history, design choice);
+`basin_stat_statements` view materialises in < 100 ms.
+
+**Total OSS effort:** ~4 weeks.
+
+## Phase 5.15 — Unified docs platform (OSS-side shipped; cloud-side at basin-cloud)
 
 **Why first.** Contributor and customer onboarding both go through documentation.
 Today docs sit in three places (`README.md`, `CAPABILITIES.md`, `docs/*.md` in
