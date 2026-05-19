@@ -574,6 +574,7 @@ mod advisory_lock;
 mod alter;
 mod any_all_rewrite;
 mod approx_count_distinct;
+mod catalog_window_exec;
 mod constraints;
 mod convert;
 mod cost_check;

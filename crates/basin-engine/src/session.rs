@@ -590,6 +590,12 @@ pub(crate) async fn open(
         .with_physical_optimizer_rule(std::sync::Arc::new(
             crate::sort_streaming_limit::SortStreamingLimit::new(),
         ))
+        // Elide redundant SortExec above WindowAggExec when the file's
+        // declared sort order (basin.sort_by) already covers the window's
+        // PARTITION BY + ORDER BY (Phase 5.14.D3).
+        .with_physical_optimizer_rule(std::sync::Arc::new(
+            crate::catalog_window_exec::CatalogWindowExecSortElision::new(),
+        ))
         .build();
     let ctx = SessionContext::new_with_state(state);
     let url = Url::parse(BASIN_URL_BASE)
