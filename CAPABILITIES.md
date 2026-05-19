@@ -142,6 +142,28 @@ Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_
 | Cross-shard query merging | 🛠 | router → shard-owner protocol shipped (consistent hashing, 28% max load); cross-shard JOIN deferred |
 | Cost-based query rejection | ✅ | v0.1: `BASIN_QUERY_COST_LIMIT_ROWS=N` rejects single-table SELECTs that estimate above the row cap with PG SQLSTATE 54000 (`program_limit_exceeded`). Default off. Multi-FROM / JOIN / sub-query / explicit-LIMIT shapes pass through unchecked; v0.2 uses A4 catalog `ColumnStats` for selectivity-aware estimates on those. |
 
+### Performance residuals (won't chase further)
+
+These are shapes where Vortex underperforms Parquet by single-digit-percent-to-30% in the smoke matrix. Documented here as known limitations with concrete workarounds. Further engineer-time invested in chasing these would return marginal customer value compared with the surface pivot (basin-cli, basin-js, WebSocket subscriptions, basin-cloud webapp).
+
+| Shape | Ratio (parquet_ms / vortex_ms) | Root cause | Workaround |
+|---|---|---|---|
+| `substring_concat` | ~0.64× | Vortex string codec maturity — substring + concat operators not yet fused | Pre-materialise the concatenated column with a generated column or a computed view |
+| `like_prefix` | ~0.72× | Prefix-LIKE doesn't push down through Vortex's string codec optimally | Declare `WITH (basin.sort_by='col')` to enable bloom-filter + zone-map prefix pruning; or maintain a trigram index (`basin-trgm`) |
+| `string_chain_funcs` | ~0.80× | Chained `LOWER`/`UPPER`/`TRIM`/`REPLACE` incur per-batch dispatch cost; Vortex doesn't fuse the chain | Compute once in a generated column |
+| `or_predicate` / `deep_or_chain` | 0.62× / 0.71× | OR / IN with many disjuncts hits Vortex's `filter_evaluation` threshold and falls back to row-scan | Split into `UNION ALL` with separate predicates per branch; or rewrite as `WHERE col IN (val1, val2, …)` if disjuncts share a column — IN list pushdown is better than OR-of-equals |
+| Window-frame execution residuals beyond Phase 5.14.D3 | varies | Some uncommon frame specifications (`RANGE`-vs-`ROWS`, complex `PARTITION BY` chains) don't benefit from sort-aware metadata | Match `basin.sort_by` to the `PARTITION BY` column when feasible |
+| Long-tail shapes at 0.85–0.95× | varies | Within measurement noise. Won't chase further | None — perf is within ±15% of Parquet, normal cross-codec variance |
+| `inner_join` @ 100k row scale (one observed at 0.71×) | 0.71× | Appears to be system-load noise; not reproduced in clean reruns | If reproducibly slow, file an issue with EXPLAIN ANALYZE output |
+
+**Vortex version cadence.** Basin tracks Vortex 0.70 as of 2026-05-19. Routine version bumps to 0.71+ are expected to improve several residuals "for free" — see Vortex release notes per upgrade.
+
+### Limitations we ARE actively fixing
+
+- **Point queries at TB-scale** — Phase 5.14.C HTAP hot tier (memtable per project/table + per-project memory budget) — in flight, lands ~10 weeks
+- **Query observability** — Phase 5.16 Query Insights (per-shape rolling histograms, regression buckets, OTLP export, `basin_stat_statements` view) — in flight, lands ~4 weeks
+- **Window frames with complex `PARTITION`** — Phase 5.14.D3 (sort elision above `WindowAggExec`) shipped at `ee80b36`; 5.14.D4 multi-sort follow-up in flight
+
 ## Vector search
 
 | Capability | Status | Notes |
