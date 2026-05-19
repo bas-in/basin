@@ -7,6 +7,7 @@ export interface PostgrestResponse<T> {
   error: BasinError | null;
   count: number | null;
   status: number;
+  nextCursor?: string | null;
 }
 
 export interface PostgrestSingleResponse<T> {
