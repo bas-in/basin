@@ -1082,64 +1082,127 @@ approximation alternative. Sketches merge across files at query time.
 gaps close via the `APPROX_*` alternative; correctness bounds (≤2%
 HLL, ≤1% t-digest) honoured on the differential harness.
 
-### 5.14.C — Row-format hot buffer for HTAP (~3 months on its own — the architectural moat)
+### 5.14.C — Row-format hot buffer for HTAP (~8 weeks engineering — the architectural moat)
 
-The architectural commitment. LSM-style memtable for recent writes
-(row-formatted, PK-indexed). Flushed to Vortex on threshold. Reads
-merge memtable + Vortex. Closes the OLTP `point_eq` HIT path floor
-and single-row UPDATE latency. **This is what differentiates Basin
-from "Parquet + DataFusion in a bucket."**
+The architectural commitment.  Full design spec in
+[ADR 0016](./docs/decisions/0016-htap-hot-tier-architecture.md).
+LSM-style memtable for recent writes (row-formatted, PK-indexed,
+`parking_lot::RwLock<BTreeMap<RowKey, MemRowValue>>` per
+`(project_id, table_name)`).  Flushed to Vortex on size / age /
+scan-pressure threshold.  Reads merge memtable + Vortex.  Closes
+the OLTP `point_eq` HIT path floor and single-row UPDATE latency.
+**This is what differentiates Basin from "Parquet + DataFusion in
+a bucket."**
 
 Precedent: SingleStore (rowstore tier), ClickHouse `ReplacingMergeTree`,
-Apache Pinot (real-time segments). All three couple a row-formatted
+Apache Pinot (real-time segments).  All three couple a row-formatted
 hot tier with a column-formatted cold tier and merge at read time.
 
-Lives in a new crate `crates/basin-hottier/` (separate from `basin-shard`
-because the lifecycle is different and the data structures don't share
-much with the WAL→Parquet compactor).
+Lives in a new crate `crates/basin-hottier/`.
 
-- [ ] **5.14.C1** `MemTable` data structure — Arc-shared, lock-free reads,
-      single-writer per-`(project, table)`. PK-indexed B-tree or
-      skip-list; row-formatted Arrow `StructArray` slabs. Files:
-      `crates/basin-hottier/src/memtable.rs` (new). Acceptance gate:
-      benchmark `memtable_insert` ≥ 100k rows/s single-thread debug,
-      ≥ 1M rows/s release.
-- [ ] **5.14.C2** Write-path integration — engine INSERT/UPDATE/DELETE
-      writes to memtable instead of WAL+Parquet for hot tier. WAL still
-      durability-anchors. Files:
-      `crates/basin-engine/src/executor.rs` (mutation path),
-      `crates/basin-shard/src/lib.rs` (route hot vs cold). Depends on
-      5.14.C1. Acceptance gate: `single_row_update_latency` p99 drops
-      ≥10× vs today's Parquet-rewrite path.
-- [ ] **5.14.C3** Read-merge: scan path merges memtable rows with the
-      Vortex base. Tombstone resolution for DELETE; latest-version-wins
-      for UPDATE per PK. Files:
-      `crates/basin-hottier/src/merge.rs` (new),
-      `crates/basin-engine/src/scan.rs` (integration). Depends on
-      5.14.C1 + 5.14.C2. Acceptance gate: `point_eq` HIT shape in
-      `vortex_vs_parquet_smoke` lands at p99 ≤ 2ms warm.
-- [ ] **5.14.C4** Flush — threshold-driven (size + age) Vortex compaction
-      from memtable. Atomic catalog commit; memtable rows GC'd post-commit.
-      Files: `crates/basin-hottier/src/flush.rs` (new). Depends on
-      5.14.C1+C2+C3. Acceptance gate: 1M-row mixed workload flushes
-      without read-stall; no row loss verified by differential.
-- [ ] **5.14.C5** Multi-tenant isolation: per-project memtable cap +
-      shared heavy resource (the in-process slab allocator), cheap
-      per-tenant primitive (counter + semaphore) — per [Multi-tenant
-      isolation must scale](file:///Users/pc/.claude/projects/-Users-pc-code-exo-basin/memory/feedback_multitenant_isolation.md).
-      Files: `crates/basin-hottier/src/registry.rs` (new). Depends on
-      C1. Acceptance gate: per-project byte usage scales O(bytes), not
-      O(pool); a 10k-tenant fuzz test fits in a 4GB heap.
-- [ ] **5.14.C6** Differential harness vs Parquet-only path — every
-      shape in `vortex_vs_parquet_smoke` runs identically when the
-      hot tier is empty (no rows in memtable), and identically when
-      everything is in memtable (all rows in memtable, no Vortex files
-      yet). Files: `tests/integration/tests/hottier_differential.rs`.
-      Acceptance gate: 0 differential rows.
+**Architecture summary (from ADR 0016):**
 
-**Acceptance gate (composite):** OLTP `point_eq` HIT p99 ≤ 2ms warm;
-single-row UPDATE p99 ≤ 5ms; 10k-tenant fuzz fits in 4GB heap; 0
-differential rows vs Parquet-only baseline.
+- Per-`(project, table)` `BTreeMap` memtable — NOT RocksDB (multi-tenant
+  isolation constraint) or sled (durability redundancy with `basin-wal`).
+  Crossbeam-skiplist `SkipMap` is the fallback if C1 benchmark fails.
+- Multi-tenant: shared `MemTableRegistry` (one per process) + per-project
+  `AtomicU64` counter + per-project `Semaphore`.  Per-tenant cost is
+  O(bytes + counter + semaphore); idle tenants cost zero.
+- Memory budgets: project hard cap 256 MB, project soft cap 192 MB,
+  per-table soft cap 16 MB, max age 60 s.  Largest-first flush
+  scheduler.
+- Non-blocking flush: write lock held only for snapshot clone + final
+  GC; object-store I/O is lock-free.
+- Transaction integration via `TxState::memtable_watermarks`; ROLLBACK
+  truncates the memtable to the per-table watermark.  Requires WAL
+  transaction-boundary markers (`BEGIN` / `ROLLBACK`) for correct
+  crash recovery.
+
+- [ ] **5.14.C1** `MemTable` + `MemTableRegistry` (new crate) — ~1 week.
+      `parking_lot::RwLock<BTreeMap<RowKey, MemRowValue>>` per
+      `(project, table)`.  `RowKey` is a newtype over `Vec<u8>` with
+      big-endian PK column encoding.  `MemRowValue::Row(Vec<u8>) |
+      Tombstone`.  `MemTableRegistry` is a `DashMap<(ProjectId, TableName),
+      Arc<MemTableEntry>>` with per-project `AtomicU64` byte counter +
+      per-project `Semaphore`.
+      Files: `crates/basin-hottier/Cargo.toml`, `crates/basin-hottier/src/lib.rs`,
+      `crates/basin-hottier/src/memtable.rs`, `crates/basin-hottier/src/registry.rs`,
+      `crates/basin-hottier/src/row_key.rs`.
+      Acceptance gate: `cargo bench memtable_insert` ≥ 100k rows/s
+      single-thread debug, ≥ 1M rows/s release; `cargo bench
+      memtable_point_lookup` p99 ≤ 500 µs at 1M rows; range scan
+      1k-row range ≤ 2ms at 1M rows.  If p99 lookup at 1M rows >
+      500 µs, switch backing structure to `crossbeam-skiplist::SkipMap`
+      before C2 starts.
+- [ ] **5.14.C2** Write-path integration + WAL transaction markers — ~1.5 weeks.
+      INSERT/UPDATE/DELETE route to memtable (after WAL append).
+      `TxState::memtable_watermarks` for per-table rollback; extend
+      `SavepointFrame` with the same.  Add `BEGIN` / `ROLLBACK`
+      markers to WAL; teach `replay_wal_into` to suppress entries
+      between matched pairs.
+      Files: `crates/basin-engine/src/executor.rs`,
+      `crates/basin-engine/src/dml_mutate.rs`,
+      `crates/basin-engine/src/session.rs`,
+      `crates/basin-shard/src/in_process.rs`,
+      `crates/basin-wal/src/file_wal.rs`.
+      Depends on C1.  Acceptance gate: `single_row_update_latency`
+      p99 ≤ 5 ms (vs the existing ≥ 50ms Parquet copy-on-write path —
+      ≥ 10× improvement); INSERT of 1 row ≤ 1 ms p99; ROLLBACK
+      correctly reverts memtable rows; crash-replay test verifies
+      rolled-back writes are NOT re-applied.
+- [ ] **5.14.C3** Read-merge path — ~1.5 weeks.  `merge_scan(memtable_iter,
+      vortex_iter) -> impl Iterator<Item=Row>` with PK-ordered merge,
+      dedup-on-PK (memtable wins), tombstone suppression.
+      `fast_select.rs::execute_simple_select` probes memtable first for
+      point lookups.  Full-scan path in `executor.rs` calls the merge.
+      Files: `crates/basin-hottier/src/merge.rs` (new),
+      `crates/basin-engine/src/fast_select.rs`,
+      `crates/basin-engine/src/executor.rs`.
+      Depends on C1 + C2.  Acceptance gate: `point_eq` HIT shape in
+      `vortex_vs_parquet_smoke` p99 ≤ 2ms warm (down from ~4ms
+      current Vortex path); all 88 existing smoke shapes produce
+      identical results with and without the hot tier populated.
+- [ ] **5.14.C4** Flush — ~2 weeks.  Background Tokio task (one per
+      `MemTableRegistry`).  Triggers: size (table_memtable_soft_cap),
+      age (memtable_max_age_secs), scan pressure (>100k rows on a
+      full-scan).  Algorithm: snapshot under brief write lock →
+      partition new/updated/tombstoned → write new rows via existing
+      `write_batch_with_options` → apply updates/tombstones via
+      existing `dml_mutate` copy-on-write → atomic catalog commit
+      via `replace_data_files` + `append_data_files` (existing path,
+      with `commit_with_retry`) → GC flushed rows → WAL truncation.
+      Files: `crates/basin-hottier/src/flush.rs` (new),
+      `crates/basin-shard/src/in_process.rs` (integrate flush loop).
+      Depends on C1+C2+C3.  Acceptance gate: 1M-row mixed workload
+      (50% INSERT, 25% UPDATE, 25% DELETE) flushes without read stall;
+      no row loss verified by `vortex_parquet_differential`; flush
+      duration ≤ 10s for 64 MB memtable on LocalFS.
+- [ ] **5.14.C5** Multi-tenant memory budget — ~1 week.  Per-project
+      hard cap (256 MB default, ALTER PROJECT configurable), soft cap
+      (192 MB triggers background flush), per-table soft cap (16 MB).
+      `Semaphore` back-pressure on hard cap.  Largest-first global
+      flush scheduler when total process pressure rises.  Configurable
+      via `MemTableConfig`.
+      Files: `crates/basin-hottier/src/budget.rs` (new),
+      `crates/basin-engine/src/lib.rs` (Engine-level config plumbing).
+      Depends on C1.  Acceptance gate: 10k-tenant fuzz test (10k
+      projects × 1k rows × 200 bytes/row = 2 TB total) — no project
+      exceeds hard cap; total process heap ≤ 4 GB; per-project byte
+      usage scales O(bytes) not O(active_projects).
+- [ ] **5.14.C6** Differential harness — ~1 week.  Every shape in
+      `vortex_vs_parquet_smoke` runs in three modes: (1) hot tier empty
+      (all rows in Vortex — baseline), (2) all rows in memtable (no
+      Vortex files; flush suppressed), (3) split (half in each).
+      Files: `tests/integration/tests/hottier_differential.rs`.
+      Depends on C1 + C2 + C3.  Acceptance gate: 0 differential rows
+      across all shapes × all three modes.
+
+**Acceptance gate (composite):** OLTP `point_eq` HIT p99 ≤ 2 ms warm;
+single-row UPDATE p99 ≤ 5 ms; 10k-tenant fuzz fits in 4 GB heap; 0
+differential rows vs Vortex-only baseline.
+
+**Total effort:** ~8 engineer-weeks.  Open risks and out-of-scope
+items documented in [ADR 0016](./docs/decisions/0016-htap-hot-tier-architecture.md).
 
 ### 5.14.D — Adaptive write-time multi-sort + catalog-aware WindowExec (~6 weeks combined, no deps)
 
