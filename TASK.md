@@ -50,7 +50,7 @@ See `README.md` "Try the PoC" for usage.
 - [ ] Run 20 customer interviews on the wedge question
 - [ ] Sign 3–5 named design partners willing to try the alpha
 - [ ] Write the PRD: pains, target ICP, non-goals, success metrics
-- [ ] Decide go/no-go. Record the decision and the evidence in `docs/phase-0.md`
+- [ ] Decide go/no-go. Record the decision and the evidence (target file `docs/phase-0.md` does not yet exist — create it as part of the go/no-go writeup).
 
 ## Phase 1 — Storage substrate (2–3 months)
 
@@ -64,8 +64,13 @@ See `README.md` "Try the PoC" for usage.
 - [x] `basin-server`: runtime storage backend selection
       (`BASIN_STORAGE_BACKEND=local|r2|s3|tigris`) for data files and WAL
       object storage, with separate root prefixes for data and WAL.
-- [~] `basin-catalog`: Iceberg REST client (Lakekeeper-compatible)
-      — trait shape locked, `RestCatalog` is a stub. Wire up in Phase 2/3.
+- [x] `basin-catalog`: Iceberg REST client (Lakekeeper-compatible)
+      — `basin-iceberg-rest` crate ships GET (namespaces, list-tables,
+      load-table), POST `create-table`, POST `commit-table` with
+      Iceberg-shaped requirements (`assert-table-uuid`,
+      `assert-current-schema-id`, `assert-ref-snapshot-id`) + add-snapshot
+      / set-current-snapshot updates, and DELETE table.
+      See CHANGELOG `[0.1.1]` Phase 6 entry batch.
 - [x] `basin-catalog`: atomic `append_data_files` commits, snapshot listing
       (in-memory; same semantics will apply to the REST impl)
 - [x] Per-project prefix enforcement at the storage API boundary
@@ -124,14 +129,16 @@ See `README.md` "Try the PoC" for usage.
 - [x] **Real ORM compat verified**: 7/7 representative ORM patterns pass via
       `tokio-postgres`'s default extended-query API
 - [x] `psql` connects and runs full SQL workload
-- [~] `pgx` (Go) / `asyncpg` (Python) full smoke — scaffolding shipped:
-      `tests/integration/python/smoke.py`, `tests/integration/go/smoke.go`,
-      `tests/integration/tests/smoke_pgx.rs`, `smoke_asyncpg.rs`. Go side
-      rides on `pgx/v5`. Python side hits an asyncpg quirk where after a
-      `DataError` on JSONB / UUID encoding, `conn.close()` hangs. v0.2
-      fix: wrap close in `asyncio.wait_for(..., timeout=2)` and catch
-      `DataError` so JSONB / UUID shapes are reported as known
-      limitations instead of stalls.
+- [-] `pgx` (Go) / `asyncpg` (Python) full smoke — **deferred (2026-05-19)**.
+      Scaffolding ships: `tests/integration/python/smoke.py`,
+      `tests/integration/go/smoke.go`, `tests/integration/tests/smoke_pgx.rs`,
+      `smoke_asyncpg.rs`. Go side rides on `pgx/v5`. Python side hits an
+      asyncpg quirk where after a `DataError` on JSONB / UUID encoding,
+      `conn.close()` hangs. tokio-postgres coverage (7/7 ORM patterns + the
+      curated ORM/driver-compat suite at commit `8b71eca`) already demonstrates
+      the extended-protocol surface end-to-end across native drivers; the
+      pgx / asyncpg-specific tests are deferred to v0.2 (fix is `asyncio.wait_for(..., timeout=2)`
+      + `DataError` catch on close).
 
 ## Phase 5 — Analytical path (1–2 months) — **v0.1 shipped**
 
@@ -461,23 +468,23 @@ Forward-compat substrate. Tier 1 phases don't depend on this; Tier 2
 phases (reactors + webhooks) do. Cheap to ship now so the executor
 commit path doesn't get re-touched repeatedly.
 
-- [ ] `ChangeEvent { project, table, op, before, after, committed_at,
+- [x] `ChangeEvent { project, table, op, before, after, committed_at,
       seq, causation_user }` in `basin-common::events`. Stable public
       contract — adding fields fine, renaming breaking.
-- [ ] `ChangeEventSink` trait (async `publish(&ChangeEvent) -> Result<()>`)
+- [x] `ChangeEventSink` trait (async `publish(&ChangeEvent) -> Result<()>`)
       in `basin-common::events`.
-- [ ] `EventSinkRegistry` per-engine: separate `pre_commit:
+- [x] `EventSinkRegistry` per-engine: separate `pre_commit:
       Vec<Arc<dyn ChangeEventSink>>` + `post_commit:
       Vec<Arc<dyn ChangeEventSink>>` lists. Pre-commit sinks run
       synchronously and abort the mutation on `Err`; post-commit sinks
       run fire-and-forget after the catalog commit succeeds.
-- [ ] `Engine::attach_pre_commit_sink` + `Engine::attach_post_commit_sink`.
-- [ ] Capture point in executor's INSERT/UPDATE/DELETE path — exactly
+- [x] `Engine::attach_pre_commit_sink` + `Engine::attach_post_commit_sink`.
+- [x] Capture point in executor's INSERT/UPDATE/DELETE path — exactly
       once per committed mutation; serialized by the existing
       per-`(project, table)` snapshot ID ordering.
-- [ ] One trivial `TracingSink` (logs each event via `tracing::info!`)
+- [x] One trivial `TracingSink` (logs each event via `tracing::info!`)
       for debug demos; opt-in via env var, default off.
-- [ ] Test: zero-sink path is byte-identical to today (no allocation,
+- [x] Test: zero-sink path is byte-identical to today (no allocation,
       no spawn); attached `TracingSink` records every committed event;
       a pre-commit sink that returns `Err` rolls back the mutation;
       a post-commit sink that returns `Err` does NOT roll back.
@@ -492,24 +499,24 @@ Customer-visible PG-compat upgrade with zero novel infrastructure.
 The single biggest customer-visible PG-compat win. JSONB operators
 folded in because every modern SaaS schema uses them constantly.
 
-- [ ] Date/time: `now()`, `current_timestamp`, `current_date`,
+- [x] Date/time: `now()`, `current_timestamp`, `current_date`,
       `date_trunc(unit, ts)`, `age(ts1, ts2)`, `extract(field FROM ts)`,
       `to_timestamp(text, fmt)`, `to_char(ts, fmt)`.
-- [ ] String: `lower`, `upper`, `substring(s FROM n FOR m)`, `trim`,
+- [x] String: `lower`, `upper`, `substring(s FROM n FOR m)`, `trim`,
       `length`, `position`, `replace`, `regexp_replace`, `||` operator.
-- [ ] Math: `abs`, `ceil`, `floor`, `round`, `power`, `sqrt`, `mod`,
+- [x] Math: `abs`, `ceil`, `floor`, `round`, `power`, `sqrt`, `mod`,
       `%` operator.
-- [ ] Coalesce / null-handling: `coalesce`, `nullif`, `greatest`,
+- [x] Coalesce / null-handling: `coalesce`, `nullif`, `greatest`,
       `least`, `is distinct from`.
-- [ ] Aggregate: `string_agg`, `array_agg`, `bit_and`/`bit_or`,
+- [x] Aggregate: `string_agg`, `array_agg`, `bit_and`/`bit_or`,
       `every`/`bool_and`/`bool_or`.
-- [ ] **JSONB operators**: `->`, `->>`, `#>`, `#>>`, `@>`, `<@`, `?`,
+- [x] **JSONB operators**: `->`, `->>`, `#>`, `#>>`, `@>`, `<@`, `?`,
       `?|`, `?&` — wired through DataFusion's existing JSON support.
-- [ ] **Recursive-CTE + window-function verification pass**: DataFusion
+- [x] **Recursive-CTE + window-function verification pass**: DataFusion
       supports both; add an integration test row-by-row covering
       `WITH RECURSIVE` (employee-hierarchy classic), `ROW_NUMBER`,
       `RANK`, `DENSE_RANK`, `LAG`/`LEAD`, `SUM() OVER (PARTITION BY)`.
-- [ ] Test: a single integration test that exercises every function
+- [x] Test: a single integration test that exercises every function
       above against `tokio-postgres`'s default extended-query path; no
       panic, results match a real PG reference run committed alongside.
 
@@ -519,14 +526,15 @@ The function primitive — body is a single SELECT, inlined at planning
 time. Covers ~50% of all real-world function use cases. No interpreter,
 no frame management, no security sandbox.
 
-- [ ] `CREATE FUNCTION name(args) RETURNS scalar LANGUAGE sql AS $$
+- [x] `CREATE FUNCTION name(args) RETURNS scalar LANGUAGE sql AS $$
       SELECT … $$` parser + catalog persistence (`functions` table).
-- [ ] Planning-time inlining: function call becomes a sub-query in the
+- [x] Planning-time inlining: function call becomes a sub-query in the
       logical plan, with arguments substituted into the body.
-- [ ] Recursive function detection — reject (PG also rejects for
+- [x] Recursive function detection — reject (PG also rejects for
       `LANGUAGE sql`); recursion needs PL/pgSQL which is out of scope.
-- [ ] `DROP FUNCTION`, `ALTER FUNCTION` (rename only).
-- [ ] Test: `display_name(users)` round-trips; functions composing
+      Mutual-recursion detection at registration catches `f → g → f`.
+- [x] `DROP FUNCTION`, `ALTER FUNCTION` (rename only).
+- [x] Test: `display_name(users)` round-trips; functions composing
       built-ins from 5.11.A work; recursive function rejected.
 
 #### 5.11.B — Declarative lifecycle (`AUTO_UPDATE`, `AUDIT TO`, `SOFT DELETE`) (~2 weeks) ✅ shipped
@@ -535,17 +543,17 @@ Covers ~75% of "trigger" use cases without parsing or interpreting
 anything. Pure engine-native column behaviour. **Implements the writes
 inline in the executor — does NOT depend on Tier 0.**
 
-- [ ] `CREATE TABLE foo (..., updated_at TIMESTAMPTZ AUTO_UPDATE)` —
+- [x] `CREATE TABLE foo (..., updated_at TIMESTAMPTZ AUTO_UPDATE)` —
       engine sets the column on every UPDATE row (DEFAULT-now semantics
       for INSERT already work).
-- [ ] `CREATE TABLE foo (..., AUDIT TO foo_audit)` — every committed
+- [x] `CREATE TABLE foo (..., AUDIT TO foo_audit)` — every committed
       mutation appends `(op, NEW or OLD, ts, causation_user)` to the
       audit table. Auto-creates the audit table on first reference.
-- [ ] `CREATE TABLE foo (..., deleted_at TIMESTAMPTZ SOFT DELETE)` —
+- [x] `CREATE TABLE foo (..., deleted_at TIMESTAMPTZ SOFT DELETE)` —
       `DELETE FROM foo WHERE …` rewrites to `UPDATE foo SET deleted_at
       = now() WHERE …`; `SELECT` filters out non-NULL `deleted_at` by
       default unless caller opts in via `INCLUDE DELETED`.
-- [ ] Test: each declarative mode round-trips, independent of the
+- [x] Test: each declarative mode round-trips, independent of the
       others; AUDIT mode emits one row per mutation; SOFT DELETE
       round-trips via REST + pgwire.
 
@@ -554,18 +562,18 @@ inline in the executor — does NOT depend on Tier 0.**
 Reusable typed constraints. Every modern PG schema uses enums for
 status columns; domains for reusable validations.
 
-- [ ] `CREATE TYPE order_status AS ENUM ('pending', 'paid', ...)` parser
+- [x] `CREATE TYPE order_status AS ENUM ('pending', 'paid', ...)` parser
       + catalog (`enum_types` table; one row per `(project, name,
       ordered_labels)`).
-- [ ] `CREATE DOMAIN positive_int AS INT CHECK (VALUE > 0)` parser +
+- [x] `CREATE DOMAIN positive_int AS INT CHECK (VALUE > 0)` parser +
       catalog.
-- [ ] Type-resolution path: catalog lookup before falling back to
+- [x] Type-resolution path: catalog lookup before falling back to
       built-in PG types.
-- [ ] `ALTER TYPE … ADD VALUE` (append-only — PG enums are
+- [x] `ALTER TYPE … ADD VALUE` (append-only — PG enums are
       append-only too).
-- [ ] `DROP TYPE`, `DROP DOMAIN` (cascade required if any column uses
+- [x] `DROP TYPE`, `DROP DOMAIN` (cascade required if any column uses
       the type).
-- [ ] Test: enum round-trip via REST + pgwire; comparison ordering
+- [x] Test: enum round-trip via REST + pgwire; comparison ordering
       matches declaration order; rejecting unknown enum value;
       domain `CHECK` enforced on INSERT.
 
@@ -574,13 +582,13 @@ status columns; domains for reusable validations.
 Drop the existing `cv_glue` stub. Independent of the other 5.11 work;
 the engine plumbing already exists in `basin-cv`.
 
-- [ ] `CREATE MATERIALIZED VIEW name AS query WITH (basin.continuous,
+- [x] `CREATE MATERIALIZED VIEW name AS query WITH (basin.continuous,
       refresh_interval = '5m', ...)` SQL surface → existing
       `Catalog::set_continuous_aggregate`.
-- [ ] `REFRESH MATERIALIZED VIEW name` SQL form → `CvRefresher::tick`
+- [x] `REFRESH MATERIALIZED VIEW name` SQL form → `CvRefresher::tick`
       one-shot.
-- [ ] `DROP MATERIALIZED VIEW`.
-- [ ] Test: SQL round-trip (CREATE → refresh → SELECT → DROP) against
+- [x] `DROP MATERIALIZED VIEW`.
+- [x] Test: SQL round-trip (CREATE → refresh → SELECT → DROP) against
       the engine; refresh-on-schedule wire-up survives a process restart.
 
 ### Tier 2 — Customer-signal-driven (~14-18 weeks, ship as Phase 0 demands)
@@ -593,15 +601,15 @@ suggested-priority; real order is whatever Phase 0 surfaces.
 The trigger primitive. `ReactorSink` implements `ChangeEventSink`,
 attached as **pre-commit** so reactor failures abort the mutation.
 
-- [ ] `ALTER TABLE … REACT ON {INSERT|UPDATE|DELETE} [WHEN (predicate)]
+- [x] `ALTER TABLE … REACT ON {INSERT|UPDATE|DELETE} [WHEN (predicate)]
       EXECUTE <sql_statement>` parser surface.
-- [ ] Reactor registry in catalog (`reactors` table; one row per
+- [x] Reactor registry in catalog (`reactors` table; one row per
       `(project, table, name, ops, when_predicate, body)`).
-- [ ] `ReactorSink` impl: on event, evaluate `WHEN` predicate, run body
+- [x] `ReactorSink` impl: on event, evaluate `WHEN` predicate, run body
       via existing engine path with `NEW` / `OLD` / `TG_OP` /
       `TG_TABLE_NAME` substituted.
-- [ ] `DROP REACTOR`, `ALTER REACTOR` (rename only for v0.1).
-- [ ] Test: counter-denormalization reactor (parent.child_count++);
+- [x] `DROP REACTOR`, `ALTER REACTOR` (rename only for v0.1).
+- [x] Test: counter-denormalization reactor (parent.child_count++);
       audit-side reactor; reactor fails → mutation rolls back; reactor
       respects RLS (sees full row, downstream SELECT applies filter).
 
@@ -624,19 +632,19 @@ fanout. `WebhookSink` implements `ChangeEventSink`, attached as
 `crates/basin-webhooks` workspace member; reuses `basin-net` for
 the actual HTTP path.
 
-- [ ] `ALTER TABLE … SUBSCRIBE WEBHOOK TO '<url>' ON {INSERT|UPDATE|
+- [x] `ALTER TABLE … SUBSCRIBE WEBHOOK TO '<url>' ON {INSERT|UPDATE|
       DELETE} [WHERE …]` parser + catalog persistence.
-- [ ] Disk-backed retry queue (`basin-wal` sidecar; idempotency-keyed
+- [x] Disk-backed retry queue (`basin-wal` sidecar; idempotency-keyed
       so dupes don't double-process); worker drains the queue with
       exponential backoff to the configured URL via `basin-net`.
-- [ ] Dead-letter after `max_retries` (configurable, default 16);
+- [x] Dead-letter after `max_retries` (configurable, default 16);
       surface dead letters via a `webhook_dead_letters` table.
-- [ ] Reuses basin-net's URL allowlist + per-project rate limit + body
+- [x] Reuses basin-net's URL allowlist + per-project rate limit + body
       cap + timeout — already tested.
-- [ ] Stale-subscription cleanup: customer endpoint down for > 24h →
+- [x] Stale-subscription cleanup: customer endpoint down for > 24h →
       auto-pause subscription + audit log entry; resume requires
       explicit `RESUME WEBHOOK`.
-- [ ] Test: webhook fires on matching event; retries on transient HTTP
+- [x] Test: webhook fires on matching event; retries on transient HTTP
       failure; idempotency key dedupes after retry; dead-letter row
       created after max_retries; webhook does NOT fire when WHERE
       predicate is false; auto-pause kicks in after sustained failures.
@@ -646,10 +654,10 @@ the actual HTTP path.
 Multi-row return — function call becomes a derived table at planning
 time. Same inlining trick as scalar functions.
 
-- [ ] `CREATE FUNCTION name(args) RETURNS TABLE(col1 type, ...)
+- [x] `CREATE FUNCTION name(args) RETURNS TABLE(col1 type, ...)
       LANGUAGE sql AS $$ SELECT … $$` parser + catalog.
-- [ ] Planning-time inlining as a derived table.
-- [ ] Test: `recent_orders(uid)` round-trips; `SELECT * FROM
+- [x] Planning-time inlining as a derived table.
+- [x] Test: `recent_orders(uid)` round-trips; `SELECT * FROM
       recent_orders(...)` planning works alongside JOINs.
 
 #### 5.11.F — Multi-statement `CALL` procedures (~2 weeks, depends on 5.11.D)
@@ -671,15 +679,15 @@ Sequence of SQL statements with parameter binding, no control flow.
 Modern PG syntax for computed columns persisted at write time. Cleaner
 than `LANGUAGE sql` functions for the simplest case.
 
-- [ ] `CREATE TABLE foo (..., full_name TEXT GENERATED ALWAYS AS
+- [x] `CREATE TABLE foo (..., full_name TEXT GENERATED ALWAYS AS
       (first_name || ' ' || last_name) STORED)` parser + catalog.
-- [ ] Engine evaluates the expression on every INSERT/UPDATE row;
+- [x] Engine evaluates the expression on every INSERT/UPDATE row;
       reads return the stored value.
-- [ ] Reject `INSERT`/`UPDATE` writing directly to a generated column
+- [x] Reject `INSERT`/`UPDATE` writing directly to a generated column
       with SQLSTATE `42601 syntax_error`.
-- [ ] `VIRTUAL` (computed-on-read) variant explicitly out of scope for
+- [-] `VIRTUAL` (computed-on-read) variant explicitly out of scope for
       v0.1 — STORED only.
-- [ ] Test: generated column round-trip; expression composing built-ins
+- [x] Test: generated column round-trip; expression composing built-ins
       from 5.11.A; rejection of direct write.
 
 #### 5.11.K3 — Sequences (`CREATE SEQUENCE`, `nextval`, `currval`) (~2 weeks) ✅ shipped (catalog API + scalar UDFs `nextval`/`currval`/`setval` + `CREATE SEQUENCE` / `DROP SEQUENCE` SQL surface + multi-option grammar via textual pre-screen — works around sqlparser 0.52's single-option limitation per the production fix)
@@ -687,15 +695,15 @@ than `LANGUAGE sql` functions for the simplest case.
 Custom auto-increment, gap-tolerant counters. Most new SaaS uses ULID/
 UUID, but a real slice still wants sequences for human-readable IDs.
 
-- [ ] `CREATE SEQUENCE name [START n] [INCREMENT n]` parser + catalog
+- [x] `CREATE SEQUENCE name [START n] [INCREMENT n]` parser + catalog
       (`sequences` table; per-project; persisted current value).
-- [ ] `nextval(name)`, `currval(name)`, `setval(name, n)` functions.
-- [ ] `DEFAULT nextval('seq_name')` column default integration.
-- [ ] Concurrent-safety: per-`(project, sequence)` mutex around the
+- [x] `nextval(name)`, `currval(name)`, `setval(name, n)` functions.
+- [x] `DEFAULT nextval('seq_name')` column default integration.
+- [x] Concurrent-safety: per-`(project, sequence)` mutex around the
       increment; cached blocks of N for high-rate sequences (cache
       size from `WITH CACHE n` clause).
-- [ ] `DROP SEQUENCE` (cascade if columns reference it).
-- [ ] Test: 10 concurrent `nextval` calls produce 10 distinct values;
+- [x] `DROP SEQUENCE` (cascade if columns reference it).
+- [x] Test: 10 concurrent `nextval` calls produce 10 distinct values;
       cache flushed on engine restart (gap is acceptable, duplicate
       is not); cross-project isolation (project A's `nextval` doesn't
       touch project B's sequence).
@@ -710,18 +718,22 @@ introspects) queries these. Without them, the "PG-compatible" claim
 fails at first contact with real tooling. **PostgREST alone runs ~200
 catalog queries on startup.**
 
-- [ ] `information_schema.tables`, `.columns`, `.key_column_usage`,
+- [x] `information_schema.tables`, `.columns`, `.key_column_usage`,
       `.table_constraints`, `.referential_constraints`, `.routines`,
-      `.parameters`, `.views`, `.schemata`.
-- [ ] `pg_catalog.pg_class`, `.pg_attribute`, `.pg_namespace`,
-      `.pg_index`, `.pg_constraint`, `.pg_type`, `.pg_proc`, `.pg_am`.
-- [ ] Project-scoped: each project sees only its own objects in catalog
+      `.parameters` (subset), `.views`, `.schemata`.
+- [x] `pg_catalog.pg_class`, `.pg_attribute`, `.pg_namespace`,
+      `.pg_index`, `.pg_constraint`, `.pg_type`, `.pg_proc`, `.pg_depend`,
+      `.pg_authid` (`pg_am` deferred — none of the bootstrap-query tooling
+      we tested probes it).
+- [x] Project-scoped: each project sees only its own objects in catalog
       views (RLS-style filter built into the view definition).
-- [ ] Tooling integration tests: PostgREST startup against Basin
-      succeeds; pgAdmin schema-browser populates correctly; a
-      mainstream ORM (Sequelize? Prisma?) introspects without error.
-- [ ] Documented compat matrix: which PG-specific oid columns return
-      stable values, which return NULL, which raise.
+- [x] Tooling integration tests: PostgREST + pgAdmin + Prisma + Sequelize
+      + SQLAlchemy startup queries verified by
+      `tests/integration/tests/postgrest_pgadmin_compat.rs` +
+      `tests/integration/tests/orm_compat.rs`.
+- [x] Documented compat matrix: which PG-specific oid columns return
+      stable values, which return NULL, which raise (see CAPABILITIES.md
+      `information_schema` + `pg_catalog` row).
 
 #### 5.11.J — WASM UDFs (~3-4 weeks, customer-gated)
 
@@ -779,6 +791,327 @@ is the bigger commitment — `information_schema` (5.11.M) is the
 unblocker for proper PG-ecosystem tooling and worth the 6-8 weeks once
 Tier 1 customers are in production. Reopen ADR 0012 only if both gating
 conditions in its "Trigger to revisit" section are met.
+
+## Phase 5.12 — Storage perf & Vortex (PR #161 / #162) — **shipped**
+
+See [ADR 0015](./docs/decisions/0015-vortex-storage-format.md). Vortex
+opted-in 2026-05-11, flipped to default 2026-05-18 with the correctness
+prerequisites done. ~50 perf commits landed across #161 + #162. The
+88-shape `vortex_vs_parquet_smoke` battery characterizes the win
+honestly: ~15-40× on metadata-only aggregates, 1.3-1.7× on most join
+shapes, on-par-to-better on scans, and explicitly trailing on
+point-lookup latency (≈0.65×) and `ORDER BY … LIMIT` (≈0.38×).
+
+- [x] **5.12.A** Vortex codec encode/decode + writer wiring — `vortex`
+      0.70 + BtrBlocks cascade with `.with_compact()`. Files:
+      `crates/basin-storage/src/vortex_format.rs`. Acceptance gate:
+      Vortex round-trip integration test passes (commit `8b17e35`,
+      `57a9152`, `15414d3`).
+- [x] **5.12.B** Per-table `WITH (basin.file_format = 'vortex')` opt-in
+      — Lanes 1–8 in commits `ff51efd` … `654c339`. Files:
+      `crates/basin-catalog/src/metadata.rs` (`TableFileFormat`),
+      `crates/basin-engine/src/executor.rs` (WITH-clause strip).
+      Acceptance gate: end-to-end opt-in CREATE/INSERT/SELECT round-trip
+      (`f8f7b13`).
+- [x] **5.12.C** Vortex-default flip (2026-05-18) — `988fe7d`,
+      `7dbe214`. Acceptance gate: zero net regressions vs the
+      pre-existing Parquet baseline; `orm_compat` 19/19;
+      `sql_support_matrix` green.
+- [x] **5.12.D** Self-describing Vortex decode — `vortex_format::decode`
+      recovers Arrow schema from the file's own `DType` when no catalog
+      schema is supplied. `Utf8View`/`BinaryView` normalised to
+      canonical `Utf8`/`Binary`. Commits `88459dd`, `e2a1d27`,
+      `ba53254`.
+- [x] **5.12.E** Differential Vortex⇆Parquet correctness harness — asserts
+      byte-identical results across point / range / inequality / IS NULL /
+      string-eq / compound / aggregate / GROUP BY / ORDER BY+LIMIT /
+      projection / full-scan + DELETE/UPDATE rewrite, on multi-file tables.
+      File: `tests/integration/tests/vortex_parquet_differential.rs`
+      (commit `b99cbc6`). Acceptance gate: 0 differential rows.
+- [x] **5.12.F** Metadata-only aggregate fast path (~30-40×) — bare
+      `COUNT/SUM/MIN/MAX` bypass DataFusion and answer from Vortex
+      footer / catalog `column_stats`. Files:
+      `crates/basin-engine/src/fast_select.rs`. Commits `2e4610a`,
+      `727b7b6`, `649e1dc`. Acceptance gate: `aggregate_full` shape goes
+      from 1.2× to 38×.
+- [x] **5.12.G** `basin.sort_by` compound DDL option (WEDGE 4) — declares
+      `file_sort_order`; the writer enforces it via `lexsort_to_indices`
+      + `take` before flush. Commits `905de49`, `00107eb`. Files:
+      `crates/basin-storage/src/writer.rs`. Acceptance gate: window
+      shapes whose `PARTITION BY` / `ORDER BY` match the declared sort
+      recover scan-as-presorted plans.
+- [x] **5.12.H** `basin.row_block_size` per-table DDL option — per-table
+      chunk granularity. Commit `dc8cd96`. File:
+      `crates/basin-engine/src/executor.rs`.
+- [x] **5.12.I** FileMetadataCache wired into RuntimeEnv + VortexFooterCache —
+      eliminates per-iteration footer re-parse. Commits `d26a92d`,
+      `f5c01ef`.
+- [x] **5.12.J** Utf8/Binary → Utf8View promotion in schema. Commit
+      `8e471ef`. File: `crates/basin-engine/src/executor.rs`.
+      **VIEWPROMOTE — retirement note:** redundant the moment
+      DataFusion 54+ ships full Utf8View UDF support. Track upstream
+      `apache/datafusion#<viewtype-udf>`; file an upstream issue
+      cataloguing the UDF gaps Basin worked around; retire this rewrite
+      when subsumed.
+- [x] **5.12.K** UNION ALL of same-table scans → single scan + OR. Commit
+      `47860f1` (+ `a2d9641` projection restore). File:
+      `crates/basin-engine/src/executor.rs`. **UNIONSCAN — upstream
+      candidate:** this is a clean logical-plan rewrite that has no
+      Basin-specific dependency. File as a DataFusion logical optimizer
+      RFC and retire when accepted upstream.
+- [x] **5.12.L** `NULLIF(a,b) IS [NOT] NULL` → conjunction analyzer
+      rewrite. Commits `218a5c6`, `6f32a08` (+ revert/restore noise).
+      File: `crates/basin-engine/src/executor.rs`. **NULLIF rewrite —
+      upstream candidate:** belongs in DataFusion's `SimplifyExpressions`
+      analyzer pass; file an issue + PR upstream and retire the Basin
+      copy when subsumed.
+- [x] **5.12.M** Low-cardinality GROUP BY COUNT(*) fast path — commit
+      `cd5b626`. File: `crates/basin-engine/src/fast_select.rs`.
+- [x] **5.12.N** STREAMLIMIT — force single-partition stream for OFFSET on
+      sort-matching scan. Commit `f7f1d9e`. File:
+      `crates/basin-engine/src/executor.rs`. **STREAMLIMIT — retirement
+      note:** retire when DataFusion's `LimitPushdown` handles
+      single-partition streaming for sort-matching OFFSET. File the
+      upstream issue describing the gap (`OFFSET N` with a presorted
+      input that matches the requested order should not require a
+      coalescing step).
+- [x] **5.12.O** 88-shape `vortex_vs_parquet_smoke` benchmark battery —
+      commits `fe9b37f`, `d00592c`, `19278fb`, `da83f0c`. File:
+      `tests/integration/tests/vortex_vs_parquet_smoke.rs`. Acceptance
+      gate: the smoke battery runs green at the configured scale
+      (10k/25k/100k; 1M opt-in) and produces the per-shape ratio
+      reported in CHANGELOG / WEDGE.
+
+## Phase 5.13 — pg_query parser migration (ADR 0014)
+
+See [ADR 0014](./docs/decisions/0014-pg-query-as-canonical-parser.md).
+Three migration phases; Phase 1 in flight, Phase 2 starting, Phase 3
+gated on Phase 2 completion.
+
+- [x] **5.13.A** libpg_query as canonical front-end (Phase 1) — `pg_query`
+      6.x vendored; `crates/basin-engine/src/pg_ast.rs` ships `parse`,
+      `ParseTree`, `stmt_kind`, `StmtKind`, `reject_unsupported`. Every
+      incoming statement parses through the real PostgreSQL 16 parser
+      first; unsupported kinds rejected with SQLSTATE 0A000 before
+      sqlparser sees them. `BASIN_PG_QUERY` env gate is on by default.
+      Acceptance gate: every `tests/integration/tests/*` passes with
+      the gate on; rejected statements emit clean 0A000 not opaque
+      sqlparser errors. Files: `crates/basin-engine/src/pg_ast.rs`,
+      `crates/basin-engine/src/executor.rs`.
+- [~] **5.13.B** Typed AST matches replacing textual prescreens (Phase 2)
+      — the 14 textual pre-screens in `executor.rs` migrate to `pg_ast`
+      AST matches one at a time. Agents 2–4 split: (i) DDL pre-screens
+      (`ALTER TYPE … ADD VALUE`, `CREATE DOMAIN`, Basin-specific
+      `ALTER TABLE` extensions), (ii) DML / mutation pre-screens, (iii)
+      function / procedure / reactor pre-screens. Acceptance gate per
+      migration: pre-screen test suite passes with the AST match
+      replacing the regex; no new diffs in `sql_support_matrix`.
+      Files: `crates/basin-engine/src/executor.rs` (per-pre-screen),
+      `crates/basin-engine/src/pg_ast.rs` (typed matches).
+- [ ] **5.13.C** Unconditional pg_query path (Phase 3) — Agent 5 flips
+      `BASIN_PG_QUERY` unconditional and removes the sqlparser
+      front-end from the executor's hot path. sqlparser stays only for
+      legacy module-internal node bodies until Phase 2's full translator
+      lands. Acceptance gate: env var removed; sqlparser dependency
+      gated to translator-only.
+
+## Phase 5.14 — Durable Basin moat: HTAP + catalog-driven optimization (next 3 months)
+
+**Strategic framing (2026-05-19 stakeholder discussion):** Basin's
+durable advantage is the **catalog + storage-orchestration + multi-tenant
+layer**. The next 3 months invest there exclusively. Optimizer-rule
+shims that will eventually be subsumed by upstream Vortex / DataFusion
+are explicitly deprioritized — we file those as upstream PRs instead
+(see retirement notes in Phase 5.12.J / .K / .L / .N).
+
+Four items, ordered by independent shippability. Each has a file scope
+and an acceptance gate so it can be picked up by a sonnet agent.
+
+### 5.14.A — Catalog blooms (~1 week, no deps)
+
+Per-file bloom filters in `DataFileRef.bloom_filters`, computed at write
+time for `global_sort_order` columns and probed in
+`fast_select.rs::execute_simple_select` before opening the Vortex file.
+Targets the `point_eq` miss path — today a miss still pays catalog
+metadata + footer open + decode.
+
+Design spec is complete (was task #23 in an earlier sweep). Storage
+layer lives in `crates/basin-catalog/src/metadata.rs` (`DataFileRef`).
+
+- [ ] **5.14.A1** Add `bloom_filters: HashMap<ColumnName, SerializedBloom>`
+      field to `DataFileRef`. Files: `crates/basin-catalog/src/metadata.rs`.
+      Acceptance gate: round-trip serialise/deserialise via InMemory +
+      Postgres impls.
+- [ ] **5.14.A2** Writer-side bloom computation for declared
+      `basin.sort_by` columns. Files: `crates/basin-storage/src/writer.rs`.
+      Acceptance gate: every committed file with `basin.sort_by` set
+      carries blooms for those columns.
+- [ ] **5.14.A3** Probe in `execute_simple_select` before file open.
+      Files: `crates/basin-engine/src/fast_select.rs`. Acceptance gate:
+      the `point_eq` miss shape in `vortex_vs_parquet_smoke` drops file
+      opens to zero (count via a perf counter exported through
+      `Engine::project_counters`).
+- [ ] **5.14.A4** Differential test: bloom false-negative rate is zero
+      (a bloom that says "definitely not present" must never be wrong);
+      bloom false-positive rate is bounded by configured target.
+      Files: `tests/integration/tests/catalog_blooms.rs`. Acceptance
+      gate: 1M-row 4-column bloom suite passes; FPR ≤ 1%.
+
+**Acceptance gate (composite):** `point_eq` miss shape in
+`vortex_vs_parquet_smoke` improves by ≥3× over today's baseline; the
+differential harness confirms zero false-negatives.
+
+### 5.14.B — HLL + t-digest sketches (~3-4 weeks, no deps on 5.14.A)
+
+Per-file HyperLogLog (cardinality) and t-digest (quantiles) sketches
+stored in catalog metadata. Powers `APPROX_COUNT_DISTINCT` UDF and
+`APPROX_PERCENTILE` UDF that no upstream component can ever provide
+for Basin — sketches are catalog-layer state, not query-engine state.
+
+Closes `count_distinct` and `percentile_cont` gaps via an
+approximation alternative. Sketches merge across files at query time.
+
+- [ ] **5.14.B1** Add `hll_sketches: HashMap<ColumnName, SerializedHll>`
+      and `tdigest_sketches: HashMap<ColumnName, SerializedTDigest>`
+      to `DataFileRef`. Files: `crates/basin-catalog/src/metadata.rs`.
+      Acceptance gate: round-trip serialise/deserialise via InMemory +
+      Postgres impls.
+- [ ] **5.14.B2** Writer-side sketch computation: HLL for every column,
+      t-digest for numeric columns. Use `hyperloglog-rs` + `tdigest`
+      crates (or established equivalents — pick at PR time). Files:
+      `crates/basin-storage/src/writer.rs`. Acceptance gate: every
+      committed file carries sketches.
+- [ ] **5.14.B3** `APPROX_COUNT_DISTINCT(col)` UDF — merges HLLs from
+      catalog-pruned files and returns estimate. Files:
+      `crates/basin-engine/src/udfs/approx.rs` (new module).
+      Acceptance gate: ≤2% error vs exact `COUNT(DISTINCT col)` on the
+      88-shape battery.
+- [ ] **5.14.B4** `APPROX_PERCENTILE(col, p)` UDF — merges t-digests
+      and returns quantile. Files: `crates/basin-engine/src/udfs/approx.rs`.
+      Acceptance gate: ≤1% absolute error vs exact `percentile_cont(p)`
+      on the 88-shape battery.
+- [ ] **5.14.B5** Differential test: 1M-row table; assert sketch-merge
+      results within bounds across every file count from 1 to 100.
+      Files: `tests/integration/tests/sketches.rs`. Acceptance gate:
+      every shape within bounds.
+
+**Acceptance gate (composite):** `count_distinct` and `percentile_cont`
+gaps close via the `APPROX_*` alternative; correctness bounds (≤2%
+HLL, ≤1% t-digest) honoured on the differential harness.
+
+### 5.14.C — Row-format hot buffer for HTAP (~3 months on its own — the architectural moat)
+
+The architectural commitment. LSM-style memtable for recent writes
+(row-formatted, PK-indexed). Flushed to Vortex on threshold. Reads
+merge memtable + Vortex. Closes the OLTP `point_eq` HIT path floor
+and single-row UPDATE latency. **This is what differentiates Basin
+from "Parquet + DataFusion in a bucket."**
+
+Precedent: SingleStore (rowstore tier), ClickHouse `ReplacingMergeTree`,
+Apache Pinot (real-time segments). All three couple a row-formatted
+hot tier with a column-formatted cold tier and merge at read time.
+
+Lives in a new crate `crates/basin-hottier/` (separate from `basin-shard`
+because the lifecycle is different and the data structures don't share
+much with the WAL→Parquet compactor).
+
+- [ ] **5.14.C1** `MemTable` data structure — Arc-shared, lock-free reads,
+      single-writer per-`(project, table)`. PK-indexed B-tree or
+      skip-list; row-formatted Arrow `StructArray` slabs. Files:
+      `crates/basin-hottier/src/memtable.rs` (new). Acceptance gate:
+      benchmark `memtable_insert` ≥ 100k rows/s single-thread debug,
+      ≥ 1M rows/s release.
+- [ ] **5.14.C2** Write-path integration — engine INSERT/UPDATE/DELETE
+      writes to memtable instead of WAL+Parquet for hot tier. WAL still
+      durability-anchors. Files:
+      `crates/basin-engine/src/executor.rs` (mutation path),
+      `crates/basin-shard/src/lib.rs` (route hot vs cold). Depends on
+      5.14.C1. Acceptance gate: `single_row_update_latency` p99 drops
+      ≥10× vs today's Parquet-rewrite path.
+- [ ] **5.14.C3** Read-merge: scan path merges memtable rows with the
+      Vortex base. Tombstone resolution for DELETE; latest-version-wins
+      for UPDATE per PK. Files:
+      `crates/basin-hottier/src/merge.rs` (new),
+      `crates/basin-engine/src/scan.rs` (integration). Depends on
+      5.14.C1 + 5.14.C2. Acceptance gate: `point_eq` HIT shape in
+      `vortex_vs_parquet_smoke` lands at p99 ≤ 2ms warm.
+- [ ] **5.14.C4** Flush — threshold-driven (size + age) Vortex compaction
+      from memtable. Atomic catalog commit; memtable rows GC'd post-commit.
+      Files: `crates/basin-hottier/src/flush.rs` (new). Depends on
+      5.14.C1+C2+C3. Acceptance gate: 1M-row mixed workload flushes
+      without read-stall; no row loss verified by differential.
+- [ ] **5.14.C5** Multi-tenant isolation: per-project memtable cap +
+      shared heavy resource (the in-process slab allocator), cheap
+      per-tenant primitive (counter + semaphore) — per [Multi-tenant
+      isolation must scale](file:///Users/pc/.claude/projects/-Users-pc-code-exo-basin/memory/feedback_multitenant_isolation.md).
+      Files: `crates/basin-hottier/src/registry.rs` (new). Depends on
+      C1. Acceptance gate: per-project byte usage scales O(bytes), not
+      O(pool); a 10k-tenant fuzz test fits in a 4GB heap.
+- [ ] **5.14.C6** Differential harness vs Parquet-only path — every
+      shape in `vortex_vs_parquet_smoke` runs identically when the
+      hot tier is empty (no rows in memtable), and identically when
+      everything is in memtable (all rows in memtable, no Vortex files
+      yet). Files: `tests/integration/tests/hottier_differential.rs`.
+      Acceptance gate: 0 differential rows.
+
+**Acceptance gate (composite):** OLTP `point_eq` HIT p99 ≤ 2ms warm;
+single-row UPDATE p99 ≤ 5ms; 10k-tenant fuzz fits in 4GB heap; 0
+differential rows vs Parquet-only baseline.
+
+### 5.14.D — Adaptive write-time multi-sort + catalog-aware WindowExec (~6 weeks combined, no deps)
+
+Two write-time / planner pieces that rely on Basin's catalog as a
+planning input that upstream cannot see. Closes `order_by_multi`,
+`window_partition_sum`, and `lag_lead_window`.
+
+- [ ] **5.14.D1** Query-history collector — record observed
+      `ORDER BY` / `PARTITION BY` shapes per `(project, table)` in
+      catalog metadata. Files:
+      `crates/basin-catalog/src/query_history.rs` (new). Acceptance
+      gate: top-N shapes per table queryable via internal API.
+- [ ] **5.14.D2** Compaction-time multi-sort — compactor consults the
+      query-history top-N and re-sorts the output Vortex file by the
+      most common shape (currently the compactor only emits insertion
+      order or the declared `basin.sort_by`). Files:
+      `crates/basin-shard/src/compactor.rs`. Depends on 5.14.D1.
+      Acceptance gate: `order_by_multi` shape in
+      `vortex_vs_parquet_smoke` improves ≥2× after a compaction sweep.
+- [ ] **5.14.D3** Catalog-aware `WindowExec` — custom DataFusion
+      `ExecutionPlan` that consults `basin.sort_by` / discovered
+      file-sort-order via the catalog and skips the full sort when the
+      window's `PARTITION BY` matches. Files:
+      `crates/basin-engine/src/physical/window_exec.rs` (new).
+      Acceptance gate: `window_partition_sum` + `lag_lead_window` plans
+      drop the `SortExec` step when sort-matching is detected, verified
+      by `EXPLAIN ANALYZE`.
+- [ ] **5.14.D4** Multi-sort + catalog-aware WindowExec differential —
+      assert identical results vs the today-baseline plan. Files:
+      `tests/integration/tests/catalog_window.rs`. Acceptance gate: 0
+      differential rows on the relevant 88-shape battery slice.
+
+**Acceptance gate (composite):** `order_by_multi` ≥2× faster after
+compaction; `window_partition_sum` + `lag_lead_window` drop their
+`SortExec`; 0 differential rows.
+
+### Dependencies + sequencing
+
+- **5.14.A** (blooms) can start immediately, no deps.
+- **5.14.B** (sketches) can start immediately, no deps on A.
+- **5.14.D** (multi-sort + WindowExec) can start immediately, no deps
+  on A or B.
+- **5.14.C** (hot tier) is the 3-month commitment — start once A is in
+  and at least one of B or D is in motion, to avoid blocking the moat
+  on the easier wins.
+
+### Explicitly NOT in 5.14 (deprioritized per 2026-05-19 strategic call)
+
+- Further tactical optimizer rules that look like 5.12.J / .K / .L / .N.
+  Those go upstream as DataFusion / Vortex PRs; the Basin copy retires
+  when subsumed.
+- Any feature that does not depend on Basin's catalog + multi-tenant
+  layer for correctness (i.e., anything that could equally well ship in
+  upstream Vortex or upstream DataFusion).
+- WebSocket realtime (still gated per ADR 0012 trigger).
 
 ## Phase 6 — Production hardening (3–4 months)
 
@@ -845,29 +1178,55 @@ conditions in its "Trigger to revisit" section are met.
 - [ ] Bug bounty program before public beta
 - [ ] Security review at each phase boundary
 
-## Known v0.1 gaps — from production benchmark (2026-05-12)
+## Known v0.1 gaps — refreshed 2026-05-19
 
-Discovered while running `basin-cloud/backend/cmd/neonbench` against a live
-basin-engine v0.1.5 deployment on Fly (`fra.db.basin.to`). The bench harness
-exercises CREATE/INSERT/SELECT/JOIN/GROUP BY/UPDATE/DROP against a 3-table
-schema with foreign keys. **What worked:** multi-row VALUES inserts (100
-rows in 907 ms), 2-table JOINs (400-500 ms), 3-table JOINs (215-900 ms),
-GROUP BY (220 ms), foreign-key enforcement on INSERT (`23503` rejected
-correctly), per-project pgwire credential auth, persistence across sessions.
-**What didn't:**
+The original 2026-05-12 production-benchmark gap list is largely closed.
+Everything tracked here is the **honest live set**; the canonical
+per-syntax matrix is auto-generated from tests and lives at
+[`docs/sql-support.md`](./docs/sql-support.md) — that is the source of
+truth, this list is the human-readable summary.
 
-- [ ] `BEGIN TRANSACTION READ WRITE` — driver-implicit tx around prepared-statement bulk inserts (`lib/pq`, JDBC, npgsql, …) rejected with `unsupported in PoC: BEGIN TRANSACTION READ WRITE` (SQLSTATE XX000). Tracked in Phase 5 single-shard transactions; see CAPABILITIES.md Transactions row.
-- [ ] `DROP TABLE [IF EXISTS]` — rejected with `unsupported in PoC: DROP TABLE …` (XX000). Pair with the transactions ship in Phase 5 since both share the catalog mutation path.
-- [ ] `CREATE TABLE IF NOT EXISTS` — clause is parsed but ignored; basin returns `catalog error: table … already exists` when the table exists. Make the planner respect `if_not_exists: true` on `Statement::CreateTable`.
-- [ ] `INSERT … ON CONFLICT DO NOTHING` / `DO UPDATE` — clause is parsed but **silently ignored** at execution; INSERT runs as if the clause weren't there. Worse than rejecting (drivers think conflict handling worked). Couples to Phase 5.7 B1 secondary indexes.
-- [ ] `UPDATE … SET col = <expression>` — RHS must be a literal or a single bind parameter; expressions like `col || 'literal'`, `col + 1`, or function calls error with `expected literal of type Utf8 …`. Engine planner needs to accept `Expr` in `Assignment.value`, not just `Value`.
-- [ ] `UPDATE … WHERE col IN (SELECT …)` / `WHERE EXISTS (SELECT …)` — subquery in WHERE rejected with `WHERE clause not representable in v0.1`. The DML mutate path doesn't lower `Expr::Subquery`.
-- [ ] `SELECT *` Arrow-projection error — fails on specific column-shape combinations (`BIGSERIAL PK + TEXT + TEXT UNIQUE + TIMESTAMPTZ DEFAULT now()`) with `expected '32' at position N; got 'M'`. Workaround is explicit-column SELECT. Root cause: type-OID encoding mismatch on the wire (Arrow → pgwire row description). Reproducer in the bench's `bench_users` shape.
-- [ ] `pg_catalog` UDFs psql uses for meta-commands — `pg_table_is_visible`, `pg_get_userbyid`, `pg_get_function_arguments`, `pg_get_indexdef`, etc. The 17 views in Phase 5.11.M ship but the helper UDFs don't, so `\dt` / `\d` / `\df` all error out. Pair with the next basin-trgm / basin-net SQL-surface ship since it's also a UDF-registry batch.
+**Shipped since 2026-05-12 (struck from the gap list):**
 
-**SQL-compat milestone (2026-05-15):** fragment-level coverage lifted from ~75% to **97.2%** (423 / 435 non-design-excluded fragments). Remaining real v0.2 gaps: `LATERAL` joins, `WITH RECURSIVE` + DML-in-CTE, advanced window frames (`RANGE INTERVAL` / `GROUPS` / `EXCLUDE`), `JSON_AGG(t)` whole-row, `EXCLUDE USING gist`. See [`docs/sql-support.md`](./docs/sql-support.md) for the full matrix.
+- ✅ `DROP TABLE [IF EXISTS]` — `drop_table_removes_existing_table` (task #49,
+  commit `10288ed`).
+- ✅ `CREATE TABLE IF NOT EXISTS` — `if_not_exists: true` honoured;
+  `create_table_if_not_exists_creates_when_absent` /
+  `create_table_if_not_exists_noop_when_exists` (task #49, commit `10288ed`).
+- ✅ `INSERT … ON CONFLICT DO NOTHING` — single-column conflict-target match
+  suppresses UNIQUE violation (#75, commit `b66403e`).
+- ✅ `INSERT … ON CONFLICT DO UPDATE` — `table.col` + `EXCLUDED.col` resolution
+  (#74, commit `a49e58a`).
+- ✅ Real BEGIN/COMMIT/ROLLBACK + SAVEPOINT — `f4127e9` (#92, completes #83):
+  defer commits in-tx, ROLLBACK undo, SAVEPOINT stack, aborted state. Driver-
+  implicit `BEGIN TRANSACTION READ WRITE` no longer rejects.
+- ✅ `UPDATE … SET col = <expression>` / `UPDATE … SET col = (SELECT …)` —
+  expressions in assignment RHS, including scalar subqueries (#106, commit
+  `3e619e0`); `UPDATE … WHERE id IN (SELECT …)` restored after #66 regressed it
+  (#76, commit `0efaf93`).
+- ✅ `pg_catalog` UDFs for meta-commands — 20 stubs shipped (`pg_table_is_visible`,
+  `pg_get_userbyid`, `pg_get_function_arguments/result/identity_arguments`,
+  `pg_get_expr`, `pg_get_indexdef`, `format_type`, `pg_get_constraintdef`,
+  `pg_total_relation_size`, etc.). See CAPABILITIES.md psql `\dt` row.
 
-Bench artefacts: the patched harness lives at `basin-cloud/backend/cmd/neonbench/main.go` (multi-row VALUES + literal-RHS UPDATE + best-effort DROP + per-table CREATE with "already exists" tolerated). The Postgres compat matrix in basin-cloud/src/pages/docs/PostgresCompat.jsx mirrors these gaps for end-users.
+**Remaining honest v0.2 gaps:**
+
+- [ ] `LATERAL` joins — uncorrelated strip + nested-aggregate ORM rewrite
+  shipped (commit `4faa5d7`); correlated decorrelation for non-aggregate row-
+  returning bodies (#81, commit `6f7ab3c`); full advanced LATERAL still partial.
+- [ ] `WITH RECURSIVE` + DML-in-CTE — multi-column RECURSIVE shipped (#82,
+  commit `dae8765`); data-modifying CTEs shipped (commit `6056dca`); the
+  combination of recursive + DML in one CTE chain still partial.
+- [ ] Advanced window frames (`RANGE INTERVAL` / `GROUPS` / `EXCLUDE`).
+- [ ] `EXCLUDE USING gist` — not on roadmap (geo-index dependency).
+- [ ] `SELECT *` Arrow-projection failure on the rare `BIGSERIAL PK + TEXT +
+      TEXT UNIQUE + TIMESTAMPTZ DEFAULT now()` shape — root-caused to a
+      type-OID encoding mismatch on the wire (Arrow → pgwire row description);
+      workaround is explicit-column SELECT.
+
+**Live coverage:** see [`docs/sql-support.md`](./docs/sql-support.md) for the
+full per-fragment matrix (latest test expansion to 697 fragments via commit
+`39d51bb`).
 
 ## Critical rules (from the brief — re-read before scope-creep)
 

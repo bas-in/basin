@@ -77,3 +77,5 @@ table.
 | 0011 | Cross-shard 2PC | Accepted | Deferred; locked architecturally; gated on customer demand |
 | 0012 | Change event primitive | Accepted | ChangeEventSink trait; declarative lifecycle + reactors replace PL/pgSQL triggers |
 | 0013 | Auth per-project schema | Accepted | Removes loopback pgwire; auth data in per-project storage; auth.uid/role/jwt |
+| 0014 | pg_query as canonical parser | Accepted, in progress | libpg_query frontend; sqlparser-rs demoted to transitional fallback; DataFusion-sql to executor-only |
+| 0015 | Vortex storage format | Accepted | Vortex default since 2026-05-18; Parquet first-class selectable; ~1.95× smaller, on-par-to-better scan |

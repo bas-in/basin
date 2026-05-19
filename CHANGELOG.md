@@ -10,7 +10,186 @@ graduate to 1.0 and the standard SemVer guarantees.
 
 ## [Unreleased]
 
-### Added
+Strategic checkpoint 2026-05-19: durable-Basin-moat plan adopted (TASK.md
+Phase 5.14). Phase 5.12 perf + storage work, Phase 5.13 pg_query parser
+migration, multi-schema isolation phases A.1/A.2/A.3, real transaction
+semantics, and 88-shape Vortex⇆Parquet smoke battery all landed since
+v0.1.3.
+
+### Added — Storage (ADR 0015)
+- **Vortex storage default since 2026-05-18** ([ADR 0015](./docs/decisions/0015-vortex-storage-format.md)).
+  Opted-in 2026-05-11, default-flipped after correctness prerequisites
+  shipped (self-describing decode, view-type normalisation, catalog-stats
+  file pruning, format-aware compaction, format-agnostic vector-search).
+  ~1.95× smaller on disk; on-par-to-better full-scan / aggregate / string-eq
+  throughput vs ZSTD Parquet; trailing on point-lookup and ORDER BY+LIMIT.
+- **Self-describing Vortex decode** — `vortex_format::decode` recovers
+  Arrow schema from the file's own `DType` via `vf.dtype().to_arrow_schema()`
+  when no catalog schema is supplied; `Utf8View`/`BinaryView` normalised
+  to canonical `Utf8`/`Binary`.
+- **FileMetadataCache wired into RuntimeEnv** — eliminates per-iteration
+  footer re-parse.
+- **VortexFooterCache** — skips per-file footer re-parse on hot shapes.
+
+### Added — Performance fast paths (#161, #162)
+- **Metadata-only aggregate fast path (~30-40×)** — bare COUNT/SUM/MIN/MAX
+  answered from catalog `column_stats` + Vortex footer; bypasses
+  DataFusion entirely.
+- **Point / range / IS NULL / BETWEEN fast paths** — `fast_select.rs`
+  short-circuits common predicate shapes through the storage read layer,
+  with catalog-stats file pruning and Arrow post-filter where needed.
+- **Inequality predicate fast path** — `>`, `<`, `>=`, `<=` join the
+  point-eq fast path.
+- **ORDER BY single_col LIMIT n fast path** — pushed through the storage
+  read layer.
+- **Low-cardinality GROUP BY COUNT(*) fast path** — bypass DataFusion's
+  full aggregate executor for the common dashboard shape.
+- **`FAST-AGG-GROUPBY` aliased-projection support** — `expr_projection`
+  accepts aliased scalar projections; ORM-style `SELECT col AS alias`
+  hits the fast path.
+- **UNION ALL same-table collapse** — collapses UNION ALL of same-table
+  scans to a single scan + OR predicate; restores output projection
+  shape.
+- **`NULLIF(a,b) IS [NOT] NULL` analyzer rewrite** — rewrites to a plain
+  conjunction so Vortex's type-gated pushdown engages.
+- **`STREAMLIMIT`** — forces single-partition stream for OFFSET on
+  sort-matching scans; avoids the coalesce-then-skip overhead.
+- **Utf8/Binary → Utf8View promotion in schema** — recovers the
+  zero-copy view-array fast path for UDFs that accept the view types.
+- **Native Vortex projection + type-safe filter pushdown** — predicates
+  pushed into Vortex when the catalog schema proves the column's Arrow
+  type exactly matches the literal.
+- **Zero-copy `batch_df_to_ws` on SELECT hot path** — eliminates the
+  workspace-arrow ↔ DataFusion-arrow copy on SELECT.
+- **Scan concurrency = 8 on Vortex ListingTable** — recovers parallel
+  scan on multi-file Vortex tables.
+
+### Added — DDL options
+- **`basin.file_format`** per-table option — `CREATE TABLE … WITH
+  (basin.file_format = 'vortex' \| 'parquet')`. Vortex is the default
+  since 2026-05-18; Parquet remains first-class selectable per ADR 0015.
+- **`basin.sort_by`** compound DDL option (WEDGE 4) — declares
+  `file_sort_order`; the writer enforces it via `lexsort_to_indices`
+  + `take` before flush. Recovers window shapes whose `PARTITION BY` /
+  `ORDER BY` matches the declared sort.
+- **`basin.row_block_size`** per-table option — per-table chunk
+  granularity; tunes point-heavy vs scan-heavy shapes.
+
+### Added — Parser (ADR 0014)
+- **pg_query canonical front-end (Phase 1)** — `pg_query` 6.x vendored;
+  `crates/basin-engine/src/pg_ast.rs` ships `parse`, `ParseTree`,
+  `stmt_kind`, `StmtKind`, `reject_unsupported`. Every statement parses
+  through PostgreSQL 16's real parser first; unsupported kinds rejected
+  with SQLSTATE 0A000 before sqlparser sees them. `BASIN_PG_QUERY` env
+  gate enabled. Engine reuses the pg_query parse tree on re-entry to
+  eliminate duplicate C-library parses per query. See [ADR 0014](./docs/decisions/0014-pg-query-as-canonical-parser.md).
+- **`reject_unsupported` guard** — `LISTEN`, `NOTIFY`, `PREPARE`,
+  `DECLARE CURSOR`, `LOCK`, `VACUUM`, `CLUSTER`, `ANALYZE`,
+  `CREATE EXTENSION`, `CREATE TRIGGER` all return clean 0A000.
+
+### Added — Schema / multi-schema isolation (#116)
+- **A.1: `SchemaName` + `QualifiedTableName` types in `basin-common`** (#117).
+- **A.2: `QualifiedTableName` API + `InMemoryCatalog` schema-aware impl** (#118).
+- **A.3: `PostgresCatalog` schema-aware impl + `basin_schemas` table** (#119).
+- **+12 multi-schema differential cases** covering `CREATE SCHEMA` /
+  `DROP SCHEMA` / cross-schema queries (#146).
+
+### Added — Transactions
+- **Real `BEGIN`/`COMMIT`/`ROLLBACK` + `SAVEPOINT` semantics** (#92,
+  completes #83): commits deferred while in-transaction, ROLLBACK undoes,
+  SAVEPOINT stack supported, aborted-state recovery. Driver-implicit
+  `BEGIN TRANSACTION READ WRITE` no longer rejects.
+- **Optimistic-lock row-version verification under concurrent writers** (#103).
+- **`LATERAL generate_series` + SAVEPOINT rollback + CTAS WITH NO DATA**
+  (commit `92aa0d0`).
+- **Scalar subquery in `UPDATE SET`** (#106); `UPDATE … WHERE id IN
+  (SELECT …)` restored after #66 regressed it (#76).
+
+### Added — Wire protocol
+- **Real `NUMERIC` binary wire format** — varlena base-10000 encoding
+  (#141); previously was sending text bytes through the binary slot.
+- **Real `ARRAY` binary wire format** — PG list-element encoding (#144);
+  same fix.
+- **`TIMESTAMP`/`DATE` binary param decode** (#67).
+- **Extended-protocol `RETURNING`** — encode projected rows as DataRows
+  (#73).
+- **Reject multi-statement extended `Parse`** per PG spec (#68).
+
+### Added — DML / DDL completeness
+- **`DROP TABLE`** + **`IF NOT EXISTS` on CREATE TABLE** (#49).
+- **`INSERT … ON CONFLICT DO NOTHING`** — single-column conflict-target
+  match suppresses UNIQUE violation (#75).
+- **`INSERT … ON CONFLICT DO UPDATE`** — `table.col` + `EXCLUDED.col`
+  resolution (#74).
+- **Data-modifying CTEs** — `WITH x AS (INSERT/UPDATE/DELETE … RETURNING)
+  SELECT …` (commit `6056dca`).
+- **`MERGE` honest-reject** — silent-noop → 0A000 with reason; 3 stale
+  differential tests un-ignored (commit `975dd93`).
+- **`RLS WITH CHECK` enforcement** + real `TABLESAMPLE` + honest
+  `CREATE TRIGGER` (commit `c92675b`, paired with array-rewrite OOB fix).
+- **`SUBSTRING(x FROM 'regex')` POSIX-style first-match extraction** (#97).
+- **Correlated subqueries in DELETE/UPDATE** via SELECT-decorrelation path
+  (commit `6d04524`).
+- **Correlated `LATERAL` → JOIN decorrelation** for non-aggregate
+  row-returning bodies (#81).
+- **Multi-column `WITH RECURSIVE`** — propagate all CTE column aliases (#82).
+- **`int4range`/`int8range`/`numrange` arithmetic + multirange
+  containment** (#94).
+- **JSONB cast + extraction on text columns** — `data::jsonb->>'key'` (#88).
+- **JSON families** salvaged from dead-agent WIP (commit `4300c72`):
+  `json_to_record` / `jsonb_to_record AS t(coldefs)` (#78),
+  `json_agg(t)` whole-row (commit `78f8057`).
+- **Full-text search bounded subset** — `tsvector` / `tsquery` / `@@` /
+  `to_tsvector` / `to_tsquery` (#79).
+- **Exact `percentile_disc` / `mode()` WITHIN GROUP ordered-set
+  aggregates** (#77).
+- **INET/CIDR containment UDFs** (#153, partial).
+- **4 silent-corruption PG-compat CRITICALs** enforced honestly
+  (commit `25c42e3`).
+- **String / datetime / window PG-compat modules** salvaged from
+  quarantine (commit `41d4b03`).
+- **psql `\dt` / `\d` family** — 20 pg_catalog scalar stubs registered.
+- **dynamic per-project `max_connections`** enforced at pgwire (no
+  commercial coupling; commit `9385474`).
+
+### Added — Testing
+- **PG-oracle differential test harness** (25 initial cases, #129).
+- **+33 PG-compat differential cases** — extended params, COPY,
+  sequences, RECURSIVE, LATERAL, strings, arrays, NULLS, txn, CAST (#143).
+- **+12 multi-schema differential cases** (#146).
+- **88-shape `vortex_vs_parquet_smoke` benchmark battery** — robust
+  scale-configurable size × shape matrix (10k / 25k / 100k / 1M opt-in);
+  honest characterization in CHANGELOG / README / WEDGE.
+- **Vortex⇆Parquet differential correctness harness** — asserts
+  byte-identical results across point / range / inequality / IS NULL /
+  string-eq / compound / aggregate / GROUP BY / ORDER BY+LIMIT /
+  projection / full-scan + DELETE/UPDATE rewrite, on multi-file tables.
+- **5 speed scenarios for 4-way comparison** — basin vs PG vs Neon vs
+  Supabase (#145).
+- **Curated ORM/driver-compat suite** — param binding, nested reads,
+  RETURNING, txn, CTE (commit `8b71eca`).
+- **`orm_compat` 4 stale-ignore tests flipped green** — `json_agg`
+  JSONB wire type, `LATERAL ORDER BY` rewrite, correlated-subquery type
+  inference, `DELETE` alias (#93).
+- **SQL-compat matrix expanded 490 → 697 fragments** — honest coverage
+  (commit `39d51bb`).
+- **Coverage for error paths, transactions, and schema evolution**
+  (commit `d129b0e`).
+
+### Added — Auth (already in [Unreleased] but kept here for completeness)
+- `auth.uid()`, `auth.role()`, `auth.jwt()` SQL session functions — Supabase-compatible;
+  usable in RLS policies (`CREATE POLICY … USING (owner_id = auth.uid())`). Both
+  `auth.uid()` and `auth_uid()` spellings work.
+- Per-project auth schema — auth data now lives in each project's own Basin storage
+  (like Supabase's `auth` schema per project). No reserved internal project, no loopback
+  pgwire connection. See ADR 0013.
+- Self-routing pgwire credentials — `pgwire_user` format now encodes `project_id` as a
+  26-char ULID prefix, enabling credential validation without a global cross-project lookup.
+- `AuthStore` trait — pluggable auth storage; `PostgresAuthStore` for external Postgres,
+  `EngineAuthStore` (default) for in-process Basin storage. Zero external dependencies
+  for open source deployments.
+
+### Added — SQL-compat lift (already in [Unreleased])
 - **SQL-compat lift: ~75% → 97.2% fragment coverage.** 423 of 435
   non-design-excluded fragments now pass end-to-end (490 total; 55 are
   explicit design-exclusions). Key work shipped in this cycle:
@@ -27,27 +206,146 @@ graduate to 1.0 and the standard SemVer guarantees.
   DML-in-CTE, advanced window frames (`RANGE INTERVAL` / `GROUPS` /
   `EXCLUDE`), `JSON_AGG(t)` whole-row, `EXCLUDE USING gist`.
   See [`docs/sql-support.md`](./docs/sql-support.md).
-- `auth.uid()`, `auth.role()`, `auth.jwt()` SQL session functions — Supabase-compatible;
-  usable in RLS policies (`CREATE POLICY … USING (owner_id = auth.uid())`). Both
-  `auth.uid()` and `auth_uid()` spellings work.
-- Per-project auth schema — auth data now lives in each project's own Basin storage
-  (like Supabase's `auth` schema per project). No reserved internal project, no loopback
-  pgwire connection. See ADR 0013.
-- Self-routing pgwire credentials — `pgwire_user` format now encodes `project_id` as a
-  26-char ULID prefix, enabling credential validation without a global cross-project lookup.
-- `AuthStore` trait — pluggable auth storage; `PostgresAuthStore` for external Postgres,
-  `EngineAuthStore` (default) for in-process Basin storage. Zero external dependencies
-  for open source deployments.
 
 ### Changed
 - Basin-server startup order: auth initialises before pgwire (eliminates `DeferredAuthResolver`
   and `wait_for_pgwire_accept` polling loop).
 - `BASIN_AUTH_CATALOG_DSN` is now an optional external Postgres override rather than the
   default loopback path.
+- **Storage backend rename** — `r2` backend renamed to `s3_compatible`;
+  `R2Config` alias dropped (commit `88162d5`). docs replace Cloudflare R2
+  with Tigris; Apache DataFusion attribution added (commit `4e1f87c`).
+- **Workspace migration to arrow58 / df53 / sqlparser0.61 / object_store0.13**
+  (commit `2b51061`) — workspace compiles clean; test modules updated.
+- **CHECK constraints** — store bare predicate and strip wrapper at
+  enforce time (commit `5bd3253`).
+- **Router accept hot path** — replaced per-accept `Mutex` with `RwLock`
+  in `LiveCounts`; dropped Arc on `conn_guard` (commit `25ddba5`).
+- **Storage scan** — cut per-row-group allocs; eliminated redundant
+  `HEAD` (commit `6f09793`); router-side per-row `BytesMut` /
+  per-cell `String` allocs eliminated on the text encoding path
+  (commit `af790e3`).
+
+### Removed
+- **`basin-cloud` / `basin-billing` crates** out of OSS repo — hosted
+  product items moved to a separate (closed-source) `basin-cloud` repo.
+  The OSS engine ships `EncryptionProvider` / `BillingProvider`-shaped
+  traits; external callers wire their own adapters. `CLOUD_ROADMAP.md`
+  removed.
 
 ### Migration
 - Existing `pgwire_user` credentials in the old `project_<hex>` format are automatically
   rotated to the new `{project_id}_{hex}` format on first startup after upgrade.
+- Existing tables without a recorded `basin.file_format` continue to read
+  and write as Parquet (zero migration); new tables default to Vortex.
+
+## [0.1.9] - 2026-05-17
+
+Vortex storage default ship batch. See [ADR 0015](./docs/decisions/0015-vortex-storage-format.md).
+
+### Added
+- Vortex codec encode/decode + writer wiring (Phase 0/1/2 of #161).
+- Per-table `WITH (basin.file_format = 'vortex')` opt-in (Lanes 1–8 of #161).
+- `ALTER TABLE … SET FILE_FORMAT` for empty tables (Lane 8).
+- Self-describing Vortex decode + view-type normalisation.
+- Differential Vortex⇆Parquet correctness harness.
+
+### Changed
+- **Vortex is the default on-disk format** as of 2026-05-18 (commit `988fe7d`).
+  Parquet remains first-class selectable. ADR 0015 updated.
+
+## [0.1.8] - 2026-05-15
+
+Perf and observability batch.
+
+### Added
+- Metadata-only aggregate fast path (~30-40×).
+- Point / range / inequality / IS NULL / BETWEEN fast paths.
+- Catalog-stats file pruning in `fast_select.rs`.
+- Low-cardinality GROUP BY COUNT(*) fast path.
+- `basin.sort_by` compound DDL option (WEDGE 4) + writer enforcement.
+- `basin.row_block_size` per-table DDL option.
+- FileMetadataCache wired into RuntimeEnv.
+- VortexFooterCache.
+- 88-shape `vortex_vs_parquet_smoke` benchmark battery.
+- Utf8/Binary → Utf8View promotion.
+- UNION ALL same-table scan collapse.
+- `NULLIF(a,b) IS [NOT] NULL` conjunction rewrite.
+- `STREAMLIMIT` for OFFSET on sort-matching scans.
+
+### Fixed
+- Red pipeline (sccache, rustfmt drift, object_store test, approx_constant)
+  (commit `6fd6c5d`).
+- Fast-path bail inside an explicit transaction (commit `790ed79`).
+
+## [0.1.7] - 2026-05-14
+
+Schema isolation and transaction-semantics batch.
+
+### Added
+- Multi-schema isolation phases A.1 (#117), A.2 (#118), A.3 (#119).
+- Real `BEGIN`/`COMMIT`/`ROLLBACK` + `SAVEPOINT` semantics (#92,
+  completes #83).
+- Optimistic-lock row-version verification under concurrent writers (#103).
+- `LATERAL generate_series` + SAVEPOINT rollback + CTAS WITH NO DATA.
+- Scalar subquery in `UPDATE SET` (#106).
+- INET/CIDR containment UDFs (#153, partial).
+
+## [0.1.6] - 2026-05-13
+
+Wire-format correctness + parser-foundation batch.
+
+### Added
+- Real `NUMERIC` binary wire format — varlena base-10000 (#141).
+- Real `ARRAY` binary wire format — PG list-element encoding (#144).
+- `TIMESTAMP`/`DATE` binary param decode (#67).
+- Extended-protocol `RETURNING` row encoding (#73).
+- Reject multi-statement extended `Parse` per PG spec (#68).
+- pg_query parse-tree foundation in `pg_ast.rs` (ADR 0014 Phase 1).
+- Engine reuses pg_query parse tree on re-entry (commit `a82d9f6`).
+
+### Fixed
+- Multi-byte UTF-8 panic in `pg_operators::find_word_sequence` (#65).
+- `RLS WITH CHECK` enforcement; real `TABLESAMPLE`; honest
+  `CREATE TRIGGER`; array-rewrite OOB panic.
+
+## [0.1.5] - 2026-05-12
+
+DML completeness + ORM-compat lift.
+
+### Added
+- `DROP TABLE` + `IF NOT EXISTS` on `CREATE TABLE` (#49).
+- `INSERT … ON CONFLICT DO NOTHING` / `DO UPDATE` (#74, #75).
+- Data-modifying CTEs (`WITH x AS (INSERT/UPDATE/DELETE … RETURNING) SELECT …`).
+- Correlated subqueries in DELETE/UPDATE.
+- Correlated `LATERAL` → JOIN decorrelation (#81).
+- Multi-column `WITH RECURSIVE` (#82).
+- `int4range`/`int8range`/`numrange` arithmetic + multirange containment (#94).
+- JSONB cast + extraction on text columns (#88).
+- Full-text search bounded subset (`tsvector` / `tsquery` / `@@`) (#79).
+- Exact `percentile_disc` / `mode()` WITHIN GROUP ordered-set aggregates (#77).
+- 4 silent-corruption PG-compat CRITICALs enforced honestly.
+- String / datetime / window PG-compat modules salvaged.
+- 20 psql `\dt` / `\d`-family pg_catalog scalar stubs.
+- Curated ORM/driver-compat suite + `orm_compat` 4 stale-ignore flips (#93).
+
+## [0.1.4] - 2026-05-11
+
+Toolchain migration + benchmark refresh.
+
+### Changed
+- Workspace migration to arrow58 / df53 / sqlparser0.61 / object_store0.13
+  (commit `2b51061`).
+- `r2` storage backend renamed to `s3_compatible`; `R2Config` alias dropped.
+- Docs replace Cloudflare R2 with Tigris; Apache DataFusion attribution added.
+
+### Added
+- 3-way Neon / Supabase / Basin-Cloud Frankfurt harness (build only;
+  run is operator-gated).
+- Post-migration `LocalFS+SeaweedFS` regenerated data for arrow58/df53.
+- Parallel config × category harness (per-group `--test`, `-j6`,
+  per-pkg `debug=0`).
+- SQL-compat matrix expansion to 490 → 697 fragments (commit `39d51bb`).
 
 ## [0.1.3] - 2026-05-11
 
@@ -209,7 +507,13 @@ Phase 6 production-hardening entry batch.
 - `basin-cloud` and `basin-billing` workspace crates (moved to `basin-cloud` repo)
 - `CLOUD_ROADMAP.md` (canonical copy lives in `basin-cloud` repo)
 
-[Unreleased]: https://github.com/bas-in/basin/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/bas-in/basin/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/bas-in/basin/compare/v0.1.8...v0.1.9
+[0.1.8]: https://github.com/bas-in/basin/compare/v0.1.7...v0.1.8
+[0.1.7]: https://github.com/bas-in/basin/compare/v0.1.6...v0.1.7
+[0.1.6]: https://github.com/bas-in/basin/compare/v0.1.5...v0.1.6
+[0.1.5]: https://github.com/bas-in/basin/compare/v0.1.4...v0.1.5
+[0.1.4]: https://github.com/bas-in/basin/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/bas-in/basin/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/bas-in/basin/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/bas-in/basin/releases/tag/v0.1.1

@@ -13,7 +13,7 @@ Legend: `[ ]` open · `[~]` in progress · `[x]` done · `[-]` deferred
 
 ---
 
-## Roadmap status — checkpoint 2026-05-15
+## Roadmap status — checkpoint 2026-05-19
 
 **The full WEDGE 1–5 + 5c slice is shipped.** All five items below are at
 v0.1 with passing benchmark coverage. Workspace tests passing; dashboard
@@ -23,6 +23,13 @@ non-design-excluded fragments — up from ~75% at last checkpoint). Remaining
 real v0.2 gaps: `LATERAL` joins, `WITH RECURSIVE` + DML-in-CTE, advanced
 window frames, `JSON_AGG(t)` whole-row, `EXCLUDE USING gist`. See
 [`docs/sql-support.md`](./docs/sql-support.md).
+
+**Vortex storage default since 2026-05-18 per [ADR 0015](./docs/decisions/0015-vortex-storage-format.md).**
+~50 perf commits landed in #161/#162; the 88-shape `vortex_vs_parquet_smoke`
+battery shows wins on metadata aggregates (~30-40×), joins (1.3-1.7×), and
+most analytics shapes; honest trailing on point-lookup latency (≈0.65×) and
+`ORDER BY … LIMIT` (≈0.38×) where native vortex-datafusion execution is
+still maturing.
 
 Three additional crates landed alongside the wedge by founder direction
 and now ship as part of the open-source bundle (Phase 5.10 in
@@ -34,21 +41,18 @@ env vars; defaults preserve the original PoC behaviour.
 **What's next, in priority order (engine / open-source repo only;
 hosted-cloud product lives in a separate repo):**
 
-1. **Phase 0 customer interviews** — strategic, not engineering. Architecture is done; what's missing is paying customers.
-2. ~~Engine `UPDATE` / `DELETE` support~~ — **shipped** (Iceberg copy-on-write).
-3. ~~A4 coalesced metadata in catalog~~ — **shipped** (file-level `column_stats` + `Storage::read_paths`).
-4. **pg_query migration (ADR 0014)** — adopt libpg_query as the canonical SQL parser, demoting sqlparser-rs to a transitional fallback and DataFusion-sql to executor-only. Phase 1 (in flight): pg_query parses every statement, drives dispatch for the 14 textual pre-screens in `executor.rs`, and rejects unsupported statement kinds with SQLSTATE 0A000. Phase 2: own `PgNode → DataFusion LogicalPlan` translator for SELECT. Phase 3: long-tail SQL (window funcs, GROUPING SETS, recursive CTEs, MERGE, LATERAL). Precedent: DuckDB, CockroachDB, Spanner-PG, YugabyteDB. Phase 1 is ~1 week of focused work; the full migration is a 1-quarter project that lands incrementally.
-5. **Phase 5.11.A — expanded built-in function catalogue** — date/time, string, math, coalesce, aggregate. Gates triggers + PL/pgSQL. ~3 weeks. The smaller "drop in your existing PG schema" win and a hard prerequisite for everything else in 5.11.
-6. **Phase 5.11.D — `CREATE MATERIALIZED VIEW` SQL surface** — drop the `cv_glue` stub. ~1 week, lands once 5.11.A is in.
-7. **B1 per-project secondary indexes** — biggest remaining point-query win. ~8 weeks.
-8. **Phase 5.12 — SmithDB-inspired storage optimizations (SQL compat at 97.2% / 423 ✅ — gate cleared).** LangChain's [SmithDB](https://www.langchain.com/blog/introducing-smithdb) is a Rust + DataFusion + Vortex + object-store database that ships LangSmith's agent-trace workload in production. The architecture is a cousin of Basin's; the four patterns below are battle-tested under the same constraints we operate within. Land them in this order:
-   - **5.12.A — time-tiered compaction.** Replace the compactor's uniform schedule with SmithDB-style time-tiered policy: recent partitions compact often, older partitions settle into larger files. Matches Basin's audit-log target workload exactly. ~1 week. Single file: `crates/basin-shard/src/compactor.rs`.
-   - **5.12.B — late materialization for big payloads.** Split JSONB and large-text columns from "core" columns at row-group write time so point queries that don't project the payload skip the body entirely. SmithDB does this for trace bodies; Basin's audit-log workload has the same shape (small core + big JSON). ~2 weeks. Touches the Parquet writer in `basin-storage` and the planner's projection pushdown. Compounds with A4 catalog stats + cluster-by for ~10× point-query latency improvement on payload-heavy tables.
-   - ~~**5.12.C — Vortex as opt-in storage format**~~ — **shipped** ([ADR 0015](./docs/decisions/0015-vortex-storage-format.md), Accepted). `CREATE TABLE … WITH (basin.file_format = 'vortex')` writes Vortex instead of Parquet for that table; Parquet remains the default this phase — preserves Iceberg / DuckDB / Athena / Spark read-compat for default tables. Per-table opt-in, single format per table (mixed-format deferred); tables with no recorded format default to Parquet. New module `crates/basin-storage/src/vortex_format.rs` implements the same DataFusion 53 `FileFormat` trait Parquet does, via `vortex-datafusion` 0.70's `VortexFormat`; write path is the BtrBlocks + `.with_compact()` cascade (`vortex` 0.70, workspace arrow58/df53). Post-migration benchmark (`benchmark/RESULTS_vortex_migration.md`, commit `5e21d13`): **1.950×** smaller on disk, **20.1× p50 / 24.3× p95** faster full scan. Native Vortex predicate pushdown (currently decode-then-filter) and in-place conversion of populated tables are deferred.
-   - **5.12.D — read-from-writer's-cache extension.** Basin already merges the in-RAM WAL tail with the Parquet base on read. SmithDB extends this further: when a query lands on the same shard owner that's currently writing, scan directly from the writer's local cache (skip even the catalog round-trip for the freshest writes). ~1 week. Touches `basin-shard` read path.
-9. **Phase 5.11.B — triggers** — `CREATE TRIGGER`, row + statement, `NEW`/`OLD`/`TG_OP`, recursive guard. ~2 months. **High priority but an explicit wedge expansion** — re-confirm with Phase 0 customer signal before committing.
-10. **Phase 5.11.C — PL/pgSQL stored procedures (subset)** — `CREATE FUNCTION` + tree-walker interpreter. ~2 months. Ships alongside 5.11.B because triggers consume the same interpreter.
-11. **Phase 6 — production hardening** (multi-region read replicas, cross-shard 2PC, point-in-time restore extensions, branching/forking GC) — multi-month. Cloud-platform items (BYO-bucket, BYO-key, Stripe billing) live in the separate hosted-cloud repo.
+1. **Phase 5.14 — Durable Basin moat (HTAP hot tier + catalog-driven optimization).** The next 3 months invest exclusively in Basin-layer work that upstream Vortex / DataFusion cannot subsume. Basin's durable advantage is the **catalog + storage-orchestration + multi-tenant layer**: per-file blooms / HLL / t-digest sketches in the catalog, a row-format hot buffer for HTAP (the architectural moat — SingleStore / ClickHouse `ReplacingMergeTree` / Apache Pinot precedent), adaptive write-time multi-sort, and a catalog-aware `WindowExec` that consults `basin.sort_by` to skip full sorts. Optimizer-rule shims that will eventually be subsumed by upstream Vortex / DataFusion are explicitly **deprioritized** — we file those as upstream PRs instead (see Phase 5.12.J / .K / .L / .N retirement notes in [TASK.md](./TASK.md)). Detailed 4-item decomposition in TASK.md Phase 5.14.
+2. **Phase 0 customer interviews** — strategic, not engineering. Architecture is done; what's missing is paying customers.
+3. ~~Engine `UPDATE` / `DELETE` support~~ — **shipped** (Iceberg copy-on-write).
+4. ~~A4 coalesced metadata in catalog~~ — **shipped** (file-level `column_stats` + `Storage::read_paths`).
+5. **pg_query migration (ADR 0014)** — adopt libpg_query as the canonical SQL parser, demoting sqlparser-rs to a transitional fallback and DataFusion-sql to executor-only. Phase 1 (in flight): pg_query parses every statement, drives dispatch for the 14 textual pre-screens in `executor.rs`, and rejects unsupported statement kinds with SQLSTATE 0A000. Phase 2: own `PgNode → DataFusion LogicalPlan` translator for SELECT. Phase 3: long-tail SQL (window funcs, GROUPING SETS, recursive CTEs, MERGE, LATERAL). Precedent: DuckDB, CockroachDB, Spanner-PG, YugabyteDB. Phase 1 is ~1 week of focused work; the full migration is a 1-quarter project that lands incrementally.
+6. ~~Phase 5.11.A — expanded built-in function catalogue~~ — **shipped** (date/time, string, math, coalesce, aggregate; recursive-CTE + window verification pass).
+7. ~~Phase 5.11.D — `CREATE MATERIALIZED VIEW` SQL surface~~ — **shipped** (CV DDL + `REFRESH MATERIALIZED VIEW` + `DROP MATERIALIZED VIEW`).
+8. **B1 per-project secondary indexes** — biggest remaining point-query win. ~8 weeks. *Note (2026-05-19):* partially subsumed by Phase 5.14.A catalog blooms + 5.14.C hot tier for the OLTP `point_eq` shape; reassess scope once 5.14 lands.
+9. **Phase 5.12 — Storage perf & Vortex** — **shipped** (50 perf commits in #161/#162; Vortex default 2026-05-18 per [ADR 0015](./docs/decisions/0015-vortex-storage-format.md); 88-shape `vortex_vs_parquet_smoke` battery green). Full Phase 5.12.A through 5.12.O ship-list in [TASK.md](./TASK.md) Phase 5.12.
+10. ~~Phase 5.11.B — triggers via PL/pgSQL~~ — **superseded by [ADR 0012](./docs/decisions/0012-change-event-primitive.md) — see Phase 5.11.C reactors instead.** The change-event primitive (declarative lifecycle + SQL-bodied reactors) covers ~95% of trigger use cases without committing to a PL/pgSQL parser / interpreter. Already shipped in Phase 5.11.B (declarative lifecycle) and Phase 5.11.C (reactors).
+11. ~~Phase 5.11.C — PL/pgSQL stored procedures (subset)~~ — **superseded by [ADR 0012](./docs/decisions/0012-change-event-primitive.md) — see Phase 5.11.C reactors instead.** Basin's procedure surface is `LANGUAGE sql` (planning-time inlining) + `CALL` procedures (multi-statement bodies), already shipped in Phase 5.11.D/E/F. PL/pgSQL with `IF`/`LOOP`/variables / `EXCEPTION` blocks / cursor-driven loops is explicit non-goal per ADR 0012.
+12. **Phase 6 — production hardening** (multi-region read replicas, cross-shard 2PC, point-in-time restore extensions, branching/forking GC) — multi-month. Cloud-platform items (BYO-bucket, BYO-key, Stripe billing) live in the separate hosted-cloud repo.
 
 ---
 
