@@ -78,6 +78,9 @@ pub struct ShardStats {
     pub evictions: u64,
     pub compactions: u64,
     pub bytes_in_wal: u64,
+    /// Phase 5.14.D2: count of compactions where the output file was sorted by
+    /// the query-history top-K pattern rather than the declared `cluster_columns`.
+    pub compactions_with_adaptive_sort: u64,
 }
 
 /// Handle to the shard map. Cheap to clone (Arc inside).

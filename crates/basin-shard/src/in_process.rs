@@ -597,8 +597,11 @@ impl InProcessShard {
 
         let mut stats = self.stats.lock().await;
         stats.compactions = stats.compactions.saturating_add(1);
-        // Phase 5.14.D2: adaptive-sort counter (field wired in 5.14.D3).
-        let _ = any_adaptive_sort;
+        // Phase 5.14.D2: adaptive-sort observability counter.
+        if any_adaptive_sort {
+            stats.compactions_with_adaptive_sort =
+                stats.compactions_with_adaptive_sort.saturating_add(1);
+        }
         Ok(())
     }
 
