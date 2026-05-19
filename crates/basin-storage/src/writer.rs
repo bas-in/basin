@@ -584,8 +584,13 @@ fn compute_bloom_filters(
             continue;
         };
         let col = batch.column(col_idx);
+        // Seed 0 is deterministic so bloom_from_bytes can reconstruct the
+        // same hasher at probe time. The DefaultHasher::default() path uses
+        // getrandom for its seed, which would make every deserialized probe
+        // use a different hash function from the one used at insert time,
+        // producing near-100% false-negative rates.
         let mut filter =
-            BloomFilter::with_false_pos(DEFAULT_BLOOM_FPP).expected_items(n_items);
+            BloomFilter::with_false_pos(DEFAULT_BLOOM_FPP).seed(&0u128).expected_items(n_items);
 
         match col.data_type() {
             DataType::Int64 => {
@@ -642,8 +647,11 @@ pub fn bloom_from_bytes(bytes: &[u8]) -> Option<fastbloom::BloomFilter> {
         .chunks_exact(8)
         .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
         .collect();
+    // Seed 0 matches the deterministic seed used at write time in
+    // `compute_bloom_filters`. Without a matching seed the hasher diverges
+    // from the one used during insert, making contains() unreliable.
     Some(
-        fastbloom::BloomFilter::from_vec(words).hashes(num_hashes),
+        fastbloom::BloomFilter::from_vec(words).seed(&0u128).hashes(num_hashes),
     )
 }
 
