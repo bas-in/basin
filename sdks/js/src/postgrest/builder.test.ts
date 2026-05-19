@@ -495,3 +495,93 @@ describe("postgrest URL construction", () => {
     expect(captured.request?.url).not.toContain("/v1/rest/v1/");
   });
 });
+
+describe("postgrest .stream()", () => {
+  function makeNdjsonStream(lines: string[]): ReadableStream<Uint8Array> {
+    const enc = new TextEncoder();
+    return new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const line of lines) {
+          controller.enqueue(enc.encode(line + "\n"));
+        }
+        controller.close();
+      },
+    });
+  }
+
+  function stubStreamFetch(
+    body: ReadableStream<Uint8Array>,
+    captured?: { request?: Request },
+  ): typeof fetch {
+    return async (input: Request | string | URL, init?: RequestInit): Promise<Response> => {
+      if (captured) {
+        captured.request = new Request(input as RequestInfo, init);
+      }
+      return new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "application/x-ndjson" },
+      });
+    };
+  }
+
+  it("yields 3 rows in order and completes cleanly with cursor sentinel skipped", async () => {
+    const rows = [{ id: 1 }, { id: 2 }, { id: 3 }];
+    const lines = [
+      ...rows.map((r) => JSON.stringify(r)),
+      JSON.stringify({ _basin_next_cursor: "tok_abc" }),
+    ];
+    const basin = newClient(stubStreamFetch(makeNdjsonStream(lines)));
+    const collected: unknown[] = [];
+    for await (const row of basin.from("events").select().stream()) {
+      collected.push(row);
+    }
+    expect(collected).toEqual(rows);
+  });
+
+  it("sets stream=true on the URL when .stream() is called", async () => {
+    const captured: { request?: Request } = {};
+    const basin = newClient(stubStreamFetch(makeNdjsonStream([]), captured));
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    for await (const _ of basin.from("events").select().stream()) {
+      /* drain */
+    }
+    const url = captured.request?.url ?? "";
+    expect(url).toContain("stream=true");
+  });
+
+  it("rejects with a network-shaped BasinError when the stream errors mid-flight", async () => {
+    const enc = new TextEncoder();
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({
+      start(c) { controller = c; },
+    });
+    const basin = newClient(stubStreamFetch(body));
+    const iter = basin.from("events").select().stream()[Symbol.asyncIterator]();
+
+    controller.enqueue(enc.encode(JSON.stringify({ id: 1 }) + "\n"));
+    const first = await iter.next();
+    expect(first.done).toBe(false);
+    expect((first.value as { id: number }).id).toBe(1);
+
+    controller.error(new Error("connection reset"));
+    await expect(iter.next()).rejects.toMatchObject({
+      code: "network",
+      message: expect.stringContaining("connection reset"),
+    });
+  });
+
+  it("rejects with invalid_response when an NDJSON line fails to parse", async () => {
+    const enc = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(enc.encode("not valid json\n"));
+        controller.close();
+      },
+    });
+    const basin = newClient(stubStreamFetch(body));
+    const iter = basin.from("events").select().stream()[Symbol.asyncIterator]();
+    await expect(iter.next()).rejects.toMatchObject({
+      code: "invalid_response",
+    });
+  });
+});
