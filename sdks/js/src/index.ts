@@ -68,3 +68,12 @@ export type { InvokeOptions, InvokeResult } from "./functions/index.js";
 
 export { AdminClient, AdminProjectsClient } from "./admin/index.js";
 export type { Credential, ProvisionResult } from "./admin/index.js";
+
+export { fetchOpenAPI } from "./openapi/index.js";
+export type {
+  OpenAPIDocument,
+  OpenAPIPathItem,
+  OpenAPIOperation,
+  OpenAPIParameter,
+  OpenAPISchema,
+} from "./openapi/index.js";

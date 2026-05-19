@@ -42,6 +42,11 @@
       "import": "./dist/admin/index.js",
       "require": "./dist/admin/index.cjs"
     },
+    "./openapi": {
+      "types": "./dist/openapi/index.d.ts",
+      "import": "./dist/openapi/index.js",
+      "require": "./dist/openapi/index.cjs"
+    },
     "./package.json": "./package.json"
   },
   "files": [
