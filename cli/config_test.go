@@ -1,5 +1,6 @@
 // config_test — round-trip the on-disk config + verify XDG override
 // + confirm the perms guard rejects world-readable files.
+// Also covers loadWorkingProject / saveWorkingProject for Tier 8.
 package main
 
 import (
@@ -230,5 +231,93 @@ func TestCloudVersionStale(t *testing.T) {
 	old := cachedCloudVersion{LastCheckedAt: time.Now().UTC().Add(-(CloudVersionTTL + time.Minute))}
 	if !cloudVersionStale(old) {
 		t.Error("aged entry past TTL should be stale")
+	}
+}
+
+// ── workingProject round-trip + helpers ─────────────────────────────
+
+// TestWorkingProjectRoundTrip verifies that saveWorkingProject +
+// loadWorkingProject preserves all three fields.
+func TestWorkingProjectRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	wp := workingProject{
+		ProjectRef:       "my-project",
+		DefaultBranch:    "main",
+		EngineVersionPin: "0.5.2",
+	}
+	if err := saveWorkingProject(dir, wp); err != nil {
+		t.Fatalf("saveWorkingProject: %v", err)
+	}
+	got, err := loadWorkingProject(dir)
+	if err != nil {
+		t.Fatalf("loadWorkingProject: %v", err)
+	}
+	if got == nil {
+		t.Fatal("loadWorkingProject: got nil, want *workingProject")
+	}
+	if got.ProjectRef != wp.ProjectRef {
+		t.Errorf("ProjectRef: got %q, want %q", got.ProjectRef, wp.ProjectRef)
+	}
+	if got.DefaultBranch != wp.DefaultBranch {
+		t.Errorf("DefaultBranch: got %q, want %q", got.DefaultBranch, wp.DefaultBranch)
+	}
+	if got.EngineVersionPin != wp.EngineVersionPin {
+		t.Errorf("EngineVersionPin: got %q, want %q", got.EngineVersionPin, wp.EngineVersionPin)
+	}
+}
+
+// TestWorkingProjectSearchUpTree verifies that loadWorkingProject walks
+// up the directory tree from a sub-directory to find the config file.
+func TestWorkingProjectSearchUpTree(t *testing.T) {
+	root := t.TempDir()
+	wp := workingProject{ProjectRef: "tree-project"}
+	if err := saveWorkingProject(root, wp); err != nil {
+		t.Fatalf("saveWorkingProject: %v", err)
+	}
+	// Create a deeply-nested sub-directory; the config lives in root.
+	sub := filepath.Join(root, "src", "pkg", "feature")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir sub: %v", err)
+	}
+	got, err := loadWorkingProject(sub)
+	if err != nil {
+		t.Fatalf("loadWorkingProject from sub: %v", err)
+	}
+	if got == nil {
+		t.Fatal("loadWorkingProject from sub: got nil, want *workingProject")
+	}
+	if got.ProjectRef != "tree-project" {
+		t.Errorf("ProjectRef: got %q, want tree-project", got.ProjectRef)
+	}
+}
+
+// TestWorkingProjectMissingFile verifies that a missing basin/config.toml
+// anywhere in the tree returns (nil, nil) rather than an error.
+func TestWorkingProjectMissingFile(t *testing.T) {
+	dir := t.TempDir()
+	got, err := loadWorkingProject(dir)
+	if err != nil {
+		t.Fatalf("expected nil error for missing file, got %v", err)
+	}
+	if got != nil {
+		t.Errorf("expected nil for missing file, got %+v", got)
+	}
+}
+
+// TestWorkingProjectMalformedTOML verifies that a syntactically invalid
+// config.toml (a line with no '=') returns a descriptive parse error.
+func TestWorkingProjectMalformedTOML(t *testing.T) {
+	dir := t.TempDir()
+	basinDir := filepath.Join(dir, "basin")
+	if err := os.MkdirAll(basinDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	bad := []byte("project_ref = ok\nTHIS LINE IS BROKEN\n")
+	if err := os.WriteFile(filepath.Join(basinDir, "config.toml"), bad, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	_, err := loadWorkingProject(dir)
+	if err == nil {
+		t.Fatal("expected parse error for malformed TOML, got nil")
 	}
 }

@@ -59,6 +59,8 @@ func commands() []commandEntry {
 		{"whoami", "Print the active user + accessible orgs.", cmdWhoami},
 		{"orgs", "List orgs / show one.", cmdOrgs},
 		{"projects", "List / get / create / delete / pause / resume projects.", cmdProjects},
+		{"init", "Scaffold a basin project directory (./basin/).", cmdInit},
+		{"unlink", "Remove the project binding from ./basin/config.toml.", cmdUnlink},
 		{"sql", "Run a SQL query against a project.", cmdSQL},
 		{"tables", "List / describe tables; show paginated rows.", cmdTables},
 		{"migrations", "List or apply project migrations (DDL snapshots).", cmdMigrations},

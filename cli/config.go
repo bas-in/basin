@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 )
 
@@ -328,4 +329,137 @@ func cliReleaseStale(entry cachedCLIRelease) bool {
 		return true
 	}
 	return time.Since(entry.LastCheckedAt) > CLIReleaseTTL
+}
+
+// ── directory-scoped working project ────────────────────────────────
+
+// workingProject is the in-memory representation of ./basin/config.toml.
+// All fields are optional: a freshly-scaffolded directory may have
+// only a placeholder until `basin link` writes project_ref.
+type workingProject struct {
+	ProjectRef        string // project_ref = <slug>
+	DefaultBranch     string // default_branch = <name>
+	EngineVersionPin  string // engine_version_pin = <semver>
+}
+
+// workingProjectFile is the relative path (from the project root)
+// where the directory-scoped config lives.
+const workingProjectFile = "basin/config.toml"
+
+// loadWorkingProject walks up from cwd looking for basin/config.toml,
+// following the same convention as git/cargo/fly. Returns
+// (nil, nil) when no config file is found anywhere in the tree.
+// Returns a non-nil error only on I/O or parse failures.
+func loadWorkingProject(cwd string) (*workingProject, error) {
+	dir := cwd
+	for {
+		p := filepath.Join(dir, workingProjectFile)
+		b, err := os.ReadFile(p)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// Walk one level up.
+				parent := filepath.Dir(dir)
+				if parent == dir {
+					// Filesystem root — not found.
+					return nil, nil
+				}
+				dir = parent
+				continue
+			}
+			return nil, err
+		}
+		// Found the file — parse it.
+		wp, err := parseWorkingProjectTOML(b)
+		if err != nil {
+			return nil, fmt.Errorf("parse %s: %w", p, err)
+		}
+		return wp, nil
+	}
+}
+
+// saveWorkingProject writes wp to <cwd>/basin/config.toml, creating
+// the basin/ directory if needed. The file is written atomically
+// (write-to-temp + rename) with mode 0o644.
+func saveWorkingProject(cwd string, wp workingProject) error {
+	dir := filepath.Join(cwd, "basin")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	p := filepath.Join(dir, "config.toml")
+	b := marshalWorkingProjectTOML(wp)
+	tmp := p + ".tmp"
+	if err := os.WriteFile(tmp, []byte(b), 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, p); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// parseWorkingProjectTOML is a hand-rolled key=value TOML parser.
+// It handles only the three keys the workingProject struct needs;
+// unknown keys are ignored. No nested tables, no arrays — v0.1 needs
+// none of that. Lines starting with '#' or blank are skipped.
+//
+// Grammar accepted (each line independently):
+//
+//	key = value          # bare value, may be quoted with " or '
+//	# comment
+//	<blank line>
+func parseWorkingProjectTOML(b []byte) (*workingProject, error) {
+	var wp workingProject
+	lines := strings.Split(string(b), "\n")
+	for i, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// Strip inline comment: find first unquoted '#'.
+		if idx := strings.Index(line, " #"); idx >= 0 {
+			line = strings.TrimSpace(line[:idx])
+		}
+		eq := strings.IndexByte(line, '=')
+		if eq < 0 {
+			return nil, fmt.Errorf("line %d: expected key=value, got %q", i+1, raw)
+		}
+		key := strings.TrimSpace(line[:eq])
+		val := strings.TrimSpace(line[eq+1:])
+		// Strip optional surrounding quotes (" or ').
+		if len(val) >= 2 {
+			if (val[0] == '"' && val[len(val)-1] == '"') ||
+				(val[0] == '\'' && val[len(val)-1] == '\'') {
+				val = val[1 : len(val)-1]
+			}
+		}
+		switch key {
+		case "project_ref":
+			wp.ProjectRef = val
+		case "default_branch":
+			wp.DefaultBranch = val
+		case "engine_version_pin":
+			wp.EngineVersionPin = val
+		// Unknown keys are silently ignored to stay forward-compatible.
+		}
+	}
+	return &wp, nil
+}
+
+// marshalWorkingProjectTOML serialises wp into a key=value TOML
+// fragment. Empty fields are omitted so an un-linked directory's
+// config.toml stays clean.
+func marshalWorkingProjectTOML(wp workingProject) string {
+	var sb strings.Builder
+	sb.WriteString("# basin project config — managed by the basin CLI\n")
+	if wp.ProjectRef != "" {
+		sb.WriteString("project_ref = " + wp.ProjectRef + "\n")
+	}
+	if wp.DefaultBranch != "" {
+		sb.WriteString("default_branch = " + wp.DefaultBranch + "\n")
+	}
+	if wp.EngineVersionPin != "" {
+		sb.WriteString("engine_version_pin = " + wp.EngineVersionPin + "\n")
+	}
+	return sb.String()
 }
