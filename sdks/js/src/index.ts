@@ -65,3 +65,12 @@ export type {
 
 export { FunctionsClient } from "./functions/index.js";
 export type { InvokeOptions, InvokeResult } from "./functions/index.js";
+
+export { fetchOpenAPI } from "./openapi/index.js";
+export type {
+  OpenAPIDocument,
+  OpenAPIPathItem,
+  OpenAPIOperation,
+  OpenAPIParameter,
+  OpenAPISchema,
+} from "./openapi/index.js";
