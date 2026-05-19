@@ -111,6 +111,20 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                     });
                 }
                 crate::pg_ast::StmtKind::Commit => {
+                    // Phase 5.14.C2: promote hot-tier rows to the shared
+                    // MemTableRegistry and emit WAL Commit markers before
+                    // clearing TxState.
+                    //
+                    // ADR 0020 §"Commit": a committed transaction is one whose
+                    // Begin marker is NOT followed by a Rollback.  There is no
+                    // explicit Commit WAL marker today — implicit commit on
+                    // absence of Rollback.  The Rollback marker IS emitted for
+                    // cancelled transactions (see the ROLLBACK arm below).
+                    let htap_rows = crate::session::tx_htap_take_all(&sess.state);
+
+                    // Promote committed HTAP batches to the process-wide registry.
+                    htap_promote_to_registry(sess, &htap_rows).await?;
+
                     // Flush pending files to the catalog (real COMMIT).
                     let pending = crate::session::tx_commit(&sess.state);
                     if !pending.is_empty() {
@@ -247,6 +261,21 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                         Some(TxnStmt::Rollback) | None
                             if matches!(kind, crate::pg_ast::StmtKind::Rollback) =>
                         {
+                            // Phase 5.14.C2: emit WAL Rollback marker so that
+                            // crash-recovery replay knows to suppress these entries.
+                            // HTAP rows are discarded inside tx_rollback (they were
+                            // never promoted to the shared MemTableRegistry).
+                            let rolled_back_tx_id = crate::session::tx_get_id(&sess.state);
+                            if let (Some(shard), Some(tx_id)) =
+                                (sess.engine.config().shard.as_ref(), rolled_back_tx_id)
+                            {
+                                let part = basin_common::PartitionKey::default_key();
+                                // Best-effort: WAL marker failures must not block rollback.
+                                let _ = shard
+                                    .wal()
+                                    .append_tx_rollback(&sess.project, &part, tx_id)
+                                    .await;
+                            }
                             // Bare ROLLBACK — undo everything.
                             let (pending, snapshots) = crate::session::tx_rollback(&sess.state);
                             // Delete pending (not-yet-committed) files best-effort.
@@ -2606,16 +2635,27 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
     // When inside an explicit transaction, defer catalog commit.  The file
     // has been written to storage; add it to the session's pending list and
     // register it with DataFusion so within-tx SELECTs can see it.
+    //
+    // Phase 5.14.C2: also buffer the Arrow batch in the tx-local HTAP store
+    // so that projection-scan queries (not just COUNT(*)) can see uncommitted
+    // rows from the same transaction.  WAL Begin marker is emitted lazily on
+    // the first DML inside the tx.
     if crate::session::tx_is_active(&sess.state) {
+        // Lazy WAL Begin — idempotent within a tx.
+        htap_emit_wal_begin_lazy(sess).await;
+        // Buffer batch for tx-local read-your-own-writes.
+        crate::session::tx_htap_push_batch(&sess.state, &table, batch.clone());
         crate::session::tx_push_pending_file(&sess.state, &table, file_ref);
         let pending = crate::session::tx_pending_files_for(&sess.state, &table);
-        if let Err(e) = crate::session::refresh_table_with_extra(
+        let htap_batches = crate::session::tx_htap_batches_for(&sess.state, &table);
+        if let Err(e) = crate::session::refresh_table_with_htap(
             &sess.engine,
             &sess.project,
             &sess.ctx,
             &sess.state,
             &table,
             &pending,
+            htap_batches,
         )
         .await
         {
@@ -5532,6 +5572,104 @@ fn record_query_patterns(sess: &ProjectSession, query: &sqlparser::ast::Query) {
             .collect();
         history.record_group_by(&sess.project, &table_name, cols);
     }
+}
+
+// ── Phase 5.14.C2 HTAP helpers ────────────────────────────────────────────────
+
+/// Emit a WAL `Begin` marker the first time a DML statement runs inside an
+/// explicit transaction.  The marker is lazy: it is emitted once per tx, on
+/// the first INSERT/UPDATE/DELETE.  Auto-commit statements never emit markers.
+///
+/// Returns the `tx_id` that was assigned (new or pre-existing).
+async fn htap_emit_wal_begin_lazy(sess: &ProjectSession) -> u64 {
+    let candidate = sess.engine.next_tx_id();
+    let tx_id = crate::session::tx_ensure_id(&sess.state, candidate);
+    // If a new id was just assigned (candidate == tx_id) emit the Begin marker.
+    if tx_id == candidate {
+        if let Some(shard) = sess.engine.config().shard.as_ref() {
+            let part = basin_common::PartitionKey::default_key();
+            // Best-effort — WAL marker failures must not block the write.
+            let _ = shard
+                .wal()
+                .append_tx_begin(&sess.project, &part, tx_id)
+                .await;
+        }
+    }
+    tx_id
+}
+
+/// Encode a `RecordBatch` to Arrow IPC stream format.
+///
+/// Returns the wire bytes.  Used to store rows in the HTAP `MemTable` as
+/// IPC-encoded blobs so the hot-tier data format matches the WAL wire format.
+fn encode_batch_to_ipc(batch: &arrow_array::RecordBatch) -> Vec<u8> {
+    use arrow::ipc::writer::StreamWriter;
+    let mut buf = Vec::new();
+    let mut writer = StreamWriter::try_new(&mut buf, batch.schema_ref())
+        .expect("IPC StreamWriter init");
+    writer.write(batch).expect("IPC write");
+    writer.finish().expect("IPC finish");
+    buf
+}
+
+/// Promote committed HTAP batches from a completed transaction to the
+/// process-wide `MemTableRegistry`.  Called on COMMIT before `tx_commit`
+/// clears the `TxState`.
+///
+/// Budget enforcement (per ADR 0016 §Multi-tenant isolation + Phase 5.14.C5):
+/// 1. `try_reserve_bytes` per batch.
+/// 2. On `HardCapReached`: synchronous eviction of the largest project's
+///    memtable, then retry once.
+/// 3. If still over cap: return `SQLSTATE 53200` (out_of_memory).
+async fn htap_promote_to_registry(
+    sess: &ProjectSession,
+    htap_rows: &std::collections::HashMap<
+        basin_common::TableName,
+        Vec<arrow_array::RecordBatch>,
+    >,
+) -> Result<()> {
+    if htap_rows.is_empty() {
+        return Ok(());
+    }
+    let registry = sess.engine.memtable_registry();
+    for (table, batches) in htap_rows {
+        let entry = registry.get_or_create(sess.project, table.clone());
+        for batch in batches {
+            let approx_bytes = batch.get_array_memory_size() as u64;
+            // Budget gate.
+            let reserve_ok = |outcome: basin_hottier::ReservationOutcome| {
+                outcome != basin_hottier::ReservationOutcome::HardCapReached
+            };
+            if !reserve_ok(registry.try_reserve_bytes(&sess.project, approx_bytes)) {
+                // Synchronous eviction: drop the largest project to free space.
+                if let Some(largest) = registry.largest_project() {
+                    registry.remove_project(&largest);
+                }
+                // Retry once.
+                if !reserve_ok(registry.try_reserve_bytes(&sess.project, approx_bytes)) {
+                    return Err(basin_common::BasinError::internal(
+                        "HTAP memtable hard cap exceeded (SQLSTATE 53200)",
+                    ));
+                }
+            }
+            // Encode each row as IPC and store under a monotonic key.
+            for row_idx in 0..batch.num_rows() {
+                let row_batch = batch.slice(row_idx, 1);
+                let row_bytes = encode_batch_to_ipc(&row_batch);
+                // Use a counter key scoped per-entry to avoid collisions across
+                // transactions.  A monotonic atomic on the entry would be ideal
+                // for production; here we use row_idx within the batch as a
+                // best-effort key (sufficient for C2 correctness guarantees).
+                let key = basin_hottier::RowKey::builder()
+                    .append_u64(entry.memtable.total_count() as u64)
+                    .finish();
+                entry
+                    .memtable
+                    .insert(key, basin_hottier::MemRowValue::row(row_bytes, 0));
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

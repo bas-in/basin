@@ -150,6 +150,13 @@ impl SavepointFrame {
 ///   deletes them.
 /// * `savepoints` — stack of `SavepointFrame`s recording per-table file
 ///   watermarks for `ROLLBACK TO SAVEPOINT`.
+/// * `tx_id` — monotonic transaction id assigned on the first DML inside the
+///   txn.  Used for WAL Begin/Commit/Rollback markers (Phase 5.14.C2).
+/// * `htap_rows` — in-memory Arrow `RecordBatch`es buffered per table during
+///   the open transaction.  Provides tx-local read-your-own-writes visibility
+///   for projection queries (the "known gap" in the Parquet-only path).  On
+///   COMMIT the batches are promoted to `MemTableRegistry`; on ROLLBACK they
+///   are simply discarded without touching any shared state.
 #[derive(Debug, Default)]
 pub(crate) struct TxState {
     /// `true` between `BEGIN` and the matching `COMMIT` / `ROLLBACK`.
@@ -165,6 +172,18 @@ pub(crate) struct TxState {
     pub(crate) pending_files: HashMap<TableName, Vec<DataFileRef>>,
     /// Savepoint stack.  Innermost (most-recently-created) frame is last.
     pub(crate) savepoints: Vec<SavepointFrame>,
+    /// Monotonic WAL transaction id, assigned lazily on the first DML
+    /// statement inside an explicit `BEGIN` block. `None` before any DML
+    /// has been issued or when the session is in auto-commit mode.
+    pub(crate) tx_id: Option<u64>,
+    /// Hot-tier in-memory row buffer: per-table Arrow `RecordBatch`es written
+    /// during this transaction.  Provides tx-local projection-scan visibility
+    /// (Phase 5.14.C2 HTAP write-path).  The batches are:
+    ///   - Appended on each INSERT/UPDATE/DELETE inside an active tx.
+    ///   - Merged with the cold-tier scan by `refresh_table_with_htap`.
+    ///   - Promoted to the shared `MemTableRegistry` on COMMIT.
+    ///   - Silently discarded on ROLLBACK (no shared state is touched).
+    pub(crate) htap_rows: HashMap<TableName, Vec<arrow_array::RecordBatch>>,
 }
 
 /// Per-session mutable state. The `SessionContext` itself is `Send + Sync`
@@ -266,12 +285,16 @@ pub(crate) fn tx_begin(state: &SessionState, current_snapshots: HashMap<TableNam
         tx.pre_tx_snapshots = current_snapshots;
         tx.pending_files.clear();
         tx.savepoints.clear();
+        tx.tx_id = None;
+        tx.htap_rows.clear();
     }
 }
 
 /// Mark the end of an explicit transaction with `COMMIT`. Returns the
 /// pending files map so the executor can flush them to the catalog.
-/// Clears all txn state afterwards.
+/// Clears all txn state afterwards (including `tx_id` and `htap_rows`;
+/// the caller is responsible for promoting `htap_rows` via
+/// [`tx_htap_take_all`] *before* calling this function if needed).
 pub(crate) fn tx_commit(state: &SessionState) -> HashMap<TableName, Vec<DataFileRef>> {
     let mut tx = state.tx_state.lock().expect("tx_state lock poisoned");
     let pending = std::mem::take(&mut tx.pending_files);
@@ -279,6 +302,8 @@ pub(crate) fn tx_commit(state: &SessionState) -> HashMap<TableName, Vec<DataFile
     tx.aborted = false;
     tx.pre_tx_snapshots.clear();
     tx.savepoints.clear();
+    tx.tx_id = None;
+    tx.htap_rows.clear();
     drop(tx);
     // PG: xact-scoped advisory locks auto-release at transaction end.
     state.advisory.release_xact();
@@ -301,6 +326,10 @@ pub(crate) fn tx_rollback(
     tx.active = false;
     tx.aborted = false;
     tx.savepoints.clear();
+    // Discard tx-local HTAP buffers — they were never committed to the shared
+    // MemTableRegistry so no cleanup is needed beyond dropping the batches.
+    tx.htap_rows.clear();
+    tx.tx_id = None;
     drop(tx);
     // PG: xact-scoped advisory locks auto-release at transaction end
     // (ROLLBACK releases them just like COMMIT).
@@ -456,6 +485,64 @@ pub(crate) fn tx_touched_tables(state: &SessionState) -> Vec<TableName> {
         .keys()
         .cloned()
         .collect()
+}
+
+// ── Phase 5.14.C2 HTAP helpers ────────────────────────────────────────────────
+
+/// Set the WAL transaction id on the current tx. Idempotent — once set, the
+/// same id is retained for the life of the tx. Returns the id that is now
+/// active (either the newly assigned one or the pre-existing one).
+pub(crate) fn tx_ensure_id(state: &SessionState, candidate: u64) -> u64 {
+    let mut tx = state.tx_state.lock().expect("tx_state lock poisoned");
+    if tx.tx_id.is_none() {
+        tx.tx_id = Some(candidate);
+    }
+    tx.tx_id.unwrap()
+}
+
+/// Read the current WAL tx id without mutation. Returns `None` when no DML
+/// has been issued yet inside the active transaction.
+pub(crate) fn tx_get_id(state: &SessionState) -> Option<u64> {
+    state.tx_state.lock().expect("tx_state lock poisoned").tx_id
+}
+
+/// Append a `RecordBatch` to the tx-local hot-tier buffer for `table`.
+///
+/// Called by the INSERT path immediately after constraint checks succeed and
+/// before Parquet is written. The batch is keyed by table name so the read
+/// path (`refresh_table_with_htap`) can merge it with the cold-tier scan.
+pub(crate) fn tx_htap_push_batch(
+    state: &SessionState,
+    table: &TableName,
+    batch: arrow_array::RecordBatch,
+) {
+    let mut tx = state.tx_state.lock().expect("tx_state lock poisoned");
+    tx.htap_rows.entry(table.clone()).or_default().push(batch);
+}
+
+/// Clone the tx-local HTAP batches for `table`. Empty vec when none exist.
+/// Used by `refresh_table_with_htap` to build the in-memory scan segment.
+pub(crate) fn tx_htap_batches_for(
+    state: &SessionState,
+    table: &TableName,
+) -> Vec<arrow_array::RecordBatch> {
+    state
+        .tx_state
+        .lock()
+        .expect("tx_state lock poisoned")
+        .htap_rows
+        .get(table)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Drain and return all tx-local HTAP batches on COMMIT so the caller can
+/// promote them to the shared `MemTableRegistry`.
+pub(crate) fn tx_htap_take_all(
+    state: &SessionState,
+) -> HashMap<TableName, Vec<arrow_array::RecordBatch>> {
+    let mut tx = state.tx_state.lock().expect("tx_state lock poisoned");
+    std::mem::take(&mut tx.htap_rows)
 }
 
 /// Stash the OVERRIDING kind extracted from the current INSERT
@@ -862,6 +949,161 @@ pub(crate) async fn refresh_table_with_extra(
     }
 
     Ok(())
+}
+
+/// Like [`refresh_table_with_extra`] but also injects tx-local HTAP
+/// in-memory batches so projection-scan queries see uncommitted writes from
+/// the same transaction (Phase 5.14.C2 read-path merge).
+///
+/// When `htap_batches` is non-empty, the registered DataFusion table provider
+/// is a union of:
+///   1. A `ListingTable` covering catalog-live files + pending Parquet files.
+///   2. A DataFusion `MemTable` holding the in-memory Arrow batches buffered
+///      during the current transaction.
+///
+/// Cross-session isolation is preserved because `htap_batches` only contains
+/// batches from *this* session's `TxState`; other sessions' DataFusion
+/// contexts do not see this registration.
+pub(crate) async fn refresh_table_with_htap(
+    engine: &Engine,
+    project: &ProjectId,
+    ctx: &SessionContext,
+    state: &Arc<SessionState>,
+    table: &TableName,
+    extra_files: &[DataFileRef],
+    htap_batches: Vec<arrow_array::RecordBatch>,
+) -> Result<()> {
+    if htap_batches.is_empty() {
+        // No hot-tier rows: fall back to the standard extra-files path.
+        return refresh_table_with_extra(engine, project, ctx, state, table, extra_files).await;
+    }
+
+    let meta = engine.config().catalog.load_table(project, table).await?;
+    let df_schema = Arc::new(schema_ws_to_df(meta.schema.as_ref())?);
+    let _ = ctx.deregister_table(table.as_str());
+
+    // Combine catalog live files + pending (in-tx) files.
+    let mut all_files: Vec<DataFileRef> = meta.live_data_files();
+    all_files.extend_from_slice(extra_files);
+
+    // Build in-memory partition from the hot-tier batches.  DataFusion's
+    // MemTable needs at least one partition even when empty.
+    let htap_provider = MemTable::try_new(df_schema.clone(), vec![htap_batches])
+        .map_err(|e| BasinError::internal(format!("MemTable for htap {table}: {e}")))?;
+
+    if all_files.is_empty() {
+        // Only in-memory rows, no Parquet files: use the MemTable alone.
+        ctx.register_table(table.as_str(), Arc::new(htap_provider))
+            .map_err(|e| BasinError::internal(format!("register_table htap-only {table}: {e}")))?;
+    } else {
+        // Build the cold-tier ListingTable and union it with the MemTable via a
+        // custom provider that concatenates both scans.
+        let (file_format, file_ext) = listing_file_format(meta.file_format);
+        let mut listing_options = ListingOptions::new(file_format).with_file_extension(file_ext);
+        if let Some(sort_cols) = meta.global_sort_order.as_deref() {
+            listing_options =
+                listing_options.with_file_sort_order(build_file_sort_order(sort_cols));
+        }
+        let mut urls: Vec<ListingTableUrl> = Vec::with_capacity(all_files.len());
+        for f in &all_files {
+            let mut s = String::from(BASIN_URL_BASE);
+            s.push_str(&f.path);
+            let url = ListingTableUrl::parse(&s)
+                .map_err(|e| BasinError::internal(format!("listing url parse {s}: {e}")))?;
+            urls.push(url);
+        }
+        let cfg = ListingTableConfig::new_with_multi_paths(urls)
+            .with_listing_options(listing_options)
+            .with_schema(df_schema.clone());
+        let listing_provider = Arc::new(
+            ListingTable::try_new(cfg)
+                .map_err(|e| BasinError::internal(format!("ListingTable::try_new {table}: {e}")))?,
+        );
+        let union_provider =
+            HtapUnionTable::new(listing_provider, Arc::new(htap_provider), df_schema);
+        ctx.register_table(table.as_str(), Arc::new(union_provider))
+            .map_err(|e| BasinError::internal(format!("register_table htap-union {table}: {e}")))?;
+    }
+
+    state
+        .snapshots
+        .lock()
+        .await
+        .insert(table.clone(), meta.current_snapshot);
+
+    if meta.partition_spec.is_partitioned() {
+        state
+            .has_partitioned_table
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    Ok(())
+}
+
+// ── HtapUnionTable ────────────────────────────────────────────────────────────
+
+/// A DataFusion [`TableProvider`] that unions two providers — a cold-tier
+/// [`ListingTable`] and a hot-tier [`MemTable`] — into a single logical table.
+///
+/// Used by [`refresh_table_with_htap`] so that within-transaction projection
+/// queries see both committed Parquet data and the current transaction's
+/// uncommitted in-memory writes without requiring a full DataFusion UNION ALL
+/// plan node at the SQL level.
+///
+/// # Isolation
+///
+/// Each session's `SessionContext` gets its own `HtapUnionTable` registered
+/// under the table name; the `MemTable` half contains only this session's
+/// uncommitted batches.  Other sessions' contexts are unaffected.
+struct HtapUnionTable {
+    cold: Arc<dyn datafusion::catalog::TableProvider>,
+    hot: Arc<dyn datafusion::catalog::TableProvider>,
+    schema: Arc<arrow_schema::Schema>,
+}
+
+impl std::fmt::Debug for HtapUnionTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HtapUnionTable").finish_non_exhaustive()
+    }
+}
+
+impl HtapUnionTable {
+    fn new(
+        cold: Arc<dyn datafusion::catalog::TableProvider>,
+        hot: Arc<dyn datafusion::catalog::TableProvider>,
+        schema: Arc<arrow_schema::Schema>,
+    ) -> Self {
+        Self { cold, hot, schema }
+    }
+}
+
+#[async_trait::async_trait]
+impl datafusion::catalog::TableProvider for HtapUnionTable {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn schema(&self) -> Arc<arrow_schema::Schema> {
+        self.schema.clone()
+    }
+
+    fn table_type(&self) -> datafusion::logical_expr::TableType {
+        datafusion::logical_expr::TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[datafusion::logical_expr::Expr],
+        limit: Option<usize>,
+    ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        use datafusion::physical_plan::union::UnionExec;
+
+        let cold_plan = self.cold.scan(state, projection, filters, limit).await?;
+        let hot_plan = self.hot.scan(state, projection, filters, limit).await?;
+        Ok(Arc::new(UnionExec::new(vec![cold_plan, hot_plan])))
+    }
 }
 
 /// Inspect `sql` for tables with [`PartitionSpec::RangeMonthly`] and, if the

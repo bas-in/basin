@@ -156,6 +156,13 @@ pub(crate) struct EngineInner {
     /// lands in subsequent sub-items; this field is only constructed + exposed
     /// here so the rest of the C-series can wire against it.
     pub(crate) memtable_registry: Arc<basin_hottier::MemTableRegistry>,
+    /// Monotonic source for WAL transaction ids (Phase 5.14.C2).
+    ///
+    /// Each explicit-tx DML assigns its tx a unique `u64` derived from this
+    /// counter.  The counter is process-scoped; ids are never reused within a
+    /// process lifetime so WAL markers are unambiguous across concurrent
+    /// sessions.
+    pub(crate) next_tx_id: AtomicU64,
 }
 
 impl Engine {
@@ -222,6 +229,7 @@ impl Engine {
             file_metadata_cache,
             query_history: Arc::new(crate::query_history::QueryHistory::new()),
             memtable_registry,
+            next_tx_id: AtomicU64::new(1),
         });
         // Phase 5.14.D2: register the query-history adapter with the shard so
         // the compactor can consult observed ORDER BY / GROUP BY patterns.
@@ -362,6 +370,15 @@ impl Engine {
     /// reference the registry via the engine handle.
     pub fn memtable_registry(&self) -> Arc<basin_hottier::MemTableRegistry> {
         self.inner.memtable_registry.clone()
+    }
+
+    /// Allocate a fresh, process-unique WAL transaction id (Phase 5.14.C2).
+    ///
+    /// The counter starts at 1 at engine construction and increments monotonically;
+    /// ids are never reused in a process lifetime so WAL Begin/Commit/Rollback
+    /// markers are unambiguous even under concurrent sessions.
+    pub(crate) fn next_tx_id(&self) -> u64 {
+        self.inner.next_tx_id.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Crate-private hook bumped by `executor::execute` when a vector

@@ -297,6 +297,17 @@ impl MemTableRegistry {
         self.tables.remove(&(*project, table.clone()));
     }
 
+    /// Remove **all** memtable entries for `project` and reset the project's
+    /// byte counter to zero.  Called by the synchronous flush path when the
+    /// global hard cap is reached and the largest project must be evicted to
+    /// free budget for incoming writes (Phase 5.14.C2 budget enforcement).
+    pub fn remove_project(&self, project: &ProjectId) {
+        self.tables.retain(|(p, _), _| p != project);
+        if let Some(state) = self.projects.get(project) {
+            state.bytes_allocated.store(0, Ordering::Release);
+        }
+    }
+
     /// Reference to the process-wide [`MemTableConfig`].
     pub fn config(&self) -> &MemTableConfig {
         &self.config

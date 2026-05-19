@@ -11,6 +11,7 @@ basin-common.workspace = true
 basin-storage.workspace = true
 basin-catalog.workspace = true
 basin-engine.workspace = true
+basin-hottier.workspace = true
 basin-cron.workspace = true
 basin-net.workspace = true
 basin-cv.workspace = true
