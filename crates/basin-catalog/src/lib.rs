@@ -641,6 +641,17 @@ pub trait Catalog: Send + Sync {
         Ok(())
     }
 
+    /// Phase 5.14.D2: set the `adaptive_sort_override` flag for `(project, table)`.
+    async fn set_adaptive_sort_override(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        value: Option<bool>,
+    ) -> Result<()> {
+        let _ = (project, table, value);
+        Ok(())
+    }
+
     /// Phase 6 multi-region scaffolding (ADR 0009). Pin `(project, table)`
     /// to a home region (or clear the pin with `None`). v0.1 only
     /// *records* the value; the cross-region routing / replication that

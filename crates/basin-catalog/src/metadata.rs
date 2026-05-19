@@ -458,6 +458,11 @@ pub struct TableMetadata {
     /// inserting a `SortExec` before `WindowAggExec` / `SortMergeJoin`.
     /// `None` is the default for every table that predates this feature.
     pub global_sort_order: Option<Vec<String>>,
+    /// Phase 5.14.D2: when `Some(true)`, the compactor may override
+    /// `cluster_columns` with the observed `QueryHistory::top_pattern` when
+    /// the threshold is met.  When `None` (the default, back-compat) or
+    /// `Some(false)`, user-declared `CLUSTER BY` always wins.
+    pub adaptive_sort_override: Option<bool>,
 }
 
 impl TableMetadata {

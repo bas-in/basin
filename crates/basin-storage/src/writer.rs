@@ -314,6 +314,8 @@ pub(crate) async fn write_batch_with_options(
         // to cold later via `Storage::migrate_to_cold`.
         tier: crate::tier::Tier::Hot,
         bloom_filters,
+        hll_sketches: std::collections::BTreeMap::new(),
+        tdigest_sketches: std::collections::BTreeMap::new(),
     })
 }
 

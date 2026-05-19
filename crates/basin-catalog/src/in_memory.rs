@@ -55,6 +55,7 @@ struct TableState {
     foreign_keys: Vec<ForeignKeyDef>,
     unique_constraints: Vec<UniqueConstraint>,
     global_sort_order: Option<Vec<String>>,
+    adaptive_sort_override: Option<bool>,
 }
 
 impl TableState {
@@ -96,6 +97,7 @@ impl TableState {
             foreign_keys: Vec::new(),
             unique_constraints: Vec::new(),
             global_sort_order: None,
+            adaptive_sort_override: None,
         }
     }
 }
@@ -257,6 +259,7 @@ impl InMemoryCatalog {
             foreign_keys: state.foreign_keys.clone(),
             unique_constraints: state.unique_constraints.clone(),
             global_sort_order: state.global_sort_order.clone(),
+            adaptive_sort_override: state.adaptive_sort_override,
         }
     }
 }
@@ -578,6 +581,19 @@ impl Catalog for InMemoryCatalog {
         let state_arc = self.get_table_qualified(project, &qtable).await?;
         let mut state = state_arc.lock().await;
         state.row_block_size = size;
+        Ok(())
+    }
+
+    async fn set_adaptive_sort_override(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        value: Option<bool>,
+    ) -> Result<()> {
+        let qtable = QualifiedTableName::in_public(table.clone());
+        let state_arc = self.get_table_qualified(project, &qtable).await?;
+        let mut state = state_arc.lock().await;
+        state.adaptive_sort_override = value;
         Ok(())
     }
 
@@ -1391,6 +1407,7 @@ impl Catalog for InMemoryCatalog {
                 foreign_keys: s.foreign_keys.clone(),
                 unique_constraints: s.unique_constraints.clone(),
                 global_sort_order: s.global_sort_order.clone(),
+                adaptive_sort_override: s.adaptive_sort_override,
             }
         };
 
