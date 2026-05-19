@@ -1,3 +1,10 @@
+---
+title: "Scaling: object storage"
+nav_section: operations
+sidebar_position: 30
+summary: "How Basin scales storage and what to expect from S3/GCS/MinIO at different sizes."
+---
+
 # Object Storage Scaling — S3-compatible backends (Tigris, S3, MinIO)
 
 Status: design + skeleton (2026-05-11)

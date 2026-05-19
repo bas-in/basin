@@ -1,3 +1,10 @@
+---
+title: "ADR 0009 — Multi-region architecture"
+nav_section: decisions
+sidebar_position: 9
+summary: "ADR 0009: Multi-region architecture. See body for status, context, decision, consequences."
+---
+
 # 0009 — Multi-region architecture (regional WALs, replicated storage, no cross-region writes)
 
 - **Status:** Accepted (decision locked; full replication implementation

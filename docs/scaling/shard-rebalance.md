@@ -1,3 +1,10 @@
+---
+title: "Scaling: shard rebalancing"
+nav_section: operations
+sidebar_position: 50
+summary: "How shards split, merge, and migrate; the operator-visible touchpoints."
+---
+
 # Shard split + rebalance (v0.2)
 
 Status: design + skeleton. Manual via admin API in v0.2; automatic rebalance

@@ -1,3 +1,10 @@
+---
+title: "ADR 0011 — Cross-shard 2PC"
+nav_section: decisions
+sidebar_position: 11
+summary: "ADR 0011: Cross-shard 2PC. See body for status, context, decision, consequences."
+---
+
 # 0011 — Cross-shard 2PC: structural rejection until customer demand
 
 - **Status:** Accepted, deferred. Trigger to revisit below.

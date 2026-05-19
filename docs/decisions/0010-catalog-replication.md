@@ -1,3 +1,10 @@
+---
+title: "ADR 0010 — Catalog replication"
+nav_section: decisions
+sidebar_position: 10
+summary: "ADR 0010: Catalog replication. See body for status, context, decision, consequences."
+---
+
 # 0010 — Catalog replication: single-writer global Postgres with regional read replicas
 
 - **Status:** Accepted (decision only). v0.1 implementation deferred behind

@@ -1,3 +1,10 @@
+---
+title: "Basin SQL compatibility"
+nav_section: sql
+sidebar_position: 10
+summary: "What Postgres SQL Basin accepts, what it doesn't, and the design rationale for each gap."
+---
+
 # SQL / ORM compatibility — survey
 
 Output of `tests/integration/tests/orm_smoke.rs`. The test drives seven

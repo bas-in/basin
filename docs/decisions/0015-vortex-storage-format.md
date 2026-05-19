@@ -1,3 +1,10 @@
+---
+title: "ADR 0015 — Vortex storage format (default)"
+nav_section: decisions
+sidebar_position: 15
+summary: "ADR 0015: Vortex storage format (default). See body for status, context, decision, consequences."
+---
+
 # 0015 — Vortex storage format (now the default; Parquet first-class selectable)
 
 - **Status:** Accepted — **superseded by the 2026-05-18 update below: Vortex IS now the default.**

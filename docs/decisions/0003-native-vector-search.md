@@ -1,3 +1,10 @@
+---
+title: "ADR 0003 — Native vector search"
+nav_section: decisions
+sidebar_position: 3
+summary: "ADR 0003: Native vector search. See body for status, context, decision, consequences."
+---
+
 # 0003 — Native vector search (supersedes part of 0002)
 
 - **Status:** Accepted

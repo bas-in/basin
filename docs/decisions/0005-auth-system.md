@@ -1,3 +1,10 @@
+---
+title: "ADR 0005 — Auth system"
+nav_section: decisions
+sidebar_position: 5
+summary: "ADR 0005: Auth system. See body for status, context, decision, consequences."
+---
+
 # 0005 — Auth system (basin-auth)
 
 - **Status:** Accepted. Build started 2026-05-01 by founder direction —

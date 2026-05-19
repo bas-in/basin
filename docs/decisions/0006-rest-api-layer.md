@@ -1,3 +1,10 @@
+---
+title: "ADR 0006 — REST API layer"
+nav_section: decisions
+sidebar_position: 6
+summary: "ADR 0006: REST API layer. See body for status, context, decision, consequences."
+---
+
 # 0006 — REST API layer (basin-rest)
 
 - **Status:** Accepted. Build started alongside ADR 0005 by founder

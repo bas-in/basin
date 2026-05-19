@@ -1,3 +1,10 @@
+---
+title: "ADR index"
+nav_section: decisions
+sidebar_position: 0
+summary: "Index of every architectural decision record. Each \"no\" with the trigger that would change our mind."
+---
+
 # Architecture Decision Records
 
 One file per load-bearing decision. Numbered, append-only, immutable.

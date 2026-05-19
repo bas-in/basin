@@ -1,3 +1,10 @@
+---
+title: "ADR 0008 — Noisy-neighbor fairness"
+nav_section: decisions
+sidebar_position: 8
+summary: "ADR 0008: Noisy-neighbor fairness. See body for status, context, decision, consequences."
+---
+
 # 0008 — Noisy-neighbor fairness on bounded backends
 
 - **Status:** Accepted v0.2 (per-project semaphore + fair-share scheduler). v0.3 work deferred behind a documented trigger.

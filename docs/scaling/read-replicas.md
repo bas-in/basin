@@ -1,3 +1,10 @@
+---
+title: "Scaling: read replicas"
+nav_section: operations
+sidebar_position: 40
+summary: "Read-replica architecture, replication lag, fail-over story, and what's deferred to Phase 6."
+---
+
 # Read Replicas — design
 
 Status: design / skeleton. v0.2 ships the single-region follower path; v0.3

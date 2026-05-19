@@ -1,3 +1,10 @@
+---
+title: "Multi-project SaaS on Basin"
+nav_section: architecture
+sidebar_position: 20
+summary: "Tenancy model and isolation primitives for thousands of projects on one cluster."
+---
+
 # Multi-project SaaS on Basin
 
 Basin's primary positioning is "cheap Postgres on object storage." A direct

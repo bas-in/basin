@@ -1,3 +1,10 @@
+---
+title: "ADR 0014 — pg_query as canonical parser"
+nav_section: decisions
+sidebar_position: 14
+summary: "ADR 0014: pg_query as canonical parser. See body for status, context, decision, consequences."
+---
+
 # 0014 — libpg_query as canonical SQL parser (retire sqlparser-rs)
 
 - **Status:** Accepted, in progress (Phase 1 in flight 2026-05-14)

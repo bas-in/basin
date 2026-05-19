@@ -1,3 +1,10 @@
+---
+title: "ADR 0012 — Change-event primitive"
+nav_section: decisions
+sidebar_position: 12
+summary: "ADR 0012: Change-event primitive. See body for status, context, decision, consequences."
+---
+
 # 0012 — Change-event sink trait as Basin's trigger / webhook / future-realtime primitive
 
 - **Status:** Accepted, 2026-05-09.

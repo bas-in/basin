@@ -1,3 +1,10 @@
+---
+title: "ADR 0004 — Multi-region read replicas"
+nav_section: decisions
+sidebar_position: 4
+summary: "ADR 0004: Multi-region read replicas. See body for status, context, decision, consequences."
+---
+
 # 0004 — Multi-region read replicas (supersedes part of 0001)
 
 - **Status:** Accepted

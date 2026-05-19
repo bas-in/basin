@@ -1,3 +1,10 @@
+---
+title: "ADR 0013 — Auth per-project schema"
+nav_section: decisions
+sidebar_position: 13
+summary: "ADR 0013: Auth per-project schema. See body for status, context, decision, consequences."
+---
+
 # 0013 — Auth per-project schema (remove loopback pgwire)
 
 - **Status:** Accepted, 2026-05-11

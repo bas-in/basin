@@ -1,3 +1,10 @@
+---
+title: "Basin architecture"
+nav_section: architecture
+sidebar_position: 10
+summary: "Four-layer design: router, shard owners, WAL service, storage. Reference doc for how the code is laid out."
+---
+
 # Basin Architecture
 
 This document describes how Basin is put together. It is the design reference

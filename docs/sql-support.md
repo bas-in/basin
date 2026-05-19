@@ -1,3 +1,10 @@
+---
+title: "Basin SQL support matrix (auto-generated)"
+nav_section: reference
+sidebar_position: 10
+summary: "Auto-generated per-syntax matrix from sql_support_matrix integration tests. Regenerated nightly."
+---
+
 # Basin SQL support — auto-generated matrix
 
 Run `cargo test -p basin-integration-tests --test sql_support_matrix` to refresh.

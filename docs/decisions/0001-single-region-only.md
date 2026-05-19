@@ -1,3 +1,10 @@
+---
+title: "ADR 0001 — Single-region only (superseded in part)"
+nav_section: decisions
+sidebar_position: 1
+summary: "ADR 0001: Single-region only (superseded in part). See body for status, context, decision, consequences."
+---
+
 # 0001 — Single-region only
 
 - **Status:** Superseded in part by [0004](./0004-multi-region-read-replicas.md)

@@ -1,3 +1,10 @@
+---
+title: "Deployment and cloud architecture"
+nav_section: deployment
+sidebar_position: 10
+summary: "How to run Basin in production: storage backends, deployment topologies, configuration."
+---
+
 # Deployment & cloud architecture
 
 How to actually run Basin in production. Companion to [`architecture.md`](./architecture.md)

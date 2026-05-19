@@ -1,3 +1,10 @@
+---
+title: "ADR 0007 — Connection pooling"
+nav_section: decisions
+sidebar_position: 7
+summary: "ADR 0007: Connection pooling. See body for status, context, decision, consequences."
+---
+
 # 0007 — Native connection pooling (`basin-pool`)
 
 - **Status:** Accepted, deferred. Build trigger below.

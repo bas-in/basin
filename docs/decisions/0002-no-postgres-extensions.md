@@ -1,3 +1,10 @@
+---
+title: "ADR 0002 — No Postgres extensions"
+nav_section: decisions
+sidebar_position: 2
+summary: "ADR 0002: No Postgres extensions. See body for status, context, decision, consequences."
+---
+
 # 0002 — No Postgres extension support (PostGIS, pg_vector, etc.)
 
 - **Status:** Superseded by [0003](./0003-native-vector-search.md) for vector
