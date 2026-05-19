@@ -20,6 +20,7 @@ import { FunctionsClient } from "./functions/client.js";
 import { PostgrestQueryBuilder } from "./postgrest/builder.js";
 import { RealtimeChannel, RealtimeClient } from "./realtime/client.js";
 import { StorageClient } from "./storage/client.js";
+import { withRetry, type RetryOptions } from "./internal/retry.js";
 
 export interface BasinClientOptions {
   /**
@@ -57,7 +58,17 @@ export interface BasinClientOptions {
    * way until basin v0.2.
    */
   projectRef?: string;
+
+  /**
+   * Retry configuration for all network requests. Pass `false` to
+   * disable retries entirely. Defaults to 3 attempts with exponential
+   * backoff (250ms base, 5000ms cap), retrying on network errors, 5xx,
+   * and 429 (honouring `Retry-After`).
+   */
+  retry?: RetryOptions | false;
 }
+
+export type { RetryOptions };
 
 export interface BasinClient {
   /** Authentication surface — signUp, signIn*, signOut, MFA. */
@@ -135,13 +146,17 @@ export function createClient(
 ): BasinClient {
   const url = engineURL;
   const base = url.replace(/\/$/, "");
-  const fetcher = options.fetch ?? globalThis.fetch;
-  if (typeof fetcher !== "function") {
+  const rawFetcher = options.fetch ?? globalThis.fetch;
+  if (typeof rawFetcher !== "function") {
     throw new Error(
       "@bas-in/basin-js: `fetch` is not available in this environment. " +
         "Pass `options.fetch` to createClient().",
     );
   }
+  const fetcher =
+    options.retry === false
+      ? rawFetcher
+      : withRetry(rawFetcher, options.retry ?? {});
 
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
