@@ -495,3 +495,31 @@ describe("postgrest URL construction", () => {
     expect(captured.request?.url).not.toContain("/v1/rest/v1/");
   });
 });
+
+describe("postgrest .cursor()", () => {
+  it("puts cursor=<token> on the URL", async () => {
+    const captured: { request?: Request } = {};
+    const basin = newClient(stubFetch({ body: [] }, captured));
+    await basin.from("t").select("*").cursor("abc");
+    expect(captured.request?.url).toContain("cursor=abc");
+  });
+
+  it("chained with eq + limit preserves all three params", async () => {
+    const captured: { request?: Request } = {};
+    const basin = newClient(stubFetch({ body: [] }, captured));
+    await basin.from("t").select("*").eq("status", "active").limit(10).cursor("xyz");
+    const url = captured.request?.url ?? "";
+    expect(url).toContain("status=eq.active");
+    expect(url).toContain("limit=10");
+    expect(url).toContain("cursor=xyz");
+  });
+
+  it("last cursor wins (URLSearchParams.set semantics)", async () => {
+    const captured: { request?: Request } = {};
+    const basin = newClient(stubFetch({ body: [] }, captured));
+    await basin.from("t").select("*").cursor("a").cursor("b");
+    const url = captured.request?.url ?? "";
+    expect(url).toContain("cursor=b");
+    expect(url).not.toContain("cursor=a");
+  });
+});

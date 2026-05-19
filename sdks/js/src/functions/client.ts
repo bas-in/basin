@@ -108,7 +108,7 @@ export class FunctionsClient {
         headers,
         body:
           options.body === undefined
-            ? undefined
+            ? null
             : typeof options.body === "string" || options.body instanceof ArrayBuffer
               ? (options.body as BodyInit)
               : JSON.stringify(options.body),
