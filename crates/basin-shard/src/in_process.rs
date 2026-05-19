@@ -54,6 +54,7 @@ use tracing::{debug, instrument, warn};
 
 use crate::{
     ProjectHandle, ProjectHandleImpl, ShardBackgroundHandle, ShardConfig, ShardImpl, ShardStats,
+    TopPatternProvider,
 };
 
 /// Per-(project, partition) in-memory state. Lives behind an `RwLock` inside
@@ -104,6 +105,7 @@ pub(crate) struct InProcessShard {
     pub(crate) cfg: ShardConfig,
     pub(crate) partitions: Arc<Mutex<PartitionMap>>,
     stats: Arc<Mutex<ShardStats>>,
+    top_pattern_provider: std::sync::RwLock<Option<Arc<dyn TopPatternProvider>>>,
 }
 
 impl InProcessShard {
@@ -112,14 +114,21 @@ impl InProcessShard {
             cfg,
             partitions: Arc::new(Mutex::new(HashMap::new())),
             stats: Arc::new(Mutex::new(ShardStats::default())),
+            top_pattern_provider: std::sync::RwLock::new(None),
         }
     }
 
     fn share_clone(&self) -> Self {
+        let provider = self
+            .top_pattern_provider
+            .read()
+            .expect("top_pattern_provider lock poisoned")
+            .clone();
         Self {
             cfg: self.cfg.clone(),
             partitions: self.partitions.clone(),
             stats: self.stats.clone(),
+            top_pattern_provider: std::sync::RwLock::new(provider),
         }
     }
 
@@ -460,6 +469,7 @@ impl InProcessShard {
 
         let mut max_lsn_overall: Option<Lsn> = None;
         let mut drained_per_table: HashMap<TableName, Lsn> = HashMap::new();
+        let mut any_adaptive_sort = false;
 
         for (table, entries) in tail_snapshot {
             let max_lsn = entries
@@ -474,24 +484,62 @@ impl InProcessShard {
             let merged = arrow::compute::concat_batches(&schema, &batches)
                 .map_err(|e| BasinError::storage(format!("concat batches: {e}")))?;
 
-            // Honour the table's persisted on-disk format. The shard
-            // compactor previously wrote `WriteOptions::default()` (format-
-            // unaware), so a Vortex table's drained tail was written as the
-            // default format and the catalog/reader (which branch on the
-            // recorded per-table format + file extension) saw a mismatch —
-            // recent rows became invisible to constraint/FK/UNIQUE scans and
-            // post-INSERT UPDATE/DELETE. Resolve the format from the catalog
-            // and write the matching format, exactly like the executor /
-            // copy-on-write rewrite paths do.
-            let file_format = match self.cfg.catalog.load_table(project, &table).await {
-                Ok(m) => shard_map_file_format(m.file_format),
-                // A table with a tail but no catalog row shouldn't happen;
-                // fall back to the storage default rather than erroring out
-                // the whole compaction.
-                Err(_) => basin_storage::FileFormat::default(),
+            // Resolve per-table metadata: on-disk format, cluster columns, and
+            // adaptive-sort override.  A missing catalog row is unusual but
+            // non-fatal; fall back to safe defaults so the whole compaction
+            // tick doesn't error out.
+            let (file_format, declared_cluster_cols, adaptive_sort_override) =
+                match self.cfg.catalog.load_table(project, &table).await {
+                    Ok(m) => (
+                        shard_map_file_format(m.file_format),
+                        m.cluster_columns,
+                        m.adaptive_sort_override.unwrap_or(false),
+                    ),
+                    Err(_) => (basin_storage::FileFormat::default(), Vec::new(), false),
+                };
+
+            // Phase 5.14.D2: consult the query-pattern history and decide
+            // which columns to sort the output file by.  Use a block scope so
+            // the !Send RwLockReadGuard is always dropped before any await.
+            let observed: Option<Vec<String>> = {
+                let guard = self
+                    .top_pattern_provider
+                    .read()
+                    .expect("top_pattern_provider lock poisoned");
+                guard.as_ref().and_then(|p| p.top_pattern(project, &table))
             };
+
+            // Record divergence for Phase 5.16.G when applicable.
+            if let Some(ref obs) = observed {
+                if !declared_cluster_cols.is_empty() && obs != &declared_cluster_cols {
+                    let provider_clone: Option<Arc<dyn TopPatternProvider>> = {
+                        let guard = self
+                            .top_pattern_provider
+                            .read()
+                            .expect("top_pattern_provider lock poisoned");
+                        guard.as_ref().cloned()
+                    };
+                    if let Some(p) = provider_clone {
+                        p.record_cluster_delta(project, &table, obs, &declared_cluster_cols);
+                    }
+                }
+            }
+
+            let (sort_cols, used_adaptive_sort): (Vec<String>, bool) = match (
+                declared_cluster_cols.is_empty(),
+                observed.as_ref(),
+                adaptive_sort_override,
+            ) {
+                (true, Some(obs), _) => (obs.clone(), true),
+                (false, Some(obs), true) => (obs.clone(), true),
+                (false, None, true) => (declared_cluster_cols, false),
+                (false, _, false) => (declared_cluster_cols, false),
+                (true, None, _) => (Vec::new(), false),
+            };
+
             let write_opts = basin_storage::WriteOptions {
                 file_format,
+                cluster_columns: sort_cols,
                 ..Default::default()
             };
             let data_file = self
@@ -512,6 +560,10 @@ impl InProcessShard {
 
             self.commit_with_retry(project, &table, &merged, file_ref)
                 .await?;
+
+            if used_adaptive_sort {
+                any_adaptive_sort = true;
+            }
 
             drained_per_table.insert(table, max_lsn);
             max_lsn_overall = Some(match max_lsn_overall {
@@ -545,6 +597,8 @@ impl InProcessShard {
 
         let mut stats = self.stats.lock().await;
         stats.compactions = stats.compactions.saturating_add(1);
+        // Phase 5.14.D2: adaptive-sort counter (field wired in 5.14.D3).
+        let _ = any_adaptive_sort;
         Ok(())
     }
 
@@ -674,6 +728,14 @@ impl ShardImpl for InProcessShard {
 
     fn wal(&self) -> &Arc<dyn basin_wal::Wal> {
         &self.cfg.wal
+    }
+
+    fn set_top_pattern_provider(&self, provider: Arc<dyn TopPatternProvider>) {
+        let mut guard = self
+            .top_pattern_provider
+            .write()
+            .expect("top_pattern_provider lock poisoned");
+        *guard = Some(provider);
     }
 
     async fn flush_to_parquet(&self) -> Result<()> {

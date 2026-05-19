@@ -777,6 +777,11 @@ pub(crate) async fn execute_simple_select(
     plan: SimpleSelectPlan,
     prefetched_meta: Option<TableMetadata>,
 ) -> Result<ExecResult> {
+    // Phase 5.16.A: fast path bypasses DataFusion (no LogicalPlan); shape
+    // hash is computed on the DataFusion path (executor::exec_select).
+    // 5.16.B will wire both paths into the histogram registry.
+    let _ = &plan.table;
+
     // Flush the in-RAM tail before we look up the table's metadata so the
     // post-flush snapshot drives the heavy-read gating below. Without this
     // the catalog reports zero data files (everything still in WAL) and we'd

@@ -118,7 +118,7 @@ pub(crate) async fn exec_alter_project_memtable_cap(
     let catalog = sess.engine.config().catalog.clone();
     let project = &sess.project;
 
-    let mut config = catalog
+    let mut config: basin_storage::ProjectStorageConfig = catalog
         .get_project_storage_config(project)
         .await?
         .unwrap_or_default();

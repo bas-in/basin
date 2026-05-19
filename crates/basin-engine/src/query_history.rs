@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use basin_common::{ProjectId, TableName};
+use basin_shard::TopPatternProvider;
 use chrono::{DateTime, Duration, Utc};
 
 /// Total-query threshold per window: reset the window after this many queries.
@@ -52,6 +53,7 @@ const TOP_FRACTION_THRESHOLD: f64 = 0.30;
 /// once inside [`crate::EngineInner`] and shared via `Arc`.
 pub(crate) struct QueryHistory {
     inner: RwLock<HashMap<(ProjectId, TableName), TableHistory>>,
+    deltas: RwLock<DeltaMap>,
 }
 
 impl QueryHistory {
@@ -59,6 +61,7 @@ impl QueryHistory {
     pub(crate) fn new() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            deltas: RwLock::new(HashMap::new()),
         }
     }
 
@@ -168,6 +171,42 @@ impl QueryHistory {
                 hist.reset();
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TopPatternProvider implementation (Phase 5.14.D2)
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+struct ClusterDelta {
+    observed: Vec<String>,
+    declared: Vec<String>,
+}
+
+type DeltaMap = std::collections::HashMap<(ProjectId, TableName), Vec<ClusterDelta>>;
+
+impl TopPatternProvider for QueryHistory {
+    fn top_pattern(&self, project: &ProjectId, table: &TableName) -> Option<Vec<String>> {
+        QueryHistory::top_pattern(self, project, table)
+    }
+
+    fn record_cluster_delta(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        observed: &[String],
+        declared: &[String],
+    ) {
+        let key = (*project, table.clone());
+        let mut guard = self
+            .deltas
+            .write()
+            .expect("cluster_delta write lock poisoned");
+        guard.entry(key).or_default().push(ClusterDelta {
+            observed: observed.to_vec(),
+            declared: declared.to_vec(),
+        });
     }
 }
 

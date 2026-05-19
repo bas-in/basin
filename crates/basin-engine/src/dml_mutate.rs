@@ -2234,6 +2234,8 @@ async fn write_replacement(
         row_count: df.row_count,
         column_stats: df.column_stats.clone(),
         bloom_filters: df.bloom_filters.clone(),
+        hll_sketches: std::collections::BTreeMap::new(),
+        tdigest_sketches: std::collections::BTreeMap::new(),
     }])
 }
 

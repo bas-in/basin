@@ -172,6 +172,13 @@ impl Shard {
         Ok(total)
     }
 
+    /// Phase 5.14.D2: register the adaptive-sort query-pattern provider.
+    /// The engine calls this once at startup so the compactor can detect
+    /// common ORDER BY / GROUP BY access patterns and pre-sort files.
+    pub fn set_top_pattern_provider(&self, provider: Arc<dyn TopPatternProvider>) {
+        self.inner.set_top_pattern_provider(provider);
+    }
+
     /// Test-only: pull out the concrete in-process implementation so the
     /// inline tests can drive its synchronous helpers. Returns `None` if a
     /// future backend swap replaces the in-process map.
@@ -237,6 +244,25 @@ impl ShardBackgroundHandle {
 /// [`Shard::run_cv_refresh`]. Implementations live in `basin-cv`
 /// (`CvRefresher` is the canonical one); the trait sits in `basin-shard`
 /// purely so `Shard::run_cv_refresh` can call it without taking a
+/// Pluggable query-pattern provider for adaptive sort (Phase 5.14.D2).
+/// Declared here so `basin-shard`'s compactor can call it without a
+/// direct dependency on `basin-engine`. `basin-engine::QueryHistory`
+/// implements this trait and registers itself via `Shard::set_top_pattern_provider`.
+pub trait TopPatternProvider: Send + Sync {
+    /// Return the most-frequently-observed GROUP BY / ORDER BY column tuple
+    /// for `(project, table)`, or `None` when there is insufficient history.
+    fn top_pattern(&self, project: &ProjectId, table: &TableName) -> Option<Vec<String>>;
+    /// Record a divergence between the observed access pattern and the
+    /// table's declared `CLUSTER BY` columns.  Used for telemetry only.
+    fn record_cluster_delta(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        observed: &[String],
+        declared: &[String],
+    );
+}
+
 /// `basin-cv` dependency (which would otherwise close a cycle through
 /// `basin-engine`).
 #[async_trait]
@@ -264,6 +290,8 @@ pub(crate) trait ShardImpl: Send + Sync {
     async fn resident_projects(&self) -> Vec<ProjectId> {
         Vec::new()
     }
+    /// Phase 5.14.D2: register the top-pattern provider. Default no-op.
+    fn set_top_pattern_provider(&self, _provider: Arc<dyn TopPatternProvider>) {}
     /// Test-only downcast for the inline test suite.
     #[cfg(test)]
     fn as_in_process(&self) -> Option<Arc<in_process::InProcessShard>> {

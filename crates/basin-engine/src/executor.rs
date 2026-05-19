@@ -1795,6 +1795,15 @@ async fn exec_create_table(
             .await?;
     }
 
+    // `basin.adaptive_sort_override` — Phase 5.14.D2
+    if let Some(aso) = crate::ddl::parse_create_table_adaptive_sort_override(raw_sql)? {
+        sess.engine
+            .config()
+            .catalog
+            .set_adaptive_sort_override(&sess.project, &table, Some(aso))
+            .await?;
+    }
+
     if !constraints.pk_columns.is_empty()
         || !constraints.checks.is_empty()
         || !constraints.foreign_keys.is_empty()

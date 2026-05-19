@@ -1366,6 +1366,7 @@ fn sanitize_create_table_extensions(sql: &str) -> String {
                                     && key != "file_format"
                                     && key != "basin.sort_by"
                                     && key != "basin.row_block_size"
+                                    && key != "basin.adaptive_sort_override"
                             }
                         })
                         .collect();
@@ -1898,6 +1899,106 @@ fn row_block_size_from_with_body(inside: &str) -> basin_common::Result<Option<u3
     }
     Ok(None)
 }
+
+/// Scan a `CREATE TABLE … WITH (…)` statement for `basin.adaptive_sort_override`.
+///
+/// Returns `None` when the key is absent, `Some(true)` for `'true'` / `true`,
+/// `Some(false)` for `'false'` / `false`. Rejects other values.
+pub fn parse_create_table_adaptive_sort_override(
+    sql: &str,
+) -> basin_common::Result<Option<bool>> {
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'"' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < bytes.len() {
+                i += 2;
+            }
+            continue;
+        }
+        if matches_kw_at(bytes, i, b"WITH") {
+            let mut k = i + b"WITH".len();
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            if k < bytes.len() && bytes[k] == b'(' {
+                if let Some(close) = find_matching_paren(bytes, k) {
+                    let inside = &sql[k + 1..close];
+                    return adaptive_sort_override_from_with_body(inside);
+                }
+                return Ok(None);
+            }
+        }
+        i += 1;
+    }
+    Ok(None)
+}
+
+fn adaptive_sort_override_from_with_body(inside: &str) -> basin_common::Result<Option<bool>> {
+    for seg in split_top_level_commas(inside) {
+        let seg = seg.trim();
+        let Some(eq) = seg.find('=') else { continue };
+        let key = unquote_with_token(seg[..eq].trim());
+        if key.to_ascii_lowercase() != "basin.adaptive_sort_override" {
+            continue;
+        }
+        let raw_val = seg[eq + 1..].trim();
+        let val = unquote_with_token(raw_val);
+        match val.to_ascii_lowercase().as_str() {
+            "true" => return Ok(Some(true)),
+            "false" => return Ok(Some(false)),
+            other => {
+                return Err(basin_common::BasinError::InvalidSchema(format!(
+                    "basin.adaptive_sort_override: expected 'true' or 'false', got {other:?}"
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
 
 /// Strip a single layer of surrounding `'...'` or `"..."` quoting from a
 /// WITH-option token, collapsing the doubled-quote escape. A bare

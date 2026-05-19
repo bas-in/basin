@@ -223,6 +223,11 @@ impl Engine {
             query_history: Arc::new(crate::query_history::QueryHistory::new()),
             memtable_registry,
         });
+        // Phase 5.14.D2: register the query-history adapter with the shard so
+        // the compactor can consult observed ORDER BY / GROUP BY patterns.
+        if let Some(shard) = inner.cfg.shard.as_ref() {
+            shard.set_top_pattern_provider(inner.query_history.clone());
+        }
         attach_reactor_sink(&inner, catalog);
         Self { inner }
     }
