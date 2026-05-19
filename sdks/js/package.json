@@ -37,9 +37,18 @@
       "import": "./dist/functions/index.js",
       "require": "./dist/functions/index.cjs"
     },
+    "./admin": {
+      "types": "./dist/admin/index.d.ts",
+      "import": "./dist/admin/index.js",
+      "require": "./dist/admin/index.cjs"
+    },
     "./package.json": "./package.json"
   },
-  "files": ["dist", "README.md", "LICENSE"],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "sideEffects": false,
   "engines": {
     "node": ">=18"
@@ -53,7 +62,14 @@
     "lint": "eslint src --max-warnings=0",
     "format": "prettier --write \"src/**/*.ts\""
   },
-  "keywords": ["basin", "database", "sdk", "postgres", "pgwire", "vector"],
+  "keywords": [
+    "basin",
+    "database",
+    "sdk",
+    "postgres",
+    "pgwire",
+    "vector"
+  ],
   "homepage": "https://basin.run",
   "repository": {
     "type": "git",
@@ -69,6 +85,8 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "@typescript-eslint/eslint-plugin": "^8.59.4",
+    "@typescript-eslint/parser": "^8.59.4",
     "eslint": "^9.18.0",
     "prettier": "^3.4.2",
     "tsup": "^8.3.5",

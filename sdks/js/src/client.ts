@@ -14,6 +14,7 @@
  * back into the client — keeps the dependency graph one-directional.
  */
 
+import { AdminClient } from "./admin/client.js";
 import { AuthClient } from "./auth/client.js";
 import { FunctionsClient } from "./functions/client.js";
 import { PostgrestQueryBuilder } from "./postgrest/builder.js";
@@ -61,6 +62,9 @@ export interface BasinClientOptions {
 export interface BasinClient {
   /** Authentication surface — signUp, signIn*, signOut, MFA. */
   readonly auth: AuthClient;
+
+  /** Admin namespace — project provisioning and credential management. */
+  readonly admin: AdminClient;
 
   /**
    * PostgREST-shaped table query builder.
@@ -172,8 +176,16 @@ export function createClient(
     ...(options.projectRef ? { projectRef: options.projectRef } : {}),
   });
 
+  const admin = new AdminClient({
+    url: base,
+    headers,
+    fetch: fetcher,
+    auth,
+  });
+
   return {
     auth,
+    admin,
     storage,
     realtime,
     functions,
