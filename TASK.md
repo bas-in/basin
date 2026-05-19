@@ -448,16 +448,15 @@ Tiered to keep the committed engineering scope honest:
 - **Tier 1** (~12-15 weeks honest): function catalogue + JSONB ops +
   `LANGUAGE sql` scalar functions + declarative lifecycle + enums +
   `CREATE MATERIALIZED VIEW` SQL surface. The committed minimum.
-- **Tier 2** (~14-18 weeks, customer-signal-driven): reactors,
-  constraint reactors, webhooks (built-in sinks), `RETURNS TABLE`
-  functions, `CALL` procedures, generated columns, sequences. Each
-  ships independently as Phase 0 interviews show real pull.
+- **Tier 2** (~14-18 weeks): reactors, constraint reactors, webhooks
+  (built-in sinks), `RETURNS TABLE` functions, `CALL` procedures,
+  generated columns, sequences. Each ships independently; parallelise
+  where the file scopes don't overlap.
 - **Tier 3** (~9-12 weeks, larger asks): `information_schema` +
   `pg_catalog` views, WASM UDFs.
-- **Deferred** (placeholder): `crates/basin-realtime` — WebSocket
-  subscriptions as a `ChangeEventSink` impl; gated on ≥2 design
-  partners explicitly asking and unable to bridge an existing realtime
-  provider via webhooks.
+- **Tier 4** (~10-12 weeks): `crates/basin-realtime` — WebSocket +
+  SSE + presence channels as `ChangeEventSink` impls (5.11.R series
+  below). Committed to ship.
 
 Phase 0 customer interviews should run **in parallel with Tier 1** so
 Tier 2 priorities are customer-driven, not imagined.
@@ -591,7 +590,7 @@ the engine plumbing already exists in `basin-cv`.
 - [x] Test: SQL round-trip (CREATE → refresh → SELECT → DROP) against
       the engine; refresh-on-schedule wire-up survives a process restart.
 
-### Tier 2 — Customer-signal-driven (~14-18 weeks, ship as Phase 0 demands)
+### Tier 2 — Built-in sinks + function/procedure surface (~14-18 weeks)
 
 Each independent. Each plugs into the Tier 0 trait. Order below is
 suggested-priority; real order is whatever Phase 0 surfaces.
@@ -735,12 +734,13 @@ catalog queries on startup.**
       stable values, which return NULL, which raise (see CAPABILITIES.md
       `information_schema` + `pg_catalog` row).
 
-#### 5.11.J — WASM UDFs (~3-4 weeks, customer-gated)
+#### 5.11.J — WASM UDFs (~3-4 weeks)
 
 Custom imperative computation as WebAssembly. Escape hatch for the
-~5% of cases `LANGUAGE sql` can't express. Gated on Phase 0 customer
-demand per ADR 0012's revisit clause — if customers haven't asked,
-don't build.
+~5% of cases `LANGUAGE sql` can't express. Committed to ship.
+Pairs with ADR 0019's RPC mount (5.11.L) — once both land, the
+`/rpc/<fn>` route transparently dispatches `LANGUAGE wasm` bodies
+alongside `LANGUAGE sql`.
 
 - [ ] `CREATE FUNCTION name(args) RETURNS type LANGUAGE wasm AS '<base64
       bytes>'` parser + catalog persistence.
@@ -749,23 +749,147 @@ don't build.
       overrun).
 - [ ] Test deferred — implement when shipped.
 
-### Deferred — `crates/basin-realtime` (placeholder, same workspace)
+### Tier 4 — `crates/basin-realtime` (~10-12 weeks)
 
-WebSocket realtime + presence channels as `ChangeEventSink`
-implementations. Lives in `crates/basin-realtime/` when it ships —
-same shape as `crates/basin-cron/`, `crates/basin-net/`. The Tier 0
-trait is the public seam; engine doesn't change.
+WebSocket + SSE + presence channels as `ChangeEventSink`
+implementations. New crate `crates/basin-realtime/` — same shape as
+`crates/basin-cron/`, `crates/basin-net/`. The Tier 0 trait is the
+public seam; engine doesn't change.
 
-**Gated on:** ≥2 design partners (Phase 0) explicitly asking for
-server-pushed realtime updates that webhooks can't satisfy AND unable
-to bridge an existing realtime provider (Pusher / Ably / Supabase
-Realtime / their own WebSocket layer) to Basin's webhook fanout. See
-ADR 0012's "Trigger to revisit" section.
+Implementation broken into file-scope-disjoint sub-tasks so multiple
+can land in parallel. Critical path: R1 → R2 → (R3 || R4) → R7.
 
-If a separate repo later makes more sense (independent release cadence,
-ecosystem signal), the workspace member becomes a separate repo via a
-one-day `git mv` + new `Cargo.toml`. Both paths stay open; same-repo
-default is just lower-friction at current scale.
+#### 5.11.R1 — Crate skeleton + trait wiring (~1 week)
+
+- [ ] New `crates/basin-realtime/` with `Cargo.toml`, `src/lib.rs`,
+      module stubs (`sse`, `ws`, `presence`, `filter`, `budget`).
+      Workspace `Cargo.toml` `[workspace.members]` adds the crate.
+- [ ] `RealtimeSink` struct implementing `ChangeEventSink`
+      (post-commit). Attaches via `Engine::attach_post_commit_sink`
+      from `services/basin-server` behind the `realtime` Cargo
+      feature (ADR 0018).
+- [ ] Per-project ring buffer (`tokio::sync::broadcast` or a custom
+      bounded channel keyed by `(project, table)`).
+- [ ] Replay cursor that consumes the existing webhook retry log
+      (5.11.I) for catch-up after a client reconnect — same
+      durable-log source for both webhooks and realtime.
+- [ ] Acceptance gate: empty crate compiles; `RealtimeSink` attaches;
+      a synthetic `ChangeEvent` published by the engine appears on
+      the in-memory broadcast channel.
+
+#### 5.11.R2 — SSE adapter (~2-3 weeks)
+
+- [ ] axum streaming response handler mounted at
+      `/realtime/v1/sse/:project/:table` (path scoping mirrors
+      `/in/<project>/<name>` from 5.11.N).
+- [ ] JWT auth identical to `basin-rest` (ADR 0006); RLS-equivalent
+      filtering applied to the event stream so a subscriber only
+      sees rows their policies permit.
+- [ ] Heartbeat comment frames every 15s to keep proxies / load
+      balancers from closing idle connections.
+- [ ] `Last-Event-Id` header support for replay-on-reconnect via the
+      shared retry-log cursor.
+- [ ] Body cap + per-connection rate limit reuse basin-net knobs.
+- [ ] Acceptance gate: `curl -N -H "Authorization: Bearer …"
+      .../realtime/v1/sse/proj/orders` receives JSON events on every
+      INSERT/UPDATE/DELETE; reconnecting with `Last-Event-Id`
+      replays missed events from the retry log.
+- [ ] Integration test:
+      `tests/integration/tests/realtime_sse.rs` covering connect /
+      replay / disconnect / RLS-filtering / cross-project-isolation.
+
+#### 5.11.R3 — WebSocket adapter (~2 weeks on top of R2)
+
+- [ ] axum WebSocket handler mounted at
+      `/realtime/v1/ws/:project`. Single connection multiplexes
+      multiple table subscriptions via subprotocol messages.
+- [ ] Subscribe / unsubscribe protocol messages (JSON-framed
+      control plane on the same WS connection).
+- [ ] Bidirectional ping / pong for liveness; tokio-tungstenite's
+      built-in support is sufficient.
+- [ ] Reuses R2's ring buffer + replay machinery; only the transport
+      adapter differs.
+- [ ] Disconnect protocol: server-initiated close with reason code
+      on auth failure / RLS denial / project deletion.
+- [ ] Acceptance gate: `wscat` connects, subscribes to two tables,
+      receives interleaved events, unsubscribes one mid-stream
+      without closing the connection.
+- [ ] Integration test: `tests/integration/tests/realtime_ws.rs`
+      covering multi-subscription / unsubscribe / RLS / ping-pong /
+      reconnect.
+
+#### 5.11.R4 — Presence channels (~2 weeks)
+
+- [ ] Per-project presence registry: `(project, channel) → Set<{
+      client_id, metadata }>`. In-memory; ephemeral (no persistence
+      across restarts).
+- [ ] Presence protocol over WS: `track` / `untrack` /
+      `presence_state` / `presence_diff` messages (Phoenix Channels
+      shape; well-trodden contract).
+- [ ] Heartbeat-driven liveness: clients send heartbeat every 30s;
+      missed heartbeats evict from the presence set after 90s.
+- [ ] Filter pushdown: a client subscribing to `(project, channel)`
+      only sees presence events for that channel.
+- [ ] Acceptance gate: two clients join the same channel; each sees
+      the other in `presence_state`; one disconnects; the other
+      receives a `presence_diff` with the leaver.
+- [ ] Integration test:
+      `tests/integration/tests/realtime_presence.rs`.
+
+#### 5.11.R5 — Subscription filter pushdown (~1 week)
+
+- [ ] Subscriber-side predicate (`WHERE` clause) evaluated at fanout
+      time against the `ChangeEvent` JSON payload (same
+      `predicate_eval` module 5.11.I uses for webhook subscriptions).
+- [ ] Predicate parsed at subscribe time; compiled once; reused per
+      event.
+- [ ] Acceptance gate: subscribing to `orders` with predicate
+      `status = 'paid'` only delivers events where the new row's
+      status is paid; bench shows ≤ 50µs predicate eval per event.
+
+#### 5.11.R6 — Multi-tenant memory budget (~1 week)
+
+- [ ] Shared bounded buffer (single `tokio::sync::broadcast`
+      cluster) + per-project byte counter + per-project semaphore.
+      Pattern from `feedback_multitenant_isolation`: cost is
+      O(bytes-in-flight) per tenant, not O(active_subscribers).
+- [ ] Per-project hard cap (default 16 MiB in-flight; configurable
+      via `BASIN_REALTIME_PER_PROJECT_BUDGET_BYTES`).
+- [ ] When a tenant's quota fills, new events drop into the durable
+      retry log; in-memory fast path is best-effort.
+- [ ] Acceptance gate: 1k-tenant fuzz with one noisy tenant pushing
+      10x events/sec — other tenants' p99 delivery latency
+      unaffected; noisy tenant sees `BUFFER_FULL` on its own
+      subscription only.
+
+#### 5.11.R7 — Differential harness + soak test (~1 week)
+
+- [ ] Differential: every shape in `change_event_smoke` runs three
+      ways — no realtime, SSE subscriber, WS subscriber. Asserts the
+      events delivered match the engine-emitted events exactly.
+- [ ] Soak: 1-hour run, 100 tenants × 10 connections each, mixed
+      INSERT/UPDATE/DELETE workload. Asserts no memory growth, no
+      dropped events under quota, durable replay catches
+      over-quota drops.
+- [ ] Files: `tests/integration/tests/realtime_differential.rs`,
+      `tests/integration/tests/realtime_soak.rs`.
+
+#### 5.11.R8 — basin-js client SDK channel API (~3-5 days)
+
+- [ ] Mirror Supabase's channel API in `basin-js`:
+      `basin.channel('orders').on('postgres_changes', { event: '*' },
+      cb).subscribe()`. Maps to SSE for read-only subscriptions, WS
+      when presence or filter changes mid-stream.
+- [ ] Reconnect-with-replay using `Last-Event-Id` automatically.
+- [ ] Acceptance gate: example app in basin-js repo subscribes,
+      sees live events, survives a network blip with replay.
+- [ ] Lives in basin-js repo; tracked here as the consumer-side
+      acceptance gate for R1-R7.
+
+If a separate repo later makes more sense (independent release
+cadence, ecosystem signal), the workspace member becomes a separate
+repo via a one-day `git mv` + new `Cargo.toml`. Both paths stay
+open; same-repo default is just lower-friction at current scale.
 
 ### Decision trade-off (read before reopening this scope)
 
@@ -1167,7 +1291,7 @@ approximation alternative. Sketches merge across files at query time.
       basin-sketch), `crates/basin-engine/src/approx_percentile.rs`
       (same).  Acceptance gate: round-trip serialise/deserialise via
       InMemory + Postgres impls; existing UDF unit tests still pass.
-- [ ] **5.14.B2** Writer-side sketch computation.  `WriteOptions::
+- [x] **5.14.B2** Writer-side sketch computation (shipped `696cadb`).  `WriteOptions::
       sketch_columns: Vec<String>` (defaults to `global_sort_order`,
       consistent with `bloom_columns`); writer's
       `compute_bloom_filters` companion `compute_sketches` runs in the
@@ -1250,7 +1374,7 @@ Lives in a new crate `crates/basin-hottier/`.
       1k-row range ≤ 2ms at 1M rows.  If p99 lookup at 1M rows >
       500 µs, switch backing structure to `crossbeam-skiplist::SkipMap`
       before C2 starts.
-- [ ] **5.14.C2** Write-path integration + WAL transaction markers — ~1.5 weeks.
+- [x] **5.14.C2** Write-path integration + WAL transaction markers (shipped `a435ba8`; single-row INSERT/UPDATE/DELETE through memtable + `HtapUnionTable` read-merge + WAL markers; INSERT-SELECT and DEFAULT VALUES deferred to C3) — ~1.5 weeks.
       INSERT/UPDATE/DELETE route to memtable (after WAL append).
       `TxState::memtable_watermarks` for per-table rollback; extend
       `SavepointFrame` with the same.  Add `BEGIN` / `ROLLBACK`
@@ -1332,7 +1456,7 @@ planning input that upstream cannot see. Closes `order_by_multi`,
       work below is the *compactor consumer*).  `QueryHistory` lives
       at `crates/basin-engine/src/query_history.rs`; executor records
       ORDER BY and GROUP BY shapes via `record_query_patterns`.
-- [ ] **5.14.D2** Compaction-time multi-sort — compactor consults the
+- [x] **5.14.D2** Compaction-time multi-sort (shipped `ddc9382`) — compactor consults the
       query-history `top_pattern` and re-sorts output files when
       threshold met (≥ 30 % share, ≥ 100 queries observed).
       **Locked priority decision (2026-05-19):** user-declared
@@ -1390,7 +1514,8 @@ compaction; `window_partition_sum` + `lag_lead_window` drop their
 - Any feature that does not depend on Basin's catalog + multi-tenant
   layer for correctness (i.e., anything that could equally well ship in
   upstream Vortex or upstream DataFusion).
-- WebSocket realtime (still gated per ADR 0012 trigger).
+- (Reserved for future entries.) WebSocket realtime moved to Tier 4
+  (5.11.R series) — committed, no longer gated.
 
 ## Phase 6 — Production hardening (3–4 months)
 
