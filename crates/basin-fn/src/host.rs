@@ -73,27 +73,38 @@ impl query::Host for FunctionHost {
     }
 }
 
-/// `basin:functions/http` — stubbed (TODO W1-followup).
+/// `basin:functions/http` — wired via `InvocationContext::http` (`HttpSend`).
 ///
-/// In a follow-up pass this calls `basin_net::HttpClient::send` using the
-/// project's allowlist + rate-limit + body-cap + timeout. The basin-net crate
-/// already implements all those guards; wiring here is deliberately deferred
-/// so this PR commits a solid foundation first.
+/// Marshals the WIT `request` record into `FnHttpRequest`, delegates to the
+/// injected `HttpSend` implementation (real: basin_net adapter; test: mock),
+/// and marshals the `FnHttpResponse` back to the WIT `response` record.
+///
+/// The allowlist + rate-limit + body-cap + timeout guardrails live in the
+/// `HttpSend` implementation — the host side has zero safety-critical logic.
 impl http::Host for FunctionHost {
     fn fetch(&mut self, req: http::Request) -> Result<http::Response, String> {
-        // TODO W1-followup: call basin_net::HttpClient::send(project, &req).
-        // The allowlist + rate-limit + body-cap + timeout are already
-        // implemented in basin-net; this stub is the only gap.
-        tracing::warn!(
+        use crate::engine::FnHttpRequest;
+
+        tracing::debug!(
             url = %req.url,
             method = %req.method,
-            "basin:fn/http fetch called — stubbed in W1; returning error"
+            "basin:fn/http fetch"
         );
-        Err(format!(
-            "basin:fn/http not yet wired \
-             (TODO W1-followup: call basin_net::HttpClient for url={})",
-            req.url
-        ))
+
+        let fn_req = FnHttpRequest {
+            url: req.url,
+            method: req.method,
+            headers: req.headers,
+            body: req.body,
+        };
+
+        let fn_resp = self.ctx.invocation.http.send(&fn_req)?;
+
+        Ok(http::Response {
+            status: fn_resp.status,
+            headers: fn_resp.headers,
+            body: fn_resp.body,
+        })
     }
 }
 
@@ -113,22 +124,20 @@ impl log::Host for FunctionHost {
     }
 }
 
-/// `basin:functions/secret` — stubbed (TODO W1-followup).
+/// `basin:functions/secret` — wired via `InvocationContext::secrets` (`SecretStore`).
 ///
-/// In a follow-up pass this calls
-/// `basin_storage::encryption::EncryptionProvider::unwrap_key` to decrypt the
-/// project secret. The trait is already defined and stable; wiring it here is
-/// deferred for the same reason as http.
+/// Delegates to the injected `SecretStore` implementation. In production the
+/// caller constructs an `InvocationContext` whose `secrets` field wraps a
+/// catalog-backed store that decrypts via `basin_auth::oauth::EncryptionProvider`
+/// (AES-256-GCM). Tests inject `MockSecretStore` with pre-seeded key-value
+/// pairs so the happy path can be exercised without a live catalog.
+///
+/// Only secrets scoped to the calling project are accessible — the
+/// `SecretStore` implementation is responsible for the project boundary
+/// (it receives a project-scoped handle from `InvocationContext`).
 impl secret::Host for FunctionHost {
     fn get(&mut self, name: String) -> Result<String, String> {
-        // TODO W1-followup: decrypt via EncryptionProvider.
-        // basin-storage::encryption::EncryptionProvider::unwrap_key is the
-        // entry point; the encrypted secret bytes are stored per-project in
-        // the catalog.
-        tracing::warn!(
-            name = %name,
-            "basin:fn/secret get called — stubbed in W1; returning error"
-        );
+        tracing::debug!(name = %name, "basin:fn/secret get");
         self.ctx.invocation.secrets.get_secret(&name)
     }
 }

@@ -22,7 +22,10 @@ use std::sync::{Arc, Mutex};
 
 use basin_fn::{
     ComponentHarness, FunctionCallContext, FunctionHost, QueryExecutor,
-    engine::{InvocationContext, MockQueryExecutor, QueryRow, StubSecretStore},
+    engine::{
+        InvocationContext, MockHttpClient, MockQueryExecutor, MockSecretStore,
+        QueryRow, StubSecretStore,
+    },
 };
 
 // Pull the generated bindings for direct trait impl tests.
@@ -66,6 +69,7 @@ fn host_query_exec_returns_rows() {
     let ctx = FunctionCallContext::new(InvocationContext {
         query: Arc::new(exec),
         secrets: Arc::new(StubSecretStore),
+        http: Arc::new(MockHttpClient::err("not configured")),
     });
     let mut host = FunctionHost::new(ctx);
 
@@ -97,6 +101,7 @@ fn host_query_exec_propagates_error() {
     let ctx = FunctionCallContext::new(InvocationContext {
         query: Arc::new(FailExecutor),
         secrets: Arc::new(StubSecretStore),
+        http: Arc::new(MockHttpClient::err("not configured")),
     });
     let mut host = FunctionHost::new(ctx);
     let err = <FunctionHost as query::Host>::exec(&mut host, "SELECT secret".to_string())
@@ -123,10 +128,16 @@ fn host_log_emit_all_levels_no_panic() {
     }
 }
 
-/// `basin:functions/http` — stubbed in W1: fetch returns an Err.
+/// `basin:functions/http` — deny path: mock client returns an error string.
+///
+/// Verifies that errors from `HttpSend::send` propagate through `fetch`.
 #[test]
-fn host_http_fetch_is_stubbed() {
-    let ctx = FunctionCallContext::new(InvocationContext::mock());
+fn host_http_fetch_propagates_error() {
+    let ctx = FunctionCallContext::new(InvocationContext {
+        query: Arc::new(MockQueryExecutor),
+        secrets: Arc::new(StubSecretStore),
+        http: Arc::new(MockHttpClient::err("host not on allowlist: example.com")),
+    });
     let mut host = FunctionHost::new(ctx);
 
     let req = http::Request {
@@ -136,25 +147,79 @@ fn host_http_fetch_is_stubbed() {
         body: None,
     };
     let err = <FunctionHost as http::Host>::fetch(&mut host, req).unwrap_err();
-    // Error message must mention TODO so callers know this is a stub.
     assert!(
-        err.contains("TODO") || err.contains("stubbed"),
-        "http stub error should mention TODO or stubbed, got: {err}"
+        err.contains("allowlist") || err.contains("example.com"),
+        "denied fetch should surface allowlist error, got: {err}"
     );
 }
 
-/// `basin:functions/secret` — stubbed in W1: get returns an Err.
+/// `basin:functions/http` — success path: mock client returns a 200 response.
+///
+/// Verifies that `FnHttpResponse` is correctly marshalled to the WIT type.
 #[test]
-fn host_secret_get_is_stubbed() {
-    let ctx = FunctionCallContext::new(InvocationContext::mock());
+fn host_http_fetch_returns_response() {
+    let ctx = FunctionCallContext::new(InvocationContext {
+        query: Arc::new(MockQueryExecutor),
+        secrets: Arc::new(StubSecretStore),
+        http: Arc::new(MockHttpClient::ok(b"hello from mock".to_vec())),
+    });
     let mut host = FunctionHost::new(ctx);
 
-    let err = <FunctionHost as secret::Host>::get(&mut host, "MY_API_KEY".to_string())
+    let req = http::Request {
+        url: "https://allowed.example.com/api".to_string(),
+        method: "GET".to_string(),
+        headers: vec![("accept".to_string(), "text/plain".to_string())],
+        body: None,
+    };
+    let resp = <FunctionHost as http::Host>::fetch(&mut host, req)
+        .expect("mock http client should return Ok");
+    assert_eq!(resp.status, 200, "status should be 200");
+    assert_eq!(resp.body, b"hello from mock".to_vec(), "body should round-trip");
+}
+
+/// `basin:functions/secret` — not-found path: unknown name returns an error.
+#[test]
+fn host_secret_get_unknown_name_returns_error() {
+    let ctx = FunctionCallContext::new(InvocationContext {
+        query: Arc::new(MockQueryExecutor),
+        secrets: Arc::new(MockSecretStore::empty()),
+        http: Arc::new(MockHttpClient::err("not configured")),
+    });
+    let mut host = FunctionHost::new(ctx);
+
+    let err = <FunctionHost as secret::Host>::get(&mut host, "MISSING_KEY".to_string())
         .unwrap_err();
     assert!(
-        !err.is_empty(),
-        "secret stub should return a non-empty error"
+        !err.is_empty() && err.contains("MISSING_KEY"),
+        "unknown secret should return a descriptive error, got: {err}"
     );
+}
+
+/// `basin:functions/secret` — happy path: known name returns the plaintext value.
+///
+/// The `MockSecretStore` simulates what the production catalog-backed store
+/// does after decryption via `EncryptionProvider`.
+#[test]
+fn host_secret_get_known_name_returns_value() {
+    let store = MockSecretStore::with_secrets([
+        ("MY_API_KEY", "sk-prod-abc123"),
+        ("DB_PASSWORD", "hunter2"),
+    ]);
+    let ctx = FunctionCallContext::new(InvocationContext {
+        query: Arc::new(MockQueryExecutor),
+        secrets: Arc::new(store),
+        http: Arc::new(MockHttpClient::err("not configured")),
+    });
+    let mut host = FunctionHost::new(ctx);
+
+    let val = <FunctionHost as secret::Host>::get(&mut host, "MY_API_KEY".to_string())
+        .expect("known secret should succeed");
+    assert_eq!(val, "sk-prod-abc123", "plaintext value should round-trip");
+
+    // Second lookup from the same host (different name).
+    let val2 = <FunctionHost as secret::Host>::get(&mut host, "DB_PASSWORD".to_string())
+        .expect("second known secret should succeed");
+    assert_eq!(val2, "hunter2");
 }
 
 // ---------------------------------------------------------------------------

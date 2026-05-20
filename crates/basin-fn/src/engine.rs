@@ -46,25 +46,110 @@ impl QueryExecutor for MockQueryExecutor {
 
 /// Secret store backing `basin:fn/secret`.
 ///
-/// A real implementation decrypts via `EncryptionProvider`; the mock below
-/// returns an error for unknown names.
+/// The real implementation decrypts via `basin_auth::oauth::EncryptionProvider`
+/// (AES-256-GCM in production, `PlaintextEncryption` in dev). The mock below
+/// returns values from an in-memory map — useful for unit tests that want to
+/// exercise the happy path without a real catalog connection.
 pub trait SecretStore: Send + Sync {
     /// Return the plaintext value for `name`, or an error string.
     fn get_secret(&self, name: &str) -> Result<String, String>;
 }
 
-/// Mock secret store — returns `Err` for all names (stub for W1 partial).
-///
-/// TODO (W1-followup): replace with real decryption via `EncryptionProvider`
-/// (see `basin-storage::encryption::EncryptionProvider`).
+/// Mock secret store — returns values from an in-memory map seeded at
+/// construction time. Unknown names return `Err`. Used by unit tests.
+pub struct MockSecretStore {
+    secrets: std::collections::HashMap<String, String>,
+}
+
+impl MockSecretStore {
+    /// Build an empty store (all lookups return `Err`).
+    pub fn empty() -> Self {
+        Self { secrets: std::collections::HashMap::new() }
+    }
+
+    /// Build a store pre-seeded with `(name, value)` pairs.
+    pub fn with_secrets(pairs: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>) -> Self {
+        Self {
+            secrets: pairs.into_iter().map(|(k, v)| (k.into(), v.into())).collect(),
+        }
+    }
+}
+
+impl SecretStore for MockSecretStore {
+    fn get_secret(&self, name: &str) -> Result<String, String> {
+        self.secrets
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("secret '{name}' not found"))
+    }
+}
+
+/// `StubSecretStore` retained for backwards-compat with callers that used it
+/// before this followup. Delegates to `MockSecretStore::empty()`.
 pub struct StubSecretStore;
 
 impl SecretStore for StubSecretStore {
     fn get_secret(&self, name: &str) -> Result<String, String> {
-        Err(format!(
-            "secret '{name}' not found \
-             (TODO W1-followup: wire EncryptionProvider)"
-        ))
+        MockSecretStore::empty().get_secret(name)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HttpSend — thin sync facade over the async basin_net::HttpClient
+// ---------------------------------------------------------------------------
+
+/// Request/response types for the `HttpSend` facade. Mirrors the WIT types so
+/// `host.rs` marshals directly without an extra conversion step.
+#[derive(Clone, Debug)]
+pub struct FnHttpRequest {
+    pub url: String,
+    pub method: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FnHttpResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// Synchronous HTTP send facade.
+///
+/// The WIT `fetch` function is not async; this trait lets `host.rs` call into
+/// an implementation that either blocks (real `basin_net::HttpClient`) or
+/// returns a canned response (mock for unit tests).
+pub trait HttpSend: Send + Sync {
+    fn send(&self, req: &FnHttpRequest) -> Result<FnHttpResponse, String>;
+}
+
+/// Mock HTTP client for unit tests. Returns a configurable canned response.
+pub struct MockHttpClient {
+    pub response: Result<FnHttpResponse, String>,
+}
+
+impl MockHttpClient {
+    /// Always succeeds with a 200 OK and the given body.
+    pub fn ok(body: impl Into<Vec<u8>>) -> Self {
+        Self {
+            response: Ok(FnHttpResponse {
+                status: 200,
+                headers: vec![],
+                body: body.into(),
+            }),
+        }
+    }
+
+    /// Always fails with the given error string.
+    pub fn err(msg: impl Into<String>) -> Self {
+        Self { response: Err(msg.into()) }
+    }
+}
+
+impl HttpSend for MockHttpClient {
+    fn send(&self, _req: &FnHttpRequest) -> Result<FnHttpResponse, String> {
+        self.response.clone()
     }
 }
 
@@ -73,16 +158,21 @@ impl SecretStore for StubSecretStore {
 pub struct InvocationContext {
     /// Executor for `basin:fn/query`. Shared across the call.
     pub query: Arc<dyn QueryExecutor>,
-    /// Secret store for `basin:fn/secret`.
+    /// Secret store for `basin:fn/secret`. Decrypts project secrets.
     pub secrets: Arc<dyn SecretStore>,
+    /// HTTP client for `basin:fn/http`. Enforces allowlist + rate-limit +
+    /// body-cap + timeout (real implementation is the `basin_net` adapter;
+    /// tests inject `MockHttpClient`).
+    pub http: Arc<dyn HttpSend>,
 }
 
 impl InvocationContext {
-    /// Build with the production mock (no real engine, no secrets).
+    /// Build with the production mock (no real engine, no secrets, deny-all http).
     pub fn mock() -> Self {
         Self {
             query: Arc::new(MockQueryExecutor),
             secrets: Arc::new(StubSecretStore),
+            http: Arc::new(MockHttpClient::err("http not configured in mock context")),
         }
     }
 
@@ -91,6 +181,7 @@ impl InvocationContext {
         Self {
             query: exec,
             secrets: Arc::new(StubSecretStore),
+            http: Arc::new(MockHttpClient::err("http not configured in mock context")),
         }
     }
 }

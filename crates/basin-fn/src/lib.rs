@@ -9,8 +9,8 @@
 //! |---|---|---|
 //! | `basin:fn/query` | **Fully wired** | executes SQL through the mock/real engine session |
 //! | `basin:fn/log` | **Fully wired** | emits via `tracing` at the requested level |
-//! | `basin:fn/http` | **Stubbed** | TODO W1-followup: call basin-net `HttpClient::send` |
-//! | `basin:fn/secret` | **Stubbed** | TODO W1-followup: decrypt via `EncryptionProvider` |
+//! | `basin:fn/http` | **Wired** | `HttpSend` facade → real `basin_net` adapter or `MockHttpClient` |
+//! | `basin:fn/secret` | **Wired** | `SecretStore` facade → `MockSecretStore` / catalog + `EncryptionProvider` |
 //!
 //! ## Component model approach
 //!
@@ -38,13 +38,22 @@ pub mod harness;
 pub mod host;
 #[cfg(feature = "component-model")]
 pub mod engine;
+#[cfg(feature = "component-model")]
+pub mod handler;
+#[cfg(feature = "component-model")]
+pub mod governance;
 
 #[cfg(feature = "component-model")]
 pub use harness::ComponentHarness;
 #[cfg(feature = "component-model")]
 pub use host::{FunctionCallContext, FunctionHost};
 #[cfg(feature = "component-model")]
-pub use engine::QueryExecutor;
+pub use engine::{
+    FnHttpRequest, FnHttpResponse, HttpSend, MockHttpClient,
+    MockSecretStore, QueryExecutor, SecretStore, StubSecretStore,
+};
+#[cfg(feature = "component-model")]
+pub use handler::{FunctionStore, HandlerHarness, HandlerRequest, HandlerResponse};
 
 /// Re-export of the generated WIT bindings for use in integration tests.
 /// Consumers use `basin_fn::harness_bindings::basin::functions::{query, …}`.
