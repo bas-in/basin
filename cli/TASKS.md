@@ -345,7 +345,7 @@ naming doesn't get bike-shed-revisited mid-Phase-X.
 
 - [x] ~~`cmd_realtime.go` — blocked on engine pub/sub~~ **UNBLOCKED 2026-05-20** — engine shipped realtime (basin 5.11.R1–R7). Promoted to **Tier 26**.
 - [ ] `cmd_functions.go` — `deploy/serve` for edge functions. Blocked on cloud Phase 8 (V8). NOTE: `rpc <fn>` *invoke* is unblocked (5.11.L) → **Tier 26**.
-- [ ] `cmd_storage_buckets.go` — `list/create/upload/download` for object storage as a product (distinct from BYO-bucket-for-Parquet). **Now on the roadmap (2026-05-20)**: engine object storage specced as basin ADR 0021 (catalog-backed `storage.objects` + RLS; engine tasks 5.17.A–E). Routes: `/storage/v1/object/*`, `/storage/v1/bucket/*`. Gated on engine 5.17 + cloud quota/billing surface.
+- [x] ~~`cmd_storage_buckets.go` — `list/create/upload/download` for object storage~~ **PORTED 2026-05-20** — `basin storage` command ships `buckets list/create/delete`, `upload`, `download`, `list`, `rm`, `sign` against engine 5.17 routes (`/storage/v1/object/*`, `/storage/v1/bucket/*`). 31 new tests.
 - [ ] `cmd_tx.go` — interactive `begin/commit/rollback`. Engine single-shard transactions **shipped** (BEGIN/COMMIT/ROLLBACK + SAVEPOINT); only the interactive REPL-session scaffolding remains.
 - [ ] `cmd_restore_pitr.go` — `restore --as-of=<timestamp>`. Blocked on engine PITR cross-DML physical-GC (catalog-level rollback shipped; GC is v0.2).
 

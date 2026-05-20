@@ -53,6 +53,7 @@ pub mod secrets;
 pub mod snapshots;
 pub mod sql;
 pub mod status;
+pub mod storage;
 pub mod tables;
 pub mod tokens;
 pub mod transfers;
@@ -161,6 +162,11 @@ pub fn all() -> Vec<Entry> {
             "rows",
             "Insert / update / delete rows in a project table.",
             rows::cmd_rows
+        ),
+        entry!(
+            "storage",
+            "Manage object storage buckets and objects (engine 5.17).",
+            storage::cmd_storage
         ),
         entry!(
             "rls",
