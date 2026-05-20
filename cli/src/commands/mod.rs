@@ -44,7 +44,9 @@ pub mod pgwire;
 pub mod projects;
 pub mod queries;
 pub mod rls;
+pub mod realtime;
 pub mod rows;
+pub mod rpc;
 pub mod saml;
 pub mod scim;
 pub mod secrets;
@@ -91,6 +93,7 @@ pub fn all() -> Vec<Entry> {
         entry!("status", "Show the linked project + migration drift summary.", status::cmd_status),
         entry!("unlink", "Remove the project binding from ./basin/config.toml.", unlink::cmd_unlink),
         entry!("sql", "Run a SQL query against a project.", sql::cmd_sql),
+        entry!("rpc", "Invoke a user-defined database function (T26.4).", rpc::cmd_rpc),
         entry!("db", "Push / pull / diff / reset / url / dump / lint the project database.", db::cmd_db),
         entry!("tables", "List / describe / create / alter / drop tables + CSV import/export.", tables::cmd_tables),
         entry!("rows", "Insert / update / delete rows in a project table.", rows::cmd_rows),
@@ -101,6 +104,7 @@ pub fn all() -> Vec<Entry> {
         entry!("snapshots", "List / create / restore project snapshots.", snapshots::cmd_snapshots),
         entry!("backups", "Manage backup policy / snapshots / restore jobs.", backups::cmd_backups),
         entry!("logs", "Stream live project logs (or poll history).", logs::cmd_logs),
+        entry!("realtime", "Subscribe to table event streams over SSE (T26.1).", realtime::cmd_realtime),
         entry!("api-keys", "List / create / rotate / revoke project-scoped API keys.", api_keys::cmd_api_keys),
         entry!("pgwire", "Show / reveal / rotate pgwire credentials and engine JWT keys.", pgwire::cmd_pgwire),
         entry!("domains", "Add / verify / cert / list / remove custom project domains.", domains::cmd_domains),

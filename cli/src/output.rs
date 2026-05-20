@@ -14,7 +14,7 @@ const ANSI_RESET: &str = "\x1b[0m";
 
 /// print_json writes `v` as pretty-printed (2-space) JSON to `w`,
 /// matching Go's `printJSON` (no HTML escaping, trailing newline).
-pub fn print_json<W: Write, T: Serialize>(w: &mut W, v: &T) -> CliResult<()> {
+pub fn print_json<W: Write + ?Sized, T: Serialize>(w: &mut W, v: &T) -> CliResult<()> {
     let s = serde_json::to_string_pretty(v)?;
     w.write_all(s.as_bytes())?;
     w.write_all(b"\n")?;

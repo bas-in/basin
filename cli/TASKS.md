@@ -393,7 +393,7 @@ OR gate the WS subcommand behind a single vetted `golang.org/x/net/websocket`
 import if the decisions.md no-deps rule permits it — **decide and record in
 `decisions.md` first.** Each task is sized for one Sonnet agent.
 
-- [ ] **T26.1 — `cmd_realtime.go` SSE single-table subscribe.** New file
+- [x] **T26.1 — `cmd_realtime.go` SSE single-table subscribe.** New file
   `cmd_realtime.go` + `cmd_realtime_test.go`. `basin realtime subscribe
   <table> [--project=<ref>] [--since=<seq>]`. Opens
   `GET /realtime/v1/sse/:project/:table` with `Authorization: Bearer
@@ -403,14 +403,14 @@ import if the decisions.md no-deps rule permits it — **decide and record in
   Ctrl-C (SIGINT) closes the response body and exits 0. **Acceptance:**
   `httptest.Server` streaming 3 `data:` frames + 1 heartbeat → 3 JSON lines
   on stdout, exit 0 on context-cancel; arg-parse error path tested.
-- [ ] **T26.2 — RFC-6455 minimal WS client (or vetted dep decision).**
+- [ ] **T26.2 — RFC-6455 minimal WS client (or vetted dep decision). WS deferred — needs tungstenite dep.**
   New `internal/ws/ws.go` + test. A tiny client: HTTP Upgrade handshake
   (`Sec-WebSocket-Key`/`Accept` via `crypto/sha1`+base64), text-frame
   read/write, masking, ping/pong, close. OR — if `decisions.md` approves —
   thin wrapper over `x/net/websocket`. **Acceptance:** round-trips text
   frames against a `httptest.Server` that upgrades and echoes; ping →
   pong; close handshake clean. This unblocks T26.3.
-- [ ] **T26.3 — `realtime subscribe --multi` over WebSocket.** Depends on
+- [ ] **T26.3 — `realtime subscribe --multi` over WebSocket. WS deferred — needs tungstenite dep.** Depends on
   T26.2. `basin realtime subscribe --multi <t1>,<t2>,… [--filter=<expr>]`.
   Opens `GET /realtime/v1/ws/:project`, sends
   `{"type":"subscribe","table":"<t>"[,"filter":"<expr>"]}` per table, waits
@@ -419,7 +419,7 @@ import if the decisions.md no-deps rule permits it — **decide and record in
   printing a stderr warning. **Acceptance:** stub WS server acks two
   subscribes, emits interleaved events → two-table tagged output; lag frame
   → stderr warning, stdout uninterrupted.
-- [ ] **T26.4 — `cmd_rpc.go` invoke user functions.** New `cmd_rpc.go` +
+- [x] **T26.4 — `cmd_rpc.go` invoke user functions.** New `cmd_rpc.go` +
   test. `basin rpc <fn> [--arg k=v …] [--body @file.json]`. POSTs to
   `POST /rest/v1/rpc/:fn` with a JSON object assembled from `--arg`
   key=value pairs (typed: ints/bools/strings inferred) or the raw
@@ -427,7 +427,7 @@ import if the decisions.md no-deps rule permits it — **decide and record in
   `RETURNS TABLE`. Honours `--json`. **Acceptance:** stub returns `7` for
   `add x=3 y=4` → prints `7`; stub returns a row array → pretty JSON array;
   401 → typed `APIError`; missing fn-name arg → parse error.
-- [ ] **T26.5 — `commands()` dispatch + README + man wiring.** Register
+- [x] **T26.5 — `commands()` dispatch + README + man wiring.** Register
   `realtime` and `rpc` in the `commands()` table, add them to the
   `integration_test.go` drive-through, add two README example one-liners,
   and a `CHANGELOG.md` Unreleased entry. **Acceptance:** `basin realtime
