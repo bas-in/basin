@@ -1629,10 +1629,6 @@ truth, this list is the human-readable summary.
   combination of recursive + DML in one CTE chain still partial.
 - [ ] Advanced window frames (`RANGE INTERVAL` / `GROUPS` / `EXCLUDE`).
 - [ ] `EXCLUDE USING gist` — not on roadmap (geo-index dependency).
-- [ ] `SELECT *` Arrow-projection failure on the rare `BIGSERIAL PK + TEXT +
-      TEXT UNIQUE + TIMESTAMPTZ DEFAULT now()` shape — root-caused to a
-      type-OID encoding mismatch on the wire (Arrow → pgwire row description);
-      workaround is explicit-column SELECT.
 
 **Live coverage:** see [`docs/sql-support.md`](./docs/sql-support.md) for the
 full per-fragment matrix (latest test expansion to 697 fragments via commit

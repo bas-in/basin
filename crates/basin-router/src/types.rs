@@ -134,11 +134,36 @@ fn arrow_to_pg_type_field(f: &Field) -> Type {
 /// Map an Arrow type to the closest Postgres type for the PoC. Anything we
 /// don't have a mapping for becomes TEXT — the value renderer will format it
 /// via `Debug`.
+///
+/// # Fixed types and their Postgres OIDs
+///
+/// | Arrow type                        | Postgres OID | Name         |
+/// |-----------------------------------|--------------|--------------|
+/// | `Int8` / `UInt8`                  | 21 (INT2)    | smallint     |
+/// | `Int16` / `UInt16`                | 21 (INT2)    | smallint     |
+/// | `Int32`                           | 23 (INT4)    | integer      |
+/// | `Int64` / `UInt32` / `UInt64`     | 20 (INT8)    | bigint       |
+/// | `Timestamp(_, Some(_))`           | 1184         | timestamptz  |
+/// | `Timestamp(_, None)`              | 1114         | timestamp    |
+///
+/// Note: `Int8` (Arrow 8-bit signed integer, aka "tinyint") and `UInt8`
+/// (Arrow 8-bit unsigned integer) have no direct Postgres equivalent — the
+/// smallest PG integer type is `SMALLINT` (2 bytes). Both are promoted to
+/// `INT2` (OID 21) here. The type-OID mismatch this previously caused —
+/// `Int8`/`UInt8` columns falling through to `TEXT` (OID 25) — produced
+/// `SELECT *` failures on tables whose Arrow schema contained these types,
+/// because drivers that do typed column access saw OID 25 instead of 21 and
+/// rejected the binary wire data.
 pub(crate) fn arrow_to_pg_type(dt: &DataType) -> Type {
     match dt {
         DataType::Int64 | DataType::UInt32 | DataType::UInt64 => Type::INT8,
         DataType::Int32 => Type::INT4,
-        DataType::Int16 => Type::INT2,
+        // Arrow Int8 / UInt8 (8-bit integers) have no direct PG equivalent.
+        // Promote to INT2 (OID 21, smallint) — the smallest PG integer type —
+        // rather than falling through to TEXT. This closes the type-OID
+        // mismatch that caused SELECT * failures on rows that DataFusion or
+        // conversion code internally typed as 8-bit.
+        DataType::Int16 | DataType::Int8 | DataType::UInt8 | DataType::UInt16 => Type::INT2,
         DataType::Boolean => Type::BOOL,
         DataType::Float64 => Type::FLOAT8,
         DataType::Float32 => Type::FLOAT4,
@@ -365,6 +390,23 @@ fn encode_value_binary(
             let v = col.as_boolean().value(idx);
             buf.put_i32(1);
             buf.put_u8(if v { 1 } else { 0 });
+        }
+        // Arrow Int8 / UInt8 / UInt16 have no direct PG type; promote to INT2
+        // (2-byte big-endian i16) — consistent with how arrow_to_pg_type maps them.
+        DataType::Int8 => {
+            let v = col.as_primitive::<Int8Type>().value(idx) as i16;
+            buf.put_i32(2);
+            buf.put_i16(v);
+        }
+        DataType::UInt8 => {
+            let v = col.as_primitive::<UInt8Type>().value(idx) as i16;
+            buf.put_i32(2);
+            buf.put_i16(v);
+        }
+        DataType::UInt16 => {
+            let v = col.as_primitive::<UInt16Type>().value(idx) as i16;
+            buf.put_i32(2);
+            buf.put_i16(v);
         }
         DataType::Int16 => {
             let v = col.as_primitive::<Int16Type>().value(idx);
@@ -682,7 +724,9 @@ fn encode_numeric_binary(raw: i128, scale: u16, buf: &mut BytesMut) {
 fn oid_for_arrow_type(dt: &DataType) -> u32 {
     match dt {
         DataType::Boolean => Type::BOOL.oid(),
-        DataType::Int16 => Type::INT2.oid(),
+        // Arrow Int8 / UInt8 / UInt16 have no direct PG element type; promote
+        // to INT2 (OID 21), consistent with arrow_to_pg_type.
+        DataType::Int8 | DataType::UInt8 | DataType::UInt16 | DataType::Int16 => Type::INT2.oid(),
         DataType::Int32 => Type::INT4.oid(),
         DataType::Int64 | DataType::UInt32 | DataType::UInt64 => Type::INT8.oid(),
         DataType::Float32 => Type::FLOAT4.oid(),
@@ -1520,6 +1564,134 @@ mod tests {
         assert_eq!(rd.fields[0].type_id, Type::INT8.oid());
         assert_eq!(rd.fields[1].name, "b");
         assert_eq!(rd.fields[1].type_id, Type::TEXT.oid());
+    }
+
+    // -----------------------------------------------------------------------
+    // Int8 / UInt8 / UInt16 → INT2 OID promotion tests
+    // Fixes the SELECT * failure on BIGSERIAL PK + TEXT + TEXT UNIQUE +
+    // TIMESTAMPTZ DEFAULT now() tables.
+    // -----------------------------------------------------------------------
+
+    /// Arrow `Int8`, `UInt8`, and `UInt16` have no direct Postgres equivalent.
+    /// The smallest PG integer type is SMALLINT (OID 21, 2 bytes). Verify
+    /// these three types all map to INT2 in `arrow_to_pg_type`.
+    #[test]
+    fn maps_int8_uint8_uint16_to_int2() {
+        assert_eq!(arrow_to_pg_type(&DataType::Int8), Type::INT2);
+        assert_eq!(arrow_to_pg_type(&DataType::UInt8), Type::INT2);
+        assert_eq!(arrow_to_pg_type(&DataType::UInt16), Type::INT2);
+        assert_eq!(Type::INT2.oid(), 21);
+        // Sanity: Int16 still maps to INT2 as before.
+        assert_eq!(arrow_to_pg_type(&DataType::Int16), Type::INT2);
+    }
+
+    /// `row_description` must advertise OID 21 (INT2) for Int8/UInt8/UInt16
+    /// columns, not OID 25 (TEXT). type_size must be 2 (INT2 typlen).
+    #[test]
+    fn row_description_int8_uint8_uint16_oids() {
+        let schema = ArrowSchema::new(vec![
+            Field::new("i8col", DataType::Int8, true),
+            Field::new("u8col", DataType::UInt8, true),
+            Field::new("u16col", DataType::UInt16, true),
+        ]);
+        let rd = row_description(&schema);
+        assert_eq!(rd.fields.len(), 3);
+        for fd in &rd.fields {
+            assert_eq!(
+                fd.type_id, 21,
+                "expected INT2 OID 21 for {}, got {}",
+                fd.name, fd.type_id
+            );
+            assert_eq!(
+                fd.type_size, 2,
+                "expected INT2 type_size 2 for {}, got {}",
+                fd.name, fd.type_size
+            );
+        }
+    }
+
+    /// Binary encoding of Int8 and UInt8 columns: each value should be emitted
+    /// as a 2-byte big-endian i16 (length prefix 2, then the 2-byte value),
+    /// consistent with the INT2 type OID advertised in RowDescription.
+    #[test]
+    fn encodes_int8_uint8_binary_as_int2() {
+        use arrow_array::{Int8Array, UInt8Array};
+        // Int8: value 42
+        let schema_i8 = Arc::new(ArrowSchema::new(vec![Field::new(
+            "v",
+            DataType::Int8,
+            false,
+        )]));
+        let arr_i8 = Arc::new(Int8Array::from(vec![42i8]));
+        let batch_i8 = RecordBatch::try_new(schema_i8.clone(), vec![arr_i8]).unwrap();
+        let rows = encode_batches_with_formats(&schema_i8, &[batch_i8], &[1]).unwrap();
+        let len_i8 = i32::from_be_bytes(rows[0].data[0..4].try_into().unwrap());
+        assert_eq!(len_i8, 2, "Int8 binary body length must be 2 (INT2)");
+        let val_i8 = i16::from_be_bytes(rows[0].data[4..6].try_into().unwrap());
+        assert_eq!(val_i8, 42i16);
+
+        // UInt8: value 200
+        let schema_u8 = Arc::new(ArrowSchema::new(vec![Field::new(
+            "v",
+            DataType::UInt8,
+            false,
+        )]));
+        let arr_u8 = Arc::new(UInt8Array::from(vec![200u8]));
+        let batch_u8 = RecordBatch::try_new(schema_u8.clone(), vec![arr_u8]).unwrap();
+        let rows = encode_batches_with_formats(&schema_u8, &[batch_u8], &[1]).unwrap();
+        let len_u8 = i32::from_be_bytes(rows[0].data[0..4].try_into().unwrap());
+        assert_eq!(len_u8, 2, "UInt8 binary body length must be 2 (INT2)");
+        let val_u8 = i16::from_be_bytes(rows[0].data[4..6].try_into().unwrap());
+        assert_eq!(val_u8, 200i16);
+    }
+
+    /// End-to-end row_description for the exact table shape that triggered the
+    /// SELECT * failure:
+    ///   id BIGSERIAL PK   → Arrow Int64  → OID 20 (INT8)
+    ///   name TEXT         → Arrow Utf8   → OID 25 (TEXT)
+    ///   email TEXT UNIQUE → Arrow Utf8   → OID 25 (TEXT)
+    ///   created_at TIMESTAMPTZ DEFAULT now() → Timestamp(µs, Some("UTC")) → OID 1184
+    #[test]
+    fn row_description_bigserial_text_text_timestamptz_shape() {
+        use arrow_schema::TimeUnit as TU;
+        let schema = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("email", DataType::Utf8, false),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(TU::Microsecond, Some("UTC".into())),
+                false,
+            ),
+        ]);
+        let rd = row_description(&schema);
+        assert_eq!(rd.fields.len(), 4);
+
+        // id: INT8 (OID 20, 8 bytes)
+        assert_eq!(rd.fields[0].name, "id");
+        assert_eq!(
+            rd.fields[0].type_id,
+            Type::INT8.oid(),
+            "BIGSERIAL PK must be OID {} (INT8), got {}",
+            Type::INT8.oid(),
+            rd.fields[0].type_id
+        );
+        assert_eq!(rd.fields[0].type_size, 8);
+
+        // name, email: TEXT (OID 25, varlena -1)
+        assert_eq!(rd.fields[1].type_id, Type::TEXT.oid());
+        assert_eq!(rd.fields[1].type_size, -1);
+        assert_eq!(rd.fields[2].type_id, Type::TEXT.oid());
+
+        // created_at: TIMESTAMPTZ (OID 1184, 8 bytes)
+        assert_eq!(rd.fields[3].name, "created_at");
+        assert_eq!(
+            rd.fields[3].type_id,
+            1184,
+            "TIMESTAMPTZ must be OID 1184, got {}",
+            rd.fields[3].type_id
+        );
+        assert_eq!(rd.fields[3].type_size, 8);
     }
 
     // -----------------------------------------------------------------------
