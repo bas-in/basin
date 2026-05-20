@@ -56,6 +56,21 @@ basin gen types typescript --output=src/database.ts  # emit TypeScript types
 basin tables import-csv users < users.csv            # stream CSV into a table
 basin alerts rules create --project=staging          # create an alert rule
 basin byo bucket put --project=staging               # configure BYO S3 bucket
+
+# Stream live INSERT/UPDATE/DELETE events (SSE, single table)
+basin realtime subscribe orders --project=staging
+
+# Resume from a known sequence number
+basin realtime subscribe orders --project=staging --since=1234
+
+# Multi-table WebSocket stream with an optional filter
+basin realtime subscribe --multi orders,items --filter="id=gt.0" --project=staging
+
+# Invoke a SQL/WASM function via PostgREST RPC
+basin rpc add --arg x=3 --arg y=4 --project=staging
+
+# Pass a raw JSON body from a file instead of --arg pairs
+basin rpc charge --body @payload.json --project=staging
 ```
 
 Every command honours:
