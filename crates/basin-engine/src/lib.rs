@@ -163,6 +163,14 @@ pub(crate) struct EngineInner {
     /// process lifetime so WAL markers are unambiguous across concurrent
     /// sessions.
     pub(crate) next_tx_id: AtomicU64,
+    /// Per-shape HDR histogram registry (Phase 5.16.B).
+    ///
+    /// Accumulates per-shape latency / rows-scanned / files-opened /
+    /// bytes-decoded / cache-hits / fast-path-engaged statistics keyed by
+    /// `(ProjectId, TableName, QueryShapeHash)`.  Shared across all sessions
+    /// on this engine; per-project isolation is structural (separate LRU caches
+    /// behind a `DashMap<ProjectId, …>`).  Idle tenants cost O(bytes).
+    pub(crate) query_stats: Arc<crate::query_stats::QueryStatRegistry>,
 }
 
 impl Engine {
@@ -230,6 +238,7 @@ impl Engine {
             query_history: Arc::new(crate::query_history::QueryHistory::new()),
             memtable_registry,
             next_tx_id: AtomicU64::new(1),
+            query_stats: Arc::new(crate::query_stats::QueryStatRegistry::new()),
         });
         // Phase 5.14.D2: register the query-history adapter with the shard so
         // the compactor can consult observed ORDER BY / GROUP BY patterns.
@@ -370,6 +379,15 @@ impl Engine {
     /// reference the registry via the engine handle.
     pub fn memtable_registry(&self) -> Arc<basin_hottier::MemTableRegistry> {
         self.inner.memtable_registry.clone()
+    }
+
+    /// Per-shape HDR histogram registry (Phase 5.16.B).
+    ///
+    /// Returns a reference to the shared registry.  Callers can inspect
+    /// per-`(project, table, shape)` statistics via
+    /// [`crate::query_stats::QueryStatRegistry::with_project_shapes`].
+    pub fn query_stats(&self) -> &crate::query_stats::QueryStatRegistry {
+        &self.inner.query_stats
     }
 
     /// Allocate a fresh, process-unique WAL transaction id (Phase 5.14.C2).
@@ -702,6 +720,7 @@ mod pg_scalar_aliases;
 mod prepared;
 mod query_history;
 pub(crate) mod query_shape;
+pub mod query_stats;
 mod procedure_ddl;
 mod range_udf;
 pub mod reactor_ddl;

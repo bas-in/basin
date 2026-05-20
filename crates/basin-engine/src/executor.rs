@@ -4308,9 +4308,39 @@ async fn exec_select(
         .await
         .map_err(|e| BasinError::internal(format!("plan: {e}")))?;
 
-    // Phase 5.16.A: compute query-shape hash (discarded here; 5.16.B routes it
-    // into the histogram registry).
-    let _shape = crate::query_shape::QueryShapeHash::of(df.logical_plan());
+    // Phase 5.16.B: compute query-shape hash and record it in the per-shape
+    // HDR histogram registry.  The hash was computed-and-discarded in 5.16.A;
+    // here we route it into `QueryStatRegistry::observe`.
+    //
+    // We time only the DataFusion collect() call below so that planning /
+    // view-rewrite overhead does not inflate the latency bucket.  The timer
+    // starts here so it covers the RLS / soft-delete rewrite below as well —
+    // those rewrites are part of the logical query shape's execution cost.
+    let shape_hash = crate::query_shape::QueryShapeHash::of(df.logical_plan());
+    // Extract the primary table name from the plan (the first TableScan we
+    // find).  Multi-table queries (JOINs) record under the sentinel name
+    // "_multi_table_" — the shape hash already encodes the full join topology.
+    let primary_table: TableName = {
+        fn first_scan(plan: &datafusion::logical_expr::LogicalPlan) -> Option<&str> {
+            use datafusion::logical_expr::LogicalPlan;
+            if let LogicalPlan::TableScan(ts) = plan {
+                return Some(ts.table_name.table());
+            }
+            for child in plan.inputs() {
+                if let Some(t) = first_scan(child) {
+                    return Some(t);
+                }
+            }
+            None
+        }
+        let raw = first_scan(df.logical_plan()).unwrap_or("_multi_table_");
+        // Sanitise: TableName::new validates idents; fall back to sentinel on
+        // failure (e.g. DataFusion internal scans, subquery aliases, etc.).
+        TableName::new(raw).unwrap_or_else(|_| {
+            TableName::new("_multi_table_").expect("sentinel is valid")
+        })
+    };
+    let exec_start = std::time::Instant::now();
 
     // Phase 5.6: row-level security. The per-project policy lookup is gated
     // on the catalog's `rls_enabled` per table; tables with RLS off cost
@@ -4366,6 +4396,30 @@ async fn exec_select(
             .await
             .map_err(|e| BasinError::internal(format!("execute: {e}")))?
     };
+    let exec_elapsed_ns = exec_start.elapsed().as_nanos() as u64;
+
+    // Phase 5.16.B: route shape + metrics into the HDR histogram registry.
+    // Row count is the sum of all batch row counts from the DataFusion output.
+    let total_rows: u64 = df_batches.iter().map(|b| b.num_rows() as u64).sum();
+    sess.engine.query_stats().observe(
+        &sess.project,
+        &primary_table,
+        shape_hash,
+        &crate::query_stats::QueryMetrics {
+            latency_ns: exec_elapsed_ns,
+            rows_scanned: total_rows,
+            // files_opened / bytes_decoded / cache_hits: DataFusion does not
+            // expose these counters through the public DataFrame API in the
+            // current version.  Set to 0 for now; 5.16.C / 5.16.D will
+            // instrument the physical plan metrics once the OTLP export is
+            // wired in.
+            files_opened: 0,
+            bytes_decoded: 0,
+            cache_hits: 0,
+            fast_path_engaged: false,
+        },
+    );
+
     let mut batches: Vec<RecordBatch> = Vec::with_capacity(df_batches.len());
     for b in df_batches.iter() {
         batches.push(batch_df_to_ws(b)?);

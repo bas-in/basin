@@ -71,6 +71,15 @@ bitflags = "2"
 # dispatch intercepts admin/RBAC/FDW/transaction statements and returns an
 # empty result without touching the sqlparser pipeline.
 pg_query.workspace = true
+# Phase 5.16.B: per-shape HDR histograms.
+# hdrhistogram — low-overhead latency/count histograms with bounded memory.
+hdrhistogram = "7"
+# dashmap — concurrent sharded HashMap; one shard per project, zero contention
+# across project boundaries.  Version 6 matches basin-hottier.
+dashmap = "6"
+# lru — bounded LRU cache; one per project, capped at 500 distinct shapes so
+# idle tenants cost O(bytes) not O(shapes).
+lru.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -89,3 +98,9 @@ serde_json.workspace = true
 # against a real PostgreSQL when `PG_DIFF_TEST_DSN` is set; without the env
 # var the cases skip cleanly so this stays test-only.
 tokio-postgres.workspace = true
+# Benchmarks (query_stats_overhead.rs, Phase 5.16.B).
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "query_stats_overhead"
+harness = false
