@@ -1,18 +1,31 @@
 //! Per-project cron-state store, backed by ordinary Basin tables.
 //!
+//! # Phase 5.18.C — `cron` reserved schema migration
+//!
+//! The canonical namespace for cron tables is now `cron` (`ReservedSchema::Cron`
+//! per ADR 0022). Table names match the pg_cron SQL surface:
+//!
+//! | Canonical (`cron.<table>`)  | Legacy flat name       |
+//! |-----------------------------|------------------------|
+//! | `cron.job`                  | `cron_job`             |
+//! | `cron.job_run_details`      | `cron_job_run_details` |
+//!
+//! **Back-compat**: [`ensure_tables`] checks for both names. When only the
+//! legacy name exists the store reads from/writes to the legacy table so
+//! existing deployments are not broken. When neither exists the canonical
+//! name is created. New deployments always use the canonical names.
+//!
 //! [`CronStore`] keeps two tables per project:
 //!
-//! - `cron_job` — current schedule. (We use underscore rather than the
-//!   `cron.job` schema-qualified pg_cron name because Basin's table names
-//!   are flat identifiers in v0.1; a future `cron` schema is a TODO.)
-//! - `cron_job_run_details` — append-only audit log.
+//! - `job` (canonical; was `cron_job`) — current schedule.
+//! - `job_run_details` (canonical; was `cron_job_run_details`) — audit log.
 //!
 //! Both are created lazily the first time the store is used for a project.
 //! All reads and writes go through `Engine::open_session`, so:
 //!
 //! 1. Project isolation is the same as for user SQL.
-//! 2. RLS policies on `cron_job` itself are honoured (you can shape who
-//!    can schedule under a single project).
+//! 2. RLS policies on `job` / `cron_job` itself are honoured (you can shape
+//!    who can schedule under a single project).
 //! 3. Persistence is handled by the catalog and storage layers; no separate
 //!    durability story.
 
@@ -27,10 +40,24 @@ use tokio::sync::Mutex;
 
 use crate::types::{CronJob, CronRunDetail, JobStatus};
 
-/// Names of the two tables we keep per project. Underscored because Basin's
-/// `Ident` validator rejects `.` characters in v0.1.
-pub(crate) const JOB_TABLE: &str = "cron_job";
-pub(crate) const RUN_DETAILS_TABLE: &str = "cron_job_run_details";
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 5.18.C — canonical reserved-schema constants + back-compat aliases
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The reserved schema name for cron system tables (ADR 0022 / 5.18.C).
+pub const RESERVED_SCHEMA: &str = "cron";
+
+/// Canonical bare table names within the `cron` schema (post-5.18.C).
+/// These match the pg_cron SQL surface: `cron.job` / `cron.job_run_details`.
+pub(crate) const JOB_TABLE: &str = "job";
+pub(crate) const RUN_DETAILS_TABLE: &str = "job_run_details";
+
+/// Legacy flat table names used before Phase 5.18.C. Physical tables created
+/// before this migration have these names. [`CronStore::ensure_tables`]
+/// recognises both names; new tables are always created under the canonical
+/// names above.
+pub(crate) const LEGACY_JOB_TABLE: &str = "cron_job";
+pub(crate) const LEGACY_RUN_DETAILS_TABLE: &str = "cron_job_run_details";
 
 /// Errors specific to scheduling.
 #[derive(Debug, Error)]
@@ -89,12 +116,25 @@ impl CronStore {
     /// Idempotently create the two cron tables under `project`. Safe to call
     /// before every operation; the underlying `CREATE TABLE` is a no-op
     /// once the table exists.
+    ///
+    /// # Phase 5.18.C back-compat
+    ///
+    /// Checks for both the canonical names (`job`, `job_run_details`) and the
+    /// legacy names (`cron_job`, `cron_job_run_details`). If neither form of a
+    /// table exists, the canonical name is created. If only the legacy name
+    /// exists it is left in place (data is preserved) and
+    /// [`effective_job_table`] / [`effective_run_details_table`] return the
+    /// legacy name so existing rows are still readable.
     pub async fn ensure_tables(&self, project: &ProjectId) -> Result<()> {
         let sess = self.inner.engine.open_session(*project).await?;
         // CREATE TABLE is currently not idempotent in basin-engine; we look
         // for the table first via SHOW TABLES so re-running is safe.
         let existing = list_table_names(&sess).await?;
-        if !existing.contains(&JOB_TABLE.to_string()) {
+
+        // --- job table ---
+        let has_canonical_job = existing.contains(&JOB_TABLE.to_string());
+        let has_legacy_job = existing.contains(&LEGACY_JOB_TABLE.to_string());
+        if !has_canonical_job && !has_legacy_job {
             sess.execute(&format!(
                 "CREATE TABLE {JOB_TABLE} (
                     jobid BIGINT NOT NULL,
@@ -109,7 +149,11 @@ impl CronStore {
             ))
             .await?;
         }
-        if !existing.contains(&RUN_DETAILS_TABLE.to_string()) {
+
+        // --- job_run_details table ---
+        let has_canonical_run = existing.contains(&RUN_DETAILS_TABLE.to_string());
+        let has_legacy_run = existing.contains(&LEGACY_RUN_DETAILS_TABLE.to_string());
+        if !has_canonical_run && !has_legacy_run {
             sess.execute(&format!(
                 "CREATE TABLE {RUN_DETAILS_TABLE} (
                     id BIGINT NOT NULL,
@@ -127,6 +171,30 @@ impl CronStore {
             .await?;
         }
         Ok(())
+    }
+
+    /// Return the effective job table name: canonical `job` if it exists,
+    /// falling back to legacy `cron_job` for pre-5.18.C deployments.
+    async fn effective_job_table(&self, project: &ProjectId) -> Result<&'static str> {
+        let sess = self.inner.engine.open_session(*project).await?;
+        let existing = list_table_names(&sess).await?;
+        if existing.contains(&JOB_TABLE.to_string()) {
+            Ok(JOB_TABLE)
+        } else {
+            Ok(LEGACY_JOB_TABLE)
+        }
+    }
+
+    /// Return the effective run-details table name: canonical `job_run_details`
+    /// if it exists, falling back to legacy `cron_job_run_details`.
+    async fn effective_run_details_table(&self, project: &ProjectId) -> Result<&'static str> {
+        let sess = self.inner.engine.open_session(*project).await?;
+        let existing = list_table_names(&sess).await?;
+        if existing.contains(&RUN_DETAILS_TABLE.to_string()) {
+            Ok(RUN_DETAILS_TABLE)
+        } else {
+            Ok(LEGACY_RUN_DETAILS_TABLE)
+        }
     }
 
     /// Schedule a new job under `project`. Mirrors pg_cron's `cron.schedule`
@@ -160,10 +228,11 @@ impl CronStore {
         }
 
         let jobid = jobs.iter().map(|j| j.jobid).max().unwrap_or(0) + 1;
+        let job_tbl = self.effective_job_table(project).await?;
 
         let sess = self.inner.engine.open_session(*project).await?;
         sess.execute(&format!(
-            "INSERT INTO {JOB_TABLE} VALUES \
+            "INSERT INTO {job_tbl} VALUES \
              ({jobid}, {jobname}, {schedule}, {command}, 1, {user}, NULL, NULL)",
             jobname = sql_text(jobname),
             schedule = sql_text(schedule),
@@ -190,8 +259,9 @@ impl CronStore {
             .find(|j| j.jobname == jobname)
             .ok_or_else(|| ScheduleError::NotFound(jobname.to_string()))?;
         let jobid = job.jobid;
+        let job_tbl = self.effective_job_table(project).await?;
         let sess = self.inner.engine.open_session(*project).await?;
-        sess.execute(&format!("DELETE FROM {JOB_TABLE} WHERE jobid = {jobid}"))
+        sess.execute(&format!("DELETE FROM {job_tbl} WHERE jobid = {jobid}"))
             .await?;
         Ok(jobid)
     }
@@ -201,11 +271,12 @@ impl CronStore {
     /// the filter is structural.
     pub async fn list_jobs(&self, project: &ProjectId) -> Result<Vec<CronJob>> {
         self.ensure_tables(project).await?;
+        let job_tbl = self.effective_job_table(project).await?;
         let sess = self.inner.engine.open_session(*project).await?;
         let res = sess
             .execute(&format!(
                 "SELECT jobid, jobname, schedule, command, active, last_run_unix_ms, last_status \
-                 FROM {JOB_TABLE} ORDER BY jobid"
+                 FROM {job_tbl} ORDER BY jobid"
             ))
             .await?;
         let batches = match res {
@@ -245,10 +316,11 @@ impl CronStore {
     /// it.
     pub async fn job_username(&self, project: &ProjectId, jobid: i64) -> Result<Option<String>> {
         self.ensure_tables(project).await?;
+        let job_tbl = self.effective_job_table(project).await?;
         let sess = self.inner.engine.open_session(*project).await?;
         let res = sess
             .execute(&format!(
-                "SELECT username FROM {JOB_TABLE} WHERE jobid = {jobid}"
+                "SELECT username FROM {job_tbl} WHERE jobid = {jobid}"
             ))
             .await?;
         let batches = match res {
@@ -264,12 +336,14 @@ impl CronStore {
         Ok(None)
     }
 
-    /// Append one row to `cron_job_run_details`.
+    /// Append one row to `job_run_details` (or `cron_job_run_details` on
+    /// legacy deployments).
     pub async fn record_run(&self, project: &ProjectId, detail: &CronRunDetail) -> Result<()> {
         self.ensure_tables(project).await?;
+        let run_tbl = self.effective_run_details_table(project).await?;
         let sess = self.inner.engine.open_session(*project).await?;
         sess.execute(&format!(
-            "INSERT INTO {RUN_DETAILS_TABLE} VALUES \
+            "INSERT INTO {run_tbl} VALUES \
              ({id}, {jobid}, {runid}, {database}, {username}, {command}, \
               {status}, {return_message}, {start}, {end})",
             id = detail.id,
@@ -291,12 +365,13 @@ impl CronStore {
     /// `SELECT * FROM cron.job_run_details`.
     pub async fn list_run_details(&self, project: &ProjectId) -> Result<Vec<CronRunDetail>> {
         self.ensure_tables(project).await?;
+        let run_tbl = self.effective_run_details_table(project).await?;
         let sess = self.inner.engine.open_session(*project).await?;
         let res = sess
             .execute(&format!(
                 "SELECT id, jobid, runid, database, username, command, \
                         status, return_message, start_unix_ms, end_unix_ms \
-                 FROM {RUN_DETAILS_TABLE} ORDER BY id"
+                 FROM {run_tbl} ORDER BY id"
             ))
             .await?;
         let batches = match res {
@@ -350,11 +425,12 @@ impl CronStore {
         last_status: &str,
     ) -> Result<()> {
         self.ensure_tables(project).await?;
+        let job_tbl = self.effective_job_table(project).await?;
         let sess = self.inner.engine.open_session(*project).await?;
         // Use a parameterised UPDATE — Basin engine supports compound WHERE
         // with `=` on a literal i64.
         sess.execute(&format!(
-            "UPDATE {JOB_TABLE} SET last_run_unix_ms = {ts}, last_status = {status} \
+            "UPDATE {job_tbl} SET last_run_unix_ms = {ts}, last_status = {status} \
              WHERE jobid = {jobid}",
             ts = last_run.timestamp_millis(),
             status = sql_text(last_status),
@@ -363,7 +439,8 @@ impl CronStore {
         Ok(())
     }
 
-    /// Allocate the next id for `cron_job_run_details`.
+    /// Allocate the next id for `job_run_details` (or `cron_job_run_details`
+    /// on legacy deployments).
     pub(crate) async fn next_run_detail_id(&self, project: &ProjectId) -> Result<i64> {
         let details = self.list_run_details(project).await?;
         Ok(details.iter().map(|d| d.id).max().unwrap_or(0) + 1)
@@ -495,4 +572,66 @@ fn downcast_opt_str(b: &arrow_array::RecordBatch, col: &str) -> Result<Vec<Optio
         });
     }
     Ok(v)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 5.18.C — unit tests for namespace constants and back-compat aliases
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+
+    #[test]
+    fn reserved_schema_is_cron() {
+        assert_eq!(RESERVED_SCHEMA, "cron");
+    }
+
+    #[test]
+    fn canonical_job_table_is_bare_name() {
+        // The canonical name should be bare `job` (living in the `cron` schema).
+        assert_eq!(JOB_TABLE, "job");
+    }
+
+    #[test]
+    fn canonical_run_details_table_is_bare_name() {
+        assert_eq!(RUN_DETAILS_TABLE, "job_run_details");
+    }
+
+    #[test]
+    fn legacy_job_table_has_schema_prefix() {
+        // The legacy name must include the `cron_` prefix so back-compat
+        // resolution can distinguish it from the canonical name.
+        assert_eq!(LEGACY_JOB_TABLE, "cron_job");
+        assert!(LEGACY_JOB_TABLE.starts_with(&format!("{RESERVED_SCHEMA}_")));
+    }
+
+    #[test]
+    fn legacy_run_details_table_has_schema_prefix() {
+        assert_eq!(LEGACY_RUN_DETAILS_TABLE, "cron_job_run_details");
+        assert!(LEGACY_RUN_DETAILS_TABLE.starts_with(&format!("{RESERVED_SCHEMA}_")));
+    }
+
+    #[test]
+    fn canonical_and_legacy_job_tables_differ() {
+        assert_ne!(JOB_TABLE, LEGACY_JOB_TABLE);
+    }
+
+    #[test]
+    fn canonical_and_legacy_run_details_tables_differ() {
+        assert_ne!(RUN_DETAILS_TABLE, LEGACY_RUN_DETAILS_TABLE);
+    }
+
+    #[test]
+    fn legacy_names_derive_from_canonical_with_schema_prefix() {
+        // Verify the mapping: canonical → schema_canonical (the old flat form).
+        assert_eq!(
+            format!("{RESERVED_SCHEMA}_{JOB_TABLE}"),
+            LEGACY_JOB_TABLE
+        );
+        assert_eq!(
+            format!("{RESERVED_SCHEMA}_{RUN_DETAILS_TABLE}"),
+            LEGACY_RUN_DETAILS_TABLE
+        );
+    }
 }

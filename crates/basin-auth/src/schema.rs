@@ -4,6 +4,31 @@
 //! and provisional v0.1 capability hedges collapsed into the authoritative
 //! CREATE TABLE definitions below.
 //!
+//! # Phase 5.18.C — `auth` reserved schema migration
+//!
+//! The canonical namespace for auth tables is now `auth` (a `ReservedSchema`
+//! in basin-catalog). Table names under the auth schema are the bare table
+//! names without the `basin_auth_` prefix:
+//!
+//! | Canonical (`auth.<table>`)    | Legacy flat name (`{prefix}_<table>`)      |
+//! |-------------------------------|---------------------------------------------|
+//! | `auth.users`                  | `{schema}_users` (e.g. `basin_auth_users`)  |
+//! | `auth.refresh_tokens`         | `{schema}_refresh_tokens`                   |
+//! | `auth.email_tokens`           | `{schema}_email_tokens`                     |
+//! | `auth.api_keys`               | `{schema}_api_keys`                         |
+//! | `auth.user_session_settings`  | `{schema}_user_session_settings`            |
+//! | `auth.magic_links`            | `{schema}_auth_magic_links`                 |
+//! | `auth.revoked_refresh_tokens` | `{schema}_auth_revoked_refresh_tokens`      |
+//! | `auth.project_credentials`    | `{schema}_auth_project_credentials`         |
+//! | `auth.oauth_providers`        | `{schema}_oauth_providers`                  |
+//! | `auth.identities`             | `{schema}_identities`                       |
+//! | `auth.oauth_states`           | `{schema}_oauth_states`                     |
+//!
+//! **Back-compat**: [`legacy_table_prefix`] maps a canonical table name
+//! (e.g. `"users"`) to the legacy flat-prefix form so callers can fall back
+//! to the old physical name when the canonical `auth.<table>` entry is absent.
+//! [`canonical_table_name`] maps the reverse direction.
+//!
 //! Mirrors the `PostgresCatalog` migration pattern: idempotent
 //! `CREATE TABLE IF NOT EXISTS` statements. Tests use a unique schema-prefix
 //! per run with a `Drop`-guard cleanup.
@@ -39,6 +64,87 @@
 
 use basin_common::{BasinError, Result};
 use tokio_postgres::Client;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 5.18.C — canonical reserved-schema constants + back-compat helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The reserved schema name for all auth system tables (ADR 0022 / 5.18.C).
+///
+/// Canonical table identifiers are `auth.<table>` — see the module-level
+/// table for the full mapping from canonical to legacy names.
+pub const RESERVED_SCHEMA: &str = "auth";
+
+/// Bare table names within the `auth` schema (canonical, post-5.18.C form).
+pub mod table_names {
+    pub const USERS: &str = "users";
+    pub const REFRESH_TOKENS: &str = "refresh_tokens";
+    pub const EMAIL_TOKENS: &str = "email_tokens";
+    pub const API_KEYS: &str = "api_keys";
+    pub const USER_SESSION_SETTINGS: &str = "user_session_settings";
+    pub const MAGIC_LINKS: &str = "magic_links";
+    pub const REVOKED_REFRESH_TOKENS: &str = "revoked_refresh_tokens";
+    pub const PROJECT_CREDENTIALS: &str = "project_credentials";
+    pub const OAUTH_PROVIDERS: &str = "oauth_providers";
+    pub const IDENTITIES: &str = "identities";
+    pub const OAUTH_STATES: &str = "oauth_states";
+}
+
+/// Given a canonical bare table name within the `auth` schema (e.g.
+/// `"users"`), return the legacy flat prefix used in the old
+/// `<schema>_<table>` scheme (e.g. `"users"` → `"users"` suffix, where the
+/// full old name was `"{prefix}_users"`).
+///
+/// Returns `None` for unknown table names (not managed by this module).
+///
+/// Use this for back-compat read paths: if the new `auth.<table>` catalog
+/// entry is absent, fall back to looking for `{schema}_{suffix}` in the
+/// legacy flat namespace.
+pub fn legacy_suffix_for(canonical_table: &str) -> Option<&'static str> {
+    match canonical_table {
+        table_names::USERS => Some("users"),
+        table_names::REFRESH_TOKENS => Some("refresh_tokens"),
+        table_names::EMAIL_TOKENS => Some("email_tokens"),
+        table_names::API_KEYS => Some("api_keys"),
+        table_names::USER_SESSION_SETTINGS => Some("user_session_settings"),
+        // magic_links and revoked_refresh_tokens had an extra `auth_` infix
+        table_names::MAGIC_LINKS => Some("auth_magic_links"),
+        table_names::REVOKED_REFRESH_TOKENS => Some("auth_revoked_refresh_tokens"),
+        table_names::PROJECT_CREDENTIALS => Some("auth_project_credentials"),
+        table_names::OAUTH_PROVIDERS => Some("oauth_providers"),
+        table_names::IDENTITIES => Some("identities"),
+        table_names::OAUTH_STATES => Some("oauth_states"),
+        _ => None,
+    }
+}
+
+/// Given a legacy flat table name (the full name including the schema prefix,
+/// e.g. `"basin_auth_users"`), return the canonical `auth.<table>` form.
+///
+/// Returns `None` if the name doesn't match any known auth table pattern.
+///
+/// This is the reverse of the legacy prefix + [`legacy_suffix_for`] scheme.
+pub fn canonical_auth_table_name(schema_prefix: &str, legacy_name: &str) -> Option<String> {
+    // Try stripping the schema prefix + underscore from the start.
+    let prefix_sep = format!("{schema_prefix}_");
+    let suffix = legacy_name.strip_prefix(prefix_sep.as_str())?;
+    // Map legacy suffixes back to canonical bare names.
+    let canonical = match suffix {
+        "users" => table_names::USERS,
+        "refresh_tokens" => table_names::REFRESH_TOKENS,
+        "email_tokens" => table_names::EMAIL_TOKENS,
+        "api_keys" => table_names::API_KEYS,
+        "user_session_settings" => table_names::USER_SESSION_SETTINGS,
+        "auth_magic_links" => table_names::MAGIC_LINKS,
+        "auth_revoked_refresh_tokens" => table_names::REVOKED_REFRESH_TOKENS,
+        "auth_project_credentials" => table_names::PROJECT_CREDENTIALS,
+        "oauth_providers" => table_names::OAUTH_PROVIDERS,
+        "identities" => table_names::IDENTITIES,
+        "oauth_states" => table_names::OAUTH_STATES,
+        _ => return None,
+    };
+    Some(format!("{RESERVED_SCHEMA}.{canonical}"))
+}
 
 /// Validate an identifier we will interpolate into DDL. The interpolated
 /// string is used as the *prefix* of every table name (e.g. `basin_auth`
@@ -331,5 +437,134 @@ mod tests {
         assert!(validate_schema_ident(&too_long).is_err());
         let just_fits = "a".repeat(32);
         validate_schema_ident(&just_fits).unwrap();
+    }
+
+    // ── Phase 5.18.C back-compat alias tests ──────────────────────────────
+
+    #[test]
+    fn reserved_schema_is_auth() {
+        assert_eq!(RESERVED_SCHEMA, "auth");
+    }
+
+    #[test]
+    fn legacy_suffix_known_tables() {
+        // Primary tables map to bare suffix (no schema infix).
+        assert_eq!(legacy_suffix_for(table_names::USERS), Some("users"));
+        assert_eq!(
+            legacy_suffix_for(table_names::REFRESH_TOKENS),
+            Some("refresh_tokens")
+        );
+        assert_eq!(
+            legacy_suffix_for(table_names::EMAIL_TOKENS),
+            Some("email_tokens")
+        );
+        assert_eq!(legacy_suffix_for(table_names::API_KEYS), Some("api_keys"));
+        assert_eq!(
+            legacy_suffix_for(table_names::USER_SESSION_SETTINGS),
+            Some("user_session_settings")
+        );
+        // These had an extra `auth_` infix in the old flat name.
+        assert_eq!(
+            legacy_suffix_for(table_names::MAGIC_LINKS),
+            Some("auth_magic_links")
+        );
+        assert_eq!(
+            legacy_suffix_for(table_names::REVOKED_REFRESH_TOKENS),
+            Some("auth_revoked_refresh_tokens")
+        );
+        assert_eq!(
+            legacy_suffix_for(table_names::PROJECT_CREDENTIALS),
+            Some("auth_project_credentials")
+        );
+        assert_eq!(
+            legacy_suffix_for(table_names::OAUTH_PROVIDERS),
+            Some("oauth_providers")
+        );
+        assert_eq!(
+            legacy_suffix_for(table_names::IDENTITIES),
+            Some("identities")
+        );
+        assert_eq!(
+            legacy_suffix_for(table_names::OAUTH_STATES),
+            Some("oauth_states")
+        );
+    }
+
+    #[test]
+    fn legacy_suffix_unknown_returns_none() {
+        assert_eq!(legacy_suffix_for("nonexistent"), None);
+        assert_eq!(legacy_suffix_for(""), None);
+    }
+
+    #[test]
+    fn canonical_auth_table_name_round_trip() {
+        let schema = "basin_auth";
+        // Users: basin_auth_users → auth.users
+        assert_eq!(
+            canonical_auth_table_name(schema, "basin_auth_users"),
+            Some("auth.users".to_string())
+        );
+        // Revoked refresh tokens has an auth_ infix.
+        assert_eq!(
+            canonical_auth_table_name(schema, "basin_auth_auth_revoked_refresh_tokens"),
+            Some("auth.revoked_refresh_tokens".to_string())
+        );
+        // Magic links.
+        assert_eq!(
+            canonical_auth_table_name(schema, "basin_auth_auth_magic_links"),
+            Some("auth.magic_links".to_string())
+        );
+        // Project credentials.
+        assert_eq!(
+            canonical_auth_table_name(schema, "basin_auth_auth_project_credentials"),
+            Some("auth.project_credentials".to_string())
+        );
+        // OAuth providers.
+        assert_eq!(
+            canonical_auth_table_name(schema, "basin_auth_oauth_providers"),
+            Some("auth.oauth_providers".to_string())
+        );
+        // Unknown suffix: returns None.
+        assert_eq!(
+            canonical_auth_table_name(schema, "basin_auth_unknown_table"),
+            None
+        );
+        // Does not match a different schema prefix.
+        assert_eq!(
+            canonical_auth_table_name("other_prefix", "basin_auth_users"),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_flat_names_resolve_via_suffix_helper() {
+        // Verify that the legacy flat name `basin_auth_<suffix>` is what
+        // you get when using the schema prefix + the suffix from
+        // `legacy_suffix_for`.
+        let prefix = "basin_auth";
+        for name in [
+            table_names::USERS,
+            table_names::REFRESH_TOKENS,
+            table_names::EMAIL_TOKENS,
+            table_names::API_KEYS,
+            table_names::USER_SESSION_SETTINGS,
+            table_names::MAGIC_LINKS,
+            table_names::REVOKED_REFRESH_TOKENS,
+            table_names::PROJECT_CREDENTIALS,
+            table_names::OAUTH_PROVIDERS,
+            table_names::IDENTITIES,
+            table_names::OAUTH_STATES,
+        ] {
+            let suffix = legacy_suffix_for(name).expect("every table_names:: has a suffix");
+            let legacy = format!("{prefix}_{suffix}");
+            // canonical_auth_table_name must recover the original table name.
+            let canonical = canonical_auth_table_name(prefix, &legacy)
+                .unwrap_or_else(|| panic!("no canonical for {legacy}"));
+            assert_eq!(
+                canonical,
+                format!("auth.{name}"),
+                "round-trip failed for {name}"
+            );
+        }
     }
 }

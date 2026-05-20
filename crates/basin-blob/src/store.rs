@@ -10,6 +10,27 @@
 //!   — `BlobStore` never constructs one itself to avoid reaching into
 //!   `basin-engine`).
 //!
+//! # Phase 5.18.C — `storage` reserved schema formalisation
+//!
+//! `basin-blob` was already shaped as `storage.*` (per ADR 0021). Phase
+//! 5.18.C formalises this by recording [`RESERVED_SCHEMA`] and the canonical
+//! table names as module-level constants so the rest of the system can
+//! reference them without hard-coding the string `"storage"`.
+//!
+//! The table layout is:
+//!
+//! | Canonical (`storage.<table>`) | Notes                                 |
+//! |-------------------------------|---------------------------------------|
+//! | `storage.buckets`             | One row per bucket (name, policy).    |
+//! | `storage.objects`             | One row per object (path, size, etag).|
+//!
+//! No back-compat prefix rename is required here because the flat names were
+//! never used — `basin-blob` always addressed these via its in-memory catalog
+//! (or Postgres tables that already carried `storage` in the schema column
+//! per ADR 0021). The only migration needed is ensuring new catalog writes
+//! use `ReservedSchema::Storage` keying; that work is mechanical and lands
+//! in the Postgres `BlobCatalog` implementation when it is added.
+//!
 //! # Operations (5.17.A surface)
 //!
 //! | Method | Description |
@@ -19,6 +40,25 @@
 //! | [`BlobStore::put_object`] | Write bytes to `object_store` + upsert row. |
 //! | [`BlobStore::get_object`] | Read bytes from `object_store` + return row. |
 //! | [`BlobStore::delete_object`] | Delete bytes from `object_store` + remove row. |
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 5.18.C — canonical reserved-schema constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The reserved schema name for blob/storage system tables (ADR 0022 / 5.18.C).
+///
+/// All tables managed by this crate are logically in the `storage` schema:
+/// `storage.buckets` and `storage.objects`. This matches the SQL surface
+/// exposed by Supabase-shaped SDKs (which already expect `storage.*`).
+pub const RESERVED_SCHEMA: &str = "storage";
+
+/// Canonical bare table names within the `storage` schema.
+pub mod table_names {
+    /// Per-project bucket rows.
+    pub const BUCKETS: &str = "buckets";
+    /// Per-project object rows.
+    pub const OBJECTS: &str = "objects";
+}
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -978,5 +1018,32 @@ mod tests {
 
         // No activity recorded — snapshot is None.
         assert!(registry.snapshot(&project).is_none());
+    }
+
+    // ── Phase 5.18.C reserved-schema constants ────────────────────────────
+
+    #[test]
+    fn reserved_schema_is_storage() {
+        assert_eq!(super::RESERVED_SCHEMA, "storage");
+    }
+
+    #[test]
+    fn table_names_are_correct() {
+        assert_eq!(super::table_names::BUCKETS, "buckets");
+        assert_eq!(super::table_names::OBJECTS, "objects");
+    }
+
+    #[test]
+    fn canonical_sql_surface_forms() {
+        // The canonical SQL surface must be `storage.buckets` / `storage.objects`.
+        let schema = super::RESERVED_SCHEMA;
+        assert_eq!(
+            format!("{schema}.{}", super::table_names::BUCKETS),
+            "storage.buckets"
+        );
+        assert_eq!(
+            format!("{schema}.{}", super::table_names::OBJECTS),
+            "storage.objects"
+        );
     }
 }

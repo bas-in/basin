@@ -182,7 +182,13 @@ impl ScalarUDFImpl for CronUnscheduleUdf {
     }
 }
 
-const CRON_JOB_TABLE: &str = "cron_job";
+/// Canonical job table name (Phase 5.18.C: `cron.job` → bare `job` in the
+/// flat catalog). Falls back to [`LEGACY_CRON_JOB_TABLE`] when the legacy
+/// table exists but the canonical one does not.
+const CRON_JOB_TABLE: &str = "job";
+
+/// Legacy flat table name used before Phase 5.18.C.
+const LEGACY_CRON_JOB_TABLE: &str = "cron_job";
 
 fn validate_cron_expr(expr: &str) -> Result<(), String> {
     let trimmed = expr.trim();
@@ -194,20 +200,61 @@ fn validate_cron_expr(expr: &str) -> Result<(), String> {
         .map_err(|e| format!("invalid cron expression {expr:?}: {e}"))
 }
 
+/// Returns the effective job table name to use for this project.
+///
+/// Phase 5.18.C: tries the canonical name (`job`) first; falls back to the
+/// legacy name (`cron_job`) when only the legacy table is present.
+async fn effective_cron_job_table(engine: &Engine, project: &ProjectId) -> Result<&'static str, String> {
+    use crate::ExecResult;
+    let sess = engine.open_session(*project).await.map_err(|e| e.to_string())?;
+    let res = sess.execute("SHOW TABLES").await.map_err(|e| e.to_string())?;
+    let names: Vec<String> = match res {
+        ExecResult::Rows { batches, .. } => {
+            let mut out = Vec::new();
+            for b in &batches {
+                if let Some(arr) = b.column_by_name("table_name")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                {
+                    for i in 0..arr.len() {
+                        out.push(arr.value(i).to_string());
+                    }
+                }
+            }
+            out
+        }
+        ExecResult::Empty { .. } => Vec::new(),
+    };
+    if names.iter().any(|n| n == CRON_JOB_TABLE) {
+        Ok(CRON_JOB_TABLE)
+    } else {
+        Ok(LEGACY_CRON_JOB_TABLE)
+    }
+}
+
 async fn ensure_cron_table(engine: &Engine, project: &ProjectId) -> Result<(), String> {
     use crate::ExecResult;
     let sess = engine.open_session(*project).await.map_err(|e| e.to_string())?;
     let res = sess.execute("SHOW TABLES").await.map_err(|e| e.to_string())?;
-    let exists = match res {
-        ExecResult::Rows { batches, .. } => batches.iter().any(|b| {
-            b.column_by_name("table_name")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-                .map(|arr| (0..arr.len()).any(|i| arr.value(i) == CRON_JOB_TABLE))
-                .unwrap_or(false)
-        }),
-        ExecResult::Empty { .. } => false,
+    let names: Vec<String> = match res {
+        ExecResult::Rows { batches, .. } => {
+            let mut out = Vec::new();
+            for b in &batches {
+                if let Some(arr) = b.column_by_name("table_name")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                {
+                    for i in 0..arr.len() {
+                        out.push(arr.value(i).to_string());
+                    }
+                }
+            }
+            out
+        }
+        ExecResult::Empty { .. } => Vec::new(),
     };
-    if !exists {
+    // Neither the canonical nor the legacy table exists — create the canonical.
+    let has_canonical = names.iter().any(|n| n == CRON_JOB_TABLE);
+    let has_legacy = names.iter().any(|n| n == LEGACY_CRON_JOB_TABLE);
+    if !has_canonical && !has_legacy {
         sess.execute(&format!(
             "CREATE TABLE {CRON_JOB_TABLE} (
                 jobid BIGINT NOT NULL, jobname TEXT NOT NULL, schedule TEXT NOT NULL,
@@ -223,11 +270,12 @@ async fn cron_schedule_impl(
 ) -> Result<i64, String> {
     validate_cron_expr(schedule)?;
     ensure_cron_table(engine, project).await?;
+    let job_tbl = effective_cron_job_table(engine, project).await?;
     use crate::ExecResult;
     use datafusion::arrow::array::Int64Array as ArrowI64;
     let sess = engine.open_session(*project).await.map_err(|e| e.to_string())?;
     let res = sess
-        .execute(&format!("SELECT jobid, jobname FROM {CRON_JOB_TABLE} ORDER BY jobid"))
+        .execute(&format!("SELECT jobid, jobname FROM {job_tbl} ORDER BY jobid"))
         .await.map_err(|e| e.to_string())?;
     let mut max_jobid = 0i64;
     let mut name_exists = false;
@@ -246,7 +294,7 @@ async fn cron_schedule_impl(
     if name_exists { return Err(format!("job {name:?} already exists")); }
     let jobid = max_jobid + 1;
     sess.execute(&format!(
-        "INSERT INTO {CRON_JOB_TABLE} VALUES ({jobid}, {}, {}, {}, 1, 'current_user', NULL, NULL)",
+        "INSERT INTO {job_tbl} VALUES ({jobid}, {}, {}, {}, 1, 'current_user', NULL, NULL)",
         sql_text(name), sql_text(schedule), sql_text(command),
     )).await.map_err(|e| e.to_string())?;
     Ok(jobid)
@@ -254,11 +302,12 @@ async fn cron_schedule_impl(
 
 async fn cron_unschedule_impl(engine: &Engine, project: &ProjectId, name: &str) -> Result<i64, String> {
     ensure_cron_table(engine, project).await?;
+    let job_tbl = effective_cron_job_table(engine, project).await?;
     use crate::ExecResult;
     use datafusion::arrow::array::Int64Array as ArrowI64;
     let sess = engine.open_session(*project).await.map_err(|e| e.to_string())?;
     let res = sess
-        .execute(&format!("SELECT jobid FROM {CRON_JOB_TABLE} WHERE jobname = {}", sql_text(name)))
+        .execute(&format!("SELECT jobid FROM {job_tbl} WHERE jobname = {}", sql_text(name)))
         .await.map_err(|e| e.to_string())?;
     let jobid = match res {
         ExecResult::Rows { batches, .. } => {
@@ -272,7 +321,7 @@ async fn cron_unschedule_impl(engine: &Engine, project: &ProjectId, name: &str) 
         }
         ExecResult::Empty { .. } => return Err(format!("job {name:?} not found")),
     };
-    sess.execute(&format!("DELETE FROM {CRON_JOB_TABLE} WHERE jobid = {jobid}"))
+    sess.execute(&format!("DELETE FROM {job_tbl} WHERE jobid = {jobid}"))
         .await.map_err(|e| e.to_string())?;
     Ok(jobid)
 }
@@ -321,5 +370,27 @@ mod tests {
     #[test]
     fn rewrite_cron_leaves_non_matching() {
         assert_eq!(rewrite_cron_schema_functions("SELECT my_cron.schedule('j')"), "SELECT my_cron.schedule('j')");
+    }
+
+    // ── Phase 5.18.C back-compat table name constants ─────────────────────
+
+    #[test]
+    fn canonical_job_table_is_bare_name() {
+        // The canonical name should be bare `job` (not `cron_job`) to reflect
+        // the `cron` schema. The flat catalog stores it without the schema prefix.
+        assert_eq!(CRON_JOB_TABLE, "job");
+    }
+
+    #[test]
+    fn legacy_job_table_has_schema_prefix() {
+        // The legacy name must include the `cron_` prefix so back-compat
+        // resolution can distinguish it from the canonical name.
+        assert_eq!(LEGACY_CRON_JOB_TABLE, "cron_job");
+        assert!(LEGACY_CRON_JOB_TABLE.starts_with("cron_"));
+    }
+
+    #[test]
+    fn canonical_and_legacy_cron_tables_differ() {
+        assert_ne!(CRON_JOB_TABLE, LEGACY_CRON_JOB_TABLE);
     }
 }

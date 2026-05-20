@@ -1,9 +1,30 @@
 //! Per-project store for async HTTP responses, backed by ordinary Basin
 //! tables.
 //!
+//! # Phase 5.18.C — `net` reserved schema migration
+//!
+//! The canonical namespace for net tables is now `net` (`ReservedSchema::Net`
+//! per ADR 0022). The primary table is `net._http_response`; the legacy flat
+//! name `_net_http_response` is preserved as a back-compat read alias.
+//!
+//! **Back-compat**: [`ensure_tables`] checks for both the new name
+//! (`_http_response`, created fresh) and the legacy name
+//! (`_net_http_response`, pre-5.18.C). When the legacy table exists it is
+//! recognised as the source of truth until an explicit one-time migration
+//! renames it. All new writes go to the canonical name; the legacy table
+//! name is surfaced as [`LEGACY_RESPONSE_TABLE`] so operators can script
+//! the rename.
+//!
+//! ## Canonical SQL surface (`net` schema)
+//!
+//! ```sql
+//! SELECT * FROM net._http_response WHERE id = $request_id;
+//! ```
+//!
 //! Three tables get created lazily on first use:
 //!
-//! - `_net_http_response` — terminal-state rows pg_net consumers read.
+//! - `_http_response` (canonical; was `_net_http_response`) — terminal-state
+//!   rows pg_net consumers read.
 //! - `_net_http_request_queue` — pending requests waiting for the runner.
 //!   pg_net keeps these in `net._http_request_queue`; the underscore-prefixed
 //!   name is a v0.1 concession to Basin's flat identifier model (the engine's
@@ -16,8 +37,9 @@
 //! All reads and writes go through `Engine::open_session`, so:
 //!
 //! 1. Project isolation is the same as for user SQL.
-//! 2. RLS policies on `_net_http_response` itself are honoured (you can
-//!    shape who can read which response under a single project).
+//! 2. RLS policies on `_http_response` / `_net_http_response` itself are
+//!    honoured (you can shape who can read which response under a single
+//!    project).
 
 use std::sync::Arc;
 
@@ -28,10 +50,24 @@ use chrono::{DateTime, Utc};
 
 use crate::types::{HttpResponse, RequestId, ResponseRow};
 
-/// Underscore-prefixed because Basin's `Ident` validator rejects a `.`
-/// character in v0.1; once a `net` schema is wired in the table name flips
-/// to `net._http_response` to match pg_net byte-for-byte.
-pub(crate) const RESPONSE_TABLE: &str = "_net_http_response";
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 5.18.C — canonical reserved-schema constants + back-compat aliases
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The reserved schema name for net system tables (ADR 0022 / 5.18.C).
+pub const RESERVED_SCHEMA: &str = "net";
+
+/// Canonical bare table name for the HTTP response store within the `net`
+/// schema (i.e. the SQL surface is `net._http_response`).
+///
+/// In the flat catalog the physical name is `_http_response` (without the
+/// `net_` prefix that the legacy name carried).
+pub(crate) const RESPONSE_TABLE: &str = "_http_response";
+
+/// Legacy flat table name used before Phase 5.18.C. Physical tables created
+/// before this migration have this name. [`ensure_tables`] recognises both
+/// names; new tables are created under [`RESPONSE_TABLE`].
+pub(crate) const LEGACY_RESPONSE_TABLE: &str = "_net_http_response";
 
 /// Store front for the per-project response table.
 ///
@@ -59,10 +95,22 @@ impl ResponseStore {
 
     /// Idempotently create the response table under `project`. Safe to call
     /// before every operation.
+    ///
+    /// # Phase 5.18.C back-compat
+    ///
+    /// Checks for both the canonical name (`_http_response`) and the legacy
+    /// name (`_net_http_response`). If neither exists, creates the canonical
+    /// table. If only the legacy table exists it is left in place (data is
+    /// preserved) — queries that reference the legacy name continue to work
+    /// because [`effective_response_table`] falls back to the legacy name when
+    /// only the legacy table is present.
     pub async fn ensure_tables(&self, project: &ProjectId) -> Result<()> {
         let sess = self.inner.engine.open_session(*project).await?;
         let existing = list_table_names(&sess).await?;
-        if !existing.contains(&RESPONSE_TABLE.to_string()) {
+        let has_canonical = existing.contains(&RESPONSE_TABLE.to_string());
+        let has_legacy = existing.contains(&LEGACY_RESPONSE_TABLE.to_string());
+        if !has_canonical && !has_legacy {
+            // Neither exists — create the canonical table.
             sess.execute(&format!(
                 "CREATE TABLE {RESPONSE_TABLE} (
                     id TEXT NOT NULL,
@@ -76,7 +124,23 @@ impl ResponseStore {
             ))
             .await?;
         }
+        // If only the legacy table exists we leave it in place for back-compat.
+        // A one-time ALTER TABLE RENAME migration can be applied out-of-band.
         Ok(())
+    }
+
+    /// Return the effective table name to use for reads/writes: the canonical
+    /// `_http_response` when the table has been migrated (or newly created),
+    /// falling back to the legacy `_net_http_response` for pre-5.18.C
+    /// deployments.
+    async fn effective_response_table(&self, project: &ProjectId) -> Result<&'static str> {
+        let sess = self.inner.engine.open_session(*project).await?;
+        let existing = list_table_names(&sess).await?;
+        if existing.contains(&RESPONSE_TABLE.to_string()) {
+            Ok(RESPONSE_TABLE)
+        } else {
+            Ok(LEGACY_RESPONSE_TABLE)
+        }
     }
 
     /// Append one row. Used by the async runner once a response has come back
@@ -89,6 +153,7 @@ impl ResponseStore {
         resp: &HttpResponse,
     ) -> Result<()> {
         self.ensure_tables(project).await?;
+        let table = self.effective_response_table(project).await?;
         let sess = self.inner.engine.open_session(*project).await?;
         let headers_json = serde_json::to_string(&resp.headers)
             .map_err(|e| BasinError::internal(format!("headers serialise: {e}")))?;
@@ -99,7 +164,7 @@ impl ResponseStore {
         };
         let now = Utc::now().timestamp_millis();
         sess.execute(&format!(
-            "INSERT INTO {RESPONSE_TABLE} VALUES \
+            "INSERT INTO {table} VALUES \
              ('{id}', '{request_id}', {status}, '{headers}', '{body}', {error}, {now})",
             id = id,
             request_id = request_id,
@@ -117,11 +182,12 @@ impl ResponseStore {
     /// recorded it.
     pub async fn get(&self, project: &ProjectId, id: RequestId) -> Result<Option<ResponseRow>> {
         self.ensure_tables(project).await?;
+        let table = self.effective_response_table(project).await?;
         let sess = self.inner.engine.open_session(*project).await?;
         let res = sess
             .execute(&format!(
                 "SELECT id, request_id, status, headers, body, error, completed_unix_ms \
-                 FROM {RESPONSE_TABLE} WHERE id = '{id}'"
+                 FROM {table} WHERE id = '{id}'"
             ))
             .await?;
         let batches = match res {
@@ -158,11 +224,12 @@ impl ResponseStore {
     /// List every recorded response for `project`. Useful for tests.
     pub async fn list(&self, project: &ProjectId) -> Result<Vec<ResponseRow>> {
         self.ensure_tables(project).await?;
+        let table = self.effective_response_table(project).await?;
         let sess = self.inner.engine.open_session(*project).await?;
         let res = sess
             .execute(&format!(
                 "SELECT id, request_id, status, headers, body, error, completed_unix_ms \
-                 FROM {RESPONSE_TABLE} ORDER BY completed_unix_ms"
+                 FROM {table} ORDER BY completed_unix_ms"
             ))
             .await?;
         let batches = match res {
@@ -256,6 +323,50 @@ fn downcast_str(b: &arrow_array::RecordBatch, col: &str) -> Result<Vec<String>> 
         v.push(arr.value(i).to_string());
     }
     Ok(v)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 5.18.C — unit tests for namespace constants and back-compat aliases
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+
+    #[test]
+    fn reserved_schema_is_net() {
+        assert_eq!(RESERVED_SCHEMA, "net");
+    }
+
+    #[test]
+    fn canonical_response_table_name() {
+        // The canonical name (post-5.18.C) strips the legacy `net_` prefix.
+        assert_eq!(RESPONSE_TABLE, "_http_response");
+    }
+
+    #[test]
+    fn legacy_response_table_name_preserved() {
+        // The legacy name must remain unchanged so back-compat checks work.
+        assert_eq!(LEGACY_RESPONSE_TABLE, "_net_http_response");
+    }
+
+    #[test]
+    fn canonical_and_legacy_differ() {
+        // Sanity: if they were equal the back-compat logic would be a no-op.
+        assert_ne!(RESPONSE_TABLE, LEGACY_RESPONSE_TABLE);
+    }
+
+    #[test]
+    fn legacy_name_contains_schema_name() {
+        // The legacy name `_net_http_response` embeds the schema name `net`
+        // as an internal component (with underscore delimiters). This differs
+        // from the cron/auth convention where the prefix comes first; the
+        // underscore prefix here is a pg_net convention for "internal" tables.
+        assert!(
+            LEGACY_RESPONSE_TABLE.contains(RESERVED_SCHEMA),
+            "legacy table name {LEGACY_RESPONSE_TABLE:?} should contain schema name {RESERVED_SCHEMA:?}"
+        );
+    }
 }
 
 fn downcast_opt_str(b: &arrow_array::RecordBatch, col: &str) -> Result<Vec<Option<String>>> {
