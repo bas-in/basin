@@ -1160,7 +1160,7 @@ this OSS repo; 5.15.E–5.15.I land in `basin-cloud` (separate repo).
       `docs/decisions/README.md`. Acceptance gate: schema documented;
       one ADR-eligible decision recorded ("why YAML frontmatter, not
       MDX or sidecar TOML").
-- [ ] **5.15.B** Migrate existing Basin OSS docs to the frontmatter
+- [x] **5.15.B** Migrate existing Basin OSS docs to the frontmatter
       spec. Files: `docs/architecture.md`, `docs/deployment.md`,
       `docs/multi-project.md`, `docs/sql-compatibility.md`,
       `docs/sql-support.md`, `docs/scaling/*.md`, every ADR in
