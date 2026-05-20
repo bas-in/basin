@@ -311,10 +311,10 @@ Cloud has the full surface (`/v1/orgs/{slug}/members*`).
 
 For customers running their own buckets, KMS, or engine.
 
-- [ ] `cmd_byo_bucket.go` — `get/put/probe/delete`. Routes: `/v1/projects/{ref}/storage` (`Get`/`Set`/`Probe`/`Revoke`). Tests: full CRUD + probe-failure response shape.
-- [ ] `cmd_byo_kms.go` — `get/put/rotate/verify/audit/delete/cache-stats`. Routes: `/v1/projects/{ref}/kms/*`. Tests: full CRUD, rotate flow, audit pagination, cache-stats shape.
-- [ ] `cmd_byo_engine.go` — `get/put/probe/delete`. Routes: `/v1/projects/{ref}/byo-engine/*`. Tests: full CRUD + probe.
-- [ ] Client: corresponding methods.
+- [x] `byo bucket` — `get/put/probe/delete`. Ported to Rust (`src/commands/byo.rs`).
+- [x] `byo kms` — `get/put/rotate/verify/audit/delete/cache-stats`. Ported to Rust.
+- [x] `byo engine` — `get/put/probe/delete`. Ported to Rust.
+- [x] Client: corresponding methods. (Rust `Client` in `src/client.rs`.)
 
 ---
 
@@ -322,9 +322,9 @@ For customers running their own buckets, KMS, or engine.
 
 Plan-gated on the cloud side; CLI surface still useful.
 
-- [ ] `cmd_saml.go` — `get/put/test/enable/disable`. Routes: `/v1/orgs/{slug}/saml/*`. Tests: full lifecycle, enable confirmation.
-- [ ] `cmd_scim.go` — `config get`, `tokens create/revoke`. Routes: `/v1/orgs/{slug}/scim/*`. Tests: token CRUD, config shape.
-- [ ] `cmd_oauth_apps.go` — `list/create/rotate/disable/enable/delete`. Routes: `/v1/orgs/{slug}/oauth-apps/*`. Tests: full lifecycle.
+- [x] `saml` — `get/put/test/enable/disable`. Ported to Rust (`src/commands/saml.rs`).
+- [x] `scim` — `config get`, `tokens create/revoke`. Ported to Rust (`src/commands/scim.rs`).
+- [x] `oauth-apps` — `list/create/rotate/disable/enable/delete`. Ported to Rust (`src/commands/oauth_apps.rs`).
 - [ ] Client: corresponding methods.
 
 ---
