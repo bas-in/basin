@@ -6,6 +6,40 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-20 — Roadmap reload + new auth/storage work chain
+
+User hand-updated TASK.md (OSS), TASKS.md+ROADMAP.md (js, cli) and the
+cloud roadmap. Reloaded. Material changes:
+
+- **New OSS engine work** that unblocks basin-js's 🔒 stubs:
+  - **5.10.O** OAuth providers (presets + generic OIDC), ADR 0020 basin-auth v2
+  - **5.10.M** MFA: TOTP + WebAuthn/passkeys, ADR 0020
+  - **5.17.A–F** Object storage (Supabase-style blobs), ADR 0021 — new crate +
+    basin-rest HTTP API + RLS + signed URLs + bytes counter + TUS resumable
+- **basin-js** is fully ✅ except T-020–024 (OAuth/MFA/storage), which stay
+  🔒 until the OSS routes above ship. Route shapes are specced in the js
+  ROADMAP (OAuth `/auth/v1/authorize`, MFA `/auth/v1/factors/*`, storage
+  `/storage/v1/object/*`).
+
+**Dispatch chain:** OSS 5.10.O/M + 5.17.* → then basin-js T-020–024 wiring.
+
+**Dispatcher discipline reaffirmed:** before sending agents for these,
+re-read the full 5.10.O / 5.10.M / 5.17.* specs from TASK.md at dispatch
+time (don't trust context — it goes stale as the user edits). Hold the
+new wave until the in-flight OSS wave lands: 6.X is editing the workspace
+`Cargo.toml` and 5.17.A also adds a crate there — guaranteed conflict if
+run concurrently.
+
+**Open issues to triage when the OSS wave lands:**
+1. CLI Go-deletion (agent a49382a) was **reverted** on agent death — 104
+   .go files are back; HEAD still fe80e9c. Re-dispatch the delete once the
+   Rust port is confirmed parity-complete + green.
+2. `create_materialized_view_without_basin_continuous_is_rejected` test now
+   fails — a sibling agent added snapshot-matview support without updating
+   the test. Reconcile (update test or revert the behaviour change).
+
+---
+
 ## 2026-05-20 — 1M-context credit cutoff + tangled-orphan recovery
 
 Three agents (advanced LATERAL, advanced window frames, 5.13.B prescreen
