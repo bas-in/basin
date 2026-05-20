@@ -70,24 +70,74 @@ Outcome:
 
 ---
 
-## 0.3 — Server-route follow-on (waiting on basin v0.2 engine routes)
+## 0.3 — Server-route follow-on
 
-These methods exist in the SDK today as `not_implemented` stubs. They flip
-to live the moment the engine ships the underlying route. The SDK work is
-mostly threading bodies through and converting stubs into real network
-calls — none of it should be blocked on architectural decisions.
+### Now unblocked — engine routes shipped (basin OSS, 2026-05-20)
+
+The basin engine landed the realtime stack, the RPC mount, and engine
+`DELETE` this cycle. These SDK methods are no longer waiting on
+architectural decisions — the route shapes are final and documented
+below. See **0.6 — Realtime** for the full protocol.
+
+- `from().delete()` — **engine `DELETE` shipped** (Iceberg copy-on-write).
+  The 501 is gone; the SDK `delete()` path is live (T-027 ✅).
+- `functions.invoke()` → **`POST /rest/v1/rpc/:fn_name`** (basin 5.11.L).
+  Body is a JSON object of named args; response is the function result
+  (scalar bare value, or array of row objects for `RETURNS TABLE`). Both
+  `LANGUAGE sql` and `LANGUAGE wasm` functions dispatch through the same
+  route. **Not** the old `/v1/projects/:ref/functions/:slug/invoke` shape.
+- `realtime.channel().on('postgres_changes', …).subscribe()` →
+  **SSE `GET /realtime/v1/sse/:project/:table`** for read-only single-table
+  subscriptions, **WebSocket `GET /realtime/v1/ws/:project`** for
+  multi-table multiplexing + presence + mid-stream filter changes.
+  Full protocol in 0.6.
+
+### Still waiting — engine routes not yet shipped
 
 - `signInWithOAuth` → `/auth/v1/oauth/:provider/authorize` + callback handler
 - `auth.mfa.{enroll, verify, unenroll}` → `/auth/v1/mfa/*` (TOTP first;
   WebAuthn is a follow-on)
 - `storage.from(bucket).{upload, download, list, remove, createSignedUrl}` →
-  `/object/*` (single-shot first; multipart + TUS resumable behind feature
-  flags that flip when the engine ships them)
-- `realtime.channel().on().subscribe()` → WebSocket transport against the
-  engine's broadcast surface
-- `functions.invoke()` → `/v1/projects/:ref/functions/:slug/invoke`
-- `from().delete()` — engine currently returns 501; either fix engine-side
-  or have the SDK throw a clearer "not yet" error than the raw 501
+  `/object/*` (engine has no object-storage HTTP surface yet; keep stubbed)
+
+---
+
+## 0.6 — Realtime (engine shipped; SDK is the remaining work)
+
+The basin engine ships a complete realtime stack (basin 5.11.R1–R7). The
+SDK mirrors Supabase's `channel()` ergonomics on top of it. Two transports;
+the SDK picks based on what the channel needs.
+
+**SSE — read-only, single table.** `GET /realtime/v1/sse/:project/:table`,
+`Authorization: Bearer <jwt>`. Server streams one JSON event per committed
+`INSERT`/`UPDATE`/`DELETE`; RLS-filtered per the caller's policies; 15s
+heartbeat comment frames; `Last-Event-Id` request header replays missed
+events from the durable log on reconnect. Use this when the channel only
+listens to one table and never needs presence.
+
+**WebSocket — multiplexed, bidirectional.**
+`GET /realtime/v1/ws/:project`. One socket carries many table
+subscriptions. JSON control plane (`tag = "type"`):
+
+- Client → server:
+  - `{"type":"subscribe","table":"orders"}` — optional
+    `"filter":"NEW.status = 'paid'"` for server-side predicate pushdown
+  - `{"type":"unsubscribe","table":"orders"}` (socket stays open)
+  - `{"type":"presence_track","channel":"room:1","client_id":"c1","metadata":{…}}`
+  - `{"type":"presence_untrack","channel":"room:1","client_id":"c1"}`
+  - `{"type":"heartbeat","channel":"room:1","client_id":"c1"}` (every 30s;
+    server evicts after 90s of silence)
+- Server → client:
+  - `{"type":"event","project":"…","table":"orders","op":"INSERT","after":{…},"seq":42}`
+  - `{"type":"subscribed","table":"orders"}` / `{"type":"unsubscribed","table":"orders"}`
+  - `{"type":"error","code":"lag","table":"orders","missed":5}`
+  - `{"type":"presence_state","channel":"room:1","presences":[…]}`
+  - `{"type":"presence_diff","channel":"room:1","joins":[…],"leaves":[…]}`
+
+SDK routing rule: a channel that only does `postgres_changes` on one table
+with no presence and no mid-stream filter change → SSE. Anything with
+presence, multiple tables, or dynamic filters → WS. Reconnect-with-replay
+uses `Last-Event-Id` (SSE) or re-subscribe + `seq` gap detection (WS).
 
 ---
 

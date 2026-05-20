@@ -413,51 +413,176 @@ routes in basin-rest.
 
 ---
 
-### T-025 — Realtime WebSocket transport 🔒
+### T-025 — Realtime: SSE transport (single-table, read-only) ✅ unblocked
 
-**Status:** blocked 2026-05-19. Engine has no broadcast surface in v0.1.
+**Status:** ready 2026-05-20. Engine shipped the realtime stack (basin
+5.11.R1–R7). Route shapes are final — see ROADMAP 0.6. This task was the
+old "WebSocket transport 🔒" placeholder; it is now split across T-025
+(SSE), T-028 (WS multiplex), T-029 (presence), T-030 (channel-API routing
++ reconnect/replay). Do them in that order.
 
-**Files:** `src/realtime/client.ts`, `src/realtime/client.test.ts`
+**Files:** `src/realtime/sse.ts` (new), `src/realtime/sse.test.ts` (new)
 
-**Engine prerequisite:** broadcast surface on basin-rest (TBD route shape).
+**Engine route:** `GET /realtime/v1/sse/:project/:table`, header
+`Authorization: Bearer <jwt>`. Streams one JSON event per committed
+mutation: `{"project","table","op":"INSERT|UPDATE|DELETE","after":{…},"seq":N}`.
+15s heartbeat comment frames (`:\n\n`). `Last-Event-Id` request header
+replays missed events on reconnect.
 
 **Scope:**
-- Replace the `enabled = false` flag with a real WebSocket client using
-  `globalThis.WebSocket` (no external deps).
-- `RealtimeChannel.subscribe()` opens (or reuses) the socket, sends a
-  subscribe frame, and resolves once the server ack arrives.
-- Postgres-changes bindings receive `INSERT/UPDATE/DELETE` payloads.
-- Auto-reconnect with exponential backoff (1s, 2s, 4s, …, cap at 30s).
+- An `SseSubscription` class using `globalThis.EventSource` if available,
+  else `fetch()` + `ReadableStream` line reader (Node 18+ has no
+  `EventSource`). No external deps.
+- `subscribe(project, table, { jwt }, onEvent)` opens the stream, parses
+  each `data:` line as JSON, invokes `onEvent` with the parsed event.
+- Track the last `seq`; on reconnect send `Last-Event-Id: <seq>`.
+- Auto-reconnect with exponential backoff (1s, 2s, 4s … cap 30s).
+- Ignore heartbeat/comment frames.
 
 **Acceptance criteria:**
-- Unit tests use a mock WebSocket (`globalThis.WebSocket = MockWS`).
-- Subscribe → ack → payload → callback fires.
-- Disconnect → reconnect attempt observed.
+- Unit tests stub the stream (mock `EventSource` or a `ReadableStream` of
+  NDJSON-ish `data:` frames).
+- Event frame → `onEvent` fires with `{op, after, seq}`.
+- Heartbeat frame → no callback.
+- Disconnect → reconnect attempt observed; `Last-Event-Id` sent with last seq.
+- `npm run typecheck` clean, `npm test` green.
 
-**Note:** this is the largest task in the file. It may need to be split
-once the engine route shape is known.
+**Reference:** `basin/crates/basin-realtime/src/sse.rs` (handler + frame
+shape); ROADMAP 0.6.
 
 ---
 
-### T-026 — Wire `functions.invoke()` 🔒
+### T-026 — Wire `functions.invoke()` → `/rest/v1/rpc/:fn` ✅ unblocked
 
-**Status:** blocked 2026-05-19. Engine `/functions/*` routes do not exist.
+**Status:** ready 2026-05-20. Engine shipped the RPC mount (basin 5.11.L,
+commit 183c315). Route is **`POST /rest/v1/rpc/:fn_name`** — NOT the old
+`/v1/projects/:ref/functions/:slug/invoke` shape the stub assumed.
 
 **Files:** `src/functions/client.ts`, `src/functions/client.test.ts`
 
-**Engine prerequisite:** `/v1/projects/:ref/functions/:slug/invoke` route.
+**Engine route:** `POST /rest/v1/rpc/:fn_name`, `Authorization: Bearer`,
+body = JSON object of named args (e.g. `{"x":3,"y":4}`). Response: bare
+scalar for single-row/single-column results; array of row objects for
+`RETURNS TABLE` functions. Both `LANGUAGE sql` and `LANGUAGE wasm`
+functions dispatch identically.
 
 **Scope:**
-- Flip the `enabled` flag; remove the `c8 ignore` comment block.
-- POST to `${url}/v1/projects/${projectRef}/functions/${slug}/invoke` with
-  the JSON body.
-- Return type-generic `{data: T, error}` matching the existing surface.
+- Flip the `enabled` flag; remove the `c8 ignore` block.
+- `functions.invoke(fnName, { body, headers })` → POST
+  `${url}/rest/v1/rpc/${fnName}` with the JSON args body + bearer auth.
+- Return type-generic `{ data: T, error }` matching the existing surface;
+  pass through the bare-scalar vs array distinction without reshaping.
+- Rename the public method/alias if the SDK currently exposes
+  `functions.invoke(slug)` — keep `invoke` but document it maps to RPC.
 
 **Acceptance criteria:**
-- Happy path with body + headers + auth-token override.
-- Missing `projectRef` (neither in `createClient` nor per-call) →
-  `invalid_request`.
-- 5xx response → propagates `BasinError`.
+- Happy path: scalar function `add(x,y)` with `{x:3,y:4}` → `data === 7`.
+- Happy path: `RETURNS TABLE` function → `data` is an array of objects.
+- No auth token → propagates the engine 401 as `BasinError("unauthorized")`.
+- 5xx → propagates `BasinError`.
+- `npm run typecheck` clean, `npm test` green.
+
+**Reference:** `basin/crates/basin-rest/src/routes/rpc.rs`; ROADMAP 0.3.
+
+---
+
+### T-028 — Realtime: WebSocket multiplex transport ✅ unblocked
+
+**Status:** ready 2026-05-20. **Depends on T-025** (shares event-parsing +
+backoff helpers). Engine route `GET /realtime/v1/ws/:project`.
+
+**Files:** `src/realtime/ws.ts` (new), `src/realtime/ws.test.ts` (new)
+
+**Protocol (JSON, `tag = "type"`):**
+- send `{"type":"subscribe","table":"orders"}` (optional
+  `"filter":"NEW.status = 'paid'"`), `{"type":"unsubscribe","table":"orders"}`
+- recv `{"type":"subscribed","table":…}`, `{"type":"event","table","op","after","seq"}`,
+  `{"type":"unsubscribed",…}`, `{"type":"error","code":"lag","missed":N}`
+
+**Scope:**
+- `WsConnection` over `globalThis.WebSocket` (no deps). One socket,
+  many table subscriptions multiplexed.
+- `subscribe(table, { filter? }, onEvent)` sends the frame, resolves on
+  `subscribed` ack, routes `event` frames to the right per-table callback.
+- `unsubscribe(table)` keeps the socket open.
+- Auto-reconnect (reuse T-025 backoff); on reconnect, re-send all active
+  subscribe frames; detect `seq` gaps and surface a `lag` event.
+
+**Acceptance criteria:**
+- Mock `WebSocket`. Subscribe two tables → both acks → interleaved events
+  route to the correct callbacks.
+- Unsubscribe one mid-stream → its events stop; the other continues; socket
+  stays open.
+- Disconnect → reconnect → both subscriptions re-established.
+- `npm run typecheck` clean, `npm test` green.
+
+**Reference:** `basin/crates/basin-realtime/src/ws.rs` (ClientMsg/ServerMsg
+enums, lines ~200–270); ROADMAP 0.6.
+
+---
+
+### T-029 — Realtime: presence over WebSocket ✅ unblocked
+
+**Status:** ready 2026-05-20. **Depends on T-028** (rides the same socket).
+
+**Files:** `src/realtime/presence.ts` (new), `src/realtime/presence.test.ts`
+(new), small additions to `src/realtime/ws.ts`
+
+**Protocol:** send `{"type":"presence_track","channel":"room:1","client_id":"c1","metadata":{…}}`,
+`{"type":"presence_untrack",…}`, `{"type":"heartbeat",…}` (every 30s).
+Recv `{"type":"presence_state","channel":"room:1","presences":[…]}` (full
+snapshot on join) and `{"type":"presence_diff","channel","joins":[…],"leaves":[…]}`.
+
+**Scope:**
+- `channel.track(metadata)` / `channel.untrack()` send the frames.
+- Maintain a local presence map from `presence_state` + `presence_diff`;
+  expose `channel.presenceState()`.
+- Start a 30s heartbeat timer while tracked; clear on untrack/close.
+- `on('presence', { event: 'sync'|'join'|'leave' }, cb)` bindings
+  (Supabase-shaped).
+
+**Acceptance criteria:**
+- Mock WS. `track()` → server `presence_state` → `presenceState()` reflects
+  members; `sync` callback fires.
+- `presence_diff` with a join → `join` callback + map updated.
+- `presence_diff` with a leave → `leave` callback + map updated.
+- Heartbeat frames sent on a fake timer at 30s cadence.
+- `npm run typecheck` clean, `npm test` green.
+
+**Reference:** `basin/crates/basin-realtime/src/presence.rs`; ROADMAP 0.6.
+
+---
+
+### T-030 — Realtime: `channel()` API + SSE/WS routing + replay ✅ unblocked
+
+**Status:** ready 2026-05-20. **Depends on T-025, T-028, T-029.** This is
+the public Supabase-shaped surface that picks a transport.
+
+**Files:** `src/realtime/client.ts`, `src/realtime/client.test.ts`,
+`src/realtime/index.ts`
+
+**Scope:**
+- `basin.channel(name)` returns a `RealtimeChannel`.
+- `.on('postgres_changes', { event: 'INSERT'|'UPDATE'|'DELETE'|'*', table }, cb)`
+  registers a binding.
+- `.on('presence', { event }, cb)` registers presence bindings.
+- `.subscribe()` decides transport: **SSE** when the channel has exactly
+  one `postgres_changes` table binding, no presence, no per-binding filter;
+  **WS** otherwise (presence, multiple tables, or a filter). Reuse T-025/028/029.
+- Remove the old `enabled = false` flag and any throwing stubs.
+- Reconnect-with-replay: SSE via `Last-Event-Id`; WS via re-subscribe +
+  `seq` gap detection.
+
+**Acceptance criteria:**
+- One-table changes-only channel → SSE transport selected (assert via the
+  mock that opened SSE not WS).
+- Channel with presence → WS transport selected.
+- Channel with two table bindings → WS transport selected.
+- End-to-end (mocked transport): subscribe → event → binding callback fires
+  with the right `{op, new}` shape.
+- `npm run typecheck` clean, `npm test` green.
+
+**Reference:** ROADMAP 0.6; Supabase `channel()` API for ergonomic parity.
 
 ---
 
