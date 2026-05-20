@@ -140,8 +140,12 @@ async fn create_refresh_select_drop_round_trip() {
 }
 
 #[tokio::test]
-async fn create_materialized_view_without_basin_continuous_is_rejected() {
-    // Non-continuous regular materialised views are not supported in v0.1.
+async fn create_snapshot_materialized_view_succeeds() {
+    // A plain `CREATE MATERIALIZED VIEW` (no `WITH (basin.continuous)`) is a
+    // one-shot snapshot: it materialises the source query immediately and
+    // stores the result as a regular table.  The view is queryable right away.
+    // `REFRESH MATERIALIZED VIEW` is NOT supported for snapshot views (no
+    // CvDef is stored); the engine correctly rejects it.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
@@ -153,14 +157,38 @@ async fn create_materialized_view_without_basin_continuous_is_rejected() {
         .await
         .unwrap();
 
-    let err = sess
+    // CREATE MATERIALIZED VIEW without basin.continuous succeeds (snapshot path).
+    let res = sess
         .execute("CREATE MATERIALIZED VIEW mv AS SELECT id FROM events")
+        .await
+        .unwrap();
+    match res {
+        ExecResult::Empty { tag } => assert_eq!(tag, "CREATE MATERIALIZED VIEW"),
+        other => panic!("expected Empty{{tag}}, got: {other:?}"),
+    }
+
+    // The snapshot rows are immediately queryable.
+    let res = sess
+        .execute("SELECT id FROM mv ORDER BY id")
+        .await
+        .unwrap();
+    let batches = match res {
+        ExecResult::Rows { batches, .. } => batches,
+        other => panic!("expected Rows, got: {other:?}"),
+    };
+    assert_eq!(col_i64(&batches, "id"), vec![1, 2, 3]);
+
+    // REFRESH MATERIALIZED VIEW is rejected for snapshot views because no
+    // CvDef (continuous-aggregate definition) was stored — the engine has no
+    // source query to re-execute automatically.
+    let err = sess
+        .execute("REFRESH MATERIALIZED VIEW mv")
         .await
         .unwrap_err();
     let msg = format!("{err}").to_ascii_lowercase();
     assert!(
-        msg.contains("basin.continuous") || msg.contains("continuous"),
-        "expected an error mentioning the basin.continuous requirement, got: {err}"
+        msg.contains("not a continuous aggregate") || msg.contains("continuous"),
+        "expected REFRESH to reject snapshot view, got: {err}"
     );
 }
 
