@@ -486,10 +486,10 @@ functions dispatch identically.
 
 ---
 
-### T-028 — Realtime: WebSocket multiplex transport ✅ unblocked
+### T-028 — Realtime: WebSocket multiplex transport ✅ done
 
-**Status:** ready 2026-05-20. **Depends on T-025** (shares event-parsing +
-backoff helpers). Engine route `GET /realtime/v1/ws/:project`.
+**Status:** done 2026-05-20. `WsConnection` ships in `src/realtime/ws.ts`;
+6 tests green. Engine route `GET /realtime/v1/ws/:project`.
 
 **Files:** `src/realtime/ws.ts` (new), `src/realtime/ws.test.ts` (new)
 
