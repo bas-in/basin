@@ -1488,10 +1488,15 @@ planning input that upstream cannot see. Closes `order_by_multi`,
       Acceptance gate: `window_partition_sum` + `lag_lead_window` plans
       drop the `SortExec` step when sort-matching is detected, verified
       by `EXPLAIN ANALYZE`.
-- [ ] **5.14.D4** Multi-sort + catalog-aware WindowExec differential —
+- [x] **5.14.D4** Multi-sort + catalog-aware WindowExec differential —
       assert identical results vs the today-baseline plan. Files:
       `tests/integration/tests/catalog_window.rs`. Acceptance gate: 0
       differential rows on the relevant 88-shape battery slice.
+      Shipped `2ce0e7c` (test bundled with docs commit); test green:
+      `order_by_multi` 50 rows, `window_partition_sum` 250 rows,
+      `lag_lead_window` 50 rows — all identical baseline/D2/D3;
+      D2 `compactions_with_adaptive_sort = 1`; D3 SortExec elision
+      confirmed for `lag_lead_window`.
 
 **Acceptance gate (composite):** `order_by_multi` ≥2× faster after
 compaction; `window_partition_sum` + `lag_lead_window` drop their
