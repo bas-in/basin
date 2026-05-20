@@ -1272,7 +1272,7 @@ for Basin — sketches are catalog-layer state, not query-engine state.
 Closes `count_distinct` and `percentile_cont` gaps via an
 approximation alternative. Sketches merge across files at query time.
 
-- [ ] **5.14.B1** Hoist HLL and t-digest types to a new `basin-sketch`
+- [x] **5.14.B1** Hoist HLL and t-digest types to a new `basin-sketch`
       crate, then add `hll_sketches: BTreeMap<String, Vec<u8>>` and
       `tdigest_sketches: BTreeMap<String, Vec<u8>>` to `DataFileRef`
       (mirroring the bloom field pattern).  **Locked decision
@@ -1291,6 +1291,7 @@ approximation alternative. Sketches merge across files at query time.
       basin-sketch), `crates/basin-engine/src/approx_percentile.rs`
       (same).  Acceptance gate: round-trip serialise/deserialise via
       InMemory + Postgres impls; existing UDF unit tests still pass.
+      Shipped `d7b96c4`.
 - [x] **5.14.B2** Writer-side sketch computation (shipped `696cadb`).  `WriteOptions::
       sketch_columns: Vec<String>` (defaults to `global_sort_order`,
       consistent with `bloom_columns`); writer's
