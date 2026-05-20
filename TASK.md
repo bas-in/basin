@@ -1770,9 +1770,14 @@ truth, this list is the human-readable summary.
   (#82, commit `dae8765`); data-modifying CTEs shipped (commit `6056dca`);
   `WITH RECURSIVE … INSERT INTO target SELECT * FROM cte` now supported via
   `exec_recursive_with_dml_body` (regression test `cte_recursive_feeding_insert`
-  green). UPDATE/DELETE with a recursive source remain deferred (explicit
-  `FeatureNotSupported` error).
-- [ ] Advanced window frames (`RANGE INTERVAL` / `GROUPS` / `EXCLUDE`).
+  green). UPDATE and DELETE with a recursive source now supported: CTEs are
+  materialized as MemTables via DataFusion then the DML runs against the
+  MemTable (regression tests `cte_recursive_feeding_delete` and
+  `cte_recursive_feeding_update` added to `set_ops_ctes.rs`).
+- [x] Advanced window frames — `RANGE BETWEEN INTERVAL '…' PRECEDING / FOLLOWING` now supported
+  natively via DataFusion 53 type-coercion (no pre-parse rewrite needed); regression test
+  `range_interval_5min_preceding_sum` added to `tests/integration/tests/window_fns.rs` (22
+  tests, all green). `GROUPS` and `EXCLUDE` frame variants still pending.
 - [ ] `EXCLUDE USING gist` — not on roadmap (geo-index dependency).
 
 **Live coverage:** see [`docs/sql-support.md`](./docs/sql-support.md) for the

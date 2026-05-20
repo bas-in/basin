@@ -99,6 +99,20 @@
 //! as `alice=*` keep working as a fallback: the binary stacks the JWT
 //! resolver in front of the static one, so dev clients and JWT clients
 //! coexist on the same listener.
+//!
+//! ## Feature flags (ADR 0018)
+//!
+//! Optional subsystems are Cargo-feature-gated so a self-hoster can build a
+//! minimal pgwire-only binary:
+//!
+//! ```text
+//! cargo build -p basin-server                               # default (auth+rest+webhooks)
+//! cargo build -p basin-server --no-default-features         # minimal pgwire-only
+//! cargo build -p basin-server --all-features                # kitchen-sink
+//! ```
+//!
+//! Gates live only at registration boundaries in this file; library crates
+//! remain feature-clean.
 
 // mimalloc as the global allocator. Allocator-heavy hot paths in basin-server
 // (Parquet decode in basin-storage::reader, Arrow batch construction in
@@ -108,6 +122,8 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+// ADR 0018: engine_auth_store is only compiled when the `auth` feature is on.
+#[cfg(feature = "auth")]
 mod engine_auth_store;
 
 use std::net::SocketAddr;
@@ -119,9 +135,13 @@ use basin_common::{
     telemetry::{init, LogFormat},
     ProjectId,
 };
+// Base resolver types always needed (pgwire core).
+use basin_router::{ProjectResolver, ServerConfig, StaticProjectResolver, TlsConfig};
+// Auth-gated resolver types — only available when `auth` (and by extension
+// `basin-auth`) is compiled in.
+#[cfg(feature = "auth")]
 use basin_router::{
-    ApiKeyProjectResolver, JwtProjectResolver, ProjectCredentialsResolver, ProjectResolver,
-    ServerConfig, StackedProjectResolver, StaticProjectResolver, TlsConfig,
+    ApiKeyProjectResolver, JwtProjectResolver, ProjectCredentialsResolver, StackedProjectResolver,
 };
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
@@ -138,8 +158,6 @@ async fn main() -> Result<()> {
         projects = cfg.projects.len(),
         shard_enabled = cfg.shard_enabled,
         pool_enabled = cfg.pool_enabled,
-        auth_enabled = cfg.auth_enabled,
-        rest_enabled = cfg.rest_enabled,
         "starting basin-server"
     );
 
@@ -298,7 +316,7 @@ async fn main() -> Result<()> {
         static_resolver = static_resolver.with_entry(user, project);
     }
 
-    // --- optional auth service (built before the router) --------------------
+    // --- optional auth service (ADR 0018: `auth` feature) -------------------
     //
     // With `EngineAuthStore`, basin-auth no longer needs an outbound TCP
     // connection back to our own pgwire listener. We can build the full
@@ -310,6 +328,10 @@ async fn main() -> Result<()> {
     // `AuthService::connect` (the old outbound-TCP path). The pgwire listener
     // is started before the connect in that case to keep the loopback option
     // available, but for most deployments the in-process path is preferred.
+    //
+    // When compiled without the `auth` feature (minimal build), this entire
+    // block is elided — no basin-auth dependency at link time.
+    #[cfg(feature = "auth")]
     let auth_service: Option<Arc<basin_auth::AuthService>> = if cfg.auth_enabled {
         let auth_cfg = basin_auth::AuthConfig::from_env()
             .context("BASIN_AUTH_ENABLED=1 but AuthConfig::from_env failed")?;
@@ -347,12 +369,18 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    // In the minimal build (no `auth` feature), auth_service is a typed
+    // placeholder so downstream code that uses `if let Some(ref auth) = auth_service`
+    // compiles away cleanly.
+    #[cfg(not(feature = "auth"))]
+    let auth_service: Option<std::convert::Infallible> = None;
 
     // Migrate legacy pgwire credentials to the new self-routing format.
     // This is safe to run on every startup — `list_legacy_credentials`
     // returns an empty list once all rows have been rotated, so subsequent
     // runs are instant no-ops. Failures warn but do not abort startup:
     // old-format credentials remain valid during the transition window.
+    #[cfg(feature = "auth")]
     if let Some(ref auth) = auth_service {
         match auth.migrate_legacy_credentials().await {
             Ok(n) if n > 0 => tracing::info!(
@@ -370,6 +398,8 @@ async fn main() -> Result<()> {
     // Build the resolver stack. When auth is enabled we have a live
     // AuthService right now (no deferred slot needed), so we wire up the
     // full JWT + API-key + credentials + static stack immediately.
+    // In the minimal build (no `auth` feature), only the static resolver is used.
+    #[cfg(feature = "auth")]
     let project_resolver: Arc<dyn ProjectResolver> = if let Some(ref auth) = auth_service {
         tracing::info!("pgwire resolver: credentials + JWT + API-key + static");
         Arc::new(StackedProjectResolver::new(vec![
@@ -380,6 +410,11 @@ async fn main() -> Result<()> {
         ]))
     } else {
         tracing::info!("pgwire resolver: static (auth disabled)");
+        Arc::new(static_resolver)
+    };
+    #[cfg(not(feature = "auth"))]
+    let project_resolver: Arc<dyn ProjectResolver> = {
+        tracing::info!("pgwire resolver: static (auth feature not compiled)");
         Arc::new(static_resolver)
     };
 
@@ -428,12 +463,19 @@ async fn main() -> Result<()> {
         .context("basin-router bind failed")?;
     tracing::info!(bind = %router.local_addr, "pgwire listener is accept-ready");
 
-    // --- optional REST listener --------------------------------------------
+    // --- optional REST listener (ADR 0018: `rest` feature) ------------------
     //
     // Per ADR 0006: REST requires AUTH. We refuse to bring up the HTTP
     // listener without an `AuthService` — that combination is the largest
     // data-leak class in this stack.
+    //
+    // The `rest` feature implies `auth` in Cargo.toml, so `auth_service` is
+    // always `Option<Arc<AuthService>>` (never Infallible) when `rest` is on.
+    #[cfg(feature = "rest")]
     let mut rest_handle: Option<basin_rest::RunningRest> = None;
+    #[cfg(not(feature = "rest"))]
+    let mut rest_handle: Option<std::convert::Infallible> = None;
+    #[cfg(feature = "rest")]
     if cfg.rest_enabled {
         let auth = auth_service.clone().ok_or_else(|| {
             anyhow!("BASIN_REST_ENABLED=1 requires BASIN_AUTH_ENABLED=1 (per ADR 0006)")
@@ -522,12 +564,16 @@ async fn main() -> Result<()> {
     // Tear down REST first so requests in flight don't survive past the
     // router; then the eviction loop; then router; then shard / WAL. The
     // shard / WAL ordering is unchanged from before this PR.
+    #[cfg(feature = "rest")]
     if let Some(rest) = rest_handle.take() {
         tracing::info!("stopping basin-rest");
         let _ = rest.shutdown.send(());
         // Awaiting the join tells us the accept loop actually exited.
         let _ = rest.join.await;
     }
+    #[cfg(not(feature = "rest"))]
+    drop(rest_handle);
+
     if let Some(h) = eviction_handle.take() {
         tracing::info!("stopping basin-pool eviction loop");
         h.shutdown().await;
@@ -546,7 +592,7 @@ async fn main() -> Result<()> {
 
     // `auth_service` is dropped at the end of `main` — its `Arc` is the only
     // lifeline, so nothing to do explicitly.
-    drop(auth_service);
+    drop(auth_service); // no-op in minimal build (Option<Infallible>)
 
     router_result.map_err(|e| anyhow!("router exited: {e}"))?;
     Ok(())
@@ -558,8 +604,12 @@ struct Cfg {
     wal_dir: PathBuf,
     shard_enabled: bool,
     pool_enabled: bool,
+    // ADR 0018: auth/rest fields compiled away in minimal build.
+    #[cfg(feature = "auth")]
     auth_enabled: bool,
+    #[cfg(feature = "rest")]
     rest_enabled: bool,
+    #[cfg(feature = "rest")]
     rest_bind: SocketAddr,
     projects: Vec<(String, ProjectId)>,
     catalog: CatalogBackend,
@@ -591,8 +641,11 @@ impl Cfg {
             .unwrap_or_else(|_| data_dir.join("wal"));
         let shard_enabled = bool_env("BASIN_SHARD_ENABLED");
         let pool_enabled = bool_env("BASIN_POOL_ENABLED");
+        #[cfg(feature = "auth")]
         let auth_enabled = bool_env("BASIN_AUTH_ENABLED");
+        #[cfg(feature = "rest")]
         let rest_enabled = bool_env("BASIN_REST_ENABLED");
+        #[cfg(feature = "rest")]
         let rest_bind: SocketAddr = std::env::var("BASIN_REST_BIND")
             .unwrap_or_else(|_| "127.0.0.1:5434".to_string())
             .parse()
@@ -626,8 +679,11 @@ impl Cfg {
             wal_dir,
             shard_enabled,
             pool_enabled,
+            #[cfg(feature = "auth")]
             auth_enabled,
+            #[cfg(feature = "rest")]
             rest_enabled,
+            #[cfg(feature = "rest")]
             rest_bind,
             projects,
             catalog,

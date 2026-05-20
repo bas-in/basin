@@ -11,14 +11,27 @@ name = "basin-server"
 path = "src/main.rs"
 
 [features]
-# ADR 0018: optional subsystem gates.
-# `realtime` is the first fully-optional subsystem — not in the default build
-# so the default `cargo build` is byte-equivalent to before this crate existed.
-default    = []
-realtime   = ["dep:basin-realtime"]
+# ADR 0018: subsystem feature gates.
+#
+# default = full SaaS happy path (auth + REST + webhooks).
+# minimal = pgwire + engine + storage + catalog + WAL only; no HTTP, no auth.
+#
+# Tested CI matrix:
+#   cargo build -p basin-server                               (default)
+#   cargo build -p basin-server --no-default-features         (minimal)
+#   cargo build -p basin-server --all-features                (kitchen-sink)
+default   = ["auth", "rest", "webhooks"]
+minimal   = []
+auth      = ["dep:basin-auth"]
+rest      = ["dep:basin-rest", "auth"]
+webhooks  = ["dep:basin-webhooks"]
+realtime  = ["dep:basin-realtime"]
+# placeholder — scaffolded now; underlying engine feature ships in 5.11.J
+# "basin-engine/wasm" is omitted until the engine exports that feature.
+wasm-udf  = []
 # Enable basin-auth's conformance test runner so the #[cfg(test)] block in
 # engine_auth_store.rs can call `basin_auth::store::conformance::*`.
-test-utils = ["basin-auth/test-utils"]
+test-utils = ["dep:basin-auth", "basin-auth/test-utils"]
 
 [dependencies]
 basin-common.workspace = true
@@ -29,8 +42,9 @@ basin-router.workspace = true
 basin-shard.workspace = true
 basin-wal.workspace = true
 basin-pool.workspace = true
-basin-auth.workspace = true
-basin-rest.workspace = true
+basin-auth     = { workspace = true, optional = true }
+basin-rest     = { workspace = true, optional = true }
+basin-webhooks = { workspace = true, optional = true }
 basin-realtime = { workspace = true, optional = true }
 
 tokio.workspace = true
