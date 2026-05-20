@@ -874,14 +874,14 @@ can land in parallel. Critical path: R1 → R2 → (R3 || R4) → R7.
 
 #### 5.11.R7 — Differential harness + soak test (~1 week)
 
-- [ ] Differential: every shape in `change_event_smoke` runs three
+- [x] Differential: every shape in `change_event_smoke` runs three
       ways — no realtime, SSE subscriber, WS subscriber. Asserts the
       events delivered match the engine-emitted events exactly.
-- [ ] Soak: 1-hour run, 100 tenants × 10 connections each, mixed
+- [x] Soak: 1-hour run, 100 tenants × 10 connections each, mixed
       INSERT/UPDATE/DELETE workload. Asserts no memory growth, no
       dropped events under quota, durable replay catches
       over-quota drops.
-- [ ] Files: `tests/integration/tests/realtime_differential.rs`,
+- [x] Files: `tests/integration/tests/realtime_differential.rs`,
       `tests/integration/tests/realtime_soak.rs`.
 
 #### 5.11.R8 — basin-js client SDK channel API (~3-5 days)
