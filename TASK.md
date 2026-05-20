@@ -368,7 +368,7 @@ this OSS roadmap.
       Anonymous sessions return `NULL` / `'anon'` matching Supabase behaviour.
       **Shipped. Supabase-compatible session functions. Both `auth.uid()` and
       `auth_uid()` spellings work.**
-- [ ] **Conformance tests** — against `EngineAuthStore` and `PostgresAuthStore`
+- [x] **Conformance tests** (shipped `bca0a2b`; 4 new conformance functions in `basin-auth::store::conformance`; shared runner via `test-utils` feature flag; PostgresAuthStore graceful-skip when `BASIN_AUTH_TEST_POSTGRES_URL` unset; bug-fixes in `engine_auth_store.rs` for Vortex/UUID + alphabetical column order + StringViewArray) — against `EngineAuthStore` and `PostgresAuthStore`
       (skip PG if unavailable): user uniqueness per project, cross-project same
       email, single-use tokens, refresh rotation, API key lifecycle,
       self-routing credential parsing.
@@ -759,23 +759,23 @@ public seam; engine doesn't change.
 Implementation broken into file-scope-disjoint sub-tasks so multiple
 can land in parallel. Critical path: R1 → R2 → (R3 || R4) → R7.
 
-#### 5.11.R1 — Crate skeleton + trait wiring (~1 week)
+#### 5.11.R1 — Crate skeleton + trait wiring (~1 week) ✅ shipped (`4c10663`)
 
-- [ ] New `crates/basin-realtime/` with `Cargo.toml`, `src/lib.rs`,
+- [x] New `crates/basin-realtime/` with `Cargo.toml`, `src/lib.rs`,
       module stubs (`sse`, `ws`, `presence`, `filter`, `budget`).
       Workspace `Cargo.toml` `[workspace.members]` adds the crate.
-- [ ] `RealtimeSink` struct implementing `ChangeEventSink`
+- [x] `RealtimeSink` struct implementing `ChangeEventSink`
       (post-commit). Attaches via `Engine::attach_post_commit_sink`
       from `services/basin-server` behind the `realtime` Cargo
       feature (ADR 0018).
-- [ ] Per-project ring buffer (`tokio::sync::broadcast` or a custom
-      bounded channel keyed by `(project, table)`).
-- [ ] Replay cursor that consumes the existing webhook retry log
+- [x] Per-project ring buffer (`DashMap<ChannelKey, broadcast::Sender>`
+      keyed by `(project, table)`; capacity 1024 events default).
+- [x] Replay cursor that consumes the existing webhook retry log
       (5.11.I) for catch-up after a client reconnect — same
       durable-log source for both webhooks and realtime.
-- [ ] Acceptance gate: empty crate compiles; `RealtimeSink` attaches;
+- [x] Acceptance gate green: empty crate compiles; `RealtimeSink` attaches;
       a synthetic `ChangeEvent` published by the engine appears on
-      the in-memory broadcast channel.
+      the in-memory broadcast channel. 5/5 unit tests pass.
 
 #### 5.11.R2 — SSE adapter (~2-3 weeks)
 
