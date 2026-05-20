@@ -278,14 +278,39 @@ naming doesn't churn.
 
 | Command (eventual) | Blocked on |
 |---|---|
-| `basin realtime subscribe <table>` | engine `LISTEN`/`NOTIFY` — `🚫` on the capabilities matrix (no pub/sub today) |
-| `basin functions deploy / serve / list / delete` | cloud Phase 8 (V8 edge functions, "8–12 weeks once unblocked") |
+| `basin functions deploy / serve` | cloud Phase 8 (V8 edge functions, "8–12 weeks once unblocked"). NOTE: **`basin rpc <fn>` invoke is now unblocked** — see "Realtime & RPC" below — only deploy/serve of *new* function bodies waits on V8. |
 | `basin storage buckets list/create/upload/download` | object-storage product distinct from BYO-bucket-for-Parquet; not on cloud roadmap |
-| `basin tx begin / commit / rollback` (interactive) | engine transactions are `◻️ planned`, single-shard when shipped |
-| `basin restore --as-of=<timestamp>` | engine PITR cross-DML rollback is v0.2 work |
+| `basin tx begin / commit / rollback` (interactive) | engine single-shard transactions **shipped** (BEGIN/COMMIT/ROLLBACK + SAVEPOINT); interactive multi-statement REPL session is the only remaining CLI scaffolding |
+| `basin restore --as-of=<timestamp>` | engine PITR cross-DML rollback is v0.2 work (catalog-level rollback shipped; physical-file GC pending) |
 
 Tracked: TASKS.md Tier 23 — design-only, no implementation until the
 blocker clears.
+
+---
+
+## Realtime & RPC — P0 (engine shipped 2026-05-20)
+
+The engine landed a complete realtime stack (basin 5.11.R1–R7) and the
+RPC mount (5.11.L). The earlier "no pub/sub today" caveat is **obsolete** —
+these are now P0 (backend exists, only CLI work needed).
+
+- `basin realtime subscribe <table> [--project=<ref>]` — stream live
+  `INSERT/UPDATE/DELETE` events for a table to stdout (JSON-lines, one
+  event per line; `--json` is implicit). Backed by SSE
+  `GET /realtime/v1/sse/:project/:table` with `Authorization: Bearer`.
+  15s heartbeats keep the connection alive; `--since=<seq>` replays via
+  the `Last-Event-Id` header. Ctrl-C closes cleanly.
+- `basin realtime subscribe --multi <t1>,<t2>,…` — multiplex several
+  tables over one WebSocket (`GET /realtime/v1/ws/:project`); each event
+  line is tagged with its table. Optional `--filter="NEW.status='paid'"`
+  pushes the predicate server-side.
+- `basin rpc <fn> [--arg k=v …] [--json-body @file]` — invoke a
+  user-defined `LANGUAGE sql`/`LANGUAGE wasm` function via
+  `POST /rest/v1/rpc/:fn`. Prints the scalar result, or a JSON array for
+  `RETURNS TABLE`. The daily-driver replacement for "run a one-off SQL
+  helper."
+
+Tracked: TASKS.md Tier 26 — Realtime & RPC.
 
 ---
 

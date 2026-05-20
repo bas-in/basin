@@ -343,11 +343,11 @@ Plan-gated on the cloud side; CLI surface still useful.
 until the backing capability ships. Listed here so the eventual
 naming doesn't get bike-shed-revisited mid-Phase-X.
 
-- [ ] `cmd_realtime.go` — `subscribe <table>` over websocket. Blocked on engine `LISTEN`/`NOTIFY` (`🚫` in `basin/CAPABILITIES.md`).
-- [ ] `cmd_functions.go` — `deploy/serve/list/delete` for edge functions. Blocked on cloud Phase 8 (V8 edge functions).
+- [x] ~~`cmd_realtime.go` — blocked on engine pub/sub~~ **UNBLOCKED 2026-05-20** — engine shipped realtime (basin 5.11.R1–R7). Promoted to **Tier 26**.
+- [ ] `cmd_functions.go` — `deploy/serve` for edge functions. Blocked on cloud Phase 8 (V8). NOTE: `rpc <fn>` *invoke* is unblocked (5.11.L) → **Tier 26**.
 - [ ] `cmd_storage_buckets.go` — `list/create/upload/download` for object storage as a product (distinct from BYO-bucket-for-Parquet). Not on the cloud roadmap.
-- [ ] `cmd_tx.go` — interactive `begin/commit/rollback`. Blocked on engine transactions (`◻️ planned`, single-shard when shipped).
-- [ ] `cmd_restore_pitr.go` — `restore --as-of=<timestamp>`. Blocked on engine PITR cross-DML rollback (v0.2 work).
+- [ ] `cmd_tx.go` — interactive `begin/commit/rollback`. Engine single-shard transactions **shipped** (BEGIN/COMMIT/ROLLBACK + SAVEPOINT); only the interactive REPL-session scaffolding remains.
+- [ ] `cmd_restore_pitr.go` — `restore --as-of=<timestamp>`. Blocked on engine PITR cross-DML physical-GC (catalog-level rollback shipped; GC is v0.2).
 
 ---
 
@@ -380,4 +380,63 @@ Drift-control for the docs as the surface fans out.
 - [ ] **`docs/` directory** — per-area markdown explainers (`docs/db-workflow.md`, `docs/branches.md`, `docs/types.md`, …). Cross-linked from `README.md`. Each one ends with a "tests covering this surface" pointer.
 - [ ] **Changelog discipline.** Every tier completion adds a `CHANGELOG.md` entry under `## Unreleased`. Tags flush `Unreleased` into a dated section.
 - [ ] **`basin docs <cmd>`** — opens `https://docs.basin.run/cli/<cmd>` in the default browser (no `os/exec` of `open`/`xdg-open` mismatch — go via `runtime.GOOS` dispatch). Tests: each OS branch returns the expected command name.
+
+---
+
+## Tier 26 — Realtime & RPC (P0, engine shipped 2026-05-20)
+
+Engine landed the full realtime stack (basin 5.11.R1–R7) and the RPC mount
+(5.11.L). These are P0: backend exists, only CLI work needed. Stdlib-only
+Go — SSE is a plain `http.Get` + `bufio.Scanner` line reader; WS needs a
+minimal RFC-6455 client (stdlib `net` + `crypto/sha1` handshake, no deps),
+OR gate the WS subcommand behind a single vetted `golang.org/x/net/websocket`
+import if the decisions.md no-deps rule permits it — **decide and record in
+`decisions.md` first.** Each task is sized for one Sonnet agent.
+
+- [ ] **T26.1 — `cmd_realtime.go` SSE single-table subscribe.** New file
+  `cmd_realtime.go` + `cmd_realtime_test.go`. `basin realtime subscribe
+  <table> [--project=<ref>] [--since=<seq>]`. Opens
+  `GET /realtime/v1/sse/:project/:table` with `Authorization: Bearer
+  <token>`, reads the SSE stream with `bufio.Scanner`, parses each `data:`
+  line as JSON, prints one compact JSON event per line to stdout. Skips
+  heartbeat/comment frames. `--since` sets the `Last-Event-Id` header.
+  Ctrl-C (SIGINT) closes the response body and exits 0. **Acceptance:**
+  `httptest.Server` streaming 3 `data:` frames + 1 heartbeat → 3 JSON lines
+  on stdout, exit 0 on context-cancel; arg-parse error path tested.
+- [ ] **T26.2 — RFC-6455 minimal WS client (or vetted dep decision).**
+  New `internal/ws/ws.go` + test. A tiny client: HTTP Upgrade handshake
+  (`Sec-WebSocket-Key`/`Accept` via `crypto/sha1`+base64), text-frame
+  read/write, masking, ping/pong, close. OR — if `decisions.md` approves —
+  thin wrapper over `x/net/websocket`. **Acceptance:** round-trips text
+  frames against a `httptest.Server` that upgrades and echoes; ping →
+  pong; close handshake clean. This unblocks T26.3.
+- [ ] **T26.3 — `realtime subscribe --multi` over WebSocket.** Depends on
+  T26.2. `basin realtime subscribe --multi <t1>,<t2>,… [--filter=<expr>]`.
+  Opens `GET /realtime/v1/ws/:project`, sends
+  `{"type":"subscribe","table":"<t>"[,"filter":"<expr>"]}` per table, waits
+  for `{"type":"subscribed"}` acks, then prints each `{"type":"event",…}`
+  as a table-tagged JSON line. Handles `{"type":"error","code":"lag"}` by
+  printing a stderr warning. **Acceptance:** stub WS server acks two
+  subscribes, emits interleaved events → two-table tagged output; lag frame
+  → stderr warning, stdout uninterrupted.
+- [ ] **T26.4 — `cmd_rpc.go` invoke user functions.** New `cmd_rpc.go` +
+  test. `basin rpc <fn> [--arg k=v …] [--body @file.json]`. POSTs to
+  `POST /rest/v1/rpc/:fn` with a JSON object assembled from `--arg`
+  key=value pairs (typed: ints/bools/strings inferred) or the raw
+  `--body` file. Prints the scalar result bare, or a JSON array for
+  `RETURNS TABLE`. Honours `--json`. **Acceptance:** stub returns `7` for
+  `add x=3 y=4` → prints `7`; stub returns a row array → pretty JSON array;
+  401 → typed `APIError`; missing fn-name arg → parse error.
+- [ ] **T26.5 — `commands()` dispatch + README + man wiring.** Register
+  `realtime` and `rpc` in the `commands()` table, add them to the
+  `integration_test.go` drive-through, add two README example one-liners,
+  and a `CHANGELOG.md` Unreleased entry. **Acceptance:** `basin realtime
+  --help` and `basin rpc --help` produce non-empty man pages; integration
+  test drives both with a stub; `go test -race ./...` green.
+
+> Inbound webhooks (`POST /in/:project/:name`, basin 5.11.N) are a
+> *cloud-managed* registration surface, not a CLI verb — the CLI's role is
+> at most `basin webhooks inbound list/create` under the existing
+> `cmd_webhooks.go`. Tracked as a follow-on once 5.11.N's catalog shape
+> stabilises; not part of Tier 26.
 
