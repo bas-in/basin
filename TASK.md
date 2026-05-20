@@ -1158,26 +1158,14 @@ content. Pin by git tag for versioned docs per OSS release.
 Eight items, ordered for incremental shipping. Items 5.15.A–5.15.D land in
 this OSS repo; 5.15.E–5.15.I land in `basin-cloud` (separate repo).
 
-- [ ] **5.15.A** Frontmatter spec — define the YAML schema OSS markdown
-      files use (`title`, `nav_section`, `sidebar_position`, `summary`,
-      optional `version_since` and `version_until`). Files:
-      `docs/frontmatter-spec.md` (new) + cross-reference in
-      `docs/decisions/README.md`. Acceptance gate: schema documented;
-      one ADR-eligible decision recorded ("why YAML frontmatter, not
-      MDX or sidecar TOML").
-- [x] **5.15.B** Migrate existing Basin OSS docs to the frontmatter
-      spec. Files: `docs/architecture.md`, `docs/deployment.md`,
-      `docs/multi-project.md`, `docs/sql-compatibility.md`,
-      `docs/sql-support.md`, `docs/scaling/*.md`, every ADR in
-      `docs/decisions/*.md`. Acceptance gate: every `.md` under
-      `docs/` parses with the spec; one CI check enforces it on every
-      PR (`scripts/check-frontmatter.sh` or similar).
-- [ ] **5.15.C** Top-level docs index — `docs/README.md` becomes the
-      OSS-repo-internal navigation manifest, ordered by `nav_section` +
-      `sidebar_position`. Used both by GitHub's directory rendering
-      (humans browsing the OSS repo) and by basin-cloud's fetcher.
-      Acceptance gate: every `.md` referenced; clicking any link works
-      from `https://github.com/basin/basin/blob/main/docs/README.md`.
+- [x] **5.15.A** Frontmatter spec (shipped `a3f7a26`; ADR 0021 records
+      the YAML-vs-MDX-vs-TOML rationale; spec + ADR + README cross-ref).
+- [x] **5.15.B** Migrate existing Basin OSS docs to the frontmatter spec
+      (shipped `f9cf57a`; 35+ docs migrated; `scripts/check-frontmatter.sh`
+      + `docs-frontmatter` CI job enforces on every PR).
+- [x] **5.15.C** Top-level docs index (shipped `2ce0e7c`; 38 docs across
+      8 nav_sections; `scripts/build-docs-index.sh` + Python helper
+      regenerates from frontmatter; `docs-index` CI job blocks drift).
 - [ ] **5.15.D** Stub repository skeletons for `basin-js` and
       `basin-cli` — even before either ships code, set up their
       `docs/` folder with placeholder frontmatter so basin-cloud's
