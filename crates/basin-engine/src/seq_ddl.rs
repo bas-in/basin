@@ -982,6 +982,106 @@ fn bool_from_node(arg: Option<&pg_query::protobuf::Node>) -> Option<bool> {
     }
 }
 
+// ==========================================================================
+// ALTER SEQUENCE — AST-based matcher (ADR 0014 Phase 5.13.B migration 7)
+// ==========================================================================
+
+/// AST-based matcher for `ALTER SEQUENCE [IF EXISTS] <name> [opt …]`.
+///
+/// libpg_query routes this as [`pg_query::protobuf::AlterSeqStmt`].
+/// The option layout is the same `DefElem` node list used by
+/// [`match_create_sequence_ast`] with the addition of `"restart"` (which
+/// encodes `RESTART [WITH n]`).  When the `restart` DefElem has no `arg`
+/// node, `RESTART` was written without an explicit value; we encode that
+/// as `i64::MIN` — the same sentinel that the textual
+/// [`match_alter_sequence`] uses, and that [`exec_alter_sequence`]
+/// recognises as "restart at the sequence's original START value".
+pub(crate) fn match_alter_sequence_ast(
+    stmt: &pg_query::protobuf::AlterSeqStmt,
+) -> Result<AlterSequenceIntent> {
+    use pg_query::NodeEnum;
+
+    let seq_rel = stmt.sequence.as_ref().ok_or_else(|| {
+        BasinError::InvalidSchema("ALTER SEQUENCE: missing sequence relation in AST".into())
+    })?;
+    if seq_rel.relname.is_empty() {
+        return Err(BasinError::InvalidSchema(
+            "ALTER SEQUENCE: empty sequence name".into(),
+        ));
+    }
+    let name = seq_rel.relname.clone();
+    let if_exists = stmt.missing_ok;
+
+    let mut options: Vec<SequenceOption> = Vec::new();
+    for node in &stmt.options {
+        let Some(NodeEnum::DefElem(de)) = node.node.as_ref() else {
+            continue;
+        };
+        let arg_node = de.arg.as_deref();
+        match de.defname.as_str() {
+            "start" => {
+                let n = int_from_node(arg_node, "START")?;
+                options.push(SequenceOption::Start(n));
+            }
+            "restart" => {
+                // `RESTART [WITH n]` — arg is Some(Integer(n)) when a value
+                // was given; None when bare `RESTART` (restart at original
+                // START). Encode the no-value form as the i64::MIN sentinel.
+                let n = match arg_node {
+                    Some(arg) => int_from_node(Some(arg), "RESTART")?,
+                    None => i64::MIN,
+                };
+                options.push(SequenceOption::Start(n));
+            }
+            "increment" => {
+                let n = int_from_node(arg_node, "INCREMENT")?;
+                options.push(SequenceOption::Increment(n));
+            }
+            "minvalue" => {
+                if let Some(arg) = arg_node {
+                    let n = int_from_node(Some(arg), "MINVALUE")?;
+                    options.push(SequenceOption::MinValue(Some(n)));
+                } else {
+                    // `NO MINVALUE` is represented as a DefElem with no arg.
+                    options.push(SequenceOption::MinValue(None));
+                }
+            }
+            "maxvalue" => {
+                if let Some(arg) = arg_node {
+                    let n = int_from_node(Some(arg), "MAXVALUE")?;
+                    options.push(SequenceOption::MaxValue(Some(n)));
+                } else {
+                    options.push(SequenceOption::MaxValue(None));
+                }
+            }
+            "cache" => {
+                let n = int_from_node(arg_node, "CACHE")?;
+                options.push(SequenceOption::Cache(n));
+            }
+            "cycle" => {
+                // boolval=true → CYCLE; boolval=false → NO CYCLE.
+                let cycles = bool_from_node(arg_node).unwrap_or(false);
+                let no = !cycles; // SequenceOption::Cycle(no=true) = NO CYCLE
+                options.push(SequenceOption::Cycle(no));
+            }
+            // "owned_by" — `OWNED BY table.col` — accepted and silently
+            // ignored (v0.1 has no column-ownership concept).
+            "owned_by" => {}
+            other => {
+                return Err(BasinError::InvalidSchema(format!(
+                    "ALTER SEQUENCE: unrecognised option {other:?} in AST"
+                )));
+            }
+        }
+    }
+
+    Ok(AlterSequenceIntent {
+        if_exists,
+        name,
+        options,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1303,5 +1403,57 @@ mod tests {
         };
         let intent = match_create_sequence_ast(css).unwrap().unwrap();
         assert_eq!(intent.options, vec![SequenceOption::Increment(-1)]);
+    }
+
+    #[test]
+    fn ast_match_alter_sequence_restart_with_value() {
+        use pg_query::NodeEnum;
+        let r = pg_query::parse("ALTER SEQUENCE myseq RESTART WITH 42").unwrap();
+        let stmt = r.protobuf.stmts.first().unwrap().stmt.as_ref().unwrap();
+        let NodeEnum::AlterSeqStmt(ref ass) = stmt.node.as_ref().unwrap() else {
+            panic!("expected AlterSeqStmt");
+        };
+        let intent = match_alter_sequence_ast(ass).unwrap();
+        assert_eq!(intent.name, "myseq");
+        assert!(!intent.if_exists);
+        assert_eq!(intent.options, vec![SequenceOption::Start(42)]);
+    }
+
+    #[test]
+    fn ast_match_alter_sequence_restart_no_value() {
+        use pg_query::NodeEnum;
+        let r = pg_query::parse("ALTER SEQUENCE myseq RESTART").unwrap();
+        let stmt = r.protobuf.stmts.first().unwrap().stmt.as_ref().unwrap();
+        let NodeEnum::AlterSeqStmt(ref ass) = stmt.node.as_ref().unwrap() else {
+            panic!("expected AlterSeqStmt");
+        };
+        let intent = match_alter_sequence_ast(ass).unwrap();
+        assert_eq!(intent.name, "myseq");
+        // Bare RESTART encodes as i64::MIN sentinel.
+        assert_eq!(intent.options, vec![SequenceOption::Start(i64::MIN)]);
+    }
+
+    #[test]
+    fn ast_match_alter_sequence_if_exists_multi_opts() {
+        use pg_query::NodeEnum;
+        let r = pg_query::parse(
+            "ALTER SEQUENCE IF EXISTS myseq INCREMENT BY 2 MAXVALUE 1000 NO CYCLE",
+        )
+        .unwrap();
+        let stmt = r.protobuf.stmts.first().unwrap().stmt.as_ref().unwrap();
+        let NodeEnum::AlterSeqStmt(ref ass) = stmt.node.as_ref().unwrap() else {
+            panic!("expected AlterSeqStmt");
+        };
+        let intent = match_alter_sequence_ast(ass).unwrap();
+        assert_eq!(intent.name, "myseq");
+        assert!(intent.if_exists);
+        assert_eq!(
+            intent.options,
+            vec![
+                SequenceOption::Increment(2),
+                SequenceOption::MaxValue(Some(1000)),
+                SequenceOption::Cycle(true), // NO CYCLE → no=true
+            ]
+        );
     }
 }

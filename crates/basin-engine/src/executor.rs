@@ -463,6 +463,16 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                 }
             }
 
+            // Migration 7: ALTER SEQUENCE [IF EXISTS] <name> [opt …]
+            if matches!(kind, crate::pg_ast::StmtKind::AlterSequence) {
+                if let Some(node) = tree.stmts().next() {
+                    if let Some(pg_query::NodeEnum::AlterSeqStmt(ref ass)) = node.node {
+                        let intent = crate::seq_ddl::match_alter_sequence_ast(ass)?;
+                        return crate::seq_ddl::exec_alter_sequence(sess, intent).await;
+                    }
+                }
+            }
+
             if let Some(result) = crate::noop_accept::try_accept_as_noop(kind, sql) {
                 return Ok(result);
             }

@@ -73,6 +73,7 @@ pub enum StmtKind {
     DropProcedure,
     // Sequence DDL
     CreateSequence,
+    AlterSequence,
     DropSequence,
     // Policy DDL
     CreatePolicy,
@@ -178,6 +179,7 @@ impl StmtKind {
             StmtKind::Call => "CALL",
             StmtKind::DropProcedure => "DROP PROCEDURE",
             StmtKind::CreateSequence => "CREATE SEQUENCE",
+            StmtKind::AlterSequence => "ALTER SEQUENCE",
             StmtKind::DropSequence => "DROP SEQUENCE",
             StmtKind::CreatePolicy => "CREATE POLICY",
             StmtKind::DropPolicy => "DROP POLICY",
@@ -405,6 +407,7 @@ pub fn stmt_kind(node: &Node) -> StmtKind {
         NodeEnum::CallStmt(_) => StmtKind::Call,
 
         NodeEnum::CreateSeqStmt(_) => StmtKind::CreateSequence,
+        NodeEnum::AlterSeqStmt(_) => StmtKind::AlterSequence,
 
         NodeEnum::CreatePolicyStmt(_) => StmtKind::CreatePolicy,
 
