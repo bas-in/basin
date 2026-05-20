@@ -415,6 +415,109 @@ async fn cte_recursive_feeding_insert() {
     );
 }
 
+/// `WITH RECURSIVE … DELETE FROM t WHERE id IN (SELECT id FROM cte)` —
+/// recursive CTE feeding a DELETE statement.
+///
+/// Basin materialises the recursive CTE as a MemTable, then runs the DELETE
+/// whose WHERE subquery references that MemTable.  Only the rows whose ids
+/// appear in the CTE result are deleted; the rest survive.
+#[tokio::test]
+async fn cte_recursive_feeding_delete() {
+    let dir = TempDir::new().unwrap();
+    let engine = engine_in(&dir);
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
+
+    s.execute("CREATE TABLE items (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    s.execute("INSERT INTO items VALUES (1),(2),(3),(4),(5),(6),(7)")
+        .await
+        .unwrap();
+
+    // Recursive CTE generates ids 1..=4; delete those rows.
+    let sql = "
+        WITH RECURSIVE to_delete(id) AS (
+            SELECT 1 AS id
+            UNION ALL
+            SELECT id + 1 FROM to_delete WHERE id < 4
+        )
+        DELETE FROM items WHERE id IN (SELECT id FROM to_delete)
+    ";
+    s.execute(sql)
+        .await
+        .expect("WITH RECURSIVE feeding DELETE must succeed");
+
+    // Ids 5, 6, 7 should remain.
+    let res = s
+        .execute("SELECT id FROM items ORDER BY id")
+        .await
+        .expect("SELECT after recursive DELETE");
+    let rows = collect_i64_sorted(res);
+    assert_eq!(
+        rows,
+        vec![5, 6, 7],
+        "recursive CTE DELETE must leave ids 5..=7: got {rows:?}"
+    );
+}
+
+/// `WITH RECURSIVE … UPDATE t SET flag=true WHERE id IN (SELECT id FROM cte)`
+/// — recursive CTE feeding an UPDATE statement.
+///
+/// Basin materialises the recursive CTE as a MemTable, then runs the UPDATE
+/// whose WHERE subquery references that MemTable.  Only the matching rows are
+/// updated; others are left unchanged.
+#[tokio::test]
+async fn cte_recursive_feeding_update() {
+    let dir = TempDir::new().unwrap();
+    let engine = engine_in(&dir);
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
+
+    s.execute(
+        "CREATE TABLE nodes (id BIGINT NOT NULL, flagged BOOLEAN NOT NULL DEFAULT FALSE)",
+    )
+    .await
+    .unwrap();
+    s.execute("INSERT INTO nodes (id) VALUES (1),(2),(3),(4),(5),(6)")
+        .await
+        .unwrap();
+
+    // Recursive CTE generates ids 1..=3; update those rows to flagged = true.
+    let sql = "
+        WITH RECURSIVE to_flag(id) AS (
+            SELECT 1 AS id
+            UNION ALL
+            SELECT id + 1 FROM to_flag WHERE id < 3
+        )
+        UPDATE nodes SET flagged = true WHERE id IN (SELECT id FROM to_flag)
+    ";
+    s.execute(sql)
+        .await
+        .expect("WITH RECURSIVE feeding UPDATE must succeed");
+
+    // Ids 1..=3 must be flagged; 4..=6 must not.
+    let res = s
+        .execute("SELECT id FROM nodes WHERE flagged = true ORDER BY id")
+        .await
+        .expect("SELECT flagged rows after recursive UPDATE");
+    let flagged = collect_i64_sorted(res);
+    assert_eq!(
+        flagged,
+        vec![1, 2, 3],
+        "recursive CTE UPDATE must flag ids 1..=3: got {flagged:?}"
+    );
+
+    let res2 = s
+        .execute("SELECT id FROM nodes WHERE flagged = false ORDER BY id")
+        .await
+        .expect("SELECT unflagged rows after recursive UPDATE");
+    let unflagged = collect_i64_sorted(res2);
+    assert_eq!(
+        unflagged,
+        vec![4, 5, 6],
+        "recursive CTE UPDATE must leave ids 4..=6 unflagged: got {unflagged:?}"
+    );
+}
+
 /// `WITH name AS MATERIALIZED (…) SELECT …` — PG-15 materialization hint.
 ///
 /// Status: 🛠 — sqlparser-rs (0.52/0.53) rejects `AS MATERIALIZED` with a

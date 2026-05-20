@@ -5641,6 +5641,7 @@ async fn materialize_recursive_ctes(
     for cte in &with.cte_tables {
         let cte_name = cte.alias.name.value.clone();
         // Build: WITH RECURSIVE <name> AS (<body>) SELECT * FROM <name>
+        // DataFusion natively expands recursive CTEs in SELECT context.
         let expand_sql = format!(
             "WITH RECURSIVE {name} AS ({body}) SELECT * FROM {name}",
             name = cte_name,
@@ -5651,27 +5652,40 @@ async fn materialize_recursive_ctes(
                 "WITH RECURSIVE: failed to plan CTE {cte_name:?}: {e}"
             ))
         })?;
+        // Capture the logical schema BEFORE consuming `df` with collect().
+        // This is the authoritative schema from the plan, which we use for
+        // the MemTable so that plan-level type info is preserved.
+        let plan_schema: datafusion::arrow::datatypes::SchemaRef =
+            df.schema().as_arrow().clone().into();
         let df_batches = df.collect().await.map_err(|e| {
             BasinError::internal(format!(
                 "WITH RECURSIVE: failed to execute CTE {cte_name:?}: {e}"
             ))
         })?;
 
-        let df_schema = if df_batches.is_empty() {
-            sess.ctx
-                .sql(&expand_sql)
-                .await
-                .map_err(|e| BasinError::internal(format!("schema re-plan: {e}")))?
-                .schema()
-                .as_arrow()
-                .clone()
-                .into()
-        } else {
-            df_batches[0].schema()
-        };
+        // Re-cast every batch to use `plan_schema` so that schema and batches
+        // agree on nullability / metadata and MemTable::try_new succeeds.
+        // `RecordBatch::with_schema` is cheap — it reuses the underlying
+        // column buffers, only wrapping them with a new schema reference.
+        let recast_batches: Vec<datafusion::arrow::record_batch::RecordBatch> = df_batches
+            .into_iter()
+            .map(|b| {
+                datafusion::arrow::record_batch::RecordBatch::try_new(
+                    plan_schema.clone(),
+                    b.columns().to_vec(),
+                )
+                .map_err(|e| {
+                    BasinError::internal(format!(
+                        "WITH RECURSIVE: recast batch for CTE {cte_name:?}: {e}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-        let provider = MemTable::try_new(df_schema, vec![df_batches])
-            .map_err(|e| BasinError::internal(format!("MemTable for CTE {cte_name:?}: {e}")))?;
+        let provider =
+            MemTable::try_new(plan_schema.clone(), vec![recast_batches]).map_err(|e| {
+                BasinError::internal(format!("MemTable for CTE {cte_name:?}: {e}"))
+            })?;
 
         let _ = sess.ctx.deregister_table(&cte_name);
         sess.ctx
