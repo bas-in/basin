@@ -2911,4 +2911,122 @@ mod tests {
             "unseen project must return None"
         );
     }
+
+    // ── Advanced window frames (v0.1 gap) ────────────────────────────────────
+
+    /// RANGE BETWEEN INTERVAL '5 days' PRECEDING AND CURRENT ROW
+    ///
+    /// DataFusion 53 supports this natively: the interval bound is stored as
+    /// `ScalarValue::Utf8("5 days")` and coerced to
+    /// `Interval(MonthDayNano)` by the type-coercion analyser when the ORDER BY
+    /// column is a timestamp. This test pins the behaviour end-to-end.
+    ///
+    /// Table layout (ts column, day offsets from 2024-01-01):
+    ///   row 0: 2024-01-01  (day 0)
+    ///   row 1: 2024-01-03  (day 2)
+    ///   row 2: 2024-01-05  (day 4)
+    ///   row 3: 2024-01-08  (day 7)
+    ///   row 4: 2024-01-15  (day 14)
+    ///
+    /// For RANGE BETWEEN INTERVAL '5 days' PRECEDING AND CURRENT ROW,
+    /// the window for each row includes all rows with ts >= current_ts - 5 days:
+    ///   row 0 (Jan 01): window = [Jan 01]             → count = 1
+    ///   row 1 (Jan 03): window = [Jan 01, Jan 03]     → count = 2
+    ///   row 2 (Jan 05): window = [Jan 01..Jan 05]     → count = 3
+    ///   row 3 (Jan 08): window = [Jan 03..Jan 08]     → count = 3
+    ///   row 4 (Jan 15): window = [Jan 15]             → count = 1
+    #[tokio::test]
+    async fn window_range_interval_preceding() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+        sess.execute("CREATE TABLE events (id BIGINT NOT NULL, ts TIMESTAMPTZ NOT NULL)")
+            .await
+            .unwrap();
+        sess.execute(
+            "INSERT INTO events VALUES \
+             (1, '2024-01-01T00:00:00Z'), \
+             (2, '2024-01-03T00:00:00Z'), \
+             (3, '2024-01-05T00:00:00Z'), \
+             (4, '2024-01-08T00:00:00Z'), \
+             (5, '2024-01-15T00:00:00Z')",
+        )
+        .await
+        .unwrap();
+
+        let res = sess
+            .execute(
+                "SELECT id, COUNT(*) OVER (\
+                   ORDER BY ts \
+                   RANGE BETWEEN INTERVAL '5 days' PRECEDING AND CURRENT ROW\
+                 ) AS cnt \
+                 FROM events \
+                 ORDER BY id",
+            )
+            .await
+            .unwrap();
+
+        let (ids, counts) = match res {
+            ExecResult::Rows { batches, .. } => (col_i64(&batches, "id"), col_i64(&batches, "cnt")),
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert_eq!(ids, vec![1, 2, 3, 4, 5], "ids");
+        assert_eq!(counts, vec![1, 2, 3, 3, 1], "window counts (5-day sliding)");
+    }
+
+    /// GROUPS n PRECEDING frame type
+    ///
+    /// GROUPS counts peer groups (ties in the ORDER BY) rather than individual
+    /// rows. DataFusion 53 supports this natively via `WindowFrameStateGroups`.
+    ///
+    /// Table layout (score column):
+    ///   rows: scores 10, 10, 20, 20, 30
+    ///
+    /// With ORDER BY score GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW:
+    ///   score=10 peer group: window covers group(0)=[10,10]         → sum = 20
+    ///   score=10 peer group: same window                            → sum = 20
+    ///   score=20 peer group: window covers groups(0,1)=[10,10,20,20] → sum = 60
+    ///   score=20 peer group: same window                            → sum = 60
+    ///   score=30 peer group: window covers groups(1,2)=[20,20,30]  → sum = 70
+    #[tokio::test]
+    async fn window_groups_preceding() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+        sess.execute("CREATE TABLE scores (id BIGINT NOT NULL, score BIGINT NOT NULL)")
+            .await
+            .unwrap();
+        sess.execute(
+            "INSERT INTO scores VALUES (1, 10), (2, 10), (3, 20), (4, 20), (5, 30)",
+        )
+        .await
+        .unwrap();
+
+        let res = sess
+            .execute(
+                "SELECT id, SUM(score) OVER (\
+                   ORDER BY score \
+                   GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW\
+                 ) AS running_sum \
+                 FROM scores \
+                 ORDER BY id",
+            )
+            .await
+            .unwrap();
+
+        let (ids, sums) = match res {
+            ExecResult::Rows { batches, .. } => (
+                col_i64(&batches, "id"),
+                col_i64(&batches, "running_sum"),
+            ),
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert_eq!(ids, vec![1, 2, 3, 4, 5], "ids");
+        // score=10 (both rows): only group 0 (10+10=20) since 1 PRECEDING from group 0 = group 0
+        // score=20 (both rows): groups 0+1 = (10+10+20+20=60)
+        // score=30: groups 1+2 = (20+20+30=70)
+        assert_eq!(sums, vec![20, 20, 60, 60, 70], "GROUPS 1 PRECEDING sums");
+    }
 }

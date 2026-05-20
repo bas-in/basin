@@ -235,3 +235,110 @@ async fn table_function_in_from() {
         }
     }
 }
+
+// ─── test 6: correlated LATERAL with ORDER BY + LIMIT (window-function rewrite) ─
+
+/// `SELECT t.id, sub.score FROM t LEFT JOIN LATERAL (SELECT score FROM scores
+/// WHERE scores.t_id = t.id ORDER BY score DESC LIMIT 1) sub ON true`
+///
+/// Each outer row t gets the **single highest score** from the `scores` table
+/// that matches its FK.  Parent rows with no matching scores should return NULL
+/// for `sub.score` (LEFT JOIN).
+///
+/// Previously this shape hit DataFusion's correlated-subquery limitation.
+/// Basin now rewrites it via `ROW_NUMBER() OVER (PARTITION BY t_id ORDER BY
+/// score DESC)` so the execution is pure SQL without any correlated physical
+/// operator.
+///
+/// This test previously *failed* with a DataFusion planning error; it now passes
+/// as proof of the `rewrite_lateral_order_limit` rewriter.
+#[tokio::test]
+async fn lateral_order_by_limit_window_rewrite() {
+    let (_dir, engine) = open_engine().await;
+    let sess = open_session(&engine).await;
+
+    exec_ok(&sess, "CREATE TABLE t (id INT NOT NULL)").await;
+    exec_ok(&sess, "CREATE TABLE scores (t_id INT NOT NULL, score INT NOT NULL)").await;
+    exec_ok(&sess, "INSERT INTO t VALUES (1), (2), (3)").await;
+    // t=1 has two scores (10, 20); t=2 has one score (5); t=3 has none.
+    exec_ok(
+        &sess,
+        "INSERT INTO scores VALUES (1, 10), (1, 20), (2, 5)",
+    )
+    .await;
+
+    // Ask for the highest score per parent (LEFT JOIN preserves t=3 with NULL).
+    let batches = exec_ok(
+        &sess,
+        "SELECT t.id, sub.score \
+         FROM t \
+         LEFT JOIN LATERAL (\
+           SELECT score FROM scores WHERE scores.t_id = t.id ORDER BY score DESC LIMIT 1\
+         ) sub ON true \
+         ORDER BY t.id",
+    )
+    .await;
+
+    // Must return 3 rows: one per outer row (LEFT JOIN).
+    assert_eq!(
+        total_rows(&batches),
+        3,
+        "LEFT JOIN LATERAL ORDER BY LIMIT must return one row per outer row"
+    );
+
+    // t=1 → score=20 (top), t=2 → score=5, t=3 → NULL (no match).
+    if let Some(batch) = batches.first() {
+        // Column 1 = sub.score
+        let score_col = batch.column(1);
+        if let Some(arr) = score_col.as_any().downcast_ref::<Int64Array>() {
+            // Row 0: t.id=1, score=20 (highest)
+            assert!(!arr.is_null(0), "t=1 must have a score");
+            assert_eq!(arr.value(0), 20, "t=1 must have score=20 (highest)");
+            // Row 1: t.id=2, score=5
+            assert!(!arr.is_null(1), "t=2 must have a score");
+            assert_eq!(arr.value(1), 5, "t=2 must have score=5");
+            // Row 2: t.id=3, no matching score → NULL
+            assert!(arr.is_null(2), "t=3 must have NULL score (no match)");
+        }
+    }
+}
+
+// ─── test 7: comma-LATERAL with ORDER BY + LIMIT (inner join semantics) ───────
+
+/// `SELECT t.id, sub.score FROM t, LATERAL (SELECT score FROM scores
+/// WHERE scores.t_id = t.id ORDER BY score DESC LIMIT 1) sub`
+///
+/// Same as test 6 but using comma-LATERAL (CROSS JOIN / INNER JOIN semantics).
+/// Outer rows with no matching child rows are *excluded* (inner join).
+#[tokio::test]
+async fn lateral_order_by_limit_comma_join() {
+    let (_dir, engine) = open_engine().await;
+    let sess = open_session(&engine).await;
+
+    exec_ok(&sess, "CREATE TABLE t (id INT NOT NULL)").await;
+    exec_ok(&sess, "CREATE TABLE scores (t_id INT NOT NULL, score INT NOT NULL)").await;
+    exec_ok(&sess, "INSERT INTO t VALUES (1), (2), (3)").await;
+    // t=1 has two scores; t=2 has one; t=3 has none.
+    exec_ok(
+        &sess,
+        "INSERT INTO scores VALUES (1, 10), (1, 20), (2, 5)",
+    )
+    .await;
+
+    let batches = exec_ok(
+        &sess,
+        "SELECT t.id, sub.score \
+         FROM t, LATERAL (\
+           SELECT score FROM scores WHERE scores.t_id = t.id ORDER BY score DESC LIMIT 1\
+         ) sub \
+         ORDER BY t.id",
+    )
+    .await;
+
+    // Only t=1 and t=2 have matches; t=3 is excluded (inner join semantics).
+    assert_eq!(
+        total_rows(&batches),
+        2,
+        "comma-LATERAL ORDER BY LIMIT must exclude outer rows with no match"
+    );
+}

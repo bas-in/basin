@@ -456,4 +456,41 @@ mod tests {
             "modifier should be outside: {out}"
         );
     }
+
+    // ── Advanced window frames — pass-through verification ───────────────────
+    //
+    // RANGE INTERVAL and GROUPS frames are handled natively by DataFusion 53's
+    // SQL planner (WindowFrame::try_from + coerce_window_frame in the type-
+    // coercion analyser). The rewrite pipeline does not need to touch these
+    // forms; these tests pin that the pre-parse rewriter leaves them alone.
+
+    #[test]
+    fn range_interval_passes_through_unchanged() {
+        let sql = "SELECT COUNT(*) OVER (ORDER BY ts RANGE BETWEEN INTERVAL '5 days' PRECEDING AND CURRENT ROW) FROM t";
+        assert_eq!(
+            rewrite_ignore_nulls_in_args(sql),
+            sql,
+            "RANGE INTERVAL frame must not be modified by the null-treatment rewriter"
+        );
+    }
+
+    #[test]
+    fn groups_frame_passes_through_unchanged() {
+        let sql = "SELECT SUM(v) OVER (ORDER BY g GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t";
+        assert_eq!(
+            rewrite_ignore_nulls_in_args(sql),
+            sql,
+            "GROUPS frame must not be modified by the null-treatment rewriter"
+        );
+    }
+
+    #[test]
+    fn range_interval_following_passes_through_unchanged() {
+        let sql = "SELECT AVG(v) OVER (ORDER BY ts RANGE BETWEEN CURRENT ROW AND INTERVAL '3 days' FOLLOWING) FROM t";
+        assert_eq!(
+            rewrite_ignore_nulls_in_args(sql),
+            sql,
+            "RANGE INTERVAL FOLLOWING frame must not be modified"
+        );
+    }
 }

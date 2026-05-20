@@ -1,16 +1,9 @@
----
-title: "Basin SQL support matrix (auto-generated)"
-nav_section: reference
-sidebar_position: 10
-summary: "Auto-generated per-syntax matrix from sql_support_matrix integration tests. Regenerated nightly."
----
-
 # Basin SQL support — auto-generated matrix
 
 Run `cargo test -p basin-integration-tests --test sql_support_matrix` to refresh.
 
-Last run: 1779059902 (Unix epoch)
-SQL fragments tested: 697 total / 1905 green (across all three configurations).
+Last run: 1779279210 (Unix epoch)
+SQL fragments tested: 697 total / 1884 green (across all three configurations).
 
 ## Configurations
 
@@ -222,8 +215,8 @@ SQL fragments tested: 697 total / 1905 green (across all three configurations).
 | `SELECT CAST(1 AS TEXT)` | ✅ | ✅ | ✅ |  |
 | `SELECT 'a' \|\| 'b'` | ✅ | ✅ | ✅ |  |
 | `SELECT 'abc' LIKE 'a%'` | ✅ | ✅ | ✅ |  |
-| `SELECT CASE id WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END FROM t` | ✅ | ✅ | ✅ |  |
-| `SELECT id, CASE WHEN id < 0 THEN 'neg' WHEN id = 0 THEN 'zero' ELSE 'pos' END FROM t` | ✅ | ✅ | ✅ |  |
+| `SELECT CASE id WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END FROM t` | 📜 | 📜 | 📜 | internal: execute: Execution error: CASE expr WHEN form is not yet supported,… |
+| `SELECT id, CASE WHEN id < 0 THEN 'neg' WHEN id = 0 THEN 'zero' ELSE 'pos' END FROM t` | 🛠 | 🛠 | 🛠 | internal: execute: Arrow error: Schema error: Unable to get field named "CASE… |
 | `SELECT 1::BIGINT + 2::BIGINT` | ✅ | ✅ | ✅ |  |
 | `SELECT '2024-01-01'::DATE` | ✅ | ✅ | ✅ |  |
 | `SELECT '12:00:00'::TIME` | ✅ | ✅ | ✅ |  |
@@ -240,8 +233,8 @@ SQL fragments tested: 697 total / 1905 green (across all three configurations).
 | `SELECT false IS NOT FALSE` | ✅ | ✅ | ✅ |  |
 | `SELECT NULL::bool IS UNKNOWN` | ✅ | ✅ | ✅ |  |
 | `SELECT NULL::bool IS NOT UNKNOWN` | ✅ | ✅ | ✅ |  |
-| `SELECT 1 IS DISTINCT FROM 2` | ✅ | ✅ | ✅ |  |
-| `SELECT 1 IS NOT DISTINCT FROM 1` | ✅ | ✅ | ✅ |  |
+| `SELECT 1 IS DISTINCT FROM 2` | 🛠 | 🛠 | 🛠 | internal: execute: Optimizer rule 'optimize_projections' failed caused by Che… |
+| `SELECT 1 IS NOT DISTINCT FROM 1` | 🛠 | 🛠 | 🛠 | internal: execute: Optimizer rule 'optimize_projections' failed caused by Che… |
 | `SELECT ROW(1, NULL) IS NULL` | ✅ | ✅ | ✅ |  |
 
 ## FullTextSearch
@@ -521,8 +514,8 @@ SQL fragments tested: 697 total / 1905 green (across all three configurations).
 
 | SQL | Default | +PG\_QUERY | +PG\_PLAN | Notes |
 |---|---|---|---|---|
-| `SELECT 1 IS DISTINCT FROM 2` | ✅ | ✅ | ✅ |  |
-| `SELECT 1 IS NOT DISTINCT FROM 1` | ✅ | ✅ | ✅ |  |
+| `SELECT 1 IS DISTINCT FROM 2` | 🛠 | 🛠 | 🛠 | internal: execute: Optimizer rule 'optimize_projections' failed caused by Che… |
+| `SELECT 1 IS NOT DISTINCT FROM 1` | 🛠 | 🛠 | 🛠 | internal: execute: Optimizer rule 'optimize_projections' failed caused by Che… |
 | `SELECT * FROM t WHERE id IS NULL` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM t WHERE id IS NOT NULL` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM t WHERE id BETWEEN 1 AND 10` | ✅ | ✅ | ✅ |  |
@@ -700,7 +693,7 @@ SQL fragments tested: 697 total / 1905 green (across all three configurations).
 | `SELECT * FROM t` | ✅ | ✅ | ✅ |  |
 | `SELECT id, name FROM t` | ✅ | ✅ | ✅ |  |
 | `SELECT t.id FROM t` | ✅ | ✅ | ✅ |  |
-| `SELECT id AS x FROM t` | ✅ | ✅ | ✅ |  |
+| `SELECT id AS x FROM t` | 🛠 | 🛠 | 🛠 | internal: fast_select: computed expr on non-numeric column id (Int32); use Da… |
 | `SELECT DISTINCT id FROM t` | ✅ | ✅ | ✅ |  |
 | `SELECT DISTINCT ON (id) id, name FROM t ORDER BY id, name` | ✅ | ✅ | ✅ |  |
 | `SELECT * FROM t WHERE id = 1` | ✅ | ✅ | ✅ |  |

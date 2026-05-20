@@ -919,6 +919,194 @@ fn read_dollar_quoted_or_string(s: &str) -> Result<(String, &str)> {
     )))
 }
 
+// ==========================================================================
+// CREATE PROCEDURE — AST-based matcher (ADR 0014 Phase 5.13.B migration 10)
+// ==========================================================================
+
+/// AST-based matcher for `CREATE PROCEDURE <name>(<args>) LANGUAGE sql AS $$ <body> $$`.
+///
+/// libpg_query routes `CREATE PROCEDURE` as
+/// [`pg_query::protobuf::CreateFunctionStmt`] with `is_procedure = true`.
+/// The procedure name lives in `funcname` as a list of String nodes;
+/// parameters are `FunctionParameter` nodes; the body and language come
+/// from `options` as `DefElem` nodes with defname `"as"` and `"language"`.
+///
+/// Returns `(name, args, body)` on success, or `Err` for unsupported forms
+/// (OR REPLACE, non-sql language, unnamed args, RETURNS clause).
+pub(crate) fn match_create_procedure_ast(
+    stmt: &pg_query::protobuf::CreateFunctionStmt,
+) -> Result<(String, Vec<SqlFunctionArg>, String)> {
+    if stmt.replace {
+        return Err(BasinError::InvalidSchema(
+            "CREATE OR REPLACE PROCEDURE is not supported in v0.1; \
+             DROP PROCEDURE first then re-create"
+                .into(),
+        ));
+    }
+
+    // Extract the bare procedure name (last part for schema-qualified forms).
+    let name = stmt
+        .funcname
+        .last()
+        .and_then(|n| n.node.as_ref())
+        .and_then(|n| {
+            if let pg_query::NodeEnum::String(s) = n {
+                Some(s.sval.clone())
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            BasinError::InvalidSchema("CREATE PROCEDURE: could not extract name from AST".into())
+        })?;
+    if name.is_empty() {
+        return Err(BasinError::InvalidSchema(
+            "CREATE PROCEDURE: empty procedure name in AST".into(),
+        ));
+    }
+
+    // RETURNS clause is not allowed on procedures.
+    if stmt.return_type.is_some() {
+        return Err(BasinError::InvalidSchema(format!(
+            "CREATE PROCEDURE {name}: RETURNS is not valid for procedures \
+             (use CREATE FUNCTION for scalar functions)"
+        )));
+    }
+
+    // Convert FunctionParameter nodes → SqlFunctionArg.
+    let mut args: Vec<SqlFunctionArg> = Vec::with_capacity(stmt.parameters.len());
+    for (idx, param_node) in stmt.parameters.iter().enumerate() {
+        let Some(pg_query::NodeEnum::FunctionParameter(fp)) = &param_node.node else {
+            continue;
+        };
+        if fp.name.is_empty() {
+            return Err(BasinError::InvalidSchema(format!(
+                "CREATE PROCEDURE {name}: argument #{idx} is unnamed; \
+                 all arguments must be named in v0.1"
+            )));
+        }
+        let type_name = fp
+            .arg_type
+            .as_ref()
+            .ok_or_else(|| {
+                BasinError::InvalidSchema(format!(
+                    "CREATE PROCEDURE {name}: argument {:?} has no type in AST",
+                    fp.name
+                ))
+            })?;
+        let dt = type_name_to_arg(type_name, &name, &fp.name)?;
+        args.push(SqlFunctionArg {
+            name: fp.name.clone(),
+            data_type: dt,
+        });
+    }
+
+    // Extract language and body from options.
+    let mut language: Option<String> = None;
+    let mut body: Option<String> = None;
+    for opt_node in &stmt.options {
+        let Some(pg_query::NodeEnum::DefElem(de)) = &opt_node.node else {
+            continue;
+        };
+        match de.defname.as_str() {
+            "language" => {
+                if let Some(arg) = de.arg.as_deref() {
+                    if let Some(pg_query::NodeEnum::String(s)) = &arg.node {
+                        language = Some(s.sval.clone());
+                    }
+                }
+            }
+            "as" => {
+                // The body is a List with one String item (the dollar-quoted body).
+                if let Some(arg) = de.arg.as_deref() {
+                    if let Some(pg_query::NodeEnum::List(lst)) = &arg.node {
+                        if let Some(first) = lst.items.first() {
+                            if let Some(pg_query::NodeEnum::String(s)) = &first.node {
+                                body = Some(s.sval.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            // Other options (SECURITY DEFINER, SET …) are not supported.
+            other => {
+                return Err(BasinError::InvalidSchema(format!(
+                    "CREATE PROCEDURE {name}: unsupported option {other:?} in v0.1"
+                )));
+            }
+        }
+    }
+
+    let lang = language.ok_or_else(|| {
+        BasinError::InvalidSchema(format!(
+            "CREATE PROCEDURE {name}: LANGUAGE clause is required"
+        ))
+    })?;
+    if !lang.eq_ignore_ascii_case("sql") {
+        return Err(BasinError::InvalidSchema(format!(
+            "CREATE PROCEDURE {name}: only LANGUAGE sql is supported in v0.1 \
+             (got LANGUAGE {lang:?}); SQLSTATE 0A000 feature_not_supported"
+        )));
+    }
+    let body = body.ok_or_else(|| {
+        BasinError::InvalidSchema(format!(
+            "CREATE PROCEDURE {name}: AS $$ … $$ body is required"
+        ))
+    })?;
+
+    Ok((name, args, body))
+}
+
+/// Map a pg_query `TypeName` (list of `String` nodes from the internal
+/// PostgreSQL type catalog) to a `SqlArgType`.
+///
+/// The type names follow PostgreSQL's internal naming convention:
+/// - `["pg_catalog", "int4"]` → `Int`
+/// - `["pg_catalog", "int8"]` → `BigInt`
+/// - `["text"]` or `["pg_catalog", "text"]` → `Text`
+/// - `["pg_catalog", "bool"]` → `Boolean`
+/// - `["pg_catalog", "float8"]` → `Double`
+/// - `["bytea"]` or `["pg_catalog", "bytea"]` → `Bytea`
+/// - `["date"]` or `["pg_catalog", "date"]` → `Date`
+/// - `["pg_catalog", "timestamp"]` → `Timestamp`
+/// - `["timestamptz"]` or `["pg_catalog", "timestamptz"]` → `TimestampTz`
+fn type_name_to_arg(
+    type_name: &pg_query::protobuf::TypeName,
+    proc_name: &str,
+    arg_name: &str,
+) -> Result<SqlArgType> {
+    // Collect the names list (String nodes).
+    let names: Vec<String> = type_name
+        .names
+        .iter()
+        .filter_map(|n| n.node.as_ref())
+        .filter_map(|n| {
+            if let pg_query::NodeEnum::String(s) = n {
+                Some(s.sval.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    // The last name is always the bare type name; pg_catalog is the schema.
+    let bare = names.last().map(|s| s.as_str()).unwrap_or("");
+    match bare {
+        "int4" => Ok(SqlArgType::Int),
+        "int8" => Ok(SqlArgType::BigInt),
+        "text" | "varchar" | "bpchar" => Ok(SqlArgType::Text),
+        "bool" => Ok(SqlArgType::Boolean),
+        "float8" | "float4" => Ok(SqlArgType::Double),
+        "bytea" => Ok(SqlArgType::Bytea),
+        "date" => Ok(SqlArgType::Date),
+        "timestamp" => Ok(SqlArgType::Timestamp),
+        "timestamptz" => Ok(SqlArgType::TimestampTz),
+        other => Err(BasinError::InvalidSchema(format!(
+            "CREATE PROCEDURE {proc_name}: unsupported arg type {other:?} \
+             for argument {arg_name:?}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

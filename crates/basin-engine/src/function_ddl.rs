@@ -310,6 +310,63 @@ pub(crate) fn match_alter_function_rename(sql: &str) -> Result<Option<(String, S
     Ok(Some((old_name, new_name)))
 }
 
+/// AST-based matcher for `ALTER FUNCTION <name>(<args>) RENAME TO <new>`.
+///
+/// libpg_query routes this as [`pg_query::protobuf::RenameStmt`] with
+/// `rename_type = ObjectFunction`.  The old function name lives in
+/// `object` as an `ObjectWithArgs` node; `newname` is the new name.
+///
+/// Returns `(old_name, new_name)`.  Only the bare (unqualified) function
+/// name is extracted; v0.1 does not support schema-qualified function names.
+pub(crate) fn match_alter_function_rename_ast(
+    stmt: &pg_query::protobuf::RenameStmt,
+) -> Result<(String, String)> {
+    // object = Box<Node> containing ObjectWithArgs
+    let owa = stmt
+        .object
+        .as_deref()
+        .and_then(|n| n.node.as_ref())
+        .and_then(|n| {
+            if let pg_query::NodeEnum::ObjectWithArgs(owa) = n {
+                Some(owa)
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            BasinError::InvalidSchema(
+                "ALTER FUNCTION RENAME: could not extract ObjectWithArgs from AST".into(),
+            )
+        })?;
+
+    // objname is a list of String nodes (schema-qualifiable).
+    // v0.1: take only the last part (the bare function name).
+    let old_name = owa
+        .objname
+        .last()
+        .and_then(|n| n.node.as_ref())
+        .and_then(|n| {
+            if let pg_query::NodeEnum::String(s) = n {
+                Some(s.sval.clone())
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            BasinError::InvalidSchema(
+                "ALTER FUNCTION RENAME: could not extract function name from AST".into(),
+            )
+        })?;
+
+    let new_name = stmt.newname.clone();
+    if old_name.is_empty() || new_name.is_empty() {
+        return Err(BasinError::InvalidSchema(
+            "ALTER FUNCTION RENAME: empty name in AST".into(),
+        ));
+    }
+    Ok((old_name, new_name))
+}
+
 /// Translate the sqlparser-parsed RETURNS clause into a `SqlReturnType`.
 /// `RETURNS TABLE(col type, ...)` parses as `DataType::Custom("TABLE", [c1, t1, c2, t2, ...])`
 /// (the modifiers are flat strings); anything else is treated as a scalar

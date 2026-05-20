@@ -254,6 +254,25 @@ pub(crate) fn match_alter_schema_rename(sql: &str) -> Option<(String, String)> {
     Some((old, new))
 }
 
+/// AST-based matcher for `ALTER SCHEMA <old> RENAME TO <new>`.
+///
+/// libpg_query routes this as
+/// [`pg_query::protobuf::RenameStmt`] with `rename_type = ObjectSchema`.
+/// The old name lives in the `subname` field (plain `String`); the new
+/// name is the `newname` field.  Returns `(old, new)` on success.
+pub(crate) fn match_alter_schema_rename_ast(
+    stmt: &pg_query::protobuf::RenameStmt,
+) -> Result<(String, String)> {
+    let old = stmt.subname.clone();
+    let new = stmt.newname.clone();
+    if old.is_empty() || new.is_empty() {
+        return Err(basin_common::BasinError::InvalidSchema(
+            "ALTER SCHEMA RENAME: empty name in AST".into(),
+        ));
+    }
+    Ok((old, new))
+}
+
 /// Execute `ALTER SCHEMA old RENAME TO new`.
 ///
 /// Validates that `old` exists, `new` does not, and neither is `"public"`.

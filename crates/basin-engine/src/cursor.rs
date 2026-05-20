@@ -343,3 +343,82 @@ pub(crate) fn match_move_sql(sql: &str) -> Option<MoveIntent> {
         None
     }
 }
+
+// ==========================================================================
+// MOVE — AST-based matcher (ADR 0014 Phase 5.13.B migration 11)
+// ==========================================================================
+
+/// AST-based matcher for `MOVE <direction> [FROM|IN] <cursor>`.
+///
+/// libpg_query routes MOVE as [`pg_query::protobuf::FetchStmt`] with
+/// `ismove = true`.  The direction and count are encoded as:
+///
+/// | SQL form                     | direction | how_many     |
+/// |------------------------------|-----------|--------------|
+/// | NEXT / FORWARD 1 / (bare)    | Forward   | 1            |
+/// | PRIOR / BACKWARD 1           | Backward  | 1            |
+/// | FIRST                        | Absolute  | 1            |
+/// | LAST                         | Absolute  | -1           |
+/// | ALL / FORWARD ALL            | Forward   | `i64::MAX`   |
+/// | BACKWARD ALL                 | Backward  | `i64::MAX`   |
+/// | n (plain count)              | Forward   | n            |
+/// | FORWARD n                    | Forward   | n            |
+/// | BACKWARD n                   | Backward  | n            |
+/// | ABSOLUTE n                   | Absolute  | n            |
+/// | RELATIVE n                   | Relative  | n            |
+///
+/// Returns a [`MoveIntent`] with the cursor name and the corresponding
+/// [`CursorDirection`].
+pub(crate) fn match_move_sql_ast(
+    stmt: &pg_query::protobuf::FetchStmt,
+) -> Result<MoveIntent> {
+    use pg_query::protobuf::FetchDirection;
+
+    let cursor_name = stmt.portalname.clone();
+    if cursor_name.is_empty() {
+        return Err(BasinError::internal(
+            "MOVE: missing cursor name in AST".to_string(),
+        ));
+    }
+
+    let direction = FetchDirection::try_from(stmt.direction).unwrap_or(FetchDirection::FetchForward);
+    let n = stmt.how_many;
+    let i64_max = i64::MAX;
+
+    let dir = match direction {
+        FetchDirection::FetchForward => {
+            if n == i64_max {
+                CursorDirection::ForwardAll
+            } else if n == 1 {
+                CursorDirection::Next
+            } else {
+                CursorDirection::Forward(Some(n))
+            }
+        }
+        FetchDirection::FetchBackward => {
+            if n == i64_max {
+                CursorDirection::BackwardAll
+            } else if n == 1 {
+                CursorDirection::Prior
+            } else {
+                CursorDirection::Backward(Some(n))
+            }
+        }
+        FetchDirection::FetchAbsolute => {
+            if n == 1 {
+                CursorDirection::First
+            } else if n == -1 {
+                CursorDirection::Last
+            } else {
+                CursorDirection::Absolute(n)
+            }
+        }
+        FetchDirection::FetchRelative => CursorDirection::Relative(n),
+        FetchDirection::Undefined => CursorDirection::Next,
+    };
+
+    Ok(MoveIntent {
+        cursor_name,
+        direction: dir,
+    })
+}

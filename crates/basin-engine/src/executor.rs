@@ -473,6 +473,64 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                 }
             }
 
+            // Migration 8: ALTER SCHEMA <old> RENAME TO <new>
+            if matches!(kind, crate::pg_ast::StmtKind::AlterSchemaRename) {
+                if let Some(node) = tree.stmts().next() {
+                    if let Some(pg_query::NodeEnum::RenameStmt(ref rs)) = node.node {
+                        let (old, new) =
+                            crate::schema_ddl::match_alter_schema_rename_ast(rs)?;
+                        return crate::schema_ddl::exec_alter_schema_rename(
+                            sess, &old, &new,
+                        )
+                        .await;
+                    }
+                }
+            }
+
+            // Migration 9: ALTER FUNCTION <name>(<args>) RENAME TO <new>
+            if matches!(kind, crate::pg_ast::StmtKind::AlterFunctionRename) {
+                if let Some(node) = tree.stmts().next() {
+                    if let Some(pg_query::NodeEnum::RenameStmt(ref rs)) = node.node {
+                        let (old, new) =
+                            crate::function_ddl::match_alter_function_rename_ast(rs)?;
+                        return crate::function_ddl::exec_alter_function_rename(
+                            sess, &old, &new,
+                        )
+                        .await;
+                    }
+                }
+            }
+
+            // Migration 10: CREATE PROCEDURE <name>(<args>) LANGUAGE sql AS $$ <body> $$
+            if matches!(kind, crate::pg_ast::StmtKind::CreateProcedure) {
+                if let Some(node) = tree.stmts().next() {
+                    if let Some(pg_query::NodeEnum::CreateFunctionStmt(ref cfs)) = node.node {
+                        if cfs.is_procedure {
+                            let (name, args, body) =
+                                crate::procedure_ddl::match_create_procedure_ast(cfs)?;
+                            return crate::procedure_ddl::exec_create_procedure(
+                                sess, &name, args, &body,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+
+            // Migration 11: MOVE <direction> [FROM|IN] <cursor>
+            // libpg_query routes MOVE as FetchStmt(ismove=true); the
+            // textual pre-screen below (match_move_sql) converts the
+            // synthetic FETCH form via sqlparser, which is now redundant
+            // for the common PG MOVE forms.
+            if matches!(kind, crate::pg_ast::StmtKind::Move) {
+                if let Some(node) = tree.stmts().next() {
+                    if let Some(pg_query::NodeEnum::FetchStmt(ref fs)) = node.node {
+                        let intent = crate::cursor::match_move_sql_ast(fs)?;
+                        return exec_cursor_move(sess, intent).await;
+                    }
+                }
+            }
+
             if let Some(result) = crate::noop_accept::try_accept_as_noop(kind, sql) {
                 return Ok(result);
             }

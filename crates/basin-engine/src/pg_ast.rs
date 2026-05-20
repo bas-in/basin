@@ -67,10 +67,18 @@ pub enum StmtKind {
     // Routine DDL
     CreateFunction,
     AlterFunction,
+    /// `ALTER FUNCTION <name>(<args>) RENAME TO <new>` — libpg_query
+    /// routes this as `RenameStmt(rename_type = ObjectFunction)`, distinct
+    /// from the other `AlterFunctionStmt` actions (OWNER TO, SET …, etc.).
+    AlterFunctionRename,
     DropFunction,
     CreateProcedure,
     Call,
     DropProcedure,
+    // Schema DDL (CREATE / DROP handled by sqlparser; RENAME pre-screened)
+    /// `ALTER SCHEMA <old> RENAME TO <new>` — libpg_query routes this as
+    /// `RenameStmt(rename_type = ObjectSchema)`.
+    AlterSchemaRename,
     // Sequence DDL
     CreateSequence,
     AlterSequence,
@@ -105,6 +113,9 @@ pub enum StmtKind {
     // Cursor lifecycle — real implementation in sibling agent (a193aadd)
     DeclareCursor,
     Fetch,
+    /// `MOVE <direction> [FROM|IN] <cursor>` — libpg_query routes this as
+    /// `FetchStmt(ismove = true)`, distinct from plain FETCH (`ismove = false`).
+    Move,
     Close,
     // Extension / trigger (syntactic-accept-only; see noop_accept.rs)
     CreateExtension,
@@ -174,10 +185,12 @@ impl StmtKind {
             StmtKind::DropMatView => "DROP MATERIALIZED VIEW",
             StmtKind::CreateFunction => "CREATE FUNCTION",
             StmtKind::AlterFunction => "ALTER FUNCTION",
+            StmtKind::AlterFunctionRename => "ALTER FUNCTION … RENAME TO",
             StmtKind::DropFunction => "DROP FUNCTION",
             StmtKind::CreateProcedure => "CREATE PROCEDURE",
             StmtKind::Call => "CALL",
             StmtKind::DropProcedure => "DROP PROCEDURE",
+            StmtKind::AlterSchemaRename => "ALTER SCHEMA … RENAME TO",
             StmtKind::CreateSequence => "CREATE SEQUENCE",
             StmtKind::AlterSequence => "ALTER SEQUENCE",
             StmtKind::DropSequence => "DROP SEQUENCE",
@@ -204,6 +217,7 @@ impl StmtKind {
             StmtKind::Deallocate => "DEALLOCATE",
             StmtKind::DeclareCursor => "DECLARE CURSOR",
             StmtKind::Fetch => "FETCH",
+            StmtKind::Move => "MOVE",
             StmtKind::Close => "CLOSE",
             StmtKind::CreateExtension => "CREATE EXTENSION",
             StmtKind::DropExtension => "DROP EXTENSION",
@@ -406,6 +420,19 @@ pub fn stmt_kind(node: &Node) -> StmtKind {
         NodeEnum::AlterFunctionStmt(_) => StmtKind::AlterFunction,
         NodeEnum::CallStmt(_) => StmtKind::Call,
 
+        // `ALTER FUNCTION … RENAME TO` and `ALTER SCHEMA … RENAME TO`
+        // both arrive as RenameStmt; the rename_type discriminates them.
+        NodeEnum::RenameStmt(s) => {
+            use pg_query::protobuf::ObjectType as O;
+            match O::try_from(s.rename_type) {
+                Ok(O::ObjectFunction) | Ok(O::ObjectProcedure) | Ok(O::ObjectRoutine) => {
+                    StmtKind::AlterFunctionRename
+                }
+                Ok(O::ObjectSchema) => StmtKind::AlterSchemaRename,
+                _ => StmtKind::Other,
+            }
+        }
+
         NodeEnum::CreateSeqStmt(_) => StmtKind::CreateSequence,
         NodeEnum::AlterSeqStmt(_) => StmtKind::AlterSequence,
 
@@ -448,7 +475,14 @@ pub fn stmt_kind(node: &Node) -> StmtKind {
         NodeEnum::ExecuteStmt(_) => StmtKind::Execute,
         NodeEnum::DeallocateStmt(_) => StmtKind::Deallocate,
         NodeEnum::DeclareCursorStmt(_) => StmtKind::DeclareCursor,
-        NodeEnum::FetchStmt(_) => StmtKind::Fetch,
+        NodeEnum::FetchStmt(s) => {
+            // MOVE and FETCH both arrive as FetchStmt; `ismove` discriminates.
+            if s.ismove {
+                StmtKind::Move
+            } else {
+                StmtKind::Fetch
+            }
+        }
         NodeEnum::ClosePortalStmt(_) => StmtKind::Close,
 
         NodeEnum::CreateExtensionStmt(_) => StmtKind::CreateExtension,

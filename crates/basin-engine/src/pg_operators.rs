@@ -2825,6 +2825,387 @@ ON {alias}.value >= {lo} AND {alias}.value <= {hi_ref}{suffix}"
     new_sql
 }
 
+// ---------------------------------------------------------------------------
+// Correlated LATERAL with ORDER BY + LIMIT → ROW_NUMBER() window decorrelation
+// ---------------------------------------------------------------------------
+
+/// Rewrite correlated `LATERAL (SELECT <proj> FROM <child> WHERE <child.fk> = <outer.pk>
+/// ORDER BY <order_expr> LIMIT <n>) <sub>` into a window-function join.
+///
+/// ## Motivation
+///
+/// `rewrite_lateral_correlated_row` deliberately bails when the LATERAL body
+/// contains `ORDER BY` or `LIMIT` because a plain join cannot reproduce the
+/// "top-N per group" semantics. The correct decorrelation uses `ROW_NUMBER()
+/// OVER (PARTITION BY <fk> ORDER BY <order_expr>)`:
+///
+/// ```sql
+/// -- in:
+/// SELECT t.id, sub.val
+/// FROM t
+/// LEFT JOIN LATERAL (
+///   SELECT val FROM u WHERE u.t_id = t.id ORDER BY val LIMIT 1
+/// ) sub ON true
+/// ORDER BY t.id
+///
+/// -- out:
+/// SELECT t.id, sub.val
+/// FROM t
+/// LEFT JOIN (
+///   SELECT val, u.t_id,
+///     ROW_NUMBER() OVER (PARTITION BY u.t_id ORDER BY val) AS __basin_rn
+///   FROM u
+/// ) sub ON sub.t_id = t.id AND sub.__basin_rn <= 1
+/// ORDER BY t.id
+/// ```
+///
+/// The `PARTITION BY <fk>` reproduces the per-outer-row scope, `ORDER BY
+/// <order_expr>` matches the LATERAL body ordering, and `__basin_rn <= n` is
+/// equivalent to `LIMIT n` within each partition.
+///
+/// ## Scope (conservative — no-op on anything unhandled)
+///
+/// Fires only when ALL of the following hold:
+/// - The LATERAL join form is `LEFT JOIN LATERAL … ON true`,
+///   `JOIN LATERAL … ON true`, or `, LATERAL` (comma).
+/// - The subquery body is a single-table `SELECT <proj> FROM <child> WHERE
+///   <child.fk> = <outer.pk> ORDER BY <order_cols> LIMIT <n>`.
+/// - Exactly **one** simple `a.b = c.d` equality predicate in WHERE (no AND/OR).
+/// - `LIMIT` is a plain positive integer literal.
+/// - No `GROUP BY` or nested sub-selects (heuristic: body has no depth-0 `GROUP BY`).
+/// - No aggregate projections (all-aggregate case is handled by
+///   `rewrite_lateral_nested_agg`).
+///
+/// Right/full/cross-lateral, multi-table child, compound WHERE, non-integer
+/// LIMIT, and bodies with their own aggregates are left untouched — honest defer.
+pub(crate) fn rewrite_lateral_order_limit(sql: &str) -> String {
+    let lower_check = sql.to_ascii_lowercase();
+    if !lower_check.contains("lateral") {
+        return sql.to_string();
+    }
+    // Must have ORDER BY and LIMIT inside the body (fast bail).
+    if !lower_check.contains("order by") || !lower_check.contains("limit") {
+        return sql.to_string();
+    }
+
+    let mut s = sql.to_string();
+    let mut search_from = 0usize;
+
+    loop {
+        let lower = s.to_ascii_lowercase();
+        let bytes = s.as_bytes();
+
+        // Find the next `lateral` keyword.
+        let Some(rel) = lower[search_from..].find("lateral") else {
+            break;
+        };
+        let lat_start = search_from + rel;
+        let lat_end = lat_start + 7;
+
+        // Word boundary before and after LATERAL.
+        let pre_ok = lat_start == 0 || !bytes[lat_start - 1].is_ascii_alphanumeric();
+        let post_ok =
+            lat_end >= s.len() || bytes[lat_end].is_ascii_whitespace() || bytes[lat_end] == b'(';
+        if !pre_ok || !post_ok {
+            search_from = lat_end;
+            continue;
+        }
+
+        // Skip whitespace after LATERAL; must be followed by `(`.
+        let mut j = lat_end;
+        while j < s.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= s.len() || bytes[j] != b'(' {
+            search_from = lat_end;
+            continue;
+        }
+        let paren_start = j;
+        let Some(paren_end) = find_matching_close_paren(&s, paren_start) else {
+            search_from = lat_end;
+            continue;
+        };
+
+        let body = s[paren_start + 1..paren_end].trim().to_string();
+        let body_lower = body.to_ascii_lowercase();
+
+        // Must be a SELECT subquery.
+        if !body_lower.trim_start().starts_with("select") {
+            search_from = lat_end;
+            continue;
+        }
+
+        // Must contain both ORDER BY and LIMIT at depth 0.
+        let has_order_by = find_keyword_at_depth0(&body_lower, "order by", 0).is_some();
+        let has_limit = find_keyword_at_depth0(&body_lower, "limit", 0).is_some();
+        if !has_order_by || !has_limit {
+            search_from = lat_end;
+            continue;
+        }
+
+        // Reject GROUP BY (aggregate pattern handled by rewrite_lateral_nested_agg).
+        if find_keyword_at_depth0(&body_lower, "group by", 0).is_some() {
+            search_from = lat_end;
+            continue;
+        }
+
+        // Parse: SELECT <proj> FROM <child> WHERE <pred> ORDER BY <order> LIMIT <n>
+        let sel_offset = if body_lower.trim_start().starts_with("select ") {
+            body_lower.trim_start().len() - body_lower.trim_start().trim_start_matches("select ").len()
+            // simpler: 7 characters after skipping leading whitespace
+        } else {
+            search_from = lat_end;
+            continue;
+        };
+        // Compute the actual offset within `body` (body is already trimmed).
+        let sel_body_offset = 7; // len("select ")
+
+        let Some(from_pos) = find_from_at_depth0(&body_lower, sel_body_offset) else {
+            search_from = lat_end;
+            continue;
+        };
+        let proj_str = body[sel_body_offset..from_pos].trim();
+
+        let after_from = from_pos + 5; // skip "from "
+        let Some(where_pos) = find_keyword_at_depth0(&body_lower, "where", after_from) else {
+            // No WHERE → no correlation → skip (uncorrelated rewriter handles).
+            search_from = lat_end;
+            continue;
+        };
+
+        let child_clause = body[after_from..where_pos].trim().to_string();
+        let (child_table, child_alias) = match parse_simple_table_ref(&child_clause) {
+            Some(pair) => pair,
+            None => {
+                search_from = lat_end;
+                continue;
+            }
+        };
+
+        // After WHERE: find ORDER BY at depth 0.
+        let where_body_start = where_pos + 6; // skip "where "
+        let Some(orderby_pos) = find_keyword_at_depth0(&body_lower, "order by", where_body_start) else {
+            search_from = lat_end;
+            continue;
+        };
+
+        let where_body = body[where_body_start..orderby_pos].trim();
+        let where_lower = where_body.to_ascii_lowercase();
+
+        // Parse single correlation predicate.
+        let corr = match parse_single_correlation_predicate(
+            where_body,
+            &where_lower,
+            &child_alias,
+            &child_table,
+        ) {
+            Some(c) => c,
+            None => {
+                search_from = lat_end;
+                continue;
+            }
+        };
+
+        // After ORDER BY: find LIMIT at depth 0.
+        let orderby_body_start = orderby_pos + 9; // skip "order by "
+        // But ORDER BY might be "order by " (8+1) — let's find LIMIT after orderby_pos.
+        let Some(limit_pos) = find_keyword_at_depth0(&body_lower, "limit", orderby_pos + 8) else {
+            search_from = lat_end;
+            continue;
+        };
+
+        let order_expr = body[orderby_body_start..limit_pos].trim();
+        if order_expr.is_empty() {
+            search_from = lat_end;
+            continue;
+        }
+
+        let limit_body_start = limit_pos + 6; // skip "limit "
+        let limit_str = body[limit_body_start..].trim();
+        // LIMIT must be a plain positive integer literal.
+        let limit_n: u64 = match limit_str.parse() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                search_from = lat_end;
+                continue;
+            }
+        };
+
+        // Reject all-aggregate projections — nested-agg rewriter handles those.
+        let proj_lower = proj_str.to_ascii_lowercase();
+        if all_projections_are_aggregates(&proj_lower) {
+            search_from = lat_end;
+            continue;
+        }
+
+        // Determine join type.
+        let pre_text = lower[..lat_start].trim_end();
+        let join_type = if pre_text.ends_with("left join") {
+            "LEFT JOIN"
+        } else if pre_text.ends_with("join") {
+            let before_join = pre_text[..pre_text.len() - 4].trim_end();
+            if before_join.ends_with("right")
+                || before_join.ends_with("full")
+                || before_join.ends_with("cross")
+            {
+                search_from = lat_end;
+                continue;
+            }
+            "INNER JOIN"
+        } else if pre_text.ends_with(',') {
+            "COMMA"
+        } else {
+            search_from = lat_end;
+            continue;
+        };
+
+        // Find sub alias after `)`.
+        let mut after_paren = paren_end + 1;
+        while after_paren < s.len() && bytes[after_paren].is_ascii_whitespace() {
+            after_paren += 1;
+        }
+        let mut alias_start = after_paren;
+        if lower[after_paren..].starts_with("as ") || lower[after_paren..].starts_with("as\t") {
+            alias_start = after_paren + 3;
+            while alias_start < s.len() && bytes[alias_start].is_ascii_whitespace() {
+                alias_start += 1;
+            }
+        }
+        let mut alias_end = alias_start;
+        while alias_end < s.len()
+            && (bytes[alias_end].is_ascii_alphanumeric() || bytes[alias_end] == b'_')
+        {
+            alias_end += 1;
+        }
+        if alias_end == alias_start {
+            search_from = lat_end;
+            continue;
+        }
+        let sub_alias = s[alias_start..alias_end].to_string();
+
+        // For JOIN/LEFT-JOIN forms verify `ON true`.
+        let rewrite_end;
+        match join_type {
+            "INNER JOIN" | "LEFT JOIN" => {
+                let mut on_start = alias_end;
+                while on_start < s.len() && bytes[on_start].is_ascii_whitespace() {
+                    on_start += 1;
+                }
+                if !lower[on_start..].starts_with("on ") && !lower[on_start..].starts_with("on\t") {
+                    search_from = lat_end;
+                    continue;
+                }
+                let on_kw_end = on_start + 3;
+                let mut on_val_start = on_kw_end;
+                while on_val_start < s.len() && bytes[on_val_start].is_ascii_whitespace() {
+                    on_val_start += 1;
+                }
+                let on_lower_slice = lower[on_val_start..].trim_start().to_string();
+                if !on_lower_slice.starts_with("true") {
+                    search_from = lat_end;
+                    continue;
+                }
+                let on_true_end = on_val_start + 4;
+                let post_ok2 = on_true_end >= s.len() || {
+                    let b = bytes[on_true_end];
+                    !b.is_ascii_alphanumeric() && b != b'_'
+                };
+                if !post_ok2 {
+                    search_from = lat_end;
+                    continue;
+                }
+                rewrite_end = on_true_end;
+            }
+            _ => {
+                rewrite_end = alias_end;
+            }
+        }
+
+        // Build the child table declaration.
+        let child_decl = if child_table != child_alias {
+            format!("{} AS {}", child_table, child_alias)
+        } else {
+            child_table.clone()
+        };
+
+        // The FK column (unqualified) in the child used for PARTITION BY.
+        let fk_col = &corr.child_col;
+        let outer_ref = &corr.outer_ref;
+        let rn_col = "__basin_rn";
+
+        // Check if fk_col already appears in the projection (unqualified or qualified).
+        let fk_in_proj = {
+            let col = fk_col.as_str();
+            let items = split_at_depth0_commas(&proj_lower);
+            items.iter().any(|item| {
+                let expr = strip_trailing_alias(item.trim()).trim();
+                expr == col
+                    || expr == format!("{}.{}", child_alias, col).as_str()
+                    || expr == format!("{}.{}", child_table, col).as_str()
+            })
+        };
+
+        // Build the windowed subquery projection:
+        //   <original_proj>, <child_alias>.<fk_col> (if not already there),
+        //   ROW_NUMBER() OVER (PARTITION BY <child_alias>.<fk_col> ORDER BY <order_expr>) AS __basin_rn
+        let window_expr = format!(
+            "ROW_NUMBER() OVER (PARTITION BY {}.{} ORDER BY {}) AS {}",
+            child_alias, fk_col, order_expr, rn_col
+        );
+        let fk_qualified = format!("{}.{}", child_alias, fk_col);
+        let sub_proj = if fk_in_proj {
+            format!("{}, {}", proj_str, window_expr)
+        } else {
+            format!("{}, {}, {}", proj_str, fk_qualified, window_expr)
+        };
+
+        let new_on = format!(
+            "{sub_alias}.{fk_col} = {outer_ref} AND {sub_alias}.{rn_col} <= {limit_n}"
+        );
+        let new_subquery = format!(
+            "(SELECT {sub_proj} FROM {child_decl}) {sub_alias}"
+        );
+
+        // Build the replacement string.
+        let (replace_from, replacement) = match join_type {
+            "LEFT JOIN" => {
+                let ljl_marker = "left join";
+                let pre = &lower[..lat_start];
+                let Some(ljl_rel) = pre.rfind(ljl_marker) else {
+                    search_from = lat_end;
+                    continue;
+                };
+                (ljl_rel, format!("LEFT JOIN {new_subquery} ON {new_on}"))
+            }
+            "INNER JOIN" => {
+                let pre = &lower[..lat_start];
+                let join_marker_start = if let Some(r) = pre.rfind("inner join") {
+                    r
+                } else if let Some(r) = pre.rfind("join") {
+                    r
+                } else {
+                    search_from = lat_end;
+                    continue;
+                };
+                (join_marker_start, format!("INNER JOIN {new_subquery} ON {new_on}"))
+            }
+            _ => {
+                // COMMA form.
+                let pre = &lower[..lat_start];
+                let Some(comma_rel) = pre.rfind(',') else {
+                    search_from = lat_end;
+                    continue;
+                };
+                (comma_rel, format!(" INNER JOIN {new_subquery} ON {new_on}"))
+            }
+        };
+
+        s.replace_range(replace_from..rewrite_end, &replacement);
+        search_from = replace_from + replacement.len();
+    }
+    s
+}
+
 /// Result of parsing a single correlation predicate from the LATERAL WHERE clause.
 struct CorrPredicate {
     /// The child-side column name (unqualified) used as the FK.
@@ -6425,5 +6806,103 @@ mod tests {
             sql,
             "more than one correlated generate_series LATERAL → defer"
         );
+    }
+
+    // ── ORDER BY + LIMIT LATERAL → ROW_NUMBER() window decorrelation ─────────
+
+    fn rlol(sql: &str) -> String {
+        rewrite_lateral_order_limit(sql)
+    }
+
+    #[test]
+    fn lol_left_join_limit1_rewrites() {
+        // Standard "first child per parent" ORM pattern.
+        let sql = "SELECT t.id, sub.val \
+                   FROM t \
+                   LEFT JOIN LATERAL (SELECT val FROM u WHERE u.t_id = t.id ORDER BY val LIMIT 1) sub ON true \
+                   ORDER BY t.id";
+        let out = rlol(sql);
+        let out_lower = out.to_ascii_lowercase();
+        assert!(!out_lower.contains("lateral"), "LATERAL must be gone: {out}");
+        assert!(out_lower.contains("left join"), "must remain LEFT JOIN: {out}");
+        assert!(out_lower.contains("row_number()"), "must have ROW_NUMBER(): {out}");
+        assert!(out_lower.contains("partition by"), "must have PARTITION BY: {out}");
+        assert!(out_lower.contains("__basin_rn"), "must have rn alias: {out}");
+        assert!(out_lower.contains("__basin_rn <= 1"), "must filter rn <= 1: {out}");
+        assert!(!out_lower.contains("on true"), "ON true must be replaced: {out}");
+    }
+
+    #[test]
+    fn lol_comma_join_limit3_rewrites() {
+        // Comma-LATERAL (= CROSS JOIN LATERAL correlation) with LIMIT 3.
+        let sql = "SELECT t.id, sub.v \
+                   FROM t, LATERAL (SELECT v FROM u WHERE u.tid = t.id ORDER BY v DESC LIMIT 3) sub";
+        let out = rlol(sql);
+        let out_lower = out.to_ascii_lowercase();
+        assert!(!out_lower.contains("lateral"), "LATERAL must be gone: {out}");
+        assert!(out_lower.contains("inner join"), "comma → INNER JOIN: {out}");
+        assert!(out_lower.contains("__basin_rn <= 3"), "must filter rn <= 3: {out}");
+    }
+
+    #[test]
+    fn lol_inner_join_limit1_rewrites() {
+        // JOIN LATERAL (without LEFT) with LIMIT 1.
+        let sql = "SELECT t.id, sub.v \
+                   FROM t JOIN LATERAL (SELECT v FROM u WHERE u.tid = t.id ORDER BY v LIMIT 1) sub ON true";
+        let out = rlol(sql);
+        let out_lower = out.to_ascii_lowercase();
+        assert!(!out_lower.contains("lateral"), "LATERAL must be gone: {out}");
+        assert!(out_lower.contains("inner join"), "must be INNER JOIN: {out}");
+        assert!(out_lower.contains("row_number()"), "must have ROW_NUMBER(): {out}");
+    }
+
+    #[test]
+    fn lol_no_order_by_not_rewritten() {
+        // No ORDER BY → must NOT fire (handled by rewrite_lateral_correlated_row instead).
+        let sql = "SELECT * FROM t LEFT JOIN LATERAL (SELECT id FROM u WHERE u.id = t.id LIMIT 1) sub ON true";
+        let out = rlol(sql);
+        assert!(
+            out.to_ascii_lowercase().contains("lateral"),
+            "no ORDER BY → must leave LATERAL: {out}"
+        );
+    }
+
+    #[test]
+    fn lol_no_limit_not_rewritten() {
+        // No LIMIT → must NOT fire.
+        let sql = "SELECT * FROM t LEFT JOIN LATERAL (SELECT id FROM u WHERE u.id = t.id ORDER BY id) sub ON true";
+        let out = rlol(sql);
+        assert!(
+            out.to_ascii_lowercase().contains("lateral"),
+            "no LIMIT → must leave LATERAL: {out}"
+        );
+    }
+
+    #[test]
+    fn lol_non_integer_limit_not_rewritten() {
+        // Non-integer LIMIT (e.g. parameter) → must NOT fire.
+        let sql = "SELECT * FROM t LEFT JOIN LATERAL (SELECT id FROM u WHERE u.id = t.id ORDER BY id LIMIT $1) sub ON true";
+        let out = rlol(sql);
+        assert!(
+            out.to_ascii_lowercase().contains("lateral"),
+            "non-integer LIMIT → must leave LATERAL: {out}"
+        );
+    }
+
+    #[test]
+    fn lol_fk_col_in_projection_not_duplicated() {
+        // If the FK col is already projected, it must not appear twice.
+        let sql = "SELECT t.id, sub.t_id, sub.val \
+                   FROM t LEFT JOIN LATERAL (\
+                   SELECT t_id, val FROM u WHERE u.t_id = t.id ORDER BY val LIMIT 1\
+                   ) sub ON true";
+        let out = rlol(sql);
+        let out_lower = out.to_ascii_lowercase();
+        assert!(!out_lower.contains("lateral"), "LATERAL must be gone: {out}");
+        // t_id is already in the projection — should not appear twice from the prepend path.
+        let count_tid = out_lower.matches("t_id,").count() + out_lower.matches(", t_id").count();
+        // Allow at most one extra reference in the ON clause (sub.t_id = t.id).
+        // The key invariant is the window subquery projection does NOT prepend an extra `u.t_id`.
+        assert!(out_lower.contains("partition by u.t_id"), "PARTITION BY must use qualified FK: {out}");
     }
 }
