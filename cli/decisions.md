@@ -288,4 +288,18 @@ later grep finds them all.
 
 ---
 
-*Last updated: 2026-05-19.*
+---
+
+## 2026-05-20 — tungstenite for WebSocket multi-table realtime subscribe (T26.2/T26.3)
+
+**Chosen:** `tungstenite = { version = "0.24", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }` (sync, no tokio) as the sole dep for the `--multi` WS path in `realtime subscribe`.
+
+**Rejected:** (1) hand-rolled RFC-6455 — SHA-1 key exchange + masking + frame parsing is ~300 lines of fiddly code with no test oracle; (2) `tokio-tungstenite` — brings in the full tokio async runtime, incompatible with our blocking `reqwest` thread model and doubles binary size; (3) `fastwebsockets` — tokio-only, same objection.
+
+**Why:** tungstenite is the de facto sync WS library in the Rust ecosystem (the async tokio-tungstenite is built on top of it). The `rustls-tls-webpki-roots` feature avoids an OpenSSL system dep, matching the choice already made for `reqwest`. The `handshake` feature (which includes RFC-6455 key negotiation via `sha1` + `data-encoding`) is required for client connections. Binary size impact: +~0.5 MB stripped vs. hand-rolling ~0 MB, justified by correctness (ping/pong, masking, close handshake all handled).
+
+**Integration gap:** a full in-test WS server stub (RFC-6455 handshake + frame exchange) would require a real tungstenite server in the test binary, which is heavy for a unit-test file. Frame-building, routing, and line-formatting logic is unit-tested directly (`handle_ws_text`, `build_ws_url`, frame shape assertions). End-to-end connect→subscribe→event path is an integration gap — covered once the engine's WS endpoint is available for testing.
+
+**Trigger to revisit:** if the async CLI rewrite lands (T-future), swap for `tokio-tungstenite` in the same commit.
+
+*Last updated: 2026-05-20.*

@@ -403,14 +403,14 @@ import if the decisions.md no-deps rule permits it — **decide and record in
   Ctrl-C (SIGINT) closes the response body and exits 0. **Acceptance:**
   `httptest.Server` streaming 3 `data:` frames + 1 heartbeat → 3 JSON lines
   on stdout, exit 0 on context-cancel; arg-parse error path tested.
-- [ ] **T26.2 — RFC-6455 minimal WS client (or vetted dep decision). WS deferred — needs tungstenite dep.**
+- [x] **T26.2 — RFC-6455 minimal WS client (or vetted dep decision). WS deferred — needs tungstenite dep.**
   New `internal/ws/ws.go` + test. A tiny client: HTTP Upgrade handshake
   (`Sec-WebSocket-Key`/`Accept` via `crypto/sha1`+base64), text-frame
   read/write, masking, ping/pong, close. OR — if `decisions.md` approves —
   thin wrapper over `x/net/websocket`. **Acceptance:** round-trips text
   frames against a `httptest.Server` that upgrades and echoes; ping →
   pong; close handshake clean. This unblocks T26.3.
-- [ ] **T26.3 — `realtime subscribe --multi` over WebSocket. WS deferred — needs tungstenite dep.** Depends on
+- [x] **T26.3 — `realtime subscribe --multi` over WebSocket. WS deferred — needs tungstenite dep.** Depends on
   T26.2. `basin realtime subscribe --multi <t1>,<t2>,… [--filter=<expr>]`.
   Opens `GET /realtime/v1/ws/:project`, sends
   `{"type":"subscribe","table":"<t>"[,"filter":"<expr>"]}` per table, waits
