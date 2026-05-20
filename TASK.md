@@ -1095,7 +1095,7 @@ Privacy and anonymisation model: [ADR 0017](./docs/decisions/0017-query-shape-pr
       Acceptance gate: 10k QPS workload → registry overhead ≤ 1% p99;
       memory bounded at 500 shapes × ~2 KiB histogram ≈ 1 MiB/project.
       Estimate: ~1 week. Depends on 5.16.A.
-- [ ] **5.16.C** Scale-dependent regression tracking.  Files:
+- [x] **5.16.C** Scale-dependent regression tracking (shipped `57a755f`; 8 log2 buckets <1k…≥1B; threshold default 1.3, configurable via `set_regression_threshold`; 7/7 query_stats tests; memory bound 10 MiB/project at 500 shapes × 13 histograms).  Files:
       `crates/basin-engine/src/query_stats.rs` (extend).  Bucket each
       query by `log2(table_row_count)` (8 buckets covering 1k → 1B rows)
       and store per-(shape, bucket) histograms.  Expose
