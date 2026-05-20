@@ -290,14 +290,14 @@ impl Catalog for InMemoryCatalog {
     #[instrument(skip(self), fields(project = %project))]
     async fn create_namespace(&self, project: &ProjectId) -> Result<()> {
         self.namespaces.lock().await.insert(*project);
-        // Pre-seed the `public` schema so `list_schemas` always returns at
-        // least `["public"]` for any project that has been initialized.
-        self.schemas
-            .lock()
-            .await
-            .entry(*project)
-            .or_insert_with(HashSet::new)
-            .insert(SchemaName::public());
+        // Phase 5.18.A: pre-seed ALL reserved schemas so that schema-qualified
+        // catalog operations on any reserved schema work without an explicit
+        // `create_schema` call. Mirrors the PostgresCatalog behaviour.
+        let mut schemas = self.schemas.lock().await;
+        let schema_set = schemas.entry(*project).or_insert_with(HashSet::new);
+        for &reserved in crate::reserved_schema::ReservedSchema::ALL {
+            schema_set.insert(reserved.to_schema_name());
+        }
         Ok(())
     }
 
@@ -3166,8 +3166,16 @@ mod tests {
         cat.create_namespace(&p).await.unwrap();
 
         let schemas = cat.list_schemas(&p).await.unwrap();
-        assert_eq!(schemas.len(), 1);
-        assert_eq!(schemas[0].as_str(), "public");
+        // Phase 5.18.A: create_namespace now seeds all 8 reserved schemas.
+        assert_eq!(
+            schemas.len(),
+            crate::reserved_schema::ReservedSchema::ALL.len(),
+            "expected all reserved schemas to be pre-seeded"
+        );
+        assert!(
+            schemas.iter().any(|s| s.as_str() == "public"),
+            "public must be present"
+        );
     }
 
     #[tokio::test]

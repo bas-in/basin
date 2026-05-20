@@ -36,6 +36,8 @@ mod postgres;
 mod procedures;
 mod project_storage_config;
 mod reactors;
+/// Phase 5.18.A — reserved schema enum + back-compat resolution helpers.
+pub mod reserved_schema;
 mod rest;
 mod sequences;
 mod snapshot;
@@ -48,6 +50,7 @@ use basin_common::{ChangeOp, ProjectId, QualifiedTableName, Result, SchemaName, 
 
 pub use domains::{DomainDef, DomainError, BASIN_DOMAIN_KEY};
 pub use enums::{EnumError, EnumTypeDef, BASIN_ENUM_TYPE_KEY};
+pub use reserved_schema::{resolve_qualified, resolve_schema, ReservedSchema};
 pub use inbound_webhooks::{InboundWebhookDef, InboundWebhookError};
 pub use functions::{
     SqlArgType, SqlFunctionArg, SqlFunctionDef, SqlFunctionLanguage, SqlReturnType,

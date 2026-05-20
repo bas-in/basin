@@ -527,19 +527,24 @@ impl Catalog for PostgresCatalog {
         )
         .await
         .map_err(|e| BasinError::catalog(format!("create_namespace: {e}")))?;
-        // Phase A.3: pre-seed the `public` schema so `list_schemas` always
-        // returns at least `["public"]` after `create_namespace`. Idempotent
-        // via ON CONFLICT DO NOTHING — calling `create_namespace` twice is a
-        // no-op (matches the InMemoryCatalog contract).
-        tx.execute(
-            &format!(
-                "INSERT INTO {sch}.basin_schemas (project_id, schema_name) VALUES ($1, 'public')
-                 ON CONFLICT (project_id, schema_name) DO NOTHING"
-            ),
-            &[&project_str],
-        )
-        .await
-        .map_err(|e| BasinError::catalog(format!("create_namespace seed public schema: {e}")))?;
+        // Phase 5.18.A: seed ALL reserved schemas so that any schema-qualified
+        // catalog operation on a reserved schema succeeds without requiring an
+        // explicit `create_schema` call. Idempotent via ON CONFLICT DO NOTHING —
+        // calling `create_namespace` twice is a no-op.
+        for reserved in crate::reserved_schema::ReservedSchema::ALL {
+            let schema_str = reserved.as_str();
+            tx.execute(
+                &format!(
+                    "INSERT INTO {sch}.basin_schemas (project_id, schema_name) VALUES ($1, $2)
+                     ON CONFLICT (project_id, schema_name) DO NOTHING"
+                ),
+                &[&project_str, &schema_str],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!(
+                "create_namespace seed schema {schema_str}: {e}"
+            )))?;
+        }
         tx.commit()
             .await
             .map_err(|e| BasinError::catalog(format!("create_namespace commit: {e}")))?;
@@ -3192,18 +3197,22 @@ impl Catalog for PostgresCatalog {
         .await
         .map_err(|e| BasinError::catalog(format!("ensure namespace: {e}")))?;
 
-        // Verify the target schema exists. For `public`, we auto-seed it;
-        // for other schemas, the caller must have run `create_schema` first.
-        if schema_name_str == "public" {
+        // Phase 5.18.A: auto-seed any reserved schema (public, auth, storage,
+        // cron, net, realtime, pg_catalog, information_schema). User-defined /
+        // unknown schema names are not given real containers — `resolve_schema`
+        // already aliased them to `public` before this call site is reached.
+        // For any non-reserved schema that still somehow arrives here, require
+        // the caller to have run `create_schema` first.
+        if crate::reserved_schema::ReservedSchema::from_str(schema_name_str).is_some() {
             tx.execute(
                 &format!(
-                    "INSERT INTO {sch}.basin_schemas (project_id, schema_name) VALUES ($1, 'public')
+                    "INSERT INTO {sch}.basin_schemas (project_id, schema_name) VALUES ($1, $2)
                      ON CONFLICT (project_id, schema_name) DO NOTHING"
                 ),
-                &[&project_str],
+                &[&project_str, &schema_name_str],
             )
             .await
-            .map_err(|e| BasinError::catalog(format!("seed public schema: {e}")))?;
+            .map_err(|e| BasinError::catalog(format!("seed reserved schema {schema_name_str}: {e}")))?;
         } else {
             let schema_exists = tx
                 .query_opt(
@@ -5377,7 +5386,18 @@ mod tests {
         let project = ProjectId::new();
         cat.create_namespace(&project).await.unwrap();
         let schemas = cat.list_schemas(&project).await.unwrap();
-        assert_eq!(schemas, vec![basin_common::SchemaName::public()]);
+        // Phase 5.18.A: create_namespace now seeds all 8 reserved schemas.
+        let n_reserved = crate::reserved_schema::ReservedSchema::ALL.len();
+        assert_eq!(
+            schemas.len(),
+            n_reserved,
+            "expected all reserved schemas; got {:?}",
+            schemas
+        );
+        assert!(
+            schemas.contains(&basin_common::SchemaName::public()),
+            "public must be present"
+        );
     }
 
     #[tokio::test]
@@ -5395,7 +5415,9 @@ mod tests {
         schemas.sort();
         assert!(schemas.contains(&basin_common::SchemaName::public()));
         assert!(schemas.contains(&analytics));
-        assert_eq!(schemas.len(), 2);
+        // Phase 5.18.A: now 8 reserved + 1 user schema = 9.
+        let n_reserved = crate::reserved_schema::ReservedSchema::ALL.len();
+        assert_eq!(schemas.len(), n_reserved + 1);
     }
 
     #[tokio::test]

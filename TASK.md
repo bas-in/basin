@@ -835,6 +835,96 @@ PostgREST-style HTTP RPC surface over catalog UDFs. Tracked via ADR 0019.
 - [x] Integration tests: `rpc_sql_scalar_function`, `rpc_requires_auth`,
       `rpc_zero_arg_function` in `crates/basin-rest/src/tests.rs`.
 
+#### Phase 5.11.W — Wasm functions: JS/TS authoring (~6-8 weeks)
+
+The committed answer to "do you have edge functions?" per
+[ADR 0019](./docs/decisions/0019-declarative-baas-surface.md)'s
+"V8 never; WebAssembly is the function runtime" decision. Devs author
+in TypeScript; the toolchain compiles to a Wasm component (Javy /
+ComponentizeJS) at deploy time; it runs on the **already-shipped**
+wasmtime runtime (5.11.J) and is invokable via the **already-shipped**
+`/rpc/<fn>` mount (5.11.L) plus a new HTTP-handler shape. **No V8, no
+isolate pool, no separate runtime.** Any Wasm-targeting language works;
+JS/TS is the headline DX. Critical path: W1 → (W2 ∥ W3) → W4 → W7.
+
+##### 5.11.W1 — Wasm component-model host ABI (~2 weeks, engine)
+
+5.11.J runs Wasm as a *pure scalar UDF* (no side effects). W1 gives a
+function-Wasm a host-import interface so it can do real work, on the
+WASI Preview 2 / component model so any guest language targets one ABI.
+
+- [ ] Host imports: `basin:fn/query` (run SQL under the caller's
+      identity — RLS applies), `basin:fn/http` (outbound HTTP via
+      `basin-net`: allowlist + rate-limit + body-cap + timeout already
+      in place), `basin:fn/log` (tracing), `basin:fn/secret` (read a
+      project secret, decrypted via `EncryptionProvider`).
+- [ ] WIT interface definitions in `crates/basin-engine` (or a new
+      `crates/basin-fn`); guest bindings generated from the WIT.
+- [ ] Acceptance: a hand-written Rust→Wasm component calls
+      `basin:fn/query("SELECT 1")` and `basin:fn/http(...)` and gets
+      correct results through the host.
+
+##### 5.11.W2 — HTTP-handler function shape `/fn/v1/:name` (~1.5 weeks, engine + basin-rest)
+
+Beyond `/rpc/<fn>` (calls a function, serialises its return), add a
+request→response handler ABI so a function receives an HTTP request
+(method, headers, body) and returns a response — the edge-function
+ergonomic shape, in Wasm.
+
+- [ ] `basin:fn/handler` WIT export: `handle(request) -> response`.
+- [ ] Mount `ANY /fn/v1/:name` in `basin-rest`; JWT/API-key gated like
+      other routes; project-scoped.
+- [ ] Acceptance: a JS function `export default (req) => Response.json({...})`
+      compiled to Wasm responds correctly to a `curl` against
+      `/fn/v1/<name>`.
+
+##### 5.11.W3 — JS/TS→Wasm build pipeline in basin-cli (~1.5 weeks, basin-cli)
+
+- [ ] `basin functions deploy ./fn.ts` runs ComponentizeJS/Javy →
+      Wasm component targeting the W1 ABI → uploads + registers.
+- [ ] `basin functions list` / `logs <name>` / `delete <name>`.
+- [ ] Acceptance: round-trip — write a TS handler, `deploy`, invoke via
+      `/fn/v1/<name>`, see logs via `functions logs`.
+
+##### 5.11.W4 — `@basin/functions` authoring SDK (~1 week, basin-js)
+
+- [ ] Typed bindings for the W1 host imports (`query` / `http` / `log`
+      / `secret`); a project template; a local test harness that runs a
+      function against a mock host without deploying.
+- [ ] Acceptance: `import { query } from '@basin/functions'` type-checks;
+      template `npm test` runs a handler against the mock host green.
+
+##### 5.11.W5 — Per-invocation resource governance (~1 week, engine)
+
+Extends 5.11.J's caps for the host-import + handler case (functions can
+now block on host calls).
+
+- [ ] Epoch-interrupt CPU cap, linear-memory cap, wall-clock timeout,
+      per-project concurrency semaphore. Configurable via
+      `BASIN_FN_*` env / per-project DDL.
+- [ ] Acceptance: a function that spins / allocates / hangs is killed at
+      the cap; a noisy project's function load doesn't starve others.
+
+##### 5.11.W6 — Function catalog + lifecycle (`LANGUAGE javascript`) (~1 week, engine)
+
+- [ ] `CREATE FUNCTION name(...) LANGUAGE javascript AS $$ … $$` sugar —
+      stores the compiled Wasm component + source; `DROP` / `ALTER …
+      RENAME`; version pin. (Compile happens client-side in W3; the
+      engine stores + runs the component.)
+- [ ] `basin:fn/query` host call is RLS-aware and `auth.aal()`-aware
+      (ADR 0020) so MFA-gated logic works inside functions.
+- [ ] Acceptance: catalog round-trip; RLS enforced on in-function
+      queries; cross-project isolation verified.
+
+##### 5.11.W7 — Differential + soak tests + docs (~1 week)
+
+- [ ] Differential: a reference TS function and its hand-written SQL
+      equivalent produce identical results across a battery of inputs.
+- [ ] Soak: 100 tenants × concurrent function invocations for 1 hour;
+      no memory growth, caps honoured, no cross-tenant interference.
+- [ ] Docs: `docs/functions.md` — authoring, host ABI, deploy, limits;
+      explicit "this is Wasm, not V8" note linking ADR 0019.
+
 ### Tier 4 — `crates/basin-realtime` (~10-12 weeks)
 
 WebSocket + SSE + presence channels as `ChangeEventSink`
@@ -1084,7 +1174,7 @@ flat-aliased to `public` (projects own tenancy). See
 **A → B**, **A → C**, **D after A**, **E last**. 5.18.A must run SOLO in
 basin-catalog (no other catalog agent concurrent).
 
-- [ ] **5.18.A — Catalog `(schema, table)` keying for reserved schemas.** Add a
+- [x] **5.18.A — Catalog `(schema, table)` keying for reserved schemas.** Add a
       `schema` dimension to catalog object identity for the closed reserved set
       (`public` auth storage cron net realtime pg_catalog information_schema);
       `public` is default; unqualified + `public.` resolve identically to today.
