@@ -189,9 +189,19 @@ mod tests {
             other => panic!("Expected Filter, got: {other:?}"),
         };
 
+        // The NULLIF scalar function must survive untouched. Newer
+        // DataFusion renders the Debug form as the UDF struct name
+        // (`NullIfFunc`) rather than call-style `nullif(...)`, so match
+        // the function name case-insensitively without assuming a paren.
         assert!(
-            pred.to_lowercase().contains("nullif("),
+            pred.to_lowercase().contains("nullif"),
             "Bare NULLIF should be preserved; predicate:\n{pred}"
+        );
+        // And it must NOT have been decomposed into the IS NULL / Eq
+        // conjunction the wrapped-NULLIF rewrite produces.
+        assert!(
+            !(pred.contains("IsNull") && pred.contains("Eq")),
+            "Bare NULLIF must not be rewritten to a conjunction; predicate:\n{pred}"
         );
         Ok(())
     }
