@@ -413,9 +413,9 @@ routes in basin-rest.
 
 ---
 
-### T-025 — Realtime: SSE transport (single-table, read-only) ✅ unblocked
+### T-025 — Realtime: SSE transport (single-table, read-only) ✅ done
 
-**Status:** ready 2026-05-20. Engine shipped the realtime stack (basin
+**Status:** done 2026-05-20. `SseSubscription` + `subscribe()` in `src/realtime/sse.ts`; `backoff()` helper in `src/realtime/backoff.ts`; 8 tests green. Engine shipped the realtime stack (basin
 5.11.R1–R7). Route shapes are final — see ROADMAP 0.6. This task was the
 old "WebSocket transport 🔒" placeholder; it is now split across T-025
 (SSE), T-028 (WS multiplex), T-029 (presence), T-030 (channel-API routing
