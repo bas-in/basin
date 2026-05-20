@@ -1065,7 +1065,7 @@ anything is persisted or exported.  Plan-shape hash is over operator tree
 
 Privacy and anonymisation model: [ADR 0017](./docs/decisions/0017-query-shape-privacy.md).
 
-- [ ] **5.16.A** Plan-shape canonical hash.  **Locked decision
+- [x] **5.16.A** Plan-shape canonical hash (shipped `33ae73f`; 6 unit tests pass; xxh3_64 seeded with `basin_sketch::QUERY_SHAPE_SEED`; LITERAL_SLOT + DataType erasure proves cross-process stability).  **Locked decision
       (2026-05-19) per ADR 0017:** use `xxhash-rust` crate's
       `xxh3_64`, seeded with the fixed constant
       `BASIN_QUERY_SHAPE_SEED = 0xBA51_4145_7E11_5A95`.  Cross-version
@@ -1359,7 +1359,7 @@ Lives in a new crate `crates/basin-hottier/`.
   transaction-boundary markers (`BEGIN` / `ROLLBACK`) for correct
   crash recovery.
 
-- [ ] **5.14.C1** `MemTable` + `MemTableRegistry` (new crate) — ~1 week.
+- [x] **5.14.C1** `MemTable` + `MemTableRegistry` (shipped `57dae11`; new `basin-hottier` crate skeleton) — ~1 week.
       `parking_lot::RwLock<BTreeMap<RowKey, MemRowValue>>` per
       `(project, table)`.  `RowKey` is a newtype over `Vec<u8>` with
       big-endian PK column encoding.  `MemRowValue::Row(Vec<u8>) |
@@ -1418,7 +1418,7 @@ Lives in a new crate `crates/basin-hottier/`.
       (50% INSERT, 25% UPDATE, 25% DELETE) flushes without read stall;
       no row loss verified by `vortex_parquet_differential`; flush
       duration ≤ 10s for 64 MB memtable on LocalFS.
-- [ ] **5.14.C5** Multi-tenant memory budget — ~1 week.  Per-project
+- [x] **5.14.C5** Multi-tenant memory budget (shipped `12b2fc2`; 10k-tenant fuzz heap ≈1.86 GiB ≤ 4 GiB gate; ALTER PROJECT DDL for hard-cap override) — ~1 week.  Per-project
       hard cap (256 MB default, ALTER PROJECT configurable), soft cap
       (192 MB triggers background flush), per-table soft cap (16 MB).
       `Semaphore` back-pressure on hard cap.  Largest-first global

@@ -6,6 +6,44 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-20 — Wave 3 reality check + recovery
+
+**TASK.md was MORE out of sync than the kickoff entry knew.** Three Phase
+5.14/5.16 items shipped in prior sessions but TASK.md still showed `[ ]`:
+
+- `57dae11` 5.14.C1 — `MemTable`/`MemTableRegistry` crate skeleton
+- `d7b96c4` 5.14.B1 — basin-sketch crate hoist (already shipped before my B1 dispatch)
+- `12b2fc2` 5.14.C5 — first-class budget module + ALTER PROJECT DDL + 10k-tenant fuzz
+- `33ae73f` 5.16.A — `QueryShapeHash` with xxh3_64 cross-process stability
+- `f5bb2e6` — follow-up fix adding sketch fields to DataFile in storage reader/writer
+- `5551761` 5.14.C2 prep — WAL BEGIN/ROLLBACK markers
+
+The `git log -5` at session start truncated below `82e7b2f`, hiding these.
+
+**Recovery actions taken.**
+
+- Stopped duplicate B1 + C5 agents (`aad212340ed014b97`, `a9920bb6fcb30b5d3`).
+  Note: B1 agent had already committed a clean validation tick (`1c2387d`)
+  before being stopped — net effect is just the TASK.md checkbox update.
+- Committed the orphaned B5 sketch differential (`tests/integration/tests/sketches.rs`,
+  538 lines) that agent `a583d6d17fea33e01` wrote but didn't commit before
+  its 1M-row × 7-file-counts test run exhausted its lifetime. Marked
+  `#[ignore]` with run instructions; recovered as commit `6d8aafc`.
+- Synced TASK.md ticks for C1 / C5 / 5.16.A.
+
+**Lesson for the loop dispatcher.** Before dispatching the next wave,
+ALWAYS run `git log --oneline -20` (not -5) and grep for the candidate
+phase markers in commit messages — TASK.md cannot be trusted as the
+canonical state.
+
+**Still-running agents (genuine work).** C3 (`a3ef293caa7524c1e`) reads-merge
+path; D4 (`ada18687e5a690d55`) D2/D3 differential. C3's `merge.rs` (385
+lines) and D4's `catalog_window.rs` (701 lines) are present in the working
+tree. If D4 hits the same test-execution timeout B5 did, recover its file
+the same way (commit with `#[ignore]`).
+
+---
+
 ## 2026-05-20 — Wave 3 dispatch + autonomous loop kickoff
 
 **Loop config.** `/loop 10m autonomous …` → cron `3,13,23,33,43,53 * * * *`
