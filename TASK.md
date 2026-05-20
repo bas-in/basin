@@ -225,14 +225,15 @@ risk/effort, ordered to ship value early.
       ships; small row groups for point-heavy tables.
 
 **C. Hot tier (6-8 weeks, the architectural commitment):**
-- [ ] **C1 In-memory hot ring** — per-project ring buffer for recent
-      writes (last 5 min or 100k rows, whichever first). Flushes to
-      Parquet on threshold or timer. Reads check ring first, fall
-      through to Parquet. Solves "90% of reads are on last week of
-      data" for audit-log / event-store / time-series shapes.
-- [ ] **C2 Embedded RocksDB hot tier (alt path)** — for projects with
-      larger hot working sets that don't fit in RAM. Optional, gated
-      by project config.
+- [-] **C1 In-memory hot ring** — **SUBSUMED by Phase 5.14.C HTAP hot tier**
+      (the `basin-hottier` crate: per-`(project,table)` memtable + WAL-backed
+      write path + read-merge + flush + budget, all shipped 5.14.C1–C6). The
+      ring-buffer design here is obsoleted by the LSM-style memtable that
+      actually landed. Closed as superseded.
+- [-] **C2 Embedded RocksDB hot tier (alt path)** — **NOT pursued.** ADR 0016
+      explicitly rejected RocksDB for the hot tier (multi-tenant isolation
+      constraint) in favour of the per-project `BTreeMap` memtable that
+      shipped in 5.14.C. Closed as superseded.
 
 Decision points:
 - A1+A2+A3 alone may be enough to ship sub-10ms warm point queries —
@@ -963,16 +964,17 @@ can land in parallel. Critical path: R1 → R2 → (R3 || R4) → R7.
 - [x] Files: `tests/integration/tests/realtime_differential.rs`,
       `tests/integration/tests/realtime_soak.rs`.
 
-#### 5.11.R8 — basin-js client SDK channel API (~3-5 days)
+#### 5.11.R8 — basin-js client SDK channel API (~3-5 days) ✅ shipped in basin-js (T-025/028/029/030)
 
-- [ ] Mirror Supabase's channel API in `basin-js`:
+- [x] Mirror Supabase's channel API in `basin-js`:
       `basin.channel('orders').on('postgres_changes', { event: '*' },
       cb).subscribe()`. Maps to SSE for read-only subscriptions, WS
-      when presence or filter changes mid-stream.
-- [ ] Reconnect-with-replay using `Last-Event-Id` automatically.
-- [ ] Acceptance gate: example app in basin-js repo subscribes,
-      sees live events, survives a network blip with replay.
-- [ ] Lives in basin-js repo; tracked here as the consumer-side
+      when presence or filter changes mid-stream. (basin-js T-030
+      `channel()` router; transports T-025 SSE / T-028 WS / T-029 presence.)
+- [x] Reconnect-with-replay using `Last-Event-Id` automatically.
+- [x] Acceptance gate: basin-js realtime suite green (SSE/WS/presence
+      transports + channel routing). Lives in the basin-js repo.
+- [x] Lives in basin-js repo; tracked here as the consumer-side
       acceptance gate for R1-R7.
 
 If a separate repo later makes more sense (independent release
