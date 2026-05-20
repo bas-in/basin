@@ -426,7 +426,7 @@ Requires `BASIN_AUTH_ENABLED=1` per ADR.
       `crates/basin-storage/src/predicate.rs`; regression tests added in
       `predicate::compound_tests` (`uuid_eq_literal_matches_row`,
       `uuid_eq_no_match_returns_all_false`, `uuid_eq_invalid_literal_is_error`,
-      `uuid_eq_via_compound_predicate`). Fixed in commit COMMIT_HASH_PLACEHOLDER.
+      `uuid_eq_via_compound_predicate`). Fixed in commit d0f0f5e.
 
 ## Phase 5.11 — Modern SaaS toolkit: SQL functions, declarative lifecycle, sink trait (~12-15 weeks committed)
 
