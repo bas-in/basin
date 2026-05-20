@@ -6,6 +6,32 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-20 — Account session-limit cutoff + orphan recovery
+
+Three agents reported "completed" but two were actually **killed by the
+Anthropic account session limit** (reset 6:30am Africa/Johannesburg), not
+finished:
+
+- **5.11.R5** (filter pushdown) — genuinely done; landed in `94db513`
+  (co-committed from a shared working tree with 5.16.D).
+- **5.11.R3** (WebSocket) — code-complete but uncommitted when killed.
+  Recovery: verified `cargo test realtime_ws` → 6/6 green, committed as
+  `10858d8`. No rework needed.
+- **5.11.C2** (constraint reactors) — uncommitted AND buggy: a stack
+  overflow in `drop_reactor_removes_constraint` (DROP-path recursion).
+  Re-dispatched a fresh agent to root-cause + fix rather than commit
+  broken work.
+
+**Lesson for the loop dispatcher.** An agent "completed" notification is
+NOT proof of success. Always verify: (1) did it commit (`git log`), and
+(2) does its work pass (`cargo test`). Recover clean orphans directly;
+re-dispatch buggy ones. Stage recovered files EXPLICITLY by path — never
+`git add -A` while sibling agents have uncommitted work in the tree
+(this session already had R6's work accidentally swept into a docs commit
+that way, commit `d1acaa0`).
+
+---
+
 ## 2026-05-20 — ADR 0020 reconciliation (WAL Commit marker vs implicit-commit-at-EOF)
 
 **Option A chosen (impl wins).** The C2 WAL impl (`5551761`) shipped `TxBegin` + `TxRollback` only — no `TxCommit` variant. ADR 0020 §6 required an explicit `Commit` marker. Reconciliation: updated ADR 0020 with a "Reconciliation (2026-05-20)" section documenting the shipped implicit-commit-at-EOF semantics, the correctness gap, and the deferred path to add explicit `TxCommit` in Phase 5.14.C4+. No code changes needed; `cargo check --workspace` is clean. Option B (add `TxCommit` variant + emit from executor) was deferred due to high conflict risk with the C3 agent editing `executor.rs` and because the correctness impact is bounded to the hot tier's in-memory rebuild path (no object-store durability affected).
