@@ -6,6 +6,41 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-20 — Schemas: user-defined WON'T-DO, system schemas made real (ADR 0022)
+
+Decided after an architecture discussion. Full rationale in
+[ADR 0022](./docs/decisions/0022-system-schema-namespacing.md).
+
+**SQL schemas' original purpose** (SQL-92): a namespace of objects *owned by a
+single authorization identifier* — i.e. a per-user private namespace inside one
+shared database (Postgres's `"$user", public` default search_path is the
+fossil). Modern uses (schema-per-tenant, logical grouping, extension
+namespacing) are drift from that intent.
+
+**Decision:**
+- **User-defined schemas → WON'T-DO.** Basin's **project** already IS the
+  owner-scoped isolated namespace schemas were invented for, promoted to a hard
+  storage-prefix boundary. A second user-facing namespace axis is redundant and
+  adds a second place to leak (violates the "one leaked row kills the project"
+  invariant) for ~zero wedge benefit. `CREATE SCHEMA x` stays accepted but
+  **aliased to `public`** (flat). Note: schemas are *more complex* but **not
+  meaningfully less efficient** — they're a metadata concern; the objection is
+  complexity/correctness-surface, not CPU/storage. We skip them because
+  projects make them redundant, not because they're slow.
+- **System schemas → MAKE REAL.** `auth/storage/cron/net/realtime/public/
+  pg_catalog/information_schema` become first-class **reserved** schemas with
+  honest `(schema, table)` keying + real `search_path` + honest
+  introspection. This replaces today's prefix hacks (`basin_auth_*`,
+  `_net_http_response`, etc.), makes `auth.users`/`storage.objects` genuinely
+  schema-qualified for Supabase-shaped SDK + PG tooling, and leaves the
+  per-project isolation boundary untouched.
+
+**Implementation:** Phase 5.18.A–E (catalog keying → search_path → migrate
+system namespaces → honest introspection → differential/tooling test). Reserved
+schema list is a closed enum; user schemas are NOT user-extensible containers.
+
+---
+
 ## 2026-05-20 — Big session-limit cutoff (8:50pm reset) + recovery
 
 7 agents killed mid-flight at the account session limit. Recovery done by
