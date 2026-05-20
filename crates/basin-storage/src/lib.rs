@@ -17,6 +17,7 @@ mod concurrency;
 mod data_file;
 mod disk_cache;
 pub mod encryption;
+pub mod encryption_static;
 mod metadata_cache;
 mod page_cache;
 mod paths;
@@ -44,6 +45,7 @@ pub use basin_catalog::ProjectStorageConfig;
 pub use data_file::{ColumnStats, DataFile};
 pub use disk_cache::{DiskCacheConfig, DiskCacheCounters, DiskCachedStore};
 pub use encryption::{EncryptionProvider, WrappedKey};
+pub use encryption_static::{EnvKeyEncryption, StaticKeyEncryption};
 pub use page_cache::{PageCache, PageCacheConfig, PageCacheCounters, PageCacheCountersSnapshot};
 pub use predicate::{
     evaluate as evaluate_predicate, evaluate_compound, evaluate_compound_for_pruning,
