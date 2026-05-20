@@ -14,8 +14,15 @@ use super::help::help_for_command;
 
 /// GLOBAL_FLAG_NAMES is the static list rendered into every shell's
 /// flag-completion table. Kept in sync with parse_global_flags by hand.
-const GLOBAL_FLAG_NAMES: &[&str] =
-    &["--api-url", "--token", "--org", "--json", "--quiet", "--no-color", "--help"];
+const GLOBAL_FLAG_NAMES: &[&str] = &[
+    "--api-url",
+    "--token",
+    "--org",
+    "--json",
+    "--quiet",
+    "--no-color",
+    "--help",
+];
 
 pub fn cmd_completion(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let shell = match args.first() {
@@ -42,7 +49,11 @@ pub fn cmd_completion(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
             help_for_command(
                 "completion",
                 "Print a shell completion script for bash, zsh, or fish.",
-                &["bash    Print bash completion.", "zsh     Print zsh completion.", "fish    Print fish completion."],
+                &[
+                    "bash    Print bash completion.",
+                    "zsh     Print zsh completion.",
+                    "fish    Print fish completion.",
+                ],
             );
             Ok(())
         }

@@ -22,8 +22,7 @@ use super::help::help_for_command;
 use super::parse_or_silent;
 
 pub fn cmd_unlink(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
-    let cmd = Command::new("unlink")
-        .arg(Arg::new("help").long("help").action(ArgAction::SetTrue));
+    let cmd = Command::new("unlink").arg(Arg::new("help").long("help").action(ArgAction::SetTrue));
     let m = parse_or_silent(cmd, args)?;
     if m.get_flag("help") {
         help_for_command(
@@ -33,8 +32,11 @@ pub fn cmd_unlink(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         );
         return Ok(());
     }
-    let cwd = std::env::current_dir()
-        .map_err(|e| msg(format!("unlink: could not determine working directory: {e}")))?;
+    let cwd = std::env::current_dir().map_err(|e| {
+        msg(format!(
+            "unlink: could not determine working directory: {e}"
+        ))
+    })?;
     run_unlink(g, &cwd)
 }
 
@@ -87,8 +89,7 @@ mod tests {
     use crate::testutil::with_temp_config_dir;
 
     fn make_cwd(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("basin-unlink-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("basin-unlink-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -114,7 +115,10 @@ mod tests {
     }
 
     fn quiet_g() -> GlobalFlags {
-        GlobalFlags { quiet: true, ..Default::default() }
+        GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -161,13 +165,20 @@ mod tests {
         let cwd = make_cwd("json-linked");
         scaffold_linked(&cwd, "proj-abc");
 
-        let g = GlobalFlags { json: true, quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            json: true,
+            quiet: true,
+            ..Default::default()
+        };
         run_unlink(&g, &cwd).unwrap();
 
         // Verify project_ref is cleared on disk.
         let wp = crate::config::load_working_project(&cwd).unwrap();
         let ref_val = wp.as_ref().map(|w| w.project_ref.as_str()).unwrap_or("");
-        assert!(ref_val.is_empty(), "project_ref should be cleared after json unlink");
+        assert!(
+            ref_val.is_empty(),
+            "project_ref should be cleared after json unlink"
+        );
 
         std::fs::remove_dir_all(&cwd).ok();
     }
@@ -178,7 +189,11 @@ mod tests {
         let cwd = make_cwd("json-noop");
         scaffold_empty(&cwd);
 
-        let g = GlobalFlags { json: true, quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            json: true,
+            quiet: true,
+            ..Default::default()
+        };
         run_unlink(&g, &cwd).unwrap();
 
         std::fs::remove_dir_all(&cwd).ok();
@@ -199,7 +214,10 @@ mod tests {
         // Migration must still exist.
         assert!(mig.exists(), "migration file removed by unlink");
         // seed.sql must still exist.
-        assert!(cwd.join("basin/seed.sql").exists(), "seed.sql removed by unlink");
+        assert!(
+            cwd.join("basin/seed.sql").exists(),
+            "seed.sql removed by unlink"
+        );
         // config.toml must exist and have no project_ref.
         let toml = std::fs::read_to_string(cwd.join("basin/config.toml")).unwrap();
         assert!(
@@ -231,7 +249,10 @@ mod tests {
         let wp = crate::config::load_working_project(&cwd).unwrap().unwrap();
         assert!(wp.project_ref.is_empty(), "project_ref not cleared");
         assert_eq!(wp.default_branch, "dev", "default_branch was lost");
-        assert_eq!(wp.engine_version_pin, "1.2.3", "engine_version_pin was lost");
+        assert_eq!(
+            wp.engine_version_pin, "1.2.3",
+            "engine_version_pin was lost"
+        );
 
         std::fs::remove_dir_all(&cwd).ok();
     }

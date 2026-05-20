@@ -42,7 +42,10 @@ pub fn cmd_docs(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     }
 
     // First non-flag positional argument is the subcommand name.
-    let sub = m.get_one::<String>("subcommand").cloned().unwrap_or_default();
+    let sub = m
+        .get_one::<String>("subcommand")
+        .cloned()
+        .unwrap_or_default();
 
     // Build the target URL.
     let url = if sub.is_empty() {
@@ -56,7 +59,10 @@ pub fn cmd_docs(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     // suppress it unconditionally under --json.
     if g.json {
         // JSON shape: { "url": "https://docs.basin.run/cli[/<subcommand>]", "opened": false }
-        return print_json(&mut std::io::stdout(), &json!({ "url": url, "opened": false }));
+        return print_json(
+            &mut std::io::stdout(),
+            &json!({ "url": url, "opened": false }),
+        );
     }
 
     // Human path: emit a progress line then spawn the browser.
@@ -64,7 +70,8 @@ pub fn cmd_docs(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let (prog, prog_args) = open_command(std::env::consts::OS, &url);
     let mut cmd = std::process::Command::new(&prog);
     cmd.args(&prog_args);
-    cmd.spawn().map_err(|e| msg(format!("docs: could not open browser: {e}")))?;
+    cmd.spawn()
+        .map_err(|e| msg(format!("docs: could not open browser: {e}")))?;
     Ok(())
 }
 
@@ -155,7 +162,11 @@ mod tests {
     #[test]
     fn json_no_subcommand_no_browser() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { json: true, quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            json: true,
+            quiet: true,
+            ..Default::default()
+        };
         // Must succeed without spawning a browser (json mode).
         cmd_docs(&g, &[]).unwrap();
     }
@@ -163,7 +174,11 @@ mod tests {
     #[test]
     fn json_with_subcommand() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { json: true, quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            json: true,
+            quiet: true,
+            ..Default::default()
+        };
         // "db" subcommand — must not error.
         cmd_docs(&g, &["db".into()]).unwrap();
     }
@@ -174,8 +189,11 @@ mod tests {
         // touch stdout and potentially need a real URL).
         let url = "https://docs.basin.run/cli/branches".to_string();
         let v = json!({ "url": url, "opened": false });
-        assert_eq!(v["url"].as_str().unwrap(), "https://docs.basin.run/cli/branches");
-        assert_eq!(v["opened"].as_bool().unwrap(), false);
+        assert_eq!(
+            v["url"].as_str().unwrap(),
+            "https://docs.basin.run/cli/branches"
+        );
+        assert!(!v["opened"].as_bool().unwrap());
     }
 
     // ── help returns Ok ──────────────────────────────────────────────
@@ -183,7 +201,10 @@ mod tests {
     #[test]
     fn help_flag_returns_ok() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_docs(&g, &["--help".into()]).is_ok());
     }
 }

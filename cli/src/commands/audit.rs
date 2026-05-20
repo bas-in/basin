@@ -120,26 +120,27 @@ fn list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
 
     let since = m.get_one::<String>("since").cloned().unwrap_or_default();
     let until = m.get_one::<String>("until").cloned().unwrap_or_default();
-    let limit = m.get_one::<String>("limit").cloned().unwrap_or_else(|| "50".into());
+    let limit = m
+        .get_one::<String>("limit")
+        .cloned()
+        .unwrap_or_else(|| "50".into());
 
     let c = require_client(g)?;
     let q = query_string(&[("limit", &limit), ("since", &since), ("until", &until)]);
 
-    let resp: AuditResp = c.do_json(
-        Method::GET,
-        &format!("/v1/orgs/{org}/audit{q}"),
-        None,
-    ).map_err(|e| {
-        if let Some(ae) = as_api_error(e.as_ref()) {
-            if ae.http_status == 403 {
-                return msg(format!(
-                    "access denied: you must be an org member to view the audit log for {:?}",
-                    org
-                ));
+    let resp: AuditResp = c
+        .do_json(Method::GET, &format!("/v1/orgs/{org}/audit{q}"), None)
+        .map_err(|e| {
+            if let Some(ae) = as_api_error(e.as_ref()) {
+                if ae.http_status == 403 {
+                    return msg(format!(
+                        "access denied: you must be an org member to view the audit log for {:?}",
+                        org
+                    ));
+                }
             }
-        }
-        e
-    })?;
+            e
+        })?;
 
     if g.json {
         // JSON shape: { events: [ AuditEvent ] }
@@ -149,7 +150,17 @@ fn list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         println!("(no audit events)");
         return Ok(());
     }
-    let mut t = Table::new(g, &["ID", "ACTOR", "ACTION", "RESOURCE_TYPE", "RESOURCE_ID", "OCCURRED_AT"]);
+    let mut t = Table::new(
+        g,
+        &[
+            "ID",
+            "ACTOR",
+            "ACTION",
+            "RESOURCE_TYPE",
+            "RESOURCE_ID",
+            "OCCURRED_AT",
+        ],
+    );
     for ev in &resp.events {
         t.row(&[
             &ev.id,
@@ -198,14 +209,20 @@ mod tests {
     #[test]
     fn help_returns_ok() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_audit(&g, &["help".to_string()]).is_ok());
     }
 
     #[test]
     fn unknown_subcommand_is_silent_error() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_audit(&g, &["frobnicate".to_string()]).unwrap_err();
         assert!(crate::error::is_silent(err.as_ref()));
     }
@@ -231,7 +248,11 @@ mod tests {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "GET");
-            assert!(req.path.starts_with("/v1/orgs/my-org/audit"), "path={}", req.path);
+            assert!(
+                req.path.starts_with("/v1/orgs/my-org/audit"),
+                "path={}",
+                req.path
+            );
             Resp::ok(format!(r#"{{"events":[{}]}}"#, sample_event_json()))
         });
         let g = flags(&srv.url);
@@ -263,7 +284,8 @@ mod tests {
                 "--org=my-org".to_string(),
                 "--since=2026-01-01T00:00:00Z".to_string(),
             ],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     #[test]
@@ -281,7 +303,8 @@ mod tests {
                 "--org=my-org".to_string(),
                 "--until=2026-06-01T00:00:00Z".to_string(),
             ],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     #[test]
@@ -294,8 +317,13 @@ mod tests {
         let g = flags(&srv.url);
         cmd_audit(
             &g,
-            &["list".to_string(), "--org=my-org".to_string(), "--limit=25".to_string()],
-        ).unwrap();
+            &[
+                "list".to_string(),
+                "--org=my-org".to_string(),
+                "--limit=25".to_string(),
+            ],
+        )
+        .unwrap();
     }
 
     // ── JSON shape ──────────────────────────────────────────────────────────
@@ -306,11 +334,12 @@ mod tests {
         let srv = TestServer::start(|_req: &Req| {
             Resp::ok(format!(r#"{{"events":[{}]}}"#, sample_event_json()))
         });
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: AuditResp =
-            c.do_json(reqwest::Method::GET, "/v1/orgs/my-org/audit", None).unwrap();
+        let resp: AuditResp = c
+            .do_json(reqwest::Method::GET, "/v1/orgs/my-org/audit", None)
+            .unwrap();
         print_json(&mut buf, &json!({ "events": resp.events })).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         let events = v["events"].as_array().unwrap();
@@ -342,7 +371,8 @@ mod tests {
             Resp::status(404, r#"{"code":"not_found","message":"org not found"}"#)
         });
         let g = flags(&srv.url);
-        let err = cmd_audit(&g, &["list".to_string(), "--org=nonexistent".to_string()]).unwrap_err();
+        let err =
+            cmd_audit(&g, &["list".to_string(), "--org=nonexistent".to_string()]).unwrap_err();
         let ae = crate::error::as_api_error(err.as_ref()).expect("expected ApiError");
         assert_eq!(ae.http_status, 404);
     }
@@ -365,7 +395,11 @@ mod tests {
                 "--export=s3://my-bucket/audit".to_string(),
             ],
         );
-        assert!(result.is_ok(), "export deferred should return ok: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "export deferred should return ok: {:?}",
+            result
+        );
     }
 
     // ── globalFlags.orgSlug fallback ────────────────────────────────────────
@@ -374,7 +408,11 @@ mod tests {
     fn list_org_from_global_flags() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|req: &Req| {
-            assert!(req.path.starts_with("/v1/orgs/global-org/audit"), "path={}", req.path);
+            assert!(
+                req.path.starts_with("/v1/orgs/global-org/audit"),
+                "path={}",
+                req.path
+            );
             Resp::ok(r#"{"events":[]}"#)
         });
         let g = GlobalFlags {

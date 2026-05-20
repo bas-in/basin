@@ -54,12 +54,13 @@ fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
     if !flag_value.is_empty() {
         return Ok(flag_value.to_string());
     }
-    let cwd = std::env::current_dir()
-        .map_err(|e| msg(format!("could not determine cwd: {e}")))?;
+    let cwd = std::env::current_dir().map_err(|e| msg(format!("could not determine cwd: {e}")))?;
     let wp = load_working_project(&cwd)?;
     match wp {
         Some(w) if !w.project_ref.is_empty() => Ok(w.project_ref),
-        _ => Err(msg("--project is required (or run `basin link` to bind this directory)")),
+        _ => Err(msg(
+            "--project is required (or run `basin link` to bind this directory)",
+        )),
     }
 }
 
@@ -112,27 +113,32 @@ fn list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     }
     let project_flag = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project_flag)?;
-    let limit = m.get_one::<String>("limit").cloned().unwrap_or_else(|| "50".into());
+    let limit = m
+        .get_one::<String>("limit")
+        .cloned()
+        .unwrap_or_else(|| "50".into());
     let since = m.get_one::<String>("since").cloned().unwrap_or_default();
 
     let c = require_client(g)?;
 
     let q = query_string(&[("limit", &limit), ("since", &since)]);
-    let resp: ActivityResp = c.do_json(
-        Method::GET,
-        &format!("/v1/projects/{ref}/activity{q}"),
-        None,
-    ).map_err(|e| {
-        if let Some(ae) = as_api_error(e.as_ref()) {
-            if ae.http_status == 403 {
-                return msg(format!(
-                    "access denied: insufficient permissions to view activity for project {:?}",
-                    r#ref
-                ));
+    let resp: ActivityResp = c
+        .do_json(
+            Method::GET,
+            &format!("/v1/projects/{ref}/activity{q}"),
+            None,
+        )
+        .map_err(|e| {
+            if let Some(ae) = as_api_error(e.as_ref()) {
+                if ae.http_status == 403 {
+                    return msg(format!(
+                        "access denied: insufficient permissions to view activity for project {:?}",
+                        r#ref
+                    ));
+                }
             }
-        }
-        e
-    })?;
+            e
+        })?;
 
     if g.json {
         // JSON shape: { events: [ ActivityEvent ] }
@@ -208,7 +214,10 @@ mod tests {
     #[test]
     fn help_returns_ok() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_activity(&g, &["help".to_string()]).is_ok());
     }
 
@@ -219,7 +228,10 @@ mod tests {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "GET");
-            assert_eq!(req.path.split('?').next().unwrap(), "/v1/projects/proj1/activity");
+            assert_eq!(
+                req.path.split('?').next().unwrap(),
+                "/v1/projects/proj1/activity"
+            );
             Resp::ok(format!(r#"{{"events":[{}]}}"#, sample_event()))
         });
         let g = flags(&srv.url);
@@ -246,8 +258,13 @@ mod tests {
         let g = flags(&srv.url);
         cmd_activity(
             &g,
-            &["list".to_string(), "--project=proj1".to_string(), "--limit=20".to_string()],
-        ).unwrap();
+            &[
+                "list".to_string(),
+                "--project=proj1".to_string(),
+                "--limit=20".to_string(),
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -265,7 +282,8 @@ mod tests {
                 "--project=proj1".to_string(),
                 "--since=2026-01-01T00:00:00Z".to_string(),
             ],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     // ── JSON shape ──────────────────────────────────────────────────────────
@@ -276,18 +294,22 @@ mod tests {
         let srv = TestServer::start(|_req: &Req| {
             Resp::ok(format!(r#"{{"events":[{}]}}"#, sample_event()))
         });
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: ActivityResp =
-            c.do_json(reqwest::Method::GET, "/v1/projects/proj1/activity", None).unwrap();
+        let resp: ActivityResp = c
+            .do_json(reqwest::Method::GET, "/v1/projects/proj1/activity", None)
+            .unwrap();
         print_json(&mut buf, &json!({ "events": resp.events })).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         let events = v["events"].as_array().unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["id"].as_str().unwrap(), "act1");
         assert_eq!(events[0]["kind"].as_str().unwrap(), "migration.apply");
-        assert_eq!(events[0]["summary"].as_str().unwrap(), "Applied migration v1");
+        assert_eq!(
+            events[0]["summary"].as_str().unwrap(),
+            "Applied migration v1"
+        );
     }
 
     // ── error mapping ───────────────────────────────────────────────────────
@@ -296,10 +318,14 @@ mod tests {
     fn list_403_gives_access_denied_message() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(403, r#"{"code":"forbidden","message":"insufficient permissions"}"#)
+            Resp::status(
+                403,
+                r#"{"code":"forbidden","message":"insufficient permissions"}"#,
+            )
         });
         let g = flags(&srv.url);
-        let err = cmd_activity(&g, &["list".to_string(), "--project=proj1".to_string()]).unwrap_err();
+        let err =
+            cmd_activity(&g, &["list".to_string(), "--project=proj1".to_string()]).unwrap_err();
         assert!(
             err.to_string().contains("access denied") || err.to_string().contains("forbidden"),
             "err={err}"
@@ -313,7 +339,8 @@ mod tests {
             Resp::status(404, r#"{"code":"not_found","message":"project not found"}"#)
         });
         let g = flags(&srv.url);
-        let err = cmd_activity(&g, &["list".to_string(), "--project=proj1".to_string()]).unwrap_err();
+        let err =
+            cmd_activity(&g, &["list".to_string(), "--project=proj1".to_string()]).unwrap_err();
         let ae = crate::error::as_api_error(err.as_ref()).expect("expected ApiError");
         assert_eq!(ae.http_status, 404);
     }
@@ -322,10 +349,14 @@ mod tests {
     fn list_422_propagates_as_api_error() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(422, r#"{"code":"validation_error","message":"invalid since value"}"#)
+            Resp::status(
+                422,
+                r#"{"code":"validation_error","message":"invalid since value"}"#,
+            )
         });
         let g = flags(&srv.url);
-        let err = cmd_activity(&g, &["list".to_string(), "--project=proj1".to_string()]).unwrap_err();
+        let err =
+            cmd_activity(&g, &["list".to_string(), "--project=proj1".to_string()]).unwrap_err();
         let ae = crate::error::as_api_error(err.as_ref()).expect("expected ApiError");
         assert_eq!(ae.http_status, 422);
     }

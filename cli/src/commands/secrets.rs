@@ -89,8 +89,11 @@ fn list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         return Err(msg("--project is required"));
     }
     let c = require_client(g)?;
-    let resp: SecretsListResp =
-        c.do_json(Method::GET, &format!("/v1/projects/{project}/secrets"), None)?;
+    let resp: SecretsListResp = c.do_json(
+        Method::GET,
+        &format!("/v1/projects/{project}/secrets"),
+        None,
+    )?;
     if g.json {
         // JSON shape: { secrets: [ { key: string, prefix: string, updated_at: string } ] }
         return print_json(
@@ -142,17 +145,21 @@ fn set(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let mut secrets: serde_json::Map<String, serde_json::Value> =
         serde_json::Map::with_capacity(pairs.len());
     for kv in &pairs {
-        let i = kv.find('=').filter(|&p| p > 0).ok_or_else(|| {
-            msg(format!("invalid pair {kv:?} (expected KEY=VALUE)"))
-        })?;
+        let i = kv
+            .find('=')
+            .filter(|&p| p > 0)
+            .ok_or_else(|| msg(format!("invalid pair {kv:?} (expected KEY=VALUE)")))?;
         let key = kv[..i].to_string();
         let val = kv[i + 1..].to_string();
         secrets.insert(key, json!(val));
     }
     let c = require_client(g)?;
     let body = json!({ "secrets": secrets });
-    let out: serde_json::Value =
-        c.do_json(Method::PUT, &format!("/v1/projects/{project}/secrets"), Some(body))?;
+    let out: serde_json::Value = c.do_json(
+        Method::PUT,
+        &format!("/v1/projects/{project}/secrets"),
+        Some(body),
+    )?;
     if g.json {
         // JSON shape: passthrough of /v1/projects/:ref/secrets PUT envelope
         // (commonly { updated: int, secrets: [{key,prefix,updated_at}] }).
@@ -224,35 +231,60 @@ mod tests {
     #[test]
     fn missing_subcommand_is_error() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_secrets(&g, &[]).is_err());
     }
 
     #[test]
     fn unknown_subcommand_is_error() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_secrets(&g, &["frobnicate".into()]).is_err());
     }
 
     #[test]
     fn list_missing_project_is_error() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_secrets(&g, &["list".into()]).is_err());
     }
 
     #[test]
     fn set_missing_pairs_is_error() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_secrets(&g, &["set".into(), "--project=p1".into()]).is_err());
     }
 
     #[test]
     fn rm_missing_keys_is_error() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_secrets(&g, &["rm".into(), "--project=p1".into()]).is_err());
     }
 
@@ -340,7 +372,10 @@ mod tests {
     fn list_server_404_returns_api_error() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(404, r#"{"error":{"code":"not_found","message":"project not found"}}"#)
+            Resp::status(
+                404,
+                r#"{"error":{"code":"not_found","message":"project not found"}}"#,
+            )
         });
         let err = cmd_secrets(&flags(&srv.url), &["list".into(), "--project=p1".into()]);
         assert!(err.is_err());
@@ -378,7 +413,10 @@ mod tests {
     #[test]
     fn help_returns_ok() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_secrets(&g, &["help".into()]).is_ok());
     }
 }

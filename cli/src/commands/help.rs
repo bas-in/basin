@@ -36,9 +36,19 @@ pub fn print_top_level_help<W: Write>(w: &mut W) {
     let _ = writeln!(w, "  basin [global flags] <command> [args]");
     let _ = writeln!(w);
     let _ = writeln!(w, "GLOBAL FLAGS");
-    let _ = writeln!(w, "  --api-url=<url>    Override the API endpoint (default {}).", default_api_url());
-    let _ = writeln!(w, "  --token=<pat>      Use this PAT instead of the on-disk config.");
-    let _ = writeln!(w, "  --org=<slug>       Use the per-org token from the config file.");
+    let _ = writeln!(
+        w,
+        "  --api-url=<url>    Override the API endpoint (default {}).",
+        default_api_url()
+    );
+    let _ = writeln!(
+        w,
+        "  --token=<pat>      Use this PAT instead of the on-disk config."
+    );
+    let _ = writeln!(
+        w,
+        "  --org=<slug>       Use the per-org token from the config file."
+    );
     let _ = writeln!(w, "  --json             Emit machine-readable JSON.");
     let _ = writeln!(w, "  -q, --quiet        Suppress non-essential output.");
     let _ = writeln!(w, "  --no-color         Disable ANSI colour in tables.");
@@ -47,8 +57,14 @@ pub fn print_top_level_help<W: Write>(w: &mut W) {
     let _ = writeln!(w, "ENVIRONMENT");
     let _ = writeln!(w, "  BASIN_TOKEN        Same as --token.");
     let _ = writeln!(w, "  BASIN_API          Same as --api-url.");
-    let _ = writeln!(w, "  XDG_CONFIG_HOME    Where to look for config.json (default ~/.config).");
-    let _ = writeln!(w, "  NO_COLOR           Disable ANSI colour (any non-empty value).");
+    let _ = writeln!(
+        w,
+        "  XDG_CONFIG_HOME    Where to look for config.json (default ~/.config)."
+    );
+    let _ = writeln!(
+        w,
+        "  NO_COLOR           Disable ANSI colour (any non-empty value)."
+    );
     let _ = writeln!(w);
     let _ = writeln!(w, "COMMANDS");
     let cmds = all();

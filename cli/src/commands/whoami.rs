@@ -27,8 +27,7 @@ struct OrgsResp {
 }
 
 pub fn cmd_whoami(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
-    let cmd = Command::new("whoami")
-        .arg(Arg::new("help").long("help").action(ArgAction::SetTrue));
+    let cmd = Command::new("whoami").arg(Arg::new("help").long("help").action(ArgAction::SetTrue));
     let m = parse_or_silent(cmd, args)?;
     if m.get_flag("help") {
         help_for_command("whoami", "Print the active user + accessible orgs.", &[]);

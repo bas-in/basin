@@ -125,8 +125,8 @@ impl Client {
 /// public bootstrap routes). A null/absent `data` falls through to flat
 /// so a `{"data":null}` 204-shape doesn't blank out the caller's struct.
 pub fn unwrap_envelope<T: DeserializeOwned>(text: &str) -> CliResult<T> {
-    let raw: Value = serde_json::from_str(text)
-        .map_err(|e| msg(format!("decode response: {e}")))?;
+    let raw: Value =
+        serde_json::from_str(text).map_err(|e| msg(format!("decode response: {e}")))?;
     if let Some(data) = raw.get("data") {
         if !data.is_null() {
             return Ok(serde_json::from_value(data.clone())?);
@@ -207,9 +207,10 @@ mod tests {
 
     #[test]
     fn unwraps_data_envelope() {
-        let q: QueryResult =
-            unwrap_envelope(r#"{"data":{"columns":["x"],"rows":[[1]],"elapsed_ms":3},"error":null}"#)
-                .unwrap();
+        let q: QueryResult = unwrap_envelope(
+            r#"{"data":{"columns":["x"],"rows":[[1]],"elapsed_ms":3},"error":null}"#,
+        )
+        .unwrap();
         assert_eq!(q.columns, vec!["x"]);
         assert_eq!(q.elapsed_ms, 3);
     }
@@ -247,7 +248,10 @@ mod tests {
     #[test]
     fn query_string_sorts_and_skips_empty() {
         assert_eq!(query_string(&[]), "");
-        assert_eq!(query_string(&[("b", "2"), ("a", "1"), ("c", "")]), "?a=1&b=2");
+        assert_eq!(
+            query_string(&[("b", "2"), ("a", "1"), ("c", "")]),
+            "?a=1&b=2"
+        );
         assert_eq!(query_string(&[("q", "a b")]), "?q=a+b");
     }
 }

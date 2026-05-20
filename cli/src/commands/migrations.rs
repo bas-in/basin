@@ -86,12 +86,13 @@ fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
     if !flag_value.is_empty() {
         return Ok(flag_value.to_string());
     }
-    let cwd = std::env::current_dir()
-        .map_err(|e| msg(format!("could not determine cwd: {e}")))?;
+    let cwd = std::env::current_dir().map_err(|e| msg(format!("could not determine cwd: {e}")))?;
     let wp = load_working_project(&cwd)?;
     match wp {
         Some(w) if !w.project_ref.is_empty() => Ok(w.project_ref),
-        _ => Err(msg("--project is required (or run `basin link` to bind this directory)")),
+        _ => Err(msg(
+            "--project is required (or run `basin link` to bind this directory)",
+        )),
     }
 }
 
@@ -104,15 +105,18 @@ fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
 /// "migration".
 fn to_slug(name: &str) -> String {
     // Map characters.
-    let mapped: String = name.chars().map(|c| {
-        if c.is_ascii_lowercase() || c.is_ascii_digit() {
-            c
-        } else if c.is_ascii_uppercase() {
-            c.to_ascii_lowercase()
-        } else {
-            '_'
-        }
-    }).collect();
+    let mapped: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() {
+                c
+            } else if c.is_ascii_uppercase() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
 
     // Collapse runs of two or more underscores.
     let mut collapsed = String::with_capacity(mapped.len());
@@ -196,11 +200,17 @@ fn list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let project = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project)?;
     let c = require_client(g)?;
-    let resp: MigrationsListResp =
-        c.do_json(Method::GET, &format!("/admin/v1/projects/{ref}/migrations"), None)?;
+    let resp: MigrationsListResp = c.do_json(
+        Method::GET,
+        &format!("/admin/v1/projects/{ref}/migrations"),
+        None,
+    )?;
     if g.json {
         // JSON shape: { migrations: [ MigrationRow ] }
-        return print_json(&mut std::io::stdout(), &json!({ "migrations": resp.migrations }));
+        return print_json(
+            &mut std::io::stdout(),
+            &json!({ "migrations": resp.migrations }),
+        );
     }
     let mut t = Table::new(g, &["ID", "AT", "OP", "TABLE", "SUMMARY"]);
     for m in &resp.migrations {
@@ -270,8 +280,11 @@ pub fn cmd_migrations_new(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     if name.is_empty() {
         return Err(msg("usage: basin migrations new <name>"));
     }
-    let cwd = std::env::current_dir()
-        .map_err(|e| msg(format!("migrations new: could not determine working directory: {e}")))?;
+    let cwd = std::env::current_dir().map_err(|e| {
+        msg(format!(
+            "migrations new: could not determine working directory: {e}"
+        ))
+    })?;
     run_migrations_new(g, &cwd, &name)
 }
 
@@ -284,8 +297,11 @@ fn new(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
 pub fn run_migrations_new(g: &GlobalFlags, cwd: &Path, name: &str) -> CliResult<()> {
     let slug = to_slug(name);
     let dir = cwd.join("basin").join("migrations");
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| msg(format!("migrations new: could not create migrations dir: {e}")))?;
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        msg(format!(
+            "migrations new: could not create migrations dir: {e}"
+        ))
+    })?;
 
     // Pick a timestamp, bumping by 1s on collision (mirrors Go).
     let now = std::time::SystemTime::now()
@@ -353,8 +369,11 @@ fn get(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let project = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project)?;
     let c = require_client(g)?;
-    let detail: MigrationDetail =
-        c.do_json(Method::GET, &format!("/admin/v1/projects/{ref}/migrations/{id}"), None)?;
+    let detail: MigrationDetail = c.do_json(
+        Method::GET,
+        &format!("/admin/v1/projects/{ref}/migrations/{id}"),
+        None,
+    )?;
     if g.json {
         // JSON shape: MigrationDetail { id, status, applied_at, sql, source, summary, op, table, at, author }
         return print_json(&mut std::io::stdout(), &detail);
@@ -400,8 +419,11 @@ fn diff(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let project = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project)?;
     let c = require_client(g)?;
-    let resp: serde_json::Value =
-        c.do_json(Method::GET, &format!("/admin/v1/projects/{ref}/migrations/diff"), None)?;
+    let resp: serde_json::Value = c.do_json(
+        Method::GET,
+        &format!("/admin/v1/projects/{ref}/migrations/diff"),
+        None,
+    )?;
     if g.json {
         // JSON shape: passthrough of diff envelope.
         return print_json(&mut std::io::stdout(), &resp);
@@ -487,8 +509,7 @@ mod tests {
     // ── helpers ───────────────────────────────────────────────────────────────
 
     fn make_cwd(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("basin-mig-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("basin-mig-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -584,19 +605,31 @@ mod tests {
     fn new_writes_file() {
         let _cfg = with_temp_config_dir();
         let cwd = make_cwd("new-writes");
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
 
         run_migrations_new(&g, &cwd, "add users table").unwrap();
 
         let dir = cwd.join("basin/migrations");
-        let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).collect();
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
         assert_eq!(entries.len(), 1, "expected exactly one file");
         let name = entries[0].file_name().to_string_lossy().to_string();
         assert!(name.ends_with("_add_users_table.sql"), "filename: {name}");
 
         let content = std::fs::read_to_string(entries[0].path()).unwrap();
-        assert!(content.contains("-- migration: add users table"), "header missing: {content:?}");
-        assert!(content.contains("-- created:"), "created header missing: {content:?}");
+        assert!(
+            content.contains("-- migration: add users table"),
+            "header missing: {content:?}"
+        );
+        assert!(
+            content.contains("-- created:"),
+            "created header missing: {content:?}"
+        );
 
         std::fs::remove_dir_all(&cwd).ok();
     }
@@ -605,7 +638,10 @@ mod tests {
     fn new_collision_bump() {
         let _cfg = with_temp_config_dir();
         let cwd = make_cwd("collision");
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
 
         run_migrations_new(&g, &cwd, "bump test").unwrap();
         run_migrations_new(&g, &cwd, "bump test").unwrap();
@@ -617,10 +653,22 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         entries.sort();
-        assert_eq!(entries.len(), 2, "expected 2 files after collision bump: {entries:?}");
+        assert_eq!(
+            entries.len(),
+            2,
+            "expected 2 files after collision bump: {entries:?}"
+        );
         assert_ne!(entries[0], entries[1], "paths must differ");
-        assert!(entries[0].ends_with("_bump_test.sql"), "slug 1: {}", entries[0]);
-        assert!(entries[1].ends_with("_bump_test.sql"), "slug 2: {}", entries[1]);
+        assert!(
+            entries[0].ends_with("_bump_test.sql"),
+            "slug 1: {}",
+            entries[0]
+        );
+        assert!(
+            entries[1].ends_with("_bump_test.sql"),
+            "slug 2: {}",
+            entries[1]
+        );
 
         std::fs::remove_dir_all(&cwd).ok();
     }
@@ -628,7 +676,10 @@ mod tests {
     #[test]
     fn new_missing_name_error() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_migrations(&g, &["new".into()]).unwrap_err();
         assert!(err.to_string().contains("usage"), "error: {err}");
     }
@@ -637,14 +688,21 @@ mod tests {
     fn new_json_output() {
         let _cfg = with_temp_config_dir();
         let cwd = make_cwd("new-json");
-        let g = GlobalFlags { json: true, quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            json: true,
+            quiet: true,
+            ..Default::default()
+        };
 
         // We can't easily capture stdout in unit tests, but we can verify the fn succeeds
         // and the file exists.
         run_migrations_new(&g, &cwd, "json output test").unwrap();
 
         let dir = cwd.join("basin/migrations");
-        let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).collect();
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
         assert_eq!(entries.len(), 1);
         let name = entries[0].file_name().to_string_lossy().to_string();
         assert!(name.ends_with("_json_output_test.sql"), "filename: {name}");
@@ -660,7 +718,9 @@ mod tests {
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "GET");
             assert_eq!(req.path, "/admin/v1/projects/proj-abc/migrations");
-            Resp::ok(r#"{"migrations":[{"id":"m1","at":"2026-01-01T00:00:00Z","op":"CREATE_TABLE","table":"users","summary":"create users"}]}"#)
+            Resp::ok(
+                r#"{"migrations":[{"id":"m1","at":"2026-01-01T00:00:00Z","op":"CREATE_TABLE","table":"users","summary":"create users"}]}"#,
+            )
         });
         let g = flags(&srv.url);
         cmd_migrations(&g, &["list".into(), "--project=proj-abc".into()]).unwrap();
@@ -692,7 +752,10 @@ mod tests {
         scaffold(&cwd);
         save_working_project(
             &cwd,
-            &WorkingProject { project_ref: "linked-proj".into(), ..Default::default() },
+            &WorkingProject {
+                project_ref: "linked-proj".into(),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -735,17 +798,27 @@ mod tests {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "POST");
-            assert_eq!(req.path, "/admin/v1/projects/proj-abc/migrations/m1/rollback");
+            assert_eq!(
+                req.path,
+                "/admin/v1/projects/proj-abc/migrations/m1/rollback"
+            );
             Resp::ok(r#"{"applied":true}"#)
         });
         let g = flags(&srv.url);
-        cmd_migrations(&g, &["apply".into(), "--project=proj-abc".into(), "m1".into()]).unwrap();
+        cmd_migrations(
+            &g,
+            &["apply".into(), "--project=proj-abc".into(), "m1".into()],
+        )
+        .unwrap();
     }
 
     #[test]
     fn apply_missing_id_error() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_migrations(&g, &["apply".into()]).unwrap_err();
         assert!(err.to_string().contains("usage"), "error: {err}");
     }
@@ -758,21 +831,33 @@ mod tests {
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "GET");
             assert_eq!(req.path, "/admin/v1/projects/proj-abc/migrations/m42");
-            Resp::ok(r#"{"id":"m42","status":"applied","applied_at":"2026-03-01T12:00:00Z","sql":"CREATE TABLE foo (id bigint primary key);","op":"CREATE_TABLE","table":"foo"}"#)
+            Resp::ok(
+                r#"{"id":"m42","status":"applied","applied_at":"2026-03-01T12:00:00Z","sql":"CREATE TABLE foo (id bigint primary key);","op":"CREATE_TABLE","table":"foo"}"#,
+            )
         });
         let g = flags(&srv.url);
-        cmd_migrations(&g, &["get".into(), "--project=proj-abc".into(), "m42".into()]).unwrap();
+        cmd_migrations(
+            &g,
+            &["get".into(), "--project=proj-abc".into(), "m42".into()],
+        )
+        .unwrap();
     }
 
     #[test]
     fn get_404_propagates() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(404, r#"{"error":{"code":"not_found","message":"migration not found"}}"#)
+            Resp::status(
+                404,
+                r#"{"error":{"code":"not_found","message":"migration not found"}}"#,
+            )
         });
         let g = flags(&srv.url);
-        let err = cmd_migrations(&g, &["get".into(), "--project=proj-abc".into(), "notexist".into()])
-            .unwrap_err();
+        let err = cmd_migrations(
+            &g,
+            &["get".into(), "--project=proj-abc".into(), "notexist".into()],
+        )
+        .unwrap_err();
         let ae = as_api_error(err.as_ref()).expect("expected ApiError");
         assert_eq!(ae.http_status, 404);
     }
@@ -781,16 +866,25 @@ mod tests {
     fn get_json_shape() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"id":"m7","status":"applied","applied_at":"2026-04-01T00:00:00Z","sql":"SELECT 1;"}"#)
+            Resp::ok(
+                r#"{"id":"m7","status":"applied","applied_at":"2026-04-01T00:00:00Z","sql":"SELECT 1;"}"#,
+            )
         });
         let g = flags_json(&srv.url);
-        cmd_migrations(&g, &["get".into(), "--project=proj-abc".into(), "m7".into()]).unwrap();
+        cmd_migrations(
+            &g,
+            &["get".into(), "--project=proj-abc".into(), "m7".into()],
+        )
+        .unwrap();
     }
 
     #[test]
     fn get_missing_id_error() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_migrations(&g, &["get".into(), "--project=proj-abc".into()]).unwrap_err();
         assert!(err.to_string().contains("usage"), "error: {err}");
     }
@@ -813,7 +907,9 @@ mod tests {
     fn diff_real_diff_prints_content() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"diff":"--- a/schema.sql\n+++ b/schema.sql\n@@ -0,0 +1 @@\n+CREATE TABLE bar (id bigint);\n"}"#)
+            Resp::ok(
+                r#"{"diff":"--- a/schema.sql\n+++ b/schema.sql\n@@ -0,0 +1 @@\n+CREATE TABLE bar (id bigint);\n"}"#,
+            )
         });
         let g = flags(&srv.url);
         cmd_migrations(&g, &["diff".into(), "--project=proj-abc".into()]).unwrap();
@@ -823,7 +919,10 @@ mod tests {
     fn diff_500_propagates() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(500, r#"{"error":{"code":"diff_error","message":"engine unavailable"}}"#)
+            Resp::status(
+                500,
+                r#"{"error":{"code":"diff_error","message":"engine unavailable"}}"#,
+            )
         });
         let g = flags(&srv.url);
         let err = cmd_migrations(&g, &["diff".into(), "--project=proj-abc".into()]).unwrap_err();
@@ -849,13 +948,21 @@ mod tests {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "POST");
-            assert_eq!(req.path, "/admin/v1/projects/proj-abc/migrations/m99/rollback");
+            assert_eq!(
+                req.path,
+                "/admin/v1/projects/proj-abc/migrations/m99/rollback"
+            );
             Resp::ok(r#"{"rolled_back":true,"migration_id":"m99"}"#)
         });
         let g = flags(&srv.url);
         cmd_migrations(
             &g,
-            &["rollback".into(), "--project=proj-abc".into(), "--yes".into(), "m99".into()],
+            &[
+                "rollback".into(),
+                "--project=proj-abc".into(),
+                "--yes".into(),
+                "m99".into(),
+            ],
         )
         .unwrap();
     }
@@ -879,12 +986,20 @@ mod tests {
     fn rollback_409_propagates() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(409, r#"{"error":{"code":"mid_flight","message":"migration in progress"}}"#)
+            Resp::status(
+                409,
+                r#"{"error":{"code":"mid_flight","message":"migration in progress"}}"#,
+            )
         });
         let g = flags(&srv.url);
         let err = cmd_migrations(
             &g,
-            &["rollback".into(), "--project=proj-abc".into(), "--yes".into(), "m99".into()],
+            &[
+                "rollback".into(),
+                "--project=proj-abc".into(),
+                "--yes".into(),
+                "m99".into(),
+            ],
         )
         .unwrap_err();
         let ae = as_api_error(err.as_ref()).expect("expected ApiError");
@@ -895,7 +1010,10 @@ mod tests {
     #[test]
     fn rollback_missing_id_error() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_migrations(&g, &["rollback".into()]).unwrap_err();
         assert!(err.to_string().contains("usage"), "error: {err}");
     }
@@ -905,7 +1023,10 @@ mod tests {
     #[test]
     fn no_subcommand_error() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_migrations(&g, &[]).unwrap_err();
         assert!(err.to_string().contains("usage"), "error: {err}");
     }
@@ -913,7 +1034,10 @@ mod tests {
     #[test]
     fn unknown_subcommand_is_silent_error() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_migrations(&g, &["frobnicate".into()]).unwrap_err();
         assert!(crate::error::is_silent(err.as_ref()), "error: {err}");
     }
@@ -921,7 +1045,10 @@ mod tests {
     #[test]
     fn help_returns_ok() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         cmd_migrations(&g, &["help".into()]).unwrap();
     }
 }

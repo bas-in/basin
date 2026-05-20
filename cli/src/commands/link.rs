@@ -143,8 +143,7 @@ fn run_link(g: &GlobalFlags, cwd: &Path, project_ref: &str, force: bool) -> CliR
 
     // Write the binding (preserving other fields).
     wp.project_ref = project_ref.to_string();
-    save_working_project(cwd, &wp)
-        .map_err(|e| msg(format!("link: write config.toml: {e}")))?;
+    save_working_project(cwd, &wp).map_err(|e| msg(format!("link: write config.toml: {e}")))?;
 
     if g.json {
         // JSON shape: { "project_ref": string, "linked": true, "previous_ref": string }
@@ -180,8 +179,7 @@ mod tests {
     use crate::testutil::{with_temp_config_dir, Req, Resp, TestServer};
 
     fn make_cwd(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("basin-link-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("basin-link-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -214,7 +212,12 @@ mod tests {
     }
 
     fn flags(url: &str) -> GlobalFlags {
-        GlobalFlags { api_url: url.into(), token: "tok".into(), quiet: true, ..Default::default() }
+        GlobalFlags {
+            api_url: url.into(),
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -255,13 +258,23 @@ mod tests {
         let _cfg = with_temp_config_dir();
         let cwd = make_cwd("alreadylinked");
         scaffold(&cwd);
-        save_working_project(&cwd, &WorkingProject { project_ref: "proj-1".into(), ..Default::default() }).unwrap();
+        save_working_project(
+            &cwd,
+            &WorkingProject {
+                project_ref: "proj-1".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         let srv = srv_known(&["proj-2"]);
         let g = flags(&srv.url);
 
         let err = run_link(&g, &cwd, "proj-2", false).unwrap_err();
-        assert!(err.to_string().contains("--force"), "error should mention --force: {err}");
+        assert!(
+            err.to_string().contains("--force"),
+            "error should mention --force: {err}"
+        );
 
         // Binding unchanged.
         let wp = load_working_project(&cwd).unwrap().unwrap();
@@ -275,7 +288,14 @@ mod tests {
         let _cfg = with_temp_config_dir();
         let cwd = make_cwd("force");
         scaffold(&cwd);
-        save_working_project(&cwd, &WorkingProject { project_ref: "proj-1".into(), ..Default::default() }).unwrap();
+        save_working_project(
+            &cwd,
+            &WorkingProject {
+                project_ref: "proj-1".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         let srv = srv_known(&["proj-2"]);
         let g = flags(&srv.url);
@@ -310,7 +330,14 @@ mod tests {
         let _cfg = with_temp_config_dir();
         let cwd = make_cwd("samref");
         scaffold(&cwd);
-        save_working_project(&cwd, &WorkingProject { project_ref: "same-proj".into(), ..Default::default() }).unwrap();
+        save_working_project(
+            &cwd,
+            &WorkingProject {
+                project_ref: "same-proj".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         let srv = srv_known(&["same-proj"]);
         let g = flags(&srv.url);
@@ -400,7 +427,10 @@ mod tests {
         scaffold(&cwd);
         save_working_project(
             &cwd,
-            &WorkingProject { project_ref: "existing-proj".into(), ..Default::default() },
+            &WorkingProject {
+                project_ref: "existing-proj".into(),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -426,7 +456,10 @@ mod tests {
         scaffold(&cwd);
         save_working_project(
             &cwd,
-            &WorkingProject { project_ref: "old-proj".into(), ..Default::default() },
+            &WorkingProject {
+                project_ref: "old-proj".into(),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -469,8 +502,14 @@ mod tests {
     fn link_missing_project_flag() {
         let _cfg = with_temp_config_dir();
         // --project is required; cmd_link with empty project should error.
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_link(&g, &[]).unwrap_err();
-        assert!(err.to_string().contains("--project"), "error should mention --project: {err}");
+        assert!(
+            err.to_string().contains("--project"),
+            "error should mention --project: {err}"
+        );
     }
 }

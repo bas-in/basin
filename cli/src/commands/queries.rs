@@ -136,12 +136,13 @@ fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
     if !flag_value.is_empty() {
         return Ok(flag_value.to_string());
     }
-    let cwd = std::env::current_dir()
-        .map_err(|e| msg(format!("could not determine cwd: {e}")))?;
+    let cwd = std::env::current_dir().map_err(|e| msg(format!("could not determine cwd: {e}")))?;
     let wp = load_working_project(&cwd)?;
     match wp {
         Some(w) if !w.project_ref.is_empty() => Ok(w.project_ref),
-        _ => Err(msg("--project is required (or run `basin link` to bind this directory)")),
+        _ => Err(msg(
+            "--project is required (or run `basin link` to bind this directory)",
+        )),
     }
 }
 
@@ -216,7 +217,10 @@ fn queries_save(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     }
     let project = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project)?;
-    let description = m.get_one::<String>("description").cloned().unwrap_or_default();
+    let description = m
+        .get_one::<String>("description")
+        .cloned()
+        .unwrap_or_default();
     let public = m.get_flag("public");
 
     let c = require_client(g)?;
@@ -224,8 +228,11 @@ fn queries_save(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     if !description.is_empty() {
         body["description"] = json!(description);
     }
-    let resp: SaveQueryResp =
-        c.do_json(Method::POST, &format!("/v1/projects/{ref}/sql/saved"), Some(body))?;
+    let resp: SaveQueryResp = c.do_json(
+        Method::POST,
+        &format!("/v1/projects/{ref}/sql/saved"),
+        Some(body),
+    )?;
     if g.json {
         // JSON shape: { "query": { id, name, sql, description, public, created_at } }
         return print_json(&mut std::io::stdout(), &json!({ "query": resp.query }));
@@ -304,8 +311,8 @@ fn queries_get(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     // --project accepted but not required (ignored by server).
     let c = require_client(g)?;
     // Top-level route (not project-scoped) — see cloud router anchor sql-saved-by-id.
-    let resp: GetQueryResp =
-        c.do_json(Method::GET, &format!("/v1/sql/saved/{id}"), None)
+    let resp: GetQueryResp = c
+        .do_json(Method::GET, &format!("/v1/sql/saved/{id}"), None)
         .map_err(|err| {
             if let Some(ae) = as_api_error(err.as_ref()) {
                 if ae.http_status == 404 {
@@ -320,7 +327,9 @@ fn queries_get(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
             }
             err
         })?;
-    let q = resp.query.ok_or_else(|| msg(format!("query {:?} not found", id)))?;
+    let q = resp
+        .query
+        .ok_or_else(|| msg(format!("query {:?} not found", id)))?;
     if g.json {
         // JSON shape: { "query": { id, name, sql, description, public, created_at } }
         return print_json(&mut std::io::stdout(), &json!({ "query": q }));
@@ -373,8 +382,12 @@ fn queries_fork(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         body["name"] = json!(name);
     }
     // Top-level route (not project-scoped) — see cloud router anchor sql-saved-by-id.
-    let resp: ForkQueryResp =
-        c.do_json(Method::POST, &format!("/v1/sql/saved/{id}/fork"), Some(body))
+    let resp: ForkQueryResp = c
+        .do_json(
+            Method::POST,
+            &format!("/v1/sql/saved/{id}/fork"),
+            Some(body),
+        )
         .map_err(|err| {
             if let Some(ae) = as_api_error(err.as_ref()) {
                 if ae.http_status == 404 {
@@ -441,8 +454,8 @@ fn queries_delete(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     }
 
     // Top-level route (not project-scoped) — see cloud router anchor sql-saved-by-id.
-    let resp: DeleteQueryResp =
-        c.do_json(Method::DELETE, &format!("/v1/sql/saved/{id}"), None)
+    let resp: DeleteQueryResp = c
+        .do_json(Method::DELETE, &format!("/v1/sql/saved/{id}"), None)
         .map_err(|err| {
             if let Some(ae) = as_api_error(err.as_ref()) {
                 if ae.http_status == 404 {
@@ -453,7 +466,10 @@ fn queries_delete(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         })?;
     if g.json {
         // JSON shape: { "deleted": true, "id": "<query id>" }
-        return print_json(&mut std::io::stdout(), &json!({ "deleted": resp.deleted, "id": resp.id }));
+        return print_json(
+            &mut std::io::stdout(),
+            &json!({ "deleted": resp.deleted, "id": resp.id }),
+        );
     }
     println!("Deleted query {}.", id);
     Ok(())
@@ -499,10 +515,18 @@ fn queries_history(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     }
 }
 
-fn history_list(g: &GlobalFlags, c: &crate::client::Client, r#ref: &str, limit: i64) -> CliResult<()> {
+fn history_list(
+    g: &GlobalFlags,
+    c: &crate::client::Client,
+    r#ref: &str,
+    limit: i64,
+) -> CliResult<()> {
     let qs = query_string(&[("limit", &limit.to_string())]);
-    let resp: HistoryListResp =
-        c.do_json(Method::GET, &format!("/v1/projects/{ref}/sql/history{qs}"), None)?;
+    let resp: HistoryListResp = c.do_json(
+        Method::GET,
+        &format!("/v1/projects/{ref}/sql/history{qs}"),
+        None,
+    )?;
     if g.json {
         // JSON shape: { "history": [ QueryHistoryEntry ] }
         return print_json(&mut std::io::stdout(), &json!({ "history": resp.history }));
@@ -519,27 +543,43 @@ fn history_list(g: &GlobalFlags, c: &crate::client::Client, r#ref: &str, limit: 
         } else {
             h.sql.clone()
         };
-        t.row(&[&h.id, &snippet, &format!("{:.0}", h.duration_ms), &h.executed_at]);
+        t.row(&[
+            &h.id,
+            &snippet,
+            &format!("{:.0}", h.duration_ms),
+            &h.executed_at,
+        ]);
     }
     t.flush()
 }
 
-fn history_clear(g: &GlobalFlags, c: &crate::client::Client, r#ref: &str, yes: bool) -> CliResult<()> {
+fn history_clear(
+    g: &GlobalFlags,
+    c: &crate::client::Client,
+    r#ref: &str,
+    yes: bool,
+) -> CliResult<()> {
     if !yes {
         if g.json {
             return Err(msg(
                 "confirmation required: pass --yes to clear history non-interactively under --json",
             ));
         }
-        eprint!("Clear all query history for project {:?}? This cannot be undone. [y/N] ", r#ref);
+        eprint!(
+            "Clear all query history for project {:?}? This cannot be undone. [y/N] ",
+            r#ref
+        );
         let line = read_line()?;
         if line.trim().to_lowercase() != "y" {
             println!("Aborted.");
             return Ok(());
         }
     }
-    let resp: HistoryClearResp =
-        c.do_json(Method::DELETE, &format!("/v1/projects/{ref}/sql/history"), None)?;
+    let resp: HistoryClearResp = c.do_json(
+        Method::DELETE,
+        &format!("/v1/projects/{ref}/sql/history"),
+        None,
+    )?;
     if g.json {
         // JSON shape: { "cleared": true }
         return print_json(&mut std::io::stdout(), &json!({ "cleared": resp.cleared }));
@@ -616,7 +656,10 @@ mod tests {
     #[test]
     fn help_returns_ok() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_queries(&g, &["help".into()]).is_ok());
     }
 
@@ -630,8 +673,7 @@ mod tests {
         let srv = TestServer::start(move |req: &Req| {
             assert_eq!(req.method, "POST");
             assert_eq!(req.path, "/v1/projects/proj1/sql/saved");
-            let b: serde_json::Value =
-                serde_json::from_str(&req.body).unwrap_or_default();
+            let b: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
             assert_eq!(b["name"].as_str().unwrap(), "My Query");
             assert_eq!(b["sql"].as_str().unwrap(), "SELECT 1");
             Resp::ok(body_resp.clone())
@@ -661,7 +703,11 @@ mod tests {
         };
         let err = cmd_queries(
             &g,
-            &["save".into(), "--project=proj1".into(), "--sql=SELECT 1".into()],
+            &[
+                "save".into(),
+                "--project=proj1".into(),
+                "--sql=SELECT 1".into(),
+            ],
         )
         .unwrap_err();
         assert!(err.to_string().contains("--name"), "got: {err}");
@@ -739,8 +785,9 @@ mod tests {
         let body_resp = format!(r#"{{"queries":[{q}]}}"#);
         let srv = TestServer::start(move |_req: &Req| Resp::ok(body_resp.clone()));
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: ListQueriesResp =
-            c.do_json(Method::GET, "/v1/projects/proj1/sql/saved", None).unwrap();
+        let resp: ListQueriesResp = c
+            .do_json(Method::GET, "/v1/projects/proj1/sql/saved", None)
+            .unwrap();
         assert_eq!(resp.queries.len(), 1);
         assert_eq!(resp.queries[0].id, "q1");
         let mut buf = Vec::<u8>::new();
@@ -784,7 +831,10 @@ mod tests {
     fn get_403_friendly_error() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(403, r#"{"error":{"code":"forbidden","message":"access denied"}}"#)
+            Resp::status(
+                403,
+                r#"{"error":{"code":"forbidden","message":"access denied"}}"#,
+            )
         });
         let g = flags(&srv.url);
         let err = cmd_queries(&g, &["get".into(), "priv".into()]).unwrap_err();
@@ -814,8 +864,7 @@ mod tests {
         let srv = TestServer::start(move |req: &Req| {
             assert_eq!(req.method, "POST");
             assert_eq!(req.path, "/v1/sql/saved/q1/fork");
-            let b: serde_json::Value =
-                serde_json::from_str(&req.body).unwrap_or_default();
+            let b: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
             assert_eq!(b["name"].as_str().unwrap_or(""), "Fork of Alpha");
             Resp::ok(body_resp.clone())
         });
@@ -847,8 +896,9 @@ mod tests {
         let body_resp = format!(r#"{{"query":{q}}}"#);
         let srv = TestServer::start(move |_req: &Req| Resp::ok(body_resp.clone()));
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: ForkQueryResp =
-            c.do_json(Method::POST, "/v1/sql/saved/q1/fork", Some(json!({}))).unwrap();
+        let resp: ForkQueryResp = c
+            .do_json(Method::POST, "/v1/sql/saved/q1/fork", Some(json!({})))
+            .unwrap();
         assert_eq!(resp.query.as_ref().unwrap().id, "q2");
     }
 
@@ -876,8 +926,11 @@ mod tests {
             json: true,
             ..Default::default()
         };
-        let err = cmd_queries(&g, &["delete".into(), "--project=proj1".into(), "q1".into()])
-            .unwrap_err();
+        let err = cmd_queries(
+            &g,
+            &["delete".into(), "--project=proj1".into(), "q1".into()],
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("confirmation required"),
             "got: {err}"
@@ -902,15 +955,14 @@ mod tests {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"deleted":true,"id":"q1"}"#));
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: DeleteQueryResp =
-            c.do_json(Method::DELETE, "/v1/sql/saved/q1", None).unwrap();
+        let resp: DeleteQueryResp = c.do_json(Method::DELETE, "/v1/sql/saved/q1", None).unwrap();
         assert!(resp.deleted);
         assert_eq!(resp.id, "q1");
         // JSON output shape
         let mut buf = Vec::<u8>::new();
         print_json(&mut buf, &json!({ "deleted": resp.deleted, "id": resp.id })).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-        assert_eq!(v["deleted"].as_bool().unwrap(), true);
+        assert!(v["deleted"].as_bool().unwrap());
         assert_eq!(v["id"].as_str().unwrap(), "q1");
     }
 
@@ -946,8 +998,13 @@ mod tests {
         let srv = TestServer::start(move |_req: &Req| Resp::ok(body_resp.clone()));
         let c = crate::client::Client::new(&srv.url, "tok");
         let qs = query_string(&[("limit", "50")]);
-        let resp: HistoryListResp =
-            c.do_json(Method::GET, &format!("/v1/projects/proj1/sql/history{qs}"), None).unwrap();
+        let resp: HistoryListResp = c
+            .do_json(
+                Method::GET,
+                &format!("/v1/projects/proj1/sql/history{qs}"),
+                None,
+            )
+            .unwrap();
         assert_eq!(resp.history.len(), 1);
         assert_eq!(resp.history[0].id, "h1");
         let mut buf = Vec::<u8>::new();
@@ -967,7 +1024,12 @@ mod tests {
         let g = flags(&srv.url);
         cmd_queries(
             &g,
-            &["history".into(), "--project=proj1".into(), "--clear".into(), "--yes".into()],
+            &[
+                "history".into(),
+                "--project=proj1".into(),
+                "--clear".into(),
+                "--yes".into(),
+            ],
         )
         .unwrap();
     }
@@ -997,7 +1059,10 @@ mod tests {
     fn history_server_error_propagates() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(403, r#"{"error":{"code":"forbidden","message":"no access"}}"#)
+            Resp::status(
+                403,
+                r#"{"error":{"code":"forbidden","message":"no access"}}"#,
+            )
         });
         let g = flags(&srv.url);
         let err = cmd_queries(&g, &["history".into(), "--project=proj1".into()]).unwrap_err();

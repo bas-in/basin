@@ -71,12 +71,13 @@ fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
     if !flag_value.is_empty() {
         return Ok(flag_value.to_string());
     }
-    let cwd = std::env::current_dir()
-        .map_err(|e| msg(format!("could not determine cwd: {e}")))?;
+    let cwd = std::env::current_dir().map_err(|e| msg(format!("could not determine cwd: {e}")))?;
     let wp = load_working_project(&cwd)?;
     match wp {
         Some(w) if !w.project_ref.is_empty() => Ok(w.project_ref),
-        _ => Err(msg("--project is required (or run `basin link` to bind this directory)")),
+        _ => Err(msg(
+            "--project is required (or run `basin link` to bind this directory)",
+        )),
     }
 }
 
@@ -129,8 +130,7 @@ fn get(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let project_flag = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project_flag)?;
     let c = require_client(g)?;
-    let resp: PinResp =
-        c.do_json(Method::GET, &format!("/v1/projects/{ref}/engine/pin"), None)?;
+    let resp: PinResp = c.do_json(Method::GET, &format!("/v1/projects/{ref}/engine/pin"), None)?;
     if g.json {
         // JSON shape: { pin: EnginePin | null }
         return print_json(&mut std::io::stdout(), &resp);
@@ -169,7 +169,10 @@ fn put(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
                 ver
             )));
         }
-        eprint!("Pin engine to version {:?} on project {:?}? [y/N] ", ver, r#ref);
+        eprint!(
+            "Pin engine to version {:?} on project {:?}? [y/N] ",
+            ver, r#ref
+        );
         let line = read_line()?;
         if line.trim().to_lowercase() != "y" {
             println!("Aborted.");
@@ -178,8 +181,11 @@ fn put(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     }
 
     let body = json!({ "version": ver });
-    let resp: PinResp =
-        c.do_json(Method::PUT, &format!("/v1/projects/{ref}/engine/pin"), Some(body))?;
+    let resp: PinResp = c.do_json(
+        Method::PUT,
+        &format!("/v1/projects/{ref}/engine/pin"),
+        Some(body),
+    )?;
     if g.json {
         // JSON shape: { pin: EnginePin }
         return print_json(&mut std::io::stdout(), &resp);
@@ -209,7 +215,10 @@ fn delete(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
                 "confirmation required: pass --yes to unpin engine version non-interactively under --json"
             ));
         }
-        eprint!("Remove the engine version pin from project {:?}? [y/N] ", r#ref);
+        eprint!(
+            "Remove the engine version pin from project {:?}? [y/N] ",
+            r#ref
+        );
         let line = read_line()?;
         if line.trim().to_lowercase() != "y" {
             println!("Aborted.");
@@ -222,8 +231,11 @@ fn delete(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         #[serde(default)]
         unpinned: bool,
     }
-    let resp: UnpinResp =
-        c.do_json(Method::DELETE, &format!("/v1/projects/{ref}/engine/pin"), None)?;
+    let resp: UnpinResp = c.do_json(
+        Method::DELETE,
+        &format!("/v1/projects/{ref}/engine/pin"),
+        None,
+    )?;
     if g.json {
         // JSON shape: { unpinned: true }
         return print_json(&mut std::io::stdout(), &resp);
@@ -247,8 +259,11 @@ fn events(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         .unwrap_or_else(|| "50".into());
     let c = require_client(g)?;
     let q = query_string(&[("limit", &limit_str)]);
-    let resp: EventsResp =
-        c.do_json(Method::GET, &format!("/v1/projects/{ref}/engine/events{q}"), None)?;
+    let resp: EventsResp = c.do_json(
+        Method::GET,
+        &format!("/v1/projects/{ref}/engine/events{q}"),
+        None,
+    )?;
     if g.json {
         // JSON shape: { events: [ EnginePinEvent ] }
         return print_json(&mut std::io::stdout(), &json!({ "events": resp.events }));
@@ -313,9 +328,7 @@ mod tests {
     #[test]
     fn get_null_pin() {
         let _cfg = with_temp_config_dir();
-        let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"pin":null}"#)
-        });
+        let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"pin":null}"#));
         let g = flags(&srv.url);
         cmd_engine_pin(&g, &["get".into(), "--project=proj1".into()]).unwrap();
     }
@@ -329,8 +342,9 @@ mod tests {
         let g = flags_json(&srv.url);
         let mut out = Vec::new();
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: PinResp =
-            c.do_json(reqwest::Method::GET, "/v1/projects/proj1/engine/pin", None).unwrap();
+        let resp: PinResp = c
+            .do_json(reqwest::Method::GET, "/v1/projects/proj1/engine/pin", None)
+            .unwrap();
         print_json(&mut out, &resp).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["pin"]["version"].as_str().unwrap(), "2.0.0");
@@ -341,7 +355,10 @@ mod tests {
     fn get_404() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(404, r#"{"error":{"code":"not_found","message":"project not found"}}"#)
+            Resp::status(
+                404,
+                r#"{"error":{"code":"not_found","message":"project not found"}}"#,
+            )
         });
         let g = flags(&srv.url);
         let err = cmd_engine_pin(&g, &["get".into(), "--project=proj1".into()]).unwrap_err();
@@ -353,7 +370,10 @@ mod tests {
     fn get_403() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(403, r#"{"error":{"code":"forbidden","message":"insufficient permissions"}}"#)
+            Resp::status(
+                403,
+                r#"{"error":{"code":"forbidden","message":"insufficient permissions"}}"#,
+            )
         });
         let g = flags(&srv.url);
         let err = cmd_engine_pin(&g, &["get".into(), "--project=proj1".into()]).unwrap_err();
@@ -364,7 +384,11 @@ mod tests {
     #[test]
     fn get_no_project_errors() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_engine_pin(&g, &["get".into()]).unwrap_err();
         assert!(err.to_string().contains("--project") || err.to_string().contains("link"));
     }
@@ -374,7 +398,11 @@ mod tests {
     #[test]
     fn put_missing_version_errors() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_engine_pin(&g, &["put".into(), "--project=proj1".into()]).unwrap_err();
         assert!(err.to_string().contains("--version"));
     }
@@ -392,7 +420,12 @@ mod tests {
         let g = flags(&srv.url);
         cmd_engine_pin(
             &g,
-            &["put".into(), "--project=proj1".into(), "--version=1.5.0".into(), "--yes".into()],
+            &[
+                "put".into(),
+                "--project=proj1".into(),
+                "--version=1.5.0".into(),
+                "--yes".into(),
+            ],
         )
         .unwrap();
     }
@@ -423,12 +456,20 @@ mod tests {
     fn put_422() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(422, r#"{"error":{"code":"validation_error","message":"invalid version format"}}"#)
+            Resp::status(
+                422,
+                r#"{"error":{"code":"validation_error","message":"invalid version format"}}"#,
+            )
         });
         let g = flags(&srv.url);
         let err = cmd_engine_pin(
             &g,
-            &["put".into(), "--project=proj1".into(), "--version=bad-ver".into(), "--yes".into()],
+            &[
+                "put".into(),
+                "--project=proj1".into(),
+                "--version=bad-ver".into(),
+                "--yes".into(),
+            ],
         )
         .unwrap_err();
         let ae = crate::error::as_api_error(err.as_ref()).expect("expected ApiError");
@@ -446,26 +487,35 @@ mod tests {
             Resp::ok(r#"{"unpinned":true}"#)
         });
         let g = flags(&srv.url);
-        cmd_engine_pin(&g, &["delete".into(), "--project=proj1".into(), "--yes".into()]).unwrap();
+        cmd_engine_pin(
+            &g,
+            &["delete".into(), "--project=proj1".into(), "--yes".into()],
+        )
+        .unwrap();
     }
 
     #[test]
     fn delete_json_shape() {
         let _cfg = with_temp_config_dir();
-        let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"unpinned":true}"#)
-        });
+        let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"unpinned":true}"#));
         let g = flags_json(&srv.url);
         let mut out = Vec::new();
 
         #[derive(Serialize, Deserialize)]
-        struct UR { unpinned: bool }
+        struct UR {
+            unpinned: bool,
+        }
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: UR =
-            c.do_json(reqwest::Method::DELETE, "/v1/projects/proj1/engine/pin", None).unwrap();
+        let resp: UR = c
+            .do_json(
+                reqwest::Method::DELETE,
+                "/v1/projects/proj1/engine/pin",
+                None,
+            )
+            .unwrap();
         print_json(&mut out, &resp).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(v["unpinned"].as_bool().unwrap(), true);
+        assert!(v["unpinned"].as_bool().unwrap());
         let _ = &g;
     }
 
@@ -477,7 +527,9 @@ mod tests {
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "GET");
             assert!(req.path.starts_with("/v1/projects/proj1/engine/events"));
-            Resp::ok(r#"{"events":[{"id":"ev1","action":"pin","version":"1.5.0","at":"2026-05-01T00:00:00Z","actor_id":"user-1"},{"id":"ev2","action":"unpin","version":"","at":"2026-05-02T00:00:00Z","actor_id":"user-2"}]}"#)
+            Resp::ok(
+                r#"{"events":[{"id":"ev1","action":"pin","version":"1.5.0","at":"2026-05-01T00:00:00Z","actor_id":"user-1"},{"id":"ev2","action":"unpin","version":"","at":"2026-05-02T00:00:00Z","actor_id":"user-2"}]}"#,
+            )
         });
         let g = flags(&srv.url);
         cmd_engine_pin(&g, &["events".into(), "--project=proj1".into()]).unwrap();
@@ -487,13 +539,21 @@ mod tests {
     fn events_limit_passthrough() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|req: &Req| {
-            assert!(req.path.contains("limit=10"), "limit not in path: {}", req.path);
+            assert!(
+                req.path.contains("limit=10"),
+                "limit not in path: {}",
+                req.path
+            );
             Resp::ok(r#"{"events":[]}"#)
         });
         let g = flags(&srv.url);
         cmd_engine_pin(
             &g,
-            &["events".into(), "--project=proj1".into(), "--limit=10".into()],
+            &[
+                "events".into(),
+                "--project=proj1".into(),
+                "--limit=10".into(),
+            ],
         )
         .unwrap();
     }
@@ -510,13 +570,20 @@ mod tests {
     fn events_json_shape() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"events":[{"id":"ev1","action":"pin","version":"2.0.0","at":"2026-05-01T00:00:00Z","actor_id":"user-1"}]}"#)
+            Resp::ok(
+                r#"{"events":[{"id":"ev1","action":"pin","version":"2.0.0","at":"2026-05-01T00:00:00Z","actor_id":"user-1"}]}"#,
+            )
         });
         let g = flags_json(&srv.url);
         let mut out = Vec::new();
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: EventsResp =
-            c.do_json(reqwest::Method::GET, "/v1/projects/proj1/engine/events", None).unwrap();
+        let resp: EventsResp = c
+            .do_json(
+                reqwest::Method::GET,
+                "/v1/projects/proj1/engine/events",
+                None,
+            )
+            .unwrap();
         print_json(&mut out, &json!({ "events": resp.events })).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["events"][0]["id"].as_str().unwrap(), "ev1");
@@ -528,7 +595,10 @@ mod tests {
     #[test]
     fn no_args_shows_help() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         // no args → shows help and returns Ok
         assert!(cmd_engine_pin(&g, &[]).is_ok());
     }
@@ -536,7 +606,10 @@ mod tests {
     #[test]
     fn unknown_subcommand_is_silent() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_engine_pin(&g, &["frobnicate".into()]).unwrap_err();
         assert!(crate::error::is_silent(err.as_ref()));
     }
@@ -544,7 +617,10 @@ mod tests {
     #[test]
     fn help_returns_ok() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_engine_pin(&g, &["help".into()]).is_ok());
     }
 }

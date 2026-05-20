@@ -27,10 +27,16 @@ pub struct Resp {
 
 impl Resp {
     pub fn ok(body: impl Into<String>) -> Resp {
-        Resp { status: 200, body: body.into() }
+        Resp {
+            status: 200,
+            body: body.into(),
+        }
     }
     pub fn status(status: u16, body: impl Into<String>) -> Resp {
-        Resp { status, body: body.into() }
+        Resp {
+            status,
+            body: body.into(),
+        }
     }
 }
 
@@ -93,7 +99,7 @@ impl TestServer {
                 let payload = format!(
                     "HTTP/1.1 {} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     resp.status,
-                    resp.body.as_bytes().len(),
+                    resp.body.len(),
                     resp.body
                 );
                 let _ = stream.write_all(payload.as_bytes());
@@ -132,5 +138,8 @@ pub fn with_temp_config_dir() -> ConfigDirGuard {
 
 fn unique() -> u128 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
 }

@@ -63,8 +63,7 @@ struct MigrationRow {
 }
 
 pub fn cmd_status(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
-    let cmd = Command::new("status")
-        .arg(Arg::new("help").long("help").action(ArgAction::SetTrue));
+    let cmd = Command::new("status").arg(Arg::new("help").long("help").action(ArgAction::SetTrue));
     let m = parse_or_silent(cmd, args)?;
     if m.get_flag("help") {
         help_for_command(
@@ -74,8 +73,11 @@ pub fn cmd_status(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         );
         return Ok(());
     }
-    let cwd = std::env::current_dir()
-        .map_err(|e| msg(format!("status: could not determine working directory: {e}")))?;
+    let cwd = std::env::current_dir().map_err(|e| {
+        msg(format!(
+            "status: could not determine working directory: {e}"
+        ))
+    })?;
     run_status(g, &cwd)
 }
 
@@ -101,27 +103,26 @@ fn run_status(g: &GlobalFlags, cwd: &Path) -> CliResult<()> {
     let c = require_client(g)?;
 
     // Fetch project metadata.
-    let proj_resp: StatusProjectResp =
-        c.do_json(Method::GET, &format!("/v1/projects/{project_ref}"), None)
-            .map_err(|e| msg(format!("status: fetch project: {e}")))?;
+    let proj_resp: StatusProjectResp = c
+        .do_json(Method::GET, &format!("/v1/projects/{project_ref}"), None)
+        .map_err(|e| msg(format!("status: fetch project: {e}")))?;
     let proj = proj_resp.project.unwrap_or_else(|| StatusProject {
         r#ref: project_ref.clone(),
         ..Default::default()
     });
 
     // Fetch remote migrations list (non-fatal on failure).
-    let remote_migrations: Vec<MigrationRow> =
-        match c.do_json::<MigrationsResp>(
-            Method::GET,
-            &format!("/admin/v1/projects/{project_ref}/migrations"),
-            None,
-        ) {
-            Ok(r) => r.migrations,
-            Err(e) => {
-                printerr!(g, "warning: could not fetch remote migrations: {e}");
-                Vec::new()
-            }
-        };
+    let remote_migrations: Vec<MigrationRow> = match c.do_json::<MigrationsResp>(
+        Method::GET,
+        &format!("/admin/v1/projects/{project_ref}/migrations"),
+        None,
+    ) {
+        Ok(r) => r.migrations,
+        Err(e) => {
+            printerr!(g, "warning: could not fetch remote migrations: {e}");
+            Vec::new()
+        }
+    };
 
     // Collect local migration filenames (*.sql) in ./basin/migrations/.
     let local_files = collect_local_migrations(cwd);
@@ -129,21 +130,33 @@ fn run_status(g: &GlobalFlags, cwd: &Path) -> CliResult<()> {
     // Build sets for drift analysis.
     // Convention: compare bare filename of local files against
     // basename of MigrationRow.source (or fall back to ID when empty).
-    let remote_set: std::collections::HashSet<String> = remote_migrations
-        .iter()
-        .map(migration_key)
-        .collect();
+    let remote_set: std::collections::HashSet<String> =
+        remote_migrations.iter().map(migration_key).collect();
 
     let local_set: std::collections::HashSet<String> = local_files
         .iter()
-        .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()))
+        .filter_map(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+        })
         .collect();
 
     let applied: usize = local_set.iter().filter(|k| remote_set.contains(*k)).count();
-    let local_only: usize = local_set.iter().filter(|k| !remote_set.contains(*k)).count();
-    let remote_only: usize = remote_set.iter().filter(|k| !local_set.contains(*k)).count();
+    let local_only: usize = local_set
+        .iter()
+        .filter(|k| !remote_set.contains(*k))
+        .count();
+    let remote_only: usize = remote_set
+        .iter()
+        .filter(|k| !local_set.contains(*k))
+        .count();
 
-    let status = if proj.status.is_empty() { "unknown".to_string() } else { proj.status.clone() };
+    let status = if proj.status.is_empty() {
+        "unknown".to_string()
+    } else {
+        proj.status.clone()
+    };
 
     if g.json {
         // JSON shape: { "linked": true, "project_ref": string, "status": string,
@@ -237,8 +250,7 @@ mod tests {
     use crate::testutil::{with_temp_config_dir, Req, Resp, TestServer};
 
     fn make_cwd(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("basin-status-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("basin-status-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -249,10 +261,7 @@ mod tests {
     }
 
     /// Build a TestServer that serves the two status endpoints.
-    fn status_server(
-        proj_json: Option<&'static str>,
-        mig_json: &'static str,
-    ) -> TestServer {
+    fn status_server(proj_json: Option<&'static str>, mig_json: &'static str) -> TestServer {
         TestServer::start(move |req: &Req| {
             let path = &req.path;
             if req.method == "GET" && path.ends_with("/migrations") {
@@ -274,7 +283,12 @@ mod tests {
     }
 
     fn flags(url: &str) -> GlobalFlags {
-        GlobalFlags { api_url: url.into(), token: "tok".into(), quiet: true, ..Default::default() }
+        GlobalFlags {
+            api_url: url.into(),
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -283,7 +297,10 @@ mod tests {
         let cwd = make_cwd("notlinked");
         scaffold(&cwd);
 
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         // Should return Ok(()) without error.
         run_status(&g, &cwd).unwrap();
 
@@ -296,7 +313,11 @@ mod tests {
         let cwd = make_cwd("notlinked-json");
         scaffold(&cwd);
 
-        let g = GlobalFlags { json: true, quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            json: true,
+            quiet: true,
+            ..Default::default()
+        };
         run_status(&g, &cwd).unwrap();
 
         std::fs::remove_dir_all(&cwd).ok();
@@ -309,7 +330,10 @@ mod tests {
         scaffold(&cwd);
         save_working_project(
             &cwd,
-            &WorkingProject { project_ref: "clean-proj".into(), ..Default::default() },
+            &WorkingProject {
+                project_ref: "clean-proj".into(),
+                ..Default::default()
+            },
         )
         .unwrap();
         std::fs::write(
@@ -319,7 +343,9 @@ mod tests {
         .unwrap();
 
         let srv = status_server(
-            Some(r#"{"ref":"clean-proj","name":"Clean","region":"jnb","status":"active","default_branch":"main"}"#),
+            Some(
+                r#"{"ref":"clean-proj","name":"Clean","region":"jnb","status":"active","default_branch":"main"}"#,
+            ),
             r#"[{"id":"m1","source":"0001_init.sql"}]"#,
         );
         let g = flags(&srv.url);
@@ -335,7 +361,10 @@ mod tests {
         scaffold(&cwd);
         save_working_project(
             &cwd,
-            &WorkingProject { project_ref: "drift-proj".into(), ..Default::default() },
+            &WorkingProject {
+                project_ref: "drift-proj".into(),
+                ..Default::default()
+            },
         )
         .unwrap();
         // Two local files.
@@ -360,7 +389,10 @@ mod tests {
         scaffold(&cwd);
         save_working_project(
             &cwd,
-            &WorkingProject { project_ref: "paused-proj".into(), ..Default::default() },
+            &WorkingProject {
+                project_ref: "paused-proj".into(),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -381,13 +413,18 @@ mod tests {
         scaffold(&cwd);
         save_working_project(
             &cwd,
-            &WorkingProject { project_ref: "json-proj".into(), ..Default::default() },
+            &WorkingProject {
+                project_ref: "json-proj".into(),
+                ..Default::default()
+            },
         )
         .unwrap();
         std::fs::write(cwd.join("basin/migrations/0001_init.sql"), b"--").unwrap();
 
         let srv = status_server(
-            Some(r#"{"ref":"json-proj","status":"active","region":"us-east","default_branch":"main"}"#),
+            Some(
+                r#"{"ref":"json-proj","status":"active","region":"us-east","default_branch":"main"}"#,
+            ),
             r#"[{"id":"m1","source":"0001_init.sql"}]"#,
         );
         let g = GlobalFlags {
@@ -408,7 +445,10 @@ mod tests {
         let _cfg = with_temp_config_dir();
         let cwd = make_cwd("nodir");
         // No scaffold — no basin/ directory.
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         // load_working_project returns Ok(None) when not found.
         run_status(&g, &cwd).unwrap();
 
@@ -422,7 +462,10 @@ mod tests {
         scaffold(&cwd);
         save_working_project(
             &cwd,
-            &WorkingProject { project_ref: "drift-json".into(), ..Default::default() },
+            &WorkingProject {
+                project_ref: "drift-json".into(),
+                ..Default::default()
+            },
         )
         .unwrap();
         // Two local-only files.
@@ -453,7 +496,10 @@ mod tests {
         scaffold(&cwd);
         save_working_project(
             &cwd,
-            &WorkingProject { project_ref: "id-fallback".into(), ..Default::default() },
+            &WorkingProject {
+                project_ref: "id-fallback".into(),
+                ..Default::default()
+            },
         )
         .unwrap();
         // No local files.
@@ -476,13 +522,19 @@ mod tests {
 
     #[test]
     fn migration_key_uses_source_basename() {
-        let m = MigrationRow { id: "some-id".into(), source: "/long/path/0001_init.sql".into() };
+        let m = MigrationRow {
+            id: "some-id".into(),
+            source: "/long/path/0001_init.sql".into(),
+        };
         assert_eq!(migration_key(&m), "0001_init.sql");
     }
 
     #[test]
     fn migration_key_falls_back_to_id() {
-        let m = MigrationRow { id: "m-abc".into(), source: String::new() };
+        let m = MigrationRow {
+            id: "m-abc".into(),
+            source: String::new(),
+        };
         assert_eq!(migration_key(&m), "m-abc");
     }
 }

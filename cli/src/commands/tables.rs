@@ -90,13 +90,19 @@ fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
     let wp = load_working_project(&cwd)?;
     match wp {
         Some(w) if !w.project_ref.is_empty() => Ok(w.project_ref),
-        _ => Err(msg("--project is required (or run `basin link` to bind this directory)")),
+        _ => Err(msg(
+            "--project is required (or run `basin link` to bind this directory)",
+        )),
     }
 }
 
 /// bool_str renders a bool as "yes" or "no" matching Go's boolStr.
 fn bool_str(b: bool) -> &'static str {
-    if b { "yes" } else { "no" }
+    if b {
+        "yes"
+    } else {
+        "no"
+    }
 }
 
 /// div_ceil is ceiling integer division, matching Go's divCeil.
@@ -104,7 +110,11 @@ fn div_ceil(a: i64, b: i64) -> i64 {
     if b <= 0 {
         return 0;
     }
-    if a % b == 0 { a / b } else { a / b + 1 }
+    if a % b == 0 {
+        a / b
+    } else {
+        a / b + 1
+    }
 }
 
 // ── columnSpec ────────────────────────────────────────────────────────────────
@@ -131,7 +141,9 @@ fn parse_column_spec(s: &str) -> CliResult<ColumnSpec> {
         return Err(msg("column spec is empty"));
     }
     let colon = s.find(':').ok_or_else(|| {
-        msg(format!("column spec {s:?}: missing ':' separator (want name:type[,key=val])"))
+        msg(format!(
+            "column spec {s:?}: missing ':' separator (want name:type[,key=val])"
+        ))
     })?;
     let name = s[..colon].trim().to_string();
     let rest = &s[colon + 1..];
@@ -165,7 +177,13 @@ fn parse_column_spec(s: &str) -> CliResult<ColumnSpec> {
         return Err(msg(format!("column spec {s:?}: type is empty")));
     }
 
-    let mut cs = ColumnSpec { name, col_type, nullable: None, pk: false, default: None };
+    let mut cs = ColumnSpec {
+        name,
+        col_type,
+        nullable: None,
+        pk: false,
+        default: None,
+    };
     if kv_part.is_empty() {
         return Ok(cs);
     }
@@ -190,21 +208,21 @@ fn parse_column_spec(s: &str) -> CliResult<ColumnSpec> {
         remaining = next_remaining;
 
         let eq = token.find('=').ok_or_else(|| {
-            msg(format!("column spec {s:?}: malformed key/value {token:?} (want key=value)"))
+            msg(format!(
+                "column spec {s:?}: malformed key/value {token:?} (want key=value)"
+            ))
         })?;
         let k = token[..eq].trim().to_ascii_lowercase();
         let v = token[eq + 1..].trim();
         match k.as_str() {
             "nullable" => {
-                let b = parse_bool_val(v).map_err(|e| {
-                    msg(format!("column spec {s:?}: nullable: {e}"))
-                })?;
+                let b = parse_bool_val(v)
+                    .map_err(|e| msg(format!("column spec {s:?}: nullable: {e}")))?;
                 cs.nullable = Some(b);
             }
             "pk" | "primary_key" => {
-                let b = parse_bool_val(v).map_err(|e| {
-                    msg(format!("column spec {s:?}: pk: {e}"))
-                })?;
+                let b =
+                    parse_bool_val(v).map_err(|e| msg(format!("column spec {s:?}: pk: {e}")))?;
                 cs.pk = b;
             }
             _ => {
@@ -360,8 +378,11 @@ fn tables_describe(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         #[serde(default)]
         table: Option<TableDetail>,
     }
-    let resp: Resp =
-        c.do_json(Method::GET, &format!("/v1/projects/{project}/tables/{name}"), None)?;
+    let resp: Resp = c.do_json(
+        Method::GET,
+        &format!("/v1/projects/{project}/tables/{name}"),
+        None,
+    )?;
     if g.json {
         // JSON shape: { table: { name: string, schema: string, columns: [ Column ] } }
         return print_json(&mut std::io::stdout(), &json!({ "table": resp.table }));
@@ -374,7 +395,13 @@ fn tables_describe(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let mut t = Table::new(g, &["COLUMN", "TYPE", "NULL", "PK", "DEFAULT"]);
     for col in &tbl.columns {
         let def = col.default.as_deref().unwrap_or("");
-        t.row(&[&col.name, &col.col_type, bool_str(col.nullable), bool_str(col.pk), def]);
+        t.row(&[
+            &col.name,
+            &col.col_type,
+            bool_str(col.nullable),
+            bool_str(col.pk),
+            def,
+        ]);
     }
     t.flush()
 }
@@ -414,8 +441,14 @@ fn tables_show_rows(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     if project.is_empty() {
         return Err(msg("--project is required"));
     }
-    let page = m.get_one::<String>("page").cloned().unwrap_or_else(|| "1".into());
-    let page_size = m.get_one::<String>("page-size").cloned().unwrap_or_else(|| "50".into());
+    let page = m
+        .get_one::<String>("page")
+        .cloned()
+        .unwrap_or_else(|| "1".into());
+    let page_size = m
+        .get_one::<String>("page-size")
+        .cloned()
+        .unwrap_or_else(|| "50".into());
     let sort = m.get_one::<String>("sort").cloned().unwrap_or_default();
     let filter = m.get_one::<String>("filter").cloned().unwrap_or_default();
 
@@ -426,8 +459,11 @@ fn tables_show_rows(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         ("sort", &sort),
         ("filter", &filter),
     ]);
-    let resp: RowsPage =
-        c.do_json(Method::GET, &format!("/v1/projects/{project}/tables/{name}/rows{q}"), None)?;
+    let resp: RowsPage = c.do_json(
+        Method::GET,
+        &format!("/v1/projects/{project}/tables/{name}/rows{q}"),
+        None,
+    )?;
     if g.json {
         // JSON shape: RowsPage — { columns: [string], rows: [[any]], total, page, page_size }
         return print_json(&mut std::io::stdout(), &resp);
@@ -435,7 +471,10 @@ fn tables_show_rows(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     crate::commands::sql::render_rows(g, &resp.columns, &resp.rows, None, 0)?;
     if !g.quiet {
         let total_pages = div_ceil(resp.total, resp.page_size.max(1));
-        eprintln!("(page {}/{} · {} total)", resp.page, total_pages, resp.total);
+        eprintln!(
+            "(page {}/{} · {} total)",
+            resp.page, total_pages, resp.total
+        );
     }
     Ok(())
 }
@@ -469,23 +508,23 @@ fn tables_create(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         );
         return Ok(());
     }
-    let name = m
-        .get_one::<String>("name")
-        .cloned()
-        .ok_or_else(|| msg("usage: basin tables create <name> --column=<spec>... [--project=<ref>]"))?;
+    let name = m.get_one::<String>("name").cloned().ok_or_else(|| {
+        msg("usage: basin tables create <name> --column=<spec>... [--project=<ref>]")
+    })?;
 
     let column_strs: Vec<String> = m
         .get_many::<String>("column")
         .map(|v| v.cloned().collect())
         .unwrap_or_default();
     if column_strs.is_empty() {
-        return Err(msg("tables create: at least one --column=<spec> is required"));
+        return Err(msg(
+            "tables create: at least one --column=<spec> is required",
+        ));
     }
 
     let mut specs = Vec::new();
     for raw in &column_strs {
-        let cs = parse_column_spec(raw)
-            .map_err(|e| msg(format!("tables create: {e}")))?;
+        let cs = parse_column_spec(raw).map_err(|e| msg(format!("tables create: {e}")))?;
         specs.push(cs);
     }
 
@@ -507,8 +546,11 @@ fn tables_create(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let project_flag = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project_flag)?;
     let c = require_client(g)?;
-    let resp: TableCreateResponse =
-        c.do_json(Method::POST, &format!("/v1/projects/{ref}/tables"), Some(json!({ "sql": sql })))?;
+    let resp: TableCreateResponse = c.do_json(
+        Method::POST,
+        &format!("/v1/projects/{ref}/tables"),
+        Some(json!({ "sql": sql })),
+    )?;
     if g.json {
         // JSON shape: { "created": true }
         return print_json(&mut std::io::stdout(), &resp);
@@ -529,8 +571,16 @@ struct TableAlterResponse {
 fn tables_alter(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let cmd = Command::new("tables alter")
         .arg(Arg::new("project").long("project"))
-        .arg(Arg::new("add-column").long("add-column").action(ArgAction::Append))
-        .arg(Arg::new("drop-column").long("drop-column").action(ArgAction::Append))
+        .arg(
+            Arg::new("add-column")
+                .long("add-column")
+                .action(ArgAction::Append),
+        )
+        .arg(
+            Arg::new("drop-column")
+                .long("drop-column")
+                .action(ArgAction::Append),
+        )
         .arg(Arg::new("name"))
         .arg(Arg::new("help").long("help").action(ArgAction::SetTrue));
     let m = parse_or_silent(cmd, args)?;
@@ -561,13 +611,14 @@ fn tables_alter(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         .unwrap_or_default();
 
     if add_columns.is_empty() && drop_columns.is_empty() {
-        return Err(msg("tables alter: at least one --add-column or --drop-column is required"));
+        return Err(msg(
+            "tables alter: at least one --add-column or --drop-column is required",
+        ));
     }
 
     let mut add_specs = Vec::new();
     for raw in &add_columns {
-        let cs = parse_column_spec(raw)
-            .map_err(|e| msg(format!("tables alter: {e}")))?;
+        let cs = parse_column_spec(raw).map_err(|e| msg(format!("tables alter: {e}")))?;
         add_specs.push(cs);
     }
 
@@ -641,17 +692,23 @@ fn tables_drop(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
                 name
             )));
         }
-        eprint!("Drop table {:?} in project {:?}? This cannot be undone. [y/N] ", name, r#ref);
+        eprint!(
+            "Drop table {:?} in project {:?}? This cannot be undone. [y/N] ",
+            name, r#ref
+        );
         let line = read_line()?;
-        if line.trim().to_ascii_lowercase() != "y" {
+        if !line.trim().eq_ignore_ascii_case("y") {
             println!("Aborted.");
             return Ok(());
         }
     }
 
     let q = query_string(&[("confirm_name", &name)]);
-    let resp: TableDropResponse =
-        c.do_json(Method::DELETE, &format!("/v1/projects/{ref}/tables/{name}{q}"), None)?;
+    let resp: TableDropResponse = c.do_json(
+        Method::DELETE,
+        &format!("/v1/projects/{ref}/tables/{name}{q}"),
+        None,
+    )?;
     if g.json {
         // JSON shape: { "dropped": true }
         return print_json(&mut std::io::stdout(), &resp);
@@ -719,7 +776,12 @@ fn tables_import_csv(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         buf
     };
 
-    let resp = post_multipart_csv(&c, &format!("/v1/projects/{ref}/tables/{name}/import-csv"), csv_bytes, &header)?;
+    let resp = post_multipart_csv(
+        &c,
+        &format!("/v1/projects/{ref}/tables/{name}/import-csv"),
+        csv_bytes,
+        &header,
+    )?;
     if g.json {
         // JSON shape: { "rows_imported": N, "rows_rejected": N, "rejections": [...], "elapsed_ms": N }
         return print_json(&mut std::io::stdout(), &resp);
@@ -749,7 +811,11 @@ fn post_multipart_csv(
 
     let mut body: Vec<u8> = Vec::new();
     // header field
-    write!(body, "--{boundary}\r\nContent-Disposition: form-data; name=\"header\"\r\n\r\n{header}\r\n").unwrap();
+    write!(
+        body,
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"header\"\r\n\r\n{header}\r\n"
+    )
+    .unwrap();
     // file field
     write!(body, "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"data.csv\"\r\nContent-Type: text/csv\r\n\r\n").unwrap();
     body.extend_from_slice(&csv_bytes);
@@ -772,11 +838,15 @@ fn post_multipart_csv(
         req = req.bearer_auth(&c.token);
     }
 
-    let resp = req.send().map_err(|e| msg(format!("tables import-csv: {e}")))?;
+    let resp = req
+        .send()
+        .map_err(|e| msg(format!("tables import-csv: {e}")))?;
     let status = resp.status().as_u16();
-    let text = resp.text().map_err(|e| msg(format!("tables import-csv: read response: {e}")))?;
+    let text = resp
+        .text()
+        .map_err(|e| msg(format!("tables import-csv: read response: {e}")))?;
 
-    if status >= 200 && status < 300 {
+    if (200..300).contains(&status) {
         return crate::client::unwrap_envelope(&text);
     }
     Err(Box::new(crate::client::parse_api_error(status, &text)))
@@ -801,9 +871,10 @@ fn tables_export_csv(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         );
         return Ok(());
     }
-    let name = m.get_one::<String>("name").cloned().ok_or_else(|| {
-        msg("usage: basin tables export-csv <name> [--project=<ref>]")
-    })?;
+    let name = m
+        .get_one::<String>("name")
+        .cloned()
+        .ok_or_else(|| msg("usage: basin tables export-csv <name> [--project=<ref>]"))?;
     let project_flag = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project_flag)?;
     let c = require_client(g)?;
@@ -820,21 +891,29 @@ fn tables_export_csv(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         req = req.bearer_auth(&c.token);
     }
 
-    let mut resp = req.send().map_err(|e| msg(format!("tables export-csv: {e}")))?;
+    let mut resp = req
+        .send()
+        .map_err(|e| msg(format!("tables export-csv: {e}")))?;
     let status = resp.status().as_u16();
-    if status < 200 || status >= 300 {
-        let text = resp.text().map_err(|e| msg(format!("tables export-csv: {e}")))?;
+    if !(200..300).contains(&status) {
+        let text = resp
+            .text()
+            .map_err(|e| msg(format!("tables export-csv: {e}")))?;
         return Err(Box::new(crate::client::parse_api_error(status, &text)));
     }
     // Stream CSV bytes to stdout.
     let mut stdout = std::io::stdout();
     let mut buf = [0u8; 8192];
     loop {
-        let n = resp.read(&mut buf).map_err(|e| msg(format!("tables export-csv: streaming: {e}")))?;
+        let n = resp
+            .read(&mut buf)
+            .map_err(|e| msg(format!("tables export-csv: streaming: {e}")))?;
         if n == 0 {
             break;
         }
-        stdout.write_all(&buf[..n]).map_err(|e| msg(format!("tables export-csv: write stdout: {e}")))?;
+        stdout
+            .write_all(&buf[..n])
+            .map_err(|e| msg(format!("tables export-csv: write stdout: {e}")))?;
     }
     Ok(())
 }
@@ -844,7 +923,9 @@ fn tables_export_csv(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
 fn tables_columns(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let (sub, rest) = match args.split_first() {
         None => {
-            return Err(msg("usage: basin tables columns (add | alter | drop) <table> ..."));
+            return Err(msg(
+                "usage: basin tables columns (add | alter | drop) <table> ...",
+            ));
         }
         Some((s, r)) => (s.as_str(), r),
     };
@@ -852,7 +933,10 @@ fn tables_columns(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         "add" => columns_add(g, rest),
         "alter" => columns_alter(g, rest),
         "drop" => columns_drop(g, rest),
-        other => Err(msg(format!("unknown subcommand {:?} for tables columns", other))),
+        other => Err(msg(format!(
+            "unknown subcommand {:?} for tables columns",
+            other
+        ))),
     }
 }
 
@@ -887,15 +971,12 @@ fn columns_add(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let table = m.get_one::<String>("name").cloned().ok_or_else(|| {
         msg("usage: basin tables columns add <table> --column=<spec> [--project=<ref>]")
     })?;
-    let col_spec_str = m
-        .get_one::<String>("column")
-        .cloned()
-        .unwrap_or_default();
+    let col_spec_str = m.get_one::<String>("column").cloned().unwrap_or_default();
     if col_spec_str.is_empty() {
         return Err(msg("tables columns add: --column=<spec> is required"));
     }
-    let cs = parse_column_spec(&col_spec_str)
-        .map_err(|e| msg(format!("tables columns add: {e}")))?;
+    let cs =
+        parse_column_spec(&col_spec_str).map_err(|e| msg(format!("tables columns add: {e}")))?;
 
     let project_flag = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project_flag)?;
@@ -967,7 +1048,9 @@ fn columns_alter(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let col_type = m.get_one::<String>("col-type").cloned().unwrap_or_default();
     let nullable_str = m.get_one::<String>("nullable").cloned().unwrap_or_default();
     if col_type.is_empty() && nullable_str.is_empty() {
-        return Err(msg("tables columns alter: at least one of --type or --nullable is required"));
+        return Err(msg(
+            "tables columns alter: at least one of --type or --nullable is required",
+        ));
     }
 
     let mut body = json!({});
@@ -1046,9 +1129,12 @@ fn columns_drop(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
                 col_name
             )));
         }
-        eprint!("Drop column {:?} from table {table}? This cannot be undone. [y/N] ", col_name);
+        eprint!(
+            "Drop column {:?} from table {table}? This cannot be undone. [y/N] ",
+            col_name
+        );
         let line = read_line()?;
-        if line.trim().to_ascii_lowercase() != "y" {
+        if !line.trim().eq_ignore_ascii_case("y") {
             println!("Aborted.");
             return Ok(());
         }
@@ -1076,11 +1162,22 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     fn flags(url: &str) -> GlobalFlags {
-        GlobalFlags { api_url: url.to_string(), token: "tok".into(), quiet: true, ..Default::default() }
+        GlobalFlags {
+            api_url: url.to_string(),
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        }
     }
 
     fn flags_json(url: &str) -> GlobalFlags {
-        GlobalFlags { api_url: url.to_string(), token: "tok".into(), quiet: true, json: true, ..Default::default() }
+        GlobalFlags {
+            api_url: url.to_string(),
+            token: "tok".into(),
+            quiet: true,
+            json: true,
+            ..Default::default()
+        }
     }
 
     // ── dispatcher ─────────────────────────────────────────────────────────
@@ -1088,14 +1185,22 @@ mod tests {
     #[test]
     fn no_args_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
         assert!(cmd_tables(&g, &[]).is_err());
     }
 
     #[test]
     fn unknown_subcommand_is_silent_error() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
         let err = cmd_tables(&g, &["frobnicate".to_string()]).unwrap_err();
         assert!(crate::error::is_silent(err.as_ref()));
     }
@@ -1103,7 +1208,11 @@ mod tests {
     #[test]
     fn help_returns_ok() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
         assert!(cmd_tables(&g, &["help".to_string()]).is_ok());
     }
 
@@ -1179,7 +1288,11 @@ mod tests {
     #[test]
     fn list_missing_project_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
         let err = cmd_tables(&g, &["list".to_string()]).unwrap_err();
         assert!(err.to_string().contains("--project"), "err: {err}");
     }
@@ -1202,12 +1315,17 @@ mod tests {
         let srv = TestServer::start(|_req: &Req| {
             Resp::ok(r#"{"tables":[{"name":"t1","schema":"public","row_count":0}]}"#)
         });
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
         #[derive(Deserialize)]
-        struct R { #[serde(default)] tables: Vec<TableInfo> }
-        let resp: R = c.do_json(Method::GET, "/v1/projects/p1/tables", None).unwrap();
+        struct R {
+            #[serde(default)]
+            tables: Vec<TableInfo>,
+        }
+        let resp: R = c
+            .do_json(Method::GET, "/v1/projects/p1/tables", None)
+            .unwrap();
         print_json(&mut buf, &json!({ "tables": resp.tables })).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert_eq!(v["tables"][0]["name"].as_str().unwrap(), "t1");
@@ -1217,7 +1335,10 @@ mod tests {
     fn list_server_error_propagates() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(404, r#"{"code":"not_found","message":"Project not found."}"#)
+            Resp::status(
+                404,
+                r#"{"code":"not_found","message":"Project not found."}"#,
+            )
         });
         let g = flags(&srv.url);
         let err = cmd_tables(&g, &["list".to_string(), "--project=p1".to_string()]).unwrap_err();
@@ -1232,16 +1353,30 @@ mod tests {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.path, "/v1/projects/p1/tables/users");
-            Resp::ok(r#"{"table":{"name":"users","schema":"public","columns":[{"name":"id","type":"bigint","nullable":false,"pk":true}]}}"#)
+            Resp::ok(
+                r#"{"table":{"name":"users","schema":"public","columns":[{"name":"id","type":"bigint","nullable":false,"pk":true}]}}"#,
+            )
         });
         let g = flags(&srv.url);
-        cmd_tables(&g, &["describe".to_string(), "--project=p1".to_string(), "users".to_string()]).unwrap();
+        cmd_tables(
+            &g,
+            &[
+                "describe".to_string(),
+                "--project=p1".to_string(),
+                "users".to_string(),
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
     fn describe_missing_name_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
         assert!(cmd_tables(&g, &["describe".to_string(), "--project=p1".to_string()]).is_err());
     }
 
@@ -1260,14 +1395,18 @@ mod tests {
             Resp::ok(r#"{"created":true}"#)
         });
         let g = flags(&srv.url);
-        cmd_tables(&g, &[
-            "create".to_string(),
-            "--project=p1".to_string(),
-            "--column=id:bigint,pk=true,nullable=false".to_string(),
-            "--column=email:text,nullable=false".to_string(),
-            "--column=created_at:timestamptz,default=now()".to_string(),
-            "users".to_string(),
-        ]).unwrap();
+        cmd_tables(
+            &g,
+            &[
+                "create".to_string(),
+                "--project=p1".to_string(),
+                "--column=id:bigint,pk=true,nullable=false".to_string(),
+                "--column=email:text,nullable=false".to_string(),
+                "--column=created_at:timestamptz,default=now()".to_string(),
+                "users".to_string(),
+            ],
+        )
+        .unwrap();
         let sql = captured_sql.lock().unwrap();
         assert!(sql.contains("CREATE TABLE"), "sql: {sql}");
         assert!(sql.contains("PRIMARY KEY"), "sql: {sql}");
@@ -1278,26 +1417,57 @@ mod tests {
     #[test]
     fn create_missing_column_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
-        let err = cmd_tables(&g, &["create".to_string(), "--project=p1".to_string(), "foo".to_string()]).unwrap_err();
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
+        let err = cmd_tables(
+            &g,
+            &[
+                "create".to_string(),
+                "--project=p1".to_string(),
+                "foo".to_string(),
+            ],
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("--column"), "err: {err}");
     }
 
     #[test]
     fn create_malformed_column_spec_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
-        assert!(cmd_tables(&g, &["create".to_string(), "--project=p1".to_string(), "--column=badspec".to_string(), "foo".to_string()]).is_err());
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
+        assert!(cmd_tables(
+            &g,
+            &[
+                "create".to_string(),
+                "--project=p1".to_string(),
+                "--column=badspec".to_string(),
+                "foo".to_string()
+            ]
+        )
+        .is_err());
     }
 
     #[test]
     fn create_json_shape() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"created":true}"#));
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: TableCreateResponse = c.do_json(Method::POST, "/v1/projects/p1/tables", Some(json!({"sql":"CREATE TABLE x (a bigint)"}))).unwrap();
+        let resp: TableCreateResponse = c
+            .do_json(
+                Method::POST,
+                "/v1/projects/p1/tables",
+                Some(json!({"sql":"CREATE TABLE x (a bigint)"})),
+            )
+            .unwrap();
         print_json(&mut buf, &resp).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert!(v["created"].as_bool().unwrap());
@@ -1310,12 +1480,16 @@ mod tests {
             Resp::status(422, r#"{"code":"bad_sql","message":"Syntax error."}"#)
         });
         let g = flags(&srv.url);
-        let err = cmd_tables(&g, &[
-            "create".to_string(),
-            "--project=p1".to_string(),
-            "--column=id:bigint".to_string(),
-            "foo".to_string(),
-        ]).unwrap_err();
+        let err = cmd_tables(
+            &g,
+            &[
+                "create".to_string(),
+                "--project=p1".to_string(),
+                "--column=id:bigint".to_string(),
+                "foo".to_string(),
+            ],
+        )
+        .unwrap_err();
         let ae = crate::error::as_api_error(err.as_ref()).expect("ApiError");
         assert_eq!(ae.http_status, 422);
     }
@@ -1334,7 +1508,16 @@ mod tests {
             Resp::ok(r#"{"altered":true}"#)
         });
         let g = flags(&srv.url);
-        cmd_tables(&g, &["alter".to_string(), "--project=p1".to_string(), "--add-column=bio:text".to_string(), "users".to_string()]).unwrap();
+        cmd_tables(
+            &g,
+            &[
+                "alter".to_string(),
+                "--project=p1".to_string(),
+                "--add-column=bio:text".to_string(),
+                "users".to_string(),
+            ],
+        )
+        .unwrap();
         let sql = cap.lock().unwrap();
         assert!(sql.contains("ADD COLUMN"), "sql: {sql}");
     }
@@ -1350,7 +1533,16 @@ mod tests {
             Resp::ok(r#"{"altered":true}"#)
         });
         let g = flags(&srv.url);
-        cmd_tables(&g, &["alter".to_string(), "--project=p1".to_string(), "--drop-column=old_field".to_string(), "users".to_string()]).unwrap();
+        cmd_tables(
+            &g,
+            &[
+                "alter".to_string(),
+                "--project=p1".to_string(),
+                "--drop-column=old_field".to_string(),
+                "users".to_string(),
+            ],
+        )
+        .unwrap();
         let sql = cap.lock().unwrap();
         assert!(sql.contains("DROP COLUMN"), "sql: {sql}");
     }
@@ -1366,23 +1558,45 @@ mod tests {
             Resp::ok(r#"{"altered":true}"#)
         });
         let g = flags(&srv.url);
-        cmd_tables(&g, &[
-            "alter".to_string(),
-            "--project=p1".to_string(),
-            "--add-column=score:int".to_string(),
-            "--drop-column=old_col".to_string(),
-            "users".to_string(),
-        ]).unwrap();
+        cmd_tables(
+            &g,
+            &[
+                "alter".to_string(),
+                "--project=p1".to_string(),
+                "--add-column=score:int".to_string(),
+                "--drop-column=old_col".to_string(),
+                "users".to_string(),
+            ],
+        )
+        .unwrap();
         let sql = cap.lock().unwrap();
-        assert!(sql.contains("ADD COLUMN") && sql.contains("DROP COLUMN"), "sql: {sql}");
+        assert!(
+            sql.contains("ADD COLUMN") && sql.contains("DROP COLUMN"),
+            "sql: {sql}"
+        );
     }
 
     #[test]
     fn alter_no_flags_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
-        let err = cmd_tables(&g, &["alter".to_string(), "--project=p1".to_string(), "users".to_string()]).unwrap_err();
-        assert!(err.to_string().contains("--add-column or --drop-column"), "err: {err}");
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
+        let err = cmd_tables(
+            &g,
+            &[
+                "alter".to_string(),
+                "--project=p1".to_string(),
+                "users".to_string(),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("--add-column or --drop-column"),
+            "err: {err}"
+        );
     }
 
     // ── tables drop ──────────────────────────────────────────────────────────
@@ -1399,7 +1613,16 @@ mod tests {
             Resp::ok(r#"{"dropped":true}"#)
         });
         let g = flags(&srv.url);
-        cmd_tables(&g, &["drop".to_string(), "--project=p1".to_string(), "--yes".to_string(), "orders".to_string()]).unwrap();
+        cmd_tables(
+            &g,
+            &[
+                "drop".to_string(),
+                "--project=p1".to_string(),
+                "--yes".to_string(),
+                "orders".to_string(),
+            ],
+        )
+        .unwrap();
         let path = confirmed.lock().unwrap();
         assert!(path.contains("confirm_name"), "path: {path}");
     }
@@ -1408,10 +1631,16 @@ mod tests {
     fn drop_json_shape() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"dropped":true}"#));
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: TableDropResponse = c.do_json(Method::DELETE, "/v1/projects/p1/tables/orders?confirm_name=orders", None).unwrap();
+        let resp: TableDropResponse = c
+            .do_json(
+                Method::DELETE,
+                "/v1/projects/p1/tables/orders?confirm_name=orders",
+                None,
+            )
+            .unwrap();
         print_json(&mut buf, &resp).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert!(v["dropped"].as_bool().unwrap());
@@ -1424,7 +1653,16 @@ mod tests {
             Resp::status(404, r#"{"code":"not_found","message":"Table not found."}"#)
         });
         let g = flags(&srv.url);
-        let err = cmd_tables(&g, &["drop".to_string(), "--project=p1".to_string(), "--yes".to_string(), "missing".to_string()]).unwrap_err();
+        let err = cmd_tables(
+            &g,
+            &[
+                "drop".to_string(),
+                "--project=p1".to_string(),
+                "--yes".to_string(),
+                "missing".to_string(),
+            ],
+        )
+        .unwrap_err();
         let ae = crate::error::as_api_error(err.as_ref()).expect("ApiError");
         assert_eq!(ae.http_status, 404);
     }
@@ -1450,18 +1688,27 @@ mod tests {
             Resp::ok(r#"{"rows_imported":2,"rows_rejected":0}"#)
         });
         let g = flags(&srv.url);
-        cmd_tables(&g, &[
-            "import-csv".to_string(),
-            "--project=p1".to_string(),
-            format!("--file={}", csv_path.display()),
-            "users".to_string(),
-        ]).unwrap();
+        cmd_tables(
+            &g,
+            &[
+                "import-csv".to_string(),
+                "--project=p1".to_string(),
+                format!("--file={}", csv_path.display()),
+                "users".to_string(),
+            ],
+        )
+        .unwrap();
 
         // Verify multipart body contains CSV data.
         let body = received_body.lock().unwrap();
         let body_str = String::from_utf8_lossy(&body);
         assert!(body_str.contains("1,Alice"), "body: {body_str}");
-        assert!(body_str.contains("multipart") || body_str.contains("BasinCSVBoundary") || body_str.contains("form-data"), "body: {body_str}");
+        assert!(
+            body_str.contains("multipart")
+                || body_str.contains("BasinCSVBoundary")
+                || body_str.contains("form-data"),
+            "body: {body_str}"
+        );
     }
 
     #[test]
@@ -1479,16 +1726,23 @@ mod tests {
             Resp::ok(r#"{"rows_imported":2,"rows_rejected":0}"#)
         });
         let g = flags(&srv.url);
-        cmd_tables(&g, &[
-            "import-csv".to_string(),
-            "--project=p1".to_string(),
-            "--header=false".to_string(),
-            format!("--file={}", csv_path.display()),
-            "products".to_string(),
-        ]).unwrap();
+        cmd_tables(
+            &g,
+            &[
+                "import-csv".to_string(),
+                "--project=p1".to_string(),
+                "--header=false".to_string(),
+                format!("--file={}", csv_path.display()),
+                "products".to_string(),
+            ],
+        )
+        .unwrap();
         let body = captured.lock().unwrap();
         // The body should contain the "header" field value "false".
-        assert!(body.contains("false"), "body should contain header=false: {body}");
+        assert!(
+            body.contains("false"),
+            "body should contain header=false: {body}"
+        );
     }
 
     #[test]
@@ -1502,9 +1756,15 @@ mod tests {
         let srv = TestServer::start(|_req: &Req| {
             Resp::ok(r#"{"rows_imported":5,"rows_rejected":1,"rejections":["row 3: bad value"]}"#)
         });
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: TableImportCSVResponse = c.do_json(Method::POST, "/v1/projects/p1/tables/t1/import-csv", Some(json!({}))).unwrap();
+        let resp: TableImportCSVResponse = c
+            .do_json(
+                Method::POST,
+                "/v1/projects/p1/tables/t1/import-csv",
+                Some(json!({})),
+            )
+            .unwrap();
         let mut buf = Vec::<u8>::new();
         print_json(&mut buf, &resp).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
@@ -1521,7 +1781,15 @@ mod tests {
             Resp::status(404, r#"{"code":"not_found","message":"Table not found."}"#)
         });
         let g = flags(&srv.url);
-        let err = cmd_tables(&g, &["export-csv".to_string(), "--project=p1".to_string(), "missing".to_string()]).unwrap_err();
+        let err = cmd_tables(
+            &g,
+            &[
+                "export-csv".to_string(),
+                "--project=p1".to_string(),
+                "missing".to_string(),
+            ],
+        )
+        .unwrap_err();
         let ae = crate::error::as_api_error(err.as_ref()).expect("ApiError");
         assert_eq!(ae.http_status, 404);
     }
@@ -1541,13 +1809,17 @@ mod tests {
             Resp::ok(r#"{"added":true}"#)
         });
         let g = flags(&srv.url);
-        cmd_tables(&g, &[
-            "columns".to_string(),
-            "add".to_string(),
-            "--project=p1".to_string(),
-            "--column=bio:text,nullable=true".to_string(),
-            "users".to_string(),
-        ]).unwrap();
+        cmd_tables(
+            &g,
+            &[
+                "columns".to_string(),
+                "add".to_string(),
+                "--project=p1".to_string(),
+                "--column=bio:text,nullable=true".to_string(),
+                "users".to_string(),
+            ],
+        )
+        .unwrap();
         let body = cap.lock().unwrap();
         assert_eq!(body["name"].as_str().unwrap(), "bio");
         assert_eq!(body["type"].as_str().unwrap(), "text");
@@ -1556,8 +1828,21 @@ mod tests {
     #[test]
     fn columns_add_missing_spec_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
-        let err = cmd_tables(&g, &["columns".to_string(), "add".to_string(), "--project=p1".to_string(), "users".to_string()]).unwrap_err();
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
+        let err = cmd_tables(
+            &g,
+            &[
+                "columns".to_string(),
+                "add".to_string(),
+                "--project=p1".to_string(),
+                "users".to_string(),
+            ],
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("--column"), "err: {err}");
     }
 
@@ -1565,10 +1850,16 @@ mod tests {
     fn columns_add_json_shape() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"added":true}"#));
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: ColumnAddResponse = c.do_json(Method::POST, "/v1/projects/p1/tables/t1/columns", Some(json!({"name":"x","type":"int"}))).unwrap();
+        let resp: ColumnAddResponse = c
+            .do_json(
+                Method::POST,
+                "/v1/projects/p1/tables/t1/columns",
+                Some(json!({"name":"x","type":"int"})),
+            )
+            .unwrap();
         print_json(&mut buf, &resp).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert!(v["added"].as_bool().unwrap());
@@ -1589,45 +1880,82 @@ mod tests {
             Resp::ok(r#"{"altered":true}"#)
         });
         let g = flags(&srv.url);
-        cmd_tables(&g, &[
-            "columns".to_string(),
-            "alter".to_string(),
-            "--project=p1".to_string(),
-            "--name=email".to_string(),
-            "--nullable=false".to_string(),
-            "users".to_string(),
-        ]).unwrap();
+        cmd_tables(
+            &g,
+            &[
+                "columns".to_string(),
+                "alter".to_string(),
+                "--project=p1".to_string(),
+                "--name=email".to_string(),
+                "--nullable=false".to_string(),
+                "users".to_string(),
+            ],
+        )
+        .unwrap();
         let body = cap.lock().unwrap();
-        assert_eq!(body["nullable"].as_bool().unwrap(), false);
+        assert!(!body["nullable"].as_bool().unwrap());
     }
 
     #[test]
     fn columns_alter_missing_name_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
-        let err = cmd_tables(&g, &["columns".to_string(), "alter".to_string(), "--project=p1".to_string(), "users".to_string()]).unwrap_err();
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
+        let err = cmd_tables(
+            &g,
+            &[
+                "columns".to_string(),
+                "alter".to_string(),
+                "--project=p1".to_string(),
+                "users".to_string(),
+            ],
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("--name"), "err: {err}");
     }
 
     #[test]
     fn columns_alter_no_changes_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
-        let err = cmd_tables(&g, &[
-            "columns".to_string(), "alter".to_string(),
-            "--project=p1".to_string(), "--name=email".to_string(), "users".to_string(),
-        ]).unwrap_err();
-        assert!(err.to_string().contains("--type or --nullable"), "err: {err}");
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
+        let err = cmd_tables(
+            &g,
+            &[
+                "columns".to_string(),
+                "alter".to_string(),
+                "--project=p1".to_string(),
+                "--name=email".to_string(),
+                "users".to_string(),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("--type or --nullable"),
+            "err: {err}"
+        );
     }
 
     #[test]
     fn columns_alter_json_shape() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"altered":true}"#));
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: ColumnAlterResponse = c.do_json(Method::PATCH, "/v1/projects/p1/tables/t1/columns/col1", Some(json!({"type":"bigint"}))).unwrap();
+        let resp: ColumnAlterResponse = c
+            .do_json(
+                Method::PATCH,
+                "/v1/projects/p1/tables/t1/columns/col1",
+                Some(json!({"type":"bigint"})),
+            )
+            .unwrap();
         print_json(&mut buf, &resp).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert!(v["altered"].as_bool().unwrap());
@@ -1647,22 +1975,39 @@ mod tests {
             Resp::ok(r#"{"dropped":true}"#)
         });
         let g = flags(&srv.url);
-        cmd_tables(&g, &[
-            "columns".to_string(),
-            "drop".to_string(),
-            "--project=p1".to_string(),
-            "--name=bio".to_string(),
-            "--yes".to_string(),
-            "users".to_string(),
-        ]).unwrap();
+        cmd_tables(
+            &g,
+            &[
+                "columns".to_string(),
+                "drop".to_string(),
+                "--project=p1".to_string(),
+                "--name=bio".to_string(),
+                "--yes".to_string(),
+                "users".to_string(),
+            ],
+        )
+        .unwrap();
         assert!(*called.lock().unwrap());
     }
 
     #[test]
     fn columns_drop_missing_name_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
-        let err = cmd_tables(&g, &["columns".to_string(), "drop".to_string(), "--project=p1".to_string(), "users".to_string()]).unwrap_err();
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
+        let err = cmd_tables(
+            &g,
+            &[
+                "columns".to_string(),
+                "drop".to_string(),
+                "--project=p1".to_string(),
+                "users".to_string(),
+            ],
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("--name"), "err: {err}");
     }
 
@@ -1670,10 +2015,12 @@ mod tests {
     fn columns_drop_json_shape() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"dropped":true}"#));
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: ColumnDropResponse = c.do_json(Method::DELETE, "/v1/projects/p1/tables/t1/columns/x", None).unwrap();
+        let resp: ColumnDropResponse = c
+            .do_json(Method::DELETE, "/v1/projects/p1/tables/t1/columns/x", None)
+            .unwrap();
         print_json(&mut buf, &resp).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert!(v["dropped"].as_bool().unwrap());
@@ -1686,10 +2033,18 @@ mod tests {
             Resp::status(404, r#"{"code":"not_found","message":"Column not found."}"#)
         });
         let g = flags(&srv.url);
-        let err = cmd_tables(&g, &[
-            "columns".to_string(), "drop".to_string(),
-            "--project=p1".to_string(), "--name=x".to_string(), "--yes".to_string(), "t1".to_string(),
-        ]).unwrap_err();
+        let err = cmd_tables(
+            &g,
+            &[
+                "columns".to_string(),
+                "drop".to_string(),
+                "--project=p1".to_string(),
+                "--name=x".to_string(),
+                "--yes".to_string(),
+                "t1".to_string(),
+            ],
+        )
+        .unwrap_err();
         let ae = crate::error::as_api_error(err.as_ref()).expect("ApiError");
         assert_eq!(ae.http_status, 404);
     }

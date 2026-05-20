@@ -112,7 +112,10 @@ fn list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
 
     if g.json {
         // JSON shape: { extensions: [ Extension ] }
-        return print_json(&mut std::io::stdout(), &json!({ "extensions": resp.extensions }));
+        return print_json(
+            &mut std::io::stdout(),
+            &json!({ "extensions": resp.extensions }),
+        );
     }
     if resp.extensions.is_empty() {
         println!("(no extensions)");
@@ -139,8 +142,7 @@ fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
     if !flag_value.is_empty() {
         return Ok(flag_value.to_string());
     }
-    let cwd = std::env::current_dir()
-        .map_err(|e| msg(format!("could not determine cwd: {e}")))?;
+    let cwd = std::env::current_dir().map_err(|e| msg(format!("could not determine cwd: {e}")))?;
     let wp = load_working_project(&cwd)?;
     match wp {
         Some(w) if !w.project_ref.is_empty() => Ok(w.project_ref),
@@ -169,7 +171,12 @@ mod tests {
     #[test]
     fn unknown_subcommand_is_error() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_extensions(&g, &["frobnicate".into()]).is_err());
     }
 
@@ -177,7 +184,12 @@ mod tests {
     fn no_project_and_no_config_is_error() {
         let _g = with_temp_config_dir();
         // In the temp dir there is no basin/config.toml, so --project must be provided.
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_extensions(&g, &["list".into()]).is_err());
     }
 
@@ -189,31 +201,27 @@ mod tests {
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "GET");
             assert_eq!(req.path, "/v1/projects/proj1/extensions/catalog");
-            Resp::ok(r#"{"extensions":[{"name":"pgvector","version":"0.7.0","installed":true,"description":"vector similarity search"},{"name":"basin-cron","version":"1.0.0","installed":false,"description":"cron jobs"}]}"#)
+            Resp::ok(
+                r#"{"extensions":[{"name":"pgvector","version":"0.7.0","installed":true,"description":"vector similarity search"},{"name":"basin-cron","version":"1.0.0","installed":false,"description":"cron jobs"}]}"#,
+            )
         });
-        cmd_extensions(
-            &flags(&srv.url),
-            &["list".into(), "--project=proj1".into()],
-        )
-        .unwrap();
+        cmd_extensions(&flags(&srv.url), &["list".into(), "--project=proj1".into()]).unwrap();
     }
 
     #[test]
     fn list_empty_extensions() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"extensions":[]}"#));
-        cmd_extensions(
-            &flags(&srv.url),
-            &["list".into(), "--project=proj1".into()],
-        )
-        .unwrap();
+        cmd_extensions(&flags(&srv.url), &["list".into(), "--project=proj1".into()]).unwrap();
     }
 
     #[test]
     fn list_json_shape() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"extensions":[{"name":"pgvector","version":"0.7.0","installed":true,"description":"vec"}]}"#)
+            Resp::ok(
+                r#"{"extensions":[{"name":"pgvector","version":"0.7.0","installed":true,"description":"vec"}]}"#,
+            )
         });
         let mut g = flags(&srv.url);
         g.json = true;
@@ -233,31 +241,36 @@ mod tests {
             let n = cc.fetch_add(1, Ordering::SeqCst);
             if n == 0 {
                 // First call → /extensions/catalog → 404
-                assert!(req.path.ends_with("/extensions/catalog"), "path={}", req.path);
-                Resp::status(404, r#"{"error":{"code":"not_found","message":"route not found"}}"#)
+                assert!(
+                    req.path.ends_with("/extensions/catalog"),
+                    "path={}",
+                    req.path
+                );
+                Resp::status(
+                    404,
+                    r#"{"error":{"code":"not_found","message":"route not found"}}"#,
+                )
             } else {
                 // Second call → /extensions root
                 assert!(req.path.ends_with("/extensions"), "path={}", req.path);
-                Resp::ok(r#"{"extensions":[{"name":"basin-net","version":"2.0.0","installed":false,"description":"net"}]}"#)
+                Resp::ok(
+                    r#"{"extensions":[{"name":"basin-net","version":"2.0.0","installed":false,"description":"net"}]}"#,
+                )
             }
         });
-        cmd_extensions(
-            &flags(&srv.url),
-            &["list".into(), "--project=proj1".into()],
-        )
-        .unwrap();
+        cmd_extensions(&flags(&srv.url), &["list".into(), "--project=proj1".into()]).unwrap();
     }
 
     #[test]
     fn catalog_403_does_not_fallback() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(403, r#"{"error":{"code":"forbidden","message":"insufficient permissions"}}"#)
+            Resp::status(
+                403,
+                r#"{"error":{"code":"forbidden","message":"insufficient permissions"}}"#,
+            )
         });
-        let err = cmd_extensions(
-            &flags(&srv.url),
-            &["list".into(), "--project=proj1".into()],
-        );
+        let err = cmd_extensions(&flags(&srv.url), &["list".into(), "--project=proj1".into()]);
         assert!(err.is_err());
         let e = err.unwrap_err();
         let ae = as_api_error(e.as_ref()).expect("expected ApiError");
@@ -270,11 +283,7 @@ mod tests {
     fn explicit_list_dispatch() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"extensions":[]}"#));
-        cmd_extensions(
-            &flags(&srv.url),
-            &["list".into(), "--project=proj1".into()],
-        )
-        .unwrap();
+        cmd_extensions(&flags(&srv.url), &["list".into(), "--project=proj1".into()]).unwrap();
     }
 
     // ── implicit list (no subcommand) ─────────────────────────────────
@@ -291,10 +300,7 @@ mod tests {
         let srv = TestServer::start(|_req: &Req| {
             Resp::status(409, r#"{"error":{"code":"conflict","message":"conflict"}}"#)
         });
-        let err = cmd_extensions(
-            &flags(&srv.url),
-            &["list".into(), "--project=proj1".into()],
-        );
+        let err = cmd_extensions(&flags(&srv.url), &["list".into(), "--project=proj1".into()]);
         assert!(err.is_err());
         let e = err.unwrap_err();
         let ae = as_api_error(e.as_ref()).expect("expected ApiError");
@@ -306,7 +312,10 @@ mod tests {
     #[test]
     fn help_returns_ok() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_extensions(&g, &["help".into()]).is_ok());
     }
 

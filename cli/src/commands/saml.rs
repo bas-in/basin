@@ -178,8 +178,7 @@ fn saml_put(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     }
 
     let c = require_client(g)?;
-    let resp: SamlResp =
-        c.do_json(Method::PATCH, &format!("/v1/orgs/{org}/saml"), Some(body))?;
+    let resp: SamlResp = c.do_json(Method::PATCH, &format!("/v1/orgs/{org}/saml"), Some(body))?;
 
     if g.json {
         // JSON shape: { "saml": { idp_metadata_url, idp_entity_id, sp_metadata_url, enabled, configured_at } }
@@ -234,10 +233,7 @@ fn saml_test(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     if resp.ok {
         println!("SAML test OK (tested_at: {}).", resp.tested_at);
     } else {
-        let err_msg = resp
-            .error
-            .as_deref()
-            .unwrap_or("(unknown error)");
+        let err_msg = resp.error.as_deref().unwrap_or("(unknown error)");
         println!("SAML test FAILED: {err_msg}");
     }
     Ok(())
@@ -288,8 +284,7 @@ fn saml_enable(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         enabled: bool,
     }
 
-    let resp: EnableResp =
-        c.do_json(Method::POST, &format!("/v1/orgs/{org}/saml/enable"), None)?;
+    let resp: EnableResp = c.do_json(Method::POST, &format!("/v1/orgs/{org}/saml/enable"), None)?;
 
     if g.json {
         // JSON shape: { "enabled": true }
@@ -396,7 +391,11 @@ mod tests {
     #[test]
     fn get_missing_org() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_saml(&g0, &["get".into()]);
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("--org"));
@@ -438,7 +437,10 @@ mod tests {
     #[test]
     fn get_server_error() {
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(500, r#"{"error":{"code":"internal","message":"server error"}}"#)
+            Resp::status(
+                500,
+                r#"{"error":{"code":"internal","message":"server error"}}"#,
+            )
         });
         let _cfg = with_temp_config_dir();
         let err = cmd_saml(&g(&srv), &["get".into(), "--org=acme".into()]);
@@ -496,7 +498,11 @@ mod tests {
     #[test]
     fn put_missing_org() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_saml(
             &g0,
             &[
@@ -512,7 +518,11 @@ mod tests {
     #[test]
     fn put_missing_metadata_url() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_saml(&g0, &["put".into(), "--org=acme".into(), "--yes".into()]);
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("--metadata-url"));
@@ -536,7 +546,10 @@ mod tests {
             ],
         );
         assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("confirmation required"));
+        assert!(err
+            .unwrap_err()
+            .to_string()
+            .contains("confirmation required"));
     }
 
     #[test]
@@ -580,13 +593,21 @@ mod tests {
         });
         let _cfg = with_temp_config_dir();
         let err = cmd_saml(&g(&srv), &["test".into(), "--org=acme".into()]);
-        assert!(err.is_ok(), "saml test (failed IdP) should be Ok: {:?}", err);
+        assert!(
+            err.is_ok(),
+            "saml test (failed IdP) should be Ok: {:?}",
+            err
+        );
     }
 
     #[test]
     fn test_missing_org() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_saml(&g0, &["test".into()]);
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("--org"));
@@ -600,10 +621,18 @@ mod tests {
         let _cfg = with_temp_config_dir();
         let mut out = Vec::new();
         #[derive(Serialize)]
-        struct T { ok: bool, error: Option<String>, tested_at: String }
+        struct T {
+            ok: bool,
+            error: Option<String>,
+            tested_at: String,
+        }
         print_json(
             &mut out,
-            &T { ok: true, error: None, tested_at: "2024-01-01T00:00:00Z".into() },
+            &T {
+                ok: true,
+                error: None,
+                tested_at: "2024-01-01T00:00:00Z".into(),
+            },
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -614,7 +643,10 @@ mod tests {
     #[test]
     fn test_server_error_mapping() {
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(422, r#"{"error":{"code":"saml_not_configured","message":"No SAML config found."}}"#)
+            Resp::status(
+                422,
+                r#"{"error":{"code":"saml_not_configured","message":"No SAML config found."}}"#,
+            )
         });
         let _cfg = with_temp_config_dir();
         let err = cmd_saml(&g(&srv), &["test".into(), "--org=acme".into()]);
@@ -634,14 +666,21 @@ mod tests {
             Resp::ok(r#"{"enabled":true}"#)
         });
         let _cfg = with_temp_config_dir();
-        let err = cmd_saml(&g(&srv), &["enable".into(), "--org=acme".into(), "--yes".into()]);
+        let err = cmd_saml(
+            &g(&srv),
+            &["enable".into(), "--org=acme".into(), "--yes".into()],
+        );
         assert!(err.is_ok(), "enable: {:?}", err);
     }
 
     #[test]
     fn enable_missing_org() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_saml(&g0, &["enable".into(), "--yes".into()]);
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("--org"));
@@ -658,7 +697,10 @@ mod tests {
         };
         let err = cmd_saml(&g0, &["enable".into(), "--org=acme".into()]);
         assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("confirmation required"));
+        assert!(err
+            .unwrap_err()
+            .to_string()
+            .contains("confirmation required"));
     }
 
     #[test]
@@ -667,7 +709,9 @@ mod tests {
         let _cfg = with_temp_config_dir();
         let mut out = Vec::new();
         #[derive(Serialize)]
-        struct E { enabled: bool }
+        struct E {
+            enabled: bool,
+        }
         print_json(&mut out, &E { enabled: true }).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed["enabled"], true);
@@ -677,10 +721,16 @@ mod tests {
     #[test]
     fn enable_server_error_mapping() {
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(403, r#"{"error":{"code":"forbidden","message":"Insufficient permissions."}}"#)
+            Resp::status(
+                403,
+                r#"{"error":{"code":"forbidden","message":"Insufficient permissions."}}"#,
+            )
         });
         let _cfg = with_temp_config_dir();
-        let err = cmd_saml(&g(&srv), &["enable".into(), "--org=acme".into(), "--yes".into()]);
+        let err = cmd_saml(
+            &g(&srv),
+            &["enable".into(), "--org=acme".into(), "--yes".into()],
+        );
         assert!(err.is_err());
         let e = err.unwrap_err();
         let ae = as_api_error(e.as_ref()).expect("expected ApiError");
@@ -697,14 +747,21 @@ mod tests {
             Resp::ok(r#"{"enabled":false}"#)
         });
         let _cfg = with_temp_config_dir();
-        let err = cmd_saml(&g(&srv), &["disable".into(), "--org=acme".into(), "--yes".into()]);
+        let err = cmd_saml(
+            &g(&srv),
+            &["disable".into(), "--org=acme".into(), "--yes".into()],
+        );
         assert!(err.is_ok(), "disable: {:?}", err);
     }
 
     #[test]
     fn disable_missing_org() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_saml(&g0, &["disable".into(), "--yes".into()]);
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("--org"));
@@ -721,7 +778,10 @@ mod tests {
         };
         let err = cmd_saml(&g0, &["disable".into(), "--org=acme".into()]);
         assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("confirmation required"));
+        assert!(err
+            .unwrap_err()
+            .to_string()
+            .contains("confirmation required"));
     }
 
     #[test]
@@ -730,7 +790,9 @@ mod tests {
         let _cfg = with_temp_config_dir();
         let mut out = Vec::new();
         #[derive(Serialize)]
-        struct D { enabled: bool }
+        struct D {
+            enabled: bool,
+        }
         print_json(&mut out, &D { enabled: false }).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed["enabled"], false);
@@ -740,10 +802,16 @@ mod tests {
     #[test]
     fn disable_server_error_mapping() {
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(404, r#"{"error":{"code":"not_found","message":"Org not found."}}"#)
+            Resp::status(
+                404,
+                r#"{"error":{"code":"not_found","message":"Org not found."}}"#,
+            )
         });
         let _cfg = with_temp_config_dir();
-        let err = cmd_saml(&g(&srv), &["disable".into(), "--org=acme".into(), "--yes".into()]);
+        let err = cmd_saml(
+            &g(&srv),
+            &["disable".into(), "--org=acme".into(), "--yes".into()],
+        );
         assert!(err.is_err());
         let e = err.unwrap_err();
         let ae = as_api_error(e.as_ref()).expect("expected ApiError");
@@ -755,7 +823,10 @@ mod tests {
     #[test]
     fn unknown_subcommand_returns_silent() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_saml(&g0, &["frobnicate".into()]);
         assert!(err.is_err());
     }
@@ -763,7 +834,10 @@ mod tests {
     #[test]
     fn help_returns_ok() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_saml(&g0, &["help".into()]);
         assert!(err.is_ok());
     }
@@ -771,9 +845,11 @@ mod tests {
     #[test]
     fn no_args_returns_ok() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_saml(&g0, &[]);
         assert!(err.is_ok());
     }
-
 }

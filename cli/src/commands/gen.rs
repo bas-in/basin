@@ -70,9 +70,21 @@ macro_rules! row {
      go: ($gt:literal, $gn:literal, $gi:literal),
      py: ($pt:literal, $pn:literal, $pi:literal)) => {
         PgRow {
-            ts: MappedType { typ: $t, nullable: $n, import: $i },
-            go: MappedType { typ: $gt, nullable: $gn, import: $gi },
-            py: MappedType { typ: $pt, nullable: $pn, import: $pi },
+            ts: MappedType {
+                typ: $t,
+                nullable: $n,
+                import: $i,
+            },
+            go: MappedType {
+                typ: $gt,
+                nullable: $gn,
+                import: $gi,
+            },
+            py: MappedType {
+                typ: $pt,
+                nullable: $pn,
+                import: $pi,
+            },
         }
     };
 }
@@ -81,70 +93,106 @@ fn type_table() -> HashMap<&'static str, PgRow> {
     let mut m: HashMap<&'static str, PgRow> = HashMap::new();
 
     // ── Boolean ──────────────────────────────────────────────────────────────
-    m.insert("boolean", row!(
-        ts: ("boolean",            "boolean | null",           ""),
-        go: ("bool",               "*bool",                    ""),
-        py: ("bool",               "Optional[bool]",           "from typing import Optional")
-    ));
-    m.insert("bool", row!(
-        ts: ("boolean",            "boolean | null",           ""),
-        go: ("bool",               "*bool",                    ""),
-        py: ("bool",               "Optional[bool]",           "from typing import Optional")
-    ));
+    m.insert(
+        "boolean",
+        row!(
+            ts: ("boolean",            "boolean | null",           ""),
+            go: ("bool",               "*bool",                    ""),
+            py: ("bool",               "Optional[bool]",           "from typing import Optional")
+        ),
+    );
+    m.insert(
+        "bool",
+        row!(
+            ts: ("boolean",            "boolean | null",           ""),
+            go: ("bool",               "*bool",                    ""),
+            py: ("bool",               "Optional[bool]",           "from typing import Optional")
+        ),
+    );
 
     // ── Integer family ───────────────────────────────────────────────────────
-    m.insert("smallint", row!(
-        ts: ("number",             "number | null",            ""),
-        go: ("int16",              "*int16",                   ""),
-        py: ("int",                "Optional[int]",            "from typing import Optional")
-    ));
-    m.insert("int2", row!(
-        ts: ("number",             "number | null",            ""),
-        go: ("int16",              "*int16",                   ""),
-        py: ("int",                "Optional[int]",            "from typing import Optional")
-    ));
-    m.insert("integer", row!(
-        ts: ("number",             "number | null",            ""),
-        go: ("int32",              "*int32",                   ""),
-        py: ("int",                "Optional[int]",            "from typing import Optional")
-    ));
-    m.insert("int4", row!(
-        ts: ("number",             "number | null",            ""),
-        go: ("int32",              "*int32",                   ""),
-        py: ("int",                "Optional[int]",            "from typing import Optional")
-    ));
-    m.insert("bigint", row!(
-        ts: ("bigint",             "bigint | null",            ""),
-        go: ("int64",              "*int64",                   ""),
-        py: ("int",                "Optional[int]",            "from typing import Optional")
-    ));
-    m.insert("int8", row!(
-        ts: ("bigint",             "bigint | null",            ""),
-        go: ("int64",              "*int64",                   ""),
-        py: ("int",                "Optional[int]",            "from typing import Optional")
-    ));
+    m.insert(
+        "smallint",
+        row!(
+            ts: ("number",             "number | null",            ""),
+            go: ("int16",              "*int16",                   ""),
+            py: ("int",                "Optional[int]",            "from typing import Optional")
+        ),
+    );
+    m.insert(
+        "int2",
+        row!(
+            ts: ("number",             "number | null",            ""),
+            go: ("int16",              "*int16",                   ""),
+            py: ("int",                "Optional[int]",            "from typing import Optional")
+        ),
+    );
+    m.insert(
+        "integer",
+        row!(
+            ts: ("number",             "number | null",            ""),
+            go: ("int32",              "*int32",                   ""),
+            py: ("int",                "Optional[int]",            "from typing import Optional")
+        ),
+    );
+    m.insert(
+        "int4",
+        row!(
+            ts: ("number",             "number | null",            ""),
+            go: ("int32",              "*int32",                   ""),
+            py: ("int",                "Optional[int]",            "from typing import Optional")
+        ),
+    );
+    m.insert(
+        "bigint",
+        row!(
+            ts: ("bigint",             "bigint | null",            ""),
+            go: ("int64",              "*int64",                   ""),
+            py: ("int",                "Optional[int]",            "from typing import Optional")
+        ),
+    );
+    m.insert(
+        "int8",
+        row!(
+            ts: ("bigint",             "bigint | null",            ""),
+            go: ("int64",              "*int64",                   ""),
+            py: ("int",                "Optional[int]",            "from typing import Optional")
+        ),
+    );
 
     // ── Floating-point family ────────────────────────────────────────────────
-    m.insert("real", row!(
-        ts: ("number",             "number | null",            ""),
-        go: ("float32",            "*float32",                 ""),
-        py: ("float",              "Optional[float]",          "from typing import Optional")
-    ));
-    m.insert("float4", row!(
-        ts: ("number",             "number | null",            ""),
-        go: ("float32",            "*float32",                 ""),
-        py: ("float",              "Optional[float]",          "from typing import Optional")
-    ));
-    m.insert("double precision", row!(
-        ts: ("number",             "number | null",            ""),
-        go: ("float64",            "*float64",                 ""),
-        py: ("float",              "Optional[float]",          "from typing import Optional")
-    ));
-    m.insert("float8", row!(
-        ts: ("number",             "number | null",            ""),
-        go: ("float64",            "*float64",                 ""),
-        py: ("float",              "Optional[float]",          "from typing import Optional")
-    ));
+    m.insert(
+        "real",
+        row!(
+            ts: ("number",             "number | null",            ""),
+            go: ("float32",            "*float32",                 ""),
+            py: ("float",              "Optional[float]",          "from typing import Optional")
+        ),
+    );
+    m.insert(
+        "float4",
+        row!(
+            ts: ("number",             "number | null",            ""),
+            go: ("float32",            "*float32",                 ""),
+            py: ("float",              "Optional[float]",          "from typing import Optional")
+        ),
+    );
+    m.insert(
+        "double precision",
+        row!(
+            ts: ("number",             "number | null",            ""),
+            go: ("float64",            "*float64",                 ""),
+            py: ("float",              "Optional[float]",          "from typing import Optional")
+        ),
+    );
+    m.insert(
+        "float8",
+        row!(
+            ts: ("number",             "number | null",            ""),
+            go: ("float64",            "*float64",                 ""),
+            py: ("float",              "Optional[float]",          "from typing import Optional")
+        ),
+    );
 
     // ── Exact numeric ────────────────────────────────────────────────────────
     m.insert("numeric", row!(
@@ -159,38 +207,56 @@ fn type_table() -> HashMap<&'static str, PgRow> {
     ));
 
     // ── Text family ──────────────────────────────────────────────────────────
-    m.insert("text", row!(
-        ts: ("string",             "string | null",            ""),
-        go: ("string",             "*string",                  ""),
-        py: ("str",                "Optional[str]",            "from typing import Optional")
-    ));
-    m.insert("character varying", row!(
-        ts: ("string",             "string | null",            ""),
-        go: ("string",             "*string",                  ""),
-        py: ("str",                "Optional[str]",            "from typing import Optional")
-    ));
-    m.insert("varchar", row!(
-        ts: ("string",             "string | null",            ""),
-        go: ("string",             "*string",                  ""),
-        py: ("str",                "Optional[str]",            "from typing import Optional")
-    ));
-    m.insert("character", row!(
-        ts: ("string",             "string | null",            ""),
-        go: ("string",             "*string",                  ""),
-        py: ("str",                "Optional[str]",            "from typing import Optional")
-    ));
-    m.insert("char", row!(
-        ts: ("string",             "string | null",            ""),
-        go: ("string",             "*string",                  ""),
-        py: ("str",                "Optional[str]",            "from typing import Optional")
-    ));
+    m.insert(
+        "text",
+        row!(
+            ts: ("string",             "string | null",            ""),
+            go: ("string",             "*string",                  ""),
+            py: ("str",                "Optional[str]",            "from typing import Optional")
+        ),
+    );
+    m.insert(
+        "character varying",
+        row!(
+            ts: ("string",             "string | null",            ""),
+            go: ("string",             "*string",                  ""),
+            py: ("str",                "Optional[str]",            "from typing import Optional")
+        ),
+    );
+    m.insert(
+        "varchar",
+        row!(
+            ts: ("string",             "string | null",            ""),
+            go: ("string",             "*string",                  ""),
+            py: ("str",                "Optional[str]",            "from typing import Optional")
+        ),
+    );
+    m.insert(
+        "character",
+        row!(
+            ts: ("string",             "string | null",            ""),
+            go: ("string",             "*string",                  ""),
+            py: ("str",                "Optional[str]",            "from typing import Optional")
+        ),
+    );
+    m.insert(
+        "char",
+        row!(
+            ts: ("string",             "string | null",            ""),
+            go: ("string",             "*string",                  ""),
+            py: ("str",                "Optional[str]",            "from typing import Optional")
+        ),
+    );
 
     // ── Binary ───────────────────────────────────────────────────────────────
-    m.insert("bytea", row!(
-        ts: ("Uint8Array",         "Uint8Array | null",        ""),
-        go: ("[]byte",             "[]byte",                   ""),
-        py: ("bytes",              "Optional[bytes]",          "from typing import Optional")
-    ));
+    m.insert(
+        "bytea",
+        row!(
+            ts: ("Uint8Array",         "Uint8Array | null",        ""),
+            go: ("[]byte",             "[]byte",                   ""),
+            py: ("bytes",              "Optional[bytes]",          "from typing import Optional")
+        ),
+    );
 
     // ── UUID ─────────────────────────────────────────────────────────────────
     m.insert("uuid", row!(
@@ -260,18 +326,24 @@ fn type_table() -> HashMap<&'static str, PgRow> {
     // ── Interval ─────────────────────────────────────────────────────────────
     // Listed as 🚫 in CAPABILITIES.md alongside MONEY/XML, but information_schema
     // may surface it from snapshots or future engine builds. Map to string.
-    m.insert("interval", row!(
-        ts: ("string",             "string | null",            ""),
-        go: ("string",             "*string",                  ""),
-        py: ("str",                "Optional[str]",            "from typing import Optional")
-    ));
+    m.insert(
+        "interval",
+        row!(
+            ts: ("string",             "string | null",            ""),
+            go: ("string",             "*string",                  ""),
+            py: ("str",                "Optional[str]",            "from typing import Optional")
+        ),
+    );
 
     // ── Vector ───────────────────────────────────────────────────────────────
-    m.insert("vector", row!(
-        ts: ("number[]",           "number[] | null",          ""),
-        go: ("[]float32",          "[]float32",                ""),
-        py: ("list[float]",        "Optional[list[float]]",    "from typing import Optional")
-    ));
+    m.insert(
+        "vector",
+        row!(
+            ts: ("number[]",           "number[] | null",          ""),
+            go: ("[]float32",          "[]float32",                ""),
+            py: ("list[float]",        "Optional[list[float]]",    "from typing import Optional")
+        ),
+    );
 
     m
 }
@@ -324,15 +396,24 @@ fn parse_schema_columns(res: &QueryResult) -> (HashMap<String, TableColumns>, Ve
             continue;
         }
         if !tables.contains_key(&table_name) {
-            tables.insert(table_name.clone(), TableColumns { columns: Vec::new() });
+            tables.insert(
+                table_name.clone(),
+                TableColumns {
+                    columns: Vec::new(),
+                },
+            );
             table_order.push(table_name.clone());
         }
-        tables.get_mut(&table_name).unwrap().columns.push(SchemaColumn {
-            table_name: table_name.clone(),
-            column_name,
-            data_type,
-            is_nullable,
-        });
+        tables
+            .get_mut(&table_name)
+            .unwrap()
+            .columns
+            .push(SchemaColumn {
+                table_name: table_name.clone(),
+                column_name,
+                data_type,
+                is_nullable,
+            });
         total_cols += 1;
     }
     table_order.sort();
@@ -381,43 +462,47 @@ fn to_pascal_case(s: &str) -> String {
 
 // ── TypeScript emitter ────────────────────────────────────────────────────────
 
-fn emit_typescript(
-    w: &mut dyn Write,
-    tables: &HashMap<String, TableColumns>,
-    order: &[String],
-) {
+fn emit_typescript(w: &mut dyn Write, tables: &HashMap<String, TableColumns>, order: &[String]) {
     let _ = write!(w, "// Code generated by basin gen types — DO NOT EDIT.\n\n");
 
     // Per-table interface declarations first.
     for tbl in order {
         let tc = &tables[tbl];
         let iface_name = format!("Table_{}", to_pascal_case(tbl));
-        let _ = write!(w, "export interface {iface_name} {{\n");
+        let _ = writeln!(w, "export interface {iface_name} {{");
         for col in &tc.columns {
             let nullable = col.is_nullable.to_uppercase() == "YES";
             let ts_type = match map_type(&col.data_type, LangTarget::TypeScript) {
                 Some(mt) => {
-                    if nullable { mt.nullable.to_string() } else { mt.typ.to_string() }
+                    if nullable {
+                        mt.nullable.to_string()
+                    } else {
+                        mt.typ.to_string()
+                    }
                 }
                 None => {
-                    let _ = write!(w, "  // WARNING: unknown pg type {}\n", col.data_type);
-                    if nullable { "unknown | null".to_string() } else { "unknown".to_string() }
+                    let _ = writeln!(w, "  // WARNING: unknown pg type {}", col.data_type);
+                    if nullable {
+                        "unknown | null".to_string()
+                    } else {
+                        "unknown".to_string()
+                    }
                 }
             };
-            let _ = write!(w, "  {}: {};\n", col.column_name, ts_type);
+            let _ = writeln!(w, "  {}: {};", col.column_name, ts_type);
         }
         let _ = write!(w, "}}\n\n");
     }
 
     // Database wrapper following the supabase-shape convention.
-    let _ = write!(w, "export interface Database {{\n");
-    let _ = write!(w, "  Tables: {{\n");
+    let _ = writeln!(w, "export interface Database {{");
+    let _ = writeln!(w, "  Tables: {{");
     for tbl in order {
         let iface_name = format!("Table_{}", to_pascal_case(tbl));
-        let _ = write!(w, "    {tbl}: {iface_name};\n");
+        let _ = writeln!(w, "    {tbl}: {iface_name};");
     }
-    let _ = write!(w, "  }};\n");
-    let _ = write!(w, "}}\n");
+    let _ = writeln!(w, "  }};");
+    let _ = writeln!(w, "}}");
 }
 
 // ── Go emitter ────────────────────────────────────────────────────────────────
@@ -443,9 +528,9 @@ fn emit_go(
         }
     }
     if !imports.is_empty() {
-        let _ = write!(w, "import (\n");
+        let _ = writeln!(w, "import (");
         for imp in &imports {
-            let _ = write!(w, "\t\"{imp}\"\n");
+            let _ = writeln!(w, "\t\"{imp}\"");
         }
         let _ = write!(w, ")\n\n");
     }
@@ -454,22 +539,26 @@ fn emit_go(
     for tbl in order {
         let tc = &tables[tbl];
         let struct_name = to_pascal_case(tbl);
-        let _ = write!(w, "type {struct_name} struct {{\n");
+        let _ = writeln!(w, "type {struct_name} struct {{");
         for col in &tc.columns {
             let nullable = col.is_nullable.to_uppercase() == "YES";
             let go_type = match map_type(&col.data_type, LangTarget::Go) {
                 Some(mt) => {
-                    if nullable { mt.nullable.to_string() } else { mt.typ.to_string() }
+                    if nullable {
+                        mt.nullable.to_string()
+                    } else {
+                        mt.typ.to_string()
+                    }
                 }
                 None => {
-                    let _ = write!(w, "\t// WARNING: unknown pg type {}\n", col.data_type);
+                    let _ = writeln!(w, "\t// WARNING: unknown pg type {}", col.data_type);
                     "interface{}".to_string()
                 }
             };
             let field_name = to_pascal_case(&col.column_name);
-            let _ = write!(
+            let _ = writeln!(
                 w,
-                "\t{field_name} {go_type} `json:\"{cn}\" db:\"{cn}\"`\n",
+                "\t{field_name} {go_type} `json:\"{cn}\" db:\"{cn}\"`",
                 cn = col.column_name
             );
         }
@@ -479,11 +568,7 @@ fn emit_go(
 
 // ── Python emitter ────────────────────────────────────────────────────────────
 
-fn emit_python(
-    w: &mut dyn Write,
-    tables: &HashMap<String, TableColumns>,
-    order: &[String],
-) {
+fn emit_python(w: &mut dyn Write, tables: &HashMap<String, TableColumns>, order: &[String]) {
     let _ = write!(w, "# Code generated by basin gen types — DO NOT EDIT.\n\n");
 
     // Collect imports from all mapped types. Use a BTreeSet so they sort
@@ -508,32 +593,40 @@ fn emit_python(
         }
     }
     for imp in &imports {
-        let _ = write!(w, "{imp}\n");
+        let _ = writeln!(w, "{imp}");
     }
-    let _ = write!(w, "\n");
+    let _ = writeln!(w);
 
     // One class per table.
     for tbl in order {
         let tc = &tables[tbl];
         let class_name = to_pascal_case(tbl);
-        let _ = write!(w, "class {class_name}(BaseModel):\n");
+        let _ = writeln!(w, "class {class_name}(BaseModel):");
         if tc.columns.is_empty() {
-            let _ = write!(w, "    pass\n");
+            let _ = writeln!(w, "    pass");
         }
         for col in &tc.columns {
             let nullable = col.is_nullable.to_uppercase() == "YES";
             let py_type = match map_type(&col.data_type, LangTarget::Python) {
                 Some(mt) => {
-                    if nullable { mt.nullable.to_string() } else { mt.typ.to_string() }
+                    if nullable {
+                        mt.nullable.to_string()
+                    } else {
+                        mt.typ.to_string()
+                    }
                 }
                 None => {
-                    let _ = write!(w, "    # WARNING: unknown pg type {}\n", col.data_type);
-                    if nullable { "Optional[None]".to_string() } else { "None".to_string() }
+                    let _ = writeln!(w, "    # WARNING: unknown pg type {}", col.data_type);
+                    if nullable {
+                        "Optional[None]".to_string()
+                    } else {
+                        "None".to_string()
+                    }
                 }
             };
-            let _ = write!(w, "    {}: {py_type}\n", col.column_name);
+            let _ = writeln!(w, "    {}: {py_type}", col.column_name);
         }
-        let _ = write!(w, "\n");
+        let _ = writeln!(w);
     }
 }
 
@@ -561,7 +654,10 @@ pub fn cmd_gen(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
             );
             Ok(())
         }
-        other => Err(msg(format!("gen: unknown subcommand {:?} (available: types)", other))),
+        other => Err(msg(format!(
+            "gen: unknown subcommand {:?} (available: types)",
+            other
+        ))),
     }
 }
 
@@ -672,7 +768,7 @@ pub fn gen_types(
 
     // --watch stub — full implementation deferred to a later batch.
     if watch {
-        let _ = write!(err_out, "basin: watch not yet implemented\n");
+        let _ = writeln!(err_out, "basin: watch not yet implemented");
         return Ok(());
     }
 
@@ -686,7 +782,9 @@ pub fn gen_types(
         }
     }
     if project.is_empty() {
-        return Err(msg("gen types: --project is required (or link a project with `basin link`)"));
+        return Err(msg(
+            "gen types: --project is required (or link a project with `basin link`)",
+        ));
     }
 
     // ── schema name validation ─────────────────────────────────────────────
@@ -740,7 +838,11 @@ pub fn gen_types(
     }
 
     // ── optional JSON metadata (always to err_out) ─────────────────────
-    let out_display = if output_path.is_empty() { "-" } else { &output_path };
+    let out_display = if output_path.is_empty() {
+        "-"
+    } else {
+        &output_path
+    };
     if g.json {
         // JSON shape: { "lang": string, "tables": int, "columns": int, "output_path": string }
         let meta = json!({
@@ -753,11 +855,13 @@ pub fn gen_types(
         // pass &mut dyn Write directly.
         let mut buf: Vec<u8> = Vec::new();
         crate::output::print_json(&mut buf, &meta)?;
-        err_out.write_all(&buf).map_err(|e| msg(format!("gen types: write metadata: {e}")))?;
+        err_out
+            .write_all(&buf)
+            .map_err(|e| msg(format!("gen types: write metadata: {e}")))?;
     } else if !g.quiet {
-        let _ = write!(
+        let _ = writeln!(
             err_out,
-            "generated {} table(s), {} column(s) → {}\n",
+            "generated {} table(s), {} column(s) → {}",
             table_order.len(),
             total_cols,
             out_display,
@@ -808,15 +912,69 @@ mod tests {
 
     fn build_schema_server() -> TestServer {
         let rows: Vec<Vec<serde_json::Value>> = vec![
-            vec!["orders".into(), "id".into(),       "uuid".into(),                    "NO".into(),  1.into()],
-            vec!["orders".into(), "user_id".into(),  "uuid".into(),                    "YES".into(), 2.into()],
-            vec!["orders".into(), "total".into(),    "numeric".into(),                 "NO".into(),  3.into()],
-            vec!["orders".into(), "metadata".into(), "jsonb".into(),                   "YES".into(), 4.into()],
-            vec!["users".into(),  "id".into(),       "uuid".into(),                    "NO".into(),  1.into()],
-            vec!["users".into(),  "email".into(),    "text".into(),                    "NO".into(),  2.into()],
-            vec!["users".into(),  "created_at".into(),"timestamp with time zone".into(),"YES".into(),3.into()],
-            vec!["users".into(),  "embedding".into(), "vector".into(),                 "YES".into(), 4.into()],
-            vec!["users".into(),  "score".into(),    "integer".into(),                 "NO".into(),  5.into()],
+            vec![
+                "orders".into(),
+                "id".into(),
+                "uuid".into(),
+                "NO".into(),
+                1.into(),
+            ],
+            vec![
+                "orders".into(),
+                "user_id".into(),
+                "uuid".into(),
+                "YES".into(),
+                2.into(),
+            ],
+            vec![
+                "orders".into(),
+                "total".into(),
+                "numeric".into(),
+                "NO".into(),
+                3.into(),
+            ],
+            vec![
+                "orders".into(),
+                "metadata".into(),
+                "jsonb".into(),
+                "YES".into(),
+                4.into(),
+            ],
+            vec![
+                "users".into(),
+                "id".into(),
+                "uuid".into(),
+                "NO".into(),
+                1.into(),
+            ],
+            vec![
+                "users".into(),
+                "email".into(),
+                "text".into(),
+                "NO".into(),
+                2.into(),
+            ],
+            vec![
+                "users".into(),
+                "created_at".into(),
+                "timestamp with time zone".into(),
+                "YES".into(),
+                3.into(),
+            ],
+            vec![
+                "users".into(),
+                "embedding".into(),
+                "vector".into(),
+                "YES".into(),
+                4.into(),
+            ],
+            vec![
+                "users".into(),
+                "score".into(),
+                "integer".into(),
+                "NO".into(),
+                5.into(),
+            ],
         ];
         let payload = serde_json::json!({
             "data": {
@@ -829,7 +987,11 @@ mod tests {
         let payload_str = serde_json::to_string(&payload).unwrap();
         TestServer::start(move |req: &Req| {
             assert_eq!(req.method, "POST");
-            assert!(req.path.contains("/sql/query"), "unexpected path: {}", req.path);
+            assert!(
+                req.path.contains("/sql/query"),
+                "unexpected path: {}",
+                req.path
+            );
             Resp::ok(payload_str.clone())
         })
     }
@@ -857,10 +1019,17 @@ mod tests {
     }
 
     fn g_for(srv: &TestServer) -> GlobalFlags {
-        GlobalFlags { api_url: srv.url.clone(), token: "test-token".into(), ..Default::default() }
+        GlobalFlags {
+            api_url: srv.url.clone(),
+            token: "test-token".into(),
+            ..Default::default()
+        }
     }
 
-    fn run_gen(g: &GlobalFlags, args: &[&str]) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    fn run_gen(
+        g: &GlobalFlags,
+        args: &[&str],
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let mut out = Vec::new();
         let mut err_out = Vec::new();
@@ -876,7 +1045,10 @@ mod tests {
         let mut out = Vec::new();
         let mut err_out = Vec::new();
         gen_types(g, &args, &mut out, &mut err_out)?;
-        Ok((String::from_utf8(out).unwrap(), String::from_utf8(err_out).unwrap()))
+        Ok((
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err_out).unwrap(),
+        ))
     }
 
     // ── Snapshot tests ────────────────────────────────────────────────────────
@@ -936,7 +1108,10 @@ mod tests {
         let srv = build_schema_server();
         // No --project passed and no working-project config → error.
         let err = run_gen(&g_for(&srv), &["typescript"]).unwrap_err();
-        assert!(err.to_string().contains("--project is required"), "err={err}");
+        assert!(
+            err.to_string().contains("--project is required"),
+            "err={err}"
+        );
     }
 
     #[test]
@@ -952,9 +1127,18 @@ mod tests {
         let _cfg = with_temp_config_dir();
         let srv = build_empty_schema_server();
         let got = run_gen(&g_for(&srv), &["typescript", "--project=test-ref"]).unwrap();
-        assert!(got.contains("Code generated by basin gen types"), "missing header: {got}");
-        assert!(got.contains("export interface Database"), "missing Database interface: {got}");
-        assert!(!got.contains("export interface Table_"), "unexpected table interface: {got}");
+        assert!(
+            got.contains("Code generated by basin gen types"),
+            "missing header: {got}"
+        );
+        assert!(
+            got.contains("export interface Database"),
+            "missing Database interface: {got}"
+        );
+        assert!(
+            !got.contains("export interface Table_"),
+            "unexpected table interface: {got}"
+        );
     }
 
     // ── --output=<path> writes to file ───────────────────────────────────────
@@ -980,7 +1164,10 @@ mod tests {
         let file_content = std::fs::read_to_string(&out_path).expect("output file not created");
         // Content must match the stdout case.
         let stdout_got = run_gen(&g, &["typescript", "--project=test-ref"]).unwrap();
-        assert_eq!(file_content, stdout_got, "file content differs from writer output");
+        assert_eq!(
+            file_content, stdout_got,
+            "file content differs from writer output"
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -992,8 +1179,7 @@ mod tests {
         let srv = build_schema_server();
         let mut g = g_for(&srv);
         g.json = true;
-        let (_out, err_str) =
-            run_gen_both(&g, &["typescript", "--project=test-ref"]).unwrap();
+        let (_out, err_str) = run_gen_both(&g, &["typescript", "--project=test-ref"]).unwrap();
         let meta: serde_json::Value = serde_json::from_str(&err_str).expect("JSON metadata parse");
         assert_eq!(meta["lang"].as_str(), Some("typescript"));
         assert_eq!(meta["tables"].as_i64(), Some(2));
@@ -1074,20 +1260,77 @@ mod tests {
     #[test]
     fn parse_schema_columns_basic() {
         let rows: Vec<Vec<serde_json::Value>> = vec![
-            vec!["orders".into(), "id".into(),       "uuid".into(),    "NO".into(),  1.into()],
-            vec!["orders".into(), "user_id".into(),  "uuid".into(),    "YES".into(), 2.into()],
-            vec!["orders".into(), "total".into(),    "numeric".into(), "NO".into(),  3.into()],
-            vec!["orders".into(), "metadata".into(), "jsonb".into(),   "YES".into(), 4.into()],
-            vec!["users".into(),  "id".into(),       "uuid".into(),    "NO".into(),  1.into()],
-            vec!["users".into(),  "email".into(),    "text".into(),    "NO".into(),  2.into()],
-            vec!["users".into(),  "created_at".into(),"timestamp with time zone".into(),"YES".into(),3.into()],
-            vec!["users".into(),  "embedding".into(), "vector".into(), "YES".into(), 4.into()],
-            vec!["users".into(),  "score".into(),    "integer".into(), "NO".into(),  5.into()],
+            vec![
+                "orders".into(),
+                "id".into(),
+                "uuid".into(),
+                "NO".into(),
+                1.into(),
+            ],
+            vec![
+                "orders".into(),
+                "user_id".into(),
+                "uuid".into(),
+                "YES".into(),
+                2.into(),
+            ],
+            vec![
+                "orders".into(),
+                "total".into(),
+                "numeric".into(),
+                "NO".into(),
+                3.into(),
+            ],
+            vec![
+                "orders".into(),
+                "metadata".into(),
+                "jsonb".into(),
+                "YES".into(),
+                4.into(),
+            ],
+            vec![
+                "users".into(),
+                "id".into(),
+                "uuid".into(),
+                "NO".into(),
+                1.into(),
+            ],
+            vec![
+                "users".into(),
+                "email".into(),
+                "text".into(),
+                "NO".into(),
+                2.into(),
+            ],
+            vec![
+                "users".into(),
+                "created_at".into(),
+                "timestamp with time zone".into(),
+                "YES".into(),
+                3.into(),
+            ],
+            vec![
+                "users".into(),
+                "embedding".into(),
+                "vector".into(),
+                "YES".into(),
+                4.into(),
+            ],
+            vec![
+                "users".into(),
+                "score".into(),
+                "integer".into(),
+                "NO".into(),
+                5.into(),
+            ],
         ];
         let res = QueryResult {
             columns: vec![
-                "table_name".into(), "column_name".into(), "data_type".into(),
-                "is_nullable".into(), "ordinal_position".into(),
+                "table_name".into(),
+                "column_name".into(),
+                "data_type".into(),
+                "is_nullable".into(),
+                "ordinal_position".into(),
             ],
             rows,
             ..Default::default()
@@ -1188,9 +1431,15 @@ mod tests {
     fn go_package_flag() {
         let _cfg = with_temp_config_dir();
         let srv = build_schema_server();
-        let got =
-            run_gen(&g_for(&srv), &["go", "--project=test-ref", "--package=mydb"]).unwrap();
-        assert!(got.contains("package mydb"), "expected 'package mydb' in:\n{got}");
+        let got = run_gen(
+            &g_for(&srv),
+            &["go", "--project=test-ref", "--package=mydb"],
+        )
+        .unwrap();
+        assert!(
+            got.contains("package mydb"),
+            "expected 'package mydb' in:\n{got}"
+        );
     }
 
     // ── unknown flag ──────────────────────────────────────────────────────────
@@ -1198,9 +1447,16 @@ mod tests {
     #[test]
     fn unknown_flag() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { token: "tok".into(), api_url: "http://127.0.0.1:0".into(), ..Default::default() };
+        let g = GlobalFlags {
+            token: "tok".into(),
+            api_url: "http://127.0.0.1:0".into(),
+            ..Default::default()
+        };
         let err = run_gen(&g, &["typescript", "--project=ref", "--no-such-flag"]).unwrap_err();
-        assert!(!err.to_string().is_empty(), "expected error for unknown flag");
+        assert!(
+            !err.to_string().is_empty(),
+            "expected error for unknown flag"
+        );
     }
 
     // ── language aliases ──────────────────────────────────────────────────────
@@ -1210,7 +1466,10 @@ mod tests {
         let _cfg = with_temp_config_dir();
         let srv = build_schema_server();
         let got = run_gen(&g_for(&srv), &["ts", "--project=test-ref"]).unwrap();
-        assert!(got.contains("export interface Database"), "'ts' alias did not emit TypeScript");
+        assert!(
+            got.contains("export interface Database"),
+            "'ts' alias did not emit TypeScript"
+        );
     }
 
     #[test]
@@ -1218,7 +1477,10 @@ mod tests {
         let _cfg = with_temp_config_dir();
         let srv = build_schema_server();
         let got = run_gen(&g_for(&srv), &["py", "--project=test-ref"]).unwrap();
-        assert!(got.contains("class Orders(BaseModel)"), "'py' alias did not emit Python");
+        assert!(
+            got.contains("class Orders(BaseModel)"),
+            "'py' alias did not emit Python"
+        );
     }
 
     // ── Type mapping table completeness ───────────────────────────────────────
@@ -1227,13 +1489,19 @@ mod tests {
     fn map_type_table_completeness() {
         let table = type_table();
         let langs = [LangTarget::TypeScript, LangTarget::Go, LangTarget::Python];
-        for (pg_name, _row) in &table {
+        for pg_name in table.keys() {
             for &lang in &langs {
-                let mt = map_type(pg_name, lang).expect(
-                    &format!("map_type({pg_name:?}, {lang:?}) returned None but key exists")
+                let mt = map_type(pg_name, lang).unwrap_or_else(|| {
+                    panic!("map_type({pg_name:?}, {lang:?}) returned None but key exists")
+                });
+                assert!(
+                    !mt.typ.is_empty(),
+                    "map_type({pg_name:?}, {lang:?}).typ is empty"
                 );
-                assert!(!mt.typ.is_empty(), "map_type({pg_name:?}, {lang:?}).typ is empty");
-                assert!(!mt.nullable.is_empty(), "map_type({pg_name:?}, {lang:?}).nullable is empty");
+                assert!(
+                    !mt.nullable.is_empty(),
+                    "map_type({pg_name:?}, {lang:?}).nullable is empty"
+                );
             }
         }
     }
@@ -1242,11 +1510,23 @@ mod tests {
 
     #[test]
     fn map_type_unknown() {
-        assert!(map_type("money", LangTarget::TypeScript).is_none(), "money should be unknown");
-        assert!(map_type("xml", LangTarget::Go).is_none(), "xml should be unknown");
-        assert!(map_type("point", LangTarget::Python).is_none(), "point should be unknown");
+        assert!(
+            map_type("money", LangTarget::TypeScript).is_none(),
+            "money should be unknown"
+        );
+        assert!(
+            map_type("xml", LangTarget::Go).is_none(),
+            "xml should be unknown"
+        );
+        assert!(
+            map_type("point", LangTarget::Python).is_none(),
+            "point should be unknown"
+        );
         assert!(map_type("not_a_real_pg_type", LangTarget::TypeScript).is_none());
-        assert!(map_type("", LangTarget::Go).is_none(), "empty string should be unknown");
+        assert!(
+            map_type("", LangTarget::Go).is_none(),
+            "empty string should be unknown"
+        );
     }
 
     // ── Specific type mappings ─────────────────────────────────────────────────

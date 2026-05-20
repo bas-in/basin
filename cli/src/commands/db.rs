@@ -168,12 +168,13 @@ fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
     if !flag_value.is_empty() {
         return Ok(flag_value.to_string());
     }
-    let cwd = std::env::current_dir()
-        .map_err(|e| msg(format!("could not determine cwd: {e}")))?;
+    let cwd = std::env::current_dir().map_err(|e| msg(format!("could not determine cwd: {e}")))?;
     let wp = load_working_project(&cwd)?;
     match wp {
         Some(w) if !w.project_ref.is_empty() => Ok(w.project_ref),
-        _ => Err(msg("--project is required (or run `basin link` to bind this directory)")),
+        _ => Err(msg(
+            "--project is required (or run `basin link` to bind this directory)",
+        )),
     }
 }
 
@@ -233,10 +234,21 @@ fn mask_password(pw: &str) -> String {
 
 /// build_dsn_from_fields assembles a postgres:// DSN from individual fields.
 /// Uses percent-encoding for the password so special characters survive.
-fn build_dsn_from_fields(host: &str, port: i64, user: &str, dbname: &str, password: &str, sslmode: &str) -> String {
+fn build_dsn_from_fields(
+    host: &str,
+    port: i64,
+    user: &str,
+    dbname: &str,
+    password: &str,
+    sslmode: &str,
+) -> String {
     let h = if host.is_empty() { "localhost" } else { host };
     let p = if port == 0 { 5432 } else { port };
-    let s = if sslmode.is_empty() { "require" } else { sslmode };
+    let s = if sslmode.is_empty() {
+        "require"
+    } else {
+        sslmode
+    };
     let pw_enc = percent_encode(password);
     let user_enc = percent_encode(user);
     if pw_enc.is_empty() {
@@ -252,9 +264,23 @@ fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-            | b'-' | b'_' | b'.' | b'~' | b'!' | b'$' | b'&'
-            | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' => {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'~'
+            | b'!'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b','
+            | b';' => {
                 out.push(b as char);
             }
             _ => {
@@ -294,7 +320,13 @@ fn quote_ident(s: &str) -> String {
 fn sql_literal(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::Null => "NULL".to_string(),
-        serde_json::Value::Bool(b) => if *b { "TRUE".to_string() } else { "FALSE".to_string() },
+        serde_json::Value::Bool(b) => {
+            if *b {
+                "TRUE".to_string()
+            } else {
+                "FALSE".to_string()
+            }
+        }
         serde_json::Value::Number(n) => {
             // Prefer integer form when exact.
             if let Some(i) = n.as_i64() {
@@ -338,15 +370,18 @@ fn extract_line_number(message: &str) -> i64 {
 
 /// to_slug converts a name to a safe filename slug.
 fn to_slug(name: &str) -> String {
-    let mapped: String = name.chars().map(|c| {
-        if c.is_ascii_lowercase() || c.is_ascii_digit() {
-            c
-        } else if c.is_ascii_uppercase() {
-            c.to_ascii_lowercase()
-        } else {
-            '_'
-        }
-    }).collect();
+    let mapped: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() {
+                c
+            } else if c.is_ascii_uppercase() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
 
     let mut collapsed = String::with_capacity(mapped.len());
     let mut prev_under = false;
@@ -440,8 +475,7 @@ fn db_push(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     }
     let project = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project)?;
-    let cwd = std::env::current_dir()
-        .map_err(|e| msg(format!("db push: cwd: {e}")))?;
+    let cwd = std::env::current_dir().map_err(|e| msg(format!("db push: cwd: {e}")))?;
     run_db_push(g, &cwd, &r#ref)
 }
 
@@ -459,28 +493,38 @@ fn run_db_push(g: &GlobalFlags, cwd: &Path, r#ref: &str) -> CliResult<()> {
     )?;
 
     // Build set of already-applied filenames.
-    let applied: std::collections::HashSet<String> = list_resp
-        .migrations
-        .iter()
-        .map(migration_key)
-        .collect();
+    let applied: std::collections::HashSet<String> =
+        list_resp.migrations.iter().map(migration_key).collect();
 
     #[derive(Serialize)]
-    struct AppliedEntry { filename: String, id: String }
+    struct AppliedEntry {
+        filename: String,
+        id: String,
+    }
     #[derive(Serialize)]
-    struct SkippedEntry { filename: String, reason: String }
+    struct SkippedEntry {
+        filename: String,
+        reason: String,
+    }
 
     let mut applied_list: Vec<AppliedEntry> = Vec::new();
     let mut skipped_list: Vec<SkippedEntry> = Vec::new();
 
     for path in &local_files {
-        let base = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        let base = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
         if applied.contains(&base) {
-            skipped_list.push(SkippedEntry { filename: base, reason: "already applied".into() });
+            skipped_list.push(SkippedEntry {
+                filename: base,
+                reason: "already applied".into(),
+            });
             continue;
         }
-        let sql = std::fs::read_to_string(path)
-            .map_err(|e| msg(format!("db push: read {base}: {e}")))?;
+        let sql =
+            std::fs::read_to_string(path).map_err(|e| msg(format!("db push: read {base}: {e}")))?;
         let body = json!({ "source": base, "sql": sql });
         let create_resp: CreateMigrationResp = c.do_json_timeout(
             Method::POST,
@@ -488,7 +532,10 @@ fn run_db_push(g: &GlobalFlags, cwd: &Path, r#ref: &str) -> CliResult<()> {
             Some(body),
             Duration::from_secs(120),
         )?;
-        applied_list.push(AppliedEntry { filename: base.clone(), id: create_resp.id.clone() });
+        applied_list.push(AppliedEntry {
+            filename: base.clone(),
+            id: create_resp.id.clone(),
+        });
         crate::printinfo!(g, "applied {}", base);
     }
 
@@ -499,7 +546,11 @@ fn run_db_push(g: &GlobalFlags, cwd: &Path, r#ref: &str) -> CliResult<()> {
             &json!({ "applied": applied_list, "skipped": skipped_list }),
         );
     }
-    println!("applied: {}  skipped: {}", applied_list.len(), skipped_list.len());
+    println!(
+        "applied: {}  skipped: {}",
+        applied_list.len(),
+        skipped_list.len()
+    );
     Ok(())
 }
 
@@ -525,8 +576,7 @@ fn db_pull(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let project = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project)?;
     let force = m.get_flag("force");
-    let cwd = std::env::current_dir()
-        .map_err(|e| msg(format!("db pull: cwd: {e}")))?;
+    let cwd = std::env::current_dir().map_err(|e| msg(format!("db pull: cwd: {e}")))?;
     run_db_pull(g, &cwd, &r#ref, force)
 }
 
@@ -546,9 +596,14 @@ fn run_db_pull(g: &GlobalFlags, cwd: &Path, r#ref: &str, force: bool) -> CliResu
         .map_err(|e| msg(format!("db pull: create migrations dir: {e}")))?;
 
     #[derive(Serialize)]
-    struct PulledEntry { filename: String }
+    struct PulledEntry {
+        filename: String,
+    }
     #[derive(Serialize)]
-    struct SkippedEntry { filename: String, reason: String }
+    struct SkippedEntry {
+        filename: String,
+        reason: String,
+    }
 
     let mut pulled_list: Vec<PulledEntry> = Vec::new();
     let mut skipped_list: Vec<SkippedEntry> = Vec::new();
@@ -599,7 +654,9 @@ fn run_db_pull(g: &GlobalFlags, cwd: &Path, r#ref: &str, force: bool) -> CliResu
 
         std::fs::write(&dest_path, &remote)
             .map_err(|e| msg(format!("db pull: write {filename}: {e}")))?;
-        pulled_list.push(PulledEntry { filename: filename.clone() });
+        pulled_list.push(PulledEntry {
+            filename: filename.clone(),
+        });
         crate::printinfo!(g, "pulled {}", filename);
     }
 
@@ -610,7 +667,11 @@ fn run_db_pull(g: &GlobalFlags, cwd: &Path, r#ref: &str, force: bool) -> CliResu
             &json!({ "pulled": pulled_list, "skipped": skipped_list }),
         );
     }
-    println!("pulled: {}  skipped: {}", pulled_list.len(), skipped_list.len());
+    println!(
+        "pulled: {}  skipped: {}",
+        pulled_list.len(),
+        skipped_list.len()
+    );
     Ok(())
 }
 
@@ -631,8 +692,7 @@ fn db_diff(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     }
     let project = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project)?;
-    let cwd = std::env::current_dir()
-        .map_err(|e| msg(format!("db diff: cwd: {e}")))?;
+    let cwd = std::env::current_dir().map_err(|e| msg(format!("db diff: cwd: {e}")))?;
     run_db_diff(g, &cwd, &r#ref)
 }
 
@@ -729,7 +789,9 @@ fn db_reset(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
 
     if !yes {
         if g.json {
-            return Err(msg("confirmation required: pass --yes to reset non-interactively under --json"));
+            return Err(msg(
+                "confirmation required: pass --yes to reset non-interactively under --json",
+            ));
         }
         eprint!(
             "Reset project {:?}? This will snapshot, rollback all migrations, re-apply local ones, and run seed.sql. [y/N] ",
@@ -742,8 +804,7 @@ fn db_reset(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         }
     }
 
-    let cwd = std::env::current_dir()
-        .map_err(|e| msg(format!("db reset: cwd: {e}")))?;
+    let cwd = std::env::current_dir().map_err(|e| msg(format!("db reset: cwd: {e}")))?;
     run_db_reset(g, &cwd, &r#ref)
 }
 
@@ -790,7 +851,11 @@ fn run_db_reset(g: &GlobalFlags, cwd: &Path, r#ref: &str) -> CliResult<()> {
     let local_files = collect_local_migrations(cwd);
     let mut applied_count = 0;
     for path in &local_files {
-        let base = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        let base = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
         let sql = std::fs::read_to_string(path)
             .map_err(|e| msg(format!("db reset: read {base}: {e}")))?;
         let body = json!({ "source": base, "sql": sql });
@@ -937,8 +1002,16 @@ fn db_url(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
 fn db_dump(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let cmd = Command::new("db dump")
         .arg(Arg::new("project").long("project"))
-        .arg(Arg::new("schema-only").long("schema-only").action(ArgAction::SetTrue))
-        .arg(Arg::new("data-only").long("data-only").action(ArgAction::SetTrue))
+        .arg(
+            Arg::new("schema-only")
+                .long("schema-only")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("data-only")
+                .long("data-only")
+                .action(ArgAction::SetTrue),
+        )
         .arg(Arg::new("help").long("help").action(ArgAction::SetTrue));
     let m = parse_or_silent(cmd, args)?;
     if m.get_flag("help") {
@@ -956,7 +1029,9 @@ fn db_dump(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let schema_only = m.get_flag("schema-only");
     let data_only = m.get_flag("data-only");
     if schema_only && data_only {
-        return Err(msg("db dump: --schema-only and --data-only are mutually exclusive"));
+        return Err(msg(
+            "db dump: --schema-only and --data-only are mutually exclusive",
+        ));
     }
     let project = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project)?;
@@ -985,7 +1060,8 @@ fn db_dump(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         data_type: String,
         is_nullable: String,
     }
-    let mut table_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut table_index: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut table_cols: Vec<(String, Vec<ColInfo>)> = Vec::new();
 
     for row in &schema_result.rows {
@@ -1017,7 +1093,11 @@ fn db_dump(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
                 i
             }
         };
-        table_cols[idx].1.push(ColInfo { col_name, data_type, is_nullable });
+        table_cols[idx].1.push(ColInfo {
+            col_name,
+            data_type,
+            is_nullable,
+        });
     }
 
     if emit_schema {
@@ -1102,8 +1182,7 @@ fn db_lint(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     }
     let project = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project)?;
-    let cwd = std::env::current_dir()
-        .map_err(|e| msg(format!("db lint: cwd: {e}")))?;
+    let cwd = std::env::current_dir().map_err(|e| msg(format!("db lint: cwd: {e}")))?;
     run_db_lint(g, &cwd, &r#ref)
 }
 
@@ -1116,9 +1195,13 @@ fn run_db_lint(g: &GlobalFlags, cwd: &Path, r#ref: &str) -> CliResult<()> {
     let mut checked = 0i64;
 
     for path in &local_files {
-        let base = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-        let sql = std::fs::read_to_string(path)
-            .map_err(|e| msg(format!("db lint: read {base}: {e}")))?;
+        let base = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        let sql =
+            std::fs::read_to_string(path).map_err(|e| msg(format!("db lint: read {base}: {e}")))?;
         checked += 1;
         let body = json!({
             "sql": sql,
@@ -1137,7 +1220,11 @@ fn run_db_lint(g: &GlobalFlags, cwd: &Path, r#ref: &str) -> CliResult<()> {
             if !g.quiet {
                 eprintln!("{base}:{line}: {message}");
             }
-            lint_errors.push(DbLintError { file: base, line, message });
+            lint_errors.push(DbLintError {
+                file: base,
+                line,
+                message,
+            });
         }
     }
 
@@ -1161,7 +1248,10 @@ fn run_db_lint(g: &GlobalFlags, cwd: &Path, r#ref: &str) -> CliResult<()> {
 
     if !lint_errors.is_empty() {
         println!("{checked} file(s) checked, {} error(s)", lint_errors.len());
-        return Err(crate::error::msg(format!("lint failed: {} error(s)", lint_errors.len())));
+        return Err(crate::error::msg(format!(
+            "lint failed: {} error(s)",
+            lint_errors.len()
+        )));
     }
     println!("{checked} file(s) checked, no errors");
     Ok(())
@@ -1178,8 +1268,7 @@ mod tests {
     // ── helpers ───────────────────────────────────────────────────────────────
 
     fn make_cwd(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("basin-db-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("basin-db-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1253,6 +1342,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)] // 3.14 is the intended SQL literal, not π
     fn sql_literal_float() {
         assert_eq!(sql_literal(&json!(3.14)), "3.14");
     }
@@ -1294,7 +1384,8 @@ mod tests {
         write_migration(&cwd, "0001_first.sql", "--");
         let files = collect_local_migrations(&cwd);
         assert_eq!(files.len(), 2);
-        let names: Vec<_> = files.iter()
+        let names: Vec<_> = files
+            .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         assert_eq!(names[0], "0001_first.sql");
@@ -1314,7 +1405,10 @@ mod tests {
 
     #[test]
     fn migration_key_falls_back_to_id() {
-        let m = MigrationRow { id: "m-abc".into(), ..Default::default() };
+        let m = MigrationRow {
+            id: "m-abc".into(),
+            ..Default::default()
+        };
         assert_eq!(migration_key(&m), "m-abc");
     }
 
@@ -1323,7 +1417,10 @@ mod tests {
     #[test]
     fn no_subcommand_prints_help() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         // No subcommand → help → Ok.
         cmd_db(&g, &[]).unwrap();
     }
@@ -1331,7 +1428,10 @@ mod tests {
     #[test]
     fn unknown_subcommand_is_silent_error() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_db(&g, &["frobnicate".into()]).unwrap_err();
         assert!(crate::error::is_silent(err.as_ref()), "error: {err}");
     }
@@ -1339,7 +1439,10 @@ mod tests {
     #[test]
     fn help_returns_ok() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         cmd_db(&g, &["help".into()]).unwrap();
     }
 
@@ -1350,15 +1453,25 @@ mod tests {
         let _cfg = with_temp_config_dir();
         let cwd = make_cwd("push-happy");
         scaffold(&cwd);
-        write_migration(&cwd, "0001_create_users.sql", "CREATE TABLE users (id int);");
-        write_migration(&cwd, "0002_add_email.sql", "ALTER TABLE users ADD COLUMN email text;");
+        write_migration(
+            &cwd,
+            "0001_create_users.sql",
+            "CREATE TABLE users (id int);",
+        );
+        write_migration(
+            &cwd,
+            "0002_add_email.sql",
+            "ALTER TABLE users ADD COLUMN email text;",
+        );
 
         let posted: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let posted2 = Arc::clone(&posted);
 
         let srv = TestServer::start(move |req: &Req| {
             if req.method == "GET" && req.path.ends_with("/migrations") {
-                return Resp::ok(r#"{"migrations":[{"id":"m1","source":"0001_create_users.sql"}]}"#);
+                return Resp::ok(
+                    r#"{"migrations":[{"id":"m1","source":"0001_create_users.sql"}]}"#,
+                );
             }
             if req.method == "POST" && req.path.ends_with("/migrations") {
                 let body: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
@@ -1459,7 +1572,9 @@ mod tests {
                 return Resp::ok(r#"{"migrations":[{"id":"m1","source":"0001_init.sql"}]}"#);
             }
             if req.method == "GET" && req.path.ends_with("/m1") {
-                return Resp::ok(r#"{"id":"m1","source":"0001_init.sql","sql":"CREATE TABLE users (id int);"}"#);
+                return Resp::ok(
+                    r#"{"id":"m1","source":"0001_init.sql","sql":"CREATE TABLE users (id int);"}"#,
+                );
             }
             Resp::status(404, r#""#)
         });
@@ -1468,7 +1583,10 @@ mod tests {
         run_db_pull(&g, &cwd, "proj1", false).unwrap();
 
         let content = std::fs::read_to_string(cwd.join("basin/migrations/0001_init.sql")).unwrap();
-        assert!(content.contains("CREATE TABLE users"), "content: {content:?}");
+        assert!(
+            content.contains("CREATE TABLE users"),
+            "content: {content:?}"
+        );
 
         std::fs::remove_dir_all(&cwd).ok();
     }
@@ -1485,7 +1603,9 @@ mod tests {
                 return Resp::ok(r#"{"migrations":[{"id":"m1","source":"0001_init.sql"}]}"#);
             }
             if req.method == "GET" && req.path.ends_with("/m1") {
-                return Resp::ok(r#"{"id":"m1","source":"0001_init.sql","sql":"CREATE TABLE users (id int);"}"#);
+                return Resp::ok(
+                    r#"{"id":"m1","source":"0001_init.sql","sql":"CREATE TABLE users (id int);"}"#,
+                );
             }
             Resp::status(404, r#""#)
         });
@@ -1495,7 +1615,10 @@ mod tests {
 
         // File should not be overwritten.
         let content = std::fs::read_to_string(cwd.join("basin/migrations/0001_init.sql")).unwrap();
-        assert!(content.contains("different content"), "should preserve local: {content:?}");
+        assert!(
+            content.contains("different content"),
+            "should preserve local: {content:?}"
+        );
 
         std::fs::remove_dir_all(&cwd).ok();
     }
@@ -1512,7 +1635,9 @@ mod tests {
                 return Resp::ok(r#"{"migrations":[{"id":"m1","source":"0001_init.sql"}]}"#);
             }
             if req.method == "GET" && req.path.ends_with("/m1") {
-                return Resp::ok(r#"{"id":"m1","source":"0001_init.sql","sql":"CREATE TABLE users (id int);"}"#);
+                return Resp::ok(
+                    r#"{"id":"m1","source":"0001_init.sql","sql":"CREATE TABLE users (id int);"}"#,
+                );
             }
             Resp::status(404, r#""#)
         });
@@ -1521,7 +1646,10 @@ mod tests {
         run_db_pull(&g, &cwd, "proj1", true).unwrap();
 
         let content = std::fs::read_to_string(cwd.join("basin/migrations/0001_init.sql")).unwrap();
-        assert!(content.contains("CREATE TABLE users"), "should be overwritten: {content:?}");
+        assert!(
+            content.contains("CREATE TABLE users"),
+            "should be overwritten: {content:?}"
+        );
 
         std::fs::remove_dir_all(&cwd).ok();
     }
@@ -1539,7 +1667,9 @@ mod tests {
                 return Resp::ok(r#"{"migrations":[{"id":"m1","source":"0001_init.sql"}]}"#);
             }
             if req.method == "GET" && req.path.ends_with("/m1") {
-                return Resp::ok(r#"{"id":"m1","source":"0001_init.sql","sql":"CREATE TABLE users (id int);"}"#);
+                return Resp::ok(
+                    r#"{"id":"m1","source":"0001_init.sql","sql":"CREATE TABLE users (id int);"}"#,
+                );
             }
             Resp::status(404, r#""#)
         });
@@ -1567,10 +1697,14 @@ mod tests {
         let g = flags(&srv.url);
         run_db_diff(&g, &cwd, "proj1").unwrap();
 
-        let entries: Vec<_> = std::fs::read_dir(cwd.join("basin/migrations")).unwrap()
+        let entries: Vec<_> = std::fs::read_dir(cwd.join("basin/migrations"))
+            .unwrap()
             .filter_map(|e| e.ok())
             .collect();
-        assert!(entries.is_empty(), "no file should be written when no drift");
+        assert!(
+            entries.is_empty(),
+            "no file should be written when no drift"
+        );
 
         std::fs::remove_dir_all(&cwd).ok();
     }
@@ -1601,7 +1735,8 @@ mod tests {
         let g = flags(&srv.url);
         run_db_diff(&g, &cwd, "proj1").unwrap();
 
-        let entries: Vec<_> = std::fs::read_dir(cwd.join("basin/migrations")).unwrap()
+        let entries: Vec<_> = std::fs::read_dir(cwd.join("basin/migrations"))
+            .unwrap()
             .filter_map(|e| e.ok())
             .collect();
         assert_eq!(entries.len(), 1, "expected 1 file written");
@@ -1718,7 +1853,9 @@ mod tests {
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "GET");
             assert!(req.path.ends_with("/pgwire"), "path: {}", req.path);
-            Resp::ok(r#"{"host":"db.basin.run","port":5432,"user":"tenant","dbname":"basin","password":"supersecret1234","sslmode":"require"}"#)
+            Resp::ok(
+                r#"{"host":"db.basin.run","port":5432,"user":"tenant","dbname":"basin","password":"supersecret1234","sslmode":"require"}"#,
+            )
         });
         let g = flags(&srv.url);
         cmd_db(&g, &["url".into(), "--project=proj1".into()]).unwrap();
@@ -1734,13 +1871,19 @@ mod tests {
             if req.path.ends_with("/pgwire/reveal") {
                 assert_eq!(req.method, "POST");
                 *called2.lock().unwrap() = true;
-                return Resp::ok(r#"{"host":"db.basin.run","port":5432,"user":"tenant","dbname":"basin","password":"plaintext","sslmode":"require"}"#);
+                return Resp::ok(
+                    r#"{"host":"db.basin.run","port":5432,"user":"tenant","dbname":"basin","password":"plaintext","sslmode":"require"}"#,
+                );
             }
             Resp::status(404, r#""#)
         });
 
         let g = flags(&srv.url);
-        cmd_db(&g, &["url".into(), "--project=proj1".into(), "--reveal".into()]).unwrap();
+        cmd_db(
+            &g,
+            &["url".into(), "--project=proj1".into(), "--reveal".into()],
+        )
+        .unwrap();
         assert!(*called.lock().unwrap(), "reveal endpoint not called");
     }
 
@@ -1754,13 +1897,24 @@ mod tests {
             if req.path.ends_with("/pgwire/rotate") {
                 assert_eq!(req.method, "POST");
                 *called2.lock().unwrap() = true;
-                return Resp::ok(r#"{"host":"db.basin.run","port":5432,"user":"tenant","dbname":"basin","password":"new_pw","sslmode":"require"}"#);
+                return Resp::ok(
+                    r#"{"host":"db.basin.run","port":5432,"user":"tenant","dbname":"basin","password":"new_pw","sslmode":"require"}"#,
+                );
             }
             Resp::status(404, r#""#)
         });
 
         let g = flags(&srv.url);
-        cmd_db(&g, &["url".into(), "--project=proj1".into(), "--rotate".into(), "--yes".into()]).unwrap();
+        cmd_db(
+            &g,
+            &[
+                "url".into(),
+                "--project=proj1".into(),
+                "--rotate".into(),
+                "--yes".into(),
+            ],
+        )
+        .unwrap();
         assert!(*called.lock().unwrap(), "rotate endpoint not called");
     }
 
@@ -1768,25 +1922,45 @@ mod tests {
     fn url_rotate_json_shape() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"host":"db.basin.run","port":5432,"user":"tenant","dbname":"basin","password":"new_pw","sslmode":"require"}"#)
+            Resp::ok(
+                r#"{"host":"db.basin.run","port":5432,"user":"tenant","dbname":"basin","password":"new_pw","sslmode":"require"}"#,
+            )
         });
         let g = flags_json(&srv.url);
-        cmd_db(&g, &["url".into(), "--project=proj1".into(), "--rotate".into(), "--yes".into()]).unwrap();
+        cmd_db(
+            &g,
+            &[
+                "url".into(),
+                "--project=proj1".into(),
+                "--rotate".into(),
+                "--yes".into(),
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
     fn url_rotate_json_requires_yes() {
         let _cfg = with_temp_config_dir();
         let g = flags_json("http://127.0.0.1:1");
-        let err = cmd_db(&g, &["url".into(), "--project=proj1".into(), "--rotate".into()]).unwrap_err();
-        assert!(err.to_string().contains("confirmation required"), "error: {err}");
+        let err = cmd_db(
+            &g,
+            &["url".into(), "--project=proj1".into(), "--rotate".into()],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("confirmation required"),
+            "error: {err}"
+        );
     }
 
     #[test]
     fn url_password_masked_in_default_output() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"host":"db.basin.run","port":5432,"user":"tenant","dbname":"basin","password":"mysecretpassword","sslmode":"require"}"#)
+            Resp::ok(
+                r#"{"host":"db.basin.run","port":5432,"user":"tenant","dbname":"basin","password":"mysecretpassword","sslmode":"require"}"#,
+            )
         });
         // The key thing: masked password should not appear in the DSN.
         let _g = flags(&srv.url);
@@ -1805,11 +1979,21 @@ mod tests {
 
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "POST");
-            Resp::ok(r#"{"columns":["table_name","column_name","data_type","is_nullable","ordinal_position"],"rows":[["users","id","integer","NO",1.0],["users","email","text","YES",2.0]],"elapsed_ms":5}"#)
+            Resp::ok(
+                r#"{"columns":["table_name","column_name","data_type","is_nullable","ordinal_position"],"rows":[["users","id","integer","NO",1.0],["users","email","text","YES",2.0]],"elapsed_ms":5}"#,
+            )
         });
 
         let g = flags(&srv.url);
-        cmd_db(&g, &["dump".into(), "--project=proj1".into(), "--schema-only".into()]).unwrap();
+        cmd_db(
+            &g,
+            &[
+                "dump".into(),
+                "--project=proj1".into(),
+                "--schema-only".into(),
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1826,14 +2010,24 @@ mod tests {
             *count += 1;
             if *count == 1 {
                 // Schema query.
-                return Resp::ok(r#"{"columns":["table_name","column_name","data_type","is_nullable","ordinal_position"],"rows":[["users","id","integer","NO",1.0]],"elapsed_ms":1}"#);
+                return Resp::ok(
+                    r#"{"columns":["table_name","column_name","data_type","is_nullable","ordinal_position"],"rows":[["users","id","integer","NO",1.0]],"elapsed_ms":1}"#,
+                );
             }
             // SELECT * FROM "users"
             Resp::ok(r#"{"columns":["id"],"rows":[[42.0]],"elapsed_ms":1}"#)
         });
 
         let g = flags(&srv.url);
-        cmd_db(&g, &["dump".into(), "--project=proj1".into(), "--data-only".into()]).unwrap();
+        cmd_db(
+            &g,
+            &[
+                "dump".into(),
+                "--project=proj1".into(),
+                "--data-only".into(),
+            ],
+        )
+        .unwrap();
 
         std::fs::remove_dir_all(&cwd).ok();
     }
@@ -1841,13 +2035,24 @@ mod tests {
     #[test]
     fn dump_mutually_exclusive_flags() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { token: "t".into(), ..Default::default() };
+        let g = GlobalFlags {
+            token: "t".into(),
+            ..Default::default()
+        };
         let err = cmd_db(
             &g,
-            &["dump".into(), "--project=proj1".into(), "--schema-only".into(), "--data-only".into()],
+            &[
+                "dump".into(),
+                "--project=proj1".into(),
+                "--schema-only".into(),
+                "--data-only".into(),
+            ],
         )
         .unwrap_err();
-        assert!(err.to_string().contains("mutually exclusive"), "error: {err}");
+        assert!(
+            err.to_string().contains("mutually exclusive"),
+            "error: {err}"
+        );
     }
 
     // ── db lint ───────────────────────────────────────────────────────────────
@@ -1859,9 +2064,8 @@ mod tests {
         scaffold(&cwd);
         write_migration(&cwd, "0001_init.sql", "CREATE TABLE users (id int);");
 
-        let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"columns":[],"rows":[],"elapsed_ms":1}"#)
-        });
+        let srv =
+            TestServer::start(|_req: &Req| Resp::ok(r#"{"columns":[],"rows":[],"elapsed_ms":1}"#));
 
         let g = flags(&srv.url);
         run_db_lint(&g, &cwd, "proj1").unwrap();
@@ -1898,9 +2102,8 @@ mod tests {
         write_migration(&cwd, "0001_ok.sql", "CREATE TABLE t (id int);");
         write_migration(&cwd, "0002_ok.sql", "ALTER TABLE t ADD COLUMN v text;");
 
-        let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"columns":[],"rows":[],"elapsed_ms":1}"#)
-        });
+        let srv =
+            TestServer::start(|_req: &Req| Resp::ok(r#"{"columns":[],"rows":[],"elapsed_ms":1}"#));
 
         let g = flags_json(&srv.url);
         run_db_lint(&g, &cwd, "proj1").unwrap();

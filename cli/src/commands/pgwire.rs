@@ -172,9 +172,17 @@ pub fn build_dsn(r: &PgwireRevealResponse) -> String {
     if !r.dsn.is_empty() {
         return r.dsn.clone();
     }
-    let host = if r.host.is_empty() { "localhost" } else { &r.host };
+    let host = if r.host.is_empty() {
+        "localhost"
+    } else {
+        &r.host
+    };
     let port = if r.port == 0 { 5432 } else { r.port };
-    let sslmode = if r.sslmode.is_empty() { "require" } else { &r.sslmode };
+    let sslmode = if r.sslmode.is_empty() {
+        "require"
+    } else {
+        &r.sslmode
+    };
     let user_enc = percent_encode_userinfo(&r.user);
     let pass_enc = percent_encode_userinfo(&r.password);
     format!(
@@ -189,9 +197,17 @@ pub fn build_rotate_dsn(r: &PgwireRotateResponse) -> String {
     if !r.dsn.is_empty() {
         return r.dsn.clone();
     }
-    let host = if r.host.is_empty() { "localhost" } else { &r.host };
+    let host = if r.host.is_empty() {
+        "localhost"
+    } else {
+        &r.host
+    };
     let port = if r.port == 0 { 5432 } else { r.port };
-    let sslmode = if r.sslmode.is_empty() { "require" } else { &r.sslmode };
+    let sslmode = if r.sslmode.is_empty() {
+        "require"
+    } else {
+        &r.sslmode
+    };
     let user_enc = percent_encode_userinfo(&r.user);
     let pass_enc = percent_encode_userinfo(&r.password);
     format!(
@@ -240,12 +256,13 @@ fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
     if !flag_value.is_empty() {
         return Ok(flag_value.to_string());
     }
-    let cwd = std::env::current_dir()
-        .map_err(|e| msg(format!("could not determine cwd: {e}")))?;
+    let cwd = std::env::current_dir().map_err(|e| msg(format!("could not determine cwd: {e}")))?;
     let wp = load_working_project(&cwd)?;
     match wp {
         Some(w) if !w.project_ref.is_empty() => Ok(w.project_ref),
-        _ => Err(msg("--project is required (or run `basin link` to bind this directory)")),
+        _ => Err(msg(
+            "--project is required (or run `basin link` to bind this directory)",
+        )),
     }
 }
 
@@ -308,7 +325,11 @@ fn show(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         return print_json(&mut std::io::stdout(), &creds);
     }
     let port = if creds.port == 0 { 5432 } else { creds.port };
-    let sslmode = if creds.sslmode.is_empty() { "require".to_string() } else { creds.sslmode.clone() };
+    let sslmode = if creds.sslmode.is_empty() {
+        "require".to_string()
+    } else {
+        creds.sslmode.clone()
+    };
     println!("host:     {}", creds.host);
     println!("port:     {}", port);
     println!("user:     {}", creds.user);
@@ -338,8 +359,11 @@ fn reveal(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let project = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project)?;
     let c = require_client(g)?;
-    let resp: PgwireRevealResponse =
-        c.do_json(Method::POST, &format!("/v1/projects/{ref}/pgwire/reveal"), None)?;
+    let resp: PgwireRevealResponse = c.do_json(
+        Method::POST,
+        &format!("/v1/projects/{ref}/pgwire/reveal"),
+        None,
+    )?;
     let dsn = build_dsn(&resp);
     if g.json {
         // JSON shape: { dsn: string } — full DSN, shown once.
@@ -389,8 +413,11 @@ fn rotate(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     }
 
     let c = require_client(g)?;
-    let resp: PgwireRotateResponse =
-        c.do_json(Method::POST, &format!("/v1/projects/{ref}/pgwire/rotate"), None)?;
+    let resp: PgwireRotateResponse = c.do_json(
+        Method::POST,
+        &format!("/v1/projects/{ref}/pgwire/rotate"),
+        None,
+    )?;
     let dsn = build_rotate_dsn(&resp);
     if g.json {
         // JSON shape: { dsn: string } — new DSN after rotation, shown once.
@@ -440,8 +467,11 @@ fn engine_keys_list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let project = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project)?;
     let c = require_client(g)?;
-    let resp: EngineKeysResponse =
-        c.do_json(Method::GET, &format!("/v1/projects/{ref}/engine-keys"), None)?;
+    let resp: EngineKeysResponse = c.do_json(
+        Method::GET,
+        &format!("/v1/projects/{ref}/engine-keys"),
+        None,
+    )?;
     if g.json {
         // JSON shape: EngineKeysResponse { keys: [ EngineKey ] }
         // masked_key or prefix shown; full key never present in list.
@@ -645,7 +675,10 @@ mod tests {
         let dsn = build_dsn(&r);
         assert!(dsn.contains("localhost"), "expected localhost: {dsn}");
         assert!(dsn.contains(":5432"), "expected port 5432: {dsn}");
-        assert!(dsn.contains("sslmode=require"), "expected sslmode=require: {dsn}");
+        assert!(
+            dsn.contains("sslmode=require"),
+            "expected sslmode=require: {dsn}"
+        );
     }
 
     // ── dispatcher ────────────────────────────────────────────────────
@@ -678,7 +711,10 @@ mod tests {
     #[test]
     fn help_returns_ok() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_pgwire(&g, &["help".into()]).is_ok());
     }
 
@@ -701,8 +737,9 @@ mod tests {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| Resp::ok(sample_creds()));
         let c = crate::client::Client::new(&srv.url, "tok");
-        let creds: PgwireCredentials =
-            c.do_json(Method::GET, "/v1/projects/proj1/pgwire", None).unwrap();
+        let creds: PgwireCredentials = c
+            .do_json(Method::GET, "/v1/projects/proj1/pgwire", None)
+            .unwrap();
         assert_eq!(creds.host, "db.basin.run");
         assert_eq!(creds.user, "proj_user");
     }
@@ -753,8 +790,9 @@ mod tests {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| Resp::ok(sample_reveal()));
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: PgwireRevealResponse =
-            c.do_json(Method::POST, "/v1/projects/proj1/pgwire/reveal", None).unwrap();
+        let resp: PgwireRevealResponse = c
+            .do_json(Method::POST, "/v1/projects/proj1/pgwire/reveal", None)
+            .unwrap();
         let dsn = build_dsn(&resp);
         assert!(dsn.starts_with("postgres://"), "got: {dsn}");
         // JSON output shape: { dsn: string }
@@ -779,11 +817,14 @@ mod tests {
     fn reveal_special_chars_in_password_encoded() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"host":"db.basin.run","port":5432,"user":"proj_user","dbname":"proj_db","password":"p@ss%word:/test","sslmode":"require"}"#)
+            Resp::ok(
+                r#"{"host":"db.basin.run","port":5432,"user":"proj_user","dbname":"proj_db","password":"p@ss%word:/test","sslmode":"require"}"#,
+            )
         });
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: PgwireRevealResponse =
-            c.do_json(Method::POST, "/v1/projects/proj1/pgwire/reveal", None).unwrap();
+        let resp: PgwireRevealResponse = c
+            .do_json(Method::POST, "/v1/projects/proj1/pgwire/reveal", None)
+            .unwrap();
         let dsn = build_dsn(&resp);
         assert!(!dsn.contains("p@ss"), "unencoded @ found in DSN: {dsn}");
         assert!(dsn.contains("p%40ss"), "missing %40 in DSN: {dsn}");
@@ -817,8 +858,7 @@ mod tests {
             json: true,
             ..Default::default()
         };
-        let err =
-            cmd_pgwire(&g, &["rotate".into(), "--project=proj1".into()]).unwrap_err();
+        let err = cmd_pgwire(&g, &["rotate".into(), "--project=proj1".into()]).unwrap_err();
         assert!(
             err.to_string().contains("confirmation required"),
             "got: {err}"
@@ -830,8 +870,9 @@ mod tests {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| Resp::ok(sample_reveal()));
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: PgwireRotateResponse =
-            c.do_json(Method::POST, "/v1/projects/proj1/pgwire/rotate", None).unwrap();
+        let resp: PgwireRotateResponse = c
+            .do_json(Method::POST, "/v1/projects/proj1/pgwire/rotate", None)
+            .unwrap();
         let dsn = build_rotate_dsn(&resp);
         assert!(dsn.starts_with("postgres://"), "got: {dsn}");
         // JSON output: { dsn: string }
@@ -854,7 +895,11 @@ mod tests {
         let g = flags(&srv.url);
         cmd_pgwire(
             &g,
-            &["engine-keys".into(), "list".into(), "--project=proj1".into()],
+            &[
+                "engine-keys".into(),
+                "list".into(),
+                "--project=proj1".into(),
+            ],
         )
         .unwrap();
     }
@@ -869,7 +914,11 @@ mod tests {
         let g = flags(&srv.url);
         cmd_pgwire(
             &g,
-            &["engine-keys".into(), "list".into(), "--project=proj1".into()],
+            &[
+                "engine-keys".into(),
+                "list".into(),
+                "--project=proj1".into(),
+            ],
         )
         .unwrap();
     }
@@ -881,8 +930,9 @@ mod tests {
         let body = format!(r#"{{"keys":[{k}]}}"#);
         let srv = TestServer::start(move |_req: &Req| Resp::ok(body.clone()));
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: EngineKeysResponse =
-            c.do_json(Method::GET, "/v1/projects/proj1/engine-keys", None).unwrap();
+        let resp: EngineKeysResponse = c
+            .do_json(Method::GET, "/v1/projects/proj1/engine-keys", None)
+            .unwrap();
         assert_eq!(resp.keys.len(), 1);
         assert_eq!(resp.keys[0].id, "ek1");
     }
@@ -904,7 +954,12 @@ mod tests {
         let g = flags(&srv.url);
         cmd_pgwire(
             &g,
-            &["engine-keys".into(), "rotate".into(), "--project=proj1".into(), "--yes".into()],
+            &[
+                "engine-keys".into(),
+                "rotate".into(),
+                "--project=proj1".into(),
+                "--yes".into(),
+            ],
         )
         .unwrap();
     }
@@ -921,7 +976,11 @@ mod tests {
         };
         let err = cmd_pgwire(
             &g,
-            &["engine-keys".into(), "rotate".into(), "--project=proj1".into()],
+            &[
+                "engine-keys".into(),
+                "rotate".into(),
+                "--project=proj1".into(),
+            ],
         )
         .unwrap_err();
         assert!(
@@ -934,13 +993,13 @@ mod tests {
     fn engine_keys_rotate_json_shape() {
         let _g = with_temp_config_dir();
         let k = sample_engine_key("ek1", "anon", "anon");
-        let body_resp = format!(
-            r#"{{"keys":[{k}],"anon_key":"eyJanonNew","service_key":"eyJserviceNew"}}"#
-        );
+        let body_resp =
+            format!(r#"{{"keys":[{k}],"anon_key":"eyJanonNew","service_key":"eyJserviceNew"}}"#);
         let srv = TestServer::start(move |_req: &Req| Resp::ok(body_resp.clone()));
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: EngineKeysRotateResponse =
-            c.do_json(Method::POST, "/v1/projects/proj1/engine-keys/rotate", None).unwrap();
+        let resp: EngineKeysRotateResponse = c
+            .do_json(Method::POST, "/v1/projects/proj1/engine-keys/rotate", None)
+            .unwrap();
         assert_eq!(resp.anon_key, "eyJanonNew");
         assert_eq!(resp.service_key, "eyJserviceNew");
     }
@@ -954,8 +1013,7 @@ mod tests {
             quiet: true,
             ..Default::default()
         };
-        let err =
-            cmd_pgwire(&g, &["engine-keys".into(), "nope".into()]).unwrap_err();
+        let err = cmd_pgwire(&g, &["engine-keys".into(), "nope".into()]).unwrap_err();
         // unknown sub → silent error
         assert!(crate::error::is_silent(err.as_ref()) || !err.to_string().is_empty());
     }

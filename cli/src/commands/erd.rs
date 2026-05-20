@@ -86,12 +86,13 @@ fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
     if !flag_value.is_empty() {
         return Ok(flag_value.to_string());
     }
-    let cwd = std::env::current_dir()
-        .map_err(|e| msg(format!("could not determine cwd: {e}")))?;
+    let cwd = std::env::current_dir().map_err(|e| msg(format!("could not determine cwd: {e}")))?;
     let wp = load_working_project(&cwd)?;
     match wp {
         Some(w) if !w.project_ref.is_empty() => Ok(w.project_ref),
-        _ => Err(msg("--project is required (or run `basin link` to bind this directory)")),
+        _ => Err(msg(
+            "--project is required (or run `basin link` to bind this directory)",
+        )),
     }
 }
 
@@ -154,7 +155,10 @@ fn export(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let project_flag = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project_flag)?;
 
-    let format = m.get_one::<String>("format").cloned().unwrap_or_else(|| "svg".into());
+    let format = m
+        .get_one::<String>("format")
+        .cloned()
+        .unwrap_or_else(|| "svg".into());
     match format.as_str() {
         "svg" | "dot" | "json" => {}
         _ => {
@@ -182,15 +186,23 @@ fn export(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
 
     let mut req = http
         .request(reqwest::Method::GET, &url)
-        .header("User-Agent", format!("basin-cli/{}", crate::client::version()))
-        .header("Accept", "application/json, image/svg+xml, text/vnd.graphviz, text/plain, */*");
+        .header(
+            "User-Agent",
+            format!("basin-cli/{}", crate::client::version()),
+        )
+        .header(
+            "Accept",
+            "application/json, image/svg+xml, text/vnd.graphviz, text/plain, */*",
+        );
     if !c.token.is_empty() {
         req = req.bearer_auth(&c.token);
     }
 
     let resp = req.send().map_err(|e| msg(format!("erd export: {e}")))?;
     let status = resp.status();
-    let body = resp.bytes().map_err(|e| msg(format!("erd export: read response: {e}")))?;
+    let body = resp
+        .bytes()
+        .map_err(|e| msg(format!("erd export: read response: {e}")))?;
 
     if !status.is_success() {
         // Parse error the same way client.rs does.
@@ -227,11 +239,13 @@ fn export(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     if !output_path.is_empty() {
         let mut f = std::fs::File::create(&output_path)
             .map_err(|e| msg(format!("erd export: create output file: {e}")))?;
-        f.write_all(&body).map_err(|e| msg(format!("erd export: write output: {e}")))?;
+        f.write_all(&body)
+            .map_err(|e| msg(format!("erd export: write output: {e}")))?;
     } else {
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
-        out.write_all(&body).map_err(|e| msg(format!("erd export: write output: {e}")))?;
+        out.write_all(&body)
+            .map_err(|e| msg(format!("erd export: write output: {e}")))?;
         // Add trailing newline for svg/dot if output is stdout and body doesn't end with one.
         if format != "json" && !body.is_empty() && body.last() != Some(&b'\n') {
             writeln!(out).map_err(|e| msg(format!("erd export: write newline: {e}")))?;
@@ -280,7 +294,9 @@ mod tests {
                 "svg" // default
             };
             match format {
-                "json" => Resp::ok(r#"{"tables":[{"name":"users","schema":"public"}],"relationships":[]}"#),
+                "json" => Resp::ok(
+                    r#"{"tables":[{"name":"users","schema":"public"}],"relationships":[]}"#,
+                ),
                 "svg" => Resp::ok("<svg xmlns='http://www.w3.org/2000/svg'><g/></svg>"),
                 "dot" => Resp::ok("digraph G { users; }"),
                 _ => Resp::status(400, r#"{"code":"bad_format"}"#),
@@ -293,7 +309,10 @@ mod tests {
     #[test]
     fn no_subcommand_is_silent_error() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_erd(&g, &[]).unwrap_err();
         assert!(crate::error::is_silent(err.as_ref()));
     }
@@ -301,7 +320,10 @@ mod tests {
     #[test]
     fn unknown_subcommand_is_silent_error() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_erd(&g, &["render".to_string()]).unwrap_err();
         assert!(crate::error::is_silent(err.as_ref()));
     }
@@ -309,7 +331,10 @@ mod tests {
     #[test]
     fn help_returns_ok() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_erd(&g, &["help".to_string()]).is_ok());
     }
 
@@ -323,8 +348,13 @@ mod tests {
         // This should succeed and write SVG to stdout.
         cmd_erd(
             &g,
-            &["export".to_string(), "--project=proj1".to_string(), "--format=svg".to_string()],
-        ).unwrap();
+            &[
+                "export".to_string(),
+                "--project=proj1".to_string(),
+                "--format=svg".to_string(),
+            ],
+        )
+        .unwrap();
     }
 
     // ── erd export -- format=dot ────────────────────────────────────────────
@@ -336,8 +366,13 @@ mod tests {
         let g = flags(&srv.url);
         cmd_erd(
             &g,
-            &["export".to_string(), "--project=proj1".to_string(), "--format=dot".to_string()],
-        ).unwrap();
+            &[
+                "export".to_string(),
+                "--project=proj1".to_string(),
+                "--format=dot".to_string(),
+            ],
+        )
+        .unwrap();
     }
 
     // ── erd export -- format=json --json shape lock ─────────────────────────
@@ -351,8 +386,13 @@ mod tests {
         // Just verify it doesn't error; the JSON is verified in the struct test below.
         cmd_erd(
             &g,
-            &["export".to_string(), "--project=proj1".to_string(), "--format=json".to_string()],
-        ).unwrap();
+            &[
+                "export".to_string(),
+                "--project=proj1".to_string(),
+                "--format=json".to_string(),
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -375,8 +415,13 @@ mod tests {
         let g = flags(&srv.url); // no --json flag
         cmd_erd(
             &g,
-            &["export".to_string(), "--project=proj1".to_string(), "--format=json".to_string()],
-        ).unwrap();
+            &[
+                "export".to_string(),
+                "--project=proj1".to_string(),
+                "--format=json".to_string(),
+            ],
+        )
+        .unwrap();
     }
 
     // ── erd export -- output to file ────────────────────────────────────────
@@ -398,9 +443,13 @@ mod tests {
                 "--format=svg".to_string(),
                 format!("--output={out_str}"),
             ],
-        ).unwrap();
+        )
+        .unwrap();
         let content = std::fs::read_to_string(&out_path).unwrap();
-        assert!(content.contains("<svg"), "expected SVG in file, got: {content:?}");
+        assert!(
+            content.contains("<svg"),
+            "expected SVG in file, got: {content:?}"
+        );
     }
 
     // ── erd export -- invalid format ────────────────────────────────────────
@@ -412,8 +461,13 @@ mod tests {
         let g = flags(&srv.url);
         let err = cmd_erd(
             &g,
-            &["export".to_string(), "--project=proj1".to_string(), "--format=pdf".to_string()],
-        ).unwrap_err();
+            &[
+                "export".to_string(),
+                "--project=proj1".to_string(),
+                "--format=pdf".to_string(),
+            ],
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("--format"), "err={err}");
     }
 
@@ -428,8 +482,10 @@ mod tests {
             ..Default::default()
         };
         let err = cmd_erd(&g, &["export".to_string()]).unwrap_err();
-        assert!(err.is::<crate::error::Silent>() || err.to_string().contains("project"),
-            "err={err}");
+        assert!(
+            err.is::<crate::error::Silent>() || err.to_string().contains("project"),
+            "err={err}"
+        );
     }
 
     // ── erd export -- 404 error mapping ─────────────────────────────────────
@@ -443,8 +499,13 @@ mod tests {
         let g = flags(&srv.url);
         let err = cmd_erd(
             &g,
-            &["export".to_string(), "--project=proj1".to_string(), "--format=svg".to_string()],
-        ).unwrap_err();
+            &[
+                "export".to_string(),
+                "--project=proj1".to_string(),
+                "--format=svg".to_string(),
+            ],
+        )
+        .unwrap_err();
         let ae = crate::error::as_api_error(err.as_ref()).expect("expected ApiError");
         assert_eq!(ae.http_status, 404);
     }

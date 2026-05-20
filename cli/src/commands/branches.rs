@@ -106,12 +106,13 @@ fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
     if !flag_value.is_empty() {
         return Ok(flag_value.to_string());
     }
-    let cwd = std::env::current_dir()
-        .map_err(|e| msg(format!("could not determine cwd: {e}")))?;
+    let cwd = std::env::current_dir().map_err(|e| msg(format!("could not determine cwd: {e}")))?;
     let wp = load_working_project(&cwd)?;
     match wp {
         Some(w) if !w.project_ref.is_empty() => Ok(w.project_ref),
-        _ => Err(msg("--project is required (or run `basin link` to bind this directory)")),
+        _ => Err(msg(
+            "--project is required (or run `basin link` to bind this directory)",
+        )),
     }
 }
 
@@ -159,9 +160,11 @@ fn branches_list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         .arg(Arg::new("help").long("help").action(ArgAction::SetTrue));
     let m = parse_or_silent(cmd, args)?;
     if m.get_flag("help") {
-        help_for_command("branches list", "List branches for a project.", &[
-            "--project=<ref>   Project ref (required if not linked).",
-        ]);
+        help_for_command(
+            "branches list",
+            "List branches for a project.",
+            &["--project=<ref>   Project ref (required if not linked)."],
+        );
         return Ok(());
     }
     let project = m.get_one::<String>("project").cloned().unwrap_or_default();
@@ -177,7 +180,10 @@ fn branches_list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
 
     if g.json {
         // JSON shape: { branches: [ Branch ] }
-        return print_json(&mut std::io::stdout(), &json!({ "branches": resp.branches }));
+        return print_json(
+            &mut std::io::stdout(),
+            &json!({ "branches": resp.branches }),
+        );
     }
     if resp.branches.is_empty() {
         println!("(no branches)");
@@ -185,8 +191,19 @@ fn branches_list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     }
     let mut t = Table::new(g, &["REF", "NAME", "KIND", "STATUS", "MERGED", "CREATED"]);
     for b in &resp.branches {
-        let merged = b.merged_at.as_deref().filter(|s| !s.is_empty()).unwrap_or("\u{2014}");
-        t.row(&[&b.r#ref, &b.branch_name, &b.branch_kind, &b.status, merged, &b.created_at]);
+        let merged = b
+            .merged_at
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("\u{2014}");
+        t.row(&[
+            &b.r#ref,
+            &b.branch_name,
+            &b.branch_kind,
+            &b.status,
+            merged,
+            &b.created_at,
+        ]);
     }
     t.flush()
 }
@@ -229,7 +246,10 @@ fn branches_create(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let project = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project)?;
     let from_ref = m.get_one::<String>("from").cloned().unwrap_or_default();
-    let kind = m.get_one::<String>("kind").cloned().unwrap_or_else(|| "branch".to_string());
+    let kind = m
+        .get_one::<String>("kind")
+        .cloned()
+        .unwrap_or_else(|| "branch".to_string());
 
     let c = require_client(g)?;
 
@@ -308,10 +328,14 @@ fn branches_get(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         .arg(Arg::new("help").long("help").action(ArgAction::SetTrue));
     let m = parse_or_silent(cmd, args)?;
     if m.get_flag("help") {
-        help_for_command("branches get", "Show one branch.", &[
-            "<branch_ref>      Branch ref (required).",
-            "--project=<ref>   Parent project ref (for display context).",
-        ]);
+        help_for_command(
+            "branches get",
+            "Show one branch.",
+            &[
+                "<branch_ref>      Branch ref (required).",
+                "--project=<ref>   Parent project ref (for display context).",
+            ],
+        );
         return Ok(());
     }
     let branch_ref = m
@@ -329,7 +353,10 @@ fn branches_get(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         project: Option<Branch>,
     }
     let resp: Resp = c.do_json(Method::GET, &format!("/v1/projects/{branch_ref}"), None)?;
-    let b = resp.project.as_ref().ok_or_else(|| msg(format!("branch not found: {branch_ref}")))?;
+    let b = resp
+        .project
+        .as_ref()
+        .ok_or_else(|| msg(format!("branch not found: {branch_ref}")))?;
 
     if g.json {
         // JSON shape: { project: Branch }
@@ -362,11 +389,15 @@ fn branches_merge(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         .arg(Arg::new("help").long("help").action(ArgAction::SetTrue));
     let m = parse_or_silent(cmd, args)?;
     if m.get_flag("help") {
-        help_for_command("branches merge", "Merge a branch into its parent.", &[
-            "<branch_ref>      Branch ref (required).",
-            "--project=<ref>   Parent project ref (required if not linked).",
-            "--yes             Skip the confirmation prompt.",
-        ]);
+        help_for_command(
+            "branches merge",
+            "Merge a branch into its parent.",
+            &[
+                "<branch_ref>      Branch ref (required).",
+                "--project=<ref>   Parent project ref (required if not linked).",
+                "--yes             Skip the confirmation prompt.",
+            ],
+        );
         return Ok(());
     }
     let branch_ref = m
@@ -432,17 +463,20 @@ fn branches_delete(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         .arg(Arg::new("help").long("help").action(ArgAction::SetTrue));
     let m = parse_or_silent(cmd, args)?;
     if m.get_flag("help") {
-        help_for_command("branches delete", "Delete (retire) a branch.", &[
-            "<branch_ref>      Branch ref (required).",
-            "--project=<ref>   Parent project ref (required if not linked).",
-            "--yes             Skip the confirmation prompt.",
-        ]);
+        help_for_command(
+            "branches delete",
+            "Delete (retire) a branch.",
+            &[
+                "<branch_ref>      Branch ref (required).",
+                "--project=<ref>   Parent project ref (required if not linked).",
+                "--yes             Skip the confirmation prompt.",
+            ],
+        );
         return Ok(());
     }
-    let branch_ref = m
-        .get_one::<String>("branch_ref")
-        .cloned()
-        .ok_or_else(|| msg("usage: basin branches delete <branch_ref> [--project=<ref>] [--yes]"))?;
+    let branch_ref = m.get_one::<String>("branch_ref").cloned().ok_or_else(|| {
+        msg("usage: basin branches delete <branch_ref> [--project=<ref>] [--yes]")
+    })?;
     let project = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project)?;
     let yes = m.get_flag("yes");
@@ -498,11 +532,15 @@ fn branches_events(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         .arg(Arg::new("help").long("help").action(ArgAction::SetTrue));
     let m = parse_or_silent(cmd, args)?;
     if m.get_flag("help") {
-        help_for_command("branches events", "List branch events.", &[
-            "--project=<ref>   Project ref (required if not linked).",
-            "--follow          Poll every 5s for new events.",
-            "--limit=<n>       Events to fetch per page (default: 50).",
-        ]);
+        help_for_command(
+            "branches events",
+            "List branch events.",
+            &[
+                "--project=<ref>   Project ref (required if not linked).",
+                "--follow          Poll every 5s for new events.",
+                "--limit=<n>       Events to fetch per page (default: 50).",
+            ],
+        );
         return Ok(());
     }
     let project = m.get_one::<String>("project").cloned().unwrap_or_default();
@@ -588,7 +626,10 @@ pub fn fetch_and_print_new_events(
         if g.json {
             let _ = print_json(&mut std::io::stdout(), ev);
         } else {
-            println!("{:20}  {:<20}  {}  {}", ev.created_at, ev.kind, ev.project_id, msg_str);
+            println!(
+                "{:20}  {:<20}  {}  {}",
+                ev.created_at, ev.kind, ev.project_id, msg_str
+            );
         }
     }
     Ok(())
@@ -603,7 +644,11 @@ fn follow_branch_events(
     limit: u32,
     g: &GlobalFlags,
 ) -> CliResult<()> {
-    printinfo!(g, "Following branch events for project {} — Ctrl-C to stop.", r#ref);
+    printinfo!(
+        g,
+        "Following branch events for project {} — Ctrl-C to stop.",
+        r#ref
+    );
     let mut seen: HashSet<String> = HashSet::new();
 
     // Fetch immediately, then poll every 5s.
@@ -630,7 +675,12 @@ mod tests {
     use std::sync::Arc;
 
     fn flags(url: &str) -> GlobalFlags {
-        GlobalFlags { api_url: url.to_string(), token: "bso_org_test".into(), quiet: true, ..Default::default() }
+        GlobalFlags {
+            api_url: url.to_string(),
+            token: "bso_org_test".into(),
+            quiet: true,
+            ..Default::default()
+        }
     }
 
     fn flags_json(url: &str) -> GlobalFlags {
@@ -706,7 +756,15 @@ mod tests {
             Resp::status(201, resp_body.clone())
         });
         let g = flags(&srv.url);
-        cmd_branches(&g, &["create".into(), "--project=proj1".into(), "my-feature".into()]).unwrap();
+        cmd_branches(
+            &g,
+            &[
+                "create".into(),
+                "--project=proj1".into(),
+                "my-feature".into(),
+            ],
+        )
+        .unwrap();
         let captured = body_captured.lock().unwrap();
         let v: serde_json::Value = serde_json::from_str(&captured).unwrap();
         assert_eq!(v["branch_name"].as_str(), Some("my-feature"));
@@ -735,7 +793,8 @@ mod tests {
                 "--kind=preview".into(),
                 "feat-from".into(),
             ],
-        ).unwrap();
+        )
+        .unwrap();
         let captured = body_captured.lock().unwrap();
         let v: serde_json::Value = serde_json::from_str(&captured).unwrap();
         assert_eq!(v["from_ref"].as_str(), Some("br-parent"));
@@ -754,10 +813,17 @@ mod tests {
         let g = flags(&srv.url);
         let err = cmd_branches(
             &g,
-            &["create".into(), "--project=proj1".into(), "existing-branch".into()],
+            &[
+                "create".into(),
+                "--project=proj1".into(),
+                "existing-branch".into(),
+            ],
         )
         .unwrap_err();
-        assert!(err.to_string().contains("branch name conflict"), "err={err}");
+        assert!(
+            err.to_string().contains("branch name conflict"),
+            "err={err}"
+        );
     }
 
     #[test]
@@ -770,7 +836,15 @@ mod tests {
         );
         let srv = TestServer::start(move |_req: &Req| Resp::status(201, resp_body.clone()));
         let g = flags_json(&srv.url);
-        cmd_branches(&g, &["create".into(), "--project=proj1".into(), "json-feature".into()]).unwrap();
+        cmd_branches(
+            &g,
+            &[
+                "create".into(),
+                "--project=proj1".into(),
+                "json-feature".into(),
+            ],
+        )
+        .unwrap();
     }
 
     // ── branches get ──────────────────────────────────────────────────────────
@@ -793,7 +867,10 @@ mod tests {
     fn get_404() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(404, r#"{"error":{"code":"not_found","message":"Project not found."}}"#)
+            Resp::status(
+                404,
+                r#"{"error":{"code":"not_found","message":"Project not found."}}"#,
+            )
         });
         let g = flags(&srv.url);
         let err = cmd_branches(&g, &["get".into(), "br-missing".into()]).unwrap_err();
@@ -829,9 +906,18 @@ mod tests {
         let g = flags(&srv.url);
         cmd_branches(
             &g,
-            &["merge".into(), "--project=proj1".into(), "--yes".into(), "br1".into()],
-        ).unwrap();
-        assert!(called.load(Ordering::SeqCst), "merge endpoint was not called");
+            &[
+                "merge".into(),
+                "--project=proj1".into(),
+                "--yes".into(),
+                "br1".into(),
+            ],
+        )
+        .unwrap();
+        assert!(
+            called.load(Ordering::SeqCst),
+            "merge endpoint was not called"
+        );
     }
 
     #[test]
@@ -844,19 +930,30 @@ mod tests {
             &["merge".into(), "--project=proj1".into(), "br1".into()],
         )
         .unwrap_err();
-        assert!(err.to_string().contains("confirmation required"), "err={err}");
+        assert!(
+            err.to_string().contains("confirmation required"),
+            "err={err}"
+        );
     }
 
     #[test]
     fn merge_400_api_error() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(400, r#"{"error":{"code":"bad_request","message":"Branch is already merged."}}"#)
+            Resp::status(
+                400,
+                r#"{"error":{"code":"bad_request","message":"Branch is already merged."}}"#,
+            )
         });
         let g = flags(&srv.url);
         let err = cmd_branches(
             &g,
-            &["merge".into(), "--project=proj1".into(), "--yes".into(), "br1".into()],
+            &[
+                "merge".into(),
+                "--project=proj1".into(),
+                "--yes".into(),
+                "br1".into(),
+            ],
         )
         .unwrap_err();
         let ae = as_api_error(err.as_ref()).expect("expected ApiError");
@@ -873,8 +970,14 @@ mod tests {
         let g = flags_json(&srv.url);
         cmd_branches(
             &g,
-            &["merge".into(), "--project=proj1".into(), "--yes".into(), "br1".into()],
-        ).unwrap();
+            &[
+                "merge".into(),
+                "--project=proj1".into(),
+                "--yes".into(),
+                "br1".into(),
+            ],
+        )
+        .unwrap();
     }
 
     // ── branches delete ───────────────────────────────────────────────────────
@@ -895,21 +998,38 @@ mod tests {
         let g = flags(&srv.url);
         cmd_branches(
             &g,
-            &["delete".into(), "--project=proj1".into(), "--yes".into(), "br1".into()],
-        ).unwrap();
-        assert!(called.load(Ordering::SeqCst), "delete endpoint was not called");
+            &[
+                "delete".into(),
+                "--project=proj1".into(),
+                "--yes".into(),
+                "br1".into(),
+            ],
+        )
+        .unwrap();
+        assert!(
+            called.load(Ordering::SeqCst),
+            "delete endpoint was not called"
+        );
     }
 
     #[test]
     fn delete_404() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(404, r#"{"error":{"code":"not_found","message":"Branch not found for this project."}}"#)
+            Resp::status(
+                404,
+                r#"{"error":{"code":"not_found","message":"Branch not found for this project."}}"#,
+            )
         });
         let g = flags(&srv.url);
         let err = cmd_branches(
             &g,
-            &["delete".into(), "--project=proj1".into(), "--yes".into(), "br-missing".into()],
+            &[
+                "delete".into(),
+                "--project=proj1".into(),
+                "--yes".into(),
+                "br-missing".into(),
+            ],
         )
         .unwrap_err();
         let ae = as_api_error(err.as_ref()).expect("expected ApiError");
@@ -925,8 +1045,14 @@ mod tests {
         let g = flags_json(&srv.url);
         cmd_branches(
             &g,
-            &["delete".into(), "--project=proj1".into(), "--yes".into(), "br1".into()],
-        ).unwrap();
+            &[
+                "delete".into(),
+                "--project=proj1".into(),
+                "--yes".into(),
+                "br1".into(),
+            ],
+        )
+        .unwrap();
     }
 
     // ── branches events ───────────────────────────────────────────────────────
@@ -939,7 +1065,11 @@ mod tests {
         let resp_body = format!(r#"{{"events":[{ev1},{ev2}]}}"#);
         let srv = TestServer::start(move |req: &Req| {
             assert_eq!(req.method, "GET");
-            assert!(req.path.starts_with("/v1/projects/proj1/branches/events"), "path={}", req.path);
+            assert!(
+                req.path.starts_with("/v1/projects/proj1/branches/events"),
+                "path={}",
+                req.path
+            );
             Resp::ok(resp_body.clone())
         });
         let g = flags(&srv.url);
@@ -974,7 +1104,10 @@ mod tests {
         let resp_body = format!(r#"{{"events":[{ev1},{ev2}]}}"#);
         let srv = TestServer::start(move |_req: &Req| Resp::ok(resp_body.clone()));
         let c = Client::new(&srv.url, "tok");
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
 
         let mut seen = HashSet::new();
         // First call — both events new.
@@ -1018,7 +1151,11 @@ mod tests {
         let srv = TestServer::start(|_req: &Req| Resp::ok("{}"));
         let g = flags(&srv.url);
         assert!(
-            cmd_branches(&g, &["merge".into(), "--project=proj1".into(), "--yes".into()]).is_err(),
+            cmd_branches(
+                &g,
+                &["merge".into(), "--project=proj1".into(), "--yes".into()]
+            )
+            .is_err(),
             "expected error for missing branch ref in merge"
         );
     }
@@ -1029,7 +1166,11 @@ mod tests {
         let srv = TestServer::start(|_req: &Req| Resp::ok("{}"));
         let g = flags(&srv.url);
         assert!(
-            cmd_branches(&g, &["delete".into(), "--project=proj1".into(), "--yes".into()]).is_err(),
+            cmd_branches(
+                &g,
+                &["delete".into(), "--project=proj1".into(), "--yes".into()]
+            )
+            .is_err(),
             "expected error for missing branch ref in delete"
         );
     }
@@ -1049,15 +1190,25 @@ mod tests {
     #[test]
     fn unknown_subcommand() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_branches(&g, &["frobnicate".into()]).unwrap_err();
-        assert!(crate::error::is_silent(err.as_ref()), "expected silent error, got: {err}");
+        assert!(
+            crate::error::is_silent(err.as_ref()),
+            "expected silent error, got: {err}"
+        );
     }
 
     #[test]
     fn help_returns_ok() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         cmd_branches(&g, &["help".into()]).unwrap();
     }
 

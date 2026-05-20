@@ -87,12 +87,13 @@ fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
     if !flag_value.is_empty() {
         return Ok(flag_value.to_string());
     }
-    let cwd = std::env::current_dir()
-        .map_err(|e| msg(format!("could not determine cwd: {e}")))?;
+    let cwd = std::env::current_dir().map_err(|e| msg(format!("could not determine cwd: {e}")))?;
     let wp = load_working_project(&cwd)?;
     match wp {
         Some(w) if !w.project_ref.is_empty() => Ok(w.project_ref),
-        _ => Err(msg("--project is required (or run `basin link` to bind this directory)")),
+        _ => Err(msg(
+            "--project is required (or run `basin link` to bind this directory)",
+        )),
     }
 }
 
@@ -101,7 +102,9 @@ fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
 pub fn cmd_backups(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let (sub, rest) = match args.split_first() {
         None => {
-            return Err(msg("usage: basin backups (policy | snapshots | restore | restore-jobs) ..."));
+            return Err(msg(
+                "usage: basin backups (policy | snapshots | restore | restore-jobs) ...",
+            ));
         }
         Some((s, r)) => (s.as_str(), r),
     };
@@ -143,7 +146,9 @@ fn policy(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     match sub {
         "get" => policy_get(g, rest),
         "set" => policy_set(g, rest),
-        other => Err(msg(format!("unknown subcommand {other:?} for backups policy"))),
+        other => Err(msg(format!(
+            "unknown subcommand {other:?} for backups policy"
+        ))),
     }
 }
 
@@ -163,8 +168,11 @@ fn policy_get(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let project_flag = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project_flag)?;
     let c = require_client(g)?;
-    let policy: BackupPolicy =
-        c.do_json(Method::GET, &format!("/v1/projects/{ref}/backups/policy"), None)?;
+    let policy: BackupPolicy = c.do_json(
+        Method::GET,
+        &format!("/v1/projects/{ref}/backups/policy"),
+        None,
+    )?;
     if g.json {
         // JSON shape: { "retention_days": N, "schedule": "...", "enabled": bool }
         return print_json(&mut std::io::stdout(), &policy);
@@ -198,13 +206,19 @@ fn policy_set(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     }
 
     // Parse --retention-days (required, >0).
-    let retention_days_str = m.get_one::<String>("retention-days").cloned().unwrap_or_default();
+    let retention_days_str = m
+        .get_one::<String>("retention-days")
+        .cloned()
+        .unwrap_or_default();
     let retention_days: i64 = if retention_days_str.is_empty() {
         0
     } else {
-        retention_days_str
-            .parse::<i64>()
-            .map_err(|_| msg(format!("--retention-days must be an integer, got {:?}", retention_days_str)))?
+        retention_days_str.parse::<i64>().map_err(|_| {
+            msg(format!(
+                "--retention-days must be an integer, got {:?}",
+                retention_days_str
+            ))
+        })?
     };
     if retention_days <= 0 {
         return Err(msg(format!(
@@ -219,11 +233,19 @@ fn policy_set(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     }
 
     // Parse --enabled (bool, defaults to "true").
-    let enabled_str = m.get_one::<String>("enabled").cloned().unwrap_or_else(|| "true".into());
+    let enabled_str = m
+        .get_one::<String>("enabled")
+        .cloned()
+        .unwrap_or_else(|| "true".into());
     let enabled: bool = match enabled_str.to_ascii_lowercase().as_str() {
         "true" | "1" | "yes" => true,
         "false" | "0" | "no" => false,
-        _ => return Err(msg(format!("--enabled must be true or false (got {:?})", enabled_str))),
+        _ => {
+            return Err(msg(format!(
+                "--enabled must be true or false (got {:?})",
+                enabled_str
+            )))
+        }
     };
 
     let project_flag = m.get_one::<String>("project").cloned().unwrap_or_default();
@@ -235,8 +257,11 @@ fn policy_set(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         "schedule": schedule,
         "enabled": enabled,
     });
-    let resp: BackupPolicy =
-        c.do_json(Method::PUT, &format!("/v1/projects/{ref}/backups/policy"), Some(body))?;
+    let resp: BackupPolicy = c.do_json(
+        Method::PUT,
+        &format!("/v1/projects/{ref}/backups/policy"),
+        Some(body),
+    )?;
     if g.json {
         // JSON shape: { "retention_days": N, "schedule": "...", "enabled": bool }
         return print_json(&mut std::io::stdout(), &resp);
@@ -252,7 +277,9 @@ fn policy_set(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
 fn snapshots(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let (sub, rest) = match args.split_first() {
         None => {
-            return Err(msg("usage: basin backups snapshots (list | create | expire) ..."));
+            return Err(msg(
+                "usage: basin backups snapshots (list | create | expire) ...",
+            ));
         }
         Some((s, r)) => (s.as_str(), r),
     };
@@ -260,7 +287,9 @@ fn snapshots(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         "list" => snapshots_list(g, rest),
         "create" => snapshots_create(g, rest),
         "expire" => snapshots_expire(g, rest),
-        other => Err(msg(format!("unknown subcommand {other:?} for backups snapshots"))),
+        other => Err(msg(format!(
+            "unknown subcommand {other:?} for backups snapshots"
+        ))),
     }
 }
 
@@ -287,11 +316,17 @@ fn snapshots_list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         snapshots: Vec<BackupSnapshot>,
     }
 
-    let resp: Resp =
-        c.do_json(Method::GET, &format!("/v1/projects/{ref}/backups/snapshots"), None)?;
+    let resp: Resp = c.do_json(
+        Method::GET,
+        &format!("/v1/projects/{ref}/backups/snapshots"),
+        None,
+    )?;
     if g.json {
         // JSON shape: { "snapshots": [ { "id":"...", "label":"...", "size_bytes":N, "created_at":"..." } ] }
-        return print_json(&mut std::io::stdout(), &json!({ "snapshots": resp.snapshots }));
+        return print_json(
+            &mut std::io::stdout(),
+            &json!({ "snapshots": resp.snapshots }),
+        );
     }
     if resp.snapshots.is_empty() {
         println!("(no backup snapshots)");
@@ -338,8 +373,11 @@ fn snapshots_create(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         snapshot: Option<BackupSnapshot>,
     }
 
-    let resp: Resp =
-        c.do_json(Method::POST, &format!("/v1/projects/{ref}/backups/snapshots"), Some(body))?;
+    let resp: Resp = c.do_json(
+        Method::POST,
+        &format!("/v1/projects/{ref}/backups/snapshots"),
+        Some(body),
+    )?;
     if g.json {
         // JSON shape: { "snapshot": { "id":"...", "label":"...", "size_bytes":N, "created_at":"..." } }
         return print_json(&mut std::io::stdout(), &resp);
@@ -378,7 +416,9 @@ fn snapshots_expire(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let id = m
         .get_many::<String>("id")
         .and_then(|mut it| it.next().cloned())
-        .ok_or_else(|| msg("usage: basin backups snapshots expire <id> [--project=<ref>] [--yes]"))?;
+        .ok_or_else(|| {
+            msg("usage: basin backups snapshots expire <id> [--project=<ref>] [--yes]")
+        })?;
     let project_flag = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project_flag)?;
     let c = require_client(g)?;
@@ -395,7 +435,7 @@ fn snapshots_expire(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
             id, r#ref
         );
         let line = read_line()?;
-        if line.trim().to_ascii_lowercase() != "y" {
+        if !line.trim().eq_ignore_ascii_case("y") {
             println!("Aborted.");
             return Ok(());
         }
@@ -457,14 +497,16 @@ fn restore(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
 
     if !m.get_flag("yes") {
         if g.json {
-            return Err(msg("confirmation required: pass --yes to restore non-interactively under --json"));
+            return Err(msg(
+                "confirmation required: pass --yes to restore non-interactively under --json",
+            ));
         }
         eprint!(
             "Restore project {:?} from snapshot {:?}? This will overwrite data. [y/N] ",
             r#ref, from
         );
         let line = read_line()?;
-        if line.trim().to_ascii_lowercase() != "y" {
+        if !line.trim().eq_ignore_ascii_case("y") {
             println!("Aborted.");
             return Ok(());
         }
@@ -484,13 +526,19 @@ fn restore(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         status: String,
     }
 
-    let resp: RestoreResp =
-        c.do_json(Method::POST, &format!("/v1/projects/{ref}/backups/restore"), Some(body))?;
+    let resp: RestoreResp = c.do_json(
+        Method::POST,
+        &format!("/v1/projects/{ref}/backups/restore"),
+        Some(body),
+    )?;
     if g.json {
         // JSON shape: { "restore_job_id": "...", "status": "..." }
         return print_json(&mut std::io::stdout(), &resp);
     }
-    println!("Restore job started: {} (status: {})", resp.restore_job_id, resp.status);
+    println!(
+        "Restore job started: {} (status: {})",
+        resp.restore_job_id, resp.status
+    );
     Ok(())
 }
 
@@ -503,7 +551,9 @@ fn restore_jobs(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     };
     match sub {
         "list" => restore_jobs_list(g, rest),
-        other => Err(msg(format!("unknown subcommand {other:?} for backups restore-jobs"))),
+        other => Err(msg(format!(
+            "unknown subcommand {other:?} for backups restore-jobs"
+        ))),
     }
 }
 
@@ -530,8 +580,11 @@ fn restore_jobs_list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         jobs: Vec<RestoreJob>,
     }
 
-    let resp: Resp =
-        c.do_json(Method::GET, &format!("/v1/projects/{ref}/backups/restore/jobs"), None)?;
+    let resp: Resp = c.do_json(
+        Method::GET,
+        &format!("/v1/projects/{ref}/backups/restore/jobs"),
+        None,
+    )?;
     if g.json {
         // JSON shape: { "jobs": [ { "id":"...", "status":"...", "started_at":"...", "completed_at":"...", "snapshot_id":"..." } ] }
         return print_json(&mut std::io::stdout(), &json!({ "jobs": resp.jobs }));
@@ -542,7 +595,11 @@ fn restore_jobs_list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     }
     let mut t = Table::new(g, &["ID", "STATUS", "STARTED", "COMPLETED", "SNAPSHOT"]);
     for j in &resp.jobs {
-        let completed = if j.completed_at.is_empty() { "—".to_string() } else { j.completed_at.clone() };
+        let completed = if j.completed_at.is_empty() {
+            "—".to_string()
+        } else {
+            j.completed_at.clone()
+        };
         t.row(&[&j.id, &j.status, &j.started_at, &completed, &j.snapshot_id]);
     }
     t.flush()
@@ -580,14 +637,22 @@ mod tests {
     #[test]
     fn no_args_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
         assert!(cmd_backups(&g, &[]).is_err());
     }
 
     #[test]
     fn unknown_subcommand_is_silent_error() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
         let err = cmd_backups(&g, &["frobnicate".to_string()]).unwrap_err();
         assert!(crate::error::is_silent(err.as_ref()));
     }
@@ -595,7 +660,11 @@ mod tests {
     #[test]
     fn help_returns_ok() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
         assert!(cmd_backups(&g, &["help".to_string()]).is_ok());
     }
 
@@ -611,8 +680,15 @@ mod tests {
         });
         let g = flags(&srv.url);
         // Should not error
-        cmd_backups(&g, &["policy".to_string(), "get".to_string(), "--project=proj1".to_string()])
-            .unwrap();
+        cmd_backups(
+            &g,
+            &[
+                "policy".to_string(),
+                "get".to_string(),
+                "--project=proj1".to_string(),
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -621,11 +697,12 @@ mod tests {
         let srv = TestServer::start(|_req: &Req| {
             Resp::ok(r#"{"retention_days":7,"schedule":"0 2 * * *","enabled":true}"#)
         });
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
-        let policy: BackupPolicy =
-            c.do_json(Method::GET, "/v1/projects/proj1/backups/policy", None).unwrap();
+        let policy: BackupPolicy = c
+            .do_json(Method::GET, "/v1/projects/proj1/backups/policy", None)
+            .unwrap();
         print_json(&mut buf, &policy).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert_eq!(v["retention_days"].as_i64().unwrap(), 7);
@@ -637,12 +714,19 @@ mod tests {
     fn policy_get_404_propagates() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(404, r#"{"code":"not_found","message":"Project not found."}"#)
+            Resp::status(
+                404,
+                r#"{"code":"not_found","message":"Project not found."}"#,
+            )
         });
         let g = flags(&srv.url);
         let err = cmd_backups(
             &g,
-            &["policy".to_string(), "get".to_string(), "--project=proj1".to_string()],
+            &[
+                "policy".to_string(),
+                "get".to_string(),
+                "--project=proj1".to_string(),
+            ],
         )
         .unwrap_err();
         let ae = crate::error::as_api_error(err.as_ref()).expect("ApiError");
@@ -724,7 +808,10 @@ mod tests {
     fn policy_set_422_propagates() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(422, r#"{"code":"invalid_policy","message":"Retention days exceeds plan limit."}"#)
+            Resp::status(
+                422,
+                r#"{"code":"invalid_policy","message":"Retention days exceeds plan limit."}"#,
+            )
         });
         let g = flags(&srv.url);
         let err = cmd_backups(
@@ -748,7 +835,7 @@ mod tests {
         let srv = TestServer::start(|_req: &Req| {
             Resp::ok(r#"{"retention_days":30,"schedule":"0 4 * * *","enabled":false}"#)
         });
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
         let resp: BackupPolicy = c
@@ -772,12 +859,18 @@ mod tests {
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "GET");
             assert_eq!(req.path, "/v1/projects/proj1/backups/snapshots");
-            Resp::ok(r#"{"snapshots":[{"id":"snap-1","label":"before-migration","size_bytes":1048576,"created_at":"2026-01-01T00:00:00Z"},{"id":"snap-2","label":"nightly","size_bytes":2048,"created_at":"2026-01-02T00:00:00Z"}]}"#)
+            Resp::ok(
+                r#"{"snapshots":[{"id":"snap-1","label":"before-migration","size_bytes":1048576,"created_at":"2026-01-01T00:00:00Z"},{"id":"snap-2","label":"nightly","size_bytes":2048,"created_at":"2026-01-02T00:00:00Z"}]}"#,
+            )
         });
         let g = flags(&srv.url);
         cmd_backups(
             &g,
-            &["snapshots".to_string(), "list".to_string(), "--project=proj1".to_string()],
+            &[
+                "snapshots".to_string(),
+                "list".to_string(),
+                "--project=proj1".to_string(),
+            ],
         )
         .unwrap();
     }
@@ -791,7 +884,11 @@ mod tests {
         // The "(no backup snapshots)" print is covered by the logic being identical to Go.
         cmd_backups(
             &g,
-            &["snapshots".to_string(), "list".to_string(), "--project=proj1".to_string()],
+            &[
+                "snapshots".to_string(),
+                "list".to_string(),
+                "--project=proj1".to_string(),
+            ],
         )
         .unwrap();
     }
@@ -800,14 +897,21 @@ mod tests {
     fn snapshots_list_json_shape() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"snapshots":[{"id":"snap-1","label":"test","size_bytes":1024,"created_at":"2026-01-01T00:00:00Z"}]}"#)
+            Resp::ok(
+                r#"{"snapshots":[{"id":"snap-1","label":"test","size_bytes":1024,"created_at":"2026-01-01T00:00:00Z"}]}"#,
+            )
         });
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
         #[derive(Deserialize)]
-        struct R { #[serde(default)] snapshots: Vec<BackupSnapshot> }
-        let resp: R = c.do_json(Method::GET, "/v1/projects/proj1/backups/snapshots", None).unwrap();
+        struct R {
+            #[serde(default)]
+            snapshots: Vec<BackupSnapshot>,
+        }
+        let resp: R = c
+            .do_json(Method::GET, "/v1/projects/proj1/backups/snapshots", None)
+            .unwrap();
         print_json(&mut buf, &json!({ "snapshots": resp.snapshots })).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         let snaps = v["snapshots"].as_array().unwrap();
@@ -827,7 +931,9 @@ mod tests {
             assert_eq!(req.method, "POST");
             let body: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
             *cap2.lock().unwrap() = body;
-            Resp::ok(r#"{"snapshot":{"id":"snap-new","label":"my-label","size_bytes":0,"created_at":""}}"#)
+            Resp::ok(
+                r#"{"snapshot":{"id":"snap-new","label":"my-label","size_bytes":0,"created_at":""}}"#,
+            )
         });
         let g = flags(&srv.url);
         cmd_backups(
@@ -857,21 +963,30 @@ mod tests {
         let g = flags(&srv.url);
         cmd_backups(
             &g,
-            &["snapshots".to_string(), "create".to_string(), "--project=proj1".to_string()],
+            &[
+                "snapshots".to_string(),
+                "create".to_string(),
+                "--project=proj1".to_string(),
+            ],
         )
         .unwrap();
         let body = captured.lock().unwrap();
         // No "label" key in body when flag is omitted.
-        assert!(body.get("label").is_none(), "label field should not be present, got: {body}");
+        assert!(
+            body.get("label").is_none(),
+            "label field should not be present, got: {body}"
+        );
     }
 
     #[test]
     fn snapshots_create_json_shape() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"snapshot":{"id":"snap-j","label":"json-snap","size_bytes":0,"created_at":""}}"#)
+            Resp::ok(
+                r#"{"snapshot":{"id":"snap-j","label":"json-snap","size_bytes":0,"created_at":""}}"#,
+            )
         });
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
 
@@ -881,7 +996,11 @@ mod tests {
             snapshot: Option<BackupSnapshot>,
         }
         let resp: SnapResp = c
-            .do_json(Method::POST, "/v1/projects/proj1/backups/snapshots", Some(json!({"label":"json-snap"})))
+            .do_json(
+                Method::POST,
+                "/v1/projects/proj1/backups/snapshots",
+                Some(json!({"label":"json-snap"})),
+            )
             .unwrap();
         print_json(&mut buf, &resp).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
@@ -896,7 +1015,10 @@ mod tests {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "POST");
-            assert_eq!(req.path, "/v1/projects/proj1/backups/snapshots/snap-1/expire");
+            assert_eq!(
+                req.path,
+                "/v1/projects/proj1/backups/snapshots/snap-1/expire"
+            );
             Resp::ok(r#"{"expired":true,"id":"snap-1"}"#)
         });
         let g = flags(&srv.url);
@@ -917,7 +1039,10 @@ mod tests {
     fn snapshots_expire_404_propagates() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(404, r#"{"code":"not_found","message":"Snapshot not found."}"#)
+            Resp::status(
+                404,
+                r#"{"code":"not_found","message":"Snapshot not found."}"#,
+            )
         });
         let g = flags(&srv.url);
         let err = cmd_backups(
@@ -939,7 +1064,10 @@ mod tests {
     fn snapshots_expire_409_conflict() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(409, r#"{"code":"already_expired","message":"Snapshot is already expired."}"#)
+            Resp::status(
+                409,
+                r#"{"code":"already_expired","message":"Snapshot is already expired."}"#,
+            )
         });
         let g = flags(&srv.url);
         let err = cmd_backups(
@@ -960,17 +1088,23 @@ mod tests {
     #[test]
     fn snapshots_expire_json_shape() {
         let _g = with_temp_config_dir();
-        let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"expired":true,"id":"snap-1"}"#)
-        });
-        let g = flags_json(&srv.url);
+        let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"expired":true,"id":"snap-1"}"#));
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
 
         #[derive(Deserialize, Serialize)]
-        struct ExpireResp { expired: bool, #[serde(skip_serializing_if = "String::is_empty", default)] id: String }
+        struct ExpireResp {
+            expired: bool,
+            #[serde(skip_serializing_if = "String::is_empty", default)]
+            id: String,
+        }
         let resp: ExpireResp = c
-            .do_json(Method::POST, "/v1/projects/proj1/backups/snapshots/snap-1/expire", None)
+            .do_json(
+                Method::POST,
+                "/v1/projects/proj1/backups/snapshots/snap-1/expire",
+                None,
+            )
             .unwrap();
         print_json(&mut buf, &resp).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
@@ -987,7 +1121,11 @@ mod tests {
         let g = flags(&srv.url);
         let err = cmd_backups(
             &g,
-            &["restore".to_string(), "--project=proj1".to_string(), "--yes".to_string()],
+            &[
+                "restore".to_string(),
+                "--project=proj1".to_string(),
+                "--yes".to_string(),
+            ],
         )
         .unwrap_err();
         assert!(err.to_string().contains("--from"), "err: {err}");
@@ -1017,7 +1155,10 @@ mod tests {
         .unwrap();
         let body = captured.lock().unwrap();
         assert_eq!(body["snapshot_id"].as_str().unwrap(), "snap-1");
-        assert!(body.get("into_branch_ref").is_none(), "into_branch_ref should be absent");
+        assert!(
+            body.get("into_branch_ref").is_none(),
+            "into_branch_ref should be absent"
+        );
     }
 
     #[test]
@@ -1050,7 +1191,10 @@ mod tests {
     fn restore_conflict_409_propagates() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(409, r#"{"code":"restore_in_progress","message":"A restore is already in progress."}"#)
+            Resp::status(
+                409,
+                r#"{"code":"restore_in_progress","message":"A restore is already in progress."}"#,
+            )
         });
         let g = flags(&srv.url);
         let err = cmd_backups(
@@ -1073,7 +1217,7 @@ mod tests {
         let srv = TestServer::start(|_req: &Req| {
             Resp::ok(r#"{"restore_job_id":"job-j","status":"pending"}"#)
         });
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
 
@@ -1105,12 +1249,18 @@ mod tests {
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "GET");
             assert_eq!(req.path, "/v1/projects/proj1/backups/restore/jobs");
-            Resp::ok(r#"{"jobs":[{"id":"job-1","status":"completed","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T01:00:00Z","snapshot_id":"snap-1"},{"id":"job-2","status":"running","started_at":"2026-01-02T00:00:00Z","completed_at":"","snapshot_id":"snap-2"}]}"#)
+            Resp::ok(
+                r#"{"jobs":[{"id":"job-1","status":"completed","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T01:00:00Z","snapshot_id":"snap-1"},{"id":"job-2","status":"running","started_at":"2026-01-02T00:00:00Z","completed_at":"","snapshot_id":"snap-2"}]}"#,
+            )
         });
         let g = flags(&srv.url);
         cmd_backups(
             &g,
-            &["restore-jobs".to_string(), "list".to_string(), "--project=proj1".to_string()],
+            &[
+                "restore-jobs".to_string(),
+                "list".to_string(),
+                "--project=proj1".to_string(),
+            ],
         )
         .unwrap();
     }
@@ -1123,7 +1273,11 @@ mod tests {
         // No error; "(no restore jobs)" is printed.
         cmd_backups(
             &g,
-            &["restore-jobs".to_string(), "list".to_string(), "--project=proj1".to_string()],
+            &[
+                "restore-jobs".to_string(),
+                "list".to_string(),
+                "--project=proj1".to_string(),
+            ],
         )
         .unwrap();
     }
@@ -1133,7 +1287,9 @@ mod tests {
         // In-flight job: no completed_at → rendered as "—".
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"jobs":[{"id":"job-3","status":"running","started_at":"2026-01-01T00:00:00Z","completed_at":"","snapshot_id":"snap-3"}]}"#)
+            Resp::ok(
+                r#"{"jobs":[{"id":"job-3","status":"running","started_at":"2026-01-01T00:00:00Z","completed_at":"","snapshot_id":"snap-3"}]}"#,
+            )
         });
         // Render the em-dash logic directly.
         let j = RestoreJob {
@@ -1143,13 +1299,21 @@ mod tests {
             completed_at: String::new(),
             snapshot_id: "snap-3".into(),
         };
-        let completed = if j.completed_at.is_empty() { "—".to_string() } else { j.completed_at.clone() };
+        let completed = if j.completed_at.is_empty() {
+            "—".to_string()
+        } else {
+            j.completed_at.clone()
+        };
         assert_eq!(completed, "—");
         // Also verify the API call doesn't fail.
         let g = flags(&srv.url);
         cmd_backups(
             &g,
-            &["restore-jobs".to_string(), "list".to_string(), "--project=proj1".to_string()],
+            &[
+                "restore-jobs".to_string(),
+                "list".to_string(),
+                "--project=proj1".to_string(),
+            ],
         )
         .unwrap();
     }
@@ -1158,14 +1322,19 @@ mod tests {
     fn restore_jobs_list_json_shape() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"jobs":[{"id":"job-j","status":"completed","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T01:00:00Z","snapshot_id":"snap-j"}]}"#)
+            Resp::ok(
+                r#"{"jobs":[{"id":"job-j","status":"completed","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T01:00:00Z","snapshot_id":"snap-j"}]}"#,
+            )
         });
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
 
         #[derive(Deserialize)]
-        struct R { #[serde(default)] jobs: Vec<RestoreJob> }
+        struct R {
+            #[serde(default)]
+            jobs: Vec<RestoreJob>,
+        }
         let resp: R = c
             .do_json(Method::GET, "/v1/projects/proj1/backups/restore/jobs", None)
             .unwrap();

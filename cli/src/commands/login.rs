@@ -64,7 +64,10 @@ pub fn cmd_login(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         return Err(msg("no token provided"));
     }
     if !token.starts_with("bso_org_") {
-        printerr!(g, "warning: token doesn't start with 'bso_org_' — is this the right value?");
+        printerr!(
+            g,
+            "warning: token doesn't start with 'bso_org_' — is this the right value?"
+        );
     }
 
     let c = Client::new(&api_url, &token);
@@ -96,7 +99,12 @@ pub fn cmd_login(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         );
     }
     match me.user.as_ref().filter(|u| !u.email.is_empty()) {
-        Some(u) => println!("Signed in as {}. Token saved to {} ({}).", u.email, path.display(), stored),
+        Some(u) => println!(
+            "Signed in as {}. Token saved to {} ({}).",
+            u.email,
+            path.display(),
+            stored
+        ),
         None => println!("Signed in. Token saved to {} ({}).", path.display(), stored),
     }
     Ok(())

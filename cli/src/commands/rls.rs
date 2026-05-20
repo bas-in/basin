@@ -81,7 +81,9 @@ fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
     let wp = load_working_project(&cwd)?;
     match wp {
         Some(w) if !w.project_ref.is_empty() => Ok(w.project_ref),
-        _ => Err(msg("--project is required (or run `basin link` to bind this directory)")),
+        _ => Err(msg(
+            "--project is required (or run `basin link` to bind this directory)",
+        )),
     }
 }
 
@@ -90,7 +92,9 @@ fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
 pub fn cmd_rls(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let (sub, rest) = match args.split_first() {
         None => {
-            return Err(msg("usage: basin rls (enable | disable | policies) <table> ..."));
+            return Err(msg(
+                "usage: basin rls (enable | disable | policies) <table> ...",
+            ));
         }
         Some((s, r)) => (s.as_str(), r),
     };
@@ -113,9 +117,7 @@ pub fn cmd_rls(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
             );
             Ok(())
         }
-        other => {
-            Err(msg(format!("unknown subcommand {:?} for rls", other)))
-        }
+        other => Err(msg(format!("unknown subcommand {:?} for rls", other))),
     }
 }
 
@@ -204,7 +206,9 @@ fn rls_disable(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
 fn rls_policies(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let (sub, rest) = match args.split_first() {
         None => {
-            return Err(msg("usage: basin rls policies (list | create | drop) <table> ..."));
+            return Err(msg(
+                "usage: basin rls policies (list | create | drop) <table> ...",
+            ));
         }
         Some((s, r)) => (s.as_str(), r),
     };
@@ -212,7 +216,10 @@ fn rls_policies(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         "list" => policies_list(g, rest),
         "create" => policies_create(g, rest),
         "drop" => policies_drop(g, rest),
-        other => Err(msg(format!("unknown subcommand {:?} for rls policies", other))),
+        other => Err(msg(format!(
+            "unknown subcommand {:?} for rls policies",
+            other
+        ))),
     }
 }
 
@@ -248,11 +255,17 @@ fn policies_list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         #[serde(default)]
         policies: Vec<Policy>,
     }
-    let resp: Resp =
-        c.do_json(Method::GET, &format!("/v1/projects/{ref}/tables/{table}/policies"), None)?;
+    let resp: Resp = c.do_json(
+        Method::GET,
+        &format!("/v1/projects/{ref}/tables/{table}/policies"),
+        None,
+    )?;
     if g.json {
         // JSON shape: { "policies": [{ name, command, using, with_check, roles }] }
-        return print_json(&mut std::io::stdout(), &json!({ "policies": resp.policies }));
+        return print_json(
+            &mut std::io::stdout(),
+            &json!({ "policies": resp.policies }),
+        );
     }
     if resp.policies.is_empty() {
         println!("(no policies)");
@@ -309,17 +322,24 @@ fn policies_create(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     }
     let command = m.get_one::<String>("command").cloned().unwrap_or_default();
     if command.is_empty() {
-        return Err(msg("rls policies create: --command is required (select|insert|update|delete|all)"));
+        return Err(msg(
+            "rls policies create: --command is required (select|insert|update|delete|all)",
+        ));
     }
     let valid_commands = ["select", "insert", "update", "delete", "all"];
     if !valid_commands.contains(&command.to_ascii_lowercase().as_str()) {
-        return Err(msg("rls policies create: --command must be one of: select, insert, update, delete, all"));
+        return Err(msg(
+            "rls policies create: --command must be one of: select, insert, update, delete, all",
+        ));
     }
     let using = m.get_one::<String>("using").cloned().unwrap_or_default();
     if using.is_empty() {
         return Err(msg("rls policies create: --using is required"));
     }
-    let with_check = m.get_one::<String>("with-check").cloned().unwrap_or_default();
+    let with_check = m
+        .get_one::<String>("with-check")
+        .cloned()
+        .unwrap_or_default();
     let roles_str = m.get_one::<String>("roles").cloned().unwrap_or_default();
 
     let project_flag = m.get_one::<String>("project").cloned().unwrap_or_default();
@@ -352,7 +372,11 @@ fn policies_create(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         // JSON shape: { "policy": { name, command, using, with_check, roles } }
         return print_json(&mut std::io::stdout(), &resp);
     }
-    let p_name = resp.policy.as_ref().map(|p| p.name.as_str()).unwrap_or(&name);
+    let p_name = resp
+        .policy
+        .as_ref()
+        .map(|p| p.name.as_str())
+        .unwrap_or(&name);
     println!("Created policy {p_name:?} on table {table}.");
     Ok(())
 }
@@ -399,9 +423,12 @@ fn policies_drop(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
                 name
             )));
         }
-        eprint!("Drop policy {:?} from table {table}? This cannot be undone. [y/N] ", name);
+        eprint!(
+            "Drop policy {:?} from table {table}? This cannot be undone. [y/N] ",
+            name
+        );
         let line = read_line()?;
-        if line.trim().to_ascii_lowercase() != "y" {
+        if !line.trim().eq_ignore_ascii_case("y") {
             println!("Aborted.");
             return Ok(());
         }
@@ -429,11 +456,22 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     fn flags(url: &str) -> GlobalFlags {
-        GlobalFlags { api_url: url.to_string(), token: "tok".into(), quiet: true, ..Default::default() }
+        GlobalFlags {
+            api_url: url.to_string(),
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        }
     }
 
     fn flags_json(url: &str) -> GlobalFlags {
-        GlobalFlags { api_url: url.to_string(), token: "tok".into(), quiet: true, json: true, ..Default::default() }
+        GlobalFlags {
+            api_url: url.to_string(),
+            token: "tok".into(),
+            quiet: true,
+            json: true,
+            ..Default::default()
+        }
     }
 
     fn sample_policy_json() -> &'static str {
@@ -445,28 +483,44 @@ mod tests {
     #[test]
     fn no_args_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
         assert!(cmd_rls(&g, &[]).is_err());
     }
 
     #[test]
     fn unknown_subcommand_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
         assert!(cmd_rls(&g, &["frobnicate".to_string()]).is_err());
     }
 
     #[test]
     fn help_returns_ok() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
         assert!(cmd_rls(&g, &["help".to_string()]).is_ok());
     }
 
     #[test]
     fn policies_unknown_subcommand_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
         assert!(cmd_rls(&g, &["policies".to_string(), "frobnicate".to_string()]).is_err());
     }
 
@@ -484,14 +538,26 @@ mod tests {
             Resp::ok(r#"{"enabled":true,"table":"posts"}"#)
         });
         let g = flags(&srv.url);
-        cmd_rls(&g, &["enable".to_string(), "--project=p1".to_string(), "posts".to_string()]).unwrap();
+        cmd_rls(
+            &g,
+            &[
+                "enable".to_string(),
+                "--project=p1".to_string(),
+                "posts".to_string(),
+            ],
+        )
+        .unwrap();
         assert!(*called.lock().unwrap());
     }
 
     #[test]
     fn enable_missing_table_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
         assert!(cmd_rls(&g, &["enable".to_string(), "--project=p1".to_string()]).is_err());
     }
 
@@ -499,11 +565,16 @@ mod tests {
     fn enable_json_shape() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"enabled":true,"table":"posts"}"#));
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: RLSStatus =
-            c.do_json(Method::POST, "/v1/projects/p1/tables/posts/rls/enable", None).unwrap();
+        let resp: RLSStatus = c
+            .do_json(
+                Method::POST,
+                "/v1/projects/p1/tables/posts/rls/enable",
+                None,
+            )
+            .unwrap();
         print_json(&mut buf, &resp).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert!(v["enabled"].as_bool().unwrap());
@@ -514,10 +585,21 @@ mod tests {
     fn enable_403_propagates() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(403, r#"{"code":"forbidden","message":"Insufficient permissions."}"#)
+            Resp::status(
+                403,
+                r#"{"code":"forbidden","message":"Insufficient permissions."}"#,
+            )
         });
         let g = flags(&srv.url);
-        let err = cmd_rls(&g, &["enable".to_string(), "--project=p1".to_string(), "posts".to_string()]).unwrap_err();
+        let err = cmd_rls(
+            &g,
+            &[
+                "enable".to_string(),
+                "--project=p1".to_string(),
+                "posts".to_string(),
+            ],
+        )
+        .unwrap_err();
         let ae = crate::error::as_api_error(err.as_ref()).expect("ApiError");
         assert_eq!(ae.http_status, 403);
     }
@@ -536,7 +618,15 @@ mod tests {
             Resp::ok(r#"{"enabled":false,"table":"posts"}"#)
         });
         let g = flags(&srv.url);
-        cmd_rls(&g, &["disable".to_string(), "--project=p1".to_string(), "posts".to_string()]).unwrap();
+        cmd_rls(
+            &g,
+            &[
+                "disable".to_string(),
+                "--project=p1".to_string(),
+                "posts".to_string(),
+            ],
+        )
+        .unwrap();
         assert!(*called.lock().unwrap());
     }
 
@@ -544,11 +634,16 @@ mod tests {
     fn disable_json_shape() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"enabled":false,"table":"posts"}"#));
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: RLSStatus =
-            c.do_json(Method::POST, "/v1/projects/p1/tables/posts/rls/disable", None).unwrap();
+        let resp: RLSStatus = c
+            .do_json(
+                Method::POST,
+                "/v1/projects/p1/tables/posts/rls/disable",
+                None,
+            )
+            .unwrap();
         print_json(&mut buf, &resp).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert!(!v["enabled"].as_bool().unwrap());
@@ -562,10 +657,23 @@ mod tests {
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "GET");
             assert_eq!(req.path, "/v1/projects/p1/tables/posts/policies");
-            Resp::ok(&format!(r#"{{"policies":[{},{}]}}"#, sample_policy_json(), r#"{"name":"write_own","command":"insert","using":"auth.uid() = user_id"}"#))
+            Resp::ok(format!(
+                r#"{{"policies":[{},{}]}}"#,
+                sample_policy_json(),
+                r#"{"name":"write_own","command":"insert","using":"auth.uid() = user_id"}"#
+            ))
         });
         let g = flags(&srv.url);
-        cmd_rls(&g, &["policies".to_string(), "list".to_string(), "--project=p1".to_string(), "posts".to_string()]).unwrap();
+        cmd_rls(
+            &g,
+            &[
+                "policies".to_string(),
+                "list".to_string(),
+                "--project=p1".to_string(),
+                "posts".to_string(),
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -573,21 +681,35 @@ mod tests {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"policies":[]}"#));
         let g = flags(&srv.url);
-        cmd_rls(&g, &["policies".to_string(), "list".to_string(), "--project=p1".to_string(), "posts".to_string()]).unwrap();
+        cmd_rls(
+            &g,
+            &[
+                "policies".to_string(),
+                "list".to_string(),
+                "--project=p1".to_string(),
+                "posts".to_string(),
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
     fn policies_list_json_shape() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(&format!(r#"{{"policies":[{}]}}"#, sample_policy_json()))
+            Resp::ok(format!(r#"{{"policies":[{}]}}"#, sample_policy_json()))
         });
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
         #[derive(Deserialize)]
-        struct R { #[serde(default)] policies: Vec<Policy> }
-        let resp: R = c.do_json(Method::GET, "/v1/projects/p1/tables/posts/policies", None).unwrap();
+        struct R {
+            #[serde(default)]
+            policies: Vec<Policy>,
+        }
+        let resp: R = c
+            .do_json(Method::GET, "/v1/projects/p1/tables/posts/policies", None)
+            .unwrap();
         print_json(&mut buf, &json!({ "policies": resp.policies })).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         let pols = v["policies"].as_array().unwrap();
@@ -603,10 +725,16 @@ mod tests {
             Resp::status(404, r#"{"code":"not_found","message":"Table not found."}"#)
         });
         let g = flags(&srv.url);
-        let err = cmd_rls(&g, &[
-            "policies".to_string(), "list".to_string(),
-            "--project=p1".to_string(), "ghost".to_string(),
-        ]).unwrap_err();
+        let err = cmd_rls(
+            &g,
+            &[
+                "policies".to_string(),
+                "list".to_string(),
+                "--project=p1".to_string(),
+                "ghost".to_string(),
+            ],
+        )
+        .unwrap_err();
         let ae = crate::error::as_api_error(err.as_ref()).expect("ApiError");
         assert_eq!(ae.http_status, 404);
     }
@@ -623,18 +751,23 @@ mod tests {
             assert_eq!(req.path, "/v1/projects/p1/tables/posts/policies");
             let body: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
             *c2.lock().unwrap() = body;
-            Resp::ok(&format!(r#"{{"policy":{}}}"#, sample_policy_json()))
+            Resp::ok(format!(r#"{{"policy":{}}}"#, sample_policy_json()))
         });
         let g = flags(&srv.url);
-        cmd_rls(&g, &[
-            "policies".to_string(), "create".to_string(),
-            "--project=p1".to_string(),
-            "--name=read_own".to_string(),
-            "--command=select".to_string(),
-            "--using=auth.uid()=user_id".to_string(),
-            "--roles=authenticated".to_string(),
-            "posts".to_string(),
-        ]).unwrap();
+        cmd_rls(
+            &g,
+            &[
+                "policies".to_string(),
+                "create".to_string(),
+                "--project=p1".to_string(),
+                "--name=read_own".to_string(),
+                "--command=select".to_string(),
+                "--using=auth.uid()=user_id".to_string(),
+                "--roles=authenticated".to_string(),
+                "posts".to_string(),
+            ],
+        )
+        .unwrap();
         let body = cap.lock().unwrap();
         assert_eq!(body["name"].as_str().unwrap(), "read_own");
         assert_eq!(body["command"].as_str().unwrap(), "select");
@@ -643,50 +776,103 @@ mod tests {
     #[test]
     fn policies_create_missing_name_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
-        let err = cmd_rls(&g, &[
-            "policies".to_string(), "create".to_string(),
-            "--project=p1".to_string(),
-            "--command=select".to_string(), "--using=true".to_string(), "posts".to_string(),
-        ]).unwrap_err();
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
+        let err = cmd_rls(
+            &g,
+            &[
+                "policies".to_string(),
+                "create".to_string(),
+                "--project=p1".to_string(),
+                "--command=select".to_string(),
+                "--using=true".to_string(),
+                "posts".to_string(),
+            ],
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("--name is required"), "err: {err}");
     }
 
     #[test]
     fn policies_create_missing_command_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
-        let err = cmd_rls(&g, &[
-            "policies".to_string(), "create".to_string(),
-            "--project=p1".to_string(),
-            "--name=p1".to_string(), "--using=true".to_string(), "posts".to_string(),
-        ]).unwrap_err();
-        assert!(err.to_string().contains("--command is required"), "err: {err}");
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
+        let err = cmd_rls(
+            &g,
+            &[
+                "policies".to_string(),
+                "create".to_string(),
+                "--project=p1".to_string(),
+                "--name=p1".to_string(),
+                "--using=true".to_string(),
+                "posts".to_string(),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("--command is required"),
+            "err: {err}"
+        );
     }
 
     #[test]
     fn policies_create_invalid_command_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
-        let err = cmd_rls(&g, &[
-            "policies".to_string(), "create".to_string(),
-            "--project=p1".to_string(),
-            "--name=p1".to_string(), "--command=truncate".to_string(), "--using=true".to_string(),
-            "posts".to_string(),
-        ]).unwrap_err();
-        assert!(err.to_string().contains("--command must be one of"), "err: {err}");
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
+        let err = cmd_rls(
+            &g,
+            &[
+                "policies".to_string(),
+                "create".to_string(),
+                "--project=p1".to_string(),
+                "--name=p1".to_string(),
+                "--command=truncate".to_string(),
+                "--using=true".to_string(),
+                "posts".to_string(),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("--command must be one of"),
+            "err: {err}"
+        );
     }
 
     #[test]
     fn policies_create_missing_using_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
-        let err = cmd_rls(&g, &[
-            "policies".to_string(), "create".to_string(),
-            "--project=p1".to_string(),
-            "--name=p1".to_string(), "--command=select".to_string(), "posts".to_string(),
-        ]).unwrap_err();
-        assert!(err.to_string().contains("--using is required"), "err: {err}");
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
+        let err = cmd_rls(
+            &g,
+            &[
+                "policies".to_string(),
+                "create".to_string(),
+                "--project=p1".to_string(),
+                "--name=p1".to_string(),
+                "--command=select".to_string(),
+                "posts".to_string(),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("--using is required"),
+            "err: {err}"
+        );
     }
 
     #[test]
@@ -695,7 +881,7 @@ mod tests {
         let srv = TestServer::start(|_req: &Req| {
             Resp::ok(r#"{"policy":{"name":"write_own","command":"insert","using":"true"}}"#)
         });
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
         let resp: PolicyCreateResponse = c
@@ -714,15 +900,25 @@ mod tests {
     fn policies_create_422_propagates() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(422, r#"{"code":"validation_error","message":"policy already exists"}"#)
+            Resp::status(
+                422,
+                r#"{"code":"validation_error","message":"policy already exists"}"#,
+            )
         });
         let g = flags(&srv.url);
-        let err = cmd_rls(&g, &[
-            "policies".to_string(), "create".to_string(),
-            "--project=p1".to_string(),
-            "--name=dup".to_string(), "--command=all".to_string(), "--using=true".to_string(),
-            "posts".to_string(),
-        ]).unwrap_err();
+        let err = cmd_rls(
+            &g,
+            &[
+                "policies".to_string(),
+                "create".to_string(),
+                "--project=p1".to_string(),
+                "--name=dup".to_string(),
+                "--command=all".to_string(),
+                "--using=true".to_string(),
+                "posts".to_string(),
+            ],
+        )
+        .unwrap_err();
         let ae = crate::error::as_api_error(err.as_ref()).expect("ApiError");
         assert_eq!(ae.http_status, 422);
     }
@@ -741,45 +937,82 @@ mod tests {
             Resp::ok(r#"{"dropped":true,"name":"read_own"}"#)
         });
         let g = flags(&srv.url);
-        cmd_rls(&g, &[
-            "policies".to_string(), "drop".to_string(),
-            "--project=p1".to_string(), "--name=read_own".to_string(), "--yes".to_string(),
-            "posts".to_string(),
-        ]).unwrap();
+        cmd_rls(
+            &g,
+            &[
+                "policies".to_string(),
+                "drop".to_string(),
+                "--project=p1".to_string(),
+                "--name=read_own".to_string(),
+                "--yes".to_string(),
+                "posts".to_string(),
+            ],
+        )
+        .unwrap();
         assert!(*called.lock().unwrap());
     }
 
     #[test]
     fn policies_drop_missing_name_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
-        let err = cmd_rls(&g, &[
-            "policies".to_string(), "drop".to_string(),
-            "--project=p1".to_string(), "--yes".to_string(), "posts".to_string(),
-        ]).unwrap_err();
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
+        let err = cmd_rls(
+            &g,
+            &[
+                "policies".to_string(),
+                "drop".to_string(),
+                "--project=p1".to_string(),
+                "--yes".to_string(),
+                "posts".to_string(),
+            ],
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("--name is required"), "err: {err}");
     }
 
     #[test]
     fn policies_drop_json_requires_yes() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), json: true, ..Default::default() };
-        let err = cmd_rls(&g, &[
-            "policies".to_string(), "drop".to_string(),
-            "--project=p1".to_string(), "--name=read_own".to_string(), "posts".to_string(),
-        ]).unwrap_err();
-        assert!(err.to_string().contains("confirmation required"), "err: {err}");
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            json: true,
+            ..Default::default()
+        };
+        let err = cmd_rls(
+            &g,
+            &[
+                "policies".to_string(),
+                "drop".to_string(),
+                "--project=p1".to_string(),
+                "--name=read_own".to_string(),
+                "posts".to_string(),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("confirmation required"),
+            "err: {err}"
+        );
     }
 
     #[test]
     fn policies_drop_json_shape() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"dropped":true,"name":"read_own"}"#));
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
         let resp: PolicyDropResponse = c
-            .do_json(Method::DELETE, "/v1/projects/p1/tables/posts/policies/read_own", None)
+            .do_json(
+                Method::DELETE,
+                "/v1/projects/p1/tables/posts/policies/read_own",
+                None,
+            )
             .unwrap();
         print_json(&mut buf, &resp).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
@@ -794,11 +1027,18 @@ mod tests {
             Resp::status(404, r#"{"code":"not_found","message":"Policy not found."}"#)
         });
         let g = flags(&srv.url);
-        let err = cmd_rls(&g, &[
-            "policies".to_string(), "drop".to_string(),
-            "--project=p1".to_string(), "--name=ghost".to_string(), "--yes".to_string(),
-            "posts".to_string(),
-        ]).unwrap_err();
+        let err = cmd_rls(
+            &g,
+            &[
+                "policies".to_string(),
+                "drop".to_string(),
+                "--project=p1".to_string(),
+                "--name=ghost".to_string(),
+                "--yes".to_string(),
+                "posts".to_string(),
+            ],
+        )
+        .unwrap_err();
         let ae = crate::error::as_api_error(err.as_ref()).expect("ApiError");
         assert_eq!(ae.http_status, 404);
     }
@@ -808,8 +1048,15 @@ mod tests {
     #[test]
     fn no_project_resolution_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
         let err = cmd_rls(&g, &["enable".to_string(), "posts".to_string()]).unwrap_err();
-        assert!(err.to_string().contains("--project") || err.to_string().contains("basin link"), "err: {err}");
+        assert!(
+            err.to_string().contains("--project") || err.to_string().contains("basin link"),
+            "err: {err}"
+        );
     }
 }

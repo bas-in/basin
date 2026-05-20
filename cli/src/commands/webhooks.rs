@@ -88,12 +88,13 @@ fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
     if !flag_value.is_empty() {
         return Ok(flag_value.to_string());
     }
-    let cwd = std::env::current_dir()
-        .map_err(|e| msg(format!("could not determine cwd: {e}")))?;
+    let cwd = std::env::current_dir().map_err(|e| msg(format!("could not determine cwd: {e}")))?;
     let wp = load_working_project(&cwd)?;
     match wp {
         Some(w) if !w.project_ref.is_empty() => Ok(w.project_ref),
-        _ => Err(msg("--project is required (or run `basin link` to bind this directory)")),
+        _ => Err(msg(
+            "--project is required (or run `basin link` to bind this directory)",
+        )),
     }
 }
 
@@ -167,7 +168,10 @@ fn list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         c.do_json(Method::GET, &format!("/v1/projects/{ref}/webhooks"), None)?;
     if g.json {
         // JSON shape: { webhooks: [ Webhook ] }
-        return print_json(&mut std::io::stdout(), &json!({ "webhooks": resp.webhooks }));
+        return print_json(
+            &mut std::io::stdout(),
+            &json!({ "webhooks": resp.webhooks }),
+        );
     }
     if resp.webhooks.is_empty() {
         println!("(no webhooks)");
@@ -176,7 +180,13 @@ fn list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let mut t = Table::new(g, &["ID", "URL", "EVENTS", "ENABLED", "CREATED"]);
     for wh in &resp.webhooks {
         let enabled = if wh.enabled { "true" } else { "false" };
-        t.row(&[&wh.id, &wh.url, &wh.events.join(","), enabled, &wh.created_at]);
+        t.row(&[
+            &wh.id,
+            &wh.url,
+            &wh.events.join(","),
+            enabled,
+            &wh.created_at,
+        ]);
     }
     t.flush()
 }
@@ -196,7 +206,9 @@ fn create(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let raw_events = m.get_one::<String>("events").cloned().unwrap_or_default();
     let events = parse_events_csv(&raw_events);
     if events.is_empty() {
-        return Err(msg("webhooks create requires --events=<csv> with at least one event type"));
+        return Err(msg(
+            "webhooks create requires --events=<csv> with at least one event type",
+        ));
     }
     let project_flag = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project_flag)?;
@@ -210,7 +222,11 @@ fn create(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         secret: String,
     }
     let body = json!({ "url": raw_url, "events": events });
-    let resp: CreateResp = c.do_json(Method::POST, &format!("/v1/projects/{ref}/webhooks"), Some(body))?;
+    let resp: CreateResp = c.do_json(
+        Method::POST,
+        &format!("/v1/projects/{ref}/webhooks"),
+        Some(body),
+    )?;
     if g.json {
         // JSON shape: { webhook: Webhook, secret: string }
         // secret is reveal-once; subsequent list calls only show secret_prefix.
@@ -252,14 +268,20 @@ fn patch(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     if let Some(ev) = m.get_one::<String>("events").filter(|s| !s.is_empty()) {
         let events = parse_events_csv(ev);
         if events.is_empty() {
-            return Err(msg("webhooks patch --events must contain at least one event type"));
+            return Err(msg(
+                "webhooks patch --events must contain at least one event type",
+            ));
         }
         body.insert("events".into(), json!(events));
     }
     if let Some(enabled_str) = m.get_one::<String>("enabled").filter(|s| !s.is_empty()) {
         match enabled_str.to_lowercase().as_str() {
-            "true" | "1" | "yes" => { body.insert("enabled".into(), json!(true)); }
-            "false" | "0" | "no" => { body.insert("enabled".into(), json!(false)); }
+            "true" | "1" | "yes" => {
+                body.insert("enabled".into(), json!(true));
+            }
+            "false" | "0" | "no" => {
+                body.insert("enabled".into(), json!(false));
+            }
             _ => {
                 return Err(msg(format!(
                     "webhooks patch --enabled must be true or false, got {:?}",
@@ -269,7 +291,9 @@ fn patch(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         }
     }
     if body.is_empty() {
-        return Err(msg("webhooks patch: at least one of --url, --events, --enabled must be provided"));
+        return Err(msg(
+            "webhooks patch: at least one of --url, --events, --enabled must be provided",
+        ));
     }
 
     let c = require_client(g)?;
@@ -299,7 +323,10 @@ fn patch(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     }
     if let Some(wh) = &resp.webhook {
         let enabled = if wh.enabled { "true" } else { "false" };
-        println!("Updated webhook {} (url={}, enabled={})", wh.id, wh.url, enabled);
+        println!(
+            "Updated webhook {} (url={}, enabled={})",
+            wh.id, wh.url, enabled
+        );
     } else {
         println!("Updated webhook {id}.");
     }
@@ -363,10 +390,9 @@ fn redeliver(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         .arg(Arg::new("delivery").long("delivery"))
         .arg(Arg::new("id"));
     let m = parse_or_silent(cmd, args)?;
-    let id = m
-        .get_one::<String>("id")
-        .cloned()
-        .ok_or_else(|| msg("usage: basin webhooks redeliver <id> --delivery=<delivery-id> [--project=<ref>]"))?;
+    let id = m.get_one::<String>("id").cloned().ok_or_else(|| {
+        msg("usage: basin webhooks redeliver <id> --delivery=<delivery-id> [--project=<ref>]")
+    })?;
     let delivery_id = m.get_one::<String>("delivery").cloned().unwrap_or_default();
     if delivery_id.is_empty() {
         return Err(msg("webhooks redeliver requires --delivery=<delivery-id>"));
@@ -383,24 +409,25 @@ fn redeliver(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         status: String,
     }
     let path = format!("/v1/projects/{ref}/webhooks/{id}/redeliver/{delivery_id}");
-    let resp: RedeliverResp = c
-        .do_json(Method::POST, &path, None)
-        .map_err(|e| {
-            if let Some(ae) = as_api_error(e.as_ref()) {
-                if ae.http_status == 404 {
-                    return msg(format!(
-                        "webhook {:?} or delivery {:?} not found on project {:?}",
-                        id, delivery_id, r#ref
-                    ));
-                }
+    let resp: RedeliverResp = c.do_json(Method::POST, &path, None).map_err(|e| {
+        if let Some(ae) = as_api_error(e.as_ref()) {
+            if ae.http_status == 404 {
+                return msg(format!(
+                    "webhook {:?} or delivery {:?} not found on project {:?}",
+                    id, delivery_id, r#ref
+                ));
             }
-            e
-        })?;
+        }
+        e
+    })?;
     if g.json {
         // JSON shape: { delivery_id: string, status: string }
         return print_json(&mut std::io::stdout(), &resp);
     }
-    println!("Redelivered delivery {} (status={})", resp.delivery_id, resp.status);
+    println!(
+        "Redelivered delivery {} (status={})",
+        resp.delivery_id, resp.status
+    );
     Ok(())
 }
 
@@ -427,7 +454,10 @@ fn delete(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
                 id
             )));
         }
-        eprint!("Delete webhook {:?} on project {:?}? This cannot be undone. [y/N] ", id, r#ref);
+        eprint!(
+            "Delete webhook {:?} on project {:?}? This cannot be undone. [y/N] ",
+            id, r#ref
+        );
         let line = read_line()?;
         if line.trim().to_lowercase() != "y" {
             println!("Aborted.");
@@ -472,10 +502,9 @@ fn deliveries(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         .arg(Arg::new("limit").long("limit"))
         .arg(Arg::new("id"));
     let m = parse_or_silent(cmd, args)?;
-    let id = m
-        .get_one::<String>("id")
-        .cloned()
-        .ok_or_else(|| msg("usage: basin webhooks deliveries <id> [--project=<ref>] [--limit=N]"))?;
+    let id = m.get_one::<String>("id").cloned().ok_or_else(|| {
+        msg("usage: basin webhooks deliveries <id> [--project=<ref>] [--limit=N]")
+    })?;
     let limit_str = m
         .get_one::<String>("limit")
         .cloned()
@@ -485,19 +514,20 @@ fn deliveries(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let c = require_client(g)?;
     let q = query_string(&[("limit", &limit_str)]);
     let path = format!("/v1/projects/{ref}/webhooks/{id}/deliveries{q}");
-    let resp: DeliveriesListResp = c
-        .do_json(Method::GET, &path, None)
-        .map_err(|e| {
-            if let Some(ae) = as_api_error(e.as_ref()) {
-                if ae.http_status == 404 {
-                    return msg(format!("webhook {:?} not found on project {:?}", id, r#ref));
-                }
+    let resp: DeliveriesListResp = c.do_json(Method::GET, &path, None).map_err(|e| {
+        if let Some(ae) = as_api_error(e.as_ref()) {
+            if ae.http_status == 404 {
+                return msg(format!("webhook {:?} not found on project {:?}", id, r#ref));
             }
-            e
-        })?;
+        }
+        e
+    })?;
     if g.json {
         // JSON shape: { deliveries: [ WebhookDelivery ] }
-        return print_json(&mut std::io::stdout(), &json!({ "deliveries": resp.deliveries }));
+        return print_json(
+            &mut std::io::stdout(),
+            &json!({ "deliveries": resp.deliveries }),
+        );
     }
     if resp.deliveries.is_empty() {
         println!("(no deliveries)");
@@ -595,7 +625,9 @@ mod tests {
     fn list_populated() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"webhooks":[{"id":"wh1","url":"https://example.com/hook","events":["project.created"],"enabled":true,"created_at":"2026-01-01T00:00:00Z"},{"id":"wh2","url":"https://other.com/hook","events":["table.altered"],"enabled":false,"created_at":"2026-01-02T00:00:00Z"}]}"#)
+            Resp::ok(
+                r#"{"webhooks":[{"id":"wh1","url":"https://example.com/hook","events":["project.created"],"enabled":true,"created_at":"2026-01-01T00:00:00Z"},{"id":"wh2","url":"https://other.com/hook","events":["table.altered"],"enabled":false,"created_at":"2026-01-02T00:00:00Z"}]}"#,
+            )
         });
         let g = flags(&srv.url);
         cmd_webhooks(&g, &["list".into(), "--project=proj1".into()]).unwrap();
@@ -605,13 +637,16 @@ mod tests {
     fn list_json_shape() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"webhooks":[{"id":"wh1","url":"https://example.com/hook","events":["project.created"],"enabled":true}]}"#)
+            Resp::ok(
+                r#"{"webhooks":[{"id":"wh1","url":"https://example.com/hook","events":["project.created"],"enabled":true}]}"#,
+            )
         });
         let g = flags_json(&srv.url);
         let mut out = Vec::new();
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: WebhooksListResp =
-            c.do_json(reqwest::Method::GET, "/v1/projects/p1/webhooks", None).unwrap();
+        let resp: WebhooksListResp = c
+            .do_json(reqwest::Method::GET, "/v1/projects/p1/webhooks", None)
+            .unwrap();
         print_json(&mut out, &json!({ "webhooks": resp.webhooks })).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert!(v["webhooks"].is_array());
@@ -622,7 +657,11 @@ mod tests {
     #[test]
     fn list_no_project_errors() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_webhooks(&g, &["list".into()]).unwrap_err();
         assert!(err.to_string().contains("--project") || err.to_string().contains("link"));
     }
@@ -637,7 +676,9 @@ mod tests {
             assert_eq!(req.path, "/v1/projects/proj1/webhooks");
             let body: serde_json::Value = serde_json::from_str(&req.body).unwrap();
             assert_eq!(body["url"], "https://example.com/hook");
-            Resp::ok(r#"{"webhook":{"id":"wh-new","url":"https://example.com/hook","events":["project.created"],"enabled":true},"secret":"whsec_supersecret1234"}"#)
+            Resp::ok(
+                r#"{"webhook":{"id":"wh-new","url":"https://example.com/hook","events":["project.created"],"enabled":true},"secret":"whsec_supersecret1234"}"#,
+            )
         });
         let g = flags(&srv.url);
         cmd_webhooks(
@@ -655,10 +696,18 @@ mod tests {
     #[test]
     fn create_missing_url_errors() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_webhooks(
             &g,
-            &["create".into(), "--project=proj1".into(), "--events=project.created".into()],
+            &[
+                "create".into(),
+                "--project=proj1".into(),
+                "--events=project.created".into(),
+            ],
         )
         .unwrap_err();
         assert!(err.to_string().contains("--url"));
@@ -667,10 +716,18 @@ mod tests {
     #[test]
     fn create_missing_events_errors() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_webhooks(
             &g,
-            &["create".into(), "--project=proj1".into(), "--url=https://example.com/hook".into()],
+            &[
+                "create".into(),
+                "--project=proj1".into(),
+                "--url=https://example.com/hook".into(),
+            ],
         )
         .unwrap_err();
         assert!(err.to_string().contains("--events"));
@@ -679,7 +736,11 @@ mod tests {
     #[test]
     fn create_empty_events_csv_errors() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_webhooks(
             &g,
             &[
@@ -697,7 +758,9 @@ mod tests {
     fn create_json_shape() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"webhook":{"id":"wh-json","url":"https://example.com/hook","events":["project.created"],"enabled":true},"secret":"whsec_jsontest"}"#)
+            Resp::ok(
+                r#"{"webhook":{"id":"wh-json","url":"https://example.com/hook","events":["project.created"],"enabled":true},"secret":"whsec_jsontest"}"#,
+            )
         });
         let g = flags_json(&srv.url);
         let mut out = Vec::new();
@@ -734,8 +797,10 @@ mod tests {
             assert_eq!(req.path, "/v1/projects/proj1/webhooks/wh1");
             let body: serde_json::Value = serde_json::from_str(&req.body).unwrap();
             assert_eq!(body["url"], "https://new.example.com/hook");
-            assert_eq!(body["enabled"].as_bool().unwrap(), false);
-            Resp::ok(r#"{"webhook":{"id":"wh1","url":"https://new.example.com/hook","events":["project.created"],"enabled":false}}"#)
+            assert!(!body["enabled"].as_bool().unwrap());
+            Resp::ok(
+                r#"{"webhook":{"id":"wh1","url":"https://new.example.com/hook","events":["project.created"],"enabled":false}}"#,
+            )
         });
         let g = flags(&srv.url);
         cmd_webhooks(
@@ -754,10 +819,16 @@ mod tests {
     #[test]
     fn patch_no_fields_errors() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
-        let err =
-            cmd_webhooks(&g, &["patch".into(), "--project=proj1".into(), "wh1".into()])
-                .unwrap_err();
+        let g = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
+        let err = cmd_webhooks(
+            &g,
+            &["patch".into(), "--project=proj1".into(), "wh1".into()],
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("at least one of"));
     }
 
@@ -765,12 +836,20 @@ mod tests {
     fn patch_404() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(404, r#"{"error":{"code":"not_found","message":"webhook not found"}}"#)
+            Resp::status(
+                404,
+                r#"{"error":{"code":"not_found","message":"webhook not found"}}"#,
+            )
         });
         let g = flags(&srv.url);
         let err = cmd_webhooks(
             &g,
-            &["patch".into(), "--project=proj1".into(), "--url=https://x.com/h".into(), "missing".into()],
+            &[
+                "patch".into(),
+                "--project=proj1".into(),
+                "--url=https://x.com/h".into(),
+                "missing".into(),
+            ],
         )
         .unwrap_err();
         assert!(err.to_string().contains("not found"));
@@ -784,7 +863,9 @@ mod tests {
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "POST");
             assert_eq!(req.path, "/v1/projects/proj1/webhooks/wh1/test");
-            Resp::ok(r#"{"delivery_id":"del-001","status_code":200,"delivered_at":"2026-01-01T00:00:00Z"}"#)
+            Resp::ok(
+                r#"{"delivery_id":"del-001","status_code":200,"delivered_at":"2026-01-01T00:00:00Z"}"#,
+            )
         });
         let g = flags(&srv.url);
         cmd_webhooks(&g, &["test".into(), "--project=proj1".into(), "wh1".into()]).unwrap();
@@ -794,16 +875,27 @@ mod tests {
     fn test_json_shape() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"delivery_id":"del-json","status_code":200,"delivered_at":"2026-01-01T00:00:00Z"}"#)
+            Resp::ok(
+                r#"{"delivery_id":"del-json","status_code":200,"delivered_at":"2026-01-01T00:00:00Z"}"#,
+            )
         });
         let g = flags_json(&srv.url);
         let mut out = Vec::new();
 
         #[derive(Serialize, Deserialize)]
-        struct TR { delivery_id: String, status_code: i64, delivered_at: String }
+        struct TR {
+            delivery_id: String,
+            status_code: i64,
+            delivered_at: String,
+        }
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: TR =
-            c.do_json(reqwest::Method::POST, "/v1/projects/proj1/webhooks/wh1/test", None).unwrap();
+        let resp: TR = c
+            .do_json(
+                reqwest::Method::POST,
+                "/v1/projects/proj1/webhooks/wh1/test",
+                None,
+            )
+            .unwrap();
         print_json(&mut out, &resp).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["delivery_id"].as_str().unwrap(), "del-json");
@@ -818,13 +910,21 @@ mod tests {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "POST");
-            assert_eq!(req.path, "/v1/projects/proj1/webhooks/wh1/redeliver/del-001");
+            assert_eq!(
+                req.path,
+                "/v1/projects/proj1/webhooks/wh1/redeliver/del-001"
+            );
             Resp::ok(r#"{"delivery_id":"del-001","status":"queued"}"#)
         });
         let g = flags(&srv.url);
         cmd_webhooks(
             &g,
-            &["redeliver".into(), "--project=proj1".into(), "--delivery=del-001".into(), "wh1".into()],
+            &[
+                "redeliver".into(),
+                "--project=proj1".into(),
+                "--delivery=del-001".into(),
+                "wh1".into(),
+            ],
         )
         .unwrap();
     }
@@ -832,7 +932,11 @@ mod tests {
     #[test]
     fn redeliver_missing_delivery_errors() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_webhooks(
             &g,
             &["redeliver".into(), "--project=proj1".into(), "wh1".into()],
@@ -851,7 +955,10 @@ mod tests {
         let mut out = Vec::new();
 
         #[derive(Serialize, Deserialize)]
-        struct RR { delivery_id: String, status: String }
+        struct RR {
+            delivery_id: String,
+            status: String,
+        }
         let c = crate::client::Client::new(&srv.url, "tok");
         let resp: RR = c
             .do_json(
@@ -879,7 +986,12 @@ mod tests {
         let g = flags(&srv.url);
         cmd_webhooks(
             &g,
-            &["delete".into(), "--project=proj1".into(), "--yes".into(), "wh1".into()],
+            &[
+                "delete".into(),
+                "--project=proj1".into(),
+                "--yes".into(),
+                "wh1".into(),
+            ],
         )
         .unwrap();
     }
@@ -887,7 +999,12 @@ mod tests {
     #[test]
     fn delete_json_requires_yes() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { token: "tok".into(), quiet: true, json: true, ..Default::default() };
+        let g = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            json: true,
+            ..Default::default()
+        };
         let err = cmd_webhooks(
             &g,
             &["delete".into(), "--project=proj1".into(), "wh1".into()],
@@ -899,16 +1016,24 @@ mod tests {
     #[test]
     fn delete_json_shape() {
         let _cfg = with_temp_config_dir();
-        let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"deleted":true,"id":"wh1"}"#)
-        });
+        let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"deleted":true,"id":"wh1"}"#));
         let g = flags_json(&srv.url);
         let mut out = Vec::new();
         #[derive(Serialize)]
-        struct D { deleted: bool, id: String }
-        print_json(&mut out, &D { deleted: true, id: "wh1".into() }).unwrap();
+        struct D {
+            deleted: bool,
+            id: String,
+        }
+        print_json(
+            &mut out,
+            &D {
+                deleted: true,
+                id: "wh1".into(),
+            },
+        )
+        .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(v["deleted"].as_bool().unwrap(), true);
+        assert!(v["deleted"].as_bool().unwrap());
         assert_eq!(v["id"].as_str().unwrap(), "wh1");
         let _ = &g;
     }
@@ -920,24 +1045,41 @@ mod tests {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "GET");
-            assert!(req.path.starts_with("/v1/projects/proj1/webhooks/wh1/deliveries"));
-            Resp::ok(r#"{"deliveries":[{"id":"del-001","status_code":200,"delivered_at":"2026-01-01T00:00:00Z","event":"project.created"},{"id":"del-002","status_code":500,"delivered_at":"2026-01-02T00:00:00Z","event":"table.altered"}]}"#)
+            assert!(req
+                .path
+                .starts_with("/v1/projects/proj1/webhooks/wh1/deliveries"));
+            Resp::ok(
+                r#"{"deliveries":[{"id":"del-001","status_code":200,"delivered_at":"2026-01-01T00:00:00Z","event":"project.created"},{"id":"del-002","status_code":500,"delivered_at":"2026-01-02T00:00:00Z","event":"table.altered"}]}"#,
+            )
         });
         let g = flags(&srv.url);
-        cmd_webhooks(&g, &["deliveries".into(), "--project=proj1".into(), "wh1".into()]).unwrap();
+        cmd_webhooks(
+            &g,
+            &["deliveries".into(), "--project=proj1".into(), "wh1".into()],
+        )
+        .unwrap();
     }
 
     #[test]
     fn deliveries_limit_passthrough() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|req: &Req| {
-            assert!(req.path.contains("limit=25"), "limit not in path: {}", req.path);
+            assert!(
+                req.path.contains("limit=25"),
+                "limit not in path: {}",
+                req.path
+            );
             Resp::ok(r#"{"deliveries":[]}"#)
         });
         let g = flags(&srv.url);
         cmd_webhooks(
             &g,
-            &["deliveries".into(), "--project=proj1".into(), "--limit=25".into(), "wh1".into()],
+            &[
+                "deliveries".into(),
+                "--project=proj1".into(),
+                "--limit=25".into(),
+                "wh1".into(),
+            ],
         )
         .unwrap();
     }
@@ -947,21 +1089,31 @@ mod tests {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"deliveries":[]}"#));
         let g = flags(&srv.url);
-        cmd_webhooks(&g, &["deliveries".into(), "--project=proj1".into(), "wh1".into()]).unwrap();
+        cmd_webhooks(
+            &g,
+            &["deliveries".into(), "--project=proj1".into(), "wh1".into()],
+        )
+        .unwrap();
     }
 
     #[test]
     fn deliveries_json_shape() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"deliveries":[{"id":"del-001","status_code":200,"delivered_at":"2026-01-01T00:00:00Z","event":"project.created"}]}"#)
+            Resp::ok(
+                r#"{"deliveries":[{"id":"del-001","status_code":200,"delivered_at":"2026-01-01T00:00:00Z","event":"project.created"}]}"#,
+            )
         });
         let g = flags_json(&srv.url);
         let mut out = Vec::new();
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: DeliveriesListResp =
-            c.do_json(reqwest::Method::GET, "/v1/projects/proj1/webhooks/wh1/deliveries", None)
-                .unwrap();
+        let resp: DeliveriesListResp = c
+            .do_json(
+                reqwest::Method::GET,
+                "/v1/projects/proj1/webhooks/wh1/deliveries",
+                None,
+            )
+            .unwrap();
         print_json(&mut out, &json!({ "deliveries": resp.deliveries })).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["deliveries"][0]["id"].as_str().unwrap(), "del-001");
@@ -972,12 +1124,17 @@ mod tests {
     fn deliveries_422() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(422, r#"{"error":{"code":"validation_error","message":"invalid limit value"}}"#)
+            Resp::status(
+                422,
+                r#"{"error":{"code":"validation_error","message":"invalid limit value"}}"#,
+            )
         });
         let g = flags(&srv.url);
-        let err =
-            cmd_webhooks(&g, &["deliveries".into(), "--project=proj1".into(), "wh1".into()])
-                .unwrap_err();
+        let err = cmd_webhooks(
+            &g,
+            &["deliveries".into(), "--project=proj1".into(), "wh1".into()],
+        )
+        .unwrap_err();
         let ae = crate::error::as_api_error(err.as_ref()).expect("expected ApiError");
         assert_eq!(ae.http_status, 422);
     }
@@ -987,7 +1144,10 @@ mod tests {
     #[test]
     fn unknown_subcommand_is_silent() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_webhooks(&g, &["frobnicate".into()]).unwrap_err();
         assert!(crate::error::is_silent(err.as_ref()));
     }
@@ -995,7 +1155,10 @@ mod tests {
     #[test]
     fn help_returns_ok() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_webhooks(&g, &["help".into()]).is_ok());
     }
 }

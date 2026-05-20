@@ -71,19 +71,23 @@ fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
     if !flag_value.is_empty() {
         return Ok(flag_value.to_string());
     }
-    let cwd = std::env::current_dir()
-        .map_err(|e| msg(format!("could not determine cwd: {e}")))?;
+    let cwd = std::env::current_dir().map_err(|e| msg(format!("could not determine cwd: {e}")))?;
     let wp = load_working_project(&cwd)?;
     match wp {
         Some(w) if !w.project_ref.is_empty() => Ok(w.project_ref),
-        _ => Err(msg("--project is required (or run `basin link` to bind this directory)")),
+        _ => Err(msg(
+            "--project is required (or run `basin link` to bind this directory)",
+        )),
     }
 }
 
 /// valid_comparator checks whether a comparator string is one of the
 /// allowed values: gt, lt, gte, lte, eq.
 fn valid_comparator(s: &str) -> bool {
-    matches!(s.to_lowercase().as_str(), "gt" | "lt" | "gte" | "lte" | "eq")
+    matches!(
+        s.to_lowercase().as_str(),
+        "gt" | "lt" | "gte" | "lte" | "eq"
+    )
 }
 
 fn silenced_display(r: &AlertRule) -> String {
@@ -115,7 +119,11 @@ const ALERTS_HELP_LINES: &[&str] = &[
 
 pub fn cmd_alerts(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     if args.is_empty() {
-        help_for_command("alerts", "Manage project alert rules and events.", ALERTS_HELP_LINES);
+        help_for_command(
+            "alerts",
+            "Manage project alert rules and events.",
+            ALERTS_HELP_LINES,
+        );
         return Ok(());
     }
     let (sub, rest) = (args[0].as_str(), &args[1..]);
@@ -123,7 +131,11 @@ pub fn cmd_alerts(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         "rules" => cmd_alerts_rules(g, rest),
         "events" => cmd_alerts_events(g, rest),
         "--help" | "-h" | "help" => {
-            help_for_command("alerts", "Manage project alert rules and events.", ALERTS_HELP_LINES);
+            help_for_command(
+                "alerts",
+                "Manage project alert rules and events.",
+                ALERTS_HELP_LINES,
+            );
             Ok(())
         }
         other => {
@@ -174,8 +186,7 @@ fn cmd_alerts_events(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
 // ── alerts rules list ─────────────────────────────────────────────────────────
 
 fn rules_list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
-    let cmd = Command::new("alerts rules list")
-        .arg(Arg::new("project").long("project"));
+    let cmd = Command::new("alerts rules list").arg(Arg::new("project").long("project"));
     let m = parse_or_silent(cmd, args)?;
     let project_flag = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project_flag)?;
@@ -186,7 +197,11 @@ fn rules_list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         #[serde(default)]
         rules: Vec<AlertRule>,
     }
-    let resp: Resp = c.do_json(Method::GET, &format!("/v1/projects/{ref}/alerts/rules"), None)?;
+    let resp: Resp = c.do_json(
+        Method::GET,
+        &format!("/v1/projects/{ref}/alerts/rules"),
+        None,
+    )?;
 
     if g.json {
         // JSON shape: { rules: [ AlertRule ] }
@@ -196,11 +211,30 @@ fn rules_list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         println!("(no alert rules)");
         return Ok(());
     }
-    let mut t = Table::new(g, &["ID", "NAME", "METRIC", "COMPARATOR", "THRESHOLD", "ENABLED", "SILENCED_UNTIL"]);
+    let mut t = Table::new(
+        g,
+        &[
+            "ID",
+            "NAME",
+            "METRIC",
+            "COMPARATOR",
+            "THRESHOLD",
+            "ENABLED",
+            "SILENCED_UNTIL",
+        ],
+    );
     for r in &resp.rules {
         let silenced = silenced_display(r);
         let enabled = if r.enabled { "true" } else { "false" };
-        t.row(&[&r.id, &r.name, &r.metric, &r.comparator, &format!("{}", r.threshold), enabled, &silenced]);
+        t.row(&[
+            &r.id,
+            &r.name,
+            &r.metric,
+            &r.comparator,
+            &format!("{}", r.threshold),
+            enabled,
+            &silenced,
+        ]);
     }
     t.flush()
 }
@@ -225,9 +259,14 @@ fn rules_create(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     if metric.is_empty() {
         return Err(msg("alerts rules create requires --metric=<metric>"));
     }
-    let comparator = m.get_one::<String>("comparator").cloned().unwrap_or_default();
+    let comparator = m
+        .get_one::<String>("comparator")
+        .cloned()
+        .unwrap_or_default();
     if comparator.is_empty() {
-        return Err(msg("alerts rules create requires --comparator=<gt|lt|gte|lte|eq>"));
+        return Err(msg(
+            "alerts rules create requires --comparator=<gt|lt|gte|lte|eq>",
+        ));
     }
     if !valid_comparator(&comparator) {
         return Err(msg(format!(
@@ -236,20 +275,34 @@ fn rules_create(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         )));
     }
 
-    let threshold_str = m.get_one::<String>("threshold").cloned().unwrap_or_default();
+    let threshold_str = m
+        .get_one::<String>("threshold")
+        .cloned()
+        .unwrap_or_default();
     let threshold: f64 = if threshold_str.is_empty() {
         0.0
     } else {
-        threshold_str
-            .parse::<f64>()
-            .map_err(|_| msg(format!("--threshold must be a number, got {:?}", threshold_str)))?
+        threshold_str.parse::<f64>().map_err(|_| {
+            msg(format!(
+                "--threshold must be a number, got {:?}",
+                threshold_str
+            ))
+        })?
     };
 
-    let enabled_str = m.get_one::<String>("enabled").cloned().unwrap_or_else(|| "true".into());
+    let enabled_str = m
+        .get_one::<String>("enabled")
+        .cloned()
+        .unwrap_or_else(|| "true".into());
     let enabled: bool = match enabled_str.to_ascii_lowercase().as_str() {
         "true" | "1" | "yes" => true,
         "false" | "0" | "no" => false,
-        _ => return Err(msg(format!("--enabled must be true or false (got {:?})", enabled_str))),
+        _ => {
+            return Err(msg(format!(
+                "--enabled must be true or false (got {:?})",
+                enabled_str
+            )))
+        }
     };
 
     let project_flag = m.get_one::<String>("project").cloned().unwrap_or_default();
@@ -269,7 +322,11 @@ fn rules_create(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         #[serde(default)]
         rule: Option<AlertRule>,
     }
-    let resp: Resp = c.do_json(Method::POST, &format!("/v1/projects/{ref}/alerts/rules"), Some(body))?;
+    let resp: Resp = c.do_json(
+        Method::POST,
+        &format!("/v1/projects/{ref}/alerts/rules"),
+        Some(body),
+    )?;
 
     if g.json {
         // JSON shape: { rule: AlertRule }
@@ -306,11 +363,18 @@ fn rules_get(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         rule: Option<AlertRule>,
     }
     let resp: Resp = c
-        .do_json(Method::GET, &format!("/v1/projects/{ref}/alerts/rules/{id}"), None)
+        .do_json(
+            Method::GET,
+            &format!("/v1/projects/{ref}/alerts/rules/{id}"),
+            None,
+        )
         .map_err(|e| {
             if let Some(ae) = as_api_error(e.as_ref()) {
                 if ae.http_status == 404 {
-                    return msg(format!("alert rule {:?} not found on project {:?}", id, r#ref));
+                    return msg(format!(
+                        "alert rule {:?} not found on project {:?}",
+                        id, r#ref
+                    ));
                 }
             }
             e
@@ -320,7 +384,9 @@ fn rules_get(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         // JSON shape: { rule: AlertRule }
         return print_json(&mut std::io::stdout(), &json!({ "rule": resp.rule }));
     }
-    let r = resp.rule.ok_or_else(|| msg(format!("alert rule {:?} not found", id)))?;
+    let r = resp
+        .rule
+        .ok_or_else(|| msg(format!("alert rule {:?} not found", id)))?;
     let silenced = silenced_display(&r);
     let enabled = if r.enabled { "true" } else { "false" };
     println!("id:             {}", r.id);
@@ -358,10 +424,16 @@ fn rules_patch(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         body["name"] = json!(name);
     }
     if threshold_set {
-        let threshold_str = m.get_one::<String>("threshold").cloned().unwrap_or_default();
-        let threshold: f64 = threshold_str
-            .parse::<f64>()
-            .map_err(|_| msg(format!("--threshold must be a number, got {:?}", threshold_str)))?;
+        let threshold_str = m
+            .get_one::<String>("threshold")
+            .cloned()
+            .unwrap_or_default();
+        let threshold: f64 = threshold_str.parse::<f64>().map_err(|_| {
+            msg(format!(
+                "--threshold must be a number, got {:?}",
+                threshold_str
+            ))
+        })?;
         body["threshold"] = json!(threshold);
     }
     if let Some(enabled_str) = m.get_one::<String>("enabled") {
@@ -394,11 +466,18 @@ fn rules_patch(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         rule: Option<AlertRule>,
     }
     let resp: Resp = c
-        .do_json(Method::PATCH, &format!("/v1/projects/{ref}/alerts/rules/{id}"), Some(body))
+        .do_json(
+            Method::PATCH,
+            &format!("/v1/projects/{ref}/alerts/rules/{id}"),
+            Some(body),
+        )
         .map_err(|e| {
             if let Some(ae) = as_api_error(e.as_ref()) {
                 if ae.http_status == 404 {
-                    return msg(format!("alert rule {:?} not found on project {:?}", id, r#ref));
+                    return msg(format!(
+                        "alert rule {:?} not found on project {:?}",
+                        id, r#ref
+                    ));
                 }
             }
             e
@@ -441,7 +520,7 @@ fn rules_delete(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
             id, r#ref
         );
         let line = read_line()?;
-        if line.trim().to_ascii_lowercase() != "y" {
+        if !line.trim().eq_ignore_ascii_case("y") {
             println!("Aborted.");
             return Ok(());
         }
@@ -455,11 +534,18 @@ fn rules_delete(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         id: String,
     }
     let resp: Resp = c
-        .do_json(Method::DELETE, &format!("/v1/projects/{ref}/alerts/rules/{id}"), None)
+        .do_json(
+            Method::DELETE,
+            &format!("/v1/projects/{ref}/alerts/rules/{id}"),
+            None,
+        )
         .map_err(|e| {
             if let Some(ae) = as_api_error(e.as_ref()) {
                 if ae.http_status == 404 {
-                    return msg(format!("alert rule {:?} not found on project {:?}", id, r#ref));
+                    return msg(format!(
+                        "alert rule {:?} not found on project {:?}",
+                        id, r#ref
+                    ));
                 }
             }
             e
@@ -481,10 +567,9 @@ fn rules_silence(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         .arg(Arg::new("until").long("until"))
         .arg(Arg::new("id"));
     let m = parse_or_silent(cmd, args)?;
-    let id = m
-        .get_one::<String>("id")
-        .cloned()
-        .ok_or_else(|| msg("usage: basin alerts rules silence <id> --until=<rfc3339> [--project=<ref>]"))?;
+    let id = m.get_one::<String>("id").cloned().ok_or_else(|| {
+        msg("usage: basin alerts rules silence <id> --until=<rfc3339> [--project=<ref>]")
+    })?;
     let until = m.get_one::<String>("until").cloned().unwrap_or_default();
     if until.is_empty() {
         return Err(msg("alerts rules silence requires --until=<rfc3339>"));
@@ -510,11 +595,18 @@ fn rules_silence(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     }
     let body = json!({ "until": until });
     let resp: Resp = c
-        .do_json(Method::POST, &format!("/v1/projects/{ref}/alerts/rules/{id}/silence"), Some(body))
+        .do_json(
+            Method::POST,
+            &format!("/v1/projects/{ref}/alerts/rules/{id}/silence"),
+            Some(body),
+        )
         .map_err(|e| {
             if let Some(ae) = as_api_error(e.as_ref()) {
                 if ae.http_status == 404 {
-                    return msg(format!("alert rule {:?} not found on project {:?}", id, r#ref));
+                    return msg(format!(
+                        "alert rule {:?} not found on project {:?}",
+                        id, r#ref
+                    ));
                 }
             }
             e
@@ -549,11 +641,18 @@ fn rules_unsilence(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         silenced: bool,
     }
     let resp: Resp = c
-        .do_json(Method::POST, &format!("/v1/projects/{ref}/alerts/rules/{id}/unsilence"), None)
+        .do_json(
+            Method::POST,
+            &format!("/v1/projects/{ref}/alerts/rules/{id}/unsilence"),
+            None,
+        )
         .map_err(|e| {
             if let Some(ae) = as_api_error(e.as_ref()) {
                 if ae.http_status == 404 {
-                    return msg(format!("alert rule {:?} not found on project {:?}", id, r#ref));
+                    return msg(format!(
+                        "alert rule {:?} not found on project {:?}",
+                        id, r#ref
+                    ));
                 }
             }
             e
@@ -578,7 +677,10 @@ fn events_list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let m = parse_or_silent(cmd, args)?;
     let project_flag = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project_flag)?;
-    let limit = m.get_one::<String>("limit").cloned().unwrap_or_else(|| "50".into());
+    let limit = m
+        .get_one::<String>("limit")
+        .cloned()
+        .unwrap_or_else(|| "50".into());
     let since = m.get_one::<String>("since").cloned().unwrap_or_default();
     let c = require_client(g)?;
 
@@ -588,8 +690,11 @@ fn events_list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         #[serde(default)]
         events: Vec<AlertEvent>,
     }
-    let resp: Resp =
-        c.do_json(Method::GET, &format!("/v1/projects/{ref}/alerts/events{q}"), None)?;
+    let resp: Resp = c.do_json(
+        Method::GET,
+        &format!("/v1/projects/{ref}/alerts/events{q}"),
+        None,
+    )?;
 
     if g.json {
         // JSON shape: { events: [ AlertEvent ] }
@@ -602,7 +707,13 @@ fn events_list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let mut t = Table::new(g, &["ID", "RULE_ID", "FIRED_AT", "RESOLVED_AT", "VALUE"]);
     for ev in &resp.events {
         let resolved = resolved_display(ev);
-        t.row(&[&ev.id, &ev.rule_id, &ev.fired_at, &resolved, &format!("{}", ev.value)]);
+        t.row(&[
+            &ev.id,
+            &ev.rule_id,
+            &ev.fired_at,
+            &resolved,
+            &format!("{}", ev.value),
+        ]);
     }
     t.flush()
 }
@@ -640,9 +751,7 @@ mod tests {
     }
 
     fn sample_event_json(id: &str) -> String {
-        format!(
-            r#"{{"id":"{id}","rule_id":"r1","fired_at":"2026-05-01T12:00:00Z","value":95.5}}"#
-        )
+        format!(r#"{{"id":"{id}","rule_id":"r1","fired_at":"2026-05-01T12:00:00Z","value":95.5}}"#)
     }
 
     // ── dispatcher ─────────────────────────────────────────────────────────
@@ -650,21 +759,30 @@ mod tests {
     #[test]
     fn no_args_shows_help_ok() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_alerts(&g, &[]).is_ok());
     }
 
     #[test]
     fn help_returns_ok() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_alerts(&g, &["help".to_string()]).is_ok());
     }
 
     #[test]
     fn unknown_subcommand_is_silent_error() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_alerts(&g, &["frobnicate".to_string()]).unwrap_err();
         assert!(crate::error::is_silent(err.as_ref()));
     }
@@ -681,9 +799,16 @@ mod tests {
         };
         let err = cmd_alerts(
             &g,
-            &["rules".into(), "create".into(), "--project=proj1".into(), "--metric=cpu".into(),
-              "--threshold=90".into(), "--comparator=gt".into()],
-        ).unwrap_err();
+            &[
+                "rules".into(),
+                "create".into(),
+                "--project=proj1".into(),
+                "--metric=cpu".into(),
+                "--threshold=90".into(),
+                "--comparator=gt".into(),
+            ],
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("--name"), "err={err}");
     }
 
@@ -697,9 +822,16 @@ mod tests {
         };
         let err = cmd_alerts(
             &g,
-            &["rules".into(), "create".into(), "--project=proj1".into(), "--name=high-cpu".into(),
-              "--threshold=90".into(), "--comparator=gt".into()],
-        ).unwrap_err();
+            &[
+                "rules".into(),
+                "create".into(),
+                "--project=proj1".into(),
+                "--name=high-cpu".into(),
+                "--threshold=90".into(),
+                "--comparator=gt".into(),
+            ],
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("--metric"), "err={err}");
     }
 
@@ -713,9 +845,16 @@ mod tests {
         };
         let err = cmd_alerts(
             &g,
-            &["rules".into(), "create".into(), "--project=proj1".into(), "--name=high-cpu".into(),
-              "--metric=cpu".into(), "--threshold=90".into()],
-        ).unwrap_err();
+            &[
+                "rules".into(),
+                "create".into(),
+                "--project=proj1".into(),
+                "--name=high-cpu".into(),
+                "--metric=cpu".into(),
+                "--threshold=90".into(),
+            ],
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("--comparator"), "err={err}");
     }
 
@@ -729,9 +868,17 @@ mod tests {
         };
         let err = cmd_alerts(
             &g,
-            &["rules".into(), "create".into(), "--project=proj1".into(), "--name=high-cpu".into(),
-              "--metric=cpu".into(), "--threshold=90".into(), "--comparator=neq".into()],
-        ).unwrap_err();
+            &[
+                "rules".into(),
+                "create".into(),
+                "--project=proj1".into(),
+                "--name=high-cpu".into(),
+                "--metric=cpu".into(),
+                "--threshold=90".into(),
+                "--comparator=neq".into(),
+            ],
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("neq") && err.to_string().contains("comparator"),
             "err={err}"
@@ -750,8 +897,14 @@ mod tests {
         };
         let err = cmd_alerts(
             &g,
-            &["rules".into(), "silence".into(), "--project=proj1".into(), "rule-1".into()],
-        ).unwrap_err();
+            &[
+                "rules".into(),
+                "silence".into(),
+                "--project=proj1".into(),
+                "rule-1".into(),
+            ],
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("--until"), "err={err}");
     }
 
@@ -765,9 +918,15 @@ mod tests {
         };
         let err = cmd_alerts(
             &g,
-            &["rules".into(), "silence".into(), "--project=proj1".into(),
-              "--until=not-a-timestamp".into(), "rule-1".into()],
-        ).unwrap_err();
+            &[
+                "rules".into(),
+                "silence".into(),
+                "--project=proj1".into(),
+                "--until=not-a-timestamp".into(),
+                "rule-1".into(),
+            ],
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("RFC3339") || err.to_string().contains("invalid"),
             "err={err}"
@@ -789,7 +948,11 @@ mod tests {
             ))
         });
         let g = flags(&srv.url);
-        cmd_alerts(&g, &["rules".into(), "list".into(), "--project=proj1".into()]).unwrap();
+        cmd_alerts(
+            &g,
+            &["rules".into(), "list".into(), "--project=proj1".into()],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -797,7 +960,11 @@ mod tests {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"rules":[]}"#));
         let g = flags(&srv.url);
-        cmd_alerts(&g, &["rules".into(), "list".into(), "--project=proj1".into()]).unwrap();
+        cmd_alerts(
+            &g,
+            &["rules".into(), "list".into(), "--project=proj1".into()],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -806,13 +973,22 @@ mod tests {
         let srv = TestServer::start(|_req: &Req| {
             Resp::ok(format!(r#"{{"rules":[{}]}}"#, sample_rule_json("r1")))
         });
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
 
         #[derive(Deserialize)]
-        struct R { #[serde(default)] rules: Vec<AlertRule> }
+        struct R {
+            #[serde(default)]
+            rules: Vec<AlertRule>,
+        }
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: R = c.do_json(reqwest::Method::GET, "/v1/projects/proj1/alerts/rules", None).unwrap();
+        let resp: R = c
+            .do_json(
+                reqwest::Method::GET,
+                "/v1/projects/proj1/alerts/rules",
+                None,
+            )
+            .unwrap();
         print_json(&mut buf, &json!({ "rules": resp.rules })).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         let rules = v["rules"].as_array().unwrap();
@@ -849,10 +1025,17 @@ mod tests {
         let g = flags(&srv.url);
         cmd_alerts(
             &g,
-            &["rules".into(), "create".into(), "--project=proj1".into(),
-              "--name=high-cpu".into(), "--metric=cpu_pct".into(),
-              "--threshold=90".into(), "--comparator=gt".into()],
-        ).unwrap();
+            &[
+                "rules".into(),
+                "create".into(),
+                "--project=proj1".into(),
+                "--name=high-cpu".into(),
+                "--metric=cpu_pct".into(),
+                "--threshold=90".into(),
+                "--comparator=gt".into(),
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -861,11 +1044,14 @@ mod tests {
         let srv = TestServer::start(|_req: &Req| {
             Resp::ok(format!(r#"{{"rule":{}}}"#, sample_rule_json("r-json")))
         });
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
 
         #[derive(Deserialize)]
-        struct R { #[serde(default)] rule: Option<AlertRule> }
+        struct R {
+            #[serde(default)]
+            rule: Option<AlertRule>,
+        }
         let c = crate::client::Client::new(&srv.url, "tok");
         let resp: R = c.do_json(
             reqwest::Method::POST,
@@ -888,7 +1074,16 @@ mod tests {
             Resp::ok(format!(r#"{{"rule":{}}}"#, sample_rule_json("r1")))
         });
         let g = flags(&srv.url);
-        cmd_alerts(&g, &["rules".into(), "get".into(), "--project=proj1".into(), "r1".into()]).unwrap();
+        cmd_alerts(
+            &g,
+            &[
+                "rules".into(),
+                "get".into(),
+                "--project=proj1".into(),
+                "r1".into(),
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -900,8 +1095,14 @@ mod tests {
         let g = flags(&srv.url);
         let err = cmd_alerts(
             &g,
-            &["rules".into(), "get".into(), "--project=proj1".into(), "missing".into()],
-        ).unwrap_err();
+            &[
+                "rules".into(),
+                "get".into(),
+                "--project=proj1".into(),
+                "missing".into(),
+            ],
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("not found"), "err={err}");
     }
 
@@ -915,15 +1116,22 @@ mod tests {
             assert_eq!(req.path, "/v1/projects/proj1/alerts/rules/r1");
             let body: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
             assert_eq!(body["name"].as_str().unwrap_or(""), "renamed");
-            assert_eq!(body["enabled"].as_bool().unwrap_or(true), false);
+            assert!(!body["enabled"].as_bool().unwrap_or(true));
             Resp::ok(format!(r#"{{"rule":{}}}"#, sample_rule_json("r1")))
         });
         let g = flags(&srv.url);
         cmd_alerts(
             &g,
-            &["rules".into(), "patch".into(), "--project=proj1".into(),
-              "--name=renamed".into(), "--enabled=false".into(), "r1".into()],
-        ).unwrap();
+            &[
+                "rules".into(),
+                "patch".into(),
+                "--project=proj1".into(),
+                "--name=renamed".into(),
+                "--enabled=false".into(),
+                "r1".into(),
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -936,8 +1144,14 @@ mod tests {
         };
         let err = cmd_alerts(
             &g,
-            &["rules".into(), "patch".into(), "--project=proj1".into(), "r1".into()],
-        ).unwrap_err();
+            &[
+                "rules".into(),
+                "patch".into(),
+                "--project=proj1".into(),
+                "r1".into(),
+            ],
+        )
+        .unwrap_err();
         assert!(!err.to_string().is_empty());
     }
 
@@ -945,14 +1159,23 @@ mod tests {
     fn rules_patch_403_propagates_as_api_error() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(403, r#"{"code":"forbidden","message":"insufficient permissions"}"#)
+            Resp::status(
+                403,
+                r#"{"code":"forbidden","message":"insufficient permissions"}"#,
+            )
         });
         let g = flags(&srv.url);
         let err = cmd_alerts(
             &g,
-            &["rules".into(), "patch".into(), "--project=proj1".into(),
-              "--name=rename".into(), "r1".into()],
-        ).unwrap_err();
+            &[
+                "rules".into(),
+                "patch".into(),
+                "--project=proj1".into(),
+                "--name=rename".into(),
+                "r1".into(),
+            ],
+        )
+        .unwrap_err();
         let ae = crate::error::as_api_error(err.as_ref()).expect("expected ApiError");
         assert_eq!(ae.http_status, 403);
     }
@@ -970,21 +1193,38 @@ mod tests {
         let g = flags(&srv.url);
         cmd_alerts(
             &g,
-            &["rules".into(), "delete".into(), "--project=proj1".into(), "--yes".into(), "r1".into()],
-        ).unwrap();
+            &[
+                "rules".into(),
+                "delete".into(),
+                "--project=proj1".into(),
+                "--yes".into(),
+                "r1".into(),
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
     fn rules_delete_json_shape() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"deleted":true,"id":"r1"}"#));
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
 
         #[derive(Deserialize, Serialize)]
-        struct D { deleted: bool, #[serde(default)] id: String }
+        struct D {
+            deleted: bool,
+            #[serde(default)]
+            id: String,
+        }
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: D = c.do_json(reqwest::Method::DELETE, "/v1/projects/proj1/alerts/rules/r1", None).unwrap();
+        let resp: D = c
+            .do_json(
+                reqwest::Method::DELETE,
+                "/v1/projects/proj1/alerts/rules/r1",
+                None,
+            )
+            .unwrap();
         print_json(&mut buf, &resp).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert!(v["deleted"].as_bool().unwrap());
@@ -1006,9 +1246,15 @@ mod tests {
         let g = flags(&srv.url);
         cmd_alerts(
             &g,
-            &["rules".into(), "silence".into(), "--project=proj1".into(),
-              "--until=2026-12-31T00:00:00Z".into(), "r1".into()],
-        ).unwrap();
+            &[
+                "rules".into(),
+                "silence".into(),
+                "--project=proj1".into(),
+                "--until=2026-12-31T00:00:00Z".into(),
+                "r1".into(),
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1017,19 +1263,27 @@ mod tests {
         let srv = TestServer::start(|_req: &Req| {
             Resp::ok(r#"{"silenced_until":"2026-12-31T00:00:00Z"}"#)
         });
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
         #[derive(Deserialize, Serialize)]
-        struct S { #[serde(default)] silenced_until: String }
-        let resp: S = c.do_json(
-            reqwest::Method::POST,
-            "/v1/projects/proj1/alerts/rules/r1/silence",
-            Some(json!({"until":"2026-12-31T00:00:00Z"})),
-        ).unwrap();
+        struct S {
+            #[serde(default)]
+            silenced_until: String,
+        }
+        let resp: S = c
+            .do_json(
+                reqwest::Method::POST,
+                "/v1/projects/proj1/alerts/rules/r1/silence",
+                Some(json!({"until":"2026-12-31T00:00:00Z"})),
+            )
+            .unwrap();
         print_json(&mut buf, &resp).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-        assert_eq!(v["silenced_until"].as_str().unwrap(), "2026-12-31T00:00:00Z");
+        assert_eq!(
+            v["silenced_until"].as_str().unwrap(),
+            "2026-12-31T00:00:00Z"
+        );
     }
 
     // ── alerts rules unsilence ──────────────────────────────────────────────
@@ -1045,8 +1299,14 @@ mod tests {
         let g = flags(&srv.url);
         cmd_alerts(
             &g,
-            &["rules".into(), "unsilence".into(), "--project=proj1".into(), "r1".into()],
-        ).unwrap();
+            &[
+                "rules".into(),
+                "unsilence".into(),
+                "--project=proj1".into(),
+                "r1".into(),
+            ],
+        )
+        .unwrap();
     }
 
     // ── alerts events list ──────────────────────────────────────────────────
@@ -1056,7 +1316,11 @@ mod tests {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "GET");
-            assert!(req.path.contains("/v1/projects/proj1/alerts/events"), "path={}", req.path);
+            assert!(
+                req.path.contains("/v1/projects/proj1/alerts/events"),
+                "path={}",
+                req.path
+            );
             Resp::ok(format!(
                 r#"{{"events":[{},{}]}}"#,
                 sample_event_json("e1"),
@@ -1064,7 +1328,11 @@ mod tests {
             ))
         });
         let g = flags(&srv.url);
-        cmd_alerts(&g, &["events".into(), "list".into(), "--project=proj1".into()]).unwrap();
+        cmd_alerts(
+            &g,
+            &["events".into(), "list".into(), "--project=proj1".into()],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1078,9 +1346,15 @@ mod tests {
         let g = flags(&srv.url);
         cmd_alerts(
             &g,
-            &["events".into(), "list".into(), "--project=proj1".into(),
-              "--limit=10".into(), "--since=2026-01-01T00:00:00Z".into()],
-        ).unwrap();
+            &[
+                "events".into(),
+                "list".into(),
+                "--project=proj1".into(),
+                "--limit=10".into(),
+                "--since=2026-01-01T00:00:00Z".into(),
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1088,7 +1362,11 @@ mod tests {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"events":[]}"#));
         let g = flags(&srv.url);
-        cmd_alerts(&g, &["events".into(), "list".into(), "--project=proj1".into()]).unwrap();
+        cmd_alerts(
+            &g,
+            &["events".into(), "list".into(), "--project=proj1".into()],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1097,12 +1375,21 @@ mod tests {
         let srv = TestServer::start(|_req: &Req| {
             Resp::ok(format!(r#"{{"events":[{}]}}"#, sample_event_json("e1")))
         });
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
         #[derive(Deserialize)]
-        struct R { #[serde(default)] events: Vec<AlertEvent> }
-        let resp: R = c.do_json(reqwest::Method::GET, "/v1/projects/proj1/alerts/events", None).unwrap();
+        struct R {
+            #[serde(default)]
+            events: Vec<AlertEvent>,
+        }
+        let resp: R = c
+            .do_json(
+                reqwest::Method::GET,
+                "/v1/projects/proj1/alerts/events",
+                None,
+            )
+            .unwrap();
         print_json(&mut buf, &json!({ "events": resp.events })).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         let events = v["events"].as_array().unwrap();
@@ -1114,13 +1401,17 @@ mod tests {
     fn events_list_422_propagates_as_api_error() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(422, r#"{"code":"validation_error","message":"invalid since value"}"#)
+            Resp::status(
+                422,
+                r#"{"code":"validation_error","message":"invalid since value"}"#,
+            )
         });
         let g = flags(&srv.url);
         let err = cmd_alerts(
             &g,
             &["events".into(), "list".into(), "--project=proj1".into()],
-        ).unwrap_err();
+        )
+        .unwrap_err();
         let ae = crate::error::as_api_error(err.as_ref()).expect("expected ApiError");
         assert_eq!(ae.http_status, 422);
     }

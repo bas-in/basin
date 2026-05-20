@@ -99,13 +99,22 @@ fn list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         return Err(msg("--project is required"));
     }
     let c = require_client(g)?;
-    let resp: SnapshotsListResp =
-        c.do_json(Method::GET, &format!("/v1/projects/{project}/backups/snapshots"), None)?;
+    let resp: SnapshotsListResp = c.do_json(
+        Method::GET,
+        &format!("/v1/projects/{project}/backups/snapshots"),
+        None,
+    )?;
     if g.json {
         // JSON shape: { snapshots: [ Snapshot ] }
-        return print_json(&mut std::io::stdout(), &json!({ "snapshots": resp.snapshots }));
+        return print_json(
+            &mut std::io::stdout(),
+            &json!({ "snapshots": resp.snapshots }),
+        );
     }
-    let mut t = Table::new(g, &["ID", "ORIGIN", "STATUS", "CREATED", "SIZE", "DESCRIPTION"]);
+    let mut t = Table::new(
+        g,
+        &["ID", "ORIGIN", "STATUS", "CREATED", "SIZE", "DESCRIPTION"],
+    );
     for s in &resp.snapshots {
         t.row(&[
             &s.id,
@@ -270,14 +279,22 @@ mod tests {
     #[test]
     fn no_subcommand_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
         assert!(cmd_snapshots(&g, &[]).is_err());
     }
 
     #[test]
     fn unknown_subcommand_is_silent_error() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
         let err = cmd_snapshots(&g, &["frobnicate".to_string()]).unwrap_err();
         assert!(crate::error::is_silent(err.as_ref()));
     }
@@ -285,7 +302,11 @@ mod tests {
     #[test]
     fn help_returns_ok() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
         assert!(cmd_snapshots(&g, &["help".to_string()]).is_ok());
     }
 
@@ -294,7 +315,11 @@ mod tests {
     #[test]
     fn list_missing_project_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
         let err = cmd_snapshots(&g, &["list".to_string()]).unwrap_err();
         assert!(err.to_string().contains("--project"));
     }
@@ -305,7 +330,9 @@ mod tests {
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "GET");
             assert_eq!(req.path, "/v1/projects/p1/backups/snapshots");
-            Resp::ok(r#"{"snapshots":[{"id":"snap-1","origin":"manual","status":"ready","created_at":"2026-01-01T00:00:00Z","size_bytes":1024,"description":"before-rls"}]}"#)
+            Resp::ok(
+                r#"{"snapshots":[{"id":"snap-1","origin":"manual","status":"ready","created_at":"2026-01-01T00:00:00Z","size_bytes":1024,"description":"before-rls"}]}"#,
+            )
         });
         let g = flags(&srv.url);
         cmd_snapshots(&g, &["list".to_string(), "--project=p1".to_string()]).unwrap();
@@ -315,14 +342,21 @@ mod tests {
     fn list_json_shape() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"snapshots":[{"id":"snap-j","origin":"manual","status":"ready","created_at":"2026-01-01T00:00:00Z","size_bytes":512,"description":"json-test"}]}"#)
+            Resp::ok(
+                r#"{"snapshots":[{"id":"snap-j","origin":"manual","status":"ready","created_at":"2026-01-01T00:00:00Z","size_bytes":512,"description":"json-test"}]}"#,
+            )
         });
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         // Capture is done by checking no error; JSON parsing is the assertion.
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: SnapshotsListResp =
-            c.do_json(reqwest::Method::GET, "/v1/projects/p1/backups/snapshots", None).unwrap();
+        let resp: SnapshotsListResp = c
+            .do_json(
+                reqwest::Method::GET,
+                "/v1/projects/p1/backups/snapshots",
+                None,
+            )
+            .unwrap();
         print_json(&mut buf, &json!({ "snapshots": resp.snapshots })).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         let snaps = v["snapshots"].as_array().unwrap();
@@ -335,7 +369,10 @@ mod tests {
     fn list_server_error_propagates() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(404, r#"{"code":"not_found","message":"Project not found."}"#)
+            Resp::status(
+                404,
+                r#"{"code":"not_found","message":"Project not found."}"#,
+            )
         });
         let g = flags(&srv.url);
         let err = cmd_snapshots(&g, &["list".to_string(), "--project=p1".to_string()]).unwrap_err();
@@ -348,7 +385,11 @@ mod tests {
     #[test]
     fn create_missing_project_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
         let err = cmd_snapshots(&g, &["create".to_string()]).unwrap_err();
         assert!(err.to_string().contains("--project"));
     }
@@ -366,7 +407,11 @@ mod tests {
         let g = flags(&srv.url);
         cmd_snapshots(
             &g,
-            &["create".to_string(), "--project=p1".to_string(), "--name=before-rls".to_string()],
+            &[
+                "create".to_string(),
+                "--project=p1".to_string(),
+                "--name=before-rls".to_string(),
+            ],
         )
         .unwrap();
     }
@@ -390,11 +435,16 @@ mod tests {
         let srv = TestServer::start(|_req: &Req| {
             Resp::ok(r#"{"snapshot":{"id":"snap-j","status":"pending"},"engine_msg":"ok"}"#)
         });
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: serde_json::Value =
-            c.do_json(reqwest::Method::POST, "/v1/projects/p1/backups/snapshots", Some(json!({}))).unwrap();
+        let resp: serde_json::Value = c
+            .do_json(
+                reqwest::Method::POST,
+                "/v1/projects/p1/backups/snapshots",
+                Some(json!({})),
+            )
+            .unwrap();
         print_json(&mut buf, &resp).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert_eq!(v["snapshot"]["id"].as_str().unwrap(), "snap-j");
@@ -408,11 +458,8 @@ mod tests {
             Resp::status(500, r#"{"code":"internal","message":"engine error"}"#)
         });
         let g = flags(&srv.url);
-        let err = cmd_snapshots(
-            &g,
-            &["create".to_string(), "--project=p1".to_string()],
-        )
-        .unwrap_err();
+        let err =
+            cmd_snapshots(&g, &["create".to_string(), "--project=p1".to_string()]).unwrap_err();
         let ae = crate::error::as_api_error(err.as_ref()).expect("expected ApiError");
         assert_eq!(ae.http_status, 500);
     }
@@ -422,10 +469,18 @@ mod tests {
     #[test]
     fn restore_missing_id_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
         let err = cmd_snapshots(
             &g,
-            &["restore".to_string(), "--project=p1".to_string(), "--yes".to_string()],
+            &[
+                "restore".to_string(),
+                "--project=p1".to_string(),
+                "--yes".to_string(),
+            ],
         )
         .unwrap_err();
         assert!(err.to_string().contains("usage:"));
@@ -434,10 +489,18 @@ mod tests {
     #[test]
     fn restore_missing_project_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
         let err = cmd_snapshots(
             &g,
-            &["restore".to_string(), "snap-1".to_string(), "--yes".to_string()],
+            &[
+                "restore".to_string(),
+                "snap-1".to_string(),
+                "--yes".to_string(),
+            ],
         )
         .unwrap_err();
         assert!(err.to_string().contains("--project"));
@@ -457,7 +520,12 @@ mod tests {
         let g = flags(&srv.url);
         cmd_snapshots(
             &g,
-            &["restore".to_string(), "snap-1".to_string(), "--project=p1".to_string(), "--yes".to_string()],
+            &[
+                "restore".to_string(),
+                "snap-1".to_string(),
+                "--project=p1".to_string(),
+                "--yes".to_string(),
+            ],
         )
         .unwrap();
     }
@@ -468,7 +536,7 @@ mod tests {
         let srv = TestServer::start(|_req: &Req| {
             Resp::ok(r#"{"restore":{"id":"r-j","status":"pending"}}"#)
         });
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
         let resp: serde_json::Value = c
@@ -487,12 +555,20 @@ mod tests {
     fn restore_server_409_propagates() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(409, r#"{"code":"conflict","message":"restore in progress"}"#)
+            Resp::status(
+                409,
+                r#"{"code":"conflict","message":"restore in progress"}"#,
+            )
         });
         let g = flags(&srv.url);
         let err = cmd_snapshots(
             &g,
-            &["restore".to_string(), "snap-1".to_string(), "--project=p1".to_string(), "--yes".to_string()],
+            &[
+                "restore".to_string(),
+                "snap-1".to_string(),
+                "--project=p1".to_string(),
+                "--yes".to_string(),
+            ],
         )
         .unwrap_err();
         let ae = crate::error::as_api_error(err.as_ref()).expect("expected ApiError");

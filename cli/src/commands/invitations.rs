@@ -47,11 +47,7 @@ struct InvitationsListResp {
 
 pub fn cmd_invitations(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let (sub, rest) = match args.split_first() {
-        None => {
-            return Err(msg(
-                "usage: basin invitations (list | resend | revoke) ...",
-            ))
-        }
+        None => return Err(msg("usage: basin invitations (list | resend | revoke) ...")),
         Some((s, r)) => (s.as_str(), r),
     };
     match sub {
@@ -195,8 +191,11 @@ fn revoke(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         revoked: bool,
         id: String,
     }
-    let resp: RevokeResp =
-        c.do_json(Method::DELETE, &format!("/v1/orgs/{org}/invitations/{id}"), None)?;
+    let resp: RevokeResp = c.do_json(
+        Method::DELETE,
+        &format!("/v1/orgs/{org}/invitations/{id}"),
+        None,
+    )?;
     if g.json {
         // JSON shape: { "revoked": true, "id": "..." }
         return print_json(&mut std::io::stdout(), &resp);
@@ -268,7 +267,11 @@ mod tests {
     #[test]
     fn list_missing_org() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_invitations(&g0, &["list".into()]);
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("--org"));
@@ -316,7 +319,10 @@ mod tests {
     #[test]
     fn list_403() {
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(403, r#"{"error":{"code":"forbidden","message":"Insufficient permissions."}}"#)
+            Resp::status(
+                403,
+                r#"{"error":{"code":"forbidden","message":"Insufficient permissions."}}"#,
+            )
         });
         let _cfg = with_temp_config_dir();
         let err = cmd_invitations(&g(&srv), &["list".into(), "--org=acme".into()]);
@@ -346,7 +352,11 @@ mod tests {
     #[test]
     fn resend_missing_id() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_invitations(&g0, &["resend".into(), "--org=acme".into()]);
         assert!(err.is_err());
     }
@@ -354,7 +364,11 @@ mod tests {
     #[test]
     fn resend_missing_org() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_invitations(&g0, &["resend".into(), "inv-1".into()]);
         assert!(err.is_err());
     }
@@ -365,8 +379,18 @@ mod tests {
         let _cfg = with_temp_config_dir();
         let mut out = Vec::new();
         #[derive(Serialize)]
-        struct R { resent: bool, id: String }
-        print_json(&mut out, &R { resent: true, id: "inv-1".into() }).unwrap();
+        struct R {
+            resent: bool,
+            id: String,
+        }
+        print_json(
+            &mut out,
+            &R {
+                resent: true,
+                id: "inv-1".into(),
+            },
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed["resent"], true);
         assert_eq!(parsed["id"], "inv-1");
@@ -376,7 +400,10 @@ mod tests {
     #[test]
     fn resend_404() {
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(404, r#"{"error":{"code":"not_found","message":"Invitation not found."}}"#)
+            Resp::status(
+                404,
+                r#"{"error":{"code":"not_found","message":"Invitation not found."}}"#,
+            )
         });
         let _cfg = with_temp_config_dir();
         let err = cmd_invitations(
@@ -401,7 +428,12 @@ mod tests {
         let _cfg = with_temp_config_dir();
         let err = cmd_invitations(
             &g(&srv),
-            &["revoke".into(), "--org=acme".into(), "--yes".into(), "inv-1".into()],
+            &[
+                "revoke".into(),
+                "--org=acme".into(),
+                "--yes".into(),
+                "inv-1".into(),
+            ],
         );
         assert!(err.is_ok(), "revoke: {:?}", err);
     }
@@ -409,7 +441,11 @@ mod tests {
     #[test]
     fn revoke_missing_id() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_invitations(&g0, &["revoke".into(), "--org=acme".into()]);
         assert!(err.is_err());
     }
@@ -417,10 +453,18 @@ mod tests {
     #[test]
     fn revoke_json_requires_yes() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { token: "tok".into(), quiet: true, json: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            json: true,
+            ..Default::default()
+        };
         let err = cmd_invitations(&g0, &["revoke".into(), "--org=acme".into(), "inv-1".into()]);
         assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("confirmation required"));
+        assert!(err
+            .unwrap_err()
+            .to_string()
+            .contains("confirmation required"));
     }
 
     #[test]
@@ -429,8 +473,18 @@ mod tests {
         let _cfg = with_temp_config_dir();
         let mut out = Vec::new();
         #[derive(Serialize)]
-        struct R { revoked: bool, id: String }
-        print_json(&mut out, &R { revoked: true, id: "inv-1".into() }).unwrap();
+        struct R {
+            revoked: bool,
+            id: String,
+        }
+        print_json(
+            &mut out,
+            &R {
+                revoked: true,
+                id: "inv-1".into(),
+            },
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed["revoked"], true);
         assert_eq!(parsed["id"], "inv-1");
@@ -440,12 +494,20 @@ mod tests {
     #[test]
     fn revoke_404() {
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(404, r#"{"error":{"code":"not_found","message":"Invitation not found."}}"#)
+            Resp::status(
+                404,
+                r#"{"error":{"code":"not_found","message":"Invitation not found."}}"#,
+            )
         });
         let _cfg = with_temp_config_dir();
         let err = cmd_invitations(
             &g(&srv),
-            &["revoke".into(), "--org=acme".into(), "--yes".into(), "ghost".into()],
+            &[
+                "revoke".into(),
+                "--org=acme".into(),
+                "--yes".into(),
+                "ghost".into(),
+            ],
         );
         assert!(err.is_err());
         let e = err.unwrap_err();
@@ -458,7 +520,10 @@ mod tests {
     #[test]
     fn unknown_subcommand() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_invitations(&g0, &["frobnicate".into()]);
         assert!(err.is_err());
     }
@@ -466,7 +531,10 @@ mod tests {
     #[test]
     fn help_returns_ok() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_invitations(&g0, &["help".into()]);
         assert!(err.is_ok());
     }
@@ -474,7 +542,10 @@ mod tests {
     #[test]
     fn no_args_returns_error() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_invitations(&g0, &[]);
         assert!(err.is_err());
     }

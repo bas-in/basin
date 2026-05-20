@@ -88,8 +88,8 @@ pub fn cmd_metrics(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         project_flag
     } else if org.is_empty() {
         // No --org: try working project.
-        let cwd = std::env::current_dir()
-            .map_err(|e| msg(format!("could not determine cwd: {e}")))?;
+        let cwd =
+            std::env::current_dir().map_err(|e| msg(format!("could not determine cwd: {e}")))?;
         match load_working_project(&cwd)? {
             Some(w) if !w.project_ref.is_empty() => w.project_ref,
             _ => String::new(),
@@ -100,7 +100,9 @@ pub fn cmd_metrics(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
 
     // Mutual exclusivity check.
     if !ref_val.is_empty() && !org.is_empty() {
-        return Err(msg("--project and --org are mutually exclusive: use one or the other"));
+        return Err(msg(
+            "--project and --org are mutually exclusive: use one or the other",
+        ));
     }
     if ref_val.is_empty() && org.is_empty() {
         return Err(msg(
@@ -123,7 +125,9 @@ pub fn cmd_metrics(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let resp: MetricsResp = c.do_json(Method::GET, &path, None).map_err(|e| {
         if let Some(ae) = as_api_error(e.as_ref()) {
             if ae.http_status == 403 {
-                return msg("access denied: check that your token has read access to this resource");
+                return msg(
+                    "access denied: check that your token has read access to this resource",
+                );
             }
         }
         e
@@ -181,7 +185,11 @@ mod tests {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "GET");
-            assert!(req.path.contains("/v1/projects/proj1/metrics"), "path={}", req.path);
+            assert!(
+                req.path.contains("/v1/projects/proj1/metrics"),
+                "path={}",
+                req.path
+            );
             Resp::ok(format!(r#"{{"metrics":{}}}"#, sample_metrics_json()))
         });
         let g = flags(&srv.url);
@@ -195,7 +203,11 @@ mod tests {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|req: &Req| {
             assert!(req.path.contains("range=7d"), "path={}", req.path);
-            assert!(req.path.contains("metric=cache_hit_ratio"), "path={}", req.path);
+            assert!(
+                req.path.contains("metric=cache_hit_ratio"),
+                "path={}",
+                req.path
+            );
             Resp::ok(r#"{"metrics":[]}"#)
         });
         let g = flags(&srv.url);
@@ -206,7 +218,8 @@ mod tests {
                 "--range=7d".to_string(),
                 "--metric=cache_hit_ratio".to_string(),
             ],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     // ── JSON shape ──────────────────────────────────────────────────────────
@@ -217,11 +230,12 @@ mod tests {
         let srv = TestServer::start(|_req: &Req| {
             Resp::ok(format!(r#"{{"metrics":{}}}"#, sample_metrics_json()))
         });
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: MetricsResp =
-            c.do_json(reqwest::Method::GET, "/v1/projects/proj1/metrics", None).unwrap();
+        let resp: MetricsResp = c
+            .do_json(reqwest::Method::GET, "/v1/projects/proj1/metrics", None)
+            .unwrap();
         print_json(&mut buf, &json!({ "metrics": resp.metrics })).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         let metrics = v["metrics"].as_array().unwrap();
@@ -236,7 +250,11 @@ mod tests {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "GET");
-            assert!(req.path.contains("/v1/orgs/acme/metrics"), "path={}", req.path);
+            assert!(
+                req.path.contains("/v1/orgs/acme/metrics"),
+                "path={}",
+                req.path
+            );
             Resp::ok(format!(r#"{{"metrics":{}}}"#, sample_metrics_json()))
         });
         let g = flags(&srv.url);
@@ -275,7 +293,11 @@ mod tests {
             token: "tok".into(),
             ..Default::default()
         };
-        let err = cmd_metrics(&g, &["--project=proj1".to_string(), "--org=acme".to_string()]).unwrap_err();
+        let err = cmd_metrics(
+            &g,
+            &["--project=proj1".to_string(), "--org=acme".to_string()],
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("mutually exclusive"), "err={err}");
     }
 
@@ -309,7 +331,10 @@ mod tests {
     #[test]
     fn metrics_help_returns_ok() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_metrics(&g, &["help".to_string()]).is_ok());
     }
 }

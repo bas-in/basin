@@ -34,6 +34,11 @@ pub fn cmd_version(g: &GlobalFlags, _args: &[String]) -> CliResult<()> {
             }),
         );
     }
-    println!("basin {} built {} for {}", version(), build_date(), os_arch());
+    println!(
+        "basin {} built {} for {}",
+        version(),
+        build_date(),
+        os_arch()
+    );
     Ok(())
 }

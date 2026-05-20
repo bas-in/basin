@@ -84,7 +84,9 @@ fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
     let wp = load_working_project(&cwd)?;
     match wp {
         Some(w) if !w.project_ref.is_empty() => Ok(w.project_ref),
-        _ => Err(msg("--project is required (or run `basin link` to bind this directory)")),
+        _ => Err(msg(
+            "--project is required (or run `basin link` to bind this directory)",
+        )),
     }
 }
 
@@ -128,7 +130,11 @@ fn realtime_subscribe(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
 
     if !multi.is_empty() {
         // ── WebSocket multi-table path (T26.3) ────────────────────────────
-        let tables: Vec<&str> = multi.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        let tables: Vec<&str> = multi
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
         if tables.is_empty() {
             return Err(msg("--multi requires at least one table name"));
         }
@@ -137,10 +143,9 @@ fn realtime_subscribe(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         ws_subscribe(&ws_url, &token, &tables, &filter)
     } else {
         // ── SSE single-table path (T26.1) ─────────────────────────────────
-        let table = m
-            .get_one::<String>("table")
-            .cloned()
-            .ok_or_else(|| msg("usage: basin realtime subscribe <table> [--project=<ref>] [--since=<seq>]"))?;
+        let table = m.get_one::<String>("table").cloned().ok_or_else(|| {
+            msg("usage: basin realtime subscribe <table> [--project=<ref>] [--since=<seq>]")
+        })?;
         let project = resolve_project_ref(&project_flag)?;
         let since = m.get_one::<String>("since").cloned().unwrap_or_default();
         let url = format!(
@@ -341,8 +346,7 @@ pub fn sse_subscribe(url: &str, token: &str, since: &str) -> CliResult<()> {
             // Validate JSON, then re-print compact (no trailing spaces).
             match serde_json::from_str::<serde_json::Value>(payload) {
                 Ok(v) => {
-                    let compact = serde_json::to_string(&v)
-                        .unwrap_or_else(|_| payload.to_string());
+                    let compact = serde_json::to_string(&v).unwrap_or_else(|_| payload.to_string());
                     println!("{compact}");
                 }
                 Err(_) => {
@@ -367,7 +371,12 @@ mod tests {
     use std::sync::Arc;
 
     fn flags(url: &str) -> GlobalFlags {
-        GlobalFlags { api_url: url.to_string(), token: "tok".into(), quiet: true, ..Default::default() }
+        GlobalFlags {
+            api_url: url.to_string(),
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        }
     }
 
     // ── dispatcher tests ──────────────────────────────────────────────────────
@@ -413,11 +422,7 @@ mod tests {
             token: "tok".into(),
             ..Default::default()
         };
-        assert!(cmd_realtime(
-            &g,
-            &["subscribe".to_string(), "--project=p1".to_string()]
-        )
-        .is_err());
+        assert!(cmd_realtime(&g, &["subscribe".to_string(), "--project=p1".to_string()]).is_err());
     }
 
     // ── SSE streaming tests ───────────────────────────────────────────────────
@@ -530,7 +535,12 @@ mod tests {
         let project = "myproj";
         let table = "orders";
         let expected = "https://api.basin.run/realtime/v1/sse/myproj/orders";
-        let got = format!("{}/realtime/v1/sse/{}/{}", base.trim_end_matches('/'), project, table);
+        let got = format!(
+            "{}/realtime/v1/sse/{}/{}",
+            base.trim_end_matches('/'),
+            project,
+            table
+        );
         assert_eq!(got, expected);
     }
 
@@ -619,7 +629,11 @@ mod tests {
         // --multi= with empty value → no tables after split → should error.
         let result = cmd_realtime(
             &g,
-            &["subscribe".to_string(), "--multi=".to_string(), "--project=p1".to_string()],
+            &[
+                "subscribe".to_string(),
+                "--multi=".to_string(),
+                "--project=p1".to_string(),
+            ],
         );
         assert!(result.is_err(), "empty --multi should error");
     }
@@ -682,16 +696,12 @@ mod tests {
 
             // Send subscribed acks (one per table).
             for _ in 0..received.len() {
-                let _ = ws.send(WsMsg::Text(
-                    r#"{"type":"subscribed"}"#.to_string(),
-                ));
+                let _ = ws.send(WsMsg::Text(r#"{"type":"subscribed"}"#.to_string()));
             }
 
             // Send two interleaved event frames (orders then items).
-            let evt_orders =
-                r#"{"type":"event","table":"orders","record":{"id":1,"amount":99}}"#;
-            let evt_items =
-                r#"{"type":"event","table":"items","record":{"id":42,"sku":"X1"}}"#;
+            let evt_orders = r#"{"type":"event","table":"orders","record":{"id":1,"amount":99}}"#;
+            let evt_items = r#"{"type":"event","table":"items","record":{"id":42,"sku":"X1"}}"#;
             let _ = ws.send(WsMsg::Text(evt_orders.to_string()));
             let _ = ws.send(WsMsg::Text(evt_items.to_string()));
 
@@ -817,13 +827,20 @@ mod tests {
         });
 
         let result = ws_subscribe(&ws_url, "test-token", &["orders", "items"], "id=gt.5");
-        assert!(result.is_ok(), "ws_subscribe with filter must return Ok: {result:?}");
+        assert!(
+            result.is_ok(),
+            "ws_subscribe with filter must return Ok: {result:?}"
+        );
 
         let received = rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("server thread did not report in time");
 
-        assert_eq!(received.len(), 2, "expected 2 subscribe frames: {received:?}");
+        assert_eq!(
+            received.len(),
+            2,
+            "expected 2 subscribe frames: {received:?}"
+        );
 
         let parsed: Vec<serde_json::Value> = received
             .iter()
@@ -832,10 +849,7 @@ mod tests {
 
         // Every frame must carry the filter.
         for (i, v) in parsed.iter().enumerate() {
-            assert_eq!(
-                v["filter"], "id=gt.5",
-                "frame {i} missing filter: {v}"
-            );
+            assert_eq!(v["filter"], "id=gt.5", "frame {i} missing filter: {v}");
         }
     }
 
@@ -854,8 +868,8 @@ mod tests {
     fn subscribe_frame_shape_with_filter() {
         let table = "orders";
         let filter = "id=gt.5";
-        let frame = serde_json::json!({"type": "subscribe", "table": table, "filter": filter})
-            .to_string();
+        let frame =
+            serde_json::json!({"type": "subscribe", "table": table, "filter": filter}).to_string();
         let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(v["type"], "subscribe");
         assert_eq!(v["table"], "orders");
@@ -866,8 +880,11 @@ mod tests {
     #[test]
     fn multi_table_split() {
         let input = "orders, items , users";
-        let tables: Vec<&str> =
-            input.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        let tables: Vec<&str> = input
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
         assert_eq!(tables, vec!["orders", "items", "users"]);
     }
 }

@@ -82,12 +82,13 @@ fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
     if !flag_value.is_empty() {
         return Ok(flag_value.to_string());
     }
-    let cwd = std::env::current_dir()
-        .map_err(|e| msg(format!("could not determine cwd: {e}")))?;
+    let cwd = std::env::current_dir().map_err(|e| msg(format!("could not determine cwd: {e}")))?;
     let wp = load_working_project(&cwd)?;
     match wp {
         Some(w) if !w.project_ref.is_empty() => Ok(w.project_ref),
-        _ => Err(msg("--project is required (or run `basin link` to bind this directory)")),
+        _ => Err(msg(
+            "--project is required (or run `basin link` to bind this directory)",
+        )),
     }
 }
 
@@ -133,8 +134,11 @@ fn list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let project_flag = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project_flag)?;
     let c = require_client(g)?;
-    let resp: DomainsListResp =
-        c.do_json(Method::GET, &format!("/v1/projects/{ref}/custom-domains"), None)?;
+    let resp: DomainsListResp = c.do_json(
+        Method::GET,
+        &format!("/v1/projects/{ref}/custom-domains"),
+        None,
+    )?;
     if g.json {
         // JSON shape: { domains: [ CustomDomain ] }
         return print_json(&mut std::io::stdout(), &json!({ "domains": resp.domains }));
@@ -186,13 +190,20 @@ fn add(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         return print_json(&mut std::io::stdout(), &resp);
     }
     if let Some(d) = &resp.domain {
-        println!("Added domain {:?} (id={}, status={})", d.hostname, d.id, d.status);
+        println!(
+            "Added domain {:?} (id={}, status={})",
+            d.hostname, d.id, d.status
+        );
     }
     if !resp.dns_records.is_empty() {
         println!("\nAdd these DNS records at your registrar:");
         let mut t = Table::new(g, &["TYPE", "NAME", "VALUE", "TTL"]);
         for r in &resp.dns_records {
-            let ttl = if r.ttl > 0 { r.ttl.to_string() } else { String::new() };
+            let ttl = if r.ttl > 0 {
+                r.ttl.to_string()
+            } else {
+                String::new()
+            };
             t.row(&[&r.r#type, &r.name, &r.value, &ttl]);
         }
         t.flush()?;
@@ -293,9 +304,15 @@ fn cert(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         return print_json(&mut std::io::stdout(), &resp);
     }
     if resp.issued {
-        println!("Certificate issued for domain {id} (status={}).", resp.cert_status);
+        println!(
+            "Certificate issued for domain {id} (status={}).",
+            resp.cert_status
+        );
     } else {
-        println!("Certificate issuance requested for domain {id} (status={}).", resp.cert_status);
+        println!(
+            "Certificate issuance requested for domain {id} (status={}).",
+            resp.cert_status
+        );
     }
     Ok(())
 }
@@ -323,7 +340,10 @@ fn remove(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
                 id
             )));
         }
-        eprint!("Remove custom domain {:?} from project {:?}? This cannot be undone. [y/N] ", id, r#ref);
+        eprint!(
+            "Remove custom domain {:?} from project {:?}? This cannot be undone. [y/N] ",
+            id, r#ref
+        );
         let line = read_line()?;
         if line.trim().to_lowercase() != "y" {
             println!("Aborted.");
@@ -432,8 +452,9 @@ mod tests {
         let g = flags_json(&srv.url);
         let mut out = Vec::new();
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: DomainsListResp =
-            c.do_json(reqwest::Method::GET, "/v1/projects/p1/custom-domains", None).unwrap();
+        let resp: DomainsListResp = c
+            .do_json(reqwest::Method::GET, "/v1/projects/p1/custom-domains", None)
+            .unwrap();
         print_json(&mut out, &json!({ "domains": resp.domains })).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert!(v["domains"].is_array());
@@ -444,7 +465,11 @@ mod tests {
     #[test]
     fn list_no_project_errors() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_domains(&g, &["list".into()]).unwrap_err();
         assert!(err.to_string().contains("--project") || err.to_string().contains("link"));
     }
@@ -465,13 +490,25 @@ mod tests {
             ))
         });
         let g = flags(&srv.url);
-        cmd_domains(&g, &["add".into(), "--project=proj1".into(), "app.example.com".into()]).unwrap();
+        cmd_domains(
+            &g,
+            &[
+                "add".into(),
+                "--project=proj1".into(),
+                "app.example.com".into(),
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
     fn add_missing_hostname_errors() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_domains(&g, &["add".into(), "--project=proj1".into()]).unwrap_err();
         assert!(err.to_string().contains("usage"));
     }
@@ -480,12 +517,19 @@ mod tests {
     fn add_409_conflict() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(409, r#"{"error":{"code":"domain_conflict","message":"hostname already registered"}}"#)
+            Resp::status(
+                409,
+                r#"{"error":{"code":"domain_conflict","message":"hostname already registered"}}"#,
+            )
         });
         let g = flags(&srv.url);
         let err = cmd_domains(
             &g,
-            &["add".into(), "--project=proj1".into(), "dup.example.com".into()],
+            &[
+                "add".into(),
+                "--project=proj1".into(),
+                "dup.example.com".into(),
+            ],
         )
         .unwrap_err();
         assert!(err.to_string().contains("dup.example.com"));
@@ -528,19 +572,28 @@ mod tests {
             Resp::ok(r#"{"verified":true,"next_check_at":""}"#)
         });
         let g = flags(&srv.url);
-        cmd_domains(&g, &["verify".into(), "--project=proj1".into(), "d1".into()]).unwrap();
+        cmd_domains(
+            &g,
+            &["verify".into(), "--project=proj1".into(), "d1".into()],
+        )
+        .unwrap();
     }
 
     #[test]
     fn verify_404() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(404, r#"{"error":{"code":"not_found","message":"domain not found"}}"#)
+            Resp::status(
+                404,
+                r#"{"error":{"code":"not_found","message":"domain not found"}}"#,
+            )
         });
         let g = flags(&srv.url);
-        let err =
-            cmd_domains(&g, &["verify".into(), "--project=proj1".into(), "missing".into()])
-                .unwrap_err();
+        let err = cmd_domains(
+            &g,
+            &["verify".into(), "--project=proj1".into(), "missing".into()],
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
 
@@ -569,7 +622,7 @@ mod tests {
             .unwrap();
         print_json(&mut out, &resp).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(v["verified"].as_bool().unwrap(), false);
+        assert!(!v["verified"].as_bool().unwrap());
         assert_eq!(v["next_check_at"].as_str().unwrap(), "2026-01-02T00:00:00Z");
         let _ = &g;
     }
@@ -591,9 +644,8 @@ mod tests {
     #[test]
     fn cert_json_shape() {
         let _cfg = with_temp_config_dir();
-        let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"cert_status":"pending","issued":false}"#)
-        });
+        let srv =
+            TestServer::start(|_req: &Req| Resp::ok(r#"{"cert_status":"pending","issued":false}"#));
         let g = flags_json(&srv.url);
         let mut out = Vec::new();
         let c = crate::client::Client::new(&srv.url, "tok");
@@ -628,20 +680,36 @@ mod tests {
             Resp::ok(r#"{"removed":true,"id":"d1"}"#)
         });
         let g = flags(&srv.url);
-        cmd_domains(&g, &["remove".into(), "--project=proj1".into(), "--yes".into(), "d1".into()])
-            .unwrap();
+        cmd_domains(
+            &g,
+            &[
+                "remove".into(),
+                "--project=proj1".into(),
+                "--yes".into(),
+                "d1".into(),
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
     fn remove_404() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(404, r#"{"error":{"code":"not_found","message":"domain not found"}}"#)
+            Resp::status(
+                404,
+                r#"{"error":{"code":"not_found","message":"domain not found"}}"#,
+            )
         });
         let g = flags(&srv.url);
         let err = cmd_domains(
             &g,
-            &["remove".into(), "--project=proj1".into(), "--yes".into(), "missing".into()],
+            &[
+                "remove".into(),
+                "--project=proj1".into(),
+                "--yes".into(),
+                "missing".into(),
+            ],
         )
         .unwrap_err();
         assert!(err.to_string().contains("not found"));
@@ -656,24 +724,35 @@ mod tests {
             json: true,
             ..Default::default()
         };
-        let err = cmd_domains(&g, &["remove".into(), "--project=proj1".into(), "d1".into()])
-            .unwrap_err();
+        let err = cmd_domains(
+            &g,
+            &["remove".into(), "--project=proj1".into(), "d1".into()],
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("confirmation required"));
     }
 
     #[test]
     fn remove_json_shape() {
         let _cfg = with_temp_config_dir();
-        let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"removed":true,"id":"d1"}"#)
-        });
+        let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"removed":true,"id":"d1"}"#));
         let g = flags_json(&srv.url);
         let mut out = Vec::new();
         #[derive(Serialize)]
-        struct R { removed: bool, id: String }
-        print_json(&mut out, &R { removed: true, id: "d1".into() }).unwrap();
+        struct R {
+            removed: bool,
+            id: String,
+        }
+        print_json(
+            &mut out,
+            &R {
+                removed: true,
+                id: "d1".into(),
+            },
+        )
+        .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(v["removed"].as_bool().unwrap(), true);
+        assert!(v["removed"].as_bool().unwrap());
         assert_eq!(v["id"].as_str().unwrap(), "d1");
         let _ = &g;
     }
@@ -683,7 +762,10 @@ mod tests {
     #[test]
     fn unknown_subcommand_is_silent() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_domains(&g, &["frobnicate".into()]).unwrap_err();
         assert!(crate::error::is_silent(err.as_ref()));
     }
@@ -691,7 +773,10 @@ mod tests {
     #[test]
     fn help_returns_ok() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_domains(&g, &["help".into()]).is_ok());
     }
 }

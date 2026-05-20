@@ -46,20 +46,18 @@ fn run_init(g: &GlobalFlags, cwd: &Path, force: bool) -> CliResult<()> {
     let basin_dir = cwd.join("basin");
 
     // Check for an existing basin/ directory.
-    if basin_dir.exists() && basin_dir.is_dir() {
-        if !force {
-            if g.json {
-                // JSON shape: { ok: bool, error: string }
-                return print_json(
-                    &mut std::io::stdout(),
-                    &json!({
-                        "ok": false,
-                        "error": "./basin/ already exists — use --force to overwrite",
-                    }),
-                );
-            }
-            return Err(msg("./basin/ already exists — use --force to overwrite"));
+    if basin_dir.exists() && basin_dir.is_dir() && !force {
+        if g.json {
+            // JSON shape: { ok: bool, error: string }
+            return print_json(
+                &mut std::io::stdout(),
+                &json!({
+                    "ok": false,
+                    "error": "./basin/ already exists — use --force to overwrite",
+                }),
+            );
         }
+        return Err(msg("./basin/ already exists — use --force to overwrite"));
     }
 
     // Create ./basin/migrations/ (and ./basin/ implicitly).
@@ -97,7 +95,10 @@ fn run_init(g: &GlobalFlags, cwd: &Path, force: bool) -> CliResult<()> {
     printinfo!(g, "  {}", basin_dir.join("config.toml").display());
     printinfo!(g, "  {}/", migrations_dir.display());
     printinfo!(g, "  {}", seed_path.display());
-    printinfo!(g, "Run `basin link --project=<ref>` to bind this directory to a remote project.");
+    printinfo!(
+        g,
+        "Run `basin link --project=<ref>` to bind this directory to a remote project."
+    );
     Ok(())
 }
 
@@ -108,14 +109,16 @@ mod tests {
 
     /// make_cwd creates a unique temp directory and returns its path.
     fn make_cwd(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("basin-init-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("basin-init-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
     fn quiet_g() -> GlobalFlags {
-        GlobalFlags { quiet: true, ..Default::default() }
+        GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -127,13 +130,19 @@ mod tests {
         run_init(&g, &cwd, false).unwrap();
 
         // config.toml must exist.
-        assert!(cwd.join("basin/config.toml").exists(), "config.toml missing");
+        assert!(
+            cwd.join("basin/config.toml").exists(),
+            "config.toml missing"
+        );
         // migrations/ must be a directory.
         let mig = cwd.join("basin/migrations");
         assert!(mig.is_dir(), "migrations/ not a directory");
         // seed.sql must contain the placeholder.
         let seed = std::fs::read_to_string(cwd.join("basin/seed.sql")).unwrap();
-        assert!(seed.contains("-- seed data"), "seed.sql placeholder missing: {seed:?}");
+        assert!(
+            seed.contains("-- seed data"),
+            "seed.sql placeholder missing: {seed:?}"
+        );
 
         std::fs::remove_dir_all(&cwd).ok();
     }
@@ -181,7 +190,11 @@ mod tests {
     fn json_output_shape() {
         let _cfg = with_temp_config_dir();
         let cwd = make_cwd("json");
-        let g = GlobalFlags { json: true, quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            json: true,
+            quiet: true,
+            ..Default::default()
+        };
 
         // Capture by inspecting what run_init writes to stdout via print_json.
         // We redirect by running the logic and checking the file on disk
@@ -199,7 +212,11 @@ mod tests {
     fn json_conflict_returns_error_or_json() {
         let _cfg = with_temp_config_dir();
         let cwd = make_cwd("json-conflict");
-        let g = GlobalFlags { json: true, quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            json: true,
+            quiet: true,
+            ..Default::default()
+        };
 
         run_init(&g, &cwd, false).unwrap();
         // Second call — with --json, this prints the error JSON and returns Ok.
@@ -214,7 +231,10 @@ mod tests {
     #[test]
     fn cmd_init_flag_parsing_help() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         // --help should return Ok(()) without scaffolding anything.
         cmd_init(&g, &["--help".into()]).unwrap();
     }

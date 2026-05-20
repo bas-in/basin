@@ -89,12 +89,13 @@ fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
     if !flag_value.is_empty() {
         return Ok(flag_value.to_string());
     }
-    let cwd = std::env::current_dir()
-        .map_err(|e| msg(format!("could not determine cwd: {e}")))?;
+    let cwd = std::env::current_dir().map_err(|e| msg(format!("could not determine cwd: {e}")))?;
     let wp = load_working_project(&cwd)?;
     match wp {
         Some(w) if !w.project_ref.is_empty() => Ok(w.project_ref),
-        _ => Err(msg("--project is required (or run `basin link` to bind this directory)")),
+        _ => Err(msg(
+            "--project is required (or run `basin link` to bind this directory)",
+        )),
     }
 }
 
@@ -131,8 +132,7 @@ pub fn cmd_projects_transfers(g: &GlobalFlags, args: &[String]) -> CliResult<()>
 }
 
 fn projects_transfers_list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
-    let cmd = Command::new("projects transfers list")
-        .arg(Arg::new("project").long("project"));
+    let cmd = Command::new("projects transfers list").arg(Arg::new("project").long("project"));
     let m = parse_or_silent(cmd, args)?;
     let project = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project)?;
@@ -154,7 +154,10 @@ fn projects_transfers_list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         return Ok(());
     }
     for t in &resp.transfers {
-        println!("{}\t{}\t{} → {}\t{}", t.id, t.status, t.from_org_slug, t.to_org_slug, t.created_at);
+        println!(
+            "{}\t{}\t{} → {}\t{}",
+            t.id, t.status, t.from_org_slug, t.to_org_slug, t.created_at
+        );
     }
     Ok(())
 }
@@ -178,7 +181,10 @@ fn projects_transfers_create(g: &GlobalFlags, args: &[String]) -> CliResult<()> 
                 "confirmation required: pass --yes to initiate a transfer non-interactively under --json",
             ));
         }
-        eprint!("Initiate transfer of project {:?} to org {:?}? [y/N] ", r#ref, to_org);
+        eprint!(
+            "Initiate transfer of project {:?} to org {:?}? [y/N] ",
+            r#ref, to_org
+        );
         let line = read_line()?;
         if line.trim().to_lowercase() != "y" {
             println!("Aborted.");
@@ -194,14 +200,21 @@ fn projects_transfers_create(g: &GlobalFlags, args: &[String]) -> CliResult<()> 
         #[serde(default)]
         transfer: Option<ProjectTransfer>,
     }
-    let resp: Resp = c.do_json(Method::POST, &format!("/v1/projects/{ref}/transfers"), Some(body))?;
+    let resp: Resp = c.do_json(
+        Method::POST,
+        &format!("/v1/projects/{ref}/transfers"),
+        Some(body),
+    )?;
 
     if g.json {
         // JSON shape: { transfer: ProjectTransfer }
         return print_json(&mut std::io::stdout(), &resp);
     }
     if let Some(t) = &resp.transfer {
-        println!("Transfer initiated: {} → {} (id={}, status={})", r#ref, to_org, t.id, t.status);
+        println!(
+            "Transfer initiated: {} → {} (id={}, status={})",
+            r#ref, to_org, t.id, t.status
+        );
     } else {
         println!("Transfer initiated: {} → {}", r#ref, to_org);
     }
@@ -218,7 +231,9 @@ fn projects_transfers_cancel(g: &GlobalFlags, args: &[String]) -> CliResult<()> 
     let id = m
         .get_many::<String>("id")
         .and_then(|mut v| v.next().cloned())
-        .ok_or_else(|| msg("usage: basin projects transfers cancel <id> [--project=<ref>] [--yes]"))?;
+        .ok_or_else(|| {
+            msg("usage: basin projects transfers cancel <id> [--project=<ref>] [--yes]")
+        })?;
     let r#ref = resolve_project_ref(&project)?;
 
     if !m.get_flag("yes") {
@@ -243,8 +258,11 @@ fn projects_transfers_cancel(g: &GlobalFlags, args: &[String]) -> CliResult<()> 
         cancelled: bool,
         id: String,
     }
-    let resp: Resp =
-        c.do_json(Method::POST, &format!("/v1/projects/{ref}/transfers/{id}/cancel"), None)?;
+    let resp: Resp = c.do_json(
+        Method::POST,
+        &format!("/v1/projects/{ref}/transfers/{id}/cancel"),
+        None,
+    )?;
 
     if g.json {
         // JSON shape: { cancelled: bool, id: string }
@@ -288,7 +306,11 @@ pub fn cmd_orgs_ownership_transfers(g: &GlobalFlags, args: &[String]) -> CliResu
             Ok(())
         }
         other => {
-            printerr!(g, "unknown subcommand {:?} for orgs ownership-transfers", other);
+            printerr!(
+                g,
+                "unknown subcommand {:?} for orgs ownership-transfers",
+                other
+            );
             Err(silent())
         }
     }
@@ -309,8 +331,11 @@ fn ownership_transfers_list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         #[serde(default)]
         transfers: Vec<OrgOwnershipTransfer>,
     }
-    let resp: Resp =
-        c.do_json(Method::GET, &format!("/v1/orgs/{slug}/ownership-transfers"), None)?;
+    let resp: Resp = c.do_json(
+        Method::GET,
+        &format!("/v1/orgs/{slug}/ownership-transfers"),
+        None,
+    )?;
 
     if g.json {
         // JSON shape: { transfers: [OrgOwnershipTransfer] }
@@ -321,7 +346,10 @@ fn ownership_transfers_list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         return Ok(());
     }
     for t in &resp.transfers {
-        println!("{}\t{}\t→ user {}\t{}", t.id, t.status, t.to_user_id, t.created_at);
+        println!(
+            "{}\t{}\t→ user {}\t{}",
+            t.id, t.status, t.to_user_id, t.created_at
+        );
     }
     Ok(())
 }
@@ -338,9 +366,14 @@ fn ownership_transfers_create(g: &GlobalFlags, args: &[String]) -> CliResult<()>
         .ok_or_else(|| {
             msg("usage: basin orgs ownership-transfers create --to-user-id=<id> <slug> [--yes]")
         })?;
-    let to_user = m.get_one::<String>("to-user-id").cloned().unwrap_or_default();
+    let to_user = m
+        .get_one::<String>("to-user-id")
+        .cloned()
+        .unwrap_or_default();
     if to_user.trim().is_empty() {
-        return Err(msg("orgs ownership-transfers create requires --to-user-id=<id>"));
+        return Err(msg(
+            "orgs ownership-transfers create requires --to-user-id=<id>",
+        ));
     }
 
     if !m.get_flag("yes") {
@@ -368,8 +401,11 @@ fn ownership_transfers_create(g: &GlobalFlags, args: &[String]) -> CliResult<()>
         #[serde(default)]
         transfer: Option<OrgOwnershipTransfer>,
     }
-    let resp: Resp =
-        c.do_json(Method::POST, &format!("/v1/orgs/{slug}/ownership-transfers"), Some(body))?;
+    let resp: Resp = c.do_json(
+        Method::POST,
+        &format!("/v1/orgs/{slug}/ownership-transfers"),
+        Some(body),
+    )?;
 
     if g.json {
         // JSON shape: { transfer: OrgOwnershipTransfer }
@@ -381,7 +417,10 @@ fn ownership_transfers_create(g: &GlobalFlags, args: &[String]) -> CliResult<()>
             slug, to_user, t.id, t.status
         );
     } else {
-        println!("Ownership transfer initiated: org {:?} → user {:?}", slug, to_user);
+        println!(
+            "Ownership transfer initiated: org {:?} → user {:?}",
+            slug, to_user
+        );
     }
     Ok(())
 }
@@ -396,7 +435,9 @@ fn ownership_transfers_cancel(g: &GlobalFlags, args: &[String]) -> CliResult<()>
         .map(|v| v.cloned().collect())
         .unwrap_or_default();
     if rest_args.len() < 2 {
-        return Err(msg("usage: basin orgs ownership-transfers cancel <slug> <id> [--yes]"));
+        return Err(msg(
+            "usage: basin orgs ownership-transfers cancel <slug> <id> [--yes]",
+        ));
     }
     let id = rest_args.remove(1);
     let slug = rest_args.remove(0);
@@ -408,7 +449,10 @@ fn ownership_transfers_cancel(g: &GlobalFlags, args: &[String]) -> CliResult<()>
                 id
             )));
         }
-        eprint!("Cancel ownership transfer {:?} for org {:?}? [y/N] ", id, slug);
+        eprint!(
+            "Cancel ownership transfer {:?} for org {:?}? [y/N] ",
+            id, slug
+        );
         let line = read_line()?;
         if line.trim().to_lowercase() != "y" {
             println!("Aborted.");
@@ -492,14 +536,13 @@ fn ownership_transfer_accept_decline(
 /// `basin orgs incoming-project-transfers <sub>`.
 /// Called from cmd_orgs in orgs.rs.
 pub fn cmd_orgs_incoming_project_transfers(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
-    let (sub, rest) = match args.split_first() {
-        None => {
-            return Err(msg(
+    let (sub, rest) =
+        match args.split_first() {
+            None => return Err(msg(
                 "usage: basin orgs incoming-project-transfers <list|accept|decline> <slug> [id]",
-            ))
-        }
-        Some((s, r)) => (s.as_str(), r),
-    };
+            )),
+            Some((s, r)) => (s.as_str(), r),
+        };
     match sub {
         "list" => incoming_project_transfers_list(g, rest),
         "accept" => incoming_project_transfer_accept_decline(g, rest, "accept"),
@@ -517,7 +560,11 @@ pub fn cmd_orgs_incoming_project_transfers(g: &GlobalFlags, args: &[String]) -> 
             Ok(())
         }
         other => {
-            printerr!(g, "unknown subcommand {:?} for orgs incoming-project-transfers", other);
+            printerr!(
+                g,
+                "unknown subcommand {:?} for orgs incoming-project-transfers",
+                other
+            );
             Err(silent())
         }
     }
@@ -538,8 +585,11 @@ fn incoming_project_transfers_list(g: &GlobalFlags, args: &[String]) -> CliResul
         #[serde(default)]
         transfers: Vec<IncomingProjectTransfer>,
     }
-    let resp: Resp =
-        c.do_json(Method::GET, &format!("/v1/orgs/{slug}/incoming-project-transfers"), None)?;
+    let resp: Resp = c.do_json(
+        Method::GET,
+        &format!("/v1/orgs/{slug}/incoming-project-transfers"),
+        None,
+    )?;
 
     if g.json {
         // JSON shape: { transfers: [IncomingProjectTransfer] }
@@ -667,21 +717,17 @@ mod tests {
             Resp::ok(format!(r#"{{"transfers":[{xfr}]}}"#))
         });
         let _cfg = with_temp_config_dir();
-        let err =
-            cmd_projects_transfers(&g(&srv), &["list".into(), "--project=proj1".into()]);
+        let err = cmd_projects_transfers(&g(&srv), &["list".into(), "--project=proj1".into()]);
         assert!(err.is_ok(), "projects transfers list: {:?}", err);
     }
 
     #[test]
     fn projects_transfers_list_empty() {
-        let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"transfers":[]}"#)
-        });
+        let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"transfers":[]}"#));
         let _cfg = with_temp_config_dir();
         let mut out = Vec::new();
         // Verify the empty-list path by inspecting our serialisation directly.
-        let resp_data: serde_json::Value =
-            serde_json::from_str(r#"{"transfers":[]}"#).unwrap();
+        let resp_data: serde_json::Value = serde_json::from_str(r#"{"transfers":[]}"#).unwrap();
         crate::output::print_json(&mut out, &resp_data).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert!(parsed["transfers"].as_array().unwrap().is_empty());
@@ -691,9 +737,8 @@ mod tests {
     #[test]
     fn projects_transfers_list_json_shape() {
         let xfr = sample_project_transfer("xfr-1", "org-a", "org-b", "pending");
-        let srv = TestServer::start(move |_req: &Req| {
-            Resp::ok(format!(r#"{{"transfers":[{xfr}]}}"#))
-        });
+        let srv =
+            TestServer::start(move |_req: &Req| Resp::ok(format!(r#"{{"transfers":[{xfr}]}}"#)));
         let _cfg = with_temp_config_dir();
         let mut out = Vec::new();
         let t = ProjectTransfer {
@@ -719,8 +764,7 @@ mod tests {
             )
         });
         let _cfg = with_temp_config_dir();
-        let err =
-            cmd_projects_transfers(&g(&srv), &["list".into(), "--project=proj1".into()]);
+        let err = cmd_projects_transfers(&g(&srv), &["list".into(), "--project=proj1".into()]);
         assert!(err.is_err());
         let msg = err.unwrap_err().to_string();
         assert!(msg.contains("404"), "expected 404 in error, got: {msg}");
@@ -731,7 +775,11 @@ mod tests {
     #[test]
     fn projects_transfers_create_missing_to_org() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_projects_transfers(
             &g0,
             &["create".into(), "--project=proj1".into(), "--yes".into()],
@@ -768,11 +816,19 @@ mod tests {
     #[test]
     fn projects_transfers_create_json_requires_yes() {
         let _cfg = with_temp_config_dir();
-        let g0 =
-            GlobalFlags { token: "tok".into(), quiet: true, json: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            json: true,
+            ..Default::default()
+        };
         let err = cmd_projects_transfers(
             &g0,
-            &["create".into(), "--project=proj1".into(), "--to-org=org-b".into()],
+            &[
+                "create".into(),
+                "--project=proj1".into(),
+                "--to-org=org-b".into(),
+            ],
         );
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("--yes"));
@@ -802,9 +858,7 @@ mod tests {
 
     #[test]
     fn projects_transfers_cancel_json_shape() {
-        let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"cancelled":true,"id":"xfr-1"}"#)
-        });
+        let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"cancelled":true,"id":"xfr-1"}"#));
         let _cfg = with_temp_config_dir();
         let mut out = Vec::new();
         #[derive(Serialize)]
@@ -812,7 +866,14 @@ mod tests {
             cancelled: bool,
             id: String,
         }
-        print_json(&mut out, &R { cancelled: true, id: "xfr-1".into() }).unwrap();
+        print_json(
+            &mut out,
+            &R {
+                cancelled: true,
+                id: "xfr-1".into(),
+            },
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed["cancelled"], true);
         assert_eq!(parsed["id"], "xfr-1");
@@ -830,10 +891,7 @@ mod tests {
             Resp::ok(format!(r#"{{"transfers":[{own}]}}"#))
         });
         let _cfg = with_temp_config_dir();
-        let err = cmd_orgs_ownership_transfers(
-            &g(&srv),
-            &["list".into(), "my-org".into()],
-        );
+        let err = cmd_orgs_ownership_transfers(&g(&srv), &["list".into(), "my-org".into()]);
         assert!(err.is_ok(), "ownership-transfers list: {:?}", err);
     }
 
@@ -842,11 +900,13 @@ mod tests {
     #[test]
     fn ownership_transfers_create_missing_to_user_id() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
-        let err = cmd_orgs_ownership_transfers(
-            &g0,
-            &["create".into(), "--yes".into(), "my-org".into()],
-        );
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
+        let err =
+            cmd_orgs_ownership_transfers(&g0, &["create".into(), "--yes".into(), "my-org".into()]);
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("--to-user-id"));
     }
@@ -909,7 +969,12 @@ mod tests {
         let _cfg = with_temp_config_dir();
         let err = cmd_orgs_ownership_transfers(
             &g(&srv),
-            &["cancel".into(), "--yes".into(), "my-org".into(), "own-1".into()],
+            &[
+                "cancel".into(),
+                "--yes".into(),
+                "my-org".into(),
+                "own-1".into(),
+            ],
         );
         assert!(err.is_ok(), "ownership-transfers cancel: {:?}", err);
     }
@@ -953,7 +1018,10 @@ mod tests {
     fn ownership_transfers_decline_happy_path() {
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "POST");
-            assert_eq!(req.path, "/v1/orgs/my-org/ownership-transfers/own-1/decline");
+            assert_eq!(
+                req.path,
+                "/v1/orgs/my-org/ownership-transfers/own-1/decline"
+            );
             Resp::ok(r#"{"declined":true,"id":"own-1"}"#)
         });
         let _cfg = with_temp_config_dir();
@@ -972,7 +1040,14 @@ mod tests {
             declined: bool,
             id: String,
         }
-        print_json(&mut out, &R { declined: true, id: "own-1".into() }).unwrap();
+        print_json(
+            &mut out,
+            &R {
+                declined: true,
+                id: "own-1".into(),
+            },
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed["declined"], true);
         assert_eq!(parsed["id"], "own-1");
@@ -982,17 +1057,15 @@ mod tests {
 
     #[test]
     fn incoming_project_transfers_list_happy_path() {
-        let ipt = sample_incoming_project_transfer("ipt-1", "org-a", "my-org", "proj-ref-1", "pending");
+        let ipt =
+            sample_incoming_project_transfer("ipt-1", "org-a", "my-org", "proj-ref-1", "pending");
         let srv = TestServer::start(move |req: &Req| {
             assert_eq!(req.method, "GET");
             assert_eq!(req.path, "/v1/orgs/my-org/incoming-project-transfers");
             Resp::ok(format!(r#"{{"transfers":[{ipt}]}}"#))
         });
         let _cfg = with_temp_config_dir();
-        let err = cmd_orgs_incoming_project_transfers(
-            &g(&srv),
-            &["list".into(), "my-org".into()],
-        );
+        let err = cmd_orgs_incoming_project_transfers(&g(&srv), &["list".into(), "my-org".into()]);
         assert!(err.is_ok(), "incoming-project-transfers list: {:?}", err);
     }
 
@@ -1016,7 +1089,10 @@ mod tests {
     fn incoming_project_transfers_accept_happy_path() {
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "POST");
-            assert_eq!(req.path, "/v1/orgs/my-org/incoming-project-transfers/ipt-1/accept");
+            assert_eq!(
+                req.path,
+                "/v1/orgs/my-org/incoming-project-transfers/ipt-1/accept"
+            );
             Resp::ok(r#"{"accepted":true,"id":"ipt-1"}"#)
         });
         let _cfg = with_temp_config_dir();
@@ -1031,7 +1107,10 @@ mod tests {
     fn incoming_project_transfers_decline_happy_path() {
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "POST");
-            assert_eq!(req.path, "/v1/orgs/my-org/incoming-project-transfers/ipt-1/decline");
+            assert_eq!(
+                req.path,
+                "/v1/orgs/my-org/incoming-project-transfers/ipt-1/decline"
+            );
             Resp::ok(r#"{"declined":true,"id":"ipt-1"}"#)
         });
         let _cfg = with_temp_config_dir();
@@ -1051,10 +1130,7 @@ mod tests {
             )
         });
         let _cfg = with_temp_config_dir();
-        let err = cmd_orgs_incoming_project_transfers(
-            &g(&srv),
-            &["list".into(), "my-org".into()],
-        );
+        let err = cmd_orgs_incoming_project_transfers(&g(&srv), &["list".into(), "my-org".into()]);
         assert!(err.is_err());
         let msg = err.unwrap_err().to_string();
         assert!(msg.contains("403"), "expected 403 in error, got: {msg}");
@@ -1065,7 +1141,11 @@ mod tests {
     #[test]
     fn projects_transfers_cancel_missing_id() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_projects_transfers(
             &g0,
             &["cancel".into(), "--project=proj1".into(), "--yes".into()],
@@ -1077,7 +1157,11 @@ mod tests {
     #[test]
     fn ownership_transfers_cancel_missing_args() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_orgs_ownership_transfers(
             &g0,
             &["cancel".into(), "--yes".into(), "only-slug".into()],
@@ -1089,11 +1173,12 @@ mod tests {
     #[test]
     fn incoming_project_transfers_accept_missing_args() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
-        let err = cmd_orgs_incoming_project_transfers(
-            &g0,
-            &["accept".into(), "only-slug".into()],
-        );
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
+        let err = cmd_orgs_incoming_project_transfers(&g0, &["accept".into(), "only-slug".into()]);
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("usage"));
     }
@@ -1103,7 +1188,10 @@ mod tests {
     #[test]
     fn projects_transfers_help_returns_ok() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_projects_transfers(&g0, &["help".into()]);
         assert!(err.is_ok());
     }
@@ -1111,7 +1199,10 @@ mod tests {
     #[test]
     fn ownership_transfers_unknown_sub_returns_silent() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_orgs_ownership_transfers(&g0, &["frobnicate".into()]);
         assert!(err.is_err());
     }
@@ -1119,7 +1210,10 @@ mod tests {
     #[test]
     fn incoming_project_transfers_help_returns_ok() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_orgs_incoming_project_transfers(&g0, &["help".into()]);
         assert!(err.is_ok());
     }

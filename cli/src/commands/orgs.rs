@@ -72,9 +72,7 @@ pub fn cmd_orgs(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         "update" => update(g, rest),
         "delete" => delete(g, rest),
         "branding" => branding(g, rest),
-        "ownership-transfers" => {
-            super::transfers::cmd_orgs_ownership_transfers(g, rest)
-        }
+        "ownership-transfers" => super::transfers::cmd_orgs_ownership_transfers(g, rest),
         "incoming-project-transfers" => {
             super::transfers::cmd_orgs_incoming_project_transfers(g, rest)
         }
@@ -125,7 +123,9 @@ fn list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
 // ── orgs show ────────────────────────────────────────────────────────
 
 fn show(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
-    let slug = args.first().ok_or_else(|| msg("usage: basin orgs show <slug>"))?;
+    let slug = args
+        .first()
+        .ok_or_else(|| msg("usage: basin orgs show <slug>"))?;
     let c = require_client(g)?;
     let resp: OrgResp = c.do_json(Method::GET, &format!("/v1/orgs/{slug}"), None)?;
     if g.json {
@@ -164,17 +164,19 @@ fn create(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         body["plan"] = json!(plan);
     }
     let c = require_client(g)?;
-    let resp: OrgResp = c.do_json(Method::POST, "/v1/orgs", Some(body)).map_err(|e| {
-        if let Some(ae) = as_api_error(e.as_ref()) {
-            if ae.http_status == 409 {
-                return msg(format!(
-                    "org slug conflict: an org with slug {:?} already exists",
-                    slug
-                ));
+    let resp: OrgResp = c
+        .do_json(Method::POST, "/v1/orgs", Some(body))
+        .map_err(|e| {
+            if let Some(ae) = as_api_error(e.as_ref()) {
+                if ae.http_status == 409 {
+                    return msg(format!(
+                        "org slug conflict: an org with slug {:?} already exists",
+                        slug
+                    ));
+                }
             }
-        }
-        e
-    })?;
+            e
+        })?;
     if g.json {
         // JSON shape: { "org": { id, slug, name, plan } }
         return print_json(&mut std::io::stdout(), &json!({ "org": resp.org }));
@@ -207,7 +209,9 @@ fn update(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         body["plan"] = json!(plan);
     }
     if body.as_object().map(|o| o.is_empty()).unwrap_or(true) {
-        return Err(msg("orgs update: nothing to update — pass --name or --plan"));
+        return Err(msg(
+            "orgs update: nothing to update — pass --name or --plan",
+        ));
     }
     let c = require_client(g)?;
     let resp: OrgResp = c.do_json(Method::PATCH, &format!("/v1/orgs/{slug}"), Some(body))?;
@@ -271,7 +275,9 @@ fn delete(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
 fn branding(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let (sub, rest) = match args.split_first() {
         None => {
-            return Err(msg("usage: basin orgs branding {get|put|delete} <slug> [flags]"))
+            return Err(msg(
+                "usage: basin orgs branding {get|put|delete} <slug> [flags]",
+            ))
         }
         Some((s, r)) => (s.as_str(), r),
     };
@@ -295,8 +301,7 @@ fn branding_get(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         .and_then(|mut v| v.next().cloned())
         .ok_or_else(|| msg("usage: basin orgs branding get <slug>"))?;
     let c = require_client(g)?;
-    let resp: BrandingResp =
-        c.do_json(Method::GET, &format!("/v1/orgs/{slug}/branding"), None)?;
+    let resp: BrandingResp = c.do_json(Method::GET, &format!("/v1/orgs/{slug}/branding"), None)?;
     if g.json {
         // JSON shape: { "branding": { logo_url, primary_color, secondary_color } }
         return print_json(&mut std::io::stdout(), &resp);
@@ -328,15 +333,24 @@ fn branding_put(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     if let Some(v) = m.get_one::<String>("logo-url").filter(|s| !s.is_empty()) {
         body["logo_url"] = json!(v);
     }
-    if let Some(v) = m.get_one::<String>("primary-color").filter(|s| !s.is_empty()) {
+    if let Some(v) = m
+        .get_one::<String>("primary-color")
+        .filter(|s| !s.is_empty())
+    {
         body["primary_color"] = json!(v);
     }
-    if let Some(v) = m.get_one::<String>("secondary-color").filter(|s| !s.is_empty()) {
+    if let Some(v) = m
+        .get_one::<String>("secondary-color")
+        .filter(|s| !s.is_empty())
+    {
         body["secondary_color"] = json!(v);
     }
     let c = require_client(g)?;
-    let resp: BrandingResp =
-        c.do_json(Method::PUT, &format!("/v1/orgs/{slug}/branding"), Some(body))?;
+    let resp: BrandingResp = c.do_json(
+        Method::PUT,
+        &format!("/v1/orgs/{slug}/branding"),
+        Some(body),
+    )?;
     if g.json {
         // JSON shape: { "branding": { logo_url, primary_color, secondary_color } }
         return print_json(&mut std::io::stdout(), &resp);
@@ -393,9 +407,7 @@ mod tests {
     }
 
     fn sample_org(slug: &str, name: &str, plan: &str) -> String {
-        format!(
-            r#"{{"id":"org-{slug}","slug":"{slug}","name":"{name}","plan":"{plan}"}}"#
-        )
+        format!(r#"{{"id":"org-{slug}","slug":"{slug}","name":"{name}","plan":"{plan}"}}"#)
     }
 
     // ── orgs list ────────────────────────────────────────────────────
@@ -427,9 +439,10 @@ mod tests {
             ..Default::default()
         };
         // Call list directly by invoking cmd_orgs to exercise dispatch.
-        let resp: OrgsListResp =
-            serde_json::from_str(r#"{"orgs":[{"id":"org-1","slug":"acme","name":"Acme","plan":"free"}]}"#)
-                .unwrap();
+        let resp: OrgsListResp = serde_json::from_str(
+            r#"{"orgs":[{"id":"org-1","slug":"acme","name":"Acme","plan":"free"}]}"#,
+        )
+        .unwrap();
         print_json(&mut out, &json!({ "orgs": resp.orgs })).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert!(parsed["orgs"].is_array());
@@ -442,7 +455,10 @@ mod tests {
     fn show_happy_path() {
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.path, "/v1/orgs/acme");
-            Resp::ok(format!(r#"{{"org":{}}}"#, sample_org("acme", "Acme", "free")))
+            Resp::ok(format!(
+                r#"{{"org":{}}}"#,
+                sample_org("acme", "Acme", "free")
+            ))
         });
         let _cfg = with_temp_config_dir();
         let err = cmd_orgs(&g(&srv), &["show".into(), "acme".into()]);
@@ -452,7 +468,11 @@ mod tests {
     #[test]
     fn show_missing_slug() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_orgs(&g0, &["show".into()]);
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("usage"));
@@ -468,12 +488,19 @@ mod tests {
             let body: serde_json::Value = serde_json::from_str(&req.body).unwrap();
             assert_eq!(body["slug"], "acme");
             assert_eq!(body["name"], "Acme Corp");
-            Resp::ok(format!(r#"{{"org":{}}}"#, sample_org("acme", "Acme Corp", "free")))
+            Resp::ok(format!(
+                r#"{{"org":{}}}"#,
+                sample_org("acme", "Acme Corp", "free")
+            ))
         });
         let _cfg = with_temp_config_dir();
         let err = cmd_orgs(
             &g(&srv),
-            &["create".into(), "--slug=acme".into(), "--name=Acme Corp".into()],
+            &[
+                "create".into(),
+                "--slug=acme".into(),
+                "--name=Acme Corp".into(),
+            ],
         );
         assert!(err.is_ok(), "create: {:?}", err);
     }
@@ -481,7 +508,11 @@ mod tests {
     #[test]
     fn create_missing_slug() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_orgs(&g0, &["create".into(), "--name=Acme Corp".into()]);
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("--slug"));
@@ -490,7 +521,11 @@ mod tests {
     #[test]
     fn create_missing_name() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_orgs(&g0, &["create".into(), "--slug=acme".into()]);
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("--name"));
@@ -499,7 +534,10 @@ mod tests {
     #[test]
     fn create_409_conflict() {
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(409, r#"{"error":{"code":"conflict","message":"slug taken"}}"#)
+            Resp::status(
+                409,
+                r#"{"error":{"code":"conflict","message":"slug taken"}}"#,
+            )
         });
         let _cfg = with_temp_config_dir();
         let err = cmd_orgs(
@@ -513,7 +551,10 @@ mod tests {
     #[test]
     fn create_json_shape() {
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(format!(r#"{{"org":{}}}"#, sample_org("acme", "Acme Corp", "pro")))
+            Resp::ok(format!(
+                r#"{{"org":{}}}"#,
+                sample_org("acme", "Acme Corp", "pro")
+            ))
         });
         let _cfg = with_temp_config_dir();
         let mut out = Vec::new();
@@ -540,7 +581,10 @@ mod tests {
             assert_eq!(req.path, "/v1/orgs/acme");
             let body: serde_json::Value = serde_json::from_str(&req.body).unwrap();
             assert_eq!(body["name"], "Acme Renamed");
-            Resp::ok(format!(r#"{{"org":{}}}"#, sample_org("acme", "Acme Renamed", "free")))
+            Resp::ok(format!(
+                r#"{{"org":{}}}"#,
+                sample_org("acme", "Acme Renamed", "free")
+            ))
         });
         let _cfg = with_temp_config_dir();
         let err = cmd_orgs(
@@ -553,7 +597,11 @@ mod tests {
     #[test]
     fn update_missing_slug() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_orgs(&g0, &["update".into(), "--name=New Name".into()]);
         assert!(err.is_err());
     }
@@ -561,7 +609,11 @@ mod tests {
     #[test]
     fn update_nothing_to_update() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_orgs(&g0, &["update".into(), "acme".into()]);
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("nothing to update"));
@@ -570,7 +622,10 @@ mod tests {
     #[test]
     fn update_json_shape() {
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(format!(r#"{{"org":{}}}"#, sample_org("acme", "Acme Updated", "pro")))
+            Resp::ok(format!(
+                r#"{{"org":{}}}"#,
+                sample_org("acme", "Acme Updated", "pro")
+            ))
         });
         let _cfg = with_temp_config_dir();
         let mut out = Vec::new();
@@ -590,7 +645,10 @@ mod tests {
     #[test]
     fn update_403() {
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(403, r#"{"error":{"code":"forbidden","message":"Insufficient permissions."}}"#)
+            Resp::status(
+                403,
+                r#"{"error":{"code":"forbidden","message":"Insufficient permissions."}}"#,
+            )
         });
         let _cfg = with_temp_config_dir();
         let err = cmd_orgs(
@@ -620,7 +678,11 @@ mod tests {
     #[test]
     fn delete_missing_slug() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_orgs(&g0, &["delete".into()]);
         assert!(err.is_err());
     }
@@ -628,22 +690,38 @@ mod tests {
     #[test]
     fn delete_json_requires_yes() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { token: "tok".into(), quiet: true, json: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            json: true,
+            ..Default::default()
+        };
         let err = cmd_orgs(&g0, &["delete".into(), "acme".into()]);
         assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("confirmation required"));
+        assert!(err
+            .unwrap_err()
+            .to_string()
+            .contains("confirmation required"));
     }
 
     #[test]
     fn delete_json_shape() {
-        let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"deleted":true,"slug":"acme"}"#)
-        });
+        let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"deleted":true,"slug":"acme"}"#));
         let _cfg = with_temp_config_dir();
         let mut out = Vec::new();
         #[derive(Serialize)]
-        struct D { deleted: bool, slug: String }
-        print_json(&mut out, &D { deleted: true, slug: "acme".into() }).unwrap();
+        struct D {
+            deleted: bool,
+            slug: String,
+        }
+        print_json(
+            &mut out,
+            &D {
+                deleted: true,
+                slug: "acme".into(),
+            },
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed["deleted"], true);
         assert_eq!(parsed["slug"], "acme");
@@ -653,7 +731,10 @@ mod tests {
     #[test]
     fn delete_404() {
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(404, r#"{"error":{"code":"not_found","message":"Org not found."}}"#)
+            Resp::status(
+                404,
+                r#"{"error":{"code":"not_found","message":"Org not found."}}"#,
+            )
         });
         let _cfg = with_temp_config_dir();
         let err = cmd_orgs(&g(&srv), &["delete".into(), "--yes".into(), "ghost".into()]);
@@ -670,7 +751,9 @@ mod tests {
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "GET");
             assert_eq!(req.path, "/v1/orgs/acme/branding");
-            Resp::ok(r##"{"branding":{"logo_url":"https://example.com/logo.png","primary_color":"#1a2b3c","secondary_color":"#4d5e6f"}}"##)
+            Resp::ok(
+                r##"{"branding":{"logo_url":"https://example.com/logo.png","primary_color":"#1a2b3c","secondary_color":"#4d5e6f"}}"##,
+            )
         });
         let _cfg = with_temp_config_dir();
         let err = cmd_orgs(&g(&srv), &["branding".into(), "get".into(), "acme".into()]);
@@ -680,7 +763,9 @@ mod tests {
     #[test]
     fn branding_get_json_shape() {
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r##"{"branding":{"logo_url":"https://example.com/logo.png","primary_color":"#1a2b3c"}}"##)
+            Resp::ok(
+                r##"{"branding":{"logo_url":"https://example.com/logo.png","primary_color":"#1a2b3c"}}"##,
+            )
         });
         let _cfg = with_temp_config_dir();
         let mut out = Vec::new();
@@ -700,7 +785,11 @@ mod tests {
     #[test]
     fn branding_get_missing_slug() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_orgs(&g0, &["branding".into(), "get".into()]);
         assert!(err.is_err());
     }
@@ -714,7 +803,9 @@ mod tests {
             assert_eq!(req.path, "/v1/orgs/acme/branding");
             let body: serde_json::Value = serde_json::from_str(&req.body).unwrap();
             assert_eq!(body["logo_url"], "https://example.com/logo.png");
-            Resp::ok(r##"{"branding":{"logo_url":"https://example.com/logo.png","primary_color":"#1a2b3c"}}"##)
+            Resp::ok(
+                r##"{"branding":{"logo_url":"https://example.com/logo.png","primary_color":"#1a2b3c"}}"##,
+            )
         });
         let _cfg = with_temp_config_dir();
         let err = cmd_orgs(
@@ -740,7 +831,10 @@ mod tests {
             Resp::ok(r#"{"deleted":true}"#)
         });
         let _cfg = with_temp_config_dir();
-        let err = cmd_orgs(&g(&srv), &["branding".into(), "delete".into(), "acme".into()]);
+        let err = cmd_orgs(
+            &g(&srv),
+            &["branding".into(), "delete".into(), "acme".into()],
+        );
         assert!(err.is_ok(), "branding delete: {:?}", err);
     }
 
@@ -749,7 +843,10 @@ mod tests {
     #[test]
     fn unknown_subcommand_returns_silent() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_orgs(&g0, &["frobnicate".into()]);
         assert!(err.is_err());
     }
@@ -757,7 +854,10 @@ mod tests {
     #[test]
     fn help_returns_ok() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_orgs(&g0, &["help".into()]);
         assert!(err.is_ok());
     }
@@ -765,7 +865,10 @@ mod tests {
     #[test]
     fn ownership_transfers_no_args_is_usage_error() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_orgs(&g0, &["ownership-transfers".into()]);
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("usage"));

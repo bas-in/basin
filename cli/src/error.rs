@@ -26,7 +26,11 @@ impl fmt::Display for ApiError {
         match (self.message.is_empty(), self.code.is_empty()) {
             (true, _) => write!(f, "HTTP {} ({})", self.http_status, self.code),
             (false, true) => write!(f, "HTTP {}: {}", self.http_status, self.message),
-            (false, false) => write!(f, "HTTP {} ({}): {}", self.http_status, self.code, self.message),
+            (false, false) => write!(
+                f,
+                "HTTP {} ({}): {}",
+                self.http_status, self.code, self.message
+            ),
         }
     }
 }

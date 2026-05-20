@@ -82,7 +82,10 @@ fn list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let resp: ProjectsResp = c.do_json(Method::GET, &format!("/v1/orgs/{org}/projects"), None)?;
     if g.json {
         // JSON shape: { projects: [ Project ] }
-        return print_json(&mut std::io::stdout(), &json!({ "projects": resp.projects }));
+        return print_json(
+            &mut std::io::stdout(),
+            &json!({ "projects": resp.projects }),
+        );
     }
     let mut t = Table::new(g, &["REF", "NAME", "REGION", "STATUS", "CREATED"]);
     for p in &resp.projects {
@@ -92,7 +95,9 @@ fn list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
 }
 
 fn get(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
-    let r#ref = args.first().ok_or_else(|| msg("usage: basin projects get <ref>"))?;
+    let r#ref = args
+        .first()
+        .ok_or_else(|| msg("usage: basin projects get <ref>"))?;
     let c = require_client(g)?;
     let resp: ProjectResp = c.do_json(Method::GET, &format!("/v1/projects/{ref}"), None)?;
     if g.json {
@@ -124,7 +129,9 @@ fn create(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         .map(|v| v.cloned().collect::<Vec<_>>().join(" "))
         .unwrap_or_default();
     if name.is_empty() {
-        return Err(msg("usage: basin projects create <name> --org <slug> [--region <code>]"));
+        return Err(msg(
+            "usage: basin projects create <name> --org <slug> [--region <code>]",
+        ));
     }
     let org = m
         .get_one::<String>("org")
@@ -139,8 +146,11 @@ fn create(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     if let Some(region) = m.get_one::<String>("region") {
         body["region"] = json!(region);
     }
-    let resp: CreateProjectResponse =
-        c.do_json(Method::POST, &format!("/v1/orgs/{org}/projects"), Some(body))?;
+    let resp: CreateProjectResponse = c.do_json(
+        Method::POST,
+        &format!("/v1/orgs/{org}/projects"),
+        Some(body),
+    )?;
     if g.json {
         // JSON shape: { project: Project, keys: {…}, pgwire: Pgwire }
         return print_json(&mut std::io::stdout(), &resp);
@@ -182,7 +192,10 @@ fn delete(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         return Err(msg(format!("project not found: {ref}")));
     };
     if !m.get_flag("yes") {
-        eprint!("About to delete project {:?} ({}). Re-type the name to confirm:\n> ", p.name, p.r#ref);
+        eprint!(
+            "About to delete project {:?} ({}). Re-type the name to confirm:\n> ",
+            p.name, p.r#ref
+        );
         let typed = read_line()?;
         if typed.trim() != p.name {
             return Err(msg("name mismatch — aborted"));
@@ -192,7 +205,10 @@ fn delete(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     c.do_noout(Method::DELETE, &format!("/v1/projects/{ref}{q}"), None)?;
     if g.json {
         // JSON shape: { deleted: bool, ref: string }
-        return print_json(&mut std::io::stdout(), &json!({ "deleted": true, "ref": r#ref }));
+        return print_json(
+            &mut std::io::stdout(),
+            &json!({ "deleted": true, "ref": r#ref }),
+        );
     }
     println!("Deleted project {ref}.");
     Ok(())

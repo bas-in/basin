@@ -37,15 +37,14 @@ impl Table {
         Table {
             headers: headers.iter().map(|s| s.to_string()).collect(),
             rows: Vec::new(),
-            dim: !g.no_color
-                && std::env::var_os("NO_COLOR").is_none()
-                && is_terminal_stdout(),
+            dim: !g.no_color && std::env::var_os("NO_COLOR").is_none() && is_terminal_stdout(),
         }
     }
 
     /// row appends one data row; cells are stringified by the caller.
     pub fn row(&mut self, cells: &[&str]) {
-        self.rows.push(cells.iter().map(|s| s.to_string()).collect());
+        self.rows
+            .push(cells.iter().map(|s| s.to_string()).collect());
     }
 
     /// row_strings appends an owned-string row (ergonomic for formatted cells).
@@ -68,7 +67,11 @@ impl Table {
         let out = io::stdout();
         let mut w = out.lock();
         write_row(&mut w, &self.headers, &widths)?;
-        let sep: Vec<String> = self.headers.iter().map(|h| "─".repeat(h.chars().count())).collect();
+        let sep: Vec<String> = self
+            .headers
+            .iter()
+            .map(|h| "─".repeat(h.chars().count()))
+            .collect();
         let sep_line = pad_join(&sep, &widths);
         if self.dim {
             writeln!(w, "{ANSI_DIM}{sep_line}{ANSI_RESET}")?;

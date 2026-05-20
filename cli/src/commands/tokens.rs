@@ -78,7 +78,9 @@ struct TokensListResp {
 pub fn cmd_tokens(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let (sub, rest) = match args.split_first() {
         None => {
-            return Err(msg("usage: basin tokens (list | create | revoke | show) ..."));
+            return Err(msg(
+                "usage: basin tokens (list | create | revoke | show) ...",
+            ));
         }
         Some((s, r)) => (s.as_str(), r),
     };
@@ -137,12 +139,12 @@ fn list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         c.do_json(Method::GET, &format!("/v1/orgs/{org}/api-tokens"), None)?;
     if g.json {
         // JSON shape: { tokens: [ APIToken ] }
-        return print_json(
-            &mut std::io::stdout(),
-            &json!({ "tokens": resp.tokens }),
-        );
+        return print_json(&mut std::io::stdout(), &json!({ "tokens": resp.tokens }));
     }
-    let mut t = Table::new(g, &["ID", "NAME", "SCOPE", "PREFIX", "EXPIRES", "LAST USED"]);
+    let mut t = Table::new(
+        g,
+        &["ID", "NAME", "SCOPE", "PREFIX", "EXPIRES", "LAST USED"],
+    );
     for tok in &resp.tokens {
         t.row(&[
             &tok.id,
@@ -192,9 +194,14 @@ fn create(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         .unwrap_or_else(|| g.org_slug.clone());
     let name = m.get_one::<String>("name").cloned().unwrap_or_default();
     if org.is_empty() || name.is_empty() {
-        return Err(msg("tokens create requires --org=<slug> and --name=<label>"));
+        return Err(msg(
+            "tokens create requires --org=<slug> and --name=<label>",
+        ));
     }
-    let desc = m.get_one::<String>("description").cloned().unwrap_or_default();
+    let desc = m
+        .get_one::<String>("description")
+        .cloned()
+        .unwrap_or_default();
     let scope = m
         .get_one::<String>("scope")
         .cloned()
@@ -219,8 +226,11 @@ fn create(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         }
     }
     let c = require_client(g)?;
-    let resp: CreateTokenResponse =
-        c.do_json(Method::POST, &format!("/v1/orgs/{org}/api-tokens"), Some(body))?;
+    let resp: CreateTokenResponse = c.do_json(
+        Method::POST,
+        &format!("/v1/orgs/{org}/api-tokens"),
+        Some(body),
+    )?;
     if g.json {
         // JSON shape: CreateTokenResponse — { token: APIToken, full_token: string }
         // (full_token is reveal-once; subsequent reads only see APIToken.Prefix).
@@ -235,7 +245,10 @@ fn create(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     if let Some(tok) = &resp.token {
         println!("  id:      {}", tok.id);
         println!("  scope:   {}", tok.scope);
-        println!("  expires: {}", format_expires_at(tok.expires_at.as_deref()));
+        println!(
+            "  expires: {}",
+            format_expires_at(tok.expires_at.as_deref())
+        );
     }
     Ok(())
 }
@@ -252,7 +265,10 @@ fn revoke(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         help_for_command(
             "tokens revoke",
             "Mark an org-scoped token as revoked.",
-            &["<id>           Token ID (required).", "--org <slug>    Org slug (required)."],
+            &[
+                "<id>           Token ID (required).",
+                "--org <slug>    Org slug (required).",
+            ],
         );
         return Ok(());
     }
@@ -295,7 +311,10 @@ fn show(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         help_for_command(
             "tokens show",
             "Print metadata for a specific token (prefix only — secret is never returned).",
-            &["<id>           Token ID (required).", "--org <slug>    Org slug (required)."],
+            &[
+                "<id>           Token ID (required).",
+                "--org <slug>    Org slug (required).",
+            ],
         );
         return Ok(());
     }
@@ -333,8 +352,14 @@ fn show(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
             }
             println!("prefix:       {}", tok.prefix);
             println!("created_at:   {}", tok.created_at);
-            println!("expires_at:   {}", format_expires_at(tok.expires_at.as_deref()));
-            println!("last_used_at: {}", format_expires_at(tok.last_used_at.as_deref()));
+            println!(
+                "expires_at:   {}",
+                format_expires_at(tok.expires_at.as_deref())
+            );
+            println!(
+                "last_used_at: {}",
+                format_expires_at(tok.last_used_at.as_deref())
+            );
             if !tok.project_ids.is_empty() {
                 println!("projects:     {}", tok.project_ids.join(","));
             }
@@ -408,7 +433,10 @@ mod tests {
 
     #[test]
     fn format_expires_at_value() {
-        assert_eq!(format_expires_at(Some("2025-01-01T00:00:00Z")), "2025-01-01T00:00:00Z");
+        assert_eq!(
+            format_expires_at(Some("2025-01-01T00:00:00Z")),
+            "2025-01-01T00:00:00Z"
+        );
     }
 
     #[test]
@@ -427,28 +455,49 @@ mod tests {
     #[test]
     fn missing_subcommand_is_error() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_tokens(&g, &[]).is_err());
     }
 
     #[test]
     fn unknown_subcommand_is_error() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_tokens(&g, &["frobnicate".into()]).is_err());
     }
 
     #[test]
     fn list_missing_org_is_error() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_tokens(&g, &["list".into()]).is_err());
     }
 
     #[test]
     fn create_missing_name_is_error() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), org_slug: "acme".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            org_slug: "acme".into(),
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_tokens(&g, &["create".into()]).is_err());
     }
 
@@ -462,11 +511,7 @@ mod tests {
             assert_eq!(req.path, "/v1/orgs/acme/api-tokens");
             Resp::ok(r#"{"tokens":[{"id":"tok1","name":"ci","scope":"write","prefix":"bso_"}]}"#)
         });
-        cmd_tokens(
-            &flags_org(&srv.url),
-            &["list".into(), "--org=acme".into()],
-        )
-        .unwrap();
+        cmd_tokens(&flags_org(&srv.url), &["list".into(), "--org=acme".into()]).unwrap();
     }
 
     #[test]
@@ -497,11 +542,17 @@ mod tests {
             assert_eq!(req.path, "/v1/orgs/acme/api-tokens");
             let body: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
             assert_eq!(body["name"].as_str().unwrap(), "ci-token");
-            Resp::ok(r#"{"token":{"id":"t1","scope":"write","prefix":"bso_"},"full_token":"bso_abc123"}"#)
+            Resp::ok(
+                r#"{"token":{"id":"t1","scope":"write","prefix":"bso_"},"full_token":"bso_abc123"}"#,
+            )
         });
         cmd_tokens(
             &flags_org(&srv.url),
-            &["create".into(), "--org=acme".into(), "--name=ci-token".into()],
+            &[
+                "create".into(),
+                "--org=acme".into(),
+                "--name=ci-token".into(),
+            ],
         )
         .unwrap();
     }
@@ -510,13 +561,19 @@ mod tests {
     fn create_json_shape() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"token":{"id":"t1","scope":"write","prefix":"bso_"},"full_token":"bso_abc123"}"#)
+            Resp::ok(
+                r#"{"token":{"id":"t1","scope":"write","prefix":"bso_"},"full_token":"bso_abc123"}"#,
+            )
         });
         let mut g = flags_org(&srv.url);
         g.json = true;
         cmd_tokens(
             &g,
-            &["create".into(), "--org=acme".into(), "--name=ci-token".into()],
+            &[
+                "create".into(),
+                "--org=acme".into(),
+                "--name=ci-token".into(),
+            ],
         )
         .unwrap();
     }
@@ -528,7 +585,9 @@ mod tests {
             let body: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
             // "30d" doesn't contain 'T' → expires_in
             assert_eq!(body["expires_in"].as_str().unwrap(), "30d");
-            Resp::ok(r#"{"token":{"id":"t1","scope":"write","prefix":"bso_"},"full_token":"bso_x"}"#)
+            Resp::ok(
+                r#"{"token":{"id":"t1","scope":"write","prefix":"bso_"},"full_token":"bso_x"}"#,
+            )
         });
         cmd_tokens(
             &flags_org(&srv.url),
@@ -549,7 +608,9 @@ mod tests {
             let body: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
             // Contains 'T' → expires_at
             assert!(body["expires_at"].as_str().unwrap().contains('T'));
-            Resp::ok(r#"{"token":{"id":"t1","scope":"write","prefix":"bso_"},"full_token":"bso_x"}"#)
+            Resp::ok(
+                r#"{"token":{"id":"t1","scope":"write","prefix":"bso_"},"full_token":"bso_x"}"#,
+            )
         });
         cmd_tokens(
             &flags_org(&srv.url),
@@ -584,7 +645,10 @@ mod tests {
     fn revoke_missing_id_is_error() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| Resp::ok("{}"));
-        let err = cmd_tokens(&flags_org(&srv.url), &["revoke".into(), "--org=acme".into()]);
+        let err = cmd_tokens(
+            &flags_org(&srv.url),
+            &["revoke".into(), "--org=acme".into()],
+        );
         assert!(err.is_err());
     }
 
@@ -594,7 +658,9 @@ mod tests {
     fn show_happy_path() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"tokens":[{"id":"tok1","name":"ci","scope":"write","prefix":"bso_","created_at":"2024-01-01"}]}"#)
+            Resp::ok(
+                r#"{"tokens":[{"id":"tok1","name":"ci","scope":"write","prefix":"bso_","created_at":"2024-01-01"}]}"#,
+            )
         });
         cmd_tokens(
             &flags_org(&srv.url),
@@ -620,10 +686,12 @@ mod tests {
     fn list_server_error_returns_api_error() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(403, r#"{"error":{"code":"forbidden","message":"insufficient permissions"}}"#)
+            Resp::status(
+                403,
+                r#"{"error":{"code":"forbidden","message":"insufficient permissions"}}"#,
+            )
         });
-        let err =
-            cmd_tokens(&flags_org(&srv.url), &["list".into(), "--org=acme".into()]);
+        let err = cmd_tokens(&flags_org(&srv.url), &["list".into(), "--org=acme".into()]);
         assert!(err.is_err());
         let e = err.unwrap_err();
         let ae = crate::error::as_api_error(e.as_ref()).expect("expected ApiError");
@@ -635,7 +703,10 @@ mod tests {
     #[test]
     fn help_returns_ok() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_tokens(&g, &["help".into()]).is_ok());
     }
 }

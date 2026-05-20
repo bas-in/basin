@@ -116,7 +116,11 @@ pub fn cmd_oauth_apps(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         "enable" => enable(g, rest),
         "delete" => delete(g, rest),
         "--help" | "-h" | "help" => {
-            help_for_command("oauth-apps", "Manage OAuth applications for an org.", HELP_LINES);
+            help_for_command(
+                "oauth-apps",
+                "Manage OAuth applications for an org.",
+                HELP_LINES,
+            );
             Ok(())
         }
         other => {
@@ -208,8 +212,11 @@ fn get(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         return Err(msg("usage: basin oauth-apps get <id> --org=<slug>"));
     }
     let c = require_client(g)?;
-    let resp: OAuthAppResp =
-        c.do_json(Method::GET, &format!("/v1/orgs/{org}/oauth-apps/{id}"), None)?;
+    let resp: OAuthAppResp = c.do_json(
+        Method::GET,
+        &format!("/v1/orgs/{org}/oauth-apps/{id}"),
+        None,
+    )?;
     if g.json {
         // JSON shape: { "app": { id, name, client_id, redirect_uri, scopes, enabled } }
         return print_json(&mut std::io::stdout(), &resp);
@@ -279,8 +286,11 @@ fn create(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     }
 
     let c = require_client(g)?;
-    let resp: SecretResp =
-        c.do_json(Method::POST, &format!("/v1/orgs/{org}/oauth-apps"), Some(body))?;
+    let resp: SecretResp = c.do_json(
+        Method::POST,
+        &format!("/v1/orgs/{org}/oauth-apps"),
+        Some(body),
+    )?;
     if g.json {
         // JSON shape: { "app": { id, name, client_id, redirect_uri, scopes, enabled },
         //              "client_secret": "..." }
@@ -335,7 +345,10 @@ fn patch(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     if let Some(n) = m.get_one::<String>("name").filter(|s| !s.is_empty()) {
         body["name"] = json!(n);
     }
-    if let Some(u) = m.get_one::<String>("redirect-uri").filter(|s| !s.is_empty()) {
+    if let Some(u) = m
+        .get_one::<String>("redirect-uri")
+        .filter(|s| !s.is_empty())
+    {
         body["redirect_uri"] = json!(u);
     }
     if let Some(sc) = m.get_one::<String>("scopes").filter(|s| !s.is_empty()) {
@@ -450,9 +463,7 @@ fn disable(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let org = m.get_one::<String>("org").cloned().unwrap_or_default();
     let id = m.get_one::<String>("id").cloned();
     if org.is_empty() || id.is_none() {
-        return Err(msg(
-            "usage: basin oauth-apps disable <id> --org=<slug>",
-        ));
+        return Err(msg("usage: basin oauth-apps disable <id> --org=<slug>"));
     }
     let id = id.unwrap();
     let c = require_client(g)?;
@@ -615,13 +626,19 @@ mod tests {
 
     #[test]
     fn no_args_shows_help_ok() {
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_oauth_apps(&g, &[]).is_ok());
     }
 
     #[test]
     fn help_subcommand_returns_ok() {
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_oauth_apps(&g, &["help".into()]).is_ok());
     }
 
@@ -666,8 +683,9 @@ mod tests {
         let body = format!(r#"{{"apps":[{app}]}}"#);
         let srv = TestServer::start(move |_req: &Req| Resp::ok(body.clone()));
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: OAuthAppsListResp =
-            c.do_json(Method::GET, "/v1/orgs/acme/oauth-apps", None).unwrap();
+        let resp: OAuthAppsListResp = c
+            .do_json(Method::GET, "/v1/orgs/acme/oauth-apps", None)
+            .unwrap();
         assert_eq!(resp.apps.len(), 1);
         assert_eq!(resp.apps[0].id, "app1");
         assert_eq!(resp.apps[0].client_id, "client_app1");
@@ -703,8 +721,7 @@ mod tests {
             )
         });
         let g = flags(&srv.url);
-        let err =
-            cmd_oauth_apps(&g, &["list".into(), "--org=acme".into()]).unwrap_err();
+        let err = cmd_oauth_apps(&g, &["list".into(), "--org=acme".into()]).unwrap_err();
         let ae = as_api_error(err.as_ref()).expect("expected ApiError");
         assert_eq!(ae.http_status, 403);
     }
@@ -733,11 +750,8 @@ mod tests {
             )
         });
         let g = flags(&srv.url);
-        let err = cmd_oauth_apps(
-            &g,
-            &["get".into(), "--org=acme".into(), "notfound".into()],
-        )
-        .unwrap_err();
+        let err = cmd_oauth_apps(&g, &["get".into(), "--org=acme".into(), "notfound".into()])
+            .unwrap_err();
         let ae = as_api_error(err.as_ref()).expect("expected ApiError");
         assert_eq!(ae.http_status, 404);
     }
@@ -749,8 +763,7 @@ mod tests {
             quiet: true,
             ..Default::default()
         };
-        let err =
-            cmd_oauth_apps(&g, &["get".into(), "app1".into()]).unwrap_err();
+        let err = cmd_oauth_apps(&g, &["get".into(), "app1".into()]).unwrap_err();
         assert!(!err.to_string().is_empty());
     }
 
@@ -759,13 +772,11 @@ mod tests {
     #[test]
     fn create_happy_path_prints_secret() {
         let app = sample_app("app1");
-        let body_resp =
-            format!(r#"{{"app":{app},"client_secret":"cs_supersecret456"}}"#);
+        let body_resp = format!(r#"{{"app":{app},"client_secret":"cs_supersecret456"}}"#);
         let srv = TestServer::start(move |req: &Req| {
             assert_eq!(req.method, "POST");
             assert_eq!(req.path, "/v1/orgs/acme/oauth-apps");
-            let b: serde_json::Value =
-                serde_json::from_str(&req.body).unwrap_or_default();
+            let b: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
             assert_eq!(b["name"].as_str().unwrap(), "My App");
             assert_eq!(
                 b["redirect_uri"].as_str().unwrap(),
@@ -789,8 +800,7 @@ mod tests {
     #[test]
     fn create_json_shape_contains_secret() {
         let app = sample_app("app1");
-        let body_resp =
-            format!(r#"{{"app":{app},"client_secret":"cs_supersecret456"}}"#);
+        let body_resp = format!(r#"{{"app":{app},"client_secret":"cs_supersecret456"}}"#);
         let srv = TestServer::start(move |_req: &Req| Resp::ok(body_resp.clone()));
         let c = crate::client::Client::new(&srv.url, "tok");
         let resp: SecretResp = c
@@ -866,8 +876,7 @@ mod tests {
         let srv = TestServer::start(move |req: &Req| {
             assert_eq!(req.method, "PATCH");
             assert_eq!(req.path, "/v1/orgs/acme/oauth-apps/app1");
-            let b: serde_json::Value =
-                serde_json::from_str(&req.body).unwrap_or_default();
+            let b: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
             assert_eq!(b["name"].as_str().unwrap(), "Updated App");
             Resp::ok(body_resp.clone())
         });
@@ -892,8 +901,7 @@ mod tests {
             ..Default::default()
         };
         let err =
-            cmd_oauth_apps(&g, &["patch".into(), "app1".into(), "--name=x".into()])
-                .unwrap_err();
+            cmd_oauth_apps(&g, &["patch".into(), "app1".into(), "--name=x".into()]).unwrap_err();
         assert!(!err.to_string().is_empty());
     }
 
@@ -902,8 +910,7 @@ mod tests {
     #[test]
     fn rotate_happy_path_prints_new_secret() {
         let app = sample_app("app1");
-        let body_resp =
-            format!(r#"{{"app":{app},"client_secret":"cs_newrotated789"}}"#);
+        let body_resp = format!(r#"{{"app":{app},"client_secret":"cs_newrotated789"}}"#);
         let srv = TestServer::start(move |req: &Req| {
             assert_eq!(req.method, "POST");
             assert_eq!(req.path, "/v1/orgs/acme/oauth-apps/app1/rotate-secret");
@@ -912,7 +919,12 @@ mod tests {
         let g = flags(&srv.url);
         cmd_oauth_apps(
             &g,
-            &["rotate".into(), "--org=acme".into(), "--yes".into(), "app1".into()],
+            &[
+                "rotate".into(),
+                "--org=acme".into(),
+                "--yes".into(),
+                "app1".into(),
+            ],
         )
         .unwrap();
     }
@@ -926,11 +938,8 @@ mod tests {
             json: true,
             ..Default::default()
         };
-        let err = cmd_oauth_apps(
-            &g,
-            &["rotate".into(), "--org=acme".into(), "app1".into()],
-        )
-        .unwrap_err();
+        let err =
+            cmd_oauth_apps(&g, &["rotate".into(), "--org=acme".into(), "app1".into()]).unwrap_err();
         assert!(
             err.to_string().contains("confirmation required"),
             "got: {err}"
@@ -945,8 +954,7 @@ mod tests {
             ..Default::default()
         };
         let err =
-            cmd_oauth_apps(&g, &["rotate".into(), "app1".into(), "--yes".into()])
-                .unwrap_err();
+            cmd_oauth_apps(&g, &["rotate".into(), "app1".into(), "--yes".into()]).unwrap_err();
         assert!(!err.to_string().is_empty());
     }
 
@@ -960,11 +968,7 @@ mod tests {
             Resp::ok(r#"{"enabled":false}"#)
         });
         let g = flags_json(&srv.url);
-        cmd_oauth_apps(
-            &g,
-            &["disable".into(), "--org=acme".into(), "app1".into()],
-        )
-        .unwrap();
+        cmd_oauth_apps(&g, &["disable".into(), "--org=acme".into(), "app1".into()]).unwrap();
     }
 
     #[test]
@@ -975,11 +979,7 @@ mod tests {
             Resp::ok(r#"{"enabled":true}"#)
         });
         let g = flags_json(&srv.url);
-        cmd_oauth_apps(
-            &g,
-            &["enable".into(), "--org=acme".into(), "app1".into()],
-        )
-        .unwrap();
+        cmd_oauth_apps(&g, &["enable".into(), "--org=acme".into(), "app1".into()]).unwrap();
     }
 
     #[test]
@@ -989,8 +989,7 @@ mod tests {
             quiet: true,
             ..Default::default()
         };
-        let err =
-            cmd_oauth_apps(&g, &["disable".into(), "app1".into()]).unwrap_err();
+        let err = cmd_oauth_apps(&g, &["disable".into(), "app1".into()]).unwrap_err();
         assert!(!err.to_string().is_empty());
     }
 
@@ -1006,7 +1005,12 @@ mod tests {
         let g = flags_json(&srv.url);
         cmd_oauth_apps(
             &g,
-            &["delete".into(), "--org=acme".into(), "--yes".into(), "app1".into()],
+            &[
+                "delete".into(),
+                "--org=acme".into(),
+                "--yes".into(),
+                "app1".into(),
+            ],
         )
         .unwrap();
     }
@@ -1020,11 +1024,8 @@ mod tests {
             json: true,
             ..Default::default()
         };
-        let err = cmd_oauth_apps(
-            &g,
-            &["delete".into(), "--org=acme".into(), "app1".into()],
-        )
-        .unwrap_err();
+        let err =
+            cmd_oauth_apps(&g, &["delete".into(), "--org=acme".into(), "app1".into()]).unwrap_err();
         assert!(
             err.to_string().contains("confirmation required"),
             "got: {err}"
@@ -1039,8 +1040,7 @@ mod tests {
             ..Default::default()
         };
         let err =
-            cmd_oauth_apps(&g, &["delete".into(), "app1".into(), "--yes".into()])
-                .unwrap_err();
+            cmd_oauth_apps(&g, &["delete".into(), "app1".into(), "--yes".into()]).unwrap_err();
         assert!(!err.to_string().is_empty());
     }
 
@@ -1055,7 +1055,12 @@ mod tests {
         let g = flags(&srv.url);
         let err = cmd_oauth_apps(
             &g,
-            &["delete".into(), "--org=acme".into(), "--yes".into(), "app1".into()],
+            &[
+                "delete".into(),
+                "--org=acme".into(),
+                "--yes".into(),
+                "app1".into(),
+            ],
         )
         .unwrap_err();
         let ae = as_api_error(err.as_ref()).expect("expected ApiError");
@@ -1073,7 +1078,12 @@ mod tests {
         let g = flags(&srv.url);
         let err = cmd_oauth_apps(
             &g,
-            &["delete".into(), "--org=acme".into(), "--yes".into(), "missing".into()],
+            &[
+                "delete".into(),
+                "--org=acme".into(),
+                "--yes".into(),
+                "missing".into(),
+            ],
         )
         .unwrap_err();
         assert!(err.to_string().contains("not found"), "got: {err}");

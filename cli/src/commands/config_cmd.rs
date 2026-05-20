@@ -68,13 +68,18 @@ fn show(g: &GlobalFlags) -> CliResult<()> {
 }
 
 fn get(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
-    let key = args.first().ok_or_else(|| msg("usage: basin config get <key>"))?;
+    let key = args
+        .first()
+        .ok_or_else(|| msg("usage: basin config get <key>"))?;
     let cf = read_config_file()?.unwrap_or_default();
     match key.as_str() {
         "telemetry" => {
             if g.json {
                 // JSON shape: { telemetry: bool }
-                return print_json(&mut std::io::stdout(), &json!({ "telemetry": cf.telemetry }));
+                return print_json(
+                    &mut std::io::stdout(),
+                    &json!({ "telemetry": cf.telemetry }),
+                );
             }
             println!("{}", on_off(cf.telemetry));
             Ok(())
@@ -87,7 +92,9 @@ fn get(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
             println!("{}", cf.api_url);
             Ok(())
         }
-        other => Err(msg(format!("unknown key {other:?} (try: telemetry, default_org, api_url)"))),
+        other => Err(msg(format!(
+            "unknown key {other:?} (try: telemetry, default_org, api_url)"
+        ))),
     }
 }
 
@@ -99,17 +106,25 @@ fn set(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let mut cf: ConfigFile = read_config_file()?.unwrap_or_default();
     match key.as_str() {
         "telemetry" => {
-            let b = parse_on_off(val).ok_or_else(|| msg(format!("telemetry must be on|off (got {val:?})")))?;
+            let b = parse_on_off(val)
+                .ok_or_else(|| msg(format!("telemetry must be on|off (got {val:?})")))?;
             cf.telemetry = b;
         }
         "default_org" => cf.default_org = val.clone(),
         "api_url" => cf.api_url = val.clone(),
-        other => return Err(msg(format!("unknown key {other:?} (try: telemetry, default_org, api_url)"))),
+        other => {
+            return Err(msg(format!(
+                "unknown key {other:?} (try: telemetry, default_org, api_url)"
+            )))
+        }
     }
     write_config_file(&cf).map_err(|e| msg(format!("write config: {e}")))?;
     if g.json {
         // JSON shape: { set: true, key: string, value: string }
-        return print_json(&mut std::io::stdout(), &json!({ "set": true, "key": key, "value": val }));
+        return print_json(
+            &mut std::io::stdout(),
+            &json!({ "set": true, "key": key, "value": val }),
+        );
     }
     println!("Set {key} = {val}.");
     Ok(())

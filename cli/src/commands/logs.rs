@@ -24,7 +24,7 @@ use crate::client::{query_string, version};
 use crate::error::{msg, CliResult};
 use crate::global::{require_client, GlobalFlags};
 use crate::output::print_json;
-use crate::{printinfo, printerr};
+use crate::{printerr, printinfo};
 
 use super::help::help_for_command;
 use super::parse_or_silent;
@@ -77,8 +77,11 @@ pub fn history_once(
     g: &GlobalFlags,
 ) -> CliResult<()> {
     let q = query_string(&[("limit", &limit.to_string())]);
-    let resp: serde_json::Value =
-        c.do_json(Method::GET, &format!("/v1/projects/{project}/logs/history{q}"), None)?;
+    let resp: serde_json::Value = c.do_json(
+        Method::GET,
+        &format!("/v1/projects/{project}/logs/history{q}"),
+        None,
+    )?;
     if g.json {
         // JSON shape: { lines: [ { at: string, level: string, message: string, ... } ] }
         return print_json(&mut std::io::stdout(), &resp);
@@ -136,7 +139,10 @@ fn stream_logs(c: &crate::client::Client, project: &str, g: &GlobalFlags) -> Cli
             let status = resp.status().as_u16();
             if status == 404 || status == 501 {
                 // Streaming not available — fall back to polling.
-                printinfo!(g, "log stream not reachable — polling /history every 3s. Ctrl-C to stop.");
+                printinfo!(
+                    g,
+                    "log stream not reachable — polling /history every 3s. Ctrl-C to stop."
+                );
                 follow_poll(c, project, g)
             } else {
                 let body = resp.text().unwrap_or_default();
@@ -169,15 +175,13 @@ fn follow_poll(c: &crate::client::Client, project: &str, g: &GlobalFlags) -> Cli
 /// and returns the unchanged `since` so the loop can retry.
 ///
 /// Exported so tests can call it once against a stub server.
-pub fn poll_once(
-    c: &crate::client::Client,
-    project: &str,
-    since: &str,
-    g: &GlobalFlags,
-) -> String {
+pub fn poll_once(c: &crate::client::Client, project: &str, since: &str, g: &GlobalFlags) -> String {
     let q = query_string(&[("since", since), ("limit", "200")]);
-    let result: CliResult<serde_json::Value> =
-        c.do_json(Method::GET, &format!("/v1/projects/{project}/logs/history{q}"), None);
+    let result: CliResult<serde_json::Value> = c.do_json(
+        Method::GET,
+        &format!("/v1/projects/{project}/logs/history{q}"),
+        None,
+    );
     let resp = match result {
         Ok(v) => v,
         Err(e) => {
@@ -273,8 +277,14 @@ mod tests {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "GET");
-            assert!(req.path.starts_with("/v1/projects/p1/logs/history"), "path: {}", req.path);
-            Resp::ok(r#"{"lines":[{"at":"2026-01-01T00:00:00Z","level":"INFO","message":"server started"},{"at":"2026-01-01T00:00:01Z","level":"ERROR","message":"oops"}]}"#)
+            assert!(
+                req.path.starts_with("/v1/projects/p1/logs/history"),
+                "path: {}",
+                req.path
+            );
+            Resp::ok(
+                r#"{"lines":[{"at":"2026-01-01T00:00:00Z","level":"INFO","message":"server started"},{"at":"2026-01-01T00:00:01Z","level":"ERROR","message":"oops"}]}"#,
+            )
         });
         let g = flags(&srv.url);
         cmd_logs(&g, &["--project=p1".to_string()]).unwrap();
@@ -284,13 +294,16 @@ mod tests {
     fn history_once_json_shape() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"lines":[{"at":"2026-01-01T00:00:00Z","level":"INFO","message":"hello"}]}"#)
+            Resp::ok(
+                r#"{"lines":[{"at":"2026-01-01T00:00:00Z","level":"INFO","message":"hello"}]}"#,
+            )
         });
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: serde_json::Value =
-            c.do_json(Method::GET, "/v1/projects/p1/logs/history?limit=100", None).unwrap();
+        let resp: serde_json::Value = c
+            .do_json(Method::GET, "/v1/projects/p1/logs/history?limit=100", None)
+            .unwrap();
         print_json(&mut buf, &resp).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         let lines = v["lines"].as_array().unwrap();
@@ -331,7 +344,9 @@ mod tests {
         let srv = TestServer::start(|req: &Req| {
             // Verify "since" is forwarded into the query.
             assert!(req.path.contains("since=2026-01-01"), "path: {}", req.path);
-            Resp::ok(r#"{"lines":[{"at":"2026-01-02T00:00:00Z","level":"INFO","message":"new line"}]}"#)
+            Resp::ok(
+                r#"{"lines":[{"at":"2026-01-02T00:00:00Z","level":"INFO","message":"new line"}]}"#,
+            )
         });
         let g = flags(&srv.url);
         let c = crate::client::Client::new(&srv.url, "tok");
@@ -370,6 +385,8 @@ mod tests {
         // capture implicitly in the harness.
         render_log_line(&serde_json::json!({}));
         render_log_line(&serde_json::json!({"at":"","level":"","message":""}));
-        render_log_line(&serde_json::json!({"at":"2026-01-01T00:00:00Z","level":"INFO","message":"ok"}));
+        render_log_line(
+            &serde_json::json!({"at":"2026-01-01T00:00:00Z","level":"INFO","message":"ok"}),
+        );
     }
 }

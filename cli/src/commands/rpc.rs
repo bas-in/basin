@@ -43,7 +43,9 @@ fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
     let wp = load_working_project(&cwd)?;
     match wp {
         Some(w) if !w.project_ref.is_empty() => Ok(w.project_ref),
-        _ => Err(msg("--project is required (or run `basin link` to bind this directory)")),
+        _ => Err(msg(
+            "--project is required (or run `basin link` to bind this directory)",
+        )),
     }
 }
 
@@ -66,9 +68,9 @@ fn infer_value(s: &str) -> serde_json::Value {
 fn parse_args(pairs: &[String]) -> CliResult<serde_json::Map<String, serde_json::Value>> {
     let mut map = serde_json::Map::new();
     for pair in pairs {
-        let (k, v) = pair.split_once('=').ok_or_else(|| {
-            msg(format!("rpc: --arg must be in k=v form, got {pair:?}"))
-        })?;
+        let (k, v) = pair
+            .split_once('=')
+            .ok_or_else(|| msg(format!("rpc: --arg must be in k=v form, got {pair:?}")))?;
         map.insert(k.to_string(), infer_value(v));
     }
     Ok(map)
@@ -106,10 +108,9 @@ pub fn cmd_rpc(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         return Ok(());
     }
 
-    let fn_name = m
-        .get_one::<String>("fn")
-        .cloned()
-        .ok_or_else(|| msg("usage: basin rpc <fn> [--arg k=v …] [--body @file.json] [--project=<ref>]"))?;
+    let fn_name = m.get_one::<String>("fn").cloned().ok_or_else(|| {
+        msg("usage: basin rpc <fn> [--arg k=v …] [--body @file.json] [--project=<ref>]")
+    })?;
 
     let project_flag = m.get_one::<String>("project").cloned().unwrap_or_default();
     let project = resolve_project_ref(&project_flag)?;
@@ -176,7 +177,12 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     fn flags(url: &str) -> GlobalFlags {
-        GlobalFlags { api_url: url.to_string(), token: "tok".into(), quiet: true, ..Default::default() }
+        GlobalFlags {
+            api_url: url.to_string(),
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        }
     }
 
     fn flags_json(url: &str) -> GlobalFlags {
@@ -244,7 +250,10 @@ mod tests {
 
     #[test]
     fn infer_string_fallback() {
-        assert_eq!(infer_value("hello"), serde_json::Value::String("hello".into()));
+        assert_eq!(
+            infer_value("hello"),
+            serde_json::Value::String("hello".into())
+        );
     }
 
     #[test]
@@ -297,8 +306,7 @@ mod tests {
             Resp::ok(r#"[{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}]"#)
         });
         let g = flags(&srv.url);
-        let result =
-            cmd_rpc(&g, &["list_users".to_string(), "--project=p1".to_string()]);
+        let result = cmd_rpc(&g, &["list_users".to_string(), "--project=p1".to_string()]);
         assert!(result.is_ok(), "rpc list_users should succeed: {result:?}");
     }
 
@@ -313,7 +321,11 @@ mod tests {
         let g = flags(&srv.url);
         let err = cmd_rpc(
             &g,
-            &["add".to_string(), "--project=p1".to_string(), "--arg=x=1".to_string()],
+            &[
+                "add".to_string(),
+                "--project=p1".to_string(),
+                "--arg=x=1".to_string(),
+            ],
         )
         .unwrap_err();
         let ae = crate::error::as_api_error(err.as_ref()).expect("ApiError");
@@ -337,7 +349,11 @@ mod tests {
         // Also verify via the flag on cmd_rpc.
         let result = cmd_rpc(
             &g,
-            &["add".to_string(), "--project=p1".to_string(), "--arg=x=1".to_string()],
+            &[
+                "add".to_string(),
+                "--project=p1".to_string(),
+                "--arg=x=1".to_string(),
+            ],
         );
         assert!(result.is_ok(), "rpc --json should succeed: {result:?}");
     }
@@ -354,8 +370,7 @@ mod tests {
             *c2.lock().unwrap() = body;
             Resp::ok(r#"{"ok":true}"#)
         });
-        let dir = std::env::temp_dir()
-            .join(format!("basin-rpc-body-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("basin-rpc-body-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("body.json");
         std::fs::write(&path, r#"{"amount":100,"currency":"USD"}"#).unwrap();

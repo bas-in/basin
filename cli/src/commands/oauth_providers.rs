@@ -63,12 +63,13 @@ fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
     if !flag_value.is_empty() {
         return Ok(flag_value.to_string());
     }
-    let cwd = std::env::current_dir()
-        .map_err(|e| msg(format!("could not determine cwd: {e}")))?;
+    let cwd = std::env::current_dir().map_err(|e| msg(format!("could not determine cwd: {e}")))?;
     let wp = load_working_project(&cwd)?;
     match wp {
         Some(w) if !w.project_ref.is_empty() => Ok(w.project_ref),
-        _ => Err(msg("--project is required (or run `basin link` to bind this directory)")),
+        _ => Err(msg(
+            "--project is required (or run `basin link` to bind this directory)",
+        )),
     }
 }
 
@@ -122,8 +123,11 @@ fn list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let project_flag = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project_flag)?;
     let c = require_client(g)?;
-    let resp: ProvidersListResp =
-        c.do_json(Method::GET, &format!("/v1/projects/{ref}/oauth-providers"), None)?;
+    let resp: ProvidersListResp = c.do_json(
+        Method::GET,
+        &format!("/v1/projects/{ref}/oauth-providers"),
+        None,
+    )?;
     if g.json {
         // JSON shape: { providers: [ OAuthProvider ] }
         return print_json(&mut std::io::stdout(), &resp);
@@ -175,7 +179,9 @@ fn get(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         // JSON shape: { provider: OAuthProvider }
         return print_json(&mut std::io::stdout(), &resp);
     }
-    let p = resp.provider.ok_or_else(|| msg(format!("OAuth provider {:?} not found", provider)))?;
+    let p = resp
+        .provider
+        .ok_or_else(|| msg(format!("OAuth provider {:?} not found", provider)))?;
     let enabled = if p.enabled { "true" } else { "false" };
     println!("provider:         {}", p.provider);
     println!("enabled:          {}", enabled);
@@ -200,11 +206,17 @@ fn set(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         .ok_or_else(|| {
             msg("usage: basin oauth-providers set <provider> --client-id=<id> --client-secret=<s> [--enabled=true|false] [--scopes=<csv>] [--project=<ref>]")
         })?;
-    let client_id = m.get_one::<String>("client-id").cloned().unwrap_or_default();
+    let client_id = m
+        .get_one::<String>("client-id")
+        .cloned()
+        .unwrap_or_default();
     if client_id.is_empty() {
         return Err(msg("oauth-providers set requires --client-id=<id>"));
     }
-    let client_secret = m.get_one::<String>("client-secret").cloned().unwrap_or_default();
+    let client_secret = m
+        .get_one::<String>("client-secret")
+        .cloned()
+        .unwrap_or_default();
     if client_secret.is_empty() {
         return Err(msg("oauth-providers set requires --client-secret=<secret>"));
     }
@@ -218,8 +230,12 @@ fn set(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     });
     if let Some(enabled_str) = m.get_one::<String>("enabled").filter(|s| !s.is_empty()) {
         match enabled_str.to_lowercase().as_str() {
-            "true" | "1" | "yes" => { body["enabled"] = json!(true); }
-            "false" | "0" | "no" => { body["enabled"] = json!(false); }
+            "true" | "1" | "yes" => {
+                body["enabled"] = json!(true);
+            }
+            "false" | "0" | "no" => {
+                body["enabled"] = json!(false);
+            }
             _ => {
                 return Err(msg(format!(
                     "oauth-providers set --enabled must be true or false, got {:?}",
@@ -278,10 +294,9 @@ fn delete(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         .arg(Arg::new("yes").long("yes").action(ArgAction::SetTrue))
         .arg(Arg::new("provider"));
     let m = parse_or_silent(cmd, args)?;
-    let provider = m
-        .get_one::<String>("provider")
-        .cloned()
-        .ok_or_else(|| msg("usage: basin oauth-providers delete <provider> [--project=<ref>] [--yes]"))?;
+    let provider = m.get_one::<String>("provider").cloned().ok_or_else(|| {
+        msg("usage: basin oauth-providers delete <provider> [--project=<ref>] [--yes]")
+    })?;
     let project_flag = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project_flag)?;
     let c = require_client(g)?;
@@ -373,10 +388,19 @@ mod tests {
     #[test]
     fn set_missing_client_id_errors() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_oauth_providers(
             &g,
-            &["set".into(), "--client-secret=secret".into(), "--project=proj1".into(), "google".into()],
+            &[
+                "set".into(),
+                "--client-secret=secret".into(),
+                "--project=proj1".into(),
+                "google".into(),
+            ],
         )
         .unwrap_err();
         assert!(err.to_string().contains("--client-id"));
@@ -385,10 +409,19 @@ mod tests {
     #[test]
     fn set_missing_client_secret_errors() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_oauth_providers(
             &g,
-            &["set".into(), "--client-id=my-id".into(), "--project=proj1".into(), "google".into()],
+            &[
+                "set".into(),
+                "--client-id=my-id".into(),
+                "--project=proj1".into(),
+                "google".into(),
+            ],
         )
         .unwrap_err();
         assert!(err.to_string().contains("--client-secret"));
@@ -397,7 +430,11 @@ mod tests {
     #[test]
     fn set_missing_provider_errors() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_oauth_providers(
             &g,
             &[
@@ -409,7 +446,7 @@ mod tests {
         )
         .unwrap_err();
         // should error (usage or missing provider)
-        assert!(err.to_string().len() > 0);
+        assert!(!err.to_string().is_empty());
     }
 
     // ── oauth-providers list ──────────────────────────────────────────────────
@@ -442,13 +479,21 @@ mod tests {
     fn list_json_shape() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(format!(r#"{{"providers":[{}]}}"#, sample_provider("google", true, "GOOG")))
+            Resp::ok(format!(
+                r#"{{"providers":[{}]}}"#,
+                sample_provider("google", true, "GOOG")
+            ))
         });
         let g = flags_json(&srv.url);
         let mut out = Vec::new();
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: ProvidersListResp =
-            c.do_json(reqwest::Method::GET, "/v1/projects/proj1/oauth-providers", None).unwrap();
+        let resp: ProvidersListResp = c
+            .do_json(
+                reqwest::Method::GET,
+                "/v1/projects/proj1/oauth-providers",
+                None,
+            )
+            .unwrap();
         print_json(&mut out, &resp).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["providers"][0]["provider"].as_str().unwrap(), "google");
@@ -458,7 +503,11 @@ mod tests {
     #[test]
     fn list_no_project_errors() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_oauth_providers(&g, &["list".into()]).unwrap_err();
         assert!(err.to_string().contains("--project") || err.to_string().contains("link"));
     }
@@ -471,17 +520,27 @@ mod tests {
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "GET");
             assert_eq!(req.path, "/v1/projects/proj1/oauth-providers/google");
-            Resp::ok(format!(r#"{{"provider":{}}}"#, sample_provider("google", true, "GOOG")))
+            Resp::ok(format!(
+                r#"{{"provider":{}}}"#,
+                sample_provider("google", true, "GOOG")
+            ))
         });
         let g = flags(&srv.url);
-        cmd_oauth_providers(&g, &["get".into(), "--project=proj1".into(), "google".into()]).unwrap();
+        cmd_oauth_providers(
+            &g,
+            &["get".into(), "--project=proj1".into(), "google".into()],
+        )
+        .unwrap();
     }
 
     #[test]
     fn get_404() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(404, r#"{"error":{"code":"not_found","message":"provider not found"}}"#)
+            Resp::status(
+                404,
+                r#"{"error":{"code":"not_found","message":"provider not found"}}"#,
+            )
         });
         let g = flags(&srv.url);
         let err = cmd_oauth_providers(
@@ -503,7 +562,10 @@ mod tests {
             let body: serde_json::Value = serde_json::from_str(&req.body).unwrap();
             assert_eq!(body["client_id"], "my-id");
             assert_eq!(body["client_secret"], "supersecret");
-            Resp::ok(format!(r#"{{"provider":{}}}"#, sample_provider("google", true, "my-")))
+            Resp::ok(format!(
+                r#"{{"provider":{}}}"#,
+                sample_provider("google", true, "my-")
+            ))
         });
         let g = flags(&srv.url);
         cmd_oauth_providers(
@@ -551,7 +613,11 @@ mod tests {
         }
         print_json(&mut out, &resp).unwrap();
         let output = String::from_utf8(out).unwrap();
-        assert!(!output.contains(raw_secret), "raw secret leaked into JSON output: {}", output);
+        assert!(
+            !output.contains(raw_secret),
+            "raw secret leaked into JSON output: {}",
+            output
+        );
         let _ = &g;
     }
 
@@ -559,7 +625,10 @@ mod tests {
     fn set_json_shape() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(format!(r#"{{"provider":{}}}"#, sample_provider("google", true, "my-")))
+            Resp::ok(format!(
+                r#"{{"provider":{}}}"#,
+                sample_provider("google", true, "my-")
+            ))
         });
         let g = flags_json(&srv.url);
         let mut out = Vec::new();
@@ -590,7 +659,12 @@ mod tests {
         let g = flags(&srv.url);
         cmd_oauth_providers(
             &g,
-            &["delete".into(), "--project=proj1".into(), "--yes".into(), "github".into()],
+            &[
+                "delete".into(),
+                "--project=proj1".into(),
+                "--yes".into(),
+                "github".into(),
+            ],
         )
         .unwrap();
     }
@@ -598,7 +672,12 @@ mod tests {
     #[test]
     fn delete_json_requires_yes() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { token: "tok".into(), quiet: true, json: true, ..Default::default() };
+        let g = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            json: true,
+            ..Default::default()
+        };
         let err = cmd_oauth_providers(
             &g,
             &["delete".into(), "--project=proj1".into(), "github".into()],
@@ -610,16 +689,25 @@ mod tests {
     #[test]
     fn delete_json_shape() {
         let _cfg = with_temp_config_dir();
-        let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"deleted":true,"provider":"github"}"#)
-        });
+        let srv =
+            TestServer::start(|_req: &Req| Resp::ok(r#"{"deleted":true,"provider":"github"}"#));
         let g = flags_json(&srv.url);
         let mut out = Vec::new();
         #[derive(Serialize)]
-        struct D { deleted: bool, provider: String }
-        print_json(&mut out, &D { deleted: true, provider: "github".into() }).unwrap();
+        struct D {
+            deleted: bool,
+            provider: String,
+        }
+        print_json(
+            &mut out,
+            &D {
+                deleted: true,
+                provider: "github".into(),
+            },
+        )
+        .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(v["deleted"].as_bool().unwrap(), true);
+        assert!(v["deleted"].as_bool().unwrap());
         assert_eq!(v["provider"].as_str().unwrap(), "github");
         let _ = &g;
     }
@@ -628,12 +716,20 @@ mod tests {
     fn delete_422() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(422, r#"{"error":{"code":"validation_error","message":"cannot delete last provider"}}"#)
+            Resp::status(
+                422,
+                r#"{"error":{"code":"validation_error","message":"cannot delete last provider"}}"#,
+            )
         });
         let g = flags(&srv.url);
         let err = cmd_oauth_providers(
             &g,
-            &["delete".into(), "--project=proj1".into(), "--yes".into(), "google".into()],
+            &[
+                "delete".into(),
+                "--project=proj1".into(),
+                "--yes".into(),
+                "google".into(),
+            ],
         )
         .unwrap_err();
         let ae = crate::error::as_api_error(err.as_ref()).expect("expected ApiError");
@@ -645,7 +741,10 @@ mod tests {
     #[test]
     fn unknown_subcommand_is_silent() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_oauth_providers(&g, &["frobnicate".into()]).unwrap_err();
         assert!(crate::error::is_silent(err.as_ref()));
     }
@@ -653,7 +752,10 @@ mod tests {
     #[test]
     fn help_returns_ok() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_oauth_providers(&g, &["help".into()]).is_ok());
     }
 }

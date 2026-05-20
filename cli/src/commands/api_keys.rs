@@ -105,12 +105,13 @@ fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
     if !flag_value.is_empty() {
         return Ok(flag_value.to_string());
     }
-    let cwd = std::env::current_dir()
-        .map_err(|e| msg(format!("could not determine cwd: {e}")))?;
+    let cwd = std::env::current_dir().map_err(|e| msg(format!("could not determine cwd: {e}")))?;
     let wp = load_working_project(&cwd)?;
     match wp {
         Some(w) if !w.project_ref.is_empty() => Ok(w.project_ref),
-        _ => Err(msg("--project is required (or run `basin link` to bind this directory)")),
+        _ => Err(msg(
+            "--project is required (or run `basin link` to bind this directory)",
+        )),
     }
 }
 
@@ -215,8 +216,11 @@ fn create(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         .unwrap_or_else(|| "write".to_string());
     let c = require_client(g)?;
     let body = json!({ "name": name, "scope": scope });
-    let resp: CreateAPIKeyResponse =
-        c.do_json(Method::POST, &format!("/v1/projects/{ref}/api-keys"), Some(body))?;
+    let resp: CreateAPIKeyResponse = c.do_json(
+        Method::POST,
+        &format!("/v1/projects/{ref}/api-keys"),
+        Some(body),
+    )?;
     if g.json {
         // JSON shape: CreateAPIKeyResponse — { key: ProjectAPIKey, full_key: string }
         // full_key is reveal-once; subsequent list calls only see the masked form.
@@ -357,20 +361,21 @@ fn revoke(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     }
 
     let c = require_client(g)?;
-    let out: serde_json::Value = c.do_json(
-        Method::DELETE,
-        &format!("/v1/projects/{ref}/api-keys/{id}"),
-        None,
-    )
-    .map_err(|err| {
-        // Map 404 → friendly message.
-        if let Some(ae) = as_api_error(err.as_ref()) {
-            if ae.http_status == 404 {
-                return msg(format!("api key {:?} not found on project {:?}", id, r#ref));
+    let out: serde_json::Value = c
+        .do_json(
+            Method::DELETE,
+            &format!("/v1/projects/{ref}/api-keys/{id}"),
+            None,
+        )
+        .map_err(|err| {
+            // Map 404 → friendly message.
+            if let Some(ae) = as_api_error(err.as_ref()) {
+                if ae.http_status == 404 {
+                    return msg(format!("api key {:?} not found on project {:?}", id, r#ref));
+                }
             }
-        }
-        err
-    })?;
+            err
+        })?;
     if g.json {
         // JSON shape: passthrough of revoke envelope (commonly { revoked: bool, id: string }).
         return print_json(&mut std::io::stdout(), &out);
@@ -438,7 +443,10 @@ mod tests {
 
     #[test]
     fn mask_api_key_no_prefix_returns_masked_placeholder() {
-        let k = ProjectAPIKey { id: "k3".into(), ..Default::default() };
+        let k = ProjectAPIKey {
+            id: "k3".into(),
+            ..Default::default()
+        };
         let masked = mask_api_key(&k);
         assert!(!masked.is_empty(), "should return placeholder, not empty");
     }
@@ -474,7 +482,10 @@ mod tests {
     #[test]
     fn help_returns_ok() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_api_keys(&g, &["help".into()]).is_ok());
     }
 
@@ -514,8 +525,9 @@ mod tests {
         let mut g = flags_json(&srv.url);
         g.json = true;
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: APIKeysListResp =
-            c.do_json(Method::GET, "/v1/projects/proj1/api-keys", None).unwrap();
+        let resp: APIKeysListResp = c
+            .do_json(Method::GET, "/v1/projects/proj1/api-keys", None)
+            .unwrap();
         assert_eq!(resp.keys.len(), 1);
         assert_eq!(resp.keys[0].id, "k1");
         // JSON output path goes through print_json; verify shape via direct parse.
@@ -543,7 +555,10 @@ mod tests {
     fn list_server_error_returns_api_error() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(403, r#"{"error":{"code":"forbidden","message":"insufficient permissions"}}"#)
+            Resp::status(
+                403,
+                r#"{"error":{"code":"forbidden","message":"insufficient permissions"}}"#,
+            )
         });
         let g = flags(&srv.url);
         let err = cmd_api_keys(&g, &["list".into(), "--project=proj1".into()]).unwrap_err();
@@ -557,13 +572,11 @@ mod tests {
     fn create_happy_path_prints_full_key() {
         let _g = with_temp_config_dir();
         let k = sample_key("k-new", "deploy-key", "write", "bsp_");
-        let body_resp =
-            format!(r#"{{"key":{k},"full_key":"bsp_supersecrettoken1234"}}"#);
+        let body_resp = format!(r#"{{"key":{k},"full_key":"bsp_supersecrettoken1234"}}"#);
         let srv = TestServer::start(move |req: &Req| {
             assert_eq!(req.method, "POST");
             assert_eq!(req.path, "/v1/projects/proj1/api-keys");
-            let b: serde_json::Value =
-                serde_json::from_str(&req.body).unwrap_or_default();
+            let b: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
             assert_eq!(b["name"].as_str().unwrap(), "deploy-key");
             assert_eq!(b["scope"].as_str().unwrap(), "write");
             Resp::ok(body_resp.clone())
@@ -601,8 +614,13 @@ mod tests {
         let body_resp = format!(r#"{{"key":{k},"full_key":"bsp_fulljsontoken5678"}}"#);
         let srv = TestServer::start(move |_req: &Req| Resp::ok(body_resp.clone()));
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: CreateAPIKeyResponse =
-            c.do_json(Method::POST, "/v1/projects/proj1/api-keys", Some(json!({"name":"ci-key","scope":"write"}))).unwrap();
+        let resp: CreateAPIKeyResponse = c
+            .do_json(
+                Method::POST,
+                "/v1/projects/proj1/api-keys",
+                Some(json!({"name":"ci-key","scope":"write"})),
+            )
+            .unwrap();
         assert_eq!(resp.full_key, "bsp_fulljsontoken5678");
         assert!(resp.key.is_some());
         assert_eq!(resp.key.as_ref().unwrap().id, "k-json");
@@ -623,7 +641,12 @@ mod tests {
         let g = flags(&srv.url);
         cmd_api_keys(
             &g,
-            &["rotate".into(), "--project=proj1".into(), "--yes".into(), "k1".into()],
+            &[
+                "rotate".into(),
+                "--project=proj1".into(),
+                "--yes".into(),
+                "k1".into(),
+            ],
         )
         .unwrap();
     }
@@ -638,8 +661,11 @@ mod tests {
             json: true,
             ..Default::default()
         };
-        let err =
-            cmd_api_keys(&g, &["rotate".into(), "--project=proj1".into(), "k1".into()]).unwrap_err();
+        let err = cmd_api_keys(
+            &g,
+            &["rotate".into(), "--project=proj1".into(), "k1".into()],
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("confirmation required"),
             "got: {err}"
@@ -670,8 +696,9 @@ mod tests {
         let body_resp = format!(r#"{{"key":{k},"full_key":"bsp_rotatedjsontoken"}}"#);
         let srv = TestServer::start(move |_req: &Req| Resp::ok(body_resp.clone()));
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: RotateAPIKeyResponse =
-            c.do_json(Method::POST, "/v1/projects/proj1/api-keys/k1/rotate", None).unwrap();
+        let resp: RotateAPIKeyResponse = c
+            .do_json(Method::POST, "/v1/projects/proj1/api-keys/k1/rotate", None)
+            .unwrap();
         assert_eq!(resp.full_key, "bsp_rotatedjsontoken");
     }
 
@@ -688,7 +715,12 @@ mod tests {
         let g = flags(&srv.url);
         cmd_api_keys(
             &g,
-            &["revoke".into(), "--project=proj1".into(), "--yes".into(), "k1".into()],
+            &[
+                "revoke".into(),
+                "--project=proj1".into(),
+                "--yes".into(),
+                "k1".into(),
+            ],
         )
         .unwrap();
     }
@@ -705,7 +737,12 @@ mod tests {
         let g = flags(&srv.url);
         let err = cmd_api_keys(
             &g,
-            &["revoke".into(), "--project=proj1".into(), "--yes".into(), "missing".into()],
+            &[
+                "revoke".into(),
+                "--project=proj1".into(),
+                "--yes".into(),
+                "missing".into(),
+            ],
         )
         .unwrap_err();
         assert!(err.to_string().contains("not found"), "got: {err}");
@@ -723,7 +760,12 @@ mod tests {
         let g = flags(&srv.url);
         let err = cmd_api_keys(
             &g,
-            &["revoke".into(), "--project=proj1".into(), "--yes".into(), "k1".into()],
+            &[
+                "revoke".into(),
+                "--project=proj1".into(),
+                "--yes".into(),
+                "k1".into(),
+            ],
         )
         .unwrap_err();
         let ae = as_api_error(err.as_ref()).expect("expected ApiError");
@@ -735,9 +777,10 @@ mod tests {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"revoked":true,"id":"k1"}"#));
         let c = crate::client::Client::new(&srv.url, "tok");
-        let out: serde_json::Value =
-            c.do_json(Method::DELETE, "/v1/projects/proj1/api-keys/k1", None).unwrap();
-        assert_eq!(out["revoked"].as_bool().unwrap(), true);
+        let out: serde_json::Value = c
+            .do_json(Method::DELETE, "/v1/projects/proj1/api-keys/k1", None)
+            .unwrap();
+        assert!(out["revoked"].as_bool().unwrap());
         assert_eq!(out["id"].as_str().unwrap(), "k1");
     }
 

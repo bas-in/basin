@@ -67,7 +67,9 @@ fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
     let wp = load_working_project(&cwd)?;
     match wp {
         Some(w) if !w.project_ref.is_empty() => Ok(w.project_ref),
-        _ => Err(msg("--project is required (or run `basin link` to bind this directory)")),
+        _ => Err(msg(
+            "--project is required (or run `basin link` to bind this directory)",
+        )),
     }
 }
 
@@ -76,7 +78,9 @@ fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
 pub fn cmd_rows(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let (sub, rest) = match args.split_first() {
         None => {
-            return Err(msg("usage: basin rows (insert | update | delete) <table> ..."));
+            return Err(msg(
+                "usage: basin rows (insert | update | delete) <table> ...",
+            ));
         }
         Some((s, r)) => (s.as_str(), r),
     };
@@ -96,9 +100,7 @@ pub fn cmd_rows(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
             );
             Ok(())
         }
-        other => {
-            Err(msg(format!("unknown subcommand {:?} for rows", other)))
-        }
+        other => Err(msg(format!("unknown subcommand {:?} for rows", other))),
     }
 }
 
@@ -123,10 +125,9 @@ fn rows_insert(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         );
         return Ok(());
     }
-    let table = m
-        .get_one::<String>("table")
-        .cloned()
-        .ok_or_else(|| msg("usage: basin rows insert <table> [--project=<ref>] [--json='{...}']"))?;
+    let table = m.get_one::<String>("table").cloned().ok_or_else(|| {
+        msg("usage: basin rows insert <table> [--project=<ref>] [--json='{...}']")
+    })?;
     let project_flag = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project_flag)?;
     let c = require_client(g)?;
@@ -149,8 +150,8 @@ fn rows_insert_one(
     table: &str,
     row_json: &str,
 ) -> CliResult<()> {
-    let row_obj: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(row_json).map_err(|e| msg(format!("rows insert: invalid JSON for --json: {e}")))?;
+    let row_obj: serde_json::Map<String, serde_json::Value> = serde_json::from_str(row_json)
+        .map_err(|e| msg(format!("rows insert: invalid JSON for --json: {e}")))?;
     let resp: RowInsertResponse = c.do_json(
         Method::POST,
         &format!("/v1/projects/{ref}/tables/{table}/rows"),
@@ -190,15 +191,17 @@ fn rows_insert_batch(
             continue;
         }
         line_num += 1;
-        let row_obj: serde_json::Map<String, serde_json::Value> =
-            match serde_json::from_str(&line) {
-                Ok(v) => v,
-                Err(e) => {
-                    printerr!(g, "rows insert: line {line_num}: invalid JSON: {e}");
-                    last_err = Some(msg(format!("rows insert: line {line_num}: invalid JSON: {e}")));
-                    continue;
-                }
-            };
+        let row_obj: serde_json::Map<String, serde_json::Value> = match serde_json::from_str(&line)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                printerr!(g, "rows insert: line {line_num}: invalid JSON: {e}");
+                last_err = Some(msg(format!(
+                    "rows insert: line {line_num}: invalid JSON: {e}"
+                )));
+                continue;
+            }
+        };
         let result = c.do_json::<RowInsertResponse>(
             Method::POST,
             &format!("/v1/projects/{ref}/tables/{table}/rows"),
@@ -272,8 +275,8 @@ fn rows_update(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         return Err(msg("rows update: --json is required"));
     }
 
-    let patch_obj: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(&json_flag).map_err(|e| msg(format!("rows update: invalid JSON for --json: {e}")))?;
+    let patch_obj: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&json_flag)
+        .map_err(|e| msg(format!("rows update: invalid JSON for --json: {e}")))?;
 
     let project_flag = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project_flag)?;
@@ -320,7 +323,9 @@ fn rows_delete(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     })?;
     let where_clause = m.get_one::<String>("where").cloned().unwrap_or_default();
     if where_clause.is_empty() {
-        return Err(msg("rows delete: --where is required (e.g. --where='id = 42')"));
+        return Err(msg(
+            "rows delete: --where is required (e.g. --where='id = 42')",
+        ));
     }
 
     let project_flag = m.get_one::<String>("project").cloned().unwrap_or_default();
@@ -337,15 +342,18 @@ fn rows_delete(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
             "Delete rows from {ref}.{table} WHERE {where_clause}? This cannot be undone. [y/N] "
         );
         let line = read_line()?;
-        if line.trim().to_ascii_lowercase() != "y" {
+        if !line.trim().eq_ignore_ascii_case("y") {
             println!("Aborted.");
             return Ok(());
         }
     }
 
     let q = query_string(&[("where", &where_clause)]);
-    let resp: RowDeleteResponse =
-        c.do_json(Method::DELETE, &format!("/v1/projects/{ref}/tables/{table}/rows{q}"), None)?;
+    let resp: RowDeleteResponse = c.do_json(
+        Method::DELETE,
+        &format!("/v1/projects/{ref}/tables/{table}/rows{q}"),
+        None,
+    )?;
     if g.json {
         // JSON shape: { "deleted": N }
         return print_json(&mut std::io::stdout(), &resp);
@@ -366,11 +374,22 @@ mod tests {
     };
 
     fn flags(url: &str) -> GlobalFlags {
-        GlobalFlags { api_url: url.to_string(), token: "tok".into(), quiet: true, ..Default::default() }
+        GlobalFlags {
+            api_url: url.to_string(),
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        }
     }
 
     fn flags_json(url: &str) -> GlobalFlags {
-        GlobalFlags { api_url: url.to_string(), token: "tok".into(), quiet: true, json: true, ..Default::default() }
+        GlobalFlags {
+            api_url: url.to_string(),
+            token: "tok".into(),
+            quiet: true,
+            json: true,
+            ..Default::default()
+        }
     }
 
     // ── dispatcher ──────────────────────────────────────────────────────────
@@ -378,21 +397,33 @@ mod tests {
     #[test]
     fn no_args_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
         assert!(cmd_rows(&g, &[]).is_err());
     }
 
     #[test]
     fn unknown_subcommand_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
         assert!(cmd_rows(&g, &["frobnicate".to_string()]).is_err());
     }
 
     #[test]
     fn help_returns_ok() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
         assert!(cmd_rows(&g, &["help".to_string()]).is_ok());
     }
 
@@ -411,12 +442,16 @@ mod tests {
             Resp::ok(r#"{"inserted":1,"rows":[{"id":1,"name":"Alice"}]}"#)
         });
         let g = flags(&srv.url);
-        cmd_rows(&g, &[
-            "insert".to_string(),
-            "--project=p1".to_string(),
-            r#"--json={"name":"Alice"}"#.to_string(),
-            "users".to_string(),
-        ]).unwrap();
+        cmd_rows(
+            &g,
+            &[
+                "insert".to_string(),
+                "--project=p1".to_string(),
+                r#"--json={"name":"Alice"}"#.to_string(),
+                "users".to_string(),
+            ],
+        )
+        .unwrap();
         let body = cap.lock().unwrap();
         assert!(body["row"].is_object(), "body should contain 'row': {body}");
     }
@@ -424,20 +459,32 @@ mod tests {
     #[test]
     fn insert_invalid_json_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
-        let err = cmd_rows(&g, &[
-            "insert".to_string(),
-            "--project=p1".to_string(),
-            "--json=notjson".to_string(),
-            "users".to_string(),
-        ]).unwrap_err();
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
+        let err = cmd_rows(
+            &g,
+            &[
+                "insert".to_string(),
+                "--project=p1".to_string(),
+                "--json=notjson".to_string(),
+                "users".to_string(),
+            ],
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("invalid JSON"), "err: {err}");
     }
 
     #[test]
     fn insert_missing_table_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
         assert!(cmd_rows(&g, &["insert".to_string(), "--project=p1".to_string()]).is_err());
     }
 
@@ -447,11 +494,15 @@ mod tests {
         let srv = TestServer::start(|_req: &Req| {
             Resp::ok(r#"{"inserted":1,"rows":[{"id":1,"name":"Alice"}]}"#)
         });
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
         let resp: RowInsertResponse = c
-            .do_json(Method::POST, "/v1/projects/p1/tables/users/rows", Some(json!({"row":{"name":"Alice"}})))
+            .do_json(
+                Method::POST,
+                "/v1/projects/p1/tables/users/rows",
+                Some(json!({"row":{"name":"Alice"}})),
+            )
             .unwrap();
         print_json(&mut buf, &resp).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
@@ -466,12 +517,16 @@ mod tests {
             Resp::status(404, r#"{"code":"not_found","message":"Table not found."}"#)
         });
         let g = flags(&srv.url);
-        let err = cmd_rows(&g, &[
-            "insert".to_string(),
-            "--project=p1".to_string(),
-            r#"--json={"name":"Alice"}"#.to_string(),
-            "users".to_string(),
-        ]).unwrap_err();
+        let err = cmd_rows(
+            &g,
+            &[
+                "insert".to_string(),
+                "--project=p1".to_string(),
+                r#"--json={"name":"Alice"}"#.to_string(),
+                "users".to_string(),
+            ],
+        )
+        .unwrap_err();
         let ae = crate::error::as_api_error(err.as_ref()).expect("ApiError");
         assert_eq!(ae.http_status, 404);
     }
@@ -480,15 +535,22 @@ mod tests {
     fn insert_403_propagates() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(403, r#"{"code":"forbidden","message":"Insufficient permissions."}"#)
+            Resp::status(
+                403,
+                r#"{"code":"forbidden","message":"Insufficient permissions."}"#,
+            )
         });
         let g = flags(&srv.url);
-        let err = cmd_rows(&g, &[
-            "insert".to_string(),
-            "--project=p1".to_string(),
-            r#"--json={"name":"X"}"#.to_string(),
-            "users".to_string(),
-        ]).unwrap_err();
+        let err = cmd_rows(
+            &g,
+            &[
+                "insert".to_string(),
+                "--project=p1".to_string(),
+                r#"--json={"name":"X"}"#.to_string(),
+                "users".to_string(),
+            ],
+        )
+        .unwrap_err();
         let ae = crate::error::as_api_error(err.as_ref()).expect("ApiError");
         assert_eq!(ae.http_status, 403);
     }
@@ -511,10 +573,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("basin-rows-batch-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let ndjson_path = dir.join("rows.ndjson");
-        std::fs::write(&ndjson_path, r#"{"item":"a"}
+        std::fs::write(
+            &ndjson_path,
+            r#"{"item":"a"}
 {"item":"b"}
 {"item":"c"}
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         // Test the internal function directly.
         let c = crate::client::Client::new(&url, "tok");
@@ -524,13 +590,18 @@ mod tests {
         let mut inserted: i64 = 0;
         for raw in file_content.lines() {
             let line = raw.trim();
-            if line.is_empty() { continue; }
-            let row_obj: serde_json::Map<String, serde_json::Value> = serde_json::from_str(line).unwrap();
-            let resp: RowInsertResponse = c.do_json(
-                Method::POST,
-                &format!("/v1/projects/p1/tables/orders/rows"),
-                Some(json!({ "row": row_obj })),
-            ).unwrap();
+            if line.is_empty() {
+                continue;
+            }
+            let row_obj: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(line).unwrap();
+            let resp: RowInsertResponse = c
+                .do_json(
+                    Method::POST,
+                    "/v1/projects/p1/tables/orders/rows",
+                    Some(json!({ "row": row_obj })),
+                )
+                .unwrap();
             inserted += resp.inserted;
         }
 
@@ -554,54 +625,79 @@ mod tests {
             Resp::ok(r#"{"row":{"id":42,"name":"Bob"}}"#)
         });
         let g = flags(&srv.url);
-        cmd_rows(&g, &[
-            "update".to_string(),
-            "--project=p1".to_string(),
-            "--pk=42".to_string(),
-            r#"--json={"name":"Bob"}"#.to_string(),
-            "users".to_string(),
-        ]).unwrap();
+        cmd_rows(
+            &g,
+            &[
+                "update".to_string(),
+                "--project=p1".to_string(),
+                "--pk=42".to_string(),
+                r#"--json={"name":"Bob"}"#.to_string(),
+                "users".to_string(),
+            ],
+        )
+        .unwrap();
         let body = cap.lock().unwrap();
-        assert!(body["patch"].is_object(), "body should contain 'patch': {body}");
+        assert!(
+            body["patch"].is_object(),
+            "body should contain 'patch': {body}"
+        );
     }
 
     #[test]
     fn update_missing_pk_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
-        let err = cmd_rows(&g, &[
-            "update".to_string(),
-            "--project=p1".to_string(),
-            r#"--json={"name":"Bob"}"#.to_string(),
-            "users".to_string(),
-        ]).unwrap_err();
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
+        let err = cmd_rows(
+            &g,
+            &[
+                "update".to_string(),
+                "--project=p1".to_string(),
+                r#"--json={"name":"Bob"}"#.to_string(),
+                "users".to_string(),
+            ],
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("--pk is required"), "err: {err}");
     }
 
     #[test]
     fn update_missing_json_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
-        let err = cmd_rows(&g, &[
-            "update".to_string(),
-            "--project=p1".to_string(),
-            "--pk=1".to_string(),
-            "users".to_string(),
-        ]).unwrap_err();
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
+        let err = cmd_rows(
+            &g,
+            &[
+                "update".to_string(),
+                "--project=p1".to_string(),
+                "--pk=1".to_string(),
+                "users".to_string(),
+            ],
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("--json is required"), "err: {err}");
     }
 
     #[test]
     fn update_json_shape() {
         let _g = with_temp_config_dir();
-        let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"row":{"id":1,"name":"updated"}}"#)
-        });
-        let g = flags_json(&srv.url);
+        let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"row":{"id":1,"name":"updated"}}"#));
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
         let resp: RowUpdateResponse = c
-            .do_json(Method::PATCH, "/v1/projects/p1/tables/users/rows/1", Some(json!({"patch":{"name":"updated"}})))
+            .do_json(
+                Method::PATCH,
+                "/v1/projects/p1/tables/users/rows/1",
+                Some(json!({"patch":{"name":"updated"}})),
+            )
             .unwrap();
         print_json(&mut buf, &resp).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
@@ -612,16 +708,23 @@ mod tests {
     fn update_422_propagates() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(422, r#"{"code":"validation_error","message":"constraint violation"}"#)
+            Resp::status(
+                422,
+                r#"{"code":"validation_error","message":"constraint violation"}"#,
+            )
         });
         let g = flags(&srv.url);
-        let err = cmd_rows(&g, &[
-            "update".to_string(),
-            "--project=p1".to_string(),
-            "--pk=99".to_string(),
-            r#"--json={"name":"X"}"#.to_string(),
-            "users".to_string(),
-        ]).unwrap_err();
+        let err = cmd_rows(
+            &g,
+            &[
+                "update".to_string(),
+                "--project=p1".to_string(),
+                "--pk=99".to_string(),
+                r#"--json={"name":"X"}"#.to_string(),
+                "users".to_string(),
+            ],
+        )
+        .unwrap_err();
         let ae = crate::error::as_api_error(err.as_ref()).expect("ApiError");
         assert_eq!(ae.http_status, 422);
     }
@@ -639,13 +742,17 @@ mod tests {
             Resp::ok(r#"{"deleted":3}"#)
         });
         let g = flags(&srv.url);
-        cmd_rows(&g, &[
-            "delete".to_string(),
-            "--project=p1".to_string(),
-            "--where=age > 30".to_string(),
-            "--yes".to_string(),
-            "users".to_string(),
-        ]).unwrap();
+        cmd_rows(
+            &g,
+            &[
+                "delete".to_string(),
+                "--project=p1".to_string(),
+                "--where=age > 30".to_string(),
+                "--yes".to_string(),
+                "users".to_string(),
+            ],
+        )
+        .unwrap();
         let path = cap.lock().unwrap();
         assert!(path.contains("where="), "path: {path}");
     }
@@ -653,38 +760,65 @@ mod tests {
     #[test]
     fn delete_missing_where_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
-        let err = cmd_rows(&g, &[
-            "delete".to_string(),
-            "--project=p1".to_string(),
-            "--yes".to_string(),
-            "users".to_string(),
-        ]).unwrap_err();
-        assert!(err.to_string().contains("--where is required"), "err: {err}");
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
+        let err = cmd_rows(
+            &g,
+            &[
+                "delete".to_string(),
+                "--project=p1".to_string(),
+                "--yes".to_string(),
+                "users".to_string(),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("--where is required"),
+            "err: {err}"
+        );
     }
 
     #[test]
     fn delete_json_requires_yes() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), json: true, ..Default::default() };
-        let err = cmd_rows(&g, &[
-            "delete".to_string(),
-            "--project=p1".to_string(),
-            "--where=id=1".to_string(),
-            "users".to_string(),
-        ]).unwrap_err();
-        assert!(err.to_string().contains("confirmation required"), "err: {err}");
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            json: true,
+            ..Default::default()
+        };
+        let err = cmd_rows(
+            &g,
+            &[
+                "delete".to_string(),
+                "--project=p1".to_string(),
+                "--where=id=1".to_string(),
+                "users".to_string(),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("confirmation required"),
+            "err: {err}"
+        );
     }
 
     #[test]
     fn delete_json_shape() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"deleted":5}"#));
-        let g = flags_json(&srv.url);
+        let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
         let resp: RowDeleteResponse = c
-            .do_json(Method::DELETE, "/v1/projects/p1/tables/users/rows?where=age%3E18", None)
+            .do_json(
+                Method::DELETE,
+                "/v1/projects/p1/tables/users/rows?where=age%3E18",
+                None,
+            )
             .unwrap();
         print_json(&mut buf, &resp).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
@@ -695,16 +829,23 @@ mod tests {
     fn delete_server_error_propagates() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(422, r#"{"code":"rls_violation","message":"RLS policy blocks delete."}"#)
+            Resp::status(
+                422,
+                r#"{"code":"rls_violation","message":"RLS policy blocks delete."}"#,
+            )
         });
         let g = flags(&srv.url);
-        let err = cmd_rows(&g, &[
-            "delete".to_string(),
-            "--project=p1".to_string(),
-            "--where=id=1".to_string(),
-            "--yes".to_string(),
-            "users".to_string(),
-        ]).unwrap_err();
+        let err = cmd_rows(
+            &g,
+            &[
+                "delete".to_string(),
+                "--project=p1".to_string(),
+                "--where=id=1".to_string(),
+                "--yes".to_string(),
+                "users".to_string(),
+            ],
+        )
+        .unwrap_err();
         let ae = crate::error::as_api_error(err.as_ref()).expect("ApiError");
         assert_eq!(ae.http_status, 422);
     }
@@ -714,13 +855,24 @@ mod tests {
     #[test]
     fn no_project_resolution_errors() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
         // No --project and no working project config.
-        let err = cmd_rows(&g, &[
-            "insert".to_string(),
-            r#"--json={"x":1}"#.to_string(),
-            "users".to_string(),
-        ]).unwrap_err();
-        assert!(err.to_string().contains("--project") || err.to_string().contains("basin link"), "err: {err}");
+        let err = cmd_rows(
+            &g,
+            &[
+                "insert".to_string(),
+                r#"--json={"x":1}"#.to_string(),
+                "users".to_string(),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("--project") || err.to_string().contains("basin link"),
+            "err: {err}"
+        );
     }
 }

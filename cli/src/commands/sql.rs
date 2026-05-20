@@ -72,7 +72,13 @@ pub fn cmd_sql(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         // rows_affected: int?, elapsed_ms: int }
         return print_json(&mut std::io::stdout(), &res);
     }
-    render_rows(g, &res.columns, &res.rows, res.rows_affected, res.elapsed_ms)
+    render_rows(
+        g,
+        &res.columns,
+        &res.rows,
+        res.rows_affected,
+        res.elapsed_ms,
+    )
 }
 
 /// render_rows is the table-output path shared by `basin sql` and table
@@ -131,7 +137,12 @@ mod tests {
     }
 
     fn flags(url: &str) -> GlobalFlags {
-        GlobalFlags { api_url: url.to_string(), token: "tok".into(), quiet: true, ..Default::default() }
+        GlobalFlags {
+            api_url: url.to_string(),
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -139,7 +150,11 @@ mod tests {
         let _g = with_temp_config_dir();
         let cap = Arc::new(Mutex::new(String::new()));
         let srv = stub_capturing(Arc::clone(&cap));
-        cmd_sql(&flags(&srv.url), &["--project=p1".into(), "-e".into(), "SELECT 1".into()]).unwrap();
+        cmd_sql(
+            &flags(&srv.url),
+            &["--project=p1".into(), "-e".into(), "SELECT 1".into()],
+        )
+        .unwrap();
         assert_eq!(*cap.lock().unwrap(), "SELECT 1");
     }
 
@@ -154,7 +169,13 @@ mod tests {
         std::fs::write(&path, "FROM_FILE").unwrap();
         cmd_sql(
             &flags(&srv.url),
-            &["--project=p1".into(), "-e".into(), "INLINE".into(), "-f".into(), path.display().to_string()],
+            &[
+                "--project=p1".into(),
+                "-e".into(),
+                "INLINE".into(),
+                "-f".into(),
+                path.display().to_string(),
+            ],
         )
         .unwrap();
         assert_eq!(*cap.lock().unwrap(), "INLINE");
@@ -163,7 +184,11 @@ mod tests {
     #[test]
     fn requires_project() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { api_url: "http://127.0.0.1:1".into(), token: "tok".into(), ..Default::default() };
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
         assert!(cmd_sql(&g, &["-e".into(), "SELECT 1".into()]).is_err());
     }
 }

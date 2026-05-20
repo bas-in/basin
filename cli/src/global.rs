@@ -100,9 +100,7 @@ pub fn parse_global_flags(argv: &[String]) -> CliResult<(GlobalFlags, Vec<String
             s if s.starts_with("--token=") => {
                 g.token = s.trim_start_matches("--token=").to_string()
             }
-            s if s.starts_with("--org=") => {
-                g.org_slug = s.trim_start_matches("--org=").to_string()
-            }
+            s if s.starts_with("--org=") => g.org_slug = s.trim_start_matches("--org=").to_string(),
             _ => rest.push(a.clone()),
         }
         i += 1;
@@ -116,7 +114,9 @@ pub fn resolve_token(g: &GlobalFlags, loaded: Option<&ConfigFile>) -> String {
     if !g.token.is_empty() {
         return g.token.clone();
     }
-    let Some(cf) = loaded else { return String::new() };
+    let Some(cf) = loaded else {
+        return String::new();
+    };
     if !g.org_slug.is_empty() {
         if let Some(t) = cf.tokens.get(&g.org_slug) {
             if !t.is_empty() {
@@ -142,7 +142,9 @@ pub fn require_client(g: &GlobalFlags) -> CliResult<Client> {
     let mut api_url = g.api_url.clone();
     if let Some(cf) = &cfg {
         if !cf.api_url.is_empty()
-            && std::env::var("BASIN_API").map(|v| v.is_empty()).unwrap_or(true)
+            && std::env::var("BASIN_API")
+                .map(|v| v.is_empty())
+                .unwrap_or(true)
             && api_url == default_api_url()
         {
             api_url = cf.api_url.clone();

@@ -117,8 +117,7 @@ fn list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         return Err(msg("members list requires --org=<slug>"));
     }
     let c = require_client(g)?;
-    let resp: MembersListResp =
-        c.do_json(Method::GET, &format!("/v1/orgs/{org}/members"), None)?;
+    let resp: MembersListResp = c.do_json(Method::GET, &format!("/v1/orgs/{org}/members"), None)?;
     if g.json {
         // JSON shape: { "members": [ { user_id, email, role, joined_at } ] }
         return print_json(&mut std::io::stdout(), &json!({ "members": resp.members }));
@@ -161,7 +160,11 @@ fn invite(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let body = json!({ "email": email, "role": role });
     let c = require_client(g)?;
     let resp: InvitationResp = c
-        .do_json(Method::POST, &format!("/v1/orgs/{org}/members/invite"), Some(body))
+        .do_json(
+            Method::POST,
+            &format!("/v1/orgs/{org}/members/invite"),
+            Some(body),
+        )
         .map_err(|e| {
             if let Some(ae) = as_api_error(e.as_ref()) {
                 if ae.http_status == 409 {
@@ -230,8 +233,11 @@ fn remove(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         removed: bool,
         user_id: String,
     }
-    let resp: RemoveResp =
-        c.do_json(Method::DELETE, &format!("/v1/orgs/{org}/members/{user_id}"), None)?;
+    let resp: RemoveResp = c.do_json(
+        Method::DELETE,
+        &format!("/v1/orgs/{org}/members/{user_id}"),
+        None,
+    )?;
     if g.json {
         // JSON shape: { "removed": true, "user_id": "..." }
         return print_json(&mut std::io::stdout(), &resp);
@@ -262,8 +268,11 @@ fn role(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     }
     let body = json!({ "role": new_role });
     let c = require_client(g)?;
-    let resp: MemberResp =
-        c.do_json(Method::PATCH, &format!("/v1/orgs/{org}/members/{user_id}"), Some(body))?;
+    let resp: MemberResp = c.do_json(
+        Method::PATCH,
+        &format!("/v1/orgs/{org}/members/{user_id}"),
+        Some(body),
+    )?;
     if g.json {
         // JSON shape: { "member": { user_id, role } }
         return print_json(&mut std::io::stdout(), &json!({ "member": resp.member }));
@@ -313,7 +322,9 @@ mod tests {
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "GET");
             assert_eq!(req.path, "/v1/orgs/acme/members");
-            Resp::ok(r#"{"members":[{"user_id":"user-1","email":"alice@example.com","role":"admin","joined_at":"2026-01-01T00:00:00Z"},{"user_id":"user-2","email":"bob@example.com","role":"member","joined_at":"2026-01-01T00:00:00Z"}]}"#)
+            Resp::ok(
+                r#"{"members":[{"user_id":"user-1","email":"alice@example.com","role":"admin","joined_at":"2026-01-01T00:00:00Z"},{"user_id":"user-2","email":"bob@example.com","role":"member","joined_at":"2026-01-01T00:00:00Z"}]}"#,
+            )
         });
         let _cfg = with_temp_config_dir();
         let err = cmd_members(&g(&srv), &["list".into(), "--org=acme".into()]);
@@ -332,7 +343,11 @@ mod tests {
     #[test]
     fn list_missing_org() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_members(&g0, &["list".into()]);
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("--org"));
@@ -341,7 +356,9 @@ mod tests {
     #[test]
     fn list_json_shape() {
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"members":[{"user_id":"user-1","email":"alice@example.com","role":"admin","joined_at":"2026-01-01T00:00:00Z"}]}"#)
+            Resp::ok(
+                r#"{"members":[{"user_id":"user-1","email":"alice@example.com","role":"admin","joined_at":"2026-01-01T00:00:00Z"}]}"#,
+            )
         });
         let _cfg = with_temp_config_dir();
         let mut out = Vec::new();
@@ -361,7 +378,10 @@ mod tests {
     #[test]
     fn list_403() {
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(403, r#"{"error":{"code":"forbidden","message":"Insufficient permissions."}}"#)
+            Resp::status(
+                403,
+                r#"{"error":{"code":"forbidden","message":"Insufficient permissions."}}"#,
+            )
         });
         let _cfg = with_temp_config_dir();
         let err = cmd_members(&g(&srv), &["list".into(), "--org=acme".into()]);
@@ -381,12 +401,19 @@ mod tests {
             let body: serde_json::Value = serde_json::from_str(&req.body).unwrap();
             assert_eq!(body["email"], "charlie@example.com");
             assert_eq!(body["role"], "member");
-            Resp::ok(r#"{"invitation":{"id":"inv-1","email":"charlie@example.com","role":"member","expires_at":"2026-06-01T00:00:00Z","status":"pending"}}"#)
+            Resp::ok(
+                r#"{"invitation":{"id":"inv-1","email":"charlie@example.com","role":"member","expires_at":"2026-06-01T00:00:00Z","status":"pending"}}"#,
+            )
         });
         let _cfg = with_temp_config_dir();
         let err = cmd_members(
             &g(&srv),
-            &["invite".into(), "--org=acme".into(), "--email=charlie@example.com".into(), "--role=member".into()],
+            &[
+                "invite".into(),
+                "--org=acme".into(),
+                "--email=charlie@example.com".into(),
+                "--role=member".into(),
+            ],
         );
         assert!(err.is_ok(), "invite: {:?}", err);
     }
@@ -394,7 +421,11 @@ mod tests {
     #[test]
     fn invite_missing_email() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_members(&g0, &["invite".into(), "--org=acme".into()]);
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("--email"));
@@ -403,12 +434,19 @@ mod tests {
     #[test]
     fn invite_409_conflict() {
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(409, r#"{"error":{"code":"conflict","message":"Member already exists."}}"#)
+            Resp::status(
+                409,
+                r#"{"error":{"code":"conflict","message":"Member already exists."}}"#,
+            )
         });
         let _cfg = with_temp_config_dir();
         let err = cmd_members(
             &g(&srv),
-            &["invite".into(), "--org=acme".into(), "--email=alice@example.com".into()],
+            &[
+                "invite".into(),
+                "--org=acme".into(),
+                "--email=alice@example.com".into(),
+            ],
         );
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("already"));
@@ -417,7 +455,9 @@ mod tests {
     #[test]
     fn invite_json_shape() {
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"invitation":{"id":"inv-1","email":"charlie@example.com","role":"admin","expires_at":"2026-06-01T00:00:00Z","status":"pending"}}"#)
+            Resp::ok(
+                r#"{"invitation":{"id":"inv-1","email":"charlie@example.com","role":"admin","expires_at":"2026-06-01T00:00:00Z","status":"pending"}}"#,
+            )
         });
         let _cfg = with_temp_config_dir();
         let mut out = Vec::new();
@@ -449,7 +489,12 @@ mod tests {
         let _cfg = with_temp_config_dir();
         let err = cmd_members(
             &g(&srv),
-            &["remove".into(), "--org=acme".into(), "--user-id=user-1".into(), "--yes".into()],
+            &[
+                "remove".into(),
+                "--org=acme".into(),
+                "--user-id=user-1".into(),
+                "--yes".into(),
+            ],
         );
         assert!(err.is_ok(), "remove: {:?}", err);
     }
@@ -457,7 +502,11 @@ mod tests {
     #[test]
     fn remove_missing_user_id() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_members(&g0, &["remove".into(), "--org=acme".into()]);
         assert!(err.is_err());
     }
@@ -465,22 +514,46 @@ mod tests {
     #[test]
     fn remove_json_requires_yes() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { token: "tok".into(), quiet: true, json: true, ..Default::default() };
-        let err = cmd_members(&g0, &["remove".into(), "--org=acme".into(), "--user-id=user-1".into()]);
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            json: true,
+            ..Default::default()
+        };
+        let err = cmd_members(
+            &g0,
+            &[
+                "remove".into(),
+                "--org=acme".into(),
+                "--user-id=user-1".into(),
+            ],
+        );
         assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("confirmation required"));
+        assert!(err
+            .unwrap_err()
+            .to_string()
+            .contains("confirmation required"));
     }
 
     #[test]
     fn remove_json_shape() {
-        let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"removed":true,"user_id":"user-1"}"#)
-        });
+        let srv =
+            TestServer::start(|_req: &Req| Resp::ok(r#"{"removed":true,"user_id":"user-1"}"#));
         let _cfg = with_temp_config_dir();
         let mut out = Vec::new();
         #[derive(Serialize)]
-        struct R { removed: bool, user_id: String }
-        print_json(&mut out, &R { removed: true, user_id: "user-1".into() }).unwrap();
+        struct R {
+            removed: bool,
+            user_id: String,
+        }
+        print_json(
+            &mut out,
+            &R {
+                removed: true,
+                user_id: "user-1".into(),
+            },
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed["removed"], true);
         assert_eq!(parsed["user_id"], "user-1");
@@ -501,7 +574,12 @@ mod tests {
         let _cfg = with_temp_config_dir();
         let err = cmd_members(
             &g(&srv),
-            &["role".into(), "--org=acme".into(), "--user-id=user-1".into(), "--role=admin".into()],
+            &[
+                "role".into(),
+                "--org=acme".into(),
+                "--user-id=user-1".into(),
+                "--role=admin".into(),
+            ],
         );
         assert!(err.is_ok(), "role: {:?}", err);
     }
@@ -509,11 +587,19 @@ mod tests {
     #[test]
     fn role_missing_flags() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         // Missing --role
         let err = cmd_members(
             &g0,
-            &["role".into(), "--org=acme".into(), "--user-id=user-1".into()],
+            &[
+                "role".into(),
+                "--org=acme".into(),
+                "--user-id=user-1".into(),
+            ],
         );
         assert!(err.is_err());
     }
@@ -525,7 +611,11 @@ mod tests {
         });
         let _cfg = with_temp_config_dir();
         let mut out = Vec::new();
-        let mb = Member { user_id: "user-1".into(), role: "owner".into(), ..Default::default() };
+        let mb = Member {
+            user_id: "user-1".into(),
+            role: "owner".into(),
+            ..Default::default()
+        };
         print_json(&mut out, &json!({ "member": mb })).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed["member"]["role"], "owner");
@@ -535,12 +625,20 @@ mod tests {
     #[test]
     fn role_404() {
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(404, r#"{"error":{"code":"not_found","message":"Member not found."}}"#)
+            Resp::status(
+                404,
+                r#"{"error":{"code":"not_found","message":"Member not found."}}"#,
+            )
         });
         let _cfg = with_temp_config_dir();
         let err = cmd_members(
             &g(&srv),
-            &["role".into(), "--org=acme".into(), "--user-id=ghost".into(), "--role=member".into()],
+            &[
+                "role".into(),
+                "--org=acme".into(),
+                "--user-id=ghost".into(),
+                "--role=member".into(),
+            ],
         );
         assert!(err.is_err());
         let e = err.unwrap_err();
@@ -553,7 +651,10 @@ mod tests {
     #[test]
     fn unknown_subcommand() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_members(&g0, &["frobnicate".into()]);
         assert!(err.is_err());
     }
@@ -561,7 +662,10 @@ mod tests {
     #[test]
     fn help_returns_ok() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_members(&g0, &["help".into()]);
         assert!(err.is_ok());
     }
@@ -569,7 +673,10 @@ mod tests {
     #[test]
     fn no_args_returns_error() {
         let _cfg = with_temp_config_dir();
-        let g0 = GlobalFlags { quiet: true, ..Default::default() };
+        let g0 = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_members(&g0, &[]);
         assert!(err.is_err());
     }

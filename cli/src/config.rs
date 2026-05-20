@@ -81,7 +81,9 @@ pub fn config_dir() -> CliResult<PathBuf> {
             return Ok(PathBuf::from(v).join("basin"));
         }
     }
-    Err(msg("could not determine config dir (set XDG_CONFIG_HOME or HOME)"))
+    Err(msg(
+        "could not determine config dir (set XDG_CONFIG_HOME or HOME)",
+    ))
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -376,7 +378,8 @@ mod tests {
 
     #[test]
     fn working_project_ignores_unknown_and_comments() {
-        let toml = "# header\nproject_ref = \"p1\"\nunknown_key = 5\ndefault_branch = dev # inline\n";
+        let toml =
+            "# header\nproject_ref = \"p1\"\nunknown_key = 5\ndefault_branch = dev # inline\n";
         let wp = parse_working_project_toml(toml).unwrap();
         assert_eq!(wp.project_ref, "p1");
         assert_eq!(wp.default_branch, "dev");

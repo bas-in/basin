@@ -82,8 +82,7 @@ fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
     if !flag_value.is_empty() {
         return Ok(flag_value.to_string());
     }
-    let cwd = std::env::current_dir()
-        .map_err(|e| msg(format!("could not determine cwd: {e}")))?;
+    let cwd = std::env::current_dir().map_err(|e| msg(format!("could not determine cwd: {e}")))?;
     let wp = load_working_project(&cwd)?;
     match wp {
         Some(w) if !w.project_ref.is_empty() => Ok(w.project_ref),
@@ -208,10 +207,7 @@ fn byo_bucket_get(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let resp: Resp = c.do_json(Method::GET, &format!("/v1/projects/{ref}/storage"), None)?;
     if g.json {
         // JSON shape: { "storage": { provider, bucket, region, configured_at } | null }
-        return print_json(
-            &mut std::io::stdout(),
-            &json!({ "storage": resp.storage }),
-        );
+        return print_json(&mut std::io::stdout(), &json!({ "storage": resp.storage }));
     }
     match resp.storage {
         None => println!("(no BYO bucket configured)"),
@@ -270,10 +266,7 @@ fn byo_bucket_put(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         .get_one::<String>("secret-key")
         .cloned()
         .unwrap_or_default();
-    let endpoint = m
-        .get_one::<String>("endpoint")
-        .cloned()
-        .unwrap_or_default();
+    let endpoint = m.get_one::<String>("endpoint").cloned().unwrap_or_default();
 
     if provider.is_empty() {
         return Err(msg(
@@ -394,10 +387,7 @@ fn byo_bucket_probe(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     if resp.ok {
         println!("Bucket probe OK (latency={:.1}ms)", resp.latency_ms);
     } else {
-        let err_msg = resp
-            .error
-            .as_deref()
-            .unwrap_or("(unknown error)");
+        let err_msg = resp.error.as_deref().unwrap_or("(unknown error)");
         println!("Bucket probe FAILED: {err_msg}");
     }
     Ok(())
@@ -449,11 +439,7 @@ fn byo_bucket_delete(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         #[serde(default)]
         revoked: bool,
     }
-    let resp: Resp = c.do_json(
-        Method::DELETE,
-        &format!("/v1/projects/{ref}/storage"),
-        None,
-    )?;
+    let resp: Resp = c.do_json(Method::DELETE, &format!("/v1/projects/{ref}/storage"), None)?;
     if g.json {
         // JSON shape: { "revoked": true }
         return print_json(&mut std::io::stdout(), &resp);
@@ -540,11 +526,7 @@ fn byo_kms_get(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     struct Resp {
         kms: Option<BYOKMSConfig>,
     }
-    let resp: Resp = c.do_json(
-        Method::GET,
-        &format!("/v1/projects/{ref}/encryption"),
-        None,
-    )?;
+    let resp: Resp = c.do_json(Method::GET, &format!("/v1/projects/{ref}/encryption"), None)?;
     if g.json {
         // JSON shape: { "kms": { provider, key_id, configured_at } | null }
         return print_json(&mut std::io::stdout(), &json!({ "kms": resp.kms }));
@@ -585,11 +567,8 @@ fn read_auth_blob(path: &str) -> CliResult<Option<Value>> {
     if raw.is_empty() {
         return Err(msg("byo kms put: auth JSON is empty"));
     }
-    let blob: Value = serde_json::from_str(raw).map_err(|e| {
-        msg(format!(
-            "byo kms put: auth JSON is not valid JSON: {e}"
-        ))
-    })?;
+    let blob: Value = serde_json::from_str(raw)
+        .map_err(|e| msg(format!("byo kms put: auth JSON is not valid JSON: {e}")))?;
     Ok(Some(blob))
 }
 
@@ -1036,11 +1015,7 @@ fn byo_engine_get(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     struct Resp {
         engine: Option<BYOEngineConfig>,
     }
-    let resp: Resp = c.do_json(
-        Method::GET,
-        &format!("/v1/projects/{ref}/byo-engine"),
-        None,
-    )?;
+    let resp: Resp = c.do_json(Method::GET, &format!("/v1/projects/{ref}/byo-engine"), None)?;
     if g.json {
         // JSON shape: { "engine": { url, configured_at } | null }
         return print_json(&mut std::io::stdout(), &json!({ "engine": resp.engine }));
@@ -1274,14 +1249,20 @@ mod tests {
     #[test]
     fn byo_no_args_ok() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_byo(&g, &[]).is_ok());
     }
 
     #[test]
     fn byo_help_ok() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_byo(&g, &["help".into()]).is_ok());
     }
 
@@ -1472,13 +1453,10 @@ mod tests {
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "PUT");
             assert_eq!(req.path, "/v1/projects/proj1/storage");
-            let body: serde_json::Value =
-                serde_json::from_str(&req.body).unwrap_or_default();
+            let body: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
             assert_eq!(body["provider"], "s3");
             assert_eq!(body["bucket"], "my-bucket");
-            Resp::ok(
-                r#"{"storage":{"provider":"s3","bucket":"my-bucket","region":"us-east-1"}}"#,
-            )
+            Resp::ok(r#"{"storage":{"provider":"s3","bucket":"my-bucket","region":"us-east-1"}}"#)
         });
         cmd_byo(
             &flags(&srv.url),
@@ -1584,8 +1562,7 @@ mod tests {
     #[test]
     fn byo_bucket_probe_json_shape() {
         let _g = with_temp_config_dir();
-        let srv =
-            TestServer::start(|_req: &Req| Resp::ok(r#"{"ok":true,"latency_ms":8.0}"#));
+        let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"ok":true,"latency_ms":8.0}"#));
         cmd_byo(
             &json_flags(&srv.url),
             &["bucket".into(), "probe".into(), "--project=proj1".into()],
@@ -1783,8 +1760,7 @@ mod tests {
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "PUT");
             assert_eq!(req.path, "/v1/projects/proj1/byo-engine");
-            let body: serde_json::Value =
-                serde_json::from_str(&req.body).unwrap_or_default();
+            let body: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
             assert_eq!(body["url"], "https://engine.example.com");
             assert_eq!(body["shared_key"], "mysecret");
             Resp::ok(
@@ -1875,9 +1851,7 @@ mod tests {
     fn byo_engine_probe_failure() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(
-                r#"{"ok":false,"latency_ms":0,"error":"dial tcp: connection refused"}"#,
-            )
+            Resp::ok(r#"{"ok":false,"latency_ms":0,"error":"dial tcp: connection refused"}"#)
         });
         cmd_byo(
             &flags(&srv.url),
@@ -1889,8 +1863,7 @@ mod tests {
     #[test]
     fn byo_engine_probe_json_shape() {
         let _g = with_temp_config_dir();
-        let srv =
-            TestServer::start(|_req: &Req| Resp::ok(r#"{"ok":true,"latency_ms":3.0}"#));
+        let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"ok":true,"latency_ms":3.0}"#));
         cmd_byo(
             &json_flags(&srv.url),
             &["engine".into(), "probe".into(), "--project=proj1".into()],
@@ -2135,7 +2108,7 @@ mod tests {
                 "--project=proj1".into(),
                 "--provider=aws".into(),
                 "--key-id=k1".into(),
-                format!("--auth-json={}", bad_file.display()).into(),
+                format!("--auth-json={}", bad_file.display()),
                 "--yes".into(),
             ],
         );
@@ -2161,8 +2134,7 @@ mod tests {
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "POST");
             assert_eq!(req.path, "/v1/projects/proj1/encryption");
-            let body: serde_json::Value =
-                serde_json::from_str(&req.body).unwrap_or_default();
+            let body: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
             assert!(body["auth"].is_object(), "auth field should be present");
             Resp::ok(
                 r#"{"kms":{"provider":"gcp","key_id":"projects/p/keys/k","configured_at":"2026-05-01T00:00:00Z"}}"#,
@@ -2176,7 +2148,7 @@ mod tests {
                 "--project=proj1".into(),
                 "--provider=gcp".into(),
                 "--key-id=projects/p/keys/k".into(),
-                format!("--auth-json={}", cred_file.display()).into(),
+                format!("--auth-json={}", cred_file.display()),
                 "--yes".into(),
             ],
         )
@@ -2209,9 +2181,8 @@ mod tests {
     #[test]
     fn byo_kms_rotate_json_shape() {
         let _g = with_temp_config_dir();
-        let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"rotated":true,"new_key_version":"v3"}"#)
-        });
+        let srv =
+            TestServer::start(|_req: &Req| Resp::ok(r#"{"rotated":true,"new_key_version":"v3"}"#));
         cmd_byo(
             &json_flags(&srv.url),
             &[
@@ -2363,19 +2334,12 @@ mod tests {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "GET");
-            assert_eq!(
-                req.path,
-                "/v1/projects/proj1/encryption/cache-stats"
-            );
+            assert_eq!(req.path, "/v1/projects/proj1/encryption/cache-stats");
             Resp::ok(r#"{"hits":100,"misses":10,"size":50,"max_size":1000}"#)
         });
         cmd_byo(
             &flags(&srv.url),
-            &[
-                "kms".into(),
-                "cache-stats".into(),
-                "--project=proj1".into(),
-            ],
+            &["kms".into(), "cache-stats".into(), "--project=proj1".into()],
         )
         .unwrap();
     }
@@ -2388,11 +2352,7 @@ mod tests {
         });
         cmd_byo(
             &json_flags(&srv.url),
-            &[
-                "kms".into(),
-                "cache-stats".into(),
-                "--project=proj1".into(),
-            ],
+            &["kms".into(), "cache-stats".into(), "--project=proj1".into()],
         )
         .unwrap();
     }
@@ -2412,14 +2372,20 @@ mod tests {
     #[test]
     fn byo_kms_help_ok() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_byo_kms(&g, &["help".into()]).is_ok());
     }
 
     #[test]
     fn byo_engine_help_ok() {
         let _g = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_byo_engine(&g, &["help".into()]).is_ok());
     }
 }

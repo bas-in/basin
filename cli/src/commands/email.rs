@@ -58,12 +58,13 @@ fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
     if !flag_value.is_empty() {
         return Ok(flag_value.to_string());
     }
-    let cwd = std::env::current_dir()
-        .map_err(|e| msg(format!("could not determine cwd: {e}")))?;
+    let cwd = std::env::current_dir().map_err(|e| msg(format!("could not determine cwd: {e}")))?;
     let wp = load_working_project(&cwd)?;
     match wp {
         Some(w) if !w.project_ref.is_empty() => Ok(w.project_ref),
-        _ => Err(msg("--project is required (or run `basin link` to bind this directory)")),
+        _ => Err(msg(
+            "--project is required (or run `basin link` to bind this directory)",
+        )),
     }
 }
 
@@ -90,7 +91,11 @@ pub fn cmd_email(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     ];
     let (sub, rest) = match args.split_first() {
         None => {
-            help_for_command("email", "Manage project email templates and view allowance.", help_lines);
+            help_for_command(
+                "email",
+                "Manage project email templates and view allowance.",
+                help_lines,
+            );
             return Ok(());
         }
         Some((s, r)) => (s.as_str(), r),
@@ -99,7 +104,11 @@ pub fn cmd_email(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         "templates" => templates(g, rest),
         "allowance" => allowance(g, rest),
         "--help" | "-h" | "help" => {
-            help_for_command("email", "Manage project email templates and view allowance.", help_lines);
+            help_for_command(
+                "email",
+                "Manage project email templates and view allowance.",
+                help_lines,
+            );
             Ok(())
         }
         other => {
@@ -135,8 +144,11 @@ fn templates_get(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let project_flag = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project_flag)?;
     let c = require_client(g)?;
-    let resp: TemplatesResp =
-        c.do_json(Method::GET, &format!("/v1/projects/{ref}/email-config"), None)?;
+    let resp: TemplatesResp = c.do_json(
+        Method::GET,
+        &format!("/v1/projects/{ref}/email-config"),
+        None,
+    )?;
     if g.json {
         // JSON shape: { templates: { <kind>: { subject, body } } }
         return print_json(&mut std::io::stdout(), &resp);
@@ -190,8 +202,11 @@ fn templates_put(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
             }
         }
     });
-    let resp: TemplatesResp =
-        c.do_json(Method::PATCH, &format!("/v1/projects/{ref}/email-config"), Some(req_body))?;
+    let resp: TemplatesResp = c.do_json(
+        Method::PATCH,
+        &format!("/v1/projects/{ref}/email-config"),
+        Some(req_body),
+    )?;
     if g.json {
         // JSON shape: { templates: { <kind>: { subject, body } } }
         return print_json(&mut std::io::stdout(), &resp);
@@ -217,7 +232,10 @@ fn templates_delete(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
                 "confirmation required: pass --yes to reset email templates non-interactively under --json"
             ));
         }
-        eprint!("Reset email templates to defaults for project {:?}? [y/N] ", r#ref);
+        eprint!(
+            "Reset email templates to defaults for project {:?}? [y/N] ",
+            r#ref
+        );
         let line = read_line()?;
         if line.trim().to_lowercase() != "y" {
             println!("Aborted.");
@@ -230,8 +248,11 @@ fn templates_delete(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         #[serde(default)]
         reset_to_defaults: bool,
     }
-    let resp: ResetResp =
-        c.do_json(Method::DELETE, &format!("/v1/projects/{ref}/email-config"), None)?;
+    let resp: ResetResp = c.do_json(
+        Method::DELETE,
+        &format!("/v1/projects/{ref}/email-config"),
+        None,
+    )?;
     if g.json {
         // JSON shape: { reset_to_defaults: true }
         return print_json(&mut std::io::stdout(), &resp);
@@ -257,7 +278,10 @@ fn templates_test(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         return Err(msg("email templates test requires --to=<email>"));
     }
     if !valid_email_address(&to) {
-        return Err(msg(format!("email templates test: invalid email address {:?}", to)));
+        return Err(msg(format!(
+            "email templates test: invalid email address {:?}",
+            to
+        )));
     }
     let project_flag = m.get_one::<String>("project").cloned().unwrap_or_default();
     let r#ref = resolve_project_ref(&project_flag)?;
@@ -306,8 +330,11 @@ fn allowance(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         #[serde(default)]
         allowance: Option<EmailAllowance>,
     }
-    let resp: AllowanceResp =
-        c.do_json(Method::GET, &format!("/v1/projects/{ref}/email/allowance"), None)?;
+    let resp: AllowanceResp = c.do_json(
+        Method::GET,
+        &format!("/v1/projects/{ref}/email/allowance"),
+        None,
+    )?;
     if g.json {
         // JSON shape: { allowance: { limit, used, reset_at } }
         return print_json(&mut std::io::stdout(), &resp);
@@ -371,10 +398,19 @@ mod tests {
     #[test]
     fn templates_test_missing_kind_errors() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_email(
             &g,
-            &["templates".into(), "test".into(), "--project=proj1".into(), "--to=user@example.com".into()],
+            &[
+                "templates".into(),
+                "test".into(),
+                "--project=proj1".into(),
+                "--to=user@example.com".into(),
+            ],
         )
         .unwrap_err();
         assert!(err.to_string().contains("--kind"));
@@ -383,10 +419,19 @@ mod tests {
     #[test]
     fn templates_test_missing_to_errors() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_email(
             &g,
-            &["templates".into(), "test".into(), "--project=proj1".into(), "--kind=confirmation".into()],
+            &[
+                "templates".into(),
+                "test".into(),
+                "--project=proj1".into(),
+                "--kind=confirmation".into(),
+            ],
         )
         .unwrap_err();
         assert!(err.to_string().contains("--to"));
@@ -395,7 +440,11 @@ mod tests {
     #[test]
     fn templates_test_invalid_to_errors() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_email(
             &g,
             &[
@@ -408,7 +457,8 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            err.to_string().contains("invalid email address") || err.to_string().contains("not-an-email"),
+            err.to_string().contains("invalid email address")
+                || err.to_string().contains("not-an-email"),
             "unexpected error: {}",
             err
         );
@@ -422,10 +472,16 @@ mod tests {
         let srv = TestServer::start(|req: &Req| {
             assert_eq!(req.method, "GET");
             assert_eq!(req.path, "/v1/projects/proj1/email-config");
-            Resp::ok(r#"{"templates":{"confirmation":{"subject":"Confirm your email","body":"<p>Click here</p>"},"recovery":{"subject":"Reset your password","body":"<p>Reset</p>"}}}"#)
+            Resp::ok(
+                r#"{"templates":{"confirmation":{"subject":"Confirm your email","body":"<p>Click here</p>"},"recovery":{"subject":"Reset your password","body":"<p>Reset</p>"}}}"#,
+            )
         });
         let g = flags(&srv.url);
-        cmd_email(&g, &["templates".into(), "get".into(), "--project=proj1".into()]).unwrap();
+        cmd_email(
+            &g,
+            &["templates".into(), "get".into(), "--project=proj1".into()],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -437,8 +493,13 @@ mod tests {
         let g = flags_json(&srv.url);
         let mut out = Vec::new();
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: TemplatesResp =
-            c.do_json(reqwest::Method::GET, "/v1/projects/proj1/email-config", None).unwrap();
+        let resp: TemplatesResp = c
+            .do_json(
+                reqwest::Method::GET,
+                "/v1/projects/proj1/email-config",
+                None,
+            )
+            .unwrap();
         print_json(&mut out, &resp).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert!(v["templates"]["confirmation"].is_object());
@@ -449,11 +510,17 @@ mod tests {
     fn templates_get_404() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(404, r#"{"error":{"code":"not_found","message":"project not found"}}"#)
+            Resp::status(
+                404,
+                r#"{"error":{"code":"not_found","message":"project not found"}}"#,
+            )
         });
         let g = flags(&srv.url);
-        let err = cmd_email(&g, &["templates".into(), "get".into(), "--project=proj1".into()])
-            .unwrap_err();
+        let err = cmd_email(
+            &g,
+            &["templates".into(), "get".into(), "--project=proj1".into()],
+        )
+        .unwrap_err();
         let ae = crate::error::as_api_error(err.as_ref()).expect("expected ApiError");
         assert_eq!(ae.http_status, 404);
     }
@@ -469,7 +536,9 @@ mod tests {
             let body: serde_json::Value = serde_json::from_str(&req.body).unwrap();
             // Verify body structure: { templates: { confirmation: { subject, body } } }
             assert_eq!(body["templates"]["confirmation"]["subject"], "New subject");
-            Resp::ok(r#"{"templates":{"confirmation":{"subject":"New subject","body":"New body"}}}"#)
+            Resp::ok(
+                r#"{"templates":{"confirmation":{"subject":"New subject","body":"New body"}}}"#,
+            )
         });
         let g = flags(&srv.url);
         cmd_email(
@@ -489,7 +558,11 @@ mod tests {
     #[test]
     fn templates_put_missing_kind_errors() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_email(
             &g,
             &[
@@ -517,7 +590,12 @@ mod tests {
         let g = flags(&srv.url);
         cmd_email(
             &g,
-            &["templates".into(), "delete".into(), "--project=proj1".into(), "--yes".into()],
+            &[
+                "templates".into(),
+                "delete".into(),
+                "--project=proj1".into(),
+                "--yes".into(),
+            ],
         )
         .unwrap();
     }
@@ -525,20 +603,25 @@ mod tests {
     #[test]
     fn templates_delete_json_shape() {
         let _cfg = with_temp_config_dir();
-        let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"reset_to_defaults":true}"#)
-        });
+        let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"reset_to_defaults":true}"#));
         let g = flags_json(&srv.url);
         let mut out = Vec::new();
 
         #[derive(Serialize, Deserialize)]
-        struct RR { reset_to_defaults: bool }
+        struct RR {
+            reset_to_defaults: bool,
+        }
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: RR =
-            c.do_json(reqwest::Method::DELETE, "/v1/projects/proj1/email-config", None).unwrap();
+        let resp: RR = c
+            .do_json(
+                reqwest::Method::DELETE,
+                "/v1/projects/proj1/email-config",
+                None,
+            )
+            .unwrap();
         print_json(&mut out, &resp).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(v["reset_to_defaults"].as_bool().unwrap(), true);
+        assert!(v["reset_to_defaults"].as_bool().unwrap());
         let _ = &g;
     }
 
@@ -572,14 +655,16 @@ mod tests {
     #[test]
     fn templates_test_json_shape() {
         let _cfg = with_temp_config_dir();
-        let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"sent":true,"message_id":"msg-456"}"#)
-        });
+        let srv =
+            TestServer::start(|_req: &Req| Resp::ok(r#"{"sent":true,"message_id":"msg-456"}"#));
         let g = flags_json(&srv.url);
         let mut out = Vec::new();
 
         #[derive(Serialize, Deserialize)]
-        struct TR { sent: bool, message_id: String }
+        struct TR {
+            sent: bool,
+            message_id: String,
+        }
         let c = crate::client::Client::new(&srv.url, "tok");
         let resp: TR = c
             .do_json(
@@ -590,7 +675,7 @@ mod tests {
             .unwrap();
         print_json(&mut out, &resp).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(v["sent"].as_bool().unwrap(), true);
+        assert!(v["sent"].as_bool().unwrap());
         assert_eq!(v["message_id"].as_str().unwrap(), "msg-456");
         let _ = &g;
     }
@@ -599,7 +684,10 @@ mod tests {
     fn templates_test_403() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(403, r#"{"error":{"code":"forbidden","message":"not allowed"}}"#)
+            Resp::status(
+                403,
+                r#"{"error":{"code":"forbidden","message":"not allowed"}}"#,
+            )
         });
         let g = flags(&srv.url);
         let err = cmd_email(
@@ -641,10 +729,17 @@ mod tests {
         let mut out = Vec::new();
 
         #[derive(Serialize, Deserialize)]
-        struct AR { allowance: Option<EmailAllowance> }
+        struct AR {
+            allowance: Option<EmailAllowance>,
+        }
         let c = crate::client::Client::new(&srv.url, "tok");
-        let resp: AR =
-            c.do_json(reqwest::Method::GET, "/v1/projects/proj1/email/allowance", None).unwrap();
+        let resp: AR = c
+            .do_json(
+                reqwest::Method::GET,
+                "/v1/projects/proj1/email/allowance",
+                None,
+            )
+            .unwrap();
         print_json(&mut out, &resp).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["allowance"]["limit"].as_i64().unwrap(), 500);
@@ -656,7 +751,10 @@ mod tests {
     fn allowance_404() {
         let _cfg = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::status(404, r#"{"error":{"code":"not_found","message":"project not found"}}"#)
+            Resp::status(
+                404,
+                r#"{"error":{"code":"not_found","message":"project not found"}}"#,
+            )
         });
         let g = flags(&srv.url);
         let err = cmd_email(&g, &["allowance".into(), "--project=proj1".into()]).unwrap_err();
@@ -667,7 +765,11 @@ mod tests {
     #[test]
     fn allowance_no_project_errors() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { token: "tok".into(), quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_email(&g, &["allowance".into()]).unwrap_err();
         assert!(err.to_string().contains("--project") || err.to_string().contains("link"));
     }
@@ -677,7 +779,10 @@ mod tests {
     #[test]
     fn unknown_subcommand_is_silent() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         let err = cmd_email(&g, &["frobnicate".into()]).unwrap_err();
         assert!(crate::error::is_silent(err.as_ref()));
     }
@@ -685,14 +790,20 @@ mod tests {
     #[test]
     fn help_returns_ok() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         assert!(cmd_email(&g, &["help".into()]).is_ok());
     }
 
     #[test]
     fn no_args_shows_help() {
         let _cfg = with_temp_config_dir();
-        let g = GlobalFlags { quiet: true, ..Default::default() };
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
         // no args → shows help and returns Ok
         assert!(cmd_email(&g, &[]).is_ok());
     }

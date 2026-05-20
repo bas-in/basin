@@ -23,18 +23,28 @@ pub struct Semver {
 pub fn parse_semver(s: &str) -> CliResult<Semver> {
     let mut s = s.trim();
     s = s.strip_prefix('v').unwrap_or(s);
-    if let Some(i) = s.find(|c| c == '-' || c == '+') {
+    if let Some(i) = s.find(['-', '+']) {
         s = &s[..i];
     }
     let parts: Vec<&str> = s.split('.').collect();
     if parts.len() < 3 {
         return Err(msg("version: need at least major.minor.patch"));
     }
-    let mut out = Semver { major: 0, minor: 0, patch: 0 };
-    for (idx, dst) in [&mut out.major, &mut out.minor, &mut out.patch].into_iter().enumerate() {
-        let n: i64 = parts[idx]
-            .parse()
-            .map_err(|_| msg(format!("version: component {} is not a non-negative integer", parts[idx])))?;
+    let mut out = Semver {
+        major: 0,
+        minor: 0,
+        patch: 0,
+    };
+    for (idx, dst) in [&mut out.major, &mut out.minor, &mut out.patch]
+        .into_iter()
+        .enumerate()
+    {
+        let n: i64 = parts[idx].parse().map_err(|_| {
+            msg(format!(
+                "version: component {} is not a non-negative integer",
+                parts[idx]
+            ))
+        })?;
         if n < 0 {
             return Err(msg("version: components must be non-negative"));
         }
@@ -65,9 +75,30 @@ mod tests {
 
     #[test]
     fn parses_plain_and_prefixed() {
-        assert_eq!(parse_semver("1.2.3").unwrap(), Semver { major: 1, minor: 2, patch: 3 });
-        assert_eq!(parse_semver("v1.2.3").unwrap(), Semver { major: 1, minor: 2, patch: 3 });
-        assert_eq!(parse_semver(" 1.2.3 ").unwrap(), Semver { major: 1, minor: 2, patch: 3 });
+        assert_eq!(
+            parse_semver("1.2.3").unwrap(),
+            Semver {
+                major: 1,
+                minor: 2,
+                patch: 3
+            }
+        );
+        assert_eq!(
+            parse_semver("v1.2.3").unwrap(),
+            Semver {
+                major: 1,
+                minor: 2,
+                patch: 3
+            }
+        );
+        assert_eq!(
+            parse_semver(" 1.2.3 ").unwrap(),
+            Semver {
+                major: 1,
+                minor: 2,
+                patch: 3
+            }
+        );
     }
 
     #[test]
@@ -85,11 +116,50 @@ mod tests {
 
     #[test]
     fn window_arithmetic() {
-        let cli = Semver { major: 1, minor: 5, patch: 0 };
-        assert!(in_support_window(cli, Semver { major: 1, minor: 4, patch: 9 }));
-        assert!(in_support_window(cli, Semver { major: 1, minor: 5, patch: 0 }));
-        assert!(in_support_window(cli, Semver { major: 1, minor: 6, patch: 2 }));
-        assert!(!in_support_window(cli, Semver { major: 1, minor: 7, patch: 0 }));
-        assert!(!in_support_window(cli, Semver { major: 2, minor: 5, patch: 0 }));
+        let cli = Semver {
+            major: 1,
+            minor: 5,
+            patch: 0,
+        };
+        assert!(in_support_window(
+            cli,
+            Semver {
+                major: 1,
+                minor: 4,
+                patch: 9
+            }
+        ));
+        assert!(in_support_window(
+            cli,
+            Semver {
+                major: 1,
+                minor: 5,
+                patch: 0
+            }
+        ));
+        assert!(in_support_window(
+            cli,
+            Semver {
+                major: 1,
+                minor: 6,
+                patch: 2
+            }
+        ));
+        assert!(!in_support_window(
+            cli,
+            Semver {
+                major: 1,
+                minor: 7,
+                patch: 0
+            }
+        ));
+        assert!(!in_support_window(
+            cli,
+            Semver {
+                major: 2,
+                minor: 5,
+                patch: 0
+            }
+        ));
     }
 }

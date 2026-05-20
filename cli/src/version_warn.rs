@@ -33,12 +33,16 @@ pub fn warn_if_version_out_of_window_to<W: Write>(g: &GlobalFlags, w: &mut W) {
     if g.quiet || unstamped(version()) {
         return;
     }
-    let Ok(cli_ver) = parse_semver(version()) else { return };
+    let Ok(cli_ver) = parse_semver(version()) else {
+        return;
+    };
     let cloud_str = resolve_cloud_version_string(g);
     if unstamped(&cloud_str) {
         return;
     }
-    let Ok(cloud_ver) = parse_semver(&cloud_str) else { return };
+    let Ok(cloud_ver) = parse_semver(&cloud_str) else {
+        return;
+    };
     if in_support_window(cli_ver, cloud_ver) {
         return;
     }
@@ -59,12 +63,16 @@ pub fn warn_if_self_update_available_to<W: Write>(g: &GlobalFlags, w: &mut W) {
     if g.quiet || unstamped(version()) {
         return;
     }
-    let Ok(cli_ver) = parse_semver(version()) else { return };
+    let Ok(cli_ver) = parse_semver(version()) else {
+        return;
+    };
     let (tag, html_url) = resolve_latest_cli_release();
     if tag.is_empty() {
         return;
     }
-    let Ok(latest) = parse_semver(&tag) else { return };
+    let Ok(latest) = parse_semver(&tag) else {
+        return;
+    };
     if latest.major < cli_ver.major {
         return;
     }

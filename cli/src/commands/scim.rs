@@ -221,32 +221,29 @@ fn scim_tokens_list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         .ok_or_else(|| msg("scim tokens list requires --org=<slug>"))?;
 
     let c = require_client(g)?;
-    let resp: ScimTokensListResp = match c.do_json(
-        Method::GET,
-        &format!("/v1/orgs/{org}/scim/tokens"),
-        None,
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            // Graceful 404 fallback: older cloud versions may not have the list endpoint.
-            if let Some(ae) = as_api_error(e.as_ref()) {
-                if ae.http_status == 404 {
-                    if g.json {
-                        // JSON shape: { "tokens": [] }
-                        return print_json(
-                            &mut std::io::stdout(),
-                            &json!({ "tokens": Vec::<ScimToken>::new() }),
+    let resp: ScimTokensListResp =
+        match c.do_json(Method::GET, &format!("/v1/orgs/{org}/scim/tokens"), None) {
+            Ok(r) => r,
+            Err(e) => {
+                // Graceful 404 fallback: older cloud versions may not have the list endpoint.
+                if let Some(ae) = as_api_error(e.as_ref()) {
+                    if ae.http_status == 404 {
+                        if g.json {
+                            // JSON shape: { "tokens": [] }
+                            return print_json(
+                                &mut std::io::stdout(),
+                                &json!({ "tokens": Vec::<ScimToken>::new() }),
+                            );
+                        }
+                        println!(
+                            "(no SCIM tokens — list endpoint not available on this cloud version)"
                         );
+                        return Ok(());
                     }
-                    println!(
-                        "(no SCIM tokens — list endpoint not available on this cloud version)"
-                    );
-                    return Ok(());
                 }
+                return Err(e);
             }
-            return Err(e);
-        }
-    };
+        };
 
     if g.json {
         // JSON shape: { "tokens": [{ id, name, prefix, created_at, last_used_at }] }
@@ -419,7 +416,10 @@ mod tests {
             Resp::ok(format!(r#"{{"scim":{}}}"#, sample_scim_config()))
         });
         let _cfg = with_temp_config_dir();
-        let err = cmd_scim(&g(&srv), &["config".into(), "get".into(), "--org=acme".into()]);
+        let err = cmd_scim(
+            &g(&srv),
+            &["config".into(), "get".into(), "--org=acme".into()],
+        );
         assert!(err.is_ok(), "scim config get: {:?}", err);
     }
 
@@ -514,7 +514,11 @@ mod tests {
             &g(&srv),
             &["tokens".into(), "list".into(), "--org=acme".into()],
         );
-        assert!(err.is_ok(), "expected graceful 404 handling, got: {:?}", err);
+        assert!(
+            err.is_ok(),
+            "expected graceful 404 handling, got: {:?}",
+            err
+        );
     }
 
     #[test]
@@ -726,7 +730,12 @@ mod tests {
         };
         let err = cmd_scim(
             &g0,
-            &["tokens".into(), "revoke".into(), "tok1".into(), "--yes".into()],
+            &[
+                "tokens".into(),
+                "revoke".into(),
+                "tok1".into(),
+                "--yes".into(),
+            ],
         );
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("--org"));
