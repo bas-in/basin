@@ -1790,8 +1790,17 @@ truth, this list is the human-readable summary.
   `cte_recursive_feeding_update` added to `set_ops_ctes.rs`).
 - [x] Advanced window frames — `RANGE BETWEEN INTERVAL '…' PRECEDING / FOLLOWING` now supported
   natively via DataFusion 53 type-coercion (no pre-parse rewrite needed); regression test
-  `range_interval_5min_preceding_sum` added to `tests/integration/tests/window_fns.rs` (22
-  tests, all green). `GROUPS` and `EXCLUDE` frame variants still pending.
+  `range_interval_5min_preceding_sum` added to `tests/integration/tests/window_fns.rs`.
+- [x] `GROUPS BETWEEN … PRECEDING/FOLLOWING` — DataFusion 53 supports `GROUPS` frames
+  natively via `WindowFrameStateGroups`; no pre-parse rewrite required. Integration tests
+  `groups_1_preceding_current_row` and `groups_unbounded_preceding_current_row` added to
+  `tests/integration/tests/window_fns.rs` (24 tests total, all green).
+- [x] `EXCLUDE {CURRENT ROW | GROUP | TIES | NO OTHERS}` — **not supported**: sqlparser 0.61
+  (used by DataFusion 53) does not parse the `EXCLUDE` clause on window frames (it has no
+  `WindowFrameExclusion` type in `WindowFrame`). Queries using `EXCLUDE` will receive a clean
+  parse error from sqlparser — no silent mis-execution. This is a known limitation of the
+  sqlparser/DataFusion stack; no workaround is possible without upgrading sqlparser to a future
+  version that adds `WindowFrame.exclusion`. Documented as a limitation, not a v0.1 blocker.
 - [ ] `EXCLUDE USING gist` — not on roadmap (geo-index dependency).
 
 **Live coverage:** see [`docs/sql-support.md`](./docs/sql-support.md) for the

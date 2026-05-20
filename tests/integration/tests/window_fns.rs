@@ -792,6 +792,108 @@ async fn multiple_window_functions_same_window() {
 }
 
 // ===========================================================================
+// Advanced window frames: GROUPS BETWEEN
+// ===========================================================================
+
+/// `SUM(score) OVER (ORDER BY score GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW)`
+///
+/// GROUPS counts peer-groups (rows with equal ORDER BY keys) rather than
+/// individual rows. DataFusion 53 supports this natively via
+/// `WindowFrameStateGroups`; no pre-parse rewrite is required.
+///
+/// Table layout (scores table):
+///   id=1  score=10
+///   id=2  score=10   ← same peer group as id=1 (group 0)
+///   id=3  score=20   ← peer group 1
+///   id=4  score=20   ← same peer group as id=3
+///   id=5  score=30   ← peer group 2
+///
+/// With GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW:
+///   score=10 rows: window covers group 0 only      → sum = 10+10 = 20
+///   score=20 rows: window covers groups 0+1        → sum = 10+10+20+20 = 60
+///   score=30 row:  window covers groups 1+2        → sum = 20+20+30 = 70
+#[tokio::test]
+async fn groups_1_preceding_current_row() {
+    let dir = TempDir::new().unwrap();
+    let engine = engine_in(&dir);
+    let tid = ProjectId::new();
+    let s = engine.open_session(tid).await.unwrap();
+
+    s.execute("CREATE TABLE scores (id BIGINT NOT NULL, score BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    s.execute(
+        "INSERT INTO scores VALUES (1, 10), (2, 10), (3, 20), (4, 20), (5, 30)",
+    )
+    .await
+    .unwrap();
+
+    let res = s
+        .execute(
+            "SELECT SUM(score) OVER (\
+               ORDER BY score \
+               GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW\
+             ) AS gs \
+             FROM scores \
+             ORDER BY id",
+        )
+        .await
+        .unwrap();
+
+    let vals = collect_i64(res, "gs");
+    assert_eq!(
+        vals,
+        vec![Some(20), Some(20), Some(60), Some(60), Some(70)],
+        "GROUPS 1 PRECEDING sliding sum mismatch: {vals:?}"
+    );
+}
+
+/// `SUM(score) OVER (ORDER BY score GROUPS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)`
+///
+/// GROUPS cumulative variant: the window expands from the first peer group
+/// through the current peer group.
+///
+/// Same fixture as `groups_1_preceding_current_row`:
+///   score=10 rows: groups [0]      → sum = 20
+///   score=20 rows: groups [0,1]    → sum = 60
+///   score=30 row:  groups [0,1,2]  → sum = 90
+#[tokio::test]
+async fn groups_unbounded_preceding_current_row() {
+    let dir = TempDir::new().unwrap();
+    let engine = engine_in(&dir);
+    let tid = ProjectId::new();
+    let s = engine.open_session(tid).await.unwrap();
+
+    s.execute("CREATE TABLE scores2 (id BIGINT NOT NULL, score BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    s.execute(
+        "INSERT INTO scores2 VALUES (1, 10), (2, 10), (3, 20), (4, 20), (5, 30)",
+    )
+    .await
+    .unwrap();
+
+    let res = s
+        .execute(
+            "SELECT SUM(score) OVER (\
+               ORDER BY score \
+               GROUPS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
+             ) AS gs \
+             FROM scores2 \
+             ORDER BY id",
+        )
+        .await
+        .unwrap();
+
+    let vals = collect_i64(res, "gs");
+    assert_eq!(
+        vals,
+        vec![Some(20), Some(20), Some(60), Some(60), Some(90)],
+        "GROUPS UNBOUNDED PRECEDING cumulative sum mismatch: {vals:?}"
+    );
+}
+
+// ===========================================================================
 // Advanced window frames: RANGE BETWEEN INTERVAL
 // ===========================================================================
 
