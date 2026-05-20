@@ -21,13 +21,13 @@
 //!    forbids per-project overloading so `(project, name)` is the unique
 //!    key.
 //!
-//! Transactional semantics (v0.1): **best-effort sequential**. Each
-//! body statement is executed via the existing engine path; if a
-//! mid-statement error occurs, **prior statements remain committed**
-//! (no rollback). This will tighten when single-shard transactions
-//! land per Phase 5; until then, callers writing destructive
-//! procedures must design for partial-completion recovery (idempotent
-//! statements, explicit progress flags, etc.).
+//! Transactional semantics (Phase 5.11.F): **all-or-nothing**. The
+//! body executes inside an implicit `BEGIN`/`COMMIT` when the caller
+//! has no outer transaction, or inside a `SAVEPOINT`/`RELEASE` when
+//! the caller is already in a `BEGIN` block. A mid-statement error
+//! rolls back all prior body statements (via `ROLLBACK` or `ROLLBACK
+//! TO SAVEPOINT`), leaving the database unchanged. This uses the
+//! single-shard transaction machinery shipped in Phase 5.
 //!
 //! Out of scope per ADR 0012 / TASK.md 5.11.F:
 //!
@@ -124,11 +124,16 @@ pub(crate) async fn exec_drop_procedure(
 /// runs the substituted statements in order through the standard
 /// engine entry point.
 ///
-/// **Best-effort sequential**: if a mid-statement error occurs, prior
-/// statements remain committed (until single-shard transactions land
-/// per Phase 5). The return tag carries the count of statements that
-/// ran successfully so callers can distinguish full from partial
-/// completion.
+/// **Transactional (Phase 5.11.F)**: the body executes as an atomic
+/// unit. When the caller is *not* already in an explicit transaction
+/// we issue an implicit `BEGIN` before the first statement and either
+/// `COMMIT` on success or `ROLLBACK` on failure. When the caller *is*
+/// already in a transaction we use a `SAVEPOINT` / `RELEASE` /
+/// `ROLLBACK TO SAVEPOINT` pair instead, so the outer transaction is
+/// not committed by CALL — matching PostgreSQL's procedure semantics.
+///
+/// The return tag carries the count of statements that ran
+/// successfully (`CALL <n>`), matching the PG command-completion tag.
 pub(crate) async fn exec_call(sess: &ProjectSession, call: Function) -> Result<ExecResult> {
     let proc_name = single_part_object_name(&call.name)?;
 
@@ -184,29 +189,110 @@ pub(crate) async fn exec_call(sess: &ProjectSession, call: Function) -> Result<E
         ))
     })?;
 
+    // Determine whether we need to manage our own transaction boundary.
+    // If the caller already issued BEGIN we use a SAVEPOINT instead so
+    // CALL does not prematurely commit the outer transaction.
+    let outer_tx_active = crate::session::tx_is_active(&sess.state);
+    // Synthetic savepoint name — unique enough within a single session.
+    let sp_name = format!("__call_{proc_name}");
+
+    if outer_tx_active {
+        // Push a savepoint so we can roll back to it on failure without
+        // aborting the outer transaction.
+        Box::pin(crate::executor::execute(
+            sess,
+            &format!("SAVEPOINT {sp_name}"),
+        ))
+        .await
+        .map_err(|e| {
+            BasinError::InvalidSchema(format!(
+                "CALL {proc_name}: failed to push savepoint: {e}"
+            ))
+        })?;
+    } else {
+        // No outer transaction — start an implicit one.
+        Box::pin(crate::executor::execute(sess, "BEGIN"))
+            .await
+            .map_err(|e| {
+                BasinError::InvalidSchema(format!(
+                    "CALL {proc_name}: failed to begin implicit transaction: {e}"
+                ))
+            })?;
+    }
+
     let mut ran = 0usize;
+    let mut exec_err: Option<BasinError> = None;
+
     for stmt in body_stmts.iter_mut() {
-        substitute_args_in_statement(stmt, &subs)?;
+        if let Err(e) = substitute_args_in_statement(stmt, &subs) {
+            exec_err = Some(e);
+            break;
+        }
         let stmt_sql = stmt.to_string();
         // Recurse through the public engine entry point so each
         // substituted statement gets the full pipeline (RLS rewrites,
         // cost check, sequence rewrite, function inlining, analytical
-        // routing, …). v0.1 has no transaction wrapper here — see the
-        // module doc-comment for the documented "best-effort
-        // sequential" semantics. `Box::pin` breaks the async recursion
-        // through `executor::execute` (same pattern as
-        // [`cv_ddl::exec_create_materialized_view`]); without it rustc
+        // routing, …). `Box::pin` breaks the async recursion through
+        // `executor::execute` (same pattern as
+        // `cv_ddl::exec_create_materialized_view`); without it rustc
         // would have to size an infinite-recursion future.
-        Box::pin(crate::executor::execute(sess, &stmt_sql))
+        match Box::pin(crate::executor::execute(sess, &stmt_sql)).await {
+            Ok(_) => {
+                ran += 1;
+            }
+            Err(e) => {
+                exec_err = Some(BasinError::InvalidSchema(format!(
+                    "CALL {proc_name}: statement #{} failed (after {ran} successful \
+                     statement(s); all prior statements rolled back): {e}",
+                    ran + 1,
+                )));
+                break;
+            }
+        }
+    }
+
+    // Commit or roll back the transaction boundary we established.
+    if let Some(err) = exec_err {
+        if outer_tx_active {
+            // Roll back to the savepoint, leaving the outer transaction alive.
+            let _ = Box::pin(crate::executor::execute(
+                sess,
+                &format!("ROLLBACK TO SAVEPOINT {sp_name}"),
+            ))
+            .await;
+            let _ = Box::pin(crate::executor::execute(
+                sess,
+                &format!("RELEASE SAVEPOINT {sp_name}"),
+            ))
+            .await;
+        } else {
+            // Roll back the implicit transaction entirely.
+            let _ = Box::pin(crate::executor::execute(sess, "ROLLBACK")).await;
+        }
+        return Err(err);
+    }
+
+    if outer_tx_active {
+        // Release the savepoint (merges its writes into the outer tx).
+        Box::pin(crate::executor::execute(
+            sess,
+            &format!("RELEASE SAVEPOINT {sp_name}"),
+        ))
+        .await
+        .map_err(|e| {
+            BasinError::InvalidSchema(format!(
+                "CALL {proc_name}: failed to release savepoint: {e}"
+            ))
+        })?;
+    } else {
+        // Commit the implicit transaction.
+        Box::pin(crate::executor::execute(sess, "COMMIT"))
             .await
             .map_err(|e| {
                 BasinError::InvalidSchema(format!(
-                    "CALL {proc_name}: statement #{} failed (after {ran} successful \
-                     statement(s); prior statements remain committed in v0.1): {e}",
-                    ran + 1,
+                    "CALL {proc_name}: failed to commit implicit transaction: {e}"
                 ))
             })?;
-        ran += 1;
     }
 
     Ok(ExecResult::Empty {

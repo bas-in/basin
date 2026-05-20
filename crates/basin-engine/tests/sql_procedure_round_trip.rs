@@ -197,10 +197,9 @@ async fn call_with_arguments_substitutes() {
 }
 
 #[tokio::test]
-async fn call_failure_mid_procedure_persists_prior_statements() {
-    // v0.1 contract: best-effort sequential. A mid-statement error
-    // leaves earlier statements committed (until single-shard
-    // transactions land per Phase 5). This test pins that contract.
+async fn call_failure_mid_procedure_rolls_back() {
+    // Phase 5.11.F contract: CALL is all-or-nothing. A mid-statement error
+    // rolls back all prior body statements via the implicit transaction.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
@@ -219,8 +218,7 @@ async fn call_failure_mid_procedure_persists_prior_statements() {
     .unwrap();
 
     let err = sess.execute("CALL half_fail()").await.unwrap_err();
-    // The error message mentions which statement failed; the prior
-    // statement should still be visible in `log`.
+    // The error message mentions which statement failed.
     let msg = format!("{err}");
     assert!(
         msg.contains("statement #2") || msg.contains("missing_table") || msg.contains("not found"),
@@ -232,8 +230,12 @@ async fn call_failure_mid_procedure_persists_prior_statements() {
         ExecResult::Rows { batches, .. } => batches,
         other => panic!("unexpected: {other:?}"),
     };
-    // First statement persisted — that's the documented v0.1 behaviour.
-    assert_eq!(col_str(&batches, "msg"), vec!["first".to_string()]);
+    // Phase 5.11.F: the implicit transaction was rolled back, so 'first' is gone.
+    assert!(
+        col_str(&batches, "msg").is_empty(),
+        "expected empty log after rollback, got: {:?}",
+        col_str(&batches, "msg")
+    );
 }
 
 #[tokio::test]
