@@ -122,6 +122,26 @@ impl ProjectCounters {
     pub fn record_bytes_written(&self, n: u64) {
         self.bytes_written_total.fetch_add(n, Ordering::Relaxed);
     }
+    /// Decrement the bytes-written counter by `n` (saturating at zero).
+    /// Called on object deletion to keep the counter accurate as a measure of
+    /// live stored bytes.
+    pub fn record_bytes_deleted(&self, n: u64) {
+        // Saturating fetch_sub via compare-exchange loop — AtomicU64 has no
+        // built-in saturating_sub, so we spin until we win or hit zero.
+        let mut current = self.bytes_written_total.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_sub(n);
+            match self.bytes_written_total.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
     pub fn record_error(&self) {
         self.errors_total.fetch_add(1, Ordering::Relaxed);
     }

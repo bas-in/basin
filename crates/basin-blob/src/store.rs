@@ -28,7 +28,7 @@ use bytes::Bytes;
 use object_store::{path::Path as ObjectPath, ObjectStore, ObjectStoreExt, PutPayload};
 use tokio::sync::RwLock;
 
-use basin_common::ProjectId;
+use basin_common::{ProjectCounterRegistry, ProjectId};
 
 use crate::{
     error::{BlobError, Result},
@@ -220,6 +220,10 @@ pub struct BlobStore<C> {
     object_store: Arc<dyn ObjectStore>,
     /// Optional root prefix prepended to every object key.
     root: Option<ObjectPath>,
+    /// Optional per-project byte counter registry.  When present, `put_object`
+    /// increments `bytes_written_total` by the object size and `delete_object`
+    /// decrements it (saturating) by the previously stored size.
+    counters: Option<Arc<ProjectCounterRegistry>>,
 }
 
 impl<C: BlobCatalog> BlobStore<C> {
@@ -238,7 +242,15 @@ impl<C: BlobCatalog> BlobStore<C> {
             catalog,
             object_store,
             root,
+            counters: None,
         }
+    }
+
+    /// Attach a [`ProjectCounterRegistry`] so that `put_object` / `delete_object`
+    /// bump the per-project byte counter.  Returns `Self` for chaining.
+    pub fn with_counters(mut self, registry: Arc<ProjectCounterRegistry>) -> Self {
+        self.counters = Some(registry);
+        self
     }
 
     // -----------------------------------------------------------------------
@@ -285,6 +297,10 @@ impl<C: BlobCatalog> BlobStore<C> {
     ///
     /// The `etag` is the hex-encoded content hash supplied by the caller.  If
     /// the object already exists at this path it is overwritten.
+    ///
+    /// When a [`ProjectCounterRegistry`] is attached (via [`BlobStore::with_counters`]),
+    /// the project's `bytes_written_total` counter is incremented by the object size
+    /// after a successful write.
     pub async fn put_object(
         &self,
         project: &ProjectId,
@@ -334,6 +350,11 @@ impl<C: BlobCatalog> BlobStore<C> {
         );
         self.catalog.upsert_object(project, object.clone()).await?;
 
+        // Bump the per-project byte counter (fire-and-forget; never fails).
+        if let Some(ref registry) = self.counters {
+            registry.for_project(project).record_bytes_written(size);
+        }
+
         tracing::debug!(
             project = %project,
             bucket = %bucket_name,
@@ -381,6 +402,10 @@ impl<C: BlobCatalog> BlobStore<C> {
     /// Delete an object's bytes from the object store and remove the catalog row.
     ///
     /// Returns `Ok(())` whether or not the object existed (idempotent).
+    ///
+    /// When a [`ProjectCounterRegistry`] is attached, the project's
+    /// `bytes_written_total` counter is decremented (saturating) by the size of
+    /// the deleted object.  If the object did not exist, the counter is unchanged.
     pub async fn delete_object(
         &self,
         project: &ProjectId,
@@ -388,6 +413,17 @@ impl<C: BlobCatalog> BlobStore<C> {
         object_path: &str,
     ) -> Result<()> {
         let bucket = self.get_bucket(project, bucket_name).await?;
+
+        // Fetch the catalog row before deletion so we know the stored size for
+        // the counter decrement.  Only needed when a counter registry is attached.
+        let prior_size: Option<u64> = if self.counters.is_some() {
+            self.catalog
+                .get_object_by_path(project, bucket.id, object_path)
+                .await?
+                .map(|o| o.size)
+        } else {
+            None
+        };
 
         let key = paths::blob_key(self.root.as_ref(), project, bucket_name, object_path)?;
 
@@ -402,6 +438,12 @@ impl<C: BlobCatalog> BlobStore<C> {
         self.catalog
             .delete_object_by_path(project, bucket.id, object_path)
             .await?;
+
+        // Decrement the per-project byte counter by the size of the deleted
+        // object (saturating — never goes below 0).
+        if let (Some(ref registry), Some(size)) = (&self.counters, prior_size) {
+            registry.for_project(project).record_bytes_deleted(size);
+        }
 
         tracing::debug!(
             project = %project,
@@ -449,6 +491,7 @@ impl<C: BlobCatalog> BlobStore<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use basin_common::ProjectCounterRegistry;
     use object_store::memory::InMemory;
 
     fn make_store() -> BlobStore<InMemoryBlobCatalog> {
@@ -731,5 +774,160 @@ mod tests {
         let project = ProjectId::new();
         let key = store.object_key(&project, "avatars", "a.png").unwrap();
         assert!(key.as_ref().contains("storage/avatars/a.png"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-project byte counter (Phase 5.17.E)
+    // -----------------------------------------------------------------------
+
+    fn make_store_with_counters(
+        registry: Arc<ProjectCounterRegistry>,
+    ) -> BlobStore<InMemoryBlobCatalog> {
+        let catalog = InMemoryBlobCatalog::arc();
+        let obj_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        BlobStore::new(catalog, obj_store, None).with_counters(registry)
+    }
+
+    #[tokio::test]
+    async fn put_object_increments_byte_counter() {
+        let registry = Arc::new(ProjectCounterRegistry::new());
+        let store = make_store_with_counters(registry.clone());
+        let project = ProjectId::new();
+
+        store
+            .create_bucket(&project, Bucket::new("b"))
+            .await
+            .unwrap();
+
+        let payload = Bytes::from(vec![0u8; 512]);
+        store
+            .put_object(
+                &project,
+                "b",
+                "file.bin",
+                payload,
+                None,
+                serde_json::Value::Null,
+                None,
+                "etag",
+            )
+            .await
+            .unwrap();
+
+        let snap = registry.snapshot(&project).unwrap();
+        assert_eq!(snap.bytes_written_total, 512);
+    }
+
+    #[tokio::test]
+    async fn delete_object_decrements_byte_counter() {
+        let registry = Arc::new(ProjectCounterRegistry::new());
+        let store = make_store_with_counters(registry.clone());
+        let project = ProjectId::new();
+
+        store
+            .create_bucket(&project, Bucket::new("b"))
+            .await
+            .unwrap();
+
+        let payload = Bytes::from(vec![1u8; 256]);
+        store
+            .put_object(
+                &project,
+                "b",
+                "file.bin",
+                payload,
+                None,
+                serde_json::Value::Null,
+                None,
+                "etag",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(registry.snapshot(&project).unwrap().bytes_written_total, 256);
+
+        store
+            .delete_object(&project, "b", "file.bin")
+            .await
+            .unwrap();
+
+        // Counter decremented back to 0 after delete.
+        assert_eq!(registry.snapshot(&project).unwrap().bytes_written_total, 0);
+    }
+
+    #[tokio::test]
+    async fn counter_is_project_isolated() {
+        let registry = Arc::new(ProjectCounterRegistry::new());
+        let store = make_store_with_counters(registry.clone());
+
+        let p1 = ProjectId::new();
+        let p2 = ProjectId::new();
+
+        store
+            .create_bucket(&p1, Bucket::new("b"))
+            .await
+            .unwrap();
+        store
+            .create_bucket(&p2, Bucket::new("b"))
+            .await
+            .unwrap();
+
+        store
+            .put_object(
+                &p1,
+                "b",
+                "a.bin",
+                Bytes::from(vec![0u8; 100]),
+                None,
+                serde_json::Value::Null,
+                None,
+                "e1",
+            )
+            .await
+            .unwrap();
+
+        store
+            .put_object(
+                &p2,
+                "b",
+                "a.bin",
+                Bytes::from(vec![0u8; 200]),
+                None,
+                serde_json::Value::Null,
+                None,
+                "e2",
+            )
+            .await
+            .unwrap();
+
+        // Each project sees only its own bytes.
+        assert_eq!(registry.snapshot(&p1).unwrap().bytes_written_total, 100);
+        assert_eq!(registry.snapshot(&p2).unwrap().bytes_written_total, 200);
+
+        // Deleting p1's object does not affect p2.
+        store.delete_object(&p1, "b", "a.bin").await.unwrap();
+        assert_eq!(registry.snapshot(&p1).unwrap().bytes_written_total, 0);
+        assert_eq!(registry.snapshot(&p2).unwrap().bytes_written_total, 200);
+    }
+
+    #[tokio::test]
+    async fn delete_nonexistent_object_does_not_change_counter() {
+        let registry = Arc::new(ProjectCounterRegistry::new());
+        let store = make_store_with_counters(registry.clone());
+        let project = ProjectId::new();
+
+        store
+            .create_bucket(&project, Bucket::new("b"))
+            .await
+            .unwrap();
+
+        // Delete something that was never stored — counter should remain absent.
+        store
+            .delete_object(&project, "b", "ghost.bin")
+            .await
+            .unwrap();
+
+        // No activity recorded — snapshot is None.
+        assert!(registry.snapshot(&project).is_none());
     }
 }
