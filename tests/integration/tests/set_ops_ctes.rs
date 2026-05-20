@@ -373,6 +373,48 @@ async fn cte_recursive() {
     );
 }
 
+/// `WITH RECURSIVE … INSERT INTO target SELECT * FROM cte` — the combination
+/// of a recursive generator CTE feeding a DML statement (v0.1 gap, PR #XXXX).
+///
+/// sqlparser routes this as `Statement::Query{body: SetExpr::Insert}`.
+/// Basin's executor lifts the `WITH RECURSIVE` clause onto the INSERT's source
+/// query so DataFusion can expand the recursion before the rows are written.
+#[tokio::test]
+async fn cte_recursive_feeding_insert() {
+    let dir = TempDir::new().unwrap();
+    let engine = engine_in(&dir);
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
+
+    s.execute("CREATE TABLE target (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
+
+    // Generate ids 1..=5 via a recursive CTE and INSERT them into `target`.
+    let sql = "
+        WITH RECURSIVE seq(id) AS (
+            SELECT 1 AS id
+            UNION ALL
+            SELECT id + 1 FROM seq WHERE id < 5
+        )
+        INSERT INTO target SELECT id FROM seq
+    ";
+    s.execute(sql)
+        .await
+        .expect("WITH RECURSIVE feeding INSERT must succeed");
+
+    // Verify rows were written.
+    let res = s
+        .execute("SELECT id FROM target ORDER BY id")
+        .await
+        .expect("SELECT after recursive INSERT");
+    let rows = collect_i64_sorted(res);
+    assert_eq!(
+        rows,
+        vec![1, 2, 3, 4, 5],
+        "recursive CTE must insert ids 1..=5: got {rows:?}"
+    );
+}
+
 /// `WITH name AS MATERIALIZED (…) SELECT …` — PG-15 materialization hint.
 ///
 /// Status: 🛠 — sqlparser-rs (0.52/0.53) rejects `AS MATERIALIZED` with a

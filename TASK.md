@@ -1622,9 +1622,12 @@ truth, this list is the human-readable summary.
 - [ ] `LATERAL` joins — uncorrelated strip + nested-aggregate ORM rewrite
   shipped (commit `4faa5d7`); correlated decorrelation for non-aggregate row-
   returning bodies (#81, commit `6f7ab3c`); full advanced LATERAL still partial.
-- [ ] `WITH RECURSIVE` + DML-in-CTE — multi-column RECURSIVE shipped (#82,
-  commit `dae8765`); data-modifying CTEs shipped (commit `6056dca`); the
-  combination of recursive + DML in one CTE chain still partial.
+- [x] `WITH RECURSIVE` + DML-in-CTE (INSERT) — multi-column RECURSIVE shipped
+  (#82, commit `dae8765`); data-modifying CTEs shipped (commit `6056dca`);
+  `WITH RECURSIVE … INSERT INTO target SELECT * FROM cte` now supported via
+  `exec_recursive_with_dml_body` (regression test `cte_recursive_feeding_insert`
+  green). UPDATE/DELETE with a recursive source remain deferred (explicit
+  `FeatureNotSupported` error).
 - [ ] Advanced window frames (`RANGE INTERVAL` / `GROUPS` / `EXCLUDE`).
 - [ ] `EXCLUDE USING gist` — not on roadmap (geo-index dependency).
 
