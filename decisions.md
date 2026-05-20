@@ -6,6 +6,38 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-20 — 1M-context credit cutoff + tangled-orphan recovery
+
+Three agents (advanced LATERAL, advanced window frames, 5.13.B prescreen
+continuation) all died with **"Usage credits required for 1M context"** —
+a different failure from the earlier session-limit cutoffs. The pattern:
+a long-running agent accumulates >200k tokens of context, flips into 1M
+mode, and that mode requires usage credits that aren't enabled. The work
+was done; the agents just couldn't commit the final result.
+
+**Critical recovery finding:** HEAD (`7967a42`) did **not compile on its
+own** — earlier committed work referenced helpers that lived only in the
+uncommitted tree. The three agents' orphaned work was intertwined across
+shared files (executor.rs, lib.rs), so it could not be split per-feature
+without leaving a non-compiling intermediate commit. Recovered as one
+bundled commit `dfff647` after verifying every affected suite green
+(LATERAL 7/7, window_fns 21/21, sql_support_matrix pass).
+
+Separately fixed the lone pre-existing red — `nullif_rewrite::tests::
+bare_nullif_is_left_alone` (`7dfd4c5`): a stale Debug-string assertion,
+not a behaviour bug. Newer DataFusion renders a ScalarUDF Debug as the
+struct name (`NullIfFunc`) instead of call-style `nullif(...)`.
+
+**Mitigation for the dispatcher.** The 1M-context trip happens at the
+*end* of long agent runs. Keep agent prompts tight and single-purpose so
+they finish + commit before crossing ~200k context. Prefer many small
+focused agents over few sprawling ones. Cap concurrent agents at 5 per
+the user's instruction. After ANY agent reports a credit/limit error,
+assume its work is uncommitted-but-possibly-complete: verify compile +
+tests, recover by committing explicitly-staged files.
+
+---
+
 ## 2026-05-20 — Account session-limit cutoff + orphan recovery
 
 Three agents reported "completed" but two were actually **killed by the
