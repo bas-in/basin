@@ -745,6 +745,28 @@ pub(crate) async fn open(
     // removed stateless stubs. Registered here, like `register_auth_udfs`.
     crate::advisory_lock::register_advisory_lock_udfs(&ctx, state.advisory.clone());
 
+    // Phase 5.11.J: register any LANGUAGE wasm UDFs the project has as
+    // DataFusion ScalarUDFs. Each one wraps a wasmtime call; they appear
+    // alongside the stateless UDFs already loaded above so DataFusion can
+    // resolve their names during query planning. Skipped if the project has
+    // no WASM functions (the common case — one catalog round-trip overhead).
+    {
+        use basin_catalog::SqlFunctionLanguage;
+        let wasm_fns: Vec<_> = engine
+            .config()
+            .catalog
+            .list_sql_functions(&project)
+            .await
+            .into_iter()
+            .filter(|f| f.language == SqlFunctionLanguage::Wasm)
+            .collect();
+        for def in &wasm_fns {
+            if let Some(udf) = crate::wasm_udf::make_wasm_scalar_udf(def) {
+                ctx.register_udf((*udf).clone());
+            }
+        }
+    }
+
     // 3. Pre-register every table the catalog already knows about. This makes
     //    SELECT work immediately without a per-query refresh.
     let tables = engine.config().catalog.list_tables(&project).await?;

@@ -71,6 +71,9 @@ bitflags = "2"
 # dispatch intercepts admin/RBAC/FDW/transaction statements and returns an
 # empty result without touching the sqlparser pipeline.
 pg_query.workspace = true
+# Phase 5.11.J: LANGUAGE wasm UDFs. wasmtime provides the WASM runtime with
+# sandboxing (epoch-based CPU caps + linear-memory limits) by construction.
+wasmtime = { version = "44", default-features = true }
 # Phase 5.16.B: per-shape HDR histograms.
 # hdrhistogram — low-overhead latency/count histograms with bounded memory.
 hdrhistogram = "7"
@@ -84,6 +87,10 @@ lru.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tokio-test.workspace = true
+# wasm_udf unit tests compile WAT text to WASM bytes via the `wat` crate.
+# `wat` is already a transitive dep of `wasmtime` (the `wat` feature is
+# enabled by default) so no extra network download is required.
+wat = "1"
 # 5.11.I integration tests in `tests/alter_table_dml_surfaces.rs` exercise
 # the HTTP delivery side of webhook subscriptions (RetryQueue / WebhookSink
 # / WebhookConfig) and need `basin-webhooks` with its default `delivery`

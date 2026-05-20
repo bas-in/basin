@@ -61,13 +61,19 @@ pub(crate) async fn exec_create_function(
         ));
     }
     let lang = language.as_ref().map(|l| l.value.as_str()).unwrap_or("");
-    if !lang.eq_ignore_ascii_case("sql") {
+    // Determine language: sql or wasm are accepted; everything else is rejected.
+    let fn_lang = if lang.eq_ignore_ascii_case("sql") {
+        SqlFunctionLanguage::Sql
+    } else if lang.eq_ignore_ascii_case("wasm") {
+        SqlFunctionLanguage::Wasm
+    } else {
         return Err(BasinError::InvalidSchema(format!(
-            "CREATE FUNCTION: only LANGUAGE sql is supported (got LANGUAGE {lang:?}); \
-             SQLSTATE 0A000 feature_not_supported. PL/pgSQL is out of scope per \
+            "CREATE FUNCTION: only LANGUAGE sql and LANGUAGE wasm are supported \
+             (got LANGUAGE {lang:?}); SQLSTATE 0A000 feature_not_supported. \
+             PL/pgSQL is out of scope per \
              docs/decisions/0012-change-event-primitive.md"
         )));
-    }
+    };
 
     let fn_name = single_part_object_name(&name)?;
 
@@ -99,16 +105,30 @@ pub(crate) async fn exec_create_function(
 
     let body_text = extract_body_text(&function_body, &fn_name)?;
 
+    // For WASM UDFs, validate the body at registration time: decode base64,
+    // parse as WASM bytes, confirm the named export exists. This surfaces
+    // errors to the DDL caller rather than at query time.
+    if fn_lang == SqlFunctionLanguage::Wasm {
+        crate::wasm_udf::validate_wasm_body(&fn_name, &body_text)?;
+    }
+
     let def = SqlFunctionDef {
         project: sess.project,
         name: fn_name.clone(),
         args: def_args,
         return_type: parsed_return,
         body: body_text,
-        language: SqlFunctionLanguage::Sql,
+        language: fn_lang,
     };
 
-    let validated = validate_for_registration(def)?;
+    // SQL UDFs go through the full inliner-safety validation (recursion check,
+    // single-SELECT body shape). WASM UDFs skip those — they are opaque bytes
+    // executed by wasmtime, not SQL expressions the inliner would ever see.
+    let validated = if fn_lang == SqlFunctionLanguage::Sql {
+        validate_for_registration(def)?
+    } else {
+        def
+    };
 
     let catalog: Arc<dyn Catalog> = sess.engine.config().catalog.clone();
     if !or_replace {
@@ -119,8 +139,12 @@ pub(crate) async fn exec_create_function(
             )));
         }
     }
-    let existing_map = collect_project_function_map(&catalog, &sess.project, &fn_name).await;
-    validate_no_mutual_recursion(&validated, &existing_map)?;
+    // Mutual-recursion check only applies to SQL bodies.
+    if fn_lang == SqlFunctionLanguage::Sql {
+        let existing_map =
+            collect_project_function_map(&catalog, &sess.project, &fn_name).await;
+        validate_no_mutual_recursion(&validated, &existing_map)?;
+    }
     catalog.register_sql_function(validated).await?;
 
     Ok(ExecResult::Empty {
@@ -188,17 +212,30 @@ pub(crate) async fn exec_alter_function_rename(
             "ALTER FUNCTION RENAME: target name {new_name:?} already exists"
         )));
     }
+    let is_wasm = existing.language == SqlFunctionLanguage::Wasm;
     let renamed = SqlFunctionDef {
         name: new_name.to_string(),
         ..existing
     };
-    let validated = validate_for_registration(renamed)?;
+    // SQL UDFs go through the inliner-safety validator; WASM UDFs are opaque
+    // blobs and only need the identifier / reserved-name checks from
+    // `validate_for_registration` — but since that function also verifies the
+    // body is a valid SELECT (which WASM bodies are not), we skip it entirely
+    // for WASM and only do the mutual-recursion pass for SQL.
+    let validated = if is_wasm {
+        renamed
+    } else {
+        validate_for_registration(renamed)?
+    };
     // Treat the rename as if registering `new_name` against the post-
     // rename catalog: skip both the old name (about to be dropped) and
     // the new name (replaced by `validated`).
-    let mut existing_map = collect_project_function_map(&catalog, &sess.project, new_name).await;
-    existing_map.remove(&old_name.to_ascii_lowercase());
-    validate_no_mutual_recursion(&validated, &existing_map)?;
+    if !is_wasm {
+        let mut existing_map =
+            collect_project_function_map(&catalog, &sess.project, new_name).await;
+        existing_map.remove(&old_name.to_ascii_lowercase());
+        validate_no_mutual_recursion(&validated, &existing_map)?;
+    }
     catalog.register_sql_function(validated).await?;
     catalog.drop_sql_function(&sess.project, old_name).await?;
     Ok(ExecResult::Empty {

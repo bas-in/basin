@@ -17,14 +17,22 @@ use serde::{Deserialize, Serialize};
 
 use basin_common::ProjectId;
 
-/// Implementation language for a user-defined function. v0.1 ships
-/// `LANGUAGE sql` only; the variant is reserved for the future Wasm /
-/// PL/pgSQL phases (see ADR 0012).
+/// Implementation language for a user-defined function. `Sql` is the v0.1
+/// shipping variant; `Wasm` is the Phase 5.11.J addition — the escape hatch
+/// for the ~5 % of cases `LANGUAGE sql` can't express. New variants are
+/// additive; historic serialised payloads that pre-date this field
+/// deserialise to `Sql` via the `#[default]` on this enum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SqlFunctionLanguage {
     #[default]
     Sql,
+    /// `LANGUAGE wasm` — body is base64-encoded WebAssembly bytes. The
+    /// function name exported by the WASM module must match the SQL
+    /// function name. Each invocation spins up a fresh `wasmtime::Store`
+    /// with a CPU-epoch budget (default 100 ms) and a linear-memory cap
+    /// (default 16 MiB). Sandboxed by construction via `wasmtime`.
+    Wasm,
 }
 
 /// Argument type. Mirrors the scalar types the engine already understands;

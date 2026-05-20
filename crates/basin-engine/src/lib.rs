@@ -171,6 +171,16 @@ pub(crate) struct EngineInner {
     /// on this engine; per-project isolation is structural (separate LRU caches
     /// behind a `DashMap<ProjectId, …>`).  Idle tenants cost O(bytes).
     pub(crate) query_stats: Arc<crate::query_stats::QueryStatRegistry>,
+    /// Phase 5.7 B1: process-wide secondary B-tree index registry.
+    ///
+    /// One `ColumnIndex` per `(project, table, col)` loaded lazily on first
+    /// access for the given triple.  Flushed to
+    /// `projects/{project}/secondary_indexes/{table}/{col}.idx` in the object
+    /// store after every DML that touches an indexed table.  Loaded from disk
+    /// on first probe after an engine restart (lazy load in `fast_select`).
+    pub(crate) secondary_index_registry: Arc<crate::secondary_index::ProjectIndexRegistry>,
+    /// Cumulative count of data files skipped by the secondary-index probe.
+    pub(crate) secondary_index_skipped: crate::secondary_index::IndexSkipCounter,
 }
 
 impl Engine {
@@ -239,6 +249,10 @@ impl Engine {
             memtable_registry,
             next_tx_id: AtomicU64::new(1),
             query_stats: Arc::new(crate::query_stats::QueryStatRegistry::new()),
+            secondary_index_registry: Arc::new(
+                crate::secondary_index::ProjectIndexRegistry::new(),
+            ),
+            secondary_index_skipped: crate::secondary_index::IndexSkipCounter::new(),
         });
         // Phase 5.14.D2: register the query-history adapter with the shard so
         // the compactor can consult observed ORDER BY / GROUP BY patterns.
@@ -425,6 +439,29 @@ impl Engine {
     /// integration tests that verify the false-positive rate.
     pub fn blooms_skipped_count(&self) -> u64 {
         self.inner.blooms_skipped.load(Ordering::Relaxed)
+    }
+
+    // ── Phase 5.7 B1: secondary index ────────────────────────────────────────
+
+    /// Process-wide secondary B-tree index registry. Returns a reference to
+    /// the shared `Arc`; cloning it is cheap.
+    pub(crate) fn secondary_index_registry(
+        &self,
+    ) -> &Arc<crate::secondary_index::ProjectIndexRegistry> {
+        &self.inner.secondary_index_registry
+    }
+
+    /// Bump the secondary-index file-skip counter by one. Called from
+    /// `fast_select` each time the index proves a data file is absent.
+    pub(crate) fn note_secondary_index_skipped(&self) {
+        self.inner.secondary_index_skipped.increment();
+    }
+
+    /// Cumulative count of data files pruned by the secondary-index probe.
+    /// Exposed for integration tests that assert measurable file-open
+    /// reductions compared to a non-indexed baseline.
+    pub fn secondary_index_skipped_count(&self) -> u64 {
+        self.inner.secondary_index_skipped.load()
     }
 
     /// Crate-private hook bumped when a statement is dispatched via the
@@ -699,6 +736,7 @@ mod function_ddl;
 mod generated_cols;
 mod geo_glue;
 mod index_extras;
+pub(crate) mod secondary_index;
 mod inet_udf;
 mod info_schema_provider;
 mod interval_tz_udf;
@@ -747,6 +785,7 @@ mod vector_planner;
 mod vector_search;
 mod view_ddl;
 mod vortex_listing_format;
+pub(crate) mod wasm_udf;
 pub mod webhook_ddl;
 pub mod webhook_registry;
 mod window_extras;

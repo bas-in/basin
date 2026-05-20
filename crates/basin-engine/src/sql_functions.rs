@@ -363,13 +363,26 @@ pub async fn rewrite_sql_inlining_functions(
     // front avoids re-locking the catalog mutex for every inlined call;
     // for projects with one or two functions this is also cheaper than
     // per-call lookups.
+    //
+    // WASM UDFs (language == Wasm) are intentionally excluded from the
+    // inlining map: their bodies are opaque base64 blobs executed by
+    // wasmtime, not SQL SELECT expressions the inliner could rewrite.
+    // They appear as DataFusion ScalarUDFs registered on the session by
+    // `crate::wasm_udf::make_wasm_scalar_udf` at session-open time.
     let funcs = catalog.list_sql_functions(project).await;
     if funcs.is_empty() {
         return Ok(sql.to_string());
     }
     let mut by_name: HashMap<String, SqlFunctionDef> = HashMap::with_capacity(funcs.len());
     for f in funcs {
+        if f.language != SqlFunctionLanguage::Sql {
+            continue; // WASM UDFs are handled by the DataFusion ScalarUDF path
+        }
         by_name.insert(f.name.to_ascii_lowercase(), f);
+    }
+    if by_name.is_empty() {
+        // All registered functions are non-SQL (e.g. WASM only); skip.
+        return Ok(sql.to_string());
     }
 
     rewrite_statement(&mut stmt, &by_name, 0)?;

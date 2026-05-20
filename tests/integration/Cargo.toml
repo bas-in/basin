@@ -53,6 +53,11 @@ anyhow.workspace = true
 bcrypt.workspace = true
 ulid.workspace = true
 uuid.workspace = true
+# Phase 5.11.J: wasm_udf integration test needs to compile WAT bytes and
+# base64-encode them before passing them to CREATE FUNCTION … LANGUAGE wasm.
+# `wat` is already a transitive dep of `wasmtime` (enabled by default).
+wat = "1"
+base64.workspace = true
 
 [lib]
 path = "src/lib.rs"

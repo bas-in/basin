@@ -748,12 +748,12 @@ Pairs with ADR 0019's RPC mount (5.11.L) — once both land, the
 `/rpc/<fn>` route transparently dispatches `LANGUAGE wasm` bodies
 alongside `LANGUAGE sql`.
 
-- [ ] `CREATE FUNCTION name(args) RETURNS type LANGUAGE wasm AS '<base64
+- [x] `CREATE FUNCTION name(args) RETURNS type LANGUAGE wasm AS '<base64
       bytes>'` parser + catalog persistence.
-- [ ] `wasmtime` runtime per-call; sandboxed by construction.
-- [ ] CPU + memory caps per invocation (deterministic shutdown on
+- [x] `wasmtime` runtime per-call; sandboxed by construction.
+- [x] CPU + memory caps per invocation (deterministic shutdown on
       overrun).
-- [ ] Test deferred — implement when shipped.
+- [x] Tests: `cargo test -p basin-engine wasm_udf` + integration suite pass.
 
 ### Tier 4 — `crates/basin-realtime` (~10-12 weeks)
 
