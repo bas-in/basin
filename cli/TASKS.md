@@ -294,7 +294,7 @@ Cloud has the full surface (`/v1/orgs/{slug}/members*`).
 
 - [ ] `cmd_engine_pin.go` — `get/put/delete/events`. Routes: `/v1/projects/{ref}/engine-version/pin`, `/pin/events`. Tests: get default, pin a version, unpin, event audit trail.
 - [ ] `cmd_extensions.go` — `list`. Route: `/v1/projects/{ref}/extensions/catalog`. Tests: list shape, JSON output.
-- [ ] `cmd_oauth_providers.go` — `list/get/set/delete`. Routes: `/v1/projects/{ref}/oauth-providers/*`. Tests: provider CRUD per slug.
+- [ ] `cmd_oauth_providers.go` — `list/get/set/delete`. Routes: `/v1/projects/{ref}/oauth-providers/*`. Tests: provider CRUD per slug. **Spec ready 2026-05-20**: engine OAuth landed as basin ADR 0020 (presets + generic OIDC; engine task 5.10.O). This CLI command drives the cloud provider-config management API; gated on cloud adopting it.
 - [ ] `cmd_email.go` — `templates get/put/delete/test`, `allowance`. Routes: `/v1/projects/{ref}/email/*`. Tests: template CRUD, test-send, allowance lookup.
 - [ ] Client: methods for each route.
 
@@ -345,7 +345,7 @@ naming doesn't get bike-shed-revisited mid-Phase-X.
 
 - [x] ~~`cmd_realtime.go` — blocked on engine pub/sub~~ **UNBLOCKED 2026-05-20** — engine shipped realtime (basin 5.11.R1–R7). Promoted to **Tier 26**.
 - [ ] `cmd_functions.go` — `deploy/serve` for edge functions. Blocked on cloud Phase 8 (V8). NOTE: `rpc <fn>` *invoke* is unblocked (5.11.L) → **Tier 26**.
-- [ ] `cmd_storage_buckets.go` — `list/create/upload/download` for object storage as a product (distinct from BYO-bucket-for-Parquet). Not on the cloud roadmap.
+- [ ] `cmd_storage_buckets.go` — `list/create/upload/download` for object storage as a product (distinct from BYO-bucket-for-Parquet). **Now on the roadmap (2026-05-20)**: engine object storage specced as basin ADR 0021 (catalog-backed `storage.objects` + RLS; engine tasks 5.17.A–E). Routes: `/storage/v1/object/*`, `/storage/v1/bucket/*`. Gated on engine 5.17 + cloud quota/billing surface.
 - [ ] `cmd_tx.go` — interactive `begin/commit/rollback`. Engine single-shard transactions **shipped** (BEGIN/COMMIT/ROLLBACK + SAVEPOINT); only the interactive REPL-session scaffolding remains.
 - [ ] `cmd_restore_pitr.go` — `restore --as-of=<timestamp>`. Blocked on engine PITR cross-DML physical-GC (catalog-level rollback shipped; GC is v0.2).
 

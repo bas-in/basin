@@ -9,3 +9,4 @@ dist/
 # Rust
 /target
 Cargo.lock merge=union
+/basin-cli

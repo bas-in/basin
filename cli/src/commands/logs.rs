@@ -21,7 +21,7 @@ use reqwest::blocking::Client as HttpClient;
 use reqwest::Method;
 
 use crate::client::{query_string, version};
-use crate::error::{as_api_error, msg, CliResult};
+use crate::error::{msg, CliResult};
 use crate::global::{require_client, GlobalFlags};
 use crate::output::print_json;
 use crate::{printinfo, printerr};
@@ -219,6 +219,7 @@ fn render_log_line(ln: &serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::as_api_error;
     use crate::testutil::{with_temp_config_dir, Req, Resp, TestServer};
 
     fn flags(url: &str) -> GlobalFlags {
