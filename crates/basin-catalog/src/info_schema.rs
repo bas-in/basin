@@ -27,6 +27,7 @@ use arrow_schema::{DataType, Field, IntervalUnit, Schema};
 use basin_common::{BasinError, ProjectId, Result, TableName};
 
 use crate::functions::{SqlArgType, SqlReturnType};
+use crate::reserved_schema::ReservedSchema;
 use crate::Catalog;
 
 /// Read-only projections over [`Catalog`] state for the
@@ -78,25 +79,30 @@ impl InfoSchemaQuery {
 
     /// Build `information_schema.tables` filtered to `project`'s tables.
     ///
+    /// Phase 5.18.D: uses [`Catalog::list_tables_qualified`] so each row
+    /// carries the table's real schema name (auth/storage/cron/net/…) rather
+    /// than hardcoding `"public"` for every table.
+    ///
     /// Cross-project leak is a P0 invariant: this only ever calls
-    /// [`Catalog::list_tables`] / [`Catalog::load_table`] for `project`.
+    /// [`Catalog::list_tables_qualified`] / [`Catalog::load_table`] for
+    /// `project`.
     pub async fn tables(catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
-        let names = catalog.list_tables(project).await?;
+        let qtables = catalog.list_tables_qualified(project).await?;
 
-        let mut catalogs: Vec<&str> = Vec::with_capacity(names.len());
-        let mut schemas: Vec<&str> = Vec::with_capacity(names.len());
-        let mut table_names: Vec<String> = Vec::with_capacity(names.len());
-        let mut table_types: Vec<&str> = Vec::with_capacity(names.len());
+        let mut catalogs: Vec<&str> = Vec::with_capacity(qtables.len());
+        let mut schemas: Vec<String> = Vec::with_capacity(qtables.len());
+        let mut table_names: Vec<String> = Vec::with_capacity(qtables.len());
+        let mut table_types: Vec<&str> = Vec::with_capacity(qtables.len());
 
         // We need the per-table metadata to distinguish materialized
         // views from base tables. PG reports MVs as `'BASE TABLE'` in
         // `information_schema.tables` (the SQL-standard view doesn't
         // know about matviews); we mirror that for compatibility.
-        for name in &names {
-            let _meta = catalog.load_table(project, name).await?;
+        for qt in &qtables {
+            let _meta = catalog.load_table_qualified(project, qt).await?;
             catalogs.push(BASIN_CATALOG_NAME);
-            schemas.push(DEFAULT_SCHEMA);
-            table_names.push(name.as_str().to_string());
+            schemas.push(qt.schema.as_str().to_string());
+            table_names.push(qt.name.as_str().to_string());
             table_types.push(TABLE_TYPE_BASE_TABLE);
         }
 
@@ -113,26 +119,30 @@ impl InfoSchemaQuery {
 
     /// Build `pg_catalog.pg_class` filtered to `project`'s tables.
     ///
+    /// Phase 5.18.D: uses [`Catalog::list_tables_qualified`] so each row's
+    /// `relnamespace` points at the table's real schema oid (auth/storage/…)
+    /// rather than always pointing at the public-schema oid.
+    ///
     /// Cross-project leak is a P0 invariant: this only ever calls
-    /// [`Catalog::list_tables`] / [`Catalog::load_table`] for `project`.
+    /// [`Catalog::list_tables_qualified`] / [`Catalog::load_table`] for
+    /// `project`.
     pub async fn pg_class(catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
-        let names = catalog.list_tables(project).await?;
+        let qtables = catalog.list_tables_qualified(project).await?;
 
-        let mut oids: Vec<i64> = Vec::with_capacity(names.len());
-        let mut relnames: Vec<String> = Vec::with_capacity(names.len());
-        let mut namespaces: Vec<i64> = Vec::with_capacity(names.len());
-        let mut relkinds: Vec<&str> = Vec::with_capacity(names.len());
-        let mut rls: Vec<bool> = Vec::with_capacity(names.len());
-        let mut partitioned: Vec<bool> = Vec::with_capacity(names.len());
-        let mut reltuples: Vec<f32> = Vec::with_capacity(names.len());
+        let mut oids: Vec<i64> = Vec::with_capacity(qtables.len());
+        let mut relnames: Vec<String> = Vec::with_capacity(qtables.len());
+        let mut namespaces: Vec<i64> = Vec::with_capacity(qtables.len());
+        let mut relkinds: Vec<&str> = Vec::with_capacity(qtables.len());
+        let mut rls: Vec<bool> = Vec::with_capacity(qtables.len());
+        let mut partitioned: Vec<bool> = Vec::with_capacity(qtables.len());
+        let mut reltuples: Vec<f32> = Vec::with_capacity(qtables.len());
 
-        let namespace_oid = namespace_oid_for(project, DEFAULT_SCHEMA);
-
-        for name in &names {
-            let meta = catalog.load_table(project, name).await?;
-            oids.push(table_oid(project, name));
-            relnames.push(name.as_str().to_string());
-            namespaces.push(namespace_oid);
+        for qt in &qtables {
+            let meta = catalog.load_table_qualified(project, qt).await?;
+            oids.push(table_oid(project, &qt.name));
+            relnames.push(qt.name.as_str().to_string());
+            // Point relnamespace at the table's real schema, not always public.
+            namespaces.push(namespace_oid_for(project, qt.schema.as_str()));
             // v0.1 only knows base tables and materialized views (the
             // continuous-aggregate flavour). Plain `CREATE VIEW` is not
             // shipped, so `'v'` is reserved for future use.
@@ -228,14 +238,16 @@ impl InfoSchemaQuery {
 
     /// Schema for `pg_catalog.pg_namespace` rows.
     ///
-    /// v0.1 emits exactly one row per project (`"public"`); multi-schema
-    /// per project is a v0.2 extension.
+    /// Phase 5.18.D: emits one row per reserved schema (all 8 variants of
+    /// [`ReservedSchema`]) rather than only `"public"`. Stable oids are derived
+    /// from `namespace_oid_for(project, schema_name)` so they are consistent
+    /// with `pg_class.relnamespace`.
     ///
-    /// | column     | type   | notes                                       |
-    /// |------------|--------|---------------------------------------------|
-    /// | oid        | BIGINT | namespace oid (FNV-1a of `(project, "public")`) |
-    /// | nspname    | TEXT   | always `"public"` for v0.1                   |
-    /// | nspowner   | BIGINT | 0 (placeholder; v0.2 wires real owner)       |
+    /// | column     | type   | notes                                                   |
+    /// |------------|--------|---------------------------------------------------------|
+    /// | oid        | BIGINT | namespace oid (FNV-1a of `(project, schema_name)`)      |
+    /// | nspname    | TEXT   | reserved schema name (`public`, `auth`, `storage`, …)   |
+    /// | nspowner   | BIGINT | 0 (placeholder; v0.2 wires real owner)                  |
     pub fn pg_namespace_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("oid", DataType::Int64, false),
@@ -351,17 +363,29 @@ impl InfoSchemaQuery {
             .map_err(|e| BasinError::internal(format!("pg_catalog.pg_attribute build: {e}")))
     }
 
-    /// Build `pg_catalog.pg_namespace` filtered to `project`. v0.1 emits
-    /// exactly one row (`"public"`) — single-schema-per-project is the
-    /// invariant the rest of the views (`pg_class.relnamespace`,
-    /// `information_schema.tables.table_schema`) already encode.
+    /// Build `pg_catalog.pg_namespace` filtered to `project`.
+    ///
+    /// Phase 5.18.D: emits one row per reserved schema (all 8 variants of
+    /// [`ReservedSchema`]) so PG tooling (pgAdmin, Prisma, PostgREST) sees
+    /// `auth`, `storage`, `cron`, `net`, `realtime`, `pg_catalog`,
+    /// `information_schema`, and `public` as distinct namespaces. Oids are
+    /// stable across restarts (FNV-1a of `(project, schema_name)`).
     pub async fn pg_namespace(_catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
-        let oid = namespace_oid_for(project, DEFAULT_SCHEMA);
+        let mut oids: Vec<i64> = Vec::with_capacity(ReservedSchema::ALL.len());
+        let mut nspnames: Vec<String> = Vec::with_capacity(ReservedSchema::ALL.len());
+        let mut nspowners: Vec<i64> = Vec::with_capacity(ReservedSchema::ALL.len());
+
+        for &rs in ReservedSchema::ALL {
+            oids.push(namespace_oid_for(project, rs.as_str()));
+            nspnames.push(rs.as_str().to_string());
+            nspowners.push(NSPOWNER_PLACEHOLDER);
+        }
+
         let schema = Self::pg_namespace_schema();
         let columns: Vec<ArrayRef> = vec![
-            Arc::new(Int64Array::from(vec![oid])),
-            Arc::new(StringArray::from(vec![DEFAULT_SCHEMA.to_string()])),
-            Arc::new(Int64Array::from(vec![NSPOWNER_PLACEHOLDER])),
+            Arc::new(Int64Array::from(oids)),
+            Arc::new(StringArray::from(nspnames)),
+            Arc::new(Int64Array::from(nspowners)),
         ];
         RecordBatch::try_new(schema, columns)
             .map_err(|e| BasinError::internal(format!("pg_catalog.pg_namespace build: {e}")))
@@ -1008,19 +1032,18 @@ impl InfoSchemaQuery {
 
     /// Schema for `information_schema.schemata` rows.
     ///
-    /// v0.1 emits exactly one row per project (`"public"`), matching
-    /// the single-schema-per-project invariant the rest of the views
-    /// already encode (`pg_namespace`, `pg_class.relnamespace`,
-    /// `information_schema.tables.table_schema`).
+    /// Phase 5.18.D: emits one row per reserved schema (all 8 variants of
+    /// [`ReservedSchema`]) so PG tooling sees the full set of system schemas.
+    /// Previously emitted only `"public"`.
     ///
-    /// | column                          | type  | notes                          |
-    /// |---------------------------------|-------|--------------------------------|
-    /// | catalog_name                    | TEXT  | always `"basin"`               |
-    /// | schema_name                     | TEXT  | always `"public"`              |
-    /// | schema_owner                    | TEXT  | `""` placeholder (v0.2 wires)  |
-    /// | default_character_set_catalog   | TEXT? | NULL                           |
-    /// | default_character_set_schema    | TEXT? | NULL                           |
-    /// | default_character_set_name      | TEXT? | NULL                           |
+    /// | column                          | type  | notes                                    |
+    /// |---------------------------------|-------|------------------------------------------|
+    /// | catalog_name                    | TEXT  | always `"basin"`                         |
+    /// | schema_name                     | TEXT  | reserved schema name (public/auth/…)     |
+    /// | schema_owner                    | TEXT  | `""` placeholder (v0.2 wires)            |
+    /// | default_character_set_catalog   | TEXT? | NULL                                     |
+    /// | default_character_set_schema    | TEXT? | NULL                                     |
+    /// | default_character_set_name      | TEXT? | NULL                                     |
     pub fn schemata_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("catalog_name", DataType::Utf8, false),
@@ -1032,19 +1055,38 @@ impl InfoSchemaQuery {
         ]))
     }
 
-    /// Build `information_schema.schemata` filtered to `project`. v0.1
-    /// emits exactly one row (`"public"`).
+    /// Build `information_schema.schemata` filtered to `project`.
+    ///
+    /// Phase 5.18.D: emits one row per reserved schema so PG tooling sees all
+    /// system schemas (`public`, `auth`, `storage`, `cron`, `net`, `realtime`,
+    /// `pg_catalog`, `information_schema`) in one view. Previously emitted
+    /// only `"public"`.
     pub async fn schemata(_catalog: &dyn Catalog, _project: &ProjectId) -> Result<RecordBatch> {
+        let n = ReservedSchema::ALL.len();
+        let mut catalog_names: Vec<&str> = Vec::with_capacity(n);
+        let mut schema_names: Vec<String> = Vec::with_capacity(n);
+        let mut schema_owners: Vec<&str> = Vec::with_capacity(n);
+        let mut charset_catalogs: Vec<Option<String>> = Vec::with_capacity(n);
+        let mut charset_schemas: Vec<Option<String>> = Vec::with_capacity(n);
+        let mut charset_names: Vec<Option<String>> = Vec::with_capacity(n);
+
+        for &rs in ReservedSchema::ALL {
+            catalog_names.push(BASIN_CATALOG_NAME);
+            schema_names.push(rs.as_str().to_string());
+            schema_owners.push(SCHEMA_OWNER_PLACEHOLDER);
+            charset_catalogs.push(None);
+            charset_schemas.push(None);
+            charset_names.push(None);
+        }
+
         let schema = Self::schemata_schema();
         let columns: Vec<ArrayRef> = vec![
-            Arc::new(StringArray::from(vec![BASIN_CATALOG_NAME.to_string()])),
-            Arc::new(StringArray::from(vec![DEFAULT_SCHEMA.to_string()])),
-            Arc::new(StringArray::from(
-                vec![SCHEMA_OWNER_PLACEHOLDER.to_string()],
-            )),
-            Arc::new(StringArray::from(vec![None::<String>])),
-            Arc::new(StringArray::from(vec![None::<String>])),
-            Arc::new(StringArray::from(vec![None::<String>])),
+            Arc::new(StringArray::from(catalog_names)),
+            Arc::new(StringArray::from(schema_names)),
+            Arc::new(StringArray::from(schema_owners)),
+            Arc::new(StringArray::from(charset_catalogs)),
+            Arc::new(StringArray::from(charset_schemas)),
+            Arc::new(StringArray::from(charset_names)),
         ];
         RecordBatch::try_new(schema, columns)
             .map_err(|e| BasinError::internal(format!("info_schema.schemata build: {e}")))
@@ -4316,4 +4358,387 @@ fn fnv1a_64_to_positive_i64(bytes: &[u8]) -> i64 {
         h = h.wrapping_mul(FNV_PRIME);
     }
     (h & 0x7fff_ffff_ffff_ffff) as i64
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 5.18.D — honest schema introspection tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests_5_18_d {
+    use std::sync::Arc;
+
+    use arrow_array::{Array, Int64Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use basin_common::{ProjectId, QualifiedTableName, SchemaName, TableName};
+
+    use crate::reserved_schema::ReservedSchema;
+    use crate::InMemoryCatalog;
+    use crate::Catalog;
+
+    use super::InfoSchemaQuery;
+
+    fn minimal_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+        ]))
+    }
+
+    fn qtable(schema: &str, table: &str) -> QualifiedTableName {
+        QualifiedTableName::new(
+            SchemaName::new(schema).unwrap(),
+            TableName::new(table).unwrap(),
+        )
+    }
+
+    // ── schemata ─────────────────────────────────────────────────────────────
+
+    /// `information_schema.schemata` must list all reserved schemas.
+    #[tokio::test]
+    async fn schemata_lists_all_reserved_schemas() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+        cat.create_namespace(&p).await.unwrap();
+
+        let batch = InfoSchemaQuery::schemata(&cat, &p).await.unwrap();
+
+        // One row per reserved schema.
+        assert_eq!(
+            batch.num_rows(),
+            ReservedSchema::ALL.len(),
+            "schemata row count should equal number of reserved schemas"
+        );
+
+        // Extract schema_name column and collect into a vec for assertion.
+        let schema_names = batch
+            .column(1) // schema_name is col index 1
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("schema_name must be StringArray");
+
+        let mut names: Vec<&str> = (0..schema_names.len())
+            .map(|i| schema_names.value(i))
+            .collect();
+        names.sort();
+
+        let mut expected: Vec<&str> = ReservedSchema::ALL.iter().map(|r| r.as_str()).collect();
+        expected.sort();
+
+        assert_eq!(names, expected, "schemata must cover every reserved schema");
+    }
+
+    /// `information_schema.schemata` must include `"public"`.
+    #[tokio::test]
+    async fn schemata_includes_public() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+        cat.create_namespace(&p).await.unwrap();
+
+        let batch = InfoSchemaQuery::schemata(&cat, &p).await.unwrap();
+        let schema_names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        let has_public = (0..schema_names.len()).any(|i| schema_names.value(i) == "public");
+        assert!(has_public, "schemata must include 'public'");
+    }
+
+    /// `information_schema.schemata` must include `"auth"`.
+    #[tokio::test]
+    async fn schemata_includes_auth() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+        cat.create_namespace(&p).await.unwrap();
+
+        let batch = InfoSchemaQuery::schemata(&cat, &p).await.unwrap();
+        let schema_names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        let has_auth = (0..schema_names.len()).any(|i| schema_names.value(i) == "auth");
+        assert!(has_auth, "schemata must include 'auth'");
+    }
+
+    // ── information_schema.tables ─────────────────────────────────────────────
+
+    /// A table created in `auth` schema must report `table_schema = 'auth'`.
+    #[tokio::test]
+    async fn tables_auth_table_reports_auth_schema() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+        cat.create_namespace(&p).await.unwrap();
+
+        let qt = qtable("auth", "users");
+        cat.create_table_qualified(&p, &qt, minimal_schema())
+            .await
+            .unwrap();
+
+        let batch = InfoSchemaQuery::tables(&cat, &p).await.unwrap();
+
+        let table_names = batch
+            .column(2) // table_name col index 2
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let table_schemas = batch
+            .column(1) // table_schema col index 1
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        // Find the row for the `users` table.
+        let idx = (0..table_names.len())
+            .find(|&i| table_names.value(i) == "users")
+            .expect("users table must appear in information_schema.tables");
+
+        assert_eq!(
+            table_schemas.value(idx),
+            "auth",
+            "auth.users must report table_schema = 'auth'"
+        );
+    }
+
+    /// A table in `public` must still report `table_schema = 'public'`.
+    #[tokio::test]
+    async fn tables_public_table_reports_public_schema() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+        cat.create_namespace(&p).await.unwrap();
+
+        let qt = QualifiedTableName::in_public(TableName::new("orders").unwrap());
+        cat.create_table_qualified(&p, &qt, minimal_schema())
+            .await
+            .unwrap();
+
+        let batch = InfoSchemaQuery::tables(&cat, &p).await.unwrap();
+
+        let table_names = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let table_schemas = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        let idx = (0..table_names.len())
+            .find(|&i| table_names.value(i) == "orders")
+            .expect("orders table must appear in information_schema.tables");
+
+        assert_eq!(
+            table_schemas.value(idx),
+            "public",
+            "public.orders must report table_schema = 'public'"
+        );
+    }
+
+    /// Tables in different schemas coexist and each reports its own schema.
+    #[tokio::test]
+    async fn tables_multi_schema_reporting() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+        cat.create_namespace(&p).await.unwrap();
+
+        cat.create_table_qualified(&p, &qtable("auth", "users"), minimal_schema())
+            .await
+            .unwrap();
+        cat.create_table_qualified(&p, &qtable("storage", "objects"), minimal_schema())
+            .await
+            .unwrap();
+        cat.create_table_qualified(
+            &p,
+            &QualifiedTableName::in_public(TableName::new("orders").unwrap()),
+            minimal_schema(),
+        )
+        .await
+        .unwrap();
+
+        let batch = InfoSchemaQuery::tables(&cat, &p).await.unwrap();
+
+        let table_names = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let table_schemas = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        let mut schema_by_table: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::new();
+        for i in 0..table_names.len() {
+            schema_by_table.insert(table_names.value(i), table_schemas.value(i));
+        }
+
+        assert_eq!(schema_by_table.get("users"), Some(&"auth"));
+        assert_eq!(schema_by_table.get("objects"), Some(&"storage"));
+        assert_eq!(schema_by_table.get("orders"), Some(&"public"));
+    }
+
+    // ── pg_namespace ─────────────────────────────────────────────────────────
+
+    /// `pg_catalog.pg_namespace` must have one row per reserved schema.
+    #[tokio::test]
+    async fn pg_namespace_lists_all_reserved_schemas() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+        cat.create_namespace(&p).await.unwrap();
+
+        let batch = InfoSchemaQuery::pg_namespace(&cat, &p).await.unwrap();
+
+        assert_eq!(
+            batch.num_rows(),
+            ReservedSchema::ALL.len(),
+            "pg_namespace row count should equal number of reserved schemas"
+        );
+
+        let nspnames = batch
+            .column(1) // nspname is col index 1
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        let mut names: Vec<&str> = (0..nspnames.len()).map(|i| nspnames.value(i)).collect();
+        names.sort();
+
+        let mut expected: Vec<&str> = ReservedSchema::ALL.iter().map(|r| r.as_str()).collect();
+        expected.sort();
+
+        assert_eq!(names, expected, "pg_namespace must cover every reserved schema");
+    }
+
+    /// `pg_namespace` oids must be stable across two calls (deterministic).
+    #[tokio::test]
+    async fn pg_namespace_oids_are_stable() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+        cat.create_namespace(&p).await.unwrap();
+
+        let batch1 = InfoSchemaQuery::pg_namespace(&cat, &p).await.unwrap();
+        let batch2 = InfoSchemaQuery::pg_namespace(&cat, &p).await.unwrap();
+
+        // Collect oid→name maps for both calls.
+
+        let oids1 = batch1.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let oids2 = batch2.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+
+        let oids1_vec: Vec<i64> = (0..oids1.len()).map(|i| oids1.value(i)).collect();
+        let oids2_vec: Vec<i64> = (0..oids2.len()).map(|i| oids2.value(i)).collect();
+
+        assert_eq!(oids1_vec, oids2_vec, "pg_namespace oids must be stable across calls");
+    }
+
+    // ── pg_class.relnamespace ─────────────────────────────────────────────────
+
+    /// `pg_class.relnamespace` for an auth-schema table must equal the
+    /// `pg_namespace.oid` for `"auth"`.
+    #[tokio::test]
+    async fn pg_class_relnamespace_matches_auth_namespace_oid() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+        cat.create_namespace(&p).await.unwrap();
+
+        let qt = qtable("auth", "users");
+        cat.create_table_qualified(&p, &qt, minimal_schema())
+            .await
+            .unwrap();
+
+        let pg_class_batch = InfoSchemaQuery::pg_class(&cat, &p).await.unwrap();
+        let pg_ns_batch = InfoSchemaQuery::pg_namespace(&cat, &p).await.unwrap();
+
+        // Find the namespace oid for "auth".
+
+        let ns_oids = pg_ns_batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let ns_names = pg_ns_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        let auth_oid = (0..ns_names.len())
+            .find(|&i| ns_names.value(i) == "auth")
+            .map(|i| ns_oids.value(i))
+            .expect("pg_namespace must contain an 'auth' row");
+
+        // Find the relnamespace for the "users" table in pg_class.
+        let relnames = pg_class_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let relnamespaces = pg_class_batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        let users_ns = (0..relnames.len())
+            .find(|&i| relnames.value(i) == "users")
+            .map(|i| relnamespaces.value(i))
+            .expect("pg_class must contain a 'users' row");
+
+        assert_eq!(
+            users_ns, auth_oid,
+            "pg_class.relnamespace for auth.users must equal pg_namespace.oid for 'auth'"
+        );
+    }
+
+    /// `pg_class.relnamespace` for a public-schema table must equal the
+    /// `pg_namespace.oid` for `"public"`.
+    #[tokio::test]
+    async fn pg_class_relnamespace_matches_public_namespace_oid() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+        cat.create_namespace(&p).await.unwrap();
+
+        let qt = QualifiedTableName::in_public(TableName::new("orders").unwrap());
+        cat.create_table_qualified(&p, &qt, minimal_schema())
+            .await
+            .unwrap();
+
+        let pg_class_batch = InfoSchemaQuery::pg_class(&cat, &p).await.unwrap();
+        let pg_ns_batch = InfoSchemaQuery::pg_namespace(&cat, &p).await.unwrap();
+
+
+        let ns_oids = pg_ns_batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let ns_names = pg_ns_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        let public_oid = (0..ns_names.len())
+            .find(|&i| ns_names.value(i) == "public")
+            .map(|i| ns_oids.value(i))
+            .expect("pg_namespace must contain a 'public' row");
+
+        let relnames = pg_class_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let relnamespaces = pg_class_batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        let orders_ns = (0..relnames.len())
+            .find(|&i| relnames.value(i) == "orders")
+            .map(|i| relnamespaces.value(i))
+            .expect("pg_class must contain an 'orders' row");
+
+        assert_eq!(
+            orders_ns, public_oid,
+            "pg_class.relnamespace for public.orders must equal pg_namespace.oid for 'public'"
+        );
+    }
 }
