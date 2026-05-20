@@ -303,3 +303,43 @@ later grep finds them all.
 **Trigger to revisit:** if the async CLI rewrite lands (T-future), swap for `tokio-tungstenite` in the same commit.
 
 *Last updated: 2026-05-20.*
+
+---
+
+## 2026-05-20 — Cosign keyless signing + Homebrew tap auto-update in cargo release CI
+
+**Chosen:** restore Sigstore cosign keyless (OIDC) signing and Homebrew tap
+auto-update in `.github/workflows/release.yml`, ported from the old
+`.goreleaser.yaml` pipeline.
+
+**Signing approach:** a dedicated `sign` job runs after `build-release`,
+installs `sigstore/cosign-installer@v3`, downloads all release assets via
+`gh release download`, then calls `cosign sign-blob --yes` (no private key —
+OIDC identity is the Actions workflow URL at the release tag) over each asset,
+producing `<asset>.sig` + `<asset>.pem`. Both are uploaded back to the GitHub
+release. The workflow-level `id-token: write` permission mints the short-lived
+OIDC token cosign needs. Downstream verification uses `cosign verify-blob`
+against `--certificate-oidc-issuer https://token.actions.githubusercontent.com`.
+
+**Homebrew tap:** a `brew-tap` job downloads the macOS + Linux tarballs, computes
+their SHA256s, generates `Formula/basin.rb` (same fields as the goreleaser
+`brews:` block: `desc`, `homepage`, `license Apache-2.0`, `bin.install "basin"`,
+`test`), and pushes it to `bas-in/homebrew-tap` via a PAT clone + `git push`.
+
+**Required secrets (new or renamed):**
+- `HOMEBREW_TAP_TOKEN` — fine-grained PAT, `contents: write` on
+  `bas-in/homebrew-tap`. The old goreleaser pipeline used `GORELEASER_TAP_TOKEN`
+  for the same purpose; rename or add an alias in the repo settings.
+- `GITHUB_TOKEN` — standard Actions token; used for release uploads and cosign
+  OIDC identity. No additional configuration needed.
+
+**Rejected:** (1) re-introducing goreleaser just for signing/brew — it would
+re-add the Go toolchain dep to the Rust release path; (2) storing a cosign
+private key as a repo secret — keyless OIDC is strictly safer and matches what
+goreleaser did; (3) using a third-party `dawidd6/action-homebrew-bump-formula`
+action — it requires formula to already exist in homebrew-core; our formula
+lives in a private tap.
+
+**Trigger to revisit:** if `taiki-e/upload-rust-binary-action` gains native
+Sigstore integration or a stable checksum-file API, consolidate signing into
+the `build-release` matrix job and drop the separate `sign` job.*Last updated: 2026-05-20.*

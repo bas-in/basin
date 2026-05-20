@@ -5,12 +5,17 @@ on:
     tags:
       - "v*"
 
+# Required secrets:
+#   HOMEBREW_TAP_TOKEN — fine-grained GitHub PAT with `contents: write`
+#                        on bas-in/homebrew-tap (used by brew-tap job).
+#                        The old goreleaser pipeline called this
+#                        GORELEASER_TAP_TOKEN; rename or alias as needed.
+#   GITHUB_TOKEN       — standard Actions token; used for release uploads
+#                        and cosign OIDC (id-token: write below).
+
 permissions:
   contents: write
-  # id-token: write is reserved for Sigstore keyless signing via cosign.
-  # TODO: re-add cosign signing — wire sigstore/cosign-installer + cosign
-  # sign-blob over each uploaded artefact and its checksums.txt, matching
-  # what .goreleaser.yaml did. Requires id-token: write here and cosign v2.
+  id-token: write   # required for Sigstore keyless OIDC signing via cosign
   packages: write
 
 jobs:
@@ -73,6 +78,60 @@ jobs:
           archive: basin_$tag_$target
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  # ── Sigstore keyless signing ────────────────────────────────────────
+  # Signs the release checksums file + each per-target archive with
+  # cosign in keyless (OIDC) mode. The signing identity is the Actions
+  # OIDC token for this workflow at the release tag, so no private keys
+  # are stored. Produces .sig + .pem (certificate) alongside each asset.
+  # Downstream verification:
+  #   cosign verify-blob --certificate basin_<ver>_<target>.tar.gz.pem \
+  #     --signature basin_<ver>_<target>.tar.gz.sig \
+  #     --certificate-identity-regexp \
+  #       'https://github.com/bas-in/basin-cli/.github/workflows/release.yml' \
+  #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  #     basin_<ver>_<target>.tar.gz
+  sign:
+    name: cosign keyless signing
+    runs-on: ubuntu-latest
+    needs: build-release
+    permissions:
+      contents: write
+      id-token: write   # mint OIDC token for keyless cosign
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          mkdir -p release-assets
+          gh release download "$TAG" --dir release-assets
+
+      - name: Sign all release assets (keyless, OIDC)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          for asset in release-assets/*; do
+            # Skip files that are already signatures or certificates
+            [[ "$asset" == *.sig ]] && continue
+            [[ "$asset" == *.pem ]] && continue
+            echo "Signing: $asset"
+            cosign sign-blob --yes \
+              --output-signature="${asset}.sig" \
+              --output-certificate="${asset}.pem" \
+              "$asset"
+          done
+          # Upload .sig + .pem files back to the release
+          for sig in release-assets/*.sig release-assets/*.pem; do
+            [ -f "$sig" ] || continue
+            gh release upload "$TAG" "$sig" --clobber
+          done
+
   # Docker image pushed to GHCR (linux amd64 + arm64 manifest list).
   # Mirrors what goreleaser's dockers: + docker_manifests: blocks did.
   docker:
@@ -120,9 +179,111 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
-  # Homebrew tap update — pushes an updated Formula/basin.rb to
-  # bas-in/homebrew-tap using the GORELEASER_TAP_TOKEN PAT (same secret
-  # the old goreleaser pipeline used, kept for continuity).
-  # TODO: automate formula generation from checksums.txt once
-  # taiki-e/upload-rust-binary-action produces a stable checksums file.
-  # For now, update manually after each release or wire a separate action.
+  # ── Homebrew tap auto-update ────────────────────────────────────────
+  # Generates and pushes an updated Formula/basin.rb to bas-in/homebrew-tap
+  # after all binaries are uploaded. Mirrors the goreleaser brews: block:
+  #   name: basin, tap: bas-in/homebrew-tap, license: Apache-2.0,
+  #   install: bin.install "basin".
+  # Requires HOMEBREW_TAP_TOKEN — a fine-grained PAT with contents: write
+  # on bas-in/homebrew-tap (the old goreleaser pipeline called this
+  # GORELEASER_TAP_TOKEN; same token, renamed for clarity).
+  brew-tap:
+    name: homebrew tap update
+    runs-on: ubuntu-latest
+    needs: build-release
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute release asset SHA256s + generate Formula/basin.rb
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          BASE_URL="https://github.com/bas-in/basin-cli/releases/download/${TAG}"
+
+          mkdir -p release-assets
+          gh release download "$TAG" --dir release-assets \
+            --pattern 'basin_*darwin*' --pattern 'basin_*linux*'
+
+          darwin_amd64_file=$(ls release-assets/basin_*x86_64-apple-darwin* 2>/dev/null | head -1)
+          darwin_arm64_file=$(ls release-assets/basin_*aarch64-apple-darwin* 2>/dev/null | head -1)
+          linux_amd64_file=$(ls release-assets/basin_*x86_64-unknown-linux-gnu* 2>/dev/null | head -1)
+          linux_arm64_file=$(ls release-assets/basin_*aarch64-unknown-linux-gnu* 2>/dev/null | head -1)
+
+          sha_darwin_amd64=$(sha256sum "$darwin_amd64_file" | awk '{print $1}')
+          sha_darwin_arm64=$(sha256sum "$darwin_arm64_file" | awk '{print $1}')
+          sha_linux_amd64=$(sha256sum "$linux_amd64_file"  | awk '{print $1}')
+          sha_linux_arm64=$(sha256sum "$linux_arm64_file"  | awk '{print $1}')
+
+          darwin_amd64=$(basename "$darwin_amd64_file")
+          darwin_arm64=$(basename "$darwin_arm64_file")
+          linux_amd64=$(basename "$linux_amd64_file")
+          linux_arm64=$(basename "$linux_arm64_file")
+
+          cat > Formula_basin.rb <<EOF
+          # Formula generated by basin-cli release workflow (bas-in/basin-cli/.github/workflows/release.yml)
+          # Do not edit manually — this file is overwritten on every release.
+          class Basin < Formula
+            desc "Basin Cloud control plane CLI"
+            homepage "https://basin.run"
+            license "Apache-2.0"
+            version "${VERSION}"
+
+            on_macos do
+              on_intel do
+                url "${BASE_URL}/${darwin_amd64}"
+                sha256 "${sha_darwin_amd64}"
+              end
+              on_arm do
+                url "${BASE_URL}/${darwin_arm64}"
+                sha256 "${sha_darwin_arm64}"
+              end
+            end
+
+            on_linux do
+              on_intel do
+                url "${BASE_URL}/${linux_amd64}"
+                sha256 "${sha_linux_amd64}"
+              end
+              on_arm do
+                url "${BASE_URL}/${linux_arm64}"
+                sha256 "${sha_linux_arm64}"
+              end
+            end
+
+            def install
+              bin.install "basin"
+            end
+
+            test do
+              system "#{bin}/basin", "--version"
+            end
+          end
+          EOF
+
+      - name: Push Formula/basin.rb to bas-in/homebrew-tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+
+          git config --global user.email "bot@basin.run"
+          git config --global user.name "basin-release-bot"
+
+          git clone \
+            "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/bas-in/homebrew-tap.git" \
+            homebrew-tap
+
+          mkdir -p homebrew-tap/Formula
+          cp Formula_basin.rb homebrew-tap/Formula/basin.rb
+
+          cd homebrew-tap
+          git add Formula/basin.rb
+          if git diff --cached --quiet; then
+            echo "Formula unchanged — nothing to commit."
+          else
+            git commit -m "formula: bump basin to ${VERSION}"
+            git push origin main
+          fi
