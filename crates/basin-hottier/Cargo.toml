@@ -29,3 +29,4 @@ tracing = { workspace = true }
 crossbeam-skiplist = "0.1"
 criterion = { version = "0.5", features = ["html_reports"] }
 rand = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread"] }

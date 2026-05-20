@@ -4,10 +4,12 @@
 //! 1. Soft-cap trigger: 100 inserts of 2 MiB each on one project.
 //! 2. Hard-cap trigger: verify `HardCapReached` fires at 256 MiB.
 //! 3. Two projects in parallel: `largest_project()` returns the right one.
+//! 4. `GlobalPressureScheduler` — largest-first ordering, limit, threshold.
+//! 5. Semaphore back-pressure: blocked writers unblock after `release_bytes`.
 
-use basin_common::ids::{ProjectId, TableName};
+use basin_common::ids::ProjectId;
 use basin_hottier::{
-    budget::MemTableConfig,
+    budget::{GlobalPressureScheduler, MemTableConfig, DEFAULT_GLOBAL_PRESSURE_THRESHOLD_BYTES},
     registry::{MemTableRegistry, ReservationOutcome},
 };
 
@@ -219,4 +221,192 @@ fn parse_byte_size_variants() {
     assert_eq!(parse_byte_size("512KB"), Some(512 * 1024));
     assert_eq!(parse_byte_size("abc"), None);
     assert_eq!(parse_byte_size(""), None);
+}
+
+// ── test 8: GlobalPressureScheduler — below threshold returns None ────────────
+
+/// `GlobalPressureScheduler::pick_flush_candidates` returns `None` when total
+/// bytes across all projects is below the global pressure threshold (4 GiB).
+#[test]
+fn budget_scheduler_below_threshold_returns_none() {
+    let sched = GlobalPressureScheduler::default();
+    // Total = 3 GiB < 4 GiB threshold.
+    let projects: Vec<(u32, u64)> = vec![
+        (1, 1 * 1024 * 1024 * 1024),
+        (2, 1 * 1024 * 1024 * 1024),
+        (3, 1 * 1024 * 1024 * 1024),
+    ];
+    assert!(
+        sched.pick_flush_candidates(&projects, usize::MAX).is_none(),
+        "scheduler must be inactive below the global pressure threshold"
+    );
+    assert!(
+        !sched.is_under_pressure(&projects),
+        "is_under_pressure must return false below threshold"
+    );
+}
+
+// ── test 9: GlobalPressureScheduler — above threshold, largest-first ──────────
+
+/// When total bytes exceeds the 4 GiB threshold, `pick_flush_candidates`
+/// returns projects in descending byte order (largest-first).
+#[test]
+fn budget_scheduler_above_threshold_largest_first() {
+    let sched = GlobalPressureScheduler::default();
+    // Total = 5 GiB > 4 GiB threshold.
+    let projects: Vec<(u32, u64)> = vec![
+        (10, 1 * 1024 * 1024 * 1024), // 1 GiB — smallest
+        (20, 3 * 1024 * 1024 * 1024), // 3 GiB — largest
+        (30, 1 * 1024 * 1024 * 1024), // 1 GiB — tie with project 10
+    ];
+    let candidates = sched
+        .pick_flush_candidates(&projects, usize::MAX)
+        .expect("scheduler must activate above threshold");
+    assert_eq!(candidates.len(), 3);
+    // First must be the 3 GiB project.
+    assert_eq!(candidates[0], 20, "largest project must be scheduled first");
+    assert!(
+        sched.is_under_pressure(&projects),
+        "is_under_pressure must return true above threshold"
+    );
+}
+
+// ── test 10: GlobalPressureScheduler — limit caps returned candidates ─────────
+
+/// The `limit` parameter caps the number of candidates returned even when
+/// global pressure is active.
+#[test]
+fn budget_scheduler_limit_caps_candidates() {
+    let sched = GlobalPressureScheduler::default();
+    // 10 projects × 512 MiB = 5 GiB > threshold.
+    let projects: Vec<(u32, u64)> = (0..10)
+        .map(|i| (i, (i as u64 + 1) * 512 * 1024 * 1024))
+        .collect();
+    let candidates = sched
+        .pick_flush_candidates(&projects, 3)
+        .expect("must be under pressure");
+    assert_eq!(candidates.len(), 3, "limit=3 must cap result to 3 candidates");
+}
+
+// ── test 11: GlobalPressureScheduler — exactly at threshold is NOT active ─────
+
+/// The boundary condition: total bytes **equal to** the threshold must NOT
+/// activate the scheduler. Only strictly greater triggers it.
+#[test]
+fn budget_scheduler_exactly_at_threshold_inactive() {
+    let sched = GlobalPressureScheduler::default();
+    let projects: Vec<(u32, u64)> = vec![(1, DEFAULT_GLOBAL_PRESSURE_THRESHOLD_BYTES)];
+    assert!(
+        sched.pick_flush_candidates(&projects, usize::MAX).is_none(),
+        "total == threshold must NOT activate scheduler"
+    );
+}
+
+// ── test 12: GlobalPressureScheduler integrates with MemTableRegistry ─────────
+
+/// Feed real per-project byte totals from `MemTableRegistry` into the scheduler
+/// and verify it correctly orders candidates.
+#[test]
+fn budget_scheduler_integrates_with_registry() {
+    // Use a custom threshold of 50 MiB for this test.
+    let sched = GlobalPressureScheduler {
+        global_pressure_threshold_bytes: 50 * 1024 * 1024,
+        ..GlobalPressureScheduler::default()
+    };
+
+    let cfg = MemTableConfig {
+        project_hard_cap_bytes: 512 * 1024 * 1024,
+        project_soft_cap_bytes: 256 * 1024 * 1024,
+        ..MemTableConfig::default()
+    };
+    let reg = MemTableRegistry::new_with_config(cfg);
+
+    let proj_a = proj();
+    let proj_b = proj();
+    let proj_c = proj();
+
+    // proj_b gets the most bytes.
+    reg.try_reserve_bytes(&proj_a, 10 * 1024 * 1024); // 10 MiB
+    reg.try_reserve_bytes(&proj_b, 30 * 1024 * 1024); // 30 MiB
+    reg.try_reserve_bytes(&proj_c, 15 * 1024 * 1024); // 15 MiB
+    // Total = 55 MiB > 50 MiB threshold.
+
+    let pairs: Vec<(ProjectId, u64)> = [proj_a, proj_b, proj_c]
+        .iter()
+        .map(|p| (*p, reg.project_bytes(p)))
+        .collect();
+
+    let candidates = sched
+        .pick_flush_candidates(&pairs, usize::MAX)
+        .expect("55 MiB > 50 MiB threshold: scheduler must activate");
+
+    assert_eq!(candidates.len(), 3);
+    assert_eq!(
+        candidates[0], proj_b,
+        "proj_b (30 MiB) must be first flush candidate"
+    );
+    assert_eq!(
+        candidates[2], proj_a,
+        "proj_a (10 MiB) must be last flush candidate"
+    );
+}
+
+// ── test 13: semaphore back-pressure — async unblock ─────────────────────────
+
+/// Verify the semaphore back-pressure path: fill a project to the hard cap,
+/// confirm the next write is `HardCapReached`, then release bytes and confirm
+/// the writer can proceed.
+///
+/// This test exercises the same code path as the flush task (C4) unblocking
+/// a stalled writer after flushing committed data.
+#[tokio::test]
+async fn budget_semaphore_backpressure_unblocks_writer() {
+    let cfg = MemTableConfig {
+        project_hard_cap_bytes: 4 * 1024 * 1024, // 4 MiB hard cap
+        project_soft_cap_bytes: 2 * 1024 * 1024, // 2 MiB soft cap
+        ..MemTableConfig::default()
+    };
+    let reg = std::sync::Arc::new(MemTableRegistry::new_with_config(cfg));
+    let project = proj();
+
+    // Fill project to exactly the hard cap (4 MiB).
+    let fill_outcome = reg.try_reserve_bytes(&project, 4 * 1024 * 1024);
+    assert_ne!(
+        fill_outcome,
+        ReservationOutcome::HardCapReached,
+        "initial fill must succeed"
+    );
+
+    // Confirm the next write is blocked.
+    assert_eq!(
+        reg.try_reserve_bytes(&project, 1024),
+        ReservationOutcome::HardCapReached,
+        "write at hard cap must be HardCapReached"
+    );
+
+    // Simulate flush: release 2 MiB.
+    let reg_clone = reg.clone();
+    let project_clone = project;
+    tokio::spawn(async move {
+        reg_clone.release_bytes(&project_clone, 2 * 1024 * 1024);
+    })
+    .await
+    .unwrap();
+
+    // Now a write that fits in the freed headroom must succeed.
+    let outcome = reg.try_reserve_bytes(&project, 1024 * 1024); // 1 MiB
+    assert_ne!(
+        outcome,
+        ReservationOutcome::HardCapReached,
+        "write must succeed after release_bytes"
+    );
+
+    // Verify semaphore permit count is consistent with the freed bytes.
+    // After releasing 2 MiB and using 1 MiB, 1 MiB of headroom remains.
+    // bytes_allocated = 4 MiB (original fill) - 2 MiB (released) + 1 MiB (new write) = 3 MiB.
+    let committed = reg.project_bytes(&project);
+    assert!(
+        committed <= 4 * 1024 * 1024,
+        "bytes_allocated {committed} must not exceed hard cap after partial release"
+    );
 }

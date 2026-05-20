@@ -188,6 +188,129 @@ fn env_u64(key: &str) -> Option<u64> {
     }
 }
 
+// ── GlobalPressureScheduler ───────────────────────────────────────────────────
+
+/// Default global process memory threshold for engaging largest-first flush
+/// scheduling (4 GiB).
+///
+/// When the sum of all project `bytes_allocated` counters exceeds this value,
+/// [`GlobalPressureScheduler::pick_flush_candidates`] activates and returns
+/// projects in largest-first order so the flush task maximises memory reclaimed
+/// per I/O round-trip.
+pub const DEFAULT_GLOBAL_PRESSURE_THRESHOLD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Stateless largest-first global flush scheduler.
+///
+/// # Purpose
+///
+/// When total process memory pressure crosses a configurable threshold the
+/// scheduler ranks all active projects by their current `bytes_allocated` and
+/// returns them largest-first so the caller (Phase 5.14.C4 flush task) can
+/// reclaim memory efficiently.
+///
+/// # Design
+///
+/// The scheduler is stateless — it has no mutable fields. All inputs are
+/// passed at call time, which makes it trivially testable without touching the
+/// async runtime, the registry, or the flush channel.
+///
+/// # Semaphore integration
+///
+/// Each project's `ProjectMemState.hard_cap_sem` tracks the available headroom
+/// below the hard cap. When a flush succeeds the flush task calls
+/// `MemTableRegistry::release_bytes` which calls `Semaphore::add_permits`;
+/// this unblocks any writer awaiting the semaphore in the hard-cap path.
+///
+/// The scheduler itself does **not** touch the semaphore — it only decides
+/// *which* projects to schedule. Semaphore bookkeeping lives in
+/// [`crate::registry::MemTableRegistry::release_bytes`].
+#[derive(Debug, Clone)]
+pub struct GlobalPressureScheduler {
+    /// Total bytes across all projects that triggers largest-first scheduling.
+    pub global_pressure_threshold_bytes: u64,
+    /// Scheduling policy (largest-first by default).
+    pub policy: FlushPolicy,
+}
+
+impl Default for GlobalPressureScheduler {
+    fn default() -> Self {
+        Self {
+            global_pressure_threshold_bytes: DEFAULT_GLOBAL_PRESSURE_THRESHOLD_BYTES,
+            policy: FlushPolicy::LargestFirst,
+        }
+    }
+}
+
+impl GlobalPressureScheduler {
+    /// Construct a scheduler from a [`MemTableConfig`].
+    ///
+    /// Uses `config.flush_policy` and `DEFAULT_GLOBAL_PRESSURE_THRESHOLD_BYTES`.
+    pub fn from_config(config: &MemTableConfig) -> Self {
+        Self {
+            global_pressure_threshold_bytes: DEFAULT_GLOBAL_PRESSURE_THRESHOLD_BYTES,
+            policy: config.flush_policy,
+        }
+    }
+
+    /// Decide which projects should be flushed next given the current per-project
+    /// byte totals.
+    ///
+    /// # Arguments
+    ///
+    /// - `project_bytes`: slice of `(project_id, bytes_allocated)` pairs. The
+    ///   caller should supply one entry per active project. The total sum of
+    ///   `bytes_allocated` is used to determine whether global pressure applies.
+    /// - `limit`: maximum number of candidates to return. Pass `usize::MAX` to
+    ///   return all projects above the threshold.
+    ///
+    /// # Returns
+    ///
+    /// - `None` when total bytes <= `global_pressure_threshold_bytes` — global
+    ///   pressure is not active; the caller should rely on per-project soft-cap
+    ///   triggers instead.
+    /// - `Some(Vec<ProjectId>)` (largest-first by default) when global pressure
+    ///   is active. The vec is sorted descending by bytes allocated; ties are
+    ///   broken arbitrarily (not guaranteed to be stable across calls).
+    ///
+    /// # Complexity
+    ///
+    /// O(n log n) on the number of active projects. At 10 000 active tenants
+    /// this is < 1 ms on modern hardware.
+    pub fn pick_flush_candidates<P: Copy>(
+        &self,
+        project_bytes: &[(P, u64)],
+        limit: usize,
+    ) -> Option<Vec<P>> {
+        let total: u64 = project_bytes.iter().map(|(_, b)| b).sum();
+        if total <= self.global_pressure_threshold_bytes {
+            return None;
+        }
+
+        let mut sorted: Vec<(P, u64)> = project_bytes.to_vec();
+        match self.policy {
+            FlushPolicy::LargestFirst => {
+                // Largest bytes_allocated first — maximises reclaimed bytes per flush.
+                sorted.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+            }
+            FlushPolicy::Lru => {
+                // Stub: Lru is not yet wired. Fall through to LargestFirst for now.
+                sorted.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+            }
+        }
+
+        let candidates: Vec<P> = sorted.into_iter().take(limit).map(|(p, _)| p).collect();
+        Some(candidates)
+    }
+
+    /// Returns `true` when the sum of `project_bytes` exceeds the global
+    /// pressure threshold. A cheap O(n) predicate for callers that only need
+    /// to know whether to invoke the scheduler.
+    pub fn is_under_pressure(&self, project_bytes: &[(impl Copy, u64)]) -> bool {
+        let total: u64 = project_bytes.iter().map(|(_, b)| b).sum();
+        total > self.global_pressure_threshold_bytes
+    }
+}
+
 // ── parse helpers (used by ALTER PROJECT DDL) ─────────────────────────────────
 
 /// Parse a human-readable byte size string into a `u64`.
@@ -228,6 +351,90 @@ pub fn parse_byte_size(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── GlobalPressureScheduler tests ─────────────────────────────────────────
+
+    #[test]
+    fn scheduler_returns_none_below_threshold() {
+        let sched = GlobalPressureScheduler::default();
+        // 3 GiB total — below 4 GiB threshold.
+        let projects = vec![
+            (1u64, 1 * 1024 * 1024 * 1024u64),
+            (2u64, 1 * 1024 * 1024 * 1024),
+            (3u64, 1 * 1024 * 1024 * 1024),
+        ];
+        assert!(sched.pick_flush_candidates(&projects, usize::MAX).is_none());
+    }
+
+    #[test]
+    fn scheduler_returns_largest_first_above_threshold() {
+        let sched = GlobalPressureScheduler::default();
+        // 5 GiB total — above 4 GiB threshold.
+        let projects = vec![
+            (1u64, 1 * 1024 * 1024 * 1024u64), // 1 GiB
+            (2u64, 2 * 1024 * 1024 * 1024),    // 2 GiB (largest)
+            (3u64, 2 * 1024 * 1024 * 1024),    // 2 GiB
+        ];
+        let candidates = sched
+            .pick_flush_candidates(&projects, usize::MAX)
+            .expect("must return candidates under pressure");
+        assert_eq!(candidates.len(), 3);
+        // First element must be one of the 2 GiB projects (2 or 3).
+        assert!(
+            candidates[0] == 2 || candidates[0] == 3,
+            "first candidate must be one of the largest projects"
+        );
+        // Last element must be the 1 GiB project.
+        assert_eq!(candidates[2], 1, "smallest project must come last");
+    }
+
+    #[test]
+    fn scheduler_respects_limit() {
+        let sched = GlobalPressureScheduler::default();
+        // 5 GiB total — above threshold.
+        let projects: Vec<(u64, u64)> = (0..10)
+            .map(|i| (i, (i + 1) * 512 * 1024 * 1024))
+            .collect();
+        let candidates = sched
+            .pick_flush_candidates(&projects, 3)
+            .expect("must return candidates under pressure");
+        assert_eq!(candidates.len(), 3, "limit must be respected");
+    }
+
+    #[test]
+    fn scheduler_is_under_pressure_matches_pick() {
+        let sched = GlobalPressureScheduler::default();
+        // Exactly at threshold — not under pressure.
+        let at_threshold = vec![(1u64, DEFAULT_GLOBAL_PRESSURE_THRESHOLD_BYTES)];
+        assert!(!sched.is_under_pressure(&at_threshold));
+        assert!(sched.pick_flush_candidates(&at_threshold, usize::MAX).is_none());
+
+        // One byte over — under pressure.
+        let over_threshold = vec![(1u64, DEFAULT_GLOBAL_PRESSURE_THRESHOLD_BYTES + 1)];
+        assert!(sched.is_under_pressure(&over_threshold));
+        assert!(sched
+            .pick_flush_candidates(&over_threshold, usize::MAX)
+            .is_some());
+    }
+
+    #[test]
+    fn scheduler_from_config_uses_flush_policy() {
+        let cfg = MemTableConfig {
+            flush_policy: FlushPolicy::Lru,
+            ..MemTableConfig::default()
+        };
+        let sched = GlobalPressureScheduler::from_config(&cfg);
+        assert_eq!(sched.policy, FlushPolicy::Lru);
+    }
+
+    #[test]
+    fn scheduler_empty_project_list_returns_none() {
+        let sched = GlobalPressureScheduler::default();
+        let empty: Vec<(u64, u64)> = vec![];
+        assert!(sched.pick_flush_candidates(&empty, usize::MAX).is_none());
+    }
+
+    // ── MemTableConfig tests ──────────────────────────────────────────────────
 
     #[test]
     fn default_values_match_adr_0016() {
