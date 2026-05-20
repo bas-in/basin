@@ -17,6 +17,7 @@
 //! | [`registry::MemTableRegistry`] | Process-wide `DashMap`; lazy allocation; per-project semaphore |
 //! | [`budget::MemTableConfig`] | Per-process memory budget configuration (Phase 5.14.C5) |
 //! | [`budget::GlobalPressureScheduler`] | Stateless largest-first flush scheduler when global pressure rises (Phase 5.14.C5) |
+//! | [`flush::FlushTask`] | Background memtable → Vortex flush loop (Phase 5.14.C4) |
 //!
 //! ## Multi-tenant isolation
 //!
@@ -33,12 +34,14 @@
 //! subsequent sub-items.
 
 pub mod budget;
+pub mod flush;
 pub mod memtable;
 pub mod merge;
 pub mod registry;
 pub mod row_key;
 
 pub use budget::{FlushPolicy, GlobalPressureScheduler, MemTableConfig};
+pub use flush::{FlushBackend, FlushTask, FlushTrigger, ImmediateFlushRequest, RowBytes, WrittenFile};
 pub use memtable::{MemRowValue, MemTable};
 pub use merge::merge_scan;
 pub use registry::{

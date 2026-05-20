@@ -312,6 +312,37 @@ impl MemTableRegistry {
     pub fn config(&self) -> &MemTableConfig {
         &self.config
     }
+
+    // ── Flush-worker iteration helpers (Phase 5.14.C4) ────────────────────────
+
+    /// Alias for [`MemTableRegistry::new`] that documents the flush channel
+    /// is open.  Used by tests that want a registry whose send side works.
+    pub fn with_flush_channel() -> Self {
+        Self::new()
+    }
+
+    /// Snapshot of all `(project_id, Arc<ProjectMemState>)` pairs. O(n).
+    ///
+    /// Returns a `Vec` so the caller can safely iterate across await points
+    /// without holding a DashMap shard lock.
+    pub fn projects_iter(&self) -> Vec<(ProjectId, Arc<ProjectMemState>)> {
+        self.projects
+            .iter()
+            .map(|e| (*e.key(), e.value().clone()))
+            .collect()
+    }
+
+    /// Snapshot of all `(project_id, table_name, Arc<MemTableEntry>)` triples.
+    /// O(n) — safe to hold across async yield points.
+    pub fn tables_iter(&self) -> Vec<(ProjectId, TableName, Arc<MemTableEntry>)> {
+        self.tables
+            .iter()
+            .map(|e| {
+                let (project, table) = e.key().clone();
+                (project, table, e.value().clone())
+            })
+            .collect()
+    }
 }
 
 impl Default for MemTableRegistry {

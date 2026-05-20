@@ -51,6 +51,12 @@ pub struct ShardConfig {
     pub compaction_interval: Duration,
     /// How often the eviction loop runs. Default 60s.
     pub eviction_interval: Duration,
+    /// Process-wide HTAP hot-tier memtable registry.  When present,
+    /// [`Shard::spawn_background`] also spawns the memtable → Vortex flush
+    /// loop (Phase 5.14.C4).  When absent the flush loop is not started.
+    pub memtable_registry: Option<Arc<basin_hottier::MemTableRegistry>>,
+    /// How often the flush task's periodic trigger fires.  Default 5 s.
+    pub flush_tick_interval: Duration,
 }
 
 impl ShardConfig {
@@ -66,7 +72,19 @@ impl ShardConfig {
             eviction_idle: Duration::from_secs(300),
             compaction_interval: Duration::from_secs(30),
             eviction_interval: Duration::from_secs(60),
+            memtable_registry: None,
+            flush_tick_interval: Duration::from_secs(5),
         }
+    }
+
+    /// Attach the HTAP memtable registry so [`Shard::spawn_background`] also
+    /// starts the flush loop (Phase 5.14.C4).
+    pub fn with_memtable_registry(
+        mut self,
+        registry: Arc<basin_hottier::MemTableRegistry>,
+    ) -> Self {
+        self.memtable_registry = Some(registry);
+        self
     }
 }
 

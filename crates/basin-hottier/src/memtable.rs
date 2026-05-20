@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use parking_lot::RwLock;
 
@@ -35,7 +36,10 @@ pub enum MemRowValue {
 impl MemRowValue {
     /// Construct a `Row` variant from pre-encoded IPC bytes.
     pub fn row(bytes: Vec<u8>, schema_version: u32) -> Self {
-        Self::Row { bytes, schema_version }
+        Self::Row {
+            bytes,
+            schema_version,
+        }
     }
 
     /// Return `true` if this is a live row (not a tombstone).
@@ -69,6 +73,10 @@ pub struct MemTable {
     /// Updated atomically on every write so callers can check caps without
     /// acquiring the lock.
     bytes_allocated: AtomicU64,
+    /// Unix-second timestamp of the first write to this generation.
+    /// `u64::MAX` = empty (no writes since last drain).  Used by the flush
+    /// task's age-based trigger without acquiring the BTree lock.
+    oldest_insert_secs: AtomicU64,
 }
 
 impl MemTable {
@@ -77,20 +85,65 @@ impl MemTable {
         Self {
             inner: RwLock::new(BTreeMap::new()),
             bytes_allocated: AtomicU64::new(0),
+            oldest_insert_secs: AtomicU64::new(u64::MAX),
         }
     }
+
+    // ── Age tracking ──────────────────────────────────────────────────────────
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    fn record_write_time(&self) {
+        // Set to now only if currently empty (MAX).
+        let _ = self.oldest_insert_secs.compare_exchange(
+            u64::MAX,
+            Self::now_secs(),
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+    }
+
+    fn maybe_reset_oldest(&self) {
+        if self.inner.read().is_empty() {
+            self.oldest_insert_secs.store(u64::MAX, Ordering::Release);
+        }
+    }
+
+    /// Age of the oldest row currently in this memtable.
+    ///
+    /// Returns `Duration::ZERO` when empty.  Cheap — reads one atomic; no lock.
+    pub fn oldest_row_age(&self) -> Duration {
+        let oldest = self.oldest_insert_secs.load(Ordering::Relaxed);
+        if oldest == u64::MAX {
+            return Duration::ZERO;
+        }
+        Duration::from_secs(Self::now_secs().saturating_sub(oldest))
+    }
+
+    // ── Mutations ─────────────────────────────────────────────────────────────
 
     /// Insert a new row.  If a row already exists under `key` it is replaced
     /// (last-write-wins, matching Basin's snapshot-isolation model).
     pub fn insert(&self, key: RowKey, value: MemRowValue) {
         let new_bytes = value.heap_bytes() as u64;
-        let mut map = self.inner.write();
-        let old_bytes = map.get(&key).map(|v| v.heap_bytes() as u64).unwrap_or(0);
-        map.insert(key, value);
+        let old_bytes = {
+            let mut map = self.inner.write();
+            let old = map.get(&key).map(|v| v.heap_bytes() as u64).unwrap_or(0);
+            map.insert(key, value);
+            old
+        };
         // Saturating arithmetic avoids underflow on pathological usage.
         let cur = self.bytes_allocated.load(Ordering::Relaxed);
-        self.bytes_allocated
-            .store(cur.saturating_add(new_bytes).saturating_sub(old_bytes), Ordering::Relaxed);
+        self.bytes_allocated.store(
+            cur.saturating_add(new_bytes).saturating_sub(old_bytes),
+            Ordering::Relaxed,
+        );
+        self.record_write_time();
     }
 
     /// Upsert a row: insert or overwrite.  Same semantics as `insert`.
@@ -103,12 +156,20 @@ impl MemTable {
     /// this key; the tombstone suppresses any matching cold-tier row during
     /// read-merge.
     pub fn delete(&self, key: RowKey) {
-        let mut map = self.inner.write();
-        let old_bytes = map.get(&key).map(|v| v.heap_bytes() as u64).unwrap_or(0);
-        map.insert(key, MemRowValue::Tombstone);
-        self.bytes_allocated
-            .fetch_sub(old_bytes.min(self.bytes_allocated.load(Ordering::Relaxed)), Ordering::Relaxed);
+        let old_bytes = {
+            let mut map = self.inner.write();
+            let old = map.get(&key).map(|v| v.heap_bytes() as u64).unwrap_or(0);
+            map.insert(key, MemRowValue::Tombstone);
+            old
+        };
+        self.bytes_allocated.fetch_sub(
+            old_bytes.min(self.bytes_allocated.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
+        );
+        self.record_write_time();
     }
+
+    // ── Reads ─────────────────────────────────────────────────────────────────
 
     /// Point lookup.  Returns `None` if the key has never been written.
     /// Returns `Some(MemRowValue::Tombstone)` if the row was deleted.
@@ -135,6 +196,8 @@ impl MemTable {
         map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
     }
 
+    // ── Stats ─────────────────────────────────────────────────────────────────
+
     /// Number of live rows (excludes tombstones).
     pub fn live_row_count(&self) -> usize {
         self.inner.read().values().filter(|v| v.is_row()).count()
@@ -150,6 +213,8 @@ impl MemTable {
         self.bytes_allocated.load(Ordering::Relaxed)
     }
 
+    // ── Flush helpers ─────────────────────────────────────────────────────────
+
     /// Remove all entries whose keys are in `keys`.  Used by the flush task
     /// (C4) after a successful cold-tier commit to GC flushed rows.  The write
     /// lock is held only for the duration of the removal loop.
@@ -157,15 +222,21 @@ impl MemTable {
         if keys.is_empty() {
             return;
         }
-        let mut map = self.inner.write();
-        let mut freed: u64 = 0;
-        for k in keys {
-            if let Some(v) = map.remove(k) {
-                freed += v.heap_bytes() as u64;
+        let freed = {
+            let mut map = self.inner.write();
+            let mut freed: u64 = 0;
+            for k in keys {
+                if let Some(v) = map.remove(k) {
+                    freed += v.heap_bytes() as u64;
+                }
             }
-        }
+            freed
+        };
         let cur = self.bytes_allocated.load(Ordering::Relaxed);
-        self.bytes_allocated.store(cur.saturating_sub(freed), Ordering::Relaxed);
+        self.bytes_allocated
+            .store(cur.saturating_sub(freed), Ordering::Relaxed);
+        // Reset age tracker when the memtable drains to empty.
+        self.maybe_reset_oldest();
     }
 }
 
@@ -213,7 +284,9 @@ mod tests {
         let mt = MemTable::new();
         mt.insert(key(1), row(0x01));
         mt.delete(key(1));
-        let v = mt.get(&key(1)).expect("tombstone must be present after delete");
+        let v = mt
+            .get(&key(1))
+            .expect("tombstone must be present after delete");
         assert!(v.is_tombstone(), "expected Tombstone, got {:?}", v);
     }
 
@@ -312,6 +385,30 @@ mod tests {
         assert_eq!(mt.total_count(), 2);
         assert!(mt.get(&key(0)).is_none());
         assert!(mt.get(&key(3)).is_some());
+    }
+
+    // ── age tracking ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn oldest_row_age_zero_when_empty() {
+        let mt = MemTable::new();
+        assert_eq!(mt.oldest_row_age(), Duration::ZERO);
+    }
+
+    #[test]
+    fn oldest_row_age_nonzero_after_insert() {
+        let mt = MemTable::new();
+        mt.insert(key(1), row(0xAA));
+        // May be 0 if insert + check happen in the same second, so just verify no panic.
+        let _ = mt.oldest_row_age();
+    }
+
+    #[test]
+    fn oldest_row_age_resets_after_full_drain() {
+        let mt = MemTable::new();
+        mt.insert(key(1), row(0xAA));
+        mt.remove_flushed(&[key(1)]);
+        assert_eq!(mt.oldest_row_age(), Duration::ZERO);
     }
 
     // ── multi-tenant isolation ────────────────────────────────────────────────

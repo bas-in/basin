@@ -684,6 +684,37 @@ impl ShardImpl for InProcessShard {
     fn spawn_background(self: Arc<Self>) -> ShardBackgroundHandle {
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let me = self.clone();
+
+        // Phase 5.14.C4: spawn the memtable → Vortex flush task if a
+        // MemTableRegistry was configured.  The task runs alongside the
+        // compaction loop; they are independent background workers.
+        let flush_task: Option<basin_hottier::FlushTask> =
+            if let Some(registry) = &me.cfg.memtable_registry {
+                let backend: Arc<dyn basin_hottier::FlushBackend> =
+                    Arc::new(ShardFlushBackend {
+                        storage: me.cfg.storage.clone(),
+                        catalog: me.cfg.catalog.clone(),
+                        wal: me.cfg.wal.clone(),
+                        partition: PartitionKey::default_key(),
+                    });
+                let task = basin_hottier::FlushTask::spawn(
+                    registry.clone(),
+                    backend,
+                    me.cfg.memtable_registry
+                        .as_ref()
+                        .map(|r| r.config().clone())
+                        .unwrap_or_default(),
+                    me.cfg.flush_tick_interval,
+                );
+                tracing::info!(
+                    tick_interval_ms = me.cfg.flush_tick_interval.as_millis(),
+                    "memtable flush task spawned (Phase 5.14.C4)",
+                );
+                Some(task)
+            } else {
+                None
+            };
+
         let join = tokio::spawn(async move {
             let mut shutdown = rx;
             let mut evict_tick = tokio::time::interval(me.cfg.eviction_interval);
@@ -706,6 +737,10 @@ impl ShardImpl for InProcessShard {
                         }
                     }
                 }
+            }
+            // Shutdown the flush task after the compaction loop exits.
+            if let Some(ft) = flush_task {
+                ft.shutdown().await;
             }
         });
         ShardBackgroundHandle { shutdown: tx, join }
@@ -761,6 +796,177 @@ impl ShardImpl for InProcessShard {
     #[cfg(test)]
     fn as_in_process(&self) -> Option<Arc<InProcessShard>> {
         Some(Arc::new(self.share_clone()))
+    }
+}
+
+// ── ShardFlushBackend ─────────────────────────────────────────────────────────
+
+/// [`FlushBackend`] implementation wired to the shard's `storage` + `catalog` +
+/// `wal`. Translates the generic `FlushBackend` trait calls into the concrete
+/// basin-storage / basin-catalog API calls already used by the compactor.
+struct ShardFlushBackend {
+    storage: basin_storage::Storage,
+    catalog: Arc<dyn basin_catalog::Catalog>,
+    wal: Arc<dyn basin_wal::Wal>,
+    partition: PartitionKey,
+}
+
+impl basin_hottier::FlushBackend for ShardFlushBackend {
+    fn write_rows(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        rows: Vec<basin_hottier::RowBytes>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<basin_hottier::WrittenFile>> + Send + '_>>
+    {
+        let storage = self.storage.clone();
+        let partition = self.partition.clone();
+        let project = *project;
+        let table = table.clone();
+        Box::pin(async move {
+            if rows.is_empty() {
+                return Err(BasinError::internal("write_rows called with empty rows"));
+            }
+
+            // Decode each row's IPC bytes into a RecordBatch and concatenate.
+            let mut batches: Vec<RecordBatch> = Vec::with_capacity(rows.len());
+            for row_bytes in &rows {
+                let cursor = Cursor::new(row_bytes.as_slice());
+                let reader = StreamReader::try_new(cursor, None)
+                    .map_err(|e| BasinError::storage(format!("flush ipc reader: {e}")))?;
+                for batch in reader {
+                    batches.push(
+                        batch.map_err(|e| BasinError::storage(format!("flush ipc batch: {e}")))?,
+                    );
+                }
+            }
+
+            if batches.is_empty() {
+                return Err(BasinError::internal("flush: decoded zero batches from rows"));
+            }
+
+            let schema = batches[0].schema();
+            let merged = arrow::compute::concat_batches(&schema, &batches)
+                .map_err(|e| BasinError::storage(format!("flush concat batches: {e}")))?;
+
+            // Write to storage using default options (format, cluster columns).
+            let write_opts = basin_storage::WriteOptions::default();
+            let data_file = storage
+                .write_batch_with_options(&project, &table, &partition, &merged, &write_opts)
+                .await?;
+
+            Ok(basin_hottier::WrittenFile {
+                path: data_file.path.as_ref().to_string(),
+                size_bytes: data_file.size_bytes,
+                row_count: data_file.row_count,
+            })
+        })
+    }
+
+    fn commit_new_file(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        file: basin_hottier::WrittenFile,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        let catalog = self.catalog.clone();
+        let storage = self.storage.clone();
+        let partition = self.partition.clone();
+        let project = *project;
+        let table = table.clone();
+        Box::pin(async move {
+            // Ensure the table exists in the catalog.
+            let mut snapshot = match catalog.load_table(&project, &table).await {
+                Ok(meta) => meta.current_snapshot,
+                Err(BasinError::NotFound(_)) => {
+                    // Table not yet in catalog — we need a schema to create it.
+                    // Load the schema from the data file we just wrote.
+                    let batches = storage
+                        .read(
+                            &project,
+                            &table,
+                            basin_storage::ReadOptions {
+                                projection: None,
+                                filters: vec![],
+                                partition: Some(partition.clone()),
+                            },
+                        )
+                        .await?;
+                    let collected: Vec<RecordBatch> = futures::StreamExt::collect::<Vec<_>>(batches).await
+                        .into_iter()
+                        .collect::<Result<Vec<_>>>()?;
+                    if let Some(b) = collected.first() {
+                        let schema_ref = b.schema();
+                        let meta = catalog
+                            .create_table(&project, &table, schema_ref.as_ref())
+                            .await?;
+                        meta.current_snapshot
+                    } else {
+                        return Err(BasinError::internal(
+                            "flush commit: cannot create table — no schema available",
+                        ));
+                    }
+                }
+                Err(e) => return Err(e),
+            };
+
+            let file_ref = DataFileRef {
+                path: file.path,
+                size_bytes: file.size_bytes,
+                row_count: file.row_count,
+                column_stats: ::std::collections::BTreeMap::new(),
+                bloom_filters: ::std::collections::BTreeMap::new(),
+                hll_sketches: ::std::collections::BTreeMap::new(),
+                tdigest_sketches: ::std::collections::BTreeMap::new(),
+            };
+
+            // Retry once on CommitConflict.
+            for attempt in 0..2usize {
+                match catalog
+                    .append_data_files(&project, &table, snapshot, vec![file_ref.clone()])
+                    .await
+                {
+                    Ok(_) => return Ok(()),
+                    Err(BasinError::CommitConflict(_)) if attempt == 0 => {
+                        let meta = catalog.load_table(&project, &table).await?;
+                        snapshot = meta.current_snapshot;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(BasinError::CommitConflict(format!(
+                "{project}/{table}: flush lost commit race twice"
+            )))
+        })
+    }
+
+    fn apply_tombstones(
+        &self,
+        _project: &ProjectId,
+        _table: &TableName,
+        _tombstone_keys: Vec<basin_hottier::RowKey>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        // Phase 5.14.C4 initial implementation: tombstones are suppressed at
+        // read time by the hot-tier merge path (merge_scan) so they don't need
+        // to be applied to the cold tier during flush.  The read-merge path
+        // already handles cold-tier suppression; flushing tombstones to the cold
+        // tier (copy-on-write DELETE via dml_mutate) is deferred to a follow-up
+        // phase once dml_mutate is accessible from basin-shard.
+        Box::pin(async { Ok(()) })
+    }
+
+    fn truncate_wal(
+        &self,
+        project: &ProjectId,
+        max_lsn: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        let wal = self.wal.clone();
+        let project = *project;
+        let partition = self.partition.clone();
+        Box::pin(async move {
+            let lsn = Lsn(max_lsn);
+            wal.truncate(&project, &partition, lsn).await
+        })
     }
 }
 
