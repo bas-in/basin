@@ -612,7 +612,7 @@ attached as **pre-commit** so reactor failures abort the mutation.
       audit-side reactor; reactor fails → mutation rolls back; reactor
       respects RLS (sees full row, downstream SELECT applies filter).
 
-#### 5.11.C2 — Constraint-shaped reactors (`REACT … CONSTRAINT`) (~1 week, depends on 5.11.C)
+#### 5.11.C2 — Constraint-shaped reactors (`REACT … CONSTRAINT`) (~1 week, depends on 5.11.C) ✅ shipped (`cdf3f99` — async-frame stack-exhaustion fix via tokio::task::spawn in reactor_sink.rs; 5/5 reactor_constraint tests)
 
 Project-scoped invariant enforcement without a body. Covers "max 100
 rows per project", "free-tier caps", "hierarchical depth limit".
@@ -659,7 +659,7 @@ time. Same inlining trick as scalar functions.
 - [x] Test: `recent_orders(uid)` round-trips; `SELECT * FROM
       recent_orders(...)` planning works alongside JOINs.
 
-#### 5.11.F — Multi-statement `CALL` procedures (~2 weeks, depends on 5.11.D) ✅ shipped
+#### 5.11.F — Multi-statement `CALL` procedures (~2 weeks, depends on 5.11.D) ✅ shipped (`59e8a10`; engine 9/9 + integration 5/5; transaction semantics via shipped BEGIN/SAVEPOINT machinery)
 
 Multi-statement workflows for onboarding, archive, periodic tasks.
 Sequence of SQL statements with parameter binding, no control flow.
