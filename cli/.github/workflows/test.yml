@@ -15,13 +15,14 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        go: ["1.23"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          go-version: ${{ matrix.go }}
-          cache: true
-      - run: go vet ./...
-      - run: go test -race -count=1 ./...
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --locked -- -D warnings
+      - run: cargo build --locked
+      - run: cargo test --locked

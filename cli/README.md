@@ -4,8 +4,8 @@ The `basin` CLI manages [Basin Cloud](https://basin.run) projects from
 the terminal — orgs, projects, secrets, migrations, SQL, logs,
 snapshots, tokens.
 
-Modelled on `gh` / `flyctl` / `supabase`. Stdlib-only Go binary, no
-runtime dependencies, one self-contained file per subcommand.
+Modelled on `gh` / `flyctl` / `supabase`. Rust binary (clap + reqwest),
+no system dependencies, one self-contained file per subcommand.
 
 ## Install
 
@@ -15,10 +15,10 @@ runtime dependencies, one self-contained file per subcommand.
 brew install bas-in/tap/basin
 ```
 
-### `go install`
+### `cargo install`
 
 ```sh
-go install github.com/bas-in/basin-cli@latest
+cargo install --git https://github.com/bas-in/basin-cli basin
 ```
 
 ### Pre-built binaries
@@ -111,12 +111,15 @@ window must continue to work against cloud HEAD without re-release.
 
 ## Releasing
 
-Tagged releases ship multi-arch tarballs + a Homebrew formula update.
+Tagged releases ship multi-arch tarballs + a Docker image + a Homebrew
+formula update, built by `.github/workflows/release.yml`.
 
 ```sh
 git tag v0.1.1
 git push origin v0.1.1
-# goreleaser handles the rest (see .goreleaser.yaml)
+# CI cross-compiles for linux/{amd64,arm64}, darwin/{amd64,arm64},
+# windows/amd64, uploads archives to the GitHub release, and pushes
+# the multi-arch GHCR image.
 ```
 
 ## Verifying release signatures

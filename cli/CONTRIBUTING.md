@@ -1,8 +1,9 @@
 # Contributing to basin-cli
 
-Thanks for considering a contribution. `basin` is a small stdlib-only Go
-binary; the bar for landing changes is high but the surface is tiny, so
-most patches read in a few minutes.
+Thanks for considering a contribution. `basin` is a Rust binary (clap +
+reqwest, one file per subcommand under `src/commands/`); the bar for
+landing changes is high but the surface is tiny, so most patches read in
+a few minutes.
 
 ## Filing issues
 
@@ -19,21 +20,19 @@ include:
 ## Pull request review
 
 - One topic per PR. Small + focused beats sprawling.
-- Cover behaviour changes with a test. The existing `*_test.go` files
-  are the template: drive `run([]string{…})` against an `httptest.Server`
-  rather than shelling out.
+- Cover behaviour changes with a test. The existing `*_test.rs` files
+  are the template: spin an `mockito` or `httptest`-style server and
+  drive the command handler directly.
 - Match the existing style — terse, no narrative comments, no emojis.
-- `go build ./... && go test ./...` MUST pass before requesting review.
-  CI gates the same matrix (Ubuntu + macOS, Go 1.23).
+- `cargo build --locked && cargo test --locked` MUST pass before
+  requesting review. CI gates the same matrix (Ubuntu + macOS).
 
-## No third-party dependencies
+## Dependencies
 
-This is a hard rule. `go.mod` has no `require` block and `go.sum`
-doesn't exist. Patches that would introduce a dependency get bounced
-without further review — vendor the few lines you need into a stdlib-
-backed helper instead. The whole CLI is small enough that this stays
-practical: net/http, encoding/json, flag, text/tabwriter cover the
-ground.
+The CLI uses a small, intentional set of crates (clap, reqwest, serde,
+serde_json, chrono — see `Cargo.toml`). Patches that would add a new
+dependency require a clear justification; cosmetic or convenience crates
+get bounced. Check `cargo audit` before submitting — the CI will.
 
 ## Commit signing
 
