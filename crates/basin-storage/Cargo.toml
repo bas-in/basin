@@ -43,6 +43,9 @@ aes-gcm = "0.10"
 # pull it as a runtime dep here so production builds get a real CSPRNG
 # (`OsRng` via `thread_rng`) without per-callsite plumbing.
 rand.workspace = true
+# UUID coercion in the predicate evaluator: `ScalarValue::Utf8` (canonical
+# hyphenated form) → 16-byte `FixedSizeBinary` before byte comparison.
+uuid = { workspace = true }
 # Vortex columnar storage format (#161 — opt-in `WITH (basin.file_format =
 # 'vortex')`). Versions pinned to match the proven benchmark/vortex_compare
 # crate; vortex 0.70 targets arrow 58 (= the workspace pin) exactly.

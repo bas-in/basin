@@ -416,12 +416,17 @@ Requires `BASIN_AUTH_ENABLED=1` per ADR.
       handing them to the engine's text-substitution path. Asserted by
       `tests/integration/tests/jsonb_uuid_param_binding.rs` (native
       `tokio-postgres` `Uuid` + `serde_json::Value` round-trip) and the
-      `decode_param_binary` unit tests. v0.2 follow-up: `WHERE id = $1`
+      `decode_param_binary` unit tests. ~~v0.2 follow-up: `WHERE id = $1`
       against a UUID column still fails inside `basin-storage`'s
       fast-select predicate evaluator because the pushed-down
       `ScalarValue::Utf8` is compared against `FixedSizeBinary(16)`;
       lift that limit and the smoke can re-enable the predicate-side
-      round-trip.
+      round-trip.~~ **Resolved** — `ScalarValue::Utf8` is now coerced to
+      16-byte `FixedSizeBinary` before comparison in
+      `crates/basin-storage/src/predicate.rs`; regression tests added in
+      `predicate::compound_tests` (`uuid_eq_literal_matches_row`,
+      `uuid_eq_no_match_returns_all_false`, `uuid_eq_invalid_literal_is_error`,
+      `uuid_eq_via_compound_predicate`). Fixed in commit COMMIT_HASH_PLACEHOLDER.
 
 ## Phase 5.11 — Modern SaaS toolkit: SQL functions, declarative lifecycle, sink trait (~12-15 weeks committed)
 

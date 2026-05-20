@@ -179,6 +179,35 @@ pub fn evaluate(
         (Predicate::Eq(_, _), ScalarValue::Float64(v)) => cmp_primitive!(Float64Type, *v, ==),
         (Predicate::Gt(_, _), ScalarValue::Float64(v)) => cmp_primitive!(Float64Type, *v, >),
         (Predicate::Lt(_, _), ScalarValue::Float64(v)) => cmp_primitive!(Float64Type, *v, <),
+        // UUID column: Arrow stores UUIDs as FixedSizeBinary(16) (RFC 4122
+        // big-endian bytes). The predicate value arrives as a
+        // `ScalarValue::Utf8` canonical hyphenated string (e.g.
+        // "550e8400-e29b-41d4-a716-446655440000") — coerce it to 16 bytes
+        // before comparing. Only `Eq` is meaningful for UUIDs; `Gt`/`Lt`
+        // fall through to the generic byte-lexicographic path below.
+        (Predicate::Eq(_, _), ScalarValue::Utf8(v))
+            if *col.data_type() == Dt::FixedSizeBinary(16) =>
+        {
+            let needle: [u8; 16] = match uuid::Uuid::parse_str(v.as_str()) {
+                Ok(u) => *u.as_bytes(),
+                Err(e) => {
+                    return Err(BasinError::storage(format!(
+                        "predicate: invalid UUID literal {v:?}: {e}"
+                    )));
+                }
+            };
+            use arrow_array::cast::AsArray;
+            let arr = col.as_fixed_size_binary();
+            let mut b = arrow_array::builder::BooleanBuilder::with_capacity(arr.len());
+            for i in 0..arr.len() {
+                if arr.is_null(i) {
+                    b.append_value(false);
+                } else {
+                    b.append_value(arr.value(i) == needle);
+                }
+            }
+            b.finish()
+        }
         (Predicate::Eq(_, _), ScalarValue::Utf8(v))
         | (Predicate::Gt(_, _), ScalarValue::Utf8(v))
         | (Predicate::Lt(_, _), ScalarValue::Utf8(v)) => {
@@ -895,5 +924,105 @@ mod compound_tests {
             evaluate_compound_for_pruning(&pred, &stats, &id_schema(), 1000),
             PruneOutcome::AllMatch
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // UUID coercion regression tests (v0.2 gap fix)
+    // -----------------------------------------------------------------------
+
+    /// Build a one-column RecordBatch whose "id" column is FixedSizeBinary(16)
+    /// holding three UUIDs (plus one NULL).
+    fn uuid_batch() -> RecordBatch {
+        use arrow_array::FixedSizeBinaryArray;
+
+        let u1: [u8; 16] = *uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
+            .unwrap()
+            .as_bytes();
+        let u2: [u8; 16] = *uuid::Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+            .unwrap()
+            .as_bytes();
+        let u3: [u8; 16] = *uuid::Uuid::parse_str("6ba7b811-9dad-11d1-80b4-00c04fd430c8")
+            .unwrap()
+            .as_bytes();
+
+        // Build a FixedSizeBinaryArray: u1, u2, NULL, u3
+        let values: Vec<Option<&[u8]>> = vec![
+            Some(&u1[..]),
+            Some(&u2[..]),
+            None,
+            Some(&u3[..]),
+        ];
+        let arr = FixedSizeBinaryArray::try_from_sparse_iter_with_size(values.into_iter(), 16)
+            .unwrap();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::FixedSizeBinary(16),
+            true,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap()
+    }
+
+    #[test]
+    fn uuid_eq_literal_matches_row() {
+        // `WHERE id = '550e8400-e29b-41d4-a716-446655440000'`
+        let batch = uuid_batch();
+        let pred = Predicate::Eq(
+            "id".into(),
+            ScalarValue::Utf8("550e8400-e29b-41d4-a716-446655440000".into()),
+        );
+        let mask = evaluate(&batch, &pred).unwrap();
+        let result: Vec<Option<bool>> = (0..mask.len())
+            .map(|i| {
+                if mask.is_null(i) {
+                    None
+                } else {
+                    Some(mask.value(i))
+                }
+            })
+            .collect();
+        // Only index 0 (u1) matches; index 2 is NULL → false.
+        assert_eq!(
+            result,
+            vec![Some(true), Some(false), Some(false), Some(false)]
+        );
+    }
+
+    #[test]
+    fn uuid_eq_no_match_returns_all_false() {
+        // A UUID that does not exist in the batch.
+        let batch = uuid_batch();
+        let pred = Predicate::Eq(
+            "id".into(),
+            ScalarValue::Utf8("ffffffff-ffff-ffff-ffff-ffffffffffff".into()),
+        );
+        let mask = evaluate(&batch, &pred).unwrap();
+        let result: Vec<bool> = (0..mask.len()).map(|i| mask.value(i)).collect();
+        assert_eq!(result, vec![false, false, false, false]);
+    }
+
+    #[test]
+    fn uuid_eq_invalid_literal_is_error() {
+        let batch = uuid_batch();
+        let pred = Predicate::Eq(
+            "id".into(),
+            ScalarValue::Utf8("not-a-uuid".into()),
+        );
+        assert!(evaluate(&batch, &pred).is_err());
+    }
+
+    #[test]
+    fn uuid_eq_via_compound_predicate() {
+        // Exercises the `CompoundPredicate::Atom` path — mirrors the
+        // `WHERE id = $1` parameterised-query shape.
+        let batch = uuid_batch();
+        let pred = CompoundPredicate::Atom(Predicate::Eq(
+            "id".into(),
+            ScalarValue::Utf8("6ba7b810-9dad-11d1-80b4-00c04fd430c8".into()),
+        ));
+        let mask = evaluate_compound(&batch, &pred).unwrap();
+        let result: Vec<bool> = (0..mask.len()).map(|i| mask.value(i)).collect();
+        // Only index 1 (u2) should match.
+        assert_eq!(result, vec![false, true, false, false]);
     }
 }
