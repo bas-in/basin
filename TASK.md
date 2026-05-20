@@ -1041,12 +1041,12 @@ same `object_store` the engine uses; signed URLs are HMAC over
 - [x] Acceptance: `curl` upload then download round-trips; private
       bucket without JWT → 401; public bucket without JWT → 200.
 
-#### 5.17.C — RLS integration (~3-5 days)
+#### 5.17.C — RLS integration (~3-5 days) ✅ shipped
 
-- [ ] `storage.objects` honours RLS policies (Phase 5.6) consulting
+- [x] `storage.objects` honours RLS policies (Phase 5.6) consulting
       `auth.uid()` / `auth.role()` / `auth.aal()`. Public buckets
       short-circuit RLS for reads.
-- [ ] Acceptance: a `CREATE POLICY … ON storage.objects` restricting by
+- [x] Acceptance: a `CREATE POLICY … ON storage.objects` restricting by
       `owner = auth.uid()` correctly filters list/download across two
       authenticated users; cross-project isolation verified.
 

@@ -51,7 +51,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use basin_blob::{
     model::Bucket,
-    store::InMemoryBlobCatalog,
+    rls::{self as blob_rls, CallerCtx, ObjectPolicyCommand},
     BlobError,
 };
 use basin_common::ProjectId;
@@ -269,7 +269,10 @@ pub(crate) async fn delete_bucket(
 
 /// `POST /storage/v1/object/:bucket/:path*` — upload a blob (JWT-gated).
 ///
-/// // 5.17.C: RLS — gate on `storage.objects` RLS policy after JWT.
+/// 5.17.C: The owner field is stamped from `auth.uid()` at upload time.
+/// INSERT-command policies are not evaluated here — Basin sets the owner
+/// automatically, and an authenticated upload is always permitted (the bucket
+/// access gate is the JWT check above).
 #[axum::debug_handler]
 pub(crate) async fn upload_object(
     State(state): State<Arc<Inner>>,
@@ -310,7 +313,9 @@ pub(crate) async fn upload_object(
 
 /// `GET /storage/v1/object/:bucket/:path*` — download a blob (JWT-gated).
 ///
-/// // 5.17.C: RLS — gate on `storage.objects` RLS policy after JWT.
+/// 5.17.C: RLS — gate on `storage.objects` policy (owner = auth.uid() etc.).
+/// Public buckets bypass RLS on the `/public/` route; this route is JWT-gated
+/// and always evaluates policies when RLS is enabled on the project.
 #[axum::debug_handler]
 pub(crate) async fn download_object(
     State(state): State<Arc<Inner>>,
@@ -320,11 +325,28 @@ pub(crate) async fn download_object(
     let claims = authorize(&state, &headers).await?;
     let project = project_from_claims(&claims);
 
+    // 5.17.C: Check bucket public flag — public buckets bypass RLS for reads.
+    let bucket_meta = state
+        .blob_store
+        .get_bucket(&project, &bucket)
+        .await
+        .map_err(blob_err_to_api)?;
+
     let (meta, data) = state
         .blob_store
         .get_object(&project, &bucket, &path)
         .await
         .map_err(blob_err_to_api)?;
+
+    // 5.17.C: Enforce RLS unless the bucket is public.
+    if !bucket_meta.public {
+        let caller = CallerCtx::authenticated(claims.user_id);
+        let (rls_enabled, applicable) = state
+            .blob_store
+            .objects_rls_applicable(&project, ObjectPolicyCommand::Select, &caller.role);
+        blob_rls::check_object_access(rls_enabled, &applicable, &meta, &caller, ObjectPolicyCommand::Select)
+            .map_err(|msg| ApiError::forbidden(msg))?;
+    }
 
     let mut builder = axum::http::Response::builder().status(StatusCode::OK);
 
@@ -347,7 +369,7 @@ pub(crate) async fn download_object(
 
 /// `DELETE /storage/v1/object/:bucket/:path*` — single delete (JWT-gated).
 ///
-/// // 5.17.C: RLS — gate on `storage.objects` RLS policy after JWT.
+/// 5.17.C: RLS — gate on `storage.objects` policy before deleting.
 #[axum::debug_handler]
 pub(crate) async fn delete_object(
     State(state): State<Arc<Inner>>,
@@ -356,6 +378,23 @@ pub(crate) async fn delete_object(
 ) -> Result<Response, ApiError> {
     let claims = authorize(&state, &headers).await?;
     let project = project_from_claims(&claims);
+
+    // 5.17.C: Fetch the object metadata to evaluate RLS before deleting.
+    let caller = CallerCtx::authenticated(claims.user_id);
+    let (rls_enabled, applicable) = state
+        .blob_store
+        .objects_rls_applicable(&project, ObjectPolicyCommand::Delete, &caller.role);
+
+    if rls_enabled {
+        // Load the object row to evaluate the USING predicate.
+        let (meta, _) = state
+            .blob_store
+            .get_object(&project, &bucket, &path)
+            .await
+            .map_err(blob_err_to_api)?;
+        blob_rls::check_object_access(rls_enabled, &applicable, &meta, &caller, ObjectPolicyCommand::Delete)
+            .map_err(|msg| ApiError::forbidden(msg))?;
+    }
 
     state
         .blob_store
@@ -372,7 +411,9 @@ pub(crate) async fn delete_object(
 /// without a bearer token.  Returns 401 when the bucket's `public` flag is
 /// false — never falls through to JWT auth.
 ///
-/// // 5.17.C: RLS — public reads already short-circuit RLS per ADR 0021.
+/// 5.17.C: Public-bucket reads short-circuit RLS per ADR 0021 — no policy
+/// evaluation.  The `public` flag check (`!meta.public → 401`) is the only
+/// gate; private buckets remain inaccessible without a JWT.
 #[axum::debug_handler]
 pub(crate) async fn download_public_object(
     State(state): State<Arc<Inner>>,
@@ -422,7 +463,7 @@ pub(crate) async fn download_public_object(
 /// `POST /storage/v1/object/list/:bucket` — list objects with optional prefix (JWT-gated).
 ///
 /// v1 lists from the in-memory catalog; full pagination is a follow-up.
-/// // 5.17.C: RLS — filter by `storage.objects` policy after JWT.
+/// 5.17.C: RLS — filter result set by `storage.objects` policy after JWT.
 #[axum::debug_handler]
 pub(crate) async fn list_objects(
     State(state): State<Arc<Inner>>,
@@ -439,8 +480,8 @@ pub(crate) async fn list_objects(
         offset: None,
     });
 
-    // Verify bucket exists.
-    let _b = state
+    // Verify bucket exists and check public flag.
+    let bucket_meta = state
         .blob_store
         .get_bucket(&project, &bucket)
         .await
@@ -453,9 +494,20 @@ pub(crate) async fn list_objects(
         .await
         .map_err(blob_err_to_api)?;
 
-    let limit = req.limit.unwrap_or(objects.len());
+    // 5.17.C: Apply RLS filter. Public buckets skip the filter for reads.
+    let filtered = if bucket_meta.public {
+        objects
+    } else {
+        let caller = CallerCtx::authenticated(claims.user_id);
+        let (rls_enabled, applicable) = state
+            .blob_store
+            .objects_rls_applicable(&project, ObjectPolicyCommand::Select, &caller.role);
+        blob_rls::filter_objects(rls_enabled, &applicable, objects, &caller)
+    };
+
+    let limit = req.limit.unwrap_or(filtered.len());
     let offset = req.offset.unwrap_or(0);
-    let page: Vec<ObjectResponse> = objects
+    let page: Vec<ObjectResponse> = filtered
         .into_iter()
         .skip(offset)
         .take(limit)
@@ -468,7 +520,8 @@ pub(crate) async fn list_objects(
 /// `DELETE /storage/v1/object/:bucket` with `{prefixes: []}` body — bulk delete (JWT-gated).
 ///
 /// Deletes every object whose path matches one of the supplied prefixes.
-/// // 5.17.C: RLS — gate individual deletes on `storage.objects` policy.
+/// 5.17.C: RLS — each object is individually checked against the DELETE policy.
+/// Objects that fail the policy check are skipped (not counted as deleted).
 #[axum::debug_handler]
 pub(crate) async fn bulk_delete_objects(
     State(state): State<Arc<Inner>>,
@@ -486,6 +539,12 @@ pub(crate) async fn bulk_delete_objects(
         .await
         .map_err(blob_err_to_api)?;
 
+    // 5.17.C: Build RLS context once for the entire bulk operation.
+    let caller = CallerCtx::authenticated(claims.user_id);
+    let (rls_enabled, applicable) = state
+        .blob_store
+        .objects_rls_applicable(&project, ObjectPolicyCommand::Delete, &caller.role);
+
     let mut deleted = 0usize;
     for prefix in &body.prefixes {
         let matching = state
@@ -494,6 +553,18 @@ pub(crate) async fn bulk_delete_objects(
             .await
             .map_err(blob_err_to_api)?;
         for obj in matching {
+            // 5.17.C: Skip objects the caller's policy doesn't permit deleting.
+            if blob_rls::check_object_access(
+                rls_enabled,
+                &applicable,
+                &obj,
+                &caller,
+                ObjectPolicyCommand::Delete,
+            )
+            .is_err()
+            {
+                continue;
+            }
             state
                 .blob_store
                 .delete_object(&project, &bucket, &obj.path)

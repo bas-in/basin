@@ -177,6 +177,16 @@ impl RestService {
         }
     }
 
+    /// Return a shared reference to the blob store so callers can register
+    /// RLS policies (Phase 5.17.C) or inspect object metadata in tests.
+    ///
+    /// The blob store is shared behind the same `Arc<Inner>` as the router.
+    pub fn blob_store(
+        &self,
+    ) -> &basin_blob::store::BlobStore<basin_blob::store::InMemoryBlobCatalog> {
+        &self.inner.blob_store
+    }
+
     /// Bind synchronously (so callers can read `local_addr`), then spawn the
     /// server on a background task. Mirrors [`basin_router::run_until_bound`].
     pub async fn run_until_bound(self) -> Result<RunningRest> {

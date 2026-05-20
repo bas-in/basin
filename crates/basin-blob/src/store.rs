@@ -34,6 +34,7 @@ use crate::{
     error::{BlobError, Result},
     model::{Bucket, BucketId, Object},
     paths,
+    rls::{CallerCtx, ObjectPolicy, ObjectPolicyCommand, ObjectRlsStore},
 };
 
 // ---------------------------------------------------------------------------
@@ -224,6 +225,12 @@ pub struct BlobStore<C> {
     /// increments `bytes_written_total` by the object size and `delete_object`
     /// decrements it (saturating) by the previously stored size.
     counters: Option<Arc<ProjectCounterRegistry>>,
+    /// RLS policy store for `storage.objects` (Phase 5.17.C).
+    ///
+    /// Holds per-project policies in memory.  The caller (usually `basin-rest`)
+    /// registers policies via `set_rls_enabled` / `add_object_policy` after
+    /// parsing `CREATE POLICY … ON storage.objects` DDL statements.
+    pub rls: Arc<ObjectRlsStore>,
 }
 
 impl<C: BlobCatalog> BlobStore<C> {
@@ -243,6 +250,7 @@ impl<C: BlobCatalog> BlobStore<C> {
             object_store,
             root,
             counters: None,
+            rls: Arc::new(ObjectRlsStore::new()),
         }
     }
 
@@ -481,6 +489,47 @@ impl<C: BlobCatalog> BlobStore<C> {
         object_path: &str,
     ) -> Result<ObjectPath> {
         paths::blob_key(self.root.as_ref(), project, bucket_name, object_path)
+    }
+
+    // -----------------------------------------------------------------------
+    // RLS management (Phase 5.17.C)
+    // -----------------------------------------------------------------------
+
+    /// Enable or disable RLS on `storage.objects` for `project`.
+    ///
+    /// When enabled, subsequent list / get / delete calls that receive a
+    /// [`CallerCtx`] will enforce the registered policies.
+    pub fn set_objects_rls_enabled(&self, project: &ProjectId, enabled: bool) {
+        self.rls.set_enabled(project, "objects", enabled);
+    }
+
+    /// Register a policy on `storage.objects` for `project`.
+    ///
+    /// Returns `true` on success, `false` if a policy with the same name
+    /// already exists (mirrors Postgres `ERROR:  policy already exists`).
+    pub fn add_object_policy(&self, project: &ProjectId, policy: ObjectPolicy) -> bool {
+        self.rls.create_policy(project, "objects", policy)
+    }
+
+    /// Remove a policy from `storage.objects` by name.
+    ///
+    /// Returns `true` if the policy existed and was removed.
+    pub fn drop_object_policy(&self, project: &ProjectId, name: &str) -> bool {
+        self.rls.drop_policy(project, "objects", name)
+    }
+
+    /// Return the applicable RLS policies for `command` in `project` for a
+    /// caller in `role`.
+    ///
+    /// Returns `(rls_enabled, applicable_policies)`.  If `rls_enabled` is
+    /// `false` the caller should skip the policy check entirely.
+    pub fn objects_rls_applicable(
+        &self,
+        project: &ProjectId,
+        command: ObjectPolicyCommand,
+        role: &str,
+    ) -> (bool, Vec<ObjectPolicy>) {
+        self.rls.applicable(project, "objects", command, role)
     }
 }
 
