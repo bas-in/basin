@@ -777,26 +777,28 @@ can land in parallel. Critical path: R1 → R2 → (R3 || R4) → R7.
       a synthetic `ChangeEvent` published by the engine appears on
       the in-memory broadcast channel. 5/5 unit tests pass.
 
-#### 5.11.R2 — SSE adapter (~2-3 weeks)
+#### 5.11.R2 — SSE adapter (~2-3 weeks) ✅ shipped (`800d6d2`)
 
-- [ ] axum streaming response handler mounted at
+- [x] axum streaming response handler mounted at
       `/realtime/v1/sse/:project/:table` (path scoping mirrors
       `/in/<project>/<name>` from 5.11.N).
-- [ ] JWT auth identical to `basin-rest` (ADR 0006); RLS-equivalent
+- [x] JWT auth identical to `basin-rest` (ADR 0006); RLS-equivalent
       filtering applied to the event stream so a subscriber only
-      sees rows their policies permit.
-- [ ] Heartbeat comment frames every 15s to keep proxies / load
-      balancers from closing idle connections.
-- [ ] `Last-Event-Id` header support for replay-on-reconnect via the
+      sees rows their policies permit (via `sse.rs::rls_permits` —
+      causation_user ownership + admin/service_role bypass; seam for
+      R5 predicate pushdown).
+- [x] Heartbeat comment frames every 15s via axum `KeepAlive::new()`.
+- [x] `Last-Event-Id` header support for replay-on-reconnect via the
       shared retry-log cursor.
-- [ ] Body cap + per-connection rate limit reuse basin-net knobs.
-- [ ] Acceptance gate: `curl -N -H "Authorization: Bearer …"
+- [x] Body cap + per-connection rate limit reuse basin-net knobs.
+- [x] Acceptance gate: `curl -N -H "Authorization: Bearer …"
       .../realtime/v1/sse/proj/orders` receives JSON events on every
       INSERT/UPDATE/DELETE; reconnecting with `Last-Event-Id`
       replays missed events from the retry log.
-- [ ] Integration test:
+- [x] Integration test:
       `tests/integration/tests/realtime_sse.rs` covering connect /
       replay / disconnect / RLS-filtering / cross-project-isolation.
+      34 tests pass (R1's 5 + 6 new SSE + concurrent-agent additions).
 
 #### 5.11.R3 — WebSocket adapter (~2 weeks on top of R2)
 

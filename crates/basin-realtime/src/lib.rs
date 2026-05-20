@@ -42,7 +42,7 @@ pub mod sse;
 pub mod ws;
 
 pub use filter::Filter;
-pub use budget::{BudgetError, BudgetTracker, DEFAULT_PER_PROJECT_BUDGET_BYTES, estimate_event_size};
+pub use budget::{BudgetError, BudgetGuard, BudgetTracker, DEFAULT_PER_PROJECT_BUDGET_BYTES, estimate_event_size};
 
 use std::sync::Arc;
 
