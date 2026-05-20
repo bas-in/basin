@@ -164,18 +164,38 @@ async fn views_excludes_plain_tables() {
     assert_eq!(batch.num_rows(), 0);
 }
 
+/// Phase 5.18.D: `information_schema.schemata` now emits one row per
+/// reserved schema (all 8 variants) instead of just `"public"`. This test
+/// pins the new behaviour so regressions break here first.
 #[tokio::test]
-async fn schemata_one_row_per_project() {
+async fn schemata_lists_all_reserved_schemas() {
+    use basin_catalog::ReservedSchema;
+
     let cat = InMemoryCatalog::new();
     let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
 
     let batch = InfoSchemaQuery::schemata(&cat, &t).await.unwrap();
-    assert_eq!(batch.num_rows(), 1);
-    assert_eq!(col_str(&batch, "catalog_name").value(0), "basin");
-    assert_eq!(col_str(&batch, "schema_name").value(0), "public");
-    assert_eq!(col_str(&batch, "schema_owner").value(0), "");
-    // Character-set columns are nullable; v0.1 reports NULL.
+    // One row per reserved schema.
+    assert_eq!(batch.num_rows(), ReservedSchema::ALL.len());
+
+    // Every row must have catalog_name = "basin" and schema_owner = "".
+    let catalog_name_col = col_str(&batch, "catalog_name");
+    let schema_name_col = col_str(&batch, "schema_name");
+    let schema_owner_col = col_str(&batch, "schema_owner");
+    for i in 0..batch.num_rows() {
+        assert_eq!(catalog_name_col.value(i), "basin");
+        assert_eq!(schema_owner_col.value(i), "");
+    }
+
+    // Collect schema names and verify all reserved schemas present.
+    let mut names: Vec<&str> = (0..schema_name_col.len()).map(|i| schema_name_col.value(i)).collect();
+    names.sort();
+    let mut expected: Vec<&str> = ReservedSchema::ALL.iter().map(|r| r.as_str()).collect();
+    expected.sort();
+    assert_eq!(names, expected);
+
+    // Character-set columns are all NULL.
     let cs_cat = batch
         .column(
             batch
@@ -206,9 +226,11 @@ async fn schemata_one_row_per_project() {
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
-    assert!(cs_cat.is_null(0));
-    assert!(cs_schema.is_null(0));
-    assert!(cs_name.is_null(0));
+    for i in 0..batch.num_rows() {
+        assert!(cs_cat.is_null(i));
+        assert!(cs_schema.is_null(i));
+        assert!(cs_name.is_null(i));
+    }
 }
 
 #[tokio::test]

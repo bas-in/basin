@@ -313,20 +313,35 @@ async fn pg_attribute_cross_project_isolation() {
     assert_eq!(names_b, vec!["b_col"]);
 }
 
+/// Phase 5.18.D: `pg_namespace` now emits one row per reserved schema
+/// (all 8 variants) instead of only `"public"`. The first row (index 0)
+/// is still `"public"` because `ReservedSchema::ALL[0]` is `Public`.
 #[tokio::test]
-async fn pg_namespace_one_row_per_project() {
+async fn pg_namespace_all_reserved_schemas() {
+    use basin_catalog::ReservedSchema;
+
     let cat = InMemoryCatalog::new();
     let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
 
     let batch = InfoSchemaQuery::pg_namespace(&cat, &t).await.unwrap();
-    assert_eq!(batch.num_rows(), 1);
-    assert_eq!(col_str(&batch, "nspname").value(0), "public");
-    assert!(
-        col_i64(&batch, "oid").value(0) > 0,
-        "namespace oid must be a positive FNV hash"
-    );
-    assert_eq!(col_i64(&batch, "nspowner").value(0), 0);
+    assert_eq!(batch.num_rows(), ReservedSchema::ALL.len());
+
+    // Collect the nspnames and verify all reserved schemas are present.
+    let nspnames = col_str(&batch, "nspname");
+    let mut names: Vec<&str> = (0..nspnames.len()).map(|i| nspnames.value(i)).collect();
+    names.sort();
+    let mut expected: Vec<&str> = ReservedSchema::ALL.iter().map(|r| r.as_str()).collect();
+    expected.sort();
+    assert_eq!(names, expected);
+
+    // Every oid must be a positive hash and nspowner must be 0.
+    let oids = col_i64(&batch, "oid");
+    let owners = col_i64(&batch, "nspowner");
+    for i in 0..batch.num_rows() {
+        assert!(oids.value(i) > 0, "namespace oid must be a positive FNV hash");
+        assert_eq!(owners.value(i), 0);
+    }
 }
 
 #[tokio::test]
@@ -369,6 +384,8 @@ async fn pg_namespace_oid_matches_pg_class_relnamespace() {
 
 #[tokio::test]
 async fn empty_project_returns_empty_columns_and_attribute() {
+    use basin_catalog::ReservedSchema;
+
     let cat = InMemoryCatalog::new();
     let t = ProjectId::new();
     cat.create_namespace(&t).await.unwrap();
@@ -377,8 +394,9 @@ async fn empty_project_returns_empty_columns_and_attribute() {
     assert_eq!(cols.num_rows(), 0);
     let attrs = InfoSchemaQuery::pg_attribute(&cat, &t).await.unwrap();
     assert_eq!(attrs.num_rows(), 0);
-    // pg_namespace still emits the single `public` row even when no tables
-    // exist — the namespace is the project boundary, not the table set.
+    // Phase 5.18.D: pg_namespace now emits one row per reserved schema
+    // (all 8) even when no tables exist — namespaces are fixed, not derived
+    // from the table set.
     let ns = InfoSchemaQuery::pg_namespace(&cat, &t).await.unwrap();
-    assert_eq!(ns.num_rows(), 1);
+    assert_eq!(ns.num_rows(), ReservedSchema::ALL.len());
 }
