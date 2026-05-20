@@ -1050,12 +1050,12 @@ same `object_store` the engine uses; signed URLs are HMAC over
       `owner = auth.uid()` correctly filters list/download across two
       authenticated users; cross-project isolation verified.
 
-#### 5.17.D — Signed URLs (~3-5 days)
+#### 5.17.D — Signed URLs (~3-5 days) ✅ shipped
 
-- [ ] `POST /storage/v1/object/sign/:bucket/:path*` mints an HMAC URL
+- [x] `POST /storage/v1/object/sign/:bucket/:path*` mints an HMAC URL
       over `(project, bucket, path, expiry)` (`hmac`+`sha2`,
       constant-time verify via `subtle`). Time-boxed, no JWT needed.
-- [ ] Acceptance: signed URL grants access until expiry; rejected past
+- [x] Acceptance: signed URL grants access until expiry; rejected past
       TTL; tampered path/expiry → 403.
 
 #### 5.17.E — Per-project bytes counter (~2-3 days) ✅ shipped

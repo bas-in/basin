@@ -30,6 +30,8 @@ chrono.workspace = true
 # hyphenated text in JSON responses (see `json::encode_cell`).
 uuid.workspace = true
 sha2.workspace = true
+hmac.workspace = true
+subtle.workspace = true
 hex.workspace = true
 object_store.workspace = true
 

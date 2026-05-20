@@ -29,7 +29,7 @@ use crate::errors::ApiError;
 use crate::routes::{
     admin as admin_routes, auth as auth_routes, data as data_routes,
     inbound as inbound_routes, openapi as openapi_routes, rpc as rpc_routes,
-    storage as storage_routes,
+    storage as storage_routes, storage_sign as storage_sign_routes,
 };
 use crate::RestConfig;
 
@@ -158,6 +158,19 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
         .route(
             "/storage/v1/object/public/:project_id/:bucket/*path",
             get(storage_routes::download_public_object),
+        )
+        // Phase 5.17.D: signed-URL mint (JWT-gated) — registered before the
+        // wildcard :bucket/*path route so the literal `sign` segment takes
+        // priority over the catch-all pattern.
+        .route(
+            "/storage/v1/object/sign/:bucket/*path",
+            post(storage_sign_routes::sign_object),
+        )
+        // Phase 5.17.D: signed-URL download (no JWT) — project ID in path so
+        // the handler can identify the project without a bearer token.
+        .route(
+            "/storage/v1/object/sign/:project/:bucket/*path",
+            get(storage_sign_routes::download_signed_object),
         )
         // Authenticated single-object routes.
         .route(

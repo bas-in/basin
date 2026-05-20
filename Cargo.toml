@@ -168,6 +168,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 # HMAC-SHA256 for signing OAuth state tokens (Phase 5.10.O).
 hmac = "0.12"
+# Constant-time comparison (used by basin-rest auth for HMAC verification).
+subtle = "2"
 # Test-config file parsing for tests/integration/src/test_config.rs.
 # Tiny, well-maintained, default features off to keep build minimal.
 toml = { version = "0.8", default-features = false, features = ["parse"] }

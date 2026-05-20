@@ -564,3 +564,240 @@ async fn oversized_body_returns_413() {
         r.status
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 5.17.D — Signed URL tests
+// ---------------------------------------------------------------------------
+
+/// Mint a signed URL via POST, then download the object without a JWT (GET).
+/// Verifies the happy-path: signed URL grants access until expiry.
+#[tokio::test]
+async fn signed_url_mint_and_download() {
+    let Some((running, _svc, auth, mailer, _guard)) = try_serve(1 << 20).await else {
+        return;
+    };
+    let addr = running.local_addr;
+
+    let project = ProjectId::new();
+    let tokens = make_user(&auth, &mailer, &project, "sign_user@example.com").await;
+    let jwt = &tokens.access_token;
+    let bearer = format!("Bearer {jwt}");
+
+    // Create a private bucket.
+    let bucket_body =
+        serde_json::to_vec(&json!({"name": "sign-bucket", "public": false})).unwrap();
+    let r = raw_request(
+        addr,
+        "POST",
+        "/storage/v1/bucket",
+        &[
+            ("Authorization", bearer.as_str()),
+            ("Content-Type", "application/json"),
+        ],
+        Some(&bucket_body),
+    )
+    .await;
+    assert_eq!(r.status, 201, "create bucket: {}", String::from_utf8_lossy(&r.body));
+
+    // Upload an object (JWT required).
+    let payload = b"signed-url-content";
+    let r = raw_request(
+        addr,
+        "POST",
+        "/storage/v1/object/sign-bucket/docs/readme.txt",
+        &[
+            ("Authorization", bearer.as_str()),
+            ("Content-Type", "text/plain"),
+        ],
+        Some(payload),
+    )
+    .await;
+    assert_eq!(r.status, 200, "upload: {}", String::from_utf8_lossy(&r.body));
+
+    // Mint a signed URL (JWT required, expires_in = 300 seconds).
+    let sign_body = serde_json::to_vec(&json!({"expires_in": 300})).unwrap();
+    let r = raw_request(
+        addr,
+        "POST",
+        "/storage/v1/object/sign/sign-bucket/docs/readme.txt",
+        &[
+            ("Authorization", bearer.as_str()),
+            ("Content-Type", "application/json"),
+        ],
+        Some(&sign_body),
+    )
+    .await;
+    assert_eq!(r.status, 200, "mint signed URL: {}", String::from_utf8_lossy(&r.body));
+
+    let resp_json = r.json();
+    let signed_url = resp_json["signedUrl"].as_str().expect("signedUrl field");
+    assert!(!signed_url.is_empty(), "signedUrl must not be empty");
+    assert!(signed_url.contains("token="), "signedUrl must contain token");
+    assert!(signed_url.contains("expires="), "signedUrl must contain expires");
+
+    // Download via the signed URL — no JWT.
+    let r = raw_request(addr, "GET", signed_url, &[], None).await;
+    assert_eq!(
+        r.status, 200,
+        "signed download: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert_eq!(r.body, payload, "body mismatch on signed download");
+}
+
+/// Tampered token (one byte flipped) → 403.
+#[tokio::test]
+async fn signed_url_tampered_token_returns_403() {
+    let Some((running, _svc, auth, mailer, _guard)) = try_serve(1 << 20).await else {
+        return;
+    };
+    let addr = running.local_addr;
+
+    let project = ProjectId::new();
+    let tokens = make_user(&auth, &mailer, &project, "tamper_user@example.com").await;
+    let jwt = &tokens.access_token;
+    let bearer = format!("Bearer {jwt}");
+
+    // Create bucket + upload object.
+    let bucket_body =
+        serde_json::to_vec(&json!({"name": "tamper-bucket", "public": false})).unwrap();
+    raw_request(
+        addr,
+        "POST",
+        "/storage/v1/bucket",
+        &[
+            ("Authorization", bearer.as_str()),
+            ("Content-Type", "application/json"),
+        ],
+        Some(&bucket_body),
+    )
+    .await;
+
+    raw_request(
+        addr,
+        "POST",
+        "/storage/v1/object/tamper-bucket/secret.bin",
+        &[
+            ("Authorization", bearer.as_str()),
+            ("Content-Type", "application/octet-stream"),
+        ],
+        Some(b"secret"),
+    )
+    .await;
+
+    // Mint a signed URL.
+    let sign_body = serde_json::to_vec(&json!({"expires_in": 300})).unwrap();
+    let r = raw_request(
+        addr,
+        "POST",
+        "/storage/v1/object/sign/tamper-bucket/secret.bin",
+        &[
+            ("Authorization", bearer.as_str()),
+            ("Content-Type", "application/json"),
+        ],
+        Some(&sign_body),
+    )
+    .await;
+    assert_eq!(r.status, 200);
+
+    let resp_json = r.json();
+    let signed_url = resp_json["signedUrl"].as_str().unwrap().to_owned();
+
+    // Flip the first two hex chars of the token to tamper it.
+    let tampered = if let Some(pos) = signed_url.find("token=") {
+        let token_start = pos + "token=".len();
+        let mut s = signed_url.clone();
+        // Replace leading two chars of token hex with "ff" (unless already ff).
+        let replacement = if s[token_start..].starts_with("ff") { "00" } else { "ff" };
+        s.replace_range(token_start..token_start + 2, replacement);
+        s
+    } else {
+        panic!("no token= in signed URL");
+    };
+
+    let r = raw_request(addr, "GET", &tampered, &[], None).await;
+    assert_eq!(
+        r.status, 403,
+        "tampered token should be 403, got {}",
+        r.status
+    );
+}
+
+/// Expired token (expires in the past) → 403.
+#[tokio::test]
+async fn signed_url_expired_returns_403() {
+    let Some((running, _svc, auth, mailer, _guard)) = try_serve(1 << 20).await else {
+        return;
+    };
+    let addr = running.local_addr;
+
+    let project = ProjectId::new();
+    let tokens = make_user(&auth, &mailer, &project, "expire_user@example.com").await;
+    let jwt = &tokens.access_token;
+    let bearer = format!("Bearer {jwt}");
+
+    // Create bucket + upload object.
+    let bucket_body =
+        serde_json::to_vec(&json!({"name": "expire-bucket", "public": false})).unwrap();
+    raw_request(
+        addr,
+        "POST",
+        "/storage/v1/bucket",
+        &[
+            ("Authorization", bearer.as_str()),
+            ("Content-Type", "application/json"),
+        ],
+        Some(&bucket_body),
+    )
+    .await;
+
+    raw_request(
+        addr,
+        "POST",
+        "/storage/v1/object/expire-bucket/data.bin",
+        &[
+            ("Authorization", bearer.as_str()),
+            ("Content-Type", "application/octet-stream"),
+        ],
+        Some(b"data"),
+    )
+    .await;
+
+    // Mint a signed URL — minimum TTL is 1 second per handler.
+    let sign_body = serde_json::to_vec(&json!({"expires_in": 300})).unwrap();
+    let r = raw_request(
+        addr,
+        "POST",
+        "/storage/v1/object/sign/expire-bucket/data.bin",
+        &[
+            ("Authorization", bearer.as_str()),
+            ("Content-Type", "application/json"),
+        ],
+        Some(&sign_body),
+    )
+    .await;
+    assert_eq!(r.status, 200);
+
+    let resp_json = r.json();
+    let signed_url = resp_json["signedUrl"].as_str().unwrap().to_owned();
+
+    // Replace the `expires=<ts>` with a timestamp in the past (Unix epoch + 1).
+    let expired_url = {
+        let pos = signed_url.find("expires=").expect("expires= in url");
+        let exp_start = pos + "expires=".len();
+        let exp_end = signed_url[exp_start..]
+            .find(|c: char| !c.is_ascii_digit())
+            .map(|i| exp_start + i)
+            .unwrap_or(signed_url.len());
+        let mut s = signed_url.clone();
+        s.replace_range(exp_start..exp_end, "1"); // Unix ts 1 = 1970-01-01T00:00:01Z (expired)
+        s
+    };
+
+    let r = raw_request(addr, "GET", &expired_url, &[], None).await;
+    assert_eq!(
+        r.status, 403,
+        "expired token should be 403, got {}",
+        r.status
+    );
+}

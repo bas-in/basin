@@ -155,6 +155,10 @@ pub(crate) struct BulkDeleteRequest {
 // Error mapping
 // ---------------------------------------------------------------------------
 
+pub(crate) fn blob_err_to_api_pub(e: BlobError) -> ApiError {
+    blob_err_to_api(e)
+}
+
 fn blob_err_to_api(e: BlobError) -> ApiError {
     match e {
         BlobError::BucketNotFound(name) => ApiError::not_found(format!("bucket not found: {name}")),

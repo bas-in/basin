@@ -90,6 +90,9 @@ impl ApiError {
     pub fn not_found(msg: impl Into<String>) -> Self {
         Self::new(ErrorCode::NotFound, msg)
     }
+    pub fn forbidden(msg: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Forbidden, msg)
+    }
     pub fn rate_limited(msg: impl Into<String>) -> Self {
         Self::new(ErrorCode::RateLimited, msg)
     }

@@ -359,6 +359,13 @@ impl AuthService {
         self.inner.jwt.verify(jwt)
     }
 
+    /// Return the raw HMAC signing key (the JWT secret). Used by the
+    /// storage-signed-URL surface (Phase 5.17.D) to mint/verify HMAC-SHA256
+    /// tokens without introducing a separate secret.
+    pub fn signing_secret(&self) -> &[u8] {
+        &self.inner.cfg.jwt_secret
+    }
+
     // --- API keys -----------------------------------------------------------
 
     /// Mint a long-lived API key. The plaintext secret is returned exactly

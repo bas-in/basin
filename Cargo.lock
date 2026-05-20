@@ -749,6 +749,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "base32"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23ce669cd6c8588f79e15cf450314f9638f967fc5770ff1c7c1deb0925ea7cfa"
+
+[[package]]
 name = "base64"
 version = "0.21.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -771,6 +777,7 @@ name = "basin-auth"
 version = "0.1.9"
 dependencies = [
  "async-trait",
+ "base32",
  "base64 0.22.1",
  "basin-catalog",
  "basin-common",
@@ -786,6 +793,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha1",
  "sha2 0.10.9",
  "subtle",
  "tempfile",
@@ -1032,6 +1040,7 @@ dependencies = [
  "arrow-schema",
  "async-trait",
  "axum",
+ "base32",
  "base64 0.22.1",
  "basin-auth",
  "basin-blob",
@@ -1055,10 +1064,12 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
+ "hmac 0.12.1",
  "object_store",
  "rand 0.8.6",
  "serde",
  "serde_json",
+ "sha1",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
@@ -1167,12 +1178,14 @@ dependencies = [
  "chrono",
  "futures",
  "hex",
+ "hmac 0.12.1",
  "http",
  "hyper",
  "object_store",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "subtle",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
