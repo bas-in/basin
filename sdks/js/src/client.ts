@@ -47,7 +47,7 @@ export interface BasinClientOptions {
     removeItem: (key: string) => void | Promise<void>;
   };
 
-  /** Storage-namespace bucket route prefix. Default `/v1/storage/v1`. */
+  /** Storage-namespace bucket route prefix. Default `${url}/storage/v1`. */
   storageUrl?: string;
 
   /**
@@ -173,7 +173,7 @@ export function createClient(
   });
 
   const storage = new StorageClient({
-    url: options.storageUrl ?? `${base}/v1/storage/v1`,
+    url: options.storageUrl ?? `${base}/storage/v1`,
     headers,
     fetch: fetcher,
     auth,

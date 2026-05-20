@@ -10,7 +10,7 @@
  *   DELETE /storage/v1/object/:bucket                → remove (bulk)
  *   POST   /storage/v1/object/sign/:bucket/:path     → createSignedUrl
  *
- * `deps.url` is resolved as `${engineBase}/v1/storage/v1` by
+ * `deps.url` is resolved as `${engineBase}/storage/v1` by
  * `createClient`, so every method appends `/object/...` to it.
  */
 
