@@ -452,9 +452,9 @@ shape); ROADMAP 0.6.
 
 ---
 
-### T-026 — Wire `functions.invoke()` → `/rest/v1/rpc/:fn` ✅ unblocked
+### T-026 — Wire `functions.invoke()` → `/rest/v1/rpc/:fn` ✅
 
-**Status:** ready 2026-05-20. Engine shipped the RPC mount (basin 5.11.L,
+**Status:** done 2026-05-20. `invoke()` POSTs to `/rest/v1/rpc/:fn_name`; `enabled=true`; 9 tests green. Engine shipped the RPC mount (basin 5.11.L,
 commit 183c315). Route is **`POST /rest/v1/rpc/:fn_name`** — NOT the old
 `/v1/projects/:ref/functions/:slug/invoke` shape the stub assumed.
 

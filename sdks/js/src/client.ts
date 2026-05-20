@@ -188,7 +188,6 @@ export function createClient(
     url: base,
     headers,
     fetch: fetcher,
-    ...(options.projectRef ? { projectRef: options.projectRef } : {}),
   });
 
   const admin = new AdminClient({
