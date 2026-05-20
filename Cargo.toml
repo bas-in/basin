@@ -5,6 +5,7 @@ members = [
     "crates/basin-storage",
     "crates/basin-catalog",
     "crates/basin-engine",
+    "crates/basin-fn",
     "crates/basin-cron",
     "crates/basin-wal",
     "crates/basin-shard",
@@ -39,6 +40,7 @@ publish = false
 [workspace.dependencies]
 # Internal
 basin-common = { path = "crates/basin-common" }
+basin-fn = { path = "crates/basin-fn" }
 basin-storage = { path = "crates/basin-storage" }
 basin-catalog = { path = "crates/basin-catalog" }
 basin-wal = { path = "crates/basin-wal" }

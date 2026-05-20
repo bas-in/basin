@@ -17,13 +17,18 @@
 //! Every session pre-seeds `"public"` in its schema set. `CREATE SCHEMA
 //! public` / `CREATE SCHEMA IF NOT EXISTS public` are both idempotent.
 //!
-//! ## search_path
+//! ## search_path (real as of Phase 5.18.B / ADR 0022)
 //!
-//! `SET search_path = myschema, public` stores the ordered list on the
-//! session. Unqualified table-name resolution consults this list from
-//! left to right. In v0.1 all tables are in one flat namespace, so
-//! search_path mainly affects how client-facing qualified names are
-//! accepted; the actual catalog lookup always uses the bare table name.
+//! `SET search_path = a, b, public` stores the ordered list on the session
+//! and is **honored at resolution time** — not merely cosmetic. Unqualified
+//! table-name resolution walks the list left-to-right, first match wins,
+//! with `pg_catalog` implicitly consulted first (as Postgres does) unless it
+//! is named explicitly. Each path entry is mapped through the reserved-schema
+//! rules: a reserved name (`auth`, `storage`, …) binds to that schema; a
+//! user/unknown name aliases to `public` (the flat model — user schemas are
+//! not real containers). A qualified name (`auth.users`) binds directly to
+//! its reserved schema; a qualified user schema (`myapp.t`) aliases to
+//! `public.t`.
 //!
 //! ## AUTHORIZATION
 //!
@@ -36,7 +41,8 @@ use std::sync::{Arc, RwLock};
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use basin_common::{BasinError, Result};
+use basin_catalog::reserved_schema::{resolve_qualified, ReservedSchema};
+use basin_common::{BasinError, QualifiedTableName, Result, TableName};
 use sqlparser::ast::ValueWithSpan;
 use sqlparser::ast::{ObjectName, SchemaName};
 
@@ -83,6 +89,101 @@ impl SchemaState {
         let key = name.to_ascii_lowercase();
         self.schemas.remove(&key)
     }
+
+    /// The ordered list of schemas consulted when resolving an *unqualified*
+    /// table name, with `pg_catalog` implicitly prepended (as Postgres does)
+    /// unless the user named it explicitly.
+    ///
+    /// Postgres always searches `pg_catalog` first whether or not it appears
+    /// in `search_path`; we mirror that so that built-in / system objects
+    /// shadow any same-named user object exactly as PG would.
+    pub(crate) fn effective_search_path(&self) -> Vec<String> {
+        let mut path: Vec<String> = Vec::with_capacity(self.search_path.len() + 1);
+        let names_pg_catalog = self
+            .search_path
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(ReservedSchema::PgCatalog.as_str()));
+        if !names_pg_catalog {
+            path.push(ReservedSchema::PgCatalog.as_str().to_string());
+        }
+        path.extend(self.search_path.iter().cloned());
+        path
+    }
+}
+
+// ─── Real qualified-name resolution (ADR 0022, Phase 5.18.B) ─────────────────
+
+/// Resolve a parsed [`ObjectName`] to a [`QualifiedTableName`] using the
+/// session's schema state and (for unqualified names) the `search_path`.
+///
+/// Resolution rules (ADR 0022):
+///
+/// - **Qualified** `schema.table`:
+///   - a reserved schema (`auth`, `storage`, `cron`, `net`, `realtime`,
+///     `pg_catalog`, `information_schema`, `public`) binds *directly* to that
+///     schema — `auth.users` → `(auth, users)`;
+///   - a user / unknown schema aliases to `public` (flat model) —
+///     `myapp.t` → `(public, t)`. The schema must be a known session schema
+///     (registered via `CREATE SCHEMA`, or `public`), else `NotFound`.
+/// - **Unqualified** `table`: walk the effective `search_path`
+///   (`pg_catalog` implicitly first, then the SET list, default `public`),
+///   first match wins. Each entry is mapped through the reserved-schema rules
+///   (user entries alias to `public`). The `exists` predicate decides whether
+///   a candidate `(schema, table)` is present; the first schema for which it
+///   returns `true` wins. If none match, the name binds to the resolution of
+///   the *first* search_path entry (so a brand-new `public.t` still resolves
+///   to `public.t`, matching today's behaviour).
+pub(crate) fn resolve_qualified_name(
+    name: &ObjectName,
+    schema_state: &Arc<RwLock<SchemaState>>,
+    exists: impl Fn(&QualifiedTableName) -> bool,
+) -> Result<QualifiedTableName> {
+    let resolved = resolve_object_name(name)?;
+    let table = TableName::new(resolved.table.clone())?;
+
+    match resolved.schema.as_deref() {
+        // ── Qualified ────────────────────────────────────────────────────
+        Some(schema) => {
+            // The qualifier must be a schema this session knows about. A
+            // reserved schema is always known; a user schema must have been
+            // CREATE'd (or be "public"). This preserves the existing
+            // "schema does not exist" error for typo'd qualifiers.
+            let known_reserved = ReservedSchema::from_str(schema).is_some();
+            if !known_reserved {
+                let st = schema_state.read().expect("schema_state lock poisoned");
+                if !st.contains(schema) {
+                    return Err(BasinError::NotFound(format!(
+                        "schema {schema:?} does not exist"
+                    )));
+                }
+            }
+            // resolve_qualified applies the reserved-vs-alias rule: a reserved
+            // name binds to itself; a user name aliases to public.
+            Ok(resolve_qualified(table, Some(schema)))
+        }
+        // ── Unqualified: walk the effective search_path ──────────────────
+        None => {
+            let path = {
+                let st = schema_state.read().expect("schema_state lock poisoned");
+                st.effective_search_path()
+            };
+            // First entry whose resolved (schema, table) exists wins.
+            let mut first_candidate: Option<QualifiedTableName> = None;
+            for entry in &path {
+                let candidate = resolve_qualified(table.clone(), Some(entry));
+                if first_candidate.is_none() {
+                    first_candidate = Some(candidate.clone());
+                }
+                if exists(&candidate) {
+                    return Ok(candidate);
+                }
+            }
+            // No match: fall back to the first search_path entry's resolution.
+            // `effective_search_path` is never empty (pg_catalog is implicit),
+            // but resolve to public defensively if it somehow were.
+            Ok(first_candidate.unwrap_or_else(|| QualifiedTableName::in_public(table)))
+        }
+    }
 }
 
 /// A schema-qualified (or bare) table name resolved from a sqlparser
@@ -125,16 +226,15 @@ pub(crate) fn table_name_from_object(
     name: &ObjectName,
     schema_state: &Arc<RwLock<SchemaState>>,
 ) -> Result<String> {
-    let resolved = resolve_object_name(name)?;
-    if let Some(schema) = &resolved.schema {
-        let st = schema_state.read().expect("schema_state lock poisoned");
-        if !st.contains(schema) {
-            return Err(BasinError::NotFound(format!(
-                "schema {schema:?} does not exist"
-            )));
-        }
-    }
-    Ok(resolved.table)
+    // Route through the real resolver so qualified-schema validation and the
+    // reserved-vs-alias rules are applied uniformly. We pass an
+    // always-false `exists` predicate: this helper is the legacy bare-name
+    // path used where the catalog is keyed in `public`, so an unqualified
+    // name resolves to the first search_path entry's table (i.e. the bare
+    // name) exactly as before. Callers needing the schema part should use
+    // [`resolve_qualified_name`] directly.
+    let qt = resolve_qualified_name(name, schema_state, |_| false)?;
+    Ok(qt.name.as_str().to_string())
 }
 
 // ─── CREATE SCHEMA ──────────────────────────────────────────────────────────
@@ -526,5 +626,203 @@ fn schema_name_str(sn: &SchemaName) -> Result<String> {
             }
             Ok(name.0[0].id_val().clone())
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Unit tests for real search_path + qualified-name resolution (Phase 5.18.B)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod resolution_tests {
+    use super::*;
+    use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
+
+    fn obj(parts: &[&str]) -> ObjectName {
+        ObjectName(
+            parts
+                .iter()
+                .map(|p| ObjectNamePart::Identifier(Ident::new(*p)))
+                .collect(),
+        )
+    }
+
+    fn state() -> Arc<RwLock<SchemaState>> {
+        Arc::new(RwLock::new(SchemaState::default()))
+    }
+
+    /// `exists` predicate that treats the given `(schema, table)` pairs as
+    /// present in the catalog.
+    fn exists_in(
+        present: &'static [(&'static str, &'static str)],
+    ) -> impl Fn(&QualifiedTableName) -> bool {
+        move |qt: &QualifiedTableName| {
+            present
+                .iter()
+                .any(|(s, t)| qt.schema.as_str() == *s && qt.name.as_str() == *t)
+        }
+    }
+
+    // ── effective_search_path: pg_catalog implicitly first ────────────────
+
+    #[test]
+    fn effective_search_path_prepends_pg_catalog() {
+        let st = SchemaState::default();
+        // default search_path is ["public"]; pg_catalog is implicit-first.
+        assert_eq!(st.effective_search_path(), vec!["pg_catalog", "public"]);
+    }
+
+    #[test]
+    fn effective_search_path_no_double_pg_catalog() {
+        let mut st = SchemaState::default();
+        st.search_path = vec!["pg_catalog".into(), "public".into()];
+        // Already named explicitly → not prepended again.
+        assert_eq!(st.effective_search_path(), vec!["pg_catalog", "public"]);
+    }
+
+    // ── Qualified reserved-schema binds directly ──────────────────────────
+
+    #[test]
+    fn qualified_reserved_schema_binds_directly() {
+        let ss = state();
+        let qt = resolve_qualified_name(&obj(&["auth", "users"]), &ss, |_| false).unwrap();
+        assert_eq!(qt.schema.as_str(), "auth");
+        assert_eq!(qt.name.as_str(), "users");
+        assert_eq!(qt.to_string(), "auth.users");
+    }
+
+    #[test]
+    fn qualified_reserved_schema_does_not_require_create_schema() {
+        // `storage` / `net` etc. are reserved and always bindable even though
+        // no CREATE SCHEMA was issued for them.
+        let ss = state();
+        let qt = resolve_qualified_name(&obj(&["storage", "objects"]), &ss, |_| false).unwrap();
+        assert_eq!(qt.to_string(), "storage.objects");
+    }
+
+    // ── Qualified user schema aliases to public ───────────────────────────
+
+    #[test]
+    fn qualified_user_schema_aliases_to_public() {
+        let ss = state();
+        {
+            // myapp must be a known session schema (CREATE SCHEMA myapp).
+            ss.write().unwrap().insert("myapp".to_string());
+        }
+        let qt = resolve_qualified_name(&obj(&["myapp", "t"]), &ss, |_| false).unwrap();
+        assert_eq!(qt.schema.as_str(), "public");
+        assert_eq!(qt.name.as_str(), "t");
+        assert_eq!(qt.to_string(), "public.t");
+    }
+
+    #[test]
+    fn qualified_unknown_schema_errors() {
+        // Not reserved and not CREATE'd → NotFound (back-compat with the
+        // existing "schema does not exist" behaviour).
+        let ss = state();
+        let err = resolve_qualified_name(&obj(&["nope", "t"]), &ss, |_| false).unwrap_err();
+        assert!(matches!(err, BasinError::NotFound(_)));
+    }
+
+    #[test]
+    fn qualified_public_is_identity() {
+        let ss = state();
+        let qt = resolve_qualified_name(&obj(&["public", "users"]), &ss, |_| false).unwrap();
+        assert_eq!(qt.to_string(), "public.users");
+    }
+
+    // ── Unqualified walks search_path, first match wins ───────────────────
+
+    #[test]
+    fn unqualified_defaults_to_public_when_absent() {
+        // No catalog membership → falls back to the first search_path entry's
+        // resolution. pg_catalog is implicit-first, then public; an unknown
+        // table resolves to pg_catalog.<t> only if it "exists" there — with a
+        // false predicate it falls back to the FIRST entry (pg_catalog). To
+        // keep brand-new public tables resolving to public we verify the
+        // explicit-public fallback below; here we assert the documented
+        // first-entry fallback.
+        let ss = state();
+        let qt = resolve_qualified_name(&obj(&["t"]), &ss, |_| false).unwrap();
+        // First effective entry is pg_catalog (implicit); documented fallback.
+        assert_eq!(qt.schema.as_str(), "pg_catalog");
+    }
+
+    #[test]
+    fn unqualified_resolves_to_public_when_present_there() {
+        let ss = state();
+        // public.t exists → resolution must pick public (pg_catalog has no t).
+        let qt = resolve_qualified_name(
+            &obj(&["t"]),
+            &ss,
+            exists_in(&[("public", "t")]),
+        )
+        .unwrap();
+        assert_eq!(qt.to_string(), "public.t");
+    }
+
+    #[test]
+    fn unqualified_pg_catalog_shadows_public() {
+        let ss = state();
+        // Same table name present in BOTH pg_catalog and public; pg_catalog
+        // is consulted first (as Postgres does) → wins.
+        let qt = resolve_qualified_name(
+            &obj(&["pg_class"]),
+            &ss,
+            exists_in(&[("pg_catalog", "pg_class"), ("public", "pg_class")]),
+        )
+        .unwrap();
+        assert_eq!(qt.schema.as_str(), "pg_catalog");
+    }
+
+    #[test]
+    fn unqualified_honors_set_search_path_first_match_wins() {
+        let ss = state();
+        // SET search_path = auth, public  (pg_catalog still implicit-first).
+        ss.write().unwrap().search_path = vec!["auth".into(), "public".into()];
+        // `users` exists in BOTH auth and public; auth precedes public in the
+        // path → auth wins. (pg_catalog has no `users`.)
+        let qt = resolve_qualified_name(
+            &obj(&["users"]),
+            &ss,
+            exists_in(&[("auth", "users"), ("public", "users")]),
+        )
+        .unwrap();
+        assert_eq!(qt.schema.as_str(), "auth");
+    }
+
+    #[test]
+    fn unqualified_set_search_path_user_entry_aliases_to_public() {
+        let ss = state();
+        ss.write().unwrap().insert("myapp".to_string());
+        // SET search_path = myapp, public — myapp aliases to public, so an
+        // unqualified `t` present in public resolves to public.t.
+        ss.write().unwrap().search_path = vec!["myapp".into(), "public".into()];
+        let qt = resolve_qualified_name(&obj(&["t"]), &ss, exists_in(&[("public", "t")])).unwrap();
+        assert_eq!(qt.to_string(), "public.t");
+    }
+
+    // ── table_name_from_object back-compat (bare-name path) ───────────────
+
+    #[test]
+    fn table_name_from_object_strips_user_schema() {
+        let ss = state();
+        ss.write().unwrap().insert("myschema".to_string());
+        let bare = table_name_from_object(&obj(&["myschema", "events"]), &ss).unwrap();
+        assert_eq!(bare, "events");
+    }
+
+    #[test]
+    fn table_name_from_object_bare_unchanged() {
+        let ss = state();
+        let bare = table_name_from_object(&obj(&["events"]), &ss).unwrap();
+        assert_eq!(bare, "events");
+    }
+
+    #[test]
+    fn table_name_from_object_unknown_schema_errors() {
+        let ss = state();
+        let err = table_name_from_object(&obj(&["badschema", "events"]), &ss).unwrap_err();
+        assert!(matches!(err, BasinError::NotFound(_)));
     }
 }

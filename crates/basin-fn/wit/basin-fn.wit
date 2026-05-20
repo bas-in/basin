@@ -1,0 +1,104 @@
+// WIT interface definitions for basin:functions host imports.
+//
+// Phase 5.11.W1 — Wasm component-model host ABI.
+//
+// Any guest language that targets the WebAssembly component model can use
+// these interfaces. The host (basin-fn) implements all four imports; guests
+// call them like normal functions.
+//
+// Package name: `basin:functions` (avoids the `fn` Rust keyword in the
+// generated host-side module path).
+//
+// Stability: This is the canonical W1 ABI. W2 adds `basin:functions/handler`
+// (HTTP-handler export shape) without changing the four interfaces below.
+
+package basin:functions;
+
+// ---------------------------------------------------------------------------
+// basin:functions/query — run SQL under the caller's identity.
+//
+// RLS applies: the host executes the statement through the same session path
+// used by every other basin-engine query. The caller identity is threaded
+// from the hosting FunctionCallContext.
+// ---------------------------------------------------------------------------
+interface query {
+    // One row of a query result: ordered list of (column-name, value) pairs.
+    // Values are JSON-encoded strings so a single type covers all SQL types
+    // (text, int, bool, timestamp, jsonb, null → "null") without a full
+    // variant type in the ABI.
+    record row {
+        columns: list<tuple<string, string>>,
+    }
+
+    // Execute `sql` and return all rows as a list.
+    // Returns an error string on failure (SQL error, RLS violation, etc.).
+    exec: func(sql: string) -> result<list<row>, string>;
+}
+
+// ---------------------------------------------------------------------------
+// basin:functions/http — outbound HTTP via basin-net.
+//
+// The host enforces the project's allowlist + rate-limit + body-cap +
+// timeout that already exist in basin-net. The guest cannot bypass them.
+// ---------------------------------------------------------------------------
+interface http {
+    record request {
+        url:     string,
+        method:  string,           // "GET" | "POST"
+        headers: list<tuple<string, string>>,
+        body:    option<list<u8>>,
+    }
+
+    record response {
+        status:  u16,
+        headers: list<tuple<string, string>>,
+        body:    list<u8>,
+    }
+
+    fetch: func(req: request) -> result<response, string>;
+}
+
+// ---------------------------------------------------------------------------
+// basin:functions/log — emit a log line via tracing.
+// ---------------------------------------------------------------------------
+interface log {
+    // Log levels that map to tracing macros: trace/debug/info/warn/error.
+    enum level {
+        trace,
+        debug,
+        info,
+        warn,
+        error,
+    }
+
+    emit: func(lvl: level, msg: string);
+}
+
+// ---------------------------------------------------------------------------
+// basin:functions/secret — read a project secret, decrypted via
+// EncryptionProvider.
+//
+// Only secrets scoped to the calling project are accessible; the host
+// resolves the project from the FunctionCallContext and returns an error
+// if the name is unknown or if decryption fails.
+// ---------------------------------------------------------------------------
+interface secret {
+    get: func(name: string) -> result<string, string>;
+}
+
+// ---------------------------------------------------------------------------
+// The world a basin function component is expected to satisfy.
+//
+// Imports: the four host interfaces above.
+// Exports: a single `run` entrypoint the host calls.
+// ---------------------------------------------------------------------------
+world basin-functions {
+    import query;
+    import http;
+    import log;
+    import secret;
+
+    // Guest exports one entrypoint. The host calls it after wiring the
+    // imports. The return value is an optional string error; `none` = success.
+    export run: func() -> option<string>;
+}

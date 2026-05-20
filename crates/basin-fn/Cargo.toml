@@ -1,0 +1,49 @@
+[package]
+name = "basin-fn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# ADR 0018: gate the component-model stack behind a Cargo feature.
+# Without `component-model`, this crate is a zero-dep stub (only WIT files
+# ship). The default build enables it; `--no-default-features` drops it.
+[features]
+default = ["component-model"]
+# Pulls in wasmtime's component API + wasmtime-wasi P2.
+component-model = [
+    "dep:wasmtime",
+    "dep:wasmtime-wasi",
+    "dep:basin-net",
+    "dep:basin-common",
+    "dep:tracing",
+    "dep:thiserror",
+    "dep:anyhow",
+    "dep:tokio",
+    "dep:serde_json",
+]
+
+[dependencies]
+basin-common = { workspace = true, optional = true }
+basin-net    = { workspace = true, optional = true }
+
+# Wasmtime component-model stack (44.x, matching basin-engine's pin).
+# wasmtime-wasi provides WASI P2 types (ResourceTable, WasiCtx) used by
+# the component linker. `p2` feature enables Preview 2 only; we don't
+# need the legacy P1 (`p1` = dep:wiggle) for function components.
+wasmtime      = { version = "44", default-features = true, features = ["component-model", "async"], optional = true }
+wasmtime-wasi = { version = "44", default-features = false, features = ["p2"], optional = true }
+
+tracing    = { workspace = true, optional = true }
+thiserror  = { workspace = true, optional = true }
+anyhow     = { workspace = true, optional = true }
+tokio      = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio      = { workspace = true, features = ["full"] }
+tracing-subscriber = { workspace = true }
+# wat crate is a transitive dep of wasmtime (the `wat` feature is on by
+# default in 44.x) — no extra network fetch needed.
+wat = "1"
