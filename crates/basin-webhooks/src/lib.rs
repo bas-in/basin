@@ -67,7 +67,7 @@
 mod clock;
 mod config;
 mod envelope;
-pub(crate) mod predicate_eval;
+pub mod predicate_eval;
 mod queue;
 #[cfg(feature = "delivery")]
 mod sink;

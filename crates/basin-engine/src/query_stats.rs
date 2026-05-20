@@ -548,6 +548,72 @@ impl QueryStatRegistry {
         let guard = arc.lock().expect("ProjectStats Mutex poisoned");
         guard.shapes.len()
     }
+
+    /// Return a flat snapshot of every tracked `(project, table, shape)` triple.
+    ///
+    /// Used by the OTLP exporter and the `basin_stat_statements` SQL view
+    /// (Phase 5.16.D).  Each call acquires the per-project `std::sync::Mutex`
+    /// briefly (O(shapes) total); no data is cached between calls.
+    ///
+    /// Shapes evicted by LRU are not included — only currently tracked shapes
+    /// are visible.
+    pub fn snapshot_all(&self) -> Vec<crate::query_stats_export::ShapeStatRow> {
+        let threshold = self.regression_threshold();
+        let mut rows = Vec::new();
+
+        for entry in self.projects.iter() {
+            let project_id = *entry.key();
+            let arc = entry.value().clone();
+            drop(entry); // release DashMap shard lock before taking Mutex
+
+            let guard = arc.lock().expect("ProjectStats Mutex poisoned");
+
+            for ((table, hash), stats) in guard.shapes.iter() {
+                let ns_to_ms = |ns: u64| ns as f64 / 1_000_000.0;
+
+                let p50_ms = ns_to_ms(stats.latency_ns.value_at_quantile(0.50));
+                let p95_ms = ns_to_ms(stats.latency_ns.value_at_quantile(0.95));
+                let p99_ms = ns_to_ms(stats.latency_ns.value_at_quantile(0.99));
+
+                // Regression alert: any adjacent bucket pair with ratio > threshold.
+                let regression_alert = {
+                    let mut alert = false;
+                    let mut prev_p99: Option<u64> = None;
+                    for hist in &stats.bucket_latency_ns {
+                        if hist.is_empty() {
+                            continue;
+                        }
+                        let bucket_p99 = hist.value_at_quantile(0.99);
+                        if let Some(prev) = prev_p99 {
+                            if prev > 0 {
+                                let ratio = bucket_p99 as f64 / prev as f64;
+                                if ratio > threshold {
+                                    alert = true;
+                                    break;
+                                }
+                            }
+                        }
+                        prev_p99 = Some(bucket_p99);
+                    }
+                    alert
+                };
+
+                rows.push(crate::query_stats_export::ShapeStatRow {
+                    shape_hash: format!("{:016x}", hash.0),
+                    project_id: project_id.to_string(),
+                    table_name: table.to_string(),
+                    observe_count: stats.total_observations,
+                    p50_ms,
+                    p95_ms,
+                    p99_ms,
+                    fast_path_hits: stats.fast_path_count,
+                    regression_alert,
+                });
+            }
+        }
+
+        rows
+    }
 }
 
 impl Default for QueryStatRegistry {

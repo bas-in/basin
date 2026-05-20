@@ -44,7 +44,14 @@ use sqlparser::parser::Parser;
 /// against `event`. Returns the boolean result (NULL collapses to
 /// `false`, matching PG's `WHERE` semantics on NULL). Parse / unsupported
 /// shapes surface as `Err`.
-pub(crate) fn eval(predicate_sql: &str, event: &ChangeEvent) -> std::result::Result<bool, String> {
+/// Parse `predicate_sql` as a single SQL expression and evaluate it
+/// against `event`. Returns the boolean result (NULL collapses to
+/// `false`, matching PG's `WHERE` semantics on NULL). Parse / unsupported
+/// shapes surface as `Err`.
+///
+/// Public so `basin-realtime` can reuse this evaluator for subscriber-side
+/// filter pushdown (Phase 5.11.R5) without duplicating the logic.
+pub fn eval(predicate_sql: &str, event: &ChangeEvent) -> std::result::Result<bool, String> {
     let dialect = PostgreSqlDialect {};
     let mut parser = Parser::new(&dialect)
         .try_with_sql(predicate_sql)

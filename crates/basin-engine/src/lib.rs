@@ -721,6 +721,7 @@ mod prepared;
 mod query_history;
 pub(crate) mod query_shape;
 pub mod query_stats;
+pub mod query_stats_export;
 mod procedure_ddl;
 mod range_udf;
 pub mod reactor_ddl;

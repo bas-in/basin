@@ -727,6 +727,16 @@ pub(crate) async fn open(
     )
     .map_err(|e| BasinError::internal(format!("info_schema providers: {e}")))?;
 
+    // Phase 5.16.D: register `basin_stat_statements` virtual view in the
+    // `public` schema so `SELECT * FROM basin_stat_statements` works without
+    // a schema prefix. The provider reads the process-wide QueryStatRegistry
+    // (shared, O(bytes) per idle project) on every scan — no caching needed.
+    crate::query_stats_export::register_basin_stat_statements(
+        &ctx,
+        engine.inner.query_stats.clone(),
+    )
+    .map_err(|e| BasinError::internal(format!("basin_stat_statements: {e}")))?;
+
     let state = Arc::new(SessionState::new());
 
     // Advisory-lock UDFs (BUG #138). Session-scoped: a lock owned by this

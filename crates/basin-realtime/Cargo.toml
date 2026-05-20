@@ -19,8 +19,10 @@ serde.workspace = true
 serde_json.workspace = true
 futures.workspace = true
 
-# HTTP stack (SSE transport, R2).
-axum.workspace = true
+# HTTP stack (SSE transport R2, WebSocket transport R3).
+# The `ws` feature pulls in tokio-tungstenite via axum's own dependency;
+# no direct tokio-tungstenite entry is needed in this crate's manifest.
+axum = { workspace = true, features = ["ws"] }
 
 # Concurrent per-(project, table) broadcast registry.
 dashmap = "6"

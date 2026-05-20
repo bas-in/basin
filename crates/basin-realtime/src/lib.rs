@@ -438,6 +438,35 @@ impl ReplayCursor {
     }
 }
 
+/// Build the WS axum sub-router for `/realtime/v1/ws/:project`.
+///
+/// Convenience re-export so callers in `basin-server` don't need to import
+/// the inner module:
+///
+/// ```ignore
+/// let ws_router = basin_realtime::ws_router(registry.clone(), auth.clone());
+/// app = app.merge(ws_router);
+/// ```
+pub fn ws_router(
+    registry: ChannelRegistry,
+    auth: Arc<basin_auth::AuthService>,
+) -> axum::Router {
+    ws::router(registry, auth)
+}
+
+/// Bind a standalone HTTP server for the WS endpoint on `bind_addr` and
+/// return a background [`tokio::task::JoinHandle`].
+///
+/// Called from `basin-server/src/main.rs` behind `#[cfg(feature = "realtime")]`
+/// so `basin-server` doesn't need to import `axum` directly.
+pub async fn ws_serve(
+    bind_addr: std::net::SocketAddr,
+    registry: ChannelRegistry,
+    auth: Arc<basin_auth::AuthService>,
+) -> Result<tokio::task::JoinHandle<()>, std::io::Error> {
+    ws::serve(bind_addr, registry, auth).await
+}
+
 /// Build the SSE axum sub-router for `/realtime/v1/sse/:project/:table`.
 ///
 /// Convenience re-export so callers in `basin-server` don't need to import
