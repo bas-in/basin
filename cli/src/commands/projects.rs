@@ -43,17 +43,19 @@ pub fn cmd_projects(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         "delete" => delete(g, rest),
         "pause" => pause_resume(g, rest, "pause"),
         "resume" => pause_resume(g, rest, "resume"),
+        "transfers" => super::transfers::cmd_projects_transfers(g, rest),
         "--help" | "-h" | "help" => {
             help_for_command(
                 "projects",
-                "List / get / create / delete / pause / resume projects.",
+                "List / get / create / delete / pause / resume / transfer projects.",
                 &[
-                    "list   [--org <slug>]                          List projects.",
-                    "get    <ref>                                   Show one project.",
-                    "create <name> --org <slug> [--region <code>]   Create a project.",
-                    "delete <ref> [--yes]                           Delete a project (confirm by name).",
-                    "pause  <ref>                                   Pause a project's data plane.",
-                    "resume <ref>                                   Resume a paused project.",
+                    "list      [--org <slug>]                               List projects.",
+                    "get       <ref>                                        Show one project.",
+                    "create    <name> --org <slug> [--region <code>]        Create a project.",
+                    "delete    <ref> [--yes]                                Delete a project (confirm by name).",
+                    "pause     <ref>                                        Pause a project's data plane.",
+                    "resume    <ref>                                        Resume a paused project.",
+                    "transfers <list|create|cancel>  [--project=<ref>]      Manage project org-transfers.",
                 ],
             );
             Ok(())

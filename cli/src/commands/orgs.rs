@@ -11,8 +11,7 @@
 //!   DELETE /v1/orgs/{slug}/branding
 //!
 //! The `ownership-transfers` and `incoming-project-transfers` subcommands
-//! live in cmd_transfers.go and are NOT yet ported — they return a clear
-//! "not yet ported" error.
+//! are implemented in commands/transfers.rs and dispatched below.
 
 use clap::{Arg, ArgAction, Command};
 use reqwest::Method;
@@ -73,8 +72,11 @@ pub fn cmd_orgs(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         "update" => update(g, rest),
         "delete" => delete(g, rest),
         "branding" => branding(g, rest),
-        "ownership-transfers" | "incoming-project-transfers" => {
-            Err(crate::error::msg("basin orgs ownership-transfers: not yet ported"))
+        "ownership-transfers" => {
+            super::transfers::cmd_orgs_ownership_transfers(g, rest)
+        }
+        "incoming-project-transfers" => {
+            super::transfers::cmd_orgs_incoming_project_transfers(g, rest)
         }
         "--help" | "-h" | "help" => {
             help_for_command(
@@ -89,6 +91,8 @@ pub fn cmd_orgs(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
                     "branding get <slug>                                        Get org branding.",
                     "branding put <slug> [--logo-url=...] [--primary-color=...] [--secondary-color=...]  Set org branding.",
                     "branding delete <slug>                                     Remove org branding.",
+                    "ownership-transfers <list|create|cancel|accept|decline>   Manage org-owner handovers.",
+                    "incoming-project-transfers <list|accept|decline>          Manage inbound project handovers.",
                 ],
             );
             Ok(())
@@ -759,11 +763,11 @@ mod tests {
     }
 
     #[test]
-    fn ownership_transfers_not_ported() {
+    fn ownership_transfers_no_args_is_usage_error() {
         let _cfg = with_temp_config_dir();
         let g0 = GlobalFlags { quiet: true, ..Default::default() };
         let err = cmd_orgs(&g0, &["ownership-transfers".into()]);
         assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("not yet ported"));
+        assert!(err.unwrap_err().to_string().contains("usage"));
     }
 }

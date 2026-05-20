@@ -55,6 +55,7 @@ pub mod sql;
 pub mod status;
 pub mod tables;
 pub mod tokens;
+pub mod transfers;
 pub mod unlink;
 pub mod version;
 pub mod webhooks;
