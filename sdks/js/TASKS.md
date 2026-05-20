@@ -304,88 +304,117 @@ stub to a real network call. **Do not start these until the engine route
 exists** — check `basin/crates/basin-rest/src/server.rs` for the route
 table. If the route isn't there, leave the stub and move on.
 
-### T-020 — Wire `signInWithOAuth` 🔒
+### T-020 — Wire `signInWithOAuth` 🔒 (spec ready)
 
-**Status:** blocked 2026-05-19. Engine `/auth/v1/oauth/*` routes do not exist
-in `basin-rest/src/server.rs`. Stub remains in place. Flip when engine ships.
+**Status:** spec ready 2026-05-20 — route shape **final** per basin
+**ADR 0020** (engine task 5.10.O). Still blocked on engine
+implementation: the route is specced, not yet in
+`basin-rest/src/server.rs`. Build against the final shape below; flip
+the stub when the engine ships it.
 
 **Files:** `src/auth/client.ts`, `src/auth/client.test.ts`
 
-**Engine prerequisite:** `/auth/v1/oauth/:provider/authorize` route in
-basin-rest.
+**Engine route (final):** `GET /auth/v1/authorize?provider=<name>&redirect_to=…`
+— **corrected** from the earlier guess `/auth/v1/oauth/:provider/authorize`.
+Supabase-shaped.
 
 **Scope:**
-- Build the authorize URL: `${url}/auth/v1/oauth/${provider}/authorize?redirect_to=…&state=…`.
+- Build the authorize URL: `${url}/auth/v1/authorize?provider=${provider}&redirect_to=…`.
 - Return `{data: {url, provider}, error: null}` — the caller redirects the
-  browser to this URL; the engine handles PKCE state server-side.
+  browser to this URL; the engine handles PKCE + signed `state`
+  server-side, then `GET /auth/v1/callback` completes the exchange.
 - Drop the current `not_implemented` short-circuit.
+
+**Provider list:** presets (Google/GitHub/Apple/…) + generic `oidc` per
+ADR 0020. Align the SDK's enumerated providers with the engine preset
+list — don't hardcode a divergent set.
 
 **Acceptance criteria:**
 - Existing `not_implemented` test deleted; replaced with URL-shape tests
-  for the 14 providers.
+  for each enumerated provider + the generic OIDC path.
 - No fetch is attempted — this is pure URL construction.
 
 ---
 
-### T-021 — Wire `auth.mfa.{enroll, verify, unenroll}` 🔒
+### T-021 — Wire `auth.mfa.{enroll, verify, unenroll, challenge}` 🔒 (spec ready)
 
-**Status:** blocked 2026-05-19. Engine `/auth/v1/mfa/*` routes do not exist.
+**Status:** spec ready 2026-05-20 — route shapes **final** per basin
+**ADR 0020** (engine task 5.10.M). Still blocked on engine
+implementation. TOTP **and** WebAuthn/passkeys ship together — WebAuthn
+is no longer a separate follow-on.
 
 **Files:** `src/auth/mfa.ts`, `src/auth/client.test.ts`
 
-**Engine prerequisite:** `/auth/v1/mfa/totp/{enable,confirm,disable,challenge}`
-routes in basin-rest.
+**Engine routes (final, Supabase-shaped — corrected from `/auth/v1/mfa/totp/*`):**
+- enroll → `POST /auth/v1/factors` (TOTP: returns `{secret, qrCode}`;
+  WebAuthn: returns a creation challenge).
+- verify enrollment → `POST /auth/v1/factors/:id/verify`.
+- step-up challenge mid-signin → `POST /auth/v1/factors/:id/challenge`
+  then `POST /auth/v1/factors/:id/challenge/verify` → re-issues an
+  `aal2` JWT.
+- unenroll → `DELETE /auth/v1/factors/:id` (requires aal2).
 
 **Scope:**
-- TOTP enroll → POST `/auth/v1/mfa/totp/enable` → returns
-  `{secret, qrCode}`.
-- TOTP verify → POST `/auth/v1/mfa/totp/confirm` with `{code}`.
-- TOTP unenroll → POST `/auth/v1/mfa/totp/disable`.
-- TOTP challenge mid-signin → POST `/auth/v1/mfa/totp/challenge` with
-  `{partial_token, code}` → full session.
-- WebAuthn paths stay stubbed for now (separate task once engine ships).
+- Map `enroll({factorType})` to `POST /factors` for both `totp` and
+  `webauthn` factor types.
+- `verify` / `challenge` / `unenroll` per the routes above.
+- `signInWithPassword` `mfa_required` branch routes the partial token to
+  `/factors/:id/challenge`.
+- Surface the JWT `aal`/`amr` claims on the session object.
 
 **Acceptance criteria:**
-- All four TOTP methods have happy-path + error-path unit tests.
-- `signInWithPassword` `mfa_required` branch routes the partial token
-  correctly to the challenge endpoint when the caller invokes it.
+- TOTP **and** WebAuthn enroll/verify/challenge/unenroll have happy-path
+  + error-path unit tests.
+- `mfa_required` branch routes the partial token to the challenge
+  endpoint and upgrades the session to aal2 on success.
 
 ---
 
-### T-022 — Wire storage `.upload()` + `.download()` 🔒
+### T-022 — Wire storage `.upload()` + `.download()` ✅ done
 
-**Status:** blocked 2026-05-19. Engine `/object/*` routes do not exist.
+**Status:** done 2026-05-20. `upload` (POST) + `download` (GET) wired to
+`/storage/v1/object/:bucket/:path`. Content-Type sniffed from Blob or
+`opts.contentType`; returns `{data, error}` envelope. 8 tests green.
 
 **Files:** `src/storage/client.ts`, `src/storage/client.test.ts`
 
-**Engine prerequisite:** `/object/*` upload + download routes.
+**Engine routes (final — corrected from bare `/object/*`):**
+`/storage/v1/object/:bucket/:path`.
 
 **Scope:**
 - `.upload(path, file, opts)` → POST multipart/form-data to
-  `/object/${bucket}/${path}`. Body: `Blob | ArrayBuffer | Uint8Array | string`.
-  Headers: `Content-Type` from `opts.contentType` or sniff from `Blob.type`.
-- `.download(path)` → GET `/object/${bucket}/${path}` → returns `Blob`.
+  `/storage/v1/object/${bucket}/${path}`. Body:
+  `Blob | ArrayBuffer | Uint8Array | string`. Headers: `Content-Type`
+  from `opts.contentType` or sniff from `Blob.type`.
+- `.download(path)` → GET `/storage/v1/object/${bucket}/${path}` →
+  returns `Blob`. Public buckets also resolve via
+  `/storage/v1/object/public/${bucket}/${path}` (no JWT).
 - Both stay synchronous about returning `{data, error}` envelope.
 
 **Acceptance criteria:**
 - Upload happy path with `Blob`, `ArrayBuffer`, `Uint8Array`, `string`.
 - Download returns a `Blob` matching the response body.
-- 404 on download → `not_found` error.
+- 404 on download → `not_found` error; 401 on private bucket without JWT.
 
 ---
 
-### T-023 — Wire storage `.list()` + `.remove()` 🔒
+### T-023 — Wire storage `.list()` + `.remove()` ✅ done
 
-**Status:** blocked 2026-05-19. Engine `/object/*` routes do not exist.
+**Status:** done 2026-05-20. `list` (POST `/object/list/:bucket` with
+`{prefix, limit, offset, sortBy}`) + `remove` (DELETE `/object/:bucket`
+with `{prefixes}` body). Empty list returns `[]`. 10 tests green.
 
 **Files:** `src/storage/client.ts`, `src/storage/client.test.ts`
 
-**Engine prerequisite:** `/object/list` + `/object/remove` routes.
+**Engine routes (final — corrected from `/object/*`):**
+`/storage/v1/object/list/:bucket` + bulk delete on
+`/storage/v1/object/:bucket`.
 
 **Scope:**
-- `.list(prefix, opts)` → POST `/object/list/${bucket}` with
+- `.list(prefix, opts)` → POST `/storage/v1/object/list/${bucket}` with
   `{prefix, limit, offset, sortBy}` → returns `ObjectInfo[]`.
-- `.remove(paths)` → POST `/object/remove/${bucket}` with `{paths}`.
+- `.remove(paths)` → DELETE `/storage/v1/object/${bucket}` with
+  `{prefixes: paths}` (bulk delete).
 
 **Acceptance criteria:**
 - Happy path + 401 unauthorized for both methods.
@@ -393,17 +422,21 @@ routes in basin-rest.
 
 ---
 
-### T-024 — Wire storage `.createSignedUrl()` 🔒
+### T-024 — Wire storage `.createSignedUrl()` ✅ done
 
-**Status:** blocked 2026-05-19. Engine `/object/sign/*` route does not exist.
+**Status:** done 2026-05-20. POST `/object/sign/:bucket/:path` with
+`{expiresIn}`; relative `signedUrl` resolved against storageUrl base;
+negative `expiresIn` → `invalid_request` before fetch. 8 tests green.
 
 **Files:** `src/storage/client.ts`, `src/storage/client.test.ts`
 
-**Engine prerequisite:** `/object/sign/*` route.
+**Engine route (final — corrected from `/object/sign/*`):**
+`/storage/v1/object/sign/:bucket/:path`.
 
 **Scope:**
-- POST `/object/sign/${bucket}/${path}` with `{expiresIn}` → returns
-  `{signedUrl: string}`.
+- POST `/storage/v1/object/sign/${bucket}/${path}` with `{expiresIn}` →
+  returns `{signedUrl: string}` (HMAC over (project, bucket, path,
+  expiry), server-side).
 - Server may return a relative path; resolve against `storageUrl`.
 
 **Acceptance criteria:**

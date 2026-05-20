@@ -3,17 +3,15 @@
  * with `.upload`, `.download`, `.list`, `.remove`, `.createSignedUrl`,
  * `.getPublicUrl`.
  *
- * Returns `BasinError("not_implemented")` from every async method
- * today — basin-engine v0.1 has no `/object/*` surface (verified
- * against `basin/crates/basin-rest/src/server.rs`). Lands when
- * basin-engine grows the storage object surface in v0.2+. The
- * synchronous `getPublicUrl` keeps its URL-construction body so
- * render-time templates compile; the URL won't resolve until the
- * engine ships the storage surface.
+ * Engine routes (final — basin-engine Phase 5.17, ADR 0021):
+ *   POST   /storage/v1/object/:bucket/:path          → upload
+ *   GET    /storage/v1/object/:bucket/:path          → download
+ *   POST   /storage/v1/object/list/:bucket           → list
+ *   DELETE /storage/v1/object/:bucket                → remove (bulk)
+ *   POST   /storage/v1/object/sign/:bucket/:path     → createSignedUrl
  *
- * The shape is preserved exactly — every signature matches what the
- * implemented version will return — so app code can be written today
- * against the stable shape and flip on with no breaking change.
+ * `deps.url` is resolved as `${engineBase}/v1/storage/v1` by
+ * `createClient`, so every method appends `/object/...` to it.
  */
 
 import { BasinError } from "../errors.js";
@@ -42,11 +40,14 @@ export interface ListSortBy {
   order: "asc" | "desc";
 }
 
+/** Result shape for `createSignedUrl`. */
+export interface SignedUrlResult {
+  signedUrl: string;
+  expiresAt?: string;
+}
+
 /** Threshold above which `.upload()` should delegate to multipart. */
 const MULTIPART_THRESHOLD = 5 * 1024 * 1024;
-
-const STORAGE_NOT_IMPLEMENTED_MESSAGE =
-  "Storage (network methods) ships when the engine route lands — tracked in ROADMAP 0.3";
 
 export class StorageClient {
   #deps: StorageDeps;
@@ -61,9 +62,6 @@ export class StorageClient {
 }
 
 export class StorageBucket {
-  // Retained for the v0.2 swap — the bucket name + deps both feed the
-  // URL builder in `getPublicUrl` and will feed the network methods
-  // when they land.
   readonly #bucket: string;
   readonly #deps: StorageDeps;
 
@@ -72,83 +70,309 @@ export class StorageBucket {
     this.#deps = deps;
   }
 
+  // ─── Internal helpers ──────────────────────────────────────────────
+
+  /** Build request headers, injecting `Authorization` from session if present. */
+  #headers(extra?: Record<string, string>): Record<string, string> {
+    const session = this.#deps.auth.getSession();
+    const auth = session?.access_token
+      ? { Authorization: `Bearer ${session.access_token}` }
+      : {};
+    return { ...this.#deps.headers, ...auth, ...extra };
+  }
+
+  /** Map an HTTP response to a typed BasinError. */
+  #httpError(status: number, details?: unknown): BasinError {
+    if (status === 401 || status === 403) {
+      return new BasinError("unauthorized", "unauthorized", status, details);
+    }
+    if (status === 404) {
+      return new BasinError("not_found", "object not found", status, details);
+    }
+    return new BasinError(
+      "internal",
+      `storage request failed (HTTP ${status})`,
+      status,
+      details,
+    );
+  }
+
+  // ─── Public methods ────────────────────────────────────────────────
+
   /**
    * Upload a file to `{bucket}/{path}`.
    *
-   * Returns `BasinError("not_implemented")` today — basin-engine has
-   * no `/object/*` routes. Lands when basin-engine grows the storage
-   * surface in v0.2+.
+   * POST `/storage/v1/object/${bucket}/${path}`
+   * Body: raw bytes / Blob / string.
+   * Content-Type: from `opts.contentType`, or sniffed from `Blob.type`.
    */
   async upload(
-    _path: string,
-    _file: Blob | ArrayBuffer | string,
-    _opts?: { contentType?: string; upsert?: boolean },
+    path: string,
+    file: Blob | ArrayBuffer | Uint8Array | string,
+    opts?: { contentType?: string; upsert?: boolean },
   ): Promise<{ data: { path: string } | null; error: BasinError | null }> {
-    return {
-      data: null,
-      error: new BasinError("not_implemented", STORAGE_NOT_IMPLEMENTED_MESSAGE),
-    };
+    const url = `${this.#deps.url}/object/${encodeURIComponent(this.#bucket)}/${encodePathSegments(path)}`;
+
+    let contentType = opts?.contentType;
+    if (!contentType && file instanceof Blob && file.type) {
+      contentType = file.type;
+    }
+    contentType = contentType ?? "application/octet-stream";
+
+    const headers = this.#headers({ "Content-Type": contentType });
+    if (opts?.upsert) {
+      headers["x-upsert"] = "true";
+    }
+
+    let res: Response;
+    try {
+      res = await this.#deps.fetch(url, {
+        method: "POST",
+        headers,
+        body: file as BodyInit,
+      });
+    } catch (e) {
+      return {
+        data: null,
+        error: new BasinError(
+          "network",
+          e instanceof Error ? e.message : "network error during upload",
+        ),
+      };
+    }
+
+    if (!res.ok) {
+      let details: unknown;
+      try {
+        details = await res.json();
+      } catch {
+        /* ignore */
+      }
+      return { data: null, error: this.#httpError(res.status, details) };
+    }
+
+    return { data: { path }, error: null };
   }
 
   /**
    * Download `{bucket}/{path}` as a Blob.
    *
-   * Returns `BasinError("not_implemented")` today — basin-engine has
-   * no `/object/*` routes. Lands in basin v0.2+.
+   * GET `/storage/v1/object/${bucket}/${path}`
    */
   async download(
-    _path: string,
+    path: string,
   ): Promise<{ data: Blob | null; error: BasinError | null }> {
-    return {
-      data: null,
-      error: new BasinError("not_implemented", STORAGE_NOT_IMPLEMENTED_MESSAGE),
-    };
+    const url = `${this.#deps.url}/object/${encodeURIComponent(this.#bucket)}/${encodePathSegments(path)}`;
+
+    let res: Response;
+    try {
+      res = await this.#deps.fetch(url, {
+        method: "GET",
+        headers: this.#headers(),
+      });
+    } catch (e) {
+      return {
+        data: null,
+        error: new BasinError(
+          "network",
+          e instanceof Error ? e.message : "network error during download",
+        ),
+      };
+    }
+
+    if (!res.ok) {
+      let details: unknown;
+      try {
+        details = await res.json();
+      } catch {
+        /* ignore */
+      }
+      return { data: null, error: this.#httpError(res.status, details) };
+    }
+
+    const blob = await res.blob();
+    return { data: blob, error: null };
   }
 
   /**
    * List objects in the bucket, optionally filtered by `prefix`.
    *
-   * Returns `BasinError("not_implemented")` today — basin-engine has
-   * no `/object/list/*` route. Lands in basin v0.2+.
+   * POST `/storage/v1/object/list/${bucket}` with `{prefix, limit, offset, sortBy}`.
+   * Returns `ObjectInfo[]`; empty result returns `[]` not `null`.
    */
   async list(
-    _prefix?: string,
-    _opts?: { limit?: number; offset?: number; sortBy?: ListSortBy },
+    prefix?: string,
+    opts?: { limit?: number; offset?: number; sortBy?: ListSortBy },
   ): Promise<{ data: ObjectInfo[] | null; error: BasinError | null }> {
-    return {
-      data: null,
-      error: new BasinError("not_implemented", STORAGE_NOT_IMPLEMENTED_MESSAGE),
-    };
+    const url = `${this.#deps.url}/object/list/${encodeURIComponent(this.#bucket)}`;
+
+    const body: Record<string, unknown> = { prefix: prefix ?? "" };
+    if (opts?.limit !== undefined) body.limit = opts.limit;
+    if (opts?.offset !== undefined) body.offset = opts.offset;
+    if (opts?.sortBy !== undefined) body.sortBy = opts.sortBy;
+
+    let res: Response;
+    try {
+      res = await this.#deps.fetch(url, {
+        method: "POST",
+        headers: this.#headers({ "Content-Type": "application/json" }),
+        body: JSON.stringify(body),
+      });
+    } catch (e) {
+      return {
+        data: null,
+        error: new BasinError(
+          "network",
+          e instanceof Error ? e.message : "network error during list",
+        ),
+      };
+    }
+
+    if (!res.ok) {
+      let details: unknown;
+      try {
+        details = await res.json();
+      } catch {
+        /* ignore */
+      }
+      return { data: null, error: this.#httpError(res.status, details) };
+    }
+
+    let items: unknown;
+    try {
+      items = await res.json();
+    } catch {
+      return {
+        data: null,
+        error: new BasinError(
+          "internal",
+          "storage.list response was not JSON",
+          res.status,
+        ),
+      };
+    }
+
+    return { data: (Array.isArray(items) ? items : []) as ObjectInfo[], error: null };
   }
 
   /**
    * Remove objects in bulk.
    *
-   * Returns `BasinError("not_implemented")` today — basin-engine has
-   * no `/object/remove` route. Lands in basin v0.2+.
+   * DELETE `/storage/v1/object/${bucket}` with `{prefixes: paths}`.
    */
   async remove(
-    _paths: string[],
+    paths: string[],
   ): Promise<{ data: { paths: string[] } | null; error: BasinError | null }> {
-    return {
-      data: null,
-      error: new BasinError("not_implemented", STORAGE_NOT_IMPLEMENTED_MESSAGE),
-    };
+    const url = `${this.#deps.url}/object/${encodeURIComponent(this.#bucket)}`;
+
+    let res: Response;
+    try {
+      res = await this.#deps.fetch(url, {
+        method: "DELETE",
+        headers: this.#headers({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ prefixes: paths }),
+      });
+    } catch (e) {
+      return {
+        data: null,
+        error: new BasinError(
+          "network",
+          e instanceof Error ? e.message : "network error during remove",
+        ),
+      };
+    }
+
+    if (!res.ok) {
+      let details: unknown;
+      try {
+        details = await res.json();
+      } catch {
+        /* ignore */
+      }
+      return { data: null, error: this.#httpError(res.status, details) };
+    }
+
+    return { data: { paths }, error: null };
   }
 
   /**
    * Mint a short-lived signed URL for `{bucket}/{path}`.
    *
-   * Returns `BasinError("not_implemented")` today — basin-engine has
-   * no `/object/sign/*` route. Lands in basin v0.2+.
+   * POST `/storage/v1/object/sign/${bucket}/${path}` with `{expiresIn}`.
+   * Returns `{ signedUrl: string, expiresAt?: string }`.
+   *
+   * Returns `invalid_request` immediately for negative `expiresIn`
+   * (before any fetch).
    */
   async createSignedUrl(
-    _path: string,
-    _expiresIn: number,
-  ): Promise<{ data: { signedUrl: string } | null; error: BasinError | null }> {
+    path: string,
+    expiresIn: number,
+  ): Promise<{ data: { signedUrl: string; expiresAt?: string } | null; error: BasinError | null }> {
+    if (expiresIn < 0) {
+      return {
+        data: null,
+        error: new BasinError(
+          "invalid_request",
+          "expiresIn must be a non-negative number of seconds",
+        ),
+      };
+    }
+
+    const url = `${this.#deps.url}/object/sign/${encodeURIComponent(this.#bucket)}/${encodePathSegments(path)}`;
+
+    let res: Response;
+    try {
+      res = await this.#deps.fetch(url, {
+        method: "POST",
+        headers: this.#headers({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ expiresIn }),
+      });
+    } catch (e) {
+      return {
+        data: null,
+        error: new BasinError(
+          "network",
+          e instanceof Error ? e.message : "network error during createSignedUrl",
+        ),
+      };
+    }
+
+    if (!res.ok) {
+      let details: unknown;
+      try {
+        details = await res.json();
+      } catch {
+        /* ignore */
+      }
+      return { data: null, error: this.#httpError(res.status, details) };
+    }
+
+    let body: unknown;
+    try {
+      body = await res.json();
+    } catch {
+      return {
+        data: null,
+        error: new BasinError(
+          "internal",
+          "storage.createSignedUrl response was not JSON",
+          res.status,
+        ),
+      };
+    }
+
+    const result = body as { signedUrl?: string; signedURL?: string; expiresAt?: string };
+    // Resolve relative signedUrl against storageUrl
+    const rawUrl = result.signedUrl ?? result.signedURL ?? "";
+    let signedUrl = rawUrl;
+    if (rawUrl && !rawUrl.startsWith("http")) {
+      const base = this.#deps.url.replace(/\/storage\/v1$/, "");
+      signedUrl = `${base}${rawUrl.startsWith("/") ? "" : "/"}${rawUrl}`;
+    }
+
     return {
-      data: null,
-      error: new BasinError("not_implemented", STORAGE_NOT_IMPLEMENTED_MESSAGE),
+      data: { signedUrl, ...(result.expiresAt ? { expiresAt: result.expiresAt } : {}) },
+      error: null,
     };
   }
 
@@ -157,10 +381,7 @@ export class StorageBucket {
    * valid for public buckets — for private buckets the URL will 401.
    *
    * No network call — pure URL composition so it stays callable
-   * inside render-time React/Vue templates. The URL won't actually
-   * resolve until basin-engine ships the storage surface in v0.2+;
-   * the construction is kept so consumer code that interpolates it
-   * into `<img src>` etc. compiles today.
+   * inside render-time React/Vue templates.
    */
   getPublicUrl(path: string): { data: { publicUrl: string } } {
     return {
@@ -173,8 +394,8 @@ export class StorageBucket {
   /**
    * Multipart upload for files > 5 MB.
    *
-   * Returns `BasinError("not_implemented")` today — basin-engine has
-   * no presigned-multipart surface. Lands in basin v0.2+.
+   * Returns `BasinError("not_implemented")` — basin-engine has
+   * no presigned-multipart surface. Lands in basin v0.3+.
    */
   async uploadMultipart(
     _path: string,
@@ -198,8 +419,8 @@ export class StorageBucket {
   /**
    * Resumable upload via TUS (tus.io).
    *
-   * Returns `BasinError("not_implemented")` today — basin-engine has
-   * no TUS proxy surface. Lands in basin v0.2+.
+   * Returns `BasinError("not_implemented")` — basin-engine has
+   * no TUS proxy surface. Lands in basin v0.3+.
    */
   async uploadResumable(
     _path: string,
@@ -220,12 +441,12 @@ export class StorageBucket {
     };
   }
 
-  // ─── Internal ──────────────────────────────────────────────────────
+  // ─── Static ────────────────────────────────────────────────────────
 
   /**
-   * `MULTIPART_THRESHOLD` is exposed as a static-ish constant for
-   * consumer code that wants to branch on `.upload` vs
-   * `.uploadMultipart` without hard-coding 5_242_880.
+   * `MULTIPART_THRESHOLD` is exposed as a static constant for consumer
+   * code that wants to branch on `.upload` vs `.uploadMultipart`
+   * without hard-coding 5_242_880.
    */
   static MULTIPART_THRESHOLD = MULTIPART_THRESHOLD;
 }
