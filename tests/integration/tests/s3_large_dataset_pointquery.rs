@@ -172,6 +172,7 @@ async fn s3_large_dataset_pointquery() {
             size_bytes: df.size_bytes,
             row_count: df.row_count,
             column_stats: df.column_stats.clone(),
+            bloom_filters: ::std::collections::BTreeMap::new(),
             hll_sketches: ::std::collections::BTreeMap::new(),
             tdigest_sketches: ::std::collections::BTreeMap::new(),
         });

@@ -156,6 +156,7 @@ async fn measure_basin_ms(files: usize) -> f64 {
             size_bytes: f.size_bytes,
             row_count: f.row_count,
             column_stats: f.column_stats.clone(),
+            bloom_filters: ::std::collections::BTreeMap::new(),
             hll_sketches: ::std::collections::BTreeMap::new(),
             tdigest_sketches: ::std::collections::BTreeMap::new(),
         });
