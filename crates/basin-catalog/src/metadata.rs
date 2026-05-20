@@ -463,6 +463,16 @@ pub struct TableMetadata {
     /// the threshold is met.  When `None` (the default, back-compat) or
     /// `Some(false)`, user-declared `CLUSTER BY` always wins.
     pub adaptive_sort_override: Option<bool>,
+    /// Phase 6 refcount GC: data-file paths collected at `rollback_to_snapshot`
+    /// time that were written by now-discarded snapshots.  These paths no longer
+    /// appear in any snapshot record (those records were pruned by the rollback)
+    /// but they are still candidates for physical deletion — they become orphaned
+    /// if no other table (e.g. a fork) holds a live reference to them.
+    ///
+    /// The `gc_orphaned_files` sweep includes this list in the "universe" it
+    /// checks against the cross-table live set.  Empty by default (back-compat:
+    /// pre-GC catalog rows simply have no accumulated orphan list).
+    pub gc_orphan_paths: Vec<String>,
 }
 
 impl TableMetadata {

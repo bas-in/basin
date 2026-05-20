@@ -1076,6 +1076,40 @@ same `object_store` the engine uses; signed URLs are HMAC over
 > (resize/optimize — post-v1, possibly a WASM UDF). Per ADR 0021's
 > OSS/cloud split.
 
+## Phase 5.18 — System-schema namespacing — ADR 0022
+
+Make the system namespaces real reserved schemas; user-defined schemas stay
+flat-aliased to `public` (projects own tenancy). See
+[ADR 0022](./docs/decisions/0022-system-schema-namespacing.md). Sequencing:
+**A → B**, **A → C**, **D after A**, **E last**. 5.18.A must run SOLO in
+basin-catalog (no other catalog agent concurrent).
+
+- [ ] **5.18.A — Catalog `(schema, table)` keying for reserved schemas.** Add a
+      `schema` dimension to catalog object identity for the closed reserved set
+      (`public` auth storage cron net realtime pg_catalog information_schema);
+      `public` is default; unqualified + `public.` resolve identically to today.
+      InMemory + Postgres impls + round-trip tests. **Foundation — blocks B/C/D/E.**
+      Files: `crates/basin-catalog/src/**`.
+- [ ] **5.18.B — Real `search_path` + qualified-name resolution.** Replace the
+      cosmetic shim in `crates/basin-engine/src/schema_ddl.rs`: resolver walks
+      `search_path` (default `public`, `pg_catalog` implicitly first); qualified
+      reserved-schema names bind directly; user schemas alias to `public`.
+      Depends on 5.18.A.
+- [ ] **5.18.C — Migrate system namespaces off prefix hacks.** auth
+      (`basin_auth_*` → `auth.*`), net (`_net_http_response` → `net.*`), cron
+      (`cron.job` real), storage (formalize `storage.*`). Back-compat read/alias
+      path + migration test per subsystem; MUST NOT regress existing
+      auth/storage/cron/net suites. Depends on 5.18.A. Files: `crates/basin-auth`,
+      `crates/basin-net`, `crates/basin-cron`, `crates/basin-blob`.
+- [ ] **5.18.D — Honest introspection.** `information_schema.schemata` +
+      `.tables.table_schema`, `pg_catalog.pg_namespace` + `pg_class.relnamespace`
+      report real reserved-schema membership (extend Phase 5.11.M views).
+      Depends on 5.18.A.
+- [ ] **5.18.E — Differential + tooling test.** PG tooling
+      (pgAdmin/Prisma/PostgREST) sees `auth.users` / `storage.objects` in the
+      right schema; RLS-on-`storage.objects` still scopes; user `CREATE SCHEMA x`
+      + `x.t` aliases to `public.t` (documented). Depends on A–D.
+
 ## Phase 5.12 — Storage perf & Vortex (PR #161 / #162) — **shipped**
 
 See [ADR 0015](./docs/decisions/0015-vortex-storage-format.md). Vortex
@@ -1688,19 +1722,24 @@ compaction; `window_partition_sum` + `lag_lead_window` drop their
 - [~] Point-in-time restore via Iceberg snapshots — v0.1 catalog-level
       `Catalog::rollback_to_snapshot(project, table, snapshot_id)` ships
       (InMemory + Postgres impls; truncates history to ≤ target,
-      rewinds head pointer). v0.2 follow-up: physical file GC of
-      orphaned post-rollback Parquet files (today the OLTP listing-based
-      reader still sees them until a compactor sweep). Reads on
-      APPEND-only history work after rollback once orphans are removed;
-      crossing UPDATE/DELETE commits is unrecoverable in v0.1 because
-      replaced files are physically deleted at commit (soft-delete is
-      a v0.2 prerequisite for cross-DML rollback).
+      rewinds head pointer). **Physical GC now shipped** via
+      `Catalog::gc_orphaned_files(project, table)`: rollback accumulates
+      discarded-snapshot paths in `TableState::gc_orphan_paths`; GC sweep
+      cross-references the project-wide live set (respecting forks) and
+      returns only paths with refcount 0 as orphaned. Verified by
+      `tests/integration/tests/pitr_fork_gc.rs`. Remaining gap: soft-delete
+      of replaced files (cross-DML rollback), which is a v0.2 prerequisite.
 - [~] Branching / forking via copy-on-write catalog metadata — v0.1
       catalog-level `Catalog::fork_table(project, src, dst)` ships
       (InMemory + Postgres impls). New table inherits source's schema /
       snapshot history / partition spec / RLS / tier / bloom / row-group
       / CV settings; data files are *shared by reference* (no Parquet
-      copy). v0.2: cross-project forking (needs refcount-aware GC).
+      copy). **Cross-project fork safety now shipped**: `gc_orphaned_files`
+      uses the project-wide live set (union of all tables' `live_data_files`)
+      so a path shared between source and fork is never reported as orphaned
+      while the fork holds a reference; `file_refcount(project, path)` returns
+      the exact count. Integration test `pitr_fork_gc.rs` covers rollback →
+      GC, fork-share safety, and cross-project isolation.
 - [x] Migration Manager v0.2 catalog ops shipped (project-wide list /
       diff / rollback; default fan-out + Postgres single-query
       optimisation).

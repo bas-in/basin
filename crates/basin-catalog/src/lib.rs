@@ -64,6 +64,24 @@ pub use reactors::{ReactorDef, ReactorError, ReactorOps};
 pub use rest::RestCatalog;
 pub use sequences::SequenceDef;
 pub use snapshot::{Snapshot, SnapshotId, SnapshotOperation, SnapshotSummary};
+
+/// Result of a [`Catalog::gc_orphaned_files`] call.
+///
+/// `orphaned_paths` lists every data-file path that had refcount 0 after the
+/// GC sweep — i.e. paths that appear in the catalog's recorded history but are
+/// not referenced by any live snapshot of any table in the project. These are
+/// safe to physically delete from object storage.
+///
+/// `live_paths` is the complementary set: paths still referenced by at least
+/// one live snapshot (or by a forked table that shares the file).  Callers
+/// must NOT delete these.
+#[derive(Clone, Debug, Default)]
+pub struct GcReport {
+    /// Paths with refcount 0 — physically deletable.
+    pub orphaned_paths: Vec<String>,
+    /// Paths still referenced by ≥ 1 live snapshot — must be kept.
+    pub live_paths: Vec<String>,
+}
 pub use views::ViewDef;
 
 /// One row in the project-wide snapshot timeline returned by
@@ -1593,5 +1611,139 @@ pub trait Catalog: Send + Sync {
     async fn list_inbound_webhooks(&self, project: &ProjectId) -> Vec<InboundWebhookDef> {
         let _ = project;
         Vec::new()
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 6 — Refcount-aware data-file GC
+    //
+    // A data-file path is "live" when it appears in the live file set of at
+    // least one table snapshot accessible from any table currently registered
+    // under `project`.  The live set is computed by [`TableMetadata::live_data_files`]
+    // for every table, then union-ed across all tables.  Because forked
+    // tables share file paths, a path shared between a source and its fork
+    // counts as refcount ≥ 2, and dropping the source does not make the path
+    // orphaned while the fork still references it.
+    //
+    // `gc_orphaned_files` scans the union of every path ever recorded in any
+    // snapshot of any table (the "known universe"), subtracts the live set,
+    // and returns the difference as `GcReport::orphaned_paths`.  Callers
+    // (the compactor, the PITR post-rollback hook) then physically delete
+    // those paths from object storage.
+    // -----------------------------------------------------------------------
+
+    /// Compute the reference count for `path` across all live snapshots of
+    /// all tables owned by `project`.  A path is referenced once per live
+    /// snapshot that contains it; a path shared between a source table and
+    /// a fork counts as referenced by each independently.  Returns 0 when the
+    /// path is not in any live file set — i.e. it is safe to physically
+    /// delete.
+    ///
+    /// Default impl iterates `list_tables` then `load_table` for each,
+    /// calling `TableMetadata::live_data_files`. O(tables × files) — fine
+    /// for the GC sweep cadence.
+    async fn file_refcount(&self, project: &ProjectId, path: &str) -> Result<usize> {
+        let tables = self.list_tables(project).await?;
+        let mut count: usize = 0;
+        for table in &tables {
+            match self.load_table(project, table).await {
+                Ok(meta) => {
+                    // Count how many live files in this table reference the path.
+                    // A single table can reference it at most once in its live set
+                    // (live_data_files deduplicates by path), but a shared path
+                    // between source and fork each appear once per table.
+                    let live = meta.live_data_files();
+                    if live.iter().any(|f| f.path == path) {
+                        count += 1;
+                    }
+                }
+                Err(basin_common::BasinError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(count)
+    }
+
+    /// Garbage-collect data files for `project` whose refcount has dropped to
+    /// zero.  Returns a [`GcReport`] listing orphaned paths (deletable) and
+    /// live paths (must be kept).  The caller is responsible for the actual
+    /// physical deletion — this method only inspects catalog state.
+    ///
+    /// The algorithm:
+    /// 1. Build the "known universe": every path ever recorded in any snapshot
+    ///    of any table (including `removed_paths` from Replace snapshots, which
+    ///    may have been physically deleted already — callers should use
+    ///    idempotent `DeleteObject` on S3/R2 so re-deleting is harmless).
+    /// 2. Build the "live set": union of `live_data_files()` across all tables.
+    ///    A path in a fork and its source counts once per table, but for GC
+    ///    purposes what matters is whether the path is in *any* live set —
+    ///    if yes, it must be kept.
+    /// 3. `orphaned = universe \ live` — these are catalog-orphans with refcount 0.
+    ///
+    /// Typical callers:
+    /// * Post-`rollback_to_snapshot`: call this to identify files written
+    ///   between the rollback target and the old head that are now invisible.
+    /// * Compactor periodic sweep: finds files from Replace commits that are
+    ///   no longer in any live snapshot.
+    ///
+    /// Default impl: single pass over `list_tables` + `load_table`.
+    async fn gc_orphaned_files(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+    ) -> Result<GcReport> {
+        let meta = self.load_table(project, table).await?;
+
+        // Universe: all paths ever recorded in this table's snapshot history
+        // (both added and removed), deduplicated.  Also include paths saved
+        // by prior `rollback_to_snapshot` calls — those snapshot records were
+        // pruned but the paths may still need physical deletion.
+        let mut universe: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for snap in &meta.snapshots {
+            for f in &snap.data_files {
+                universe.insert(f.path.clone());
+            }
+            for p in &snap.removed_paths {
+                universe.insert(p.clone());
+            }
+        }
+        for p in &meta.gc_orphan_paths {
+            universe.insert(p.clone());
+        }
+
+        // Live set across ALL tables in the project so cross-table fork
+        // references are respected: a path shared with a fork must not be
+        // treated as orphaned just because it was removed from this table.
+        let all_tables = self.list_tables(project).await?;
+        let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for t in &all_tables {
+            match self.load_table(project, t).await {
+                Ok(m) => {
+                    for f in m.live_data_files() {
+                        live.insert(f.path);
+                    }
+                }
+                Err(basin_common::BasinError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        let mut orphaned_paths: Vec<String> = universe
+            .iter()
+            .filter(|p| !live.contains(*p))
+            .cloned()
+            .collect();
+        orphaned_paths.sort();
+
+        let mut live_paths: Vec<String> = universe
+            .iter()
+            .filter(|p| live.contains(*p))
+            .cloned()
+            .collect();
+        live_paths.sort();
+
+        Ok(GcReport {
+            orphaned_paths,
+            live_paths,
+        })
     }
 }

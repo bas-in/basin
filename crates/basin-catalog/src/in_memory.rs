@@ -57,6 +57,13 @@ struct TableState {
     unique_constraints: Vec<UniqueConstraint>,
     global_sort_order: Option<Vec<String>>,
     adaptive_sort_override: Option<bool>,
+    /// Paths collected by `rollback_to_snapshot` that were written by
+    /// now-discarded snapshots.  These are catalog-orphans: they do not
+    /// appear in any live snapshot but were once recorded in the table's
+    /// history.  The GC sweep includes this list in the "universe" so
+    /// `gc_orphaned_files` can identify them as physically deletable even
+    /// though the snapshot records that added them have been pruned.
+    gc_orphan_paths: Vec<String>,
 }
 
 impl TableState {
@@ -99,6 +106,7 @@ impl TableState {
             unique_constraints: Vec::new(),
             global_sort_order: None,
             adaptive_sort_override: None,
+            gc_orphan_paths: Vec::new(),
         }
     }
 }
@@ -266,6 +274,7 @@ impl InMemoryCatalog {
             unique_constraints: state.unique_constraints.clone(),
             global_sort_order: state.global_sort_order.clone(),
             adaptive_sort_override: state.adaptive_sort_override,
+            gc_orphan_paths: state.gc_orphan_paths.clone(),
         }
     }
 }
@@ -1234,6 +1243,110 @@ impl Catalog for InMemoryCatalog {
     }
 
     // -----------------------------------------------------------------------
+    // Phase 6: refcount-aware GC — InMemoryCatalog optimised override.
+    //
+    // Instead of N list_tables + load_table round-trips (the default-impl
+    // path), we snapshot the per-table Arc handles in one map-lock pass,
+    // then read each table's snapshots directly.  This stays entirely in
+    // memory without any per-table mutex round-trip overhead.
+    // -----------------------------------------------------------------------
+
+    async fn gc_orphaned_files(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+    ) -> basin_common::Result<crate::GcReport> {
+        use std::collections::HashSet;
+
+        // Snapshot all per-table Arc handles for this project in one pass.
+        let handles: Vec<(QualifiedTableName, std::sync::Arc<tokio::sync::Mutex<TableState>>)> = {
+            let tables = self.tables.lock().await;
+            tables
+                .iter()
+                .filter(|((p, _), _)| p == project)
+                .map(|((_, qt), arc)| (qt.clone(), arc.clone()))
+                .collect()
+        };
+
+        // Identify the target table handle (for its universe).
+        let target_qtable = QualifiedTableName::in_public(table.clone());
+        let target_arc = handles
+            .iter()
+            .find(|(qt, _)| qt == &target_qtable)
+            .map(|(_, arc)| arc.clone())
+            .ok_or_else(|| BasinError::not_found(format!("{project}/{table}")))?;
+
+        // Build the universe: every path ever recorded in the target table's
+        // snapshot history (added files + removed_paths from Replace commits),
+        // PLUS paths saved in `gc_orphan_paths` by prior `rollback_to_snapshot`
+        // calls (those snapshot records were pruned but the paths are still
+        // candidates for physical deletion).
+        let universe: HashSet<String> = {
+            let guard = target_arc.lock().await;
+            let mut u = HashSet::new();
+            for snap in &guard.snapshots {
+                for f in &snap.data_files {
+                    u.insert(f.path.clone());
+                }
+                for p in &snap.removed_paths {
+                    u.insert(p.clone());
+                }
+            }
+            // Include rollback-orphaned paths collected at rollback time.
+            for p in &guard.gc_orphan_paths {
+                u.insert(p.clone());
+            }
+            u
+        };
+
+        // Build the live set across ALL tables in the project.
+        // live_data_files() replays the snapshot chain; a path shared by a
+        // fork and its source appears once per table here — but for the GC
+        // decision we only need to know "is it in ANY live set?".
+        let mut live: HashSet<String> = HashSet::new();
+        for (_, arc) in &handles {
+            let guard = arc.lock().await;
+            // Compute live_data_files inline: replay snapshots in id order.
+            let mut ordered: Vec<&crate::snapshot::Snapshot> = guard.snapshots.iter().collect();
+            ordered.sort_by_key(|s| s.id);
+            let mut live_map: std::collections::HashMap<String, ()> = std::collections::HashMap::new();
+            for snap in ordered {
+                if snap.id > guard.current {
+                    break;
+                }
+                for p in &snap.removed_paths {
+                    live_map.remove(p);
+                }
+                for f in &snap.data_files {
+                    live_map.insert(f.path.clone(), ());
+                }
+            }
+            for path in live_map.into_keys() {
+                live.insert(path);
+            }
+        }
+
+        let mut orphaned_paths: Vec<String> = universe
+            .iter()
+            .filter(|p| !live.contains(*p))
+            .cloned()
+            .collect();
+        orphaned_paths.sort();
+
+        let mut live_paths: Vec<String> = universe
+            .iter()
+            .filter(|p| live.contains(*p))
+            .cloned()
+            .collect();
+        live_paths.sort();
+
+        Ok(crate::GcReport {
+            orphaned_paths,
+            live_paths,
+        })
+    }
+
+    // -----------------------------------------------------------------------
     // Phase A.2 overrides: schema-qualified operations
     //
     // InMemoryCatalog provides real multi-schema semantics. All `*_qualified`
@@ -1463,6 +1576,10 @@ impl Catalog for InMemoryCatalog {
                 unique_constraints: s.unique_constraints.clone(),
                 global_sort_order: s.global_sort_order.clone(),
                 adaptive_sort_override: s.adaptive_sort_override,
+                // The fork starts with a clean GC orphan list: any paths
+                // that were orphaned in the source before this fork are the
+                // source's problem, not the fork's.
+                gc_orphan_paths: Vec::new(),
             }
         };
 
@@ -1495,6 +1612,22 @@ impl Catalog for InMemoryCatalog {
                 "{project}/{qtable}: snapshot {snapshot_id} not in history",
             )));
         }
+
+        // Collect the paths added by snapshots being discarded (id >
+        // snapshot_id) into the persistent orphan list.  This preserves GC
+        // visibility after the snapshot records are pruned: `gc_orphaned_files`
+        // will find these paths in `gc_orphan_paths` and check whether any
+        // other table still has a live reference to them.
+        let discarded_paths: Vec<String> = state
+            .snapshots
+            .iter()
+            .filter(|s| s.id > snapshot_id)
+            .flat_map(|s| s.data_files.iter().map(|f| f.path.clone()))
+            .collect();
+        state.gc_orphan_paths.extend(discarded_paths);
+        // Deduplicate — multiple rollbacks can accumulate the same path.
+        state.gc_orphan_paths.sort();
+        state.gc_orphan_paths.dedup();
 
         state.snapshots.retain(|s| s.id <= snapshot_id);
         state.current = snapshot_id;
@@ -3217,5 +3350,273 @@ mod tests {
             cat.load_table(&p, &tbl).await.unwrap_err(),
             BasinError::NotFound(_)
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 6: refcount-aware GC tests
+    // -----------------------------------------------------------------------
+
+    /// After a PITR rollback, files written by the discarded snapshots have
+    /// refcount 0 and must appear in `gc_orphaned_files` → `orphaned_paths`.
+    /// Files referenced by the surviving snapshots must appear in `live_paths`.
+    #[tokio::test]
+    async fn gc_after_rollback_orphans_discarded_files() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+        let tbl = TableName::new("gc_pitr").unwrap();
+        cat.create_table(&p, &tbl, &schema()).await.unwrap();
+
+        // Snapshot 1: file "a.parquet"
+        cat.append_data_files(
+            &p,
+            &tbl,
+            SnapshotId::GENESIS,
+            vec![file("a.parquet", 10, 100)],
+        )
+        .await
+        .unwrap();
+        // Snapshot 2: file "b.parquet"
+        cat.append_data_files(&p, &tbl, SnapshotId(1), vec![file("b.parquet", 20, 200)])
+            .await
+            .unwrap();
+        // Snapshot 3: file "c.parquet"
+        cat.append_data_files(&p, &tbl, SnapshotId(2), vec![file("c.parquet", 30, 300)])
+            .await
+            .unwrap();
+
+        // Rollback to snapshot 1 — snapshots 2 and 3 are pruned from history.
+        cat.rollback_to_snapshot(&p, &tbl, SnapshotId(1))
+            .await
+            .unwrap();
+
+        // GC: "b.parquet" and "c.parquet" are orphans; "a.parquet" is live.
+        let report = cat.gc_orphaned_files(&p, &tbl).await.unwrap();
+        assert!(
+            report.orphaned_paths.contains(&"b.parquet".to_string()),
+            "b.parquet should be orphaned: {:?}",
+            report.orphaned_paths
+        );
+        assert!(
+            report.orphaned_paths.contains(&"c.parquet".to_string()),
+            "c.parquet should be orphaned: {:?}",
+            report.orphaned_paths
+        );
+        assert!(
+            report.live_paths.contains(&"a.parquet".to_string()),
+            "a.parquet should be live: {:?}",
+            report.live_paths
+        );
+        assert!(
+            !report.orphaned_paths.contains(&"a.parquet".to_string()),
+            "a.parquet must NOT be orphaned: {:?}",
+            report.orphaned_paths
+        );
+    }
+
+    /// A file referenced by the live snapshot must never appear as an orphan,
+    /// even on a freshly-written table.
+    #[tokio::test]
+    async fn gc_no_orphans_on_live_table() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+        let tbl = TableName::new("gc_live").unwrap();
+        cat.create_table(&p, &tbl, &schema()).await.unwrap();
+        cat.append_data_files(
+            &p,
+            &tbl,
+            SnapshotId::GENESIS,
+            vec![file("x.parquet", 5, 50)],
+        )
+        .await
+        .unwrap();
+
+        let report = cat.gc_orphaned_files(&p, &tbl).await.unwrap();
+        assert!(
+            report.orphaned_paths.is_empty(),
+            "no orphans expected on live table: {:?}",
+            report.orphaned_paths
+        );
+        assert!(report.live_paths.contains(&"x.parquet".to_string()));
+    }
+
+    /// Forked table shares files with source.  Dropping the source table from
+    /// the catalog (simulated by rollback of source to GENESIS so shared files
+    /// drop out of source's live set) must NOT orphan files the fork still
+    /// references.
+    #[tokio::test]
+    async fn gc_fork_protects_shared_files() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+        let src = TableName::new("gc_src").unwrap();
+        let dst = TableName::new("gc_dst").unwrap();
+        cat.create_table(&p, &src, &schema()).await.unwrap();
+
+        // Two appends into source.
+        cat.append_data_files(
+            &p,
+            &src,
+            SnapshotId::GENESIS,
+            vec![file("shared_a.parquet", 10, 100)],
+        )
+        .await
+        .unwrap();
+        cat.append_data_files(
+            &p,
+            &src,
+            SnapshotId(1),
+            vec![file("shared_b.parquet", 20, 200)],
+        )
+        .await
+        .unwrap();
+
+        // Fork: dst inherits the same shared_a and shared_b.
+        cat.fork_table(&p, &src, &dst).await.unwrap();
+
+        // Rollback source all the way to GENESIS — shared files drop from
+        // source's live set.
+        cat.rollback_to_snapshot(&p, &src, SnapshotId::GENESIS)
+            .await
+            .unwrap();
+
+        // GC on source: shared_a and shared_b should NOT be orphaned because
+        // the fork (dst) still references them in its live set.
+        let report = cat.gc_orphaned_files(&p, &src).await.unwrap();
+        assert!(
+            !report.orphaned_paths.contains(&"shared_a.parquet".to_string()),
+            "shared_a.parquet must not be orphaned while fork exists: {:?}",
+            report.orphaned_paths
+        );
+        assert!(
+            !report.orphaned_paths.contains(&"shared_b.parquet".to_string()),
+            "shared_b.parquet must not be orphaned while fork exists: {:?}",
+            report.orphaned_paths
+        );
+    }
+
+    /// Cross-project fork safety: files in project B's table are not visible
+    /// to project A's GC sweep — the refcount only counts references within
+    /// the same project.
+    #[tokio::test]
+    async fn gc_cross_project_isolation() {
+        let cat = InMemoryCatalog::new();
+        let proj_a = ProjectId::new();
+        let proj_b = ProjectId::new();
+        let tbl_a = TableName::new("gc_iso_a").unwrap();
+        let tbl_b = TableName::new("gc_iso_b").unwrap();
+
+        cat.create_table(&proj_a, &tbl_a, &schema()).await.unwrap();
+        cat.create_table(&proj_b, &tbl_b, &schema()).await.unwrap();
+
+        // Both projects write a file with the same logical path name.
+        cat.append_data_files(
+            &proj_a,
+            &tbl_a,
+            SnapshotId::GENESIS,
+            vec![file("shared_name.parquet", 10, 100)],
+        )
+        .await
+        .unwrap();
+        cat.append_data_files(
+            &proj_b,
+            &tbl_b,
+            SnapshotId::GENESIS,
+            vec![file("shared_name.parquet", 10, 100)],
+        )
+        .await
+        .unwrap();
+
+        // Rollback project A to GENESIS — file becomes orphaned for proj_a.
+        cat.rollback_to_snapshot(&proj_a, &tbl_a, SnapshotId::GENESIS)
+            .await
+            .unwrap();
+
+        // GC for project A must see the path as orphaned — even though
+        // project B has a live reference to the same path name.  Projects
+        // are isolated; cross-project liveness is not a concern.
+        let report_a = cat.gc_orphaned_files(&proj_a, &tbl_a).await.unwrap();
+        assert!(
+            report_a
+                .orphaned_paths
+                .contains(&"shared_name.parquet".to_string()),
+            "project A: path should be orphaned after rollback: {:?}",
+            report_a.orphaned_paths
+        );
+
+        // GC for project B must still see the path as live.
+        let report_b = cat.gc_orphaned_files(&proj_b, &tbl_b).await.unwrap();
+        assert!(
+            report_b
+                .live_paths
+                .contains(&"shared_name.parquet".to_string()),
+            "project B: path should still be live: {:?}",
+            report_b.live_paths
+        );
+    }
+
+    /// `file_refcount` returns 0 for a path that is not in any live snapshot,
+    /// and ≥ 1 for a live path.  A path shared between two tables (source and
+    /// fork) has refcount 2 — once per table.
+    #[tokio::test]
+    async fn file_refcount_after_rollback_and_fork() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+        let src = TableName::new("rc_src").unwrap();
+        let dst = TableName::new("rc_dst").unwrap();
+        cat.create_table(&p, &src, &schema()).await.unwrap();
+
+        cat.append_data_files(
+            &p,
+            &src,
+            SnapshotId::GENESIS,
+            vec![file("rc_shared.parquet", 10, 100)],
+        )
+        .await
+        .unwrap();
+        cat.append_data_files(
+            &p,
+            &src,
+            SnapshotId(1),
+            vec![file("rc_only_src.parquet", 5, 50)],
+        )
+        .await
+        .unwrap();
+
+        // Fork: dst sees both files.
+        cat.fork_table(&p, &src, &dst).await.unwrap();
+
+        // rc_shared is in both src and dst live sets → refcount 2.
+        let rc = cat.file_refcount(&p, "rc_shared.parquet").await.unwrap();
+        assert_eq!(rc, 2, "shared file should have refcount 2 (src + dst)");
+
+        // rc_only_src is also in both live sets → 2.
+        let rc2 = cat
+            .file_refcount(&p, "rc_only_src.parquet")
+            .await
+            .unwrap();
+        assert_eq!(rc2, 2, "src-only file shared via fork → refcount 2");
+
+        // Rollback source to GENESIS — rc_only_src drops from src's live set
+        // but dst still has it.
+        cat.rollback_to_snapshot(&p, &src, SnapshotId::GENESIS)
+            .await
+            .unwrap();
+
+        // rc_only_src now only in dst → refcount 1.
+        let rc3 = cat
+            .file_refcount(&p, "rc_only_src.parquet")
+            .await
+            .unwrap();
+        assert_eq!(
+            rc3, 1,
+            "after rollback, rc_only_src only in dst → refcount 1"
+        );
+
+        // Drop the fork table entirely — rc_only_src now has refcount 0.
+        cat.drop_table(&p, &dst).await.unwrap();
+        let rc4 = cat
+            .file_refcount(&p, "rc_only_src.parquet")
+            .await
+            .unwrap();
+        assert_eq!(rc4, 0, "after fork drop, rc_only_src has refcount 0");
     }
 }

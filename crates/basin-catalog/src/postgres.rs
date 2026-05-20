@@ -671,6 +671,7 @@ impl Catalog for PostgresCatalog {
             unique_constraints: Vec::new(),
             global_sort_order: None,
             adaptive_sort_override: None,
+            gc_orphan_paths: Vec::new(),
         })
     }
 
@@ -819,6 +820,7 @@ impl Catalog for PostgresCatalog {
             unique_constraints,
             global_sort_order: None,
             adaptive_sort_override: None,
+            gc_orphan_paths: Vec::new(),
         })
     }
 
@@ -3303,6 +3305,7 @@ impl Catalog for PostgresCatalog {
             unique_constraints: Vec::new(),
             global_sort_order: None,
             adaptive_sort_override: None,
+            gc_orphan_paths: Vec::new(),
         })
     }
 
@@ -3455,6 +3458,7 @@ impl Catalog for PostgresCatalog {
             unique_constraints,
             global_sort_order: None,
             adaptive_sort_override: None,
+            gc_orphan_paths: Vec::new(),
         })
     }
 
