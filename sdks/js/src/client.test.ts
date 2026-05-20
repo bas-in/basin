@@ -21,17 +21,23 @@ describe("createClient", () => {
     ).not.toThrow();
   });
 
-  it("returns `{ data: null, error: BasinError }` for not-yet-implemented surfaces (functions.invoke)", async () => {
+  it("functions.invoke posts to /rest/v1/rpc and returns the parsed result", async () => {
+    let calledUrl = "";
     const basin = createClient("https://api.basin.run", "anon", {
-      fetch: async () => new Response("{}", { status: 200 }),
+      fetch: async (input: RequestInfo | URL) => {
+        calledUrl = typeof input === "string" ? input : input.toString();
+        return new Response("7", {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
     });
-    // functions.invoke is the canonical Tier-5 placeholder.
-    const { data, error } = await basin.functions.invoke("hello", {
-      body: { name: "pc" },
+    const { data, error } = await basin.functions.invoke("add", {
+      body: { x: 3, y: 4 },
     });
-    expect(data).toBeNull();
-    expect(error).toBeInstanceOf(BasinError);
-    expect(error?.code).toBe("not_implemented");
+    expect(error).toBeNull();
+    expect(data).toBe(7);
+    expect(calledUrl).toContain("/rest/v1/rpc/add");
   });
 
   it("exposes realtime + functions namespaces on the client", () => {
@@ -39,8 +45,11 @@ describe("createClient", () => {
     expect(basin).toHaveProperty("realtime");
     expect(basin).toHaveProperty("functions");
     expect(typeof basin.channel).toBe("function");
+    // functions.invoke went live with T-026 (POST /rest/v1/rpc/:fn).
+    expect(basin.functions.enabled).toBe(true);
+    // realtime channel API (T-030) is not wired yet; transports (SSE/WS)
+    // exist but the channel() router still reports disabled until T-030.
     expect(basin.realtime.enabled).toBe(false);
-    expect(basin.functions.enabled).toBe(false);
   });
 
   it("query-builder chains compose without throwing", () => {
