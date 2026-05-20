@@ -1002,15 +1002,15 @@ same `object_store` the engine uses; signed URLs are HMAC over
 
 #### 5.17.A — Data model + crate skeleton (~1 week)
 
-- [ ] New crate `crates/basin-blob/` (workspace member; `storage`
+- [x] New crate `crates/basin-blob/` (workspace member; `storage`
       feature in `basin-server`).
-- [ ] `storage.buckets` (id, name, public, file_size_limit,
+- [x] `storage.buckets` (id, name, public, file_size_limit,
       allowed_mime_types[]) + `storage.objects` (id, bucket_id, path,
       size, mime_type, metadata jsonb, owner, created_at, updated_at,
       etag). Per-project, project-scoped.
-- [ ] Bytes path convention: `<project_prefix>/storage/<bucket>/<path>`
+- [x] Bytes path convention: `<project_prefix>/storage/<bucket>/<path>`
       in `object_store`. No second backend.
-- [ ] Acceptance: bucket + object rows round-trip through the catalog;
+- [x] Acceptance: bucket + object rows round-trip through the catalog;
       object_store write/read of a small blob works.
 
 #### 5.17.B — HTTP API in basin-rest (~1.5 weeks)

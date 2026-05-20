@@ -23,6 +23,7 @@ members = [
     "crates/basin-iceberg-rest",
     "crates/basin-sketch",
     "crates/basin-hottier",
+    "crates/basin-blob",
     "services/basin-server",
     "services/basinctl",
     "tests/integration",
@@ -63,6 +64,7 @@ basin-cv = { path = "crates/basin-cv" }
 basin-geo = { path = "crates/basin-geo" }
 basin-trgm = { path = "crates/basin-trgm" }
 basin-iceberg-rest = { path = "crates/basin-iceberg-rest" }
+basin-blob = { path = "crates/basin-blob" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -164,6 +166,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # std::DefaultHasher (unstable across Rust versions) and fnv1a-64
 # (too weak at cloud-scale).
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+# HMAC-SHA256 for signing OAuth state tokens (Phase 5.10.O).
+hmac = "0.12"
 # Test-config file parsing for tests/integration/src/test_config.rs.
 # Tiny, well-maintained, default features off to keep build minimal.
 toml = { version = "0.8", default-features = false, features = ["parse"] }
