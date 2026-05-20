@@ -624,17 +624,220 @@ mod tests {
         assert!(result.is_err(), "empty --multi should error");
     }
 
-    // ── WS integration stub ───────────────────────────────────────────────────
-    //
-    // Integration gap note: a full tungstenite-server-in-test would require
-    // spinning a real WebSocket server (doing the RFC-6455 handshake + frame
-    // exchange over a TcpListener). The frame-building and routing logic is
-    // covered by the unit tests above (ws_subscribed_ack_decrements_counter,
-    // ws_event_frame_compact_json, ws_lag_frame_returns_ok, etc.). The
-    // connect/subscribe/event end-to-end path is left as an integration gap
-    // to be covered by an external stub server test (e.g., with a real
-    // tungstenite server in a separate integration test binary) once the
-    // engine's WS endpoint is available for testing.
+    // ── WS end-to-end integration test ───────────────────────────────────────
+
+    /// Hermetic in-process WS server for --multi integration testing.
+    ///
+    /// Topology
+    /// --------
+    ///   main thread : calls ws_subscribe("orders,items") against 127.0.0.1:0
+    ///   server thread: does the tungstenite RFC-6455 handshake via accept(),
+    ///                  collects subscribe frames, sends subscribed acks,
+    ///                  sends two interleaved event frames (one per table),
+    ///                  sends one {"type":"error","code":"lag"} frame,
+    ///                  then closes.
+    ///
+    /// Assertions
+    /// ----------
+    ///   1. ws_subscribe returns Ok(())  – lag frame does not abort the stream.
+    ///   2. Server received exactly two subscribe frames, one per table.
+    ///   3. Each subscribe frame has the correct JSON shape.
+    ///   4. Protocol: client-sent frames arrive before any server message is
+    ///      consumed, so the server can echo them back for inspection.
+    #[test]
+    fn ws_multi_integration_scripted_server() {
+        use std::sync::mpsc;
+        use tungstenite::{accept, Message as WsMsg};
+
+        // --- bind an ephemeral port -----------------------------------------
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind WS stub");
+        let addr = listener.local_addr().expect("local addr");
+        let ws_url = format!("ws://{addr}/realtime/v1/ws/testproj");
+
+        // Channel: server → main: list of subscribe-frame payloads received.
+        let (tx, rx) = mpsc::channel::<Vec<String>>();
+
+        // --- server thread ---------------------------------------------------
+        std::thread::spawn(move || {
+            // Accept exactly one connection.
+            let stream = match listener.accept() {
+                Ok((s, _)) => s,
+                Err(_) => return,
+            };
+            // Perform the WebSocket handshake (server side).
+            let mut ws = match accept(stream) {
+                Ok(ws) => ws,
+                Err(_) => return,
+            };
+
+            // Collect subscribe frames until we have received two.
+            let mut received: Vec<String> = Vec::new();
+            while received.len() < 2 {
+                match ws.read() {
+                    Ok(WsMsg::Text(t)) => received.push(t.to_string()),
+                    Ok(WsMsg::Close(_)) | Err(_) => break,
+                    _ => {}
+                }
+            }
+
+            // Send subscribed acks (one per table).
+            for _ in 0..received.len() {
+                let _ = ws.send(WsMsg::Text(
+                    r#"{"type":"subscribed"}"#.to_string(),
+                ));
+            }
+
+            // Send two interleaved event frames (orders then items).
+            let evt_orders =
+                r#"{"type":"event","table":"orders","record":{"id":1,"amount":99}}"#;
+            let evt_items =
+                r#"{"type":"event","table":"items","record":{"id":42,"sku":"X1"}}"#;
+            let _ = ws.send(WsMsg::Text(evt_orders.to_string()));
+            let _ = ws.send(WsMsg::Text(evt_items.to_string()));
+
+            // Send the lag-error frame — client must NOT abort, must stay Ok.
+            let lag = r#"{"type":"error","code":"lag","message":"consumer behind"}"#;
+            let _ = ws.send(WsMsg::Text(lag.to_string()));
+
+            // Close cleanly.
+            let _ = ws.close(None);
+            // Flush any remaining frames so the client sees Close before EOF.
+            loop {
+                match ws.read() {
+                    Ok(WsMsg::Close(_)) | Err(_) => break,
+                    _ => {}
+                }
+            }
+
+            // Report received frames to the main thread.
+            let _ = tx.send(received);
+        });
+
+        // --- client (ws_subscribe) ------------------------------------------
+        let result = ws_subscribe(&ws_url, "test-token", &["orders", "items"], "");
+        assert!(
+            result.is_ok(),
+            "ws_subscribe must return Ok after lag frame + clean server close: {result:?}"
+        );
+
+        // --- collect server-side observations --------------------------------
+        let received = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("server thread did not report received frames in time");
+
+        // Two subscribe frames must have arrived.
+        assert_eq!(
+            received.len(),
+            2,
+            "expected 2 subscribe frames, server saw: {received:?}"
+        );
+
+        // Parse each frame and verify the JSON shape.
+        let parsed: Vec<serde_json::Value> = received
+            .iter()
+            .map(|s| serde_json::from_str(s).expect("subscribe frame must be valid JSON"))
+            .collect();
+
+        // Both frames must have type == "subscribe".
+        for (i, v) in parsed.iter().enumerate() {
+            assert_eq!(
+                v["type"], "subscribe",
+                "frame {i} missing type:subscribe — got {v}"
+            );
+        }
+
+        // The two table names must be exactly {"orders", "items"} (order agnostic).
+        let mut tables: Vec<&str> = parsed
+            .iter()
+            .map(|v| v["table"].as_str().expect("table field must be a string"))
+            .collect();
+        tables.sort_unstable();
+        assert_eq!(
+            tables,
+            vec!["items", "orders"],
+            "subscribe frames must cover exactly the requested tables"
+        );
+
+        // Neither frame should contain a filter key (we passed "").
+        for (i, v) in parsed.iter().enumerate() {
+            assert!(
+                v.get("filter").is_none(),
+                "frame {i} must not include a filter key when no filter was requested"
+            );
+        }
+    }
+
+    /// Same topology as ws_multi_integration_scripted_server but with a filter
+    /// expression — verifies the filter key is forwarded in every subscribe frame.
+    #[test]
+    fn ws_multi_integration_filter_forwarded() {
+        use std::sync::mpsc;
+        use tungstenite::{accept, Message as WsMsg};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind WS stub");
+        let addr = listener.local_addr().expect("local addr");
+        let ws_url = format!("ws://{addr}/realtime/v1/ws/testproj");
+
+        let (tx, rx) = mpsc::channel::<Vec<String>>();
+
+        std::thread::spawn(move || {
+            let stream = match listener.accept() {
+                Ok((s, _)) => s,
+                Err(_) => return,
+            };
+            let mut ws = match accept(stream) {
+                Ok(ws) => ws,
+                Err(_) => return,
+            };
+
+            let mut received: Vec<String> = Vec::new();
+            while received.len() < 2 {
+                match ws.read() {
+                    Ok(WsMsg::Text(t)) => received.push(t.to_string()),
+                    Ok(WsMsg::Close(_)) | Err(_) => break,
+                    _ => {}
+                }
+            }
+
+            // Ack both tables.
+            for _ in 0..received.len() {
+                let _ = ws.send(WsMsg::Text(r#"{"type":"subscribed"}"#.to_string()));
+            }
+
+            // Close immediately — the client sees ConnectionClosed and exits Ok.
+            let _ = ws.close(None);
+            loop {
+                match ws.read() {
+                    Ok(WsMsg::Close(_)) | Err(_) => break,
+                    _ => {}
+                }
+            }
+
+            let _ = tx.send(received);
+        });
+
+        let result = ws_subscribe(&ws_url, "test-token", &["orders", "items"], "id=gt.5");
+        assert!(result.is_ok(), "ws_subscribe with filter must return Ok: {result:?}");
+
+        let received = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("server thread did not report in time");
+
+        assert_eq!(received.len(), 2, "expected 2 subscribe frames: {received:?}");
+
+        let parsed: Vec<serde_json::Value> = received
+            .iter()
+            .map(|s| serde_json::from_str(s).expect("valid JSON"))
+            .collect();
+
+        // Every frame must carry the filter.
+        for (i, v) in parsed.iter().enumerate() {
+            assert_eq!(
+                v["filter"], "id=gt.5",
+                "frame {i} missing filter: {v}"
+            );
+        }
+    }
 
     /// Subscribe frame JSON shape — verifies the exact wire format sent
     /// to the server for a table with and without a filter.
