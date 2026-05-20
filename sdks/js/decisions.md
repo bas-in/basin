@@ -6,6 +6,32 @@ that would let someone re-litigate it later.
 
 ---
 
+## 2026-05-20 — T-041: SSR cookie helpers shipped as src/ssr sub-path, not a separate package
+
+**Choice:** Ship `createServerClient` inside `src/ssr/` and expose it as the
+`./ssr` sub-path export on `@bas-in/basin-js`. No new npm package, no
+monorepo restructuring.
+
+**Alternatives considered:**
+- Separate package `packages/ssr/` / `@bas-in/basin-js-ssr` — rejected.
+  The repo is currently a single-package setup; adding a second workspace
+  adds tooling overhead (root `package.json` workspaces field, separate
+  `tsup`, separate publish lifecycle) for a module that reuses the same
+  `AuthClient` and `BasinError` from the parent package. The sub-path is
+  the minimal incremental step; we can extract later if it grows its own
+  deps (e.g. `next/headers` types) or a user files an issue.
+- Ship directly on the root barrel (`src/index.ts`) — rejected. SSR
+  helpers import `AuthClient` internals; tree-shaking is cleaner if
+  the SSR surface lives behind an explicit sub-path import that browser
+  bundles need not pull in.
+
+**Re-litigation trigger:** revisit if callers need Next.js-specific types
+(`ReadonlyRequestCookies`) or SvelteKit-specific types (`Cookies`) to be
+statically resolved, which would require peer-dep declarations and push
+toward a separate package.
+
+---
+
 ## 2026-05-19 — Iceberg JS client deferred (T-050)
 
 **Choice:** No JS-side Iceberg client in this SDK or as a sibling package

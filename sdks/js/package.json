@@ -47,6 +47,11 @@
       "import": "./dist/openapi/index.js",
       "require": "./dist/openapi/index.cjs"
     },
+    "./ssr": {
+      "types": "./dist/ssr/index.d.ts",
+      "import": "./dist/ssr/index.js",
+      "require": "./dist/ssr/index.cjs"
+    },
     "./codegen": {
       "types": "./dist/src/codegen/index.d.ts",
       "import": "./dist/src/codegen/index.js",

@@ -632,9 +632,9 @@ adapter), `src/internal/retry.test.ts`.
 
 ---
 
-### T-041 — `@bas-in/ssr` cookie helpers for Next.js / SvelteKit ⏸
+### T-041 — `@bas-in/ssr` cookie helpers for Next.js / SvelteKit ✅
 
-**Status:** deferred 2026-05-19. Needs structural decision: monorepo vs
+**Status:** done 2026-05-20. `createServerClient` ships in `src/ssr/` as the `./ssr` sub-path export; 7 tests green. Needs structural decision: monorepo vs
 sub-path vs separate repo. Not blocking v0.2 ship. Re-litigate when a user
 files a Next.js / SvelteKit issue.
 
