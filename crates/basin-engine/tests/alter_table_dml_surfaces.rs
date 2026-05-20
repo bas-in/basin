@@ -353,6 +353,12 @@ async fn constraint_predicate_blocks_violating_insert() {
     // Cap the table at 2 rows. The 3rd INSERT must fail with a
     // SQLSTATE 23514 message; the source mutation rolls back so the
     // table stays at 2 rows.
+    //
+    // The reactor fires pre-commit against the committed table state (the
+    // new row is NOT yet visible to the reactor's session). The predicate
+    // `count < 2` means "there must be fewer than 2 committed rows", which
+    // allows the 1st and 2nd INSERTs (committed count 0 and 1 respectively)
+    // but blocks the 3rd (committed count is 2, `2 < 2` = false).
     let dir = TempDir::new().unwrap();
     let (eng, cat) = engine_in(&dir);
     let project = ProjectId::new();
@@ -362,7 +368,7 @@ async fn constraint_predicate_blocks_violating_insert() {
         .unwrap();
 
     let intent = match_alter_table_react_constraint(
-        "ALTER TABLE orders REACT ON INSERT CONSTRAINT ((SELECT count(*) FROM orders) <= 2) \
+        "ALTER TABLE orders REACT ON INSERT CONSTRAINT ((SELECT count(*) FROM orders) < 2) \
          WITH (name = 'cap')",
     )
     .unwrap()

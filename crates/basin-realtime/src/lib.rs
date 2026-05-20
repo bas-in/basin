@@ -43,6 +43,10 @@ pub mod ws;
 
 pub use filter::Filter;
 pub use budget::{BudgetError, BudgetGuard, BudgetTracker, DEFAULT_PER_PROJECT_BUDGET_BYTES, estimate_event_size};
+pub use presence::{
+    ChannelName, ClientId, PresenceConfig, PresenceEntry, PresenceEvent, PresenceMeta,
+    PresenceRegistry, serialize_presence_diff, serialize_presence_state,
+};
 
 use std::sync::Arc;
 

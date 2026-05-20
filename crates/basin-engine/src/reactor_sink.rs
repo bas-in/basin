@@ -72,6 +72,20 @@ impl ReactorSink {
     /// the project of `event`. We use `open_session_as` with the event's
     /// `causation_user` so RLS evaluation inside the reactor body sees
     /// the same principal that triggered the source mutation.
+    ///
+    /// ## Stack-break via `tokio::spawn`
+    ///
+    /// `run_sql` is called from `ReactorSink::publish`, which is called
+    /// from `dispatch_pre_commit`, which is called from the INSERT executor
+    /// path.  In debug builds the accumulated async-frame depth is large
+    /// enough to overflow the default tokio thread stack when the reactor
+    /// body contains a subquery (e.g. `(SELECT COUNT(*) FROM t)`).
+    ///
+    /// Wrapping the `session.execute` call in `tokio::task::spawn` creates
+    /// a new Tokio task that starts with a fresh OS stack frame, breaking
+    /// the call chain regardless of how deep the caller's stack already is.
+    /// The `await` on the `JoinHandle` parks the current task without
+    /// consuming additional stack in the caller.
     async fn run_sql(&self, event: &ChangeEvent, sql: &str) -> Result<ExecResult> {
         let inner = self
             .engine
@@ -82,8 +96,17 @@ impl ReactorSink {
             .causation_user
             .clone()
             .unwrap_or_else(|| crate::ANONYMOUS_USER.to_string());
-        let session = engine.open_session_as(event.project, user).await?;
-        session.execute(sql).await
+        let project = event.project;
+        let sql = sql.to_string();
+        // Spawn on a new Tokio task so the reactor body starts on a fresh
+        // OS stack frame, breaking the pre-commit → reactor → sub-select
+        // async-frame chain that would otherwise overflow the thread stack
+        // in debug builds (and at extreme reactor nesting depth in release).
+        let handle = tokio::task::spawn(async move {
+            let session = engine.open_session_as(project, user).await?;
+            session.execute(&sql).await
+        });
+        handle.await.map_err(|e| BasinError::internal(format!("reactor task panicked: {e}")))?
     }
 
     /// Evaluate the (rewritten) predicate by wrapping it in

@@ -617,10 +617,10 @@ attached as **pre-commit** so reactor failures abort the mutation.
 Project-scoped invariant enforcement without a body. Covers "max 100
 rows per project", "free-tier caps", "hierarchical depth limit".
 
-- [ ] `ALTER TABLE … REACT ON INSERT CONSTRAINT (predicate)` —
+- [x] `ALTER TABLE … REACT ON INSERT CONSTRAINT (predicate)` —
       predicate evaluated against NEW + the current table state; if
       false, mutation aborts with SQLSTATE `23514 check_violation`.
-- [ ] Test: cap-at-N rejection works; cap-at-N allows under the cap;
+- [x] Test: cap-at-N rejection works; cap-at-N allows under the cap;
       constraint with subquery against a sibling table works.
 
 #### 5.11.I — Webhook fanout (~4-5 weeks honest, depends on Tier 0) ✅ shipped (machinery: `crates/basin-webhooks` ships `WebhookSink` + retry queue + dead-letter + per-project counters/p99-latency observability; `ALTER TABLE … SUBSCRIBE WEBHOOK` / `UNSUBSCRIBE WEBHOOK` SQL surface; predicate evaluation via `predicate_eval` module against ChangeEvent JSON payload)
@@ -659,19 +659,20 @@ time. Same inlining trick as scalar functions.
 - [x] Test: `recent_orders(uid)` round-trips; `SELECT * FROM
       recent_orders(...)` planning works alongside JOINs.
 
-#### 5.11.F — Multi-statement `CALL` procedures (~2 weeks, depends on 5.11.D)
+#### 5.11.F — Multi-statement `CALL` procedures (~2 weeks, depends on 5.11.D) ✅ shipped
 
 Multi-statement workflows for onboarding, archive, periodic tasks.
 Sequence of SQL statements with parameter binding, no control flow.
 
-- [ ] `CREATE PROCEDURE name(args) LANGUAGE sql AS $$ stmt1; stmt2;
+- [x] `CREATE PROCEDURE name(args) LANGUAGE sql AS $$ stmt1; stmt2;
       … $$` parser + catalog.
-- [ ] `CALL name(args)` — runs each statement in order with arguments
-      substituted; transactional once Phase 5 single-shard transactions
-      ship; until then, best-effort sequential.
-- [ ] Test: `CALL archive_project(t)` round-trip; multi-project isolation
-      preserved through the call; failure mid-procedure leaves earlier
-      statements applied (until single-shard transactions ship).
+- [x] `CALL name(args)` — runs each statement in order with arguments
+      substituted; wrapped in an implicit BEGIN/COMMIT (or SAVEPOINT
+      when inside an outer transaction) — all-or-nothing semantics via
+      the Phase 5 single-shard transaction machinery.
+- [x] Test: `CALL archive_project(t)` round-trip; multi-project isolation
+      preserved through the call; failure mid-procedure rolls back earlier
+      statements via implicit transaction.
 
 #### 5.11.K — Generated columns (`GENERATED ALWAYS AS … STORED`) (~2 weeks) ✅ shipped
 

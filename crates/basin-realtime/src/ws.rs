@@ -1,4 +1,4 @@
-//! WebSocket transport layer — Phase 5.11.R3.
+//! WebSocket transport layer — Phase 5.11.R3 + R4 presence.
 //!
 //! Mounts a multiplexed WebSocket handler at `/realtime/v1/ws/:project`.
 //! A single connection can subscribe to multiple tables simultaneously.
@@ -14,6 +14,14 @@
 //! {"type":"unsubscribe","table":"orders"}
 //! ```
 //!
+//! Presence messages (R4, Phoenix Channels shape):
+//!
+//! ```json
+//! {"type":"presence_track","channel":"room:1","client_id":"c1","metadata":{…}}
+//! {"type":"presence_untrack","channel":"room:1","client_id":"c1"}
+//! {"type":"heartbeat","channel":"room:1","client_id":"c1"}
+//! ```
+//!
 //! Server → Client event frames (text frames, JSON):
 //!
 //! ```json
@@ -21,6 +29,8 @@
 //! {"type":"error","code":"lag","table":"orders","missed":5}
 //! {"type":"subscribed","table":"orders"}
 //! {"type":"unsubscribed","table":"orders"}
+//! {"type":"presence_state","channel":"room:1","presences":[…]}
+//! {"type":"presence_diff","channel":"room:1","joins":[…],"leaves":[…]}
 //! ```
 //!
 //! Server → Client close codes (WebSocket close frames):
@@ -90,6 +100,9 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
+use crate::presence::{
+    serialize_presence_diff, serialize_presence_state, PresenceEvent, PresenceRegistry,
+};
 use crate::{ChannelKey, ChannelRegistry, ReplayCursor};
 
 // ---------------------------------------------------------------------------
@@ -121,6 +134,8 @@ const CLOSE_PROJECT_DELETED: u16 = 4008;
 pub struct WsState {
     pub registry: ChannelRegistry,
     pub auth: Arc<AuthService>,
+    /// Presence registry (R4). Shared across all connections.
+    pub presence: PresenceRegistry,
 }
 
 // ---------------------------------------------------------------------------
@@ -134,7 +149,22 @@ pub struct WsState {
 /// app = app.merge(ws_router);
 /// ```
 pub fn router(registry: ChannelRegistry, auth: Arc<AuthService>) -> Router {
-    let state = WsState { registry, auth };
+    router_with_presence(registry, auth, PresenceRegistry::default())
+}
+
+/// Build the WS sub-router with a custom [`PresenceRegistry`].
+///
+/// Useful in tests that need shortened heartbeat timeouts.
+pub fn router_with_presence(
+    registry: ChannelRegistry,
+    auth: Arc<AuthService>,
+    presence: PresenceRegistry,
+) -> Router {
+    let state = WsState {
+        registry,
+        auth,
+        presence,
+    };
     Router::new()
         .route("/realtime/v1/ws/:project", get(ws_handler))
         .with_state(state)
@@ -154,7 +184,7 @@ pub async fn serve(
     registry: ChannelRegistry,
     auth: Arc<AuthService>,
 ) -> Result<tokio::task::JoinHandle<()>, std::io::Error> {
-    let app = router(registry, auth);
+    let app = router_with_presence(registry, auth, PresenceRegistry::default());
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     let handle = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
@@ -170,7 +200,7 @@ pub async fn serve(
 
 /// A control message sent by the client over the WebSocket text channel.
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(tag = "type", rename_all = "snake_case")]
 enum ClientMsg {
     /// Subscribe to change events for a table.
     Subscribe {
@@ -183,6 +213,37 @@ enum ClientMsg {
     },
     /// Unsubscribe from a table. Connection stays open.
     Unsubscribe { table: String },
+
+    // --- Presence (R4) -------------------------------------------------------
+    /// Track this client in a presence channel.
+    ///
+    /// ```json
+    /// {"type":"presence_track","channel":"room:1","client_id":"c1","metadata":{…}}
+    /// ```
+    PresenceTrack {
+        channel: String,
+        client_id: String,
+        #[serde(default)]
+        metadata: serde_json::Value,
+    },
+    /// Remove this client from a presence channel.
+    ///
+    /// ```json
+    /// {"type":"presence_untrack","channel":"room:1","client_id":"c1"}
+    /// ```
+    PresenceUntrack {
+        channel: String,
+        client_id: String,
+    },
+    /// Refresh the heartbeat for `(channel, client_id)`.
+    ///
+    /// ```json
+    /// {"type":"heartbeat","channel":"room:1","client_id":"c1"}
+    /// ```
+    Heartbeat {
+        channel: String,
+        client_id: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -277,7 +338,7 @@ fn rls_permits(event: &ChangeEvent, subscriber_user_id: &str, subscriber_roles: 
 }
 
 // ---------------------------------------------------------------------------
-// Fan-in event envelope
+// Fan-in event envelopes
 // ---------------------------------------------------------------------------
 
 /// An event forwarded from a per-table forwarder task to the main loop.
@@ -290,6 +351,12 @@ struct IncomingEvent {
     payload: Option<Arc<ChangeEvent>>,
     /// When `Some(n)`, the receiver lagged by `n` events.
     lagged: Option<u64>,
+}
+
+/// A presence event forwarded from a per-channel presence forwarder task to
+/// the main connection loop.
+struct IncomingPresence {
+    event: PresenceEvent,
 }
 
 // ---------------------------------------------------------------------------
@@ -358,10 +425,11 @@ pub async fn ws_handler(
     let user_id = claims.user_id.to_string();
     let roles = claims.roles.clone();
     let registry = state.registry.clone();
+    let presence = state.presence.clone();
 
     // --- 4. Upgrade to WebSocket -------------------------------------------
     ws_upgrade.on_upgrade(move |socket| {
-        handle_ws(socket, project_id, user_id, roles, registry)
+        handle_ws(socket, project_id, user_id, roles, registry, presence)
     })
 }
 
@@ -388,15 +456,26 @@ async fn handle_ws(
     user_id: String,
     roles: Vec<String>,
     registry: ChannelRegistry,
+    presence: PresenceRegistry,
 ) {
     info!(project = %project_id, user = %user_id, "WS connection open");
 
     // Fan-in channel: all per-table forwarder tasks send events here.
     let (fan_tx, mut fan_rx) = mpsc::channel::<IncomingEvent>(FAN_IN_CAPACITY);
 
+    // Presence fan-in channel: per-channel presence forwarder tasks.
+    let (pres_tx, mut pres_rx) = mpsc::channel::<IncomingPresence>(64);
+
     // Per-table forwarder task handles, keyed by table name.
     // Dropping a handle cancels the task (tokio::task::JoinHandle drop = abort).
     let mut forwarder_handles: HashMap<TableName, tokio::task::JoinHandle<()>> = HashMap::new();
+
+    // Per-presence-channel forwarder task handles, keyed by channel name.
+    let mut presence_handles: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+
+    // Track which client_ids this connection has registered, per channel.
+    // Used for cleanup on disconnect. Maps channel_name -> client_id.
+    let mut tracked_clients: HashMap<String, String> = HashMap::new();
 
     let mut ping_timer = interval(PING_INTERVAL);
     ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -443,8 +522,12 @@ async fn handle_ws(
                             &user_id,
                             &roles,
                             &registry,
+                            &presence,
                             &fan_tx,
+                            &pres_tx,
                             &mut forwarder_handles,
+                            &mut presence_handles,
+                            &mut tracked_clients,
                         ).await {
                             let _ = socket.send(Message::Close(Some(close))).await;
                             break;
@@ -516,11 +599,36 @@ async fn handle_ws(
                     }
                 }
             }
+
+            // Presence event delivered by a per-channel presence forwarder.
+            maybe_pres = pres_rx.recv() => {
+                let pev = match maybe_pres {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let json = match &pev.event {
+                    PresenceEvent::State { channel, presences } => {
+                        serialize_presence_state(channel, presences)
+                    }
+                    PresenceEvent::Diff { channel, joins, leaves } => {
+                        serialize_presence_diff(channel, joins, leaves)
+                    }
+                };
+                if socket.send(Message::Text(json.into())).await.is_err() {
+                    break;
+                }
+            }
         }
+    }
+
+    // On disconnect: untrack all presence entries owned by this connection.
+    for (channel, client_id) in &tracked_clients {
+        presence.untrack(project_id, channel, client_id);
     }
 
     // Drop all forwarder tasks (JoinHandle abort on drop).
     drop(forwarder_handles);
+    drop(presence_handles);
     info!(project = %project_id, user = %user_id, "WS connection closed");
 }
 
@@ -542,6 +650,7 @@ fn serialize_event(event: &ChangeEvent, table_str: &str) -> String {
 ///
 /// Returns `Ok(())` if the message was handled successfully, or
 /// `Err(CloseFrame)` if the connection should be closed.
+#[allow(clippy::too_many_arguments)]
 async fn handle_client_msg(
     text: &str,
     socket: &mut WebSocket,
@@ -549,8 +658,12 @@ async fn handle_client_msg(
     user_id: &str,
     roles: &[String],
     registry: &ChannelRegistry,
+    presence: &PresenceRegistry,
     fan_tx: &mpsc::Sender<IncomingEvent>,
+    pres_tx: &mpsc::Sender<IncomingPresence>,
     forwarder_handles: &mut HashMap<TableName, tokio::task::JoinHandle<()>>,
+    presence_handles: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+    tracked_clients: &mut HashMap<String, String>,
 ) -> Result<(), CloseFrame<'static>> {
     let msg: ClientMsg = match serde_json::from_str(text) {
         Ok(m) => m,
@@ -644,6 +757,64 @@ async fn handle_client_msg(
             .unwrap_or_default();
             let _ = socket.send(Message::Text(ack.into())).await;
         }
+
+        // --- Presence (R4) --------------------------------------------------
+        ClientMsg::PresenceTrack {
+            channel,
+            client_id,
+            metadata,
+        } => {
+            // Subscribe this connection to the channel's presence broadcast if
+            // not already subscribed. Subscribe *before* track so we don't miss
+            // the diff we're about to publish.
+            if !presence_handles.contains_key(&channel) {
+                let pres_rx = presence.subscribe(*project_id, &channel);
+                let pres_tx_clone = pres_tx.clone();
+                let handle =
+                    tokio::spawn(presence_forwarder_task(pres_rx, pres_tx_clone));
+                presence_handles.insert(channel.clone(), handle);
+            }
+
+            // Send the current snapshot to this client (Phoenix Channels:
+            // `presence_state` on join).
+            let current = presence.snapshot(*project_id, &channel);
+            let state_json = serialize_presence_state(&channel, &current);
+            let _ = socket.send(Message::Text(state_json.into())).await;
+
+            // Track the client — publishes a diff to all other subscribers.
+            presence.track(*project_id, &channel, &client_id, metadata);
+
+            // Remember for cleanup on disconnect.
+            tracked_clients.insert(channel.clone(), client_id.clone());
+
+            debug!(
+                project = %project_id,
+                channel = %channel,
+                client = %client_id,
+                "WS: presence tracked"
+            );
+        }
+
+        ClientMsg::PresenceUntrack { channel, client_id } => {
+            presence.untrack(*project_id, &channel, &client_id);
+            tracked_clients.remove(&channel);
+            debug!(
+                project = %project_id,
+                channel = %channel,
+                client = %client_id,
+                "WS: presence untracked"
+            );
+        }
+
+        ClientMsg::Heartbeat { channel, client_id } => {
+            presence.heartbeat(*project_id, &channel, &client_id);
+            debug!(
+                project = %project_id,
+                channel = %channel,
+                client = %client_id,
+                "WS: presence heartbeat"
+            );
+        }
     }
 
     Ok(())
@@ -692,6 +863,33 @@ async fn forwarder_task(
         if fan_tx.send(ev).await.is_err() {
             // Connection handler dropped the receiver — task is done.
             return;
+        }
+    }
+}
+
+/// Per-presence-channel forwarder task. Reads `PresenceEvent`s from a broadcast
+/// receiver and forwards them to the connection-scoped presence mpsc channel.
+///
+/// Runs until the broadcast channel is closed or the mpsc receiver is dropped.
+async fn presence_forwarder_task(
+    mut rx: broadcast::Receiver<PresenceEvent>,
+    pres_tx: mpsc::Sender<IncomingPresence>,
+) {
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                if pres_tx.send(IncomingPresence { event }).await.is_err() {
+                    // Connection handler dropped the receiver.
+                    return;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                warn!(missed = n, "WS presence forwarder lagged; continuing");
+                // Presence events are ephemeral; silently skip lagged items.
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                return;
+            }
         }
     }
 }
@@ -793,6 +991,47 @@ mod tests {
         assert!(matches!(msg, ClientMsg::Unsubscribe { table } if table == "orders"));
     }
 
+    // --- Presence message parsing (R4) ------------------------------------
+
+    #[test]
+    fn parse_presence_track_msg() {
+        let text =
+            r#"{"type":"presence_track","channel":"room:1","client_id":"c1","metadata":{"name":"Alice"}}"#;
+        let msg: ClientMsg = serde_json::from_str(text).expect("parse");
+        match msg {
+            ClientMsg::PresenceTrack {
+                channel,
+                client_id,
+                metadata,
+            } => {
+                assert_eq!(channel, "room:1");
+                assert_eq!(client_id, "c1");
+                assert_eq!(metadata["name"], "Alice");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn parse_presence_untrack_msg() {
+        let text = r#"{"type":"presence_untrack","channel":"room:1","client_id":"c1"}"#;
+        let msg: ClientMsg = serde_json::from_str(text).expect("parse");
+        assert!(
+            matches!(msg, ClientMsg::PresenceUntrack { channel, client_id }
+                if channel == "room:1" && client_id == "c1")
+        );
+    }
+
+    #[test]
+    fn parse_heartbeat_msg() {
+        let text = r#"{"type":"heartbeat","channel":"room:1","client_id":"c1"}"#;
+        let msg: ClientMsg = serde_json::from_str(text).expect("parse");
+        assert!(
+            matches!(msg, ClientMsg::Heartbeat { channel, client_id }
+                if channel == "room:1" && client_id == "c1")
+        );
+    }
+
     // --- Token extraction --------------------------------------------------
 
     #[test]
@@ -874,7 +1113,7 @@ mod tests {
     /// Two subscriptions on one fan-in: events for both tables appear in order.
     #[tokio::test]
     async fn multiplex_two_tables_fan_in() {
-        use crate::{ChannelRegistry, RealtimeSink};
+        use crate::RealtimeSink;
         use basin_common::ChangeEventSink;
 
         let sink = RealtimeSink::new();
