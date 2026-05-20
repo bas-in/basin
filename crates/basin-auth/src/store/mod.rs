@@ -10,7 +10,11 @@
 //! operation the flow modules need. There is no "execute arbitrary SQL"
 //! escape hatch — callers write to the trait, implementations write SQL.
 
-#[cfg(test)]
+/// Shared conformance test runner for the `AuthStore` trait. Available in
+/// test builds (including integration tests) and when the `test-utils`
+/// feature is enabled (for cross-crate test suites such as
+/// `services/basin-server/src/engine_auth_store.rs`).
+#[cfg(any(test, feature = "test-utils"))]
 pub mod conformance;
 pub mod postgres;
 

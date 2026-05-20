@@ -6,6 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+# Expose `basin_auth::store::conformance` to external test suites (e.g.
+# services/basin-server/src/engine_auth_store.rs #[cfg(test)]). Never
+# enabled in production builds.
+test-utils = []
+
 [dependencies]
 basin-common.workspace = true
 basin-catalog.workspace = true

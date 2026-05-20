@@ -158,6 +158,38 @@ impl EngineAuthStore {
 // Column-extraction helpers
 // ---------------------------------------------------------------------------
 
+/// Look up a column index by name in the batch schema. Returns `None` if the
+/// column is not present. Used to look up values by name rather than position,
+/// which is necessary because the engine may return columns in alphabetical
+/// order rather than the SELECT-specified order.
+fn col_idx(batch: &arrow_array::RecordBatch, name: &str) -> Option<usize> {
+    batch.schema().index_of(name).ok()
+}
+
+/// Get a TEXT value by column name.
+fn get_named_text(batch: &arrow_array::RecordBatch, row: usize, name: &str) -> Option<String> {
+    let col = col_idx(batch, name)?;
+    get_text(batch, row, col)
+}
+
+/// Get a UUID value by column name.
+fn get_named_uuid(batch: &arrow_array::RecordBatch, row: usize, name: &str) -> Option<Uuid> {
+    let col = col_idx(batch, name)?;
+    get_uuid_col(batch, row, col)
+}
+
+/// Get a TIMESTAMPTZ value by column name.
+fn get_named_ts(batch: &arrow_array::RecordBatch, row: usize, name: &str) -> Option<DateTime<Utc>> {
+    let col = col_idx(batch, name)?;
+    get_ts(batch, row, col)
+}
+
+/// Get an i64 value by column name.
+fn get_named_i64(batch: &arrow_array::RecordBatch, row: usize, name: &str) -> Option<i64> {
+    let col = col_idx(batch, name)?;
+    get_i64(batch, row, col)
+}
+
 fn get_text(batch: &arrow_array::RecordBatch, row: usize, col: usize) -> Option<String> {
     use arrow_array::Array;
     let c = batch.column(col);
@@ -168,6 +200,15 @@ fn get_text(batch: &arrow_array::RecordBatch, row: usize, col: usize) -> Option<
         return Some(a.value(row).to_string());
     }
     if let Some(a) = c.as_any().downcast_ref::<arrow_array::LargeStringArray>() {
+        return Some(a.value(row).to_string());
+    }
+    // DataFusion may return Utf8View (StringViewArray) for certain expressions
+    // (e.g. string functions, projections over Parquet Utf8View columns). Fall
+    // through to this path so TEXT columns are always readable.
+    if let Some(a) = c
+        .as_any()
+        .downcast_ref::<arrow_array::StringViewArray>()
+    {
         return Some(a.value(row).to_string());
     }
     None
@@ -204,7 +245,7 @@ fn get_ts(batch: &arrow_array::RecordBatch, row: usize, col: usize) -> Option<Da
     get_text(batch, row, col).and_then(|s| s.parse::<DateTime<Utc>>().ok())
 }
 
-fn get_uuid(batch: &arrow_array::RecordBatch, row: usize, col: usize) -> Option<Uuid> {
+fn get_uuid_col(batch: &arrow_array::RecordBatch, row: usize, col: usize) -> Option<Uuid> {
     // Engine stores UUID as TEXT; parse it.
     get_text(batch, row, col).and_then(|s| s.parse::<Uuid>().ok())
 }
@@ -254,11 +295,24 @@ impl AuthStore for EngineAuthStore {
     async fn migrate(&self, schema: &str) -> Result<()> {
         // Mirror basin_auth::schema::run_migrations but run each statement
         // through the engine session instead of tokio_postgres.
+        //
+        // Engine-specific DDL notes:
+        //
+        // 1. UUID columns are declared as TEXT. The engine's Vortex storage
+        //    backend does not yet support FixedSizeBinary(16) — the Arrow
+        //    physical type that UUID maps to. Using TEXT is consistent with how
+        //    the engine stores all UUID values at runtime (p_uuid serialises
+        //    to ScalarParam::Text), so round-trips are lossless.
+        //
+        // 2. REFERENCES … ON DELETE CASCADE FK constraints are omitted.
+        //    The engine enforces FKs by re-reading the referenced column, which
+        //    requires the column type to be encodable. Auth referential
+        //    integrity is maintained by the application layer.
         let sch = schema;
         let stmts = vec![
             format!(
                 "CREATE TABLE IF NOT EXISTS {sch}_users (
-                    user_id           UUID PRIMARY KEY,
+                    user_id           TEXT PRIMARY KEY,
                     project_id         TEXT NOT NULL,
                     email             TEXT NOT NULL,
                     password_hash     TEXT NOT NULL,
@@ -270,7 +324,7 @@ impl AuthStore for EngineAuthStore {
             format!(
                 "CREATE TABLE IF NOT EXISTS {sch}_refresh_tokens (
                     token_hash   TEXT PRIMARY KEY,
-                    user_id      UUID NOT NULL REFERENCES {sch}_users(user_id) ON DELETE CASCADE,
+                    user_id      TEXT NOT NULL,
                     project_id    TEXT NOT NULL,
                     expires_at   TIMESTAMPTZ NOT NULL,
                     revoked_at   TIMESTAMPTZ,
@@ -280,7 +334,7 @@ impl AuthStore for EngineAuthStore {
             format!(
                 "CREATE TABLE IF NOT EXISTS {sch}_email_tokens (
                     token_hash   TEXT PRIMARY KEY,
-                    user_id      UUID NOT NULL REFERENCES {sch}_users(user_id) ON DELETE CASCADE,
+                    user_id      TEXT NOT NULL,
                     project_id    TEXT NOT NULL,
                     purpose      TEXT NOT NULL,
                     expires_at   TIMESTAMPTZ NOT NULL,
@@ -292,7 +346,7 @@ impl AuthStore for EngineAuthStore {
                 "CREATE TABLE IF NOT EXISTS {sch}_api_keys (
                     id            BIGSERIAL PRIMARY KEY,
                     project_id     TEXT NOT NULL,
-                    user_id       UUID NOT NULL REFERENCES {sch}_users(user_id) ON DELETE CASCADE,
+                    user_id       TEXT NOT NULL,
                     name          TEXT NOT NULL,
                     key_hash      TEXT NOT NULL,
                     key_bcrypt    TEXT NOT NULL,
@@ -305,10 +359,10 @@ impl AuthStore for EngineAuthStore {
             format!(
                 "CREATE TABLE IF NOT EXISTS {sch}_user_session_settings (
                     project_id   TEXT NOT NULL,
-                    user_id     UUID NOT NULL REFERENCES {sch}_users(user_id) ON DELETE CASCADE,
-                    key         TEXT NOT NULL,
-                    value       TEXT NOT NULL,
-                    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    user_id      TEXT NOT NULL,
+                    key          TEXT NOT NULL,
+                    value        TEXT NOT NULL,
+                    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
                     PRIMARY KEY (project_id, user_id, key)
                 )"
             ),
@@ -325,7 +379,7 @@ impl AuthStore for EngineAuthStore {
             format!(
                 "CREATE TABLE IF NOT EXISTS {sch}_auth_revoked_refresh_tokens (
                     token_hash   TEXT PRIMARY KEY,
-                    user_id      UUID NOT NULL REFERENCES {sch}_users(user_id) ON DELETE CASCADE,
+                    user_id      TEXT NOT NULL,
                     revoked_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
                     expires_at   TIMESTAMPTZ NOT NULL
                 )"
@@ -423,11 +477,11 @@ impl AuthStore for EngineAuthStore {
             .map_err(|e| BasinError::catalog(format!("find_user_by_email: {e}")))?;
         first_row_opt(&batches, |b, r| {
             Ok(AuthUser {
-                user_id: get_uuid(b, r, 0)
+                user_id: get_named_uuid(b, r, "user_id")
                     .ok_or_else(|| BasinError::internal("find_user_by_email: missing user_id"))?,
-                email: get_text(b, r, 1).unwrap_or_default(),
-                password_hash: get_text(b, r, 2).unwrap_or_default(),
-                email_verified_at: get_ts(b, r, 3),
+                email: get_named_text(b, r, "email").unwrap_or_default(),
+                password_hash: get_named_text(b, r, "password_hash").unwrap_or_default(),
+                email_verified_at: get_named_ts(b, r, "email_verified_at"),
             })
         })
     }
@@ -449,11 +503,11 @@ impl AuthStore for EngineAuthStore {
             .map_err(|e| BasinError::catalog(format!("find_user_by_id: {e}")))?;
         first_row_opt(&batches, |b, r| {
             Ok(AuthUser {
-                user_id: get_uuid(b, r, 0)
+                user_id: get_named_uuid(b, r, "user_id")
                     .ok_or_else(|| BasinError::internal("find_user_by_id: missing user_id"))?,
-                email: get_text(b, r, 1).unwrap_or_default(),
-                password_hash: get_text(b, r, 2).unwrap_or_default(),
-                email_verified_at: get_ts(b, r, 3),
+                email: get_named_text(b, r, "email").unwrap_or_default(),
+                password_hash: get_named_text(b, r, "password_hash").unwrap_or_default(),
+                email_verified_at: get_named_ts(b, r, "email_verified_at"),
             })
         })
     }
@@ -483,9 +537,9 @@ impl AuthStore for EngineAuthStore {
             .await
             .map_err(|e| BasinError::catalog(format!("latest_user_by_email: {e}")))?;
         first_row_opt(&batches, |b, r| {
-            let user_id = get_uuid(b, r, 0)
+            let user_id = get_named_uuid(b, r, "user_id")
                 .ok_or_else(|| BasinError::internal("latest_user_by_email: missing user_id"))?;
-            let project_str = get_text(b, r, 1)
+            let project_str = get_named_text(b, r, "project_id")
                 .ok_or_else(|| BasinError::internal("latest_user_by_email: missing project_id"))?;
             let project: ProjectId = project_str.parse().map_err(|e| {
                 BasinError::internal(format!("latest_user_by_email project parse: {e}"))
@@ -590,12 +644,12 @@ impl AuthStore for EngineAuthStore {
             .map_err(|e| BasinError::catalog(format!("find_email_token: {e}")))?;
         first_row_opt(&batches, |b, r| {
             Ok(EmailTokenRow {
-                user_id: get_uuid(b, r, 0)
+                user_id: get_named_uuid(b, r, "user_id")
                     .ok_or_else(|| BasinError::internal("find_email_token: missing user_id"))?,
-                expires_at: get_ts(b, r, 1)
+                expires_at: get_named_ts(b, r, "expires_at")
                     .ok_or_else(|| BasinError::internal("find_email_token: missing expires_at"))?,
-                consumed_at: get_ts(b, r, 2),
-                purpose: get_text(b, r, 3).unwrap_or_default(),
+                consumed_at: get_named_ts(b, r, "consumed_at"),
+                purpose: get_named_text(b, r, "purpose").unwrap_or_default(),
             })
         })
     }
@@ -627,10 +681,10 @@ impl AuthStore for EngineAuthStore {
 
         let token_row = match first_row_opt(&batches, |b, r| {
             Ok((
-                get_uuid(b, r, 0),
-                get_ts(b, r, 1),
-                get_ts(b, r, 2),
-                get_text(b, r, 3),
+                get_named_uuid(b, r, "user_id"),
+                get_named_ts(b, r, "expires_at"),
+                get_named_ts(b, r, "consumed_at"),
+                get_named_text(b, r, "purpose"),
             ))
         })? {
             Some((Some(uid), Some(exp), consumed_at, purpose)) => {
@@ -654,7 +708,7 @@ impl AuthStore for EngineAuthStore {
             .await
             .map_err(|e| BasinError::catalog(format!("find_magic_link_email_token user: {e}")))?;
         let email = match first_row_opt(&user_batches, |b, r| {
-            Ok(get_text(b, r, 0).unwrap_or_default())
+            Ok(get_named_text(b, r, "email").unwrap_or_default())
         })? {
             Some(e) => e,
             None => return Ok(None),
@@ -738,8 +792,8 @@ impl AuthStore for EngineAuthStore {
             .map_err(|e| BasinError::catalog(format!("list_refresh_revocations: {e}")))?;
         all_rows(&batches, |b, r| {
             Ok(RefreshRevocationRow {
-                token_hash: get_text(b, r, 0).unwrap_or_default(),
-                revoked_at: get_ts(b, r, 1).unwrap_or_else(Utc::now),
+                token_hash: get_named_text(b, r, "token_hash").unwrap_or_default(),
+                revoked_at: get_named_ts(b, r, "revoked_at").unwrap_or_else(Utc::now),
             })
         })
     }
@@ -825,8 +879,8 @@ impl AuthStore for EngineAuthStore {
             .map_err(|e| BasinError::catalog(format!("insert_api_key select: {e}")))?;
         match first_row_opt(&batches, |b, r| {
             Ok((
-                get_i64(b, r, 0).unwrap_or(0),
-                get_ts(b, r, 1).unwrap_or_else(Utc::now),
+                get_named_i64(b, r, "id").unwrap_or(0),
+                get_named_ts(b, r, "created_at").unwrap_or_else(Utc::now),
             ))
         })? {
             Some(pair) => Ok(pair),
@@ -849,11 +903,11 @@ impl AuthStore for EngineAuthStore {
             .map_err(|e| BasinError::catalog(format!("find_api_keys_by_hash: {e}")))?;
         all_rows(&batches, |b, r| {
             Ok(ApiKeyRow {
-                id: get_i64(b, r, 0).unwrap_or(0),
-                project_id: get_text(b, r, 1).unwrap_or_default(),
-                user_id: get_uuid(b, r, 2).unwrap_or_else(Uuid::nil),
-                key_bcrypt: get_text(b, r, 3).unwrap_or_default(),
-                revoked_at: get_ts(b, r, 4),
+                id: get_named_i64(b, r, "id").unwrap_or(0),
+                project_id: get_named_text(b, r, "project_id").unwrap_or_default(),
+                user_id: get_named_uuid(b, r, "user_id").unwrap_or_else(Uuid::nil),
+                key_bcrypt: get_named_text(b, r, "key_bcrypt").unwrap_or_default(),
+                revoked_at: get_named_ts(b, r, "revoked_at"),
             })
         })
     }
@@ -919,11 +973,11 @@ impl AuthStore for EngineAuthStore {
             .map_err(|e| BasinError::catalog(format!("list_api_keys: {e}")))?;
         all_rows(&batches, |b, r| {
             Ok(ApiKeyDescriptor {
-                id: get_i64(b, r, 0).unwrap_or(0),
-                name: get_text(b, r, 1).unwrap_or_default(),
-                created_at: get_ts(b, r, 2).unwrap_or_else(Utc::now),
-                last_used_at: get_ts(b, r, 3),
-                revoked_at: get_ts(b, r, 4),
+                id: get_named_i64(b, r, "id").unwrap_or(0),
+                name: get_named_text(b, r, "name").unwrap_or_default(),
+                created_at: get_named_ts(b, r, "created_at").unwrap_or_else(Utc::now),
+                last_used_at: get_named_ts(b, r, "last_used_at"),
+                revoked_at: get_named_ts(b, r, "revoked_at"),
             })
         })
     }
@@ -977,8 +1031,8 @@ impl AuthStore for EngineAuthStore {
         let mut map = HashMap::new();
         for batch in &batches {
             for row in 0..batch.num_rows() {
-                let k = get_text(batch, row, 0).unwrap_or_default();
-                let v = get_text(batch, row, 1).unwrap_or_default();
+                let k = get_named_text(batch, row, "key").unwrap_or_default();
+                let v = get_named_text(batch, row, "value").unwrap_or_default();
                 map.insert(k, v);
             }
         }
@@ -1032,9 +1086,9 @@ impl AuthStore for EngineAuthStore {
             .map_err(|e| BasinError::catalog(format!("find_project_credential: {e}")))?;
         first_row_opt(&batches, |b, r| {
             Ok(ProjectCredentialRow {
-                project_id: get_text(b, r, 0).unwrap_or_default(),
-                password_hash: get_text(b, r, 1).unwrap_or_default(),
-                dbname: get_text(b, r, 2).unwrap_or_default(),
+                project_id: get_named_text(b, r, "project_id").unwrap_or_default(),
+                password_hash: get_named_text(b, r, "password_hash").unwrap_or_default(),
+                dbname: get_named_text(b, r, "dbname").unwrap_or_default(),
             })
         })
     }
@@ -1074,8 +1128,8 @@ impl AuthStore for EngineAuthStore {
             .map_err(|e| BasinError::catalog(format!("rotate_project_credential select: {e}")))?;
         first_row_opt(&batches, |b, r| {
             Ok(ProjectCredentialRow {
-                project_id: get_text(b, r, 0).unwrap_or_default(),
-                dbname: get_text(b, r, 1).unwrap_or_default(),
+                project_id: get_named_text(b, r, "project_id").unwrap_or_default(),
+                dbname: get_named_text(b, r, "dbname").unwrap_or_default(),
                 password_hash: String::new(), // Not returned after rotation.
             })
         })
@@ -1097,17 +1151,17 @@ impl AuthStore for EngineAuthStore {
             .await
             .map_err(|e| BasinError::catalog(format!("list_project_credentials: {e}")))?;
         all_rows(&batches, |b, r| {
-            let t_str = get_text(b, r, 1).unwrap_or_default();
+            let t_str = get_named_text(b, r, "project_id").unwrap_or_default();
             let t: ProjectId = t_str.parse().map_err(|e| {
                 BasinError::internal(format!("list_project_credentials project parse: {e}"))
             })?;
             Ok(ProjectCredentialDescriptor {
-                id: get_i64(b, r, 0).unwrap_or(0),
+                id: get_named_i64(b, r, "id").unwrap_or(0),
                 project_id: t,
-                pgwire_user: get_text(b, r, 2).unwrap_or_default(),
-                dbname: get_text(b, r, 3).unwrap_or_default(),
-                created_at: get_ts(b, r, 4).unwrap_or_else(Utc::now),
-                rotated_at: get_ts(b, r, 5),
+                pgwire_user: get_named_text(b, r, "pgwire_user").unwrap_or_default(),
+                dbname: get_named_text(b, r, "dbname").unwrap_or_default(),
+                created_at: get_named_ts(b, r, "created_at").unwrap_or_else(Utc::now),
+                rotated_at: get_named_ts(b, r, "rotated_at"),
             })
         })
     }
@@ -1125,13 +1179,13 @@ impl AuthStore for EngineAuthStore {
             .await
             .map_err(|e| BasinError::catalog(format!("list_legacy_project_credentials: {e}")))?;
         all_rows(&batches, |b, r| {
-            let t_str = get_text(b, r, 0).unwrap_or_default();
+            let t_str = get_named_text(b, r, "project_id").unwrap_or_default();
             let t: ProjectId = t_str.parse().map_err(|e| {
                 BasinError::internal(format!(
                     "list_legacy_project_credentials project parse: {e}"
                 ))
             })?;
-            Ok((t, get_text(b, r, 1).unwrap_or_default()))
+            Ok((t, get_named_text(b, r, "pgwire_user").unwrap_or_default()))
         })
     }
 
@@ -1188,9 +1242,9 @@ impl AuthStore for EngineAuthStore {
             .map_err(|e| BasinError::catalog(format!("list_active_auth_magic_links: {e}")))?;
         all_rows(&batches, |b, r| {
             Ok(AuthMagicLinkRow {
-                id: get_i64(b, r, 0).unwrap_or(0),
-                email: get_text(b, r, 1).unwrap_or_default(),
-                token_hash: get_text(b, r, 2).unwrap_or_default(),
+                id: get_named_i64(b, r, "id").unwrap_or(0),
+                email: get_named_text(b, r, "email").unwrap_or_default(),
+                token_hash: get_named_text(b, r, "token_hash").unwrap_or_default(),
             })
         })
     }
@@ -1255,4 +1309,79 @@ fn all_rows<T>(
         }
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// AuthStore conformance tests — EngineAuthStore (Phase 5.10)
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, feature = "test-utils"))]
+mod tests {
+    //! Full `AuthStore` conformance suite against the in-process engine backend.
+    //!
+    //! Run with:
+    //!
+    //! ```bash
+    //! cargo test -p basin-server --features test-utils
+    //! ```
+    //!
+    //! The `test-utils` feature enables `basin_auth::store::conformance` (gated
+    //! by `#[cfg(any(test, feature = "test-utils"))]` in basin-auth).
+
+    use std::sync::Arc;
+
+    use basin_auth::store::conformance::test_auth_store_conformance;
+    use basin_auth::store::AuthStore;
+    use basin_catalog::InMemoryCatalog;
+    use basin_common::ProjectId;
+    use basin_engine::{Engine, EngineConfig};
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    use super::EngineAuthStore;
+
+    fn build_engine(dir: &TempDir) -> Arc<Engine> {
+        let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
+            object_store: Arc::new(fs),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
+        Arc::new(Engine::new(EngineConfig {
+            storage,
+            catalog,
+            shard: None,
+        }))
+    }
+
+    async fn build_store(dir: &TempDir) -> Arc<dyn AuthStore> {
+        let engine = build_engine(dir);
+        let schema = "basin_auth".to_string();
+        let auth_project: ProjectId = basin_auth::INTERNAL_AUTH_PROJECT_ID
+            .parse()
+            .expect("INTERNAL_AUTH_PROJECT_ID must be valid");
+        let store = Arc::new(EngineAuthStore::new(engine, schema.clone(), auth_project));
+        store
+            .migrate(&schema)
+            .await
+            .expect("EngineAuthStore migration must succeed");
+        store as Arc<dyn AuthStore>
+    }
+
+    /// Full `AuthStore` conformance suite against `EngineAuthStore`.
+    ///
+    /// Covers all Phase 5.10 invariants:
+    ///  1. User uniqueness per project + cross-project same email
+    ///  2. Single-use email tokens
+    ///  3. Refresh rotation + blanket-revoke sentinel
+    ///  4. API key lifecycle (insert → validate → revoke → validate fails)
+    ///  5. Self-routing credential parsing + malformed input handling
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn engine_auth_store_conformance() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = build_store(&dir).await;
+        test_auth_store_conformance(store).await;
+    }
 }

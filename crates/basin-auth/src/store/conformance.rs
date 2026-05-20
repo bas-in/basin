@@ -49,15 +49,28 @@ fn bcrypt_hash(plain: &str) -> String {
 /// had `migrate(schema)` called (schema migrations are out-of-scope for this
 /// runner — they are tested by the `AuthService::connect_with_mailer` path in
 /// `lib.rs`).
+///
+/// Covers all Phase 5.10 invariants:
+///
+/// 1. User uniqueness per project (same email, same project → conflict)
+/// 2. Cross-project same email (same email, different projects → ok)
+/// 3. Single-use email tokens
+/// 4. Refresh token rotation + blanket-revoke sentinel
+/// 5. API key lifecycle (insert → validate → revoke → validate-after-revoke)
+/// 6. Self-routing credential parsing + malformed input handling (no panic)
 pub async fn test_auth_store_conformance(store: Arc<dyn AuthStore>) {
     user_uniqueness_per_project(&store).await;
+    cross_project_same_email(&store).await;
     find_user_by_email_tests(&store).await;
     email_token_single_use(&store).await;
     email_token_expiry(&store).await;
+    refresh_rotation(&store).await;
+    refresh_blanket_revocation(&store).await;
     api_key_lifecycle(&store).await;
     api_key_project_scoping(&store).await;
     project_credential_uniqueness(&store).await;
     project_credential_self_routing(&store).await;
+    project_credential_malformed_inputs();
     session_settings_upsert(&store).await;
 }
 
@@ -94,6 +107,40 @@ async fn user_uniqueness_per_project(store: &Arc<dyn AuthStore>) {
         .create_user(&project_b, email, &hash, uid_b)
         .await
         .expect("same email in different project must succeed");
+}
+
+/// Cross-project same email: `find_user_by_email` must isolate by project_id.
+async fn cross_project_same_email(store: &Arc<dyn AuthStore>) {
+    let project_a = ProjectId::new();
+    let project_b = ProjectId::new();
+    let email = format!("cross-{}@conformance.test", Uuid::new_v4());
+    let hash = bcrypt_hash("testpassword");
+
+    let uid_a = Uuid::new_v4();
+    store
+        .create_user(&project_a, &email, &hash, uid_a)
+        .await
+        .expect("create in project_a");
+
+    let uid_b = Uuid::new_v4();
+    store
+        .create_user(&project_b, &email, &hash, uid_b)
+        .await
+        .expect("same email in project_b must succeed");
+
+    let found_a = store
+        .find_user_by_email(&project_a, &email)
+        .await
+        .expect("find in project_a")
+        .expect("user must exist in project_a");
+    assert_eq!(found_a.user_id, uid_a, "project_a must return uid_a");
+
+    let found_b = store
+        .find_user_by_email(&project_b, &email)
+        .await
+        .expect("find in project_b")
+        .expect("user must exist in project_b");
+    assert_eq!(found_b.user_id, uid_b, "project_b must return uid_b");
 }
 
 /// `find_user_by_email` returns `None` for unknown users, `Some` for known
@@ -224,6 +271,145 @@ async fn email_token_expiry(store: &Arc<dyn AuthStore>) {
     );
     assert_eq!(row.user_id, user_id);
     assert_eq!(row.purpose, "reset");
+}
+
+/// Refresh-token rotation: a jti can only be used once.
+/// `insert_refresh_revocation` is idempotent (ON CONFLICT DO NOTHING) and the
+/// jti appears in `list_refresh_revocations` after insertion.
+async fn refresh_rotation(store: &Arc<dyn AuthStore>) {
+    let user_id = Uuid::new_v4();
+    let email = format!("refresh-{}@conformance.test", Uuid::new_v4());
+    let project = ProjectId::new();
+    let hash = bcrypt_hash("testpassword");
+    store
+        .create_user(&project, &email, &hash, user_id)
+        .await
+        .expect("create_user for refresh rotation test");
+
+    let jti_a = format!("jti-a-{}", Uuid::new_v4());
+    let jti_b = format!("jti-b-{}", Uuid::new_v4());
+    let expires = Utc::now() + chrono::Duration::days(30);
+
+    // First insert → 1 row.
+    let n = store
+        .insert_refresh_revocation(&jti_a, user_id, expires)
+        .await
+        .expect("insert jti_a");
+    assert_eq!(n, 1, "first revocation must insert 1 row");
+
+    // jti_a must appear in the list.
+    let rows = store
+        .list_refresh_revocations(user_id)
+        .await
+        .expect("list after jti_a");
+    assert!(
+        rows.iter().any(|r| r.token_hash == jti_a),
+        "jti_a must appear in revocation list"
+    );
+
+    // Insert jti_b (the "next" token after rotation).
+    store
+        .insert_refresh_revocation(&jti_b, user_id, expires)
+        .await
+        .expect("insert jti_b");
+
+    // Both must be present.
+    let rows2 = store
+        .list_refresh_revocations(user_id)
+        .await
+        .expect("list after jti_b");
+    assert!(rows2.iter().any(|r| r.token_hash == jti_a), "jti_a still present");
+    assert!(rows2.iter().any(|r| r.token_hash == jti_b), "jti_b present");
+
+    // Duplicate insert of jti_a → 0 rows (ON CONFLICT DO NOTHING), no error.
+    let n2 = store
+        .insert_refresh_revocation(&jti_a, user_id, expires)
+        .await
+        .expect("duplicate insert must not error");
+    assert_eq!(n2, 0, "duplicate returns 0 (ON CONFLICT DO NOTHING)");
+
+    // jti_a still in list after idempotent re-insert.
+    let rows3 = store
+        .list_refresh_revocations(user_id)
+        .await
+        .expect("list after idempotent insert");
+    assert!(
+        rows3.iter().any(|r| r.token_hash == jti_a),
+        "jti_a must remain after idempotent re-insert"
+    );
+}
+
+/// Blanket-revoke sentinel: `BLANKET:<user_id>` appears in the revocation
+/// list; upsert is idempotent and never creates duplicate rows.
+async fn refresh_blanket_revocation(store: &Arc<dyn AuthStore>) {
+    let user_id = Uuid::new_v4();
+    let email = format!("blanket-{}@conformance.test", Uuid::new_v4());
+    let project = ProjectId::new();
+    let hash = bcrypt_hash("testpassword");
+    store
+        .create_user(&project, &email, &hash, user_id)
+        .await
+        .expect("create_user for blanket revocation test");
+
+    let blanket_key = format!("BLANKET:{user_id}");
+    let expires = Utc::now() + chrono::Duration::days(30);
+
+    // First upsert — must insert the row.
+    store
+        .upsert_blanket_revocation(&blanket_key, user_id, expires)
+        .await
+        .expect("upsert_blanket_revocation first call");
+
+    // Sentinel must appear in the revocation list.
+    let rows = store
+        .list_refresh_revocations(user_id)
+        .await
+        .expect("list after blanket upsert");
+    assert!(
+        rows.iter().any(|r| r.token_hash == blanket_key),
+        "BLANKET sentinel must appear in list_refresh_revocations"
+    );
+
+    // Second upsert must not error (idempotent ON CONFLICT DO UPDATE).
+    store
+        .upsert_blanket_revocation(&blanket_key, user_id, expires)
+        .await
+        .expect("second upsert must not error");
+
+    // Still exactly one sentinel row.
+    let rows2 = store
+        .list_refresh_revocations(user_id)
+        .await
+        .expect("list after second upsert");
+    let count = rows2
+        .iter()
+        .filter(|r| r.token_hash == blanket_key)
+        .count();
+    assert_eq!(count, 1, "duplicate upsert must not create two sentinel rows");
+}
+
+/// Self-routing malformed inputs: `parse_project_from_pgwire_user` must return
+/// `None` for all malformed inputs without panicking.
+fn project_credential_malformed_inputs() {
+    use crate::project_credentials::parse_project_from_pgwire_user;
+
+    let bad: &[&str] = &[
+        "",
+        "short",
+        "project_a1b2c3d4",                  // legacy format
+        "01JBAS1NAVTH00000000000000",         // 26 chars, no underscore
+        "01JBAS1NAVTH00000000000000-suffix",  // wrong separator
+        "01JBAS1NAVTH00000000000000_",        // nothing after underscore
+        "../etc/passwd",                       // path injection
+        "'; DROP TABLE users; --",            // SQL injection
+    ];
+
+    for input in bad {
+        assert!(
+            parse_project_from_pgwire_user(input).is_none(),
+            "malformed input {input:?} must return None"
+        );
+    }
 }
 
 /// API key lifecycle: insert → find-by-hash (not revoked) → revoke →
