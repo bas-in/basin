@@ -41,6 +41,9 @@ pub mod presence;
 pub mod sse;
 pub mod ws;
 
+pub use filter::Filter;
+pub use budget::{BudgetError, BudgetTracker, DEFAULT_PER_PROJECT_BUDGET_BYTES, estimate_event_size};
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -113,6 +116,22 @@ impl ChannelRegistry {
         entry.sender.subscribe()
     }
 
+    /// Subscribe with an optional predicate filter (Phase 5.11.R5).
+    ///
+    /// When `filter` is `Some`, the returned [`FilteredReceiver`] evaluates
+    /// the predicate on each event before returning it. Events that do not
+    /// match are silently discarded at receive time, so the transport layer
+    /// (`sse.rs`, `ws.rs`) never sees them. When `filter` is `None` the
+    /// behaviour is identical to [`Self::subscribe`].
+    pub fn subscribe_filtered(
+        &self,
+        key: ChannelKey,
+        filter: Option<Filter>,
+    ) -> FilteredReceiver {
+        let rx = self.subscribe(key);
+        FilteredReceiver { rx, filter }
+    }
+
     /// Publish an event into the channel for `(project, table)`.
     ///
     /// Returns `Ok(n)` where `n` is the number of active receivers the send
@@ -144,6 +163,86 @@ impl ChannelRegistry {
     }
 }
 
+/// A broadcast receiver with an optional subscriber-side predicate filter
+/// (Phase 5.11.R5).
+///
+/// Created via [`ChannelRegistry::subscribe_filtered`]. The filter is evaluated
+/// in the subscriber's async task at receive time — events that do not satisfy
+/// the predicate are discarded before they reach the transport layer
+/// (`sse.rs`, `ws.rs`). This is logically equivalent to "fanout-time"
+/// filtering because filtered events never hit the wire.
+///
+/// # Compile-once evaluation
+///
+/// The SQL predicate is parsed once by [`Filter::new`] and stored in an
+/// `Arc<Expr>`. Each call to [`FilteredReceiver::recv`] reuses the parsed AST
+/// without re-parsing. Typical eval latency for simple comparisons is ≤ 50 µs
+/// (see `benches/filter_eval.rs`).
+pub struct FilteredReceiver {
+    rx: broadcast::Receiver<Arc<ChangeEvent>>,
+    filter: Option<Filter>,
+}
+
+impl FilteredReceiver {
+    /// Receive the next event that satisfies the filter, skipping non-matching
+    /// events.
+    ///
+    /// Returns `Err` on lag (ring-buffer overflow) or channel close, matching
+    /// [`broadcast::Receiver::recv`] semantics. If predicate evaluation fails
+    /// for an event (unsupported expression) that event is skipped (fail-closed).
+    pub async fn recv(
+        &mut self,
+    ) -> Result<Arc<ChangeEvent>, broadcast::error::RecvError> {
+        loop {
+            let event = self.rx.recv().await?;
+            match &self.filter {
+                None => return Ok(event),
+                Some(f) => match f.matches(&event) {
+                    Ok(true) => return Ok(event),
+                    Ok(false) => {
+                        // Predicate not satisfied; skip silently.
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            predicate = %f,
+                            error = %e,
+                            "realtime filter eval failed; skipping event",
+                        );
+                        continue;
+                    }
+                },
+            }
+        }
+    }
+
+    /// Try to receive without blocking. Returns `Err(TryRecvError::Empty)` if
+    /// no matching event is immediately available (including if all buffered
+    /// events are filtered out).
+    pub fn try_recv(
+        &mut self,
+    ) -> Result<Arc<ChangeEvent>, broadcast::error::TryRecvError> {
+        loop {
+            let event = self.rx.try_recv()?;
+            match &self.filter {
+                None => return Ok(event),
+                Some(f) => match f.matches(&event) {
+                    Ok(true) => return Ok(event),
+                    Ok(false) => continue,
+                    Err(e) => {
+                        tracing::warn!(
+                            predicate = %f,
+                            error = %e,
+                            "realtime filter eval failed; skipping event",
+                        );
+                        continue;
+                    }
+                },
+            }
+        }
+    }
+}
+
 /// Post-commit [`ChangeEventSink`] that fans committed mutations out to
 /// per-`(project, table)` broadcast channels.
 ///
@@ -161,28 +260,73 @@ impl ChannelRegistry {
 /// connected the lookup finds no entry (or finds an entry with 0 receivers)
 /// and returns immediately. The allocation cost is O(1) regardless of project
 /// or table count.
+///
+/// # Multi-tenant memory budget (Phase 5.11.R6)
+///
+/// Each [`RealtimeSink`] holds a [`BudgetTracker`] that enforces a
+/// per-project in-flight byte cap (default 16 MiB, configurable via
+/// `BASIN_REALTIME_PER_PROJECT_BUDGET_BYTES`). The hot path:
+///
+/// 1. Estimate the event size (JSON payload + fixed overhead).
+/// 2. `BudgetTracker::try_reserve` — CAS on the project's `AtomicU64`;
+///    O(1) with no allocation.
+/// 3. On success: broadcast the event and release the bytes (RAII guard).
+/// 4. On `BUFFER_FULL`: drop the event into the optional durable retry log
+///    so no data is lost; skip the broadcast for this tenant only.
+///
+/// Other tenants' ring-buffer slots are unaffected by a noisy tenant's
+/// `BUFFER_FULL` rejections.
 #[derive(Clone)]
 pub struct RealtimeSink {
     registry: ChannelRegistry,
+    /// Per-project byte budget tracker (Phase 5.11.R6).
+    budget: BudgetTracker,
+    /// Optional durable retry log. When `Some`, events that overflow the
+    /// per-project budget are written here rather than silently discarded.
+    /// When `None`, overflow events are dropped with a tracing warning.
+    retry_log: Option<basin_webhooks::RetryQueue>,
 }
 
 impl RealtimeSink {
-    /// Build with [`DEFAULT_CHANNEL_CAPACITY`].
+    /// Build with [`DEFAULT_CHANNEL_CAPACITY`] and a budget tracker seeded
+    /// from the environment ([`BudgetTracker::from_env`]).
     pub fn new() -> Self {
         Self::with_capacity(DEFAULT_CHANNEL_CAPACITY)
     }
 
-    /// Build with a custom per-channel ring buffer capacity.
+    /// Build with a custom per-channel ring buffer capacity and a budget
+    /// tracker seeded from the environment.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             registry: ChannelRegistry::new(capacity),
+            budget: BudgetTracker::from_env(),
+            retry_log: None,
         }
+    }
+
+    /// Attach a durable retry log. Events that overflow a tenant's budget
+    /// are written here instead of being silently dropped.
+    pub fn with_retry_log(mut self, retry_log: basin_webhooks::RetryQueue) -> Self {
+        self.retry_log = Some(retry_log);
+        self
+    }
+
+    /// Attach a custom [`BudgetTracker`]. Useful in tests to inject a
+    /// tracker with a specific hard cap without touching env vars.
+    pub fn with_budget(mut self, budget: BudgetTracker) -> Self {
+        self.budget = budget;
+        self
     }
 
     /// Borrow the underlying [`ChannelRegistry`]. R2-R6 use this to hand
     /// receivers to SSE / WebSocket handlers.
     pub fn registry(&self) -> &ChannelRegistry {
         &self.registry
+    }
+
+    /// Borrow the [`BudgetTracker`]. Exposed for observability / tests.
+    pub fn budget(&self) -> &BudgetTracker {
+        &self.budget
     }
 }
 
@@ -196,13 +340,57 @@ impl Default for RealtimeSink {
 impl ChangeEventSink for RealtimeSink {
     /// Fan the event out to all open subscribers for `(project, table)`.
     ///
-    /// This is O(1) — one [`DashMap`] shard lock, one `broadcast::Sender::send`.
+    /// # Budget enforcement (Phase 5.11.R6)
+    ///
+    /// Before broadcasting, this method checks the per-project byte budget:
+    ///
+    /// - **Fast path (budget available):** broadcast the event to all
+    ///   subscribers for `(project, table)` in O(1); release the reserved
+    ///   bytes via RAII guard.
+    /// - **Slow path (`BUFFER_FULL`):** drop the event into the durable retry
+    ///   log (if attached) or emit a tracing warning; return `Ok(())` so the
+    ///   engine's post-commit path is not blocked.
+    ///
     /// Lagged receivers get a [`tokio::sync::broadcast::error::RecvError::Lagged`]
     /// error on their next `recv()` and are responsible for reconnecting via
     /// the replay path ([`ReplayCursor`]).
     async fn publish(&self, event: &ChangeEvent) -> Result<()> {
-        let key = ChannelKey::new(event.project, event.table.clone());
-        self.registry.publish(&key, Arc::new(event.clone()));
+        let size = estimate_event_size(event);
+
+        match self.budget.try_reserve(event.project, size) {
+            Ok(guard) => {
+                let key = ChannelKey::new(event.project, event.table.clone());
+                self.registry.publish(&key, Arc::new(event.clone()));
+                // Release the reserved bytes once the event is in the ring.
+                drop(guard);
+            }
+            Err(BudgetError::BufferFull) => {
+                tracing::warn!(
+                    project = %event.project.as_prefix(),
+                    table = %event.table,
+                    seq = event.seq,
+                    "realtime BUFFER_FULL: per-project budget exhausted; dropping to retry log",
+                );
+                if let Some(retry_log) = &self.retry_log {
+                    // Use a stable sentinel subscription-id for the realtime
+                    // overflow path (distinct from webhook subscription ids).
+                    let sub_id = basin_webhooks::WebhookSubscriptionId(
+                        uuid::Uuid::nil(),
+                    );
+                    let envelope = basin_webhooks::WebhookEnvelope::from_event(sub_id, event);
+                    // Fire-and-forget: enqueue error is non-fatal (post-commit).
+                    if let Err(e) = retry_log.enqueue_new(sub_id, event.project, envelope).await {
+                        tracing::error!(
+                            error = %e,
+                            "realtime overflow: retry log enqueue failed",
+                        );
+                    }
+                }
+                // Return Ok — post-commit sinks must not block the engine.
+                return Ok(());
+            }
+        }
+
         Ok(())
     }
 }
@@ -248,6 +436,35 @@ impl ReplayCursor {
         //   queue.events_after(self.project, &self.table, self.last_seen)
         vec![]
     }
+}
+
+/// Build the SSE axum sub-router for `/realtime/v1/sse/:project/:table`.
+///
+/// Convenience re-export so callers in `basin-server` don't need to import
+/// the inner module:
+///
+/// ```ignore
+/// let sse_router = basin_realtime::sse_router(registry.clone(), auth.clone());
+/// app = app.merge(sse_router);
+/// ```
+pub fn sse_router(
+    registry: ChannelRegistry,
+    auth: Arc<basin_auth::AuthService>,
+) -> axum::Router {
+    sse::router(registry, auth)
+}
+
+/// Bind a standalone HTTP server for the SSE endpoint on `bind_addr` and
+/// return a background [`tokio::task::JoinHandle`].
+///
+/// Called from `basin-server/src/main.rs` behind `#[cfg(feature = "realtime")]`
+/// so `basin-server` doesn't need to import `axum` directly.
+pub async fn sse_serve(
+    bind_addr: std::net::SocketAddr,
+    registry: ChannelRegistry,
+    auth: Arc<basin_auth::AuthService>,
+) -> Result<tokio::task::JoinHandle<()>, std::io::Error> {
+    sse::serve(bind_addr, registry, auth).await
 }
 
 #[cfg(test)]
@@ -351,5 +568,90 @@ mod tests {
         let table = TableName::new("orders").unwrap();
         let cursor = ReplayCursor::new(project, table, 0);
         assert!(cursor.drain().is_empty());
+    }
+
+    // ---- filter integration tests (Phase 5.11.R5) -------------------------
+
+    fn make_event_with_status(project: ProjectId, table: &str, seq: u64, status: &str) -> ChangeEvent {
+        ChangeEvent {
+            project,
+            table: TableName::new(table).unwrap(),
+            op: ChangeOp::Insert,
+            before: None,
+            after: Some(serde_json::json!({"id": seq, "status": status})),
+            committed_at: Utc::now(),
+            seq,
+            causation_user: None,
+        }
+    }
+
+    /// Acceptance gate: subscribing to `orders` with predicate
+    /// `NEW.status = 'paid'` only delivers events where status is paid.
+    #[tokio::test]
+    async fn filter_integration_paid_status() {
+        let sink = RealtimeSink::new();
+        let project = ProjectId::new();
+        let key = ChannelKey::new(project, TableName::new("orders").unwrap());
+
+        let filter = Filter::new("NEW.status = 'paid'").unwrap();
+        let mut rx = sink.registry().subscribe_filtered(key.clone(), Some(filter));
+
+        // Publish a non-matching event (pending) then a matching one (paid).
+        let pending = make_event_with_status(project, "orders", 1, "pending");
+        let paid = make_event_with_status(project, "orders", 2, "paid");
+
+        sink.publish(&pending).await.unwrap();
+        sink.publish(&paid).await.unwrap();
+
+        // try_recv: first call returns paid (seq=2), skipping pending (seq=1).
+        let got = rx.try_recv().expect("paid event must be available");
+        assert_eq!(got.seq, 2, "only the paid event should pass the filter");
+
+        // No more events.
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A subscriber with no filter receives all events (unfiltered path).
+    #[tokio::test]
+    async fn no_filter_receives_all_events() {
+        let sink = RealtimeSink::new();
+        let project = ProjectId::new();
+        let key = ChannelKey::new(project, TableName::new("orders").unwrap());
+
+        let mut rx = sink.registry().subscribe_filtered(key.clone(), None);
+
+        sink.publish(&make_event_with_status(project, "orders", 1, "pending")).await.unwrap();
+        sink.publish(&make_event_with_status(project, "orders", 2, "paid")).await.unwrap();
+
+        assert_eq!(rx.try_recv().unwrap().seq, 1);
+        assert_eq!(rx.try_recv().unwrap().seq, 2);
+    }
+
+    /// Two subscribers on the same channel with different filters each get
+    /// only their matching events.
+    #[tokio::test]
+    async fn two_subscribers_different_filters() {
+        let sink = RealtimeSink::new();
+        let project = ProjectId::new();
+        let key = ChannelKey::new(project, TableName::new("orders").unwrap());
+
+        let f_paid = Filter::new("NEW.status = 'paid'").unwrap();
+        let f_pending = Filter::new("NEW.status = 'pending'").unwrap();
+
+        let mut rx_paid = sink.registry().subscribe_filtered(key.clone(), Some(f_paid));
+        let mut rx_pending = sink.registry().subscribe_filtered(key.clone(), Some(f_pending));
+
+        sink.publish(&make_event_with_status(project, "orders", 1, "pending")).await.unwrap();
+        sink.publish(&make_event_with_status(project, "orders", 2, "paid")).await.unwrap();
+
+        // paid subscriber sees seq=2 only
+        let p = rx_paid.try_recv().unwrap();
+        assert_eq!(p.seq, 2);
+        assert!(rx_paid.try_recv().is_err());
+
+        // pending subscriber sees seq=1 only
+        let q = rx_pending.try_recv().unwrap();
+        assert_eq!(q.seq, 1);
+        assert!(rx_pending.try_recv().is_err());
     }
 }

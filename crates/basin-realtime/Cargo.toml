@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 basin-common.workspace = true
+basin-auth.workspace = true
 
 tokio.workspace = true
 async-trait.workspace = true
@@ -16,10 +17,31 @@ tracing.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+futures.workspace = true
+
+# HTTP stack (SSE transport, R2).
+axum.workspace = true
 
 # Concurrent per-(project, table) broadcast registry.
 dashmap = "6"
 
+# Used by budget.rs (BudgetTracker) and the realtime overflow sentinel sub-id.
+uuid.workspace = true
+
+# Predicate eval reused from the webhook subscription filter path (5.11.I).
+# The `delivery` feature (default) is fine here; basin-net does not
+# depend on basin-realtime so there is no dep cycle.
+basin-webhooks.workspace = true
+sqlparser.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 basin-common.workspace = true
+
+[dev-dependencies.criterion]
+version = "0.5"
+features = ["html_reports"]
+
+[[bench]]
+name = "filter_eval"
+harness = false

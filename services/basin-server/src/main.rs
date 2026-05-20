@@ -284,11 +284,12 @@ async fn main() -> Result<()> {
     // The sink is a no-op until at least one SSE/WebSocket subscriber calls
     // `RealtimeSink::registry().subscribe(key)` (R2/R3).
     #[cfg(feature = "realtime")]
-    {
-        let realtime_sink = basin_realtime::RealtimeSink::new();
-        engine.attach_post_commit_sink(std::sync::Arc::new(realtime_sink));
+    let realtime_sink = {
+        let sink = basin_realtime::RealtimeSink::new();
+        engine.attach_post_commit_sink(std::sync::Arc::new(sink.clone()));
         tracing::info!("basin-realtime post-commit sink attached");
-    }
+        sink
+    };
 
     // Build the static resolver from `BASIN_PROJECTS`.
     let mut static_resolver = StaticProjectResolver::default();
@@ -446,6 +447,39 @@ async fn main() -> Result<()> {
         tracing::info!(bind = %running.local_addr, "basin-rest listening");
         rest_handle = Some(running);
     }
+
+    // --- optional realtime SSE listener (Phase 5.11.R2, ADR 0018) ------------
+    //
+    // Requires auth (same invariant as basin-rest per ADR 0006). Binds on
+    // BASIN_REALTIME_BIND (default 127.0.0.1:5435) and serves
+    // GET /realtime/v1/sse/:project/:table.
+    //
+    // The `sse_serve` function is self-contained inside `basin-realtime`:
+    // `basin-server` never imports `axum` directly.
+    #[cfg(feature = "realtime")]
+    let _realtime_handle: Option<tokio::task::JoinHandle<()>> =
+        if let Some(ref auth) = auth_service {
+            let realtime_bind: std::net::SocketAddr = std::env::var("BASIN_REALTIME_BIND")
+                .unwrap_or_else(|_| "127.0.0.1:5435".to_string())
+                .parse()
+                .context("BASIN_REALTIME_BIND must be host:port")?;
+            let handle = basin_realtime::sse_serve(
+                realtime_bind,
+                realtime_sink.registry().clone(),
+                auth.clone(),
+            )
+            .await
+            .with_context(|| format!("basin-realtime bind {realtime_bind} failed"))?;
+            tracing::info!(bind = %realtime_bind, "basin-realtime SSE listener is accept-ready");
+            Some(handle)
+        } else {
+            tracing::info!(
+                "basin-realtime: SSE listener not started (requires BASIN_AUTH_ENABLED=1)"
+            );
+            None
+        };
+    #[cfg(not(feature = "realtime"))]
+    let _realtime_handle: Option<tokio::task::JoinHandle<()>> = None;
 
     // Wait for Ctrl-C, then signal the router to stop.
     let _ = tokio::signal::ctrl_c().await;

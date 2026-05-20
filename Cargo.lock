@@ -1081,14 +1081,21 @@ name = "basin-realtime"
 version = "0.1.9"
 dependencies = [
  "async-trait",
+ "axum",
+ "basin-auth",
  "basin-common",
+ "basin-webhooks",
  "chrono",
+ "criterion",
  "dashmap",
+ "futures",
  "serde",
  "serde_json",
+ "sqlparser",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
