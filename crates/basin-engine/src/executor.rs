@@ -4410,13 +4410,17 @@ async fn exec_select(
             rows_scanned: total_rows,
             // files_opened / bytes_decoded / cache_hits: DataFusion does not
             // expose these counters through the public DataFrame API in the
-            // current version.  Set to 0 for now; 5.16.C / 5.16.D will
-            // instrument the physical plan metrics once the OTLP export is
-            // wired in.
+            // current version.  Set to 0 for now; 5.16.D will instrument the
+            // physical plan metrics once the OTLP export is wired in.
             files_opened: 0,
             bytes_decoded: 0,
             cache_hits: 0,
             fast_path_engaged: false,
+            // Phase 5.16.C: table_row_count for scale-bucket assignment.
+            // We use 0 (bucket 0) as the default — the catalog row count is
+            // not readily available at this call site without an additional
+            // load_table round-trip.  5.16.D will wire in the real count.
+            table_row_count: 0,
         },
     );
 
