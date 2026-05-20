@@ -5568,10 +5568,11 @@ fn query_has_recursive_with_dml_body(query: &sqlparser::ast::Query) -> bool {
 ///    DataFusion CAN plan `WITH RECURSIVE … SELECT …`, so the recursive
 ///    generator is fully expanded before the rows land in the target table.
 ///
-/// Limitations (deferred to a follow-up):
-/// - UPDATE/DELETE with a recursive source are not yet supported; an explicit
-///   error is returned for those shapes so the caller gets a clear message
-///   rather than a confusing DataFusion planning failure.
+/// **UPDATE/DELETE**: Materialize each recursive CTE by running
+///   `WITH RECURSIVE name AS (body) SELECT * FROM name` through DataFusion,
+///   register the result as a MemTable, then run the UPDATE/DELETE.  The WHERE
+///   subquery (e.g. `WHERE id IN (SELECT id FROM cte)`) resolves against the
+///   registered MemTable via `resolve_subqueries_in_expr`.
 async fn exec_recursive_with_dml_body(
     sess: &ProjectSession,
     query: &sqlparser::ast::Query,
@@ -5603,11 +5604,11 @@ async fn exec_recursive_with_dml_body(
 
             exec_insert(sess, ins).await
         }
-        SetExpr::Update(_) | SetExpr::Delete(_) => {
-            Err(BasinError::FeatureNotSupported(
-                "WITH RECURSIVE feeding UPDATE or DELETE is not yet supported (SQLSTATE 0A000)"
-                    .into(),
-            ))
+        SetExpr::Update(Statement::Update(upd)) => {
+            exec_recursive_with_update(sess, with, upd).await
+        }
+        SetExpr::Delete(Statement::Delete(del)) => {
+            exec_recursive_with_delete(sess, with, del).await
         }
         _ => {
             // Shouldn't reach here given the query_has_recursive_with_dml_body
@@ -5617,6 +5618,124 @@ async fn exec_recursive_with_dml_body(
             ))
         }
     }
+}
+
+/// Materialize every CTE in `with` as a MemTable registered in `sess.ctx`.
+///
+/// For each CTE `name AS (body)` we run:
+///   `WITH RECURSIVE name AS (body) SELECT * FROM name`
+/// through DataFusion (which natively supports recursive CTEs), collect the
+/// rows, and register them as a MemTable so subsequent DML can reference
+/// `name` in WHERE subqueries (e.g. `WHERE id IN (SELECT id FROM name)`).
+///
+/// Returns the list of registered table names so the caller can deregister
+/// after DML completes (best-effort cleanup; sessions are per-request anyway).
+async fn materialize_recursive_ctes(
+    sess: &ProjectSession,
+    with: &sqlparser::ast::With,
+) -> Result<Vec<String>> {
+    use datafusion::datasource::memory::MemTable;
+
+    let mut registered: Vec<String> = Vec::new();
+
+    for cte in &with.cte_tables {
+        let cte_name = cte.alias.name.value.clone();
+        // Build: WITH RECURSIVE <name> AS (<body>) SELECT * FROM <name>
+        let expand_sql = format!(
+            "WITH RECURSIVE {name} AS ({body}) SELECT * FROM {name}",
+            name = cte_name,
+            body = cte.query,
+        );
+        let df = sess.ctx.sql(&expand_sql).await.map_err(|e| {
+            BasinError::internal(format!(
+                "WITH RECURSIVE: failed to plan CTE {cte_name:?}: {e}"
+            ))
+        })?;
+        let df_batches = df.collect().await.map_err(|e| {
+            BasinError::internal(format!(
+                "WITH RECURSIVE: failed to execute CTE {cte_name:?}: {e}"
+            ))
+        })?;
+
+        let df_schema = if df_batches.is_empty() {
+            sess.ctx
+                .sql(&expand_sql)
+                .await
+                .map_err(|e| BasinError::internal(format!("schema re-plan: {e}")))?
+                .schema()
+                .as_arrow()
+                .clone()
+                .into()
+        } else {
+            df_batches[0].schema()
+        };
+
+        let provider = MemTable::try_new(df_schema, vec![df_batches])
+            .map_err(|e| BasinError::internal(format!("MemTable for CTE {cte_name:?}: {e}")))?;
+
+        let _ = sess.ctx.deregister_table(&cte_name);
+        sess.ctx
+            .register_table(&cte_name, Arc::new(provider))
+            .map_err(|e| BasinError::internal(format!("register CTE {cte_name:?}: {e}")))?;
+        registered.push(cte_name);
+    }
+
+    Ok(registered)
+}
+
+/// Execute `WITH RECURSIVE … UPDATE …` by materializing the CTEs as MemTables
+/// and routing the UPDATE through the existing `exec_update` path.
+///
+/// The WHERE clause subquery (e.g. `WHERE id IN (SELECT id FROM cte)`) is
+/// resolved by `resolve_subqueries_in_expr` against the registered MemTable.
+async fn exec_recursive_with_update(
+    sess: &ProjectSession,
+    with: &sqlparser::ast::With,
+    upd: &sqlparser::ast::Update,
+) -> Result<ExecResult> {
+    let registered = materialize_recursive_ctes(sess, with).await?;
+
+    let from_twj = upd.from.as_ref().and_then(|f| match f {
+        sqlparser::ast::UpdateTableFromKind::BeforeSet(v)
+        | sqlparser::ast::UpdateTableFromKind::AfterSet(v) => v.first().cloned(),
+    });
+
+    let result = crate::dml_mutate::exec_update(
+        sess,
+        upd.table.clone(),
+        upd.assignments.clone(),
+        from_twj,
+        upd.selection.clone(),
+        upd.returning.clone(),
+    )
+    .await;
+
+    for name in &registered {
+        let _ = sess.ctx.deregister_table(name.as_str());
+    }
+
+    result
+}
+
+/// Execute `WITH RECURSIVE … DELETE …` by materializing the CTEs as MemTables
+/// and routing the DELETE through the existing `exec_delete` path.
+///
+/// The WHERE clause subquery (e.g. `WHERE id IN (SELECT id FROM cte)`) is
+/// resolved by `resolve_subqueries_in_expr` against the registered MemTable.
+async fn exec_recursive_with_delete(
+    sess: &ProjectSession,
+    with: &sqlparser::ast::With,
+    del: &sqlparser::ast::Delete,
+) -> Result<ExecResult> {
+    let registered = materialize_recursive_ctes(sess, with).await?;
+
+    let result = crate::dml_mutate::exec_delete(sess, del.clone()).await;
+
+    for name in &registered {
+        let _ = sess.ctx.deregister_table(name.as_str());
+    }
+
+    result
 }
 
 /// Execute a `WITH … SELECT …` query whose CTE list contains at least one

@@ -30,6 +30,7 @@ mod enums;
 mod functions;
 mod in_memory;
 pub mod info_schema;
+mod inbound_webhooks;
 mod metadata;
 mod postgres;
 mod procedures;
@@ -47,6 +48,7 @@ use basin_common::{ChangeOp, ProjectId, QualifiedTableName, Result, SchemaName, 
 
 pub use domains::{DomainDef, DomainError, BASIN_DOMAIN_KEY};
 pub use enums::{EnumError, EnumTypeDef, BASIN_ENUM_TYPE_KEY};
+pub use inbound_webhooks::{InboundWebhookDef, InboundWebhookError};
 pub use functions::{
     SqlArgType, SqlFunctionArg, SqlFunctionDef, SqlFunctionLanguage, SqlReturnType,
 };
@@ -1547,5 +1549,49 @@ pub trait Catalog: Send + Sync {
     async fn list_views(&self, project: &ProjectId) -> Vec<ViewDef> {
         let _ = project;
         vec![]
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 5.11.N — inbound webhook receivers (ADR 0019)
+    // -----------------------------------------------------------------------
+
+    /// Register a `CREATE INBOUND WEBHOOK` declaration. Returns
+    /// [`basin_common::BasinError::Catalog`] when `name` collides with an
+    /// existing inbound webhook for the same project, and
+    /// [`basin_common::BasinError::InvalidSchema`] when the body fails to
+    /// parse. Default impl: not implemented.
+    async fn register_inbound_webhook(&self, def: InboundWebhookDef) -> Result<()> {
+        let _ = def;
+        Err(basin_common::BasinError::Internal(
+            "register_inbound_webhook not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Drop a previously-registered inbound webhook. Returns
+    /// [`basin_common::BasinError::NotFound`] if no webhook with that
+    /// `(project, name)` exists. Default impl: not implemented.
+    async fn drop_inbound_webhook(&self, project: &ProjectId, name: &str) -> Result<()> {
+        let _ = (project, name);
+        Err(basin_common::BasinError::Internal(
+            "drop_inbound_webhook not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Look up a registered inbound webhook by `(project, name)`. Returns
+    /// `None` when the name does not resolve. Default impl: `None`.
+    async fn lookup_inbound_webhook(
+        &self,
+        project: &ProjectId,
+        name: &str,
+    ) -> Option<InboundWebhookDef> {
+        let _ = (project, name);
+        None
+    }
+
+    /// List every inbound webhook registered for `project`. Default impl:
+    /// empty.
+    async fn list_inbound_webhooks(&self, project: &ProjectId) -> Vec<InboundWebhookDef> {
+        let _ = project;
+        Vec::new()
     }
 }

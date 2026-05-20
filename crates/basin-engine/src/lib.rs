@@ -734,6 +734,7 @@ mod fts_udf;
 mod is_distinct_rewrite;
 mod function_ddl;
 mod generated_cols;
+pub mod inbound_webhook_ddl;
 mod geo_glue;
 mod index_extras;
 pub(crate) mod secondary_index;

@@ -23,6 +23,7 @@ use crate::metadata::{
     CheckConstraint, CvDef, DataFileRef, ForeignKeyDef, PartitionSpec, Policy, SecondaryIndex,
     TableFileFormat, TableMetadata, UniqueConstraint,
 };
+use crate::inbound_webhooks::{self, InboundWebhookDef, InboundWebhookError};
 use crate::procedures::{self, ProcedureError, SqlProcedureDef};
 use crate::project_storage_config::ProjectStorageConfig;
 use crate::reactors::{self, ReactorDef, ReactorError};
@@ -164,6 +165,10 @@ pub struct InMemoryCatalog {
     /// `create_namespace`. Used by `list_schemas`, `create_schema`, and
     /// `drop_schema`.
     schemas: Mutex<HashMap<ProjectId, HashSet<SchemaName>>>,
+    /// Per-project inbound webhook definitions (Phase 5.11.N, ADR 0019).
+    /// One shared `HashMap` keyed by `(ProjectId, name)` — per-project cost
+    /// stays `O(bytes)` with no per-project heavy resource.
+    inbound_webhooks: Mutex<HashMap<(ProjectId, String), InboundWebhookDef>>,
 }
 
 /// Aggregate reactor state. The seq counter assigns each newly-
@@ -207,6 +212,7 @@ impl InMemoryCatalog {
             project_storage_config: Mutex::new(HashMap::new()),
             views: Mutex::new(HashMap::new()),
             schemas: Mutex::new(HashMap::new()),
+            inbound_webhooks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -362,6 +368,8 @@ impl Catalog for InMemoryCatalog {
         storage_cfg.remove(project);
         let mut schemas = self.schemas.lock().await;
         schemas.remove(project);
+        let mut iwhs = self.inbound_webhooks.lock().await;
+        iwhs.retain(|(t, _), _| t != project);
         Ok(())
     }
 
@@ -1179,6 +1187,53 @@ impl Catalog for InMemoryCatalog {
     }
 
     // -----------------------------------------------------------------------
+    // Phase 5.11.N — inbound webhook receivers (ADR 0019)
+    // -----------------------------------------------------------------------
+
+    async fn register_inbound_webhook(&self, def: InboundWebhookDef) -> Result<()> {
+        inbound_webhooks::validate_body(&def.body).map_err(inbound_webhook_err_to_basin)?;
+        let key = (def.project, def.name.clone());
+        let mut map = self.inbound_webhooks.lock().await;
+        if map.contains_key(&key) {
+            return Err(BasinError::Catalog(format!(
+                "inbound webhook {:?} already exists for project {}",
+                def.name, def.project
+            )));
+        }
+        map.insert(key, def);
+        Ok(())
+    }
+
+    async fn drop_inbound_webhook(&self, project: &ProjectId, name: &str) -> Result<()> {
+        let key = (*project, name.to_string());
+        let mut map = self.inbound_webhooks.lock().await;
+        if map.remove(&key).is_none() {
+            return Err(BasinError::not_found(format!(
+                "inbound webhook {name:?} does not exist"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn lookup_inbound_webhook(
+        &self,
+        project: &ProjectId,
+        name: &str,
+    ) -> Option<InboundWebhookDef> {
+        let key = (*project, name.to_string());
+        let map = self.inbound_webhooks.lock().await;
+        map.get(&key).cloned()
+    }
+
+    async fn list_inbound_webhooks(&self, project: &ProjectId) -> Vec<InboundWebhookDef> {
+        let map = self.inbound_webhooks.lock().await;
+        map.iter()
+            .filter(|((t, _), _)| t == project)
+            .map(|(_, v)| v.clone())
+            .collect()
+    }
+
+    // -----------------------------------------------------------------------
     // Phase A.2 overrides: schema-qualified operations
     //
     // InMemoryCatalog provides real multi-schema semantics. All `*_qualified`
@@ -1778,6 +1833,21 @@ fn procedure_err_to_basin(e: ProcedureError) -> BasinError {
 }
 
 /// Map [`ReactorError`] into the cross-crate [`BasinError`] surface.
+fn inbound_webhook_err_to_basin(e: InboundWebhookError) -> BasinError {
+    match e {
+        InboundWebhookError::Duplicate => {
+            BasinError::Catalog("inbound webhook with the same name already exists".into())
+        }
+        InboundWebhookError::InvalidBody(msg) => {
+            BasinError::InvalidSchema(format!("inbound webhook body: {msg}"))
+        }
+        InboundWebhookError::MultiStatementBody => BasinError::InvalidSchema(
+            "inbound webhook body must be a single SQL statement".into(),
+        ),
+        InboundWebhookError::NotFound => BasinError::NotFound("inbound webhook not found".into()),
+    }
+}
+
 fn reactor_err_to_basin(e: ReactorError) -> BasinError {
     match e {
         ReactorError::Duplicate => {

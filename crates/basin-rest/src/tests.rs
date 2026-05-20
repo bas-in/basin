@@ -1514,3 +1514,88 @@ async fn rpc_zero_arg_function() {
 
     let _ = running.shutdown.send(());
 }
+
+// --- Phase 5.11.N: POST /in/<project>/<name> (ADR 0019) ----------------------
+
+/// Happy path: register an inbound webhook via DDL, POST JSON to /in/…,
+/// assert the row landed in the target table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_webhook_row_insert() {
+    let Some((running, svc, _auth, _mailer, _g)) = try_serve().await else {
+        return;
+    };
+    let addr = running.local_addr;
+    let project = ProjectId::new();
+
+    // Create the target table and register the inbound webhook via the engine.
+    let session = svc.inner.cfg.engine.open_session(project).await.unwrap();
+    session
+        .execute("CREATE TABLE webhook_events (id TEXT, raw_payload JSONB)")
+        .await
+        .unwrap();
+    session
+        .execute(
+            "CREATE INBOUND WEBHOOK test_hook EXECUTE \
+             INSERT INTO webhook_events (id, raw_payload) \
+             VALUES (payload->>'id', payload)",
+        )
+        .await
+        .unwrap();
+
+    // POST a JSON payload to /in/<project>/test_hook.
+    let project_str = project.to_string();
+    let path = format!("/in/{project_str}/test_hook");
+    let body = br#"{"id": "evt_001", "amount": 99}"#;
+    let r = http_request(
+        addr,
+        "POST",
+        &path,
+        &[("Content-Type", "application/json")],
+        Some(body),
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        200,
+        "inbound webhook body: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert_eq!(r.json()["ok"], serde_json::json!(true));
+
+    // Verify the row landed.
+    let rows = session
+        .execute("SELECT id FROM webhook_events WHERE id = 'evt_001'")
+        .await
+        .unwrap();
+    match rows {
+        basin_engine::ExecResult::Rows { batches, .. } => {
+            let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total, 1, "expected 1 row after inbound webhook insert");
+        }
+        other => panic!("unexpected result: {other:?}"),
+    }
+
+    let _ = running.shutdown.send(());
+}
+
+/// 404 when the webhook name does not exist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_webhook_not_found() {
+    let Some((running, _svc, _a, _m, _g)) = try_serve().await else {
+        return;
+    };
+    let addr = running.local_addr;
+    let project = ProjectId::new();
+    let path = format!("/in/{project}/no_such_hook");
+    let r = http_request(
+        addr,
+        "POST",
+        &path,
+        &[("Content-Type", "application/json")],
+        Some(br#"{}"#),
+    )
+    .await;
+    assert_eq!(r.status, 404);
+
+    let _ = running.shutdown.send(());
+}

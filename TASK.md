@@ -1761,7 +1761,11 @@ truth, this list is the human-readable summary.
 
 - [ ] `LATERAL` joins — uncorrelated strip + nested-aggregate ORM rewrite
   shipped (commit `4faa5d7`); correlated decorrelation for non-aggregate row-
-  returning bodies (#81, commit `6f7ab3c`); full advanced LATERAL still partial.
+  returning bodies (#81, commit `6f7ab3c`); compound-WHERE nested-agg shape
+  (e.g. `WHERE fk = outer.pk AND extra_col = val`) closed via
+  `parse_corr_predicate_with_extra_filters` + `split_and_conjuncts` helpers;
+  ORDER BY + LIMIT shape closed via window-function rewrite; remaining
+  shapes (multi-table child, OR predicates, CROSS LATERAL aggregate) still partial.
 - [x] `WITH RECURSIVE` + DML-in-CTE (INSERT) — multi-column RECURSIVE shipped
   (#82, commit `dae8765`); data-modifying CTEs shipped (commit `6056dca`);
   `WITH RECURSIVE … INSERT INTO target SELECT * FROM cte` now supported via
