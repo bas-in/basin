@@ -521,9 +521,9 @@ enums, lines ~200–270); ROADMAP 0.6.
 
 ---
 
-### T-029 — Realtime: presence over WebSocket ✅ unblocked
+### T-029 — Realtime: presence over WebSocket ✅ done
 
-**Status:** ready 2026-05-20. **Depends on T-028** (rides the same socket).
+**Status:** done 2026-05-20. `PresenceChannel` in `src/realtime/presence.ts`; presence routing added to `WsConnection` in `src/realtime/ws.ts`; 8 tests green.
 
 **Files:** `src/realtime/presence.ts` (new), `src/realtime/presence.test.ts`
 (new), small additions to `src/realtime/ws.ts`

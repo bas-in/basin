@@ -3,6 +3,10 @@ function backoff(attempt: number): number {
   return Math.min(1000 * Math.pow(2, attempt), 30_000);
 }
 
+export interface PresenceMessageHandler {
+  handleMessage(msg: unknown): void;
+}
+
 export interface WsEvent {
   table: string;
   op: "INSERT" | "UPDATE" | "DELETE";
@@ -34,7 +38,9 @@ type ServerMsg =
   | { type: "subscribed"; table: string }
   | { type: "unsubscribed"; table: string }
   | { type: "event"; table: string; op: "INSERT" | "UPDATE" | "DELETE"; after: unknown; seq: number }
-  | { type: "error"; code: string; table?: string; missed?: number };
+  | { type: "error"; code: string; table?: string; missed?: number }
+  | { type: "presence_state"; channel: string; presences: unknown[] }
+  | { type: "presence_diff"; channel: string; joins: unknown[]; leaves: unknown[] };
 
 export class WsConnection {
   #url: string;
@@ -44,6 +50,7 @@ export class WsConnection {
   #ws: WebSocket | null = null;
   #subs: Map<string, Subscription> = new Map();
   #pending: Map<string, { resolve: () => void; reject: (e: Error) => void }> = new Map();
+  #presenceHandlers: Map<string, PresenceMessageHandler> = new Map();
   #closed = false;
   #reconnectAttempt = 0;
   #reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -125,6 +132,11 @@ export class WsConnection {
           sub.onLag({ table: msg.table, missed: msg.missed ?? 0 });
         }
       }
+    } else if (msg.type === "presence_state" || msg.type === "presence_diff") {
+      const channel = (msg as unknown as Record<string, unknown>)["channel"] as string | undefined;
+      if (channel) {
+        this.#presenceHandlers.get(channel)?.handleMessage(msg);
+      }
     }
   }
 
@@ -170,6 +182,20 @@ export class WsConnection {
         resolve();
       }
     });
+  }
+
+  registerPresence(channel: string, handler: PresenceMessageHandler): void {
+    this.#presenceHandlers.set(channel, handler);
+  }
+
+  unregisterPresence(channel: string): void {
+    this.#presenceHandlers.delete(channel);
+  }
+
+  send(frame: unknown): void {
+    if (this.#ws && this.#ws.readyState === 1 /* OPEN */) {
+      this.#ws.send(JSON.stringify(frame));
+    }
   }
 
   close(): void {
