@@ -643,9 +643,27 @@ pub(crate) async fn enforce_with_check(
         preds.push(substitute_current_user(raw, current_user));
     }
 
-    // RLS on + no permissive policy applies ⇒ default-deny: no row may be
-    // written. Postgres rejects the write with 42501 here.
+    // RLS on + no permissive policy applies ⇒ default-deny, but only when
+    // either (a) the table has no policies at all (bare `ENABLE ROW LEVEL
+    // SECURITY` with nothing declared), or (b) at least one policy targets
+    // this operation kind (ALL or `kind`) but none matched the current user.
+    //
+    // Case (c): the table has policies, but they are all FOR SELECT (or FOR
+    // DELETE, etc.) — none govern INSERT. In that situation Postgres does NOT
+    // block the write; the INSERT is simply uncontrolled by RLS. Without this
+    // distinction a table with only a FOR SELECT policy would incorrectly
+    // deny all INSERTs.
     let combined: String = if preds.is_empty() {
+        let has_relevant_policy = policies.iter().any(|p| {
+            matches!(p.command, PolicyCommand::All) || p.command == kind
+        });
+        if !policies.is_empty() && !has_relevant_policy {
+            // Policies exist, but none target this operation — nothing to
+            // enforce; allow the write.
+            return Ok(());
+        }
+        // Either no policies at all (bare ENABLE RLS → deny-all), or there
+        // are relevant policies but none matched the current user (deny-all).
         "FALSE".to_string()
     } else {
         // OR-merge: a row passes if it satisfies *any* applicable
