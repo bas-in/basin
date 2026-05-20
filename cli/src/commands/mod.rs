@@ -26,6 +26,7 @@ pub mod email;
 pub mod engine_pin;
 pub mod erd;
 pub mod extensions;
+pub mod functions;
 pub mod gen;
 pub mod help;
 pub mod init;
@@ -167,6 +168,11 @@ pub fn all() -> Vec<Entry> {
             "storage",
             "Manage object storage buckets and objects (engine 5.17).",
             storage::cmd_storage
+        ),
+        entry!(
+            "functions",
+            "Deploy JS/TS edge functions to the Wasm component runtime (5.11.W).",
+            functions::cmd_functions
         ),
         entry!(
             "rls",
