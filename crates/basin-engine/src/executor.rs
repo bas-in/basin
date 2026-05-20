@@ -1095,46 +1095,12 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     .await?;
     let sql = enum_rewritten.as_str();
 
-    // ADR 0014 Phase 1 — noop-accept intercept + explicit-reject gate.
-    //
-    // Parse with libpg_query and intercept any statement in the syntactic-
-    // accept set *before* sqlparser sees the SQL. sqlparser's
-    // PostgreSqlDialect cannot parse many PG-native forms (`BEGIN`,
-    // `SAVEPOINT`, `PREPARE`, `CREATE TRIGGER`, etc.) so this intercept
-    // must run before the `Parser::parse_sql` call below. Any kind not in
-    // the noop set falls through to sqlparser as before.
-    //
-    // The explicit-reject gate (is_unsupported) fires here so that kinds
-    // like LISTEN / NOTIFY / UNLISTEN get a clean SQLSTATE 0A000 error
-    // instead of a confusing sqlparser parse-error (sqlparser's
-    // PostgreSqlDialect can't parse those forms either, and its error
-    // messages don't mention 0A000).
-    //
-    // We use `raw_sql` (the unmodified statement the caller provided)
-    // rather than `sql` (which has been through Basin's pre-screen
-    // pipeline) because statements in the noop / reject sets are simple
-    // PG-native forms that are not rewritten by any pre-screen above.
-    // Reuse `raw_pg_tree` from the Phase 1 parse above — same SQL, no
-    // need to call the C library parser a second time.
-    if let Some(ref tree) = raw_pg_tree {
-        if let Some(node) = tree.stmts().next() {
-            let kind = crate::pg_ast::stmt_kind(node);
-            // Noop-accept: return an empty ok result without reaching sqlparser.
-            if let Some(result) = crate::noop_accept::try_accept_as_noop(kind, raw_sql) {
-                return Ok(result);
-            }
-            // Explicit-reject: LISTEN / NOTIFY / UNLISTEN are permanent
-            // non-goals per ADR 0012; surface 0A000 before sqlparser fails
-            // with a confusing parse error.
-            if kind.is_unsupported() {
-                return Err(BasinError::FeatureNotSupported(format!(
-                    "{} is not supported (SQLSTATE 0A000)",
-                    kind.as_label()
-                )));
-            }
-        }
-    }
-
+    // Phase 5.13.C — the noop-accept + explicit-reject gates above (early
+    // in the hot path, before any string-rewrite pipeline) already dispatch
+    // every statement in the syntactic-accept set and reject every
+    // design-exclusion kind (LISTEN/NOTIFY/UNLISTEN). The redundant second
+    // gate that previously lived here (ADR 0014 Phase 1 dual path) has been
+    // removed; sqlparser now only sees DML/DDL that needs its AST.
     let dialect = PostgreSqlDialect {};
     let mut stmts = Parser::parse_sql(&dialect, sql).map_err(|e| {
         // sqlparser's PostgreSqlDialect requires `STORED` after a

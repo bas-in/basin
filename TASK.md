@@ -1016,9 +1016,11 @@ same `object_store` the engine uses; signed URLs are HMAC over
 #### 5.17.B — HTTP API in basin-rest (~1.5 weeks)
 
 - [ ] `POST/GET/DELETE /storage/v1/object/:bucket/:path*` (upload /
-      download / delete; RLS-gated). `GET /storage/v1/object/public/…`
+      download / single-delete; RLS-gated). `GET /storage/v1/object/public/…`
       fast path for public buckets. `POST /storage/v1/object/list/:bucket`.
-      Bucket CRUD under `/storage/v1/bucket`.
+      Bulk delete `DELETE /storage/v1/object/:bucket` with `{prefixes:[]}`
+      body (basin-js `.remove(paths[])` maps here). Bucket CRUD under
+      `/storage/v1/bucket`.
 - [ ] Body cap from `storage.buckets.file_size_limit`; MIME sniffed
       server-side against `allowed_mime_types[]`; path normalised
       (traversal guard).
@@ -1174,7 +1176,7 @@ gated on Phase 2 completion.
       replacing the regex; no new diffs in `sql_support_matrix`.
       Files: `crates/basin-engine/src/executor.rs` (per-pre-screen),
       `crates/basin-engine/src/pg_ast.rs` (typed matches).
-- [ ] **5.13.C** Unconditional pg_query path (Phase 3) — Agent 5 flips
+- [x] **5.13.C** Unconditional pg_query path (Phase 3) — Agent 5 flips
       `BASIN_PG_QUERY` unconditional and removes the sqlparser
       front-end from the executor's hot path. sqlparser stays only for
       legacy module-internal node bodies until Phase 2's full translator

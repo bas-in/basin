@@ -6,14 +6,12 @@
 //! the long-tail SQL features (window funcs, GROUPING SETS, recursive CTEs,
 //! MERGE, LATERAL).
 //!
-//! Today this module is wired into [`crate::executor::execute`] behind the
-//! `BASIN_PG_QUERY` env-gate: when set, every incoming statement is parsed
-//! with libpg_query and any kind in the "known-but-unsupported" set is
-//! rejected with SQLSTATE 0A000 *before* sqlparser sees it. Other kinds
-//! fall through to the existing sqlparser-based pipeline. The gate is
-//! intentional — agents 2–4 migrate the textual pre-screens to AST
-//! matchers against the same parse tree before agent 5 flips this
-//! unconditional and deletes the textual pre-screens.
+//! Phase 5.13.C: the `BASIN_PG_QUERY` env-gate has been removed. libpg_query
+//! now unconditionally parses every incoming statement at the top of
+//! [`crate::executor::execute`]; unsupported kinds are rejected with
+//! SQLSTATE 0A000 before sqlparser sees them, and all textual prescreens
+//! have been migrated to typed AST matches (Phase 5.13.B). sqlparser
+//! remains only for DML/DDL that needs its AST downstream.
 
 use basin_common::{BasinError, Result};
 use pg_query::protobuf::{node::Node as NodeEnum, Node};
@@ -1126,9 +1124,8 @@ fn capture_right_unit(bytes: &[u8], i_in: usize) -> usize {
 /// unsupported statement. Returns `Ok(())` if every statement is
 /// either supported or [`StmtKind::Other`].
 ///
-/// Routed by the executor's `BASIN_PG_QUERY` env-gate today. Phase 2
-/// makes this unconditional and extends the reject set as features
-/// land.
+/// Called unconditionally from the executor entry (Phase 5.13.C).
+/// Extends the reject set as design-exclusion features are confirmed.
 pub fn reject_unsupported(tree: &ParseTree) -> Result<()> {
     for node in tree.stmts() {
         let kind = stmt_kind(node);
