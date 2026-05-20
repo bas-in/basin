@@ -342,3 +342,88 @@ async fn lateral_order_by_limit_comma_join() {
         "comma-LATERAL ORDER BY LIMIT must exclude outer rows with no match"
     );
 }
+
+// ─── test 8: correlated LATERAL aggregate with compound WHERE (AND extra filter) ─
+
+/// `SELECT p.id, cnt.c FROM parents p LEFT JOIN LATERAL (SELECT count(*) AS c
+/// FROM children ch WHERE ch.parent_id = p.id AND ch.active = true) cnt ON true`
+///
+/// Each parent gets the count of **active** children only.  Previously this
+/// shape fell through all rewriters because `parse_single_correlation_predicate`
+/// rejects compound AND clauses.  Basin now splits the AND conjuncts, extracts
+/// the FK equality for the GROUP BY correlation, and pushes the extra filter
+/// into a WHERE clause on the rewritten pre-aggregation subquery:
+///
+/// ```sql
+/// -- rewritten to:
+/// SELECT p.id, cnt.c
+/// FROM parents p
+/// LEFT JOIN (
+///   SELECT ch.parent_id, count(*) AS c
+///   FROM children ch
+///   WHERE ch.active = true
+///   GROUP BY ch.parent_id
+/// ) cnt ON cnt.parent_id = p.id
+/// ```
+///
+/// This test previously failed with a DataFusion correlated-subquery error;
+/// it now passes as proof of the compound-WHERE nested-agg decorrelation.
+#[tokio::test]
+async fn lateral_nested_agg_compound_where_filter() {
+    let (_dir, engine) = open_engine().await;
+    let sess = open_session(&engine).await;
+
+    exec_ok(&sess, "CREATE TABLE parents (id INT NOT NULL)").await;
+    exec_ok(
+        &sess,
+        "CREATE TABLE children (parent_id INT NOT NULL, active BOOLEAN NOT NULL)",
+    )
+    .await;
+    exec_ok(&sess, "INSERT INTO parents VALUES (1), (2), (3)").await;
+    // parent=1: 2 active, 1 inactive; parent=2: 1 active; parent=3: 0 active.
+    exec_ok(
+        &sess,
+        "INSERT INTO children VALUES \
+         (1, true), (1, true), (1, false), \
+         (2, true), \
+         (3, false)",
+    )
+    .await;
+
+    let batches = exec_ok(
+        &sess,
+        "SELECT p.id, cnt.c \
+         FROM parents p \
+         LEFT JOIN LATERAL (\
+           SELECT count(*) AS c \
+           FROM children ch \
+           WHERE ch.parent_id = p.id AND ch.active = true\
+         ) cnt ON true \
+         ORDER BY p.id",
+    )
+    .await;
+
+    // 3 rows: one per parent (LEFT JOIN preserves all).
+    assert_eq!(
+        total_rows(&batches),
+        3,
+        "LEFT JOIN LATERAL compound-WHERE agg must return one row per parent"
+    );
+
+    if let Some(batch) = batches.first() {
+        use arrow_array::Int64Array;
+        let c_col = batch.column(1); // cnt.c
+        if let Some(arr) = c_col.as_any().downcast_ref::<Int64Array>() {
+            // parent=1 → 2 active children
+            assert_eq!(arr.value(0), 2, "parent=1 must have 2 active children");
+            // parent=2 → 1 active child
+            assert_eq!(arr.value(1), 1, "parent=2 must have 1 active child");
+            // parent=3 → no active children; pre-agg subquery has no row for
+            // parent=3 so the LEFT JOIN produces NULL.
+            assert!(
+                arr.is_null(2),
+                "parent=3 must have NULL count (no active children)"
+            );
+        }
+    }
+}

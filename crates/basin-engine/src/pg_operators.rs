@@ -2093,16 +2093,17 @@ pub(crate) fn rewrite_lateral_nested_agg(sql: &str) -> String {
         let where_body = body[where_pos_opt.unwrap() + 6..].trim(); // skip "where "
         let where_body_lower = where_body.to_ascii_lowercase();
 
-        // Parse exactly one correlation predicate: `child_ref.fk = outer_ref.pk`
-        // or `outer_ref.pk = child_ref.fk`. We do NOT rewrite if there are
-        // additional predicates (AND, OR) beyond the single correlation.
-        let corr = match parse_single_correlation_predicate(
+        // Parse the FK correlation predicate. We now also accept compound AND
+        // clauses: extra conjuncts (non-FK filters) are passed through into a
+        // WHERE clause on the rewritten pre-aggregation subquery.  This covers
+        // the ORM pattern `WHERE fk = outer.pk AND extra_col = val`.
+        let (corr, extra_where) = match parse_corr_predicate_with_extra_filters(
             where_body,
             &where_body_lower,
             &child_alias,
             &child_table,
         ) {
-            Some(c) => c,
+            Some(pair) => pair,
             None => {
                 search_from = ljl_end;
                 continue;
@@ -2175,17 +2176,28 @@ pub(crate) fn rewrite_lateral_nested_agg(sql: &str) -> String {
 
         // All preconditions satisfied. Build the rewritten SQL.
         //
-        // Original: LEFT JOIN LATERAL (SELECT proj FROM child [AS calias] WHERE child.fk = outer.pk) sub ON true
-        // Rewrite:  LEFT JOIN (SELECT child.fk, proj FROM child [AS calias] GROUP BY child.fk) sub ON sub.fk = outer.pk
+        // Original: LEFT JOIN LATERAL (SELECT proj FROM child [AS calias]
+        //           WHERE child.fk = outer.pk [AND extra]) sub ON true
+        // Rewrite:  LEFT JOIN (SELECT child.fk, proj FROM child [AS calias]
+        //           [WHERE extra] GROUP BY child.fk) sub ON sub.fk = outer.pk
         //
-        // The fk_col comes from the corr.child_col; pk side is corr.outer_ref (e.g. "parent.id").
+        // extra_where contains any additional AND conjuncts from the LATERAL
+        // WHERE clause beyond the FK=outer correlation; empty when the original
+        // had only the single equality predicate.
         let fk_ref = format!("{}.{}", child_alias, corr.child_col);
         let child_decl = if child_table != child_alias {
             format!("{} AS {}", child_table, child_alias)
         } else {
             child_table.clone()
         };
-        let new_body = format!("SELECT {fk_ref}, {proj_str} FROM {child_decl} GROUP BY {fk_ref}",);
+        let where_clause = if extra_where.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {extra_where}")
+        };
+        let new_body = format!(
+            "SELECT {fk_ref}, {proj_str} FROM {child_decl}{where_clause} GROUP BY {fk_ref}"
+        );
         let new_on = format!("{sub_alias}.{} = {}", corr.child_col, corr.outer_ref);
         let replacement = format!("LEFT JOIN ({new_body}) {sub_alias} ON {new_on}",);
 
@@ -3259,6 +3271,103 @@ fn parse_single_correlation_predicate(
     } else {
         None
     }
+}
+
+/// Split a WHERE clause into AND-conjuncts at depth 0 (not inside parens/quotes).
+///
+/// Returns slices of `where_body`, one per conjunct (whitespace-trimmed).
+/// OR at depth 0 is not split — callers treat it conservatively.
+fn split_and_conjuncts(where_body: &str) -> Vec<&str> {
+    let bytes = where_body.as_bytes();
+    let lower = where_body.to_ascii_lowercase();
+    let mut depth = 0i32;
+    let mut in_quote = false;
+    let mut segments: Vec<&str> = Vec::new();
+    let mut seg_start = 0usize;
+    let mut i = 0usize;
+    while i < where_body.len() {
+        match bytes[i] {
+            b'\'' if !in_quote => {
+                in_quote = true;
+                i += 1;
+            }
+            b'\'' if in_quote => {
+                if i + 1 < where_body.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                } else {
+                    in_quote = false;
+                    i += 1;
+                }
+            }
+            b'(' if !in_quote => {
+                depth += 1;
+                i += 1;
+            }
+            b')' if !in_quote => {
+                depth -= 1;
+                i += 1;
+            }
+            _ if !in_quote && depth == 0 => {
+                if lower[i..].starts_with(" and ") {
+                    segments.push(where_body[seg_start..i].trim());
+                    seg_start = i + 5;
+                    i = seg_start;
+                } else {
+                    i += 1;
+                }
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    let last = where_body[seg_start..].trim();
+    if !last.is_empty() {
+        segments.push(last);
+    }
+    segments
+}
+
+/// Parse the FK correlation predicate from a potentially compound AND WHERE clause.
+///
+/// Splits conjuncts by AND at depth 0, identifies the one FK equality predicate
+/// (`child.fk = outer.pk`), and returns it plus the remaining conjuncts as an
+/// extra-filters string (joined with " AND ").  Returns `None` if:
+/// - The clause contains OR (too complex).
+/// - No conjunct matches the FK equality pattern.
+/// - More than one conjunct matches (ambiguous FK).
+fn parse_corr_predicate_with_extra_filters(
+    where_body: &str,
+    where_lower: &str,
+    child_alias: &str,
+    child_table: &str,
+) -> Option<(CorrPredicate, String)> {
+    if where_lower.contains(" or ") {
+        return None;
+    }
+    let conjuncts = split_and_conjuncts(where_body);
+    if conjuncts.is_empty() {
+        return None;
+    }
+    let mut corr_opt: Option<CorrPredicate> = None;
+    let mut extra_filters: Vec<&str> = Vec::new();
+    for conjunct in &conjuncts {
+        let conj_lower = conjunct.to_ascii_lowercase();
+        match parse_single_correlation_predicate(conjunct, &conj_lower, child_alias, child_table) {
+            Some(c) if corr_opt.is_none() => {
+                corr_opt = Some(c);
+            }
+            Some(_) => {
+                return None; // Two FK predicates — ambiguous.
+            }
+            None => {
+                extra_filters.push(conjunct);
+            }
+        }
+    }
+    let corr = corr_opt?;
+    let extra_where = extra_filters.join(" AND ");
+    Some((corr, extra_where))
 }
 
 /// Find a bare `=` at depth 0 that is not part of `!=`, `<=`, `>=`.
@@ -6048,6 +6157,65 @@ mod tests {
         assert!(
             !out2.to_ascii_lowercase().contains("lateral"),
             "nested_agg rewriter must still handle the ORM shape: {out2}"
+        );
+    }
+
+    // ── Compound-WHERE nested-agg decorrelation ──────────────────────────────
+
+    #[test]
+    fn lateral_nested_agg_compound_where_extra_filter_rewrites() {
+        // Compound AND WHERE: FK equality + extra filter.
+        // Both conjuncts present → FK becomes GROUP BY, extra becomes WHERE.
+        let sql = "SELECT p.id, cnt.c FROM parents p LEFT JOIN LATERAL (SELECT count(*) AS c FROM children ch WHERE ch.parent_id = p.id AND ch.active = true) cnt ON true";
+        let out = rewrite_lateral_nested_agg(sql);
+        let out_lower = out.to_ascii_lowercase();
+        // LATERAL must be gone.
+        assert!(
+            !out_lower.contains("lateral"),
+            "compound-WHERE agg LATERAL must be rewritten: {out}"
+        );
+        // Must have GROUP BY on the FK column.
+        assert!(out_lower.contains("group by"), "must have GROUP BY: {out}");
+        // The extra filter must be preserved in a WHERE clause.
+        assert!(
+            out_lower.contains("where"),
+            "extra filter must produce WHERE: {out}"
+        );
+        assert!(
+            out_lower.contains("ch.active = true") || out_lower.contains("active = true"),
+            "extra filter must be preserved: {out}"
+        );
+        // The ON clause must reference the subquery alias.
+        assert!(
+            out_lower.contains("on cnt."),
+            "ON clause must reference sub alias: {out}"
+        );
+    }
+
+    #[test]
+    fn lateral_nested_agg_single_where_still_rewrites() {
+        // Single predicate (no AND) → must still rewrite (regression guard).
+        let sql = "SELECT u.id, agg.posts FROM users u LEFT JOIN LATERAL (SELECT json_agg(p.title) AS posts FROM posts p WHERE p.author_id = u.id) agg ON true";
+        let out = rewrite_lateral_nested_agg(sql);
+        assert!(
+            !out.to_ascii_lowercase().contains("lateral"),
+            "single-predicate rewrite must still work: {out}"
+        );
+        // Must NOT produce a spurious WHERE (no extra filter).
+        assert!(
+            !out.to_ascii_lowercase().contains(" where "),
+            "no extra WHERE when no extra filter: {out}"
+        );
+    }
+
+    #[test]
+    fn lateral_nested_agg_compound_or_not_rewritten() {
+        // OR in WHERE → too complex, must NOT rewrite.
+        let sql = "SELECT p.id, cnt.c FROM parents p LEFT JOIN LATERAL (SELECT count(*) AS c FROM children ch WHERE ch.parent_id = p.id OR ch.active = true) cnt ON true";
+        let out = rewrite_lateral_nested_agg(sql);
+        assert!(
+            out.to_ascii_lowercase().contains("lateral"),
+            "OR in WHERE must not be rewritten: {out}"
         );
     }
 

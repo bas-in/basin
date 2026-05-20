@@ -10,6 +10,7 @@ publish = false
 basin-common.workspace = true
 basin-engine.workspace = true
 basin-auth.workspace = true
+basin-catalog.workspace = true
 
 tokio.workspace = true
 futures.workspace = true
@@ -39,7 +40,6 @@ hyper.workspace = true
 tempfile.workspace = true
 tokio-test.workspace = true
 basin-storage.workspace = true
-basin-catalog.workspace = true
 object_store.workspace = true
 tokio-postgres.workspace = true
 ulid.workspace = true
