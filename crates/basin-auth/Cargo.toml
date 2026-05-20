@@ -63,6 +63,12 @@ base64.workspace = true
 reqwest = { workspace = true }
 hmac = { workspace = true }
 
+# MFA (Phase 5.10.M — ADR 0020).
+# base32: RFC4648 encoding for TOTP shared secrets (otpauth:// URI format).
+# sha1: RFC 6238 TOTP requires SHA1-HMAC (interoperability with authenticator apps).
+base32 = "0.4"
+sha1 = { workspace = true }
+
 [dev-dependencies]
 tempfile.workspace = true
 tokio-test.workspace = true

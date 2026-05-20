@@ -33,6 +33,7 @@
 
 pub mod api_keys;
 pub mod config;
+pub mod mfa;
 pub mod oauth;
 pub mod project_credentials;
 pub mod store;
@@ -74,7 +75,11 @@ pub use crate::config::{
     INTERNAL_AUTH_USERNAME,
 };
 pub use crate::email::{Mailer, Outbound, SmtpMailer, StubMailer};
-pub use crate::jwt::Claims;
+pub use crate::jwt::{Aal, Claims};
+pub use crate::mfa::{
+    ChallengeVerifyResult, FactorStatus, FactorType, MfaChallengeRow, MfaFactorRow,
+    TotpEnrollment, WebAuthnEnrollment,
+};
 
 /// True iff the DSN is a `postgres://` URL carrying `sslmode=disable`. In
 /// that case the loopback catalog path uses `NoTls` directly — building the
@@ -139,6 +144,9 @@ pub(crate) struct Inner {
     /// does not implement `OAuthStore` (e.g. `EngineAuthStore` in integration
     /// tests). For Postgres-backed stores the DB is used directly instead.
     pub(crate) oauth_state_cache: Arc<oauth::OAuthStateCache>,
+    /// In-memory MFA state cache used when the concrete store does not
+    /// implement `MfaStore` (e.g. `EngineAuthStore` in integration tests).
+    pub(crate) mfa_cache: Arc<mfa::MfaCache>,
 }
 
 /// Top-level auth handle. `Clone` is cheap; share across the engine, router,
@@ -246,6 +254,7 @@ impl AuthService {
                 ip_limiter,
                 email_limiter,
                 oauth_state_cache: Arc::new(oauth::OAuthStateCache::new()),
+                mfa_cache: Arc::new(mfa::MfaCache::new()),
             }),
         };
         svc.migrate().await?;
@@ -574,6 +583,196 @@ impl AuthService {
             scopes,
             redirect_uri,
         );
+    }
+
+    // --- MFA (Phase 5.10.M / ADR 0020) --------------------------------------
+
+    /// Begin TOTP factor enrollment. Returns the base32 secret and otpauth URI.
+    pub async fn enroll_totp<S>(
+        &self,
+        mfa_store: Option<&S>,
+        enc: &dyn oauth::EncryptionProvider,
+        project_id: &ProjectId,
+        user_id: UserId,
+        friendly_name: &str,
+    ) -> Result<mfa::TotpEnrollment>
+    where
+        S: mfa::MfaStore,
+    {
+        mfa::enroll_totp(&self.inner, mfa_store, enc, project_id, user_id, friendly_name).await
+    }
+
+    /// Confirm TOTP enrollment. Returns plaintext recovery codes on first factor.
+    pub async fn verify_totp_factor<S>(
+        &self,
+        mfa_store: Option<&S>,
+        enc: &dyn oauth::EncryptionProvider,
+        project_id: &ProjectId,
+        user_id: UserId,
+        factor_id: uuid::Uuid,
+        code: &str,
+    ) -> Result<Option<Vec<String>>>
+    where
+        S: mfa::MfaStore,
+    {
+        mfa::verify_totp_factor(
+            &self.inner, mfa_store, enc, project_id, user_id, factor_id, code,
+        )
+        .await
+    }
+
+    /// Begin a TOTP step-up challenge. Returns the challenge ID.
+    pub async fn begin_totp_challenge<S>(
+        &self,
+        mfa_store: Option<&S>,
+        project_id: &ProjectId,
+        user_id: UserId,
+        factor_id: uuid::Uuid,
+    ) -> Result<uuid::Uuid>
+    where
+        S: mfa::MfaStore,
+    {
+        mfa::begin_totp_challenge(&self.inner, mfa_store, project_id, user_id, factor_id).await
+    }
+
+    /// Complete a TOTP step-up challenge. Returns aal2 tokens on success.
+    pub async fn verify_totp_challenge<S>(
+        &self,
+        mfa_store: Option<&S>,
+        enc: &dyn oauth::EncryptionProvider,
+        project_id: &ProjectId,
+        user_id: UserId,
+        challenge_id: uuid::Uuid,
+        code: &str,
+    ) -> Result<mfa::ChallengeVerifyResult>
+    where
+        S: mfa::MfaStore,
+    {
+        mfa::verify_totp_challenge(
+            &self.inner, mfa_store, enc, project_id, user_id, challenge_id, code,
+        )
+        .await
+    }
+
+    /// Begin WebAuthn factor enrollment. Returns creation options JSON + challenge ID.
+    pub async fn enroll_webauthn<S>(
+        &self,
+        mfa_store: Option<&S>,
+        project_id: &ProjectId,
+        user_id: UserId,
+        friendly_name: &str,
+    ) -> Result<mfa::WebAuthnEnrollment>
+    where
+        S: mfa::MfaStore,
+    {
+        mfa::enroll_webauthn(&self.inner, mfa_store, project_id, user_id, friendly_name).await
+    }
+
+    /// Confirm WebAuthn enrollment with the attestation response.
+    pub async fn verify_webauthn_factor<S>(
+        &self,
+        mfa_store: Option<&S>,
+        enc: &dyn oauth::EncryptionProvider,
+        project_id: &ProjectId,
+        user_id: UserId,
+        factor_id: uuid::Uuid,
+        challenge_id: uuid::Uuid,
+        attestation_json: &str,
+    ) -> Result<Option<Vec<String>>>
+    where
+        S: mfa::MfaStore,
+    {
+        mfa::verify_webauthn_factor(
+            &self.inner, mfa_store, enc, project_id, user_id, factor_id, challenge_id,
+            attestation_json,
+        )
+        .await
+    }
+
+    /// Begin a WebAuthn step-up assertion challenge.
+    /// Returns `(challenge_id, request_options_json)`.
+    pub async fn begin_webauthn_challenge<S>(
+        &self,
+        mfa_store: Option<&S>,
+        project_id: &ProjectId,
+        user_id: UserId,
+        factor_id: uuid::Uuid,
+    ) -> Result<(uuid::Uuid, String)>
+    where
+        S: mfa::MfaStore,
+    {
+        mfa::begin_webauthn_challenge(&self.inner, mfa_store, project_id, user_id, factor_id).await
+    }
+
+    /// Complete a WebAuthn step-up assertion. Returns aal2 tokens on success.
+    pub async fn verify_webauthn_challenge<S>(
+        &self,
+        mfa_store: Option<&S>,
+        project_id: &ProjectId,
+        user_id: UserId,
+        challenge_id: uuid::Uuid,
+        assertion_json: &str,
+    ) -> Result<mfa::ChallengeVerifyResult>
+    where
+        S: mfa::MfaStore,
+    {
+        mfa::verify_webauthn_challenge(
+            &self.inner, mfa_store, project_id, user_id, challenge_id, assertion_json,
+        )
+        .await
+    }
+
+    /// Use a recovery code to get aal2 tokens.
+    pub async fn use_recovery_code<S>(
+        &self,
+        mfa_store: Option<&S>,
+        project_id: &ProjectId,
+        user_id: UserId,
+        code: &str,
+    ) -> Result<mfa::ChallengeVerifyResult>
+    where
+        S: mfa::MfaStore,
+    {
+        mfa::use_recovery_code(&self.inner, mfa_store, project_id, user_id, code).await
+    }
+
+    /// Unenroll a factor. Requires aal2 in the caller's JWT.
+    pub async fn unenroll_factor<S>(
+        &self,
+        mfa_store: Option<&S>,
+        project_id: &ProjectId,
+        user_id: UserId,
+        factor_id: uuid::Uuid,
+        caller_aal: &Aal,
+    ) -> Result<()>
+    where
+        S: mfa::MfaStore,
+    {
+        mfa::unenroll_factor(
+            &self.inner, mfa_store, project_id, user_id, factor_id, caller_aal,
+        )
+        .await
+    }
+
+    /// Returns true iff the user has at least one verified MFA factor.
+    pub async fn has_verified_factor<S>(
+        &self,
+        mfa_store: Option<&S>,
+        project_id: &ProjectId,
+        user_id: UserId,
+    ) -> Result<bool>
+    where
+        S: mfa::MfaStore,
+    {
+        mfa::has_verified_factor(&self.inner, mfa_store, project_id, user_id).await
+    }
+
+    // --- test-utils: MFA cache access ---------------------------------------
+
+    /// Direct access to the in-memory MFA cache for test setup.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn mfa_cache(&self) -> &Arc<mfa::MfaCache> {
+        &self.inner.mfa_cache
     }
 
     // --- session settings ---------------------------------------------------
