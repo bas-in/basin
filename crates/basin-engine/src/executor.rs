@@ -366,12 +366,12 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
 
             // ── Phase 5.13.B — AST-based DDL pre-screens ──────────────────────
             //
-            // Three statement kinds are parsed natively by libpg_query but NOT
-            // by sqlparser 0.52. Instead of re-inspecting the SQL text with
-            // regex/lexer helpers, we lift the intent directly from the pg_query
-            // parse tree that is already in hand (`raw_pg_tree` above).
+            // Statement kinds parsed by libpg_query but not by sqlparser 0.52
+            // are dispatched here via typed AST matches instead of textual
+            // regex/lexer helpers. The pg_query parse tree is already in hand
+            // (`raw_pg_tree` above) so this costs nothing extra.
             //
-            // Migration 1/3: ALTER TYPE <name> ADD VALUE '<label>'
+            // Migration 1: ALTER TYPE <name> ADD VALUE '<label>'
             if matches!(kind, crate::pg_ast::StmtKind::AlterType) {
                 if let Some(node) = tree.stmts().next() {
                     if let Some(pg_query::NodeEnum::AlterEnumStmt(ref aes)) = node.node {
@@ -385,7 +385,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                 }
             }
 
-            // Migration 2/3: CREATE DOMAIN <name> [AS] <type> [CHECK (<pred>)]
+            // Migration 2: CREATE DOMAIN <name> [AS] <type> [CHECK (<pred>)]
             if matches!(kind, crate::pg_ast::StmtKind::CreateDomain) {
                 if let Some(node) = tree.stmts().next() {
                     if let Some(pg_query::NodeEnum::CreateDomainStmt(ref cds)) = node.node {
@@ -397,7 +397,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                 }
             }
 
-            // Migration 3/3: DROP DOMAIN [IF EXISTS] <name>
+            // Migration 3: DROP DOMAIN [IF EXISTS] <name>
             if matches!(kind, crate::pg_ast::StmtKind::DropDomain) {
                 if let Some(node) = tree.stmts().next() {
                     if let Some(pg_query::NodeEnum::DropStmt(ref ds)) = node.node {
@@ -406,6 +406,58 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                         {
                             return crate::type_ddl::exec_drop_domain(sess, &name, if_exists)
                                 .await;
+                        }
+                    }
+                }
+            }
+
+            // Migration 4: REFRESH MATERIALIZED VIEW <name>
+            // Note: Basin's custom `WITH (full = true)` extension is not valid
+            // PG SQL so pg_query rejects it — raw_pg_tree is None for that
+            // form and this block is skipped. The textual pre-screen below
+            // handles the WITH (full = true) case.
+            if matches!(kind, crate::pg_ast::StmtKind::RefreshMatView) {
+                if let Some(node) = tree.stmts().next() {
+                    if let Some(pg_query::NodeEnum::RefreshMatViewStmt(ref rms)) = node.node {
+                        let (name, force_full) =
+                            crate::cv_ddl::match_refresh_materialized_view_ast(rms)?;
+                        return crate::cv_ddl::exec_refresh_materialized_view(
+                            sess, &name, force_full,
+                        )
+                        .await;
+                    }
+                }
+            }
+
+            // Migration 5: DROP MATERIALIZED VIEW [IF EXISTS] <name>
+            if matches!(kind, crate::pg_ast::StmtKind::DropMatView) {
+                if let Some(node) = tree.stmts().next() {
+                    if let Some(pg_query::NodeEnum::DropStmt(ref ds)) = node.node {
+                        if let Some((name, if_exists)) =
+                            crate::cv_ddl::match_drop_materialized_view_ast(ds)?
+                        {
+                            return crate::cv_ddl::exec_drop_materialized_view(
+                                sess, &name, if_exists,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+
+            // Migration 6: CREATE [TEMPORARY] SEQUENCE [IF NOT EXISTS] <name> [opts…]
+            // The textual pre-screen in match_create_sequence claims all CREATE
+            // SEQUENCE shapes; the AST path replaces it for the valid-PG forms.
+            if matches!(kind, crate::pg_ast::StmtKind::CreateSequence) {
+                if let Some(node) = tree.stmts().next() {
+                    if let Some(pg_query::NodeEnum::CreateSeqStmt(ref css)) = node.node {
+                        if let Some(intent) =
+                            crate::seq_ddl::match_create_sequence_ast(css)?
+                        {
+                            return crate::seq_ddl::exec_create_sequence_pre_screen(
+                                sess, intent,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -829,6 +881,14 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     //     → `INNER JOIN (SELECT u.col, expr AS a FROM u) sub ON sub.col = t.col`
     // Only fires for non-aggregate, single-predicate, no-ORDER-BY/LIMIT bodies.
     let rewritten = crate::pg_operators::rewrite_lateral_correlated_row(&rewritten);
+    // Rewrite correlated LATERAL bodies with ORDER BY + LIMIT into window-function
+    // joins.  `LEFT JOIN LATERAL (SELECT col FROM u WHERE u.fk = t.pk ORDER BY col
+    // LIMIT n) sub ON true` → `LEFT JOIN (SELECT col, u.fk, ROW_NUMBER() OVER
+    // (PARTITION BY u.fk ORDER BY col) AS __basin_rn FROM u) sub ON
+    // sub.fk = t.pk AND sub.__basin_rn <= n`.  Fires after the no-ORDER-BY/LIMIT
+    // row-rewriter so both paths get a chance; only fires when ORDER BY + LIMIT are
+    // present at depth-0 in the body and all other guards pass.
+    let rewritten = crate::pg_operators::rewrite_lateral_order_limit(&rewritten);
     // Decorrelate `[CROSS] JOIN LATERAL generate_series(<lo>, <tbl>.<col>)
     // <alias>` (and the comma form) into a bounded recursive-CTE JOIN. The
     // built-in `generate_series` table function rejects non-literal args
@@ -1247,6 +1307,16 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
             // the session context, then hand the outer SELECT to DataFusion.
             if query_has_dml_cte(query) {
                 return exec_dml_cte_query(sess, query, sql, include_deleted).await;
+            }
+
+            // ── WITH RECURSIVE … INSERT/UPDATE/DELETE … intercept ────────────
+            // `WITH RECURSIVE t(col) AS (… UNION ALL …) INSERT INTO target …`
+            // sqlparser routes this as a Query whose body is SetExpr::Insert
+            // (rather than SetExpr::Select).  DataFusion cannot plan DML in a
+            // query body, so we lift the RECURSIVE CTE into the DML source and
+            // dispatch through the normal DML path.
+            if query_has_recursive_with_dml_body(query) {
+                return exec_recursive_with_dml_body(sess, query).await;
             }
 
             // pg_plan routing instrumentation (ADR 0014 Phase 2). When the
@@ -5430,6 +5500,92 @@ fn query_has_dml_cte(query: &sqlparser::ast::Query) -> bool {
             SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_)
         )
     })
+}
+
+/// Returns `true` when the query has a `WITH RECURSIVE` clause AND the outer
+/// body is a DML statement (`INSERT`, `UPDATE`, or `DELETE`).
+///
+/// This is the combination shape: `WITH RECURSIVE t(col) AS (… UNION ALL …)
+/// INSERT INTO target SELECT * FROM t`.  sqlparser routes the whole thing as a
+/// `Statement::Query` with `SetExpr::Insert` as the body.  DataFusion cannot
+/// plan DML bodies inside a query, so we intercept before `exec_select`.
+fn query_has_recursive_with_dml_body(query: &sqlparser::ast::Query) -> bool {
+    let Some(ref with) = query.with else {
+        return false;
+    };
+    if !with.recursive {
+        return false;
+    }
+    matches!(
+        query.body.as_ref(),
+        SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_)
+    )
+}
+
+/// Execute a `WITH RECURSIVE … INSERT/UPDATE/DELETE …` query.
+///
+/// Strategy: the `WITH RECURSIVE` clause contains only pure-SELECT CTEs (the
+/// recursive generator); the DML is the query *body*, not a CTE.  sqlparser
+/// wraps the whole statement as a `Statement::Query{with: RECURSIVE, body:
+/// SetExpr::Insert}`.  DataFusion's `sql()` cannot plan a DML body, so we:
+///
+/// 1. Lift the `WITH RECURSIVE` clause onto the DML's *source* `SELECT`.
+///    e.g. `INSERT INTO t SELECT * FROM cte` becomes
+///         `INSERT INTO t (WITH RECURSIVE cte AS (…) SELECT * FROM cte)`.
+/// 2. Call `exec_insert` / the appropriate DML path with the modified
+///    statement, which then routes through `exec_insert_select` → DataFusion.
+///    DataFusion CAN plan `WITH RECURSIVE … SELECT …`, so the recursive
+///    generator is fully expanded before the rows land in the target table.
+///
+/// Limitations (deferred to a follow-up):
+/// - UPDATE/DELETE with a recursive source are not yet supported; an explicit
+///   error is returned for those shapes so the caller gets a clear message
+///   rather than a confusing DataFusion planning failure.
+async fn exec_recursive_with_dml_body(
+    sess: &ProjectSession,
+    query: &sqlparser::ast::Query,
+) -> Result<ExecResult> {
+    let with = query
+        .with
+        .as_ref()
+        .expect("caller verified query.with is Some");
+
+    match query.body.as_ref() {
+        SetExpr::Insert(Statement::Insert(ins)) => {
+            let mut ins = ins.clone();
+
+            // Attach the RECURSIVE WITH clause to the INSERT's source query so
+            // that DataFusion sees `WITH RECURSIVE t AS (…) SELECT * FROM t`
+            // when it plans the source.  The Insert.source is the SELECT that
+            // feeds rows into the target table.
+            if let Some(ref mut source) = ins.source {
+                // Only attach when the source doesn't already have a WITH
+                // clause (shouldn't happen, but be safe).
+                if source.with.is_none() {
+                    source.with = Some(with.clone());
+                }
+            } else {
+                return Err(BasinError::InvalidSchema(
+                    "WITH RECURSIVE INSERT without a SELECT source is not supported".into(),
+                ));
+            }
+
+            exec_insert(sess, ins).await
+        }
+        SetExpr::Update(_) | SetExpr::Delete(_) => {
+            Err(BasinError::FeatureNotSupported(
+                "WITH RECURSIVE feeding UPDATE or DELETE is not yet supported (SQLSTATE 0A000)"
+                    .into(),
+            ))
+        }
+        _ => {
+            // Shouldn't reach here given the query_has_recursive_with_dml_body
+            // guard, but be defensive.
+            Err(BasinError::internal(
+                "exec_recursive_with_dml_body called on non-DML body",
+            ))
+        }
+    }
 }
 
 /// Execute a `WITH … SELECT …` query whose CTE list contains at least one
