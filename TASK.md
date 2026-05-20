@@ -373,6 +373,56 @@ this OSS roadmap.
       email, single-use tokens, refresh rotation, API key lifecycle,
       self-routing credential parsing.
 
+### basin-auth v2 — OAuth + MFA — ADR 0020
+
+Lifts ADR 0005's OAuth + MFA deferral. Unblocks basin-js's 🔒
+`signInWithOAuth` / `auth.mfa.*` stubs. All flows in OSS `basin-auth`;
+cloud builds only provider-registration / factor UI.
+
+#### 5.10.O — OAuth providers (presets + generic OIDC, ~2-3 weeks)
+
+- [ ] `auth.oauth_providers` table (per-project): provider, client_id,
+      client_secret (encrypted via `EncryptionProvider`), scopes,
+      redirect_uri, OIDC discovery/endpoints. `auth.identities` table
+      (user_id, provider, provider_user_id).
+- [ ] Provider presets (Google, GitHub, Apple) with endpoint/scope
+      defaults; a preset row needs only client_id + secret.
+- [ ] Generic OIDC via RFC 8414 discovery (`.well-known/openid-
+      configuration`); explicit-endpoint fallback.
+- [ ] `GET /auth/v1/authorize?provider=&redirect_to=` — signed `state`
+      (CSRF) + PKCE `code_challenge`; 302 to provider.
+- [ ] `GET /auth/v1/callback` — validate state, exchange code (PKCE
+      verifier), fetch userinfo, link/create user, issue Basin JWT +
+      refresh.
+- [ ] Identity linking on provider-asserted **verified** email;
+      `redirect_to` validated against per-project allowlist
+      (open-redirect guard).
+- [ ] Crates: `oauth2` (authz-code + PKCE), `subtle` (constant-time).
+- [ ] Tests: `tests/integration/tests/oauth_flow.rs` — mock provider;
+      full authorize→callback→JWT; CSRF-state rejection; PKCE; verified-
+      email linking; open-redirect rejection.
+
+#### 5.10.M — MFA: TOTP + WebAuthn/passkeys (~3-4 weeks)
+
+- [ ] `auth.mfa_factors` (id, user_id, type ∈ {totp, webauthn}, status,
+      secret/credential — encrypted), `auth.mfa_challenges` (short TTL),
+      `auth.mfa_recovery_codes` (argon2-hashed, single-use).
+- [ ] JWT carries `aal` (`aal1`/`aal2`) + `amr` (methods). New SQL
+      session fn `auth.aal()` alongside `auth.uid()`/`role()`/`jwt()`.
+- [ ] Endpoints: `POST /auth/v1/factors` (enroll: TOTP secret+otpauth
+      URI / WebAuthn creation challenge), `/factors/:id/verify`,
+      `/factors/:id/challenge`, `/factors/:id/challenge/verify`
+      (re-issues aal2 JWT), `DELETE /factors/:id` (requires aal2).
+- [ ] Recovery codes issued at first enrollment; single-use; rate-
+      limited via existing `governor`.
+- [ ] Downgrade guard: once a factor is enrolled, JWT caps at aal1
+      until a challenge succeeds; aal2-requiring RLS fails closed.
+- [ ] Crates: `totp-rs`/`oath` (RFC 6238), `webauthn-rs` (FIDO2).
+- [ ] Tests: `tests/integration/tests/mfa_totp.rs` +
+      `tests/integration/tests/mfa_webauthn.rs` — enroll/verify/
+      challenge/step-up; recovery-code single-use; TOTP replay
+      rejection; aal2 RLS gating.
+
 ### basin-rest (PostgREST equivalent) — ADR 0006
 
 Requires `BASIN_AUTH_ENABLED=1` per ADR.
@@ -941,6 +991,73 @@ unblocker for proper PG-ecosystem tooling and worth the 6-8 weeks once
 Tier 1 customers are in production. Reopen ADR 0012 only if both gating
 conditions in its "Trigger to revisit" section are met.
 
+## Phase 5.17 — Object storage (Supabase-style blobs) — ADR 0021
+
+Catalog-backed blob storage. Objects are rows in `storage.objects`;
+access control reuses the RLS engine (Phase 5.6); bytes live in the
+same `object_store` the engine uses; signed URLs are HMAC over
+`(project, bucket, path, expiry)`. New `basin-blob` crate behind the
+`storage` Cargo feature (ADR 0018). Unblocks basin-js's 🔒
+`storage.from(bucket)` stubs.
+
+#### 5.17.A — Data model + crate skeleton (~1 week)
+
+- [ ] New crate `crates/basin-blob/` (workspace member; `storage`
+      feature in `basin-server`).
+- [ ] `storage.buckets` (id, name, public, file_size_limit,
+      allowed_mime_types[]) + `storage.objects` (id, bucket_id, path,
+      size, mime_type, metadata jsonb, owner, created_at, updated_at,
+      etag). Per-project, project-scoped.
+- [ ] Bytes path convention: `<project_prefix>/storage/<bucket>/<path>`
+      in `object_store`. No second backend.
+- [ ] Acceptance: bucket + object rows round-trip through the catalog;
+      object_store write/read of a small blob works.
+
+#### 5.17.B — HTTP API in basin-rest (~1.5 weeks)
+
+- [ ] `POST/GET/DELETE /storage/v1/object/:bucket/:path*` (upload /
+      download / delete; RLS-gated). `GET /storage/v1/object/public/…`
+      fast path for public buckets. `POST /storage/v1/object/list/:bucket`.
+      Bucket CRUD under `/storage/v1/bucket`.
+- [ ] Body cap from `storage.buckets.file_size_limit`; MIME sniffed
+      server-side against `allowed_mime_types[]`; path normalised
+      (traversal guard).
+- [ ] Acceptance: `curl` upload then download round-trips; private
+      bucket without JWT → 401; public bucket without JWT → 200.
+
+#### 5.17.C — RLS integration (~3-5 days)
+
+- [ ] `storage.objects` honours RLS policies (Phase 5.6) consulting
+      `auth.uid()` / `auth.role()` / `auth.aal()`. Public buckets
+      short-circuit RLS for reads.
+- [ ] Acceptance: a `CREATE POLICY … ON storage.objects` restricting by
+      `owner = auth.uid()` correctly filters list/download across two
+      authenticated users; cross-project isolation verified.
+
+#### 5.17.D — Signed URLs (~3-5 days)
+
+- [ ] `POST /storage/v1/object/sign/:bucket/:path*` mints an HMAC URL
+      over `(project, bucket, path, expiry)` (`hmac`+`sha2`,
+      constant-time verify via `subtle`). Time-boxed, no JWT needed.
+- [ ] Acceptance: signed URL grants access until expiry; rejected past
+      TTL; tampered path/expiry → 403.
+
+#### 5.17.E — Per-project bytes counter (~2-3 days)
+
+- [ ] Bump the per-project byte counter (`ProjectCounterRegistry`) on
+      store/delete so cloud can enforce quota + bill. Exposed via the
+      same snapshot/OTLP path as other counters.
+
+#### 5.17.F — Resumable uploads (TUS) — v1.1 fast-follow (~1 week)
+
+- [ ] TUS protocol for large-file resumable uploads. Not v1; ship after
+      A-E land and a real large-file use case appears.
+
+> Cloud-side (basin-cloud repo): quota enforcement, billing on
+> bytes-stored + egress, CDN in front of public reads, image transforms
+> (resize/optimize — post-v1, possibly a WASM UDF). Per ADR 0021's
+> OSS/cloud split.
+
 ## Phase 5.12 — Storage perf & Vortex (PR #161 / #162) — **shipped**
 
 See [ADR 0015](./docs/decisions/0015-vortex-storage-format.md). Vortex
@@ -1047,7 +1164,7 @@ gated on Phase 2 completion.
       the gate on; rejected statements emit clean 0A000 not opaque
       sqlparser errors. Files: `crates/basin-engine/src/pg_ast.rs`,
       `crates/basin-engine/src/executor.rs`.
-- [~] **5.13.B** Typed AST matches replacing textual prescreens (Phase 2)
+- [x] **5.13.B** Typed AST matches replacing textual prescreens (Phase 2)
       — the 14 textual pre-screens in `executor.rs` migrate to `pg_ast`
       AST matches one at a time. Agents 2–4 split: (i) DDL pre-screens
       (`ALTER TYPE … ADD VALUE`, `CREATE DOMAIN`, Basin-specific
@@ -1538,6 +1655,12 @@ compaction; `window_partition_sum` + `lag_lead_window` drop their
 
 ## Phase 6 — Production hardening (3–4 months)
 
+- [x] **Subsystem Cargo feature flags + minimal pgwire-only build** (ADR 0018) —
+      `auth`, `rest`, `webhooks`, `realtime`, `wasm-udf` gated in
+      `services/basin-server/Cargo.toml`; `default = ["auth","rest","webhooks"]`;
+      `minimal = []` (pgwire + engine + storage + catalog + WAL only).
+      Both `cargo build -p basin-server` (full) and
+      `cargo build -p basin-server --no-default-features` (minimal) verified clean.
 - [ ] Multi-region: regional WAL + S3 cross-region replication
 - [~] Catalog replication strategy chosen and implemented — strategy
       chosen in [ADR 0010](./docs/decisions/0010-catalog-replication.md)
