@@ -1403,7 +1403,7 @@ Lives in a new crate `crates/basin-hottier/`.
       `vortex_vs_parquet_smoke` p99 ≤ 2ms warm (down from ~4ms
       current Vortex path); all 88 existing smoke shapes produce
       identical results with and without the hot tier populated.
-- [ ] **5.14.C4** Flush — ~2 weeks.  Background Tokio task (one per
+- [x] **5.14.C4** Flush (shipped `9e107ef`; FlushTask + FlushBackend trait + 7-step non-blocking algorithm from ADR 0016; 12/12 flush unit tests; 14/14 shard tests; pause/resume exposed for C6) — ~2 weeks.  Background Tokio task (one per
       `MemTableRegistry`).  Triggers: size (table_memtable_soft_cap),
       age (memtable_max_age_secs), scan pressure (>100k rows on a
       full-scan).  Algorithm: snapshot under brief write lock →
