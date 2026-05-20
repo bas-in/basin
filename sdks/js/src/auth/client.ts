@@ -22,10 +22,10 @@
  *  - POST /auth/v1/request-password-reset
  *
  * Public surface mirrors @supabase/auth-js so existing Supabase-shaped
- * app code ports over with a `createClient` swap. Methods that the
- * engine doesn't (yet) expose — `signInWithOAuth`, `mfa.*`, and the
- * whole `basin.storage` namespace — return `BasinError("not_implemented")`
- * with a JSDoc note explaining the v0.2+ target. `signOut()` has no
+ * app code ports over with a `createClient` swap. `signInWithOAuth` and
+ * `auth.mfa.*` are fully wired (T-020/T-021). Methods that the engine
+ * doesn't (yet) expose — the `basin.storage` namespace — return
+ * `BasinError("not_implemented")` with a JSDoc note. `signOut()` has no
  * server-side counterpart on the engine; sign-out is purely local
  * (the session's refresh_token expires naturally per its TTL).
  */
@@ -281,32 +281,55 @@ export class AuthClient {
   /**
    * Sign in with an OAuth provider.
    *
-   * Returns `BasinError("not_implemented")` today — basin-engine v0.1
-   * has no OAuth routes (`/auth/v1/oauth/*` doesn't exist on the
-   * verified engine surface in `basin/crates/basin-rest/src/server.rs`).
-   * The method signature stays so app code can compile against the
-   * stable shape; the body lands when the engine grows the OAuth
-   * authorize + callback handlers in v0.2+. Provider TS-validation
-   * (the 14-provider `OAuthProvider` union) is preserved for forward
-   * compatibility.
+   * Builds the engine's `GET /auth/v1/authorize?provider=<name>&redirect_to=…`
+   * URL. The engine handles PKCE + signed `state` server-side and completes
+   * the exchange via `GET /auth/v1/callback`. In a browser environment this
+   * method sets `window.location.href` to redirect automatically; in all
+   * other runtimes it returns the URL for the caller to act on.
+   *
+   * Returns `{data: {url, provider}, error: null}` — the URL is always
+   * returned so callers can inspect it before the redirect.
+   *
+   * Provider list: Google, GitHub, Microsoft, GitLab, Slack, Discord, Apple,
+   * X (Twitter), Bitbucket, Notion, Spotify, Twitch, LinkedIn, Figma, + generic
+   * OIDC per ADR 0020.
    *
    * @example
-   * // Returns { data: null, error: BasinError('not_implemented', ...) }
-   * const { error } = await basin.auth.signInWithOAuth({ provider: 'github' });
+   * const { data, error } = await basin.auth.signInWithOAuth({ provider: 'github' });
+   * if (error) return handleError(error);
+   * // In non-browser (SSR/Node): redirect manually.
+   * window.location.href = data.url; // handled automatically in browser
    */
   async signInWithOAuth(
-    _input: SignInWithOAuthInput,
+    input: SignInWithOAuthInput,
   ): Promise<{
     data: { url: string; provider: import("./types.js").OAuthProvider } | null;
     error: BasinError | null;
   }> {
-    return {
-      data: null,
-      error: new BasinError(
-        "not_implemented",
-        "auth.signInWithOAuth (OAuth) ships when the engine route lands — tracked in ROADMAP 0.3",
-      ),
-    };
+    if (!input?.provider) {
+      return {
+        data: null,
+        error: new BasinError(
+          "invalid_request",
+          "auth.signInWithOAuth requires a provider",
+        ),
+      };
+    }
+    const params = new URLSearchParams({ provider: input.provider });
+    if (input.redirectTo) params.set("redirect_to", input.redirectTo);
+    if (input.scopes) params.set("scopes", input.scopes);
+    if (input.queryParams) {
+      for (const [k, v] of Object.entries(input.queryParams)) {
+        params.set(k, v);
+      }
+    }
+    const url = `${this.#url}/authorize?${params.toString()}`;
+    // In browser environments, redirect automatically. Return the URL
+    // first so SSR callers can issue a 302 without a window reference.
+    if (typeof window !== "undefined" && typeof window.location !== "undefined") {
+      window.location.href = url;
+    }
+    return { data: { url, provider: input.provider }, error: null };
   }
 
   /**

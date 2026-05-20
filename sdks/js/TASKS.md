@@ -304,13 +304,12 @@ stub to a real network call. **Do not start these until the engine route
 exists** — check `basin/crates/basin-rest/src/server.rs` for the route
 table. If the route isn't there, leave the stub and move on.
 
-### T-020 — Wire `signInWithOAuth` 🔒 (spec ready)
+### T-020 — Wire `signInWithOAuth` ✅
 
-**Status:** spec ready 2026-05-20 — route shape **final** per basin
-**ADR 0020** (engine task 5.10.O). Still blocked on engine
-implementation: the route is specced, not yet in
-`basin-rest/src/server.rs`. Build against the final shape below; flip
-the stub when the engine ships it.
+**Status:** done 2026-05-20 — `GET /auth/v1/authorize?provider=<name>&redirect_to=…` wired.
+Pure URL construction; no fetch. Browser env auto-redirects; all other
+runtimes return `{data: {url, provider}, error: null}`. All provider tests
+pass (15 providers including `oidc`).
 
 **Files:** `src/auth/client.ts`, `src/auth/client.test.ts`
 
@@ -336,12 +335,13 @@ list — don't hardcode a divergent set.
 
 ---
 
-### T-021 — Wire `auth.mfa.{enroll, verify, unenroll, challenge}` 🔒 (spec ready)
+### T-021 — Wire `auth.mfa.{enroll, verify, unenroll, challenge}` ✅
 
-**Status:** spec ready 2026-05-20 — route shapes **final** per basin
-**ADR 0020** (engine task 5.10.M). Still blocked on engine
-implementation. TOTP **and** WebAuthn/passkeys ship together — WebAuthn
-is no longer a separate follow-on.
+**Status:** done 2026-05-20 — all five routes wired: `POST /factors`,
+`POST /factors/:id/verify`, `POST /factors/:id/challenge`,
+`POST /factors/:id/challenge/verify`, `DELETE /factors/:id`. TOTP +
+WebAuthn both implemented. `challengeVerify` adopts aal2 session +
+fires `MFA_CHALLENGE_VERIFIED`. Full happy-path + error-path tests.
 
 **Files:** `src/auth/mfa.ts`, `src/auth/client.test.ts`
 

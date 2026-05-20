@@ -48,7 +48,7 @@
  * `apikey` header. No parsing or validation is performed client-side.
  */
 
-/** One of the 14 BYO-OAuth providers basin-cloud supports. */
+/** OAuth provider presets + generic OIDC per ADR 0020. */
 export type OAuthProvider =
   | "google"
   | "github"
@@ -63,7 +63,8 @@ export type OAuthProvider =
   | "spotify"
   | "twitch"
   | "linkedin"
-  | "figma";
+  | "figma"
+  | "oidc";
 
 export interface AuthUser {
   id: string;
@@ -83,6 +84,10 @@ export interface AuthSession {
   /** Seconds-since-epoch when the access token expires. */
   expires_at: number;
   user: AuthUser;
+  /** Authenticator Assurance Level — `aal1` (password) or `aal2` (MFA). */
+  aal?: "aal1" | "aal2";
+  /** Authentication Method References — list of methods used (e.g. `["pwd"]`, `["totp"]`). */
+  amr?: string[];
 }
 
 export type AuthChangeEvent =
@@ -160,6 +165,42 @@ export type MFAVerifyResult =
   | { factor: "totp"; enabled: true }
   | { factor: "totp_challenge"; session: AuthSession }
   | { factor: "webauthn"; verified: true };
+
+/**
+ * Input for `auth.mfa.challenge` — initiates a step-up challenge for an
+ * already-enrolled factor. Returns a `challenge_id` used by
+ * `challengeVerify`.
+ */
+export interface MFAChallengeInput {
+  /** The ID of the enrolled factor to challenge. */
+  factorId: string;
+}
+
+export interface MFAChallengeResult {
+  /** The ID of the created challenge — pass to `challengeVerify`. */
+  id: string;
+  /** Factor type the challenge was issued for. */
+  type: "totp" | "webauthn";
+  /** Seconds-since-epoch when the challenge expires. */
+  expires_at: number;
+}
+
+/**
+ * Input for `auth.mfa.challengeVerify` — submits the user's code/assertion
+ * to complete a step-up challenge and re-issue an aal2 session.
+ */
+export type MFAChallengeVerifyInput =
+  | { factorId: string; challengeId: string; code: string }
+  | { factorId: string; challengeId: string; assertion: unknown };
+
+/**
+ * Input for `auth.mfa.unenroll` — removes an enrolled factor. Requires an
+ * aal2 session.
+ */
+export interface MFAUnenrollInput {
+  /** The ID of the enrolled factor to remove. */
+  factorId: string;
+}
 
 export interface SignUpInput {
   email: string;

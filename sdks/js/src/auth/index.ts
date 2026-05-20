@@ -27,4 +27,8 @@ export type {
   MFAEnrollWebAuthnResult,
   MFAVerifyInput,
   MFAVerifyResult,
+  MFAChallengeInput,
+  MFAChallengeResult,
+  MFAChallengeVerifyInput,
+  MFAUnenrollInput,
 } from "./types.js";
