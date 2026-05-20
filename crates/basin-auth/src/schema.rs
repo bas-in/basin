@@ -203,11 +203,72 @@ pub async fn run_migrations(client: &Client, schema: &str) -> Result<()> {
                 rotated_at    TIMESTAMPTZ
             )"
         ),
+        // --- OAuth provider config (Phase 5.10.O / ADR 0020) ---
+        //
+        // Stores per-project OAuth 2.0 / OIDC provider configuration.
+        // `client_secret` is AES-GCM encrypted by the EncryptionProvider
+        // before being stored. For preset providers (google, github, apple)
+        // the endpoint/scope columns are populated from defaults; only
+        // `client_id` + `client_secret` are required. Generic OIDC sets
+        // `discovery_url` and the explicit endpoint columns are filled in at
+        // runtime via RFC 8414 discovery.
+        format!(
+            "CREATE TABLE IF NOT EXISTS {schema}_oauth_providers (
+                id               BIGSERIAL PRIMARY KEY,
+                project_id        TEXT NOT NULL,
+                provider         TEXT NOT NULL,
+                client_id        TEXT NOT NULL,
+                client_secret    TEXT NOT NULL,
+                scopes           TEXT NOT NULL DEFAULT '',
+                redirect_uri     TEXT NOT NULL DEFAULT '',
+                discovery_url    TEXT NOT NULL DEFAULT '',
+                authorize_url    TEXT NOT NULL DEFAULT '',
+                token_url        TEXT NOT NULL DEFAULT '',
+                userinfo_url     TEXT NOT NULL DEFAULT '',
+                enabled          BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+                UNIQUE (project_id, provider)
+            )"
+        ),
+        // OAuth identity links — one row per (user, provider) pair.
+        // `provider_user_id` is the sub/id from the provider's userinfo.
+        // `email_verified` records whether the provider asserted email
+        // verification at the time of the last sign-in.
+        format!(
+            "CREATE TABLE IF NOT EXISTS {schema}_identities (
+                id                BIGSERIAL PRIMARY KEY,
+                user_id           UUID NOT NULL REFERENCES {schema}_users(user_id) ON DELETE CASCADE,
+                project_id         TEXT NOT NULL,
+                provider          TEXT NOT NULL,
+                provider_user_id  TEXT NOT NULL,
+                email             TEXT NOT NULL,
+                email_verified    BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+                last_sign_in_at   TIMESTAMPTZ,
+                UNIQUE (project_id, provider, provider_user_id)
+            )"
+        ),
+        // OAuth PKCE / state store — short-lived rows tracking in-flight
+        // authorization code flows. The `state` value is HMAC-signed and also
+        // stored here so we can validate the callback quickly. Each row is
+        // deleted on successful callback or on expiry.
+        format!(
+            "CREATE TABLE IF NOT EXISTS {schema}_oauth_states (
+                state_hash   TEXT PRIMARY KEY,
+                project_id    TEXT NOT NULL,
+                provider     TEXT NOT NULL,
+                pkce_verifier TEXT NOT NULL,
+                redirect_to  TEXT NOT NULL DEFAULT '',
+                expires_at   TIMESTAMPTZ NOT NULL,
+                created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+            )"
+        ),
         // Secondary indexes — one per hot lookup path:
         //   - api_keys (key_hash): bearer-token verification
         //   - auth_magic_links (token_hash): consume-flow lookup
         //   - auth_revoked_refresh_tokens (user_id): reuse-detection sweep
         //   - auth_project_credentials (pgwire_user): pgwire startup auth
+        //   - identities (project_id, provider, email): email-link lookup
         //
         // Note: users (project_id, email) is covered by the UNIQUE constraint
         // on that table, which implies a unique index — no separate entry here.
@@ -226,6 +287,14 @@ pub async fn run_migrations(client: &Client, schema: &str) -> Result<()> {
         format!(
             "CREATE INDEX IF NOT EXISTS {schema}_auth_project_credentials_pgwire_user \
              ON {schema}_auth_project_credentials (pgwire_user)"
+        ),
+        format!(
+            "CREATE INDEX IF NOT EXISTS {schema}_identities_project_provider_email \
+             ON {schema}_identities (project_id, provider, email)"
+        ),
+        format!(
+            "CREATE INDEX IF NOT EXISTS {schema}_oauth_states_expires_at \
+             ON {schema}_oauth_states (expires_at)"
         ),
     ];
 

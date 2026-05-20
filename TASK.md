@@ -381,26 +381,33 @@ cloud builds only provider-registration / factor UI.
 
 #### 5.10.O — OAuth providers (presets + generic OIDC, ~2-3 weeks)
 
-- [ ] `auth.oauth_providers` table (per-project): provider, client_id,
+- [x] `auth.oauth_providers` table (per-project): provider, client_id,
       client_secret (encrypted via `EncryptionProvider`), scopes,
       redirect_uri, OIDC discovery/endpoints. `auth.identities` table
-      (user_id, provider, provider_user_id).
-- [ ] Provider presets (Google, GitHub, Apple) with endpoint/scope
+      (user_id, provider, provider_user_id). Also `auth.oauth_states`
+      for in-flight PKCE state. Migrations in `schema.rs`.
+- [x] Provider presets (Google, GitHub, Apple) with endpoint/scope
       defaults; a preset row needs only client_id + secret.
-- [ ] Generic OIDC via RFC 8414 discovery (`.well-known/openid-
+- [x] Generic OIDC via RFC 8414 discovery (`.well-known/openid-
       configuration`); explicit-endpoint fallback.
-- [ ] `GET /auth/v1/authorize?provider=&redirect_to=` — signed `state`
-      (CSRF) + PKCE `code_challenge`; 302 to provider.
-- [ ] `GET /auth/v1/callback` — validate state, exchange code (PKCE
+- [x] `GET /auth/v1/authorize?provider=&redirect_to=` — signed `state`
+      (CSRF, HMAC-SHA256) + PKCE `code_challenge`; 302 to provider.
+      Routed via `AuthService::begin_oauth_authorize`.
+- [x] `GET /auth/v1/callback` — validate state, exchange code (PKCE
       verifier), fetch userinfo, link/create user, issue Basin JWT +
-      refresh.
-- [ ] Identity linking on provider-asserted **verified** email;
+      refresh. Routed via `AuthService::handle_oauth_callback`.
+- [x] Identity linking on provider-asserted **verified** email;
       `redirect_to` validated against per-project allowlist
       (open-redirect guard).
-- [ ] Crates: `oauth2` (authz-code + PKCE), `subtle` (constant-time).
-- [ ] Tests: `tests/integration/tests/oauth_flow.rs` — mock provider;
-      full authorize→callback→JWT; CSRF-state rejection; PKCE; verified-
-      email linking; open-redirect rejection.
+- [x] Crates: `hmac` (HMAC-SHA256 state signing), `reqwest` (OIDC
+      discovery + token exchange + userinfo), `subtle` (constant-time
+      comparison) — all already in workspace. Custom PKCE via `sha2` +
+      `base64`. Note: used `hmac`+`reqwest` instead of the `oauth2` crate
+      (same security model, lighter API surface).
+- [x] Tests: `tests/integration/tests/oauth_flow.rs` — mock provider
+      (axum HTTP server); full authorize→callback→JWT; CSRF-state
+      rejection; PKCE S256; verified-email linking; open-redirect
+      rejection. 17 tests, all pass.
 
 #### 5.10.M — MFA: TOTP + WebAuthn/passkeys (~3-4 weeks)
 

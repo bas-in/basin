@@ -57,6 +57,12 @@ rand = "0.8"
 # transitive surface.
 base64.workspace = true
 
+# OAuth 2.0 / OIDC (Phase 5.10.O — ADR 0020).
+# reqwest: HTTP client for OIDC discovery + token exchange + userinfo.
+# hmac: HMAC-SHA256 signing for the CSRF state parameter.
+reqwest = { workspace = true }
+hmac = { workspace = true }
+
 [dev-dependencies]
 tempfile.workspace = true
 tokio-test.workspace = true

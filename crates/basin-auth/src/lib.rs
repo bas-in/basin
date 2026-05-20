@@ -33,6 +33,7 @@
 
 pub mod api_keys;
 pub mod config;
+pub mod oauth;
 pub mod project_credentials;
 pub mod store;
 
@@ -134,6 +135,10 @@ pub(crate) struct Inner {
     pub(crate) mailer: Arc<dyn Mailer>,
     pub(crate) ip_limiter: rate_limit::PerKey,
     pub(crate) email_limiter: rate_limit::PerKey,
+    /// In-memory state cache used by the OAuth flow when the concrete store
+    /// does not implement `OAuthStore` (e.g. `EngineAuthStore` in integration
+    /// tests). For Postgres-backed stores the DB is used directly instead.
+    pub(crate) oauth_state_cache: Arc<oauth::OAuthStateCache>,
 }
 
 /// Top-level auth handle. `Clone` is cheap; share across the engine, router,
@@ -240,6 +245,7 @@ impl AuthService {
                 mailer,
                 ip_limiter,
                 email_limiter,
+                oauth_state_cache: Arc::new(oauth::OAuthStateCache::new()),
             }),
         };
         svc.migrate().await?;
@@ -491,6 +497,83 @@ impl AuthService {
             }
         }
         Ok(migrated)
+    }
+
+    // --- OAuth (Phase 5.10.O) -----------------------------------------------
+
+    /// Start an OAuth authorization flow. Returns the redirect URL (302 to
+    /// the provider) and the raw state value. Stores the in-flight
+    /// `(state_hash, pkce_verifier)` row in the DB or in the in-memory cache.
+    ///
+    /// Pass `oauth_store = None` when using the in-process `EngineAuthStore`
+    /// (e.g. integration tests). Pass `Some(&postgres_store)` for the
+    /// external-Postgres path.
+    pub async fn begin_oauth_authorize<S>(
+        &self,
+        oauth_store: Option<&S>,
+        project_id: &ProjectId,
+        provider: &str,
+        redirect_to: &str,
+    ) -> Result<oauth::AuthorizeRedirect>
+    where
+        S: oauth::OAuthStore,
+    {
+        oauth::begin_authorize(&self.inner, oauth_store, project_id, provider, redirect_to)
+            .await
+    }
+
+    /// Handle an OAuth callback. Returns tokens + redirect_to.
+    pub async fn handle_oauth_callback<S>(
+        &self,
+        enc: &dyn oauth::EncryptionProvider,
+        oauth_store: Option<&S>,
+        provider_hint: &str,
+        code: &str,
+        state_val: &str,
+        redirect_callback_base: &str,
+    ) -> Result<oauth::OAuthCallbackResult>
+    where
+        S: oauth::OAuthStore,
+    {
+        oauth::handle_callback(
+            &self.inner,
+            enc,
+            oauth_store,
+            provider_hint,
+            code,
+            state_val,
+            redirect_callback_base,
+        )
+        .await
+    }
+
+    /// Register a mock OAuth provider in the in-memory cache. Only available
+    /// in test builds (or when the `test-utils` feature is enabled). Used by
+    /// integration tests that drive the OAuth flow without a real DB.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn register_mock_oauth_provider(
+        &self,
+        project_id: &ProjectId,
+        provider: &str,
+        client_id: &str,
+        client_secret: &str,
+        authorize_url: &str,
+        token_url: &str,
+        userinfo_url: &str,
+        scopes: &str,
+        redirect_uri: &str,
+    ) {
+        self.inner.oauth_state_cache.register_mock_provider(
+            project_id,
+            provider,
+            client_id,
+            client_secret,
+            authorize_url,
+            token_url,
+            userinfo_url,
+            scopes,
+            redirect_uri,
+        );
     }
 
     // --- session settings ---------------------------------------------------

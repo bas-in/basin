@@ -35,7 +35,10 @@ use crate::{
 /// emitted here uses `{schema}_<table>` as the flat table name, matching the
 /// basin-engine dialect described in `schema.rs`.
 pub struct PostgresAuthStore {
-    client: Mutex<Client>,
+    /// Lock-protected client. `pub(crate)` so `oauth.rs` can acquire the
+    /// lock directly for OAuth-specific SQL without going through a method
+    /// that doesn't exist on the `AuthStore` trait.
+    pub(crate) client: Mutex<Client>,
     schema: String,
 }
 
