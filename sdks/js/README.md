@@ -90,8 +90,8 @@ Full reference: <https://basin.run/docs/js-sdk>.
 | `basin.auth`     | `signUp`, `signInWithPassword`, `signInWithMagicLink`, `consumeMagicLink`, `refreshSession`, `signOut`, `getSession`, `getUser`, `onAuthStateChange`, `requestPasswordReset`, `resetPassword`, `verifyEmail` |
 | `basin.from(t)`  | `.select`, `.insert`, `.update`, `.upsert`, `.delete`, `.eq`, `.neq`, `.gt`, `.gte`, `.lt`, `.lte`, `.like`, `.ilike`, `.is`, `.in`, `.order`, `.limit`, `.range`, `.single`, `.maybeSingle` |
 | `basin.storage`  | `from(bucket).upload`, `.download`, `.list`, `.remove`, `.createSignedUrl`, `.getPublicUrl` — **v0.2** |
-| `basin.realtime` | `.channel(name).on(...).subscribe()` — **v0.2** |
-| `basin.functions`| `.invoke(slug, { body })` — **v0.2** |
+| `basin.realtime` | `.channel(name).on('postgres_changes', …).subscribe()`, `.on('presence', …)`, `.track()`, `.untrack()`, `.presenceState()` |
+| `basin.functions`| `.invoke(fnName, { body })` → `POST /rest/v1/rpc/:fn_name` |
 
 ## Row Level Security and auth session functions
 
@@ -124,6 +124,72 @@ const { data, error } = await basin.from('items').select('*');
 ```
 
 Anonymous requests (`auth.role() = 'anon'`) get `auth.uid() = null`.
+
+## Realtime
+
+Subscribe to live table changes with `basin.channel()`. The SDK picks the
+cheapest transport automatically — SSE for a simple single-table listener,
+WebSocket when you need multiple tables, server-side row filters, or presence.
+
+```ts
+// Listen for new rows in the orders table (uses SSE automatically)
+basin
+  .channel("orders-feed")
+  .on("postgres_changes", { event: "INSERT", table: "orders" }, (payload) => {
+    console.log("new order:", payload.new);
+  })
+  .subscribe();
+
+// Filtered subscription (uses WebSocket)
+basin
+  .channel("paid-orders")
+  .on(
+    "postgres_changes",
+    { event: "INSERT", table: "orders", filter: "status=eq.paid" },
+    (payload) => console.log(payload.new),
+  )
+  .subscribe();
+
+// Presence — track online users in a channel (uses WebSocket)
+const channel = basin
+  .channel("room:lobby")
+  .on("presence", { event: "sync" }, (members) => {
+    console.log("online:", members);
+  })
+  .subscribe();
+
+channel.track({ userId: "u_42", status: "online" });
+// channel.untrack();   // stop announcing
+// channel.unsubscribe(); // close transport
+```
+
+Full guide: [`docs/realtime.md`](./docs/realtime.md).
+
+## RPC / functions
+
+Call server-side SQL or Wasm functions with `basin.functions.invoke()`.
+The SDK POSTs named arguments to `/rest/v1/rpc/:fn_name` and returns the
+result — a bare scalar for single-value functions, an array of row objects
+for `RETURNS TABLE` functions.
+
+```ts
+// Scalar function: add(x int, y int) RETURNS int
+const { data, error } = await basin.functions.invoke<number>("add", {
+  body: { x: 3, y: 4 },
+});
+// data === 7
+
+// RETURNS TABLE function
+type User = { id: string; email: string };
+const { data: users } = await basin.functions.invoke<User[]>("active_users", {
+  body: { min_logins: 5 },
+});
+```
+
+The active session JWT is forwarded automatically. Per-call auth overrides
+and custom headers are supported via the `headers` option.
+
+Full guide: [`docs/rpc.md`](./docs/rpc.md).
 
 ## API keys and pgwire connections
 

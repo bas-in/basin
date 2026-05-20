@@ -660,9 +660,15 @@ mono-repo vs sub-path. Sonnet agent should write a short
 
 ---
 
-### T-042 — Stop shipping stubs that throw — decision + execution ⏸
+### T-042 — Stop shipping stubs that throw — decision + execution ✅
 
-**Status:** deferred 2026-05-19. Needs paired decision with the Phase 0.3
+**Status:** done 2026-05-20. Decision: GATE, don't remove. All not-yet-live
+methods (signInWithOAuth, auth.mfa.{enroll,verify,unenroll},
+storage.{upload,download,list,remove,createSignedUrl,uploadMultipart,uploadResumable})
+now throw BasinError("not_implemented", "<method> ships when the engine route
+lands — tracked in ROADMAP 0.3"). getPublicUrl untouched. 222 tests green.
+
+**Original status:** deferred 2026-05-19. Needs paired decision with the Phase 0.3
 engine-route ramp: if 0.3 routes are landing soon, leaving the stubs in
 place is correct (so app code can be written against the future shape). If
 0.3 slips, remove the stubs and re-add when engine routes ship. Coupled to
@@ -770,6 +776,18 @@ added; `package-lock.json` regenerated.
 
 **Why this matters:** every future task's acceptance gate hits these
 failures. Fixing once unblocks every subsequent agent.
+
+---
+
+### T-031 — Realtime + RPC quickstart docs ✅
+
+**Status:** done 2026-05-20. `docs/realtime.md` and `docs/rpc.md` written from
+source truth in `src/realtime/client.ts`, `src/realtime/sse.ts`,
+`src/realtime/ws.ts`, `src/realtime/presence.ts`, and `src/functions/client.ts`.
+README gained "Realtime" and "RPC / functions" sections with copy-pasteable
+snippets. API surface table updated to reflect shipped status.
+
+**Files:** `README.md`, `docs/realtime.md` (new), `docs/rpc.md` (new)
 
 ---
 
