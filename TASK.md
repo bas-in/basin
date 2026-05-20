@@ -204,7 +204,7 @@ risk/effort, ordered to ship value early.
       bars not moved here pending that.**
 
 **B. Indexing + clustering (8 weeks, real Postgres-class point queries):**
-- [ ] **B1 Per-project secondary indexes** — B-tree mapping
+- [x] **B1 Per-project secondary indexes** — B-tree mapping
       `(table, indexed_col) → (file, row_group, row)`. Stored as a
       separate per-project file. Cached in RAM. `CREATE INDEX` SQL.
       **Flagged as the biggest remaining point-query win in CAPABILITIES.md.**

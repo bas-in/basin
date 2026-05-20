@@ -2694,6 +2694,8 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
             crate::session::tx_set_aborted(&sess.state);
             return Err(e);
         }
+        // Phase 5.7 B1: maintain secondary indexes on INSERT (tx-active path).
+        maintain_secondary_indexes_on_insert(sess, &table, &meta, &batch, df.path.as_ref()).await;
         if ins.returning.is_some() {
             return Ok(ExecResult::Rows {
                 schema: batch.schema(),
@@ -2759,6 +2761,9 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
     // pre-commit "extra" file reference.
     refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table).await?;
     write_insert_audit_rows(sess, meta.schema.as_ref(), std::slice::from_ref(&batch)).await?;
+
+    // Phase 5.7 B1: maintain secondary indexes on INSERT (auto-commit path).
+    maintain_secondary_indexes_on_insert(sess, &table, &meta, &batch, df.path.as_ref()).await;
 
     // RETURNING: if the caller asked for RETURNING *, return the inserted batch.
     if ins.returning.is_some() {
@@ -5850,6 +5855,52 @@ async fn htap_promote_to_registry(
         }
     }
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 5.7 B1: secondary index maintenance on INSERT
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Maintain secondary B-tree indexes after a successful INSERT.
+///
+/// For each single-column non-expression index declared on `table`, extracts
+/// the indexed column's values from `batch` and inserts `(key → location)`
+/// entries into the process-wide registry, then flushes the updated index to
+/// the object store (best-effort; errors are logged, not propagated).
+///
+/// Called after a successful Parquet write and catalog commit on the
+/// auto-commit path, and after the tx-deferred write on the tx-active path.
+async fn maintain_secondary_indexes_on_insert(
+    sess: &ProjectSession,
+    table: &TableName,
+    meta: &basin_catalog::TableMetadata,
+    batch: &arrow_array::RecordBatch,
+    file_path: &str,
+) {
+    if meta.indexes.is_empty() {
+        return;
+    }
+    let registry = sess.engine.secondary_index_registry();
+    let storage = &sess.engine.config().storage;
+
+    for idx in &meta.indexes {
+        // Only handle single-column non-expression indexes in v0.1.
+        if idx.columns.len() != 1 {
+            continue;
+        }
+        let col_name = &idx.columns[0];
+        let entries = crate::secondary_index::extract_entries_from_batch(
+            batch,
+            col_name,
+            file_path,
+            0, // row_group 0 — single batch write
+        );
+        if !entries.is_empty() {
+            registry.insert_batch(&sess.project, table, col_name, entries);
+        }
+        crate::secondary_index::flush_index(registry, storage, &sess.project, table, col_name)
+            .await;
+    }
 }
 
 // ---------------------------------------------------------------------------

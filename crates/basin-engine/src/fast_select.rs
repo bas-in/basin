@@ -1130,6 +1130,106 @@ pub(crate) async fn execute_simple_select(
             })
             .unwrap_or(false);
 
+    // ── Phase 5.7 B1: secondary index probe ─────────────────────────────────
+    //
+    // For Eq-predicate point queries, check if we have a loaded secondary
+    // index for the queried column.  If so, restrict the live-file set to
+    // only those files listed in the index for that key value.
+    //
+    // The probe is conservative:
+    //   * If the index is not loaded, we fall through to the full file scan.
+    //   * If the index is loaded but the key is absent, we know no file
+    //     contains the key → return zero rows immediately.
+    //   * If the index is loaded and returns some file paths, we further
+    //     intersect with the catalog's live-file list (so rolled-back /
+    //     deleted files are still excluded).
+    //
+    // The probe runs for exactly ONE Eq predicate.  If the query has multiple
+    // Eq predicates we use the first indexed column found.
+    let secondary_index_file_allowlist: Option<Option<std::collections::HashSet<String>>> = {
+        let registry = sess.engine.secondary_index_registry();
+        let mut result: Option<Option<std::collections::HashSet<String>>> = None;
+
+        if plan.aggregates.is_none() {
+            for pred in &plan.predicates {
+                if let Predicate::Eq(col, val) = pred {
+                    // Check if the table has a declared index on this column.
+                    let has_index = meta.indexes.iter().any(|idx| {
+                        idx.columns.len() == 1
+                            && !idx.columns[0].starts_with("expr:")
+                            && idx.columns[0] == col.as_str()
+                    });
+                    if !has_index {
+                        continue;
+                    }
+
+                    // Try to load from disk if not yet in RAM.
+                    if !registry.is_loaded(&sess.project, &plan.table, col) {
+                        crate::secondary_index::load_index(
+                            registry,
+                            &sess.engine.config().storage,
+                            &sess.project,
+                            &plan.table,
+                            col,
+                        )
+                        .await;
+                    }
+
+                    // Now probe the in-RAM index.
+                    if let Some(key_text) = crate::secondary_index::scalar_to_key(val) {
+                        if let Some(files) = registry.probe(
+                            &sess.project,
+                            &plan.table,
+                            col,
+                            &key_text,
+                        ) {
+                            // Index is loaded and has a definitive answer.
+                            let allowlist: std::collections::HashSet<String> =
+                                files.into_iter().collect();
+                            result = Some(Some(allowlist));
+                        } else if registry.is_loaded(&sess.project, &plan.table, col) {
+                            // Index is loaded but key is absent → no match.
+                            // Return empty immediately.
+                            result = Some(None); // None means "definitely empty"
+                        }
+                        // If probe returned None and index not loaded, fall through.
+                    }
+                    break; // Only use one index column per query.
+                }
+            }
+        }
+        result
+    };
+
+    // If the secondary index says the key is definitely absent, return empty
+    // without opening any files.
+    if matches!(secondary_index_file_allowlist, Some(None)) {
+        let output_schema = match &plan.projection {
+            None => meta.schema.clone(),
+            Some(items) => {
+                let idxs: Result<Vec<usize>, _> = items
+                    .iter()
+                    .filter_map(|item| match item {
+                        ProjectionItem::Column(c) => Some(meta.schema.index_of(c)),
+                        _ => None,
+                    })
+                    .collect();
+                match idxs {
+                    Ok(ix) => Arc::new(
+                        meta.schema
+                            .project(&ix)
+                            .unwrap_or_else(|_| meta.schema.as_ref().clone()),
+                    ),
+                    Err(_) => meta.schema.clone(),
+                }
+            }
+        };
+        return Ok(crate::ExecResult::Rows {
+            schema: output_schema,
+            batches: vec![],
+        });
+    }
+
     // Build the catalog-driven live file list. `live_data_files()` replays the
     // snapshot chain up to `current_snapshot`, so after a rollback it returns
     // only the pre-rollback files — physical files from post-rollback snapshots
@@ -1173,6 +1273,16 @@ pub(crate) async fn execute_simple_select(
         live_files
             .into_iter()
             .filter(|f| {
+                // Phase 5.7 B1: secondary index allowlist pruning.
+                // If the index has a definitive answer for which files contain
+                // the queried key, skip any file NOT in that set.
+                if let Some(Some(ref allowlist)) = secondary_index_file_allowlist {
+                    if !allowlist.contains(f.path.as_str()) {
+                        sess.engine.note_secondary_index_skipped();
+                        return false;
+                    }
+                }
+
                 // Min/max catalog-stats pruning — the existing pass.
                 if matches!(
                     evaluate_compound_for_pruning(&cp, &f.column_stats, schema, f.row_count),
@@ -1311,25 +1421,59 @@ pub(crate) async fn execute_simple_select(
 
                     (out_schema, evaluated)
                 } else {
-                    // Plain column list — derive schema by index, same as before.
-                    let mut idxs = Vec::with_capacity(items.len());
-                    for item in items {
-                        let c = match item {
-                            ProjectionItem::Column(c) => c,
+                    // Plain column list — build output schema from the full table
+                    // schema and re-project each batch to the requested columns.
+                    //
+                    // `read_cols` (the columns handed to `read_paths_with_schema`)
+                    // is the union of the user-requested columns and all filter
+                    // columns, sorted alphabetically. The storage layer returns
+                    // batches whose columns are in that sorted order. We must
+                    // re-project each batch so the output matches the SELECT list
+                    // order and contains only the user-requested columns.
+                    let col_names: Vec<&str> = items
+                        .iter()
+                        .map(|item| match item {
+                            ProjectionItem::Column(c) => c.as_str(),
                             ProjectionItem::Computed { .. } => unreachable!(),
-                        };
-                        let i = meta
-                            .schema
-                            .index_of(c)
-                            .map_err(|_| BasinError::InvalidSchema(format!("unknown column {c}")))?;
-                        idxs.push(i);
-                    }
+                        })
+                        .collect();
+                    let idxs: Vec<usize> = col_names
+                        .iter()
+                        .map(|c| {
+                            meta.schema.index_of(c).map_err(|_| {
+                                BasinError::InvalidSchema(format!("unknown column {c}"))
+                            })
+                        })
+                        .collect::<Result<_>>()?;
                     let schema = Arc::new(
                         meta.schema
                             .project(&idxs)
                             .map_err(|e| BasinError::internal(format!("project schema: {e}")))?,
                     );
-                    (schema, batches)
+                    // Project each batch: find each requested column by NAME in
+                    // the batch schema (which reflects read_cols order, not the
+                    // full table schema order) and assemble a new RecordBatch.
+                    let projected: Vec<RecordBatch> = batches
+                        .into_iter()
+                        .map(|b| {
+                            let cols: Result<Vec<_>> = col_names
+                                .iter()
+                                .map(|c| {
+                                    b.schema()
+                                        .index_of(c)
+                                        .map(|i| b.column(i).clone())
+                                        .map_err(|_| {
+                                            BasinError::InvalidSchema(format!(
+                                                "batch missing column {c}"
+                                            ))
+                                        })
+                                })
+                                .collect();
+                            RecordBatch::try_new(schema.clone(), cols?)
+                                .map_err(|e| BasinError::internal(format!("project batch: {e}")))
+                        })
+                        .collect::<Result<_>>()?;
+                    (schema, projected)
                 }
             }
         };
