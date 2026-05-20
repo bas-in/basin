@@ -1395,3 +1395,122 @@ async fn refresh_token_reuse_detected_revokes_all() {
 
     let _ = running.shutdown.send(());
 }
+
+// --- Phase 5.11.L: POST /rpc/<fn> mount (ADR 0019) --------------------------
+
+/// Happy path: register a LANGUAGE sql scalar function, invoke it over REST,
+/// assert the scalar result comes back as JSON.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rpc_sql_scalar_function() {
+    let Some((running, svc, auth, mailer, _g)) = try_serve().await else {
+        return;
+    };
+    let addr = running.local_addr;
+    let project = ProjectId::new();
+
+    // Create a simple scalar SQL function out-of-band via the engine session.
+    let session = svc.inner.cfg.engine.open_session(project).await.unwrap();
+    session
+        .execute(
+            "CREATE FUNCTION add_two(x int, y int) \
+             RETURNS int \
+             LANGUAGE sql \
+             AS $$ SELECT x + y $$",
+        )
+        .await
+        .unwrap();
+
+    let toks = make_user(&auth, &mailer, &project, "rpc@example.com").await;
+    let bearer = format!("Bearer {}", toks.access_token);
+
+    // Invoke the function via POST /rest/v1/rpc/add_two.
+    let r = http_request(
+        addr,
+        "POST",
+        "/rest/v1/rpc/add_two",
+        &[
+            ("Authorization", &bearer),
+            ("Content-Type", "application/json"),
+        ],
+        Some(br#"{"x": 3, "y": 4}"#),
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        200,
+        "rpc body: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+    // Scalar result → bare JSON value (integer 7).
+    let v = r.json();
+    assert_eq!(v, serde_json::json!(7), "expected 7, got {v}");
+
+    let _ = running.shutdown.send(());
+}
+
+/// Auth gate: RPC without a bearer token must return 401.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rpc_requires_auth() {
+    let Some((running, _svc, _a, _m, _g)) = try_serve().await else {
+        return;
+    };
+    let addr = running.local_addr;
+    let r = http_request(
+        addr,
+        "POST",
+        "/rest/v1/rpc/any_fn",
+        &[("Content-Type", "application/json")],
+        Some(br#"{}"#),
+    )
+    .await;
+    assert_eq!(r.status, 401);
+    assert_eq!(r.json()["code"], "E_UNAUTHENTICATED");
+
+    let _ = running.shutdown.send(());
+}
+
+/// Zero-arg RPC: function with no parameters, empty body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rpc_zero_arg_function() {
+    let Some((running, svc, auth, mailer, _g)) = try_serve().await else {
+        return;
+    };
+    let addr = running.local_addr;
+    let project = ProjectId::new();
+
+    let session = svc.inner.cfg.engine.open_session(project).await.unwrap();
+    session
+        .execute(
+            "CREATE FUNCTION answer() \
+             RETURNS int \
+             LANGUAGE sql \
+             AS $$ SELECT 42 $$",
+        )
+        .await
+        .unwrap();
+
+    let toks = make_user(&auth, &mailer, &project, "rpc0@example.com").await;
+    let bearer = format!("Bearer {}", toks.access_token);
+
+    // Empty body — zero-arg call.
+    let r = http_request(
+        addr,
+        "POST",
+        "/rest/v1/rpc/answer",
+        &[
+            ("Authorization", &bearer),
+            ("Content-Type", "application/json"),
+        ],
+        Some(br#"{}"#),
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        200,
+        "rpc zero-arg body: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert_eq!(r.json(), serde_json::json!(42));
+
+    let _ = running.shutdown.send(());
+}

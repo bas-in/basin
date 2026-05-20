@@ -755,6 +755,21 @@ alongside `LANGUAGE sql`.
       overrun).
 - [x] Tests: `cargo test -p basin-engine wasm_udf` + integration suite pass.
 
+#### 5.11.L — `POST /rest/v1/rpc/<fn>` mount (ADR 0019) ✅ shipped
+
+PostgREST-style HTTP RPC surface over catalog UDFs. Tracked via ADR 0019.
+
+- [x] Route `POST /rest/v1/rpc/:fn_name` wired in `crates/basin-rest/src/routes/rpc.rs`.
+- [x] Auth: JWT / API-key bearer gate (identical to `/rest/v1/<table>`).
+- [x] Body: JSON object → named args → positional call via catalog lookup;
+      falls back to insertion order when function is not in catalog.
+- [x] Response: scalar unwrap for single-row/single-column results; array
+      of objects for `RETURNS TABLE`; `{"ok":true,"tag":…}` for empty.
+- [x] Both `LANGUAGE sql` (5.11.D) and `LANGUAGE wasm` (5.11.J) dispatch
+      transparently — engine routes by language; route just builds the SQL.
+- [x] Integration tests: `rpc_sql_scalar_function`, `rpc_requires_auth`,
+      `rpc_zero_arg_function` in `crates/basin-rest/src/tests.rs`.
+
 ### Tier 4 — `crates/basin-realtime` (~10-12 weeks)
 
 WebSocket + SSE + presence channels as `ChangeEventSink`

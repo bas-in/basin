@@ -27,6 +27,7 @@ use tower_http::trace::TraceLayer;
 use crate::errors::ApiError;
 use crate::routes::{
     admin as admin_routes, auth as auth_routes, data as data_routes, openapi as openapi_routes,
+    rpc as rpc_routes,
 };
 use crate::RestConfig;
 
@@ -69,6 +70,7 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
 
     Router::new()
         .route("/rest/v1/_openapi.json", get(openapi_routes::openapi))
+        .route("/rest/v1/rpc/:fn_name", post(rpc_routes::post_rpc))
         .route(
             "/rest/v1/:table",
             get(data_routes::get_table)

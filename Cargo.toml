@@ -155,6 +155,9 @@ clap = { version = "4", features = ["derive"] }
 rand = "0.8"
 # Regex engine used by regexp_match / regexp_split_to_array UDFs in basin-engine.
 regex = "1"
+# HTTP client for net.http_get / net.http_post UDFs (basin-engine) and the
+# basin-net crate. Pinned at 0.12 (rustls-tls, no native-tls, json support).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 # Phase 5.16.A lock-in (2026-05-19, ADR 0017).  Cross-process / cross-
 # Rust-version stable 64-bit hash function used by QueryShape.  Seeded
 # with the fixed BASIN_QUERY_SHAPE_SEED constant.  Rejected

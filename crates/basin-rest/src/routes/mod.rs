@@ -10,3 +10,4 @@ pub(crate) mod admin;
 pub(crate) mod auth;
 pub(crate) mod data;
 pub(crate) mod openapi;
+pub(crate) mod rpc;
