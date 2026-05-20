@@ -800,25 +800,25 @@ can land in parallel. Critical path: R1 → R2 → (R3 || R4) → R7.
       replay / disconnect / RLS-filtering / cross-project-isolation.
       34 tests pass (R1's 5 + 6 new SSE + concurrent-agent additions).
 
-#### 5.11.R3 — WebSocket adapter (~2 weeks on top of R2)
+#### 5.11.R3 — WebSocket adapter (~2 weeks on top of R2) ✅ shipped (`10858d8`)
 
-- [ ] axum WebSocket handler mounted at
+- [x] axum WebSocket handler mounted at
       `/realtime/v1/ws/:project`. Single connection multiplexes
       multiple table subscriptions via subprotocol messages.
-- [ ] Subscribe / unsubscribe protocol messages (JSON-framed
+- [x] Subscribe / unsubscribe protocol messages (JSON-framed
       control plane on the same WS connection).
-- [ ] Bidirectional ping / pong for liveness; tokio-tungstenite's
+- [x] Bidirectional ping / pong for liveness; tokio-tungstenite's
       built-in support is sufficient.
-- [ ] Reuses R2's ring buffer + replay machinery; only the transport
+- [x] Reuses R2's ring buffer + replay machinery; only the transport
       adapter differs.
-- [ ] Disconnect protocol: server-initiated close with reason code
+- [x] Disconnect protocol: server-initiated close with reason code
       on auth failure / RLS denial / project deletion.
-- [ ] Acceptance gate: `wscat` connects, subscribes to two tables,
+- [x] Acceptance gate: `wscat` connects, subscribes to two tables,
       receives interleaved events, unsubscribes one mid-stream
       without closing the connection.
-- [ ] Integration test: `tests/integration/tests/realtime_ws.rs`
+- [x] Integration test: `tests/integration/tests/realtime_ws.rs`
       covering multi-subscription / unsubscribe / RLS / ping-pong /
-      reconnect.
+      reconnect. 6/6 pass.
 
 #### 5.11.R4 — Presence channels (~2 weeks)
 
@@ -838,31 +838,34 @@ can land in parallel. Critical path: R1 → R2 → (R3 || R4) → R7.
 - [ ] Integration test:
       `tests/integration/tests/realtime_presence.rs`.
 
-#### 5.11.R5 — Subscription filter pushdown (~1 week)
+#### 5.11.R5 — Subscription filter pushdown (~1 week) ✅ shipped (`94db513`)
 
-- [ ] Subscriber-side predicate (`WHERE` clause) evaluated at fanout
+- [x] Subscriber-side predicate (`WHERE` clause) evaluated at fanout
       time against the `ChangeEvent` JSON payload (same
-      `predicate_eval` module 5.11.I uses for webhook subscriptions).
-- [ ] Predicate parsed at subscribe time; compiled once; reused per
+      `predicate_eval` module 5.11.I uses for webhook subscriptions;
+      `subscribe_filtered` → `FilteredReceiver`).
+- [x] Predicate parsed at subscribe time; compiled once (`Arc<Expr>`); reused per
       event.
-- [ ] Acceptance gate: subscribing to `orders` with predicate
+- [x] Acceptance gate: subscribing to `orders` with predicate
       `status = 'paid'` only delivers events where the new row's
-      status is paid; bench shows ≤ 50µs predicate eval per event.
+      status is paid; bench shows ≤ 50µs predicate eval per event
+      (observed: simple_eq ~64ns, AND ~104ns, IS NULL ~28ns). 15/15 tests.
 
-#### 5.11.R6 — Multi-tenant memory budget (~1 week)
+#### 5.11.R6 — Multi-tenant memory budget (~1 week) ✅ shipped (`d1acaa0`)
 
-- [ ] Shared bounded buffer (single `tokio::sync::broadcast`
-      cluster) + per-project byte counter + per-project semaphore.
-      Pattern from `feedback_multitenant_isolation`: cost is
+- [x] Shared bounded buffer + per-project byte counter (`BudgetTracker`
+      = `DashMap<ProjectId, ProjectBudget>`, lazy per-tenant alloc, single
+      `AtomicU64` + `hard_cap` each; lock-free CAS `try_reserve`; RAII
+      `BudgetGuard`). Pattern from `feedback_multitenant_isolation`: cost is
       O(bytes-in-flight) per tenant, not O(active_subscribers).
-- [ ] Per-project hard cap (default 16 MiB in-flight; configurable
+- [x] Per-project hard cap (default 16 MiB in-flight; configurable
       via `BASIN_REALTIME_PER_PROJECT_BUDGET_BYTES`).
-- [ ] When a tenant's quota fills, new events drop into the durable
+- [x] When a tenant's quota fills, new events drop into the durable
       retry log; in-memory fast path is best-effort.
-- [ ] Acceptance gate: 1k-tenant fuzz with one noisy tenant pushing
+- [x] Acceptance gate: 1k-tenant fuzz with one noisy tenant pushing
       10x events/sec — other tenants' p99 delivery latency
-      unaffected; noisy tenant sees `BUFFER_FULL` on its own
-      subscription only.
+      unaffected (sub-ms); noisy tenant sees `BUFFER_FULL` on its own
+      subscription only. 8/8 budget tests + fuzz smoke.
 
 #### 5.11.R7 — Differential harness + soak test (~1 week)
 
