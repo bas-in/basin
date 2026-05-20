@@ -15,6 +15,7 @@ export default defineConfig({
     "src/admin/index.ts",
     "src/openapi/index.ts",
     "src/ssr/index.ts",
+    "src/functions-sdk/index.ts",
     "src/codegen/index.ts",
     "bin/gen-types.ts",
   ],

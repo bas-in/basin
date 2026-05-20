@@ -52,6 +52,11 @@
       "import": "./dist/ssr/index.js",
       "require": "./dist/ssr/index.cjs"
     },
+    "./functions-sdk": {
+      "types": "./dist/functions-sdk/index.d.ts",
+      "import": "./dist/functions-sdk/index.js",
+      "require": "./dist/functions-sdk/index.cjs"
+    },
     "./codegen": {
       "types": "./dist/src/codegen/index.d.ts",
       "import": "./dist/src/codegen/index.js",
