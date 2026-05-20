@@ -364,6 +364,53 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                 _ => {}
             }
 
+            // ── Phase 5.13.B — AST-based DDL pre-screens ──────────────────────
+            //
+            // Three statement kinds are parsed natively by libpg_query but NOT
+            // by sqlparser 0.52. Instead of re-inspecting the SQL text with
+            // regex/lexer helpers, we lift the intent directly from the pg_query
+            // parse tree that is already in hand (`raw_pg_tree` above).
+            //
+            // Migration 1/3: ALTER TYPE <name> ADD VALUE '<label>'
+            if matches!(kind, crate::pg_ast::StmtKind::AlterType) {
+                if let Some(node) = tree.stmts().next() {
+                    if let Some(pg_query::NodeEnum::AlterEnumStmt(ref aes)) = node.node {
+                        let (type_name, label) =
+                            crate::type_ddl::match_alter_type_add_value_ast(aes)?;
+                        return crate::type_ddl::exec_alter_type_add_value(
+                            sess, &type_name, &label,
+                        )
+                        .await;
+                    }
+                }
+            }
+
+            // Migration 2/3: CREATE DOMAIN <name> [AS] <type> [CHECK (<pred>)]
+            if matches!(kind, crate::pg_ast::StmtKind::CreateDomain) {
+                if let Some(node) = tree.stmts().next() {
+                    if let Some(pg_query::NodeEnum::CreateDomainStmt(ref cds)) = node.node {
+                        let (name, base, check) =
+                            crate::type_ddl::match_create_domain_ast(cds)?;
+                        return crate::type_ddl::exec_create_domain(sess, &name, base, check)
+                            .await;
+                    }
+                }
+            }
+
+            // Migration 3/3: DROP DOMAIN [IF EXISTS] <name>
+            if matches!(kind, crate::pg_ast::StmtKind::DropDomain) {
+                if let Some(node) = tree.stmts().next() {
+                    if let Some(pg_query::NodeEnum::DropStmt(ref ds)) = node.node {
+                        if let Some((name, if_exists)) =
+                            crate::type_ddl::match_drop_domain_ast(ds)?
+                        {
+                            return crate::type_ddl::exec_drop_domain(sess, &name, if_exists)
+                                .await;
+                        }
+                    }
+                }
+            }
+
             if let Some(result) = crate::noop_accept::try_accept_as_noop(kind, sql) {
                 return Ok(result);
             }
@@ -427,22 +474,6 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     // and dispatch to the catalog rename helper.
     if let Some((old, new)) = crate::function_ddl::match_alter_function_rename(sql)? {
         return crate::function_ddl::exec_alter_function_rename(sess, &old, &new).await;
-    }
-
-    // ALTER TYPE <name> ADD VALUE 'label': sqlparser 0.52 has no
-    // AlterType AST node either; textual pre-screen + dispatch.
-    if let Some((name, value)) = crate::type_ddl::match_alter_type_add_value(sql)? {
-        return crate::type_ddl::exec_alter_type_add_value(sess, &name, &value).await;
-    }
-
-    // CREATE DOMAIN: sqlparser 0.52's CREATE parser rejects `DOMAIN`.
-    if let Some((name, base, check)) = crate::type_ddl::match_create_domain(sql)? {
-        return crate::type_ddl::exec_create_domain(sess, &name, base, check).await;
-    }
-
-    // DROP DOMAIN: sqlparser 0.52's DROP parser rejects `DOMAIN`.
-    if let Some((name, if_exists)) = crate::type_ddl::match_drop_domain(sql)? {
-        return crate::type_ddl::exec_drop_domain(sess, &name, if_exists).await;
     }
 
     // CREATE PROCEDURE … LANGUAGE sql AS $$ … $$: sqlparser 0.52 only
