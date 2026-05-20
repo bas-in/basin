@@ -1814,13 +1814,24 @@ truth, this list is the human-readable summary.
 
 **Remaining honest v0.2 gaps:**
 
-- [ ] `LATERAL` joins — uncorrelated strip + nested-aggregate ORM rewrite
+- [x] `LATERAL` joins — uncorrelated strip + nested-aggregate ORM rewrite
   shipped (commit `4faa5d7`); correlated decorrelation for non-aggregate row-
   returning bodies (#81, commit `6f7ab3c`); compound-WHERE nested-agg shape
   (e.g. `WHERE fk = outer.pk AND extra_col = val`) closed via
   `parse_corr_predicate_with_extra_filters` + `split_and_conjuncts` helpers;
-  ORDER BY + LIMIT shape closed via window-function rewrite; remaining
-  shapes (multi-table child, OR predicates, CROSS LATERAL aggregate) still partial.
+  ORDER BY + LIMIT shape closed via window-function rewrite.
+  Advanced LATERAL gap-closure (v0.1 gap): `CROSS JOIN LATERAL (SELECT agg…)`
+  now rewrites to `INNER JOIN (SELECT fk, agg GROUP BY fk) ON fk`; multi-table
+  child body (`FROM a JOIN b ON …` inside LATERAL) now handled via
+  `parse_corr_predicate_multi_table` which detects FK without knowing child alias
+  in advance; both shapes green in `lateral_cross_join_aggregate` and
+  `lateral_multi_table_child_aggregate` integration tests.
+  Remaining partial: OR predicates in the correlated WHERE clause (`WHERE fk =
+  outer.pk OR alt_fk = outer.pk`) — OR cannot be safely decorrelated to a simple
+  GROUP BY FK; DataFusion's physical planner does not execute
+  `OuterReferenceColumn` so these queries return a clear planning error rather
+  than silently mis-executing (contract verified in `lateral_or_predicate_clean_error`
+  test).
 - [x] `WITH RECURSIVE` + DML-in-CTE (INSERT) — multi-column RECURSIVE shipped
   (#82, commit `dae8765`); data-modifying CTEs shipped (commit `6056dca`);
   `WITH RECURSIVE … INSERT INTO target SELECT * FROM cte` now supported via

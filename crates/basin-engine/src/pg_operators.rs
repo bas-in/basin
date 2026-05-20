@@ -1967,10 +1967,18 @@ fn collect_outer_table_names(outer_text: &str) -> Vec<String> {
 /// - Non-aggregate column refs in projection → deferred (semantics differ from
 ///   aggregating).
 /// - Multiple correlation predicates in WHERE → deferred (complex join condition).
-/// - Multiple FROM tables inside the subquery → deferred.
-/// - INNER/CROSS/comma LATERAL → deferred (different null semantics).
-/// - Arbitrary correlated LATERAL (generate_series(1, t.id), multi-table body,
-///   etc.) → DataFusion upstream limitation; left failing with original error.
+/// - OR predicates in WHERE → cannot be safely decorrelated without full subquery
+///   support; DataFusion's physical planner does not execute `OuterReferenceColumn`
+///   so these fail at execution time.  No rewrite is applied; the query falls
+///   through to DataFusion's planner which returns a clear planning error.
+/// - INNER/comma LATERAL → deferred (different null semantics from LEFT JOIN).
+/// - CROSS JOIN LATERAL aggregate → now rewritten to `INNER JOIN` (rows with no
+///   matching children are excluded — identical to CROSS JOIN semantics).
+/// - Multi-table child body (`FROM a JOIN b ON …`) → now rewritten when the
+///   correlation FK column is unambiguously in one conjunct and all projection
+///   items are aggregates.
+/// - Arbitrary correlated LATERAL (generate_series(1, t.id), etc.) →
+///   DataFusion upstream limitation; left failing with original error.
 pub(crate) fn rewrite_lateral_nested_agg(sql: &str) -> String {
     let lower_check = sql.to_ascii_lowercase();
     if !lower_check.contains("lateral") {
@@ -1981,23 +1989,38 @@ pub(crate) fn rewrite_lateral_nested_agg(sql: &str) -> String {
     let mut search_from = 0usize;
     loop {
         let lower = s.to_ascii_lowercase();
-        // Look for `left join lateral` sequence.
-        let Some(rel) = lower[search_from..].find("left join lateral") else {
+        // Look for `left join lateral` OR `cross join lateral` sequences.
+        // We scan for `lateral` and inspect the preceding tokens.
+        let Some(rel) = lower[search_from..].find("lateral") else {
             break;
         };
-        let ljl_start = search_from + rel;
-        let ljl_end = ljl_start + 17; // len("left join lateral")
+        let lat_start = search_from + rel;
+        let lat_end = lat_start + 7; // len("lateral")
         let bytes = s.as_bytes();
 
-        // Word boundary before.
-        let pre_ok = ljl_start == 0 || !bytes[ljl_start - 1].is_ascii_alphanumeric();
-        // Word boundary after "lateral": whitespace or `(`.
+        // Word boundary before LATERAL.
+        let pre_ok = lat_start == 0 || !bytes[lat_start - 1].is_ascii_alphanumeric();
+        // Word boundary after LATERAL.
         let post_ok =
-            ljl_end >= s.len() || bytes[ljl_end].is_ascii_whitespace() || bytes[ljl_end] == b'(';
+            lat_end >= s.len() || bytes[lat_end].is_ascii_whitespace() || bytes[lat_end] == b'(';
         if !pre_ok || !post_ok {
-            search_from = ljl_end;
+            search_from = lat_end;
             continue;
         }
+
+        // Identify join type from the tokens immediately before LATERAL.
+        let pre_text = lower[..lat_start].trim_end();
+        let (join_kw, join_type) = if pre_text.ends_with("left join") {
+            ("left join", "LEFT JOIN")
+        } else if pre_text.ends_with("cross join") {
+            ("cross join", "INNER JOIN")
+        } else {
+            // Not a recognised aggregate-LATERAL join type — skip this occurrence.
+            search_from = lat_end;
+            continue;
+        };
+        let ljl_start = pre_text.len() - join_kw.len();
+        let ljl_end = lat_end;
 
         // Skip whitespace after `lateral`.
         let mut j = ljl_end;
@@ -2079,42 +2102,77 @@ pub(crate) fn rewrite_lateral_nested_agg(sql: &str) -> String {
             continue;
         };
 
-        // Parse child table name and optional alias. Only allow a single
-        // simple table reference (no subqueries, no JOINs inside).
-        let (child_table, child_alias) = match parse_simple_table_ref(&child_clause) {
-            Some(pair) => pair,
-            None => {
-                search_from = ljl_end;
-                continue;
-            }
-        };
-
         // Extract the WHERE clause body (between WHERE and end of body).
         let where_body = body[where_pos_opt.unwrap() + 6..].trim(); // skip "where "
         let where_body_lower = where_body.to_ascii_lowercase();
 
-        // Parse the FK correlation predicate. We now also accept compound AND
-        // clauses: extra conjuncts (non-FK filters) are passed through into a
-        // WHERE clause on the rewritten pre-aggregation subquery.  This covers
-        // the ORM pattern `WHERE fk = outer.pk AND extra_col = val`.
-        let (corr, extra_where) = match parse_corr_predicate_with_extra_filters(
-            where_body,
-            &where_body_lower,
-            &child_alias,
-            &child_table,
-        ) {
-            Some(pair) => pair,
-            None => {
-                search_from = ljl_end;
-                continue;
-            }
-        };
-
         // Validate that ALL projection items are aggregate function calls.
+        // Do this early — multi-table and single-table paths both require it.
         if !all_projections_are_aggregates(&proj_lower) {
             search_from = ljl_end;
             continue;
         }
+
+        // Determine the child table reference and FK correlation.
+        //
+        // Two paths:
+        // (a) Single table: `FROM child [AS alias]` — use parse_simple_table_ref.
+        // (b) Multi-table: `FROM a JOIN b ON …` or `FROM a, b` — use
+        //     parse_corr_predicate_multi_table which identifies the FK column
+        //     from any child table without needing to know which table has the FK.
+        //
+        // Both paths produce:
+        //   fk_ref       — `child_alias.child_col` for GROUP BY + SELECT prepend
+        //   child_col_uq — unqualified child column name for ON clause
+        //   outer_ref    — outer reference string (e.g. `parent.id`)
+        //   child_decl   — the FROM body for the rewritten pre-agg subquery
+        //   extra_where  — extra conjuncts to push into WHERE
+        let (fk_ref, child_col_uq, outer_ref, child_decl, extra_where) =
+            if let Some((child_table, child_alias)) = parse_simple_table_ref(&child_clause) {
+                // Single-table path (original behaviour).
+                let (corr, extra_where) = match parse_corr_predicate_with_extra_filters(
+                    where_body,
+                    &where_body_lower,
+                    &child_alias,
+                    &child_table,
+                ) {
+                    Some(pair) => pair,
+                    None => {
+                        search_from = ljl_end;
+                        continue;
+                    }
+                };
+                let fk_ref = format!("{}.{}", child_alias, corr.child_col);
+                let child_decl = if child_table != child_alias {
+                    format!("{} AS {}", child_table, child_alias)
+                } else {
+                    child_table.clone()
+                };
+                (fk_ref, corr.child_col, corr.outer_ref, child_decl, extra_where)
+            } else {
+                // Multi-table path: keep the full FROM clause, detect FK from WHERE.
+                // Reject subqueries inside the FROM clause (too complex).
+                let cl_lower = child_clause.to_ascii_lowercase();
+                if cl_lower.contains('(') {
+                    search_from = ljl_end;
+                    continue;
+                }
+                let (fk_tbl_alias, child_col_uq, outer_ref, extra_where) =
+                    match parse_corr_predicate_multi_table(
+                        where_body,
+                        &where_body_lower,
+                        &cl_lower,
+                    ) {
+                        Some(quad) => quad,
+                        None => {
+                            search_from = ljl_end;
+                            continue;
+                        }
+                    };
+                let fk_ref = format!("{}.{}", fk_tbl_alias, child_col_uq);
+                // Keep the original child clause (preserving case) as the FROM body.
+                (fk_ref, child_col_uq, outer_ref, child_clause.clone(), extra_where)
+            };
 
         // Find the subquery alias after the closing `)`.
         // Skip whitespace.
@@ -2143,53 +2201,52 @@ pub(crate) fn rewrite_lateral_nested_agg(sql: &str) -> String {
         }
         let sub_alias = s[alias_start..alias_end].to_string();
 
-        // Find `ON true` after the alias.
-        let mut on_start = alias_end;
-        while on_start < s.len() && bytes[on_start].is_ascii_whitespace() {
-            on_start += 1;
-        }
-        if !lower[on_start..].starts_with("on ") && !lower[on_start..].starts_with("on\t") {
-            search_from = ljl_end;
-            continue;
-        }
-        let on_kw_end = on_start + 3;
-        let mut on_val_start = on_kw_end;
-        while on_val_start < s.len() && bytes[on_val_start].is_ascii_whitespace() {
-            on_val_start += 1;
-        }
-        // Must be `ON true`.
-        let on_lower = lower[on_val_start..].trim_start();
-        if !on_lower.starts_with("true") {
-            search_from = ljl_end;
-            continue;
-        }
-        let on_true_end = on_val_start + 4;
-        // Word boundary after `true`.
-        let on_post_ok = on_true_end >= s.len() || {
-            let b = bytes[on_true_end];
-            !b.is_ascii_alphanumeric() && b != b'_'
+        // For LEFT JOIN LATERAL: require `ON true` after the alias and consume it.
+        // For CROSS JOIN LATERAL: no ON clause; replacement ends at alias_end.
+        let replace_end = if join_kw == "left join" {
+            let mut on_start = alias_end;
+            while on_start < s.len() && bytes[on_start].is_ascii_whitespace() {
+                on_start += 1;
+            }
+            if !lower[on_start..].starts_with("on ") && !lower[on_start..].starts_with("on\t") {
+                search_from = ljl_end;
+                continue;
+            }
+            let on_kw_end = on_start + 3;
+            let mut on_val_start = on_kw_end;
+            while on_val_start < s.len() && bytes[on_val_start].is_ascii_whitespace() {
+                on_val_start += 1;
+            }
+            // Must be `ON true`.
+            let on_lower = lower[on_val_start..].trim_start();
+            if !on_lower.starts_with("true") {
+                search_from = ljl_end;
+                continue;
+            }
+            let on_true_end = on_val_start + 4;
+            // Word boundary after `true`.
+            let on_post_ok = on_true_end >= s.len() || {
+                let b = bytes[on_true_end];
+                !b.is_ascii_alphanumeric() && b != b'_'
+            };
+            if !on_post_ok {
+                search_from = ljl_end;
+                continue;
+            }
+            on_true_end
+        } else {
+            // CROSS JOIN LATERAL has no ON clause; replacement ends after alias.
+            alias_end
         };
-        if !on_post_ok {
-            search_from = ljl_end;
-            continue;
-        }
 
         // All preconditions satisfied. Build the rewritten SQL.
         //
-        // Original: LEFT JOIN LATERAL (SELECT proj FROM child [AS calias]
-        //           WHERE child.fk = outer.pk [AND extra]) sub ON true
-        // Rewrite:  LEFT JOIN (SELECT child.fk, proj FROM child [AS calias]
-        //           [WHERE extra] GROUP BY child.fk) sub ON sub.fk = outer.pk
+        // LEFT JOIN LATERAL  → LEFT JOIN  (…) sub ON sub.fk = outer.pk
+        // CROSS JOIN LATERAL → INNER JOIN (…) sub ON sub.fk = outer.pk
         //
         // extra_where contains any additional AND conjuncts from the LATERAL
         // WHERE clause beyond the FK=outer correlation; empty when the original
         // had only the single equality predicate.
-        let fk_ref = format!("{}.{}", child_alias, corr.child_col);
-        let child_decl = if child_table != child_alias {
-            format!("{} AS {}", child_table, child_alias)
-        } else {
-            child_table.clone()
-        };
         let where_clause = if extra_where.is_empty() {
             String::new()
         } else {
@@ -2198,11 +2255,10 @@ pub(crate) fn rewrite_lateral_nested_agg(sql: &str) -> String {
         let new_body = format!(
             "SELECT {fk_ref}, {proj_str} FROM {child_decl}{where_clause} GROUP BY {fk_ref}"
         );
-        let new_on = format!("{sub_alias}.{} = {}", corr.child_col, corr.outer_ref);
-        let replacement = format!("LEFT JOIN ({new_body}) {sub_alias} ON {new_on}",);
+        let new_on = format!("{sub_alias}.{child_col_uq} = {outer_ref}");
+        let replacement = format!("{join_type} ({new_body}) {sub_alias} ON {new_on}");
 
-        // Replace from `left join lateral` start through `on true` end.
-        s.replace_range(ljl_start..on_true_end, &replacement);
+        s.replace_range(ljl_start..replace_end, &replacement);
         search_from = ljl_start + replacement.len();
     }
     s
@@ -3368,6 +3424,87 @@ fn parse_corr_predicate_with_extra_filters(
     let corr = corr_opt?;
     let extra_where = extra_filters.join(" AND ");
     Some((corr, extra_where))
+}
+
+/// Parse a correlation predicate from a WHERE clause when there are multiple
+/// child tables (i.e. the caller does not know which table has the FK).
+///
+/// Returns `(fk_table_alias, child_col, outer_ref, extra_where)` where:
+/// - `fk_table_alias` is the table/alias on the child side of the FK predicate
+/// - `child_col` is the unqualified column name on the child side
+/// - `outer_ref` is the full outer reference (e.g. `parent.id`)
+/// - `extra_where` is any remaining AND conjuncts (non-FK filters)
+///
+/// Heuristic: the "child" side of the FK equality predicate is whichever
+/// `table.col` reference's table name (or alias) appears in `child_from_lower`
+/// (the lowercased FROM clause text).  The other side is the outer reference.
+///
+/// Returns `None` if:
+/// - The WHERE clause contains OR.
+/// - No unambiguous FK predicate is found.
+/// - More than one conjunct matches the FK pattern (ambiguous).
+fn parse_corr_predicate_multi_table(
+    where_body: &str,
+    where_lower: &str,
+    child_from_lower: &str,
+) -> Option<(String, String, String, String)> {
+    if where_lower.contains(" or ") {
+        return None;
+    }
+    let conjuncts = split_and_conjuncts(where_body);
+    if conjuncts.is_empty() {
+        return None;
+    }
+
+    let mut found: Option<(String, String, String)> = None; // (fk_tbl_alias, child_col, outer_ref)
+    let mut extra_filters: Vec<&str> = Vec::new();
+
+    for conjunct in &conjuncts {
+        let conj_lower = conjunct.to_ascii_lowercase();
+        // Try to parse as `a.b = c.d` at depth 0.
+        let eq_pos = match find_bare_eq(&conj_lower) {
+            Some(p) => p,
+            None => {
+                extra_filters.push(conjunct);
+                continue;
+            }
+        };
+        let lhs = conjunct[..eq_pos].trim();
+        let rhs = conjunct[eq_pos + 1..].trim();
+        let lhs_lower = lhs.to_ascii_lowercase();
+        let rhs_lower = rhs.to_ascii_lowercase();
+        let lhs_parts = parse_dotted_ref(&lhs_lower);
+        let rhs_parts = parse_dotted_ref(&rhs_lower);
+
+        match (lhs_parts, rhs_parts) {
+            (Some((lt, lc)), Some((rt, rc))) => {
+                // Determine which side is in the child FROM clause.
+                let lhs_is_child = child_from_lower.contains(lt);
+                let rhs_is_child = child_from_lower.contains(rt);
+                if lhs_is_child && !rhs_is_child {
+                    if found.is_some() {
+                        return None; // ambiguous
+                    }
+                    found = Some((lt.to_string(), lc.to_string(), rhs.to_string()));
+                } else if rhs_is_child && !lhs_is_child {
+                    if found.is_some() {
+                        return None; // ambiguous
+                    }
+                    found = Some((rt.to_string(), rc.to_string(), lhs.to_string()));
+                } else {
+                    // Both or neither are child tables — treat as extra filter.
+                    extra_filters.push(conjunct);
+                }
+            }
+            _ => {
+                extra_filters.push(conjunct);
+            }
+        }
+    }
+
+    let (fk_tbl, child_col, outer_ref) = found?;
+    let extra_where = extra_filters.join(" AND ");
+    Some((fk_tbl, child_col, outer_ref, extra_where))
 }
 
 /// Find a bare `=` at depth 0 that is not part of `!=`, `<=`, `>=`.
