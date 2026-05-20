@@ -790,3 +790,73 @@ async fn multiple_window_functions_same_window() {
     let drs = collect_i64(res_dr, "dr");
     assert_eq!(drs.len(), 6, "dense_rank row count: {drs:?}");
 }
+
+// ===========================================================================
+// Advanced window frames: RANGE BETWEEN INTERVAL
+// ===========================================================================
+
+/// `SUM(x) OVER (ORDER BY ts RANGE BETWEEN INTERVAL '5 minutes' PRECEDING AND CURRENT ROW)`
+///
+/// Regression test for the RANGE INTERVAL frame variant (v0.1 gap item,
+/// ADR 0020 / window_extras.rs). DataFusion 53 coerces the interval literal
+/// to `Interval(MonthDayNano)` at type-resolution time when the ORDER BY
+/// column is a timestamp, so no pre-parse rewrite is required.
+///
+/// Time-series layout (ts at fixed 2-minute intervals):
+///   t=00:00  x=10
+///   t=00:02  x=20
+///   t=00:04  x=30
+///   t=00:08  x=40   ← outside the 5-minute window from t=00:04 (8-5=3, so 00:03..00:08)
+///   t=00:10  x=50
+///
+/// For RANGE BETWEEN INTERVAL '5 minutes' PRECEDING AND CURRENT ROW:
+///   t=00:00: window [00:00]             → sum =  10
+///   t=00:02: window [00:00..00:02]      → sum =  30  (0+2=2 ≤ 5)
+///   t=00:04: window [00:00..00:04]      → sum =  60  (0+2+4 all within 5 min)
+///   t=00:08: window [00:04..00:08]      → sum =  70  (08-5=03, so 04 and 08 qualify)
+///   t=00:10: window [00:05..00:10]      → sum =  90  (10-5=05, so 08 and 10 qualify)
+#[tokio::test]
+async fn range_interval_5min_preceding_sum() {
+    let dir = TempDir::new().unwrap();
+    let engine = engine_in(&dir);
+    let tid = ProjectId::new();
+    let s = engine.open_session(tid).await.unwrap();
+
+    s.execute("CREATE TABLE readings (ts TIMESTAMPTZ NOT NULL, x BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    s.execute(
+        "INSERT INTO readings VALUES \
+         ('2024-01-01T00:00:00Z', 10), \
+         ('2024-01-01T00:02:00Z', 20), \
+         ('2024-01-01T00:04:00Z', 30), \
+         ('2024-01-01T00:08:00Z', 40), \
+         ('2024-01-01T00:10:00Z', 50)",
+    )
+    .await
+    .unwrap();
+
+    let res = s
+        .execute(
+            "SELECT SUM(x) OVER (\
+               ORDER BY ts \
+               RANGE BETWEEN INTERVAL '5 minutes' PRECEDING AND CURRENT ROW\
+             ) AS window_sum \
+             FROM readings \
+             ORDER BY ts",
+        )
+        .await
+        .unwrap();
+
+    let vals = collect_i64(res, "window_sum");
+    // t=00:00: [10]           → 10
+    // t=00:02: [10,20]        → 30
+    // t=00:04: [10,20,30]     → 60
+    // t=00:08: [30,40]        → 70   (00:03..00:08 → only 00:04 and 00:08)
+    // t=00:10: [40,50]        → 90   (00:05..00:10 → only 00:08 and 00:10)
+    assert_eq!(
+        vals,
+        vec![Some(10), Some(30), Some(60), Some(70), Some(90)],
+        "RANGE INTERVAL 5-minute sliding sum mismatch: {vals:?}"
+    );
+}
