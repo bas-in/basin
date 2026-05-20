@@ -553,9 +553,9 @@ snapshot on join) and `{"type":"presence_diff","channel","joins":[…],"leaves":
 
 ---
 
-### T-030 — Realtime: `channel()` API + SSE/WS routing + replay ✅ unblocked
+### T-030 — Realtime: `channel()` API + SSE/WS routing + replay ✅ done
 
-**Status:** ready 2026-05-20. **Depends on T-025, T-028, T-029.** This is
+**Status:** done 2026-05-20. **Depends on T-025, T-028, T-029.** This is
 the public Supabase-shaped surface that picks a transport.
 
 **Files:** `src/realtime/client.ts`, `src/realtime/client.test.ts`,

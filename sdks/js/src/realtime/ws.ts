@@ -1,7 +1,4 @@
-// TODO: dedupe with realtime/backoff.ts once both land (T-030)
-function backoff(attempt: number): number {
-  return Math.min(1000 * Math.pow(2, attempt), 30_000);
-}
+import { backoff } from "./backoff.js";
 
 export interface PresenceMessageHandler {
   handleMessage(msg: unknown): void;

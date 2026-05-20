@@ -47,9 +47,8 @@ describe("createClient", () => {
     expect(typeof basin.channel).toBe("function");
     // functions.invoke went live with T-026 (POST /rest/v1/rpc/:fn).
     expect(basin.functions.enabled).toBe(true);
-    // realtime channel API (T-030) is not wired yet; transports (SSE/WS)
-    // exist but the channel() router still reports disabled until T-030.
-    expect(basin.realtime.enabled).toBe(false);
+    // realtime channel API wired in T-030; SSE/WS routing live.
+    expect(basin.realtime.enabled).toBe(true);
   });
 
   it("query-builder chains compose without throwing", () => {

@@ -182,6 +182,7 @@ export function createClient(
   const realtime = new RealtimeClient({
     url: base,
     headers,
+    fetchFn: fetcher,
   });
 
   const functions = new FunctionsClient({
