@@ -10,6 +10,16 @@ publish = false
 name = "basin-server"
 path = "src/main.rs"
 
+[features]
+# ADR 0018: optional subsystem gates.
+# `realtime` is the first fully-optional subsystem — not in the default build
+# so the default `cargo build` is byte-equivalent to before this crate existed.
+default    = []
+realtime   = ["dep:basin-realtime"]
+# Enable basin-auth's conformance test runner so the #[cfg(test)] block in
+# engine_auth_store.rs can call `basin_auth::store::conformance::*`.
+test-utils = ["basin-auth/test-utils"]
+
 [dependencies]
 basin-common.workspace = true
 basin-storage.workspace = true
@@ -21,6 +31,7 @@ basin-wal.workspace = true
 basin-pool.workspace = true
 basin-auth.workspace = true
 basin-rest.workspace = true
+basin-realtime = { workspace = true, optional = true }
 
 tokio.workspace = true
 object_store.workspace = true

@@ -308,7 +308,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "atoi",
- "base64",
+ "base64 0.22.1",
  "chrono",
  "comfy-table",
  "half",
@@ -732,6 +732,12 @@ dependencies = [
 
 [[package]]
 name = "base64"
+version = "0.21.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d297deb1925b89f2ccc13d7635fa0714f12c87adce1c75356b39ca9b7178567"
+
+[[package]]
+name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
@@ -747,7 +753,7 @@ name = "basin-auth"
 version = "0.1.9"
 dependencies = [
  "async-trait",
- "base64",
+ "base64 0.22.1",
  "basin-catalog",
  "basin-common",
  "bcrypt",
@@ -871,9 +877,10 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "async-trait",
- "base64",
+ "base64 0.22.1",
  "basin-catalog",
  "basin-common",
+ "basin-hottier",
  "basin-shard",
  "basin-sketch",
  "basin-storage",
@@ -884,13 +891,17 @@ dependencies = [
  "bitflags",
  "bytes",
  "chrono",
+ "criterion",
+ "dashmap",
  "datafusion",
  "datafusion-datasource",
  "datafusion-physical-expr",
  "datafusion-physical-plan",
  "datafusion-session",
  "futures",
+ "hdrhistogram",
  "hex",
+ "lru",
  "md-5 0.10.6",
  "object_store",
  "parquet",
@@ -941,6 +952,7 @@ dependencies = [
  "rand 0.8.6",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -983,6 +995,7 @@ dependencies = [
  "basin-cv",
  "basin-engine",
  "basin-geo",
+ "basin-hottier",
  "basin-net",
  "basin-rest",
  "basin-router",
@@ -1064,6 +1077,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "basin-realtime"
+version = "0.1.9"
+dependencies = [
+ "async-trait",
+ "basin-common",
+ "chrono",
+ "dashmap",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "basin-rest"
 version = "0.1.9"
 dependencies = [
@@ -1072,7 +1100,7 @@ dependencies = [
  "arrow-schema",
  "async-trait",
  "axum",
- "base64",
+ "base64 0.22.1",
  "basin-auth",
  "basin-catalog",
  "basin-common",
@@ -1147,6 +1175,7 @@ dependencies = [
  "basin-common",
  "basin-engine",
  "basin-pool",
+ "basin-realtime",
  "basin-rest",
  "basin-router",
  "basin-shard",
@@ -1173,6 +1202,7 @@ dependencies = [
  "async-trait",
  "basin-catalog",
  "basin-common",
+ "basin-hottier",
  "basin-storage",
  "basin-wal",
  "bytes",
@@ -1327,7 +1357,7 @@ version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b1866ecef4f2d06a0bb77880015fdf2b89e25a1c2e5addacb87e459c86dc67e"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "blowfish",
  "getrandom 0.2.17",
  "subtle",
@@ -2446,7 +2476,7 @@ checksum = "f28aa4e10384e782774b10e72aca4d93ef7b31aa653095d9d4536b0a3dbc51b6"
 dependencies = [
  "arrow",
  "arrow-buffer",
- "base64",
+ "base64 0.22.1",
  "blake2",
  "blake3",
  "chrono",
@@ -2899,7 +2929,7 @@ version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9298e6504d9b9e780ed3f7dfd43a61be8cd0e09eb07f7706a945b0072b6670b6"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "memchr",
 ]
 
@@ -3457,6 +3487,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hdrhistogram"
+version = "7.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "765c9198f173dd59ce26ff9f95ef0aafd0a0fe01fb9d72841bc5066a4c06511d"
+dependencies = [
+ "base64 0.21.7",
+ "byteorder",
+ "crossbeam-channel",
+ "flate2",
+ "nom 7.1.3",
+ "num-traits",
+]
+
+[[package]]
 name = "heapless"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3640,7 +3684,7 @@ version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96547c2556ec9d12fb1578c4eaf448b04993e7fb79cbaad930a656880a6bdfa0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-channel",
  "futures-util",
@@ -4013,7 +4057,7 @@ version = "9.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a87cc7a48537badeae96744432de36f4be2b4a34a05a5ef32e9dd8a1c169dde"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "js-sys",
  "pem",
  "ring",
@@ -4115,7 +4159,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0da65617f6cb926332d039cb578aad56178da86e128db6a1b09f4c94fa5b3349"
 dependencies = [
  "async-trait",
- "base64",
+ "base64 0.22.1",
  "email-encoding",
  "email_address",
  "fastrand",
@@ -4651,7 +4695,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "622acbc9100d3c10e2ee15804b0caa40e55c933d5aa53814cd520805b7958a49"
 dependencies = [
  "async-trait",
- "base64",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "form_urlencoded",
@@ -4884,7 +4928,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "arrow-select",
- "base64",
+ "base64 0.22.1",
  "brotli",
  "bytes",
  "chrono",
@@ -4937,7 +4981,7 @@ version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "serde_core",
 ]
 
@@ -5172,7 +5216,7 @@ version = "0.6.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56201207dac53e2f38e848e31b4b91616a6bb6e0c7205b77718994a7f49e70fc"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "byteorder",
  "bytes",
  "fallible-iterator",
@@ -5714,7 +5758,7 @@ version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-core",
  "futures-util",
@@ -6812,7 +6856,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
- "base64",
+ "base64 0.22.1",
  "bytes",
  "h2",
  "http",

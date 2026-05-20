@@ -277,6 +277,19 @@ async fn main() -> Result<()> {
         shard: shard_for_engine,
     });
 
+    // --- optional realtime sink (Phase 5.11.R1, ADR 0018) -------------------
+    //
+    // Attach *before* the first connection is accepted so no events slip
+    // through the window between engine construction and sink registration.
+    // The sink is a no-op until at least one SSE/WebSocket subscriber calls
+    // `RealtimeSink::registry().subscribe(key)` (R2/R3).
+    #[cfg(feature = "realtime")]
+    {
+        let realtime_sink = basin_realtime::RealtimeSink::new();
+        engine.attach_post_commit_sink(std::sync::Arc::new(realtime_sink));
+        tracing::info!("basin-realtime post-commit sink attached");
+    }
+
     // Build the static resolver from `BASIN_PROJECTS`.
     let mut static_resolver = StaticProjectResolver::default();
     for (user, project) in cfg.projects {
