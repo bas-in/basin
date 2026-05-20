@@ -5,3 +5,7 @@ dist/
 .vscode/
 .DS_Store
 .claude/
+
+# Rust
+/target
+Cargo.lock merge=union

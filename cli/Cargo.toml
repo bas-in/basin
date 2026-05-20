@@ -1,0 +1,30 @@
+[package]
+name = "basin-cli"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "Apache-2.0"
+description = "Basin Cloud control plane CLI"
+repository = "https://github.com/bas-in/basin-cli"
+
+# The daily-driver binary is `basin` (matches the flyctl→fly / supabase
+# convention of one short word), distinct from the engine admin `basinctl`.
+[[bin]]
+name = "basin"
+path = "src/main.rs"
+
+[dependencies]
+# clap (builder API, used per-command with no_binary_name) replaces Go's
+# hand-rolled flag.FlagSet. reqwest blocking + rustls-tls is the HTTP
+# transport (rustls avoids an OpenSSL system dep for cross-compiled
+# release binaries). serde/serde_json shape the {data,error} envelopes.
+# chrono parses the RFC3339 timestamps cached in config.json.
+clap = "4"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+
+[profile.release]
+strip = true
+lto = "thin"
