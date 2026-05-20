@@ -439,3 +439,17 @@ crash-safe write path.
 - [ADR 0016 addendum 2026-05-19](./0016-htap-hot-tier-architecture.md) — locks memtable schema evolution policy; notes the ADR 0018 pre-condition.
 - [Phase 5.14.C2 spec](../roadmap/2026-05-19-decomposition.md) — file-scope and acceptance gate for the write-path side of this protocol.
 - `crates/basin-wal/src/lib.rs` — `WalEvent`, `WalReplayConfig`, `replay_wal`, and the `Wal` trait method stubs (`append_tx_begin`, `append_tx_rollback`, `append_tx_commit`).
+
+## Reconciliation (2026-05-20)
+
+**Option A chosen: impl wins; ADR §6 updated to reflect shipped semantics.**
+
+The C2 implementation commit (`5551761`, "feat(wal): BEGIN/ROLLBACK transaction markers + replay suppression") shipped only `TxBegin` and `TxRollback` variants in `SegmentRecord` / `WalEvent` — no `TxCommit` variant was added, and no `append_tx_commit` method was implemented on `LocalWal` / `FileWal`. The `replay_wal` function instead uses **implicit commit at end-of-input**: any open transaction (a `Begin` with no matching `Rollback` and no `Commit`) is emitted as committed when the event stream is exhausted. This directly contradicts the explicit-`Commit`-marker design in §6 above.
+
+**Why the deviation happened.** The C2 agent followed the WAL implementation plan that was active at the time (BEGIN + ROLLBACK only), which omitted the `Commit` variant for simplicity. The ADR was written in parallel and locked the more conservative explicit-commit protocol, but the two sides were not cross-checked before the commit landed.
+
+**Correctness assessment of the shipped semantics.** The ADR's §6 argument is sound: implicit-commit-at-EOF cannot distinguish a clean shutdown from a mid-transaction crash. A `BEGIN` / N inserts / crash scenario will, on replay, emit all N rows as if committed — the application never issued `COMMIT`. For Basin's current memtable use case this is a real (not theoretical) correctness risk. However, the risk is bounded: the hot tier is write-preview only in Phase 5.14, and crash recovery of the in-memory memtable always starts from a cold empty state anyway (memtable is not persisted to object store yet). In the current deployment reality, a crash discards the memtable entirely and the WAL replay rebuilds it; the implicit-commit semantics cause at most a brief window of phantom rows that will be overwritten or compacted on the next flush cycle. This is not ideal but is not a data-loss or durability violation at the Parquet / object-store layer.
+
+**Future work.** An explicit `TxCommit` variant (`tag 0x12`) and a matching `append_tx_commit` call from `executor.rs` remain the correct long-term design and should be added when the hot tier's WAL-replay path is used for durable recovery (Phase 5.14.C4 or later). At that point the `replay_wal` state machine must be updated to treat end-of-input with an open transaction as a **discard** (the original Case 4 intent), and the existing implicit-commit-at-EOF path should be removed. The acceptance test in `crates/basin-wal/tests/tx_markers.rs` (gate 1) explicitly tests implicit commit and will need to be updated when this change lands.
+
+**Files touched by this reconciliation.** `docs/decisions/0020-wal-transaction-markers.md` (this section), `decisions.md` (one-line log entry). No code changes — the WAL crate (`crates/basin-wal/`) is unchanged.

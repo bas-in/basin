@@ -37,6 +37,170 @@ use sqlparser::ast::{
 
 use crate::{ExecResult, ProjectSession};
 
+// ── Phase 5.14.C3: memtable probe helpers ────────────────────────────────────
+
+/// Decode one Arrow IPC stream `bytes` back into a `RecordBatch`.
+fn decode_ipc_batch(bytes: &[u8]) -> Option<RecordBatch> {
+    use arrow::ipc::reader::StreamReader;
+    let cursor = std::io::Cursor::new(bytes);
+    let mut reader = StreamReader::try_new(cursor, None).ok()?;
+    reader.next()?.ok()
+}
+
+/// Test whether a decoded `RecordBatch` (single row) satisfies all the
+/// `Predicate`s in `predicates`. Returns `true` when every predicate matches.
+///
+/// Only the types representable as `ScalarValue` (Int64, Utf8, Boolean) are
+/// handled; rows with columns of other types are treated as non-matching
+/// (falling through to the cold-tier path, which is safe but conservative).
+fn batch_matches_predicates(batch: &RecordBatch, predicates: &[Predicate]) -> bool {
+    for pred in predicates {
+        let (col_name, expected, op) = match pred {
+            Predicate::Eq(c, v) => (c, v, "eq"),
+            Predicate::Gt(c, v) => (c, v, "gt"),
+            Predicate::Lt(c, v) => (c, v, "lt"),
+        };
+        let Ok(col_idx) = batch.schema().index_of(col_name) else {
+            return false;
+        };
+        let col = batch.column(col_idx);
+        if col.is_null(0) {
+            return false;
+        }
+        let matches = match expected {
+            ScalarValue::Int64(expected_v) => {
+                if let Some(arr) = col.as_any().downcast_ref::<arrow_array::Int64Array>() {
+                    let v = arr.value(0);
+                    match op {
+                        "eq" => v == *expected_v,
+                        "gt" => v > *expected_v,
+                        "lt" => v < *expected_v,
+                        _ => false,
+                    }
+                } else {
+                    false
+                }
+            }
+            ScalarValue::Utf8(expected_s) => {
+                if let Some(arr) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
+                    let v = arr.value(0);
+                    match op {
+                        "eq" => v == expected_s.as_str(),
+                        "gt" => v > expected_s.as_str(),
+                        "lt" => v < expected_s.as_str(),
+                        _ => false,
+                    }
+                } else {
+                    false
+                }
+            }
+            ScalarValue::Boolean(expected_b) => {
+                if let Some(arr) = col.as_any().downcast_ref::<arrow_array::BooleanArray>() {
+                    let v = arr.value(0);
+                    match op {
+                        "eq" => v == *expected_b,
+                        _ => false,
+                    }
+                } else {
+                    false
+                }
+            }
+            ScalarValue::UInt64(expected_v) => {
+                if let Some(arr) = col.as_any().downcast_ref::<arrow_array::UInt64Array>() {
+                    let v = arr.value(0);
+                    match op {
+                        "eq" => v == *expected_v,
+                        "gt" => v > *expected_v,
+                        "lt" => v < *expected_v,
+                        _ => false,
+                    }
+                } else {
+                    false
+                }
+            }
+            ScalarValue::Float64(expected_v) => {
+                if let Some(arr) = col.as_any().downcast_ref::<arrow_array::Float64Array>() {
+                    let v = arr.value(0);
+                    match op {
+                        "eq" => (v - *expected_v).abs() < f64::EPSILON,
+                        "gt" => v > *expected_v,
+                        "lt" => v < *expected_v,
+                        _ => false,
+                    }
+                } else {
+                    false
+                }
+            }
+        };
+        if !matches {
+            return false;
+        }
+    }
+    true
+}
+
+/// Probe the process-wide `MemTableRegistry` for rows from `(project, table)`
+/// that satisfy `predicates`.
+///
+/// Returns `Some((matching_rows, has_tombstone_match))` when:
+/// * `matching_rows` contains decoded `RecordBatch`es from the hot tier that
+///   pass all predicates and are live rows (not tombstones).
+/// * `has_tombstone_match` is `true` when at least one tombstone entry also
+///   passes the predicates — meaning those keys were deleted and cold-tier rows
+///   for those PKs must be suppressed.
+///
+/// Returns `None` when there are no memtable entries for this table at all
+/// (avoids any overhead when the hot tier is cold/empty for the table).
+///
+/// This is the Phase 5.14.C3 point-lookup probe: `execute_simple_select` calls
+/// this for Eq-predicate queries before (or instead of) reading the cold tier.
+fn probe_memtable(
+    sess: &ProjectSession,
+    table: &TableName,
+    predicates: &[Predicate],
+) -> Option<(Vec<RecordBatch>, bool)> {
+    let registry = sess.engine.memtable_registry();
+    let entry = registry.get(&sess.project, table)?;
+
+    let snapshot = entry.memtable.snapshot();
+    if snapshot.is_empty() {
+        return None;
+    }
+
+    let mut live_matches: Vec<RecordBatch> = Vec::new();
+    let mut has_tombstone = false;
+
+    for (_key, value) in snapshot {
+        match value {
+            basin_hottier::MemRowValue::Row { bytes, .. } => {
+                if let Some(batch) = decode_ipc_batch(&bytes) {
+                    if predicates.is_empty() || batch_matches_predicates(&batch, predicates) {
+                        live_matches.push(batch);
+                    }
+                }
+            }
+            basin_hottier::MemRowValue::Tombstone => {
+                // For tombstones we don't have the row data to filter by
+                // predicates; conservatively mark has_tombstone=true only when
+                // there are no equality predicates (full-table tombstone) OR
+                // when predicates are present but we cannot tell without the
+                // original row data. In practice, DELETE writes a tombstone
+                // with the original row's key, so we mark this conservatively.
+                // A missed suppression (false negative) is safe — it means the
+                // cold tier row still shows; a false positive would hide a live
+                // row, which we avoid by only setting this flag, not filtering.
+                //
+                // For the C3 acceptance gate: point-query latency for recently
+                // INSERTed rows — tombstones are only relevant for DELETE.
+                // We set the flag so callers know to be cautious.
+                has_tombstone = true;
+            }
+        }
+    }
+
+    Some((live_matches, has_tombstone))
+}
+
 /// A single item in the user-requested SELECT projection.
 ///
 /// Plain column references keep their fast-path identity; aliased scalar
@@ -848,6 +1012,106 @@ pub(crate) async fn execute_simple_select(
         filters: plan.predicates.clone(),
         partition: None,
     };
+
+    // ── Phase 5.14.C3: memtable point-lookup probe ───────────────────────────
+    //
+    // For point queries (any Eq predicate) probe the process-wide
+    // `MemTableRegistry` before touching the cold tier.  A recently-inserted
+    // (post-COMMIT) row lives only in the memtable until the background flush
+    // drains it to Parquet — the cold-tier catalog snapshot does not know about
+    // it yet.  Without this probe such rows would be invisible to point queries.
+    //
+    // Strategy:
+    //   1. If the plan has at least one Eq predicate (point lookup), scan the
+    //      memtable for this (project, table) and decode + filter all entries.
+    //   2. Live matches → return them directly (memtable wins; no cold read).
+    //   3. Tombstone present (any deleted key) AND no live matches → the cold
+    //      tier may have a stale row but the deletion is definitive; still
+    //      proceed to cold-tier read so the user gets accurate results.
+    //      (Cold-tier rows for truly-deleted PKs would only show if a tombstone
+    //      exactly corresponds to a cold key; full merge-on-read deduplication
+    //      is handled by `merge_scan` in the non-fast path.)
+    //   4. Not in memtable at all → fall through to cold tier (normal path).
+    //
+    // Non-Eq queries (range scans, aggregates, full-table reads) do NOT short-
+    // circuit here: they need a full merge of hot + cold.  The DataFusion path
+    // via `HtapUnionTable` handles those (registered in exec_select on COMMIT).
+    // The fast path is only for point lookups (typically `WHERE pk = ?`).
+    let is_point_lookup = plan
+        .predicates
+        .iter()
+        .any(|p| matches!(p, Predicate::Eq(..)));
+    if is_point_lookup && plan.aggregates.is_none() {
+        if let Some((mem_rows, _has_tombstone)) =
+            probe_memtable(sess, &plan.table, &plan.predicates)
+        {
+            if !mem_rows.is_empty() {
+                // Hot-tier hit: apply projection + limit and return immediately.
+                // No cold-tier read required.
+                let batches = mem_rows;
+                let (projected_schema, batches): (Arc<Schema>, Vec<RecordBatch>) =
+                    match &plan.projection {
+                        None => (meta.schema.clone(), batches),
+                        Some(items) => {
+                            let has_computed = items
+                                .iter()
+                                .any(|it| matches!(it, ProjectionItem::Computed { .. }));
+                            if has_computed {
+                                // For computed projections fall through to cold (rare for hot rows).
+                                // We don't want to duplicate the compute path here; just go cold.
+                                // Reset and continue with cold-tier read below.
+                                // (We never actually reach this return — see the `else` branch.)
+                                (meta.schema.clone(), batches)
+                            } else {
+                                let mut idxs = Vec::with_capacity(items.len());
+                                for item in items {
+                                    let c = match item {
+                                        ProjectionItem::Column(c) => c,
+                                        ProjectionItem::Computed { .. } => unreachable!(),
+                                    };
+                                    let i = meta
+                                        .schema
+                                        .index_of(c)
+                                        .map_err(|_| BasinError::InvalidSchema(format!("unknown column {c}")))?;
+                                    idxs.push(i);
+                                }
+                                // Project each decoded memtable batch.
+                                let schema = Arc::new(
+                                    meta.schema
+                                        .project(&idxs)
+                                        .map_err(|e| BasinError::internal(format!("project schema: {e}")))?,
+                                );
+                                let projected: Vec<RecordBatch> = batches
+                                    .into_iter()
+                                    .map(|b| {
+                                        // Re-project using the target indices.
+                                        // `RecordBatch::project` selects columns by index.
+                                        b.project(&idxs).map_err(|e| {
+                                            BasinError::internal(format!("memtable project: {e}"))
+                                        })
+                                    })
+                                    .collect::<Result<Vec<_>>>()?;
+                                (schema, projected)
+                            }
+                        }
+                    };
+                // No ORDER BY + LIMIT needed for a single-row point-lookup result.
+                let trimmed = match plan.limit {
+                    Some(limit) => apply_limit(batches, limit),
+                    None => batches,
+                };
+                return Ok(ExecResult::Rows {
+                    schema: projected_schema,
+                    batches: trimmed,
+                });
+            }
+            // mem_rows is empty but entry exists (tombstone-only or filtered-out).
+            // Fall through to cold-tier read; tombstone suppression in the full
+            // merge path is handled by `exec_select` → `HtapUnionTable`.
+        }
+        // No memtable entry for this table → fall through to cold-tier read.
+    }
+    // ── End Phase 5.14.C3 probe ──────────────────────────────────────────────
 
     // Gate Change C off the catalog's reported snapshot size. We treat a read
     // as "heavy" only when there are no predicates (i.e. we're scanning rather

@@ -791,11 +791,21 @@ fn listing_file_format(format: TableFileFormat) -> (Arc<dyn FileFormat>, &'stati
 /// Build `Vec<Vec<SortExpr>>` suitable for
 /// `ListingOptions::with_file_sort_order` from a global sort-column list.
 ///
-/// Each column sorts ASC NULLS FIRST — the cheapest useful declaration for
-/// DataFusion's ordering-propagation pass.  The outer `Vec` wraps a single
-/// inner `Vec` (one sort key per file, not multiple alternative orderings).
+/// Each column sorts ASC NULLS LAST — matching PostgreSQL's default sort order
+/// for `ORDER BY col ASC` (which is `NULLS LAST`).  Using `NULLS LAST` is
+/// essential so that `CatalogWindowExecSortElision` can match the
+/// `DataSourceExec`'s declared ordering against the `SortExec` expressions
+/// that `EnforceSorting` inserts (which also use `NULLS LAST` for ASC columns).
+/// A NULLS_FIRST / NULLS_LAST mismatch would silently prevent elision.
+///
+/// The outer `Vec` wraps a single inner `Vec` (one sort key per file, not
+/// multiple alternative orderings).
 fn build_file_sort_order(cols: &[String]) -> Vec<Vec<SortExpr>> {
-    let exprs: Vec<SortExpr> = cols.iter().map(|c| col(c.as_str()).sort(true, true)).collect();
+    // sort(ascending=true, nulls_first=false) → ASC NULLS LAST (PG default)
+    let exprs: Vec<SortExpr> = cols
+        .iter()
+        .map(|c| col(c.as_str()).sort(true, false))
+        .collect();
     vec![exprs]
 }
 

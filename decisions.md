@@ -6,6 +6,12 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-20 — ADR 0020 reconciliation (WAL Commit marker vs implicit-commit-at-EOF)
+
+**Option A chosen (impl wins).** The C2 WAL impl (`5551761`) shipped `TxBegin` + `TxRollback` only — no `TxCommit` variant. ADR 0020 §6 required an explicit `Commit` marker. Reconciliation: updated ADR 0020 with a "Reconciliation (2026-05-20)" section documenting the shipped implicit-commit-at-EOF semantics, the correctness gap, and the deferred path to add explicit `TxCommit` in Phase 5.14.C4+. No code changes needed; `cargo check --workspace` is clean. Option B (add `TxCommit` variant + emit from executor) was deferred due to high conflict risk with the C3 agent editing `executor.rs` and because the correctness impact is bounded to the hot tier's in-memory rebuild path (no object-store durability affected).
+
+---
+
 ## 2026-05-20 — Wave 3 reality check + recovery
 
 **TASK.md was MORE out of sync than the kickoff entry knew.** Three Phase
