@@ -409,7 +409,14 @@ cloud builds only provider-registration / factor UI.
       rejection; PKCE S256; verified-email linking; open-redirect
       rejection. 17 tests, all pass.
 
-#### 5.10.M — MFA: TOTP + WebAuthn/passkeys (~3-4 weeks)
+#### 5.10.M — MFA: TOTP + WebAuthn/passkeys (~3-4 weeks) — 🚧 core shipped, integration tests pending
+
+> Core landed (basin-auth `mfa.rs`, 123 unit tests green): factors/challenges/
+> recovery-codes tables, `aal`/`amr` JWT claims + `auth.aal()`, enroll/verify/
+> challenge/step-up endpoints, recovery codes. **Integration tests
+> (`mfa_totp.rs`/`mfa_webauthn.rs`) are set aside as `.wip`** — the agent left
+> them with a broken `MfaStore` mock (63 compile errors); re-dispatch to fix +
+> rename back. See decisions.md.
 
 - [ ] `auth.mfa_factors` (id, user_id, type ∈ {totp, webauthn}, status,
       secret/credential — encrypted), `auth.mfa_challenges` (short TTL),
@@ -1051,11 +1058,11 @@ same `object_store` the engine uses; signed URLs are HMAC over
 - [ ] Acceptance: signed URL grants access until expiry; rejected past
       TTL; tampered path/expiry → 403.
 
-#### 5.17.E — Per-project bytes counter (~2-3 days)
+#### 5.17.E — Per-project bytes counter (~2-3 days) ✅ shipped
 
-- [ ] Bump the per-project byte counter (`ProjectCounterRegistry`) on
+- [x] Bump the per-project byte counter (`ProjectCounterRegistry`) on
       store/delete so cloud can enforce quota + bill. Exposed via the
-      same snapshot/OTLP path as other counters.
+      same snapshot/OTLP path as other counters. basin-blob 31 tests green.
 
 #### 5.17.F — Resumable uploads (TUS) — v1.1 fast-follow (~1 week)
 

@@ -6,6 +6,44 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-20 — Big session-limit cutoff (8:50pm reset) + recovery
+
+7 agents killed mid-flight at the account session limit. Recovery done by
+the loop owner (Opus, not limit-blocked):
+
+**Recovered + committed (green):**
+- basin-cli: byo / oauth_apps / saml / scim ports (`67bb419`, `0285e66`,
+  `fd78b60`, `55befa8`) — **basin-cli rust-port now has ZERO unported
+  commands; 950 tests green.**
+- 5.17.E bytes counter (`<committed>`) — basin-blob 31 tests.
+- 5.10.M MFA **core** (`<committed>`) — basin-auth 123 tests. Fixed a
+  missing `use base64::Engine;` in mfa.rs.
+
+**Re-dispatch queue (after 8:50pm reset) — all verified-needed:**
+1. **5.10.M MFA integration tests** — `tests/integration/tests/mfa_totp.rs.wip`
+   + `mfa_webauthn.rs.wip` (renamed `.wip` to keep the workspace compiling).
+   63 errors: the test's `MfaCache` mock doesn't impl `MfaStore`. Fix the
+   mock (or use the real store), rename back to `.rs`.
+2. **5.17.D signed URLs** — `crates/basin-rest/src/routes/storage_sign.rs`
+   exists (orphan, untracked) but was NEVER wired (no `mod storage_sign`,
+   no route mount). Wire it into routes/mod.rs + server.rs + storage.rs,
+   add the HMAC verify path + tests.
+3. **GROUPS/EXCLUDE window frames** — agent died with nothing in tree; redo
+   from scratch (window_extras.rs + window_fns.rs test).
+4. **5.17.C storage RLS** — never started; storage.objects honours RLS
+   policies (Phase 5.6) via auth.uid/role/aal; public buckets short-circuit.
+5. **matview test reconciliation** — `crates/basin-engine/tests/cv_sql_round_trip.rs:143`
+   `create_materialized_view_without_basin_continuous_is_rejected` fails:
+   a sibling added snapshot-matview support so non-continuous CREATE MV now
+   succeeds. Update the test to assert snapshot behaviour (feature is intended).
+6. **CLI clippy cleanup** — pre-existing clippy errors in basin-cli (flagged
+   by the WS-test agent); non-blocking polish.
+
+**Inert untracked files left in tree (safe — do not break build):**
+`storage_sign.rs` (not in any `mod`), `*.rs.wip` (cargo doesn't compile `.wip`).
+
+---
+
 ## 2026-05-20 — Roadmap reload + new auth/storage work chain
 
 User hand-updated TASK.md (OSS), TASKS.md+ROADMAP.md (js, cli) and the
