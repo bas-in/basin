@@ -1022,16 +1022,16 @@ same `object_store` the engine uses; signed URLs are HMAC over
 
 #### 5.17.B — HTTP API in basin-rest (~1.5 weeks)
 
-- [ ] `POST/GET/DELETE /storage/v1/object/:bucket/:path*` (upload /
+- [x] `POST/GET/DELETE /storage/v1/object/:bucket/:path*` (upload /
       download / single-delete; RLS-gated). `GET /storage/v1/object/public/…`
       fast path for public buckets. `POST /storage/v1/object/list/:bucket`.
       Bulk delete `DELETE /storage/v1/object/:bucket` with `{prefixes:[]}`
       body (basin-js `.remove(paths[])` maps here). Bucket CRUD under
       `/storage/v1/bucket`.
-- [ ] Body cap from `storage.buckets.file_size_limit`; MIME sniffed
+- [x] Body cap from `storage.buckets.file_size_limit`; MIME sniffed
       server-side against `allowed_mime_types[]`; path normalised
       (traversal guard).
-- [ ] Acceptance: `curl` upload then download round-trips; private
+- [x] Acceptance: `curl` upload then download round-trips; private
       bucket without JWT → 401; public bucket without JWT → 200.
 
 #### 5.17.C — RLS integration (~3-5 days)

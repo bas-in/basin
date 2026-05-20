@@ -3,6 +3,7 @@
 //! - [`data`] handles `/rest/v1/<table>` (GET / POST / PATCH / DELETE).
 //! - [`auth`] handles `/auth/v1/{signup,signin,refresh,verify-email,
 //!   reset-password,magic-link}`.
+//! - [`storage`] handles `/storage/v1/{object,bucket}/*` (Phase 5.17.B).
 //!
 //! Routes are wired together in [`crate::server`].
 
@@ -12,3 +13,4 @@ pub(crate) mod data;
 pub(crate) mod inbound;
 pub(crate) mod openapi;
 pub(crate) mod rpc;
+pub(crate) mod storage;

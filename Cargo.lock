@@ -1034,6 +1034,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "basin-auth",
+ "basin-blob",
  "basin-catalog",
  "basin-common",
  "basin-cron",

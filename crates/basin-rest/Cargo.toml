@@ -11,6 +11,7 @@ basin-common.workspace = true
 basin-engine.workspace = true
 basin-auth.workspace = true
 basin-catalog.workspace = true
+basin-blob.workspace = true
 
 tokio.workspace = true
 futures.workspace = true
@@ -28,6 +29,9 @@ chrono.workspace = true
 # Used to render `FixedSizeBinary(16)` UUID columns as canonical
 # hyphenated text in JSON responses (see `json::encode_cell`).
 uuid.workspace = true
+sha2.workspace = true
+hex.workspace = true
+object_store.workspace = true
 
 # HTTP stack.
 axum.workspace = true

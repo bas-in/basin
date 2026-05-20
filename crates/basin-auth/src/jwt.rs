@@ -12,6 +12,31 @@ use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Authenticator Assurance Level (RFC 8176 / Supabase AAL).
+/// `aal1` = single-factor (password, magic-link, OAuth).
+/// `aal2` = multi-factor (TOTP or WebAuthn challenge verified this session).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Aal {
+    Aal1,
+    Aal2,
+}
+
+impl Default for Aal {
+    fn default() -> Self {
+        Self::Aal1
+    }
+}
+
+impl std::fmt::Display for Aal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Aal::Aal1 => f.write_str("aal1"),
+            Aal::Aal2 => f.write_str("aal2"),
+        }
+    }
+}
+
 /// Decoded JWT claims. The wire format uses string forms for ULID/UUID so the
 /// token survives any JSON tooling on the way to a client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +53,11 @@ pub struct Claims {
     /// control plane mints one admin-true token at deploy time and uses it to
     /// provision projects.
     pub is_admin: bool,
+    /// Authenticator Assurance Level. `aal1` until an MFA challenge succeeds.
+    pub aal: Aal,
+    /// Authentication Method References (RFC 8176): ordered list of methods
+    /// used this session (e.g. `["pwd"]`, `["pwd","totp"]`).
+    pub amr: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -40,6 +70,10 @@ struct WireClaims {
     iat: i64,
     #[serde(default)]
     is_admin: bool,
+    #[serde(default)]
+    aal: Aal,
+    #[serde(default)]
+    amr: Vec<String>,
 }
 
 /// Refresh-token claims. Distinct `aud` keeps a stolen access token from
@@ -122,6 +156,24 @@ impl JwtKeys {
         now: DateTime<Utc>,
         ttl: Duration,
     ) -> Result<(String, DateTime<Utc>)> {
+        self.issue_full(project, user, email, roles, is_admin, Aal::Aal1, vec![], now, ttl)
+    }
+
+    /// Issue an access token with full AAL/AMR control (used by MFA challenge
+    /// step-up flow). `aal2` is emitted when the user has passed an MFA challenge
+    /// in this session; `amr` lists the methods used.
+    pub fn issue_full(
+        &self,
+        project: &ProjectId,
+        user: Uuid,
+        email: &str,
+        roles: &[String],
+        is_admin: bool,
+        aal: Aal,
+        amr: Vec<String>,
+        now: DateTime<Utc>,
+        ttl: Duration,
+    ) -> Result<(String, DateTime<Utc>)> {
         let exp_dt = now
             + chrono::Duration::from_std(ttl).map_err(|e| {
                 BasinError::internal(format!("token_ttl out of range for chrono: {e}"))
@@ -134,6 +186,8 @@ impl JwtKeys {
             exp: exp_dt.timestamp(),
             iat: now.timestamp(),
             is_admin,
+            aal,
+            amr,
         };
         let token = encode(&Header::new(Algorithm::HS256), &wire, &self.encoding)
             .map_err(|e| BasinError::internal(format!("jwt encode: {e}")))?;
@@ -161,6 +215,8 @@ impl JwtKeys {
             exp: w.exp,
             iat: w.iat,
             is_admin: w.is_admin,
+            aal: w.aal,
+            amr: w.amr,
         })
     }
 
@@ -245,6 +301,32 @@ mod tests {
         assert_eq!(claims.roles, vec!["admin".to_string()]);
         assert_eq!(claims.exp, exp.timestamp());
         assert_eq!(claims.iat, now.timestamp());
+        assert_eq!(claims.aal, Aal::Aal1);
+        assert!(claims.amr.is_empty());
+    }
+
+    #[test]
+    fn issue_full_aal2_round_trips() {
+        let keys = JwtKeys::new(&[7u8; 32]);
+        let project = ProjectId::new();
+        let user = Uuid::new_v4();
+        let now = Utc::now();
+        let (jwt, _) = keys
+            .issue_full(
+                &project,
+                user,
+                "alice@example.com",
+                &["user".to_string()],
+                false,
+                Aal::Aal2,
+                vec!["pwd".to_string(), "totp".to_string()],
+                now,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        let claims = keys.verify(&jwt).unwrap();
+        assert_eq!(claims.aal, Aal::Aal2);
+        assert_eq!(claims.amr, vec!["pwd", "totp"]);
     }
 
     #[test]

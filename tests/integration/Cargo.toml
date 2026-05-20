@@ -23,6 +23,7 @@ basin-shard.workspace = true
 basin-wal.workspace = true
 basin-auth = { workspace = true, features = ["test-utils"] }
 basin-rest.workspace = true
+basin-blob.workspace = true
 basin-realtime.workspace = true
 
 tokio.workspace = true

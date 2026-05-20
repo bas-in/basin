@@ -82,6 +82,16 @@ pub trait BlobCatalog: Send + Sync + 'static {
         bucket_id: BucketId,
         path: &str,
     ) -> Result<bool>;
+
+    /// List all object rows for a bucket, optionally filtered to those whose
+    /// `path` starts with `prefix`.  Returns an empty `Vec` when the bucket is
+    /// empty or no paths match the prefix.
+    async fn list_objects_by_prefix(
+        &self,
+        project: &ProjectId,
+        bucket_id: BucketId,
+        prefix: Option<&str>,
+    ) -> Result<Vec<Object>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -167,6 +177,29 @@ impl BlobCatalog for InMemoryBlobCatalog {
             path.to_string(),
         );
         Ok(self.objects.write().await.remove(&key).is_some())
+    }
+
+    async fn list_objects_by_prefix(
+        &self,
+        project: &ProjectId,
+        bucket_id: BucketId,
+        prefix: Option<&str>,
+    ) -> Result<Vec<Object>> {
+        let project_str = project.to_string();
+        let bucket_id_str = bucket_id.to_string();
+        let guard = self.objects.read().await;
+        let mut results: Vec<Object> = guard
+            .iter()
+            .filter(|((p, b, path), _)| {
+                p == &project_str
+                    && b == &bucket_id_str
+                    && prefix.map_or(true, |pfx| path.starts_with(pfx))
+            })
+            .map(|(_, obj)| obj.clone())
+            .collect();
+        // Stable order for reproducible tests.
+        results.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(results)
     }
 }
 
@@ -377,6 +410,22 @@ impl<C: BlobCatalog> BlobStore<C> {
             "object deleted"
         );
         Ok(())
+    }
+
+    /// List objects in a bucket, optionally filtered by `prefix`.
+    ///
+    /// Returns all matching object catalog rows (not bytes).  An empty `prefix`
+    /// or `None` returns every object in the bucket.
+    pub async fn list_objects(
+        &self,
+        project: &ProjectId,
+        bucket_name: &str,
+        prefix: Option<&str>,
+    ) -> Result<Vec<Object>> {
+        let bucket = self.get_bucket(project, bucket_name).await?;
+        self.catalog
+            .list_objects_by_prefix(project, bucket.id, prefix)
+            .await
     }
 
     /// Return the underlying object-store key for an object path.

@@ -18,6 +18,7 @@ use axum::http::header::{HeaderName, AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, Method};
 use axum::routing::{get, post, Router};
 use basin_auth::Claims;
+use basin_blob::store::{BlobStore, InMemoryBlobCatalog};
 use basin_common::Result;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -28,6 +29,7 @@ use crate::errors::ApiError;
 use crate::routes::{
     admin as admin_routes, auth as auth_routes, data as data_routes,
     inbound as inbound_routes, openapi as openapi_routes, rpc as rpc_routes,
+    storage as storage_routes,
 };
 use crate::RestConfig;
 
@@ -35,6 +37,14 @@ use crate::RestConfig;
 pub(crate) struct Inner {
     pub(crate) cfg: RestConfig,
     pub(crate) rate_limiter: basin_auth::rate_limit::PerKey,
+    /// In-process blob store backed by an in-memory catalog.
+    ///
+    /// // TODO 5.17.A-followup: catalog-backed BlobCatalog — swap
+    /// //      InMemoryBlobCatalog for a Postgres-backed implementation once
+    /// //      the catalog migration ships.  For now the object bytes go to
+    /// //      the same object_store as the engine; the catalog metadata lives
+    /// //      only in-process.
+    pub(crate) blob_store: BlobStore<InMemoryBlobCatalog>,
 }
 
 impl Inner {
@@ -43,8 +53,18 @@ impl Inner {
         // requests-per-second to translate to "burst N then refill". 60×N per
         // minute matches the requested rate.
         let rate = cfg.rate_limit_per_sec.saturating_mul(60).max(1);
+
+        // Build the blob store from the engine's object_store so blob bytes
+        // land in the same backend as engine table data.  The catalog layer is
+        // in-memory for 5.17.B; swap for a Postgres-backed BlobCatalog in the
+        // 5.17.A-followup.
+        let blob_obj_store = cfg.engine.config().storage.object_store_handle();
+        let blob_catalog = InMemoryBlobCatalog::arc();
+        let blob_store = BlobStore::new(blob_catalog, blob_obj_store, None);
+
         Self {
             rate_limiter: basin_auth::rate_limit::PerKey::per_minute(rate, "rest_per_project"),
+            blob_store,
             cfg,
         }
     }
@@ -120,6 +140,42 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
             get(admin_routes::list_project_credentials),
         )
         .route("/health", get(health))
+        // --- Phase 5.17.B: object-storage HTTP surface (ADR 0021) -----------
+        // TODO 5.17.B-featuregate: wrap in #[cfg(feature = "storage")] once
+        //      ADR 0018 adds the `storage` Cargo feature to basin-server.
+        //      For now mounted unconditionally alongside the REST + auth routes.
+        .route(
+            "/storage/v1/bucket",
+            post(storage_routes::create_bucket),
+        )
+        .route(
+            "/storage/v1/bucket/:name",
+            get(storage_routes::get_bucket)
+                .delete(storage_routes::delete_bucket),
+        )
+        // Public (no JWT) — must be registered before the wildcard :bucket
+        // route so axum's router matches the literal `public` segment first.
+        .route(
+            "/storage/v1/object/public/:project_id/:bucket/*path",
+            get(storage_routes::download_public_object),
+        )
+        // Authenticated single-object routes.
+        .route(
+            "/storage/v1/object/:bucket/*path",
+            post(storage_routes::upload_object)
+                .get(storage_routes::download_object)
+                .delete(storage_routes::delete_object),
+        )
+        // List (POST with body) and bulk-delete (DELETE with body) share :bucket
+        // but differ in method — axum resolves by method, not path conflict.
+        .route(
+            "/storage/v1/object/list/:bucket",
+            post(storage_routes::list_objects),
+        )
+        .route(
+            "/storage/v1/object/:bucket",
+            axum::routing::delete(storage_routes::bulk_delete_objects),
+        )
         .layer(body_limit)
         .layer(cors)
         .layer(TraceLayer::new_for_http())
@@ -205,6 +261,8 @@ pub(crate) async fn authorize(
                 exp: 0,
                 iat: 0,
                 is_admin: false,
+                aal: basin_auth::jwt::Aal::Aal1,
+                amr: Vec::new(),
             },
             Err(e) => {
                 return Err(ApiError::unauthenticated(format!(
