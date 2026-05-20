@@ -1107,7 +1107,7 @@ Privacy and anonymisation model: [ADR 0017](./docs/decisions/0017-query-shape-pr
       monotonically with row count flags the shape correctly; a shape
       with flat latency does not.
       Estimate: ~1 week. Depends on 5.16.B.
-- [ ] **5.16.D** OTLP export schema.  Files:
+- [x] **5.16.D** OTLP export schema (shipped `94db513`; 5/5 query_stats_export tests; SQL view `basin_stat_statements` with 9 columns; OTLP via tracing-opentelemetry bridge; 1k QPS smoke under 1s wall).  Files:
       `crates/basin-engine/src/query_stats_export.rs` (new); extends the
       existing OpenTelemetry pipeline with `basin.query_shape.*` metrics
       (Counter + Histogram per shape).  Plus a `basin_stat_statements`
