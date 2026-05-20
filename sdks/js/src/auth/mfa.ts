@@ -76,7 +76,7 @@ export class AuthMfaClient {
       data: null,
       error: new BasinError(
         "not_implemented",
-        "MFA lands when basin-rest grows /auth/v1/mfa/* surface",
+        "auth.mfa.enroll (MFA) ships when the engine route lands — tracked in ROADMAP 0.3",
       ),
     };
   }
@@ -101,7 +101,7 @@ export class AuthMfaClient {
       data: null,
       error: new BasinError(
         "not_implemented",
-        "MFA lands when basin-rest grows /auth/v1/mfa/* surface",
+        "auth.mfa.verify (MFA) ships when the engine route lands — tracked in ROADMAP 0.3",
       ),
     };
   }
@@ -123,7 +123,7 @@ export class AuthMfaClient {
       data: null,
       error: new BasinError(
         "not_implemented",
-        "MFA lands when basin-rest grows /auth/v1/mfa/* surface",
+        "auth.mfa.unenroll (MFA) ships when the engine route lands — tracked in ROADMAP 0.3",
       ),
     };
   }

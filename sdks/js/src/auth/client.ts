@@ -304,7 +304,7 @@ export class AuthClient {
       data: null,
       error: new BasinError(
         "not_implemented",
-        "auth.signInWithOAuth is not implemented yet — basin-engine has no /auth/v1/oauth/* routes today; lands in basin v0.2+",
+        "auth.signInWithOAuth (OAuth) ships when the engine route lands — tracked in ROADMAP 0.3",
       ),
     };
   }

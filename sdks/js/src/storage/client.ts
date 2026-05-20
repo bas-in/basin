@@ -46,7 +46,7 @@ export interface ListSortBy {
 const MULTIPART_THRESHOLD = 5 * 1024 * 1024;
 
 const STORAGE_NOT_IMPLEMENTED_MESSAGE =
-  "Storage lands when basin-engine grows /object/* surface — basin v0.2+";
+  "Storage (network methods) ships when the engine route lands — tracked in ROADMAP 0.3";
 
 export class StorageClient {
   #deps: StorageDeps;
@@ -190,7 +190,7 @@ export class StorageBucket {
       data: null,
       error: new BasinError(
         "not_implemented",
-        "Storage multipart lands when basin-engine grows /object/upload/sign/* — basin v0.2+",
+        "storage.uploadMultipart (Storage) ships when the engine route lands — tracked in ROADMAP 0.3",
       ),
     };
   }
@@ -215,7 +215,7 @@ export class StorageBucket {
       data: null,
       error: new BasinError(
         "not_implemented",
-        "Storage TUS lands when basin-engine grows /object/upload/resumable/* — basin v0.2+",
+        "storage.uploadResumable (Storage) ships when the engine route lands — tracked in ROADMAP 0.3",
       ),
     };
   }

@@ -396,6 +396,7 @@ describe("auth.signInWithOAuth", () => {
     expect(error).toBeInstanceOf(BasinError);
     expect(error?.code).toBe("not_implemented");
     expect(error?.message).toContain("OAuth");
+    expect(error?.message).toContain("ROADMAP 0.3");
     // No network egress — the stub returns not_implemented before any fetch.
     expect(fetchCalled).toBe(false);
   });
@@ -898,6 +899,7 @@ describe("auth.mfa.* (not_implemented)", () => {
     expect(data).toBeNull();
     expect(error).toBeInstanceOf(BasinError);
     expect(error?.code).toBe("not_implemented");
+    expect(error?.message).toContain("ROADMAP 0.3");
     expect(fetchCalled).toBe(false);
   });
 
@@ -925,6 +927,7 @@ describe("auth.mfa.* (not_implemented)", () => {
     });
     expect(data).toBeNull();
     expect(error?.code).toBe("not_implemented");
+    expect(error?.message).toContain("ROADMAP 0.3");
     expect(fetchCalled).toBe(false);
   });
 
@@ -948,6 +951,7 @@ describe("auth.mfa.* (not_implemented)", () => {
     const { data, error } = await basin.auth.mfa.unenroll({ code: "123456" });
     expect(data).toBeNull();
     expect(error?.code).toBe("not_implemented");
+    expect(error?.message).toContain("ROADMAP 0.3");
   });
 });
 

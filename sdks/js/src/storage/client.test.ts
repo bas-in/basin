@@ -25,6 +25,7 @@ describe("storage.upload (not_implemented)", () => {
     expect(error).toBeInstanceOf(BasinError);
     expect(error?.code).toBe("not_implemented");
     expect(error?.message).toContain("Storage");
+    expect(error?.message).toContain("ROADMAP 0.3");
   });
 });
 
@@ -38,6 +39,7 @@ describe("storage.download (not_implemented)", () => {
       .download("u1/avatar.png");
     expect(data).toBeNull();
     expect(error?.code).toBe("not_implemented");
+    expect(error?.message).toContain("ROADMAP 0.3");
   });
 });
 
@@ -51,6 +53,7 @@ describe("storage.list (not_implemented)", () => {
       .list("u1/", { limit: 50, offset: 0 });
     expect(data).toBeNull();
     expect(error?.code).toBe("not_implemented");
+    expect(error?.message).toContain("ROADMAP 0.3");
   });
 });
 
@@ -64,6 +67,7 @@ describe("storage.remove (not_implemented)", () => {
       .remove(["a.png", "b.png"]);
     expect(data).toBeNull();
     expect(error?.code).toBe("not_implemented");
+    expect(error?.message).toContain("ROADMAP 0.3");
   });
 });
 
@@ -77,6 +81,7 @@ describe("storage.createSignedUrl (not_implemented)", () => {
       .createSignedUrl("u1/avatar.png", 300);
     expect(data).toBeNull();
     expect(error?.code).toBe("not_implemented");
+    expect(error?.message).toContain("ROADMAP 0.3");
   });
 });
 
@@ -130,6 +135,7 @@ describe("storage multipart + TUS (not_implemented)", () => {
       .uploadMultipart("big.bin", new Blob(["x"]));
     expect(data).toBeNull();
     expect(error.code).toBe("not_implemented");
+    expect(error.message).toContain("ROADMAP 0.3");
   });
 
   it("uploadResumable returns not_implemented", async () => {
@@ -141,5 +147,6 @@ describe("storage multipart + TUS (not_implemented)", () => {
       .uploadResumable("big.bin", new Blob(["x"]));
     expect(data).toBeNull();
     expect(error.code).toBe("not_implemented");
+    expect(error.message).toContain("ROADMAP 0.3");
   });
 });
