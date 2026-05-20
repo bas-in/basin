@@ -46,6 +46,10 @@ ulid.workspace = true
 axum.workspace = true
 base64.workspace = true
 sha2.workspace = true
+# Phase 5.10.M: MFA TOTP integration tests compute TOTP codes in-test.
+hmac.workspace = true
+sha1.workspace = true
+base32 = "0.4"
 
 [dev-dependencies]
 # `with-uuid-1` + `with-serde_json-1` enable native binary encoding of

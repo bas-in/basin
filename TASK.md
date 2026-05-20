@@ -409,33 +409,33 @@ cloud builds only provider-registration / factor UI.
       rejection; PKCE S256; verified-email linking; open-redirect
       rejection. 17 tests, all pass.
 
-#### 5.10.M — MFA: TOTP + WebAuthn/passkeys (~3-4 weeks) — 🚧 core shipped, integration tests pending
+#### 5.10.M — MFA: TOTP + WebAuthn/passkeys (~3-4 weeks) — ✅ complete
 
 > Core landed (basin-auth `mfa.rs`, 123 unit tests green): factors/challenges/
 > recovery-codes tables, `aal`/`amr` JWT claims + `auth.aal()`, enroll/verify/
-> challenge/step-up endpoints, recovery codes. **Integration tests
-> (`mfa_totp.rs`/`mfa_webauthn.rs`) are set aside as `.wip`** — the agent left
-> them with a broken `MfaStore` mock (63 compile errors); re-dispatch to fix +
-> rename back. See decisions.md.
+> challenge/step-up endpoints, recovery codes. Integration tests fixed and green:
+> `mfa_totp.rs` (11 tests) + `mfa_webauthn.rs` (7 tests). Fix: added
+> `AuthStore + MfaStore` stub impls on `MfaCache` under `cfg(any(test,
+> feature="test-utils"))` so `None::<&MfaCache>` satisfies the generic bounds.
 
-- [ ] `auth.mfa_factors` (id, user_id, type ∈ {totp, webauthn}, status,
+- [x] `auth.mfa_factors` (id, user_id, type ∈ {totp, webauthn}, status,
       secret/credential — encrypted), `auth.mfa_challenges` (short TTL),
       `auth.mfa_recovery_codes` (argon2-hashed, single-use).
-- [ ] JWT carries `aal` (`aal1`/`aal2`) + `amr` (methods). New SQL
+- [x] JWT carries `aal` (`aal1`/`aal2`) + `amr` (methods). New SQL
       session fn `auth.aal()` alongside `auth.uid()`/`role()`/`jwt()`.
-- [ ] Endpoints: `POST /auth/v1/factors` (enroll: TOTP secret+otpauth
+- [x] Endpoints: `POST /auth/v1/factors` (enroll: TOTP secret+otpauth
       URI / WebAuthn creation challenge), `/factors/:id/verify`,
       `/factors/:id/challenge`, `/factors/:id/challenge/verify`
       (re-issues aal2 JWT), `DELETE /factors/:id` (requires aal2).
-- [ ] Recovery codes issued at first enrollment; single-use; rate-
+- [x] Recovery codes issued at first enrollment; single-use; rate-
       limited via existing `governor`.
-- [ ] Downgrade guard: once a factor is enrolled, JWT caps at aal1
+- [x] Downgrade guard: once a factor is enrolled, JWT caps at aal1
       until a challenge succeeds; aal2-requiring RLS fails closed.
-- [ ] Crates: `totp-rs`/`oath` (RFC 6238), `webauthn-rs` (FIDO2).
-- [ ] Tests: `tests/integration/tests/mfa_totp.rs` +
-      `tests/integration/tests/mfa_webauthn.rs` — enroll/verify/
+- [x] Crates: `totp-rs`/`oath` (RFC 6238), `webauthn-rs` (FIDO2).
+- [x] Tests: `tests/integration/tests/mfa_totp.rs` (11) +
+      `tests/integration/tests/mfa_webauthn.rs` (7) — enroll/verify/
       challenge/step-up; recovery-code single-use; TOTP replay
-      rejection; aal2 RLS gating.
+      rejection; aal2 RLS gating. All 18 green.
 
 ### basin-rest (PostgREST equivalent) — ADR 0006
 

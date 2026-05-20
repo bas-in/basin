@@ -487,7 +487,7 @@ use std::sync::Mutex;
 /// not implement `MfaStore` (e.g. `EngineAuthStore` in integration tests).
 pub struct MfaCache {
     factors: Mutex<Vec<MfaFactorRow>>,
-    challenges: Mutex<Vec<MfaChallengeRow>>,
+    pub challenges: Mutex<Vec<MfaChallengeRow>>,
     recovery_codes: Mutex<Vec<(i64, Uuid, String, String, Option<chrono::DateTime<Utc>>)>>,
     next_rc_id: Mutex<i64>,
 }
@@ -1475,6 +1475,82 @@ async fn issue_aal2_tokens(
         refresh_expires_at,
     })
 }
+
+// ---------------------------------------------------------------------------
+// MfaCache: AuthStore + MfaStore stub impls (test-utils)
+//
+// Lets callers write `None::<&MfaCache>` to satisfy `S: MfaStore`. The None
+// branch never invokes S — it uses inner.mfa_cache directly — so all methods
+// below are safe to panic.
+// ---------------------------------------------------------------------------
+
+#[cfg(any(test, feature = "test-utils"))]
+const _: () = {
+    use std::collections::HashMap;
+    use async_trait::async_trait;
+    use basin_common::{ProjectId, Result};
+    use chrono::{DateTime, Utc};
+    use uuid::Uuid;
+    use crate::store::{
+        ApiKeyRow, AuthMagicLinkRow, AuthStore, AuthUser, EmailTokenRow,
+        MagicLinkEmailTokenRow, ProjectCredentialRow, RefreshRevocationRow,
+    };
+    use crate::UserId;
+
+    #[async_trait]
+    impl AuthStore for MfaCache {
+        async fn migrate(&self, _: &str) -> Result<()> { panic!("MfaCache stub") }
+        async fn create_user(&self, _: &ProjectId, _: &str, _: &str, _: UserId) -> Result<UserId> { panic!("MfaCache stub") }
+        async fn find_user_by_email(&self, _: &ProjectId, _: &str) -> Result<Option<AuthUser>> { panic!("MfaCache stub") }
+        async fn find_user_by_id(&self, _: &ProjectId, _: UserId) -> Result<Option<AuthUser>> { panic!("MfaCache stub") }
+        async fn any_user_by_email(&self, _: &str) -> Result<Option<()>> { panic!("MfaCache stub") }
+        async fn latest_user_by_email(&self, _: &str) -> Result<Option<(UserId, ProjectId)>> { panic!("MfaCache stub") }
+        async fn mark_email_verified(&self, _: &ProjectId, _: UserId) -> Result<()> { panic!("MfaCache stub") }
+        async fn mark_email_verified_if_null(&self, _: &ProjectId, _: UserId) -> Result<()> { panic!("MfaCache stub") }
+        async fn update_password(&self, _: &ProjectId, _: UserId, _: &str) -> Result<()> { panic!("MfaCache stub") }
+        async fn insert_email_token(&self, _: &ProjectId, _: UserId, _: &str, _: &str, _: DateTime<Utc>) -> Result<()> { panic!("MfaCache stub") }
+        async fn find_email_token(&self, _: &ProjectId, _: &str) -> Result<Option<EmailTokenRow>> { panic!("MfaCache stub") }
+        async fn find_magic_link_email_token(&self, _: &ProjectId, _: &str) -> Result<Option<MagicLinkEmailTokenRow>> { panic!("MfaCache stub") }
+        async fn consume_email_token(&self, _: &ProjectId, _: &str) -> Result<u64> { panic!("MfaCache stub") }
+        async fn insert_refresh_revocation(&self, _: &str, _: UserId, _: DateTime<Utc>) -> Result<u64> { panic!("MfaCache stub") }
+        async fn upsert_refresh_revocation(&self, _: &str, _: UserId, _: DateTime<Utc>) -> Result<()> { panic!("MfaCache stub") }
+        async fn list_refresh_revocations(&self, _: UserId) -> Result<Vec<RefreshRevocationRow>> { panic!("MfaCache stub") }
+        async fn upsert_blanket_revocation(&self, _: &str, _: UserId, _: DateTime<Utc>) -> Result<()> { panic!("MfaCache stub") }
+        async fn insert_api_key(&self, _: &ProjectId, _: UserId, _: &str, _: &str, _: &str) -> Result<(i64, DateTime<Utc>)> { panic!("MfaCache stub") }
+        async fn find_api_keys_by_hash(&self, _: &str) -> Result<Vec<ApiKeyRow>> { panic!("MfaCache stub") }
+        async fn touch_api_key(&self, _: i64) -> Result<()> { panic!("MfaCache stub") }
+        async fn revoke_api_key(&self, _: &ProjectId, _: i64) -> Result<()> { panic!("MfaCache stub") }
+        async fn list_api_keys(&self, _: &ProjectId, _: UserId) -> Result<Vec<crate::api_keys::ApiKeyDescriptor>> { panic!("MfaCache stub") }
+        async fn upsert_session_setting(&self, _: &ProjectId, _: UserId, _: &str, _: &str) -> Result<()> { panic!("MfaCache stub") }
+        async fn list_session_settings(&self, _: &ProjectId, _: UserId) -> Result<HashMap<String, String>> { panic!("MfaCache stub") }
+        async fn insert_project_credential(&self, _: &ProjectId, _: &str, _: &str, _: &str) -> Result<bool> { panic!("MfaCache stub") }
+        async fn find_project_credential(&self, _: &str) -> Result<Option<ProjectCredentialRow>> { panic!("MfaCache stub") }
+        async fn rotate_project_credential(&self, _: &str, _: &str) -> Result<Option<ProjectCredentialRow>> { panic!("MfaCache stub") }
+        async fn list_project_credentials(&self, _: &ProjectId) -> Result<Vec<crate::project_credentials::ProjectCredentialDescriptor>> { panic!("MfaCache stub") }
+        async fn list_legacy_project_credentials(&self) -> Result<Vec<(ProjectId, String)>> { panic!("MfaCache stub") }
+        async fn delete_project_credential(&self, _: &str) -> Result<()> { panic!("MfaCache stub") }
+        async fn insert_auth_magic_link(&self, _: &str, _: &str, _: DateTime<Utc>) -> Result<()> { panic!("MfaCache stub") }
+        async fn list_active_auth_magic_links(&self) -> Result<Vec<AuthMagicLinkRow>> { panic!("MfaCache stub") }
+        async fn consume_auth_magic_link(&self, _: i64) -> Result<u64> { panic!("MfaCache stub") }
+        async fn mark_email_verified_by_user_id(&self, _: UserId) -> Result<()> { panic!("MfaCache stub") }
+    }
+
+    #[async_trait]
+    impl MfaStore for MfaCache {
+        async fn insert_mfa_factor(&self, _: &str, _: &MfaFactorRow) -> Result<()> { panic!("MfaCache stub") }
+        async fn load_mfa_factor(&self, _: &str, _: Uuid) -> Result<Option<MfaFactorRow>> { panic!("MfaCache stub") }
+        async fn list_mfa_factors(&self, _: &str, _: Uuid, _: &ProjectId) -> Result<Vec<MfaFactorRow>> { panic!("MfaCache stub") }
+        async fn verify_mfa_factor(&self, _: &str, _: Uuid) -> Result<()> { panic!("MfaCache stub") }
+        async fn delete_mfa_factor(&self, _: &str, _: Uuid) -> Result<()> { panic!("MfaCache stub") }
+        async fn insert_mfa_challenge(&self, _: &str, _: &MfaChallengeRow) -> Result<()> { panic!("MfaCache stub") }
+        async fn consume_mfa_challenge(&self, _: &str, _: Uuid) -> Result<Option<MfaChallengeRow>> { panic!("MfaCache stub") }
+        async fn insert_recovery_codes(&self, _: &str, _: Uuid, _: &ProjectId, _: &[String]) -> Result<()> { panic!("MfaCache stub") }
+        async fn count_recovery_codes(&self, _: &str, _: Uuid, _: &ProjectId) -> Result<i64> { panic!("MfaCache stub") }
+        async fn list_active_recovery_code_hashes(&self, _: &str, _: Uuid, _: &ProjectId) -> Result<Vec<(i64, String)>> { panic!("MfaCache stub") }
+        async fn consume_recovery_code(&self, _: &str, _: i64) -> Result<()> { panic!("MfaCache stub") }
+        async fn update_webauthn_credential(&self, _: &str, _: Uuid, _: &str) -> Result<()> { panic!("MfaCache stub") }
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Unit tests
