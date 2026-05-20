@@ -22,6 +22,7 @@ component-model = [
     "dep:anyhow",
     "dep:tokio",
     "dep:serde_json",
+    "dep:dashmap",
 ]
 
 [dependencies]
@@ -40,6 +41,9 @@ thiserror  = { workspace = true, optional = true }
 anyhow     = { workspace = true, optional = true }
 tokio      = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+# dashmap — concurrent sharded HashMap used by FunctionGovernance to key the
+# per-project concurrency semaphores. Matches the version used by basin-engine.
+dashmap    = { version = "6", optional = true }
 
 [dev-dependencies]
 tokio      = { workspace = true, features = ["full"] }
