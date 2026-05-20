@@ -2963,6 +2963,36 @@ async fn exec_insert_select(
         tdigest_sketches: std::collections::BTreeMap::new(),
     };
 
+    // ── Phase 5.14.C3: INSERT-SELECT HTAP wiring (transaction-deferred path) ──
+    // When inside an explicit transaction, mirror the VALUES path: buffer the
+    // batch in the tx-local HTAP store and defer the catalog commit.
+    if crate::session::tx_is_active(&sess.state) {
+        // Lazy WAL Begin — idempotent within a tx.
+        htap_emit_wal_begin_lazy(sess).await;
+        // Buffer batch for tx-local read-your-own-writes.
+        crate::session::tx_htap_push_batch(&sess.state, table, batch.clone());
+        crate::session::tx_push_pending_file(&sess.state, table, file_ref);
+        let pending = crate::session::tx_pending_files_for(&sess.state, table);
+        let htap_batches = crate::session::tx_htap_batches_for(&sess.state, table);
+        if let Err(e) = crate::session::refresh_table_with_htap(
+            &sess.engine,
+            &sess.project,
+            &sess.ctx,
+            &sess.state,
+            table,
+            &pending,
+            htap_batches,
+        )
+        .await
+        {
+            crate::session::tx_set_aborted(&sess.state);
+            return Err(e);
+        }
+        return Ok(ExecResult::Empty {
+            tag: format!("INSERT 0 {row_count}"),
+        });
+    }
+
     // Pre-commit: expose the new file to DataFusion so reactor hooks can
     // see it.  Mirror the auto-commit VALUES path: use refresh_table_with_extra
     // so the file is visible before the catalog snapshot advances.
@@ -2997,6 +3027,19 @@ async fn exec_insert_select(
 
     commit_with_retry(sess, table, meta.current_snapshot, vec![file_ref]).await?;
     dispatch_post_commit(&sess.engine, events);
+
+    // ── Phase 5.14.C3: auto-commit INSERT-SELECT → memtable registry ─────────
+    // After a successful auto-commit, push the batch to the shared
+    // MemTableRegistry so that subsequent point-lookup fast-path queries find
+    // the rows without flushing. This mirrors the committed-row visibility
+    // provided by the VALUES path on COMMIT.
+    {
+        let htap_rows: std::collections::HashMap<_, _> =
+            [(table.clone(), vec![batch.clone()])].into_iter().collect();
+        // Best-effort: if promotion fails (e.g. hard-cap exceeded), the row is
+        // still durable in Parquet — we just lose the hot-tier cache entry.
+        let _ = htap_promote_to_registry(sess, &htap_rows).await;
+    }
 
     refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, table).await?;
     write_insert_audit_rows(sess, meta.schema.as_ref(), std::slice::from_ref(&batch)).await?;
@@ -3131,6 +3174,42 @@ async fn exec_insert_default_values(
         tdigest_sketches: std::collections::BTreeMap::new(),
     };
 
+    // ── Phase 5.14.C3: DEFAULT VALUES HTAP wiring (transaction-deferred path) ─
+    // When inside an explicit transaction, mirror the VALUES path: buffer the
+    // batch in the tx-local HTAP store and defer the catalog commit.
+    if crate::session::tx_is_active(&sess.state) {
+        // Lazy WAL Begin — idempotent within a tx.
+        htap_emit_wal_begin_lazy(sess).await;
+        // Buffer batch for tx-local read-your-own-writes.
+        crate::session::tx_htap_push_batch(&sess.state, &table, batch.clone());
+        crate::session::tx_push_pending_file(&sess.state, &table, file_ref);
+        let pending = crate::session::tx_pending_files_for(&sess.state, &table);
+        let htap_batches = crate::session::tx_htap_batches_for(&sess.state, &table);
+        if let Err(e) = crate::session::refresh_table_with_htap(
+            &sess.engine,
+            &sess.project,
+            &sess.ctx,
+            &sess.state,
+            &table,
+            &pending,
+            htap_batches,
+        )
+        .await
+        {
+            crate::session::tx_set_aborted(&sess.state);
+            return Err(e);
+        }
+        if ins.returning.is_some() {
+            return Ok(ExecResult::Rows {
+                schema: batch.schema(),
+                batches: vec![batch],
+            });
+        }
+        return Ok(ExecResult::Empty {
+            tag: format!("INSERT 0 {row_count}"),
+        });
+    }
+
     // Pre-commit: register the new file as "extra" so reactor hooks see it
     // before the catalog snapshot advances (mirrors the VALUES path fix).
     crate::session::refresh_table_with_extra(
@@ -3145,6 +3224,18 @@ async fn exec_insert_default_values(
     dispatch_pre_commit(&sess.engine, &events).await?;
     commit_with_retry(sess, &table, meta.current_snapshot, vec![file_ref]).await?;
     dispatch_post_commit(&sess.engine, events);
+
+    // ── Phase 5.14.C3: auto-commit DEFAULT VALUES → memtable registry ─────────
+    // After a successful auto-commit, push the batch to the shared
+    // MemTableRegistry so that subsequent point-lookup fast-path queries find
+    // the row without requiring a flush. Best-effort: failure just means the
+    // row is served from Parquet on the next read (still durable).
+    {
+        let htap_rows: std::collections::HashMap<_, _> =
+            [(table.clone(), vec![batch.clone()])].into_iter().collect();
+        let _ = htap_promote_to_registry(sess, &htap_rows).await;
+    }
+
     refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table).await?;
     write_insert_audit_rows(sess, meta.schema.as_ref(), std::slice::from_ref(&batch)).await?;
 

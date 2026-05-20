@@ -16,6 +16,7 @@
 //! | [`memtable::MemRowValue`] | `Row { bytes, schema_version }` or `Tombstone` |
 //! | [`registry::MemTableRegistry`] | Process-wide `DashMap`; lazy allocation; per-project semaphore |
 //! | [`budget::MemTableConfig`] | Per-process memory budget configuration (Phase 5.14.C5) |
+//! | [`budget::GlobalPressureScheduler`] | Stateless largest-first flush scheduler when global pressure rises (Phase 5.14.C5) |
 //!
 //! ## Multi-tenant isolation
 //!
@@ -33,11 +34,13 @@
 
 pub mod budget;
 pub mod memtable;
+pub mod merge;
 pub mod registry;
 pub mod row_key;
 
-pub use budget::{FlushPolicy, MemTableConfig};
+pub use budget::{FlushPolicy, GlobalPressureScheduler, MemTableConfig};
 pub use memtable::{MemRowValue, MemTable};
+pub use merge::merge_scan;
 pub use registry::{
     FlushRequest, MemTableEntry, MemTableRegistry, ProjectMemState, ReservationOutcome,
 };
