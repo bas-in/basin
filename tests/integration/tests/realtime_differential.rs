@@ -541,7 +541,7 @@ async fn realtime_differential_budget_enforced() {
 
 /// Gate: `ReplayCursor::drain` always returns empty (stub) — the subscriber
 /// gets only live events, no phantom replay events injected.
-#[tokio::test]
+#[test]
 fn realtime_differential_replay_cursor_stub_is_empty() {
     use basin_realtime::ReplayCursor;
     let project = ProjectId::new();
