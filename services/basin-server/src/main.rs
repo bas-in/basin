@@ -481,6 +481,39 @@ async fn main() -> Result<()> {
     #[cfg(not(feature = "realtime"))]
     let _realtime_handle: Option<tokio::task::JoinHandle<()>> = None;
 
+    // --- optional realtime WebSocket listener (Phase 5.11.R3, ADR 0018) ----
+    //
+    // Mounts the multiplexed WS handler at `GET /realtime/v1/ws/:project` on
+    // BASIN_REALTIME_WS_BIND (default 127.0.0.1:5436).  Auth is identical to
+    // R2's SSE listener — same JWT, same cross-project isolation invariant.
+    //
+    // `ws_serve` is self-contained inside `basin-realtime`; `basin-server`
+    // never imports `axum` or `tokio-tungstenite` directly.
+    #[cfg(feature = "realtime")]
+    let _realtime_ws_handle: Option<tokio::task::JoinHandle<()>> =
+        if let Some(ref auth) = auth_service {
+            let ws_bind: std::net::SocketAddr = std::env::var("BASIN_REALTIME_WS_BIND")
+                .unwrap_or_else(|_| "127.0.0.1:5436".to_string())
+                .parse()
+                .context("BASIN_REALTIME_WS_BIND must be host:port")?;
+            let handle = basin_realtime::ws_serve(
+                ws_bind,
+                realtime_sink.registry().clone(),
+                auth.clone(),
+            )
+            .await
+            .with_context(|| format!("basin-realtime WS bind {ws_bind} failed"))?;
+            tracing::info!(bind = %ws_bind, "basin-realtime WS listener is accept-ready");
+            Some(handle)
+        } else {
+            tracing::info!(
+                "basin-realtime: WS listener not started (requires BASIN_AUTH_ENABLED=1)"
+            );
+            None
+        };
+    #[cfg(not(feature = "realtime"))]
+    let _realtime_ws_handle: Option<tokio::task::JoinHandle<()>> = None;
+
     // Wait for Ctrl-C, then signal the router to stop.
     let _ = tokio::signal::ctrl_c().await;
     tracing::info!("shutdown signal received");

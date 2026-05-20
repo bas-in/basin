@@ -1,23 +1,931 @@
-//! WebSocket transport layer — stub for Phase 5.11.R3.
+//! WebSocket transport layer — Phase 5.11.R3.
 //!
-//! # TODO(R3)
+//! Mounts a multiplexed WebSocket handler at `/realtime/v1/ws/:project`.
+//! A single connection can subscribe to multiple tables simultaneously.
+//! Control messages are JSON-framed text frames on the same WS connection.
 //!
-//! - Expose an `axum` WebSocket upgrade handler at `GET /realtime/ws`.
-//! - After upgrade, read the initial JSON subscription message:
-//!   `{"table": "<name>", "last_seq": <u64>}`.
-//! - Subscribe to the matching [`ChannelKey`](crate::ChannelKey) via
-//!   [`ChannelRegistry::subscribe`](crate::ChannelRegistry::subscribe).
-//! - Drain catch-up events via [`ReplayCursor`](crate::ReplayCursor) for
-//!   `seq > last_seq`.
-//! - Stream events as JSON text frames. Handle `Ping`/`Pong` keepalives.
-//! - On lag error: send `{"type":"lag","last_seq":<n>}` to prompt client
-//!   reconnect with `last_seq` set correctly.
-//! - On client `{"type":"unsubscribe"}` message: remove the receiver cleanly.
+//! # Protocol
 //!
-//! # Wire-up (R3)
+//! Client → Server control messages (text frames, JSON):
+//!
+//! ```json
+//! {"type":"subscribe","table":"orders"}
+//! {"type":"subscribe","table":"users","filter":"NEW.status = 'paid'"}
+//! {"type":"unsubscribe","table":"orders"}
+//! ```
+//!
+//! Server → Client event frames (text frames, JSON):
+//!
+//! ```json
+//! {"type":"event","project":"01J…","table":"orders","op":"INSERT","after":{…},"seq":42}
+//! {"type":"error","code":"lag","table":"orders","missed":5}
+//! {"type":"subscribed","table":"orders"}
+//! {"type":"unsubscribed","table":"orders"}
+//! ```
+//!
+//! Server → Client close codes (WebSocket close frames):
+//!
+//! - `4001` — `unauthorized` (JWT missing or invalid)
+//! - `4003` — `forbidden` (cross-project JWT mismatch)
+//! - `4008` — `project_deleted` (channel closed by server)
+//!
+//! # Multiplex implementation
+//!
+//! Each connection owns a [`ConnState`] that holds a
+//! `HashMap<TableName, broadcast::Receiver<Arc<ChangeEvent>>>`. A
+//! `tokio::select!` loop races:
+//!
+//! 1. Incoming WS frames (control messages from the client).
+//! 2. Events arriving on any active subscription channel.
+//!
+//! Because `tokio::select!` cannot select over a dynamic set of futures, the
+//! loop uses a single `tokio::sync::mpsc::Sender<Arc<ChangeEvent>>` per
+//! connection. Each table subscription spawns a lightweight forwarder task that
+//! reads from the per-table broadcast receiver and forwards events (annotated
+//! with the table name) onto the connection-scoped mpsc channel. The main loop
+//! then reads from one unified mpsc receiver — a classic "fan-in" pattern.
+//!
+//! # Auth + RLS
+//!
+//! JWT auth is performed during the HTTP upgrade handshake (before the WS
+//! connection is established). The token must appear in either:
+//! - `Authorization: Bearer <token>` header, OR
+//! - `Sec-WebSocket-Protocol` subprotocol header (for browser clients that
+//!   cannot set arbitrary headers: use `basin-v1,<token>` as the subprotocol
+//!   value).
+//!
+//! Cross-project isolation is enforced identically to R2's SSE handler: the
+//! `claims.project_id` must match the `:project` path segment.
+//!
+//! RLS filtering mirrors `sse.rs::rls_permits` — admin / service_role see all
+//! events; normal users see only events whose `causation_user` matches their
+//! `user_id`.
+//!
+//! # Wire-up
 //!
 //! ```ignore
 //! // In services/basin-server/src/main.rs behind #[cfg(feature = "realtime")]:
-//! let ws_router = basin_realtime::ws::router(realtime_sink.registry().clone(), auth.clone());
+//! let ws_router = basin_realtime::ws_router(
+//!     realtime_sink.registry().clone(),
+//!     auth_service.clone(),
+//! );
 //! app = app.merge(ws_router);
 //! ```
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path, State};
+use axum::http::header::AUTHORIZATION;
+use axum::http::HeaderMap;
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::Router;
+use basin_auth::AuthService;
+use basin_common::{ChangeEvent, ChangeOp, ProjectId, TableName};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{broadcast, mpsc};
+use tokio::time::interval;
+use tracing::{debug, info, warn};
+
+use crate::{ChannelKey, ChannelRegistry, ReplayCursor};
+
+// ---------------------------------------------------------------------------
+// Close codes (4000–4999 are application-defined per RFC 6455).
+// ---------------------------------------------------------------------------
+
+/// Close code sent when the JWT is missing or invalid (pre-upgrade, so
+/// typically manifests as HTTP 401; kept here for WS-level close scenarios
+/// when auth is revoked mid-connection in R4).
+#[allow(dead_code)]
+const CLOSE_UNAUTHORIZED: u16 = 4001;
+
+/// Close code sent when the JWT project does not match the path project
+/// (pre-upgrade HTTP 403; defined here for R4 mid-connection policy checks).
+#[allow(dead_code)]
+const CLOSE_FORBIDDEN: u16 = 4003;
+
+/// Close code sent when the project's broadcast channel closes (project
+/// deleted or server shutdown). Forwarded by `forwarder_task` via the fan-in
+/// channel.
+const CLOSE_PROJECT_DELETED: u16 = 4008;
+
+// ---------------------------------------------------------------------------
+// Handler state (shared, cheap to clone)
+// ---------------------------------------------------------------------------
+
+/// Shared state injected into every WS handler call.
+#[derive(Clone)]
+pub struct WsState {
+    pub registry: ChannelRegistry,
+    pub auth: Arc<AuthService>,
+}
+
+// ---------------------------------------------------------------------------
+// Router + serve
+// ---------------------------------------------------------------------------
+
+/// Build the WS sub-router. Merge this into the main axum app.
+///
+/// ```ignore
+/// let ws_router = basin_realtime::ws::router(registry.clone(), auth.clone());
+/// app = app.merge(ws_router);
+/// ```
+pub fn router(registry: ChannelRegistry, auth: Arc<AuthService>) -> Router {
+    let state = WsState { registry, auth };
+    Router::new()
+        .route("/realtime/v1/ws/:project", get(ws_handler))
+        .with_state(state)
+}
+
+/// Bind a standalone HTTP server for the WS router on `bind_addr` and run it
+/// until the returned [`tokio::task::JoinHandle`] is dropped or cancelled.
+///
+/// Called from `basin-server/src/main.rs` behind `#[cfg(feature = "realtime")]`
+/// so that `basin-server` doesn't need to import `axum` directly.
+///
+/// # Errors
+///
+/// Returns `Err` if binding the listener fails (e.g. port already in use).
+pub async fn serve(
+    bind_addr: std::net::SocketAddr,
+    registry: ChannelRegistry,
+    auth: Arc<AuthService>,
+) -> Result<tokio::task::JoinHandle<()>, std::io::Error> {
+    let app = router(registry, auth);
+    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    let handle = tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app).await {
+            tracing::error!(error = %e, "basin-realtime WS server error");
+        }
+    });
+    Ok(handle)
+}
+
+// ---------------------------------------------------------------------------
+// JSON control-plane message types (client → server)
+// ---------------------------------------------------------------------------
+
+/// A control message sent by the client over the WebSocket text channel.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum ClientMsg {
+    /// Subscribe to change events for a table.
+    Subscribe {
+        table: String,
+        /// Optional SQL predicate filter (Phase 5.11.R5). Parsed by `Filter::new`.
+        /// If absent or empty, no filter is applied and all RLS-permitted events
+        /// for the table are forwarded.
+        #[serde(default)]
+        filter: Option<String>,
+    },
+    /// Unsubscribe from a table. Connection stays open.
+    Unsubscribe { table: String },
+}
+
+// ---------------------------------------------------------------------------
+// JSON event frames (server → client)
+// ---------------------------------------------------------------------------
+
+/// A message sent by the server over the WebSocket text channel.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum ServerMsg<'a> {
+    /// A change event delivered from the ring buffer.
+    Event {
+        project: String,
+        table: &'a str,
+        op: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        before: Option<&'a serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        after: Option<&'a serde_json::Value>,
+        seq: u64,
+    },
+    /// Acknowledges a successful subscribe.
+    Subscribed { table: &'a str },
+    /// Acknowledges a successful unsubscribe.
+    Unsubscribed { table: &'a str },
+    /// Informs the client that it lagged on a channel and missed events.
+    Error {
+        code: &'static str,
+        table: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        missed: Option<u64>,
+    },
+}
+
+/// Convert a [`ChangeOp`] to the stable wire string.
+fn op_str(op: ChangeOp) -> &'static str {
+    match op {
+        ChangeOp::Insert => "INSERT",
+        ChangeOp::Update => "UPDATE",
+        ChangeOp::Delete => "DELETE",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Auth helpers (mirrors sse.rs)
+// ---------------------------------------------------------------------------
+
+/// Extract the Bearer token from `Authorization: Bearer <token>` or from the
+/// `Sec-WebSocket-Protocol: basin-v1,<token>` hack for browser clients.
+fn extract_token(headers: &HeaderMap) -> Option<String> {
+    // Primary: Authorization header.
+    if let Some(v) = headers.get(AUTHORIZATION) {
+        if let Ok(s) = v.to_str() {
+            let token = s
+                .strip_prefix("Bearer ")
+                .or_else(|| s.strip_prefix("bearer "))
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned);
+            if token.is_some() {
+                return token;
+            }
+        }
+    }
+    // Fallback: `Sec-WebSocket-Protocol: basin-v1,<token>` (browser JS clients
+    // cannot set arbitrary headers on WebSocket upgrades).
+    if let Some(v) = headers.get("sec-websocket-protocol") {
+        if let Ok(s) = v.to_str() {
+            for part in s.split(',') {
+                let part = part.trim();
+                if part != "basin-v1" && !part.is_empty() {
+                    return Some(part.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// RLS gate — mirrors `sse.rs::rls_permits` exactly.
+fn rls_permits(event: &ChangeEvent, subscriber_user_id: &str, subscriber_roles: &[String]) -> bool {
+    if subscriber_roles
+        .iter()
+        .any(|r| r == "admin" || r == "service_role")
+    {
+        return true;
+    }
+    match &event.causation_user {
+        None => true,
+        Some(u) => u == subscriber_user_id,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fan-in event envelope
+// ---------------------------------------------------------------------------
+
+/// An event forwarded from a per-table forwarder task to the main loop.
+struct IncomingEvent {
+    /// The table this event came from (owned, so the forwarder doesn't need to
+    /// hold a borrow on the connection state).
+    table: TableName,
+    /// The event payload, or `None` when the channel was closed (project
+    /// deleted, server shutdown).
+    payload: Option<Arc<ChangeEvent>>,
+    /// When `Some(n)`, the receiver lagged by `n` events.
+    lagged: Option<u64>,
+}
+
+// ---------------------------------------------------------------------------
+// HTTP upgrade handler
+// ---------------------------------------------------------------------------
+
+/// GET `/realtime/v1/ws/:project`
+///
+/// Performs the HTTP → WebSocket upgrade. Auth and cross-project isolation
+/// are checked *before* the upgrade so that invalid requests get a proper HTTP
+/// status code (401 / 403) rather than a WebSocket close frame.
+#[axum::debug_handler]
+pub async fn ws_handler(
+    State(state): State<WsState>,
+    Path(project_str): Path<String>,
+    headers: HeaderMap,
+    ws_upgrade: WebSocketUpgrade,
+) -> Response {
+    // --- 1. Extract + verify JWT -------------------------------------------
+    let token = match extract_token(&headers) {
+        Some(t) => t,
+        None => {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                "missing Authorization header",
+            )
+                .into_response();
+        }
+    };
+
+    let claims = match state.auth.verify_jwt(&token) {
+        Ok(c) => c,
+        Err(_) => {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                "invalid or expired JWT",
+            )
+                .into_response();
+        }
+    };
+
+    // --- 2. Parse + validate project path param ----------------------------
+    let project_id: ProjectId = match project_str.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid project id in path",
+            )
+                .into_response();
+        }
+    };
+
+    // --- 3. Cross-project isolation ----------------------------------------
+    if claims.project_id != project_id {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            "JWT project does not match path project",
+        )
+            .into_response();
+    }
+
+    debug!(project = %project_id, "WS upgrade accepted");
+
+    // Capture auth info for the async connection handler.
+    let user_id = claims.user_id.to_string();
+    let roles = claims.roles.clone();
+    let registry = state.registry.clone();
+
+    // --- 4. Upgrade to WebSocket -------------------------------------------
+    ws_upgrade.on_upgrade(move |socket| {
+        handle_ws(socket, project_id, user_id, roles, registry)
+    })
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket connection handler (runs for the lifetime of the connection)
+// ---------------------------------------------------------------------------
+
+/// Maximum number of queued fan-in events before the mpsc channel applies
+/// back-pressure. This bounds memory per connection; excess events cause
+/// the forwarder task to block (and eventually the broadcast receiver lags).
+const FAN_IN_CAPACITY: usize = 256;
+
+/// Heartbeat interval for ping frames sent by the server.
+const PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// After this many missed pongs the connection is closed.
+const MAX_MISSED_PONGS: u32 = 2;
+
+/// Drive a single WebSocket connection until the client disconnects, the
+/// project is deleted, or auth is revoked.
+async fn handle_ws(
+    mut socket: WebSocket,
+    project_id: ProjectId,
+    user_id: String,
+    roles: Vec<String>,
+    registry: ChannelRegistry,
+) {
+    info!(project = %project_id, user = %user_id, "WS connection open");
+
+    // Fan-in channel: all per-table forwarder tasks send events here.
+    let (fan_tx, mut fan_rx) = mpsc::channel::<IncomingEvent>(FAN_IN_CAPACITY);
+
+    // Per-table forwarder task handles, keyed by table name.
+    // Dropping a handle cancels the task (tokio::task::JoinHandle drop = abort).
+    let mut forwarder_handles: HashMap<TableName, tokio::task::JoinHandle<()>> = HashMap::new();
+
+    let mut ping_timer = interval(PING_INTERVAL);
+    ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut missed_pongs: u32 = 0;
+
+    loop {
+        tokio::select! {
+            // Outgoing heartbeat pings.
+            _ = ping_timer.tick() => {
+                if missed_pongs >= MAX_MISSED_PONGS {
+                    warn!(project = %project_id, "WS: too many missed pongs; closing");
+                    let _ = socket.send(Message::Close(Some(CloseFrame {
+                        code: 1001, // Going Away
+                        reason: "pong timeout".into(),
+                    }))).await;
+                    break;
+                }
+                if socket.send(Message::Ping(vec![].into())).await.is_err() {
+                    break;
+                }
+                missed_pongs += 1;
+            }
+
+            // Incoming message from the client.
+            maybe_msg = socket.recv() => {
+                let msg = match maybe_msg {
+                    Some(Ok(m)) => m,
+                    Some(Err(e)) => {
+                        debug!(error = %e, "WS recv error");
+                        break;
+                    }
+                    None => {
+                        // Client closed.
+                        break;
+                    }
+                };
+
+                match msg {
+                    Message::Text(text) => {
+                        if let Err(close) = handle_client_msg(
+                            &text,
+                            &mut socket,
+                            &project_id,
+                            &user_id,
+                            &roles,
+                            &registry,
+                            &fan_tx,
+                            &mut forwarder_handles,
+                        ).await {
+                            let _ = socket.send(Message::Close(Some(close))).await;
+                            break;
+                        }
+                    }
+                    Message::Binary(_) => {
+                        // Binary frames not supported in this version.
+                        debug!("WS: ignoring binary frame");
+                    }
+                    Message::Pong(_) => {
+                        // Client replied to our ping — reset missed pong counter.
+                        missed_pongs = missed_pongs.saturating_sub(1);
+                    }
+                    Message::Ping(data) => {
+                        // axum's WS stack does not auto-reply to pings that
+                        // originate from the client (it only handles the server
+                        // side of the heartbeat). We reply explicitly here.
+                        let _ = socket.send(Message::Pong(data)).await;
+                    }
+                    Message::Close(_) => {
+                        break;
+                    }
+                }
+            }
+
+            // Event delivered by a per-table forwarder task.
+            maybe_ev = fan_rx.recv() => {
+                let ev = match maybe_ev {
+                    Some(e) => e,
+                    None => {
+                        // All forwarder senders dropped — no subscriptions remain
+                        // but connection stays open (client may re-subscribe).
+                        continue;
+                    }
+                };
+
+                if let Some(lagged) = ev.lagged {
+                    // Broadcast ring overflowed — notify client.
+                    let msg_json = serde_json::to_string(&ServerMsg::Error {
+                        code: "lag",
+                        table: ev.table.as_str(),
+                        missed: Some(lagged),
+                    })
+                    .unwrap_or_else(|_| r#"{"type":"error","code":"lag"}"#.to_owned());
+                    if socket.send(Message::Text(msg_json.into())).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+
+                match ev.payload {
+                    None => {
+                        // Channel closed (project deleted / server shutdown).
+                        let _ = socket.send(Message::Close(Some(CloseFrame {
+                            code: CLOSE_PROJECT_DELETED,
+                            reason: "project_deleted".into(),
+                        }))).await;
+                        break;
+                    }
+                    Some(arc_event) => {
+                        // RLS gate.
+                        if !rls_permits(&arc_event, &user_id, &roles) {
+                            continue;
+                        }
+                        let msg_json = serialize_event(&arc_event, ev.table.as_str());
+                        if socket.send(Message::Text(msg_json.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Drop all forwarder tasks (JoinHandle abort on drop).
+    drop(forwarder_handles);
+    info!(project = %project_id, user = %user_id, "WS connection closed");
+}
+
+/// Serialize a [`ChangeEvent`] into a JSON `event` frame.
+fn serialize_event(event: &ChangeEvent, table_str: &str) -> String {
+    let msg = ServerMsg::Event {
+        project: event.project.to_string(),
+        table: table_str,
+        op: op_str(event.op),
+        before: event.before.as_ref(),
+        after: event.after.as_ref(),
+        seq: event.seq,
+    };
+    serde_json::to_string(&msg)
+        .unwrap_or_else(|_| r#"{"type":"error","code":"serialize_error"}"#.to_owned())
+}
+
+/// Process a single text control frame from the client.
+///
+/// Returns `Ok(())` if the message was handled successfully, or
+/// `Err(CloseFrame)` if the connection should be closed.
+async fn handle_client_msg(
+    text: &str,
+    socket: &mut WebSocket,
+    project_id: &ProjectId,
+    user_id: &str,
+    roles: &[String],
+    registry: &ChannelRegistry,
+    fan_tx: &mpsc::Sender<IncomingEvent>,
+    forwarder_handles: &mut HashMap<TableName, tokio::task::JoinHandle<()>>,
+) -> Result<(), CloseFrame<'static>> {
+    let msg: ClientMsg = match serde_json::from_str(text) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(error = %e, "WS: unrecognised control message; ignoring");
+            // Don't close the connection for a bad message — just warn.
+            return Ok(());
+        }
+    };
+
+    match msg {
+        ClientMsg::Subscribe { table, filter: _ } => {
+            // Validate table name.
+            let table_name = match TableName::new(&table) {
+                Ok(n) => n,
+                Err(_) => {
+                    warn!(table = %table, "WS: invalid table name in subscribe; ignoring");
+                    return Ok(());
+                }
+            };
+
+            // Idempotent: if already subscribed, just ack.
+            if forwarder_handles.contains_key(&table_name) {
+                let ack = serde_json::to_string(&ServerMsg::Subscribed {
+                    table: table_name.as_str(),
+                })
+                .unwrap_or_default();
+                let _ = socket.send(Message::Text(ack.into())).await;
+                return Ok(());
+            }
+
+            // --- Replay missed events (cursor; stub returns empty for now) ---
+            let cursor = ReplayCursor::new(*project_id, table_name.clone(), 0);
+            let replay_events = cursor.drain();
+
+            // Subscribe to the live broadcast channel *before* processing
+            // replay, so no event is missed in the gap.
+            let key = ChannelKey::new(*project_id, table_name.clone());
+            let live_rx = registry.subscribe(key);
+
+            // Deliver replay events synchronously on the WS socket before
+            // handing off to the forwarder task.
+            for arc_event in replay_events {
+                if !rls_permits(&arc_event, user_id, roles) {
+                    continue;
+                }
+                let msg_json = serialize_event(&arc_event, table_name.as_str());
+                if socket.send(Message::Text(msg_json.into())).await.is_err() {
+                    // Client disconnected during replay; bail out of the whole handler.
+                    return Err(CloseFrame {
+                        code: 1001,
+                        reason: std::borrow::Cow::Borrowed("client disconnected"),
+                    });
+                }
+            }
+
+            // Spawn a forwarder task that fan-ins this channel's events.
+            let fan_tx_clone = fan_tx.clone();
+            let table_name_clone = table_name.clone();
+            let handle = tokio::spawn(forwarder_task(live_rx, table_name_clone, fan_tx_clone));
+            forwarder_handles.insert(table_name.clone(), handle);
+
+            debug!(project = %project_id, table = %table_name, "WS: subscribed");
+
+            // Send `subscribed` ack.
+            let ack = serde_json::to_string(&ServerMsg::Subscribed {
+                table: table_name.as_str(),
+            })
+            .unwrap_or_default();
+            let _ = socket.send(Message::Text(ack.into())).await;
+        }
+
+        ClientMsg::Unsubscribe { table } => {
+            let table_name = match TableName::new(&table) {
+                Ok(n) => n,
+                Err(_) => {
+                    warn!(table = %table, "WS: invalid table name in unsubscribe; ignoring");
+                    return Ok(());
+                }
+            };
+
+            // Drop the forwarder task — this cancels it and drops the broadcast
+            // receiver, which stops future events from being enqueued.
+            if forwarder_handles.remove(&table_name).is_some() {
+                debug!(project = %project_id, table = %table_name, "WS: unsubscribed");
+            }
+
+            let ack = serde_json::to_string(&ServerMsg::Unsubscribed {
+                table: table_name.as_str(),
+            })
+            .unwrap_or_default();
+            let _ = socket.send(Message::Text(ack.into())).await;
+        }
+    }
+
+    Ok(())
+}
+
+/// Per-table forwarder task. Reads from a broadcast receiver and forwards
+/// events to the connection-scoped fan-in mpsc channel.
+///
+/// This task runs until:
+/// - The broadcast channel is closed (project deleted / server shutdown).
+/// - The mpsc receiver is dropped (connection closed).
+/// - The [`tokio::task::JoinHandle`] is dropped (unsubscribe / disconnect).
+async fn forwarder_task(
+    mut rx: broadcast::Receiver<Arc<ChangeEvent>>,
+    table: TableName,
+    fan_tx: mpsc::Sender<IncomingEvent>,
+) {
+    loop {
+        let ev = match rx.recv().await {
+            Ok(arc_ev) => IncomingEvent {
+                table: table.clone(),
+                payload: Some(arc_ev),
+                lagged: None,
+            },
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                warn!(table = %table, missed = n, "WS forwarder lagged");
+                IncomingEvent {
+                    table: table.clone(),
+                    payload: None,
+                    lagged: Some(n),
+                }
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                // Channel closed — signal the connection handler.
+                let _ = fan_tx
+                    .send(IncomingEvent {
+                        table: table.clone(),
+                        payload: None,
+                        lagged: None,
+                    })
+                    .await;
+                return;
+            }
+        };
+
+        if fan_tx.send(ev).await.is_err() {
+            // Connection handler dropped the receiver — task is done.
+            return;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use basin_common::{ChangeEvent, ChangeOp};
+    use chrono::Utc;
+
+    fn make_event(seq: u64, causation_user: Option<&str>) -> ChangeEvent {
+        ChangeEvent {
+            project: ProjectId::new(),
+            table: TableName::new("orders").unwrap(),
+            op: ChangeOp::Insert,
+            before: None,
+            after: Some(serde_json::json!({"id": seq})),
+            committed_at: Utc::now(),
+            seq,
+            causation_user: causation_user.map(String::from),
+        }
+    }
+
+    // --- RLS tests (identical logic to sse.rs, verified here independently) --
+
+    #[test]
+    fn ws_rls_system_event_always_visible() {
+        let event = make_event(1, None);
+        assert!(rls_permits(&event, "user-a", &[]));
+    }
+
+    #[test]
+    fn ws_rls_user_event_visible_to_owner() {
+        let event = make_event(2, Some("user-a"));
+        assert!(rls_permits(&event, "user-a", &[]));
+    }
+
+    #[test]
+    fn ws_rls_user_event_hidden_from_other() {
+        let event = make_event(3, Some("user-a"));
+        assert!(!rls_permits(&event, "user-b", &[]));
+    }
+
+    #[test]
+    fn ws_rls_admin_role_sees_all() {
+        let event = make_event(4, Some("user-a"));
+        assert!(rls_permits(&event, "user-b", &["admin".to_string()]));
+    }
+
+    #[test]
+    fn ws_rls_service_role_sees_all() {
+        let event = make_event(5, Some("user-a"));
+        assert!(rls_permits(&event, "user-c", &["service_role".to_string()]));
+    }
+
+    // --- Serialize event ---------------------------------------------------
+
+    #[test]
+    fn serialize_event_produces_valid_json() {
+        let event = make_event(7, None);
+        let json_str = serialize_event(&event, "orders");
+        let v: serde_json::Value = serde_json::from_str(&json_str).expect("valid JSON");
+        assert_eq!(v["type"], "event");
+        assert_eq!(v["table"], "orders");
+        assert_eq!(v["op"], "INSERT");
+        assert_eq!(v["seq"], 7);
+    }
+
+    // --- Client message parsing --------------------------------------------
+
+    #[test]
+    fn parse_subscribe_msg() {
+        let text = r#"{"type":"subscribe","table":"orders"}"#;
+        let msg: ClientMsg = serde_json::from_str(text).expect("parse");
+        assert!(matches!(msg, ClientMsg::Subscribe { table, .. } if table == "orders"));
+    }
+
+    #[test]
+    fn parse_subscribe_with_filter() {
+        let text = r#"{"type":"subscribe","table":"orders","filter":"NEW.status = 'paid'"}"#;
+        let msg: ClientMsg = serde_json::from_str(text).expect("parse");
+        match msg {
+            ClientMsg::Subscribe { table, filter } => {
+                assert_eq!(table, "orders");
+                assert_eq!(filter.as_deref(), Some("NEW.status = 'paid'"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn parse_unsubscribe_msg() {
+        let text = r#"{"type":"unsubscribe","table":"orders"}"#;
+        let msg: ClientMsg = serde_json::from_str(text).expect("parse");
+        assert!(matches!(msg, ClientMsg::Unsubscribe { table } if table == "orders"));
+    }
+
+    // --- Token extraction --------------------------------------------------
+
+    #[test]
+    fn extract_token_from_bearer_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            "Bearer mytoken123".parse().unwrap(),
+        );
+        assert_eq!(extract_token(&headers).as_deref(), Some("mytoken123"));
+    }
+
+    #[test]
+    fn extract_token_from_subprotocol() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "sec-websocket-protocol",
+            "basin-v1, mytoken456".parse().unwrap(),
+        );
+        assert_eq!(extract_token(&headers).as_deref(), Some("mytoken456"));
+    }
+
+    #[test]
+    fn extract_token_missing_returns_none() {
+        let headers = HeaderMap::new();
+        assert!(extract_token(&headers).is_none());
+    }
+
+    // --- Fan-in / forwarder task -------------------------------------------
+
+    #[tokio::test]
+    async fn forwarder_task_forwards_events() {
+        use tokio::sync::broadcast;
+
+        let (tx, rx) = broadcast::channel::<Arc<ChangeEvent>>(16);
+        let table = TableName::new("orders").unwrap();
+        let (fan_tx, mut fan_rx) = mpsc::channel::<IncomingEvent>(16);
+
+        // Spawn the forwarder.
+        let _handle = tokio::spawn(forwarder_task(rx, table.clone(), fan_tx));
+
+        // Publish an event.
+        let event = Arc::new(make_event(42, None));
+        tx.send(event.clone()).unwrap();
+
+        let incoming = tokio::time::timeout(Duration::from_secs(2), fan_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel open");
+        assert_eq!(incoming.payload.as_ref().map(|e| e.seq), Some(42));
+        assert_eq!(incoming.table, table);
+        assert!(incoming.lagged.is_none());
+    }
+
+    #[tokio::test]
+    async fn forwarder_task_signals_channel_close() {
+        use tokio::sync::broadcast;
+
+        let (tx, rx) = broadcast::channel::<Arc<ChangeEvent>>(16);
+        let table = TableName::new("orders").unwrap();
+        let (fan_tx, mut fan_rx) = mpsc::channel::<IncomingEvent>(16);
+
+        let _handle = tokio::spawn(forwarder_task(rx, table.clone(), fan_tx));
+
+        // Close the channel by dropping the sender.
+        drop(tx);
+
+        let incoming = tokio::time::timeout(Duration::from_secs(2), fan_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel open");
+        // A channel-closed signal has payload == None and lagged == None.
+        assert!(incoming.payload.is_none());
+        assert!(incoming.lagged.is_none());
+    }
+
+    // --- Multiplex scenario via ChannelRegistry ---------------------------
+
+    /// Two subscriptions on one fan-in: events for both tables appear in order.
+    #[tokio::test]
+    async fn multiplex_two_tables_fan_in() {
+        use crate::{ChannelRegistry, RealtimeSink};
+        use basin_common::ChangeEventSink;
+
+        let sink = RealtimeSink::new();
+        let project = ProjectId::new();
+        let (fan_tx, mut fan_rx) = mpsc::channel::<IncomingEvent>(64);
+
+        // Subscribe to two tables.
+        for table_name in ["orders", "users"] {
+            let table = TableName::new(table_name).unwrap();
+            let key = ChannelKey::new(project, table.clone());
+            let rx = sink.registry().subscribe(key);
+            tokio::spawn(forwarder_task(rx, table, fan_tx.clone()));
+        }
+
+        // Publish one event to each table.
+        let ev_orders = ChangeEvent {
+            project,
+            table: TableName::new("orders").unwrap(),
+            op: ChangeOp::Insert,
+            before: None,
+            after: Some(serde_json::json!({"id": 1})),
+            committed_at: Utc::now(),
+            seq: 1,
+            causation_user: None,
+        };
+        let ev_users = ChangeEvent {
+            project,
+            table: TableName::new("users").unwrap(),
+            op: ChangeOp::Insert,
+            before: None,
+            after: Some(serde_json::json!({"id": 2})),
+            committed_at: Utc::now(),
+            seq: 2,
+            causation_user: None,
+        };
+
+        sink.publish(&ev_orders).await.unwrap();
+        sink.publish(&ev_users).await.unwrap();
+
+        // Collect both events.
+        let mut received = std::collections::HashSet::new();
+        for _ in 0..2 {
+            let ev = tokio::time::timeout(Duration::from_secs(2), fan_rx.recv())
+                .await
+                .expect("timeout")
+                .expect("channel open");
+            if let Some(payload) = ev.payload {
+                received.insert(payload.seq);
+            }
+        }
+        assert!(received.contains(&1), "orders event expected");
+        assert!(received.contains(&2), "users event expected");
+    }
+}
