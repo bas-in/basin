@@ -62,6 +62,10 @@ base64 = { workspace = true }
 bcrypt = { workspace = true }
 # Regex engine for regexp_match / regexp_split_to_array UDFs.
 regex.workspace = true
+# Phase 5.8.A: cron.schedule / cron.unschedule UDFs need cron-expr validation.
+cron = "0.12"
+# Phase 5.8.A: net.http_get / net.http_post UDFs — same lib as basin-net.
+reqwest.workspace = true
 # `WebhookOps` (5.11.I) is a bitflags struct stored on the engine-local
 # `webhook_registry` module after the cycle-fix moved registry types out
 # of basin-webhooks.

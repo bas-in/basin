@@ -856,6 +856,9 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     // and always runs, even when auth is disabled — the UDFs simply return
     // NULL/`'anon'` for unauthenticated sessions.
     let sql = crate::udf::rewrite_auth_schema_functions(sql);
+    // Phase 5.8.A: rewrite cron.schedule/unschedule and net.http_get/post.
+    let sql = crate::cron_glue::rewrite_cron_schema_functions(&sql);
+    let sql = crate::net_glue::rewrite_net_schema_functions(&sql);
     let sql = sql.as_str();
 
     // Translate the pg_vector operator forms (`<->`, `<#>`, `<=>`) into the

@@ -745,6 +745,13 @@ pub(crate) async fn open(
     // removed stateless stubs. Registered here, like `register_auth_udfs`.
     crate::advisory_lock::register_advisory_lock_udfs(&ctx, state.advisory.clone());
 
+    // Phase 5.8.A: cron.schedule / cron.unschedule UDFs. Capture engine +
+    // project so they can open an independent session to mutate cron_job.
+    crate::cron_glue::register_cron_udfs(&ctx, engine.clone(), project);
+
+    // Phase 5.8.A: net.http_get / net.http_post UDFs (stateless, per-session).
+    crate::net_glue::register_net_udfs(&ctx);
+
     // Phase 5.11.J: register any LANGUAGE wasm UDFs the project has as
     // DataFusion ScalarUDFs. Each one wraps a wasmtime call; they appear
     // alongside the stateless UDFs already loaded above so DataFusion can

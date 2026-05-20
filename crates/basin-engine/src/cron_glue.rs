@@ -1,25 +1,325 @@
-//! Glue point for `basin-cron`.
+//! Glue point for `basin-cron` — `cron.schedule` / `cron.unschedule` scalar UDFs.
 //!
-//! `basin-cron` is the pg_cron-compatible scheduler. It depends on this
-//! crate (via `Engine::open_session`); to keep the dependency graph
-//! one-directional we cannot pull `basin-cron` into `basin-engine`. What
-//! we can do here is reserve the symbol the engine calls during
-//! [`Engine::new`] so a future wiring (e.g. registering the
-//! `cron.schedule` / `cron.unschedule` scalar UDFs at per-session open
-//! time) has an obvious, named landing spot in the source tree.
-//!
-//! Today's implementation is a deliberate no-op: the SQL surface
-//! (`SELECT cron.schedule(...)` / `SELECT cron.unschedule(...)`) is
-//! exercised in v0.1 by calling `basin_cron::CronStore` directly. When
-//! the executor's parser-level hook learns to recognise the `cron.`
-//! schema-qualified function call form, the registration will go here
-//! and `Engine::new` will pick it up automatically.
-//!
-//! See `basin-cron`'s crate docs for the full surface.
+//! `basin-cron` depends on `basin-engine`. These UDFs replicate cron table ops
+//! (INSERT/DELETE on `cron_job`) without introducing a circular dep, using
+//! independent engine sessions per call. The SQL surface is rewritten via
+//! [`rewrite_cron_schema_functions`] before DataFusion sees the SQL.
 
-/// Hook called once from [`crate::Engine::new`]. No-op today; reserved
-/// for the future SQL-surface wiring described in the module doc.
+use std::any::Any;
+use std::sync::Arc;
+
+use datafusion::arrow::array::{Array, ArrayRef, Int64Array, StringArray};
+use datafusion::arrow::datatypes::DataType;
+use datafusion::common::Result as DFResult;
+use datafusion::error::DataFusionError;
+use datafusion::logical_expr::{
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
+    Volatility,
+};
+use datafusion::prelude::SessionContext;
+use datafusion::scalar::ScalarValue;
+
+use basin_common::ProjectId;
+
+use crate::Engine;
+
+/// Hook called once from [`crate::Engine::new`]. No-op; registration happens
+/// per-session via [`register_cron_udfs`].
 #[inline]
-pub(crate) fn install() {
-    // Intentionally empty. See the module-level doc for why.
+pub(crate) fn install() {}
+
+/// Register `cron_schedule` and `cron_unschedule` UDFs on `ctx`. Both capture
+/// `engine` and `project` so table ops run in an independent session.
+pub(crate) fn register_cron_udfs(ctx: &SessionContext, engine: Engine, project: ProjectId) {
+    let eng = Arc::new(engine);
+    ctx.register_udf(ScalarUDF::from(CronScheduleUdf {
+        engine: eng.clone(),
+        project,
+        signature: Signature::one_of(
+            vec![TypeSignature::Exact(vec![
+                DataType::Utf8,
+                DataType::Utf8,
+                DataType::Utf8,
+            ])],
+            Volatility::Volatile,
+        ),
+    }));
+    ctx.register_udf(ScalarUDF::from(CronUnscheduleUdf {
+        engine: eng,
+        project,
+        signature: Signature::exact(vec![DataType::Utf8], Volatility::Volatile),
+    }));
+}
+
+/// Rewrite `cron.schedule(...)` / `cron.unschedule(...)` to underscore forms.
+/// Case-insensitive, identifier-boundary checked (mirrors auth schema rewrite).
+pub(crate) fn rewrite_cron_schema_functions(sql: &str) -> String {
+    const TARGETS: &[(&str, &str)] = &[
+        ("cron.schedule", "cron_schedule"),
+        ("cron.unschedule", "cron_unschedule"),
+    ];
+    rewrite_schema_dot(sql, TARGETS)
+}
+
+/// Generic schema-dot rewriter (shared by cron and net modules).
+pub(crate) fn rewrite_schema_dot(sql: &str, targets: &[(&str, &str)]) -> String {
+    let mut out = sql.to_string();
+    for (schema_dot_name, replacement) in targets {
+        let mut scan_pos = 0usize;
+        loop {
+            let lower = out.to_ascii_lowercase();
+            let Some(rel_found) = lower[scan_pos..].find(schema_dot_name) else {
+                break;
+            };
+            let abs_start = scan_pos + rel_found;
+            let abs_end = abs_start + schema_dot_name.len();
+            let pre_ok = abs_start == 0 || {
+                let prev = out.as_bytes()[abs_start - 1];
+                !(prev.is_ascii_alphanumeric() || prev == b'_')
+            };
+            let post_ok = abs_end >= out.len() || {
+                let next = out.as_bytes()[abs_end];
+                !(next.is_ascii_alphanumeric() || next == b'_')
+            };
+            if pre_ok && post_ok {
+                out.replace_range(abs_start..abs_end, replacement);
+                scan_pos = abs_start + replacement.len();
+            } else {
+                scan_pos = abs_start + 1;
+            }
+        }
+    }
+    out
+}
+
+// cron_schedule(name TEXT, schedule TEXT, command TEXT) -> BIGINT
+struct CronScheduleUdf {
+    engine: Arc<Engine>,
+    project: ProjectId,
+    signature: Signature,
+}
+impl std::fmt::Debug for CronScheduleUdf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CronScheduleUdf({})", self.project)
+    }
+}
+impl PartialEq for CronScheduleUdf {
+    fn eq(&self, o: &Self) -> bool {
+        self.project == o.project && Arc::ptr_eq(&self.engine, &o.engine)
+    }
+}
+impl Eq for CronScheduleUdf {}
+impl std::hash::Hash for CronScheduleUdf {
+    fn hash<H: std::hash::Hasher>(&self, s: &mut H) {
+        self.project.hash(s);
+    }
+}
+impl ScalarUDFImpl for CronScheduleUdf {
+    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str { "cron_schedule" }
+    fn signature(&self) -> &Signature { &self.signature }
+    fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> { Ok(DataType::Int64) }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let ScalarFunctionArgs { args, number_rows, .. } = args;
+        if args.len() != 3 {
+            return Err(DataFusionError::Execution(format!(
+                "cron_schedule expects 3 args, got {}", args.len())));
+        }
+        let name = cron_scalar_utf8(&args[0], "name")?;
+        let schedule = cron_scalar_utf8(&args[1], "schedule")?;
+        let command = cron_scalar_utf8(&args[2], "command")?;
+        let engine = self.engine.clone();
+        let project = self.project;
+        let jobid = tokio::runtime::Handle::current()
+            .block_on(async move {
+                cron_schedule_impl(&engine, &project, &name, &schedule, &command).await
+            })
+            .map_err(DataFusionError::Execution)?;
+        Ok(ColumnarValue::Array(Arc::new(Int64Array::from(vec![jobid; number_rows]))))
+    }
+}
+
+// cron_unschedule(name TEXT) -> BIGINT
+struct CronUnscheduleUdf {
+    engine: Arc<Engine>,
+    project: ProjectId,
+    signature: Signature,
+}
+impl std::fmt::Debug for CronUnscheduleUdf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CronUnscheduleUdf({})", self.project)
+    }
+}
+impl PartialEq for CronUnscheduleUdf {
+    fn eq(&self, o: &Self) -> bool {
+        self.project == o.project && Arc::ptr_eq(&self.engine, &o.engine)
+    }
+}
+impl Eq for CronUnscheduleUdf {}
+impl std::hash::Hash for CronUnscheduleUdf {
+    fn hash<H: std::hash::Hasher>(&self, s: &mut H) {
+        self.project.hash(s);
+    }
+}
+impl ScalarUDFImpl for CronUnscheduleUdf {
+    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str { "cron_unschedule" }
+    fn signature(&self) -> &Signature { &self.signature }
+    fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> { Ok(DataType::Int64) }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let ScalarFunctionArgs { args, number_rows, .. } = args;
+        if args.len() != 1 {
+            return Err(DataFusionError::Execution(format!(
+                "cron_unschedule expects 1 arg, got {}", args.len())));
+        }
+        let name = cron_scalar_utf8(&args[0], "name")?;
+        let engine = self.engine.clone();
+        let project = self.project;
+        let jobid = tokio::runtime::Handle::current()
+            .block_on(async move { cron_unschedule_impl(&engine, &project, &name).await })
+            .map_err(DataFusionError::Execution)?;
+        Ok(ColumnarValue::Array(Arc::new(Int64Array::from(vec![jobid; number_rows]))))
+    }
+}
+
+const CRON_JOB_TABLE: &str = "cron_job";
+
+fn validate_cron_expr(expr: &str) -> Result<(), String> {
+    let trimmed = expr.trim();
+    let count = trimmed.split_whitespace().count();
+    let normalized = if count == 5 { format!("0 {trimmed}") } else { trimmed.to_string() };
+    use std::str::FromStr;
+    cron::Schedule::from_str(&normalized)
+        .map(|_| ())
+        .map_err(|e| format!("invalid cron expression {expr:?}: {e}"))
+}
+
+async fn ensure_cron_table(engine: &Engine, project: &ProjectId) -> Result<(), String> {
+    use crate::ExecResult;
+    let sess = engine.open_session(*project).await.map_err(|e| e.to_string())?;
+    let res = sess.execute("SHOW TABLES").await.map_err(|e| e.to_string())?;
+    let exists = match res {
+        ExecResult::Rows { batches, .. } => batches.iter().any(|b| {
+            b.column_by_name("table_name")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .map(|arr| (0..arr.len()).any(|i| arr.value(i) == CRON_JOB_TABLE))
+                .unwrap_or(false)
+        }),
+        ExecResult::Empty { .. } => false,
+    };
+    if !exists {
+        sess.execute(&format!(
+            "CREATE TABLE {CRON_JOB_TABLE} (
+                jobid BIGINT NOT NULL, jobname TEXT NOT NULL, schedule TEXT NOT NULL,
+                command TEXT NOT NULL, active BIGINT NOT NULL, username TEXT NOT NULL,
+                last_run_unix_ms BIGINT, last_status TEXT)"
+        )).await.map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+async fn cron_schedule_impl(
+    engine: &Engine, project: &ProjectId, name: &str, schedule: &str, command: &str,
+) -> Result<i64, String> {
+    validate_cron_expr(schedule)?;
+    ensure_cron_table(engine, project).await?;
+    use crate::ExecResult;
+    use datafusion::arrow::array::Int64Array as ArrowI64;
+    let sess = engine.open_session(*project).await.map_err(|e| e.to_string())?;
+    let res = sess
+        .execute(&format!("SELECT jobid, jobname FROM {CRON_JOB_TABLE} ORDER BY jobid"))
+        .await.map_err(|e| e.to_string())?;
+    let mut max_jobid = 0i64;
+    let mut name_exists = false;
+    if let ExecResult::Rows { batches, .. } = res {
+        for b in &batches {
+            let ids = b.column_by_name("jobid").and_then(|c| c.as_any().downcast_ref::<ArrowI64>());
+            let names = b.column_by_name("jobname").and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            if let (Some(ids), Some(names)) = (ids, names) {
+                for i in 0..b.num_rows() {
+                    if ids.value(i) > max_jobid { max_jobid = ids.value(i); }
+                    if names.value(i) == name { name_exists = true; }
+                }
+            }
+        }
+    }
+    if name_exists { return Err(format!("job {name:?} already exists")); }
+    let jobid = max_jobid + 1;
+    sess.execute(&format!(
+        "INSERT INTO {CRON_JOB_TABLE} VALUES ({jobid}, {}, {}, {}, 1, 'current_user', NULL, NULL)",
+        sql_text(name), sql_text(schedule), sql_text(command),
+    )).await.map_err(|e| e.to_string())?;
+    Ok(jobid)
+}
+
+async fn cron_unschedule_impl(engine: &Engine, project: &ProjectId, name: &str) -> Result<i64, String> {
+    ensure_cron_table(engine, project).await?;
+    use crate::ExecResult;
+    use datafusion::arrow::array::Int64Array as ArrowI64;
+    let sess = engine.open_session(*project).await.map_err(|e| e.to_string())?;
+    let res = sess
+        .execute(&format!("SELECT jobid FROM {CRON_JOB_TABLE} WHERE jobname = {}", sql_text(name)))
+        .await.map_err(|e| e.to_string())?;
+    let jobid = match res {
+        ExecResult::Rows { batches, .. } => {
+            let mut found: Option<i64> = None;
+            'outer: for b in &batches {
+                if let Some(arr) = b.column_by_name("jobid").and_then(|c| c.as_any().downcast_ref::<ArrowI64>()) {
+                    for i in 0..arr.len() { found = Some(arr.value(i)); break 'outer; }
+                }
+            }
+            found.ok_or_else(|| format!("job {name:?} not found"))?
+        }
+        ExecResult::Empty { .. } => return Err(format!("job {name:?} not found")),
+    };
+    sess.execute(&format!("DELETE FROM {CRON_JOB_TABLE} WHERE jobid = {jobid}"))
+        .await.map_err(|e| e.to_string())?;
+    Ok(jobid)
+}
+
+fn sql_text(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+fn cron_scalar_utf8(col: &ColumnarValue, name: &str) -> DFResult<String> {
+    match col {
+        ColumnarValue::Scalar(sv) => match sv {
+            ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) | ScalarValue::Utf8View(Some(s)) => Ok(s.clone()),
+            ScalarValue::Utf8(None) | ScalarValue::LargeUtf8(None) | ScalarValue::Utf8View(None) =>
+                Err(DataFusionError::Execution(format!("cron arg {name} must not be NULL"))),
+            other => Err(DataFusionError::Execution(format!("cron arg {name} expected TEXT, got {other:?}"))),
+        },
+        ColumnarValue::Array(arr) => {
+            use datafusion::arrow::array::Array;
+            let arr = arr.as_any().downcast_ref::<StringArray>()
+                .ok_or_else(|| DataFusionError::Execution(format!("cron arg {name} expected TEXT array")))?;
+            if arr.is_null(0) {
+                return Err(DataFusionError::Execution(format!("cron arg {name} must not be NULL")));
+            }
+            Ok(arr.value(0).to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rewrite_cron_schedule() {
+        let r = rewrite_cron_schema_functions("SELECT cron.schedule('j', '* * * * *', 'SELECT 1')");
+        assert_eq!(r, "SELECT cron_schedule('j', '* * * * *', 'SELECT 1')");
+    }
+    #[test]
+    fn rewrite_cron_unschedule() {
+        assert_eq!(rewrite_cron_schema_functions("SELECT cron.unschedule('j')"), "SELECT cron_unschedule('j')");
+    }
+    #[test]
+    fn rewrite_cron_case_insensitive() {
+        assert_eq!(rewrite_cron_schema_functions("SELECT CRON.SCHEDULE('j', '* * * * *', 'S')"), "SELECT cron_schedule('j', '* * * * *', 'S')");
+    }
+    #[test]
+    fn rewrite_cron_leaves_non_matching() {
+        assert_eq!(rewrite_cron_schema_functions("SELECT my_cron.schedule('j')"), "SELECT my_cron.schedule('j')");
+    }
 }
