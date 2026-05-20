@@ -821,23 +821,22 @@ can land in parallel. Critical path: R1 → R2 → (R3 || R4) → R7.
       covering multi-subscription / unsubscribe / RLS / ping-pong /
       reconnect. 6/6 pass.
 
-#### 5.11.R4 — Presence channels (~2 weeks)
+#### 5.11.R4 — Presence channels (~2 weeks) ✅ shipped (`cdf3f99`)
 
-- [ ] Per-project presence registry: `(project, channel) → Set<{
-      client_id, metadata }>`. In-memory; ephemeral (no persistence
-      across restarts).
-- [ ] Presence protocol over WS: `track` / `untrack` /
-      `presence_state` / `presence_diff` messages (Phoenix Channels
-      shape; well-trodden contract).
-- [ ] Heartbeat-driven liveness: clients send heartbeat every 30s;
-      missed heartbeats evict from the presence set after 90s.
-- [ ] Filter pushdown: a client subscribing to `(project, channel)`
-      only sees presence events for that channel.
-- [ ] Acceptance gate: two clients join the same channel; each sees
+- [x] Per-project presence registry: `(project, channel) → Set<{
+      client_id, metadata }>`. In-memory; ephemeral. `DashMap<(ProjectId,
+      ChannelName), Arc<ChannelPresence>>`.
+- [x] Presence protocol over WS: `track` / `untrack` /
+      `presence_state` / `presence_diff` messages (Phoenix Channels shape).
+- [x] Heartbeat-driven liveness: heartbeat refreshes TTL; missed
+      heartbeats evict after 90s (`PresenceConfig` TTL=90s/sweep=30s;
+      background eviction task).
+- [x] Filter pushdown: registry-key isolation per `(project, channel)`.
+- [x] Acceptance gate: two clients join the same channel; each sees
       the other in `presence_state`; one disconnects; the other
       receives a `presence_diff` with the leaver.
-- [ ] Integration test:
-      `tests/integration/tests/realtime_presence.rs`.
+- [x] Integration test:
+      `tests/integration/tests/realtime_presence.rs`. 64 basin-realtime tests pass.
 
 #### 5.11.R5 — Subscription filter pushdown (~1 week) ✅ shipped (`94db513`)
 
