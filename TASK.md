@@ -1753,7 +1753,7 @@ each impl sub-task flips a named slice green.
       `tests/integration/tests/pool_session_leakage.rs`,
       `benches/pool_transaction_mode.rs`.
       Acceptance: harness compiles + reports red.
-- [ ] **5.27.B — Txn-mode pool primitive in `basin-pool`** (~1 week).
+- [x] **5.27.B — Txn-mode pool primitive in `basin-pool`** (~1 week).
       Per-transaction connection assignment; explicit modes
       (`session` / `transaction` / `statement`) selectable via pool
       config + per-connection `?pool_mode=transaction` URL param.
@@ -1999,7 +1999,7 @@ exists); each impl sub-task flips a named slice green.
       `.github/workflows/docker-publish.yml`,
       `tests/integration/scripts/docker-smoke.sh`.
       Acceptance: harness compiles + reports red (no image yet).
-- [ ] **5.31.B — `Dockerfile` (multi-stage build, distroless or
+- [~] **5.31.B — `Dockerfile` (multi-stage build, distroless or
       alpine)** (~2 days). Rust builder stage + minimal runtime
       base (`gcr.io/distroless/cc` or `alpine`). Final image ≤
       100 MB. Health check via pgwire ping. ENV defaults:
