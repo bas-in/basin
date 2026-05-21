@@ -82,31 +82,21 @@ fn refresh_materialized_view_with_options_is_a_syntax_error() {
 
 #[test]
 fn alter_function_rename_is_accepted() {
-    // sqlparser 0.52 has no AlterFunction node; this required a textual
-    // pre-screen in executor.rs.
-    //
-    // libpg_query routes `ALTER FUNCTION … RENAME TO` through `RenameStmt`,
-    // NOT `AlterFunctionStmt`. The Phase 1 `stmt_kind` classifier therefore
-    // returns `StmtKind::Other` for this form, which causes the executor to
-    // fall through to the existing textual pre-screen / legacy pipeline. That
-    // is intentional for Phase 1: the task spec explicitly says "if the
-    // foundation surfaces RenameStmt under a different variant, document and
-    // test what it returns." Agents 2–4 will add a `RenameStmt` arm to
-    // `stmt_kind` so it returns `StmtKind::AlterFunction` and the pre-screen
-    // can be retired.
+    // libpg_query routes `ALTER FUNCTION … RENAME TO` through `RenameStmt`.
+    // Phase 6.X added a dedicated `AlterFunctionRename` arm to `stmt_kind`
+    // (retiring the Phase 1 Other/RenameStmt fallthrough noted here).
     //
     // The critical thing proven here is that pg_query *parses* the statement
-    // without error — sqlparser's failure was a parse error, not a dispatch
-    // gap.
+    // without error and the classifier returns a recognised variant.
     let tree = pg_ast::parse("ALTER FUNCTION foo(int) RENAME TO bar")
         .expect("pg_query must parse ALTER FUNCTION … RENAME TO without error");
     let node = tree.stmts().next().expect("at least one statement");
     let kind = pg_ast::stmt_kind(node);
-    // Accepted by the parser; falls into Other (RenameStmt) pending Phase 2.
+    // Phase 6.X: dedicated AlterFunctionRename variant (was Other in Phase 1).
     assert_eq!(
         kind,
-        StmtKind::Other,
-        "expected Other (RenameStmt path) for ALTER FUNCTION RENAME TO in Phase 1"
+        StmtKind::AlterFunctionRename,
+        "expected AlterFunctionRename for ALTER FUNCTION RENAME TO"
     );
 }
 
@@ -266,7 +256,10 @@ fn savepoint_is_noop_accepted() {
 
 #[test]
 fn drop_trigger_is_noop_accepted() {
-    assert_allowed("DROP TRIGGER trg ON t");
+    // Phase 6.X: `DROP TRIGGER trg ON t` now errors when the trigger does not
+    // exist (PG-faithful SQLSTATE 0A000). Use `IF EXISTS` for the idempotent
+    // no-op semantic (Basin has no trigger runtime).
+    assert_allowed("DROP TRIGGER IF EXISTS trg ON t");
 }
 
 #[test]

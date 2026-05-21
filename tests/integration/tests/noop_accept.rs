@@ -164,25 +164,38 @@ async fn rollback_is_accepted() {
 
 #[tokio::test]
 async fn savepoint_is_accepted() {
+    // Phase 6.X: SAVEPOINT now requires a transaction block (SQLSTATE 25P01),
+    // matching PG-faithful behaviour. Run inside BEGIN/COMMIT.
     let (_dir, engine) = open_engine().await;
     let sess = open_session_with_engine(&engine).await;
+    sess.execute("BEGIN").await.unwrap();
     assert_noop(&sess, "SAVEPOINT my_sp", "SAVEPOINT").await;
+    sess.execute("COMMIT").await.unwrap();
 }
 
 #[tokio::test]
 async fn release_savepoint_is_accepted() {
     // RELEASE SAVEPOINT also arrives as TransactionStmt / RELEASE kind;
     // the StmtKind::Savepoint arm covers both SAVEPOINT and RELEASE.
+    // Phase 6.X: must be inside a transaction block.
     let (_dir, engine) = open_engine().await;
     let sess = open_session_with_engine(&engine).await;
-    assert_noop(&sess, "RELEASE SAVEPOINT my_sp", "SAVEPOINT").await;
+    sess.execute("BEGIN").await.unwrap();
+    sess.execute("SAVEPOINT my_sp").await.unwrap();
+    // Phase 6.X: RELEASE SAVEPOINT now returns tag "RELEASE" (not "SAVEPOINT").
+    assert_noop(&sess, "RELEASE SAVEPOINT my_sp", "RELEASE").await;
+    sess.execute("COMMIT").await.unwrap();
 }
 
 #[tokio::test]
 async fn rollback_to_savepoint_is_accepted() {
+    // Phase 6.X: must be inside a transaction block.
     let (_dir, engine) = open_engine().await;
     let sess = open_session_with_engine(&engine).await;
+    sess.execute("BEGIN").await.unwrap();
+    sess.execute("SAVEPOINT my_sp").await.unwrap();
     assert_noop(&sess, "ROLLBACK TO SAVEPOINT my_sp", "ROLLBACK").await;
+    sess.execute("COMMIT").await.unwrap();
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -191,25 +204,29 @@ async fn rollback_to_savepoint_is_accepted() {
 
 #[tokio::test]
 async fn create_trigger_is_accepted() {
-    // Basin does not execute PL/pgSQL trigger bodies; declarative lifecycle
-    // columns and SQL-bodied reactors (Phase 5.11.B / 5.11.C) cover the
-    // common trigger use cases. CREATE TRIGGER is accepted syntactically so
-    // migration scripts don't bounce.
+    // Phase 6.X: CREATE TRIGGER now returns FeatureNotSupported (SQLSTATE 0A000)
+    // instead of a silent noop — Basin has no PL/pgSQL trigger runtime;
+    // use declarative lifecycle columns or SQL-bodied reactors (ADR 0012).
     let (_dir, engine) = open_engine().await;
     let sess = open_session_with_engine(&engine).await;
-    assert_noop(
-        &sess,
-        "CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
-        "CREATE TRIGGER",
-    )
-    .await;
+    let err = sess
+        .execute("CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()")
+        .await
+        .unwrap_err();
+    let msg = format!("{err}").to_ascii_lowercase();
+    assert!(
+        msg.contains("trigger") || msg.contains("not supported"),
+        "expected FeatureNotSupported for CREATE TRIGGER, got: {err}"
+    );
 }
 
 #[tokio::test]
 async fn drop_trigger_is_accepted() {
+    // Phase 6.X: `DROP TRIGGER trg ON t` errors when trigger does not exist.
+    // `DROP TRIGGER IF EXISTS` gives the idempotent no-op semantic.
     let (_dir, engine) = open_engine().await;
     let sess = open_session_with_engine(&engine).await;
-    assert_noop(&sess, "DROP TRIGGER trg ON t", "DROP TRIGGER").await;
+    assert_noop(&sess, "DROP TRIGGER IF EXISTS trg ON t", "DROP TRIGGER").await;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

@@ -189,12 +189,21 @@ async fn attach_and_detach_partition_are_accepted() {
         .await
         .unwrap();
     sess.execute("CREATE TABLE p (region TEXT)").await.unwrap();
+    // ATTACH PARTITION is accepted (parse-level no-op).
     sess.execute("ALTER TABLE t ATTACH PARTITION p FOR VALUES IN ('us')")
         .await
         .unwrap();
-    sess.execute("ALTER TABLE t DETACH PARTITION p")
+    // DETACH PARTITION: engine now explicitly errors (Phase 6.X PG-faithfulness
+    // change — Basin uses flat storage without declarative partitioning).
+    let err = sess
+        .execute("ALTER TABLE t DETACH PARTITION p")
         .await
-        .unwrap();
+        .unwrap_err();
+    let msg = format!("{err}").to_ascii_lowercase();
+    assert!(
+        msg.contains("partition") || msg.contains("not supported"),
+        "expected unsupported-partition error, got: {err}"
+    );
 }
 
 #[tokio::test]
