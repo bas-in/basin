@@ -403,6 +403,159 @@ async fn verified_email_links_existing_user() {
     assert_eq!(uid1, uid2, "second sign-in with same verified email must reuse the same user");
 }
 
+/// 6.SEC.P1 — account-takeover via unverified provider email.
+///
+/// A callback whose email matches an existing account but whose
+/// `email_verified=false` must NOT be auto-linked into that account. It must
+/// resolve to a DISTINCT user. (Here "existing account" is an existing OAuth
+/// identity created by a verified first sign-in; the second sign-in uses a
+/// different provider `sub` + the same email but `email_verified=false`.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unverified_email_does_not_link_to_existing_account() {
+    let Some(svc) = try_make_auth_service().await else { return; };
+
+    let project = ProjectId::new();
+    let provider = "mock_unverified";
+    let enc = PlaintextEncryption;
+    let email = "victim@example.com";
+
+    // 1. Verified first sign-in (sub-trusted) establishes the account.
+    let mock_v = MockProvider::start("tok-v", "sub-trusted", email, true).await;
+    let reg_v = || {
+        svc.register_mock_oauth_provider(
+            &project, provider, "cid", "csec",
+            &format!("{}/authorize", mock_v.base_url),
+            &format!("{}/token", mock_v.base_url),
+            &format!("{}/userinfo", mock_v.base_url),
+            "openid email", "",
+        );
+    };
+    reg_v();
+    let a1 = svc.begin_oauth_authorize(no_pg(), &project, provider, "").await.unwrap();
+    reg_v();
+    let r1 = svc.handle_oauth_callback(&enc, no_pg(), provider, "code-v", &a1.state, "")
+        .await.unwrap();
+    let uid_verified = svc.verify_jwt(&r1.tokens.access_token).unwrap().user_id;
+
+    // 2. Attacker sign-in: SAME email, DIFFERENT sub, email_verified=false.
+    let mock_u = MockProvider::start("tok-u", "sub-attacker", email, false).await;
+    let reg_u = || {
+        svc.register_mock_oauth_provider(
+            &project, provider, "cid", "csec",
+            &format!("{}/authorize", mock_u.base_url),
+            &format!("{}/token", mock_u.base_url),
+            &format!("{}/userinfo", mock_u.base_url),
+            "openid email", "",
+        );
+    };
+    reg_u();
+    let a2 = svc.begin_oauth_authorize(no_pg(), &project, provider, "").await.unwrap();
+    reg_u();
+    let r2 = svc.handle_oauth_callback(&enc, no_pg(), provider, "code-u", &a2.state, "")
+        .await.unwrap();
+    let uid_unverified = svc.verify_jwt(&r2.tokens.access_token).unwrap().user_id;
+
+    assert_ne!(
+        uid_verified, uid_unverified,
+        "unverified provider email must NOT auto-link into the existing verified account (account takeover)"
+    );
+}
+
+/// 6.SEC.P1 — the legitimate flow: a returning user identified by a
+/// pre-existing `(provider, provider_user_id)` identity logs into the SAME
+/// account. The match is keyed by `sub`, independent of `email_verified` on
+/// the *return* leg.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn existing_identity_by_sub_logs_into_same_account() {
+    let Some(svc) = try_make_auth_service().await else { return; };
+
+    let mock = MockProvider::start("tok-sub", "sub-stable", "dave@example.com", true).await;
+    let project = ProjectId::new();
+    let provider = "mock_sub_stable";
+    let enc = PlaintextEncryption;
+
+    let reg = || {
+        svc.register_mock_oauth_provider(
+            &project, provider, "cid", "csec",
+            &format!("{}/authorize", mock.base_url),
+            &format!("{}/token", mock.base_url),
+            &format!("{}/userinfo", mock.base_url),
+            "openid email", "",
+        );
+    };
+
+    reg();
+    let a1 = svc.begin_oauth_authorize(no_pg(), &project, provider, "").await.unwrap();
+    reg();
+    let r1 = svc.handle_oauth_callback(&enc, no_pg(), provider, "c1", &a1.state, "")
+        .await.unwrap();
+    let uid1 = svc.verify_jwt(&r1.tokens.access_token).unwrap().user_id;
+
+    reg();
+    let a2 = svc.begin_oauth_authorize(no_pg(), &project, provider, "").await.unwrap();
+    reg();
+    let r2 = svc.handle_oauth_callback(&enc, no_pg(), provider, "c2", &a2.state, "")
+        .await.unwrap();
+    let uid2 = svc.verify_jwt(&r2.tokens.access_token).unwrap().user_id;
+
+    assert_eq!(uid1, uid2, "returning user matched by (provider, sub) must reuse the same account");
+}
+
+/// 6.SEC.P1 — provider `sub` collision: the SAME `sub` value asserted by two
+/// DIFFERENT providers must resolve to two DISTINCT identities/accounts. The
+/// identity key is `(provider, provider_user_id)`, never the bare `sub`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_sub_across_providers_resolves_distinct_identities() {
+    let Some(svc) = try_make_auth_service().await else { return; };
+
+    let project = ProjectId::new();
+    let enc = PlaintextEncryption;
+    let shared_sub = "12345";
+
+    // Provider A: unverified email so we never collapse via the email-link path.
+    let mock_a = MockProvider::start("tok-a", shared_sub, "a@provider-a.example", false).await;
+    let prov_a = "mock_prov_a";
+    let reg_a = || {
+        svc.register_mock_oauth_provider(
+            &project, prov_a, "cid", "csec",
+            &format!("{}/authorize", mock_a.base_url),
+            &format!("{}/token", mock_a.base_url),
+            &format!("{}/userinfo", mock_a.base_url),
+            "openid email", "",
+        );
+    };
+    reg_a();
+    let aa = svc.begin_oauth_authorize(no_pg(), &project, prov_a, "").await.unwrap();
+    reg_a();
+    let ra = svc.handle_oauth_callback(&enc, no_pg(), prov_a, "ca", &aa.state, "")
+        .await.unwrap();
+    let uid_a = svc.verify_jwt(&ra.tokens.access_token).unwrap().user_id;
+
+    // Provider B: SAME sub, different provider + different email.
+    let mock_b = MockProvider::start("tok-b", shared_sub, "b@provider-b.example", false).await;
+    let prov_b = "mock_prov_b";
+    let reg_b = || {
+        svc.register_mock_oauth_provider(
+            &project, prov_b, "cid", "csec",
+            &format!("{}/authorize", mock_b.base_url),
+            &format!("{}/token", mock_b.base_url),
+            &format!("{}/userinfo", mock_b.base_url),
+            "openid email", "",
+        );
+    };
+    reg_b();
+    let ab = svc.begin_oauth_authorize(no_pg(), &project, prov_b, "").await.unwrap();
+    reg_b();
+    let rb = svc.handle_oauth_callback(&enc, no_pg(), prov_b, "cb", &ab.state, "")
+        .await.unwrap();
+    let uid_b = svc.verify_jwt(&rb.tokens.access_token).unwrap().user_id;
+
+    assert_ne!(
+        uid_a, uid_b,
+        "the same sub from two different providers must NOT collapse into one identity"
+    );
+}
+
 /// Absolute `redirect_to` not in the allowlist must be rejected at authorize time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn open_redirect_rejected_at_authorize() {

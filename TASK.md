@@ -1837,6 +1837,16 @@ regression-test backfill in `tests/integration/tests/security.rs`.
       missing, presence `client_id` impersonation, public-bucket alias
       gap, reserved-schema CREATE/DROP open). Each ~½–1 day; file:line in
       audit §4.
+  - [x] **6.SEC.P1 (OAuth)** — account-takeover via unverified email closed.
+        Auto-link to an existing account now requires the provider's honest
+        `email_verified=true` claim (removed the unconditional GitHub
+        override at `oauth.rs` callback); identity lookup is keyed by
+        `(provider, provider_user_id)` so a `sub` reused across providers
+        resolves to distinct identities. Tests: `oauth_flow.rs`
+        (`unverified_email_does_not_link_to_existing_account`,
+        `existing_identity_by_sub_logs_into_same_account`,
+        `same_sub_across_providers_resolves_distinct_identities`) +
+        `oauth.rs` unit tests for absent/false `email_verified`.
 
 - [ ] **6.SEC.T — 17 regression tests** in
       `tests/integration/tests/security.rs` from audit §6. Land each test

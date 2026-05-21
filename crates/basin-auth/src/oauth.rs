@@ -1211,8 +1211,15 @@ where
         .provider_user_id()
         .ok_or_else(|| BasinError::internal("provider did not return a sub/id"))?;
 
-    // GitHub always returns verified emails for primary addresses.
-    let verified = userinfo.is_email_verified() || provider == "github";
+    // Auto-link to an existing account is only safe when the provider asserts
+    // the email is verified (the standard OIDC `email_verified=true` claim).
+    // We must NOT blanket-trust any provider (incl. GitHub, whose /user
+    // endpoint can return an *unverified* public email): an attacker who
+    // controls a provider account asserting a victim's email would otherwise
+    // be silently merged into the victim's existing password account
+    // (account takeover — 6.SEC.P1). Match Supabase/Auth0: unverified email
+    // never merges into an existing account.
+    let verified = userinfo.is_email_verified();
 
     // 6. Link or create user.
     let (user_id, user_created) = if let Some(pg) = oauth_store {
@@ -1586,6 +1593,36 @@ mod tests {
             ..info.clone()
         };
         assert!(!info2.is_email_verified());
+    }
+
+    #[test]
+    fn userinfo_email_verified_absent_is_false() {
+        // 6.SEC.P1: a provider that omits the `email_verified` claim must NOT
+        // be treated as verified — absence is the unverified case, so the
+        // callback flow will refuse to auto-link to an existing account.
+        let info = UserInfo {
+            sub: Some("123".into()),
+            email: Some("victim@example.com".into()),
+            email_verified: None,
+            name: None,
+            extra: HashMap::new(),
+        };
+        assert!(
+            !info.is_email_verified(),
+            "absent email_verified must be treated as unverified"
+        );
+    }
+
+    #[test]
+    fn userinfo_email_verified_string_false_is_false() {
+        let info = UserInfo {
+            sub: Some("123".into()),
+            email: Some("victim@example.com".into()),
+            email_verified: Some(serde_json::Value::String("false".into())),
+            name: None,
+            extra: HashMap::new(),
+        };
+        assert!(!info.is_email_verified());
     }
 
     #[test]
