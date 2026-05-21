@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use arrow_array::{new_null_array, RecordBatch};
-use arrow_schema::{Schema, SchemaRef};
+use arrow_schema::{Field, Schema, SchemaRef};
 use basin_common::{BasinError, ProjectId, Result, TableName};
 use futures::stream::{BoxStream, StreamExt};
 use object_store::path::Path as ObjectPath;
@@ -1264,15 +1264,21 @@ where
                 let stream = builder
                     .build()
                     .map_err(|e| BasinError::storage(format!("parquet build {path}: {e}")))?;
+                let catalog_schema_for_stamp = catalog_schema.clone();
                 let mapped = stream.map(move |res| {
                     let batch =
                         res.map_err(|e| BasinError::storage(format!("parquet read: {e}")))?;
-                    synthesise_missing_columns(
+                    let synth = synthesise_missing_columns(
                         batch,
                         &present_names_arc,
                         &missing_cols_arc,
                         &output_schema_arc,
-                    )
+                    )?;
+                    // Re-stamp BASIN_TYPE (and any other) field metadata from
+                    // the catalog schema — Parquet's `ArrowWriter` round-trip
+                    // does not re-apply the `ARROW:schema` blob's field
+                    // metadata to the per-batch schema the reader emits.
+                    Ok(restamp_field_metadata_from_catalog(synth, catalog_schema_for_stamp.as_ref()))
                 });
 
                 // Page-cache write-through with the synthesised batches.
@@ -1374,8 +1380,16 @@ where
     let stream = builder
         .build()
         .map_err(|e| BasinError::storage(format!("parquet build {path}: {e}")))?;
-    let mapped =
-        stream.map(|res| res.map_err(|e| BasinError::storage(format!("parquet read: {e}"))));
+    let catalog_schema_for_stamp = catalog_schema.clone();
+    let mapped = stream.map(move |res| {
+        let batch = res.map_err(|e| BasinError::storage(format!("parquet read: {e}")))?;
+        // Re-stamp BASIN_TYPE field metadata from the catalog schema —
+        // Parquet's `ArrowWriter` round-trip does not re-apply the
+        // `ARROW:schema` blob's field metadata to the per-batch schema the
+        // reader emits, so semantic types (MONEY, INET, …) would otherwise
+        // be downgraded to their physical Arrow type post-storage.
+        Ok(restamp_field_metadata_from_catalog(batch, catalog_schema_for_stamp.as_ref()))
+    });
 
     if let (Some(pc), Some(key)) = (page_cache, cache_key) {
         let buf: Arc<std::sync::Mutex<Option<Vec<Arc<RecordBatch>>>>> =
@@ -1505,7 +1519,12 @@ fn vortex_project_and_filter(
                     .map_err(|e| BasinError::storage(format!("vortex projection assemble: {e}")))?
             }
         };
-        out.push(projected);
+        // Re-stamp BASIN_TYPE field metadata from the catalog schema —
+        // Vortex's `DType::to_arrow_schema` drops field metadata wholesale
+        // on decode, so semantic types (MONEY, INET, …) would otherwise be
+        // downgraded to their physical Arrow type post-storage.
+        let restamped = restamp_field_metadata_from_catalog(projected, catalog_schema);
+        out.push(restamped);
     }
     Ok(out)
 }
@@ -1610,6 +1629,71 @@ fn vortex_read_projection(opts: &ReadOptions) -> Option<Vec<String>> {
         }
     }
     Some(out)
+}
+
+/// Re-stamp each output field's metadata from the catalog schema (by name)
+/// so logical-type markers like `BASIN_TYPE` survive the storage round-trip.
+///
+/// Both the Parquet `ArrowWriter` and the Vortex codec drop field-level
+/// Arrow metadata on the way back in (Parquet's `ARROW:schema` blob is not
+/// re-applied to the per-batch schema the reader emits; Vortex's
+/// `DType::to_arrow_schema` strips field metadata wholesale). The engine
+/// emits BASIN_TYPE field metadata at DDL time so semantic types (MONEY,
+/// INET, CIDR, MACADDR, MACADDR8, BIT(n), VARBIT(n), JSONB, UUID, …)
+/// can be reconstructed from the Arrow schema alone; losing those markers
+/// downgrades reads to the physical Arrow type and breaks parity with
+/// Postgres for the storage→pgwire/REST/realtime round-trip.
+///
+/// Pure metadata rewrap — column arrays are reused unchanged. When
+/// `catalog_schema` is `None` (schema-less callers: `read_file`,
+/// continuous-view refresh, cron-job state, system tables) the input
+/// batch is returned untouched.
+fn restamp_field_metadata_from_catalog(
+    batch: RecordBatch,
+    catalog_schema: Option<&SchemaRef>,
+) -> RecordBatch {
+    let Some(catalog) = catalog_schema else {
+        return batch;
+    };
+    let in_schema = batch.schema();
+    // Cheap probe: bail out when no field in the batch has a catalog
+    // counterpart that would change its metadata. Avoids cloning the
+    // schema for the common-case batch that is already correctly stamped
+    // (e.g. write-then-read in the same process before any encode/decode).
+    let needs_rewrap = in_schema.fields().iter().any(|f| {
+        catalog
+            .field_with_name(f.name())
+            .ok()
+            .map(|cf| cf.metadata() != f.metadata())
+            .unwrap_or(false)
+    });
+    if !needs_rewrap {
+        return batch;
+    }
+    let new_fields: Vec<arrow_schema::FieldRef> = in_schema
+        .fields()
+        .iter()
+        .map(|f| match catalog.field_with_name(f.name()) {
+            Ok(cf) if cf.metadata() != f.metadata() => {
+                // Keep the physical type from the file (it may differ
+                // legitimately — e.g. timezone normalisation) but adopt the
+                // catalog's metadata so BASIN_TYPE survives.
+                Arc::new(
+                    Field::new(f.name(), f.data_type().clone(), f.is_nullable())
+                        .with_metadata(cf.metadata().clone()),
+                )
+            }
+            _ => f.clone(),
+        })
+        .collect();
+    let new_schema = Arc::new(Schema::new_with_metadata(
+        new_fields,
+        in_schema.metadata().clone(),
+    ));
+    // Reuse the column arrays — no data motion.
+    let cols = batch.columns().to_vec();
+    RecordBatch::try_new(new_schema, cols)
+        .expect("restamp: metadata-only rewrap cannot fail")
 }
 
 fn synthesise_missing_columns(
