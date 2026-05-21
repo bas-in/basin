@@ -1,0 +1,80 @@
+// Prisma schema for migration-tool compatibility test (Phase 5.25.F).
+//
+// This schema is rendered at test time with the actual Basin connection string
+// substituted for DATABASE_URL.  It defines a minimal but realistic data model
+// to exercise Prisma Migrate and the Prisma Client query engine against Basin.
+//
+// Known Basin compatibility risks (documented in CAPABILITIES.md):
+//
+//   1. Prisma introspect / migrate dev heavily query pg_catalog (pg_class,
+//      pg_attribute, pg_namespace, pg_constraint, pg_index, pg_enum, …).
+//      Basin's pg_catalog coverage is partial; missing catalog rows may cause
+//      Prisma to report "Could not determine the connector to use" or silently
+//      drop table/column mappings.
+//
+//   2. Prisma Client uses the extended wire protocol with named prepared
+//      statements.  Basin's extended-protocol support is exercised by
+//      `poc_extended_smoke.rs` and `pgwire_wire_compat.rs` but some edge
+//      cases (type OIDs for JSONB, SERIAL default-value reflection, enum
+//      handling) may not be fully covered.
+//
+//   3. `prisma migrate dev` creates a _prisma_migrations shadow database to
+//      diff the schema.  Basin does not support CREATE DATABASE; the shadow DB
+//      step will be skipped / replaced by `prisma migrate deploy` in CI.
+//
+//   4. `prisma db push` (schema-push without migration files) may be more
+//      reliable against Basin than `prisma migrate` because it avoids the
+//      shadow-database creation step.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id          Int      @id @default(autoincrement())
+  email       String
+  displayName String?  @map("display_name")
+  createdAt   DateTime @default(now()) @map("created_at")
+  posts       Post[]
+  comments    Comment[]
+
+  @@map("users")
+}
+
+model Team {
+  id        Int      @id @default(autoincrement())
+  name      String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("teams")
+}
+
+model Post {
+  id        Int       @id @default(autoincrement())
+  authorId  Int       @map("author_id")
+  title     String
+  body      String?
+  published Boolean   @default(false)
+  createdAt DateTime  @default(now()) @map("created_at")
+  author    User      @relation(fields: [authorId], references: [id])
+  comments  Comment[]
+
+  @@map("posts")
+}
+
+model Comment {
+  id        Int      @id @default(autoincrement())
+  postId    Int      @map("post_id")
+  authorId  Int      @map("author_id")
+  body      String
+  createdAt DateTime @default(now()) @map("created_at")
+  post      Post     @relation(fields: [postId], references: [id])
+  author    User     @relation(fields: [authorId], references: [id])
+
+  @@map("comments")
+}
