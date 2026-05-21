@@ -101,7 +101,8 @@ use tokio::time::interval;
 use tracing::{debug, info, warn};
 
 use crate::presence::{
-    serialize_presence_diff, serialize_presence_state, PresenceEvent, PresenceRegistry,
+    authorize_client_id, serialize_presence_diff, serialize_presence_state, validate_metadata_size,
+    PresenceEvent, PresenceRegistry,
 };
 use crate::{ChannelKey, ChannelRegistry, ReplayCursor};
 
@@ -275,6 +276,14 @@ enum ServerMsg<'a> {
         table: &'a str,
         #[serde(skip_serializing_if = "Option::is_none")]
         missed: Option<u64>,
+    },
+    /// Informs the client that a presence operation was rejected (e.g.
+    /// `client_id` impersonation or oversized metadata). The connection stays
+    /// open; only the offending presence message is dropped.
+    PresenceError {
+        code: &'static str,
+        channel: &'a str,
+        message: String,
     },
 }
 
@@ -764,6 +773,36 @@ async fn handle_client_msg(
             client_id,
             metadata,
         } => {
+            // 6.SEC.P1: bind the presence identity to the authenticated session.
+            // A wire-supplied client_id that does not match this connection's
+            // JWT identity is rejected — a client must not impersonate another.
+            let bound_id = match authorize_client_id(user_id, &client_id) {
+                Ok(id) => id.to_owned(),
+                Err(rej) => {
+                    warn!(
+                        project = %project_id,
+                        channel = %channel,
+                        authenticated = %user_id,
+                        requested = %client_id,
+                        "WS: rejected presence track with forged client_id"
+                    );
+                    send_presence_error(socket, &channel, &rej).await;
+                    return Ok(());
+                }
+            };
+
+            // 6.SEC.P1: cap metadata size before storing or broadcasting it.
+            if let Err(rej) = validate_metadata_size(&metadata) {
+                warn!(
+                    project = %project_id,
+                    channel = %channel,
+                    client = %bound_id,
+                    "WS: rejected presence track with oversized metadata"
+                );
+                send_presence_error(socket, &channel, &rej).await;
+                return Ok(());
+            }
+
             // Subscribe this connection to the channel's presence broadcast if
             // not already subscribed. Subscribe *before* track so we don't miss
             // the diff we're about to publish.
@@ -782,42 +821,88 @@ async fn handle_client_msg(
             let _ = socket.send(Message::Text(state_json.into())).await;
 
             // Track the client — publishes a diff to all other subscribers.
-            presence.track(*project_id, &channel, &client_id, metadata);
+            presence.track(*project_id, &channel, &bound_id, metadata);
 
             // Remember for cleanup on disconnect.
-            tracked_clients.insert(channel.clone(), client_id.clone());
+            tracked_clients.insert(channel.clone(), bound_id.clone());
 
             debug!(
                 project = %project_id,
                 channel = %channel,
-                client = %client_id,
+                client = %bound_id,
                 "WS: presence tracked"
             );
         }
 
         ClientMsg::PresenceUntrack { channel, client_id } => {
-            presence.untrack(*project_id, &channel, &client_id);
+            // 6.SEC.P1: only the authenticated identity may untrack itself.
+            let bound_id = match authorize_client_id(user_id, &client_id) {
+                Ok(id) => id.to_owned(),
+                Err(rej) => {
+                    warn!(
+                        project = %project_id,
+                        channel = %channel,
+                        authenticated = %user_id,
+                        requested = %client_id,
+                        "WS: rejected presence untrack with forged client_id"
+                    );
+                    send_presence_error(socket, &channel, &rej).await;
+                    return Ok(());
+                }
+            };
+            presence.untrack(*project_id, &channel, &bound_id);
             tracked_clients.remove(&channel);
             debug!(
                 project = %project_id,
                 channel = %channel,
-                client = %client_id,
+                client = %bound_id,
                 "WS: presence untracked"
             );
         }
 
         ClientMsg::Heartbeat { channel, client_id } => {
-            presence.heartbeat(*project_id, &channel, &client_id);
+            // 6.SEC.P1: a heartbeat may only refresh the authenticated identity.
+            let bound_id = match authorize_client_id(user_id, &client_id) {
+                Ok(id) => id.to_owned(),
+                Err(rej) => {
+                    warn!(
+                        project = %project_id,
+                        channel = %channel,
+                        authenticated = %user_id,
+                        requested = %client_id,
+                        "WS: rejected presence heartbeat with forged client_id"
+                    );
+                    send_presence_error(socket, &channel, &rej).await;
+                    return Ok(());
+                }
+            };
+            presence.heartbeat(*project_id, &channel, &bound_id);
             debug!(
                 project = %project_id,
                 channel = %channel,
-                client = %client_id,
+                client = %bound_id,
                 "WS: presence heartbeat"
             );
         }
     }
 
     Ok(())
+}
+
+/// Send a `presence_error` frame to the client for a rejected presence op.
+/// The connection stays open; only the offending message is dropped.
+async fn send_presence_error(
+    socket: &mut WebSocket,
+    channel: &str,
+    rejection: &crate::presence::PresenceRejection,
+) {
+    let json = serde_json::to_string(&ServerMsg::PresenceError {
+        code: rejection.code(),
+        channel,
+        message: rejection.message(),
+    })
+    .unwrap_or_else(|_| r#"{"type":"presenceerror","code":"presence_error"}"#.to_owned());
+    let _ = socket.send(Message::Text(json.into())).await;
 }
 
 /// Per-table forwarder task. Reads from a broadcast receiver and forwards
