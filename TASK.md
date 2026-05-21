@@ -1642,6 +1642,460 @@ consistently.
       the test results — never hand-edited; CI regenerates on every
       green run.
 
+## Phase 5.26 — pgvector SQL-syntax compat (~1-2 weeks)
+
+`basin-vector` ships HNSW + vector search; the operator and index
+syntax must be **byte-for-byte pgvector-compatible** so LangChain /
+LlamaIndex / OpenAI cookbooks / any pgvector-assuming AI app drops
+in. This is the same shape as `LANGUAGE plpgsql`: a syntax-compat
+decision that determines drop-in-ability for a huge customer profile.
+
+**Test-first.** Differential battery vs a reference pgvector docker
++ ORM-compat harness lands first; each implementation sub-task
+flips a named slice of the harness from red to green.
+
+- [ ] **5.26.A — pgvector differential + ORM-compat test harness**
+      (~3 days, lands first; lands red against current engine).
+      Four layers:
+      (1) **Reference differential:** spin up the official `pgvector/pgvector`
+      docker image; seed both it and Basin with the same 1M-row
+      embedding table (384-dim, mixed real-world distributions);
+      for a curated battery of similarity queries, assert the
+      top-k row ordering matches (within float tolerance for the
+      score column).
+      (2) **Operator semantics:** for each of `<->` (L2), `<=>`
+      (cosine), `<#>` (negative inner product), golden-file pairs
+      from the reference instance; assert ranking + score within
+      tolerance.
+      (3) **DDL surface:** `vector(N)` type literal, `CREATE INDEX
+      … USING hnsw (embedding vector_l2_ops)`, `CREATE INDEX …
+      USING ivfflat (embedding vector_cosine_ops) WITH (lists =
+      100)` — parse + persist + planner uses them.
+      (4) **ORM compat:** SQLAlchemy's `pgvector.sqlalchemy.Vector`,
+      Drizzle's `vector()` column, Prisma's `@db.Vector(N)` + raw
+      queries — migration applies + CRUD + similarity round-trip.
+      Files: `tests/integration/tests/pgvector_differential.rs`,
+      `tests/integration/tests/pgvector_operators.rs`,
+      `tests/integration/tests/pgvector_index_syntax.rs`,
+      `tests/integration/tests/pgvector_orm_compat.rs`.
+      Acceptance: harness compiles + reports red against the
+      current engine.
+- [ ] **5.26.B — `vector(N)` type alias via basin-vector** (~1 day).
+      `vector(384)` as a type literal; round-trip through psql
+      binary + text protocol; dimension stored in column metadata,
+      validated on insert. Files: `crates/basin-vector/src/type.rs`
+      (extend), `crates/basin-engine/src/types.rs` (register).
+      Acceptance: closes the **type round-trip** slice of 5.26.A.
+- [ ] **5.26.C — Operators `<->` / `<=>` / `<#>`** (~3-5 days).
+      Implement (or alias to existing basin-vector operators) the
+      three pgvector distance/similarity operators. Files:
+      `crates/basin-vector/src/operators.rs` (extend),
+      `crates/basin-engine/src/operators/vector.rs` (extend).
+      Acceptance: closes the **operator semantics** slice of 5.26.A.
+- [ ] **5.26.D — `USING hnsw (col vector_l2_ops)` DDL** (~2-3 days).
+      `USING hnsw` parser + planner map to basin-vector's HNSW
+      implementation. Operator-class names: `vector_l2_ops`,
+      `vector_cosine_ops`, `vector_ip_ops`. Files:
+      `crates/basin-engine/src/ddl.rs` (extend),
+      `crates/basin-vector/src/index.rs` (extend).
+      Acceptance: closes the **DDL — hnsw index** slice of 5.26.A.
+- [ ] **5.26.E — `USING ivfflat` DDL** (~2-3 days). IVFFlat with
+      `WITH (lists = N)` storage parameter; planner picks ivfflat
+      vs hnsw based on index hint or selectivity. Files:
+      `crates/basin-engine/src/ddl.rs` (extend),
+      `crates/basin-vector/src/ivfflat.rs` (new).
+      Acceptance: closes the **DDL — ivfflat index** slice of 5.26.A.
+- [ ] **5.26.F — ORM-compat polish + CAPABILITIES row** (~1-2 days).
+      Whatever the SQLAlchemy / Drizzle / Prisma slices surface
+      (psql binary-protocol corner cases, `@db.Vector` shape, etc.)
+      gets closed here; CAPABILITIES.md pgvector row marked
+      shipped. Acceptance: closes the **ORM compat** slice of 5.26.A.
+
+## Phase 5.27 — Transaction-mode connection pooling (~2 weeks)
+
+`basin-pool` (Phase 1) ships session-mode pooling. **Transaction-
+mode** is required for serverless customers (Vercel / Netlify /
+Cloudflare Workers / AWS Lambda) — sessions burn through PG
+connections fast; transaction mode lets a small pool serve many
+short-lived clients. This is required for the basin-js +
+edge-runtime wedge.
+
+**Test-first.** Pool-semantics + serverless-adapter + per-project
+isolation + session-leakage detection battery lands red first;
+each impl sub-task flips a named slice green.
+
+- [ ] **5.27.A — Txn-mode pool + serverless test harness**
+      (~3 days, lands first; lands red against current engine).
+      Four layers:
+      (1) **Pool semantics:** txn-mode contract — a cursor opened
+      in one txn is not visible to the next txn on the same
+      underlying connection; spawn 1000 short-lived clients, each
+      runs `BEGIN; DECLARE cur CURSOR …; SELECT …; COMMIT;` against
+      a 10-connection pool in transaction mode; assert no cursor /
+      session-state bleed across checkouts.
+      (2) **`@vercel/postgres` dockerised integration:** a Node.js
+      Vercel-shaped app in docker-compose imports `@vercel/postgres`,
+      points at Basin via the txn pool, runs 50 concurrent
+      invocations × 10 queries each; 0 connection failures, p99
+      within budget.
+      (3) **Per-project isolation:** alice's open txn state (locks,
+      temp tables, GUCs) never bleeds into bob's checkout against
+      the same physical connection slot — assert via a deliberate
+      `SET LOCAL search_path = 'alice_secret'` in one project's txn,
+      then verify a parallel checkout by another project sees the
+      default search_path.
+      (4) **Session-leakage detection:** a pre-checkout `SET LOCAL`
+      or `LISTEN` does not survive return-to-pool; explicit assertion
+      battery for the documented set of session-affecting commands.
+      Files: `tests/integration/tests/pool_transaction_mode.rs`,
+      `tests/integration/tests/pool_vercel_adapter.rs`,
+      `tests/integration/tests/pool_project_isolation.rs`,
+      `tests/integration/tests/pool_session_leakage.rs`,
+      `benches/pool_transaction_mode.rs`.
+      Acceptance: harness compiles + reports red.
+- [ ] **5.27.B — Txn-mode pool primitive in `basin-pool`** (~1 week).
+      Per-transaction connection assignment; explicit modes
+      (`session` / `transaction` / `statement`) selectable via pool
+      config + per-connection `?pool_mode=transaction` URL param.
+      Files: `crates/basin-pool/src/mode.rs` (new),
+      `crates/basin-pool/src/lib.rs` (extend).
+      Acceptance: closes the **pool semantics** slice of 5.27.A.
+- [ ] **5.27.C — `@vercel/postgres` dockerised e2e** (~2 days).
+      `tests/integration/docker/vercel-postgres-app/` — minimal
+      Node.js app + Dockerfile + compose service; CI job runs the
+      integration script. Acceptance: closes the
+      **`@vercel/postgres` slice** of 5.27.A.
+- [ ] **5.27.D — Per-project isolation enforcement at checkout**
+      (~3 days). Per-project pool partitions remain isolated even
+      under txn-mode sharing; one project's exhaustion doesn't
+      starve others (use the per-tenant semaphore pattern from
+      `feedback_multitenant_isolation`); checkout validates the
+      project tag matches the requesting session before handing
+      back the connection. Files:
+      `crates/basin-pool/src/tenant_isolation.rs` (extend).
+      Acceptance: closes the **per-project isolation** slice of 5.27.A.
+- [ ] **5.27.E — Session-leakage scrub on return-to-pool** (~2 days).
+      On connection return: DISCARD ALL semantics — reset GUCs to
+      defaults, drop temp tables, clear advisory locks, drop
+      prepared statements, unsubscribe LISTEN channels. Files:
+      `crates/basin-pool/src/return_scrub.rs` (new).
+      Acceptance: closes the **leakage detection** slice of 5.27.A.
+      Companion: `docs/connection-pooling.md` lists which PG
+      features fail under txn mode (LISTEN, session advisory locks,
+      SET PERSIST) with clear SQLSTATE codes; CAPABILITIES.md row
+      flipped to shipped.
+
+## Phase 5.28 — `lock_timeout` + `idle_in_transaction_session_timeout` (~3-5 days)
+
+`BASIN_STATEMENT_TIMEOUT_MS` (Phase 6.P0.A) ships. The matching
+session-level knobs every production PG app sets — `lock_timeout`
+and `idle_in_transaction_session_timeout` — are not yet surfaced.
+Without them, abandoned transactions hold locks forever and lock
+acquisition can hang indefinitely. **This completes the timeout
+trio with 6.P0.A's `statement_timeout`.**
+
+**Test-first.** Timeout-firing battery lands red first; each
+impl sub-task flips a named slice green.
+
+- [ ] **5.28.A — Timeout-firing + tooling-compat test harness**
+      (~1 day, lands first; lands red against current engine).
+      Four layers:
+      (1) **`lock_timeout` fires:** start a transaction holding
+      an UPDATE lock; in a second session set `SET lock_timeout =
+      '100ms'`; issue a conflicting UPDATE; assert it aborts
+      **with SQLSTATE 55P03 (`lock_not_available`)** within 200 ms.
+      (2) **`idle_in_transaction_session_timeout` closes session:**
+      start a transaction with `SET idle_in_transaction_session_timeout
+      = '500ms'`; wait 1 s without further activity; assert the
+      session is terminated with `SQLSTATE 25P03`.
+      (3) **`SET` / `SHOW` round-trip:** values round-trip via
+      `SET` and are visible via `SHOW` + `current_setting()`.
+      (4) **Tooling compat:** psql, DBeaver, pgcli — each tool's
+      session-knob UI / introspection sees and uses these GUCs
+      identically to a real PG instance (dockerised tool harness).
+      Files: `tests/integration/tests/session_timeouts.rs`,
+      `tests/integration/tests/session_timeouts_tooling.rs`.
+      Acceptance: harness compiles + reports red.
+- [ ] **5.28.B — `lock_timeout` GUC + per-statement enforcement**
+      (~1 day). Cooperative cancellation at the lock-acquisition
+      boundary in `basin-shard` partition writers; SQLSTATE 55P03
+      on expiry. Files: `crates/basin-shard/src/lock_wait.rs` (new),
+      `crates/basin-engine/src/session.rs` (extend GUCs).
+      Acceptance: closes the **`lock_timeout` fires + 55P03**
+      slice of 5.28.A.
+- [ ] **5.28.C — `idle_in_transaction_session_timeout` GUC +
+      session reaper** (~1 day). Tokio timer per transaction; on
+      expiry, cancel the session + roll back; SQLSTATE 25P03.
+      Files: `crates/basin-engine/src/session.rs` (extend),
+      `crates/basin-engine/src/session_reaper.rs` (new).
+      Acceptance: closes the **idle-in-txn closes session** slice
+      of 5.28.A.
+- [ ] **5.28.D — Tooling-compat slice green** (~1 day). psql /
+      DBeaver / pgcli pre-flight probes (`SHOW lock_timeout`, etc.)
+      return PG-shape values; tool-driven `SET` lands cleanly.
+      Files: `crates/basin-engine/src/guc.rs` (extend).
+      Acceptance: closes the **tooling compat** slice of 5.28.A;
+      full harness goes green.
+
+## Phase 5.29 — Time-series hypertable equivalent (~3-4 weeks)
+
+TimescaleDB's killer feature is auto-partitioning by time + a
+retention policy DDL. Basin has partitioning primitives; this
+phase wraps them in a Basin-flavored "hypertable" surface so the
+time-series / observability customer profile drops in. Pairs
+naturally with the audit-log wedge already named.
+
+**Test-first.** Time-series workload battery + ORM-compat + 1B-row
+soak lands red first; each impl sub-task flips a named slice green.
+
+- [ ] **5.29.A — Hypertable workload + ORM-compat + soak harness**
+      (~3 days, lands first; lands red against current engine).
+      Five layers:
+      (1) **Auto-partition by time bucket (1d / 1w / 1mo):** insert
+      1M rows spanning 2 years of timestamps into a hypertable;
+      assert per-bucket partitions exist and queries with a time
+      filter only scan the relevant partitions (≥ 100× speedup vs
+      unpartitioned).
+      (2) **`add_retention_policy(table, INTERVAL)`:** set retention
+      to 90 days; insert old + new rows; tick the retention job;
+      assert old partitions are dropped, new ones remain.
+      (3) **Compression / tier-down round-trip:** old partitions
+      get re-encoded into a tighter Vortex profile + moved to cold
+      tier; reads still work; storage bytes ≥ 3× smaller.
+      (4) **ORM compat:** sqlx + Diesel — each declares a
+      hypertable via raw SQL escape, INSERTs + reads work,
+      retention policy survives ORM-driven schema changes.
+      (5) **1B-row write soak:** sustained ingest at 100k rows/s
+      for 3 h (1.08B rows total); assert no partition-creation
+      stalls > 100 ms; p99 write latency within budget; cold-tier
+      reads stay correct under continuous ingest.
+      Files: `tests/integration/tests/hypertable_partitioning.rs`,
+      `tests/integration/tests/hypertable_retention.rs`,
+      `tests/integration/tests/hypertable_compression.rs`,
+      `tests/integration/tests/hypertable_orm_compat.rs`,
+      `tests/integration/tests/hypertable_soak_1b.rs` (gated
+      behind `--ignored` for nightly).
+      Acceptance: harness compiles + reports red.
+- [ ] **5.29.B — `create_hypertable(table, time_column,
+      chunk_interval)` DDL** (~3-5 days). UDF + DDL surface;
+      catalog persistence of the hypertable spec (time column,
+      bucket interval, dimension partitioning); runtime auto-create
+      of new partitions as data arrives.
+      Files: `crates/basin-engine/src/ddl.rs` (extend),
+      `crates/basin-engine/src/udfs/hypertable.rs` (new),
+      `crates/basin-shard/src/auto_partition.rs` (new).
+      Acceptance: closes the **auto-partition** slice of 5.29.A.
+- [ ] **5.29.C — Per-chunk routing in executor** (~1 week).
+      Planner prunes chunks based on time-filter; per-chunk scan
+      parallelism; chunk-aware aggregation pushdown. Files:
+      `crates/basin-engine/src/chunk_router.rs` (new),
+      `crates/basin-engine/src/planner.rs` (extend).
+      Acceptance: closes the **query routing** slice of 5.29.A
+      (≥ 100× speedup gate).
+- [ ] **5.29.D — `add_retention_policy` + cron-driven drop**
+      (~3-5 days). `SELECT basin.add_retention_policy('events',
+      INTERVAL '90 days')` — registers a basin-cron job that drops
+      partitions older than the threshold;
+      `basin.remove_retention_policy()`,
+      `basin.show_retention_policies()`.
+      Files: `crates/basin-cron/src/retention.rs` (new),
+      `crates/basin-engine/src/udfs/retention.rs` (new).
+      Acceptance: closes the **retention** slice of 5.29.A.
+- [ ] **5.29.E — Compression + tier-down to cold tier** (~1 week).
+      Old partitions (configurable threshold) get re-encoded into
+      a more compressed Vortex profile + moved to a colder storage
+      class. Integrates with basin-hottier (5.14.C) for the read
+      path. Files: `crates/basin-shard/src/tier_down.rs` (new).
+      Acceptance: closes the **tier-down** slice of 5.29.A
+      (1-year-old reads work; bytes ≥ 3× smaller).
+- [ ] **5.29.F — ORM compat + 1B-row soak slice** (~3-5 days).
+      sqlx / Diesel migration escape hatches documented; soak
+      harness wired into nightly CI; perf regression gates set.
+      Acceptance: closes the **ORM compat** + **soak** slices of
+      5.29.A; CAPABILITIES.md hypertable row flipped to shipped.
+
+## Phase 5.30 — `citext` type (case-insensitive text) (~3 days)
+
+Common ask for case-insensitive email-uniqueness columns. Small
+type + comparison operator overrides. Postgres ships it as an
+extension; Basin ships it native (no extension surface).
+
+**Test-first.** Type round-trip + comparison + UNIQUE + ORM
+battery lands red first; each impl sub-task flips a named slice
+green.
+
+- [ ] **5.30.A — citext semantics + ORM-compat harness**
+      (~half day, lands first; lands red against current engine).
+      Four layers:
+      (1) **Type round-trip:** `citext` declared on a column,
+      INSERTs + SELECTs round-trip through psql binary + text
+      protocol; cast `'Alice@Example.COM'::citext` works.
+      (2) **Comparisons (`=`, `<`, `<>`):**
+      `'Alice@Example.COM'::citext = 'alice@example.com'::citext`
+      → true; ordering + inequality match folded-lowercase
+      semantics.
+      (3) **Unique-constraint case-insensitivity:** UNIQUE on a
+      citext column rejects `Alice@Example.com` after
+      `alice@example.com` is inserted, with SQLSTATE 23505
+      (case-insensitive email uniqueness).
+      (4) **ORM compat:** Diesel `CiText`, sqlx, Prisma
+      `@db.Citext` — migration applies + INSERT/SELECT/UNIQUE
+      round-trip.
+      Files: `tests/integration/tests/citext_semantics.rs`,
+      `tests/integration/tests/citext_unique.rs`,
+      `tests/integration/tests/citext_orm_compat.rs`.
+      Acceptance: harness compiles + reports red.
+- [ ] **5.30.B — `citext` type** (~1 day). Catalog type
+      registration; binary + text serialisation; Arrow
+      representation. Files:
+      `crates/basin-common/src/types/citext.rs` (new),
+      `crates/basin-engine/src/types.rs` (register).
+      Acceptance: closes the **type round-trip** slice of 5.30.A.
+- [ ] **5.30.C — Comparison operators** (~1 day). `=`, `<>`, `<`,
+      `<=`, `>`, `>=` with case-folded semantics; integrates with
+      planner so ORDER BY on citext respects fold.
+      Files: `crates/basin-engine/src/operators/citext_cmp.rs` (new).
+      Acceptance: closes the **comparison semantics** slice of 5.30.A.
+- [ ] **5.30.D — UNIQUE on citext column** (~half day).
+      Case-folded at index time so UNIQUE rejects equivalents;
+      performant at 100k rows. Files:
+      `crates/basin-storage/src/index/btree_citext.rs` (new or
+      extend).
+      Acceptance: closes the **unique-constraint case-insensitivity**
+      slice of 5.30.A.
+- [ ] **5.30.E — ORM compat + CAPABILITIES row** (~half day).
+      Diesel + Prisma + sqlx slice closed; CAPABILITIES.md citext
+      row marked shipped with the "no `CREATE EXTENSION citext;`
+      needed — always available" note.
+      Acceptance: closes the **ORM slice** of 5.30.A.
+
+## Phase 5.31 — Official Docker image + self-host quickstart (~1 week)
+
+Basin's pitch is "self-hostable Apache-2.0." Need a `docker pull
+basin/basin-server` + 5-minute quickstart so the self-host claim
+has a 30-second proof.
+
+**Test-first.** Multi-arch build + dockerised pgwire smoke +
+tag-publish flow battery lands red first (no published image
+exists); each impl sub-task flips a named slice green.
+
+- [ ] **5.31.A — Docker image + quickstart test harness**
+      (~1 day, lands first; lands red against current state — no
+      published image exists). Five layers:
+      (1) **Multi-arch build:** GHA matrix builds for `linux/amd64`
+      + `linux/arm64`; both produce a final image ≤ 100 MB.
+      (2) **5-min quickstart `docker run`:** a single `docker run`
+      command brings up a working pgwire endpoint reachable from
+      the host.
+      (3) **Dockerised psql smoke:** from a sidecar `postgres:16`
+      container, `psql` against the Basin image runs CREATE TABLE
+      / INSERT / SELECT round-trip cleanly.
+      (4) **Tag-publish to GHCR:** on a `v*` tag push, image lands
+      in `ghcr.io/bas-in/basin-server:<tag>` (+ `:latest` for
+      stable); cosign-signed.
+      (5) **Tag-publish to Docker Hub:** same flow to
+      `docker.io/basin/basin-server:<tag>`.
+      Files: `.github/workflows/docker-smoke.yml`,
+      `.github/workflows/docker-publish.yml`,
+      `tests/integration/scripts/docker-smoke.sh`.
+      Acceptance: harness compiles + reports red (no image yet).
+- [ ] **5.31.B — `Dockerfile` (multi-stage build, distroless or
+      alpine)** (~2 days). Rust builder stage + minimal runtime
+      base (`gcr.io/distroless/cc` or `alpine`). Final image ≤
+      100 MB. Health check via pgwire ping. ENV defaults:
+      `BASIN_BIND_ADDR=0.0.0.0:5432`, `BASIN_DATA_DIR=/var/basin`,
+      `BASIN_OBJECT_STORE=memory` (first-boot smoke).
+      Files: `Dockerfile` (engine repo root),
+      `.dockerignore` (engine repo root).
+      Acceptance: closes the **multi-arch build** +
+      **5-min quickstart `docker run`** + **dockerised psql smoke**
+      slices of 5.31.A.
+- [ ] **5.31.C — GHA workflow: build → test → publish to GHCR**
+      (~1 day, on tag). Multi-arch build via `docker/build-push-action`;
+      smoke step runs the docker-smoke.sh harness; on green +
+      `v*` tag, push to GHCR; cosign-sign.
+      Files: `.github/workflows/docker-publish.yml`.
+      Acceptance: closes the **tag-publish to GHCR** slice of
+      5.31.A after the next tag.
+- [ ] **5.31.D — Same to Docker Hub** (~half day). Mirror the
+      GHCR push job to `docker.io/basin/basin-server`; Docker Hub
+      access token in repo secrets.
+      Files: `.github/workflows/docker-publish.yml` (extend).
+      Acceptance: closes the **tag-publish to Docker Hub** slice
+      of 5.31.A.
+- [ ] **5.31.E — `docs/quickstart-docker.md` — 5-min
+      one-command setup** (~1-2 days). `docker run` line, connect
+      with psql, create a table, insert + select, run basin-cli
+      against it. Linked from README + basin.to/docs +
+      `docs/index`.
+      Files: `docs/quickstart-docker.md`.
+      Acceptance: a new engineer who has never seen Basin completes
+      the walkthrough in ≤ 10 min on a clean machine; full 5.31.A
+      harness goes green.
+
+## Phase 5.32 — Tutorial + 2 sample reference apps (~2 weeks)
+
+The landing page references a "first-app" tutorial; the actual
+walkthrough doesn't exist. Same for sample reference apps using
+the whole Basin surface — auth + RLS + realtime + functions +
+storage. Both docs and the sales motion benefit from "show me a
+complete app."
+
+**Test-first.** Tutorial + samples build-from-clean harness lands
+red first (apps don't exist yet); each impl sub-task flips a
+named slice green.
+
+- [ ] **5.32.A — Tutorial + samples clean-build test harness**
+      (~1 day, lands first; lands red until apps exist). Three
+      layers:
+      (1) **Tutorial steps execute top-to-bottom:** every command
+      in `docs/tutorial.md` runs cleanly from a fresh container
+      (no prior Basin state); each step's expected output asserted.
+      (2) **`examples/saas-starter/` builds + runs + tests:** from
+      a clean checkout, `npm ci && npm test && npm run dev` →
+      green tests + working app.
+      (3) **`examples/ai-rag-app/` builds + runs + tests:** same
+      shape for the RAG app.
+      Files: `.github/workflows/tutorial-and-samples.yml`,
+      `tests/integration/scripts/tutorial-smoke.sh`,
+      `tests/integration/scripts/sample-saas-starter-smoke.sh`,
+      `tests/integration/scripts/sample-ai-rag-app-smoke.sh`.
+      Acceptance: harness compiles + reports red.
+- [ ] **5.32.B — `docs/tutorial.md` — getting-started walkthrough
+      (CRUD + auth + first deployment)** (~3-5 days). 15-minute
+      walkthrough: `npm install @bas-in/basin-js`, sign up, create
+      project, schema (a few tables with RLS), auth signup +
+      signin, CRUD query from a tiny React/Vite frontend, first
+      deployment to basin-cloud. Files: `docs/tutorial.md`.
+      Acceptance: closes the **tutorial steps execute** slice of
+      5.32.A; engineer completes in ≤ 20 min on a clean machine.
+- [ ] **5.32.C — `examples/saas-starter/` — multi-tenant SaaS
+      reference app (Drizzle ORM + basin-auth + basin-rest +
+      RLS)** (~1 week). Full small SaaS (CRM-shaped or
+      todo-with-orgs): Drizzle ORM for schema/migrations,
+      basin-auth (signin + OAuth), RLS policies enforcing
+      per-tenant row visibility, basin-rest for the
+      auto-generated REST surface, storage for avatars.
+      Files: `examples/saas-starter/` (new directory tree).
+      Acceptance: closes the **`saas-starter` builds + runs +
+      tests** slice of 5.32.A.
+- [ ] **5.32.D — `examples/ai-rag-app/` — AI/RAG reference app
+      (basin-vector + chunks/embeddings/queries + basin-fn for
+      the inference call)** (~1 week). Document chunking +
+      embedding pipeline; basin-vector for similarity retrieval;
+      basin-fn (Wasm function) calls an inference endpoint and
+      streams the answer; minimal UI for the query loop.
+      Files: `examples/ai-rag-app/` (new directory tree).
+      Acceptance: closes the **`ai-rag-app` builds + runs + tests**
+      slice of 5.32.A; works against an OpenAI / Anthropic API key
+      provided via env.
+- [ ] **5.32.E — Cross-linked from README.md, docs/index,
+      CAPABILITIES.md** (~1 day). Every product entry point links
+      to the tutorial + both examples within one click. Files:
+      `README.md`, `docs/index.md`, `CAPABILITIES.md`.
+      Acceptance: link audit script (grep-based) finds the two
+      example dirs + tutorial in all three entry points.
+
 ## Phase 5.12 — Storage perf & Vortex (PR #161 / #162) — **shipped**
 
 See [ADR 0015](./docs/decisions/0015-vortex-storage-format.md). Vortex
