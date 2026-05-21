@@ -136,6 +136,114 @@ pub(crate) fn parse_statement_timeout(raw: Option<&str>) -> Option<std::time::Du
     }
 }
 
+/// Parse a SQL GUC-style `statement_timeout` value as set by
+/// `SET statement_timeout = <val>`.
+///
+/// Accepted forms (matching Postgres behaviour):
+/// * Bare integer — milliseconds: `5000`, `0`
+/// * Quoted string with unit suffix: `'5s'`, `'500ms'`, `'2min'`, `'1h'`,
+///   `'0'` (also bare integer strings like `'5000'` are accepted as ms)
+///
+/// Returns:
+/// * `Ok(None)` — timeout disabled (`0` / `'0'`)
+/// * `Ok(Some(d))` — effective timeout
+/// * `Err(…)` — unrecognised format
+pub(crate) fn parse_statement_timeout_guc(raw: &str) -> Result<Option<std::time::Duration>> {
+    let s = raw.trim().trim_matches('\'');
+    let s = s.trim();
+    if s == "0" || s.is_empty() {
+        return Ok(None);
+    }
+    // Try bare integer first (milliseconds).
+    if let Ok(ms) = s.parse::<u64>() {
+        return Ok(if ms == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(ms))
+        });
+    }
+    // Try string with unit suffix (case-insensitive).
+    // Walk backwards to split numeric prefix from unit suffix.
+    let (num_part, unit_part) = {
+        let idx = s
+            .find(|c: char| c.is_ascii_alphabetic())
+            .unwrap_or(s.len());
+        (&s[..idx], s[idx..].trim())
+    };
+    let count: f64 = num_part
+        .parse()
+        .map_err(|_| BasinError::InvalidSchema(format!("invalid statement_timeout value: {raw}")))?;
+    let ms = match unit_part.to_ascii_lowercase().as_str() {
+        "ms" | "msec" | "millisecond" | "milliseconds" => count,
+        "s" | "sec" | "second" | "seconds" => count * 1_000.0,
+        "min" | "minute" | "minutes" => count * 60_000.0,
+        "h" | "hour" | "hours" => count * 3_600_000.0,
+        other => {
+            return Err(BasinError::InvalidSchema(format!(
+                "invalid statement_timeout unit: {other}"
+            )));
+        }
+    };
+    let ms = ms as u64;
+    Ok(if ms == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_millis(ms))
+    })
+}
+
+/// Return the effective `statement_timeout` for `state`, honouring any
+/// per-session override set by `SET statement_timeout = …`.
+///
+/// Priority: per-session override (if set) → process-wide default
+/// (`BASIN_STATEMENT_TIMEOUT_MS` env / [`statement_timeout`]).
+pub(crate) fn session_statement_timeout(
+    state: &SessionState,
+) -> Option<std::time::Duration> {
+    let v = state
+        .statement_timeout_ms
+        .load(std::sync::atomic::Ordering::Relaxed);
+    match v {
+        -1 => statement_timeout(), // no per-session override
+        0 => None,                 // explicitly disabled
+        ms => Some(std::time::Duration::from_millis(ms as u64)),
+    }
+}
+
+/// Apply a `SET statement_timeout = <raw>` GUC to the session.
+///
+/// `raw` is the raw RHS string from the SQL statement (may include quotes).
+/// Returns `Err` on unrecognised format.
+pub(crate) fn set_statement_timeout(state: &SessionState, raw: &str) -> Result<()> {
+    let d = parse_statement_timeout_guc(raw)?;
+    let ms: i64 = match d {
+        None => 0,
+        Some(d) => d.as_millis().min(i64::MAX as u128) as i64,
+    };
+    state
+        .statement_timeout_ms
+        .store(ms, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// Return the current per-session `statement_timeout` as a Postgres-style
+/// string for `SHOW statement_timeout`.
+pub(crate) fn show_statement_timeout(state: &SessionState) -> String {
+    match session_statement_timeout(state) {
+        None => "0".to_string(),
+        Some(d) => {
+            let ms = d.as_millis();
+            if ms % 60_000 == 0 {
+                format!("{}min", ms / 60_000)
+            } else if ms % 1_000 == 0 {
+                format!("{}s", ms / 1_000)
+            } else {
+                format!("{}ms", ms)
+            }
+        }
+    }
+}
+
 /// Build the shared stateless UDF registry once at `Engine::new` time.
 ///
 /// Strategy: register all stateless UDFs into a throwaway `SessionContext`
@@ -318,6 +426,18 @@ pub(crate) struct SessionState {
     /// `tx_commit` / `tx_rollback`; all locks are released when the session
     /// is dropped (see `impl Drop for SessionState`).
     pub(crate) advisory: Arc<crate::advisory_lock::AdvisorySessionLocks>,
+    /// Per-session `statement_timeout` set by `SET statement_timeout = …`.
+    ///
+    /// Encoded as milliseconds in an `AtomicI64`:
+    /// * `-1` — no per-session override; use the process-wide default
+    ///   (`BASIN_STATEMENT_TIMEOUT_MS`).
+    /// * `0` — timeout disabled (Postgres semantics: `SET statement_timeout = 0`).
+    /// * `> 0` — the effective timeout in milliseconds.
+    ///
+    /// `AtomicI64` is `Send + Sync` and avoids a `Mutex` on the hot path
+    /// (a single 64-bit load with `Relaxed` ordering is sufficient — there
+    /// is no ordering relationship required with other fields).
+    pub(crate) statement_timeout_ms: std::sync::atomic::AtomicI64,
 }
 
 impl Drop for SessionState {
@@ -341,6 +461,8 @@ impl SessionState {
             pending_overriding: std::sync::Mutex::new(None),
             tx_state: std::sync::Mutex::new(TxState::default()),
             advisory: Arc::new(crate::advisory_lock::AdvisorySessionLocks::new()),
+            // -1 means "no per-session override; use process-wide default".
+            statement_timeout_ms: std::sync::atomic::AtomicI64::new(-1),
         }
     }
 }
@@ -1636,6 +1758,75 @@ mod tests {
         assert_eq!(
             parse_statement_timeout(Some("abc")),
             Some(Duration::from_millis(DEFAULT_STATEMENT_TIMEOUT_MS))
+        );
+    }
+
+    // ── parse_statement_timeout_guc (Bug #2 / SET statement_timeout wiring) ──
+
+    #[test]
+    fn guc_parse_bare_integer_ms() {
+        assert_eq!(
+            parse_statement_timeout_guc("5000").unwrap(),
+            Some(Duration::from_millis(5000))
+        );
+        assert_eq!(
+            parse_statement_timeout_guc("0").unwrap(),
+            None,
+            "0 means disabled"
+        );
+    }
+
+    #[test]
+    fn guc_parse_quoted_string_forms() {
+        assert_eq!(
+            parse_statement_timeout_guc("'5s'").unwrap(),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            parse_statement_timeout_guc("'500ms'").unwrap(),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(
+            parse_statement_timeout_guc("'2min'").unwrap(),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            parse_statement_timeout_guc("'0'").unwrap(),
+            None,
+            "'0' means disabled"
+        );
+    }
+
+    #[test]
+    fn guc_parse_unquoted_unit_forms() {
+        assert_eq!(
+            parse_statement_timeout_guc("1s").unwrap(),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            parse_statement_timeout_guc("1000ms").unwrap(),
+            Some(Duration::from_millis(1000))
+        );
+    }
+
+    #[test]
+    fn session_statement_timeout_per_session_override() {
+        let state = SessionState::new();
+        // Initially uses process-wide default (not -1 override testing here,
+        // just check that set/get round-trips work).
+        set_statement_timeout(&state, "2s").expect("set 2s");
+        assert_eq!(
+            session_statement_timeout(&state),
+            Some(Duration::from_secs(2))
+        );
+        // Zero disables.
+        set_statement_timeout(&state, "0").expect("set 0");
+        assert_eq!(session_statement_timeout(&state), None);
+        // Quoted ms form.
+        set_statement_timeout(&state, "'500ms'").expect("set 500ms");
+        assert_eq!(
+            session_statement_timeout(&state),
+            Some(Duration::from_millis(500))
         );
     }
 

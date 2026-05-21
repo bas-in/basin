@@ -104,6 +104,19 @@ pub(crate) fn register_pg_udfs(ctx: &SessionContext) {
             Volatility::Volatile,
         ),
     }));
+    // pg_sleep(seconds) — sleeps the given number of seconds and returns void.
+    // Accepts float8, float4, int8, int4 to match PG's flexible overloads.
+    ctx.register_udf(ScalarUDF::from(PgSleepUdf {
+        signature: Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Float64]),
+                TypeSignature::Exact(vec![DataType::Float32]),
+                TypeSignature::Exact(vec![DataType::Int64]),
+                TypeSignature::Exact(vec![DataType::Int32]),
+            ],
+            Volatility::Volatile,
+        ),
+    }));
 }
 
 /// Register the PG-compat scalar function set (Phase 5.11.A): `mod`, `age`,
@@ -721,6 +734,95 @@ fn extract_right_operand(s: &str, start: usize) -> (usize, usize) {
 // yields the same UUID for every row of a multi-row INSERT, which is why
 // `Volatile` is load-bearing here.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// pg_sleep(seconds float8) → void
+// ---------------------------------------------------------------------------
+// Postgres built-in that sleeps the given number of seconds and returns void.
+// The implementation blocks the calling thread via `std::thread::sleep` for the
+// requested duration. The outer `tokio::time::timeout` in `exec_select` can
+// interrupt it on the async path: because DataFusion evaluates UDFs within
+// async tasks that are `tokio::time::timeout`-wrapped at a higher level, and
+// the timeout drops the outer future causing the in-progress task to be
+// abandoned. On the non-shard path the sleep runs on a tokio worker thread;
+// on the shard path it runs inside `spawn_blocking` with its own runtime —
+// in both cases the overall execution budget is enforced at the `exec_select`
+// boundary.
+//
+// `pg_sleep` returns a Utf8 null scalar (Postgres returns void; we model void
+// as a single NULL string to give DataFusion a concrete type to work with).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct PgSleepUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for PgSleepUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "pg_sleep"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        // Postgres `pg_sleep` returns `void`; we model void as nullable Utf8.
+        Ok(DataType::Utf8)
+    }
+    #[allow(deprecated)]
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        use datafusion::arrow::array::StringArray;
+        let seconds = if let Some(first) = args.args.first() {
+            match first {
+                ColumnarValue::Scalar(s) => {
+                    let f = match s {
+                        datafusion::scalar::ScalarValue::Float64(Some(v)) => *v,
+                        datafusion::scalar::ScalarValue::Float32(Some(v)) => *v as f64,
+                        datafusion::scalar::ScalarValue::Int64(Some(v)) => *v as f64,
+                        datafusion::scalar::ScalarValue::Int32(Some(v)) => *v as f64,
+                        datafusion::scalar::ScalarValue::Float64(None)
+                        | datafusion::scalar::ScalarValue::Float32(None)
+                        | datafusion::scalar::ScalarValue::Int64(None)
+                        | datafusion::scalar::ScalarValue::Int32(None) => 0.0,
+                        other => {
+                            return datafusion::common::exec_err!(
+                                "pg_sleep: unsupported argument type {:?}",
+                                other
+                            );
+                        }
+                    };
+                    f
+                }
+                ColumnarValue::Array(arr) => {
+                    // For array inputs take the first element's value.
+                    use datafusion::arrow::array::{Float64Array, Int64Array};
+                    if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
+                        if arr.len() > 0 && !a.is_null(0) { a.value(0) } else { 0.0 }
+                    } else if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
+                        if arr.len() > 0 && !a.is_null(0) { a.value(0) as f64 } else { 0.0 }
+                    } else {
+                        0.0
+                    }
+                }
+            }
+        } else {
+            0.0
+        };
+
+        if seconds > 0.0 {
+            let dur = std::time::Duration::from_secs_f64(seconds);
+            std::thread::sleep(dur);
+        }
+
+        // Return one NULL row (void semantics).
+        let nrows = args.number_rows.max(1);
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![None::<&str>; nrows]));
+        Ok(ColumnarValue::Array(arr))
+    }
+}
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct GenRandomUuid {

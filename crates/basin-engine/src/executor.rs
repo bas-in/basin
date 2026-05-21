@@ -7332,3 +7332,122 @@ mod jsonb_srf_expansion_tests {
         );
     }
 }
+
+/// Tests for Bug #2 (SET statement_timeout wiring) and pg_sleep registration.
+#[cfg(test)]
+mod statement_timeout_guc_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use basin_catalog::{Catalog, InMemoryCatalog};
+    use basin_common::ProjectId;
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    use crate::{Engine, EngineConfig, ExecResult};
+
+    fn make_engine(dir: &TempDir) -> Engine {
+        let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
+            object_store: Arc::new(fs),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+        Engine::new(EngineConfig { storage, catalog, shard: None })
+    }
+
+    /// `SET statement_timeout = '5s'` must be accepted and stored on the session.
+    #[tokio::test]
+    async fn set_statement_timeout_string_form() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("SET statement_timeout = '5s'")
+            .await
+            .expect("SET statement_timeout '5s' must succeed");
+        assert_eq!(
+            crate::session::session_statement_timeout(&sess.state),
+            Some(Duration::from_secs(5)),
+            "session timeout should be 5 s after SET"
+        );
+    }
+
+    /// `SET statement_timeout = 5000` (bare integer milliseconds) must work.
+    #[tokio::test]
+    async fn set_statement_timeout_integer_form() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("SET statement_timeout = 5000")
+            .await
+            .expect("SET statement_timeout 5000 must succeed");
+        assert_eq!(
+            crate::session::session_statement_timeout(&sess.state),
+            Some(Duration::from_millis(5000))
+        );
+    }
+
+    /// `SET statement_timeout = 0` disables the timeout (Postgres semantics).
+    #[tokio::test]
+    async fn set_statement_timeout_zero_disables() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("SET statement_timeout = 0")
+            .await
+            .expect("SET statement_timeout 0 must succeed");
+        assert_eq!(
+            crate::session::session_statement_timeout(&sess.state),
+            None,
+            "timeout should be disabled after SET statement_timeout = 0"
+        );
+    }
+
+    /// `SHOW statement_timeout` reflects the value set by `SET`.
+    #[tokio::test]
+    async fn show_statement_timeout_reflects_set() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("SET statement_timeout = '500ms'")
+            .await
+            .unwrap();
+        let res = sess
+            .execute("SHOW statement_timeout")
+            .await
+            .expect("SHOW statement_timeout must succeed");
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                assert!(!batches.is_empty(), "expected at least one batch");
+                let batch = &batches[0];
+                let col = batch
+                    .column_by_name("statement_timeout")
+                    .expect("column statement_timeout");
+                use arrow_array::StringArray;
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("Utf8 column");
+                let val = arr.value(0);
+                assert_eq!(val, "500ms", "SHOW should reflect 500ms");
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    /// `pg_sleep` is registered — `SELECT pg_sleep(0)` must not error.
+    #[tokio::test]
+    async fn pg_sleep_is_registered() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        // pg_sleep(0) must succeed without sleeping.
+        let res = sess
+            .execute("SELECT pg_sleep(0)")
+            .await
+            .expect("pg_sleep(0) must be registered and callable");
+        assert!(matches!(res, ExecResult::Rows { .. }), "expected Rows result");
+    }
+}

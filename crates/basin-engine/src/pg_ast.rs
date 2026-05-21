@@ -277,6 +277,97 @@ impl StmtKind {
     }
 }
 
+/// Maximum parenthesis/expression nesting depth accepted by the parser.
+///
+/// libpg_query and sqlparser both implement recursive descent: deeply nested
+/// parentheses cause stack growth proportional to depth. At ~10 000 levels the
+/// process receives SIGABRT (stack overflow) — a remote DoS. We pre-scan the
+/// SQL string before calling either parser and reject early with a clean parse
+/// error once depth exceeds this bound. 1000 is deep enough for any real query
+/// and orders of magnitude below the stack limit (typ. ~4 000 frames).
+const MAX_PARSE_DEPTH: u32 = 1000;
+
+/// Pre-scan `sql` and count the maximum parenthesis nesting depth, ignoring
+/// parens inside string literals and comments. Returns `Err` if depth exceeds
+/// [`MAX_PARSE_DEPTH`].
+fn check_parse_depth(sql: &str) -> Result<()> {
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut depth: u32 = 0;
+    let mut i = 0;
+    while i < len {
+        match bytes[i] {
+            // Skip single-quoted string literals (including `''` escapes).
+            b'\'' => {
+                i += 1;
+                while i < len {
+                    if bytes[i] == b'\'' {
+                        i += 1;
+                        // `''` is an escaped quote — keep scanning.
+                        if i < len && bytes[i] == b'\'' {
+                            i += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            // Skip double-quoted identifiers.
+            b'"' => {
+                i += 1;
+                while i < len {
+                    if bytes[i] == b'"' {
+                        i += 1;
+                        if i < len && bytes[i] == b'"' {
+                            i += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            // Skip `--` line comments.
+            b'-' if i + 1 < len && bytes[i + 1] == b'-' => {
+                i += 2;
+                while i < len && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            // Skip `/* */` block comments (non-nested for speed).
+            b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < len {
+                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'(' => {
+                depth += 1;
+                if depth > MAX_PARSE_DEPTH {
+                    return Err(BasinError::InvalidSchema(format!(
+                        "pg_query parse error (SQLSTATE 42601): \
+                         query nesting depth exceeds maximum ({MAX_PARSE_DEPTH})"
+                    )));
+                }
+                i += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Parse `sql` with libpg_query (the real Postgres parser).
 ///
 /// Maps `pg_query::Error::Parse(_)` to [`BasinError::InvalidSchema`],
@@ -289,7 +380,13 @@ impl StmtKind {
 /// renders [`BasinError::InvalidSchema`] under that class today; once
 /// ADR 0014 lands a dedicated `BasinError::Parse` variant Phase 2 will
 /// switch over.
+///
+/// A recursion-depth guard ([`check_parse_depth`]) is applied before handing
+/// the SQL to libpg_query. Queries with more than [`MAX_PARSE_DEPTH`] nested
+/// parentheses are rejected with a clean parse error rather than overflowing
+/// the stack (remote DoS protection, SQLSTATE 42601).
 pub fn parse(sql: &str) -> Result<ParseTree> {
+    check_parse_depth(sql)?;
     match pg_query::parse(sql) {
         Ok(result) => Ok(ParseTree(result.protobuf)),
         Err(pg_query::Error::Parse(msg)) => Err(BasinError::InvalidSchema(format!(
@@ -1826,6 +1923,54 @@ mod tests {
             }
             other => panic!("expected FeatureNotSupported, got {other:?}"),
         }
+    }
+
+    // ── parser recursion-depth guard (Bug #1 / sec_parser_dos) ──────────────
+
+    #[test]
+    fn deeply_nested_parens_returns_err_not_panic() {
+        // 1001 nested parens: SELECT (((...1001 times...))) — must return Err,
+        // never panic / SIGABRT.
+        let mut sql = "SELECT ".to_string();
+        for _ in 0..1001 {
+            sql.push('(');
+        }
+        sql.push('1');
+        for _ in 0..1001 {
+            sql.push(')');
+        }
+        let err = parse(&sql).expect_err("over-depth query must be rejected");
+        match err {
+            BasinError::InvalidSchema(msg) => {
+                assert!(
+                    msg.contains("42601") && msg.contains("nesting depth"),
+                    "expected parse error about nesting depth, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidSchema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn moderately_nested_parens_accepted() {
+        // 999 levels — just under the guard — must parse fine.
+        let mut sql = "SELECT ".to_string();
+        for _ in 0..999 {
+            sql.push('(');
+        }
+        sql.push('1');
+        for _ in 0..999 {
+            sql.push(')');
+        }
+        parse(&sql).expect("999-level nesting must be accepted");
+    }
+
+    #[test]
+    fn parens_inside_string_literal_ignored_by_depth_guard() {
+        // 2000 parens inside a string literal must not trip the depth guard.
+        let inner: String = "(".repeat(2000);
+        let sql = format!("SELECT '{inner}'");
+        parse(&sql).expect("parens inside string literal must not count toward depth");
     }
 }
 

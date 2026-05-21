@@ -236,7 +236,7 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
                 .trim_start()
                 .trim_start_matches("SESSION")
                 .trim_start();
-            if after_set.starts_with("SEARCH_PATH") {
+            if after_set.starts_with("SEARCH_PATH") || after_set.starts_with("STATEMENT_TIMEOUT") {
                 None // Let the real executor handler fire.
             } else {
                 Some(ExecResult::Empty { tag: "SET".into() })
@@ -250,7 +250,10 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
         StmtKind::VariableShow => {
             let trimmed = sql.trim().to_ascii_uppercase();
             let trimmed = trimmed.trim_end_matches(';').trim_end();
-            if trimmed == "SHOW TABLES" || trimmed == "SHOW SEARCH_PATH" {
+            if trimmed == "SHOW TABLES"
+                || trimmed == "SHOW SEARCH_PATH"
+                || trimmed == "SHOW STATEMENT_TIMEOUT"
+            {
                 None
             } else {
                 Some(ExecResult::Empty { tag: "SHOW".into() })
