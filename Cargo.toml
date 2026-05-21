@@ -197,5 +197,14 @@ debug = 1
 debug = 0
 strip = true
 
+# Same per-package trick for dev/test: each integration test compiles to its
+# own statically-linked binary including the full workspace dep tree. With
+# cargo's default `debug = 2`, each is ~426 MB; ~80 binaries = ~34 GB of
+# duplicated debug symbols on disk. Dropping to line-tables-only (`debug = 1`)
+# keeps stack-trace file:line for test failures but loses the variable-
+# inspection sections, shrinking each binary to ~80-150 MB.
+[profile.dev.package.basin-integration-tests]
+debug = 1
+
 [profile.bench]
 lto = "thin"
