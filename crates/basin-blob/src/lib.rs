@@ -23,12 +23,14 @@
 pub mod error;
 pub mod model;
 pub mod paths;
+pub mod postgres;
 pub mod rls;
 pub mod store;
 
 pub use error::{BlobError, Result};
 pub use model::{Bucket, BucketId, Object, ObjectId};
+pub use postgres::PostgresBlobCatalog;
 pub use rls::{
     CallerCtx, ObjectPolicy, ObjectPolicyCommand, ObjectRlsStore, ObjectUsing,
 };
-pub use store::BlobStore;
+pub use store::{BlobCatalog, BlobStore};

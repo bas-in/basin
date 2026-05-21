@@ -11,7 +11,7 @@
 //! DELETE /storage/v1/object/:bucket                  — bulk delete (prefixes[] in body; JWT required)
 //! POST   /storage/v1/bucket                          — create bucket
 //! GET    /storage/v1/bucket/:name                    — get bucket metadata
-//! DELETE /storage/v1/bucket/:name                    — delete bucket (stub)
+//! DELETE /storage/v1/bucket/:name                    — delete bucket + purge objects
 //! ```
 //!
 //! ## Auth seam
@@ -26,9 +26,10 @@
 //!
 //! ## Persistence
 //!
-//! `BlobStore<InMemoryBlobCatalog>` is used as the catalog backend.
-//! // TODO 5.17.A-followup: catalog-backed BlobCatalog — swap InMemoryBlobCatalog
-//! //      for a Postgres-backed implementation once the catalog migration ships.
+//! The catalog backend is chosen at construction (`BlobStore<Arc<dyn BlobCatalog>>`):
+//! a durable `PostgresBlobCatalog` when `BASIN_BLOB_PG_URL` is set (the only
+//! correct backend for multi-replica deployments — closes #54 P0), otherwise an
+//! in-memory catalog for tests / single-process dev.
 //!
 //! ## MIME sniffing
 //!
@@ -180,6 +181,7 @@ fn blob_err_to_api(e: BlobError) -> ApiError {
         }
         BlobError::ObjectStore(e) => ApiError::internal(format!("object store error: {e}")),
         BlobError::Serde(e) => ApiError::invalid(format!("serialisation error: {e}")),
+        BlobError::Catalog(msg) => ApiError::internal(format!("blob catalog error: {msg}")),
     }
 }
 
@@ -244,23 +246,30 @@ pub(crate) async fn get_bucket(
     Ok(Json(resp).into_response())
 }
 
-/// `DELETE /storage/v1/bucket/:name` — delete a bucket (stub; contents not purged in 5.17.B).
+/// `DELETE /storage/v1/bucket/:name` — delete a bucket and purge all of its
+/// object bytes from `object_store` (closes #54 P0 — DELETE bucket no longer
+/// leaks orphaned blobs).
 #[axum::debug_handler]
 pub(crate) async fn delete_bucket(
     State(state): State<Arc<Inner>>,
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Response, ApiError> {
-    let _claims = authorize(&state, &headers).await?;
-    // Confirm the bucket exists (returns 404 if not).
-    let _project = _claims.project_id;
-    let _bucket = state
+    let claims = authorize(&state, &headers).await?;
+    let project = claims.project_id;
+    // Drop the bucket + every object row and purge each object's bytes from
+    // object_store. Closes the #54 P0 leak where DELETE bucket left orphaned
+    // blobs behind. Returns 404 if the bucket does not exist.
+    let purged = state
         .blob_store
-        .get_bucket(&_project, &name)
+        .delete_bucket(&project, &name)
         .await
         .map_err(blob_err_to_api)?;
-    // TODO 5.17.B-followup: purge all objects in the bucket from the catalog + object_store.
-    Ok((StatusCode::OK, Json(json!({"message": "bucket deleted"}))).into_response())
+    Ok((
+        StatusCode::OK,
+        Json(json!({"message": "bucket deleted", "objects_purged": purged})),
+    )
+        .into_response())
 }
 
 // ---------------------------------------------------------------------------

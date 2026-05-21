@@ -18,7 +18,8 @@ use axum::http::header::{HeaderName, AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, Method};
 use axum::routing::{any, get, post, Router};
 use basin_auth::Claims;
-use basin_blob::store::{BlobStore, InMemoryBlobCatalog};
+use basin_blob::store::{BlobCatalog, BlobStore, InMemoryBlobCatalog};
+use basin_blob::PostgresBlobCatalog;
 use basin_common::Result;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -39,14 +40,18 @@ use crate::RestConfig;
 pub(crate) struct Inner {
     pub(crate) cfg: RestConfig,
     pub(crate) rate_limiter: basin_auth::rate_limit::PerKey,
-    /// In-process blob store backed by an in-memory catalog.
+    /// Blob store. The catalog backend is chosen at construction time:
     ///
-    /// // TODO 5.17.A-followup: catalog-backed BlobCatalog — swap
-    /// //      InMemoryBlobCatalog for a Postgres-backed implementation once
-    /// //      the catalog migration ships.  For now the object bytes go to
-    /// //      the same object_store as the engine; the catalog metadata lives
-    /// //      only in-process.
-    pub(crate) blob_store: BlobStore<InMemoryBlobCatalog>,
+    /// - **Postgres** (`PostgresBlobCatalog`) when `BASIN_BLOB_PG_URL` is set
+    ///   (or via [`RestService::new_async`]). This is the only correct backend
+    ///   for multi-replica deployments — metadata is durable across restarts
+    ///   and shared by every replica (closes #54 P0).
+    /// - **In-memory** (`InMemoryBlobCatalog`) otherwise — tests and
+    ///   single-process dev only. Per-process, lost on restart.
+    ///
+    /// Held as `Arc<dyn BlobCatalog>` so the runtime choice doesn't leak into
+    /// every call site as a generic parameter.
+    pub(crate) blob_store: BlobStore<Arc<dyn BlobCatalog>>,
     /// Phase 6.X.D — optional coordinator-handed slice gate for the
     /// per-project `RestQps` cap (ADR 0023). When attached, every authed
     /// request consumes one token from the slice for
@@ -59,20 +64,69 @@ pub(crate) struct Inner {
     pub(crate) function_registry: admin_fn_routes::FunctionRegistry,
 }
 
+/// Env var holding the Postgres connection string for the durable blob
+/// catalog. When set, [`Inner::from_config_async`] backs the blob store with
+/// [`PostgresBlobCatalog`]; otherwise it falls back to the in-memory catalog
+/// (tests / single-process dev only).
+pub(crate) const BLOB_PG_URL_ENV: &str = "BASIN_BLOB_PG_URL";
+/// Env var overriding the Postgres schema for blob catalog tables.
+pub(crate) const BLOB_PG_SCHEMA_ENV: &str = "BASIN_BLOB_PG_SCHEMA";
+
 impl Inner {
+    /// Synchronous constructor — always backs the blob store with the
+    /// in-memory catalog. Suitable for tests and single-process dev. For
+    /// multi-replica deployments use [`Inner::from_config_async`], which honors
+    /// `BASIN_BLOB_PG_URL` and connects a durable Postgres catalog.
     pub(crate) fn from_config(cfg: RestConfig) -> Self {
+        let catalog: Arc<dyn BlobCatalog> = InMemoryBlobCatalog::arc();
+        Self::build(cfg, catalog)
+    }
+
+    /// Async constructor — selects the catalog backend from the environment.
+    ///
+    /// If `BASIN_BLOB_PG_URL` is set, connects a [`PostgresBlobCatalog`]
+    /// (durable, multi-replica safe; closes #54 P0). Otherwise falls back to
+    /// the in-memory catalog. Connection / migration failures are surfaced as
+    /// an error so a misconfigured deployment fails loudly rather than
+    /// silently degrading to per-process metadata.
+    pub(crate) async fn from_config_async(cfg: RestConfig) -> Result<Self> {
+        let catalog: Arc<dyn BlobCatalog> = match std::env::var(BLOB_PG_URL_ENV) {
+            Ok(url) if !url.trim().is_empty() => {
+                let pg = match std::env::var(BLOB_PG_SCHEMA_ENV) {
+                    Ok(schema) if !schema.trim().is_empty() => {
+                        PostgresBlobCatalog::connect_with_schema(&url, &schema).await
+                    }
+                    _ => PostgresBlobCatalog::connect(&url).await,
+                }
+                .map_err(|e| {
+                    basin_common::BasinError::Internal(format!(
+                        "blob catalog connect ({BLOB_PG_URL_ENV}): {e}"
+                    ))
+                })?;
+                tracing::info!("blob catalog: Postgres-backed (durable, multi-replica)");
+                Arc::new(pg)
+            }
+            _ => {
+                tracing::warn!(
+                    "blob catalog: in-memory (per-process, lost on restart). \
+                     Set {BLOB_PG_URL_ENV} for a durable multi-replica catalog."
+                );
+                InMemoryBlobCatalog::arc()
+            }
+        };
+        Ok(Self::build(cfg, catalog))
+    }
+
+    fn build(cfg: RestConfig, blob_catalog: Arc<dyn BlobCatalog>) -> Self {
         // governor's `Quota::per_minute` is the closest fit; we want
         // requests-per-second to translate to "burst N then refill". 60×N per
         // minute matches the requested rate.
         let rate = cfg.rate_limit_per_sec.saturating_mul(60).max(1);
 
         // Build the blob store from the engine's object_store so blob bytes
-        // land in the same backend as engine table data.  The catalog layer is
-        // in-memory for 5.17.B; swap for a Postgres-backed BlobCatalog in the
-        // 5.17.A-followup.
+        // land in the same backend as engine table data.
         let blob_obj_store = cfg.engine.config().storage.object_store_handle();
-        let blob_catalog = InMemoryBlobCatalog::arc();
-        let blob_store = BlobStore::new(blob_catalog, blob_obj_store, None);
+        let blob_store = BlobStore::new(Arc::new(blob_catalog), blob_obj_store, None);
 
         Self {
             rate_limiter: basin_auth::rate_limit::PerKey::per_minute(rate, "rest_per_project"),

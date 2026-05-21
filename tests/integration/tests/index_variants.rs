@@ -249,27 +249,34 @@ async fn create_index_if_not_exists_idempotent() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Edge: UNIQUE + partial + expression combined
+// Edge: UNIQUE + partial — loud-rejected (uniqueness not enforced for partial)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn unique_partial_index_combined_accepted() {
+async fn unique_partial_index_combined_rejected() {
     let dir = TempDir::new().unwrap();
     let sess = setup(&dir, "CREATE TABLE t (id INT NOT NULL, active BOOLEAN)").await;
 
-    let res = sess
+    // A partial UNIQUE index cannot be enforced by Basin's plain-column unique
+    // machinery; silently accepting it as metadata would break the uniqueness
+    // contract, so it must fail loudly at DDL time.
+    let err = sess
         .execute("CREATE UNIQUE INDEX idx ON t(id) WHERE active = true")
         .await
-        .expect("UNIQUE partial index should be accepted");
-    assert_empty(res, "CREATE INDEX");
+        .expect_err("partial UNIQUE index must be rejected, not silently accepted");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not yet enforced") && msg.contains("plain-column UNIQUE"),
+        "expected loud-reject for partial UNIQUE, got: {msg}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Edge: multi-column with INCLUDE (covering index)
+// Edge: multi-column UNIQUE with INCLUDE — loud-rejected (covering cols not enforced)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn multi_column_with_include_accepted() {
+async fn multi_column_with_include_rejected() {
     let dir = TempDir::new().unwrap();
     let sess = setup(
         &dir,
@@ -277,9 +284,41 @@ async fn multi_column_with_include_accepted() {
     )
     .await;
 
-    let res = sess
+    let err = sess
         .execute("CREATE UNIQUE INDEX idx ON t (a, b) INCLUDE (c, d)")
         .await
-        .expect("multi-column UNIQUE index with INCLUDE should be accepted");
+        .expect_err("UNIQUE index with INCLUDE must be rejected, not silently accepted");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not yet enforced") && msg.contains("plain-column UNIQUE"),
+        "expected loud-reject for UNIQUE … INCLUDE, got: {msg}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Edge: non-unique INCLUDE / partial indexes remain accepted as metadata
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn non_unique_partial_and_include_still_accepted() {
+    let dir = TempDir::new().unwrap();
+    let sess = setup(
+        &dir,
+        "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, c TEXT)",
+    )
+    .await;
+
+    // Non-unique partial index: only a performance hint, correctness preserved.
+    let res = sess
+        .execute("CREATE INDEX p ON t(a) WHERE b > 0")
+        .await
+        .expect("non-unique partial index should still be accepted");
+    assert_empty(res, "CREATE INDEX");
+
+    // Non-unique INCLUDE: covering-column hint, also fine to accept.
+    let res = sess
+        .execute("CREATE INDEX cov ON t (a) INCLUDE (c)")
+        .await
+        .expect("non-unique INCLUDE index should still be accepted");
     assert_empty(res, "CREATE INDEX");
 }

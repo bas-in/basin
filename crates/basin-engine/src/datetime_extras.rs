@@ -86,7 +86,7 @@ pub(crate) fn register_datetime_extras(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(ArraysOverlapUdf {
         signature: Signature::any(2, Volatility::Immutable),
     }));
-    // int4multirange(r1, r2, ...) — stub returning text of first arg
+    // int4multirange(r1, r2, ...) — builds canonical {[l,u),…} from range args
     ctx.register_udf(ScalarUDF::from(Int4MultirangeUdf {
         signature: Signature::variadic_any(Volatility::Immutable),
     }));
@@ -543,8 +543,38 @@ impl ScalarUDFImpl for ArraysOverlapUdf {
 
 // ── int4multirange ────────────────────────────────────────────────────────────
 
-/// `int4multirange(r1, r2, ...)` — PG multirange constructor. Stub returning
-/// a text representation of the multirange for v0.1.
+/// Render one range value (stored as the range-UDF JSON form
+/// `{"l":..,"u":..,"li":bool,"ui":bool}`) to PostgreSQL's canonical range text,
+/// e.g. `[1,5)`. Returns `None` if the value is not a parseable range object.
+fn render_range_to_pg_text(s: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(s).ok()?;
+    let obj = v.as_object()?;
+    // Empty range marker: PG renders it as `empty`.
+    if obj.get("empty").and_then(|e| e.as_bool()) == Some(true) {
+        return Some("empty".to_string());
+    }
+    let bound_text = |val: Option<&serde_json::Value>| -> String {
+        match val {
+            None | Some(serde_json::Value::Null) => String::new(),
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(other) => other.to_string(),
+        }
+    };
+    let l = bound_text(obj.get("l"));
+    let u = bound_text(obj.get("u"));
+    let li = obj.get("li").and_then(|b| b.as_bool()).unwrap_or(true);
+    let ui = obj.get("ui").and_then(|b| b.as_bool()).unwrap_or(false);
+    let open = if li { '[' } else { '(' };
+    let close = if ui { ']' } else { ')' };
+    Some(format!("{open}{l},{u}{close}"))
+}
+
+/// `int4multirange(r1, r2, ...)` — PG multirange constructor. Builds the
+/// canonical `{[l1,u1),[l2,u2),…}` text from its range arguments. Each argument
+/// is a range value produced by a range constructor (`int4range`, …) stored as
+/// JSON; bounds and inclusivity are preserved per-range. Empty `int4multirange()`
+/// yields `{}`. This is the constructor only — multirange set operations and the
+/// `@>`/`&&` operators over multiranges are Phase 5.24 and not implemented here.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct Int4MultirangeUdf {
     signature: Signature,
@@ -573,8 +603,52 @@ impl ScalarUDFImpl for Int4MultirangeUdf {
             })
             .max()
             .unwrap_or(1);
-        // Stub: return a placeholder multirange string.
-        let out: Vec<Option<String>> = (0..n).map(|_| Some("{[,)}".to_string())).collect();
+
+        // Materialise each range argument as a Utf8 array of its JSON form.
+        let mut cols: Vec<StringArray> = Vec::with_capacity(args.len());
+        for a in args {
+            let arr = a.clone().into_array(n)?;
+            let arr = if arr.data_type() == &DataType::Utf8 {
+                arr
+            } else {
+                datafusion::arrow::compute::cast(&arr, &DataType::Utf8)?
+            };
+            cols.push(
+                arr.as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("cast to Utf8 yields StringArray")
+                    .clone(),
+            );
+        }
+
+        let mut out: Vec<Option<String>> = Vec::with_capacity(n);
+        for row in 0..n {
+            // A multirange is the ordered set of its non-null member ranges.
+            let mut parts: Vec<String> = Vec::with_capacity(cols.len());
+            let mut null_arg = false;
+            for col in &cols {
+                if col.is_null(row) {
+                    null_arg = true;
+                    break;
+                }
+                match render_range_to_pg_text(col.value(row)) {
+                    // `empty` member ranges contribute nothing to the multirange.
+                    Some(t) if t == "empty" => {}
+                    Some(t) => parts.push(t),
+                    None => {
+                        return exec_err!(
+                            "int4multirange: argument {:?} is not a valid range value",
+                            col.value(row)
+                        );
+                    }
+                }
+            }
+            if null_arg {
+                out.push(None);
+            } else {
+                out.push(Some(format!("{{{}}}", parts.join(","))));
+            }
+        }
         Ok(ColumnarValue::Array(Arc::new(StringArray::from(out))))
     }
 }
@@ -663,5 +737,36 @@ mod tests {
         let sql = "SELECT '2024-01-01'::date";
         let out = rewrite_infinity_timestamp(sql);
         assert_eq!(out, sql);
+    }
+
+    #[test]
+    fn render_range_default_bounds() {
+        // int4range(1,5) stores [1,5).
+        let json = r#"{"l":1,"u":5,"li":true,"ui":false}"#;
+        assert_eq!(render_range_to_pg_text(json).as_deref(), Some("[1,5)"));
+    }
+
+    #[test]
+    fn render_range_inclusive_upper() {
+        let json = r#"{"l":1,"u":5,"li":true,"ui":true}"#;
+        assert_eq!(render_range_to_pg_text(json).as_deref(), Some("[1,5]"));
+    }
+
+    #[test]
+    fn render_range_unbounded_lower() {
+        let json = r#"{"l":null,"u":5,"li":false,"ui":false}"#;
+        assert_eq!(render_range_to_pg_text(json).as_deref(), Some("(,5)"));
+    }
+
+    #[test]
+    fn render_range_empty_marker() {
+        let json = r#"{"empty":true}"#;
+        assert_eq!(render_range_to_pg_text(json).as_deref(), Some("empty"));
+    }
+
+    #[test]
+    fn render_range_rejects_non_range() {
+        assert_eq!(render_range_to_pg_text("not json"), None);
+        assert_eq!(render_range_to_pg_text("[1,2,3]"), None);
     }
 }

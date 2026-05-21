@@ -64,15 +64,6 @@ pub(crate) fn log_metadata_only_notice(index_name: &str, table_name: &str) {
     );
 }
 
-/// Emit a notice when a UNIQUE index is accepted without enforcement.
-pub(crate) fn log_unique_notice(index_name: &str) {
-    info!(
-        index = %index_name,
-        "CREATE UNIQUE INDEX: uniqueness is not enforced in v0.1 \
-         (declare UNIQUE on the table for enforcement); accepted as metadata."
-    );
-}
-
 /// Emit a notice when a partial-index predicate is accepted as metadata.
 pub(crate) fn log_partial_index_notice(index_name: &str, predicate: &str) {
     info!(

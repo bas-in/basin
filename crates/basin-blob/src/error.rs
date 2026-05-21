@@ -39,4 +39,10 @@ pub enum BlobError {
     /// Serialisation / deserialisation error (metadata JSON).
     #[error("serde error: {0}")]
     Serde(#[from] serde_json::Error),
+
+    /// An error from the Postgres-backed catalog (connection, query, or
+    /// migration failure).  Carries a human-readable message; the HTTP layer
+    /// maps this to a 500.
+    #[error("blob catalog error: {0}")]
+    Catalog(String),
 }

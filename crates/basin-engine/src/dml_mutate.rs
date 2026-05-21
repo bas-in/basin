@@ -215,6 +215,51 @@ pub(crate) async fn resolve_subqueries_in_expr(sess: &ProjectSession, expr: Expr
     }
 }
 
+/// Parse a SQL boolean expression fragment (no leading `WHERE`) into a
+/// sqlparser `Expr` by wrapping it in `SELECT <fragment>` and extracting the
+/// projection. Used by the RLS USING-merge path in `exec_delete` to fold a
+/// policy-built predicate string into the user's WHERE before per-file
+/// predicate evaluation. Returns `InvalidSchema` if the fragment fails to
+/// parse — that would indicate a malformed policy USING clause stored in the
+/// catalog, which is a user-facing schema issue, not an internal bug.
+fn parse_sql_expr_fragment(fragment: &str) -> Result<Expr> {
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+    let probe = format!("SELECT {fragment}");
+    let mut stmts = Parser::parse_sql(&PostgreSqlDialect {}, &probe).map_err(|e| {
+        BasinError::InvalidSchema(format!("could not parse RLS USING fragment {fragment:?}: {e}"))
+    })?;
+    let stmt = stmts.pop().ok_or_else(|| {
+        BasinError::internal(format!("empty parse result for RLS fragment {fragment:?}"))
+    })?;
+    let query = match stmt {
+        sqlparser::ast::Statement::Query(q) => q,
+        other => {
+            return Err(BasinError::internal(format!(
+                "RLS fragment did not parse as Query: {other:?}"
+            )));
+        }
+    };
+    let select = match *query.body {
+        sqlparser::ast::SetExpr::Select(s) => s,
+        other => {
+            return Err(BasinError::internal(format!(
+                "RLS fragment body not a SELECT: {other:?}"
+            )));
+        }
+    };
+    let item = select.projection.into_iter().next().ok_or_else(|| {
+        BasinError::internal(format!("RLS fragment {fragment:?} produced no projection"))
+    })?;
+    match item {
+        sqlparser::ast::SelectItem::UnnamedExpr(e) => Ok(e),
+        sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } => Ok(expr),
+        other => Err(BasinError::internal(format!(
+            "RLS fragment projection not an Expr: {other:?}"
+        ))),
+    }
+}
+
 /// Convert a single cell from an Arrow array column into a sqlparser `Expr`
 /// literal. Supports Int16/Int32/Int64, Float32/Float64, Utf8, Boolean.
 ///
@@ -377,7 +422,6 @@ pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result
         None => None,
         Some(e) => Some(resolve_subqueries_in_expr(sess, e).await?),
     };
-    let predicate_expr = resolved_selection.as_ref();
 
     // Refuse the easy-foot-gun multi-table DELETE / DELETE with USING for now
     // — they're not on the v0.1 surface and silently picking one would risk
@@ -403,6 +447,39 @@ pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result
         .load_table(&sess.project, &table)
         .await?;
     let schema = meta.schema.clone();
+
+    // RLS USING enforcement on DELETE (P0 #56 fix). UPDATE's exec_update
+    // already enforces RLS WITH CHECK on the post-SET image, which trips
+    // when an UPDATE-without-WHERE tries to overwrite a row the current
+    // user doesn't own. DELETE has no post-image, so without this guard a
+    // `DELETE FROM t` issued by user A would drop every row in the file,
+    // including ones policy-owned by B — bypassing RLS entirely.
+    //
+    // We mirror the SELECT path semantically: load the table's policies,
+    // combine the applicable USING predicates (permissive → OR), and AND
+    // the result into the user's WHERE before parsing the compound
+    // predicate. With no applicable policy under rls_enabled, the helper
+    // returns `(FALSE)` (Postgres default-deny). When rls is disabled it
+    // returns `None` and the existing fast path is untouched.
+    let rls_using_sql = crate::rls::build_using_predicate_sql_for_kind(
+        meta.rls_enabled,
+        &meta.policies,
+        &sess.current_user,
+        basin_catalog::PolicyCommand::Delete,
+    );
+    let effective_selection: Option<Expr> = match (resolved_selection, rls_using_sql) {
+        (sel, None) => sel,
+        (None, Some(rls_sql)) => Some(parse_sql_expr_fragment(&rls_sql)?),
+        (Some(user), Some(rls_sql)) => {
+            let rls_expr = parse_sql_expr_fragment(&rls_sql)?;
+            Some(Expr::BinaryOp {
+                left: Box::new(Expr::Nested(Box::new(user))),
+                op: BinaryOperator::And,
+                right: Box::new(Expr::Nested(Box::new(rls_expr))),
+            })
+        }
+    };
+    let predicate_expr = effective_selection.as_ref();
 
     // SOFT DELETE rewrite: when the table has a SOFT DELETE column the
     // physical operation is an UPDATE that stamps that column with

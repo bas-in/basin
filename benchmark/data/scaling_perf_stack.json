@@ -3,7 +3,7 @@
   "id": "perf_stack",
   "name": "Full perf stack on a WAN-class point query",
   "claim": "Same SELECT … WHERE id = X measured four ways under a 1000-iteration random-working-set point-query workload (1000 hot ids, fixed PRNG seed) with a 50 ms-per-RPC latency injector standing in for cross-region S3: (a) no cache, (b) +disk cache, (c) +page cache, (d) +bloom filter. Layer (a) shows the cold WAN cost (>200 ms p50), layer (d) lands cold p99 under 1500 ms (the tail is dominated by the fraction of iterations whose id wasn't yet cached and paid the full miss cost), and the headline claim is speedup ≥ 100× from (a)'s cold p50 to (d)'s cold p50.",
-  "passed": true,
+  "passed": false,
   "x_axis": {
     "key": "stack_layer",
     "label": "Stack layer"
@@ -23,53 +23,53 @@
   "rows": [
     {
       "label": "(a) no cache",
-      "max_ms": 1051.3457500000002,
-      "mean_ms": 578.5289381549997,
-      "min_ms": 475.17616699999996,
-      "p50_ms": 576.449209,
-      "p999_ms": 1051.3457500000002,
-      "p99_ms": 582.502375,
+      "max_ms": 348.40862500000003,
+      "mean_ms": 228.67126981,
+      "min_ms": 195.043084,
+      "p50_ms": 224.86945799999998,
+      "p999_ms": 348.40862500000003,
+      "p99_ms": 284.94691700000004,
       "stack_layer": "a_baseline"
     },
     {
       "label": "(b) +disk cache",
-      "max_ms": 1068.3715,
-      "mean_ms": 48.037229294999996,
-      "min_ms": 0.757583,
-      "p50_ms": 1.681208,
-      "p999_ms": 1068.3715,
-      "p99_ms": 592.592333,
+      "max_ms": 314.78099999999995,
+      "mean_ms": 105.81670916500003,
+      "min_ms": 63.874375,
+      "p50_ms": 78.586,
+      "p999_ms": 314.78099999999995,
+      "p99_ms": 291.00175,
       "stack_layer": "b_disk"
     },
     {
       "label": "(c) +page cache",
-      "max_ms": 1062.363666,
-      "mean_ms": 47.530902105,
-      "min_ms": 0.230416,
-      "p50_ms": 1.528583,
-      "p999_ms": 1062.363666,
-      "p99_ms": 589.661333,
+      "max_ms": 910.890084,
+      "mean_ms": 144.17594332000007,
+      "min_ms": 0.6483749999999999,
+      "p50_ms": 145.38458300000002,
+      "p999_ms": 910.890084,
+      "p99_ms": 653.042875,
       "stack_layer": "c_disk_page"
     },
     {
       "label": "(d) +bloom filter",
-      "max_ms": 959.830958,
-      "mean_ms": 64.19164123499999,
-      "min_ms": 0.239125,
-      "p50_ms": 1.384083,
-      "p999_ms": 959.830958,
-      "p99_ms": 648.606625,
+      "max_ms": 302.13275,
+      "mean_ms": 113.34927813000002,
+      "min_ms": 0.653458,
+      "p50_ms": 146.554375,
+      "p999_ms": 302.13275,
+      "p99_ms": 278.15433299999995,
       "stack_layer": "d_full"
     }
   ],
   "primary": {
     "label": "speedup p50 (a→d)",
-    "value": 416.48456703824843,
+    "value": 1.5343756063235914,
     "unit": "x",
     "bar": {
       "op": "greater_than_or_equal",
       "value": 100.0
     }
   },
-  "generated_at": "@1778866747"
+  "generated_at": "@1779363296"
 }

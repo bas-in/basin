@@ -1,0 +1,43 @@
+{
+  "kind": "viability",
+  "id": "migration_manager",
+  "name": "Migration Manager v0.2 catalog ops end-to-end",
+  "claim": "Boot engine over InMemoryCatalog, CREATE 5 tables, INSERT first batch, capture wall time, INSERT second batch; list_snapshots_project_wide returns every table's snapshots in commit order; rollback_to_snapshot_project_wide(captured_time) rewinds every table to its first-batch state (count(*) = 3).",
+  "passed": true,
+  "primary": {
+    "label": "tables_rolled_back",
+    "value": 5.0,
+    "unit": "tables",
+    "bar": {
+      "op": "equal",
+      "value": 5.0
+    }
+  },
+  "details": {
+    "post_rollback_counts": [
+      [
+        "t_a",
+        3
+      ],
+      [
+        "t_b",
+        3
+      ],
+      [
+        "t_c",
+        3
+      ],
+      [
+        "t_d",
+        3
+      ],
+      [
+        "t_e",
+        3
+      ]
+    ],
+    "project_wide_total_entries": 30,
+    "tables": 5
+  },
+  "generated_at": "@1779359349"
+}

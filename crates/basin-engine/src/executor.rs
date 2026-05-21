@@ -2235,7 +2235,7 @@ async fn exec_create_index(
 ) -> Result<ExecResult> {
     use crate::index_extras::{
         log_expression_column_notice, log_include_notice, log_metadata_only_notice,
-        log_partial_index_notice, log_unique_notice, log_using_notice, parse_index_columns,
+        log_partial_index_notice, log_using_notice, parse_index_columns,
         IndexColumn,
     };
 
@@ -2306,10 +2306,40 @@ async fn exec_create_index(
     // notice so behavior does not regress.
     let enforce_unique = ci.unique && ci.predicate.is_none() && !has_expressions;
 
-    // Emit notices for accepted-but-not-enforced features.
+    // Loud-reject UNIQUE variants we cannot actually enforce. Silently
+    // accepting them as metadata (the previous behavior) breaks the
+    // uniqueness contract: duplicate rows would accumulate undetected.
+    // A non-unique secondary index is fine to accept as metadata (queries
+    // fall through to scan, correctness preserved) — but UNIQUE is a data
+    // integrity guarantee, so an un-enforceable UNIQUE must fail at DDL time.
     if ci.unique && !enforce_unique {
-        log_unique_notice(&index_name);
+        return Err(BasinError::FeatureNotSupported(
+            "UNIQUE on expression / partial UNIQUE / INCLUDE not yet enforced; \
+             use a plain-column UNIQUE"
+                .into(),
+        ));
     }
+    if ci.unique && !ci.include.is_empty() {
+        return Err(BasinError::FeatureNotSupported(
+            "UNIQUE on expression / partial UNIQUE / INCLUDE not yet enforced; \
+             use a plain-column UNIQUE"
+                .into(),
+        ));
+    }
+    if ci.unique {
+        if let Some(method) = &ci.using {
+            let m = method.to_string();
+            if !matches!(m.to_lowercase().as_str(), "btree") {
+                return Err(BasinError::FeatureNotSupported(
+                    "UNIQUE on expression / partial UNIQUE / INCLUDE not yet enforced; \
+                     use a plain-column UNIQUE"
+                        .into(),
+                ));
+            }
+        }
+    }
+
+    // Emit notices for accepted-but-not-enforced features.
     if let Some(pred) = &ci.predicate {
         log_partial_index_notice(&index_name, &pred.to_string());
     }

@@ -595,6 +595,47 @@ pub(crate) async fn build_policies_for_query(
     Ok(out)
 }
 
+/// Build a parenthesised SQL string for the combined USING predicate that
+/// applies to `current_user` for the given DML `kind` against `policies`.
+///
+/// Used by DML executors (DELETE, in particular) that don't go through the
+/// DataFusion plan-rewrite path used by SELECT but still need to filter rows
+/// against the RLS USING clause before mutating them.
+///
+/// Returns:
+///   * `None` when `rls_enabled` is false — caller takes the no-RLS fast path.
+///   * `Some("(FALSE)")` when RLS is on but no applicable policy exists or no
+///     policy targets this `kind` (Postgres default-deny semantics).
+///   * `Some("((p1) OR (p2) …)")` when one or more permissive policies apply —
+///     each policy's USING is parenthesised individually and the lot is
+///     OR-combined, mirroring `inject_select_predicates`.
+///
+/// `current_user` is substituted into the USING expression text before
+/// returning, with the same identifier-boundary rules as
+/// `substitute_current_user` (so `mycurrent_user_col` is left alone).
+pub(crate) fn build_using_predicate_sql_for_kind(
+    rls_enabled: bool,
+    policies: &[Policy],
+    current_user: &str,
+    kind: PolicyCommand,
+) -> Option<String> {
+    if !rls_enabled {
+        return None;
+    }
+    let applicable = select_applicable(policies, current_user, kind);
+    if applicable.is_empty() {
+        // RLS on, but either no policies at all, or none target this kind.
+        // For DELETE the safe (Postgres-aligned) behaviour is deny-all:
+        // a DELETE that can't satisfy any USING predicate sees no rows.
+        return Some("(FALSE)".to_string());
+    }
+    let parts: Vec<String> = applicable
+        .iter()
+        .map(|p| format!("({})", substitute_current_user(&p.using_expr, current_user)))
+        .collect();
+    Some(format!("({})", parts.join(" OR ")))
+}
+
 // --- WITH CHECK enforcement on INSERT / UPDATE -----------------------------
 
 /// Enforce row-level-security WITH CHECK on a candidate (about-to-be-written)

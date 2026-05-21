@@ -832,7 +832,8 @@ pub(crate) fn register_fts_udfs(ctx: &SessionContext) {
         signature: sig_rank(),
     }));
 
-    // ts_headline — STUB (out of scope): returns the body unchanged.
+    // ts_headline — minimal highlighting: wraps matched query terms in <b>…</b>
+    // (full body, not PG cover-density fragments). See `headline_highlight`.
     ctx.register_udf(ScalarUDF::from(TsHeadlineUdf {
         signature: Signature::one_of(
             vec![
@@ -1462,11 +1463,90 @@ impl ScalarUDFImpl for TsHeadlineUdf {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let args = &args.args;
         let n = num_rows(args);
-        // 2-arg: (body, tsquery) → body @0
-        // 3/4-arg: (config, body, tsquery[, opts]) → body @1
-        let body_idx = if args.len() == 2 { 0 } else { 1 };
-        let arr = arg_strings(&args[body_idx], n)?;
-        Ok(ColumnarValue::Array(Arc::new(arr)))
+        // 2-arg: (body, tsquery)            → body @0, query @1
+        // 3/4-arg: (config, body, tsquery[, opts]) → body @1, query @2
+        let (body_idx, query_idx) = if args.len() == 2 { (0, 1) } else { (1, 2) };
+        let bodies = arg_strings(&args[body_idx], n)?;
+        let queries = arg_strings(&args[query_idx], n)?;
+
+        let mut out: Vec<Option<String>> = Vec::with_capacity(n);
+        for i in 0..n {
+            if bodies.is_null(i) {
+                out.push(None);
+                continue;
+            }
+            let body = bodies.value(i);
+            let query = if queries.is_null(i) { "" } else { queries.value(i) };
+            out.push(Some(headline_highlight(body, query)));
+        }
+        Ok(ColumnarValue::Array(Arc::new(StringArray::from(out))))
+    }
+}
+
+/// Minimal `ts_headline` highlighting: wrap every body word whose lowercased
+/// token form matches a positive (non-negated) query term in `<b>…</b>`.
+///
+/// This is *not* PG's cover-density fragment selection — it returns the full
+/// body with matched terms bolded, which is the common, honest behavior most
+/// callers expect (and far better than the previous no-op stub). Stemming is
+/// not applied (consistent with Basin's no-stemming tsvector), so matching is
+/// exact-token on the lowercased word.
+fn headline_highlight(body: &str, query: &str) -> String {
+    // Collect positive query terms (skip negated `!term` branches).
+    let terms: std::collections::HashSet<String> = match TsQuery::parse_to_tsquery(query) {
+        Ok(Some(q)) => {
+            let mut acc = Vec::new();
+            collect_positive_terms(&q, &mut acc);
+            acc.into_iter().collect()
+        }
+        // Fall back to a plain tokenisation of the raw text if it is not a
+        // valid tsquery (e.g. a plain phrase was passed in).
+        _ => tokenize(query).into_iter().collect(),
+    };
+
+    if terms.is_empty() {
+        return body.to_string();
+    }
+
+    // Walk the body splitting on word/non-word boundaries so punctuation and
+    // whitespace are preserved verbatim and only the word runs are wrapped.
+    let mut out = String::with_capacity(body.len() + 16);
+    let mut word = String::new();
+    let flush_word = |word: &mut String, out: &mut String| {
+        if word.is_empty() {
+            return;
+        }
+        if terms.contains(&word.to_lowercase()) {
+            out.push_str("<b>");
+            out.push_str(word);
+            out.push_str("</b>");
+        } else {
+            out.push_str(word);
+        }
+        word.clear();
+    };
+    for ch in body.chars() {
+        if ch.is_alphanumeric() {
+            word.push(ch);
+        } else {
+            flush_word(&mut word, &mut out);
+            out.push(ch);
+        }
+    }
+    flush_word(&mut word, &mut out);
+    out
+}
+
+/// Collect the lexemes of every non-negated `Term` in a tsquery tree.
+fn collect_positive_terms(q: &TsQuery, acc: &mut Vec<String>) {
+    match q {
+        TsQuery::Term(t) => acc.push(t.to_lowercase()),
+        // A `!q` branch is a negative term — do not highlight its lexemes.
+        TsQuery::Not(_) => {}
+        TsQuery::And(a, b) | TsQuery::Or(a, b) | TsQuery::Phrase(a, b, _) => {
+            collect_positive_terms(a, acc);
+            collect_positive_terms(b, acc);
+        }
     }
 }
 
@@ -1510,6 +1590,42 @@ mod tests {
         assert!(is_stopword("the"));
         assert!(is_stopword("a"));
         assert!(!is_stopword("fox"));
+    }
+
+    #[test]
+    fn headline_wraps_matched_terms() {
+        // Single term, preserves punctuation/whitespace verbatim.
+        assert_eq!(
+            headline_highlight("The quick brown fox.", "fox"),
+            "The quick brown <b>fox</b>."
+        );
+    }
+
+    #[test]
+    fn headline_handles_and_query_and_case_insensitive() {
+        assert_eq!(
+            headline_highlight("Quick brown FOX jumps", "quick & fox"),
+            "<b>Quick</b> brown <b>FOX</b> jumps"
+        );
+    }
+
+    #[test]
+    fn headline_skips_negated_terms() {
+        // `!brown` is a negative term and must NOT be highlighted; `fox` is.
+        assert_eq!(
+            headline_highlight("quick brown fox", "fox & !brown"),
+            "quick brown <b>fox</b>"
+        );
+    }
+
+    #[test]
+    fn headline_no_match_returns_body_unchanged() {
+        assert_eq!(
+            headline_highlight("the quick brown fox", "dog"),
+            "the quick brown fox"
+        );
+        // Empty query → unchanged body (no terms to wrap).
+        assert_eq!(headline_highlight("hello world", ""), "hello world");
     }
 
     #[test]

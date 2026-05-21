@@ -133,6 +133,84 @@ pub trait BlobCatalog: Send + Sync + 'static {
         bucket_id: BucketId,
         prefix: Option<&str>,
     ) -> Result<Vec<Object>>;
+
+    /// Delete a bucket row and every object row keyed to it.  Returns the list
+    /// of object paths that were removed so the caller can purge their bytes
+    /// from `object_store` (closing the #54 P0 leak where DELETE bucket left
+    /// orphaned blobs behind).  Returns an empty `Vec` if the bucket had no
+    /// objects; returns [`BlobError::BucketNotFound`] if the bucket is absent.
+    async fn delete_bucket_by_name(
+        &self,
+        project: &ProjectId,
+        name: &str,
+    ) -> Result<Vec<String>>;
+}
+
+// ---------------------------------------------------------------------------
+// Blanket impl so `BlobStore<Arc<dyn BlobCatalog>>` works
+// ---------------------------------------------------------------------------
+
+/// Forward every [`BlobCatalog`] method through an `Arc<dyn BlobCatalog>`.
+///
+/// This lets `basin-rest` hold a single `BlobStore<Arc<dyn BlobCatalog>>`
+/// whose concrete backend (in-memory vs Postgres) is chosen at runtime by an
+/// env flag, without making every call site generic over the catalog type.
+#[async_trait]
+impl BlobCatalog for Arc<dyn BlobCatalog> {
+    async fn insert_bucket(&self, project: &ProjectId, bucket: Bucket) -> Result<()> {
+        (**self).insert_bucket(project, bucket).await
+    }
+
+    async fn get_bucket_by_name(
+        &self,
+        project: &ProjectId,
+        name: &str,
+    ) -> Result<Option<Bucket>> {
+        (**self).get_bucket_by_name(project, name).await
+    }
+
+    async fn upsert_object(&self, project: &ProjectId, object: Object) -> Result<()> {
+        (**self).upsert_object(project, object).await
+    }
+
+    async fn get_object_by_path(
+        &self,
+        project: &ProjectId,
+        bucket_id: BucketId,
+        path: &str,
+    ) -> Result<Option<Object>> {
+        (**self).get_object_by_path(project, bucket_id, path).await
+    }
+
+    async fn delete_object_by_path(
+        &self,
+        project: &ProjectId,
+        bucket_id: BucketId,
+        path: &str,
+    ) -> Result<bool> {
+        (**self)
+            .delete_object_by_path(project, bucket_id, path)
+            .await
+    }
+
+    async fn list_objects_by_prefix(
+        &self,
+        project: &ProjectId,
+        bucket_id: BucketId,
+        prefix: Option<&str>,
+    ) -> Result<Vec<Object>> {
+        (**self)
+            .list_objects_by_prefix(project, bucket_id, prefix)
+            .await
+    }
+
+    async fn delete_bucket_by_name(
+        &self,
+        project: &ProjectId,
+        name: &str,
+    ) -> Result<Vec<String>> {
+        (**self).delete_bucket_by_name(project, name).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +320,36 @@ impl BlobCatalog for InMemoryBlobCatalog {
         results.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(results)
     }
+
+    async fn delete_bucket_by_name(
+        &self,
+        project: &ProjectId,
+        name: &str,
+    ) -> Result<Vec<String>> {
+        let project_str = project.to_string();
+        // Remove the bucket row first so we can recover its id.
+        let bucket = {
+            let mut guard = self.buckets.write().await;
+            guard
+                .remove(&(project_str.clone(), name.to_string()))
+                .ok_or_else(|| BlobError::BucketNotFound(name.to_string()))?
+        };
+        let bucket_id_str = bucket.id.to_string();
+        // Drain every object row keyed to this bucket, collecting paths so the
+        // caller can purge the bytes.
+        let mut paths = Vec::new();
+        let mut objects = self.objects.write().await;
+        objects.retain(|(p, b, path), _| {
+            if p == &project_str && b == &bucket_id_str {
+                paths.push(path.clone());
+                false
+            } else {
+                true
+            }
+        });
+        paths.sort();
+        Ok(paths)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -328,6 +436,70 @@ impl<C: BlobCatalog> BlobStore<C> {
             .get_bucket_by_name(project, name)
             .await?
             .ok_or_else(|| BlobError::BucketNotFound(name.to_string()))
+    }
+
+    /// Delete a bucket and **purge all of its object bytes** from the object
+    /// store.
+    ///
+    /// This closes the #54 P0 leak: previously DELETE bucket only dropped the
+    /// in-process metadata (or, with the old in-memory catalog, nothing
+    /// durable at all) and left every blob orphaned in `object_store`. Now we:
+    ///
+    /// 1. Drop the bucket + every object row in the catalog atomically,
+    ///    receiving back the list of object paths.
+    /// 2. Delete each object's bytes from `object_store`, decrementing the
+    ///    per-project byte counter when one is attached.
+    ///
+    /// Byte deletes are best-effort idempotent (a missing key is not an
+    /// error) so a partially-applied prior delete still converges. Returns the
+    /// number of objects whose bytes were purged.
+    ///
+    /// Returns [`BlobError::BucketNotFound`] if no bucket with this name
+    /// exists in the project.
+    pub async fn delete_bucket(&self, project: &ProjectId, name: &str) -> Result<usize> {
+        // Capture sizes for the counter decrement before we drop the rows.
+        let sizes: Vec<(String, u64)> = if self.counters.is_some() {
+            let bucket = self.get_bucket(project, name).await?;
+            self.catalog
+                .list_objects_by_prefix(project, bucket.id, None)
+                .await?
+                .into_iter()
+                .map(|o| (o.path, o.size))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Atomically drop the bucket + object rows; recover the object paths.
+        let paths = self.catalog.delete_bucket_by_name(project, name).await?;
+
+        // Purge each object's bytes. A NotFound from the object store is
+        // ignored so the sweep is idempotent.
+        let mut purged = 0usize;
+        for path in &paths {
+            let key = paths::blob_key(self.root.as_ref(), project, name, path)?;
+            match self.object_store.delete(&key).await {
+                Ok(()) => purged += 1,
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => return Err(BlobError::ObjectStore(e)),
+            }
+        }
+
+        // Decrement the per-project byte counter by the total purged bytes.
+        if let Some(ref registry) = self.counters {
+            let total: u64 = sizes.iter().map(|(_, s)| *s).sum();
+            if total > 0 {
+                registry.for_project(project).record_bytes_deleted(total);
+            }
+        }
+
+        tracing::debug!(
+            project = %project,
+            bucket = %name,
+            objects_purged = purged,
+            "bucket deleted; object bytes purged"
+        );
+        Ok(purged)
     }
 
     // -----------------------------------------------------------------------

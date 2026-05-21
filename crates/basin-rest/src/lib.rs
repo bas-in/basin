@@ -180,6 +180,24 @@ impl RestService {
         }
     }
 
+    /// Construct a new service, selecting the blob catalog backend from the
+    /// environment.
+    ///
+    /// When `BASIN_BLOB_PG_URL` is set, the blob store is backed by a durable,
+    /// multi-replica-safe Postgres catalog ([`basin_blob::PostgresBlobCatalog`]).
+    /// Otherwise it falls back to the in-memory catalog (the same backend
+    /// [`RestService::new`] always uses), which is per-process and lost on
+    /// restart — fine for tests and single-process dev only.
+    ///
+    /// Prefer this over [`RestService::new`] for any deployment that runs more
+    /// than one replica (closes #54 P0). Returns an error if the Postgres URL
+    /// is set but the connection or migration fails.
+    pub async fn new_async(cfg: RestConfig) -> Result<Self> {
+        Ok(Self {
+            inner: Arc::new(server::Inner::from_config_async(cfg).await?),
+        })
+    }
+
     /// Bind, listen, accept until the process is killed. Mirrors
     /// [`basin_router::run`].
     pub async fn run(self) -> Result<()> {
@@ -196,7 +214,7 @@ impl RestService {
     /// The blob store is shared behind the same `Arc<Inner>` as the router.
     pub fn blob_store(
         &self,
-    ) -> &basin_blob::store::BlobStore<basin_blob::store::InMemoryBlobCatalog> {
+    ) -> &basin_blob::store::BlobStore<std::sync::Arc<dyn basin_blob::store::BlobCatalog>> {
         &self.inner.blob_store
     }
 
