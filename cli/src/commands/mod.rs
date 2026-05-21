@@ -22,6 +22,7 @@ pub mod config_cmd;
 pub mod db;
 pub mod docs;
 pub mod domains;
+pub mod dump;
 pub mod email;
 pub mod engine_pin;
 pub mod erd;
@@ -49,6 +50,7 @@ pub mod realtime;
 pub mod rls;
 pub mod rows;
 pub mod rpc;
+pub mod restore;
 pub mod saml;
 pub mod scim;
 pub mod secrets;
@@ -145,6 +147,16 @@ pub fn all() -> Vec<Entry> {
             unlink::cmd_unlink
         ),
         entry!("sql", "Run a SQL query against a project.", sql::cmd_sql),
+        entry!(
+            "dump",
+            "Export a project's schema + data (pg_dump-shaped, plain or custom format).",
+            dump::cmd_dump
+        ),
+        entry!(
+            "restore",
+            "Replay a dump file into a project (inverse of `basin dump`).",
+            restore::cmd_restore
+        ),
         entry!(
             "migrate-from-pg",
             "Guided Postgres → Basin migration with --dry-run + --resume (T27.1).",
