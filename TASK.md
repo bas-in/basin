@@ -1903,12 +1903,21 @@ Sequencing: **A → B**, **A → D**, **B → C**, **A–D → E + F**.
       Files: `crates/basin-catalog/src/{leases,postgres}.rs` (new
       `leases.rs`), `crates/basin-wal/src/file_wal.rs` (epoch fence on
       append), `crates/basin-shard/src/in_process.rs` (heartbeat loop).
-- [ ] **6.X.B — Partition-level routing (~2 wk).** `ShardMap::shard_for(project)`
-      → `LeaseRegistry::owner_for(project, partition)`. Router caches with
-      TTL + miss-fetch from coordinator. Default 1 partition per project →
-      back-compat byte-equivalent to today; whales partition explicitly via
-      DDL. **Depends on A.** Files: `crates/basin-router/src/sharding.rs`
-      (gut), `crates/basin-engine/src/executor.rs` (partition-aware path).
+- [x] **6.X.B — Partition-level routing (~2 wk).** `ShardMap::shard_for(project)`
+      → `LeaseAwareShardMap::owner_for(project, partition)` (ADR 0023).
+      Router consults the `LeaseRegistry::owner_of(project, partition)` and
+      caches the result with a configurable TTL
+      (`BASIN_ROUTER_LEASE_CACHE_TTL_MS`, default 5000 ms). On cache miss the
+      local replica falls back to `acquire` (v1 "any replica can become
+      owner if free" rule). Default 1 partition per project preserves the
+      pre-6.X.B back-compat path byte-equivalently (single
+      `(project, "_default")` lease lives on whichever replica acquires
+      first). Whales partition via `ALTER PROJECT <name> SET partitions = N`
+      (persisted in `ProjectStorageConfig::provider_extras` under
+      `"basin.partitions"`; 1 ≤ N ≤ 1024). Multi-partition test verifies
+      4 partitions across 4 replicas distribute to 4 distinct shard owners.
+      Files: `crates/basin-router/src/{sharding,lib}.rs`,
+      `crates/basin-engine/src/{alter_project,executor}.rs`. **Depends on A.**
 - [ ] **6.X.C — Lease handoff under load (~1 wk).** A replica voluntarily
       yields a lease on coordinator request: snapshot memtable → flush →
       transfer epoch → ack. Target < 500 ms p99 stall. **Depends on A + B.**

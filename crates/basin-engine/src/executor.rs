@@ -583,6 +583,20 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
         });
     }
 
+    // Phase 6.X.B (ADR 0023) — ALTER PROJECT <name> SET partitions = <n>.
+    // Persists in `ProjectStorageConfig::provider_extras`; the
+    // `LeaseAwareShardMap` reads it on the next `owner_for` call. Existing
+    // leases are NOT re-balanced here (that's 6.X.C lease handoff).
+    if let Some((project_name, partitions)) =
+        crate::alter_project::match_alter_project_partitions(sql)?
+    {
+        crate::alter_project::exec_alter_project_partitions(sess, &project_name, partitions)
+            .await?;
+        return Ok(ExecResult::Empty {
+            tag: "ALTER PROJECT".into(),
+        });
+    }
+
     // Phase 5.8: Basin-specific ALTER TABLE extensions (`SET cold_after`,
     // `SET cold_age_column`, `SET BLOOM FILTERS ON (...)`, `CLUSTER BY`,
     // `RESET CLUSTER BY`).

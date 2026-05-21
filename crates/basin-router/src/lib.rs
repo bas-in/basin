@@ -69,7 +69,10 @@ pub use resolver::{
     ApiKeyProjectResolver, JwtProjectResolver, ProjectCredentialsResolver, ProjectResolver,
     StackedProjectResolver, StaticProjectResolver,
 };
-pub use sharding::{parse_pins_env, ShardMap};
+pub use sharding::{
+    parse_lease_cache_ttl_env, parse_pins_env, LeaseAwareShardMap, ShardMap,
+    DEFAULT_LEASE_CACHE_TTL,
+};
 pub use tls::{build_acceptor, TlsConfig};
 
 use crate::protocol::{
