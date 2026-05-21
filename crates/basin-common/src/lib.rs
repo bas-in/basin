@@ -12,6 +12,7 @@ pub mod events;
 pub mod ids;
 pub mod project_counters;
 pub mod telemetry;
+pub mod types;
 
 pub use error::{BasinError, Result};
 pub use events::{ChangeEvent, ChangeEventSink, ChangeOp, EventSinkRegistry};

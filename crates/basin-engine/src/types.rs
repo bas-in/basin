@@ -58,6 +58,13 @@ pub const BASIN_TYPE_MONEY: &str = "MONEY";
 // XML — UTF-8 text with marker for OID 142.
 pub const BASIN_TYPE_XML: &str = "XML";
 
+/// `CITEXT` — case-insensitive text. Stored as plain `Utf8` in Arrow; the
+/// marker tells comparison operators, UNIQUE enforcement, and ORDER BY to
+/// apply case-folding (lower()) before comparing values. PG OID 25 (same as
+/// TEXT) — citext is a PG extension, not a wire-level distinct type, so the
+/// pgwire encoder emits OID 25 for citext columns.
+pub const BASIN_TYPE_CITEXT: &str = "CITEXT";
+
 // Range types — stored as a JSON string `{"l":<lower>,"u":<upper>,"li":<bool>,"ui":<bool>}`.
 // Physical Arrow type is Utf8; the marker carries the PG range sub-type so the
 // pgwire encoder knows which element OID to advertise.
@@ -292,6 +299,13 @@ pub(crate) fn field_is_macaddr(field: &arrow_schema::Field) -> bool {
 /// Returns `true` if `field` carries the `MACADDR8` metadata marker.
 pub(crate) fn field_is_macaddr8(field: &arrow_schema::Field) -> bool {
     field.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_MACADDR8)
+}
+
+/// Returns `true` if `field` carries the `CITEXT` metadata marker. The
+/// underlying Arrow type is `Utf8`; the marker tells comparison operators,
+/// UNIQUE enforcement, and ORDER BY to apply lower()-fold before comparing.
+pub(crate) fn field_is_citext(field: &arrow_schema::Field) -> bool {
+    field.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_CITEXT)
 }
 
 /// Returns `true` if `field` carries the `MONEY` metadata marker.
@@ -903,6 +917,7 @@ pub(crate) fn basin_type_marker(sql: &SqlDataType) -> Option<String> {
                 Some(format!("VARBIT({})", modifiers[0].trim()))
             }
         }
+        "CITEXT" if modifiers.is_empty() => Some(BASIN_TYPE_CITEXT.to_string()),
         _ => None,
     }
 }

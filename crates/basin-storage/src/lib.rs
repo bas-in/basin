@@ -14,6 +14,7 @@
 
 pub mod backends;
 mod concurrency;
+pub mod index;
 mod data_file;
 mod disk_cache;
 pub mod encryption;

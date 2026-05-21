@@ -21,8 +21,8 @@ use crate::types::{
     BASIN_IDENTITY_SEQ, BASIN_SOFT_DELETE_KEY, BASIN_TYPE_CIDR, BASIN_TYPE_DATERANGE,
     BASIN_TYPE_INET, BASIN_TYPE_INT4RANGE, BASIN_TYPE_INT8RANGE, BASIN_TYPE_JSONB, BASIN_TYPE_KEY,
     BASIN_TYPE_MACADDR, BASIN_TYPE_MACADDR8, BASIN_TYPE_MONEY, BASIN_TYPE_NUMRANGE,
-    BASIN_TYPE_TSQUERY, BASIN_TYPE_TSRANGE, BASIN_TYPE_TSTZRANGE, BASIN_TYPE_TSVECTOR,
-    BASIN_TYPE_UUID, BASIN_TYPE_XML,
+    BASIN_TYPE_CITEXT, BASIN_TYPE_TSQUERY, BASIN_TYPE_TSRANGE, BASIN_TYPE_TSTZRANGE,
+    BASIN_TYPE_TSVECTOR, BASIN_TYPE_UUID, BASIN_TYPE_XML,
 };
 
 /// One implicit sequence promised by a `SERIAL` / `BIGSERIAL` /
@@ -93,11 +93,28 @@ fn is_uuid_sql(sql: &sqlparser::ast::DataType) -> bool {
     }
 }
 
+/// Returns `true` if the SQL column type is `CITEXT` (case-insensitive text).
+/// The Arrow physical type is `Utf8`; the `BASIN_TYPE=CITEXT` marker on the
+/// field tells UNIQUE enforcement and comparison operators to apply
+/// case-folding (lower()) before comparing values.
+fn is_citext_sql(sql: &sqlparser::ast::DataType) -> bool {
+    use sqlparser::ast::DataType as SqlDataType;
+    if let SqlDataType::Custom(name, modifiers) = sql {
+        name.0.len() == 1
+            && name.0[0].id_val().eq_ignore_ascii_case("citext")
+            && modifiers.is_empty()
+    } else {
+        false
+    }
+}
+
 /// Returns the `BASIN_TYPE` marker string to stamp on the Arrow `Field`
 /// metadata for new "text-with-marker" types (network addresses, money, xml,
 /// ranges). Returns `None` for all other types (handled by other branches).
 fn basin_type_marker_for(sql: &sqlparser::ast::DataType) -> Option<&'static str> {
-    if is_inet_sql(sql) {
+    if is_citext_sql(sql) {
+        Some(BASIN_TYPE_CITEXT)
+    } else if is_inet_sql(sql) {
         Some(BASIN_TYPE_INET)
     } else if is_cidr_sql(sql) {
         Some(BASIN_TYPE_CIDR)
