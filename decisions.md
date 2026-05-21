@@ -6,6 +6,70 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-21 — Shared-git-index hazard with many concurrent agents (operational lesson)
+
+Running 5+ agents that each `git commit` against the **one shared working
+tree + index** cross-contaminates commit boundaries. Observed:
+- Commits `6f0982e` and `94d7a50` BOTH carry the "Phase 5.11.W6" message —
+  `6f0982e` actually holds the SQL-compat+perf-suite agent's files
+  (sql_support_matrix +1722, perf_suite.rs, run-suite.sh), `94d7a50` holds the
+  real W6 files. A sibling's `git commit` swept another agent's
+  explicitly-staged files under its own message.
+- Multiple agents reported "my `git commit` failed twice with 'no changes
+  added'" — because a sibling committed their staged files first.
+
+**Why content survived anyway:** agents are instructed to stage by EXPLICIT
+PATH (never `git add -A`), so each commit captured the right *files* even
+when the *message* was misattributed. The danger that did NOT materialize:
+a commit capturing a half-written file from another agent. Explicit-path
+staging is what kept this cosmetic.
+
+**Decision / mitigation going forward:**
+- Do NOT rewrite history to fix the misattributed messages (`6f0982e` vs
+  `94d7a50`) — rewriting races live agents and is destructive. The content
+  is correct + reachable; the wrong label is acceptable.
+- Keep concurrent *committers* modest. The `isolation: "worktree"` feature
+  was meant to solve this but is flaky here (one agent got a ~162-commit
+  stale base; another correctly got HEAD). When using worktrees, VERIFY the
+  branch base before merging.
+- The loop owner's own `git commit`s must stage explicit paths only (never
+  `-A`) so they can't sweep an agent's partial work.
+- Prefer dispatching agents into genuinely file-disjoint CRATES so even
+  message-contamination is unlikely (different files → different staged sets).
+
+---
+
+## 2026-05-21 — Wasm functions HTTP surface: CRUD on `/rest/v1/functions/*`, invoke on `/fn/v1/:name` (Phase 5.11.W2)
+
+W2 adds the HTTP-handler function shape. The CLI work (5.11.W3) registers /
+lists / tails-logs / deletes functions under `/rest/v1/functions/*`; W2 needed
+to decide where the **invoke** verb lives, because the same name could
+plausibly hang off either prefix.
+
+**Decision: split CRUD from invoke.**
+- **CRUD** (deploy / list / logs / delete) stays on `/rest/v1/functions/*` —
+  the prefix W3 already targets, alongside every other catalog-admin verb under
+  `/rest/v1`. Standard JSON envelopes, standard methods. W2 does **not** touch
+  these (so W3 lands unchanged).
+- **Invoke** lives on `ANY /fn/v1/:name`, its own prefix. Rationale:
+  1. Invocation proxies the guest's raw response — arbitrary content-type,
+     status, headers — which doesn't fit the `/rest/v1` JSON-envelope shape.
+  2. A dedicated prefix means a function can never collide with a table called
+     `functions`, nor with the `/rest/v1/:table` wildcard.
+  3. `TASK.md` § 5.11.W2 already names `/fn/v1/:name` as the invoke mount, so
+     this matches the planned surface.
+
+**Independence from W6 (catalog).** The route resolves `:name` through a
+`basin_rest::FunctionInvoker` trait (plain-data request/response, no `basin-fn`
+dep in `basin-rest`). W2 installs a process-wide slot defaulting to
+`NoopFunctionInvoker` (every name → 404). Tests inject a `HandlerHarness`-backed
+invoker via `set_global_invoker`; W6 will lift the slot to a per-`RestService`
+`Inner` field backed by the function catalog. The slot (vs. an `Inner` field)
+was chosen so W2 doesn't churn `server.rs`/`RestConfig` while the W1-followup /
+W5 / W6 siblings are concurrently editing `basin-fn`.
+
+---
+
 ## 2026-05-21 — Multi-replica scale-out architecture: leases, not coordinator-or-counters (ADR 0023)
 
 The noisy-neighbor audit (`docs/audits/2026-05-21-noisy-neighbor-fairness.md`,
