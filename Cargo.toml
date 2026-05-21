@@ -26,6 +26,8 @@ members = [
     "crates/basin-hottier",
     "crates/basin-blob",
     "crates/basin-bench-harness",
+    "crates/basin-autoscale",
+    "services/basin-autoscale",
     "services/basin-server",
     "services/basinctl",
     "tests/integration",
@@ -69,6 +71,7 @@ basin-trgm = { path = "crates/basin-trgm" }
 basin-iceberg-rest = { path = "crates/basin-iceberg-rest" }
 basin-blob = { path = "crates/basin-blob" }
 basin-bench-harness = { path = "crates/basin-bench-harness" }
+basin-autoscale = { path = "crates/basin-autoscale" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

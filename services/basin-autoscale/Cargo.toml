@@ -1,0 +1,28 @@
+[package]
+name = "basin-autoscale-bin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "basin-autoscale"
+path = "src/main.rs"
+
+[dependencies]
+basin-autoscale.workspace = true
+basin-common.workspace = true
+
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+
+# Override workspace clap to add the `env` feature for BASIN_AUTOSCALE_* vars.
+clap = { version = "4", features = ["derive", "env"] }
+
+# Override workspace tokio-postgres to add chrono integration for
+# the tenant_usage_periods period_start TIMESTAMPTZ column.
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
