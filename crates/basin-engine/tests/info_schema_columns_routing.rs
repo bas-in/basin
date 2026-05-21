@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use arrow_array::{Array, BooleanArray, Int16Array, Int64Array, StringArray};
-use basin_catalog::InMemoryCatalog;
+use basin_catalog::{InMemoryCatalog, ReservedSchema};
 use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
 use object_store::local::LocalFileSystem;
@@ -380,6 +380,8 @@ async fn pg_attribute_atttypid_matches_router() {
     assert_eq!(got, expected, "atttypid must match basin-router's PG OIDs");
 }
 
+/// Phase 5.18.D: `pg_namespace` now emits one row per reserved schema (all 8
+/// variants of `ReservedSchema::ALL`) instead of only `"public"`.
 #[tokio::test]
 async fn pg_namespace_one_row_per_project() {
     let dir = TempDir::new().unwrap();
@@ -391,13 +393,25 @@ async fn pg_namespace_one_row_per_project() {
         "SELECT oid, nspname, nspowner FROM pg_catalog.pg_namespace",
     )
     .await;
-    assert_eq!(total_rows(&batches), 1, "exactly one namespace per project");
+    let expected_count = ReservedSchema::ALL.len();
+    assert_eq!(
+        total_rows(&batches),
+        expected_count,
+        "one namespace row per reserved schema (5.18.D)"
+    );
     let names = col_string(&batches, "nspname");
-    assert_eq!(names, vec!["public".to_string()]);
+    assert!(
+        names.contains(&"public".to_string()),
+        "public must be present among namespace names: {names:?}"
+    );
     let oids = col_i64(&batches, "oid");
-    assert!(oids[0] > 0, "namespace oid must be a positive FNV hash");
+    for oid in &oids {
+        assert!(*oid > 0, "namespace oid must be a positive FNV hash");
+    }
     let owners = col_i64(&batches, "nspowner");
-    assert_eq!(owners, vec![0_i64], "v0.1 placeholder owner is 0");
+    for owner in &owners {
+        assert_eq!(*owner, 0_i64, "v0.1 placeholder owner is 0");
+    }
 }
 
 #[tokio::test]
@@ -484,10 +498,11 @@ async fn cross_project_isolation_pg_attribute() {
     );
 }
 
+/// Phase 5.18.D: `pg_namespace` returns all 8 reserved schemas per project.
+/// Each project's `"public"` namespace oid hashes (project_id, "public") so
+/// two distinct projects must produce disjoint oids for that row.
 #[tokio::test]
 async fn cross_project_isolation_pg_namespace() {
-    // Each project's namespace oid hashes (project, "public") so two projects
-    // must see distinct values.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let a = ProjectId::new();
@@ -495,18 +510,26 @@ async fn cross_project_isolation_pg_namespace() {
     let sa = eng.open_session(a).await.unwrap();
     let sb = eng.open_session(b).await.unwrap();
 
-    let oid_a = col_i64(
-        &rows(&sa, "SELECT oid FROM pg_catalog.pg_namespace").await,
+    let oids_a = col_i64(
+        &rows(
+            &sa,
+            "SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = 'public'",
+        )
+        .await,
         "oid",
     );
-    let oid_b = col_i64(
-        &rows(&sb, "SELECT oid FROM pg_catalog.pg_namespace").await,
+    let oids_b = col_i64(
+        &rows(
+            &sb,
+            "SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = 'public'",
+        )
+        .await,
         "oid",
     );
-    assert_eq!(oid_a.len(), 1);
-    assert_eq!(oid_b.len(), 1);
+    assert_eq!(oids_a.len(), 1, "exactly one 'public' namespace row per project");
+    assert_eq!(oids_b.len(), 1, "exactly one 'public' namespace row per project");
     assert_ne!(
-        oid_a[0], oid_b[0],
+        oids_a[0], oids_b[0],
         "two projects must hash to disjoint namespace oids"
     );
 }
