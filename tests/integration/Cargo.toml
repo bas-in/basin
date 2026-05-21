@@ -54,6 +54,7 @@ base32 = "0.4"
 hex.workspace = true
 
 [dev-dependencies]
+serial_test = "3"
 # `with-uuid-1` + `with-serde_json-1` enable native binary encoding of
 # `Uuid` and `serde_json::Value` so the JSONB/UUID parameter-binding
 # integration test can exercise the binary wire format end-to-end.

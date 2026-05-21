@@ -142,6 +142,7 @@ fn render_scalar(arr: &dyn Array, i: usize) -> String {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn pg_compat_string_functions() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -226,6 +227,7 @@ async fn pg_compat_string_functions() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn pg_compat_math_functions() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -268,6 +270,7 @@ async fn pg_compat_math_functions() {
 
 #[ignore = "C2: DataFusion 53 IS DISTINCT FROM optimizer schema invariant violation on literal integer comparison — blocked on #40 cluster"]
 #[tokio::test]
+#[serial_test::serial]
 async fn pg_compat_null_handling() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -321,6 +324,7 @@ async fn pg_compat_null_handling() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn pg_compat_datetime_functions() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -522,6 +526,7 @@ async fn pg_compat_datetime_functions() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn pg_compat_chrono_format_passthrough() {
     // Make sure we didn't break callers who already use chrono-style
     // format strings. The PG-format wrappers register under the same
@@ -550,6 +555,7 @@ async fn pg_compat_chrono_format_passthrough() {
 /// Bare `coalesce(NULL, NULL)` no longer requires a CAST: the bridge models
 /// `DataType::Null` as a NullArray.
 #[tokio::test]
+#[serial_test::serial]
 async fn coalesce_untyped_null() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -582,6 +588,7 @@ async fn coalesce_untyped_null() {
 /// type-checks. We assert the column data-type rather than poke at PG's text
 /// shape (the test render helper formats the triple).
 #[tokio::test]
+#[serial_test::serial]
 async fn age_returns_interval_type() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -607,6 +614,7 @@ async fn age_returns_interval_type() {
 /// from PG's `timestamp_age` source. Values were cross-checked against a
 /// reference PG run; document any divergence in the PR report.
 #[tokio::test]
+#[serial_test::serial]
 async fn age_calendar_walk_edge_cases() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -672,6 +680,7 @@ async fn age_calendar_walk_edge_cases() {
 /// is the practical fix). DataFusion's default `date_part('second', ts)`
 /// returns Int32 (whole seconds only) — that's the bug this test pins.
 #[tokio::test]
+#[serial_test::serial]
 async fn pg_compat_extract_second_precision() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();

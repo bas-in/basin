@@ -118,6 +118,7 @@ fn render_scalar(arr: &dyn Array, i: usize) -> String {
 /// does not substitute patterns like MS, CC, Q, W, DY, HH12/AM.
 /// Fix required in basin-engine to_char datetime formatting layer (src-only).
 #[tokio::test]
+#[serial_test::serial]
 #[ignore = "real engine bug: to_char(timestamp, fmt) returns format string literally instead of applying it (Phase 6.X)"]
 async fn to_char_datetime_extended() {
     let (_dir, engine) = open_engine().await;
@@ -222,6 +223,7 @@ async fn to_char_datetime_extended() {
 /// handler does not implement the `X`/`XXX` hex pattern.
 /// Fix required in basin-engine to_char numeric formatter (src-only).
 #[tokio::test]
+#[serial_test::serial]
 #[ignore = "real engine bug: to_char(numeric, 'XXX') returns decimal instead of hex (Phase 6.X)"]
 async fn to_char_numeric() {
     let (_dir, engine) = open_engine().await;
@@ -265,6 +267,7 @@ async fn to_char_numeric() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial_test::serial]
 async fn to_date_basic() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -309,6 +312,7 @@ async fn to_date_basic() {
 /// string literally instead of applying it.  Same root cause as
 /// `to_char_datetime_extended` — datetime picture string not implemented.
 #[tokio::test]
+#[serial_test::serial]
 #[ignore = "real engine bug: to_char(timestamp, fmt) returns format string literally (same as to_char_datetime_extended)"]
 async fn to_timestamp_extended() {
     let (_dir, engine) = open_engine().await;
@@ -342,6 +346,7 @@ async fn to_timestamp_extended() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial_test::serial]
 async fn encode_decode_formats() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -378,6 +383,7 @@ async fn encode_decode_formats() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial_test::serial]
 async fn text_encoding_roundtrip() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -416,6 +422,7 @@ async fn text_encoding_roundtrip() {
 /// produces 3 bytes for U+20AC but `length(...)` returns 1 (character count).
 /// Fix required in basin-engine length(bytea) overload (src-only).
 #[tokio::test]
+#[serial_test::serial]
 #[ignore = "real engine bug: length(bytea) returns char count not byte count for multi-byte UTF-8 (Phase 6.X)"]
 async fn length_bytea() {
     let (_dir, engine) = open_engine().await;
@@ -445,6 +452,7 @@ async fn length_bytea() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial_test::serial]
 async fn bit_and_octet_length() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -464,6 +472,7 @@ async fn bit_and_octet_length() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial_test::serial]
 async fn overlay_function() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -490,6 +499,7 @@ async fn overlay_function() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial_test::serial]
 async fn translate_function() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -518,6 +528,7 @@ async fn translate_function() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial_test::serial]
 async fn position_in() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -537,6 +548,7 @@ async fn position_in() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial_test::serial]
 async fn quote_functions() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -571,6 +583,7 @@ async fn quote_functions() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial_test::serial]
 async fn format_function() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();

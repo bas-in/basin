@@ -58,6 +58,7 @@ async fn one_col(sess: &basin_engine::ProjectSession, sql: &str) -> Arc<dyn Arra
 /// The OVERLAPS predicate implemented as a 4-arg UDF.
 /// Two intervals `[s1,e1)` and `[s2,e2)` overlap iff `s1 < e2 AND s2 < e1`.
 #[tokio::test]
+#[serial_test::serial]
 async fn overlaps_true_when_intervals_cross() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -79,6 +80,7 @@ async fn overlaps_true_when_intervals_cross() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn overlaps_false_when_disjoint() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -100,6 +102,7 @@ async fn overlaps_false_when_disjoint() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn overlaps_false_when_adjacent() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -126,6 +129,7 @@ async fn overlaps_false_when_adjacent() {
 // ── INFINITY TIMESTAMPS ───────────────────────────────────────────────────────
 
 #[tokio::test]
+#[serial_test::serial]
 async fn infinity_timestamp_cast() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -144,6 +148,7 @@ async fn infinity_timestamp_cast() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn neg_infinity_timestamp_cast() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -161,6 +166,7 @@ async fn neg_infinity_timestamp_cast() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn infinity_gt_neg_infinity() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -183,6 +189,7 @@ async fn infinity_gt_neg_infinity() {
 /// `date_part('year', ts)` must return the year as a Float64 (PG returns
 /// `double precision`; DataFusion's `date_part` does the same).
 #[tokio::test]
+#[serial_test::serial]
 async fn date_part_year() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -216,6 +223,7 @@ async fn date_part_year() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn date_part_month() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -251,6 +259,7 @@ async fn date_part_month() {
 /// `array_dims(ARRAY[[1,2],[3,4]])` must return `'[1:2][1:2]'`.
 #[ignore = "C6: array_dims on 2D array returns non-StringArray (Utf8View) from DataFusion 53 — blocked on #40 cluster"]
 #[tokio::test]
+#[serial_test::serial]
 async fn array_dims_2d() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -269,6 +278,7 @@ async fn array_dims_2d() {
 
 /// `array_dims(ARRAY[1,2,3])` must return `'[1:3]'`.
 #[tokio::test]
+#[serial_test::serial]
 async fn array_dims_1d() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -293,6 +303,7 @@ async fn array_dims_1d() {
 /// rather than the PG `'{{1,2},{3,4}}'::int[][]` string-cast syntax (which
 /// DataFusion does not support for nested arrays).
 #[tokio::test]
+#[serial_test::serial]
 async fn multi_dim_array_cast_executes() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
