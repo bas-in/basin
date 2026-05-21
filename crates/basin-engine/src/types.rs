@@ -820,12 +820,13 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
             }
         }
 
-        // ── Native BIT / BIT VARYING variants ───────────────────────────
-        // sqlparser's Postgres dialect parses `BIT(8)` as
-        // `SqlDataType::Bit(Some(8))` and `VARBIT(16)` / `BIT VARYING(16)`
-        // as `SqlDataType::BitVarying(Some(16))`. The `Custom("BIT", …)`
-        // branch above handles the bare-keyword form; these arms handle the
-        // native AST variants so both parse paths produce `DataType::Utf8`.
+        // ── Native BIT / BIT VARYING / VARBIT variants ──────────────────
+        // sqlparser 0.61 parses `BIT(8)` as `SqlDataType::Bit(Some(8))`,
+        // `BIT VARYING(16)` as `SqlDataType::BitVarying(Some(16))`, and the
+        // PostgreSQL alias `VARBIT(16)` as the distinct `SqlDataType::VarBit`.
+        // The `Custom("BIT", …)` / `Custom("VARBIT", …)` branches above handle
+        // bare-keyword forms that arrive as Custom AST nodes; these arms handle
+        // the native AST variants so all parse paths produce `DataType::Utf8`.
         // The `BASIN_TYPE` marker (e.g. "BIT(8)" / "VARBIT(16)") is
         // attached by `ddl::schema_from_columns` via `basin_type_marker`.
         SqlDataType::Bit(len) => {
@@ -835,7 +836,9 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
             }
             Ok(DataType::Utf8)
         }
-        SqlDataType::BitVarying(_) => Ok(DataType::Utf8),
+        // BIT VARYING(n) and the PG alias VARBIT(n) are both variable-length;
+        // both map to Arrow Utf8 with a BASIN_TYPE=VARBIT(n) sidecar.
+        SqlDataType::BitVarying(_) | SqlDataType::VarBit(_) => Ok(DataType::Utf8),
 
         other => Err(BasinError::InvalidSchema(format!(
             "unsupported column type in PoC: {other}"
@@ -897,7 +900,7 @@ pub(crate) fn basin_type_marker(sql: &SqlDataType) -> Option<String> {
             let n = len.unwrap_or(1);
             return Some(format!("BIT({n})"));
         }
-        SqlDataType::BitVarying(len) => {
+        SqlDataType::BitVarying(len) | SqlDataType::VarBit(len) => {
             return match len {
                 Some(n) => Some(format!("VARBIT({n})")),
                 None => Some("VARBIT".to_string()),

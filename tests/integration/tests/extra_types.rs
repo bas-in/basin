@@ -452,7 +452,6 @@ async fn bit_fixed_round_trip() {
 /// the engine schema layer does not yet map VARBIT to an Arrow type.
 /// Remains blocked until that mapping is implemented.
 #[tokio::test]
-#[ignore = "engine bug: VARBIT column type not supported in schema layer (CREATE TABLE fails — separate from vortex metadata fix)"]
 async fn varbit_round_trip() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
