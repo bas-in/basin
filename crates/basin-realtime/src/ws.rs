@@ -104,7 +104,7 @@ use crate::presence::{
     authorize_client_id, serialize_presence_diff, serialize_presence_state, validate_metadata_size,
     PresenceEvent, PresenceRegistry,
 };
-use crate::{ChannelKey, ChannelRegistry, ReplayCursor};
+use crate::{ChannelKey, ChannelRegistry, ReplayCursor, ReplayRingRegistry};
 
 // ---------------------------------------------------------------------------
 // Close codes (4000–4999 are application-defined per RFC 6455).
@@ -137,6 +137,12 @@ pub struct WsState {
     pub auth: Arc<AuthService>,
     /// Presence registry (R4). Shared across all connections.
     pub presence: PresenceRegistry,
+    /// Per-`(project, table)` replay ring backing reconnect-resume.
+    /// Defaults to an empty registry when the WS router is built without
+    /// one (legacy behaviour); callers should pass
+    /// `sink.replay_rings().clone()` so the ring the publisher writes into
+    /// is the same one this handler reads from.
+    pub replay_rings: ReplayRingRegistry,
 }
 
 // ---------------------------------------------------------------------------
@@ -161,10 +167,24 @@ pub fn router_with_presence(
     auth: Arc<AuthService>,
     presence: PresenceRegistry,
 ) -> Router {
+    router_with_state(registry, auth, presence, ReplayRingRegistry::new())
+}
+
+/// Build the WS sub-router with explicit presence + replay ring state.
+///
+/// Callers wired to a [`crate::RealtimeSink`] should pass
+/// `sink.replay_rings().clone()` so reconnect-resume sees publisher events.
+pub fn router_with_state(
+    registry: ChannelRegistry,
+    auth: Arc<AuthService>,
+    presence: PresenceRegistry,
+    replay_rings: ReplayRingRegistry,
+) -> Router {
     let state = WsState {
         registry,
         auth,
         presence,
+        replay_rings,
     };
     Router::new()
         .route("/realtime/v1/ws/:project", get(ws_handler))
@@ -211,6 +231,13 @@ enum ClientMsg {
         /// for the table are forwarded.
         #[serde(default)]
         filter: Option<String>,
+        /// Optional reconnect cursor: the last `seq` the client successfully
+        /// processed before disconnecting. When present and non-zero the
+        /// server consults the per-channel replay ring and re-feeds any
+        /// missed events (or emits a `gap` frame if events have already
+        /// been evicted). Closes #54 P0 silent replay loss.
+        #[serde(default)]
+        last_event_id: Option<u64>,
     },
     /// Unsubscribe from a table. Connection stays open.
     Unsubscribe { table: String },
@@ -284,6 +311,18 @@ enum ServerMsg<'a> {
         code: &'static str,
         channel: &'a str,
         message: String,
+    },
+    /// Reconnect-resume gap: the supplied `last_event_id` predated the
+    /// oldest event still in the replay ring; events between
+    /// `last_event_id` and `oldest_in_ring - 1` were evicted and cannot be
+    /// replayed via this transport. The client should cold re-sync from
+    /// the analytical store. The live stream continues from `newest_in_ring`
+    /// after this frame. Closes #54 P0.
+    Gap {
+        table: &'a str,
+        last_event_id: u64,
+        oldest_in_ring: u64,
+        newest_in_ring: u64,
     },
 }
 
@@ -435,10 +474,11 @@ pub async fn ws_handler(
     let roles = claims.roles.clone();
     let registry = state.registry.clone();
     let presence = state.presence.clone();
+    let replay_rings = state.replay_rings.clone();
 
     // --- 4. Upgrade to WebSocket -------------------------------------------
     ws_upgrade.on_upgrade(move |socket| {
-        handle_ws(socket, project_id, user_id, roles, registry, presence)
+        handle_ws(socket, project_id, user_id, roles, registry, presence, replay_rings)
     })
 }
 
@@ -459,6 +499,7 @@ const MAX_MISSED_PONGS: u32 = 2;
 
 /// Drive a single WebSocket connection until the client disconnects, the
 /// project is deleted, or auth is revoked.
+#[allow(clippy::too_many_arguments)]
 async fn handle_ws(
     mut socket: WebSocket,
     project_id: ProjectId,
@@ -466,6 +507,7 @@ async fn handle_ws(
     roles: Vec<String>,
     registry: ChannelRegistry,
     presence: PresenceRegistry,
+    replay_rings: ReplayRingRegistry,
 ) {
     info!(project = %project_id, user = %user_id, "WS connection open");
 
@@ -532,6 +574,7 @@ async fn handle_ws(
                             &roles,
                             &registry,
                             &presence,
+                            &replay_rings,
                             &fan_tx,
                             &pres_tx,
                             &mut forwarder_handles,
@@ -668,6 +711,7 @@ async fn handle_client_msg(
     roles: &[String],
     registry: &ChannelRegistry,
     presence: &PresenceRegistry,
+    replay_rings: &ReplayRingRegistry,
     fan_tx: &mpsc::Sender<IncomingEvent>,
     pres_tx: &mpsc::Sender<IncomingPresence>,
     forwarder_handles: &mut HashMap<TableName, tokio::task::JoinHandle<()>>,
@@ -684,7 +728,11 @@ async fn handle_client_msg(
     };
 
     match msg {
-        ClientMsg::Subscribe { table, filter: _ } => {
+        ClientMsg::Subscribe {
+            table,
+            filter: _,
+            last_event_id,
+        } => {
             // Validate table name.
             let table_name = match TableName::new(&table) {
                 Ok(n) => n,
@@ -704,22 +752,64 @@ async fn handle_client_msg(
                 return Ok(());
             }
 
-            // --- Replay missed events (cursor; stub returns empty for now) ---
-            let cursor = ReplayCursor::new(*project_id, table_name.clone(), 0);
-            let replay_events = cursor.drain();
-
             // Subscribe to the live broadcast channel *before* processing
             // replay, so no event is missed in the gap.
             let key = ChannelKey::new(*project_id, table_name.clone());
             let live_rx = registry.subscribe(key);
 
+            // --- Replay missed events from the per-channel ring -------------
+            //
+            // Bound to the publisher's ring registry so events the client
+            // missed during the disconnect window are re-fed before the live
+            // forwarder takes over. A cursor that predates the oldest ring
+            // entry surfaces as a Gap server message; the client should then
+            // cold re-sync from the analytical store. Closes #54 P0 SSE/WS
+            // silent replay loss.
+            let last_seen = last_event_id.unwrap_or(0);
+            let cursor = ReplayCursor::with_rings(
+                *project_id,
+                table_name.clone(),
+                last_seen,
+                replay_rings.clone(),
+            );
+            let outcome = cursor.drain_outcome();
+
+            if let crate::DrainOutcome::Gap {
+                oldest_seq,
+                newest_seq,
+                ..
+            } = &outcome
+            {
+                warn!(
+                    project = %project_id,
+                    table = %table_name,
+                    last_event_id = last_seen,
+                    oldest_in_ring = oldest_seq,
+                    newest_in_ring = newest_seq,
+                    "WS reconnect: Last-Event-ID predates ring; missed events evicted, client must cold re-sync"
+                );
+                let gap = serde_json::to_string(&ServerMsg::Gap {
+                    table: table_name.as_str(),
+                    last_event_id: last_seen,
+                    oldest_in_ring: *oldest_seq,
+                    newest_in_ring: *newest_seq,
+                })
+                .unwrap_or_else(|_| r#"{"type":"gap"}"#.to_owned());
+                if socket.send(Message::Text(gap.into())).await.is_err() {
+                    return Err(CloseFrame {
+                        code: 1001,
+                        reason: std::borrow::Cow::Borrowed("client disconnected"),
+                    });
+                }
+            }
+
             // Deliver replay events synchronously on the WS socket before
             // handing off to the forwarder task.
-            for arc_event in replay_events {
-                if !rls_permits(&arc_event, user_id, roles) {
+            for arc_event in outcome.events() {
+                if !rls_permits(arc_event, user_id, roles) {
                     continue;
                 }
-                let msg_json = serialize_event(&arc_event, table_name.as_str());
+                let msg_json = serialize_event(arc_event, table_name.as_str());
                 if socket.send(Message::Text(msg_json.into())).await.is_err() {
                     // Client disconnected during replay; bail out of the whole handler.
                     return Err(CloseFrame {
@@ -1061,9 +1151,10 @@ mod tests {
         let text = r#"{"type":"subscribe","table":"orders","filter":"NEW.status = 'paid'"}"#;
         let msg: ClientMsg = serde_json::from_str(text).expect("parse");
         match msg {
-            ClientMsg::Subscribe { table, filter } => {
+            ClientMsg::Subscribe { table, filter, last_event_id } => {
                 assert_eq!(table, "orders");
                 assert_eq!(filter.as_deref(), Some("NEW.status = 'paid'"));
+                assert!(last_event_id.is_none());
             }
             _ => panic!("wrong variant"),
         }
@@ -1074,6 +1165,21 @@ mod tests {
         let text = r#"{"type":"unsubscribe","table":"orders"}"#;
         let msg: ClientMsg = serde_json::from_str(text).expect("parse");
         assert!(matches!(msg, ClientMsg::Unsubscribe { table } if table == "orders"));
+    }
+
+    /// Reconnect-resume: `last_event_id` carries the client's cursor across
+    /// the disconnect (closes #54 P0).
+    #[test]
+    fn parse_subscribe_with_last_event_id() {
+        let text = r#"{"type":"subscribe","table":"orders","last_event_id":42}"#;
+        let msg: ClientMsg = serde_json::from_str(text).expect("parse");
+        match msg {
+            ClientMsg::Subscribe { table, filter: _, last_event_id } => {
+                assert_eq!(table, "orders");
+                assert_eq!(last_event_id, Some(42));
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 
     // --- Presence message parsing (R4) ------------------------------------

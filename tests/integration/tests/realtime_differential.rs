@@ -30,7 +30,7 @@
 use std::sync::Arc;
 
 use basin_common::{ChangeEvent, ChangeEventSink, ChangeOp, ProjectId, TableName};
-use basin_realtime::{ChannelKey, ChannelRegistry, RealtimeSink};
+use basin_realtime::{ChannelKey, RealtimeSink};
 use chrono::Utc;
 
 // ---------------------------------------------------------------------------
@@ -539,8 +539,10 @@ async fn realtime_differential_budget_enforced() {
 // Additional differential: replay cursor stub
 // ---------------------------------------------------------------------------
 
-/// Gate: `ReplayCursor::drain` always returns empty (stub) — the subscriber
-/// gets only live events, no phantom replay events injected.
+/// Gate: `ReplayCursor::drain` always returns empty when no ring registry is
+/// attached — the subscriber gets only live events, no phantom replay events
+/// injected. The ring-backed path is exercised by
+/// `realtime_differential_reconnect_resume_replays_missed_events` below.
 #[test]
 fn realtime_differential_replay_cursor_stub_is_empty() {
     use basin_realtime::ReplayCursor;
@@ -550,8 +552,163 @@ fn realtime_differential_replay_cursor_stub_is_empty() {
     let drained = cursor.drain();
     assert!(
         drained.is_empty(),
-        "ReplayCursor::drain stub must return empty (no phantom replay events)"
+        "ReplayCursor::drain with no rings attached must return empty"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #54 P0 — SSE/WS reconnect-resume replays missed events
+// ---------------------------------------------------------------------------
+
+/// **Closes #54 P0.** Pre-fix, [`basin_realtime::ReplayCursor::drain`]
+/// returned `vec![]` and SSE/WS clients honouring `Last-Event-ID` silently
+/// missed every event published during a disconnect window.
+///
+/// This test simulates the exact bug shape:
+///   1. Subscriber attaches to `(project, "orders")` and receives 3 live events.
+///   2. Subscriber "disconnects" (its broadcast receiver is dropped).
+///   3. Publisher emits 5 more events into the now-empty channel.
+///   4. Client "reconnects" with `Last-Event-ID: 3` — equivalent to
+///      [`ReplayCursor::with_rings`] bound to the sink's replay rings.
+///   5. The reconnected cursor's `drain` must yield all 5 missed events
+///      (seq 4..=8). Pre-fix this returned `[]` — the silent loss.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn realtime_differential_reconnect_resume_replays_missed_events() {
+    use basin_realtime::{DrainOutcome, ReplayCursor};
+
+    let project = ProjectId::new();
+    let table_str = "orders";
+    let table = TableName::new(table_str).unwrap();
+    let key = ChannelKey::new(project, table.clone());
+
+    let sink = RealtimeSink::new();
+
+    // --- Phase 1: client subscribes and receives the first 3 events. ---------
+    let mut rx_live = sink.registry().subscribe(key.clone());
+    for seq in 1u64..=3 {
+        let ev = ChangeEvent {
+            project,
+            table: table.clone(),
+            op: ChangeOp::Insert,
+            before: None,
+            after: Some(serde_json::json!({"id": seq})),
+            committed_at: Utc::now(),
+            seq,
+            causation_user: None,
+        };
+        sink.publish(&ev).await.expect("publish must not fail");
+    }
+    let mut seen: Vec<u64> = Vec::new();
+    while let Ok(ev) = rx_live.try_recv() {
+        seen.push(ev.seq);
+    }
+    assert_eq!(seen, vec![1, 2, 3], "phase-1 live receiver must see seq 1..=3");
+
+    // --- Phase 2: client disconnects. ----------------------------------------
+    // Dropping the receiver simulates the TCP close / EventSource cleanup.
+    drop(rx_live);
+
+    // --- Phase 3: publisher emits 5 events into the disconnected channel. ----
+    for seq in 4u64..=8 {
+        let ev = ChangeEvent {
+            project,
+            table: table.clone(),
+            op: ChangeOp::Insert,
+            before: None,
+            after: Some(serde_json::json!({"id": seq})),
+            committed_at: Utc::now(),
+            seq,
+            causation_user: None,
+        };
+        sink.publish(&ev).await.expect("publish must not fail");
+    }
+
+    // --- Phase 4: client reconnects with Last-Event-ID: 3. -------------------
+    // The reconnect cursor binds to the sink's replay rings — this is the
+    // exact wiring the SSE handler does via `cursor.drain_outcome()`.
+    let cursor = ReplayCursor::with_rings(
+        project,
+        table.clone(),
+        /* last_seen */ 3,
+        sink.replay_rings().clone(),
+    );
+    let outcome = cursor.drain_outcome();
+
+    // Pre-fix this was a Replay { events: [] } — the silent-loss bug.
+    assert!(
+        outcome.is_replay(),
+        "reconnect within ring window must be Replay, not Gap; got {outcome:?}"
+    );
+    let replayed: Vec<u64> = outcome.events().iter().map(|e| e.seq).collect();
+    assert_eq!(
+        replayed,
+        vec![4, 5, 6, 7, 8],
+        "reconnect with Last-Event-ID: 3 must re-feed every event published \
+         during the disconnect (closes #54 P0 SSE/WS silent replay loss); \
+         got {replayed:?}"
+    );
+    assert_eq!(outcome.newest_seq(), 8, "cursor advance target must be the newest seq");
+
+    // --- Phase 5: handoff to live stream — events newer than `newest_seq` go
+    //              straight through the live receiver, no duplication. -------
+    let mut rx_resumed = sink.registry().subscribe(key.clone());
+    let ev9 = ChangeEvent {
+        project,
+        table: table.clone(),
+        op: ChangeOp::Insert,
+        before: None,
+        after: Some(serde_json::json!({"id": 9})),
+        committed_at: Utc::now(),
+        seq: 9,
+        causation_user: None,
+    };
+    sink.publish(&ev9).await.expect("publish must not fail");
+    let got = rx_resumed.try_recv().expect("live receiver must get post-reconnect event");
+    assert_eq!(got.seq, 9, "live stream resumes from seq=9 after replay");
+    assert!(
+        rx_resumed.try_recv().is_err(),
+        "live stream must not double-deliver events the replay already covered"
+    );
+
+    // Sanity: explicit Gap shape is reachable when the ring is too small.
+    // (Belt-and-braces: proves the Gap variant isn't dead code.)
+    let small_sink = RealtimeSink::new().with_replay_rings(
+        basin_realtime::ReplayRingRegistry::with_capacity(
+            2,
+            basin_realtime::DEFAULT_REPLAY_RING_TTL,
+        ),
+    );
+    for seq in 1u64..=5 {
+        let ev = ChangeEvent {
+            project,
+            table: table.clone(),
+            op: ChangeOp::Insert,
+            before: None,
+            after: Some(serde_json::json!({"id": seq})),
+            committed_at: Utc::now(),
+            seq,
+            causation_user: None,
+        };
+        small_sink.publish(&ev).await.expect("publish");
+    }
+    let gap_cursor = ReplayCursor::with_rings(
+        project,
+        table.clone(),
+        /* last_seen */ 1,
+        small_sink.replay_rings().clone(),
+    );
+    let gap_outcome = gap_cursor.drain_outcome();
+    assert!(
+        gap_outcome.is_gap(),
+        "cursor predating evicted events must surface as Gap, not silent loss; got {gap_outcome:?}"
+    );
+    match gap_outcome {
+        DrainOutcome::Gap { oldest_seq, newest_seq, .. } => {
+            assert!(oldest_seq > 1, "oldest_seq={oldest_seq} must be past the cursor (1)");
+            assert_eq!(newest_seq, 5);
+        }
+        _ => unreachable!(),
+    }
 }
 
 // ---------------------------------------------------------------------------

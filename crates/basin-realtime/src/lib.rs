@@ -38,6 +38,7 @@
 pub mod budget;
 pub mod filter;
 pub mod presence;
+pub mod retry_queue;
 pub mod sse;
 pub mod ws;
 
@@ -46,6 +47,10 @@ pub use budget::{BudgetError, BudgetGuard, BudgetTracker, DEFAULT_PER_PROJECT_BU
 pub use presence::{
     ChannelName, ClientId, PresenceConfig, PresenceEntry, PresenceEvent, PresenceMeta,
     PresenceRegistry, serialize_presence_diff, serialize_presence_state,
+};
+pub use retry_queue::{
+    DrainOutcome, ReplayRingRegistry, DEFAULT_RING_CAPACITY as DEFAULT_REPLAY_RING_CAPACITY,
+    DEFAULT_RING_TTL as DEFAULT_REPLAY_RING_TTL,
 };
 
 use std::sync::Arc;
@@ -289,6 +294,11 @@ pub struct RealtimeSink {
     /// per-project budget are written here rather than silently discarded.
     /// When `None`, overflow events are dropped with a tracing warning.
     retry_log: Option<basin_webhooks::RetryQueue>,
+    /// Per-`(project, table)` bounded ring buffer that backs
+    /// [`ReplayCursor::drain`] so SSE / WS reconnect-resume actually
+    /// delivers events the subscriber missed while disconnected
+    /// (closes #54 P0 SSE silent replay loss).
+    replay_rings: ReplayRingRegistry,
 }
 
 impl RealtimeSink {
@@ -305,7 +315,23 @@ impl RealtimeSink {
             registry: ChannelRegistry::new(capacity),
             budget: BudgetTracker::from_env(),
             retry_log: None,
+            replay_rings: ReplayRingRegistry::new(),
         }
+    }
+
+    /// Attach a custom [`ReplayRingRegistry`] (useful in tests that need
+    /// a smaller per-channel capacity or shorter TTL to exercise eviction
+    /// / gap signalling).
+    pub fn with_replay_rings(mut self, rings: ReplayRingRegistry) -> Self {
+        self.replay_rings = rings;
+        self
+    }
+
+    /// Borrow the [`ReplayRingRegistry`]. Exposed so SSE / WS handlers and
+    /// tests can construct a [`ReplayCursor`] bound to the same rings the
+    /// sink writes to.
+    pub fn replay_rings(&self) -> &ReplayRingRegistry {
+        &self.replay_rings
     }
 
     /// Attach a durable retry log. Events that overflow a project's budget
@@ -364,7 +390,14 @@ impl ChangeEventSink for RealtimeSink {
         match self.budget.try_reserve(event.project, size) {
             Ok(guard) => {
                 let key = ChannelKey::new(event.project, event.table.clone());
-                self.registry.publish(&key, Arc::new(event.clone()));
+                let arc_event = Arc::new(event.clone());
+                // Record into the per-channel replay ring *before* broadcasting
+                // so a reconnect that races a publish cannot land in the live
+                // stream having skipped an event that is also missing from the
+                // ring. Both writes are O(1); ordering is enforced by the
+                // synchronous-publish single-threaded engine post-commit path.
+                self.replay_rings.record(&key, Arc::clone(&arc_event));
+                self.registry.publish(&key, arc_event);
                 // Hold the reserved bytes in flight until the guard is forgotten.
                 // We intentionally do NOT release the budget here: the bytes remain
                 // charged until the BudgetTracker itself is reset (or dropped), so
@@ -410,43 +443,93 @@ impl ChangeEventSink for RealtimeSink {
 /// Replay cursor for catch-up after a client reconnect.
 ///
 /// On reconnect a client supplies the last `seq` it successfully received.
-/// The cursor re-feeds events with `seq > last_seen_seq` from the webhook
-/// retry log (5.11.I) back to the client, then hands off to the live
-/// broadcast receiver.
+/// The cursor consults the per-`(project, table)` [`ReplayRingRegistry`] —
+/// a bounded ring buffer the publisher writes into alongside the live
+/// broadcast — and replays events with `seq > last_seen` before the
+/// transport hands off to the live broadcast receiver.
 ///
-/// # Status: stub for R2
+/// # Fixed: #54 P0 — SSE / WS silent replay loss
 ///
-/// TODO(R2): inject a `RetryQueue` / WAL handle here and implement
-///   `replay_from(project, table, last_seen_seq)` to drain catch-up events.
-///   The live receiver should be created *before* draining catch-up to
-///   avoid a race: new events published between drain-end and subscribe
-///   would be lost otherwise.
+/// Prior to this implementation [`Self::drain`] returned an empty vec and
+/// the SSE / WS handlers therefore swallowed every event published during
+/// a transient disconnect, without signalling the client. The replay ring
+/// closes the silent-loss path; an evicted cursor surfaces as
+/// [`DrainOutcome::Gap`] so the client can decide whether to fall back to
+/// a cold re-sync from the analytical store.
+///
+/// # Construction
+///
+/// Use [`Self::new`] for the legacy "no rings attached" path (always
+/// returns an empty replay — preserves the old stub behaviour for callers
+/// that have not yet been migrated). Use [`Self::with_rings`] to bind the
+/// cursor to the live publisher's ring registry.
 pub struct ReplayCursor {
     pub project: ProjectId,
     pub table: TableName,
     /// The last sequence number the client saw. Events with `seq > last_seen`
     /// will be replayed on the next `drain` call.
     pub last_seen: u64,
+    /// Optional handle to the publisher-side ring registry. When `None`,
+    /// `drain` returns an empty vec (matching the legacy stub).
+    rings: Option<ReplayRingRegistry>,
 }
 
 impl ReplayCursor {
+    /// Build a cursor without a ring handle — `drain` returns empty.
+    /// Kept for back-compat with call sites that have not yet been migrated;
+    /// new code should prefer [`Self::with_rings`].
     pub fn new(project: ProjectId, table: TableName, last_seen: u64) -> Self {
         Self {
             project,
             table,
             last_seen,
+            rings: None,
         }
     }
 
-    /// Drain catch-up events from the webhook retry log.
-    ///
-    /// TODO(R2): implement using the 5.11.I `RetryQueue` interface once the
-    ///   API for querying by `(project, table, seq > last_seen)` is exposed.
-    ///   For now returns an empty iterator.
+    /// Build a cursor bound to the live publisher's ring registry.
+    /// `drain_outcome` will replay events the publisher recorded with
+    /// `seq > last_seen`, or return [`DrainOutcome::Gap`] if the cursor
+    /// predates the oldest still-buffered event.
+    pub fn with_rings(
+        project: ProjectId,
+        table: TableName,
+        last_seen: u64,
+        rings: ReplayRingRegistry,
+    ) -> Self {
+        Self {
+            project,
+            table,
+            last_seen,
+            rings: Some(rings),
+        }
+    }
+
+    /// Drain catch-up events. Returns an empty vec when no ring is attached
+    /// or the cursor has nothing newer to deliver. **Loses the
+    /// gap-vs-replay distinction** — call [`Self::drain_outcome`] if the
+    /// caller needs to signal a gap to the client.
     pub fn drain(&self) -> Vec<Arc<ChangeEvent>> {
-        // TODO(R2): replace with actual retry-log query:
-        //   queue.events_after(self.project, &self.table, self.last_seen)
-        vec![]
+        match &self.rings {
+            None => Vec::new(),
+            Some(rings) => rings
+                .drain_after(self.project, &self.table, self.last_seen)
+                .events()
+                .to_vec(),
+        }
+    }
+
+    /// Drain catch-up events and report whether the cursor was within the
+    /// ring window or whether events were lost to eviction. Transport
+    /// handlers should prefer this form so they can emit a gap signal.
+    pub fn drain_outcome(&self) -> DrainOutcome {
+        match &self.rings {
+            None => DrainOutcome::Replay {
+                events: Vec::new(),
+                newest_seq: self.last_seen,
+            },
+            Some(rings) => rings.drain_after(self.project, &self.table, self.last_seen),
+        }
     }
 }
 
@@ -464,6 +547,19 @@ pub fn ws_router(
     auth: Arc<basin_auth::AuthService>,
 ) -> axum::Router {
     ws::router(registry, auth)
+}
+
+/// Build the WS axum sub-router with an explicit [`ReplayRingRegistry`]
+/// (Phase 5.11.R2 reconnect-resume; closes #54 P0 SSE/WS silent replay
+/// loss). Callers wired to a [`RealtimeSink`] should pass
+/// `sink.replay_rings().clone()` so the WS handler sees the same ring the
+/// publisher writes into.
+pub fn ws_router_with_rings(
+    registry: ChannelRegistry,
+    auth: Arc<basin_auth::AuthService>,
+    replay_rings: ReplayRingRegistry,
+) -> axum::Router {
+    ws::router_with_state(registry, auth, presence::PresenceRegistry::default(), replay_rings)
 }
 
 /// Bind a standalone HTTP server for the WS endpoint on `bind_addr` and
@@ -493,6 +589,19 @@ pub fn sse_router(
     auth: Arc<basin_auth::AuthService>,
 ) -> axum::Router {
     sse::router(registry, auth)
+}
+
+/// Build the SSE axum sub-router with an explicit [`ReplayRingRegistry`]
+/// (Phase 5.11.R2 reconnect-resume; closes #54 P0 SSE silent replay loss).
+/// Callers wired to a [`RealtimeSink`] should pass
+/// `sink.replay_rings().clone()` so `Last-Event-ID` honours the same ring
+/// the publisher writes into.
+pub fn sse_router_with_rings(
+    registry: ChannelRegistry,
+    auth: Arc<basin_auth::AuthService>,
+    replay_rings: ReplayRingRegistry,
+) -> axum::Router {
+    sse::router_with_rings(registry, auth, replay_rings)
 }
 
 /// Bind a standalone HTTP server for the SSE endpoint on `bind_addr` and

@@ -62,13 +62,19 @@ use serde::Serialize;
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
-use crate::{ChannelKey, ChannelRegistry, ReplayCursor};
+use crate::{ChannelKey, ChannelRegistry, ReplayCursor, ReplayRingRegistry};
 
 /// Shared handler state.
 #[derive(Clone)]
 pub struct SseState {
     pub registry: ChannelRegistry,
     pub auth: Arc<AuthService>,
+    /// Per-`(project, table)` ring used to honour `Last-Event-ID` on
+    /// reconnect (closes #54 P0 SSE silent replay loss). Defaults to an
+    /// empty registry — handlers built without one will see an empty
+    /// replay (legacy behaviour) but will still log a warning when the
+    /// client supplies a `Last-Event-ID` that cannot be honoured.
+    pub replay_rings: ReplayRingRegistry,
 }
 
 /// Build the SSE sub-router. Merge this into the main axum app.
@@ -78,7 +84,24 @@ pub struct SseState {
 /// app = app.merge(sse_router);
 /// ```
 pub fn router(registry: ChannelRegistry, auth: Arc<AuthService>) -> Router {
-    let state = SseState { registry, auth };
+    router_with_rings(registry, auth, ReplayRingRegistry::new())
+}
+
+/// Build the SSE sub-router with an explicit [`ReplayRingRegistry`].
+///
+/// Callers that have a [`crate::RealtimeSink`] should pass
+/// `sink.replay_rings().clone()` so `Last-Event-ID` honours the events the
+/// sink has buffered.
+pub fn router_with_rings(
+    registry: ChannelRegistry,
+    auth: Arc<AuthService>,
+    replay_rings: ReplayRingRegistry,
+) -> Router {
+    let state = SseState {
+        registry,
+        auth,
+        replay_rings,
+    };
     Router::new()
         .route("/realtime/v1/sse/:project/:table", get(sse_handler))
         .with_state(state)
@@ -266,9 +289,42 @@ pub async fn sse_handler(
     let key = ChannelKey::new(project_id, table_name.clone());
     let live_rx = state.registry.subscribe(key.clone());
 
-    // --- 6. Drain replay events from the retry log -------------------------
-    let cursor = ReplayCursor::new(project_id, table_name.clone(), last_seen);
-    let replay_events = cursor.drain(); // Vec<Arc<ChangeEvent>>; empty until R2's RetryQueue lands
+    // --- 6. Drain replay events from the per-channel ring -------------------
+    //
+    // Bound to the live publisher's ring registry so events the client missed
+    // during the disconnect window are re-fed before handoff to the live
+    // stream. If the cursor predates the oldest still-buffered event we get
+    // a [`DrainOutcome::Gap`] and emit a `gap` comment frame so the client
+    // can fall back to a cold re-sync (closes #54 P0 SSE silent replay loss).
+    let cursor = ReplayCursor::with_rings(
+        project_id,
+        table_name.clone(),
+        last_seen,
+        state.replay_rings.clone(),
+    );
+    let outcome = cursor.drain_outcome();
+    let gap_comment = match &outcome {
+        crate::DrainOutcome::Gap {
+            oldest_seq,
+            newest_seq,
+            ..
+        } => {
+            warn!(
+                project = %project_id,
+                table = %table_name,
+                last_seen,
+                oldest_in_ring = oldest_seq,
+                newest_in_ring = newest_seq,
+                "SSE reconnect: Last-Event-ID predates ring; missed events evicted, client must cold re-sync"
+            );
+            Some(format!(
+                "gap last_seen={} oldest_in_ring={} newest_in_ring={}",
+                last_seen, oldest_seq, newest_seq
+            ))
+        }
+        crate::DrainOutcome::Replay { .. } => None,
+    };
+    let replay_events: Vec<Arc<ChangeEvent>> = outcome.events().to_vec();
 
     // Clone the auth info for the filter closure (must be 'static).
     let subscriber_user_id = claims.user_id.to_string();
@@ -278,6 +334,7 @@ pub async fn sse_handler(
         project = %project_id,
         table = %table_name,
         last_seen,
+        replay_count = replay_events.len(),
         "SSE subscriber connected",
     );
 
@@ -346,8 +403,18 @@ pub async fn sse_handler(
         }
     });
 
-    // Chain replay → live.
-    let stream = replay_stream.chain(live_stream);
+    // Chain: optional gap-signal comment → replay → live.
+    //
+    // When the reconnect cursor predates the oldest event in the ring we
+    // emit a single `: gap …` comment frame so EventSource clients can
+    // detect the loss and fall back to a cold re-sync.
+    let gap_stream = stream::iter(
+        gap_comment
+            .into_iter()
+            .map(|c| Ok(Event::default().comment(c)))
+            .collect::<Vec<_>>(),
+    );
+    let stream = gap_stream.chain(replay_stream).chain(live_stream);
 
     // Heartbeat: axum's KeepAlive sends `: \n\n` comment frames every 15 s.
     Ok(Sse::new(stream).keep_alive(
