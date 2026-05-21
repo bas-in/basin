@@ -560,6 +560,38 @@ fn find_first_op(s: &str) -> Option<(usize, usize, &'static str)> {
     best
 }
 
+/// Return `true` if `expr` looks like a PG range type or range literal.
+///
+/// Range literals are single-quoted strings whose content starts with `[` or
+/// `(` and contains a comma (the lo/hi separator), e.g. `'[1,10)'`.
+/// Range constructors are identifiers like `int4range`, `numrange`, etc.
+///
+/// Used by the JSONB `<@` / `@>` rewriters to avoid clobbering expressions
+/// that will be handled by the range-operator rewriter.
+fn operand_looks_like_range(expr: &str) -> bool {
+    const RANGE_CTOR_KWS: &[&str] = &[
+        "int4range", "int8range", "numrange", "daterange", "tsrange", "tstzrange",
+    ];
+    let lower = expr.to_ascii_lowercase();
+    if RANGE_CTOR_KWS.iter().any(|kw| lower.starts_with(kw)) {
+        return true;
+    }
+    if expr.starts_with('\'') {
+        // Check if the content inside the quotes starts with `[` or `(`.
+        let inner = &expr[1..];
+        let mut k = 0;
+        let bytes = inner.as_bytes();
+        while k < bytes.len() && bytes[k] == b' ' { k += 1; }
+        if k < bytes.len() && (bytes[k] == b'[' || bytes[k] == b'(') {
+            // Find the closing quote.
+            let mut end = k;
+            while end < bytes.len() && bytes[end] != b'\'' { end += 1; }
+            return inner.as_bytes()[k..end].contains(&b',');
+        }
+    }
+    false
+}
+
 /// Walk back from `end` capturing one operand. Returns the inclusive
 /// `(start, end)` byte range of the operand within `s`, where `end` is the
 /// exclusive upper bound. Operands recognised:
@@ -4284,15 +4316,40 @@ fn rewrite_json_at_gt(s: &str) -> String {
         let op_end = op_start + 2;
 
         // Look ahead past whitespace for RHS token — copy bytes to avoid borrow conflict
-        let rhs_looks_json = {
+        let (rhs_looks_json, rhs_looks_range) = {
             let bytes = out.as_bytes();
             let mut j = op_end;
             while j < bytes.len() && bytes[j].is_ascii_whitespace() {
                 j += 1;
             }
-            j < bytes.len() && (bytes[j] == b'\'' || bytes[j] == b'{' || bytes[j] == b'[')
+            let looks_json = j < bytes.len() && (bytes[j] == b'\'' || bytes[j] == b'{' || bytes[j] == b'[');
+            // Detect PG range literals: single-quoted strings whose content
+            // starts with `[` or `(` and contains a comma — e.g. `'[1,10)'`.
+            // These are NOT JSON and should NOT be rewritten to jsonb_contains.
+            let looks_range = if looks_json && j < bytes.len() && bytes[j] == b'\'' {
+                // Peek inside the quoted string.
+                let inner_start = j + 1;
+                let mut k = inner_start;
+                while k < bytes.len() && bytes[k] == b' ' {
+                    k += 1;
+                }
+                if k < bytes.len() && (bytes[k] == b'[' || bytes[k] == b'(') {
+                    // Check for comma (bound separator) inside the literal.
+                    let mut end = k;
+                    while end < bytes.len() && bytes[end] != b'\'' {
+                        end += 1;
+                    }
+                    let content = &bytes[k..end];
+                    content.contains(&b',')
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            (looks_json, looks_range)
         };
-        if rhs_looks_json {
+        if rhs_looks_json && !rhs_looks_range {
             let (lhs_start, lhs_end) = extract_left_operand(&out, op_start);
             let (rhs_start, rhs_end) = extract_right_operand(&out, op_end);
             let lhs = out[lhs_start..lhs_end].to_string();
@@ -4491,6 +4548,16 @@ fn rewrite_binary_op_skip_arrays(sql: &str, op: &str, func: &str) -> String {
         let lhs_upper = lhs.trim_start().to_ascii_uppercase();
         let rhs_upper = rhs.trim_start().to_ascii_uppercase();
         if lhs_upper.starts_with("ARRAY") || rhs_upper.starts_with("ARRAY") {
+            search_from = op_end;
+            continue;
+        }
+
+        // Skip if either operand looks like a PG range type or range literal.
+        // Range literals: single-quoted strings starting with `[` or `(` and
+        // containing a comma — e.g. `'[1,10)'`. Range constructors: identifiers
+        // like `int4range(...)`.  These are handled by the range-operator
+        // rewriter later; rewriting them here as JSONB would be wrong.
+        if operand_looks_like_range(lhs.trim()) || operand_looks_like_range(rhs.trim()) {
             search_from = op_end;
             continue;
         }

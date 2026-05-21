@@ -1058,6 +1058,10 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     // get auto-names like `"Int64(1)"` which break the recursive term's
     // field references.  Adding `AS col` in the base case fixes the schema.
     let rewritten = crate::pg_operators::rewrite_recursive_cte_column_aliases(&rewritten);
+    // Rewrite `'[lo,hi)'::int4range = '[lo,hi)'::int4range` to
+    // `range_eq('...', '...', 'int4range')` BEFORE the generic operator
+    // rewriter and BEFORE cast-stripping, so the subtype is captured.
+    let rewritten = crate::range_udf::rewrite_range_equality(&rewritten);
     // Translate PG range infix operators (`@>`, `<@`, `&&`, `<<`, `>>`,
     // `-|-`) into UDF calls. Must run before sqlparser sees the SQL because
     // sqlparser's PostgreSqlDialect does not model these operators.
@@ -3277,10 +3281,28 @@ async fn exec_insert_select(
             }
             columns.push(arr);
         } else {
-            columns.push(arrow_array::new_null_array(
-                target_field.data_type(),
-                row_count,
-            ));
+            // Column not supplied by the SELECT. For identity/SERIAL columns,
+            // generate sequential values via nextval; for others push NULLs.
+            use crate::types::field_identity_sequence;
+            if let Some(seq_name) = field_identity_sequence(target_field) {
+                // Allocate one nextval per row from the catalog sequence.
+                let catalog = &sess.engine.config().catalog;
+                let mut ids: Vec<i64> = Vec::with_capacity(row_count);
+                for _ in 0..row_count {
+                    let next = catalog.nextval(&sess.project, seq_name).await?;
+                    sess.state
+                        .sequence_cache
+                        .record(sess.project, seq_name, next)
+                        .await;
+                    ids.push(next);
+                }
+                columns.push(Arc::new(arrow_array::Int64Array::from(ids)) as ArrayRef);
+            } else {
+                columns.push(arrow_array::new_null_array(
+                    target_field.data_type(),
+                    row_count,
+                ));
+            }
         }
     }
     let batch = RecordBatch::try_new(schema.clone(), columns)

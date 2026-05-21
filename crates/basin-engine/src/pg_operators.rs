@@ -693,9 +693,18 @@ fn looks_like_array(expr: &str) -> bool {
     if lower.starts_with("array[") || lower.starts_with("array [") {
         return true;
     }
-    // '{...}'::type[] cast form — starts with single-quote
+    // '{...}'::type[] cast form — starts with single-quote.
+    // But skip range literals like `'[1,10)'::int4range` — their content
+    // starts with `[` or `(` (range notation), not `{` (PG array literal).
     if trimmed.starts_with('\'') && trimmed.contains("::") {
-        return true;
+        // Peek at the first non-space char inside the string.
+        let inner = &trimmed[1..];
+        let first_inner = inner.as_bytes().iter().copied().find(|&b| b != b' ');
+        // `{` → PG array literal. `[` or `(` → range literal (skip).
+        if first_inner == Some(b'{') {
+            return true;
+        }
+        // Not an array — could be a range literal or something else.
     }
     // Also exclude range constructors so we don't compete with the range rewriter.
     for prefix in RANGE_CTOR_PREFIXES {

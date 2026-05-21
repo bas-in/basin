@@ -118,7 +118,6 @@ async fn scalar_bool(sess: &basin_engine::ProjectSession, sql: &str) -> bool {
 ///   daterange  — date range
 ///
 /// Closed by: 5.24.B (range type recognition in parser + catalog).
-#[ignore = "5.24.A harness — range types + GIST pending; closes 5.24.B-F"]
 #[tokio::test]
 async fn range_type_round_trip() {
     // Slice: "type round-trip"
@@ -382,7 +381,6 @@ async fn range_type_round_trip() {
 /// instance.
 ///
 /// Closed by: 5.24.C (containment + overlap operators for all range types).
-#[ignore = "5.24.A harness — range types + GIST pending; closes 5.24.B-F"]
 #[tokio::test]
 async fn range_operators_containment() {
     // Slice: "operator semantics — containment/overlap"
@@ -593,7 +591,6 @@ async fn range_operators_containment() {
 /// documentation and verified against a real PG instance.
 ///
 /// Closed by: 5.24.D (positional operators for range types).
-#[ignore = "5.24.A harness — range types + GIST pending; closes 5.24.B-F"]
 #[tokio::test]
 async fn range_operators_positional() {
     // Slice: "operator semantics — positional"
@@ -802,7 +799,6 @@ async fn range_operators_positional() {
 /// range-type scalar decoder in the test harness.
 ///
 /// Closed by: 5.24.D (range set-operation operators).
-#[ignore = "5.24.A harness — range types + GIST pending; closes 5.24.B-F"]
 #[tokio::test]
 async fn range_union_intersection() {
     // Slice: "operator semantics — set ops"
@@ -1004,7 +1000,7 @@ async fn range_union_intersection() {
 /// high-selectivity `@>` point query, and asserts ≥ 5× speedup.
 ///
 /// Closed by: 5.24.E (GIST index + planner integration for range `@>` probes).
-#[ignore = "5.24.A harness — range types + GIST pending; closes 5.24.B-F"]
+#[ignore = "5.24.E — GIST index planner integration pending"]
 #[tokio::test]
 async fn range_gist_index() {
     // Slice: "GIST perf"
@@ -1192,7 +1188,7 @@ async fn range_gist_index() {
 ///   4. Adjacent (non-overlapping) booking for the same room is accepted.
 ///
 /// Closed by: 5.24.F (EXCLUDE USING gist + constraint enforcement).
-#[ignore = "5.24.A harness — range types + GIST pending; closes 5.24.B-F"]
+#[ignore = "5.24.F — exclusion constraint scheduling pending"]
 #[tokio::test]
 async fn range_exclusion_constraint_scheduling() {
     // Slice: "scheduling pattern"

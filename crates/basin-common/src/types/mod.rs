@@ -7,3 +7,4 @@
 //! can be shared across crates without pulling in the full engine dependency.
 
 pub mod citext;
+pub mod range;

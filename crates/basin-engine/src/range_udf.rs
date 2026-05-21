@@ -148,6 +148,16 @@ pub(crate) fn register_range_udfs(ctx: &SessionContext) {
         kind: RangeRelKind::Adjacent,
         sig: Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable),
     }));
+    ctx.register_udf(ScalarUDF::from(RangeRelationalUdf {
+        name: "range_not_extends_right",
+        kind: RangeRelKind::NotExtendsRight,
+        sig: Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable),
+    }));
+    ctx.register_udf(ScalarUDF::from(RangeRelationalUdf {
+        name: "range_not_extends_left",
+        kind: RangeRelKind::NotExtendsLeft,
+        sig: Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable),
+    }));
     // Set operations.
     ctx.register_udf(ScalarUDF::from(RangeMergeUdf {
         sig: Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable),
@@ -162,6 +172,19 @@ pub(crate) fn register_range_udfs(ctx: &SessionContext) {
         sig: two_utf8.clone(),
     }));
     ctx.register_udf(ScalarUDF::from(RangeDiffUdf { sig: two_utf8 }));
+
+    // Range equality with semantic canonicalization.
+    // Signature: (range_text, range_text, subtype_text) → bool.
+    // The subtype arg is injected by the pre-parse rewriter.
+    ctx.register_udf(ScalarUDF::from(RangeEqUdf {
+        sig: Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8, DataType::Utf8]),
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8]),
+            ],
+            Volatility::Immutable,
+        ),
+    }));
 
     // Multirange @> scalar containment.
     ctx.register_udf(ScalarUDF::from(MultirangeContainsUdf {
@@ -179,9 +202,27 @@ pub(crate) fn register_range_udfs(ctx: &SessionContext) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Parse a range JSON string and return a `serde_json::Value`.
+/// Parse a range string in either Basin JSON form or PG text form, and
+/// return a `serde_json::Value` in the Basin JSON schema.
+///
+/// Basin JSON form: `{"l":<lo>,"u":<hi>,"li":<bool>,"ui":<bool>}`
+/// PG text form:    `[lo,hi)` / `(lo,hi]` / `empty`
+///
+/// For inline range literals passed as SQL string arguments (e.g.
+/// `'[1,10)'` after cast-stripping), the PG text form is tried first when
+/// the JSON parse fails.
 fn parse_range(s: &str) -> Option<serde_json::Value> {
-    serde_json::from_str(s).ok()
+    let trimmed = s.trim();
+    // Fast path: JSON object.
+    if trimmed.starts_with('{') {
+        return serde_json::from_str(trimmed).ok();
+    }
+    // Try PG text form → convert to JSON.
+    use basin_common::types::range::RangeValue;
+    let rv = RangeValue::from_pg_text(trimmed)?;
+    // Re-encode as the Basin JSON schema.
+    let json_str = rv.to_json_string();
+    serde_json::from_str(&json_str).ok()
 }
 
 /// Format a range value as the canonical JSON string used for storage.
@@ -842,6 +883,12 @@ enum RangeRelKind {
     StrictlyLeft,
     StrictlyRight,
     Adjacent,
+    /// `A &< B` — A does not extend to the right of B.
+    /// True when upper(A) <= upper(B) (with bound inclusivity respected).
+    NotExtendsRight,
+    /// `A &> B` — A does not extend to the left of B.
+    /// True when lower(A) >= lower(B) (with bound inclusivity respected).
+    NotExtendsLeft,
 }
 
 #[derive(PartialEq, Eq, Hash)]
@@ -933,6 +980,45 @@ impl ScalarUDFImpl for RangeRelationalUdf {
                         };
                         Some(adj_a_b || adj_b_a)
                     }
+                    RangeRelKind::NotExtendsRight => {
+                        // A &< B: upper(A) <= upper(B)
+                        // If A is +inf upper, false (it extends to +inf).
+                        // If B is +inf upper, true (A can't exceed +inf).
+                        match (a_hi, b_hi) {
+                            (None, _) => Some(false), // A extends to +inf
+                            (Some(_), None) => Some(true), // B extends to +inf → A can't exceed
+                            (Some(ah), Some(bh)) => {
+                                if ah < bh {
+                                    Some(true)
+                                } else if ah > bh {
+                                    Some(false)
+                                } else {
+                                    // ah == bh: true if a_ui <= b_ui (false <= false ok,
+                                    // true <= true ok, false < true ok, true > false → false)
+                                    Some(!a_ui || b_ui)
+                                }
+                            }
+                        }
+                    }
+                    RangeRelKind::NotExtendsLeft => {
+                        // A &> B: lower(A) >= lower(B)
+                        // If A is -inf lower, false (it extends to -inf).
+                        // If B is -inf lower, true (A can't be less than -inf).
+                        match (a_lo, b_lo) {
+                            (None, _) => Some(false), // A extends to -inf
+                            (Some(_), None) => Some(true), // B extends to -inf → A lower >= -inf
+                            (Some(al), Some(bl)) => {
+                                if al > bl {
+                                    Some(true)
+                                } else if al < bl {
+                                    Some(false)
+                                } else {
+                                    // al == bl: A &> B if a_li >= b_li (inclusive >= exclusive)
+                                    Some(a_li || !b_li)
+                                }
+                            }
+                        }
+                    }
                 }
             });
             out.push(result);
@@ -940,6 +1026,102 @@ impl ScalarUDFImpl for RangeRelationalUdf {
         Ok(ColumnarValue::Array(
             Arc::new(BooleanArray::from(out)) as ArrayRef
         ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// range_eq — semantically-correct range equality with canonicalization
+// ---------------------------------------------------------------------------
+
+/// `range_eq(a TEXT, b TEXT, subtype TEXT) -> BOOL`
+///
+/// Returns `true` when `a` and `b` represent the same range under
+/// PostgreSQL semantics, including discrete-range canonicalization:
+///
+/// - For discrete subtypes (`int4range`, `int8range`, `daterange`) both
+///   sides are normalized to the half-open `[lo, hi)` form before
+///   comparison, so `[1,9]::int4range = '[1,10)'::int4range` → `true`.
+/// - For continuous subtypes (`numrange`, `tsrange`, `tstzrange`) the
+///   bounds and inclusivity flags must match exactly.
+/// - The third argument is the range subtype (e.g. `'int4range'`); it is
+///   inserted by the pre-parse rewriter when it detects a `::rangetype` cast.
+#[derive(PartialEq, Eq, Hash)]
+struct RangeEqUdf {
+    sig: Signature,
+}
+
+impl std::fmt::Debug for RangeEqUdf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RangeEqUdf")
+    }
+}
+
+impl ScalarUDFImpl for RangeEqUdf {
+    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str { "range_eq" }
+    fn signature(&self) -> &Signature { &self.sig }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Boolean) }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        use basin_common::types::range::{RangeValue, RangeSubtype};
+
+        let n = args.number_rows;
+        let a_strs = columnar_to_strings(&args.args[0], n)?;
+        let b_strs = columnar_to_strings(&args.args[1], n)?;
+        // Third arg: subtype name (e.g. 'int4range'). Scalar or array.
+        let sub_strs = if args.args.len() >= 3 {
+            columnar_to_strings(&args.args[2], n)?
+        } else {
+            vec![Some("unknown".to_string()); n]
+        };
+
+        let mut out: Vec<Option<bool>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let result = a_strs[i].as_deref().and_then(|as_| {
+                let bs = b_strs[i].as_deref()?;
+                let subtype_str = sub_strs[i].as_deref().unwrap_or("unknown");
+                let subtype = parse_subtype(subtype_str);
+
+                // Parse both operands. Try PG text form first (`[lo,hi)`),
+                // then the Basin JSON form (`{"l":...}`).
+                let a = parse_range_for_eq(as_)?;
+                let b = parse_range_for_eq(bs)?;
+
+                // Canonicalize for discrete types.
+                let a_canon = a.canonicalize(subtype);
+                let b_canon = b.canonicalize(subtype);
+
+                Some(a_canon.semantic_eq(&b_canon))
+            });
+            out.push(result);
+        }
+        Ok(ColumnarValue::Array(
+            Arc::new(BooleanArray::from(out)) as ArrayRef
+        ))
+    }
+}
+
+/// Parse a range value from either PG text form `[lo,hi)` or Basin JSON form.
+fn parse_range_for_eq(s: &str) -> Option<basin_common::types::range::RangeValue> {
+    use basin_common::types::range::RangeValue;
+    let trimmed = s.trim();
+    if trimmed.starts_with('{') {
+        RangeValue::from_json_str(trimmed)
+    } else {
+        RangeValue::from_pg_text(trimmed)
+    }
+}
+
+/// Map a subtype name string to a [`RangeSubtype`].
+fn parse_subtype(s: &str) -> basin_common::types::range::RangeSubtype {
+    use basin_common::types::range::RangeSubtype;
+    match s.to_ascii_lowercase().as_str() {
+        "int4range" => RangeSubtype::Int4,
+        "int8range" => RangeSubtype::Int8,
+        "numrange"  => RangeSubtype::Num,
+        "tsrange"   => RangeSubtype::Ts,
+        "tstzrange" => RangeSubtype::Tstz,
+        "daterange" => RangeSubtype::Date,
+        _ => RangeSubtype::Num, // conservative: treat unknown as continuous
     }
 }
 
@@ -1729,6 +1911,142 @@ const RANGE_CTOR_KEYWORDS: &[&str] = &[
 /// Multirange constructor keywords.
 const MULTIRANGE_CTOR_KEYWORDS: &[&str] = &["int4multirange", "int8multirange", "nummultirange"];
 
+/// Rewrite `'range_literal'::rangetype = 'range_literal'::rangetype` to
+/// `range_eq('range_literal', 'range_literal', 'rangetype')` before the
+/// generic operator rewriter runs.
+///
+/// This pass handles the equality operator specifically because the generic
+/// `range_extract_left` / `range_extract_right` helpers cannot correctly
+/// extract `'string'::type` as a single operand — the `::type` cast looks
+/// like an identifier run that gets separated from the string literal.
+///
+/// Pattern matched (case-insensitive):
+/// `'<range_text>'  ::<rangetype>  =  '<range_text>'  ::<rangetype>`
+/// The range_text inside quotes must start with `[` or `(` or be `empty`.
+pub(crate) fn rewrite_range_equality(sql: &str) -> String {
+    // We scan for `::rangetype` occurrences, then check if what precedes is
+    // a range string literal and what follows is `= 'range_literal'::rangetype`.
+    let mut result = sql.to_string();
+    'outer: loop {
+        let lower = result.to_ascii_lowercase();
+        // Find any `::rangetype` suffix.
+        let mut found = false;
+        for kw in RANGE_CTOR_KEYWORDS {
+            let cast_pat = format!("::{kw}");
+            let mut search_from = 0;
+            while let Some(cast_pos) = lower[search_from..].find(&cast_pat) {
+                let cast_pos = search_from + cast_pos;
+                let cast_end = cast_pos + cast_pat.len();
+
+                // Walk back to find the preceding `'...'` string literal.
+                let before = result[..cast_pos].trim_end();
+                if !before.ends_with('\'') {
+                    search_from = cast_end;
+                    continue;
+                }
+                // Find the opening quote of the string literal.
+                let lit_end = before.len(); // position of closing quote in `before`
+                let lit_content_end = lit_end - 1; // strip closing quote
+                // Scan backward for opening quote.
+                let Some(lit_open) = before[..lit_content_end].rfind('\'') else {
+                    search_from = cast_end;
+                    continue;
+                };
+                let lit_text = &before[lit_open + 1..lit_content_end];
+                // Check it's a range literal.
+                let lt = lit_text.trim();
+                let is_range_lit = lt.eq_ignore_ascii_case("empty")
+                    || ((lt.starts_with('[') || lt.starts_with('(')) && lt.contains(','));
+                if !is_range_lit {
+                    search_from = cast_end;
+                    continue;
+                }
+                // Now look for `= 'range_literal'::rangetype` after cast_end.
+                let after = result[cast_end..].trim_start();
+                if !after.starts_with('=') {
+                    search_from = cast_end;
+                    continue;
+                }
+                let eq_suffix = after[1..].trim_start();
+                // eq_suffix should start with `'` — the second range literal.
+                if !eq_suffix.starts_with('\'') {
+                    search_from = cast_end;
+                    continue;
+                }
+                // Find the closing quote of the second literal.
+                let inner2 = &eq_suffix[1..]; // skip opening quote
+                let close2 = find_closing_quote(inner2);
+                let lit2_text = &inner2[..close2];
+                let lt2 = lit2_text.trim();
+                let is_range_lit2 = lt2.eq_ignore_ascii_case("empty")
+                    || ((lt2.starts_with('[') || lt2.starts_with('(')) && lt2.contains(','));
+                if !is_range_lit2 {
+                    search_from = cast_end;
+                    continue;
+                }
+                let after_lit2 = &inner2[close2 + 1..]; // after closing quote of lit2
+                // Look for `::rangetype` after lit2.
+                let after_lit2_lower = after_lit2.to_ascii_lowercase();
+                let mut rhs_type: &str = kw; // default to same subtype as LHS
+                let rhs_cast_len;
+                if let Some(rp) = after_lit2_lower.find("::") {
+                    // Extract the range keyword after `::`.
+                    let after_colon = after_lit2[rp + 2..].trim_start();
+                    let mut matched_rhs_kw: Option<&str> = None;
+                    let mut matched_len = 0usize;
+                    for rhs_kw in RANGE_CTOR_KEYWORDS {
+                        if after_colon.to_ascii_lowercase().starts_with(rhs_kw) {
+                            matched_rhs_kw = Some(rhs_kw);
+                            matched_len = rp + 2 + rhs_kw.len();
+                            break;
+                        }
+                    }
+                    if let Some(rk) = matched_rhs_kw {
+                        rhs_type = rk;
+                        rhs_cast_len = matched_len;
+                    } else {
+                        search_from = cast_end;
+                        continue;
+                    }
+                } else {
+                    // No `::type` on RHS — it's fine, just no cast.
+                    rhs_cast_len = 0;
+                }
+
+                // Compute the full span to replace:
+                // from lit_open (start of `'lhs_text'`) to
+                // cast_end + (offset of eq) + 1 + len(eq_suffix up to rhs_cast_end)
+                let overall_start = lit_open;  // position in `result`
+                // The `=` is at: cast_end + (len of whitespace) + 0
+                let after_trim_len = result[cast_end..].len() - after.len(); // whitespace before `=`
+                let eq_pos_in_result = cast_end + after_trim_len + 1; // after `=`
+                let eq_suffix_start_in_result =
+                    eq_pos_in_result + (after.len() - after.trim_start().len()); // skip ws after `=`
+                // position of second lit opening quote in result:
+                let lit2_open_in_result = eq_suffix_start_in_result; // eq_suffix starts with `'`
+                let lit2_close_in_result = lit2_open_in_result + 1 + close2; // closing `'`
+                let overall_end = lit2_close_in_result + 1 + rhs_cast_len; // include `::type` if present
+
+                if overall_end > result.len() {
+                    search_from = cast_end;
+                    continue;
+                }
+
+                let replacement = format!(
+                    "range_eq('{lit_text}', '{lit2_text}', '{rhs_type}')"
+                );
+                result.replace_range(overall_start..overall_end, &replacement);
+                found = true;
+                continue 'outer;
+            }
+        }
+        if !found {
+            break;
+        }
+    }
+    result
+}
+
 /// Rewrite range type cast suffixes like `'[1,10)'::int4range` to just
 /// `'[1,10)'`. Basin stores range values as plain Utf8 strings; the cast
 /// target is not a type DataFusion understands so we strip it.
@@ -1775,6 +2093,9 @@ pub(crate) fn rewrite_range_operators(sql: &str) -> String {
         ("@>", "__range_at_gt"), // placeholder, see below
         ("<@", "__range_lt_at"), // placeholder, see below
         ("&&", "range_overlaps"),
+        // &< / &> must be before << / >> to avoid the `<` in `&<` matching `<<`.
+        ("&<", "range_not_extends_right"),
+        ("&>", "range_not_extends_left"),
         ("<<", "range_strictly_left"),
         (">>", "range_strictly_right"),
         // Arithmetic operators: only rewrite when both operands look like
@@ -1783,6 +2104,8 @@ pub(crate) fn rewrite_range_operators(sql: &str) -> String {
         ("+", "__range_plus"),  // placeholder
         ("*", "__range_star"),  // placeholder
         ("-", "__range_minus"), // placeholder
+        // Range equality is handled by rewrite_range_equality() which runs
+        // before this function, so we don't need a `=` entry here.
     ];
     let mut s = sql.to_string();
     for &(op, func) in ops {
@@ -1820,6 +2143,15 @@ fn rewrite_range_op_once(sql: &str, op: &str, func: &str) -> String {
                     } else {
                         "range_contains_elem"
                     }
+                } else if looks_like_numeric(rhs) {
+                    // LHS is a column reference (identifier), RHS is a numeric
+                    // literal — almost certainly range @> element (e.g. `r @> 5`
+                    // where `r` is a range-typed column). JSONB / array @> never
+                    // uses a plain numeric RHS, so this is safe.
+                    "range_contains_elem"
+                } else if looks_like_numeric(lhs) && looks_like_identifier(rhs) {
+                    // `5 @> r` is unusual but handle symmetrically.
+                    "range_contains_elem"
                 } else {
                     // Not range — leave this occurrence alone (skip past it).
                     // We can't just break; there might be more. Advance past
@@ -1878,6 +2210,14 @@ fn rewrite_range_op_once(sql: &str, op: &str, func: &str) -> String {
                     break;
                 }
             }
+            // &< / &> — only rewrite when at least one operand is a range.
+            "range_not_extends_right" | "range_not_extends_left" => {
+                if looks_like_range(lhs) || looks_like_range(rhs) {
+                    func
+                } else {
+                    break;
+                }
+            }
             other => other,
         };
 
@@ -1892,10 +2232,92 @@ fn rewrite_range_op_once(sql: &str, op: &str, func: &str) -> String {
 }
 
 /// Return `true` if `expr` (trimmed) textually starts with a known range
-/// constructor name. Heuristic — good enough for the common case.
+/// constructor name, OR looks like a range literal (a single-quoted string
+/// starting with `[` or `(` that contains a comma, optionally followed by a
+/// `::rangetype` cast suffix).
+///
+/// The literal form detection catches PG range syntax like `'[1,10)'::int4range`
+/// which is used in `SELECT '[1,10)'::int4range @> 5` — at the time the
+/// operator rewriter runs the `::int4range` cast is still present as a suffix.
 fn looks_like_range(expr: &str) -> bool {
-    let trimmed = expr.trim().to_ascii_lowercase();
-    RANGE_CTOR_KEYWORDS.iter().any(|kw| trimmed.starts_with(kw))
+    let trimmed = expr.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    // Fast path: expression starts with a range constructor keyword.
+    if RANGE_CTOR_KEYWORDS.iter().any(|kw| lower.starts_with(kw)) {
+        return true;
+    }
+    // Detect `'[lo,hi)'` / `'(lo,hi]'` / `'empty'` string literals,
+    // optionally followed by `::rangetype`.
+    // A range literal is a single-quoted string whose first non-whitespace
+    // character after the opening `'` is `[` or `(`, and which contains a
+    // comma (the bound separator).
+    let s = trimmed;
+    if s.starts_with('\'') {
+        let inner_start = 1;
+        let inner = &s[inner_start..];
+        // Find the closing quote (allow for `''` escapes by scanning).
+        let quote_end = find_closing_quote(inner);
+        let content = &inner[..quote_end];
+        let content_trimmed = content.trim();
+        if content_trimmed.eq_ignore_ascii_case("empty") {
+            return true;
+        }
+        if (content_trimmed.starts_with('[') || content_trimmed.starts_with('('))
+            && content_trimmed.contains(',')
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Walk past a single-quoted string in `s` (which starts AFTER the opening
+/// quote) and return the index of the character just before the closing quote.
+fn find_closing_quote(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            // Check for `''` escape.
+            if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                i += 2;
+                continue;
+            }
+            return i;
+        }
+        i += 1;
+    }
+    s.len()
+}
+
+
+/// Return `true` if `expr` is a plain numeric literal (integer or decimal).
+/// Used to detect `col @> 5` patterns where `col` is a range-typed column.
+fn looks_like_numeric(expr: &str) -> bool {
+    let s = expr.trim();
+    if s.is_empty() { return false; }
+    // Optional leading minus.
+    let s = if s.starts_with('-') { &s[1..] } else { s };
+    // Must be all digits with at most one `.`
+    let mut has_dot = false;
+    for &b in s.as_bytes() {
+        if b == b'.' {
+            if has_dot { return false; }
+            has_dot = true;
+        } else if !b.is_ascii_digit() {
+            return false;
+        }
+    }
+    !s.is_empty()
+}
+
+/// Return `true` if `expr` looks like a plain SQL identifier (column name).
+/// Identifiers are alphanumeric + underscore, may be quoted with `"`.
+fn looks_like_identifier(expr: &str) -> bool {
+    let s = expr.trim();
+    if s.is_empty() { return false; }
+    if s.starts_with('"') && s.ends_with('"') { return true; }
+    s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
 }
 
 /// Return `true` if `expr` looks like a multirange constructor call.
@@ -1939,6 +2361,12 @@ fn find_op_outside_strings(s: &str, op: &str) -> Option<usize> {
 
 /// Walk back from `end` (the start of the operator) and extract the left
 /// operand. Returns `(start, end)` byte offsets in `s`.
+///
+/// Handles:
+/// - Plain identifiers / numbers: `col_name`, `5`
+/// - Function calls: `int4range(1, 10)` (goes back through parentheses)
+/// - String literals with cast: `'[1,10)'::int4range` — walks through the
+///   alphanumeric cast suffix, then `::`, then the quoted string literal.
 fn range_extract_left(s: &str, end: usize) -> (usize, usize) {
     let bytes = s.as_bytes();
     let mut i = end;
@@ -1971,13 +2399,39 @@ fn range_extract_left(s: &str, end: usize) -> (usize, usize) {
             i -= 1;
         }
     } else {
-        // Identifier / number run.
+        // Identifier / number run (may be a `::cast` suffix like `int4range`).
         while i > 0
             && (bytes[i - 1].is_ascii_alphanumeric()
                 || bytes[i - 1] == b'_'
                 || bytes[i - 1] == b'.')
         {
             i -= 1;
+        }
+        // Check for a `::` cast operator before the identifier — if found,
+        // consume the `::` and then try to capture a preceding string literal.
+        if i >= 2 && bytes[i - 1] == b':' && bytes[i - 2] == b':' {
+            i -= 2; // skip `::`
+            // Skip whitespace before `::`.
+            while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+                i -= 1;
+            }
+            // If we have a closing quote, walk back through the string literal.
+            if i > 0 && bytes[i - 1] == b'\'' {
+                i -= 1; // consume closing `'`
+                // Walk backward through the string content (handle `''` escapes).
+                while i > 0 {
+                    if bytes[i - 1] == b'\'' {
+                        // Check for `''` escape: peek two positions back.
+                        if i >= 2 && bytes[i - 2] == b'\'' {
+                            i -= 2; // skip the `''` escape
+                            continue;
+                        }
+                        i -= 1; // consume opening `'`
+                        break;
+                    }
+                    i -= 1;
+                }
+            }
         }
     }
     (i, operand_end)
