@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 
 use arrow_array::{Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
 use basin_common::{BasinError, PartitionKey, ProjectId, Result, TableName};
 use bytes::Bytes;
 use chrono::Utc;
@@ -216,10 +217,33 @@ pub(crate) async fn write_batch_with_options(
         &sorted_batch_owned
     };
 
+    // ADR 0024 — UUID-as-Decimal128 storage encoding (Vortex only).
+    // Vortex 0.70 has no FixedSizeBinary(N) encoder, so any UUID column
+    // (Arrow `FixedSizeBinary(16)` + `BASIN_TYPE=UUID` field metadata) would
+    // otherwise fail to encode. We reinterpret the 16-byte UUID buffer as
+    // the unsigned big-endian magnitude of a `Decimal128(38, 0)` before
+    // handing the batch to Vortex; the read path performs the inverse so
+    // basin-engine, planner, pgwire, REST keep seeing UUIDs. Parquet has
+    // native FixedSizeBinary support so the translation is skipped.
+    // TODO(adr-0024): drop this branch once vortex-data/vortex grows a
+    // `FixedSizeBinary(N)` encoder and basin-engine pins the new release;
+    // every uuid-disguised Decimal128 file already on disk is identifiable
+    // by its BASIN_TYPE=UUID field marker.
+    let uuid_xlated_owned;
+    let batch_for_encode = match opts.file_format {
+        FileFormat::Vortex => match uuid_fsb_to_decimal128(batch_to_write) {
+            Some(b) => {
+                uuid_xlated_owned = b;
+                &uuid_xlated_owned
+            }
+            None => batch_to_write,
+        },
+        FileFormat::Parquet => batch_to_write,
+    };
     let bytes = match opts.file_format {
-        FileFormat::Parquet => encode_parquet(batch_to_write, opts)?,
+        FileFormat::Parquet => encode_parquet(batch_for_encode, opts)?,
         FileFormat::Vortex => {
-            crate::vortex_format::encode(batch_to_write, opts.row_block_size).await?
+            crate::vortex_format::encode(batch_for_encode, opts.row_block_size).await?
         }
     };
     let row_count = batch_to_write.num_rows() as u64;
@@ -363,6 +387,101 @@ fn sort_batch_by_cluster_cols(
         .collect::<Result<Vec<_>>>()?;
     RecordBatch::try_new(batch.schema(), columns)
         .map_err(|e| BasinError::storage(format!("rebuild cluster-sorted batch: {e}")))
+}
+
+/// Field-metadata key the engine plants on UUID columns. Mirrors
+/// `basin_engine::types::BASIN_TYPE_KEY` (load-bearing duplicate — basin-storage
+/// must not depend on basin-engine).
+const BASIN_TYPE_KEY: &str = "BASIN_TYPE";
+/// `BASIN_TYPE` value for UUID columns. Mirrors
+/// `basin_engine::types::BASIN_TYPE_UUID`.
+const BASIN_TYPE_UUID: &str = "UUID";
+
+/// Returns `true` iff `field` carries the `BASIN_TYPE=UUID` marker AND has
+/// the physical type `FixedSizeBinary(16)` (the catalog-declared shape for
+/// UUID). Both predicates must hold so an unrelated `FixedSizeBinary(16)`
+/// column (e.g. a 16-byte digest) is never miscoerced.
+fn field_is_uuid_fsb(field: &Field) -> bool {
+    matches!(field.data_type(), DataType::FixedSizeBinary(16))
+        && field.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_UUID)
+}
+
+/// ADR 0024 — write-side reinterpretation. Walks `batch`'s schema; for every
+/// column with Arrow type `FixedSizeBinary(16)` AND field metadata
+/// `BASIN_TYPE=UUID`, reinterprets the 16-byte buffer as
+/// `Decimal128(38, 0)` (unsigned big-endian magnitude) so the Vortex codec
+/// can encode the column. Field metadata is preserved on the rebuilt
+/// schema; the read path keys off `BASIN_TYPE=UUID + Decimal128(38, 0)`
+/// to perform the inverse.
+///
+/// Returns `None` when no column needs translation — the caller reuses the
+/// original `batch` without an Arc-clone.
+///
+/// TODO(adr-0024): delete when Vortex grows native `FixedSizeBinary(N)`
+/// encoding and basin-engine pins the new release.
+fn uuid_fsb_to_decimal128(batch: &RecordBatch) -> Option<RecordBatch> {
+    use arrow_array::{Decimal128Array, FixedSizeBinaryArray};
+
+    let schema = batch.schema();
+    let needs_xlate = schema
+        .fields()
+        .iter()
+        .any(|f| field_is_uuid_fsb(f));
+    if !needs_xlate {
+        return None;
+    }
+
+    let mut new_fields: Vec<Field> = Vec::with_capacity(schema.fields().len());
+    let mut new_cols: Vec<arrow_array::ArrayRef> = Vec::with_capacity(batch.num_columns());
+    for (i, f) in schema.fields().iter().enumerate() {
+        if field_is_uuid_fsb(f) {
+            let src = batch
+                .column(i)
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .expect("UUID column must be FixedSizeBinaryArray");
+            let len = src.len();
+            // Build the array as `Vec<Option<i128>>` so nulls propagate. The
+            // 16 UUID bytes are interpreted as a big-endian *bit pattern* and
+            // round-tripped exactly in the read path via `to_be_bytes()`. We
+            // do not depend on the signed/unsigned reinterpretation of the
+            // high bit because the engine sorts UUIDs at the
+            // `FixedSizeBinary(16)` layer post-inverse — the on-disk
+            // Decimal128 ordering never reaches a user.
+            let mut values: Vec<Option<i128>> = Vec::with_capacity(len);
+            for r in 0..len {
+                if src.is_null(r) {
+                    values.push(None);
+                } else {
+                    let mut buf = [0u8; 16];
+                    buf.copy_from_slice(src.value(r));
+                    values.push(Some(i128::from_be_bytes(buf)));
+                }
+            }
+            let arr = Decimal128Array::from(values)
+                .with_precision_and_scale(38, 0)
+                .expect("Decimal128(38, 0) precision is valid");
+            let new_field = Field::new(
+                f.name(),
+                DataType::Decimal128(38, 0),
+                f.is_nullable(),
+            )
+            .with_metadata(f.metadata().clone());
+            new_fields.push(new_field);
+            new_cols.push(std::sync::Arc::new(arr));
+        } else {
+            new_fields.push(f.as_ref().clone());
+            new_cols.push(batch.column(i).clone());
+        }
+    }
+    let new_schema = std::sync::Arc::new(Schema::new_with_metadata(
+        new_fields,
+        schema.metadata().clone(),
+    ));
+    Some(
+        RecordBatch::try_new(new_schema, new_cols)
+            .expect("uuid_fsb_to_decimal128: metadata-only schema replacement cannot fail"),
+    )
 }
 
 fn encode_parquet(batch: &RecordBatch, opts: &WriteOptions) -> Result<Vec<u8>> {

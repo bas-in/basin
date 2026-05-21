@@ -1524,7 +1524,17 @@ fn vortex_project_and_filter(
         // on decode, so semantic types (MONEY, INET, …) would otherwise be
         // downgraded to their physical Arrow type post-storage.
         let restamped = restamp_field_metadata_from_catalog(projected, catalog_schema);
-        out.push(restamped);
+        // ADR 0024 — UUID-as-Decimal128 read-side inverse. The write path
+        // reinterprets `FixedSizeBinary(16) + BASIN_TYPE=UUID` columns as
+        // `Decimal128(38, 0)` before handing to Vortex; restore the UUID
+        // layout here so basin-engine, planner, pgwire, and REST keep
+        // seeing UUIDs above the storage trait. Restamping above is the
+        // load-bearing pre-condition: without `BASIN_TYPE=UUID` on the
+        // post-decode schema we cannot distinguish a UUID-disguised
+        // Decimal128 from a genuine `NUMERIC(38, 0)` column.
+        // TODO(adr-0024): drop when vortex grows native FixedSizeBinary(N).
+        let restored = decimal128_to_uuid_fsb(restamped);
+        out.push(restored);
     }
     Ok(out)
 }
@@ -1694,6 +1704,82 @@ fn restamp_field_metadata_from_catalog(
     let cols = batch.columns().to_vec();
     RecordBatch::try_new(new_schema, cols)
         .expect("restamp: metadata-only rewrap cannot fail")
+}
+
+/// Field-metadata key the engine plants on UUID columns. Mirrors
+/// `basin_engine::types::BASIN_TYPE_KEY` (load-bearing duplicate — the
+/// storage layer must not depend on basin-engine).
+const BASIN_TYPE_KEY: &str = "BASIN_TYPE";
+/// `BASIN_TYPE` value for UUID columns. Mirrors
+/// `basin_engine::types::BASIN_TYPE_UUID`.
+const BASIN_TYPE_UUID: &str = "UUID";
+
+/// ADR 0024 — read-side inverse of `writer::uuid_fsb_to_decimal128`. Walks
+/// `batch`'s schema; for every column with Arrow type `Decimal128(38, 0)`
+/// AND field metadata `BASIN_TYPE=UUID`, reinterprets each 128-bit
+/// magnitude (big-endian) back to `FixedSizeBinary(16)` so the rest of
+/// Basin keeps seeing UUIDs.
+///
+/// Returns the input batch unchanged when no column needs translation.
+///
+/// TODO(adr-0024): drop when Vortex grows native `FixedSizeBinary(N)`
+/// encoding and basin-engine pins the new release.
+fn decimal128_to_uuid_fsb(batch: RecordBatch) -> RecordBatch {
+    use arrow_array::{Array, Decimal128Array, FixedSizeBinaryArray};
+
+    let schema = batch.schema();
+    let needs_xlate = schema.fields().iter().any(|f| {
+        matches!(f.data_type(), arrow_schema::DataType::Decimal128(38, 0))
+            && f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_UUID)
+    });
+    if !needs_xlate {
+        return batch;
+    }
+
+    let mut new_fields: Vec<Field> = Vec::with_capacity(schema.fields().len());
+    let mut new_cols: Vec<arrow_array::ArrayRef> = Vec::with_capacity(batch.num_columns());
+    for (i, f) in schema.fields().iter().enumerate() {
+        let is_uuid = matches!(f.data_type(), arrow_schema::DataType::Decimal128(38, 0))
+            && f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_UUID);
+        if is_uuid {
+            let src = batch
+                .column(i)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("UUID-disguised column must be Decimal128Array");
+            let len = src.len();
+            // Build via the per-row sparse-iterator helper: it accepts
+            // `Option<[u8; 16]>` and constructs the FixedSizeBinaryArray
+            // with the right null mask. Avoids hand-rolling the underlying
+            // Buffer / NullBuffer with arrow-buffer (not a direct dep here).
+            let rows = (0..len).map(|r| {
+                if src.is_null(r) {
+                    None
+                } else {
+                    // `i128::to_be_bytes()` is exactly the inverse of
+                    // `i128::from_be_bytes()` used in the writer, so the 16
+                    // UUID bytes round-trip identically.
+                    Some(src.value(r).to_be_bytes())
+                }
+            });
+            let arr = FixedSizeBinaryArray::try_from_sparse_iter_with_size(rows, 16)
+                .expect("FixedSizeBinary(16) construction cannot fail");
+            let new_field =
+                Field::new(f.name(), arrow_schema::DataType::FixedSizeBinary(16), f.is_nullable())
+                    .with_metadata(f.metadata().clone());
+            new_fields.push(new_field);
+            new_cols.push(Arc::new(arr));
+        } else {
+            new_fields.push(f.as_ref().clone());
+            new_cols.push(batch.column(i).clone());
+        }
+    }
+    let new_schema = Arc::new(Schema::new_with_metadata(
+        new_fields,
+        schema.metadata().clone(),
+    ));
+    RecordBatch::try_new(new_schema, new_cols)
+        .expect("decimal128_to_uuid_fsb: schema swap cannot fail")
 }
 
 fn synthesise_missing_columns(
