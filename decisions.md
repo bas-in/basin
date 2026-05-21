@@ -6,6 +6,63 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-21 — Post-wave3 baseline green; #64 engine fixes + 3 test-first harnesses landed (4-agent disjoint wave)
+
+**Baseline triage.** The clean `cargo test --workspace` baseline surfaced 12
+failures, all non-regressions, fixed in `f8f485f`+`bc30e58` and a test-fix
+commit:
+- `ts_headline` now does real `<b></b>` highlighting (5.20) — `fts_stubs`
+  asserted old pass-through stub; updated.
+- `SHOW search_path` returns real value (5.18.B) — `noop_accept` asserted old
+  Empty noop; updated.
+- SSRF IP-literal denylist (b56f2d1) now rejects `127.0.0.1`, breaking every
+  test that delivers to a loopback mock: `viability_basin_net` + 8 webhook
+  tests. Fixed by switching their `HttpClient` to
+  `with_config(GuardConfig::from_env().with_loopback_allowed_for_tests(), …)`.
+  **Carry-forward rule:** any future test that hits a localhost mock through
+  `basin-net` must use this escape hatch, not `HttpClient::new()`.
+
+**FIX 2 verified + committed (`f8f485f`).** The `#54` carry-forward
+(`ddl.rs::sanitize_create_table_extensions` skipping INCLUDE-strip for
+`CREATE [UNIQUE] INDEX`) was found uncommitted in-tree, was present during the
+green baseline, and its tests (`unique_include_clause_is_stripped_pre_parse`,
+`non_unique_partial_and_include_still_accepted`) pass. Committed solo.
+
+**4-agent disjoint wave (all committed, `cargo check --workspace --all-targets`
+EXIT 0):**
+- `f308403` #64 — parser recursion-depth guard (`MAX_PARSE_DEPTH=1000`,
+  pre-scan reject before libpg_query → no SIGABRT), session
+  `statement_timeout` GUC wired to the 6.P0.A enforcement path, `pg_sleep`
+  UDF registered. **Follow-up:** `pg_sleep` uses blocking `std::thread::sleep`
+  — on the multi-thread runtime the client still gets the timeout error, but
+  the worker thread leaks until the sleep ends. Should move to an async sleep
+  so the timeout actually cancels it. Tracked under #64 residual.
+- `0e5c524` 5.25.A — migration-tool test scaffold (fixture template + common
+  helpers + ignored placeholder). Also fixed a pre-existing `executor.rs`
+  compile error (`schema_df_to_ws` Arc/Result mismatch) that blocked the whole
+  integration crate.
+- `d2be3ad` 5.27.A — txn-mode pool + serverless harness (4 `pool_*.rs` +
+  bench), lands RED by design; sole editor of `tests/integration/Cargo.toml`
+  (added `criterion`, `basin-pool`, `[[bench]]`).
+- `49bce69` 5.31.A — Docker smoke + publish CI workflows + `docker-smoke.sh`,
+  lands red until the Dockerfile (5.31.B) exists.
+
+**Disjointness method that worked:** one agent owned `basin-engine/src`
+exclusively; the other three created only NEW test/CI files (auto-discovered —
+0 explicit `[[test]]` entries, so no shared-Cargo.toml contention except the
+one designated Cargo.toml editor). 4 concurrent agents stayed under the
+~4-6 build-lock gridlock threshold. Note: the 5.25.A agent did stray into
+`executor.rs` for a necessary compile fix — it landed cleanly because #64
+committed last and captured the union, but next time scope the "compile-fix
+license" explicitly to avoid the shared-tree clobber risk.
+
+**#63 (vortex-datafusion 0.70→0.71) deliberately deferred to a SOLO wave:** a
+multi-crate dep bump recompiles the whole downstream tree, so running it
+alongside other Rust agents would invalidate their builds repeatedly
+(gridlock). Runs alone next.
+
+---
+
 ## 2026-05-21 — #22 noisy-neighbor permanent harness landed; all agent-amenable items closed
 
 Commit `31bc2a7` — `tests/integration/tests/noisy_neighbor_harness.rs`
