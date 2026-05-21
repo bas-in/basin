@@ -1324,18 +1324,18 @@ implementation task flips a slice of the harness green.
       `benches/fts.rs`.
       Acceptance: harness compiles + reports red against the
       current engine.
-- [ ] **5.20.B — `tsvector` + `tsquery` types** (~1 week). Catalog
+- [x] **5.20.B — `tsvector` + `tsquery` types** (~1 week). Catalog
       type registration; binary + text serialisation; Arrow
       representation. Files: `crates/basin-common/src/types/tsvector.rs`
       (new), `crates/basin-engine/src/types.rs` (register).
       Acceptance: type-round-trip slice of 5.20.A flips green.
-- [ ] **5.20.C — `to_tsvector` / `to_tsquery` / `plainto_tsquery`
+- [x] **5.20.C — `to_tsvector` / `to_tsquery` / `plainto_tsquery`
       UDFs with stemming** (~1 week). English stemming first
       (Snowball / `rust-stemmers`); pluggable language registry for
       future additions. Stop-word lists per language. Files:
       `crates/basin-engine/src/udfs/fts.rs` (new).
       Acceptance: stemming-golden-file slice of 5.20.A flips green.
-- [ ] **5.20.D — `@@` operator + ranking** (`ts_rank`, `ts_rank_cd`)
+- [x] **5.20.D — `@@` operator + ranking** (`ts_rank`, `ts_rank_cd`)
       (~1 week). Lexeme-position-aware matching; ranking with
       weighting by document section (A/B/C/D). Files:
       `crates/basin-engine/src/operators/fts_match.rs` (new).
@@ -1636,7 +1636,7 @@ consistently.
       likely to find real gaps (Prisma introspects heavily); plus a
       Prisma Client query battery against the migrated schema. Files:
       `tests/integration/tests/migration_tool_prisma.rs`.
-- [ ] **5.25.G — `CAPABILITIES.md` migration-tool matrix row**
+- [x] **5.25.G — `CAPABILITIES.md` migration-tool matrix row**
       (~1 day). Table: tool × supported (yes/no/with-caveats) ×
       caveats column × verified-on-version column. Generated from
       the test results — never hand-edited; CI regenerates on every
@@ -1760,7 +1760,7 @@ each impl sub-task flips a named slice green.
       Files: `crates/basin-pool/src/mode.rs` (new),
       `crates/basin-pool/src/lib.rs` (extend).
       Acceptance: closes the **pool semantics** slice of 5.27.A.
-- [ ] **5.27.C — `@vercel/postgres` dockerised e2e** (~2 days).
+- [x] **5.27.C — `@vercel/postgres` dockerised e2e** (~2 days).
       `tests/integration/docker/vercel-postgres-app/` — minimal
       Node.js app + Dockerfile + compose service; CI job runs the
       integration script. Acceptance: closes the
@@ -2010,14 +2010,14 @@ exists); each impl sub-task flips a named slice green.
       Acceptance: closes the **multi-arch build** +
       **5-min quickstart `docker run`** + **dockerised psql smoke**
       slices of 5.31.A.
-- [ ] **5.31.C — GHA workflow: build → test → publish to GHCR**
+- [x] **5.31.C — GHA workflow: build → test → publish to GHCR**
       (~1 day, on tag). Multi-arch build via `docker/build-push-action`;
       smoke step runs the docker-smoke.sh harness; on green +
       `v*` tag, push to GHCR; cosign-sign.
       Files: `.github/workflows/docker-publish.yml`.
       Acceptance: closes the **tag-publish to GHCR** slice of
       5.31.A after the next tag.
-- [ ] **5.31.D — Same to Docker Hub** (~half day). Mirror the
+- [x] **5.31.D — Same to Docker Hub** (~half day). Mirror the
       GHCR push job to `docker.io/basin/basin-server`; Docker Hub
       access token in repo secrets.
       Files: `.github/workflows/docker-publish.yml` (extend).
@@ -2061,7 +2061,7 @@ named slice green.
       `tests/integration/scripts/sample-saas-starter-smoke.sh`,
       `tests/integration/scripts/sample-ai-rag-app-smoke.sh`.
       Acceptance: harness compiles + reports red.
-- [ ] **5.32.B — `docs/tutorial.md` — getting-started walkthrough
+- [x] **5.32.B — `docs/tutorial.md` — getting-started walkthrough
       (CRUD + auth + first deployment)** (~3-5 days). 15-minute
       walkthrough: `npm install @bas-in/basin-js`, sign up, create
       project, schema (a few tables with RLS), auth signup +
