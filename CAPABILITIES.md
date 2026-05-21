@@ -293,6 +293,7 @@ above are honest recommendations.
 | Tool | Supported | Notes |
 |------|-----------|-------|
 | Flyway | untested (needs flyway CLI in CI) | 10-migration fixture exists at `tests/integration/fixtures/migration-tool-scaffold/flyway/sql/`. Test (`migration_tool_flyway.rs`) skips cleanly when `flyway` binary is absent. Known potential gaps: `SET search_path`, `pg_advisory_lock`, `SHOW transaction_isolation`, composite PKs, `ALTER TABLE ADD COLUMN DEFAULT`. Run with `cargo test … -- --ignored` once Flyway CE ≥ 9.x + Java 17 are on PATH. |
+| golang-migrate | untested (needs golang-migrate CLI in CI) | 5-migration up/down fixture at `tests/integration/fixtures/migration-tool-scaffold/golang-migrate/`. Test (`migration_tool_golang_migrate.rs`) covers `migrate up`, `down`, `version`, `force`; skips cleanly when `migrate` binary is absent. Primary known risk: `pg_advisory_lock` — golang-migrate calls `SELECT pg_advisory_lock($1)` before writing to `schema_migrations`; Basin must return a no-op row rather than an error. Secondary gaps: `SET search_path`, `SELECT current_schema()`. Install: `curl -L https://github.com/golang-migrate/migrate/releases/download/v4.18.1/migrate.linux-amd64.tar.gz \| tar xz -C /usr/local/bin`. |
 
 ---
 
