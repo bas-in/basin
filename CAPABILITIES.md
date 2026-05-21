@@ -288,6 +288,12 @@ Basin's wedge is multi-project SaaS with audit-log workloads where storage
 cost and per-project isolation dominate. If your shape doesn't match, the
 above are honest recommendations.
 
+## Migration tools
+
+| Tool | Supported | Notes |
+|------|-----------|-------|
+| Flyway | untested (needs flyway CLI in CI) | 10-migration fixture exists at `tests/integration/fixtures/migration-tool-scaffold/flyway/sql/`. Test (`migration_tool_flyway.rs`) skips cleanly when `flyway` binary is absent. Known potential gaps: `SET search_path`, `pg_advisory_lock`, `SHOW transaction_isolation`, composite PKs, `ALTER TABLE ADD COLUMN DEFAULT`. Run with `cargo test … -- --ignored` once Flyway CE ≥ 9.x + Java 17 are on PATH. |
+
 ---
 
-*Last updated: 2026-05-20. This file is hand-maintained; PRs welcome.*
+*Last updated: 2026-05-21. This file is hand-maintained; PRs welcome.*
