@@ -1,0 +1,78 @@
+# Phase 5.32.A — CI harness for the Basin tutorial and sample applications.
+#
+# LANDING STATE: This workflow lands RED until the following phases complete:
+#   5.32.B  docs/tutorial.md authored          (tutorial-smoke job)
+#   5.32.C  examples/saas-starter/ scaffolded  (saas-starter-smoke job)
+#   5.32.D  examples/ai-rag-app/ scaffolded    (ai-rag-app-smoke job)
+#
+# Until those artifacts exist, each job script detects the missing path and
+# exits 0 with a skip message — so this workflow itself stays green, but
+# the downstream real assertions are exercised once the artifacts land.
+
+name: Tutorial & Sample Apps Smoke
+
+on:
+  pull_request:
+    branches: [main, master]
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Tutorial smoke ────────────────────────────────────────────────────────
+  # Runs every command in docs/tutorial.md top-to-bottom and asserts output.
+  # Skips cleanly until 5.32.B lands.
+  tutorial-smoke:
+    name: Tutorial smoke
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run tutorial smoke
+        run: bash tests/integration/scripts/tutorial-smoke.sh
+
+  # ── SaaS Starter smoke ────────────────────────────────────────────────────
+  # npm ci + npm test + npm run build for examples/saas-starter/.
+  # Skips cleanly until 5.32.C lands.
+  saas-starter-smoke:
+    name: SaaS Starter smoke
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache-dependency-path: examples/saas-starter/package-lock.json
+
+      - name: Run SaaS Starter smoke
+        run: bash tests/integration/scripts/sample-saas-starter-smoke.sh
+
+  # ── AI RAG App smoke ──────────────────────────────────────────────────────
+  # npm ci + npm test + npm run build for examples/ai-rag-app/.
+  # Skips cleanly until 5.32.D lands.
+  ai-rag-app-smoke:
+    name: AI RAG App smoke
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache-dependency-path: examples/ai-rag-app/package-lock.json
+
+      - name: Run AI RAG App smoke
+        run: bash tests/integration/scripts/sample-ai-rag-app-smoke.sh
