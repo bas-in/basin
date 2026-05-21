@@ -1,0 +1,41 @@
+# Phase 5.31.B — keep the Docker build context small.
+# Only Rust source and manifests are needed; everything else is excluded.
+
+# Build artifacts (largest exclusion — can be gigabytes)
+target/
+
+# Version control
+.git/
+.gitignore
+.gitattributes
+
+# Benchmarks (not needed for the image build)
+benchmark/
+
+# Test fixtures and scripts (heavy assets); the Cargo.toml members must remain
+# reachable so the workspace resolver can parse them — only exclude non-Rust assets.
+tests/integration/fixtures/
+tests/integration/scripts/
+tests/integration/go/
+tests/integration/python/
+tests/integration/suite/
+
+# Documentation
+docs/
+*.md
+
+# CI / GitHub Actions
+.github/
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local Claude config
+.claude/
+
+# Docker files themselves (no need to copy into context)
+Dockerfile
+.dockerignore
