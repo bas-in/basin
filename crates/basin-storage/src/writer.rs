@@ -217,21 +217,24 @@ pub(crate) async fn write_batch_with_options(
         &sorted_batch_owned
     };
 
-    // ADR 0024 — UUID-as-Decimal128 storage encoding (Vortex only).
+    // ADR 0024 — UUID-as-Decimal256 storage encoding (Vortex only).
     // Vortex 0.70 has no FixedSizeBinary(N) encoder, so any UUID column
-    // (Arrow `FixedSizeBinary(16)` + `BASIN_TYPE=UUID` field metadata) would
-    // otherwise fail to encode. We reinterpret the 16-byte UUID buffer as
-    // the unsigned big-endian magnitude of a `Decimal128(38, 0)` before
-    // handing the batch to Vortex; the read path performs the inverse so
-    // basin-engine, planner, pgwire, REST keep seeing UUIDs. Parquet has
-    // native FixedSizeBinary support so the translation is skipped.
+    // (Arrow `FixedSizeBinary(16)` + `BASIN_TYPE=UUID` field metadata)
+    // would otherwise fail to encode. We reinterpret the 16-byte UUID
+    // buffer as the unsigned big-endian magnitude of a `Decimal256(39, 0)`
+    // before handing the batch to Vortex; the read path performs the
+    // inverse so basin-engine, planner, pgwire, REST keep seeing UUIDs.
+    // Parquet has native FixedSizeBinary support so the translation is
+    // skipped. (ADR 0024 originally proposed Decimal128(38, 0); see
+    // `uuid_fsb_to_decimal256` for why Decimal256 is required for
+    // lossless coverage of every UUID bit-pattern.)
     // TODO(adr-0024): drop this branch once vortex-data/vortex grows a
     // `FixedSizeBinary(N)` encoder and basin-engine pins the new release;
-    // every uuid-disguised Decimal128 file already on disk is identifiable
+    // every uuid-disguised Decimal256 file already on disk is identifiable
     // by its BASIN_TYPE=UUID field marker.
     let uuid_xlated_owned;
     let batch_for_encode = match opts.file_format {
-        FileFormat::Vortex => match uuid_fsb_to_decimal128(batch_to_write) {
+        FileFormat::Vortex => match uuid_fsb_to_decimal256(batch_to_write) {
             Some(b) => {
                 uuid_xlated_owned = b;
                 &uuid_xlated_owned
@@ -408,19 +411,32 @@ fn field_is_uuid_fsb(field: &Field) -> bool {
 
 /// ADR 0024 — write-side reinterpretation. Walks `batch`'s schema; for every
 /// column with Arrow type `FixedSizeBinary(16)` AND field metadata
-/// `BASIN_TYPE=UUID`, reinterprets the 16-byte buffer as
-/// `Decimal128(38, 0)` (unsigned big-endian magnitude) so the Vortex codec
-/// can encode the column. Field metadata is preserved on the rebuilt
-/// schema; the read path keys off `BASIN_TYPE=UUID + Decimal128(38, 0)`
-/// to perform the inverse.
+/// `BASIN_TYPE=UUID`, reinterprets the 16-byte buffer as the unsigned
+/// big-endian magnitude of a `Decimal256(39, 0)` value so the Vortex
+/// codec can encode the column. Field metadata is preserved on the
+/// rebuilt schema; the read path keys off `BASIN_TYPE=UUID +
+/// Decimal256(39, 0)` to perform the inverse.
+///
+/// ## Why Decimal256 and not Decimal128
+///
+/// ADR 0024's original strawman used Decimal128(38, 0). That representation
+/// cannot losslessly hold every 128-bit UUID: `Decimal128(38, 0)` rejects
+/// any value whose absolute magnitude is ≥ 10^38, but i128 reinterpretation
+/// of a UUID with the high bit set reaches |v| ≈ 1.7×10^38 (and a true
+/// unsigned magnitude reaches 2^128 ≈ 3.4×10^38). Vortex's scalar validator
+/// surfaces this as `"decimal value … does not fit in precision of
+/// decimal(38, 0)"` for roughly 70 % of randomly-generated UUIDs.
+/// `Decimal256(39, 0)` fits up to 10^39 - 1, comfortably above 2^128, so
+/// every UUID bit-pattern round-trips losslessly.
 ///
 /// Returns `None` when no column needs translation — the caller reuses the
 /// original `batch` without an Arc-clone.
 ///
 /// TODO(adr-0024): delete when Vortex grows native `FixedSizeBinary(N)`
 /// encoding and basin-engine pins the new release.
-fn uuid_fsb_to_decimal128(batch: &RecordBatch) -> Option<RecordBatch> {
-    use arrow_array::{Decimal128Array, FixedSizeBinaryArray};
+fn uuid_fsb_to_decimal256(batch: &RecordBatch) -> Option<RecordBatch> {
+    use arrow_array::{Decimal256Array, FixedSizeBinaryArray};
+    use arrow_buffer::i256;
 
     let schema = batch.schema();
     let needs_xlate = schema
@@ -441,29 +457,28 @@ fn uuid_fsb_to_decimal128(batch: &RecordBatch) -> Option<RecordBatch> {
                 .downcast_ref::<FixedSizeBinaryArray>()
                 .expect("UUID column must be FixedSizeBinaryArray");
             let len = src.len();
-            // Build the array as `Vec<Option<i128>>` so nulls propagate. The
-            // 16 UUID bytes are interpreted as a big-endian *bit pattern* and
-            // round-tripped exactly in the read path via `to_be_bytes()`. We
-            // do not depend on the signed/unsigned reinterpretation of the
-            // high bit because the engine sorts UUIDs at the
-            // `FixedSizeBinary(16)` layer post-inverse — the on-disk
-            // Decimal128 ordering never reaches a user.
-            let mut values: Vec<Option<i128>> = Vec::with_capacity(len);
+            // Pad the 16 UUID bytes with 16 leading zero bytes to form a
+            // 32-byte big-endian *unsigned* i256. The leading zeros pin
+            // the sign bit to 0, so every UUID maps to a non-negative
+            // i256 in [0, 2^128) — well below the Decimal256(39, 0)
+            // precision bound of 10^39 - 1. The read path strips the
+            // padding via `to_be_bytes()` and takes the last 16 bytes.
+            let mut values: Vec<Option<i256>> = Vec::with_capacity(len);
             for r in 0..len {
                 if src.is_null(r) {
                     values.push(None);
                 } else {
-                    let mut buf = [0u8; 16];
-                    buf.copy_from_slice(src.value(r));
-                    values.push(Some(i128::from_be_bytes(buf)));
+                    let mut buf = [0u8; 32];
+                    buf[16..32].copy_from_slice(src.value(r));
+                    values.push(Some(i256::from_be_bytes(buf)));
                 }
             }
-            let arr = Decimal128Array::from(values)
-                .with_precision_and_scale(38, 0)
-                .expect("Decimal128(38, 0) precision is valid");
+            let arr = Decimal256Array::from(values)
+                .with_precision_and_scale(39, 0)
+                .expect("Decimal256(39, 0) precision is valid");
             let new_field = Field::new(
                 f.name(),
-                DataType::Decimal128(38, 0),
+                DataType::Decimal256(39, 0),
                 f.is_nullable(),
             )
             .with_metadata(f.metadata().clone());
@@ -480,7 +495,7 @@ fn uuid_fsb_to_decimal128(batch: &RecordBatch) -> Option<RecordBatch> {
     ));
     Some(
         RecordBatch::try_new(new_schema, new_cols)
-            .expect("uuid_fsb_to_decimal128: metadata-only schema replacement cannot fail"),
+            .expect("uuid_fsb_to_decimal256: metadata-only schema replacement cannot fail"),
     )
 }
 

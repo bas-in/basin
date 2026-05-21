@@ -1524,6 +1524,7 @@ dependencies = [
  "aes-gcm",
  "arrow",
  "arrow-array",
+ "arrow-buffer",
  "arrow-schema",
  "arrow-select",
  "async-trait",

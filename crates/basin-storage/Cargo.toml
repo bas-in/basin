@@ -17,6 +17,7 @@ async-trait.workspace = true
 bytes.workspace = true
 arrow.workspace = true
 arrow-array.workspace = true
+arrow-buffer = "58"
 arrow-schema.workspace = true
 arrow-select.workspace = true
 parquet.workspace = true

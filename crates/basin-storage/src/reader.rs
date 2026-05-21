@@ -624,11 +624,11 @@ async fn read_one(
     // a Parquet file — so Vortex is safe on every read path, not just the
     // table-aware one.
     if path.as_ref().ends_with(".vortex") {
-        // ADR 0024 — UUID-as-Decimal128 storage encoding. The catalog
+        // ADR 0024 — UUID-as-Decimal256 storage encoding. The catalog
         // schema reports UUID columns as `FixedSizeBinary(16)`, but on
-        // disk (and via Vortex's executor) they are `Decimal128(38, 0)`.
+        // disk (and via Vortex's executor) they are `Decimal256(39, 0)`.
         // We must hand Vortex the *physical* schema so
-        // `execute_record_batch` doesn't try to cast Decimal128→FSB(16)
+        // `execute_record_batch` doesn't try to cast Decimal256→FSB(16)
         // (Vortex 0.70 has no FSB encoder and the cast fails). The
         // post-decode inverse in `vortex_project_and_filter` will
         // re-stamp the BASIN_TYPE marker and reinterpret the buffer
@@ -636,7 +636,7 @@ async fn read_one(
         // TODO(adr-0024): drop when vortex grows native FSB(N) support.
         let schema = catalog_schema
             .as_ref()
-            .map(|s| Arc::new(catalog_schema_uuid_to_decimal128(s.as_ref())));
+            .map(|s| Arc::new(catalog_schema_uuid_to_decimal256(s.as_ref())));
 
         // Two byte-acquisition paths must feed the Vortex decoder:
         //   (a) envelope-encrypted: a `<path>.wrapped` sidecar exists, so we
@@ -1536,16 +1536,16 @@ fn vortex_project_and_filter(
         // on decode, so semantic types (MONEY, INET, …) would otherwise be
         // downgraded to their physical Arrow type post-storage.
         let restamped = restamp_field_metadata_from_catalog(projected, catalog_schema);
-        // ADR 0024 — UUID-as-Decimal128 read-side inverse. The write path
+        // ADR 0024 — UUID-as-Decimal256 read-side inverse. The write path
         // reinterprets `FixedSizeBinary(16) + BASIN_TYPE=UUID` columns as
-        // `Decimal128(38, 0)` before handing to Vortex; restore the UUID
+        // `Decimal256(39, 0)` before handing to Vortex; restore the UUID
         // layout here so basin-engine, planner, pgwire, and REST keep
         // seeing UUIDs above the storage trait. Restamping above is the
         // load-bearing pre-condition: without `BASIN_TYPE=UUID` on the
         // post-decode schema we cannot distinguish a UUID-disguised
-        // Decimal128 from a genuine `NUMERIC(38, 0)` column.
+        // Decimal256 from a genuine wide-precision NUMERIC column.
         // TODO(adr-0024): drop when vortex grows native FixedSizeBinary(N).
-        let restored = decimal128_to_uuid_fsb(restamped);
+        let restored = decimal256_to_uuid_fsb(restamped);
         out.push(restored);
     }
     Ok(out)
@@ -1727,12 +1727,12 @@ const BASIN_TYPE_KEY: &str = "BASIN_TYPE";
 const BASIN_TYPE_UUID: &str = "UUID";
 
 /// ADR 0024 — translate the catalog schema so UUID columns claim
-/// `Decimal128(38, 0)` instead of `FixedSizeBinary(16)`. Vortex 0.70 has
+/// `Decimal256(39, 0)` instead of `FixedSizeBinary(16)`. Vortex 0.70 has
 /// no FSB encoder, so the on-disk physical representation chosen by the
-/// write path is Decimal128; if we hand the catalog schema (which says
-/// FSB) to Vortex's `execute_record_batch`, it tries to cast Decimal128
+/// write path is Decimal256; if we hand the catalog schema (which says
+/// FSB) to Vortex's `execute_record_batch`, it tries to cast Decimal256
 /// → FSB and fails ("Conversion to Arrow type FixedSizeBinary(16) is not
-/// supported"). The post-decode inverse in `decimal128_to_uuid_fsb`
+/// supported"). The post-decode inverse in `decimal256_to_uuid_fsb`
 /// rebuilds the FSB layout for callers above the storage trait, so the
 /// disguise is invisible to basin-engine.
 ///
@@ -1741,7 +1741,7 @@ const BASIN_TYPE_UUID: &str = "UUID";
 ///
 /// TODO(adr-0024): drop when Vortex grows native `FixedSizeBinary(N)`
 /// encoding and basin-engine pins the new release.
-fn catalog_schema_uuid_to_decimal128(schema: &Schema) -> Schema {
+fn catalog_schema_uuid_to_decimal256(schema: &Schema) -> Schema {
     let new_fields: Vec<Field> = schema
         .fields()
         .iter()
@@ -1752,7 +1752,7 @@ fn catalog_schema_uuid_to_decimal128(schema: &Schema) -> Schema {
             ) && f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str())
                 == Some(BASIN_TYPE_UUID);
             if is_uuid_fsb {
-                Field::new(f.name(), arrow_schema::DataType::Decimal128(38, 0), f.is_nullable())
+                Field::new(f.name(), arrow_schema::DataType::Decimal256(39, 0), f.is_nullable())
                     .with_metadata(f.metadata().clone())
             } else {
                 f.as_ref().clone()
@@ -1762,22 +1762,22 @@ fn catalog_schema_uuid_to_decimal128(schema: &Schema) -> Schema {
     Schema::new_with_metadata(new_fields, schema.metadata().clone())
 }
 
-/// ADR 0024 — read-side inverse of `writer::uuid_fsb_to_decimal128`. Walks
-/// `batch`'s schema; for every column with Arrow type `Decimal128(38, 0)`
-/// AND field metadata `BASIN_TYPE=UUID`, reinterprets each 128-bit
-/// magnitude (big-endian) back to `FixedSizeBinary(16)` so the rest of
-/// Basin keeps seeing UUIDs.
+/// ADR 0024 — read-side inverse of `writer::uuid_fsb_to_decimal256`. Walks
+/// `batch`'s schema; for every column with Arrow type `Decimal256(39, 0)`
+/// AND field metadata `BASIN_TYPE=UUID`, strips the 16-byte leading zero
+/// padding the writer added and rebuilds `FixedSizeBinary(16)` so the
+/// rest of Basin keeps seeing UUIDs.
 ///
 /// Returns the input batch unchanged when no column needs translation.
 ///
 /// TODO(adr-0024): drop when Vortex grows native `FixedSizeBinary(N)`
 /// encoding and basin-engine pins the new release.
-fn decimal128_to_uuid_fsb(batch: RecordBatch) -> RecordBatch {
-    use arrow_array::{Array, Decimal128Array, FixedSizeBinaryArray};
+fn decimal256_to_uuid_fsb(batch: RecordBatch) -> RecordBatch {
+    use arrow_array::{Array, Decimal256Array, FixedSizeBinaryArray};
 
     let schema = batch.schema();
     let needs_xlate = schema.fields().iter().any(|f| {
-        matches!(f.data_type(), arrow_schema::DataType::Decimal128(38, 0))
+        matches!(f.data_type(), arrow_schema::DataType::Decimal256(39, 0))
             && f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_UUID)
     });
     if !needs_xlate {
@@ -1787,27 +1787,28 @@ fn decimal128_to_uuid_fsb(batch: RecordBatch) -> RecordBatch {
     let mut new_fields: Vec<Field> = Vec::with_capacity(schema.fields().len());
     let mut new_cols: Vec<arrow_array::ArrayRef> = Vec::with_capacity(batch.num_columns());
     for (i, f) in schema.fields().iter().enumerate() {
-        let is_uuid = matches!(f.data_type(), arrow_schema::DataType::Decimal128(38, 0))
+        let is_uuid = matches!(f.data_type(), arrow_schema::DataType::Decimal256(39, 0))
             && f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_UUID);
         if is_uuid {
             let src = batch
                 .column(i)
                 .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .expect("UUID-disguised column must be Decimal128Array");
+                .downcast_ref::<Decimal256Array>()
+                .expect("UUID-disguised column must be Decimal256Array");
             let len = src.len();
             // Build via the per-row sparse-iterator helper: it accepts
             // `Option<[u8; 16]>` and constructs the FixedSizeBinaryArray
-            // with the right null mask. Avoids hand-rolling the underlying
-            // Buffer / NullBuffer with arrow-buffer (not a direct dep here).
+            // with the right null mask. The writer left-padded the 16-byte
+            // UUID with 16 zero bytes to form a 32-byte non-negative
+            // `i256`; the inverse is `to_be_bytes()[16..32]`.
             let rows = (0..len).map(|r| {
                 if src.is_null(r) {
                     None
                 } else {
-                    // `i128::to_be_bytes()` is exactly the inverse of
-                    // `i128::from_be_bytes()` used in the writer, so the 16
-                    // UUID bytes round-trip identically.
-                    Some(src.value(r).to_be_bytes())
+                    let full = src.value(r).to_be_bytes();
+                    let mut buf = [0u8; 16];
+                    buf.copy_from_slice(&full[16..32]);
+                    Some(buf)
                 }
             });
             let arr = FixedSizeBinaryArray::try_from_sparse_iter_with_size(rows, 16)
@@ -1827,7 +1828,7 @@ fn decimal128_to_uuid_fsb(batch: RecordBatch) -> RecordBatch {
         schema.metadata().clone(),
     ));
     RecordBatch::try_new(new_schema, new_cols)
-        .expect("decimal128_to_uuid_fsb: schema swap cannot fail")
+        .expect("decimal256_to_uuid_fsb: schema swap cannot fail")
 }
 
 fn synthesise_missing_columns(
