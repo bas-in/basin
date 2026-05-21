@@ -970,13 +970,13 @@ fn audit_p1_4_recovery_code_hash_format_documented() {
 /// (no `claims.project_id == path_project_id` check in `admin.rs`). Fix
 /// not landed; recorded as `#[ignore]`d.
 #[test]
-#[ignore = "audit P1-5: admin endpoints lack per-tenant binding; fix not landed"]
+#[ignore = "audit P1-5: admin endpoints lack per-project binding; fix not landed"]
 fn audit_p1_5_admin_rotate_other_project_rejected() {
     // Shape (once fixed): mint admin JWT bound to project A, attempt
     // POST /admin/v1/projects/<B's pgwire_user>/rotate with that JWT →
     // expect 403 (not 200). Requires the rest+auth fixture from
     // `per_project_credentials.rs`.
-    panic!("audit P1-5 fix not landed; un-ignore once admin tenant binding is enforced");
+    panic!("audit P1-5 fix not landed; un-ignore once admin project binding is enforced");
 }
 
 // --- audit P1 OAuth identity-link (shipped) ---------------------------------
@@ -1416,6 +1416,227 @@ fn sec_p1_33_alias_path_cannot_bypass_signed_url_verification() {
         "[security::sec_p1_33] (c) alias-path RLS gate (anon, no applicable policy → deny) PASS; \
          signed-URL segment disambiguation PASS"
     );
+}
+
+// --- 12. RLS UPDATE/DELETE enforced via USING predicate ----------------------
+
+/// #53 P0 gap: RLS USING must restrict which rows UPDATE/DELETE can touch.
+///
+/// alice's policy covers ALL commands with `USING (owner_id = current_user)`;
+/// a bare `UPDATE … SET amount = 0` (no WHERE) issued by alice must leave
+/// bob's row at amount = 200, and a bare `DELETE FROM orders` must leave
+/// bob's row in place.
+///
+/// Real P0 engine bug discovered: `exec_delete` in `dml_mutate.rs` does NOT
+/// merge the RLS USING predicate into the DELETE WHERE filter. A bare
+/// `DELETE FROM orders` as alice removes ALL rows — including bob's — because
+/// the predicate-pruner sees no WHERE clause and drops every file. Only the
+/// INSERT/UPDATE WITH CHECK path runs `enforce_with_check`; the DELETE path
+/// has no equivalent USING-based row filter.
+///
+/// Root cause: `crates/basin-engine/src/dml_mutate.rs::exec_delete` resolves
+/// `predicate_expr` from `delete.selection` only; it never loads
+/// `meta.policies` or calls `rls::build_policies_for_query` to inject a
+/// USING guard into the per-file row-evaluation pass. Fix: merge the
+/// applicable USING expression into `pred` before `file_outcome` is called.
+///
+/// Un-ignore when the fix ships.
+#[tokio::test]
+#[ignore = "P0 RLS bug — fix not landed; closes when engine fix ships (exec_delete must inject USING predicate into WHERE filter)"]
+async fn rls_update_delete_enforced() {
+    let (engine, t, _, _dir) = engine_with_two_projects();
+    let admin = engine.open_session(t).await.unwrap();
+    admin
+        .execute(
+            "CREATE TABLE orders (id BIGINT NOT NULL, owner_id TEXT NOT NULL, amount BIGINT NOT NULL)",
+        )
+        .await
+        .unwrap();
+    admin
+        .execute("INSERT INTO orders VALUES (1, 'alice', 100), (2, 'bob', 200)")
+        .await
+        .unwrap();
+    admin
+        .execute("ALTER TABLE orders ENABLE ROW LEVEL SECURITY")
+        .await
+        .unwrap();
+    admin
+        .execute(
+            "CREATE POLICY p ON orders FOR ALL TO PUBLIC USING (owner_id = current_user)",
+        )
+        .await
+        .unwrap();
+
+    // --- Phase 1: UPDATE without WHERE as alice ---
+    let alice = engine.open_session_as(t, "alice").await.unwrap();
+    alice
+        .execute("UPDATE orders SET amount = 0")
+        .await
+        .unwrap_or_else(|e| {
+            // UPDATE errored — that is also acceptable (deny-all under RLS).
+            // We still need to verify bob's row is untouched below.
+            println!("[rls_update_delete] UPDATE returned err (acceptable): {e}");
+            basin_engine::ExecResult::Empty { tag: "UPDATE 0".into() }
+        });
+
+    // Bob's row must still have amount = 200. Use bob's session so the RLS
+    // USING predicate resolves correctly (current_user = 'bob' → sees his row).
+    let bob = engine.open_session_as(t, "bob").await.unwrap();
+    let bob_after_update = bob
+        .execute("SELECT amount FROM orders WHERE owner_id = 'bob'")
+        .await
+        .unwrap();
+    let amounts = collect_int64(bob_after_update, "amount");
+    if amounts != vec![200] {
+        // Bob's row was mutated — this is a real P0 bug.
+        panic!(
+            "SECURITY P0 #53: RLS UPDATE/DELETE USING predicate not enforced — \
+             alice's UPDATE modified bob's row (amount became {:?}, expected [200]). \
+             Engine bug: exec_update does not merge the USING predicate into the \
+             WHERE filter before row evaluation.",
+            amounts
+        );
+    }
+    println!("[rls_update_delete] UPDATE phase PASS: bob amount still 200");
+
+    // --- Phase 2: DELETE without WHERE as alice ---
+    alice
+        .execute("DELETE FROM orders")
+        .await
+        .unwrap_or_else(|e| {
+            println!("[rls_update_delete] DELETE returned err (acceptable): {e}");
+            basin_engine::ExecResult::Empty { tag: "DELETE 0".into() }
+        });
+
+    // Bob's row must still exist. Use bob's session for the same reason.
+    let bob2 = engine.open_session_as(t, "bob").await.unwrap();
+    let bob_after_delete = bob2
+        .execute("SELECT id FROM orders WHERE owner_id = 'bob'")
+        .await
+        .unwrap();
+    let ids = collect_int64(bob_after_delete, "id");
+    if ids != vec![2] {
+        panic!(
+            "SECURITY P0 #53: RLS UPDATE/DELETE USING predicate not enforced — \
+             alice's DELETE removed bob's row (found ids={ids:?}, expected [2]). \
+             Engine bug: exec_delete does not merge the USING predicate into the \
+             WHERE filter before row evaluation."
+        );
+    }
+    println!("[rls_update_delete] DELETE phase PASS: bob row still present");
+}
+
+// --- 13. RLS WITH CHECK blocks cross-owner INSERT ----------------------------
+
+/// #53 P0 gap: RLS WITH CHECK must block an INSERT that sets owner_id to a
+/// different user.
+///
+/// alice attempts `INSERT INTO orders VALUES (99, 'bob', 999)` — the WITH
+/// CHECK expression `owner_id = current_user` evaluates to FALSE for that
+/// row, and the engine must reject with `BasinError::RlsViolation`.
+///
+/// A follow-up INSERT `(3, 'alice', 300)` must succeed (owner matches
+/// current_user).
+///
+/// If the engine does not enforce WITH CHECK on INSERT (or falls back to
+/// USING when no WITH CHECK is declared), the cross-owner row would be
+/// silently written — a P0 isolation breach. In that case the test is
+/// `#[ignore]`d.
+#[tokio::test]
+async fn rls_with_check_blocks_cross_owner_insert() {
+    let (engine, t, _, _dir) = engine_with_two_projects();
+    let admin = engine.open_session(t).await.unwrap();
+    admin
+        .execute(
+            "CREATE TABLE orders (id BIGINT NOT NULL, owner_id TEXT NOT NULL, amount BIGINT NOT NULL)",
+        )
+        .await
+        .unwrap();
+    admin
+        .execute("ALTER TABLE orders ENABLE ROW LEVEL SECURITY")
+        .await
+        .unwrap();
+    // A policy with explicit WITH CHECK that mirrors the USING clause.
+    // This is the standard Postgres pattern for INSERT/UPDATE restriction.
+    admin
+        .execute(
+            "CREATE POLICY p ON orders FOR ALL TO PUBLIC \
+             USING (owner_id = current_user) \
+             WITH CHECK (owner_id = current_user)",
+        )
+        .await
+        .unwrap();
+
+    let alice = engine.open_session_as(t, "alice").await.unwrap();
+
+    // --- Attempt cross-owner INSERT (must be rejected) ---
+    let cross_owner_result = alice
+        .execute("INSERT INTO orders VALUES (99, 'bob', 999)")
+        .await;
+
+    match cross_owner_result {
+        Err(basin_common::BasinError::RlsViolation(_)) => {
+            println!("[rls_with_check] cross-owner INSERT correctly rejected with RlsViolation");
+        }
+        Err(other) => {
+            // A different error variant is acceptable (permission denied, etc.)
+            // as long as the row was not written.
+            println!(
+                "[rls_with_check] cross-owner INSERT rejected with non-RlsViolation error \
+                 (still counts as correct rejection): {other:?}"
+            );
+        }
+        Ok(_) => {
+            // The row was accepted — verify whether it actually landed.
+            // Use alice's session; under the USING policy she can see her own
+            // rows. A row with owner_id='bob' would not match her policy, so
+            // if the enforcement is absent it would still land in storage even
+            // if alice can't SELECT it. Use a bob session to check for the leak.
+            let bob_check = engine.open_session_as(t, "bob").await.unwrap();
+            let leaked = bob_check
+                .execute("SELECT id FROM orders WHERE id = 99")
+                .await
+                .unwrap();
+            let ids = collect_int64(leaked, "id");
+            if !ids.is_empty() {
+                panic!(
+                    "SECURITY P0 #53: RLS WITH CHECK not enforced on INSERT — \
+                     alice was able to INSERT a row with owner_id='bob' (id=99 found in table). \
+                     Engine bug: enforce_with_check returned Ok for a row that violates the policy."
+                );
+            }
+            // Row was not written despite Ok return — treat as OK (idempotent no-op)
+            println!(
+                "[rls_with_check] cross-owner INSERT returned Ok but row not in table \
+                 (acceptable no-op behaviour)"
+            );
+        }
+    }
+
+    // --- Self-owner INSERT (must succeed) ---
+    alice
+        .execute("INSERT INTO orders VALUES (3, 'alice', 300)")
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "SECURITY P0 #53: RLS WITH CHECK blocked a valid self-owner INSERT — \
+                 alice could not insert her own row: {e}"
+            )
+        });
+
+    // Verify alice's row is present. Use alice's session so the RLS USING
+    // predicate (current_user = 'alice') allows her to see her own rows.
+    let alice_rows = alice
+        .execute("SELECT id FROM orders WHERE owner_id = 'alice'")
+        .await
+        .unwrap();
+    let ids = collect_int64(alice_rows, "id");
+    assert!(
+        ids.contains(&3),
+        "SECURITY P0 #53: alice's self-owner INSERT (id=3) is missing from the table \
+         after a successful execute; got ids={ids:?}"
+    );
+    println!("[rls_with_check] self-owner INSERT PASS: alice row id=3 present");
 }
 
 // ===========================================================================
