@@ -2090,6 +2090,47 @@ Sequencing: **A → B**, **A → D**, **B → C**, **A–D → E + F**.
 
 ---
 
+## Phase 6.TR — Type round-trip + UUID-in-Vortex workaround (ADR 0024) **(PRIORITY)**
+
+Surfaced by the post-Phase-6.X triage (task #40). Two clusters that
+share storage-layer plumbing; do them as one wave because C1 is gated
+on C4 and the fix lives in the same files.
+
+**Why this is priority:** UUID is the default primary-key type. Until
+C1 closes, any table with a UUID column can't be written to Vortex —
+the storage moat (ADR 0015) doesn't apply where customers most need it.
+C4 unblocks not just UUID but the entire `BASIN_TYPE`-tagged logical-type
+family (MONEY, INET, CIDR, MACADDR, MACADDR8, BIT, VARBIT) — 7 extra_types
+tests + 3 UUID tests = 10 ignores removed in one wave.
+
+- [ ] **6.TR.A — `BASIN_TYPE` field-level metadata round-trip** (cluster C4).
+      Write path preserves field metadata into Vortex; read path restores
+      it on the way back. The 7 `extra_types` tests already encode the
+      desired behavior — they currently fail because the metadata is lost,
+      so the reader can't tell `Decimal128` from `MONEY`, `FixedSizeBinary(6)`
+      from `MACADDR`, etc. **Blocks 6.TR.B; pays for itself across MONEY,
+      INET, CIDR, MACADDR, MACADDR8, BIT, VARBIT** beyond the UUID work.
+- [ ] **6.TR.B — UUID-as-Decimal128 storage encoding** (cluster C1, ADR 0024).
+      Single-boundary translation in basin-storage: `FixedSizeBinary(16) +
+      BASIN_TYPE="uuid"` ↔ `Decimal128(38, 0) + BASIN_TYPE="uuid"` (BE
+      unsigned magnitude). Engine, planner, pgwire, REST keep treating
+      UUID as `FixedSizeBinary(16)` — the translation is hidden below the
+      storage trait. Tag the conditional branches `TODO(adr-0024)` so the
+      eventual upstream-Vortex removal is mechanical. Closes
+      `jsonb_uuid_param_binding`, `smoke_pgx`, `viability_uuid`.
+- [ ] **6.TR.C — Upstream Vortex `FixedSizeBinary(N)` encoder PR** (parallel
+      track, no Basin-side blocking work). Open a PR to vortex-data/vortex
+      adding the encoder; when it lands and we pin the new version,
+      delete the 6.TR.B translation layer (the `BASIN_TYPE` sidecar from
+      6.TR.A stays — it's still needed for the other logical types).
+
+> **Explicitly out of scope for 6.TR:** changing engine/planner/pgwire to
+> see Decimal128 instead of UUID — that would leak the storage detail
+> across the codebase. The whole point of ADR 0024 is that the boundary
+> is single-layer.
+
+---
+
 ## Phase 6 — Production hardening (3–4 months)
 
 - [x] **Subsystem Cargo feature flags + minimal pgwire-only build** (ADR 0018) —
