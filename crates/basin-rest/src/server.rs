@@ -46,6 +46,11 @@ pub(crate) struct Inner {
     /// //      the same object_store as the engine; the catalog metadata lives
     /// //      only in-process.
     pub(crate) blob_store: BlobStore<InMemoryBlobCatalog>,
+    /// Phase 6.X.D — optional coordinator-handed slice gate for the
+    /// per-project `RestQps` cap (ADR 0023). When attached, every authed
+    /// request consumes one token from the slice for
+    /// `(claims.project_id, RestQps)`. Exhausted slice → 429.
+    pub(crate) slice_gate: Option<basin_catalog::SliceGate>,
 }
 
 impl Inner {
@@ -67,7 +72,16 @@ impl Inner {
             rate_limiter: basin_auth::rate_limit::PerKey::per_minute(rate, "rest_per_project"),
             blob_store,
             cfg,
+            slice_gate: None,
         }
+    }
+
+    /// Phase 6.X.D — attach a heartbeat-reconciled slice gate for the
+    /// per-project REST QPS cap.
+    #[allow(dead_code)]
+    pub(crate) fn with_slice_gate(mut self, gate: basin_catalog::SliceGate) -> Self {
+        self.slice_gate = Some(gate);
+        self
     }
 }
 
@@ -293,6 +307,21 @@ pub(crate) async fn authorize(
         .rate_limiter
         .check(&claims.project_id.to_string())
         .map_err(|_| ApiError::rate_limited("per-project rate limit exceeded"))?;
+
+    // Phase 6.X.D — heartbeat-reconciled slice gate for RestQps. No-op when
+    // slice_gate is None (back-compat) or when the slice has never been set
+    // (coordinator silent / project uncapped → `PerKey` is the cap).
+    if let Some(gate) = state.slice_gate.as_ref() {
+        if gate
+            .try_consume(claims.project_id, basin_catalog::CapKind::RestQps, 1)
+            .await
+            .is_err()
+        {
+            return Err(ApiError::rate_limited(
+                "per-project rate limit exceeded (coordinator-handed slice)",
+            ));
+        }
+    }
 
     Ok(claims)
 }
