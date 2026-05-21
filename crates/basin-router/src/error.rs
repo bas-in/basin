@@ -62,6 +62,11 @@ fn classify(err: &BasinError) -> (&'static str, &'static str) {
         // retryable (same SQLSTATE class as commit conflict, since the
         // caller should retry from a fresh route + re-resolved owner).
         BasinError::LeaseHandoffInProgress(_) => ("ERROR", "40001"), // serialization_failure
+        // Phase 5.28.B: lock_timeout expiry — PostgreSQL raises 55P03.
+        BasinError::LockNotAvailable(_) => ("ERROR", "55P03"), // lock_not_available
+        // Phase 5.28.C: idle_in_transaction_session_timeout — PostgreSQL
+        // terminates the session as FATAL with 25P03.
+        BasinError::IdleInTransactionTimeout(_) => ("FATAL", "25P03"), // idle_in_transaction_session_timeout
         BasinError::IsolationViolation(_) => ("FATAL", "XX000"),
         // Coarse-grained internal categories all collapse to XX000.
         BasinError::Storage(_)
