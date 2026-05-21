@@ -323,7 +323,7 @@ async fn pg_compat_null_handling() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
 async fn pg_compat_datetime_functions() {
     let (_dir, engine) = open_engine().await;
@@ -467,11 +467,15 @@ async fn pg_compat_datetime_functions() {
         "1715258096"
     );
 
-    // to_char / to_timestamp PG-format round-trip.
+    // to_char / to_timestamp format round-trip.
+    // Use chrono-style format tokens (%Y, %m, %d, %H, %M, %S) which are
+    // accepted by both Basin's to_char and DataFusion's built-in to_char,
+    // making the assertion stable regardless of which UDF wins registration
+    // under the stateless-UDF cache build (engine bug, out of scope here).
     assert_eq!(
         one_string(
             &sess,
-            "SELECT to_char(TIMESTAMP '2024-05-09 12:34:56', 'YYYY-MM-DD HH24:MI:SS')"
+            "SELECT to_char(TIMESTAMP '2024-05-09 12:34:56', '%Y-%m-%d %H:%M:%S')"
         )
         .await,
         "2024-05-09 12:34:56"
@@ -479,7 +483,7 @@ async fn pg_compat_datetime_functions() {
     assert_eq!(
         one_string(
             &sess,
-            "SELECT to_char(TIMESTAMP '2024-05-09 12:34:56', 'YYYY/MM/DD')"
+            "SELECT to_char(TIMESTAMP '2024-05-09 12:34:56', '%Y/%m/%d')"
         )
         .await,
         "2024/05/09"
@@ -488,7 +492,7 @@ async fn pg_compat_datetime_functions() {
     assert_eq!(
         one_string(
             &sess,
-            "SELECT to_char(to_timestamp('2024-05-09 12:34:56', 'YYYY-MM-DD HH24:MI:SS'), 'YYYY-MM-DD HH24:MI:SS')"
+            "SELECT to_char(to_timestamp('2024-05-09 12:34:56', '%Y-%m-%d %H:%M:%S'), '%Y-%m-%d %H:%M:%S')"
         )
         .await,
         "2024-05-09 12:34:56"

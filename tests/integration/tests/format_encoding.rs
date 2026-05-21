@@ -25,7 +25,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, BinaryArray, Int32Array, Int64Array, StringArray};
+use arrow_array::{Array, BinaryArray, Date32Array, Int32Array, Int64Array, StringArray};
 use arrow_schema::DataType;
 
 fn bytes_to_hex(bytes: &[u8]) -> String {
@@ -103,6 +103,17 @@ fn render_scalar(arr: &dyn Array, i: usize) -> String {
             let bytes = arr.as_any().downcast_ref::<BinaryArray>().unwrap().value(i);
             // Render as hex for stable test comparison.
             bytes_to_hex(bytes)
+        }
+        DataType::Date32 => {
+            // Days since 1970-01-01 (Unix epoch). Render as ISO 8601 calendar
+            // date so test assertions read like the PG output without depending
+            // on the to_char UDF. The offset 719_163 converts from the Unix epoch
+            // (1970-01-01 = day 0) to the CE epoch (0001-01-01 = day 1) that
+            // chrono's `from_num_days_from_ce_opt` expects.
+            let days = arr.as_any().downcast_ref::<Date32Array>().unwrap().value(i);
+            chrono::NaiveDate::from_num_days_from_ce_opt(days + 719_163)
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| format!("Date32({days})"))
         }
         DataType::Null => "<NULL>".to_string(),
         other => format!("<unhandled {other:?}>"),
@@ -266,40 +277,30 @@ async fn to_char_numeric() {
 // to_date(text, fmt) → Date32
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
 async fn to_date_basic() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // Parse a DD-Mon-YYYY date string.
-    // We verify by formatting back with to_char to an ISO date.
+    // Render via the Date32 arm of render_scalar (ISO 8601) to avoid depending
+    // on the to_char UDF whose registration is non-deterministic under the
+    // stateless-UDF cache build (engine bug, out of scope to fix here).
     assert_eq!(
-        one_string(
-            &sess,
-            "SELECT to_char(to_date('09-May-2024', 'DD-Mon-YYYY'), 'YYYY-MM-DD')"
-        )
-        .await,
+        one_string(&sess, "SELECT to_date('09-May-2024', 'DD-Mon-YYYY')").await,
         "2024-05-09"
     );
 
     // Parse YYYY-MM-DD.
     assert_eq!(
-        one_string(
-            &sess,
-            "SELECT to_char(to_date('2024-05-09', 'YYYY-MM-DD'), 'YYYY-MM-DD')"
-        )
-        .await,
+        one_string(&sess, "SELECT to_date('2024-05-09', 'YYYY-MM-DD')").await,
         "2024-05-09"
     );
 
     // Parse MM/DD/YYYY.
     assert_eq!(
-        one_string(
-            &sess,
-            "SELECT to_char(to_date('05/09/2024', 'MM/DD/YYYY'), 'YYYY-MM-DD')"
-        )
-        .await,
+        one_string(&sess, "SELECT to_date('05/09/2024', 'MM/DD/YYYY')").await,
         "2024-05-09"
     );
 }
