@@ -6,6 +6,38 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-21 — #63 vortex 0.70→0.71 bump landed solo (arrow-58 held; 6/7 extra_types green)
+
+Commit `5d4c92d`. Ran SOLO (dep bump recompiles the whole downstream tree).
+
+- **arrow compat held:** vortex 0.71 still targets `arrow-* ^58`, matching the
+  workspace pin. No workspace arrow bump needed. **No basin source changes** —
+  basin-storage + basin-engine compiled cleanly against 0.71 (deprecation
+  warnings only). basin-storage (93) + basin-engine (15) tests green, zero
+  regressions.
+- **6 of 7 extra_types now green** (un-ignored in `extra_types.rs`): MONEY,
+  INET, CIDR, MACADDR, MACADDR8, BIT(8). The 0.71 vortex-datafusion
+  field-metadata fix (the reason for the bump) works — the `BASIN_TYPE`
+  sidecar now survives the DataFusion read path.
+
+**Two residuals it surfaced (NOT #63 scope; new follow-ups):**
+1. **`varbit_round_trip` still ignored** — `CREATE TABLE (c VARBIT(16))` fails
+   with "unsupported column type: VARBIT(16)". This is a **schema-layer gap**,
+   not a metadata issue: #47 added the BIT/VARBIT *sqlparser* variants but the
+   CREATE TABLE → Arrow schema mapping for `VARBIT(N)` is still missing. Small,
+   bounded engine task.
+2. **`viability_uuid` still ignored** — SELECT fails with "Cannot cast
+   Decimal256(39,0) to FixedSizeBinary(16)". The metadata now survives (good),
+   but ADR-0024's **read-path UUID translation** (strip pad bytes, reinterpret
+   Decimal256 magnitude → FixedSizeBinary(16)) is applied only in
+   basin-storage's own `read_batch`, NOT on the **vortex-datafusion read
+   path** that this test exercises. So DataFusion attempts a naive numeric→
+   binary cast and fails. Follow-up belongs to the #42/ADR-0024 cluster:
+   wire the UUID sidecar translation into the DataFusion scan output (or a
+   projection rewrite) so it matches the storage-trait read path.
+
+---
+
 ## 2026-05-21 — Post-wave3 baseline green; #64 engine fixes + 3 test-first harnesses landed (4-agent disjoint wave)
 
 **Baseline triage.** The clean `cargo test --workspace` baseline surfaced 12
