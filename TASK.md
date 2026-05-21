@@ -1268,7 +1268,7 @@ harness.
       Acceptance: `CREATE INDEX i ON t USING gin (data jsonb_path_ops);`
       persists; `\d t` in psql shows the index; the ORM-compat slice
       of 5.19.A (migration-applies) flips green.
-- [ ] **5.19.C — Containment probe** (`@>`, `<@`) (~1 week).
+- [x] **5.19.C — Containment probe** (`@>`, `<@`) (~1 week).
       Engine query planner uses the GIN index for containment when
       the query predicate matches the index operator class.
       Posting-list AND-merge for compound containment.
@@ -1621,18 +1621,18 @@ consistently.
 - [ ] **5.25.C — golang-migrate compat** (~1 day).
       `migrate up/down/version/force` against Basin. Files:
       `tests/integration/tests/migration_tool_golang_migrate.rs`.
-- [ ] **5.25.D — Diesel compat** (CLI + ORM) (~1 day). `diesel
+- [x] **5.25.D — Diesel compat** (CLI + ORM) (~1 day). `diesel
       migration run`, `diesel migration revert`, `diesel migration
       generate`; plus an ORM query battery against the migrated
       schema (CRUD round-trip; JSONB column queries via Diesel's
       `Jsonb` type). Files:
       `tests/integration/tests/migration_tool_diesel.rs`.
-- [ ] **5.25.E — sqlx-migrate compat** (~1 day). `sqlx migrate run`,
+- [x] **5.25.E — sqlx-migrate compat** (~1 day). `sqlx migrate run`,
       `sqlx migrate revert`; plus a compile-time-checked-query
       battery (`query!` / `query_as!` macros) against the migrated
       schema. Files:
       `tests/integration/tests/migration_tool_sqlx.rs`.
-- [ ] **5.25.F — Prisma migrate compat** (~1 day). This is the most
+- [x] **5.25.F — Prisma migrate compat** (~1 day). This is the most
       likely to find real gaps (Prisma introspects heavily); plus a
       Prisma Client query battery against the migrated schema. Files:
       `tests/integration/tests/migration_tool_prisma.rs`.
@@ -1774,7 +1774,7 @@ each impl sub-task flips a named slice green.
       back the connection. Files:
       `crates/basin-pool/src/tenant_isolation.rs` (extend).
       Acceptance: closes the **per-project isolation** slice of 5.27.A.
-- [ ] **5.27.E — Session-leakage scrub on return-to-pool** (~2 days).
+- [x] **5.27.E — Session-leakage scrub on return-to-pool** (~2 days).
       On connection return: DISCARD ALL semantics — reset GUCs to
       defaults, drop temp tables, clear advisory locks, drop
       prepared statements, unsubscribe LISTEN channels. Files:
@@ -2045,7 +2045,7 @@ complete app."
 red first (apps don't exist yet); each impl sub-task flips a
 named slice green.
 
-- [ ] **5.32.A — Tutorial + samples clean-build test harness**
+- [x] **5.32.A — Tutorial + samples clean-build test harness**
       (~1 day, lands first; lands red until apps exist). Three
       layers:
       (1) **Tutorial steps execute top-to-bottom:** every command
@@ -2069,7 +2069,7 @@ named slice green.
       deployment to basin-cloud. Files: `docs/tutorial.md`.
       Acceptance: closes the **tutorial steps execute** slice of
       5.32.A; engineer completes in ≤ 20 min on a clean machine.
-- [ ] **5.32.C — `examples/saas-starter/` — multi-tenant SaaS
+- [x] **5.32.C — `examples/saas-starter/` — multi-tenant SaaS
       reference app (Drizzle ORM + basin-auth + basin-rest +
       RLS)** (~1 week). Full small SaaS (CRM-shaped or
       todo-with-orgs): Drizzle ORM for schema/migrations,
@@ -2079,7 +2079,7 @@ named slice green.
       Files: `examples/saas-starter/` (new directory tree).
       Acceptance: closes the **`saas-starter` builds + runs +
       tests** slice of 5.32.A.
-- [ ] **5.32.D — `examples/ai-rag-app/` — AI/RAG reference app
+- [x] **5.32.D — `examples/ai-rag-app/` — AI/RAG reference app
       (basin-vector + chunks/embeddings/queries + basin-fn for
       the inference call)** (~1 week). Document chunking +
       embedding pipeline; basin-vector for similarity retrieval;
