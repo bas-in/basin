@@ -53,18 +53,30 @@ pub const MAX_HARD_CAP_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 /// Scheduling algorithm for the flush task when global memory pressure rises.
 ///
-/// `LargestFirst` is the default and matches ADR 0016. `Lru` is a stub
-/// reserved for future use as a configurable alternative; it is not yet wired
-/// into the flush executor.
+/// `LargestFirst` is the default and matches ADR 0016. `Lru` is reserved for
+/// future use but is **not implemented**: the flush scheduler requires a
+/// `last_write_at` timestamp per project which is not yet threaded through the
+/// `(project_id, bytes_allocated)` pairs accepted by
+/// [`GlobalPressureScheduler::pick_flush_candidates`].
+///
+/// Attempting to run the scheduler with `FlushPolicy::Lru` will panic. Use
+/// `largest_first` or `oldest_first` instead. Setting
+/// `BASIN_MEMTABLE_FLUSH_POLICY=lru` logs a warning and falls back to
+/// `largest_first`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FlushPolicy {
     /// Flush the project (or table) with the most bytes allocated first.
     /// Maximises memory reclaimed per flush I/O round-trip.
     #[default]
     LargestFirst,
-    /// Flush the project (or table) whose last flush was the longest ago.
-    /// Stub — not yet wired. Penalises write-light projects; documented
-    /// as non-default per ADR 0016.
+    /// **Not implemented.** Reserved for a future LRU-by-last-write-at policy.
+    ///
+    /// The flush scheduler does not yet carry `last_write_at` timestamps, so
+    /// this variant cannot be dispatched. Constructing a
+    /// [`GlobalPressureScheduler`] with this policy and then calling
+    /// [`GlobalPressureScheduler::pick_flush_candidates`] will panic.
+    ///
+    /// Use [`FlushPolicy::LargestFirst`] until this variant is wired.
     Lru,
 }
 
@@ -140,7 +152,14 @@ impl MemTableConfig {
                     cfg.flush_policy = FlushPolicy::LargestFirst;
                 }
                 "lru" => {
-                    cfg.flush_policy = FlushPolicy::Lru;
+                    // FlushPolicy::Lru is not implemented (no last_write_at in
+                    // the scheduler interface). Reject loudly and keep the
+                    // default so the process starts safely.
+                    tracing::warn!(
+                        "BASIN_MEMTABLE_FLUSH_POLICY=lru is not yet implemented \
+                         (flush_policy=lru not supported; use largest_first). \
+                         Falling back to largest_first."
+                    );
                 }
                 other => {
                     tracing::warn!(
@@ -272,6 +291,12 @@ impl GlobalPressureScheduler {
     ///   is active. The vec is sorted descending by bytes allocated; ties are
     ///   broken arbitrarily (not guaranteed to be stable across calls).
     ///
+    /// # Panics
+    ///
+    /// Panics if `self.policy == FlushPolicy::Lru`. That variant requires
+    /// per-project `last_write_at` timestamps which this interface does not
+    /// carry. Use [`FlushPolicy::LargestFirst`] until LRU is wired.
+    ///
     /// # Complexity
     ///
     /// O(n log n) on the number of active projects. At 10 000 active projects
@@ -293,8 +318,17 @@ impl GlobalPressureScheduler {
                 sorted.sort_unstable_by(|a, b| b.1.cmp(&a.1));
             }
             FlushPolicy::Lru => {
-                // Stub: Lru is not yet wired. Fall through to LargestFirst for now.
-                sorted.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+                // FlushPolicy::Lru requires per-project last_write_at timestamps
+                // which are not carried in the (project_id, bytes_allocated) slice.
+                // Reaching this arm is a configuration bug — the from_env() parser
+                // already warns and falls back to LargestFirst, so this path should
+                // be unreachable in production.
+                panic!(
+                    "FlushPolicy::Lru is not implemented: \
+                     pick_flush_candidates requires last_write_at timestamps that \
+                     are not present in the project_bytes slice. \
+                     Use FlushPolicy::LargestFirst instead."
+                );
             }
         }
 
@@ -425,6 +459,38 @@ mod tests {
         };
         let sched = GlobalPressureScheduler::from_config(&cfg);
         assert_eq!(sched.policy, FlushPolicy::Lru);
+    }
+
+    /// `FlushPolicy::Lru` panics when `pick_flush_candidates` is called because
+    /// the scheduler interface carries no `last_write_at` timestamps (#54 P1).
+    #[test]
+    #[should_panic(expected = "FlushPolicy::Lru is not implemented")]
+    fn scheduler_lru_pick_panics_not_silent() {
+        // Build a scheduler explicitly configured with Lru so we can verify the
+        // panic — this bypasses from_env which already rejects "lru".
+        let sched = GlobalPressureScheduler {
+            global_pressure_threshold_bytes: 0, // threshold=0 ensures pressure is always active
+            policy: FlushPolicy::Lru,
+        };
+        // 1 byte is enough to exceed the 0-byte threshold and reach the match arm.
+        let projects = vec![(1u64, 1u64)];
+        // This must panic, not silently fall through to LargestFirst.
+        let _ = sched.pick_flush_candidates(&projects, usize::MAX);
+    }
+
+    /// `from_env` with `BASIN_MEMTABLE_FLUSH_POLICY=lru` must warn and fall
+    /// back to `LargestFirst`, never silently install `Lru` (#54 P1).
+    #[test]
+    fn from_env_lru_falls_back_to_largest_first() {
+        // Temporarily set the env var for this test only.
+        std::env::set_var("BASIN_MEMTABLE_FLUSH_POLICY", "lru");
+        let cfg = MemTableConfig::from_env();
+        std::env::remove_var("BASIN_MEMTABLE_FLUSH_POLICY");
+        assert_eq!(
+            cfg.flush_policy,
+            FlushPolicy::LargestFirst,
+            "from_env must not install FlushPolicy::Lru — it should warn and fall back"
+        );
     }
 
     #[test]
