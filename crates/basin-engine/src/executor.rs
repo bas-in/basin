@@ -710,8 +710,25 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
         });
     }
 
-    // 5.11.N — `CREATE INBOUND WEBHOOK …` / `DROP INBOUND WEBHOOK …` (ADR 0019).
-    if let Some(i) = crate::inbound_webhook_ddl::match_create_inbound_webhook(sql)? { crate::inbound_webhook_ddl::exec_create_inbound_webhook(i, &sess.project, sess.engine.config().catalog.as_ref()).await?; return Ok(ExecResult::Empty { tag: "CREATE INBOUND WEBHOOK".into() }); }
+    // 5.11.N + 6.SEC.P0.3 — `CREATE INBOUND WEBHOOK …` returns the generated
+    // HMAC secret as a single-row `secret` result set so the creator can
+    // copy it once. `DROP INBOUND WEBHOOK …` is an empty side-effect.
+    if let Some(i) = crate::inbound_webhook_ddl::match_create_inbound_webhook(sql)? {
+        let secret_hex = crate::inbound_webhook_ddl::exec_create_inbound_webhook(
+            i,
+            &sess.project,
+            sess.engine.config().catalog.as_ref(),
+        )
+        .await?;
+        let schema = Arc::new(Schema::new(vec![Field::new("secret", DataType::Utf8, false)]));
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![secret_hex]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![arr])
+            .map_err(|e| BasinError::Internal(format!("build CREATE INBOUND WEBHOOK row: {e}")))?;
+        return Ok(ExecResult::Rows {
+            schema,
+            batches: vec![batch],
+        });
+    }
     if let Some(i) = crate::inbound_webhook_ddl::match_drop_inbound_webhook(sql)? { crate::inbound_webhook_ddl::exec_drop_inbound_webhook(i, &sess.project, sess.engine.config().catalog.as_ref()).await?; return Ok(ExecResult::Empty { tag: "DROP INBOUND WEBHOOK".into() }); }
 
     // DROP MATERIALIZED VIEW [IF EXISTS] <name> — sqlparser's DROP parser

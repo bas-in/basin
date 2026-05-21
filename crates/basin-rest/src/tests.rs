@@ -13,6 +13,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use arrow_array::Array;
 use basin_auth::{AuthConfig, AuthService, SmtpConfig, SmtpTls, StubMailer};
 use basin_catalog::InMemoryCatalog;
 use basin_common::ProjectId;
@@ -1515,12 +1516,44 @@ async fn rpc_zero_arg_function() {
     let _ = running.shutdown.send(());
 }
 
-// --- Phase 5.11.N: POST /in/<project>/<name> (ADR 0019) ----------------------
+// --- Phase 5.11.N + 6.SEC.P0.3: POST /in/<project>/<name> (ADR 0019) --------
 
-/// Happy path: register an inbound webhook via DDL, POST JSON to /in/…,
-/// assert the row landed in the target table.
+/// Compute HMAC-SHA256 of `body` under `secret_hex`, hex-encoded — the
+/// canonical `X-Basin-Signature` value an SDK would send.
+fn inbound_sign(secret_hex: &str, body: &[u8]) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let secret = hex::decode(secret_hex).expect("secret_hex is valid hex");
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&secret).expect("hmac key");
+    mac.update(body);
+    hex::encode(mac.finalize().into_bytes())
+}
+
+/// Extract the `secret` column from a `CREATE INBOUND WEBHOOK` result set.
+fn extract_secret(res: &basin_engine::ExecResult) -> String {
+    match res {
+        basin_engine::ExecResult::Rows { batches, .. } => {
+            assert_eq!(
+                batches.len(),
+                1,
+                "expected 1 batch from CREATE INBOUND WEBHOOK"
+            );
+            let arr = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .expect("secret column is utf8");
+            assert_eq!(arr.len(), 1);
+            arr.value(0).to_string()
+        }
+        other => panic!("expected Rows for CREATE INBOUND WEBHOOK, got {other:?}"),
+    }
+}
+
+/// Happy path: register an inbound webhook, POST JSON with a valid
+/// `X-Basin-Signature`, assert 200 + the row landed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn inbound_webhook_row_insert() {
+async fn inbound_webhook_row_insert_signed() {
     let Some((running, svc, _auth, _mailer, _g)) = try_serve().await else {
         return;
     };
@@ -1533,7 +1566,7 @@ async fn inbound_webhook_row_insert() {
         .execute("CREATE TABLE webhook_events (id TEXT, raw_payload JSONB)")
         .await
         .unwrap();
-    session
+    let create_res = session
         .execute(
             "CREATE INBOUND WEBHOOK test_hook EXECUTE \
              INSERT INTO webhook_events (id, raw_payload) \
@@ -1541,16 +1574,22 @@ async fn inbound_webhook_row_insert() {
         )
         .await
         .unwrap();
+    let secret = extract_secret(&create_res);
+    assert_eq!(secret.len(), 64, "expected 64-hex-char secret");
 
-    // POST a JSON payload to /in/<project>/test_hook.
+    // POST a JSON payload with a valid signature.
     let project_str = project.to_string();
     let path = format!("/in/{project_str}/test_hook");
     let body = br#"{"id": "evt_001", "amount": 99}"#;
+    let sig = inbound_sign(&secret, body);
     let r = http_request(
         addr,
         "POST",
         &path,
-        &[("Content-Type", "application/json")],
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Basin-Signature", &sig),
+        ],
         Some(body),
     )
     .await;
@@ -1578,9 +1617,89 @@ async fn inbound_webhook_row_insert() {
     let _ = running.shutdown.send(());
 }
 
-/// 404 when the webhook name does not exist.
+/// Phase 6.SEC.P0.3: unsigned POST → 401 (default-secure).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn inbound_webhook_not_found() {
+async fn inbound_webhook_unsigned_rejected() {
+    let Some((running, svc, _auth, _mailer, _g)) = try_serve().await else {
+        return;
+    };
+    let addr = running.local_addr;
+    let project = ProjectId::new();
+    let session = svc.inner.cfg.engine.open_session(project).await.unwrap();
+    session
+        .execute("CREATE TABLE webhook_events (id TEXT, raw_payload JSONB)")
+        .await
+        .unwrap();
+    let _ = session
+        .execute(
+            "CREATE INBOUND WEBHOOK h1 EXECUTE \
+             INSERT INTO webhook_events (id, raw_payload) VALUES ('x', payload)",
+        )
+        .await
+        .unwrap();
+
+    let project_str = project.to_string();
+    let path = format!("/in/{project_str}/h1");
+    let r = http_request(
+        addr,
+        "POST",
+        &path,
+        &[("Content-Type", "application/json")],
+        Some(br#"{}"#),
+    )
+    .await;
+    assert_eq!(r.status, 401, "unsigned request must be 401");
+    assert_eq!(r.json()["code"], serde_json::json!("E_UNAUTHENTICATED"));
+    let _ = running.shutdown.send(());
+}
+
+/// Phase 6.SEC.P0.3: invalid signature → 401.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_webhook_bad_signature_rejected() {
+    let Some((running, svc, _auth, _mailer, _g)) = try_serve().await else {
+        return;
+    };
+    let addr = running.local_addr;
+    let project = ProjectId::new();
+    let session = svc.inner.cfg.engine.open_session(project).await.unwrap();
+    session
+        .execute("CREATE TABLE webhook_events (id TEXT, raw_payload JSONB)")
+        .await
+        .unwrap();
+    let _ = session
+        .execute(
+            "CREATE INBOUND WEBHOOK h2 EXECUTE \
+             INSERT INTO webhook_events (id, raw_payload) VALUES ('y', payload)",
+        )
+        .await
+        .unwrap();
+
+    let project_str = project.to_string();
+    let path = format!("/in/{project_str}/h2");
+    // Wrong sig — 32 bytes of `0xff`.
+    let bad_sig = "f".repeat(64);
+    let r = http_request(
+        addr,
+        "POST",
+        &path,
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Basin-Signature", &bad_sig),
+        ],
+        Some(br#"{"id":"x"}"#),
+    )
+    .await;
+    assert_eq!(r.status, 401);
+    assert_eq!(r.json()["code"], serde_json::json!("E_UNAUTHENTICATED"));
+    let _ = running.shutdown.send(());
+}
+
+/// Phase 6.SEC.P0.3: an attacker who hits an unknown webhook name without
+/// a signature still gets 401 (not 404) — the 404 distinction would leak
+/// existence info, and the unsigned path is rejected before the catalog
+/// shape is consulted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_webhook_unsigned_unknown_name_401() {
     let Some((running, _svc, _a, _m, _g)) = try_serve().await else {
         return;
     };
@@ -1595,7 +1714,35 @@ async fn inbound_webhook_not_found() {
         Some(br#"{}"#),
     )
     .await;
-    assert_eq!(r.status, 404);
+    assert_eq!(r.status, 401, "unsigned request to unknown hook must 401");
+
+    let _ = running.shutdown.send(());
+}
+
+/// Phase 6.SEC.P0.3: a *signed* request to an unknown hook → 401
+/// (same external shape as a wrong-signature failure on a real hook,
+/// so an attacker can't tell the two apart).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_webhook_signed_unknown_name_401() {
+    let Some((running, _svc, _a, _m, _g)) = try_serve().await else {
+        return;
+    };
+    let addr = running.local_addr;
+    let project = ProjectId::new();
+    let path = format!("/in/{project}/no_such_hook");
+    let bogus_sig = "a".repeat(64);
+    let r = http_request(
+        addr,
+        "POST",
+        &path,
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Basin-Signature", &bogus_sig),
+        ],
+        Some(br#"{}"#),
+    )
+    .await;
+    assert_eq!(r.status, 401);
 
     let _ = running.shutdown.send(());
 }

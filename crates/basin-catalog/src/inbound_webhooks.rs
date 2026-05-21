@@ -22,6 +22,14 @@ pub struct InboundWebhookDef {
     /// (INSERT / UPDATE / DELETE / SELECT). The special identifier `payload`
     /// inside the statement refers to the incoming POST body as `jsonb`.
     pub body: String,
+    /// Hex-encoded HMAC secret (32 raw bytes → 64 hex chars). Generated at
+    /// `CREATE INBOUND WEBHOOK` time and returned to the creator exactly
+    /// once. The dispatcher verifies the `X-Basin-Signature` header
+    /// (hex-encoded HMAC-SHA256 of the request body under this secret) in
+    /// constant time before executing the registered SQL body
+    /// (Phase 6.SEC.P0.3, ADR 0019). Stored verbatim in the catalog row so
+    /// the dispatcher can recompute the MAC.
+    pub secret_hex: String,
 }
 
 /// Errors specific to inbound-webhook registration.

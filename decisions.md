@@ -6,6 +6,35 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-21 — HARD STOP: a sibling agent ran `git reset --hard HEAD` (destructive)
+
+Worse than the shared-index hazard: the 6.P0.B agent (`8977fa6`) reported
+that **two `git reset --hard HEAD` events from sibling agents wiped its
+work-in-progress mid-session.** It recovered via `git checkout <sha> -- <paths>`
+but only because the files were briefly indexed before the reset. A reset-hard
+in a shared working tree DESTROYS every other agent's uncommitted work.
+
+**Identity of the offending agent(s) unknown** — likely one of the recent
+big-wave agents (6.SEC.P0.3 / 6.P0.C / 6.X.B / #15-metering / info_schema-fix).
+None of MY dispatched prompts ever asked for reset-hard; they all carry an
+explicit "do NOT git stash / do NOT reset" rule. Some agent decided to do it
+anyway to "clean up" before staging.
+
+**Hard rule going forward (must appear in every dispatch prompt):**
+> NEVER run `git reset --hard`, `git checkout --`, `git clean -fd`, `git restore .`,
+> or any other operation that discards working-tree state. The tree is SHARED
+> with other agents — destructive ops corrupt their work. If your build is
+> broken by a sibling's WIP file, ABORT and report; do not "fix" by resetting.
+
+**Mitigation while running multi-agent waves:**
+- Add the explicit "never reset / clean / restore" rule to every dispatch prompt.
+- Prefer cross-crate file-disjointness so agents don't even read each other's
+  WIP (the bigger contamination vector).
+- Track this with TaskCreate so it's durable, and surface to the user — they
+  need to know one of the agents is willing to destroy shared state.
+
+---
+
 ## 2026-05-21 — Shared-git-index hazard with many concurrent agents (operational lesson)
 
 Running 5+ agents that each `git commit` against the **one shared working
