@@ -37,6 +37,7 @@ pub mod logout;
 pub mod logs;
 pub mod members;
 pub mod metrics;
+pub mod migrate_from_pg;
 pub mod migrations;
 pub mod oauth_apps;
 pub mod oauth_providers;
@@ -144,6 +145,11 @@ pub fn all() -> Vec<Entry> {
             unlink::cmd_unlink
         ),
         entry!("sql", "Run a SQL query against a project.", sql::cmd_sql),
+        entry!(
+            "migrate-from-pg",
+            "Guided Postgres → Basin migration with --dry-run + --resume (T27.1).",
+            migrate_from_pg::cmd_migrate_from_pg
+        ),
         entry!(
             "rpc",
             "Invoke a user-defined database function (T26.4).",
