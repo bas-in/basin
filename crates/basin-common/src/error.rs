@@ -104,6 +104,15 @@ pub enum BasinError {
     #[error("{0}")]
     RlsViolation(String),
 
+    /// Caller attempted a privileged operation that the current session is
+    /// not allowed to perform — e.g. user DDL targeting a reserved system
+    /// schema (`auth`, `storage`, `cron`, `net`, `realtime`, `pg_catalog`,
+    /// `information_schema`). Router maps to SQLSTATE `42501`
+    /// (`insufficient_privilege`), matching PostgreSQL's
+    /// `permission denied for schema "<name>"`.
+    #[error("{0}")]
+    PermissionDenied(String),
+
     /// A text value exceeded a declared `VARCHAR(n)` / `CHAR(n)` length.
     /// Router maps to SQLSTATE `22001` (`string_data_right_truncation`),
     /// matching PostgreSQL's `value too long for type ...` error.

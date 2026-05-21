@@ -196,6 +196,53 @@ pub(crate) struct ResolvedName {
     pub table: String,
 }
 
+/// Guard for user-initiated DDL: reject when the target object lives in a
+/// reserved system schema (other than `public`).
+///
+/// Postgres-compatible semantics: a regular user session cannot
+/// `CREATE TABLE auth.users` / `DROP TABLE storage.objects` / etc., even
+/// though the engine *can* address those schemas internally for system
+/// provisioning. The internal provisioning paths (basin-auth, basin-blob,
+/// basin-cron, basin-net, basin-realtime) run sqlx-direct against the
+/// Postgres backing store with prefixed names (e.g. `basin_auth_users`) —
+/// they do not flow through this SQL parser, so this guard does not
+/// affect them.
+///
+/// `public` is NOT reserved (the back-compat default). Bare / unqualified
+/// names pass through unchanged.
+///
+/// Returns:
+/// - `Ok(())` when the name is bare, unqualified, or qualified by `public`
+///   or a user-defined schema.
+/// - `Err(BasinError::PermissionDenied)` when the qualifier is any
+///   non-public [`ReservedSchema`] (`auth`, `storage`, `cron`, `net`,
+///   `realtime`, `pg_catalog`, `information_schema`).
+///
+/// `ddl_verb` is woven into the error message ("CREATE TABLE",
+/// "DROP INDEX", …) so the client sees which operation was rejected;
+/// the SQLSTATE on the wire is always `42501` (insufficient_privilege).
+pub(crate) fn guard_reserved_schema_for_user_ddl(
+    name: &ObjectName,
+    ddl_verb: &str,
+) -> Result<()> {
+    // Only two-part names carry a schema qualifier; bare names are always
+    // fine (they resolve to `public` per the back-compat default).
+    if name.0.len() < 2 {
+        return Ok(());
+    }
+    let schema = name.0[0].id_val().as_str();
+    if let Some(reserved) = ReservedSchema::from_str(schema) {
+        if !reserved.is_public() {
+            return Err(BasinError::PermissionDenied(format!(
+                "permission denied for schema \"{}\": user {ddl_verb} \
+                 against reserved system schemas is not permitted",
+                reserved.as_str()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Resolve a sqlparser `ObjectName` to a `(schema?, table)` pair.
 ///
 /// - One part → bare table name; schema is `None`.

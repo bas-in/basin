@@ -1773,6 +1773,10 @@ async fn exec_create_table(
     // than the parsed `CreateTable` AST.
     raw_sql: &str,
 ) -> Result<ExecResult> {
+    // 6.SEC.P1 — reject user DDL targeting a reserved system schema
+    // (`auth`, `storage`, `cron`, `net`, `realtime`, `pg_catalog`,
+    // `information_schema`). `public` and bare names pass through.
+    crate::schema_ddl::guard_reserved_schema_for_user_ddl(&ct.name, "CREATE TABLE")?;
     let name = single_part_name(&ct.name)?;
     let table = TableName::new(name)?;
 
@@ -2183,6 +2187,8 @@ async fn exec_drop_table(
     names: Vec<sqlparser::ast::ObjectName>,
 ) -> Result<ExecResult> {
     for name in names {
+        // 6.SEC.P1 — reject DROP TABLE targeting a reserved system schema.
+        crate::schema_ddl::guard_reserved_schema_for_user_ddl(&name, "DROP TABLE")?;
         let n = single_part_name(&name)?;
         let table = TableName::new(n)?;
         match sess
@@ -2238,6 +2244,13 @@ async fn exec_create_index(
         return Err(BasinError::FeatureNotSupported(
             "CREATE INDEX CONCURRENTLY is not supported in v0.1".into(),
         ));
+    }
+
+    // 6.SEC.P1 — reject CREATE INDEX targeting a reserved system schema.
+    // Guards both the target table and (when explicit) the index name.
+    crate::schema_ddl::guard_reserved_schema_for_user_ddl(&ci.table_name, "CREATE INDEX")?;
+    if let Some(ref idx_name) = ci.name {
+        crate::schema_ddl::guard_reserved_schema_for_user_ddl(idx_name, "CREATE INDEX")?;
     }
 
     let table_name = single_part_name(&ci.table_name)?;
@@ -2406,6 +2419,8 @@ async fn exec_drop_index(
         ));
     }
     for n in &names {
+        // 6.SEC.P1 — reject DROP INDEX targeting a reserved system schema.
+        crate::schema_ddl::guard_reserved_schema_for_user_ddl(n, "DROP INDEX")?;
         let index_name = single_part_name(n)?;
         // The catalog stores indexes per-table; we don't track a
         // global (project, index-name) → table mapping. Scan every
@@ -4990,6 +5005,8 @@ async fn exec_alter_table(
     name: sqlparser::ast::ObjectName,
     operations: Vec<sqlparser::ast::AlterTableOperation>,
 ) -> Result<ExecResult> {
+    // 6.SEC.P1 — reject ALTER TABLE targeting a reserved system schema.
+    crate::schema_ddl::guard_reserved_schema_for_user_ddl(&name, "ALTER TABLE")?;
     let tag = crate::alter::apply_standard_alter_table(
         &sess.engine.config().catalog,
         &sess.project,

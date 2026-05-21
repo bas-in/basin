@@ -55,6 +55,8 @@ pub(crate) async fn exec_create_function(
     function_body: Option<CreateFunctionBody>,
     language: Option<Ident>,
 ) -> Result<ExecResult> {
+    // 6.SEC.P1 — reject CREATE FUNCTION targeting a reserved system schema.
+    crate::schema_ddl::guard_reserved_schema_for_user_ddl(&name, "CREATE FUNCTION")?;
     if temporary {
         return Err(BasinError::InvalidSchema(
             "CREATE TEMPORARY FUNCTION is not supported; functions are project-scoped".into(),
@@ -195,6 +197,8 @@ pub(crate) async fn exec_drop_function(
     }
     let catalog: Arc<dyn Catalog> = sess.engine.config().catalog.clone();
     for name in names {
+        // 6.SEC.P1 — reject DROP FUNCTION targeting a reserved system schema.
+        crate::schema_ddl::guard_reserved_schema_for_user_ddl(&name, "DROP FUNCTION")?;
         let fn_name = single_part_object_name(&name)?;
         match catalog.drop_sql_function(&sess.project, &fn_name).await {
             Ok(()) => {}

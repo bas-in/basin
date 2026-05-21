@@ -73,6 +73,11 @@ pub(crate) fn match_rls_ddl(stmt: &Statement) -> Result<Option<RlsDdl>> {
             with_check,
             .. // policy_type: PERMISSIVE only in v0.1; RESTRICTIVE deferred.
         }) => {
+            // 6.SEC.P1 — reject CREATE POLICY against a reserved system schema.
+            crate::schema_ddl::guard_reserved_schema_for_user_ddl(
+                table_name,
+                "CREATE POLICY",
+            )?;
             let table = single_part_object_name(table_name)?;
             let cmd = command
                 .as_ref()
@@ -111,6 +116,11 @@ pub(crate) fn match_rls_ddl(stmt: &Statement) -> Result<Option<RlsDdl>> {
             operation,
             ..
         }) => {
+            // 6.SEC.P1 — reject ALTER POLICY against a reserved system schema.
+            crate::schema_ddl::guard_reserved_schema_for_user_ddl(
+                table_name,
+                "ALTER POLICY",
+            )?;
             let table = single_part_object_name(table_name)?;
             let op = match operation {
                 AlterPolicyOperation::Rename { new_name } => {
@@ -147,6 +157,11 @@ pub(crate) fn match_rls_ddl(stmt: &Statement) -> Result<Option<RlsDdl>> {
             table_name,
             ..
         }) => {
+            // 6.SEC.P1 — reject DROP POLICY against a reserved system schema.
+            crate::schema_ddl::guard_reserved_schema_for_user_ddl(
+                table_name,
+                "DROP POLICY",
+            )?;
             let table = single_part_object_name(table_name)?;
             Ok(Some(RlsDdl::DropPolicy {
                 table,

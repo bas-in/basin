@@ -1876,6 +1876,26 @@ regression-test backfill in `tests/integration/tests/security.rs`.
         `existing_identity_by_sub_logs_into_same_account`,
         `same_sub_across_providers_resolves_distinct_identities`) +
         `oauth.rs` unit tests for absent/false `email_verified`.
+  - [x] **6.SEC.P1 (reserved-schema)** — user DDL targeting reserved system
+        schemas now rejected with SQLSTATE 42501 (`permission denied for
+        schema "<name>"`). Guard `guard_reserved_schema_for_user_ddl` in
+        `crates/basin-engine/src/schema_ddl.rs` is invoked from every
+        user-DDL entry point that accepts a schema-qualified name:
+        `CREATE TABLE`, `DROP TABLE`, `ALTER TABLE`, `CREATE INDEX`,
+        `DROP INDEX` (executor.rs); `CREATE FUNCTION`, `DROP FUNCTION`
+        (function_ddl.rs); `CREATE POLICY`, `ALTER POLICY`, `DROP POLICY`
+        (rls.rs). `public` and bare names pass through unchanged.
+        Internal subsystems (basin-auth, basin-blob, basin-cron, basin-net,
+        basin-realtime) write tables sqlx-direct against Postgres with
+        prefixed names (`basin_auth_users`, etc.) — they don't flow
+        through this SQL parser, so the guard does not affect them; their
+        existing integration tests stayed green. New `BasinError::PermissionDenied`
+        variant maps to SQLSTATE 42501 in `basin-router/src/error.rs`.
+        Tests: `crates/basin-engine/tests/reserved_schema_ddl_guard.rs`
+        (14 tests — CREATE TABLE in each reserved schema rejected, DROP
+        TABLE rejected even with IF EXISTS, ALTER TABLE / CREATE INDEX
+        guarded, `public.foo` + bare names + user `CREATE SCHEMA myapp`
+        still work).
 
 - [x] **6.SEC.T (#21) — 17 regression tests** in
       `tests/integration/tests/security.rs` from audit §6. Shipped P0/P1
