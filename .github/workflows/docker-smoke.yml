@@ -1,0 +1,100 @@
+# Phase 5.31.A — CI smoke harness for the Basin Docker image.
+# DEPENDENCY: This workflow WILL FAIL until 5.31.B lands the Dockerfile at the
+# repo root. That is the expected "lands red" state for this phase.
+
+name: Docker Smoke
+
+on:
+  pull_request:
+    branches: [main, master]
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: basin-server
+  # pgwire default port
+  BASIN_PORT: 5432
+
+jobs:
+  build-and-smoke:
+    name: Build & smoke (${{ matrix.platform }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - linux/amd64
+          - linux/arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (for cross-platform builds)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          # Do not push — load locally for inspection and smoke test.
+          # NOTE: multi-arch images cannot be loaded; we load only the current
+          # native arch for the smoke step (arm64 runner is not available on
+          # free GHA, so linux/arm64 will build but not be loadable here).
+          load: ${{ matrix.platform == 'linux/amd64' }}
+          push: false
+          tags: ${{ env.IMAGE_NAME }}:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── Size assertion (amd64 only — arm64 can't be loaded on ubuntu-latest) ──
+      - name: Assert image ≤ 100 MB
+        if: matrix.platform == 'linux/amd64'
+        run: |
+          SIZE_BYTES=$(docker image inspect "$IMAGE_NAME:ci" \
+            --format '{{.Size}}')
+          SIZE_MB=$(( SIZE_BYTES / 1024 / 1024 ))
+          echo "Image size: ${SIZE_MB} MB"
+          if (( SIZE_MB > 100 )); then
+            echo "ERROR: image exceeds 100 MB limit (got ${SIZE_MB} MB)"
+            exit 1
+          fi
+
+      # ── Quick-start smoke: bring up Basin, wait for pgwire, run round-trip ──
+      - name: Start Basin container
+        if: matrix.platform == 'linux/amd64'
+        run: |
+          docker run -d \
+            --name basin-smoke \
+            -p "$BASIN_PORT:$BASIN_PORT" \
+            "$IMAGE_NAME:ci"
+
+      - name: Run smoke script (via postgres:16 sidecar)
+        if: matrix.platform == 'linux/amd64'
+        run: |
+          docker run --rm \
+            --network host \
+            -v "${{ github.workspace }}/tests/integration/scripts/docker-smoke.sh:/smoke.sh:ro" \
+            -e PGHOST=127.0.0.1 \
+            -e PGPORT=${{ env.BASIN_PORT }} \
+            -e PGUSER=basin \
+            -e PGDATABASE=basin \
+            postgres:16 \
+            bash /smoke.sh
+
+      - name: Dump Basin logs on failure
+        if: failure() && matrix.platform == 'linux/amd64'
+        run: docker logs basin-smoke || true
+
+      - name: Stop Basin container
+        if: always() && matrix.platform == 'linux/amd64'
+        run: docker rm -f basin-smoke || true
