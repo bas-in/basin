@@ -1,0 +1,31 @@
+{
+  "name": "@bas-in/ai-rag-example",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AI/RAG reference app: Basin vector search + Wasm inference function",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "test": "vitest run",
+    "ingest": "tsx src/ingest.ts",
+    "query": "tsx src/query-cli.ts"
+  },
+  "dependencies": {
+    "openai": "^4.67.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "@types/react": "^18.3.1",
+    "@types/react-dom": "^18.3.1",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.8",
+    "vitest": "^2.1.3",
+    "pg": "^8.13.0",
+    "@types/pg": "^8.11.10"
+  }
+}
