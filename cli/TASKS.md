@@ -440,3 +440,71 @@ import if the decisions.md no-deps rule permits it — **decide and record in
 > `cmd_webhooks.go`. Tracked as a follow-on once 5.11.N's catalog shape
 > stabilises; not part of Tier 26.
 
+---
+
+## Tier 27 — `basin migrate-from-pg` (pairs with basin OSS 5.22)
+
+Guided Postgres → Basin migration. basin OSS 5.22 ships `pg_dump`
+compat (the engine primitive); this CLI command wraps it into a
+one-line migration path so the "drop-in for Postgres" wedge claim
+has a 30-second proof.
+
+### T27.1 — `cmd_migrate_from_pg.go` — guided one-shot migration [ ]
+
+**Files:** `cmd_migrate_from_pg.go`, `cmd_migrate_from_pg_test.go`,
+`README.md` (Migrating from Postgres section)
+
+**Test-first scope** (harness lands red against current basin-cli;
+each impl slice flips a named slice green):
+- Integration test (**dockerised PG + seed schema**): spin up real
+  Postgres (docker-compose fixture), seed a 5-table schema with
+  diverse types (JSONB, text, timestamps, arrays, sequences, FKs);
+  run `basin migrate-from-pg --dsn=… --to-project=test`; assert all
+  5 tables land in Basin with identical schema + row counts.
+- Integration test (**`--dry-run` shows schema diff**): same
+  fixture; `basin migrate-from-pg --dry-run` exits 0, emits a
+  diff-shape report (per-table: source DDL → Basin DDL with
+  caveats called out) without writing.
+- Integration test (**actual run completes idempotently**): run
+  the migration twice end-to-end; second run is a no-op (or
+  schema-only catch-up) — row counts identical, no duplicates.
+- Integration test (**`--resume` after kill produces identical
+  end-state**): start the migration, SIGKILL mid-way (between
+  per-table watermarks); re-run with `--resume`; assert the final
+  Basin state is byte-identical to the unkilled control run.
+- Unit test: schema-compat probe correctly flags unsupported PG
+  features (extensions, plpgsql functions, custom types) and emits
+  the manual-fix pointer table.
+
+**Scope:**
+- Connect to source PG, snapshot the search path, run `pg_dump` in
+  custom format streamed to a temp file (shape:
+  `pg_dump --section=pre-data | basin restore` for the schema
+  phase, then `--section=data` for row data).
+- Schema-compat probe: parse the dump's DDL via libpg_query
+  (already vendored in basin OSS), check each statement against
+  Basin's `CAPABILITIES.md` SQL subset matrix (basin 5.25.G);
+  classify as `ok` / `caveat` / `unsupported`.
+- Emit a pre-flight report: table count, total size, estimated
+  duration, list of caveats + unsupported features with remediation
+  pointers.
+- After user `--confirm`, run `basin restore` (basin 5.22.D)
+  against the target project; stream progress to stderr.
+- Post-import: row-count diff between source PG and target Basin
+  per table; emit a final report.
+- `--dry-run` produces the report without writing.
+- `--resume` continues a previous run from the per-table watermark.
+
+**Acceptance criteria:**
+- Integration test passes against a real PG fixture.
+- A representative SaaS schema (auth.users-like, orders/customers,
+  JSONB documents) migrates cleanly with caveats reported but no
+  silent data loss.
+- `--dry-run` exits 0 + emits the report.
+- README has a "Migrating from Postgres" section linking to the
+  command + a written guide in basin OSS `docs/migration-from-postgres.md`.
+
+**Depends on:** basin OSS 5.22.A (test harness), 5.22.D (basin-cli
+restore command), 5.25.G (CAPABILITIES.md compat matrix for the
+probe).
+
