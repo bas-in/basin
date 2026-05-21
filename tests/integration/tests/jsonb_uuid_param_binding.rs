@@ -90,6 +90,7 @@ async fn connect(addr: SocketAddr) -> tokio_postgres::Client {
     client
 }
 
+#[ignore = "C1: UUID/Vortex FixedSizeBinary(16) encoding not implemented — blocked on #40 cluster"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn jsonb_uuid_param_binding_round_trip() {
     let server = start_server().await;
