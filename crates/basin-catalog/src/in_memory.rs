@@ -20,8 +20,8 @@ use crate::domains::{self, DomainDef, DomainError};
 use crate::enums::{self, EnumError, EnumTypeDef};
 use crate::functions::SqlFunctionDef;
 use crate::metadata::{
-    CheckConstraint, CvDef, DataFileRef, ForeignKeyDef, PartitionSpec, Policy, SecondaryIndex,
-    TableFileFormat, TableMetadata, UniqueConstraint,
+    CheckConstraint, CvDef, DataFileRef, ForeignKeyDef, PartitionSpec, Policy, ProjectMetadata,
+    SecondaryIndex, TableFileFormat, TableMetadata, UniqueConstraint,
 };
 use crate::inbound_webhooks::{self, InboundWebhookDef, InboundWebhookError};
 use crate::procedures::{self, ProcedureError, SqlProcedureDef};
@@ -183,6 +183,12 @@ pub struct InMemoryCatalog {
     /// it is held only for the brief in-map arithmetic. Per-project cost stays
     /// `O(partitions)` with no per-replica heavy resource.
     leases: Mutex<HashMap<(ProjectId, String), LeaseRow>>,
+    /// Per-project metadata (BYO-bucket config, etc.). Single shared
+    /// `HashMap` keyed by `ProjectId`; lazy entry creation; per-project
+    /// cost stays `O(bytes)` with no per-project heavy resource.
+    /// Cleared in `drop_namespace`. Implements `set_project_metadata` /
+    /// `get_project_metadata` on the `Catalog` trait (T-048).
+    project_metadata: Mutex<HashMap<ProjectId, ProjectMetadata>>,
 }
 
 /// In-memory lease row. Mirrors the `partition_leases` Postgres table.
@@ -240,6 +246,7 @@ impl InMemoryCatalog {
             schemas: Mutex::new(HashMap::new()),
             inbound_webhooks: Mutex::new(HashMap::new()),
             leases: Mutex::new(HashMap::new()),
+            project_metadata: Mutex::new(HashMap::new()),
         }
     }
 
@@ -400,6 +407,8 @@ impl Catalog for InMemoryCatalog {
         iwhs.retain(|(t, _), _| t != project);
         let mut leases = self.leases.lock().await;
         leases.retain(|(t, _), _| t != project);
+        let mut pm = self.project_metadata.lock().await;
+        pm.remove(project);
         Ok(())
     }
 
@@ -1183,6 +1192,23 @@ impl Catalog for InMemoryCatalog {
     ) -> Result<Option<ProjectStorageConfig>> {
         let map = self.project_storage_config.lock().await;
         Ok(map.get(project).cloned())
+    }
+
+    #[instrument(skip(self, meta), fields(project = %project))]
+    async fn set_project_metadata(
+        &self,
+        project: &ProjectId,
+        meta: ProjectMetadata,
+    ) -> Result<()> {
+        let mut map = self.project_metadata.lock().await;
+        map.insert(*project, meta);
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(project = %project))]
+    async fn get_project_metadata(&self, project: &ProjectId) -> Result<ProjectMetadata> {
+        let map = self.project_metadata.lock().await;
+        Ok(map.get(project).cloned().unwrap_or_default())
     }
 
     async fn register_view(&self, def: ViewDef, or_replace: bool) -> Result<()> {
