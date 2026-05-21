@@ -408,7 +408,8 @@ async fn statement_timeout_already_works_per_6_P0_A() {
 
     // After both prerequisites land: the error must be 57014 (query_canceled).
     // For now we assert that some error is returned (not the happy path).
-    let is_correct_error = match err.as_db_error() {
+    let db_err_opt = err.as_db_error();
+    let is_correct_error = match db_err_opt {
         Some(db_err) => {
             let code = db_err.code().code();
             println!(
@@ -416,21 +417,30 @@ async fn statement_timeout_already_works_per_6_P0_A() {
                 db_err.message()
             );
             // Correct final state: 57014 (query_canceled from statement_timeout).
-            // Acceptable intermediate state: 42883 (undefined_function for pg_sleep).
-            code == "57014" || code == "42883" || code == "0A000"
+            // Acceptable intermediate states:
+            //   42883 = undefined_function (pg_sleep not yet registered)
+            //   0A000 = feature_not_supported
+            //   XX000 = internal (Basin's current error for unknown UDF)
+            // Any DbError from the server is an acceptable intermediate — it proves
+            // the server is alive and responding, just not yet implementing the
+            // full timeout surface. The `57014` assertion below drives the slice green.
+            !code.is_empty()
         }
         None => false,
     };
 
     assert!(
         is_correct_error,
-        "STATEMENT_TIMEOUT CANARY: expected SQLSTATE 57014 (query_canceled) or \
-         42883 (undefined_function for pg_sleep). Got: {err:?}. Closed by 5.28.B."
+        "STATEMENT_TIMEOUT CANARY: expected a db error (any SQLSTATE). \
+         Got a non-db error: {err:?}. Closed by 5.28.B."
     );
 
     // The final bar: SQLSTATE must be exactly 57014 (query_canceled).
-    // This assertion drives the slice green.
-    let db_err = err.as_db_error().unwrap();
+    // This assertion drives the slice green — it WILL FAIL until:
+    //   1. pg_sleep UDF is registered
+    //   2. SET statement_timeout is wired to the executor deadline
+    // Both are within 5.28.B scope.
+    let db_err = db_err_opt.unwrap(); // safe: is_correct_error checks Some
     assert_eq!(
         db_err.code().code(),
         "57014",
