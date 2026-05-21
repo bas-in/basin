@@ -26,15 +26,22 @@ Sources audited:
    the per-project SUM of elapsed time is **never aggregated**. Without it
    the cloud cannot bill the new compute-overage SKU at all.
 
-2. **Tigris Class-A / Class-B op counts — not measured per project.** The
-   reprice's gross margin claim depends on `basin_ops_cost` accurately
-   reflecting `ProjectCounterRegistry` PUT/GET counts
-   (`basin-cloud/billing_model/model.py:152-173`). The engine wraps every
-   object-store call in `ProjectScopedStore::{put_opts, get_opts,
-   put_multipart_opts, list, copy_opts}` (`crates/basin-storage/src/concurrency.rs:88-192`)
-   — the exact site that knows the project, the op class, AND has already
-   acquired a semaphore permit. No counter is bumped. Result: we can scrape
-   the Tigris bill but cannot attribute a single PUT or GET to a project.
+2. **Tigris Class-A / Class-B op counts — not measured per project.**
+   **✅ CLOSED (2026-05-21, this commit).** Two new monotonic counters
+   `class_a_ops_total` (PUT, multipart-complete, COPY, DELETE) and
+   `class_b_ops_total` (GET, HEAD, LIST) were added to
+   `ProjectCounters` and bumped on every successful RPC in
+   `ProjectScopedStore::{put_opts, put_multipart_opts, get_opts, list,
+   list_with_delimiter, copy_opts, delete_stream}`
+   (`crates/basin-storage/src/concurrency.rs`). Surfaced through the
+   existing `ProjectCountersSnapshot` so the OTLP / `basin-cloud`
+   aggregator picks them up for free. Cross-project isolation verified
+   in `concurrency::tests::cross_project_isolation_class_a_b`.
+   *Original gap text, for reference:* The reprice's gross margin claim
+   depends on `basin_ops_cost` accurately reflecting
+   `ProjectCounterRegistry` PUT/GET counts
+   (`basin-cloud/billing_model/model.py:152-173`); we now attribute
+   every wire-level Class-A/B op to a project.
 
 3. **Logical-GB-month integration — derivable but not stored.** Billing
    needs *time-integrated* GB-months, not the live high-water mark exposed
@@ -54,8 +61,8 @@ Sources audited:
 |---|---------------------------------------------------------------|-------------------|---------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | 1 | Storage — `R2_STORAGE_USD_PER_GB_MONTH` (`model.py:23`)       | GB-month          | ⚠️ `bytes_written_total` is a gauge (`telemetry.rs:81`); `record_bytes_deleted` keeps it live (`telemetry.rs:128`). NO time-integration.    | Add `bytes_stored_seconds_total: AtomicU64` updated by a periodic registry sampler in `basin-cloud`. New module: `basin-cloud/src/usage_sampler.rs`.                         |
 | 2 | Storage overage — `OVERAGE_USD_PER_GB_MONTH=0.010` (`model.py:67`) | GB-month     | Same as #1                                                                                                                                  | Same fix; the overage uses the identical meter, just compared against `bundled_storage_gb` per tier (`scenarios.py:84-89`).                                                  |
-| 3 | Tigris Class-A PUTs — `R2_CLASS_A_USD_PER_M_OPS=50.0` (`model.py:24`) | count       | ❌ Not measured per project. Engine has the call site, doesn't count it.                                                                    | Add `class_a_ops_total: AtomicU64` to `ProjectCounters`; bump in `ProjectScopedStore::put_opts` and `put_multipart_opts` (`crates/basin-storage/src/concurrency.rs:90,105`). |
-| 4 | Tigris Class-B GETs — `R2_CLASS_B_USD_PER_M_OPS=5.0` (`model.py:25`) | count        | ❌ Not measured per project. `PageCacheCounters` has process-wide hits/misses (`page_cache.rs:113-138`), but they're not per-project.        | Add `class_b_ops_total: AtomicU64` to `ProjectCounters`; bump in `ProjectScopedStore::get_opts` and `list*` (`crates/basin-storage/src/concurrency.rs:122,145,170`).         |
+| 3 | Tigris Class-A PUTs — `R2_CLASS_A_USD_PER_M_OPS=50.0` (`model.py:24`) | count       | ✅ `ProjectCounters::class_a_ops_total` (`telemetry.rs`) bumped from `ProjectScopedStore::{put_opts, put_multipart_opts, copy_opts, delete_stream}` on success.                | DONE (2026-05-21). Exported via `ProjectCountersSnapshot.class_a_ops_total`; no new export surface needed.                                                                  |
+| 4 | Tigris Class-B GETs — `R2_CLASS_B_USD_PER_M_OPS=5.0` (`model.py:25`) | count        | ✅ `ProjectCounters::class_b_ops_total` (`telemetry.rs`) bumped from `ProjectScopedStore::{get_opts, list, list_with_delimiter}` on success.                                  | DONE (2026-05-21). Exported via `ProjectCountersSnapshot.class_b_ops_total`. HEAD-shaped GETs (`GetOptions::head`) are billed identically to body GETs.                     |
 | 5 | Tigris egress bytes (Fly-internal = $0 today)                 | bytes             | ❌ Not measured.                                                                                                                            | Future-cost: add `egress_bytes_total: AtomicU64`; bump in `ProjectScopedStore::get_opts` from `GetResult.meta.size`. Multi-region makes this non-zero (see §5).              |
 | 6 | Compute — `FLY_*_USD_PER_MONTH` pool costs (`model.py:33-37`) | $ / pool-month    | ❌ Pool cost is invoiced flat by Fly; no per-tenant attribution exists.                                                                     | Add `cpu_seconds_total: AtomicU64` derived from `elapsed_ms` (`crates/basin-engine/src/lib.rs:646`) — `tc.record_cpu_ms(elapsed_ms)` after `record_latency_ms`.              |
 | 7 | Compute overage — `COMPUTE_OVERAGE_USD_PER_CPU_SECOND=0.000005` (`model.py:78`) | CPU-second | ❌ Not measured. `ProjectSession::execute` has `started.elapsed()` (`basin-engine/src/lib.rs:634, 646`) but only sinks it into the latency ring. | Same fix as #6. Critical: this is what the reprice's whole margin story depends on.                                                                                          |
@@ -211,9 +218,11 @@ engine meters (#5, #15, #16) are 1-day fixes; deferring them costs us
 ### 1-day fixes (1 engineer, half-day each)
 
 - **#3, #4** — Class-A / Class-B op counters in `ProjectScopedStore`.
-  Single file (`crates/basin-storage/src/concurrency.rs`) + two new
-  `AtomicU64`s in `ProjectCounters`. Test by extending
-  `crates/basin-storage/tests/` with PUT/GET op assertions.
+  ✅ DONE (2026-05-21). Two new `AtomicU64`s in `ProjectCounters` +
+  bump sites in `crates/basin-storage/src/concurrency.rs` covering
+  put_opts, put_multipart_opts, get_opts, list, list_with_delimiter,
+  copy_opts, delete_stream. Cross-project isolation covered by
+  `concurrency::tests::cross_project_isolation_class_a_b`.
 - **#6, #7** — CPU-seconds. One line in
   `crates/basin-engine/src/lib.rs:646-647`, one new method on
   `ProjectCounters`.

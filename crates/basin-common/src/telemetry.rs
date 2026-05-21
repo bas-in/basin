@@ -74,11 +74,25 @@ const LATENCY_RING_SIZE: usize = 128;
 
 /// Per-project counters. Atomic bump points + a fixed-size ring of recent
 /// latency samples. Public API is `record_*` (bumps) and `snapshot()` (read).
+///
+/// Class-A / Class-B op counts mirror the Tigris / S3 billing dimensions:
+/// `class_a_ops_total` covers state-changing requests (PUT, multipart-complete,
+/// COPY, DELETE) and `class_b_ops_total` covers read requests (GET, HEAD,
+/// LIST). These two are the unit-of-billing for the basin-cloud overage
+/// pricing audit (`docs/audits/2026-05-21-billing-meter-gap.md`); keep them
+/// monotonic and project-scoped so the meter can be aggregated by tenant
+/// without per-request log scraping.
 #[derive(Debug)]
 pub struct ProjectCounters {
     ops_total: AtomicU64,
     bytes_read_total: AtomicU64,
     bytes_written_total: AtomicU64,
+    /// State-changing object-store ops: PUT, multipart-complete, COPY,
+    /// DELETE. Monotonic, project-scoped, unit = ops (not bytes).
+    class_a_ops_total: AtomicU64,
+    /// Read object-store ops: GET, HEAD, LIST. Monotonic, project-scoped,
+    /// unit = ops (not bytes).
+    class_b_ops_total: AtomicU64,
     errors_total: AtomicU64,
     latency: Mutex<LatencyRing>,
 }
@@ -106,6 +120,8 @@ impl Default for ProjectCounters {
             ops_total: AtomicU64::new(0),
             bytes_read_total: AtomicU64::new(0),
             bytes_written_total: AtomicU64::new(0),
+            class_a_ops_total: AtomicU64::new(0),
+            class_b_ops_total: AtomicU64::new(0),
             errors_total: AtomicU64::new(0),
             latency: Mutex::new(LatencyRing::default()),
         }
@@ -145,6 +161,28 @@ impl ProjectCounters {
     pub fn record_error(&self) {
         self.errors_total.fetch_add(1, Ordering::Relaxed);
     }
+    /// Bump the Class-A op counter by one. Caller is responsible for the
+    /// classification (PUT / multipart-complete / COPY / DELETE → Class-A).
+    pub fn record_class_a_op(&self) {
+        self.class_a_ops_total.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Bump the Class-A op counter by `n`. Used when a single high-level
+    /// operation maps to multiple wire-level Class-A requests (e.g. bulk
+    /// delete fan-out).
+    pub fn record_class_a_ops(&self, n: u64) {
+        self.class_a_ops_total.fetch_add(n, Ordering::Relaxed);
+    }
+    /// Bump the Class-B op counter by one. Caller is responsible for the
+    /// classification (GET / HEAD / LIST → Class-B).
+    pub fn record_class_b_op(&self) {
+        self.class_b_ops_total.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Bump the Class-B op counter by `n`. Used when a single high-level
+    /// operation maps to multiple wire-level Class-B requests (e.g. a
+    /// paginated LIST that issues multiple continuation calls).
+    pub fn record_class_b_ops(&self, n: u64) {
+        self.class_b_ops_total.fetch_add(n, Ordering::Relaxed);
+    }
     /// Record one latency observation in milliseconds. O(1).
     pub fn record_latency_ms(&self, ms: u32) {
         let mut g = self.latency.lock().expect("project latency ring poisoned");
@@ -172,6 +210,8 @@ impl ProjectCounters {
             ops_total: self.ops_total.load(Ordering::Relaxed),
             bytes_read_total: self.bytes_read_total.load(Ordering::Relaxed),
             bytes_written_total: self.bytes_written_total.load(Ordering::Relaxed),
+            class_a_ops_total: self.class_a_ops_total.load(Ordering::Relaxed),
+            class_b_ops_total: self.class_b_ops_total.load(Ordering::Relaxed),
             errors_total: self.errors_total.load(Ordering::Relaxed),
             latency_p99_ms_estimate: p99,
         }
@@ -184,6 +224,12 @@ pub struct ProjectCountersSnapshot {
     pub ops_total: u64,
     pub bytes_read_total: u64,
     pub bytes_written_total: u64,
+    /// Cumulative Class-A op count (PUT / multipart-complete / COPY /
+    /// DELETE) — the basin-cloud billing dimension for write requests.
+    pub class_a_ops_total: u64,
+    /// Cumulative Class-B op count (GET / HEAD / LIST) — the basin-cloud
+    /// billing dimension for read requests.
+    pub class_b_ops_total: u64,
     pub errors_total: u64,
     pub latency_p99_ms_estimate: u32,
 }
@@ -245,6 +291,30 @@ mod tests {
         assert_eq!(r.snapshot(&a).unwrap().bytes_written_total, 1000);
         assert_eq!(r.snapshot(&b).unwrap().bytes_written_total, 7);
         assert!(r.snapshot(&ProjectId::new()).is_none());
+    }
+
+    #[test]
+    fn class_a_b_op_counters_are_per_project() {
+        let r = ProjectCounterRegistry::new();
+        let a = ProjectId::new();
+        let b = ProjectId::new();
+
+        let ca = r.for_project(&a);
+        ca.record_class_a_op();
+        ca.record_class_a_op();
+        ca.record_class_b_op();
+        ca.record_class_b_ops(4);
+
+        let cb = r.for_project(&b);
+        cb.record_class_a_ops(5);
+
+        let snap_a = r.snapshot(&a).unwrap();
+        assert_eq!(snap_a.class_a_ops_total, 2);
+        assert_eq!(snap_a.class_b_ops_total, 5);
+
+        let snap_b = r.snapshot(&b).unwrap();
+        assert_eq!(snap_b.class_a_ops_total, 5);
+        assert_eq!(snap_b.class_b_ops_total, 0);
     }
 
     #[test]

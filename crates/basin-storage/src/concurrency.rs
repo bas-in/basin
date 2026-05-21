@@ -38,7 +38,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use basin_common::ProjectId;
+use basin_common::{ProjectCounters, ProjectId};
 use futures::stream::BoxStream;
 use object_store::path::Path as ObjectPath;
 use object_store::{
@@ -55,12 +55,24 @@ use crate::scheduler::{Priority, Scheduler};
 /// every other [`ProjectScopedStore`] for the same project — so concurrent
 /// reads from the engine layer and from inside `basin-storage` itself
 /// contend on the *same* permit pool and the *same* scheduler heap.
+///
+/// Optionally carries a per-project [`ProjectCounters`] handle. When
+/// present, every forwarded RPC bumps the corresponding Class-A
+/// (state-changing: PUT, multipart-complete, COPY, DELETE) or Class-B
+/// (read: GET, HEAD, LIST) op counter, feeding the basin-cloud billing
+/// meter per the `2026-05-21-billing-meter-gap.md` audit. Counter bumps
+/// happen *after* the inner RPC succeeds so failed/rejected ops aren't
+/// billed (errors go through `record_error` on the counters at higher
+/// layers).
 #[derive(Debug)]
 pub(crate) struct ProjectScopedStore {
     inner: Arc<dyn ObjectStore>,
     sem: Arc<Semaphore>,
     scheduler: Scheduler,
     project: ProjectId,
+    /// `None` when no `ProjectCounterRegistry` is attached to `Storage`
+    /// (legacy test paths) — the bump is then a no-op via `if let Some(..)`.
+    counters: Option<Arc<ProjectCounters>>,
 }
 
 impl ProjectScopedStore {
@@ -69,12 +81,37 @@ impl ProjectScopedStore {
         sem: Arc<Semaphore>,
         scheduler: Scheduler,
         project: ProjectId,
+        counters: Option<Arc<ProjectCounters>>,
     ) -> Self {
         Self {
             inner,
             sem,
             scheduler,
             project,
+            counters,
+        }
+    }
+
+    /// Bump the Class-A op counter by one if a registry is attached.
+    fn bump_class_a(&self) {
+        if let Some(c) = &self.counters {
+            c.record_class_a_op();
+        }
+    }
+
+    /// Bump the Class-B op counter by one if a registry is attached.
+    fn bump_class_b(&self) {
+        if let Some(c) = &self.counters {
+            c.record_class_b_op();
+        }
+    }
+
+    /// Bump the Class-B op counter by `n` (used for streaming LIST where
+    /// one logical call can yield many continuation requests; we charge
+    /// at least one even if `n == 0` for the "issued the LIST" intent).
+    fn bump_class_b_n(&self, n: u64) {
+        if let Some(c) = &self.counters {
+            c.record_class_b_ops(n.max(1));
         }
     }
 }
@@ -99,7 +136,13 @@ impl ObjectStore for ProjectScopedStore {
         // Parquet files). Schedule as Low so it never starves point
         // reads.
         let _slot = self.scheduler.acquire(self.project, Priority::Low).await;
-        self.inner.put_opts(location, payload, opts).await
+        let res = self.inner.put_opts(location, payload, opts).await;
+        // Class-A: state-changing. Only bill successful RPCs — failed
+        // PUTs aren't billable in the Tigris/S3 cost model.
+        if res.is_ok() {
+            self.bump_class_a();
+        }
+        res
     }
 
     async fn put_multipart_opts(
@@ -114,9 +157,19 @@ impl ObjectStore for ProjectScopedStore {
         // the writer path uses `put` for our Parquet sizes, and the
         // multipart path is only reachable through the engine's analytical
         // plumbing where we don't yet drive uploads at this scale.
+        //
+        // Billing note: the multipart *completion* is the Class-A op in
+        // the Tigris/S3 model. Initiating the session bumps Class-A here
+        // because we don't currently interpose on the returned
+        // `MultipartUpload` — under-counting per-part PUTs is the safer
+        // (less surprising-bill) default until the interposer lands.
         let _floor = self.sem.acquire().await.expect("semaphore not closed");
         let _slot = self.scheduler.acquire(self.project, Priority::Low).await;
-        self.inner.put_multipart_opts(location, opts).await
+        let res = self.inner.put_multipart_opts(location, opts).await;
+        if res.is_ok() {
+            self.bump_class_a();
+        }
+        res
     }
 
     async fn get_opts(
@@ -130,16 +183,37 @@ impl ObjectStore for ProjectScopedStore {
         // size hint, default to High so footers / metadata fetches stay
         // snappy; the engine's range-read path is the bulk channel.
         let _slot = self.scheduler.acquire(self.project, Priority::High).await;
-        self.inner.get_opts(location, options).await
+        let is_head = options.head;
+        let res = self.inner.get_opts(location, options).await;
+        // Class-B: GET / HEAD. `GetOptions { head: true, .. }` is the
+        // HEAD-only path (no body); still one Class-B op.
+        if res.is_ok() {
+            let _ = is_head; // both HEAD and GET are Class-B, single bump.
+            self.bump_class_b();
+        }
+        res
     }
 
     fn delete_stream(
         &self,
         locations: BoxStream<'static, object_store::Result<ObjectPath>>,
     ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
-        // Pass through to inner — the per-item delete RPCs inherit the
-        // semaphore/scheduler gating via the inner store's own delete path.
-        self.inner.delete_stream(locations)
+        // We need per-item billing for DELETE (Class-A), so wrap the
+        // inner stream and bump on every successful item yielded. The
+        // semaphore/scheduler gating still happens inside the inner
+        // store's per-item delete path.
+        use futures::stream::StreamExt;
+        let inner_stream = self.inner.delete_stream(locations);
+        let counters = self.counters.clone();
+        inner_stream
+            .inspect(move |res| {
+                if res.is_ok() {
+                    if let Some(c) = &counters {
+                        c.record_class_a_op();
+                    }
+                }
+            })
+            .boxed()
     }
 
     fn list(
@@ -152,16 +226,27 @@ impl ObjectStore for ProjectScopedStore {
         // consumer drives the stream to exhaustion before moving on.
         //
         // LIST is metadata-shaped → High priority by default.
+        //
+        // Billing: one Class-B op per `list()` call, regardless of how
+        // many objects are returned (matches the Tigris/S3 wire model
+        // where a single LIST request returns up to 1000 keys; we don't
+        // currently observe continuation-token pagination at this layer,
+        // so a single bump per logical call is the right under-bound).
         use futures::stream::StreamExt;
         let sem = self.sem.clone();
         let scheduler = self.scheduler.clone();
         let project = self.project;
         let inner = self.inner.clone();
         let prefix = prefix.cloned();
+        let counters = self.counters.clone();
         futures::stream::once(async move {
             let _floor = sem.acquire_owned().await.expect("semaphore not closed");
             let _slot = scheduler.acquire(project, Priority::High).await;
-            inner.list(prefix.as_ref()).collect::<Vec<_>>().await
+            let items = inner.list(prefix.as_ref()).collect::<Vec<_>>().await;
+            if let Some(c) = &counters {
+                c.record_class_b_op();
+            }
+            items
         })
         .flat_map(futures::stream::iter)
         .boxed()
@@ -173,7 +258,13 @@ impl ObjectStore for ProjectScopedStore {
     ) -> object_store::Result<ListResult> {
         let _floor = self.sem.acquire().await.expect("semaphore not closed");
         let _slot = self.scheduler.acquire(self.project, Priority::High).await;
-        self.inner.list_with_delimiter(prefix).await
+        let res = self.inner.list_with_delimiter(prefix).await;
+        if res.is_ok() {
+            // Charge the same single Class-B op as `list()`; the
+            // delimiter variant is also a single LIST RPC at the wire.
+            self.bump_class_b_n(1);
+        }
+        res
     }
 
     async fn copy_opts(
@@ -187,6 +278,191 @@ impl ObjectStore for ProjectScopedStore {
         // single small request, so High. CopyMode::Overwrite = old `copy`,
         // CopyMode::Create = old `copy_if_not_exists`.
         let _slot = self.scheduler.acquire(self.project, Priority::High).await;
-        self.inner.copy_opts(from, to, options).await
+        let res = self.inner.copy_opts(from, to, options).await;
+        // Class-A: COPY is state-changing.
+        if res.is_ok() {
+            self.bump_class_a();
+        }
+        res
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for Class-A / Class-B op metering.
+    //!
+    //! We exercise the wrapper directly against an `InMemory` object store
+    //! (no `Storage` machinery needed) so the test stays focused on the
+    //! counter-bump invariants and isn't sensitive to compaction or
+    //! catalog state. Cross-project isolation is asserted by running the
+    //! same operations against two wrappers with distinct project ids
+    //! sharing the same registry, and confirming each project's snapshot
+    //! reflects only its own ops.
+
+    use super::*;
+    use basin_common::ProjectCounterRegistry;
+    use futures::StreamExt;
+    use object_store::memory::InMemory;
+    use object_store::PutPayload;
+
+    fn make_store(
+        project: ProjectId,
+        registry: &Arc<ProjectCounterRegistry>,
+        inner: Arc<dyn ObjectStore>,
+    ) -> ProjectScopedStore {
+        let sem = Arc::new(Semaphore::new(16));
+        let scheduler = Scheduler::new(crate::DEFAULT_GLOBAL_BUDGET);
+        let counters = Some(registry.for_project(&project));
+        ProjectScopedStore::new(inner, sem, scheduler, project, counters)
+    }
+
+    #[tokio::test]
+    async fn put_get_list_delete_increment_class_a_b_counters() {
+        let registry = Arc::new(ProjectCounterRegistry::new());
+        let project = ProjectId::new();
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = make_store(project, &registry, inner);
+
+        // 1 PUT — Class-A == 1.
+        let path = ObjectPath::from("a/b/c");
+        store
+            .put_opts(&path, PutPayload::from_static(b"hello"), Default::default())
+            .await
+            .expect("put_opts");
+        let s = registry.snapshot(&project).unwrap();
+        assert_eq!(s.class_a_ops_total, 1, "PUT should bump Class-A");
+        assert_eq!(s.class_b_ops_total, 0, "PUT must not bump Class-B");
+
+        // 1 GET — Class-B == 1.
+        let got = store
+            .get_opts(&path, Default::default())
+            .await
+            .expect("get_opts");
+        let _ = got.bytes().await.unwrap();
+        let s = registry.snapshot(&project).unwrap();
+        assert_eq!(s.class_a_ops_total, 1);
+        assert_eq!(s.class_b_ops_total, 1, "GET should bump Class-B");
+
+        // 1 HEAD via get_opts(head=true) — Class-B == 2.
+        let head_opts = object_store::GetOptions {
+            head: true,
+            ..Default::default()
+        };
+        store
+            .get_opts(&path, head_opts)
+            .await
+            .expect("get_opts(head=true)");
+        let s = registry.snapshot(&project).unwrap();
+        assert_eq!(s.class_b_ops_total, 2, "HEAD-as-GET should also bump Class-B");
+
+        // 1 LIST — Class-B == 3.
+        let listed: Vec<_> = store.list(None).collect().await;
+        assert!(!listed.is_empty());
+        let s = registry.snapshot(&project).unwrap();
+        assert_eq!(
+            s.class_b_ops_total, 3,
+            "LIST stream consumption should bump Class-B once"
+        );
+
+        // 1 list_with_delimiter — Class-B == 4.
+        let _ = store
+            .list_with_delimiter(None)
+            .await
+            .expect("list_with_delimiter");
+        let s = registry.snapshot(&project).unwrap();
+        assert_eq!(s.class_b_ops_total, 4);
+
+        // 1 COPY — Class-A == 2.
+        let path_copy = ObjectPath::from("a/b/c2");
+        store
+            .copy_opts(&path, &path_copy, Default::default())
+            .await
+            .expect("copy_opts");
+        let s = registry.snapshot(&project).unwrap();
+        assert_eq!(s.class_a_ops_total, 2, "COPY should bump Class-A");
+
+        // DELETE 2 items via delete_stream — Class-A == 4.
+        let to_delete =
+            futures::stream::iter(vec![Ok(path.clone()), Ok(path_copy.clone())]).boxed();
+        let results: Vec<_> = store.delete_stream(to_delete).collect().await;
+        assert_eq!(results.len(), 2);
+        for r in &results {
+            assert!(r.is_ok(), "delete failed: {r:?}");
+        }
+        let s = registry.snapshot(&project).unwrap();
+        assert_eq!(
+            s.class_a_ops_total, 4,
+            "two DELETEs via delete_stream should bump Class-A by 2"
+        );
+        assert_eq!(s.class_b_ops_total, 4, "DELETEs must not bump Class-B");
+    }
+
+    #[tokio::test]
+    async fn cross_project_isolation_class_a_b() {
+        // Same shared registry + same shared inner store, but two distinct
+        // project ids. Project A does writes only; project B does reads only.
+        // After the workload each project's snapshot must reflect only its
+        // own ops — no cross-project bleed.
+        let registry = Arc::new(ProjectCounterRegistry::new());
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let project_a = ProjectId::new();
+        let project_b = ProjectId::new();
+        let store_a = make_store(project_a, &registry, inner.clone());
+        let store_b = make_store(project_b, &registry, inner.clone());
+
+        // Project A: 3 PUTs.
+        for i in 0..3 {
+            let key = ObjectPath::from(format!("a/{i}"));
+            store_a
+                .put_opts(&key, PutPayload::from_static(b"x"), Default::default())
+                .await
+                .expect("put_opts (project A)");
+        }
+
+        // Project B: 2 GETs against a key project A wrote (so the read
+        // succeeds and the Class-B bump fires), plus one LIST.
+        let key_a0 = ObjectPath::from("a/0");
+        for _ in 0..2 {
+            let got = store_b
+                .get_opts(&key_a0, Default::default())
+                .await
+                .expect("get_opts (project B)");
+            let _ = got.bytes().await.unwrap();
+        }
+        let _listed: Vec<_> = store_b.list(None).collect().await;
+
+        let snap_a = registry.snapshot(&project_a).expect("snapshot A");
+        let snap_b = registry.snapshot(&project_b).expect("snapshot B");
+
+        assert_eq!(snap_a.class_a_ops_total, 3, "project A wrote 3");
+        assert_eq!(snap_a.class_b_ops_total, 0, "project A did no reads");
+        assert_eq!(snap_b.class_a_ops_total, 0, "project B did no writes");
+        assert_eq!(
+            snap_b.class_b_ops_total, 3,
+            "project B did 2 GET + 1 LIST = 3 Class-B ops"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_registry_attached_is_a_noop() {
+        // Confirm the legacy un-instrumented path stays compatible: when
+        // counters is None, no panics, no extra alloc, all ops succeed.
+        let project = ProjectId::new();
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let sem = Arc::new(Semaphore::new(16));
+        let scheduler = Scheduler::new(crate::DEFAULT_GLOBAL_BUDGET);
+        let store = ProjectScopedStore::new(inner, sem, scheduler, project, None);
+
+        let path = ObjectPath::from("x");
+        store
+            .put_opts(&path, PutPayload::from_static(b"y"), Default::default())
+            .await
+            .expect("put_opts (no registry)");
+        let got = store
+            .get_opts(&path, Default::default())
+            .await
+            .expect("get_opts (no registry)");
+        let _ = got.bytes().await.unwrap();
     }
 }

@@ -596,11 +596,16 @@ impl Storage {
     /// will then count against the project's permit pool.
     pub fn project_object_store(&self, project: &ProjectId) -> Arc<dyn ObjectStore> {
         let sem = self.project_semaphore(project);
+        // Pull the per-project counters handle (None if no registry has
+        // been attached). The wrapper's bump sites are a no-op when None,
+        // so the legacy un-instrumented test paths stay byte-identical.
+        let counters = self.project_counters(project);
         Arc::new(concurrency::ProjectScopedStore::new(
             self.inner.object_store.clone(),
             sem,
             self.inner.scheduler.clone(),
             *project,
+            counters,
         ))
     }
 
