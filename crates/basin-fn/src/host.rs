@@ -7,8 +7,10 @@
 //! id, identity) added in subsequent phases.
 
 use wasmtime::component::HasSelf;
+use wasmtime::ResourceLimiter;
 
 use crate::engine::InvocationContext;
+use crate::governance::MemoryLimiter;
 
 // Pull the generated host-trait bindings.
 use crate::harness::basin::functions::{http, log, query, secret};
@@ -38,14 +40,44 @@ impl FunctionCallContext {
 
 /// The value stored in every `wasmtime::Store` used by this harness.
 ///
-/// One instance per function invocation (Stores are single-use in W1).
+/// One instance per function invocation (Stores are single-use in W1). The
+/// optional `memory_limiter` slot is populated when the harness is built
+/// with a [`crate::governance::FunctionGovernance`] — wasmtime's
+/// [`wasmtime::Store::limiter`] requires the [`ResourceLimiter`] to live
+/// *inside* the store-data type, so the limiter rides along on
+/// [`FunctionHost`] and is reached via [`FunctionHost::limiter_mut`].
 pub struct FunctionHost {
     pub ctx: FunctionCallContext,
+    /// Per-Store linear-memory cap. `None` when the host is built without a
+    /// governance attached (legacy path) — in that case the engine-level
+    /// `memory_reservation` is the only memory backstop.
+    pub memory_limiter: Option<MemoryLimiter>,
 }
 
 impl FunctionHost {
+    /// Build a host with no per-Store memory limiter. Engine-level
+    /// `memory_reservation` is the only memory cap.
     pub fn new(ctx: FunctionCallContext) -> Self {
-        Self { ctx }
+        Self { ctx, memory_limiter: None }
+    }
+
+    /// Build a host carrying a [`MemoryLimiter`] for the per-Store cap.
+    /// Used by [`crate::ComponentHarness`] / [`crate::HandlerHarness`] when
+    /// they are constructed with governance.
+    pub fn with_limiter(ctx: FunctionCallContext, limiter: MemoryLimiter) -> Self {
+        Self { ctx, memory_limiter: Some(limiter) }
+    }
+
+    /// Closure-style accessor used by [`wasmtime::Store::limiter`]. Returns
+    /// a `&mut dyn ResourceLimiter` to the embedded [`MemoryLimiter`]; if
+    /// the host was built without a limiter, an unbounded one is lazily
+    /// installed so the closure signature stays satisfied (the engine-level
+    /// reservation still caps memory in that case).
+    pub fn limiter_mut(&mut self) -> &mut dyn ResourceLimiter {
+        if self.memory_limiter.is_none() {
+            self.memory_limiter = Some(MemoryLimiter::new(usize::MAX));
+        }
+        self.memory_limiter.as_mut().expect("just set")
     }
 }
 

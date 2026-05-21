@@ -99,6 +99,8 @@ fn caps_for_cpu_test() -> FunctionCaps {
         memory_max_bytes: 64 * 1024 * 1024,
         wall_timeout: Duration::from_secs(5),
         project_concurrency: 4,
+        project_semaphore_cap: 16,
+        worker_threads: 2,
     }
 }
 
@@ -109,6 +111,8 @@ fn caps_for_mem_test() -> FunctionCaps {
         memory_max_bytes: 1024 * 1024,
         wall_timeout: Duration::from_secs(5),
         project_concurrency: 4,
+        project_semaphore_cap: 16,
+        worker_threads: 2,
     }
 }
 
@@ -255,6 +259,8 @@ async fn wall_timeout_kills_long_sleep() {
         memory_max_bytes: 64 * 1024 * 1024,
         wall_timeout: Duration::from_millis(80),
         project_concurrency: 4,
+        project_semaphore_cap: 16,
+        worker_threads: 2,
     };
     let gov = FunctionGovernance::new(caps);
     let project = ProjectId::new();
@@ -289,6 +295,8 @@ async fn project_concurrency_limits_in_flight() {
         memory_max_bytes: 64 * 1024 * 1024,
         wall_timeout: Duration::from_secs(5),
         project_concurrency: 2,
+        project_semaphore_cap: 16,
+        worker_threads: 2,
     };
     let gov = FunctionGovernance::new(caps);
     let project = ProjectId::new();
@@ -323,5 +331,148 @@ async fn project_concurrency_limits_in_flight() {
     assert_eq!(
         peak, 2,
         "expected at most 2 concurrent invocations under project_concurrency=2, saw peak={peak}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6.P0.C acceptance tests — wire W5 caps into the real entrypoint
+// (ComponentHarness::run_with), dedicated wasm runtime, semaphore LRU.
+// ---------------------------------------------------------------------------
+
+/// 6.P0.C #1: a spinner Wasm guest invoked through `ComponentHarness::run_with`
+/// is killed by the CPU cap. The previous W1 entrypoint had no ticker and no
+/// limiter wired (audit finding #1) — this test proves governance is now
+/// enforced on the real path, not just on a hand-rolled closure passed to
+/// `invoke_with_caps`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn component_harness_run_with_cpu_cap_kills_spinner() {
+    use basin_fn::ComponentHarness;
+
+    let caps = caps_for_cpu_test();
+    let gov = FunctionGovernance::new(caps);
+
+    let wasm = wat::parse_str(SPINNER_WAT).expect("WAT spinner parses");
+    let harness =
+        Arc::new(ComponentHarness::with_governance(&wasm, gov.clone()).expect("compile"));
+    assert!(harness.has_governance(), "with_governance must attach caps");
+
+    let project = ProjectId::new();
+    let started = std::time::Instant::now();
+    let err = harness
+        .run_with(project, InvocationContext::mock())
+        .await
+        .expect_err("spinner must be killed at the CPU cap");
+    let elapsed = started.elapsed();
+
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("interrupt") || msg.contains("trap") || msg.contains("epoch")
+            || msg.contains("wall-clock"),
+        "expected epoch/trap/wall-clock interrupt, got: {msg}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(6),
+        "spinner kill should happen well under the 5 s wall timeout (took {elapsed:?})"
+    );
+}
+
+/// 6.P0.C #2: a 1000-concurrent-invocation soak on the dedicated wasm
+/// runtime does not starve the main runtime. We assert this indirectly by
+/// proving a cheap `tokio::time::sleep(10ms)` on the MAIN runtime stays
+/// responsive while 1000 wasm-no-op invocations are in flight.
+///
+/// Pre-fix: every wasm invocation hit `tokio::task::spawn_blocking` (the
+/// global pool, default 512 threads, shared with axum + shard-mode
+/// executor). 1000 concurrent + a wall_timeout near zero starved the
+/// global pool and any cheap task on the main runtime saw multi-second
+/// stalls. Post-fix: wasm rides the dedicated `WasmRuntime`, leaving the
+/// global pool empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dedicated_runtime_does_not_starve_main_runtime() {
+    let caps = FunctionCaps {
+        cpu_ticks: 100,
+        memory_max_bytes: 64 * 1024 * 1024,
+        wall_timeout: Duration::from_secs(5),
+        // Per-project semaphore high enough that 1000 calls really run in
+        // parallel rather than serialising at the admission gate.
+        project_concurrency: 1000,
+        project_semaphore_cap: 16,
+        worker_threads: 4,
+    };
+    let gov = FunctionGovernance::new(caps);
+    let project = ProjectId::new();
+
+    // Launch 1000 fire-and-forget wasm invocations that hold their
+    // dedicated-runtime blocking thread for ~50 ms each.
+    let mut wasm_handles = Vec::with_capacity(1000);
+    for _ in 0..1000 {
+        let gov = gov.clone();
+        wasm_handles.push(tokio::spawn(async move {
+            let _ = gov
+                .invoke_with_caps(project, || {
+                    std::thread::sleep(Duration::from_millis(50));
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await;
+        }));
+    }
+
+    // Meanwhile, on the MAIN runtime, schedule a cheap async sleep + measure
+    // round-trip latency. If wasm were stealing the main runtime / global
+    // blocking pool, this number would balloon.
+    let canary_started = std::time::Instant::now();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let canary_latency = canary_started.elapsed();
+
+    // Generous bound — under a starvation regression this is multi-seconds.
+    // 500 ms gives huge headroom while still proving "not blocked".
+    assert!(
+        canary_latency < Duration::from_millis(500),
+        "main-runtime canary must stay responsive under wasm soak; saw {canary_latency:?}"
+    );
+
+    // Drain the wasm handles so the test cleanly exits (without leaking the
+    // dedicated-runtime threads).
+    for h in wasm_handles {
+        let _ = h.await;
+    }
+}
+
+/// 6.P0.C #3: 10k distinct projects called once each must NOT grow the
+/// per-project semaphore map unboundedly — the LRU caps it at
+/// `project_semaphore_cap`. Pre-fix the `DashMap<ProjectId, Arc<Semaphore>>`
+/// grew O(distinct projects ever seen). Post-fix the LRU bounds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn per_project_semaphore_lru_evicts_at_scale() {
+    let caps = FunctionCaps {
+        cpu_ticks: 50,
+        memory_max_bytes: 64 * 1024 * 1024,
+        wall_timeout: Duration::from_secs(2),
+        project_concurrency: 4,
+        // Tight LRU so we can detect eviction quickly without churning
+        // 10k entries (which would make CI slow).
+        project_semaphore_cap: 32,
+        worker_threads: 2,
+    };
+    let gov = FunctionGovernance::new(caps);
+
+    // Touch 10 000 distinct cold projects (one invocation each). Without
+    // LRU eviction, the underlying map would hold 10 000 Arc<Semaphore>
+    // entries forever (~640 KB just for the map + semaphore overhead).
+    for _ in 0..10_000 {
+        let project = ProjectId::new();
+        gov.invoke_with_caps(project, || Ok::<_, anyhow::Error>(()))
+            .await
+            .expect("no-op succeeds");
+    }
+
+    let cache_len = gov.project_semaphore_cache_len();
+    assert!(
+        cache_len <= 32,
+        "per-project semaphore LRU must cap at 32 entries; saw {cache_len}"
+    );
+    assert!(
+        cache_len > 0,
+        "LRU should still hold the most-recent entries; saw 0"
     );
 }

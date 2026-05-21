@@ -7,7 +7,8 @@
 //! cron / one-shot shape. W2 adds the HTTP-handler shape: a component that
 //! exports `basin:functions/handler#handle(request) -> response`. The host's
 //! `/fn/v1/:name` mount instantiates one of these per registered function and
-//! dispatches every matching request through `HandlerHarness::handle`.
+//! dispatches every matching request through `HandlerHarness::handle` (no
+//! caps) or `HandlerHarness::handle_with` (W5 caps, Phase 6.P0.C).
 //!
 //! ## Mirroring W1
 //!
@@ -29,7 +30,10 @@ use std::sync::Arc;
 use wasmtime::{Engine, Store};
 use wasmtime::component::Component;
 
+use basin_common::ids::ProjectId;
+
 use crate::engine::InvocationContext;
+use crate::governance::{FunctionGovernance, MemoryLimiter};
 use crate::host::{FunctionCallContext, FunctionHost};
 
 // ---------------------------------------------------------------------------
@@ -100,32 +104,56 @@ impl HandlerResponse {
 /// Pre-compiled component that implements the `basin-functions-handler` world.
 ///
 /// Build once per registered function (per uploaded `.wasm`); call
-/// [`HandlerHarness::handle`] for every incoming `/fn/v1/:name` request.
-/// Thread-safe.
+/// [`HandlerHarness::handle`] (no governance) or
+/// [`HandlerHarness::handle_with`] (governance-wrapped, Phase 6.P0.C) for
+/// every incoming `/fn/v1/:name` request. Thread-safe.
 pub struct HandlerHarness {
     engine: Arc<Engine>,
     component: Component,
     linker: wasmtime::component::Linker<FunctionHost>,
+    governance: Option<Arc<FunctionGovernance>>,
 }
 
 impl HandlerHarness {
     /// Compile `wasm_bytes` into a component and pre-link the four host
-    /// imports.
+    /// imports, against the process-wide engine and **without governance**.
     ///
     /// `wasm_bytes` must be a valid Wasm **component** (component model format,
     /// not a core module) that exports the `basin:functions/handler`
     /// interface.
     pub fn new(wasm_bytes: &[u8]) -> anyhow::Result<Self> {
         let engine = crate::harness::component_engine_pub();
-        let component = Component::new(&engine, wasm_bytes)?;
+        Self::build(engine, wasm_bytes, None)
+    }
 
+    /// Compile `wasm_bytes` against `governance`'s engine and attach the
+    /// governance so [`Self::handle_with`] enforces every cap.
+    pub fn with_governance(
+        wasm_bytes: &[u8],
+        governance: Arc<FunctionGovernance>,
+    ) -> anyhow::Result<Self> {
+        let engine = governance.engine().clone();
+        Self::build(engine, wasm_bytes, Some(governance))
+    }
+
+    fn build(
+        engine: Arc<Engine>,
+        wasm_bytes: &[u8],
+        governance: Option<Arc<FunctionGovernance>>,
+    ) -> anyhow::Result<Self> {
+        let component = Component::new(&engine, wasm_bytes)?;
         let mut linker: wasmtime::component::Linker<FunctionHost> =
             wasmtime::component::Linker::new(&engine);
         // Re-use the W1 linker wiring for query / http / log / secret —
         // the trait impls live in `crate::host` and are world-agnostic.
         crate::host::add_host_to_linker(&mut linker)?;
 
-        Ok(Self { engine, component, linker })
+        Ok(Self { engine, component, linker, governance })
+    }
+
+    /// Whether the harness was built with [`Self::with_governance`].
+    pub fn has_governance(&self) -> bool {
+        self.governance.is_some()
     }
 
     /// Instantiate the component with the provided `ctx` and call
@@ -134,6 +162,10 @@ impl HandlerHarness {
     /// Returns the guest's response, or maps a guest-side `Err(String)` to a
     /// 500 with the error message in the body. Trap / linkage failures
     /// propagate via `anyhow::Result`.
+    ///
+    /// **Synchronous, no governance.** This entrypoint is kept for the test
+    /// fixtures and any caller that has its own governance wrapping; the
+    /// production W6 path goes through [`Self::handle_with`].
     pub fn handle(
         &self,
         ctx: InvocationContext,
@@ -156,7 +188,63 @@ impl HandlerHarness {
         let bindings = BasinFunctionsHandler::instantiate(&mut store, &self.component, &self.linker)?;
         let res = bindings.call_handle(&mut store, &wit_req)?;
 
-        Ok(match res {
+        Ok(Self::lift_response(res))
+    }
+
+    /// Governance-wrapped invocation (the W2 / W6 production path). Enforces
+    /// CPU (epoch trap), memory (per-Store [`MemoryLimiter`]), wall-clock
+    /// timeout, per-project semaphore, and runs the synchronous wasm work
+    /// on the dedicated wasm tokio runtime.
+    ///
+    /// Panics if the harness was built via [`Self::new`] (without
+    /// governance). Use [`Self::has_governance`] to check.
+    pub async fn handle_with(
+        self: &Arc<Self>,
+        project: ProjectId,
+        ctx: InvocationContext,
+        req: HandlerRequest,
+    ) -> anyhow::Result<HandlerResponse> {
+        let gov = self.governance.clone().expect(
+            "HandlerHarness::handle_with requires a governance-attached harness; \
+             use HandlerHarness::with_governance(..) at construction",
+        );
+        let me = self.clone();
+        let caps = gov.caps().clone();
+        // Clone `gov` for the closure body; the outer `gov` is borrowed by
+        // `invoke_with_caps`. Both Arcs alias the same FunctionGovernance.
+        let gov_inner = gov.clone();
+        gov.invoke_with_caps(project, move || {
+            let call_ctx = FunctionCallContext::new(ctx);
+            let host = FunctionHost::with_limiter(
+                call_ctx,
+                MemoryLimiter::new(caps.memory_max_bytes),
+            );
+            let mut store = Store::new(&me.engine, host);
+            gov_inner.prepare_store_with_limiter(
+                &mut store,
+                |h: &mut FunctionHost| h.limiter_mut(),
+            );
+
+            let wit_req = WitRequest {
+                method: req.method,
+                path: req.path,
+                headers: req.headers,
+                body: req.body,
+            };
+            let bindings =
+                BasinFunctionsHandler::instantiate(&mut store, &me.component, &me.linker)?;
+            let res = bindings.call_handle(&mut store, &wit_req)?;
+            Ok(Self::lift_response(res))
+        })
+        .await
+    }
+
+    /// Shared response lift used by both [`Self::handle`] and
+    /// [`Self::handle_with`].
+    fn lift_response(
+        res: Result<basin::functions::handler::Response, String>,
+    ) -> HandlerResponse {
+        match res {
             Ok(r) => HandlerResponse {
                 status: r.status,
                 headers: r.headers,
@@ -167,7 +255,7 @@ impl HandlerHarness {
                 headers: vec![("content-type".into(), "text/plain; charset=utf-8".into())],
                 body: format!("function returned error: {msg}").into_bytes(),
             },
-        })
+        }
     }
 }
 

@@ -1903,11 +1903,36 @@ an audit P0 single-instance gap on its own.
       verifies concurrent checkouts surface ≥4 distinct PG backend pids
       where the old shared `Client` could only ever surface one. Commits
       8977fa6 (refactor) + c36790a (test).
-- [ ] **6.P0.C — Wasm on a dedicated tokio runtime** — Wasm invocations
-      currently run on the shared `spawn_blocking` pool
-      (`crates/basin-fn/src/governance.rs:359`), starving the shard-mode
-      executor under load. Move to a sized, separate runtime; per-replica
-      cap.
+- [x] **6.P0.C — Wasm on a dedicated tokio runtime + wire W5 caps to real
+      entrypoint** (combined with W5-followup #16). Five fixes in
+      `crates/basin-fn`:
+      1. `ComponentHarness::with_governance` + `run_with` re-added so every
+         invocation routes through `FunctionGovernance::invoke_with_caps`
+         (CPU epoch trap, per-Store `MemoryLimiter`, wall guard, per-project
+         semaphore). Mirrored on `HandlerHarness::with_governance` +
+         `handle_with`; `FunctionRuntime::with_caps_governance` plugs the W5
+         caps into the W6 catalog-aware registry. Closes audit finding #1:
+         the W5 caps had zero non-test callers.
+      2. Epoch ticker spawned per governance instance — `set_epoch_deadline`
+         now has teeth on the real path.
+      3. `FunctionHost` carries an optional `MemoryLimiter`; installed onto
+         every governance-wrapped `Store` via `Store::limiter(...)` so the
+         linear-memory cap is per-invocation (not just engine-wide).
+      4. New `WasmRuntime` owns a multi-thread `tokio::runtime::Runtime`
+         sized via `BASIN_FN_WORKER_THREADS` (default 4) on a side thread
+         so wasm-blocking no longer competes with axum / shard-mode
+         executor / basin-net on the global pool.
+      5. Per-project `DashMap<ProjectId, Arc<Semaphore>>` replaced by a
+         bounded `Mutex<LruCache<...>>` (default 10 000 entries via
+         `BASIN_FN_PROJECT_SEM_CAP`) — closes #16 (per-tenant cost is now
+         O(bytes), not O(distinct projects ever seen)).
+      Acceptance tests in `tests/governance_caps_test.rs`:
+      `component_harness_run_with_cpu_cap_kills_spinner` (spinner via the
+      real entrypoint),
+      `dedicated_runtime_does_not_starve_main_runtime` (1k-soak +
+      main-runtime canary stays < 500 ms),
+      `per_project_semaphore_lru_evicts_at_scale` (10k cold projects → LRU
+      cap holds).
 
 ### Phase 6.X — the architectural commitment (~6–10 weeks single-engineer)
 Sequencing: **A → B**, **A → D**, **B → C**, **A–D → E + F**.

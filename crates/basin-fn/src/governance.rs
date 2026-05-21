@@ -1,21 +1,26 @@
 //! [`FunctionGovernance`] — per-invocation resource governance for Wasm
-//! component functions (Phase 5.11.W5).
+//! component functions (Phase 5.11.W5, hardened by Phase 6.P0.C).
 //!
 //! W1 ([`ComponentHarness`](crate::ComponentHarness)) created a fresh
 //! [`wasmtime::Store`] per invocation with an epoch deadline set, but no
 //! interrupter, no memory cap, no wall-clock guard, and no per-project
-//! admission control. W5 adds those four caps:
+//! admission control. W5 added those four caps; 6.P0.C wires them onto the
+//! real `ComponentHarness::run` / `HandlerHarness::handle` entrypoints and
+//! lifts the noisy-neighbor concerns flagged in
+//! `docs/audits/2026-05-21-noisy-neighbor-fairness.md` (item #16):
 //!
 //! | Cap | Mechanism |
 //! |---|---|
 //! | **CPU**            | [`wasmtime::Engine::increment_epoch`] ticked by a tokio task; each store is configured with `set_epoch_deadline(cpu_ticks)` + `epoch_deadline_trap()` so a runaway loop traps once it has consumed `cpu_ticks` ticks. |
-//! | **Linear memory**  | [`wasmtime::ResourceLimiter`] impl that rejects any `memory.grow` whose desired byte size exceeds [`FunctionCaps::memory_max_bytes`]. Returning `Err` causes wasmtime to raise a trap. |
-//! | **Wall clock**     | [`tokio::time::timeout`] wraps the [`tokio::task::spawn_blocking`] handle that runs the synchronous wasm call. On expiry the epoch is bumped past the deadline to interrupt the wasm thread, then an error is returned. |
-//! | **Concurrency**    | A [`DashMap<ProjectId, Arc<Semaphore>>`] of bounded [`tokio::sync::Semaphore`]s, default 16 permits each. [`FunctionGovernance::invoke_with_caps`] acquires before delegating to the caller-supplied closure, so over-capacity invocations wait fairly. |
+//! | **Linear memory**  | [`wasmtime::ResourceLimiter`] impl ([`MemoryLimiter`]) installed on every [`Store`] via `store.limiter(...)`. The cap is enforced per-Store *and* engine-wide via `memory_reservation` so the trap fires before host OOM. |
+//! | **Wall clock**     | [`tokio::time::timeout`] wraps the dedicated-runtime blocking task that runs the synchronous wasm call. On expiry the epoch is bumped past the deadline to interrupt the wasm thread, then an error is returned. |
+//! | **Concurrency**    | A bounded [`LruCache<ProjectId, Arc<Semaphore>>`] of bounded [`tokio::sync::Semaphore`]s, default 16 permits each. The LRU evicts least-recently-used entries on insert when full, so per-tenant cost is O(bytes), not O(distinct projects ever seen). |
+//! | **Runtime**        | A dedicated [`tokio::runtime::Runtime`] sized via `BASIN_FN_WORKER_THREADS` (default 4) runs every blocking wasm call. Without this, Wasm shares the global `spawn_blocking` pool with axum, the shard-mode executor (basin-engine), and basin-net — a few aggressive tenants starve all of them. |
 //!
 //! Defaults come from constants below; [`FunctionCaps::from_env`] reads the
 //! `BASIN_FN_CPU_TICKS / BASIN_FN_MEM_MB / BASIN_FN_WALL_MS /
-//! BASIN_FN_PROJECT_CONCURRENCY` environment variables for overrides.
+//! BASIN_FN_PROJECT_CONCURRENCY / BASIN_FN_PROJECT_SEM_CAP /
+//! BASIN_FN_WORKER_THREADS` environment variables for overrides.
 //!
 //! ## Scope
 //!
@@ -25,12 +30,13 @@
 //! `basin-functions` (`run`) and `basin-functions-handler` (`handle`) worlds
 //! without forcing one to import the other.
 
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use basin_common::ids::ProjectId;
-use dashmap::DashMap;
+use lru::LruCache;
 use tokio::sync::Semaphore;
 use wasmtime::{Engine, ResourceLimiter, Store};
 
@@ -52,6 +58,17 @@ pub const DEFAULT_WALL_TIMEOUT_MS: u64 = 10_000;
 /// Per-project concurrency cap default: 16 concurrent invocations.
 /// Configurable via `BASIN_FN_PROJECT_CONCURRENCY`.
 pub const DEFAULT_PROJECT_CONCURRENCY: usize = 16;
+
+/// Per-project semaphore-map capacity. Defaults to 10 000 active projects;
+/// past this, the LRU evicts the least-recently-used entry on every insert.
+/// Configurable via `BASIN_FN_PROJECT_SEM_CAP`.
+pub const DEFAULT_PROJECT_SEMAPHORE_CAP: usize = 10_000;
+
+/// Dedicated-runtime worker-thread count default: 4. Configurable via
+/// `BASIN_FN_WORKER_THREADS`. The Wasm runtime is **separate** from the main
+/// tokio runtime so a flood of wasm invocations cannot starve the rest of
+/// the process (axum HTTP, shard-mode executor, basin-net outbound).
+pub const DEFAULT_WORKER_THREADS: usize = 4;
 
 /// Epoch ticker interval. Matches the W1 / 5.11.J `BASIN_WASM_EPOCH_MS`
 /// default; the W5 ticker is independent of the J ticker because the two
@@ -75,6 +92,13 @@ pub struct FunctionCaps {
     pub wall_timeout: Duration,
     /// Max concurrent invocations per project.
     pub project_concurrency: usize,
+    /// Max distinct projects whose per-project semaphore is held in memory.
+    /// LRU-evicted; an idle project's semaphore is dropped when the cap is
+    /// reached. Default [`DEFAULT_PROJECT_SEMAPHORE_CAP`].
+    pub project_semaphore_cap: usize,
+    /// Number of worker threads in the dedicated Wasm tokio runtime.
+    /// Default [`DEFAULT_WORKER_THREADS`].
+    pub worker_threads: usize,
 }
 
 impl FunctionCaps {
@@ -85,6 +109,8 @@ impl FunctionCaps {
             memory_max_bytes: DEFAULT_MEMORY_MAX_BYTES,
             wall_timeout: Duration::from_millis(DEFAULT_WALL_TIMEOUT_MS),
             project_concurrency: DEFAULT_PROJECT_CONCURRENCY,
+            project_semaphore_cap: DEFAULT_PROJECT_SEMAPHORE_CAP,
+            worker_threads: DEFAULT_WORKER_THREADS,
         }
     }
 
@@ -114,6 +140,12 @@ impl FunctionCaps {
         if let Some(v) = lookup("BASIN_FN_PROJECT_CONCURRENCY").and_then(|s| s.parse().ok()) {
             c.project_concurrency = v;
         }
+        if let Some(v) = lookup("BASIN_FN_PROJECT_SEM_CAP").and_then(|s| s.parse().ok()) {
+            c.project_semaphore_cap = v;
+        }
+        if let Some(v) = lookup("BASIN_FN_WORKER_THREADS").and_then(|s| s.parse().ok()) {
+            c.worker_threads = v;
+        }
         c
     }
 }
@@ -128,15 +160,17 @@ impl Default for FunctionCaps {
 // MemoryLimiter — wasmtime::ResourceLimiter that caps linear-memory growth
 // ---------------------------------------------------------------------------
 
-/// Cap on linear-memory growth for a single invocation.
-///
-/// One logical instance per `Store`. The actual cap value lives in an
-/// `Arc<Mutex<...>>` so the same limiter can be installed via wasmtime's
-/// callback-style API (see [`install_limiter`]).
+/// Cap on linear-memory growth for a single invocation. Installed on every
+/// [`Store`] via [`Store::limiter`] from inside
+/// [`FunctionGovernance::prepare_store_with_limiter`].
 ///
 /// Returning `Err` from `memory_growing` causes wasmtime to trap the guest
 /// (per the [`ResourceLimiter`] docs) — i.e. the function is killed rather
 /// than silently observing `-1` from `memory.grow`. We want killed.
+///
+/// Per-Store rather than per-Engine: each invocation gets its own
+/// [`MemoryLimiter`] with the configured cap, so accounting is isolated.
+#[derive(Clone, Debug)]
 pub struct MemoryLimiter {
     max_bytes: usize,
 }
@@ -144,6 +178,12 @@ pub struct MemoryLimiter {
 impl MemoryLimiter {
     pub fn new(max_bytes: usize) -> Self {
         Self { max_bytes }
+    }
+
+    /// The configured cap. Exposed so [`crate::FunctionHost`] can construct a
+    /// limiter from caps without re-importing the constant.
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
     }
 }
 
@@ -181,14 +221,6 @@ impl ResourceLimiter for MemoryLimiter {
 
 /// Apply the linear-memory cap to a fresh wasmtime [`wasmtime::Config`].
 ///
-/// We enforce the cap at `Config` level (engine-wide) rather than via
-/// [`Store::limiter`] for one structural reason: `Store::limiter`'s closure
-/// must return a `&mut dyn ResourceLimiter` whose lifetime is tied to
-/// `&mut T` (the store data type). Without modifying the existing
-/// [`crate::FunctionHost`] (`host.rs`, owned by W1-followup), there is no
-/// place inside `T` for the limiter to live, and the borrow checker rules
-/// out returning a reference to closure-captured state from an `FnMut`.
-///
 /// Three settings combine to make the engine-level cap a *hard* trap on
 /// overflow instead of a soft `-1` return from `memory.grow`:
 ///
@@ -199,15 +231,116 @@ impl ResourceLimiter for MemoryLimiter {
 /// 3. `memory_may_move(false)` — disallows relocating, so growing past the
 ///    reservation has nowhere to go and traps the guest.
 ///
-/// The trade-off is that the cap is per-Engine rather than per-invocation.
-/// W5 acceptance is "fixture that tries to grow past the cap is killed",
-/// which this satisfies; promoting to a true per-invocation budget belongs
-/// to a future pass that's allowed to add a limiter slot inside
-/// `FunctionHost`.
+/// Defence in depth: per-Store [`MemoryLimiter`] is the primary cap; engine
+/// reservation is the backstop in case a host fails to install the limiter.
 fn apply_memory_cap_to_config(cfg: &mut wasmtime::Config, max_bytes: usize) {
     cfg.memory_reservation(max_bytes as u64);
     cfg.memory_reservation_for_growth(0);
     cfg.memory_may_move(false);
+}
+
+// ---------------------------------------------------------------------------
+// Dedicated tokio runtime — keeps wasm off the global spawn_blocking pool
+// ---------------------------------------------------------------------------
+
+/// Owns the dedicated multi-thread tokio runtime that runs every Wasm
+/// invocation's blocking closure.
+///
+/// Why a *separate* runtime? `tokio::task::spawn_blocking` posts onto the
+/// global blocking pool (default 512 threads), shared with axum's blocking
+/// extractors, the basin-engine shard-mode executor, basin-net's blocking
+/// HTTP fallbacks, and any other crate that ever calls `spawn_blocking`. A
+/// burst of wasm guests that hold their blocking thread for the full wall
+/// timeout (e.g. 10 s default) can starve everything else process-wide.
+/// The dedicated runtime gives wasm a sized, isolated budget — over-capacity
+/// callers wait on the wasm semaphore, not on the global pool.
+///
+/// ## Why the `Runtime` lives on a side thread
+///
+/// `tokio::runtime::Runtime` panics when dropped from inside another
+/// runtime's async context — but [`FunctionGovernance`] is created and
+/// dropped from inside tokio tasks in tests and in production. The fix is
+/// to build the runtime on a dedicated std thread that *owns* the
+/// `Runtime` value; the rest of the process interacts via a cheap
+/// [`tokio::runtime::Handle`] clone. Dropping the [`WasmRuntime`] signals
+/// the owner thread to shut the runtime down off any tokio context.
+pub(crate) struct WasmRuntime {
+    handle: tokio::runtime::Handle,
+    shutdown: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WasmRuntime {
+    fn new(worker_threads: usize) -> anyhow::Result<Self> {
+        let workers = worker_threads.max(1);
+        let (handle_tx, handle_rx) = std::sync::mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
+
+        let thread = std::thread::Builder::new()
+            .name("basin-fn-wasm-rt".into())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(workers)
+                    // Generous blocking-pool sizing per worker: each wasm
+                    // invocation runs on a blocking thread (spawn_blocking)
+                    // so the pool is the actual concurrency ceiling. Cap at
+                    // workers * 16 — the per-project semaphore bounds
+                    // in-flight wasm calls below this.
+                    .max_blocking_threads(workers.saturating_mul(16).max(16))
+                    .thread_name("basin-fn-wasm")
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(_) => return,
+                };
+                let _ = handle_tx.send(rt.handle().clone());
+                // Block this thread until shutdown — we own the Runtime and
+                // must outlive every spawn_blocking caller.
+                let _ = shutdown_rx.recv();
+                // Drop the runtime *off* any tokio context (this thread is
+                // a vanilla std thread), so the blocking-pool shutdown does
+                // not panic.
+                drop(rt);
+            })
+            .context("spawn dedicated wasm runtime thread")?;
+
+        let handle = handle_rx
+            .recv()
+            .context("dedicated wasm runtime failed to initialise")?;
+
+        Ok(Self {
+            handle,
+            shutdown: Some(shutdown_tx),
+            thread: Some(thread),
+        })
+    }
+
+    /// Spawn the synchronous `work` closure on the dedicated wasm pool's
+    /// blocking thread set. Returns a `JoinHandle` callers await from the
+    /// main runtime.
+    fn spawn_blocking<F, R>(&self, work: F) -> tokio::task::JoinHandle<R>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        self.handle.spawn_blocking(work)
+    }
+}
+
+impl Drop for WasmRuntime {
+    fn drop(&mut self) {
+        // Signal the owner thread; ignore send errors (means the thread
+        // already exited). Then join so the Runtime is fully torn down
+        // before this Drop returns — important for tests that count
+        // threads.
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -217,8 +350,9 @@ fn apply_memory_cap_to_config(cfg: &mut wasmtime::Config, max_bytes: usize) {
 /// Per-process governance state for Wasm function invocations.
 ///
 /// One instance is typically shared across all functions: it owns the
-/// `Engine` (so the epoch ticker can drive it), the per-project semaphore
-/// map, and the immutable [`FunctionCaps`].
+/// `Engine` (so the epoch ticker can drive it), the bounded per-project
+/// semaphore cache, the dedicated wasm runtime, and the immutable
+/// [`FunctionCaps`].
 ///
 /// ```rust,no_run
 /// use basin_fn::governance::{FunctionGovernance, FunctionCaps};
@@ -229,7 +363,11 @@ fn apply_memory_cap_to_config(cfg: &mut wasmtime::Config, max_bytes: usize) {
 pub struct FunctionGovernance {
     engine: Arc<Engine>,
     caps: FunctionCaps,
-    project_sems: DashMap<ProjectId, Arc<Semaphore>>,
+    /// Bounded LRU of per-project semaphores. Mutex-guarded because
+    /// `LruCache::get` mutates the recency order. Cheap (sub-µs lookup).
+    project_sems: Mutex<LruCache<ProjectId, Arc<Semaphore>>>,
+    /// Dedicated tokio runtime that owns every wasm-blocking thread.
+    wasm_runtime: WasmRuntime,
     // Hold the ticker guard so dropping `FunctionGovernance` ends the
     // background task — avoids leaking a tokio task per test instance.
     _ticker: Mutex<Option<TickerGuard>>,
@@ -250,7 +388,7 @@ impl Drop for TickerGuard {
 impl FunctionGovernance {
     /// Build a new governance instance with a fresh `Engine` configured for
     /// component-model + epoch interruption + the linear-memory cap from
-    /// `caps`. Starts the epoch ticker.
+    /// `caps`. Starts the epoch ticker and the dedicated wasm runtime.
     ///
     /// Must be called from inside a tokio runtime — the ticker is a
     /// `tokio::spawn`ed task.
@@ -278,10 +416,18 @@ impl FunctionGovernance {
                 }
             }
         });
+        // LruCache requires a non-zero capacity. Floor at 1 so a malformed
+        // env override doesn't panic; a cap of 1 just thrashes (acceptable
+        // failure mode versus a process abort).
+        let sem_cap = NonZeroUsize::new(caps.project_semaphore_cap.max(1))
+            .expect("max(1) is non-zero");
+        let wasm_runtime = WasmRuntime::new(caps.worker_threads)
+            .expect("dedicated wasm runtime construction");
         Arc::new(Self {
             engine,
             caps,
-            project_sems: DashMap::new(),
+            project_sems: Mutex::new(LruCache::new(sem_cap)),
+            wasm_runtime,
             _ticker: Mutex::new(Some(TickerGuard { handle })),
         })
     }
@@ -297,15 +443,25 @@ impl FunctionGovernance {
         &self.caps
     }
 
-    /// Acquire or lazily create the semaphore for `project`. Cheap (DashMap
-    /// shard lookup); returns an `Arc` so callers can `clone` and `acquire`.
+    /// Acquire or lazily create the semaphore for `project`. LRU-bounded:
+    /// when the cache is full and an entry is inserted, the least-recently
+    /// used entry is dropped. A busy project is touched on every invocation
+    /// so it stays warm at the head of the LRU.
+    ///
+    /// If a project IS evicted while holding outstanding permits, the
+    /// dropped `Arc<Semaphore>` survives via the still-held
+    /// `OwnedSemaphorePermit`s; the next call for that project builds a
+    /// fresh semaphore. Slightly weakens the cap during the transition
+    /// (worst case `project_concurrency × 2`) — acceptable given the LRU
+    /// is sized at 10 K projects by default.
     fn project_sem(&self, project: ProjectId) -> Arc<Semaphore> {
-        // entry() avoids the construct-then-discard pattern when the entry
-        // already exists; the closure runs only on the missing-key path.
-        self.project_sems
-            .entry(project)
-            .or_insert_with(|| Arc::new(Semaphore::new(self.caps.project_concurrency)))
-            .clone()
+        let mut cache = self.project_sems.lock().expect("project_sems poisoned");
+        if let Some(existing) = cache.get(&project) {
+            return existing.clone();
+        }
+        let sem = Arc::new(Semaphore::new(self.caps.project_concurrency));
+        cache.put(project, sem.clone());
+        sem
     }
 
     /// How many concurrent invocations are currently in flight for `project`.
@@ -319,23 +475,52 @@ impl FunctionGovernance {
             .saturating_sub(sem.available_permits())
     }
 
+    /// How many distinct projects currently have a semaphore in the LRU.
+    /// Exposed for tests; production code shouldn't need this.
+    pub fn project_semaphore_cache_len(&self) -> usize {
+        self.project_sems
+            .lock()
+            .expect("project_sems poisoned")
+            .len()
+    }
+
     /// Configure `store` with the per-invocation CPU cap (epoch deadline +
-    /// trap-on-deadline). The memory cap is enforced via the `Engine`'s
-    /// `Config` (see [`apply_memory_cap_to_config`]) so it kicks in for
-    /// every store derived from the engine without needing a per-store
-    /// `ResourceLimiter`.
+    /// trap-on-deadline). Engine-level `memory_reservation` is the only
+    /// memory cap on this path; callers that want the per-Store
+    /// [`MemoryLimiter`] (Phase 6.P0.C) should use
+    /// [`Self::prepare_store_with_limiter`] instead.
     pub fn prepare_store<T: Send + 'static>(&self, store: &mut Store<T>) {
         store.set_epoch_deadline(self.caps.cpu_ticks);
         store.epoch_deadline_trap();
     }
 
-    /// Acquire the per-project semaphore, run `work` on a blocking thread
-    /// under a wall-clock timeout, and translate every failure mode into an
-    /// `anyhow::Error` with a clear message.
+    /// Variant of [`Self::prepare_store`] that ALSO installs a per-Store
+    /// [`ResourceLimiter`] via [`wasmtime::Store::limiter`]. `limiter` is a
+    /// closure that, given the store-data type `T`, returns a `&mut dyn
+    /// ResourceLimiter` — typically a slot on `T` (e.g.
+    /// [`crate::FunctionHost::limiter_mut`]).
+    ///
+    /// This is the Phase 6.P0.C path: the per-invocation memory cap fires
+    /// from inside the `Store` (where wasmtime's accounting lives) rather
+    /// than relying solely on the engine-level reservation.
+    pub fn prepare_store_with_limiter<T>(
+        &self,
+        store: &mut Store<T>,
+        limiter: impl (FnMut(&mut T) -> &mut dyn ResourceLimiter) + Send + Sync + 'static,
+    ) {
+        store.set_epoch_deadline(self.caps.cpu_ticks);
+        store.epoch_deadline_trap();
+        store.limiter(limiter);
+    }
+
+    /// Acquire the per-project semaphore, run `work` on the **dedicated wasm
+    /// runtime**'s blocking thread set under a wall-clock timeout, and
+    /// translate every failure mode into an `anyhow::Error` with a clear
+    /// message.
     ///
     /// `work` is `FnOnce() -> anyhow::Result<R>` — typically the closure
-    /// builds a `Store`, calls `prepare_store`, instantiates the component,
-    /// and calls `call_run` / `call_handle`.
+    /// builds a `Store`, calls `prepare_store_with_limiter`, instantiates
+    /// the component, and calls `call_run` / `call_handle`.
     ///
     /// If the wall-clock timeout fires the epoch is bumped enough to trip
     /// the deadline trap inside the wasm thread, so a runaway CPU-bound
@@ -356,7 +541,10 @@ impl FunctionGovernance {
         let wall = self.caps.wall_timeout;
         let cpu_ticks = self.caps.cpu_ticks;
 
-        let join = tokio::task::spawn_blocking(work);
+        // Route onto the dedicated wasm runtime's blocking pool. The global
+        // `tokio::task::spawn_blocking` would compete with axum / shard-mode
+        // executor / basin-net — see WasmRuntime docs.
+        let join = self.wasm_runtime.spawn_blocking(work);
 
         match tokio::time::timeout(wall, join).await {
             Ok(Ok(res)) => res,
@@ -394,6 +582,8 @@ mod tests {
         assert_eq!(c.memory_max_bytes, DEFAULT_MEMORY_MAX_BYTES);
         assert_eq!(c.wall_timeout, Duration::from_millis(DEFAULT_WALL_TIMEOUT_MS));
         assert_eq!(c.project_concurrency, DEFAULT_PROJECT_CONCURRENCY);
+        assert_eq!(c.project_semaphore_cap, DEFAULT_PROJECT_SEMAPHORE_CAP);
+        assert_eq!(c.worker_threads, DEFAULT_WORKER_THREADS);
     }
 
     #[test]
@@ -405,6 +595,8 @@ mod tests {
             "BASIN_FN_MEM_MB"              => Some("8".to_string()),
             "BASIN_FN_WALL_MS"             => Some("1234".to_string()),
             "BASIN_FN_PROJECT_CONCURRENCY" => Some("3".to_string()),
+            "BASIN_FN_PROJECT_SEM_CAP"     => Some("42".to_string()),
+            "BASIN_FN_WORKER_THREADS"      => Some("9".to_string()),
             _ => None,
         };
         let c = FunctionCaps::from_lookup(lookup);
@@ -412,6 +604,8 @@ mod tests {
         assert_eq!(c.memory_max_bytes, 8 * 1024 * 1024);
         assert_eq!(c.wall_timeout, Duration::from_millis(1234));
         assert_eq!(c.project_concurrency, 3);
+        assert_eq!(c.project_semaphore_cap, 42);
+        assert_eq!(c.worker_threads, 9);
     }
 
     #[test]
@@ -449,6 +643,8 @@ mod tests {
             memory_max_bytes: DEFAULT_MEMORY_MAX_BYTES,
             wall_timeout: Duration::from_secs(5),
             project_concurrency: 2,
+            project_semaphore_cap: 10,
+            worker_threads: 2,
         };
         let gov = FunctionGovernance::new(caps);
         let project = ProjectId::new();
@@ -494,6 +690,8 @@ mod tests {
             memory_max_bytes: DEFAULT_MEMORY_MAX_BYTES,
             wall_timeout: Duration::from_secs(5),
             project_concurrency: 1,
+            project_semaphore_cap: 10,
+            worker_threads: 2,
         };
         let gov = FunctionGovernance::new(caps);
         let p1 = ProjectId::new();
@@ -543,6 +741,8 @@ mod tests {
             memory_max_bytes: DEFAULT_MEMORY_MAX_BYTES,
             wall_timeout: Duration::from_millis(50),
             project_concurrency: 4,
+            project_semaphore_cap: 10,
+            worker_threads: 2,
         };
         let gov = FunctionGovernance::new(caps);
         let project = ProjectId::new();
@@ -557,6 +757,38 @@ mod tests {
         assert!(
             err.to_string().contains("wall-clock timeout"),
             "expected wall-clock timeout error, got: {err}"
+        );
+    }
+
+    /// LRU bound on per-project semaphores: with a cap of 4, adding 100 cold
+    /// projects must leave only 4 entries — the 96 idle ones get evicted.
+    /// This is the W5-followup #16 / noisy-neighbor audit fix: the prior
+    /// `DashMap` grew unboundedly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn project_semaphore_map_is_lru_bounded() {
+        let caps = FunctionCaps {
+            cpu_ticks: 100,
+            memory_max_bytes: DEFAULT_MEMORY_MAX_BYTES,
+            wall_timeout: Duration::from_secs(2),
+            project_concurrency: 4,
+            // 4-entry LRU so we can prove eviction without burning time.
+            project_semaphore_cap: 4,
+            worker_threads: 2,
+        };
+        let gov = FunctionGovernance::new(caps);
+
+        // Touch 100 distinct projects; each call completes before the next.
+        for _ in 0..100 {
+            let project = ProjectId::new();
+            gov.invoke_with_caps(project, || Ok::<_, anyhow::Error>(()))
+                .await
+                .expect("succeeds");
+        }
+
+        let len = gov.project_semaphore_cache_len();
+        assert!(
+            len <= 4,
+            "project semaphore LRU must cap at 4 entries; saw {len}"
         );
     }
 }

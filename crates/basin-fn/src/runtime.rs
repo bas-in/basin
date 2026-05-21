@@ -59,9 +59,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use basin_common::ids::ProjectId;
 use tokio::sync::RwLock;
 
 use crate::engine::InvocationContext;
+use crate::governance::FunctionGovernance as W5Governance;
 use crate::handler::{HandlerHarness, HandlerRequest, HandlerResponse};
 
 // ---------------------------------------------------------------------------
@@ -160,6 +162,12 @@ pub enum InvokeResult {
 pub struct FunctionRuntime {
     store: Arc<dyn FunctionStore>,
     governance: Option<Arc<dyn FunctionGovernance>>,
+    /// Phase 6.P0.C: W5 resource governance (CPU / memory / wall / project
+    /// semaphore / dedicated wasm runtime). When present, every cached
+    /// harness is built via [`HandlerHarness::with_governance`] and every
+    /// invoke goes through [`HandlerHarness::handle_with`] — that's how the
+    /// W5 caps actually fire on the W2 / W6 invoke path.
+    caps_governance: Option<Arc<W5Governance>>,
     /// `(project, name, version)` → pre-compiled handler harness. `Arc`
     /// so a concurrent invocation can hold the harness past a cache
     /// eviction.
@@ -179,11 +187,12 @@ impl FunctionRuntime {
         Self {
             store,
             governance: None,
+            caps_governance: None,
             cache: RwLock::new(HashMap::new()),
         }
     }
 
-    /// Build a runtime with both a store and a governance gate.
+    /// Build a runtime with both a store and a governance gate (admit/deny).
     pub fn with_governance(
         store: Arc<dyn FunctionStore>,
         governance: Arc<dyn FunctionGovernance>,
@@ -191,6 +200,28 @@ impl FunctionRuntime {
         Self {
             store,
             governance: Some(governance),
+            caps_governance: None,
+            cache: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Build a runtime that runs every invocation through the W5
+    /// [`W5Governance`] (CPU + memory + wall + per-project semaphore +
+    /// dedicated wasm runtime). The cached harnesses are constructed via
+    /// [`HandlerHarness::with_governance`] so the caps fire on every
+    /// `invoke`.
+    ///
+    /// Phase 6.P0.C: this is the recommended constructor for production —
+    /// the older [`Self::new`] / [`Self::with_governance`] paths leave the
+    /// caps unenforced on the HTTP handler shape.
+    pub fn with_caps_governance(
+        store: Arc<dyn FunctionStore>,
+        caps_governance: Arc<W5Governance>,
+    ) -> Self {
+        Self {
+            store,
+            governance: None,
+            caps_governance: Some(caps_governance),
             cache: RwLock::new(HashMap::new()),
         }
     }
@@ -242,6 +273,27 @@ impl FunctionRuntime {
             Err(e) => return InvokeResult::RuntimeError(e),
         };
 
+        // Phase 6.P0.C: when W5 governance is attached, every cap (CPU,
+        // memory, wall, per-project semaphore, dedicated wasm runtime) fires
+        // through `HandlerHarness::handle_with`. The semaphore key is the
+        // typed `ProjectId`. The legacy path (`handle` + the global
+        // `spawn_blocking`) is retained only for runtimes constructed via
+        // `FunctionRuntime::new` / `with_governance` without caps.
+        if self.caps_governance.is_some() {
+            let project_id = match project.parse::<ProjectId>() {
+                Ok(id) => id,
+                Err(e) => {
+                    return InvokeResult::RuntimeError(format!(
+                        "invalid project id {project:?}: {e}"
+                    ))
+                }
+            };
+            return match harness.handle_with(project_id, ctx, req).await {
+                Ok(resp) => InvokeResult::Ok(resp),
+                Err(e) => InvokeResult::RuntimeError(format!("{e:#}")),
+            };
+        }
+
         // `HandlerHarness::handle` is synchronous (the WIT `handle` import
         // is not async in W2's shape). Wrap in `spawn_blocking` so we
         // don't stall the tokio reactor on a CPU-bound guest. Per-call
@@ -279,9 +331,15 @@ impl FunctionRuntime {
             }
         }
         // Compile outside the lock — `Component::new` is expensive and
-        // we don't want to serialise compilation across the cache.
-        let compiled = HandlerHarness::new(&record.body)
-            .map_err(|e| format!("compile component for {}: {e:#}", record.name))?;
+        // we don't want to serialise compilation across the cache. When
+        // W5 caps governance is attached the harness is compiled against
+        // the governance's engine so the per-Engine memory reservation +
+        // epoch ticker apply to every invocation.
+        let compiled = match &self.caps_governance {
+            Some(gov) => HandlerHarness::with_governance(&record.body, gov.clone()),
+            None => HandlerHarness::new(&record.body),
+        }
+        .map_err(|e| format!("compile component for {}: {e:#}", record.name))?;
         let arc = Arc::new(compiled);
 
         let mut cache = self.cache.write().await;
