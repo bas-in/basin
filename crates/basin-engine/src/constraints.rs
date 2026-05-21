@@ -40,6 +40,7 @@ use datafusion::prelude::SessionContext;
 use futures::StreamExt;
 
 use crate::convert::{batch_df_to_ws, batch_ws_to_df};
+use crate::types::field_is_citext;
 
 // --------------------------------------------------------------------
 // PRIMARY KEY enforcement
@@ -245,6 +246,19 @@ async fn enforce_one_unique(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    // Determine which constraint columns are citext so we can apply
+    // case-folding when building the dedup key. citext UNIQUE treats
+    // 'Foo' and 'foo' as duplicates (PG citext extension semantics).
+    let batch_schema = batch.schema();
+    let citext_positions: std::collections::HashSet<usize> = col_idx
+        .iter()
+        .enumerate()
+        .filter_map(|(pos, &arr_idx)| {
+            let field = batch_schema.field(arr_idx);
+            if field_is_citext(field) { Some(pos) } else { None }
+        })
+        .collect();
+
     // 1. Existing-table scan (skip replaced files on UPDATE).
     let replaced: std::collections::HashSet<&str> =
         replaced_paths.iter().map(|s| s.as_str()).collect();
@@ -265,8 +279,21 @@ async fn enforce_one_unique(
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
+            // Determine citext positions in this read-back batch's schema
+            // (same columns, but we re-resolve to handle schema evolution).
+            let rb_schema = rb.schema();
+            let rb_citext: std::collections::HashSet<usize> = rb_idx
+                .iter()
+                .enumerate()
+                .filter_map(|(pos, &arr_idx)| {
+                    let field = rb_schema.field(arr_idx);
+                    if field_is_citext(field) { Some(pos) } else { None }
+                })
+                .collect();
             for row in 0..rb.num_rows() {
-                if let Some(k) = pk_tuple_for_row(&rb, &rb_idx, row)? {
+                if let Some(k) =
+                    pk_tuple_for_row_citext(&rb, &rb_idx, row, &rb_citext)?
+                {
                     existing.insert(k);
                 }
             }
@@ -277,7 +304,7 @@ async fn enforce_one_unique(
     let mut seen: std::collections::HashSet<Vec<String>> = Default::default();
     for row in 0..batch.num_rows() {
         // NULL in any column → row exempt (PG default).
-        let Some(k) = pk_tuple_for_row(batch, &col_idx, row)? else {
+        let Some(k) = pk_tuple_for_row_citext(batch, &col_idx, row, &citext_positions)? else {
             continue;
         };
         if existing.contains(&k) || !seen.insert(k.clone()) {
@@ -290,6 +317,34 @@ async fn enforce_one_unique(
         }
     }
     Ok(())
+}
+
+/// Variant of `pk_tuple_for_row` that lower-cases string values for columns
+/// whose position in the key is in `citext_positions` (citext column indexes).
+/// This ensures UNIQUE constraints on citext columns treat 'Foo' and 'foo'
+/// as duplicates, matching PostgreSQL citext semantics.
+fn pk_tuple_for_row_citext(
+    batch: &RecordBatch,
+    pk_idx: &[usize],
+    row: usize,
+    citext_positions: &std::collections::HashSet<usize>,
+) -> Result<Option<Vec<String>>> {
+    let mut out = Vec::with_capacity(pk_idx.len());
+    for (pos, &i) in pk_idx.iter().enumerate() {
+        let arr = batch.column(i);
+        if arr.is_null(row) {
+            return Ok(None);
+        }
+        let s = scalar_to_canonical_string(arr.as_ref(), row)?;
+        // Apply case-folding for citext columns so 'Foo' == 'foo'.
+        let s = if citext_positions.contains(&pos) {
+            s.to_lowercase()
+        } else {
+            s
+        };
+        out.push(s);
+    }
+    Ok(Some(out))
 }
 
 /// Format a row's PK tuple as a Vec<String>. Returns None if any PK

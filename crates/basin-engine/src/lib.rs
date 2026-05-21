@@ -731,6 +731,7 @@ pub enum ExecResult {
 mod advisory_lock;
 mod alter;
 mod alter_project;
+pub(crate) mod operators;
 mod any_all_rewrite;
 mod approx_count_distinct;
 mod approx_percentile;
