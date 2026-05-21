@@ -1572,18 +1572,18 @@ integration harness lands first.
       `tests/integration/tests/range_scheduling.rs`,
       `benches/range_index.rs`.
       Acceptance: harness compiles + reports red.
-- [ ] **5.24.B — Range type implementations** (~1 week).
+- [x] **5.24.B — Range type implementations** (~1 week).
       `int4range`, `int8range`, `numrange`, `tsrange`, `tstzrange`,
       `daterange`. Binary + text serialisation; Arrow representation
       (struct of {lower, upper, lower_inc, upper_inc, empty}). Files:
       `crates/basin-common/src/types/range.rs` (new),
       `crates/basin-engine/src/types.rs` (register).
       Acceptance: type-round-trip slice of 5.24.A flips green.
-- [ ] **5.24.C — Range operators** (~1 week). `@>`, `<@`, `&&`,
+- [x] **5.24.C — Range operators** (~1 week). `@>`, `<@`, `&&`,
       `<<`, `>>`, `-|-`, `+`, `*`, `-`. Files:
       `crates/basin-engine/src/operators/range.rs` (new).
       Acceptance: operator-semantics slice of 5.24.A flips green.
-- [ ] **5.24.D — GIST-equivalent index** (~1 week). True GIST is
+- [~] **5.24.D — GIST-equivalent index** (~1 week). True GIST is
       a deep build; ship a simpler alternative: pre-sort + interval-
       tree-style probe on a B-tree-of-(lower, upper) for the common
       overlap / contains query shapes. Falls back to full scan for
