@@ -25,3 +25,8 @@ basin-test.toml
 **/target/
 .basin-seaweedfs-data/
 .basin-seaweedfs-*
+
+# Generated perf-suite CSV artifacts (tests/integration/tests/perf_suite.rs).
+# Machine-specific timing output diffed by CI run-over-run, not source.
+/perf_suite.csv
+/perf_suite_*.csv
