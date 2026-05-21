@@ -1992,13 +1992,29 @@ Sequencing: **A → B**, **A → D**, **B → C**, **A–D → E + F**.
 - [ ] **6.X.C — Lease handoff under load (~1 wk).** A replica voluntarily
       yields a lease on coordinator request: snapshot memtable → flush →
       transfer epoch → ack. Target < 500 ms p99 stall. **Depends on A + B.**
-- [ ] **6.X.D — Heartbeat budget reconciliation (~1 wk).** Per-replica
+- [x] **6.X.D — Heartbeat budget reconciliation (~1 wk).** Per-replica
       heartbeat carries per-`(project, partition)` usage deltas; coordinator
       computes project totals and writes per-partition slice budgets into
-      the heartbeat response. Replace every per-process `DashMap` cap (REST
-      QPS, pgwire QPS, memtable bytes, realtime `BUFFER_FULL`, Wasm
-      semaphore, basin-net outbound) with slice-budget consumers. **Closes
-      the multi-instance cap-bypass P0.** **Depends on A.**
+      the heartbeat response. `basin-catalog::budgets` ships the foundation:
+      `CapKind` enum (6 sites), `UsageDelta` / `ProjectBudget` /
+      `SliceBudget`, `BudgetCoordinator` trait + `InMemoryBudgetCoordinator`,
+      lock-free `SliceBudgetView` + token-bucket `SliceGate`. All six cap
+      consumers wired: REST QPS (`basin-rest` authorize path), pgwire QPS
+      (`basin-router::PgRateLimit::check_async`), memtable bytes
+      (`basin-hottier::MemTableRegistry::try_reserve_bytes` uses
+      `min(hard_cap, slice)`), realtime BUFFER_FULL
+      (`basin-realtime::BudgetTracker::with_slice_view`), Wasm semaphore
+      (`basin-fn::FunctionGovernance::invoke_with_caps` consumes one slice
+      token before the per-project Semaphore), basin-net outbound
+      (`basin-net::RateLimit::check_async`). Shard heartbeat
+      (`InProcessShard::heartbeat_budgets`) pushes deltas on the same tick
+      as the lease renew and fans the slice answer out to every registered
+      view. Multi-replica acceptance test
+      (`in_process::tests::multi_replica_heartbeat_aggregates_rest_qps_under_project_cap`):
+      3 shards share one coordinator, project capped at 60 RestQps; after
+      2 heartbeat rounds slice=20 each, aggregate admits=60 (not 3×60=180).
+      Failure path: coordinator unreachable → views stay stale (safe).
+      **Closes the multi-instance cap-bypass P0.** **Depends on A.**
 - [ ] **6.X.E — Failure-path hardening (~1–2 wk).** Replica-loss tests
       (kill mid-write, verify recovery within TTL); dual-leaseholder
       fencing test (force a partition; verify loser's WAL appends are
