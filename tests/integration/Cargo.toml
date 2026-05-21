@@ -22,6 +22,7 @@ basin-vector.workspace = true
 basin-shard.workspace = true
 basin-wal.workspace = true
 basin-auth = { workspace = true, features = ["test-utils"] }
+basin-pool.workspace = true
 basin-rest.workspace = true
 basin-blob.workspace = true
 basin-realtime.workspace = true
@@ -79,6 +80,13 @@ base64.workspace = true
 # (FunctionHost / QueryExecutor) against a real engine session to verify
 # auth.uid() resolves to the caller's JWT sub inside a function.
 basin-fn.workspace = true
+# Phase 5.27.A: txn-mode pool benchmark.
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [lib]
 path = "src/lib.rs"
+
+# Phase 5.27.A: txn-mode pool throughput / latency benchmark.
+[[bench]]
+name = "pool_transaction_mode"
+harness = false
