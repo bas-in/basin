@@ -62,7 +62,14 @@ async fn async_post_roundtrip_records_response_row() {
     let addr = spawn_ok_server().await;
     let url = format!("http://{addr}/echo");
 
-    let client = HttpClient::new();
+    // Use the test-only SSRF-loopback opt-out so the mock server on
+    // 127.0.0.1 is reachable; the IP-class denylist (#53) would otherwise
+    // refuse the connect.
+    let client = HttpClient::with_config(
+        basin_net::GuardConfig::default().with_loopback_allowed_for_tests(),
+        basin_net::AllowList::new(),
+        basin_net::RateLimit::new(),
+    );
     client.allow_host(&project, "127.0.0.1").await;
     let store = ResponseStore::new(engine.clone());
     let queue = RequestQueue::new(client, store.clone());
@@ -90,16 +97,22 @@ async fn async_post_roundtrip_records_response_row() {
 async fn allowlist_failure_is_recorded_as_terminal_error_row() {
     // pg_net stores DNS / TLS / blocked-host failures in the same response
     // table with an `error` column populated. Mirror that.
+    //
+    // The literal hostname here is `attacker.example` (not `127.0.0.1`)
+    // so the row's error comes from the allowlist gate specifically, not
+    // the SSRF IP-class denylist (#53) which would otherwise short-
+    // circuit before the allowlist check.
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
     let project = ProjectId::new();
 
     let client = HttpClient::new();
-    // Note: deliberately not opting in to "127.0.0.1" so the allowlist fires.
+    // Note: deliberately not opting in to "attacker.example" so the
+    // allowlist fires.
     let store = ResponseStore::new(engine.clone());
     let queue = RequestQueue::new(client, store.clone());
 
-    let req = HttpRequest::get("http://127.0.0.1/blocked");
+    let req = HttpRequest::get("http://attacker.example/blocked");
     let id = queue.submit(&project, req);
     let processed = queue.run_one().await.expect("queue had a request");
     assert_eq!(processed, id);

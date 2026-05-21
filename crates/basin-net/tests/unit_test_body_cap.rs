@@ -6,9 +6,12 @@ use basin_net::{AllowList, GuardConfig, HttpClient, RateLimit};
 #[tokio::test]
 async fn oversized_post_body_rejected() {
     // Tighten the cap so we don't have to allocate 10 MiB in the test.
+    // `allow_loopback_for_tests` opts out of the SSRF IP-class denylist
+    // so this test can exercise the body-cap gate against `127.0.0.1`.
     let cfg = GuardConfig {
         max_body_bytes: 1024,
         timeout: std::time::Duration::from_secs(5),
+        allow_loopback_for_tests: true,
     };
     let client = HttpClient::with_config(cfg, AllowList::new(), RateLimit::new());
     let project = ProjectId::new();
@@ -36,6 +39,7 @@ async fn at_cap_post_body_passes_the_gate() {
     let cfg = GuardConfig {
         max_body_bytes: 64,
         timeout: std::time::Duration::from_secs(5),
+        allow_loopback_for_tests: true,
     };
     let client = HttpClient::with_config(cfg, AllowList::new(), RateLimit::new());
     let project = ProjectId::new();

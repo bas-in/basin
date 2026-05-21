@@ -15,10 +15,15 @@ fn fresh_client() -> HttpClient {
 
 #[tokio::test]
 async fn unknown_host_is_denied() {
+    // Use a hostname rather than an IP literal here: since the SSRF
+    // hardening (#53) any non-globally-routable literal would short-
+    // circuit on the IP-class denylist before this assertion ever ran.
+    // The point of *this* test is to verify the *allowlist* gate, so
+    // give it a domain whose only possible failure mode is allowlist.
     let client = fresh_client();
     let project = ProjectId::new();
     let err = client
-        .http_get(&project, "http://203.0.113.5/admin")
+        .http_get(&project, "http://attacker.example/admin")
         .await
         .unwrap_err();
     let msg = format!("{err}");
@@ -29,20 +34,29 @@ async fn unknown_host_is_denied() {
 async fn allowlisted_host_passes_the_gate() {
     // We're not actually doing IO here — the test asserts the *gate*
     // accepts an allowlisted host. The check passes; the dispatch then
-    // fails with a transport error against an unbound port, which is the
-    // expected next step. We assert the failure surface is *not* the
-    // allowlist one.
+    // fails with a transport / DNS error against an unbound port, which
+    // is the expected next step. We assert the failure surface is *not*
+    // the allowlist one.
+    //
+    // We deliberately use a routable-looking public hostname here rather
+    // than `127.0.0.1`. Since the SSRF hardening (#53), the IP-class
+    // denylist refuses loopback even when allowlisted — that property
+    // is itself tested in `unit_test_ssrf.rs::ssrf_ip_literal_*`.
     let client = fresh_client();
     let project = ProjectId::new();
-    client.allow_host(&project, "127.0.0.1").await;
+    client.allow_host(&project, "example.invalid").await;
     let err = client
-        .http_get(&project, "http://127.0.0.1:1/never-listens")
+        .http_get(&project, "http://example.invalid:1/never-listens")
         .await
         .unwrap_err();
     let msg = format!("{err}");
     assert!(
         !msg.contains("host not on allowlist"),
         "allowlist gate fired for an opted-in host: {msg}"
+    );
+    assert!(
+        !msg.contains("ip literal in denied class"),
+        "IP-class denylist fired for a hostname: {msg}"
     );
 }
 
@@ -89,4 +103,25 @@ async fn invalid_url_surfaces_invalid_url() {
     let err = client.http_get(&project, "not-a-url").await.unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("invalid url"), "got {msg}");
+}
+
+#[tokio::test]
+async fn allowlisting_a_private_ip_literal_does_not_let_it_through() {
+    // The point of the SSRF hardening (issue #53). Operator allowlists a
+    // private IP — perhaps because they have a legitimate on-cluster
+    // peer with the same literal — and the IP-class denylist still
+    // refuses. The allowlist is a positive opt-in for *names*; the IP
+    // denylist is a negative absolute on *addresses*.
+    let client = fresh_client();
+    let project = ProjectId::new();
+    client.allow_host(&project, "127.0.0.1").await;
+    let err = client
+        .http_get(&project, "http://127.0.0.1:1/whatever")
+        .await
+        .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("ip literal in denied class"),
+        "expected IP-class rejection, got {msg}"
+    );
 }

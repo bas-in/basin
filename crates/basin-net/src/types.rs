@@ -132,6 +132,22 @@ pub enum HttpError {
     Timeout(Duration),
     #[error("transport: {0}")]
     Transport(String),
+    /// SSRF guard: the URL's host (or one of its DNS-resolved addresses)
+    /// is an IP literal in a denied class — loopback, private RFC1918,
+    /// link-local (incl. `169.254.169.254` IMDS), unique-local IPv6,
+    /// multicast, or unspecified. Fires *before* the allowlist so an
+    /// allowlisted hostname that DNS-resolves to a private IP is still
+    /// blocked at connect time.
+    #[error("ip literal in denied class: {0}")]
+    IpLiteralDenied(std::net::IpAddr),
+    /// SSRF guard: the URL contains `user`/`user:password` userinfo. The
+    /// allowlist matches on `host_str`, but downstream tooling can disagree
+    /// on whether `http://a@b/` connects to `a` or `b`; rather than chase
+    /// the cross-stack ambiguity we reject userinfo URLs outright (Basin's
+    /// `http_get` / `http_post` SQL surface never needs them — credentials
+    /// belong in headers).
+    #[error("url contains userinfo, refusing for SSRF safety")]
+    UriUserinfoNotAllowed,
 }
 
 impl HttpError {

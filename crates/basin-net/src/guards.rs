@@ -18,15 +18,246 @@
 
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::future::ready;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
 use basin_common::ProjectId;
 use governor::{clock::DefaultClock, state::keyed::DefaultKeyedStateStore, Quota, RateLimiter};
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use tokio::sync::RwLock;
 
 use crate::types::HttpError;
+
+/// AWS / EC2 / GCP / Azure instance-metadata service IPv4. Always denied
+/// regardless of the more general link-local rule, both so the test name
+/// reads honestly and so a future tweak to the link-local check can't
+/// silently re-open the most well-known SSRF target on the planet.
+pub const IMDS_V4: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 254);
+
+/// AWS IMDSv2 IPv6 endpoint (`fd00:ec2::254`). Caught by the unique-local
+/// rule already, but called out explicitly for the same reason as
+/// [`IMDS_V4`].
+pub const IMDS_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x00ec, 0x0002, 0, 0, 0, 0, 0x0254);
+
+/// SSRF IP-class denylist. Returns `true` when `ip` is in a class we never
+/// want an outbound request to reach:
+///
+/// * IPv4: loopback (`127.0.0.0/8`), private RFC1918 (`10/8`, `172.16/12`,
+///   `192.168/16`), link-local (`169.254/16`, incl. IMDS), multicast,
+///   broadcast, unspecified (`0.0.0.0`), and the documentation ranges.
+/// * IPv6: loopback (`::1`), unique-local (`fc00::/7`), unicast link-local
+///   (`fe80::/10`), multicast, unspecified (`::`), IPv4-mapped that maps
+///   to a denied IPv4, plus explicit `fd00:ec2::254` (IMDSv2).
+///
+/// Pure function — fires both at parse time on URL host-literals and at
+/// DNS-resolve time inside [`RebindingGuardedResolver`].
+pub fn is_denied_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_denied_ipv4(v4),
+        IpAddr::V6(v6) => is_denied_ipv6(v6),
+    }
+}
+
+fn is_denied_ipv4(v4: Ipv4Addr) -> bool {
+    if v4 == IMDS_V4 {
+        return true;
+    }
+    // RFC 6890 sweep: anything not a globally-routable unicast is denied.
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_multicast()
+        || v4.is_broadcast()
+        || v4.is_unspecified()
+        || v4.is_documentation()
+        // 0.0.0.0/8 — `this network`. `is_unspecified` only catches `0.0.0.0`.
+        || v4.octets()[0] == 0
+        // Carrier-grade NAT 100.64.0.0/10 — RFC 6598. Not strictly private
+        // but should not be reachable from a Postgres extension.
+        || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40)
+}
+
+fn is_denied_ipv6(v6: Ipv6Addr) -> bool {
+    if v6 == IMDS_V6 {
+        return true;
+    }
+    // IPv4-mapped IPv6 — `::ffff:0:0/96`. An attacker can dress 127.0.0.1
+    // up as `::ffff:127.0.0.1`; pull the v4 out and re-check.
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return is_denied_ipv4(v4);
+    }
+    v6.is_loopback()
+        || v6.is_unique_local()
+        || v6.is_unicast_link_local()
+        || v6.is_multicast()
+        || v6.is_unspecified()
+}
+
+/// Vet a URL string for SSRF-class violations *before* the per-project
+/// allowlist check. This fires regardless of whether the host is on the
+/// allowlist, because an operator who allowlists `attacker.com` should
+/// still be safe when the attacker controls DNS and rebinds the name to
+/// `127.0.0.1` or `169.254.169.254`.
+///
+/// Three things happen here:
+///
+/// 1. URL must parse and carry a host.
+/// 2. Userinfo (`http://user[:pass]@host/`) is rejected — see
+///    [`HttpError::UriUserinfoNotAllowed`] for the rationale.
+/// 3. If the host is an IP literal (any form `url::Host` recognises,
+///    incl. decimal/octal IPv4 and IPv4-mapped IPv6), check it against
+///    [`is_denied_ip`].
+///
+/// DNS-time rebinding is caught separately by
+/// [`RebindingGuardedResolver`] inside the reqwest client; the two checks
+/// together close the TOCTOU window between URL parse and TCP connect.
+pub fn check_url_safety(url: &str) -> Result<url::Url, HttpError> {
+    check_url_safety_with(url, false)
+}
+
+/// Variant of [`check_url_safety`] that honours the
+/// [`GuardConfig::allow_loopback_for_tests`] escape hatch. When
+/// `allow_loopback` is `true`, the IP-class denylist is skipped — the
+/// userinfo and URL-parse gates still fire. Production callers always
+/// invoke [`check_url_safety`]; only `HttpClient::send` opens the
+/// escape hatch when its `GuardConfig` says so.
+pub fn check_url_safety_with(url: &str, allow_loopback: bool) -> Result<url::Url, HttpError> {
+    let parsed = url::Url::parse(url).map_err(|e| HttpError::InvalidUrl(format!("{url}: {e}")))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(HttpError::UriUserinfoNotAllowed);
+    }
+    let host = parsed
+        .host()
+        .ok_or_else(|| HttpError::InvalidUrl(format!("no host in url: {url}")))?;
+    if !allow_loopback {
+        match host {
+            url::Host::Ipv4(v4) => {
+                let ip = IpAddr::V4(v4);
+                if is_denied_ip(ip) {
+                    return Err(HttpError::IpLiteralDenied(ip));
+                }
+            }
+            url::Host::Ipv6(v6) => {
+                let ip = IpAddr::V6(v6);
+                if is_denied_ip(ip) {
+                    return Err(HttpError::IpLiteralDenied(ip));
+                }
+            }
+            url::Host::Domain(_) => {
+                // Hostnames go through `RebindingGuardedResolver` at
+                // connect time; we can't validate the IP from the URL
+                // string alone.
+            }
+        }
+    }
+    Ok(parsed)
+}
+
+/// `reqwest::dns::Resolve` wrapper that filters out IPs in the SSRF
+/// denylist *before* reqwest's hyper connector hands them to the TCP
+/// stack. Two reasons this lives at the resolver layer rather than
+/// after-the-fact:
+///
+/// 1. **DNS rebinding (TOCTOU)**. The allowlist check sees a host string;
+///    by the time reqwest resolves it, an attacker-controlled authoritative
+///    server can hand back `127.0.0.1`. The resolver hook is the only
+///    place where the *actual* connect IP is observable before the TCP
+///    SYN goes out.
+/// 2. **No double-resolution**. We use the same `std::net::ToSocketAddrs`
+///    path reqwest's default `GaiResolver` does, so resolver semantics
+///    (TTL, IPv4/IPv6 ordering, hosts file) don't drift between the guard
+///    and the real fetch.
+///
+/// Implementation note: `ToSocketAddrs::to_socket_addrs()` is blocking;
+/// we run it on the tokio blocking pool via `spawn_blocking` so it
+/// doesn't stall the runtime.
+#[derive(Default)]
+pub struct RebindingGuardedResolver {
+    /// When `true`, skip the IP-class denylist (matches
+    /// [`GuardConfig::allow_loopback_for_tests`]). Production constructions
+    /// always pass `false`. Even when `true` this resolver still uses the
+    /// same blocking-`getaddrinfo` path as the default, so resolver
+    /// semantics are unchanged.
+    allow_loopback: bool,
+}
+
+impl RebindingGuardedResolver {
+    pub fn new() -> Self {
+        Self {
+            allow_loopback: false,
+        }
+    }
+
+    /// Test-only constructor. Mirrors
+    /// [`GuardConfig::with_loopback_allowed_for_tests`] — see that doc.
+    pub fn with_loopback_allowed_for_tests() -> Self {
+        Self {
+            allow_loopback: true,
+        }
+    }
+}
+
+impl std::fmt::Debug for RebindingGuardedResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RebindingGuardedResolver")
+            .field("allow_loopback", &self.allow_loopback)
+            .finish()
+    }
+}
+
+impl Resolve for RebindingGuardedResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_string();
+        let allow_loopback = self.allow_loopback;
+        Box::pin(async move {
+            // `ToSocketAddrs` needs a port; reqwest will overwrite it later
+            // (see `DynResolver::http_resolve`). Port 0 is the convention.
+            let lookup_host = host.clone();
+            let join = tokio::task::spawn_blocking(move || {
+                (lookup_host.as_str(), 0u16)
+                    .to_socket_addrs()
+                    .map(|it| it.collect::<Vec<_>>())
+            })
+            .await;
+            let addrs: Vec<SocketAddr> = match join {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
+                    let err: Box<dyn std::error::Error + Send + Sync> =
+                        format!("resolve {host}: {e}").into();
+                    return Err(err);
+                }
+                Err(e) => {
+                    let err: Box<dyn std::error::Error + Send + Sync> =
+                        format!("resolver join: {e}").into();
+                    return Err(err);
+                }
+            };
+            // Strict: if *any* resolved address is in the denylist, fail
+            // the whole resolution. Returning a filtered subset would let
+            // an attacker still win by ordering: if the first record is
+            // private and the second is public, reqwest may take the
+            // first. Fail closed.
+            if !allow_loopback {
+                for addr in &addrs {
+                    if is_denied_ip(addr.ip()) {
+                        let err: Box<dyn std::error::Error + Send + Sync> = format!(
+                            "dns rebinding guard: {} resolved to denied ip {}",
+                            host,
+                            addr.ip()
+                        )
+                        .into();
+                        return Err(err);
+                    }
+                }
+            }
+            let iter: Addrs = Box::new(addrs.into_iter());
+            ready(Ok::<_, Box<dyn std::error::Error + Send + Sync>>(iter)).await
+        })
+    }
+}
 
 /// Static knobs read from the environment. Cloned into [`HttpClient`] at
 /// construction time so a mid-process env mutation can't change behaviour
@@ -39,6 +270,19 @@ pub struct GuardConfig {
     /// Maximum wall-clock for one outbound request including TLS/connect.
     /// Default 30s. Override via `BASIN_NET_TIMEOUT_SECS`.
     pub timeout: Duration,
+    /// Escape hatch for the SSRF IP-class denylist. **Production callers
+    /// must leave this `false`.** Set to `true` only from test fixtures
+    /// that spawn a local mock HTTP server on `127.0.0.1` and need to
+    /// exercise unrelated gates (body cap, rate limit, timeout). When
+    /// `true`, [`check_url_safety`] and [`RebindingGuardedResolver`] skip
+    /// the loopback / RFC1918 / link-local checks. Userinfo rejection is
+    /// still enforced.
+    ///
+    /// There is no env-var that flips this — the field is build-time
+    /// only, set explicitly by tests via
+    /// [`GuardConfig::with_loopback_allowed_for_tests`]. The very loud
+    /// name is the point.
+    pub allow_loopback_for_tests: bool,
 }
 
 impl GuardConfig {
@@ -60,7 +304,16 @@ impl GuardConfig {
         Self {
             max_body_bytes,
             timeout: Duration::from_secs(timeout_secs),
+            allow_loopback_for_tests: false,
         }
+    }
+
+    /// Build-time opt-out of the SSRF IP-class denylist. Use **only** from
+    /// test fixtures that spawn a localhost mock server. See the field
+    /// doc on [`Self::allow_loopback_for_tests`] for the contract.
+    pub fn with_loopback_allowed_for_tests(mut self) -> Self {
+        self.allow_loopback_for_tests = true;
+        self
     }
 }
 
@@ -114,13 +367,34 @@ impl AllowList {
             .unwrap_or_default()
     }
 
-    /// The load-bearing check. Splits `url` for its host part, lowercases
-    /// it, and confirms `project` has explicitly opted in. The default
-    /// behaviour is **deny** so a freshly-provisioned project cannot
-    /// accidentally exfiltrate to anywhere.
+    /// The load-bearing check. Runs three gates in order:
+    ///
+    /// 1. [`check_url_safety`] — reject userinfo URLs and IP-literal hosts
+    ///    in denied classes (loopback / RFC1918 / link-local / IMDS /
+    ///    IPv4-mapped IPv6). Fires *before* the allowlist so an operator
+    ///    who allowlists a hostname is not on the hook for what that
+    ///    hostname resolves to via decimal-encoded IPv4 trickery.
+    /// 2. Lowercase the URL's host string.
+    /// 3. Confirm the project has explicitly opted in. Default is **deny**.
+    ///
+    /// DNS-time rebinding (an allowlisted hostname that resolves to a
+    /// private IP at connect time) is enforced by
+    /// [`RebindingGuardedResolver`] wired into the reqwest client. The two
+    /// halves together close the parse → connect TOCTOU.
     pub async fn check(&self, project: &ProjectId, url: &str) -> Result<(), HttpError> {
-        let parsed =
-            url::Url::parse(url).map_err(|e| HttpError::InvalidUrl(format!("{url}: {e}")))?;
+        self.check_with(project, url, false).await
+    }
+
+    /// Variant of [`Self::check`] that honours the
+    /// [`GuardConfig::allow_loopback_for_tests`] escape hatch. See that
+    /// field's doc for the contract; production code calls [`Self::check`].
+    pub async fn check_with(
+        &self,
+        project: &ProjectId,
+        url: &str,
+        allow_loopback: bool,
+    ) -> Result<(), HttpError> {
+        let parsed = check_url_safety_with(url, allow_loopback)?;
         let host = parsed
             .host_str()
             .ok_or_else(|| HttpError::InvalidUrl(format!("no host in url: {url}")))?

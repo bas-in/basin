@@ -43,6 +43,8 @@ async fn timeout_fires_on_slow_server() {
     let cfg = GuardConfig {
         max_body_bytes: 1024,
         timeout: Duration::from_millis(150),
+        // Localhost test fixture — bypass the SSRF IP-class denylist.
+        allow_loopback_for_tests: true,
     };
     let client = HttpClient::with_config(cfg, AllowList::new(), RateLimit::new());
     let project = ProjectId::new();

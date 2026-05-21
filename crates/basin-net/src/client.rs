@@ -12,7 +12,7 @@ use basin_common::ProjectId;
 use reqwest::Method;
 use tokio::time::timeout;
 
-use crate::guards::{AllowList, GuardConfig, RateLimit};
+use crate::guards::{AllowList, GuardConfig, RateLimit, RebindingGuardedResolver};
 use crate::types::{HttpError, HttpRequest, HttpResponse};
 
 /// HTTP client scoped to a single Basin process. Cheap to clone (`Arc`
@@ -47,8 +47,22 @@ impl HttpClient {
         // TLS is on by default; we don't expose `danger_accept_invalid_certs`
         // by design — letting SQL disable cert verification would be the
         // single biggest footgun in this crate.
+        //
+        // The `dns_resolver` hook installs a [`RebindingGuardedResolver`]
+        // that re-checks every resolved IP against the SSRF denylist before
+        // hyper opens the TCP socket. Without this, an allowlisted hostname
+        // whose authoritative server hands back `127.0.0.1` would walk
+        // straight past the parse-time check in [`AllowList::check`]. The
+        // `allow_loopback_for_tests` flag (loud name on purpose) opts out
+        // of the denylist for test fixtures that spawn a local mock server.
+        let resolver: Arc<RebindingGuardedResolver> = if cfg.allow_loopback_for_tests {
+            Arc::new(RebindingGuardedResolver::with_loopback_allowed_for_tests())
+        } else {
+            Arc::new(RebindingGuardedResolver::new())
+        };
         let reqwest = reqwest::Client::builder()
             .user_agent("basin-net/0.1")
+            .dns_resolver(resolver)
             .build()
             .expect("reqwest::Client::build cannot fail with default config");
         Self {
@@ -120,8 +134,14 @@ impl HttpClient {
         project: &ProjectId,
         req: &HttpRequest,
     ) -> Result<HttpResponse, HttpError> {
-        // 1. Allowlist.
-        self.inner.allow.check(project, &req.url).await?;
+        // 1. Allowlist + SSRF safety. The SSRF gate runs inside
+        // `check_with` (IP-literal denylist + userinfo rejection); when
+        // `allow_loopback_for_tests` is set, only the IP-class slice of
+        // that gate is suppressed.
+        self.inner
+            .allow
+            .check_with(project, &req.url, self.inner.cfg.allow_loopback_for_tests)
+            .await?;
         // 2. Rate limit.
         self.inner.rate.check(project)?;
         // 3. Outgoing body cap.
