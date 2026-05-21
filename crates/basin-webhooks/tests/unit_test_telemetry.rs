@@ -11,7 +11,7 @@ mod common;
 use std::sync::Arc;
 
 use basin_common::{ChangeEvent, ChangeEventSink, ChangeOp, ProjectId, TableName};
-use basin_net::HttpClient;
+use basin_net::{AllowList, GuardConfig, HttpClient, RateLimit};
 use basin_webhooks::{
     Clock, RetryQueue, TestClock, WebhookConfig, WebhookCountersRegistry, WebhookOps,
     WebhookRegistry, WebhookSink, WebhookSubscription, WebhookSubscriptionId, WebhookWorker,
@@ -109,7 +109,13 @@ fn sub(
 }
 
 fn make_client() -> HttpClient {
-    HttpClient::new()
+    // Tests deliver to a 127.0.0.1 mock server, which the SSRF IP-literal
+    // denylist rejects in production. Use the explicit test escape hatch.
+    HttpClient::with_config(
+        GuardConfig::from_env().with_loopback_allowed_for_tests(),
+        AllowList::new(),
+        RateLimit::new(),
+    )
 }
 
 /// Five matching events in flight; all 200s. Counters report 5 successes,

@@ -27,7 +27,9 @@ use basin_catalog::InMemoryCatalog;
 use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
-use basin_net::{HttpClient, HttpRequest, RequestQueue, ResponseStore};
+use basin_net::{
+    AllowList, GuardConfig, HttpClient, HttpRequest, RateLimit, RequestQueue, ResponseStore,
+};
 use object_store::local::LocalFileSystem;
 use serde_json::json;
 use tempfile::TempDir;
@@ -76,7 +78,14 @@ async fn viability_basin_net() {
     let project = ProjectId::new();
     let addr = spawn_ok_server().await;
 
-    let client = HttpClient::new();
+    // The mock server binds to 127.0.0.1, which the SSRF IP-literal denylist
+    // rejects in production. Use the explicit test escape hatch so the real
+    // round-trip can be exercised against loopback.
+    let client = HttpClient::with_config(
+        GuardConfig::from_env().with_loopback_allowed_for_tests(),
+        AllowList::new(),
+        RateLimit::new(),
+    );
     // Equivalent to `INSERT INTO _net_allowed_hosts VALUES ('127.0.0.1')`.
     client.allow_host(&project, "127.0.0.1").await;
 

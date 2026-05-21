@@ -194,6 +194,8 @@ async fn ts_rank_cd_returns_zero() {
 // ts_headline
 // ---------------------------------------------------------------------------
 
+// Phase 6.X: ts_headline now performs real highlighting — matched lexemes are
+// wrapped in <b></b> like PostgreSQL's default StartSel/StopSel.
 #[tokio::test]
 async fn ts_headline_2arg_returns_body() {
     let (_dir, engine) = open_engine().await;
@@ -204,7 +206,7 @@ async fn ts_headline_2arg_returns_body() {
     )
     .await;
     let strings = col.as_any().downcast_ref::<StringArray>().unwrap();
-    assert_eq!(strings.value(0), "a quick brown fox");
+    assert_eq!(strings.value(0), "a quick brown <b>fox</b>");
 }
 
 #[tokio::test]
@@ -217,7 +219,7 @@ async fn ts_headline_3arg_returns_body() {
     )
     .await;
     let strings = col.as_any().downcast_ref::<StringArray>().unwrap();
-    assert_eq!(strings.value(0), "a quick brown fox");
+    assert_eq!(strings.value(0), "a quick brown <b>fox</b>");
 }
 
 // ---------------------------------------------------------------------------

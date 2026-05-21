@@ -523,12 +523,20 @@ async fn reset_role_is_accepted() {
 #[tokio::test]
 async fn show_search_path_is_accepted() {
     let (_dir, sess) = open_session().await;
-    // SHOW <param> returns Empty (tag = "SHOW"); SHOW TABLES is special.
+    // Phase 5.18.B: SHOW search_path now returns the real current search_path
+    // (default "public") as a single-row, single-column result rather than a
+    // noop-accepted Empty tag.
     match sess.execute("SHOW search_path").await {
-        Ok(ExecResult::Empty { tag }) => {
-            assert_eq!(tag, "SHOW");
+        Ok(ExecResult::Rows { batches, .. }) => {
+            assert!(!batches.is_empty(), "SHOW search_path should return a row");
+            let col = batches[0].column(0);
+            let strings = col
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .expect("search_path value should be Utf8");
+            assert_eq!(strings.value(0), "public");
         }
-        Ok(other) => panic!("expected Empty for SHOW search_path, got: {other:?}"),
+        Ok(other) => panic!("expected Rows for SHOW search_path, got: {other:?}"),
         Err(e) => panic!("expected Ok for SHOW search_path, got: {e}"),
     }
 }
