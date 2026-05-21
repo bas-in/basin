@@ -33,7 +33,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, Int64Array};
+use arrow_array::{Array, Int16Array, Int32Array, Int64Array};
 use basin_catalog::InMemoryCatalog;
 use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
@@ -49,6 +49,46 @@ fn rows_int64(batches: &[arrow_array::RecordBatch], name: &str) -> Vec<i64> {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap_or_else(|| panic!("column {name} is not Int64"));
+        for i in 0..arr.len() {
+            if arr.is_null(i) {
+                continue;
+            }
+            out.push(arr.value(i));
+        }
+    }
+    out
+}
+
+/// Phase 5.14 PG-faithfulness: SERIAL/SERIAL4 → Int32.
+fn rows_int32(batches: &[arrow_array::RecordBatch], name: &str) -> Vec<i32> {
+    let mut out = Vec::new();
+    for b in batches {
+        let arr = b
+            .column_by_name(name)
+            .unwrap_or_else(|| panic!("missing column {name}"))
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap_or_else(|| panic!("column {name} is not Int32"));
+        for i in 0..arr.len() {
+            if arr.is_null(i) {
+                continue;
+            }
+            out.push(arr.value(i));
+        }
+    }
+    out
+}
+
+/// Phase 5.14 PG-faithfulness: SMALLSERIAL/SERIAL2 → Int16.
+fn rows_int16(batches: &[arrow_array::RecordBatch], name: &str) -> Vec<i16> {
+    let mut out = Vec::new();
+    for b in batches {
+        let arr = b
+            .column_by_name(name)
+            .unwrap_or_else(|| panic!("missing column {name}"))
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .unwrap_or_else(|| panic!("column {name} is not Int16"));
         for i in 0..arr.len() {
             if arr.is_null(i) {
                 continue;
@@ -238,7 +278,8 @@ async fn serial_accepts_literal_and_auto_fills() {
         .unwrap();
     match res {
         ExecResult::Rows { batches, .. } => {
-            let ids = rows_int64(&batches, "id");
+            // Phase 5.14: SERIAL is INT4-backed (Int32), not Int64.
+            let ids = rows_int32(&batches, "id");
             assert_eq!(ids, vec![99, 1]);
         }
         other => panic!("unexpected: {other:?}"),
@@ -281,7 +322,8 @@ async fn smallserial_creates_table() {
     let res = sess.execute("SELECT id FROM w").await.unwrap();
     match res {
         ExecResult::Rows { batches, .. } => {
-            assert_eq!(rows_int64(&batches, "id"), vec![1]);
+            // Phase 5.14: SMALLSERIAL is INT2-backed (Int16), not Int64.
+            assert_eq!(rows_int16(&batches, "id"), vec![1]);
         }
         other => panic!("unexpected: {other:?}"),
     }

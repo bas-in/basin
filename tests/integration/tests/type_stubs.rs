@@ -144,10 +144,12 @@ async fn ddl_accepts_money_column() {
     h.exec_ok(&sess, "CREATE TABLE t_money (id BIGINT, price MONEY)")
         .await;
     let f = h.field_for("t_money", "price").await;
+    // Phase 6.X: MONEY precision widened from 19 to 20 to accommodate the
+    // full PG MONEY range (up to ~92 quadrillion).
     assert_eq!(
         f.data_type(),
-        &DataType::Decimal128(19, 2),
-        "MONEY must be Decimal128(19,2)"
+        &DataType::Decimal128(20, 2),
+        "MONEY must be Decimal128(20,2)"
     );
     assert_eq!(
         f.metadata().get("BASIN_TYPE").map(|s| s.as_str()),

@@ -498,7 +498,10 @@ async fn type_format_type_stub() {
 async fn agg_count_sum_avg_min_max() {
     let (_d, e) = open_engine().await;
     let s = e.open_session(ProjectId::new()).await.unwrap();
-    s.execute("CREATE TABLE agg_t (v INT NOT NULL)")
+    // Phase 5.14: INT/INTEGER → Int32. The fast-select SUM/MIN/MAX path only
+    // supports Int64; use BIGINT to stay on the supported code path until the
+    // fast-select aggregates are widened to cover Int32.
+    s.execute("CREATE TABLE agg_t (v BIGINT NOT NULL)")
         .await
         .unwrap();
     s.execute("INSERT INTO agg_t VALUES (1), (2), (3), (4), (5)")
