@@ -411,9 +411,20 @@ pub(crate) async fn delete_object(
 /// without a bearer token.  Returns 401 when the bucket's `public` flag is
 /// false — never falls through to JWT auth.
 ///
-/// 5.17.C: Public-bucket reads short-circuit RLS per ADR 0021 — no policy
-/// evaluation.  The `public` flag check (`!meta.public → 401`) is the only
-/// gate; private buckets remain inaccessible without a JWT.
+/// ## Auth / RLS chain (6.SEC.P1 fix)
+///
+/// The request is evaluated with `CallerCtx::anonymous()` (`role = "anon"`,
+/// `uid = None`) — the same RLS path the authenticated `download_object` uses,
+/// just with the anonymous principal.  Concretely:
+///
+/// 1. Private bucket (`public = false`) → 401 before any object is fetched.
+/// 2. Public bucket, RLS off → permit (same behaviour as before the fix).
+/// 3. Public bucket, RLS on, no applicable `SELECT` policy → 403 (default-deny).
+/// 4. Public bucket, RLS on, matching policy → permit.
+///
+/// This closes the bypass where an operator could mark a bucket `public = true`
+/// and add an object-level RLS policy (e.g. `FOR ROLE anon USING (metadata->>'restricted' IS NULL)`)
+/// that would be completely skipped by the old alias path.
 #[axum::debug_handler]
 pub(crate) async fn download_public_object(
     State(state): State<Arc<Inner>>,
@@ -426,13 +437,13 @@ pub(crate) async fn download_public_object(
         .map_err(|_| ApiError::not_found(format!("project not found: {project_str}")))?;
 
     // Verify the bucket is public before serving bytes.
-    let meta = state
+    let bucket_meta = state
         .blob_store
         .get_bucket(&project, &bucket)
         .await
         .map_err(blob_err_to_api)?;
 
-    if !meta.public {
+    if !bucket_meta.public {
         return Err(ApiError::unauthenticated(
             "bucket is private; use the authenticated endpoint",
         ));
@@ -443,6 +454,17 @@ pub(crate) async fn download_public_object(
         .get_object(&project, &bucket, &path)
         .await
         .map_err(blob_err_to_api)?;
+
+    // 6.SEC.P1 fix: evaluate object-level RLS with the anonymous principal so
+    // that operator-configured `anon`-role policies are enforced here, just as
+    // they would be on the authenticated path.  This closes the alias bypass
+    // where the public path silently skipped all policy evaluation.
+    let caller = CallerCtx::anonymous();
+    let (rls_enabled, applicable) = state
+        .blob_store
+        .objects_rls_applicable(&project, ObjectPolicyCommand::Select, &caller.role);
+    blob_rls::check_object_access(rls_enabled, &applicable, &obj_meta, &caller, ObjectPolicyCommand::Select)
+        .map_err(|msg| ApiError::forbidden(msg))?;
 
     let mut builder = axum::http::Response::builder().status(StatusCode::OK);
 
