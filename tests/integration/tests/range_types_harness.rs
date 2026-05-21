@@ -296,9 +296,54 @@ async fn range_type_round_trip() {
     );
     println!("[5.24.A round-trip] daterange: {ndate} row returned (expected 1)");
 
+    // ── Canonicalization discriminator ─────────────────────────────────────────
+    // This assertion distinguishes a *genuine* range type from a text/opaque
+    // fallback (where '[1,10)' is just stored as a string). PG canonicalizes
+    // ranges over discrete types (int4, int8, date): the inclusive-upper form
+    // '[1,9]'::int4range is normalized to the half-open form '[1,10)'. Hence:
+    //
+    //   '[1,9]'::int4range = '[1,10)'::int4range  → TRUE  (same canonical range)
+    //
+    // A text fallback compares the raw literals ('[1,9]' vs '[1,10)') and yields
+    // FALSE, or rejects the typed equality outright. Only a real int4range
+    // implementation (5.24.B) returns TRUE here.
+    let canonical_eq = scalar_bool(
+        &sess,
+        "SELECT '[1,9]'::int4range = '[1,10)'::int4range",
+    )
+    .await;
+    println!(
+        "[5.24.A round-trip] '[1,9]'::int4range = '[1,10)'::int4range → {canonical_eq} \
+         (expected true — discrete-range canonicalization)"
+    );
+    assert!(
+        canonical_eq,
+        "RANGE ROUND-TRIP: '[1,9]'::int4range = '[1,10)'::int4range must be TRUE — \
+         PG canonicalizes discrete int4ranges to the half-open '[lo,hi)' form, so the \
+         inclusive-upper '[1,9]' equals '[1,10)'. A text/opaque fallback fails this. \
+         Closed by 5.24.B."
+    );
+
+    // Same discriminator for daterange (also a discrete type): '[2024-01-01,2024-01-30]'
+    // canonicalizes to '[2024-01-01,2024-01-31)'.
+    let date_canonical_eq = scalar_bool(
+        &sess,
+        "SELECT '[2024-01-01,2024-01-30]'::daterange = '[2024-01-01,2024-01-31)'::daterange",
+    )
+    .await;
+    println!(
+        "[5.24.A round-trip] daterange canonicalization eq → {date_canonical_eq} (expected true)"
+    );
+    assert!(
+        date_canonical_eq,
+        "RANGE ROUND-TRIP: '[2024-01-01,2024-01-30]'::daterange must equal \
+         '[2024-01-01,2024-01-31)'::daterange — daterange canonicalizes to half-open form. \
+         Closed by 5.24.B."
+    );
+
     println!(
         "[5.24.A round-trip] PASSED — all 6 range types (int4range, int8range, numrange, \
-         tsrange, tstzrange, daterange) round-tripped successfully"
+         tsrange, tstzrange, daterange) round-tripped, and discrete ranges canonicalize correctly"
     );
 }
 
