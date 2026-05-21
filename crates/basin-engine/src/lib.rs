@@ -181,6 +181,12 @@ pub(crate) struct EngineInner {
     pub(crate) secondary_index_registry: Arc<crate::secondary_index::ProjectIndexRegistry>,
     /// Cumulative count of data files skipped by the secondary-index probe.
     pub(crate) secondary_index_skipped: crate::secondary_index::IndexSkipCounter,
+    /// Phase 5.19.C: process-wide GIN posting list registry for JSONB
+    /// containment probes (`@>`, `<@`).  One `TermPostingList` per
+    /// `(project, table, col)` populated at INSERT time for columns declared
+    /// with `CREATE INDEX … USING gin`.  Probed at query time to prune file
+    /// candidates before the full `jsonb_contains` UDF re-evaluation.
+    pub(crate) gin_index_registry: Arc<crate::index_probe::GinIndexRegistry>,
 }
 
 impl Engine {
@@ -253,6 +259,7 @@ impl Engine {
                 crate::secondary_index::ProjectIndexRegistry::new(),
             ),
             secondary_index_skipped: crate::secondary_index::IndexSkipCounter::new(),
+            gin_index_registry: Arc::new(crate::index_probe::GinIndexRegistry::new()),
         });
         // Phase 5.14.D2: register the query-history adapter with the shard so
         // the compactor can consult observed ORDER BY / GROUP BY patterns.
@@ -449,6 +456,14 @@ impl Engine {
         &self,
     ) -> &Arc<crate::secondary_index::ProjectIndexRegistry> {
         &self.inner.secondary_index_registry
+    }
+
+    // ── Phase 5.19.C: GIN containment index ──────────────────────────────────
+
+    /// Process-wide GIN posting list registry for JSONB containment probes.
+    /// Returns a reference to the shared `Arc`; cloning it is cheap.
+    pub(crate) fn gin_index_registry(&self) -> &Arc<crate::index_probe::GinIndexRegistry> {
+        &self.inner.gin_index_registry
     }
 
     /// Bump the secondary-index file-skip counter by one. Called from
@@ -745,6 +760,7 @@ mod generated_cols;
 pub mod inbound_webhook_ddl;
 mod geo_glue;
 mod index_extras;
+pub(crate) mod index_probe;
 pub(crate) mod secondary_index;
 mod inet_udf;
 mod info_schema_provider;

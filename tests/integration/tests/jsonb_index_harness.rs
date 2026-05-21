@@ -838,3 +838,182 @@ async fn jsonb_orm_compat() {
          query shapes all accepted and return correct results"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slice 4 — Containment correctness (Phase 5.19.C)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// This slice proves differential correctness for the JSONB containment
+// operators (`@>`, `<@`) that 5.19.C closes.  It does NOT test key/path
+// operators (`?`, `?&`, `?|`, `->`, `->>`), which are 5.19.D scope.
+//
+// Closed by: 5.19.C (GIN containment probe + jsonb_contains / jsonb_contained_by UDFs).
+//
+// Row count: 10_000 (small; this test validates CORRECTNESS, not performance).
+// The perf gate (≥10× speedup) is tracked separately in `jsonb_index_perf_gate`
+// (above), which remains `#[ignore]`d pending a dedicated benchmark harness.
+//
+// Differential approach: the expected counts are derived from the seeding
+// logic (same formula as `jsonb_diff_1m_row_seed`) rather than a live PG
+// connection.  The Basin results must match these correct expectations.
+
+/// Phase 5.19.C — containment correctness: seed rows with six JSONB shape
+/// families, create a GIN index, and assert that `@>` and `<@` predicates
+/// return the exact counts dictated by PostgreSQL semantics.
+///
+/// This test is NOT `#[ignore]`d — it is the green slice that 5.19.C closes.
+/// The full differential battery (`jsonb_diff_1m_row_seed`) remains `#[ignore]`d
+/// until 5.19.D (key/path probes) also lands.
+#[tokio::test]
+async fn gin_containment_correctness() {
+    // Slice: "containment correctness" (Phase 5.19.C).
+    //
+    // CORRECTNESS CONTRACT: every assertion uses the *correct PostgreSQL
+    // semantics*.  Do NOT change expected values to match Basin output —
+    // fix the engine instead.
+
+    basin_common::telemetry::try_init_for_tests();
+
+    const ROW_COUNT: usize = 10_000;
+    // Small row count: this test validates correctness, not performance.
+    // The 6-family distribution matches `jsonb_diff_1m_row_seed` exactly.
+
+    let dir = TempDir::new().unwrap();
+    let engine = build_engine(&dir);
+    let project = ProjectId::new();
+    let sess = engine.open_session(project).await.unwrap();
+
+    // ── DDL ────────────────────────────────────────────────────────────────
+    sess.execute(
+        "CREATE TABLE gin_ct (
+            id      BIGINT  NOT NULL,
+            payload JSONB
+        )",
+    )
+    .await
+    .expect("CREATE TABLE gin_ct");
+
+    // GIN index — expected to succeed after 5.19.B.
+    let gin_ddl = sess
+        .execute(
+            "CREATE INDEX gin_ct_gin_idx ON gin_ct USING gin (payload jsonb_path_ops)",
+        )
+        .await;
+    assert!(
+        gin_ddl.is_ok(),
+        "CREATE INDEX USING gin must succeed (closed by 5.19.B): {:?}",
+        gin_ddl.unwrap_err()
+    );
+
+    // ── Seed rows ──────────────────────────────────────────────────────────
+    // Six shape families (same distribution as jsonb_diff_1m_row_seed).
+    let batch_size = 500usize;
+    let mut inserted = 0usize;
+    while inserted < ROW_COUNT {
+        let take = batch_size.min(ROW_COUNT - inserted);
+        let mut values: Vec<String> = Vec::with_capacity(take);
+        for i in inserted..(inserted + take) {
+            let payload = match i % 6 {
+                // Family 0 — nested object with "tag":"nested"
+                0 => format!(
+                    "{{\"id\":{i},\"level1\":{{\"level2\":{{\"level3\":{{\"level4\":{{\"level5\":{i}}}}}}}}},\"tag\":\"nested\"}}"
+                ),
+                // Family 1 — array with "tag":"array"
+                1 => format!(
+                    "{{\"id\":{i},\"arr\":[{i},\"{i}\",true,null,{{\"nested\":true}}],\"tag\":\"array\"}}"
+                ),
+                // Family 2 — nulls with "tag":"nulls"
+                2 => format!(
+                    "{{\"id\":{i},\"nullable\":null,\"active\":false,\"tag\":\"nulls\"}}"
+                ),
+                // Family 3 — empty object (no keys)
+                3 => "{}".to_owned(),
+                // Family 4 — large value with "tag":"large"
+                4 => {
+                    let long_val = "x".repeat(256); // shorter than 10k for test speed
+                    format!("{{\"id\":{i},\"large\":\"{long_val}\",\"tag\":\"large\"}}")
+                }
+                // Family 5 — unicode key
+                _ => format!("{{\"中文键\":{i},\"emojiὠ0\":\"yes\",\"tag\":\"unicode\"}}"),
+            };
+            values.push(format!("({i}, '{payload}')"));
+        }
+        let sql = format!("INSERT INTO gin_ct VALUES {}", values.join(", "));
+        sess.execute(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("INSERT batch at {inserted}: {e}"));
+        inserted += take;
+    }
+    println!("[5.19.C] inserted {inserted} rows into gin_ct");
+
+    // ── Family-count helper ────────────────────────────────────────────────
+    // For family k with ROW_COUNT rows over 6 families:
+    //   count = (ROW_COUNT + (5 - k)) / 6   (integer division)
+    let family_count = |k: usize| -> usize { (ROW_COUNT + (5 - k)) / 6 };
+
+    // ── Assertion (a): @> containment — "has tag = nested" (family 0) ──────
+    // PostgreSQL: `payload @> '{"tag":"nested"}'` returns rows where the
+    // JSONB document contains the key-value pair `tag = "nested"`.
+    // Expected: exactly the family-0 count (every 6th row starting at 0).
+    let contains_nested = row_count(
+        &sess,
+        r#"SELECT id FROM gin_ct WHERE payload @> '{"tag":"nested"}'"#,
+    )
+    .await;
+    let expected_nested = family_count(0);
+    println!(
+        "[5.19.C] @> 'nested': got={contains_nested}, expected={expected_nested}"
+    );
+    assert_eq!(
+        contains_nested, expected_nested,
+        "CONTAINMENT(@>): @> must return exactly the 'nested' family. \
+         expected={expected_nested}, got={contains_nested}. \
+         This is closed by 5.19.C (jsonb_contains UDF + GIN planner detection)."
+    );
+
+    // ── Assertion (b): <@ reverse containment — empty objects ──────────────
+    // PostgreSQL: `payload <@ '{"":""}'` returns rows where `payload` is
+    // contained in the superset document `{"":""}`.
+    // Only empty-object rows (`{}`) satisfy `{} <@ {"":""}` because `{}`
+    // has no key-value pairs, so vacuously all zero of its pairs exist in
+    // the superset.  Non-empty objects have at least one kv-pair that is
+    // absent from `{"":""}`.
+    // Expected: exactly the family-3 count (empty objects).
+    let contained_by = row_count(
+        &sess,
+        r#"SELECT id FROM gin_ct WHERE payload <@ '{"":""}'"#,
+    )
+    .await;
+    let expected_contained = family_count(3);
+    println!(
+        "[5.19.C] <@: got={contained_by}, expected={expected_contained}"
+    );
+    assert_eq!(
+        contained_by, expected_contained,
+        "CONTAINMENT(<@): <@ must return only the empty-object family. \
+         expected={expected_contained}, got={contained_by}. \
+         This is closed by 5.19.C (jsonb_contained_by UDF + GIN planner detection)."
+    );
+
+    // ── Bonus: compound containment with multiple keys ──────────────────────
+    // `payload @> '{"tag":"nested","id":0}'` must match exactly one row (id=0).
+    // Tests the AND-merge of posting lists for multi-key needle documents.
+    let compound = row_count(
+        &sess,
+        r#"SELECT id FROM gin_ct WHERE payload @> '{"tag":"nested","id":0}'"#,
+    )
+    .await;
+    println!("[5.19.C] compound @>: got={compound}, expected=1");
+    assert_eq!(
+        compound, 1,
+        "CONTAINMENT(@> compound): compound needle must match exactly one row. \
+         got={compound}"
+    );
+
+    println!(
+        "[5.19.C] PASSED — GIN containment correctness: \
+         @> returned {contains_nested}/{expected_nested} 'nested' rows, \
+         <@ returned {contained_by}/{expected_contained} empty-object rows, \
+         compound @> returned {compound}/1 rows ({ROW_COUNT} total rows)"
+    );
+}

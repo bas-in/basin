@@ -1577,6 +1577,45 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                 }
             }
 
+            // Phase 5.19.C: GIN containment fast path.
+            // Detect `SELECT … FROM t WHERE col @> 'literal'` (or `<@`) on a
+            // column that has a GIN index; probe the in-RAM posting list to
+            // get candidate files, then fall through to DataFusion which
+            // applies the full `jsonb_contains` predicate for correctness.
+            // The probe is advisory-only: when it returns `NoIndex` the query
+            // falls through to a full DataFusion scan without error.
+            if !crate::session::tx_is_active(&sess.state)
+                && (raw_sql.contains("@>") || raw_sql.contains("<@"))
+            {
+                if let Some(gin_plan) = crate::index_probe::detect_gin_containment(
+                    raw_sql,
+                    &sess.project,
+                    &sess.engine.config().catalog,
+                )
+                .await
+                {
+                    // Probe the posting list.  Only an explicit Empty result
+                    // lets us short-circuit; NoIndex and FileCandidates both
+                    // fall through (the DataFusion path handles correctness).
+                    let gin_result = sess.engine.gin_index_registry().probe_containment(
+                        &sess.project,
+                        &gin_plan.table,
+                        &gin_plan.col,
+                        &gin_plan.opclass,
+                        &gin_plan.needle,
+                    );
+                    if let crate::index_probe::ProbeResult::Empty = gin_result {
+                        // Posting list guarantees no rows match — short-circuit.
+                        let schema = Arc::new(arrow_schema::Schema::empty());
+                        return Ok(ExecResult::Rows { schema, batches: vec![] });
+                    }
+                    // FileCandidates: the DataFusion path still executes; the
+                    // posting list result is currently advisory (file-level
+                    // pruning via DataFusion scan override is 5.19.E).
+                    // Fall through to exec_select for correctness.
+                }
+            }
+
             exec_select(sess, sql, include_deleted).await
         }
         Statement::ShowTables { .. } => exec_show_tables(sess).await,
@@ -6397,6 +6436,7 @@ async fn maintain_secondary_indexes_on_insert(
         return;
     }
     let registry = sess.engine.secondary_index_registry();
+    let gin_registry = sess.engine.gin_index_registry();
     let storage = &sess.engine.config().storage;
 
     for idx in &meta.indexes {
@@ -6405,6 +6445,18 @@ async fn maintain_secondary_indexes_on_insert(
             continue;
         }
         let col_name = &idx.columns[0];
+
+        // Phase 5.19.C: populate GIN posting list for JSONB containment.
+        if idx.access_method == "gin" {
+            let opclass = idx.opclass.as_deref().unwrap_or("jsonb_ops");
+            maintain_gin_index_on_insert(gin_registry, &sess.project, table, col_name, opclass, batch, file_path);
+            // GIN posting list is RAM-only (5.19.E handles persistence); skip
+            // the flush call.  Continue to also populate the B-tree registry
+            // (which is a no-op for LargeBinary columns — scalar_to_key returns
+            // None — so this is harmless).
+            continue;
+        }
+
         let entries = crate::secondary_index::extract_entries_from_batch(
             batch,
             col_name,
@@ -6416,6 +6468,38 @@ async fn maintain_secondary_indexes_on_insert(
         }
         crate::secondary_index::flush_index(registry, storage, &sess.project, table, col_name)
             .await;
+    }
+}
+
+/// Populate the GIN posting list for a single JSONB column from a newly
+/// written `batch`.  Iterates every row in the batch, parses the JSONB bytes,
+/// extracts GIN terms, and inserts them into the registry.
+///
+/// Only `LargeBinary` columns are handled (Basin's canonical JSONB wire type).
+/// Other column types are silently skipped — the index is best-effort.
+fn maintain_gin_index_on_insert(
+    gin_registry: &Arc<crate::index_probe::GinIndexRegistry>,
+    project: &basin_common::ProjectId,
+    table: &basin_common::TableName,
+    col_name: &str,
+    opclass: &str,
+    batch: &arrow_array::RecordBatch,
+    file_path: &str,
+) {
+    use arrow_array::Array;
+    let Ok(col_idx) = batch.schema().index_of(col_name) else {
+        return;
+    };
+    let col = batch.column(col_idx);
+    // Basin stores JSONB as LargeBinary.
+    if let Some(arr) = col.as_any().downcast_ref::<arrow_array::LargeBinaryArray>() {
+        for row in 0..arr.len() {
+            if arr.is_null(row) {
+                continue;
+            }
+            let bytes = arr.value(row);
+            gin_registry.index_row(project, table, col_name, opclass, bytes, file_path, 0, row as u64);
+        }
     }
 }
 
