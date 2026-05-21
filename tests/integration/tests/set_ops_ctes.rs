@@ -520,10 +520,9 @@ async fn cte_recursive_feeding_update() {
 
 /// `WITH name AS MATERIALIZED (…) SELECT …` — PG-15 materialization hint.
 ///
-/// Status: 🛠 — sqlparser-rs (0.52/0.53) rejects `AS MATERIALIZED` with a
-/// parse error. Basin passes the SQL through sqlparser before DataFusion, so
-/// this hint is not yet supported. This test documents the current limitation
-/// and will become a positive assertion once sqlparser support lands.
+/// sqlparser now supports `AS MATERIALIZED` (landed in 0.54+). The hint is
+/// accepted and ignored (DataFusion treats the CTE normally). Updated from
+/// the previous limitation-documenting negative assertion to a positive one.
 #[tokio::test]
 async fn cte_materialized_hint() {
     let dir = TempDir::new().unwrap();
@@ -537,18 +536,24 @@ async fn cte_materialized_hint() {
         .await
         .unwrap();
 
-    let sql = "WITH src AS MATERIALIZED (SELECT n FROM nums WHERE n >= 20) SELECT n FROM src";
+    let sql = "WITH src AS MATERIALIZED (SELECT n FROM nums WHERE n >= 20) SELECT n FROM src ORDER BY n";
     let result = s.execute(sql).await;
-    // Currently rejected by sqlparser with a parse error. Assert the error
-    // shape so a regression (e.g. silent wrong answer) is immediately visible.
-    assert!(
-        result.is_err(),
-        "AS MATERIALIZED hint is not yet supported by sqlparser — \
-         expected parse error, got Ok"
-    );
-    let err_msg = format!("{:?}", result.unwrap_err());
-    assert!(
-        err_msg.contains("MATERIALIZED") || err_msg.contains("Parser") || err_msg.contains("parse"),
-        "unexpected error message for MATERIALIZED CTE: {err_msg}"
-    );
+    // AS MATERIALIZED is now parsed and treated as a normal CTE.
+    match result {
+        Ok(ExecResult::Rows { batches, .. }) => {
+            let ns = batches[0]
+                .column_by_name("n")
+                .expect("n column")
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("n is BIGINT");
+            assert_eq!(
+                (0..ns.len()).map(|i| ns.value(i)).collect::<Vec<_>>(),
+                vec![20, 30],
+                "AS MATERIALIZED CTE should return filtered rows"
+            );
+        }
+        Ok(other) => panic!("unexpected result variant: {other:?}"),
+        Err(e) => panic!("AS MATERIALIZED CTE must be accepted by sqlparser now: {e}"),
+    }
 }
