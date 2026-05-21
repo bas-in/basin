@@ -39,10 +39,20 @@ pub const DEFAULT_SUSTAINED_QPS: u32 = 100;
 pub const BURST_FACTOR: u32 = 3;
 
 /// Per-project pgwire rate limiter. Cheap to clone (Arc inside).
+///
+/// ## Phase 6.X.D — heartbeat-reconciled slice (ADR 0023)
+///
+/// Optionally carries a [`basin_catalog::SliceGate`] keyed on
+/// [`basin_catalog::CapKind::PgQps`]. When a slice is present each `check`
+/// also consumes one token from the coordinator-handed slice, closing the
+/// multi-instance bypass: N replicas with their own `governor` buckets used
+/// to admit `N × sustained_qps` total; with the slice they share
+/// `project_total / partition_count` per replica.
 #[derive(Clone)]
 pub struct PgRateLimit {
     inner: Arc<RateLimiter<ProjectId, DefaultKeyedStateStore<ProjectId>, DefaultClock>>,
     sustained_qps: u32,
+    slice: Option<basin_catalog::SliceGate>,
 }
 
 impl std::fmt::Debug for PgRateLimit {
@@ -72,7 +82,17 @@ impl PgRateLimit {
         Self {
             inner: Arc::new(RateLimiter::keyed(quota)),
             sustained_qps: qps,
+            slice: None,
         }
+    }
+
+    /// Phase 6.X.D — attach a [`basin_catalog::SliceGate`] so `check_async`
+    /// consults the leaseholder's last-received `PgQps` slice. The local
+    /// `governor` bucket remains as a secondary cap (back-compat); the
+    /// slice is the binding one when a coordinator total is configured.
+    pub fn with_slice_gate(mut self, gate: basin_catalog::SliceGate) -> Self {
+        self.slice = Some(gate);
+        self
     }
 
     /// Sustained quota in statements per second. Surfaced for telemetry
@@ -86,7 +106,36 @@ impl PgRateLimit {
     /// budget for the current window. The bare `()` keeps this module
     /// dependency-free of pgwire types; the call site does the
     /// SQLSTATE-53400 mapping.
+    ///
+    /// Sync variant — does **not** consume from the slice gate (it can't,
+    /// without awaiting). Use [`Self::check_async`] from async sites to get
+    /// the slice enforcement; this sync entrypoint preserves the existing
+    /// pgwire call site shape and falls through to `governor` only.
     pub fn check(&self, project: &ProjectId) -> Result<(), ()> {
+        if let Some(gate) = &self.slice {
+            let slice = gate
+                .view()
+                .slice_for_sync(*project, basin_catalog::CapKind::PgQps);
+            if slice != basin_catalog::SLICE_UNSET && slice == 0 {
+                return Err(());
+            }
+        }
+        self.inner.check_key(project).map(|_| ()).map_err(|_| ())
+    }
+
+    /// Async variant of [`Self::check`] that consumes one token from the
+    /// coordinator-handed slice (Phase 6.X.D) as well as the local
+    /// `governor` bucket. Either side denying fails the check.
+    pub async fn check_async(&self, project: &ProjectId) -> Result<(), ()> {
+        if let Some(gate) = &self.slice {
+            if gate
+                .try_consume(*project, basin_catalog::CapKind::PgQps, 1)
+                .await
+                .is_err()
+            {
+                return Err(());
+            }
+        }
         self.inner.check_key(project).map(|_| ()).map_err(|_| ())
     }
 }

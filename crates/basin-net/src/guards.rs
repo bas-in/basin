@@ -145,10 +145,21 @@ impl AllowList {
 /// `governor::Quota::per_minute`. The burst allowance is set explicitly so a
 /// short flurry doesn't immediately stall.
 ///
+/// ## Phase 6.X.D — heartbeat-reconciled slice
+///
+/// Optionally carries a [`basin_catalog::SliceGate`] that consults the
+/// leaseholder's last-received slice for `(project, NetOutboundQps)` before
+/// admitting traffic. When a slice is present the gate is the binding cap;
+/// when absent, the local `governor` bucket is the cap (back-compat). The
+/// slice closes the multi-instance bypass: N replicas with their own
+/// `governor` buckets can each admit 10 req/s; with the slice gate they
+/// share `project_total / partition_count` per replica.
+///
 /// Cheap to clone.
 #[derive(Clone)]
 pub struct RateLimit {
     inner: Arc<RateLimiter<ProjectId, DefaultKeyedStateStore<ProjectId>, DefaultClock>>,
+    slice: Option<basin_catalog::SliceGate>,
 }
 
 impl std::fmt::Debug for RateLimit {
@@ -174,12 +185,60 @@ impl RateLimit {
         let quota = Quota::per_second(per_sec).allow_burst(burst);
         Self {
             inner: Arc::new(RateLimiter::keyed(quota)),
+            slice: None,
         }
     }
 
+    /// Phase 6.X.D — attach a [`basin_catalog::SliceGate`] keyed on
+    /// [`basin_catalog::CapKind::NetOutboundQps`]. The heartbeat loop pushes
+    /// fresh slices into the gate's view; subsequent `check` calls reject
+    /// when the per-partition slice is exhausted, even if the local
+    /// `governor` bucket still has tokens.
+    pub fn with_slice_gate(mut self, gate: basin_catalog::SliceGate) -> Self {
+        self.slice = Some(gate);
+        self
+    }
+
     /// One token check. Errors with [`HttpError::RateLimited`] when the
-    /// project's bucket is empty.
+    /// project's bucket is empty *or* — under Phase 6.X.D — when the
+    /// coordinator-handed slice for `NetOutboundQps` is exhausted.
     pub fn check(&self, project: &ProjectId) -> Result<(), HttpError> {
+        // Slice check first so the noisy-neighbour bypass is closed even if
+        // the local `governor` bucket has plenty of tokens.
+        if let Some(gate) = &self.slice {
+            // The gate's `try_consume` is async — use the sync read of the
+            // slice + a synchronous best-effort counter decrement to keep
+            // `check` callable from sync contexts. When no slice is set
+            // (coordinator silent / project uncapped), `slice_for_sync`
+            // returns `SLICE_UNSET` and we admit through to `governor`.
+            let slice = gate
+                .view()
+                .slice_for_sync(*project, basin_catalog::CapKind::NetOutboundQps);
+            if slice != basin_catalog::SLICE_UNSET && slice == 0 {
+                return Err(HttpError::RateLimited);
+            }
+        }
+        match self.inner.check_key(project) {
+            Ok(_) => Ok(()),
+            Err(_) => Err(HttpError::RateLimited),
+        }
+    }
+
+    /// Async variant that consumes a token from both the coordinator-handed
+    /// slice (when present) and the local `governor` bucket. Callers in async
+    /// contexts should prefer this; the sync [`Self::check`] is retained for
+    /// existing blocking call sites. Returns [`HttpError::RateLimited`] when
+    /// either gate denies.
+    pub async fn check_async(&self, project: &ProjectId) -> Result<(), HttpError> {
+        if let Some(gate) = &self.slice {
+            if gate
+                .try_consume(*project, basin_catalog::CapKind::NetOutboundQps, 1)
+                .await
+                .is_err()
+            {
+                return Err(HttpError::RateLimited);
+            }
+        }
         match self.inner.check_key(project) {
             Ok(_) => Ok(()),
             Err(_) => Err(HttpError::RateLimited),

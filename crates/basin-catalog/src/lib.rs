@@ -25,6 +25,8 @@
 
 #![forbid(unsafe_code)]
 
+/// Phase 6.X.D — heartbeat-reconciled per-project budgets (ADR 0023).
+pub mod budgets;
 mod domains;
 mod enums;
 mod functions;
@@ -58,6 +60,10 @@ pub use functions::{
     SqlArgType, SqlFunctionArg, SqlFunctionDef, SqlFunctionLanguage, SqlReturnType,
 };
 pub use in_memory::InMemoryCatalog;
+pub use budgets::{
+    BudgetCoordinator, CapKind, InMemoryBudgetCoordinator, ProjectBudget, SliceBudget,
+    SliceBudgetView, SliceGate, UsageDelta, UsageSnapshot, SLICE_UNSET,
+};
 pub use leases::{
     Lease, LeaseRegistry, DEFAULT_LEASE_RENEW_SECS, DEFAULT_LEASE_TTL_SECS,
 };

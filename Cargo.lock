@@ -1213,6 +1213,7 @@ dependencies = [
  "async-trait",
  "axum",
  "basin-auth",
+ "basin-catalog",
  "basin-common",
  "basin-webhooks",
  "chrono",

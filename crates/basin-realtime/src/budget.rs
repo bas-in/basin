@@ -96,11 +96,20 @@ impl ProjectBudget {
     /// Try to reserve `size` bytes. Returns `Ok(new_total)` on success,
     /// `Err(BudgetError::BufferFull)` if the cap would be exceeded.
     fn try_reserve(&self, size: u64) -> Result<u64, BudgetError> {
-        // CAS loop: add `size` only if the post-addition value stays ≤ hard_cap.
+        self.try_reserve_against(size, self.hard_cap)
+    }
+
+    /// Variant of [`Self::try_reserve`] that uses an externally-supplied
+    /// `cap` instead of the row's stored `hard_cap`. Used by the slice-view
+    /// path (Phase 6.X.D) where the effective cap is
+    /// `min(hard_cap, slice_for(project, RealtimeBytes))` and changes as
+    /// the heartbeat tick refreshes the slice.
+    fn try_reserve_against(&self, size: u64, cap: u64) -> Result<u64, BudgetError> {
+        // CAS loop: add `size` only if the post-addition value stays ≤ cap.
         let mut current = self.bytes_in_flight.load(Ordering::Relaxed);
         loop {
             let next = current.saturating_add(size);
-            if next > self.hard_cap {
+            if next > cap {
                 return Err(BudgetError::BufferFull);
             }
             match self.bytes_in_flight.compare_exchange_weak(
@@ -162,6 +171,13 @@ pub struct BudgetTracker {
 struct BudgetTrackerInner {
     budgets: DashMap<ProjectId, ProjectBudget>,
     hard_cap: u64,
+    /// Phase 6.X.D — optional view of the coordinator-handed slice for
+    /// `(project, RealtimeBytes)`. When `Some` and the slice is set, the
+    /// effective cap is `min(hard_cap, slice)` so a project's aggregate
+    /// in-flight bytes across N replicas never exceeds the project total.
+    /// When `None` or the slice is unset, behaviour is the back-compat
+    /// per-process `hard_cap`.
+    slice: Option<basin_catalog::SliceBudgetView>,
 }
 
 impl BudgetTracker {
@@ -171,6 +187,23 @@ impl BudgetTracker {
             inner: Arc::new(BudgetTrackerInner {
                 budgets: DashMap::new(),
                 hard_cap,
+                slice: None,
+            }),
+        }
+    }
+
+    /// Phase 6.X.D — build a tracker carrying both a `hard_cap` (local
+    /// per-process backstop) and a [`basin_catalog::SliceBudgetView`] for
+    /// `RealtimeBytes` (cross-replica aggregate cap). The effective cap on
+    /// `try_reserve` becomes `min(hard_cap, slice)` when the slice is set;
+    /// when the slice is `SLICE_UNSET` (coordinator silent or project
+    /// uncapped), the per-process `hard_cap` is the cap (back-compat).
+    pub fn with_slice_view(hard_cap: u64, view: basin_catalog::SliceBudgetView) -> Self {
+        Self {
+            inner: Arc::new(BudgetTrackerInner {
+                budgets: DashMap::new(),
+                hard_cap,
+                slice: Some(view),
             }),
         }
     }
@@ -190,17 +223,27 @@ impl BudgetTracker {
     /// Returns a [`BudgetGuard`] that releases the bytes when dropped.
     /// Returns `Err(BudgetError::BufferFull)` if the per-project cap is
     /// exceeded; the caller should drop the event to the retry log.
+    ///
+    /// Phase 6.X.D: when a slice view is attached, the effective cap is
+    /// `min(hard_cap, slice_for(project, RealtimeBytes))`. The slice is the
+    /// per-partition allotment; with N replicas the project total is
+    /// `N × slice`, so the cap *is* the project-wide budget the operator
+    /// configured (no multi-instance bypass).
     pub fn try_reserve(
         &self,
         project: ProjectId,
         size: u64,
     ) -> Result<BudgetGuard, BudgetError> {
+        let effective_cap = self.effective_cap(project);
         let budget = self
             .inner
             .budgets
             .entry(project)
-            .or_insert_with(|| ProjectBudget::new(self.inner.hard_cap));
-        budget.try_reserve(size)?;
+            .or_insert_with(|| ProjectBudget::new(effective_cap));
+        // If the slice has tightened the cap since the budget row was
+        // created, run with the tighter value for this reservation.
+        let cap = effective_cap.min(budget.hard_cap);
+        budget.try_reserve_against(size, cap)?;
         // Keep a reference to the DashMap entry's value through the tracker Arc.
         // We drop the dashmap guard here and re-look up on release, which is
         // fine: the entry is never removed (projects are never evicted).
@@ -210,6 +253,23 @@ impl BudgetTracker {
             project,
             size,
         })
+    }
+
+    /// Compute the effective per-reservation cap for `project`. Reads the
+    /// slice synchronously (best-effort try-read; SLICE_UNSET on contention)
+    /// so the hot path stays sync. Falls back to `hard_cap` whenever no
+    /// slice is set, which keeps the back-compat behaviour byte-for-byte.
+    fn effective_cap(&self, project: ProjectId) -> u64 {
+        let hard = self.inner.hard_cap;
+        let Some(view) = self.inner.slice.as_ref() else {
+            return hard;
+        };
+        let slice = view.slice_for_sync(project, basin_catalog::CapKind::RealtimeBytes);
+        if slice == basin_catalog::SLICE_UNSET {
+            hard
+        } else {
+            hard.min(slice)
+        }
     }
 
     /// Release `size` bytes for `project`. Called internally by [`BudgetGuard`].

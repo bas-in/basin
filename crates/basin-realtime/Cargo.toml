@@ -9,6 +9,9 @@ publish = false
 [dependencies]
 basin-common.workspace = true
 basin-auth.workspace = true
+# Phase 6.X.D — heartbeat-reconciled budgets (ADR 0023). Read-only handle
+# to the slice view; no catalog reads on the hot path.
+basin-catalog.workspace = true
 
 tokio.workspace = true
 async-trait.workspace = true
