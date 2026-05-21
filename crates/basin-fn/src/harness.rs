@@ -27,6 +27,7 @@ use wasmtime::{Config, Engine, Store};
 use wasmtime::component::Component;
 
 use basin_common::ids::ProjectId;
+use basin_common::telemetry::ProjectCounterRegistry;
 
 use crate::engine::InvocationContext;
 use crate::governance::{FunctionGovernance, MemoryLimiter};
@@ -103,6 +104,14 @@ pub struct ComponentHarness {
     /// CPU + memory + wall-clock + per-project-semaphore + dedicated-runtime
     /// enforcement chain.
     governance: Option<Arc<FunctionGovernance>>,
+    /// Optional per-project counter registry. When attached,
+    /// [`ComponentHarness::run_with`] bumps `cpu_micros_total` for the
+    /// invoking project after the Wasm work completes (the wall-clock here is
+    /// CPU on the tenant's behalf — same SKU as engine query time).
+    /// `None` means metering is disabled for this harness (bench harness +
+    /// legacy callers); kept optional so adding the counter didn't break
+    /// existing constructors.
+    counters: Option<Arc<ProjectCounterRegistry>>,
 }
 
 impl ComponentHarness {
@@ -144,7 +153,17 @@ impl ComponentHarness {
             wasmtime::component::Linker::new(&engine);
         add_host_to_linker(&mut linker)?;
 
-        Ok(Self { engine, component, linker, governance })
+        Ok(Self { engine, component, linker, governance, counters: None })
+    }
+
+    /// Attach a per-project counter registry so [`Self::run_with`] bumps
+    /// `cpu_micros_total` for the invoking project. Wasm wall-clock counts as
+    /// CPU on the tenant's behalf and feeds the same
+    /// `COMPUTE_OVERAGE_USD_PER_CPU_SECOND` SKU as engine query CPU
+    /// (`docs/audits/2026-05-21-billing-meter-gap.md` hole #12). Idempotent
+    /// (overwrites). Optional — leaving it unset disables metering.
+    pub fn attach_project_counters(&mut self, counters: Arc<ProjectCounterRegistry>) {
+        self.counters = Some(counters);
     }
 
     /// Instantiate the component with the provided `ctx` and call `run`.
@@ -200,24 +219,41 @@ impl ComponentHarness {
         // Clone `gov` for the closure body; the outer `gov` is borrowed by
         // `invoke_with_caps`. Both Arcs alias the same FunctionGovernance.
         let gov_inner = gov.clone();
-        gov.invoke_with_caps(project, move || {
-            let call_ctx = FunctionCallContext::new(ctx);
-            let host = FunctionHost::with_limiter(
-                call_ctx,
-                MemoryLimiter::new(caps.memory_max_bytes),
-            );
-            let mut store = Store::new(&me.engine, host);
-            // Install the per-Store memory limiter + CPU trap. The closure
-            // reaches the limiter through `FunctionHost::limiter_mut`.
-            gov_inner.prepare_store_with_limiter(
-                &mut store,
-                |h: &mut FunctionHost| h.limiter_mut(),
-            );
-            let bindings =
-                BasinFunctions::instantiate(&mut store, &me.component, &me.linker)?;
-            Ok(bindings.call_run(&mut store)?)
-        })
-        .await
+        // Wall-clock from just before invoke_with_caps until it returns is
+        // the CPU bill we attribute to the project. Includes the per-project
+        // semaphore wait + wasm task time. That's the right granularity for
+        // a per-tenant CPU meter: queueing under contention IS time we're
+        // running the tenant's work-in-flight, and Wasm host imports
+        // (HTTP / SQL) are billed too because the same fn invocation owns
+        // them. Same SKU as the engine query meter — see
+        // `docs/audits/2026-05-21-billing-meter-gap.md` hole #12.
+        let started = std::time::Instant::now();
+        let result = gov
+            .invoke_with_caps(project, move || {
+                let call_ctx = FunctionCallContext::new(ctx);
+                let host = FunctionHost::with_limiter(
+                    call_ctx,
+                    MemoryLimiter::new(caps.memory_max_bytes),
+                );
+                let mut store = Store::new(&me.engine, host);
+                // Install the per-Store memory limiter + CPU trap. The closure
+                // reaches the limiter through `FunctionHost::limiter_mut`.
+                gov_inner.prepare_store_with_limiter(
+                    &mut store,
+                    |h: &mut FunctionHost| h.limiter_mut(),
+                );
+                let bindings =
+                    BasinFunctions::instantiate(&mut store, &me.component, &me.linker)?;
+                Ok(bindings.call_run(&mut store)?)
+            })
+            .await;
+        // Bump even on error: a guest that traps still consumed CPU. Skip the
+        // bump only when no registry is attached (bench / legacy callers).
+        if let Some(counters) = &self.counters {
+            let micros = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            counters.for_project(&project).record_cpu_micros(micros);
+        }
+        result
     }
 
     /// Whether this harness was built with [`Self::with_governance`].

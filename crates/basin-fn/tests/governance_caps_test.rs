@@ -476,3 +476,90 @@ async fn per_project_semaphore_lru_evicts_at_scale() {
         "LRU should still hold the most-recent entries; saw 0"
     );
 }
+
+/// Minimal no-op component used by the metering test: instantiates cleanly and
+/// returns `option<string>::None`. Same shape as the GUEST_WAT in
+/// `component_host_test.rs`, duplicated here so the metering test does not
+/// drag in cross-file fixtures.
+const NOOP_COMPONENT_WAT: &str = r#"
+(component
+  (core module $core_m
+    (memory (export "memory") 1)
+    (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32)
+      i32.const 0)
+    (func (export "run_inner") (result i32)
+      i32.const 0)
+  )
+  (core instance $core_i (instantiate $core_m))
+  (func (export "run") (result (option string))
+    (canon lift
+      (core func $core_i "run_inner")
+      (memory $core_i "memory")
+      (realloc (func $core_i "cabi_realloc"))
+    )
+  )
+)
+"#;
+
+/// Billing meter (`docs/audits/2026-05-21-billing-meter-gap.md` hole #12):
+/// when a `ProjectCounterRegistry` is attached, `ComponentHarness::run_with`
+/// bumps `cpu_micros_total` for the invoking project and keeps cross-project
+/// counts isolated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn component_harness_run_with_bumps_cpu_micros_per_project() {
+    use basin_common::telemetry::ProjectCounterRegistry;
+    use basin_fn::ComponentHarness;
+
+    let caps = FunctionCaps {
+        cpu_ticks: 50,
+        memory_max_bytes: 64 * 1024 * 1024,
+        wall_timeout: Duration::from_secs(2),
+        project_concurrency: 4,
+        project_semaphore_cap: 8,
+        worker_threads: 2,
+    };
+    let gov = FunctionGovernance::new(caps);
+
+    let wasm = wat::parse_str(NOOP_COMPONENT_WAT).expect("noop component WAT parses");
+    let registry = Arc::new(ProjectCounterRegistry::new());
+
+    let mut harness =
+        ComponentHarness::with_governance(&wasm, gov.clone()).expect("compile");
+    harness.attach_project_counters(registry.clone());
+    let harness = Arc::new(harness);
+
+    let a = ProjectId::new();
+    let b = ProjectId::new();
+
+    // Three calls on A, one on B.
+    for _ in 0..3 {
+        let res = harness
+            .run_with(a, InvocationContext::mock())
+            .await
+            .expect("noop guest returns None");
+        assert!(res.is_none());
+    }
+    harness
+        .run_with(b, InvocationContext::mock())
+        .await
+        .expect("noop guest returns None on B");
+
+    let snap_a = registry.snapshot(&a).expect("A has snapshot");
+    let snap_b = registry.snapshot(&b).expect("B has snapshot");
+
+    assert!(
+        snap_a.cpu_micros_total > 0,
+        "A's cpu_micros must be non-zero after 3 invocations"
+    );
+    assert!(
+        snap_b.cpu_micros_total > 0,
+        "B's cpu_micros must be non-zero after 1 invocation"
+    );
+    // Isolation: A ran 3x as much work as B, so its meter must exceed B's.
+    // (Generous comparison - wall-clock noise can shrink the gap below 3x.)
+    assert!(
+        snap_a.cpu_micros_total > snap_b.cpu_micros_total,
+        "A({} micros) should exceed B({} micros) after 3x more invocations",
+        snap_a.cpu_micros_total, snap_b.cpu_micros_total,
+    );
+}

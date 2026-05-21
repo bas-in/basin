@@ -17,14 +17,27 @@ Sources audited:
 
 ## 1. Executive summary — the 3 holes that block T-104 / Phase 4 billing
 
-1. **CPU-seconds per project — not measured at all.** The reprice introduces
+1. **CPU-seconds per project — not measured at all.**
+   **✅ CLOSED (2026-05-21, this commit).** A new monotonic
+   `cpu_micros_total: AtomicU64` was added to `ProjectCounters`
+   (`crates/basin-common/src/telemetry.rs`) and is bumped on two sites:
+   (a) the engine's per-query exec-completion site
+   (`crates/basin-engine/src/lib.rs` — right after `record_latency_ms`)
+   with `started.elapsed().as_micros()`, and (b) the Wasm
+   `ComponentHarness::run_with` wrapper
+   (`crates/basin-fn/src/harness.rs`) so per-invocation wall-clock
+   on the dedicated wasm runtime is also attributed. Surfaced through
+   `ProjectCountersSnapshot.cpu_micros_total` so the OTLP /
+   `basin-cloud` aggregator picks it up for free. Per-project
+   aggregation + cross-project isolation verified by
+   `basin_engine::tests::cpu_micros_total_aggregates_per_project`,
+   `governance_caps_test::component_harness_run_with_bumps_cpu_micros_per_project`,
+   and `basin_common::telemetry::tests::cpu_micros_counter_is_per_project_and_monotonic`.
+   *Original gap text, for reference:* The reprice introduces
    `COMPUTE_OVERAGE_USD_PER_CPU_SECOND = 0.000005`
    (`basin-cloud/billing_model/model.py:78`) as the structural margin line.
-   The engine knows `elapsed_ms` per query
-   (`crates/basin-engine/src/lib.rs:646`) but only feeds it into a 128-slot
-   p99 latency ring (`crates/basin-common/src/telemetry.rs:73-89,149-157`);
-   the per-project SUM of elapsed time is **never aggregated**. Without it
-   the cloud cannot bill the new compute-overage SKU at all.
+   The engine knew `elapsed_ms` per query but only fed it into a 128-slot
+   p99 latency ring; the per-project SUM was never aggregated.
 
 2. **Tigris Class-A / Class-B op counts — not measured per project.**
    **✅ CLOSED (2026-05-21, this commit).** Two new monotonic counters
@@ -64,13 +77,13 @@ Sources audited:
 | 3 | Tigris Class-A PUTs — `R2_CLASS_A_USD_PER_M_OPS=50.0` (`model.py:24`) | count       | ✅ `ProjectCounters::class_a_ops_total` (`telemetry.rs`) bumped from `ProjectScopedStore::{put_opts, put_multipart_opts, copy_opts, delete_stream}` on success.                | DONE (2026-05-21). Exported via `ProjectCountersSnapshot.class_a_ops_total`; no new export surface needed.                                                                  |
 | 4 | Tigris Class-B GETs — `R2_CLASS_B_USD_PER_M_OPS=5.0` (`model.py:25`) | count        | ✅ `ProjectCounters::class_b_ops_total` (`telemetry.rs`) bumped from `ProjectScopedStore::{get_opts, list, list_with_delimiter}` on success.                                  | DONE (2026-05-21). Exported via `ProjectCountersSnapshot.class_b_ops_total`. HEAD-shaped GETs (`GetOptions::head`) are billed identically to body GETs.                     |
 | 5 | Tigris egress bytes (Fly-internal = $0 today)                 | bytes             | ❌ Not measured.                                                                                                                            | Future-cost: add `egress_bytes_total: AtomicU64`; bump in `ProjectScopedStore::get_opts` from `GetResult.meta.size`. Multi-region makes this non-zero (see §5).              |
-| 6 | Compute — `FLY_*_USD_PER_MONTH` pool costs (`model.py:33-37`) | $ / pool-month    | ❌ Pool cost is invoiced flat by Fly; no per-tenant attribution exists.                                                                     | Add `cpu_seconds_total: AtomicU64` derived from `elapsed_ms` (`crates/basin-engine/src/lib.rs:646`) — `tc.record_cpu_ms(elapsed_ms)` after `record_latency_ms`.              |
-| 7 | Compute overage — `COMPUTE_OVERAGE_USD_PER_CPU_SECOND=0.000005` (`model.py:78`) | CPU-second | ❌ Not measured. `ProjectSession::execute` has `started.elapsed()` (`basin-engine/src/lib.rs:634, 646`) but only sinks it into the latency ring. | Same fix as #6. Critical: this is what the reprice's whole margin story depends on.                                                                                          |
+| 6 | Compute — `FLY_*_USD_PER_MONTH` pool costs (`model.py:33-37`) | $ / pool-month    | ✅ `ProjectCounters::cpu_micros_total` bumped after every `ProjectSession::execute` (`crates/basin-engine/src/lib.rs`) and every `ComponentHarness::run_with` (`crates/basin-fn/src/harness.rs`).                | DONE (2026-05-21). Exported via `ProjectCountersSnapshot.cpu_micros_total`. Pool-flat cost is now attributable to a project by summing per-project CPU.                       |
+| 7 | Compute overage — `COMPUTE_OVERAGE_USD_PER_CPU_SECOND=0.000005` (`model.py:78`) | CPU-second | ✅ Same counter as #6.                                                                                                                       | DONE (2026-05-21). The reprice's margin story is now backable by a real meter. basin-cloud sums `cpu_micros_total / 1e6` to bill against the SKU.                              |
 | 8 | Active connection-seconds (per-tier conn caps, `proposed_pricing.md:101-103`) | conn·s     | ⚠️ `basin-pool` exposes `resident_sessions` + `resident_per_project` as point-in-time gauges (`crates/basin-pool/src/stats.rs:44-50`). No accumulation. | Add `conn_seconds_total: AtomicU64` bumped on session checkin (release) by elapsed-since-checkout. Wire from `basin-pool::pooled_session::PooledSession::drop`.            |
 | 9 | WAL bytes per project                                         | bytes (cumulative)| ✅ `LocalWal::append` bumps `bytes_written_total` + `record_op` (`crates/basin-wal/src/lib.rs:393-394`).                                    | None. Already counted, but shared with table-data writes — no way to split. Document the limitation if WAL becomes its own SKU.                                             |
 | 10 | Hottier resident bytes (memtable)                            | bytes (gauge)     | ⚠️ Tracked internally by `MemTableRegistry` per `(project, table)` (`crates/basin-hottier/src/registry.rs:6-32`), but NOT re-exported through `ProjectCounters`. | Add `hottier_resident_bytes: AtomicU64` mirror on `ProjectCounters`; update in `MemTableRegistry::try_reserve_bytes` and `release_bytes`.                                 |
 | 11 | Compaction CPU                                               | CPU-second        | ❌ `Shard::compact_one` (`crates/basin-shard/src/in_process.rs:448`) does background work with no project-side accounting.                  | Wrap `compact_one` body in `Instant::now()` + `tc.record_cpu_ms()`. Background CPU is a real margin leak today.                                                             |
-| 12 | Function (`basin-fn`) wall-clock                              | CPU-second        | ⚠️ `WasmGovernance::invoke_with_caps` measures wall via `tokio::time::timeout` (`crates/basin-fn/src/governance.rs:343-379`) but never reports it. | Add `fn_cpu_seconds_total: AtomicU64`; bump from a finished-task hook in `invoke_with_caps`. Should be billed as compute (same SKU as #7).                                  |
+| 12 | Function (`basin-fn`) wall-clock                              | CPU-second        | ✅ Wasm invocation wall-clock attributed via `ComponentHarness::run_with` measuring `started.elapsed()` around `invoke_with_caps` and bumping `cpu_micros_total` on the optional `ProjectCounterRegistry` attached via `ComponentHarness::attach_project_counters`.                                                                                                                       | DONE (2026-05-21). Same SKU as engine query CPU (#6/#7) — single billing counter; no need for a separate `fn_cpu_seconds_total`.                                            |
 | 13 | Catalog Postgres bytes (`CATALOG_PG_*`, `model.py:41-43`)     | GB                | Out of engine scope — lives in basin-cloud's Postgres.                                                                                       | Not present in tree (and shouldn't be); `basin-cloud` sums `pg_database_size()` directly. Note here for completeness.                                                       |
 | 14 | Stripe / Paystack fees (`model.py:46-47, 100-104, 176-199`)  | $ per txn         | Out of engine scope — payments live in basin-cloud.                                                                                          | Not present in tree (correct). No engine work.                                                                                                                              |
 | 15 | HTTP egress to customer (REST/SSE response bytes)            | bytes             | ❌ Not measured. `basin-rest::routes::data::ndjson_stream` materialises a `Vec<u8>` before chunking (`crates/basin-rest/src/routes/data.rs:164-198`) — exact bytes known. | Future-cost. Add `http_egress_bytes_total: AtomicU64`; bump in `render_get_response` and `ndjson_stream`. Free on Fly→client today.                                          |
@@ -87,22 +100,28 @@ Legend: ✅ exported per project · ⚠️ exists internally but not per-project
 Every fix below is **additive** — none mutates an existing counter or
 breaks ABI. Implementation order matches §6 sizing.
 
-### Hole #7 (and #6, #12) — CPU-seconds
+### Hole #7 (and #6, #12) — CPU-seconds — ✅ CLOSED (2026-05-21)
 
-- New counter: add `cpu_micros_total: AtomicU64` to `ProjectCounters`
-  (`crates/basin-common/src/telemetry.rs:78-84`) plus a `record_cpu_micros(u64)`
-  method modelled on `record_bytes_written`.
-- Engine bump point: `crates/basin-engine/src/lib.rs:646` — right after
-  `record_latency_ms(elapsed_ms)`:
-  ```rust
-  tc.record_cpu_micros(started.elapsed().as_micros().min(u64::MAX as u128) as u64);
-  ```
-- Compaction bump point: `crates/basin-shard/src/in_process.rs:448-470`
-  (`compact_one`) — wrap body in `let t = Instant::now()` and bump after the
-  `Ok(())`. Source the registry via the same path the writer uses
-  (`storage.project_counters(project)` at `lib.rs:532-537`).
-- WASM fn bump point: `crates/basin-fn/src/governance.rs:359-378` — measure
-  `join.await` elapsed before returning.
+Implementation as landed:
+- New counter `cpu_micros_total: AtomicU64` on `ProjectCounters`
+  (`crates/basin-common/src/telemetry.rs`) plus `record_cpu_micros(u64)`
+  method, mirrored to `ProjectCountersSnapshot.cpu_micros_total`.
+- Engine bump point: `crates/basin-engine/src/lib.rs` — right after
+  `record_latency_ms(elapsed_ms)`, bumps with
+  `started.elapsed().as_micros()`.
+- WASM fn bump point: `crates/basin-fn/src/harness.rs` —
+  `ComponentHarness::run_with` measures wall-clock around
+  `invoke_with_caps` and, when an optional `ProjectCounterRegistry` is
+  attached via `ComponentHarness::attach_project_counters`, bumps
+  `cpu_micros_total` for the invoking project. The bump fires even on
+  guest error/trap because a trapping guest still consumed CPU.
+
+Still open as a defence-in-depth follow-up (NOT a billing blocker):
+- Compaction bump point: `crates/basin-shard/src/in_process.rs`
+  (`compact_one`). Background CPU is a real margin leak today but is
+  not directly billed against `COMPUTE_OVERAGE_USD_PER_CPU_SECOND` —
+  it's amortised into the fixed-fee SKU. Tracked separately as a
+  v0.2 attribution-accuracy item.
 
 ### Holes #3, #4 — Class-A / Class-B op counts
 
@@ -223,11 +242,17 @@ engine meters (#5, #15, #16) are 1-day fixes; deferring them costs us
   put_opts, put_multipart_opts, get_opts, list, list_with_delimiter,
   copy_opts, delete_stream. Cross-project isolation covered by
   `concurrency::tests::cross_project_isolation_class_a_b`.
-- **#6, #7** — CPU-seconds. One line in
-  `crates/basin-engine/src/lib.rs:646-647`, one new method on
-  `ProjectCounters`.
-- **#12** — Function CPU-seconds. One wrapper in
-  `crates/basin-fn/src/governance.rs:343-379`.
+- **#6, #7** — CPU-seconds. ✅ DONE (2026-05-21). One bump after
+  `record_latency_ms` in `crates/basin-engine/src/lib.rs`, plus the new
+  `cpu_micros_total` field + `record_cpu_micros` method on
+  `ProjectCounters`. Test
+  `basin_engine::tests::cpu_micros_total_aggregates_per_project`.
+- **#12** — Function CPU-seconds. ✅ DONE (2026-05-21). Bump in
+  `ComponentHarness::run_with` in `crates/basin-fn/src/harness.rs`
+  (wrap `invoke_with_caps` in `Instant::now()` and call
+  `counters.for_project(&project).record_cpu_micros(...)` on return).
+  Test
+  `governance_caps_test::component_harness_run_with_bumps_cpu_micros_per_project`.
 - **#5, #15** — Egress byte counters (future-cost insurance). Three
   bump sites total (concurrency.rs + data.rs render path).
 

@@ -371,6 +371,12 @@ pub struct FunctionGovernance {
     // Hold the ticker guard so dropping `FunctionGovernance` ends the
     // background task — avoids leaking a tokio task per test instance.
     _ticker: Mutex<Option<TickerGuard>>,
+    /// Phase 6.X.D — optional cross-replica gate for the per-project
+    /// `WasmConcurrency` cap (ADR 0023). When attached and the
+    /// coordinator has handed out a slice, the gate refuses invocations
+    /// that would breach the per-partition slice even though the local
+    /// `project_sems` semaphore still has permits.
+    slice_gate: Mutex<Option<basin_catalog::SliceGate>>,
 }
 
 /// Owns the epoch-ticker tokio task. Dropping the guard aborts the task so
@@ -429,7 +435,18 @@ impl FunctionGovernance {
             project_sems: Mutex::new(LruCache::new(sem_cap)),
             wasm_runtime,
             _ticker: Mutex::new(Some(TickerGuard { handle })),
+            slice_gate: Mutex::new(None),
         })
+    }
+
+    /// Phase 6.X.D — attach a [`basin_catalog::SliceGate`] keyed on
+    /// [`basin_catalog::CapKind::WasmConcurrency`]. The shard heartbeat
+    /// loop fills the underlying [`basin_catalog::SliceBudgetView`];
+    /// subsequent calls to [`Self::invoke_with_caps`] reject (with
+    /// `WasmConcurrency slice exhausted`) when the project's per-partition
+    /// slice is exhausted, closing the multi-instance bypass.
+    pub fn attach_slice_gate(&self, gate: basin_catalog::SliceGate) {
+        *self.slice_gate.lock().expect("slice_gate poisoned") = Some(gate);
     }
 
     /// Access the underlying [`Engine`] (so the same one used by the ticker
@@ -530,6 +547,31 @@ impl FunctionGovernance {
         F: FnOnce() -> anyhow::Result<R> + Send + 'static,
         R: Send + 'static,
     {
+        // Phase 6.X.D — slice gate first. The per-process semaphore (below)
+        // still bounds local in-flight invocations, but the slice gate is
+        // the binding cap across all replicas when a coordinator total is
+        // configured. Reject immediately when the slice is exhausted; do
+        // not block on the local semaphore (a noisy tenant would otherwise
+        // queue up against their own slice).
+        //
+        // Clone the gate out of the mutex into a local Option so the
+        // `std::sync::MutexGuard` is dropped before we hit any `.await` —
+        // otherwise the resulting future is `!Send` and tokio can't spawn it.
+        let slice_gate: Option<basin_catalog::SliceGate> = {
+            let g = self.slice_gate.lock().expect("slice_gate poisoned");
+            g.as_ref().cloned()
+        };
+        if let Some(gate) = slice_gate {
+            if gate
+                .try_consume(project, basin_catalog::CapKind::WasmConcurrency, 1)
+                .await
+                .is_err()
+            {
+                return Err(anyhow!(
+                    "per-project WasmConcurrency slice exhausted (coordinator-handed)"
+                ));
+            }
+        }
         let sem = self.project_sem(project);
         let _permit = sem
             .clone()

@@ -93,6 +93,16 @@ pub struct ProjectCounters {
     /// Read object-store ops: GET, HEAD, LIST. Monotonic, project-scoped,
     /// unit = ops (not bytes).
     class_b_ops_total: AtomicU64,
+    /// Cumulative CPU time spent on this project's behalf, in microseconds.
+    /// Monotonic. Bumped by the engine's query exec-completion site
+    /// (`crates/basin-engine/src/lib.rs`) and by the Wasm function runtime
+    /// (`crates/basin-fn/src/harness.rs`) so the basin-cloud billing
+    /// aggregator can sum a single counter per project for the
+    /// `COMPUTE_OVERAGE_USD_PER_CPU_SECOND` SKU
+    /// (`docs/audits/2026-05-21-billing-meter-gap.md` hole #6/#7/#12).
+    /// Microseconds (not millis) so a single fast query is still attributed
+    /// rather than rounding to zero.
+    cpu_micros_total: AtomicU64,
     errors_total: AtomicU64,
     latency: Mutex<LatencyRing>,
 }
@@ -122,6 +132,7 @@ impl Default for ProjectCounters {
             bytes_written_total: AtomicU64::new(0),
             class_a_ops_total: AtomicU64::new(0),
             class_b_ops_total: AtomicU64::new(0),
+            cpu_micros_total: AtomicU64::new(0),
             errors_total: AtomicU64::new(0),
             latency: Mutex::new(LatencyRing::default()),
         }
@@ -183,6 +194,13 @@ impl ProjectCounters {
     pub fn record_class_b_ops(&self, n: u64) {
         self.class_b_ops_total.fetch_add(n, Ordering::Relaxed);
     }
+    /// Bump the cumulative CPU-time counter by `micros` microseconds. Called
+    /// from the engine's per-query exec-completion site and from the Wasm
+    /// function runtime — both represent work done on the project's behalf.
+    /// O(1). See `cpu_micros_total` for the billing rationale.
+    pub fn record_cpu_micros(&self, micros: u64) {
+        self.cpu_micros_total.fetch_add(micros, Ordering::Relaxed);
+    }
     /// Record one latency observation in milliseconds. O(1).
     pub fn record_latency_ms(&self, ms: u32) {
         let mut g = self.latency.lock().expect("project latency ring poisoned");
@@ -212,6 +230,7 @@ impl ProjectCounters {
             bytes_written_total: self.bytes_written_total.load(Ordering::Relaxed),
             class_a_ops_total: self.class_a_ops_total.load(Ordering::Relaxed),
             class_b_ops_total: self.class_b_ops_total.load(Ordering::Relaxed),
+            cpu_micros_total: self.cpu_micros_total.load(Ordering::Relaxed),
             errors_total: self.errors_total.load(Ordering::Relaxed),
             latency_p99_ms_estimate: p99,
         }
@@ -230,6 +249,10 @@ pub struct ProjectCountersSnapshot {
     /// Cumulative Class-B op count (GET / HEAD / LIST) — the basin-cloud
     /// billing dimension for read requests.
     pub class_b_ops_total: u64,
+    /// Cumulative CPU time on the project's behalf, in microseconds. Aggregates
+    /// query exec time (engine) and Wasm function wall-clock (basin-fn). Used
+    /// by basin-cloud to bill `COMPUTE_OVERAGE_USD_PER_CPU_SECOND`.
+    pub cpu_micros_total: u64,
     pub errors_total: u64,
     pub latency_p99_ms_estimate: u32,
 }
@@ -315,6 +338,25 @@ mod tests {
         let snap_b = r.snapshot(&b).unwrap();
         assert_eq!(snap_b.class_a_ops_total, 5);
         assert_eq!(snap_b.class_b_ops_total, 0);
+    }
+
+    #[test]
+    fn cpu_micros_counter_is_per_project_and_monotonic() {
+        let r = ProjectCounterRegistry::new();
+        let a = ProjectId::new();
+        let b = ProjectId::new();
+
+        let ca = r.for_project(&a);
+        ca.record_cpu_micros(150);
+        ca.record_cpu_micros(50);
+
+        let cb = r.for_project(&b);
+        cb.record_cpu_micros(7);
+
+        let snap_a = r.snapshot(&a).unwrap();
+        let snap_b = r.snapshot(&b).unwrap();
+        assert_eq!(snap_a.cpu_micros_total, 200);
+        assert_eq!(snap_b.cpu_micros_total, 7);
     }
 
     #[test]

@@ -1027,6 +1027,7 @@ name = "basin-fn"
 version = "0.1.9"
 dependencies = [
  "anyhow",
+ "basin-catalog",
  "basin-common",
  "basin-net",
  "dashmap",

@@ -17,6 +17,7 @@ component-model = [
     "dep:wasmtime-wasi",
     "dep:basin-net",
     "dep:basin-common",
+    "dep:basin-catalog",
     "dep:tracing",
     "dep:thiserror",
     "dep:anyhow",
@@ -27,8 +28,10 @@ component-model = [
 ]
 
 [dependencies]
-basin-common = { workspace = true, optional = true }
-basin-net    = { workspace = true, optional = true }
+basin-common  = { workspace = true, optional = true }
+basin-net     = { workspace = true, optional = true }
+# Phase 6.X.D — slice view for the per-project WasmConcurrency cap.
+basin-catalog = { workspace = true, optional = true }
 
 # Wasmtime component-model stack (44.x, matching basin-engine's pin).
 # wasmtime-wasi provides WASI P2 types (ResourceTable, WasiCtx) used by

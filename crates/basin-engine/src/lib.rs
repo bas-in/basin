@@ -643,8 +643,16 @@ impl ProjectSession {
             .project_counters_registry()
             .for_project(&self.project);
         tc.record_op();
-        let elapsed_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+        let elapsed = started.elapsed();
+        let elapsed_ms = elapsed.as_millis().min(u32::MAX as u128) as u32;
         tc.record_latency_ms(elapsed_ms);
+        // Aggregate CPU time per project for billing. The p99 latency ring
+        // above is a sliding-window SLO signal; this sum is the monotonic
+        // billing meter consumed by basin-cloud
+        // (`docs/audits/2026-05-21-billing-meter-gap.md` hole #6/#7).
+        // Saturate at u64::MAX defensively; one query is never going to come
+        // close, but the cast must be total.
+        tc.record_cpu_micros(elapsed.as_micros().min(u64::MAX as u128) as u64);
         if result.is_err() {
             tc.record_error();
         }
@@ -3029,5 +3037,54 @@ mod tests {
         // score=20 (both rows): groups 0+1 = (10+10+20+20=60)
         // score=30: groups 1+2 = (20+20+30=70)
         assert_eq!(sums, vec![20, 20, 60, 60, 70], "GROUPS 1 PRECEDING sums");
+    }
+
+    /// `cpu_micros_total` (the basin-cloud
+    /// `COMPUTE_OVERAGE_USD_PER_CPU_SECOND` meter) must aggregate every
+    /// session-side `execute` and stay isolated per project.
+    /// `docs/audits/2026-05-21-billing-meter-gap.md` hole #6/#7 closure.
+    #[tokio::test]
+    async fn cpu_micros_total_aggregates_per_project() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let a = ProjectId::new();
+        let b = ProjectId::new();
+
+        let sa = eng.open_session(a).await.unwrap();
+        // Force several non-zero-elapsed queries on project A.
+        let n_queries = 5;
+        for _ in 0..n_queries {
+            sa.execute("SELECT 1").await.unwrap();
+        }
+
+        let sb = eng.open_session(b).await.unwrap();
+        sb.execute("SELECT 1").await.unwrap();
+
+        let snap_a = eng.project_counters(&a);
+        let snap_b = eng.project_counters(&b);
+
+        // A executed N+1 ops (open_session may not count, but execute does).
+        assert!(
+            snap_a.ops_total >= n_queries,
+            "expected at least {n_queries} ops on A, saw {}",
+            snap_a.ops_total
+        );
+        // Each query takes nonzero microseconds; aggregate must be > 0.
+        assert!(
+            snap_a.cpu_micros_total > 0,
+            "expected nonzero cpu_micros for A, saw 0"
+        );
+        // Cross-project isolation: B's CPU does not leak into A.
+        // B ran 1 query — its counter is positive but strictly less than A's
+        // (which ran N=5). Use a generous floor to stay stable on fast hosts.
+        assert!(
+            snap_b.cpu_micros_total > 0,
+            "expected nonzero cpu_micros for B, saw 0"
+        );
+        assert!(
+            snap_a.cpu_micros_total > snap_b.cpu_micros_total,
+            "A({} micros) should exceed B({} micros) after {n_queries}x more work",
+            snap_a.cpu_micros_total, snap_b.cpu_micros_total,
+        );
     }
 }
