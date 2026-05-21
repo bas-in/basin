@@ -26,6 +26,68 @@ the same data.
 The `data_real/` directory and `run_pg_compare.sh` are **legacy** — see
 the section below.
 
+## Unified benchmark harness (`basin-bench-harness`)
+
+As of the harness-consolidation pass, there is **one shared benchmark core**:
+the `basin-bench-harness` crate (`crates/basin-bench-harness/`). It owns engine
++ storage startup, project/table seeding, latency sampling (HDR histograms),
+threshold checking, and JSON-sidecar emission. Every profile is a thin
+`BenchConfig` builder + a list of shapes; swapping "Parquet" for "Vortex" or
+"single-instance" for "multi-instance" is a config edit, not a new test file.
+
+```sh
+# Run one profile (writes JSON into benchmark/<data_slug>/, same files the
+# dashboards already read), prints a Markdown summary to stdout:
+scripts/run-bench.sh vortex-vs-parquet
+scripts/run-bench.sh wasm --fast
+scripts/run-bench.sh all --fast > benchmark/RESULTS_harness.md
+
+# Then re-bundle so the HTML picks up the fresh JSON (unchanged step):
+python3 benchmark/bundle.py
+open benchmark/index_localfs.html
+```
+
+Registered profiles (`basin_bench_harness::profiles::all()`):
+
+| Profile | Shapes | Notes |
+|---|---|---|
+| `vortex-vs-parquet` | Parquet point-select, Vortex point-select | Vortex flag staged; engine swap gated upstream. |
+| `noisy-neighbor` | quiet-tenant p99 under noisy load | Scenarios from `docs/audits/2026-05-21-noisy-neighbor-fairness.md`. |
+| `multi-instance` | N in-process engine replicas, round-robin fanout | Surfaces the audit's P0 multi-instance gap. |
+| `wasm` | cold-start, host-roundtrip, concurrent, memory-cap, wall-timeout, componentize-js, differential | New Wasm bench family. |
+
+### Add a profile
+
+1. Add a `BenchProfile` under `crates/basin-bench-harness/src/profiles/`.
+   A profile = `(name, baseline: fn() -> BenchConfig, shapes: &[BenchShape])`.
+   Each shape's `run` closure calls a workload primitive
+   (`workload::point_select`, `workload::scan`, `workload::wasm_invoke`, …),
+   asserts a bar via `emit::BarOp`, and writes the JSON sidecar via
+   `emit::report_viability` / `emit::report_scaling`.
+2. Register it in `profiles::all()`.
+3. (Optional) Add a criterion bench under `crates/basin-bench-harness/benches/`
+   that calls the same workload primitive — both surfaces are first-class.
+
+The emitted JSON uses the **same schema** as
+`tests/integration/src/benchmark.rs`, so the existing `index_*.html` viewers
+and `bundle.py` render harness output identically — no dashboard changes. The
+harness does **not** touch `manifest.json` (the bundler still owns that).
+
+### Relationship to the integration perf tests
+
+The legacy `tests/integration/tests/{viability,scaling,s3_*}.rs` tests still
+emit their own JSONs (they remain the authoritative emitter for the 80+ cards
+under `data/`). The harness is additive: it writes the *same shape* into the
+*same directories*, so a profile run is indistinguishable from a per-test
+report. Migration of individual tests onto the harness is incremental — see
+the wrapper note at the top of `crates/basin-bench-harness/src/lib.rs`.
+
+The three criterion benches (`memtable_bench`, `query_stats_overhead`,
+`filter_eval`) are unchanged and still run via `cargo bench`; the new
+`benches/wasm_family.rs` in `basin-bench-harness` delegates to the same
+`workload::wasm_invoke` primitive the `wasm` profile uses, so `cargo bench`
+and `scripts/run-bench.sh wasm` exercise identical code.
+
 ## Use it
 
 ```sh

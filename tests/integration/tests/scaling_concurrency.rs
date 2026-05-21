@@ -1,5 +1,14 @@
 //! Scaling test 3: concurrent reader fan-out.
 //!
+//! MIGRATION NOTE (unified bench harness): the engine-setup + random-id
+//! point-query workload here is now also available as a reusable primitive
+//! in `basin_bench_harness::workload::point_select`, driven by a swappable
+//! `BenchConfig`. This test is intentionally left in place (it remains the
+//! authoritative LocalFS `scaling_concurrency` dashboard card and must not
+//! collide with the in-flight `perf_suite.rs` consolidation). New
+//! concurrency shapes should prefer a `BenchProfile` over a hand-rolled test.
+//! See `crates/basin-bench-harness/src/lib.rs` and `benchmark/README.md`.
+//!
 //! Claim: Aggregate read throughput scales as more concurrent readers are
 //! added. If contention (mutex, single-threaded executor, IO serialization)
 //! dominates, this test catches it — adding more cores wouldn't help.

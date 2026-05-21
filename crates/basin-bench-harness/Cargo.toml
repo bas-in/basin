@@ -1,0 +1,60 @@
+[package]
+name = "basin-bench-harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# Unified benchmark harness consumed by criterion benches in the workspace
+# AND by the perf integration tests under `tests/integration/tests/`.
+#
+# Read `crates/basin-bench-harness/src/lib.rs` first — it sets the scope and
+# the JSON-shape contract with `benchmark/<data_dir>/results.js`. The crate
+# intentionally pulls only the engine-level deps it needs (storage, catalog,
+# engine, fn, shard); routing/server-level deps stay outside so the harness
+# doesn't drag the whole world into a criterion build.
+
+[dependencies]
+basin-common.workspace = true
+basin-storage.workspace = true
+basin-catalog.workspace = true
+basin-engine.workspace = true
+basin-fn.workspace = true
+basin-shard.workspace = true
+basin-wal.workspace = true
+basin-hottier.workspace = true
+
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+arrow.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+object_store.workspace = true
+tracing.workspace = true
+rand.workspace = true
+anyhow.workspace = true
+# HDR histogram for accurate p50/p99/p999 across millions of samples.
+# Workspace dep would be ideal but only this crate needs it today.
+hdrhistogram = "7"
+# `wat` compiles the bundled no-op Wasm component used by the wasm bench
+# family when no real component bytes are supplied. Already a transitive dep
+# of wasmtime (via basin-fn), so no new tree.
+wat = "1"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[lib]
+path = "src/lib.rs"
+
+# Criterion bench front-end that delegates to BenchHarness so the existing
+# `cargo bench` flow stays valid AND the same code paths populate the JSON
+# dashboards under `benchmark/<data_dir>/`.
+[[bench]]
+name = "wasm_family"
+harness = false

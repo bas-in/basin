@@ -1,5 +1,14 @@
 //! Scaling test 4: multi-project interference (noisy neighbor).
 //!
+//! MIGRATION NOTE (unified bench harness): the quiet-vs-noisy degradation
+//! scenario here is also available as the `noisy-neighbor` profile in
+//! `basin_bench_harness::profiles::noisy_neighbor`, which additionally
+//! scaffolds the further axes from
+//! `docs/audits/2026-05-21-noisy-neighbor-fairness.md` (cost-limit-off,
+//! catalog-mutex contention, quiet-tenant scaling). This test stays in place
+//! as the authoritative LocalFS `scaling_noisy_neighbor` card; new fairness
+//! scenarios should land as harness profile shapes. See `benchmark/README.md`.
+//!
 //! Claim: A heavy "noisy" project doesn't crater a quiet project's latency.
 //!
 //! Honest expectation: in this single-process PoC, where every project
