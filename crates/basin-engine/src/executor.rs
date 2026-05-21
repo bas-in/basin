@@ -1384,6 +1384,15 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
 
             if var_name == "search_path" {
                 crate::schema_ddl::exec_set_search_path(sess, &values)
+            } else if var_name == "statement_timeout" {
+                // Wire `SET statement_timeout = …` to the per-session override.
+                // Accept both string literals ('5s', '500ms') and bare integers (5000).
+                let raw = values
+                    .first()
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                crate::session::set_statement_timeout(&sess.state, &raw)?;
+                Ok(ExecResult::Empty { tag: "SET".into() })
             } else {
                 // Silently accept unknown SET variables.
                 Ok(ExecResult::Empty { tag: "SET".into() })
@@ -1581,6 +1590,20 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                 .to_ascii_lowercase();
             if var_name == "search_path" {
                 crate::schema_ddl::exec_show_search_path(sess)
+            } else if var_name == "statement_timeout" {
+                let val = crate::session::show_statement_timeout(&sess.state);
+                let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                    "statement_timeout",
+                    arrow_schema::DataType::Utf8,
+                    false,
+                )]));
+                let col: ArrayRef = Arc::new(StringArray::from(vec![val]));
+                let batch = RecordBatch::try_new(schema.clone(), vec![col])
+                    .map_err(|e| BasinError::internal(format!("SHOW statement_timeout: {e}")))?;
+                Ok(ExecResult::Rows {
+                    schema: Arc::new(crate::convert::schema_df_to_ws(&schema)?),
+                    batches: vec![batch],
+                })
             } else {
                 // Silently return empty for other SHOW <var> forms so
                 // ORM startup queries don't hard-fail.
@@ -4626,10 +4649,10 @@ async fn exec_select(
     // deadline is a single comparison set up once — it is NOT a per-row check,
     // so a normal sub-timeout query sees no latency regression. `None` (env
     // `BASIN_STATEMENT_TIMEOUT_MS=0`) disables the guard for back-compat.
-    let timeout = crate::session::statement_timeout();
+    let timeout = crate::session::session_statement_timeout(&sess.state);
     let canceled = || {
         BasinError::query_canceled(match timeout {
-            Some(d) => format!("exceeded BASIN_STATEMENT_TIMEOUT_MS ({} ms)", d.as_millis()),
+            Some(d) => format!("exceeded statement_timeout ({} ms)", d.as_millis()),
             None => "exceeded statement timeout".to_owned(),
         })
     };

@@ -1,0 +1,46 @@
+# docker-compose.template.yml — ephemeral Basin instance for migration-tool tests
+#
+# Per-tool tests (5.25.B–F) copy/symlink this template into a temporary
+# directory, substitute the two placeholders, then run `docker-compose up -d`
+# to get a fully isolated Basin instance accepting pgwire connections.
+#
+# Placeholders (substitute before use):
+#   {{PGWIRE_PORT}}   — host-side port Basin will listen on (pick a free port,
+#                       e.g. via `python3 -c "import socket; s=socket.socket();
+#                       s.bind(('',0)); print(s.getsockname()[1]); s.close()"`)
+#   {{PROJECT_NAME}}  — the pgwire "username" / project slug, e.g. "alice"
+#
+# Usage from a per-tool Rust test:
+#   1. Write the rendered YAML to a temp directory.
+#   2. docker-compose -f <tempdir>/docker-compose.yml up -d
+#   3. Connect with tokio-postgres at 127.0.0.1:{{PGWIRE_PORT}} user={{PROJECT_NAME}}
+#   4. Run migration tool commands against that DSN.
+#   5. Call migration_tool_common helpers to introspect / diff schema.
+#   6. docker-compose -f <tempdir>/docker-compose.yml down -v  (teardown)
+
+version: "3.9"
+
+services:
+  basin:
+    # Use the locally-built basin-server image. The image is expected to be
+    # built before the test runs (CI: `docker build -t basin-server .`).
+    # Override with BASIN_IMAGE env var to test against a pinned release tag.
+    image: ${BASIN_IMAGE:-basin-server:latest}
+    restart: "no"
+    environment:
+      BASIN_BIND: "0.0.0.0:5432"
+      # In-memory catalog — no durable state needed for migration-tool tests.
+      BASIN_CATALOG: "memory"
+      # Allow any password for the test project so migration tools that require
+      # a non-empty password string can connect without extra config.
+      BASIN_PROJECTS: "{{PROJECT_NAME}}=*"
+      RUST_LOG: "warn"
+    ports:
+      - "{{PGWIRE_PORT}}:5432"
+    healthcheck:
+      # Poll the pgwire port until Basin accepts TCP connections.
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 5432 || exit 1"]
+      interval: 1s
+      timeout: 3s
+      retries: 15
+      start_period: 3s
