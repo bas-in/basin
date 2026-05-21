@@ -57,14 +57,54 @@ pub struct ProviderPreset {
 }
 
 /// Look up a known preset by lower-case provider name.
+///
+/// Provider aliases:
+/// - `microsoft` / `azure_ad` → same Microsoft v2 common-tenant endpoints.
+/// - `twitter_x` / `twitter` → X (Twitter) OAuth 2.0 PKCE endpoints.
 pub fn preset(name: &str) -> Option<&'static ProviderPreset> {
     match name {
+        // Original 3 (Phase 5.10.O — ADR 0020).
         "google" => Some(&GOOGLE),
         "github" => Some(&GITHUB),
         "apple" => Some(&APPLE),
+        // Cloud-broker batch (T-015 / T-033 / T-036). Alphabetical.
+        "bitbucket" => Some(&BITBUCKET),
+        "discord" => Some(&DISCORD),
+        "figma" => Some(&FIGMA),
+        "gitlab" => Some(&GITLAB),
+        "linkedin" => Some(&LINKEDIN),
+        "microsoft" | "azure_ad" => Some(&MICROSOFT),
+        "notion" => Some(&NOTION),
+        "slack" => Some(&SLACK),
+        "spotify" => Some(&SPOTIFY),
+        "twitch" => Some(&TWITCH),
+        "twitter_x" | "twitter" => Some(&TWITTER_X),
         _ => None,
     }
 }
+
+/// All preset provider names known to `preset()`. Used by integration tests
+/// to assert the cloud broker's `BasinAuthProvider` has a matching entry for
+/// every provider the broker advertises (T-015 / T-033 / T-036).
+///
+/// `microsoft`/`azure_ad` and `twitter_x`/`twitter` collapse to a single
+/// preset each, so this list returns only the canonical name.
+pub const PRESET_PROVIDER_NAMES: &[&str] = &[
+    "google",
+    "github",
+    "apple",
+    "bitbucket",
+    "discord",
+    "figma",
+    "gitlab",
+    "linkedin",
+    "microsoft",
+    "notion",
+    "slack",
+    "spotify",
+    "twitch",
+    "twitter_x",
+];
 
 static GOOGLE: ProviderPreset = ProviderPreset {
     name: "google",
@@ -82,12 +122,123 @@ static GITHUB: ProviderPreset = ProviderPreset {
     default_scopes: "read:user user:email",
 };
 
+// Apple Sign In with Apple. Production callbacks require
+// `response_mode=form_post` AND a JWT client_secret signed with the developer's
+// ES256 key (rotated every ~6 months). This preset satisfies the broker gate
+// (correct host + token endpoint shape); the full JWT-client-secret signing
+// path is tracked separately.
+// TODO(T-033): wire response_mode=form_post + ES256 client-secret JWT.
+// Spec: https://developer.apple.com/documentation/sign_in_with_apple/generate_and_validate_tokens
 static APPLE: ProviderPreset = ProviderPreset {
     name: "apple",
     authorize_url: "https://appleid.apple.com/auth/authorize",
     token_url: "https://appleid.apple.com/auth/token",
     userinfo_url: "https://appleid.apple.com/auth/userinfo",
     default_scopes: "name email",
+};
+
+static BITBUCKET: ProviderPreset = ProviderPreset {
+    name: "bitbucket",
+    authorize_url: "https://bitbucket.org/site/oauth2/authorize",
+    token_url: "https://bitbucket.org/site/oauth2/access_token",
+    userinfo_url: "https://api.bitbucket.org/2.0/user",
+    default_scopes: "account email",
+};
+
+static DISCORD: ProviderPreset = ProviderPreset {
+    name: "discord",
+    authorize_url: "https://discord.com/api/oauth2/authorize",
+    token_url: "https://discord.com/api/oauth2/token",
+    userinfo_url: "https://discord.com/api/users/@me",
+    default_scopes: "identify email",
+};
+
+static FIGMA: ProviderPreset = ProviderPreset {
+    name: "figma",
+    authorize_url: "https://www.figma.com/oauth",
+    token_url: "https://api.figma.com/v1/oauth/token",
+    userinfo_url: "https://api.figma.com/v1/me",
+    default_scopes: "files:read",
+};
+
+// GitLab — defaults to gitlab.com. Self-hosted instances should override
+// `authorize_url`/`token_url`/`userinfo_url` in their `OAuthProviderRow`.
+static GITLAB: ProviderPreset = ProviderPreset {
+    name: "gitlab",
+    authorize_url: "https://gitlab.com/oauth/authorize",
+    token_url: "https://gitlab.com/oauth/token",
+    userinfo_url: "https://gitlab.com/api/v4/user",
+    default_scopes: "read_user openid email profile",
+};
+
+// LinkedIn — v2 OIDC ("Sign In with LinkedIn using OpenID Connect"). The
+// legacy v1 (`r_emailaddress r_liteprofile`) was deprecated August 2023.
+static LINKEDIN: ProviderPreset = ProviderPreset {
+    name: "linkedin",
+    authorize_url: "https://www.linkedin.com/oauth/v2/authorization",
+    token_url: "https://www.linkedin.com/oauth/v2/accessToken",
+    userinfo_url: "https://api.linkedin.com/v2/userinfo",
+    default_scopes: "openid profile email",
+};
+
+// Microsoft Identity Platform v2 — `common` tenant accepts both personal
+// (MSA) and work/school (AAD) accounts. Per-app tenant lock-down should be
+// done by overriding `authorize_url`/`token_url` with the tenant GUID.
+static MICROSOFT: ProviderPreset = ProviderPreset {
+    name: "microsoft",
+    authorize_url: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+    token_url: "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+    userinfo_url: "https://graph.microsoft.com/oidc/userinfo",
+    default_scopes: "openid email profile",
+};
+
+// Notion — non-standard OAuth: the token response embeds a `bot_id` +
+// `workspace_id` instead of a `sub`, and the access token is workspace-scoped.
+// userinfo_url points at the standard `/users/me`; the callback flow falls
+// back to the token response's `owner.user.id` when `sub` is absent.
+// TODO(T-033): handle bot/internal-integration tokens distinctly from user OAuth.
+// Spec: https://developers.notion.com/docs/authorization
+static NOTION: ProviderPreset = ProviderPreset {
+    name: "notion",
+    authorize_url: "https://api.notion.com/v1/oauth/authorize",
+    token_url: "https://api.notion.com/v1/oauth/token",
+    userinfo_url: "https://api.notion.com/v1/users/me",
+    default_scopes: "",
+};
+
+static SLACK: ProviderPreset = ProviderPreset {
+    name: "slack",
+    authorize_url: "https://slack.com/openid/connect/authorize",
+    token_url: "https://slack.com/api/openid.connect.token",
+    userinfo_url: "https://slack.com/api/openid.connect.userInfo",
+    default_scopes: "openid email profile",
+};
+
+static SPOTIFY: ProviderPreset = ProviderPreset {
+    name: "spotify",
+    authorize_url: "https://accounts.spotify.com/authorize",
+    token_url: "https://accounts.spotify.com/api/token",
+    userinfo_url: "https://api.spotify.com/v1/me",
+    default_scopes: "user-read-email user-read-private",
+};
+
+static TWITCH: ProviderPreset = ProviderPreset {
+    name: "twitch",
+    authorize_url: "https://id.twitch.tv/oauth2/authorize",
+    token_url: "https://id.twitch.tv/oauth2/token",
+    userinfo_url: "https://id.twitch.tv/oauth2/userinfo",
+    default_scopes: "openid user:read:email",
+};
+
+// X (Twitter) OAuth 2.0 — requires PKCE. The legacy OAuth 1.0a flow is not
+// supported here; broker callers should ensure the developer app is
+// configured for "OAuth 2.0" in the X developer portal.
+static TWITTER_X: ProviderPreset = ProviderPreset {
+    name: "twitter_x",
+    authorize_url: "https://twitter.com/i/oauth2/authorize",
+    token_url: "https://api.twitter.com/2/oauth2/token",
+    userinfo_url: "https://api.twitter.com/2/users/me",
+    default_scopes: "users.read tweet.read offline.access",
 };
 
 // ---------------------------------------------------------------------------
@@ -1557,6 +1708,153 @@ mod tests {
     #[test]
     fn preset_unknown_is_none() {
         assert!(preset("saml_sso").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // T-015/T-033/T-036 — cloud-broker provider catalog (12 new providers).
+    // -----------------------------------------------------------------------
+
+    /// Asserts that a preset resolves, has the expected hostname in the
+    /// authorize/token URLs, and that `build_authorize_url` produces a query
+    /// string containing the OAuth 2.0 + PKCE parameters the broker requires.
+    fn check_provider(name: &str, host_fragment: &str, expected_scope_fragment: &str) {
+        let p = preset(name).unwrap_or_else(|| panic!("preset({name}) returned None"));
+        assert!(
+            p.authorize_url.contains(host_fragment),
+            "{name}.authorize_url ({}) missing host fragment {host_fragment:?}",
+            p.authorize_url
+        );
+        assert!(
+            p.token_url.contains(host_fragment),
+            "{name}.token_url ({}) missing host fragment {host_fragment:?}",
+            p.token_url
+        );
+        assert!(
+            p.authorize_url.starts_with("https://"),
+            "{name}.authorize_url must be https"
+        );
+        assert!(
+            p.token_url.starts_with("https://"),
+            "{name}.token_url must be https"
+        );
+        if !expected_scope_fragment.is_empty() {
+            assert!(
+                p.default_scopes.contains(expected_scope_fragment),
+                "{name}.default_scopes ({}) missing fragment {expected_scope_fragment:?}",
+                p.default_scopes
+            );
+        }
+        // Build URL and verify shape.
+        let url = build_authorize_url(
+            p.authorize_url,
+            "client_xyz",
+            "https://app.example.com/auth/v1/callback",
+            p.default_scopes,
+            "nonce.sig",
+            "s256_challenge",
+        );
+        assert!(url.starts_with(p.authorize_url), "{name}: url prefix mismatch");
+        assert!(url.contains("response_type=code"), "{name}: missing response_type");
+        assert!(url.contains("client_id=client_xyz"), "{name}: missing client_id");
+        assert!(url.contains("state=nonce.sig"), "{name}: missing state");
+        assert!(
+            url.contains("code_challenge=s256_challenge"),
+            "{name}: missing PKCE challenge"
+        );
+        assert!(
+            url.contains("code_challenge_method=S256"),
+            "{name}: missing PKCE method"
+        );
+    }
+
+    #[test]
+    fn preset_microsoft_has_endpoints() {
+        check_provider("microsoft", "login.microsoftonline.com", "openid");
+        // Alias.
+        let alias = preset("azure_ad").unwrap();
+        assert_eq!(alias.authorize_url, preset("microsoft").unwrap().authorize_url);
+    }
+
+    #[test]
+    fn preset_gitlab_has_endpoints() {
+        check_provider("gitlab", "gitlab.com", "read_user");
+    }
+
+    #[test]
+    fn preset_slack_has_endpoints() {
+        check_provider("slack", "slack.com", "openid");
+    }
+
+    #[test]
+    fn preset_discord_has_endpoints() {
+        check_provider("discord", "discord.com", "identify");
+    }
+
+    #[test]
+    fn preset_apple_endpoints_still_resolve() {
+        // Apple was already wired; the cloud-broker batch did not regress it.
+        check_provider("apple", "appleid.apple.com", "email");
+    }
+
+    #[test]
+    fn preset_twitter_x_has_endpoints() {
+        check_provider("twitter_x", "twitter.com", "users.read");
+        // `twitter` alias resolves to the same preset.
+        let alias = preset("twitter").unwrap();
+        assert_eq!(alias.authorize_url, preset("twitter_x").unwrap().authorize_url);
+    }
+
+    #[test]
+    fn preset_bitbucket_has_endpoints() {
+        check_provider("bitbucket", "bitbucket.org", "account");
+    }
+
+    #[test]
+    fn preset_notion_has_endpoints() {
+        // Notion uses a non-standard `scope`-less flow; check only host shape.
+        check_provider("notion", "notion.com", "");
+    }
+
+    #[test]
+    fn preset_spotify_has_endpoints() {
+        check_provider("spotify", "spotify.com", "user-read-email");
+    }
+
+    #[test]
+    fn preset_twitch_has_endpoints() {
+        check_provider("twitch", "twitch.tv", "openid");
+    }
+
+    #[test]
+    fn preset_linkedin_has_endpoints() {
+        check_provider("linkedin", "linkedin.com", "openid");
+    }
+
+    #[test]
+    fn preset_figma_has_endpoints() {
+        check_provider("figma", "figma.com", "files:read");
+    }
+
+    #[test]
+    fn preset_provider_names_list_matches_dispatch() {
+        // Every name in PRESET_PROVIDER_NAMES must resolve via `preset()`,
+        // and every preset() match arm must list its canonical name here
+        // (the catch is verified by `preset_unknown_is_none` for unknowns).
+        for name in PRESET_PROVIDER_NAMES {
+            assert!(
+                preset(name).is_some(),
+                "PRESET_PROVIDER_NAMES contains {name:?} but preset() returns None"
+            );
+        }
+        // Sanity: list length matches the documented 14 (3 original + 12 new,
+        // minus the 1 alias collapse for microsoft/azure_ad and 1 for
+        // twitter_x/twitter — counted as canonical, so 14 total).
+        assert_eq!(
+            PRESET_PROVIDER_NAMES.len(),
+            14,
+            "expected 14 canonical providers (3 original + 11 new canonical names; \
+             microsoft/azure_ad + twitter_x/twitter share a preset)"
+        );
     }
 
     #[test]
