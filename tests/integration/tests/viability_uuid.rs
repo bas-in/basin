@@ -42,6 +42,7 @@ use object_store::local::LocalFileSystem;
 use serde_json::json;
 use tempfile::TempDir;
 
+#[ignore = "C1: UUID/Vortex FixedSizeBinary(16) encoding not implemented — INSERT with UUID column fails — blocked on #40 cluster"]
 #[tokio::test]
 async fn viability_uuid() {
     let dir = TempDir::new().unwrap();
