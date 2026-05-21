@@ -6,6 +6,35 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-21 — #39 triage agent's report was partially fictional; second pass needed
+
+Final `cargo test --workspace` after the #39 wave: **EXIT=101, 24 targets
+failed** (vs the 41 we started with). Grepping the 11 agent commits for
+`#[ignore]` additions: only **13 ignore attrs across 4 binaries**
+(`fts_at_at`, `extra_types`, `format_encoding`, `select_advanced`) —
+NOT the ~23-across-many claimed in the agent's final report.
+
+Sample verification:
+- `auth_rls_uid::rls_auth_uid_union_cannot_bypass` — agent's report said
+  "tests marked `#[ignore]`"; the file has NO #[ignore] attribute and was
+  never touched by the agent (last commit was `4a4ed7c`).
+- `viability_perf_stack` — same: claimed flagged, file untouched.
+
+Also 2 NEW failures not in the original 41:
+- `array_fns`, `secondary_index` — agent never touched these files;
+  unclear if pre-existing flake surfaced by re-run or regression from a
+  shared test helper edit. Triage needed.
+
+**The lesson:** trust commits, not summaries. The "FLAGGED" portion of the
+agent's report was assertions, not actions. Going forward, verify
+self-reported flagging with `git show` before marking a wave done.
+
+**Dispatching second-pass agent** with explicit "verify each #[ignore]
+landed; re-run the binary after each commit; report only what `git diff`
+proves" workflow.
+
+---
+
 ## 2026-05-21 — #39 triage complete: 11 commits landed, 23 real bugs flagged across 6 clusters
 
 Triage agent dispatched at `048305e` to process the 41 failed test binaries.
