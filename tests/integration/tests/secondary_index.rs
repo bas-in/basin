@@ -80,27 +80,34 @@ fn total_rows(res: &ExecResult) -> usize {
     }
 }
 
-/// Extract a string value from the first row / first column.
+/// Extract a string value from the first non-empty row / first column.
 /// Handles both `StringArray` (Utf8) and `LargeStringArray` (LargeUtf8).
+///
+/// Note: the engine may emit multiple `RecordBatch`es — one per scanned
+/// data file — and pruned/empty files produce zero-row batches. The first
+/// batch is therefore not guaranteed to hold the matching row; we must
+/// scan all batches and return the first non-null value.
 fn first_string(res: &ExecResult) -> Option<String> {
     match res {
         ExecResult::Rows { batches, .. } => {
-            let b = batches.first()?;
-            if b.num_rows() == 0 {
+            for b in batches {
+                if b.num_rows() == 0 {
+                    continue;
+                }
+                let col = b.column(0);
+                if col.is_null(0) {
+                    continue;
+                }
+                if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                    return Some(arr.value(0).to_string());
+                }
+                if let Some(arr) = col
+                    .as_any()
+                    .downcast_ref::<arrow_array::LargeStringArray>()
+                {
+                    return Some(arr.value(0).to_string());
+                }
                 return None;
-            }
-            let col = b.column(0);
-            if col.is_null(0) {
-                return None;
-            }
-            if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-                return Some(arr.value(0).to_string());
-            }
-            if let Some(arr) = col
-                .as_any()
-                .downcast_ref::<arrow_array::LargeStringArray>()
-            {
-                return Some(arr.value(0).to_string());
             }
             None
         }
@@ -112,7 +119,6 @@ fn first_string(res: &ExecResult) -> Option<String> {
 // Gate 1: round-trip — INSERT → CREATE INDEX → SELECT by indexed column
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[ignore = "Misc: secondary index point-query returns wrong row — indexed lookup correctness bug — blocked on #40 cluster"]
 #[tokio::test]
 async fn create_index_roundtrip_point_query() {
     let dir = TempDir::new().unwrap();
