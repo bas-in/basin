@@ -6,6 +6,49 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-22 — Shared-tree waves: 5.23 admin views, 5.20.E + 5.24.D index structures, 5.24 range types, ADR 0025
+
+Back to file-disjoint shared-tree waves (no worktrees). Each coherence-gated
+(`cargo build --workspace` + targeted regression) green; no regressions.
+
+- `7b8b59f` **5.23.B/C/D** — EXPLAIN ANALYZE (real per-node metrics via DataFusion
+  analyze-mode), `pg_stat_activity` (project-scoped, new `connection_registry.rs`),
+  `pg_locks` (project-scoped, new `basin-shard/lock_registry.rs` observing
+  `lock_wait.rs`). Added `rewrite_unqualified_pg_catalog_views()` qualifying
+  `FROM pg_locks` etc. (27 views) — regression-checked clean against noop_accept.
+  `explain_pg_stat_harness` 5 pass / 2 ignored. **5.23 done.**
+- `91e937d` **5.20.E** GIN-on-tsvector posting-list builder (`basin-storage/index/
+  gin_tsvector.rs`) — storage structure + API + 13 unit tests; engine `@@`-probe
+  wiring deferred (`// TODO(5.20.E-wiring)`). PARTIAL. + **ADR 0025** (PG-compat
+  surface decisions 5.19–5.30; the unifying BASIN_TYPE-sidecar + shared GIN +
+  test-first-harness + single-point-SQLSTATE themes).
+- `0c3e438` **5.24.B/C** range types (int4/int8/num/ts/tstz/daterange as Utf8 +
+  BASIN_TYPE JSON repr) + operators (`@>`,`<@`,`&&`,`<<`,`>>`,`-|-`,`+`,`*`,`-`).
+  Also fixed real rewrite-pipeline bugs (range literals must skip JSON/array
+  rewrites; `r @> 5` → range_contains_elem; INSERT-SELECT nextval for omitted
+  SERIAL). `range_types_harness` 4 pass / 2 ignored. **5.24.B/C done.** 5.24.D
+  interval-tree index structure landed (`basin-storage/index/interval.rs`) but
+  engine-probe wiring deferred → PARTIAL.
+- `902fa04` CAPABILITIES.md refreshed (honest with-caveats rows for all the above).
+
+**DEFERRED-WIRING backlog (consolidate into one focused engine wave later):** the
+GIN-JSONB (5.19.C), GIN-tsvector (5.20.E), and interval (5.24.D) index probes all
+landed as advisory/standalone structures NOT yet wired into the DataFusion physical
+scan to actually prune files. Closing them flips the perf-gate / index-latency
+slices. They all touch the engine scan path → must be ONE engine agent.
+
+**DISK:** test-binary builds drove free space to 4.8GB (100% full). `find
+target/debug/deps -name "*.rcgu.o" -delete` + `rm -rf target/debug/incremental`
+reclaimed 65GB. RULE: run this between waves when `df` < ~15GB. Do NOT use
+`--all-targets` (builds all ~200 integration binaries at once → blows disk); build
+the workspace libs/bins for coherence + run only the targeted/affected harnesses.
+
+**Commit-race recurrence:** the 5.32.B/5.25.G and 5.20.E/ADR pairs again interleaved
+`git commit`s (files mis-attributed across commits) — content never lost, swept up
+after. Confirms: for purely-disjoint file sets it's benign; just verify+sweep.
+
+---
+
 ## 2026-05-21 — Worktree-isolation wave EXHAUSTED THE DISK; recovered citext + timeouts via manual merge
 
 **What happened.** To parallelize two `basin-engine` phases (5.30 citext, 5.28.B/C/D
