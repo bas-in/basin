@@ -62,6 +62,101 @@ pub type ChannelName = String;
 pub type ClientId = String;
 
 // ---------------------------------------------------------------------------
+// Trust-boundary limits (6.SEC.P1)
+// ---------------------------------------------------------------------------
+
+/// Maximum serialized size (in bytes) of presence `metadata` accepted from a
+/// client. Anything larger is rejected before being stored or broadcast, to
+/// bound per-`track` fanout cost. 4 KiB is generous for status payloads
+/// (cursor position, typing flag, display name, avatar URL).
+pub const MAX_METADATA_BYTES: usize = 4 * 1024;
+
+/// Why a presence `track`/`untrack`/`heartbeat` request was rejected.
+///
+/// The presence identity (`client_id`) is bound to the connection's
+/// authenticated session: a client must not be able to act as another
+/// `client_id`. See [`authorize_client_id`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PresenceRejection {
+    /// The wire-supplied `client_id` does not match the connection's
+    /// authenticated identity (impersonation attempt).
+    ClientIdMismatch {
+        /// Identity proven by the connection's JWT.
+        authenticated: ClientId,
+        /// Identity the client tried to claim.
+        requested: ClientId,
+    },
+    /// The serialized `metadata` exceeds [`MAX_METADATA_BYTES`].
+    MetadataTooLarge {
+        /// Actual serialized size in bytes.
+        size: usize,
+        /// The enforced limit.
+        limit: usize,
+    },
+}
+
+impl PresenceRejection {
+    /// Stable machine-readable error code for the WS `error` frame.
+    pub fn code(&self) -> &'static str {
+        match self {
+            PresenceRejection::ClientIdMismatch { .. } => "presence_client_id_forbidden",
+            PresenceRejection::MetadataTooLarge { .. } => "presence_metadata_too_large",
+        }
+    }
+
+    /// Human-readable description for the WS `error` frame.
+    pub fn message(&self) -> String {
+        match self {
+            PresenceRejection::ClientIdMismatch { authenticated, .. } => format!(
+                "presence client_id must match the authenticated session identity ({authenticated})"
+            ),
+            PresenceRejection::MetadataTooLarge { size, limit } => {
+                format!("presence metadata of {size} bytes exceeds the {limit}-byte limit")
+            }
+        }
+    }
+}
+
+/// Bind a wire-supplied `client_id` to the connection's authenticated identity.
+///
+/// The presence identity is derived from the connection's auth context (the
+/// JWT-proven `user_id`), never trusted from the wire. A client may either:
+/// - omit / supply its own authenticated identity, or
+/// - supply nothing meaningful — but it must NOT claim a different identity.
+///
+/// Returns the identity to use on success, or [`PresenceRejection::ClientIdMismatch`]
+/// when the client tries to act as someone else.
+pub fn authorize_client_id<'a>(
+    authenticated: &'a str,
+    requested: &str,
+) -> Result<&'a str, PresenceRejection> {
+    if requested.is_empty() || requested == authenticated {
+        Ok(authenticated)
+    } else {
+        Err(PresenceRejection::ClientIdMismatch {
+            authenticated: authenticated.to_owned(),
+            requested: requested.to_owned(),
+        })
+    }
+}
+
+/// Reject presence `metadata` whose serialized form exceeds
+/// [`MAX_METADATA_BYTES`]. Returns `Ok(())` for in-bounds payloads.
+pub fn validate_metadata_size(metadata: &serde_json::Value) -> Result<(), PresenceRejection> {
+    // Use the compact serialized length as the canonical size measure; this is
+    // what would actually be broadcast to subscribers.
+    let size = serde_json::to_vec(metadata).map(|v| v.len()).unwrap_or(0);
+    if size > MAX_METADATA_BYTES {
+        Err(PresenceRejection::MetadataTooLarge {
+            size,
+            limit: MAX_METADATA_BYTES,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
@@ -671,6 +766,71 @@ mod tests {
         assert_eq!(v["type"], "presence_state");
         assert_eq!(v["channel"], "room:1");
         assert_eq!(v["presences"][0]["client_id"], "c1");
+    }
+
+    // --- 6.SEC.P1: client_id binding + metadata cap -----------------------
+
+    #[test]
+    fn forged_client_id_is_rejected() {
+        // Alice's connection (authenticated as "alice") tries to act as "bob".
+        let err = authorize_client_id("alice", "bob").unwrap_err();
+        assert_eq!(
+            err,
+            PresenceRejection::ClientIdMismatch {
+                authenticated: "alice".to_owned(),
+                requested: "bob".to_owned(),
+            }
+        );
+        assert_eq!(err.code(), "presence_client_id_forbidden");
+    }
+
+    #[test]
+    fn self_track_is_authorized() {
+        // Supplying your own identity is fine and returns it unchanged.
+        assert_eq!(authorize_client_id("alice", "alice").unwrap(), "alice");
+    }
+
+    #[test]
+    fn empty_client_id_normalizes_to_authenticated_identity() {
+        // An omitted/empty wire client_id falls back to the authenticated id,
+        // never to an attacker-chosen value.
+        assert_eq!(authorize_client_id("alice", "").unwrap(), "alice");
+    }
+
+    #[test]
+    fn small_metadata_is_accepted() {
+        let meta = serde_json::json!({"name": "Alice", "typing": true});
+        assert!(validate_metadata_size(&meta).is_ok());
+    }
+
+    #[test]
+    fn oversized_metadata_is_rejected() {
+        // ~8 KiB string payload — comfortably over the 4 KiB cap.
+        let big = "x".repeat(8 * 1024);
+        let meta = serde_json::json!({ "blob": big });
+        let err = validate_metadata_size(&meta).unwrap_err();
+        match err {
+            PresenceRejection::MetadataTooLarge { size, limit } => {
+                assert!(size > MAX_METADATA_BYTES);
+                assert_eq!(limit, MAX_METADATA_BYTES);
+            }
+            other => panic!("expected MetadataTooLarge, got {other:?}"),
+        }
+        assert_eq!(
+            validate_metadata_size(&meta).unwrap_err().code(),
+            "presence_metadata_too_large"
+        );
+    }
+
+    #[test]
+    fn metadata_exactly_at_limit_is_accepted() {
+        // Build a payload whose serialized form is exactly at the boundary.
+        // {"blob":"<N x>"} — overhead is 11 bytes for the wrapper.
+        let overhead = r#"{"blob":""}"#.len();
+        let fill = MAX_METADATA_BYTES - overhead;
+        let meta = serde_json::json!({ "blob": "x".repeat(fill) });
+        assert_eq!(serde_json::to_vec(&meta).unwrap().len(), MAX_METADATA_BYTES);
+        assert!(validate_metadata_size(&meta).is_ok());
     }
 
     #[test]
