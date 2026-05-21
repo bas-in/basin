@@ -10,11 +10,15 @@
 pub mod error;
 pub mod events;
 pub mod ids;
+pub mod project_counters;
 pub mod telemetry;
 
 pub use error::{BasinError, Result};
 pub use events::{ChangeEvent, ChangeEventSink, ChangeOp, EventSinkRegistry};
 pub use ids::{
     Ident, PartitionKey, ProjectId, QualifiedTableName, SchemaName, TableName, MAX_IDENT_LEN,
+};
+pub use project_counters::{
+    AcquireResult, CapLabel, HistogramSnapshot, LeaseMetrics, RenewResult, ReplicaLeaseSnapshot,
 };
 pub use telemetry::{ProjectCounterRegistry, ProjectCounters, ProjectCountersSnapshot};

@@ -96,6 +96,13 @@ pub struct ShardConfig {
     /// [`basin_catalog::SliceBudgetView::slice_for_sync`] and don't need
     /// the gate refill.
     pub slice_gates: Vec<basin_catalog::SliceGate>,
+    /// Phase 6.X.F — optional lease observability sink (ADR 0023). When
+    /// attached, the lease acquire / renew / heartbeat sites bump the
+    /// corresponding counters; absent it, the metric emission sites are
+    /// no-ops (zero-cost back-compat). One handle per process; consumers
+    /// snapshot it via [`basin_common::LeaseMetrics::snapshot_replicas`]
+    /// and [`basin_common::LeaseMetrics::snapshot_over_cap`].
+    pub lease_metrics: Option<Arc<basin_common::LeaseMetrics>>,
 }
 
 impl ShardConfig {
@@ -126,7 +133,18 @@ impl ShardConfig {
             budget_coordinator: None,
             slice_views: Vec::new(),
             slice_gates: Vec::new(),
+            lease_metrics: None,
         }
+    }
+
+    /// Phase 6.X.F — attach the observability sink. The lease event sites
+    /// then bump counters on `lease_metrics`; consumers (basin-cloud
+    /// exporter, `/metrics` endpoint) snapshot via
+    /// [`basin_common::LeaseMetrics::snapshot_replicas`]. Optional —
+    /// shards without a metrics handle behave identically.
+    pub fn with_lease_metrics(mut self, metrics: Arc<basin_common::LeaseMetrics>) -> Self {
+        self.lease_metrics = Some(metrics);
+        self
     }
 
     /// Phase 6.X.D — attach a budget coordinator + the cap consumers'
@@ -280,6 +298,34 @@ impl Shard {
         self.inner.set_top_pattern_provider(provider);
     }
 
+    /// Phase 6.X.C (ADR 0023) — voluntarily hand off the lease for
+    /// `(project, partition)` to `to_holder`. While the handoff is in
+    /// progress new writes against this partition fail with
+    /// [`basin_common::BasinError::LeaseHandoffInProgress`] so the router
+    /// can retry against the new owner; reads continue. On completion the
+    /// outgoing replica releases the lease, the candidate `acquire`s under
+    /// a fresh epoch, and replay of the WAL on the new owner picks up any
+    /// post-handoff entries.
+    ///
+    /// Target: **< 500 ms p99 stall** for the yielded partition
+    /// (small-memtable case). Larger memtables are dominated by the
+    /// cold-tier write step; operators should size partitions accordingly.
+    /// See the `InProcessShard::yield_partition` docstring for the full
+    /// state machine.
+    ///
+    /// No-op (returns `Ok`) if this replica doesn't hold the lease, or if
+    /// no lease registry is configured.
+    pub async fn yield_partition(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        to_holder: &str,
+    ) -> Result<()> {
+        self.inner
+            .yield_partition(project, partition, to_holder)
+            .await
+    }
+
     /// Test-only: pull out the concrete in-process implementation so the
     /// inline tests can drive its synchronous helpers. Returns `None` if a
     /// future backend swap replaces the in-process map.
@@ -393,6 +439,16 @@ pub(crate) trait ShardImpl: Send + Sync {
     }
     /// Phase 5.14.D2: register the top-pattern provider. Default no-op.
     fn set_top_pattern_provider(&self, _provider: Arc<dyn TopPatternProvider>) {}
+    /// Phase 6.X.C — voluntary lease handoff. Default returns Ok (a backend
+    /// that doesn't model leases has nothing to hand off).
+    async fn yield_partition(
+        &self,
+        _project: &ProjectId,
+        _partition: &PartitionKey,
+        _to_holder: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
     /// Test-only downcast for the inline test suite.
     #[cfg(test)]
     fn as_in_process(&self) -> Option<Arc<in_process::InProcessShard>> {

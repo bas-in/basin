@@ -32,6 +32,7 @@ unified nav tree; GitHub renders it for humans browsing `docs/`.
 - [Wasm functions: authoring, ABI, deploy, limits](functions.md) — TypeScript HTTP handlers compiled to WebAssembly and run inside Basin under per-invocation CPU, memory, wall-clock, and per-project concurrency caps. Authoring, host ABI, deploy, limits.
 - [Scaling: object storage](scaling/object-storage.md) — How Basin scales storage and what to expect from S3/GCS/MinIO at different sizes.
 - [Scaling: read replicas](scaling/read-replicas.md) — Read-replica architecture, replication lag, fail-over story, and what's deferred to Phase 6.
+- [Lease ownership — operator runbook](operators/lease-ownership.md) — Day-2 ops guide for ADR 0023 lease-based ownership: how it works, how to query lease state, how to rebalance hot replicas, when to bump partition count, and the stuck-lease incident playbook.
 - [Scaling: shard rebalancing](scaling/shard-rebalance.md) — How shards split, merge, and migrate; the operator-visible touchpoints.
 
 ## Architecture decisions (ADRs)

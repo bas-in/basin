@@ -2040,11 +2040,29 @@ Sequencing: **A → B**, **A → D**, **B → C**, **A–D → E + F**.
       fencing test (force a partition; verify loser's WAL appends are
       rejected); network-partition simulator. **Depends on A–D.** Files:
       `tests/integration/tests/lease_failure_paths.rs` (new).
-- [ ] **6.X.F — Observability + ops (~1 wk).** Dashboards for lease
-      distribution, rebalance events, over-cap windows, heartbeat lag.
-      Operator runbook at `docs/operators/lease-ownership.md` covering
-      manual rebalance / forced lease yield / partition-count tuning.
-      **Depends on A–D.**
+- [x] **6.X.F — Observability + ops (~1 wk).** OTLP-named lease metrics
+      live in `basin_common::project_counters::LeaseMetrics`:
+      `basin_lease_holdings_total{replica}` (gauge),
+      `basin_lease_acquire_total{replica,result}` (counter),
+      `basin_lease_renew_total{replica,result}` (counter),
+      `basin_lease_handoff_duration_ms{replica}` (histogram; shape-only
+      until 6.X.C lands), `basin_budget_over_cap_seconds_total{project,cap}`
+      (counter), `basin_heartbeat_lag_ms{replica}` (histogram). Emission
+      hooks added to `crates/basin-shard/src/in_process.rs` at the lease
+      acquire / renew / heartbeat sites (additive, zero-cost back-compat
+      when `lease_metrics` is `None`). Operator runbook at
+      `docs/operators/lease-ownership.md` covers ownership-model
+      summary + dashboard reading, manual-rebalance sample SQL, whale
+      identification via byte-counter snapshot + `basin_stat_statements`,
+      partition-count tuning, stuck-lease incident playbook (manual steal
+      via catalog UPDATE), and the failure-mode matrix. Forced-yield DDL
+      + auto-reshuffle on `SET partitions=N` documented as TODOs blocked
+      on 6.X.C. Tests:
+      `in_process::tests::lease_metrics_emit_acquire_renew_and_heartbeat_lag`,
+      `lease_metrics_emit_failed_acquire_for_contested_lease`,
+      `lease_metrics_decrement_holdings_on_lost_lease`,
+      `no_lease_metrics_path_does_not_panic`, plus 6 unit tests in
+      `basin_common::project_counters`. **Depends on A–D.**
 
 > **Explicitly out of scope (or deferred) for 6.X v1**: Raft / Paxos lease
 > consensus (Postgres CAS is sufficient); distributed counters on the hot

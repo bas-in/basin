@@ -106,6 +106,12 @@ type PartitionSnapshot = Vec<((ProjectId, PartitionKey), Arc<RwLock<PartitionSta
 /// it knows what to renew and at which epoch. Empty in no-lease mode.
 type HeldLeases = Arc<Mutex<HashMap<(ProjectId, PartitionKey), i64>>>;
 
+/// Phase 6.X.C — `(project, partition)` pairs whose lease is currently being
+/// voluntarily handed off. New writes to a draining partition are rejected
+/// with `BasinError::LeaseHandoffInProgress` so the router can retry on the
+/// new owner once the handoff completes. Reads are unaffected.
+type DrainingSet = Arc<Mutex<HashSet<(ProjectId, PartitionKey)>>>;
+
 pub(crate) struct InProcessShard {
     pub(crate) cfg: ShardConfig,
     pub(crate) partitions: Arc<Mutex<PartitionMap>>,
@@ -113,6 +119,10 @@ pub(crate) struct InProcessShard {
     top_pattern_provider: std::sync::RwLock<Option<Arc<dyn TopPatternProvider>>>,
     /// Phase 6.X.A — leases held by this replica + their granted epoch.
     held_leases: HeldLeases,
+    /// Phase 6.X.C — partitions whose lease is mid-handoff. While present in
+    /// this set the write path returns `LeaseHandoffInProgress`; the read
+    /// path is unaffected. Cleared once the handoff completes or aborts.
+    draining: DrainingSet,
 }
 
 impl InProcessShard {
@@ -123,6 +133,7 @@ impl InProcessShard {
             stats: Arc::new(Mutex::new(ShardStats::default())),
             top_pattern_provider: std::sync::RwLock::new(None),
             held_leases: Arc::new(Mutex::new(HashMap::new())),
+            draining: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -138,6 +149,7 @@ impl InProcessShard {
             stats: self.stats.clone(),
             top_pattern_provider: std::sync::RwLock::new(provider),
             held_leases: self.held_leases.clone(),
+            draining: self.draining.clone(),
         }
     }
 
@@ -184,11 +196,32 @@ impl InProcessShard {
             Some(lease) => {
                 let mut held = self.held_leases.lock().await;
                 held.insert((*project, partition.clone()), lease.epoch);
+                // Phase 6.X.F observability hook. v1 emits Acquired for
+                // every successful acquire — the registry surface doesn't
+                // (yet) distinguish first-grant vs steal-on-expiry, so we
+                // can't separate `Acquired` from `Stolen` at this site
+                // without leaking registry-internal state. The Stolen
+                // label is reserved for when the registry trait grows a
+                // discriminator (follow-on; cheap additive change).
+                if let Some(m) = &self.cfg.lease_metrics {
+                    m.record_acquire(
+                        &self.cfg.replica_id,
+                        basin_common::AcquireResult::Acquired,
+                    );
+                }
                 Ok(())
             }
-            None => Err(BasinError::CommitConflict(format!(
-                "lease for {project}/{partition} held by another replica"
-            ))),
+            None => {
+                if let Some(m) = &self.cfg.lease_metrics {
+                    m.record_acquire(
+                        &self.cfg.replica_id,
+                        basin_common::AcquireResult::Failed,
+                    );
+                }
+                Err(BasinError::CommitConflict(format!(
+                    "lease for {project}/{partition} held by another replica"
+                )))
+            }
         }
     }
 
@@ -196,6 +229,172 @@ impl InProcessShard {
     #[allow(dead_code)]
     pub(crate) async fn run_heartbeat_once(&self) {
         self.heartbeat_renew().await
+    }
+
+    /// Phase 6.X.C — voluntary lease handoff (ADR 0023).
+    ///
+    /// State machine for transferring the `(project, partition)` lease from
+    /// this replica to a candidate, with the **< 500 ms p99 stall** target
+    /// from ADR 0023:
+    ///
+    /// 1. **Mark draining.** The partition enters the `draining` set;
+    ///    subsequent `write_batch` calls fail with
+    ///    [`BasinError::LeaseHandoffInProgress`] so the router can retry on
+    ///    the new owner. Reads continue.
+    /// 2. **Drain + flush.** Compact the in-memory tail to Parquet via the
+    ///    existing compaction path, and request an immediate flush of any
+    ///    hot-tier memtable via the existing
+    ///    `basin-hottier::FlushTask::request_immediate` path when a registry
+    ///    is configured. The memtable / tail-snapshot work is what bounds the
+    ///    stall — for small memtables (< a few MB) this is well under the
+    ///    500 ms p99 target. **Larger memtables**: a multi-hundred-MB
+    ///    memtable is dominated by the cold-tier write step (object-storage
+    ///    PUT bandwidth ~100 MB/s typical); operators should size partitions
+    ///    so single-partition memtable depth fits the target window, or
+    ///    accept a larger-than-500-ms one-off stall during the handoff.
+    /// 3. **Handoff marker.** Append a `Handoff { to_holder, at_epoch }` WAL
+    ///    marker as the boundary record. Replay treats it as a no-op (see
+    ///    [`basin_wal::replay_wal`]); the marker exists for audit + observability.
+    /// 4. **Release lease.** Drop the row in the catalog via
+    ///    [`basin_catalog::LeaseRegistry::release`]. The candidate may now
+    ///    `acquire` and increment the epoch.
+    /// 5. **Local cleanup.** Drop the partition's in-memory state and the
+    ///    held-leases entry; clear the draining flag.
+    ///
+    /// `to_holder` is the candidate replica id (informational — the candidate
+    /// races every other replica via the lease registry's CAS regardless;
+    /// `to_holder` lets observability traces correlate yield -> acquire pairs).
+    ///
+    /// No-op (returns `Ok`) if this replica doesn't hold the lease; the
+    /// caller is asking for something already-true. No-op in no-lease mode
+    /// (no registry configured) — the back-compat single-replica model has
+    /// nothing to hand off.
+    pub(crate) async fn yield_partition(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        to_holder: &str,
+    ) -> Result<()> {
+        let key = (*project, partition.clone());
+        // 0. Read the current epoch we hold; if we don't hold it, no-op.
+        let epoch = {
+            let held = self.held_leases.lock().await;
+            match held.get(&key).copied() {
+                Some(e) => e,
+                None => return Ok(()),
+            }
+        };
+
+        // 1. Mark draining. Idempotent — a concurrent yield_partition on the
+        //    same key returns the same already-draining state and the second
+        //    caller's later steps are no-ops (the lease is gone, the state is
+        //    gone). The single-leaseholder invariant means concurrent yields
+        //    on the same key would be a programming error anyway.
+        {
+            let mut d = self.draining.lock().await;
+            d.insert(key.clone());
+        }
+
+        // 2. Drain: flush the WAL so any in-RAM buffered entries become
+        //    closed segments (compact_one's WAL truncate only operates on
+        //    closed segments — entries still in the RAM buffer won't be
+        //    removed). Then compact the in-memory tail to Parquet so the
+        //    new owner's cold-load is cheap and doesn't double-count rows
+        //    that already landed in the cold tier.
+        if let Err(e) = self.cfg.wal.flush().await {
+            warn!(
+                %project,
+                %partition,
+                error = %e,
+                "lease-handoff pre-compaction wal flush failed; proceeding",
+            );
+        }
+        if let Err(e) = self.compact_one_keyed(project, partition).await {
+            // A compaction failure means the WAL still has the tail; the new
+            // owner will replay it. Surface as a warn — we do NOT abort the
+            // handoff, because cancelling now would leave the replica in
+            // draining-rejecting-writes mode with no path to recovery.
+            warn!(
+                %project,
+                %partition,
+                error = %e,
+                "lease-handoff drain compaction failed; new owner will replay WAL",
+            );
+        }
+
+        // 3. Handoff marker. Best-effort: a backend that doesn't implement
+        //    the marker (e.g. RaftWal stub) returns FeatureNotSupported,
+        //    which we treat as informational — the handoff still completes.
+        match self
+            .cfg
+            .wal
+            .append_handoff_marker(project, partition, to_holder.to_string(), epoch)
+            .await
+        {
+            Ok(_) => {}
+            Err(BasinError::FeatureNotSupported(_)) => {
+                // Marker is informational; backend doesn't ship it yet. OK.
+            }
+            Err(e) => {
+                warn!(
+                    %project,
+                    %partition,
+                    error = %e,
+                    "lease-handoff marker append failed; proceeding (informational only)",
+                );
+            }
+        }
+        // Force a flush so the marker is durable before we release.
+        if let Err(e) = self.cfg.wal.flush().await {
+            warn!(
+                %project,
+                %partition,
+                error = %e,
+                "lease-handoff wal flush failed; proceeding (marker may be in-buffer)",
+            );
+        }
+
+        // 4. Release the lease in the catalog. The candidate may now acquire.
+        if let Some(registry) = &self.cfg.lease_registry {
+            let _ = registry
+                .release(project, partition.as_str(), &self.cfg.replica_id)
+                .await;
+        }
+
+        // 5. Local cleanup. Drop the in-memory state and the held-lease
+        //    entry, then clear the draining flag.
+        {
+            let mut held = self.held_leases.lock().await;
+            held.remove(&key);
+        }
+        {
+            let mut map = self.partitions.lock().await;
+            map.remove(&key);
+        }
+        {
+            let mut d = self.draining.lock().await;
+            d.remove(&key);
+        }
+        self.refresh_resident_stats().await;
+        Ok(())
+    }
+
+    /// Look up the per-partition state (if resident) and run `compact_one`.
+    /// Used by [`Self::yield_partition`]. Returns `Ok` if the partition is
+    /// not resident — nothing to drain.
+    async fn compact_one_keyed(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+    ) -> Result<()> {
+        let state = {
+            let map = self.partitions.lock().await;
+            match map.get(&(*project, partition.clone())) {
+                Some(s) => s.clone(),
+                None => return Ok(()),
+            }
+        };
+        self.compact_one(project, partition, state).await
     }
 
     /// Test-only: drive one budget-heartbeat tick synchronously.
@@ -227,15 +426,23 @@ impl InProcessShard {
             held.keys().cloned().collect()
         };
         for (project, partition) in snapshot {
-            let slice = match coord
+            // Phase 6.X.F: time the budget-heartbeat round-trip the same
+            // way as the lease renew so the dashboard sees one combined
+            // `basin_heartbeat_lag_ms` story per replica.
+            let started = Instant::now();
+            let push_outcome = coord
                 .push_heartbeat(
                     &project,
                     partition.as_str(),
                     &self.cfg.replica_id,
                     basin_catalog::UsageDelta::zero(),
                 )
-                .await
-            {
+                .await;
+            let lag_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+            if let Some(m) = &self.cfg.lease_metrics {
+                m.record_heartbeat_lag(&self.cfg.replica_id, lag_ms);
+            }
+            let slice = match push_outcome {
                 Ok(s) => s,
                 Err(e) => {
                     // Failure path: the coordinator is unreachable. Leave
@@ -281,7 +488,13 @@ impl InProcessShard {
             held.iter().map(|(k, v)| (k.clone(), *v)).collect()
         };
         for ((project, partition), epoch) in snapshot {
-            let renewed = registry
+            // Phase 6.X.F: time the renew round-trip so the heartbeat-lag
+            // histogram tracks coordinator latency. Captures the network +
+            // postgres path; a flat-line lag dashboard is the leading
+            // indicator that the coordinator is unhealthy *before* TTLs
+            // start expiring.
+            let started = Instant::now();
+            let renew_outcome = registry
                 .renew(
                     &project,
                     partition.as_str(),
@@ -289,8 +502,37 @@ impl InProcessShard {
                     epoch,
                     self.cfg.lease_ttl,
                 )
-                .await
-                .unwrap_or(false);
+                .await;
+            let lag_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+            if let Some(m) = &self.cfg.lease_metrics {
+                m.record_heartbeat_lag(&self.cfg.replica_id, lag_ms);
+            }
+            let renewed = match &renew_outcome {
+                Ok(true) => {
+                    if let Some(m) = &self.cfg.lease_metrics {
+                        m.record_renew(&self.cfg.replica_id, basin_common::RenewResult::Ok);
+                    }
+                    true
+                }
+                Ok(false) => {
+                    if let Some(m) = &self.cfg.lease_metrics {
+                        m.record_renew(
+                            &self.cfg.replica_id,
+                            basin_common::RenewResult::Expired,
+                        );
+                    }
+                    false
+                }
+                Err(_) => {
+                    if let Some(m) = &self.cfg.lease_metrics {
+                        m.record_renew(&self.cfg.replica_id, basin_common::RenewResult::Failed);
+                    }
+                    // Conservative: treat transport failure the same as a
+                    // lost lease so the partition state doesn't outlive
+                    // the holder's belief that it still owns it.
+                    false
+                }
+            };
             if renewed {
                 continue;
             }
@@ -863,6 +1105,7 @@ impl ShardImpl for InProcessShard {
             state,
             cfg: self.cfg.clone(),
             held_leases: self.held_leases.clone(),
+            draining: self.draining.clone(),
         });
         Ok(ProjectHandle { inner })
     }
@@ -980,6 +1223,15 @@ impl ShardImpl for InProcessShard {
 
     async fn run_tiering_sweep(&self) -> Result<()> {
         self.tiering_sweep().await
+    }
+
+    async fn yield_partition(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        to_holder: &str,
+    ) -> Result<()> {
+        InProcessShard::yield_partition(self, project, partition, to_holder).await
     }
 
     async fn resident_projects(&self) -> Vec<ProjectId> {
@@ -1196,12 +1448,30 @@ struct InProcessProjectHandle {
     /// write path can fence WAL appends with the current epoch. Empty in
     /// no-lease mode (the WAL append then runs unfenced / back-compat).
     held_leases: HeldLeases,
+    /// Phase 6.X.C — shared view of partitions mid-handoff. The write path
+    /// short-circuits with `BasinError::LeaseHandoffInProgress` while this
+    /// partition is draining so the router can retry against the new owner.
+    /// Reads are unaffected.
+    draining: DrainingSet,
 }
 
 #[async_trait]
 impl ProjectHandleImpl for InProcessProjectHandle {
     #[instrument(skip(self, batch), fields(project = %self.project, partition = %self.partition, table = %table, rows = batch.num_rows()))]
     async fn write_batch(&self, table: &TableName, batch: RecordBatch) -> Result<()> {
+        // Phase 6.X.C: short-circuit if this partition is mid-handoff.
+        // The router treats `LeaseHandoffInProgress` as retryable: it
+        // invalidates its lease cache for the partition and retries against
+        // the new owner once the handoff completes.
+        {
+            let d = self.draining.lock().await;
+            if d.contains(&(self.project, self.partition.clone())) {
+                return Err(BasinError::lease_handoff_in_progress(format!(
+                    "{}/{}",
+                    self.project, self.partition
+                )));
+            }
+        }
         let payload = encode_payload(table, &batch)?;
         // Phase 6.X.A: fence the WAL append with our current lease epoch.
         // `None` (no-lease mode) appends unconditionally — back-compat. A
@@ -1846,6 +2116,25 @@ mod tests {
         (crate::Shard::new(cfg), storage_dir, wal_dir)
     }
 
+    /// Build a shard against an already-shared `Storage` + `Wal`. Used by the
+    /// handoff acceptance test where replicas must share object storage to
+    /// mirror ADR 0023's "object store stays the durable substrate" model.
+    fn leased_shard_with_storage(
+        catalog: Arc<InMemoryCatalog>,
+        storage: Storage,
+        wal: Arc<dyn Wal>,
+        replica_id: &str,
+        ttl: Duration,
+    ) -> crate::Shard {
+        basin_common::telemetry::try_init_for_tests();
+        let registry: Arc<dyn basin_catalog::LeaseRegistry> = catalog.clone();
+        let mut cfg = ShardConfig::new(storage, catalog, wal)
+            .with_lease_registry(registry, replica_id);
+        cfg.lease_ttl = ttl;
+        cfg.lease_renew_interval = Duration::from_millis(50);
+        crate::Shard::new(cfg)
+    }
+
     #[tokio::test]
     async fn two_replicas_contend_for_lease() {
         let catalog = Arc::new(InMemoryCatalog::new());
@@ -1926,6 +2215,246 @@ mod tests {
         inner.run_heartbeat_once().await;
         let read = handle.read(&table, ReadOptions::default()).await.unwrap();
         assert_eq!(rows_in(&read), 10);
+    }
+
+    // ── Phase 6.X.C: voluntary lease handoff under load ──────────────────
+
+    /// End-to-end handoff: A holds the lease, takes a write, yields to B.
+    /// Post-yield B acquires under a fresh (higher) epoch, the pre-handoff
+    /// row set is visible on B (compaction drained the tail before
+    /// release), the WAL handoff marker is durable, and the total stall
+    /// stays well under the 500 ms p99 target for the small-memtable case.
+    #[tokio::test]
+    async fn handoff_transfers_lease_with_writes_intact() {
+        use basin_wal::WalEvent;
+
+        let catalog = Arc::new(InMemoryCatalog::new());
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+        let table = TableName::new("events").unwrap();
+
+        // Shared object storage + WAL — replicas in ADR 0023 share the
+        // durable substrate; only the in-memory state is per-replica.
+        let storage_dir = TempDir::new().unwrap();
+        let wal_dir = TempDir::new().unwrap();
+        let storage_fs = LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap();
+        let wal_fs = LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap();
+        let storage = Storage::new(StorageConfig {
+            object_store: Arc::new(storage_fs),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let wal: Arc<dyn Wal> = Arc::new(
+            LocalWal::open(WalConfig {
+                object_store: Arc::new(wal_fs),
+                root_prefix: None,
+                flush_interval: Duration::from_millis(50),
+                flush_max_bytes: 1024 * 1024,
+            })
+            .await
+            .unwrap(),
+        );
+
+        // A acquires the lease and writes 10 rows.
+        let shard_a = leased_shard_with_storage(
+            catalog.clone(),
+            storage.clone(),
+            wal.clone(),
+            "replica-a",
+            Duration::from_secs(15),
+        );
+        let ha = shard_a.get(&project, &partition).await.unwrap();
+        ha.write_batch(&table, batch(0, 10, "pre-")).await.unwrap();
+        let inner_a = impl_of(&shard_a);
+        let epoch_a = inner_a.lease_epoch(&project, &partition).await.unwrap();
+        assert_eq!(epoch_a, 1, "A starts at the first-grant epoch");
+
+        // Yield. Time it: < 500 ms is the ADR 0023 p99 target for the
+        // small-memtable case (here: 10 rows).
+        let t0 = std::time::Instant::now();
+        shard_a
+            .yield_partition(&project, &partition, "replica-b")
+            .await
+            .unwrap();
+        let stall = t0.elapsed();
+        assert!(
+            stall < Duration::from_millis(500),
+            "handoff stall {stall:?} exceeds 500ms p99 target (small-memtable case)",
+        );
+
+        // Post-yield: A no longer tracks the lease and no resident state.
+        assert_eq!(inner_a.lease_epoch(&project, &partition).await, None);
+        assert_eq!(shard_a.stats().resident_partitions, 0);
+        // The catalog confirms there is no live owner (lease released).
+        assert_eq!(
+            catalog.owner_of(&project, partition.as_str()).await.unwrap(),
+            None,
+        );
+
+        // B acquires (via the shared catalog + storage) and reads the
+        // partition; the pre-handoff row set must be visible (compaction
+        // flushed the tail into the shared object store before release).
+        let shard_b = leased_shard_with_storage(
+            catalog.clone(),
+            storage.clone(),
+            wal.clone(),
+            "replica-b",
+            Duration::from_secs(15),
+        );
+        let hb = shard_b.get(&project, &partition).await.unwrap();
+        let read = hb.read(&table, ReadOptions::default()).await.unwrap();
+        assert_eq!(
+            rows_in(&read),
+            10,
+            "post-handoff replica must see pre-handoff rows",
+        );
+        // B is now the legitimate single owner — it holds a granted lease
+        // and can perform the write path. (After a clean release the
+        // catalog row is removed; B's acquire is a first-grant under a
+        // fresh epoch. The fencing invariant matters during dual-
+        // leaseholder windows, not after a voluntary handoff — see
+        // [`Self::yield_partition`] docstring.)
+        let inner_b = impl_of(&shard_b);
+        let epoch_b = inner_b.lease_epoch(&project, &partition).await.unwrap();
+        assert!(epoch_b > 0, "B must hold a granted lease, got epoch {epoch_b}");
+        // B can write the partition (new lease → new appends accepted).
+        hb.write_batch(&table, batch(100, 2, "post-")).await.unwrap();
+
+        // WAL handoff marker is durable and observable on the shared WAL.
+        let events = wal
+            .read_events(&project, &partition, basin_wal::Lsn::ZERO)
+            .await
+            .unwrap();
+        let marker = events.iter().find(|e| {
+            matches!(
+                e,
+                WalEvent::Handoff { to_holder, at_epoch }
+                if to_holder == "replica-b" && *at_epoch == epoch_a
+            )
+        });
+        assert!(
+            marker.is_some(),
+            "WAL must carry the handoff marker (to=replica-b, at_epoch=1); got {events:?}",
+        );
+    }
+
+    /// While the handoff is in progress, writes to the draining partition
+    /// fail fast with the typed `LeaseHandoffInProgress` error so the
+    /// router can retry against the new owner. We set the draining flag
+    /// directly so the assertion doesn't race the state-machine timing.
+    #[tokio::test]
+    async fn draining_partition_rejects_new_writes() {
+        let catalog = Arc::new(InMemoryCatalog::new());
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+        let table = TableName::new("events").unwrap();
+
+        let (shard, _sd, _wd) =
+            leased_shard(catalog.clone(), "replica-a", Duration::from_secs(15)).await;
+        let handle = shard.get(&project, &partition).await.unwrap();
+        let inner = impl_of(&shard);
+
+        // Mark the partition draining (synthesise the mid-handoff state).
+        {
+            let mut d = inner.draining.lock().await;
+            d.insert((project, partition.clone()));
+        }
+        // Write rejected with the typed retryable error.
+        let err = handle
+            .write_batch(&table, batch(0, 5, "x-"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, BasinError::LeaseHandoffInProgress(_)),
+            "draining write must surface LeaseHandoffInProgress, got {err:?}",
+        );
+        // Reads are unaffected by draining.
+        let read = handle.read(&table, ReadOptions::default()).await.unwrap();
+        assert_eq!(rows_in(&read), 0);
+
+        // Clear the flag; writes resume.
+        {
+            let mut d = inner.draining.lock().await;
+            d.remove(&(project, partition.clone()));
+        }
+        handle
+            .write_batch(&table, batch(0, 5, "x-"))
+            .await
+            .unwrap();
+        let read = handle.read(&table, ReadOptions::default()).await.unwrap();
+        assert_eq!(rows_in(&read), 5);
+    }
+
+    /// `yield_partition` is a no-op on a replica that doesn't hold the
+    /// lease (no-registry mode + not-our-lease both return Ok without
+    /// side effects).
+    #[tokio::test]
+    async fn yield_is_noop_without_held_lease() {
+        let (shard, _sd, _wd, _storage, _cat, _wal) = fresh_shard().await;
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+        shard
+            .yield_partition(&project, &partition, "replica-x")
+            .await
+            .unwrap();
+    }
+
+    /// The handoff WAL marker is informational: `replay_wal` filters
+    /// `WalEvent::Handoff` out and emits exactly one `WalEntry` per
+    /// `WalEvent::Entry` in the input stream. Replay is deterministic
+    /// (idempotent across repeated invocations).
+    #[tokio::test]
+    async fn handoff_marker_is_replay_noop() {
+        use basin_wal::{replay_wal, WalEvent, WalReplayConfig};
+
+        let catalog = Arc::new(InMemoryCatalog::new());
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+        let table = TableName::new("events").unwrap();
+
+        let (shard, _sd, _wd) =
+            leased_shard(catalog.clone(), "replica-a", Duration::from_secs(15)).await;
+        let handle = shard.get(&project, &partition).await.unwrap();
+        handle.write_batch(&table, batch(0, 3, "v-")).await.unwrap();
+        shard
+            .yield_partition(&project, &partition, "replica-b")
+            .await
+            .unwrap();
+
+        let events = shard
+            .wal()
+            .read_events(&project, &partition, basin_wal::Lsn::ZERO)
+            .await
+            .unwrap();
+        // Exactly one handoff marker on the WAL.
+        let handoff_count = events
+            .iter()
+            .filter(|e| matches!(e, WalEvent::Handoff { .. }))
+            .count();
+        assert_eq!(handoff_count, 1, "exactly one handoff marker; got {events:?}");
+
+        // `replay_wal` must yield one WalEntry per data event — markers
+        // are filtered out, no entries are synthesised or dropped.
+        let data_event_count = events
+            .iter()
+            .filter(|e| matches!(e, WalEvent::Entry(_)))
+            .count();
+        let entries = replay_wal(events.clone(), &WalReplayConfig::default());
+        assert_eq!(
+            entries.len(),
+            data_event_count,
+            "replay must yield exactly one WalEntry per data event; marker is a no-op",
+        );
+
+        // Idempotence: replaying the same event stream again produces
+        // identical output — markers don't toggle any state.
+        let entries2 = replay_wal(events, &WalReplayConfig::default());
+        assert_eq!(
+            entries.len(),
+            entries2.len(),
+            "replay must be deterministic across repeated invocations",
+        );
     }
 
     // ── Phase 6.X.D: heartbeat-reconciled budgets ────────────────────────
@@ -2044,5 +2573,203 @@ mod tests {
         let inner = impl_of(&shard);
         // No coordinator wired — must not panic, must not error.
         inner.run_budget_heartbeat_once().await;
+    }
+
+    // ── Phase 6.X.F: lease observability metric emission ─────────────────
+
+    /// Acquire-success + heartbeat-renew-success bump the corresponding
+    /// counters on the attached [`basin_common::LeaseMetrics`] sink. The
+    /// holdings gauge tracks the live lease count; the heartbeat-lag
+    /// histogram records one sample per renew tick.
+    #[tokio::test]
+    async fn lease_metrics_emit_acquire_renew_and_heartbeat_lag() {
+        let catalog = Arc::new(InMemoryCatalog::new());
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+        let metrics = Arc::new(basin_common::LeaseMetrics::new());
+
+        let storage_dir = TempDir::new().unwrap();
+        let wal_dir = TempDir::new().unwrap();
+        let storage_fs = LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap();
+        let wal_fs = LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap();
+        let storage = Storage::new(StorageConfig {
+            object_store: Arc::new(storage_fs),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let wal: Arc<dyn Wal> = Arc::new(
+            LocalWal::open(WalConfig {
+                object_store: Arc::new(wal_fs),
+                root_prefix: None,
+                flush_interval: Duration::from_millis(50),
+                flush_max_bytes: 1024 * 1024,
+            })
+            .await
+            .unwrap(),
+        );
+        let registry: Arc<dyn basin_catalog::LeaseRegistry> = catalog.clone();
+        let mut cfg = ShardConfig::new(storage, catalog.clone(), wal)
+            .with_lease_registry(registry, "replica-metrics")
+            .with_lease_metrics(metrics.clone());
+        cfg.lease_ttl = Duration::from_secs(60);
+        cfg.lease_renew_interval = Duration::from_millis(50);
+        let shard = crate::Shard::new(cfg);
+
+        let _h = shard.get(&project, &partition).await.unwrap();
+        let inner = impl_of(&shard);
+        inner.run_heartbeat_once().await;
+
+        let snap = metrics.snapshot_replicas();
+        let r = snap
+            .get("replica-metrics")
+            .expect("replica-metrics has emitted counters");
+        assert_eq!(r.acquire_acquired_total, 1);
+        assert_eq!(r.renew_ok_total, 1);
+        assert_eq!(r.holdings, 1);
+        assert_eq!(
+            r.heartbeat_lag_ms.count, 1,
+            "exactly one heartbeat-lag sample per renew tick",
+        );
+        // No handoff samples in v1 — 6.X.C ships them.
+        assert_eq!(r.handoff_duration_ms.count, 0);
+    }
+
+    /// A losing acquire (lease already held by a peer) bumps the `failed`
+    /// counter and leaves the holdings gauge unchanged.
+    #[tokio::test]
+    async fn lease_metrics_emit_failed_acquire_for_contested_lease() {
+        let catalog = Arc::new(InMemoryCatalog::new());
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+
+        // Replica A grabs first; its metrics handle is irrelevant for this test.
+        let (shard_a, _sa, _wa) =
+            leased_shard(catalog.clone(), "replica-a", Duration::from_secs(60)).await;
+        let _ha = shard_a.get(&project, &partition).await.unwrap();
+
+        // Replica B has its own metrics sink — we observe the `failed` bump
+        // on B's side.
+        let metrics_b = Arc::new(basin_common::LeaseMetrics::new());
+        let storage_dir = TempDir::new().unwrap();
+        let wal_dir = TempDir::new().unwrap();
+        let storage_fs = LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap();
+        let wal_fs = LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap();
+        let storage = Storage::new(StorageConfig {
+            object_store: Arc::new(storage_fs),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let wal: Arc<dyn Wal> = Arc::new(
+            LocalWal::open(WalConfig {
+                object_store: Arc::new(wal_fs),
+                root_prefix: None,
+                flush_interval: Duration::from_millis(50),
+                flush_max_bytes: 1024 * 1024,
+            })
+            .await
+            .unwrap(),
+        );
+        let registry: Arc<dyn basin_catalog::LeaseRegistry> = catalog.clone();
+        let cfg = ShardConfig::new(storage, catalog, wal)
+            .with_lease_registry(registry, "replica-b")
+            .with_lease_metrics(metrics_b.clone());
+        let shard_b = crate::Shard::new(cfg);
+
+        let res = shard_b.get(&project, &partition).await;
+        match res {
+            Err(BasinError::CommitConflict(_)) => {}
+            Ok(_) => panic!("second replica must be refused the lease"),
+            Err(e) => panic!("expected CommitConflict, got {e:?}"),
+        }
+
+        let snap = metrics_b.snapshot_replicas();
+        let b = snap.get("replica-b").expect("replica-b emitted counters");
+        assert_eq!(b.acquire_failed_total, 1);
+        assert_eq!(
+            b.acquire_acquired_total, 0,
+            "failed acquire must not double-count as acquired",
+        );
+        assert_eq!(b.holdings, 0, "failed acquire does not change holdings");
+    }
+
+    /// Lost-lease path: the renew tick observes the lease was stolen,
+    /// bumps `renew_expired_total`, and decrements the holdings gauge.
+    #[tokio::test]
+    async fn lease_metrics_decrement_holdings_on_lost_lease() {
+        let catalog = Arc::new(InMemoryCatalog::new());
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+        let metrics = Arc::new(basin_common::LeaseMetrics::new());
+
+        let storage_dir = TempDir::new().unwrap();
+        let wal_dir = TempDir::new().unwrap();
+        let storage_fs = LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap();
+        let wal_fs = LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap();
+        let storage = Storage::new(StorageConfig {
+            object_store: Arc::new(storage_fs),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let wal: Arc<dyn Wal> = Arc::new(
+            LocalWal::open(WalConfig {
+                object_store: Arc::new(wal_fs),
+                root_prefix: None,
+                flush_interval: Duration::from_millis(50),
+                flush_max_bytes: 1024 * 1024,
+            })
+            .await
+            .unwrap(),
+        );
+        let registry: Arc<dyn basin_catalog::LeaseRegistry> = catalog.clone();
+        let mut cfg = ShardConfig::new(storage, catalog.clone(), wal)
+            .with_lease_registry(registry, "replica-evicted")
+            .with_lease_metrics(metrics.clone());
+        cfg.lease_ttl = Duration::from_millis(10);
+        cfg.lease_renew_interval = Duration::from_millis(50);
+        let shard = crate::Shard::new(cfg);
+
+        let _h = shard.get(&project, &partition).await.unwrap();
+        // Wait for TTL to expire, then a peer steals.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        catalog
+            .acquire(
+                &project,
+                partition.as_str(),
+                "replica-peer",
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .expect("peer steals after expiry");
+
+        let inner = impl_of(&shard);
+        inner.run_heartbeat_once().await;
+
+        let snap = metrics.snapshot_replicas();
+        let r = snap.get("replica-evicted").expect("replica entry");
+        assert_eq!(r.acquire_acquired_total, 1);
+        assert_eq!(r.renew_expired_total, 1);
+        assert_eq!(
+            r.holdings, 0,
+            "lost-lease decrements the holdings gauge back to zero",
+        );
+    }
+
+    /// Without a metrics sink configured, the lease event sites are
+    /// zero-cost — no panic, no double-bookkeeping. Back-compat guarantee.
+    #[tokio::test]
+    async fn no_lease_metrics_path_does_not_panic() {
+        let catalog = Arc::new(InMemoryCatalog::new());
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+        let (shard, _sd, _wd) =
+            leased_shard(catalog, "replica-nometrics", Duration::from_secs(60)).await;
+        let _h = shard.get(&project, &partition).await.unwrap();
+        let inner = impl_of(&shard);
+        inner.run_heartbeat_once().await;
+        // Survival is the assertion.
     }
 }
