@@ -57,6 +57,22 @@ pub struct ShardConfig {
     pub memtable_registry: Option<Arc<basin_hottier::MemTableRegistry>>,
     /// How often the flush task's periodic trigger fires.  Default 5 s.
     pub flush_tick_interval: Duration,
+    /// Phase 6.X.A — optional lease registry (ADR 0023). When present, the
+    /// shard acquires a lease per `(project, partition)` it owns and the
+    /// background heartbeat renews held leases on a fixed cadence; a renewal
+    /// failure (lost lease) drops the partition's in-memory state. When
+    /// absent, the shard runs in single-replica / no-lease mode exactly as
+    /// before — `get` neither acquires nor fences.
+    pub lease_registry: Option<Arc<dyn basin_catalog::LeaseRegistry>>,
+    /// This replica's stable lease holder id (e.g. `host:pid` or a uuid).
+    /// Defaults to a per-process random id; only meaningful when
+    /// `lease_registry` is set.
+    pub replica_id: String,
+    /// Lease TTL handed to `acquire` / `renew`. Default 15 s
+    /// (`BASIN_LEASE_TTL_SECS`).
+    pub lease_ttl: Duration,
+    /// Heartbeat renew cadence. Default 5 s (`BASIN_LEASE_RENEW_SECS`).
+    pub lease_renew_interval: Duration,
 }
 
 impl ShardConfig {
@@ -74,7 +90,29 @@ impl ShardConfig {
             eviction_interval: Duration::from_secs(60),
             memtable_registry: None,
             flush_tick_interval: Duration::from_secs(5),
+            lease_registry: None,
+            replica_id: default_replica_id(),
+            lease_ttl: Duration::from_secs(env_secs(
+                "BASIN_LEASE_TTL_SECS",
+                basin_catalog::DEFAULT_LEASE_TTL_SECS,
+            )),
+            lease_renew_interval: Duration::from_secs(env_secs(
+                "BASIN_LEASE_RENEW_SECS",
+                basin_catalog::DEFAULT_LEASE_RENEW_SECS,
+            )),
         }
+    }
+
+    /// Attach a lease registry + holder id so [`Shard::spawn_background`] runs
+    /// the per-partition lease heartbeat (Phase 6.X.A, ADR 0023).
+    pub fn with_lease_registry(
+        mut self,
+        registry: Arc<dyn basin_catalog::LeaseRegistry>,
+        replica_id: impl Into<String>,
+    ) -> Self {
+        self.lease_registry = Some(registry);
+        self.replica_id = replica_id.into();
+        self
     }
 
     /// Attach the HTAP memtable registry so [`Shard::spawn_background`] also
@@ -330,6 +368,29 @@ pub(crate) trait ProjectHandleImpl: Send + Sync {
     ) -> Result<Vec<RecordBatch>>;
     fn last_active(&self) -> Instant;
     fn project(&self) -> ProjectId;
+}
+
+/// Read a `u64` seconds value from an env var, falling back to `default` when
+/// unset or unparseable. Used for the lease TTL / renew cadence knobs.
+fn env_secs(var: &str, default: u64) -> u64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+/// Per-process default lease holder id: `host:pid` plus a short random suffix
+/// so two processes on the same host with the same pid (after recycle) don't
+/// collide. Only used when a lease registry is attached.
+fn default_replica_id() -> String {
+    let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "host".to_string());
+    let pid = std::process::id();
+    // Nanosecond start salt disambiguates a pid recycled on the same host.
+    let salt = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{host}:{pid}:{salt}")
 }
 
 mod follower;

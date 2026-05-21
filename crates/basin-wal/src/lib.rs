@@ -256,6 +256,30 @@ pub trait Wal: Send + Sync + std::fmt::Debug {
         payload: Bytes,
     ) -> Result<Lsn>;
 
+    /// Phase 6.X.A — epoch-fenced append (ADR 0023).
+    ///
+    /// Identical to [`Self::append`] but carries the holder's current lease
+    /// `epoch`. If a stale epoch appends (a dual-leaseholder after a network
+    /// partition — the loser presents a lower epoch than the winner already
+    /// raised the fence to), the append is **rejected** with a
+    /// [`basin_common::BasinError::Wal`] fencing error and no LSN is consumed.
+    ///
+    /// Back-compat: `epoch == None` (or `Some(0)`) is the no-lease /
+    /// single-replica mode — it never raises the partition's fence and always
+    /// appends, exactly as [`Self::append`] does today. The default
+    /// implementation ignores the epoch and delegates to [`Self::append`], so
+    /// non-fencing backends (e.g. the [`RaftWal`] stub) stay buildable.
+    async fn append_fenced(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        payload: Bytes,
+        epoch: Option<i64>,
+    ) -> Result<Lsn> {
+        let _ = epoch;
+        self.append(project, partition, payload).await
+    }
+
     /// Force a synchronous flush of any queued segments to durable storage.
     /// For raft this is usually a no-op (already fsync'd on quorum); for
     /// the local WAL it forces an upload of buffered entries.
@@ -396,6 +420,29 @@ impl Wal for LocalWal {
         Ok(lsn)
     }
 
+    async fn append_fenced(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        payload: Bytes,
+        epoch: Option<i64>,
+    ) -> Result<Lsn> {
+        let bytes = payload.len() as u64;
+        let lsn = self
+            .inner
+            .append_fenced(project, partition, payload, epoch)
+            .await?;
+        // Mirror the counter bookkeeping of the unfenced path; a rejected
+        // (fenced-out) append returns Err above and never reaches here, so
+        // stale-epoch writes are correctly excluded from the per-project rollup.
+        if let Some(reg) = self.project_counters.get() {
+            let tc = reg.for_project(project);
+            tc.record_op();
+            tc.record_bytes_written(bytes);
+        }
+        Ok(lsn)
+    }
+
     async fn flush(&self) -> Result<()> {
         self.inner.flush().await
     }
@@ -477,6 +524,18 @@ pub(crate) trait WalImpl: Send + Sync {
         partition: &PartitionKey,
         payload: Bytes,
     ) -> Result<Lsn>;
+    /// Phase 6.X.A — epoch-fenced append. Default delegates to [`Self::append`]
+    /// (no fencing) so backends that don't track lease epochs stay buildable.
+    async fn append_fenced(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        payload: Bytes,
+        epoch: Option<i64>,
+    ) -> Result<Lsn> {
+        let _ = epoch;
+        self.append(project, partition, payload).await
+    }
     async fn flush(&self) -> Result<()>;
     async fn read_from(
         &self,

@@ -64,6 +64,13 @@ pub(crate) struct PartitionState {
     /// range scan. Two segments cannot share a `first_lsn` so a `BTreeMap`
     /// is sufficient.
     pub closed: BTreeMap<Lsn, ClosedSegment>,
+    /// Phase 6.X.A — highest lease epoch ever observed on a fenced append for
+    /// this partition (ADR 0023). Monotonic: once a higher-epoch holder
+    /// appends, any later append carrying a strictly lower epoch is rejected
+    /// (the loser of a dual-leaseholder window). `0` is the back-compat
+    /// no-lease sentinel — single-replica / no-lease appends pass `0`/`None`,
+    /// never raise the fence, and are accepted unconditionally.
+    pub fence_epoch: i64,
 }
 
 impl PartitionState {
@@ -75,6 +82,7 @@ impl PartitionState {
             buffer: Vec::new(),
             buffer_bytes: 0,
             closed: BTreeMap::new(),
+            fence_epoch: 0,
         }
     }
 

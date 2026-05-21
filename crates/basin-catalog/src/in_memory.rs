@@ -177,6 +177,24 @@ pub struct InMemoryCatalog {
     /// One shared `HashMap` keyed by `(ProjectId, name)` — per-project cost
     /// stays `O(bytes)` with no per-project heavy resource.
     inbound_webhooks: Mutex<HashMap<(ProjectId, String), InboundWebhookDef>>,
+    /// Phase 6.X.A — partition leases (ADR 0023). One shared `HashMap` keyed
+    /// by `(ProjectId, partition_id)`. The outer mutex serialises the
+    /// acquire / renew / steal CAS so two contending replicas can't both win;
+    /// it is held only for the brief in-map arithmetic. Per-project cost stays
+    /// `O(partitions)` with no per-replica heavy resource.
+    leases: Mutex<HashMap<(ProjectId, String), LeaseRow>>,
+}
+
+/// In-memory lease row. Mirrors the `partition_leases` Postgres table.
+#[derive(Clone)]
+struct LeaseRow {
+    holder: String,
+    epoch: i64,
+    /// Recorded for parity with the Postgres `granted_at` column / future
+    /// observability (lease age). Not read on the in-memory hot path.
+    #[allow(dead_code)]
+    granted_at: chrono::DateTime<chrono::Utc>,
+    expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Aggregate reactor state. The seq counter assigns each newly-
@@ -221,6 +239,7 @@ impl InMemoryCatalog {
             views: Mutex::new(HashMap::new()),
             schemas: Mutex::new(HashMap::new()),
             inbound_webhooks: Mutex::new(HashMap::new()),
+            leases: Mutex::new(HashMap::new()),
         }
     }
 
@@ -379,6 +398,8 @@ impl Catalog for InMemoryCatalog {
         schemas.remove(project);
         let mut iwhs = self.inbound_webhooks.lock().await;
         iwhs.retain(|(t, _), _| t != project);
+        let mut leases = self.leases.lock().await;
+        leases.retain(|(t, _), _| t != project);
         Ok(())
     }
 
@@ -2002,6 +2023,115 @@ fn reactor_err_to_basin(e: ReactorError) -> BasinError {
             BasinError::InvalidSchema("reactor body must be a single SQL statement".into())
         }
         ReactorError::NotFound => BasinError::NotFound("reactor not found".into()),
+    }
+}
+
+#[async_trait]
+impl crate::leases::LeaseRegistry for InMemoryCatalog {
+    #[instrument(skip(self), fields(project = %project, partition = %partition_id, holder = %holder))]
+    async fn acquire(
+        &self,
+        project: &ProjectId,
+        partition_id: &str,
+        holder: &str,
+        ttl: std::time::Duration,
+    ) -> Result<Option<crate::leases::Lease>> {
+        let now = chrono::Utc::now();
+        let expires_at = now + chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::zero());
+        let key = (*project, partition_id.to_string());
+        let mut map = self.leases.lock().await;
+        let (granted, epoch) = match map.get(&key) {
+            // First grant: no row yet. Epoch starts at 1.
+            None => (true, 1),
+            // We already hold it (or it's expired): (re)grant + bump epoch.
+            Some(row) if row.holder == holder || row.expires_at <= now => {
+                (true, row.epoch + 1)
+            }
+            // A different, non-expired holder owns it: lose the race.
+            Some(_) => (false, 0),
+        };
+        if !granted {
+            return Ok(None);
+        }
+        let lease = crate::leases::Lease {
+            project: *project,
+            partition_id: partition_id.to_string(),
+            holder: holder.to_string(),
+            epoch,
+            granted_at: now,
+            expires_at,
+        };
+        map.insert(
+            key,
+            LeaseRow {
+                holder: holder.to_string(),
+                epoch,
+                granted_at: now,
+                expires_at,
+            },
+        );
+        Ok(Some(lease))
+    }
+
+    #[instrument(skip(self), fields(project = %project, partition = %partition_id, holder = %holder, epoch))]
+    async fn renew(
+        &self,
+        project: &ProjectId,
+        partition_id: &str,
+        holder: &str,
+        epoch: i64,
+        ttl: std::time::Duration,
+    ) -> Result<bool> {
+        let now = chrono::Utc::now();
+        let expires_at = now + chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::zero());
+        let key = (*project, partition_id.to_string());
+        let mut map = self.leases.lock().await;
+        match map.get_mut(&key) {
+            // Still ours at the exact epoch, and not yet expired.
+            Some(row) if row.holder == holder && row.epoch == epoch && row.expires_at > now => {
+                row.expires_at = expires_at;
+                Ok(true)
+            }
+            // Lost the lease: stolen, regranted, expired, or never held.
+            _ => Ok(false),
+        }
+    }
+
+    #[instrument(skip(self), fields(project = %project, partition = %partition_id, holder = %holder))]
+    async fn release(
+        &self,
+        project: &ProjectId,
+        partition_id: &str,
+        holder: &str,
+    ) -> Result<bool> {
+        let key = (*project, partition_id.to_string());
+        let mut map = self.leases.lock().await;
+        match map.get(&key) {
+            Some(row) if row.holder == holder => {
+                map.remove(&key);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    #[instrument(skip(self), fields(project = %project, partition = %partition_id))]
+    async fn owner_of(
+        &self,
+        project: &ProjectId,
+        partition_id: &str,
+    ) -> Result<Option<(String, i64)>> {
+        let now = chrono::Utc::now();
+        let key = (*project, partition_id.to_string());
+        let map = self.leases.lock().await;
+        Ok(map.get(&key).and_then(|row| {
+            // Expired rows have no live owner even though the row lingers.
+            if row.expires_at > now {
+                Some((row.holder.clone(), row.epoch))
+            } else {
+                None
+            }
+        }))
     }
 }
 

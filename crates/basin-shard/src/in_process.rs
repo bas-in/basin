@@ -101,11 +101,18 @@ impl PartitionState {
 type PartitionMap = HashMap<(ProjectId, PartitionKey), Arc<RwLock<PartitionState>>>;
 type PartitionSnapshot = Vec<((ProjectId, PartitionKey), Arc<RwLock<PartitionState>>)>;
 
+/// Leases this replica currently holds, keyed by `(project, partition)` with
+/// the granted fencing epoch as the value. Shared with the heartbeat task so
+/// it knows what to renew and at which epoch. Empty in no-lease mode.
+type HeldLeases = Arc<Mutex<HashMap<(ProjectId, PartitionKey), i64>>>;
+
 pub(crate) struct InProcessShard {
     pub(crate) cfg: ShardConfig,
     pub(crate) partitions: Arc<Mutex<PartitionMap>>,
     stats: Arc<Mutex<ShardStats>>,
     top_pattern_provider: std::sync::RwLock<Option<Arc<dyn TopPatternProvider>>>,
+    /// Phase 6.X.A — leases held by this replica + their granted epoch.
+    held_leases: HeldLeases,
 }
 
 impl InProcessShard {
@@ -115,6 +122,7 @@ impl InProcessShard {
             partitions: Arc::new(Mutex::new(HashMap::new())),
             stats: Arc::new(Mutex::new(ShardStats::default())),
             top_pattern_provider: std::sync::RwLock::new(None),
+            held_leases: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -129,6 +137,109 @@ impl InProcessShard {
             partitions: self.partitions.clone(),
             stats: self.stats.clone(),
             top_pattern_provider: std::sync::RwLock::new(provider),
+            held_leases: self.held_leases.clone(),
+        }
+    }
+
+    /// Phase 6.X.A — current fencing epoch this replica holds for
+    /// `(project, partition)`, if any. `None` in no-lease mode (the WAL append
+    /// path then runs unfenced / back-compat). The write path reads the same
+    /// `held_leases` map directly; this accessor exists for tests / future
+    /// callers (6.X.B routing).
+    #[cfg(test)]
+    pub(crate) async fn lease_epoch(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+    ) -> Option<i64> {
+        let held = self.held_leases.lock().await;
+        held.get(&(*project, partition.clone())).copied()
+    }
+
+    /// Acquire (or refresh) the lease for `(project, partition)` on first
+    /// access when a lease registry is configured. Records the granted epoch
+    /// in `held_leases`. No-op (returns Ok) in no-lease mode. Returns an error
+    /// only if a *different* replica holds a live lease — the caller can't
+    /// own this partition right now.
+    async fn ensure_lease(&self, project: &ProjectId, partition: &PartitionKey) -> Result<()> {
+        let Some(registry) = &self.cfg.lease_registry else {
+            return Ok(());
+        };
+        // Fast path: already held.
+        {
+            let held = self.held_leases.lock().await;
+            if held.contains_key(&(*project, partition.clone())) {
+                return Ok(());
+            }
+        }
+        match registry
+            .acquire(
+                project,
+                partition.as_str(),
+                &self.cfg.replica_id,
+                self.cfg.lease_ttl,
+            )
+            .await?
+        {
+            Some(lease) => {
+                let mut held = self.held_leases.lock().await;
+                held.insert((*project, partition.clone()), lease.epoch);
+                Ok(())
+            }
+            None => Err(BasinError::CommitConflict(format!(
+                "lease for {project}/{partition} held by another replica"
+            ))),
+        }
+    }
+
+    /// Test-only: drive one heartbeat tick synchronously.
+    #[allow(dead_code)]
+    pub(crate) async fn run_heartbeat_once(&self) {
+        self.heartbeat_renew().await
+    }
+
+    /// Renew every lease this replica holds. On a failed renewal (lost lease)
+    /// drop the partition's in-memory state and stop tracking the lease — the
+    /// partition now belongs to whoever stole it. No-op in no-lease mode.
+    async fn heartbeat_renew(&self) {
+        let Some(registry) = &self.cfg.lease_registry else {
+            return;
+        };
+        let snapshot: Vec<((ProjectId, PartitionKey), i64)> = {
+            let held = self.held_leases.lock().await;
+            held.iter().map(|(k, v)| (k.clone(), *v)).collect()
+        };
+        for ((project, partition), epoch) in snapshot {
+            let renewed = registry
+                .renew(
+                    &project,
+                    partition.as_str(),
+                    &self.cfg.replica_id,
+                    epoch,
+                    self.cfg.lease_ttl,
+                )
+                .await
+                .unwrap_or(false);
+            if renewed {
+                continue;
+            }
+            // Lost the lease. Drop the partition's in-memory state and stop
+            // tracking it; a peer has (or will) take over.
+            warn!(
+                %project,
+                %partition,
+                epoch,
+                "lease renewal failed; dropping partition state",
+            );
+            {
+                let mut held = self.held_leases.lock().await;
+                held.remove(&(project, partition.clone()));
+            }
+            {
+                let mut map = self.partitions.lock().await;
+                map.remove(&(project, partition.clone()));
+            }
+            self.refresh_resident_stats().await;
         }
     }
 
@@ -670,6 +781,9 @@ fn unique_projects(map: &PartitionMap) -> usize {
 impl ShardImpl for InProcessShard {
     #[instrument(skip(self), fields(project = %project, partition = %partition))]
     async fn get(&self, project: &ProjectId, partition: &PartitionKey) -> Result<ProjectHandle> {
+        // Phase 6.X.A: acquire the lease before exposing the partition (no-op
+        // in no-lease mode). Errors if a peer holds a live lease.
+        self.ensure_lease(project, partition).await?;
         let state = self.load_or_create(project, partition).await?;
         self.refresh_resident_stats().await;
         let inner: Arc<dyn ProjectHandleImpl> = Arc::new(InProcessProjectHandle {
@@ -677,6 +791,7 @@ impl ShardImpl for InProcessShard {
             partition: partition.clone(),
             state,
             cfg: self.cfg.clone(),
+            held_leases: self.held_leases.clone(),
         });
         Ok(ProjectHandle { inner })
     }
@@ -719,10 +834,15 @@ impl ShardImpl for InProcessShard {
             let mut shutdown = rx;
             let mut evict_tick = tokio::time::interval(me.cfg.eviction_interval);
             let mut compact_tick = tokio::time::interval(me.cfg.compaction_interval);
+            // Phase 6.X.A: lease heartbeat. Only renews when a lease registry
+            // is configured (heartbeat_renew is a no-op otherwise), so the
+            // ticker firing in no-lease mode is harmless.
+            let mut heartbeat_tick = tokio::time::interval(me.cfg.lease_renew_interval);
             // First firing of `interval` is immediate; skip it so the loops
             // align with their configured cadence.
             evict_tick.tick().await;
             compact_tick.tick().await;
+            heartbeat_tick.tick().await;
             loop {
                 tokio::select! {
                     _ = &mut shutdown => break,
@@ -735,6 +855,9 @@ impl ShardImpl for InProcessShard {
                         if let Err(e) = me.compact_all().await {
                             warn!(error = %e, "compaction tick failed");
                         }
+                    }
+                    _ = heartbeat_tick.tick() => {
+                        me.heartbeat_renew().await;
                     }
                 }
             }
@@ -994,6 +1117,10 @@ struct InProcessProjectHandle {
     partition: PartitionKey,
     state: Arc<RwLock<PartitionState>>,
     cfg: ShardConfig,
+    /// Phase 6.X.A — shared view of the leases this replica holds, so the
+    /// write path can fence WAL appends with the current epoch. Empty in
+    /// no-lease mode (the WAL append then runs unfenced / back-compat).
+    held_leases: HeldLeases,
 }
 
 #[async_trait]
@@ -1001,10 +1128,17 @@ impl ProjectHandleImpl for InProcessProjectHandle {
     #[instrument(skip(self, batch), fields(project = %self.project, partition = %self.partition, table = %table, rows = batch.num_rows()))]
     async fn write_batch(&self, table: &TableName, batch: RecordBatch) -> Result<()> {
         let payload = encode_payload(table, &batch)?;
+        // Phase 6.X.A: fence the WAL append with our current lease epoch.
+        // `None` (no-lease mode) appends unconditionally — back-compat. A
+        // stale-epoch append (lost-lease dual writer) is rejected at the WAL.
+        let epoch = {
+            let held = self.held_leases.lock().await;
+            held.get(&(self.project, self.partition.clone())).copied()
+        };
         let lsn = self
             .cfg
             .wal
-            .append(&self.project, &self.partition, payload)
+            .append_fenced(&self.project, &self.partition, payload, epoch)
             .await?;
 
         let mut guard = self.state.write().await;
@@ -1297,7 +1431,7 @@ mod tests {
 
     use arrow_array::{Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
-    use basin_catalog::InMemoryCatalog;
+    use basin_catalog::{InMemoryCatalog, LeaseRegistry};
     use basin_common::{PartitionKey, ProjectId, TableName};
     use basin_storage::{Storage, StorageConfig};
     use basin_wal::{LocalWal, Wal, WalConfig};
@@ -1596,5 +1730,126 @@ mod tests {
                 names.value(i)
             );
         }
+    }
+
+    // ── Phase 6.X.A: lease heartbeat + fencing ───────────────────────────
+
+    /// Build a shard wired with an in-memory lease registry under `replica_id`.
+    /// The same `InMemoryCatalog` instance is used as catalog AND lease
+    /// registry so two shards built against the same catalog contend for real.
+    async fn leased_shard(
+        catalog: Arc<InMemoryCatalog>,
+        replica_id: &str,
+        ttl: Duration,
+    ) -> (crate::Shard, TempDir, TempDir) {
+        basin_common::telemetry::try_init_for_tests();
+        let storage_dir = TempDir::new().unwrap();
+        let wal_dir = TempDir::new().unwrap();
+        let storage_fs = LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap();
+        let wal_fs = LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap();
+        let storage = Storage::new(StorageConfig {
+            object_store: Arc::new(storage_fs),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let wal: Arc<dyn Wal> = Arc::new(
+            LocalWal::open(WalConfig {
+                object_store: Arc::new(wal_fs),
+                root_prefix: None,
+                flush_interval: Duration::from_millis(50),
+                flush_max_bytes: 1024 * 1024,
+            })
+            .await
+            .unwrap(),
+        );
+        let registry: Arc<dyn basin_catalog::LeaseRegistry> = catalog.clone();
+        let mut cfg = ShardConfig::new(storage, catalog, wal)
+            .with_lease_registry(registry, replica_id);
+        cfg.lease_ttl = ttl;
+        cfg.lease_renew_interval = Duration::from_millis(50);
+        (crate::Shard::new(cfg), storage_dir, wal_dir)
+    }
+
+    #[tokio::test]
+    async fn two_replicas_contend_for_lease() {
+        let catalog = Arc::new(InMemoryCatalog::new());
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+
+        // Replica A acquires the lease via `get`.
+        let (shard_a, _sa, _wa) =
+            leased_shard(catalog.clone(), "replica-a", Duration::from_secs(15)).await;
+        let _ha = shard_a.get(&project, &partition).await.unwrap();
+
+        // Replica B (same catalog/registry) is refused — A holds a live lease.
+        let (shard_b, _sb, _wb) =
+            leased_shard(catalog.clone(), "replica-b", Duration::from_secs(15)).await;
+        match shard_b.get(&project, &partition).await {
+            Err(BasinError::CommitConflict(_)) => {}
+            Ok(_) => panic!("second replica must be refused the lease"),
+            Err(e) => panic!("expected CommitConflict, got {e:?}"),
+        }
+
+        // The registry confirms A is the owner at epoch 1.
+        let owner = catalog.owner_of(&project, partition.as_str()).await.unwrap();
+        assert_eq!(owner, Some(("replica-a".to_string(), 1)));
+    }
+
+    #[tokio::test]
+    async fn lost_lease_drops_partition_state() {
+        let catalog = Arc::new(InMemoryCatalog::new());
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+
+        // A acquires with a short TTL so its lease can be stolen.
+        let (shard_a, _sa, _wa) =
+            leased_shard(catalog.clone(), "replica-a", Duration::from_millis(10)).await;
+        let _ha = shard_a.get(&project, &partition).await.unwrap();
+        let inner_a = impl_of(&shard_a);
+        assert_eq!(shard_a.stats().resident_partitions, 1);
+
+        // Let A's lease expire, then B steals it.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        catalog
+            .acquire(
+                &project,
+                partition.as_str(),
+                "replica-b",
+                Duration::from_secs(15),
+            )
+            .await
+            .unwrap()
+            .expect("B steals after expiry");
+
+        // A's heartbeat tick now fails to renew (lost lease) and drops state.
+        inner_a.run_heartbeat_once().await;
+        assert_eq!(
+            shard_a.stats().resident_partitions,
+            0,
+            "lost-lease partition state must be dropped",
+        );
+        // A no longer tracks the lease epoch.
+        assert_eq!(inner_a.lease_epoch(&project, &partition).await, None);
+    }
+
+    #[tokio::test]
+    async fn no_lease_mode_unaffected() {
+        // Without a lease registry, get() never acquires and writes go through
+        // the unfenced WAL path — byte-for-byte the old behaviour.
+        let (shard, _sd, _wd, _storage, _cat, _wal) = fresh_shard().await;
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+        let table = TableName::new("events").unwrap();
+
+        let inner = impl_of(&shard);
+        assert_eq!(inner.lease_epoch(&project, &partition).await, None);
+
+        let handle = shard.get(&project, &partition).await.unwrap();
+        handle.write_batch(&table, batch(0, 10, "v-")).await.unwrap();
+        // Heartbeat is a no-op with no registry.
+        inner.run_heartbeat_once().await;
+        let read = handle.read(&table, ReadOptions::default()).await.unwrap();
+        assert_eq!(rows_in(&read), 10);
     }
 }

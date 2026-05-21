@@ -31,6 +31,8 @@ mod functions;
 mod in_memory;
 pub mod info_schema;
 mod inbound_webhooks;
+/// Phase 6.X.A — partition-lease primitive (ADR 0023 foundation).
+pub mod leases;
 mod metadata;
 mod postgres;
 mod procedures;
@@ -56,6 +58,9 @@ pub use functions::{
     SqlArgType, SqlFunctionArg, SqlFunctionDef, SqlFunctionLanguage, SqlReturnType,
 };
 pub use in_memory::InMemoryCatalog;
+pub use leases::{
+    Lease, LeaseRegistry, DEFAULT_LEASE_RENEW_SECS, DEFAULT_LEASE_TTL_SECS,
+};
 pub use metadata::{
     CheckConstraint, ColumnStats, CvDef, DataFileRef, ForeignKeyDef, PartitionSpec, Policy,
     PolicyCommand, RefAction, SecondaryIndex, TableFileFormat, TableMetadata, UniqueConstraint,

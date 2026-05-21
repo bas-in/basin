@@ -350,9 +350,40 @@ impl WalImpl for FileWal {
         partition: &PartitionKey,
         payload: Bytes,
     ) -> Result<Lsn> {
+        // Unfenced append == no-lease mode (epoch None): never raises the
+        // fence, always accepted. Identical behaviour to pre-6.X.A.
+        self.append_fenced(project, partition, payload, None).await
+    }
+
+    #[tracing::instrument(skip(self, payload), fields(project=%project, partition=%partition, bytes=payload.len(), ?epoch))]
+    async fn append_fenced(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        payload: Bytes,
+        epoch: Option<i64>,
+    ) -> Result<Lsn> {
         let state = self.inner.get_or_create_partition(project, partition).await;
         let (lsn, should_flush) = {
             let mut guard = state.lock().await;
+            // Epoch fence (ADR 0023). `None` / `Some(0)` is the no-lease
+            // back-compat path: it never raises the fence and is always
+            // accepted. A real lease epoch must be >= the highest epoch this
+            // partition has seen; a strictly lower epoch is a stale
+            // dual-leaseholder write and is rejected before consuming an LSN.
+            if let Some(e) = epoch {
+                if e != 0 {
+                    if e < guard.fence_epoch {
+                        return Err(BasinError::wal(format!(
+                            "stale lease epoch {e} for {project}/{partition}: \
+                             fence is at {} (dual-leaseholder write rejected)",
+                            guard.fence_epoch
+                        )));
+                    }
+                    // Monotonically raise the fence to the winning epoch.
+                    guard.fence_epoch = e;
+                }
+            }
             let lsn = guard.next_lsn;
             guard.next_lsn = lsn.next();
             let now = Utc::now();
@@ -879,6 +910,80 @@ mod tests {
         for i in 1..=1000u64 {
             assert!(seen.contains(&Lsn(i)), "missing lsn {i}");
         }
+        wal.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fence_rejects_stale_epoch() {
+        // Phase 6.X.A epoch fence: a higher epoch raises the fence; a later
+        // append with a strictly lower epoch is rejected; the current (or a
+        // higher) epoch succeeds.
+        let dir = TempDir::new().unwrap();
+        let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
+        let project = ProjectId::new();
+        let part = PartitionKey::default_key();
+
+        // Epoch 1 winner raises the fence.
+        wal.append_fenced(&project, &part, payload(1), Some(1))
+            .await
+            .unwrap();
+        // Epoch 2 winner raises it further.
+        wal.append_fenced(&project, &part, payload(2), Some(2))
+            .await
+            .unwrap();
+
+        // A stale epoch-1 holder (dual-leaseholder loser) is rejected.
+        let err = wal
+            .append_fenced(&project, &part, payload(3), Some(1))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, BasinError::Wal(_)),
+            "stale-epoch append must be a Wal fencing error, got {err:?}"
+        );
+
+        // The current epoch still succeeds, as does a higher one.
+        wal.append_fenced(&project, &part, payload(4), Some(2))
+            .await
+            .unwrap();
+        wal.append_fenced(&project, &part, payload(5), Some(3))
+            .await
+            .unwrap();
+
+        // Exactly the four accepted appends are durable; the rejected one
+        // consumed no LSN.
+        wal.flush().await.unwrap();
+        let all = wal.read_from(&project, &part, Lsn::ZERO).await.unwrap();
+        assert_eq!(all.len(), 4, "rejected append must not consume an LSN");
+        wal.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fence_no_lease_mode_always_appends() {
+        // Back-compat: epoch None and Some(0) never raise the fence and are
+        // always accepted, even interleaved with fenced appends.
+        let dir = TempDir::new().unwrap();
+        let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
+        let project = ProjectId::new();
+        let part = PartitionKey::default_key();
+
+        // Raise the fence to epoch 5 with a fenced append.
+        wal.append_fenced(&project, &part, payload(1), Some(5))
+            .await
+            .unwrap();
+        // No-lease appends (None and 0) still succeed despite the raised fence.
+        wal.append_fenced(&project, &part, payload(2), None)
+            .await
+            .unwrap();
+        wal.append_fenced(&project, &part, payload(3), Some(0))
+            .await
+            .unwrap();
+        // And the plain append() (no-lease) path is unaffected.
+        wal.append(&project, &part, payload(4)).await.unwrap();
+
+        wal.flush().await.unwrap();
+        let all = wal.read_from(&project, &part, Lsn::ZERO).await.unwrap();
+        assert_eq!(all.len(), 4, "no-lease appends must all be accepted");
         wal.close().await.unwrap();
     }
 

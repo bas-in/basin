@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use basin_common::{
     BasinError, ChangeOp, ProjectId, QualifiedTableName, Result, SchemaName, TableName,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls};
 use tracing::instrument;
@@ -495,6 +495,24 @@ impl PostgresCatalog {
                    END IF; \
                  END $$"
             ),
+            // Phase 6.X.A — partition leases (ADR 0023). One row per
+            // `(project, partition)` records the current leaseholder and its
+            // monotonic fencing `epoch`. `acquire` is `INSERT … ON CONFLICT
+            // DO NOTHING` (first grant) plus `UPDATE … WHERE expires_at <
+            // now()` (steal-on-expiry); `renew` extends `expires_at` while the
+            // holder/epoch still match. `project_id` is the ULID string form,
+            // matching every other catalog table's keying.
+            format!(
+                "CREATE TABLE IF NOT EXISTS {schema}.partition_leases (
+                    project_id    TEXT NOT NULL,
+                    partition_id  TEXT NOT NULL,
+                    holder        TEXT NOT NULL,
+                    epoch         BIGINT NOT NULL,
+                    granted_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    expires_at    TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (project_id, partition_id)
+                )"
+            ),
         ];
         let client = self.client.lock().await;
         for stmt in stmts {
@@ -944,6 +962,13 @@ impl Catalog for PostgresCatalog {
         )
         .await
         .map_err(|e| BasinError::catalog(format!("drop_namespace basin_schemas: {e}")))?;
+        // Phase 6.X.A: drop every partition lease this project held.
+        tx.execute(
+            &format!("DELETE FROM {sch}.partition_leases WHERE project_id = $1"),
+            &[&project.to_string()],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("drop_namespace partition_leases: {e}")))?;
         tx.execute(
             &format!("DELETE FROM {sch}.namespaces WHERE project_id = $1"),
             &[&project.to_string()],
@@ -3849,6 +3874,190 @@ impl PostgresCatalog {
             }
         }
         Ok(out)
+    }
+}
+
+#[async_trait]
+impl crate::leases::LeaseRegistry for PostgresCatalog {
+    #[instrument(skip(self), fields(project = %project, partition = %partition_id, holder = %holder))]
+    async fn acquire(
+        &self,
+        project: &ProjectId,
+        partition_id: &str,
+        holder: &str,
+        ttl: std::time::Duration,
+    ) -> Result<Option<crate::leases::Lease>> {
+        let sch = &self.schema;
+        let project_str = project.to_string();
+        let ttl_secs = i64::try_from(ttl.as_secs())
+            .map_err(|_| BasinError::catalog(format!("lease ttl {ttl:?} overflows BIGINT")))?;
+
+        let mut client = self.client.lock().await;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| BasinError::catalog(format!("begin lease acquire: {e}")))?;
+
+        // Lock the row (if any) for the duration of the CAS so two replicas
+        // racing to acquire serialise here rather than both winning. The row
+        // lock is per-(project, partition); other partitions are unaffected.
+        let row = tx
+            .query_opt(
+                &format!(
+                    "SELECT holder, epoch, expires_at FROM {sch}.partition_leases \
+                     WHERE project_id = $1 AND partition_id = $2 \
+                     FOR UPDATE"
+                ),
+                &[&project_str, &partition_id],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("lease acquire lock: {e}")))?;
+
+        let now = Utc::now();
+        let expires_at = now + chrono::Duration::seconds(ttl_secs);
+
+        let new_epoch: i64 = match &row {
+            // First grant — no row exists. Epoch starts at 1.
+            None => 1,
+            Some(r) => {
+                let existing_holder: String = r.get(0);
+                let existing_epoch: i64 = r.get(1);
+                let existing_expires: DateTime<Utc> = r.get(2);
+                // (Re)grant if it's already ours or expired; else lose the race.
+                if existing_holder == holder || existing_expires <= now {
+                    existing_epoch + 1
+                } else {
+                    tx.rollback().await.ok();
+                    return Ok(None);
+                }
+            }
+        };
+
+        // UPSERT the grant. ON CONFLICT covers the "row exists" branch we just
+        // CAS-checked under the FOR UPDATE lock.
+        tx.execute(
+            &format!(
+                "INSERT INTO {sch}.partition_leases \
+                   (project_id, partition_id, holder, epoch, granted_at, expires_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT (project_id, partition_id) DO UPDATE \
+                   SET holder = EXCLUDED.holder, \
+                       epoch = EXCLUDED.epoch, \
+                       granted_at = EXCLUDED.granted_at, \
+                       expires_at = EXCLUDED.expires_at"
+            ),
+            &[
+                &project_str,
+                &partition_id,
+                &holder,
+                &new_epoch,
+                &now,
+                &expires_at,
+            ],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("lease acquire upsert: {e}")))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| BasinError::catalog(format!("commit lease acquire: {e}")))?;
+
+        Ok(Some(crate::leases::Lease {
+            project: *project,
+            partition_id: partition_id.to_string(),
+            holder: holder.to_string(),
+            epoch: new_epoch,
+            granted_at: now,
+            expires_at,
+        }))
+    }
+
+    #[instrument(skip(self), fields(project = %project, partition = %partition_id, holder = %holder, epoch))]
+    async fn renew(
+        &self,
+        project: &ProjectId,
+        partition_id: &str,
+        holder: &str,
+        epoch: i64,
+        ttl: std::time::Duration,
+    ) -> Result<bool> {
+        let sch = &self.schema;
+        let ttl_secs = i64::try_from(ttl.as_secs())
+            .map_err(|_| BasinError::catalog(format!("lease ttl {ttl:?} overflows BIGINT")))?;
+        let now = Utc::now();
+        let expires_at = now + chrono::Duration::seconds(ttl_secs);
+        let client = self.client.lock().await;
+        // Only extend if still ours at the exact epoch and not yet expired.
+        // A single conditional UPDATE is the CAS — no transaction needed.
+        let n = client
+            .execute(
+                &format!(
+                    "UPDATE {sch}.partition_leases \
+                     SET expires_at = $5 \
+                     WHERE project_id = $1 AND partition_id = $2 \
+                       AND holder = $3 AND epoch = $4 AND expires_at > $6"
+                ),
+                &[
+                    &project.to_string(),
+                    &partition_id,
+                    &holder,
+                    &epoch,
+                    &expires_at,
+                    &now,
+                ],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("lease renew: {e}")))?;
+        Ok(n == 1)
+    }
+
+    #[instrument(skip(self), fields(project = %project, partition = %partition_id, holder = %holder))]
+    async fn release(
+        &self,
+        project: &ProjectId,
+        partition_id: &str,
+        holder: &str,
+    ) -> Result<bool> {
+        let sch = &self.schema;
+        let client = self.client.lock().await;
+        let n = client
+            .execute(
+                &format!(
+                    "DELETE FROM {sch}.partition_leases \
+                     WHERE project_id = $1 AND partition_id = $2 AND holder = $3"
+                ),
+                &[&project.to_string(), &partition_id, &holder],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("lease release: {e}")))?;
+        Ok(n >= 1)
+    }
+
+    #[instrument(skip(self), fields(project = %project, partition = %partition_id))]
+    async fn owner_of(
+        &self,
+        project: &ProjectId,
+        partition_id: &str,
+    ) -> Result<Option<(String, i64)>> {
+        let sch = &self.schema;
+        let client = self.client.lock().await;
+        // Expired rows have no live owner: filter on expires_at > now() so a
+        // lingering row is reported as unowned (reclaimable).
+        let row = client
+            .query_opt(
+                &format!(
+                    "SELECT holder, epoch FROM {sch}.partition_leases \
+                     WHERE project_id = $1 AND partition_id = $2 AND expires_at > now()"
+                ),
+                &[&project.to_string(), &partition_id],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("lease owner_of: {e}")))?;
+        Ok(row.map(|r| {
+            let holder: String = r.get(0);
+            let epoch: i64 = r.get(1);
+            (holder, epoch)
+        }))
     }
 }
 
