@@ -106,7 +106,7 @@ fn engine_in(dir: &TempDir) -> Engine {
 /// Asserts `HardCapReached` for the noisy project and `Granted` for the quiet
 /// project — the quiet project's bucket is independent.
 #[tokio::test]
-async fn a_htap_hard_cap_isolates_noisy_tenant() {
+async fn a_htap_hard_cap_isolates_noisy_project() {
     basin_common::telemetry::try_init_for_tests();
 
     // Tiny caps so the noisy project exhausts quickly.

@@ -74,10 +74,10 @@ use basin_fn::governance::{FunctionCaps, FunctionGovernance};
 
 /// Project count for the short variant. Matches the task spec
 /// ("100 tenants × concurrent function invocations").
-const TENANT_COUNT: usize = 100;
+const PROJECT_COUNT: usize = 100;
 
 /// Per-tenant burst size for the short variant.
-const INVOCATIONS_PER_TENANT: usize = 50;
+const INVOCATIONS_PER_PROJECT: usize = 50;
 
 /// Per-invocation "work" — sleep on the blocking thread. Tiny so 100
 /// tenants × 50 calls finish in seconds, not minutes. The soak's
@@ -88,7 +88,7 @@ const PER_CALL_WORK: Duration = Duration::from_millis(2);
 /// non-trivial in-flight overlap without making the test slow.
 const PROJECT_CONCURRENCY: usize = 4;
 
-/// LRU cap on the per-project semaphore map. Below `TENANT_COUNT` so the
+/// LRU cap on the per-project semaphore map. Below `PROJECT_COUNT` so the
 /// LRU eviction path fires during the soak (the invariant "per-tenant
 /// cost is O(bytes), not O(projects ever seen)" — see ADR notes in
 /// `governance.rs`).
@@ -111,37 +111,37 @@ fn soak_caps() -> FunctionCaps {
 // Invariant #1 + #2: bounded memory, caps honoured, no leaked permits
 // ---------------------------------------------------------------------------
 //
-// 100 tenants × `INVOCATIONS_PER_TENANT` concurrent invocations each.
+// 100 tenants × `INVOCATIONS_PER_PROJECT` concurrent invocations each.
 // After the soak:
 //   - the LRU semaphore map is capped at `SEMAPHORE_LRU_CAP`
-//     (it can't grow to TENANT_COUNT)
+//     (it can't grow to PROJECT_COUNT)
 //   - every project's in-flight count is back to zero
 //     (no leaked semaphore permit)
 //   - peak in-flight across every project never exceeded its
 //     `project_concurrency` cap
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn soak_100_tenants_short_variant_invariants_hold() {
+async fn soak_100_projects_short_variant_invariants_hold() {
     let gov = FunctionGovernance::new(soak_caps());
 
     // Pre-allocate stable ProjectId values so we can re-probe `in_flight`
     // after the soak.
-    let projects: Vec<ProjectId> = (0..TENANT_COUNT).map(|_| ProjectId::new()).collect();
+    let projects: Vec<ProjectId> = (0..PROJECT_COUNT).map(|_| ProjectId::new()).collect();
 
     // Per-project peak in-flight tracker. Each tenant has its own counter
     // bumped by every closure entry / decremented on exit.
     let peak_in_flight: Arc<Vec<AtomicUsize>> = Arc::new(
-        (0..TENANT_COUNT).map(|_| AtomicUsize::new(0)).collect(),
+        (0..PROJECT_COUNT).map(|_| AtomicUsize::new(0)).collect(),
     );
     let live_in_flight: Arc<Vec<AtomicUsize>> = Arc::new(
-        (0..TENANT_COUNT).map(|_| AtomicUsize::new(0)).collect(),
+        (0..PROJECT_COUNT).map(|_| AtomicUsize::new(0)).collect(),
     );
 
     let started = Instant::now();
-    let mut handles = Vec::with_capacity(TENANT_COUNT * INVOCATIONS_PER_TENANT);
+    let mut handles = Vec::with_capacity(PROJECT_COUNT * INVOCATIONS_PER_PROJECT);
 
-    for (tenant_idx, project) in projects.iter().enumerate() {
-        for _ in 0..INVOCATIONS_PER_TENANT {
+    for (project_idx, project) in projects.iter().enumerate() {
+        for _ in 0..INVOCATIONS_PER_PROJECT {
             let gov = gov.clone();
             let project = *project;
             let live = live_in_flight.clone();
@@ -149,10 +149,10 @@ async fn soak_100_tenants_short_variant_invariants_hold() {
             handles.push(tokio::spawn(async move {
                 gov.invoke_with_caps(project, move || {
                     // Bump live → track peak → do the bounded work → decrement.
-                    let cur = live[tenant_idx].fetch_add(1, Ordering::SeqCst) + 1;
-                    peak[tenant_idx].fetch_max(cur, Ordering::SeqCst);
+                    let cur = live[project_idx].fetch_add(1, Ordering::SeqCst) + 1;
+                    peak[project_idx].fetch_max(cur, Ordering::SeqCst);
                     std::thread::sleep(PER_CALL_WORK);
-                    live[tenant_idx].fetch_sub(1, Ordering::SeqCst);
+                    live[project_idx].fetch_sub(1, Ordering::SeqCst);
                     Ok::<_, anyhow::Error>(())
                 })
                 .await
@@ -170,14 +170,14 @@ async fn soak_100_tenants_short_variant_invariants_hold() {
         }
     }
     let elapsed = started.elapsed();
-    let expected_total = TENANT_COUNT * INVOCATIONS_PER_TENANT;
+    let expected_total = PROJECT_COUNT * INVOCATIONS_PER_PROJECT;
     assert_eq!(
         ok_count, expected_total,
         "every soak invocation must complete cleanly"
     );
 
     println!(
-        "soak short variant: {expected_total} invocations across {TENANT_COUNT} tenants in {elapsed:?}"
+        "soak short variant: {expected_total} invocations across {PROJECT_COUNT} tenants in {elapsed:?}"
     );
 
     // Invariant #2: no per-tenant cap breach.
@@ -203,7 +203,7 @@ async fn soak_100_tenants_short_variant_invariants_hold() {
     }
 
     // Invariant #1b: per-project semaphore map is LRU-bounded — it cannot
-    // grow to TENANT_COUNT. The dropped projects' semaphores were freed
+    // grow to PROJECT_COUNT. The dropped projects' semaphores were freed
     // (the load-bearing fix from W5-followup #16 / Phase 6.P0.C).
     let cache_len = gov.project_semaphore_cache_len();
     assert!(
@@ -212,7 +212,7 @@ async fn soak_100_tenants_short_variant_invariants_hold() {
     );
     println!(
         "soak: per-project semaphore cache size = {cache_len} (cap {SEMAPHORE_LRU_CAP}, \
-         had {TENANT_COUNT} distinct tenants)"
+         had {PROJECT_COUNT} distinct tenants)"
     );
 }
 
@@ -356,8 +356,8 @@ async fn long_variant_1h_no_growth() {
     let mut iter = 0u64;
     let mut last_log = Instant::now();
     while Instant::now() < deadline {
-        let mut handles = Vec::with_capacity(TENANT_COUNT);
-        for _ in 0..TENANT_COUNT {
+        let mut handles = Vec::with_capacity(PROJECT_COUNT);
+        for _ in 0..PROJECT_COUNT {
             let gov = gov.clone();
             let project = ProjectId::new();
             handles.push(tokio::spawn(async move {

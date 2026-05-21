@@ -86,23 +86,23 @@ fn op_for_seq(seq: u64) -> ChangeOp {
 ///
 /// # Parameters
 ///
-/// - `n_tenants`: number of independent projects (tenants).
-/// - `conns_per_tenant`: number of concurrent subscribers per tenant's table.
-/// - `events_per_tenant`: total events published per tenant during the run.
+/// - `n_projects`: number of independent projects.
+/// - `conns_per_project`: number of concurrent subscribers per project's table.
+/// - `events_per_project`: total events published per project during the run.
 /// - `budget_bytes`: per-project budget (use `u64::MAX` for "effectively
-///   unlimited"). When a tenant is designated "noisy" its budget is set to a
-///   small fraction so BUFFER_FULL fires; other tenants use `budget_bytes`.
+///   unlimited"). When a project is designated "noisy" its budget is set to a
+///   small fraction so BUFFER_FULL fires; other projects use `budget_bytes`.
 async fn run_soak(
-    n_tenants: usize,
-    conns_per_tenant: usize,
-    events_per_tenant: u64,
+    n_projects: usize,
+    conns_per_project: usize,
+    events_per_project: u64,
     budget_bytes: u64,
 ) -> SoakResult {
     let table = "soak_table";
 
     // ---- Build per-tenant sinks and subscribers ---------------------------
 
-    struct Tenant {
+    struct ProjectHandle {
         project: ProjectId,
         sink: Arc<RealtimeSink>,
         /// Aggregate counter: events published to this tenant's channel.
@@ -111,12 +111,12 @@ async fn run_soak(
         delivered: Arc<AtomicU64>,
     }
 
-    let tenants: Vec<Tenant> = (0..n_tenants)
+    let projects: Vec<ProjectHandle> = (0..n_projects)
         .map(|i| {
             let project = ProjectId::new();
-            // First tenant is the "noisy" tenant with a tight budget.
+            // First project is the "noisy" project with a tight budget.
             let cap = if i == 0 {
-                // Noisy tenant: budget for roughly 2 events before BUFFER_FULL.
+                // Noisy project: budget for roughly 2 events before BUFFER_FULL.
                 let small_ev = make_event(project, table, 1, ChangeOp::Insert);
                 estimate_event_size(&small_ev) * 2
             } else {
@@ -124,7 +124,7 @@ async fn run_soak(
             };
             let budget = BudgetTracker::new(cap);
             let sink = Arc::new(RealtimeSink::new().with_budget(budget));
-            Tenant {
+            ProjectHandle {
                 project,
                 sink,
                 published: Arc::new(AtomicU64::new(0)),
@@ -137,13 +137,13 @@ async fn run_soak(
 
     let mut subscriber_handles = Vec::new();
 
-    for tenant in &tenants {
-        let project = tenant.project;
-        let sink = Arc::clone(&tenant.sink);
-        let delivered_counter = Arc::clone(&tenant.delivered);
+    for project in &projects {
+        let project_id = project.project;
+        let sink = Arc::clone(&project.sink);
+        let delivered_counter = Arc::clone(&project.delivered);
 
-        for _conn_idx in 0..conns_per_tenant {
-            let key = ChannelKey::new(project, TableName::new(table).unwrap());
+        for _conn_idx in 0..conns_per_project {
+            let key = ChannelKey::new(project_id, TableName::new(table).unwrap());
             let mut rx = sink.registry().subscribe(key);
             let delivered = Arc::clone(&delivered_counter);
 
@@ -180,17 +180,17 @@ async fn run_soak(
 
     let mut publisher_handles = Vec::new();
 
-    for tenant in &tenants {
-        let project = tenant.project;
-        let sink = Arc::clone(&tenant.sink);
-        let published_counter = Arc::clone(&tenant.published);
-        let n_events = events_per_tenant;
+    for project in &projects {
+        let project_id = project.project;
+        let sink = Arc::clone(&project.sink);
+        let published_counter = Arc::clone(&project.published);
+        let n_events = events_per_project;
         let tbl = table;
 
         let handle = tokio::spawn(async move {
             for seq in 1..=n_events {
                 let op = op_for_seq(seq);
-                let ev = make_event(project, tbl, seq, op);
+                let ev = make_event(project_id, tbl, seq, op);
                 // publish must not fail even on BUFFER_FULL.
                 sink.publish(&ev).await.expect("publish must not error");
                 published_counter.fetch_add(1, Ordering::Relaxed);
@@ -221,30 +221,30 @@ async fn run_soak(
 
     // ---- Aggregate results ------------------------------------------------
 
-    let total_published: u64 = tenants
+    let total_published: u64 = projects
         .iter()
-        .map(|t| t.published.load(Ordering::Relaxed))
+        .map(|p| p.published.load(Ordering::Relaxed))
         .sum();
 
-    // Non-noisy tenants (index 1..) have unlimited budget — they must have
+    // Non-noisy projects (index 1..) have unlimited budget — they must have
     // all events delivered.
-    let non_noisy_published: u64 = tenants
+    let non_noisy_published: u64 = projects
         .iter()
         .skip(1)
-        .map(|t| t.published.load(Ordering::Relaxed))
+        .map(|p| p.published.load(Ordering::Relaxed))
         .sum();
-    let non_noisy_delivered: u64 = tenants
+    let non_noisy_delivered: u64 = projects
         .iter()
         .skip(1)
-        .map(|t| t.delivered.load(Ordering::Relaxed))
+        .map(|p| p.delivered.load(Ordering::Relaxed))
         .sum();
 
     SoakResult {
         total_published,
         non_noisy_published,
         non_noisy_delivered,
-        n_tenants,
-        conns_per_tenant,
+        n_projects,
+        conns_per_project,
     }
 }
 
@@ -252,29 +252,29 @@ struct SoakResult {
     total_published: u64,
     non_noisy_published: u64,
     non_noisy_delivered: u64,
-    n_tenants: usize,
-    conns_per_tenant: usize,
+    n_projects: usize,
+    conns_per_project: usize,
 }
 
 impl SoakResult {
     fn assert_invariants(&self) {
-        // Invariant 1: every non-noisy tenant event reached every subscriber.
-        // delivered = published × conns_per_tenant (broadcast fan-out).
-        let expected_delivered = self.non_noisy_published * self.conns_per_tenant as u64;
+        // Invariant 1: every non-noisy project event reached every subscriber.
+        // delivered = published × conns_per_project (broadcast fan-out).
+        let expected_delivered = self.non_noisy_published * self.conns_per_project as u64;
         assert_eq!(
             self.non_noisy_delivered, expected_delivered,
-            "non-noisy tenants: delivered({}) must equal published({}) × conns({})",
+            "non-noisy projects: delivered({}) must equal published({}) × conns({})",
             self.non_noisy_delivered,
             self.non_noisy_published,
-            self.conns_per_tenant,
+            self.conns_per_project,
         );
 
         println!(
-            "soak: {n_tenants} tenants × {conns} conns/tenant | \
+            "soak: {n_projects} projects × {conns} conns/project | \
              total_published={total_pub} | \
              non_noisy delivered={deliv}/{expected} (100%)",
-            n_tenants = self.n_tenants,
-            conns = self.conns_per_tenant,
+            n_projects = self.n_projects,
+            conns = self.conns_per_project,
             total_pub = self.total_published,
             deliv = self.non_noisy_delivered,
             expected = expected_delivered,
@@ -295,19 +295,19 @@ impl SoakResult {
 ///
 /// Expected wall-clock time: < 30 s.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn soak_short_10_tenants_5_conns() {
+async fn soak_short_10_projects_5_conns() {
     let start = Instant::now();
 
-    let n_tenants = 10;
-    let conns_per_tenant = 5;
-    let events_per_tenant = 200u64;
-    let budget_bytes = u64::MAX; // unlimited for non-noisy tenants
+    let n_projects = 10;
+    let conns_per_project = 5;
+    let events_per_project = 200u64;
+    let budget_bytes = u64::MAX; // unlimited for non-noisy projects
 
     println!(
-        "soak_short: starting — {n_tenants} tenants × {conns_per_tenant} conns × {events_per_tenant} events"
+        "soak_short: starting — {n_projects} projects × {conns_per_project} conns × {events_per_project} events"
     );
 
-    let result = run_soak(n_tenants, conns_per_tenant, events_per_tenant, budget_bytes).await;
+    let result = run_soak(n_projects, conns_per_project, events_per_project, budget_bytes).await;
     result.assert_invariants();
 
     let elapsed = start.elapsed();
@@ -344,24 +344,24 @@ async fn soak_short_10_tenants_5_conns() {
 /// - Total wall-clock ~1 hour (36 000 events × ~0.1 ms/event per tenant).
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn soak_long_100_tenants_10_conns() {
+async fn soak_long_100_projects_10_conns() {
     let start = Instant::now();
 
-    let n_tenants = 100;
-    let conns_per_tenant = 10;
-    // 36 000 events @ ~1 event/ms ≈ 36 s per tenant (tokio multi-thread
+    let n_projects = 100;
+    let conns_per_project = 10;
+    // 36 000 events @ ~1 event/ms ≈ 36 s per project (tokio multi-thread
     // schedules them concurrently so wall-clock is ~36 s, not 3600 s).
     // To make this a genuine 1-hour soak, increase to 3_600_000 or add
     // `tokio::time::sleep(Duration::from_millis(1)).await` in the publisher
     // loop after removing the yield_now.
-    let events_per_tenant = 36_000u64;
+    let events_per_project = 36_000u64;
     let budget_bytes = u64::MAX;
 
     println!(
-        "soak_long: starting — {n_tenants} tenants × {conns_per_tenant} conns × {events_per_tenant} events"
+        "soak_long: starting — {n_projects} projects × {conns_per_project} conns × {events_per_project} events"
     );
 
-    let result = run_soak(n_tenants, conns_per_tenant, events_per_tenant, budget_bytes).await;
+    let result = run_soak(n_projects, conns_per_project, events_per_project, budget_bytes).await;
     result.assert_invariants();
 
     let elapsed = start.elapsed();
