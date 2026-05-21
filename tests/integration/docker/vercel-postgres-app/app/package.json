@@ -1,0 +1,17 @@
+{
+  "name": "vercel-postgres-app",
+  "version": "1.0.0",
+  "description": "Minimal Vercel-serverless-function-shaped app for Basin Phase 5.27.C e2e load test. Uses `pg` (node-postgres) instead of `@vercel/postgres` — see README.md §Driver Substitution.",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "check": "node --check app.js"
+  },
+  "dependencies": {
+    "pg": "^8.13.3"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "Apache-2.0"
+}

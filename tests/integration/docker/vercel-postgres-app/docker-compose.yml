@@ -1,0 +1,86 @@
+# Phase 5.27.C — docker-compose stack for Basin vercel-postgres e2e test.
+#
+# Services
+# ────────────────────────────────────────────────────────────────────────────
+#   basin-server  — Basin pgwire endpoint with transaction-mode pooling enabled.
+#   node-app      — Vercel-serverless-function-shaped load harness; runs
+#                   50 concurrent invocations × 10 queries and exposes results
+#                   at GET /bench (HTTP 3000).
+#
+# Usage
+# ────────────────────────────────────────────────────────────────────────────
+#   # From repo root — build Basin image first:
+#   docker build -t basin-server .
+#
+#   # Then run the e2e stack (from this directory or pass -f):
+#   docker compose up --build --abort-on-container-exit
+#
+#   # The node-app exits 0 when /bench returns ok=true, non-zero otherwise.
+#   # docker compose returns that exit code to the shell.
+#
+#   # Cleanup:
+#   docker compose down -v
+
+name: basin-vercel-e2e
+
+networks:
+  basin-net:
+    driver: bridge
+
+services:
+
+  # ── Basin pgwire server ────────────────────────────────────────────────────
+  basin-server:
+    image: basin-server
+    # Build from the workspace root when no pre-built image exists:
+    #   docker build -t basin-server .
+    # We do NOT build here to keep CI cache hits; build once, run many.
+    environment:
+      # Bind on all interfaces so node-app can reach it by service name.
+      BASIN_BIND: "0.0.0.0:5432"
+      BASIN_DATA_DIR: "/var/basin"
+      BASIN_STORAGE_BACKEND: "local"
+      # Provision a single project for the "basin" user (no auth required).
+      BASIN_PROJECTS: "basin=*"
+      # Enable transaction-mode pooling (Phase 5.27.B).
+      # basin-router reads this and sets PoolMode::Transaction for all
+      # incoming connections that carry ?pool_mode=transaction in the DSN.
+      BASIN_POOL_MODE: "transaction"
+    volumes:
+      - basin-data:/var/basin
+    networks:
+      - basin-net
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "5432"]
+      interval: 5s
+      timeout: 3s
+      start_period: 30s
+      retries: 10
+    # Restart until healthy during the grace period only.
+    restart: "no"
+
+  # ── Node.js load harness ───────────────────────────────────────────────────
+  node-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      PORT: "3000"
+      # DSN for Basin.  ?pool_mode=transaction is forwarded to Basin's router
+      # (the pg driver strips it before dialling — see app.js URL handling).
+      POSTGRES_URL: "postgres://basin@basin-server:5432/basin?pool_mode=transaction"
+      # Tune if needed during CI environment adjustment.
+      # P99_BUDGET_MS: "100"
+    ports:
+      # Expose on the host so the Rust test (pool_vercel_adapter.rs) can poll
+      # /health and fetch /bench results without joining the compose network.
+      - "3000:3000"
+    networks:
+      - basin-net
+    depends_on:
+      basin-server:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  basin-data:
