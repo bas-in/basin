@@ -6,6 +6,48 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-21 — Two wide waves (6 + 5 agents): JSONB GIN probe, Phase 5.27 complete, FTS core, examples, docs
+
+**Wave A (6 agents, all file-disjoint, coherence EXIT 0):** `337b1ee` 5.19.C
+JSONB GIN containment probe (posting-list AND-merge; advisory candidate-prune,
+not yet wired into the DataFusion scan so the ≥10× perf gate stays ignored —
+that needs a physical-scan override in a later phase). `912696f` 5.27.E
+session-leakage scrub (DISCARD ALL on return) — **Phase 5.27 now fully done**
+(B/D/E + harness); 2 leakage cases pass, 4 stay ignored on real upstream stubs
+(PREPARE/EXECUTE noop, temp-table catalog tracking, LISTEN routing,
+pg_advisory_lock). `ab3d76c` 5.25.D/E/F migration tests (Diesel/sqlx/Prisma,
+skip-if-absent). `ed5890f` 5.32.A tutorial+samples harness. `22d470b` 5.32.C
+saas-starter, `c5af7d2` 5.32.D ai-rag-app (both build clean; `@bas-in/basin-js`
++ `@basin/functions` are forward-spec so a local stub is aliased — documented).
+
+**Wave B (5 agents):** `96b51ed` FTS 5.20.B/C/D — **NOTE: implemented via the
+existing FTS path, NOT the spec's new-file architecture** (`tsvector.rs` /
+`udfs/fts.rs` / `operators/fts_match.rs` were NOT created). The agent instead
+fixed `ALTER TABLE ADD COLUMN tsvector` metadata routing in `types.rs`+`alter.rs`
+and flipped `fts_harness` 5/5 green (fts_stubs 20/20, fts_at_at 9/10 still green).
+Acceptance (harness green) met, but future FTS work (5.20.E GIN-on-tsvector)
+should look in types.rs/alter.rs/the existing UDF registry, not the spec paths.
+`8ba686e` 5.32.B tutorial + 5.25.G matrix (see race note). `57628b7` 5.27.C
+vercel-postgres docker e2e (substituted `pg` for `@vercel/postgres` — the latter
+requires Neon's WS proxy, can't hit raw pgwire). `d8b1c8d` 5.31.C/D publish
+workflow finalized (was mostly scaffolded in 5.31.A; fixed a hardcoded Docker Hub
+username → secret).
+
+**LESSON — parallel-agent commit race.** Two agents (5.32.B tutorial, 5.25.G
+matrix) both ran `git add <paths>` + `git commit` concurrently on the shared
+tree. `git commit` captures the WHOLE index, so the first commit (`8ba686e`,
+titled 5.25.G) swept up the tutorial agent's staged files, and the matrix
+agent's own files were left uncommitted (recovered in a follow-up commit). The
+HARD-STOP ban on `git add -A/.` does NOT prevent this — explicit-path `add` still
+shares one index. **Mitigations going forward:** (a) prefer giving each
+Rust/doc-writing agent `isolation: "worktree"` when >1 agent may commit in the
+same window; or (b) have agents stage+commit only, and serialize the actual
+commits; or (c) accept the race for purely-disjoint file sets and just sweep
+stranded files afterward (what I did). Content was never lost — only
+mis-attributed to the wrong commit.
+
+---
+
 ## 2026-05-21 — #63 vortex 0.70→0.71 bump landed solo (arrow-58 held; 6/7 extra_types green)
 
 Commit `5d4c92d`. Ran SOLO (dep bump recompiles the whole downstream tree).
