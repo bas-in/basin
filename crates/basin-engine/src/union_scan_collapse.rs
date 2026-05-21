@@ -186,6 +186,25 @@ fn try_collapse(union: Union) -> Result<Transformed<LogicalPlan>> {
             predicates.push(infos[idx].predicate.clone());
         }
 
+        // Safety: do NOT collapse when all predicates are identical.
+        // `P OR P = P`, which is semantically correct as a predicate but
+        // wrong for UNION ALL row-count semantics: two branches with the same
+        // filter both produce the same rows, and UNION ALL must return them
+        // twice. Collapsing would return them once. This is the RLS bug:
+        // `SELECT t FROM tbl UNION ALL SELECT t FROM tbl` with identical RLS
+        // filters on both arms must return 2 rows, not 1.
+        let all_predicates_identical = predicates.windows(2).all(|w| {
+            match (&w[0], &w[1]) {
+                (Some(a), Some(b)) => format!("{a:?}") == format!("{b:?}"),
+                (None, None) => true,
+                _ => false,
+            }
+        });
+        if all_predicates_identical {
+            // Skip collapsing this group — leave the branches as-is.
+            continue;
+        }
+
         let scan = Arc::clone(&infos[first_idx].scan);
 
         // If any branch is unfiltered, the merged result is also unfiltered.
