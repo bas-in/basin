@@ -1602,7 +1602,7 @@ tested matrix in `CAPABILITIES.md` closes a real adoption objection.
 harness scaffolds first so each tool's verification slots in
 consistently.
 
-- [ ] **5.25.A — Shared migration-tool test scaffold** (~1 day,
+- [x] **5.25.A — Shared migration-tool test scaffold** (~1 day,
       lands first). docker-compose fixture template + ephemeral
       Basin instance launcher + result-comparison helpers
       (introspection diff, ORM-query battery against the migrated
@@ -1724,7 +1724,7 @@ edge-runtime wedge.
 isolation + session-leakage detection battery lands red first;
 each impl sub-task flips a named slice green.
 
-- [ ] **5.27.A — Txn-mode pool + serverless test harness**
+- [x] **5.27.A — Txn-mode pool + serverless test harness**
       (~3 days, lands first; lands red against current engine).
       Four layers:
       (1) **Pool semantics:** txn-mode contract — a cursor opened
@@ -1979,7 +1979,7 @@ has a 30-second proof.
 tag-publish flow battery lands red first (no published image
 exists); each impl sub-task flips a named slice green.
 
-- [ ] **5.31.A — Docker image + quickstart test harness**
+- [x] **5.31.A — Docker image + quickstart test harness**
       (~1 day, lands first; lands red against current state — no
       published image exists). Five layers:
       (1) **Multi-arch build:** GHA matrix builds for `linux/amd64`
