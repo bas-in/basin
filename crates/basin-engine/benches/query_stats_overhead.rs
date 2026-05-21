@@ -31,6 +31,7 @@ fn bench_registry_overhead(c: &mut Criterion) {
         bytes_decoded: 131_072,
         cache_hits: 5,
         fast_path_engaged: false,
+        table_row_count: 5_000,
     };
 
     // Pre-warm the registry so the first bench iteration doesn't pay

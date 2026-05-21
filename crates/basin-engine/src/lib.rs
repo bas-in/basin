@@ -766,7 +766,7 @@ pub mod pg_plan;
 mod pg_scalar_aliases;
 mod prepared;
 mod query_history;
-pub(crate) mod query_shape;
+pub mod query_shape;
 pub mod query_stats;
 pub mod query_stats_export;
 mod procedure_ddl;
