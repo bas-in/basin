@@ -67,6 +67,56 @@ pub(crate) const BASIN_URL_BASE: &str = "basin://engine/";
 /// pinning a DataFusion worker thread (noisy-neighbor P0, Phase 6.P0.A).
 pub(crate) const DEFAULT_STATEMENT_TIMEOUT_MS: u64 = 30_000;
 
+/// Parse a PostgreSQL GUC duration string into an `Option<Duration>`.
+///
+/// Accepted forms (case-insensitive):
+///   - `0` or `"0"` → `None` (disabled)
+///   - `"500ms"` → 500 milliseconds
+///   - `"5s"` or `"5000ms"` → 5 seconds
+///   - A bare integer is treated as **milliseconds** (matching `statement_timeout`
+///     convention: `SET lock_timeout = 500` means 500 ms).
+///
+/// Any unrecognised form returns `None` (disabled), which is safe: the lock
+/// timeout simply doesn't fire rather than misfiring.
+pub(crate) fn parse_pg_duration(raw: &str) -> Option<std::time::Duration> {
+    let s = raw.trim().to_ascii_lowercase();
+    if s.is_empty() || s == "0" || s == "off" {
+        return None;
+    }
+    // "Nms"
+    if let Some(n) = s.strip_suffix("ms") {
+        if let Ok(ms) = n.trim().parse::<u64>() {
+            return if ms == 0 { None } else { Some(std::time::Duration::from_millis(ms)) };
+        }
+    }
+    // "Ns" or "Nsec"
+    if let Some(n) = s.strip_suffix("sec").or_else(|| s.strip_suffix('s')) {
+        if let Ok(sec) = n.trim().parse::<u64>() {
+            return if sec == 0 { None } else { Some(std::time::Duration::from_secs(sec)) };
+        }
+    }
+    // "Nmin"
+    if let Some(n) = s.strip_suffix("min") {
+        if let Ok(min) = n.trim().parse::<u64>() {
+            return if min == 0 { None } else { Some(std::time::Duration::from_secs(min * 60)) };
+        }
+    }
+    // bare integer → milliseconds
+    if let Ok(ms) = s.parse::<u64>() {
+        return if ms == 0 { None } else { Some(std::time::Duration::from_millis(ms)) };
+    }
+    None
+}
+
+/// Render `Option<Duration>` as a PG-compatible GUC string.
+/// `None` → `"0"` (disabled); `Some(d)` → `"<ms>ms"`.
+pub(crate) fn format_pg_duration(d: Option<std::time::Duration>) -> String {
+    match d {
+        None => "0".to_string(),
+        Some(dur) => format!("{}ms", dur.as_millis()),
+    }
+}
+
 /// Process-wide statement wall-clock budget. `None` = disabled (back-compat,
 /// `BASIN_STATEMENT_TIMEOUT_MS=0`); `Some(d)` = cancel any statement still
 /// executing after `d`. Cached in a `OnceLock` so a query never pays a getenv
@@ -438,6 +488,23 @@ pub(crate) struct SessionState {
     /// (a single 64-bit load with `Relaxed` ordering is sufficient — there
     /// is no ordering relationship required with other fields).
     pub(crate) statement_timeout_ms: std::sync::atomic::AtomicI64,
+
+    // ── Phase 5.28 session-level GUCs ────────────────────────────────────────
+
+    /// `SET lock_timeout = '500ms'` per-session override.
+    /// `None` = disabled (0). Atomically readable by the lock-wait primitive.
+    /// Uses `std::sync::Mutex` so the SET handler can update it synchronously.
+    pub(crate) lock_timeout: std::sync::Mutex<Option<std::time::Duration>>,
+
+    /// `SET idle_in_transaction_session_timeout = '30s'` per-session override.
+    /// `None` = disabled (0). The reaper reads this.
+    pub(crate) idle_in_transaction_session_timeout:
+        std::sync::Mutex<Option<std::time::Duration>>,
+
+    /// Timestamp of the last statement activity on this session. Updated by
+    /// the executor at the start of every `execute()` call; the idle-in-txn
+    /// reaper compares this against the current time.
+    pub(crate) last_active: std::sync::Mutex<std::time::Instant>,
 }
 
 impl Drop for SessionState {
@@ -450,7 +517,7 @@ impl Drop for SessionState {
 }
 
 impl SessionState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             snapshots: Mutex::new(HashMap::new()),
             prepared: crate::prepared::PreparedRegistry::new(),
@@ -463,6 +530,9 @@ impl SessionState {
             advisory: Arc::new(crate::advisory_lock::AdvisorySessionLocks::new()),
             // -1 means "no per-session override; use process-wide default".
             statement_timeout_ms: std::sync::atomic::AtomicI64::new(-1),
+            lock_timeout: std::sync::Mutex::new(None),
+            idle_in_transaction_session_timeout: std::sync::Mutex::new(None),
+            last_active: std::sync::Mutex::new(std::time::Instant::now()),
         }
     }
 }
@@ -761,6 +831,65 @@ pub(crate) fn take_pending_overriding(state: &SessionState) -> Option<Overriding
         .take()
 }
 
+// ── Phase 5.28 GUC accessors ─────────────────────────────────────────────────
+
+/// Read the current `lock_timeout` for this session. `None` = disabled.
+pub(crate) fn session_lock_timeout(state: &SessionState) -> Option<std::time::Duration> {
+    *state
+        .lock_timeout
+        .lock()
+        .expect("lock_timeout lock poisoned")
+}
+
+/// Set `lock_timeout` for this session. `None` disables it.
+pub(crate) fn set_session_lock_timeout(
+    state: &SessionState,
+    d: Option<std::time::Duration>,
+) {
+    *state
+        .lock_timeout
+        .lock()
+        .expect("lock_timeout lock poisoned") = d;
+}
+
+/// Read the current `idle_in_transaction_session_timeout` for this session.
+pub(crate) fn session_idle_in_transaction_timeout(
+    state: &SessionState,
+) -> Option<std::time::Duration> {
+    *state
+        .idle_in_transaction_session_timeout
+        .lock()
+        .expect("idle_in_transaction_session_timeout lock poisoned")
+}
+
+/// Set `idle_in_transaction_session_timeout` for this session.
+pub(crate) fn set_session_idle_in_transaction_timeout(
+    state: &SessionState,
+    d: Option<std::time::Duration>,
+) {
+    *state
+        .idle_in_transaction_session_timeout
+        .lock()
+        .expect("idle_in_transaction_session_timeout lock poisoned") = d;
+}
+
+/// Touch the session's last-active timestamp. Called at the start of every
+/// `execute()` so the idle-in-txn reaper sees fresh activity.
+pub(crate) fn touch_last_active(state: &SessionState) {
+    *state
+        .last_active
+        .lock()
+        .expect("last_active lock poisoned") = std::time::Instant::now();
+}
+
+/// Read the session's last-active timestamp.
+pub(crate) fn last_active(state: &SessionState) -> std::time::Instant {
+    *state
+        .last_active
+        .lock()
+        .expect("last_active lock poisoned")
+}
+
 #[instrument(skip(engine, current_user, auth_context), fields(project = %project))]
 pub(crate) async fn open(
     engine: Engine,
@@ -936,6 +1065,9 @@ pub(crate) async fn open(
 
     let state = Arc::new(SessionState::new());
 
+    // Phase 5.28.C: register with the idle-in-txn reaper.
+    let (reaper_id, reaped_flag) = engine.reaper_registry().register(state.clone());
+
     // Advisory-lock UDFs (BUG #138). Session-scoped: a lock owned by this
     // session must appear "held" to other sessions, so these capture the
     // per-session `Arc<AdvisorySessionLocks>` and overwrite (by name) the
@@ -985,6 +1117,8 @@ pub(crate) async fn open(
         auth_context,
         ctx,
         state,
+        reaped_flag,
+        reaper_id,
     })
 }
 
@@ -2362,5 +2496,82 @@ mod tests {
         assert!(tx.pending_files.is_empty());
         assert!(tx.pre_tx_snapshots.is_empty());
         assert!(tx.savepoints.is_empty());
+    }
+
+    // ── Phase 5.28.B/C/D — GUC parse + accessor unit tests ───────────────────
+
+    #[test]
+    fn parse_pg_duration_disabled_forms() {
+        assert_eq!(parse_pg_duration("0"), None);
+        assert_eq!(parse_pg_duration(""), None);
+        assert_eq!(parse_pg_duration("off"), None);
+        assert_eq!(parse_pg_duration("  0  "), None);
+    }
+
+    #[test]
+    fn parse_pg_duration_ms_suffix() {
+        assert_eq!(parse_pg_duration("500ms"), Some(Duration::from_millis(500)));
+        assert_eq!(parse_pg_duration("100ms"), Some(Duration::from_millis(100)));
+        assert_eq!(parse_pg_duration("1000ms"), Some(Duration::from_millis(1000)));
+    }
+
+    #[test]
+    fn parse_pg_duration_s_suffix() {
+        assert_eq!(parse_pg_duration("5s"), Some(Duration::from_secs(5)));
+        assert_eq!(parse_pg_duration("1sec"), Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn parse_pg_duration_bare_integer_is_ms() {
+        assert_eq!(parse_pg_duration("200"), Some(Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn parse_pg_duration_min_suffix() {
+        assert_eq!(parse_pg_duration("2min"), Some(Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn format_pg_duration_roundtrip() {
+        let d = Some(Duration::from_millis(500));
+        let s = format_pg_duration(d);
+        assert_eq!(s, "500ms");
+        assert_eq!(parse_pg_duration(&s), d);
+
+        assert_eq!(format_pg_duration(None), "0");
+    }
+
+    #[test]
+    fn lock_timeout_guc_accessor() {
+        let state = make_test_session_state();
+        assert_eq!(session_lock_timeout(&state), None);
+        set_session_lock_timeout(&state, Some(Duration::from_millis(300)));
+        assert_eq!(
+            session_lock_timeout(&state),
+            Some(Duration::from_millis(300))
+        );
+        set_session_lock_timeout(&state, None);
+        assert_eq!(session_lock_timeout(&state), None);
+    }
+
+    #[test]
+    fn idle_in_transaction_timeout_guc_accessor() {
+        let state = make_test_session_state();
+        assert_eq!(session_idle_in_transaction_timeout(&state), None);
+        set_session_idle_in_transaction_timeout(&state, Some(Duration::from_secs(30)));
+        assert_eq!(
+            session_idle_in_transaction_timeout(&state),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn touch_last_active_updates_timestamp() {
+        let state = make_test_session_state();
+        let t0 = last_active(&state);
+        std::thread::sleep(Duration::from_millis(5));
+        touch_last_active(&state);
+        let t1 = last_active(&state);
+        assert!(t1 > t0, "last_active must advance after touch");
     }
 }
