@@ -2,216 +2,220 @@
 title: "5-Minute Docker Quickstart"
 nav_section: deployment
 sidebar_position: 10
-summary: "Bring Basin up locally with a single docker compose command, run the smoke test, and connect via psql — all in under five minutes."
-version_since: "0.5.0"
+summary: "Get Basin running with a single docker run command and connect via psql in under five minutes."
+version_since: "0.1.0"
 tags: [deployment, docker, quickstart, self-host]
 ---
 
 # 5-Minute Docker Quickstart
 
-Get Basin running locally with a single command. The dev-stack
-(`dev/docker-compose.yml`) wires together basin-server, a catalog Postgres 16
-instance, and MinIO (S3-compatible object store) — everything you need to
-exercise real TCP paths and the full write/read/query flow.
+Get Basin running locally and make your first SQL queries in under five minutes.
+No external object store or catalog database is needed — the default mode
+stores everything on the local filesystem inside the container volume.
 
-> **Prerequisites:** Docker ≥ 24 with the Compose plugin, `psql` (any
-> version), and ~2 GB of free disk for images and volumes.
-
----
-
-## 1. TL;DR
-
-```sh
-bash dev/scripts/up.sh
-psql -h 127.0.0.1 -p 5533 -U alice -d postgres
-```
-
-That is the entire quickstart. The `up.sh` script builds the basin-server
-image, waits for all services to pass their health checks, and prints a
-ready banner. Once you see it, the `psql` line above connects you to
-replica 0 over pgwire.
-
-To run the full stack manually via Compose directly:
-
-```sh
-docker compose -f dev/docker-compose.yml up --build
-```
+> **Prerequisites:** Docker (any recent version), `psql` (any version).
+> No Rust toolchain needed for the published-image path.
 
 ---
 
-## 2. What Comes Up
+## 1. Start the server
 
-The dev-stack starts three services. Full service reference is in
-[`dev/README.md`](../dev/README.md).
+### Option A — build locally (works today)
 
-| Service | Host port (default) | What it is |
+The GHCR image (`ghcr.io/bas-in/basin-server:latest`) will be published on the
+first tagged release. Until then, build from the repo root:
+
+```sh
+# Build the image (takes ~5 min on first run; subsequent builds are fast
+# because Docker caches the Cargo dependency layer).
+docker build -t basin-server .
+
+# Run it.
+docker run --rm \
+  -p 5432:5432 \
+  -v basin-data:/var/basin \
+  --name basin \
+  basin-server
+```
+
+### Option B — published image (after first release)
+
+```sh
+docker run --rm \
+  -p 5432:5432 \
+  -v basin-data:/var/basin \
+  --name basin \
+  ghcr.io/bas-in/basin-server:latest
+```
+
+What these flags do:
+
+| Flag | Effect |
+|---|---|
+| `-p 5432:5432` | Exposes the pgwire port on the host |
+| `-v basin-data:/var/basin` | Persists data across container restarts |
+| `--name basin` | Names the container for easy `docker stop basin` |
+
+The server is ready when you see a log line like:
+```
+INFO basin_server: pgwire listener is accept-ready bind=0.0.0.0:5432
+```
+
+The container's healthcheck (`nc -z 127.0.0.1 5432`) confirms liveness every
+10 seconds. You can check it with `docker inspect --format='{{.State.Health.Status}}' basin`.
+
+---
+
+## 2. Connect with psql
+
+```sh
+psql -h 127.0.0.1 -p 5432 -U basin
+```
+
+| Parameter | Value | Source |
 |---|---|---|
-| `catalog-pg` | 5532 | Postgres 16 — Basin's catalog backend |
-| `minio` API | 9100 | S3-compatible object store (data blocks) |
-| `minio` Console | 9101 | MinIO web UI (browse at `http://localhost:9101`) |
-| `basin-server-0` | 5533 | Basin replica 0 — always started |
-| `basin-server-1` | 5534 | Basin replica 1 — only with `--replicas 2` |
+| Host | `127.0.0.1` | localhost via the `-p 5432:5432` mapping |
+| Port | `5432` | Dockerfile `EXPOSE 5432` / `BASIN_BIND=0.0.0.0:5432` |
+| User | `basin` | `BASIN_PROJECTS=basin=*` auto-provisions this project |
+| Password | _(none)_ | No auth enabled in the default dev configuration |
 
-`basin-server` connects to `catalog-pg` for catalog persistence and to MinIO
-for Vortex block storage. The entire stack is ephemeral — volumes are deleted
-by `down.sh`. For production persistence, see the operator runbooks
-([`docs/operators/`](./operators/)).
-
-### Published image vs. local build
-
-The official GHCR/Docker Hub image (`ghcr.io/exo/basin:latest`) is being
-prepared in Phase 5.31.C/D and may not be published yet. Once it is
-available:
-
-```sh
-docker run --rm -it ghcr.io/exo/basin:latest --help
-```
-
-Until then, build locally via `dev/Dockerfile.basin-server`:
-
-```sh
-docker build -f dev/Dockerfile.basin-server -t basin-server:local .
-```
-
-The `up.sh` script handles this automatically — it builds the image if it is
-not already cached.
+The `basin` user is mapped to a fresh auto-generated project ID at startup.
+You will see the provisioned project ULID printed to stderr on first boot.
 
 ---
 
-## 3. Verify
+## 3. Run SQL
 
-### Option A — smoke test (recommended)
-
-```sh
-bash dev/scripts/smoke.sh
-```
-
-`smoke.sh` runs approximately 10 psql round-trips against `basin-server-0`:
-CREATE TABLE, several INSERTs, a range SELECT, an UPDATE, and a DELETE. It
-exits 0 on success and prints a pass/fail summary. Failures include the
-failing SQL and the server response.
-
-### Option B — manual psql
-
-```sh
-psql -h 127.0.0.1 -p 5533 -U alice -d postgres
-```
-
-Then:
+This is the same round-trip used by the smoke harness
+(`tests/integration/scripts/docker-smoke.sh`), so it is known to work:
 
 ```sql
--- Create a table in the alice project
-CREATE TABLE events (id BIGSERIAL PRIMARY KEY, payload TEXT, ts TIMESTAMPTZ DEFAULT now());
+-- Create a table.
+CREATE TABLE smoke (id int, name text);
 
--- Insert a row
-INSERT INTO events (payload) VALUES ('hello basin');
+-- Insert a row.
+INSERT INTO smoke VALUES (1, 'hello basin');
 
--- Read it back
-SELECT id, payload, ts FROM events;
+-- Read it back.
+SELECT id, name FROM smoke WHERE id = 1;
 ```
 
-A result row confirms that the write path (WAL + memtable), the catalog, and
-the read path (query engine) are all wired up correctly.
+Expected output:
+
+```
+ id |    name
+----+-------------
+  1 | hello basin
+(1 row)
+```
+
+Try a few more shapes:
+
+```sql
+-- Analytical aggregate.
+SELECT COUNT(*) FROM smoke;
+
+-- Basin stores data as Vortex columns under the volume.
+-- Confirm with: docker exec basin find /var/basin -name '*.vortex'
+```
 
 ---
 
-## 4. Configuration
+## 4. Using basin-cli
 
-All configuration is via environment variables. Export any of the following
-before calling `up.sh`, or set them in a `.env` file next to
-`dev/docker-compose.yml`.
+[`basin-cli`](https://github.com/bas-in/basin-cli) is a separate operator
+daily-driver CLI (Go, Apache-2.0). It talks to the basin-cloud control plane,
+not directly to a standalone `basin-server` container. For local development,
+`psql` and any Postgres-compatible driver are the easiest path.
 
-### Port overrides
+If you have `basin-cli` installed and want to point it at a self-hosted engine,
+see the `--endpoint` flag in `basin-cli --help`.
+
+---
+
+## 5. Stopping and cleaning up
 
 ```sh
-export POSTGRES_PORT=5532        # catalog-pg host port
-export MINIO_API_PORT=9100       # MinIO S3 API host port
-export MINIO_CONSOLE_PORT=9101   # MinIO web UI host port
-export BASIN_PORT_BASE=5533      # basin-server-0 pgwire host port
-export BASIN_PORT_REPLICA1=5534  # basin-server-1 pgwire host port (replica mode)
+# Stop the container (data volume is preserved).
+docker stop basin
+
+# Remove the volume too (all data is discarded).
+docker volume rm basin-data
 ```
 
-### Key basin-server variables
+---
 
-| Variable | Default | Description |
+## Troubleshooting
+
+### Port conflict: address already in use
+
+Port 5432 is the default Postgres port and may already be in use. Map to a
+different host port:
+
+```sh
+docker run --rm \
+  -p 5433:5432 \           # host 5433 → container 5432
+  -v basin-data:/var/basin \
+  --name basin \
+  basin-server
+
+# Then connect on the host port you chose:
+psql -h 127.0.0.1 -p 5433 -U basin
+```
+
+### Data not persisting across restarts
+
+The container writes data to `/var/basin` inside the container. If you omit the
+`-v basin-data:/var/basin` flag, all data is lost when the container exits.
+The named volume `basin-data` survives `docker stop` / `docker start` cycles;
+only `docker volume rm basin-data` deletes it.
+
+### Changing the default user or adding more projects
+
+Pass `BASIN_PROJECTS` as an environment variable. Each entry is `user=*`
+(auto-generates a project ID) or `user=<ulid>` (fixed ID):
+
+```sh
+docker run --rm \
+  -p 5432:5432 \
+  -v basin-data:/var/basin \
+  -e BASIN_PROJECTS="alice=*,bob=*" \
+  basin-server
+```
+
+Then connect as `psql -h 127.0.0.1 -p 5432 -U alice` or `-U bob`.
+
+### Connecting from a container on the same Docker network
+
+```sh
+docker run --rm \
+  --network container:basin \
+  postgres:16 \
+  psql -h 127.0.0.1 -p 5432 -U basin -c "SELECT 1"
+```
+
+Or use the container's name as the host on a shared bridge network:
+
+```sh
+psql -h basin -p 5432 -U basin
+```
+
+---
+
+## Environment variable reference
+
+All configuration is via environment variables. The following are the key
+knobs for a single-node local setup:
+
+| Variable | Default in image | Description |
 |---|---|---|
-| `BASIN_BIND` | `0.0.0.0:5433` | pgwire listen address inside the container |
-| `BASIN_CATALOG` | `memory` | `memory` or a `postgres://…` DSN — dev-stack sets this to the `catalog-pg` DSN |
-| `BASIN_STORAGE_BACKEND` | `local` | `local`, `s3`, or `tigris` — dev-stack sets `s3` pointed at MinIO |
-| `BASIN_STORAGE_ENDPOINT` | — | S3 endpoint URL; dev-stack sets `http://minio:9000` |
-| `BASIN_STORAGE_BUCKET` | — | S3 bucket name |
-| `BASIN_STORAGE_ACCESS_KEY_ID` | — | S3 access key |
-| `BASIN_STORAGE_SECRET_ACCESS_KEY` | — | S3 secret |
-| `BASIN_PROJECTS` | `alice=*,bob=*` | Comma-separated `user=project_id` pairs; `*` auto-generates the project ID |
-| `BASIN_SHARD_ENABLED` | `0` | Set to `1` to route INSERTs through the WAL + compactor pipeline |
-| `BASIN_POOL_ENABLED` | `0` | Set to `1` to enable the session pool |
-| `BASIN_DATA_DIR` | `/data/basin` | Local data directory (inside container) |
-| `BASIN_WAL_DIR` | `/data/wal` | WAL directory (inside container) |
+| `BASIN_BIND` | `0.0.0.0:5432` | pgwire listen address inside the container |
+| `BASIN_DATA_DIR` | `/var/basin` | Data root; mount a volume here for persistence |
+| `BASIN_STORAGE_BACKEND` | `local` | `local` (filesystem), `s3`, or `tigris` |
+| `BASIN_PROJECTS` | `basin=*` | Comma-separated `user=project_id` pairs; `*` auto-allocates a ULID |
+| `BASIN_SHARD_ENABLED` | `0` | Set to `1` to route writes through the WAL + compactor |
+| `BASIN_CATALOG` | `memory` | `memory` (volatile) or a `postgres://…` DSN for durable catalog |
 
-For a full variable reference, see [`dev/README.md`](../dev/README.md#environment-variable-reference-basin-server).
-
----
-
-## 5. Multi-Replica Mode
-
-To start two basin-server replicas (ports 5533 and 5534):
-
-```sh
-bash dev/scripts/up.sh --replicas 2
-```
-
-Or via Compose directly using the `replica-1` profile:
-
-```sh
-docker compose -f dev/docker-compose.yml --profile replica-1 up --build
-```
-
-Connect to replica 0 on port 5533, replica 1 on port 5534:
-
-```sh
-psql -h 127.0.0.1 -p 5533 -U alice -d postgres   # replica 0
-psql -h 127.0.0.1 -p 5534 -U alice -d postgres   # replica 1
-```
-
-Each replica acquires per-`(project, partition)` leases from `catalog-pg`.
-If replica 0 goes down, replica 1 picks up its leases within the heartbeat
-budget defined in [ADR 0023](./decisions/0023-leases-and-partition-routing.md)
-(20 s for the dev-stack, configurable for production). You can exercise this
-with the handoff workload:
-
-```sh
-bash dev/scripts/e2e.sh --workload handoff --replicas 2
-```
-
-The E2E runner kills replica 0 via `docker compose stop`, polls replica 1
-until it returns the lease marker row, and asserts that wall time stays
-within the ADR 0023 budget.
-
----
-
-## 6. Teardown
-
-```sh
-bash dev/scripts/down.sh
-```
-
-`down.sh` stops all containers and removes volumes. All data written during
-the session is discarded. Re-running `up.sh` starts from a clean state.
-
----
-
-## 7. Production Note
-
-The dev-stack is for local development and CI only. For production
-deployments:
-
-- See the **operator runbooks** in [`docs/operators/`](./operators/) for
-  storage configuration, backup strategy, and upgrade procedures.
-- The lease-ownership model that drives multi-replica routing is described
-  in [ADR 0023](./decisions/0023-leases-and-partition-routing.md).
-- Catalog persistence requires a production-grade Postgres instance (not
-  the dev-stack `catalog-pg`). Set `BASIN_CATALOG` to a managed Postgres
-  DSN before starting basin-server.
-- MinIO can be replaced with any S3-compatible object store (AWS S3,
-  Tigris, Backblaze B2) by setting `BASIN_STORAGE_BACKEND=s3` and
-  the corresponding endpoint/credentials variables.
+For S3/Tigris object storage, production catalog (Postgres DSN), auth, REST,
+and other advanced options, see [`docs/deployment.md`](./deployment.md) and
+[`docs/operators/`](./operators/).

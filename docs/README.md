@@ -15,6 +15,7 @@ unified nav tree; GitHub renders it for humans browsing `docs/`.
 
 ## Getting started
 
+- [5-Minute Docker Quickstart](quickstart-docker.md) — One `docker run` command, connect with `psql`, run SQL. No Rust toolchain required.
 - [Getting started with Basin](tutorial.md) — End-to-end walkthrough: spin up a dev cluster, create a table, add auth, enable row-level security, call the REST API, and deploy a Wasm function.
 
 ## Architecture
