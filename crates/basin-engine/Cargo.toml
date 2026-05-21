@@ -28,12 +28,13 @@ parquet.workspace = true
 bytes.workspace = true
 datafusion.workspace = true
 # Vortex DataFusion integration (#162 — read path for opt-in Vortex tables).
-# 0.70 targets datafusion 53 / arrow 58 = the workspace pins exactly.
-vortex-datafusion = "0.70"
+# 0.71 targets datafusion 53 / arrow 58 = the workspace pins exactly.
+# 0.71 fixes Arrow field-level metadata stripping (ADR-0024 BASIN_TYPE sidecar).
+vortex-datafusion = "0.71"
 # vortex core — needed by vortex_listing_format (W2-1) to call
 # VortexSession::default() and to name types in BasinVortexFormat.
-# Already a transitive dep of vortex-datafusion 0.70.
-vortex = "0.70"
+# Already a transitive dep of vortex-datafusion 0.71.
+vortex = "0.71"
 # Sub-crates used by vortex_listing_format's FileFormat impl; they must be
 # direct deps to name their types in method signatures.  Versions match the
 # datafusion = "53" workspace entry exactly.

@@ -134,13 +134,9 @@ async fn decimal_synonym_accepted() {
 
 /// MONEY is stored as Decimal128(20,2) with BASIN_TYPE=MONEY metadata.
 ///
-/// REAL BUG (Phase 6.X): BASIN_TYPE field-level metadata is not preserved
-/// through the storage write/read round-trip.  The engine emits the metadata
-/// at DDL time but does not reconstruct it when reading the Arrow schema back
-/// from storage.  Fix required in basin-engine column-type→Arrow mapping layer
-/// (src-only change).
+/// Unblocked by vortex 0.71 which preserves Arrow field-level metadata
+/// through the DataFusion read path (ADR-0024 BASIN_TYPE sidecar fix).
 #[tokio::test]
-#[ignore = "real engine bug: BASIN_TYPE field metadata lost on storage read-back (Phase 6.X regression)"]
 async fn money_round_trip() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -189,10 +185,9 @@ async fn money_round_trip() {
 
 /// INET column: CREATE + INSERT valid addresses + SELECT round-trip.
 ///
-/// REAL BUG (Phase 6.X): BASIN_TYPE field-level metadata is not preserved
-/// through the storage round-trip.  Same root cause as money_round_trip.
+/// Unblocked by vortex 0.71 which preserves Arrow field-level metadata
+/// through the DataFusion read path (ADR-0024 BASIN_TYPE sidecar fix).
 #[tokio::test]
-#[ignore = "real engine bug: BASIN_TYPE field metadata lost on storage read-back (Phase 6.X regression)"]
 async fn inet_round_trip() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -252,10 +247,9 @@ async fn inet_round_trip() {
 
 /// CIDR column: CREATE + INSERT + SELECT round-trip.
 ///
-/// REAL BUG (Phase 6.X): BASIN_TYPE field-level metadata is not preserved
-/// through the storage round-trip.  Same root cause as money_round_trip.
+/// Unblocked by vortex 0.71 which preserves Arrow field-level metadata
+/// through the DataFusion read path (ADR-0024 BASIN_TYPE sidecar fix).
 #[tokio::test]
-#[ignore = "real engine bug: BASIN_TYPE field metadata lost on storage read-back (Phase 6.X regression)"]
 async fn cidr_round_trip() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -297,10 +291,9 @@ async fn cidr_round_trip() {
 
 /// MACADDR column: CREATE + INSERT + SELECT round-trip.
 ///
-/// REAL BUG (Phase 6.X): BASIN_TYPE field-level metadata is not preserved
-/// through the storage round-trip.  Same root cause as money_round_trip.
+/// Unblocked by vortex 0.71 which preserves Arrow field-level metadata
+/// through the DataFusion read path (ADR-0024 BASIN_TYPE sidecar fix).
 #[tokio::test]
-#[ignore = "real engine bug: BASIN_TYPE field metadata lost on storage read-back (Phase 6.X regression)"]
 async fn macaddr_round_trip() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -343,10 +336,9 @@ async fn macaddr_round_trip() {
 
 /// MACADDR8 (EUI-64) column: CREATE + INSERT + SELECT round-trip.
 ///
-/// REAL BUG (Phase 6.X): BASIN_TYPE field-level metadata is not preserved
-/// through the storage round-trip.  Same root cause as money_round_trip.
+/// Unblocked by vortex 0.71 which preserves Arrow field-level metadata
+/// through the DataFusion read path (ADR-0024 BASIN_TYPE sidecar fix).
 #[tokio::test]
-#[ignore = "real engine bug: BASIN_TYPE field metadata lost on storage read-back (Phase 6.X regression)"]
 async fn macaddr8_round_trip() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -394,10 +386,9 @@ async fn macaddr8_round_trip() {
 
 /// BIT(8) column: CREATE + INSERT + SELECT round-trip.
 ///
-/// REAL BUG (Phase 6.X): BASIN_TYPE field-level metadata is not preserved
-/// through the storage round-trip.  Same root cause as money_round_trip.
+/// Unblocked by vortex 0.71 which preserves Arrow field-level metadata
+/// through the DataFusion read path (ADR-0024 BASIN_TYPE sidecar fix).
 #[tokio::test]
-#[ignore = "real engine bug: BASIN_TYPE field metadata lost on storage read-back (Phase 6.X regression)"]
 async fn bit_fixed_round_trip() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -456,10 +447,12 @@ async fn bit_fixed_round_trip() {
 
 /// VARBIT(16) column: variable-length bit string up to 16 bits.
 ///
-/// REAL BUG (Phase 6.X): BASIN_TYPE field-level metadata is not preserved
-/// through the storage round-trip.  Same root cause as money_round_trip.
+/// BASIN_TYPE metadata stripping (the 0.71 fix) is NOT the blocker here.
+/// CREATE TABLE fails with "unsupported column type in PoC: VARBIT(16)" —
+/// the engine schema layer does not yet map VARBIT to an Arrow type.
+/// Remains blocked until that mapping is implemented.
 #[tokio::test]
-#[ignore = "real engine bug: BASIN_TYPE field metadata lost on storage read-back (Phase 6.X regression)"]
+#[ignore = "engine bug: VARBIT column type not supported in schema layer (CREATE TABLE fails — separate from vortex metadata fix)"]
 async fn varbit_round_trip() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();

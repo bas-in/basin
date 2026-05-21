@@ -49,14 +49,15 @@ rand.workspace = true
 uuid = { workspace = true }
 # Vortex columnar storage format (#161 — opt-in `WITH (basin.file_format =
 # 'vortex')`). Versions pinned to match the proven benchmark/vortex_compare
-# crate; vortex 0.70 targets arrow 58 (= the workspace pin) exactly.
-vortex-array = "0.70"
-vortex-file = { version = "0.70", features = ["zstd"] }
-vortex-btrblocks = { version = "0.70", features = ["zstd", "pco"] }
-vortex-session = "0.70"
-vortex-io = { version = "0.70", features = ["tokio"] }
-vortex-layout = "0.70"
-vortex-buffer = "0.70"
+# crate; vortex 0.71 targets arrow 58 (= the workspace pin) exactly.
+# 0.71 fixes Arrow field-level metadata stripping (ADR-0024 BASIN_TYPE sidecar).
+vortex-array = "0.71"
+vortex-file = { version = "0.71", features = ["zstd"] }
+vortex-btrblocks = { version = "0.71", features = ["zstd", "pco"] }
+vortex-session = "0.71"
+vortex-io = { version = "0.71", features = ["tokio"] }
+vortex-layout = "0.71"
+vortex-buffer = "0.71"
 # Per-file bloom filters for point_eq miss-path pruning (Phase 5.14.A2/A3).
 # fastbloom 0.7.x: block-Bloom implementation with Hash-based insert/contains;
 # serialises via as_slice() (Vec<u64>) — stable across restarts on the same
