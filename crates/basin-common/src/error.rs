@@ -119,6 +119,17 @@ pub enum BasinError {
     #[error("{0}")]
     StringTooLong(String),
 
+    /// Phase 6.X.C (ADR 0023) — a voluntary lease handoff is in progress for
+    /// this `(project, partition)` and the leaseholder is rejecting new writes
+    /// so the memtable can drain to the cold tier before ownership transfers.
+    /// Routers and tests treat this as **retryable**: the router invalidates
+    /// its lease cache entry and retries against the new owner once the
+    /// handoff completes. The accompanying message names the partition for
+    /// observability. Reads are not blocked during a handoff; only new writes
+    /// are rejected.
+    #[error("lease handoff in progress: {0}")]
+    LeaseHandoffInProgress(String),
+
     /// Catch-all for sources without a dedicated variant.
     #[error("internal: {0}")]
     Internal(String),
@@ -152,5 +163,11 @@ impl BasinError {
     /// wrong and we fail closed.
     pub fn isolation(msg: impl Into<String>) -> Self {
         Self::IsolationViolation(msg.into())
+    }
+    /// Phase 6.X.C — typed constructor for the lease-handoff rejection.
+    /// Callers should set `msg` to `"{project}/{partition}"` so the router
+    /// can extract the affected partition on retry.
+    pub fn lease_handoff_in_progress(msg: impl Into<String>) -> Self {
+        Self::LeaseHandoffInProgress(msg.into())
     }
 }

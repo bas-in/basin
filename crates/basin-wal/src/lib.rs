@@ -100,6 +100,18 @@ pub enum WalEvent {
     Begin { tx_id: u64 },
     /// Marks that all buffered entries for `tx_id` should be discarded.
     Rollback { tx_id: u64 },
+    /// Phase 6.X.C (ADR 0023) — voluntary lease-handoff marker emitted by an
+    /// outgoing leaseholder just before it releases the lease. Replay treats
+    /// it as a **no-op** (informational only); the marker exists so the new
+    /// owner / operators / audit logs can see exactly where the handoff
+    /// boundary sits in the WAL.
+    Handoff {
+        /// Replica id the lease is being handed to.
+        to_holder: String,
+        /// Fence epoch under which the handoff was performed (the outgoing
+        /// holder's current epoch).
+        at_epoch: i64,
+    },
 }
 
 /// Configuration for [`replay_wal`].
@@ -153,7 +165,9 @@ pub fn replay_wal(events: Vec<WalEvent>, config: &WalReplayConfig) -> Vec<WalEnt
             .into_iter()
             .filter_map(|ev| match ev {
                 WalEvent::Entry(e) => Some(e),
-                WalEvent::Begin { .. } | WalEvent::Rollback { .. } => None,
+                WalEvent::Begin { .. }
+                | WalEvent::Rollback { .. }
+                | WalEvent::Handoff { .. } => None,
             })
             .collect();
     }
@@ -193,6 +207,11 @@ pub fn replay_wal(events: Vec<WalEvent>, config: &WalReplayConfig) -> Vec<WalEnt
                     committed.push(entry);
                 }
             }
+            // Phase 6.X.C handoff markers are informational only — they
+            // record where the lease was voluntarily transferred but never
+            // affect committed row state. The new owner replays data
+            // entries unchanged; the marker is the audit breadcrumb.
+            WalEvent::Handoff { .. } => {}
         }
     }
 
@@ -345,6 +364,26 @@ pub trait Wal: Send + Sync + std::fmt::Debug {
         ))
     }
 
+    /// Phase 6.X.C (ADR 0023) — append a voluntary lease-handoff marker
+    /// (`to_holder`, `at_epoch`) to the log for `(project, partition)`.
+    /// Returns the LSN assigned to the marker.
+    ///
+    /// The marker is informational only: replay treats it as a no-op (see
+    /// [`replay_wal`]). Concrete backends override this; the default returns
+    /// [`basin_common::BasinError::FeatureNotSupported`] so the non-fencing
+    /// backends (e.g. the [`RaftWal`] stub) stay buildable.
+    async fn append_handoff_marker(
+        &self,
+        _project: &ProjectId,
+        _partition: &PartitionKey,
+        _to_holder: String,
+        _at_epoch: i64,
+    ) -> Result<Lsn> {
+        Err(basin_common::BasinError::feature_not_supported(
+            "append_handoff_marker",
+        ))
+    }
+
     /// Return all events (data entries **and** transaction markers) for
     /// `(project, partition)` with LSN strictly greater than `since_lsn`, in
     /// append order.
@@ -493,6 +532,18 @@ impl Wal for LocalWal {
             .await
     }
 
+    async fn append_handoff_marker(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        to_holder: String,
+        at_epoch: i64,
+    ) -> Result<Lsn> {
+        self.inner
+            .append_handoff_marker(project, partition, to_holder, at_epoch)
+            .await
+    }
+
     async fn read_events(
         &self,
         project: &ProjectId,
@@ -563,6 +614,19 @@ pub(crate) trait WalImpl: Send + Sync {
         partition: &PartitionKey,
         tx_id: u64,
     ) -> Result<Lsn>;
+    /// Phase 6.X.C — append a handoff marker. Default returns
+    /// `FeatureNotSupported` so non-fencing backends stay buildable.
+    async fn append_handoff_marker(
+        &self,
+        _project: &ProjectId,
+        _partition: &PartitionKey,
+        _to_holder: String,
+        _at_epoch: i64,
+    ) -> Result<Lsn> {
+        Err(basin_common::BasinError::feature_not_supported(
+            "append_handoff_marker",
+        ))
+    }
     async fn read_events(
         &self,
         project: &ProjectId,

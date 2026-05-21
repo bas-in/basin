@@ -43,8 +43,9 @@ use tokio::sync::{watch, Mutex, RwLock};
 use ulid::Ulid;
 
 use crate::segment::{
-    decode_segment, decode_segment_full, entry_record, frame_into, tx_begin_record,
-    tx_rollback_record, DecodedRecord, EntryRecord, SegmentHeader, SegmentRecord, FORMAT_VERSION,
+    decode_segment, decode_segment_full, entry_record, frame_into, handoff_record,
+    tx_begin_record, tx_rollback_record, DecodedRecord, EntryRecord, SegmentHeader, SegmentRecord,
+    FORMAT_VERSION,
 };
 use crate::state::{BufferRecord, ClosedSegment, PartitionState};
 use crate::{Lsn, WalConfig, WalEntry, WalEvent, WalImpl};
@@ -171,6 +172,13 @@ impl Inner {
                 }
                 BufferRecord::TxRollback { tx_id, .. } => {
                     frame_into(&mut buf, &tx_rollback_record(*tx_id))?;
+                }
+                BufferRecord::Handoff {
+                    to_holder,
+                    at_epoch,
+                    ..
+                } => {
+                    frame_into(&mut buf, &handoff_record(to_holder.clone(), *at_epoch))?;
                 }
             }
         }
@@ -580,6 +588,37 @@ impl WalImpl for FileWal {
         Ok(lsn)
     }
 
+    #[tracing::instrument(skip(self), fields(project=%project, partition=%partition, %to_holder, at_epoch))]
+    async fn append_handoff_marker(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        to_holder: String,
+        at_epoch: i64,
+    ) -> Result<Lsn> {
+        let state = self.inner.get_or_create_partition(project, partition).await;
+        let (lsn, should_flush) = {
+            let mut guard = state.lock().await;
+            let lsn = guard.next_lsn;
+            guard.next_lsn = lsn.next();
+            guard.buffer.push(BufferRecord::Handoff {
+                lsn,
+                to_holder,
+                at_epoch,
+            });
+            // Markers are tiny; same fixed overhead as the tx markers.
+            guard.buffer_bytes += 64;
+            let pressure = guard.buffer_bytes >= self.inner.flush_max_bytes;
+            (lsn, pressure)
+        };
+        if should_flush {
+            if let Err(e) = self.inner.flush_one(&state).await {
+                tracing::warn!(error = %e, "buffer-pressure flush failed (handoff)");
+            }
+        }
+        Ok(lsn)
+    }
+
     #[tracing::instrument(skip(self), fields(project=%project, partition=%partition, %since_lsn))]
     async fn read_events(
         &self,
@@ -636,6 +675,15 @@ impl WalImpl for FileWal {
                     DecodedRecord::TxRollback { tx_id } => {
                         events.push(WalEvent::Rollback { tx_id });
                     }
+                    DecodedRecord::Handoff {
+                        to_holder,
+                        at_epoch,
+                    } => {
+                        events.push(WalEvent::Handoff {
+                            to_holder,
+                            at_epoch,
+                        });
+                    }
                     DecodedRecord::Entry(_) => {} // lsn <= since_lsn, skip
                 }
             }
@@ -648,6 +696,14 @@ impl WalImpl for FileWal {
                 BufferRecord::TxRollback { tx_id, .. } => {
                     events.push(WalEvent::Rollback { tx_id })
                 }
+                BufferRecord::Handoff {
+                    to_holder,
+                    at_epoch,
+                    ..
+                } => events.push(WalEvent::Handoff {
+                    to_holder,
+                    at_epoch,
+                }),
             }
         }
 

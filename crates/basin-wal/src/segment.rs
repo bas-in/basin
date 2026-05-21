@@ -58,6 +58,14 @@ pub(crate) enum SegmentRecord {
     /// Marks that all entries since the matching `TxBegin { tx_id }` should be
     /// discarded during replay.
     TxRollback { tx_id: u64 },
+    /// Phase 6.X.C (ADR 0023) — voluntary lease-handoff marker. The outgoing
+    /// leaseholder writes this as the last record before releasing the lease;
+    /// it records `to_holder` (the candidate replica id) and `at_epoch` (the
+    /// fence under which the handoff was performed). Treated as an
+    /// informational no-op by the replay path — handoff doesn't change any
+    /// row state, it's purely an observability + audit hook. New owners replay
+    /// data entries normally and see the marker as a recovery breadcrumb.
+    Handoff { to_holder: String, at_epoch: i64 },
 }
 
 pub(crate) const FORMAT_VERSION: u16 = 1;
@@ -82,6 +90,8 @@ pub(crate) enum DecodedRecord {
     Entry(EntryRecord),
     TxBegin { tx_id: u64 },
     TxRollback { tx_id: u64 },
+    /// Phase 6.X.C — handoff marker. See [`SegmentRecord::Handoff`].
+    Handoff { to_holder: String, at_epoch: i64 },
 }
 
 /// Parse a length-prefixed segment buffer into header + decoded records.
@@ -124,6 +134,15 @@ pub(crate) fn decode_segment_full(
             SegmentRecord::TxRollback { tx_id } => {
                 records.push(DecodedRecord::TxRollback { tx_id });
             }
+            SegmentRecord::Handoff {
+                to_holder,
+                at_epoch,
+            } => {
+                records.push(DecodedRecord::Handoff {
+                    to_holder,
+                    at_epoch,
+                });
+            }
         }
     }
 
@@ -143,7 +162,9 @@ pub(crate) fn decode_segment(buf: &[u8]) -> Result<(SegmentHeader, Vec<EntryReco
         .into_iter()
         .filter_map(|r| match r {
             DecodedRecord::Entry(e) => Some(e),
-            DecodedRecord::TxBegin { .. } | DecodedRecord::TxRollback { .. } => None,
+            DecodedRecord::TxBegin { .. }
+            | DecodedRecord::TxRollback { .. }
+            | DecodedRecord::Handoff { .. } => None,
         })
         .collect();
     Ok((header, entries))
@@ -157,6 +178,14 @@ pub(crate) fn tx_begin_record(tx_id: u64) -> SegmentRecord {
 /// Construct a `TxRollback` segment record for the given transaction id.
 pub(crate) fn tx_rollback_record(tx_id: u64) -> SegmentRecord {
     SegmentRecord::TxRollback { tx_id }
+}
+
+/// Construct a `Handoff` segment record (Phase 6.X.C).
+pub(crate) fn handoff_record(to_holder: String, at_epoch: i64) -> SegmentRecord {
+    SegmentRecord::Handoff {
+        to_holder,
+        at_epoch,
+    }
 }
 
 /// Convenience for constructing the wire entry from the public type's pieces.

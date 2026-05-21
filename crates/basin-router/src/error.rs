@@ -58,6 +58,10 @@ fn classify(err: &BasinError) -> (&'static str, &'static str) {
         BasinError::RlsViolation(_) => ("ERROR", "42501"), // insufficient_privilege (RLS)
         BasinError::PermissionDenied(_) => ("ERROR", "42501"), // insufficient_privilege
         BasinError::StringTooLong(_) => ("ERROR", "22001"), // string_data_right_truncation
+        // Phase 6.X.C (ADR 0023): voluntary lease handoff in progress —
+        // retryable (same SQLSTATE class as commit conflict, since the
+        // caller should retry from a fresh route + re-resolved owner).
+        BasinError::LeaseHandoffInProgress(_) => ("ERROR", "40001"), // serialization_failure
         BasinError::IsolationViolation(_) => ("FATAL", "XX000"),
         // Coarse-grained internal categories all collapse to XX000.
         BasinError::Storage(_)

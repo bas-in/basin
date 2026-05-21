@@ -30,13 +30,23 @@ pub(crate) enum BufferRecord {
     Entry(EntryRecord),
     TxBegin { lsn: Lsn, tx_id: u64 },
     TxRollback { lsn: Lsn, tx_id: u64 },
+    /// Phase 6.X.C — voluntary lease-handoff marker. Replay treats it as
+    /// informational; the marker exists so the new owner / audit logs see
+    /// the boundary.
+    Handoff {
+        lsn: Lsn,
+        to_holder: String,
+        at_epoch: i64,
+    },
 }
 
 impl BufferRecord {
     pub fn lsn(&self) -> Lsn {
         match self {
             BufferRecord::Entry(e) => e.lsn,
-            BufferRecord::TxBegin { lsn, .. } | BufferRecord::TxRollback { lsn, .. } => *lsn,
+            BufferRecord::TxBegin { lsn, .. }
+            | BufferRecord::TxRollback { lsn, .. }
+            | BufferRecord::Handoff { lsn, .. } => *lsn,
         }
     }
 }
