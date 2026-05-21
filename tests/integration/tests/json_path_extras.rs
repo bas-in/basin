@@ -55,6 +55,49 @@ async fn make_engine() -> (Engine, ProjectId) {
     (engine, project)
 }
 
+/// Helper: run a SELECT and concatenate ALL rows of the first column as a
+/// space-separated string.  Used for set-returning functions (json_each,
+/// json_object_keys) that now return one value per row (real SRF behavior
+/// since Phase 5.14+) instead of a single comma-separated stub string.
+async fn all_strings_concat(engine: &Engine, project: ProjectId, sql: &str) -> Option<String> {
+    let sess = engine.open_session(project).await.expect("open_session");
+    let result = sess.execute(sql).await.expect(sql);
+    let batches = match result {
+        ExecResult::Rows { batches, .. } => batches,
+        ExecResult::Empty { .. } => return None,
+    };
+    let mut out = Vec::new();
+    for batch in &batches {
+        let col = batch.column(0);
+        match col.data_type() {
+            DataType::Utf8 => {
+                let a = col.as_any().downcast_ref::<StringArray>().unwrap();
+                for i in 0..a.len() {
+                    if !a.is_null(i) {
+                        out.push(a.value(i).to_string());
+                    }
+                }
+            }
+            DataType::LargeBinary => {
+                let a = col.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+                for i in 0..a.len() {
+                    if !a.is_null(i) {
+                        if let Ok(s) = std::str::from_utf8(a.value(i)) {
+                            out.push(s.to_string());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out.join(" "))
+    }
+}
+
 /// Helper: run a SELECT and get first column first row as String.
 async fn first_string(engine: &Engine, project: ProjectId, sql: &str) -> Option<String> {
     let sess = engine.open_session(project).await.expect("open_session");
@@ -233,10 +276,12 @@ async fn test_jsonb_path_query_array() {
 // json_object_keys
 // ===========================
 
+/// Phase 5.14+: `json_object_keys` is a real SRF returning one key per row.
+/// Use `all_strings_concat` to collect all rows before asserting.
 #[tokio::test]
 async fn test_json_object_keys() {
     let (engine, project) = make_engine().await;
-    let s = first_string(
+    let s = all_strings_concat(
         &engine,
         project,
         "SELECT json_object_keys('{\"a\":1,\"b\":2,\"c\":3}')",
@@ -253,18 +298,29 @@ async fn test_json_object_keys() {
 // json_each / json_each_text
 // ===========================
 
+/// Phase 5.14+: `json_each` is a real SRF returning one (key, value) row per
+/// JSON key.  The first column is the key.  Use `all_strings_concat` to
+/// collect all key values across rows before asserting presence of both keys.
 #[tokio::test]
 async fn test_json_each() {
     let (engine, project) = make_engine().await;
-    let s = first_string(&engine, project, "SELECT json_each('{\"x\":1,\"y\":2}')").await;
+    let s = all_strings_concat(
+        &engine,
+        project,
+        "SELECT json_each('{\"x\":1,\"y\":2}')",
+    )
+    .await;
     let s = s.expect("json_each result");
     assert!(s.contains('x') && s.contains('y'), "json_each output: {s}");
 }
 
+/// Phase 5.14+: `json_each_text` is a real SRF returning one (key, value) row
+/// per JSON key.  The first column of the SRF output is the key.
+/// Use `all_strings_concat` to collect all rows before asserting.
 #[tokio::test]
 async fn test_json_each_text() {
     let (engine, project) = make_engine().await;
-    let s = first_string(
+    let s = all_strings_concat(
         &engine,
         project,
         "SELECT json_each_text('{\"name\":\"alice\",\"age\":30}')",
@@ -272,7 +328,7 @@ async fn test_json_each_text() {
     .await;
     let s = s.expect("json_each_text result");
     assert!(
-        s.contains("name") && s.contains("alice"),
+        s.contains("name") && s.contains("age"),
         "json_each_text: {s}"
     );
 }
