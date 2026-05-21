@@ -1,0 +1,61 @@
+{
+  "name": "@basin-examples/saas-starter",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Multi-tenant SaaS reference app for Basin: Drizzle ORM + basin-auth + RLS + basin-rest + storage",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "node --experimental-vm-modules node_modules/.bin/jest --testPathPattern=tests/",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "tsx scripts/migrate.ts",
+    "db:setup": "tsx scripts/setup-rls.ts",
+    "db:seed": "tsx scripts/seed.ts",
+    "setup": "npm run db:migrate && npm run db:setup"
+  },
+  "dependencies": {
+    "drizzle-orm": "^0.36.4",
+    "postgres": "^3.4.4",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.27.0"
+  },
+  "optionalDependencies": {
+    "@basin/basin-js": "^0.1.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.12",
+    "@types/node": "^22.0.0",
+    "@types/react": "^18.3.1",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "drizzle-kit": "^0.28.1",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.2.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10"
+  },
+  "jest": {
+    "preset": "ts-jest",
+    "testEnvironment": "node",
+    "extensionsToTreatAsEsm": [
+      ".ts"
+    ],
+    "moduleNameMapper": {
+      "^(\\.{1,2}/.*)\\.js$": "$1"
+    },
+    "transform": {
+      "^.+\\.tsx?$": [
+        "ts-jest",
+        {
+          "useESM": true,
+          "tsconfig": {
+            "module": "ES2022"
+          }
+        }
+      ]
+    }
+  }
+}
