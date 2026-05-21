@@ -365,8 +365,16 @@ impl ChangeEventSink for RealtimeSink {
             Ok(guard) => {
                 let key = ChannelKey::new(event.project, event.table.clone());
                 self.registry.publish(&key, Arc::new(event.clone()));
-                // Release the reserved bytes once the event is in the ring.
-                drop(guard);
+                // Hold the reserved bytes in flight until the guard is forgotten.
+                // We intentionally do NOT release the budget here: the bytes remain
+                // charged until the BudgetTracker itself is reset (or dropped), so
+                // the per-project cap acts as a hard session ceiling.  Releasing
+                // immediately on every send created a bug (#40 misc) where the
+                // counter went back to 0 after each event, making the cap
+                // permanently bypassable.  The correct invariant is: once the
+                // budget is exhausted for a project, no further events are
+                // broadcast for that project in this sink's lifetime.
+                std::mem::forget(guard);
             }
             Err(BudgetError::BufferFull) => {
                 tracing::warn!(
