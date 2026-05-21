@@ -1,183 +1,237 @@
 ---
-title: "Getting started with Basin — CRUD, auth, RLS, REST, and Wasm functions"
+title: "Getting started with Basin — 15-minute walkthrough"
 nav_section: overview
 sidebar_position: 1
-summary: "End-to-end walkthrough: spin up a dev cluster, create a table, add auth, enable row-level security, call the REST API, and deploy a Wasm function."
-tags: [getting-started, tutorial, auth, rls, rest, functions]
+summary: "Spin up Basin with Docker, create tables, add RLS policies, call the auth and REST APIs, and wire a React/Vite frontend. Every step is copy-pasteable and verified against the real system."
+tags: [getting-started, tutorial, auth, rls, rest, react]
 ---
 
 # Getting started with Basin
 
-This tutorial walks you from zero to a working Basin project on a local dev machine. You will:
+This tutorial takes you from a fresh machine to a working Basin project in
+about 15 minutes. You will:
 
-1. Start the Basin dev-stack with Docker (or a pre-built binary).
-2. Create a table, insert rows, and query them over pgwire.
-3. Enable `basin-auth`, sign up a user, and get a JWT.
-4. Protect rows with a row-level security policy.
-5. Read data over the PostgREST-shaped REST API.
-6. Deploy a tiny Wasm function and invoke it over HTTP.
+1. Start Basin with a single `docker run`.
+2. Connect with `psql` and verify the round-trip.
+3. Create a schema with two tables and an RLS policy.
+4. Sign up a user and sign in to get a JWT (basin-auth).
+5. Run CRUD over psql and the REST API (basin-rest).
+6. Wire a tiny React/Vite component to query Basin from the browser.
+7. Learn the first-deployment path to basin-cloud.
 
-Follow each section in order — later steps depend on what earlier ones set up.
+Follow the steps in order — later sections use what earlier ones set up.
 
 ---
 
 ## Prerequisites
 
-| Tool | Version | Notes |
-|---|---|---|
-| Docker | 24+ | With the `docker compose` plugin (v2) |
-| `psql` | 14+ | Any Postgres client works; psql ships with every OS Postgres package |
-| `curl` | any | For REST and function calls |
-| `basin-cli` | latest | For `basin functions deploy`; see [basin-cli design spec](./basin-cli-design.md) |
-
-> **No Docker?** If you have a pre-built `basin-server` binary, skip to
-> [Start Basin — binary path](#start-basin--binary-path).
+| Tool | Notes |
+|---|---|
+| Docker (any recent version) | No Rust toolchain required for the Docker path |
+| `psql` | Ships with most OS Postgres packages; any version works |
+| `curl` | For auth and REST calls |
+| Node 20+ | For the React snippet in step 6 |
 
 ---
 
 ## 1. Start Basin
 
-### Option A — Docker (recommended)
+The GHCR image will be published on the first tagged release. Until then,
+build the image from the repo root (takes about five minutes on the first
+run; subsequent builds are fast because Docker caches the Cargo layer):
 
-The `dev/` directory contains a ready-made compose stack: Postgres 16 as the catalog backend, MinIO as the object store, and one `basin-server` replica.
-
-```bash
-# Clone the repo (or cd into it if you already have it).
+```sh
 git clone https://github.com/bas-in/basin.git
 cd basin
 
-# Build images and start. The script waits until every service is healthy.
-bash dev/scripts/up.sh
+# Build the image.
+docker build -t basin-server .
+
+# Run it.
+docker run --rm \
+  -p 5432:5432 \
+  -v basin-data:/var/basin \
+  --name basin \
+  basin-server
 ```
 
-When the script prints `Dev-stack is UP`, Basin is ready:
+Once the published image ships, replace `basin-server` with
+`ghcr.io/bas-in/basin-server:latest` — the flags stay the same.
+
+Basin is ready when you see:
 
 ```
-==> Dev-stack is UP.
-    catalog-pg : postgres://basin:basin@localhost:5532/basin
-    minio      : http://localhost:9100  (console: http://localhost:9101)
-    basin[0]   : postgres://alice@localhost:5533/postgres
+INFO basin_server: pgwire listener is accept-ready bind=0.0.0.0:5432
 ```
 
-Basin's pgwire endpoint is `localhost:5533`. The dev stack pre-creates two project users, `alice` and `bob`, both with wildcard project access (`BASIN_PROJECTS=alice=*,bob=*`).
+Key environment variables (all have defaults; override with `-e`):
 
-To stop the stack later:
+| Variable | Default | What it controls |
+|---|---|---|
+| `BASIN_BIND` | `0.0.0.0:5432` | pgwire listen address inside the container |
+| `BASIN_DATA_DIR` | `/var/basin` | Data root — mount a volume here for persistence |
+| `BASIN_STORAGE_BACKEND` | `local` | `local` (filesystem), `s3`, or `tigris` |
+| `BASIN_PROJECTS` | `basin=*` | Comma-separated `user=project_id` pairs; `*` auto-generates a ULID |
 
-```bash
-bash dev/scripts/down.sh
+The `-v basin-data:/var/basin` flag persists data across restarts.
+Omit it and all data is lost when the container exits.
+
+**Port conflict?** If 5432 is already in use, map to a different host port:
+
+```sh
+docker run --rm -p 5433:5432 -v basin-data:/var/basin --name basin basin-server
+# Then connect on 5433 everywhere below instead of 5432.
 ```
-
-### Option B — binary path
-
-If you built `basin-server` from source, set the `BASIN_SERVER_BYO_BINARY` env var and start the compose stack — the Dockerfile stage is skipped and the binary is bind-mounted instead:
-
-```bash
-export BASIN_SERVER_BYO_BINARY=/path/to/target/release/basin-server
-bash dev/scripts/up.sh --no-build
-```
-
-Or run the binary directly (you still need a catalog Postgres and a MinIO or S3 bucket; the compose file shows the required env vars under `x-basin-env`).
-
-### Confirm pgwire is up
-
-```bash
-psql "postgres://alice@localhost:5533/postgres" -c "SELECT version();"
-```
-
-Expected output includes `Basin` in the version string. If `psql` can't connect, run `docker compose -f dev/docker-compose.yml logs basin-server-0 | tail -30` to inspect the startup logs.
 
 ---
 
-## 2. Create your first table
+## 2. Connect with psql
 
-Connect as `alice` and create a table:
+Open a new terminal (leave the container running):
 
-```bash
-psql "postgres://alice@localhost:5533/postgres"
+```sh
+psql -h 127.0.0.1 -p 5432 -U basin
 ```
 
+| Parameter | Value | Source |
+|---|---|---|
+| Host | `127.0.0.1` | localhost via the `-p 5432:5432` mapping |
+| Port | `5432` | `BASIN_BIND=0.0.0.0:5432` inside the container |
+| User | `basin` | `BASIN_PROJECTS=basin=*` auto-provisions this user |
+| Password | _(none)_ | No auth required in the default dev configuration |
+
+Run a quick sanity check — this is the same round-trip the smoke harness
+(`tests/integration/scripts/docker-smoke.sh`) executes:
+
 ```sql
--- Declare a primary key so the hot-tier memtable can do sub-millisecond
--- point lookups and upserts. See the HTAP guide for why this matters.
-CREATE TABLE events (
-    id         BIGSERIAL PRIMARY KEY,
-    owner_id   TEXT        NOT NULL,
-    category   TEXT        NOT NULL,
-    payload    JSONB,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+CREATE TABLE smoke (id int, name text);
+INSERT INTO smoke VALUES (1, 'hello basin');
+SELECT id, name FROM smoke WHERE id = 1;
+```
+
+Expected output:
+
+```
+ id |    name
+----+-------------
+  1 | hello basin
+(1 row)
+```
+
+Data lands in Vortex-compressed columnar files under the volume:
+
+```sh
+docker exec basin find /var/basin -name '*.vortex'
+```
+
+Drop the smoke table when you are done:
+
+```sql
+DROP TABLE smoke;
+```
+
+---
+
+## 3. Create a schema and an RLS policy
+
+Still in the same psql session. Create two tables — a `users` profile table
+and a `notes` table — then lock `notes` behind a row-level security policy
+so each user can only see their own rows.
+
+```sql
+-- Users table. The id column matches the JWT `sub` claim issued by
+-- basin-auth (a UUID string). Populated by the app on first sign-in.
+CREATE TABLE users (
+  id           TEXT        NOT NULL PRIMARY KEY,
+  email        TEXT        NOT NULL UNIQUE,
+  display_name TEXT,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Notes table. Each note belongs to one user.
+CREATE TABLE notes (
+  id         UUID        NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
+  user_id    TEXT        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  title      TEXT        NOT NULL,
+  body       TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
 
-Insert a few rows:
+Enable RLS on `notes` and add two policies:
 
 ```sql
-INSERT INTO events (owner_id, category, payload) VALUES
-    ('alice',  'login',   '{"ip": "1.2.3.4"}'),
-    ('alice',  'purchase','{"item": "widget", "amount": 9.99}'),
-    ('bob',    'login',   '{"ip": "5.6.7.8"}'),
-    ('bob',    'purchase','{"item": "gadget", "amount": 49.99}');
+-- Enable row-level security. After this, SELECT returns zero rows for
+-- any role that has no matching policy — not an error, just an empty set.
+ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+
+-- auth.uid() returns the `sub` claim from the JWT of the current request.
+-- basin-rest injects this automatically from the Authorization header.
+
+-- SELECT: users can only read their own notes.
+CREATE POLICY notes_owner_select ON notes
+  FOR SELECT
+  USING (user_id = auth.uid());
+
+-- INSERT: users can only create notes for themselves.
+CREATE POLICY notes_owner_insert ON notes
+  FOR INSERT
+  WITH CHECK (user_id = auth.uid());
+
+-- UPDATE: users can only edit their own notes.
+CREATE POLICY notes_owner_update ON notes
+  FOR UPDATE
+  USING (user_id = auth.uid());
+
+-- DELETE: users can only delete their own notes.
+CREATE POLICY notes_owner_delete ON notes
+  FOR DELETE
+  USING (user_id = auth.uid());
 ```
 
-Query them back:
+Insert a couple of rows to have data ready for the REST step:
 
 ```sql
-SELECT id, owner_id, category, created_at
-FROM events
-ORDER BY created_at;
+-- Direct inserts bypass RLS (you are the privileged pgwire user).
+-- In production, app code always goes through basin-rest with a JWT.
+INSERT INTO users (id, email, display_name) VALUES
+  ('user_alice', 'alice@example.com', 'Alice'),
+  ('user_bob',   'bob@example.com',   'Bob');
+
+INSERT INTO notes (user_id, title, body) VALUES
+  ('user_alice', 'First note',  'Hello from Alice'),
+  ('user_alice', 'Second note', 'Still Alice'),
+  ('user_bob',   'Bob note',    'Only Bob sees this');
 ```
 
-All four rows are visible because no security policies are in place yet.
+Query without a JWT (privileged pgwire session bypasses RLS):
 
 ```sql
--- Aggregation works in the same query — Basin merges the hot-tier
--- memtable with the Vortex columnar store transparently.
-SELECT owner_id, COUNT(*) AS event_count, SUM((payload->>'amount')::numeric) AS total
-FROM events
-GROUP BY owner_id;
+SELECT id, user_id, title FROM notes ORDER BY created_at;
 ```
+
+All three rows are visible here because you are connected as the privileged
+project user via pgwire, not through basin-rest. The RLS policies fire when
+requests arrive over the REST API carrying a JWT.
 
 ---
 
-## 3. Add auth
+## 4. Auth: sign up and sign in
 
-Basin's auth subsystem (`basin-auth`) is off by default. To enable it, add the required env vars to the dev stack.
+`basin-auth` and `basin-rest` are enabled by default in the Docker image
+(they ship in the OSS bundle). They listen on the same port as pgwire and
+share the HTTP path prefix `/auth/v1/` and `/rest/v1/` respectively.
 
-### Configure the dev stack
+> **SMTP note:** basin-auth requires SMTP configuration to send email
+> verification and password-reset links. In the default Docker dev setup,
+> email flows are disabled (`BASIN_AUTH_SMTP_TLS=none`) so sign-up succeeds
+> immediately without an inbox check. For production, pass the full SMTP env
+> block described in [ADR 0005](./decisions/0005-auth-system.md).
 
-Create a `dev/.env` file (the compose file reads it automatically):
+### Sign up
 
-```bash
-# dev/.env
-BASIN_AUTH_ENABLED=1
-BASIN_AUTH_JWT_SECRET=0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
-
-# Dev SMTP: use Mailpit or any local SMTP relay (port 1025 by default).
-# For quick testing you can set BASIN_AUTH_SMTP_TLS=none and point at
-# a local Mailpit container.
-BASIN_AUTH_SMTP_HOST=localhost
-BASIN_AUTH_SMTP_PORT=1025
-BASIN_AUTH_SMTP_USERNAME=dev
-BASIN_AUTH_SMTP_PASSWORD=dev
-BASIN_AUTH_SMTP_FROM=noreply@basin.local
-BASIN_AUTH_SMTP_TLS=none
-```
-
-> `basin-auth` **will not start** if SMTP env vars are missing — half-configured email is the source of every sign-in support ticket in production. For a quick local run, Mailpit (`docker run -p 1025:1025 -p 8025:8025 axllent/mailpit`) provides a no-config local SMTP server.
-
-Restart the stack to pick up the env:
-
-```bash
-bash dev/scripts/down.sh
-bash dev/scripts/up.sh
-```
-
-### Sign up a user
-
-`basin-auth` exposes an HTTP auth API alongside the pgwire port. On the dev stack it listens on `localhost:5533` under `/auth/v1/`:
-
-```bash
-# Sign up alice@example.com
-curl -s -X POST http://localhost:5533/auth/v1/signup \
+```sh
+curl -s -X POST http://127.0.0.1:5432/auth/v1/signup \
   -H "Content-Type: application/json" \
   -d '{"email":"alice@example.com","password":"hunter2hunter2"}' \
   | jq .
@@ -190,16 +244,22 @@ Response:
   "access_token": "eyJ...",
   "token_type": "bearer",
   "expires_in": 3600,
-  "refresh_token": "rt_..."
+  "refresh_token": "rt_...",
+  "user": {
+    "id": "01JW...",
+    "email": "alice@example.com"
+  }
 }
 ```
 
-If email verification is enabled (the default), check your Mailpit inbox at `http://localhost:8025` and click the verification link before proceeding.
+The `access_token` is a short-lived JWT (default TTL: 1 hour). The
+`refresh_token` is an opaque token (default TTL: 30 days) used to rotate
+the access token via `POST /auth/v1/refresh`.
 
-### Sign in and capture the JWT
+### Sign in
 
-```bash
-JWT=$(curl -s -X POST http://localhost:5533/auth/v1/signin \
+```sh
+JWT=$(curl -s -X POST http://127.0.0.1:5432/auth/v1/signin \
   -H "Content-Type: application/json" \
   -d '{"email":"alice@example.com","password":"hunter2hunter2"}' \
   | jq -r .access_token)
@@ -207,231 +267,330 @@ JWT=$(curl -s -X POST http://localhost:5533/auth/v1/signin \
 echo "JWT: ${JWT:0:40}..."
 ```
 
-Keep `$JWT` in your shell — you will use it in the REST and Wasm sections below.
+Keep `$JWT` in your shell. Every REST and direct-fetch call below passes it
+in the `Authorization: Bearer $JWT` header. basin-rest verifies the token
+and extracts `auth.uid()` from the `sub` claim, which the RLS policies use.
 
 ---
 
-## 4. Row-level security
+## 5. CRUD over psql and the REST API
 
-With identities in place, lock the `events` table so each user can only see their own rows.
+### psql path (always works today)
 
-Connect as a privileged user (or the `basin_auth_service` role) and enable RLS:
+You can set the JWT claim in psql to simulate what basin-rest does
+automatically, which is useful for debugging RLS policies:
 
-```bash
-psql "postgres://alice@localhost:5533/postgres"
+```sql
+-- Set the JWT sub claim so auth.uid() resolves to alice's id.
+SET request.jwt.claims = '{"sub":"user_alice"}';
+
+-- Now the RLS policy fires: only Alice's notes are visible.
+SELECT id, title FROM notes;
+```
+
+Expected output (only Alice's two rows):
+
+```
+ id                                   | title
+--------------------------------------+-------------
+ <uuid>                               | First note
+ <uuid>                               | Second note
+(2 rows)
 ```
 
 ```sql
--- Enable row-level security. After this, SELECT returns zero rows for
--- any role that doesn't match a policy — not an error, just an empty set.
-ALTER TABLE events ENABLE ROW LEVEL SECURITY;
-
--- Owner-only read policy.
--- auth.uid() returns the `sub` claim from the JWT of the current session.
-CREATE POLICY events_owner_read ON events
-    FOR SELECT
-    USING (owner_id = auth.uid());
-
--- Owner-only insert policy.
-CREATE POLICY events_owner_insert ON events
-    FOR INSERT
-    WITH CHECK (owner_id = auth.uid());
+-- Switch to Bob's claim — Bob's note is now visible instead.
+SET request.jwt.claims = '{"sub":"user_bob"}';
+SELECT id, title FROM notes;
 ```
 
-### Verify isolation
+> `SET request.jwt.claims` is a development introspection tool for testing
+> RLS policies directly in psql. In production, basin-rest injects the JWT
+> context automatically from the `Authorization` header on every request.
 
-Open two separate psql sessions that supply different JWTs. In a real application the JWT comes from the `Authorization` header; in psql you can set it as a connection parameter:
+Reset the session before continuing:
 
-```bash
-# Alice's session — set the JWT claim so auth.uid() resolves correctly.
-psql "postgres://alice@localhost:5533/postgres" \
-  -c "SET request.jwt.claims = '{\"sub\":\"alice\"}'; SELECT id, owner_id FROM events;"
+```sql
+RESET request.jwt.claims;
 ```
 
-Alice sees only her two rows.
+### REST API path (basin-rest)
 
-```bash
-# Bob's session.
-psql "postgres://alice@localhost:5533/postgres" \
-  -c "SET request.jwt.claims = '{\"sub\":\"bob\"}'; SELECT id, owner_id FROM events;"
-```
+`basin-rest` exposes every table at `/rest/v1/<table>` using
+PostgREST-compatible URL conventions. The `$JWT` from Step 4 is the
+authentication credential.
 
-Bob sees only his two rows. The filter is enforced inside the engine — there is no application-layer `WHERE owner_id = ?` to forget.
+**Read notes (RLS-filtered to Alice's rows):**
 
-> In production the JWT is verified and injected automatically by `basin-rest` and the Wasm function runtime. The `SET request.jwt.claims` pattern is a development introspection tool; it is not how authentication works in production.
-
----
-
-## 5. REST API
-
-`basin-rest` exposes every table as a PostgREST-compatible endpoint under `/rest/v1/<table>`. The JWT you captured in Section 3 is the auth credential.
-
-### Read your rows
-
-```bash
-curl -s "http://localhost:5533/rest/v1/events" \
+```sh
+curl -s "http://127.0.0.1:5432/rest/v1/notes" \
   -H "Authorization: Bearer $JWT" \
   | jq .
 ```
 
-The response is a JSON array. Because RLS is active, you only see Alice's rows — the engine enforces the `events_owner_read` policy using the `sub` claim from `$JWT`.
+Because the RLS policy is active, only Alice's notes come back — there is
+no `WHERE user_id = ?` in the application code.
 
-### Filter and project
+**Filter and project:**
 
-```bash
-# Only purchase events, selecting two columns.
-curl -s "http://localhost:5533/rest/v1/events?category=eq.purchase&select=id,payload" \
+```sh
+# Only the title column, ordered newest first.
+curl -s "http://127.0.0.1:5432/rest/v1/notes?select=id,title&order=created_at.desc" \
   -H "Authorization: Bearer $JWT" \
   | jq .
 ```
 
-### Insert via REST
+**Insert a new note:**
 
-```bash
-curl -s -X POST "http://localhost:5533/rest/v1/events" \
+```sh
+curl -s -X POST "http://127.0.0.1:5432/rest/v1/notes" \
   -H "Authorization: Bearer $JWT" \
   -H "Content-Type: application/json" \
   -H "Prefer: return=representation" \
-  -d '{"owner_id":"alice","category":"api_call","payload":{"endpoint":"/rest/v1/events"}}' \
+  -d '{"user_id":"user_alice","title":"From REST","body":"Inserted via HTTP"}' \
   | jq .
 ```
 
-The `Prefer: return=representation` header makes Basin return the inserted row (with the server-assigned `id` and `created_at`).
+The `Prefer: return=representation` header returns the inserted row,
+including the server-generated `id` and `created_at`.
 
-### Supported query parameters (v1)
+**Update a note** (replace `<note-id>` with an `id` from above):
 
-| Parameter | Example | Effect |
-|---|---|---|
-| `select` | `select=id,category` | Column projection |
-| `<col>=eq.<val>` | `category=eq.login` | Equality filter |
-| `<col>=gt.<val>` | `created_at=gt.2026-01-01` | Greater-than |
-| `<col>=lt.<val>` | `created_at=lt.2027-01-01` | Less-than |
-| `<col>=in.(a,b)` | `category=in.(login,purchase)` | Membership |
-| `order` | `order=created_at.desc` | Result ordering |
-| `limit` | `limit=10` | Result cap |
-| `offset` | `offset=20` | Pagination |
-
----
-
-## 6. A Wasm function
-
-Basin runs WebAssembly functions inside the engine — no separate runtime process. Author in TypeScript (or any WASI Preview 2 language), deploy via `basin functions deploy`, and invoke over HTTP.
-
-### Write the function
-
-Create a file `fn/summarise.ts`:
-
-```typescript
-// fn/summarise.ts
-// Returns a JSON summary of how many events each category has.
-import { handle, query, log } from "@bas-in/functions";
-
-export default handle(async (req) => {
-  log.info("summarise called");
-
-  const rows = await query.exec(`
-    SELECT category, COUNT(*) AS n
-    FROM events
-    GROUP BY category
-    ORDER BY n DESC
-  `);
-
-  // rows is list<{ columns: list<[string, string]> }>
-  const summary = rows.map((r) => ({
-    category: r.columns[0][1],
-    count:    parseInt(r.columns[1][1], 10),
-  }));
-
-  return {
-    status:  200,
-    headers: [["content-type", "application/json"]],
-    body:    new TextEncoder().encode(JSON.stringify({ summary })),
-  };
-});
+```sh
+curl -s -X PATCH "http://127.0.0.1:5432/rest/v1/notes?id=eq.<note-id>" \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -H "Prefer: return=representation" \
+  -d '{"title":"Updated title"}' \
+  | jq .
 ```
 
-Key points:
+**Delete a note:**
 
-- `query.exec` runs SQL under **the caller's identity**. `auth.uid()` inside the SQL resolves to the JWT `sub` of whoever hits the endpoint.
-- RLS policies on `events` fire normally — Alice's invocation sees only Alice's rows.
-- `log.info` writes to Basin's structured log, tagged with the function name and project.
-
-### Deploy
-
-```bash
-# basin-cli compiles TypeScript → Wasm component via ComponentizeJS,
-# then uploads the compiled bytes to the engine catalog.
-basin functions deploy ./fn/summarise.ts --name summarise
-```
-
-Expected output:
-
-```
-Compiled fn/summarise.ts → 142 KiB Wasm component
-Deployed function "summarise" (version 1)
-Invoke: ANY /fn/v1/summarise
-```
-
-### Invoke
-
-```bash
-curl -s "http://localhost:5533/fn/v1/summarise" \
+```sh
+curl -s -X DELETE "http://127.0.0.1:5432/rest/v1/notes?id=eq.<note-id>" \
   -H "Authorization: Bearer $JWT" \
   | jq .
 ```
 
-Response (Alice's events only, because RLS applies inside the function):
+### Supported query parameters (REST v1)
 
-```json
-{
-  "summary": [
-    { "category": "login",    "count": 1 },
-    { "category": "purchase", "count": 1 },
-    { "category": "api_call", "count": 1 }
-  ]
-}
-```
-
-The JWT auth gate fires before the function is resolved — a missing or invalid token gets a 401 without the function ever loading.
-
-### Limits (dev defaults)
-
-| Cap | Default |
-|---|---|
-| CPU time per invocation | 200 ms |
-| Memory per invocation | 64 MiB |
-| Wall-clock time | 5 s |
-| Concurrent invocations per project | 10 |
-
-Caps are configurable per project via `ALTER PROJECT` (see [functions.md](./functions.md) for the full ABI and limit reference).
+| Parameter | Example | Effect |
+|---|---|---|
+| `select` | `select=id,title` | Column projection |
+| `<col>=eq.<val>` | `user_id=eq.user_alice` | Equality filter |
+| `<col>=gt.<val>` | `created_at=gt.2026-01-01` | Greater-than |
+| `<col>=lt.<val>` | `created_at=lt.2027-01-01` | Less-than |
+| `<col>=in.(a,b)` | `user_id=in.(user_alice,user_bob)` | Membership |
+| `<col>=is.null` | `body=is.null` | Null check |
+| `order` | `order=created_at.desc` | Ordering |
+| `limit` | `limit=10` | Result cap |
+| `offset` | `offset=20` | Pagination offset |
 
 ---
 
-## 7. Next steps
+## 6. A React/Vite frontend
 
-### Sample applications
+The `examples/saas-starter/` directory in the repo is a working Vite + React
+application that demonstrates CRUD, auth, and RLS end-to-end.
 
-The following sample applications are in progress and will reference this tutorial as their starting point:
+Below is the minimal pattern from that app — a note-list component that
+authenticates, fetches notes (RLS-filtered server-side), and inserts new
+ones.
 
-- **SaaS starter** (Phase 5.32.C — coming soon) — a multi-tenant to-do app that demonstrates per-project isolation, RLS, auth, and the REST layer end-to-end.
-- **AI / RAG sample** (Phase 5.32.D — coming soon) — vector search over embedded documents with Basin's native vector index; calls OpenAI embeddings from a Wasm function.
+> **npm package status:** `@basin/basin-js` is not yet published to npm
+> as of May 2026. The saas-starter uses a fetch-based shim
+> (`src/lib/basin-js-stub.ts`) that implements the same interface. The
+> snippet below follows the same pattern — swap in the real SDK once it
+> publishes, with no API changes.
 
-### Deeper reading
+### Install
+
+```sh
+npm create vite@latest my-basin-app -- --template react-ts
+cd my-basin-app
+npm install
+```
+
+Copy `examples/saas-starter/src/lib/basin-js-stub.ts` into your project as
+`src/lib/basin.ts` and adjust the import path. Or point directly at the
+real SDK once it ships:
+
+```sh
+# Once published:
+npm install @basin/basin-js
+```
+
+### Configure
+
+Create `.env.local`:
+
+```sh
+VITE_BASIN_URL=http://localhost:5432
+VITE_BASIN_ANON_KEY=     # leave empty in dev (no RLS on anon key needed)
+```
+
+### basin client singleton (`src/lib/basin.ts`)
+
+```ts
+// Until @basin/basin-js is published, alias basin-js-stub.ts here.
+// The API surface is identical — swap the import once the package ships.
+import { createClient } from './basin-js-stub'
+
+const BASIN_URL  = import.meta.env.VITE_BASIN_URL  ?? 'http://localhost:5432'
+const BASIN_ANON = import.meta.env.VITE_BASIN_ANON_KEY ?? ''
+
+export const basin = createClient(BASIN_URL, BASIN_ANON)
+```
+
+### Auth (sign in, sign up)
+
+```ts
+// Sign up — POST /auth/v1/signup
+const { data, error } = await basin.auth.signUp({ email, password })
+// data.user.id  = JWT `sub` claim (matches users.id in your schema)
+// data.session.accessToken = JWT stored in localStorage automatically
+
+// Sign in — POST /auth/v1/signin
+const { data, error } = await basin.auth.signInWithPassword({ email, password })
+
+// Sign out — POST /auth/v1/signout
+await basin.auth.signOut()
+```
+
+The JWT is stored in `localStorage` under the key `basin-session` and
+attached automatically to every subsequent REST call.
+
+### Notes component — fetch + insert + delete
+
+```tsx
+import { useEffect, useState } from 'react'
+import { basin } from './lib/basin'
+
+interface Note {
+  id: string
+  user_id: string
+  title: string
+  body: string | null
+  created_at: string
+}
+
+export function NoteList({ userId }: { userId: string }) {
+  const [notes, setNotes]     = useState<Note[]>([])
+  const [newTitle, setNewTitle] = useState('')
+
+  // Fetch — RLS enforced server-side; no WHERE clause needed here.
+  useEffect(() => {
+    basin
+      .from<Note>('notes')
+      .select('id, user_id, title, body, created_at')
+      .then(({ data, error }) => {
+        if (!error && data) setNotes(data)
+      })
+  }, [])
+
+  // Insert
+  async function addNote() {
+    if (!newTitle.trim()) return
+    const { data, error } = await basin
+      .from<Note>('notes')
+      .insert({ user_id: userId, title: newTitle.trim() })
+    if (!error && data?.[0]) {
+      setNotes(n => [...n, data[0]])
+      setNewTitle('')
+    }
+  }
+
+  // Delete
+  async function deleteNote(id: string) {
+    const { error } = await basin.from<Note>('notes').delete().eq('id', id)
+    if (!error) setNotes(n => n.filter(note => note.id !== id))
+  }
+
+  return (
+    <div>
+      <ul>
+        {notes.map(note => (
+          <li key={note.id}>
+            <strong>{note.title}</strong>
+            <button onClick={() => deleteNote(note.id)}>Delete</button>
+          </li>
+        ))}
+      </ul>
+      <input
+        value={newTitle}
+        onChange={e => setNewTitle(e.target.value)}
+        placeholder="New note title"
+      />
+      <button onClick={addNote}>Add</button>
+    </div>
+  )
+}
+```
+
+Under the hood each call translates to:
+
+| Operation | HTTP call |
+|---|---|
+| `.from('notes').select(...)` | `GET /rest/v1/notes?select=id,user_id,...` |
+| `.insert({...})` | `POST /rest/v1/notes` with `Prefer: return=representation` |
+| `.delete().eq('id', id)` | `DELETE /rest/v1/notes?id=eq.<id>` |
+
+The `Authorization: Bearer <jwt>` header is attached automatically from
+the session stored in `localStorage`. The RLS policies fire on the server;
+the component never writes a `WHERE user_id = ?` clause.
+
+For a full working example with org switcher, avatar upload, and Drizzle
+migrations, see [`examples/saas-starter/`](../examples/saas-starter/).
+
+---
+
+## 7. First deployment to basin-cloud
+
+> **Forward-spec note:** basin-cloud and basin-cli are not yet publicly
+> available. This section describes the intended path; the self-hosted
+> Docker setup above is the working path today.
+
+When basin-cloud launches, the deployment flow will be:
+
+```sh
+# Install basin-cli (Go binary, Sigstore-signed release artefacts).
+# The bas-in/basin-cli repository will publish pre-built binaries.
+basin login                            # OAuth/JWT flow, stores credential in OS keychain
+basin projects create my-app           # provisions a Basin engine on Fly Machines
+basin projects connect my-app          # prints the postgres:// URL for psql / .env
+```
+
+Point your app at the cloud engine URL — everything else (psql, REST,
+basin-js) works identically because the wire protocol is the same.
+
+For production self-hosting today (before basin-cloud launches), see
+[`docs/deployment.md`](./deployment.md) for the full env-var reference,
+S3/Tigris object storage configuration, and durable catalog setup with
+`BASIN_CATALOG=postgres://...`.
+
+---
+
+## Stop and clean up
+
+```sh
+# Stop the container (the named volume basin-data is preserved).
+docker stop basin
+
+# Remove the volume too — all data is discarded.
+docker volume rm basin-data
+```
+
+---
+
+## Next steps
 
 | Document | What it covers |
 |---|---|
-| [HTAP guide](./htap-guide.md) | Hot-tier vs cold-tier performance, `basin.sort_by`, memtable caps |
-| [Wasm functions](./functions.md) | Full ABI reference, host imports, outbound HTTP, secrets |
+| [5-Minute Docker Quickstart](./quickstart-docker.md) | Single-command start, env-var reference, troubleshooting |
 | [SQL compatibility](./sql-compatibility.md) | Which Postgres SQL Basin accepts and which it defers |
-| [Multi-project SaaS](./multi-project.md) | Project-membership model, per-tenant cost primitives |
-| [CAPABILITIES.md](../CAPABILITIES.md) | Full capability matrix: shipped, in-progress, planned, off-roadmap |
-| [Operator runbooks](./operators/lease-ownership.md) | Day-2 ops: lease ownership, shard rebalancing, stuck-lease playbook |
+| [Multi-project SaaS](./multi-project.md) | Per-project isolation, RLS with `auth.uid()`, cost math at 10k projects |
+| [HTAP guide](./htap-guide.md) | Hot-tier vs cold-tier performance, `basin.sort_by`, memtable caps |
 | [Deployment](./deployment.md) | Production storage backends, topology, configuration |
-
-### Tear down
-
-```bash
-bash dev/scripts/down.sh
-# To also remove all volumes (wipes catalog and object store data):
-docker compose -f dev/docker-compose.yml down -v
-```
+| [CAPABILITIES.md](../CAPABILITIES.md) | Full capability matrix: shipped, in-progress, planned, off-roadmap |
+| [`examples/saas-starter/`](../examples/saas-starter/) | Full React/Vite app with auth, RLS, Drizzle migrations, and avatar upload |
