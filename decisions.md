@@ -6,6 +6,42 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-21 — cargo test --workspace baseline post-Phase-6.X: 41 targets failed
+
+After Phase 6.X complete (A–F all landed, commit `dcad853`), 6.SEC.P1
+public-bucket alias closed (`f1ed678`), and storage_rls test aligned
+(`57f3180`), ran a clean `cargo test --workspace --no-fail-fast`.
+
+Result: **41 of N test targets failed** (workspace builds clean — these
+are runtime assertions, not compile errors).
+
+Sample triage (3 binaries probed):
+- `basin-engine --test serial_type`: 2/5 — engine now correctly distinguishes
+  int2/int4/int8 backings for the SERIAL family; tests still assert Int64.
+  Tests are stale (this is what task #13 was anticipating).
+- `basin-engine --test info_schema_more_routing`: 1/5 —
+  `select_information_schema_schemata_routes` expects 1 row, gets 8 (5.18.D
+  now exposes all reserved schemas — fix landed in `b783a5c` but missed this
+  binary). Test stale.
+- `integration --test pg_query_compat`: 2/33 — parser variant changed
+  (`AlterFunctionRename` now first-class, not `Other`); engine now correctly
+  errors on `DROP TRIGGER` of non-existent trigger (was silently no-op'd).
+  Tests stale; engine more PG-faithful.
+- `integration --test auth_rls_uid`: 1/7 — `UNION ALL under RLS` returns 1
+  instead of expected 2. **Probable real engine bug** (UNION ALL must
+  preserve duplicates); flagged for closer look during triage.
+
+**Decision:** dispatch ONE Sonnet agent to triage all 41 binaries
+sequentially (parallel agents on this many tests/integration/* files would
+collide). Agent instructed: fix obvious stale-test mismatches; FLAG
+anything that looks like a real engine bug rather than auto-updating its
+assertion to pass.
+
+Cost trade-off: serial triage is slower but correct; the UNION ALL case is
+the exemplar of why "just make the test pass" is the wrong default here.
+
+---
+
 ## 2026-05-21 — HARD STOP rule was IGNORED again (`git reset` + `git add -A`)
 
 Despite the explicit rule put in every dispatch prompt after `84b0633`, the
