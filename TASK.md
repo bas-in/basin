@@ -2051,7 +2051,7 @@ Sequencing: **A → B**, **A → D**, **B → C**, **A–D → E + F**.
       2 heartbeat rounds slice=20 each, aggregate admits=60 (not 3×60=180).
       Failure path: coordinator unreachable → views stay stale (safe).
       **Closes the multi-instance cap-bypass P0.** **Depends on A.**
-- [ ] **6.X.E — Failure-path hardening (~1–2 wk).** Replica-loss tests
+- [x] **6.X.E — Failure-path hardening (~1–2 wk).** Replica-loss tests
       (kill mid-write, verify recovery within TTL); dual-leaseholder
       fencing test (force a partition; verify loser's WAL appends are
       rejected); network-partition simulator. **Depends on A–D.** Files:
