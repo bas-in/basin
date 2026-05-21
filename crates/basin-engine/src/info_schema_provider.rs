@@ -43,6 +43,8 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use arrow_array::{ArrayRef, BooleanArray, Int16Array, Int32Array, Int64Array, StringArray};
+use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use basin_catalog::{info_schema::InfoSchemaQuery, Catalog};
 use basin_common::ProjectId;
@@ -54,6 +56,7 @@ use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::logical_expr::{Expr, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 
+use crate::connection_registry::ConnectionRegistry;
 use crate::convert::{batch_ws_to_df, schema_ws_to_df};
 
 /// `TableProvider` for `information_schema.tables` filtered to the calling
@@ -167,6 +170,75 @@ impl InfoSchemaColumnsProvider {
     }
 }
 
+/// Map an Arrow [`DataType`] to a `(data_type, udt_name)` pair matching PG's
+/// `information_schema.columns` values. Used when synthesising column metadata
+/// for pg_catalog system views whose schemas are defined in Arrow terms.
+fn arrow_to_pg_type(dt: &DataType) -> (&'static str, &'static str) {
+    match dt {
+        DataType::Boolean => ("boolean", "bool"),
+        DataType::Int16 => ("smallint", "int2"),
+        DataType::Int32 => ("integer", "int4"),
+        DataType::Int64 | DataType::UInt64 | DataType::UInt32 => ("bigint", "int8"),
+        DataType::Float32 => ("real", "float4"),
+        DataType::Float64 => ("double precision", "float8"),
+        DataType::Utf8 | DataType::LargeUtf8 => ("text", "text"),
+        DataType::Binary | DataType::LargeBinary => ("bytea", "bytea"),
+        DataType::Date32 => ("date", "date"),
+        DataType::Timestamp(_, Some(_)) => ("timestamp with time zone", "timestamptz"),
+        DataType::Timestamp(_, None) => ("timestamp without time zone", "timestamp"),
+        _ => ("text", "text"),
+    }
+}
+
+/// Build an `information_schema.columns` `RecordBatch` for a set of named
+/// pg_catalog system views. Each `(view_name, Arrow schema)` pair contributes
+/// one row per field. The resulting batch is concatenated with the user-table
+/// batch so that tools querying `information_schema.columns WHERE
+/// table_schema = 'pg_catalog'` see the system view column set.
+fn pg_catalog_view_columns_batch(
+    views: &[(&str, Arc<arrow_schema::Schema>)],
+) -> Result<arrow_array::RecordBatch, arrow_schema::ArrowError> {
+    let mut table_catalogs: Vec<&str> = Vec::new();
+    let mut table_schemas: Vec<&str> = Vec::new();
+    let mut table_names: Vec<String> = Vec::new();
+    let mut column_names: Vec<String> = Vec::new();
+    let mut ordinals: Vec<i32> = Vec::new();
+    let mut defaults: Vec<Option<&str>> = Vec::new();
+    let mut is_nullables: Vec<&str> = Vec::new();
+    let mut data_types: Vec<&str> = Vec::new();
+    let mut udt_names: Vec<&str> = Vec::new();
+
+    for (view_name, schema) in views {
+        for (idx, field) in schema.fields().iter().enumerate() {
+            table_catalogs.push("basin");
+            table_schemas.push("pg_catalog");
+            table_names.push(view_name.to_string());
+            column_names.push(field.name().clone());
+            ordinals.push((idx as i32) + 1);
+            defaults.push(None);
+            is_nullables.push(if field.is_nullable() { "YES" } else { "NO" });
+            let (dt, udt) = arrow_to_pg_type(field.data_type());
+            data_types.push(dt);
+            udt_names.push(udt);
+        }
+    }
+
+    // Build using the same columns_schema layout.
+    let ws_schema = InfoSchemaQuery::columns_schema();
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(StringArray::from(table_catalogs)),
+        Arc::new(StringArray::from(table_schemas)),
+        Arc::new(StringArray::from(table_names)),
+        Arc::new(StringArray::from(column_names)),
+        Arc::new(Int32Array::from(ordinals)),
+        Arc::new(StringArray::from(defaults)),
+        Arc::new(StringArray::from(is_nullables)),
+        Arc::new(StringArray::from(data_types)),
+        Arc::new(StringArray::from(udt_names)),
+    ];
+    arrow_array::RecordBatch::try_new(ws_schema, columns)
+}
+
 #[async_trait]
 impl TableProvider for InfoSchemaColumnsProvider {
     fn as_any(&self) -> &dyn Any {
@@ -188,11 +260,52 @@ impl TableProvider for InfoSchemaColumnsProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let ws_batch = InfoSchemaQuery::columns(self.catalog.as_ref(), &self.project)
+        // 1. User tables in the public schema.
+        let user_batch = InfoSchemaQuery::columns(self.catalog.as_ref(), &self.project)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        // 2. Known pg_catalog system views — their column metadata exposed via
+        //    information_schema.columns so that monitoring tools and ORMs that
+        //    query `WHERE table_schema = 'pg_catalog' AND table_name = '…'`
+        //    receive the canonical column set (Phase 5.23.C/D).
+        let pg_views: &[(&str, Arc<arrow_schema::Schema>)] = &[
+            ("pg_stat_activity", InfoSchemaQuery::pg_stat_activity_schema()),
+            ("pg_locks", InfoSchemaQuery::pg_locks_schema()),
+            ("pg_class", InfoSchemaQuery::pg_class_schema()),
+            ("pg_attribute", InfoSchemaQuery::pg_attribute_schema()),
+            ("pg_namespace", InfoSchemaQuery::pg_namespace_schema()),
+            ("pg_type", InfoSchemaQuery::pg_type_schema()),
+            ("pg_proc", InfoSchemaQuery::pg_proc_schema()),
+            ("pg_index", InfoSchemaQuery::pg_index_schema()),
+            ("pg_constraint", InfoSchemaQuery::pg_constraint_schema()),
+            ("pg_depend", InfoSchemaQuery::pg_depend_schema()),
+            ("pg_authid", InfoSchemaQuery::pg_authid_schema()),
+            ("pg_database", InfoSchemaQuery::pg_database_schema()),
+            ("pg_roles", InfoSchemaQuery::pg_roles_schema()),
+            ("pg_views", InfoSchemaQuery::pg_views_schema()),
+            ("pg_indexes", InfoSchemaQuery::pg_indexes_schema()),
+            ("pg_tables", InfoSchemaQuery::pg_tables_schema()),
+            ("pg_settings", InfoSchemaQuery::pg_settings_schema()),
+            ("pg_description", InfoSchemaQuery::pg_description_schema()),
+            ("pg_stat_user_tables", InfoSchemaQuery::pg_stat_user_tables_schema()),
+            ("pg_stat_user_indexes", InfoSchemaQuery::pg_stat_user_indexes_schema()),
+            ("pg_stat_database", InfoSchemaQuery::pg_stat_database_schema()),
+        ];
+
+        let pg_catalog_batch = pg_catalog_view_columns_batch(pg_views)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        // 3. Concatenate: user-table rows first, then pg_catalog view rows.
+        //    Both batches share the same ws-Arrow schema (columns_schema).
+        let combined = arrow_select::concat::concat_batches(
+            &InfoSchemaQuery::columns_schema(),
+            &[user_batch, pg_catalog_batch],
+        )
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
         let df_batch =
-            batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
+            batch_ws_to_df(&combined).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
         let exec = MemorySourceConfig::try_new_exec(
             &partitions,
@@ -1613,6 +1726,291 @@ simple_provider!(
     "UserMappingOptionsProvider"
 );
 
+// ---------------------------------------------------------------------------
+// Phase 5.23.C: live pg_stat_activity provider
+// ---------------------------------------------------------------------------
+
+/// `TableProvider` for `pg_catalog.pg_stat_activity` backed by the process-wide
+/// [`ConnectionRegistry`]. Each `scan()` call snapshots the live session list
+/// for the calling project, so the view always reflects currently-active sessions
+/// without any per-query caching overhead.
+pub(crate) struct PgStatActivityLiveProvider {
+    catalog: Arc<dyn Catalog>,
+    project: ProjectId,
+    schema: DfSchemaRef,
+    registry: ConnectionRegistry,
+}
+
+impl std::fmt::Debug for PgStatActivityLiveProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PgStatActivityLiveProvider")
+            .field("project", &self.project)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PgStatActivityLiveProvider {
+    pub(crate) fn new(
+        catalog: Arc<dyn Catalog>,
+        project: ProjectId,
+        registry: ConnectionRegistry,
+    ) -> DfResult<Self> {
+        let ws_schema = InfoSchemaQuery::pg_stat_activity_schema();
+        let df_schema = schema_ws_to_df(ws_schema.as_ref())
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(Self {
+            catalog,
+            project,
+            schema: Arc::new(df_schema),
+            registry,
+        })
+    }
+}
+
+#[async_trait]
+impl TableProvider for PgStatActivityLiveProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> DfSchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        // Snapshot active sessions from the connection registry.
+        let sessions = self.registry.snapshot(&self.project);
+
+        // Build the pg_stat_activity batch. If no sessions are registered
+        // (e.g. during engine unit tests that don't wire the registry),
+        // fall back to the catalog stub which provides a single synthetic row.
+        let ws_batch = if sessions.is_empty() {
+            InfoSchemaQuery::pg_stat_activity(self.catalog.as_ref(), &self.project)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?
+        } else {
+            let ws_schema = InfoSchemaQuery::pg_stat_activity_schema();
+            let n = sessions.len();
+            // Pre-allocate owned strings to avoid temporary lifetime issues.
+            let project_str = self.project.to_string();
+            let app_names: Vec<String> =
+                sessions.iter().map(|s| s.application_name.clone()).collect();
+            let states: Vec<String> = sessions.iter().map(|s| s.state.clone()).collect();
+            let queries: Vec<Option<String>> =
+                sessions.iter().map(|s| s.query.clone()).collect();
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from(vec![None::<i64>; n])), // datid (synthetic)
+                Arc::new(StringArray::from(vec![Some("basin"); n])),
+                Arc::new(Int32Array::from(sessions.iter().map(|s| s.pid).collect::<Vec<_>>())),
+                Arc::new(Int64Array::from(vec![None::<i64>; n])), // usesysid (synthetic)
+                Arc::new(StringArray::from(vec![Some(project_str.as_str()); n])),
+                Arc::new(StringArray::from(
+                    app_names
+                        .iter()
+                        .map(|a| Some(a.as_str()))
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(vec![None::<&str>; n])), // client_addr
+                Arc::new(StringArray::from(vec![None::<&str>; n])), // client_hostname
+                Arc::new(Int32Array::from(vec![None::<i32>; n])),   // client_port
+                Arc::new(StringArray::from(vec![None::<&str>; n])), // backend_start
+                Arc::new(StringArray::from(vec![None::<&str>; n])), // xact_start
+                Arc::new(StringArray::from(
+                    sessions
+                        .iter()
+                        .map(|s| s.query_start.map(|_| "now"))
+                        .collect::<Vec<_>>(),
+                )), // query_start
+                Arc::new(StringArray::from(vec![None::<&str>; n])), // state_change
+                Arc::new(StringArray::from(vec![None::<&str>; n])), // wait_event_type
+                Arc::new(StringArray::from(vec![None::<&str>; n])), // wait_event
+                Arc::new(StringArray::from(
+                    states
+                        .iter()
+                        .map(|s| Some(s.as_str()))
+                        .collect::<Vec<_>>(),
+                )), // state
+                Arc::new(Int64Array::from(vec![None::<i64>; n])), // backend_xid
+                Arc::new(Int64Array::from(vec![None::<i64>; n])), // backend_xmin
+                Arc::new(StringArray::from(
+                    queries
+                        .iter()
+                        .map(|q| q.as_deref())
+                        .collect::<Vec<_>>(),
+                )), // query
+                Arc::new(StringArray::from(vec![Some("client backend"); n])), // backend_type
+            ];
+            arrow_array::RecordBatch::try_new(ws_schema, columns)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?
+        };
+
+        let df_batch =
+            batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let partitions = vec![vec![df_batch]];
+        let exec = MemorySourceConfig::try_new_exec(
+            &partitions,
+            Arc::clone(&self.schema),
+            projection.cloned(),
+        )?;
+        Ok(exec)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5.23.D: live pg_locks provider
+// ---------------------------------------------------------------------------
+
+/// `TableProvider` for `pg_catalog.pg_locks` backed by the process-wide
+/// [`basin_shard::LockRegistry`]. Each `scan()` call snapshots the current
+/// lock state for the calling project so that `pg_locks` reflects real held
+/// and waiting locks rather than a static empty stub.
+///
+/// ## Composition with `lock_wait.rs`
+///
+/// [`basin_shard::lock_wait::bounded_lock_wait`] drives the async acquisition
+/// loop (retries + deadline). `PgLocksLiveProvider` is the observer: it reads
+/// what `LockRegistry` records after acquisition succeeds or while a waiter
+/// is parked, without duplicating the wait-loop logic.
+pub(crate) struct PgLocksLiveProvider {
+    catalog: Arc<dyn Catalog>,
+    project: ProjectId,
+    schema: DfSchemaRef,
+    registry: basin_shard::LockRegistry,
+}
+
+impl std::fmt::Debug for PgLocksLiveProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PgLocksLiveProvider")
+            .field("project", &self.project)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PgLocksLiveProvider {
+    pub(crate) fn new(
+        catalog: Arc<dyn Catalog>,
+        project: ProjectId,
+        registry: basin_shard::LockRegistry,
+    ) -> DfResult<Self> {
+        let ws_schema = InfoSchemaQuery::pg_locks_schema();
+        let df_schema = schema_ws_to_df(ws_schema.as_ref())
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(Self {
+            catalog,
+            project,
+            schema: Arc::new(df_schema),
+            registry,
+        })
+    }
+}
+
+#[async_trait]
+impl TableProvider for PgLocksLiveProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> DfSchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        // Snapshot live lock entries for this project.
+        let entries = self.registry.snapshot(&self.project);
+
+        let ws_batch = if entries.is_empty() {
+            // Fall back to the catalog stub (empty batch) when no locks are
+            // registered — preserves the schema even for idle sessions.
+            InfoSchemaQuery::pg_locks(self.catalog.as_ref(), &self.project)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?
+        } else {
+            let ws_schema = InfoSchemaQuery::pg_locks_schema();
+            let n = entries.len();
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(StringArray::from(
+                    entries
+                        .iter()
+                        .map(|e| Some(e.locktype.as_str()))
+                        .collect::<Vec<_>>(),
+                )), // locktype
+                Arc::new(Int64Array::from(
+                    entries.iter().map(|e| e.database).collect::<Vec<_>>(),
+                )), // database
+                Arc::new(Int64Array::from(
+                    entries.iter().map(|e| e.relation).collect::<Vec<_>>(),
+                )), // relation
+                Arc::new(Int32Array::from(vec![None::<i32>; n])),   // page
+                Arc::new(Int16Array::from(vec![None::<i16>; n])),   // tuple
+                Arc::new(StringArray::from(
+                    entries
+                        .iter()
+                        .map(|e| e.virtualxid.as_deref())
+                        .collect::<Vec<_>>(),
+                )), // virtualxid
+                Arc::new(Int64Array::from(vec![None::<i64>; n])),   // transactionid
+                Arc::new(Int64Array::from(vec![None::<i64>; n])),   // classid
+                Arc::new(Int64Array::from(vec![None::<i64>; n])),   // objid
+                Arc::new(Int16Array::from(vec![None::<i16>; n])),   // objsubid
+                Arc::new(StringArray::from(
+                    entries
+                        .iter()
+                        .map(|e| format!("1/{}", e.pid))
+                        .collect::<Vec<String>>(),
+                )), // virtualtransaction
+                Arc::new(Int32Array::from(
+                    entries.iter().map(|e| Some(e.pid)).collect::<Vec<_>>(),
+                )), // pid
+                Arc::new(StringArray::from(
+                    entries
+                        .iter()
+                        .map(|e| Some(e.mode.as_str()))
+                        .collect::<Vec<_>>(),
+                )), // mode
+                Arc::new(BooleanArray::from(
+                    entries
+                        .iter()
+                        .map(|e| Some(e.granted))
+                        .collect::<Vec<_>>(),
+                )), // granted
+                Arc::new(BooleanArray::from(vec![Some(true); n])), // fastpath
+            ];
+            arrow_array::RecordBatch::try_new(ws_schema, columns)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?
+        };
+
+        let df_batch =
+            batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let partitions = vec![vec![df_batch]];
+        let exec = MemorySourceConfig::try_new_exec(
+            &partitions,
+            Arc::clone(&self.schema),
+            projection.cloned(),
+        )?;
+        Ok(exec)
+    }
+}
+
 /// Register `information_schema.tables` and `pg_catalog.pg_class` with the
 /// session's default catalog (`datafusion`). Must be called once per
 /// session, before the listing tables are pre-registered, so the schemas
@@ -1632,6 +2030,8 @@ pub(crate) fn register_info_schema_providers(
     ctx: &datafusion::prelude::SessionContext,
     catalog: Arc<dyn Catalog>,
     project: ProjectId,
+    lock_registry: basin_shard::LockRegistry,
+    connection_registry: ConnectionRegistry,
 ) -> DfResult<()> {
     use datafusion::catalog::MemorySchemaProvider;
 
@@ -1771,11 +2171,16 @@ pub(crate) fn register_info_schema_providers(
         "pg_stat_user_indexes".to_string(),
         pg_stat_user_indexes_provider,
     )?;
+    // Phase 5.23.D: use the live provider backed by LockRegistry so that
+    // `pg_locks` reflects real held/waiting locks for the calling project.
     let pg_locks_provider: Arc<dyn TableProvider> =
-        Arc::new(PgLocksProvider::new(catalog.clone(), project)?);
+        Arc::new(PgLocksLiveProvider::new(catalog.clone(), project, lock_registry)?);
     pg_catalog_schema.register_table("pg_locks".to_string(), pg_locks_provider)?;
-    let pg_stat_activity_provider: Arc<dyn TableProvider> =
-        Arc::new(PgStatActivityProvider::new(catalog.clone(), project)?);
+    // Phase 5.23.C: use the live provider backed by ConnectionRegistry so that
+    // `pg_stat_activity` reflects the current session list for the project.
+    let pg_stat_activity_provider: Arc<dyn TableProvider> = Arc::new(
+        PgStatActivityLiveProvider::new(catalog.clone(), project, connection_registry)?,
+    );
     pg_catalog_schema.register_table("pg_stat_activity".to_string(), pg_stat_activity_provider)?;
 
     // Bulk catalog expansion: information_schema additions

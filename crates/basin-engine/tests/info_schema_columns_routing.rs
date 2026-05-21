@@ -430,10 +430,16 @@ async fn cross_project_isolation_columns() {
         .await
         .unwrap();
 
+    // Filter to user-table columns only (`table_schema = 'public'`).
+    // Phase 5.23.C/D extended `information_schema.columns` to also expose
+    // pg_catalog system view column metadata (table_schema = 'pg_catalog').
+    // Those rows are shared across projects and should not affect cross-project
+    // isolation for user tables. We assert isolation on the `public` schema only.
     let cols_a = col_string(
         &rows(
             &sa,
-            "SELECT column_name FROM information_schema.columns ORDER BY column_name",
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_schema = 'public' ORDER BY column_name",
         )
         .await,
         "column_name",
@@ -441,7 +447,8 @@ async fn cross_project_isolation_columns() {
     let cols_b = col_string(
         &rows(
             &sb,
-            "SELECT column_name FROM information_schema.columns ORDER BY column_name",
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_schema = 'public' ORDER BY column_name",
         )
         .await,
         "column_name",

@@ -5756,6 +5756,146 @@ fn extract_json_literal_arg(arg: &str) -> Option<(String, String)> {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 5.23.D: qualify unqualified pg_catalog system view names
+// ---------------------------------------------------------------------------
+
+/// Rewrite unqualified references to well-known pg_catalog system views so
+/// that DataFusion resolves them in the `pg_catalog` schema rather than the
+/// default `public` schema.
+///
+/// DataFusion resolves unqualified table names in the session's default schema
+/// (`public`). Basin registers pg_stat_activity, pg_locks, etc. in the
+/// `pg_catalog` schema. Without this rewrite, `SELECT … FROM pg_locks` would
+/// fail with "table 'datafusion.public.pg_locks' not found".
+///
+/// The rewrite is identifier-boundary-safe: it only fires when `pg_<view>` is
+/// preceded by whitespace / `(` / `,` and followed by whitespace / `)` / `,` /
+/// end-of-string / `;`, and the immediately-preceding non-whitespace token is
+/// NOT `.` (i.e. the name is not already schema-qualified). The rewrite is
+/// case-insensitive on the `FROM`/`JOIN` keywords but preserves original case
+/// for the view name itself.
+pub(crate) fn rewrite_unqualified_pg_catalog_views(sql: &str) -> String {
+    // The list of pg_catalog system view names Basin registers. Each entry is
+    // matched unqualified (not already preceded by a `.` token) and rewritten
+    // to `pg_catalog.<name>`.
+    const PG_CATALOG_VIEWS: &[&str] = &[
+        "pg_locks",
+        "pg_stat_activity",
+        "pg_class",
+        "pg_attribute",
+        "pg_namespace",
+        "pg_type",
+        "pg_proc",
+        "pg_index",
+        "pg_constraint",
+        "pg_depend",
+        "pg_authid",
+        "pg_database",
+        "pg_roles",
+        "pg_views",
+        "pg_indexes",
+        "pg_tables",
+        "pg_settings",
+        "pg_description",
+        "pg_stat_user_tables",
+        "pg_stat_user_indexes",
+        "pg_stat_database",
+        "pg_stat_bgwriter",
+        "pg_stat_replication",
+        "pg_stat_archiver",
+        "pg_stat_wal_receiver",
+        "pg_stat_subscription",
+        "pg_extension",
+    ];
+
+    let mut result = sql.to_string();
+    for view in PG_CATALOG_VIEWS {
+        result = qualify_pg_view_name(&result, view);
+    }
+    result
+}
+
+/// Qualify a single pg_catalog view name in `sql`. The view name is replaced
+/// with `pg_catalog.<view>` only when it is not already schema-qualified (i.e.
+/// not immediately preceded by a `.` character with no intervening whitespace)
+/// and not inside a single-quoted string literal.
+fn qualify_pg_view_name(sql: &str, view: &str) -> String {
+    // Fast path: if the view name does not appear at all, return early.
+    let view_lower = view.to_ascii_lowercase();
+    if !sql.to_ascii_lowercase().contains(view_lower.as_str()) {
+        return sql.to_string();
+    }
+
+    // Walk through `sql`, skipping single-quoted string literals, and replace
+    // each unqualified occurrence of `view` outside of string literals.
+    let mut out = String::with_capacity(sql.len() + 16);
+    let bytes = sql.as_bytes();
+    let n = bytes.len();
+    let vlen = view.len();
+    let mut i = 0usize;
+    let mut in_string = false; // inside a single-quoted literal
+
+    while i < n {
+        // Track single-quoted string literals.  We skip the view-name match
+        // logic when inside a literal so that e.g. `table_name = 'pg_locks'`
+        // is left untouched.
+        if bytes[i] == b'\'' {
+            if in_string {
+                // Check for escaped quote `''`.
+                if i + 1 < n && bytes[i + 1] == b'\'' {
+                    out.push('\'');
+                    out.push('\'');
+                    i += 2;
+                    continue;
+                }
+                in_string = false;
+            } else {
+                in_string = true;
+            }
+            out.push('\'');
+            i += 1;
+            continue;
+        }
+
+        if in_string {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+
+        // Outside of a string literal: check for view name match.
+        if i + vlen <= n && sql[i..i + vlen].eq_ignore_ascii_case(view) {
+            // Check that the character immediately before is not `.`
+            // (which would mean it's already qualified).
+            let prev_is_dot = i > 0 && bytes[i - 1] == b'.';
+
+            // Check that the match is at a word boundary (preceded by a
+            // non-identifier char or start-of-string, followed by a
+            // non-identifier char or end-of-string).
+            let prev_ok = i == 0 || {
+                let c = bytes[i - 1] as char;
+                !c.is_alphanumeric() && c != '_'
+            };
+            let after_pos = i + vlen;
+            let next_ok = after_pos >= n || {
+                let c = bytes[after_pos] as char;
+                !c.is_alphanumeric() && c != '_'
+            };
+
+            if !prev_is_dot && prev_ok && next_ok {
+                out.push_str("pg_catalog.");
+                out.push_str(&sql[i..i + vlen]);
+                i += vlen;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -7209,5 +7349,37 @@ mod tests {
         // Allow at most one extra reference in the ON clause (sub.t_id = t.id).
         // The key invariant is the window subquery projection does NOT prepend an extra `u.t_id`.
         assert!(out_lower.contains("partition by u.t_id"), "PARTITION BY must use qualified FK: {out}");
+    }
+
+    #[test]
+    fn qualify_pg_catalog_unqualified() {
+        let sql = "SELECT locktype, mode, granted FROM pg_locks";
+        let out = crate::pg_operators::rewrite_unqualified_pg_catalog_views(sql);
+        assert!(
+            out.to_ascii_lowercase().contains("pg_catalog.pg_locks"),
+            "must qualify pg_locks: {out}"
+        );
+        // Already-qualified form must not be double-qualified.
+        let sql2 = "SELECT * FROM pg_catalog.pg_locks";
+        let out2 = crate::pg_operators::rewrite_unqualified_pg_catalog_views(sql2);
+        assert!(
+            out2.to_ascii_lowercase()
+                .matches("pg_catalog.pg_locks")
+                .count()
+                == 1,
+            "must not double-qualify: {out2}"
+        );
+        // String literals must not be rewritten.
+        let sql3 = "SELECT column_name FROM information_schema.columns \
+                    WHERE table_name = 'pg_locks' AND table_schema = 'pg_catalog'";
+        let out3 = crate::pg_operators::rewrite_unqualified_pg_catalog_views(sql3);
+        assert!(
+            out3.contains("'pg_locks'"),
+            "string literal 'pg_locks' must not be rewritten: {out3}"
+        );
+        assert!(
+            !out3.contains("'pg_catalog.pg_locks'"),
+            "string literal must not gain schema prefix: {out3}"
+        );
     }
 }

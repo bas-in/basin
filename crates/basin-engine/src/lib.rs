@@ -192,6 +192,17 @@ pub(crate) struct EngineInner {
     /// Sessions register themselves on open; the reaper background task sweeps
     /// the registry on a fixed cadence and flags expired sessions.
     pub(crate) reaper_registry: crate::session_reaper::SessionReaperRegistry,
+
+    /// Phase 5.23.D: process-wide lock registry for `pg_locks` view support.
+    /// Sessions acquire lock entries (virtualxid + relation-level) when they
+    /// open or begin transactions; `PgLocksLiveProvider` reads a per-project
+    /// snapshot for each `SELECT … FROM pg_locks` query.
+    pub(crate) lock_registry: basin_shard::LockRegistry,
+
+    /// Phase 5.23.C: process-wide connection registry for `pg_stat_activity`.
+    /// Sessions register on open and update state on each `execute()` call;
+    /// `PgStatActivityLiveProvider` reads a per-project snapshot on scan.
+    pub(crate) connection_registry: crate::connection_registry::ConnectionRegistry,
 }
 
 impl Engine {
@@ -266,6 +277,8 @@ impl Engine {
             secondary_index_skipped: crate::secondary_index::IndexSkipCounter::new(),
             gin_index_registry: Arc::new(crate::index_probe::GinIndexRegistry::new()),
             reaper_registry: crate::session_reaper::SessionReaperRegistry::new(),
+            lock_registry: basin_shard::LockRegistry::new(),
+            connection_registry: crate::connection_registry::ConnectionRegistry::new(),
         });
         // Phase 5.14.D2: register the query-history adapter with the shard so
         // the compactor can consult observed ORDER BY / GROUP BY patterns.
@@ -429,6 +442,16 @@ impl Engine {
     /// Phase 5.28.C: access the process-wide idle-in-txn reaper registry.
     pub fn reaper_registry(&self) -> &crate::session_reaper::SessionReaperRegistry {
         &self.inner.reaper_registry
+    }
+
+    /// Phase 5.23.D: access the process-wide lock registry for pg_locks.
+    pub(crate) fn lock_registry(&self) -> &basin_shard::LockRegistry {
+        &self.inner.lock_registry
+    }
+
+    /// Phase 5.23.C: access the process-wide connection registry for pg_stat_activity.
+    pub(crate) fn connection_registry(&self) -> &crate::connection_registry::ConnectionRegistry {
+        &self.inner.connection_registry
     }
 
     /// Crate-private hook bumped by `executor::execute` when a vector
@@ -646,6 +669,15 @@ pub struct ProjectSession {
     pub(crate) reaped_flag: Arc<crate::session_reaper::ReapedFlag>,
     /// Registry id for deregistering when the session is dropped.
     pub(crate) reaper_id: u64,
+    /// Phase 5.23.D: RAII lock handle holding the session's virtualxid lock
+    /// in the `LockRegistry`. Dropped when the session is dropped, releasing
+    /// the lock entry from `pg_locks`. Uses `Option` so session construction
+    /// can set it after the session struct is assembled.
+    pub(crate) _lock_handle: Option<basin_shard::LockHandle>,
+    /// Phase 5.23.C: RAII connection handle tracking this session in the
+    /// `ConnectionRegistry`. Dropped when the session is dropped. Uses `Option`
+    /// for the same construction-order reason as `_lock_handle`.
+    pub(crate) _connection_handle: Option<crate::connection_registry::ConnectionHandle>,
 }
 
 impl ProjectSession {
@@ -759,6 +791,7 @@ pub enum ExecResult {
 mod advisory_lock;
 mod alter;
 mod alter_project;
+pub mod connection_registry;
 pub(crate) mod operators;
 mod any_all_rewrite;
 mod approx_count_distinct;

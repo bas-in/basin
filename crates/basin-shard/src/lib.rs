@@ -493,10 +493,12 @@ fn default_replica_id() -> String {
 
 mod follower;
 mod in_process;
+pub mod lock_registry;
 pub mod lock_wait;
 pub mod split;
 
 pub use follower::{
     promote, FollowerConfig, FollowerShard, FollowerStats, LagTier, ReplicaRole, ShardFollower,
 };
+pub use lock_registry::{LockEntry, LockHandle, LockRegistry};
 pub use split::{CatchupReport, Epoch, LocalShardSplitter, ShardSplitter, SplitPlan};

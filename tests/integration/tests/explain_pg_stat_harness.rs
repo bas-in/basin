@@ -145,7 +145,7 @@ async fn string_column(sess: &basin_engine::ProjectSession, sql: &str) -> Vec<St
 ///
 /// Closes when: 5.23.B (indexed scan planner integration). At that point drop
 /// this `#[ignore]` and re-run `cargo test --test explain_pg_stat_harness`.
-#[ignore = "5.23.A harness — pending 5.23.B-G"]
+#[ignore = "5.23.B pending: indexed-scan planner not yet implemented; DataFusion emits DataSourceExec (seq scan) for all predicates, no index-seek node"]
 #[tokio::test]
 async fn explain_point_scan() {
     // Slice: "scan family"
@@ -254,7 +254,6 @@ async fn explain_point_scan() {
 ///
 /// Closes when: 5.23.C (aggregation plan-node exposure in EXPLAIN ANALYZE).
 /// At that point drop this `#[ignore]`.
-#[ignore = "5.23.A harness — pending 5.23.B-G"]
 #[tokio::test]
 async fn explain_range_scan_with_agg() {
     // Slice: "agg/window/CTE family" (partial — agg side)
@@ -350,7 +349,6 @@ async fn explain_range_scan_with_agg() {
 ///
 /// Closes when: 5.23.D (join plan-node exposure in EXPLAIN ANALYZE).
 /// At that point drop this `#[ignore]`.
-#[ignore = "5.23.A harness — pending 5.23.B-G"]
 #[tokio::test]
 async fn explain_inner_join() {
     // Slice: "join family"
@@ -473,7 +471,6 @@ async fn explain_inner_join() {
 ///
 /// Closes when: 5.23.C (window plan-node exposure in EXPLAIN ANALYZE).
 /// At that point drop this `#[ignore]`.
-#[ignore = "5.23.A harness — pending 5.23.B-G"]
 #[tokio::test]
 async fn explain_window_function() {
     // Slice: "agg/window/CTE family"
@@ -588,7 +585,6 @@ async fn explain_window_function() {
 ///
 /// Closes when: 5.23.E (pg_stat_activity virtual view). At that point drop
 /// this `#[ignore]`.
-#[ignore = "5.23.A harness — pending 5.23.B-G"]
 #[tokio::test]
 async fn pg_stat_activity_view_shape() {
     // Slice: "view shape"
@@ -699,7 +695,6 @@ async fn pg_stat_activity_view_shape() {
 ///
 /// Closes when: 5.23.F (pg_locks virtual view). At that point drop this
 /// `#[ignore]`.
-#[ignore = "5.23.A harness — pending 5.23.B-G"]
 #[tokio::test]
 async fn pg_locks_view_returns_acquired_locks() {
     // Slice: "locks view"
@@ -798,7 +793,7 @@ async fn pg_locks_view_returns_acquired_locks() {
 ///
 /// Closes when: 5.23.G (psql/pgcli wire-compat session initialization).
 /// At that point drop this `#[ignore]`.
-#[ignore = "5.23.A harness — pending 5.23.B-G"]
+#[ignore = "5.23.G env-gated: set BASIN_LOCAL_URL=postgres://... to run; requires live Basin server + psql/pgcli on PATH"]
 #[tokio::test]
 async fn tooling_compat_pgcli_psql_runs_basic_session() {
     // Slice: "tooling compat"

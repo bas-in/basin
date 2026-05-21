@@ -1050,6 +1050,8 @@ pub(crate) async fn open(
         &ctx,
         engine.config().catalog.clone(),
         project,
+        engine.lock_registry().clone(),
+        engine.connection_registry().clone(),
     )
     .map_err(|e| BasinError::internal(format!("info_schema providers: {e}")))?;
 
@@ -1110,6 +1112,22 @@ pub(crate) async fn open(
         refresh_table(&engine, &project, &ctx, &state, &table).await?;
     }
 
+    // Phase 5.23.C: register session with the connection registry. The handle
+    // is stored on the session and dropped when the session is dropped, which
+    // automatically removes the entry from pg_stat_activity.
+    let connection_handle = engine.connection_registry().connect(&project);
+    let session_pid = connection_handle.pid;
+
+    // Phase 5.23.D: register the session's virtualxid lock with the lock
+    // registry. Every active Postgres backend holds a virtualxid lock
+    // (ExclusiveLock on its own virtual transaction id). This ensures that
+    // pg_locks always returns at least one row for the current session,
+    // matching PG's behaviour where `SELECT * FROM pg_locks` in any live
+    // session shows the session's own virtualxid lock.
+    let vtxid = format!("1/{session_pid}");
+    let lock_entry = basin_shard::LockEntry::virtualxid_lock(session_pid, &vtxid);
+    let lock_handle = engine.lock_registry().acquire(&project, lock_entry);
+
     Ok(ProjectSession {
         engine,
         project,
@@ -1119,6 +1137,8 @@ pub(crate) async fn open(
         state,
         reaped_flag,
         reaper_id,
+        _lock_handle: Some(lock_handle),
+        _connection_handle: Some(connection_handle),
     })
 }
 
