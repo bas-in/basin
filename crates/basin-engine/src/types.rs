@@ -820,6 +820,23 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
             }
         }
 
+        // ── Native BIT / BIT VARYING variants ───────────────────────────
+        // sqlparser's Postgres dialect parses `BIT(8)` as
+        // `SqlDataType::Bit(Some(8))` and `VARBIT(16)` / `BIT VARYING(16)`
+        // as `SqlDataType::BitVarying(Some(16))`. The `Custom("BIT", …)`
+        // branch above handles the bare-keyword form; these arms handle the
+        // native AST variants so both parse paths produce `DataType::Utf8`.
+        // The `BASIN_TYPE` marker (e.g. "BIT(8)" / "VARBIT(16)") is
+        // attached by `ddl::schema_from_columns` via `basin_type_marker`.
+        SqlDataType::Bit(len) => {
+            let n = len.unwrap_or(1);
+            if n == 0 {
+                return Err(BasinError::InvalidSchema("BIT(n): n must be >= 1".into()));
+            }
+            Ok(DataType::Utf8)
+        }
+        SqlDataType::BitVarying(_) => Ok(DataType::Utf8),
+
         other => Err(BasinError::InvalidSchema(format!(
             "unsupported column type in PoC: {other}"
         ))),
@@ -873,6 +890,22 @@ fn clamp_precision(p: u64) -> Result<u8> {
 /// Called from `ddl::schema_from_columns` after `arrow_data_type` so the
 /// metadata marker is attached to the resulting `Field` immediately.
 pub(crate) fn basin_type_marker(sql: &SqlDataType) -> Option<String> {
+    // Handle the native sqlparser AST variants for BIT / BIT VARYING before
+    // the Custom fallback so both parse paths get the same metadata marker.
+    match sql {
+        SqlDataType::Bit(len) => {
+            let n = len.unwrap_or(1);
+            return Some(format!("BIT({n})"));
+        }
+        SqlDataType::BitVarying(len) => {
+            return match len {
+                Some(n) => Some(format!("VARBIT({n})")),
+                None => Some("VARBIT".to_string()),
+            };
+        }
+        _ => {}
+    }
+
     let SqlDataType::Custom(name, modifiers) = sql else {
         return None;
     };
