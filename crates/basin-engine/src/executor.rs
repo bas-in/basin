@@ -30,6 +30,20 @@ use crate::{ExecResult, ProjectSession};
 use basin_catalog::PartitionSpec;
 
 pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResult> {
+    // Phase 5.28.C: touch last-activity timestamp so the idle-in-txn reaper
+    // sees that this session is still making progress. Done unconditionally at
+    // the top of every execute — even for rejected statements — so the reaper
+    // doesn't incorrectly fire during a burst of aborted commands.
+    crate::session::touch_last_active(&sess.state);
+
+    // Phase 5.28.C: check whether the idle-in-txn reaper has flagged this
+    // session as expired. If so, reject with SQLSTATE 25P03 immediately.
+    if sess.reaped_flag.is_reaped() {
+        return Err(basin_common::BasinError::IdleInTransactionTimeout(
+            "idle transaction terminated by server idle_in_transaction_session_timeout".into(),
+        ));
+    }
+
     // Keep a reference to the SQL the user actually wrote. The rewriter
     // below mangles vector operators into UDF calls; that rewrite is
     // irrelevant to (and would only confuse) the analytical engine, which
@@ -1384,6 +1398,18 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
 
             if var_name == "search_path" {
                 crate::schema_ddl::exec_set_search_path(sess, &values)
+            } else if var_name == "lock_timeout" {
+                // Phase 5.28.B: SET lock_timeout = '500ms' / 500 / 0
+                let raw = extract_set_string_value(&values);
+                let d = crate::session::parse_pg_duration(&raw);
+                crate::session::set_session_lock_timeout(&sess.state, d);
+                Ok(ExecResult::Empty { tag: "SET".into() })
+            } else if var_name == "idle_in_transaction_session_timeout" {
+                // Phase 5.28.C: SET idle_in_transaction_session_timeout = '30s'
+                let raw = extract_set_string_value(&values);
+                let d = crate::session::parse_pg_duration(&raw);
+                crate::session::set_session_idle_in_transaction_timeout(&sess.state, d);
+                Ok(ExecResult::Empty { tag: "SET".into() })
             } else {
                 // Silently accept unknown SET variables.
                 Ok(ExecResult::Empty { tag: "SET".into() })
@@ -1581,6 +1607,18 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                 .to_ascii_lowercase();
             if var_name == "search_path" {
                 crate::schema_ddl::exec_show_search_path(sess)
+            } else if var_name == "lock_timeout" {
+                // Phase 5.28.D: SHOW lock_timeout
+                let val = crate::session::format_pg_duration(
+                    crate::session::session_lock_timeout(&sess.state),
+                );
+                Ok(make_show_result("lock_timeout", &val))
+            } else if var_name == "idle_in_transaction_session_timeout" {
+                // Phase 5.28.D: SHOW idle_in_transaction_session_timeout
+                let val = crate::session::format_pg_duration(
+                    crate::session::session_idle_in_transaction_timeout(&sess.state),
+                );
+                Ok(make_show_result("idle_in_transaction_session_timeout", &val))
             } else {
                 // Silently return empty for other SHOW <var> forms so
                 // ORM startup queries don't hard-fail.
@@ -5053,6 +5091,41 @@ async fn exec_show_tables(sess: &ProjectSession) -> Result<ExecResult> {
         schema,
         batches: vec![batch],
     })
+}
+
+/// Phase 5.28.D: build a single-row/single-column `ExecResult::Rows` for `SHOW <var>`.
+/// Column name is the variable name; value is `val`.
+fn make_show_result(col_name: &str, val: &str) -> ExecResult {
+    let schema = Arc::new(Schema::new(vec![Field::new(col_name, DataType::Utf8, false)]));
+    let arr = StringArray::from(vec![val]);
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr) as ArrayRef])
+        .expect("make_show_result: infallible");
+    ExecResult::Rows {
+        schema,
+        batches: vec![batch],
+    }
+}
+
+/// Extract the string form of the first value in a SET expression.
+/// Handles both literal string values and numeric literals.
+/// Falls back to `"0"` for unrecognised forms.
+fn extract_set_string_value(values: &[sqlparser::ast::Expr]) -> String {
+    use sqlparser::ast::{Expr, Value, ValueWithSpan};
+    if let Some(expr) = values.first() {
+        match expr {
+            Expr::Value(ValueWithSpan {
+                value: Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
+                ..
+            }) => return s.clone(),
+            Expr::Value(ValueWithSpan {
+                value: Value::Number(n, _),
+                ..
+            }) => return n.clone(),
+            Expr::Identifier(id) => return id.value.clone(),
+            _ => {}
+        }
+    }
+    "0".to_string()
 }
 
 /// Pull a bare table name out of a sqlparser `ObjectName`.

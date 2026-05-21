@@ -181,6 +181,11 @@ pub(crate) struct EngineInner {
     pub(crate) secondary_index_registry: Arc<crate::secondary_index::ProjectIndexRegistry>,
     /// Cumulative count of data files skipped by the secondary-index probe.
     pub(crate) secondary_index_skipped: crate::secondary_index::IndexSkipCounter,
+
+    /// Phase 5.28.C: process-wide idle-in-transaction session reaper registry.
+    /// Sessions register themselves on open; the reaper background task sweeps
+    /// the registry on a fixed cadence and flags expired sessions.
+    pub(crate) reaper_registry: crate::session_reaper::SessionReaperRegistry,
 }
 
 impl Engine {
@@ -253,6 +258,7 @@ impl Engine {
                 crate::secondary_index::ProjectIndexRegistry::new(),
             ),
             secondary_index_skipped: crate::secondary_index::IndexSkipCounter::new(),
+            reaper_registry: crate::session_reaper::SessionReaperRegistry::new(),
         });
         // Phase 5.14.D2: register the query-history adapter with the shard so
         // the compactor can consult observed ORDER BY / GROUP BY patterns.
@@ -411,6 +417,11 @@ impl Engine {
     /// markers are unambiguous even under concurrent sessions.
     pub(crate) fn next_tx_id(&self) -> u64 {
         self.inner.next_tx_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Phase 5.28.C: access the process-wide idle-in-txn reaper registry.
+    pub fn reaper_registry(&self) -> &crate::session_reaper::SessionReaperRegistry {
+        &self.inner.reaper_registry
     }
 
     /// Crate-private hook bumped by `executor::execute` when a vector
@@ -613,6 +624,13 @@ pub struct ProjectSession {
     pub(crate) auth_context: Arc<AuthContext>,
     pub(crate) ctx: datafusion::prelude::SessionContext,
     pub(crate) state: Arc<crate::session::SessionState>,
+    /// Phase 5.28.C: idle-in-transaction reaper flag. Set by the background
+    /// reaper when the session has been idle inside a transaction past its
+    /// configured `idle_in_transaction_session_timeout`. The executor checks
+    /// this at the start of every `execute()` call.
+    pub(crate) reaped_flag: Arc<crate::session_reaper::ReapedFlag>,
+    /// Registry id for deregistering when the session is dropped.
+    pub(crate) reaper_id: u64,
 }
 
 impl ProjectSession {
@@ -692,6 +710,16 @@ impl ProjectSession {
     /// Forget a prepared statement. Idempotent.
     pub async fn close_statement(&self, handle: &StatementHandle) {
         crate::prepared::close_statement(self, handle).await
+    }
+}
+
+impl Drop for ProjectSession {
+    fn drop(&mut self) {
+        // Phase 5.28.C: deregister from the idle-in-txn reaper so the entry
+        // is not kept alive after the session ends.
+        self.engine
+            .reaper_registry()
+            .deregister(self.reaper_id);
     }
 }
 
@@ -780,6 +808,7 @@ mod select_advanced;
 mod seq_ddl;
 mod seq_udf;
 mod session;
+pub mod session_reaper;
 mod sort_streaming_limit;
 mod sql_functions;
 mod string_dt_udf;

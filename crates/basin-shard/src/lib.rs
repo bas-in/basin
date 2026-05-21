@@ -493,6 +493,7 @@ fn default_replica_id() -> String {
 
 mod follower;
 mod in_process;
+pub mod lock_wait;
 pub mod split;
 
 pub use follower::{

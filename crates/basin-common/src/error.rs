@@ -130,6 +130,20 @@ pub enum BasinError {
     #[error("lease handoff in progress: {0}")]
     LeaseHandoffInProgress(String),
 
+    /// A statement waited for a row or table lock longer than
+    /// `lock_timeout` allows. Router maps to SQLSTATE `55P03`
+    /// (`lock_not_available`), matching PostgreSQL's behaviour when
+    /// `lock_timeout` fires.
+    #[error("canceling statement due to lock timeout: {0}")]
+    LockNotAvailable(String),
+
+    /// An idle-in-transaction session exceeded `idle_in_transaction_session_timeout`.
+    /// The session is terminated by the reaper; the client sees a connection-
+    /// closed error on the next attempt. Router maps to SQLSTATE `25P03`
+    /// (`idle_in_transaction_session_timeout`).
+    #[error("terminating connection due to idle-in-transaction timeout: {0}")]
+    IdleInTransactionTimeout(String),
+
     /// Catch-all for sources without a dedicated variant.
     #[error("internal: {0}")]
     Internal(String),
@@ -169,5 +183,17 @@ impl BasinError {
     /// can extract the affected partition on retry.
     pub fn lease_handoff_in_progress(msg: impl Into<String>) -> Self {
         Self::LeaseHandoffInProgress(msg.into())
+    }
+
+    /// Phase 5.28.B — typed constructor for `lock_timeout` expiry.
+    /// Produces SQLSTATE 55P03 (`lock_not_available`).
+    pub fn lock_not_available(msg: impl Into<String>) -> Self {
+        Self::LockNotAvailable(msg.into())
+    }
+
+    /// Phase 5.28.C — typed constructor for `idle_in_transaction_session_timeout` expiry.
+    /// Produces SQLSTATE 25P03.
+    pub fn idle_in_transaction_timeout(msg: impl Into<String>) -> Self {
+        Self::IdleInTransactionTimeout(msg.into())
     }
 }
