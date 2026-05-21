@@ -11,6 +11,19 @@
 //! row, which serializes concurrent appenders on the same `(project, table)`
 //! without blocking commits to other tables.
 //!
+//! ## Connection pooling (Phase 6.P0.B — noisy-neighbor P0)
+//!
+//! The original implementation wrapped a single `tokio_postgres::Client` in a
+//! `tokio::sync::Mutex` and serialised every catalog operation across every
+//! tenant. That made one project's DDL latency a tail-latency problem for
+//! every other project's reads. We now keep a `deadpool_postgres::Pool` of
+//! 16 connections by default (override with `BASIN_CATALOG_PG_POOL_SIZE`);
+//! each operation checks a connection out for the duration of that call and
+//! returns it on drop, so concurrent reads scale linearly with pool size
+//! rather than queueing behind a single mutex. Transactional semantics are
+//! preserved: each transaction runs on one checked-out connection so all of
+//! its statements share the same session.
+//!
 //! TLS: `tokio_postgres::NoTls` is hard-coded for the PoC. Production
 //! deployments need to swap to `tokio_postgres_rustls` or `tokio_postgres
 //! _native_tls` at the connect site.
@@ -23,8 +36,8 @@ use basin_common::{
     BasinError, ChangeOp, ProjectId, QualifiedTableName, Result, SchemaName, TableName,
 };
 use chrono::{DateTime, Utc};
-use tokio::sync::Mutex;
-use tokio_postgres::{Client, NoTls};
+use deadpool_postgres::{GenericClient, Manager, ManagerConfig, Pool, RecyclingMethod};
+use tokio_postgres::NoTls;
 use tracing::instrument;
 
 use crate::domains::{self, DomainDef, DomainError, BASIN_DOMAIN_KEY};
@@ -43,26 +56,32 @@ use crate::{Catalog, ProjectSnapshotEntry};
 
 const DEFAULT_SCHEMA: &str = "basin_catalog";
 
+/// Default catalog pool size if `BASIN_CATALOG_PG_POOL_SIZE` is unset.
+/// Sixteen is empirically enough headroom for ~16 concurrent DDL/read
+/// operations to run without queueing behind each other on a single
+/// connection while staying well under Postgres' default `max_connections`
+/// (100), even after the engine and other crates open their own pools.
+const DEFAULT_POOL_SIZE: usize = 16;
+const POOL_SIZE_ENV: &str = "BASIN_CATALOG_PG_POOL_SIZE";
+
 /// Postgres-backed implementation of [`Catalog`].
 ///
 /// Cheap to wrap in [`std::sync::Arc`] and share across the engine, router,
-/// and analytical pool. The underlying `tokio_postgres::Client` is itself a
-/// thin handle around an `mpsc` to the connection driver task; concurrent
-/// read-only queries are fine via `&Client`. Transactions need `&mut Client`
-/// in `tokio_postgres` 0.7, so the client is wrapped in a `tokio::sync::
-/// Mutex`. The mutex is only held for the duration of a single transaction
-/// (begin → commit), which is the same scope as a per-table lock would have
-/// covered anyway because `append_data_files` is the only multi-statement
-/// path. For read-heavy workloads we could split into a pool later.
+/// and analytical pool. Backed by a `deadpool_postgres::Pool` (default 16
+/// connections, override via `BASIN_CATALOG_PG_POOL_SIZE`) so concurrent
+/// catalog operations don't queue behind a single shared `Mutex<Client>` —
+/// every checkout is a constant-time pool grab, and transactions run on
+/// their own checked-out connection for the duration of the begin → commit
+/// window.
 pub struct PostgresCatalog {
-    client: Mutex<Client>,
+    pool: Pool,
     schema: String,
 }
 
 impl PostgresCatalog {
-    /// Connect using the default schema (`basin_catalog`). Spawns the
-    /// connection driver task and runs idempotent migrations before
-    /// returning.
+    /// Connect using the default schema (`basin_catalog`). Builds a pool of
+    /// `BASIN_CATALOG_PG_POOL_SIZE` (default 16) connections and runs
+    /// idempotent migrations before returning.
     pub async fn connect(conn_str: &str) -> Result<Self> {
         Self::connect_with_schema(conn_str, DEFAULT_SCHEMA).await
     }
@@ -71,23 +90,43 @@ impl PostgresCatalog {
     /// each test run to a unique schema so leftovers can't accumulate.
     pub async fn connect_with_schema(conn_str: &str, schema: &str) -> Result<Self> {
         validate_schema_ident(schema)?;
-        let (client, connection) = tokio_postgres::connect(conn_str, NoTls)
-            .await
-            .map_err(|e| BasinError::catalog(format!("postgres connect: {e}")))?;
-        // Drop the driver task without join; if the connection dies, every
-        // subsequent `client.query` returns an error which we map to
-        // `BasinError::Catalog`.
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                tracing::warn!(error = %e, "postgres connection driver exited");
-            }
-        });
+        let pg_config: tokio_postgres::Config = conn_str
+            .parse()
+            .map_err(|e| BasinError::catalog(format!("postgres conn_str parse: {e}")))?;
+        // `Fast` recycling skips the per-checkout `SELECT 1` round-trip; the
+        // pool just hands back the connection and lets the next query fail
+        // (and the manager evict it) if the driver task has died. That's the
+        // right trade-off for a catalog: the alternative `Verified` doubles
+        // every operation's latency at p50 just to detect dead connections
+        // that the subsequent real query would surface anyway.
+        let mgr_config = ManagerConfig {
+            recycling_method: RecyclingMethod::Fast,
+        };
+        let manager = Manager::from_config(pg_config, NoTls, mgr_config);
+        let pool_size = pool_size_from_env();
+        let pool = Pool::builder(manager)
+            .max_size(pool_size)
+            .build()
+            .map_err(|e| BasinError::catalog(format!("build catalog pool: {e}")))?;
         let cat = Self {
-            client: Mutex::new(client),
+            pool,
             schema: schema.to_owned(),
         };
         cat.migrate().await?;
         Ok(cat)
+    }
+
+    /// Helper: get a pooled client or map the deadpool error onto our
+    /// [`BasinError`] surface. Every Catalog-trait method that returns
+    /// `Result` uses this; methods that return `Vec`/`Option` use
+    /// `pool.get().await.ok()` directly so a pool exhaustion / dead
+    /// connection degrades the same way the old code degraded on a
+    /// mutex-poisoned client (empty result, not panic).
+    async fn client(&self) -> Result<deadpool_postgres::Client> {
+        self.pool
+            .get()
+            .await
+            .map_err(|e| BasinError::catalog(format!("catalog pool get: {e}")))
     }
 
     /// Run `CREATE SCHEMA IF NOT EXISTS` and `CREATE TABLE IF NOT EXISTS` for
@@ -514,7 +553,7 @@ impl PostgresCatalog {
                 )"
             ),
         ];
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         for stmt in stmts {
             client
                 .batch_execute(&stmt)
@@ -531,7 +570,7 @@ impl Catalog for PostgresCatalog {
     async fn create_namespace(&self, project: &ProjectId) -> Result<()> {
         let sch = &self.schema;
         let project_str = project.to_string();
-        let mut client = self.client.lock().await;
+        let mut client = self.client().await?;
         let tx = client
             .transaction()
             .await
@@ -599,7 +638,7 @@ impl Catalog for PostgresCatalog {
         // Ensure namespace exists, then attempt table insert. ON CONFLICT
         // turns "already exists" into a CommitConflict-shaped catalog error;
         // mirrors `InMemoryCatalog::create_table`.
-        let mut client = self.client.lock().await;
+        let mut client = self.client().await?;
         let tx = client
             .transaction()
             .await
@@ -704,7 +743,7 @@ impl Catalog for PostgresCatalog {
         let project_str = project.to_string();
         let table_str = table.to_string();
 
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let row_opt = client
             .query_opt(
                 &format!(
@@ -850,7 +889,7 @@ impl Catalog for PostgresCatalog {
     #[instrument(skip(self), fields(project = %project, table = %table))]
     async fn drop_table(&self, project: &ProjectId, table: &TableName) -> Result<()> {
         let sch = &self.schema;
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let n = client
             .execute(
                 &format!(
@@ -874,7 +913,7 @@ impl Catalog for PostgresCatalog {
         // existing callers' expectations. Use `list_tables_qualified` for
         // cross-schema enumeration.
         let sch = &self.schema;
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let rows = client
             .query(
                 &format!(
@@ -902,7 +941,7 @@ impl Catalog for PostgresCatalog {
         // the FK) and the namespace row. One round-trip vs N from the
         // default impl. Idempotent: missing rows are not an error.
         let sch = &self.schema;
-        let mut client = self.client.lock().await;
+        let mut client = self.client().await?;
         let tx = client
             .transaction()
             .await
@@ -988,7 +1027,7 @@ impl Catalog for PostgresCatalog {
         // refs; we deserialise per-row and concatenate. One round-trip vs
         // the default impl's (list_tables, then N × load_table → fetch_snapshots).
         let sch = &self.schema;
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let rows = client
             .query(
                 &format!("SELECT data_files FROM {sch}.snapshots WHERE project_id = $1"),
@@ -1041,7 +1080,7 @@ impl Catalog for PostgresCatalog {
         let files_json = serde_json::to_value(&files)
             .map_err(|e| BasinError::catalog(format!("serialise data files: {e}")))?;
 
-        let mut client = self.client.lock().await;
+        let mut client = self.client().await?;
         let tx = client
             .transaction()
             .await
@@ -1165,7 +1204,7 @@ impl Catalog for PostgresCatalog {
         let removed_paths_json = serde_json::to_value(&removed_paths)
             .map_err(|e| BasinError::catalog(format!("serialise removed paths: {e}")))?;
 
-        let mut client = self.client.lock().await;
+        let mut client = self.client().await?;
         let tx = client
             .transaction()
             .await
@@ -1248,7 +1287,7 @@ impl Catalog for PostgresCatalog {
         let sch = &self.schema;
         let json = serde_json::to_value(&spec)
             .map_err(|e| BasinError::catalog(format!("serialise partition spec: {e}")))?;
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let n = client
             .execute(
                 &format!(
@@ -1276,7 +1315,7 @@ impl Catalog for PostgresCatalog {
         let sch = &self.schema;
         let json = serde_json::to_value(&policies)
             .map_err(|e| BasinError::catalog(format!("serialise policies: {e}")))?;
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let n = client
             .execute(
                 &format!(
@@ -1316,7 +1355,7 @@ impl Catalog for PostgresCatalog {
             })?),
             None => None,
         };
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let n = client
             .execute(
                 &format!(
@@ -1348,7 +1387,7 @@ impl Catalog for PostgresCatalog {
         let sch = &self.schema;
         let json = serde_json::to_value(&columns)
             .map_err(|e| BasinError::catalog(format!("serialise bloom_filter_columns: {e}")))?;
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let n = client
             .execute(
                 &format!(
@@ -1382,7 +1421,7 @@ impl Catalog for PostgresCatalog {
             })?),
             None => None,
         };
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let n = client
             .execute(
                 &format!(
@@ -1413,7 +1452,7 @@ impl Catalog for PostgresCatalog {
             })?),
             None => None,
         };
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let n = client
             .execute(
                 &format!(
@@ -1450,7 +1489,7 @@ impl Catalog for PostgresCatalog {
                     .map_err(|e| BasinError::catalog(format!("serialise cluster_columns: {e}")))?,
             )
         };
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let n = client
             .execute(
                 &format!(
@@ -1476,7 +1515,7 @@ impl Catalog for PostgresCatalog {
     ) -> Result<()> {
         let sch = &self.schema;
         let size_pg: Option<i64> = size.map(|v| v as i64);
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let n = client
             .execute(
                 &format!(
@@ -1506,7 +1545,7 @@ impl Catalog for PostgresCatalog {
     ) -> Result<()> {
         let sch = &self.schema;
         let token = file_format_to_token(format);
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let n = client
             .execute(
                 &format!(
@@ -1531,7 +1570,7 @@ impl Catalog for PostgresCatalog {
         region: Option<String>,
     ) -> Result<()> {
         let sch = &self.schema;
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let n = client
             .execute(
                 &format!(
@@ -1582,7 +1621,7 @@ impl Catalog for PostgresCatalog {
                     .map_err(|e| BasinError::catalog(format!("serialise foreign_keys: {e}")))?,
             )
         };
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let n = client
             .execute(
                 &format!(
@@ -1624,7 +1663,7 @@ impl Catalog for PostgresCatalog {
                     BasinError::catalog(format!("serialise unique_constraints: {e}"))
                 })?)
             };
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let n = client
             .execute(
                 &format!(
@@ -1680,7 +1719,7 @@ impl Catalog for PostgresCatalog {
         let indexes_json = serde_json::to_value(&meta.indexes)
             .map_err(|e| BasinError::catalog(format!("serialise indexes: {e}")))?;
         let sch = &self.schema;
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let n = client
             .execute(
                 &format!(
@@ -1717,7 +1756,7 @@ impl Catalog for PostgresCatalog {
             )
         };
         let sch = &self.schema;
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let n = client
             .execute(
                 &format!(
@@ -1745,7 +1784,7 @@ impl Catalog for PostgresCatalog {
         let sch = &self.schema;
         let schema_json = serde_json::to_value(&schema)
             .map_err(|e| BasinError::catalog(format!("serialise arrow schema: {e}")))?;
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let n = client
             .execute(
                 &format!(
@@ -1771,7 +1810,7 @@ impl Catalog for PostgresCatalog {
         let sch = &self.schema;
         let project_str = project.to_string();
         let table_str = table.to_string();
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         // Existence check so callers get NotFound (matching InMemoryCatalog)
         // rather than an empty list when the table is missing.
         let exists = client
@@ -1799,7 +1838,7 @@ impl Catalog for PostgresCatalog {
         // order. The outer ORDER BY mirrors the default impl's tie-breakers
         // so InMemory and Postgres produce byte-identical timelines.
         let sch = &self.schema;
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let rows = client
             .query(
                 &format!(
@@ -1853,7 +1892,7 @@ impl Catalog for PostgresCatalog {
         let project_str = project.to_string();
         let src_str = src_table.to_string();
         let dst_str = dst_table.to_string();
-        let mut client = self.client.lock().await;
+        let mut client = self.client().await?;
         let txn = client
             .transaction()
             .await
@@ -1955,7 +1994,7 @@ impl Catalog for PostgresCatalog {
         let project_str = project.to_string();
         let table_str = table.to_string();
         let snap_id_i64 = snapshot_id.0 as i64;
-        let mut client = self.client.lock().await;
+        let mut client = self.client().await?;
         let txn = client
             .transaction()
             .await
@@ -2041,7 +2080,7 @@ impl Catalog for PostgresCatalog {
             .as_str()
             .unwrap_or("sql")
             .to_string();
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         client
             .execute(
                 &format!(
@@ -2072,7 +2111,7 @@ impl Catalog for PostgresCatalog {
     async fn drop_sql_function(&self, project: &ProjectId, name: &str) -> Result<()> {
         let sch = &self.schema;
         let project_str = project.to_string();
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let n = client
             .execute(
                 &format!(
@@ -2095,7 +2134,7 @@ impl Catalog for PostgresCatalog {
     async fn lookup_sql_function(&self, project: &ProjectId, name: &str) -> Option<SqlFunctionDef> {
         let sch = &self.schema;
         let project_str = project.to_string();
-        let client = self.client.lock().await;
+        let client = self.client().await.ok()?;
         let row = client
             .query_opt(
                 &format!(
@@ -2136,7 +2175,9 @@ impl Catalog for PostgresCatalog {
     async fn list_sql_functions(&self, project: &ProjectId) -> Vec<SqlFunctionDef> {
         let sch = &self.schema;
         let project_str = project.to_string();
-        let client = self.client.lock().await;
+        let Ok(client) = self.client().await else {
+            return Vec::new();
+        };
         let rows = match client
             .query(
                 &format!(
@@ -2190,7 +2231,7 @@ impl Catalog for PostgresCatalog {
         // first hand-out lands on `start` after the standard advance.
         let stored = def.start.wrapping_sub(def.increment);
         let cache_size_pg: i64 = def.cache_size as i64;
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let n = client
             .execute(
                 &format!(
@@ -2226,7 +2267,7 @@ impl Catalog for PostgresCatalog {
     #[instrument(skip(self), fields(project = %project, name = %name))]
     async fn drop_sequence(&self, project: &ProjectId, name: &str) -> Result<()> {
         let sch = &self.schema;
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let n = client
             .execute(
                 &format!(
@@ -2248,7 +2289,7 @@ impl Catalog for PostgresCatalog {
     #[instrument(skip(self), fields(project = %project, name = %name))]
     async fn lookup_sequence(&self, project: &ProjectId, name: &str) -> Option<SequenceDef> {
         let sch = &self.schema;
-        let client = self.client.lock().await;
+        let client = self.client().await.ok()?;
         let row = client
             .query_opt(
                 &format!(
@@ -2283,7 +2324,7 @@ impl Catalog for PostgresCatalog {
     async fn nextval(&self, project: &ProjectId, name: &str) -> Result<i64> {
         let sch = &self.schema;
         let project_str = project.to_string();
-        let mut client = self.client.lock().await;
+        let mut client = self.client().await?;
         let txn = client
             .transaction()
             .await
@@ -2355,7 +2396,7 @@ impl Catalog for PostgresCatalog {
     #[instrument(skip(self), fields(project = %project, name = %name))]
     async fn currval(&self, project: &ProjectId, name: &str) -> Result<i64> {
         let sch = &self.schema;
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let row_opt = client
             .query_opt(
                 &format!(
@@ -2390,7 +2431,7 @@ impl Catalog for PostgresCatalog {
     ) -> Result<i64> {
         let sch = &self.schema;
         let project_str = project.to_string();
-        let mut client = self.client.lock().await;
+        let mut client = self.client().await?;
         let txn = client
             .transaction()
             .await
@@ -2451,7 +2492,7 @@ impl Catalog for PostgresCatalog {
         let project_str = def.project.to_string();
         let table_str = def.table.to_string();
         let ops_bits: i16 = def.ops.bits() as i16;
-        let mut client = self.client.lock().await;
+        let mut client = self.client().await?;
         let txn = client
             .transaction()
             .await
@@ -2501,7 +2542,7 @@ impl Catalog for PostgresCatalog {
     #[instrument(skip(self), fields(project = %project, table = %table, name = %name))]
     async fn drop_reactor(&self, project: &ProjectId, table: &TableName, name: &str) -> Result<()> {
         let sch = &self.schema;
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let n = client
             .execute(
                 &format!(
@@ -2528,7 +2569,9 @@ impl Catalog for PostgresCatalog {
         op: ChangeOp,
     ) -> Vec<ReactorDef> {
         let sch = &self.schema;
-        let client = self.client.lock().await;
+        let Ok(client) = self.client().await else {
+            return Vec::new();
+        };
         let rows = match client
             .query(
                 &format!(
@@ -2569,7 +2612,9 @@ impl Catalog for PostgresCatalog {
     #[instrument(skip(self), fields(project = %project))]
     async fn list_reactors(&self, project: &ProjectId) -> Vec<ReactorDef> {
         let sch = &self.schema;
-        let client = self.client.lock().await;
+        let Ok(client) = self.client().await else {
+            return Vec::new();
+        };
         let rows = match client
             .query(
                 &format!(
@@ -2616,7 +2661,7 @@ impl Catalog for PostgresCatalog {
             .map_err(|e| BasinError::catalog(format!("serialise enum labels: {e}")))?;
         let sch = &self.schema;
         let project_str = def.project.to_string();
-        let mut client = self.client.lock().await;
+        let mut client = self.client().await?;
         let tx = client
             .transaction()
             .await
@@ -2667,7 +2712,7 @@ impl Catalog for PostgresCatalog {
     #[instrument(skip(self), fields(project = %project, name = %name))]
     async fn lookup_enum_type(&self, project: &ProjectId, name: &str) -> Option<EnumTypeDef> {
         let sch = &self.schema;
-        let client = self.client.lock().await;
+        let client = self.client().await.ok()?;
         let row = client
             .query_opt(
                 &format!(
@@ -2697,7 +2742,7 @@ impl Catalog for PostgresCatalog {
         }
         let sch = &self.schema;
         let project_str = project.to_string();
-        let mut client = self.client.lock().await;
+        let mut client = self.client().await?;
         let tx = client
             .transaction()
             .await
@@ -2764,7 +2809,7 @@ impl Catalog for PostgresCatalog {
             )));
         }
         let sch = &self.schema;
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let n = client
             .execute(
                 &format!(
@@ -2786,7 +2831,9 @@ impl Catalog for PostgresCatalog {
     #[instrument(skip(self), fields(project = %project))]
     async fn list_enum_types(&self, project: &ProjectId) -> Vec<EnumTypeDef> {
         let sch = &self.schema;
-        let client = self.client.lock().await;
+        let Ok(client) = self.client().await else {
+            return Vec::new();
+        };
         let rows = match client
             .query(
                 &format!(
@@ -2821,7 +2868,7 @@ impl Catalog for PostgresCatalog {
             .map_err(|e| BasinError::catalog(format!("serialise domain base_type: {e}")))?;
         let sch = &self.schema;
         let project_str = def.project.to_string();
-        let mut client = self.client.lock().await;
+        let mut client = self.client().await?;
         let tx = client
             .transaction()
             .await
@@ -2878,7 +2925,7 @@ impl Catalog for PostgresCatalog {
     #[instrument(skip(self), fields(project = %project, name = %name))]
     async fn lookup_domain(&self, project: &ProjectId, name: &str) -> Option<DomainDef> {
         let sch = &self.schema;
-        let client = self.client.lock().await;
+        let client = self.client().await.ok()?;
         let row = client
             .query_opt(
                 &format!(
@@ -2911,7 +2958,7 @@ impl Catalog for PostgresCatalog {
             )));
         }
         let sch = &self.schema;
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let n = client
             .execute(
                 &format!(
@@ -2931,7 +2978,9 @@ impl Catalog for PostgresCatalog {
     #[instrument(skip(self), fields(project = %project))]
     async fn list_domains(&self, project: &ProjectId) -> Vec<DomainDef> {
         let sch = &self.schema;
-        let client = self.client.lock().await;
+        let Ok(client) = self.client().await else {
+            return Vec::new();
+        };
         let rows = match client
             .query(
                 &format!(
@@ -2963,7 +3012,9 @@ impl Catalog for PostgresCatalog {
 
     async fn list_sequences(&self, project: &ProjectId) -> Vec<SequenceDef> {
         let sch = &self.schema;
-        let client = self.client.lock().await;
+        let Ok(client) = self.client().await else {
+            return Vec::new();
+        };
         let rows = match client
             .query(
                 &format!(
@@ -3008,7 +3059,7 @@ impl Catalog for PostgresCatalog {
             .map_err(|e| BasinError::catalog(format!("serialise procedure args: {e}")))?;
         let sch = &self.schema;
         let project_str = def.project.to_string();
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let n = client
             .execute(
                 &format!(
@@ -3032,7 +3083,7 @@ impl Catalog for PostgresCatalog {
     #[instrument(skip(self), fields(project = %project, name = %name))]
     async fn drop_procedure(&self, project: &ProjectId, name: &str) -> Result<()> {
         let sch = &self.schema;
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let n = client
             .execute(
                 &format!(
@@ -3054,7 +3105,7 @@ impl Catalog for PostgresCatalog {
     #[instrument(skip(self), fields(project = %project, name = %name))]
     async fn lookup_procedure(&self, project: &ProjectId, name: &str) -> Option<SqlProcedureDef> {
         let sch = &self.schema;
-        let client = self.client.lock().await;
+        let client = self.client().await.ok()?;
         let row = client
             .query_opt(
                 &format!(
@@ -3080,7 +3131,9 @@ impl Catalog for PostgresCatalog {
     #[instrument(skip(self), fields(project = %project))]
     async fn list_procedures(&self, project: &ProjectId) -> Vec<SqlProcedureDef> {
         let sch = &self.schema;
-        let client = self.client.lock().await;
+        let Ok(client) = self.client().await else {
+            return Vec::new();
+        };
         let rows = match client
             .query(
                 &format!(
@@ -3120,7 +3173,7 @@ impl Catalog for PostgresCatalog {
         let project_str = project.to_string();
         let config_json = serde_json::to_value(&config)
             .map_err(|e| BasinError::catalog(format!("serialise project_storage_config: {e}")))?;
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         client
             .execute(
                 &format!(
@@ -3145,7 +3198,7 @@ impl Catalog for PostgresCatalog {
     ) -> Result<Option<ProjectStorageConfig>> {
         let sch = &self.schema;
         let project_str = project.to_string();
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let row = client
             .query_opt(
                 &format!(
@@ -3215,7 +3268,7 @@ impl Catalog for PostgresCatalog {
         let empty_policies_json = serde_json::to_value::<Vec<Policy>>(Vec::new())
             .map_err(|e| BasinError::catalog(format!("serialise policies: {e}")))?;
 
-        let mut client = self.client.lock().await;
+        let mut client = self.client().await?;
         let tx = client
             .transaction()
             .await
@@ -3365,7 +3418,7 @@ impl Catalog for PostgresCatalog {
         let table_str = qtable.name.to_string();
         let schema_name_str = qtable.schema.as_str();
 
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let row_opt = client
             .query_opt(
                 &format!(
@@ -3514,7 +3567,7 @@ impl Catalog for PostgresCatalog {
         qtable: &QualifiedTableName,
     ) -> Result<()> {
         let sch = &self.schema;
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let n = client
             .execute(
                 &format!(
@@ -3567,7 +3620,7 @@ impl Catalog for PostgresCatalog {
             ));
         }
 
-        let mut client = self.client.lock().await;
+        let mut client = self.client().await?;
         let tx = client
             .transaction()
             .await
@@ -3633,7 +3686,7 @@ impl Catalog for PostgresCatalog {
     #[instrument(skip(self), fields(project = %project))]
     async fn list_tables_qualified(&self, project: &ProjectId) -> Result<Vec<QualifiedTableName>> {
         let sch = &self.schema;
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let rows = client
             .query(
                 &format!(
@@ -3665,7 +3718,7 @@ impl Catalog for PostgresCatalog {
     #[instrument(skip(self), fields(project = %project))]
     async fn list_schemas(&self, project: &ProjectId) -> Result<Vec<SchemaName>> {
         let sch = &self.schema;
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let rows = client
             .query(
                 &format!(
@@ -3700,7 +3753,7 @@ impl Catalog for PostgresCatalog {
         let sch = &self.schema;
         let project_str = project.to_string();
         let schema_str = schema.as_str();
-        let mut client = self.client.lock().await;
+        let mut client = self.client().await?;
         let tx = client
             .transaction()
             .await
@@ -3752,7 +3805,7 @@ impl Catalog for PostgresCatalog {
         let project_str = project.to_string();
         let schema_str = schema.as_str();
 
-        let mut client = self.client.lock().await;
+        let mut client = self.client().await?;
         let tx = client
             .transaction()
             .await
@@ -3848,7 +3901,7 @@ impl PostgresCatalog {
             BASIN_DOMAIN_KEY
         };
         let sch = &self.schema;
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let rows = client
             .query(
                 &format!(
@@ -3892,7 +3945,7 @@ impl crate::leases::LeaseRegistry for PostgresCatalog {
         let ttl_secs = i64::try_from(ttl.as_secs())
             .map_err(|_| BasinError::catalog(format!("lease ttl {ttl:?} overflows BIGINT")))?;
 
-        let mut client = self.client.lock().await;
+        let mut client = self.client().await?;
         let tx = client
             .transaction()
             .await
@@ -3986,7 +4039,7 @@ impl crate::leases::LeaseRegistry for PostgresCatalog {
             .map_err(|_| BasinError::catalog(format!("lease ttl {ttl:?} overflows BIGINT")))?;
         let now = Utc::now();
         let expires_at = now + chrono::Duration::seconds(ttl_secs);
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         // Only extend if still ours at the exact epoch and not yet expired.
         // A single conditional UPDATE is the CAS — no transaction needed.
         let n = client
@@ -4019,7 +4072,7 @@ impl crate::leases::LeaseRegistry for PostgresCatalog {
         holder: &str,
     ) -> Result<bool> {
         let sch = &self.schema;
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let n = client
             .execute(
                 &format!(
@@ -4040,7 +4093,7 @@ impl crate::leases::LeaseRegistry for PostgresCatalog {
         partition_id: &str,
     ) -> Result<Option<(String, i64)>> {
         let sch = &self.schema;
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         // Expired rows have no live owner: filter on expires_at > now() so a
         // lingering row is reported as unowned (reclaimable).
         let row = client
@@ -4151,7 +4204,7 @@ fn reactor_err_to_basin(e: ReactorError) -> BasinError {
 }
 
 async fn fetch_snapshots(
-    client: &Client,
+    client: &impl GenericClient,
     schema: &str,
     project_str: &str,
     schema_name_str: &str,
@@ -4197,6 +4250,22 @@ async fn fetch_snapshots(
         });
     }
     Ok(out)
+}
+
+/// Resolve the catalog pool size from `BASIN_CATALOG_PG_POOL_SIZE`, falling
+/// back to [`DEFAULT_POOL_SIZE`] for missing / unparseable / zero values.
+/// Zero is treated as "use the default" rather than a hard error so a
+/// misconfigured env var degrades gracefully instead of taking the server
+/// down on startup.
+fn pool_size_from_env() -> usize {
+    match std::env::var(POOL_SIZE_ENV) {
+        Ok(s) => s
+            .parse::<usize>()
+            .ok()
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_POOL_SIZE),
+        Err(_) => DEFAULT_POOL_SIZE,
+    }
 }
 
 fn validate_schema_ident(s: &str) -> Result<()> {

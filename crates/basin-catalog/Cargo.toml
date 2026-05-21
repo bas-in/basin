@@ -22,6 +22,11 @@ chrono.workspace = true
 # Postgres-backed durable catalog. NoTls only for now; production deployments
 # will need to swap in rustls or native-tls at the connect call site.
 tokio-postgres = { workspace = true, features = ["with-serde_json-1", "with-chrono-0_4"] }
+# Phase 6.P0.B noisy-neighbor fix: connection pool for the catalog. The old
+# `Mutex<Client>` serialised every catalog read across every tenant; a pool
+# lets concurrent DDL + reads run in parallel. Default pool size 16,
+# overridable via `BASIN_CATALOG_PG_POOL_SIZE`.
+deadpool-postgres = "0.14"
 # Reactor body / predicate validation at registration time. Same version
 # the engine pins; already in the lock file.
 sqlparser.workspace = true
