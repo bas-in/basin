@@ -73,6 +73,29 @@ pub struct ShardConfig {
     pub lease_ttl: Duration,
     /// Heartbeat renew cadence. Default 5 s (`BASIN_LEASE_RENEW_SECS`).
     pub lease_renew_interval: Duration,
+    /// Phase 6.X.D — optional budget coordinator (ADR 0023). When attached,
+    /// the lease heartbeat tick *also* pushes per-`(project, partition)`
+    /// usage deltas to the coordinator and writes the returned slice budget
+    /// into each registered [`basin_catalog::SliceBudgetView`]. v1 ships
+    /// zero-delta heartbeats — the slice itself is the load-bearing
+    /// cross-replica primitive; per-cap usage telemetry feeds the
+    /// coordinator in a follow-on once each cap consumer exposes an
+    /// observable counter. **Closes the multi-instance cap-bypass P0.**
+    pub budget_coordinator: Option<Arc<dyn basin_catalog::BudgetCoordinator>>,
+    /// Phase 6.X.D — slice views the heartbeat tick should push slices into.
+    /// Same [`basin_catalog::SliceBudgetView`] handle each cap consumer was
+    /// built with; the heartbeat fans the coordinator's slice answer out to
+    /// every registered view (typically one per cap consumer crate).
+    pub slice_views: Vec<basin_catalog::SliceBudgetView>,
+    /// Phase 6.X.D — slice gates whose token counters should be refilled
+    /// after every heartbeat tick. Refilling is necessary for the qps-style
+    /// caps (`RestQps` / `PgQps` / `NetOutboundQps`) where the slice is
+    /// "tokens per heartbeat window" — without periodic refill the gate
+    /// would drain and stay drained forever. Byte-style caps
+    /// (`MemtableBytes` / `RealtimeBytes`) read the slice directly via
+    /// [`basin_catalog::SliceBudgetView::slice_for_sync`] and don't need
+    /// the gate refill.
+    pub slice_gates: Vec<basin_catalog::SliceGate>,
 }
 
 impl ShardConfig {
@@ -100,7 +123,26 @@ impl ShardConfig {
                 "BASIN_LEASE_RENEW_SECS",
                 basin_catalog::DEFAULT_LEASE_RENEW_SECS,
             )),
+            budget_coordinator: None,
+            slice_views: Vec::new(),
+            slice_gates: Vec::new(),
         }
+    }
+
+    /// Phase 6.X.D — attach a budget coordinator + the cap consumers'
+    /// slice views/gates. The lease heartbeat then becomes the budget
+    /// heartbeat too: each tick pushes a usage delta and writes the slice
+    /// answer back into every registered view.
+    pub fn with_budget_coordinator(
+        mut self,
+        coordinator: Arc<dyn basin_catalog::BudgetCoordinator>,
+        views: Vec<basin_catalog::SliceBudgetView>,
+        gates: Vec<basin_catalog::SliceGate>,
+    ) -> Self {
+        self.budget_coordinator = Some(coordinator);
+        self.slice_views = views;
+        self.slice_gates = gates;
+        self
     }
 
     /// Attach a lease registry + holder id so [`Shard::spawn_background`] runs

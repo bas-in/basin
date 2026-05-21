@@ -198,6 +198,77 @@ impl InProcessShard {
         self.heartbeat_renew().await
     }
 
+    /// Test-only: drive one budget-heartbeat tick synchronously.
+    #[allow(dead_code)]
+    pub(crate) async fn run_budget_heartbeat_once(&self) {
+        self.heartbeat_budgets().await
+    }
+
+    /// Phase 6.X.D — push per-`(project, partition)` usage deltas to the
+    /// coordinator and write the returned slice budgets back into every
+    /// registered slice view. No-op when no coordinator is configured.
+    ///
+    /// v1 pushes empty deltas; the slice answer itself is the load-bearing
+    /// cross-replica primitive (the cap consumer's slice decisions are
+    /// what actually close the multi-instance bypass). Per-cap usage
+    /// telemetry feeds the coordinator in a follow-on once each consumer
+    /// exposes an observable counter.
+    async fn heartbeat_budgets(&self) {
+        let Some(coord) = &self.cfg.budget_coordinator else {
+            return;
+        };
+        // Snapshot the currently-held leases so the heartbeat covers exactly
+        // the partitions this replica owns. The heartbeat must always cover
+        // partitions whose lease this replica holds, even when the slice
+        // views / gates list is empty — that keeps the coordinator's
+        // partition count accurate for downstream slice arithmetic.
+        let snapshot: Vec<(ProjectId, PartitionKey)> = {
+            let held = self.held_leases.lock().await;
+            held.keys().cloned().collect()
+        };
+        for (project, partition) in snapshot {
+            let slice = match coord
+                .push_heartbeat(
+                    &project,
+                    partition.as_str(),
+                    &self.cfg.replica_id,
+                    basin_catalog::UsageDelta::zero(),
+                )
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    // Failure path: the coordinator is unreachable. Leave
+                    // every existing slice view in place (stale-safe; same
+                    // value it had last heartbeat). Cap consumers fall back
+                    // to per-process defaults for `(project, cap)` pairs
+                    // that have never received a slice. Degraded — no
+                    // cross-replica aggregation — but safe.
+                    warn!(
+                        %project,
+                        %partition,
+                        error = %e,
+                        "budget heartbeat push failed; slice views stay stale",
+                    );
+                    continue;
+                }
+            };
+            // Fan the slice out to every registered view.
+            for view in &self.cfg.slice_views {
+                for cap in basin_catalog::CapKind::ALL {
+                    if let Some(s) = slice.get(*cap) {
+                        view.set_slice(project, *cap, s).await;
+                    }
+                }
+            }
+        }
+        // Refill every registered slice gate's token counters from its view.
+        // Required for the qps-style caps where slice = tokens-per-window.
+        for gate in &self.cfg.slice_gates {
+            gate.refill_from_view().await;
+        }
+    }
+
     /// Renew every lease this replica holds. On a failed renewal (lost lease)
     /// drop the partition's in-memory state and stop tracking the lease — the
     /// partition now belongs to whoever stole it. No-op in no-lease mode.
@@ -858,6 +929,10 @@ impl ShardImpl for InProcessShard {
                     }
                     _ = heartbeat_tick.tick() => {
                         me.heartbeat_renew().await;
+                        // Phase 6.X.D — same cadence as the lease renew.
+                        // Pushing on every renew tick keeps slices fresh
+                        // within `lease_renew_interval` (default 5 s).
+                        me.heartbeat_budgets().await;
                     }
                 }
             }
@@ -1851,5 +1926,123 @@ mod tests {
         inner.run_heartbeat_once().await;
         let read = handle.read(&table, ReadOptions::default()).await.unwrap();
         assert_eq!(rows_in(&read), 10);
+    }
+
+    // ── Phase 6.X.D: heartbeat-reconciled budgets ────────────────────────
+    //
+    // Multi-replica acceptance test for the multi-instance cap-bypass P0.
+    // Three "replicas" (in-process shards) share one in-memory
+    // BudgetCoordinator and one in-memory LeaseRegistry. The project is
+    // capped at 60 RestQps. After two heartbeat rounds (per ADR 0023 the
+    // first round is stale — slices converge within one heartbeat interval),
+    // each replica's slice gate admits exactly 20 ops. Aggregate ≤ 60.
+
+    use basin_catalog::{
+        BudgetCoordinator, CapKind, InMemoryBudgetCoordinator, ProjectBudget, SliceBudgetView,
+        SliceGate,
+    };
+
+    #[tokio::test]
+    async fn multi_replica_heartbeat_aggregates_rest_qps_under_project_cap() {
+        let catalog = Arc::new(InMemoryCatalog::new());
+        let coord: Arc<dyn BudgetCoordinator> = Arc::new(InMemoryBudgetCoordinator::new());
+        let project = ProjectId::new();
+
+        // Project cap: 60 RestQps across all replicas combined.
+        coord
+            .set_project_budget(&project, ProjectBudget::default().with(CapKind::RestQps, 60))
+            .await
+            .unwrap();
+
+        // Three "replicas": each gets its own (shard, partition, slice
+        // gate, slice view). Each holds a distinct partition's lease.
+        let mut shards: Vec<(crate::Shard, SliceGate, PartitionKey, TempDir, TempDir)> =
+            Vec::new();
+        for i in 0..3 {
+            let storage_dir = TempDir::new().unwrap();
+            let wal_dir = TempDir::new().unwrap();
+            let storage_fs = LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap();
+            let wal_fs = LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap();
+            let storage = Storage::new(StorageConfig {
+                object_store: Arc::new(storage_fs),
+                root_prefix: None,
+                disk_cache: None,
+                page_cache: None,
+            });
+            let wal: Arc<dyn Wal> = Arc::new(
+                LocalWal::open(WalConfig {
+                    object_store: Arc::new(wal_fs),
+                    root_prefix: None,
+                    flush_interval: Duration::from_millis(50),
+                    flush_max_bytes: 1024 * 1024,
+                })
+                .await
+                .unwrap(),
+            );
+            let view = SliceBudgetView::new();
+            let gate = SliceGate::new(view.clone());
+            let registry: Arc<dyn basin_catalog::LeaseRegistry> = catalog.clone();
+            let mut cfg = ShardConfig::new(storage, catalog.clone(), wal)
+                .with_lease_registry(registry, format!("replica-{i}"));
+            cfg.lease_ttl = Duration::from_secs(60);
+            cfg.lease_renew_interval = Duration::from_millis(50);
+            cfg = cfg.with_budget_coordinator(coord.clone(), vec![view], vec![gate.clone()]);
+            let partition = PartitionKey::new(format!("p-{i}")).unwrap();
+            let shard = crate::Shard::new(cfg);
+            // Acquire the lease for this replica's partition.
+            let _h = shard.get(&project, &partition).await.unwrap();
+            shards.push((shard, gate, partition, storage_dir, wal_dir));
+        }
+
+        // Two heartbeat rounds. After round 1 every coordinator entry knows
+        // the live partition count; after round 2 every slice view reflects
+        // slice = 60 / 3 = 20.
+        for _ in 0..2 {
+            for (shard, _gate, _part, _sd, _wd) in &shards {
+                let inner = impl_of(shard);
+                inner.run_budget_heartbeat_once().await;
+            }
+        }
+
+        for (_shard, gate, _part, _sd, _wd) in &shards {
+            assert_eq!(
+                gate.view().slice_for(project, CapKind::RestQps).await,
+                20,
+                "after convergence each replica must see slice=20",
+            );
+        }
+
+        // Each replica burns its slice; aggregate must equal the project cap.
+        let mut admitted = 0u64;
+        for (_shard, gate, _part, _sd, _wd) in &shards {
+            for _ in 0..40 {
+                if gate
+                    .try_consume(project, CapKind::RestQps, 1)
+                    .await
+                    .is_ok()
+                {
+                    admitted += 1;
+                }
+            }
+        }
+        assert_eq!(
+            admitted, 60,
+            "multi-replica aggregate must equal the project cap (60), not 3 × 20 = 60 \
+             but the same N × per_process_cap would have given 180+",
+        );
+    }
+
+    /// Failure path: with no coordinator attached, the heartbeat tick is a
+    /// no-op and cap consumers fall back to their per-process defaults
+    /// (back-compat). Verifies the safe degradation.
+    #[tokio::test]
+    async fn no_coordinator_heartbeat_is_noop_and_safe() {
+        let (shard, _sd, _wd, _storage, _cat, _wal) = fresh_shard().await;
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+        let _h = shard.get(&project, &partition).await.unwrap();
+        let inner = impl_of(&shard);
+        // No coordinator wired — must not panic, must not error.
+        inner.run_budget_heartbeat_once().await;
     }
 }
