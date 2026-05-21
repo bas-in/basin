@@ -475,6 +475,50 @@ pub struct TableMetadata {
     pub gc_orphan_paths: Vec<String>,
 }
 
+// ---------------------------------------------------------------------------
+// T-048 — per-tenant BYO-bucket config
+// ---------------------------------------------------------------------------
+
+/// Stored inside [`TenantMetadata::byo_bucket`] when a project has configured
+/// its own object-storage bucket. The `secret_access_key_enc` field carries
+/// the secret key envelope-encrypted by the cloud layer's KMS; the OSS engine
+/// persists the bytes verbatim and never inspects them. The `force_path_style`
+/// flag enables path-style request routing required by MinIO and some S3-
+/// compatible stores that don't support virtual-hosted-style.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct S3Config {
+    /// Full HTTPS endpoint URL (e.g. `"https://s3.amazonaws.com"` or
+    /// `"https://fly.storage.tigris.dev"`).
+    pub endpoint: String,
+    /// Customer's bucket name.
+    pub bucket: String,
+    /// Region string. `"auto"` for Tigris/R2; a real AWS region for S3.
+    pub region: String,
+    /// AWS-style access key identifier (not secret).
+    pub access_key_id: String,
+    /// Secret access key, envelope-encrypted by the cloud layer's KMS.
+    /// The OSS engine persists the ciphertext verbatim and never decrypts it.
+    pub secret_access_key_enc: Vec<u8>,
+    /// When `true`, use path-style URLs. Required for MinIO and some
+    /// custom S3-compatible providers.
+    pub force_path_style: bool,
+}
+
+/// Per-tenant settings shared across all tables owned by the tenant.
+///
+/// `byo_bucket` is the only field today. `#[serde(default)]` on optional
+/// fields and `skip_serializing_if` ensure forward/backward compatibility:
+/// a catalog row that predates this struct deserialises with all fields at
+/// their defaults, preserving the pre-T-048 shared-bucket behaviour.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantMetadata {
+    /// When `Some`, reads and writes for this tenant are routed to the
+    /// customer's own S3-compatible bucket. `None` (the default) uses
+    /// Basin's shared bucket — back-compat with all existing tenants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byo_bucket: Option<S3Config>,
+}
+
 impl TableMetadata {
     /// Convenience: the snapshot record matching `current_snapshot`. The
     /// in-memory implementation always keeps these consistent; this helper
@@ -530,3 +574,4 @@ impl TableMetadata {
         live.into_values().collect()
     }
 }
+

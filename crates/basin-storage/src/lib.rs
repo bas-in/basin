@@ -284,6 +284,14 @@ struct Inner {
     /// arrive with a 5ms deadline; bulk ops (PUT / large range) get a
     /// 1s deadline so they can't crowd out point lookups. See ADR 0008.
     scheduler: Scheduler,
+    /// T-049 — per-tenant BYO object-store overrides. Registered by the
+    /// cloud layer (or tests) after `Storage::new` via
+    /// [`Storage::register_byo_object_store`]. The `Mutex` is held only
+    /// for nanoseconds (map insert / remove / probe); it is never held
+    /// across an `await`. When a project has an entry here,
+    /// [`Storage::project_object_store`] routes its I/O to the
+    /// registered store instead of `Inner::object_store`.
+    byo_object_stores: Mutex<HashMap<ProjectId, Arc<dyn ObjectStore>>>,
 }
 
 /// Best-effort counters for the read path. See [`Inner::read_counters`].
@@ -400,6 +408,7 @@ impl Storage {
                 catalog: OnceLock::new(),
                 project_config_cache: RwLock::new(HashMap::new()),
                 scheduler: Scheduler::new(DEFAULT_GLOBAL_BUDGET),
+                byo_object_stores: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -434,6 +443,128 @@ impl Storage {
     /// backwards compatible.
     pub fn attach_catalog(&self, catalog: Arc<dyn Catalog>) {
         let _ = self.inner.catalog.set(catalog);
+    }
+
+    // -----------------------------------------------------------------------
+    // T-049 — per-tenant BYO object-store registration
+    // -----------------------------------------------------------------------
+
+    /// Register a pre-built [`ObjectStore`] as the BYO override for
+    /// `project`. Subsequent calls to [`Storage::project_object_store`] for
+    /// this project will route to `store` instead of the shared
+    /// `Inner::object_store`. Replaces any previously registered store for
+    /// the same project.
+    ///
+    /// The `store` should already be correctly scoped to the customer's
+    /// bucket root; the storage layer will still apply the per-project
+    /// `projects/{project_id}/` prefix on top of it (via
+    /// `project_object_store`), so the customer's bucket must be writable at
+    /// that prefix.
+    pub fn register_byo_object_store(&self, project: ProjectId, store: Arc<dyn ObjectStore>) {
+        self.inner
+            .byo_object_stores
+            .lock()
+            .expect("byo_object_stores poisoned")
+            .insert(project, store);
+    }
+
+    /// Remove a previously-registered BYO override for `project`. After
+    /// this call, [`Storage::project_object_store`] falls back to the shared
+    /// store. No-op when no override is registered.
+    pub fn deregister_byo_object_store(&self, project: &ProjectId) {
+        self.inner
+            .byo_object_stores
+            .lock()
+            .expect("byo_object_stores poisoned")
+            .remove(project);
+    }
+
+    /// Build a ready-to-use [`ObjectStore`] from a catalog-persisted
+    /// [`basin_catalog::S3Config`] and the *already-decrypted* secret access
+    /// key bytes (the cloud layer decrypts `S3Config::secret_access_key_enc`
+    /// before calling here; the engine never sees the ciphertext).
+    ///
+    /// The returned store is suitable as the `store` argument to
+    /// [`Storage::register_byo_object_store`].
+    ///
+    /// # Errors
+    /// Returns an error when the `AmazonS3Builder` rejects the supplied
+    /// config (e.g. invalid endpoint, empty bucket name, etc.).
+    pub fn register_byo_object_store_from_config_with_secret(
+        &self,
+        project: ProjectId,
+        cfg: &basin_catalog::S3Config,
+        secret_plain: &str,
+    ) -> Result<Arc<dyn ObjectStore>> {
+        let store = Self::build_byo_object_store_from_config_with_secret(cfg, secret_plain)?;
+        self.register_byo_object_store(project, store.clone());
+        Ok(store)
+    }
+
+    /// Pure constructor: build an [`ObjectStore`] from a [`basin_catalog::S3Config`]
+    /// and a *plaintext* secret key without mutating `Storage`. Useful when
+    /// the caller wants to inspect the store before registering it, or when
+    /// running tests that need multiple stores.
+    ///
+    /// The `secret_plain` value is the plaintext secret access key; the
+    /// cloud layer is responsible for decrypting
+    /// `S3Config::secret_access_key_enc` before calling here.
+    pub fn build_byo_object_store_from_config_with_secret(
+        cfg: &basin_catalog::S3Config,
+        secret_plain: &str,
+    ) -> Result<Arc<dyn ObjectStore>> {
+        use object_store::aws::AmazonS3Builder;
+
+        let b = AmazonS3Builder::new()
+            .with_bucket_name(&cfg.bucket)
+            .with_region(&cfg.region)
+            .with_access_key_id(&cfg.access_key_id)
+            .with_secret_access_key(secret_plain)
+            .with_endpoint(&cfg.endpoint)
+            // force_path_style = true → path-style (disable virtual-hosted);
+            // force_path_style = false → virtual-hosted (the common default).
+            .with_virtual_hosted_style_request(!cfg.force_path_style);
+
+        let store = b.build().map_err(|e| {
+            basin_common::BasinError::storage(format!(
+                "build_byo_object_store_from_config_with_secret: {e}"
+            ))
+        })?;
+        Ok(Arc::new(store))
+    }
+
+    // -----------------------------------------------------------------------
+    // T-051 — BYO-bucket-aware project deletion
+    // -----------------------------------------------------------------------
+
+    /// Catalog-aware, BYO-bucket-safe project deletion.
+    ///
+    /// - When the tenant has a BYO bucket configured (`TenantMetadata::byo_bucket
+    ///   .is_some()`): logs a notice and **only** drops the catalog namespace.
+    ///   The customer's bucket objects are left intact — Basin must never
+    ///   delete data from a bucket it doesn't own.
+    /// - Otherwise: delegates to the standard [`Storage::delete_project`]
+    ///   which deletes all objects under the project prefix and drops the
+    ///   catalog namespace.
+    ///
+    /// Returns the number of objects physically deleted (0 for BYO tenants).
+    #[tracing::instrument(skip(self, catalog), fields(project=%project))]
+    pub async fn delete_project_byo_aware(
+        &self,
+        project: ProjectId,
+        catalog: &dyn basin_catalog::Catalog,
+    ) -> basin_common::Result<usize> {
+        let meta = catalog.get_tenant_metadata(&project).await?;
+        if meta.byo_bucket.is_some() {
+            tracing::info!(
+                target: "basin_storage::delete_project",
+                project = %project,
+                "tenant {project} BYO-bucket — leaving customer bucket intact",
+            );
+            catalog.drop_namespace(&project).await?;
+            return Ok(0);
+        }
+        self.delete_project(catalog, &project).await
     }
 
     /// Persist a per-project storage config. Delegates to the attached
@@ -594,14 +725,30 @@ impl Storage {
     /// (`SessionContext::register_object_store`) for a session bound to
     /// `project`: every range read DataFusion drives for that session
     /// will then count against the project's permit pool.
+    ///
+    /// T-049: if a BYO object store has been registered for `project` via
+    /// [`Storage::register_byo_object_store`], that store is used as the
+    /// backing store instead of the shared `Inner::object_store`. Prefix
+    /// isolation (`projects/{project_id}/…`) is preserved either way.
     pub fn project_object_store(&self, project: &ProjectId) -> Arc<dyn ObjectStore> {
+        // T-049: check for a per-project BYO store first.
+        let backing = {
+            let byo = self
+                .inner
+                .byo_object_stores
+                .lock()
+                .expect("byo_object_stores poisoned");
+            byo.get(project).cloned()
+        };
+        let backing = backing.unwrap_or_else(|| self.inner.object_store.clone());
+
         let sem = self.project_semaphore(project);
         // Pull the per-project counters handle (None if no registry has
         // been attached). The wrapper's bump sites are a no-op when None,
         // so the legacy un-instrumented test paths stay byte-identical.
         let counters = self.project_counters(project);
         Arc::new(concurrency::ProjectScopedStore::new(
-            self.inner.object_store.clone(),
+            backing,
             sem,
             self.inner.scheduler.clone(),
             *project,
@@ -1625,5 +1772,340 @@ mod tests {
             );
             assert!(!f.path.as_ref().contains(&format!("projects/{b}/")));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // T-049 / T-051 BYO-bucket tests
+    // -----------------------------------------------------------------------
+
+    /// Minimal in-memory catalog stub for BYO tests. Supports
+    /// `get_tenant_metadata` / `drop_namespace` / `list_project_data_files`;
+    /// all other methods panic to ensure they aren't called unexpectedly.
+    struct ByoCatalog {
+        tenant_meta: std::sync::Mutex<HashMap<ProjectId, basin_catalog::TenantMetadata>>,
+        dropped: std::sync::Mutex<Vec<ProjectId>>,
+    }
+
+    impl ByoCatalog {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                tenant_meta: std::sync::Mutex::new(HashMap::new()),
+                dropped: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn set_meta(&self, project: ProjectId, meta: basin_catalog::TenantMetadata) {
+            self.tenant_meta
+                .lock()
+                .unwrap()
+                .insert(project, meta);
+        }
+
+        fn was_dropped(&self, project: &ProjectId) -> bool {
+            self.dropped.lock().unwrap().contains(project)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl basin_catalog::Catalog for ByoCatalog {
+        async fn create_namespace(&self, _p: &ProjectId) -> basin_common::Result<()> { Ok(()) }
+        async fn drop_namespace(&self, p: &ProjectId) -> basin_common::Result<()> {
+            self.dropped.lock().unwrap().push(*p);
+            Ok(())
+        }
+        async fn create_table(&self, _p: &ProjectId, _t: &TableName, _schema: &arrow_schema::Schema) -> basin_common::Result<basin_catalog::TableMetadata> { unimplemented!() }
+        async fn load_table(&self, _p: &ProjectId, _t: &TableName) -> basin_common::Result<basin_catalog::TableMetadata> { unimplemented!() }
+        async fn drop_table(&self, _p: &ProjectId, _t: &TableName) -> basin_common::Result<()> { Ok(()) }
+        async fn list_tables(&self, _p: &ProjectId) -> basin_common::Result<Vec<TableName>> { Ok(vec![]) }
+        async fn append_data_files(&self, _p: &ProjectId, _t: &TableName, _exp: basin_catalog::SnapshotId, _files: Vec<basin_catalog::DataFileRef>) -> basin_common::Result<basin_catalog::TableMetadata> { unimplemented!() }
+        async fn replace_data_files(&self, _p: &ProjectId, _t: &TableName, _exp: basin_catalog::SnapshotId, _removed: Vec<String>, _added: Vec<basin_catalog::DataFileRef>) -> basin_common::Result<basin_catalog::TableMetadata> { unimplemented!() }
+        async fn list_snapshots(&self, _p: &ProjectId, _t: &TableName) -> basin_common::Result<Vec<basin_catalog::Snapshot>> { Ok(vec![]) }
+        async fn set_partition_spec(&self, _p: &ProjectId, _t: &TableName, _spec: basin_catalog::PartitionSpec) -> basin_common::Result<()> { Ok(()) }
+        async fn list_project_data_files(&self, _p: &ProjectId) -> basin_common::Result<Vec<basin_catalog::DataFileRef>> {
+            // Return empty list so delete_project fast-paths to an empty bulk delete.
+            Ok(vec![])
+        }
+        async fn get_tenant_metadata(&self, p: &ProjectId) -> basin_common::Result<basin_catalog::TenantMetadata> {
+            Ok(self
+                .tenant_meta
+                .lock()
+                .unwrap()
+                .get(p)
+                .cloned()
+                .unwrap_or_default())
+        }
+    }
+
+    /// Thin spy wrapping an `InMemory` store; counts how many objects were
+    /// passed through `delete_stream` (the bulk-delete path used by
+    /// `delete_project` / `delete_project_prefix`).
+    #[derive(Debug, Clone)]
+    struct SpyStore {
+        inner: Arc<object_store::memory::InMemory>,
+        deletes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl SpyStore {
+        fn new() -> Self {
+            Self {
+                inner: Arc::new(object_store::memory::InMemory::new()),
+                deletes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+        fn delete_count(&self) -> usize {
+            self.deletes.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl std::fmt::Display for SpyStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "SpyStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for SpyStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
+            // Intercept each path that passes through, bump the counter,
+            // then delegate to the inner InMemory store. Both the counter
+            // Arc and the inner Arc are cloned so the stream can be 'static.
+            use futures::StreamExt;
+            let counter = self.deletes.clone();
+            let inner = self.inner.clone();
+            let counted: BoxStream<'static, object_store::Result<ObjectPath>> =
+                locations.map(move |r| {
+                    if r.is_ok() {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    r
+                }).boxed();
+            inner.delete_stream(counted)
+        }
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// T-049: register a BYO store; `project_object_store` must route to it.
+    ///
+    /// Strategy: register a SpyStore as BYO, write a batch, assert the data
+    /// lives in the SpyStore's inner InMemory — NOT in the shared LocalFS.
+    /// This confirms project_object_store routes through the BYO backing store.
+    #[tokio::test]
+    async fn register_then_lookup_returns_byo_store() {
+        let dir = TempDir::new().unwrap();
+        let s = storage_in(&dir);
+        let project = ProjectId::new();
+        let spy = SpyStore::new();
+        let table = TableName::new("t").unwrap();
+        let part = PartitionKey::default_key();
+
+        // Register the spy as the BYO store.
+        s.register_byo_object_store(project, Arc::new(spy.clone()) as Arc<dyn ObjectStore>);
+
+        // Write a batch — this must hit the spy store.
+        s.write_batch(&project, &table, &part, &small_batch(0, 5, "x-"))
+            .await
+            .unwrap();
+
+        // Because the spy's inner InMemory received the PUT we can read it back.
+        let stream = s.read(&project, &table, ReadOptions::default()).await.unwrap();
+        let batches: Vec<_> = stream.collect::<Vec<_>>().await;
+        let total: usize = batches.iter().map(|b| b.as_ref().unwrap().num_rows()).sum();
+        assert_eq!(total, 5, "expected 5 rows read back from BYO store");
+
+        // The shared store (LocalFS) must be empty for this project.
+        let gated = {
+            // Temporarily use the raw shared store to verify isolation.
+            let gated_shared = Arc::new(concurrency::ProjectScopedStore::new(
+                s.inner.object_store.clone(),
+                s.project_semaphore(&project),
+                s.inner.scheduler.clone(),
+                project,
+                None,
+            ));
+            let root = s.project_root(&project);
+            gated_shared
+                .list(Some(&root))
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+        };
+        assert!(
+            gated.is_empty(),
+            "shared store should have no objects for a BYO project"
+        );
+    }
+
+    /// T-049: after `deregister_byo_object_store`, `project_object_store`
+    /// must route to the shared store (fallback).
+    #[tokio::test]
+    async fn deregister_falls_back_to_shared() {
+        let dir = TempDir::new().unwrap();
+        let s = storage_in(&dir);
+        let project = ProjectId::new();
+        let spy = SpyStore::new();
+        let table = TableName::new("t").unwrap();
+        let part = PartitionKey::default_key();
+
+        s.register_byo_object_store(project, Arc::new(spy.clone()) as Arc<dyn ObjectStore>);
+        s.deregister_byo_object_store(&project);
+
+        // Write a batch — must now land in the shared LocalFS store, not spy.
+        s.write_batch(&project, &table, &part, &small_batch(0, 3, "y-"))
+            .await
+            .unwrap();
+
+        // Reading back works (shared store has the data).
+        let stream = s.read(&project, &table, ReadOptions::default()).await.unwrap();
+        let batches: Vec<_> = stream.collect::<Vec<_>>().await;
+        let total: usize = batches.iter().map(|b| b.as_ref().unwrap().num_rows()).sum();
+        assert_eq!(total, 3, "expected 3 rows from shared store after deregister");
+    }
+
+    /// T-051: `delete_project_byo_aware` must NOT issue any DELETE to the BYO
+    /// store when a BYO bucket is configured — it only drops the catalog
+    /// namespace.
+    #[tokio::test]
+    async fn delete_byo_tenant_leaves_bucket_objects() {
+        let dir = TempDir::new().unwrap();
+        let s = storage_in(&dir);
+        let project = ProjectId::new();
+        let spy = SpyStore::new();
+        let table = TableName::new("t").unwrap();
+        let part = PartitionKey::default_key();
+
+        // Register the BYO store and write a file into it.
+        s.register_byo_object_store(project, Arc::new(spy.clone()) as Arc<dyn ObjectStore>);
+        s.write_batch(&project, &table, &part, &small_batch(0, 5, "byo-"))
+            .await
+            .unwrap();
+
+        // Set up a catalog that reports byo_bucket = Some(…).
+        let catalog = ByoCatalog::new();
+        catalog.set_meta(
+            project,
+            basin_catalog::TenantMetadata {
+                byo_bucket: Some(basin_catalog::S3Config {
+                    endpoint: "https://s3.example.com".into(),
+                    bucket: "cust-bucket".into(),
+                    region: "us-east-1".into(),
+                    access_key_id: "AKI".into(),
+                    secret_access_key_enc: b"encrypted".to_vec(),
+                    force_path_style: false,
+                }),
+            },
+        );
+
+        // Snapshot delete count before.
+        let deletes_before = spy.delete_count();
+
+        let deleted = s
+            .delete_project_byo_aware(project, catalog.as_ref())
+            .await
+            .unwrap();
+
+        assert_eq!(deleted, 0, "BYO deletion must return 0 (no objects removed)");
+        assert_eq!(
+            spy.delete_count(),
+            deletes_before,
+            "no DELETE must be issued to the BYO store"
+        );
+        assert!(
+            catalog.was_dropped(&project),
+            "catalog namespace must still be dropped"
+        );
+    }
+
+    /// T-051: `delete_project_byo_aware` with no BYO bucket must physically
+    /// remove all objects under the project prefix via the shared store.
+    #[tokio::test]
+    async fn delete_shared_tenant_removes_objects() {
+        let dir = TempDir::new().unwrap();
+        let s = storage_in(&dir);
+        let project = ProjectId::new();
+        let table = TableName::new("t").unwrap();
+        let part = PartitionKey::default_key();
+
+        // Write two files into the shared store.
+        s.write_batch(&project, &table, &part, &small_batch(0, 5, "s-"))
+            .await
+            .unwrap();
+        s.write_batch(&project, &table, &part, &small_batch(5, 5, "s-"))
+            .await
+            .unwrap();
+
+        // Verify the files exist.
+        let files_before = s.list_data_files(&project, &table).await.unwrap();
+        assert_eq!(files_before.len(), 2, "expected 2 files before deletion");
+
+        let catalog = ByoCatalog::new();
+        // No byo_bucket set — TenantMetadata::default().
+        let deleted = s
+            .delete_project_byo_aware(project, catalog.as_ref())
+            .await
+            .unwrap();
+
+        assert!(deleted >= 2, "at least the 2 data files must be deleted; got {deleted}");
+        assert!(
+            catalog.was_dropped(&project),
+            "catalog namespace must be dropped"
+        );
+
+        // After deletion the store should have no objects for this project.
+        let root = s.project_root(&project);
+        let remaining = s
+            .inner
+            .object_store
+            .list(Some(&root))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(
+            remaining.is_empty(),
+            "no objects should remain after shared-tenant deletion"
+        );
     }
 }

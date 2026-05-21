@@ -69,7 +69,8 @@ pub use leases::{
 };
 pub use metadata::{
     CheckConstraint, ColumnStats, CvDef, DataFileRef, ForeignKeyDef, PartitionSpec, Policy,
-    PolicyCommand, RefAction, SecondaryIndex, TableFileFormat, TableMetadata, UniqueConstraint,
+    PolicyCommand, RefAction, S3Config, SecondaryIndex, TableFileFormat, TableMetadata,
+    TenantMetadata, UniqueConstraint,
 };
 pub use postgres::PostgresCatalog;
 pub use procedures::{ProcedureError, SqlProcedureDef};
@@ -231,6 +232,32 @@ pub trait Catalog: Send + Sync {
             }
         }
         Ok(out)
+    }
+
+    /// Persist per-tenant metadata (BYO-bucket config, etc.) for `project`.
+    /// Idempotent: a second call with the same project replaces the prior
+    /// value. `None` on `TenantMetadata::byo_bucket` restores the default
+    /// shared-bucket behaviour. Default impl returns
+    /// `Internal("not implemented")` so non-default backends opt in
+    /// explicitly.
+    async fn set_tenant_metadata(
+        &self,
+        project: &ProjectId,
+        meta: TenantMetadata,
+    ) -> Result<()> {
+        let _ = (project, meta);
+        Err(basin_common::BasinError::Internal(
+            "set_tenant_metadata not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Look up the persisted [`TenantMetadata`] for `project`. Returns
+    /// `TenantMetadata::default()` (i.e. `byo_bucket = None`) when no
+    /// metadata has been set — meaning "use Basin's shared bucket". Default
+    /// impl: returns `Ok(TenantMetadata::default())`.
+    async fn get_tenant_metadata(&self, project: &ProjectId) -> Result<TenantMetadata> {
+        let _ = project;
+        Ok(TenantMetadata::default())
     }
 
     /// Atomic commit: append `files` to the table, producing a new snapshot.
@@ -1760,4 +1787,6 @@ pub trait Catalog: Send + Sync {
             live_paths,
         })
     }
+
 }
+
