@@ -1795,6 +1795,134 @@ compaction; `window_partition_sum` + `lag_lead_window` drop their
 - (Reserved for future entries.) WebSocket realtime moved to Tier 4
   (5.11.R series) — committed, no longer gated.
 
+## Phase 6.SEC — Security P0/P1 fixes from 2026-05-21 audit **(BETA-BLOCKER)**
+
+Audit: `docs/audits/2026-05-21-security-audit.md` (3 P0 / 5 P1 / 7 P2 / 17
+test-gaps; commit landing alongside this section). **All P0s must land
+before any beta** — two MFA crypto holes mean aal2 is currently security
+theater; an unauthenticated inbound-webhook lets anyone trigger registered
+SQL with their project ID.
+
+Sequencing: P0s in parallel (different files), then P1s, then the
+regression-test backfill in `tests/integration/tests/security.rs`.
+
+- [ ] **6.SEC.P0.1 — TOTP replay protection actually wired**
+      (`crates/basin-auth/src/mfa.rs:852,931`). Today the call passes
+      `&HashSet::new()` as the seen-codes set → no replay protection. Plumb
+      a real per-factor recently-seen-codes ring (TTL ≥ TOTP step × 2 =
+      60–90 s). Test: capture a code → second submission inside the window
+      fails.
+- [ ] **6.SEC.P0.2 — WebAuthn signature verification** (`mfa.rs:1066–1126,
+      1182–1240`). Today only echoes the challenge nonce; no attestation /
+      assertion crypto. Wire `webauthn-rs` per its standard flow (the crate
+      is already a dep — it's just not being called). Test: forged
+      attestation rejected; valid authenticator-signed assertion accepted.
+- [ ] **6.SEC.P0.3 — Inbound webhook authentication**
+      (`crates/basin-rest/src/routes/inbound.rs:52`). The
+      `BASIN_NET_ALLOW_PLAINTEXT_WEBHOOKS` debug gate promised by ADR 0019
+      doesn't exist. Default to **require HMAC signature** (`X-Basin-Signature`
+      header over the body, secret from the registered webhook row); debug
+      env opens plaintext only when explicitly set. Test: unsigned/invalid
+      sig → 401; valid sig → 200 + SQL runs.
+
+- [ ] **6.SEC.P1.* — five P1 findings** detailed in the audit (OAuth
+      identity-link via unverified email, signed-URL secret rotation
+      missing, presence `client_id` impersonation, public-bucket alias
+      gap, reserved-schema CREATE/DROP open). Each ~½–1 day; file:line in
+      audit §4.
+
+- [ ] **6.SEC.T — 17 regression tests** in
+      `tests/integration/tests/security.rs` from audit §6. Land each test
+      BEFORE its corresponding fix (red→green discipline). See task #21.
+
+---
+
+## Phase 6.X — Lease-based ownership + partition routing — ADR 0023 **(TOP PRIORITY)**
+
+The architectural commitment that fixes hot-tenant pinning AND multi-instance
+cap bypass in one shape. Driven by the noisy-neighbor audit
+(`docs/audits/2026-05-21-noisy-neighbor-fairness.md`, 4 P0 / 6 P1 / 5 P2-P3).
+Full design in [ADR 0023](./docs/decisions/0023-leases-and-partition-routing.md).
+
+**Why TOP PRIORITY:** every per-project cap in OSS today (REST QPS, pgwire QPS,
+HTAP memtable bytes, realtime `BUFFER_FULL`, Wasm semaphore, basin-net
+outbound) is per-process — a tenant on N replicas gets `N×` the cap they
+should. Hot tenants pin one replica at 100% while siblings idle. The new
+basin-cloud overage prices (`acb2f7c`: storage $0.010/GB-mo, compute
+$0.018/CPU-hr) cannot bill correctly until this is fixed. Blocks any
+multi-replica production deployment.
+
+### Phase 6.P0 — single-instance mechanical fixes (parallel, ~1 day each)
+Independent of 6.X; ship immediately while 6.X is being built. Each closes
+an audit P0 single-instance gap on its own.
+
+- [ ] **6.P0.A — Statement-level wall-clock + CPU timeout** in the executor
+      hot path. `BASIN_STATEMENT_TIMEOUT_MS` default (e.g. 30 000). Closes
+      "any hostile/buggy query runs forever" today. Files:
+      `crates/basin-engine/src/{executor,session}.rs`. Test: long-running
+      aggregate is cancelled at the timeout; clean SQLSTATE 57014
+      (`query_canceled`).
+- [ ] **6.P0.B — Catalog connection pool** — replace `Mutex<Client>` in
+      `crates/basin-catalog/src/postgres.rs:57–60` with `deadpool-postgres`.
+      Every DDL no longer serializes every catalog read across all tenants.
+      Test: concurrent DDL+read benchmark shows linear scaling, not
+      mutex-serialized.
+- [ ] **6.P0.C — Wasm on a dedicated tokio runtime** — Wasm invocations
+      currently run on the shared `spawn_blocking` pool
+      (`crates/basin-fn/src/governance.rs:359`), starving the shard-mode
+      executor under load. Move to a sized, separate runtime; per-replica
+      cap.
+
+### Phase 6.X — the architectural commitment (~6–10 weeks single-engineer)
+Sequencing: **A → B**, **A → D**, **B → C**, **A–D → E + F**.
+
+- [ ] **6.X.A — Lease table + leaseholder primitive (~2 wk).** New table
+      `basin_catalog.partition_leases (project_id, partition_id, holder,
+      epoch, granted_at, expires_at)`. `LeaseRegistry` trait + Postgres impl;
+      acquire / renew / steal-on-expiry / release. Per-replica heartbeat
+      loop (default 5 s renew, 15 s TTL). Epoch fencing token at the WAL
+      append site so a dual-leaseholder (network partition) → loser's
+      appends fail at WAL write time. **FOUNDATION — blocks B/C/D/E/F.**
+      Files: `crates/basin-catalog/src/{leases,postgres}.rs` (new
+      `leases.rs`), `crates/basin-wal/src/file_wal.rs` (epoch fence on
+      append), `crates/basin-shard/src/in_process.rs` (heartbeat loop).
+- [ ] **6.X.B — Partition-level routing (~2 wk).** `ShardMap::shard_for(project)`
+      → `LeaseRegistry::owner_for(project, partition)`. Router caches with
+      TTL + miss-fetch from coordinator. Default 1 partition per project →
+      back-compat byte-equivalent to today; whales partition explicitly via
+      DDL. **Depends on A.** Files: `crates/basin-router/src/sharding.rs`
+      (gut), `crates/basin-engine/src/executor.rs` (partition-aware path).
+- [ ] **6.X.C — Lease handoff under load (~1 wk).** A replica voluntarily
+      yields a lease on coordinator request: snapshot memtable → flush →
+      transfer epoch → ack. Target < 500 ms p99 stall. **Depends on A + B.**
+- [ ] **6.X.D — Heartbeat budget reconciliation (~1 wk).** Per-replica
+      heartbeat carries per-`(project, partition)` usage deltas; coordinator
+      computes project totals and writes per-partition slice budgets into
+      the heartbeat response. Replace every per-process `DashMap` cap (REST
+      QPS, pgwire QPS, memtable bytes, realtime `BUFFER_FULL`, Wasm
+      semaphore, basin-net outbound) with slice-budget consumers. **Closes
+      the multi-instance cap-bypass P0.** **Depends on A.**
+- [ ] **6.X.E — Failure-path hardening (~1–2 wk).** Replica-loss tests
+      (kill mid-write, verify recovery within TTL); dual-leaseholder
+      fencing test (force a partition; verify loser's WAL appends are
+      rejected); network-partition simulator. **Depends on A–D.** Files:
+      `tests/integration/tests/lease_failure_paths.rs` (new).
+- [ ] **6.X.F — Observability + ops (~1 wk).** Dashboards for lease
+      distribution, rebalance events, over-cap windows, heartbeat lag.
+      Operator runbook at `docs/operators/lease-ownership.md` covering
+      manual rebalance / forced lease yield / partition-count tuning.
+      **Depends on A–D.**
+
+> **Explicitly out of scope (or deferred) for 6.X v1**: Raft / Paxos lease
+> consensus (Postgres CAS is sufficient); distributed counters on the hot
+> path (heartbeat reconciliation does the job at lower cost); separate
+> budget service (catalog Postgres is the only coordinator); cross-project
+> budget aggregation (caps are per-project; org rollups are basin-cloud);
+> auto-rebalance heuristics (ops trigger manually for v1; auto when a real
+> customer needs it). All recorded in ADR 0023.
+
+---
+
 ## Phase 6 — Production hardening (3–4 months)
 
 - [x] **Subsystem Cargo feature flags + minimal pgwire-only build** (ADR 0018) —

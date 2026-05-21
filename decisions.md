@@ -6,6 +6,40 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-21 — Multi-replica scale-out architecture: leases, not coordinator-or-counters (ADR 0023)
+
+The noisy-neighbor audit (`docs/audits/2026-05-21-noisy-neighbor-fairness.md`,
+4 P0) surfaced two coupled architectural P0s: **hot-tenant pinning** (router
+hashes ProjectId→one replica; memtable + WAL live only there) and
+**multi-instance cap bypass** (per-project caps are per-process DashMaps; N
+replicas = N× the cap). The audit offered two repair options — (a) central
+coordinator/budget service, (b) replicated counters. **Rejected both:** (a)
+fixes caps but leaves whales pinned; (b) pays a distributed-systems cost on
+the hot path for a weaker (a). Neither addresses the root cause: per-project
+state lives in process-local memory keyed by a hash.
+
+**Decision (ADR 0023):** lease-based ownership + partition-level routing +
+heartbeat budgets. Key insight — almost every subsystem is ALREADY keyed by
+`(project,partition)` / `(project,table)` (WAL, memtable, catalog, blooms,
+sketches, indexes); only the router still hashes whole-project. Fix that
+mismatch. Ownership becomes a lease in the catalog Postgres (CAS + TTL +
+epoch fencing token; no Raft). Replicas go stateless; the router consults
+leases; budgets reconcile via 5s heartbeats (leaseholder is the per-partition
+arbiter — no per-request coordination; project totals sum across leaseholders
+async). This fixes pinning AND cap-correctness in one shape, composes with
+everything already built, and needs no new infra service. Cost: ~6–10 wk.
+Phase 6.X, TOP PRIORITY. Three single-instance mechanical fixes (statement
+timeout, catalog pool, Wasm dedicated runtime) ship first as Phase 6.P0 —
+independent, ~1 day each, immediately good.
+
+**Also (2026-05-21 security audit, 3 P0):** Phase 6.SEC beta-blocker — MFA
+TOTP replay is a no-op (`mfa.rs:852,931` passes empty seen-set), WebAuthn does
+zero crypto (only echoes the challenge nonce), inbound webhooks are
+unauthenticated (the ADR-0019 plaintext gate doesn't exist). aal2 is currently
+security theater. Must fix before any beta; ~4–5 eng-days for all P0 + 4/5 P1.
+
+---
+
 ## 2026-05-20 — Schemas: user-defined WON'T-DO, system schemas made real (ADR 0022)
 
 Decided after an architecture discussion. Full rationale in
