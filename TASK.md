@@ -1862,9 +1862,21 @@ regression-test backfill in `tests/integration/tests/security.rs`.
         `same_sub_across_providers_resolves_distinct_identities`) +
         `oauth.rs` unit tests for absent/false `email_verified`.
 
-- [ ] **6.SEC.T — 17 regression tests** in
-      `tests/integration/tests/security.rs` from audit §6. Land each test
-      BEFORE its corresponding fix (red→green discipline). See task #21.
+- [x] **6.SEC.T (#21) — 17 regression tests** in
+      `tests/integration/tests/security.rs` from audit §6. Shipped P0/P1
+      fixes get green tests asserting the FIX is in place (TOTP replay +
+      monotonic counter, WebAuthn structural + counter + pointer guards,
+      inbound webhook default-secure + sig-shape + bypass-env-name,
+      presence forged client_id + metadata cap, OAuth unverified-email +
+      same-sub-distinct-per-provider, recovery-code hash format, JWT
+      alg:none reject, P2-6 pgwire-user routing hint safety, cross-project
+      fuzz pointer). Remaining audit P1/P2 surfaces with no fix yet land
+      as `#[ignore]`d "expected failing" tests documenting the gap
+      (P1-1 WS filter, P1-3 redirect_to origin, P1-5 admin tenant binding,
+      P2-1 signed-URL rotation, P2-3 OAuth state TTL, P2-4 MIME sniff,
+      P2-5 reserved-schema DDL, P2-7 refresh-token compromise window).
+      28 green + 8 ignored under `cargo test -p basin-integration-tests
+      --test security`.
 
 ---
 
