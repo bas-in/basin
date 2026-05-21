@@ -47,11 +47,13 @@ use tokio::sync::{oneshot, Mutex};
 use tracing::instrument;
 
 mod eviction;
+mod mode;
 mod pooled_session;
 mod state;
 mod stats;
 
 pub use eviction::EvictionHandle;
+pub use mode::PoolMode;
 pub use pooled_session::PooledSession;
 pub use stats::PoolStats;
 
@@ -66,13 +68,22 @@ pub struct PoolConfig {
     /// an existing session to be released.
     pub max_sessions: usize,
     /// How long an idle session may sit in the cache before the eviction
-    /// loop drops it.
+    /// loop drops it.  Only relevant for [`PoolMode::Session`]: in
+    /// transaction / statement mode sessions are never cached.
     pub idle_ttl: Duration,
     /// Maximum sessions per project (in-use plus idle). Prevents one
     /// project's burst from starving the rest of the pool.
     pub per_project_cap: usize,
     /// Cadence of the background eviction tick.
     pub eviction_interval: Duration,
+    /// Connection-assignment granularity.
+    ///
+    /// * [`PoolMode::Session`] — classic: sessions are cached and reused
+    ///   across logical-client checkouts.
+    /// * [`PoolMode::Transaction`] (default) — sessions are destroyed on
+    ///   return so no per-session state crosses checkout boundaries.
+    /// * [`PoolMode::Statement`] — placeholder; same as Transaction today.
+    pub pool_mode: PoolMode,
 }
 
 impl Default for PoolConfig {
@@ -82,6 +93,7 @@ impl Default for PoolConfig {
             idle_ttl: Duration::from_secs(300),
             per_project_cap: 64,
             eviction_interval: Duration::from_secs(60),
+            pool_mode: PoolMode::Transaction,
         }
     }
 }
@@ -140,22 +152,35 @@ impl SessionPool {
         loop {
             // Step 1: try to satisfy from the cache, or detect that we
             // need to open a fresh session and reserve the slot.
+            //
+            // Transaction / statement mode: bypass the idle cache entirely.
+            // Each checkout must start with a fresh session so that cursors,
+            // prepared statements, and per-session SET state from the
+            // previous logical client cannot leak into this one.
             let action = {
                 let mut state = self.inner.state.lock().await;
 
-                if let Some(queue) = state.available.get_mut(&key) {
-                    if let Some(entry) = queue.pop_back() {
-                        if queue.is_empty() {
+                let session_mode = self.inner.cfg.pool_mode == PoolMode::Session;
+
+                if session_mode {
+                    if let Some(queue) = state.available.get_mut(&key) {
+                        if let Some(entry) = queue.pop_back() {
+                            if queue.is_empty() {
+                                state.available.remove(&key);
+                            }
+                            Action::Hit(entry.session)
+                        } else {
+                            // An empty queue should have been removed by the
+                            // last popper, but treat it defensively.
                             state.available.remove(&key);
+                            decide_open(&mut state, &self.inner.cfg, key.project)
                         }
-                        Action::Hit(entry.session)
                     } else {
-                        // An empty queue should have been removed by the
-                        // last popper, but treat it defensively.
-                        state.available.remove(&key);
                         decide_open(&mut state, &self.inner.cfg, key.project)
                     }
                 } else {
+                    // Transaction / statement mode: always open a fresh
+                    // session; never serve from the cache.
                     decide_open(&mut state, &self.inner.cfg, key.project)
                 }
             };
@@ -367,6 +392,10 @@ mod tests {
             idle_ttl: Duration::from_secs(300),
             per_project_cap: 16,
             eviction_interval: Duration::from_secs(60),
+            // Unit tests verify session-reuse semantics (hit/miss counters,
+            // eviction, address stability). Use Session mode so the existing
+            // cache-hit assertions remain valid.
+            pool_mode: PoolMode::Session,
         }
     }
 

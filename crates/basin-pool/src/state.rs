@@ -116,4 +116,22 @@ impl PoolState {
         }
         self.total = self.total.saturating_sub(1);
     }
+
+    /// Wake one waiter for `project`, if any.
+    ///
+    /// Called by transaction-mode `PooledSession::Drop` after releasing the
+    /// slot so that a parked `acquire` for the same project can proceed.
+    /// In session mode the equivalent wake happens inside `return_entry`.
+    pub(crate) fn wake_one_waiter(&mut self, project: ProjectId) {
+        if let Some(queue) = self.waiters.get_mut(&project) {
+            while let Some(tx) = queue.pop_front() {
+                if tx.send(()).is_ok() {
+                    break;
+                }
+            }
+            if queue.is_empty() {
+                self.waiters.remove(&project);
+            }
+        }
+    }
 }
