@@ -9,12 +9,12 @@
 //! # Data layout
 //!
 //! One index file per `(project, table, col)`, stored at:
-//! ```
+//! ```text
 //! <object_store_root>/<project>/secondary_indexes/<table>/<col>.idx
 //! ```
 //!
 //! The file is a little-endian binary blob encoded as:
-//! ```
+//! ```text
 //! [header: magic(4) + version(1) + entry_count(u64 LE)]
 //! [entries: { key_len(u32 LE) | key_bytes | locations_len(u32 LE)
 //!             | locations: { file_len(u32 LE) | file_bytes | rg(u32 LE) | row(u64 LE) }* }*]
