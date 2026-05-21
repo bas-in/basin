@@ -145,6 +145,16 @@ impl ProjectMemState {
 /// Process-wide registry of per-`(project, table)` memtables.
 ///
 /// Thread-safe; designed as a process-level singleton.
+///
+/// ## Phase 6.X.D — heartbeat-reconciled MemtableBytes cap (ADR 0023)
+///
+/// Optionally carries a [`basin_catalog::SliceBudgetView`]. When set, the
+/// effective per-project hard cap becomes `min(config.project_hard_cap_bytes,
+/// slice_for(project, MemtableBytes))`. The slice closes the multi-instance
+/// bypass: with N replicas each holding a 256 MiB local cap, a project
+/// could allocate `N × 256 MiB` total; with the slice attached they share
+/// `project_total / partition_count` per replica. Back-compat: when no slice
+/// is set the config cap is used unchanged.
 pub struct MemTableRegistry {
     tables: DashMap<(ProjectId, TableName), Arc<MemTableEntry>>,
     projects: DashMap<ProjectId, Arc<ProjectMemState>>,
@@ -152,6 +162,9 @@ pub struct MemTableRegistry {
     /// Soft-cap flush channel sender. Sends are best-effort; the C4 stub
     /// drops the receiver so `SendError` is silently ignored.
     flush_tx: mpsc::UnboundedSender<FlushRequest>,
+    /// Phase 6.X.D — coordinator-handed slice cap. `None` in single-replica
+    /// / back-compat mode; `Some` when the shard heartbeat is wired.
+    slice: Option<basin_catalog::SliceBudgetView>,
 }
 
 impl MemTableRegistry {
@@ -170,7 +183,24 @@ impl MemTableRegistry {
             projects: DashMap::new(),
             config,
             flush_tx,
+            slice: None,
         }
+    }
+
+    /// Phase 6.X.D — attach a slice view so [`Self::try_reserve_bytes`]
+    /// enforces the smaller of the local config cap and the
+    /// coordinator-handed slice for `(project, MemtableBytes)`. The shard
+    /// heartbeat loop fills the view; consumers transparently degrade to
+    /// the config cap when no slice is set.
+    pub fn with_slice_view(mut self, view: basin_catalog::SliceBudgetView) -> Self {
+        self.slice = Some(view);
+        self
+    }
+
+    /// Read-only access to the attached slice view (for the shard heartbeat
+    /// loop that pushes slices back into it).
+    pub fn slice_view(&self) -> Option<&basin_catalog::SliceBudgetView> {
+        self.slice.as_ref()
     }
 
     // ── table CRUD ────────────────────────────────────────────────────────────
@@ -208,12 +238,18 @@ impl MemTableRegistry {
     /// - **FlushSuggested**: soft_cap < after <= hard_cap; counter bumped,
     ///   flush request enqueued.
     /// - **HardCapReached**: would exceed hard_cap; counter NOT bumped.
+    ///
+    /// Phase 6.X.D: when a slice view is attached, the effective hard cap
+    /// is `min(state.hard_cap_bytes, slice_for(project, MemtableBytes))`.
+    /// The slice closes the multi-instance bypass — each replica's local
+    /// allotment is `project_total / partition_count` (no `N × hard_cap`).
     pub fn try_reserve_bytes(&self, project: &ProjectId, n: u64) -> ReservationOutcome {
         let state = self.project_state(*project);
+        let hard_cap = self.effective_hard_cap(project, &state);
         let current = state.bytes_allocated.load(Ordering::Relaxed);
         let after = current.saturating_add(n);
 
-        if after > state.hard_cap_bytes {
+        if after > hard_cap {
             return ReservationOutcome::HardCapReached;
         }
 
@@ -229,8 +265,8 @@ impl MemTableRegistry {
                 Ok(_) => break,
                 Err(actual) => {
                     cur = actual;
-                    // Re-check hard cap after losing the race.
-                    if cur.saturating_add(n) > state.hard_cap_bytes {
+                    // Re-check the effective hard cap after losing the race.
+                    if cur.saturating_add(n) > hard_cap {
                         return ReservationOutcome::HardCapReached;
                     }
                 }
@@ -242,6 +278,23 @@ impl MemTableRegistry {
             ReservationOutcome::FlushSuggested
         } else {
             ReservationOutcome::Granted
+        }
+    }
+
+    /// Compute the effective hard cap for `project` given the attached
+    /// slice view (if any). Returns `state.hard_cap_bytes` when no slice is
+    /// configured (back-compat) or when the slice is unset (coordinator
+    /// silent / project uncapped).
+    fn effective_hard_cap(&self, project: &ProjectId, state: &ProjectMemState) -> u64 {
+        let local = state.hard_cap_bytes;
+        let Some(view) = self.slice.as_ref() else {
+            return local;
+        };
+        let slice = view.slice_for_sync(*project, basin_catalog::CapKind::MemtableBytes);
+        if slice == basin_catalog::SLICE_UNSET {
+            local
+        } else {
+            local.min(slice)
         }
     }
 

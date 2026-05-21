@@ -1059,6 +1059,7 @@ dependencies = [
  "arrow-array",
  "arrow-ipc",
  "arrow-schema",
+ "basin-catalog",
  "basin-common",
  "bytes",
  "criterion",
