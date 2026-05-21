@@ -62,8 +62,10 @@ async fn try_make_auth(secret: &[u8]) -> Option<Arc<AuthService>> {
         token_ttl: Duration::from_secs(300),
         refresh_ttl: Duration::from_secs(86_400),
         catalog_dsn: Some(PG_URL.to_owned()),
-        // 32-char budget enforced by basin-auth: 5-char prefix + 26-char ULID = 31.
-        catalog_schema: format!("bbyo_{}", ulid::Ulid::new().to_string().to_lowercase()),
+        catalog_schema: format!(
+            "basin_admin_byo_test_{}",
+            ulid::Ulid::new().to_string().to_lowercase()
+        ),
         smtp: SmtpConfig {
             host: "smtp.invalid".into(),
             port: 587,

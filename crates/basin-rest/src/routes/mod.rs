@@ -9,6 +9,7 @@
 //! Routes are wired together in [`crate::server`].
 
 pub(crate) mod admin;
+pub(crate) mod admin_functions;
 pub(crate) mod auth;
 pub(crate) mod data;
 pub(crate) mod fn_handler;

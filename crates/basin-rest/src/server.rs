@@ -27,7 +27,8 @@ use tower_http::trace::TraceLayer;
 
 use crate::errors::ApiError;
 use crate::routes::{
-    admin as admin_routes, auth as auth_routes, data as data_routes,
+    admin as admin_routes, admin_functions as admin_fn_routes,
+    auth as auth_routes, data as data_routes,
     fn_handler as fn_handler_routes, inbound as inbound_routes,
     openapi as openapi_routes, rpc as rpc_routes,
     storage as storage_routes, storage_sign as storage_sign_routes,
@@ -51,6 +52,11 @@ pub(crate) struct Inner {
     /// request consumes one token from the slice for
     /// `(claims.project_id, RestQps)`. Exhausted slice → 429.
     pub(crate) slice_gate: Option<basin_catalog::SliceGate>,
+    /// T-078/079/080: in-process per-project function catalog driving
+    /// `/admin/v1/functions/*`. Opaque Wasm-bytes registry — basin-rest does
+    /// not parse the bytes; a downstream `FunctionInvoker` impl is what
+    /// hands them to `basin_fn::HandlerHarness::new`.
+    pub(crate) function_registry: admin_fn_routes::FunctionRegistry,
 }
 
 impl Inner {
@@ -73,6 +79,7 @@ impl Inner {
             blob_store,
             cfg,
             slice_gate: None,
+            function_registry: admin_fn_routes::FunctionRegistry::new(),
         }
     }
 
@@ -160,6 +167,29 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
         .route(
             "/admin/v1/projects/:project_id/byo-bucket",
             post(admin_routes::register_byo_bucket),
+        )
+        // T-078 / T-079 / T-080 / T-081: basin-fn control API. The Wasm
+        // bytes flow through this surface as opaque blobs; an out-of-process
+        // wiring (W6's catalog-backed FunctionInvoker) compiles + runs them.
+        .route(
+            "/admin/v1/functions/deploy",
+            post(admin_fn_routes::deploy_function),
+        )
+        .route(
+            "/admin/v1/functions",
+            get(admin_fn_routes::list_functions),
+        )
+        .route(
+            "/admin/v1/functions/:name",
+            axum::routing::delete(admin_fn_routes::delete_function),
+        )
+        .route(
+            "/admin/v1/functions/:name/logs",
+            get(admin_fn_routes::function_logs),
+        )
+        .route(
+            "/admin/v1/functions/:name/cpu-ms",
+            get(admin_fn_routes::function_cpu_ms),
         )
         .route("/health", get(health))
         // --- Phase 5.17.B: object-storage HTTP surface (ADR 0021) -----------
