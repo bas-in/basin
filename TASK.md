@@ -1824,13 +1824,27 @@ regression-test backfill in `tests/integration/tests/security.rs`.
       `webauthn_bad_signature_rejected`, `webauthn_counter_regression_rejected`
       (+ `mfa_webauthn::webauthn_counter_regression_rejected` integration test
       driving a software P-256 authenticator).
-- [ ] **6.SEC.P0.3 — Inbound webhook authentication**
-      (`crates/basin-rest/src/routes/inbound.rs:52`). The
-      `BASIN_NET_ALLOW_PLAINTEXT_WEBHOOKS` debug gate promised by ADR 0019
-      doesn't exist. Default to **require HMAC signature** (`X-Basin-Signature`
-      header over the body, secret from the registered webhook row); debug
-      env opens plaintext only when explicitly set. Test: unsigned/invalid
-      sig → 401; valid sig → 200 + SQL runs.
+- [x] **6.SEC.P0.3 — Inbound webhook authentication** (LAST P0 beta-blocker
+      closed). Added `secret_hex` column to `InboundWebhookDef` + a
+      `CREATE INBOUND WEBHOOK <name> [WITH SECRET '<hex>'] EXECUTE <body>`
+      DDL clause; auto-generates a 32-byte random hex token when omitted
+      and surfaces it as a single-row `secret` result set (only time the
+      plaintext leaves the server). `POST /in/:project_id/:name` now
+      requires `X-Basin-Signature: <hex>` = HMAC-SHA256(body, secret),
+      verified in constant time via `subtle::ConstantTimeEq`. The
+      ADR-0019-promised `BASIN_NET_ALLOW_PLAINTEXT_WEBHOOKS=1` env gate
+      now exists and only widens the *unsigned* path (signed requests
+      still go through full verification). Tests:
+      `inbound_webhook_row_insert_signed`,
+      `inbound_webhook_unsigned_rejected`,
+      `inbound_webhook_bad_signature_rejected`,
+      `inbound_webhook_unsigned_unknown_name_401`,
+      `inbound_webhook_signed_unknown_name_401` (basin-rest) +
+      `tests/integration/tests/inbound_webhook_auth.rs` (end-to-end
+      round-trip incl. constant-time-compare smoke + debug-bypass scenario)
+      + `verify_signature_*` unit tests for hex/length/ct-compare paths.
+      **All 3 security P0s are now closed (P0.1 TOTP replay, P0.2 WebAuthn,
+      P0.3 inbound webhook auth).**
 
 - [ ] **6.SEC.P1.* — five P1 findings** detailed in the audit (OAuth
       identity-link via unverified email, signed-URL secret rotation
@@ -1879,11 +1893,16 @@ an audit P0 single-instance gap on its own.
       `crates/basin-engine/src/{executor,session}.rs`. Test: long-running
       aggregate is cancelled at the timeout; clean SQLSTATE 57014
       (`query_canceled`).
-- [ ] **6.P0.B — Catalog connection pool** — replace `Mutex<Client>` in
-      `crates/basin-catalog/src/postgres.rs:57–60` with `deadpool-postgres`.
-      Every DDL no longer serializes every catalog read across all tenants.
-      Test: concurrent DDL+read benchmark shows linear scaling, not
-      mutex-serialized.
+- [x] **6.P0.B — Catalog connection pool** — replaced `Mutex<Client>` in
+      `crates/basin-catalog/src/postgres.rs` with `deadpool-postgres` (default
+      pool size 16, override via `BASIN_CATALOG_PG_POOL_SIZE`). Every DDL no
+      longer serializes every catalog read across all tenants; multi-statement
+      transactions still run on one checked-out connection so their semantics
+      are preserved. Lease impl (`postgres.rs::LeaseRegistry`) reuses the
+      same pool. Structural test (`pool_exposes_distinct_postgres_sessions`)
+      verifies concurrent checkouts surface ≥4 distinct PG backend pids
+      where the old shared `Client` could only ever surface one. Commits
+      8977fa6 (refactor) + c36790a (test).
 - [ ] **6.P0.C — Wasm on a dedicated tokio runtime** — Wasm invocations
       currently run on the shared `spawn_blocking` pool
       (`crates/basin-fn/src/governance.rs:359`), starving the shard-mode
