@@ -1136,6 +1136,17 @@ pub(crate) fn extract_create_table_cluster_by(sql: &str) -> Result<(String, Opti
 ///   → dropped (Basin doesn't materialise an INCLUDE-shaped index)
 /// * `WITH (option = value[, …])` storage parameters → dropped
 fn sanitize_create_table_extensions(sql: &str) -> String {
+    // Do NOT strip `INCLUDE (...)` from `CREATE [UNIQUE] INDEX` statements:
+    // it must survive to the AST so the executor can loud-reject a UNIQUE
+    // index with INCLUDE (uniqueness over the key columns is not enforced
+    // for INCLUDE-shaped indexes — silently dropping INCLUDE would mask that).
+    // Non-unique `CREATE INDEX … INCLUDE (...)` still parses and is accepted.
+    let is_create_index = {
+        let l = sql.trim_start().to_ascii_lowercase();
+        l.starts_with("create index")
+            || l.starts_with("create unique index")
+            || l.starts_with("create or replace index")
+    };
     let mut out = String::with_capacity(sql.len());
     let bytes = sql.as_bytes();
     let mut i = 0usize;
@@ -1263,7 +1274,7 @@ fn sanitize_create_table_extensions(sql: &str) -> String {
         // Only inside CREATE statement contexts (the outer caller
         // gates on CREATE-prefix); within string literals we already
         // bypassed.
-        if matches_kw_at(bytes, i, b"INCLUDE") {
+        if !is_create_index && matches_kw_at(bytes, i, b"INCLUDE") {
             let end_after_kw = i + b"INCLUDE".len();
             let mut k = end_after_kw;
             while k < bytes.len() && bytes[k].is_ascii_whitespace() {
