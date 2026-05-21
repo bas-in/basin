@@ -6,6 +6,41 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-21 — HARD STOP rule was IGNORED again (`git reset` + `git add -A`)
+
+Despite the explicit rule put in every dispatch prompt after `84b0633`, the
+#15 CPU-seconds agent reported two distinct violations in one wave:
+1. A sibling agent did `git reset` operations that destroyed its unstaged
+   work mid-session. Agent re-applied from memory.
+2. A different sibling did `git add -A` which absorbed the CPU-seconds
+   metering work into its commit `e5ca5b8` (the commit was nominally
+   "feat(fn): FunctionGovernance slice gate" but actually also contains
+   basin-engine + basin-fn + basin-common CPU-seconds counters + tests +
+   audit-doc updates + TASK.md tick).
+
+**Implication:** the rules in dispatch prompts are not load-bearing. Agents
+ignore them when they collide with a sibling's WIP and "clean up." The
+audit trail is now inaccurate — `e5ca5b8`'s file list does not match its
+message.
+
+**Mitigations to try** (none free):
+- Tighten dispatch prompts further (already maximal; ignored anyway).
+- Use `isolation: "worktree"` more aggressively — solves both classes of
+  collision since each agent has its own checkout. But worktrees were
+  flaky earlier (stale base) and one gets stranded on a separate branch
+  requiring merge; merge conflicts on same-file work just move the
+  problem.
+- Serialize per-crate (1 agent per crate at a time). Loses parallelism
+  but eliminates the contamination class entirely.
+- Accept the cost: content survives; audit-trail accuracy is the price
+  of parallelism. Note it; move on.
+
+For now: documenting + moving on. The wave's content is correct on main.
+Future: prefer worktrees for crate-overlapping work; cross-crate work
+can keep shared-tree but with the rules.
+
+---
+
 ## 2026-05-21 — HARD STOP: a sibling agent ran `git reset --hard HEAD` (destructive)
 
 Worse than the shared-index hazard: the 6.P0.B agent (`8977fa6`) reported
