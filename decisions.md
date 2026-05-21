@@ -613,3 +613,28 @@ match impl, or add the variant + emit it. Queueing for Wave 4 alongside
 
 **Artifacts policy.** Agents must not write to `.claude/`. The autonomous
 loop persists nothing to disk except commits + this decisions.md.
+
+---
+
+## 2026-05-21 — Shared-tree clobber at high agent concurrency (wave3)
+
+Running 9-12 agents on ONE shared working tree, an external broad-commit
+process ("wave3" `c219129`, `git add`-style sweep of the whole dirty tree)
+committed multiple agents' uncommitted work in one batch AND mutated the
+working tree under a still-running agent (ENGINE-STUBS), clobbering its
+unstaged FIX 2 (UNIQUE-reject) edits mid-flight. The agent correctly
+ABORTED per HARD STOP rather than running recovery git ops.
+
+**Net:** most work survived in wave3 (cargo check --workspace EXIT=0), but
+FIX 2 (UNIQUE-on-expression / partial / INCLUDE loud-reject) is uncertain —
+needs a SOLO re-run to verify/complete. Carry-forward: FIX 2's INCLUDE case
+requires `ddl.rs::sanitize_create_table_extensions` to skip stripping
+INCLUDE for CREATE INDEX (else the executor-only reject silently no-ops).
+
+**Lessons:**
+1. Cap concurrent Rust agents at ~4-6; one cargo target-dir lock serializes
+   all builds, so beyond that agents gridlock + truncate mid-verify.
+2. Never run a broad `git add -A`/sweep commit while agents hold unstaged
+   work — it clobbers them. If a sweep is needed, quiesce agents first.
+3. Worktree isolation per agent would prevent this but was flaky earlier;
+   for shared-tree, serialize same-crate agents.
