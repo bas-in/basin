@@ -26,6 +26,13 @@ extensions are out of scope for this OSS roadmap.
 
 Legend: `[ ]` open · `[~]` in progress · `[x]` done · `[-]` deferred / out of scope
 
+> **Test-first phase ladder (Phase 5.19+):** every phase leads with
+> `.A — test harness` that lands FIRST and reports RED against the
+> current engine. Every implementation task references which named
+> slice of the harness it flips from red → green. Agents picking up
+> a sub-task in isolation know what "done" looks like by reading the
+> slice description.
+
 ---
 
 ## Local PoC milestone — reached 2026-04-30
@@ -1214,6 +1221,426 @@ basin-catalog (no other catalog agent concurrent).
       (pgAdmin/Prisma/PostgREST) sees `auth.users` / `storage.objects` in the
       right schema; RLS-on-`storage.objects` still scopes; user `CREATE SCHEMA x`
       + `x.t` aliases to `public.t` (documented). Depends on A–D.
+
+## Phase 5.19 — JSONB indexing (GIN-equivalent) (~3-4 weeks)
+
+JSONB shipped in 5.11.A with `->`, `->>`, `#>`, `@>` operators —
+without a path-aware index, any JSON-heavy workload full-scans.
+This is the single biggest "they tried it and switched back" risk
+for new-SaaS apps using JSONB document columns. Adds a GIN-style
+index that probes containment, key existence, and path operators
+without scanning every row.
+
+**Test-first.** The differential + ORM-compat harness lands before
+the implementation; every implementation task closes against this
+harness.
+
+- [ ] **5.19.A — Differential + ORM-compat test harness** (~1 week,
+      lands first). Three layers:
+      (1) **Differential correctness:** for a curated battery of
+      JSONB queries (`@>`, `<@`, `?`, `?&`, `?|`, `->`, `->>`, `#>`),
+      run with-index vs full-scan; assert identical rows on a 1M-row
+      seeded table covering: nested objects (≤ 5 deep), arrays
+      (mixed types), nulls inside JSONB, empty objects, very-large
+      values (≥ 10 KiB), unicode keys.
+      (2) **Performance gate:** assert ≥ 10× speedup with-index vs
+      without on representative queries; p99 ≤ 5 ms on the indexed
+      path vs ≥ 200 ms on full-scan. Bench in `benches/jsonb_gin.rs`.
+      (3) **ORM compat:** Diesel, sqlx-migrate, and Prisma can each
+      declare a GIN index via their migration DSL, the migration
+      applies against Basin, the index is used (verified via
+      `EXPLAIN`), and ORM-shaped queries (`.contains()`,
+      `path::overlaps`, JSON path operators) round-trip.
+      Files: `tests/integration/tests/jsonb_gin_differential.rs`,
+      `tests/integration/tests/jsonb_gin_orm_compat.rs`,
+      `benches/jsonb_gin.rs`.
+      Acceptance: harness compiles and reports red against the
+      current (no-index) engine — the harness exists *before* the
+      implementation; every implementation task below flips a slice
+      of the harness from red to green.
+- [ ] **5.19.B — GIN index type + catalog DDL** (~1 week).
+      `CREATE INDEX … USING gin (col)` + `CREATE INDEX … USING gin
+      (col jsonb_path_ops)` parser + catalog persistence. Two operator
+      classes: `jsonb_ops` (key+value indexing, supports more operators)
+      and `jsonb_path_ops` (path hashes only, smaller + faster for `@>`).
+      Files: `crates/basin-catalog/src/index.rs` (extend),
+      `crates/basin-engine/src/ddl.rs` (parser).
+      Acceptance: `CREATE INDEX i ON t USING gin (data jsonb_path_ops);`
+      persists; `\d t` in psql shows the index; the ORM-compat slice
+      of 5.19.A (migration-applies) flips green.
+- [ ] **5.19.C — Containment probe** (`@>`, `<@`) (~1 week).
+      Engine query planner uses the GIN index for containment when
+      the query predicate matches the index operator class.
+      Posting-list AND-merge for compound containment.
+      Files: `crates/basin-engine/src/index_probe.rs` (new),
+      `crates/basin-engine/src/planner.rs` (extend).
+      Acceptance: containment-slice of 5.19.A flips green
+      (differential clean + ≥ 10× speedup).
+- [ ] **5.19.D — Key / path probe** (`?`, `?&`, `?|`, `->`, `->>`,
+      `#>`) (~1 week). Index probe for key-existence and path
+      operators when the column uses `jsonb_ops`.
+      Files: `crates/basin-engine/src/index_probe.rs` (extend).
+      Acceptance: key/path slice of 5.19.A flips green.
+- [ ] **5.19.E — Index maintenance on UPDATE / DELETE** (~1 week).
+      Copy-on-write aligned: GIN posting lists rebuilt for affected
+      row groups on Iceberg snapshot commit. Soft-delete tombstones
+      filtered at probe time.
+      Files: `crates/basin-storage/src/index_maint.rs` (new),
+      `crates/basin-engine/src/dml_mutate.rs` (extend).
+      Acceptance: 10k UPDATE/DELETE workload against a GIN-indexed
+      table; differential re-eval slice of 5.19.A stays green
+      across the workload.
+
+## Phase 5.20 — Full-text search (`tsvector` / `tsquery` / `@@`) (~3-4 weeks)
+
+`basin-trgm` (shipped) covers trigram / typo-tolerant search —
+different from FTS. Every content app reaches for
+`to_tsvector('english', body) @@ to_tsquery('search')`. PG-style
+stemming + ranking + GIN index. Without this, customers bolt on
+Meilisearch/Typesense or leave.
+
+**Test-first.** The FTS battery + ORM-compat lands first; each
+implementation task flips a slice of the harness green.
+
+- [ ] **5.20.A — FTS battery + ORM-compat test harness** (~1 week,
+      lands first). Three layers:
+      (1) **Type round-trip:** `tsvector` + `tsquery` round-trip
+      through psql + binary pgwire (binary parameter binding);
+      unicode + edge cases (empty, very long, exotic punctuation).
+      (2) **Semantics:** stemming correctness for English (golden
+      file: 200 input strings → expected lexeme outputs, sourced
+      from a reference PG instance); `@@` operator matches PG
+      semantics on a curated battery; `ts_rank` / `ts_rank_cd`
+      ordering matches PG within float tolerance; GIN-indexed
+      latency ≤ 10 ms vs full-scan ≥ 500 ms on a 1M-doc seed.
+      (3) **ORM compat:** Prisma's `@@db.TsVector` / `searchableText`
+      DSL, Diesel's `tsvector` type, and sqlx's `PgTsVector`
+      bindings — for each, migration applies, INSERTs round-trip,
+      queries (`@@` with named params) work.
+      Files: `tests/integration/tests/fts_semantics.rs`,
+      `tests/integration/tests/fts_orm_compat.rs`,
+      `tests/integration/tests/fts_content_app.rs` (sample
+      blog-app schema reproducing a golden result set),
+      `benches/fts.rs`.
+      Acceptance: harness compiles + reports red against the
+      current engine.
+- [ ] **5.20.B — `tsvector` + `tsquery` types** (~1 week). Catalog
+      type registration; binary + text serialisation; Arrow
+      representation. Files: `crates/basin-common/src/types/tsvector.rs`
+      (new), `crates/basin-engine/src/types.rs` (register).
+      Acceptance: type-round-trip slice of 5.20.A flips green.
+- [ ] **5.20.C — `to_tsvector` / `to_tsquery` / `plainto_tsquery`
+      UDFs with stemming** (~1 week). English stemming first
+      (Snowball / `rust-stemmers`); pluggable language registry for
+      future additions. Stop-word lists per language. Files:
+      `crates/basin-engine/src/udfs/fts.rs` (new).
+      Acceptance: stemming-golden-file slice of 5.20.A flips green.
+- [ ] **5.20.D — `@@` operator + ranking** (`ts_rank`, `ts_rank_cd`)
+      (~1 week). Lexeme-position-aware matching; ranking with
+      weighting by document section (A/B/C/D). Files:
+      `crates/basin-engine/src/operators/fts_match.rs` (new).
+      Acceptance: @@ semantics + ranking slice of 5.20.A flips green.
+- [ ] **5.20.E — GIN index on `tsvector`** (~1 week). Reuses the
+      GIN infrastructure from 5.19. Posting lists per lexeme;
+      probe at `@@` query time. Files:
+      `crates/basin-storage/src/index/gin_tsvector.rs` (new).
+      Acceptance: indexed-latency slice of 5.20.A flips green.
+      **Depends on:** 5.19.B (shared GIN infra).
+
+## Phase 5.21 — Logical CDC / `pgoutput` / replication slots (~4-6 weeks)
+
+`ChangeEventSink` + webhooks (5.11.I) cover most "row changed → do
+thing" cases, but Debezium / Materialize / Fivetran / Airbyte /
+Estuary all expect a **logical-replication consumer protocol**.
+This is what unlocks the data-platform integration story —
+"drop-in for any tool that talks to Postgres" instead of "drop-in
+for apps, adapters for data tools."
+
+**Test-first.** A pgoutput-protocol conformance harness + real
+Debezium + Fivetran integration tests land first; each
+implementation task closes against this harness.
+
+- [ ] **5.21.A — CDC protocol conformance + tool-integration test
+      harness** (~1 week, lands first). Three layers:
+      (1) **In-process consumer:** test-only Rust client that speaks
+      pgwire's replication-protocol subset (`CREATE_REPLICATION_SLOT`,
+      `START_REPLICATION`, ack messages); decodes pgoutput; asserts
+      message types, field ordering, LSN monotonicity.
+      (2) **Tool integration:** Debezium (Kafka Connect) + Fivetran
+      (HVR / Postgres connector) — each spins up against a Basin
+      instance via docker-compose; snapshot phase + streaming phase
+      verified end-to-end. 10k mixed INSERT/UPDATE/DELETE produce
+      identical row sets at the consumer (ordered, no dupes, no
+      drops). Crash-restart: kill the consumer mid-stream; on
+      restart, resumes from last-ack'd LSN with zero gaps.
+      (3) **Replay & retention:** WAL retention respects
+      min-confirmed across slots; consumers can replay from an
+      arbitrary historical LSN within retention.
+      Files: `tests/integration/tests/cdc_pgoutput_conformance.rs`,
+      `tests/integration/tests/cdc_debezium_e2e.rs`,
+      `tests/integration/tests/cdc_fivetran_e2e.rs`,
+      `tests/integration/tests/cdc_replay_retention.rs`,
+      `tests/integration/fixtures/debezium-compose.yml`,
+      `tests/integration/fixtures/fivetran-compose.yml`.
+      Acceptance: harness compiles + reports red against the current
+      engine.
+- [ ] **5.21.B — Replication slot pgwire commands** (~1 week).
+      `CREATE_REPLICATION_SLOT <name> LOGICAL pgoutput`,
+      `DROP_REPLICATION_SLOT <name>`, `START_REPLICATION SLOT <name>
+      LOGICAL <start_lsn>` parsed at the pgwire layer. Catalog
+      persistence of slot state (`name`, `plugin`, `start_lsn`,
+      `confirmed_flush_lsn`, `consumer_id`). Files:
+      `crates/basin-engine/src/pgwire/replication.rs` (new),
+      `crates/basin-catalog/src/replication_slots.rs` (new).
+      Acceptance: protocol-handshake slice of 5.21.A flips green.
+- [ ] **5.21.C — `pgoutput` plugin: encode `ChangeEvent` → pgoutput
+      messages** (~2 weeks). Translate Phase 5.11.G ChangeEventSink
+      events into pgoutput wire format: `RELATION`, `BEGIN`, `INSERT`,
+      `UPDATE`, `DELETE`, `COMMIT`. Tuple encoding (text + binary).
+      Files: `crates/basin-engine/src/replication/pgoutput.rs` (new).
+      Acceptance: in-process-consumer slice of 5.21.A flips green;
+      Debezium snapshot+streaming slice begins decoding correctly.
+- [ ] **5.21.D — LSN management + ack handling + replay** (~1 week).
+      Monotonic per-project LSN sequence (already exists as
+      `ChangeEvent.seq`). Consumer ack messages advance
+      `confirmed_flush_lsn`; engine GCs WAL segments only past the
+      min-confirmed across all active slots. Replay from arbitrary
+      LSN. Files: `crates/basin-engine/src/replication/lsn.rs` (new),
+      `crates/basin-wal/src/retention.rs` (extend).
+      Acceptance: replay+retention slice of 5.21.A flips green
+      (crash-restart resumes; WAL retention respects min-confirmed).
+- [ ] **5.21.E — `CREATE PUBLICATION` SQL surface** (~1 week).
+      `CREATE PUBLICATION p FOR ALL TABLES;`,
+      `CREATE PUBLICATION p FOR TABLE t1, t2 WITH (publish='insert,update');`,
+      `ALTER PUBLICATION`, `DROP PUBLICATION`. Per-project per-table
+      filtering applied at the publisher side before encoding.
+      Files: `crates/basin-engine/src/ddl.rs` (extend),
+      `crates/basin-catalog/src/publications.rs` (new).
+      Acceptance: publication-filter slice of 5.21.A flips green
+      (cross-project + table-subset isolation verified by both the
+      in-process consumer and the Debezium/Fivetran fixtures).
+
+## Phase 5.22 — `pg_dump` / `pg_restore` compat (export side) (~2-3 weeks)
+
+Two reasons: (a) buyer trust — "I can get my data out if I need to"
+closes deals; (b) migration *into* Basin from existing PG is the
+highest-leverage onboarding path. Engine already has snapshots so
+"consistent point-in-time" semantics are free.
+
+**Test-first.** A round-trip + cross-tool harness lands first;
+each implementation task flips a slice of it green.
+
+- [ ] **5.22.A — Round-trip + cross-tool + ORM-load test harness**
+      (~1 week, lands first). Four layers:
+      (1) **Basin → Basin round-trip:** 10-table seed schema with
+      diverse types (JSONB, vector, text, timestamps, arrays,
+      sequences, generated columns, enums); dump in both formats
+      (plain + custom); restore to fresh Basin; diff schema + data;
+      assert zero diff.
+      (2) **Basin → Postgres cross-tool:** dump from Basin in both
+      formats; load into real Postgres via `psql` (plain) +
+      `pg_restore` (custom); confirm schema + row counts; flag any
+      Basin-specific features that should be marked with
+      `-- skipped: <feature>` comments and verify the comments are
+      present.
+      (3) **Postgres → Basin migration path:** dump from real
+      Postgres of a representative SaaS schema (auth.users-like,
+      orders/customers, JSONB documents); load into Basin via
+      `basin restore`; confirm queries against the loaded data work.
+      (4) **ORM-load compat:** after a dump + restore on a Basin
+      instance, Diesel / sqlx / Prisma each connect, introspect, and
+      run their standard test queries against the restored data.
+      Files:
+      `tests/integration/tests/pg_dump_basin_round_trip.rs`,
+      `tests/integration/tests/pg_dump_cross_tool_pg.rs`,
+      `tests/integration/tests/pg_dump_pg_to_basin_migration.rs`,
+      `tests/integration/tests/pg_dump_orm_load_compat.rs`,
+      `tests/integration/fixtures/pg-compose.yml`.
+      Acceptance: harness compiles + reports red against the current
+      engine.
+- [ ] **5.22.B — Plain-text SQL dump format** (`pg_dump -F p`
+      equivalent) (~1 week). Schema + data emitted as `CREATE TABLE`
+      / `CREATE INDEX` / `COPY … FROM stdin` / data rows. Snapshot
+      pinned at dump-start for consistency. Files:
+      `crates/basin-engine/src/dump/plain.rs` (new).
+      Acceptance: plain-format Basin→Basin round-trip slice of
+      5.22.A flips green.
+- [ ] **5.22.C — Custom binary format** (`pg_dump -F c` equivalent)
+      (~1 week). Compressed, restorable with `pg_restore`. Header
+      includes pg_dump version + Basin version markers. Files:
+      `crates/basin-engine/src/dump/custom.rs` (new).
+      Acceptance: custom-format + cross-tool slices of 5.22.A flip
+      green (`pg_restore -l` lists objects; real PG accepts the
+      dump modulo skipped features).
+- [ ] **5.22.D — `basin dump` / `basin restore` CLI commands**
+      (~3-5 days). basin-cli wraps the pgwire-side dump endpoint:
+      `basin dump --project=<ref> --format=plain|custom -o dump.sql`,
+      `basin restore --project=<ref> dump.sql`. Files:
+      basin-cli `cmd_dump.go` + `cmd_restore.go`.
+      Acceptance: end-to-end CLI slice of 5.22.A flips green;
+      output is byte-for-byte stable across runs at the same
+      snapshot.
+- [ ] **5.22.E — Documented exclusions in `CAPABILITIES.md`**
+      (~1 day). Note any PG features Basin can't dump losslessly
+      (extensions, plpgsql); dump output flags them with
+      `-- skipped: <feature>` comments so import-into-PG attempts
+      have clear hints. Verified by the cross-tool slice of 5.22.A.
+
+## Phase 5.23 — `EXPLAIN ANALYZE` polish + `pg_stat_activity` + `pg_locks` (~1-2 weeks)
+
+`basin_stat_statements` is on the roadmap (5.16.D). The other two
+views matter for ops + dev tooling that introspects (DataGrip /
+pgAdmin / pgcli). Plus `EXPLAIN ANALYZE` correctness verification.
+
+**Test-first.** Admin-view structural correctness + real-tooling
+compat harness lands first.
+
+- [ ] **5.23.A — Admin-view + tooling-compat test harness**
+      (~3 days, lands first). Three layers:
+      (1) **EXPLAIN ANALYZE correctness:** curated query battery
+      (point lookup, full scan, join, aggregate, window, CTE);
+      assert "actual rows" + "actual time" match reality;
+      determinism across runs (no flapping above a tolerance).
+      (2) **View shape:** `pg_stat_activity` + `pg_locks` return
+      the expected columns + types vs PG reference; per-project
+      RLS enforced (other projects' rows not visible).
+      (3) **Real-tooling compat:** dockerised pgAdmin, DataGrip,
+      and pgcli connect to a Basin instance and complete the
+      following without errors: object browser populates, "Server
+      activity" pane populates from `pg_stat_activity`, "Locks"
+      pane populates from `pg_locks`.
+      Files: `tests/integration/tests/explain_analyze_battery.rs`,
+      `tests/integration/tests/admin_views_shape.rs`,
+      `tests/integration/tests/admin_view_tooling_compat.rs`,
+      `tests/integration/fixtures/pgadmin-compose.yml`,
+      `tests/integration/fixtures/datagrip-compose.yml` (or
+      headless pgcli script).
+      Acceptance: harness compiles + reports red.
+- [ ] **5.23.B — `EXPLAIN ANALYZE` verification + polish**
+      (~3 days). Audit every executor node for accurate
+      "actual rows" + "actual time" reporting; ensure parallel
+      plans aggregate correctly; buffer/I-O stats where measurable.
+      Files: `crates/basin-engine/src/executor.rs` (instrument).
+      Acceptance: EXPLAIN-correctness slice of 5.23.A flips green.
+- [ ] **5.23.C — `pg_stat_activity` view** (~3 days). Current
+      connections, queries in flight, wait events, client IP, app
+      name, query text (params redacted). Per-project RLS — a user
+      only sees their own project's activity. Files:
+      `crates/basin-engine/src/info_schema_provider.rs` (extend),
+      `crates/basin-engine/src/connection_registry.rs` (new — or
+      extend existing pool tracking).
+      Acceptance: pg_stat_activity slice of 5.23.A flips green.
+- [ ] **5.23.D — `pg_locks` view** (~3 days). Current lock holders +
+      waiters. Engine has single-writer-per-shard semantics so the
+      lock model is simple (writers serialise per partition);
+      surface that accurately. Files:
+      `crates/basin-engine/src/info_schema_provider.rs` (extend),
+      `crates/basin-shard/src/lock_registry.rs` (new).
+      Acceptance: pg_locks slice of 5.23.A flips green; tooling
+      compat slice (pgAdmin/DataGrip/pgcli) all flip green together.
+
+## Phase 5.24 — Range types + GIST-equivalent index (~2-3 weeks)
+
+`int4range`, `tsrange`, `daterange` etc. — booking apps, scheduling
+apps, "is X in range Y" queries. PG-idiomatic. Without ranges these
+apps reach for two separate `lower` + `upper` columns and lose the
+overlap-detection ergonomics.
+
+**Test-first.** Range-types semantics + ORM compat + scheduling
+integration harness lands first.
+
+- [ ] **5.24.A — Range types + ORM-compat + scheduling test harness**
+      (~1 week, lands first). Three layers:
+      (1) **Type round-trip:** all six range types
+      (`int4range`, `int8range`, `numrange`, `tsrange`, `tstzrange`,
+      `daterange`) round-trip through psql + binary pgwire;
+      inclusive/exclusive bounds (`[)`, `(]`, `[]`, `()`, `empty`)
+      preserved.
+      (2) **Operator semantics:** curated battery for every operator
+      (`@>`, `<@`, `&&`, `<<`, `>>`, `-|-`, `+`, `*`, `-`) verified
+      against a reference PG instance for equivalence; index-covered
+      shapes meet ≤ 10 ms p99 latency vs full-scan ≥ 200 ms on a
+      1M-row table.
+      (3) **ORM compat + scheduling integration:** Diesel's
+      range-type bindings, sqlx's `PgRange`, and Prisma's range
+      support — migration applies, CRUD round-trips, overlap
+      queries work via the ORM. Plus a booking-system schema
+      (rooms × time-ranges) with a no-overlap exclusion constraint
+      reproducing a golden conflict-rejection sequence.
+      Files: `tests/integration/tests/range_types_semantics.rs`,
+      `tests/integration/tests/range_orm_compat.rs`,
+      `tests/integration/tests/range_scheduling.rs`,
+      `benches/range_index.rs`.
+      Acceptance: harness compiles + reports red.
+- [ ] **5.24.B — Range type implementations** (~1 week).
+      `int4range`, `int8range`, `numrange`, `tsrange`, `tstzrange`,
+      `daterange`. Binary + text serialisation; Arrow representation
+      (struct of {lower, upper, lower_inc, upper_inc, empty}). Files:
+      `crates/basin-common/src/types/range.rs` (new),
+      `crates/basin-engine/src/types.rs` (register).
+      Acceptance: type-round-trip slice of 5.24.A flips green.
+- [ ] **5.24.C — Range operators** (~1 week). `@>`, `<@`, `&&`,
+      `<<`, `>>`, `-|-`, `+`, `*`, `-`. Files:
+      `crates/basin-engine/src/operators/range.rs` (new).
+      Acceptance: operator-semantics slice of 5.24.A flips green.
+- [ ] **5.24.D — GIST-equivalent index** (~1 week). True GIST is
+      a deep build; ship a simpler alternative: pre-sort + interval-
+      tree-style probe on a B-tree-of-(lower, upper) for the common
+      overlap / contains query shapes. Falls back to full scan for
+      uncovered query shapes (documented). Files:
+      `crates/basin-storage/src/index/interval.rs` (new).
+      Acceptance: index-latency slice of 5.24.A flips green
+      (1M-row range table; overlap ≤ 10 ms vs full-scan ≥ 200 ms).
+
+## Phase 5.25 — Migration-tool compat matrix (~3-5 days)
+
+Verification + docs sprint. Flyway / golang-migrate / Diesel /
+sqlx-migrate / Prisma should mostly "just work" via pgwire, but a
+tested matrix in `CAPABILITIES.md` closes a real adoption objection.
+
+**Test-first.** This whole phase is testing — but the shared
+harness scaffolds first so each tool's verification slots in
+consistently.
+
+- [ ] **5.25.A — Shared migration-tool test scaffold** (~1 day,
+      lands first). docker-compose fixture template + ephemeral
+      Basin instance launcher + result-comparison helpers
+      (introspection diff, ORM-query battery against the migrated
+      schema). Each per-tool task below plugs into this scaffold.
+      Files: `tests/integration/fixtures/migration-tool-scaffold/`,
+      `tests/integration/tests/migration_tool_common.rs`.
+      Acceptance: scaffold builds; a placeholder per-tool test
+      compiles + skips correctly until its real implementation
+      lands.
+- [ ] **5.25.B — Flyway compat** (~1 day). Run Flyway's standard
+      test migrations against Basin; document any gaps. Files:
+      `tests/integration/tests/migration_tool_flyway.rs`,
+      `CAPABILITIES.md` (row added).
+      Acceptance: a 10-migration Flyway project applies cleanly;
+      `flyway_schema_history` table populated correctly.
+- [ ] **5.25.C — golang-migrate compat** (~1 day).
+      `migrate up/down/version/force` against Basin. Files:
+      `tests/integration/tests/migration_tool_golang_migrate.rs`.
+- [ ] **5.25.D — Diesel compat** (CLI + ORM) (~1 day). `diesel
+      migration run`, `diesel migration revert`, `diesel migration
+      generate`; plus an ORM query battery against the migrated
+      schema (CRUD round-trip; JSONB column queries via Diesel's
+      `Jsonb` type). Files:
+      `tests/integration/tests/migration_tool_diesel.rs`.
+- [ ] **5.25.E — sqlx-migrate compat** (~1 day). `sqlx migrate run`,
+      `sqlx migrate revert`; plus a compile-time-checked-query
+      battery (`query!` / `query_as!` macros) against the migrated
+      schema. Files:
+      `tests/integration/tests/migration_tool_sqlx.rs`.
+- [ ] **5.25.F — Prisma migrate compat** (~1 day). This is the most
+      likely to find real gaps (Prisma introspects heavily); plus a
+      Prisma Client query battery against the migrated schema. Files:
+      `tests/integration/tests/migration_tool_prisma.rs`.
+- [ ] **5.25.G — `CAPABILITIES.md` migration-tool matrix row**
+      (~1 day). Table: tool × supported (yes/no/with-caveats) ×
+      caveats column × verified-on-version column. Generated from
+      the test results — never hand-edited; CI regenerates on every
+      green run.
 
 ## Phase 5.12 — Storage perf & Vortex (PR #161 / #162) — **shipped**
 
