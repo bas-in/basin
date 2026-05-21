@@ -1816,21 +1816,21 @@ impl sub-task flips a named slice green.
       Files: `tests/integration/tests/session_timeouts.rs`,
       `tests/integration/tests/session_timeouts_tooling.rs`.
       Acceptance: harness compiles + reports red.
-- [ ] **5.28.B — `lock_timeout` GUC + per-statement enforcement**
+- [~] **5.28.B — `lock_timeout` GUC + per-statement enforcement**
       (~1 day). Cooperative cancellation at the lock-acquisition
       boundary in `basin-shard` partition writers; SQLSTATE 55P03
       on expiry. Files: `crates/basin-shard/src/lock_wait.rs` (new),
       `crates/basin-engine/src/session.rs` (extend GUCs).
       Acceptance: closes the **`lock_timeout` fires + 55P03**
       slice of 5.28.A.
-- [ ] **5.28.C — `idle_in_transaction_session_timeout` GUC +
+- [~] **5.28.C — `idle_in_transaction_session_timeout` GUC +
       session reaper** (~1 day). Tokio timer per transaction; on
       expiry, cancel the session + roll back; SQLSTATE 25P03.
       Files: `crates/basin-engine/src/session.rs` (extend),
       `crates/basin-engine/src/session_reaper.rs` (new).
       Acceptance: closes the **idle-in-txn closes session** slice
       of 5.28.A.
-- [ ] **5.28.D — Tooling-compat slice green** (~1 day). psql /
+- [~] **5.28.D — Tooling-compat slice green** (~1 day). psql /
       DBeaver / pgcli pre-flight probes (`SHOW lock_timeout`, etc.)
       return PG-shape values; tool-driven `SET` lands cleanly.
       Files: `crates/basin-engine/src/guc.rs` (extend).
@@ -1945,25 +1945,25 @@ green.
       `tests/integration/tests/citext_unique.rs`,
       `tests/integration/tests/citext_orm_compat.rs`.
       Acceptance: harness compiles + reports red.
-- [ ] **5.30.B — `citext` type** (~1 day). Catalog type
+- [~] **5.30.B — `citext` type** (~1 day). Catalog type
       registration; binary + text serialisation; Arrow
       representation. Files:
       `crates/basin-common/src/types/citext.rs` (new),
       `crates/basin-engine/src/types.rs` (register).
       Acceptance: closes the **type round-trip** slice of 5.30.A.
-- [ ] **5.30.C — Comparison operators** (~1 day). `=`, `<>`, `<`,
+- [~] **5.30.C — Comparison operators** (~1 day). `=`, `<>`, `<`,
       `<=`, `>`, `>=` with case-folded semantics; integrates with
       planner so ORDER BY on citext respects fold.
       Files: `crates/basin-engine/src/operators/citext_cmp.rs` (new).
       Acceptance: closes the **comparison semantics** slice of 5.30.A.
-- [ ] **5.30.D — UNIQUE on citext column** (~half day).
+- [~] **5.30.D — UNIQUE on citext column** (~half day).
       Case-folded at index time so UNIQUE rejects equivalents;
       performant at 100k rows. Files:
       `crates/basin-storage/src/index/btree_citext.rs` (new or
       extend).
       Acceptance: closes the **unique-constraint case-insensitivity**
       slice of 5.30.A.
-- [ ] **5.30.E — ORM compat + CAPABILITIES row** (~half day).
+- [~] **5.30.E — ORM compat + CAPABILITIES row** (~half day).
       Diesel + Prisma + sqlx slice closed; CAPABILITIES.md citext
       row marked shipped with the "no `CREATE EXTENSION citext;`
       needed — always available" note.
