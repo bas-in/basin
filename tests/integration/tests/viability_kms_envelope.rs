@@ -1,12 +1,19 @@
 //! Viability test: BYO-key envelope-encryption hooks.
 //!
 //! Card: `viability_kms_envelope`
-//! Bar: with a `MockProvider` attached, written Parquet bodies are NOT
-//! the same bytes as a plaintext write of the same batch (encryption is
-//! actually happening), the `<key>.wrapped` sidecar is present, and a
+//! Bar: with a `MockProvider` attached, written data-file bodies (Parquet
+//! OR Vortex — whichever codec the default `WriteOptions` selects) are
+//! NOT the same bytes as a plaintext write of the same batch (encryption
+//! is actually happening), the `<key>.wrapped` sidecar is present, and a
 //! read on the encrypted `Storage` returns the original rows. Detaching
 //! the provider (== fresh Storage with no provider) preserves backwards
 //! compatibility on plaintext files.
+//!
+//! The envelope layer in `basin-storage::writer` runs on the encoded
+//! bytes *after* format selection, so Parquet and Vortex receive the
+//! same nonce-prefixed AES-GCM treatment and the same `.wrapped`
+//! sidecar; this test asserts the layout in a format-agnostic way so
+//! flipping `FileFormat::default` does not break the gate.
 //!
 //! This is the load-bearing integration test for the
 //! `EncryptionProvider` trait shipped in basin-storage. External KMS
@@ -89,7 +96,25 @@ fn first_file_with_suffix(root: &std::path::Path, suffix: &str) -> Option<std::p
     None
 }
 
-#[ignore = "Misc: KMS envelope encryption not yet wired — plaintext parquet exists after write — blocked on #40 cluster"]
+/// Return the first body file in `root` written by `Storage::write_batch` —
+/// either `.parquet` or `.vortex` depending on the active default file
+/// format. The envelope-encryption layer in `basin-storage::writer` runs on
+/// the encoded bytes after format selection, so both codecs receive the
+/// same sidecar treatment; this helper lets the test assert the layout
+/// without caring which codec is in force.
+fn first_body_file(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    first_file_with_suffix(root, ".parquet").or_else(|| first_file_with_suffix(root, ".vortex"))
+}
+
+/// Return the sidecar for a given body path — `<body>.wrapped` — written
+/// by the writer alongside the envelope-encrypted body. Same format-
+/// agnostic suffix the writer derives via `wrapped_sidecar_key`.
+fn sidecar_for(body_path: &std::path::Path) -> std::path::PathBuf {
+    let mut s = body_path.as_os_str().to_owned();
+    s.push(".wrapped");
+    std::path::PathBuf::from(s)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn viability_kms_envelope() {
     basin_common::telemetry::try_init_for_tests();
@@ -114,16 +139,25 @@ async fn viability_kms_envelope() {
         .write_batch(&project, &table, &part, &batch)
         .await
         .expect("plain write");
-    let plain_path =
-        first_file_with_suffix(plain_dir.path(), ".parquet").expect("plaintext parquet exists");
+    let plain_path = first_body_file(plain_dir.path()).expect("plaintext body exists");
     let plain_bytes = std::fs::read(&plain_path).unwrap();
-    // Must start with the Parquet magic. Sanity that we wrote a real
-    // Parquet file in the no-provider path.
-    assert_eq!(
-        &plain_bytes[..4],
-        b"PAR1",
-        "plaintext path lost Parquet magic — check writer is unchanged when no provider attached"
-    );
+    // Format-specific sanity check on the plaintext body. Parquet uses
+    // `PAR1` magic; Vortex blobs are self-describing and start with a
+    // length-prefixed sequence, so for the Vortex default we only assert
+    // the bytes are non-empty (the byte-difference check vs. the
+    // encrypted body below is the load-bearing assertion).
+    if plain_path.extension().and_then(|s| s.to_str()) == Some("parquet") {
+        assert_eq!(
+            &plain_bytes[..4],
+            b"PAR1",
+            "plaintext path lost Parquet magic — check writer is unchanged when no provider attached"
+        );
+    } else {
+        assert!(
+            !plain_bytes.is_empty(),
+            "plaintext Vortex body must not be empty"
+        );
+    }
 
     // ---- 2. Encrypted run. Same batch, provider attached. ---------
     let enc_dir = TempDir::new().unwrap();
@@ -142,9 +176,10 @@ async fn viability_kms_envelope() {
         .expect("encrypted write");
 
     // Body file exists and is NOT plaintext bytes.
-    let enc_path =
-        first_file_with_suffix(enc_dir.path(), ".parquet").expect("encrypted parquet path exists");
+    let enc_path = first_body_file(enc_dir.path()).expect("encrypted body path exists");
     let enc_bytes = std::fs::read(&enc_path).unwrap();
+    // The envelope is `nonce(12) || AES-GCM ciphertext`, so it cannot
+    // start with either of the known plaintext format magics.
     assert_ne!(
         &enc_bytes[..4.min(enc_bytes.len())],
         b"PAR1",
@@ -155,9 +190,14 @@ async fn viability_kms_envelope() {
         "encrypted body must not match the plaintext bytes"
     );
 
-    // Sidecar exists at <key>.wrapped.
-    let sidecar_path = first_file_with_suffix(enc_dir.path(), ".parquet.wrapped")
-        .expect("sidecar `<key>.parquet.wrapped` exists");
+    // Sidecar exists at `<body>.wrapped` (e.g. `<ulid>.vortex.wrapped` or
+    // `<ulid>.parquet.wrapped`), matching `writer::wrapped_sidecar_key`.
+    let sidecar_path = sidecar_for(&enc_path);
+    assert!(
+        sidecar_path.exists(),
+        "sidecar `{}` must exist alongside encrypted body",
+        sidecar_path.display()
+    );
     let sidecar_bytes = std::fs::read(&sidecar_path).unwrap();
     assert!(
         !sidecar_bytes.is_empty(),
@@ -166,7 +206,8 @@ async fn viability_kms_envelope() {
 
     // ---- 3. Round-trip read on the encrypted Storage returns the
     // input rows. The reader transparently fetches the sidecar,
-    // unwraps, AES-GCM-decrypts, and decodes Parquet.
+    // unwraps, AES-GCM-decrypts, and decodes the body (Parquet or
+    // Vortex — `read_one` dispatches on the file extension).
     let stream = storage
         .read(&project, &table, ReadOptions::default())
         .await
@@ -254,7 +295,10 @@ async fn viability_kms_envelope() {
     let mut s = raw.list(None);
     while let Some(meta) = s.next().await {
         let m = meta.unwrap();
-        if m.location.as_ref().ends_with(".parquet.wrapped") {
+        // Format-agnostic: writer derives the sidecar via
+        // `wrapped_sidecar_key(body) = "<body>.wrapped"` regardless of
+        // whether the body is `.parquet` or `.vortex`.
+        if m.location.as_ref().ends_with(".wrapped") {
             found_sidecar = true;
             break;
         }
