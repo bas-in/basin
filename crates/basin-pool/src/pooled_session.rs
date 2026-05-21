@@ -1,5 +1,25 @@
 //! [`PooledSession`] — RAII handle that returns its session to the pool
 //! when dropped.
+//!
+//! ## Scrub-on-checkout (Session mode)
+//!
+//! Per-session state accumulated during a checkout (GUCs, cursors, LISTEN
+//! subscriptions) must not bleed into the next logical client.  In
+//! [`PoolMode::Session`] the physical session is reused across checkouts, so
+//! we apply the DISCARD-ALL scrub sequence **at checkout time** (in
+//! [`SessionPool::acquire`]) rather than at return time.  Scrubbing on
+//! checkout rather than on return has two advantages:
+//!
+//! 1. `Drop` stays synchronous — we return the session to the idle queue
+//!    immediately (preserving the try_lock fast path and the
+//!    `hit_then_release_then_hit` test invariant).
+//! 2. A session that is evicted from the idle queue while waiting is not
+//!    scrubbed unnecessarily.
+//!
+//! The caller of [`build`] is responsible for calling
+//! [`crate::return_scrub::scrub_session_for_pool_return`] before handing the
+//! session to the logical client when the session came from the idle cache
+//! (cache hit path in [`SessionPool::acquire`]).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -81,6 +101,11 @@ impl Drop for PooledSession {
         }
 
         // Session mode: return the session to the idle cache as before.
+        //
+        // The DISCARD-ALL scrub is applied on the *checkout* side (in
+        // `SessionPool::acquire`, on a cache hit) rather than here, so that
+        // `Drop` can stay synchronous and the try_lock fast path is preserved.
+        // See the module-level doc for the rationale.
         let mut entry = entry;
         entry.last_used = Instant::now();
 

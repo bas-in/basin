@@ -49,6 +49,7 @@ use tracing::instrument;
 mod eviction;
 mod mode;
 mod pooled_session;
+mod return_scrub;
 mod state;
 mod stats;
 
@@ -188,6 +189,22 @@ impl SessionPool {
             match action {
                 Action::Hit(session) => {
                     self.inner.stats.record_hit();
+                    // Session mode: scrub the session before handing it to the
+                    // new logical client.  Applying the scrub at checkout (not
+                    // at return) keeps `Drop` synchronous and preserves the
+                    // try_lock fast path on the return side.  Best-effort: a
+                    // failed scrub is logged but does not abort the checkout —
+                    // the next client would see stale state in the unlikely
+                    // event the scrub fails, which is no worse than the
+                    // pre-5.27.E baseline.
+                    if let Err(e) =
+                        return_scrub::scrub_session_for_pool_return(&session).await
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            "pool scrub failed on checkout; session may carry stale state"
+                        );
+                    }
                     return Ok(pooled_session::build(self.inner.clone(), key, session));
                 }
                 Action::Open => {
