@@ -2097,6 +2097,13 @@ impl Catalog for PostgresCatalog {
             return_type,
             body,
             language,
+            // Phase 5.11.W6: postgres backend pre-dates the version /
+            // source columns. Default version to 1 (the lowest value
+            // `register_sql_function` ever stores) so lookups round-trip
+            // through the new shape; `source` is `None` because we
+            // haven't persisted it server-side yet (followup work).
+            version: 1,
+            source: None,
         })
     }
 
@@ -2137,6 +2144,9 @@ impl Catalog for PostgresCatalog {
                     return_type,
                     body,
                     language,
+                    // See lookup_sql_function for the version/source rationale.
+                    version: 1,
+                    source: None,
                 })
             })
             .collect()
@@ -4604,6 +4614,11 @@ mod tests {
             return_type: SqlReturnType::Scalar(SqlArgType::BigInt),
             body: "SELECT x * 2".into(),
             language: SqlFunctionLanguage::Sql,
+            // Postgres backend doesn't persist these yet; the lookup
+            // path returns version=1, source=None — match here so the
+            // round-trip equality holds.
+            version: 1,
+            source: None,
         };
         cat.register_sql_function(def.clone()).await.unwrap();
         let got = cat.lookup_sql_function(&t, "double_it").await.unwrap();

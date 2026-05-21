@@ -184,6 +184,8 @@ async fn generated_column_with_user_function() {
         return_type: SqlReturnType::Scalar(SqlArgType::BigInt),
         body: "SELECT x * 2".to_string(),
         language: SqlFunctionLanguage::Sql,
+        version: 1,
+        source: None,
     };
     catalog.register_sql_function(def).await.unwrap();
 

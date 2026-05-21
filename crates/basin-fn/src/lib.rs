@@ -42,6 +42,8 @@ pub mod engine;
 pub mod handler;
 #[cfg(feature = "component-model")]
 pub mod governance;
+#[cfg(feature = "component-model")]
+pub mod runtime;
 
 #[cfg(feature = "component-model")]
 pub use harness::ComponentHarness;

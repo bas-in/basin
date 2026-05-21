@@ -1301,6 +1301,8 @@ mod tests {
             return_type: SqlReturnType::Scalar(SqlArgType::BigInt),
             body: body.into(),
             language: SqlFunctionLanguage::Sql,
+            version: 1,
+            source: None,
         }
     }
 

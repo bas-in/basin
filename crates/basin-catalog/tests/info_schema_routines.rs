@@ -52,6 +52,8 @@ fn make_func(
         return_type: SqlReturnType::Scalar(ret),
         body: body.to_string(),
         language: SqlFunctionLanguage::Sql,
+        version: 1,
+        source: None,
     }
 }
 

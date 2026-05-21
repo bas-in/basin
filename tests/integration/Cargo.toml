@@ -67,6 +67,10 @@ uuid.workspace = true
 # `wat` is already a transitive dep of `wasmtime` (enabled by default).
 wat = "1"
 base64.workspace = true
+# Phase 5.11.W6: fn_javascript test exercises the basin-fn host trait
+# (FunctionHost / QueryExecutor) against a real engine session to verify
+# auth.uid() resolves to the caller's JWT sub inside a function.
+basin-fn.workspace = true
 
 [lib]
 path = "src/lib.rs"

@@ -19,9 +19,13 @@ use basin_common::ProjectId;
 
 /// Implementation language for a user-defined function. `Sql` is the v0.1
 /// shipping variant; `Wasm` is the Phase 5.11.J addition — the escape hatch
-/// for the ~5 % of cases `LANGUAGE sql` can't express. New variants are
-/// additive; historic serialised payloads that pre-date this field
-/// deserialise to `Sql` via the `#[default]` on this enum.
+/// for the ~5 % of cases `LANGUAGE sql` can't express. `Javascript`
+/// (Phase 5.11.W6) is **sugar over `Wasm`**: the body is a compiled
+/// WebAssembly **component** produced client-side by ComponentizeJS / Javy
+/// (see `basin functions deploy`); the engine stores the compiled bytes
+/// and the source side-by-side. New variants are additive; historic
+/// serialised payloads that pre-date a field deserialise to whatever
+/// default the enum / struct provides.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SqlFunctionLanguage {
@@ -33,6 +37,15 @@ pub enum SqlFunctionLanguage {
     /// with a CPU-epoch budget (default 100 ms) and a linear-memory cap
     /// (default 16 MiB). Sandboxed by construction via `wasmtime`.
     Wasm,
+    /// `LANGUAGE javascript` (Phase 5.11.W6) — sugar over `Wasm`. Body is
+    /// a base64-encoded Wasm **component** (component-model format),
+    /// compiled client-side from JS by ComponentizeJS / Javy. The engine
+    /// stores the compiled bytes verbatim; invocation flows through
+    /// `basin-fn`'s [`ComponentHarness`] rather than the bare-module
+    /// scalar-UDF path used by `Wasm`. JavaScript functions are
+    /// **request-style** (not DataFusion scalar UDFs) — see
+    /// `basin-fn::runtime::FunctionRuntime`.
+    Javascript,
 }
 
 /// Argument type. Mirrors the scalar types the engine already understands;
@@ -78,9 +91,8 @@ pub enum SqlReturnType {
     Table(Vec<(String, SqlArgType)>),
 }
 
-/// Catalog row for a user-defined `LANGUAGE sql` function. Stored
-/// per-project; two projects registering the same function name are
-/// independent rows.
+/// Catalog row for a user-defined function. Stored per-project; two
+/// projects registering the same function name are independent rows.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SqlFunctionDef {
     pub project: ProjectId,
@@ -89,9 +101,37 @@ pub struct SqlFunctionDef {
     pub name: String,
     pub args: Vec<SqlFunctionArg>,
     pub return_type: SqlReturnType,
-    /// Raw SQL of the function body. Validated at registration to parse
-    /// as a single `SELECT` statement; stored verbatim so the engine
-    /// inliner reparses on demand (no AST-level Serialize round-trip).
+    /// Body text. The interpretation depends on `language`:
+    /// * `Sql` — a single SQL `SELECT` statement (validated at registration).
+    /// * `Wasm` — base64-encoded WebAssembly module bytes (core module).
+    /// * `Javascript` — base64-encoded Wasm **component** bytes, compiled
+    ///   client-side from JS by ComponentizeJS / Javy. The original source
+    ///   text travels in [`Self::source`] for `EXPLAIN` / debugging.
     pub body: String,
     pub language: SqlFunctionLanguage,
+    /// Monotonically-increasing revision counter. Bumped on every
+    /// `CREATE OR REPLACE FUNCTION` so callers can detect a redeploy
+    /// (e.g. CDN invalidation, stale-component eviction in the runtime
+    /// registry). Starts at `1`; historic serialised payloads that
+    /// pre-date this field deserialise to `1` via [`default_one`] (so a
+    /// migrated row looks like a fresh first registration rather than a
+    /// nonsensical version `0`).
+    #[serde(default = "default_one")]
+    pub version: i32,
+    /// Original source text for languages that compile through an
+    /// intermediate format (currently `Javascript` → Wasm component).
+    /// `None` for `Sql` and `Wasm` (whose `body` is already the canonical
+    /// representation). Stored for `EXPLAIN FUNCTION` and for the
+    /// `basin functions deploy` redeploy diff. Historic serialised
+    /// payloads default to `None`.
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// Serde default helper — version is `1` for newly-created functions and
+/// for pre-existing serialised rows that lack the field (so a migrated
+/// row reads as a fresh first registration). The next
+/// `register_sql_function` REPLACE bumps it to `2`.
+fn default_one() -> i32 {
+    1
 }

@@ -61,16 +61,25 @@ pub(crate) async fn exec_create_function(
         ));
     }
     let lang = language.as_ref().map(|l| l.value.as_str()).unwrap_or("");
-    // Determine language: sql or wasm are accepted; everything else is rejected.
+    // Determine language: sql / wasm / javascript are accepted; everything
+    // else is rejected. `javascript` is sugar over `wasm` — `basin functions
+    // deploy` compiles the source client-side via ComponentizeJS / Javy and
+    // uploads a Wasm component (base64-encoded). The engine never invokes a
+    // JS compiler; it stores the bytes verbatim and the runtime registry
+    // (basin-fn) executes them.
     let fn_lang = if lang.eq_ignore_ascii_case("sql") {
         SqlFunctionLanguage::Sql
     } else if lang.eq_ignore_ascii_case("wasm") {
         SqlFunctionLanguage::Wasm
+    } else if lang.eq_ignore_ascii_case("javascript")
+        || lang.eq_ignore_ascii_case("js")
+    {
+        SqlFunctionLanguage::Javascript
     } else {
         return Err(BasinError::InvalidSchema(format!(
-            "CREATE FUNCTION: only LANGUAGE sql and LANGUAGE wasm are supported \
-             (got LANGUAGE {lang:?}); SQLSTATE 0A000 feature_not_supported. \
-             PL/pgSQL is out of scope per \
+            "CREATE FUNCTION: only LANGUAGE sql, LANGUAGE wasm, and LANGUAGE \
+             javascript are supported (got LANGUAGE {lang:?}); SQLSTATE 0A000 \
+             feature_not_supported. PL/pgSQL is out of scope per \
              docs/decisions/0012-change-event-primitive.md"
         )));
     };
@@ -111,6 +120,16 @@ pub(crate) async fn exec_create_function(
     if fn_lang == SqlFunctionLanguage::Wasm {
         crate::wasm_udf::validate_wasm_body(&fn_name, &body_text)?;
     }
+    // For JS UDFs, validate the body is non-empty base64. We deliberately
+    // skip the wasm-component parse here because that would force the
+    // engine to load wasmtime's component-model bindings just to register
+    // a function (basin-fn holds those; this crate doesn't depend on it).
+    // The runtime registry (`basin-fn::runtime::FunctionRuntime`) compiles
+    // and instantiates the component on first invocation and surfaces
+    // structural errors there.
+    if fn_lang == SqlFunctionLanguage::Javascript {
+        validate_javascript_body(&fn_name, &body_text)?;
+    }
 
     let def = SqlFunctionDef {
         project: sess.project,
@@ -119,6 +138,14 @@ pub(crate) async fn exec_create_function(
         return_type: parsed_return,
         body: body_text,
         language: fn_lang,
+        // `version` is bumped by the catalog on REPLACE; first-registration
+        // value of 1 lets the runtime registry treat absence-of-cache and
+        // version-1 identically.
+        version: 1,
+        // `source` is populated by the CLI deploy path (which knows the
+        // original .js text); the SQL surface here only sees the compiled
+        // Wasm component, so source stays `None`.
+        source: None,
     };
 
     // SQL UDFs go through the full inliner-safety validation (recursion check,
@@ -212,17 +239,24 @@ pub(crate) async fn exec_alter_function_rename(
             "ALTER FUNCTION RENAME: target name {new_name:?} already exists"
         )));
     }
-    let is_wasm = existing.language == SqlFunctionLanguage::Wasm;
+    // Opaque-body languages (Wasm, Javascript) skip the SQL-body parse
+    // inside `validate_for_registration` and the inliner mutual-recursion
+    // walk — neither is meaningful when the body is base64 bytes.
+    let is_opaque = matches!(
+        existing.language,
+        SqlFunctionLanguage::Wasm | SqlFunctionLanguage::Javascript
+    );
     let renamed = SqlFunctionDef {
         name: new_name.to_string(),
         ..existing
     };
-    // SQL UDFs go through the inliner-safety validator; WASM UDFs are opaque
-    // blobs and only need the identifier / reserved-name checks from
-    // `validate_for_registration` — but since that function also verifies the
-    // body is a valid SELECT (which WASM bodies are not), we skip it entirely
-    // for WASM and only do the mutual-recursion pass for SQL.
-    let validated = if is_wasm {
+    // SQL UDFs go through the inliner-safety validator; opaque-body UDFs
+    // only need the identifier / reserved-name checks from
+    // `validate_for_registration` — but since that function also verifies
+    // the body is a valid SELECT (which Wasm / JS bodies are not), we skip
+    // it entirely for opaque languages and only do the mutual-recursion
+    // pass for SQL.
+    let validated = if is_opaque {
         renamed
     } else {
         validate_for_registration(renamed)?
@@ -230,7 +264,7 @@ pub(crate) async fn exec_alter_function_rename(
     // Treat the rename as if registering `new_name` against the post-
     // rename catalog: skip both the old name (about to be dropped) and
     // the new name (replaced by `validated`).
-    if !is_wasm {
+    if !is_opaque {
         let mut existing_map =
             collect_project_function_map(&catalog, &sess.project, new_name).await;
         existing_map.remove(&old_name.to_ascii_lowercase());
@@ -501,6 +535,44 @@ fn extract_body_text(body: &Option<CreateFunctionBody>, fn_name: &str) -> Result
              forms are not supported in v0.1; use `AS $$ SELECT <expr> $$`"
         ))),
     }
+}
+
+/// Validate the body of a `LANGUAGE javascript` registration. The CLI
+/// (`basin functions deploy`) compiles the user's JS source through
+/// ComponentizeJS / Javy and uploads a Wasm **component** (base64-encoded).
+/// This check is intentionally light: we decode the base64 and assert the
+/// payload is non-empty. The full component-model parse + instantiation
+/// happens in `basin-fn::runtime::FunctionRuntime` on first invocation, so
+/// the engine doesn't need to pull in wasmtime's component bindings just
+/// to register a function.
+fn validate_javascript_body(fn_name: &str, body_b64: &str) -> Result<()> {
+    use base64::Engine as Base64Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(body_b64.trim())
+        .map_err(|e| {
+            BasinError::InvalidSchema(format!(
+                "CREATE FUNCTION {fn_name}: LANGUAGE javascript body is not valid \
+                 base64 (expected a base64-encoded Wasm component produced by \
+                 `basin functions deploy`): {e}"
+            ))
+        })?;
+    if bytes.is_empty() {
+        return Err(BasinError::InvalidSchema(format!(
+            "CREATE FUNCTION {fn_name}: LANGUAGE javascript body decoded to zero \
+             bytes; expected a compiled Wasm component"
+        )));
+    }
+    // Lightweight magic-number check: Wasm components and Wasm modules
+    // both start with `\0asm` (0x00 0x61 0x73 0x6D). Anything else is
+    // certainly not a JS-compiled-to-Wasm artefact.
+    if bytes.len() < 4 || &bytes[0..4] != b"\0asm" {
+        return Err(BasinError::InvalidSchema(format!(
+            "CREATE FUNCTION {fn_name}: LANGUAGE javascript body does not start \
+             with the Wasm magic bytes (\\0asm); ensure the upload is the \
+             ComponentizeJS / Javy output, not the raw JS source"
+        )));
+    }
+    Ok(())
 }
 
 /// Pull a bare-identifier function name out of an `ObjectName`. Schema-

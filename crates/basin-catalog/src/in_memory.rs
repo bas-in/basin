@@ -713,9 +713,16 @@ impl Catalog for InMemoryCatalog {
     }
 
     #[instrument(skip(self, def), fields(project = %def.project, name = %def.name))]
-    async fn register_sql_function(&self, def: SqlFunctionDef) -> Result<()> {
+    async fn register_sql_function(&self, mut def: SqlFunctionDef) -> Result<()> {
         let key = (def.project, def.name.clone());
         let mut map = self.sql_functions.lock().await;
+        // Phase 5.11.W6: bump `version` on REPLACE so callers (CDN
+        // invalidator, basin-fn runtime cache) can detect redeploys
+        // without diffing the body bytes. First registration keeps the
+        // caller-supplied version (defaults to `1`).
+        if let Some(existing) = map.get(&key) {
+            def.version = existing.version.saturating_add(1);
+        }
         map.insert(key, def);
         Ok(())
     }

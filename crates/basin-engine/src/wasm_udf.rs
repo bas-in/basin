@@ -697,6 +697,8 @@ mod tests {
             return_type: SqlReturnType::Scalar(SqlArgType::Int),
             body: body_b64,
             language: SqlFunctionLanguage::Wasm,
+            version: 1,
+            source: None,
         };
 
         let udf = make_wasm_scalar_udf(&def).expect("should produce a ScalarUDF");
@@ -721,6 +723,8 @@ mod tests {
             return_type: SqlReturnType::Scalar(SqlArgType::BigInt),
             body: body_b64,
             language: SqlFunctionLanguage::Wasm,
+            version: 1,
+            source: None,
         };
 
         let udf = make_wasm_scalar_udf(&def).expect("should produce a ScalarUDF");
