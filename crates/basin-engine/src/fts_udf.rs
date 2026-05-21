@@ -6,11 +6,11 @@
 //!   *canonical text form* (lexemes sorted with positions for a tsvector;
 //!   `&`/`|`/`!`/`<->` boolean tree for a tsquery).  Type mapping lives in
 //!   `types.rs` / `ddl.rs`.
-//! - **`to_tsvector([config,] text)`** — tokenises on non-alphanumeric runs,
-//!   lowercases, drops a small fixed English stopword set (see
-//!   [`STOPWORDS`]), assigns 1-based positions, and emits the PG canonical
-//!   sorted form `'fox':2 'quick':1`.  **No stemming** — PG would map
-//!   `running -> run`; we deliberately do NOT (documented, honest).
+//! - **`to_tsvector([config,] text)`** — tokenises on non-alphanumeric runs
+//!   (preserving digit-hyphen-digit sequences), lowercases, strips English
+//!   possessives (`'s`), drops the Basin English stopword set (see
+//!   [`STOPWORDS`]), **stems with Snowball English** (Phase 5.20.C), assigns
+//!   1-based positions, and emits the PG canonical sorted form.
 //! - **`to_tsquery([config,] text)`** — parses `&` `|` `!` and the phrase
 //!   operator `<->` (and `<N>` distance) into a boolean tree; emits the PG
 //!   canonical form with minimal parentheses.
@@ -34,13 +34,12 @@
 //!
 //! # What is OUT of scope (honestly unsupported — NOT faked)
 //!
-//! - Word **stemming / lemmatisation** (`running` stays `running`).
-//! - **`ts_headline`** (returns the body unchanged — a stub, not a real
-//!   snippet generator).
+//! - **`ts_headline`** (returns the body with matched terms wrapped in
+//!   `<b>…</b>` — not PG's cover-density fragment selection).
 //! - **Weighted vectors** (`setweight`, A–D weight classes / `:1A`).
 //! - **`ts_rank_cd` cover density** (we reuse the simplified `ts_rank`).
 //! - **Language configs** beyond `english` / `simple` (the config arg is
-//!   accepted and otherwise ignored; only stopword on/off differs).
+//!   accepted; only `simple` changes behaviour — no stemming, no stopwords).
 //! - **`websearch_to_tsquery`** (best-effort: treated like `plainto`).
 //! - Real **GIN index acceleration** (`CREATE INDEX ... USING gin` is a
 //!   no-op; `@@` always uses a sequential scan — correct, just not fast).
@@ -65,19 +64,44 @@ use datafusion::logical_expr::{
     Volatility,
 };
 use datafusion::prelude::SessionContext;
+use rust_stemmers::{Algorithm, Stemmer};
 
 // ===========================================================================
 // Stopwords
 // ===========================================================================
 
-/// Small, fixed English stopword list (~30 words).  Postgres' real
-/// `english` dictionary has 127 entries; we use a defensible common subset.
-/// Only `english` (default / unknown configs) drops stopwords; `simple`
-/// keeps every token.  This list is documented and stable.
+/// English stopword list (~127 words).  Mirrors the Snowball project's
+/// English stopword list, which is what PostgreSQL's `english` text search
+/// configuration ships with.  Only `english` (default / unknown configs)
+/// drops stopwords; `simple` keeps every token.
+///
+/// **Must remain sorted** (ASCII lexicographic order, `binary_search` used
+/// for O(log n) lookup).  No contractions (apostrophe tokens are never
+/// produced by `tokenize()`, so contractions would be unreachable anyway).
 pub(crate) const STOPWORDS: &[&str] = &[
-    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in", "into", "is", "it",
-    "no", "not", "of", "on", "or", "such", "that", "the", "their", "then", "there", "these",
-    "they", "this", "to", "was", "will", "with",
+    "a", "about", "above", "after", "again", "against", "all", "am", "an", "and",
+    "any", "are", "as", "at",
+    "be", "because", "been", "before", "being", "below", "between", "both", "but", "by",
+    "cannot", "could",
+    "did", "do", "does", "doing", "down", "during",
+    "each",
+    "few", "for", "from", "further",
+    "get", "got",
+    "had", "has", "have", "having", "he", "her", "here", "hers", "herself", "him",
+    "himself", "his", "how",
+    "i", "if", "in", "into", "is", "it", "its", "itself",
+    "just",
+    "me", "more", "most", "my", "myself",
+    "no", "nor", "not",
+    "of", "off", "on", "once", "only", "or", "other", "our", "ours", "ourselves", "out", "over", "own",
+    "s", "same", "she", "should", "so", "some", "such",
+    "than", "that", "the", "their", "theirs", "them", "themselves", "then", "there", "these",
+    "they", "this", "those", "through", "to", "too",
+    "under", "until", "up",
+    "very",
+    "was", "we", "were", "what", "when", "where", "which", "while", "who", "whom", "why",
+    "will", "with", "would",
+    "you", "your", "yours", "yourself", "yourselves",
 ];
 
 fn is_stopword(w: &str) -> bool {
@@ -96,17 +120,137 @@ fn config_drops_stopwords(config: Option<&str>) -> bool {
 }
 
 // ===========================================================================
+// Language registry + stemming (Phase 5.20.C)
+// ===========================================================================
+
+/// Language-specific stemming algorithm. Currently only `English` (Snowball)
+/// is implemented; the registry is pluggable for future additions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FtsLanguage {
+    /// Snowball English (Porter2) — the default for `to_tsvector('english', …)`.
+    English,
+    /// Simple: no stemming, no stopword removal.
+    Simple,
+}
+
+impl FtsLanguage {
+    /// Select the language from a PG text-search config name. Unknown configs
+    /// fall back to `English` (matching PG's behaviour of using the default
+    /// dictionary for unrecognised configs).
+    pub(crate) fn from_config(config: Option<&str>) -> Self {
+        match config {
+            Some(c) if c.eq_ignore_ascii_case("simple") => FtsLanguage::Simple,
+            _ => FtsLanguage::English,
+        }
+    }
+}
+
+/// Apply the Snowball English (Porter2) stemmer to a single lowercase token.
+/// Returns the stemmed form (which may be identical to the input).
+///
+/// The stemmer is constructed on each call; the Stemmer struct from
+/// `rust-stemmers` is `!Send` so we can't cache a thread-local cheaply
+/// across different call sites. Performance-wise construction is O(1)
+/// (just a vtable pointer).
+fn stem_english(token: &str) -> String {
+    let stemmer = Stemmer::create(Algorithm::English);
+    stemmer.stem(token).into_owned()
+}
+
+/// Stem a token using the given language. For `Simple`, stemming is a no-op.
+fn stem_token(token: &str, lang: FtsLanguage) -> String {
+    match lang {
+        FtsLanguage::English => stem_english(token),
+        FtsLanguage::Simple => token.to_owned(),
+    }
+}
+
+// ===========================================================================
 // Tokenisation
 // ===========================================================================
 
-/// Split `text` into lowercase alphanumeric tokens.  Tokenisation boundary
-/// is any run of non-alphanumeric characters.  **No stemming** (explicitly
-/// out of scope — PG would stem `running -> run`; we keep `running`).
+/// Tokenise `text` into lowercase tokens for the tsvector document builder.
+///
+/// Rules (matching Basin's documented FTS tokenization — a practical subset
+/// of PG's parser behaviour):
+///
+/// 1. Split on any non-alphanumeric character, **except** a hyphen that sits
+///    between two digit characters (e.g. `2024-01-15` stays as one token).
+/// 2. Strip the English possessive suffix `'s` from word-final position
+///    (e.g. `John's` → `John`).  The stripped `s` does NOT emit a separate
+///    token (Basin documents this as a minor divergence from PG's possessive
+///    handling; the position counter is not advanced for the elided suffix).
+/// 3. Lowercase every token via Unicode rules.
+/// 4. Discard tokens that are empty after normalization.
+///
+/// Stemming is applied separately (in `from_text_document`) after stopword
+/// filtering, so this function returns the post-possessive-strip lowercase
+/// tokens without stemming.
 fn tokenize(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_lowercase())
-        .collect()
+    let mut tokens = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut i = 0usize;
+
+    while i < len {
+        // Skip non-alphanumeric chars (token separators).
+        if !chars[i].is_alphanumeric() {
+            i += 1;
+            continue;
+        }
+
+        // Collect an alphanumeric run, but allow hyphen between digits.
+        let start = i;
+        let mut buf = String::new();
+        while i < len {
+            let c = chars[i];
+            if c.is_alphanumeric() {
+                buf.push(c);
+                i += 1;
+            } else if c == '-'
+                && i + 1 < len
+                && chars[i - 1].is_ascii_digit()
+                && chars[i + 1].is_ascii_digit()
+            {
+                // Digit-hyphen-digit: keep hyphen as part of the token
+                // (e.g. date literals like 2024-01-15).
+                buf.push(c);
+                i += 1;
+            } else {
+                break;
+            }
+        }
+
+        if buf.is_empty() {
+            // Shouldn't happen given the outer guard, but be safe.
+            i = i.max(start + 1);
+            continue;
+        }
+
+        // Strip English possessive suffix `'s` (case-insensitive).
+        // We look at the character immediately after `buf` ends: if the
+        // source has `'s` (apostrophe + s + non-alphanumeric or EOS) right
+        // after our token, consume those chars and don't add them to the
+        // token. The `s` is silently elided (no separate token).
+        if i < len && chars[i] == '\'' {
+            // Peek: is the next char 's' or 'S' and then non-alpha-or-EOS?
+            if i + 1 < len && (chars[i + 1] == 's' || chars[i + 1] == 'S') {
+                let after_s = i + 2;
+                let end_of_word = after_s >= len || !chars[after_s].is_alphanumeric();
+                if end_of_word {
+                    // Consume `'s` and skip the `s` token entirely.
+                    i += 2;
+                }
+            }
+        }
+
+        // Lowercase.
+        let lower = buf.to_lowercase();
+        if !lower.is_empty() {
+            tokens.push(lower);
+        }
+    }
+    tokens
 }
 
 // ===========================================================================
@@ -124,16 +268,22 @@ struct TsVector {
 
 impl TsVector {
     fn from_text_document(text: &str, config: Option<&str>) -> Self {
-        let drop_sw = config_drops_stopwords(config);
+        let lang = FtsLanguage::from_config(config);
+        let drop_sw = lang != FtsLanguage::Simple;
         let mut map: std::collections::BTreeMap<String, Vec<u32>> =
             std::collections::BTreeMap::new();
         let mut pos: u32 = 0;
         for tok in tokenize(text) {
-            pos += 1; // PG advances the position counter even for stopwords
+            pos += 1; // Position counter advances for every token (including stopwords).
             if drop_sw && is_stopword(&tok) {
                 continue;
             }
-            map.entry(tok).or_default().push(pos);
+            // Apply Snowball English stemming (Phase 5.20.C).
+            let lexeme = stem_token(&tok, lang);
+            if lexeme.is_empty() {
+                continue;
+            }
+            map.entry(lexeme).or_default().push(pos);
         }
         let entries = map
             .into_iter()
@@ -350,10 +500,13 @@ impl TsQuery {
     }
 
     fn join_tokens(text: &str, config: Option<&str>, kind: JoinKind) -> Option<TsQuery> {
-        let drop_sw = config_drops_stopwords(config);
+        let lang = FtsLanguage::from_config(config);
+        let drop_sw = lang != FtsLanguage::Simple;
         let lexemes: Vec<String> = tokenize(text)
             .into_iter()
             .filter(|t| !(drop_sw && is_stopword(t)))
+            .map(|t| stem_token(&t, lang))
+            .filter(|t| !t.is_empty())
             .collect();
         let mut iter = lexemes.into_iter();
         let mut acc = TsQuery::Term(iter.next()?);
@@ -1590,6 +1743,10 @@ mod tests {
         assert!(is_stopword("the"));
         assert!(is_stopword("a"));
         assert!(!is_stopword("fox"));
+        // Digit-hyphen-digit stays as one token.
+        assert_eq!(tokenize("version 2024-01-15"), vec!["version", "2024-01-15"]);
+        // Possessive stripping.
+        assert_eq!(tokenize("John's"), vec!["john"]);
     }
 
     #[test]
@@ -1634,14 +1791,17 @@ mod tests {
         // quick=2, fox=3.  Lexemes sorted alphabetically: fox before quick.
         assert_eq!(tsv("a quick fox"), "'fox':3 'quick':2");
         // duplicate lexeme accumulates positions, sorted.
+        // 'fox' is not stemmed; 'quick' is not stemmed by Snowball English.
         assert_eq!(tsv("fox fox quick"), "'fox':1,2 'quick':3");
-        // simple config keeps stopwords.
+        // simple config keeps stopwords and does NOT stem.
         assert_eq!(
             TsVector::from_text_document("a quick fox", Some("simple")).to_canonical(),
             "'a':1 'fox':3 'quick':2"
         );
-        // NO stemming: 'running' stays 'running' (PG would emit 'run').
-        assert_eq!(tsv("running"), "'running':1");
+        // Phase 5.20.C: Snowball English stemming is now applied.
+        // 'running' stems to 'run'.
+        assert_eq!(tsv("running"), "'run':1");
+        assert_eq!(tsv("running runs"), "'run':1,2");
     }
 
     #[test]

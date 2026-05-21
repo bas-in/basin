@@ -88,6 +88,8 @@ dashmap = "6"
 # lru — bounded LRU cache; one per project, capped at 500 distinct shapes so
 # idle projects cost O(bytes) not O(shapes).
 lru.workspace = true
+# Snowball English stemmer for FTS to_tsvector (Phase 5.20.C).
+rust-stemmers.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

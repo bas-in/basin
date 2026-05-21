@@ -497,6 +497,31 @@ fn read_simple_identifier(s: &str) -> Result<(String, &str)> {
             "expected an identifier, got end of statement".into(),
         ));
     }
+    // Accept double-quoted identifiers (`"table_name"`).
+    if bytes[0] == b'"' {
+        let mut i = 1usize;
+        let mut name = String::new();
+        loop {
+            if i >= bytes.len() {
+                return Err(BasinError::InvalidIdent(
+                    "unterminated double-quoted identifier".into(),
+                ));
+            }
+            if bytes[i] == b'"' {
+                i += 1;
+                if i < bytes.len() && bytes[i] == b'"' {
+                    name.push('"');
+                    i += 1;
+                } else {
+                    return Ok((name, &s[i..]));
+                }
+            } else {
+                let ch_len = s[i..].chars().next().map_or(1, |c| c.len_utf8());
+                name.push_str(&s[i..i + ch_len]);
+                i += ch_len;
+            }
+        }
+    }
     if !(bytes[0].is_ascii_alphabetic() || bytes[0] == b'_') {
         return Err(BasinError::InvalidIdent(format!(
             "expected an identifier at {:?}",

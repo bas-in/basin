@@ -528,6 +528,12 @@ pub(crate) fn is_tsrange_sql(sql: &SqlDataType) -> bool {
 pub(crate) fn is_tstzrange_sql(sql: &SqlDataType) -> bool {
     custom_type_name_eq(sql, "tstzrange")
 }
+pub(crate) fn is_tsvector_sql(sql: &SqlDataType) -> bool {
+    matches!(sql, SqlDataType::TsVector) || custom_type_name_eq(sql, "tsvector")
+}
+pub(crate) fn is_tsquery_sql(sql: &SqlDataType) -> bool {
+    matches!(sql, SqlDataType::TsQuery) || custom_type_name_eq(sql, "tsquery")
+}
 
 /// True when `sql` is an unparameterised `Custom` whose identifier matches
 /// `keyword` case-insensitively.

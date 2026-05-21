@@ -40,7 +40,10 @@ use sqlparser::ast::{
 };
 use std::sync::{Arc, RwLock};
 
-use crate::types::arrow_data_type;
+use crate::types::{
+    arrow_data_type, is_tsquery_sql, is_tsvector_sql, BASIN_TYPE_KEY, BASIN_TYPE_TSQUERY,
+    BASIN_TYPE_TSVECTOR,
+};
 
 /// Custom Basin-specific ALTER TABLE extensions that sqlparser doesn't
 /// recognise. The engine pre-screens the raw SQL string for these forms
@@ -910,8 +913,24 @@ async fn add_column(
             }
         }
     }
+    // Carry BASIN_TYPE metadata (TSVECTOR, TSQUERY, etc.) so that the INSERT
+    // coercion path recognises the column type after a schema round-trip.
+    // Without this, Arrow sees DataType::Utf8 with no marker and falls
+    // through to the plain-text coercion branch, which rejects UDF calls
+    // such as `to_tsvector(...)` with "expected string literal".
+    let mut md: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if is_tsvector_sql(&column_def.data_type) {
+        md.insert(BASIN_TYPE_KEY.to_string(), BASIN_TYPE_TSVECTOR.to_string());
+    } else if is_tsquery_sql(&column_def.data_type) {
+        md.insert(BASIN_TYPE_KEY.to_string(), BASIN_TYPE_TSQUERY.to_string());
+    }
     let mut fields: Vec<Field> = meta.schema.fields().iter().map(|f| (**f).clone()).collect();
-    fields.push(Field::new(name, dt, nullable));
+    let field = if md.is_empty() {
+        Field::new(name, dt, nullable)
+    } else {
+        Field::new(name, dt, nullable).with_metadata(md)
+    };
+    fields.push(field);
     let new_schema = Schema::new(fields);
     catalog.set_schema(project, table, new_schema).await?;
     Ok(())
@@ -941,6 +960,39 @@ fn read_identifier(s: &str) -> Result<(String, &str)> {
     if s.is_empty() {
         return Err(BasinError::InvalidIdent("expected identifier".into()));
     }
+    // Handle double-quoted identifiers: `"table_name"`.
+    // PG allows any characters inside double quotes; embedded `""` is a
+    // literal double-quote.  Basin's matcher only needs to consume and
+    // return the unquoted name.
+    if s.starts_with('"') {
+        let bytes = s.as_bytes();
+        let mut i = 1usize; // skip opening `"`
+        let mut name = String::new();
+        loop {
+            if i >= bytes.len() {
+                return Err(BasinError::InvalidIdent(
+                    "unterminated double-quoted identifier".into(),
+                ));
+            }
+            if bytes[i] == b'"' {
+                i += 1;
+                if i < bytes.len() && bytes[i] == b'"' {
+                    // Escaped double-quote `""` → literal `"`.
+                    name.push('"');
+                    i += 1;
+                } else {
+                    // End of quoted identifier.
+                    return Ok((name, &s[i..]));
+                }
+            } else {
+                // Push the char (may be multi-byte UTF-8).
+                let ch_len = s[i..].chars().next().map_or(1, |c| c.len_utf8());
+                name.push_str(&s[i..i + ch_len]);
+                i += ch_len;
+            }
+        }
+    }
+    // Bare identifier: alphanumeric + underscore.
     let mut end = 0usize;
     for (i, c) in s.char_indices() {
         if c.is_ascii_alphanumeric() || c == '_' {

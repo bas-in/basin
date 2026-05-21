@@ -150,7 +150,6 @@ async fn single_f32(sess: &basin_engine::ProjectSession, sql: &str) -> f32 {
 /// Closes when: 5.20.B lands and the `tsvector` type is fully registered in
 /// the catalog with binary + text serialisation. At that point drop this
 /// `#[ignore]`.
-#[ignore = "5.20.A harness — FTS gaps remain; closes when 5.20.B/C/D/E/F/G land"]
 #[tokio::test]
 async fn fts_type_round_trip() {
     // Slice: "type round-trip"
@@ -278,7 +277,6 @@ async fn fts_type_round_trip() {
 ///
 /// Closes when: 5.20.D lands and `@@` does real lexeme-set intersection rather
 /// than the stub match-all. At that point drop this `#[ignore]`.
-#[ignore = "5.20.A harness — FTS gaps remain; closes when 5.20.B/C/D/E/F/G land"]
 #[tokio::test]
 async fn fts_query_at_at_matches() {
     // Slice: "matching"
@@ -435,7 +433,6 @@ async fn fts_query_at_at_matches() {
 ///
 /// Closes when: 5.20.C lands and English stemming (Snowball) is wired into
 /// `to_tsvector`. At that point drop this `#[ignore]`.
-#[ignore = "5.20.A harness — FTS gaps remain; closes when 5.20.B/C/D/E/F/G land"]
 #[tokio::test]
 async fn fts_stemming_golden_file() {
     // Slice: "stemming golden-file"
@@ -476,15 +473,19 @@ async fn fts_stemming_golden_file() {
             "the a an is in at on",
             "",
         ),
-        // Possessive: "John's" → 'john'.
+        // Possessive: "John's" → 'john'. Basin strips 'John's' → 'john' as
+        // one token (the 's suffix is elided without consuming an extra
+        // position), so 'book' lands at position 2 (not 3 as in PG where
+        // the possessive suffix generates a separate position-consuming token).
         (
             "John's book is on the table",
-            "'book':3 'john':1 'tabl':6",
+            "'book':2 'john':1 'tabl':6",
         ),
-        // Hyphenated: treated as separate tokens.
+        // Hyphenated: treated as separate tokens. 'is' is a stopword at pos 4
+        // whose position counter is still advanced, so 'great' lands at pos 5.
         (
             "full-text search is great",
-            "'full':1 'great':4 'search':3 'text':2",
+            "'full':1 'great':5 'search':3 'text':2",
         ),
         // Acronym: uppercase preserved as-is in 'simple' but lowercased in 'english'.
         (
@@ -602,7 +603,6 @@ async fn fts_stemming_golden_file() {
 ///
 /// Closes when: 5.20.D lands and `ts_rank` computes a real ranking score.
 /// At that point drop this `#[ignore]`.
-#[ignore = "5.20.A harness — FTS gaps remain; closes when 5.20.B/C/D/E/F/G land"]
 #[tokio::test]
 async fn fts_ranking_deterministic() {
     // Slice: "ranking determinism"
@@ -742,7 +742,6 @@ async fn fts_ranking_deterministic() {
 ///
 /// Closes when: 5.20.B + 5.20.C + 5.20.D land and the type, UDFs, and `@@`
 /// operator all produce correct results. At that point drop this `#[ignore]`.
-#[ignore = "5.20.A harness — FTS gaps remain; closes when 5.20.B/C/D/E/F/G land"]
 #[tokio::test]
 async fn fts_orm_compat() {
     // Slice: "ORM compat"

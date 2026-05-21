@@ -165,6 +165,8 @@ clap = { version = "4", features = ["derive"] }
 rand = "0.8"
 # Regex engine used by regexp_match / regexp_split_to_array UDFs in basin-engine.
 regex = "1"
+# Snowball stemming for FTS (to_tsvector English stemmer). Phase 5.20.C.
+rust-stemmers = "1.2"
 # HTTP client for net.http_get / net.http_post UDFs (basin-engine) and the
 # basin-net crate. Pinned at 0.12 (rustls-tls, no native-tls, json support).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
