@@ -107,6 +107,11 @@ pub use routes::fn_handler::{
     NoopFunctionInvoker,
 };
 
+// #55: per-function log buffer + CPU counter. Public so FunctionInvoker
+// implementations (integration tests, W6 catalog-backed runtime) can call
+// `append_log` / `add_cpu_ms` after each invocation.
+pub use routes::admin_functions::{FunctionRegistry, LogEntry, LOG_BUFFER_CAP};
+
 /// REST server configuration.
 ///
 /// `engine` and `auth` are required and non-optional by design — a REST
@@ -193,6 +198,21 @@ impl RestService {
         &self,
     ) -> &basin_blob::store::BlobStore<basin_blob::store::InMemoryBlobCatalog> {
         &self.inner.blob_store
+    }
+
+    /// Return a clone of the in-process [`FunctionRegistry`].
+    ///
+    /// Cheap: the registry is an `Arc`-wrapped pair of maps. The clone shares
+    /// the same underlying data as the server's copy, so writes via
+    /// [`FunctionRegistry::append_log`] / [`FunctionRegistry::add_cpu_ms`]
+    /// are immediately visible to the `/admin/v1/functions/:name/logs` and
+    /// `/cpu-ms` endpoints.
+    ///
+    /// Intended for [`FunctionInvoker`] implementations that need to record
+    /// per-invocation instrumentation without depending on
+    /// `basin-rest`-internal types.
+    pub fn function_registry(&self) -> FunctionRegistry {
+        self.inner.function_registry.clone()
     }
 
     /// Bind synchronously (so callers can read `local_addr`), then spawn the

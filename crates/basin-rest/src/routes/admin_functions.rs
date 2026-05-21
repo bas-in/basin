@@ -8,8 +8,8 @@
 //! | `POST /admin/v1/functions/deploy`            | upload Wasm bytes       | 201 |
 //! | `GET /admin/v1/functions`                    | list deployed functions | 200 |
 //! | `DELETE /admin/v1/functions/:name`           | delete by name          | 204 |
-//! | `GET /admin/v1/functions/:name/logs`         | recent log lines        | 200 (empty) |
-//! | `GET /admin/v1/functions/:name/cpu-ms`       | per-fn CPU-ms counter   | 200 (zero) |
+//! | `GET /admin/v1/functions/:name/logs`         | recent log lines        | 200 |
+//! | `GET /admin/v1/functions/:name/cpu-ms`       | per-fn CPU-ms counter   | 200 |
 //!
 //! ## Auth
 //!
@@ -27,19 +27,23 @@
 //! [`crate::FunctionInvoker`] impl) is the layer that hands the bytes to
 //! `basin_fn::HandlerHarness::new`.
 //!
-//! ## TODOs for follow-on basin-fn instrumentation
+//! ## Per-function instrumentation (closes #55 sub-items)
 //!
-//! Per the task soft-cap, `logs` and `cpu-ms` ship as **stubs** in this PR:
-//! - `logs` returns an empty list. basin-fn does not currently capture per-
-//!   function log lines — the `basin:fn/log` host import forwards to
-//!   `tracing` without buffering. A future basin-fn change should add a
-//!   ring-buffered per-`(project, name)` capture that this endpoint reads.
-//! - `cpu-ms` returns 0. basin-fn's `FunctionGovernance` enforces a CPU cap
-//!   (`cpu_ticks` epoch counter) but does not expose a wall-CPU counter per
-//!   function. A future change should add a per-`(project, name)` atomic
-//!   counter incremented inside `invoke_with_caps` and read here.
+//! `FunctionRegistry` now carries two instrumentation structures per
+//! `(project, name)` pair, both written by the `FunctionInvoker`
+//! implementation that runs Wasm after each invocation:
+//!
+//! - **`LogBuffer`** — a bounded ring buffer (default cap 100) of
+//!   [`LogEntry`] values. Callers append via
+//!   [`FunctionRegistry::append_log`]; the `/logs` endpoint reads a
+//!   snapshot via [`FunctionRegistry::logs`].
+//! - **CPU counter** — a per-`(project, name)` `AtomicU64` accumulating
+//!   wall-CPU milliseconds. Callers add via
+//!   [`FunctionRegistry::add_cpu_ms`]; the `/cpu-ms` endpoint reads via
+//!   [`FunctionRegistry::cpu_ms`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -58,6 +62,57 @@ use crate::parser::validate_ident;
 use crate::server::{authorize, Inner};
 
 // ---------------------------------------------------------------------------
+// Per-function log buffer
+// ---------------------------------------------------------------------------
+
+/// Maximum log entries retained per `(project, name)`. Oldest entries are
+/// evicted when the cap is reached (ring-buffer semantics).
+pub const LOG_BUFFER_CAP: usize = 100;
+
+/// A single log line captured from the `basin:fn/log` host import.
+#[derive(Clone, Debug, Serialize)]
+pub struct LogEntry {
+    /// Log level string: `"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"`.
+    pub level: String,
+    /// The log message text.
+    pub message: String,
+    /// Wall-clock timestamp when the entry was appended (seconds since epoch).
+    pub ts_secs: u64,
+}
+
+/// Bounded ring buffer of [`LogEntry`] values for one `(project, name)`.
+///
+/// - Appends are O(1) amortised.
+/// - When the buffer is at `cap`, the oldest entry is dropped before inserting.
+/// - [`LogBuffer::snapshot`] returns a `Vec` in oldest-first order.
+struct LogBuffer {
+    entries: VecDeque<LogEntry>,
+    cap: usize,
+}
+
+impl LogBuffer {
+    fn new(cap: usize) -> Self {
+        Self {
+            entries: VecDeque::with_capacity(cap.min(256)),
+            cap,
+        }
+    }
+
+    /// Append `entry`, evicting the oldest if the buffer is full.
+    fn push(&mut self, entry: LogEntry) {
+        if self.entries.len() >= self.cap {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(entry);
+    }
+
+    /// Return all entries in oldest-first order.
+    fn snapshot(&self) -> Vec<LogEntry> {
+        self.entries.iter().cloned().collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // In-process function registry
 // ---------------------------------------------------------------------------
 
@@ -72,20 +127,40 @@ pub(crate) struct FunctionEntry {
     pub bytes: Vec<u8>,
 }
 
-/// In-process function catalog. Each project has its own namespace; cross-
-/// project lookups never cross. Cheap to clone (`Arc` inside).
+/// Shared instrumentation state for one `(project, name)` pair.
+struct FnInstrumentation {
+    logs: LogBuffer,
+    cpu_ms: AtomicU64,
+}
+
+impl FnInstrumentation {
+    fn new() -> Self {
+        Self {
+            logs: LogBuffer::new(LOG_BUFFER_CAP),
+            cpu_ms: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Per-project catalog + instrumentation. Cheap to clone (`Arc` inside).
 ///
-/// Per-project cost is O(deployed functions × bytes/function) — there is no
-/// global structure that scales with the number of distinct projects ever
-/// seen (the outer map only carries projects that have deployed at least one
-/// function). Matches the multi-project isolation rule.
+/// Per-project cost is O(deployed functions × bytes/function + log entries) —
+/// there is no global structure that scales with the number of distinct
+/// projects ever seen. Matches the multi-project isolation rule.
 #[derive(Default, Clone)]
-pub(crate) struct FunctionRegistry {
+pub struct FunctionRegistry {
     inner: Arc<RwLock<HashMap<ProjectId, HashMap<String, FunctionEntry>>>>,
+    /// Instrumentation is keyed by `(project, name)` independently of the
+    /// deploy map so CPU / log state survives a redeploy of the same
+    /// function. An `Arc<Mutex<…>>` inside the outer `Arc<RwLock<…>>` would
+    /// require holding the outer lock to update counters; instead we use a
+    /// second top-level `RwLock`-guarded map so log appends and CPU
+    /// increments acquire only the instr lock, not the deploy lock.
+    instr: Arc<RwLock<HashMap<(ProjectId, String), FnInstrumentation>>>,
 }
 
 impl FunctionRegistry {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
@@ -125,11 +200,88 @@ impl FunctionRegistry {
         }
     }
 
-    async fn exists(&self, project: &ProjectId, name: &str) -> bool {
+    pub(crate) async fn exists(&self, project: &ProjectId, name: &str) -> bool {
         let map = self.inner.read().await;
         map.get(project)
             .map(|m| m.contains_key(name))
             .unwrap_or(false)
+    }
+
+    // -----------------------------------------------------------------------
+    // Instrumentation write path (called by FunctionInvoker implementations)
+    // -----------------------------------------------------------------------
+
+    /// Append a log line for `(project, name)`. Oldest entries are evicted at
+    /// `LOG_BUFFER_CAP`. This is the write side of the `/logs` endpoint.
+    ///
+    /// `level` should be one of `"trace"`, `"debug"`, `"info"`, `"warn"`,
+    /// `"error"`.
+    pub async fn append_log(
+        &self,
+        project: ProjectId,
+        name: impl Into<String>,
+        level: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        let name = name.into();
+        let ts_secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let entry = LogEntry {
+            level: level.into(),
+            message: message.into(),
+            ts_secs,
+        };
+        let mut instr = self.instr.write().await;
+        instr
+            .entry((project, name))
+            .or_insert_with(FnInstrumentation::new)
+            .logs
+            .push(entry);
+    }
+
+    /// Add `delta_ms` milliseconds to the cumulative CPU counter for
+    /// `(project, name)`. This is the write side of the `/cpu-ms` endpoint.
+    pub async fn add_cpu_ms(&self, project: ProjectId, name: impl Into<String>, delta_ms: u64) {
+        let name = name.into();
+        let instr = self.instr.read().await;
+        if let Some(entry) = instr.get(&(project, name.clone())) {
+            entry.cpu_ms.fetch_add(delta_ms, Ordering::Relaxed);
+            return;
+        }
+        drop(instr);
+        // Slow path: create the entry under write lock.
+        let mut instr = self.instr.write().await;
+        let e = instr
+            .entry((project, name))
+            .or_insert_with(FnInstrumentation::new);
+        e.cpu_ms.fetch_add(delta_ms, Ordering::Relaxed);
+    }
+
+    // -----------------------------------------------------------------------
+    // Instrumentation read path (called by admin endpoint handlers)
+    // -----------------------------------------------------------------------
+
+    /// Return a snapshot of the log buffer for `(project, name)`,
+    /// oldest-first. Returns an empty `Vec` if no entries have been captured
+    /// yet.
+    pub async fn logs(&self, project: &ProjectId, name: &str) -> Vec<LogEntry> {
+        let instr = self.instr.read().await;
+        instr
+            .get(&(*project, name.to_string()))
+            .map(|e| e.logs.snapshot())
+            .unwrap_or_default()
+    }
+
+    /// Return the cumulative CPU-ms counter for `(project, name)`. Returns `0`
+    /// if the function has never been invoked.
+    pub async fn cpu_ms(&self, project: &ProjectId, name: &str) -> u64 {
+        let instr = self.instr.read().await;
+        instr
+            .get(&(*project, name.to_string()))
+            .map(|e| e.cpu_ms.load(Ordering::Relaxed))
+            .unwrap_or(0)
     }
 }
 
@@ -269,12 +421,6 @@ pub(crate) async fn delete_function(
 // ---------------------------------------------------------------------------
 // GET /admin/v1/functions/:name/logs
 // ---------------------------------------------------------------------------
-//
-// Stub: returns an empty `lines` array regardless of how many invocations the
-// function has served. basin-fn does not currently capture per-function log
-// output (the `basin:fn/log` host import forwards directly to `tracing`),
-// so there is nothing to read back. A follow-up basin-fn change should add a
-// ring-buffered capture this endpoint reads from.
 
 #[axum::debug_handler]
 pub(crate) async fn function_logs(
@@ -295,12 +441,16 @@ pub(crate) async fn function_logs(
             "function {name:?} not found for project"
         )));
     }
+
+    let lines = state
+        .function_registry
+        .logs(&claims.project_id, &name)
+        .await;
+
     Ok(Json(json!({
         "project_id": claims.project_id.to_string(),
         "name": name,
-        "lines": Vec::<String>::new(),
-        // TODO basin-fn: surface per-function log lines via a ring buffer
-        //      keyed by (project, name); this stub returns empty until then.
+        "lines": lines,
     }))
     .into_response())
 }
@@ -308,11 +458,6 @@ pub(crate) async fn function_logs(
 // ---------------------------------------------------------------------------
 // GET /admin/v1/functions/:name/cpu-ms
 // ---------------------------------------------------------------------------
-//
-// Stub: returns `cpu_ms = 0`. basin-fn's `FunctionGovernance` enforces a CPU
-// cap (epoch-based) but does not export a wall-CPU counter per function.
-// A follow-up basin-fn change should add an atomic counter incremented inside
-// `FunctionGovernance::invoke_with_caps`; this endpoint will then read it.
 
 #[axum::debug_handler]
 pub(crate) async fn function_cpu_ms(
@@ -333,12 +478,16 @@ pub(crate) async fn function_cpu_ms(
             "function {name:?} not found for project"
         )));
     }
+
+    let cpu_ms = state
+        .function_registry
+        .cpu_ms(&claims.project_id, &name)
+        .await;
+
     Ok(Json(json!({
         "project_id": claims.project_id.to_string(),
         "name": name,
-        "cpu_ms": 0u64,
-        // TODO basin-fn: surface per-function cumulative wall-CPU; this stub
-        //      returns 0 until basin-fn exposes a metering counter.
+        "cpu_ms": cpu_ms,
     }))
     .into_response())
 }

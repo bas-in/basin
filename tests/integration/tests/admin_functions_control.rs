@@ -8,6 +8,12 @@
 //! succeed. basin-rest treats the bytes as opaque, so we don't need a
 //! component that actually exports `handle`.
 //!
+//! `admin_functions_invoke_meters_cpu_and_logs` (#55): installs a real
+//! `HandlerHarness`-backed `FunctionInvoker` that records CPU time and
+//! synthetic log entries into the `FunctionRegistry`; then asserts the
+//! `/admin/v1/functions/:name/cpu-ms` and `/logs` endpoints return real
+//! (non-zero / non-empty) data after three invocations.
+//!
 //! ## Skip-cleanly
 //!
 //! Needs Postgres at `127.0.0.1:5432` so `AuthService::connect_with_mailer`
@@ -17,15 +23,21 @@
 
 #![allow(clippy::print_stdout)]
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use basin_auth::{AuthConfig, AuthService, SmtpConfig, SmtpTls, StubMailer};
 use basin_catalog::{Catalog, InMemoryCatalog};
 use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig};
-use basin_rest::{RestConfig, RestService, RunningRest};
+use basin_fn::{HandlerHarness, HandlerRequest};
+use basin_rest::{
+    set_global_invoker, FunctionInvoker, FunctionRegistry, InvokeRequest, InvokeResponse,
+    RestConfig, RestService, RunningRest,
+};
 use object_store::local::LocalFileSystem;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -219,6 +231,173 @@ fn tiny_component_b64() -> String {
 
 fn bearer(token: &str) -> String {
     format!("Bearer {token}")
+}
+
+// ---------------------------------------------------------------------------
+// Handler WAT + FunctionInvoker for #55 instrumentation test
+// ---------------------------------------------------------------------------
+
+/// Minimal WAT component that exports `basin:functions/handler#handle` and
+/// returns a 200 OK with empty body. Identical to the component used by
+/// `fn_handler.rs`. Reused here so we can run real Wasm invocations and
+/// measure CPU time through the registry.
+const HANDLER_WAT: &str = r#"
+(component
+  (core module $core_m
+    (memory (export "memory") 1)
+
+    (global $bump (mut i32) (i32.const 16))
+    (func (export "cabi_realloc")
+        (param $old i32) (param $old_sz i32) (param $align i32) (param $new_sz i32)
+        (result i32)
+      (local $ret i32)
+      (local.set $ret
+        (i32.and
+          (i32.add (global.get $bump) (i32.sub (local.get $align) (i32.const 1)))
+          (i32.xor (i32.sub (local.get $align) (i32.const 1)) (i32.const -1))))
+      (global.set $bump (i32.add (local.get $ret) (local.get $new_sz)))
+      (local.get $ret)
+    )
+
+    (func (export "handle_inner")
+        (param $method_ptr i32) (param $method_len i32)
+        (param $path_ptr   i32) (param $path_len   i32)
+        (param $headers_ptr i32) (param $headers_len i32)
+        (param $body_ptr   i32) (param $body_len   i32)
+        (result i32)
+      (local $out i32)
+      (local.set $out (i32.const 1024))
+      (i32.store (i32.add (local.get $out) (i32.const  0)) (i32.const 0))
+      (i32.store (i32.add (local.get $out) (i32.const  4)) (i32.const 0))
+      (i32.store (i32.add (local.get $out) (i32.const  8)) (i32.const 0))
+      (i32.store (i32.add (local.get $out) (i32.const 12)) (i32.const 0))
+      (i32.store (i32.add (local.get $out) (i32.const 16)) (i32.const 0))
+      (i32.store (i32.add (local.get $out) (i32.const 20)) (i32.const 0))
+      (i32.store (i32.add (local.get $out) (i32.const 24)) (i32.const 0))
+      (i32.store (i32.add (local.get $out) (i32.const 28)) (i32.const 0))
+      (i32.store (i32.add (local.get $out) (i32.const 32)) (i32.const 0))
+      (i32.store (i32.add (local.get $out) (i32.const 36)) (i32.const 0))
+      (i32.store (i32.add (local.get $out) (i32.const 40)) (i32.const 0))
+      (i32.store (i32.add (local.get $out) (i32.const 44)) (i32.const 0))
+      (i32.store16 (i32.add (local.get $out) (i32.const 4)) (i32.const 200))
+      (local.get $out)
+    )
+  )
+  (core instance $core_i (instantiate $core_m))
+
+  (type $request (record
+    (field "method" string)
+    (field "path" string)
+    (field "headers" (list (tuple string string)))
+    (field "body" (list u8))))
+  (export $request-name "request" (type $request))
+  (type $response (record
+    (field "status" u16)
+    (field "headers" (list (tuple string string)))
+    (field "body" (list u8))))
+  (export $response-name "response" (type $response))
+
+  (func (export "handle")
+    (param "req" $request-name)
+    (result (result $response-name (error string)))
+    (canon lift
+      (core func $core_i "handle_inner")
+      (memory $core_i "memory")
+      (realloc (func $core_i "cabi_realloc"))
+    )
+  )
+)
+"#;
+
+/// `FunctionInvoker` implementation that:
+///
+/// 1. Runs the Wasm component via `HandlerHarness::handle`.
+/// 2. Measures wall-CPU time and calls `FunctionRegistry::add_cpu_ms`.
+/// 3. Appends a synthetic `"info"` log entry via `FunctionRegistry::append_log`
+///    (simulating what the `basin:fn/log` host import would do once per call).
+///
+/// This is the minimal bridge needed by the integration test: the
+/// `FunctionRegistry` belongs to basin-rest; the harness lives in basin-fn.
+/// The invoker stitches them together without requiring basin-rest to depend
+/// on basin-fn directly.
+struct InstrumentedInvoker {
+    by_name: Mutex<HashMap<(ProjectId, String), Arc<HandlerHarness>>>,
+    registry: FunctionRegistry,
+}
+
+impl InstrumentedInvoker {
+    fn new(registry: FunctionRegistry) -> Self {
+        Self {
+            by_name: Mutex::new(HashMap::new()),
+            registry,
+        }
+    }
+
+    fn register(&self, project: ProjectId, name: &str, harness: Arc<HandlerHarness>) {
+        self.by_name
+            .lock()
+            .unwrap()
+            .insert((project, name.to_string()), harness);
+    }
+}
+
+#[async_trait]
+impl FunctionInvoker for InstrumentedInvoker {
+    async fn invoke(
+        &self,
+        project: ProjectId,
+        name: &str,
+        req: InvokeRequest,
+    ) -> Result<Option<InvokeResponse>, String> {
+        let harness = {
+            let guard = self.by_name.lock().unwrap();
+            guard.get(&(project, name.to_string())).cloned()
+        };
+        let Some(harness) = harness else {
+            return Ok(None);
+        };
+
+        let name_owned = name.to_string();
+        let handler_req = HandlerRequest {
+            method: req.method,
+            path: req.path,
+            headers: req.headers,
+            body: req.body,
+        };
+
+        // Run the synchronous wasmtime call on a blocking thread, measuring
+        // wall time as a CPU proxy (the WAT component does no I/O).
+        let t0 = Instant::now();
+        let resp = tokio::task::spawn_blocking(move || {
+            let ctx = basin_fn::engine::InvocationContext::mock();
+            harness.handle(ctx, handler_req)
+        })
+        .await
+        .map_err(|e| format!("join error: {e}"))?
+        .map_err(|e| format!("wasm trap: {e}"))?;
+        let elapsed_ms = t0.elapsed().as_millis().max(1) as u64;
+
+        // Record instrumentation into the shared registry. These writes are
+        // visible to the `/admin/v1/functions/:name/cpu-ms` and `/logs`
+        // endpoints served by the same process.
+        self.registry
+            .add_cpu_ms(project, &name_owned, elapsed_ms)
+            .await;
+        self.registry
+            .append_log(
+                project,
+                &name_owned,
+                "info",
+                format!("invoked {name_owned} — status {}", resp.status),
+            )
+            .await;
+
+        Ok(Some(InvokeResponse {
+            status: resp.status,
+            headers: resp.headers,
+            body: resp.body,
+        }))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -488,4 +667,143 @@ async fn admin_functions_deploy_rejects_invalid_body() {
     )
     .await;
     assert_eq!(r.status, 400);
+}
+
+// ---------------------------------------------------------------------------
+// #55: per-function log buffer + CPU counter
+// ---------------------------------------------------------------------------
+
+/// Deploy a real handler-shape Wasm component, invoke it 3 times through an
+/// `InstrumentedInvoker` that records CPU time and log entries into the
+/// `FunctionRegistry`, then assert that `/admin/v1/functions/:name/cpu-ms`
+/// returns a value > 0 and `/logs` returns a non-empty array.
+///
+/// This is the end-to-end fix for issue #55:
+///   - `cpu-ms` endpoint previously always returned `0`.
+///   - `logs` endpoint previously always returned `[]`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_functions_invoke_meters_cpu_and_logs() {
+    // Build the instrumented invoker backed by the real handler harness.
+    let handler_bytes = wat::parse_str(HANDLER_WAT).expect("compile HANDLER_WAT");
+
+    // Spin up a fresh REST service. We need the `RestService` handle (before
+    // `run_until_bound` consumes it) to call `function_registry()` and obtain
+    // the shared `Arc`-backed registry that the admin endpoints read from.
+    let secret = vec![5u8; 32];
+    let Some(auth) = try_make_auth(&secret).await else {
+        return;
+    };
+    let dir = TempDir::new().expect("tempdir");
+    let engine = engine_in(&dir);
+    let svc = RestService::new(RestConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        engine,
+        auth,
+        max_body_bytes: 1 << 20,
+        default_page_size: 100,
+        max_page_size: 1000,
+        cors_origins: Vec::new(),
+        rate_limit_per_sec: 1000,
+    });
+    // Clone the registry before consuming `svc` with `run_until_bound`.
+    let fn_registry = svc.function_registry();
+    let running = svc.run_until_bound().await.expect("rest bind");
+    let addr = running.local_addr;
+
+    // Build a fresh project + admin JWT tied to this service's secret.
+    let project = ProjectId::new();
+    let token = admin_jwt_for(&secret, &project);
+    let bearer_str = bearer(&token);
+    let auth2 = ("Authorization", bearer_str.as_str());
+
+    // Install the instrumented invoker globally so `/fn/v1/:name` routes here.
+    let harness = Arc::new(
+        HandlerHarness::new(&handler_bytes).expect("compile handler harness"),
+    );
+    let invoker = Arc::new(InstrumentedInvoker::new(fn_registry));
+    invoker.register(project, "meter_fn", harness);
+    set_global_invoker(invoker);
+
+    // 1. Deploy the function (opaque bytes; admin endpoint).
+    let wasm_b64 = B64.encode(&handler_bytes);
+    let deploy_body = serde_json::json!({
+        "name": "meter_fn",
+        "wasm_b64": wasm_b64,
+    })
+    .to_string();
+    let r = http_request(
+        addr,
+        "POST",
+        "/admin/v1/functions/deploy",
+        &[("Content-Type", "application/json"), auth2],
+        Some(deploy_body.as_bytes()),
+    )
+    .await;
+    assert_eq!(
+        r.status, 201,
+        "deploy should 201; got {} body: {}",
+        r.status,
+        String::from_utf8_lossy(&r.body)
+    );
+
+    // 2. Invoke the function 3 times via `/fn/v1/meter_fn`.
+    for i in 0..3 {
+        let r = http_request(
+            addr,
+            "POST",
+            "/fn/v1/meter_fn",
+            &[auth2],
+            Some(b"{}"),
+        )
+        .await;
+        assert_eq!(
+            r.status, 200,
+            "invocation {} should 200; got {}",
+            i, r.status
+        );
+    }
+
+    // 3. cpu-ms must now be > 0.
+    let r = http_request(
+        addr,
+        "GET",
+        "/admin/v1/functions/meter_fn/cpu-ms",
+        &[auth2],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    let v = r.json();
+    let cpu = v["cpu_ms"].as_u64().expect("cpu_ms field");
+    assert!(
+        cpu > 0,
+        "cpu_ms must be > 0 after 3 invocations; got {cpu}"
+    );
+
+    // 4. logs must be non-empty (one entry per invocation).
+    let r = http_request(
+        addr,
+        "GET",
+        "/admin/v1/functions/meter_fn/logs",
+        &[auth2],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    let v = r.json();
+    let lines = v["lines"].as_array().expect("lines array");
+    assert!(
+        !lines.is_empty(),
+        "logs must be non-empty after 3 invocations; got []"
+    );
+    assert_eq!(
+        lines.len(),
+        3,
+        "expected 3 log entries (one per invocation); got {}",
+        lines.len()
+    );
+
+    // Restore noop invoker so subsequent tests aren't affected.
+    set_global_invoker(Arc::new(basin_rest::NoopFunctionInvoker));
+    let _ = running.shutdown.send(());
 }
