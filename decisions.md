@@ -6,6 +6,41 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-21 — #22 noisy-neighbor permanent harness landed; all agent-amenable items closed
+
+Commit `31bc2a7` — `tests/integration/tests/noisy_neighbor_harness.rs`
+(685 lines, 9 scenarios from the noisy-neighbor audit codified as
+permanent regression tests):
+
+- HTAP hard-cap isolation (Scenario C / axis #4, P0)
+- Connection-limit ceiling (Scenario B / axis #1, P0-2)
+- Pgwire rate-limit burst throttle (Scenario A / axis #1, P0-4)
+- Realtime budget per-project isolation (Scenario D / axis #5)
+- Cron per-project job cap (Scenario E / axis #13)
+- Net allowlist deny-all default (Scenario J / axis #14)
+- Net rate-limit per-project isolation (Scenario J / axis #14)
+- Realtime channel-count visibility + prune (Scenario K / axis #5)
+- Cross-project row isolation under 2×10×20 concurrent contention
+
+All pass in 11s. Intentionally skipped: Scenario A (long-query timeout,
+needs P0.A integration), F (real Postgres needed), G (already covered by
+wasm soak). Agent's report verified — commit landed, file size matches,
+all 9 tests `ok.`
+
+**Final session state — true stop:**
+- All 38 original TASK.md items completed; #13/#22/#39 also closed.
+- Single remaining open task: #40 (engine bug clusters from triage) —
+  NOT agent-amenable (DataFusion-53 upstream work, Vortex codec
+  extensions, real engine debugging). Human prioritization needed.
+- 3 environmental isolation flakes documented (datetime_extras,
+  format_encoding, viability_pg_compat_funcs) — CI infra work, not
+  engine bugs.
+
+Loop stops cleanly. Cron continues firing but each iteration will see
+no agent-amenable work and idle.
+
+---
+
 ## 2026-05-21 — Final state: 3 isolation-flake binaries remain; workspace otherwise green
 
 Second-pass triage (`53ca8e9`) landed 30 #[ignore]s across 21 files,
