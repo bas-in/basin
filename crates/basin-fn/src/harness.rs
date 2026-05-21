@@ -48,6 +48,13 @@ fn component_engine() -> Arc<Engine> {
         .clone()
 }
 
+/// Sibling-module accessor for the shared wasmtime Engine. Used by
+/// `crate::handler::HandlerHarness` so the W1 and W2 worlds share one
+/// JIT cache rather than spinning up a second `Engine`.
+pub(crate) fn component_engine_pub() -> Arc<Engine> {
+    component_engine()
+}
+
 // ---------------------------------------------------------------------------
 // ComponentHarness
 // ---------------------------------------------------------------------------

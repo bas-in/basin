@@ -206,10 +206,13 @@ sink implementation — no engine change, no surface change.
 
 ## What this does NOT commit us to
 
-- **V8 / Deno edge functions.** Out, permanently — re-stated for the
-  record. Compute that needs a JS runtime belongs on the customer's
-  app server. The same reasoning applies as ADR 0012's PL/pgSQL
-  rejection: permanent-maintenance-load not justified by wedge fit.
+- **V8 / Deno edge-function runtime.** Out, permanently — Basin will
+  never run a V8/Deno isolate pool. The cost (isolate pool, cold
+  starts, deploy pipeline, log streaming, multi-tenant CPU/mem
+  isolation, ~4-6 months + permanent ops) isn't justified by wedge
+  fit, and it competes with free incumbents (Vercel / CF Workers /
+  Supabase Edge). **In-DB compute is WebAssembly, not V8** — see the
+  decision below.
 - **Hand-written HTTP middleware in user code.** Inbound webhooks
   and RPC are *terminating endpoints*, not middleware. Filtering /
   rewriting / chaining live in the customer's app server.
@@ -228,22 +231,35 @@ sink implementation — no engine change, no surface change.
   synchronously (≤1s typical). Long work = enqueue a row, let a
   reactor or cron job pick it up.
 
-## Trigger to revisit (V8 / Deno edge functions)
+## Decision: V8 never; WebAssembly is the function runtime
 
-**Reopen and consider a V8/Deno edge-function runtime** when ALL of:
+The honest framing for "do you have edge functions?": **Basin does
+not run a V8/Deno isolate pool, and never will. In-DB compute is
+WebAssembly — any language that compiles to Wasm, including
+JavaScript/TypeScript via Javy / ComponentizeJS. Imperative HTTP
+handlers that don't need the database run on the customer's app
+server.**
 
-1. ≥3 Phase 0 design partners explicitly ask for V8-shaped HTTP
-   handlers and rule out running them on their own app server, AND
-2. The use cases they describe genuinely cannot be expressed as the
-   declarative composition above (inbound + reactor + outbound + RPC),
-   AND
-3. The engineering org has budget for the ~4-6 months of build plus
-   permanent ops load (sandbox, isolate pool, cold starts, deploy
-   pipeline, log streaming, multi-tenant CPU/memory isolation).
+Why Wasm and not V8:
+- **Reuses what's built** — the wasmtime runtime (Phase 5.11.J) + the
+  `/rpc/<fn>` mount (Phase 5.11.L) are already committed. Wasm
+  functions are an extension, not a new runtime.
+- **Cleaner multi-tenant isolation** — wasmtime epoch-interruption +
+  linear-memory caps are simpler and safer than V8 isolate quotas +
+  cgroup wrangling.
+- **Bets with the market** — Cloudflare, Fermyon Spin, and the
+  WASI-component ecosystem are all moving toward Wasm components.
+  JS-on-Wasm (Javy, ComponentizeJS) is a proven, shipping path.
+- **Closes ~70% of the DX gap** — devs author in TS; the toolchain
+  compiles to a Wasm component at deploy time. No V8 ops load.
 
-Without all three, the answer stays "no." The Wasm UDF escape hatch
-(Phase 5.11.J) is the in-DB compute path; the customer's app server
-is the imperative HTTP path.
+This is committed work, tracked as **Phase 5.11.W** in TASK.md (JS/TS
+authoring on the Wasm function runtime). It builds on 5.11.J + 5.11.L;
+it does not reopen the V8 question.
+
+The remaining ~5% (deep imperative orchestration with arbitrary npm
+packages and instant JS hot-reload DX) stays on the customer's app
+server — that's the deliberate wedge boundary, not a gap to close.
 
 ## References
 

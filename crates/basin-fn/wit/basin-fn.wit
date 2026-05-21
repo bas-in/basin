@@ -87,10 +87,47 @@ interface secret {
 }
 
 // ---------------------------------------------------------------------------
-// The world a basin function component is expected to satisfy.
+// basin:functions/handler — HTTP-handler shape (Phase 5.11.W2).
 //
-// Imports: the four host interfaces above.
-// Exports: a single `run` entrypoint the host calls.
+// A function that opts into this export receives an HTTP request (method,
+// headers, body) and returns an HTTP response (status, headers, body). This
+// is the "edge-function ergonomic shape": one component answers many requests
+// over its lifetime through the host-side `/fn/v1/:name` mount.
+//
+// The W1 `run` export remains the no-arg cron / one-shot shape; W2 adds this
+// second world for HTTP-driven invocations. Guests pick whichever world
+// matches the function they're writing.
+//
+// This interface defines the canonical request / response record types. The
+// `basin-functions-handler` world below exports `handle` as a **world-level
+// func** (rather than re-exporting the whole interface) so the export shape
+// mirrors W1's bare `run` export — a guest implements a single `handle`
+// entrypoint, and any Wasm toolchain can target it without interface-level
+// instance plumbing.
+// ---------------------------------------------------------------------------
+interface handler {
+    record request {
+        method:  string,                           // "GET" | "POST" | …
+        path:    string,                           // request path + query
+        headers: list<tuple<string, string>>,
+        body:    list<u8>,
+    }
+
+    record response {
+        status:  u16,
+        headers: list<tuple<string, string>>,
+        body:    list<u8>,
+    }
+
+    // Synchronous request → response. Errors propagate as a string; the host
+    // turns them into a 500 with a clear message. Declared here for
+    // documentation; the world exports the equivalent `handle` func directly.
+    handle: func(req: request) -> result<response, string>;
+}
+
+// ---------------------------------------------------------------------------
+// The original `run`-only world (Phase 5.11.W1). Kept for back-compat: a
+// guest authoring a cron / one-shot function only exports `run`.
 // ---------------------------------------------------------------------------
 world basin-functions {
     import query;
@@ -101,4 +138,23 @@ world basin-functions {
     // Guest exports one entrypoint. The host calls it after wiring the
     // imports. The return value is an optional string error; `none` = success.
     export run: func() -> option<string>;
+}
+
+// ---------------------------------------------------------------------------
+// The HTTP-handler world (Phase 5.11.W2). Same four imports; exports `handle`
+// as a world-level func using the `handler` interface's record types. The
+// host's `/fn/v1/:name` mount instantiates components against this world.
+// ---------------------------------------------------------------------------
+world basin-functions-handler {
+    import query;
+    import http;
+    import log;
+    import secret;
+
+    // Bring the request / response record types into scope.
+    use handler.{request, response};
+
+    // Bare func export — same export style as W1's `run`, so a guest only
+    // needs to implement one entrypoint.
+    export handle: func(req: request) -> result<response, string>;
 }

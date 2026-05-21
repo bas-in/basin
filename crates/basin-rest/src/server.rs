@@ -16,7 +16,7 @@ use std::sync::Arc;
 use axum::extract::DefaultBodyLimit;
 use axum::http::header::{HeaderName, AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, Method};
-use axum::routing::{get, post, Router};
+use axum::routing::{any, get, post, Router};
 use basin_auth::Claims;
 use basin_blob::store::{BlobStore, InMemoryBlobCatalog};
 use basin_common::Result;
@@ -28,7 +28,8 @@ use tower_http::trace::TraceLayer;
 use crate::errors::ApiError;
 use crate::routes::{
     admin as admin_routes, auth as auth_routes, data as data_routes,
-    inbound as inbound_routes, openapi as openapi_routes, rpc as rpc_routes,
+    fn_handler as fn_handler_routes, inbound as inbound_routes,
+    openapi as openapi_routes, rpc as rpc_routes,
     storage as storage_routes, storage_sign as storage_sign_routes,
 };
 use crate::RestConfig;
@@ -91,6 +92,8 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
     Router::new()
         .route("/rest/v1/_openapi.json", get(openapi_routes::openapi))
         .route("/rest/v1/rpc/:fn_name", post(rpc_routes::post_rpc))
+        // Phase 5.11.W2: HTTP-handler function shape (ANY method).
+        .route("/fn/v1/:name", any(fn_handler_routes::any_fn_handler))
         .route(
             "/in/:project_id/:name",
             post(inbound_routes::post_inbound_webhook),

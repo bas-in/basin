@@ -99,6 +99,14 @@ mod tests;
 
 pub use errors::ErrorCode;
 
+// Phase 5.11.W2: HTTP-handler function shape. Public re-exports so callers
+// (integration tests for W2; W6's catalog-backed runtime later) can install
+// a [`FunctionInvoker`] without taking a `pub(crate)` path into `routes`.
+pub use routes::fn_handler::{
+    set_global_invoker, FunctionInvoker, InvokeRequest, InvokeResponse,
+    NoopFunctionInvoker,
+};
+
 /// REST server configuration.
 ///
 /// `engine` and `auth` are required and non-optional by design — a REST
