@@ -125,10 +125,25 @@ pub const REFRESH_AUDIENCE: &str = "basin-refresh";
 
 /// Wraps the HS256 keys and validation parameters shared between issue
 /// and verify. Cheap to clone (key material is `Arc`'d inside jsonwebtoken).
+///
+/// # Secret rotation
+///
+/// Construct a fresh `JwtKeys` with the new secret to rotate. Tokens signed
+/// with the old key will be rejected immediately (hard rotation). For a
+/// graceful rotation that gives in-flight tokens time to expire without forcing
+/// all users to re-authenticate, supply the previous secret via
+/// [`JwtKeys::with_previous_secret`]: tokens that fail verification against the
+/// current key are re-tried against the previous key. Remove `previous_secret`
+/// once its TTL has elapsed (typically one access-token lifetime, e.g. 1 hour).
 #[derive(Clone)]
 pub struct JwtKeys {
     encoding: EncodingKey,
     decoding: DecodingKey,
+    /// Optional previous decoding key retained for grace-window rotation.
+    /// Access tokens are first verified with `decoding`; on failure they are
+    /// re-tried with this key. New tokens are always signed with `encoding`
+    /// (current secret), so the previous key is read-only.
+    previous_decoding: Option<DecodingKey>,
     validation: Validation,
     refresh_validation: Validation,
 }
@@ -154,9 +169,30 @@ impl JwtKeys {
         Self {
             encoding: EncodingKey::from_secret(secret),
             decoding: DecodingKey::from_secret(secret),
+            previous_decoding: None,
             validation,
             refresh_validation,
         }
+    }
+
+    /// Construct a `JwtKeys` that accepts tokens signed with either `secret`
+    /// (current) **or** `previous_secret` (grace-window rotation).
+    ///
+    /// New tokens are always issued with `secret`. Tokens signed with
+    /// `previous_secret` will verify successfully until the caller rebuilds
+    /// `JwtKeys` without a `previous_secret` (typically after one
+    /// access-token TTL has elapsed). This avoids force-logging-out every user
+    /// the moment the secret is rotated in the environment.
+    ///
+    /// # Rotation procedure
+    /// 1. Set `BASIN_AUTH_JWT_SECRET` to the new value and
+    ///    `BASIN_AUTH_JWT_SECRET_PREVIOUS` to the old value; restart.
+    /// 2. Wait one access-token TTL (default 1 h) for old tokens to expire.
+    /// 3. Unset `BASIN_AUTH_JWT_SECRET_PREVIOUS`; restart.
+    pub fn with_previous_secret(secret: &[u8], previous_secret: &[u8]) -> Self {
+        let mut keys = Self::new(secret);
+        keys.previous_decoding = Some(DecodingKey::from_secret(previous_secret));
+        keys
     }
 
     /// Issue a fresh access token. `now` lets tests be deterministic.
@@ -234,9 +270,31 @@ impl JwtKeys {
     /// - `iat` must be present in the token.
     /// - `iat` must not be more than [`IAT_MAX_SKEW_SECS`] seconds in the
     ///   future; a token issued with `iat = year 3000` is rejected here.
+    ///
+    /// If a `previous_decoding` key is present (grace-window rotation), tokens
+    /// that fail verification against the current key are automatically retried
+    /// against the previous key. The iat checks still apply in both cases.
     pub fn verify(&self, token: &str) -> Result<Claims> {
-        let data = decode::<WireClaims>(token, &self.decoding, &self.validation)
-            .map_err(|e| BasinError::internal(format!("jwt verify: {e}")))?;
+        let decode_result = decode::<WireClaims>(token, &self.decoding, &self.validation);
+        let data = match decode_result {
+            Ok(d) => d,
+            Err(primary_err) => {
+                // On primary failure, try the previous key if one is configured.
+                match &self.previous_decoding {
+                    Some(prev_key) => {
+                        decode::<WireClaims>(token, prev_key, &self.validation).map_err(|_| {
+                            // Surface the primary error so callers see a consistent
+                            // message rather than a potentially confusing "previous
+                            // key also failed" message.
+                            BasinError::internal(format!("jwt verify: {primary_err}"))
+                        })?
+                    }
+                    None => {
+                        return Err(BasinError::internal(format!("jwt verify: {primary_err}")));
+                    }
+                }
+            }
+        };
         let w = data.claims;
 
         // --- iat validation (jsonwebtoken does not enforce this natively) ---
@@ -309,9 +367,28 @@ impl JwtKeys {
     }
 
     /// Verify a refresh JWT (signature + expiry + audience).
+    ///
+    /// Like [`Self::verify`], falls back to `previous_decoding` if present and
+    /// the primary key rejects the token.
     pub fn verify_refresh(&self, token: &str) -> Result<RefreshClaims> {
-        let data = decode::<RefreshWireClaims>(token, &self.decoding, &self.refresh_validation)
-            .map_err(|e| BasinError::internal(format!("refresh jwt verify: {e}")))?;
+        let decode_result =
+            decode::<RefreshWireClaims>(token, &self.decoding, &self.refresh_validation);
+        let data = match decode_result {
+            Ok(d) => d,
+            Err(primary_err) => match &self.previous_decoding {
+                Some(prev_key) => {
+                    decode::<RefreshWireClaims>(token, prev_key, &self.refresh_validation)
+                        .map_err(|_| {
+                            BasinError::internal(format!("refresh jwt verify: {primary_err}"))
+                        })?
+                }
+                None => {
+                    return Err(BasinError::internal(format!(
+                        "refresh jwt verify: {primary_err}"
+                    )));
+                }
+            },
+        };
         let w = data.claims;
         let project: ProjectId = w
             .project_id
@@ -626,5 +703,199 @@ mod tests {
             )
             .unwrap();
         assert!(keys.verify(&jwt).is_err(), "expired jwt must not verify");
+    }
+
+    // -----------------------------------------------------------------------
+    // Secret rotation tests (fixes #53 P1 JWT rotation)
+    // -----------------------------------------------------------------------
+
+    /// Hard rotation: a token signed with secret-A must be rejected once keys
+    /// are rebuilt with secret-B only (no grace window).
+    ///
+    /// This validates that `JwtKeys` holds no stale key material and that
+    /// constructing a new `JwtKeys` with a different secret is sufficient to
+    /// invalidate all previously-issued tokens.
+    #[test]
+    fn jwt_secret_rotation_invalidates_old_tokens() {
+        let secret_a = [0xAAu8; 32];
+        let secret_b = [0xBBu8; 32];
+
+        // Issue with secret-A.
+        let keys_a = JwtKeys::new(&secret_a);
+        let (token_signed_with_a, _) = keys_a
+            .issue(
+                &ProjectId::new(),
+                Uuid::new_v4(),
+                "alice@example.com",
+                &["user".to_string()],
+                Utc::now(),
+                Duration::from_secs(3600),
+            )
+            .unwrap();
+
+        // Rotate to secret-B (hard rotation — no previous key).
+        let keys_b = JwtKeys::new(&secret_b);
+
+        // The token issued with A must fail verification against B.
+        let result = keys_b.verify(&token_signed_with_a);
+        assert!(
+            result.is_err(),
+            "token signed with secret-A must be rejected after hard rotation to secret-B"
+        );
+
+        // Sanity-check: the new keys can still issue and verify their own tokens.
+        let (token_b, _) = keys_b
+            .issue(
+                &ProjectId::new(),
+                Uuid::new_v4(),
+                "bob@example.com",
+                &[],
+                Utc::now(),
+                Duration::from_secs(3600),
+            )
+            .unwrap();
+        assert!(
+            keys_b.verify(&token_b).is_ok(),
+            "keys_b must verify tokens it signed itself"
+        );
+
+        // And old keys cannot verify new tokens (different secret, different sig).
+        assert!(
+            keys_a.verify(&token_b).is_err(),
+            "keys_a must not verify tokens signed with secret-B"
+        );
+    }
+
+    /// Refresh-token hard rotation: a refresh token issued with secret-A must be
+    /// rejected after rotation to secret-B (no grace window).
+    #[test]
+    fn jwt_refresh_secret_rotation_invalidates_old_tokens() {
+        let secret_a = [0xCCu8; 32];
+        let secret_b = [0xDDu8; 32];
+
+        let keys_a = JwtKeys::new(&secret_a);
+        let (refresh_token, _jti, _exp) = keys_a
+            .issue_refresh(
+                &ProjectId::new(),
+                Uuid::new_v4(),
+                "carol@example.com",
+                Utc::now(),
+                Duration::from_secs(3600),
+            )
+            .unwrap();
+
+        // Hard rotate to secret-B.
+        let keys_b = JwtKeys::new(&secret_b);
+
+        assert!(
+            keys_b.verify_refresh(&refresh_token).is_err(),
+            "refresh token signed with secret-A must be rejected after rotation to secret-B"
+        );
+    }
+
+    /// Grace-window rotation: a token signed with the *previous* secret must
+    /// still verify during the grace window when `with_previous_secret` is used.
+    ///
+    /// Rotation procedure:
+    ///   1. `JwtKeys::with_previous_secret(new, old)` — accepts both.
+    ///   2. After one TTL window: `JwtKeys::new(new)` — old tokens expire.
+    #[test]
+    fn jwt_secret_rotation_grace_window_accepts_previous() {
+        let secret_old = [0x11u8; 32];
+        let secret_new = [0x22u8; 32];
+
+        // Issue with the old secret.
+        let keys_old = JwtKeys::new(&secret_old);
+        let (token_signed_with_old, _) = keys_old
+            .issue(
+                &ProjectId::new(),
+                Uuid::new_v4(),
+                "dave@example.com",
+                &["viewer".to_string()],
+                Utc::now(),
+                Duration::from_secs(3600),
+            )
+            .unwrap();
+
+        // Rotate: current=new, previous=old (grace window open).
+        let keys_grace = JwtKeys::with_previous_secret(&secret_new, &secret_old);
+
+        // Token signed with old secret must still verify during grace window.
+        let claims = keys_grace.verify(&token_signed_with_old);
+        assert!(
+            claims.is_ok(),
+            "token signed with previous secret must verify during grace window; \
+             got: {:?}",
+            claims.err()
+        );
+        assert_eq!(
+            claims.unwrap().email,
+            "dave@example.com",
+            "claims must decode correctly through the grace-window path"
+        );
+
+        // New tokens are issued with the new secret.
+        let (token_signed_with_new, _) = keys_grace
+            .issue(
+                &ProjectId::new(),
+                Uuid::new_v4(),
+                "eve@example.com",
+                &[],
+                Utc::now(),
+                Duration::from_secs(3600),
+            )
+            .unwrap();
+
+        // New tokens verify fine against keys_grace.
+        assert!(
+            keys_grace.verify(&token_signed_with_new).is_ok(),
+            "new tokens signed with current secret must verify against grace-window keys"
+        );
+
+        // Once the grace window closes (new JwtKeys with only the new secret),
+        // old tokens must be rejected.
+        let keys_final = JwtKeys::new(&secret_new);
+        assert!(
+            keys_final.verify(&token_signed_with_old).is_err(),
+            "old token must be rejected once grace window closes"
+        );
+        // New tokens must still verify after grace window closes.
+        assert!(
+            keys_final.verify(&token_signed_with_new).is_ok(),
+            "new tokens must continue to verify after grace window closes"
+        );
+    }
+
+    /// Grace-window rotation for refresh tokens.
+    #[test]
+    fn jwt_refresh_grace_window_accepts_previous() {
+        let secret_old = [0x33u8; 32];
+        let secret_new = [0x44u8; 32];
+
+        let keys_old = JwtKeys::new(&secret_old);
+        let (refresh_token, _jti, _exp) = keys_old
+            .issue_refresh(
+                &ProjectId::new(),
+                Uuid::new_v4(),
+                "frank@example.com",
+                Utc::now(),
+                Duration::from_secs(3600),
+            )
+            .unwrap();
+
+        // Rotate with grace window.
+        let keys_grace = JwtKeys::with_previous_secret(&secret_new, &secret_old);
+
+        assert!(
+            keys_grace.verify_refresh(&refresh_token).is_ok(),
+            "refresh token signed with previous secret must verify during grace window"
+        );
+
+        // After grace window closes, the old refresh token must fail.
+        let keys_final = JwtKeys::new(&secret_new);
+        assert!(
+            keys_final.verify_refresh(&refresh_token).is_err(),
+            "refresh token must be rejected once grace window closes"
+        );
     }
 }
