@@ -6,6 +6,44 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-21 — Worktree-isolation wave EXHAUSTED THE DISK; recovered citext + timeouts via manual merge
+
+**What happened.** To parallelize two `basin-engine` phases (5.30 citext, 5.28.B/C/D
+timeouts), I dispatched two agents with `isolation: "worktree"`. Each worktree got
+its OWN cargo `target/` dir; combined with the main target (~30GB), the two extra
+full compile trees filled the 926GB APFS volume to **0 bytes free**. Both agents
+wrote correct code but ENOSPC blocked their `git commit`, test linking, and Bash
+output. The harness also created the worktrees under `.claude/worktrees/` (violates
+the never-write-to-.claude rule).
+
+**Recovery.** (1) `rm -rf .claude/worktrees/*/target` freed 30GB. (2) Committed each
+worktree branch by hand (staged explicit paths). (3) Merged both into main:
+- citext: add/add conflict on `citext_harness.rs` (pre-existing canonical harness vs
+  the agent's self-written one) → kept main's canonical.
+- timeouts: content conflicts on `lib.rs`/`session.rs`/`executor.rs` (worktree branched
+  from a staler base than main, which had #64's statement_timeout) → resolved as
+  "keep both" unions (gin_index_registry + reaper_registry; statement_timeout +
+  lock_timeout + idle_in_transaction else-if chains); add/add on
+  `timeout_trio_harness.rs` → kept main's canonical.
+(4) `git worktree remove -f -f` + `git branch -D` all three (a stale third worktree
+`abf71609` was also cleaned). (5) Core-crate build green (merge commit `628a146`).
+
+**RULE (also saved to cross-session memory):** do NOT use worktree isolation for
+Rust-compiling agents on this machine — duplicate target dirs blow the disk. Use
+file-disjoint shared-tree waves, ONE engine agent per wave. `basin-engine` feature
+work is inherently serial (hub files: types.rs, executor.rs, session.rs, lib.rs).
+
+**Landed (impl merged + core crates compile; canonical harnesses kept with their
+ignores — slice-by-slice un-ignore is a verification follow-up):**
+- citext (5.30.B-E): `basin-common/types/citext.rs`, engine `types.rs`/`operators/
+  citext_cmp.rs`, `basin-storage/index/btree_citext.rs`; case-folded `=`/`<`/`LIKE`/
+  ORDER BY + UNIQUE folding. NOTE: full WHERE-clause citext rewrite deferred (agent).
+- timeouts (5.28.B/C/D): `basin-shard/lock_wait.rs` (55P03 LockNotAvailable),
+  engine `session_reaper.rs` (idle-in-txn reaper), lock_timeout +
+  idle_in_transaction_session_timeout GUCs in session.rs/executor.rs.
+
+---
+
 ## 2026-05-21 — Two wide waves (6 + 5 agents): JSONB GIN probe, Phase 5.27 complete, FTS core, examples, docs
 
 **Wave A (6 agents, all file-disjoint, coherence EXIT 0):** `337b1ee` 5.19.C
