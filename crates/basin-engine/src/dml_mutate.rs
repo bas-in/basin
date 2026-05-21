@@ -2254,36 +2254,31 @@ async fn commit_replace(
     removed: Vec<String>,
     added: Vec<DataFileRef>,
 ) -> Result<()> {
-    match sess
-        .engine
+    // Optimistic-locking semantics: the catalog rejects the commit when the
+    // table snapshot has advanced past `expected`. We MUST propagate that
+    // `CommitConflict` to the router so the entire statement re-runs against
+    // the fresh snapshot — re-evaluating the WHERE clause from scratch.
+    //
+    // Earlier versions of this helper silently swallowed `CommitConflict`
+    // and re-applied the *same* `removed`/`added` plan against the newer
+    // snapshot. That broke OCC: a TypeORM-style
+    //   UPDATE t SET v = $1, version = version + 1
+    //   WHERE id = $2 AND version = $3
+    // could observe both concurrent writers "win" because the loser blindly
+    // replayed its stale removed/added list — clobbering the winner's
+    // change instead of observing that no row now matches version = $3.
+    //
+    // The router (`execute_with_conflict_retry`) already handles the
+    // transparent retry with backoff; bouncing the error up gives the
+    // statement a chance to re-read the new snapshot, re-evaluate the
+    // predicate, and either commit on a still-matching row or correctly
+    // return zero affected rows.
+    sess.engine
         .config()
         .catalog
-        .replace_data_files(
-            &sess.project,
-            table,
-            expected,
-            removed.clone(),
-            added.clone(),
-        )
-        .await
-    {
-        Ok(_) => Ok(()),
-        Err(BasinError::CommitConflict(_)) => {
-            let fresh = sess
-                .engine
-                .config()
-                .catalog
-                .load_table(&sess.project, table)
-                .await?;
-            sess.engine
-                .config()
-                .catalog
-                .replace_data_files(&sess.project, table, fresh.current_snapshot, removed, added)
-                .await?;
-            Ok(())
-        }
-        Err(e) => Err(e),
-    }
+        .replace_data_files(&sess.project, table, expected, removed, added)
+        .await?;
+    Ok(())
 }
 
 /// Best-effort physical removal of the old Parquet files plus any HNSW

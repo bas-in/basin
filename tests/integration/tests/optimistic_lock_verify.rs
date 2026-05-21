@@ -133,7 +133,6 @@ async fn connect(addr: SocketAddr) -> tokio_postgres::Client {
 ///
 /// Correct OCC semantics: exactly one task sees 1 returned row (wins), the
 /// other sees 0 (loses — stale version). Final version must be 2, not 3.
-#[ignore = "Misc: optimistic-lock row-version isolation not enforced — concurrent writers both commit — blocked on #40 cluster"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn optimistic_lock_row_version_concurrent_writers() {
     let server = start_server().await;
