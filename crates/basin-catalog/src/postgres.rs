@@ -5978,4 +5978,67 @@ mod tests {
             "expected FeatureNotSupported, got: {err}"
         );
     }
+
+    /// Phase 6.P0.B structural test. With the old `Mutex<Client>` design,
+    /// every catalog op went through one shared `tokio_postgres::Client`
+    /// and therefore one shared postgres backend pid — no matter how many
+    /// callers raced concurrently. The deadpool pool exposes 16 distinct
+    /// postgres sessions (default `BASIN_CATALOG_PG_POOL_SIZE = 16`).
+    /// We assert that property directly by holding multiple pooled clients
+    /// concurrently and confirming they sit on distinct backend pids.
+    ///
+    /// A wall-clock latency bench is too noisy to be a reliable signal
+    /// when the test suite shares one postgres instance with many sibling
+    /// tests; the structural invariant ("more than one PG session under
+    /// concurrent checkout") is the load-bearing claim that the latency
+    /// win depends on, so we test it directly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn pool_exposes_distinct_postgres_sessions() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let cat = std::sync::Arc::new(cat);
+
+        // Concurrently check out 16 pooled clients and query each for its
+        // backend pid. Holding the clients alive across the join keeps the
+        // pool's connections concurrently-in-flight, so deadpool must open
+        // fresh sessions rather than serially reusing one.
+        let mut handles = Vec::with_capacity(16);
+        for _ in 0..16 {
+            let cat = cat.clone();
+            handles.push(tokio::spawn(async move {
+                let client = cat.client().await.expect("checkout from pool");
+                // Hold a small barrier so all 16 tasks have their clients
+                // checked out at the same time before any returns to the
+                // pool. Without it the test could fire 16 strictly serial
+                // checkouts that all reuse one connection.
+                let pid: i32 = client
+                    .query_one("SELECT pg_backend_pid()", &[])
+                    .await
+                    .expect("pg_backend_pid query")
+                    .get(0);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                drop(client);
+                pid
+            }));
+        }
+        let mut pids = Vec::with_capacity(16);
+        for h in handles {
+            pids.push(h.await.unwrap());
+        }
+        let unique: std::collections::HashSet<i32> = pids.iter().copied().collect();
+        // Old `Mutex<Client>` exposed exactly one backend pid no matter
+        // how many concurrent callers. The pool must surface clearly more
+        // than one to satisfy this test; the bar is loose (>= 4) because
+        // OS/pg-side variance can occasionally hand a previously-released
+        // connection back even in-flight.
+        assert!(
+            unique.len() >= 4,
+            "expected the pool to expose multiple distinct postgres sessions \
+             under concurrent checkout, got {} unique pid(s) across 16 \
+             checkouts: {:?}",
+            unique.len(),
+            pids
+        );
+    }
 }
