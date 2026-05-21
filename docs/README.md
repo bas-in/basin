@@ -13,6 +13,10 @@ Navigation root for the Basin OSS repo. Every file is organised by
 basin-cloud's build-time fetcher uses this index to assemble the
 unified nav tree; GitHub renders it for humans browsing `docs/`.
 
+## Getting started
+
+- [Getting started with Basin](tutorial.md) — End-to-end walkthrough: spin up a dev cluster, create a table, add auth, enable row-level security, call the REST API, and deploy a Wasm function.
+
 ## Architecture
 
 - [Basin architecture](architecture.md) — Four-layer design: router, shard owners, WAL service, storage. Reference doc for how the code is laid out.
