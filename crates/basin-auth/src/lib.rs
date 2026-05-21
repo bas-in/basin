@@ -715,6 +715,7 @@ impl AuthService {
     pub async fn verify_webauthn_challenge<S>(
         &self,
         mfa_store: Option<&S>,
+        enc: &dyn oauth::EncryptionProvider,
         project_id: &ProjectId,
         user_id: UserId,
         challenge_id: uuid::Uuid,
@@ -724,7 +725,7 @@ impl AuthService {
         S: mfa::MfaStore,
     {
         mfa::verify_webauthn_challenge(
-            &self.inner, mfa_store, project_id, user_id, challenge_id, assertion_json,
+            &self.inner, mfa_store, enc, project_id, user_id, challenge_id, assertion_json,
         )
         .await
     }

@@ -195,6 +195,7 @@ fn mfa_cache_factor_lifecycle_unit() {
         status: FactorStatus::Unverified,
         secret_enc: "enc:x".into(),
         friendly_name: "App".into(),
+        last_used_step: 0,
         created_at: now,
         updated_at: now,
     });
@@ -452,9 +453,10 @@ async fn totp_challenge_step_up_issues_aal2() {
         .await
         .expect("begin_totp_challenge");
 
-    // Use next step's code (or same — within ±1 window).
-    let step2 = chrono::Utc::now().timestamp() as u64 / 30;
-    let code2 = compute_totp_code(&secret_bytes, step2);
+    // The factor-verify above burned `step` (6.SEC.P0.1 replay guard), so the
+    // step-up must present a code from a *later* step. `step + 1` is within the
+    // +1 skew window the verifier accepts and is > the burned step.
+    let code2 = compute_totp_code(&secret_bytes, step + 1);
 
     let result = svc
         .verify_totp_challenge(

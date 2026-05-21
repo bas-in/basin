@@ -69,6 +69,19 @@ hmac = { workspace = true }
 base32 = "0.4"
 sha1 = { workspace = true }
 
+# WebAuthn / FIDO2 (Phase 6.SEC.P0.2). Real assertion + attestation crypto:
+# - p256: pure-Rust NIST P-256 ECDSA verification of the authenticator
+#   signature over `authenticatorData || sha256(clientDataJSON)` (COSE alg -7).
+# - ciborium: CBOR decode of the attestation object + COSE public key. Both
+#   are pure-Rust (no openssl), Apache-2.0/MIT, and avoid the heavy
+#   `webauthn-authenticator-rs` softpasskey path (which drags in openssl).
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+ciborium = "0.2"
+
 [dev-dependencies]
 tempfile.workspace = true
 tokio-test.workspace = true
+# Software authenticator fixture for WebAuthn tests: signs assertions with a
+# generated P-256 key so the verification path can be exercised end-to-end.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+rand_core = "0.6"

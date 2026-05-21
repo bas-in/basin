@@ -86,50 +86,119 @@ async fn make_user(svc: &AuthService, project: &ProjectId, email: &str) -> Uuid 
         .expect("signup")
 }
 
-/// Build a minimal fake attestation response that echoes the challenge.
-fn make_attestation(challenge: &str) -> String {
-    let client_data = serde_json::json!({
-        "type": "webauthn.create",
-        "challenge": challenge,
-        "origin": "http://localhost"
-    });
-    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(serde_json::to_vec(&client_data).unwrap());
-    serde_json::json!({
-        "type": "public-key",
-        "id": "fake-cred-id",
-        "rawId": "fake-cred-id",
-        "response": {
-            "clientDataJSON": b64,
-            "attestationObject": base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .encode(b"fake-att-obj")
-        }
-    })
-    .to_string()
+const RP_ID: &str = "localhost";
+const ORIGIN: &str = "http://localhost";
+
+fn b64url(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
-/// Build a minimal fake assertion response that echoes the challenge.
-fn make_assertion(challenge: &str) -> String {
-    let client_data = serde_json::json!({
-        "type": "webauthn.get",
-        "challenge": challenge,
-        "origin": "http://localhost"
-    });
-    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(serde_json::to_vec(&client_data).unwrap());
-    serde_json::json!({
-        "type": "public-key",
-        "id": "fake-cred-id",
-        "rawId": "fake-cred-id",
-        "response": {
-            "clientDataJSON": b64,
-            "authenticatorData": base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .encode(b"fake-auth-data"),
-            "signature": base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .encode(b"fake-sig")
+fn sha256(data: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize().into()
+}
+
+/// A software P-256 authenticator that produces real FIDO2 attestation +
+/// assertion blobs. Mirrors the in-prod verifier in `basin-auth::mfa`.
+struct SoftAuthenticator {
+    signing_key: p256::ecdsa::SigningKey,
+    credential_id: Vec<u8>,
+}
+
+impl SoftAuthenticator {
+    fn new() -> Self {
+        Self {
+            signing_key: p256::ecdsa::SigningKey::random(&mut rand_core::OsRng),
+            credential_id: b"soft-cred-int-01".to_vec(),
         }
-    })
-    .to_string()
+    }
+
+    fn cose_key(&self) -> Vec<u8> {
+        use ciborium::value::{Integer, Value};
+        let vk = p256::ecdsa::VerifyingKey::from(&self.signing_key);
+        let point = vk.to_encoded_point(false);
+        let x = point.x().unwrap().to_vec();
+        let y = point.y().unwrap().to_vec();
+        let map = Value::Map(vec![
+            (Value::Integer(Integer::from(1)), Value::Integer(Integer::from(2))),
+            (Value::Integer(Integer::from(3)), Value::Integer(Integer::from(-7))),
+            (Value::Integer(Integer::from(-1)), Value::Integer(Integer::from(1))),
+            (Value::Integer(Integer::from(-2)), Value::Bytes(x)),
+            (Value::Integer(Integer::from(-3)), Value::Bytes(y)),
+        ]);
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&map, &mut buf).unwrap();
+        buf
+    }
+
+    fn auth_data(&self, sign_count: u32, include_cred: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&sha256(RP_ID.as_bytes()));
+        let mut flags = 0x01u8; // UP
+        if include_cred {
+            flags |= 0x40; // AT
+        }
+        out.push(flags);
+        out.extend_from_slice(&sign_count.to_be_bytes());
+        if include_cred {
+            out.extend_from_slice(&[0u8; 16]); // aaguid
+            out.extend_from_slice(&(self.credential_id.len() as u16).to_be_bytes());
+            out.extend_from_slice(&self.credential_id);
+            out.extend_from_slice(&self.cose_key());
+        }
+        out
+    }
+
+    fn client_data(&self, ty: &str, challenge: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "type": ty, "challenge": challenge, "origin": ORIGIN,
+        }))
+        .unwrap()
+    }
+
+    fn attestation(&self, challenge: &str, sign_count: u32) -> String {
+        use ciborium::value::Value;
+        let client_data = self.client_data("webauthn.create", challenge);
+        let att_obj = Value::Map(vec![
+            (Value::Text("fmt".into()), Value::Text("none".into())),
+            (Value::Text("attStmt".into()), Value::Map(vec![])),
+            (Value::Text("authData".into()), Value::Bytes(self.auth_data(sign_count, true))),
+        ]);
+        let mut obj_buf = Vec::new();
+        ciborium::ser::into_writer(&att_obj, &mut obj_buf).unwrap();
+        serde_json::json!({
+            "type": "public-key",
+            "id": b64url(&self.credential_id),
+            "rawId": b64url(&self.credential_id),
+            "response": {
+                "clientDataJSON": b64url(&client_data),
+                "attestationObject": b64url(&obj_buf),
+            }
+        })
+        .to_string()
+    }
+
+    fn assertion(&self, challenge: &str, sign_count: u32) -> String {
+        use p256::ecdsa::{signature::Signer, DerSignature};
+        let client_data = self.client_data("webauthn.get", challenge);
+        let auth_data = self.auth_data(sign_count, false);
+        let mut signed = auth_data.clone();
+        signed.extend_from_slice(&sha256(&client_data));
+        let sig: DerSignature = self.signing_key.sign(&signed);
+        serde_json::json!({
+            "type": "public-key",
+            "id": b64url(&self.credential_id),
+            "rawId": b64url(&self.credential_id),
+            "response": {
+                "clientDataJSON": b64url(&client_data),
+                "authenticatorData": b64url(&auth_data),
+                "signature": b64url(sig.as_bytes()),
+            }
+        })
+        .to_string()
+    }
 }
 
 fn extract_challenge(options_json: &str) -> String {
@@ -178,8 +247,9 @@ async fn webauthn_verify_ok_issues_recovery_codes() {
         .await
         .expect("enroll");
 
+    let auth = SoftAuthenticator::new();
     let challenge = extract_challenge(&enrollment.creation_options_json);
-    let attestation = make_attestation(&challenge);
+    let attestation = auth.attestation(&challenge, 1);
 
     let codes = svc
         .verify_webauthn_factor(
@@ -213,7 +283,8 @@ async fn webauthn_verify_wrong_challenge_rejected() {
         .await
         .expect("enroll");
 
-    let attestation = make_attestation("WRONG_CHALLENGE");
+    let auth = SoftAuthenticator::new();
+    let attestation = auth.attestation("WRONG_CHALLENGE", 1);
     let err = svc
         .verify_webauthn_factor(
             None::<&MfaCache>,
@@ -247,8 +318,9 @@ async fn webauthn_challenge_step_up_issues_aal2() {
         .await
         .expect("enroll");
 
+    let auth = SoftAuthenticator::new();
     let challenge = extract_challenge(&enrollment.creation_options_json);
-    let attestation = make_attestation(&challenge);
+    let attestation = auth.attestation(&challenge, 1);
     svc.verify_webauthn_factor(
         None::<&MfaCache>,
         &enc,
@@ -267,10 +339,11 @@ async fn webauthn_challenge_step_up_issues_aal2() {
         .expect("begin_webauthn_challenge");
 
     let req_challenge = extract_challenge(&options_json);
-    let assertion = make_assertion(&req_challenge);
+    // Counter must strictly advance past the registration value (1).
+    let assertion = auth.assertion(&req_challenge, 2);
 
     let result = svc
-        .verify_webauthn_challenge(None::<&MfaCache>, &project, uid, challenge_id, &assertion)
+        .verify_webauthn_challenge(None::<&MfaCache>, &enc, &project, uid, challenge_id, &assertion)
         .await
         .expect("verify_webauthn_challenge");
 
@@ -294,8 +367,9 @@ async fn webauthn_assertion_wrong_challenge_rejected() {
         .await
         .expect("enroll");
 
+    let auth = SoftAuthenticator::new();
     let challenge = extract_challenge(&enrollment.creation_options_json);
-    let attestation = make_attestation(&challenge);
+    let attestation = auth.attestation(&challenge, 1);
     svc.verify_webauthn_factor(
         None::<&MfaCache>,
         &enc,
@@ -313,10 +387,12 @@ async fn webauthn_assertion_wrong_challenge_rejected() {
         .await
         .expect("begin");
 
-    let bad_assertion = make_assertion("BAD_CHALLENGE");
+    // Assertion over the wrong challenge: clientDataJSON binding fails.
+    let bad_assertion = auth.assertion("BAD_CHALLENGE", 2);
     let err = svc
         .verify_webauthn_challenge(
             None::<&MfaCache>,
+            &enc,
             &project,
             uid,
             challenge_id,
@@ -324,6 +400,74 @@ async fn webauthn_assertion_wrong_challenge_rejected() {
         )
         .await;
     assert!(err.is_err());
+}
+
+/// 6.SEC.P0.2: a sign-counter regression (cloned authenticator replaying an
+/// old counter) is rejected even though the signature is valid.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webauthn_counter_regression_rejected() {
+    let schema = unique_schema("mfa_wa_e8");
+    let Some(svc) = try_make_svc(&schema).await else {
+        return;
+    };
+    let enc = PlaintextEncryption;
+    let project = ProjectId::new();
+    let uid = make_user(&svc, &project, "wa8@example.com").await;
+
+    let auth = SoftAuthenticator::new();
+    let enrollment = svc
+        .enroll_webauthn(None::<&MfaCache>, &project, uid, "Passkey")
+        .await
+        .expect("enroll");
+    let challenge = extract_challenge(&enrollment.creation_options_json);
+    // Register at counter 10.
+    svc.verify_webauthn_factor(
+        None::<&MfaCache>,
+        &enc,
+        &project,
+        uid,
+        enrollment.factor_id,
+        enrollment.challenge_id,
+        &auth.attestation(&challenge, 10),
+    )
+    .await
+    .expect("verify");
+
+    // First assertion advances to 11 → accepted.
+    let (cid1, opts1) = svc
+        .begin_webauthn_challenge(None::<&MfaCache>, &project, uid, enrollment.factor_id)
+        .await
+        .expect("begin1");
+    svc.verify_webauthn_challenge(
+        None::<&MfaCache>,
+        &enc,
+        &project,
+        uid,
+        cid1,
+        &auth.assertion(&extract_challenge(&opts1), 11),
+    )
+    .await
+    .expect("assertion at counter 11 accepted");
+
+    // Second assertion REPLAYS counter 11 (no advance) → must be rejected.
+    let (cid2, opts2) = svc
+        .begin_webauthn_challenge(None::<&MfaCache>, &project, uid, enrollment.factor_id)
+        .await
+        .expect("begin2");
+    let err = svc
+        .verify_webauthn_challenge(
+            None::<&MfaCache>,
+            &enc,
+            &project,
+            uid,
+            cid2,
+            &auth.assertion(&extract_challenge(&opts2), 11),
+        )
+        .await;
+    assert!(
+        err.is_err(),
+        "non-advancing sign-counter must be rejected as a clone"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -341,8 +485,9 @@ async fn webauthn_unenroll_requires_aal2() {
         .await
         .expect("enroll");
 
+    let auth = SoftAuthenticator::new();
     let challenge = extract_challenge(&enrollment.creation_options_json);
-    let attestation = make_attestation(&challenge);
+    let attestation = auth.attestation(&challenge, 1);
     svc.verify_webauthn_factor(
         None::<&MfaCache>,
         &enc,
@@ -407,7 +552,8 @@ async fn webauthn_expired_challenge_rejected() {
     }
 
     let enc = PlaintextEncryption;
-    let attestation = make_attestation("expired-challenge");
+    let auth = SoftAuthenticator::new();
+    let attestation = auth.attestation("expired-challenge", 1);
     let err = svc
         .verify_webauthn_factor(
             None::<&MfaCache>,

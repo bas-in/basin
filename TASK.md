@@ -1806,17 +1806,24 @@ SQL with their project ID.
 Sequencing: P0s in parallel (different files), then P1s, then the
 regression-test backfill in `tests/integration/tests/security.rs`.
 
-- [ ] **6.SEC.P0.1 — TOTP replay protection actually wired**
-      (`crates/basin-auth/src/mfa.rs:852,931`). Today the call passes
-      `&HashSet::new()` as the seen-codes set → no replay protection. Plumb
-      a real per-factor recently-seen-codes ring (TTL ≥ TOTP step × 2 =
-      60–90 s). Test: capture a code → second submission inside the window
-      fails.
-- [ ] **6.SEC.P0.2 — WebAuthn signature verification** (`mfa.rs:1066–1126,
-      1182–1240`). Today only echoes the challenge nonce; no attestation /
-      assertion crypto. Wire `webauthn-rs` per its standard flow (the crate
-      is already a dep — it's just not being called). Test: forged
-      attestation rejected; valid authenticator-signed assertion accepted.
+- [x] **6.SEC.P0.1 — TOTP replay protection actually wired**
+      (`crates/basin-auth/src/mfa.rs`). Replaced the `&HashSet::new()` no-op
+      with the RFC 6238 §5.2 monotonic-counter rule: the highest accepted
+      30-second step is persisted on the factor row (new `last_used_step`
+      column, monotonic via `GREATEST`/`max`) and any code at or below it is
+      rejected. Burned on both factor-verify and challenge-verify. Tests:
+      `totp_used_code_rejected_on_replay`, `totp_next_window_code_still_accepted`,
+      `mfa_cache_last_used_step_is_monotonic`.
+- [x] **6.SEC.P0.2 — WebAuthn signature verification** (`mfa.rs`). Replaced
+      the echo-only stub with real FIDO2 crypto (pure-Rust `p256` + `ciborium`,
+      no openssl): registration parses the CBOR attestation object + COSE P-256
+      key and binds clientData type/challenge/origin + rpIdHash; assertion
+      verifies the ECDSA-P256 signature over `authData || sha256(clientDataJSON)`
+      and enforces a strictly-advancing sign-counter (clone detection). Tests:
+      `webauthn_forged_attestation_rejected`, `webauthn_valid_assertion_accepted`,
+      `webauthn_bad_signature_rejected`, `webauthn_counter_regression_rejected`
+      (+ `mfa_webauthn::webauthn_counter_regression_rejected` integration test
+      driving a software P-256 authenticator).
 - [ ] **6.SEC.P0.3 — Inbound webhook authentication**
       (`crates/basin-rest/src/routes/inbound.rs:52`). The
       `BASIN_NET_ALLOW_PLAINTEXT_WEBHOOKS` debug gate promised by ADR 0019

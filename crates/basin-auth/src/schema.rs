@@ -369,6 +369,55 @@ pub async fn run_migrations(client: &Client, schema: &str) -> Result<()> {
                 created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
             )"
         ),
+        // MFA factors (Phase 5.10.M / 6.SEC.P0). `secret_enc` carries the
+        // encrypted TOTP base32 secret, or — for WebAuthn — the serialised
+        // passkey credential (credential id + COSE public key + sign-counter).
+        // `last_used_step` is the replay/clone guard: the highest accepted TOTP
+        // 30-second step (RFC 6238 §5.2) or the highest WebAuthn sign-counter.
+        // A code/assertion at or below this value is a replay and is rejected.
+        format!(
+            "CREATE TABLE IF NOT EXISTS {schema}_mfa_factors (
+                id              UUID PRIMARY KEY,
+                user_id         UUID NOT NULL REFERENCES {schema}_users(user_id) ON DELETE CASCADE,
+                project_id      TEXT NOT NULL,
+                factor_type     TEXT NOT NULL,
+                status          TEXT NOT NULL,
+                secret_enc      TEXT NOT NULL,
+                friendly_name   TEXT NOT NULL,
+                last_used_step  BIGINT NOT NULL DEFAULT 0,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+            )"
+        ),
+        // Defensive add-column for schemas migrated before 6.SEC.P0 landed the
+        // replay guard. Idempotent on Postgres ≥ 9.6.
+        format!(
+            "ALTER TABLE {schema}_mfa_factors \
+             ADD COLUMN IF NOT EXISTS last_used_step BIGINT NOT NULL DEFAULT 0"
+        ),
+        // Short-lived MFA challenges (step-up + WebAuthn registration/assertion).
+        // `challenge_data` carries the base64url challenge nonce.
+        format!(
+            "CREATE TABLE IF NOT EXISTS {schema}_mfa_challenges (
+                id             UUID PRIMARY KEY,
+                factor_id      UUID NOT NULL,
+                user_id        UUID NOT NULL REFERENCES {schema}_users(user_id) ON DELETE CASCADE,
+                project_id     TEXT NOT NULL,
+                expires_at     TIMESTAMPTZ NOT NULL,
+                challenge_data TEXT NOT NULL DEFAULT ''
+            )"
+        ),
+        // Single-use recovery codes (bcrypt-hashed). `consumed_at` non-null ⇒ spent.
+        format!(
+            "CREATE TABLE IF NOT EXISTS {schema}_mfa_recovery_codes (
+                id           BIGSERIAL PRIMARY KEY,
+                user_id      UUID NOT NULL REFERENCES {schema}_users(user_id) ON DELETE CASCADE,
+                project_id   TEXT NOT NULL,
+                code_hash    TEXT NOT NULL,
+                created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+                consumed_at  TIMESTAMPTZ
+            )"
+        ),
         // Secondary indexes — one per hot lookup path:
         //   - api_keys (key_hash): bearer-token verification
         //   - auth_magic_links (token_hash): consume-flow lookup

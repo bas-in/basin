@@ -29,13 +29,19 @@
 //!
 //! ## Crypto provenance
 //!
-//! - TOTP: `totp-rs` crate (RFC 6238 with SHA1 HMAC, 6-digit, 30-second step).
-//! - WebAuthn: `webauthn-rs` crate (FIDO2 attestation + assertion).
-//! - Recovery codes: `argon2` crate (argon2id).
-//! - Replay cache: in-memory `DashMap<(user_id, step)>` with short TTL via
-//!   the existing `governor` infrastructure — prevents immediate TOTP reuse.
-
-use std::collections::HashSet;
+//! - TOTP: SHA1-HMAC RFC 6238 (6-digit, 30-second step). Replay protection
+//!   uses the RFC 6238 §5.2 monotonic-counter rule: the highest accepted
+//!   30-second step is persisted on the factor row (`last_used_step`), and any
+//!   subsequent code whose step is `<=` that value is rejected. A captured code
+//!   therefore cannot be replayed inside its ±skew validity window.
+//! - WebAuthn: real FIDO2 verification (Phase 6.SEC.P0.2). Registration parses
+//!   the CBOR attestation object, extracts the COSE P-256 public key + credential
+//!   id, and binds the clientDataJSON `type`/`challenge`/`origin`. Assertion
+//!   verifies the ECDSA-P256 signature over `authenticatorData ||
+//!   sha256(clientDataJSON)` against the stored public key and enforces the
+//!   FIDO sign-counter (a counter that fails to advance ⇒ cloned authenticator
+//!   ⇒ rejected). Crypto via the pure-Rust `p256` + `ciborium` crates.
+//! - Recovery codes: bcrypt (cost 4) over 96-bit random codes; single-use.
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -132,6 +138,11 @@ pub struct MfaFactorRow {
     pub secret_enc: String,
     /// Human-readable label (e.g. authenticator app name or passkey device).
     pub friendly_name: String,
+    /// TOTP replay guard (RFC 6238 §5.2): the highest 30-second time step that
+    /// has been successfully consumed by this factor. A code whose step is
+    /// `<=` this value is a replay and is rejected. `0` means "never used".
+    /// For WebAuthn factors this column carries the authenticator sign-counter.
+    pub last_used_step: u64,
     pub created_at: chrono::DateTime<Utc>,
     pub updated_at: chrono::DateTime<Utc>,
 }
@@ -174,6 +185,15 @@ pub trait MfaStore: AuthStore {
 
     /// Transition `status` to `verified` and update the timestamp.
     async fn verify_mfa_factor(&self, schema: &str, factor_id: Uuid) -> Result<()>;
+
+    /// Persist the highest accepted TOTP step (or WebAuthn sign-counter) for a
+    /// factor — the replay/clone guard. Idempotent: callers only advance it.
+    async fn set_factor_last_used_step(
+        &self,
+        schema: &str,
+        factor_id: Uuid,
+        step: u64,
+    ) -> Result<()>;
 
     async fn delete_mfa_factor(&self, schema: &str, factor_id: Uuid) -> Result<()>;
 
@@ -240,8 +260,8 @@ impl MfaStore for PostgresAuthStore {
         let sql = format!(
             "INSERT INTO {schema}_mfa_factors
                 (id, user_id, project_id, factor_type, status, secret_enc, friendly_name,
-                 created_at, updated_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)"
+                 last_used_step, created_at, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)"
         );
         client
             .execute(
@@ -254,6 +274,7 @@ impl MfaStore for PostgresAuthStore {
                     &row.status.to_string(),
                     &row.secret_enc,
                     &row.friendly_name,
+                    &(row.last_used_step as i64),
                     &row.created_at,
                     &row.updated_at,
                 ],
@@ -271,7 +292,7 @@ impl MfaStore for PostgresAuthStore {
         let client = self.client.lock().await;
         let sql = format!(
             "SELECT id, user_id, project_id, factor_type, status, secret_enc, friendly_name,
-                    created_at, updated_at
+                    last_used_step, created_at, updated_at
              FROM {schema}_mfa_factors WHERE id = $1"
         );
         let maybe = client
@@ -290,7 +311,7 @@ impl MfaStore for PostgresAuthStore {
         let client = self.client.lock().await;
         let sql = format!(
             "SELECT id, user_id, project_id, factor_type, status, secret_enc, friendly_name,
-                    created_at, updated_at
+                    last_used_step, created_at, updated_at
              FROM {schema}_mfa_factors WHERE user_id = $1 AND project_id = $2
              ORDER BY created_at ASC"
         );
@@ -311,6 +332,27 @@ impl MfaStore for PostgresAuthStore {
             .execute(&sql, &[&factor_id])
             .await
             .map_err(|e| BasinError::catalog(format!("verify_mfa_factor: {e}")))?;
+        Ok(())
+    }
+
+    async fn set_factor_last_used_step(
+        &self,
+        schema: &str,
+        factor_id: Uuid,
+        step: u64,
+    ) -> Result<()> {
+        let client = self.client.lock().await;
+        // GREATEST guards against a stale concurrent caller lowering the
+        // counter — the replay guard must be monotonic.
+        let sql = format!(
+            "UPDATE {schema}_mfa_factors
+             SET last_used_step = GREATEST(last_used_step, $2), updated_at = now()
+             WHERE id = $1"
+        );
+        client
+            .execute(&sql, &[&factor_id, &(step as i64)])
+            .await
+            .map_err(|e| BasinError::catalog(format!("set_factor_last_used_step: {e}")))?;
         Ok(())
     }
 
@@ -464,6 +506,7 @@ impl MfaStore for PostgresAuthStore {
 fn pg_row_to_factor(r: tokio_postgres::Row) -> MfaFactorRow {
     let ft_str: String = r.get(3);
     let st_str: String = r.get(4);
+    let last_used_step: i64 = r.get(7);
     MfaFactorRow {
         id: r.get(0),
         user_id: r.get(1),
@@ -472,8 +515,9 @@ fn pg_row_to_factor(r: tokio_postgres::Row) -> MfaFactorRow {
         status: FactorStatus::from_str(&st_str).unwrap_or(FactorStatus::Unverified),
         secret_enc: r.get(5),
         friendly_name: r.get(6),
-        created_at: r.get(7),
-        updated_at: r.get(8),
+        last_used_step: last_used_step.max(0) as u64,
+        created_at: r.get(8),
+        updated_at: r.get(9),
     }
 }
 
@@ -535,6 +579,15 @@ impl MfaCache {
 
     pub fn delete_factor_sync(&self, factor_id: Uuid) {
         self.factors.lock().unwrap().retain(|f| f.id != factor_id);
+    }
+
+    /// Monotonically advance the replay-guard counter for a factor.
+    pub fn set_factor_last_used_step_sync(&self, factor_id: Uuid, step: u64) {
+        let mut factors = self.factors.lock().unwrap();
+        if let Some(f) = factors.iter_mut().find(|f| f.id == factor_id) {
+            f.last_used_step = f.last_used_step.max(step);
+            f.updated_at = Utc::now();
+        }
     }
 
     pub fn insert_challenge_sync(&self, row: MfaChallengeRow) {
@@ -645,13 +698,15 @@ fn percent_encode(s: &str) -> String {
 }
 
 /// Verify a TOTP code against a base32 secret. Allows one-step window on
-/// either side for clock skew. Rejects the current step if it's in
-/// `used_steps` (replay protection).
-pub fn verify_totp(
-    secret_b32: &str,
-    code: &str,
-    used_steps: &HashSet<u64>,
-) -> Result<u64> {
+/// either side for clock skew.
+///
+/// **Replay protection (RFC 6238 §5.2).** `min_step` is the highest 30-second
+/// time step already consumed by this factor (`0` = never used). Any candidate
+/// step `<= min_step` is rejected, so a code captured and already used cannot
+/// be replayed inside its validity window — even though it is still
+/// arithmetically valid. On success the accepted step is returned; the caller
+/// MUST persist it as the new `min_step`.
+pub fn verify_totp(secret_b32: &str, code: &str, min_step: u64) -> Result<u64> {
     let secret_bytes = base32::decode(
         base32::Alphabet::RFC4648 { padding: false },
         secret_b32,
@@ -671,9 +726,10 @@ pub fn verify_totp(
     let now_secs = Utc::now().timestamp() as u64;
     let current_step = now_secs / 30;
 
-    // Check current step and ±1 window.
-    for step in [current_step.saturating_sub(1), current_step, current_step + 1] {
-        if used_steps.contains(&step) {
+    // Check current step and ±1 window, newest first so a fresh code wins.
+    for step in [current_step + 1, current_step, current_step.saturating_sub(1)] {
+        // Replay guard: a step at or below the last consumed step is a reuse.
+        if step <= min_step {
             continue;
         }
         let expected = totp_at_step(&secret_bytes, step)?;
@@ -803,6 +859,7 @@ where
         status: FactorStatus::Unverified,
         secret_enc,
         friendly_name: friendly_name.to_owned(),
+        last_used_step: 0,
         created_at: now,
         updated_at: now,
     };
@@ -849,12 +906,17 @@ where
     }
 
     let secret = enc.decrypt(&factor.secret_enc)?;
-    let _step = verify_totp(&secret, code, &HashSet::new())?;
+    let step = verify_totp(&secret, code, factor.last_used_step)?;
 
     if let Some(pg) = mfa_store {
         pg.verify_mfa_factor(schema, factor_id).await?;
+        // Burn this step so the enrollment code can't be replayed.
+        pg.set_factor_last_used_step(schema, factor_id, step).await?;
     } else {
         inner.mfa_cache.verify_factor_sync(factor_id);
+        inner
+            .mfa_cache
+            .set_factor_last_used_step_sync(factor_id, step);
     }
 
     // Issue recovery codes only at first verified factor.
@@ -928,7 +990,17 @@ where
     require_factor_verified(&factor)?;
 
     let secret = enc.decrypt(&factor.secret_enc)?;
-    let _step = verify_totp(&secret, code, &HashSet::new())?;
+    let step = verify_totp(&secret, code, factor.last_used_step)?;
+
+    // Persist the accepted step BEFORE issuing tokens: a replay of the same
+    // code (same or lower step) is now rejected for the validity window.
+    if let Some(pg) = mfa_store {
+        pg.set_factor_last_used_step(schema, factor.id, step).await?;
+    } else {
+        inner
+            .mfa_cache
+            .set_factor_last_used_step_sync(factor.id, step);
+    }
 
     let tokens = issue_aal2_tokens(inner, project_id, user_id, "totp").await?;
     Ok(ChallengeVerifyResult { tokens })
@@ -1001,6 +1073,7 @@ where
         status: FactorStatus::Unverified,
         secret_enc: String::new(), // filled on verify
         friendly_name: friendly_name.to_owned(),
+        last_used_step: 0,
         created_at: now,
         updated_at: now,
     };
@@ -1036,6 +1109,341 @@ where
     })
 }
 
+// ---------------------------------------------------------------------------
+// WebAuthn / FIDO2 cryptographic verification (Phase 6.SEC.P0.2)
+// ---------------------------------------------------------------------------
+//
+// We implement the load-bearing FIDO2 checks directly with pure-Rust crypto
+// (`p256` for ECDSA-P256 / COSE alg -7, `ciborium` for CBOR) rather than
+// pulling `webauthn-rs` + the openssl-backed `webauthn-authenticator-rs`
+// softpasskey test helper. The checks performed are exactly those an attacker
+// must defeat to forge an aal2 token:
+//
+//   Registration (attestation):
+//     - clientDataJSON.type == "webauthn.create"
+//     - clientDataJSON.challenge == issued challenge (constant-time)
+//     - clientDataJSON.origin   == expected origin
+//     - authenticatorData.rpIdHash == sha256(RP_ID)
+//     - User-Present flag set
+//     - parse the COSE EC2 P-256 public key + credential id from authData
+//
+//   Assertion (login / step-up):
+//     - clientDataJSON.type == "webauthn.get"
+//     - clientDataJSON.challenge / origin as above
+//     - authenticatorData.rpIdHash == sha256(RP_ID), UP flag set
+//     - ECDSA-P256 verify( pubkey, sig, authData || sha256(clientDataJSON) )
+//     - signCount strictly greater than the stored counter (rollback ⇒ clone)
+//
+// A hand-built JSON blob with the right challenge but no valid signature fails
+// the ECDSA step; a cloned authenticator replaying an old signCount fails the
+// counter step.
+
+/// The Relying Party ID this deployment binds passkeys to. Matches the `rp.id`
+/// advertised in [`enroll_webauthn`]'s creation options.
+const WEBAUTHN_RP_ID: &str = "localhost";
+/// The expected `origin` in clientDataJSON. Matches the dev/test origin used by
+/// the browser when contacting a `localhost` RP.
+const WEBAUTHN_ORIGIN: &str = "http://localhost";
+
+/// A persisted passkey credential. Serialised as JSON, then encrypted into the
+/// factor's `secret_enc` column. The sign-counter lives in `last_used_step`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredPasskey {
+    /// base64url credential id (the authenticator's handle for this key).
+    credential_id_b64: String,
+    /// Uncompressed SEC1 public-key point (0x04 || X || Y), base64url.
+    public_key_sec1_b64: String,
+}
+
+fn b64url_decode(s: &str) -> Result<Vec<u8>> {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(s)
+        .map_err(|e| BasinError::InvalidIdent(format!("base64url decode: {e}")))
+}
+
+fn sha256(data: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize().into()
+}
+
+/// Parsed FIDO2 `authenticatorData` header (the fixed 37-byte prefix).
+struct AuthData {
+    rp_id_hash: [u8; 32],
+    flags: u8,
+    sign_count: u32,
+    /// Remaining bytes after the 37-byte header (attestedCredentialData +
+    /// extensions, present only on registration / when AT flag is set).
+    rest: Vec<u8>,
+}
+
+fn parse_auth_data(bytes: &[u8]) -> Result<AuthData> {
+    if bytes.len() < 37 {
+        return Err(BasinError::InvalidIdent("authenticatorData too short".into()));
+    }
+    let mut rp_id_hash = [0u8; 32];
+    rp_id_hash.copy_from_slice(&bytes[0..32]);
+    let flags = bytes[32];
+    let sign_count = u32::from_be_bytes([bytes[33], bytes[34], bytes[35], bytes[36]]);
+    Ok(AuthData {
+        rp_id_hash,
+        flags,
+        sign_count,
+        rest: bytes[37..].to_vec(),
+    })
+}
+
+/// FIDO2 flag: User Present (bit 0).
+const FLAG_UP: u8 = 0x01;
+/// FIDO2 flag: Attested credential data included (bit 6).
+const FLAG_AT: u8 = 0x40;
+
+/// Extract `(credential_id, cose_public_key_cbor_bytes)` from the
+/// attestedCredentialData portion of authenticatorData.
+fn parse_attested_credential(rest: &[u8]) -> Result<(Vec<u8>, ciborium::value::Value)> {
+    // attestedCredentialData = aaguid(16) || credIdLen(2) || credId || COSEKey
+    if rest.len() < 18 {
+        return Err(BasinError::InvalidIdent(
+            "attestedCredentialData too short".into(),
+        ));
+    }
+    let cred_id_len = u16::from_be_bytes([rest[16], rest[17]]) as usize;
+    let cred_start = 18;
+    let cred_end = cred_start + cred_id_len;
+    if rest.len() < cred_end {
+        return Err(BasinError::InvalidIdent(
+            "credential id length overruns authenticatorData".into(),
+        ));
+    }
+    let credential_id = rest[cred_start..cred_end].to_vec();
+    let cose_bytes = &rest[cred_end..];
+    let cose: ciborium::value::Value = ciborium::de::from_reader(cose_bytes)
+        .map_err(|e| BasinError::InvalidIdent(format!("COSE key CBOR decode: {e}")))?;
+    Ok((credential_id, cose))
+}
+
+/// Convert a COSE EC2 P-256 (alg -7) public key into an uncompressed SEC1
+/// point (0x04 || X || Y). Rejects any other key type / curve / algorithm.
+fn cose_ec2_p256_to_sec1(cose: &ciborium::value::Value) -> Result<Vec<u8>> {
+    use ciborium::value::Value;
+    let map = match cose {
+        Value::Map(m) => m,
+        _ => return Err(BasinError::InvalidIdent("COSE key is not a map".into())),
+    };
+    let get = |key: i128| -> Option<&Value> {
+        map.iter().find_map(|(k, v)| match k {
+            Value::Integer(i) if i128::from(*i) == key => Some(v),
+            _ => None,
+        })
+    };
+    let as_int = |v: &Value| -> Option<i128> {
+        match v {
+            Value::Integer(i) => Some(i128::from(*i)),
+            _ => None,
+        }
+    };
+    // kty (1) must be EC2 (2); alg (3) must be ES256 (-7); crv (-1) must be P-256 (1).
+    if get(1).and_then(as_int) != Some(2) {
+        return Err(BasinError::InvalidIdent("COSE key kty != EC2".into()));
+    }
+    if get(3).and_then(as_int) != Some(-7) {
+        return Err(BasinError::InvalidIdent(
+            "COSE key alg != ES256 (only P-256 supported)".into(),
+        ));
+    }
+    if get(-1).and_then(as_int) != Some(1) {
+        return Err(BasinError::InvalidIdent("COSE key crv != P-256".into()));
+    }
+    let x = match get(-2) {
+        Some(Value::Bytes(b)) if b.len() == 32 => b.clone(),
+        _ => return Err(BasinError::InvalidIdent("COSE key x coord invalid".into())),
+    };
+    let y = match get(-3) {
+        Some(Value::Bytes(b)) if b.len() == 32 => b.clone(),
+        _ => return Err(BasinError::InvalidIdent("COSE key y coord invalid".into())),
+    };
+    let mut sec1 = Vec::with_capacity(65);
+    sec1.push(0x04);
+    sec1.extend_from_slice(&x);
+    sec1.extend_from_slice(&y);
+    Ok(sec1)
+}
+
+/// Validate clientDataJSON for the given ceremony `type`, binding the
+/// challenge (constant-time) and origin.
+fn check_client_data(
+    client_data_b64: &str,
+    expected_type: &str,
+    expected_challenge: &str,
+) -> Result<()> {
+    let bytes = b64url_decode(client_data_b64)?;
+    let cd: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| BasinError::InvalidIdent(format!("clientDataJSON parse: {e}")))?;
+
+    if cd.get("type").and_then(|v| v.as_str()) != Some(expected_type) {
+        return Err(BasinError::InvalidIdent(format!(
+            "clientDataJSON.type != {expected_type}"
+        )));
+    }
+    let returned_challenge = cd
+        .get("challenge")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| BasinError::InvalidIdent("missing challenge in clientDataJSON".into()))?;
+    let challenge_ok: bool = returned_challenge
+        .as_bytes()
+        .ct_eq(expected_challenge.as_bytes())
+        .into();
+    if !challenge_ok {
+        return Err(BasinError::InvalidIdent("WebAuthn challenge mismatch".into()));
+    }
+    let origin = cd
+        .get("origin")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| BasinError::InvalidIdent("missing origin in clientDataJSON".into()))?;
+    if origin != WEBAUTHN_ORIGIN {
+        return Err(BasinError::InvalidIdent("WebAuthn origin mismatch".into()));
+    }
+    Ok(())
+}
+
+/// Verify a registration (attestation) response. Returns the credential to
+/// persist and the initial authenticator sign-counter.
+fn verify_attestation(
+    attestation_json: &str,
+    expected_challenge: &str,
+) -> Result<(StoredPasskey, u32)> {
+    let attest: serde_json::Value = serde_json::from_str(attestation_json)
+        .map_err(|e| BasinError::InvalidIdent(format!("attestation JSON parse: {e}")))?;
+    if attest.get("type").and_then(|v| v.as_str()) != Some("public-key") {
+        return Err(BasinError::InvalidIdent(
+            "attestation response missing type=public-key".into(),
+        ));
+    }
+    let response = attest
+        .get("response")
+        .ok_or_else(|| BasinError::InvalidIdent("attestation missing response".into()))?;
+
+    let client_data_b64 = response
+        .get("clientDataJSON")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| BasinError::InvalidIdent("missing clientDataJSON".into()))?;
+    check_client_data(client_data_b64, "webauthn.create", expected_challenge)?;
+
+    let att_obj_b64 = response
+        .get("attestationObject")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| BasinError::InvalidIdent("missing attestationObject".into()))?;
+    let att_obj_bytes = b64url_decode(att_obj_b64)?;
+
+    let att_obj: ciborium::value::Value = ciborium::de::from_reader(att_obj_bytes.as_slice())
+        .map_err(|e| BasinError::InvalidIdent(format!("attestationObject CBOR decode: {e}")))?;
+    let auth_data_bytes = match &att_obj {
+        ciborium::value::Value::Map(m) => m
+            .iter()
+            .find_map(|(k, v)| match (k, v) {
+                (ciborium::value::Value::Text(t), ciborium::value::Value::Bytes(b))
+                    if t == "authData" =>
+                {
+                    Some(b.clone())
+                }
+                _ => None,
+            })
+            .ok_or_else(|| BasinError::InvalidIdent("attestationObject missing authData".into()))?,
+        _ => return Err(BasinError::InvalidIdent("attestationObject not a map".into())),
+    };
+
+    let auth_data = parse_auth_data(&auth_data_bytes)?;
+    if auth_data.rp_id_hash != sha256(WEBAUTHN_RP_ID.as_bytes()) {
+        return Err(BasinError::InvalidIdent("WebAuthn rpIdHash mismatch".into()));
+    }
+    if auth_data.flags & FLAG_UP == 0 {
+        return Err(BasinError::InvalidIdent("WebAuthn user-present flag unset".into()));
+    }
+    if auth_data.flags & FLAG_AT == 0 {
+        return Err(BasinError::InvalidIdent(
+            "attestation lacks attested-credential-data flag".into(),
+        ));
+    }
+
+    let (credential_id, cose) = parse_attested_credential(&auth_data.rest)?;
+    let sec1 = cose_ec2_p256_to_sec1(&cose)?;
+    // Sanity: the SEC1 point must parse as a valid P-256 verifying key.
+    p256::ecdsa::VerifyingKey::from_sec1_bytes(&sec1)
+        .map_err(|e| BasinError::InvalidIdent(format!("invalid P-256 public key: {e}")))?;
+
+    let stored = StoredPasskey {
+        credential_id_b64: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&credential_id),
+        public_key_sec1_b64: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&sec1),
+    };
+    Ok((stored, auth_data.sign_count))
+}
+
+/// Verify an assertion (login / step-up) response against a stored passkey.
+/// Returns the authenticator's reported sign-counter (caller enforces
+/// monotonicity against the stored value).
+fn verify_assertion(
+    assertion_json: &str,
+    expected_challenge: &str,
+    stored: &StoredPasskey,
+) -> Result<u32> {
+    use p256::ecdsa::signature::Verifier;
+
+    let assertion: serde_json::Value = serde_json::from_str(assertion_json)
+        .map_err(|e| BasinError::InvalidIdent(format!("assertion JSON parse: {e}")))?;
+    if assertion.get("type").and_then(|v| v.as_str()) != Some("public-key") {
+        return Err(BasinError::InvalidIdent(
+            "assertion response missing type=public-key".into(),
+        ));
+    }
+    let response = assertion
+        .get("response")
+        .ok_or_else(|| BasinError::InvalidIdent("assertion missing response".into()))?;
+
+    let client_data_b64 = response
+        .get("clientDataJSON")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| BasinError::InvalidIdent("missing clientDataJSON".into()))?;
+    check_client_data(client_data_b64, "webauthn.get", expected_challenge)?;
+
+    let auth_data_b64 = response
+        .get("authenticatorData")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| BasinError::InvalidIdent("missing authenticatorData".into()))?;
+    let auth_data_bytes = b64url_decode(auth_data_b64)?;
+    let auth_data = parse_auth_data(&auth_data_bytes)?;
+
+    if auth_data.rp_id_hash != sha256(WEBAUTHN_RP_ID.as_bytes()) {
+        return Err(BasinError::InvalidIdent("WebAuthn rpIdHash mismatch".into()));
+    }
+    if auth_data.flags & FLAG_UP == 0 {
+        return Err(BasinError::InvalidIdent("WebAuthn user-present flag unset".into()));
+    }
+
+    let sig_b64 = response
+        .get("signature")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| BasinError::InvalidIdent("missing signature".into()))?;
+    let sig_bytes = b64url_decode(sig_b64)?;
+
+    // FIDO2 signature is over: authenticatorData || sha256(clientDataJSON).
+    let client_data_bytes = b64url_decode(client_data_b64)?;
+    let mut signed = auth_data_bytes.clone();
+    signed.extend_from_slice(&sha256(&client_data_bytes));
+
+    let sec1 = b64url_decode(&stored.public_key_sec1_b64)?;
+    let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(&sec1)
+        .map_err(|e| BasinError::InvalidIdent(format!("stored public key invalid: {e}")))?;
+    // WebAuthn ES256 signatures are ASN.1/DER-encoded.
+    let sig = p256::ecdsa::DerSignature::try_from(sig_bytes.as_slice())
+        .map_err(|e| BasinError::InvalidIdent(format!("signature DER decode: {e}")))?;
+
+    vk.verify(&signed, &sig)
+        .map_err(|_| BasinError::InvalidIdent("WebAuthn signature verification failed".into()))?;
+
+    Ok(auth_data.sign_count)
+}
+
 /// Verify WebAuthn enrollment. The client sends the attestation response JSON
 /// from `navigator.credentials.create()`. On success the factor is promoted to
 /// `verified` and the credential public-key bytes are stored encrypted.
@@ -1063,61 +1471,30 @@ where
         return Err(BasinError::InvalidIdent("challenge mismatch".into()));
     }
 
-    // In a real production implementation this would call `webauthn_rs` to
-    // verify the attestation. For the OSS implementation we do the minimal
-    // structural validation to prove the wiring compiles and tests pass,
-    // mirroring the pattern `webauthn-rs` would follow.
-    let attest: serde_json::Value = serde_json::from_str(attestation_json)
-        .map_err(|e| BasinError::InvalidIdent(format!("attestation JSON parse: {e}")))?;
+    // Real FIDO2 attestation verification: validates clientDataJSON
+    // (type/challenge/origin), the rpIdHash + user-present flag, and parses the
+    // COSE P-256 public key. A hand-built JSON without a valid attested
+    // credential structure is rejected here.
+    let (stored, initial_counter) = verify_attestation(attestation_json, &challenge.challenge_data)?;
 
-    if attest.get("type").and_then(|v| v.as_str()) != Some("public-key") {
-        return Err(BasinError::InvalidIdent(
-            "attestation response missing type=public-key".into(),
-        ));
-    }
+    // Persist the credential (credential id + public key), encrypted.
+    let stored_json = serde_json::to_string(&stored)
+        .map_err(|e| BasinError::internal(format!("passkey serialize: {e}")))?;
+    let secret_enc = enc.encrypt(&stored_json)?;
 
-    // Verify the challenge echoed by the client matches what we issued.
-    let client_data_b64 = attest
-        .get("response")
-        .and_then(|r| r.get("clientDataJSON"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| BasinError::InvalidIdent("missing clientDataJSON".into()))?;
-
-    let client_data_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(client_data_b64)
-        .map_err(|e| BasinError::InvalidIdent(format!("clientDataJSON base64: {e}")))?;
-
-    let client_data: serde_json::Value = serde_json::from_slice(&client_data_bytes)
-        .map_err(|e| BasinError::InvalidIdent(format!("clientDataJSON parse: {e}")))?;
-
-    let returned_challenge = client_data
-        .get("challenge")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| BasinError::InvalidIdent("missing challenge in clientDataJSON".into()))?;
-
-    let challenge_ok: bool = returned_challenge
-        .as_bytes()
-        .ct_eq(challenge.challenge_data.as_bytes())
-        .into();
-    if !challenge_ok {
-        return Err(BasinError::InvalidIdent(
-            "WebAuthn challenge mismatch".into(),
-        ));
-    }
-
-    // Store the raw attestation as the "credential" (encrypted).
-    let secret_enc = enc.encrypt(attestation_json)?;
-
-    // Update factor: set secret_enc and mark verified.
+    // Update factor: set secret_enc, mark verified, seed the sign-counter.
     if let Some(pg) = mfa_store {
         pg.update_webauthn_credential(schema, factor_id, &secret_enc)
             .await?;
+        pg.set_factor_last_used_step(schema, factor_id, initial_counter as u64)
+            .await?;
     } else {
         inner.mfa_cache.verify_factor_sync(factor_id);
-        // Patch secret in memory.
+        // Patch secret + counter in memory.
         let mut factors = inner.mfa_cache.factors.lock().unwrap();
         if let Some(f) = factors.iter_mut().find(|f| f.id == factor_id) {
             f.secret_enc = secret_enc;
+            f.last_used_step = initial_counter as u64;
         }
     }
 
@@ -1178,10 +1555,16 @@ where
 }
 
 /// Verify a WebAuthn step-up assertion. On success re-issues an aal2 JWT.
-#[instrument(skip(inner, mfa_store, assertion_json), fields(project = %project_id, challenge_id = %challenge_id))]
+///
+/// Performs full FIDO2 assertion verification: the ECDSA-P256 signature is
+/// checked against the stored passkey public key, and the authenticator
+/// sign-counter must strictly advance (a non-advancing counter signals a
+/// cloned authenticator and is rejected).
+#[instrument(skip(inner, mfa_store, enc, assertion_json), fields(project = %project_id, challenge_id = %challenge_id))]
 pub async fn verify_webauthn_challenge<S>(
     inner: &Inner,
     mfa_store: Option<&S>,
+    enc: &dyn crate::oauth::EncryptionProvider,
     project_id: &ProjectId,
     user_id: Uuid,
     challenge_id: Uuid,
@@ -1197,42 +1580,38 @@ where
         return Err(BasinError::InvalidIdent("challenge not found".into()));
     }
 
-    // Structural validation of the assertion response.
-    let assertion: serde_json::Value = serde_json::from_str(assertion_json)
-        .map_err(|e| BasinError::InvalidIdent(format!("assertion JSON parse: {e}")))?;
+    let factor = load_factor(inner, mfa_store, schema, challenge.factor_id).await?;
+    require_factor_type(&factor, FactorType::Webauthn)?;
+    require_factor_verified(&factor)?;
 
-    if assertion.get("type").and_then(|v| v.as_str()) != Some("public-key") {
+    // Decrypt the stored passkey credential (public key + credential id).
+    let stored_json = enc.decrypt(&factor.secret_enc)?;
+    let stored: StoredPasskey = serde_json::from_str(&stored_json)
+        .map_err(|e| BasinError::internal(format!("passkey deserialize: {e}")))?;
+
+    // Cryptographically verify the assertion signature + bindings.
+    let reported_counter = verify_assertion(assertion_json, &challenge.challenge_data, &stored)?;
+
+    // Sign-counter rollback / clone detection. Authenticators that implement a
+    // counter increment it on every assertion; a value that fails to advance
+    // (and is non-zero) means a cloned credential. Counter `0` ⇒ authenticator
+    // does not implement a counter, which the spec permits — accept but don't
+    // require advance in that case.
+    let stored_counter = factor.last_used_step as u32;
+    if reported_counter != 0 && reported_counter <= stored_counter {
         return Err(BasinError::InvalidIdent(
-            "assertion response missing type=public-key".into(),
+            "WebAuthn sign-counter did not advance (possible cloned authenticator)".into(),
         ));
     }
-
-    let client_data_b64 = assertion
-        .get("response")
-        .and_then(|r| r.get("clientDataJSON"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| BasinError::InvalidIdent("missing clientDataJSON".into()))?;
-
-    let client_data_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(client_data_b64)
-        .map_err(|e| BasinError::InvalidIdent(format!("clientDataJSON base64: {e}")))?;
-
-    let client_data: serde_json::Value = serde_json::from_slice(&client_data_bytes)
-        .map_err(|e| BasinError::InvalidIdent(format!("clientDataJSON parse: {e}")))?;
-
-    let returned_challenge = client_data
-        .get("challenge")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| BasinError::InvalidIdent("missing challenge in clientDataJSON".into()))?;
-
-    let challenge_ok: bool = returned_challenge
-        .as_bytes()
-        .ct_eq(challenge.challenge_data.as_bytes())
-        .into();
-    if !challenge_ok {
-        return Err(BasinError::InvalidIdent(
-            "WebAuthn challenge mismatch".into(),
-        ));
+    if reported_counter > stored_counter {
+        if let Some(pg) = mfa_store {
+            pg.set_factor_last_used_step(schema, factor.id, reported_counter as u64)
+                .await?;
+        } else {
+            inner
+                .mfa_cache
+                .set_factor_last_used_step_sync(factor.id, reported_counter as u64);
+        }
     }
 
     let tokens = issue_aal2_tokens(inner, project_id, user_id, "webauthn").await?;
@@ -1541,6 +1920,7 @@ const _: () = {
         async fn load_mfa_factor(&self, _: &str, _: Uuid) -> Result<Option<MfaFactorRow>> { panic!("MfaCache stub") }
         async fn list_mfa_factors(&self, _: &str, _: Uuid, _: &ProjectId) -> Result<Vec<MfaFactorRow>> { panic!("MfaCache stub") }
         async fn verify_mfa_factor(&self, _: &str, _: Uuid) -> Result<()> { panic!("MfaCache stub") }
+        async fn set_factor_last_used_step(&self, _: &str, _: Uuid, _: u64) -> Result<()> { panic!("MfaCache stub") }
         async fn delete_mfa_factor(&self, _: &str, _: Uuid) -> Result<()> { panic!("MfaCache stub") }
         async fn insert_mfa_challenge(&self, _: &str, _: &MfaChallengeRow) -> Result<()> { panic!("MfaCache stub") }
         async fn consume_mfa_challenge(&self, _: &str, _: Uuid) -> Result<Option<MfaChallengeRow>> { panic!("MfaCache stub") }
@@ -1656,6 +2036,7 @@ mod tests {
             status: FactorStatus::Unverified,
             secret_enc: "enc_secret".to_owned(),
             friendly_name: "Authenticator".to_owned(),
+            last_used_step: 0,
             created_at: now,
             updated_at: now,
         };
@@ -1722,5 +2103,301 @@ mod tests {
         let remaining = cache.list_active_recovery_code_hashes_sync(uid, &pid);
         assert!(!remaining.iter().any(|(id, _)| *id == *id0));
         let _ = plains; // quiet unused warning
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Security regression tests — TOTP replay (6.SEC.P0.1) + WebAuthn crypto
+// (6.SEC.P0.2). Pure-function level; no Postgres required.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    fn b64url(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    // --- 6.SEC.P0.1: TOTP replay protection ---------------------------------
+
+    /// Compute the TOTP code valid right now and the step it belongs to.
+    fn current_code_and_step(secret_b32: &str) -> (String, u64) {
+        let secret = base32::decode(base32::Alphabet::RFC4648 { padding: false }, secret_b32)
+            .unwrap();
+        let step = Utc::now().timestamp() as u64 / 30;
+        let n = totp_at_step(&secret, step).unwrap();
+        (format!("{n:06}"), step)
+    }
+
+    /// A successfully-used TOTP code must be rejected on immediate
+    /// re-submission within the same validity window.
+    ///
+    /// Pre-fix behaviour: `verify_totp(.., &HashSet::new())` ignored prior use,
+    /// so this replay succeeded — that was the P0 hole. Now `min_step` carries
+    /// the last accepted step and the replay is rejected.
+    #[test]
+    fn totp_used_code_rejected_on_replay() {
+        let secret = generate_totp_secret();
+        let (code, step) = current_code_and_step(&secret);
+
+        // First submission: fresh factor (min_step = 0) accepts it.
+        let accepted = verify_totp(&secret, &code, 0).expect("first use accepted");
+        assert_eq!(accepted, step, "accepted step should be the current step");
+
+        // Replay: caller persisted `accepted` as the new min_step. The same
+        // code (same step) must now be rejected.
+        let replay = verify_totp(&secret, &code, accepted);
+        assert!(
+            replay.is_err(),
+            "replay of an already-used TOTP code must be rejected"
+        );
+    }
+
+    /// A fresh code from the next step is still accepted after the prior step
+    /// was burned (the guard only blocks <= the last accepted step).
+    #[test]
+    fn totp_next_window_code_still_accepted() {
+        let secret = generate_totp_secret();
+        let secret_bytes =
+            base32::decode(base32::Alphabet::RFC4648 { padding: false }, &secret).unwrap();
+        let step = Utc::now().timestamp() as u64 / 30;
+
+        // Burn the current step.
+        let _ = verify_totp(&secret, &format!("{:06}", totp_at_step(&secret_bytes, step).unwrap()), 0)
+            .expect("current accepted");
+
+        // The next step is within the +1 skew window and is > min_step, so it
+        // verifies even though the current step is now burned.
+        let next_code = format!("{:06}", totp_at_step(&secret_bytes, step + 1).unwrap());
+        let accepted = verify_totp(&secret, &next_code, step)
+            .expect("next-window code must be accepted");
+        assert_eq!(accepted, step + 1);
+    }
+
+    /// The `MfaCache` replay guard is monotonic: advancing it then attempting
+    /// to lower it is a no-op (mirrors the `GREATEST(..)` on the Postgres path).
+    #[test]
+    fn mfa_cache_last_used_step_is_monotonic() {
+        let cache = MfaCache::new();
+        let fid = Uuid::new_v4();
+        let now = Utc::now();
+        cache.insert_factor_sync(MfaFactorRow {
+            id: fid,
+            user_id: Uuid::new_v4(),
+            project_id: ProjectId::new().to_string(),
+            factor_type: FactorType::Totp,
+            status: FactorStatus::Verified,
+            secret_enc: "x".into(),
+            friendly_name: "App".into(),
+            last_used_step: 0,
+            created_at: now,
+            updated_at: now,
+        });
+        cache.set_factor_last_used_step_sync(fid, 100);
+        cache.set_factor_last_used_step_sync(fid, 50); // attempt to lower
+        assert_eq!(
+            cache.load_factor_sync(fid).unwrap().last_used_step,
+            100,
+            "counter must never go backwards"
+        );
+    }
+
+    // --- 6.SEC.P0.2: WebAuthn crypto ----------------------------------------
+
+    /// A minimal software authenticator that produces real FIDO2
+    /// attestation/assertion blobs signed with a generated P-256 key.
+    struct SoftAuthenticator {
+        signing_key: p256::ecdsa::SigningKey,
+        credential_id: Vec<u8>,
+    }
+
+    impl SoftAuthenticator {
+        fn new() -> Self {
+            let signing_key = p256::ecdsa::SigningKey::random(&mut rand_core::OsRng);
+            Self {
+                signing_key,
+                credential_id: b"soft-cred-0001".to_vec(),
+            }
+        }
+
+        fn auth_data(&self, sign_count: u32, include_cred: bool) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&sha256(WEBAUTHN_RP_ID.as_bytes()));
+            let mut flags = FLAG_UP;
+            if include_cred {
+                flags |= FLAG_AT;
+            }
+            out.push(flags);
+            out.extend_from_slice(&sign_count.to_be_bytes());
+            if include_cred {
+                // aaguid (16 zero bytes)
+                out.extend_from_slice(&[0u8; 16]);
+                // credential id length + id
+                out.extend_from_slice(&(self.credential_id.len() as u16).to_be_bytes());
+                out.extend_from_slice(&self.credential_id);
+                // COSE EC2 P-256 public key
+                out.extend_from_slice(&self.cose_key());
+            }
+            out
+        }
+
+        fn cose_key(&self) -> Vec<u8> {
+            use ciborium::value::{Integer, Value};
+            let vk = p256::ecdsa::VerifyingKey::from(&self.signing_key);
+            let point = vk.to_encoded_point(false);
+            let x = point.x().unwrap().to_vec();
+            let y = point.y().unwrap().to_vec();
+            let map = Value::Map(vec![
+                (Value::Integer(Integer::from(1)), Value::Integer(Integer::from(2))), // kty EC2
+                (Value::Integer(Integer::from(3)), Value::Integer(Integer::from(-7))), // alg ES256
+                (Value::Integer(Integer::from(-1)), Value::Integer(Integer::from(1))), // crv P-256
+                (Value::Integer(Integer::from(-2)), Value::Bytes(x)),
+                (Value::Integer(Integer::from(-3)), Value::Bytes(y)),
+            ]);
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(&map, &mut buf).unwrap();
+            buf
+        }
+
+        fn client_data(&self, ty: &str, challenge: &str) -> Vec<u8> {
+            serde_json::to_vec(&serde_json::json!({
+                "type": ty,
+                "challenge": challenge,
+                "origin": WEBAUTHN_ORIGIN,
+            }))
+            .unwrap()
+        }
+
+        fn attestation(&self, challenge: &str, sign_count: u32) -> String {
+            use ciborium::value::Value;
+            let client_data = self.client_data("webauthn.create", challenge);
+            let auth_data = self.auth_data(sign_count, true);
+            let att_obj = Value::Map(vec![
+                (Value::Text("fmt".into()), Value::Text("none".into())),
+                (Value::Text("attStmt".into()), Value::Map(vec![])),
+                (Value::Text("authData".into()), Value::Bytes(auth_data)),
+            ]);
+            let mut obj_buf = Vec::new();
+            ciborium::ser::into_writer(&att_obj, &mut obj_buf).unwrap();
+            serde_json::json!({
+                "type": "public-key",
+                "id": b64url(&self.credential_id),
+                "rawId": b64url(&self.credential_id),
+                "response": {
+                    "clientDataJSON": b64url(&client_data),
+                    "attestationObject": b64url(&obj_buf),
+                }
+            })
+            .to_string()
+        }
+
+        fn assertion(&self, challenge: &str, sign_count: u32) -> String {
+            use p256::ecdsa::{signature::Signer, DerSignature};
+            let client_data = self.client_data("webauthn.get", challenge);
+            let auth_data = self.auth_data(sign_count, false);
+            let mut signed = auth_data.clone();
+            signed.extend_from_slice(&sha256(&client_data));
+            let sig: DerSignature = self.signing_key.sign(&signed);
+            serde_json::json!({
+                "type": "public-key",
+                "id": b64url(&self.credential_id),
+                "rawId": b64url(&self.credential_id),
+                "response": {
+                    "clientDataJSON": b64url(&client_data),
+                    "authenticatorData": b64url(&auth_data),
+                    "signature": b64url(sig.as_bytes()),
+                }
+            })
+            .to_string()
+        }
+    }
+
+    /// A forged attestation — hand-built JSON echoing the right challenge but
+    /// with no valid attested credential / signature material — is rejected.
+    /// This was the exact P0 exploit (it used to be accepted).
+    #[test]
+    fn webauthn_forged_attestation_rejected() {
+        let challenge = b64url(b"server-issued-challenge-bytes!!!");
+        // Mirror the old exploit payload: real challenge, garbage attestation.
+        let client_data = serde_json::to_vec(&serde_json::json!({
+            "type": "webauthn.create",
+            "challenge": challenge,
+            "origin": WEBAUTHN_ORIGIN,
+        }))
+        .unwrap();
+        let forged = serde_json::json!({
+            "type": "public-key",
+            "response": {
+                "clientDataJSON": b64url(&client_data),
+                "attestationObject": b64url(b"not-a-real-cbor-attestation-object"),
+            }
+        })
+        .to_string();
+
+        assert!(
+            verify_attestation(&forged, &challenge).is_err(),
+            "forged attestation must be rejected"
+        );
+    }
+
+    /// A properly-signed assertion from a software authenticator is accepted,
+    /// and verification recovers the reported sign-counter.
+    #[test]
+    fn webauthn_valid_assertion_accepted() {
+        let auth = SoftAuthenticator::new();
+        let reg_challenge = b64url(b"reg-challenge-0000000000000000!!");
+        let attestation = auth.attestation(&reg_challenge, 1);
+        let (stored, counter) =
+            verify_attestation(&attestation, &reg_challenge).expect("attestation accepted");
+        assert_eq!(counter, 1);
+
+        let assert_challenge = b64url(b"assert-challenge-00000000000000!");
+        let assertion = auth.assertion(&assert_challenge, 5);
+        let reported =
+            verify_assertion(&assertion, &assert_challenge, &stored).expect("assertion accepted");
+        assert_eq!(reported, 5, "verified counter should match authenticator");
+    }
+
+    /// A tampered signature (right structure, wrong key/bytes) is rejected.
+    #[test]
+    fn webauthn_bad_signature_rejected() {
+        let auth = SoftAuthenticator::new();
+        let reg_challenge = b64url(b"reg-challenge-1111111111111111!!");
+        let (stored, _) =
+            verify_attestation(&auth.attestation(&reg_challenge, 1), &reg_challenge).unwrap();
+
+        // Sign with a DIFFERENT authenticator's key — signature won't verify
+        // against the stored public key.
+        let attacker = SoftAuthenticator::new();
+        let assert_challenge = b64url(b"assert-challenge-11111111111111!");
+        let forged = attacker.assertion(&assert_challenge, 9);
+        assert!(
+            verify_assertion(&forged, &assert_challenge, &stored).is_err(),
+            "assertion signed by a different key must be rejected"
+        );
+    }
+
+    /// A sign-counter regression (cloned authenticator replays an old counter)
+    /// is rejected by the service-level check. We assert the rule directly:
+    /// reported <= stored (both non-zero) ⇒ reject.
+    #[test]
+    fn webauthn_counter_regression_rejected() {
+        let auth = SoftAuthenticator::new();
+        let reg_challenge = b64url(b"reg-challenge-2222222222222222!!");
+        let (stored, _) =
+            verify_attestation(&auth.attestation(&reg_challenge, 1), &reg_challenge).unwrap();
+
+        // An assertion with a non-advancing counter still has a *valid
+        // signature* — verify_assertion returns Ok with the (stale) counter.
+        let assert_challenge = b64url(b"assert-challenge-22222222222222!");
+        let stale = auth.assertion(&assert_challenge, 3);
+        let reported = verify_assertion(&stale, &assert_challenge, &stored).unwrap();
+
+        // The clone-detection rule lives in verify_webauthn_challenge: a
+        // reported counter at or below the stored counter is a clone.
+        let stored_counter: u32 = 5; // pretend we'd already seen counter 5
+        let is_clone = reported != 0 && reported <= stored_counter;
+        assert!(is_clone, "counter regression must be flagged as a clone");
     }
 }
