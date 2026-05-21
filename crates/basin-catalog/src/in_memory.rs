@@ -260,6 +260,54 @@ impl InMemoryCatalog {
             .await
     }
 
+    /// Internal helper that persists an index with full access_method + opclass
+    /// metadata. Both `create_index_qualified` and `create_index_with_method`
+    /// delegate here so the column-validation and duplicate-name logic lives in
+    /// one place.
+    async fn create_index_qualified_with_method(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        name: &str,
+        columns: &[String],
+        if_not_exists: bool,
+        access_method: &str,
+        opclass: Option<&str>,
+    ) -> Result<()> {
+        let state_arc = self.get_table_qualified(project, qtable).await?;
+        let mut state = state_arc.lock().await;
+        if columns.is_empty() {
+            return Err(BasinError::InvalidSchema(
+                "create_index: column list cannot be empty".into(),
+            ));
+        }
+        // For GIN indexes the column is a JSONB column; its Arrow type is Utf8
+        // with a BASIN_TYPE=JSONB marker.  The schema field_with_name check
+        // validates the column exists regardless of type.
+        for col in columns {
+            if state.schema.field_with_name(col).is_err() {
+                return Err(BasinError::InvalidSchema(format!(
+                    "create_index: column {col:?} not in table {project}/{qtable} schema"
+                )));
+            }
+        }
+        if state.indexes.iter().any(|i| i.name == name) {
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(BasinError::catalog(format!(
+                "create_index: {project}/{qtable}: index {name:?} already exists"
+            )));
+        }
+        state.indexes.push(SecondaryIndex {
+            name: name.to_string(),
+            columns: columns.to_vec(),
+            access_method: access_method.to_string(),
+            opclass: opclass.map(|s| s.to_string()),
+        });
+        Ok(())
+    }
+
     async fn get_table_qualified(
         &self,
         project: &ProjectId,
@@ -1809,33 +1857,33 @@ impl Catalog for InMemoryCatalog {
         columns: &[String],
         if_not_exists: bool,
     ) -> Result<()> {
-        let state_arc = self.get_table_qualified(project, qtable).await?;
-        let mut state = state_arc.lock().await;
-        if columns.is_empty() {
-            return Err(BasinError::InvalidSchema(
-                "create_index: column list cannot be empty".into(),
-            ));
-        }
-        for col in columns {
-            if state.schema.field_with_name(col).is_err() {
-                return Err(BasinError::InvalidSchema(format!(
-                    "create_index: column {col:?} not in table {project}/{qtable} schema"
-                )));
-            }
-        }
-        if state.indexes.iter().any(|i| i.name == name) {
-            if if_not_exists {
-                return Ok(());
-            }
-            return Err(BasinError::catalog(format!(
-                "create_index: {project}/{qtable}: index {name:?} already exists"
-            )));
-        }
-        state.indexes.push(SecondaryIndex {
-            name: name.to_string(),
-            columns: columns.to_vec(),
-        });
-        Ok(())
+        self.create_index_qualified_with_method(
+            project, qtable, name, columns, if_not_exists, "btree", None,
+        )
+        .await
+    }
+
+    async fn create_index_with_method(
+        &self,
+        project: &ProjectId,
+        table: &basin_common::TableName,
+        name: &str,
+        columns: &[String],
+        if_not_exists: bool,
+        access_method: &str,
+        opclass: Option<&str>,
+    ) -> Result<()> {
+        let qtable = basin_common::QualifiedTableName::in_public(table.clone());
+        self.create_index_qualified_with_method(
+            project,
+            &qtable,
+            name,
+            columns,
+            if_not_exists,
+            access_method,
+            opclass,
+        )
+        .await
     }
 
     async fn drop_index_qualified(

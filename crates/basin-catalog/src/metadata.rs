@@ -66,6 +66,20 @@ pub struct SecondaryIndex {
     /// Columns the index keys on, in declaration order. Single-column indexes
     /// land here as a one-element vec.
     pub columns: Vec<String>,
+    /// Access method (index type). The default is `"btree"` (standard B-tree).
+    /// Phase 5.19.B adds `"gin"` for JSONB GIN indexes.
+    #[serde(default = "default_access_method")]
+    pub access_method: String,
+    /// Operator class for GIN indexes. For `USING gin`, this is either
+    /// `"jsonb_ops"` (default, key+value containment) or `"jsonb_path_ops"`
+    /// (path-hash only, more selective for `@>`). `None` for B-tree indexes
+    /// (where the operator class is implicit / unrecorded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opclass: Option<String>,
+}
+
+fn default_access_method() -> String {
+    "btree".to_string()
 }
 
 /// One UNIQUE constraint attached to a table. Records the column list

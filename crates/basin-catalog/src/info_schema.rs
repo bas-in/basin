@@ -1770,8 +1770,9 @@ impl InfoSchemaQuery {
         ]))
     }
 
-    /// Returns one row per index in the project's tables. v0.1 only carries
-    /// PRIMARY KEY constraints; each PK produces one `<table>_pkey` row.
+    /// Returns one row per index in the project's tables. Covers PRIMARY KEY
+    /// constraints and every `SecondaryIndex` stored in the catalog (B-tree,
+    /// GIN, etc.).
     pub async fn pg_indexes(catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
         let names = catalog.list_tables(project).await?;
         let mut schemas: Vec<&str> = Vec::new();
@@ -1781,6 +1782,7 @@ impl InfoSchemaQuery {
         let mut indexdefs: Vec<Option<String>> = Vec::new();
         for name in &names {
             let meta = catalog.load_table(project, name).await?;
+            // Primary key pseudo-index.
             if !meta.pk_columns.is_empty() {
                 schemas.push(DEFAULT_SCHEMA);
                 tablenames.push(name.as_str().to_string());
@@ -1793,6 +1795,15 @@ impl InfoSchemaQuery {
                     name.as_str(),
                     cols
                 )));
+            }
+            // Secondary indexes (B-tree, GIN, …).
+            for idx in &meta.indexes {
+                schemas.push(DEFAULT_SCHEMA);
+                tablenames.push(name.as_str().to_string());
+                indexnames.push(idx.name.clone());
+                tablespaces.push(None);
+                let indexdef = build_indexdef(name.as_str(), idx);
+                indexdefs.push(Some(indexdef));
             }
         }
         let schema = Self::pg_indexes_schema();
@@ -1811,6 +1822,7 @@ impl InfoSchemaQuery {
     // pg_catalog.pg_tables  (denormalised table info)
     // pg_catalog.pg_tables
     // -----------------------------------------------------------------------
+    // (build_indexdef is a free fn below the impl block)
 
     pub fn pg_tables_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -4358,6 +4370,44 @@ fn fnv1a_64_to_positive_i64(bytes: &[u8]) -> i64 {
         h = h.wrapping_mul(FNV_PRIME);
     }
     (h & 0x7fff_ffff_ffff_ffff) as i64
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 5.19.B — GIN index introspection helper
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build the `indexdef` string for a [`crate::metadata::SecondaryIndex`] in the
+/// style PostgreSQL uses for `pg_indexes.indexdef`:
+///
+/// - B-tree (default): `CREATE INDEX <name> ON <table> (<cols>)`
+/// - GIN without opclass: `CREATE INDEX <name> ON <table> USING gin (<col>)`
+/// - GIN with opclass: `CREATE INDEX <name> ON <table> USING gin (<col> jsonb_path_ops)`
+///
+/// The result matches what `\d <tbl>` and `psql` display, so ORM migration
+/// tooling that reads `pg_indexes` to verify applied migrations sees the
+/// correct DDL text.
+fn build_indexdef(table_name: &str, idx: &crate::metadata::SecondaryIndex) -> String {
+    let is_gin = idx.access_method.eq_ignore_ascii_case("gin");
+    if is_gin {
+        // GIN indexes are always single-column in Basin v0.1.
+        // Include the opclass when it was explicitly declared.
+        let col_part = match idx.columns.first() {
+            Some(col) => match &idx.opclass {
+                Some(opclass) => format!("{col} {opclass}"),
+                None => col.clone(),
+            },
+            None => String::new(),
+        };
+        format!(
+            "CREATE INDEX {} ON {} USING gin ({})",
+            idx.name, table_name, col_part
+        )
+    } else {
+        // B-tree (and any unrecognised access method): omit USING clause for
+        // back-compatibility with the PK indexdef format already in use.
+        let cols = idx.columns.join(", ");
+        format!("CREATE INDEX {} ON {} ({})", idx.name, table_name, cols)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

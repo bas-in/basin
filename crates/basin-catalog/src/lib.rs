@@ -756,6 +756,32 @@ pub trait Catalog: Send + Sync {
         ))
     }
 
+    /// Phase 5.19.B: declare a GIN index with an explicit access method and
+    /// optional operator class. The default implementation delegates to
+    /// [`create_index`](Catalog::create_index) so existing catalog backends
+    /// (RestCatalog, PostgresCatalog) stay buildable. InMemoryCatalog overrides
+    /// this to persist `access_method` and `opclass` onto `SecondaryIndex`.
+    ///
+    /// `access_method` is the lowercase access method string (e.g. `"gin"`).
+    /// `opclass` is the operator class declared on the single indexed column,
+    /// e.g. `"jsonb_ops"` or `"jsonb_path_ops"`. `None` means the default for
+    /// the access method applies.
+    async fn create_index_with_method(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        name: &str,
+        columns: &[String],
+        if_not_exists: bool,
+        access_method: &str,
+        opclass: Option<&str>,
+    ) -> Result<()> {
+        // Default: delegate to the existing create_index (btree-only backends).
+        let _ = (access_method, opclass);
+        self.create_index(project, table, name, columns, if_not_exists)
+            .await
+    }
+
     /// Phase 5.7 B1: drop a previously-declared secondary index by name.
     /// Returns [`basin_common::BasinError::NotFound`] if no index with that
     /// name exists on the table. Default impl returns `Internal("not

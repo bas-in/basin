@@ -2362,15 +2362,59 @@ async fn exec_create_index(
         }
     }
 
+    // Determine the access method. `USING gin` → "gin"; `USING btree` or
+    // absent → "btree" (the default). Other methods are logged as a notice and
+    // treated as btree metadata-only (same pre-5.19 behaviour).
+    let access_method_str: String = ci
+        .using
+        .as_ref()
+        .map(|m| m.to_string().to_lowercase())
+        .unwrap_or_else(|| "btree".to_string());
+
+    // For GIN indexes: extract the operator class from the first (and only)
+    // indexed column's `operator_class` field in the sqlparser AST.
+    // sqlparser parses `(col jsonb_path_ops)` as an IndexColumn with
+    // `operator_class = Some(ObjectName([Ident("jsonb_path_ops")]))`.
+    // We normalise to lowercase and validate: only `jsonb_ops` and
+    // `jsonb_path_ops` are accepted; unknown opclasses are rejected.
+    let gin_opclass: Option<String> = if access_method_str == "gin" {
+        // Extract the operator class from the first indexed column.
+        // sqlparser 0.61 parses `(col jsonb_path_ops)` as an IndexColumn with
+        // `operator_class = Some(ObjectName([Identifier(Ident{value:"jsonb_path_ops"})]))`.
+        // Use `id_val()` (from ObjectNamePartExt) to unwrap the identifier string.
+        let raw_opclass = ci
+            .columns
+            .first()
+            .and_then(|c| c.operator_class.as_ref())
+            .map(|oc| {
+                oc.0.iter()
+                    .map(|part| part.id_val().to_lowercase())
+                    .collect::<Vec<_>>()
+                    .join(".")
+            });
+        match raw_opclass.as_deref() {
+            None | Some("jsonb_ops") => Some("jsonb_ops".to_string()),
+            Some("jsonb_path_ops") => Some("jsonb_path_ops".to_string()),
+            Some(other) => {
+                return Err(BasinError::InvalidSchema(format!(
+                    "CREATE INDEX USING gin: unknown operator class {other:?}; \
+                     accepted: jsonb_ops (default), jsonb_path_ops"
+                )));
+            }
+        }
+    } else {
+        None
+    };
+
     // Emit notices for accepted-but-not-enforced features.
     if let Some(pred) = &ci.predicate {
         log_partial_index_notice(&index_name, &pred.to_string());
     }
-    if let Some(method) = &ci.using {
-        let m = method.to_string();
-        if !matches!(m.to_lowercase().as_str(), "btree") {
-            log_using_notice(&index_name, &m);
-        }
+    if !access_method_str.eq_ignore_ascii_case("btree")
+        && !access_method_str.eq_ignore_ascii_case("gin")
+    {
+        // Non-btree, non-gin access methods: log the notice (treated as btree).
+        log_using_notice(&index_name, &access_method_str);
     }
     if !ci.include.is_empty() {
         let include_cols: Vec<String> =
@@ -2410,15 +2454,21 @@ async fn exec_create_index(
 
     log_metadata_only_notice(&index_name, table_name);
 
+    // Phase 5.19.B: use create_index_with_method so GIN indexes persist their
+    // access_method ("gin") and opclass ("jsonb_ops" / "jsonb_path_ops") in the
+    // catalog SecondaryIndex row. Btree indexes continue to use the same path
+    // via the default impl that delegates to create_index.
     sess.engine
         .config()
         .catalog
-        .create_index(
+        .create_index_with_method(
             &sess.project,
             &table,
             &index_name,
             &catalog_columns,
             ci.if_not_exists,
+            &access_method_str,
+            gin_opclass.as_deref(),
         )
         .await?;
 
