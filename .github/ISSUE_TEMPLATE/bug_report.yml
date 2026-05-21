@@ -44,6 +44,6 @@ body:
     id: extra
     attributes:
       label: Anything else?
-      description: Workload shape, tenant count, dataset size, anything contextual
+      description: Workload shape, project count, dataset size, anything contextual
     validations:
       required: false

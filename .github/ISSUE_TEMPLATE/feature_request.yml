@@ -14,7 +14,7 @@ body:
     attributes:
       label: What workload are you trying to run that needs this?
       description: |
-        Concrete is good. "Multi-tenant audit log SaaS, 5k tenants, retention 90 days, mostly
+        Concrete is good. "Multi-project audit log SaaS, 5k projects, retention 90 days, mostly
         recent reads" beats "I need feature X".
     validations:
       required: true
