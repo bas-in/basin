@@ -146,7 +146,8 @@ async fn poc_pgwire_end_to_end_create_insert_select() {
     assert_eq!(rows[1], vec![Some("2".into()), Some("second".into())]);
     assert_eq!(rows[2], vec![Some("3".into()), Some("third".into())]);
 
-    // Parquet must actually be on disk under alice's prefix, and only there.
+    // Data file must actually be on disk under alice's prefix, and only there.
+    // Phase 5.14+: engine uses Vortex format (.vortex) instead of Parquet.
     let alice_prefix = format!("projects/{}", server.alice);
     let bob_prefix = format!("projects/{}", server.bob);
     let mut alice_files = 0;
@@ -154,15 +155,17 @@ async fn poc_pgwire_end_to_end_create_insert_select() {
     for entry in WalkDir::new(server.data_dir.path()).into_iter().flatten() {
         if entry.file_type().is_file() {
             let p = entry.path().to_string_lossy().to_string();
-            if p.contains(&alice_prefix) && p.ends_with(".parquet") {
+            // Accept both .vortex (current) and .parquet (legacy) data files.
+            let is_data = p.ends_with(".vortex") || p.ends_with(".parquet");
+            if p.contains(&alice_prefix) && is_data {
                 alice_files += 1;
             }
-            if p.contains(&bob_prefix) && p.ends_with(".parquet") {
+            if p.contains(&bob_prefix) && is_data {
                 bob_files += 1;
             }
         }
     }
-    assert_eq!(alice_files, 1, "expected 1 parquet file for alice");
+    assert_eq!(alice_files, 1, "expected 1 data file for alice");
     assert_eq!(bob_files, 0, "bob should have no files yet");
 }
 

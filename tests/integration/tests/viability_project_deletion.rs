@@ -118,13 +118,17 @@ async fn viability_4_project_deletion() {
     // Sanity check (outside any timed window).
     let project_prefix = ObjectPath::from(format!("projects/{project}"));
     let listed_before: Vec<_> = fs.list(Some(&project_prefix)).try_collect().await.unwrap();
-    let parquet_count = listed_before
+    // Phase 5.14+: engine uses Vortex format (.vortex) instead of Parquet.
+    let data_file_count = listed_before
         .iter()
-        .filter(|m| m.location.as_ref().ends_with(".parquet"))
+        .filter(|m| {
+            let loc = m.location.as_ref();
+            loc.ends_with(".parquet") || loc.ends_with(".vortex")
+        })
         .count();
     assert_eq!(
-        parquet_count, FILES,
-        "expected {FILES} parquet files, found {parquet_count}"
+        data_file_count, FILES,
+        "expected {FILES} data files, found {data_file_count}"
     );
 
     // ---- Reset caches before timing -------------------------------------

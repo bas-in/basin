@@ -155,10 +155,13 @@ fn total_bytes_on_disk(root: &std::path::Path) -> u64 {
     let mut total = 0u64;
     for entry in walkdir::WalkDir::new(root) {
         let entry = entry.unwrap();
-        if entry.file_type().is_file()
-            && entry.path().extension().and_then(|s| s.to_str()) == Some("parquet")
-        {
-            total += std::fs::metadata(entry.path()).unwrap().len();
+        if entry.file_type().is_file() {
+            // Phase 5.14+: engine uses Vortex format (.vortex) instead of Parquet.
+            // Accept both extensions for forward/backward compat.
+            let ext = entry.path().extension().and_then(|s| s.to_str());
+            if ext == Some("parquet") || ext == Some("vortex") {
+                total += std::fs::metadata(entry.path()).unwrap().len();
+            }
         }
     }
     total
