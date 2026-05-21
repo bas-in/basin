@@ -11,8 +11,10 @@
 //! - SELECTs against information_schema.views surface continuous
 //!   materialized views created via `CREATE MATERIALIZED VIEW ... WITH
 //!   (basin.continuous, ...)`.
-//! - SELECTs against information_schema.schemata return exactly one row
-//!   per project with `schema_name = 'public'`.
+//! - SELECTs against information_schema.schemata return one row per
+//!   reserved schema (Phase 5.18.D exposed all 8 reserved schemas:
+//!   public, auth, storage, cron, net, realtime, pg_catalog,
+//!   information_schema).
 //! - Cross-project isolation: A's matview is invisible to B.
 
 use std::sync::Arc;
@@ -162,14 +164,28 @@ async fn select_information_schema_schemata_routes() {
          FROM information_schema.schemata",
     )
     .await;
-    assert_eq!(total_rows(&batches), 1);
+    // Phase 5.18.D: information_schema.schemata now lists all reserved
+    // schemas (public, auth, storage, cron, net, realtime, pg_catalog,
+    // information_schema) — 8 rows, not just 'public'.
+    assert_eq!(total_rows(&batches), 8);
     let cats = col_string(&batches, "catalog_name");
     let schemas = col_string(&batches, "schema_name");
     let owners = col_string(&batches, "schema_owner");
-    assert_eq!(cats, vec!["basin".to_string()]);
-    assert_eq!(schemas, vec!["public".to_string()]);
-    // schema_owner is the empty placeholder string in v0.1.
-    assert_eq!(owners, vec![String::new()]);
+    // Every row belongs to the 'basin' catalog.
+    assert!(
+        cats.iter().all(|c| c == "basin"),
+        "all schemata rows must have catalog_name='basin', got: {cats:?}"
+    );
+    // 'public' must be present.
+    assert!(
+        schemas.contains(&"public".to_string()),
+        "schemata must include 'public', got: {schemas:?}"
+    );
+    // schema_owner is the empty placeholder string in v0.1 for all schemas.
+    assert!(
+        owners.iter().all(|o| o.is_empty()),
+        "schema_owner should be empty placeholder for all schemas, got: {owners:?}"
+    );
 }
 
 #[tokio::test]

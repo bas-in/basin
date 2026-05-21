@@ -8,10 +8,15 @@
 //! the catalog `create_table` call returns. This test pins the full
 //! round-trip so a future refactor can't silently regress the
 //! invariant.
+//!
+//! Phase 5.14 made the engine PG-faithful on serial widths:
+//!   SMALLSERIAL / SERIAL2  → Int16 (INT2)
+//!   SERIAL / SERIAL4       → Int32 (INT4)
+//!   BIGSERIAL / SERIAL8    → Int64 (INT8)
 
 use std::sync::Arc;
 
-use arrow_array::{Array, Int64Array};
+use arrow_array::{Array, Int16Array, Int32Array, Int64Array};
 use basin_catalog::InMemoryCatalog;
 use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
@@ -34,7 +39,7 @@ fn engine_in(dir: &TempDir) -> Engine {
     })
 }
 
-/// Pull the first row's `id` column as i64.
+/// Pull the first row's `id` column as i64 from a BIGSERIAL/BIGINT column.
 fn first_id_i64(res: ExecResult) -> i64 {
     match res {
         ExecResult::Rows { batches, .. } => {
@@ -44,7 +49,41 @@ fn first_id_i64(res: ExecResult) -> i64 {
                 .expect("id column")
                 .as_any()
                 .downcast_ref::<Int64Array>()
-                .expect("id is BIGINT");
+                .expect("id is BIGINT (Int64)");
+            arr.value(0)
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+/// Pull the first row's `id` column as i32 from a SERIAL/INT4 column.
+fn first_id_i32(res: ExecResult) -> i32 {
+    match res {
+        ExecResult::Rows { batches, .. } => {
+            let b = &batches[0];
+            let arr = b
+                .column_by_name("id")
+                .expect("id column")
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("id is INT4 (Int32)");
+            arr.value(0)
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+/// Pull the first row's `id` column as i16 from a SMALLSERIAL/INT2 column.
+fn first_id_i16(res: ExecResult) -> i16 {
+    match res {
+        ExecResult::Rows { batches, .. } => {
+            let b = &batches[0];
+            let arr = b
+                .column_by_name("id")
+                .expect("id column")
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .expect("id is INT2 (Int16)");
             arr.value(0)
         }
         other => panic!("expected rows, got {other:?}"),
@@ -57,7 +96,8 @@ async fn serial_column_creates_sequence_and_autonumbers() {
     let eng = engine_in(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    // SERIAL pseudo-type expands to BIGINT + sequence + DEFAULT nextval.
+    // SERIAL pseudo-type expands to INT4 + sequence + DEFAULT nextval
+    // (PG-faithful: SERIAL → int4, OID 23).
     sess.execute("CREATE TABLE orders (id SERIAL PRIMARY KEY, name TEXT)")
         .await
         .unwrap();
@@ -65,6 +105,7 @@ async fn serial_column_creates_sequence_and_autonumbers() {
     // The implicit `orders_id_seq` sequence must be reachable to a
     // bare `nextval` call right after CREATE TABLE — proves the
     // sequence was registered, not just promised on the column.
+    // nextval returns INT8 regardless of the column backing width.
     let v = first_id_i64(
         sess.execute("SELECT nextval('orders_id_seq') AS id")
             .await
@@ -90,11 +131,12 @@ async fn serial_column_creates_sequence_and_autonumbers() {
         ExecResult::Rows { batches, .. } => batches,
         other => panic!("expected rows, got {other:?}"),
     };
+    // SERIAL is INT4-backed (Int32) since Phase 5.14 PG-faithfulness update.
     let ids = rows[0]
         .column_by_name("id")
         .unwrap()
         .as_any()
-        .downcast_ref::<Int64Array>()
+        .downcast_ref::<Int32Array>()
         .unwrap();
     assert_eq!(ids.len(), 2);
     assert_eq!(ids.value(0), 2);
@@ -120,11 +162,9 @@ async fn bigserial_is_int64_backed() {
 
 #[tokio::test]
 async fn smallserial_works_end_to_end() {
-    // SMALLSERIAL widens to Int64 in this engine (see the comment in
-    // `basin_engine::types::arrow_data_type` — the INSERT path doesn't
-    // yet have an Int16 row-builder). The PG-shaped pseudo-type
-    // behaviour (sequence + DEFAULT + NOT NULL) is still in force; only
-    // the physical column width is widened.
+    // SMALLSERIAL is INT2-backed (Int16) since Phase 5.14 PG-faithfulness
+    // update. The PG-shaped pseudo-type behaviour (sequence + DEFAULT +
+    // NOT NULL) is still in force.
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
@@ -136,7 +176,8 @@ async fn smallserial_works_end_to_end() {
         .await
         .unwrap();
 
-    let v = first_id_i64(sess.execute("SELECT id FROM tiny LIMIT 1").await.unwrap());
+    // SMALLSERIAL → Int16; use first_id_i16 to match the backing width.
+    let v = first_id_i16(sess.execute("SELECT id FROM tiny LIMIT 1").await.unwrap());
     assert_eq!(v, 1);
 }
 
