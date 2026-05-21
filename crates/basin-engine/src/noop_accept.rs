@@ -224,15 +224,33 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
 
         // Session-variable control.
         // `SET search_path = …`, `RESET role`, etc. are no-op accepted.
-        StmtKind::VariableSet => Some(ExecResult::Empty { tag: "SET".into() }),
+        // EXCEPTION: `SET search_path = …` falls through to the real executor
+        // which stores the value and makes `SHOW search_path` work.
+        StmtKind::VariableSet => {
+            let upper = sql.trim().to_ascii_uppercase();
+            // Strip leading "SET " and optional LOCAL/SESSION keywords.
+            let after_set = upper
+                .trim_start_matches("SET")
+                .trim_start()
+                .trim_start_matches("LOCAL")
+                .trim_start()
+                .trim_start_matches("SESSION")
+                .trim_start();
+            if after_set.starts_with("SEARCH_PATH") {
+                None // Let the real executor handler fire.
+            } else {
+                Some(ExecResult::Empty { tag: "SET".into() })
+            }
+        }
         // `SHOW search_path`, `SHOW all`, etc. are no-op accepted.
         // IMPORTANT: `SHOW TABLES` is Basin's extension command that returns
         // a real result set (sqlparser handles it). Do NOT intercept it here;
         // return None so it falls through to the existing SHOW TABLES handler.
+        // EXCEPTION: `SHOW SEARCH_PATH` also falls through to the real executor.
         StmtKind::VariableShow => {
             let trimmed = sql.trim().to_ascii_uppercase();
             let trimmed = trimmed.trim_end_matches(';').trim_end();
-            if trimmed == "SHOW TABLES" {
+            if trimmed == "SHOW TABLES" || trimmed == "SHOW SEARCH_PATH" {
                 None
             } else {
                 Some(ExecResult::Empty { tag: "SHOW".into() })
