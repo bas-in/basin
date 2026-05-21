@@ -8,6 +8,93 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-05-21 — Phase 6.X+ wave
+
+### Phase 6.X — Lease-based ownership (ADR 0023)
+- Lease table, `LeaseRegistry`, heartbeat, and WAL epoch fence establish the
+  ownership primitive for partition routing (`acf7929`).
+- Partition-level routing via `LeaseRegistry` wired into the router accept path
+  (`eadebbe`).
+- Voluntary lease handoff under load with <500 ms p99 stall (`d85e893`).
+- Heartbeat-budget tick + multi-replica acceptance test land Phase 6.X.D
+  (`fd88b13`).
+- Slice gates: `MemtableBytes` cap (`8ca80ba`), `WasmConcurrency` cap
+  (`e5ca5b8`), per-project `RestQps` gate in the authorize path (`bb34b9e`).
+- Heartbeat-reconciled budgets foundation — cap consumers wired across catalog,
+  router, net, and realtime (`49dd734`).
+- Lease observability metrics + operator runbook (Phase 6.X.F) (`af63d22`).
+- Lease failure-path regression suite: replica loss, dual-leaseholder fence,
+  network partition, budget-coordinator unreach, handoff-mid-write atomicity
+  (`dcad853`).
+
+### Phase 6.SEC — Security P0/P1
+- Real TOTP replay protection + WebAuthn signature verification close
+  beta-blocker P0 items (`94a2e14`).
+- OAuth auto-link now requires a verified email and a `(provider, sub)` identity
+  key, closing the account-takeover vector (`216fda8`).
+- Reserved-schema DDL rejected with SQLSTATE 42501 (`2566baa`).
+- Public-bucket alias bypass closed — anonymous alias path routes through the
+  full RLS chain (`f1ed678`).
+- Presence `client_id` bound to the authed session; metadata size capped
+  (`1a4e046`).
+- 17 audit-driven regression tests for shipped P0/P1 fixes; remaining P2s
+  marked `#[ignore]` with rationale (`1fc84dd`).
+
+### Phase 6.P0 — Production hardening
+- Statement-level wall-clock timeout → SQLSTATE 57014 (`efda53e`).
+- Catalog `deadpool-postgres` connection pool replaces `Mutex<Client>`,
+  eliminating the noisy-neighbor connection bottleneck (`8977fa6`).
+- Wasm function runtime: governance wired into the real entrypoint, epoch
+  ticker, dedicated runtime, semaphore LRU (`e3b0feb`).
+
+### Cloud-side gates
+- 12 OAuth providers added: Microsoft, GitLab, Slack, Discord, Apple,
+  Twitter/X, Bitbucket, Notion, Spotify, Twitch, LinkedIn, Figma (`b87c9ee`).
+- BYO bucket support + per-tenant Class-A/B usage counters (`d620281`,
+  `8bd64b5`).
+- `basin-autoscale` crate and daemon (T-096) (`246b678`).
+- Per-subscriber realtime budget cap enforced (`7003e76`).
+
+### Engine bug fixes
+- `RETURNS TABLE` parsed correctly from sqlparser 0.53+ `DataType::Table` shape
+  (`235c1f8`).
+- UNION ALL scan-collapse skipped when all branch predicates are identical
+  (`94530d0`).
+- `SET`/`SHOW search_path` deferred to real executor in `noop_accept` (`68bae0f`).
+- `CommitConflict` from UPDATE/DELETE propagated to the router for re-evaluation
+  (`ebac48d`).
+- Secondary-index helper `first_string` skips empty batches (`29e2263`).
+
+### Test infrastructure
+- Noisy-neighbor + fairness permanent regression harness (#22) (`31bc2a7`).
+- `sql_syntax_fuzz` — graceful-handling assertions across 119 broad SQL shapes
+  (`4705544`).
+- Wasm-functions differential + soak harness (Phase 5.11.W7 capstone)
+  (`b832961`).
+- Lease failure-path hardening suite (Phase 6.X.E) (`dcad853`).
+
+### Documentation
+- Operator runbooks for storage, realtime, wasm-functions, session-pool
+  (`5f98af0`).
+- ADR 0024 + Phase 6.TR plan: UUID-as-Decimal128 storage encoding (workaround
+  for Vortex `FixedSizeBinary` gap) (`a79e710`).
+- ADR 0023 leases + partition routing (`073e4aa`).
+
+### Known limitations
+- **Secondary-index point-query returns wrong row** — `create_index_roundtrip_point_query`
+  and 24 related binaries are `#[ignore]`'d pending resolution of the #40
+  cluster (indexed-lookup bug, not blocked on infra).
+- **`BASIN_TYPE` metadata round-trip** — type metadata is silently dropped on
+  Vortex round-trip; `extra_types` test flagged as a real engine bug (Phase
+  6.TR not yet shipped).
+- **Format-encoding edge cases** — datetime, hex, and bytea format-encoding
+  bugs flagged in `format_encoding`; `@@` comment-rewriter interference in FTS
+  flagged in `fts_at_at`; all awaiting #40 triage queue.
+- **`TABLESAMPLE BERNOULLI`** — marked as a real behavior change vs PostgreSQL
+  baseline; not yet fixed.
+- **Performance regression test** — `viability_perf_stack` `#[ignore]`'d with
+  measured data: root cause identified but fix not yet landed.
+
 ## [Unreleased]
 
 Strategic checkpoint 2026-05-19: durable-Basin-moat plan adopted (TASK.md

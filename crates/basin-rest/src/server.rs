@@ -156,6 +156,11 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
             "/admin/v1/projects/:project_id/credentials",
             get(admin_routes::list_project_credentials),
         )
+        // T-049 engine-side: cloud-handed BYO bucket registration.
+        .route(
+            "/admin/v1/projects/:project_id/byo-bucket",
+            post(admin_routes::register_byo_bucket),
+        )
         .route("/health", get(health))
         // --- Phase 5.17.B: object-storage HTTP surface (ADR 0021) -----------
         // TODO 5.17.B-featuregate: wrap in #[cfg(feature = "storage")] once
