@@ -29,6 +29,7 @@ members = [
     "crates/basin-autoscale",
     "services/basin-autoscale",
     "services/basin-server",
+    "services/basin-e2e-runner",
     "services/basinctl",
     "tests/integration",
 ]

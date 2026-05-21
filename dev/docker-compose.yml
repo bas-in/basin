@@ -1,0 +1,166 @@
+# Basin dev-stack docker-compose
+#
+# Brings up:
+#   - catalog-pg   : Postgres 16 (catalog backend)
+#   - minio        : S3-compatible object store
+#   - basin-server : 1..N replicas (REPLICAS env, default 1)
+#
+# Quick start:
+#   bash dev/scripts/up.sh        # build + start + wait for health
+#   bash dev/scripts/smoke.sh     # ~10 psql round-trips
+#   bash dev/scripts/e2e.sh       # full E2E suite (calls basin-e2e-runner)
+#   bash dev/scripts/down.sh      # tear down
+#
+# "Bring your own binary" pattern:
+#   If the basin-server Docker build is not available, set
+#   BASIN_SERVER_BYO_BINARY=/absolute/path/to/basin-server and un-comment
+#   the byo-basin-server service below. The scripts detect this env var.
+#
+# Env vars (all have defaults; override in a .env file or export before running):
+#   REPLICAS            number of basin-server replicas (default 1)
+#   BASIN_PROJECTS      comma-separated user=project_id pairs (default "alice=*,bob=*")
+#   POSTGRES_PORT       host port for catalog Postgres (default 5532)
+#   MINIO_API_PORT      host port for MinIO API (default 9100)
+#   MINIO_CONSOLE_PORT  host port for MinIO Console (default 9101)
+#   BASIN_PORT_BASE     base host port for basin-server pgwire (default 5533)
+#                       replica 0 → BASIN_PORT_BASE, replica 1 → BASIN_PORT_BASE+1, etc.
+
+x-basin-env: &basin-env
+  BASIN_CATALOG: postgres://basin:basin@catalog-pg:5432/basin
+  BASIN_CATALOG_SCHEMA: basin_catalog
+  BASIN_STORAGE_BACKEND: s3
+  BASIN_STORAGE_BUCKET: basin-dev
+  BASIN_STORAGE_ENDPOINT: http://minio:9000
+  BASIN_STORAGE_REGION: us-east-1
+  BASIN_STORAGE_ACCESS_KEY_ID: minioadmin
+  BASIN_STORAGE_SECRET_ACCESS_KEY: minioadmin
+  BASIN_STORAGE_ROOT_PREFIX: warehouse
+  BASIN_WAL_BACKEND: local
+  BASIN_DATA_DIR: /data/basin
+  BASIN_WAL_DIR: /data/wal
+  BASIN_SHARD_ENABLED: "1"
+  BASIN_POOL_ENABLED: "0"
+  BASIN_PROJECTS: ${BASIN_PROJECTS:-alice=*,bob=*}
+  # Disk/page cache: reduced sizes for dev; set 0 to disable.
+  BASIN_DISK_CACHE_MAX_BYTES: "536870912"   # 512 MiB
+  BASIN_PAGE_CACHE_MAX_BYTES: "268435456"   # 256 MiB
+
+services:
+
+  # ── Catalog Postgres 16 ────────────────────────────────────────────────────
+  catalog-pg:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: basin
+      POSTGRES_PASSWORD: basin
+      POSTGRES_DB: basin
+    ports:
+      - "${POSTGRES_PORT:-5532}:5432"
+    volumes:
+      - catalog-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U basin -d basin"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+  # ── MinIO (S3-compatible object store) ────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "${MINIO_API_PORT:-9100}:9000"
+      - "${MINIO_CONSOLE_PORT:-9101}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+  # ── MinIO bucket bootstrap ─────────────────────────────────────────────────
+  # One-shot container that creates the basin-dev bucket after minio is healthy.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin &&
+        mc mb --ignore-existing local/basin-dev &&
+        echo 'basin-dev bucket ready'
+      "
+    restart: "no"
+
+  # ── basin-server replica 0 (always present) ───────────────────────────────
+  basin-server-0:
+    build:
+      context: ..
+      dockerfile: dev/Dockerfile.basin-server
+    depends_on:
+      catalog-pg:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *basin-env
+      BASIN_BIND: "0.0.0.0:5433"
+      BASIN_REPLICA_ID: "replica-0"
+    ports:
+      - "${BASIN_PORT_BASE:-5533}:5433"
+    volumes:
+      - basin-data-0:/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5433 -U alice 2>/dev/null || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  # ── basin-server replica 1 (optional; start with REPLICAS=2) ─────────────
+  # To start: docker compose --profile replica-1 up -d
+  basin-server-1:
+    profiles: ["replica-1"]
+    build:
+      context: ..
+      dockerfile: dev/Dockerfile.basin-server
+    depends_on:
+      catalog-pg:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *basin-env
+      BASIN_BIND: "0.0.0.0:5433"
+      BASIN_REPLICA_ID: "replica-1"
+    ports:
+      - "${BASIN_PORT_REPLICA1:-5534}:5433"
+    volumes:
+      - basin-data-1:/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5433 -U alice 2>/dev/null || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  catalog-pg-data:
+  minio-data:
+  basin-data-0:
+  basin-data-1:

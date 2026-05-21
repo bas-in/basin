@@ -1,0 +1,57 @@
+# Multi-stage build for basin-server.
+#
+# Stage 1 (builder): compiles the Rust workspace with the minimal feature set.
+#   Cargo features: no auth/rest/webhooks by default (pgwire-only dev image).
+#   Set BUILD_FEATURES=default to include auth+rest+webhooks.
+#
+# Stage 2 (runtime): copies the stripped binary into a minimal Debian image.
+#   psql is included so the container's healthcheck can use pg_isready.
+#
+# ── "Bring your own binary" ──────────────────────────────────────────────────
+# If you cannot build from source inside Docker (e.g. missing musl toolchain),
+# skip this file entirely and use the byo-basin-server compose service pattern
+# documented in dev/README.md. Mount your pre-built binary at /usr/local/bin/
+# and the scripts will detect BASIN_SERVER_BYO_BINARY automatically.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 1: Rust builder
+# ─────────────────────────────────────────────────────────────────────────────
+FROM rust:1.85-bookworm AS builder
+
+WORKDIR /workspace
+
+# Cache layer: copy manifests first, then source.
+# This lets Docker reuse the cargo-fetch layer when only .rs files change.
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates/ crates/
+COPY services/ services/
+COPY tests/ tests/
+
+ARG BUILD_FEATURES=""
+
+RUN cargo build \
+      --release \
+      -p basin-server \
+      $([ -n "$BUILD_FEATURES" ] && echo "--features $BUILD_FEATURES" || echo "--no-default-features") \
+    && strip target/release/basin-server
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 2: runtime image
+# ─────────────────────────────────────────────────────────────────────────────
+FROM debian:bookworm-slim AS runtime
+
+# postgresql-client for pg_isready (healthcheck) and psql (smoke tests).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+         ca-certificates \
+         postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /workspace/target/release/basin-server /usr/local/bin/basin-server
+
+# Default data dirs; override via BASIN_DATA_DIR / BASIN_WAL_DIR env vars.
+RUN mkdir -p /data/basin /data/wal
+
+EXPOSE 5433
+
+ENTRYPOINT ["/usr/local/bin/basin-server"]
