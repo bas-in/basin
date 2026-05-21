@@ -75,7 +75,6 @@ async fn setup_orders_table(eng: &Engine) -> basin_engine::ProjectSession {
     sess
 }
 
-#[ignore = "C3: RETURNS TABLE AST shape not yet parsed by function_ddl — blocked on #40 cluster"]
 #[tokio::test]
 async fn returns_table_basic() {
     let dir = TempDir::new().unwrap();
@@ -101,7 +100,6 @@ async fn returns_table_basic() {
     assert_eq!(col_i64(&batches, "amount"), vec![500, 1500, 2500]);
 }
 
-#[ignore = "C3: RETURNS TABLE AST shape not yet parsed by function_ddl — blocked on #40 cluster"]
 #[tokio::test]
 async fn returns_table_with_where_filter() {
     let dir = TempDir::new().unwrap();
@@ -127,7 +125,6 @@ async fn returns_table_with_where_filter() {
     assert_eq!(col_i64(&batches, "amount"), vec![1500, 2500]);
 }
 
-#[ignore = "C3: RETURNS TABLE AST shape not yet parsed by function_ddl — blocked on #40 cluster"]
 #[tokio::test]
 async fn returns_table_with_join() {
     let dir = TempDir::new().unwrap();
@@ -196,7 +193,6 @@ async fn returns_table_with_join() {
     }
 }
 
-#[ignore = "C3: RETURNS TABLE AST shape not yet parsed by function_ddl — blocked on #40 cluster"]
 #[tokio::test]
 async fn arity_mismatch_rejected_at_registration() {
     let dir = TempDir::new().unwrap();
@@ -224,7 +220,6 @@ async fn arity_mismatch_rejected_at_registration() {
     );
 }
 
-#[ignore = "C3: RETURNS TABLE AST shape not yet parsed by function_ddl — blocked on #40 cluster"]
 #[tokio::test]
 async fn column_name_uniqueness_enforced() {
     let dir = TempDir::new().unwrap();
@@ -247,7 +242,6 @@ async fn column_name_uniqueness_enforced() {
     );
 }
 
-#[ignore = "C3: RETURNS TABLE AST shape not yet parsed by function_ddl — blocked on #40 cluster"]
 #[tokio::test]
 async fn returns_table_in_scalar_position_rejected() {
     let dir = TempDir::new().unwrap();
@@ -273,7 +267,6 @@ async fn returns_table_in_scalar_position_rejected() {
     );
 }
 
-#[ignore = "C3: RETURNS TABLE AST shape not yet parsed by function_ddl — blocked on #40 cluster"]
 #[tokio::test]
 async fn cross_project_isolation() {
     let dir = TempDir::new().unwrap();

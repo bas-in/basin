@@ -406,10 +406,21 @@ pub(crate) fn match_alter_function_rename_ast(
 }
 
 /// Translate the sqlparser-parsed RETURNS clause into a `SqlReturnType`.
-/// `RETURNS TABLE(col type, ...)` parses as `DataType::Custom("TABLE", [c1, t1, c2, t2, ...])`
-/// (the modifiers are flat strings); anything else is treated as a scalar
-/// return and routed through [`sql_data_type_to_arg`].
+///
+/// sqlparser 0.53+ shape: `RETURNS TABLE(a BIGINT, b TEXT)` parses as
+/// `DataType::Table(Some(Vec<ColumnDef>))`.
+///
+/// Legacy / fallback shape (sqlparser ≤0.52): `DataType::Custom("TABLE",
+/// [c1, t1, c2, t2, ...])` where the modifiers are flat strings.
+///
+/// Anything else is treated as a scalar return and routed through
+/// [`sql_data_type_to_arg`].
 fn parse_return_type(dt: &SqlDataType, fn_name: &str) -> Result<SqlReturnType> {
+    // sqlparser 0.53+ shape: DataType::Table(Some(cols))
+    if let SqlDataType::Table(Some(col_defs)) = dt {
+        return parse_returns_table_from_coldefs(col_defs, fn_name);
+    }
+    // Legacy / fallback shape: DataType::Custom("TABLE", [name, type, ...])
     if let SqlDataType::Custom(obj, modifiers) = dt {
         if obj.0.len() == 1 && obj.0[0].id_val().eq_ignore_ascii_case("TABLE") {
             return parse_returns_table(modifiers, fn_name);
@@ -421,6 +432,37 @@ fn parse_return_type(dt: &SqlDataType, fn_name: &str) -> Result<SqlReturnType> {
         ))
     })?;
     Ok(SqlReturnType::Scalar(arg))
+}
+
+/// Parse `RETURNS TABLE(...)` from sqlparser 0.53+ `Vec<ColumnDef>` shape.
+fn parse_returns_table_from_coldefs(
+    col_defs: &[sqlparser::ast::ColumnDef],
+    fn_name: &str,
+) -> Result<SqlReturnType> {
+    if col_defs.is_empty() {
+        return Err(BasinError::InvalidSchema(format!(
+            "CREATE FUNCTION {fn_name}: RETURNS TABLE requires at least one (name type) pair"
+        )));
+    }
+    let mut cols: Vec<(String, SqlArgType)> = Vec::with_capacity(col_defs.len());
+    let mut seen = std::collections::HashSet::new();
+    for col in col_defs {
+        let col_name = col.name.value.clone();
+        if !seen.insert(col_name.to_ascii_lowercase()) {
+            return Err(BasinError::InvalidSchema(format!(
+                "CREATE FUNCTION {fn_name}: RETURNS TABLE column name {col_name:?} \
+                 appears more than once"
+            )));
+        }
+        let arg = sql_data_type_to_arg(&col.data_type).map_err(|e| {
+            BasinError::InvalidSchema(format!(
+                "CREATE FUNCTION {fn_name}: RETURNS TABLE column {col_name:?} type \
+                 unsupported ({e})"
+            ))
+        })?;
+        cols.push((col_name, arg));
+    }
+    Ok(SqlReturnType::Table(cols))
 }
 
 /// Parse `[col1, type1, col2, type2, ...]` into a `Table` return type.

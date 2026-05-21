@@ -122,7 +122,6 @@ async fn create_function_with_timestamp_arg() {
     assert_eq!(col_string(&batches, "d"), vec!["2024-06-15".to_string()]);
 }
 
-#[ignore = "C3: RETURNS TABLE AST shape not yet parsed by function_ddl — blocked on #40 cluster"]
 #[tokio::test]
 async fn create_function_returns_table_with_timestamp() {
     let dir = TempDir::new().unwrap();
