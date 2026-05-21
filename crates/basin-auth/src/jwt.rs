@@ -3,6 +3,13 @@
 //! Claims layout matches ADR 0005: `project_id`, `user_id`, `email`, `roles`,
 //! `iat`, `exp`. Signing is HS256 with the platform-level secret loaded by
 //! `AuthConfig::from_env`.
+//!
+//! Security invariants enforced on every `verify` call (fixes #53 P1):
+//! - `exp` required and validated (token not expired).
+//! - `nbf` required and validated (token not used before it is valid).
+//! - `iat` required and must not be more than `IAT_MAX_SKEW_SECS` seconds in
+//!   the future (prevents pre-issued tokens with `iat = year 3000`).
+//! - 60-second leeway on `exp`/`nbf` to tolerate minor clock skew.
 
 use std::time::Duration;
 
@@ -11,6 +18,12 @@ use chrono::{DateTime, Utc};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// Maximum number of seconds that `iat` may exceed the current wall clock.
+/// Tokens issued more than this far in the future are rejected even if the
+/// signature is valid (prevents attacker with leaked secret from minting tokens
+/// with `iat = year 3000` that would otherwise slip through).
+const IAT_MAX_SKEW_SECS: i64 = 60;
 
 /// Authenticator Assurance Level (RFC 8176 / Supabase AAL).
 /// `aal1` = single-factor (password, magic-link, OAuth).
@@ -67,7 +80,13 @@ struct WireClaims {
     email: String,
     roles: Vec<String>,
     exp: i64,
-    iat: i64,
+    /// `iat` is deserialized as `Option` so that a missing claim is
+    /// distinguishable from `iat = 0`. The `verify` method rejects `None`.
+    #[serde(default)]
+    iat: Option<i64>,
+    /// `nbf` (not-before) is set equal to `iat` on issue so that the token is
+    /// not usable before the moment it was minted. Required by validation.
+    nbf: i64,
     #[serde(default)]
     is_admin: bool,
     #[serde(default)]
@@ -97,6 +116,8 @@ struct RefreshWireClaims {
     aud: String,
     exp: i64,
     iat: i64,
+    /// `nbf` = `iat`: refresh token not usable before issuance moment.
+    nbf: i64,
 }
 
 /// Audience claim for refresh JWTs. Access tokens have no `aud`.
@@ -116,10 +137,19 @@ impl JwtKeys {
     pub fn new(secret: &[u8]) -> Self {
         let mut validation = Validation::new(Algorithm::HS256);
         // Access tokens have no `aud`; refresh validation requires it below.
-        validation.required_spec_claims = ["exp"].iter().map(|s| s.to_string()).collect();
+        // Require exp + nbf; iat is validated manually in `verify` because
+        // jsonwebtoken's required_spec_claims only enforces exp/nbf/aud/iss/sub.
+        validation.required_spec_claims =
+            ["exp", "nbf"].iter().map(|s| s.to_string()).collect();
+        // Enable nbf enforcement (defaults to false in jsonwebtoken).
+        validation.validate_nbf = true;
+        // 60-second leeway for exp + nbf to absorb minor clock skew.
+        validation.leeway = 60;
         let mut refresh_validation = Validation::new(Algorithm::HS256);
         refresh_validation.required_spec_claims =
-            ["exp", "aud"].iter().map(|s| s.to_string()).collect();
+            ["exp", "nbf", "aud"].iter().map(|s| s.to_string()).collect();
+        refresh_validation.validate_nbf = true;
+        refresh_validation.leeway = 60;
         refresh_validation.set_audience(&[REFRESH_AUDIENCE]);
         Self {
             encoding: EncodingKey::from_secret(secret),
@@ -178,13 +208,16 @@ impl JwtKeys {
             + chrono::Duration::from_std(ttl).map_err(|e| {
                 BasinError::internal(format!("token_ttl out of range for chrono: {e}"))
             })?;
+        let now_ts = now.timestamp();
         let wire = WireClaims {
             project_id: project.to_string(),
             user_id: user.to_string(),
             email: email.to_owned(),
             roles: roles.to_vec(),
             exp: exp_dt.timestamp(),
-            iat: now.timestamp(),
+            iat: Some(now_ts),
+            // nbf = iat: token is not valid before the moment it was issued.
+            nbf: now_ts,
             is_admin,
             aal,
             amr,
@@ -195,10 +228,33 @@ impl JwtKeys {
     }
 
     /// Verify signature + expiry, return parsed claims.
+    ///
+    /// In addition to the checks performed by `jsonwebtoken` (signature, `exp`,
+    /// `nbf`), this method enforces `iat` validity:
+    /// - `iat` must be present in the token.
+    /// - `iat` must not be more than [`IAT_MAX_SKEW_SECS`] seconds in the
+    ///   future; a token issued with `iat = year 3000` is rejected here.
     pub fn verify(&self, token: &str) -> Result<Claims> {
         let data = decode::<WireClaims>(token, &self.decoding, &self.validation)
             .map_err(|e| BasinError::internal(format!("jwt verify: {e}")))?;
         let w = data.claims;
+
+        // --- iat validation (jsonwebtoken does not enforce this natively) ---
+        // 1. iat must be present.
+        let iat = w.iat.ok_or_else(|| {
+            BasinError::internal("jwt verify: missing required claim: iat".to_string())
+        })?;
+        // 2. Reject tokens whose iat is more than IAT_MAX_SKEW_SECS in the future.
+        //    This closes the attack where an adversary with a stolen secret mints a
+        //    token with iat = year 3000 to confuse any time-based audit trail.
+        let now_ts = Utc::now().timestamp();
+        if iat > now_ts + IAT_MAX_SKEW_SECS {
+            return Err(BasinError::internal(format!(
+                "jwt verify: iat ({iat}) is too far in the future \
+                 (now={now_ts}, max_skew={IAT_MAX_SKEW_SECS}s)"
+            )));
+        }
+
         let project: ProjectId = w
             .project_id
             .parse()
@@ -213,7 +269,7 @@ impl JwtKeys {
             email: w.email,
             roles: w.roles,
             exp: w.exp,
-            iat: w.iat,
+            iat,
             is_admin: w.is_admin,
             aal: w.aal,
             amr: w.amr,
@@ -236,6 +292,7 @@ impl JwtKeys {
                 BasinError::internal(format!("refresh_ttl out of range for chrono: {e}"))
             })?;
         let jti = Uuid::new_v4().to_string();
+        let now_ts = now.timestamp();
         let wire = RefreshWireClaims {
             project_id: project.to_string(),
             user_id: user.to_string(),
@@ -243,7 +300,8 @@ impl JwtKeys {
             jti: jti.clone(),
             aud: REFRESH_AUDIENCE.to_owned(),
             exp: exp_dt.timestamp(),
-            iat: now.timestamp(),
+            iat: now_ts,
+            nbf: now_ts,
         };
         let token = encode(&Header::new(Algorithm::HS256), &wire, &self.encoding)
             .map_err(|e| BasinError::internal(format!("refresh jwt encode: {e}")))?;
@@ -277,6 +335,134 @@ impl JwtKeys {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Helper: encode a raw JWT with arbitrary claims (for adversarial tests).
+    // -----------------------------------------------------------------------
+
+    /// Minimal wire shape for crafting adversarial tokens in tests.
+    #[derive(Debug, Serialize, Deserialize)]
+    struct RawClaims {
+        project_id: String,
+        user_id: String,
+        email: String,
+        roles: Vec<String>,
+        exp: i64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        iat: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nbf: Option<i64>,
+    }
+
+    fn encode_raw(secret: &[u8], raw: &RawClaims) -> String {
+        let key = EncodingKey::from_secret(secret);
+        encode(&Header::new(Algorithm::HS256), raw, &key).unwrap()
+    }
+
+    fn default_raw(now_ts: i64, iat: Option<i64>, nbf: Option<i64>) -> RawClaims {
+        RawClaims {
+            project_id: ProjectId::new().to_string(),
+            user_id: Uuid::new_v4().to_string(),
+            email: "test@example.com".to_owned(),
+            roles: vec![],
+            // exp safely in the future
+            exp: now_ts + 3600,
+            iat,
+            nbf,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // iat / nbf security tests (fixes #53 P1)
+    // -----------------------------------------------------------------------
+
+    /// A token with `iat` one year in the future must be rejected, even though
+    /// the signature is valid (attacker with stolen secret scenario).
+    #[test]
+    fn jwt_iat_in_future_rejected() {
+        let secret = [42u8; 32];
+        let keys = JwtKeys::new(&secret);
+        let now_ts = Utc::now().timestamp();
+        let future_iat = now_ts + 3600 * 24 * 365; // ~1 year ahead
+        let raw = default_raw(now_ts, Some(future_iat), Some(now_ts));
+        let token = encode_raw(&secret, &raw);
+        let err = keys.verify(&token).unwrap_err();
+        assert!(
+            err.to_string().contains("iat") || err.to_string().contains("future"),
+            "expected iat-future error, got: {err}"
+        );
+    }
+
+    /// A token with `nbf` one hour in the future must be rejected.
+    #[test]
+    fn jwt_nbf_in_future_rejected() {
+        let secret = [43u8; 32];
+        let keys = JwtKeys::new(&secret);
+        let now_ts = Utc::now().timestamp();
+        let future_nbf = now_ts + 3600; // 1 hour ahead
+        let raw = default_raw(now_ts, Some(now_ts), Some(future_nbf));
+        let token = encode_raw(&secret, &raw);
+        // The library should reject via ImmatureSignature.
+        assert!(
+            keys.verify(&token).is_err(),
+            "token with nbf in the future must be rejected"
+        );
+    }
+
+    /// A token with `iat` only 30 seconds ahead is within the 60-second leeway
+    /// and must be accepted.
+    #[test]
+    fn jwt_iat_within_leeway_accepted() {
+        let secret = [44u8; 32];
+        let keys = JwtKeys::new(&secret);
+        let now_ts = Utc::now().timestamp();
+        let slightly_future_iat = now_ts + 30; // within IAT_MAX_SKEW_SECS (60)
+        let raw = default_raw(now_ts, Some(slightly_future_iat), Some(now_ts));
+        let token = encode_raw(&secret, &raw);
+        assert!(
+            keys.verify(&token).is_ok(),
+            "token with iat 30s ahead should be accepted (within 60s leeway)"
+        );
+    }
+
+    /// A token missing `iat` must be rejected because our validation now
+    /// requires `iat` to be present (validated manually in `verify`).
+    #[test]
+    fn jwt_missing_iat_rejected() {
+        let secret = [45u8; 32];
+        let keys = JwtKeys::new(&secret);
+        let now_ts = Utc::now().timestamp();
+        // iat = None means the field is omitted from the token payload.
+        let raw = default_raw(now_ts, None, Some(now_ts));
+        let token = encode_raw(&secret, &raw);
+        // Without iat the iat > now + skew check treats w.iat as the serde
+        // default (0), which is safely in the past — so we need the explicit
+        // missing-iat guard. Tokens without iat must be rejected.
+        let err = keys.verify(&token).unwrap_err();
+        assert!(
+            err.to_string().contains("iat") || err.to_string().contains("missing"),
+            "expected missing-iat error, got: {err}"
+        );
+    }
+
+    /// A token missing `nbf` must be rejected because nbf is now required.
+    #[test]
+    fn jwt_missing_nbf_rejected() {
+        let secret = [46u8; 32];
+        let keys = JwtKeys::new(&secret);
+        let now_ts = Utc::now().timestamp();
+        // nbf = None → field omitted; required_spec_claims includes "nbf".
+        let raw = default_raw(now_ts, Some(now_ts), None);
+        let token = encode_raw(&secret, &raw);
+        assert!(
+            keys.verify(&token).is_err(),
+            "token missing nbf must be rejected (nbf is required)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Pre-existing tests (must still pass)
+    // -----------------------------------------------------------------------
 
     #[test]
     fn issue_then_verify_round_trips() {
