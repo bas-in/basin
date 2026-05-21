@@ -1,12 +1,17 @@
-# Phase 5.31.A — Publish workflow for the Basin Docker image.
-# DEPENDENCY: This workflow WILL FAIL until 5.31.B lands the Dockerfile at the
-# repo root. That is the expected "lands red" state for this phase.
+# Phases 5.31.C + 5.31.D — Publish workflow for the Basin Docker image.
+# DEPENDENCY: Requires the repo-root Dockerfile produced in Phase 5.31.B.
+#             This workflow will fail until that Dockerfile is present.
 #
-# Triggered on `v*` tag pushes.  Builds a multi-arch image, runs the smoke
-# test, then pushes (and cosign-signs) to both GHCR and Docker Hub.
+# Triggered on `v*` tag pushes.  Builds a multi-arch image (linux/amd64 +
+# linux/arm64), runs the smoke test, then pushes (and cosign-signs) to both
+# GHCR and Docker Hub.  `:latest` is applied only to stable releases
+# (vX.Y.Z); pre-release tags (vX.Y.Z-rc1 etc.) are tagged by version only.
 #
 # Required repository secrets:
-#   DOCKERHUB_TOKEN  — Docker Hub access token for basin/basin-server
+#   DOCKERHUB_USERNAME — Docker Hub username (account that owns basin/basin-server)
+#   DOCKERHUB_TOKEN    — Docker Hub access token for basin/basin-server
+#
+# GHCR auth uses the built-in ${{ secrets.GITHUB_TOKEN }} — no extra secret needed.
 
 name: Docker Publish
 
@@ -89,7 +94,7 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: docker.io
-          username: basin
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Generate Docker metadata (GHCR)
@@ -189,7 +194,7 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: docker.io
-          username: basin
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Check if stable release
@@ -208,7 +213,8 @@ jobs:
         with:
           images: ${{ env.DHUB_IMAGE }}
           tags: |
-            type=raw,value=${{ needs.build-publish.outputs.version }}
+            type=semver,pattern={{version}},value=${{ needs.build-publish.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.build-publish.outputs.version }}
             type=raw,value=latest,enable=${{ steps.stable.outputs.is_stable }}
 
       - name: Re-tag and push to Docker Hub
