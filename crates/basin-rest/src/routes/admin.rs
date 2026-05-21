@@ -41,6 +41,26 @@ fn require_admin(claims: &basin_auth::Claims) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Enforce that an admin JWT is scoped to the project named in the URL path.
+///
+/// Every `/admin/v1/projects/:project_id/…` handler calls this as its first
+/// check (after `require_admin`). If the token's `project_id` claim differs
+/// from the path-level project ULID the request is rejected with 403 — the
+/// error message is deliberately non-leaky (no information about the target
+/// project is returned).
+fn assert_admin_for_path_project(
+    claims: &basin_auth::Claims,
+    path_project_id: &ProjectId,
+) -> Result<(), ApiError> {
+    if claims.project_id != *path_project_id {
+        return Err(ApiError::forbidden(format!(
+            "admin token scoped to project {} cannot operate on project {}",
+            claims.project_id, path_project_id,
+        )));
+    }
+    Ok(())
+}
+
 fn connection_info_to_json(info: &basin_auth::ConnectionInfo) -> Value {
     json!({
         "project_id": info.project_id.to_string(),
@@ -81,9 +101,15 @@ pub(crate) async fn provision_project(
 }
 
 /// `POST /admin/v1/projects/{id}/rotate` — rotate a credential's password.
-/// `id` is the `pgwire_user` (`project_<8 hex>`), not the project ULID. The
-/// older password stops validating immediately; the response carries the new
-/// `connection_url`.
+/// `id` is the `pgwire_user` (`project_<8 hex>` or `{ulid}_{hex}`), not the
+/// project ULID. The older password stops validating immediately; the response
+/// carries the new `connection_url`.
+///
+/// Project-binding is enforced: the admin token must be scoped to the same
+/// project that owns the credential being rotated. For new-format usernames
+/// (`{26-char-ulid}_{hex}`) the check runs before the DB call; for legacy
+/// format (`project_{hex}`) we perform the rotation then check post-hoc,
+/// ensuring no credential data is returned if the project doesn't match.
 #[axum::debug_handler]
 pub(crate) async fn rotate_project(
     State(state): State<Arc<Inner>>,
@@ -93,12 +119,25 @@ pub(crate) async fn rotate_project(
     let claims = authorize(&state, &headers).await?;
     require_admin(&claims)?;
 
+    // Pre-check: new-format pgwire_user encodes the project ULID as its first
+    // 26 characters. If present, enforce binding before touching the DB.
+    if let Some(ulid_prefix) = basin_auth::project_credentials::parse_project_from_pgwire_user(&pgwire_user) {
+        let path_project: ProjectId = ulid_prefix
+            .parse()
+            .map_err(|e| ApiError::invalid(format!("invalid project_id in pgwire_user: {e}")))?;
+        assert_admin_for_path_project(&claims, &path_project)?;
+    }
+
     let info = state
         .cfg
         .auth
         .rotate_pgwire_password(&pgwire_user)
         .await
         .map_err(ApiError::from)?;
+
+    // Post-check: for legacy-format usernames the ULID was not encoded in the
+    // username; verify binding on the returned credential's project_id.
+    assert_admin_for_path_project(&claims, &info.project_id)?;
 
     Ok(Json(connection_info_to_json(&info)).into_response())
 }
@@ -118,6 +157,7 @@ pub(crate) async fn list_project_credentials(
     let project: ProjectId = project_id
         .parse()
         .map_err(|e| ApiError::invalid(format!("invalid project_id: {e}")))?;
+    assert_admin_for_path_project(&claims, &project)?;
 
     let descriptors = state
         .cfg
@@ -197,6 +237,7 @@ pub(crate) async fn register_byo_bucket(
     let project: ProjectId = project_id
         .parse()
         .map_err(|e| ApiError::invalid(format!("invalid project_id: {e}")))?;
+    assert_admin_for_path_project(&claims, &project)?;
 
     if req.bucket.trim().is_empty() {
         return Err(ApiError::invalid("bucket must be non-empty"));

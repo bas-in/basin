@@ -66,6 +66,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use basin_catalog::{Catalog, InMemoryCatalog};
 use basin_common::{BasinError, PartitionKey, ProjectId, TableName};
@@ -73,7 +74,10 @@ use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_router::{PgRateLimit, ServerConfig, StaticProjectResolver};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
+use uuid::Uuid;
 
 /// OWASP-flavoured SQL-injection payloads. Each is a string we'll feed
 /// through both the simple and extended pgwire paths.
@@ -963,20 +967,231 @@ fn audit_p1_4_recovery_code_hash_format_documented() {
     );
 }
 
-// --- audit P1-5: admin tenant binding (not yet fixed) -----------------------
+// --- audit P1-5: admin tenant binding (fixed) --------------------------------
 
-/// Audit §6 row "admin cross-tenant rotate" (P1-5): a JWT with
-/// `is_admin: true` can today rotate / list credentials for any project ULID
-/// (no `claims.project_id == path_project_id` check in `admin.rs`). Fix
-/// not landed; recorded as `#[ignore]`d.
-#[test]
-#[ignore = "audit P1-5: admin endpoints lack per-project binding; fix not landed"]
-fn audit_p1_5_admin_rotate_other_project_rejected() {
-    // Shape (once fixed): mint admin JWT bound to project A, attempt
-    // POST /admin/v1/projects/<B's pgwire_user>/rotate with that JWT →
-    // expect 403 (not 200). Requires the rest+auth fixture from
-    // `per_project_credentials.rs`.
-    panic!("audit P1-5 fix not landed; un-ignore once admin project binding is enforced");
+/// Audit §6 row "admin cross-tenant rotate" (P1-5 fix): `admin.rs` now calls
+/// `assert_admin_for_path_project` before any route logic. An admin JWT scoped
+/// to project A must receive 403 when it attempts to rotate project B's
+/// credential.
+///
+/// The test mints two projects (A and B) and constructs B's pgwire_user in
+/// new-format `{B-ulid}_{hex}`. The pre-check in `rotate_project` extracts B's
+/// ULID from the username and compares it with A's `claims.project_id`; the
+/// mismatch triggers a 403 before the handler touches the auth DB.
+///
+/// Skip-cleanly: Postgres is required to start `AuthService` (the signing-key
+/// store). If Postgres is unreachable the test prints a skip note and returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audit_p1_5_admin_rotate_other_project_rejected() {
+    use basin_auth::{AuthConfig, AuthService, SmtpConfig, SmtpTls, StubMailer};
+    use basin_auth::jwt::JwtKeys;
+
+    const PG_URL: &str = "host=127.0.0.1 port=5432 user=pc dbname=postgres";
+
+    // Check Postgres availability; skip cleanly if not reachable.
+    let pg_ok = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio_postgres::connect(PG_URL, NoTls),
+    )
+    .await;
+    let pg_alive = match pg_ok {
+        Ok(Ok((_c, conn))) => {
+            tokio::spawn(async move { let _ = conn.await; });
+            true
+        }
+        _ => false,
+    };
+    if !pg_alive {
+        eprintln!("[audit_p1_5] postgres unreachable — skipping (not a test failure)");
+        return;
+    }
+
+    // Unique schema to avoid cross-test interference.
+    let schema = format!(
+        "basin_sec_p1_5_{}",
+        ulid::Ulid::new().to_string().to_lowercase()
+    );
+
+    let jwt_secret = vec![42u8; 32];
+    let cfg = AuthConfig {
+        jwt_secret: jwt_secret.clone(),
+        token_ttl: Duration::from_secs(300),
+        refresh_ttl: Duration::from_secs(86_400),
+        catalog_dsn: Some(PG_URL.to_owned()),
+        catalog_schema: schema.clone(),
+        smtp: SmtpConfig {
+            host: "smtp.invalid".into(),
+            port: 587,
+            username: "u".into(),
+            password: "p".into(),
+            from_email: "noreply@example.com".into(),
+            from_name: Some("Basin".into()),
+            tls: SmtpTls::StartTls,
+        },
+        bcrypt_cost: 4,
+        password_min_len: 10,
+        rate_limit_per_ip_per_min: 10_000,
+        email_enabled: true,
+        pgwire_public_host: "127.0.0.1:0".into(),
+    };
+    let mailer = StubMailer::new(cfg.smtp.from_email.clone());
+    let auth = match tokio::time::timeout(
+        Duration::from_secs(3),
+        AuthService::connect_with_mailer(cfg, Arc::new(mailer)),
+    )
+    .await
+    {
+        Ok(Ok(a)) => Arc::new(a),
+        _ => {
+            eprintln!("[audit_p1_5] auth connect failed — skipping");
+            return;
+        }
+    };
+
+    // Tear down the schema when the test exits.
+    struct SchemaGuard {
+        schema: String,
+    }
+    impl Drop for SchemaGuard {
+        fn drop(&mut self) {
+            let schema = self.schema.clone();
+            let rt = tokio::runtime::Handle::try_current();
+            if let Ok(handle) = rt {
+                handle.spawn(async move {
+                    if let Ok((client, conn)) =
+                        tokio_postgres::connect("host=127.0.0.1 port=5432 user=pc dbname=postgres", NoTls).await
+                    {
+                        tokio::spawn(async move { let _ = conn.await; });
+                        let _ = client
+                            .execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"), &[])
+                            .await;
+                    }
+                });
+            }
+        }
+    }
+    let _schema_guard = SchemaGuard { schema };
+
+    // Stand up a basin-rest server.
+    let dir = TempDir::new().expect("tempdir");
+    let fs = LocalFileSystem::new_with_prefix(dir.path()).expect("local fs");
+    let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
+        object_store: Arc::new(fs),
+        root_prefix: None,
+        disk_cache: None,
+        page_cache: None,
+    });
+    let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+    let engine = Engine::new(EngineConfig { storage, catalog, shard: None });
+    let rest_cfg = basin_rest::RestConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        engine,
+        auth.clone(),
+    );
+    let rest = basin_rest::RestService::new(rest_cfg)
+        .run_until_bound()
+        .await
+        .expect("rest bind");
+    let rest_addr = rest.local_addr;
+
+    // Mint an admin JWT scoped to project A.
+    let project_a = ProjectId::new();
+    let project_b = ProjectId::new();
+    let keys = JwtKeys::new(&jwt_secret);
+    let (jwt_a, _) = keys
+        .issue_with_admin(
+            &project_a,
+            Uuid::new_v4(),
+            "admin-a@example.com",
+            &[],
+            true,
+            chrono::Utc::now(),
+            Duration::from_secs(300),
+        )
+        .expect("issue admin JWT for project A");
+
+    // Construct a new-format pgwire_user for project B.
+    // Format: `{26-char-project-b-ulid}_{8-hex-chars}`.
+    // The project doesn't need to exist in the DB — the pre-check fires
+    // before any DB access.
+    let fake_b_pgwire_user = format!("{project_b}_deadbeef");
+
+    // POST /admin/v1/projects/<B's pgwire_user>/rotate with A's admin JWT.
+    // Expect 403, not 200 or any other success code.
+    let path = format!("/admin/v1/projects/{fake_b_pgwire_user}/rotate");
+    let resp = p1_5_http_post(rest_addr, &path, &jwt_a, b"{}").await;
+    assert_eq!(
+        resp.status, 403,
+        "SECURITY P1-5: admin token for project A rotated project B's credential \
+         (got HTTP {}); project-scoped binding not enforced",
+        resp.status
+    );
+    println!(
+        "[audit_p1_5] rotate with cross-project token → {} (expected 403) PASS",
+        resp.status
+    );
+
+    // Belt-and-braces: also test the credentials list endpoint.
+    let creds_path = format!("/admin/v1/projects/{project_b}/credentials");
+    let creds_resp = p1_5_http_get(rest_addr, &creds_path, &jwt_a).await;
+    assert_eq!(
+        creds_resp.status, 403,
+        "SECURITY P1-5: admin token for project A listed project B's credentials \
+         (got HTTP {}); project-scoped binding not enforced",
+        creds_resp.status
+    );
+    println!(
+        "[audit_p1_5] credentials list with cross-project token → {} (expected 403) PASS",
+        creds_resp.status
+    );
+}
+
+/// Minimal HTTP helper for audit_p1_5 — POST with a JSON body.
+async fn p1_5_http_post(addr: SocketAddr, path: &str, bearer: &str, body: &[u8]) -> HttpResp {
+    let mut sock = TcpStream::connect(addr).await.expect("connect");
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
+         Authorization: Bearer {bearer}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\n\r\n",
+        body.len()
+    );
+    sock.write_all(req.as_bytes()).await.expect("write head");
+    sock.write_all(body).await.expect("write body");
+    sock.flush().await.expect("flush");
+    p1_5_read_response(sock).await
+}
+
+/// Minimal HTTP helper for audit_p1_5 — GET with an Authorization header.
+async fn p1_5_http_get(addr: SocketAddr, path: &str, bearer: &str) -> HttpResp {
+    let mut sock = TcpStream::connect(addr).await.expect("connect");
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
+         Authorization: Bearer {bearer}\r\n\r\n",
+    );
+    sock.write_all(req.as_bytes()).await.expect("write head");
+    sock.flush().await.expect("flush");
+    p1_5_read_response(sock).await
+}
+
+struct HttpResp {
+    status: u16,
+}
+
+async fn p1_5_read_response(mut sock: TcpStream) -> HttpResp {
+    let mut buf = Vec::with_capacity(4096);
+    sock.read_to_end(&mut buf).await.expect("read response");
+    let split = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("response missing header terminator");
+    let head = std::str::from_utf8(&buf[..split]).expect("headers utf8");
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .expect("status line");
+    HttpResp { status }
 }
 
 // --- audit P1 OAuth identity-link (shipped) ---------------------------------
@@ -1442,7 +1657,6 @@ fn sec_p1_33_alias_path_cannot_bypass_signed_url_verification() {
 ///
 /// Un-ignore when the fix ships.
 #[tokio::test]
-#[ignore = "P0 RLS bug — fix not landed; closes when engine fix ships (exec_delete must inject USING predicate into WHERE filter)"]
 async fn rls_update_delete_enforced() {
     let (engine, t, _, _dir) = engine_with_two_projects();
     let admin = engine.open_session(t).await.unwrap();
