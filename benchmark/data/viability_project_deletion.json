@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "deletion_ms",
-    "value": 4.0747919999999995,
+    "value": 3.814417,
     "unit": "ms",
     "bar": {
       "op": "less_than",
@@ -15,7 +15,7 @@
   },
   "details": {
     "files": 100,
-    "setup_ms": 42.873416999999996
+    "setup_ms": 4894.364291999999
   },
-  "generated_at": "@1778866756"
+  "generated_at": "@1779382625"
 }

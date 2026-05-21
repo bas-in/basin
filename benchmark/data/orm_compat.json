@@ -1,5 +1,5 @@
 {
-  "generated_at": "@1779373902",
+  "generated_at": "@1779381372",
   "sections": [
     {
       "orm": "Drizzle",
@@ -109,7 +109,7 @@
           "sql": "SELECT pg_get_serial_sequence('\"User\"', 'id')",
           "outcome": "typed_error",
           "sqlstate": "XX000",
-          "message": "internal: plan: Error during planning: Invalid function 'pg_get_serial_sequence'.\nDid you mean 'pg_get_indexdef'?"
+          "message": "internal: plan: Error during planning: Invalid function 'pg_get_serial_sequence'.\nDid you mean 'pg_get_partkeydef'?"
         },
         {
           "sql": "CREATE TABLE IF NOT EXISTS \"Profile\" (\n               \"id\"     BIGINT NOT NULL,\n               \"bio\"    TEXT,\n               \"userId\" BIGINT NOT NULL,\n               PRIMARY KEY (\"id\")\n           )",

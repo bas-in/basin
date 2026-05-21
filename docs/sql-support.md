@@ -2,8 +2,8 @@
 
 Run `cargo test -p basin-integration-tests --test sql_support_matrix` to refresh.
 
-Last run: 1779326331 (Unix epoch)
-SQL fragments tested: 975 total / 2577 green (across all three configurations).
+Last run: 1779382195 (Unix epoch)
+SQL fragments tested: 975 total / 2589 green (across all three configurations).
 
 ## Configurations
 
@@ -1082,8 +1082,8 @@ SQL fragments tested: 975 total / 2577 green (across all three configurations).
 | `CREATE TABLE __t (c POINT); DROP TABLE __t` | ✅ | ✅ | ✅ |  |
 | `CREATE TABLE __t (c INT4RANGE); DROP TABLE __t` | ✅ | ✅ | ✅ |  |
 | `CREATE TABLE __t (c VECTOR(3)); DROP TABLE __t` | ✅ | ✅ | ✅ |  |
-| `CREATE TABLE __t (c BIT(8)); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported column type in PoC: BIT(8) |
-| `CREATE TABLE __t (c BIT VARYING(8)); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported column type in PoC: BIT VARYING(8) |
+| `CREATE TABLE __t (c BIT(8)); DROP TABLE __t` | ✅ | ✅ | ✅ |  |
+| `CREATE TABLE __t (c BIT VARYING(8)); DROP TABLE __t` | ✅ | ✅ | ✅ |  |
 | `CREATE TABLE __t (c OID); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported custom type: OID |
 | `CREATE TABLE __t (c REGCLASS); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported column type in PoC: REGCLASS |
 | `CREATE TABLE __t (c REGTYPE); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported custom type: REGTYPE |
@@ -1112,8 +1112,8 @@ SQL fragments tested: 975 total / 2577 green (across all three configurations).
 | `CREATE TABLE __t (c CIRCLE); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported custom type: CIRCLE |
 | `CREATE TABLE __t (c PATH); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported custom type: PATH |
 | `CREATE TABLE __t (c POLYGON); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported custom type: POLYGON |
-| `CREATE TABLE __t (c BIT(8)); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported column type in PoC: BIT(8) |
-| `CREATE TABLE __t (c BIT VARYING(16)); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported column type in PoC: BIT VARYING(16) |
+| `CREATE TABLE __t (c BIT(8)); DROP TABLE __t` | ✅ | ✅ | ✅ |  |
+| `CREATE TABLE __t (c BIT VARYING(16)); DROP TABLE __t` | ✅ | ✅ | ✅ |  |
 | `CREATE TABLE __t (c XML); DROP TABLE __t` | ✅ | ✅ | ✅ |  |
 | `CREATE TABLE __t (c PG_LSN); DROP TABLE __t` | 📜 | 📜 | 📜 | invalid schema: unsupported custom type: PG_LSN |
 | `CREATE TABLE __t (c TSQUERY); DROP TABLE __t` | ✅ | ✅ | ✅ |  |

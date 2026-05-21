@@ -21,21 +21,21 @@
       "range_gets": 0
     },
     "pre_a4_legacy_io_same_predicate": {
-      "gets": 0,
-      "heads": 2,
+      "gets": 2,
+      "heads": 0,
       "lists": 2,
-      "range_gets": 4
+      "range_gets": 0
     },
     "predicates": {
       "all_out": "id = 1500 (outside both file ranges)",
       "selective": "id = 750 (only in file-B's range)"
     },
     "selective_post_a4_io_one_surviving_file": {
-      "gets": 0,
+      "gets": 1,
       "heads": 0,
       "lists": 0,
-      "range_gets": 2
+      "range_gets": 0
     }
   },
-  "generated_at": "@1778866561"
+  "generated_at": "@1779382262"
 }

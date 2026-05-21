@@ -22,38 +22,38 @@
   ],
   "rows": [
     {
-      "per_project_ram_kib": 96.0,
+      "per_project_ram_kib": 224.0,
       "project_count": 1,
-      "quiet_p50_ms": 0.30075,
-      "rss_delta_kib": 96
+      "quiet_p50_ms": 1.003875,
+      "rss_delta_kib": 224
     },
     {
-      "per_project_ram_kib": 76.44444444444444,
+      "per_project_ram_kib": 72.88888888888889,
       "project_count": 10,
-      "quiet_p50_ms": 0.27345800000000003,
-      "rss_delta_kib": 688
+      "quiet_p50_ms": 1.022792,
+      "rss_delta_kib": 656
     },
     {
-      "per_project_ram_kib": 7.644444444444445,
+      "per_project_ram_kib": 23.822222222222223,
       "project_count": 100,
-      "quiet_p50_ms": 0.252375,
-      "rss_delta_kib": 688
+      "quiet_p50_ms": 0.97425,
+      "rss_delta_kib": 2144
     },
     {
-      "per_project_ram_kib": 5.44,
+      "per_project_ram_kib": 8.053333333333333,
       "project_count": 1000,
-      "quiet_p50_ms": 0.227458,
-      "rss_delta_kib": 4896
+      "quiet_p50_ms": 1.003708,
+      "rss_delta_kib": 7248
     }
   ],
   "primary": {
     "label": "quiet_p50_at_max / quiet_p50_at_1",
-    "value": 0.7563025768911055,
+    "value": 0.99983364462707,
     "unit": "x",
     "bar": {
       "op": "less_than",
       "value": 5.0
     }
   },
-  "generated_at": "@1778866814"
+  "generated_at": "@1779381885"
 }

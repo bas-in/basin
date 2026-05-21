@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "per_project_kib",
-    "value": 1.184,
+    "value": 2.016,
     "unit": "KiB",
     "bar": {
       "op": "less_than",
@@ -15,8 +15,8 @@
   },
   "details": {
     "projects": 1000,
-    "rss_after_kib": 7984,
-    "rss_before_kib": 6800
+    "rss_after_kib": 10672,
+    "rss_before_kib": 8656
   },
-  "generated_at": "@1778866577"
+  "generated_at": "@1779382406"
 }
