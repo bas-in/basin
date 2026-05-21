@@ -524,7 +524,7 @@ mod pg_tests {
     use crate::store::BlobStore;
     use crate::Bucket;
     use bytes::Bytes;
-    use object_store::{memory::InMemory, ObjectStore};
+    use object_store::{memory::InMemory, ObjectStore, ObjectStoreExt};
     use std::sync::Arc;
 
     const URL_ENV: &str = "BASIN_AUTH_TEST_POSTGRES_URL";
