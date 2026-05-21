@@ -211,15 +211,22 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
             "/storage/v1/object/public/:project_id/:bucket/*path",
             get(storage_routes::download_public_object),
         )
-        // Phase 5.17.D: signed-URL mint (JWT-gated) — registered before the
-        // wildcard :bucket/*path route so the literal `sign` segment takes
-        // priority over the catch-all pattern.
+        // Phase 5.17.D: signed-URL mint (JWT-gated).
+        // Uses the `upload` literal segment to avoid an axum route-param
+        // ambiguity with the download path (fixes #55 — :bucket/*path vs
+        // :project/:bucket/*path both starting from `sign/` were
+        // indistinguishable to axum's router).
+        // BREAKING: POST path changed from
+        //   /storage/v1/object/sign/:bucket/*path
+        // to
+        //   /storage/v1/object/sign/upload/:bucket/*path
         .route(
-            "/storage/v1/object/sign/:bucket/*path",
+            "/storage/v1/object/sign/upload/:bucket/*path",
             post(storage_sign_routes::sign_object),
         )
         // Phase 5.17.D: signed-URL download (no JWT) — project ID in path so
         // the handler can identify the project without a bearer token.
+        // Path is server-minted by sign_object, so no client breakage here.
         .route(
             "/storage/v1/object/sign/:project/:bucket/*path",
             get(storage_sign_routes::download_signed_object),

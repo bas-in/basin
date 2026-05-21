@@ -3,9 +3,14 @@
 //! ## Routes
 //!
 //! ```text
-//! POST /storage/v1/object/sign/:bucket/*path   — mint (JWT-gated)
-//! GET  /storage/v1/object/sign/:bucket/*path   — download via signed URL (no JWT)
+//! POST /storage/v1/object/sign/upload/:bucket/*path          — mint (JWT-gated)
+//! GET  /storage/v1/object/sign/:project/:bucket/*path        — download via signed URL (no JWT)
 //! ```
+//!
+//! The `upload` literal on the POST route disambiguates it from the GET route
+//! in axum's router: without a literal segment both paths begin with
+//! `/storage/v1/object/sign/` followed by a path parameter, which axum cannot
+//! distinguish at registration time (route conflict, fixes #55).
 //!
 //! ## Signing scheme
 //!
@@ -113,7 +118,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 // Mint handler
 // ---------------------------------------------------------------------------
 
-/// `POST /storage/v1/object/sign/:bucket/*path` — mint a time-boxed signed URL (JWT-gated).
+/// `POST /storage/v1/object/sign/upload/:bucket/*path` — mint a time-boxed signed URL (JWT-gated).
 ///
 /// Body: `{ "expires_in": <seconds> }` (optional; defaults to 3600).
 /// Returns: `{ "signedUrl": "...", "expiresAt": "<rfc3339>" }`.

@@ -619,7 +619,7 @@ async fn signed_url_mint_and_download() {
     let r = raw_request(
         addr,
         "POST",
-        "/storage/v1/object/sign/sign-bucket/docs/readme.txt",
+        "/storage/v1/object/sign/upload/sign-bucket/docs/readme.txt",
         &[
             ("Authorization", bearer.as_str()),
             ("Content-Type", "application/json"),
@@ -690,7 +690,7 @@ async fn signed_url_tampered_token_returns_403() {
     let r = raw_request(
         addr,
         "POST",
-        "/storage/v1/object/sign/tamper-bucket/secret.bin",
+        "/storage/v1/object/sign/upload/tamper-bucket/secret.bin",
         &[
             ("Authorization", bearer.as_str()),
             ("Content-Type", "application/json"),
@@ -768,7 +768,7 @@ async fn signed_url_expired_returns_403() {
     let r = raw_request(
         addr,
         "POST",
-        "/storage/v1/object/sign/expire-bucket/data.bin",
+        "/storage/v1/object/sign/upload/expire-bucket/data.bin",
         &[
             ("Authorization", bearer.as_str()),
             ("Content-Type", "application/json"),
