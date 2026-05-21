@@ -438,10 +438,11 @@ async fn plaintext_bypass_accepts_unsigned() {
     // Set the bypass FIRST, before any other tests in this process can
     // boot a fresh server.
     std::env::set_var("BASIN_NET_ALLOW_PLAINTEXT_WEBHOOKS", "1");
-    let result: Result<(), String> = async {
-        let fx = boot()
-            .await
-            .ok_or_else(|| "PG unavailable for bypass test".to_string())?;
+    let result: Result<bool, String> = async {
+        let Some(fx) = boot().await else {
+            // PG-unreachable — skip cleanly like the other tests.
+            return Ok(false);
+        };
         let project = ProjectId::new();
         let _secret = register_hook(
             &fx.engine,
@@ -471,9 +472,12 @@ async fn plaintext_bypass_accepts_unsigned() {
             return Err(format!("expected 1 row inserted, got {n}"));
         }
         let _ = fx.running.shutdown.send(());
-        Ok(())
+        Ok(true)
     }
     .await;
     std::env::remove_var("BASIN_NET_ALLOW_PLAINTEXT_WEBHOOKS");
-    result.expect("bypass scenario");
+    let ran = result.expect("bypass scenario");
+    if !ran {
+        eprintln!("postgres unreachable, skipping plaintext_bypass test");
+    }
 }
