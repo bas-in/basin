@@ -263,12 +263,23 @@ const HANDLER_WAT: &str = r#"
     (memory (export "memory") 1)
 
     (global $bump (mut i32) (i32.const 16))
+    ;; Bump allocator that honours the canonical-ABI alignment contract:
+    ;; wasmtime's host validates that realloc's return is `$align`-aligned
+    ;; on every call (lifting fails with "realloc return: result not aligned"
+    ;; otherwise). After each allocation we round the bump up to the next
+    ;; multiple of `$align` before claiming the offset, then advance past
+    ;; `$new_sz`. Since strings/lists may request align=1,2,4,8 the rounding
+    ;; uses the standard `(x + align - 1) & ~(align - 1)` formula.
     (func (export "cabi_realloc")
         (param $old i32) (param $old_sz i32) (param $align i32) (param $new_sz i32)
         (result i32)
       (local $ret i32)
-      (local.set $ret (global.get $bump))
-      (global.set $bump (i32.add (global.get $bump) (local.get $new_sz)))
+      ;; ret = (bump + align - 1) & ~(align - 1)
+      (local.set $ret
+        (i32.and
+          (i32.add (global.get $bump) (i32.sub (local.get $align) (i32.const 1)))
+          (i32.xor (i32.sub (local.get $align) (i32.const 1)) (i32.const -1))))
+      (global.set $bump (i32.add (local.get $ret) (local.get $new_sz)))
       (local.get $ret)
     )
 
@@ -298,16 +309,28 @@ const HANDLER_WAT: &str = r#"
   )
   (core instance $core_i (instantiate $core_m))
 
+  ;; Named component-level types. Wasmtime >= 44 (wasmparser >= 0.246) tightens
+  ;; the "all types referred to by an exported func must be named" rule
+  ;; (validate_and_register_named_types in wasmparser::validator::component),
+  ;; so the request / response records must be top-level type declarations
+  ;; with explicit exported names rather than inline anonymous records on the
+  ;; export's signature. Headers/body lists stay anonymous — only the
+  ;; outermost defined types need exported names.
+  (type $request (record
+    (field "method" string)
+    (field "path" string)
+    (field "headers" (list (tuple string string)))
+    (field "body" (list u8))))
+  (export $request-name "request" (type $request))
+  (type $response (record
+    (field "status" u16)
+    (field "headers" (list (tuple string string)))
+    (field "body" (list u8))))
+  (export $response-name "response" (type $response))
+
   (func (export "handle")
-    (param "req" (record
-      (field "method" string)
-      (field "path" string)
-      (field "headers" (list (tuple string string)))
-      (field "body" (list u8))))
-    (result (result (record
-      (field "status" u16)
-      (field "headers" (list (tuple string string)))
-      (field "body" (list u8))) (error string)))
+    (param "req" $request-name)
+    (result (result $response-name (error string)))
     (canon lift
       (core func $core_i "handle_inner")
       (memory $core_i "memory")
