@@ -1715,6 +1715,8 @@ impl Catalog for PostgresCatalog {
         meta.indexes.push(SecondaryIndex {
             name: name.to_string(),
             columns: columns.to_vec(),
+            access_method: "btree".to_string(),
+            opclass: None,
         });
         let indexes_json = serde_json::to_value(&meta.indexes)
             .map_err(|e| BasinError::catalog(format!("serialise indexes: {e}")))?;
@@ -4530,6 +4532,8 @@ mod tests {
             vec![SecondaryIndex {
                 name: "users_name_idx".into(),
                 columns: vec!["name".into()],
+                access_method: "btree".to_string(),
+                opclass: None,
             }]
         );
 
