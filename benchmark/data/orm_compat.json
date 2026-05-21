@@ -1,0 +1,275 @@
+{
+  "generated_at": "@1779373902",
+  "sections": [
+    {
+      "orm": "Drizzle",
+      "total": 14,
+      "ok": 12,
+      "typed_error": 2,
+      "regression": 0,
+      "pass_rate_pct": 85.71428571428571,
+      "shapes": [
+        {
+          "sql": "SELECT \"users\".\"id\", \"users\".\"email\" FROM \"users\" WHERE \"users\".\"email\" = 'alice@example.com' LIMIT 1",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"users\".\"id\", \"users\".\"email\" FROM \"users\" WHERE \"users\".\"email\" = $1 LIMIT 1",
+          "outcome": "typed_error",
+          "sqlstate": "XX000",
+          "message": "internal: execute: Execution error: Placeholder '$1' was not provided a value for execution."
+        },
+        {
+          "sql": "INSERT INTO \"users\" (\"id\",\"email\",\"created_at\") VALUES (3,'carol@example.com',NOW()) RETURNING \"id\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "UPDATE \"users\" SET \"email\" = 'alice2@example.com', \"updated_at\" = NOW() WHERE \"id\" = 1 RETURNING *",
+          "outcome": "ok"
+        },
+        {
+          "sql": "DELETE FROM \"users\" WHERE \"id\" = ANY($1::int[])",
+          "outcome": "typed_error",
+          "sqlstate": "42601",
+          "message": "invalid schema: UPDATE SET id: expected literal of type Int64, got $1::INT[]"
+        },
+        {
+          "sql": "SELECT \"users\".\"id\",\"users\".\"email\",\n               (SELECT count(*) FROM \"orders\" WHERE \"orders\".\"user_id\" = \"users\".\"id\") AS \"order_count\"\n           FROM \"users\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"users\".\"id\",\"users\".\"email\",\"users\".\"created_at\"\n           FROM \"users\" ORDER BY \"users\".\"created_at\" DESC LIMIT 10 OFFSET 0",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"users\".\"id\",\"users\".\"email\",\"orders\".\"id\" AS \"order_id\",\"orders\".\"status\"\n           FROM \"users\"\n           INNER JOIN \"orders\" ON \"orders\".\"user_id\" = \"users\".\"id\"\n           WHERE \"orders\".\"status\" = 'completed'",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"users\".\"id\",\"users\".\"email\" FROM \"users\" WHERE \"users\".\"id\" IN (1,2)",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT count(*) AS \"count\" FROM \"users\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "INSERT INTO \"users\" (\"id\",\"email\") VALUES (99,'dup@example.com') ON CONFLICT DO NOTHING",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"users\".\"id\",\"users\".\"email\" FROM \"users\" WHERE \"users\".\"name\" IS NULL",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"orders\".\"id\",\"orders\".\"total\" FROM \"orders\" WHERE \"orders\".\"total\" BETWEEN 10.0 AND 100.0",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT u.id, u.email, sub.order_count\n           FROM \"users\" u\n           JOIN (\n               SELECT \"user_id\", count(*) AS order_count\n               FROM \"orders\" GROUP BY \"user_id\"\n           ) sub ON sub.\"user_id\" = u.id",
+          "outcome": "ok"
+        }
+      ]
+    },
+    {
+      "orm": "Prisma",
+      "total": 11,
+      "ok": 5,
+      "typed_error": 6,
+      "regression": 0,
+      "pass_rate_pct": 45.45454545454545,
+      "shapes": [
+        {
+          "sql": "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'User'",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"User\".\"id\",\"User\".\"email\",\"User\".\"name\",\"User\".\"createdAt\" FROM \"User\" WHERE \"User\".\"id\" = 1 LIMIT 1",
+          "outcome": "typed_error",
+          "sqlstate": "XX000",
+          "message": "internal: plan: Error during planning: table 'datafusion.public.User' not found"
+        },
+        {
+          "sql": "SELECT \"User\".\"id\",\"User\".\"email\",\"User\".\"name\",\"User\".\"createdAt\" FROM \"User\"",
+          "outcome": "typed_error",
+          "sqlstate": "XX000",
+          "message": "internal: plan: Error during planning: table 'datafusion.public.User' not found"
+        },
+        {
+          "sql": "SELECT count(*) FROM \"Order\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"User\".\"id\",\"User\".\"email\",\n               (SELECT json_agg(o.*) FROM \"Order\" o WHERE o.\"userId\" = \"User\".\"id\") AS \"orders\"\n           FROM \"User\"",
+          "outcome": "typed_error",
+          "sqlstate": "XX000",
+          "message": "internal: plan: Error during planning: table 'datafusion.public.User' not found"
+        },
+        {
+          "sql": "SELECT pg_get_serial_sequence('\"User\"', 'id')",
+          "outcome": "typed_error",
+          "sqlstate": "XX000",
+          "message": "internal: plan: Error during planning: Invalid function 'pg_get_serial_sequence'.\nDid you mean 'pg_get_indexdef'?"
+        },
+        {
+          "sql": "CREATE TABLE IF NOT EXISTS \"Profile\" (\n               \"id\"     BIGINT NOT NULL,\n               \"bio\"    TEXT,\n               \"userId\" BIGINT NOT NULL,\n               PRIMARY KEY (\"id\")\n           )",
+          "outcome": "ok"
+        },
+        {
+          "sql": "INSERT INTO \"User\" (\"id\",\"email\",\"name\")\n           VALUES (5,'eve@example.com','Eve')\n           ON CONFLICT (\"id\") DO UPDATE SET \"email\" = EXCLUDED.\"email\"\n           RETURNING \"id\",\"email\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"userId\", count(*) AS \"_count\" FROM \"Order\" GROUP BY \"userId\" ORDER BY \"userId\"",
+          "outcome": "typed_error",
+          "sqlstate": "XX000",
+          "message": "internal: plan: Error during planning: table 'datafusion.public.Order' not found"
+        },
+        {
+          "sql": "SELECT relname, relkind FROM pg_class WHERE relname = 'User' AND relkind = 'r'",
+          "outcome": "typed_error",
+          "sqlstate": "XX000",
+          "message": "internal: plan: Error during planning: table 'datafusion.public.pg_class' not found"
+        },
+        {
+          "sql": "DELETE FROM \"User\" WHERE \"id\" = 999 RETURNING \"id\"",
+          "outcome": "ok"
+        }
+      ]
+    },
+    {
+      "orm": "sqlx",
+      "total": 8,
+      "ok": 5,
+      "typed_error": 3,
+      "regression": 0,
+      "pass_rate_pct": 62.5,
+      "shapes": [
+        {
+          "sql": "SELECT id, email, name FROM \"users\" WHERE id = $1",
+          "outcome": "typed_error",
+          "sqlstate": "XX000",
+          "message": "internal: execute: Execution error: Placeholder '$1' was not provided a value for execution."
+        },
+        {
+          "sql": "INSERT INTO \"users\" (id, email, name, created_at)\n           VALUES (4,'dave@example.com','Dave',NOW()) RETURNING id, email",
+          "outcome": "ok"
+        },
+        {
+          "sql": "UPDATE \"users\" SET name = 'David' WHERE id = 4",
+          "outcome": "ok"
+        },
+        {
+          "sql": "DELETE FROM \"users\" WHERE id = 4",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT id, email FROM \"users\" WHERE email = $1 AND id > $2",
+          "outcome": "typed_error",
+          "sqlstate": "XX000",
+          "message": "internal: execute: Execution error: Placeholder '$1' was not provided a value for execution."
+        },
+        {
+          "sql": "LISTEN mychannel",
+          "outcome": "typed_error",
+          "sqlstate": "0A000",
+          "message": "feature not supported: LISTEN is not supported (SQLSTATE 0A000)"
+        },
+        {
+          "sql": "SHOW server_version",
+          "outcome": "ok"
+        },
+        {
+          "sql": "BEGIN",
+          "outcome": "ok"
+        }
+      ]
+    },
+    {
+      "orm": "Diesel",
+      "total": 8,
+      "ok": 8,
+      "typed_error": 0,
+      "regression": 0,
+      "pass_rate_pct": 100.0,
+      "shapes": [
+        {
+          "sql": "SELECT id, title, body, user_id FROM posts WHERE id = 1",
+          "outcome": "ok"
+        },
+        {
+          "sql": "INSERT INTO posts (id, title, body, user_id)\n           VALUES (3,'Third Post','New content',1) RETURNING id, title",
+          "outcome": "ok"
+        },
+        {
+          "sql": "UPDATE posts SET title = 'Updated Title' WHERE id = 1 RETURNING id, title",
+          "outcome": "ok"
+        },
+        {
+          "sql": "DELETE FROM posts WHERE id = 999",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT posts.id, posts.title, posts.body, posts.user_id\n           FROM posts\n           INNER JOIN \"users\" ON posts.user_id = \"users\".\"id\"\n           WHERE \"users\".\"email\" = 'alice@example.com'",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = 'public'",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT id, title, body, user_id FROM posts ORDER BY id ASC LIMIT 10 OFFSET 0",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT count(*) FROM posts WHERE user_id = 1",
+          "outcome": "ok"
+        }
+      ]
+    },
+    {
+      "orm": "TypeORM",
+      "total": 6,
+      "ok": 3,
+      "typed_error": 3,
+      "regression": 0,
+      "pass_rate_pct": 50.0,
+      "shapes": [
+        {
+          "sql": "SELECT \"users\".\"id\" AS \"users_id\",\"users\".\"email\" AS \"users_email\",\"users\".\"name\" AS \"users_name\"\n           FROM \"users\" WHERE \"users\".\"id\" = 1 LIMIT 1",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"users\".\"id\" AS \"users_id\",\"users\".\"email\" AS \"users_email\",\n                  \"orders\".\"id\" AS \"orders_id\",\"orders\".\"status\" AS \"orders_status\"\n           FROM \"users\"\n           LEFT JOIN \"orders\" ON \"orders\".\"user_id\" = \"users\".\"id\"\n           WHERE \"orders\".\"status\" = 'completed'",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT count(\"users\".\"id\") AS \"cnt\" FROM \"users\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"users\".\"id\",\"users\".\"email\" FROM \"users\" WHERE \"users\".\"id\" = $1",
+          "outcome": "typed_error",
+          "sqlstate": "XX000",
+          "message": "internal: execute: Execution error: Placeholder '$1' was not provided a value for execution."
+        },
+        {
+          "sql": "DELETE FROM \"users\" WHERE \"users\".\"id\" IN ($1)",
+          "outcome": "typed_error",
+          "sqlstate": "42601",
+          "message": "invalid schema: ERROR: current transaction is aborted, commands ignored until end of transaction block (SQLSTATE 25P02)"
+        },
+        {
+          "sql": "INSERT INTO \"orders\" (\"id\",\"user_id\",\"status\",\"total\") VALUES (20,1,'new',5.00) RETURNING \"id\"",
+          "outcome": "typed_error",
+          "sqlstate": "42601",
+          "message": "invalid schema: ERROR: current transaction is aborted, commands ignored until end of transaction block (SQLSTATE 25P02)"
+        }
+      ]
+    }
+  ],
+  "total_shapes": 47,
+  "total_ok": 33,
+  "total_typed_error": 14,
+  "total_regression": 0
+}

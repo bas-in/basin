@@ -624,7 +624,19 @@ async fn read_one(
     // a Parquet file — so Vortex is safe on every read path, not just the
     // table-aware one.
     if path.as_ref().ends_with(".vortex") {
-        let schema = catalog_schema.clone();
+        // ADR 0024 — UUID-as-Decimal128 storage encoding. The catalog
+        // schema reports UUID columns as `FixedSizeBinary(16)`, but on
+        // disk (and via Vortex's executor) they are `Decimal128(38, 0)`.
+        // We must hand Vortex the *physical* schema so
+        // `execute_record_batch` doesn't try to cast Decimal128→FSB(16)
+        // (Vortex 0.70 has no FSB encoder and the cast fails). The
+        // post-decode inverse in `vortex_project_and_filter` will
+        // re-stamp the BASIN_TYPE marker and reinterpret the buffer
+        // back to FSB(16) so the engine never sees the disguise.
+        // TODO(adr-0024): drop when vortex grows native FSB(N) support.
+        let schema = catalog_schema
+            .as_ref()
+            .map(|s| Arc::new(catalog_schema_uuid_to_decimal128(s.as_ref())));
 
         // Two byte-acquisition paths must feed the Vortex decoder:
         //   (a) envelope-encrypted: a `<path>.wrapped` sidecar exists, so we
@@ -1713,6 +1725,42 @@ const BASIN_TYPE_KEY: &str = "BASIN_TYPE";
 /// `BASIN_TYPE` value for UUID columns. Mirrors
 /// `basin_engine::types::BASIN_TYPE_UUID`.
 const BASIN_TYPE_UUID: &str = "UUID";
+
+/// ADR 0024 — translate the catalog schema so UUID columns claim
+/// `Decimal128(38, 0)` instead of `FixedSizeBinary(16)`. Vortex 0.70 has
+/// no FSB encoder, so the on-disk physical representation chosen by the
+/// write path is Decimal128; if we hand the catalog schema (which says
+/// FSB) to Vortex's `execute_record_batch`, it tries to cast Decimal128
+/// → FSB and fails ("Conversion to Arrow type FixedSizeBinary(16) is not
+/// supported"). The post-decode inverse in `decimal128_to_uuid_fsb`
+/// rebuilds the FSB layout for callers above the storage trait, so the
+/// disguise is invisible to basin-engine.
+///
+/// Field metadata is preserved verbatim (BASIN_TYPE=UUID + any others) so
+/// the post-decode inverse can identify the disguised column.
+///
+/// TODO(adr-0024): drop when Vortex grows native `FixedSizeBinary(N)`
+/// encoding and basin-engine pins the new release.
+fn catalog_schema_uuid_to_decimal128(schema: &Schema) -> Schema {
+    let new_fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let is_uuid_fsb = matches!(
+                f.data_type(),
+                arrow_schema::DataType::FixedSizeBinary(16)
+            ) && f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str())
+                == Some(BASIN_TYPE_UUID);
+            if is_uuid_fsb {
+                Field::new(f.name(), arrow_schema::DataType::Decimal128(38, 0), f.is_nullable())
+                    .with_metadata(f.metadata().clone())
+            } else {
+                f.as_ref().clone()
+            }
+        })
+        .collect();
+    Schema::new_with_metadata(new_fields, schema.metadata().clone())
+}
 
 /// ADR 0024 — read-side inverse of `writer::uuid_fsb_to_decimal128`. Walks
 /// `batch`'s schema; for every column with Arrow type `Decimal128(38, 0)`
