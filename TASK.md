@@ -1340,7 +1340,7 @@ implementation task flips a slice of the harness green.
       weighting by document section (A/B/C/D). Files:
       `crates/basin-engine/src/operators/fts_match.rs` (new).
       Acceptance: @@ semantics + ranking slice of 5.20.A flips green.
-- [ ] **5.20.E — GIN index on `tsvector`** (~1 week). Reuses the
+- [~] **5.20.E — GIN index on `tsvector`** (~1 week). Reuses the
       GIN infrastructure from 5.19. Posting lists per lexeme;
       probe at `@@` query time. Files:
       `crates/basin-storage/src/index/gin_tsvector.rs` (new).
@@ -1516,13 +1516,13 @@ compat harness lands first.
       `tests/integration/fixtures/datagrip-compose.yml` (or
       headless pgcli script).
       Acceptance: harness compiles + reports red.
-- [ ] **5.23.B — `EXPLAIN ANALYZE` verification + polish**
+- [x] **5.23.B — `EXPLAIN ANALYZE` verification + polish**
       (~3 days). Audit every executor node for accurate
       "actual rows" + "actual time" reporting; ensure parallel
       plans aggregate correctly; buffer/I-O stats where measurable.
       Files: `crates/basin-engine/src/executor.rs` (instrument).
       Acceptance: EXPLAIN-correctness slice of 5.23.A flips green.
-- [ ] **5.23.C — `pg_stat_activity` view** (~3 days). Current
+- [x] **5.23.C — `pg_stat_activity` view** (~3 days). Current
       connections, queries in flight, wait events, client IP, app
       name, query text (params redacted). Per-project RLS — a user
       only sees their own project's activity. Files:
@@ -1530,7 +1530,7 @@ compat harness lands first.
       `crates/basin-engine/src/connection_registry.rs` (new — or
       extend existing pool tracking).
       Acceptance: pg_stat_activity slice of 5.23.A flips green.
-- [ ] **5.23.D — `pg_locks` view** (~3 days). Current lock holders +
+- [x] **5.23.D — `pg_locks` view** (~3 days). Current lock holders +
       waiters. Engine has single-writer-per-shard semantics so the
       lock model is simple (writers serialise per partition);
       surface that accurately. Files:
