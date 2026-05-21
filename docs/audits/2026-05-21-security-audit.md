@@ -33,7 +33,7 @@ dependencies, TLS).
 | **P1-2** | **Presence allows arbitrary `client_id` from the wire — no binding to JWT `user_id`.** `ws.rs:762-796` reads `client_id` from `ClientMsg::PresenceTrack` without any check that it matches `claims.user_id`. The connection can also track an arbitrary number of channels with arbitrary `metadata` — no per-connection cap, no per-channel cap, no metadata size cap. | Realtime |
 | **P1-3** | **OAuth `redirect_to` allowlist is prefix-match only — vulnerable to host confusion.** `validate_redirect_to` (`oauth.rs:225-228`) does `redirect_to.starts_with(prefix)`. An allowlist of `https://example.com` matches `https://example.com.evil.com/cb` and `https://example.com@evil.com/cb`. | OAuth |
 | **P1-4** | **Recovery codes use bcrypt cost 4 despite the doc claiming argon2.** `mfa.rs:25-34` doc-comment says "argon2 hashing of recovery codes". Actual code at `mfa.rs:729-730` uses `bcrypt::hash(&plain, 4)`. Comment at 726-728 admits "argon2 not in workspace yet". The recovery-code entropy (96 bits) makes this acceptable in practice, but a documentation/audit-trail mismatch will mislead reviewers. | MFA |
-| **P1-5** | **`/admin/v1/projects/:id/{rotate,credentials}` does not check that the target project belongs to the caller's tenancy.** `admin.rs:86-141` checks only `claims.is_admin == true`; the path `:id` is then passed straight to `rotate_pgwire_password` / `list_project_credentials`. Any holder of *an* admin-grade JWT can rotate/list credentials for *any* project in the deployment. | REST admin |
+| **P1-5** | **`/admin/v1/projects/:id/{rotate,credentials}` does not check that the target project belongs to the caller's project-membership.** `admin.rs:86-141` checks only `claims.is_admin == true`; the path `:id` is then passed straight to `rotate_pgwire_password` / `list_project_credentials`. Any holder of *an* admin-grade JWT can rotate/list credentials for *any* project in the deployment. | REST admin |
 
 ### P2 list (counts only)
 
@@ -84,7 +84,7 @@ What I deferred:
 | P1-2 | P1 | Realtime | `crates/basin-realtime/src/ws.rs:762-810` | Presence `client_id` impersonation + unbounded `metadata` size + no per-conn cap |
 | P1-3 | P1 | OAuth | `crates/basin-auth/src/oauth.rs:225-228` | `redirect_to` allowlist uses naive prefix match → `prefix.evil.com` and `prefix@evil.com` pass |
 | P1-4 | P1 | MFA | `crates/basin-auth/src/mfa.rs:729-730` | Recovery codes use bcrypt cost 4, not argon2id as documented |
-| P1-5 | P1 | REST admin | `crates/basin-rest/src/routes/admin.rs:86-141` | Admin token from one tenant can rotate / list credentials for any project ULID |
+| P1-5 | P1 | REST admin | `crates/basin-rest/src/routes/admin.rs:86-141` | Admin token from one project can rotate / list credentials for any project ULID |
 | P2-1 | P2 | Signed URLs | `crates/basin-rest/src/routes/storage_sign.rs:140, 188` | Signing secret = JWT secret; no rotation story; key compromise = global blast radius |
 | P2-2 | P2 | OAuth | `crates/basin-auth/src/oauth.rs:1215` | GitHub identity is always treated as verified regardless of provider response; `is_email_verified` accepts loose "true"-string |
 | P2-3 | P2 | OAuth | `crates/basin-auth/src/oauth.rs:710-871` | In-memory `OAuthStateCache` never expires entries — long-running test/dev servers accumulate state |
@@ -317,7 +317,7 @@ column intended for hashes. Recovery-code disclosure → MFA bypass.
 
 ---
 
-### P1-5: Admin endpoints lack tenant binding
+### P1-5: Admin endpoints lack project binding
 
 **Code:** `crates/basin-rest/src/routes/admin.rs:86-99`
 ```rust
@@ -339,10 +339,10 @@ no comparison between `claims.project_id` and the path `project_id`.
 
 The doc at `admin.rs:1-6` admits "the wedge customer's control-plane
 mints one such token at deploy time" — i.e. the deployment model is
-single-tenant control plane. In a multi-tenant deployment (basin-cloud),
-that single admin token shouldn't reach across tenants.
+single-project control plane. In a multi-project deployment (basin-cloud),
+that single admin token shouldn't reach across projects.
 
-**Mitigation:** Require either (a) `is_admin = true && claims.project_id == path_project_id`, or (b) a separate `is_super_admin` claim for the cross-tenant control-plane case, with the basic `is_admin` capped to own-project.
+**Mitigation:** Require either (a) `is_admin = true && claims.project_id == path_project_id`, or (b) a separate `is_super_admin` claim for the cross-project control-plane case, with the basic `is_admin` capped to own-project.
 
 ---
 
@@ -490,7 +490,7 @@ as the doc claims, or update `SECURITY.md`.
 | P1-2 (presence binding + caps) | 4-8 h | **Yes.** Trust-boundary fix; one-line per check. |
 | P1-3 (redirect_to strict origin) | 2 h | **Yes.** Trivial fix; one of the highest-leverage account-takeover primitives. |
 | P1-4 (recovery codes: argon2 or doc fix) | 2 h doc fix, 1 day for argon2 impl | Beta: doc fix is sufficient (codes have 96-bit entropy). |
-| P1-5 (admin tenant binding) | 1 h | **Yes if multi-tenant.** Single-tenant deployments unaffected. |
+| P1-5 (admin project binding) | 1 h | **Yes if multi-project.** Single-project deployments unaffected. |
 
 **Total beta-blocker effort:** ~4-5 engineer-days.
 

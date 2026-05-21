@@ -671,7 +671,7 @@ mod tests {
         assert!(registry.owner_of(&project, "1").await.unwrap().is_some());
     }
 
-    /// Multi-partition + multi-replica hot-tenant pinning verification:
+    /// Multi-partition + multi-replica hot-project pinning verification:
     /// 4 partitions, 4 replicas, each replica preempts a different
     /// partition. After resolution, all 4 partitions land on 4 different
     /// endpoints. This is the "whales partition across replicas"

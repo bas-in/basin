@@ -1,7 +1,7 @@
 //! Core autoscale decision logic.
 //!
 //! `Scaler` is a pure-function evaluator: given a project ID and a
-//! [`TenantSnapshot`] it returns a [`ScaleDecision`]. All mutable state
+//! [`ProjectSnapshot`] it returns a [`ScaleDecision`]. All mutable state
 //! (consecutive hot/cool tick counts, cooldown timestamps, current shard
 //! counts) lives in `Scaler` and is updated via `evaluate`.
 //!
@@ -35,12 +35,12 @@ use chrono::{DateTime, Utc};
 
 /// Per-project usage snapshot passed to [`Scaler::evaluate`].
 ///
-/// Mirrors `basin_catalog::usage::TenantCounters` field-for-field so the
+/// Mirrors `basin_catalog::usage::ProjectCounters` field-for-field so the
 /// service binary can populate this from the catalog query without pulling
 /// `basin-catalog` into the policy library itself (which would create a
 /// heavyweight dependency on the full catalog crate just for a struct).
 #[derive(Clone, Debug, Default)]
-pub struct TenantSnapshot {
+pub struct ProjectSnapshot {
     /// Project this snapshot belongs to.
     pub project_id: ProjectId,
     /// Hour-truncated period start (UTC). Used for logging; not load-bearing
@@ -77,11 +77,11 @@ pub struct ScalerConfig {
     /// merge) decision is emitted. Default: 3.
     pub hysteresis_window: u32,
 
-    /// Minimum number of shards per tenant. Split is never proposed below
+    /// Minimum number of shards per project. Split is never proposed below
     /// this value; merge is held at this floor. Default: 1.
     pub min_shards: u32,
 
-    /// Maximum number of shards per tenant. Split is capped here. Default: 16.
+    /// Maximum number of shards per project. Split is capped here. Default: 16.
     pub max_shards: u32,
 
     /// How long after a split before another split (or a merge) may be
@@ -169,7 +169,7 @@ impl Scaler {
     ///
     /// Updates internal tick counters and cooldown timestamps for the project
     /// and returns the scale decision for this tick.
-    pub fn evaluate(&mut self, snapshot: &TenantSnapshot) -> ScaleDecision {
+    pub fn evaluate(&mut self, snapshot: &ProjectSnapshot) -> ScaleDecision {
         let project_id = snapshot.project_id;
         let cfg = &self.config;
 
@@ -278,8 +278,8 @@ mod tests {
     use basin_common::ProjectId;
     use chrono::Utc;
 
-    fn snapshot(project_id: ProjectId, cpu_ms: u64) -> TenantSnapshot {
-        TenantSnapshot {
+    fn snapshot(project_id: ProjectId, cpu_ms: u64) -> ProjectSnapshot {
+        ProjectSnapshot {
             project_id,
             period_start: Utc::now(),
             storage_bytes: 0,
@@ -289,17 +289,17 @@ mod tests {
         }
     }
 
-    fn cold_snapshot(project_id: ProjectId) -> TenantSnapshot {
+    fn cold_snapshot(project_id: ProjectId) -> ProjectSnapshot {
         snapshot(project_id, 0)
     }
 
-    fn hot_snapshot(project_id: ProjectId, config: &ScalerConfig) -> TenantSnapshot {
+    fn hot_snapshot(project_id: ProjectId, config: &ScalerConfig) -> ProjectSnapshot {
         // 90% of budget — well above the default 80% threshold.
         let cpu_ms = config.cpu_budget_ms_per_tick * 90 / 100;
         snapshot(project_id, cpu_ms)
     }
 
-    fn cool_snapshot(project_id: ProjectId, config: &ScalerConfig) -> TenantSnapshot {
+    fn cool_snapshot(project_id: ProjectId, config: &ScalerConfig) -> ProjectSnapshot {
         // 10% of budget — well below the default 30% merge threshold.
         let cpu_ms = config.cpu_budget_ms_per_tick * 10 / 100;
         snapshot(project_id, cpu_ms)

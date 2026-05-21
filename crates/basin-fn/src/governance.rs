@@ -14,8 +14,8 @@
 //! | **CPU**            | [`wasmtime::Engine::increment_epoch`] ticked by a tokio task; each store is configured with `set_epoch_deadline(cpu_ticks)` + `epoch_deadline_trap()` so a runaway loop traps once it has consumed `cpu_ticks` ticks. |
 //! | **Linear memory**  | [`wasmtime::ResourceLimiter`] impl ([`MemoryLimiter`]) installed on every [`Store`] via `store.limiter(...)`. The cap is enforced per-Store *and* engine-wide via `memory_reservation` so the trap fires before host OOM. |
 //! | **Wall clock**     | [`tokio::time::timeout`] wraps the dedicated-runtime blocking task that runs the synchronous wasm call. On expiry the epoch is bumped past the deadline to interrupt the wasm thread, then an error is returned. |
-//! | **Concurrency**    | A bounded [`LruCache<ProjectId, Arc<Semaphore>>`] of bounded [`tokio::sync::Semaphore`]s, default 16 permits each. The LRU evicts least-recently-used entries on insert when full, so per-tenant cost is O(bytes), not O(distinct projects ever seen). |
-//! | **Runtime**        | A dedicated [`tokio::runtime::Runtime`] sized via `BASIN_FN_WORKER_THREADS` (default 4) runs every blocking wasm call. Without this, Wasm shares the global `spawn_blocking` pool with axum, the shard-mode executor (basin-engine), and basin-net — a few aggressive tenants starve all of them. |
+//! | **Concurrency**    | A bounded [`LruCache<ProjectId, Arc<Semaphore>>`] of bounded [`tokio::sync::Semaphore`]s, default 16 permits each. The LRU evicts least-recently-used entries on insert when full, so per-project cost is O(bytes), not O(distinct projects ever seen). |
+//! | **Runtime**        | A dedicated [`tokio::runtime::Runtime`] sized via `BASIN_FN_WORKER_THREADS` (default 4) runs every blocking wasm call. Without this, Wasm shares the global `spawn_blocking` pool with axum, the shard-mode executor (basin-engine), and basin-net — a few aggressive projects starve all of them. |
 //!
 //! Defaults come from constants below; [`FunctionCaps::from_env`] reads the
 //! `BASIN_FN_CPU_TICKS / BASIN_FN_MEM_MB / BASIN_FN_WALL_MS /
@@ -551,7 +551,7 @@ impl FunctionGovernance {
         // still bounds local in-flight invocations, but the slice gate is
         // the binding cap across all replicas when a coordinator total is
         // configured. Reject immediately when the slice is exhausted; do
-        // not block on the local semaphore (a noisy tenant would otherwise
+        // not block on the local semaphore (a noisy project would otherwise
         // queue up against their own slice).
         //
         // Clone the gate out of the mutex into a local Option so the

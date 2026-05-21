@@ -50,7 +50,7 @@ serde_json = { workspace = true, optional = true }
 dashmap    = { version = "6", optional = true }
 # lru — bounded per-project semaphore cache for FunctionGovernance. Without
 # an eviction policy a DashMap grows unboundedly (one entry per distinct
-# project ever invoked), violating the per-tenant O(bytes) rule. Workspace-
+# project ever invoked), violating the per-project O(bytes) rule. Workspace-
 # pinned at 0.12 alongside basin-storage / basin-engine usage.
 lru        = { workspace = true, optional = true }
 

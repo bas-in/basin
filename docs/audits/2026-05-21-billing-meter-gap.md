@@ -188,7 +188,7 @@ operational telemetry — but flagged for completeness.
 | `PoolStats::{hits, misses, evictions}` | `crates/basin-pool/src/stats.rs:10-13, 47-49`     | No. Useful for pool-tuning, not billing.                                                                                                                  |
 | `PageCacheCountersSnapshot`            | `crates/basin-storage/src/page_cache.rs:122-138`  | No (process-wide, not per-project anyway).                                                                                                                |
 | `DiskCacheCounters`                    | `crates/basin-storage/src/disk_cache.rs:303-311`  | No (process-wide).                                                                                                                                        |
-| `basin-webhooks` per-tenant latency    | `crates/basin-webhooks/src/telemetry.rs:127, 263` | No (separate subsystem; webhooks aren't a billed SKU today).                                                                                              |
+| `basin-webhooks` per-project latency    | `crates/basin-webhooks/src/telemetry.rs:127, 263` | No (separate subsystem; webhooks aren't a billed SKU today).                                                                                              |
 
 ---
 

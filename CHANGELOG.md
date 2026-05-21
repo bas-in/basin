@@ -50,7 +50,7 @@ graduate to 1.0 and the standard SemVer guarantees.
 ### Cloud-side gates
 - 12 OAuth providers added: Microsoft, GitLab, Slack, Discord, Apple,
   Twitter/X, Bitbucket, Notion, Spotify, Twitch, LinkedIn, Figma (`b87c9ee`).
-- BYO bucket support + per-tenant Class-A/B usage counters (`d620281`,
+- BYO bucket support + per-project Class-A/B usage counters (`d620281`,
   `8bd64b5`).
 - `basin-autoscale` crate and daemon (T-096) (`246b678`).
 - Per-subscriber realtime budget cap enforced (`7003e76`).

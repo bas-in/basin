@@ -1,14 +1,14 @@
-//! 1k-tenant isolation fuzz for the realtime budget (Phase 5.11.R6).
+//! 1k-project isolation fuzz for the realtime budget (Phase 5.11.R6).
 //!
 //! Acceptance gate (from TASK.md):
 //! - 1000 lightweight tasks each publishing events; one task publishes 10×
 //!   faster than the others.
-//! - Noisy tenant's `BUFFER_FULL` count is high while others' are zero (or
+//! - Noisy project's `BUFFER_FULL` count is high while others' are zero (or
 //!   very low — race windows allow brief overlap).
-//! - p99 delivery latency for non-noisy tenants is bounded (< 100ms in
+//! - p99 delivery latency for non-noisy projects is bounded (< 100ms in
 //!   practice, generous for CI).
 //!
-//! The heavy `isolation_1k_tenants` test is marked `#[ignore]` because it
+//! The heavy `isolation_1k_projects` test is marked `#[ignore]` because it
 //! takes > 30s. Run with:
 //!   `cargo test -p basin-realtime budget_fuzz -- --ignored`
 
@@ -47,66 +47,66 @@ fn fill_budget(tracker: &BudgetTracker, project: ProjectId, chunk: u64) -> Vec<B
     guards
 }
 
-/// Smoke test: 100 tenants, 5× noisy, verifies isolation.
+/// Smoke test: 100 projects, 5× noisy, verifies isolation.
 ///
-/// The noisy tenant pre-fills its budget by holding guards (simulating a slow
-/// consumer that hasn't drained the ring). Other tenants still have their full
+/// The noisy project pre-fills its budget by holding guards (simulating a slow
+/// consumer that hasn't drained the ring). Other projects still have their full
 /// budget available.
 #[test]
-fn isolation_100_tenants_smoke() {
-    const TENANT_COUNT: usize = 100;
-    const PER_PROJECT_CAP: u64 = 16 * 1024; // 16 KiB per tenant
+fn isolation_100_projects_smoke() {
+    const PROJECT_COUNT: usize = 100;
+    const PER_PROJECT_CAP: u64 = 16 * 1024; // 16 KiB per project
     const CHUNK: u64 = 512; // 512 bytes per reservation
 
     let rt = Runtime::new().expect("runtime");
     rt.block_on(async move {
         let tracker = BudgetTracker::new(PER_PROJECT_CAP);
-        let projects: Vec<ProjectId> = (0..TENANT_COUNT).map(|_| ProjectId::new()).collect();
+        let projects: Vec<ProjectId> = (0..PROJECT_COUNT).map(|_| ProjectId::new()).collect();
         let noisy_project = projects[0];
 
-        // --- Noisy tenant saturates its own budget (holds guards = slow consumer).
+        // --- Noisy project saturates its own budget (holds guards = slow consumer).
         let noisy_guards = fill_budget(&tracker, noisy_project, CHUNK);
         assert!(
             !noisy_guards.is_empty(),
-            "noisy tenant must have at least one guard"
+            "noisy project must have at least one guard"
         );
 
-        // Noisy tenant is now at cap — next reservation must fail.
+        // Noisy project is now at cap — next reservation must fail.
         assert_eq!(
             tracker.try_reserve(noisy_project, CHUNK).unwrap_err(),
             BudgetError::BufferFull,
-            "noisy tenant must see BUFFER_FULL after filling budget"
+            "noisy project must see BUFFER_FULL after filling budget"
         );
 
-        // --- Other tenants still have their full budget (isolated).
+        // --- Other projects still have their full budget (isolated).
         for &project in &projects[1..] {
             let g = tracker
                 .try_reserve(project, CHUNK)
-                .expect("other tenants must not be affected by noisy tenant overflow");
+                .expect("other projects must not be affected by noisy project overflow");
             drop(g);
         }
 
-        // --- Release noisy tenant's budget.
+        // --- Release noisy project's budget.
         drop(noisy_guards);
         assert_eq!(tracker.bytes_in_flight(noisy_project), 0);
 
-        // After release, noisy tenant can publish again.
+        // After release, noisy project can publish again.
         let _g = tracker
             .try_reserve(noisy_project, CHUNK)
-            .expect("noisy tenant must be usable after release");
+            .expect("noisy project must be usable after release");
     });
 }
 
-/// 1k-tenant fuzz with concurrent tasks.
+/// 1k-project fuzz with concurrent tasks.
 ///
 /// Marked `#[ignore]` — takes > 30s; run with `-- --ignored`.
 #[test]
 #[ignore]
-fn isolation_1k_tenants_noisy_tenant_does_not_starve_others() {
-    const TENANT_COUNT: usize = 1_000;
+fn isolation_1k_projects_noisy_project_does_not_starve_others() {
+    const PROJECT_COUNT: usize = 1_000;
     // 64 KiB per project. Normal events = ~400 bytes each.
     // Noisy fills 64 KiB / 400 bytes ≈ 160 events before hitting cap.
-    // Normal tenants publish 20 events each; none should hit the cap.
+    // Normal projects publish 20 events each; none should hit the cap.
     const PER_PROJECT_CAP: u64 = 64 * 1024;
     const EVENTS_PER_NORMAL: u64 = 20;
     const NOISY_BATCH_SIZE: u64 = 200; // >> 160 → will definitely overflow
@@ -114,23 +114,23 @@ fn isolation_1k_tenants_noisy_tenant_does_not_starve_others() {
     let rt = Runtime::new().expect("runtime");
     rt.block_on(async move {
         let tracker = BudgetTracker::new(PER_PROJECT_CAP);
-        let projects: Vec<ProjectId> = (0..TENANT_COUNT).map(|_| ProjectId::new()).collect();
+        let projects: Vec<ProjectId> = (0..PROJECT_COUNT).map(|_| ProjectId::new()).collect();
         let noisy_project = projects[0];
 
         let noisy_buffer_full = Arc::new(AtomicU64::new(0));
         let other_buffer_full = Arc::new(AtomicU64::new(0));
         let latency_samples = Arc::new(tokio::sync::Mutex::new(Vec::<u64>::new()));
 
-        // Pre-fill the noisy tenant's budget so it's near cap from the start.
+        // Pre-fill the noisy project's budget so it's near cap from the start.
         // We hold these guards for the duration of the test to simulate a slow
-        // consumer not draining the ring. Noisy tenant's subsequent publishes
+        // consumer not draining the ring. Noisy project's subsequent publishes
         // should all get BUFFER_FULL.
         let noisy_prefill: Vec<BudgetGuard> = fill_budget(&tracker, noisy_project, 512);
         assert!(!noisy_prefill.is_empty());
 
         let mut handles = Vec::new();
 
-        // Noisy tenant task: tries to publish NOISY_BATCH_SIZE more events;
+        // Noisy project task: tries to publish NOISY_BATCH_SIZE more events;
         // all should fail since budget is already full.
         {
             let t = tracker.clone();
@@ -150,7 +150,7 @@ fn isolation_1k_tenants_noisy_tenant_does_not_starve_others() {
             }));
         }
 
-        // Normal tenant tasks.
+        // Normal project tasks.
         for &project in &projects[1..] {
             let t = tracker.clone();
             let obf = other_buffer_full.clone();
@@ -188,17 +188,17 @@ fn isolation_1k_tenants_noisy_tenant_does_not_starve_others() {
         let noisy_full = noisy_buffer_full.load(Ordering::Relaxed);
         let other_full = other_buffer_full.load(Ordering::Relaxed);
 
-        // (a) Noisy tenant sees BUFFER_FULL; others don't.
+        // (a) Noisy project sees BUFFER_FULL; others don't.
         assert!(
             noisy_full > 0,
-            "noisy tenant must see at least one BUFFER_FULL"
+            "noisy project must see at least one BUFFER_FULL"
         );
         assert_eq!(
             other_full, 0,
-            "non-noisy tenants must see zero BUFFER_FULL; got {other_full}"
+            "non-noisy projects must see zero BUFFER_FULL; got {other_full}"
         );
 
-        // (b) p99 for non-noisy tenants.
+        // (b) p99 for non-noisy projects.
         let mut lats = latency_samples.lock().await;
         lats.sort_unstable();
         let p99_idx = (lats.len() as f64 * 0.99) as usize;
@@ -209,7 +209,7 @@ fn isolation_1k_tenants_noisy_tenant_does_not_starve_others() {
         );
 
         eprintln!(
-            "1k-tenant fuzz: noisy BUFFER_FULL={noisy_full}, other BUFFER_FULL={other_full}, \
+            "1k-project fuzz: noisy BUFFER_FULL={noisy_full}, other BUFFER_FULL={other_full}, \
              non-noisy p99={p99_us}µs (samples={})",
             lats.len()
         );

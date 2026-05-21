@@ -284,7 +284,7 @@ struct Inner {
     /// arrive with a 5ms deadline; bulk ops (PUT / large range) get a
     /// 1s deadline so they can't crowd out point lookups. See ADR 0008.
     scheduler: Scheduler,
-    /// T-049 — per-tenant BYO object-store overrides. Registered by the
+    /// T-049 — per-project BYO object-store overrides. Registered by the
     /// cloud layer (or tests) after `Storage::new` via
     /// [`Storage::register_byo_object_store`]. The `Mutex` is held only
     /// for nanoseconds (map insert / remove / probe); it is never held
@@ -446,7 +446,7 @@ impl Storage {
     }
 
     // -----------------------------------------------------------------------
-    // T-049 — per-tenant BYO object-store registration
+    // T-049 — per-project BYO object-store registration
     // -----------------------------------------------------------------------
 
     /// Register a pre-built [`ObjectStore`] as the BYO override for
@@ -539,7 +539,7 @@ impl Storage {
 
     /// Catalog-aware, BYO-bucket-safe project deletion.
     ///
-    /// - When the tenant has a BYO bucket configured (`TenantMetadata::byo_bucket
+    /// - When the project has a BYO bucket configured (`ProjectMetadata::byo_bucket
     ///   .is_some()`): logs a notice and **only** drops the catalog namespace.
     ///   The customer's bucket objects are left intact — Basin must never
     ///   delete data from a bucket it doesn't own.
@@ -547,19 +547,19 @@ impl Storage {
     ///   which deletes all objects under the project prefix and drops the
     ///   catalog namespace.
     ///
-    /// Returns the number of objects physically deleted (0 for BYO tenants).
+    /// Returns the number of objects physically deleted (0 for BYO projects).
     #[tracing::instrument(skip(self, catalog), fields(project=%project))]
     pub async fn delete_project_byo_aware(
         &self,
         project: ProjectId,
         catalog: &dyn basin_catalog::Catalog,
     ) -> basin_common::Result<usize> {
-        let meta = catalog.get_tenant_metadata(&project).await?;
+        let meta = catalog.get_project_metadata(&project).await?;
         if meta.byo_bucket.is_some() {
             tracing::info!(
                 target: "basin_storage::delete_project",
                 project = %project,
-                "tenant {project} BYO-bucket — leaving customer bucket intact",
+                "project {project} BYO-bucket — leaving customer bucket intact",
             );
             catalog.drop_namespace(&project).await?;
             return Ok(0);
@@ -1779,23 +1779,23 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Minimal in-memory catalog stub for BYO tests. Supports
-    /// `get_tenant_metadata` / `drop_namespace` / `list_project_data_files`;
+    /// `get_project_metadata` / `drop_namespace` / `list_project_data_files`;
     /// all other methods panic to ensure they aren't called unexpectedly.
     struct ByoCatalog {
-        tenant_meta: std::sync::Mutex<HashMap<ProjectId, basin_catalog::TenantMetadata>>,
+        project_meta: std::sync::Mutex<HashMap<ProjectId, basin_catalog::ProjectMetadata>>,
         dropped: std::sync::Mutex<Vec<ProjectId>>,
     }
 
     impl ByoCatalog {
         fn new() -> Arc<Self> {
             Arc::new(Self {
-                tenant_meta: std::sync::Mutex::new(HashMap::new()),
+                project_meta: std::sync::Mutex::new(HashMap::new()),
                 dropped: std::sync::Mutex::new(Vec::new()),
             })
         }
 
-        fn set_meta(&self, project: ProjectId, meta: basin_catalog::TenantMetadata) {
-            self.tenant_meta
+        fn set_meta(&self, project: ProjectId, meta: basin_catalog::ProjectMetadata) {
+            self.project_meta
                 .lock()
                 .unwrap()
                 .insert(project, meta);
@@ -1825,9 +1825,9 @@ mod tests {
             // Return empty list so delete_project fast-paths to an empty bulk delete.
             Ok(vec![])
         }
-        async fn get_tenant_metadata(&self, p: &ProjectId) -> basin_common::Result<basin_catalog::TenantMetadata> {
+        async fn get_project_metadata(&self, p: &ProjectId) -> basin_common::Result<basin_catalog::ProjectMetadata> {
             Ok(self
-                .tenant_meta
+                .project_meta
                 .lock()
                 .unwrap()
                 .get(p)
@@ -2009,7 +2009,7 @@ mod tests {
     /// store when a BYO bucket is configured — it only drops the catalog
     /// namespace.
     #[tokio::test]
-    async fn delete_byo_tenant_leaves_bucket_objects() {
+    async fn delete_byo_project_leaves_bucket_objects() {
         let dir = TempDir::new().unwrap();
         let s = storage_in(&dir);
         let project = ProjectId::new();
@@ -2027,7 +2027,7 @@ mod tests {
         let catalog = ByoCatalog::new();
         catalog.set_meta(
             project,
-            basin_catalog::TenantMetadata {
+            basin_catalog::ProjectMetadata {
                 byo_bucket: Some(basin_catalog::S3Config {
                     endpoint: "https://s3.example.com".into(),
                     bucket: "cust-bucket".into(),
@@ -2062,7 +2062,7 @@ mod tests {
     /// T-051: `delete_project_byo_aware` with no BYO bucket must physically
     /// remove all objects under the project prefix via the shared store.
     #[tokio::test]
-    async fn delete_shared_tenant_removes_objects() {
+    async fn delete_shared_project_removes_objects() {
         let dir = TempDir::new().unwrap();
         let s = storage_in(&dir);
         let project = ProjectId::new();
@@ -2082,7 +2082,7 @@ mod tests {
         assert_eq!(files_before.len(), 2, "expected 2 files before deletion");
 
         let catalog = ByoCatalog::new();
-        // No byo_bucket set — TenantMetadata::default().
+        // No byo_bucket set — ProjectMetadata::default().
         let deleted = s
             .delete_project_byo_aware(project, catalog.as_ref())
             .await
@@ -2105,7 +2105,7 @@ mod tests {
             .unwrap();
         assert!(
             remaining.is_empty(),
-            "no objects should remain after shared-tenant deletion"
+            "no objects should remain after shared-project deletion"
         );
     }
 }

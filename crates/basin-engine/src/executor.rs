@@ -4589,7 +4589,7 @@ async fn exec_select(
     // The cost-check (`cost_check.rs`) only bounds single-table SELECTs at
     // *planning* time; JOIN / sub-query / CTE / cartesian shapes pass through
     // unchecked and can pin a DataFusion worker thread indefinitely, starving
-    // every other tenant on the runtime. We wrap the *execution* future in
+    // every other project on the runtime. We wrap the *execution* future in
     // `tokio::time::timeout`: when the deadline elapses the future is dropped,
     // which drops the DataFusion stream / physical plan and cancels execution
     // (DataFusion's documented cancellation contract). On the fast path the
@@ -6214,7 +6214,7 @@ fn encode_batch_to_ipc(batch: &arrow_array::RecordBatch) -> Vec<u8> {
 /// process-wide `MemTableRegistry`.  Called on COMMIT before `tx_commit`
 /// clears the `TxState`.
 ///
-/// Budget enforcement (per ADR 0016 §Multi-tenant isolation + Phase 5.14.C5):
+/// Budget enforcement (per ADR 0016 §Multi-project isolation + Phase 5.14.C5):
 /// 1. `try_reserve_bytes` per batch.
 /// 2. On `HardCapReached`: synchronous eviction of the largest project's
 ///    memtable, then retry once.

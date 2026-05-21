@@ -279,7 +279,7 @@ impl<C: BlobCatalog> BlobStore<C> {
     /// - `catalog` — row catalog (bucket + object metadata).
     /// - `object_store` — byte store for blob payloads.
     /// - `root` — optional path prefix inside the object store (e.g.
-    ///   `"warehouse"` for a shared bucket with other tenants).
+    ///   `"warehouse"` for a shared bucket with other projects).
     pub fn new(
         catalog: Arc<C>,
         object_store: Arc<dyn ObjectStore>,

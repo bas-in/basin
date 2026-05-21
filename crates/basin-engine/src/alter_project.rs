@@ -20,7 +20,7 @@
 //! `"basin.partitions"`. v1 default is 1 (back-compat: a single partition
 //! whose lease lives on whichever replica was first to touch the project;
 //! the router maps `(project, "_default") → owner` through the
-//! [`basin_catalog::LeaseRegistry`]). Setting N > 1 lets a whale tenant
+//! [`basin_catalog::LeaseRegistry`]). Setting N > 1 lets a whale project
 //! distribute its memtable / WAL / cap state across N replicas via the
 //! Phase 6.X.B partition-aware router.
 //!
@@ -165,7 +165,7 @@ pub const BASIN_PARTITIONS_KEY: &str = "basin.partitions";
 pub const DEFAULT_PARTITION_COUNT: u32 = 1;
 
 /// Maximum partition count accepted by `ALTER PROJECT … SET partitions = N`.
-/// 1024 is well past what a single tenant can plausibly need in v1
+/// 1024 is well past what a single project can plausibly need in v1
 /// (a 1024-partition project against a 16-replica cluster would already
 /// distribute 64 partitions per replica) and bounds the lease-table cost
 /// per project at `O(N)` rows.

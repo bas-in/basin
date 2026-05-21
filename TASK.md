@@ -231,7 +231,7 @@ risk/effort, ordered to ship value early.
       ring-buffer design here is obsoleted by the LSM-style memtable that
       actually landed. Closed as superseded.
 - [-] **C2 Embedded RocksDB hot tier (alt path)** — **NOT pursued.** ADR 0016
-      explicitly rejected RocksDB for the hot tier (multi-tenant isolation
+      explicitly rejected RocksDB for the hot tier (multi-project isolation
       constraint) in favour of the per-project `BTreeMap` memtable that
       shipped in 5.14.C. Closed as superseded.
 
@@ -924,14 +924,14 @@ now block on host calls).
       scalar TEXT, scalar INT, RETURNS TABLE, and error propagation
       across the `basin:functions/query` host-trait path (the exact
       ABI a ComponentizeJS-produced guest takes). 4/4 green.
-- [x] Soak: 100 tenants × concurrent function invocations.
+- [x] Soak: 100 projects × concurrent function invocations.
       `tests/integration/tests/wasm_functions_soak.rs` ships a short
-      variant (100 tenants × 50 invocations, ~seconds) covering the
+      variant (100 projects × 50 invocations, ~seconds) covering the
       three invariants — bounded memory (per-project semaphore LRU
-      cap holds; no leaked permits), caps honoured (per-tenant peak
-      in-flight never exceeds `project_concurrency`), no cross-tenant
-      interference (quiet-tenant p99 stays within 5× baseline under a
-      noisy-tenant load; same shape as
+      cap holds; no leaked permits), caps honoured (per-project peak
+      in-flight never exceeds `project_concurrency`), no cross-project
+      interference (quiet-project p99 stays within 5× baseline under a
+      noisy-project load; same shape as
       `basin-bench-harness::profiles::noisy_neighbor`). A 1-hour
       `#[ignore]` long variant is documented inline for releases.
       Short variant 2/2 green; long variant ignored in CI.
@@ -1041,20 +1041,20 @@ can land in parallel. Critical path: R1 → R2 → (R3 || R4) → R7.
       status is paid; bench shows ≤ 50µs predicate eval per event
       (observed: simple_eq ~64ns, AND ~104ns, IS NULL ~28ns). 15/15 tests.
 
-#### 5.11.R6 — Multi-tenant memory budget (~1 week) ✅ shipped (`d1acaa0`)
+#### 5.11.R6 — Multi-project memory budget (~1 week) ✅ shipped (`d1acaa0`)
 
 - [x] Shared bounded buffer + per-project byte counter (`BudgetTracker`
-      = `DashMap<ProjectId, ProjectBudget>`, lazy per-tenant alloc, single
+      = `DashMap<ProjectId, ProjectBudget>`, lazy per-project alloc, single
       `AtomicU64` + `hard_cap` each; lock-free CAS `try_reserve`; RAII
       `BudgetGuard`). Pattern from `feedback_multitenant_isolation`: cost is
-      O(bytes-in-flight) per tenant, not O(active_subscribers).
+      O(bytes-in-flight) per project, not O(active_subscribers).
 - [x] Per-project hard cap (default 16 MiB in-flight; configurable
       via `BASIN_REALTIME_PER_PROJECT_BUDGET_BYTES`).
-- [x] When a tenant's quota fills, new events drop into the durable
+- [x] When a project's quota fills, new events drop into the durable
       retry log; in-memory fast path is best-effort.
-- [x] Acceptance gate: 1k-tenant fuzz with one noisy tenant pushing
-      10x events/sec — other tenants' p99 delivery latency
-      unaffected (sub-ms); noisy tenant sees `BUFFER_FULL` on its own
+- [x] Acceptance gate: 1k-project fuzz with one noisy project pushing
+      10x events/sec — other projects' p99 delivery latency
+      unaffected (sub-ms); noisy project sees `BUFFER_FULL` on its own
       subscription only. 8/8 budget tests + fuzz smoke.
 
 #### 5.11.R7 — Differential harness + soak test (~1 week)
@@ -1062,7 +1062,7 @@ can land in parallel. Critical path: R1 → R2 → (R3 || R4) → R7.
 - [x] Differential: every shape in `change_event_smoke` runs three
       ways — no realtime, SSE subscriber, WS subscriber. Asserts the
       events delivered match the engine-emitted events exactly.
-- [x] Soak: 1-hour run, 100 tenants × 10 connections each, mixed
+- [x] Soak: 1-hour run, 100 projects × 10 connections each, mixed
       INSERT/UPDATE/DELETE workload. Asserts no memory growth, no
       dropped events under quota, durable replay catches
       over-quota drops.
@@ -1184,7 +1184,7 @@ same `object_store` the engine uses; signed URLs are HMAC over
 ## Phase 5.18 — System-schema namespacing — ADR 0022
 
 Make the system namespaces real reserved schemas; user-defined schemas stay
-flat-aliased to `public` (projects own tenancy). See
+flat-aliased to `public` (projects own project-membership). See
 [ADR 0022](./docs/decisions/0022-system-schema-namespacing.md). Sequencing:
 **A → B**, **A → C**, **D after A**, **E last**. 5.18.A must run SOLO in
 basin-catalog (no other catalog agent concurrent).
@@ -1368,7 +1368,7 @@ Privacy and anonymisation model: [ADR 0017](./docs/decisions/0017-query-shape-pr
       (2026-05-19) per ADR 0017:** use `xxhash-rust` crate's
       `xxh3_64`, seeded with the fixed constant
       `BASIN_QUERY_SHAPE_SEED = 0xBA51_4145_7E11_5A95`.  Cross-version
-      stable (required for the OSS → cloud → cross-tenant aggregate
+      stable (required for the OSS → cloud → cross-project aggregate
       pipeline that follows in 5.16.D – H).  Reject `std::DefaultHasher`
       (unstable across Rust versions), `fnv1a-64` (too weak at cloud
       scale), `siphash13` (slower; reserved as fallback if
@@ -1388,7 +1388,7 @@ Privacy and anonymisation model: [ADR 0017](./docs/decisions/0017-query-shape-pr
       with HDR histograms (use the `hdrhistogram` crate) for latency, rows
       scanned, files opened, bytes decoded, cache hits, fast-path-engaged
       enum, p50/p95/p99 readouts.  Per-project + per-table breakdown.
-      Multi-tenant isolation pattern: shared registry + per-project
+      Multi-project isolation pattern: shared registry + per-project
       bounded LRU of shapes (max 500 distinct shapes/project), counter
       O(bytes).
       Acceptance gate: 10k QPS workload → registry overhead ≤ 1% p99;
@@ -1506,7 +1506,7 @@ documented from day one in the place customers and contributors look.
 ## Phase 5.14 — Durable Basin moat: HTAP + catalog-driven optimization (next 3 months)
 
 **Strategic framing (2026-05-19 stakeholder discussion):** Basin's
-durable advantage is the **catalog + storage-orchestration + multi-tenant
+durable advantage is the **catalog + storage-orchestration + multi-project
 layer**. The next 3 months invest there exclusively. Optimizer-rule
 shims that will eventually be subsumed by upstream Vortex / DataFusion
 are explicitly deprioritized — we file those as upstream PRs instead
@@ -1630,12 +1630,12 @@ Lives in a new crate `crates/basin-hottier/`.
 
 **Architecture summary (from ADR 0016):**
 
-- Per-`(project, table)` `BTreeMap` memtable — NOT RocksDB (multi-tenant
+- Per-`(project, table)` `BTreeMap` memtable — NOT RocksDB (multi-project
   isolation constraint) or sled (durability redundancy with `basin-wal`).
   Crossbeam-skiplist `SkipMap` is the fallback if C1 benchmark fails.
-- Multi-tenant: shared `MemTableRegistry` (one per process) + per-project
-  `AtomicU64` counter + per-project `Semaphore`.  Per-tenant cost is
-  O(bytes + counter + semaphore); idle tenants cost zero.
+- Multi-project: shared `MemTableRegistry` (one per process) + per-project
+  `AtomicU64` counter + per-project `Semaphore`.  Per-project cost is
+  O(bytes + counter + semaphore); idle projects cost zero.
 - Memory budgets: project hard cap 256 MB, project soft cap 192 MB,
   per-table soft cap 16 MB, max age 60 s.  Largest-first flush
   scheduler.
@@ -1705,7 +1705,7 @@ Lives in a new crate `crates/basin-hottier/`.
       (50% INSERT, 25% UPDATE, 25% DELETE) flushes without read stall;
       no row loss verified by `vortex_parquet_differential`; flush
       duration ≤ 10s for 64 MB memtable on LocalFS.
-- [x] **5.14.C5** Multi-tenant memory budget (shipped `12b2fc2`; 10k-tenant fuzz heap ≈1.86 GiB ≤ 4 GiB gate; ALTER PROJECT DDL for hard-cap override) — ~1 week.  Per-project
+- [x] **5.14.C5** Multi-project memory budget (shipped `12b2fc2`; 10k-project fuzz heap ≈1.86 GiB ≤ 4 GiB gate; ALTER PROJECT DDL for hard-cap override) — ~1 week.  Per-project
       hard cap (256 MB default, ALTER PROJECT configurable), soft cap
       (192 MB triggers background flush), per-table soft cap (16 MB).
       `Semaphore` back-pressure on hard cap.  Largest-first global
@@ -1713,7 +1713,7 @@ Lives in a new crate `crates/basin-hottier/`.
       via `MemTableConfig`.
       Files: `crates/basin-hottier/src/budget.rs` (new),
       `crates/basin-engine/src/lib.rs` (Engine-level config plumbing).
-      Depends on C1.  Acceptance gate: 10k-tenant fuzz test (10k
+      Depends on C1.  Acceptance gate: 10k-project fuzz test (10k
       projects × 1k rows × 200 bytes/row = 2 TB total) — no project
       exceeds hard cap; total process heap ≤ 4 GB; per-project byte
       usage scales O(bytes) not O(active_projects).
@@ -1726,7 +1726,7 @@ Lives in a new crate `crates/basin-hottier/`.
       across all shapes × all three modes.
 
 **Acceptance gate (composite):** OLTP `point_eq` HIT p99 ≤ 2 ms warm;
-single-row UPDATE p99 ≤ 5 ms; 10k-tenant fuzz fits in 4 GB heap; 0
+single-row UPDATE p99 ≤ 5 ms; 10k-project fuzz fits in 4 GB heap; 0
 differential rows vs Vortex-only baseline.
 
 **Total effort:** ~8 engineer-weeks.  Open risks and out-of-scope
@@ -1804,7 +1804,7 @@ compaction; `window_partition_sum` + `lag_lead_window` drop their
 - Further tactical optimizer rules that look like 5.12.J / .K / .L / .N.
   Those go upstream as DataFusion / Vortex PRs; the Basin copy retires
   when subsumed.
-- Any feature that does not depend on Basin's catalog + multi-tenant
+- Any feature that does not depend on Basin's catalog + multi-project
   layer for correctness (i.e., anything that could equally well ship in
   upstream Vortex or upstream DataFusion).
 - (Reserved for future entries.) WebSocket realtime moved to Tier 4
@@ -1907,7 +1907,7 @@ regression-test backfill in `tests/integration/tests/security.rs`.
       alg:none reject, P2-6 pgwire-user routing hint safety, cross-project
       fuzz pointer). Remaining audit P1/P2 surfaces with no fix yet land
       as `#[ignore]`d "expected failing" tests documenting the gap
-      (P1-1 WS filter, P1-3 redirect_to origin, P1-5 admin tenant binding,
+      (P1-1 WS filter, P1-3 redirect_to origin, P1-5 admin project binding,
       P2-1 signed-URL rotation, P2-3 OAuth state TTL, P2-4 MIME sniff,
       P2-5 reserved-schema DDL, P2-7 refresh-token compromise window).
       28 green + 8 ignored under `cargo test -p basin-integration-tests
@@ -1917,15 +1917,15 @@ regression-test backfill in `tests/integration/tests/security.rs`.
 
 ## Phase 6.X — Lease-based ownership + partition routing — ADR 0023 **(TOP PRIORITY)**
 
-The architectural commitment that fixes hot-tenant pinning AND multi-instance
+The architectural commitment that fixes hot-project pinning AND multi-instance
 cap bypass in one shape. Driven by the noisy-neighbor audit
 (`docs/audits/2026-05-21-noisy-neighbor-fairness.md`, 4 P0 / 6 P1 / 5 P2-P3).
 Full design in [ADR 0023](./docs/decisions/0023-leases-and-partition-routing.md).
 
 **Why TOP PRIORITY:** every per-project cap in OSS today (REST QPS, pgwire QPS,
 HTAP memtable bytes, realtime `BUFFER_FULL`, Wasm semaphore, basin-net
-outbound) is per-process — a tenant on N replicas gets `N×` the cap they
-should. Hot tenants pin one replica at 100% while siblings idle. The new
+outbound) is per-process — a project on N replicas gets `N×` the cap they
+should. Hot projects pin one replica at 100% while siblings idle. The new
 basin-cloud overage prices (`acb2f7c`: storage $0.010/GB-mo, compute
 $0.018/CPU-hr) cannot bill correctly until this is fixed. Blocks any
 multi-replica production deployment.
@@ -1943,7 +1943,7 @@ an audit P0 single-instance gap on its own.
 - [x] **6.P0.B — Catalog connection pool** — replaced `Mutex<Client>` in
       `crates/basin-catalog/src/postgres.rs` with `deadpool-postgres` (default
       pool size 16, override via `BASIN_CATALOG_PG_POOL_SIZE`). Every DDL no
-      longer serializes every catalog read across all tenants; multi-statement
+      longer serializes every catalog read across all projects; multi-statement
       transactions still run on one checked-out connection so their semantics
       are preserved. Lease impl (`postgres.rs::LeaseRegistry`) reuses the
       same pool. Structural test (`pool_exposes_distinct_postgres_sessions`)
@@ -1971,7 +1971,7 @@ an audit P0 single-instance gap on its own.
          executor / basin-net on the global pool.
       5. Per-project `DashMap<ProjectId, Arc<Semaphore>>` replaced by a
          bounded `Mutex<LruCache<...>>` (default 10 000 entries via
-         `BASIN_FN_PROJECT_SEM_CAP`) — closes #16 (per-tenant cost is now
+         `BASIN_FN_PROJECT_SEM_CAP`) — closes #16 (per-project cost is now
          O(bytes), not O(distinct projects ever seen)).
       Acceptance tests in `tests/governance_caps_test.rs`:
       `component_harness_run_with_cpu_cap_kills_spinner` (spinner via the

@@ -2,7 +2,7 @@
 title: "Phase 0 customer interview script — wedge validation"
 nav_section: meta
 sidebar_position: 40
-summary: "5-10 founder interviews to validate the Basin wedge (multi-tenant Postgres-compat HTAP) before committing 3-6 months to basin-cloud. Question bank, facilitation guide, scoring rubric, pivot triggers."
+summary: "5-10 founder interviews to validate the Basin wedge (multi-project Postgres-compat HTAP) before committing 3-6 months to basin-cloud. Question bank, facilitation guide, scoring rubric, pivot triggers."
 ---
 
 # Phase 0 customer interview script — wedge validation
@@ -11,7 +11,7 @@ summary: "5-10 founder interviews to validate the Basin wedge (multi-tenant Post
 
 The canonical failure mode for a platform-shift product is shipping into a market that doesn't exist. Every year, technically excellent databases fail not because the engineering was wrong but because the founders mistook "this is clever" for "this is what people will pay to use."
 
-Basin has strong technical evidence: Vortex storage is 2–30x faster than Parquet on typical SaaS analytical shapes; the multi-tenant isolation primitives (per-project shard owners, eviction, memory budgets) are architecturally sound; ADR 0016's HTAP hot tier closes the write-latency gap that used to make columnar engines awkward for transactional workloads. The substrate is real.
+Basin has strong technical evidence: Vortex storage is 2–30x faster than Parquet on typical SaaS analytical shapes; the multi-project isolation primitives (per-project shard owners, eviction, memory budgets) are architecturally sound; ADR 0016's HTAP hot tier closes the write-latency gap that used to make columnar engines awkward for transactional workloads. The substrate is real.
 
 What we do not have is strong customer evidence. We don't know which segment feels the pain most acutely, which specific workload justifies a DB migration, which switching costs are prohibitive, or what willingness-to-pay looks like when the ask is real money rather than a hobbyist side project. Five to ten 45-minute interviews with the right people will either confirm the wedge or surface the pivot before we spend three to six months building basin-cloud on a faulty premise. Running these interviews is the cheapest insurance available.
 
@@ -23,10 +23,10 @@ What we do not have is strong customer evidence. We don't know which segment fee
 
 Qualifying criteria:
 
-- **Product type:** Per-tenant data is core to the product — CRM, billing platform, project management, AI tooling, audit/compliance tools. The data model is naturally per-customer, not a shared blob.
+- **Product type:** Per-project data is core to the product — CRM, billing platform, project management, AI tooling, audit/compliance tools. The data model is naturally per-customer, not a shared blob.
 - **Current stack:** Postgres, Aurora, RDS, or Supabase. (Conversations with teams on MySQL or MongoDB are useful background but don't validate the pgwire compatibility moat.)
-- **Scale:** 1,000–100,000 tenants. Below 1k the pain is theoretical; above 100k the architecture is likely purpose-built (Planetscale-style shard orchestration, Vitess, etc.) and the wedge fit weakens.
-- **Pain signal:** Has personally dealt with at least one of: slow tenant onboarding, noisy-neighbor incidents, unexpected DB cost spikes, or a shard migration project.
+- **Scale:** 1,000–100,000 projects. Below 1k the pain is theoretical; above 100k the architecture is likely purpose-built (Planetscale-style shard orchestration, Vitess, etc.) and the wedge fit weakens.
+- **Pain signal:** Has personally dealt with at least one of: slow project onboarding, noisy-neighbor incidents, unexpected DB cost spikes, or a shard migration project.
 
 **Secondary (useful but not primary):** Staff or Principal Engineers who own the data layer at a qualifying company. They describe pain more precisely but lack purchasing authority; treat their input as corroboration.
 
@@ -46,7 +46,7 @@ Start sourcing immediately; scheduling drag means 10 targets → 5–7 completed
 **Cold outreach (fill remaining slots):**
 
 - LinkedIn Sales Navigator: filter Series A–C B2B SaaS, headcount 20–200, "VP Engineering" or "CTO" title. Personalize by referencing a publicly known scale story.
-- YC W/S 2022–2025 batch directory: filter by SaaS tag. Many founders list their email; a short, honest cold note ("I'm building a multi-tenant DB and want to understand your pain before we build the wrong thing") converts better than a product pitch.
+- YC W/S 2022–2025 batch directory: filter by SaaS tag. Many founders list their email; a short, honest cold note ("I'm building a multi-project DB and want to understand your pain before we build the wrong thing") converts better than a product pitch.
 - Case studies published by Supabase, Neon, PlanetScale, Vercel. Companies whose engineering blog describes scaling pain are self-selecting signal — their VP Eng is literally on record saying the problem exists.
 
 **Incentive:** Offer either $200 Amazon gift card or $500 of Basin Cloud credit on launch. Mention it in the ask. Founders are time-constrained; the incentive signals you value their time without making the conversation transactional.
@@ -71,7 +71,7 @@ Start sourcing immediately; scheduling drag means 10 targets → 5–7 completed
 
 **Intro script (verbatim, not improvised):**
 
-> "Thanks for making time. I'm building a database product aimed at multi-tenant SaaS — but before I build the wrong thing I want to understand how people are actually running their data infrastructure today. There's no product pitch in this call; I genuinely want to hear about your stack and where the pain is. Do you mind if I record for my own notes?"
+> "Thanks for making time. I'm building a database product aimed at multi-project SaaS — but before I build the wrong thing I want to understand how people are actually running their data infrastructure today. There's no product pitch in this call; I genuinely want to hear about your stack and where the pain is. Do you mind if I record for my own notes?"
 
 ---
 
@@ -81,17 +81,17 @@ Run these as a conversation, not a checklist. Follow the energy. If they go deep
 
 **Opening (set the stage):**
 
-1. "Walk me through how your customers' data is stored today. One database everyone shares? Schema-per-tenant? Database per tenant? Something else?"
+1. "Walk me through how your customers' data is stored today. One database everyone shares? Schema-per-project? Database per project? Something else?"
 
-2. "How many tenants are you at now? What's the largest tenant by row count or query volume? The smallest? Is there a lot of variance or are they roughly similar?"
+2. "How many projects are you at now? What's the largest project by row count or query volume? The smallest? Is there a lot of variance or are they roughly similar?"
 
 **Operations and incidents:**
 
 3. "What's a recent incident that woke you up at an inconvenient time? What was the root cause — was the database involved?"
 
-4. "What does tenant onboarding look like operationally? Walk me through the steps. How long does it take from 'new customer signed the contract' to 'their data is live'? What can go wrong in that process?"
+4. "What does project onboarding look like operationally? Walk me through the steps. How long does it take from 'new customer signed the contract' to 'their data is live'? What can go wrong in that process?"
 
-5. "If a tenant suddenly 10x'd their query volume — say, they ran a big report or exported everything — what happens to your other tenants? Have you seen that in practice?"
+5. "If a project suddenly 10x'd their query volume — say, they ran a big report or exported everything — what happens to your other projects? Have you seen that in practice?"
 
 **Cost and economics:**
 
@@ -125,7 +125,7 @@ Then share your screen (or paste into chat) this description:
 
 ---
 
-> "Basin is a Postgres-compatible database designed multi-tenant from day one. Every project gets per-tenant memory budgets, isolated quotas, and a columnar+row hybrid storage that handles both fast point queries and big analytical scans in one engine. Today it is 2–30x faster than Parquet on typical SaaS workloads, costs less to run because storage is bucket-native, and speaks pgwire so existing apps drop in. We are 8 weeks from beta."
+> "Basin is a Postgres-compatible database designed multi-project from day one. Every project gets per-project memory budgets, isolated quotas, and a columnar+row hybrid storage that handles both fast point queries and big analytical scans in one engine. Today it is 2–30x faster than Parquet on typical SaaS workloads, costs less to run because storage is bucket-native, and speaks pgwire so existing apps drop in. We are 8 weeks from beta."
 
 ---
 
@@ -134,7 +134,7 @@ Then ask, in this order:
 - **"What's your reaction in one sentence?"** — Wait for them to answer before saying anything. The first unguarded sentence is the most valuable data point in the interview.
 - **"What would you need to believe to try this on a side project or a non-critical service?"** — Surfaces their personal bar, not their company's procurement bar.
 - **"What part of that description feels too good to be true?"** — Gives them permission to poke holes. Healthy skepticism is information; you want it surfaced here, not after they've soft-committed.
-- **"Who else should I talk to? Do you know anyone else running multi-tenant Postgres at scale who might have opinions?"** — Never skip this. It turns 10 interviews into 20 leads.
+- **"Who else should I talk to? Do you know anyone else running multi-project Postgres at scale who might have opinions?"** — Never skip this. It turns 10 interviews into 20 leads.
 
 ---
 
@@ -142,20 +142,20 @@ Then ask, in this order:
 
 Strong signal — increase conviction in current wedge:
 
-- They mention multi-tenant pain **unprompted** in the open-ended section, before you've said anything about Basin.
+- They mention multi-project pain **unprompted** in the open-ended section, before you've said anything about Basin.
 - They ask mid-interview "could I try this?" or "when can I get access?"
-- Their incident story maps precisely to noisy-neighbor degradation or tenant onboarding complexity.
+- Their incident story maps precisely to noisy-neighbor degradation or project onboarding complexity.
 - They describe DB cost as a top-3 operational concern without prompting.
 
 Weak signal — the wedge may be right but you haven't found the right cohort yet:
 
-- They describe a plausible multi-tenant architecture but say "our DB is fine."
+- They describe a plausible multi-project architecture but say "our DB is fine."
 - They acknowledge the pain exists but describe it as "a quarterly nuisance, not a daily fire."
 - They react positively to the Basin description but pivot immediately to "we couldn't switch because of migrations."
 
 Negative signal — reconsider the wedge:
 
-- Multi-tenant pain is described as their #1 cost driver, but they say flatly they would not switch databases under any circumstances. (Switching cost is a real moat; if it's absolute, the wedge doesn't break through it.)
+- Multi-project pain is described as their #1 cost driver, but they say flatly they would not switch databases under any circumstances. (Switching cost is a real moat; if it's absolute, the wedge doesn't break through it.)
 - Three or more interviewees independently name a completely different pain as the thing they'd pay to fix — see pivot triggers below.
 
 **Pivot triggers:** If three or more interviewees independently name the same alternative pain as their primary — e.g., "actually our problem is vector search at scale," or "our real issue is real-time fan-out to millions of subscribers," or "we'd pay anything for affordable global replication" — that is a statistically meaningful signal. Flag it immediately, pause further interviews in the current script, and re-evaluate the wedge before booking more calls.
@@ -168,7 +168,7 @@ Score each interview immediately after it ends, while memory is fresh. Use whole
 
 | Dimension | 1 | 3 | 5 |
 |---|---|---|---|
-| **Multi-tenant pain present?** | Not mentioned; they're happy with their stack | Acknowledged but described as low-priority | Unprompted, central to their narrative |
+| **Multi-project pain present?** | Not mentioned; they're happy with their stack | Acknowledged but described as low-priority | Unprompted, central to their narrative |
 | **Postgres-compat valuable?** | Irrelevant; they'd switch parsers happily | Nice-to-have; reduces friction | Hard requirement; migration from pgwire is a non-starter |
 | **Cost a major concern?** | DB cost is immaterial to planning | On the radar; comes up quarterly | Top-3 cost driver; actively trying to reduce it |
 | **Willingness to try beta?** | No interest; not even curious | Would watch from the sidelines | Directly asked how to get access |
@@ -183,8 +183,8 @@ Evaluate after every five interviews; don't wait until all ten are done.
 
 | Outcome | Action |
 |---|---|
-| 6 or more interviews scoring **15 or higher** | Wedge validated. Proceed with the current plan — basin-cloud, beta access, ICP targeting multi-tenant SaaS at 1k–100k tenants. |
-| 3–5 interviews scoring **15 or higher** | Wedge plausible but ICP is too broad or sourcing missed the right cohort. Narrow the ICP (e.g., restrict to 5k–50k tenants, or focus on a specific vertical like billing platforms) and run a second round of 5 interviews before committing to basin-cloud. |
+| 6 or more interviews scoring **15 or higher** | Wedge validated. Proceed with the current plan — basin-cloud, beta access, ICP targeting multi-project SaaS at 1k–100k projects. |
+| 3–5 interviews scoring **15 or higher** | Wedge plausible but ICP is too broad or sourcing missed the right cohort. Narrow the ICP (e.g., restrict to 5k–50k projects, or focus on a specific vertical like billing platforms) and run a second round of 5 interviews before committing to basin-cloud. |
 | Fewer than 3 scoring **15 or higher** | Wedge invalid in current form. Pivot triggered. Review the pattern in low scores — is it missing pain, low switching willingness, or Postgres-compat irrelevance? That pattern determines the direction of the pivot. |
 
 A score of 15 is not arbitrary: it requires pain to be genuinely present (≥3), Postgres-compat to matter (≥3), cost to be a concern (≥4), and some expressed willingness to try (≥5) — or similar combinations that add up to a real buyer, not a polite nod.
@@ -193,9 +193,9 @@ A score of 15 is not arbitrary: it requires pain to be genuinely present (≥3),
 
 ## 10. Anti-patterns — things that invalidate your signal
 
-**Do not pitch in the open-ended section.** If you mention Basin, multi-tenant architecture, or bucket-native storage before the 30-minute mark, you prime the interviewee. They will tell you what you want to hear. The open-ended section must be 100% about their world.
+**Do not pitch in the open-ended section.** If you mention Basin, multi-project architecture, or bucket-native storage before the 30-minute mark, you prime the interviewee. They will tell you what you want to hear. The open-ended section must be 100% about their world.
 
-**Do not ask leading questions.** "Don't you find multi-tenant databases frustrating?" is not a question; it is a suggestion. Use neutral language: "Walk me through what that looks like" rather than "So I imagine that must cause noisy-neighbor problems?"
+**Do not ask leading questions.** "Don't you find multi-project databases frustrating?" is not a question; it is a suggestion. Use neutral language: "Walk me through what that looks like" rather than "So I imagine that must cause noisy-neighbor problems?"
 
 **Do not skip the incentive mention.** Founders have competing priorities. Offering $200 or equivalent cloud credit is not bribery — it is acknowledging that 45 minutes of their time has real value. Leaving it out signals you don't understand how time-constrained founders are.
 
@@ -222,7 +222,7 @@ A score of 15 is not arbitrary: it requires pain to be genuinely present (≥3),
 | Company | |
 | Persona | Title + whether VP/CTO/Staff |
 | Source | How you got the intro |
-| Multi-tenant pain (1–5) | |
+| Multi-project pain (1–5) | |
 | Postgres-compat (1–5) | |
 | Cost concern (1–5) | |
 | Beta willingness (1–5) | |

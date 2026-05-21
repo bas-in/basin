@@ -15,7 +15,7 @@
 //!
 //! The original implementation wrapped a single `tokio_postgres::Client` in a
 //! `tokio::sync::Mutex` and serialised every catalog operation across every
-//! tenant. That made one project's DDL latency a tail-latency problem for
+//! project. That made one project's DDL latency a tail-latency problem for
 //! every other project's reads. We now keep a `deadpool_postgres::Pool` of
 //! 16 connections by default (override with `BASIN_CATALOG_PG_POOL_SIZE`);
 //! each operation checks a connection out for the duration of that call and

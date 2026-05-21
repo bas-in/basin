@@ -20,7 +20,7 @@ troubleshooting procedures, and failure modes.
 |---|---|---|
 | [lease-ownership.md](./lease-ownership.md) | Lease ownership + heartbeat budget coordination | Stuck lease, hot replica, whale partition, coordinator Postgres failure |
 | [storage.md](./storage.md) | Object store, disk cache, page cache, I/O scheduler, KMS encryption, hot-tier memtable | Cache miss storms, write stalls (memtable hard cap), KMS errors, ObjectStore unavailability |
-| [realtime.md](./realtime.md) | SSE / WebSocket change-event fan-out, per-tenant budget | BUFFER_FULL, subscriber lag, event drought, noisy tenant starvation |
+| [realtime.md](./realtime.md) | SSE / WebSocket change-event fan-out, per-project budget | BUFFER_FULL, subscriber lag, event drought, noisy project starvation |
 | [wasm-functions.md](./wasm-functions.md) | Wasm component-model edge functions, per-invocation governance | CPU trap, memory cap, wall-clock timeout, concurrency exhaustion, worker thread pool saturation |
 | [session-pool.md](./session-pool.md) | Native session pool (ADR 0007) | Pool exhaustion, per-project cap stall, guard leak, eviction loop stopped |
 
@@ -34,7 +34,7 @@ troubleshooting procedures, and failure modes.
    See [lease-ownership.md](./lease-ownership.md).
 
 2. **Check the over-cap metrics** — `basin_budget_over_cap_seconds_total` is
-   the noisy-tenant signal across all cap types:
+   the noisy-project signal across all cap types:
    - `cap=memtable_bytes` → storage write stall
    - `cap=realtime_bytes` → realtime BUFFER_FULL
    - `cap=wasm_concurrency` → edge function concurrency gate

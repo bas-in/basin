@@ -1,13 +1,13 @@
-//! T-053 — per-tenant usage counters + hourly snapshot persistence.
+//! T-053 — per-project usage counters + hourly snapshot persistence.
 //!
 //! # Design
 //!
-//! `TenantCounters` is a plain-data snapshot of the per-project atomic counters
+//! `ProjectCounters` is a plain-data snapshot of the per-project atomic counters
 //! kept by [`basin_common::telemetry::ProjectCounterRegistry`]. The snapshot is
 //! collected at the call site (no locking here) and written to the catalog's
-//! `tenant_usage_periods` table once per hour by [`spawn_usage_snapshot_task`].
+//! `project_usage_periods` table once per hour by [`spawn_usage_snapshot_task`].
 //!
-//! ## Table schema (`tenant_usage_periods`)
+//! ## Table schema (`project_usage_periods`)
 //!
 //! | column              | type        | note                                  |
 //! |---------------------|-------------|---------------------------------------|
@@ -27,7 +27,7 @@
 //! ## OTLP export
 //!
 //! [`spawn_usage_otlp_exporter`] emits structured `tracing::info!` records via
-//! the `basin.tenant.usage` target. When `tracing-opentelemetry` is attached
+//! the `basin.project.usage` target. When `tracing-opentelemetry` is attached
 //! these become OTLP metric events; plain `fmt` subscribers log them as INFO
 //! lines useful for self-hosted debugging without a collector.
 //!
@@ -46,11 +46,15 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use basin_common::{ProjectCounterRegistry, ProjectId};
+use serde::{Deserialize, Serialize};
 
-/// Snapshot of per-tenant usage counters for one hourly period.
+/// Snapshot of per-project usage counters for one hourly period.
 /// Collected from [`ProjectCounterRegistry`] and persisted to the catalog.
-#[derive(Clone, Debug, Default)]
-pub struct TenantCounters {
+///
+/// Serialises to the JSON shape expected by the cloud's metering ingest
+/// endpoint (`POST /internal/v1/metering/counters`, T-023).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ProjectCounters {
     /// Project this snapshot belongs to.
     pub project_id: ProjectId,
     /// Hour-truncated start of the period (UTC).
@@ -96,6 +100,12 @@ pub struct UsageSnapshotConfig {
     /// OTLP/HTTP endpoint the exporter pushes metrics to.
     /// Read from `BASIN_OTLP_ENDPOINT` at spawn time if `None`.
     pub otlp_endpoint: Option<String>,
+    /// Cloud metering ingest base URL.  When set (or when the
+    /// `BASIN_METERING_URL` env var is present) the snapshot loop POSTs each
+    /// batch as JSON to `{url}/internal/v1/metering/counters` (T-023).  When
+    /// absent, only the existing `tracing::info!` audit trail is emitted —
+    /// local dev / OSS deployments are unaffected.
+    pub metering_url: Option<String>,
 }
 
 impl Default for UsageSnapshotConfig {
@@ -103,6 +113,7 @@ impl Default for UsageSnapshotConfig {
         Self {
             interval: std::time::Duration::from_secs(3600),
             otlp_endpoint: None,
+            metering_url: None,
         }
     }
 }
@@ -117,36 +128,50 @@ impl UsageSnapshotConfig {
         std::env::var("BASIN_OTLP_ENDPOINT")
             .unwrap_or_else(|_| "http://localhost:4318".to_string())
     }
+
+    /// Resolve the cloud metering URL.  Returns `None` when neither the
+    /// constructor field nor `BASIN_METERING_URL` is set — in that case the
+    /// HTTP POST is silently skipped.
+    pub fn resolved_metering_url(&self) -> Option<String> {
+        if let Some(ref u) = self.metering_url {
+            return Some(u.clone());
+        }
+        std::env::var("BASIN_METERING_URL").ok()
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Snapshot collection helpers
 // ---------------------------------------------------------------------------
 
-/// Collect a [`TenantCounters`] snapshot for every project that has registered
-/// activity in `registry`. The `state` mutex carries the previous-tick
-/// watermarks across calls.
-pub fn collect_snapshots(
+/// Collect a [`ProjectCounters`] snapshot for every project in `project_ids`
+/// that has a recorded entry in `registry`.  Projects with no registry entry
+/// (i.e. never accessed via `for_project`) are silently skipped.
+///
+/// The `state` mutex carries the previous-tick watermarks across calls and is
+/// used to decide whether a project is "active" in this hour.
+fn collect_snapshots(
     registry: &ProjectCounterRegistry,
+    project_ids: &[ProjectId],
     state: &Mutex<UsageSnapshotState>,
     period_start: chrono::DateTime<chrono::Utc>,
-) -> Vec<TenantCounters> {
-    // Read-lock the registry once to enumerate projects; each project's
-    // individual snapshot is lock-free (atomic loads on the counters).
-    let snapshots = registry.snapshot_all_projects();
+) -> Vec<ProjectCounters> {
     let mut state_guard = state.lock().expect("usage snapshot state poisoned");
-    snapshots
-        .into_iter()
-        .map(|(project_id, snap)| {
-            let active = state_guard.is_active(&project_id, snap.ops_total);
-            TenantCounters {
-                project_id,
+    project_ids
+        .iter()
+        .filter_map(|project_id| {
+            // `ProjectCounterRegistry::snapshot` returns `None` when the
+            // project has never called `for_project`; skip those.
+            let snap = registry.snapshot(project_id)?;
+            let active = state_guard.is_active(project_id, snap.ops_total);
+            Some(ProjectCounters {
+                project_id: *project_id,
                 period_start,
                 storage_bytes: snap.bytes_written_total,
                 ops_count: snap.ops_total,
                 active_hours: if active { 1.0 } else { 0.0 },
                 cpu_ms: snap.cpu_micros_total / 1000,
-            }
+            })
         })
         .collect()
 }
@@ -156,26 +181,46 @@ pub fn collect_snapshots(
 // ---------------------------------------------------------------------------
 
 /// Spawn a background task that wakes on `config.interval` and:
-/// 1. Collects a [`TenantCounters`] snapshot per active project.
-/// 2. Calls `persist_fn` to write each row to the catalog.
-/// 3. Emits structured tracing events for OTLP export.
+/// 1. Calls `projects_fn` to obtain the current set of active project IDs.
+/// 2. Collects a [`ProjectCounters`] snapshot per project via `registry`.
+/// 3. Emits structured tracing events for OTLP export (audit trail).
+/// 4. POSTs the batch as JSON to the cloud metering endpoint if configured.
+/// 5. Calls `persist_fn` to write each row to the catalog.
 ///
-/// `persist_fn` is async and receives a `Vec<TenantCounters>`; it should
-/// write to `tenant_usage_periods`. Errors from `persist_fn` are logged but
+/// `projects_fn` is called every tick.  It should return all project IDs that
+/// have activity in the current process; typically this is maintained by the
+/// engine's project-registration list.
+///
+/// `persist_fn` is async and receives a `Vec<ProjectCounters>`; it should
+/// write to `project_usage_periods`. Errors from `persist_fn` are logged but
 /// do not stop the loop.
 ///
 /// Returns a [`tokio::task::JoinHandle`] that can be aborted on engine
 /// shutdown.
-pub fn spawn_usage_snapshot_task<F, Fut>(
+pub fn spawn_usage_snapshot_task<P, F, Fut>(
     registry: Arc<ProjectCounterRegistry>,
     config: UsageSnapshotConfig,
+    projects_fn: P,
     persist_fn: F,
 ) -> tokio::task::JoinHandle<()>
 where
-    F: Fn(Vec<TenantCounters>) -> Fut + Send + 'static,
+    P: Fn() -> Vec<ProjectId> + Send + 'static,
+    F: Fn(Vec<ProjectCounters>) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
     let otlp_endpoint = config.resolved_otlp_endpoint();
+    let metering_url = config.resolved_metering_url();
+
+    // Build a shared reqwest client once; it manages its own connection pool.
+    // Only constructed when a metering URL is configured so OSS/local builds
+    // pay zero initialisation cost.
+    let http_client = metering_url.as_ref().map(|_| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(8))
+            .build()
+            .expect("failed to build metering HTTP client")
+    });
+
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(config.interval);
         // Skip the first immediate tick so we don't emit empty metrics on startup.
@@ -196,12 +241,13 @@ where
                     .unwrap_or(now)
             };
 
-            let counters = collect_snapshots(&registry, &state, period_start);
+            let project_ids = projects_fn();
+            let counters = collect_snapshots(&registry, &project_ids, &state, period_start);
 
-            // 1. Emit OTLP-compatible tracing events.
+            // 1. Emit OTLP-compatible tracing events (audit trail — always kept).
             for c in &counters {
                 tracing::info!(
-                    target: "basin.tenant.usage",
+                    target: "basin.project.usage",
                     project_id = %c.project_id,
                     period_start = %c.period_start,
                     storage_bytes = c.storage_bytes,
@@ -209,22 +255,109 @@ where
                     active_hours = c.active_hours,
                     cpu_ms = c.cpu_ms,
                     otlp_endpoint = %otlp_endpoint,
-                    "basin.tenant.usage.snapshot",
+                    "basin.project.usage.snapshot",
                 );
             }
 
             tracing::debug!(
-                target: "basin.tenant.usage",
+                target: "basin.project.usage",
                 projects = counters.len(),
-                "tenant usage snapshot cycle complete",
+                "project usage snapshot cycle complete",
             );
 
-            // 2. Persist to catalog.
+            // 2. POST batch to cloud metering endpoint (T-023) if configured.
+            if !counters.is_empty() {
+                if let (Some(ref client), Some(ref base_url)) = (&http_client, &metering_url) {
+                    let url = format!(
+                        "{}/internal/v1/metering/counters",
+                        base_url.trim_end_matches('/')
+                    );
+                    post_metering_batch(client, &url, &counters).await;
+                }
+            }
+
+            // 3. Persist to catalog.
             if !counters.is_empty() {
                 persist_fn(counters).await;
             }
         }
     })
+}
+
+/// POST a batch of [`ProjectCounters`] snapshots to the cloud metering endpoint.
+///
+/// Errors are logged and the loop continues — a metering delivery failure must
+/// never crash the engine or block catalog persistence.  Retries once on 5xx
+/// with a short back-off; 4xx (misconfiguration) is logged without retry.
+async fn post_metering_batch(client: &reqwest::Client, url: &str, counters: &[ProjectCounters]) {
+    const MAX_RETRIES: u32 = 2;
+    let body = match serde_json::to_vec(counters) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                target: "basin.project.usage",
+                error = %e,
+                "failed to serialise metering batch; skipping POST",
+            );
+            return;
+        }
+    };
+
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let resp = client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.clone())
+            .send()
+            .await;
+
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                tracing::debug!(
+                    target: "basin.project.usage",
+                    status = r.status().as_u16(),
+                    projects = counters.len(),
+                    "metering batch delivered",
+                );
+                return;
+            }
+            Ok(r) if r.status().is_server_error() && attempt < MAX_RETRIES => {
+                let status = r.status().as_u16();
+                tracing::warn!(
+                    target: "basin.project.usage",
+                    status,
+                    attempt,
+                    "metering endpoint returned 5xx; retrying after back-off",
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    500 * u64::from(attempt),
+                ))
+                .await;
+                // continue loop for retry
+            }
+            Ok(r) => {
+                tracing::warn!(
+                    target: "basin.project.usage",
+                    status = r.status().as_u16(),
+                    url,
+                    "metering POST failed; skipping (no further retries)",
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "basin.project.usage",
+                    error = %e,
+                    url,
+                    attempt,
+                    "metering POST error; skipping",
+                );
+                return;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -248,7 +381,7 @@ mod tests {
 
         let state = Mutex::new(UsageSnapshotState::default());
         let now = chrono::Utc::now();
-        let snaps = collect_snapshots(&registry, &state, now);
+        let snaps = collect_snapshots(&registry, &[p], &state, now);
 
         assert_eq!(snaps.len(), 1);
         let snap = &snaps[0];
@@ -269,9 +402,9 @@ mod tests {
         let state = Mutex::new(UsageSnapshotState::default());
         let now = chrono::Utc::now();
         // First tick: active.
-        collect_snapshots(&registry, &state, now);
+        collect_snapshots(&registry, &[p], &state, now);
         // Second tick: no new ops → inactive.
-        let snaps = collect_snapshots(&registry, &state, now);
+        let snaps = collect_snapshots(&registry, &[p], &state, now);
         let snap = snaps.iter().find(|s| s.project_id == p).unwrap();
         assert_eq!(snap.active_hours, 0.0, "second tick without new ops should be inactive");
     }
@@ -286,7 +419,7 @@ mod tests {
 
         let state = Mutex::new(UsageSnapshotState::default());
         let now = chrono::Utc::now();
-        let snaps = collect_snapshots(&registry, &state, now);
+        let snaps = collect_snapshots(&registry, &[p], &state, now);
         let snap = snaps.iter().find(|s| s.project_id == p).unwrap();
         assert_eq!(snap.cpu_ms, 2500);
     }
@@ -303,7 +436,7 @@ mod tests {
 
         let state = Mutex::new(UsageSnapshotState::default());
         let now = chrono::Utc::now();
-        let snaps = collect_snapshots(&registry, &state, now);
+        let snaps = collect_snapshots(&registry, &[a, b], &state, now);
 
         assert!(snaps.len() >= 2);
         let sa = snaps.iter().find(|s| s.project_id == a).unwrap();
@@ -318,20 +451,26 @@ mod tests {
         let p = ProjectId::new();
         registry.for_project(&p).record_op();
 
-        let captured: Arc<Mutex<Vec<TenantCounters>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured: Arc<Mutex<Vec<ProjectCounters>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_clone = captured.clone();
 
         let config = UsageSnapshotConfig {
             interval: std::time::Duration::from_millis(20),
             otlp_endpoint: Some("http://localhost:4318".into()),
+            metering_url: None,
         };
 
-        let handle = spawn_usage_snapshot_task(registry, config, move |rows| {
-            let captured = captured_clone.clone();
-            async move {
-                captured.lock().unwrap().extend(rows);
-            }
-        });
+        let handle = spawn_usage_snapshot_task(
+            registry,
+            config,
+            move || vec![p],
+            move |rows| {
+                let captured = captured_clone.clone();
+                async move {
+                    captured.lock().unwrap().extend(rows);
+                }
+            },
+        );
 
         // Let at least one tick fire.
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;

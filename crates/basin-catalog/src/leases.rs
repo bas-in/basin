@@ -4,7 +4,7 @@
 //! A *lease* is the durable record of which replica currently owns a
 //! `(project, partition)`. Ownership used to be an implicit hash on
 //! `ProjectId` (`ShardMap::shard_for`); ADR 0023 converts it into a lease in
-//! the catalog Postgres so replicas become stateless and a hot tenant can
+//! the catalog Postgres so replicas become stateless and a hot project can
 //! distribute across replicas by partitioning. This module ships the
 //! primitive; partition-aware routing (6.X.B), handoff (6.X.C), and budget
 //! reconciliation (6.X.D) build on top.

@@ -274,7 +274,7 @@ impl GlobalPressureScheduler {
     ///
     /// # Complexity
     ///
-    /// O(n log n) on the number of active projects. At 10 000 active tenants
+    /// O(n log n) on the number of active projects. At 10 000 active projects
     /// this is < 1 ms on modern hardware.
     pub fn pick_flush_candidates<P: Copy>(
         &self,

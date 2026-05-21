@@ -11,7 +11,7 @@
 //!
 //! The Fly Machines autoscaler (`backend-rs/src/bin/autoscaler.rs`) manages
 //! the cloud *infrastructure* layer — spinning Fly VMs up/down based on
-//! tenant count. This crate is the *engine* layer: reading per-tenant OTEL
+//! project count. This crate is the *engine* layer: reading per-project OTEL
 //! usage counters and deciding when to split or merge hash-bucket shards
 //! inside a single engine instance.
 //!
@@ -20,7 +20,7 @@
 //! `Scaler` is a pure-function decision engine:
 //!
 //! ```text
-//! tick N:  evaluate(&self, project_id, &TenantCounters) -> ScaleDecision
+//! tick N:  evaluate(&self, project_id, &ProjectCounters) -> ScaleDecision
 //! ```
 //!
 //! The caller drives the tick loop (the service binary does so on a
@@ -39,7 +39,7 @@
 //!
 //! ### Shard count bounds
 //!
-//! `Scaler` respects `min_shards` and `max_shards` per tenant. When the
+//! `Scaler` respects `min_shards` and `max_shards` per project. When the
 //! shard count is at `max_shards` a hot project gets `Hold`; when at
 //! `min_shards` a cold project gets `Hold` instead of `MergeShards`.
 //!
@@ -49,4 +49,4 @@
 
 pub mod scaler;
 
-pub use scaler::{ScaleDecision, Scaler, ScalerConfig, TenantSnapshot};
+pub use scaler::{ScaleDecision, Scaler, ScalerConfig, ProjectSnapshot};

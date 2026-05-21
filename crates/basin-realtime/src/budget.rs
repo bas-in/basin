@@ -1,12 +1,12 @@
-//! Per-tenant realtime memory budget enforcement (Phase 5.11.R6).
+//! Per-project realtime memory budget enforcement (Phase 5.11.R6).
 //!
 //! # Design
 //!
-//! Per the `feedback_multitenant_isolation` rule: **per-tenant cost is
+//! Per the `feedback_multitenant_isolation` rule: **per-project cost is
 //! O(bytes-in-flight), not O(active_subscribers)**. The implementation uses:
 //!
 //! - A single shared `tokio::sync::broadcast` cluster (the [`ChannelRegistry`]
-//!   in `lib.rs`) for all tenants — no per-tenant channel.
+//!   in `lib.rs`) for all projects — no per-project channel.
 //! - A [`DashMap<ProjectId, ProjectBudget>`] lazily allocating one
 //!   [`ProjectBudget`] per project *that has actually published an event*.
 //!   Idle projects pay zero.
@@ -32,9 +32,9 @@
 //! When `try_reserve` returns `Err(BudgetError::BufferFull)`:
 //! - The caller (`RealtimeSink::publish`) drops the event into the durable
 //!   webhook retry log so no data is lost.
-//! - The fast-path broadcast is skipped — the noisy tenant does not starve
-//!   other tenants' ring-buffer slots.
-//! - Other tenants' `bytes_in_flight` counters are unaffected.
+//! - The fast-path broadcast is skipped — the noisy project does not starve
+//!   other projects' ring-buffer slots.
+//! - Other projects' `bytes_in_flight` counters are unaffected.
 //!
 //! # Configuration
 //!
@@ -58,7 +58,7 @@ pub const ENV_PER_PROJECT_BUDGET: &str = "BASIN_REALTIME_PER_PROJECT_BUDGET_BYTE
 /// byte cap is exceeded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BudgetError {
-    /// The tenant's in-flight byte budget is full. The event should be
+    /// The project's in-flight byte budget is full. The event should be
     /// dropped to the durable retry log; the fast-path broadcast is skipped.
     BufferFull,
 }
@@ -143,7 +143,7 @@ impl ProjectBudget {
     }
 }
 
-/// Shared multi-tenant budget tracker. Cheap to clone — all state is behind
+/// Shared multi-project budget tracker. Cheap to clone — all state is behind
 /// an `Arc`-backed [`DashMap`].
 ///
 /// # Usage
@@ -295,7 +295,7 @@ impl BudgetTracker {
     }
 
     /// Number of projects that have ever published at least one event (i.e.
-    /// have a budget entry). Bounded by the number of active tenants.
+    /// have a budget entry). Bounded by the number of active projects.
     pub fn tracked_project_count(&self) -> usize {
         self.inner.budgets.len()
     }
@@ -338,7 +338,7 @@ impl Drop for BudgetGuard {
 /// plus the JSON payload sizes (`before` + `after`).
 ///
 /// The estimate is intentionally generous: a too-small estimate would let
-/// noisy tenants exceed their real cap; a too-large estimate wastes a few KiB
+/// noisy projects exceed their real cap; a too-large estimate wastes a few KiB
 /// of headroom, which is acceptable.
 pub fn estimate_event_size(event: &basin_common::ChangeEvent) -> u64 {
     const FIXED_OVERHEAD: u64 = 128;

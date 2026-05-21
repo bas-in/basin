@@ -1,20 +1,20 @@
-//! [`MemTableRegistry`] — process-wide, multi-tenant memtable registry.
+//! [`MemTableRegistry`] — process-wide, multi-project memtable registry.
 //!
 //! # Isolation model
 //!
-//! Follows the shared-heavy-resource + cheap-per-tenant-primitive pattern
+//! Follows the shared-heavy-resource + cheap-per-project-primitive pattern
 //! from `basin-common::ProjectCounterRegistry`:
 //!
 //! - **Shared heavy resource**: one `DashMap<(ProjectId, TableName),
 //!   Arc<MemTableEntry>>`.  Allocation is lazy: only projects that have
-//!   received at least one write consume an entry.  Inactive tenants cost zero.
-//! - **Cheap per-tenant primitive**: one `AtomicU64` byte counter + one
+//!   received at least one write consume an entry.  Inactive projects cost zero.
+//! - **Cheap per-project primitive**: one `AtomicU64` byte counter + one
 //!   `Arc<tokio::sync::Semaphore>` per project.  The semaphore models the
 //!   `project_memtable_hard_cap` back-pressure mechanism (C5).
 //!
 //! # Cost model
 //!
-//! At 10 000 inactive tenants the registry is a 10 000-entry `DashMap` with
+//! At 10 000 inactive projects the registry is a 10 000-entry `DashMap` with
 //! zero-byte counters — sub-MB overhead total.  Per-project semaphores are
 //! allocated only on first write.
 //!

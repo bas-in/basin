@@ -24,5 +24,5 @@ chrono.workspace = true
 clap = { version = "4", features = ["derive", "env"] }
 
 # Override workspace tokio-postgres to add chrono integration for
-# the tenant_usage_periods period_start TIMESTAMPTZ column.
+# the project_usage_periods period_start TIMESTAMPTZ column.
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }

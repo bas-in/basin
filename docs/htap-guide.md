@@ -17,7 +17,7 @@ Basin runs both workloads in one engine. The key architectural move is the **hot
 
 The practical effect is that Basin handles "what is the current balance for user 42?" and "what was the total payment volume by country last year?" from the same table, without you maintaining a separate OLTP sidecar. Point queries on recent inserts are sub-millisecond. Aggregate scans over years of history are sub-second on terabyte-scale data. Range queries that straddle both — say, "all orders from the last two hours with subtotals" — are automatically merged without any query rewriting from you.
 
-This design follows the same architectural recipe used by SingleStore, ClickHouse's ReplacingMergeTree, and Apache Pinot, applied within Basin's multi-tenant, object-store-native architecture. The reference design is [ADR 0016](./decisions/0016-htap-hot-tier-architecture.md).
+This design follows the same architectural recipe used by SingleStore, ClickHouse's ReplacingMergeTree, and Apache Pinot, applied within Basin's multi-project, object-store-native architecture. The reference design is [ADR 0016](./decisions/0016-htap-hot-tier-architecture.md).
 
 ---
 
@@ -156,9 +156,9 @@ The engine takes the memtable range and the Vortex range for the same interval, 
 
 ## Multi-project isolation
 
-Every project in Basin has its own memtable memory budget, enforced independently. When project A's memtable hits its hard cap and writes block, project B is unaffected. The underlying mechanism is a per-project semaphore backed by atomic byte counters — shared bookkeeping structure, zero per-tenant thread pool or allocator overhead. An inactive project costs one entry in a hash map; no memory for the memtable itself.
+Every project in Basin has its own memtable memory budget, enforced independently. When project A's memtable hits its hard cap and writes block, project B is unaffected. The underlying mechanism is a per-project semaphore backed by atomic byte counters — shared bookkeeping structure, zero per-project thread pool or allocator overhead. An inactive project costs one entry in a hash map; no memory for the memtable itself.
 
-This is a deliberate architectural property. Most HTAP systems share a global memtable across all tenants: one busy tenant can spike write latency for everyone else. Basin's multi-tenant design (see [ADR 0016 §"Multi-tenant isolation"](./decisions/0016-htap-hot-tier-architecture.md)) eliminates that class of noisy-neighbor problem at the storage layer. It complements the connection-pool fairness already provided by [ADR 0008](./decisions/0008-noisy-neighbor-fairness.md).
+This is a deliberate architectural property. Most HTAP systems share a global memtable across all projects: one busy project can spike write latency for everyone else. Basin's multi-project design (see [ADR 0016 §"Multi-project isolation"](./decisions/0016-htap-hot-tier-architecture.md)) eliminates that class of noisy-neighbor problem at the storage layer. It complements the connection-pool fairness already provided by [ADR 0008](./decisions/0008-noisy-neighbor-fairness.md).
 
 The practical consequence: you can safely colocate OLTP-heavy and analytics-heavy projects on the same Basin instance. Set each project's `memtable_hard_cap` according to its write pattern. Caps are enforced in memory accounting, not in wall-clock time, so a project doing large batch inserts does not eat into another project's latency budget.
 
@@ -268,4 +268,4 @@ A: Increase `memtable_table_cap` to hold more rows before flushing (e.g., 64 MB)
 A: Postgres is row-oriented end-to-end. A `SUM` query over 100M rows reads every column of every row even if you only need one column, because the heap file interleaves all columns. At scale, analytical queries on Postgres are slow because of this. Basin's cold tier is columnar: analytical scans read only the columns they need. Basin also runs HTAP queries from object storage, which scales horizontally in a way a single Postgres instance cannot.
 
 **Q: How does this differ from DuckDB?**
-A: DuckDB is an excellent single-node analytical engine but it is a library, not a multi-tenant server. It has no concept of per-project memory isolation, no built-in hot/cold split, and no WAL-backed durability for a shared write workload. Basin is designed to run as a multi-tenant database-as-a-service where dozens of projects share one process with hard-enforced memory budgets and independent crash recovery.
+A: DuckDB is an excellent single-node analytical engine but it is a library, not a multi-project server. It has no concept of per-project memory isolation, no built-in hot/cold split, and no WAL-backed durability for a shared write workload. Basin is designed to run as a multi-project database-as-a-service where dozens of projects share one process with hard-enforced memory budgets and independent crash recovery.

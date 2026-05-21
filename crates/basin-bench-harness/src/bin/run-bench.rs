@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
             cfg.workload.iterations = cfg.workload.iterations.min(200);
             cfg.workload.table_rows = cfg.workload.table_rows.min(20_000);
             if let Some(n) = cfg.workload.noisy.as_mut() {
-                n.quiet_tenants = n.quiet_tenants.min(4);
+                n.quiet_projects = n.quiet_projects.min(4);
             }
         }
     })

@@ -169,7 +169,7 @@ pub(crate) struct EngineInner {
     /// bytes-decoded / cache-hits / fast-path-engaged statistics keyed by
     /// `(ProjectId, TableName, QueryShapeHash)`.  Shared across all sessions
     /// on this engine; per-project isolation is structural (separate LRU caches
-    /// behind a `DashMap<ProjectId, …>`).  Idle tenants cost O(bytes).
+    /// behind a `DashMap<ProjectId, …>`).  Idle projects cost O(bytes).
     pub(crate) query_stats: Arc<crate::query_stats::QueryStatRegistry>,
     /// Phase 5.7 B1: process-wide secondary B-tree index registry.
     ///

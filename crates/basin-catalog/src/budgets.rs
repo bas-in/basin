@@ -2,7 +2,7 @@
 //!
 //! Closes the **multi-instance cap-bypass P0** from
 //! `docs/audits/2026-05-21-noisy-neighbor-fairness.md`: every per-project cap
-//! used to live in a per-process `DashMap`, so a tenant capped at e.g. 100/s
+//! used to live in a per-process `DashMap`, so a project capped at e.g. 100/s
 //! sustained `N × 100/s` simply by spraying traffic across `N` replicas. This
 //! module is the coordinator side: every leaseholder pushes per-`(project,
 //! partition)` usage deltas on its heartbeat tick; the coordinator sums them
@@ -25,7 +25,7 @@
 //!
 //! ## Shape rule
 //!
-//! Same `feedback_multitenant_isolation` rule as everywhere else: per-tenant
+//! Same `feedback_multitenant_isolation` rule as everywhere else: per-project
 //! cost is `O(bytes)`. Idle projects cost only a hash-map entry; the
 //! coordinator holds one row per `(project, partition)` it has ever heard
 //! about (no per-replica entry).
@@ -59,7 +59,7 @@ use basin_common::{ProjectId, Result};
 use tokio::sync::RwLock;
 
 /// The six per-project cap consumer sites ADR 0023 names. Each gets its own
-/// slice number per `(project, partition)` so a tenant that burns their REST
+/// slice number per `(project, partition)` so a project that burns their REST
 /// budget doesn't starve their pgwire / Wasm / memtable budget.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CapKind {
@@ -474,7 +474,7 @@ impl std::fmt::Debug for SliceBudgetView {
 /// caller maps that to its existing "rejected" code path (`RateLimited`,
 /// `BUFFER_FULL`, etc.).
 ///
-/// Per-tenant cost: one `AtomicU64` per `(project, cap)` actually exercised.
+/// Per-project cost: one `AtomicU64` per `(project, cap)` actually exercised.
 /// Cheap to clone (Arc inside).
 #[derive(Clone, Default)]
 pub struct SliceGate {

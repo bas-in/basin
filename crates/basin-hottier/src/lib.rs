@@ -19,10 +19,10 @@
 //! | [`budget::GlobalPressureScheduler`] | Stateless largest-first flush scheduler when global pressure rises (Phase 5.14.C5) |
 //! | [`flush::FlushTask`] | Background memtable → Vortex flush loop (Phase 5.14.C4) |
 //!
-//! ## Multi-tenant isolation
+//! ## Multi-project isolation
 //!
 //! Cost is O(bytes of actual data) + one `AtomicU64` counter + one
-//! `Semaphore` per active project.  10 000 inactive tenants cost sub-MB — the
+//! `Semaphore` per active project.  10 000 inactive projects cost sub-MB — the
 //! registry is just 10 000 empty `DashMap` entries.
 //!
 //! ## Phase scope

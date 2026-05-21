@@ -2,14 +2,14 @@
 title: "ADR 0023 — Lease-based ownership + partition-level routing + heartbeat budgets"
 nav_section: decisions
 sidebar_position: 23
-summary: "Convert per-(project,partition) ownership from a hash on ProjectId into a lease in the catalog Postgres. Stateless replicas + partition-level routing + heartbeat-reconciled budgets fix hot-tenant pinning and multi-instance cap-bypass in one architecture, without a central coordinator service or distributed counters on the hot path. The architectural commitment for Basin's multi-replica scale-out."
-tags: [architecture, scaling, multi-tenant, hot-tier]
+summary: "Convert per-(project,partition) ownership from a hash on ProjectId into a lease in the catalog Postgres. Stateless replicas + partition-level routing + heartbeat-reconciled budgets fix hot-project pinning and multi-instance cap-bypass in one architecture, without a central coordinator service or distributed counters on the hot path. The architectural commitment for Basin's multi-replica scale-out."
+tags: [architecture, scaling, multi-project, hot-tier]
 ---
 
 # 0023 — Lease-based ownership + partition-level routing + heartbeat budgets
 
 - **Status:** Accepted, 2026-05-21.
-- **Tags:** architecture, scaling, multi-tenant, hot-tier
+- **Tags:** architecture, scaling, multi-project, hot-tier
 - **Supersedes / strengthens:** the implicit single-replica model in
   [ADR 0010 (catalog replication)](./0010-catalog-replication.md),
   [ADR 0016 (HTAP hot-tier architecture)](./0016-htap-hot-tier-architecture.md).
@@ -20,7 +20,7 @@ tags: [architecture, scaling, multi-tenant, hot-tier]
 
 The noisy-neighbor audit surfaced two coupled architectural P0s:
 
-1. **Hot-tenant pinning.** `ShardMap::shard_for` (`crates/basin-router/src/sharding.rs:88–94`)
+1. **Hot-project pinning.** `ShardMap::shard_for` (`crates/basin-router/src/sharding.rs:88–94`)
    hashes `ProjectId → ShardOwner`. The HTAP memtable
    (`crates/basin-hottier/src/registry.rs:149`) and the per-`(project, partition)`
    WAL mutex (`crates/basin-wal/src/file_wal.rs:57`) live only on the hashed
@@ -28,7 +28,7 @@ The noisy-neighbor audit surfaced two coupled architectural P0s:
    replicas stay cold.
 2. **Multi-instance cap bypass.** Every per-project cap (REST QPS, pgwire QPS,
    memtable bytes, realtime `BUFFER_FULL`, Wasm semaphore, basin-net outbound)
-   is a per-process `DashMap` with no cross-replica aggregation. A tenant capped
+   is a per-process `DashMap` with no cross-replica aggregation. A project capped
    at 100/s sustains `N × 100/s` by spraying across `N` replicas. The new
    overage prices (`acb2f7c`: storage $0.010/GB-mo, compute $0.018/CPU-hr) are
    similarly per-replica → undercharging.
@@ -109,7 +109,7 @@ behaviour is identical to today; this is the no-op back-compat path.
   and writes a **per-partition slice budget** back into each heartbeat
   response. Slice = `project_total_budget / partition_count`, conservatively
   rounded down.
-- A tenant can over-spend by at most one heartbeat interval × the slack the
+- A project can over-spend by at most one heartbeat interval × the slack the
   scheduler grants. This is **acceptable for billing** (you charge actual
   usage; the cap is a slow brake, not a per-request gate) and for soft caps;
   hard limits set the slice conservatively.
@@ -124,7 +124,7 @@ with the lease.
 ## Consequences
 
 **Positive**
-- **Hot-tenant pinning is automatic.** A project with N partitions distributes
+- **Hot-project pinning is automatic.** A project with N partitions distributes
   across replicas naturally. Whales partition explicitly; everyone else
   defaults to 1 partition and sees no behaviour change.
 - **Caps are correct without per-request coordination.** The leaseholder owns
@@ -171,7 +171,7 @@ the audit's single-instance P0s while the bigger work proceeds.
   `crates/basin-catalog/src/postgres.rs:57–60` with `deadpool-postgres`.
   Every DDL no longer serializes every catalog read.
 - **6.P0.C — Wasm on a dedicated tokio runtime, not the shared
-  `spawn_blocking` pool.** Kills cross-tenant Wasm starvation of the
+  `spawn_blocking` pool.** Kills cross-project Wasm starvation of the
   shard-mode executor.
 
 ### Phase 6.X — the architectural commitment (~6–10 weeks single-engineer)
@@ -212,7 +212,7 @@ the audit's single-instance P0s while the bigger work proceeds.
 
 ## Cross-references
 
-- Closes the noisy-neighbor audit's P0s coupled with hot-tenant pinning:
+- Closes the noisy-neighbor audit's P0s coupled with hot-project pinning:
   [`docs/audits/2026-05-21-noisy-neighbor-fairness.md`](../audits/2026-05-21-noisy-neighbor-fairness.md).
 - Strengthens [ADR 0010 (catalog replication)](./0010-catalog-replication.md)
   — the lease table is in the global Postgres ADR 0010 already selected.

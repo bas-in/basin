@@ -3,7 +3,7 @@ title: "Lease ownership — operator runbook"
 nav_section: operations
 sidebar_position: 50
 summary: "Day-2 ops guide for ADR 0023 lease-based ownership: how it works, how to query lease state, how to rebalance hot replicas, when to bump partition count, and the stuck-lease incident playbook."
-tags: [operations, scaling, multi-tenant, lease, partitioning]
+tags: [operations, scaling, multi-project, lease, partitioning]
 ---
 
 # Lease ownership — operator runbook
@@ -69,7 +69,7 @@ your monitoring stack via the standard `/metrics` scrape.
 
 | metric | type | dimensions | what it tells you |
 |---|---|---|---|
-| `basin_lease_holdings_total` | gauge | `replica` | How many partitions a replica currently owns. Skew across replicas = hot tenant. |
+| `basin_lease_holdings_total` | gauge | `replica` | How many partitions a replica currently owns. Skew across replicas = hot project. |
 | `basin_lease_acquire_total` | counter | `replica`, `result={acquired,stolen,failed}` | Rate of new acquires. `stolen` rate spike = a peer is flapping. |
 | `basin_lease_renew_total` | counter | `replica`, `result={ok,expired,failed}` | `expired` ≠ 0 means a replica lost a lease. `failed` ≠ 0 means coordinator transport hiccups. |
 | `basin_lease_handoff_duration_ms` | histogram | `replica` | Voluntary handoff stall time. Empty until 6.X.C lands. ADR 0023 target: < 500 ms p99. |

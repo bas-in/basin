@@ -109,7 +109,7 @@ async fn noisy_neighbor_profile_smoke() {
         cfg.workload.iterations = 32;
         cfg.workload.table_rows = 2_000;
         if let Some(n) = cfg.workload.noisy.as_mut() {
-            n.quiet_tenants = 3;
+            n.quiet_projects = 3;
         }
         cfg.workload.project_count = 4; // 1 noisy + 3 quiet
         cfg.output_dir = Some(out_dir.clone());

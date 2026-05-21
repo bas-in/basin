@@ -94,7 +94,7 @@ fn soft_cap_fires_then_hard_cap_blocks() {
 /// Two projects: A gets 100 MiB reserved, B gets 150 MiB reserved.
 /// `largest_project()` must return B.
 #[test]
-fn largest_project_identifies_the_heavier_tenant() {
+fn largest_project_identifies_the_heavier_project() {
     let cfg = MemTableConfig {
         project_hard_cap_bytes: 512 * 1024 * 1024,
         project_soft_cap_bytes: 256 * 1024 * 1024,

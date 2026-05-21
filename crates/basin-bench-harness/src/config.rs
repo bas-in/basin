@@ -128,7 +128,7 @@ pub struct WorkloadKnobs {
     pub deadline_secs: u64,
     /// Optional Wasm-bench knobs (None for non-wasm shapes).
     pub wasm: Option<WasmKnobs>,
-    /// Optional noisy-neighbor knobs (None for single-tenant shapes).
+    /// Optional noisy-neighbor knobs (None for single-project shapes).
     pub noisy: Option<NoisyKnobs>,
     /// Optional multi-instance knobs (None for single-instance shapes).
     pub multi_instance: Option<MultiInstanceKnobs>,
@@ -180,16 +180,16 @@ impl Default for WasmKnobs {
     }
 }
 
-/// Noisy-neighbor knobs. The profile spins up one "noisy" tenant doing the
-/// `noisy_shape` workload and N quiet tenants doing the `quiet_shape`
-/// workload, then measures the quiet tenants' p99 degradation vs a baseline
-/// run with the noisy tenant disabled.
+/// Noisy-neighbor knobs. The profile spins up one "noisy" project doing the
+/// `noisy_shape` workload and N quiet projects doing the `quiet_shape`
+/// workload, then measures the quiet projects' p99 degradation vs a baseline
+/// run with the noisy project disabled.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NoisyKnobs {
-    pub quiet_tenants: usize,
-    /// Concurrency of the noisy tenant's full-scan workload.
+    pub quiet_projects: usize,
+    /// Concurrency of the noisy project's full-scan workload.
     pub noisy_concurrency: usize,
-    /// Per-tenant query cost cap in rows (matches BASIN_QUERY_COST_LIMIT_ROWS).
+    /// Per-project query cost cap in rows (matches BASIN_QUERY_COST_LIMIT_ROWS).
     /// `None` means uncapped — surfaces the P0 gap from the noisy-neighbor
     /// audit (2026-05-21).
     pub query_cost_limit_rows: Option<u64>,
@@ -200,7 +200,7 @@ pub struct NoisyKnobs {
 impl Default for NoisyKnobs {
     fn default() -> Self {
         Self {
-            quiet_tenants: 8,
+            quiet_projects: 8,
             noisy_concurrency: 4,
             query_cost_limit_rows: None,
             io_permits: None,
@@ -245,7 +245,7 @@ pub struct BenchConfig {
 }
 
 impl BenchConfig {
-    /// Default LocalFS / Parquet / single-tenant configuration suitable for
+    /// Default LocalFS / Parquet / single-project configuration suitable for
     /// fast CI sanity (target: <30s per shape, <5min for the whole CI subset).
     pub fn ci_default() -> Self {
         Self {

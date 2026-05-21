@@ -1,8 +1,8 @@
-//! 10 000-tenant memory budget fuzz test for Phase 5.14.C5.
+//! 10 000-project memory budget fuzz test for Phase 5.14.C5.
 //!
 //! Verifies the per-project byte-budget invariants at scale:
 //! - No project exceeds its configured hard cap.
-//! - Total process heap across all projects scales O(bytes), not O(tenants).
+//! - Total process heap across all projects scales O(bytes), not O(projects).
 //! - `largest_project()` always returns the project with the most bytes.
 //!
 //! Sizing: 10 000 projects × 1 000 rows × 200 bytes/row = 2 000 000 000 bytes
@@ -34,7 +34,7 @@ const MAX_TOTAL_HEAP_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const HARD_CAP: u64 = 256 * 1024 * 1024;
 
 #[test]
-fn ten_k_tenant_fuzz_heap_under_4_gib() {
+fn ten_k_project_fuzz_heap_under_4_gib() {
     let cfg = MemTableConfig {
         project_hard_cap_bytes: HARD_CAP,
         project_soft_cap_bytes: 192 * 1024 * 1024,

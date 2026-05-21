@@ -411,7 +411,7 @@ mod tests {
         assert_eq!(mt.oldest_row_age(), Duration::ZERO);
     }
 
-    // ── multi-tenant isolation ────────────────────────────────────────────────
+    // ── multi-project isolation ────────────────────────────────────────────────
 
     #[test]
     fn separate_memtables_are_isolated() {

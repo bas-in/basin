@@ -5,16 +5,16 @@
 //! scenario (quiet point-select + 4 noisy full-scans, baseline-vs-under-load
 //! degradation ratio). The audit calls out three additional P0/P1 axes:
 //!
-//! 1. **`BASIN_QUERY_COST_LIMIT_ROWS` off**: a noisy tenant runs an unbounded
-//!    cartesian self-join; quiet tenants observe their p99 climb past the
+//! 1. **`BASIN_QUERY_COST_LIMIT_ROWS` off**: a noisy project runs an unbounded
+//!    cartesian self-join; quiet projects observe their p99 climb past the
 //!    5x bar. Currently records the gap; the fix is in W6's scope.
-//! 2. **Catalog Postgres = single Mutex<Client>**: every noisy tenant DDL
-//!    contends with every quiet tenant `load_table`. We surface the
+//! 2. **Catalog Postgres = single Mutex<Client>**: every noisy project DDL
+//!    contends with every quiet project `load_table`. We surface the
 //!    contention by issuing N parallel `CREATE INDEX` against the noisy
-//!    tenant while the quiet tenants point-query.
+//!    project while the quiet projects point-query.
 //! 3. **Per-project counters but no per-project executor**: the noisy
-//!    tenant saturates the runtime; we measure how many quiet tenants
-//!    degrade as a function of N (= `quiet_tenants`).
+//!    project saturates the runtime; we measure how many quiet projects
+//!    degrade as a function of N (= `quiet_projects`).
 //!
 //! This first cut wires scenario (3) — the other two require knobs the
 //! harness doesn't own yet (cost-limit env var; catalog backend). Each
@@ -52,11 +52,11 @@ fn baseline() -> BenchConfig {
     }
 }
 
-/// Scenario: how many quiet tenants does ONE noisy tenant degrade?
+/// Scenario: how many quiet projects does ONE noisy project degrade?
 ///
-/// We run the noisy tenant doing `SELECT COUNT(*) FROM events` in a tight
-/// loop, while each quiet tenant runs N point-selects. We report the per-
-/// tenant p99 vs the baseline p99 (taken from a no-noisy warmup).
+/// We run the noisy project doing `SELECT COUNT(*) FROM events` in a tight
+/// loop, while each quiet project runs N point-selects. We report the per-
+/// project p99 vs the baseline p99 (taken from a no-noisy warmup).
 fn run_quiet_degradation<'a>(
     h: &'a BenchHarness,
     cfg: &'a BenchConfig,
@@ -74,7 +74,7 @@ fn run_quiet_degradation<'a>(
             .projects
             .iter()
             .skip(1)
-            .take(noisy.quiet_tenants)
+            .take(noisy.quiet_projects)
             .copied()
             .collect();
         let table = h.table.clone();
@@ -149,7 +149,7 @@ fn run_quiet_degradation<'a>(
         let passed = ratio < 5.0;
 
         let rows = vec![json!({
-            "quiet_tenants": noisy.quiet_tenants,
+            "quiet_projects": noisy.quiet_projects,
             "baseline_p99_us": baseline.p99_us,
             "under_load_p99_us": under_load.p99_us,
             "ratio": ratio,
@@ -159,13 +159,13 @@ fn run_quiet_degradation<'a>(
         let path = report_scaling(
             &h.output_dir(cfg),
             "noisy_neighbor_quiet_degradation",
-            "Noisy-neighbor: quiet-tenant p99 under load",
-            "Quiet tenants' p99 latency stays within 5x of baseline when one \
-             noisy tenant runs full-scans.",
+            "Noisy-neighbor: quiet-project p99 under load",
+            "Quiet projects' p99 latency stays within 5x of baseline when one \
+             noisy project runs full-scans.",
             passed,
             AxisSpec {
-                key: "quiet_tenants".into(),
-                label: "Quiet tenants".into(),
+                key: "quiet_projects".into(),
+                label: "Quiet projects".into(),
             },
             vec![
                 SeriesSpec {
@@ -197,8 +197,8 @@ pub static PROFILE: BenchProfile = BenchProfile {
     shapes: &[BenchShape {
         kind: ShapeKind::Scaling,
         id: "noisy_neighbor_quiet_degradation",
-        name: "Quiet-tenant p99 under noisy load",
-        claim: "Quiet tenants' p99 stays within 5x of baseline.",
+        name: "Quiet-project p99 under noisy load",
+        claim: "Quiet projects' p99 stays within 5x of baseline.",
         run: run_quiet_degradation,
     }],
 };

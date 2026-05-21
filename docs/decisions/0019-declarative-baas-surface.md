@@ -146,8 +146,8 @@ threats and how each is addressed:
 | **Replay attacks** (capture + replay later) | Signature schemes that include a timestamp (Stripe-v1, GitHub-v1) are verified against a configurable window (default 5 min). Schemes without timestamps fall back to body-level idempotency (`ON CONFLICT … DO NOTHING` on a payload id). |
 | **Body tampering** | HMAC covers the byte-exact body; even single-bit changes invalidate. Body is buffered and signed before parsing (no parse-then-verify race). |
 | **SQL injection** | `payload` is a `jsonb` bind parameter, not string-interpolated. Same protection as every other parameterised query in the engine. |
-| **Cross-tenant routing** | Endpoint URL is project-scoped: `/in/<project_slug>/<webhook_name>`. The HMAC secret is stored per-webhook and only resolved when the URL matches the project. No global namespace. |
-| **DoS / rate flooding** | Reuses `basin-net`'s per-project rate limit (`BASIN_NET_RATE_LIMIT_QPS`) and body cap (`BASIN_NET_BODY_LIMIT_BYTES`). 4xx on cap; events queued via existing in-memory channel + per-project byte semaphore (see ADR 0012's webhook-fanout note about per-tenant bounding). |
+| **Cross-project routing** | Endpoint URL is project-scoped: `/in/<project_slug>/<webhook_name>`. The HMAC secret is stored per-webhook and only resolved when the URL matches the project. No global namespace. |
+| **DoS / rate flooding** | Reuses `basin-net`'s per-project rate limit (`BASIN_NET_RATE_LIMIT_QPS`) and body cap (`BASIN_NET_BODY_LIMIT_BYTES`). 4xx on cap; events queued via existing in-memory channel + per-project byte semaphore (see ADR 0012's webhook-fanout note about per-project bounding). |
 | **Secret exposure** | Secret stored encrypted at rest using the `EncryptionProvider` trait (already shipped). Masked in `pg_proc` / `information_schema.routines` output; never logged in plaintext; redacted in error messages. |
 | **Timing attacks on HMAC compare** | `subtle::ConstantTimeEq` or `hmac::Mac::verify` — constant-time by construction. Never compare raw bytes with `==`. |
 | **TLS downgrade** | TLS required by default; HTTP-only inbound webhooks rejected unless `BASIN_NET_ALLOW_PLAINTEXT_WEBHOOKS=true` (debug-only env, never set in prod). |
@@ -208,7 +208,7 @@ sink implementation — no engine change, no surface change.
 
 - **V8 / Deno edge-function runtime.** Out, permanently — Basin will
   never run a V8/Deno isolate pool. The cost (isolate pool, cold
-  starts, deploy pipeline, log streaming, multi-tenant CPU/mem
+  starts, deploy pipeline, log streaming, multi-project CPU/mem
   isolation, ~4-6 months + permanent ops) isn't justified by wedge
   fit, and it competes with free incumbents (Vercel / CF Workers /
   Supabase Edge). **In-DB compute is WebAssembly, not V8** — see the
@@ -244,7 +244,7 @@ Why Wasm and not V8:
 - **Reuses what's built** — the wasmtime runtime (Phase 5.11.J) + the
   `/rpc/<fn>` mount (Phase 5.11.L) are already committed. Wasm
   functions are an extension, not a new runtime.
-- **Cleaner multi-tenant isolation** — wasmtime epoch-interruption +
+- **Cleaner multi-project isolation** — wasmtime epoch-interruption +
   linear-memory caps are simpler and safer than V8 isolate quotas +
   cgroup wrangling.
 - **Bets with the market** — Cloudflare, Fermyon Spin, and the

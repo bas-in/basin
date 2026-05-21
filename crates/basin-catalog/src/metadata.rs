@@ -476,10 +476,10 @@ pub struct TableMetadata {
 }
 
 // ---------------------------------------------------------------------------
-// T-048 — per-tenant BYO-bucket config
+// T-048 — per-project BYO-bucket config
 // ---------------------------------------------------------------------------
 
-/// Stored inside [`TenantMetadata::byo_bucket`] when a project has configured
+/// Stored inside [`ProjectMetadata::byo_bucket`] when a project has configured
 /// its own object-storage bucket. The `secret_access_key_enc` field carries
 /// the secret key envelope-encrypted by the cloud layer's KMS; the OSS engine
 /// persists the bytes verbatim and never inspects them. The `force_path_style`
@@ -504,17 +504,17 @@ pub struct S3Config {
     pub force_path_style: bool,
 }
 
-/// Per-tenant settings shared across all tables owned by the tenant.
+/// Per-project settings shared across all tables owned by the project.
 ///
 /// `byo_bucket` is the only field today. `#[serde(default)]` on optional
 /// fields and `skip_serializing_if` ensure forward/backward compatibility:
 /// a catalog row that predates this struct deserialises with all fields at
 /// their defaults, preserving the pre-T-048 shared-bucket behaviour.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TenantMetadata {
-    /// When `Some`, reads and writes for this tenant are routed to the
+pub struct ProjectMetadata {
+    /// When `Some`, reads and writes for this project are routed to the
     /// customer's own S3-compatible bucket. `None` (the default) uses
-    /// Basin's shared bucket — back-compat with all existing tenants.
+    /// Basin's shared bucket — back-compat with all existing projects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub byo_bucket: Option<S3Config>,
 }

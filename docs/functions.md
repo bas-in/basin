@@ -21,7 +21,7 @@ CPU / memory / wall-clock / concurrency caps.
 > for the decision and the trade-offs. WebAssembly gives Basin one
 > sandbox the wasmtime team already maintains, with `epoch_interruption`
 > + linear-memory reservations that compose naturally with the
-> per-tenant cap structure the engine already enforces. JavaScript /
+> per-project cap structure the engine already enforces. JavaScript /
 > TypeScript is still a first-class authoring language via Javy /
 > ComponentizeJS; the engine just never sees the JS — it sees the
 > compiled Wasm component.
@@ -195,7 +195,7 @@ production path (`HandlerHarness::handle_with`).
 | Linear memory | 64 MiB | `BASIN_FN_MEM_MB` | Per-Store `MemoryLimiter` (`ResourceLimiter`) + engine-wide `memory_reservation` |
 | Wall-clock | 10 s | `BASIN_FN_WALL_MS` | `tokio::time::timeout` around the dedicated-runtime blocking task; epoch bumped past deadline on expiry to interrupt the wasm thread |
 | Per-project concurrency | 16 | `BASIN_FN_PROJECT_CONCURRENCY` | Per-project bounded `tokio::sync::Semaphore` |
-| Per-project semaphore LRU cap (memory bound for distinct projects) | 10 000 | `BASIN_FN_PROJECT_SEM_CAP` | Bounded `LruCache` — eviction keeps per-tenant cost O(bytes), not O(projects ever seen). See [ADR 0008 — Noisy-neighbor fairness](./decisions/0008-noisy-neighbor-fairness.md) |
+| Per-project semaphore LRU cap (memory bound for distinct projects) | 10 000 | `BASIN_FN_PROJECT_SEM_CAP` | Bounded `LruCache` — eviction keeps per-project cost O(bytes), not O(projects ever seen). See [ADR 0008 — Noisy-neighbor fairness](./decisions/0008-noisy-neighbor-fairness.md) |
 | Dedicated runtime worker threads | 4 | `BASIN_FN_WORKER_THREADS` | Wasm runs on a side-thread-owned `tokio::runtime::Runtime`, isolated from axum + the shard-mode executor + basin-net's blocking pool. Phase 6.P0.C — see audit `docs/audits/2026-05-21-noisy-neighbor-fairness.md` item #16 |
 
 A function that spins past the CPU cap, allocates past the memory cap,
@@ -256,9 +256,9 @@ The choice is load-bearing for the project's scope:
   the HTTP-handler world, and the governance plumbing on top. Adding
   V8 would mean a second sandbox, a second resource model, and a
   second security review.
-- **Cleaner multi-tenant isolation.** `epoch_interruption` + a
+- **Cleaner multi-project isolation.** `epoch_interruption` + a
   per-Store `ResourceLimiter` + a per-project semaphore compose into
-  the same per-tenant cost model the rest of the engine enforces
+  the same per-project cost model the rest of the engine enforces
   (`O(bytes)`, not `O(projects ever seen)`). V8 isolates would need a
   parallel resource-quota system that doesn't share primitives with
   the SQL path.
@@ -273,7 +273,7 @@ The choice is load-bearing for the project's scope:
 - [`tests/integration/tests/fn_handler.rs`](https://github.com/bas-in/basin/blob/main/tests/integration/tests/fn_handler.rs) — `/fn/v1/:name` integration test
 - [`tests/integration/tests/fn_javascript.rs`](https://github.com/bas-in/basin/blob/main/tests/integration/tests/fn_javascript.rs) — `LANGUAGE javascript` catalog + RLS-in-function tests
 - [`tests/integration/tests/wasm_functions_differential.rs`](https://github.com/bas-in/basin/blob/main/tests/integration/tests/wasm_functions_differential.rs) — function ≡ SQL differential
-- [`tests/integration/tests/wasm_functions_soak.rs`](https://github.com/bas-in/basin/blob/main/tests/integration/tests/wasm_functions_soak.rs) — 100-tenant concurrent soak (short variant; 1-hour `#[ignore]` variant for releases)
+- [`tests/integration/tests/wasm_functions_soak.rs`](https://github.com/bas-in/basin/blob/main/tests/integration/tests/wasm_functions_soak.rs) — 100-project concurrent soak (short variant; 1-hour `#[ignore]` variant for releases)
 - [ADR 0019 — Declarative BaaS surface](./decisions/0019-declarative-baas-surface.md) — "Wasm, not V8" decision
 - [ADR 0018 — Subsystem feature flags](./decisions/0018-subsystem-feature-flags.md) — the `component-model` Cargo feature; minimal builds drop the wasmtime runtime
 - [`basin-cli-design.md`](./basin-cli-design.md) — `basin functions deploy` CLI shape

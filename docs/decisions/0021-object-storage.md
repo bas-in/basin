@@ -102,7 +102,7 @@ Large-file resumable uploads via the TUS protocol are a fast-follow
 | Signed-URL replay after expiry | Expiry baked into the signed payload; rejected past TTL. |
 | Path traversal (`../`) | Path normalised + validated; rejected if it escapes the bucket prefix. |
 | MIME spoofing / dangerous uploads | `allowed_mime_types[]` per bucket; content-type sniffed server-side, not trusted from the client. |
-| Cross-tenant access | Object paths are project-prefixed in `object_store`; `storage.objects` rows are project-scoped; RLS enforces per-project. |
+| Cross-project access | Object paths are project-prefixed in `object_store`; `storage.objects` rows are project-scoped; RLS enforces per-project. |
 | Storage exhaustion (DoS) | `file_size_limit` per bucket; per-project quota enforced cloud-side (OSS exposes the counter). |
 | Public-bucket info leak | `public` flag is explicit per bucket; defaults to private; listing a private bucket is RLS-gated. |
 

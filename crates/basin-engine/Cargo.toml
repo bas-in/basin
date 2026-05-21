@@ -85,7 +85,7 @@ hdrhistogram = "7"
 # across project boundaries.  Version 6 matches basin-hottier.
 dashmap = "6"
 # lru — bounded LRU cache; one per project, capped at 500 distinct shapes so
-# idle tenants cost O(bytes) not O(shapes).
+# idle projects cost O(bytes) not O(shapes).
 lru.workspace = true
 
 [dev-dependencies]

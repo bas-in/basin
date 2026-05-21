@@ -2,7 +2,7 @@
 title: "Realtime (SSE / WebSocket) — operator runbook"
 nav_section: operations
 sidebar_position: 52
-summary: "Day-2 ops guide for Basin's realtime change-event fan-out: SSE and WebSocket subscriptions, per-tenant budget enforcement, BUFFER_FULL handling, subscriber lag, and replay-on-reconnect."
+summary: "Day-2 ops guide for Basin's realtime change-event fan-out: SSE and WebSocket subscriptions, per-project budget enforcement, BUFFER_FULL handling, subscriber lag, and replay-on-reconnect."
 tags: [operations, realtime, sse, websocket, budget, subscriptions]
 ---
 
@@ -14,7 +14,7 @@ Day-2 operator's guide to Basin's change-event fan-out subsystem
 On every committed INSERT / UPDATE / DELETE the engine posts a
 `ChangeEvent` to the realtime sink, which broadcasts it to every
 subscriber that has an open SSE or WebSocket connection on the
-`(project, table)` pair. Per-tenant memory budget enforcement prevents
+`(project, table)` pair. Per-project memory budget enforcement prevents
 a single noisy project from starving the shared broadcast ring.
 
 ---
@@ -47,7 +47,7 @@ must reconnect with `Last-Event-ID` to replay missed events from the
 webhook retry log.
 
 Key source files:
-- `crates/basin-realtime/src/budget.rs` — per-tenant budget enforcement
+- `crates/basin-realtime/src/budget.rs` — per-project budget enforcement
 - `crates/basin-realtime/src/lib.rs` — channel registry and sink
 - `crates/basin-realtime/src/sse.rs` — SSE transport
 - `crates/basin-realtime/src/ws.rs` — WebSocket transport
@@ -71,7 +71,7 @@ internal counters visible at `/metrics`.
 | `basin_realtime_lag_events` | gauge | `project`, `table` | How far behind the slowest receiver is on this channel's ring. |
 
 > **Leading indicator**: `basin_budget_over_cap_seconds_total{cap=realtime_bytes}`
-> is the first signal of a noisy tenant. A rising value means that tenant's
+> is the first signal of a noisy project. A rising value means that project's
 > events are being dropped to the retry log and its real-time latency for
 > subscribers is degraded — they receive events from replay, not the live ring.
 
@@ -294,7 +294,7 @@ If committed mutations are not appearing on subscriber connections within
 
 | Failure | Visible signal | Behaviour | Recovery |
 |---|---|---|---|
-| **BUFFER_FULL (noisy tenant)** | `basin_budget_over_cap_seconds_total{cap=realtime_bytes}` rising | Events for that project dropped to webhook retry log. Other projects unaffected. | Increase budget, or reduce tenant write rate. Self-healing once in-flight bytes drain. |
+| **BUFFER_FULL (noisy project)** | `basin_budget_over_cap_seconds_total{cap=realtime_bytes}` rising | Events for that project dropped to webhook retry log. Other projects unaffected. | Increase budget, or reduce project write rate. Self-healing once in-flight bytes drain. |
 | **Subscriber lagged out** | `basin_realtime_lag_events` at ring cap (1 024); subscriber receives `Lagged` error | Subscriber is evicted from ring. Client reconnects; replays missed events from retry log. | Self-healing; client must handle `Lagged` and reconnect. |
 | **ChannelRegistry miss** | Subscriber gets no events; `basin_realtime_subscribers_active` = 0 for the subscription | No channel exists yet — first subscriber creates it; no events emitted before that point are in the ring. | First subscriber subscribe-before-first-write; or use replay cursor to catch up. |
 | **Replica crash mid-broadcast** | All connections on that replica drop | Clients reconnect (another replica or the restarted replica). Replay cursor makes them whole. | Lease TTL-style recovery; no data loss (webhook retry log is durable). |

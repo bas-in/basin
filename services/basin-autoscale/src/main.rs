@@ -2,8 +2,8 @@
 //!
 //! # Overview
 //!
-//! This binary reads per-tenant usage snapshots (from the
-//! `tenant_usage_periods` catalog table or from an OTLP collector) and
+//! This binary reads per-project usage snapshots (from the
+//! `project_usage_periods` catalog table or from an OTLP collector) and
 //! drives shard split / rebalance operations via `basin-cli admin split` /
 //! `basin-cli admin rebalance`.
 //!
@@ -11,8 +11,8 @@
 //!
 //! The Fly Machines autoscaler (`backend-rs/src/bin/autoscaler.rs`) manages
 //! the *cloud infrastructure* layer — spawning or destroying Fly VMs based on
-//! how many tenants are active. This binary is the *engine shard* layer:
-//! deciding when individual tenants need their hash-bucket shards split or
+//! how many projects are active. This binary is the *engine shard* layer:
+//! deciding when individual projects need their hash-bucket shards split or
 //! merged based on CPU / ops load.
 //!
 //! # Configuration
@@ -26,14 +26,14 @@
 //!
 //! ## Catalog poll mode (default)
 //!
-//! Reads the `tenant_usage_periods` table directly from the basin catalog
+//! Reads the `project_usage_periods` table directly from the basin catalog
 //! Postgres instance. Suitable for single-node deployments without a
 //! dedicated OTLP collector.
 //!
 //! ## OTLP mode
 //!
 //! When `BASIN_OTLP_ENDPOINT` is set, the daemon subscribes to the OTLP
-//! counter stream instead. (Implementation: the `basin.tenant.usage` target
+//! counter stream instead. (Implementation: the `basin.project.usage` target
 //! events emitted by `basin-catalog::usage::spawn_usage_snapshot_task` are
 //! scraped from the collector's query API.)
 //!
@@ -57,7 +57,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use basin_autoscale::{ScaleDecision, Scaler, ScalerConfig, TenantSnapshot};
+use basin_autoscale::{ScaleDecision, Scaler, ScalerConfig, ProjectSnapshot};
 use basin_common::ProjectId;
 use clap::Parser;
 use tracing::{info, warn};
@@ -68,7 +68,7 @@ use tracing::{info, warn};
 
 /// Basin engine shard autoscale controller.
 ///
-/// Reads per-tenant usage counters and drives `basin-cli admin split` /
+/// Reads per-project usage counters and drives `basin-cli admin split` /
 /// `basin-cli admin rebalance` when thresholds are exceeded.
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
@@ -119,12 +119,12 @@ struct Args {
     )]
     hysteresis_window: u32,
 
-    /// Minimum number of shards per tenant.
+    /// Minimum number of shards per project.
     /// Env: BASIN_AUTOSCALE_MIN_SHARDS (default 1).
     #[arg(long, default_value = "1", env = "BASIN_AUTOSCALE_MIN_SHARDS")]
     min_shards: u32,
 
-    /// Maximum number of shards per tenant.
+    /// Maximum number of shards per project.
     /// Env: BASIN_AUTOSCALE_MAX_SHARDS (default 16).
     #[arg(long, default_value = "16", env = "BASIN_AUTOSCALE_MAX_SHARDS")]
     max_shards: u32,
@@ -240,13 +240,13 @@ async fn run(args: Args) -> Result<()> {
 // Source: catalog poll
 // ---------------------------------------------------------------------------
 
-/// Fetch the latest `TenantSnapshot` for every active project from the
-/// `tenant_usage_periods` catalog table.
+/// Fetch the latest `ProjectSnapshot` for every active project from the
+/// `project_usage_periods` catalog table.
 ///
 /// Returns the most-recent row per project (ordered by `period_start DESC`).
 /// When `BASIN_OTLP_ENDPOINT` is set this function still runs because the
 /// OTLP subscriber is a v0.3 stub; the OTLP warning is emitted in `run`.
-async fn fetch_snapshots(args: &Args) -> Result<Vec<TenantSnapshot>> {
+async fn fetch_snapshots(args: &Args) -> Result<Vec<ProjectSnapshot>> {
     let pg_dsn = args
         .catalog_pg
         .as_deref()
@@ -263,7 +263,7 @@ async fn fetch_snapshots(args: &Args) -> Result<Vec<TenantSnapshot>> {
         }
     });
 
-    // Query: most-recent row per project from tenant_usage_periods.
+    // Query: most-recent row per project from project_usage_periods.
     let rows = client
         .query(
             r#"
@@ -274,20 +274,20 @@ async fn fetch_snapshots(args: &Args) -> Result<Vec<TenantSnapshot>> {
                 ops_count,
                 active_hours,
                 cpu_ms
-            FROM tenant_usage_periods
+            FROM project_usage_periods
             ORDER BY project_id, period_start DESC
             "#,
             &[],
         )
         .await
-        .context("failed to query tenant_usage_periods")?;
+        .context("failed to query project_usage_periods")?;
 
     let mut result = Vec::with_capacity(rows.len());
     for row in rows {
         let project_id_str: String = row.try_get("project_id")?;
         let project_id: ProjectId = project_id_str
             .parse()
-            .context("invalid project_id in tenant_usage_periods")?;
+            .context("invalid project_id in project_usage_periods")?;
 
         let period_start: chrono::DateTime<chrono::Utc> = row.try_get("period_start")?;
         let storage_bytes: i64 = row.try_get("storage_bytes")?;
@@ -295,7 +295,7 @@ async fn fetch_snapshots(args: &Args) -> Result<Vec<TenantSnapshot>> {
         let active_hours: f64 = row.try_get("active_hours")?;
         let cpu_ms: i64 = row.try_get("cpu_ms")?;
 
-        result.push(TenantSnapshot {
+        result.push(ProjectSnapshot {
             project_id,
             period_start,
             storage_bytes: storage_bytes.max(0) as u64,

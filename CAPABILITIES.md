@@ -33,7 +33,7 @@ Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_
 | Realtime WebSocket (`GET /realtime/v1/ws/:project`) | ✅ | Phase 5.11.R3 (`10858d8`). Multiplexed subscribe/unsubscribe over a single WS connection; JSON envelope with `type`, `table`, `payload`. |
 | Presence channels (track/untrack/presence_state/presence_diff) | ✅ | Phase 5.11.R4 (`cdf3f99`). Per-project presence rooms; `track`, `untrack`, `presence_state`, `presence_diff` messages over the WS channel. |
 | Subscriber-side filter pushdown | ✅ | Phase 5.11.R5. `subscribe_filtered` predicate evaluated in ≤ 50 µs at the sink before bytes hit the wire. |
-| Per-project realtime memory budget | ✅ | Phase 5.11.R6. `O(bytes)` per-tenant `BudgetTracker`; back-pressure on over-budget projects without affecting others. |
+| Per-project realtime memory budget | ✅ | Phase 5.11.R6. `O(bytes)` per-project `BudgetTracker`; back-pressure on over-budget projects without affecting others. |
 | Replication protocol | 🚫 | not the right shape for object-store storage |
 
 ## SQL surface
@@ -150,7 +150,7 @@ Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_
 | HTAP hot tier (memtable + WAL markers) | ✅ | Phase 5.14.C1–C6 (`57d2ae11`…`9e107ef`). Per-project/table `MemTable` absorbs writes; `RaftWal`-marker flush loop snapshots to Vortex non-blocking; read-path merge gives HTAP semantics. `GlobalPressureScheduler` picks largest-first flush. PK-ordered read-merge handles INSERT-SELECT/DEFAULT through the hot tier. `ALTER PROJECT … SET memtable_cap = N` controls per-project memory budget. 88-shape differential confirms hot/cold/split modes produce byte-identical results. |
 | Catalog bloom filters (per-file point-eq miss pruning) | ✅ | Phase 5.14.A (`ae6460a`…`c5739a6`). Per-file bloom filters stored in `DataFileRef.bloom_filters`; fixed-seed hasher closes false-negative correctness bug (5.14.A4). Complements per-column Parquet page bloom filters. |
 | HLL / t-digest sketches + `APPROX_COUNT_DISTINCT` / `APPROX_PERCENTILE` | ✅ | Phase 5.14.B1–B5 (`1c2387d`, `696cadb`, `fc00a41`, `4935115`). Writer-side per-column HLL and t-digest sketches stored in `DataFileRef`; `APPROX_COUNT_DISTINCT(col)` aggregate UDF (HLL); `APPROX_PERCENTILE(col, p)` aggregate UDF (t-digest). Differential tested at 1 M rows across file counts. |
-| Query-shape insights + `basin_stat_statements` view | ✅ | Phase 5.16.A–D (`33ae73f`…`94db513`). Canonical per-shape hash (xxh3_64); per-shape HDR histogram registry (bounded LRU, O(bytes) per tenant); scale-dependent regression tracking (per-(shape, log2-bucket) histograms + `top_regressions`); `basin_stat_statements` SQL view + OTLP export. |
+| Query-shape insights + `basin_stat_statements` view | ✅ | Phase 5.16.A–D (`33ae73f`…`94db513`). Canonical per-shape hash (xxh3_64); per-shape HDR histogram registry (bounded LRU, O(bytes) per project); scale-dependent regression tracking (per-(shape, log2-bucket) histograms + `top_regressions`); `basin_stat_statements` SQL view + OTLP export. |
 
 ### Performance residuals (won't chase further)
 

@@ -107,7 +107,7 @@ pub struct ComponentHarness {
     /// Optional per-project counter registry. When attached,
     /// [`ComponentHarness::run_with`] bumps `cpu_micros_total` for the
     /// invoking project after the Wasm work completes (the wall-clock here is
-    /// CPU on the tenant's behalf — same SKU as engine query time).
+    /// CPU on the project's behalf — same SKU as engine query time).
     /// `None` means metering is disabled for this harness (bench harness +
     /// legacy callers); kept optional so adding the counter didn't break
     /// existing constructors.
@@ -158,7 +158,7 @@ impl ComponentHarness {
 
     /// Attach a per-project counter registry so [`Self::run_with`] bumps
     /// `cpu_micros_total` for the invoking project. Wasm wall-clock counts as
-    /// CPU on the tenant's behalf and feeds the same
+    /// CPU on the project's behalf and feeds the same
     /// `COMPUTE_OVERAGE_USD_PER_CPU_SECOND` SKU as engine query CPU
     /// (`docs/audits/2026-05-21-billing-meter-gap.md` hole #12). Idempotent
     /// (overwrites). Optional — leaving it unset disables metering.
@@ -200,7 +200,7 @@ impl ComponentHarness {
     /// `spawn_blocking` pool.
     ///
     /// `project` is the calling project. The semaphore is keyed on it so
-    /// concurrency is bounded per-tenant.
+    /// concurrency is bounded per-project.
     ///
     /// Panics if the harness was built via [`ComponentHarness::new`]
     /// (without governance). Callers that don't know which constructor was
@@ -222,8 +222,8 @@ impl ComponentHarness {
         // Wall-clock from just before invoke_with_caps until it returns is
         // the CPU bill we attribute to the project. Includes the per-project
         // semaphore wait + wasm task time. That's the right granularity for
-        // a per-tenant CPU meter: queueing under contention IS time we're
-        // running the tenant's work-in-flight, and Wasm host imports
+        // a per-project CPU meter: queueing under contention IS time we're
+        // running the project's work-in-flight, and Wasm host imports
         // (HTTP / SQL) are billed too because the same fn invocation owns
         // them. Same SKU as the engine query meter — see
         // `docs/audits/2026-05-21-billing-meter-gap.md` hole #12.

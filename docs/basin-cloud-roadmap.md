@@ -145,7 +145,7 @@ Basin-engineer-only anonymised cross-customer aggregates.
 
 The OSS side strips literals at the LogicalPlan layer before any
 persistence or export.  By the time the cloud side sees a record there is
-no tenant-identifying SQL content; only the canonical plan-shape hash +
+no project-identifying SQL content; only the canonical plan-shape hash +
 aggregate metrics.  This is the privacy invariant ADR 0017 will record.
 
 Items (mirror of TASK.md Phase 5.16.E – 5.16.H):

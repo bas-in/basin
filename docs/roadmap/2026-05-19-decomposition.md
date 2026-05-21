@@ -33,7 +33,7 @@ for the inter-item dependencies.
 2. Plan-shape hash uses `xxhash3` 64-bit, fixed seed `0xBA51_4145_7E11_5A95`.
 3. Memtable schema evolution: DEFAULT-at-read for constant defaults; force-flush-required for non-constant.
 4. Compaction multi-sort: user-declared `CLUSTER BY` always wins; `basin.adaptive_sort_override = true` per-table opt-in for override.
-5. Cross-tenant aggregates: anonymised template (`t1.c0`); k-anonymity ≥ 5.
+5. Cross-project aggregates: anonymised template (`t1.c0`); k-anonymity ≥ 5.
 
 ## Wave structure
 
@@ -167,7 +167,7 @@ write time; existing UDF tests still pass.
 Depends on **5.16.A.**  Files: `crates/basin-engine/src/query_stats.rs`
 (new), `crates/basin-engine/src/lib.rs` (mod + Engine accessor),
 `crates/basin-engine/src/session.rs` (record at end of each
-statement).  Add `hdrhistogram` to workspace.  Multi-tenant
+statement).  Add `hdrhistogram` to workspace.  Multi-project
 pattern: DashMap shared registry + per-project bounded LRU
 (max 500 shapes/project).  Acceptance gate: registry overhead ≤ 1 %
 p99 at 10 k QPS.
@@ -183,14 +183,14 @@ markers, replay-time suppression).  Acceptance gate per ADR 0016:
 single-row UPDATE p99 ≤ 5 ms (10× current), INSERT p99 ≤ 1 ms,
 rolled-back-tx WAL entries NOT re-applied on restart.
 
-### 5.14.C5 — Multi-tenant memory budget (1 week)
+### 5.14.C5 — Multi-project memory budget (1 week)
 
 Depends on **C1.**  Files: `crates/basin-hottier/src/budget.rs`
 (new), `crates/basin-hottier/src/registry.rs` (extend),
 `crates/basin-engine/src/{lib,alter,ddl}.rs` (config plumbing +
 `ALTER PROJECT SET basin.memtable_hard_cap = N` DDL).  Hard cap
 256 MB / soft cap 192 MB / per-table 16 MB defaults per ADR 0016.
-Largest-first global flush scheduler.  Acceptance gate: 10 k-tenant
+Largest-first global flush scheduler.  Acceptance gate: 10 k-project
 fuzz fits in 4 GB heap; per-project byte usage scales O(bytes)
 not O(active_projects).
 
@@ -255,7 +255,7 @@ flushes without read stall; 0 differential rows.
 Depends on **5.16.B + 5.16.C.**  OTLP metrics for cross-process
 shape stats export; Postgres-style `basin_stat_statements` view
 for in-process consumption.  Privacy guards per ADR 0017
-(per-customer view shows real names; cross-tenant export later
+(per-customer view shows real names; cross-project export later
 anonymises at cloud-side).  Files:
 `crates/basin-engine/src/query_stats_export.rs` (new),
 `crates/basin-engine/src/info_schema_provider.rs` (extend).

@@ -20,12 +20,12 @@ gets a canonical plan-shape hash, then `QueryStatRegistry` aggregates
 per-shape p50/p95/p99 latency, rows scanned, files opened, bytes
 decoded.  These records flow over OTLP to basin-cloud, which renders
 per-customer "Query Insights" UI and Basin-engineer-only anonymised
-cross-tenant aggregates.
+cross-project aggregates.
 
 Two correctness questions:
 
 1. **Privacy.** What customer-identifying data can leak — directly via
-   exported records, or indirectly via cross-tenant aggregation?
+   exported records, or indirectly via cross-project aggregation?
 2. **Cross-process / cross-version stability.** The shape hash is the
    join key across the OSS → cloud pipeline.  If `hash(plan)` differs
    between Rust versions or between OSS basin instances, the cloud's
@@ -45,7 +45,7 @@ Rejected alternatives:
   across Rust versions.  Two basin nodes at different patch levels
   would produce different hashes for the same plan.  Unacceptable.
 - **`fnv1a-64`** — stable and fast but weak; at cloud scale
-  (≥ 10 k tenants × 500 shapes ≈ 5 M distinct shapes) collision
+  (≥ 10 k projects × 500 shapes ≈ 5 M distinct shapes) collision
   probability rises into the measurable range.
 - **`siphash13`** — what fastbloom uses; stable and strong but ~3 ×
   slower than xxhash3.  Reserved as fallback if xxhash-rust ever
@@ -75,7 +75,7 @@ every `Expr::Literal` node with `Expr::LiteralSlot(DataType)` before
 the plan walk reaches the hash sink.  This is the bedrock invariant —
 without it, every other privacy guarantee unravels.
 
-**Layer 2 — Per-customer OTLP export (OSS → cloud, single tenant view).**
+**Layer 2 — Per-customer OTLP export (OSS → cloud, single project view).**
 The basin-cloud Query Insights UI for a customer shows that customer
 their own real schema names: `customers.email_hash`, `orders.amount`.
 This is correct: a customer must be able to read shape templates to
@@ -90,7 +90,7 @@ act on them.  Exported record carries:
 project scoping is enforced at the cloud ingest pipeline by the
 `ProjectId` field on every record.
 
-**Layer 3 — Cross-tenant aggregates (Basin engineers only).**
+**Layer 3 — Cross-project aggregates (Basin engineers only).**
 For roadmap evidence ("X % of customers run shape Y at > 100 GB table
 size") basin-cloud surfaces aggregate views to Basin engineers.  These:
 
@@ -110,18 +110,18 @@ size") basin-cloud surfaces aggregate views to Basin engineers.  These:
 - Literal values in WHERE / VALUES / SET clauses
 - Customer's row data
 - pgwire raw SQL text
-- Project / table / column names in cross-tenant aggregates (only in
+- Project / table / column names in cross-project aggregates (only in
   the per-customer view)
 
 ### What may be exported
 
 - Plan-shape hash (xxh3_64 of canonical literal-stripped plan)
 - Plan template (real names in per-customer; positional placeholders
-  in cross-tenant)
+  in cross-project)
 - HDR histograms
 - Counters
 - Aggregate metadata (number of files, table-size bucket — but not
-  table identity in cross-tenant view)
+  table identity in cross-project view)
 
 ### Opt-out
 
@@ -137,7 +137,7 @@ external traffic.
   cryptographic levels.  Rejected — the marginal safety is not worth
   the wire-size doubling.  64-bit at 1.4 × 10⁻⁷ collision rate is
   already several orders of magnitude below "would ever matter".
-- **Per-customer hash salt.** Would make cross-tenant aggregation
+- **Per-customer hash salt.** Would make cross-project aggregation
   impossible by design.  Rejected — Phase 5.16's value proposition is
   precisely the cross-customer evidence loop.  k-anonymity is the right
   privacy tool for that goal, not unsalvageable hash separation.

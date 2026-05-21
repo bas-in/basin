@@ -30,6 +30,6 @@ pub mod tdigest;
 /// (correlation).  Documented in ADR 0017.
 ///
 /// **Do not rotate.**  This seed is the join key across the entire
-/// OSS → cloud → cross-tenant aggregate pipeline.  Changing it
+/// OSS → cloud → cross-project aggregate pipeline.  Changing it
 /// invalidates every historical shape record in basin-cloud.
 pub const QUERY_SHAPE_SEED: u64 = 0xBA51_4145_7E11_5A95;

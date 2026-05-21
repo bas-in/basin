@@ -9,7 +9,7 @@ tags: [storage, performance, htap]
 # 0016 — HTAP hot tier architecture
 
 - **Status:** Accepted (2026-05-19) — implementation Phase 5.14.C, sub-items C1–C6 in TASK.md.
-- **Tags:** storage, performance, htap, multi-tenant
+- **Tags:** storage, performance, htap, multi-project
 - **Supersedes:** none
 - **Cross-references:** [ADR 0015 (Vortex storage format)](./0015-vortex-storage-format.md), [ADR 0007 (Connection pooling)](./0007-connection-pooling.md), [ADR 0008 (Noisy-neighbor fairness)](./0008-noisy-neighbor-fairness.md), [ADR 0010 (Catalog replication)](./0010-catalog-replication.md)
 
@@ -26,7 +26,7 @@ Single-row UPDATE / DELETE pay full Vortex chunk-rewrite cost via
 
 This is the structural OLTP gap. Columnar object-store files are the
 wrong shape for row-at-a-time random access — and the gap widens
-exactly as a tenant's data grows. Without an architectural answer,
+exactly as a project's data grows. Without an architectural answer,
 Basin remains an OLAP-first system that has to disclose the OLTP
 tax to every customer.
 
@@ -65,22 +65,22 @@ columns, backed by `parking_lot::RwLock<BTreeMap<RowKey, MemRowValue>>`.
   rowid is tombstoned. Document this as a HTAP user requirement:
   declare a PK to get UPDATE p99 in the OLTP target band.
 
-### Multi-tenant isolation
+### Multi-project isolation
 
 Follows the same pattern as `ProjectCounterRegistry`
-(see [the multi-tenant isolation feedback note](../../memory/feedback_multitenant_isolation.md)):
-**shared heavy resource + cheap per-tenant primitive.**
+(see [the multi-project isolation feedback note](../../memory/feedback_multitenant_isolation.md)):
+**shared heavy resource + cheap per-project primitive.**
 
 - **Shared heavy resource:** one `MemTableRegistry` per process. Lazy
   `DashMap<(ProjectId, TableName), Arc<MemTableEntry>>`. Allocation
-  only on first write to a `(project, table)` pair; idle tenants
+  only on first write to a `(project, table)` pair; idle projects
   cost zero memory.
-- **Cheap per-tenant primitive:** per-`MemTableEntry`
+- **Cheap per-project primitive:** per-`MemTableEntry`
   `AtomicU64 bytes_allocated` counter + per-project `Semaphore` for
-  hard-cap back-pressure. No per-tenant thread pool, no per-tenant
+  hard-cap back-pressure. No per-project thread pool, no per-project
   allocator.
 - **Cost:** O(bytes of actual data) + one counter + one semaphore per
-  active project. At 10k inactive tenants, the registry is a 10k-entry
+  active project. At 10k inactive projects, the registry is a 10k-entry
   `DashMap` with zero-byte counters — sub-MB overhead.
 
 ### Memory budgets
@@ -231,13 +231,13 @@ require either:
 
 - One RocksDB instance per `(project, table)` — multiplies file
   descriptors and threads by the table count, violating the
-  multi-tenant isolation constraint (O(bytes), not O(pool)).
-- One shared RocksDB with a key-prefix scheme — makes per-tenant
+  multi-project isolation constraint (O(bytes), not O(pool)).
+- One shared RocksDB with a key-prefix scheme — makes per-project
   memory budgets difficult and introduces noisy-neighbor contention
   on the shared compaction thread.
 
 Plus: C++ FFI build complexity, second WAL conflicts with `basin-wal`,
-shared block cache makes per-tenant accounting hard.
+shared block cache makes per-project accounting hard.
 
 ### sled-backed memtable
 
@@ -271,7 +271,7 @@ scopes + acceptance gates in [`TASK.md`](../../TASK.md) Phase 5.14.C.
 | C2 | Write-path integration (INSERT/UPDATE/DELETE → memtable; tx watermarks; WAL boundary markers) | C1 | 1.5w |
 | C3 | Read-merge path (point lookup probe + range merge + full-scan merge) | C1+C2 | 1.5w |
 | C4 | Flush task (size/age/scan triggers; non-blocking algorithm) | C1+C2+C3 | 2w |
-| C5 | Per-tenant memory budget enforcement (caps + back-pressure + largest-first flush) | C1 | 1w |
+| C5 | Per-project memory budget enforcement (caps + back-pressure + largest-first flush) | C1 | 1w |
 | C6 | Differential harness (all 88 shapes × 3 modes: empty/memtable/split) | C1+C2+C3 | 1w |
 
 ## Risks and open questions

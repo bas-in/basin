@@ -45,6 +45,9 @@ pub mod reserved_schema;
 mod rest;
 mod sequences;
 mod snapshot;
+/// T-053 — per-project usage counters, hourly snapshot task, and cloud metering
+/// HTTP POST to `/internal/v1/metering/counters`.
+pub mod usage;
 mod views;
 
 use std::sync::Arc;
@@ -70,7 +73,7 @@ pub use leases::{
 pub use metadata::{
     CheckConstraint, ColumnStats, CvDef, DataFileRef, ForeignKeyDef, PartitionSpec, Policy,
     PolicyCommand, RefAction, S3Config, SecondaryIndex, TableFileFormat, TableMetadata,
-    TenantMetadata, UniqueConstraint,
+    ProjectMetadata, UniqueConstraint,
 };
 pub use postgres::PostgresCatalog;
 pub use procedures::{ProcedureError, SqlProcedureDef};
@@ -234,30 +237,30 @@ pub trait Catalog: Send + Sync {
         Ok(out)
     }
 
-    /// Persist per-tenant metadata (BYO-bucket config, etc.) for `project`.
+    /// Persist per-project metadata (BYO-bucket config, etc.) for `project`.
     /// Idempotent: a second call with the same project replaces the prior
-    /// value. `None` on `TenantMetadata::byo_bucket` restores the default
+    /// value. `None` on `ProjectMetadata::byo_bucket` restores the default
     /// shared-bucket behaviour. Default impl returns
     /// `Internal("not implemented")` so non-default backends opt in
     /// explicitly.
-    async fn set_tenant_metadata(
+    async fn set_project_metadata(
         &self,
         project: &ProjectId,
-        meta: TenantMetadata,
+        meta: ProjectMetadata,
     ) -> Result<()> {
         let _ = (project, meta);
         Err(basin_common::BasinError::Internal(
-            "set_tenant_metadata not implemented for this catalog backend".into(),
+            "set_project_metadata not implemented for this catalog backend".into(),
         ))
     }
 
-    /// Look up the persisted [`TenantMetadata`] for `project`. Returns
-    /// `TenantMetadata::default()` (i.e. `byo_bucket = None`) when no
+    /// Look up the persisted [`ProjectMetadata`] for `project`. Returns
+    /// `ProjectMetadata::default()` (i.e. `byo_bucket = None`) when no
     /// metadata has been set — meaning "use Basin's shared bucket". Default
-    /// impl: returns `Ok(TenantMetadata::default())`.
-    async fn get_tenant_metadata(&self, project: &ProjectId) -> Result<TenantMetadata> {
+    /// impl: returns `Ok(ProjectMetadata::default())`.
+    async fn get_project_metadata(&self, project: &ProjectId) -> Result<ProjectMetadata> {
         let _ = project;
-        Ok(TenantMetadata::default())
+        Ok(ProjectMetadata::default())
     }
 
     /// Atomic commit: append `files` to the table, producing a new snapshot.

@@ -23,7 +23,7 @@ chrono.workspace = true
 # will need to swap in rustls or native-tls at the connect call site.
 tokio-postgres = { workspace = true, features = ["with-serde_json-1", "with-chrono-0_4"] }
 # Phase 6.P0.B noisy-neighbor fix: connection pool for the catalog. The old
-# `Mutex<Client>` serialised every catalog read across every tenant; a pool
+# `Mutex<Client>` serialised every catalog read across every project; a pool
 # lets concurrent DDL + reads run in parallel. Default pool size 16,
 # overridable via `BASIN_CATALOG_PG_POOL_SIZE`.
 deadpool-postgres = "0.14"
@@ -33,6 +33,10 @@ sqlparser.workspace = true
 # Bitflags for `ReactorOps`. Already in the lock file via several
 # transitive deps.
 bitflags = "2"
+# HTTP client for POSTing metering batches to the cloud ingest endpoint (T-053).
+reqwest.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Mock HTTP server for verifying metering POST body shape + URL (T-053).
+httpmock = "0.7"

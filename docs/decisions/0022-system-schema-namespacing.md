@@ -2,7 +2,7 @@
 title: "ADR 0022 — System-schema namespacing (reserved schemas first-class; user schemas stay flat)"
 nav_section: decisions
 sidebar_position: 22
-summary: "Make the system namespaces (auth, storage, cron, net, realtime, public, pg_catalog, information_schema) real reserved schemas with honest (schema, table) keying + introspection + search_path. User-defined schemas stay flat-aliased to public — projects already own the tenancy/isolation axis, so arbitrary user schemas are a redundant second isolation boundary with ~zero wedge benefit."
+summary: "Make the system namespaces (auth, storage, cron, net, realtime, public, pg_catalog, information_schema) real reserved schemas with honest (schema, table) keying + introspection + search_path. User-defined schemas stay flat-aliased to public — projects already own the project-membership/isolation axis, so arbitrary user schemas are a redundant second isolation boundary with ~zero wedge benefit."
 tags: [catalog, schema, baas, oss, pg-compat]
 ---
 
@@ -33,7 +33,7 @@ namespace to fill the gap between "one flat database" and "separate databases
 you can't join across."
 
 ### How schema usage drifted from intent
-- **Schema-per-tenant multi-tenancy** — emergent, never the design intent.
+- **Schema-per-project multi-project-membership** — emergent, never the design intent.
 - **Logical grouping** (`sales.*`, `billing.*`) — a preference; a naming
   convention (`sales_orders`) is equivalent.
 - **System / extension namespacing** (`pg_catalog`, `information_schema`,
@@ -75,7 +75,7 @@ We will **not** build full Postgres schema isolation for user data. Rationale:
    for — an isolated, owner-scoped namespace inside a shared system — is exactly
    what a Basin **project** is, promoted to a stronger primitive (hard
    storage-prefix isolation, not a soft naming convention). Projects are
-   "schemas done right for the multi-tenant era."
+   "schemas done right for the multi-project era."
 2. **A second isolation axis is a liability, not a feature.** Basin's #1
    invariant is "one leaked row across projects and the project dies." A second
    namespacing axis is a second boundary to get RLS-scoping right against and a
@@ -88,7 +88,7 @@ We will **not** build full Postgres schema isolation for user data. Rationale:
    user schemas not because they're slow but because projects make them
    redundant.)
 4. ADR 0012 already gave up "drop in any legacy PG schema unchanged" — Basin's
-   wedge is new SaaS, where project = tenant and RLS = access control.
+   wedge is new SaaS, where project = project and RLS = access control.
 
 Concretely: a user `CREATE SCHEMA myapp` continues to be accepted and
 **aliased to `public`** (flat). `myapp.t` and `public.t` are the same table.

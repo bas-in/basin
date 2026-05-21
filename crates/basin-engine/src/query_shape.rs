@@ -12,7 +12,7 @@
 //!
 //! The hash is seeded with `basin_sketch::QUERY_SHAPE_SEED` — a fixed constant
 //! documented in ADR 0017.  **Do not change that constant.** It is the join key
-//! across the entire OSS → cloud → cross-tenant aggregate pipeline; rotating it
+//! across the entire OSS → cloud → cross-project aggregate pipeline; rotating it
 //! invalidates every historical shape record in basin-cloud.
 //!
 //! The hash is 64 bits and computed with `xxh3_64_with_seed`, which is
@@ -21,7 +21,7 @@
 //! # Not in scope here
 //! - Registering or persisting hashes (Phase 5.16.B)
 //! - Exporting over OTLP (Phase 5.16.D)
-//! - Per-customer salting (cross-tenant aggregates require a shared key space)
+//! - Per-customer salting (cross-project aggregates require a shared key space)
 
 use datafusion::common::Column;
 use datafusion::logical_expr::{

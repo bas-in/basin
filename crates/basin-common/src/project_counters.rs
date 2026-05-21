@@ -9,7 +9,7 @@
 //!   no allocation, no map walk.
 //! - **Lazy per dimension.** A `(project, cap)` over-cap pair is allocated
 //!   on first observation; idle projects cost zero. Matches the
-//!   `feedback_multitenant_isolation` rule: per-tenant cost is `O(bytes)`.
+//!   `feedback_multitenant_isolation` rule: per-project cost is `O(bytes)`.
 //! - **Snapshot-shaped.** Consumers (basin-cloud OTLP exporter, the
 //!   ops `/metrics` endpoint, dashboards) pull a plain-data snapshot. No
 //!   exporter is wired into this crate — the same surface trivially maps

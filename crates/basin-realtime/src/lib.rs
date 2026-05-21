@@ -265,7 +265,7 @@ impl FilteredReceiver {
 /// and returns immediately. The allocation cost is O(1) regardless of project
 /// or table count.
 ///
-/// # Multi-tenant memory budget (Phase 5.11.R6)
+/// # Multi-project memory budget (Phase 5.11.R6)
 ///
 /// Each [`RealtimeSink`] holds a [`BudgetTracker`] that enforces a
 /// per-project in-flight byte cap (default 16 MiB, configurable via
@@ -276,9 +276,9 @@ impl FilteredReceiver {
 ///    O(1) with no allocation.
 /// 3. On success: broadcast the event and release the bytes (RAII guard).
 /// 4. On `BUFFER_FULL`: drop the event into the optional durable retry log
-///    so no data is lost; skip the broadcast for this tenant only.
+///    so no data is lost; skip the broadcast for this project only.
 ///
-/// Other tenants' ring-buffer slots are unaffected by a noisy tenant's
+/// Other projects' ring-buffer slots are unaffected by a noisy project's
 /// `BUFFER_FULL` rejections.
 #[derive(Clone)]
 pub struct RealtimeSink {
@@ -308,7 +308,7 @@ impl RealtimeSink {
         }
     }
 
-    /// Attach a durable retry log. Events that overflow a tenant's budget
+    /// Attach a durable retry log. Events that overflow a project's budget
     /// are written here instead of being silently dropped.
     pub fn with_retry_log(mut self, retry_log: basin_webhooks::RetryQueue) -> Self {
         self.retry_log = Some(retry_log);

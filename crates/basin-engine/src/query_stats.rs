@@ -22,7 +22,7 @@
 //!                                              (8 log2 row-count buckets)
 //! ```
 //!
-//! **Multi-tenant isolation** (load-bearing rule from `feedback_multitenant_isolation.md`):
+//! **Multi-project isolation** (load-bearing rule from `feedback_multitenant_isolation.md`):
 //!
 //! * The shared registry is a `DashMap` of `ProjectId → ProjectStats`.
 //! * Each `ProjectStats` is a bounded `LruCache` capped at
@@ -830,7 +830,7 @@ mod tests {
     ///   500 shapes × 26 KiB ≈ 13 MiB worst case.
     /// In practice HDR histograms for our bounds are ≈ 1.6 KiB each; we cap at 10 MiB.
     ///
-    /// This verifies the O(bytes) per-tenant cost bound from the
+    /// This verifies the O(bytes) per-project cost bound from the
     /// `feedback_multitenant_isolation` rule.
     #[test]
     fn memory_bound_500_shapes() {

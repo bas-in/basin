@@ -16,7 +16,7 @@ unified nav tree; GitHub renders it for humans browsing `docs/`.
 ## Architecture
 
 - [Basin architecture](architecture.md) — Four-layer design: router, shard owners, WAL service, storage. Reference doc for how the code is laid out.
-- [Multi-project SaaS on Basin](multi-project.md) — Tenancy model and isolation primitives for thousands of projects on one cluster.
+- [Multi-project SaaS on Basin](multi-project.md) — Project-membership model and isolation primitives for thousands of projects on one cluster.
 
 ## SQL
 
@@ -61,8 +61,8 @@ unified nav tree; GitHub renders it for humans browsing `docs/`.
 - [ADR 0020 — WAL transaction markers + replay suppression](decisions/0020-wal-transaction-markers.md) — WAL adopts explicit Begin/Commit/Rollback markers for HTAP memtable integration. Replay discards entries inside rolled-back or crash-interrupted transactions. Pre-marker WAL files replay identically.
 - [ADR 0021 — YAML frontmatter as the docs metadata contract](decisions/0021-docs-frontmatter-yaml.md) — All markdown files under docs/ carry YAML frontmatter with a fixed schema (title, nav_section, sidebar_position, summary, optional version bounds). MDX and sidecar TOML were considered and rejected.
 - [ADR 0021 — Object storage (catalog-backed blobs)](decisions/0021-object-storage.md) — Supabase-style blob storage. Objects are rows in a storage.objects system table, access control reuses the RLS engine, bytes live in the same object_store the engine uses, signed URLs are HMAC over (path, expiry). New basin-blob crate. Cloud builds quota/billing/CDN/image-transforms.
-- [ADR 0022 — System-schema namespacing (reserved schemas first-class; user schemas stay flat)](decisions/0022-system-schema-namespacing.md) — Make the system namespaces (auth, storage, cron, net, realtime, public, pg_catalog, information_schema) real reserved schemas with honest (schema, table) keying + introspection + search_path. User-defined schemas stay flat-aliased to public — projects already own the tenancy/isolation axis, so arbitrary user schemas are a redundant second isolation boundary with ~zero wedge benefit.
-- [ADR 0023 — Lease-based ownership + partition-level routing + heartbeat budgets](decisions/0023-leases-and-partition-routing.md) — Convert per-(project,partition) ownership from a hash on ProjectId into a lease in the catalog Postgres. Stateless replicas + partition-level routing + heartbeat-reconciled budgets fix hot-tenant pinning and multi-instance cap-bypass in one architecture, without a central coordinator service or distributed counters on the hot path. The architectural commitment for Basin's multi-replica scale-out.
+- [ADR 0022 — System-schema namespacing (reserved schemas first-class; user schemas stay flat)](decisions/0022-system-schema-namespacing.md) — Make the system namespaces (auth, storage, cron, net, realtime, public, pg_catalog, information_schema) real reserved schemas with honest (schema, table) keying + introspection + search_path. User-defined schemas stay flat-aliased to public — projects already own the project-membership/isolation axis, so arbitrary user schemas are a redundant second isolation boundary with ~zero wedge benefit.
+- [ADR 0023 — Lease-based ownership + partition-level routing + heartbeat budgets](decisions/0023-leases-and-partition-routing.md) — Convert per-(project,partition) ownership from a hash on ProjectId into a lease in the catalog Postgres. Stateless replicas + partition-level routing + heartbeat-reconciled budgets fix hot-project pinning and multi-instance cap-bypass in one architecture, without a central coordinator service or distributed counters on the hot path. The architectural commitment for Basin's multi-replica scale-out.
 
 ## Meta
 
@@ -72,7 +72,7 @@ unified nav tree; GitHub renders it for humans browsing `docs/`.
 - [basin-cli v0.1 design spec](basin-cli-design.md) — Forward-spec for basin-cli — operator daily-driver Go CLI. Lives in bas-in/basin-cli when that repo is bootstrapped. This is the design contract.
 - [basin-js v0.1 design spec](basin-js-design.md) — Forward-spec for basin-js — TypeScript client SDK. Supabase-shaped API; talks pgwire/REST/WebSocket directly to a Basin engine. MIT-licensed.
 - [WebSocket subscriptions — design spec](websocket-subscription-design.md) — Forward-spec for basin-rest /realtime/v1/subscribe. Tails the change-event primitive (ADR 0012); emits JSON over a multiplexed single-socket protocol. Realtime parity with Supabase.
-- [Phase 0 customer interview script — wedge validation](customer-interview-script.md) — 5-10 founder interviews to validate the Basin wedge (multi-tenant Postgres-compat HTAP) before committing 3-6 months to basin-cloud. Question bank, facilitation guide, scoring rubric, pivot triggers.
+- [Phase 0 customer interview script — wedge validation](customer-interview-script.md) — 5-10 founder interviews to validate the Basin wedge (multi-project Postgres-compat HTAP) before committing 3-6 months to basin-cloud. Question bank, facilitation guide, scoring rubric, pivot triggers.
 
 ## 
 

@@ -80,7 +80,7 @@ const LATENCY_RING_SIZE: usize = 128;
 /// COPY, DELETE) and `class_b_ops_total` covers read requests (GET, HEAD,
 /// LIST). These two are the unit-of-billing for the basin-cloud overage
 /// pricing audit (`docs/audits/2026-05-21-billing-meter-gap.md`); keep them
-/// monotonic and project-scoped so the meter can be aggregated by tenant
+/// monotonic and project-scoped so the meter can be aggregated by project
 /// without per-request log scraping.
 #[derive(Debug)]
 pub struct ProjectCounters {

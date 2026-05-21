@@ -269,7 +269,7 @@ mod tests {
     fn resolve_user_defined_aliases_to_public() {
         assert_eq!(resolve_schema(Some("myapp")).as_str(), "public");
         assert_eq!(resolve_schema(Some("billing")).as_str(), "public");
-        assert_eq!(resolve_schema(Some("tenant_42")).as_str(), "public");
+        assert_eq!(resolve_schema(Some("project_42")).as_str(), "public");
     }
 
     // ── resolve_qualified ─────────────────────────────────────────────────
