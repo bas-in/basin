@@ -4538,30 +4538,75 @@ async fn exec_select(
     // cooperative tokio workers a quiet project's point queries run on. Tests
     // that run without a shard keep the single-await path and behave as
     // before.
+    //
+    // Phase 6.P0.A: statement-level wall-clock timeout (noisy-neighbor P0).
+    // The cost-check (`cost_check.rs`) only bounds single-table SELECTs at
+    // *planning* time; JOIN / sub-query / CTE / cartesian shapes pass through
+    // unchecked and can pin a DataFusion worker thread indefinitely, starving
+    // every other tenant on the runtime. We wrap the *execution* future in
+    // `tokio::time::timeout`: when the deadline elapses the future is dropped,
+    // which drops the DataFusion stream / physical plan and cancels execution
+    // (DataFusion's documented cancellation contract). On the fast path the
+    // deadline is a single comparison set up once — it is NOT a per-row check,
+    // so a normal sub-timeout query sees no latency regression. `None` (env
+    // `BASIN_STATEMENT_TIMEOUT_MS=0`) disables the guard for back-compat.
+    let timeout = crate::session::statement_timeout();
+    let canceled = || {
+        BasinError::query_canceled(match timeout {
+            Some(d) => format!("exceeded BASIN_STATEMENT_TIMEOUT_MS ({} ms)", d.as_millis()),
+            None => "exceeded statement timeout".to_owned(),
+        })
+    };
     let df_batches = if sess.engine.config().shard.is_some() {
         let plan = df
             .create_physical_plan()
             .await
             .map_err(|e| BasinError::internal(format!("create plan: {e}")))?;
         let task_ctx = sess.ctx.task_ctx();
+        // The DataFusion collect runs on its own current-thread runtime inside
+        // a blocking thread, so the *outer* runtime's timer can't observe it.
+        // Apply the timeout INSIDE `block_on` so the inner stream is dropped on
+        // elapse — that both cancels execution and lets the blocking thread
+        // return promptly instead of running on detached. We surface the
+        // elapsed case as a sentinel `Ok(None)` and map it to QueryCanceled.
         let join = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| BasinError::internal(format!("blocking runtime: {e}")))?;
             rt.block_on(async {
-                datafusion::physical_plan::collect(plan, task_ctx)
-                    .await
-                    .map_err(|e| BasinError::internal(format!("execute: {e}")))
+                let fut = datafusion::physical_plan::collect(plan, task_ctx);
+                match timeout {
+                    Some(d) => match tokio::time::timeout(d, fut).await {
+                        Ok(res) => res
+                            .map(Some)
+                            .map_err(|e| BasinError::internal(format!("execute: {e}"))),
+                        Err(_) => Ok(None),
+                    },
+                    None => fut
+                        .await
+                        .map(Some)
+                        .map_err(|e| BasinError::internal(format!("execute: {e}"))),
+                }
             })
         })
         .await
         .map_err(|e| BasinError::internal(format!("spawn_blocking join: {e}")))?;
-        join?
+        match join? {
+            Some(batches) => batches,
+            None => return Err(canceled()),
+        }
     } else {
-        df.collect()
-            .await
-            .map_err(|e| BasinError::internal(format!("execute: {e}")))?
+        let fut = df.collect();
+        match timeout {
+            Some(d) => match tokio::time::timeout(d, fut).await {
+                Ok(res) => res.map_err(|e| BasinError::internal(format!("execute: {e}")))?,
+                Err(_) => return Err(canceled()),
+            },
+            None => fut
+                .await
+                .map_err(|e| BasinError::internal(format!("execute: {e}")))?,
+        }
     };
     let exec_elapsed_ns = exec_start.elapsed().as_nanos() as u64;
 
@@ -6830,6 +6875,117 @@ mod auto_commit_ryow_tests {
 
         let n2 = count_from_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
         assert_eq!(n2, 2, "both rows must be visible after INSERT RETURNING");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6.P0.A — statement-level wall-clock timeout (noisy-neighbor P0)
+// ---------------------------------------------------------------------------
+// Proves: (1) a deliberately slow JOIN/cross-join shape — exactly the family
+// the planning-time cost-check misses — is cancelled at the deadline with
+// SQLSTATE-mappable QueryCanceled; (2) the connection stays usable for the
+// next query; (3) a fast query under the deadline is unaffected; (4)
+// disabling (`timeout = None`, i.e. BASIN_STATEMENT_TIMEOUT_MS=0) restores
+// back-compat (the same slow query completes).
+#[cfg(test)]
+mod statement_timeout_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use basin_catalog::{Catalog, InMemoryCatalog};
+    use basin_common::{BasinError, ProjectId};
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    use crate::session::test_timeout_override;
+    use crate::{Engine, EngineConfig, ExecResult};
+
+    fn make_engine(dir: &TempDir) -> Engine {
+        let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
+            object_store: Arc::new(fs),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+        Engine::new(EngineConfig {
+            storage,
+            catalog,
+            shard: None,
+        })
+    }
+
+    /// Seed a table with `n` rows so a self cross-join is `n^4` output rows —
+    /// astronomically expensive, guaranteed to outrun a millisecond deadline.
+    async fn seed(sess: &crate::ProjectSession, n: i64) {
+        sess.execute("CREATE TABLE big (id BIGINT NOT NULL)")
+            .await
+            .unwrap();
+        let vals: Vec<String> = (0..n).map(|i| format!("({i})")).collect();
+        sess.execute(&format!("INSERT INTO big VALUES {}", vals.join(",")))
+            .await
+            .unwrap();
+    }
+
+    const HOSTILE_JOIN: &str = "SELECT COUNT(*) FROM big a, big b, big c, big d";
+
+    #[tokio::test]
+    async fn slow_join_is_canceled_and_connection_survives() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        seed(&sess, 80).await; // 80^4 = ~41M output rows for the COUNT
+
+        // 1 ms deadline: the cross-join cannot finish in time.
+        let _guard = test_timeout_override::install(Some(Duration::from_millis(1)));
+        let err = sess
+            .execute(HOSTILE_JOIN)
+            .await
+            .expect_err("hostile cross-join must be cancelled at the deadline");
+        assert!(
+            matches!(err, BasinError::QueryCanceled(_)),
+            "expected QueryCanceled (→ SQLSTATE 57014), got {err:?}"
+        );
+
+        // The connection must remain usable: a fast query on the same session
+        // succeeds immediately after the cancellation.
+        let res = sess.execute("SELECT 1").await.expect("session still usable");
+        assert!(matches!(res, ExecResult::Rows { .. }));
+    }
+
+    #[tokio::test]
+    async fn fast_query_under_deadline_is_unaffected() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        seed(&sess, 3).await;
+
+        // Generous deadline; a trivial query must complete normally.
+        let _guard = test_timeout_override::install(Some(Duration::from_secs(30)));
+        let res = sess
+            .execute("SELECT COUNT(*) FROM big")
+            .await
+            .expect("fast query under the deadline must succeed");
+        assert!(matches!(res, ExecResult::Rows { .. }));
+    }
+
+    #[tokio::test]
+    async fn disabled_timeout_runs_unbounded() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        seed(&sess, 6).await; // 6^4 = 1296 rows — small but JOIN-shaped
+
+        // None == BASIN_STATEMENT_TIMEOUT_MS=0: back-compat, no cancellation.
+        // The same JOIN shape that gets cancelled under a tight deadline must
+        // run to completion when the guard is disabled.
+        let _guard = test_timeout_override::install(None);
+        let res = sess
+            .execute(HOSTILE_JOIN)
+            .await
+            .expect("disabled timeout must let the (small) join complete");
+        assert!(matches!(res, ExecResult::Rows { .. }));
     }
 }
 

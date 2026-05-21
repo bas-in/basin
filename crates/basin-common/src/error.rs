@@ -66,6 +66,14 @@ pub enum BasinError {
     #[error("query cost exceeded: {0}")]
     QueryCostExceeded(String),
 
+    /// Statement exceeded its wall-clock budget and was cancelled. The router
+    /// maps this to Postgres SQLSTATE `57014` (`query_canceled`) — exactly the
+    /// code PostgreSQL raises when `statement_timeout` fires — so drivers
+    /// surface a distinct, non-retryable-without-rework exception class.
+    /// Configured via `BASIN_STATEMENT_TIMEOUT_MS`; `0` disables the timeout.
+    #[error("canceling statement due to statement timeout: {0}")]
+    QueryCanceled(String),
+
     /// User asked for a feature that's known but not yet implemented (e.g.
     /// `GENERATED ALWAYS AS ... VIRTUAL`). The router maps this to
     /// Postgres SQLSTATE `0A000` (`feature_not_supported`) so drivers can
@@ -125,6 +133,9 @@ impl BasinError {
     }
     pub fn feature_not_supported(msg: impl Into<String>) -> Self {
         Self::FeatureNotSupported(msg.into())
+    }
+    pub fn query_canceled(msg: impl Into<String>) -> Self {
+        Self::QueryCanceled(msg.into())
     }
 
     /// Convenience for the load-bearing safety check. The router and shard

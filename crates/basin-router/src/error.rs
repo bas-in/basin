@@ -50,6 +50,7 @@ fn classify(err: &BasinError) -> (&'static str, &'static str) {
         BasinError::NotFound(_) => ("ERROR", "42704"), // undefined_object
         BasinError::CommitConflict(_) => ("ERROR", "40001"), // serialization_failure
         BasinError::QueryCostExceeded(_) => ("ERROR", "54000"), // program_limit_exceeded
+        BasinError::QueryCanceled(_) => ("ERROR", "57014"),     // query_canceled
         BasinError::FeatureNotSupported(_) => ("ERROR", "0A000"), // feature_not_supported
         BasinError::UniqueViolation(_) => ("ERROR", "23505"), // unique_violation
         BasinError::CheckViolation(_) => ("ERROR", "23514"), // check_violation
@@ -84,5 +85,15 @@ mod tests {
     fn classifies_not_found() {
         let er = error_response(&BasinError::NotFound("table x".into()));
         assert_eq!(er.fields[1], (b'C', "42704".to_owned()));
+    }
+
+    #[test]
+    fn classifies_query_canceled() {
+        // Statement-timeout cancellation must surface as SQLSTATE 57014
+        // (query_canceled) — the exact code PostgreSQL raises for
+        // statement_timeout — so drivers map it to a dedicated class.
+        let er = error_response(&BasinError::QueryCanceled("timed out".into()));
+        assert_eq!(er.fields[0], (b'S', "ERROR".to_owned()));
+        assert_eq!(er.fields[1], (b'C', "57014".to_owned()));
     }
 }

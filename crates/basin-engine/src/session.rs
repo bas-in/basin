@@ -22,7 +22,7 @@
 
 use crate::pg_ast::ObjectNamePartExt;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::AuthContext;
 
@@ -60,6 +60,81 @@ use vortex::VortexSessionDefault as _;
 /// purely an internal protocol between `basin-engine` and DataFusion; it is
 /// never exposed to clients.
 pub(crate) const BASIN_URL_BASE: &str = "basin://engine/";
+
+/// Default statement timeout (milliseconds) when `BASIN_STATEMENT_TIMEOUT_MS`
+/// is unset. 30 s is generous for analytic workloads yet cheap insurance
+/// against a hostile cartesian self-join or an ill-bounded recursive CTE
+/// pinning a DataFusion worker thread (noisy-neighbor P0, Phase 6.P0.A).
+pub(crate) const DEFAULT_STATEMENT_TIMEOUT_MS: u64 = 30_000;
+
+/// Process-wide statement wall-clock budget. `None` = disabled (back-compat,
+/// `BASIN_STATEMENT_TIMEOUT_MS=0`); `Some(d)` = cancel any statement still
+/// executing after `d`. Cached in a `OnceLock` so a query never pays a getenv
+/// on the hot path — the deadline is read once and compared, never per-row.
+pub(crate) fn statement_timeout() -> Option<std::time::Duration> {
+    #[cfg(test)]
+    if let Some(over) = test_timeout_override::get() {
+        return over;
+    }
+    static CACHED: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        parse_statement_timeout(std::env::var("BASIN_STATEMENT_TIMEOUT_MS").ok().as_deref())
+    })
+}
+
+/// Test-only deterministic override for [`statement_timeout`]. The production
+/// path caches the env once in a `OnceLock`, so tests cannot exercise the
+/// cancellation path by mutating the env (it races, and the `OnceLock` would
+/// have already latched). Instead a test installs a thread-local override for
+/// the duration of its body. Never compiled into release builds.
+#[cfg(test)]
+pub(crate) mod test_timeout_override {
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    thread_local! {
+        // Outer Option: is an override installed? Inner Option: the timeout
+        // value an installed override maps to (None = disabled).
+        static OVERRIDE: Cell<Option<Option<Duration>>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn get() -> Option<Option<Duration>> {
+        OVERRIDE.with(|c| c.get())
+    }
+
+    /// Install `value` as the effective statement timeout for the current
+    /// thread; the returned guard restores the previous state on drop.
+    pub(crate) fn install(value: Option<Duration>) -> Guard {
+        let prev = OVERRIDE.with(|c| c.replace(Some(value)));
+        Guard { prev }
+    }
+
+    pub(crate) struct Guard {
+        prev: Option<Option<Duration>>,
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            OVERRIDE.with(|c| c.set(self.prev));
+        }
+    }
+}
+
+/// Pure parse of `BASIN_STATEMENT_TIMEOUT_MS`. Pulled out of
+/// [`statement_timeout`] so unit tests pass strings directly instead of
+/// mutating the process env (which races under `cargo test`'s parallel
+/// runner). Unset → default; `0` → disabled; non-numeric / empty → default.
+pub(crate) fn parse_statement_timeout(raw: Option<&str>) -> Option<std::time::Duration> {
+    let ms = match raw.map(str::trim) {
+        None | Some("") => DEFAULT_STATEMENT_TIMEOUT_MS,
+        Some(s) => s.parse::<u64>().unwrap_or(DEFAULT_STATEMENT_TIMEOUT_MS),
+    };
+    if ms == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_millis(ms))
+    }
+}
 
 /// Build the shared stateless UDF registry once at `Engine::new` time.
 ///
@@ -1526,6 +1601,43 @@ fn parse_timestamp_string_for_pruning(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn statement_timeout_parse_unset_uses_default() {
+        assert_eq!(
+            parse_statement_timeout(None),
+            Some(Duration::from_millis(DEFAULT_STATEMENT_TIMEOUT_MS))
+        );
+        assert_eq!(
+            parse_statement_timeout(Some("")),
+            Some(Duration::from_millis(DEFAULT_STATEMENT_TIMEOUT_MS))
+        );
+        assert_eq!(
+            parse_statement_timeout(Some("   ")),
+            Some(Duration::from_millis(DEFAULT_STATEMENT_TIMEOUT_MS))
+        );
+    }
+
+    #[test]
+    fn statement_timeout_parse_zero_disables() {
+        assert_eq!(parse_statement_timeout(Some("0")), None);
+        assert_eq!(parse_statement_timeout(Some(" 0 ")), None);
+    }
+
+    #[test]
+    fn statement_timeout_parse_value() {
+        assert_eq!(
+            parse_statement_timeout(Some("500")),
+            Some(Duration::from_millis(500))
+        );
+        // Non-numeric falls back to the default rather than disabling — a typo
+        // must never silently remove the guard.
+        assert_eq!(
+            parse_statement_timeout(Some("abc")),
+            Some(Duration::from_millis(DEFAULT_STATEMENT_TIMEOUT_MS))
+        );
+    }
 
     /// Timing micro-bench: measures the SessionContext construction + UDF
     /// registration phase in isolation (the primary target of the stateless-UDF-cache

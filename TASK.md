@@ -1873,7 +1873,7 @@ multi-replica production deployment.
 Independent of 6.X; ship immediately while 6.X is being built. Each closes
 an audit P0 single-instance gap on its own.
 
-- [ ] **6.P0.A — Statement-level wall-clock + CPU timeout** in the executor
+- [x] **6.P0.A — Statement-level wall-clock + CPU timeout** in the executor
       hot path. `BASIN_STATEMENT_TIMEOUT_MS` default (e.g. 30 000). Closes
       "any hostile/buggy query runs forever" today. Files:
       `crates/basin-engine/src/{executor,session}.rs`. Test: long-running
