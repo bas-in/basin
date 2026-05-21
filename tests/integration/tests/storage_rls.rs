@@ -422,8 +422,10 @@ async fn rls_owner_eq_auth_uid_filters_list_and_download() {
     println!("[storage_rls] owner=auth.uid() filter PASS: alice sees 1, bob sees 1, cross-access denied");
 }
 
-/// Public bucket: reads bypass RLS — any authenticated user can list and
-/// download regardless of the owner policy.
+/// Public bucket: authenticated reads bypass the owner policy; anonymous
+/// reads via the `/storage/v1/object/public/...` alias path are gated by
+/// object-level RLS like any other read (since the 6.SEC.P1 fix in
+/// `f1ed678`) and require an explicit `anon`-role policy to permit them.
 #[tokio::test]
 async fn rls_public_bucket_bypasses_rls_for_reads() {
     let Some((running, svc, auth, mailer, _guard)) = try_serve().await else {
@@ -500,7 +502,33 @@ async fn rls_public_bucket_bypasses_rls_for_reads() {
         items.len()
     );
 
-    // Bob downloads from the public route (no JWT) — should succeed.
+    // Anonymous (no JWT) download of the public-bucket alias is RLS-gated
+    // since 6.SEC.P1 (`f1ed678`). With only an `OwnerEqAuthUid` policy on
+    // the bucket and no `anon`-role permit, the anonymous request is denied.
+    let r = raw(
+        addr,
+        "GET",
+        &format!("/storage/v1/object/public/{project}/public-rls/img.png"),
+        &[],
+        None,
+    )
+    .await;
+    assert!(
+        r.status == 401 || r.status == 403,
+        "anon download of RLS-on public bucket without anon policy should be 401/403; got {}",
+        r.status
+    );
+
+    // Operator opt-in: add an `anon`-role permit policy → anon download works.
+    svc.blob_store().add_object_policy(
+        &project,
+        ObjectPolicy {
+            name: "anon_read_ok".into(),
+            command: ObjectPolicyCommand::Select,
+            applies_to_roles: vec!["anon".into()],
+            using: ObjectUsing::True,
+        },
+    );
     let r = raw(
         addr,
         "GET",
@@ -511,12 +539,12 @@ async fn rls_public_bucket_bypasses_rls_for_reads() {
     .await;
     assert_eq!(
         r.status, 200,
-        "public object download without JWT should be 200; got {}",
+        "with explicit anon-permit policy, public download should be 200; got {}",
         r.status
     );
     assert_eq!(r.body, b"\x89PNG");
 
-    println!("[storage_rls] public-bucket bypass PASS: bob sees alice's object, no-JWT public route works");
+    println!("[storage_rls] public-bucket auth-bypass + anon-RLS-gated PASS");
 }
 
 /// Cross-project isolation: objects uploaded in project-A are invisible from
