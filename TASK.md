@@ -1340,7 +1340,7 @@ implementation task flips a slice of the harness green.
       weighting by document section (A/B/C/D). Files:
       `crates/basin-engine/src/operators/fts_match.rs` (new).
       Acceptance: @@ semantics + ranking slice of 5.20.A flips green.
-- [~] **5.20.E — GIN index on `tsvector`** (~1 week). Reuses the
+- [x] **5.20.E — GIN index on `tsvector`** (~1 week). Reuses the
       GIN infrastructure from 5.19. Posting lists per lexeme;
       probe at `@@` query time. Files:
       `crates/basin-storage/src/index/gin_tsvector.rs` (new).

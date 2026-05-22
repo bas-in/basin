@@ -1005,3 +1005,21 @@ file holds candidate rows → nothing to prune. A real ≥10× win needs a
 high-selectivity (<5%) test + a larger/raised posting-entry cap. Test-tuning
 follow-up. The same prune pattern now generalizes to tsvector-GIN (5.20.E) and
 interval (5.24.D) when wanted.
+
+---
+
+## 2026-05-22 — tsvector-GIN end-to-end wiring (5.20.E); 2/3 deferred index-wirings done
+
+`21d8a6e` — generalized the JSONB-GIN scan-prune pattern to FTS: (1) populate
+`GinTsvectorRegistry` per-row on tsvector-column inserts (`maintain_gin_fts_index_on_insert`)
++ `mark_file_indexed`; CREATE INDEX auto-assigns `tsvector_ops` opclass for tsvector
+columns; (2) `detect_tsvector_match` probes `col @@ to_tsquery/plainto/phraseto/
+websearch` on a GIN tsvector column; (3) `apply_gin_fts_pruning_for_query` prunes the
+ListingTable to candidate files — **same completeness guard** (indexed_files ⊇
+live_files, eviction wipes the marker, else full scan). FTS differential stays green
+(fts_harness 5/5, fts_stubs 20/20, noop 42/42, smoke_pgx, insert). **5.20.E done.**
+Perf/latency gate moot (no fts_indexed_latency test; small per-session data won't
+prune). Cloud sibling: `f248133` T-158 (hickory-resolver DNS in backend-rs).
+
+Index-scan-wiring trilogy: JSONB-GIN ✅ (85d156a), tsvector-GIN ✅ (21d8a6e),
+interval/range (5.24.D) remains — same template.
