@@ -213,54 +213,17 @@ debug = 1
 lto = "thin"
 
 # bench-fast: faster bench-build profile for benchmark/run/_setup.sh.
-#
-# Inherits from release and keeps release's panic strategy (unwind), so the
-# entire dependency tree (DataFusion, Arrow, tokio, …) is byte-identical to a
-# release dep build — no panic-strategy-induced dep duplication, and the
-# libtest harness keeps working unchanged.  ONLY the basin-integration-tests
-# package (the 81-binary blowup) gets the cheaper codegen knobs below.
-#
-# Key levers vs. plain release, applied ONLY to basin-integration-tests:
-#   opt-level = 2  — still vectorises + inlines hot paths; avoids the
-#                    aggressive global-value-numbering / unrolling passes that
-#                    dominate opt-level = 3 compile time (≈2–3× faster codegen
-#                    for large monomorphised crates).  Benchmark workloads run
-#                    inside the engine/storage deps (built at opt-3 via the
-#                    inherited release profile), so the measured numbers are
-#                    governed by opt-3 dep code, NOT the opt-2 test glue.
-#   codegen-units = 256 — splits each binary's unique code into up to 256
-#                    parallel LLVM modules; each is far smaller so LLVM
-#                    finishes in seconds rather than minutes per binary.  At 81
-#                    binaries this is the single biggest wall-clock lever.
-#   debug = 0      — no debuginfo (already the release setting for this pkg);
-#                    combined with strip shrinks each binary so the link is
-#                    far faster.
-#   strip = "symbols" — strip the symbol table after link.
-#   incremental = false — consistent with the workspace .cargo/config.toml
-#                    default; avoids stale incremental state masking failures.
-#
-# Benchmark-validity contract: every measured code path (point-select, scan,
-# bulk-insert, …) lives in basin-engine / basin-storage / DataFusion, which
-# bench-fast builds at the inherited release opt-level = 3.  Only the thin test
-# driver + JSON emitter in basin-integration-tests drops to opt-2, and that
-# code is not on any timed hot path.  The 28× perf gate numbers (Phase 5.24.D)
-# are therefore preserved.
+# Inherits from release so deps (DataFusion/Arrow/tokio/…) stay byte-identical
+# to release (opt-3, valid bench measurement). Only basin-integration-tests
+# gets cheaper codegen below (the 81-binary blowup).
 [profile.bench-fast]
 inherits = "release"
-# Profile-wide debug=0 (overrides release's debug=1 default for deps).  Each
-# bench binary statically links the full dep tree; release's debug=1 leaves
-# line-table sections in every dep .rlib that the linker then has to copy +
-# relocate into all 81 test binaries.  Setting debug=0 across the profile
-# shrinks every dep .rlib (and the final binary) and cuts the per-binary
-# link wall-clock by a large factor — the dominant cost when building 81
-# binaries that each link the same ~150 MB of static dep code.  Stack
-# traces from test failures lose file:line, but bench tests already have
-# tracing-based failure output (`tracing-subscriber`) and the build is
-# infrequently used for live debugging.
-debug = 0
-strip = "symbols"
 
+# Per-package overrides — ONLY basin-integration-tests gets cheaper codegen.
 [profile.bench-fast.package.basin-integration-tests]
 opt-level = 2
 codegen-units = 256
+debug = 0
+strip = "symbols"
 incremental = false
+
