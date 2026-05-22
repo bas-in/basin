@@ -2358,7 +2358,7 @@ this OSS repo; 5.15.E–5.15.I land in `basin-cloud` (separate repo).
 - [x] **5.15.C** Top-level docs index (shipped `2ce0e7c`; 38 docs across
       8 nav_sections; `scripts/build-docs-index.sh` + Python helper
       regenerates from frontmatter; `docs-index` CI job blocks drift).
-- [ ] **5.15.D** Stub repository skeletons for `basin-js` and
+- [x] **5.15.D** Stub repository skeletons for `basin-js` and
       `basin-cli` — even before either ships code, set up their
       `docs/` folder with placeholder frontmatter so basin-cloud's
       fetcher has a target. Files: separate repos (not this one).
