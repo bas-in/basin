@@ -6,6 +6,25 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-22 — 5.18.C completed (user reversed the defer): system tables on reserved schemas, security-safe
+
+Earlier this session 5.18.C was deferred ("needs engine CREATE SCHEMA"). The user corrected that
+the defer-reasoning conflated two ADR-0022 decisions: **user `CREATE SCHEMA` = WON'T-DO** (aliased
+to public), but **system schemas = MAKE-REAL** (a closed reserved enum) — a v0.1 commitment, not a
+v0.2 monster. So we completed it (`140bfe7`).
+
+Mechanism (security-critical): added `Engine::open_system_session` carrying an `is_system` flag.
+The shipped P1 guard `guard_reserved_schema_for_user_ddl` (SQLSTATE 42501) is **bypassed ONLY** on
+system sessions; all user-facing `open_session*` pass `is_system: false`, so user SQL still cannot
+touch reserved schemas. cron/net/auth `migrate()` now emit reserved-schema-qualified DDL via the
+system path; `InMemoryCatalog` resolves bare names across schemas (public-first). **`reserved_schema_ddl_guard`
+stays 14/14** — verified the user guard is intact, the internal path is unreachable from user SQL.
+basin-engine 1194, cron/net/catalog/noop/schema_e2e/info_schema all green; `cargo build --workspace` green.
+
+Note: this makes audit finding **P2-5** ("reserved-schema DDL not gated by is_admin") effectively
+**superseded** — reserved-schema DDL is now system-internal only, stricter than is_admin (no user,
+admin or not, gets it via SQL). The security-fix wave should close P2-5 on that basis.
+
 ## 2026-05-22 — Wave 6 (5.19.B) + STOP: autonomous loop reached its stop condition
 
 Final solo agent closed **5.19.B** (`4628acc`): the `CREATE INDEX … USING gin` parser/executor/InMemoryCatalog
