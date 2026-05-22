@@ -18,6 +18,7 @@ use axum::http::header::{HeaderName, AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, Method};
 use axum::routing::{any, get, post, Router};
 use basin_auth::Claims;
+use basin_blob::signing::BlobSigningSecret;
 use basin_blob::store::{BlobCatalog, BlobStore, InMemoryBlobCatalog};
 use basin_blob::PostgresBlobCatalog;
 use basin_common::Result;
@@ -62,6 +63,11 @@ pub(crate) struct Inner {
     /// not parse the bytes; a downstream `FunctionInvoker` impl is what
     /// hands them to `basin_fn::HandlerHarness::new`.
     pub(crate) function_registry: admin_fn_routes::FunctionRegistry,
+    /// P2-1: dedicated rotatable HMAC-SHA256 secret for blob signed-URL
+    /// tokens. Kept separate from the JWT secret so each can be rotated
+    /// independently. Seeded from the JWT secret at startup; rotated via
+    /// `POST /admin/v1/storage/signing-key/rotate`.
+    pub(crate) blob_signing_secret: Arc<BlobSigningSecret>,
 }
 
 /// Env var holding the Postgres connection string for the durable blob
@@ -128,12 +134,20 @@ impl Inner {
         let blob_obj_store = cfg.engine.config().storage.object_store_handle();
         let blob_store = BlobStore::new(Arc::new(blob_catalog), blob_obj_store, None);
 
+        // P2-1: seed the blob signing secret from the JWT secret. This
+        // gives a non-trivial initial key without requiring a new config
+        // field. The key is immediately rotatable via the admin endpoint.
+        let blob_signing_secret = Arc::new(BlobSigningSecret::new(
+            cfg.auth.signing_secret(),
+        ));
+
         Self {
             rate_limiter: basin_auth::rate_limit::PerKey::per_minute(rate, "rest_per_project"),
             blob_store,
             cfg,
             slice_gate: None,
             function_registry: admin_fn_routes::FunctionRegistry::new(),
+            blob_signing_secret,
         }
     }
 
@@ -251,6 +265,11 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
         .route(
             "/admin/v1/projects/:project_id/byo-bucket",
             post(admin_routes::register_byo_bucket),
+        )
+        // P2-1: blob signing-key rotation (admin-gated).
+        .route(
+            "/admin/v1/storage/signing-key/rotate",
+            post(admin_routes::rotate_blob_signing_key),
         )
         // T-078 / T-079 / T-080 / T-081: basin-fn control API. The Wasm
         // bytes flow through this surface as opaque blobs; an out-of-process

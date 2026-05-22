@@ -19,6 +19,10 @@ use basin_catalog::{S3Config, ProjectMetadata};
 use basin_common::ProjectId;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use hex;
+
+// P2-1: new key length requirement for blob signing key rotation.
+const BLOB_SIGNING_KEY_MIN_BYTES: usize = 32;
 
 use crate::errors::ApiError;
 use crate::server::{authorize, Inner};
@@ -218,6 +222,60 @@ pub(crate) struct ByoBucketRequest {
     /// Defaults to `false` (virtual-hosted, the AWS default).
     #[serde(default)]
     pub force_path_style: bool,
+}
+
+// ---------------------------------------------------------------------------
+// P2-1: blob signing-key rotation
+// ---------------------------------------------------------------------------
+
+/// Body for `POST /admin/v1/storage/signing-key/rotate`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct RotateSigningKeyRequest {
+    /// The new raw signing key bytes (hex-encoded). Must be at least 32 bytes
+    /// (64 hex characters) of high-entropy random material.
+    pub new_key_hex: String,
+}
+
+/// `POST /admin/v1/storage/signing-key/rotate` — replace the active blob
+/// signing key (P2-1). Requires `is_admin: true`.
+///
+/// After this call:
+/// - All previously-issued signed URLs become invalid immediately.
+/// - New signed URLs are minted with the new key.
+///
+/// # Request body
+///
+/// ```json
+/// { "new_key_hex": "<at least 64 hex chars of random material>" }
+/// ```
+///
+/// # Response
+///
+/// `204 No Content` on success.
+#[axum::debug_handler]
+pub(crate) async fn rotate_blob_signing_key(
+    State(state): State<Arc<Inner>>,
+    headers: HeaderMap,
+    Json(req): Json<RotateSigningKeyRequest>,
+) -> Result<Response, ApiError> {
+    let claims = authorize(&state, &headers).await?;
+    require_admin(&claims)?;
+
+    let new_key = hex::decode(&req.new_key_hex)
+        .map_err(|_| ApiError::invalid("new_key_hex: invalid hex encoding"))?;
+
+    if new_key.len() < BLOB_SIGNING_KEY_MIN_BYTES {
+        return Err(ApiError::invalid(format!(
+            "new_key_hex: decoded key must be at least {BLOB_SIGNING_KEY_MIN_BYTES} bytes \
+             ({} hex chars); got {} bytes",
+            BLOB_SIGNING_KEY_MIN_BYTES * 2,
+            new_key.len(),
+        )));
+    }
+
+    state.blob_signing_secret.rotate(&new_key);
+
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// `POST /admin/v1/projects/:project_id/byo-bucket` — register a customer-

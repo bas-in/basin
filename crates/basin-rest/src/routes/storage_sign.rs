@@ -20,8 +20,9 @@
 //! <project_id>\n<bucket>\n<path>\n<expires_unix_secs>
 //! ```
 //!
-//! The key is the server's JWT secret (`AuthService::signing_secret()`), so no
-//! additional secret material needs to be provisioned.
+//! The key is a dedicated `BlobSigningSecret` held in the server state
+//! (P2-1), rotatable independently of the JWT secret via
+//! `POST /admin/v1/storage/signing-key/rotate`.
 //!
 //! The token is hex-encoded and travels as a `?token=<hex>&expires=<ts>`
 //! query-string pair on the download URL.
@@ -41,15 +42,10 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::Utc;
-use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
-use subtle::ConstantTimeEq;
 
 use crate::errors::ApiError;
 use crate::server::{authorize, Inner};
-
-type HmacSha256 = Hmac<Sha256>;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -89,32 +85,6 @@ pub(crate) struct SignedDownloadQuery {
 }
 
 // ---------------------------------------------------------------------------
-// HMAC helpers
-// ---------------------------------------------------------------------------
-
-/// Compute HMAC-SHA256 over the canonical `(project, bucket, path, expiry)` tuple.
-fn compute_mac(secret: &[u8], project: &str, bucket: &str, path: &str, expires: i64) -> Vec<u8> {
-    let mut mac =
-        HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
-    mac.update(project.as_bytes());
-    mac.update(b"\n");
-    mac.update(bucket.as_bytes());
-    mac.update(b"\n");
-    mac.update(path.as_bytes());
-    mac.update(b"\n");
-    mac.update(expires.to_string().as_bytes());
-    mac.finalize().into_bytes().to_vec()
-}
-
-/// Constant-time comparison of two byte slices.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.ct_eq(b).into()
-}
-
-// ---------------------------------------------------------------------------
 // Mint handler
 // ---------------------------------------------------------------------------
 
@@ -142,9 +112,8 @@ pub(crate) async fn sign_object(
     let expires_dt = chrono::DateTime::from_timestamp(expires_ts, 0)
         .ok_or_else(|| ApiError::internal("timestamp overflow"))?;
 
-    let secret = state.cfg.auth.signing_secret();
     let project_str = project.to_string();
-    let mac_bytes = compute_mac(secret, &project_str, &bucket, &path, expires_ts);
+    let mac_bytes = state.blob_signing_secret.compute_mac(&project_str, &bucket, &path, expires_ts);
     let token_hex = hex::encode(&mac_bytes);
 
     // Build the signed URL. The project ID is embedded in the path so the
@@ -189,13 +158,11 @@ pub(crate) async fn download_signed_object(
         return Err(ApiError::forbidden("signed URL has expired"));
     }
 
-    // Verify MAC — constant-time.
-    let secret = state.cfg.auth.signing_secret();
-    let expected = compute_mac(secret, &project_str, &bucket, &path, q.expires);
+    // Verify MAC — constant-time via BlobSigningSecret (P2-1).
     let provided = hex::decode(&q.token)
         .map_err(|_| ApiError::forbidden("invalid token encoding"))?;
 
-    if !ct_eq(&expected, &provided) {
+    if !state.blob_signing_secret.verify_mac(&project_str, &bucket, &path, q.expires, &provided) {
         return Err(ApiError::forbidden("invalid or tampered signed URL"));
     }
 
@@ -227,66 +194,105 @@ pub(crate) async fn download_signed_object(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use basin_blob::signing::BlobSigningSecret;
 
-    const SECRET: &[u8] = b"test-secret-32-bytes-long-enough!";
+    const SECRET_A: &[u8] = b"test-secret-32-bytes-long-enough!";
+    const SECRET_B: &[u8] = b"rotated-secret-32-bytes-or-more!!";
+
+    fn make_secret() -> BlobSigningSecret {
+        BlobSigningSecret::new(SECRET_A)
+    }
 
     #[test]
     fn mac_round_trip() {
-        let mac1 = compute_mac(SECRET, "proj1", "bucket", "path/to/file.txt", 9999999);
-        let mac2 = compute_mac(SECRET, "proj1", "bucket", "path/to/file.txt", 9999999);
+        let s = make_secret();
+        let mac1 = s.compute_mac("proj1", "bucket", "path/to/file.txt", 9999999);
+        let mac2 = s.compute_mac("proj1", "bucket", "path/to/file.txt", 9999999);
         assert_eq!(mac1, mac2, "deterministic");
     }
 
     #[test]
     fn mac_differs_on_project_change() {
-        let mac1 = compute_mac(SECRET, "proj1", "bucket", "file.txt", 9999);
-        let mac2 = compute_mac(SECRET, "proj2", "bucket", "file.txt", 9999);
+        let s = make_secret();
+        let mac1 = s.compute_mac("proj1", "bucket", "file.txt", 9999);
+        let mac2 = s.compute_mac("proj2", "bucket", "file.txt", 9999);
         assert_ne!(mac1, mac2);
     }
 
     #[test]
     fn mac_differs_on_path_change() {
-        let mac1 = compute_mac(SECRET, "proj", "bucket", "a.txt", 9999);
-        let mac2 = compute_mac(SECRET, "proj", "bucket", "b.txt", 9999);
+        let s = make_secret();
+        let mac1 = s.compute_mac("proj", "bucket", "a.txt", 9999);
+        let mac2 = s.compute_mac("proj", "bucket", "b.txt", 9999);
         assert_ne!(mac1, mac2);
     }
 
     #[test]
     fn mac_differs_on_expiry_change() {
-        let mac1 = compute_mac(SECRET, "proj", "bucket", "file.txt", 1000);
-        let mac2 = compute_mac(SECRET, "proj", "bucket", "file.txt", 1001);
+        let s = make_secret();
+        let mac1 = s.compute_mac("proj", "bucket", "file.txt", 1000);
+        let mac2 = s.compute_mac("proj", "bucket", "file.txt", 1001);
         assert_ne!(mac1, mac2);
     }
 
     #[test]
-    fn ct_eq_same_bytes() {
-        assert!(ct_eq(b"hello", b"hello"));
-    }
-
-    #[test]
-    fn ct_eq_different_bytes() {
-        assert!(!ct_eq(b"hello", b"world"));
-    }
-
-    #[test]
-    fn ct_eq_different_lengths() {
-        assert!(!ct_eq(b"hi", b"hello"));
+    fn verify_round_trip() {
+        let s = make_secret();
+        let mac = s.compute_mac("proj", "bucket", "file.txt", 9999);
+        assert!(s.verify_mac("proj", "bucket", "file.txt", 9999, &mac));
     }
 
     #[test]
     fn hex_encode_decode_round_trip() {
-        let mac = compute_mac(SECRET, "p", "b", "f", 42);
+        let s = make_secret();
+        let mac = s.compute_mac("p", "b", "f", 42);
         let encoded = hex::encode(&mac);
         let decoded = hex::decode(&encoded).unwrap();
         assert_eq!(mac, decoded);
     }
 
     #[test]
-    fn tampered_token_fails_ct_eq() {
-        let mac = compute_mac(SECRET, "proj", "bucket", "file.txt", 9999);
+    fn tampered_token_fails_verify() {
+        let s = make_secret();
+        let mac = s.compute_mac("proj", "bucket", "file.txt", 9999);
         let mut tampered = mac.clone();
         tampered[0] ^= 0xFF;
-        assert!(!ct_eq(&mac, &tampered));
+        assert!(!s.verify_mac("proj", "bucket", "file.txt", 9999, &tampered));
+    }
+
+    // ── P2-1 rotation ─────────────────────────────────────────────────────
+
+    /// Token minted before rotation must fail verification after rotation.
+    #[test]
+    fn rotation_invalidates_old_signed_url_token() {
+        let s = make_secret();
+
+        // Mint a token (simulating a signed URL being issued).
+        let old_mac = s.compute_mac("proj", "my-bucket", "photos/cat.jpg", 9_999_999);
+        assert!(
+            s.verify_mac("proj", "my-bucket", "photos/cat.jpg", 9_999_999, &old_mac),
+            "token must verify before rotation"
+        );
+
+        // Rotate to a new key — old URLs are now invalid.
+        s.rotate(SECRET_B);
+
+        assert!(
+            !s.verify_mac("proj", "my-bucket", "photos/cat.jpg", 9_999_999, &old_mac),
+            "token minted before rotation must be rejected after rotation (P2-1)"
+        );
+    }
+
+    /// A freshly-signed URL (minted after rotation) must verify successfully.
+    #[test]
+    fn freshly_signed_url_verifies_after_rotation() {
+        let s = make_secret();
+        s.rotate(SECRET_B);
+
+        let new_mac = s.compute_mac("proj", "my-bucket", "photos/cat.jpg", 9_999_999);
+        assert!(
+            s.verify_mac("proj", "my-bucket", "photos/cat.jpg", 9_999_999, &new_mac),
+            "token minted after rotation must verify against the new key"
+        );
     }
 }
