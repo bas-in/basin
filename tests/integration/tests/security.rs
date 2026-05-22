@@ -1341,53 +1341,254 @@ fn audit_p1_oauth_same_sub_distinct_per_provider() {
     );
 }
 
-// --- audit P2-1: signed-URL secret rotation (no fix yet) --------------------
+// --- audit P2-1: signed-URL secret rotation ----------------------------------
 
-/// Audit §6 row "signed URL rotation" (P2-1): outstanding signed URLs
-/// minted before a `BASIN_AUTH_JWT_SECRET` rotation should fail to verify
-/// after the rotation. No rotation hook exists today (the signing secret
-/// IS the JWT secret), so this test is `#[ignore]`d until a separate
-/// signing-secret + key-id rotation story lands.
+/// Audit §6 row "signed URL rotation" (P2-1): a signed URL minted with the
+/// pre-rotation key must be rejected after `BlobSigningSecret::rotate()` is
+/// called.
+///
+/// Fix shipped in `basin-blob` `BlobSigningSecret` + `rotate()` (commit
+/// 19cccfd). The `basin-rest` wiring of `BlobSigningSecret` into the route
+/// handler (`POST /admin/v1/storage/signing-key/rotate`) is a cross-crate
+/// follow-up (task #16) tracked separately; the security property itself is
+/// fully exercised here by calling the primitive directly.
+///
+/// This test verifies the load-bearing security invariant: after `rotate()`,
+/// `verify_mac` returns `false` for any MAC minted against the old key.
+/// The basin-rest wiring adds an HTTP endpoint on top; it does not change
+/// the security property established here.
 #[test]
-#[ignore = "audit P2-1: FIXED in basin-blob BlobSigningSecret (19cccfd), covered by basin-blob::signing unit tests; basin-rest wiring pending (task #16); integration assertion TODO"]
 fn audit_p2_1_signed_url_rotates_when_jwt_secret_rotates() {
-    panic!("audit P2-1 fix not landed; un-ignore once a rotation hook exists");
+    use basin_blob::signing::BlobSigningSecret;
+
+    let key_a = b"audit-p2-1-key-A-32-bytes-long!";
+    let key_b = b"audit-p2-1-key-B-32-bytes-long!";
+
+    let secret = BlobSigningSecret::new(key_a);
+
+    // Mint a signed-URL token before rotation.
+    let pre_mac = secret.compute_mac("proj", "bucket", "report.pdf", 9_999_999);
+    assert!(
+        secret.verify_mac("proj", "bucket", "report.pdf", 9_999_999, &pre_mac),
+        "pre-rotation MAC must verify before rotation"
+    );
+
+    // Rotate to a new key.
+    secret.rotate(key_b);
+
+    // The pre-rotation MAC must now be rejected.
+    assert!(
+        !secret.verify_mac("proj", "bucket", "report.pdf", 9_999_999, &pre_mac),
+        "SECURITY P2-1: pre-rotation signed URL (MAC) MUST be rejected after secret rotation"
+    );
+
+    // A freshly-minted MAC with the new key must still verify (regression guard).
+    let post_mac = secret.compute_mac("proj", "bucket", "report.pdf", 9_999_999);
+    assert!(
+        secret.verify_mac("proj", "bucket", "report.pdf", 9_999_999, &post_mac),
+        "post-rotation MAC must verify with the new key"
+    );
+    // Belt-and-braces: the pre-rotation MAC must not accidentally match the
+    // post-rotation MAC (would indicate the rotate() call was a no-op).
+    assert_ne!(
+        pre_mac, post_mac,
+        "MACs before and after rotation must differ"
+    );
+
+    println!("[audit_p2_1] pre-rotation URL rejected post-rotation PASS");
 }
 
-// --- audit P2-3: OAuthStateCache never expires entries ----------------------
+// --- audit P2-3: OAuthStateCache TTL -----------------------------------------
 
 /// Audit §6 row "in-memory OAuth state cache never expires" (P2-3): the
-/// `OAuthStateCache` currently consumes by hash but never sweeps expired
-/// entries. Long-running test/dev servers accumulate state. The test
-/// asserts the desired post-fix behaviour and is `#[ignore]`d.
+/// `OAuthStateCache` now carries a per-entry TTL (fix in commit 5db66c6).
+/// `consume_state_sync` rejects an entry whose TTL has elapsed even if the
+/// state hash is present.
+///
+/// This test uses `OAuthStateCache::with_ttl(Duration::ZERO)` so the entry
+/// expires instantaneously without any actual sleep.
 #[test]
-#[ignore = "audit P2-3: FIXED in basin-auth OAuthStateCache TTL (5db66c6), covered by basin-auth oauth unit tests; integration assertion TODO"]
 fn audit_p2_3_oauth_state_cache_expires() {
-    panic!("audit P2-3 fix not landed; un-ignore once a TTL sweep exists");
+    use basin_auth::oauth::OAuthStateCache;
+    use sha2::{Digest, Sha256};
+
+    let project = ProjectId::new();
+
+    // Insert a state into a cache whose TTL is effectively zero.  Any entry
+    // inserted will be considered expired by the time consume_state_sync runs
+    // (Instant::now() + Duration::ZERO <= Instant::now() at the next line).
+    let cache = OAuthStateCache::with_ttl(Duration::ZERO);
+
+    let state_value = "nonce1234.deadbeef";
+    let state_hash = hex::encode(Sha256::digest(state_value.as_bytes()));
+
+    cache.insert_state_sync(&state_hash, &project, "github", "pkce-verifier", "/");
+
+    // Consuming an expired entry must return an error.
+    let result = cache.consume_state_sync(&state_hash);
+    assert!(
+        result.is_err(),
+        "SECURITY P2-3: expired OAuthStateCache entry MUST be rejected by consume_state_sync"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.to_lowercase().contains("expired") || err_msg.to_lowercase().contains("not found"),
+        "error must mention 'expired' or 'not found', got: {err_msg}"
+    );
+
+    // A freshly-inserted entry with a normal TTL must still be consumable.
+    let cache2 = OAuthStateCache::new();
+    let state_hash2 = hex::encode(Sha256::digest(b"fresh-state.abc123"));
+    cache2.insert_state_sync(&state_hash2, &project, "github", "pkce-verifier-2", "/cb");
+    assert!(
+        cache2.consume_state_sync(&state_hash2).is_ok(),
+        "a non-expired state must be consumable"
+    );
+
+    // Consuming the same state twice must fail (single-use).
+    let cache3 = OAuthStateCache::new();
+    let state_hash3 = hex::encode(Sha256::digest(b"single-use.xyz"));
+    cache3.insert_state_sync(&state_hash3, &project, "github", "pkce-single", "/cb");
+    cache3.consume_state_sync(&state_hash3).expect("first consume ok");
+    assert!(
+        cache3.consume_state_sync(&state_hash3).is_err(),
+        "SECURITY P2-3: state entry must only be consumable once"
+    );
+
+    println!("[audit_p2_3] TTL expiry + single-use enforced PASS");
 }
 
-// --- audit P2-4: MIME sniff overrides client header -------------------------
+// --- audit P2-4: MIME sniff overrides client header --------------------------
 
-/// Audit §6 row "MIME sniff" (P2-4): the storage upload path trusts the
-/// client-supplied `Content-Type` header. A PNG uploaded with
-/// `Content-Type: text/plain` should be stored with the sniffed
-/// `image/png` MIME. Fix not landed.
+/// Audit §6 row "MIME sniff" (P2-4): the server must override a
+/// client-supplied `Content-Type` with the type sniffed from the actual
+/// magic bytes (fix in `basin-blob::mime::sniff`, commit 19cccfd).
+///
+/// This test exercises the fix at the crate-library level, which is the
+/// appropriate integration boundary: the sniff function is pure (no I/O),
+/// so calling it directly is equivalent to the upload-path calling it.
+/// The basin-rest upload handler calls `basin_blob::mime::sniff(&body)` and
+/// stores the returned type — if that call returns the wrong type, a stored
+/// object will carry the wrong MIME, and this test will catch regressions.
 #[test]
-#[ignore = "audit P2-4: FIXED in basin-blob mime::sniff (19cccfd), covered by basin-blob mime unit tests; integration assertion TODO"]
 fn audit_p2_4_mime_sniff_overrides_client_header() {
-    panic!("audit P2-4 fix not landed; un-ignore once sniffing is wired");
+    use basin_blob::mime::sniff;
+    use bytes::Bytes;
+
+    // Attack shape 1: PNG bytes uploaded with Content-Type: text/plain.
+    // The client header is ignored; the sniffed type is image/png.
+    let png_magic = Bytes::from_static(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR extra_data");
+    let sniffed = sniff(&png_magic);
+    assert_eq!(
+        sniffed, "image/png",
+        "SECURITY P2-4: PNG bytes must sniff as image/png, not trust client header text/plain"
+    );
+
+    // Attack shape 2: HTML bytes uploaded with Content-Type: image/png.
+    // Must sniff as text/html (browser would execute it).
+    let html_bytes = Bytes::from_static(b"<!DOCTYPE html><html><body>evil</body></html>");
+    let sniffed_html = sniff(&html_bytes);
+    assert_eq!(
+        sniffed_html, "text/html",
+        "SECURITY P2-4: HTML bytes must sniff as text/html regardless of claimed image/png"
+    );
+
+    // Attack shape 3: JavaScript uploaded with Content-Type: text/plain.
+    let js_bytes = Bytes::from_static(b"function evil() { document.cookie = ''; }");
+    let sniffed_js = sniff(&js_bytes);
+    assert_eq!(
+        sniffed_js, "text/javascript",
+        "SECURITY P2-4: JavaScript bytes must sniff as text/javascript"
+    );
+
+    // Attack shape 4: SVG (XSS vector) uploaded with Content-Type: image/png.
+    let svg_bytes = Bytes::from_static(
+        b"<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>",
+    );
+    let sniffed_svg = sniff(&svg_bytes);
+    assert_eq!(
+        sniffed_svg, "image/svg+xml",
+        "SECURITY P2-4: SVG bytes must sniff as image/svg+xml"
+    );
+
+    // Positive: plain text stays text/plain (no false positives).
+    let plain = Bytes::from_static(b"Hello, world!\n");
+    assert_eq!(sniff(&plain), "text/plain");
+
+    // Positive: JPEG stays image/jpeg.
+    let jpeg = Bytes::from_static(b"\xff\xd8\xff\xe0\x00\x10JFIF");
+    assert_eq!(sniff(&jpeg), "image/jpeg");
+
+    println!("[audit_p2_4] MIME sniff overrides client-claimed Content-Type PASS");
 }
 
-// --- audit P2-5: reserved-schema CREATE/DROP blocked ------------------------
+// --- audit P2-5: reserved-schema CREATE TABLE blocked (5.18.C) ---------------
 
-/// Audit §6 row "reserved-schema CREATE TABLE blocked" (P2-5): a regular
-/// user JWT must not be allowed to `CREATE TABLE auth.evil (...)`. The
-/// engine today binds qualified `auth.users` directly to the reserved
-/// schema for any caller. Fix not landed; recorded as `#[ignore]`d.
-#[test]
-#[ignore = "audit P2-5: reserved-schema DDL not gated by is_admin"]
-fn audit_p2_5_reserved_schema_create_table_rejected() {
-    panic!("audit P2-5 fix not landed; un-ignore once reserved-schema DDL is gated");
+/// Audit §6 row "reserved-schema CREATE TABLE blocked" (P2-5).
+///
+/// **Superseded by 5.18.C (commit 140bfe7)**: reserved-schema DDL is
+/// system-internal only.  ALL user SQL (admin or not) targeting a reserved
+/// schema is rejected SQLSTATE 42501 / `BasinError::PermissionDenied` via
+/// `guard_reserved_schema_for_user_ddl` in the engine. See decisions.md
+/// 2026-05-22 entry and `crates/basin-engine/tests/reserved_schema_ddl_guard.rs`
+/// for the full test matrix.
+///
+/// This integration test drives the engine directly (same path as the unit
+/// tests in the engine crate) to confirm the guard is active from the
+/// integration-test harness and to keep the audit matrix row visible here.
+#[tokio::test]
+async fn audit_p2_5_reserved_schema_create_table_rejected() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fs = object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+    let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
+        object_store: Arc::new(fs),
+        root_prefix: None,
+        disk_cache: None,
+        page_cache: None,
+    });
+    let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
+    let engine = Engine::new(EngineConfig {
+        storage,
+        catalog,
+        shard: None,
+    });
+    let project = ProjectId::new();
+
+    // Every session type (regular user and admin both) must be blocked.
+    // The guard fires at the parser/AST level before any privilege check,
+    // so there is no bypass via is_admin.
+    for (sql, schema) in [
+        ("CREATE TABLE auth.evil (id BIGINT)", "auth"),
+        ("CREATE TABLE storage.evil (id BIGINT)", "storage"),
+        ("CREATE TABLE cron.evil (id BIGINT)", "cron"),
+        ("CREATE TABLE net.evil (id BIGINT)", "net"),
+        ("CREATE TABLE realtime.evil (id BIGINT)", "realtime"),
+    ] {
+        let sess = engine.open_session(project).await.unwrap();
+        let err = sess
+            .execute(sql)
+            .await
+            .expect_err(&format!("CREATE TABLE {schema}.evil must be rejected"));
+        match &err {
+            basin_common::BasinError::PermissionDenied(msg) => {
+                assert!(
+                    msg.contains(&format!("\"{schema}\"")),
+                    "SECURITY P2-5: PermissionDenied message must mention schema {schema:?}, got: {msg}"
+                );
+            }
+            other => panic!(
+                "SECURITY P2-5: expected PermissionDenied for {schema}, got {other:?}"
+            ),
+        }
+    }
+
+    // Positive: unqualified and public-qualified DDL must still work.
+    let sess = engine.open_session(project).await.unwrap();
+    sess.execute("CREATE TABLE public.ok_table (id BIGINT)")
+        .await
+        .expect("public DDL must succeed");
+
+    println!("[audit_p2_5] reserved-schema DDL guard active for all reserved schemas PASS");
 }
 
 // --- audit P2-6: pgwire user invalid-ULID prefix routing hint ---------------
@@ -1431,16 +1632,102 @@ fn audit_p2_6_pgwire_user_invalid_ulid_hint_safe() {
     );
 }
 
-// --- audit P2-7: JWT issuance-floor / refresh-window bound (no fix) ---------
+// --- audit P2-7: JWT issuance-floor / refresh-window bound -------------------
 
-/// Audit §6 row "refresh-token compromise window" (P2-7): no
-/// issuance-floor check today; a stolen refresh remains valid for the
-/// full 30-day refresh TTL. Fix needs key-rotation infra. Recorded as
-/// `#[ignore]`d.
+/// Audit §6 row "refresh-token compromise window" (P2-7): `JwtKeys` now
+/// supports `with_issuance_floor(t₀)` (fix in commit 5db66c6).  Any token
+/// (access or refresh) whose `iat < t₀` is rejected by `verify()` /
+/// `verify_refresh()` even if the signature is otherwise valid.
+///
+/// This bounds the damage window of a stolen refresh token: setting the floor
+/// to the rotation instant instantly invalidates pre-rotation tokens without
+/// requiring the full 30-day TTL to elapse.
 #[test]
-#[ignore = "audit P2-7: FIXED in basin-auth JWT issuance-floor (5db66c6), covered by basin-auth jwt unit tests; integration assertion TODO"]
 fn audit_p2_7_refresh_token_compromise_window_bounded() {
-    panic!("audit P2-7 fix not landed; un-ignore once key-rotation infra exists");
+    use basin_auth::jwt::JwtKeys;
+    use chrono::Utc;
+
+    let secret = [0xA7u8; 32];
+    let keys = JwtKeys::new(&secret);
+    let now = Utc::now();
+    let project = ProjectId::new();
+
+    // Issue a refresh token whose iat is 2 minutes in the past (simulates a
+    // token that was issued before the rotation event).
+    let (refresh_pre, _jti, _exp) = keys
+        .issue_refresh(
+            &project,
+            uuid::Uuid::new_v4(),
+            "victim@example.com",
+            now - chrono::Duration::seconds(120),
+            Duration::from_secs(86_400 * 30), // 30-day TTL; would normally stay valid
+        )
+        .expect("issue pre-rotation refresh token");
+
+    // Issue an access token in the same "pre-rotation" window.
+    let (access_pre, _exp_access) = keys
+        .issue(
+            &project,
+            uuid::Uuid::new_v4(),
+            "victim@example.com",
+            &[],
+            now - chrono::Duration::seconds(120),
+            Duration::from_secs(3_600 * 24), // 24h TTL; would normally stay valid
+        )
+        .expect("issue pre-rotation access token");
+
+    // Simulate key rotation: set the issuance floor to now - 60s.
+    // The pre-rotation tokens have iat = now - 120s, which is before the floor.
+    let floor = (now - chrono::Duration::seconds(60)).timestamp();
+    let keys_with_floor = JwtKeys::new(&secret).with_issuance_floor(floor);
+    assert_eq!(keys_with_floor.issuance_floor(), Some(floor));
+
+    // Pre-floor refresh token must be rejected.
+    let refresh_result = keys_with_floor.verify_refresh(&refresh_pre);
+    assert!(
+        refresh_result.is_err(),
+        "SECURITY P2-7: refresh token issued before issuance floor MUST be rejected; \
+         a stolen pre-rotation refresh token must not remain valid after rotation"
+    );
+
+    // Pre-floor access token must also be rejected.
+    let access_result = keys_with_floor.verify(&access_pre);
+    assert!(
+        access_result.is_err(),
+        "SECURITY P2-7: access token issued before issuance floor MUST be rejected"
+    );
+
+    // Post-floor tokens (iat >= floor) must still verify correctly.
+    let (refresh_post, _jti2, _exp2) = keys_with_floor
+        .issue_refresh(
+            &project,
+            uuid::Uuid::new_v4(),
+            "victim@example.com",
+            now,
+            Duration::from_secs(3_600),
+        )
+        .expect("issue post-rotation refresh token");
+    assert!(
+        keys_with_floor.verify_refresh(&refresh_post).is_ok(),
+        "SECURITY P2-7: refresh token issued after the floor MUST still verify"
+    );
+
+    let (access_post, _) = keys_with_floor
+        .issue(
+            &project,
+            uuid::Uuid::new_v4(),
+            "victim@example.com",
+            &[],
+            now,
+            Duration::from_secs(3_600),
+        )
+        .expect("issue post-rotation access token");
+    assert!(
+        keys_with_floor.verify(&access_post).is_ok(),
+        "SECURITY P2-7: access token issued after the floor MUST still verify"
+    );
+
+    println!("[audit_p2_7] issuance-floor rejects pre-rotation tokens; post-rotation OK PASS");
 }
 
 // --- "additional surface coverage" gaps the audit called out ---------------
