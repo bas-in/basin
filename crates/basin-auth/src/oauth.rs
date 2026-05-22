@@ -509,9 +509,18 @@ pub fn verify_state_hmac(
 /// Validate `redirect_to` against the per-project allowlist.
 ///
 /// - Empty or relative (`/...`) paths are always allowed.
-/// - Absolute URLs must be `http://` or `https://` and match one of
-///   `allowed_prefixes`. Reject everything else.
-pub fn validate_redirect_to(redirect_to: &str, allowed_prefixes: &[String]) -> Result<()> {
+/// - Absolute URLs must be `http://` or `https://` and their **origin**
+///   (scheme + host + port) must exactly match the origin of one entry in
+///   `allowed_origins`. Reject everything else.
+///
+/// Using origin comparison (rather than a naive `starts_with` prefix match)
+/// prevents subdomain-confusion attacks such as:
+/// - `https://example.com.evil.com/cb` — host does not match
+/// - `https://example.com@evil.com/cb` — userinfo prefix trick; the actual
+///   host is `evil.com`, not `example.com`
+///
+/// (Audit finding P1-3.)
+pub fn validate_redirect_to(redirect_to: &str, allowed_origins: &[String]) -> Result<()> {
     if redirect_to.is_empty() || redirect_to.starts_with('/') {
         return Ok(());
     }
@@ -520,16 +529,29 @@ pub fn validate_redirect_to(redirect_to: &str, allowed_prefixes: &[String]) -> R
             "redirect_to must be a relative path or http(s) URL: {redirect_to:?}"
         )));
     }
-    if allowed_prefixes.is_empty() {
+    if allowed_origins.is_empty() {
         return Err(BasinError::InvalidIdent(
             "redirect_to allowlist is empty; configure oauth provider redirect_uri".into(),
         ));
     }
-    for prefix in allowed_prefixes {
-        if redirect_to.starts_with(prefix.as_str()) {
+
+    // Parse the candidate URL and extract its origin.
+    let candidate = url::Url::parse(redirect_to).map_err(|e| {
+        BasinError::InvalidIdent(format!("redirect_to is not a valid URL: {e}"))
+    })?;
+    let candidate_origin = candidate.origin();
+
+    for entry in allowed_origins {
+        // Parse the allowlist entry. Malformed entries are skipped — a bad
+        // admin config must not silently open the redirect.
+        let Ok(allowed_url) = url::Url::parse(entry.trim()) else {
+            continue;
+        };
+        if candidate_origin == allowed_url.origin() {
             return Ok(());
         }
     }
+
     Err(BasinError::InvalidIdent(format!(
         "redirect_to {redirect_to:?} not in provider redirect_uri allowlist"
     )))
@@ -1007,21 +1029,46 @@ fn pg_row_to_identity(r: tokio_postgres::Row) -> IdentityRow {
 
 use std::sync::Mutex;
 
+/// TTL for in-memory OAuth states: matches the 10-minute window used by the
+/// Postgres-backed path (`expires_at = now() + 10 minutes`).
+const OAUTH_STATE_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// An in-memory OAuth state entry with a wall-clock expiry.
+struct CachedState {
+    row: OAuthStateRow,
+    /// Monotonic instant after which the entry is considered expired.
+    expires_at: Instant,
+}
+
 /// Thread-safe in-memory state cache used when the concrete `AuthStore` does
 /// not implement `OAuthStore` (e.g. `EngineAuthStore` in integration tests).
 /// Not for production use.
+///
+/// Each entry carries a TTL (audit P2-3): `consume_state_sync` rejects states
+/// whose TTL has elapsed, and lazily sweeps expired entries from the map on
+/// every insert so the cache does not grow unboundedly in long-running
+/// test/dev servers.
 pub struct OAuthStateCache {
-    states: Mutex<HashMap<String, OAuthStateRow>>,
+    states: Mutex<HashMap<String, CachedState>>,
     providers: Mutex<HashMap<String, ResolvedProvider>>,
     identities: Mutex<Vec<IdentityRow>>,
+    /// State TTL. Configurable for tests that need to exercise expiry quickly.
+    state_ttl: Duration,
 }
 
 impl OAuthStateCache {
     pub fn new() -> Self {
+        Self::with_ttl(OAUTH_STATE_TTL)
+    }
+
+    /// Construct with a custom TTL. Used by unit tests that need to set a very
+    /// short TTL to verify expiry behaviour without sleeping for 10 minutes.
+    pub fn with_ttl(state_ttl: Duration) -> Self {
         Self {
             states: Mutex::new(HashMap::new()),
             providers: Mutex::new(HashMap::new()),
             identities: Mutex::new(Vec::new()),
+            state_ttl,
         }
     }
 
@@ -1040,18 +1087,29 @@ impl OAuthStateCache {
             pkce_verifier: pkce_verifier.to_owned(),
             redirect_to: redirect_to.to_owned(),
         };
-        self.states
-            .lock()
-            .unwrap()
-            .insert(state_hash.to_owned(), row);
+        let entry = CachedState {
+            row,
+            expires_at: Instant::now() + self.state_ttl,
+        };
+        let mut map = self.states.lock().unwrap();
+        // Lazy sweep: evict all expired entries on every insert so the map
+        // does not grow unboundedly in long-running test/dev processes.
+        let now = Instant::now();
+        map.retain(|_, v| v.expires_at > now);
+        map.insert(state_hash.to_owned(), entry);
     }
 
+    /// Consume (read-and-delete) an OAuth state entry. Returns an error if the
+    /// entry does not exist **or** has expired (audit P2-3 TTL enforcement).
     pub fn consume_state_sync(&self, state_hash: &str) -> Result<OAuthStateRow> {
-        self.states
-            .lock()
-            .unwrap()
-            .remove(state_hash)
-            .ok_or_else(|| BasinError::InvalidIdent("oauth state not found or expired".into()))
+        let mut map = self.states.lock().unwrap();
+        match map.remove(state_hash) {
+            Some(entry) if entry.expires_at > Instant::now() => Ok(entry.row),
+            Some(_expired) => {
+                Err(BasinError::InvalidIdent("oauth state not found or expired".into()))
+            }
+            None => Err(BasinError::InvalidIdent("oauth state not found or expired".into())),
+        }
     }
 
     /// Register a mock provider for tests (no real DB row needed).
@@ -2101,5 +2159,144 @@ mod tests {
         let enc = PlaintextEncryption;
         let ct = enc.encrypt("my_secret").unwrap();
         assert_eq!(enc.decrypt(&ct).unwrap(), "my_secret");
+    }
+
+    // -----------------------------------------------------------------------
+    // P1-3: validate_redirect_to strict-origin tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn redirect_to_legitimate_passes() {
+        let allow = vec!["https://example.com".to_string()];
+        assert!(validate_redirect_to("https://example.com/callback", &allow).is_ok());
+        assert!(validate_redirect_to("https://example.com/deep/path?q=1", &allow).is_ok());
+    }
+
+    #[test]
+    fn redirect_to_subdomain_confusion_rejected() {
+        let allow = vec!["https://example.com".to_string()];
+        // Subdomain prefix trick: host is `example.com.evil.com`.
+        let result = validate_redirect_to("https://example.com.evil.com/cb", &allow);
+        assert!(
+            result.is_err(),
+            "SECURITY P1-3: subdomain-confusion redirect_to MUST be rejected"
+        );
+    }
+
+    #[test]
+    fn redirect_to_userinfo_prefix_rejected() {
+        let allow = vec!["https://example.com".to_string()];
+        // Userinfo trick: `example.com` is the userinfo, real host is `evil.com`.
+        let result = validate_redirect_to("https://example.com@evil.com/cb", &allow);
+        assert!(
+            result.is_err(),
+            "SECURITY P1-3: userinfo-prefix redirect_to MUST be rejected"
+        );
+    }
+
+    #[test]
+    fn redirect_to_relative_always_allowed() {
+        let allow = vec!["https://example.com".to_string()];
+        assert!(validate_redirect_to("/local/path", &allow).is_ok());
+        assert!(validate_redirect_to("", &allow).is_ok());
+    }
+
+    #[test]
+    fn redirect_to_different_scheme_rejected() {
+        let allow = vec!["https://example.com".to_string()];
+        // http vs https: different origins.
+        let result = validate_redirect_to("http://example.com/cb", &allow);
+        assert!(result.is_err(), "http must not match an https allowlist entry");
+    }
+
+    #[test]
+    fn redirect_to_port_mismatch_rejected() {
+        let allow = vec!["https://example.com:8080".to_string()];
+        let result = validate_redirect_to("https://example.com/cb", &allow);
+        assert!(result.is_err(), "default port must not match explicit port 8080");
+    }
+
+    // -----------------------------------------------------------------------
+    // P2-3: OAuthStateCache TTL tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn oauth_state_cache_rejects_expired_entry() {
+        use basin_common::ProjectId;
+        // Use a 1-nanosecond TTL so entries expire instantly.
+        let cache = OAuthStateCache::with_ttl(Duration::from_nanos(1));
+        let project = ProjectId::new();
+        cache.insert_state_sync("hash1", &project, "google", "verifier", "https://app.example.com");
+
+        // Sleep just long enough to guarantee expiry (1ns TTL + a short pause).
+        std::thread::sleep(Duration::from_millis(10));
+
+        let result = cache.consume_state_sync("hash1");
+        assert!(
+            result.is_err(),
+            "SECURITY P2-3: expired state MUST be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn oauth_state_cache_accepts_fresh_entry() {
+        use basin_common::ProjectId;
+        let cache = OAuthStateCache::with_ttl(Duration::from_secs(600));
+        let project = ProjectId::new();
+        cache.insert_state_sync(
+            "hash2",
+            &project,
+            "github",
+            "verifier2",
+            "https://app.example.com/cb",
+        );
+
+        let result = cache.consume_state_sync("hash2");
+        assert!(result.is_ok(), "fresh state must be accepted: {result:?}");
+        assert_eq!(result.unwrap().provider, "github");
+    }
+
+    #[test]
+    fn oauth_state_cache_single_use() {
+        use basin_common::ProjectId;
+        let cache = OAuthStateCache::with_ttl(Duration::from_secs(600));
+        let project = ProjectId::new();
+        cache.insert_state_sync("hash3", &project, "google", "v3", "https://app.example.com");
+
+        // First consume succeeds.
+        assert!(cache.consume_state_sync("hash3").is_ok());
+        // Second consume fails (state was removed).
+        assert!(
+            cache.consume_state_sync("hash3").is_err(),
+            "state must be single-use"
+        );
+    }
+
+    #[test]
+    fn oauth_state_cache_sweep_removes_expired_on_insert() {
+        use basin_common::ProjectId;
+        let cache = OAuthStateCache::with_ttl(Duration::from_nanos(1));
+        let project = ProjectId::new();
+
+        // Insert 3 entries that will expire immediately.
+        for i in 0..3u32 {
+            cache.insert_state_sync(
+                &format!("expired_{i}"),
+                &project,
+                "google",
+                "v",
+                "https://x.example.com",
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+
+        // Insert a fresh entry — this should trigger the lazy sweep.
+        let cache_long = OAuthStateCache::with_ttl(Duration::from_secs(600));
+        let project2 = ProjectId::new();
+        cache_long.insert_state_sync("fresh_after_sweep", &project2, "google", "v", "https://y.example.com");
+
+        // Expired entries must be gone from the original cache.
+        assert!(cache.consume_state_sync("expired_0").is_err());
+        assert!(cache.consume_state_sync("expired_1").is_err());
     }
 }

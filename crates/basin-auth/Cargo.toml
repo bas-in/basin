@@ -60,8 +60,10 @@ base64.workspace = true
 # OAuth 2.0 / OIDC (Phase 5.10.O — ADR 0020).
 # reqwest: HTTP client for OIDC discovery + token exchange + userinfo.
 # hmac: HMAC-SHA256 signing for the CSRF state parameter.
+# url: strict-origin validation for redirect_to allowlist (audit P1-3).
 reqwest = { workspace = true }
 hmac = { workspace = true }
+url = "2"
 
 # MFA (Phase 5.10.M — ADR 0020).
 # base32: RFC4648 encoding for TOTP shared secrets (otpauth:// URI format).

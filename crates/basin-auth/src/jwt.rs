@@ -135,6 +135,19 @@ pub const REFRESH_AUDIENCE: &str = "basin-refresh";
 /// [`JwtKeys::with_previous_secret`]: tokens that fail verification against the
 /// current key are re-tried against the previous key. Remove `previous_secret`
 /// once its TTL has elapsed (typically one access-token lifetime, e.g. 1 hour).
+///
+/// # Issuance-floor / key-rotation window bounding (audit P2-7)
+///
+/// An **issuance floor** is a Unix timestamp `t₀` below which any token whose
+/// `iat < t₀` is rejected even if the signature is otherwise valid. This bounds
+/// the refresh-token compromise window after a key rotation: by setting the
+/// floor to the rotation instant, all tokens that were issued before the
+/// rotation (and could be stolen refresh tokens) are immediately invalidated,
+/// rather than remaining valid for the full refresh TTL (up to 30 days).
+///
+/// Set the floor with [`JwtKeys::with_issuance_floor`]. Tokens issued by
+/// `JwtKeys` itself always set `iat = now`, so freshly minted tokens are never
+/// below the floor.
 #[derive(Clone)]
 pub struct JwtKeys {
     encoding: EncodingKey,
@@ -146,6 +159,10 @@ pub struct JwtKeys {
     previous_decoding: Option<DecodingKey>,
     validation: Validation,
     refresh_validation: Validation,
+    /// Issuance floor (audit P2-7). When `Some(t₀)`, any token whose `iat`
+    /// claim is strictly less than `t₀` is rejected regardless of signature
+    /// validity. `None` means "no floor" (default — backward compatible).
+    issuance_floor: Option<i64>,
 }
 
 impl JwtKeys {
@@ -172,6 +189,7 @@ impl JwtKeys {
             previous_decoding: None,
             validation,
             refresh_validation,
+            issuance_floor: None,
         }
     }
 
@@ -193,6 +211,36 @@ impl JwtKeys {
         let mut keys = Self::new(secret);
         keys.previous_decoding = Some(DecodingKey::from_secret(previous_secret));
         keys
+    }
+
+    /// Set an **issuance floor**: any token whose `iat` is strictly before
+    /// `floor_unix_secs` is rejected, bounding the window during which a
+    /// previously-stolen refresh token can be used (audit P2-7).
+    ///
+    /// Typically `floor_unix_secs` is set to `Utc::now().timestamp()` at the
+    /// moment a key rotation is performed. After setting the floor, the caller
+    /// should also rotate to a new secret (or keep the existing secret —
+    /// the floor alone is sufficient to invalidate pre-rotation tokens without
+    /// forcing a full secret change).
+    ///
+    /// # Example
+    /// ```rust
+    /// use basin_auth::jwt::JwtKeys;
+    /// use chrono::Utc;
+    ///
+    /// // At rotation time:
+    /// let floor = Utc::now().timestamp();
+    /// let keys = JwtKeys::new(&[0u8; 32]).with_issuance_floor(floor);
+    /// // Tokens issued before `floor` are now rejected; new tokens are fine.
+    /// ```
+    pub fn with_issuance_floor(mut self, floor_unix_secs: i64) -> Self {
+        self.issuance_floor = Some(floor_unix_secs);
+        self
+    }
+
+    /// Return the current issuance floor, if any.
+    pub fn issuance_floor(&self) -> Option<i64> {
+        self.issuance_floor
     }
 
     /// Issue a fresh access token. `now` lets tests be deterministic.
@@ -312,6 +360,17 @@ impl JwtKeys {
                  (now={now_ts}, max_skew={IAT_MAX_SKEW_SECS}s)"
             )));
         }
+        // 3. Issuance-floor check (audit P2-7): reject tokens issued before the
+        //    rotation floor. This bounds the refresh-token compromise window to
+        //    the interval [floor, now] after a secret/key rotation.
+        if let Some(floor) = self.issuance_floor {
+            if iat < floor {
+                return Err(BasinError::internal(format!(
+                    "jwt verify: token issued before issuance floor \
+                     (iat={iat}, floor={floor})"
+                )));
+            }
+        }
 
         let project: ProjectId = w
             .project_id
@@ -390,6 +449,20 @@ impl JwtKeys {
             },
         };
         let w = data.claims;
+
+        // Issuance-floor check (audit P2-7): a stolen refresh token issued
+        // before a rotation event is rejected here, bounding the compromise
+        // window even when the full 30-day TTL has not yet elapsed.
+        if let Some(floor) = self.issuance_floor {
+            if w.iat < floor {
+                return Err(BasinError::internal(format!(
+                    "refresh jwt verify: token issued before issuance floor \
+                     (iat={}, floor={floor})",
+                    w.iat
+                )));
+            }
+        }
+
         let project: ProjectId = w
             .project_id
             .parse()
@@ -896,6 +969,152 @@ mod tests {
         assert!(
             keys_final.verify_refresh(&refresh_token).is_err(),
             "refresh token must be rejected once grace window closes"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issuance-floor tests (audit P2-7)
+    // -----------------------------------------------------------------------
+
+    /// Tokens issued BEFORE the floor are rejected, even with a valid signature.
+    #[test]
+    fn jwt_issuance_floor_rejects_pre_rotation_access_token() {
+        let secret = [0xA1u8; 32];
+        let keys = JwtKeys::new(&secret);
+        let now = Utc::now();
+
+        // Issue a token whose iat is in the "past" relative to the floor.
+        let (token, _) = keys
+            .issue(
+                &ProjectId::new(),
+                Uuid::new_v4(),
+                "victim@example.com",
+                &["user".to_string()],
+                now - chrono::Duration::seconds(120), // iat = 2 minutes ago
+                Duration::from_secs(3600),
+            )
+            .unwrap();
+
+        // Install a floor at (now - 60s): the token's iat is before the floor.
+        let floor = (now - chrono::Duration::seconds(60)).timestamp();
+        let keys_with_floor = JwtKeys::new(&secret).with_issuance_floor(floor);
+
+        let result = keys_with_floor.verify(&token);
+        assert!(
+            result.is_err(),
+            "SECURITY P2-7: access token issued before issuance floor MUST be rejected"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("floor") || msg.contains("issuance"),
+            "error must mention floor/issuance, got: {msg}"
+        );
+    }
+
+    /// Tokens issued AFTER the floor are still accepted.
+    #[test]
+    fn jwt_issuance_floor_accepts_post_rotation_access_token() {
+        let secret = [0xA2u8; 32];
+        let now = Utc::now();
+
+        // Floor = 10 minutes ago; token iat = now → after the floor.
+        let floor = (now - chrono::Duration::seconds(600)).timestamp();
+        let keys = JwtKeys::new(&secret).with_issuance_floor(floor);
+
+        let (token, _) = keys
+            .issue(
+                &ProjectId::new(),
+                Uuid::new_v4(),
+                "ok@example.com",
+                &[],
+                now,
+                Duration::from_secs(3600),
+            )
+            .unwrap();
+
+        assert!(
+            keys.verify(&token).is_ok(),
+            "token issued after the floor must still verify"
+        );
+    }
+
+    /// Refresh token issued before the floor is rejected (audit P2-7).
+    #[test]
+    fn jwt_issuance_floor_rejects_pre_rotation_refresh_token() {
+        let secret = [0xA3u8; 32];
+        let keys = JwtKeys::new(&secret);
+        let now = Utc::now();
+
+        // Issue refresh token with iat 2 minutes in the past.
+        let (refresh, _jti, _exp) = keys
+            .issue_refresh(
+                &ProjectId::new(),
+                Uuid::new_v4(),
+                "stolen@example.com",
+                now - chrono::Duration::seconds(120),
+                Duration::from_secs(86_400 * 30), // 30-day TTL
+            )
+            .unwrap();
+
+        // Install floor at (now - 60s).
+        let floor = (now - chrono::Duration::seconds(60)).timestamp();
+        let keys_with_floor = JwtKeys::new(&secret).with_issuance_floor(floor);
+
+        let result = keys_with_floor.verify_refresh(&refresh);
+        assert!(
+            result.is_err(),
+            "SECURITY P2-7: stolen refresh token issued before floor MUST be rejected"
+        );
+    }
+
+    /// Refresh token issued after the floor is still accepted (audit P2-7).
+    #[test]
+    fn jwt_issuance_floor_accepts_post_rotation_refresh_token() {
+        let secret = [0xA4u8; 32];
+        let now = Utc::now();
+
+        let floor = (now - chrono::Duration::seconds(600)).timestamp();
+        let keys = JwtKeys::new(&secret).with_issuance_floor(floor);
+
+        let (refresh, _jti, _exp) = keys
+            .issue_refresh(
+                &ProjectId::new(),
+                Uuid::new_v4(),
+                "fresh@example.com",
+                now,
+                Duration::from_secs(3600),
+            )
+            .unwrap();
+
+        assert!(
+            keys.verify_refresh(&refresh).is_ok(),
+            "refresh token issued after the floor must still verify"
+        );
+    }
+
+    /// No-floor keys (the default) still accept all valid tokens (backward compat).
+    #[test]
+    fn jwt_no_floor_accepts_old_tokens() {
+        let secret = [0xA5u8; 32];
+        let keys = JwtKeys::new(&secret); // no floor
+        let past = Utc::now() - chrono::Duration::seconds(7200);
+
+        let (token, _) = keys
+            .issue(
+                &ProjectId::new(),
+                Uuid::new_v4(),
+                "nofloor@example.com",
+                &[],
+                past,
+                // TTL of 3 hours so the token hasn't expired yet even issued
+                // 2 hours ago (exp = past + 3h = now + 1h).
+                Duration::from_secs(3 * 3600),
+            )
+            .unwrap();
+
+        assert!(
+            keys.verify(&token).is_ok(),
+            "without a floor, tokens issued in the past must still verify (backward compat)"
         );
     }
 }
