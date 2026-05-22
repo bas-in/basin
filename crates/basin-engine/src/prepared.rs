@@ -172,6 +172,12 @@ impl PreparedRegistry {
             inner: RwLock::new(HashMap::new()),
         }
     }
+
+    /// Drop every prepared statement. Used by the connection-pool scrub on
+    /// Session-mode reuse (DISCARD ALL / `DEALLOCATE ALL` semantics).
+    pub(crate) async fn clear_all(&self) {
+        self.inner.write().await.clear();
+    }
 }
 
 /// Implementation of [`ProjectSession::prepare`]. See module docs for the

@@ -134,6 +134,13 @@ impl CursorRegistry {
         }
     }
 
+    /// Drop every open cursor. Used by the connection-pool scrub on
+    /// return-to-pool (DISCARD ALL / `CLOSE ALL` semantics) so no cursor
+    /// state crosses a Session-mode pooled checkout boundary.
+    pub(crate) async fn clear_all(&self) {
+        self.inner.lock().await.clear();
+    }
+
     /// Store a new cursor under `name`.  Fails if a cursor by that name is
     /// already open (matches PG's `ERROR: cursor "x" already exists`).
     pub(crate) async fn declare(

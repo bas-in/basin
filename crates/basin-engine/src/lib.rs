@@ -755,6 +755,16 @@ impl ProjectSession {
         &self.current_user
     }
 
+    /// Reset in-memory session state before a Session-mode pool reuse
+    /// (DISCARD ALL semantics that SQL `CLOSE ALL` / `DEALLOCATE ALL` do not
+    /// fully cover in v0.1): drop all open cursors and prepared statements so
+    /// no per-session state crosses a pooled checkout boundary. The
+    /// connection-pool scrub calls this on checkout.
+    pub async fn reset_for_pool_reuse(&self) {
+        self.state.cursors.clear_all().await;
+        self.state.prepared.clear_all().await;
+    }
+
     /// Run one SQL statement. Returns either a result set ([`ExecResult::Rows`])
     /// or a side-effect tag for DML/DDL ([`ExecResult::Empty`]).
     #[tracing::instrument(skip(self, sql), fields(project=%self.project, sql=%sql.lines().next().unwrap_or("")))]

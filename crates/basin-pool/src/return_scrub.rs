@@ -72,20 +72,13 @@ pub(crate) async fn scrub_session_for_pool_return(session: &ProjectSession) -> R
         );
     }
 
-    // 2. Close all open cursors.
-    //    Basin's CursorRegistry is consulted; CLOSE ALL is intercepted
-    //    by the executor's cursor path.  In Basin v0.1 "CLOSE ALL is not
-    //    supported" returns an error — that is acceptable here; the
-    //    session destruction path (Transaction mode) handles cursors via
-    //    Arc drop.  For Session mode this is best-effort until the engine
-    //    implements CLOSE ALL natively.
-    if let Err(e) = session.execute("CLOSE ALL").await {
-        tracing::debug!(
-            error = %e,
-            "pool scrub: CLOSE ALL unsupported by engine (cursors will be \
-             cleaned up when session is eventually dropped)"
-        );
-    }
+    // 2. Drop all open cursors AND named prepared statements directly via the
+    //    engine's in-memory registries. SQL `CLOSE ALL` / `DEALLOCATE ALL` are
+    //    not fully wired in v0.1, so this is the authoritative cursor/prepared
+    //    scrub for Session-mode reuse (no per-session state crosses the pooled
+    //    checkout boundary). Transaction mode destroys the session entirely and
+    //    never reaches this path.
+    session.reset_for_pool_reuse().await;
 
     // 3. Deallocate all named prepared statements.  In Basin, SQL-level
     //    PREPARE/EXECUTE are noop-accepts so this has no effect today, but
