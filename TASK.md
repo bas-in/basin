@@ -2759,7 +2759,7 @@ regression-test backfill in `tests/integration/tests/security.rs`.
       **All 3 security P0s are now closed (P0.1 TOTP replay, P0.2 WebAuthn,
       P0.3 inbound webhook auth).**
 
-- [ ] **6.SEC.P1.* — five P1 findings** detailed in the audit (OAuth
+- [~] **6.SEC.P1.* — five P1 findings** detailed in the audit (OAuth
       identity-link via unverified email, signed-URL secret rotation
       missing, presence `client_id` impersonation, public-bucket alias
       gap, reserved-schema CREATE/DROP open). Each ~½–1 day; file:line in

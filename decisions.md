@@ -6,6 +6,29 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-22 — Wave 4 (3 agents): closed the 6.SEC P1/P2 security tail
+
+Agents (disjoint crates, none editing the shared `security.rs` — orchestrator un-ignored): G1=basin-realtime
+(P1-1), G2=basin-auth (P1-3/P2-3/P2-7), G3=basin-blob (P2-4/P2-1). Gate: `cargo build --workspace` +
+`cargo test --test security` exit 0 — **audit_p1_1 + audit_p1_3 un-ignored and PASS**; suite 36 passed/0
+failed/5 ignored.
+
+- **P1-1 WS subscribe.filter** (`9a70fd3`): the Subscribe handler matched `filter: _` and DISCARDED the
+  predicate — every subscriber got all RLS-permitted events (info-disclosure). Now compiles `Filter::new(sql)`
+  at subscribe time → `subscribe_filtered` → `FilteredReceiver`; fail-closed on unparseable filter. 81 tests.
+- **P1-3 redirect_to** (`5db66c6`): naive `starts_with` prefix match replaced with `url::Url::origin()`
+  comparison — blocks `example.com.evil.com` and `example.com@evil.com` confusion. audit_p1_3 passes.
+- **P2-3 OAuth state TTL** + **P2-7 JWT issuance-floor** (`5db66c6`): real fixes + basin-auth unit tests
+  (174/0). **P2-4 MIME sniff** (`19cccfd`): server-side magic-byte sniff overrides client Content-Type
+  (basin-blob 78/0). **P2-1 signed-URL rotation** (`19cccfd`): `BlobSigningSecret` (rotatable HMAC) shipped
+  in basin-blob; **basin-rest wiring (storage_sign.rs) is a follow-up (task #16)** — blob agent correctly
+  refused to cross into basin-rest.
+- **Honest test bookkeeping:** the P2 *integration* tests in security.rs are `panic!` placeholders; the real
+  fixes are covered by crate *unit* tests. Rather than fake-pass them, I left them `#[ignore]`'d but updated
+  each ignore reason to "FIXED in <commit>, covered by <crate> unit tests; integration assertion TODO".
+- **6.SEC.P1 box → `[~]`**: 4 of 5 named P1s fully closed (OAuth, presence, public-bucket, reserved-schema)
+  + P1-1/P1-3 closed; the 5th (signed-URL rotation) is blob-half done pending #16.
+
 ## 2026-05-22 — Wave 3 (3 agents) + reconciliation: found a real GIN eviction bug; 8 stale .A boxes were already done
 
 Agents: F1=engine/catalog (5.18 search_path), F2=basin-pool (5.27.D), F3=reconciliation+CAPABILITIES.
