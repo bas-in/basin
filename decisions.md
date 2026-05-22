@@ -6,6 +6,38 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-22 — WIP from 3 prior engine agents was NOT clean-buildable; pipe-masked exit codes hid it
+
+The advisory-lock / GIN-completeness / pg_sleep WIP left uncommitted by the previous
+session's three engine agents did **not** compile cleanly. Two real breaks, both
+invisible to the agents because they (and my first verification runs) piped `cargo`
+through `tail`/`grep` — so the reported exit code was the pipe tail's `0`, not cargo's.
+
+- **`gin_tsvector.rs`**: the #2 agent renamed `MAX_POSTING_ENTRIES` → `DEFAULT_POSTING_BUDGET`
+  and added a `posting_budget()` accessor, but left two eviction-path call sites
+  referencing the deleted constant → lib failed to compile. Fixed: call `posting_budget()`
+  (also makes eviction honor the new `BASIN_GIN_POSTING_BUDGET` knob, matching intent).
+- **`lock_registry.rs`**: `LockRegistry` / `LockHandle` (new basin-shard types) lacked
+  `#[derive(Debug)]`, but basin-engine's `advisory_lock.rs` embeds them in `#[derive(Debug)]`
+  structs → E0277. Fixed: derived `Debug` on both (all fields are Debug-able).
+
+`cargo build --workspace` had *also* failed earlier for the same reason but its pipe
+masked it. **Lesson (now in muscle memory): never pipe cargo through `tail`/`grep` when
+the exit code matters — run it bare and grep the captured output file afterward.**
+
+After fixes: WIP crates build clean; `timeout_trio_harness` 5/5, `fts_harness` 42/42,
+`jsonb_index_harness` 2 pass + 2 perf-gates intentionally `#[ignore]`'d (adversarial
+fixtures, not a defect — see prior ADR discussion). Committed as 3 explicit-path commits
+(`01a53f6` advisory locks, `fe579e0` GIN completeness, `710ad06` pg_sleep). TASK.md
+5.28.A/B/C ticked; 5.28.B done via ADR 0026 advisory-lock blocking (no row-lock manager).
+
+## 2026-05-22 — Reclaimed 451GB: `target/debug` had ballooned; disk was at 98%
+
+`target/debug` was 451GB (vs 7.6GB release), volume at 98% / 26GB free — below the
+loop's 15GB reclaim floor and far too tight for parallel agent builds. `rm -rf
+target/debug` (fully regenerable) took the volume to 47% / 475GB free. `.claude` was
+only 1.8GB (memory + transcripts) and deliberately left untouched.
+
 ## 2026-05-22 — Capstone `cargo test --workspace --lib --bins` caught 1 real regression + 1 latent bug
 
 Ran the full workspace lib+bin unit suite as the capstone (the loop's "all clear →

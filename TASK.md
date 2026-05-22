@@ -1797,7 +1797,7 @@ trio with 6.P0.A's `statement_timeout`.**
 **Test-first.** Timeout-firing battery lands red first; each
 impl sub-task flips a named slice green.
 
-- [ ] **5.28.A — Timeout-firing + tooling-compat test harness**
+- [x] **5.28.A — Timeout-firing + tooling-compat test harness**
       (~1 day, lands first; lands red against current engine).
       Four layers:
       (1) **`lock_timeout` fires:** start a transaction holding
@@ -1816,20 +1816,21 @@ impl sub-task flips a named slice green.
       Files: `tests/integration/tests/session_timeouts.rs`,
       `tests/integration/tests/session_timeouts_tooling.rs`.
       Acceptance: harness compiles + reports red.
-- [~] **5.28.B — `lock_timeout` GUC + per-statement enforcement**
-      (~1 day). Cooperative cancellation at the lock-acquisition
-      boundary in `basin-shard` partition writers; SQLSTATE 55P03
-      on expiry. Files: `crates/basin-shard/src/lock_wait.rs` (new),
-      `crates/basin-engine/src/session.rs` (extend GUCs).
-      Acceptance: closes the **`lock_timeout` fires + 55P03**
-      slice of 5.28.A.
-- [~] **5.28.C — `idle_in_transaction_session_timeout` GUC +
+- [x] **5.28.B — `lock_timeout` GUC + per-statement enforcement**
+      (~1 day). Implemented per **ADR 0026** as advisory-lock blocking
+      (not a PG-style row-lock manager — row writes stay optimistic →
+      40001 at commit). `pg_advisory_lock` acquisition blocks and honors
+      `lock_timeout`, aborting with SQLSTATE 55P03 on expiry.
+      `crates/basin-engine/src/advisory_lock.rs` + `lock_registry.rs`.
+      Closes the **`lock_timeout` fires + 55P03** slice of 5.28.A
+      (timeout_trio_harness green).
+- [x] **5.28.C — `idle_in_transaction_session_timeout` GUC +
       session reaper** (~1 day). Tokio timer per transaction; on
       expiry, cancel the session + roll back; SQLSTATE 25P03.
       Files: `crates/basin-engine/src/session.rs` (extend),
       `crates/basin-engine/src/session_reaper.rs` (new).
-      Acceptance: closes the **idle-in-txn closes session** slice
-      of 5.28.A.
+      Closes the **idle-in-txn closes session** slice of 5.28.A
+      (timeout_trio_harness green).
 - [~] **5.28.D — Tooling-compat slice green** (~1 day). psql /
       DBeaver / pgcli pre-flight probes (`SHOW lock_timeout`, etc.)
       return PG-shape values; tool-driven `SET` lands cleanly.
