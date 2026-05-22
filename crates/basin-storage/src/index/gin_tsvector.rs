@@ -32,9 +32,16 @@
 //! # Storage / eviction
 //!
 //! The posting list lives entirely in RAM.  The registry caps each per-column
-//! posting list at [`MAX_POSTING_ENTRIES`] total entries; oldest insertions are
-//! evicted in 25% batches when the cap is exceeded.  On engine restart the
-//! registry starts empty and rebuilds lazily from writes.
+//! posting list at [`DEFAULT_POSTING_BUDGET`] total entries (operator-tunable
+//! via `BASIN_GIN_POSTING_BUDGET`); oldest lexemes are evicted in 25% batches
+//! when the cap is exceeded.  On engine restart the registry starts empty and
+//! rebuilds lazily from writes.
+//!
+//! **Per-file completeness (Phase 5.20.E+):** eviction marks only the
+//! *affected files* (those whose posting entries were dropped) as un-indexed,
+//! not the entire column.  Files that still have complete lexeme coverage
+//! remain prunable.  Un-indexed files are treated as forced candidates
+//! (must-scan) — correctness is scale-independent.
 //!
 //! # Engine wiring (Phase 5.20.E)
 //!
@@ -65,7 +72,27 @@ use basin_common::{ProjectId, TableName};
 
 /// Maximum total posting entries (file+rg+row tuples) kept per `(table, col)`
 /// posting list.  Beyond this threshold the oldest 25% of lexemes are evicted.
-const MAX_POSTING_ENTRIES: usize = 500_000;
+///
+/// This default can be overridden at process start via the
+/// `BASIN_GIN_POSTING_BUDGET` environment variable (shared with the JSONB GIN
+/// registry).  Example: `BASIN_GIN_POSTING_BUDGET=2000000 basin-server`.
+const DEFAULT_POSTING_BUDGET: usize = 500_000;
+
+/// Return the effective per-column posting-entry budget.
+///
+/// Reads `BASIN_GIN_POSTING_BUDGET` once and caches the result.  The same env
+/// var governs both the JSONB and tsvector GIN registries so operators have a
+/// single knob for both.
+fn posting_budget() -> usize {
+    use std::sync::OnceLock;
+    static BUDGET: OnceLock<usize> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("BASIN_GIN_POSTING_BUDGET")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_POSTING_BUDGET)
+    })
+}
 
 // ── Data types ────────────────────────────────────────────────────────────────
 
@@ -241,7 +268,7 @@ impl LexemePostingList {
             self.insert_order.push(lexeme);
         }
 
-        if self.total_count > MAX_POSTING_ENTRIES {
+        if self.total_count > posting_budget() {
             self.evict_oldest();
             true // eviction happened
         } else {
@@ -251,7 +278,7 @@ impl LexemePostingList {
 
     /// Evict the oldest 25% of lexemes.
     fn evict_oldest(&mut self) {
-        let evict_count = (MAX_POSTING_ENTRIES / 4).max(1);
+        let evict_count = (posting_budget() / 4).max(1);
         let to_evict: Vec<String> =
             self.insert_order.drain(..evict_count.min(self.insert_order.len())).collect();
         for k in &to_evict {

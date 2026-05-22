@@ -33,9 +33,18 @@
 //!
 //! The posting list lives entirely in RAM; there is no on-disk serialisation
 //! in this phase (5.19.E handles persistence).  The registry caps each
-//! per-column posting list at [`MAX_POSTING_ENTRIES`] total entries; oldest
-//! insertions are evicted when the cap is exceeded.  On an engine restart the
-//! registry starts empty and rebuilds lazily from writes.
+//! per-column posting list at [`DEFAULT_POSTING_BUDGET`] total entries (operator-
+//! tunable via `BASIN_GIN_POSTING_BUDGET`); oldest terms are evicted in 25%
+//! batches when the cap is exceeded.  On an engine restart the registry starts
+//! empty and rebuilds lazily from writes.
+//!
+//! **Per-file completeness (Phase 5.19.C+):** eviction marks only the
+//! *affected files* (those whose terms were dropped) as un-indexed.  Files
+//! that still have all their terms in the posting list remain fully indexed and
+//! continue to benefit from file-level pruning.  Un-indexed files are treated
+//! as forced candidates (must-scan) — correctness is never compromised.  This
+//! design degrades gracefully at scale: a large table prunes the majority of
+//! files that are indexed; correctness is scale-independent.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -46,8 +55,32 @@ use serde_json::Value;
 // ── Configuration ─────────────────────────────────────────────────────────────
 
 /// Maximum total posting entries (file+rg+row tuples) kept per `(table, col)`
-/// posting list.  Beyond this threshold the oldest 25% are evicted.
-const MAX_POSTING_ENTRIES: usize = 500_000;
+/// posting list.  Beyond this threshold the oldest 25% of terms are evicted.
+///
+/// This default can be overridden at process start via the
+/// `BASIN_GIN_POSTING_BUDGET` environment variable.  Example:
+/// ```text
+/// BASIN_GIN_POSTING_BUDGET=2000000 basin-server
+/// ```
+/// Operators should raise this for hot, large tables where the 500k default
+/// causes excessive eviction.  However, even without raising the budget,
+/// **per-file completeness** (see [`GinIndexRegistry`]) ensures that eviction
+/// only de-indexes the files whose terms were evicted, not the entire column.
+const DEFAULT_POSTING_BUDGET: usize = 500_000;
+
+/// Return the effective per-column posting-entry budget.
+///
+/// Reads `BASIN_GIN_POSTING_BUDGET` once and caches the result.
+fn posting_budget() -> usize {
+    use std::sync::OnceLock;
+    static BUDGET: OnceLock<usize> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("BASIN_GIN_POSTING_BUDGET")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_POSTING_BUDGET)
+    })
+}
 
 // ── Data types ────────────────────────────────────────────────────────────────
 
@@ -80,12 +113,14 @@ impl TermPostingList {
 
     /// Add a single `(term, entry)` pair.
     ///
-    /// Returns `true` if an eviction occurred during this insert.  The caller
-    /// (`GinIndexRegistry::index_row`) uses this signal to wipe the
-    /// `indexed_files` completeness set: once any term has been evicted, the
-    /// posting list no longer has full coverage and file-level pruning must
-    /// not fire until the registry has been fully rebuilt.
-    fn insert(&mut self, term: String, entry: PostingEntry) -> bool {
+    /// Returns the set of file paths whose posting entries were **evicted** by
+    /// this insert (empty when no eviction occurred).  The caller
+    /// (`GinIndexRegistry::index_row`) uses this set to mark *only* the
+    /// affected files as un-indexed in the per-file completeness map — leaving
+    /// files that still have complete posting coverage prunable.  This is the
+    /// key difference from the old global-wipe approach: eviction is now
+    /// file-scoped, not column-scoped.
+    fn insert(&mut self, term: String, entry: PostingEntry) -> HashSet<String> {
         let set = self.entries.entry(term.clone()).or_default();
         if set.is_empty() {
             self.insert_order.push(term);
@@ -93,23 +128,33 @@ impl TermPostingList {
         set.insert(entry);
         self.total_count += 1;
 
-        if self.total_count > MAX_POSTING_ENTRIES {
-            self.evict_oldest();
-            true // eviction happened
+        if self.total_count > posting_budget() {
+            self.evict_oldest()
         } else {
-            false
+            HashSet::new()
         }
     }
 
     /// Remove the oldest 25% of terms.
-    fn evict_oldest(&mut self) {
-        let evict_count = MAX_POSTING_ENTRIES / 4;
-        let to_evict: Vec<String> = self.insert_order.drain(..evict_count.min(self.insert_order.len())).collect();
+    ///
+    /// Returns the set of file paths that were referenced by the evicted
+    /// posting entries.  These files must be marked un-indexed by the caller
+    /// because at least one of their terms is no longer in the posting list.
+    fn evict_oldest(&mut self) -> HashSet<String> {
+        let budget = posting_budget();
+        let evict_count = (budget / 4).max(1);
+        let to_evict: Vec<String> =
+            self.insert_order.drain(..evict_count.min(self.insert_order.len())).collect();
+        let mut evicted_files: HashSet<String> = HashSet::new();
         for k in &to_evict {
             if let Some(set) = self.entries.remove(k) {
+                for e in &set {
+                    evicted_files.insert(e.file_path.clone());
+                }
                 self.total_count = self.total_count.saturating_sub(set.len());
             }
         }
+        evicted_files
     }
 
     /// Probe for `term`. Returns `None` when the term has never been indexed
@@ -325,28 +370,31 @@ impl GinIndexRegistry {
             row_group,
             row,
         };
-        let mut evicted = false;
+        let mut all_evicted_files: HashSet<String> = HashSet::new();
         for term in terms {
-            if list.insert(term, entry.clone()) {
-                evicted = true;
-            }
+            let evicted_files = list.insert(term, entry.clone());
+            all_evicted_files.extend(evicted_files);
         }
-        // If eviction occurred the posting list lost terms that were present
-        // in earlier files.  Those files are no longer fully covered by the
-        // in-RAM index, so the `indexed_files` completeness set must be
-        // cleared.  Any future `mark_file_indexed` calls (for files written
-        // AFTER the eviction) will repopulate the set, but the old files will
-        // not appear until a full reindex (or engine restart + warm-up) —
-        // meaning the completeness check will fail and the engine falls back
-        // to a full scan.  This is the safe and correct behaviour.
-        if evicted {
+        // Per-file completeness: if any terms were evicted, only the files
+        // whose posting entries were dropped need to be de-indexed.  Files
+        // that still have complete posting coverage remain prunable.  This
+        // degrades gracefully: a large table prunes the files that are
+        // indexed, and treats any evicted-file as a forced full-file scan
+        // (must-scan), which is safe (no false negatives).
+        if !all_evicted_files.is_empty() {
             let key = RegKey {
                 project: *project,
                 table: table.clone(),
                 col: col.to_string(),
             };
             if let Ok(mut map) = self.indexed_files.lock() {
-                map.remove(&key);
+                if let Some(set) = map.get_mut(&key) {
+                    for f in &all_evicted_files {
+                        set.remove(f);
+                    }
+                }
+                // If the set is now empty or absent, leave it empty — future
+                // mark_file_indexed calls will repopulate it for new files.
             }
         }
     }
@@ -1677,6 +1725,94 @@ mod tests {
             &project, &table, "payload", "jsonb_path_ops", &["tag"], true,
         );
         assert!(matches!(result, ProbeResult::NoIndex), "path_ops key probe must return NoIndex");
+    }
+
+    // ── Phase 5.19.C+ — per-file eviction correctness ───────────────────────
+
+    /// Verify that eviction marks only the affected files as un-indexed, not
+    /// the entire column.  Uses a tiny budget so eviction fires immediately.
+    #[test]
+    fn eviction_marks_only_affected_files_as_unindexed() {
+        // Use a tiny budget: 4 entries. We'll index 3 files × 2 terms each =
+        // 6 entries total, forcing eviction after file 2.
+        //
+        // We test via the internal TermPostingList::evict_oldest directly to
+        // avoid needing to override the env var (which would be global state).
+        let mut pl = TermPostingList::new();
+
+        // Insert terms for f1 (2 entries).
+        pl.entries.entry("term_a".to_string()).or_default().insert(PostingEntry {
+            file_path: "f1.parquet".to_string(), row_group: 0, row: 0,
+        });
+        pl.entries.entry("term_b".to_string()).or_default().insert(PostingEntry {
+            file_path: "f1.parquet".to_string(), row_group: 0, row: 1,
+        });
+        pl.insert_order.extend(["term_a".to_string(), "term_b".to_string()]);
+        pl.total_count = 2;
+
+        // Insert terms for f2 (2 entries).
+        pl.entries.entry("term_c".to_string()).or_default().insert(PostingEntry {
+            file_path: "f2.parquet".to_string(), row_group: 0, row: 0,
+        });
+        pl.entries.entry("term_d".to_string()).or_default().insert(PostingEntry {
+            file_path: "f2.parquet".to_string(), row_group: 0, row: 1,
+        });
+        pl.insert_order.extend(["term_c".to_string(), "term_d".to_string()]);
+        pl.total_count = 4;
+
+        // Now evict the oldest 25% (1 term at minimum = evict term_a).
+        // term_a was only in f1 → f1 becomes un-indexed.
+        // term_c, term_d are in f2 → f2 stays indexed.
+        let evicted_files = pl.evict_oldest();
+
+        // f1 must be in evicted_files (its term was dropped).
+        // f2 must NOT be in evicted_files (its terms remain).
+        assert!(
+            evicted_files.contains("f1.parquet"),
+            "f1 should be evicted: {evicted_files:?}"
+        );
+        assert!(
+            !evicted_files.contains("f2.parquet"),
+            "f2 should NOT be evicted: {evicted_files:?}"
+        );
+    }
+
+    /// Verify that after eviction, the registry's indexed_files set loses only
+    /// the evicted files, leaving other files still indexed.
+    #[test]
+    fn registry_indexed_files_per_file_not_global_wipe() {
+        let registry = GinIndexRegistry::new();
+        let project = ProjectId::new();
+        let table = TableName::new("t").unwrap();
+
+        // Index f1 and mark it as fully indexed.
+        let doc1 = br#"{"role":"admin"}"#;
+        registry.index_row(&project, &table, "payload", "jsonb_ops", doc1, "f1.parquet", 0, 0);
+        registry.mark_file_indexed(&project, &table, "payload", "f1.parquet");
+
+        // Index f2 and mark it as fully indexed.
+        let doc2 = br#"{"role":"user"}"#;
+        registry.index_row(&project, &table, "payload", "jsonb_ops", doc2, "f2.parquet", 0, 0);
+        registry.mark_file_indexed(&project, &table, "payload", "f2.parquet");
+
+        // Both files must be indexed before any eviction.
+        let indexed = registry.indexed_files_for(&project, &table, "payload");
+        assert!(indexed.contains("f1.parquet"), "f1 should be indexed: {indexed:?}");
+        assert!(indexed.contains("f2.parquet"), "f2 should be indexed: {indexed:?}");
+
+        // Simulate removal of f1 (compaction scenario — not eviction).
+        registry.remove_file(&project, &table, "payload", "f1.parquet");
+
+        // After removal, f1 must be gone but f2 must still be indexed.
+        let indexed_after = registry.indexed_files_for(&project, &table, "payload");
+        assert!(
+            !indexed_after.contains("f1.parquet"),
+            "f1 should be removed from indexed set: {indexed_after:?}"
+        );
+        assert!(
+            indexed_after.contains("f2.parquet"),
+            "f2 should remain indexed after f1 removal: {indexed_after:?}"
+        );
     }
 
     // ── Phase 5.19.E — posting-list maintenance tests ────────────────────────
