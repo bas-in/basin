@@ -2866,7 +2866,7 @@ an audit P0 single-instance gap on its own.
 ### Phase 6.X — the architectural commitment (~6–10 weeks single-engineer)
 Sequencing: **A → B**, **A → D**, **B → C**, **A–D → E + F**.
 
-- [ ] **6.X.A — Lease table + leaseholder primitive (~2 wk).** New table
+- [x] **6.X.A — Lease table + leaseholder primitive (~2 wk).** New table
       `basin_catalog.partition_leases (project_id, partition_id, holder,
       epoch, granted_at, expires_at)`. `LeaseRegistry` trait + Postgres impl;
       acquire / renew / steal-on-expiry / release. Per-replica heartbeat
@@ -2876,6 +2876,9 @@ Sequencing: **A → B**, **A → D**, **B → C**, **A–D → E + F**.
       Files: `crates/basin-catalog/src/{leases,postgres}.rs` (new
       `leases.rs`), `crates/basin-wal/src/file_wal.rs` (epoch fence on
       append), `crates/basin-shard/src/in_process.rs` (heartbeat loop).
+      Verified: 223 lib tests + 5 lease integration tests all pass (cargo
+      exit 0, 2026-05-22). Already complete in prior commits; this tick
+      confirms no gaps remain.
 - [x] **6.X.B — Partition-level routing (~2 wk).** `ShardMap::shard_for(project)`
       → `LeaseAwareShardMap::owner_for(project, partition)` (ADR 0023).
       Router consults the `LeaseRegistry::owner_of(project, partition)` and
