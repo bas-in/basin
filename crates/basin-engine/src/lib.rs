@@ -203,6 +203,16 @@ pub(crate) struct EngineInner {
     /// Sessions register on open and update state on each `execute()` call;
     /// `PgStatActivityLiveProvider` reads a per-project snapshot on scan.
     pub(crate) connection_registry: crate::connection_registry::ConnectionRegistry,
+
+    /// Phase 5.29.B-D: process-wide hypertable registry.
+    ///
+    /// Tracks which tables have been converted to hypertables (their time
+    /// column, chunk interval, and retention policy) and which logical chunks
+    /// exist per project. Shared across all sessions; per-project isolation is
+    /// structural (each project has its own `Arc<Mutex<ProjectHypertables>>`
+    /// inside the `DashMap`). Serves `timescaledb_information.chunks` at query
+    /// time via [`crate::hypertable_provider::ChunksProvider`].
+    pub(crate) hypertable_registry: Arc<crate::hypertable::HypertableRegistry>,
 }
 
 impl Engine {
@@ -279,6 +289,8 @@ impl Engine {
             reaper_registry: crate::session_reaper::SessionReaperRegistry::new(),
             lock_registry: basin_shard::LockRegistry::new(),
             connection_registry: crate::connection_registry::ConnectionRegistry::new(),
+            // Phase 5.29.B-D: process-wide hypertable registry.
+            hypertable_registry: Arc::new(crate::hypertable::HypertableRegistry::new()),
         });
         // Phase 5.14.D2: register the query-history adapter with the shard so
         // the compactor can consult observed ORDER BY / GROUP BY patterns.
@@ -452,6 +464,12 @@ impl Engine {
     /// Phase 5.23.C: access the process-wide connection registry for pg_stat_activity.
     pub(crate) fn connection_registry(&self) -> &crate::connection_registry::ConnectionRegistry {
         &self.inner.connection_registry
+    }
+
+    /// Phase 5.29.B-D: access the process-wide hypertable registry.
+    /// Cheap to clone (`Arc` inside).
+    pub(crate) fn hypertable_registry(&self) -> &Arc<crate::hypertable::HypertableRegistry> {
+        &self.inner.hypertable_registry
     }
 
     /// Crate-private hook bumped by `executor::execute` when a vector
@@ -792,6 +810,10 @@ mod advisory_lock;
 mod alter;
 mod alter_project;
 pub mod connection_registry;
+/// Phase 5.29.B-D — TimescaleDB-style hypertable registry and SQL matchers.
+pub(crate) mod hypertable;
+/// Phase 5.29.C — virtual `timescaledb_information.chunks` table provider.
+pub(crate) mod hypertable_provider;
 /// Phase 5.22.B/C — pg_dump-compatible plain + custom binary dump.
 pub mod dump;
 pub(crate) mod operators;

@@ -57,6 +57,8 @@ pub fn evaluate(
     use arrow_array::cast::AsArray;
     use arrow_array::types::{
         Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, UInt64Type,
+        TimestampMicrosecondType, TimestampNanosecondType,
+        TimestampMillisecondType, TimestampSecondType,
     };
     use arrow_array::Array;
     use arrow_array::BooleanArray;
@@ -149,6 +151,72 @@ pub fn evaluate(
         (Predicate::Lt(_, _), ScalarValue::Int64(v)) if *col.data_type() == Dt::Int16 => {
             cmp_narrow_int_as_i64!(Int16Type, *v, <)
         }
+        // Timestamp(Microsecond) column vs Int64 scalar (µs since epoch).
+        // Arrow's TimestampMicrosecondType stores raw i64 µs; comparing an
+        // Int64 scalar directly gives the correct result.
+        (Predicate::Eq(_, _), ScalarValue::Int64(v))
+            if matches!(col.data_type(), Dt::Timestamp(arrow_schema::TimeUnit::Microsecond, _)) =>
+        {
+            cmp_narrow_int_as_i64!(TimestampMicrosecondType, *v, ==)
+        }
+        (Predicate::Gt(_, _), ScalarValue::Int64(v))
+            if matches!(col.data_type(), Dt::Timestamp(arrow_schema::TimeUnit::Microsecond, _)) =>
+        {
+            cmp_narrow_int_as_i64!(TimestampMicrosecondType, *v, >)
+        }
+        (Predicate::Lt(_, _), ScalarValue::Int64(v))
+            if matches!(col.data_type(), Dt::Timestamp(arrow_schema::TimeUnit::Microsecond, _)) =>
+        {
+            cmp_narrow_int_as_i64!(TimestampMicrosecondType, *v, <)
+        }
+        // Timestamp(Nanosecond) column vs Int64 scalar (ns since epoch).
+        (Predicate::Eq(_, _), ScalarValue::Int64(v))
+            if matches!(col.data_type(), Dt::Timestamp(arrow_schema::TimeUnit::Nanosecond, _)) =>
+        {
+            cmp_narrow_int_as_i64!(TimestampNanosecondType, *v, ==)
+        }
+        (Predicate::Gt(_, _), ScalarValue::Int64(v))
+            if matches!(col.data_type(), Dt::Timestamp(arrow_schema::TimeUnit::Nanosecond, _)) =>
+        {
+            cmp_narrow_int_as_i64!(TimestampNanosecondType, *v, >)
+        }
+        (Predicate::Lt(_, _), ScalarValue::Int64(v))
+            if matches!(col.data_type(), Dt::Timestamp(arrow_schema::TimeUnit::Nanosecond, _)) =>
+        {
+            cmp_narrow_int_as_i64!(TimestampNanosecondType, *v, <)
+        }
+        // Timestamp(Millisecond) column vs Int64 scalar (ms since epoch).
+        (Predicate::Eq(_, _), ScalarValue::Int64(v))
+            if matches!(col.data_type(), Dt::Timestamp(arrow_schema::TimeUnit::Millisecond, _)) =>
+        {
+            cmp_narrow_int_as_i64!(TimestampMillisecondType, *v, ==)
+        }
+        (Predicate::Gt(_, _), ScalarValue::Int64(v))
+            if matches!(col.data_type(), Dt::Timestamp(arrow_schema::TimeUnit::Millisecond, _)) =>
+        {
+            cmp_narrow_int_as_i64!(TimestampMillisecondType, *v, >)
+        }
+        (Predicate::Lt(_, _), ScalarValue::Int64(v))
+            if matches!(col.data_type(), Dt::Timestamp(arrow_schema::TimeUnit::Millisecond, _)) =>
+        {
+            cmp_narrow_int_as_i64!(TimestampMillisecondType, *v, <)
+        }
+        // Timestamp(Second) column vs Int64 scalar (s since epoch).
+        (Predicate::Eq(_, _), ScalarValue::Int64(v))
+            if matches!(col.data_type(), Dt::Timestamp(arrow_schema::TimeUnit::Second, _)) =>
+        {
+            cmp_narrow_int_as_i64!(TimestampSecondType, *v, ==)
+        }
+        (Predicate::Gt(_, _), ScalarValue::Int64(v))
+            if matches!(col.data_type(), Dt::Timestamp(arrow_schema::TimeUnit::Second, _)) =>
+        {
+            cmp_narrow_int_as_i64!(TimestampSecondType, *v, >)
+        }
+        (Predicate::Lt(_, _), ScalarValue::Int64(v))
+            if matches!(col.data_type(), Dt::Timestamp(arrow_schema::TimeUnit::Second, _)) =>
+        {
+            cmp_narrow_int_as_i64!(TimestampSecondType, *v, <)
+        }
         // Fallback: Int64 scalar vs any remaining int type (original arms).
         (Predicate::Eq(_, _), ScalarValue::Int64(v)) => cmp_primitive!(Int64Type, *v, ==),
         (Predicate::Gt(_, _), ScalarValue::Int64(v)) => cmp_primitive!(Int64Type, *v, >),
@@ -204,6 +272,33 @@ pub fn evaluate(
                     b.append_value(false);
                 } else {
                     b.append_value(arr.value(i) == needle);
+                }
+            }
+            b.finish()
+        }
+        // Timestamp column vs Utf8 scalar — parse the string as a PG/ISO-8601
+        // timestamp and compare as i64 microseconds.  This handles pushdown of
+        // queries like `WHERE ts < '2023-02-01 00:00:00+00'` where the literal
+        // arrives as a Utf8 scalar from `fast_select::literal_value`.
+        (Predicate::Eq(_, _), ScalarValue::Utf8(v))
+        | (Predicate::Gt(_, _), ScalarValue::Utf8(v))
+        | (Predicate::Lt(_, _), ScalarValue::Utf8(v))
+            if matches!(col.data_type(), Dt::Timestamp(..)) =>
+        {
+            // Parse the timestamp string into microseconds since epoch.
+            let us: i64 = parse_ts_str_to_us(v);
+            let arr = col.as_primitive::<TimestampMicrosecondType>();
+            let op: fn(i64, i64) -> bool = match predicate {
+                Predicate::Eq(_, _) => |a, b| a == b,
+                Predicate::Gt(_, _) => |a, b| a > b,
+                Predicate::Lt(_, _) => |a, b| a < b,
+            };
+            let mut b = arrow_array::builder::BooleanBuilder::with_capacity(arr.len());
+            for i in 0..arr.len() {
+                if arr.is_null(i) {
+                    b.append_value(false);
+                } else {
+                    b.append_value(op(arr.value(i), us));
                 }
             }
             b.finish()
@@ -665,6 +760,54 @@ fn decode_f64(b: &[u8]) -> Option<f64> {
     let mut arr = [0u8; 8];
     arr.copy_from_slice(b);
     Some(f64::from_le_bytes(arr))
+}
+
+/// Parse a PG/ISO-8601 timestamp string to microseconds since Unix epoch.
+///
+/// Accepted forms (examples):
+///   * `'2023-02-01 00:00:00+00'`   (PG short UTC offset — most common)
+///   * `'2023-02-01T00:00:00+00:00'` (RFC 3339)
+///   * `'2023-02-01 00:00:00'`       (no timezone → UTC assumed)
+///
+/// Returns `i64::MIN` on parse failure so the predicate never matches — a
+/// safe sentinel since valid timestamps are far from `i64::MIN`.
+fn parse_ts_str_to_us(s: &str) -> i64 {
+    use chrono::{NaiveDateTime, TimeZone, Utc};
+
+    // 1) RFC 3339 / ISO-8601 with full offset.
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return dt.with_timezone(&Utc).timestamp_micros();
+    }
+
+    // 2) Normalise: replace space separator with 'T', then expand short UTC
+    //    offset `+HH` → `+HH:00`.
+    let mut norm = s.to_string();
+    if !norm.contains('T') {
+        if let Some(pos) = norm.find(' ') {
+            norm.replace_range(pos..=pos, "T");
+        }
+    }
+    // Expand trailing +HH or -HH (3 chars, no colon).
+    let maybe_tz = norm[10..].rfind('+').map(|p| p + 10)
+        .or_else(|| norm[10..].rfind('-').map(|p| p + 10));
+    if let Some(pos) = maybe_tz {
+        let suffix = &norm[pos..];
+        if suffix.len() == 3 && !suffix.contains(':') {
+            norm.push_str(":00");
+        }
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&norm) {
+        return dt.with_timezone(&Utc).timestamp_micros();
+    }
+
+    // 3) No timezone — assume UTC.
+    let no_tz = s.trim_end_matches('+').trim_end_matches("00");
+    if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Utc.from_utc_datetime(&ndt).timestamp_micros();
+    }
+    let _ = no_tz;
+
+    i64::MIN
 }
 
 #[cfg(test)]

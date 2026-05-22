@@ -84,11 +84,9 @@ async fn row_count(sess: &basin_engine::ProjectSession, sql: &str) -> usize {
 //
 // Closed by: 5.29.B (hypertable DDL + auto-chunk creation).
 
-/// Phase 5.29.A — `create_hypertable` auto-partitions inserts by time bucket.
+/// Phase 5.29.B — `create_hypertable` auto-partitions inserts by time bucket.
 ///
-/// Closes when: 5.29.B lands and the engine supports `create_hypertable` with
-/// a 1-day partition interval. At that point drop this `#[ignore]`.
-#[ignore = "5.29.A harness — hypertable pending; closes 5.29.B-F"]
+/// Closed by 5.29.B: create_hypertable DDL + auto-chunk creation.
 #[tokio::test]
 async fn hypertable_create_and_autopartition() {
     // Slice: "auto-partition"
@@ -216,11 +214,9 @@ async fn hypertable_create_and_autopartition() {
 //
 // Closed by: 5.29.C (chunk-exclusion / predicate pushdown).
 
-/// Phase 5.29.A — SELECT WHERE ts BETWEEN only scans relevant chunks.
+/// Phase 5.29.C — SELECT WHERE ts BETWEEN only scans relevant chunks.
 ///
-/// Closes when: 5.29.C lands and the query planner prunes chunks outside the
-/// requested time range. At that point drop this `#[ignore]`.
-#[ignore = "5.29.A harness — hypertable pending; closes 5.29.B-F"]
+/// Closed by 5.29.C: chunk-exclusion / predicate pushdown.
 #[tokio::test]
 async fn hypertable_query_routing() {
     // Slice: "query routing"
@@ -373,11 +369,9 @@ async fn hypertable_query_routing() {
 //
 // Closed by: 5.29.D (retention policy scheduler + chunk drop).
 
-/// Phase 5.29.A — `add_retention_policy` drops old chunks on schedule.
+/// Phase 5.29.D — `add_retention_policy` drops old chunks on schedule.
 ///
-/// Closes when: 5.29.D lands and the retention policy machinery can drop
-/// chunks older than the specified interval. At that point drop this `#[ignore]`.
-#[ignore = "5.29.A harness — hypertable pending; closes 5.29.B-F"]
+/// Closed by 5.29.D: retention policy scheduler + chunk drop.
 #[tokio::test]
 async fn hypertable_add_retention_policy() {
     // Slice: "retention"
@@ -521,11 +515,11 @@ async fn hypertable_add_retention_policy() {
 //
 // Closed by: 5.29.E (compression + tiered storage read path).
 
-/// Phase 5.29.A — old chunks compress + tier to cold storage; still queryable.
+/// Phase 5.29.E — old chunks compress + tier to cold storage; still queryable.
 ///
-/// Closes when: 5.29.E lands and the engine can compress old chunks and serve
-/// queries transparently from compressed cold storage. Drop this `#[ignore]`.
-#[ignore = "5.29.A harness — hypertable pending; closes 5.29.B-F"]
+/// Closed by 5.29.E: compress_chunk marks is_compressed, rows still queryable.
+/// Note: physical cold-tier storage is metadata-only in this implementation;
+/// data remains in the base table and is transparently queryable.
 #[tokio::test]
 async fn hypertable_compression_tier_down() {
     // Slice: "tier-down"
@@ -674,11 +668,9 @@ async fn hypertable_compression_tier_down() {
 //
 // Closed by: 5.29.F (ORM compat validation).
 
-/// Phase 5.29.A — sqlx / Diesel migration + insert + time-range query shapes.
+/// Phase 5.29.F — sqlx / Diesel migration + insert + time-range query shapes.
 ///
-/// Closes when: 5.29.F lands and the engine accepts all ORM-generated SQL for
-/// hypertable operations. Drop this `#[ignore]`.
-#[ignore = "5.29.A harness — hypertable pending; closes 5.29.B-F"]
+/// Closed by 5.29.F: ORM compat validation.
 #[tokio::test]
 async fn hypertable_orm_compat() {
     // Slice: "ORM compat"
@@ -874,12 +866,13 @@ async fn hypertable_orm_compat() {
 //
 // Closed by: 5.29.F (write-path efficiency for hypertable inserts).
 
-/// Phase 5.29.A — sustained hypertable insert throughput stays bounded.
+/// Phase 5.29.F — sustained hypertable insert throughput stays bounded.
 ///
 /// Uses 1M rows (see scale note; 1B is the production target per TASK.md).
-/// Closes when: 5.29.F lands and insert throughput is stable over the soak
-/// duration. At that point drop this `#[ignore]`.
-#[ignore = "5.29.A harness — hypertable pending; closes 5.29.B-F"]
+/// Left ignored: 1M-row soak is too slow for CI; run manually in a dedicated
+/// load-test environment.  The 1B-row production target requires a separate
+/// performance harness per TASK.md.
+#[ignore = "5.29.F soak — 1M-row insert is too slow for CI; run manually"]
 #[tokio::test]
 async fn hypertable_1b_row_write_soak() {
     // Slice: "soak"

@@ -325,6 +325,11 @@ pub(crate) fn build_stateless_udf_cache() -> StatelessUdfCache {
     crate::datetime_more_udf::register_datetime_more_udfs(&ctx);
     crate::string_more_udf::register_string_more_udfs(&ctx);
     crate::regex_udf::register_regex_udfs(&ctx);
+    // Phase 5.29.B: time_bucket(interval_text, ts) → ts (TimescaleDB-compat).
+    // Registered before datetime_extras so that datetime_extras (which
+    // registers array_dims) comes last and takes precedence over any
+    // DataFusion built-in with the same name.
+    crate::hypertable::register_time_bucket_udf(&ctx);
     crate::datetime_extras::register_datetime_extras(&ctx);
     let state = ctx.state();
     StatelessUdfCache {
@@ -1065,6 +1070,27 @@ pub(crate) async fn open(
         engine.inner.query_stats.clone(),
     )
     .map_err(|e| BasinError::internal(format!("basin_stat_statements: {e}")))?;
+
+    // Phase 5.29.C: register `timescaledb_information.chunks` virtual schema.
+    // Serves chunk metadata from the HypertableRegistry so TimescaleDB-
+    // compatible queries like `SELECT chunk_name FROM
+    // timescaledb_information.chunks WHERE hypertable_name = 'metrics'` work.
+    {
+        use datafusion::catalog::{MemorySchemaProvider, SchemaProvider};
+        use datafusion::datasource::TableProvider;
+        let catalog_name = ctx.state().config_options().catalog.default_catalog.clone();
+        if let Some(df_catalog) = ctx.catalog(&catalog_name) {
+            let ts_schema = Arc::new(MemorySchemaProvider::new());
+            let chunks_provider: Arc<dyn TableProvider> = Arc::new(
+                crate::hypertable_provider::ChunksProvider::new(
+                    engine.hypertable_registry().clone(),
+                    project,
+                ),
+            );
+            let _ = ts_schema.register_table("chunks".to_string(), chunks_provider);
+            let _ = df_catalog.register_schema("timescaledb_information", ts_schema);
+        }
+    }
 
     let state = Arc::new(SessionState::new());
 
