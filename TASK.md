@@ -1384,7 +1384,7 @@ implementation task closes against this harness.
       `tests/integration/fixtures/fivetran-compose.yml`.
       Acceptance: harness compiles + reports red against the current
       engine.
-- [ ] **5.21.B — Replication slot pgwire commands** (~1 week).
+- [x] **5.21.B — Replication slot pgwire commands** (~1 week).
       `CREATE_REPLICATION_SLOT <name> LOGICAL pgoutput`,
       `DROP_REPLICATION_SLOT <name>`, `START_REPLICATION SLOT <name>
       LOGICAL <start_lsn>` parsed at the pgwire layer. Catalog
@@ -1393,14 +1393,14 @@ implementation task closes against this harness.
       `crates/basin-engine/src/pgwire/replication.rs` (new),
       `crates/basin-catalog/src/replication_slots.rs` (new).
       Acceptance: protocol-handshake slice of 5.21.A flips green.
-- [ ] **5.21.C — `pgoutput` plugin: encode `ChangeEvent` → pgoutput
+- [x] **5.21.C — `pgoutput` plugin: encode `ChangeEvent` → pgoutput
       messages** (~2 weeks). Translate Phase 5.11.G ChangeEventSink
       events into pgoutput wire format: `RELATION`, `BEGIN`, `INSERT`,
       `UPDATE`, `DELETE`, `COMMIT`. Tuple encoding (text + binary).
       Files: `crates/basin-engine/src/replication/pgoutput.rs` (new).
       Acceptance: in-process-consumer slice of 5.21.A flips green;
       Debezium snapshot+streaming slice begins decoding correctly.
-- [ ] **5.21.D — LSN management + ack handling + replay** (~1 week).
+- [x] **5.21.D — LSN management + ack handling + replay** (~1 week).
       Monotonic per-project LSN sequence (already exists as
       `ChangeEvent.seq`). Consumer ack messages advance
       `confirmed_flush_lsn`; engine GCs WAL segments only past the
@@ -1409,7 +1409,7 @@ implementation task closes against this harness.
       `crates/basin-wal/src/retention.rs` (extend).
       Acceptance: replay+retention slice of 5.21.A flips green
       (crash-restart resumes; WAL retention respects min-confirmed).
-- [ ] **5.21.E — `CREATE PUBLICATION` SQL surface** (~1 week).
+- [x] **5.21.E — `CREATE PUBLICATION` SQL surface** (~1 week).
       `CREATE PUBLICATION p FOR ALL TABLES;`,
       `CREATE PUBLICATION p FOR TABLE t1, t2 WITH (publish='insert,update');`,
       `ALTER PUBLICATION`, `DROP PUBLICATION`. Per-project per-table
