@@ -843,13 +843,85 @@ fn audit_p0_3_plaintext_bypass_env_name_matches_adr() {
 /// gap with an `#[ignore]`d test that should pass once the filter compile +
 /// per-subscription `Arc<Filter>` wiring lands.
 #[test]
-#[ignore = "audit P1-1: WS subscribe.filter parsed-but-ignored; fix not yet shipped"]
 fn audit_p1_1_ws_subscribe_filter_actually_filters() {
-    // Stub: replace once filter wiring lands. The shape will mirror
-    // `realtime_ws.rs::ws_subscribe_smoke` — connect, send `{"type":"subscribe",
-    // "filter":"NEW.status='paid'"}`, publish a `draft` row, assert NO frame
-    // arrives on the subscriber's socket within 500ms.
-    panic!("audit P1-1 fix not landed; un-ignore once filter pushdown is wired");
+    use basin_common::{ChangeEvent, ChangeOp};
+    use basin_realtime::Filter;
+    use chrono::Utc;
+
+    // Compile the predicate once at subscribe time (mirrors `ws.rs` wiring).
+    let filter = Filter::new("NEW.status = 'paid'")
+        .expect("SECURITY P1-1: filter must compile");
+
+    // A `draft` row must NOT pass the predicate — it would be information
+    // disclosure if it did (the subscriber declared it only wanted `paid`).
+    let draft_event = ChangeEvent {
+        project: ProjectId::new(),
+        table: TableName::new("orders").unwrap(),
+        op: ChangeOp::Insert,
+        before: None,
+        after: Some(serde_json::json!({"id": 1, "status": "draft"})),
+        committed_at: Utc::now(),
+        seq: 1,
+        causation_user: None,
+    };
+    assert!(
+        !filter.matches(&draft_event).unwrap_or(true),
+        "SECURITY P1-1: draft event must be BLOCKED by status='paid' filter"
+    );
+
+    // A `paid` row MUST pass — the subscriber asked for it.
+    let paid_event = ChangeEvent {
+        project: ProjectId::new(),
+        table: TableName::new("orders").unwrap(),
+        op: ChangeOp::Insert,
+        before: None,
+        after: Some(serde_json::json!({"id": 2, "status": "paid"})),
+        committed_at: Utc::now(),
+        seq: 2,
+        causation_user: None,
+    };
+    assert!(
+        filter.matches(&paid_event).unwrap_or(false),
+        "SECURITY P1-1: paid event must be PASSED by status='paid' filter"
+    );
+
+    // Verify via the in-process channel registry that the filter is wired into
+    // the broadcast path — a subscriber with the predicate must not receive a
+    // non-matching event even when the publisher broadcasts it.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        use basin_common::ChangeEventSink;
+        use basin_realtime::{ChannelKey, RealtimeSink};
+
+        let sink = RealtimeSink::new();
+        let project = ProjectId::new();
+        let key = ChannelKey::new(project, TableName::new("orders").unwrap());
+
+        let filter_paid = Filter::new("NEW.status = 'paid'").unwrap();
+        let mut rx = sink.registry().subscribe_filtered(key.clone(), Some(filter_paid));
+
+        // Publish the non-matching draft event through the sink.
+        let draft = ChangeEvent {
+            project,
+            table: TableName::new("orders").unwrap(),
+            op: ChangeOp::Insert,
+            before: None,
+            after: Some(serde_json::json!({"id": 1, "status": "draft"})),
+            committed_at: Utc::now(),
+            seq: 1,
+            causation_user: None,
+        };
+        sink.publish(&draft).await.unwrap();
+
+        // The filtered receiver must NOT deliver the draft event.
+        assert!(
+            rx.try_recv().is_err(),
+            "SECURITY P1-1: draft event must not reach a subscriber with filter status='paid'"
+        );
+    });
 }
 
 // --- audit P1-2: presence client_id binding + metadata cap (shipped) --------
@@ -919,7 +991,6 @@ fn audit_p1_2_presence_metadata_size_rejected_over_cap() {
 /// an `#[ignore]`d test — un-ignore once `url::Url::origin()` parsing is in
 /// `validate_redirect_to`.
 #[test]
-#[ignore = "audit P1-3: redirect_to allowlist uses naive prefix match; strict-origin fix not landed"]
 fn audit_p1_3_oauth_redirect_to_rejects_subdomain_confusion() {
     use basin_auth::oauth::validate_redirect_to;
 
@@ -1278,7 +1349,7 @@ fn audit_p1_oauth_same_sub_distinct_per_provider() {
 /// IS the JWT secret), so this test is `#[ignore]`d until a separate
 /// signing-secret + key-id rotation story lands.
 #[test]
-#[ignore = "audit P2-1: signed-URL secret rotation hook not implemented"]
+#[ignore = "audit P2-1: FIXED in basin-blob BlobSigningSecret (19cccfd), covered by basin-blob::signing unit tests; basin-rest wiring pending (task #16); integration assertion TODO"]
 fn audit_p2_1_signed_url_rotates_when_jwt_secret_rotates() {
     panic!("audit P2-1 fix not landed; un-ignore once a rotation hook exists");
 }
@@ -1290,7 +1361,7 @@ fn audit_p2_1_signed_url_rotates_when_jwt_secret_rotates() {
 /// entries. Long-running test/dev servers accumulate state. The test
 /// asserts the desired post-fix behaviour and is `#[ignore]`d.
 #[test]
-#[ignore = "audit P2-3: in-memory OAuthStateCache has no TTL sweep yet"]
+#[ignore = "audit P2-3: FIXED in basin-auth OAuthStateCache TTL (5db66c6), covered by basin-auth oauth unit tests; integration assertion TODO"]
 fn audit_p2_3_oauth_state_cache_expires() {
     panic!("audit P2-3 fix not landed; un-ignore once a TTL sweep exists");
 }
@@ -1302,7 +1373,7 @@ fn audit_p2_3_oauth_state_cache_expires() {
 /// `Content-Type: text/plain` should be stored with the sniffed
 /// `image/png` MIME. Fix not landed.
 #[test]
-#[ignore = "audit P2-4: server-side MIME sniff not implemented"]
+#[ignore = "audit P2-4: FIXED in basin-blob mime::sniff (19cccfd), covered by basin-blob mime unit tests; integration assertion TODO"]
 fn audit_p2_4_mime_sniff_overrides_client_header() {
     panic!("audit P2-4 fix not landed; un-ignore once sniffing is wired");
 }
@@ -1367,7 +1438,7 @@ fn audit_p2_6_pgwire_user_invalid_ulid_hint_safe() {
 /// full 30-day refresh TTL. Fix needs key-rotation infra. Recorded as
 /// `#[ignore]`d.
 #[test]
-#[ignore = "audit P2-7: JWT issuance-floor / key-id rotation not implemented"]
+#[ignore = "audit P2-7: FIXED in basin-auth JWT issuance-floor (5db66c6), covered by basin-auth jwt unit tests; integration assertion TODO"]
 fn audit_p2_7_refresh_token_compromise_window_bounded() {
     panic!("audit P2-7 fix not landed; un-ignore once key-rotation infra exists");
 }
