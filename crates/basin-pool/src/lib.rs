@@ -52,6 +52,7 @@ mod pooled_session;
 mod return_scrub;
 mod state;
 mod stats;
+mod tenant_isolation;
 
 pub use eviction::EvictionHandle;
 pub use mode::PoolMode;
@@ -192,6 +193,23 @@ impl SessionPool {
             match action {
                 Action::Hit(session) => {
                     self.inner.stats.record_hit();
+
+                    // 5.27.D: defence-in-depth project-tag validation.
+                    // The cache key already encodes the project, so a mismatch
+                    // here indicates a pool-internal bug (wrong-key lookup, map
+                    // corruption, etc.).  Reject hard rather than silently
+                    // exposing one project's session to another.
+                    if let Err(e) =
+                        tenant_isolation::assert_project_tag(&session, key.project)
+                    {
+                        // Drop the session Arc before releasing the slot so its
+                        // destructors run outside the pool lock.
+                        drop(session);
+                        let mut state = self.inner.state.lock().await;
+                        state.release_slot(key.project);
+                        return Err(e);
+                    }
+
                     // Session mode: scrub the session before handing it to the
                     // new logical client.  Applying the scrub at checkout (not
                     // at return) keeps `Drop` synchronous and preserves the
@@ -217,6 +235,24 @@ impl SessionPool {
                     match self.inner.engine.open_session(key.project).await {
                         Ok(session) => {
                             self.inner.stats.record_miss();
+
+                            // 5.27.D: validate the freshly-opened session carries
+                            // the correct project tag.  The engine stamps the tag
+                            // at open time; this assertion catches any regression
+                            // where open_session returns a session for the wrong
+                            // project.
+                            if let Err(e) = tenant_isolation::assert_project_tag(
+                                &session,
+                                key.project,
+                            ) {
+                                // Drop the session outside the lock, then release
+                                // the reserved slot so capacity is not leaked.
+                                drop(session);
+                                let mut state = self.inner.state.lock().await;
+                                state.release_slot(key.project);
+                                return Err(e);
+                            }
+
                             let arc = Arc::new(session);
                             return Ok(pooled_session::build(self.inner.clone(), key, arc));
                         }
@@ -653,5 +689,120 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), handle.shutdown())
             .await
             .expect("eviction loop should respond to shutdown");
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 5.27.D — per-project isolation at checkout
+    // -------------------------------------------------------------------------
+
+    /// A session opened for project A carries project A's tag; acquiring from
+    /// the pool for project A must succeed and return that session.
+    #[tokio::test]
+    async fn checkout_validates_correct_project_tag() {
+        let dir = TempDir::new().unwrap();
+        let pool = SessionPool::new(engine_in(&dir), cfg_default());
+        let project_a = ProjectId::new();
+
+        // First acquire opens a fresh session for project A.
+        let s1 = pool.acquire(project_a, None).await.unwrap();
+        assert_eq!(
+            s1.project(),
+            project_a,
+            "PooledSession must carry the project it was opened for"
+        );
+        drop(s1);
+
+        // Second acquire is a cache hit; project tag validation must pass.
+        let s2 = pool.acquire(project_a, None).await.unwrap();
+        assert_eq!(
+            s2.project(),
+            project_a,
+            "cached session must still carry the correct project tag"
+        );
+        let stats = pool.stats();
+        assert_eq!(stats.hits, 1, "second acquire must be a cache hit");
+    }
+
+    /// Two distinct projects must never share a session: acquiring for project
+    /// A and then acquiring for project B must open two separate sessions, each
+    /// carrying only its own project tag.
+    #[tokio::test]
+    async fn two_projects_never_share_a_session() {
+        let dir = TempDir::new().unwrap();
+        let pool = SessionPool::new(engine_in(&dir), cfg_default());
+        let project_a = ProjectId::new();
+        let project_b = ProjectId::new();
+
+        let sa = pool.acquire(project_a, None).await.unwrap();
+        let sb = pool.acquire(project_b, None).await.unwrap();
+
+        assert_eq!(sa.project(), project_a);
+        assert_eq!(sb.project(), project_b);
+        assert_ne!(
+            session_addr(sa.session()),
+            session_addr(sb.session()),
+            "distinct projects must get distinct physical sessions"
+        );
+
+        drop(sa);
+        drop(sb);
+
+        // After releasing both, each project should be able to hit its own
+        // cached slot — and the project tag must still match.
+        let sa2 = pool.acquire(project_a, None).await.unwrap();
+        assert_eq!(sa2.project(), project_a, "project A cache hit must keep tag");
+
+        let sb2 = pool.acquire(project_b, None).await.unwrap();
+        assert_eq!(sb2.project(), project_b, "project B cache hit must keep tag");
+
+        let stats = pool.stats();
+        assert_eq!(stats.hits, 2, "both second acquires should be cache hits");
+    }
+
+    /// Under high concurrency across two projects, no session must ever be
+    /// handed to the wrong project. Each task validates `s.project() == its_project`.
+    #[tokio::test]
+    async fn concurrent_checkouts_across_projects_never_cross() {
+        let dir = TempDir::new().unwrap();
+        let cfg = PoolConfig {
+            max_sessions: 16,
+            per_project_cap: 8,
+            ..cfg_default()
+        };
+        let pool = Arc::new(SessionPool::new(engine_in(&dir), cfg));
+        let project_a = ProjectId::new();
+        let project_b = ProjectId::new();
+
+        let mut joins = Vec::new();
+        for _ in 0..20 {
+            let p = pool.clone();
+            joins.push(tokio::spawn(async move {
+                let s = p.acquire(project_a, None).await.unwrap();
+                // Project tag on the handed-out session MUST match.
+                assert_eq!(
+                    s.project(),
+                    project_a,
+                    "5.27.D violation: session for project_a carries wrong tag"
+                );
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                drop(s);
+            }));
+
+            let p2 = pool.clone();
+            joins.push(tokio::spawn(async move {
+                let s = p2.acquire(project_b, None).await.unwrap();
+                assert_eq!(
+                    s.project(),
+                    project_b,
+                    "5.27.D violation: session for project_b carries wrong tag"
+                );
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                drop(s);
+            }));
+        }
+
+        for j in joins {
+            j.await.expect("task must not panic");
+        }
     }
 }
