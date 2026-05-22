@@ -11,7 +11,8 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::body::Body;
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -348,4 +349,83 @@ pub(crate) async fn register_byo_bucket(
         .map_err(ApiError::from)?;
 
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Feature 3 (5.22.D): GET /admin/v1/:project_id/dump?format=plain|custom
+// ---------------------------------------------------------------------------
+
+/// Query parameters for the dump endpoint.
+#[derive(Debug, Deserialize)]
+pub(crate) struct DumpQuery {
+    /// `plain` (default) — self-contained SQL script.
+    /// `custom` — Basin binary archive format.
+    #[serde(default)]
+    pub format: DumpFormat,
+}
+
+/// Wire format selector for the dump endpoint.
+#[derive(Debug, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum DumpFormat {
+    #[default]
+    Plain,
+    Custom,
+}
+
+/// `GET /admin/v1/:project_id/dump` — stream a pg_dump-compatible export.
+///
+/// Auth: `is_admin: true` JWT scoped to `project_id`.
+///
+/// Query params:
+/// - `format=plain` (default) → `Content-Type: application/sql`
+/// - `format=custom`          → `Content-Type: application/octet-stream`
+#[axum::debug_handler]
+pub(crate) async fn dump_project(
+    State(state): State<Arc<Inner>>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Query(query): Query<DumpQuery>,
+) -> Result<Response, ApiError> {
+    let claims = authorize(&state, &headers).await?;
+    require_admin(&claims)?;
+
+    let project: ProjectId = project_id
+        .parse()
+        .map_err(|e| ApiError::invalid(format!("invalid project_id: {e}")))?;
+    assert_admin_for_path_project(&claims, &project)?;
+
+    let engine = &state.cfg.engine;
+    let opts = basin_engine::dump::DumpOptions::new();
+
+    match query.format {
+        DumpFormat::Plain => {
+            let sql = basin_engine::dump::dump_plain(engine, project, &opts)
+                .await
+                .map_err(ApiError::from)?;
+            Ok((
+                StatusCode::OK,
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("application/sql"),
+                )],
+                Body::from(sql),
+            )
+                .into_response())
+        }
+        DumpFormat::Custom => {
+            let bytes = basin_engine::dump::dump_custom(engine, project, &opts)
+                .await
+                .map_err(ApiError::from)?;
+            Ok((
+                StatusCode::OK,
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("application/octet-stream"),
+                )],
+                Body::from(bytes),
+            )
+                .into_response())
+        }
+    }
 }
