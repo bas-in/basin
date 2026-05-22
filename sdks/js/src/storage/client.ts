@@ -3,12 +3,13 @@
  * with `.upload`, `.download`, `.list`, `.remove`, `.createSignedUrl`,
  * `.getPublicUrl`.
  *
- * Engine routes (final — basin-engine Phase 5.17, ADR 0021):
- *   POST   /storage/v1/object/:bucket/:path          → upload
- *   GET    /storage/v1/object/:bucket/:path          → download
- *   POST   /storage/v1/object/list/:bucket           → list
- *   DELETE /storage/v1/object/:bucket                → remove (bulk)
- *   POST   /storage/v1/object/sign/:bucket/:path     → createSignedUrl
+ * Engine routes (final — basin-engine Phase 5.17.D, ADR 0021, fixes #55):
+ *   POST   /storage/v1/object/:bucket/*path                        → upload
+ *   GET    /storage/v1/object/:bucket/*path                        → download
+ *   POST   /storage/v1/object/list/:bucket                         → list
+ *   DELETE /storage/v1/object/:bucket                              → remove (bulk)
+ *   POST   /storage/v1/object/sign/upload/:bucket/*path            → createSignedUrl
+ *   GET    /storage/v1/object/public/:project_id/:bucket/*path     → getPublicUrl
  *
  * `deps.url` is resolved as `${engineBase}/storage/v1` by
  * `createClient`, so every method appends `/object/...` to it.
@@ -298,8 +299,12 @@ export class StorageBucket {
   /**
    * Mint a short-lived signed URL for `{bucket}/{path}`.
    *
-   * POST `/storage/v1/object/sign/${bucket}/${path}` with `{expiresIn}`.
+   * POST `/storage/v1/object/sign/upload/${bucket}/${path}` with `{expiresIn}`.
    * Returns `{ signedUrl: string, expiresAt?: string }`.
+   *
+   * NOTE: The `upload` literal segment is required to disambiguate this route
+   * from the signed-download path in axum's router (Phase 5.17.D, fixes #55).
+   * The old path `/object/sign/:bucket/*path` is no longer valid.
    *
    * Returns `invalid_request` immediately for negative `expiresIn`
    * (before any fetch).
@@ -318,7 +323,7 @@ export class StorageBucket {
       };
     }
 
-    const url = `${this.#deps.url}/object/sign/${encodeURIComponent(this.#bucket)}/${encodePathSegments(path)}`;
+    const url = `${this.#deps.url}/object/sign/upload/${encodeURIComponent(this.#bucket)}/${encodePathSegments(path)}`;
 
     let res: Response;
     try {
@@ -382,11 +387,21 @@ export class StorageBucket {
    *
    * No network call — pure URL composition so it stays callable
    * inside render-time React/Vue templates.
+   *
+   * Engine route: GET `/storage/v1/object/public/:project_id/:bucket/*path`
+   * Pass `projectId` to target the correct project. Omitting it falls back
+   * to the literal `"public"` segment (for testing / legacy compat only).
    */
-  getPublicUrl(path: string): { data: { publicUrl: string } } {
+  getPublicUrl(
+    path: string,
+    opts?: { projectId?: string },
+  ): { data: { publicUrl: string } } {
+    const projectSegment = opts?.projectId
+      ? encodeURIComponent(opts.projectId)
+      : "public";
     return {
       data: {
-        publicUrl: `${this.#deps.url}/object/public/${encodeURIComponent(this.#bucket)}/${encodePathSegments(path)}`,
+        publicUrl: `${this.#deps.url}/object/public/${projectSegment}/${encodeURIComponent(this.#bucket)}/${encodePathSegments(path)}`,
       },
     };
   }

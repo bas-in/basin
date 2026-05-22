@@ -370,7 +370,7 @@ describe("storage.remove", () => {
 // ── createSignedUrl ───────────────────────────────────────────────────
 
 describe("storage.createSignedUrl", () => {
-  it("happy path — POST to correct URL, returns signedUrl", async () => {
+  it("happy path — POST to correct URL (sign/upload literal), returns signedUrl", async () => {
     let capturedUrl = "";
     let capturedMethod = "";
     let capturedBody: unknown;
@@ -395,7 +395,8 @@ describe("storage.createSignedUrl", () => {
     expect(error).toBeNull();
     expect(data?.signedUrl).toContain("token=abc");
     expect(capturedMethod).toBe("POST");
-    expect(capturedUrl).toContain("/object/sign/avatars/u1/avatar.png");
+    // Phase 5.17.D / fixes #55: `upload` literal segment required
+    expect(capturedUrl).toContain("/object/sign/upload/avatars/u1/avatar.png");
     expect(capturedBody).toEqual({ expiresIn: 300 });
   });
 
@@ -465,7 +466,9 @@ describe("storage.createSignedUrl", () => {
   });
 });
 
-// ── getPublicUrl (unchanged) ─────────────────────────────────────────
+// ── getPublicUrl ─────────────────────────────────────────────────────
+// Engine route: GET /storage/v1/object/public/:project_id/:bucket/*path
+// (Phase 5.17.D — project_id segment is required for route resolution)
 
 describe("storage.getPublicUrl (sync URL construction)", () => {
   it("constructs the public URL synchronously without a network call", () => {
@@ -476,11 +479,44 @@ describe("storage.getPublicUrl (sync URL construction)", () => {
         throw new Error("should not fetch");
       },
     });
-    const { data } = basin.storage.from("avatars").getPublicUrl("u1/avatar.png");
+    const { data } = basin.storage
+      .from("avatars")
+      .getPublicUrl("u1/avatar.png", { projectId: "proj_abc" });
     expect(data.publicUrl).toContain("avatars");
     expect(data.publicUrl).toContain("u1/avatar.png");
     expect(data.publicUrl).toContain("/object/public/");
+    expect(data.publicUrl).toContain("proj_abc");
     expect(called).toBe(false);
+  });
+
+  it("includes projectId as the :project_id segment in the URL", () => {
+    const basin = createClient("https://api.basin.run", "anon", {
+      fetch: noFetch(),
+    });
+    const { data } = basin.storage
+      .from("avatars")
+      .getPublicUrl("u1/avatar.png", { projectId: "proj_123" });
+    expect(data.publicUrl).toBe(
+      "https://api.basin.run/storage/v1/object/public/proj_123/avatars/u1/avatar.png",
+    );
+  });
+
+  it("encodes projectId when it contains special characters", () => {
+    const basin = createClient("https://api.basin.run", "anon", {
+      fetch: noFetch(),
+    });
+    const { data } = basin.storage
+      .from("avatars")
+      .getPublicUrl("file.png", { projectId: "proj/special" });
+    expect(data.publicUrl).toContain("proj%2Fspecial");
+  });
+
+  it("falls back to literal 'public' segment when projectId is omitted", () => {
+    const basin = createClient("https://api.basin.run", "anon", {
+      fetch: noFetch(),
+    });
+    const { data } = basin.storage.from("avatars").getPublicUrl("u1/avatar.png");
+    expect(data.publicUrl).toContain("/object/public/public/avatars/u1/avatar.png");
   });
 
   it("encodes path segments but preserves / separators", () => {
@@ -489,7 +525,7 @@ describe("storage.getPublicUrl (sync URL construction)", () => {
     });
     const { data } = basin.storage
       .from("docs")
-      .getPublicUrl("folder one/file name.png");
+      .getPublicUrl("folder one/file name.png", { projectId: "proj_x" });
     expect(data.publicUrl).toContain("folder%20one/file%20name.png");
   });
 
@@ -499,7 +535,7 @@ describe("storage.getPublicUrl (sync URL construction)", () => {
     });
     const { data } = basin.storage
       .from("public assets")
-      .getPublicUrl("logo.png");
+      .getPublicUrl("logo.png", { projectId: "proj_x" });
     expect(data.publicUrl).toContain("public%20assets");
   });
 });
