@@ -1,7 +1,71 @@
 //! SQL → side-effects + result sets, dispatched by sqlparser statement kind.
 
 use crate::pg_ast::ObjectNamePartExt;
+use std::cell::Cell;
 use std::sync::Arc;
+use std::time::Instant;
+
+// ---------------------------------------------------------------------------
+// Cooperative pg_sleep cancellation (Phase 5.28.D / #64 partial fix)
+// ---------------------------------------------------------------------------
+// Problem: `pg_sleep(N)` sleeps the full N seconds even when `statement_timeout`
+// fires, because DataFusion UDFs are synchronous and cannot be preempted by the
+// outer `tokio::time::timeout` wrapper.
+//
+// Solution: before each DataFusion `collect()` call the executor records the
+// absolute statement deadline in a thread-local.  `PgSleepUdf` reads this
+// deadline cooperatively: instead of sleeping the full duration in one shot, it
+// sleeps in 50 ms ticks and checks the deadline after each tick.  If the
+// deadline has passed it signals cancellation by setting `PG_SLEEP_CANCELED`
+// and returning a `DataFusionError::Execution`.  The executor then converts that
+// sentinel into `BasinError::QueryCanceled` (SQLSTATE 57014) instead of the
+// generic `BasinError::internal`.
+//
+// Thread-local safety: for the non-shard path the UDF runs on the same tokio
+// thread that called `collect()`.  For the shard path the executor captures the
+// deadline by value, spawns a blocking thread, sets the thread-local at the top
+// of the closure (before `rt.block_on`), and DataFusion runs the UDF on that
+// same blocking thread — so the thread-local is always visible.
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Absolute wall-clock deadline for the current statement, or `None` if
+    /// no `statement_timeout` is active.  Set by the executor before each
+    /// DataFusion `collect()`; read by `PgSleepUdf` on each sleep tick.
+    static STATEMENT_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+
+    /// Set to `true` by `PgSleepUdf` when it terminates early due to the
+    /// deadline.  The executor checks this flag after a DataFusion collect
+    /// error to decide whether to return `QueryCanceled` vs `internal`.
+    static PG_SLEEP_CANCELED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Set the per-statement deadline that `pg_sleep` will poll against.
+/// Called by the executor before each `df.collect()` / `physical_plan::collect()`.
+pub(crate) fn set_statement_deadline(deadline: Option<Instant>) {
+    STATEMENT_DEADLINE.with(|c| c.set(deadline));
+}
+
+/// Return the current statement deadline (called from `PgSleepUdf`).
+pub(crate) fn get_statement_deadline() -> Option<Instant> {
+    STATEMENT_DEADLINE.with(|c| c.get())
+}
+
+/// Signal that `pg_sleep` terminated early because the deadline passed.
+/// Called from `PgSleepUdf` before returning the cancellation error.
+pub(crate) fn mark_pg_sleep_canceled() {
+    PG_SLEEP_CANCELED.with(|c| c.set(true));
+}
+
+/// Read-and-clear the pg_sleep cancellation flag.  Returns `true` once if
+/// `mark_pg_sleep_canceled` was called since the last `take_pg_sleep_canceled`.
+pub(crate) fn take_pg_sleep_canceled() -> bool {
+    PG_SLEEP_CANCELED.with(|c| {
+        let v = c.get();
+        if v { c.set(false); }
+        v
+    })
+}
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
@@ -5237,6 +5301,12 @@ async fn exec_select(
             None => "exceeded statement timeout".to_owned(),
         })
     };
+    // Phase 5.28.D: publish the absolute statement deadline into the
+    // per-thread slot so `PgSleepUdf` can observe it cooperatively.
+    // The deadline is computed here (= now + timeout) so both the shard and
+    // non-shard paths share the same reference point.
+    let statement_deadline: Option<Instant> =
+        timeout.map(|d| Instant::now() + d);
     let df_batches = if sess.engine.config().shard.is_some() {
         let plan = df
             .create_physical_plan()
@@ -5250,25 +5320,46 @@ async fn exec_select(
         // return promptly instead of running on detached. We surface the
         // elapsed case as a sentinel `Ok(None)` and map it to QueryCanceled.
         let join = tokio::task::spawn_blocking(move || {
+            // Publish the deadline on this blocking thread so pg_sleep can
+            // poll it cooperatively via get_statement_deadline().
+            set_statement_deadline(statement_deadline);
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| BasinError::internal(format!("blocking runtime: {e}")))?;
-            rt.block_on(async {
+            let result = rt.block_on(async {
                 let fut = datafusion::physical_plan::collect(plan, task_ctx);
                 match timeout {
                     Some(d) => match tokio::time::timeout(d, fut).await {
                         Ok(res) => res
                             .map(Some)
-                            .map_err(|e| BasinError::internal(format!("execute: {e}"))),
+                            .map_err(|e| {
+                                if take_pg_sleep_canceled() {
+                                    BasinError::query_canceled(
+                                        "pg_sleep: interrupted by statement_timeout",
+                                    )
+                                } else {
+                                    BasinError::internal(format!("execute: {e}"))
+                                }
+                            }),
                         Err(_) => Ok(None),
                     },
                     None => fut
                         .await
                         .map(Some)
-                        .map_err(|e| BasinError::internal(format!("execute: {e}"))),
+                        .map_err(|e| {
+                            if take_pg_sleep_canceled() {
+                                BasinError::query_canceled(
+                                    "pg_sleep: interrupted by statement_timeout",
+                                )
+                            } else {
+                                BasinError::internal(format!("execute: {e}"))
+                            }
+                        }),
                 }
-            })
+            });
+            set_statement_deadline(None);
+            result
         })
         .await
         .map_err(|e| BasinError::internal(format!("spawn_blocking join: {e}")))?;
@@ -5277,16 +5368,36 @@ async fn exec_select(
             None => return Err(canceled()),
         }
     } else {
+        // Non-shard path: set the deadline on the current tokio thread.
+        // pg_sleep's block_in_place runs on the same thread, so the
+        // thread-local is visible inside the UDF.
+        set_statement_deadline(statement_deadline);
         let fut = df.collect();
-        match timeout {
+        let result = match timeout {
             Some(d) => match tokio::time::timeout(d, fut).await {
-                Ok(res) => res.map_err(|e| BasinError::internal(format!("execute: {e}")))?,
-                Err(_) => return Err(canceled()),
+                Ok(res) => res.map_err(|e| {
+                    if take_pg_sleep_canceled() {
+                        BasinError::query_canceled(
+                            "pg_sleep: interrupted by statement_timeout",
+                        )
+                    } else {
+                        BasinError::internal(format!("execute: {e}"))
+                    }
+                }),
+                Err(_) => return { set_statement_deadline(None); Err(canceled()) },
             },
-            None => fut
-                .await
-                .map_err(|e| BasinError::internal(format!("execute: {e}")))?,
-        }
+            None => fut.await.map_err(|e| {
+                if take_pg_sleep_canceled() {
+                    BasinError::query_canceled(
+                        "pg_sleep: interrupted by statement_timeout",
+                    )
+                } else {
+                    BasinError::internal(format!("execute: {e}"))
+                }
+            }),
+        };
+        set_statement_deadline(None);
+        result?
     };
     let exec_elapsed_ns = exec_start.elapsed().as_nanos() as u64;
 

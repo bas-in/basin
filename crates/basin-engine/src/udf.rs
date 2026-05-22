@@ -1097,34 +1097,62 @@ impl ScalarUDFImpl for PgSleepUdf {
         };
 
         if seconds > 0.0 {
-            let dur = std::time::Duration::from_secs_f64(seconds);
-            // Cancellability note (Phase 5.28 / #64):
+            let total_dur = std::time::Duration::from_secs_f64(seconds);
+            // Phase 5.28.D: cooperative deadline-polling cancellation.
             //
             // DataFusion invokes UDFs synchronously inside physical plan poll().
-            // `block_in_place` evacuates other tasks from the current thread so
-            // they aren't blocked, and `handle.block_on(tokio::time::sleep)`
-            // uses the shared timer wheel rather than an OS sleep, which allows
-            // the outer `statement_timeout` deadline to fire on another tokio
-            // thread.  However the outer `tokio::time::timeout(d, df.collect())`
-            // wrapper cannot preempt this blocking poll(); the timeout future
-            // only fires after poll() returns.  Net effect: the sleep still
-            // runs for its full duration even if statement_timeout fires.
+            // The outer `tokio::time::timeout(statement_timeout, df.collect())`
+            // wrapper cannot preempt a blocking poll(); the timeout future only
+            // fires after poll() returns, so without cooperative polling
+            // `pg_sleep(10)` under `statement_timeout = '500ms'` would sleep
+            // the full 10 seconds before the client sees the cancel error.
             //
-            // Full cancellation requires DataFusion's async-UDF support (not yet
-            // stable in the version we vendor) or a per-statement cancellation
-            // token passed into the UDF context.  For now the improvement over
-            // std::thread::sleep is that the rest of the tokio runtime remains
-            // responsive during the sleep (other connections are not stalled).
+            // Fix: sleep in 50 ms ticks. After each tick check whether the
+            // statement deadline published by the executor has elapsed. If so,
+            // signal cancellation via `mark_pg_sleep_canceled()` (so the executor
+            // converts the DataFusion error to SQLSTATE 57014) and return an
+            // error immediately.
             //
-            // Fall back to std::thread::sleep when not in a tokio runtime (e.g.
-            // called from a plain sync test).
+            // The deadline is written by `executor::set_statement_deadline` just
+            // before `df.collect()` / `physical_plan::collect()` and cleared
+            // after they return, so reading it here is always coherent on the
+            // same thread.
+            //
+            // Fall back to `std::thread::sleep` when not in a tokio runtime
+            // (e.g. plain sync unit tests) — those calls never carry a deadline.
+            const TICK: std::time::Duration = std::time::Duration::from_millis(50);
+            let sleep_until = std::time::Instant::now() + total_dur;
             let handle = tokio::runtime::Handle::try_current();
             if let Ok(handle) = handle {
-                tokio::task::block_in_place(|| {
-                    handle.block_on(tokio::time::sleep(dur));
+                let cancel_err = tokio::task::block_in_place(|| -> Option<datafusion::common::DataFusionError> {
+                    loop {
+                        let now = std::time::Instant::now();
+                        if now >= sleep_until {
+                            break; // full sleep completed normally
+                        }
+                        // Check the statement deadline before sleeping the next tick.
+                        if let Some(deadline) = crate::executor::get_statement_deadline() {
+                            if now >= deadline {
+                                // Deadline has passed: flag and bail out.
+                                crate::executor::mark_pg_sleep_canceled();
+                                return Some(datafusion::common::DataFusionError::Execution(
+                                    "pg_sleep: interrupted by statement_timeout (SQLSTATE 57014)"
+                                        .to_string(),
+                                ));
+                            }
+                        }
+                        let remaining = sleep_until - now;
+                        let tick = remaining.min(TICK);
+                        handle.block_on(tokio::time::sleep(tick));
+                    }
+                    None
                 });
+                if let Some(err) = cancel_err {
+                    return Err(err);
+                }
             } else {
-                std::thread::sleep(dur);
+                // No tokio runtime: plain blocking sleep; no deadline available.
+                std::thread::sleep(total_dur);
             }
         }
 
