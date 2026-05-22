@@ -1937,6 +1937,25 @@ fn scalar_from_array(arr: &dyn arrow_array::Array, row: usize, dt: &DataType) ->
             let v = arr.as_primitive::<TimestampMicrosecondType>().value(row);
             Ok(v.to_string())
         }
+        DataType::Date32 => {
+            // Render as ISO-8601 date literal: '2024-01-15'.
+            // Date32 is days since 1970-01-01 (Arrow spec).
+            use arrow_array::types::Date32Type;
+            let days = arr.as_primitive::<Date32Type>().value(row);
+            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+            let d = epoch + chrono::Duration::days(days as i64);
+            Ok(format!("'{}'", d.format("%Y-%m-%d")))
+        }
+        DataType::Binary => {
+            // Render as PostgreSQL hex-escape bytea literal: '\xDEADBEEF'.
+            let bytes = arr.as_binary::<i32>().value(row);
+            Ok(format!("'\\x{}'", hex::encode(bytes)))
+        }
+        DataType::LargeBinary => {
+            // Render as PostgreSQL hex-escape bytea literal: '\xDEADBEEF'.
+            let bytes = arr.as_binary::<i64>().value(row);
+            Ok(format!("'\\x{}'", hex::encode(bytes)))
+        }
         other => Err(BasinError::InvalidSchema(format!(
             "UPDATE/DELETE FROM: unsupported PK column type {other:?} in v0.1"
         ))),
@@ -4211,6 +4230,79 @@ mod tests {
         assert!(
             contains_subquery(&expr),
             "Expr::InSubquery should be detected by contains_subquery"
+        );
+    }
+
+    // ── scalar_from_array PK quoting (P1 security fix) ───────────────────────
+    //
+    // Verifies that `scalar_from_array` correctly quotes / escapes all types
+    // that can appear as primary-key columns.  Un-escaped string injection
+    // (e.g. a PK value of `'; DROP TABLE users; --`) would allow SQL injection
+    // via the UPDATE/DELETE WHERE clause.
+
+    /// A Utf8 PK value containing a single-quote must be escaped to `''`.
+    #[test]
+    fn scalar_from_array_utf8_single_quote_escaped() {
+        use arrow_array::StringArray;
+        let arr = StringArray::from(vec!["it's a test"]);
+        let lit = scalar_from_array(&arr, 0, &DataType::Utf8).expect("Utf8 must succeed");
+        assert_eq!(lit, "'it''s a test'", "single-quote must be doubled: {lit}");
+    }
+
+    /// A LargeUtf8 PK value containing a single-quote must also be escaped.
+    #[test]
+    fn scalar_from_array_large_utf8_quote_escaped() {
+        use arrow_array::LargeStringArray;
+        let arr = LargeStringArray::from(vec!["O'Brien"]);
+        let lit =
+            scalar_from_array(&arr, 0, &DataType::LargeUtf8).expect("LargeUtf8 must succeed");
+        assert_eq!(lit, "'O''Brien'", "single-quote must be doubled: {lit}");
+    }
+
+    /// A Date32 PK renders as a quoted ISO-8601 date literal (not a bare integer).
+    #[test]
+    fn scalar_from_array_date32_is_quoted_iso() {
+        use arrow_array::Date32Array;
+        // Day 0 = 1970-01-01; day 1 = 1970-01-02.
+        let arr = Date32Array::from(vec![1i32]);
+        let lit = scalar_from_array(&arr, 0, &DataType::Date32).expect("Date32 must succeed");
+        assert_eq!(lit, "'1970-01-02'", "Date32 must render as quoted ISO date: {lit}");
+    }
+
+    /// A Binary PK renders as a PostgreSQL hex-escape bytea literal.
+    #[test]
+    fn scalar_from_array_binary_is_hex_escaped() {
+        use arrow_array::BinaryArray;
+        let arr = BinaryArray::from(vec![b"\xde\xad\xbe\xef".as_slice()]);
+        let lit = scalar_from_array(&arr, 0, &DataType::Binary).expect("Binary must succeed");
+        assert_eq!(lit, "'\\xdeadbeef'", "Binary must render as hex-escaped literal: {lit}");
+    }
+
+    /// A NULL value renders as `NULL` regardless of type.
+    #[test]
+    fn scalar_from_array_null_renders_as_null() {
+        use arrow_array::StringArray;
+        let arr = StringArray::from(vec![None::<&str>]);
+        let lit = scalar_from_array(&arr, 0, &DataType::Utf8).expect("null Utf8 must succeed");
+        assert_eq!(lit, "NULL");
+    }
+
+    /// An unhandled Arrow type (e.g. Float16) must return an error rather than
+    /// bare-interpolating an unescaped value.
+    #[test]
+    fn scalar_from_array_unhandled_type_returns_error() {
+        // UInt8 is not in the handled set — it should error, not interpolate bare.
+        use arrow_array::UInt8Array;
+        let arr = UInt8Array::from(vec![42u8]);
+        let result = scalar_from_array(&arr, 0, &DataType::UInt8);
+        assert!(
+            result.is_err(),
+            "unhandled type UInt8 must return an error, not interpolate bare"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("unsupported PK column type"),
+            "error message should mention unsupported type, got: {msg}"
         );
     }
 }
