@@ -193,6 +193,13 @@ pub struct FilteredReceiver {
 }
 
 impl FilteredReceiver {
+    /// Construct a [`FilteredReceiver`] directly from a raw broadcast receiver
+    /// and an optional filter. Useful in tests that create channels manually
+    /// without going through [`ChannelRegistry::subscribe_filtered`].
+    pub fn from_receiver(rx: broadcast::Receiver<Arc<ChangeEvent>>, filter: Option<Filter>) -> Self {
+        Self { rx, filter }
+    }
+
     /// Receive the next event that satisfies the filter, skipping non-matching
     /// events.
     ///

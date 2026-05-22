@@ -100,11 +100,12 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
+use crate::filter::Filter;
 use crate::presence::{
     authorize_client_id, serialize_presence_diff, serialize_presence_state, validate_metadata_size,
     PresenceEvent, PresenceRegistry,
 };
-use crate::{ChannelKey, ChannelRegistry, ReplayCursor, ReplayRingRegistry};
+use crate::{ChannelKey, ChannelRegistry, FilteredReceiver, ReplayCursor, ReplayRingRegistry};
 
 // ---------------------------------------------------------------------------
 // Close codes (4000–4999 are application-defined per RFC 6455).
@@ -730,7 +731,7 @@ async fn handle_client_msg(
     match msg {
         ClientMsg::Subscribe {
             table,
-            filter: _,
+            filter: filter_sql,
             last_event_id,
         } => {
             // Validate table name.
@@ -752,10 +753,46 @@ async fn handle_client_msg(
                 return Ok(());
             }
 
+            // Parse the optional subscriber-side predicate filter (P1-1 fix).
+            // If the SQL string is present but unparseable, reject the subscribe
+            // with a protocol error rather than silently ignoring the predicate
+            // (fail-closed: a broken filter must not open the floodgate).
+            let compiled_filter: Option<Filter> = match filter_sql.as_deref() {
+                None | Some("") => None,
+                Some(sql) => match Filter::new(sql) {
+                    Ok(f) => {
+                        debug!(
+                            project = %project_id,
+                            table = %table_name,
+                            predicate = %sql,
+                            "WS: subscribe filter compiled"
+                        );
+                        Some(f)
+                    }
+                    Err(e) => {
+                        warn!(
+                            project = %project_id,
+                            table = %table_name,
+                            predicate = %sql,
+                            error = %e,
+                            "WS: invalid subscribe filter predicate; rejecting subscribe"
+                        );
+                        let err_json = serde_json::to_string(&ServerMsg::Error {
+                            code: "invalid_filter",
+                            table: table_name.as_str(),
+                            missed: None,
+                        })
+                        .unwrap_or_default();
+                        let _ = socket.send(Message::Text(err_json.into())).await;
+                        return Ok(());
+                    }
+                },
+            };
+
             // Subscribe to the live broadcast channel *before* processing
             // replay, so no event is missed in the gap.
             let key = ChannelKey::new(*project_id, table_name.clone());
-            let live_rx = registry.subscribe(key);
+            let live_rx = registry.subscribe_filtered(key, compiled_filter);
 
             // --- Replay missed events from the per-channel ring -------------
             //
@@ -820,6 +857,8 @@ async fn handle_client_msg(
             }
 
             // Spawn a forwarder task that fan-ins this channel's events.
+            // `live_rx` is a `FilteredReceiver` — it skips events that don't
+            // satisfy the subscriber's compiled predicate before forwarding.
             let fan_tx_clone = fan_tx.clone();
             let table_name_clone = table_name.clone();
             let handle = tokio::spawn(forwarder_task(live_rx, table_name_clone, fan_tx_clone));
@@ -995,15 +1034,21 @@ async fn send_presence_error(
     let _ = socket.send(Message::Text(json.into())).await;
 }
 
-/// Per-table forwarder task. Reads from a broadcast receiver and forwards
-/// events to the connection-scoped fan-in mpsc channel.
+/// Per-table forwarder task. Reads from a [`FilteredReceiver`] and forwards
+/// matching events to the connection-scoped fan-in mpsc channel.
+///
+/// The `FilteredReceiver` already skips events that do not satisfy the
+/// subscriber's compiled predicate (P1-1 fix). This task therefore only
+/// forwards events that have passed both:
+/// 1. The subscriber-side SQL predicate filter (if any), AND
+/// 2. The broadcast channel's fan-out.
 ///
 /// This task runs until:
 /// - The broadcast channel is closed (project deleted / server shutdown).
 /// - The mpsc receiver is dropped (connection closed).
 /// - The [`tokio::task::JoinHandle`] is dropped (unsubscribe / disconnect).
 async fn forwarder_task(
-    mut rx: broadcast::Receiver<Arc<ChangeEvent>>,
+    mut rx: FilteredReceiver,
     table: TableName,
     fan_tx: mpsc::Sender<IncomingEvent>,
 ) {
@@ -1255,14 +1300,16 @@ mod tests {
 
     #[tokio::test]
     async fn forwarder_task_forwards_events() {
+        use crate::FilteredReceiver;
         use tokio::sync::broadcast;
 
         let (tx, rx) = broadcast::channel::<Arc<ChangeEvent>>(16);
+        let filtered_rx = FilteredReceiver::from_receiver(rx, None);
         let table = TableName::new("orders").unwrap();
         let (fan_tx, mut fan_rx) = mpsc::channel::<IncomingEvent>(16);
 
         // Spawn the forwarder.
-        let _handle = tokio::spawn(forwarder_task(rx, table.clone(), fan_tx));
+        let _handle = tokio::spawn(forwarder_task(filtered_rx, table.clone(), fan_tx));
 
         // Publish an event.
         let event = Arc::new(make_event(42, None));
@@ -1279,13 +1326,15 @@ mod tests {
 
     #[tokio::test]
     async fn forwarder_task_signals_channel_close() {
+        use crate::FilteredReceiver;
         use tokio::sync::broadcast;
 
         let (tx, rx) = broadcast::channel::<Arc<ChangeEvent>>(16);
+        let filtered_rx = FilteredReceiver::from_receiver(rx, None);
         let table = TableName::new("orders").unwrap();
         let (fan_tx, mut fan_rx) = mpsc::channel::<IncomingEvent>(16);
 
-        let _handle = tokio::spawn(forwarder_task(rx, table.clone(), fan_tx));
+        let _handle = tokio::spawn(forwarder_task(filtered_rx, table.clone(), fan_tx));
 
         // Close the channel by dropping the sender.
         drop(tx);
@@ -1311,11 +1360,11 @@ mod tests {
         let project = ProjectId::new();
         let (fan_tx, mut fan_rx) = mpsc::channel::<IncomingEvent>(64);
 
-        // Subscribe to two tables.
+        // Subscribe to two tables (unfiltered — None filter passes all events).
         for table_name in ["orders", "users"] {
             let table = TableName::new(table_name).unwrap();
             let key = ChannelKey::new(project, table.clone());
-            let rx = sink.registry().subscribe(key);
+            let rx = sink.registry().subscribe_filtered(key, None);
             tokio::spawn(forwarder_task(rx, table, fan_tx.clone()));
         }
 
