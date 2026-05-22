@@ -8,7 +8,9 @@ from ._http import HttpTransport
 from .admin.client import AdminClient
 from .auth.client import AuthClient
 from .errors import BasinError
+from .functions.client import FunctionsClient
 from .postgrest.builder import QueryBuilder
+from .storage.client import StorageClient
 
 T = TypeVar("T")
 
@@ -69,6 +71,16 @@ class Client:
         )
 
         self.admin = AdminClient(
+            http=self._http,
+            get_headers=self._current_headers,
+        )
+
+        self.storage = StorageClient(
+            http=self._http,
+            get_headers=self._current_headers,
+        )
+
+        self.functions = FunctionsClient(
             http=self._http,
             get_headers=self._current_headers,
         )
