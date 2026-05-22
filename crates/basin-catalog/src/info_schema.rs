@@ -3943,6 +3943,326 @@ impl InfoSchemaQuery {
             ))
         })
     }
+
+    // -----------------------------------------------------------------------
+    // pg_catalog.pg_ts_config  (text-search configuration catalog)
+    // -----------------------------------------------------------------------
+    //
+    // PostgreSQL's `pg_ts_config` exposes every text-search configuration known
+    // to the database: OID, name, owning namespace OID, owning role OID, and
+    // the OID of the parser the config uses. Basin ships two built-in FTS
+    // configurations that correspond to the tsvector/GIN index path in
+    // `basin-storage`:
+    //
+    // * `english`  — the default English-language stemming config (dictionaries:
+    //               simple, english_stem). This is what PG itself defaults to
+    //               for `to_tsvector('english', …)` / `plainto_tsquery('english', …)`.
+    //               PG system OID: 12824.
+    // * `simple`   — token pass-through, no stemming. PG system OID: 12801.
+    //               Used by `to_tsvector('simple', …)` or callers that have
+    //               already pre-stemmed their input.
+    //
+    // Both configs share the default parser (OID 3722, `pg_catalog.default`).
+    //
+    // These are the only two configs Basin's GIN/tsvector index path in
+    // `basin-storage::index::gin_tsvector` recognises; the lexeme extraction
+    // there is parser-agnostic (it reads the pre-computed tsvector literals
+    // from Arrow columns) so adding further configs is purely a catalog
+    // declaration — no storage change needed.
+    //
+    // Column layout mirrors PG 15's `pg_ts_config`:
+    //   oid          BIGINT  — stable FNV-1a oid (see BASIN_TS_CONFIGS)
+    //   cfgname      TEXT    — config name ("english" / "simple")
+    //   cfgnamespace BIGINT  — namespace oid for "pg_catalog"
+    //   cfgowner     BIGINT  — role oid for the project (matches pg_authid.oid)
+    //   cfgparser    BIGINT  — oid of the parser (PG's default parser = 3722)
+
+    /// Schema for `pg_catalog.pg_ts_config` rows.
+    ///
+    /// | column        | type   | notes                                              |
+    /// |---------------|--------|----------------------------------------------------|
+    /// | oid           | BIGINT | stable per-config oid                              |
+    /// | cfgname       | TEXT   | config name (`"english"`, `"simple"`)              |
+    /// | cfgnamespace  | BIGINT | namespace oid for `"pg_catalog"`                   |
+    /// | cfgowner      | BIGINT | role oid (matches `pg_authid.oid` for this project)|
+    /// | cfgparser     | BIGINT | parser oid (`3722` = PG default text-search parser)|
+    pub fn pg_ts_config_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("oid", DataType::Int64, false),
+            Field::new("cfgname", DataType::Utf8, false),
+            Field::new("cfgnamespace", DataType::Int64, false),
+            Field::new("cfgowner", DataType::Int64, false),
+            Field::new("cfgparser", DataType::Int64, false),
+        ]))
+    }
+
+    /// Build `pg_catalog.pg_ts_config`. Returns two rows — one for
+    /// `"english"` and one for `"simple"` — which are the text-search
+    /// configurations Basin's GIN/tsvector index path in
+    /// `basin-storage::index::gin_tsvector` supports.
+    ///
+    /// OIDs are deterministic: the two built-in rows use PG's own catalog
+    /// OIDs (12824 for `english`, 12801 for `simple`) so clients that look
+    /// up a config by its PG OID still resolve correctly.
+    ///
+    /// `cfgnamespace` points at the `"pg_catalog"` namespace oid (per-project
+    /// FNV-1a hash, consistent with [`pg_type`] which does the same).
+    /// `cfgowner` is the project's role oid (same value as `pg_authid.oid`).
+    /// `cfgparser` is `3722` — PG's well-known OID for the built-in default
+    /// text-search parser.
+    pub async fn pg_ts_config(
+        _catalog: &dyn Catalog,
+        project: &ProjectId,
+    ) -> Result<RecordBatch> {
+        let cfgnamespace = namespace_oid_for(project, PG_CATALOG_SCHEMA);
+        let cfgowner = role_oid_for(project);
+
+        // Static rows: (oid, cfgname). OIDs mirror PG 15 system catalog values
+        // for maximum compatibility with introspecting clients.
+        let configs: &[(i64, &str)] = &[
+            (PG_TS_CONFIG_OID_ENGLISH, "english"),
+            (PG_TS_CONFIG_OID_SIMPLE, "simple"),
+        ];
+
+        let mut oids: Vec<i64> = Vec::with_capacity(configs.len());
+        let mut cfgnames: Vec<&str> = Vec::with_capacity(configs.len());
+        let mut cfgnamespaces: Vec<i64> = Vec::with_capacity(configs.len());
+        let mut cfgowners: Vec<i64> = Vec::with_capacity(configs.len());
+        let mut cfgparsers: Vec<i64> = Vec::with_capacity(configs.len());
+
+        for (oid, name) in configs {
+            oids.push(*oid);
+            cfgnames.push(name);
+            cfgnamespaces.push(cfgnamespace);
+            cfgowners.push(cfgowner);
+            cfgparsers.push(PG_TS_DEFAULT_PARSER_OID);
+        }
+
+        let schema = Self::pg_ts_config_schema();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(oids)),
+            Arc::new(StringArray::from(cfgnames)),
+            Arc::new(Int64Array::from(cfgnamespaces)),
+            Arc::new(Int64Array::from(cfgowners)),
+            Arc::new(Int64Array::from(cfgparsers)),
+        ];
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| BasinError::internal(format!("pg_catalog.pg_ts_config build: {e}")))
+    }
+
+    // -----------------------------------------------------------------------
+    // pg_catalog.pg_cancel_backend(pid)  (cancel a backend's current query)
+    // -----------------------------------------------------------------------
+    //
+    // PostgreSQL semantics: `pg_cancel_backend(pid integer) → boolean`
+    // signals the target backend to cancel its current query (SIGINT to the
+    // backend process in PG's model). The function returns `true` if the
+    // signal was sent successfully, `false` if no such pid exists.
+    //
+    // Basin model: pids are tracked in `basin-engine::connection_registry`
+    // (added in Phase 5.23.C, surfaced via `pg_stat_activity`).
+    // `ConnectionRegistry` stores `SessionInfo { pid, state, query, … }` in a
+    // per-project `Arc<Mutex<HashMap<ProjectId, Vec<SessionInfo>>>>`.
+    //
+    // ## Cancellation hook protocol
+    //
+    // Full cross-session cancellation requires engine-side wiring not present
+    // in this crate (see "Engine wiring needed" below). This module provides:
+    //
+    //  1. The `pg_proc` row that registers `pg_cancel_backend` as a built-in
+    //     function visible in `pg_catalog.pg_proc` (so ORMs / admin tools
+    //     discover it).
+    //  2. The `CancelBackendRegistry` — a thin `Arc<Mutex<HashMap<i32,
+    //     Arc<tokio_util::sync::CancellationToken>>>>` that the engine can
+    //     populate per-pid and the catalog layer can signal from here.
+    //  3. `pg_cancel_backend(registry, project, pid)` — the catalog-side
+    //     evaluator. It looks up the pid in the registry, calls `.cancel()`
+    //     on the token, and returns `true`. Returns `false` if no token is
+    //     found for that pid (unknown pid or already finished).
+    //
+    // ## Engine wiring needed (DO NOT edit basin-engine)
+    //
+    // The following changes in `crates/basin-engine/` are required to make
+    // cancellation actually interrupt a running query:
+    //
+    //  a. **`connection_registry.rs`**: Extend `SessionInfo` to hold an
+    //     `Option<Arc<tokio_util::sync::CancellationToken>>` field `cancel_token`.
+    //     On `ConnectionRegistry::connect(project)` allocate a fresh
+    //     `CancellationToken`, store the `Arc<…>` in `SessionInfo.cancel_token`,
+    //     and also register a clone in a `CancelBackendRegistry` (new field on
+    //     `ConnectionRegistry`) keyed by `pid`. On `ConnectionHandle::drop`
+    //     remove the pid from the `CancelBackendRegistry`.
+    //
+    //  b. **`session.rs` / executor `execute()` path**: Before awaiting a
+    //     DataFusion `ExecutionPlan::execute()` future, drive it with a
+    //     `tokio::select!` branch on `cancel_token.cancelled()`. On
+    //     cancellation return a `BasinError::Cancelled` (new variant, error
+    //     code 57014 / `query_canceled` in pgwire) so the frontend receives
+    //     the standard PG `ERROR: canceling statement due to user request`.
+    //
+    //  c. **Router layer**: Pass the `CancelBackendRegistry` handle down to
+    //     the catalog query evaluator so `pg_cancel_backend(pid)` can resolve
+    //     the token. The simplest wiring is a `Arc<CancelBackendRegistry>`
+    //     field on `ProjectSession` (analogous to `connection_registry`).
+    //
+    // Until that engine wiring lands, calling `pg_cancel_backend(pid)` from
+    // SQL returns `false` for every pid (safe fallback — no crash, no
+    // panic). The pg_proc entry is present so tooling discovery succeeds.
+
+    /// Process-wide registry mapping pid → `CancellationToken`. The engine
+    /// populates this on connect and clears it on disconnect; the catalog
+    /// layer signals from `pg_cancel_backend`.
+    ///
+    /// Cheap to clone — just an `Arc` bump.
+    pub fn pg_cancel_backend_schema() -> Arc<Schema> {
+        // The function returns a single BOOLEAN column named "pg_cancel_backend".
+        // DataFusion scalar-function results are returned as a RecordBatch with
+        // one column named after the function; the single row carries the bool result.
+        Arc::new(Schema::new(vec![Field::new(
+            "pg_cancel_backend",
+            DataType::Boolean,
+            false,
+        )]))
+    }
+
+    /// Evaluate `pg_cancel_backend(pid)` against `registry`.
+    ///
+    /// Returns a single-row `RecordBatch` whose sole boolean column is:
+    /// - `true`  — the cancellation token for `pid` was found and signalled.
+    /// - `false` — no live session with `pid` exists in this project's registry.
+    ///
+    /// The `project` argument is not currently used for routing (the
+    /// `CancelBackendRegistry` is process-wide by pid) but is held for
+    /// signature stability against the multi-tenant v0.2 expansion where pids
+    /// will be scoped per-project.
+    pub fn pg_cancel_backend(
+        registry: &CancelBackendRegistry,
+        _project: &ProjectId,
+        pid: i32,
+    ) -> Result<RecordBatch> {
+        let cancelled = registry.cancel(pid);
+        let schema = Self::pg_cancel_backend_schema();
+        let columns: Vec<ArrayRef> = vec![Arc::new(BooleanArray::from(vec![cancelled]))];
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| BasinError::internal(format!("pg_cancel_backend build: {e}")))
+    }
+
+    /// Build the `pg_proc` row for `pg_cancel_backend`. This row is injected
+    /// into the `pg_catalog.pg_proc` result alongside user-defined functions
+    /// so that ORMs and admin tools (pgAdmin, psql `\df pg_cancel_backend`)
+    /// discover the function through standard catalog introspection.
+    ///
+    /// | field        | value                          |
+    /// |--------------|-------------------------------|
+    /// | oid          | FNV-1a of `(project, "pg_cancel_backend")` |
+    /// | proname      | `"pg_cancel_backend"`          |
+    /// | pronamespace | pg_catalog namespace oid       |
+    /// | prokind      | `'f'` (function)               |
+    /// | pronargs     | 1                              |
+    /// | prorettype   | 16 (bool)                      |
+    /// | proargtypes  | `"23"` (int4)                  |
+    /// | prosrc       | `"-- built-in"`                |
+    /// | prolang      | 14 (SQL)                       |
+    pub fn pg_cancel_backend_proc_row(project: &ProjectId) -> PgProcRow {
+        let fn_oid = routine_oid(project, PG_CANCEL_BACKEND_NAME);
+        let ns_oid = namespace_oid_for(project, PG_CATALOG_SCHEMA);
+        PgProcRow {
+            oid: fn_oid,
+            proname: PG_CANCEL_BACKEND_NAME.to_string(),
+            pronamespace: ns_oid,
+            prokind: PROKIND_FUNCTION.to_string(),
+            pronargs: 1i16,
+            prorettype: 16i64, // bool OID
+            proargtypes: "23".to_string(), // int4 OID
+            prosrc: "-- built-in".to_string(),
+            prolang: PROLANG_SQL,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CancelBackendRegistry — process-wide pid → CancellationToken map
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A plain `bool` flag acts as a cancellation token in the catalog layer.
+/// When the engine wires real `tokio_util::sync::CancellationToken`s the
+/// registry can store those instead — the API is identical from the
+/// catalog's perspective (just call `cancel(pid)` and check the bool).
+///
+/// The registry is keyed by `pid` (process-wide, not per-project), matching
+/// `ConnectionRegistry`'s pid counter. Thread safety: `std::sync::Mutex`
+/// because all mutations are synchronous and brief.
+///
+/// ## Lifecycle
+///
+/// 1. Engine calls `register(pid)` on connect → stores a fresh `Registered`
+///    entry.
+/// 2. Catalog evaluator calls `cancel(pid)` → marks the entry as cancelled,
+///    returns `true`. Returns `false` if pid is unknown.
+/// 3. Engine polls `is_cancelled(pid)` in the select! branch around each
+///    query future → finds `true`, aborts the query with error code 57014.
+/// 4. Engine calls `deregister(pid)` on disconnect → removes the entry.
+#[derive(Clone, Default)]
+pub struct CancelBackendRegistry {
+    inner: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<i32, bool>>>,
+}
+
+impl CancelBackendRegistry {
+    /// Create a new, empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a pid. Called by the engine on session connect.
+    /// Idempotent: re-registering a pid resets its cancelled flag to `false`.
+    pub fn register(&self, pid: i32) {
+        let mut map = self.inner.lock().expect("CancelBackendRegistry poisoned");
+        map.insert(pid, false);
+    }
+
+    /// Signal cancellation for `pid`. Returns `true` if the pid was found
+    /// and the flag was set; `false` if the pid is unknown (already
+    /// disconnected or never registered).
+    pub fn cancel(&self, pid: i32) -> bool {
+        let mut map = self.inner.lock().expect("CancelBackendRegistry poisoned");
+        if let Some(flag) = map.get_mut(&pid) {
+            *flag = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Check whether `pid` has been cancelled. Called by the engine's query
+    /// execution loop to decide whether to abort the current query.
+    pub fn is_cancelled(&self, pid: i32) -> bool {
+        let map = self.inner.lock().expect("CancelBackendRegistry poisoned");
+        map.get(&pid).copied().unwrap_or(false)
+    }
+
+    /// Deregister a pid. Called by the engine on session disconnect (after
+    /// the query loop has exited). Idempotent.
+    pub fn deregister(&self, pid: i32) {
+        let mut map = self.inner.lock().expect("CancelBackendRegistry poisoned");
+        map.remove(&pid);
+    }
+}
+
+/// A flattened row suitable for injection into `pg_catalog.pg_proc` output.
+/// Returned by [`InfoSchemaQuery::pg_cancel_backend_proc_row`] so callers
+/// can append the built-in function row to the project-scoped `pg_proc`
+/// result without re-reading the full catalog.
+#[derive(Clone, Debug)]
+pub struct PgProcRow {
+    pub oid: i64,
+    pub proname: String,
+    pub pronamespace: i64,
+    pub prokind: String,
+    pub pronargs: i16,
+    pub prorettype: i64,
+    pub proargtypes: String,
+    pub prosrc: String,
+    pub prolang: i64,
 }
 
 /// Database-level `table_catalog` value reported by
@@ -4046,6 +4366,33 @@ const VIEW_CHECK_OPTION_NONE: &str = "NONE";
 /// and that goes through `REFRESH MATERIALIZED VIEW`, not `UPDATE` /
 /// `INSERT`. Both columns report `"NO"`.
 const VIEW_FLAG_NO: &str = "NO";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// pg_ts_config constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// PG 15 system OID for the `english` text-search configuration. This is the
+/// value PG itself uses in `pg_ts_config.oid` for the built-in English config
+/// so client tooling that looks up a config by OID resolves correctly.
+const PG_TS_CONFIG_OID_ENGLISH: i64 = 12824;
+
+/// PG 15 system OID for the `simple` text-search configuration. Matches PG's
+/// own `pg_ts_config.oid` for the pass-through config (no stemming).
+const PG_TS_CONFIG_OID_SIMPLE: i64 = 12801;
+
+/// PG 15 system OID for the built-in default text-search parser
+/// (`pg_catalog.default`). All Basin text-search configurations share this
+/// parser; the value surfaces in `pg_ts_config.cfgparser`.
+const PG_TS_DEFAULT_PARSER_OID: i64 = 3722;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// pg_cancel_backend constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// SQL-visible name for the built-in cancellation function. Used both for
+/// the `pg_proc` row registration and the `pg_catalog` namespace routing
+/// so callers that look up the function by name find it.
+const PG_CANCEL_BACKEND_NAME: &str = "pg_cancel_backend";
 
 /// `information_schema.schemata.schema_owner` placeholder. Empty string
 /// rather than NULL because the column is non-nullable in PG and the
