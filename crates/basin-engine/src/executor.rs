@@ -80,7 +80,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
 use crate::convert::{batch_df_to_ws, batch_ws_to_df, schema_df_to_ws};
-use crate::ddl::{extract_create_table_cluster_by, partition_spec_from_ast};
+use crate::ddl::{extract_create_table_cluster_by, extract_exclude_using_gist, partition_spec_from_ast};
 use crate::dml::{batch_from_rows, group_rows_by_partition};
 use crate::events::{
     build_row_json, dispatch_post_commit, dispatch_pre_commit, make_event, registry_has_any,
@@ -934,7 +934,13 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     // CLUSTER BY: sqlparser doesn't recognise these forms.
     let (lifecycle_stripped, lifecycle) =
         extract_create_table_lifecycle(cluster_stripped.as_str())?;
-    let sql_owned = lifecycle_stripped;
+    // Phase 5.24.F: strip `EXCLUDE USING gist (...)` table-level constraints
+    // before sqlparser sees the SQL (sqlparser 0.61 has no TableConstraint::Exclude
+    // variant). The parsed specs are threaded into `exec_create_table` so the
+    // constraint is persisted as a sentinel CheckConstraint and enforced on INSERT.
+    let (excl_stripped, exclude_specs) =
+        extract_exclude_using_gist(lifecycle_stripped.as_str());
+    let sql_owned = excl_stripped;
     let sql = sql_owned.as_str();
 
     // `CREATE TABLE … AS <query> [WITH [NO] DATA]` (CTAS). libpg_query —
@@ -1372,7 +1378,16 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
 
     let result = match stmt {
         Statement::CreateTable(ct) => {
-            exec_create_table(sess, ct, cluster_columns, lifecycle, ctas_shape, raw_sql).await
+            exec_create_table(
+                sess,
+                ct,
+                cluster_columns,
+                lifecycle,
+                ctas_shape,
+                raw_sql,
+                exclude_specs,
+            )
+            .await
         }
         Statement::CreateIndex(ci) => exec_create_index(sess, ci).await,
         Statement::Drop {
@@ -2200,6 +2215,11 @@ async fn exec_create_table(
     // the file format must be recovered from the original text rather
     // than the parsed `CreateTable` AST.
     raw_sql: &str,
+    // Phase 5.24.F: EXCLUDE USING gist constraints extracted from the SQL
+    // by `extract_exclude_using_gist` before sqlparser saw it. Each spec is
+    // encoded as a sentinel `CheckConstraint` predicate and persisted on the
+    // table metadata so the INSERT path can enforce it.
+    exclude_specs: Vec<crate::ddl::ExcludeConstraintSpec>,
 ) -> Result<ExecResult> {
     // 6.SEC.P1 — reject user DDL targeting a reserved system schema
     // (`auth`, `storage`, `cron`, `net`, `realtime`, `pg_catalog`,
@@ -2244,7 +2264,7 @@ async fn exec_create_table(
     .await?;
     let extra_md = crate::type_ddl::rewrite_user_type_columns(&mut ct.columns, &bindings)?;
 
-    let (schema, constraints) = crate::ddl::schema_and_constraints_from_columns(
+    let (schema, mut constraints) = crate::ddl::schema_and_constraints_from_columns(
         &ct.columns,
         &ct.constraints,
         name,
@@ -2456,6 +2476,17 @@ async fn exec_create_table(
             .catalog
             .set_adaptive_sort_override(&sess.project, &table, Some(aso))
             .await?;
+    }
+
+    // Phase 5.24.F: encode each EXCLUDE USING gist spec as a sentinel
+    // CheckConstraint predicate and fold it into the check-constraints list.
+    // The INSERT path detects these sentinels in `enforce_check_constraints`
+    // and routes them to the exclusion enforcer instead of DataFusion.
+    for spec in &exclude_specs {
+        constraints.checks.push(basin_catalog::CheckConstraint {
+            name: spec.name.clone(),
+            predicate: crate::ddl::encode_exclusion_sentinel(spec),
+        });
     }
 
     if !constraints.pk_columns.is_empty()
@@ -3291,6 +3322,9 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
             )
             .await?;
             crate::constraints::enforce_check_constraints(
+                &sess.engine.config().storage,
+                &sess.project,
+                &table,
                 table.as_str(),
                 meta.schema.as_ref(),
                 &meta.check_constraints,
@@ -3391,6 +3425,9 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
     // v0.2 secondary indexes (Phase 5.7 B1) will collapse PK / FK
     // to point lookups; for v0.1 we accept the scan cost.
     crate::constraints::enforce_check_constraints(
+        &sess.engine.config().storage,
+        &sess.project,
+        &table,
         table.as_str(),
         meta.schema.as_ref(),
         &meta.check_constraints,
@@ -3765,6 +3802,9 @@ async fn exec_insert_select(
     crate::type_ddl::enforce_domain_checks(&sess.engine.config().catalog, &sess.project, &batch)
         .await?;
     crate::constraints::enforce_check_constraints(
+        &sess.engine.config().storage,
+        &sess.project,
+        table,
         table.as_str(),
         meta.schema.as_ref(),
         &meta.check_constraints,
@@ -3977,6 +4017,9 @@ async fn exec_insert_default_values(
     crate::type_ddl::enforce_domain_checks(&sess.engine.config().catalog, &sess.project, &batch)
         .await?;
     crate::constraints::enforce_check_constraints(
+        &sess.engine.config().storage,
+        &sess.project,
+        &table,
         table.as_str(),
         meta.schema.as_ref(),
         &meta.check_constraints,

@@ -497,7 +497,16 @@ fn strip_check_wrapper(predicate: &str) -> &str {
 /// Evaluate every CHECK predicate against the batch via DataFusion.
 /// Rows where the predicate is false (or NULL — PG treats NULL as
 /// satisfying the predicate, so we accept NULL) raise SQLSTATE 23514.
+///
+/// Predicates that start with the sentinel prefix `__basin_excl:` are NOT
+/// DataFusion expressions — they encode an `EXCLUDE USING gist` constraint
+/// stored at DDL time. Those are dispatched to
+/// [`enforce_one_exclusion_constraint`] which performs a table scan and raises
+/// SQLSTATE 23P01 (`exclusion_violation`) on conflict.
 pub(crate) async fn enforce_check_constraints(
+    storage: &basin_storage::Storage,
+    project: &ProjectId,
+    table: &TableName,
     table_name_str: &str,
     schema: &Schema,
     checks: &[CheckConstraint],
@@ -522,6 +531,21 @@ pub(crate) async fn enforce_check_constraints(
         .map_err(|e| BasinError::internal(format!("CHECK register: {e}")))?;
 
     for c in checks {
+        // Phase 5.24.F: sentinel predicates encode EXCLUDE USING gist constraints.
+        // Route them to the exclusion enforcer instead of DataFusion evaluation.
+        if let Some(spec) = crate::ddl::parse_exclusion_sentinel(&c.predicate) {
+            enforce_one_exclusion_constraint(
+                storage,
+                project,
+                table,
+                table_name_str,
+                &spec,
+                batch,
+            )
+            .await?;
+            continue;
+        }
+
         // Normalize: strip any leading CHECK (...) wrapper that may have been
         // stored by an earlier version of the DDL path, making evaluation
         // idempotent whether the stored form is bare or wrapped.
@@ -564,6 +588,278 @@ pub(crate) async fn enforce_check_constraints(
         }
     }
     Ok(())
+}
+
+// --------------------------------------------------------------------
+// EXCLUSION constraint enforcement (Phase 5.24.F)
+// --------------------------------------------------------------------
+
+/// Enforce one `EXCLUDE USING gist` constraint stored as a sentinel
+/// `CheckConstraint` predicate (see `ddl::encode_exclusion_sentinel`).
+///
+/// For each new row in `batch`, scans every existing row in the table and
+/// checks whether *all* element conditions hold simultaneously:
+///
+/// - `col WITH =`  → the existing row's column value equals the new row's.
+/// - `col WITH &&` → the existing range column overlaps the new row's range.
+///
+/// If all conditions hold, the row pair violates the exclusion constraint and
+/// we return `BasinError::CheckViolation` with SQLSTATE 23P01 in the message
+/// so downstream tests / the router can classify it correctly.
+///
+/// Cost: `O(new_rows × existing_rows)` per constraint — same scan pattern as
+/// `enforce_pk_on_insert`. Acceptable for v0.1; Phase 5.24.G can add a GIST
+/// probe path once the index is queryable at enforcement time.
+async fn enforce_one_exclusion_constraint(
+    storage: &basin_storage::Storage,
+    project: &ProjectId,
+    table: &TableName,
+    table_name_str: &str,
+    spec: &crate::ddl::ExcludeConstraintSpec,
+    batch: &RecordBatch,
+) -> Result<()> {
+    if spec.elements.is_empty() || batch.num_rows() == 0 {
+        return Ok(());
+    }
+
+    // Build column-index maps for the new batch.
+    let new_col_idx: Vec<usize> = spec
+        .elements
+        .iter()
+        .map(|e| {
+            batch.schema().index_of(&e.column).map_err(|_| {
+                BasinError::internal(format!(
+                    "exclusion constraint column {:?} not in batch",
+                    e.column
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Collect all new-row tuples: Vec<(row_idx, Vec<String>)>.
+    let mut new_tuples: Vec<(usize, Vec<String>)> = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        let mut vals = Vec::with_capacity(spec.elements.len());
+        let mut any_null = false;
+        for &ci in &new_col_idx {
+            let arr = batch.column(ci);
+            if arr.is_null(row) {
+                any_null = true;
+                break;
+            }
+            vals.push(scalar_to_string_for_excl(arr.as_ref(), row)?);
+        }
+        if !any_null {
+            new_tuples.push((row, vals));
+        }
+    }
+    if new_tuples.is_empty() {
+        return Ok(());
+    }
+
+    // Intra-batch check: two new rows must not conflict with each other.
+    for i in 0..new_tuples.len() {
+        for j in (i + 1)..new_tuples.len() {
+            if exclusion_tuples_conflict(&spec.elements, &new_tuples[i].1, &new_tuples[j].1)? {
+                return Err(BasinError::CheckViolation(format!(
+                    "conflicting key value violates exclusion constraint \"{name}\" \
+                     on table \"{table_name_str}\" (SQLSTATE 23P01): \
+                     two rows in the same INSERT conflict with each other.",
+                    name = spec.name
+                )));
+            }
+        }
+    }
+
+    // Existing-row scan.
+    let data_files = storage.list_data_files_with_stats(project, table).await?;
+    for f in &data_files {
+        let mut stream = storage.read_file(project, &f.path).await?;
+        while let Some(rb) = stream.next().await {
+            let rb = rb?;
+            // Build column index map for this file batch (may differ from
+            // the insert batch's schema).
+            let file_col_idx: Vec<usize> = spec
+                .elements
+                .iter()
+                .map(|e| {
+                    rb.schema().index_of(&e.column).map_err(|_| {
+                        BasinError::internal(format!(
+                            "exclusion constraint column {:?} not in data file",
+                            e.column
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            for exist_row in 0..rb.num_rows() {
+                // Build existing-row tuple.
+                let mut exist_vals = Vec::with_capacity(spec.elements.len());
+                let mut any_null = false;
+                for &ci in &file_col_idx {
+                    let arr = rb.column(ci);
+                    if arr.is_null(exist_row) {
+                        any_null = true;
+                        break;
+                    }
+                    exist_vals.push(scalar_to_string_for_excl(arr.as_ref(), exist_row)?);
+                }
+                if any_null {
+                    continue;
+                }
+
+                // Check each new row against this existing row.
+                for (_, new_vals) in &new_tuples {
+                    if exclusion_tuples_conflict(&spec.elements, new_vals, &exist_vals)? {
+                        return Err(BasinError::CheckViolation(format!(
+                            "conflicting key value violates exclusion constraint \"{name}\" \
+                             on table \"{table_name_str}\" (SQLSTATE 23P01): \
+                             key conflicts with existing row.",
+                            name = spec.name
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Returns `true` if `a_vals` and `b_vals` jointly satisfy ALL element
+/// conditions, meaning they constitute an exclusion-constraint violation.
+///
+/// For `=` : the two values are string-equal.
+/// For `&&`: the two range values overlap (reuses the same logic as the
+///           `range_overlaps` UDF — non-overlapping / adjacent → false).
+fn exclusion_tuples_conflict(
+    elements: &[crate::ddl::ExcludeElement],
+    a_vals: &[String],
+    b_vals: &[String],
+) -> Result<bool> {
+    for (i, elem) in elements.iter().enumerate() {
+        let a = &a_vals[i];
+        let b = &b_vals[i];
+        let matches = match elem.op.as_str() {
+            "=" => a == b,
+            "&&" => ranges_overlap(a, b),
+            other => {
+                return Err(BasinError::FeatureNotSupported(format!(
+                    "EXCLUDE USING gist: operator {other:?} is not supported in v0.1 \
+                     (only `=` and `&&` are); open a feature request"
+                )));
+            }
+        };
+        if !matches {
+            // One element didn't match → no conflict.
+            return Ok(false);
+        }
+    }
+    // All elements matched → conflict.
+    Ok(true)
+}
+
+/// Check whether two range strings overlap using the same bound semantics as
+/// the `range_overlaps` UDF. Range strings may be in either the Basin JSON
+/// form (`{"l":…,"u":…,"li":…,"ui":…}`) or the PG text form (`[lo,hi)`).
+///
+/// Returns `false` when either value cannot be parsed (defensive: treat
+/// unparseable ranges as non-conflicting so a bad value doesn't hard-stop
+/// all inserts — the DataFusion path will catch type errors on SELECT).
+fn ranges_overlap(a: &str, b: &str) -> bool {
+    // Re-use the existing basin_common range parser.
+    use basin_common::types::range::RangeValue;
+
+    let parse = |s: &str| -> Option<RangeValue> {
+        let t = s.trim();
+        if t.starts_with('{') {
+            RangeValue::from_json_str(t)
+        } else {
+            RangeValue::from_pg_text(t)
+        }
+    };
+
+    let Some(ra) = parse(a) else { return false };
+    let Some(rb) = parse(b) else { return false };
+
+    // Convert to comparable f64 bounds via the JSON representation.
+    let ra_json = ra.to_json_string();
+    let rb_json = rb.to_json_string();
+
+    let va: serde_json::Value = match serde_json::from_str(&ra_json) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let vb: serde_json::Value = match serde_json::from_str(&rb_json) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    // Helper: extract a bound as f64 (null / missing = infinity).
+    let bound_f64 = |v: &serde_json::Value, key: &str| -> Option<f64> {
+        let val = v.get(key)?;
+        if val.is_null() {
+            return None; // unbounded / infinity
+        }
+        if let Some(n) = val.as_f64() {
+            return Some(n);
+        }
+        // String-encoded timestamp or similar — convert to micros via parse.
+        if let Some(s) = val.as_str() {
+            // Try naive timestamp parse (PG epoch in microseconds).
+            if let Ok(ts) = s.parse::<i64>() {
+                return Some(ts as f64);
+            }
+            // Try chrono naive datetime.
+            if let Ok(dt) =
+                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                    .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
+            {
+                return Some(dt.and_utc().timestamp_micros() as f64);
+            }
+        }
+        None
+    };
+    let bound_inc = |v: &serde_json::Value, key: &str, default: bool| -> bool {
+        v.get(key).and_then(|x| x.as_bool()).unwrap_or(default)
+    };
+
+    let a_lo = bound_f64(&va, "l");
+    let a_hi = bound_f64(&va, "u");
+    let b_lo = bound_f64(&vb, "l");
+    let b_hi = bound_f64(&vb, "u");
+    let a_li = bound_inc(&va, "li", true);
+    let a_ui = bound_inc(&va, "ui", false);
+    let b_li = bound_inc(&vb, "li", true);
+    let b_ui = bound_inc(&vb, "ui", false);
+
+    // a ends before b starts?
+    let a_before_b = match (a_hi, b_lo) {
+        (Some(ah), Some(bl)) => {
+            if a_ui && b_li { ah < bl } else { ah <= bl }
+        }
+        _ => false,
+    };
+    // b ends before a starts?
+    let b_before_a = match (b_hi, a_lo) {
+        (Some(bh), Some(al)) => {
+            if b_ui && a_li { bh < al } else { bh <= al }
+        }
+        _ => false,
+    };
+    !(a_before_b || b_before_a)
+}
+
+/// Convert an Arrow scalar at `(arr, row)` to a string for exclusion
+/// comparisons. This is similar to `scalar_to_canonical_string` but also
+/// handles `Utf8` (range values are stored as JSON strings) and returns
+/// the raw string value directly for `&&` operator comparisons.
+fn scalar_to_string_for_excl(arr: &dyn Array, row: usize) -> Result<String> {
+    // Utf8 columns (includes range types stored as JSON strings).
+    if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
+        return Ok(a.value(row).to_string());
+    }
+    // Fall back to the shared canonical-string helper for numeric / UUID types.
+    scalar_to_canonical_string(arr, row)
 }
 
 /// Render `(v1, v2, ...)` in the loose PG style for the failing-row

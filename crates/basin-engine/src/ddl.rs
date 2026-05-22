@@ -2558,6 +2558,282 @@ pub(crate) fn strip_ctas_column_list(sql: &str) -> String {
     out
 }
 
+// -----------------------------------------------------------------------
+// EXCLUDE USING gist — range exclusion-constraint pre-processor (5.24.F)
+// -----------------------------------------------------------------------
+
+/// One column entry in an `EXCLUDE USING gist (...)` clause.
+/// `op` is the operator text (`=` for equality, `&&` for range-overlap).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExcludeElement {
+    pub column: String,
+    pub op: String,
+}
+
+/// One fully-parsed `EXCLUDE USING gist (...)` constraint extracted
+/// from a `CREATE TABLE` statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExcludeConstraintSpec {
+    /// Constraint name (synthesised when absent).
+    pub name: String,
+    /// Ordered list of `(column, operator)` pairs.
+    pub elements: Vec<ExcludeElement>,
+}
+
+/// Serialise a single [`ExcludeConstraintSpec`] into the sentinel string
+/// stored inside a `CheckConstraint::predicate`. Format:
+///
+/// ```text
+/// __basin_excl:<name>:<col1>:<op1>:<col2>:<op2>:...
+/// ```
+///
+/// The sentinel is recognised by [`parse_exclusion_sentinel`] in
+/// `constraints.rs` and triggers the exclusion-enforcement path instead of
+/// the normal boolean-expression evaluation.
+pub(crate) fn encode_exclusion_sentinel(spec: &ExcludeConstraintSpec) -> String {
+    let mut s = format!("__basin_excl:{}:", spec.name);
+    for (i, e) in spec.elements.iter().enumerate() {
+        if i > 0 {
+            s.push(':');
+        }
+        s.push_str(&e.column);
+        s.push(':');
+        s.push_str(&e.op);
+    }
+    s
+}
+
+/// Inverse of [`encode_exclusion_sentinel`]. Returns `None` for non-sentinel
+/// predicates (i.e. ordinary CHECK expressions).
+pub(crate) fn parse_exclusion_sentinel(predicate: &str) -> Option<ExcludeConstraintSpec> {
+    let rest = predicate.strip_prefix("__basin_excl:")?;
+    let mut parts: Vec<&str> = rest.splitn(2, ':').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let name = parts[0].to_string();
+    let tail = parts[1];
+    // Remaining tokens: col op col op ...
+    let tokens: Vec<&str> = tail.split(':').collect();
+    if tokens.len() % 2 != 0 || tokens.is_empty() {
+        return None;
+    }
+    let mut elements = Vec::new();
+    let mut i = 0;
+    while i + 1 < tokens.len() {
+        elements.push(ExcludeElement {
+            column: tokens[i].to_string(),
+            op: tokens[i + 1].to_string(),
+        });
+        i += 2;
+    }
+    if elements.is_empty() {
+        return None;
+    }
+    let _ = parts.drain(..);
+    Some(ExcludeConstraintSpec { name, elements })
+}
+
+/// Strip `EXCLUDE USING gist (...)` table-level constraints from a
+/// `CREATE TABLE` SQL string before sqlparser sees it (sqlparser 0.61 has no
+/// `TableConstraint::Exclude` variant).
+///
+/// Returns `(cleaned_sql, specs)` where:
+/// - `cleaned_sql` is the original SQL with every matched EXCLUDE clause
+///   removed (replaced by nothing so the surrounding commas / whitespace
+///   are cleaned up naturally).
+/// - `specs` contains the parsed exclusion specs (one per clause found).
+///
+/// Only `EXCLUDE USING gist` is handled; other `EXCLUDE USING <index_method>`
+/// forms are *not* on the 5.24.F roadmap and are left in the SQL (sqlparser
+/// will reject them with a normal parse error, which is the correct
+/// behaviour).
+///
+/// Non-`CREATE TABLE` statements are returned unchanged with an empty vec.
+pub(crate) fn extract_exclude_using_gist(
+    sql: &str,
+) -> (String, Vec<ExcludeConstraintSpec>) {
+    let leading = sql.trim_start();
+    if !leading
+        .get(..6)
+        .map(|s| s.eq_ignore_ascii_case("create"))
+        .unwrap_or(false)
+    {
+        return (sql.to_string(), vec![]);
+    }
+
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut specs: Vec<ExcludeConstraintSpec> = Vec::new();
+    let mut i = 0usize;
+    // Synthetic counter for constraint names.
+    let mut excl_counter: usize = 0;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        // Pass string literals verbatim.
+        if b == b'\'' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        // Quoted identifiers.
+        if b == b'"' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        // Line comments.
+        if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        // Block comments.
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            let start = i;
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < bytes.len() {
+                i += 2;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+
+        // Look for `EXCLUDE` keyword at a word boundary.
+        if matches_kw_at(bytes, i, b"EXCLUDE") {
+            // Peek ahead: expect `USING` then `gist` then `(`.
+            let mut j = i + b"EXCLUDE".len();
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if !matches_kw_at(bytes, j, b"USING") {
+                // Not an EXCLUDE USING — pass through.
+                out.push(b as char);
+                i += 1;
+                continue;
+            }
+            j += b"USING".len();
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if !matches_kw_at(bytes, j, b"gist") {
+                // EXCLUDE USING <other> — pass through (will fail sqlparser).
+                out.push(b as char);
+                i += 1;
+                continue;
+            }
+            j += b"gist".len();
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j >= bytes.len() || bytes[j] != b'(' {
+                out.push(b as char);
+                i += 1;
+                continue;
+            }
+            // Found `EXCLUDE USING gist (`. Scan the balanced paren body.
+            let open = j;
+            let Some(close) = find_matching_paren(bytes, open) else {
+                out.push(b as char);
+                i += 1;
+                continue;
+            };
+            let body = &sql[open + 1..close];
+
+            // Parse `col WITH op` pairs from the body.
+            let mut elements: Vec<ExcludeElement> = Vec::new();
+            for part in body.split(',') {
+                let part = part.trim();
+                if part.is_empty() {
+                    continue;
+                }
+                // Each part looks like `col WITH op` (case-insensitive WITH).
+                let upper = part.to_ascii_uppercase();
+                let with_pos = upper.find(" WITH ");
+                let (col_part, op_part) = if let Some(wp) = with_pos {
+                    (&part[..wp], part[wp + 6..].trim())
+                } else {
+                    // Malformed — skip.
+                    continue;
+                };
+                let col = col_part.trim().to_string();
+                let op = op_part.to_string();
+                if !col.is_empty() && !op.is_empty() {
+                    elements.push(ExcludeElement { column: col, op });
+                }
+            }
+
+            if !elements.is_empty() {
+                excl_counter += 1;
+                let spec = ExcludeConstraintSpec {
+                    name: format!("excl_gist_{excl_counter}"),
+                    elements,
+                };
+                specs.push(spec);
+                // Remove the EXCLUDE clause from the output. We need to also
+                // remove the preceding comma (if it follows another column/
+                // constraint) to keep the column list well-formed.
+                // Strategy: trim trailing comma+whitespace from `out` if
+                // the last non-whitespace char in `out` is a comma.
+                let trimmed = out.trim_end();
+                if trimmed.ends_with(',') {
+                    out.truncate(trimmed.len() - 1);
+                }
+            }
+
+            i = close + 1;
+            // Skip any trailing comma + whitespace that follows the clause
+            // (in case it was the *first* or *middle* entry in the list).
+            while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
+                // But only eat ONE trailing comma.
+                if bytes[i] == b',' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        out.push(b as char);
+        i += 1;
+    }
+
+    (out, specs)
+}
+
 #[cfg(test)]
 mod cluster_by_tests {
     use super::*;

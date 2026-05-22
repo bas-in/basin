@@ -205,6 +205,36 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
             "/auth/v1/api-keys/:id",
             axum::routing::delete(auth_routes::delete_api_key),
         )
+        // --- OAuth routes (Phase 5.10.O) ------------------------------------
+        .route(
+            "/auth/v1/oauth/:provider/authorize",
+            get(auth_routes::oauth_authorize),
+        )
+        .route(
+            "/auth/v1/oauth/:provider/callback",
+            get(auth_routes::oauth_callback),
+        )
+        // --- MFA routes (Phase 5.10.M) --------------------------------------
+        .route(
+            "/auth/v1/factors",
+            post(auth_routes::enroll_factor).get(auth_routes::list_factors),
+        )
+        .route(
+            "/auth/v1/factors/:id/verify",
+            post(auth_routes::verify_factor),
+        )
+        .route(
+            "/auth/v1/factors/:id/challenge",
+            post(auth_routes::begin_challenge),
+        )
+        .route(
+            "/auth/v1/factors/:id/challenge/verify",
+            post(auth_routes::verify_challenge),
+        )
+        .route(
+            "/auth/v1/factors/:id",
+            axum::routing::delete(auth_routes::unenroll_factor),
+        )
         // Operator-grade endpoints: provision per-project pgwire credentials
         // and rotate them. All gated on `claims.is_admin == true` (see
         // `admin_routes::*`).

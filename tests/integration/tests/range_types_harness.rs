@@ -1187,7 +1187,6 @@ async fn range_gist_index() {
 ///   4. Adjacent (non-overlapping) booking for the same room is accepted.
 ///
 /// Closed by: 5.24.F (EXCLUDE USING gist + constraint enforcement).
-#[ignore = "5.24.F — exclusion constraint scheduling pending"]
 #[tokio::test]
 async fn range_exclusion_constraint_scheduling() {
     // Slice: "scheduling pattern"

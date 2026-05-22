@@ -1165,6 +1165,9 @@ pub(crate) async fn exec_update(
     if !meta.check_constraints.is_empty() {
         for batch in &replacement_batches {
             crate::constraints::enforce_check_constraints(
+                &storage,
+                &sess.project,
+                &table,
                 table.as_str(),
                 meta.schema.as_ref(),
                 &meta.check_constraints,

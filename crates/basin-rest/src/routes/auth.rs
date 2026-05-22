@@ -7,16 +7,34 @@
 //! The intent is end-to-end usability: a frontend can `fetch('/auth/v1/...')`
 //! to get a JWT, then `fetch('/rest/v1/...')` with that JWT in the
 //! `Authorization` header, all on a single host.
+//!
+//! ## OAuth routes (Phase 5.10.O)
+//!
+//! - `GET  /auth/v1/oauth/:provider/authorize` — build PKCE/state URL → JSON
+//!   `{redirect_url, state}` (client-side redirect or 302 per convention).
+//! - `GET  /auth/v1/oauth/:provider/callback?code=&state=` — exchange code →
+//!   issue Basin JWT + refresh; returns token body.
+//!
+//! ## MFA routes (Phase 5.10.M)
+//!
+//! - `POST   /auth/v1/factors`                          — enroll (TOTP or WebAuthn)
+//! - `GET    /auth/v1/factors`                          — list factors for current user
+//! - `POST   /auth/v1/factors/:id/verify`               — confirm enrollment
+//! - `POST   /auth/v1/factors/:id/challenge`            — begin step-up challenge
+//! - `POST   /auth/v1/factors/:id/challenge/verify`     — complete step-up → aal2 JWT
+//! - `DELETE /auth/v1/factors/:id`                      — unenroll (requires aal2)
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use basin_auth::oauth::PlaintextEncryption;
 use basin_common::ProjectId;
 use serde::Deserialize;
 use serde_json::json;
+use uuid::Uuid;
 
 use crate::errors::ApiError;
 use crate::server::{authorize, Inner};
@@ -342,5 +360,467 @@ pub(crate) async fn delete_api_key(
         .revoke_api_key(id, &claims.project_id)
         .await
         .map_err(ApiError::from)?;
+    Ok(Json(json!({ "ok": true })).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// OAuth routes (Phase 5.10.O)
+// ---------------------------------------------------------------------------
+
+/// Type alias for the `None` store — uses the in-memory `OAuthStateCache` /
+/// `MfaCache` path. The `PostgresAuthStore` implements both `OAuthStore` and
+/// `MfaStore`; passing `None::<&PostgresAuthStore>` satisfies the generic
+/// bound while routing through the in-memory fallback that lives on `Inner`.
+/// This is correct for single-process in-process deployments; multi-replica
+/// Postgres-backed paths require injecting a real store (future work).
+type PgStore = basin_auth::store::postgres::PostgresAuthStore;
+
+/// Query parameters for `GET /auth/v1/oauth/:provider/authorize`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct OAuthAuthorizeQuery {
+    /// Project for which the OAuth flow is being initiated. Required so we
+    /// can look up the provider config and sign the CSRF state correctly.
+    pub project_id: String,
+    /// URL to redirect to after the flow completes. Validated against the
+    /// per-project allowlist stored in `{schema}_oauth_providers.redirect_uri`.
+    #[serde(default)]
+    pub redirect_to: String,
+}
+
+/// Query parameters for `GET /auth/v1/oauth/:provider/callback`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct OAuthCallbackQuery {
+    /// Authorization code from the provider.
+    pub code: String,
+    /// CSRF state echoed back by the provider.
+    pub state: String,
+    /// The callback URL used in the original authorize request. Must match
+    /// what was passed as `redirect_to` during authorize so the PKCE verifier
+    /// is valid.
+    #[serde(default)]
+    pub redirect_uri: String,
+    /// Provider hint for the callback (same as the path param).
+    #[serde(default)]
+    pub provider: String,
+}
+
+/// `GET /auth/v1/oauth/:provider/authorize?project_id=&redirect_to=`
+///
+/// Builds the provider authorize URL (with PKCE + signed CSRF state) and
+/// returns it as JSON. The client should redirect the browser to
+/// `redirect_url`.
+///
+/// Response: `{ "redirect_url": "https://provider.com/oauth/authorize?...", "state": "..." }`
+///
+/// The `oauth_store` is `None` — in-memory `OAuthStateCache` is used.
+/// For Postgres-backed multi-replica setups, inject a real `OAuthStore`.
+#[axum::debug_handler]
+pub(crate) async fn oauth_authorize(
+    State(state): State<Arc<Inner>>,
+    Path(provider): Path<String>,
+    Query(q): Query<OAuthAuthorizeQuery>,
+) -> Result<Response, ApiError> {
+    if provider.is_empty() || provider.len() > 64 {
+        return Err(ApiError::invalid("invalid provider name"));
+    }
+    let project_id = parse_project(&q.project_id)?;
+
+    let result = state
+        .cfg
+        .auth
+        .begin_oauth_authorize(
+            None::<&PgStore>,
+            &project_id,
+            &provider,
+            &q.redirect_to,
+        )
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(Json(json!({
+        "redirect_url": result.redirect_url,
+        "state": result.state,
+    }))
+    .into_response())
+}
+
+/// `GET /auth/v1/oauth/:provider/callback?code=&state=`
+///
+/// Handles the OAuth provider redirect-back. Validates state + HMAC,
+/// exchanges the code (with PKCE verifier), fetches userinfo, links/creates
+/// the user, and issues Basin JWT + refresh tokens.
+///
+/// Response: same token body as `/auth/v1/signin`.
+#[axum::debug_handler]
+pub(crate) async fn oauth_callback(
+    State(state): State<Arc<Inner>>,
+    Path(provider): Path<String>,
+    Query(q): Query<OAuthCallbackQuery>,
+) -> Result<Response, ApiError> {
+    if provider.is_empty() || provider.len() > 64 {
+        return Err(ApiError::invalid("invalid provider name"));
+    }
+
+    let enc = PlaintextEncryption;
+    let result = state
+        .cfg
+        .auth
+        .handle_oauth_callback(
+            &enc,
+            None::<&PgStore>,
+            &provider,
+            &q.code,
+            &q.state,
+            &q.redirect_uri,
+        )
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(Json(token_body(&result.tokens)).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// MFA routes (Phase 5.10.M)
+// ---------------------------------------------------------------------------
+
+fn parse_uuid(s: &str, label: &str) -> Result<Uuid, ApiError> {
+    s.parse::<Uuid>()
+        .map_err(|_| ApiError::invalid(format!("invalid {label}: {s:?}")))
+}
+
+/// Request body for `POST /auth/v1/factors` (enroll a new factor).
+#[derive(Debug, Deserialize)]
+pub(crate) struct EnrollFactorRequest {
+    /// `"totp"` or `"webauthn"`.
+    pub factor_type: String,
+    /// Human-readable label (e.g. "Authenticator App", "YubiKey 5").
+    #[serde(default)]
+    pub friendly_name: String,
+}
+
+/// Request body for `POST /auth/v1/factors/:id/verify` (confirm enrollment).
+#[derive(Debug, Deserialize)]
+pub(crate) struct VerifyFactorRequest {
+    /// TOTP: the 6-digit OTP code from the authenticator app.
+    #[serde(default)]
+    pub code: Option<String>,
+    /// WebAuthn: attestation response JSON from `navigator.credentials.create()`.
+    #[serde(default)]
+    pub attestation: Option<String>,
+    /// WebAuthn: the `challenge_id` returned by `POST /auth/v1/factors`.
+    #[serde(default)]
+    pub challenge_id: Option<String>,
+}
+
+/// Request body for `POST /auth/v1/factors/:id/challenge/verify`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ChallengeVerifyRequest {
+    /// The `challenge_id` returned by `POST /auth/v1/factors/:id/challenge`.
+    pub challenge_id: String,
+    /// TOTP: 6-digit OTP code.
+    #[serde(default)]
+    pub code: Option<String>,
+    /// WebAuthn: assertion response JSON from `navigator.credentials.get()`.
+    #[serde(default)]
+    pub assertion: Option<String>,
+}
+
+/// `POST /auth/v1/factors` — enroll a new MFA factor.
+///
+/// **TOTP**: body `{ "factor_type": "totp", "friendly_name": "..." }`.
+/// Returns `{ factor_id, factor_type, secret_b32, otpauth_uri }`.
+///
+/// **WebAuthn**: body `{ "factor_type": "webauthn", "friendly_name": "..." }`.
+/// Returns `{ factor_id, factor_type, challenge_id, creation_options_json }`.
+///
+/// The factor is `unverified` until `POST /auth/v1/factors/:id/verify`.
+#[axum::debug_handler]
+pub(crate) async fn enroll_factor(
+    State(state): State<Arc<Inner>>,
+    headers: HeaderMap,
+    Json(req): Json<EnrollFactorRequest>,
+) -> Result<Response, ApiError> {
+    let claims = authorize(&state, &headers).await?;
+    let enc = PlaintextEncryption;
+
+    let body = match req.factor_type.as_str() {
+        "totp" => {
+            let enr = state
+                .cfg
+                .auth
+                .enroll_totp(
+                    None::<&PgStore>,
+                    &enc,
+                    &claims.project_id,
+                    claims.user_id,
+                    &req.friendly_name,
+                )
+                .await
+                .map_err(ApiError::from)?;
+            json!({
+                "factor_id": enr.factor_id.to_string(),
+                "factor_type": "totp",
+                "secret_b32": enr.secret_b32,
+                "otpauth_uri": enr.otpauth_uri,
+            })
+        }
+        "webauthn" => {
+            let enr = state
+                .cfg
+                .auth
+                .enroll_webauthn(
+                    None::<&PgStore>,
+                    &claims.project_id,
+                    claims.user_id,
+                    &req.friendly_name,
+                )
+                .await
+                .map_err(ApiError::from)?;
+            json!({
+                "factor_id": enr.factor_id.to_string(),
+                "factor_type": "webauthn",
+                "challenge_id": enr.challenge_id.to_string(),
+                "creation_options_json": enr.creation_options_json,
+            })
+        }
+        other => {
+            return Err(ApiError::invalid(format!(
+                "unknown factor_type {other:?}; expected \"totp\" or \"webauthn\""
+            )))
+        }
+    };
+
+    Ok((StatusCode::CREATED, Json(body)).into_response())
+}
+
+/// `GET /auth/v1/factors` — list MFA factors for the current user.
+///
+/// Returns an array of factor descriptors (id, type, status, friendly_name,
+/// timestamps). The secret/credential is never included.
+///
+/// **Limitation:** `AuthService::list_factors` does not yet exist in
+/// `basin-auth`. This endpoint always returns an empty array until that method
+/// is added and wired here (tracked as future work). Enrollment + verification
+/// work correctly; this list surface is the only gap.
+#[axum::debug_handler]
+pub(crate) async fn list_factors(
+    State(state): State<Arc<Inner>>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let _claims = authorize(&state, &headers).await?;
+    // TODO(future): call AuthService::list_factors once it exists in basin-auth.
+    // Until then, return an empty array so the route is mounted and auth-gated
+    // correctly; clients that enumerate factors will get [] rather than a 404.
+    let _ = &state;
+    let body: Vec<serde_json::Value> = Vec::new();
+    Ok(Json(body).into_response())
+}
+
+/// `POST /auth/v1/factors/:id/verify` — confirm factor enrollment.
+///
+/// **TOTP**: body `{ "code": "123456" }`.
+/// **WebAuthn**: body `{ "attestation": "<json>", "challenge_id": "<uuid>" }`.
+///
+/// On first verified factor, also returns `recovery_codes` (plaintext,
+/// single-issue — client must store them).
+#[axum::debug_handler]
+pub(crate) async fn verify_factor(
+    State(state): State<Arc<Inner>>,
+    headers: HeaderMap,
+    Path(factor_id_str): Path<String>,
+    Json(req): Json<VerifyFactorRequest>,
+) -> Result<Response, ApiError> {
+    let claims = authorize(&state, &headers).await?;
+    let factor_id = parse_uuid(&factor_id_str, "factor_id")?;
+    let enc = PlaintextEncryption;
+
+    let recovery_codes = if let Some(attestation) = req.attestation.as_deref() {
+        // WebAuthn path.
+        let challenge_id_str = req
+            .challenge_id
+            .as_deref()
+            .ok_or_else(|| ApiError::invalid("challenge_id required for webauthn verify"))?;
+        let challenge_id = parse_uuid(challenge_id_str, "challenge_id")?;
+        state
+            .cfg
+            .auth
+            .verify_webauthn_factor(
+                None::<&PgStore>,
+                &enc,
+                &claims.project_id,
+                claims.user_id,
+                factor_id,
+                challenge_id,
+                attestation,
+            )
+            .await
+            .map_err(ApiError::from)?
+    } else {
+        // TOTP path.
+        let code = req
+            .code
+            .as_deref()
+            .ok_or_else(|| ApiError::invalid("code required for totp verify"))?;
+        state
+            .cfg
+            .auth
+            .verify_totp_factor(
+                None::<&PgStore>,
+                &enc,
+                &claims.project_id,
+                claims.user_id,
+                factor_id,
+                code,
+            )
+            .await
+            .map_err(ApiError::from)?
+    };
+
+    let mut body = json!({ "ok": true });
+    if let Some(codes) = recovery_codes {
+        body["recovery_codes"] = json!(codes);
+    }
+    Ok(Json(body).into_response())
+}
+
+/// `POST /auth/v1/factors/:id/challenge` — begin a step-up challenge.
+///
+/// **TOTP**: returns `{ "challenge_id": "<uuid>" }`.
+/// **WebAuthn**: returns `{ "challenge_id": "<uuid>", "request_options_json": "..." }`.
+///
+/// The response `challenge_id` is used in the subsequent
+/// `POST /auth/v1/factors/:id/challenge/verify` call.
+#[axum::debug_handler]
+pub(crate) async fn begin_challenge(
+    State(state): State<Arc<Inner>>,
+    headers: HeaderMap,
+    Path(factor_id_str): Path<String>,
+) -> Result<Response, ApiError> {
+    let claims = authorize(&state, &headers).await?;
+    let factor_id = parse_uuid(&factor_id_str, "factor_id")?;
+
+    // Try TOTP first (most common). On factor-type mismatch, fall back to
+    // WebAuthn. The error text from mfa::require_factor_type is
+    // "factor type mismatch: expected totp, got webauthn" — we detect it by
+    // substring match to avoid cross-crate coupling on error variants.
+    let totp_result = state
+        .cfg
+        .auth
+        .begin_totp_challenge(
+            None::<&PgStore>,
+            &claims.project_id,
+            claims.user_id,
+            factor_id,
+        )
+        .await;
+
+    match totp_result {
+        Ok(challenge_id) => {
+            Ok(Json(json!({ "challenge_id": challenge_id.to_string() })).into_response())
+        }
+        Err(e) if e.to_string().contains("factor type mismatch") => {
+            let (challenge_id, options_json) = state
+                .cfg
+                .auth
+                .begin_webauthn_challenge(
+                    None::<&PgStore>,
+                    &claims.project_id,
+                    claims.user_id,
+                    factor_id,
+                )
+                .await
+                .map_err(ApiError::from)?;
+            Ok(Json(json!({
+                "challenge_id": challenge_id.to_string(),
+                "request_options_json": options_json,
+            }))
+            .into_response())
+        }
+        Err(e) => Err(ApiError::from(e)),
+    }
+}
+
+/// `POST /auth/v1/factors/:id/challenge/verify` — complete step-up → aal2 JWT.
+///
+/// **TOTP**: body `{ "challenge_id": "<uuid>", "code": "123456" }`.
+/// **WebAuthn**: body `{ "challenge_id": "<uuid>", "assertion": "<json>" }`.
+///
+/// Returns the same token body as `/auth/v1/signin` but with `aal2` in the
+/// JWT claims.
+#[axum::debug_handler]
+pub(crate) async fn verify_challenge(
+    State(state): State<Arc<Inner>>,
+    headers: HeaderMap,
+    Path(factor_id_str): Path<String>,
+    Json(req): Json<ChallengeVerifyRequest>,
+) -> Result<Response, ApiError> {
+    let claims = authorize(&state, &headers).await?;
+    let _factor_id = parse_uuid(&factor_id_str, "factor_id")?;
+    let challenge_id = parse_uuid(&req.challenge_id, "challenge_id")?;
+    let enc = PlaintextEncryption;
+
+    let result = if let Some(code) = req.code.as_deref() {
+        state
+            .cfg
+            .auth
+            .verify_totp_challenge(
+                None::<&PgStore>,
+                &enc,
+                &claims.project_id,
+                claims.user_id,
+                challenge_id,
+                code,
+            )
+            .await
+            .map_err(ApiError::from)?
+    } else if let Some(assertion) = req.assertion.as_deref() {
+        state
+            .cfg
+            .auth
+            .verify_webauthn_challenge(
+                None::<&PgStore>,
+                &enc,
+                &claims.project_id,
+                claims.user_id,
+                challenge_id,
+                assertion,
+            )
+            .await
+            .map_err(ApiError::from)?
+    } else {
+        return Err(ApiError::invalid(
+            "one of `code` (TOTP) or `assertion` (WebAuthn) is required",
+        ));
+    };
+
+    Ok(Json(token_body(&result.tokens)).into_response())
+}
+
+/// `DELETE /auth/v1/factors/:id` — unenroll an MFA factor.
+///
+/// Requires `aal2` in the caller's JWT (the AAL check is also enforced
+/// inside `AuthService::unenroll_factor`).
+#[axum::debug_handler]
+pub(crate) async fn unenroll_factor(
+    State(state): State<Arc<Inner>>,
+    headers: HeaderMap,
+    Path(factor_id_str): Path<String>,
+) -> Result<Response, ApiError> {
+    let claims = authorize(&state, &headers).await?;
+    let factor_id = parse_uuid(&factor_id_str, "factor_id")?;
+
+    state
+        .cfg
+        .auth
+        .unenroll_factor(
+            None::<&PgStore>,
+            &claims.project_id,
+            claims.user_id,
+            factor_id,
+            &claims.aal,
+        )
+        .await
+        .map_err(ApiError::from)?;
+
     Ok(Json(json!({ "ok": true })).into_response())
 }

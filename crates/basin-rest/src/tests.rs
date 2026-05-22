@@ -1746,3 +1746,265 @@ async fn inbound_webhook_signed_unknown_name_401() {
 
     let _ = running.shutdown.send(());
 }
+
+// ---------------------------------------------------------------------------
+// OAuth route smoke tests (Phase 5.10.O)
+// ---------------------------------------------------------------------------
+
+/// `GET /auth/v1/oauth/:provider/authorize` with no registered provider →
+/// 4xx (route is mounted, not 404). The exact error code depends on whether
+/// the in-memory mock provider is registered; without registration the auth
+/// layer returns "not found" → 404 from `AuthService`, mapped to 4xx by
+/// `ApiError`. Key invariant: the route is NOT a 404 "no such route" from
+/// the axum router.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oauth_authorize_route_mounted() {
+    let Some((running, _svc, _auth, _mailer, _g)) = try_serve().await else {
+        return;
+    };
+    let addr = running.local_addr;
+    let project = ProjectId::new();
+
+    let r = http_request(
+        addr,
+        "GET",
+        &format!(
+            "/auth/v1/oauth/google/authorize?project_id={project}&redirect_to="
+        ),
+        &[],
+        None,
+    )
+    .await;
+    // Must NOT be axum's 405 "Method Not Allowed" or 404 "No such route".
+    // Any 4xx from our handler is fine — it means the route is mounted.
+    assert_ne!(
+        r.status, 405,
+        "oauth authorize must not return 405 (route not mounted for GET)"
+    );
+    // 404 from our handler is acceptable ("provider not found"); 404 from
+    // axum's router would indicate the route is not mounted at all. We
+    // distinguish by checking the body contains a recognisable JSON error.
+    if r.status == 404 {
+        let body = String::from_utf8_lossy(&r.body);
+        assert!(
+            body.contains("error") || body.contains("not_found") || body.contains("provider"),
+            "404 body looks like axum router miss, not our handler: {body}"
+        );
+    }
+
+    let _ = running.shutdown.send(());
+}
+
+/// `GET /auth/v1/oauth/:provider/callback` with missing state → 4xx
+/// (route is mounted, not a router 404/405).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oauth_callback_route_mounted() {
+    let Some((running, _svc, _auth, _mailer, _g)) = try_serve().await else {
+        return;
+    };
+    let addr = running.local_addr;
+
+    let r = http_request(
+        addr,
+        "GET",
+        "/auth/v1/oauth/google/callback?code=abc&state=def",
+        &[],
+        None,
+    )
+    .await;
+    assert_ne!(r.status, 405, "oauth callback must not 405 (not mounted)");
+
+    let _ = running.shutdown.send(());
+}
+
+// ---------------------------------------------------------------------------
+// MFA route smoke tests (Phase 5.10.M)
+// ---------------------------------------------------------------------------
+
+/// `POST /auth/v1/factors` without auth → 401 (route is mounted and
+/// `authorize()` fires before the handler body).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mfa_enroll_unauthenticated_401() {
+    let Some((running, _svc, _auth, _mailer, _g)) = try_serve().await else {
+        return;
+    };
+    let addr = running.local_addr;
+
+    let body = serde_json::json!({"factor_type": "totp", "friendly_name": "Test"}).to_string();
+    let r = http_request(
+        addr,
+        "POST",
+        "/auth/v1/factors",
+        &[("Content-Type", "application/json")],
+        Some(body.as_bytes()),
+    )
+    .await;
+    assert_eq!(
+        r.status, 401,
+        "POST /auth/v1/factors without bearer must be 401; got {}; body: {}",
+        r.status,
+        String::from_utf8_lossy(&r.body)
+    );
+
+    let _ = running.shutdown.send(());
+}
+
+/// `GET /auth/v1/factors` without auth → 401.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mfa_list_unauthenticated_401() {
+    let Some((running, _svc, _auth, _mailer, _g)) = try_serve().await else {
+        return;
+    };
+    let addr = running.local_addr;
+
+    let r = http_request(addr, "GET", "/auth/v1/factors", &[], None).await;
+    assert_eq!(
+        r.status, 401,
+        "GET /auth/v1/factors without bearer must be 401"
+    );
+
+    let _ = running.shutdown.send(());
+}
+
+/// `POST /auth/v1/factors/:id/verify` without auth → 401.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mfa_verify_factor_unauthenticated_401() {
+    let Some((running, _svc, _auth, _mailer, _g)) = try_serve().await else {
+        return;
+    };
+    let addr = running.local_addr;
+    let factor_id = uuid::Uuid::new_v4();
+
+    let body = serde_json::json!({"code": "123456"}).to_string();
+    let r = http_request(
+        addr,
+        "POST",
+        &format!("/auth/v1/factors/{factor_id}/verify"),
+        &[("Content-Type", "application/json")],
+        Some(body.as_bytes()),
+    )
+    .await;
+    assert_eq!(
+        r.status, 401,
+        "POST /auth/v1/factors/:id/verify without bearer must be 401"
+    );
+
+    let _ = running.shutdown.send(());
+}
+
+/// `POST /auth/v1/factors/:id/challenge` without auth → 401.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mfa_begin_challenge_unauthenticated_401() {
+    let Some((running, _svc, _auth, _mailer, _g)) = try_serve().await else {
+        return;
+    };
+    let addr = running.local_addr;
+    let factor_id = uuid::Uuid::new_v4();
+
+    let r = http_request(
+        addr,
+        "POST",
+        &format!("/auth/v1/factors/{factor_id}/challenge"),
+        &[("Content-Type", "application/json")],
+        Some(b"{}"),
+    )
+    .await;
+    assert_eq!(
+        r.status, 401,
+        "POST /auth/v1/factors/:id/challenge without bearer must be 401"
+    );
+
+    let _ = running.shutdown.send(());
+}
+
+/// `POST /auth/v1/factors/:id/challenge/verify` without auth → 401.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mfa_verify_challenge_unauthenticated_401() {
+    let Some((running, _svc, _auth, _mailer, _g)) = try_serve().await else {
+        return;
+    };
+    let addr = running.local_addr;
+    let factor_id = uuid::Uuid::new_v4();
+
+    let body =
+        serde_json::json!({"challenge_id": uuid::Uuid::new_v4().to_string(), "code": "123456"})
+            .to_string();
+    let r = http_request(
+        addr,
+        "POST",
+        &format!("/auth/v1/factors/{factor_id}/challenge/verify"),
+        &[("Content-Type", "application/json")],
+        Some(body.as_bytes()),
+    )
+    .await;
+    assert_eq!(
+        r.status, 401,
+        "POST /auth/v1/factors/:id/challenge/verify without bearer must be 401"
+    );
+
+    let _ = running.shutdown.send(());
+}
+
+/// `DELETE /auth/v1/factors/:id` without auth → 401.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mfa_unenroll_unauthenticated_401() {
+    let Some((running, _svc, _auth, _mailer, _g)) = try_serve().await else {
+        return;
+    };
+    let addr = running.local_addr;
+    let factor_id = uuid::Uuid::new_v4();
+
+    let r = http_request(
+        addr,
+        "DELETE",
+        &format!("/auth/v1/factors/{factor_id}"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(
+        r.status, 401,
+        "DELETE /auth/v1/factors/:id without bearer must be 401"
+    );
+
+    let _ = running.shutdown.send(());
+}
+
+/// Authenticated `GET /auth/v1/factors` → 200 with empty JSON array.
+/// This verifies that the route is accessible with a valid JWT and that the
+/// current "empty list" stub responds correctly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mfa_list_authenticated_returns_empty_array() {
+    let Some((running, _svc, auth, mailer, _g)) = try_serve().await else {
+        return;
+    };
+    let addr = running.local_addr;
+    let project = ProjectId::new();
+    let tokens = make_user(&auth, &mailer, &project, "mfalist@example.com").await;
+
+    let r = http_request(
+        addr,
+        "GET",
+        "/auth/v1/factors",
+        &[(&format!("Authorization"), &format!("Bearer {}", tokens.access_token))],
+        None,
+    )
+    .await;
+    assert_eq!(
+        r.status, 200,
+        "GET /auth/v1/factors with valid JWT must be 200; body: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let body = r.json();
+    assert!(
+        body.is_array(),
+        "GET /auth/v1/factors must return a JSON array"
+    );
+    assert_eq!(
+        body.as_array().unwrap().len(),
+        0,
+        "new user has no factors"
+    );
+
+    let _ = running.shutdown.send(());
+}
