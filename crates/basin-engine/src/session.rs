@@ -1691,6 +1691,130 @@ async fn register_pruned_listing_table(
     Ok(())
 }
 
+/// Phase 5.19.C — GIN file-level pruning.
+///
+/// After all tables have been refreshed (so their `ListingTable` registrations
+/// reflect the current live file set), inspect `sql` for a JSONB containment
+/// predicate (`@>` or `<@`) on a column with a GIN index.  When the GIN
+/// posting list returns `FileCandidates` AND the completeness guard passes
+/// (every live file for that column is in the indexed-files set), replace the
+/// table's `ListingTable` registration with one scoped to the candidate files
+/// only.  DataFusion then only opens and scans those files; files pruned here
+/// are never fetched from the object store.
+///
+/// Correctness contract:
+/// * `FileCandidates` is a conservative superset — no file containing a
+///   real match is ever excluded (the posting list may produce false
+///   positives that the `jsonb_contains` UDF filters out at read time).
+/// * Pruning only fires when `indexed_files ⊇ live_files`.  Any gap
+///   (e.g. a file written before the index existed) triggers a full scan.
+/// * Transactions are excluded (`tx_is_active` guard in the caller) because
+///   pending files are not yet indexed.
+///
+/// On any error or uncertainty this function returns `Ok(())` and the full
+/// scan proceeds — correctness is never sacrificed for speed.
+pub(crate) async fn apply_gin_pruning_for_query(
+    engine: &Engine,
+    project: &ProjectId,
+    ctx: &SessionContext,
+    sql: &str,
+) -> Result<()> {
+    // Fast pre-check: must contain @> or <@ to be relevant.
+    if !sql.contains("@>") && !sql.contains("<@") {
+        return Ok(());
+    }
+
+    // Parse and detect a GIN containment plan (same detector used by the
+    // Empty short-circuit path in executor.rs).
+    let gin_plan = match crate::index_probe::detect_gin_containment(
+        sql,
+        project,
+        &engine.config().catalog,
+    )
+    .await
+    {
+        Some(p) => p,
+        None => return Ok(()), // query shape not recognised → full scan
+    };
+
+    // Probe the posting list.
+    let gin_result = engine.gin_index_registry().probe_containment(
+        project,
+        &gin_plan.table,
+        &gin_plan.col,
+        &gin_plan.opclass,
+        &gin_plan.needle,
+    );
+
+    let candidate_files = match gin_result {
+        crate::index_probe::ProbeResult::FileCandidates(files) => files,
+        // Empty is handled before exec_select (short-circuit with 0 rows).
+        // NoIndex → full scan.
+        _ => return Ok(()),
+    };
+
+    // Completeness guard: fetch the live file set from the catalog.
+    let meta = match engine.config().catalog.load_table(project, &gin_plan.table).await {
+        Ok(m) => m,
+        Err(_) => return Ok(()), // can't verify completeness → full scan
+    };
+    let live_files: Vec<DataFileRef> = meta.live_data_files();
+    if live_files.is_empty() {
+        // No live files — the Empty short-circuit handles this; nothing to prune.
+        return Ok(());
+    }
+
+    // Check coverage: every live file must appear in the indexed-files set.
+    let indexed = engine.gin_index_registry().indexed_files_for(
+        project,
+        &gin_plan.table,
+        &gin_plan.col,
+    );
+    let all_covered = live_files.iter().all(|f| indexed.contains(f.path.as_str()));
+    if !all_covered {
+        // At least one live file is not in the posting list → full scan.
+        // This covers the case where a file was written before the GIN index
+        // existed (or after a restart cleared the RAM registry).
+        return Ok(());
+    }
+
+    // Completeness confirmed.  Intersect candidate set with live files so
+    // we only open files that both (a) the GIN probe considers relevant and
+    // (b) the catalog considers live.
+    let pruned_paths: Vec<String> = live_files
+        .iter()
+        .filter(|f| candidate_files.contains(f.path.as_str()))
+        .map(|f| f.path.to_string())
+        .collect();
+
+    if pruned_paths.is_empty() {
+        // GIN probe says no files match — the Empty short-circuit should have
+        // caught this, but guard defensively: leave the full set registered
+        // so DataFusion returns the (empty) result rather than us returning
+        // an incorrect empty result for an edge case.
+        return Ok(());
+    }
+
+    if pruned_paths.len() == live_files.len() {
+        // All files are candidates — pruning would be a no-op.
+        return Ok(());
+    }
+
+    // Re-register with only the pruned file set.
+    let _ = register_pruned_listing_table(
+        engine,
+        ctx,
+        &gin_plan.table,
+        &meta.schema,
+        meta.file_format,
+        &pruned_paths,
+        meta.global_sort_order.as_deref(),
+    )
+    .await;
+
+    Ok(())
+}
+
 /// Inclusive month range covering the rows a query may need.
 #[derive(Copy, Clone, Debug)]
 struct YearMonthRange {

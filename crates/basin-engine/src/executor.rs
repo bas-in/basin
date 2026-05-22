@@ -1816,7 +1816,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                 }
             }
 
-            exec_select(sess, sql, include_deleted).await
+            exec_select(sess, sql, include_deleted, Some(raw_sql)).await
         }
         Statement::ShowTables { .. } => exec_show_tables(sess).await,
         // ── SHOW search_path ─────────────────────────────────────────────
@@ -4846,10 +4846,16 @@ async fn commit_with_retry(
     }
 }
 
+// `gin_original_sql`: the original (pre-operator-rewrite) SQL for GIN pruning
+// detection.  `None` when calling from internal paths that have no original SQL
+// (e.g. CTAS, DML SELECT sub-selects).  When `Some`, `apply_gin_pruning_for_query`
+// uses this to detect `@>` / `<@` before the JSON operator rewriter converts them
+// to `jsonb_contains(...)`.
 async fn exec_select(
     sess: &ProjectSession,
     sql: &str,
     include_deleted: bool,
+    gin_original_sql: Option<&str>,
 ) -> Result<ExecResult> {
     // Refresh the catalog-driven file set for every table before planning.
     //
@@ -4919,6 +4925,21 @@ async fn exec_select(
             &sess.project,
             &sess.ctx,
             sql,
+        )
+        .await?;
+    }
+
+    // Phase 5.19.C — GIN file-level pruning.
+    // Use the original (pre-operator-rewrite) SQL so `@>` / `<@` operators
+    // are still present in the text.  After `rewrite_json_operators` runs,
+    // `@>` becomes `jsonb_contains(…)` and the detector would miss it.
+    // On any parse/probe failure this is a silent no-op → full scan.
+    if let Some(orig_sql) = gin_original_sql {
+        crate::session::apply_gin_pruning_for_query(
+            &sess.engine,
+            &sess.project,
+            &sess.ctx,
+            orig_sql,
         )
         .await?;
     }
@@ -5592,7 +5613,7 @@ async fn exec_declare(
 
         // Execute the SELECT to materialise the result set.
         let select_sql = query.to_string();
-        let result = exec_select(sess, &select_sql, false).await?;
+        let result = exec_select(sess, &select_sql, false, None).await?;
         // An empty result (0 rows) is valid — declare with the schema.
         let (schema, batches) = match result {
             ExecResult::Rows { schema, batches } => (schema, batches),
@@ -6454,7 +6475,7 @@ async fn exec_dml_cte_query(
 
     // Execute the outer SELECT through the normal path, which will find the
     // registered MemTables in `sess.ctx` when it references them.
-    exec_select(sess, &outer_sql, include_deleted).await
+    exec_select(sess, &outer_sql, include_deleted, None).await
 }
 
 /// Extract rows from a DML result.  When `user_had_returning` is false (we
@@ -6837,6 +6858,11 @@ fn maintain_gin_index_on_insert(
             let bytes = arr.value(row);
             gin_registry.index_row(project, table, col_name, opclass, bytes, file_path, 0, row as u64);
         }
+        // Phase 5.19.C: mark this file as fully indexed so the completeness
+        // guard in the probe path can safely prune to FileCandidates.
+        // We only mark it when the column was present and had a LargeBinary
+        // array — i.e., a real JSONB column in this batch.
+        gin_registry.mark_file_indexed(project, table, col_name, file_path);
     }
 }
 

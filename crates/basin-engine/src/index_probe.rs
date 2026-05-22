@@ -79,7 +79,13 @@ impl TermPostingList {
     }
 
     /// Add a single `(term, entry)` pair.
-    fn insert(&mut self, term: String, entry: PostingEntry) {
+    ///
+    /// Returns `true` if an eviction occurred during this insert.  The caller
+    /// (`GinIndexRegistry::index_row`) uses this signal to wipe the
+    /// `indexed_files` completeness set: once any term has been evicted, the
+    /// posting list no longer has full coverage and file-level pruning must
+    /// not fire until the registry has been fully rebuilt.
+    fn insert(&mut self, term: String, entry: PostingEntry) -> bool {
         let set = self.entries.entry(term.clone()).or_default();
         if set.is_empty() {
             self.insert_order.push(term);
@@ -89,6 +95,9 @@ impl TermPostingList {
 
         if self.total_count > MAX_POSTING_ENTRIES {
             self.evict_oldest();
+            true // eviction happened
+        } else {
+            false
         }
     }
 
@@ -244,13 +253,23 @@ struct RegKey {
 /// One `TermPostingList` per `(project, table, col)`.  Concurrent access is
 /// serialised by an inner `Mutex` per posting list, with the outer `Mutex`
 /// only held briefly to look up or insert an `Arc`.
+///
+/// `indexed_files` tracks, for each `(project, table, col)`, the set of file
+/// paths whose rows have been fully loaded into the posting list.  This is the
+/// completeness guard required by Phase 5.19.C: file-level pruning is only
+/// safe when every live data file appears in this set.
 pub struct GinIndexRegistry {
     inner: Mutex<HashMap<RegKey, Arc<Mutex<TermPostingList>>>>,
+    /// File-completeness tracking: `RegKey → set of fully-indexed file paths`.
+    indexed_files: Mutex<HashMap<RegKey, HashSet<String>>>,
 }
 
 impl GinIndexRegistry {
     pub fn new() -> Self {
-        Self { inner: Mutex::new(HashMap::new()) }
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            indexed_files: Mutex::new(HashMap::new()),
+        }
     }
 
     fn get_or_create(
@@ -306,8 +325,29 @@ impl GinIndexRegistry {
             row_group,
             row,
         };
+        let mut evicted = false;
         for term in terms {
-            list.insert(term, entry.clone());
+            if list.insert(term, entry.clone()) {
+                evicted = true;
+            }
+        }
+        // If eviction occurred the posting list lost terms that were present
+        // in earlier files.  Those files are no longer fully covered by the
+        // in-RAM index, so the `indexed_files` completeness set must be
+        // cleared.  Any future `mark_file_indexed` calls (for files written
+        // AFTER the eviction) will repopulate the set, but the old files will
+        // not appear until a full reindex (or engine restart + warm-up) —
+        // meaning the completeness check will fail and the engine falls back
+        // to a full scan.  This is the safe and correct behaviour.
+        if evicted {
+            let key = RegKey {
+                project: *project,
+                table: table.clone(),
+                col: col.to_string(),
+            };
+            if let Ok(mut map) = self.indexed_files.lock() {
+                map.remove(&key);
+            }
         }
     }
 
@@ -377,6 +417,9 @@ impl GinIndexRegistry {
     }
 
     /// Remove all posting entries for `file_path` in `(project, table, col)`.
+    /// Also removes `file_path` from the indexed-files completeness set so
+    /// future probes do not erroneously claim full coverage after this file
+    /// is gone.
     pub fn remove_file(
         &self,
         project: &ProjectId,
@@ -387,6 +430,55 @@ impl GinIndexRegistry {
         if let Some(arc) = self.get(project, table, col) {
             let mut list = arc.lock().expect("TermPostingList lock poisoned");
             list.remove_file(file_path);
+        }
+        // Remove from completeness tracking.
+        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        if let Ok(mut map) = self.indexed_files.lock() {
+            if let Some(set) = map.get_mut(&key) {
+                set.remove(file_path);
+            }
+        }
+    }
+
+    /// Record that `file_path` has been fully indexed for `(project, table,
+    /// col)`.  Called immediately after all rows in a new file have been
+    /// passed to [`index_row`].  This is the write side of the completeness
+    /// guard: a file that appears here is safe to use as a prune boundary.
+    pub fn mark_file_indexed(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        col: &str,
+        file_path: &str,
+    ) {
+        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        if let Ok(mut map) = self.indexed_files.lock() {
+            map.entry(key).or_default().insert(file_path.to_string());
+        }
+    }
+
+    /// Return the set of file paths that have been completely indexed for
+    /// `(project, table, col)`.  The caller uses this to decide whether the
+    /// GIN posting list provides FULL coverage of the live file set:
+    ///
+    /// ```text
+    /// completeness = indexed_files ⊇ live_files
+    /// ```
+    ///
+    /// If `completeness` is true, file-level pruning to `FileCandidates` is
+    /// safe.  If any live file is missing from this set, pruning must NOT
+    /// happen (full scan instead, no false negatives).
+    pub fn indexed_files_for(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        col: &str,
+    ) -> HashSet<String> {
+        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        if let Ok(map) = self.indexed_files.lock() {
+            map.get(&key).cloned().unwrap_or_default()
+        } else {
+            HashSet::new()
         }
     }
 
@@ -482,6 +574,9 @@ impl GinIndexRegistry {
     /// entries have already been removed via `remove_file`; this call adds the
     /// replacement file's entries.
     ///
+    /// After rebuilding, `new_file_path` is marked as fully indexed so the
+    /// completeness guard remains valid for file-level pruning.
+    ///
     /// Silently skips non-JSONB (non-LargeBinary) columns.
     pub fn rebuild_file_entries(
         &self,
@@ -493,12 +588,14 @@ impl GinIndexRegistry {
         new_file_path: &str,
     ) {
         use arrow_array::Array;
+        let mut indexed_any = false;
         for batch in batches {
             let Ok(col_idx) = batch.schema().index_of(col) else {
                 continue;
             };
             let col_arr = batch.column(col_idx);
             if let Some(arr) = col_arr.as_any().downcast_ref::<arrow_array::LargeBinaryArray>() {
+                indexed_any = true;
                 for row in 0..arr.len() {
                     if arr.is_null(row) {
                         continue;
@@ -515,6 +612,12 @@ impl GinIndexRegistry {
                     );
                 }
             }
+        }
+        // Mark the new file as fully indexed only when the column was found
+        // and processed.  If the column was absent (wrong schema), we cannot
+        // claim coverage and leave the completeness set unchanged.
+        if indexed_any {
+            self.mark_file_indexed(project, table, col, new_file_path);
         }
     }
 }
