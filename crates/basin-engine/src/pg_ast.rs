@@ -1241,23 +1241,39 @@ pub fn reject_unsupported(tree: &ParseTree) -> Result<()> {
         };
 
         // CREATE TABLE with EXCLUDE constraint — Basin has no GiST / exclusion
-        // index support. This is a design exclusion (flat-storage model).
+        // index support in general. This is a design exclusion (flat-storage
+        // model). EXCEPTION: Phase 5.24.F adds range-exclusion enforcement for
+        // `EXCLUDE USING gist` specifically. If ALL exclusion constraints in the
+        // table use `gist`, allow the statement through — the DDL pre-processor
+        // (`extract_exclude_using_gist`) will strip the clause before sqlparser
+        // sees it and convert it into a sentinel CheckConstraint for enforcement.
         if let NodeEnum::CreateStmt(cs) = inner {
             use pg_query::protobuf::ConstrType;
-            let has_exclusion = cs.table_elts.iter().any(|elt| {
-                if let Some(NodeEnum::Constraint(c)) = elt.node.as_ref() {
-                    c.contype == ConstrType::ConstrExclusion as i32
-                } else {
-                    false
-                }
-            });
-            if has_exclusion {
+            let exclusions: Vec<_> = cs
+                .table_elts
+                .iter()
+                .filter_map(|elt| {
+                    if let Some(NodeEnum::Constraint(c)) = elt.node.as_ref() {
+                        if c.contype == ConstrType::ConstrExclusion as i32 {
+                            return Some(c.access_method.as_str());
+                        }
+                    }
+                    None
+                })
+                .collect();
+            // Only reject if there are exclusion constraints AND at least one
+            // uses an index method OTHER than gist (the unsupported case).
+            let has_non_gist_exclusion = exclusions
+                .iter()
+                .any(|m| !m.eq_ignore_ascii_case("gist"));
+            if has_non_gist_exclusion {
                 return Err(BasinError::FeatureNotSupported(
                     "EXCLUDE constraint is not supported (SQLSTATE 0A000): \
                      Basin has no GiST index backend"
                         .into(),
                 ));
             }
+            // All-gist exclusion constraints pass through — handled by 5.24.F.
         }
 
         // BUG #132 — CREATE TRIGGER / CREATE CONSTRAINT TRIGGER honest-reject.
@@ -1899,11 +1915,22 @@ mod tests {
         }
     }
 
+    /// Phase 5.24.F: `EXCLUDE USING gist` is now handled by the engine
+    /// (range-exclusion enforcement). The pg-level reject gate must pass it
+    /// through so the DDL pre-processor can strip and encode the constraint.
+    ///
+    /// Only `EXCLUDE USING <non-gist>` remains a design exclusion.
     #[test]
     fn strip_only_detects_exclude_constraint_as_design_exclusion() {
+        // EXCLUDE USING gist — allowed through by 5.24.F.
         let tree = parse("CREATE TABLE t (id INT, EXCLUDE USING gist (id WITH =))")
             .expect("pg_query parses EXCLUDE");
-        let err = reject_unsupported(&tree).expect_err("EXCLUDE should be rejected");
+        reject_unsupported(&tree).expect("EXCLUDE USING gist should be allowed (5.24.F)");
+
+        // EXCLUDE USING btree (non-gist) — still a design exclusion.
+        let tree2 = parse("CREATE TABLE t (id INT, EXCLUDE USING btree (id WITH =))")
+            .expect("pg_query parses EXCLUDE btree");
+        let err = reject_unsupported(&tree2).expect_err("EXCLUDE USING btree should be rejected");
         match err {
             BasinError::FeatureNotSupported(msg) => {
                 assert!(msg.contains("0A000"), "expected SQLSTATE 0A000 in: {msg}");
