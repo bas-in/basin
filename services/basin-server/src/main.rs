@@ -126,6 +126,11 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[cfg(feature = "auth")]
 mod engine_auth_store;
 
+// Feature 1 (5.11.W6): catalog-backed FunctionInvoker for LANGUAGE javascript.
+// Compiled only when `wasm-fn` feature is on (pulls in basin-fn / wasmtime).
+#[cfg(feature = "wasm-fn")]
+mod fn_runtime;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -294,6 +299,15 @@ async fn main() -> Result<()> {
         catalog: catalog.clone(),
         shard: shard_for_engine,
     });
+
+    // Feature 1 (5.11.W6): install the catalog-backed FunctionInvoker so that
+    // LANGUAGE javascript (and LANGUAGE wasm component-model) functions stored
+    // in the catalog are actually executed when /fn/v1/:name is called.
+    // Requires the `wasm-fn` feature which pulls in basin-fn / wasmtime.
+    #[cfg(feature = "wasm-fn")]
+    {
+        fn_runtime::install_catalog_invoker(catalog.clone());
+    }
 
     // --- optional realtime sink (Phase 5.11.R1, ADR 0018) -------------------
     //
@@ -480,13 +494,23 @@ async fn main() -> Result<()> {
         let auth = auth_service.clone().ok_or_else(|| {
             anyhow!("BASIN_REST_ENABLED=1 requires BASIN_AUTH_ENABLED=1 (per ADR 0006)")
         })?;
-        let rest_cfg = basin_rest::RestConfig::new(cfg.rest_bind, engine.clone(), auth);
-        let svc = basin_rest::RestService::new(rest_cfg);
+        let rest_cfg = basin_rest::RestConfig::new(cfg.rest_bind, engine.clone(), auth.clone());
+        let mut svc = basin_rest::RestService::new(rest_cfg);
+        // Feature 2: co-mount realtime SSE + WS on the REST port when both
+        // features are compiled in and an auth service is available. The
+        // standalone BASIN_REALTIME_BIND / BASIN_REALTIME_WS_BIND ports are
+        // still started below for clients that prefer dedicated ports.
+        #[cfg(feature = "realtime")]
+        svc.attach_realtime(basin_rest::RealtimeCoMount {
+            registry: realtime_sink.registry().clone(),
+            auth: auth.clone(),
+            replay_rings: Some(realtime_sink.replay_rings().clone()),
+        });
         let running = svc
             .run_until_bound()
             .await
             .map_err(|e| anyhow!("basin-rest bind failed: {e}"))?;
-        tracing::info!(bind = %running.local_addr, "basin-rest listening");
+        tracing::info!(bind = %running.local_addr, "basin-rest listening (realtime co-mounted)");
         rest_handle = Some(running);
     }
 
