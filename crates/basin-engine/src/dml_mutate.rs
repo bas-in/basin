@@ -761,6 +761,46 @@ pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result
         }
     }
 
+    // Phase 5.24.D — GIST interval-tree maintenance for DELETE.
+    // Remove stale entries for all files that are being dropped or replaced.
+    {
+        let gist_cols: Vec<String> = meta
+            .indexes
+            .iter()
+            .filter(|idx| idx.access_method == "gist" && idx.columns.len() == 1)
+            .map(|idx| idx.columns[0].clone())
+            .collect();
+        if !gist_cols.is_empty() {
+            let ireg = sess.engine.interval_registry();
+            for col in &gist_cols {
+                for path in &dropped_paths {
+                    ireg.remove_file(&sess.project, &table, col, path);
+                }
+                for path in &replaced_paths {
+                    ireg.remove_file(&sess.project, &table, col, path);
+                }
+                // Rebuild from the replacement batches for replaced files.
+                if let Some(new_file) = added_files.first() {
+                    for batch in &gin_replacement_batches {
+                        use arrow_array::Array;
+                        if let Ok(col_idx) = batch.schema().index_of(col) {
+                            let col_arr = batch.column(col_idx);
+                            if let Some(arr) = col_arr.as_any().downcast_ref::<arrow_array::StringArray>() {
+                                for row in 0..arr.len() {
+                                    if arr.is_null(row) { continue; }
+                                    ireg.index_row(&sess.project, &table, col, arr.value(row), &new_file.path, 0);
+                                }
+                            }
+                        }
+                    }
+                    if !replaced_paths.is_empty() {
+                        ireg.mark_file_indexed(&sess.project, &table, col, &new_file.path);
+                    }
+                }
+            }
+        }
+    }
+
     delete_objects(sess, &table, schema.as_ref(), &removed_paths).await?;
     refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table).await?;
 
@@ -1252,6 +1292,41 @@ pub(crate) async fn exec_update(
             if let Some(new_file) = added_files.first() {
                 for old_path in &replaced_paths {
                     maint.on_file_replaced(old_path, &new_file.path, &gin_replacement_batches);
+                }
+            }
+        }
+    }
+
+    // Phase 5.24.D — GIST interval-tree maintenance for UPDATE.
+    // Every replaced file's entries are purged; the new file's entries are
+    // rebuilt from the post-SET batches.
+    {
+        let gist_cols: Vec<String> = meta
+            .indexes
+            .iter()
+            .filter(|idx| idx.access_method == "gist" && idx.columns.len() == 1)
+            .map(|idx| idx.columns[0].clone())
+            .collect();
+        if !gist_cols.is_empty() {
+            let ireg = sess.engine.interval_registry();
+            if let Some(new_file) = added_files.first() {
+                for col in &gist_cols {
+                    for old_path in &replaced_paths {
+                        ireg.remove_file(&sess.project, &table, col, old_path);
+                    }
+                    for batch in &gin_replacement_batches {
+                        use arrow_array::Array;
+                        if let Ok(col_idx) = batch.schema().index_of(col) {
+                            let col_arr = batch.column(col_idx);
+                            if let Some(arr) = col_arr.as_any().downcast_ref::<arrow_array::StringArray>() {
+                                for row in 0..arr.len() {
+                                    if arr.is_null(row) { continue; }
+                                    ireg.index_row(&sess.project, &table, col, arr.value(row), &new_file.path, 0);
+                                }
+                            }
+                        }
+                    }
+                    ireg.mark_file_indexed(&sess.project, &table, col, &new_file.path);
                 }
             }
         }

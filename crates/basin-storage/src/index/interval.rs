@@ -26,30 +26,27 @@
 //! [`IntervalIndex::probe_overlaps`] must be re-evaluated by the full
 //! DataFusion predicate at the storage read layer.
 //!
-//! # Engine-probe wiring
+//! # Engine-probe wiring (Phase 5.24.D)
 //!
-//! ```text
-//! // TODO(5.24.D-wiring): wire this registry into the basin-engine query path.
-//! //
-//! // 1. In `basin-engine/src/index_probe.rs`, add an `IntervalIndexPlan` struct
-//! //    and a `detect_interval_range` fn analogous to `detect_gin_containment`
-//! //    for JSONB — inspecting the WHERE clause for `range_col @> $val` or
-//! //    `range_col && $other`.
-//! //
-//! // 2. In the engine write path (wherever range-type column values are
-//! //    persisted), call `IntervalRegistry::index_row` so the index stays
-//! //    current after every INSERT / compaction.
-//! //
-//! // 3. In the `@>` / `&&` evaluation path, call
-//! //    `IntervalRegistry::probe_contains_point` or
-//! //    `IntervalRegistry::probe_overlaps` to obtain a `FileCandidates` set;
-//! //    skip non-candidate files before passing them to DataFusion.
-//! //
-//! // 4. Un-ignore the `range_gist_index` test slice added in Phase 5.24.A once
-//! //    the wiring is confirmed green in CI.
-//! ```
+//! Three wiring stages implemented in Phase 5.24.D:
+//!
+//! 1. **Populate on write** — `maintain_gist_index_on_insert` in
+//!    `basin-engine/src/executor.rs` calls `index_row` for every range-typed
+//!    column in a newly written Parquet file. `mark_file_indexed` is called
+//!    after all rows are processed so the completeness guard is valid.
+//!
+//! 2. **Probe at query** — `detect_range_index_probe` in
+//!    `basin-engine/src/index_probe.rs` recognises `col @> val` / `col && range`
+//!    / `col <@ range` on a GIST-indexed range column and returns an
+//!    `IntervalIndexPlan`. The executor probes the registry for an `Empty`
+//!    short-circuit or `FileCandidates` for file-level pruning.
+//!
+//! 3. **Prune the scan** — `apply_gist_pruning_for_query` in
+//!    `basin-engine/src/session.rs` intersects `FileCandidates` with live files
+//!    and re-registers a pruned `ListingTable` ONLY when the completeness guard
+//!    passes (`indexed_files ⊇ live_files`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use basin_common::types::range::IndexInterval;
@@ -133,10 +130,6 @@ impl IntervalTree {
     /// Probe: return all *distinct* file paths whose intervals contain `point`.
     ///
     /// `point` is inside `[lo, hi)` iff `lo <= point < hi`.
-    ///
-    /// # TODO(5.24.D-wiring)
-    ///
-    /// The engine `@>` path must call this method for point probes.
     pub fn probe_contains_point(&mut self, point: f64) -> ProbeResult {
         // Flush any pending entries.
         if !self.pending.is_empty() {
@@ -169,10 +162,6 @@ impl IntervalTree {
     /// Probe: return all *distinct* file paths whose intervals overlap `query`.
     ///
     /// Two half-open intervals `[a,b)` and `[c,d)` overlap iff `a < d && c < b`.
-    ///
-    /// # TODO(5.24.D-wiring)
-    ///
-    /// The engine `&&` path must call this method for interval overlap probes.
     pub fn probe_overlaps(&mut self, query: &IndexInterval) -> ProbeResult {
         if !self.pending.is_empty() {
             self.rebuild();
@@ -260,14 +249,24 @@ struct RegKey {
 /// two-level locking scheme identical to [`super::gin_tsvector::GinTsvectorRegistry`]:
 /// the outer `Mutex` is held only for `HashMap` lookups; the inner `Mutex`
 /// guards the tree itself and is never held while the outer lock is taken.
+///
+/// `indexed_files` tracks, for each `(project, table, col)`, the set of file
+/// paths whose rows have been fully loaded into the interval tree. This is the
+/// completeness guard required by Phase 5.24.D: file-level pruning is only
+/// safe when every live data file appears in this set.
 pub struct IntervalRegistry {
     inner: Mutex<HashMap<RegKey, Arc<Mutex<IntervalTree>>>>,
+    /// File-completeness tracking: `RegKey → set of fully-indexed file paths`.
+    indexed_files: Mutex<HashMap<RegKey, HashSet<String>>>,
 }
 
 impl IntervalRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
-        Self { inner: Mutex::new(HashMap::new()) }
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            indexed_files: Mutex::new(HashMap::new()),
+        }
     }
 
     fn get_or_create(
@@ -296,26 +295,29 @@ impl IntervalRegistry {
 
     /// Index one row's range-type column value.
     ///
-    /// `range_json` is the Basin JSON storage form of the range value
-    /// (e.g. `{"l":1,"u":10,"li":true,"ui":false}`). Only finite-bound
-    /// ranges can be indexed; infinite-bound ranges are silently skipped
-    /// (they match everything — no pruning benefit).
-    ///
-    /// # TODO(5.24.D-wiring)
-    ///
-    /// The engine write path must call this method for every range-column row
-    /// written to a Parquet file. See module-level doc.
+    /// `range_str` accepts both the Basin JSON storage form
+    /// (e.g. `{"l":1,"u":10,"li":true,"ui":false}`) and the PG text form
+    /// (e.g. `[1,10)` / `(1,10]`). The PG text form is what Basin stores
+    /// in Parquet and what INSERT batches carry before any UDF conversion.
+    /// Only finite-bound ranges can be indexed; infinite-bound ranges are
+    /// silently skipped (they match everything — no pruning benefit).
     pub fn index_row(
         &self,
         project: &ProjectId,
         table: &TableName,
         col: &str,
-        range_json: &str,
+        range_str: &str,
         file_path: &str,
         row_group: u32,
     ) {
         use basin_common::types::range::{IndexInterval, RangeValue};
-        let rv = match RangeValue::from_json_str(range_json) {
+        let trimmed = range_str.trim();
+        let rv = if trimmed.starts_with('{') {
+            RangeValue::from_json_str(trimmed)
+        } else {
+            RangeValue::from_pg_text(trimmed)
+        };
+        let rv = match rv {
             Some(r) => r,
             None => return,
         };
@@ -334,9 +336,6 @@ impl IntervalRegistry {
     }
 
     /// Probe: return file paths whose indexed intervals contain `point`.
-    ///
-    /// # TODO(5.24.D-wiring)
-    ///
     /// Called from the engine `@> scalar` probe path.
     pub fn probe_contains_point(
         &self,
@@ -354,10 +353,7 @@ impl IntervalRegistry {
     }
 
     /// Probe: return file paths whose indexed intervals overlap `query`.
-    ///
-    /// # TODO(5.24.D-wiring)
-    ///
-    /// Called from the engine `&&` probe path.
+    /// Called from the engine `&&` / `<@` probe path.
     pub fn probe_overlaps(
         &self,
         project: &ProjectId,
@@ -375,6 +371,10 @@ impl IntervalRegistry {
 
     /// Remove all indexed entries for a given file. Call when a Parquet file
     /// is compacted or deleted.
+    ///
+    /// Also removes `file_path` from the indexed-files completeness set so
+    /// future probes do not erroneously claim full coverage after this file
+    /// is gone.
     pub fn remove_file(
         &self,
         project: &ProjectId,
@@ -385,6 +385,55 @@ impl IntervalRegistry {
         if let Some(arc) = self.get(project, table, col) {
             let mut tree = arc.lock().expect("IntervalTree lock poisoned");
             tree.remove_file(file_path);
+        }
+        // Remove from completeness tracking.
+        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        if let Ok(mut map) = self.indexed_files.lock() {
+            if let Some(set) = map.get_mut(&key) {
+                set.remove(file_path);
+            }
+        }
+    }
+
+    /// Record that `file_path` has been fully indexed for `(project, table,
+    /// col)`. Called immediately after all rows in a new file have been passed
+    /// to [`index_row`]. This is the write side of the completeness guard: a
+    /// file that appears here is safe to use as a prune boundary.
+    pub fn mark_file_indexed(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        col: &str,
+        file_path: &str,
+    ) {
+        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        if let Ok(mut map) = self.indexed_files.lock() {
+            map.entry(key).or_default().insert(file_path.to_string());
+        }
+    }
+
+    /// Return the set of file paths that have been completely indexed for
+    /// `(project, table, col)`. The caller uses this to decide whether the
+    /// interval index provides FULL coverage of the live file set:
+    ///
+    /// ```text
+    /// completeness = indexed_files ⊇ live_files
+    /// ```
+    ///
+    /// If `completeness` is true, file-level pruning to the interval candidate
+    /// set is safe. If any live file is missing from this set, pruning must NOT
+    /// happen (full scan instead, no false negatives).
+    pub fn indexed_files_for(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        col: &str,
+    ) -> HashSet<String> {
+        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        if let Ok(map) = self.indexed_files.lock() {
+            map.get(&key).cloned().unwrap_or_default()
+        } else {
+            HashSet::new()
         }
     }
 

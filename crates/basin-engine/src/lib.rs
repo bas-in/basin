@@ -194,6 +194,13 @@ pub(crate) struct EngineInner {
     pub(crate) gin_fts_registry:
         Arc<basin_storage::index::gin_tsvector::GinTsvectorRegistry>,
 
+    /// Phase 5.24.D: process-wide interval-tree registry for range-typed columns
+    /// with a GIST index.  One [`IntervalTree`] per `(project, table, col)`
+    /// populated at INSERT time.  Probed at query time for `@>` / `&&` / `<@`
+    /// predicates to prune files before the full UDF re-evaluation.
+    pub(crate) interval_registry:
+        Arc<basin_storage::index::interval::IntervalRegistry>,
+
     /// Phase 5.28.C: process-wide idle-in-transaction session reaper registry.
     /// Sessions register themselves on open; the reaper background task sweeps
     /// the registry on a fixed cadence and flags expired sessions.
@@ -308,6 +315,9 @@ impl Engine {
             gin_index_registry: Arc::new(crate::index_probe::GinIndexRegistry::new()),
             gin_fts_registry: Arc::new(
                 basin_storage::index::gin_tsvector::GinTsvectorRegistry::new(),
+            ),
+            interval_registry: Arc::new(
+                basin_storage::index::interval::IntervalRegistry::new(),
             ),
             reaper_registry: crate::session_reaper::SessionReaperRegistry::new(),
             lock_registry: basin_shard::LockRegistry::new(),
@@ -580,6 +590,16 @@ impl Engine {
         &self,
     ) -> &Arc<basin_storage::index::gin_tsvector::GinTsvectorRegistry> {
         &self.inner.gin_fts_registry
+    }
+
+    // ── Phase 5.24.D: GIST interval-tree index for range types ───────────────
+
+    /// Process-wide interval-tree registry for range-typed columns with a GIST
+    /// index. Returns a reference to the shared `Arc`; cloning it is cheap.
+    pub(crate) fn interval_registry(
+        &self,
+    ) -> &Arc<basin_storage::index::interval::IntervalRegistry> {
+        &self.inner.interval_registry
     }
 
     /// Bump the secondary-index file-skip counter by one. Called from

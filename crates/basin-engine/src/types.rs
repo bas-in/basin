@@ -326,6 +326,22 @@ pub(crate) fn field_is_tsquery(field: &arrow_schema::Field) -> bool {
     field.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_TSQUERY)
 }
 
+/// Returns `true` if `field` carries any of the six PG range-type markers
+/// (`INT4RANGE`, `INT8RANGE`, `NUMRANGE`, `DATERANGE`, `TSRANGE`, `TSTZRANGE`).
+/// Range values are stored as `Utf8` JSON strings; this marker distinguishes
+/// them from plain text columns.
+pub(crate) fn field_is_range(field: &arrow_schema::Field) -> bool {
+    matches!(
+        field.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()),
+        Some(BASIN_TYPE_INT4RANGE)
+            | Some(BASIN_TYPE_INT8RANGE)
+            | Some(BASIN_TYPE_NUMRANGE)
+            | Some(BASIN_TYPE_DATERANGE)
+            | Some(BASIN_TYPE_TSRANGE)
+            | Some(BASIN_TYPE_TSTZRANGE)
+    )
+}
+
 /// Returns `true` if `field` is a BIT(n) column (fixed-length bit string).
 /// Checks that the `BASIN_TYPE` value starts with `"BIT("`.
 pub(crate) fn field_is_bit(field: &arrow_schema::Field) -> bool {

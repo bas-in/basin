@@ -1204,6 +1204,224 @@ fn extract_string_literal(expr: &sqlparser::ast::Expr) -> Option<String> {
     }
 }
 
+// ── Phase 5.24.D — range GIST probe detection ─────────────────────────────────
+
+/// Which range operator triggered the interval-index probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RangeOp {
+    /// `col @> scalar` — range contains element.
+    ContainsElem,
+    /// `col @> range` — range contains range (treated as overlap for pruning).
+    ContainsRange,
+    /// `col && range` — ranges overlap.
+    Overlaps,
+    /// `col <@ range` — range is contained by (treated as overlap for pruning).
+    ContainedBy,
+}
+
+/// Detected GIST interval-index probe plan for a range operator predicate.
+///
+/// Produced by [`detect_range_index_probe`] when the query (before the
+/// `rewrite_range_operators` lowering) contains `@>` / `&&` / `<@` on a
+/// range-typed column that has a GIST index.
+#[derive(Debug)]
+pub struct IntervalIndexPlan {
+    /// The table to scan.
+    pub table: TableName,
+    /// The indexed range column.
+    pub col: String,
+    /// The operator that triggered the probe.
+    pub op: RangeOp,
+    /// For `ContainsElem`: the numeric point to probe (e.g. `5` in `r @> 5`).
+    pub point: Option<f64>,
+    /// For `ContainsRange`, `Overlaps`, `ContainedBy`: the range literal
+    /// (raw PG text form, e.g. `'[1,10)'`) to convert to an `IndexInterval`.
+    pub range_literal: Option<String>,
+}
+
+/// Detect `SELECT … FROM table WHERE col @> val` / `col && range` / `col <@ range`
+/// on a GIST-indexed range column for interval-tree probe acceleration.
+///
+/// The SQL arrives *before* the `rewrite_range_operators` pass that converts
+/// `@>` / `&&` / `<@` to UDF calls, so the raw operators are still present.
+///
+/// Returns `None` for any query that doesn't fit the supported shape or when
+/// the column has no GIST index.  On any error or uncertainty returns `None`
+/// → full scan (safe).
+pub async fn detect_range_index_probe(
+    raw_sql: &str,
+    project: &ProjectId,
+    catalog: &Arc<dyn basin_catalog::Catalog>,
+) -> Option<IntervalIndexPlan> {
+    // Fast pre-check: must contain at least one range operator.
+    if !raw_sql.contains("@>") && !raw_sql.contains("&&") && !raw_sql.contains("<@") {
+        return None;
+    }
+
+    // Parse the raw SQL (before operator rewriting).
+    let dialect = sqlparser::dialect::PostgreSqlDialect {};
+    let stmts = sqlparser::parser::Parser::parse_sql(&dialect, raw_sql).ok()?;
+    if stmts.len() != 1 {
+        return None;
+    }
+    let query = match &stmts[0] {
+        sqlparser::ast::Statement::Query(q) => q.as_ref(),
+        _ => return None,
+    };
+    if query.with.is_some() {
+        return None;
+    }
+    let select = match query.body.as_ref() {
+        sqlparser::ast::SetExpr::Select(s) => s,
+        _ => return None,
+    };
+
+    // Single table, no joins.
+    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+        return None;
+    }
+    let table_name = match &select.from[0].relation {
+        sqlparser::ast::TableFactor::Table { name, alias: None, args: None, .. } => {
+            if name.0.len() != 1 {
+                return None;
+            }
+            use crate::pg_ast::ObjectNamePartExt;
+            name.0[0].id_val().clone()
+        }
+        _ => return None,
+    };
+    let table = TableName::new(table_name).ok()?;
+
+    // Parse WHERE `col op rhs` where op ∈ { @>, <@, && }.
+    let (col_name, op, point, range_literal) =
+        extract_range_where(&select.selection)?;
+
+    // Catalog lookup: the column must have a GIST index.
+    let meta = catalog.load_table(project, &table).await.ok()?;
+    let _gist_index = meta.indexes.iter().find(|idx| {
+        idx.access_method == "gist"
+            && idx.columns.len() == 1
+            && idx.columns[0] == col_name
+    })?;
+
+    // Additionally verify the column itself is a range type (defensive).
+    let _range_field = meta.schema.fields().iter().find(|f| {
+        f.name() == &col_name && crate::types::field_is_range(f)
+    })?;
+
+    Some(IntervalIndexPlan { table, col: col_name, op, point, range_literal })
+}
+
+/// Parse the WHERE clause for a single range operator predicate.
+///
+/// Supported forms:
+///   - `col @> numeric_literal`   → (`col`, `ContainsElem`, `Some(f64)`, `None`)
+///   - `col @> range_literal`     → (`col`, `ContainsRange`, `None`, `Some(str)`)
+///   - `col && range_literal`     → (`col`, `Overlaps`, `None`, `Some(str)`)
+///   - `col <@ range_literal`     → (`col`, `ContainedBy`, `None`, `Some(str)`)
+///   - `numeric <@ col`           → (`col`, `ContainsElem` reversed, `Some(f64)`, `None`)
+///
+/// Returns `None` for any shape that does not match.
+fn extract_range_where(
+    selection: &Option<sqlparser::ast::Expr>,
+) -> Option<(String, RangeOp, Option<f64>, Option<String>)> {
+    use sqlparser::ast::Expr;
+
+    let expr = selection.as_ref()?;
+
+    let (left, op_str, right) = match expr {
+        Expr::BinaryOp { left, op, right } => (left, op.to_string(), right),
+        _ => return None,
+    };
+
+    match op_str.as_str() {
+        "@>" => {
+            // `col @> val` — LHS must be a column name.
+            let col = extract_col_name(left)?;
+            // RHS: numeric literal → ContainsElem; range literal → ContainsRange.
+            if let Some(pt) = extract_numeric_literal(right) {
+                Some((col, RangeOp::ContainsElem, Some(pt), None))
+            } else if let Some(s) = extract_range_literal_str(right) {
+                Some((col, RangeOp::ContainsRange, None, Some(s)))
+            } else {
+                None
+            }
+        }
+        "<@" => {
+            // Two forms:
+            //   `col <@ range_literal` — col is contained by a literal range
+            //   `numeric_literal <@ col` — numeric is contained by the range column
+            if let Some(col) = extract_col_name(left) {
+                // `col <@ range_literal`
+                if let Some(s) = extract_range_literal_str(right) {
+                    return Some((col, RangeOp::ContainedBy, None, Some(s)));
+                }
+                // `col <@ numeric` — unusual; skip
+                None
+            } else if let Some(pt) = extract_numeric_literal(left) {
+                // `numeric <@ col` — equivalent to `col @> numeric`
+                let col = extract_col_name(right)?;
+                Some((col, RangeOp::ContainsElem, Some(pt), None))
+            } else {
+                None
+            }
+        }
+        "&&" => {
+            // `col && range_literal` — LHS must be a column name.
+            let col = extract_col_name(left)?;
+            let s = extract_range_literal_str(right)?;
+            Some((col, RangeOp::Overlaps, None, Some(s)))
+        }
+        _ => None,
+    }
+}
+
+/// Extract a bare column name (or `alias.col`) from an expression.
+fn extract_col_name(expr: &sqlparser::ast::Expr) -> Option<String> {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::Identifier(id) => Some(id.value.clone()),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => Some(parts[1].value.clone()),
+        _ => None,
+    }
+}
+
+/// Extract a numeric literal (integer or float) as `f64` from an expression.
+fn extract_numeric_literal(expr: &sqlparser::ast::Expr) -> Option<f64> {
+    use sqlparser::ast::{Expr, Value, ValueWithSpan};
+    match expr {
+        Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. }) => s.parse().ok(),
+        Expr::UnaryOp {
+            op: sqlparser::ast::UnaryOperator::Minus,
+            expr: inner,
+        } => extract_numeric_literal(inner).map(|v| -v),
+        Expr::Cast { expr: inner, .. } => extract_numeric_literal(inner),
+        _ => None,
+    }
+}
+
+/// Extract a PG range literal string (e.g. `'[1,10)'` or `'[1,10)'::int4range`)
+/// from an expression.  Returns the inner string content (without quotes).
+fn extract_range_literal_str(expr: &sqlparser::ast::Expr) -> Option<String> {
+    use sqlparser::ast::{Expr, Value, ValueWithSpan};
+    match expr {
+        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => {
+            // Must look like a PG range literal: starts with `[` or `(` or `empty`.
+            let trimmed = s.trim();
+            if trimmed.starts_with('[')
+                || trimmed.starts_with('(')
+                || trimmed.eq_ignore_ascii_case("empty")
+            {
+                Some(s.clone())
+            } else {
+                None
+            }
+        }
+        Expr::Cast { expr: inner, .. } => extract_range_literal_str(inner),
+        _ => None,
+    }
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

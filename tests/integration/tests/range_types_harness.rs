@@ -1000,7 +1000,6 @@ async fn range_union_intersection() {
 /// high-selectivity `@>` point query, and asserts ≥ 5× speedup.
 ///
 /// Closed by: 5.24.E (GIST index + planner integration for range `@>` probes).
-#[ignore = "5.24.E — GIST index planner integration pending"]
 #[tokio::test]
 async fn range_gist_index() {
     // Slice: "GIST perf"

@@ -1844,6 +1844,68 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                 }
             }
 
+            // Phase 5.24.D — detect `SELECT … FROM t WHERE col @> val` /
+            // `col && range` / `col <@ range` on a GIST-indexed range column
+            // and probe the interval tree.  Advisory-only: `Empty` short-circuits;
+            // anything else falls through to the DataFusion / UDF path for
+            // correctness.
+            if !crate::session::tx_is_active(&sess.state)
+                && (raw_sql.contains("@>") || raw_sql.contains("&&") || raw_sql.contains("<@"))
+            {
+                if let Some(interval_plan) = crate::index_probe::detect_range_index_probe(
+                    raw_sql,
+                    &sess.project,
+                    &sess.engine.config().catalog,
+                )
+                .await
+                {
+                    use basin_common::types::range::{IndexInterval, RangeValue};
+                    use basin_storage::index::interval::ProbeResult;
+                    let interval_result = match &interval_plan.op {
+                        crate::index_probe::RangeOp::ContainsElem => {
+                            if let Some(pt) = interval_plan.point {
+                                sess.engine.interval_registry().probe_contains_point(
+                                    &sess.project,
+                                    &interval_plan.table,
+                                    &interval_plan.col,
+                                    pt,
+                                )
+                            } else {
+                                ProbeResult::NoIndex
+                            }
+                        }
+                        crate::index_probe::RangeOp::ContainsRange
+                        | crate::index_probe::RangeOp::Overlaps
+                        | crate::index_probe::RangeOp::ContainedBy => {
+                            if let Some(lit) = &interval_plan.range_literal {
+                                if let Some(rv) = RangeValue::from_pg_text(lit) {
+                                    if let Some(iv) = IndexInterval::from_range(&rv) {
+                                        sess.engine.interval_registry().probe_overlaps(
+                                            &sess.project,
+                                            &interval_plan.table,
+                                            &interval_plan.col,
+                                            &iv,
+                                        )
+                                    } else {
+                                        ProbeResult::NoIndex
+                                    }
+                                } else {
+                                    ProbeResult::NoIndex
+                                }
+                            } else {
+                                ProbeResult::NoIndex
+                            }
+                        }
+                    };
+                    if let ProbeResult::Empty = interval_result {
+                        // Interval tree guarantees no rows match — short-circuit.
+                        let schema = Arc::new(arrow_schema::Schema::empty());
+                        return Ok(ExecResult::Rows { schema, batches: vec![] });
+                    }
+                    // FileCandidates / NoIndex: fall through to DataFusion for correctness.
+                }
+            }
+
             exec_select(sess, sql, include_deleted, Some(raw_sql)).await
         }
         Statement::ShowTables { .. } => exec_show_tables(sess).await,
@@ -2767,16 +2829,39 @@ async fn exec_create_index(
         );
     }
 
+    // Phase 5.24.D: extract opclass for GIST indexes on range columns.
+    // Accepted: `range_ops` (default when not specified), empty (treated as
+    // `range_ops`).  Unknown opclasses are accepted with a notice so that
+    // users writing `CREATE INDEX … USING gist (col)` without an explicit
+    // opclass get the interval-tree wiring.
+    let gist_opclass: Option<String> = if access_method_str == "gist" {
+        let raw_opclass = ci
+            .columns
+            .first()
+            .and_then(|c| c.operator_class.as_ref())
+            .map(|oc| {
+                use crate::pg_ast::ObjectNamePartExt;
+                oc.0.iter()
+                    .map(|part| part.id_val().to_lowercase())
+                    .collect::<Vec<_>>()
+                    .join(".")
+            });
+        Some(raw_opclass.unwrap_or_else(|| "range_ops".to_string()))
+    } else {
+        None
+    };
+
     // Emit notices for accepted-but-not-enforced features.
     if let Some(pred) = &ci.predicate {
         log_partial_index_notice(&index_name, &pred.to_string());
     }
     if !access_method_str.eq_ignore_ascii_case("btree")
         && !access_method_str.eq_ignore_ascii_case("gin")
+        && !access_method_str.eq_ignore_ascii_case("gist")
         && !access_method_str.eq_ignore_ascii_case("hnsw")
         && !access_method_str.eq_ignore_ascii_case("ivfflat")
     {
-        // Non-btree, non-gin, non-vector access methods: log the notice.
+        // Non-btree, non-gin, non-gist, non-vector access methods: log the notice.
         log_using_notice(&index_name, &access_method_str);
     }
     if !ci.include.is_empty() {
@@ -2836,6 +2921,11 @@ async fn exec_create_index(
             .map(|op| format!("ivfflat:{op}"))
             .or_else(|| Some("ivfflat:vector_l2_ops".to_string()));
         ("hnsw".to_string(), opclass)
+    } else if access_method_str == "gist" {
+        // Phase 5.24.D: GIST indexes on range columns are stored with their
+        // opclass (default "range_ops") so the probe path can verify that
+        // a GIST index covers the queried column.
+        ("gist".to_string(), gist_opclass.clone())
     } else {
         (access_method_str.clone(), gin_opclass.clone())
     };
@@ -5011,6 +5101,16 @@ async fn exec_select(
             orig_sql,
         )
         .await?;
+        // Phase 5.24.D — GIST interval-tree file-level pruning (range @> / && / <@).
+        // Use the original SQL so range operators are still present (before
+        // `rewrite_range_operators` converts them to UDF calls).
+        crate::session::apply_gist_pruning_for_query(
+            &sess.engine,
+            &sess.project,
+            &sess.ctx,
+            orig_sql,
+        )
+        .await?;
     }
 
     // View-reference rewriting: replace any reference to a known plain view
@@ -6891,6 +6991,15 @@ async fn maintain_secondary_indexes_on_insert(
             continue;
         }
 
+        // Phase 5.24.D: populate interval-tree for range-typed columns with a
+        // GIST index.  Range values are stored as Utf8 JSON; the interval tree
+        // allows point-containment and overlap probes at file-level granularity.
+        if idx.access_method == "gist" {
+            let interval_registry = sess.engine.interval_registry();
+            maintain_gist_index_on_insert(interval_registry, &sess.project, table, col_name, batch, file_path);
+            continue;
+        }
+
         let entries = crate::secondary_index::extract_entries_from_batch(
             batch,
             col_name,
@@ -6974,6 +7083,43 @@ fn maintain_gin_fts_index_on_insert(
         // Mark this file as fully indexed so the completeness guard in the
         // probe path can safely prune to FileCandidates.
         fts_registry.mark_file_indexed(project, table, col_name, file_path);
+    }
+}
+
+/// Phase 5.24.D — Populate the interval-tree index for a single range-typed
+/// column from a newly written `batch`. Iterates every row in the batch, parses
+/// the range JSON string, converts it to a half-open `IndexInterval`, and
+/// inserts it into the registry.
+///
+/// Only `Utf8` columns with range-type metadata are handled (Basin stores range
+/// types as Utf8 JSON). Other column types are silently skipped — the index is
+/// best-effort.  After all rows have been indexed, `mark_file_indexed` is called
+/// so the completeness guard can safely prune to `FileCandidates`.
+fn maintain_gist_index_on_insert(
+    interval_registry: &Arc<basin_storage::index::interval::IntervalRegistry>,
+    project: &basin_common::ProjectId,
+    table: &basin_common::TableName,
+    col_name: &str,
+    batch: &arrow_array::RecordBatch,
+    file_path: &str,
+) {
+    use arrow_array::Array;
+    let Ok(col_idx) = batch.schema().index_of(col_name) else {
+        return;
+    };
+    let col = batch.column(col_idx);
+    // Basin stores range types as Utf8 JSON strings.
+    if let Some(arr) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
+        for row in 0..arr.len() {
+            if arr.is_null(row) {
+                continue;
+            }
+            let range_json = arr.value(row);
+            interval_registry.index_row(project, table, col_name, range_json, file_path, 0);
+        }
+        // Mark this file as fully indexed so the completeness guard in the
+        // probe path can safely prune to FileCandidates.
+        interval_registry.mark_file_indexed(project, table, col_name, file_path);
     }
 }
 

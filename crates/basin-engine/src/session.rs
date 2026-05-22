@@ -1920,6 +1920,131 @@ pub(crate) async fn apply_gin_fts_pruning_for_query(
     Ok(())
 }
 
+/// Phase 5.24.D — GIST interval-tree file-level pruning.
+///
+/// Mirrors [`apply_gin_pruning_for_query`] for range `@>` / `&&` / `<@`
+/// predicates.  After all tables have been refreshed, inspect `sql` (the
+/// *original* pre-rewrite SQL that still contains `@>` / `&&` / `<@`) for a
+/// range predicate on a column with a GIST index.  When the interval tree
+/// returns `FileCandidates` AND the completeness guard passes (every live file
+/// is in the indexed-files set), replace the table's `ListingTable`
+/// registration with one scoped to the candidate files only.
+///
+/// Correctness contract:
+/// * `FileCandidates` is a conservative superset — no file containing a real
+///   match is ever excluded (the range UDF re-evaluates on every candidate row).
+/// * Pruning only fires when `indexed_files ⊇ live_files`.
+/// * On any error or uncertainty returns `Ok(())` → full scan.
+pub(crate) async fn apply_gist_pruning_for_query(
+    engine: &Engine,
+    project: &ProjectId,
+    ctx: &SessionContext,
+    sql: &str,
+) -> Result<()> {
+    // Fast pre-check: must contain a range operator to be relevant.
+    if !sql.contains("@>") && !sql.contains("&&") && !sql.contains("<@") {
+        return Ok(());
+    }
+
+    // Detect the range predicate shape.
+    let plan = match crate::index_probe::detect_range_index_probe(
+        sql,
+        project,
+        &engine.config().catalog,
+    )
+    .await
+    {
+        Some(p) => p,
+        None => return Ok(()), // query shape not recognised → full scan
+    };
+
+    // Probe the interval tree.
+    use basin_common::types::range::{IndexInterval, RangeValue};
+    use basin_storage::index::interval::ProbeResult;
+    let interval_result = match &plan.op {
+        crate::index_probe::RangeOp::ContainsElem => {
+            let pt = match plan.point {
+                Some(p) => p,
+                None => return Ok(()),
+            };
+            engine.interval_registry().probe_contains_point(project, &plan.table, &plan.col, pt)
+        }
+        crate::index_probe::RangeOp::ContainsRange
+        | crate::index_probe::RangeOp::Overlaps
+        | crate::index_probe::RangeOp::ContainedBy => {
+            let lit = match &plan.range_literal {
+                Some(s) => s,
+                None => return Ok(()),
+            };
+            let rv = match RangeValue::from_pg_text(lit) {
+                Some(r) => r,
+                None => return Ok(()),
+            };
+            let iv = match IndexInterval::from_range(&rv) {
+                Some(iv) => iv,
+                None => return Ok(()), // infinite-bound → full scan
+            };
+            engine.interval_registry().probe_overlaps(project, &plan.table, &plan.col, &iv)
+        }
+    };
+
+    let candidate_files = match interval_result {
+        ProbeResult::FileCandidates(files) => files,
+        // Empty is handled before exec_select (short-circuit with 0 rows).
+        // NoIndex → full scan.
+        _ => return Ok(()),
+    };
+
+    // Completeness guard: fetch the live file set from the catalog.
+    let meta = match engine.config().catalog.load_table(project, &plan.table).await {
+        Ok(m) => m,
+        Err(_) => return Ok(()), // can't verify completeness → full scan
+    };
+    let live_files: Vec<DataFileRef> = meta.live_data_files();
+    if live_files.is_empty() {
+        return Ok(());
+    }
+
+    // Check coverage: every live file must appear in the indexed-files set.
+    let indexed = engine.interval_registry().indexed_files_for(
+        project,
+        &plan.table,
+        &plan.col,
+    );
+    let all_covered = live_files.iter().all(|f| indexed.contains(f.path.as_str()));
+    if !all_covered {
+        // At least one live file is not in the interval tree → full scan.
+        return Ok(());
+    }
+
+    // Completeness confirmed. Intersect candidate set with live files.
+    let pruned_paths: Vec<String> = live_files
+        .iter()
+        .filter(|f| candidate_files.contains(f.path.as_str()))
+        .map(|f| f.path.to_string())
+        .collect();
+
+    if pruned_paths.is_empty() || pruned_paths.len() == live_files.len() {
+        // Either no candidates (defensively leave full set) or all files are
+        // candidates (pruning is a no-op).
+        return Ok(());
+    }
+
+    // Re-register with only the pruned file set.
+    let _ = register_pruned_listing_table(
+        engine,
+        ctx,
+        &plan.table,
+        &meta.schema,
+        meta.file_format,
+        &pruned_paths,
+        meta.global_sort_order.as_deref(),
+    )
+    .await;
+
+    Ok(())
+}
+
 /// Inclusive month range covering the rows a query may need.
 #[derive(Copy, Clone, Debug)]
 struct YearMonthRange {
