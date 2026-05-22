@@ -6,6 +6,44 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-22 — 5.19.D/E + partials-cleanup; broad agent-amenable sweep essentially complete
+
+- `9ac7afb` **5.19.D/E** — JSONB GIN key/path probe (`?`/`?&`/`?|`/`->`/`#>`; fixed
+  4 real JSONB-UDF bugs incl. `List<Utf8>` array-arg handling + chained-`->` rewrite)
+  + index maintenance on UPDATE/DELETE (rebuild posting lists for COW-replaced
+  files + tombstone filtering). gin_containment + 100k-row diff green.
+- `7e09c07` **partials cleanup:** idle_in_transaction timeout slice GREEN (noop_accept
+  was eating the SET); citext type-round-trip + UNIQUE slices GREEN (UNIQUE fix:
+  reuse INSERT-batch citext positions since Parquet read-back drops field metadata);
+  **ALTER TABLE ADD COLUMN now attaches BASIN_TYPE for JSONB/UUID/CITEXT/6 range
+  types/XML** (mirrors CREATE TABLE); `pg_sleep` → `block_in_place + tokio sleep`
+  (yields, though full preemption needs DataFusion async-UDF). 1178 engine tests.
+- Sibling repos advanced in parallel (isolated, zero contention): basin-cli
+  `c7d5a94` (Tier-8 cwd fallback for sql/logs/secrets/snapshots, 1070 tests);
+  basin-cloud `40022d0` T-154, `515d3dd` T-157 (GCP-KMS JWT), `0d70a3a` T-155.
+
+### STOP-CONDITION ASSESSMENT (per the loop's own criterion)
+Phases 5.18–5.32 are now substantially complete (impl slices landed + coherence-gated
++ regression-swept green across ~12 waves). basin TASK.md: ~60 open + 15 partial, but
+the **remainder is no longer cleanly agent-amenable** — it falls into:
+1. **Deep architectural work better done solo-with-review, not an autonomous sweep:**
+   index-probe → DataFusion physical-scan wiring (the ≥10× perf gates for JSONB-GIN
+   5.19.C, tsvector-GIN 5.20.E, interval 5.24.D); citext `WHERE col='x'` auto-fold
+   (needs a schema-aware DataFusion `AnalyzerRule`); `lock_timeout` 55P03 (cross-session
+   row-lock tracking); `pg_sleep` preemption (DataFusion async-UDF support).
+2. **External-dependency / can't-verify-here:** 5.22.A (real pg_dump/psql + CLI binary),
+   5.25 per-tool CI (Flyway/Diesel/sqlx/Prisma/golang-migrate binaries), 5.29.F 1M-row
+   soak, 5.31 docker image CI build, 5.32 sample-app `npm` CI.
+3. **Upstream-blocked / parked:** #40 (to_char/IS-DISTINCT-FROM Utf8View — DataFusion 53),
+   #63-uuid (vortex-datafusion read-path UUID translation), #43 (Vortex FSB encoder PR).
+4. **Security/stub P1/P2 tails:** #53, #54 remainders.
+
+Recommendation: pause the broad multi-agent sweep. The above want either human direction
+or focused solo sessions with careful review (esp. category 1, which touches the core
+scan path). Everything cleanly parallelizable has been done.
+
+---
+
 ## 2026-05-22 — Engine-phase + isolated-sibling-repo waves: 5.22 pg_dump, 5.26 pgvector, 5.29 hypertable
 
 Cadence that works under engine-serialization + disk limits: ONE engine agent on a
