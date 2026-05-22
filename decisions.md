@@ -6,6 +6,37 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-22 — Wave 2 (4 agents) green; closed 6.TR.B/#63, list_factors stub, CI wiring, docs; ORCHESTRATION ERROR caught
+
+Dispatched 4 file-disjoint agents: E1=basin-engine (6.TR.B viability_uuid read-path),
+E2=basin-auth+rest (list_factors stub removal), E3=.github (external-tool CIs),
+E4=docs (Docker quickstart + cross-links). Plus the Wave-1 5.24.F continuation agent (D')
+finished late. Coherence gate `cargo build --workspace` exit 0; sweep all bare-exit:
+viability_uuid 1/1 (un-ignored), jsonb_uuid 1/1, smoke_pgx 1/1, range_types 6/6, noop 42/42.
+
+- **6.TR.B / #63 CLOSED** (`82d5ed6`): `UuidDecimal256RestoreExec` — a custom ExecutionPlan
+  wrapper in `vortex_listing_format.rs` that translates UUID `Decimal256(39,0)`→`FixedSizeBinary(16)`
+  post-scan, plus a `file_source` schema swap so DataFusion's expr-adapter doesn't attempt the
+  unsupported cast. Single-boundary invariant (ADR 0024) preserved.
+- **list_factors stub REMOVED** (`52b4342`): real `AuthService::list_factors` + `FactorDescriptor`
+  (no secret) in basin-auth; `GET /auth/v1/factors` returns real data; test asserts an enrolled
+  factor appears. The atomic `git add && git commit` mitigation WORKED — no commit-race this time.
+- **External-tool CIs** (`18451a9`): `.github/workflows/external-tool-compat.yml` (pg_dump/Flyway/
+  golang-migrate, `--ignored` harnesses) + `hypertable-soak.yml` (nightly+dispatch). Marked `[~]`
+  honestly (CI-only, not sandbox-verifiable).
+- **Docs** (`4482ede`): quickstart-docker.md already accurate (env vars verified vs main.rs/Dockerfile);
+  added cross-links; 5.31.E/5.32.E ticked.
+- **5.24.F** (`d78c387`): D' finished — pg_ast gate now lets `EXCLUDE USING gist` syntax through
+  (range exclusion constraints USE that syntax); ddl.rs encodes them as sentinel CHECK predicates;
+  constraints.rs does the overlap-scan enforcement (SQLSTATE 23P01).
+
+**ORCHESTRATION ERROR (caught, no damage):** I dispatched E1 into basin-engine while the Wave-1
+5.24.F continuation agent (D') was STILL running in basin-engine — I'd assumed D' was done because
+its earlier work got swept into `1b7deb1`. Two same-crate agents ran concurrently. Got lucky: D'
+only touched `pg_ast.rs` (committed atomically as `d78c387`), E1 only touched `vortex_listing_format.rs`,
+so no file overlap. **Lesson: never dispatch a same-crate agent until the prior one's COMPLETION
+NOTIFICATION has arrived — do not infer doneness from a commit that swept its files.**
+
 ## 2026-05-22 — Wave 1 (4 file-disjoint agents) landed green; commit-race swept one agent's work into another's (benign)
 
 Dispatched 4 sonnet agents across disjoint crates: A=basin-rest (OAuth/MFA routes),
