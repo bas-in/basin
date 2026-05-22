@@ -228,3 +228,553 @@ fn pause_resume(g: &GlobalFlags, args: &[String], action: &str) -> CliResult<()>
     println!("{ref}: {action} ok.");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::testutil::{with_temp_config_dir, Req, Resp, TestServer};
+
+    fn flags(url: &str) -> GlobalFlags {
+        GlobalFlags {
+            api_url: url.to_string(),
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        }
+    }
+
+    fn flags_json(url: &str) -> GlobalFlags {
+        GlobalFlags {
+            api_url: url.to_string(),
+            token: "tok".into(),
+            quiet: true,
+            json: true,
+            ..Default::default()
+        }
+    }
+
+    fn flags_org(url: &str, org: &str) -> GlobalFlags {
+        GlobalFlags {
+            api_url: url.to_string(),
+            token: "tok".into(),
+            org_slug: org.to_string(),
+            quiet: true,
+            ..Default::default()
+        }
+    }
+
+    // ── dispatcher ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn no_subcommand_defaults_to_list_error_without_org() {
+        let _g = with_temp_config_dir();
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
+        // No org in flag or GlobalFlags.org_slug → list returns an error.
+        let err = cmd_projects(&g, &[]).unwrap_err();
+        assert!(
+            err.to_string().contains("--org") || err.to_string().contains("org"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_subcommand_is_silent_error() {
+        let _g = with_temp_config_dir();
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
+        let err = cmd_projects(&g, &["frobnicate".into()]).unwrap_err();
+        assert!(crate::error::is_silent(err.as_ref()), "error: {err}");
+    }
+
+    #[test]
+    fn help_returns_ok() {
+        let _g = with_temp_config_dir();
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            ..Default::default()
+        };
+        assert!(cmd_projects(&g, &["help".into()]).is_ok());
+        assert!(cmd_projects(&g, &["--help".into()]).is_ok());
+    }
+
+    // ── projects list ────────────────────────────────────────────────────────
+
+    #[test]
+    fn list_missing_org_errors() {
+        let _g = with_temp_config_dir();
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
+        let err = cmd_projects(&g, &["list".into()]).unwrap_err();
+        assert!(
+            err.to_string().contains("--org") || err.to_string().contains("org"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn list_uses_org_flag() {
+        let _g = with_temp_config_dir();
+        let srv = TestServer::start(|req: &Req| {
+            assert_eq!(req.method, "GET");
+            assert_eq!(req.path, "/v1/orgs/acme/projects");
+            Resp::ok(r#"{"projects":[{"ref":"p1","name":"My Project","region":"us-east","status":"active","created_at":"2025-01-01T00:00:00Z"}]}"#)
+        });
+        let g = flags(&srv.url);
+        cmd_projects(&g, &["list".into(), "--org=acme".into()]).unwrap();
+    }
+
+    #[test]
+    fn list_falls_back_to_global_org_slug() {
+        let _g = with_temp_config_dir();
+        let srv = TestServer::start(|req: &Req| {
+            assert_eq!(req.path, "/v1/orgs/global-org/projects");
+            Resp::ok(r#"{"projects":[]}"#)
+        });
+        let g = flags_org(&srv.url, "global-org");
+        cmd_projects(&g, &["list".into()]).unwrap();
+    }
+
+    #[test]
+    fn list_json_shape() {
+        let _g = with_temp_config_dir();
+        let srv = TestServer::start(|_req: &Req| {
+            Resp::ok(r#"{"projects":[{"ref":"p1","name":"My Project","region":"us-east","status":"active","created_at":"2025-01-01T00:00:00Z"}]}"#)
+        });
+        let mut buf = Vec::<u8>::new();
+        let c = crate::client::Client::new(&srv.url, "tok");
+        let resp: ProjectsResp = c
+            .do_json(reqwest::Method::GET, "/v1/orgs/acme/projects", None)
+            .unwrap();
+        print_json(&mut buf, &json!({ "projects": resp.projects })).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["projects"][0]["ref"].as_str().unwrap(), "p1");
+        assert_eq!(v["projects"][0]["name"].as_str().unwrap(), "My Project");
+    }
+
+    #[test]
+    fn list_server_error_propagates() {
+        let _g = with_temp_config_dir();
+        let srv = TestServer::start(|_req: &Req| {
+            Resp::status(500, r#"{"code":"internal","message":"boom"}"#)
+        });
+        let g = flags(&srv.url);
+        assert!(cmd_projects(&g, &["list".into(), "--org=acme".into()]).is_err());
+    }
+
+    // ── projects get ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn get_missing_ref_errors() {
+        let _g = with_temp_config_dir();
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
+        let err = cmd_projects(&g, &["get".into()]).unwrap_err();
+        assert!(
+            err.to_string().contains("usage:"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn get_happy_path() {
+        let _g = with_temp_config_dir();
+        let srv = TestServer::start(|req: &Req| {
+            assert_eq!(req.method, "GET");
+            assert_eq!(req.path, "/v1/projects/p1");
+            Resp::ok(r#"{"project":{"ref":"p1","name":"My Project","region":"us-east","status":"active","id":"id-1","engine_tenant_id":"t-1","created_at":"2025-01-01T00:00:00Z"}}"#)
+        });
+        let g = flags(&srv.url);
+        cmd_projects(&g, &["get".into(), "p1".into()]).unwrap();
+    }
+
+    #[test]
+    fn get_empty_project_returns_ok() {
+        let _g = with_temp_config_dir();
+        let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"project":null}"#));
+        let g = flags(&srv.url);
+        // Should succeed (prints "(empty)") rather than error.
+        cmd_projects(&g, &["get".into(), "p1".into()]).unwrap();
+    }
+
+    #[test]
+    fn get_json_shape() {
+        let _g = with_temp_config_dir();
+        let srv = TestServer::start(|_req: &Req| {
+            Resp::ok(r#"{"project":{"ref":"p-j","name":"JSON Project","region":"eu-west","status":"active","created_at":"2025-06-01T00:00:00Z"}}"#)
+        });
+        let mut buf = Vec::<u8>::new();
+        let c = crate::client::Client::new(&srv.url, "tok");
+        let resp: ProjectResp = c
+            .do_json(reqwest::Method::GET, "/v1/projects/p-j", None)
+            .unwrap();
+        print_json(&mut buf, &json!({ "project": resp.project })).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["project"]["ref"].as_str().unwrap(), "p-j");
+        assert_eq!(v["project"]["name"].as_str().unwrap(), "JSON Project");
+    }
+
+    #[test]
+    fn get_server_error_propagates() {
+        let _g = with_temp_config_dir();
+        let srv = TestServer::start(|_req: &Req| {
+            Resp::status(404, r#"{"code":"not_found","message":"project not found"}"#)
+        });
+        let g = flags(&srv.url);
+        assert!(cmd_projects(&g, &["get".into(), "missing".into()]).is_err());
+    }
+
+    // ── projects create ──────────────────────────────────────────────────────
+
+    #[test]
+    fn create_missing_name_errors() {
+        let _g = with_temp_config_dir();
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            org_slug: "acme".into(),
+            quiet: true,
+            ..Default::default()
+        };
+        let err = cmd_projects(&g, &["create".into()]).unwrap_err();
+        assert!(
+            err.to_string().contains("usage:"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn create_missing_org_errors() {
+        let _g = with_temp_config_dir();
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
+        // name is present, but no org in flag or org_slug.
+        let err = cmd_projects(&g, &["create".into(), "my-project".into()]).unwrap_err();
+        assert!(
+            err.to_string().contains("--org") || err.to_string().contains("org"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn create_happy_path_sends_name_and_org() {
+        let _g = with_temp_config_dir();
+        let srv = TestServer::start(|req: &Req| {
+            assert_eq!(req.method, "POST");
+            assert_eq!(req.path, "/v1/orgs/acme/projects");
+            let body: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
+            assert_eq!(body["name"].as_str().unwrap_or(""), "my-project");
+            Resp::ok(r#"{"project":{"ref":"p-new","name":"my-project","region":"us-east","status":"creating","created_at":"2025-01-01T00:00:00Z"}}"#)
+        });
+        let g = flags(&srv.url);
+        // --org must come before the name positional because trailing_var_arg
+        // captures everything after the first positional as part of the name.
+        cmd_projects(
+            &g,
+            &[
+                "create".into(),
+                "--org=acme".into(),
+                "my-project".into(),
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn create_with_region_sends_region_field() {
+        let _g = with_temp_config_dir();
+        let srv = TestServer::start(|req: &Req| {
+            let body: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
+            assert_eq!(body["region"].as_str().unwrap_or(""), "eu-west");
+            Resp::ok(r#"{"project":{"ref":"p-eu","name":"my-project","region":"eu-west","status":"creating","created_at":"2025-01-01T00:00:00Z"}}"#)
+        });
+        let g = flags(&srv.url);
+        // Flags before the trailing positional name.
+        cmd_projects(
+            &g,
+            &[
+                "create".into(),
+                "--org=acme".into(),
+                "--region=eu-west".into(),
+                "my-project".into(),
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn create_json_shape() {
+        let _g = with_temp_config_dir();
+        let srv = TestServer::start(|_req: &Req| {
+            Resp::ok(r#"{"project":{"ref":"p-j","name":"json-proj","region":"us-east","status":"creating","created_at":"2025-01-01T00:00:00Z"},"pgwire":{"connection_url":"postgres://user:pass@host:5432/db"}}"#)
+        });
+        let mut buf = Vec::<u8>::new();
+        let c = crate::client::Client::new(&srv.url, "tok");
+        let resp: CreateProjectResponse = c
+            .do_json(
+                reqwest::Method::POST,
+                "/v1/orgs/acme/projects",
+                Some(json!({"name":"json-proj"})),
+            )
+            .unwrap();
+        print_json(&mut buf, &resp).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["project"]["ref"].as_str().unwrap(), "p-j");
+    }
+
+    #[test]
+    fn create_server_error_propagates() {
+        let _g = with_temp_config_dir();
+        let srv = TestServer::start(|_req: &Req| {
+            Resp::status(409, r#"{"code":"conflict","message":"name taken"}"#)
+        });
+        let g = flags(&srv.url);
+        assert!(
+            cmd_projects(&g, &["create".into(), "my-project".into(), "--org=acme".into()])
+                .is_err()
+        );
+    }
+
+    // ── projects delete ──────────────────────────────────────────────────────
+
+    #[test]
+    fn delete_missing_ref_errors() {
+        let _g = with_temp_config_dir();
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
+        let err = cmd_projects(&g, &["delete".into()]).unwrap_err();
+        assert!(
+            err.to_string().contains("usage:"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn delete_yes_skips_prompt_and_calls_delete() {
+        let _g = with_temp_config_dir();
+        // Two requests: GET /v1/projects/p1, then DELETE /v1/projects/p1?confirm_name=My+Project
+        let call_count = Arc::new(Mutex::new(0u32));
+        let cc = Arc::clone(&call_count);
+        let srv = TestServer::start(move |req: &Req| {
+            let mut n = cc.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                assert_eq!(req.method, "GET");
+                assert_eq!(req.path, "/v1/projects/p1");
+                return Resp::ok(
+                    r#"{"project":{"ref":"p1","name":"My Project","region":"us-east","status":"active","created_at":"2025-01-01T00:00:00Z"}}"#,
+                );
+            }
+            assert_eq!(req.method, "DELETE");
+            assert!(
+                req.path.starts_with("/v1/projects/p1"),
+                "unexpected DELETE path: {}",
+                req.path
+            );
+            assert!(
+                req.path.contains("confirm_name"),
+                "missing confirm_name query param: {}",
+                req.path
+            );
+            Resp::ok(r#"{}"#)
+        });
+        let g = flags(&srv.url);
+        // --yes must precede the ref positional because trailing_var_arg
+        // captures everything after the first positional as part of the ref.
+        cmd_projects(
+            &g,
+            &["delete".into(), "--yes".into(), "p1".into()],
+        )
+        .unwrap();
+        assert_eq!(*call_count.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn delete_project_not_found_errors() {
+        let _g = with_temp_config_dir();
+        let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"project":null}"#));
+        let g = flags(&srv.url);
+        let err = cmd_projects(&g, &["delete".into(), "--yes".into(), "ghost".into()])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not found"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn delete_server_error_on_get_propagates() {
+        let _g = with_temp_config_dir();
+        let srv = TestServer::start(|_req: &Req| {
+            Resp::status(500, r#"{"code":"internal","message":"boom"}"#)
+        });
+        let g = flags(&srv.url);
+        assert!(
+            cmd_projects(&g, &["delete".into(), "--yes".into(), "p1".into()]).is_err()
+        );
+    }
+
+    #[test]
+    fn delete_json_shape() {
+        let _g = with_temp_config_dir();
+        let call_count = Arc::new(Mutex::new(0u32));
+        let cc = Arc::clone(&call_count);
+        let srv = TestServer::start(move |req: &Req| {
+            let mut n = cc.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                assert_eq!(req.method, "GET");
+                return Resp::ok(
+                    r#"{"project":{"ref":"p-j","name":"JSON Proj","region":"us-east","status":"active","created_at":"2025-01-01T00:00:00Z"}}"#,
+                );
+            }
+            Resp::ok(r#"{}"#)
+        });
+        let mut buf = Vec::<u8>::new();
+        print_json(
+            &mut buf,
+            &json!({ "deleted": true, "ref": "p-j" }),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["deleted"].as_bool().unwrap(), true);
+        assert_eq!(v["ref"].as_str().unwrap(), "p-j");
+        // Ensure the stub was set up correctly (used in later assertion).
+        drop(srv);
+    }
+
+    // ── projects pause ───────────────────────────────────────────────────────
+
+    #[test]
+    fn pause_missing_ref_errors() {
+        let _g = with_temp_config_dir();
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
+        let err = cmd_projects(&g, &["pause".into()]).unwrap_err();
+        assert!(
+            err.to_string().contains("usage:"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn pause_calls_post_pause() {
+        let _g = with_temp_config_dir();
+        let srv = TestServer::start(|req: &Req| {
+            assert_eq!(req.method, "POST");
+            assert_eq!(req.path, "/v1/projects/p1/pause");
+            Resp::ok(r#"{"status":"pausing"}"#)
+        });
+        let g = flags(&srv.url);
+        cmd_projects(&g, &["pause".into(), "p1".into()]).unwrap();
+    }
+
+    #[test]
+    fn pause_json_shape() {
+        let _g = with_temp_config_dir();
+        let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"status":"pausing"}"#));
+        let mut buf = Vec::<u8>::new();
+        let c = crate::client::Client::new(&srv.url, "tok");
+        let out: serde_json::Value = c
+            .do_json(reqwest::Method::POST, "/v1/projects/p1/pause", None)
+            .unwrap();
+        print_json(&mut buf, &out).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["status"].as_str().unwrap(), "pausing");
+    }
+
+    #[test]
+    fn pause_server_error_propagates() {
+        let _g = with_temp_config_dir();
+        let srv = TestServer::start(|_req: &Req| {
+            Resp::status(409, r#"{"code":"conflict","message":"already pausing"}"#)
+        });
+        let g = flags(&srv.url);
+        assert!(cmd_projects(&g, &["pause".into(), "p1".into()]).is_err());
+    }
+
+    // ── projects resume ──────────────────────────────────────────────────────
+
+    #[test]
+    fn resume_missing_ref_errors() {
+        let _g = with_temp_config_dir();
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "tok".into(),
+            quiet: true,
+            ..Default::default()
+        };
+        let err = cmd_projects(&g, &["resume".into()]).unwrap_err();
+        assert!(
+            err.to_string().contains("usage:"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn resume_calls_post_resume() {
+        let _g = with_temp_config_dir();
+        let srv = TestServer::start(|req: &Req| {
+            assert_eq!(req.method, "POST");
+            assert_eq!(req.path, "/v1/projects/p1/resume");
+            Resp::ok(r#"{"status":"resuming"}"#)
+        });
+        let g = flags(&srv.url);
+        cmd_projects(&g, &["resume".into(), "p1".into()]).unwrap();
+    }
+
+    #[test]
+    fn resume_json_shape() {
+        let _g = with_temp_config_dir();
+        let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"status":"resuming"}"#));
+        let mut buf = Vec::<u8>::new();
+        let c = crate::client::Client::new(&srv.url, "tok");
+        let out: serde_json::Value = c
+            .do_json(reqwest::Method::POST, "/v1/projects/p1/resume", None)
+            .unwrap();
+        print_json(&mut buf, &out).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["status"].as_str().unwrap(), "resuming");
+    }
+
+    #[test]
+    fn resume_server_error_propagates() {
+        let _g = with_temp_config_dir();
+        let srv = TestServer::start(|_req: &Req| {
+            Resp::status(409, r#"{"code":"conflict","message":"already active"}"#)
+        });
+        let g = flags(&srv.url);
+        assert!(cmd_projects(&g, &["resume".into(), "p1".into()]).is_err());
+    }
+}
