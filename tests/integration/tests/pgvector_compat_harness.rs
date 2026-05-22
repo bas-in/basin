@@ -106,7 +106,8 @@ async fn scalar_f64(sess: &basin_engine::ProjectSession, sql: &str) -> f64 {
 /// Closes when: 5.26.B lands and the engine accepts `vector(N)` column DDL,
 /// parses the `'[…]'` literal on INSERT, and returns the stored array on
 /// SELECT. At that point drop this `#[ignore]`.
-#[ignore = "5.26.A harness — pgvector SQL-syntax compat pending; closes 5.26.B-F"]
+// Slice 5.26.B: un-ignored after vector(N) type, vector_dims() UDF, ::vector cast,
+// and vector_to_text() (for ::text cast) are implemented.
 #[tokio::test]
 async fn pgvector_type_round_trip() {
     // Slice: "type round-trip" via existing basin-vector.
@@ -217,7 +218,7 @@ async fn pgvector_type_round_trip() {
 /// Closes when: 5.26.C lands and the SQL planner/executor resolves `<->` to
 /// the L2 distance function for `vector` operands. At that point drop this
 /// `#[ignore]`.
-#[ignore = "5.26.A harness — pgvector SQL-syntax compat pending; closes 5.26.B-F"]
+// Slice 5.26.C: un-ignored after <->, <=>, <#> operators are wired and ::vector cast strip lands.
 #[tokio::test]
 async fn pgvector_op_l2_distance() {
     // Slice: "operator semantics — L2".
@@ -338,7 +339,7 @@ async fn pgvector_op_l2_distance() {
 /// Closes when: 5.26.C lands and the SQL planner/executor resolves `<=>` to
 /// the cosine distance function for `vector` operands. At that point drop this
 /// `#[ignore]`.
-#[ignore = "5.26.A harness — pgvector SQL-syntax compat pending; closes 5.26.B-F"]
+// Slice 5.26.C cosine: un-ignored after <=> operator is wired.
 #[tokio::test]
 async fn pgvector_op_cosine_distance() {
     // Slice: "operator semantics — cosine".
@@ -468,7 +469,7 @@ async fn pgvector_op_cosine_distance() {
 /// Closes when: 5.26.C lands and the SQL planner/executor resolves `<#>` to
 /// the negative inner product function for `vector` operands. At that point
 /// drop this `#[ignore]`.
-#[ignore = "5.26.A harness — pgvector SQL-syntax compat pending; closes 5.26.B-F"]
+// Slice 5.26.C inner product: un-ignored after <#> operator is wired.
 #[tokio::test]
 async fn pgvector_op_inner_product() {
     // Slice: "operator semantics — inner product".
@@ -601,7 +602,8 @@ async fn pgvector_op_inner_product() {
 /// vector operator-class names (`vector_l2_ops`, `vector_cosine_ops`,
 /// `vector_ip_ops`) and optional storage parameters `m` / `ef_construction`.
 /// At that point drop this `#[ignore]`.
-#[ignore = "5.26.A harness — pgvector SQL-syntax compat pending; closes 5.26.B-F"]
+// Slice 5.26.D: un-ignored after USING hnsw + vector opclasses + WITH (m/ef) DDL
+// parsing is wired into exec_create_index and the catalog records the index.
 #[tokio::test]
 async fn pgvector_ddl_using_hnsw() {
     // Slice: "DDL — hnsw index".
@@ -774,7 +776,8 @@ async fn pgvector_ddl_using_hnsw() {
 /// Closes when: 5.26.E lands and the engine accepts ORM-generated DDL,
 /// INSERT, and SELECT shapes for vector columns. At that point drop this
 /// `#[ignore]`.
-#[ignore = "5.26.A harness — pgvector SQL-syntax compat pending; closes 5.26.B-F"]
+// Slice 5.26.F (ORM compat): un-ignored — depends on B (vector(N) type),
+// C (<-> / <=> operators), and D (USING hnsw DDL). All three close together.
 #[tokio::test]
 async fn pgvector_orm_compat() {
     // Slice: "ORM compat".

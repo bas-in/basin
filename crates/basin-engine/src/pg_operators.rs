@@ -5904,6 +5904,176 @@ fn qualify_pg_view_name(sql: &str, view: &str) -> String {
     out
 }
 
+// ─── Phase 5.26.B — `expr::text` → `vector_to_text(expr)` rewriter ──────────
+
+/// Rewrite `identifier::text` to `vector_to_text(identifier)` so that
+/// pgvector-style text representations of vector columns work in WHERE
+/// predicates and SELECT lists.
+///
+/// Arrow's cast kernel does not support `FixedSizeList<Float32> → Utf8`, so a
+/// plain `CAST(embedding AS TEXT)` (which is what sqlparser produces from
+/// `embedding::text`) would fail at plan time.  The `vector_to_text` UDF
+/// handles both `FixedSizeList<Float32>` (vector columns) and `Utf8` (text
+/// columns) transparently, so it is safe to apply broadly.
+///
+/// Pattern: `WORD::text` where `WORD` is an ASCII identifier (letters, digits,
+/// underscores).  The rewriter is conservative: multi-part names (`t.col`),
+/// quoted identifiers, and expressions in parens are left unchanged (their
+/// `::text` cast will either be handled by DataFusion directly or will fail
+/// with a clearer error).
+///
+/// Phase 5.26.B: closes the `embedding::text` fragment of the type round-trip
+/// slice.
+pub(crate) fn rewrite_vector_col_text_cast(sql: &str) -> String {
+    // Fast-path: skip if no `::text` in the query.
+    let lower = sql.to_ascii_lowercase();
+    if !lower.contains("::text") {
+        return sql.to_string();
+    }
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 64);
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // Look for `::text` (case-insensitive), ensuring the next char is not
+        // an alphanumeric / underscore (to avoid `::textarray` etc.).
+        if i + 6 <= bytes.len()
+            && bytes[i] == b':'
+            && bytes[i + 1] == b':'
+            && lower.as_bytes()[i + 2] == b't'
+            && lower.as_bytes()[i + 3] == b'e'
+            && lower.as_bytes()[i + 4] == b'x'
+            && lower.as_bytes()[i + 5] == b't'
+        {
+            let after = i + 6;
+            let next_is_ident = bytes
+                .get(after)
+                .map(|&c| c.is_ascii_alphanumeric() || c == b'_')
+                .unwrap_or(false);
+            if next_is_ident {
+                // Something like `::textarray` — copy as-is.
+                out.push_str(&sql[i..after]);
+                i = after;
+                continue;
+            }
+            // Look back to find the identifier that precedes `::text`.
+            // We scan backward through `out` to find a contiguous `[a-zA-Z0-9_]`
+            // token.  We only rewrite bare identifiers (no dots, no parens).
+            let out_bytes = out.as_bytes();
+            let ident_end = out_bytes.len();
+            let mut id_start = ident_end;
+            while id_start > 0 {
+                let b = out_bytes[id_start - 1];
+                if b.is_ascii_alphanumeric() || b == b'_' {
+                    id_start -= 1;
+                } else {
+                    break;
+                }
+            }
+            let ident_len = ident_end - id_start;
+            // Only rewrite when the token is a valid SQL identifier: must
+            // start with a letter or underscore (not a digit).  `1::text`
+            // is a numeric cast and must pass through unmodified; only column
+            // names like `embedding::text` are converted to `vector_to_text(…)`.
+            let first_byte = if ident_len > 0 {
+                out_bytes[id_start]
+            } else {
+                0
+            };
+            let is_ident = ident_len > 0
+                && (first_byte.is_ascii_alphabetic() || first_byte == b'_');
+            if is_ident {
+                // Wrap the identifier: `IDENT::text` → `vector_to_text(IDENT)`.
+                let ident = out[id_start..ident_end].to_string();
+                out.truncate(id_start);
+                out.push_str("vector_to_text(");
+                out.push_str(&ident);
+                out.push(')');
+                i = after; // skip `::text`
+            } else {
+                // Numeric literal or no plain identifier before `::text` — copy as-is.
+                out.push_str(&sql[i..after]);
+                i = after;
+            }
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+// ─── Phase 5.26.C — `::vector` cast rewriter ─────────────────────────────────
+
+/// Strip `::vector` type casts before DataFusion sees the SQL.
+///
+/// pgvector users routinely write `'[1.0,0.0,0.0]'::vector` to give a literal
+/// a vector type.  DataFusion does not know the `vector` type so the cast
+/// expression would cause a parse / plan failure.  Since Basin's distance UDFs
+/// already accept a bare `'[…]'` string literal on either side (they parse it
+/// internally via `parse_vector_literal`), stripping the `::vector` suffix is
+/// semantically correct: the string literal is identical to its cast form for
+/// all purposes the UDF layer cares about.
+///
+/// The rewriter also handles `::vector(N)` (with an explicit dimension) by
+/// stripping the entire `::vector(…)` suffix.
+///
+/// Phase 5.26.C: closes the `'…'::vector` fragment of the operator slices.
+pub(crate) fn rewrite_vector_cast(sql: &str) -> String {
+    // Fast-path: skip allocation when no cast marker is present.
+    let lower = sql.to_ascii_lowercase();
+    if !lower.contains("::vector") {
+        return sql.to_string();
+    }
+    let bytes = sql.as_bytes();
+    let lower_bytes = lower.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // Look for `::vector` (case-insensitive).
+        if i + 8 <= bytes.len()
+            && lower_bytes[i] == b':'
+            && lower_bytes[i + 1] == b':'
+            && lower_bytes[i + 2] == b'v'
+            && lower_bytes[i + 3] == b'e'
+            && lower_bytes[i + 4] == b'c'
+            && lower_bytes[i + 5] == b't'
+            && lower_bytes[i + 6] == b'o'
+            && lower_bytes[i + 7] == b'r'
+        {
+            // Make sure this isn't `::vectorfoo` (i.e. longer identifier).
+            let after = i + 8;
+            if after < bytes.len()
+                && (bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_')
+            {
+                // Not `::vector` alone — copy as-is and continue.
+                out.push(bytes[i] as char);
+                i += 1;
+                continue;
+            }
+            // Skip `::vector`.
+            i = after;
+            // Also skip an optional `(N)` dimension qualifier.
+            if i < bytes.len() && bytes[i] == b'(' {
+                let start = i;
+                i += 1;
+                while i < bytes.len() && bytes[i] != b')' {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1; // consume ')'
+                } else {
+                    // Malformed — emit the original `(…` fragment.
+                    out.push_str(&sql[start..i]);
+                }
+            }
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------

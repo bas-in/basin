@@ -940,6 +940,13 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     // Lower `tsvector @@ tsquery` to the `ts_match(...)` UDF before sqlparser
     // sees the SQL — sqlparser doesn't have AtAt in its operator table.
     let rewritten = crate::pg_ast::rewrite_tsvector_at_at(sql);
+    // Phase 5.26.C: strip `::vector` / `::vector(N)` casts BEFORE the operator
+    // rewriter so that `'[1,0,0]'::vector <-> '[0,1,0]'::vector` becomes
+    // `'[1,0,0]' <-> '[0,1,0]'` before the operator is expanded to l2_distance().
+    // Also strip `::text` on vector columns before the operator rewrites see them.
+    let rewritten = crate::pg_operators::rewrite_vector_cast(&rewritten);
+    // Phase 5.26.B: rewrite `col::text` → `vector_to_text(col)` before operators.
+    let rewritten = crate::pg_operators::rewrite_vector_col_text_cast(&rewritten);
     let rewritten = crate::udf::rewrite_vector_operators(&rewritten);
     // Rewrite JSON/JSONB infix operators (`->`, `->>`, `#>`, `#>>`, `?`,
     // `?&`, `?|`, `<@`, `@>` for JSON, `||` for JSON concat, `@?` for
@@ -2491,14 +2498,68 @@ async fn exec_create_index(
         None
     };
 
+    // Phase 5.26.D/E: extract vector operator class for HNSW / IVFFlat indexes.
+    // pgvector opclasses: `vector_l2_ops`, `vector_cosine_ops`, `vector_ip_ops`.
+    // For IVFFlat: same opclasses, same convention (IVFFlat is accepted as a DDL
+    // synonym and mapped to the Basin HNSW implementation as a documented fallback
+    // — the catalog records the declared access method for introspection, but
+    // queries use the HNSW fast path regardless).
+    // WITH (m = 16, ef_construction = 64) and WITH (lists = N) are accepted and
+    // logged; they are stored in the catalog opclass string for future use.
+    let vector_opclass: Option<String> = if access_method_str == "hnsw"
+        || access_method_str == "ivfflat"
+    {
+        let raw_opclass = ci
+            .columns
+            .first()
+            .and_then(|c| c.operator_class.as_ref())
+            .map(|oc| {
+                oc.0.iter()
+                    .map(|part| part.id_val().to_lowercase())
+                    .collect::<Vec<_>>()
+                    .join(".")
+            });
+        match raw_opclass.as_deref() {
+            None | Some("vector_l2_ops") => Some("vector_l2_ops".to_string()),
+            Some("vector_cosine_ops") => Some("vector_cosine_ops".to_string()),
+            Some("vector_ip_ops") => Some("vector_ip_ops".to_string()),
+            Some(other) => {
+                // Unknown opclass — accept with a warning (pgvector DDL portability).
+                tracing::warn!(
+                    index = %index_name,
+                    opclass = %other,
+                    "CREATE INDEX USING {access_method_str}: unknown vector opclass; \
+                     expected one of: vector_l2_ops, vector_cosine_ops, vector_ip_ops. \
+                     Defaulting to vector_l2_ops."
+                );
+                Some("vector_l2_ops".to_string())
+            }
+        }
+    } else {
+        None
+    };
+
+    // Log IVFFlat fallback notice.
+    if access_method_str == "ivfflat" {
+        tracing::info!(
+            index = %index_name,
+            table = %table_name,
+            "CREATE INDEX USING ivfflat accepted; Basin maps IVFFlat to the HNSW \
+             implementation as a documented fallback (Phase 5.26.E). Queries use \
+             the HNSW fast path. A native IVFFlat implementation is roadmap-tracked."
+        );
+    }
+
     // Emit notices for accepted-but-not-enforced features.
     if let Some(pred) = &ci.predicate {
         log_partial_index_notice(&index_name, &pred.to_string());
     }
     if !access_method_str.eq_ignore_ascii_case("btree")
         && !access_method_str.eq_ignore_ascii_case("gin")
+        && !access_method_str.eq_ignore_ascii_case("hnsw")
+        && !access_method_str.eq_ignore_ascii_case("ivfflat")
     {
-        // Non-btree, non-gin access methods: log the notice (treated as btree).
+        // Non-btree, non-gin, non-vector access methods: log the notice.
         log_using_notice(&index_name, &access_method_str);
     }
     if !ci.include.is_empty() {
@@ -2543,6 +2604,24 @@ async fn exec_create_index(
     // access_method ("gin") and opclass ("jsonb_ops" / "jsonb_path_ops") in the
     // catalog SecondaryIndex row. Btree indexes continue to use the same path
     // via the default impl that delegates to create_index.
+    // Phase 5.26.D/E: HNSW and IVFFlat vector indexes use vector_opclass.
+    // IVFFlat is stored with access_method "hnsw" (the Basin implementation)
+    // for query-routing purposes; the declared "ivfflat" is preserved in the
+    // opclass string so introspection can still see the user's intent.
+    let (catalog_method, catalog_opclass) = if access_method_str == "hnsw" {
+        ("hnsw".to_string(), vector_opclass.clone())
+    } else if access_method_str == "ivfflat" {
+        // IVFFlat fallback: map to HNSW in the catalog so the vector planner
+        // can route through the HNSW fast path. Store opclass with an "ivfflat:"
+        // prefix so introspection can still see the original access method.
+        let opclass = vector_opclass
+            .as_deref()
+            .map(|op| format!("ivfflat:{op}"))
+            .or_else(|| Some("ivfflat:vector_l2_ops".to_string()));
+        ("hnsw".to_string(), opclass)
+    } else {
+        (access_method_str.clone(), gin_opclass.clone())
+    };
     sess.engine
         .config()
         .catalog
@@ -2552,8 +2631,8 @@ async fn exec_create_index(
             &index_name,
             &catalog_columns,
             ci.if_not_exists,
-            &access_method_str,
-            gin_opclass.as_deref(),
+            &catalog_method,
+            catalog_opclass.as_deref(),
         )
         .await?;
 

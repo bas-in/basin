@@ -50,6 +50,24 @@ pub(crate) fn register_distance_udfs(ctx: &SessionContext) {
     ctx.register_udf(make_udf("l2_distance", DistanceFn::L2));
     ctx.register_udf(make_udf("cosine_distance", DistanceFn::Cosine));
     ctx.register_udf(make_udf("dot_product", DistanceFn::Dot));
+    // pgvector catalog function: vector_dims(vec) → int4
+    // Returns the dimensionality (element count) of a vector column.
+    // Phase 5.26.B: registered alongside the distance UDFs so every session
+    // that runs vector queries has access to it without a separate registration.
+    ctx.register_udf(ScalarUDF::from(VectorDimsUdf {
+        signature: Signature::any(1, Volatility::Immutable),
+    }));
+    // pgvector catalog function: vector_norm(vec) → float8
+    // Returns the L2 norm (Euclidean length) of a vector.
+    ctx.register_udf(ScalarUDF::from(VectorNormUdf {
+        signature: Signature::any(1, Volatility::Immutable),
+    }));
+    // Internal UDF: vector_to_text(vec) → text.
+    // Used by the `::text` cast rewriter to render vector columns as their
+    // pgvector bracket-notation string representation.
+    ctx.register_udf(ScalarUDF::from(VectorToTextUdf {
+        signature: Signature::any(1, Volatility::Immutable),
+    }));
 }
 
 /// Register the UUID + pgcrypto-shaped UDFs on `ctx`. Idempotent. Surface:
@@ -499,6 +517,186 @@ impl<'a> VectorView<'a> {
     }
 }
 
+// ─── Phase 5.26.B/C pgvector catalog UDFs ────────────────────────────────────
+
+/// `vector_dims(vec) → int4` — pgvector catalog function that returns the
+/// number of dimensions in a vector column.  Accepts `FixedSizeList<Float32>`
+/// (the native storage form) or a `'[…]'`-quoted string literal.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct VectorDimsUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for VectorDimsUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "vector_dims"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Int32)
+    }
+    #[allow(deprecated)]
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
+        if args.len() != 1 {
+            return exec_err!("vector_dims expects 1 argument, got {}", args.len());
+        }
+        let num_rows = match &args[0] {
+            ColumnarValue::Array(arr) => arr.len(),
+            ColumnarValue::Scalar(_) => 1,
+        };
+        let arr = args[0].clone().into_array(num_rows)?;
+        let mut out = Int32Builder::new();
+        match arr.data_type() {
+            DataType::FixedSizeList(_, n) => {
+                let dim = *n;
+                for i in 0..num_rows {
+                    if arr.is_null(i) {
+                        out.append_null();
+                    } else {
+                        out.append_value(dim);
+                    }
+                }
+            }
+            DataType::Utf8 => {
+                let sarr = arr
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| DataFusionError::Execution("vector_dims: not Utf8".into()))?;
+                for i in 0..num_rows {
+                    if sarr.is_null(i) {
+                        out.append_null();
+                    } else {
+                        let s = sarr.value(i);
+                        let v = parse_vector_literal(s)
+                            .map_err(|e| DataFusionError::Execution(format!("{e}")))?;
+                        out.append_value(v.len() as i32);
+                    }
+                }
+            }
+            other => {
+                return exec_err!("vector_dims: unsupported input type {other:?}");
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+/// `vector_norm(vec) → float8` — pgvector function that returns the L2 norm
+/// (Euclidean length) of a vector column.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct VectorNormUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for VectorNormUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "vector_norm"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Float64)
+    }
+    #[allow(deprecated)]
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
+        if args.len() != 1 {
+            return exec_err!("vector_norm expects 1 argument, got {}", args.len());
+        }
+        let num_rows = match &args[0] {
+            ColumnarValue::Array(arr) => arr.len(),
+            ColumnarValue::Scalar(_) => 1,
+        };
+        let arr = args[0].clone().into_array(num_rows)?;
+        let view = VectorView::from_array(&arr, "vector_norm", "arg")?;
+        let mut out = Float64Array::builder(num_rows);
+        for i in 0..num_rows {
+            match view.row(i)? {
+                None => out.append_null(),
+                Some(v) => {
+                    let norm: f64 = v.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+                    out.append_value(norm);
+                }
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+/// `vector_to_text(vec) → text` — convert a vector column to its pgvector
+/// bracket-notation text representation.  Used internally to satisfy
+/// `embedding::text` casts in WHERE predicates (the `::text` suffix is
+/// rewritten to this UDF call by the `rewrite_vector_to_text` pass in
+/// `pg_operators`).
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct VectorToTextUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for VectorToTextUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "vector_to_text"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+    #[allow(deprecated)]
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
+        if args.len() != 1 {
+            return exec_err!("vector_to_text expects 1 argument, got {}", args.len());
+        }
+        let num_rows = match &args[0] {
+            ColumnarValue::Array(arr) => arr.len(),
+            ColumnarValue::Scalar(_) => 1,
+        };
+        let arr = args[0].clone().into_array(num_rows)?;
+        match arr.data_type() {
+            DataType::FixedSizeList(_, _) => {
+                let view = VectorView::from_array(&arr, "vector_to_text", "arg")?;
+                let mut out: Vec<Option<String>> = Vec::with_capacity(num_rows);
+                for i in 0..num_rows {
+                    match view.row(i)? {
+                        None => out.push(None),
+                        Some(v) => {
+                            // pgvector bracket notation: [0.1000,0.2000,0.3000]
+                            // 4 decimal places matches the pgvector default output format.
+                            let components: Vec<String> =
+                                v.iter().map(|&x| format!("{x:.4}")).collect();
+                            out.push(Some(format!("[{}]", components.join(","))));
+                        }
+                    }
+                }
+                Ok(ColumnarValue::Array(Arc::new(StringArray::from(out))))
+            }
+            DataType::Utf8 => {
+                // Passthrough for non-vector text columns (e.g. when `::text`
+                // appears on a column that happens to contain a string literal).
+                Ok(ColumnarValue::Array(arr))
+            }
+            other => exec_err!("vector_to_text: unsupported input type {other:?}"),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// Pre-DataFusion SQL rewriter for the three `pg_vector` operator forms.
 ///
 /// `a <-> b`  ->  `l2_distance(a, b)`
@@ -646,12 +844,49 @@ fn extract_left_operand(s: &str, end: usize) -> (usize, usize) {
             i = j;
         }
     } else if last == b'\'' {
-        // Walk back to matching unescaped quote.
+        // Walk back to matching unescaped single-quote.
         i -= 1;
         while i > 0 {
             i -= 1;
             if bytes[i] == b'\'' {
                 break;
+            }
+        }
+    } else if last == b'"' {
+        // Double-quoted identifier: walk back to the opening `"`.
+        i -= 1;
+        while i > 0 {
+            i -= 1;
+            if bytes[i] == b'"' {
+                break;
+            }
+        }
+        // After capturing the column's double-quoted name, check for a
+        // table-qualifier prefix: `"TableName"."col"` or `tablename."col"`.
+        // If the byte immediately before the opening `"` is `.`, also consume
+        // the qualifier so the full expression (e.g. `"VectorItem"."embedding"`)
+        // is the LHS, not just `"embedding"` with `"VectorItem".` dangling.
+        if i > 0 && bytes[i - 1] == b'.' {
+            i -= 1; // consume the `.`
+            if i > 0 && bytes[i - 1] == b'"' {
+                // Qualifier is double-quoted: walk back to its opening `"`.
+                i -= 1;
+                while i > 0 {
+                    i -= 1;
+                    if bytes[i] == b'"' {
+                        break;
+                    }
+                }
+            } else {
+                // Qualifier is unquoted: walk back over alphanumeric/_/.
+                while i > 0 {
+                    let c = bytes[i - 1];
+                    if c.is_ascii_alphanumeric() || c == b'_' {
+                        i -= 1;
+                    } else {
+                        break;
+                    }
+                }
             }
         }
     } else {
@@ -693,6 +928,15 @@ fn extract_right_operand(s: &str, start: usize) -> (usize, usize) {
     } else if first == b'\'' {
         i += 1;
         while i < bytes.len() && bytes[i] != b'\'' {
+            i += 1;
+        }
+        if i < bytes.len() {
+            i += 1; // include closing quote
+        }
+    } else if first == b'"' {
+        // Double-quoted identifier.
+        i += 1;
+        while i < bytes.len() && bytes[i] != b'"' {
             i += 1;
         }
         if i < bytes.len() {

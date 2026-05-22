@@ -29,6 +29,7 @@ use crate::AuthContext;
 use basin_catalog::{DataFileRef, PartitionSpec, SnapshotId, TableFileFormat};
 use basin_common::{BasinError, ProjectId, Result, TableName};
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use datafusion::common::TableReference;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::listing::{
@@ -1220,7 +1221,13 @@ pub(crate) async fn refresh_table(
 
     // Drop any stale registration before re-registering. `deregister_table`
     // returns Ok(None) for the first-time path, which is exactly what we want.
-    let _ = ctx.deregister_table(table.as_str());
+    //
+    // Phase 5.26.F: Use `TableReference::Bare` to preserve the catalog key case
+    // (e.g. "VectorItem" stays "VectorItem", not "vectoritem"). DataFusion's
+    // `From<&str>` impl lowercases unquoted identifiers via `parse_str`, so we
+    // bypass that path by constructing the reference directly.
+    let tref = || TableReference::Bare { table: table.as_str().into() };
+    let _ = ctx.deregister_table(tref());
 
     // Catalog-driven read path: enumerate exactly the files that are live at
     // `current_snapshot`. This is the fix for bug #41: a directory-URL
@@ -1238,7 +1245,7 @@ pub(crate) async fn refresh_table(
         // MemTable requires at least one partition; supply an empty one.
         let provider = MemTable::try_new(df_schema, vec![vec![]])
             .map_err(|e| BasinError::internal(format!("MemTable empty {table}: {e}")))?;
-        ctx.register_table(table.as_str(), Arc::new(provider))
+        ctx.register_table(tref(), Arc::new(provider))
             .map_err(|e| BasinError::internal(format!("register_table {table}: {e}")))?;
     } else {
         // Build per-file listing URLs. Each `DataFileRef::path` is a full
@@ -1267,7 +1274,7 @@ pub(crate) async fn refresh_table(
             .with_schema(df_schema);
         let provider = ListingTable::try_new(cfg)
             .map_err(|e| BasinError::internal(format!("ListingTable::try_new {table}: {e}")))?;
-        ctx.register_table(table.as_str(), Arc::new(provider))
+        ctx.register_table(tref(), Arc::new(provider))
             .map_err(|e| BasinError::internal(format!("register_table {table}: {e}")))?;
     }
 
@@ -1308,7 +1315,8 @@ pub(crate) async fn refresh_table_with_extra(
 
     let meta = engine.config().catalog.load_table(project, table).await?;
     let df_schema = Arc::new(schema_ws_to_df(meta.schema.as_ref())?);
-    let _ = ctx.deregister_table(table.as_str());
+    let tref = || TableReference::Bare { table: table.as_str().into() };
+    let _ = ctx.deregister_table(tref());
 
     // Combine catalog live files + pending (in-tx) files.
     let mut all_files: Vec<DataFileRef> = meta.live_data_files();
@@ -1333,7 +1341,7 @@ pub(crate) async fn refresh_table_with_extra(
         .with_schema(df_schema);
     let provider = ListingTable::try_new(cfg)
         .map_err(|e| BasinError::internal(format!("ListingTable::try_new {table}: {e}")))?;
-    ctx.register_table(table.as_str(), Arc::new(provider))
+    ctx.register_table(tref(), Arc::new(provider))
         .map_err(|e| BasinError::internal(format!("register_table {table}: {e}")))?;
 
     state
@@ -1380,7 +1388,8 @@ pub(crate) async fn refresh_table_with_htap(
 
     let meta = engine.config().catalog.load_table(project, table).await?;
     let df_schema = Arc::new(schema_ws_to_df(meta.schema.as_ref())?);
-    let _ = ctx.deregister_table(table.as_str());
+    let tref = || TableReference::Bare { table: table.as_str().into() };
+    let _ = ctx.deregister_table(tref());
 
     // Combine catalog live files + pending (in-tx) files.
     let mut all_files: Vec<DataFileRef> = meta.live_data_files();
@@ -1393,7 +1402,7 @@ pub(crate) async fn refresh_table_with_htap(
 
     if all_files.is_empty() {
         // Only in-memory rows, no Parquet files: use the MemTable alone.
-        ctx.register_table(table.as_str(), Arc::new(htap_provider))
+        ctx.register_table(tref(), Arc::new(htap_provider))
             .map_err(|e| BasinError::internal(format!("register_table htap-only {table}: {e}")))?;
     } else {
         // Build the cold-tier ListingTable and union it with the MemTable via a
@@ -1421,7 +1430,7 @@ pub(crate) async fn refresh_table_with_htap(
         );
         let union_provider =
             HtapUnionTable::new(listing_provider, Arc::new(htap_provider), df_schema);
-        ctx.register_table(table.as_str(), Arc::new(union_provider))
+        ctx.register_table(tref(), Arc::new(union_provider))
             .map_err(|e| BasinError::internal(format!("register_table htap-union {table}: {e}")))?;
     }
 
@@ -1625,8 +1634,9 @@ async fn register_pruned_listing_table(
     let provider = ListingTable::try_new(cfg)
         .map_err(|e| BasinError::internal(format!("ListingTable::try_new (pruned): {e}")))?;
 
-    let _ = ctx.deregister_table(table.as_str());
-    ctx.register_table(table.as_str(), Arc::new(provider))
+    let tref = TableReference::Bare { table: table.as_str().into() };
+    let _ = ctx.deregister_table(tref.clone());
+    ctx.register_table(tref, Arc::new(provider))
         .map_err(|e| BasinError::internal(format!("register_table pruned: {e}")))?;
     Ok(())
 }
