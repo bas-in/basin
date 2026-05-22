@@ -1583,7 +1583,7 @@ integration harness lands first.
       `<<`, `>>`, `-|-`, `+`, `*`, `-`. Files:
       `crates/basin-engine/src/operators/range.rs` (new).
       Acceptance: operator-semantics slice of 5.24.A flips green.
-- [~] **5.24.D — GIST-equivalent index** (~1 week). True GIST is
+- [x] **5.24.D — GIST-equivalent index** (~1 week). True GIST is
       a deep build; ship a simpler alternative: pre-sort + interval-
       tree-style probe on a B-tree-of-(lower, upper) for the common
       overlap / contains query shapes. Falls back to full scan for

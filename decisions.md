@@ -1023,3 +1023,24 @@ prune). Cloud sibling: `f248133` T-158 (hickory-resolver DNS in backend-rs).
 
 Index-scan-wiring trilogy: JSONB-GIN ✅ (85d156a), tsvector-GIN ✅ (21d8a6e),
 interval/range (5.24.D) remains — same template.
+
+---
+
+## 2026-05-22 — Interval/GIST index wiring (5.24.D) DONE; index-scan-wiring trilogy complete
+
+`2592a6e` — completed the partial in-tree interval-wiring (populate IntervalRegistry
+on range-column inserts, `detect_range_index_probe` for `@>`/`&&`/`<@`,
+`apply_gist_pruning_for_query` with the same completeness guard). Root fix: `index_row`
+parsed only JSON range form; Basin stores PG-text `[lo,hi)` — added dual-parse (matches
+`range_udf::parse_range`), so the tree was being populated. **GIST perf slice
+un-ignored and GREEN at 28× speedup** (50k rows / 100 files / 1-in-100 point probe) —
+the FIRST perf gate to pass, because the range harness uses high-selectivity data.
+range_types_harness 5/5 (only 5.24.F exclusion-constraint still ignored); jsonb 2/2,
+fts 5/5, noop 42/42, smoke green — no regression.
+
+**Trilogy complete:** JSONB-GIN (85d156a), tsvector-GIN (21d8a6e), interval/GIST
+(2592a6e) — all three index types populate-on-write, probe-at-query, and prune the
+DataFusion scan, each gated by `indexed_files ⊇ live_files` (else full-scan fallback,
+correctness-safe). JSONB/tsvector perf gates remain ignored only due to adversarial
+test-fixture data shape (low selectivity + posting eviction), NOT a wiring defect —
+test-tuning follow-up.
