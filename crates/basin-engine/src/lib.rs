@@ -874,6 +874,8 @@ pub(crate) mod hypertable_provider;
 /// Phase 5.22.B/C — pg_dump-compatible plain + custom binary dump.
 pub mod dump;
 pub(crate) mod operators;
+/// Phase 5.30.C/E — schema-aware citext logical-plan rewrite.
+mod citext_analyzer;
 mod any_all_rewrite;
 mod approx_count_distinct;
 mod approx_percentile;

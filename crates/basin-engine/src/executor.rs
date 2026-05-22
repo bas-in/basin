@@ -1705,7 +1705,40 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                     // DataFusion path whenever a txn is open; a missed fast
                     // path is merely slower, a wrong answer is not acceptable.
                     let in_txn = crate::session::tx_is_active(&sess.state);
-                    if !is_view && !has_rls && !has_soft_delete && !in_txn {
+                    // Phase 5.30.C/E: citext column check.
+                    // The fast path uses byte-exact string comparison in
+                    // `batch_matches_predicates` and a byte-lexicographic sort
+                    // in the ORDER BY path; neither honours the case-insensitive
+                    // citext contract.  Route through DataFusion (which applies
+                    // CitextAnalyzerRule) whenever a WHERE predicate column or
+                    // an ORDER BY column is marked BASIN_TYPE=CITEXT.
+                    let schema_field_is_citext = |col_name: &str| -> bool {
+                        meta.schema
+                            .field_with_name(col_name)
+                            .ok()
+                            .map(|f| {
+                                f.metadata()
+                                    .get(crate::types::BASIN_TYPE_KEY)
+                                    .map(|v| v.as_str() == crate::types::BASIN_TYPE_CITEXT)
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false)
+                    };
+                    let has_citext_predicate = plan.predicates.iter().any(|pred| {
+                        schema_field_is_citext(pred.column())
+                    });
+                    let has_citext_order_by = plan
+                        .order_by
+                        .as_ref()
+                        .map(|(col, _)| schema_field_is_citext(col.as_str()))
+                        .unwrap_or(false);
+                    if !is_view
+                        && !has_rls
+                        && !has_soft_delete
+                        && !in_txn
+                        && !has_citext_predicate
+                        && !has_citext_order_by
+                    {
                         return execute_simple_select(sess, plan, table_meta).await;
                     }
                 }

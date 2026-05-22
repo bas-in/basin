@@ -1021,6 +1021,14 @@ pub(crate) async fn open(
         .with_physical_optimizer_rule(std::sync::Arc::new(
             crate::catalog_window_exec::CatalogWindowExecSortElision::new(),
         ))
+        // Phase 5.30.C/E: schema-aware citext logical-plan rewrite.
+        // Runs after TypeCoercion (all schemas resolved) and rewrites
+        // binary comparisons / sort exprs on BASIN_TYPE=CITEXT columns
+        // to use lower()-folded operands so plain SQL `WHERE col = 'Foo'`
+        // and `ORDER BY col` are automatically case-insensitive.
+        .with_analyzer_rule(std::sync::Arc::new(
+            crate::citext_analyzer::CitextAnalyzerRule,
+        ))
         .build();
     let ctx = SessionContext::new_with_state(state);
     let url = Url::parse(BASIN_URL_BASE)

@@ -4852,41 +4852,168 @@ pub(crate) fn rewrite_uuid_cast(sql: &str) -> String {
 // citext cast rewriter
 // ---------------------------------------------------------------------------
 
-/// Rewrite `::citext` casts to `::TEXT` so DataFusion's type system accepts
-/// them.  citext is stored as plain Utf8/TEXT at the Arrow level; the only
-/// distinction is in the BASIN_TYPE field metadata and the citext_* UDF
-/// comparisons.  A literal `'Foo'::citext` must evaluate as `'Foo'` (a
-/// plain string), which `::TEXT` achieves without changing semantics.
+/// Rewrite `::citext` casts in SQL text before DataFusion sees them.
+///
+/// citext is stored as plain Utf8/TEXT at the Arrow level; the BASIN_TYPE
+/// field metadata is what marks a column as citext.  Two cases arise:
+///
+/// 1. **String-literal cast** — `'Foo'::citext`:  The `CitextAnalyzerRule`
+///    cannot help here because there is no column reference to inspect.
+///    We emit `lower('Foo')` so that comparisons like
+///    `'ABC'::citext = 'abc'::citext` resolve to `lower('ABC') = lower('abc')`
+///    which is `true`.
+///
+/// 2. **Column or sub-expression cast** — `col::citext`:  Any citext column
+///    is already handled by the `CitextAnalyzerRule` which wraps both sides
+///    of the comparison in `lower()`.  Here we just strip the cast to `::TEXT`
+///    so DataFusion's type system does not complain.
 pub(crate) fn rewrite_citext_cast(sql: &str) -> String {
     // Fast-path: skip if "citext" is absent.
     if !sql.to_ascii_lowercase().contains("citext") {
         return sql.to_string();
     }
-    let lower = sql.to_ascii_lowercase();
-    let mut out = sql.to_string();
+    let lower_sql = sql.to_ascii_lowercase();
     let needle = "::citext";
-    let mut positions: Vec<usize> = Vec::new();
+    let bytes = sql.as_bytes();
+
+    // Collect (position, is_string_literal_lhs) for each `::citext` occurrence.
+    struct Occurrence {
+        pos: usize,        // byte offset of `::`
+        lit_start: usize,  // byte offset of the opening `'` (0 if not a literal)
+        is_literal: bool,
+    }
+    let mut occurrences: Vec<Occurrence> = Vec::new();
     let mut start = 0usize;
-    while let Some(pos) = lower[start..].find(needle) {
-        let abs = start + pos;
+    while let Some(rel) = lower_sql[start..].find(needle) {
+        let abs = start + rel;
         let end_pos = abs + needle.len();
-        // Only replace if the character after `::citext` is NOT alphanumeric
-        // or `_` (so `::citextarray` is not mangled).
-        let next_is_ident = out
-            .as_bytes()
+        // Skip if followed by an ident char (e.g. `::citextarray`).
+        let next_is_ident = bytes
             .get(end_pos)
             .map(|&c| c.is_ascii_alphanumeric() || c == b'_')
             .unwrap_or(false);
         if !next_is_ident {
-            positions.push(abs);
+            // Scan backward from `abs` to determine if the LHS is a single-
+            // quoted string literal: skip any trailing whitespace then check
+            // for a closing `'` that is not an escaped `''`.
+            let lhs = &sql[..abs];
+            let trimmed = lhs.trim_end();
+            if trimmed.ends_with('\'') {
+                // Find the matching opening quote.  Walk backward, counting
+                // pairs of `''` (escaped quotes within the literal).
+                let t_bytes = trimmed.as_bytes();
+                let close_pos = trimmed.len() - 1; // position of the closing `'`
+                let mut i = close_pos.saturating_sub(1);
+                let mut found_open = false;
+                loop {
+                    if t_bytes[i] == b'\'' {
+                        // Two consecutive `'` inside a literal — skip one.
+                        if i > 0 && t_bytes[i - 1] == b'\'' {
+                            if i >= 2 { i -= 2; } else { break; }
+                        } else {
+                            // This is the opening quote.
+                            found_open = true;
+                            break;
+                        }
+                    } else if i == 0 {
+                        break;
+                    } else {
+                        i -= 1;
+                    }
+                }
+                if found_open {
+                    occurrences.push(Occurrence {
+                        pos: abs,
+                        lit_start: i, // offset of `'` in `trimmed`
+                        is_literal: true,
+                    });
+                } else {
+                    occurrences.push(Occurrence { pos: abs, lit_start: 0, is_literal: false });
+                }
+            } else {
+                occurrences.push(Occurrence { pos: abs, lit_start: 0, is_literal: false });
+            }
         }
         start = abs + needle.len();
     }
-    // Replace right-to-left so byte offsets stay valid.
-    for pos in positions.into_iter().rev() {
-        out.replace_range(pos..pos + needle.len(), "::TEXT");
+
+    if occurrences.is_empty() {
+        return sql.to_string();
+    }
+
+    // Apply replacements right-to-left to keep earlier byte offsets valid.
+    let mut out = sql.to_string();
+    for occ in occurrences.into_iter().rev() {
+        if occ.is_literal {
+            // Replace `'literal'::citext` with `lower('literal')`.
+            // `occ.lit_start` is an offset into the trimmed LHS; we need the
+            // corresponding byte offset in `out`.  The trimmed prefix of the
+            // LHS is `sql[..occ.pos].trim_end()`, which has length equal to
+            // the length of `trimmed` when we computed `occ.lit_start`.  But
+            // since we are working right-to-left on `out` the prefix
+            // `out[..occ.pos]` still matches `sql[..occ.pos]` at this point.
+            let lhs_trimmed = out[..occ.pos].trim_end();
+            let open_in_lhs = occ.lit_start; // offset within lhs_trimmed
+            // Absolute byte position of the opening quote in `out`.
+            let open_abs = open_in_lhs; // lhs_trimmed is a prefix of out
+            let end_of_cast = occ.pos + needle.len(); // byte after `::citext`
+            let literal = &out[open_abs..lhs_trimmed.len()]; // e.g. `'Foo'`
+            let replacement = format!("lower({literal})");
+            out.replace_range(open_abs..end_of_cast, &replacement);
+        } else {
+            // Non-literal: just strip `::citext` → `::TEXT`.
+            out.replace_range(occ.pos..occ.pos + needle.len(), "::TEXT");
+        }
     }
     out
+}
+
+#[cfg(test)]
+mod citext_cast_tests {
+    use super::rewrite_citext_cast;
+
+    #[test]
+    fn string_literal_cast_becomes_lower() {
+        let sql = "SELECT 'ABC'::citext = 'abc'::citext";
+        let rewritten = rewrite_citext_cast(sql);
+        assert!(
+            rewritten.contains("lower("),
+            "expected lower() wrapping; got: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("::citext"),
+            "::citext should be gone; got: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn column_cast_becomes_text() {
+        let sql = "SELECT email::citext FROM users";
+        let rewritten = rewrite_citext_cast(sql);
+        assert!(
+            rewritten.contains("::TEXT"),
+            "column cast should become ::TEXT; got: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("::citext"),
+            "::citext should be gone; got: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn no_citext_unchanged() {
+        let sql = "SELECT name FROM users WHERE name = 'Alice'";
+        let rewritten = rewrite_citext_cast(sql);
+        assert_eq!(sql, rewritten);
+    }
+
+    #[test]
+    fn citextarray_not_mangled() {
+        let sql = "SELECT col::citextarray FROM t";
+        let rewritten = rewrite_citext_cast(sql);
+        // `::citextarray` is not `::citext` and should remain untouched.
+        assert!(rewritten.contains("::citextarray"), "got: {rewritten}");
+    }
 }
 
 // Bit-string literal rewriter
