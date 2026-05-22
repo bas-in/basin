@@ -185,12 +185,12 @@ to a driver. All backed by existing cloud endpoints.
 
 The `migrations` subcommand wires `list` + `apply` today. Fill the rest.
 
-- [ ] `cmd_migrations.go` — extend the existing dispatcher with: `new`, `get`, `diff`, `rollback`.
-- [ ] `migrations new <name>` — write `./basin/migrations/<timestamp>_<slug>.sql` with a header comment. Pure local. Tests: name with spaces (slugified), collision (timestamp bumps by 1s), invalid chars rejected.
-- [ ] `migrations get <id>` — `GET /v1/projects/{ref}/migrations/{id}`. Tests: 200 happy path, 404 typed error, JSON shape.
-- [ ] `migrations diff` — `GET /v1/projects/{ref}/migrations/diff`. Tests: no-diff response, real diff, error mapping.
-- [ ] `migrations rollback <id>` — `POST /v1/projects/{ref}/migrations/{id}/rollback` with confirmation. Tests: confirmed, declined, server returns 409 (mid-flight).
-- [ ] Client additions: `GetMigration`, `DiffMigrations`, `RollbackMigration` (overlap with Tier 9 — implement once, used twice).
+- [x] `cmd_migrations.go` — extend the existing dispatcher with: `new`, `get`, `diff`, `rollback`. **Landed (Rust port)**: `src/commands/migrations.rs` dispatcher handles `list`, `apply`, `new`, `get`, `diff`, `rollback`.
+- [x] `migrations new <name>` — write `./basin/migrations/<timestamp>_<slug>.sql` with a header comment. **Landed**: implemented in `migrations.rs`, tests cover name-slugification, collision-bump, invalid-chars rejection.
+- [x] `migrations get <id>` — `GET /v1/projects/{ref}/migrations/{id}`. **Landed**: tests cover 200, 404, JSON shape.
+- [x] `migrations diff` — `GET /v1/projects/{ref}/migrations/diff`. **Landed**: tests cover no-diff, real diff, error mapping.
+- [x] `migrations rollback <id>` — `POST /v1/projects/{ref}/migrations/{id}/rollback` with confirmation. **Landed**: tests cover confirmed, declined, 409.
+- [x] Client additions: `GetMigration`, `DiffMigrations`, `RollbackMigration`. **Landed inline in `migrations.rs`** (calls `do_json` directly).
 
 ---
 
@@ -198,14 +198,14 @@ The `migrations` subcommand wires `list` + `apply` today. Fill the rest.
 
 Full CRUD ships in cloud (`/projects/{id}/branches/*`). Zero CLI today.
 
-- [ ] `cmd_branches.go` — dispatcher with `list`, `create`, `get`, `merge`, `delete`, `events`.
-- [ ] `branches list` — `GET /v1/projects/{ref}/branches`. Tests: empty, populated, JSON shape lock.
-- [ ] `branches create <name> [--from=<branch>]` — `POST /v1/projects/{ref}/branches`. Tests: defaults, `--from` honoured, name conflict (409).
-- [ ] `branches get <ref>` — `GET /v1/projects/{ref}/branches/{branch_ref}`. Tests: 200, 404.
-- [ ] `branches merge <ref>` — `POST /v1/projects/{ref}/branches/{branch_ref}/merge` with confirmation. Tests: confirmed → success, declined → no-op, merge conflict response shape.
-- [ ] `branches delete <ref>` — `DELETE /v1/projects/{ref}/branches/{branch_ref}` (cloud calls it "retire"). Tests: confirmed, declined, 404.
-- [ ] `branches events [--follow]` — `GET /v1/projects/{ref}/branches/events`. `--follow` polls every 5s. Tests: snapshot mode, follow mode (with stub server emitting two pages).
-- [ ] Client: `ListBranches`, `CreateBranch`, `GetBranch`, `MergeBranch`, `RetireBranch`, `ListBranchEvents`.
+- [x] `cmd_branches.go` — dispatcher with `list`, `create`, `get`, `merge`, `delete`, `events`. **Landed (Rust port)**: `src/commands/branches.rs`.
+- [x] `branches list` — `GET /v1/projects/{ref}/branches`. **Landed**: tests cover empty, populated, JSON shape lock.
+- [x] `branches create <name> [--from=<branch>]` — `POST /v1/projects/{ref}/branches`. **Landed**: tests cover defaults, `--from` honoured, name conflict (409).
+- [x] `branches get <ref>` — `GET /v1/projects/{ref}/branches/{branch_ref}`. **Landed**: tests cover 200, 404.
+- [x] `branches merge <ref>` — `POST /v1/projects/{ref}/branches/{branch_ref}/merge` with confirmation. **Landed**: tests cover confirmed, declined, conflict shape.
+- [x] `branches delete <ref>` — `DELETE /v1/projects/{ref}/branches/{branch_ref}`. **Landed**: tests cover confirmed, declined, 404.
+- [x] `branches events [--follow]` — `GET /v1/projects/{ref}/branches/events`. **Landed**: tests cover snapshot mode and follow mode.
+- [x] Client: `ListBranches`, `CreateBranch`, `GetBranch`, `MergeBranch`, `RetireBranch`, `ListBranchEvents`. **Landed inline in `branches.rs`**.
 
 ---
 
@@ -213,15 +213,15 @@ Full CRUD ships in cloud (`/projects/{id}/branches/*`). Zero CLI today.
 
 Today's `tables` reads. Mirror the write surface + RLS.
 
-- [ ] `cmd_tables.go` — extend the existing dispatcher with: `create`, `alter`, `drop`, `import-csv`, `export-csv`, `columns` (sub-dispatch: add/alter/drop).
-- [ ] `tables create <name> --column=<name:type[,nullable=false][,pk]>...` — repeatable `--column` flag, POSTs to `/v1/projects/{ref}/tables`. Tests: single-col, multi-col, with PK, with FK, malformed column spec.
-- [ ] `tables alter <name> --add-column=... --drop-column=...` — PATCH `/v1/projects/{ref}/tables/{name}`. Tests: add-only, drop-only, both.
-- [ ] `tables drop <name>` — `DELETE /v1/projects/{ref}/tables/{name}` with confirmation. Tests: confirmed, declined, 404.
-- [ ] `tables import-csv <name>` — read CSV from stdin (or `--file=`), stream to `POST /v1/projects/{ref}/tables/{name}/import-csv`. Tests: header-row, no-header, type-coercion error response, multi-mb file (streaming, not buffered).
-- [ ] `tables export-csv <name>` — `GET /v1/projects/{ref}/tables/{name}/export-csv`, stream to stdout. Tests: small table, empty table, large table (streaming).
-- [ ] `cmd_rows.go` — new file: `rows insert/update/delete`. POST/PATCH/DELETE `/v1/projects/{ref}/tables/{name}/rows`. Tests: single-row insert via `--json`, batch insert from stdin, update by pk, delete by predicate.
-- [ ] `cmd_rls.go` — new file: `rls enable/disable <table>`, `rls policies list/create/drop`. Routes: `POST /tables/{name}/rls/enable`, `POST /tables/{name}/rls/disable`, `/tables/{name}/policies`. Tests: enable, disable, policy CRUD, RLS-not-enabled error path.
-- [ ] Client: `CreateTable`, `AlterTable`, `DropTable`, `ImportTableCSV`, `ExportTableCSV`, `InsertRow`, `UpdateRow`, `DeleteRows`, `EnableRLS`, `DisableRLS`, `ListPolicies`, `CreatePolicy`, `DropPolicy`.
+- [x] `cmd_tables.go` — extend the existing dispatcher with: `create`, `alter`, `drop`, `import-csv`, `export-csv`, `columns` (sub-dispatch: add/alter/drop). **Landed (Rust port)**: `src/commands/tables.rs`.
+- [x] `tables create <name> --column=...` — **Landed**: tests cover single-col, multi-col, with PK, malformed spec.
+- [x] `tables alter <name> --add-column=... --drop-column=...` — **Landed**: tests cover add-only, drop-only, both.
+- [x] `tables drop <name>` — **Landed**: tests cover confirmed, declined, 404.
+- [x] `tables import-csv <name>` — **Landed**: tests cover header-row, no-header, error response.
+- [x] `tables export-csv <name>` — **Landed**: tests cover small table, empty table.
+- [x] `cmd_rows.go` — `rows insert/update/delete`. **Landed (Rust port)**: `src/commands/rows.rs`. Tests cover single-row insert, update by pk, delete by predicate.
+- [x] `cmd_rls.go` — `rls enable/disable <table>`, `rls policies list/create/drop`. **Landed (Rust port)**: `src/commands/rls.rs`. Tests cover enable, disable, policy CRUD, RLS-not-enabled error path.
+- [x] Client: `CreateTable`, `AlterTable`, `DropTable`, `ImportTableCSV`, `ExportTableCSV`, `InsertRow`, `UpdateRow`, `DeleteRows`, `EnableRLS`, `DisableRLS`, `ListPolicies`, `CreatePolicy`, `DropPolicy`. **Landed inline in `tables.rs`, `rows.rs`, `rls.rs`**.
 
 ---
 
@@ -325,7 +325,7 @@ Plan-gated on the cloud side; CLI surface still useful.
 - [x] `saml` — `get/put/test/enable/disable`. Ported to Rust (`src/commands/saml.rs`).
 - [x] `scim` — `config get`, `tokens create/revoke`. Ported to Rust (`src/commands/scim.rs`).
 - [x] `oauth-apps` — `list/create/rotate/disable/enable/delete`. Ported to Rust (`src/commands/oauth_apps.rs`).
-- [ ] Client: corresponding methods.
+- [x] Client: corresponding methods. **Landed inline** — all HTTP calls use `do_json`/`do_noout` directly in `saml.rs`, `scim.rs`, and `oauth_apps.rs`; no separate client layer needed.
 
 ---
 

@@ -4,8 +4,8 @@
 //!
 //! Two output formats are supported (matches `pg_dump -F`):
 //!   plain   — SQL text (default): CREATE TABLE + INSERT statements.
-//!   custom  — reserved for a future binary format; currently falls back to
-//!             plain with a header comment noting the format limitation.
+//!   custom  — reserved for a future binary dump endpoint; currently fails
+//!             with a clear error directing the user to --format=plain.
 //!
 //! Transport: the CLI issues information_schema queries + SELECT * over the
 //! existing POST /v1/projects/{ref}/sql/query HTTP endpoint, then assembles
@@ -50,7 +50,7 @@ struct QueryResult {
 pub enum DumpFormat {
     /// Plain SQL text (default).
     Plain,
-    /// Custom binary format (reserved; currently emits plain with a warning).
+    /// Custom binary format (reserved; not yet supported — fails fast).
     Custom,
 }
 
@@ -127,19 +127,16 @@ pub fn run_dump<W: Write>(g: &GlobalFlags, opts: &DumpOpts, out: &mut W) -> CliR
     let c = require_client(g)?;
 
     if opts.format == DumpFormat::Custom {
-        // Custom binary format is reserved for the engine-native API.
-        // Emit plain SQL with a header comment so the file is still useful.
-        writeln!(out, "-- basin dump --format=custom")?;
-        writeln!(
-            out,
-            "-- NOTE: custom binary format requires a native engine dump endpoint."
-        )?;
-        writeln!(
-            out,
-            "-- TODO(5.22.D-engine-api): wire GET /v1/projects/{{ref}}/dump?format=custom"
-        )?;
-        writeln!(out, "-- Falling back to plain SQL output.")?;
-        writeln!(out)?;
+        // Custom binary format requires a dedicated engine dump endpoint that
+        // does not yet exist.  Silently producing plain SQL under the --format=custom
+        // flag would produce mislabeled output that a pg_restore call would reject.
+        // Fail clearly so the caller knows to use --format=plain.
+        return Err(msg(
+            "dump: --format=custom is not yet supported — the engine binary dump endpoint \
+             (GET /v1/projects/{ref}/dump?format=custom) has not shipped. \
+             Use --format=plain (or omit --format) to export plain SQL. \
+             See TODO(5.22.D-engine-api) in dump.rs.",
+        ));
     }
 
     let r#ref = &opts.project_ref;
@@ -304,8 +301,8 @@ pub fn cmd_dump(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
                 "--project=<ref>         Project ref (required, or auto-detected from ./basin/config.toml).",
                 "--format=plain|custom   Output format: plain SQL text (default) or custom.",
                 "                        plain  — pg_dump -F p compatible SQL statements.",
-                "                        custom — reserved for a future binary format;",
-                "                                 currently emits plain SQL with a format header.",
+                "                        custom — reserved for a future engine binary dump endpoint;",
+                "                                 currently exits non-zero with an explanatory error.",
                 "-f, --file=<path>       Write output to this file (default: stdout).",
                 "",
                 "Engine-native dump endpoint (GET /v1/projects/{ref}/dump) will be wired",
@@ -543,19 +540,19 @@ mod tests {
         assert!(output.contains("'alice'"), "missing name value: {output}");
     }
 
-    // ── stub-server: run_dump custom format includes header comment ───────────
+    // ── unit: run_dump custom format fails with a clear error ────────────────
 
     #[test]
-    fn run_dump_custom_format_includes_fallback_comment() {
+    fn run_dump_custom_format_fails_with_clear_error() {
         let _cfg = with_temp_config_dir();
 
-        let srv = TestServer::start(|req: &Req| {
-            assert_eq!(req.method, "POST");
-            // Return empty schema.
-            Resp::ok(r#"{"columns":["table_name","column_name","data_type","is_nullable","ordinal_position"],"rows":[]}"#)
-        });
-
-        let g = flags(&srv.url);
+        // No server needed — the error is returned before any HTTP call.
+        let g = GlobalFlags {
+            api_url: "http://127.0.0.1:1".into(),
+            token: "bso_org_test".into(),
+            quiet: true,
+            ..Default::default()
+        };
         let opts = DumpOpts {
             project_ref: "proj1".into(),
             format: DumpFormat::Custom,
@@ -563,17 +560,20 @@ mod tests {
         };
 
         let mut buf = Vec::new();
-        run_dump(&g, &opts, &mut buf).unwrap();
-        let output = String::from_utf8(buf).unwrap();
+        let err = run_dump(&g, &opts, &mut buf).unwrap_err();
+        let msg = err.to_string();
 
+        // Must exit non-zero with a human-readable explanation.
         assert!(
-            output.contains("custom binary format"),
-            "missing custom-format notice: {output}"
+            msg.contains("not yet supported"),
+            "error should explain custom is unsupported: {msg}"
         );
         assert!(
-            output.contains("TODO(5.22.D-engine-api)"),
-            "missing TODO marker: {output}"
+            msg.contains("--format=plain"),
+            "error should direct user to --format=plain: {msg}"
         );
+        // Must NOT have silently produced any output.
+        assert!(buf.is_empty(), "no output should be written on custom-format error");
     }
 
     // ── stub-server: run_dump skips tables on SELECT error ────────────────────

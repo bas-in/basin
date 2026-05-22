@@ -16,19 +16,17 @@
 //!   basin functions logs <name> [--limit <n>]
 //!   basin functions delete <name>
 //!
-//! ## Routes (data-plane, base derived from `g.api_url`)
+//! ## Routes (cloud control-plane, project-ref-scoped)
 //!
-//!   POST   /rest/v1/functions/:name        deploy + register a component
-//!   GET    /rest/v1/functions              list functions
-//!   GET    /rest/v1/functions/:name/logs   tail invocation logs
-//!   DELETE /rest/v1/functions/:name        delete a function
+//!   POST   /v1/projects/:ref/functions            deploy + register a component
+//!   GET    /v1/projects/:ref/functions            list functions
+//!   GET    /v1/projects/:ref/functions/:name/logs tail invocation logs
+//!   DELETE /v1/projects/:ref/functions/:name      delete a function
 //!
-//! TODO(W2): reconcile the register/invoke mount with Phase 5.11.W2 —
-//! W2 mounts the *invoke* path at `ANY /fn/v1/:name`. The TASK.md W3 box
-//! does not pin the *register* route, so this uses the REST admin shape
-//! `POST /rest/v1/functions/:name` (mirrors the table-CRUD admin surface
-//! under `/rest/v1`). If W2 lands the register route under `/fn/v1`, flip
-//! `FN_BASE` below.
+//! Routes are verified against basin-cloud
+//! `backend-rs/src/handlers/project_functions.rs` (routes() fn, 2026-05-22).
+//! The W2 invoke path (`ANY /fn/v1/:name`) is a separate data-plane surface;
+//! `FN_BASE` here is the cloud control-plane surface.
 
 use clap::{Arg, ArgAction, Command};
 use reqwest::blocking::Client as HttpClient;
@@ -43,9 +41,9 @@ use crate::output::{print_json, Table};
 use super::help::help_for_command;
 use super::parse_or_silent;
 
-/// Base path for the functions admin surface. See the W2 reconciliation
-/// TODO in the module docs.
-const FN_BASE: &str = "/rest/v1/functions";
+/// Project-scoped base path for the functions control-plane surface.
+/// Callers interpolate the resolved project ref: `{FN_BASE_PREFIX}/{ref}/functions`.
+const FN_BASE_PREFIX: &str = "/v1/projects";
 
 // ── project resolution ─────────────────────────────────────────────────────────
 
@@ -273,7 +271,7 @@ fn functions_deploy(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         })?,
     };
     let project_flag = m.get_one::<String>("project").cloned().unwrap_or_default();
-    let _ = resolve_project_ref(&project_flag)?;
+    let project_ref = resolve_project_ref(&project_flag)?;
 
     // Compile TS/JS → Wasm component (the meat of W3).
     let toolchain = detect_toolchain()?;
@@ -296,7 +294,13 @@ fn functions_deploy(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         return Err(crate::error::silent());
     }
 
-    let url = format!("{}{}/{}", g.api_url.trim_end_matches('/'), FN_BASE, name);
+    let url = format!(
+        "{}{}/{}/functions/{}",
+        g.api_url.trim_end_matches('/'),
+        FN_BASE_PREFIX,
+        project_ref,
+        name
+    );
     let http = HttpClient::builder()
         .timeout(crate::client::DEFAULT_TIMEOUT)
         .build()?;
@@ -342,10 +346,11 @@ fn functions_list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     }
 
     let project_flag = m.get_one::<String>("project").cloned().unwrap_or_default();
-    let _ = resolve_project_ref(&project_flag)?;
+    let project_ref = resolve_project_ref(&project_flag)?;
 
     let c = require_client(g)?;
-    let raw: serde_json::Value = c.do_json(Method::GET, FN_BASE, None)?;
+    let path = format!("{}/{}/functions", FN_BASE_PREFIX, project_ref);
+    let raw: serde_json::Value = c.do_json(Method::GET, &path, None)?;
 
     if g.json {
         return print_json(&mut std::io::stdout(), &raw);
@@ -402,10 +407,10 @@ fn functions_logs(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         .transpose()?
         .unwrap_or(100);
     let project_flag = m.get_one::<String>("project").cloned().unwrap_or_default();
-    let _ = resolve_project_ref(&project_flag)?;
+    let project_ref = resolve_project_ref(&project_flag)?;
 
     let c = require_client(g)?;
-    let path = format!("{}/{}/logs?limit={}", FN_BASE, name, limit);
+    let path = format!("{}/{}/functions/{}/logs?limit={}", FN_BASE_PREFIX, project_ref, name, limit);
     let raw: serde_json::Value = c.do_json(Method::GET, &path, None)?;
 
     if g.json {
@@ -460,10 +465,10 @@ fn functions_delete(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         .cloned()
         .ok_or_else(|| msg("usage: basin functions delete <name>"))?;
     let project_flag = m.get_one::<String>("project").cloned().unwrap_or_default();
-    let _ = resolve_project_ref(&project_flag)?;
+    let project_ref = resolve_project_ref(&project_flag)?;
 
     let c = require_client(g)?;
-    let path = format!("{}/{}", FN_BASE, name);
+    let path = format!("{}/{}/functions/{}", FN_BASE_PREFIX, project_ref, name);
     let raw: serde_json::Value = c.do_json(Method::DELETE, &path, None)?;
 
     if g.json {
@@ -624,7 +629,8 @@ mod tests {
         let g = flags(&srv.url);
         let result = cmd_functions(&g, &["list".to_string(), "--project=p1".to_string()]);
         assert!(result.is_ok(), "list: {result:?}");
-        assert_eq!(*cap.lock().unwrap(), "/rest/v1/functions");
+        // Cloud route: GET /v1/projects/:ref/functions
+        assert_eq!(*cap.lock().unwrap(), "/v1/projects/p1/functions");
     }
 
     #[test]
@@ -681,7 +687,8 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_eq!(*cap.lock().unwrap(), "/rest/v1/functions/hello/logs?limit=50");
+        // Cloud route: GET /v1/projects/:ref/functions/:name/logs
+        assert_eq!(*cap.lock().unwrap(), "/v1/projects/p1/functions/hello/logs?limit=50");
     }
 
     #[test]
@@ -756,7 +763,8 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_eq!(*cap.lock().unwrap(), "/rest/v1/functions/hello");
+        // Cloud route: DELETE /v1/projects/:ref/functions/:name
+        assert_eq!(*cap.lock().unwrap(), "/v1/projects/p1/functions/hello");
     }
 
     #[test]

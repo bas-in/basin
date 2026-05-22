@@ -163,6 +163,35 @@ cosign verify-blob \
 A successful run prints `Verified OK`. Anything else — wrong issuer,
 mismatched tag, edited binary — fails closed.
 
+## Self-hosted OSS engine
+
+If you are running a bare `basin-server` (the open-source OSS engine at
+[`bas-in/basin`](https://github.com/bas-in/basin)) without basin-cloud,
+only a subset of `basin` commands will work:
+
+| Command group | Works against OSS `basin-server`? |
+|---|---|
+| `rpc` | Yes — calls `POST /rest/v1/rpc/:fn` directly on the engine |
+| `storage` | Yes — calls `GET/POST /storage/v1/*` directly on the engine |
+| `realtime` | Yes — calls `GET /realtime/v1/sse/:project/:table` on the engine |
+| Everything else | **No** — requires basin-cloud |
+
+Commands that require basin-cloud (not available against bare OSS):
+
+- `sql`, `db push/pull/diff/reset/url/dump/lint`
+- `migrations *`, `branches *`, `snapshots *`, `backups *`
+- `tables *`, `rows *`, `rls *`
+- `secrets *`
+- `login`, `logout`, `whoami`, `orgs *`, `projects *`
+- `tokens *`, `members *`, `domains *`, `webhooks *`, `alerts *`, `audit *`
+- `gen types`, `migrate-from-pg`, `dump`, `restore`
+
+These commands call `/v1/projects/:ref/*` control-plane routes that only
+basin-cloud exposes. Against a bare OSS engine they will return 404.
+
+**In short:** use `basin rpc`, `basin storage`, and `basin realtime` against
+a self-hosted engine. All other commands need basin-cloud.
+
 ## License
 
 Apache-2.0 — see [`LICENSE`](LICENSE).

@@ -418,28 +418,29 @@ pub fn list_tables_from_ddl(ddl: &str) -> Vec<String> {
     tables
 }
 
-// ── basin restore stub ────────────────────────────────────────────────────────
+// ── basin restore ─────────────────────────────────────────────────────────────
 
-/// basin_restore_sql sends `sql` to the Basin project via the SQL query API.
+/// basin_restore_sql sends `sql` to the Basin project via the real `restore`
+/// path (`run_restore` in `src/commands/restore.rs`).
 ///
-/// TODO(T27.1): when `basin restore` command exists (basin 5.22.D), shell
-/// out to it instead of using the SQL API.  Currently this calls
-/// POST /v1/projects/{ref}/sql/query with writes_enabled=true.
+/// This replaces the old TODO(T27.1) SQL-loop stub.  `run_restore` splits the
+/// SQL on statement boundaries and POSTs each statement to
+/// POST /v1/projects/{ref}/sql/query with writes_enabled=true, logging
+/// per-statement errors while continuing the rest of the dump — exactly the
+/// semantics we need here.
 pub fn basin_restore_sql(g: &GlobalFlags, project_ref: &str, sql: &str) -> CliResult<()> {
-    use crate::global::require_client;
-    use reqwest::Method;
+    use super::restore::{run_restore, RestoreOpts};
 
-    let c = require_client(g)?;
-    let body = json!({
-        "sql": sql,
-        "writes_enabled": true,
-    });
-    // Ignore the result shape — we only care about success/failure.
-    let _: serde_json::Value = c.do_json(
-        Method::POST,
-        &format!("/v1/projects/{project_ref}/sql/query"),
-        Some(body),
-    )?;
+    let opts = RestoreOpts {
+        project_ref: project_ref.to_string(),
+        file: String::new(),
+    };
+    let (total, errors) = run_restore(g, &opts, sql)?;
+    if errors > 0 {
+        return Err(msg(format!(
+            "basin_restore_sql: {total} statement(s), {errors} error(s) restoring to project {project_ref:?}"
+        )));
+    }
     Ok(())
 }
 
