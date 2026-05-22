@@ -320,7 +320,7 @@ variants); generated file imports + type-checks under mypy.
 
 ---
 
-### T-016 — `client.admin` namespace + projects client [ ]
+### T-016 — `client.admin` namespace + projects client [x]
 
 **Files:** `src/basin/admin/client.py`, `src/basin/admin/types.py`,
 `src/basin/admin/__init__.py`, `tests/test_admin.py`; wire `Client.admin`.
@@ -345,7 +345,7 @@ variants); generated file imports + type-checks under mypy.
 the engine `DELETE` path returns representation; remove any 501 guard. (Pairs
 basin-js T-027.)
 
-### T-021 — `client.functions.invoke()` → `POST /rest/v1/rpc/:fn` [ ]
+### T-021 — `client.functions.invoke()` → `POST /rest/v1/rpc/:fn` [x]
 **Files:** `src/basin/functions/client.py`, `__init__.py`, tests; wire
 `Client.functions`. Body = JSON object of named args; response = function
 result. (basin-js T-026.)
@@ -360,12 +360,12 @@ opens/returns for the caller); `GET /auth/v1/callback` completion helper.
 `/factors/:id/verify`, `/factors/:id/challenge`, `/factors/:id/challenge/
 verify`, `DELETE /factors/:id`. TOTP + WebAuthn. (basin-js T-021.)
 
-### T-024 — Storage: `upload` / `download` / `delete` [ ]
+### T-024 — Storage: `upload` / `download` / `delete` [x]
 **Files:** `src/basin/storage/client.py`, `__init__.py`, tests; wire
 `Client.storage`. `client.storage.from_(bucket).upload(path, data)` →
 `/storage/v1/object/:bucket/:path`. (basin-js T-022.)
 
-### T-025 — Storage: `list` / `remove` / `create_signed_url` [ ]
+### T-025 — Storage: `list` / `remove` / `create_signed_url` [x]
 **Files:** `src/basin/storage/client.py`, tests. `list` →
 `/storage/v1/object/list/:bucket`; `remove(paths)` → bulk `DELETE
 /storage/v1/object/:bucket` `{prefixes}`; `create_signed_url` →
@@ -375,22 +375,22 @@ verify`, `DELETE /factors/:id`. TOTP + WebAuthn. (basin-js T-021.)
 
 ## Phase 0.6 — Realtime
 
-### T-030 — SSE transport (single-table, read-only) [ ]
+### T-030 — SSE transport (single-table, read-only) [x]
 **Files:** `src/basin/realtime/sse.py`, tests. Stream
 `GET /realtime/v1/sse/:project/:table` over `httpx` streaming; parse SSE
 frames into events; 15s heartbeat tolerance; `Last-Event-Id` replay on
 reconnect. No extra dep. (basin-js T-025.)
 
-### T-031 — WebSocket multiplex transport [ ]
+### T-031 — WebSocket multiplex transport [x]
 **Files:** `src/basin/realtime/ws.py`, tests. `websockets` under `[realtime]`
 extra. JSON control plane: subscribe/unsubscribe (+`filter`), event/error
 frames, `seq` gap detection. (basin-js T-028.)
 
-### T-032 — Presence over WebSocket [ ]
+### T-032 — Presence over WebSocket [x]
 **Files:** `src/basin/realtime/presence.py`, tests. `presence_track`/`untrack`/
 `heartbeat`; `presence_state`/`presence_diff`. (basin-js T-029.)
 
-### T-033 — `channel()` API + SSE/WS routing + replay [ ]
+### T-033 — `channel()` API + SSE/WS routing + replay [x]
 **Files:** `src/basin/realtime/channel.py`, `__init__.py`, tests; wire
 `Client.channel(name)`. Routing rule identical to basin-js (single-table
 read-only → SSE; presence/multi-table/dynamic-filter → WS). (basin-js T-030.)

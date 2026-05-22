@@ -10,6 +10,7 @@ from .auth.client import AuthClient
 from .errors import BasinError
 from .functions.client import FunctionsClient
 from .postgrest.builder import QueryBuilder
+from .realtime.channel import RealtimeChannel, RealtimeClient
 from .storage.client import StorageClient
 
 T = TypeVar("T")
@@ -85,6 +86,11 @@ class Client:
             get_headers=self._current_headers,
         )
 
+        self.realtime = RealtimeClient(
+            url=self._base_url,
+            headers=self._current_headers(),
+        )
+
     # ── Public surface ─────────────────────────────────────────────────
 
     def from_(self, table: str) -> QueryBuilder[Any]:
@@ -96,6 +102,10 @@ class Client:
             get_headers=self._current_headers,
             http=self._http,
         )
+
+    def channel(self, topic: str) -> RealtimeChannel:
+        """Convenience shim: delegates to ``self.realtime.channel(topic)``."""
+        return self.realtime.channel(topic)
 
     async def _request(
         self,
