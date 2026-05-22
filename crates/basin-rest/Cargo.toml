@@ -6,12 +6,19 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+# Optional realtime co-mount: SSE + WS handlers on the REST port.
+# Enabled by basin-server's `realtime` feature so clients can reach
+# /realtime/v1/sse|ws on the same port as /rest/v1/*.
+realtime = ["dep:basin-realtime"]
+
 [dependencies]
 basin-common.workspace = true
 basin-engine.workspace = true
 basin-auth.workspace = true
 basin-catalog.workspace = true
 basin-blob.workspace = true
+basin-realtime = { workspace = true, optional = true }
 
 tokio.workspace = true
 futures.workspace = true

@@ -27,6 +27,13 @@ use tokio::sync::oneshot;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
+// Feature-gated realtime co-mount types. The `RealimeCoMount` struct holds
+// the ChannelRegistry + AuthService + optional replay rings needed to build
+// the SSE and WS sub-routers that are merged into the main axum app when the
+// `realtime` feature is on.
+#[cfg(feature = "realtime")]
+use basin_realtime::{ChannelRegistry, ReplayRingRegistry};
+
 use crate::errors::ApiError;
 use crate::routes::{
     admin as admin_routes, admin_functions as admin_fn_routes,
@@ -68,6 +75,22 @@ pub(crate) struct Inner {
     /// independently. Seeded from the JWT secret at startup; rotated via
     /// `POST /admin/v1/storage/signing-key/rotate`.
     pub(crate) blob_signing_secret: Arc<BlobSigningSecret>,
+    /// Feature 2: optional realtime co-mount (SSE + WS on the REST port).
+    /// When set, the SSE router is merged at `/realtime/v1/sse/:project/:table`
+    /// and the WS router at `/realtime/v1/ws/:project`.  Absent → those paths
+    /// return 404 (same behaviour as before this feature landed).
+    #[cfg(feature = "realtime")]
+    pub(crate) realtime: Option<RealtimeCoMount>,
+}
+
+/// Feature 2: data needed to build the realtime SSE + WS sub-routers that
+/// are merged into the REST app when the `realtime` Cargo feature is on.
+/// Constructed by [`RestService::attach_realtime`] and stored in [`Inner`].
+#[cfg(feature = "realtime")]
+pub struct RealtimeCoMount {
+    pub registry: ChannelRegistry,
+    pub auth: Arc<basin_auth::AuthService>,
+    pub replay_rings: Option<ReplayRingRegistry>,
 }
 
 /// Env var holding the Postgres connection string for the durable blob
@@ -148,6 +171,8 @@ impl Inner {
             slice_gate: None,
             function_registry: admin_fn_routes::FunctionRegistry::new(),
             blob_signing_secret,
+            #[cfg(feature = "realtime")]
+            realtime: None,
         }
     }
 
@@ -178,7 +203,35 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
     let cors = build_cors(&inner.cfg.cors_origins);
     let body_limit = DefaultBodyLimit::max(inner.cfg.max_body_bytes);
 
-    Router::new()
+    // Feature 2: build realtime sub-routers before consuming `inner`.
+    // Each sub-router has its own `State` type (SseState / WsState) that is
+    // independent of `Arc<Inner>`, so `Router::merge` works without any
+    // state-type gymnastics. The routers are built here (before `inner` is
+    // moved into `.with_state(inner)`) so we can borrow from `inner.realtime`.
+    #[cfg(feature = "realtime")]
+    let realtime_sse: Option<Router> = inner.realtime.as_ref().map(|rt| {
+        match &rt.replay_rings {
+            Some(rings) => basin_realtime::sse_router_with_rings(
+                rt.registry.clone(),
+                rt.auth.clone(),
+                rings.clone(),
+            ),
+            None => basin_realtime::sse_router(rt.registry.clone(), rt.auth.clone()),
+        }
+    });
+    #[cfg(feature = "realtime")]
+    let realtime_ws: Option<Router> = inner.realtime.as_ref().map(|rt| {
+        match &rt.replay_rings {
+            Some(rings) => basin_realtime::ws_router_with_rings(
+                rt.registry.clone(),
+                rt.auth.clone(),
+                rings.clone(),
+            ),
+            None => basin_realtime::ws_router(rt.registry.clone(), rt.auth.clone()),
+        }
+    });
+
+    let app = Router::new()
         .route("/rest/v1/_openapi.json", get(openapi_routes::openapi))
         .route("/rest/v1/rpc/:fn_name", post(rpc_routes::post_rpc))
         // Phase 5.11.W2: HTTP-handler function shape (ANY method).
@@ -266,6 +319,11 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
             "/admin/v1/projects/:project_id/byo-bucket",
             post(admin_routes::register_byo_bucket),
         )
+        // Feature 3 (5.22.D): pg_dump-compatible project export.
+        .route(
+            "/admin/v1/projects/:project_id/dump",
+            get(admin_routes::dump_project),
+        )
         // P2-1: blob signing-key rotation (admin-gated).
         .route(
             "/admin/v1/storage/signing-key/rotate",
@@ -293,6 +351,19 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
         .route(
             "/admin/v1/functions/:name/cpu-ms",
             get(admin_fn_routes::function_cpu_ms),
+        )
+        // Feature 4 (5.11.W): invocation log, version history, rollback.
+        .route(
+            "/admin/v1/functions/:name/invocations",
+            get(admin_fn_routes::function_invocations),
+        )
+        .route(
+            "/admin/v1/functions/:name/versions",
+            get(admin_fn_routes::function_versions),
+        )
+        .route(
+            "/admin/v1/functions/:name/rollback",
+            post(admin_fn_routes::function_rollback),
         )
         .route("/health", get(health))
         // --- Phase 5.17.B: object-storage HTTP surface (ADR 0021) -----------
@@ -354,7 +425,26 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
         .layer(body_limit)
         .layer(cors)
         .layer(TraceLayer::new_for_http())
-        .with_state(inner)
+        .with_state(inner);
+
+    // Feature 2: merge the realtime SSE + WS sub-routers (if configured).
+    // The sub-routers carry their own `State` (SseState / WsState) so they
+    // integrate cleanly via `Router::merge` — no `Arc<Inner>` threading needed.
+    #[cfg(feature = "realtime")]
+    let app = {
+        let app = if let Some(sse) = realtime_sse {
+            app.merge(sse)
+        } else {
+            app
+        };
+        if let Some(ws) = realtime_ws {
+            app.merge(ws)
+        } else {
+            app
+        }
+    };
+
+    app
 }
 
 async fn health() -> &'static str {

@@ -107,10 +107,18 @@ pub use routes::fn_handler::{
     NoopFunctionInvoker,
 };
 
+// Feature 2: realtime co-mount public surface.
+#[cfg(feature = "realtime")]
+pub use server::RealtimeCoMount;
+
 // #55: per-function log buffer + CPU counter. Public so FunctionInvoker
 // implementations (integration tests, W6 catalog-backed runtime) can call
 // `append_log` / `add_cpu_ms` after each invocation.
-pub use routes::admin_functions::{FunctionRegistry, LogEntry, LOG_BUFFER_CAP};
+// Feature 4: also re-export invocation log + version history types.
+pub use routes::admin_functions::{
+    FunctionRegistry, InvocationRecord, LogEntry, VersionRecord, INVOCATION_LOG_CAP,
+    LOG_BUFFER_CAP, VERSION_HISTORY_CAP,
+};
 
 /// REST server configuration.
 ///
@@ -216,6 +224,28 @@ impl RestService {
         &self,
     ) -> &basin_blob::store::BlobStore<std::sync::Arc<dyn basin_blob::store::BlobCatalog>> {
         &self.inner.blob_store
+    }
+
+    /// Feature 2: attach realtime SSE + WS handlers so clients can reach
+    /// `/realtime/v1/sse/:project/:table` and `/realtime/v1/ws/:project`
+    /// on the same REST port.
+    ///
+    /// Must be called **before** [`Self::run_until_bound`]. The returned
+    /// `&mut Self` allows chaining: `svc.attach_realtime(…).run_until_bound()`.
+    ///
+    /// When the `realtime` feature is not compiled in, this method is absent
+    /// and callers behind `#[cfg(feature = "realtime")]` compile cleanly.
+    #[cfg(feature = "realtime")]
+    pub fn attach_realtime(&mut self, mount: RealtimeCoMount) -> &mut Self {
+        // `Inner` is behind `Arc`; we need to replace it with a clone that has
+        // the realtime field set.  The `Arc::make_mut` would work if `Inner`
+        // were `Clone`, but it's not worth adding that.  Instead we use
+        // `Arc::try_unwrap` / `get_mut` (guaranteed to succeed if we're the
+        // only holder at this point, which is always true pre-`run`).
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.realtime = Some(mount);
+        }
+        self
     }
 
     /// Return a clone of the in-process [`FunctionRegistry`].
