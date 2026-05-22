@@ -2813,6 +2813,18 @@ regression-test backfill in `tests/integration/tests/security.rs`.
 
 ---
 
+## Phase 6.SEC.P2 — P2 audit findings (closed)
+
+Real integration assertions landed `0f40541` in `tests/integration/tests/security.rs`
+(`cargo test --test security` → 41 passed, 0 ignored):
+- [x] **P2-1** signed-URL rotation — `BlobSigningSecret` rotate/verify primitive asserted; basin-rest rotation endpoint shipped (`b4d76db`, task #16).
+- [x] **P2-3** OAuth state-cache TTL — `OAuthStateCache::with_ttl` expiry + single-use asserted.
+- [x] **P2-4** server-side MIME sniff — `mime::sniff` overrides client Content-Type (PNG/HTML/JS/SVG).
+- [x] **P2-5** reserved-schema DDL — **superseded by 5.18.C**: engine rejects user DDL on all 5 reserved schemas (SQLSTATE 42501); stricter than the original "gate by is_admin".
+- [x] **P2-7** JWT issuance-floor — pre-rotation access+refresh tokens rejected; post-floor accepted.
+
+---
+
 ## Phase 6.X — Lease-based ownership + partition routing — ADR 0023 **(TOP PRIORITY)**
 
 The architectural commitment that fixes hot-project pinning AND multi-instance
