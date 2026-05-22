@@ -1970,9 +1970,8 @@ async fn mfa_unenroll_unauthenticated_401() {
     let _ = running.shutdown.send(());
 }
 
-/// Authenticated `GET /auth/v1/factors` → 200 with empty JSON array.
-/// This verifies that the route is accessible with a valid JWT and that the
-/// current "empty list" stub responds correctly.
+/// Authenticated `GET /auth/v1/factors` → 200 with empty JSON array for a
+/// fresh user who has not enrolled any factors yet.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mfa_list_authenticated_returns_empty_array() {
     let Some((running, _svc, auth, mailer, _g)) = try_serve().await else {
@@ -2005,6 +2004,78 @@ async fn mfa_list_authenticated_returns_empty_array() {
         0,
         "new user has no factors"
     );
+
+    let _ = running.shutdown.send(());
+}
+
+/// `GET /auth/v1/factors` after enrolling a TOTP factor returns that factor
+/// in the list with the correct metadata (never the secret).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mfa_list_returns_enrolled_factor() {
+    let Some((running, _svc, auth, mailer, _g)) = try_serve().await else {
+        return;
+    };
+    let addr = running.local_addr;
+    let project = ProjectId::new();
+    let tokens = make_user(&auth, &mailer, &project, "mfalist2@example.com").await;
+
+    // Enroll a TOTP factor via the HTTP route.
+    let enroll_body =
+        serde_json::json!({"factor_type": "totp", "friendly_name": "My App"}).to_string();
+    let enroll_r = http_request(
+        addr,
+        "POST",
+        "/auth/v1/factors",
+        &[
+            ("Authorization", &format!("Bearer {}", tokens.access_token)),
+            ("Content-Type", "application/json"),
+        ],
+        Some(enroll_body.as_bytes()),
+    )
+    .await;
+    assert_eq!(
+        enroll_r.status, 201,
+        "POST /auth/v1/factors must be 201; body: {}",
+        String::from_utf8_lossy(&enroll_r.body)
+    );
+    let enroll_json = enroll_r.json();
+    let factor_id = enroll_json["factor_id"]
+        .as_str()
+        .expect("factor_id in enroll response");
+
+    // List factors — should contain the newly enrolled (unverified) factor.
+    let list_r = http_request(
+        addr,
+        "GET",
+        "/auth/v1/factors",
+        &[("Authorization", &format!("Bearer {}", tokens.access_token))],
+        None,
+    )
+    .await;
+    assert_eq!(
+        list_r.status, 200,
+        "GET /auth/v1/factors must be 200; body: {}",
+        String::from_utf8_lossy(&list_r.body)
+    );
+    let list_body = list_r.json();
+    let factors = list_body.as_array().expect("list must be a JSON array");
+    assert_eq!(factors.len(), 1, "one factor enrolled");
+
+    let f = &factors[0];
+    assert_eq!(f["id"].as_str().unwrap(), factor_id, "factor id matches");
+    assert_eq!(f["factor_type"].as_str().unwrap(), "totp");
+    assert_eq!(
+        f["status"].as_str().unwrap(),
+        "unverified",
+        "newly enrolled factor is unverified"
+    );
+    assert_eq!(f["friendly_name"].as_str().unwrap(), "My App");
+    assert!(
+        f.get("secret_b32").is_none() && f.get("secret_enc").is_none(),
+        "secret must not be present in list response"
+    );
+    assert!(f["created_at"].as_str().is_some(), "created_at present");
+    assert!(f["updated_at"].as_str().is_some(), "updated_at present");
 
     let _ = running.shutdown.send(());
 }

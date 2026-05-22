@@ -77,8 +77,8 @@ pub use crate::config::{
 pub use crate::email::{Mailer, Outbound, SmtpMailer, StubMailer};
 pub use crate::jwt::{Aal, Claims};
 pub use crate::mfa::{
-    ChallengeVerifyResult, FactorStatus, FactorType, MfaChallengeRow, MfaFactorRow,
-    TotpEnrollment, WebAuthnEnrollment,
+    ChallengeVerifyResult, FactorDescriptor, FactorStatus, FactorType, MfaChallengeRow,
+    MfaFactorRow, TotpEnrollment, WebAuthnEnrollment,
 };
 
 /// True iff the DSN is a `postgres://` URL carrying `sslmode=disable`. In
@@ -773,6 +773,20 @@ impl AuthService {
         S: mfa::MfaStore,
     {
         mfa::has_verified_factor(&self.inner, mfa_store, project_id, user_id).await
+    }
+
+    /// List all MFA factors for a user within a project.
+    /// Returns public descriptors only — the secret/credential is never exposed.
+    pub async fn list_factors<S>(
+        &self,
+        mfa_store: Option<&S>,
+        project_id: &ProjectId,
+        user_id: UserId,
+    ) -> Result<Vec<mfa::FactorDescriptor>>
+    where
+        S: mfa::MfaStore,
+    {
+        mfa::list_factors(&self.inner, mfa_store, project_id, user_id).await
     }
 
     // --- test-utils: MFA cache access ---------------------------------------

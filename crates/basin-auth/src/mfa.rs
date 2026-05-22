@@ -800,6 +800,31 @@ pub fn verify_recovery_code(presented: &str, hash: &str) -> bool {
 // MFA service methods (called from AuthService)
 // ---------------------------------------------------------------------------
 
+/// Public descriptor for a factor returned by `list_factors`. Contains only
+/// the metadata fields — the secret/credential (`secret_enc`) is never exposed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FactorDescriptor {
+    pub id: Uuid,
+    pub factor_type: FactorType,
+    pub status: FactorStatus,
+    pub friendly_name: String,
+    pub created_at: chrono::DateTime<Utc>,
+    pub updated_at: chrono::DateTime<Utc>,
+}
+
+impl From<MfaFactorRow> for FactorDescriptor {
+    fn from(row: MfaFactorRow) -> Self {
+        Self {
+            id: row.id,
+            factor_type: row.factor_type,
+            status: row.status,
+            friendly_name: row.friendly_name,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
+}
+
 /// Enrollment result for a TOTP factor.
 #[derive(Debug)]
 pub struct TotpEnrollment {
@@ -1708,6 +1733,27 @@ where
         inner.mfa_cache.list_factors_sync(user_id, project_id)
     };
     Ok(factors.iter().any(|f| f.status == FactorStatus::Verified))
+}
+
+/// List all MFA factors for a user within a project. Returns public
+/// descriptors only — the secret/credential column is never included.
+#[instrument(skip(inner, mfa_store), fields(project = %project_id, user_id = %user_id))]
+pub async fn list_factors<S>(
+    inner: &Inner,
+    mfa_store: Option<&S>,
+    project_id: &ProjectId,
+    user_id: Uuid,
+) -> Result<Vec<FactorDescriptor>>
+where
+    S: MfaStore,
+{
+    let schema = &inner.cfg.catalog_schema;
+    let rows = if let Some(pg) = mfa_store {
+        pg.list_mfa_factors(schema, user_id, project_id).await?
+    } else {
+        inner.mfa_cache.list_factors_sync(user_id, project_id)
+    };
+    Ok(rows.into_iter().map(FactorDescriptor::from).collect())
 }
 
 // ---------------------------------------------------------------------------

@@ -597,22 +597,31 @@ pub(crate) async fn enroll_factor(
 ///
 /// Returns an array of factor descriptors (id, type, status, friendly_name,
 /// timestamps). The secret/credential is never included.
-///
-/// **Limitation:** `AuthService::list_factors` does not yet exist in
-/// `basin-auth`. This endpoint always returns an empty array until that method
-/// is added and wired here (tracked as future work). Enrollment + verification
-/// work correctly; this list surface is the only gap.
 #[axum::debug_handler]
 pub(crate) async fn list_factors(
     State(state): State<Arc<Inner>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let _claims = authorize(&state, &headers).await?;
-    // TODO(future): call AuthService::list_factors once it exists in basin-auth.
-    // Until then, return an empty array so the route is mounted and auth-gated
-    // correctly; clients that enumerate factors will get [] rather than a 404.
-    let _ = &state;
-    let body: Vec<serde_json::Value> = Vec::new();
+    let claims = authorize(&state, &headers).await?;
+    let factors = state
+        .cfg
+        .auth
+        .list_factors(None::<&PgStore>, &claims.project_id, claims.user_id)
+        .await
+        .map_err(ApiError::from)?;
+    let body: Vec<serde_json::Value> = factors
+        .into_iter()
+        .map(|f| {
+            json!({
+                "id": f.id.to_string(),
+                "factor_type": f.factor_type.to_string(),
+                "status": f.status.to_string(),
+                "friendly_name": f.friendly_name,
+                "created_at": f.created_at.to_rfc3339(),
+                "updated_at": f.updated_at.to_rfc3339(),
+            })
+        })
+        .collect();
     Ok(Json(body).into_response())
 }
 
