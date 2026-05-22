@@ -98,7 +98,10 @@ async fn row_count(sess: &basin_engine::ProjectSession, sql: &str) -> usize {
 /// Closes when: 5.19.C (containment) + 5.19.D (key/path probe) both land.
 /// At that point drop this `#[ignore]` and re-run `cargo test --test
 /// jsonb_index_harness` to confirm green.
-#[ignore = "5.19.A harness — engine GIN-equivalent pending; closes when 5.19.B/C/D/E land"]
+// 5.19.D closed: key/path operators (?|, ?&, ?, ->, ->>, #>, #>>) now correct.
+// 5.19.E closed: GIN posting-list maintenance on UPDATE/DELETE (index_maint.rs).
+// jsonb_orm_compat remains ignored (ALTER TABLE ADD COLUMN JSONB metadata — 5.19.B scope).
+// jsonb_index_perf_gate remains ignored (advisory-only probe, physical-scan not wired — deferred).
 #[tokio::test]
 async fn jsonb_diff_1m_row_seed() {
     // Slice: "differential 1M-row seed" (capped to 100k per soft-cap rule).
@@ -284,14 +287,16 @@ async fn jsonb_diff_1m_row_seed() {
     );
 
     // (e) All-key existence ?& — rows with BOTH "id" AND "tag"
-    // Families 0, 1, 2, 4, 5 have "id" and "tag" (family 3 is empty).
+    // Family 3 (empty) has neither "id" nor "tag".
+    // Family 5 (unicode) has "tag" but NOT "id" (its id-like key is "中文键").
+    // Only families 0, 1, 2, 4 have BOTH "id" AND "tag".
     let has_all_keys = row_count(
         &sess,
         "SELECT id FROM jsonb_diff WHERE payload ?& array['id', 'tag']",
     )
     .await;
     let expected_all_keys = family_count(0) + family_count(1) + family_count(2)
-        + family_count(4) + family_count(5);
+        + family_count(4);
     println!("[5.19.A diff] ?& ['id','tag']: got={has_all_keys}, expected={expected_all_keys}");
     assert_eq!(
         has_all_keys, expected_all_keys,

@@ -384,6 +384,41 @@ use crate::lifecycle::AuditRecord;
 use crate::session::refresh_table;
 use crate::{ExecResult, ProjectSession};
 
+// ---------------------------------------------------------------------------
+// Phase 5.19.E — GIN posting-list maintenance trait impl
+// ---------------------------------------------------------------------------
+
+/// Implement the storage-layer `GinRegistry` trait for `GinIndexRegistry` so
+/// the `GinPostingListMaintainer` in `basin-storage` can drive maintenance
+/// without a compile-time dependency on `basin-engine` types.
+impl basin_storage::index::index_maint::GinRegistry
+    for crate::index_probe::GinIndexRegistry
+{
+    fn remove_file(
+        &self,
+        project: &basin_common::ProjectId,
+        table: &basin_common::TableName,
+        col: &str,
+        file_path: &str,
+    ) {
+        crate::index_probe::GinIndexRegistry::remove_file(self, project, table, col, file_path);
+    }
+
+    fn rebuild_file_entries(
+        &self,
+        project: &basin_common::ProjectId,
+        table: &basin_common::TableName,
+        col: &str,
+        opclass: &str,
+        batches: &[arrow_array::RecordBatch],
+        new_file_path: &str,
+    ) {
+        crate::index_probe::GinIndexRegistry::rebuild_file_entries(
+            self, project, table, col, opclass, batches, new_file_path,
+        );
+    }
+}
+
 pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result<ExecResult> {
     let table = single_table_from_delete(&delete)?;
     // Resolve any IN (SELECT …) subqueries in the WHERE clause to literal
@@ -682,6 +717,10 @@ pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result
     let events = build_events(sess, &table, ChangeOp::Delete, event_payloads);
     let mut removed_paths = replaced_paths.clone();
     removed_paths.extend(dropped_paths.iter().cloned());
+    // Phase 5.19.E: clone replacement batches for GIN posting-list maintenance
+    // BEFORE write_replacement consumes them. Arrow RecordBatch clones are
+    // cheap (data lives in Arc-backed buffers).
+    let gin_replacement_batches: Vec<RecordBatch> = replacement_batches.iter().cloned().collect();
     // Pre-commit before writing the replacement file so a rejecting
     // sink leaves no orphan parquet on disk.
     dispatch_pre_commit(&sess.engine, &events).await?;
@@ -691,10 +730,37 @@ pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result
         &table,
         meta.current_snapshot,
         removed_paths.clone(),
-        added_files,
+        added_files.clone(),
     )
     .await?;
     dispatch_post_commit(&sess.engine, events);
+
+    // Phase 5.19.E — GIN posting-list maintenance: remove dropped/replaced
+    // file entries and rebuild for any new replacement file.
+    {
+        use basin_storage::index::index_maint::GinPostingListMaintainer;
+        if let Some(maint) = GinPostingListMaintainer::new(
+            sess.engine.gin_index_registry().as_ref(),
+            &sess.project,
+            &table,
+            &meta,
+        ) {
+            // Files that were fully dropped (AllMatch delete).
+            for path in &dropped_paths {
+                maint.on_file_removed(path);
+            }
+            // Files that were rewritten (Mixed delete — kept rows written
+            // to a new file). added_files[0].path is the replacement.
+            if !replaced_paths.is_empty() {
+                if let Some(new_file) = added_files.first() {
+                    for old_path in &replaced_paths {
+                        maint.on_file_replaced(old_path, &new_file.path, &gin_replacement_batches);
+                    }
+                }
+            }
+        }
+    }
+
     delete_objects(sess, &table, schema.as_ref(), &removed_paths).await?;
     refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table).await?;
 
@@ -1155,6 +1221,9 @@ pub(crate) async fn exec_update(
         Vec::new()
     };
     let events = build_events(sess, &table, ChangeOp::Update, event_payloads);
+    // Phase 5.19.E: clone replacement batches for GIN posting-list maintenance
+    // BEFORE write_replacement consumes them.
+    let gin_replacement_batches: Vec<RecordBatch> = replacement_batches.iter().cloned().collect();
     // Pre-commit before writing the replacement file so a rejecting
     // sink leaves no orphan parquet on disk.
     dispatch_pre_commit(&sess.engine, &events).await?;
@@ -1164,10 +1233,30 @@ pub(crate) async fn exec_update(
         &table,
         meta.current_snapshot,
         replaced_paths.clone(),
-        added_files,
+        added_files.clone(),
     )
     .await?;
     dispatch_post_commit(&sess.engine, events);
+
+    // Phase 5.19.E — GIN posting-list maintenance for UPDATE.
+    // Every replaced file's old entries are purged; the new replacement
+    // file's entries are rebuilt from the post-SET batches.
+    {
+        use basin_storage::index::index_maint::GinPostingListMaintainer;
+        if let Some(maint) = GinPostingListMaintainer::new(
+            sess.engine.gin_index_registry().as_ref(),
+            &sess.project,
+            &table,
+            &meta,
+        ) {
+            if let Some(new_file) = added_files.first() {
+                for old_path in &replaced_paths {
+                    maint.on_file_replaced(old_path, &new_file.path, &gin_replacement_batches);
+                }
+            }
+        }
+    }
+
     delete_objects(sess, &table, schema.as_ref(), &replaced_paths).await?;
     refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table).await?;
 

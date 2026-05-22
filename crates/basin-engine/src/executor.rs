@@ -1747,6 +1747,39 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                 }
             }
 
+            // Phase 5.19.D — detect `SELECT … FROM t WHERE col ? 'key'` (or
+            // `?&` / `?|` variants) and probe the GIN posting list.
+            // Advisory-only: `Empty` short-circuits; anything else falls
+            // through to the DataFusion / UDF path for correctness.
+            if !crate::session::tx_is_active(&sess.state)
+                && (raw_sql.contains(" ? ") || raw_sql.contains(" ?'")
+                    || raw_sql.contains("?&") || raw_sql.contains("?|"))
+            {
+                if let Some(key_plan) = crate::index_probe::detect_gin_key_probe(
+                    raw_sql,
+                    &sess.project,
+                    &sess.engine.config().catalog,
+                )
+                .await
+                {
+                    let key_refs: Vec<&str> = key_plan.keys.iter().map(|s| s.as_str()).collect();
+                    let gin_result = sess.engine.gin_index_registry().probe_key_existence(
+                        &sess.project,
+                        &key_plan.table,
+                        &key_plan.col,
+                        &key_plan.opclass,
+                        &key_refs,
+                        key_plan.require_all,
+                    );
+                    if let crate::index_probe::ProbeResult::Empty = gin_result {
+                        // No files contain these keys — short-circuit with empty result.
+                        let schema = Arc::new(arrow_schema::Schema::empty());
+                        return Ok(ExecResult::Rows { schema, batches: vec![] });
+                    }
+                    // FileCandidates / NoIndex: fall through to DataFusion for correctness.
+                }
+            }
+
             exec_select(sess, sql, include_deleted).await
         }
         Statement::ShowTables { .. } => exec_show_tables(sess).await,

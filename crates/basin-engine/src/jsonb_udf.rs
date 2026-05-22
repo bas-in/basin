@@ -3398,15 +3398,14 @@ impl ScalarUDFImpl for JsonbHasAllKeysUdf {
                     continue;
                 }
             };
-            // keys arg: comma-separated string or JSON array
-            let keys_str = match extract_string(&keys_arr, i) {
-                Some(s) => s,
+            // keys arg: PG array literal string, comma-separated text, List, or LargeList.
+            let keys = match extract_key_list(&keys_arr, i) {
+                Some(k) => k,
                 None => {
                     out.push(None);
                     continue;
                 }
             };
-            let keys = parse_key_list(&keys_str);
             let found = match &doc {
                 Value::Object(map) => keys.iter().all(|k| map.contains_key(k.as_str())),
                 _ => false,
@@ -3459,14 +3458,14 @@ impl ScalarUDFImpl for JsonbHasAnyKeyUdf {
                     continue;
                 }
             };
-            let keys_str = match extract_string(&keys_arr, i) {
-                Some(s) => s,
+            // keys arg: PG array literal string, comma-separated text, List, or LargeList.
+            let keys = match extract_key_list(&keys_arr, i) {
+                Some(k) => k,
                 None => {
                     out.push(None);
                     continue;
                 }
             };
-            let keys = parse_key_list(&keys_str);
             let found = match &doc {
                 Value::Object(map) => keys.iter().any(|k| map.contains_key(k.as_str())),
                 _ => false,
@@ -3900,6 +3899,70 @@ fn extract_string(arr: &ArrayRef, i: usize) -> Option<String> {
         DataType::LargeBinary => {
             let a = arr.as_any().downcast_ref::<LargeBinaryArray>()?;
             String::from_utf8(a.value(i).to_vec()).ok()
+        }
+        _ => None,
+    }
+}
+
+/// Extract a list of key strings from a UDF argument array at row `i`.
+///
+/// Handles all three shapes that `?&` / `?|` RHS values can arrive as:
+/// * `Utf8`        — a single string in `{k1,k2}` PG-array-literal form or
+///                   plain comma-separated form; parsed by `parse_key_list`.
+/// * `LargeBinary` — same textual content, stored as raw bytes.
+/// * `List<Utf8>`  — a proper DataFusion / Arrow list array (produced when the
+///                   SQL uses `array['k1','k2']` or the rewriter emits a list
+///                   literal).
+/// * `LargeList<Utf8>` — same as List but with 64-bit offsets.
+///
+/// Returns `None` when the cell is null or the type is not recognised;
+/// the caller treats `None` as "unknown → NULL result".
+fn extract_key_list(arr: &ArrayRef, i: usize) -> Option<Vec<String>> {
+    if arr.is_null(i) {
+        return None;
+    }
+    match arr.data_type() {
+        DataType::Utf8 => {
+            let a = arr.as_any().downcast_ref::<StringArray>()?;
+            Some(parse_key_list(a.value(i)))
+        }
+        DataType::LargeUtf8 => {
+            use datafusion::arrow::array::LargeStringArray;
+            let a = arr.as_any().downcast_ref::<LargeStringArray>()?;
+            Some(parse_key_list(a.value(i)))
+        }
+        DataType::LargeBinary => {
+            let a = arr.as_any().downcast_ref::<LargeBinaryArray>()?;
+            let s = String::from_utf8(a.value(i).to_vec()).ok()?;
+            Some(parse_key_list(&s))
+        }
+        DataType::List(_) => {
+            use datafusion::arrow::array::ListArray;
+            let a = arr.as_any().downcast_ref::<ListArray>()?;
+            let values = a.value(i);
+            let sa = values.as_any().downcast_ref::<StringArray>();
+            match sa {
+                Some(sa) => Some(
+                    (0..sa.len())
+                        .filter_map(|j| if sa.is_null(j) { None } else { Some(sa.value(j).to_string()) })
+                        .collect(),
+                ),
+                None => Some(vec![]),
+            }
+        }
+        DataType::LargeList(_) => {
+            use datafusion::arrow::array::LargeListArray;
+            let a = arr.as_any().downcast_ref::<LargeListArray>()?;
+            let values = a.value(i);
+            let sa = values.as_any().downcast_ref::<StringArray>();
+            match sa {
+                Some(sa) => Some(
+                    (0..sa.len())
+                        .filter_map(|j| if sa.is_null(j) { None } else { Some(sa.value(j).to_string()) })
+                        .collect(),
+                ),
+                None => Some(vec![]),
+            }
         }
         _ => None,
     }

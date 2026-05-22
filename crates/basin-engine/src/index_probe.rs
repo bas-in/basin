@@ -389,6 +389,134 @@ impl GinIndexRegistry {
             list.remove_file(file_path);
         }
     }
+
+    /// Probe the posting list for a key-existence predicate (`?`, `?&`, `?|`).
+    ///
+    /// `keys` is the set of keys to check; `require_all` distinguishes
+    /// `?&` (all keys must be present — AND-merge) from `?|` (any key
+    /// suffices — OR-merge).  For `?` (single key) pass a one-element slice
+    /// with `require_all = true`.
+    ///
+    /// Only works for `jsonb_ops` opclass where key-presence terms are
+    /// stored as `"key:<k>"`.  For `jsonb_path_ops` this returns `NoIndex`
+    /// (the path-hash encoding does not preserve individual key names).
+    ///
+    /// Returns the same `ProbeResult` variants as [`probe_containment`].
+    pub fn probe_key_existence(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        col: &str,
+        opclass: &str,
+        keys: &[&str],
+        require_all: bool,
+    ) -> ProbeResult {
+        if opclass != "jsonb_ops" {
+            // jsonb_path_ops does not store plain key: terms.
+            return ProbeResult::NoIndex;
+        }
+        if keys.is_empty() {
+            return ProbeResult::NoIndex;
+        }
+
+        let arc = match self.get(project, table, col) {
+            Some(a) => a,
+            None => return ProbeResult::NoIndex,
+        };
+        let list = arc.lock().expect("TermPostingList lock poisoned");
+
+        if require_all {
+            // ?& / ? — all keys must be present: AND-merge posting lists.
+            let mut candidate_files: Option<HashSet<String>> = None;
+            for key in keys {
+                let term = format!("key:{key}");
+                match list.probe_term(&term) {
+                    None => {
+                        // Term not in index — unknown state; fall through to full scan.
+                        return ProbeResult::NoIndex;
+                    }
+                    Some(entries) => {
+                        let files: HashSet<String> =
+                            entries.iter().map(|e| e.file_path.clone()).collect();
+                        candidate_files = Some(match candidate_files {
+                            None => files,
+                            Some(prev) => prev.intersection(&files).cloned().collect(),
+                        });
+                    }
+                }
+            }
+            match candidate_files {
+                None => ProbeResult::NoIndex,
+                Some(files) if files.is_empty() => ProbeResult::Empty,
+                Some(files) => ProbeResult::FileCandidates(files),
+            }
+        } else {
+            // ?| — any key suffices: OR-merge posting lists (union).
+            let mut candidate_files: HashSet<String> = HashSet::new();
+            let mut all_unknown = true;
+            for key in keys {
+                let term = format!("key:{key}");
+                if let Some(entries) = list.probe_term(&term) {
+                    all_unknown = false;
+                    for e in entries {
+                        candidate_files.insert(e.file_path.clone());
+                    }
+                }
+                // If the term is unknown (None), we conservatively include all
+                // files later by returning NoIndex; track via all_unknown.
+            }
+            if all_unknown {
+                return ProbeResult::NoIndex;
+            }
+            if candidate_files.is_empty() {
+                ProbeResult::Empty
+            } else {
+                ProbeResult::FileCandidates(candidate_files)
+            }
+        }
+    }
+
+    /// Rebuild posting list entries for `file_path` in `(project, table, col)`
+    /// from a fresh batch of JSONB rows.  Called on the UPDATE/DELETE commit
+    /// path after a copy-on-write replacement file is written: the old file's
+    /// entries have already been removed via `remove_file`; this call adds the
+    /// replacement file's entries.
+    ///
+    /// Silently skips non-JSONB (non-LargeBinary) columns.
+    pub fn rebuild_file_entries(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        col: &str,
+        opclass: &str,
+        batches: &[arrow_array::RecordBatch],
+        new_file_path: &str,
+    ) {
+        use arrow_array::Array;
+        for batch in batches {
+            let Ok(col_idx) = batch.schema().index_of(col) else {
+                continue;
+            };
+            let col_arr = batch.column(col_idx);
+            if let Some(arr) = col_arr.as_any().downcast_ref::<arrow_array::LargeBinaryArray>() {
+                for row in 0..arr.len() {
+                    if arr.is_null(row) {
+                        continue;
+                    }
+                    self.index_row(
+                        project,
+                        table,
+                        col,
+                        opclass,
+                        arr.value(row),
+                        new_file_path,
+                        0,
+                        row as u64,
+                    );
+                }
+            }
+        }
+    }
 }
 
 impl Default for GinIndexRegistry {
@@ -539,6 +667,199 @@ pub async fn detect_gin_containment(
         opclass,
         projection,
     })
+}
+
+/// Phase 5.19.D — detected GIN key-existence probe plan.
+///
+/// Produced by [`detect_gin_key_probe`] when the SQL matches the shape
+/// `SELECT … FROM table WHERE col ? 'key'` (or the `?&` / `?|` variants)
+/// and the column has a GIN index with `jsonb_ops` opclass.
+#[derive(Debug)]
+pub struct GinKeyPlan {
+    /// The table to scan.
+    pub table: TableName,
+    /// The indexed JSONB column.
+    pub col: String,
+    /// Opclass from the catalog index declaration (`jsonb_ops` only).
+    pub opclass: String,
+    /// The keys to probe.
+    pub keys: Vec<String>,
+    /// `true` when ALL keys must exist (`?` single key, `?&` all-keys).
+    /// `false` when ANY key suffices (`?|`).
+    pub require_all: bool,
+}
+
+/// Phase 5.19.D — detect `SELECT … FROM table WHERE col ? 'key'` (and
+/// the `?&` / `?|` variants) for GIN key-existence probe acceleration.
+///
+/// The SQL arrives *before* the `rewrite_json_operators` pass that converts
+/// `?` → `jsonb_has_key(...)`, so the raw `?` operator is still present in
+/// the text. We sniff the raw SQL for `?` / `?&` / `?|` first, then parse
+/// the rewritten SQL (which DataFusion will process) to validate the shape.
+///
+/// Returns `None` for any query that doesn't fit the supported shape or
+/// when the column has no GIN index with `jsonb_ops`.
+pub async fn detect_gin_key_probe(
+    raw_sql: &str,
+    project: &ProjectId,
+    catalog: &Arc<dyn basin_catalog::Catalog>,
+) -> Option<GinKeyPlan> {
+    // Fast pre-check: must contain the ? family operators.
+    let has_any = raw_sql.contains("?|");
+    let has_all = raw_sql.contains("?&");
+    let has_key = raw_sql.contains(" ? ") || raw_sql.contains(" ?'");
+    if !has_any && !has_all && !has_key {
+        return None;
+    }
+
+    // Parse the raw SQL (before operator rewriting).
+    let dialect = sqlparser::dialect::PostgreSqlDialect {};
+    let stmts = sqlparser::parser::Parser::parse_sql(&dialect, raw_sql).ok()?;
+    if stmts.len() != 1 {
+        return None;
+    }
+    let query = match &stmts[0] {
+        sqlparser::ast::Statement::Query(q) => q.as_ref(),
+        _ => return None,
+    };
+    if query.with.is_some() {
+        return None;
+    }
+    let select = match query.body.as_ref() {
+        sqlparser::ast::SetExpr::Select(s) => s,
+        _ => return None,
+    };
+
+    // Single table, no joins.
+    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+        return None;
+    }
+    let table_name = match &select.from[0].relation {
+        sqlparser::ast::TableFactor::Table { name, alias: None, args: None, .. } => {
+            if name.0.len() != 1 {
+                return None;
+            }
+            use crate::pg_ast::ObjectNamePartExt;
+            name.0[0].id_val().clone()
+        }
+        _ => return None,
+    };
+    let table = TableName::new(table_name).ok()?;
+
+    // WHERE must be `col OP keys` where OP is one of `?`, `?&`, `?|`.
+    let (col_name, keys, require_all) = extract_key_probe_where(&select.selection)?;
+
+    // Projection: `*` or simple column list.
+    let _projection = extract_simple_projection(&select.projection)?;
+
+    // Catalog lookup: must have a GIN index on `col_name` with `jsonb_ops`.
+    let meta = catalog.load_table(project, &table).await.ok()?;
+    let gin_index = meta.indexes.iter().find(|idx| {
+        idx.access_method == "gin"
+            && idx.columns.len() == 1
+            && idx.columns[0] == col_name
+    })?;
+    let opclass = gin_index.opclass.clone().unwrap_or_else(|| "jsonb_ops".to_string());
+    // Key probes only accelerate jsonb_ops (which stores key: terms).
+    if opclass != "jsonb_ops" {
+        return None;
+    }
+
+    Some(GinKeyPlan { table, col: col_name, opclass, keys, require_all })
+}
+
+/// Extract `(col_name, keys, require_all)` from a WHERE clause containing
+/// `col ? 'key'`, `col ?& array['k1','k2']`, or `col ?| array['k1','k2']`.
+///
+/// sqlparser 0.52 parses `?` as a custom operator in PG dialect; we match the
+/// AST shapes that actually appear.
+fn extract_key_probe_where(
+    selection: &Option<sqlparser::ast::Expr>,
+) -> Option<(String, Vec<String>, bool)> {
+    use sqlparser::ast::{Array, Expr, Value, ValueWithSpan};
+    let expr = selection.as_ref()?;
+
+    // sqlparser represents `col ? 'key'` and `col ?& ...` / `col ?| ...` as
+    // `BinaryOp` nodes in PG dialect.
+    let (left, op, right) = match expr {
+        Expr::BinaryOp { left, op, right } => (left, op, right),
+        _ => return None,
+    };
+
+    // LHS must be a bare column name.
+    let col_name = match left.as_ref() {
+        Expr::Identifier(id) => id.value.clone(),
+        _ => return None,
+    };
+
+    let op_str = op.to_string();
+
+    // `?` — single key existence.
+    if op_str == "?" {
+        let key = extract_single_string_literal(right)?;
+        return Some((col_name, vec![key], true));
+    }
+
+    // `?&` — all keys.
+    if op_str == "?&" {
+        let keys = extract_key_array_literal(right)?;
+        return Some((col_name, keys, true));
+    }
+
+    // `?|` — any key.
+    if op_str == "?|" {
+        let keys = extract_key_array_literal(right)?;
+        return Some((col_name, keys, false));
+    }
+
+    None
+}
+
+/// Extract a single string literal from an Expr (for the `?` operator RHS).
+fn extract_single_string_literal(expr: &sqlparser::ast::Expr) -> Option<String> {
+    use sqlparser::ast::{Expr, Value, ValueWithSpan};
+    match expr {
+        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => Some(s.clone()),
+        Expr::Cast { expr: inner, .. } => extract_single_string_literal(inner),
+        _ => None,
+    }
+}
+
+/// Extract a list of string keys from a PG array literal or ARRAY constructor.
+///
+/// Handles:
+/// * `array['k1','k2']` — DataFusion/sqlparser Array constructor
+/// * `'{k1,k2}'` — PG text-array literal as a single-quoted string
+fn extract_key_array_literal(expr: &sqlparser::ast::Expr) -> Option<Vec<String>> {
+    use sqlparser::ast::{Expr, Value, ValueWithSpan};
+    match expr {
+        // `ARRAY['k1', 'k2']` or `array[...]`
+        Expr::Array(arr) => {
+            let mut keys = Vec::new();
+            for elem in &arr.elem {
+                if let Some(k) = extract_single_string_literal(elem) {
+                    keys.push(k);
+                }
+            }
+            if keys.is_empty() { None } else { Some(keys) }
+        }
+        // `'{k1,k2}'` — PG text-array literal as a quoted string.
+        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => {
+            let s = s.trim();
+            if s.starts_with('{') && s.ends_with('}') {
+                let keys: Vec<String> = s[1..s.len() - 1]
+                    .split(',')
+                    .map(|k| k.trim().trim_matches('"').to_string())
+                    .filter(|k| !k.is_empty())
+                    .collect();
+                if keys.is_empty() { None } else { Some(keys) }
+            } else {
+                None
+            }
+        }
+        Expr::Cast { expr: inner, .. } => extract_key_array_literal(inner),
+        _ => None,
+    }
 }
 
 /// Extract the JSON literal string from the RHS of a `@>` / `<@` expression.
@@ -715,5 +1036,174 @@ mod tests {
             matches!(result, ProbeResult::NoIndex | ProbeResult::Empty),
             "expected NoIndex or Empty after remove, got {result:?}"
         );
+    }
+
+    // ── Phase 5.19.D — key-existence probe tests ──────────────────────────────
+
+    #[test]
+    fn probe_key_existence_single_key_hit() {
+        let registry = GinIndexRegistry::new();
+        let project = ProjectId::new();
+        let table = TableName::new("t").unwrap();
+
+        // Index a doc that has the key "tag".
+        let doc = br#"{"tag":"nested","id":1}"#;
+        registry.index_row(&project, &table, "payload", "jsonb_ops", doc, "f1.parquet", 0, 0);
+
+        let result = registry.probe_key_existence(
+            &project, &table, "payload", "jsonb_ops", &["tag"], true,
+        );
+        match result {
+            ProbeResult::FileCandidates(files) => {
+                assert!(files.contains("f1.parquet"), "expected f1.parquet in {files:?}");
+            }
+            other => panic!("expected FileCandidates, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_key_existence_single_key_miss() {
+        let registry = GinIndexRegistry::new();
+        let project = ProjectId::new();
+        let table = TableName::new("t").unwrap();
+
+        // Index a doc that has "role" but NOT "tag".
+        let doc = br#"{"role":"admin"}"#;
+        registry.index_row(&project, &table, "payload", "jsonb_ops", doc, "f1.parquet", 0, 0);
+
+        let result = registry.probe_key_existence(
+            &project, &table, "payload", "jsonb_ops", &["tag"], true,
+        );
+        // "key:tag" not in index → NoIndex (conservative).
+        assert!(
+            matches!(result, ProbeResult::NoIndex | ProbeResult::Empty),
+            "expected NoIndex or Empty, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn probe_key_existence_all_keys_and_merge() {
+        let registry = GinIndexRegistry::new();
+        let project = ProjectId::new();
+        let table = TableName::new("t").unwrap();
+
+        // f1 has both "id" and "tag".
+        let doc1 = br#"{"id":1,"tag":"x"}"#;
+        registry.index_row(&project, &table, "payload", "jsonb_ops", doc1, "f1.parquet", 0, 0);
+
+        // f2 has only "id".
+        let doc2 = br#"{"id":2}"#;
+        registry.index_row(&project, &table, "payload", "jsonb_ops", doc2, "f2.parquet", 0, 0);
+
+        // ?& ["id","tag"] — f2 lacks "tag", should be excluded.
+        let result = registry.probe_key_existence(
+            &project, &table, "payload", "jsonb_ops", &["id", "tag"], true,
+        );
+        match result {
+            ProbeResult::FileCandidates(files) => {
+                assert!(files.contains("f1.parquet"), "f1 should match {files:?}");
+                assert!(!files.contains("f2.parquet"), "f2 should be excluded {files:?}");
+            }
+            ProbeResult::NoIndex => {
+                // Conservative fall-through is also acceptable.
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_key_existence_any_key_or_merge() {
+        let registry = GinIndexRegistry::new();
+        let project = ProjectId::new();
+        let table = TableName::new("t").unwrap();
+
+        // f1 has "nullable".
+        let doc1 = br#"{"nullable":null}"#;
+        registry.index_row(&project, &table, "payload", "jsonb_ops", doc1, "f1.parquet", 0, 0);
+
+        // f2 has "large".
+        let doc2 = br#"{"large":"x"}"#;
+        registry.index_row(&project, &table, "payload", "jsonb_ops", doc2, "f2.parquet", 0, 0);
+
+        // ?| ["nullable","large"] — both files should match.
+        let result = registry.probe_key_existence(
+            &project, &table, "payload", "jsonb_ops", &["nullable", "large"], false,
+        );
+        match result {
+            ProbeResult::FileCandidates(files) => {
+                assert!(files.contains("f1.parquet"), "f1 should match {files:?}");
+                assert!(files.contains("f2.parquet"), "f2 should match {files:?}");
+            }
+            ProbeResult::NoIndex => {
+                // Conservative fall-through is also acceptable.
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_key_existence_path_ops_returns_no_index() {
+        let registry = GinIndexRegistry::new();
+        let project = ProjectId::new();
+        let table = TableName::new("t").unwrap();
+
+        // Even if a doc is indexed, jsonb_path_ops doesn't support key probes.
+        let doc = br#"{"tag":"nested"}"#;
+        registry.index_row(&project, &table, "payload", "jsonb_path_ops", doc, "f1.parquet", 0, 0);
+
+        let result = registry.probe_key_existence(
+            &project, &table, "payload", "jsonb_path_ops", &["tag"], true,
+        );
+        assert!(matches!(result, ProbeResult::NoIndex), "path_ops key probe must return NoIndex");
+    }
+
+    // ── Phase 5.19.E — posting-list maintenance tests ────────────────────────
+
+    #[test]
+    fn rebuild_file_entries_repopulates_after_remove() {
+        use arrow_array::{LargeBinaryArray, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let registry = GinIndexRegistry::new();
+        let project = ProjectId::new();
+        let table = TableName::new("t").unwrap();
+
+        // Index a document in f1.
+        let doc = br#"{"tag":"v1"}"#;
+        registry.index_row(&project, &table, "payload", "jsonb_ops", doc, "f1.parquet", 0, 0);
+
+        // Remove f1 (simulating DELETE path).
+        registry.remove_file(&project, &table, "payload", "f1.parquet");
+
+        // Build a replacement batch for f2.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::LargeBinary,
+            true,
+        )]));
+        let new_doc = br#"{"tag":"v2"}"#;
+        let arr = LargeBinaryArray::from_iter_values([new_doc.as_ref()]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+
+        // Rebuild f2 entries.
+        registry.rebuild_file_entries(
+            &project, &table, "payload", "jsonb_ops", &[batch], "f2.parquet",
+        );
+
+        // Now probe for "tag": should find f2, not f1.
+        let result = registry.probe_key_existence(
+            &project, &table, "payload", "jsonb_ops", &["tag"], true,
+        );
+        match result {
+            ProbeResult::FileCandidates(files) => {
+                assert!(files.contains("f2.parquet"), "f2 should be in candidates: {files:?}");
+                assert!(!files.contains("f1.parquet"), "f1 should NOT be in candidates: {files:?}");
+            }
+            ProbeResult::NoIndex => {
+                // Conservative acceptable.
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

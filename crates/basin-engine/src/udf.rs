@@ -820,6 +820,14 @@ fn extract_left_operand(s: &str, end: usize) -> (usize, usize) {
                 _ => {}
             }
         }
+        // After matching the `(`, also consume any immediately-preceding
+        // function-name identifier (e.g. `json_get` in `json_get(a, b)`).
+        // Without this, a chained `json_get(a, b) -> c` would capture
+        // `(a, b)` as the LHS and leave `json_get` as a dangling prefix,
+        // producing `json_getjson_get(json_get(a, b), c)`.
+        while i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+            i -= 1;
+        }
     } else if last == b']' {
         let mut depth = 1i32;
         i -= 1;

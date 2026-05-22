@@ -2,4 +2,5 @@
 
 pub mod btree_citext;
 pub mod gin_tsvector;
+pub mod index_maint;
 pub mod interval;
