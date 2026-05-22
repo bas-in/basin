@@ -769,4 +769,76 @@ mod tests {
         let s = "(a, (b, c), d)rest";
         assert_eq!(skip_paren_block(s), Some("rest"));
     }
+
+    // ── validate_javascript_body ─────────────────────────────────────────────
+
+    /// Base64 of `\0asm` followed by a version/section byte — minimal Wasm
+    /// magic that satisfies the check. This is not a valid full component but
+    /// it passes the lightweight magic-number + non-empty decode check.
+    fn wasm_magic_b64() -> String {
+        use base64::Engine as Base64Engine;
+        // `\0asm` + one extra byte so the slice is long enough.
+        base64::engine::general_purpose::STANDARD.encode(b"\0asm\x01")
+    }
+
+    #[test]
+    fn validate_javascript_body_accepts_wasm_magic() {
+        validate_javascript_body("hello", &wasm_magic_b64()).unwrap();
+    }
+
+    #[test]
+    fn validate_javascript_body_rejects_non_base64() {
+        let err = validate_javascript_body("f", "not-valid-base64!!!").unwrap_err();
+        assert!(
+            matches!(err, BasinError::InvalidSchema(_)),
+            "expected InvalidSchema, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("base64"),
+            "error should mention base64, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_javascript_body_rejects_empty_decoded() {
+        use base64::Engine as Base64Engine;
+        let empty_b64 = base64::engine::general_purpose::STANDARD.encode(b"");
+        let err = validate_javascript_body("f", &empty_b64).unwrap_err();
+        assert!(
+            matches!(err, BasinError::InvalidSchema(_)),
+            "expected InvalidSchema, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("zero bytes"),
+            "error should mention zero bytes, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_javascript_body_rejects_wrong_magic() {
+        use base64::Engine as Base64Engine;
+        // Valid base64 but not Wasm: just ASCII text.
+        let bad_b64 = base64::engine::general_purpose::STANDARD
+            .encode(b"export default (req) => new Response('hi')");
+        let err = validate_javascript_body("f", &bad_b64).unwrap_err();
+        assert!(
+            matches!(err, BasinError::InvalidSchema(_)),
+            "expected InvalidSchema, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("magic bytes"),
+            "error should mention Wasm magic bytes, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_javascript_body_accepts_wasm_magic_with_whitespace() {
+        // The trim() in the implementation means leading/trailing whitespace
+        // in the body (as it arrives from a dollar-quoted string) is fine.
+        let b64 = format!("  {}  ", wasm_magic_b64());
+        validate_javascript_body("hello", &b64).unwrap();
+    }
 }
