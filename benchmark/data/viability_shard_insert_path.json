@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "inserts_per_sec",
-    "value": 2926.1088003564887,
+    "value": 2971.674371351573,
     "unit": "inserts/sec",
     "bar": {
       "op": "greater_than_or_equal",
@@ -14,9 +14,9 @@
     }
   },
   "details": {
-    "elapsed_ms": 341.75079200000005,
-    "ms_per_insert": 0.341750792,
+    "elapsed_ms": 336.510625,
+    "ms_per_insert": 0.336510625,
     "n_inserts": 1000
   },
-  "generated_at": "@1779422532"
+  "generated_at": "@1779435955"
 }
