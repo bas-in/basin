@@ -1816,6 +1816,34 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                 }
             }
 
+            // Phase 5.20.E — detect `SELECT … FROM t WHERE col @@ to_tsquery(…)`
+            // on a tsvector column with a GIN index and probe the FTS posting
+            // list.  Advisory-only: `Empty` short-circuits; anything else falls
+            // through to the DataFusion / UDF path for correctness.
+            if !crate::session::tx_is_active(&sess.state) && raw_sql.contains("@@") {
+                if let Some(fts_plan) = crate::index_probe::detect_tsvector_match(
+                    raw_sql,
+                    &sess.project,
+                    &sess.engine.config().catalog,
+                )
+                .await
+                {
+                    use basin_storage::index::gin_tsvector::TsvProbeResult;
+                    let fts_result = sess.engine.gin_fts_registry().probe_query(
+                        &sess.project,
+                        &fts_plan.table,
+                        &fts_plan.col,
+                        &fts_plan.tsquery_str,
+                    );
+                    if let TsvProbeResult::Empty = fts_result {
+                        // Posting list guarantees no rows match — short-circuit.
+                        let schema = Arc::new(arrow_schema::Schema::empty());
+                        return Ok(ExecResult::Rows { schema, batches: vec![] });
+                    }
+                    // FileCandidates / NoIndex: fall through to DataFusion for correctness.
+                }
+            }
+
             exec_select(sess, sql, include_deleted, Some(raw_sql)).await
         }
         Statement::ShowTables { .. } => exec_show_tables(sess).await,
@@ -2626,8 +2654,9 @@ async fn exec_create_index(
     // indexed column's `operator_class` field in the sqlparser AST.
     // sqlparser parses `(col jsonb_path_ops)` as an IndexColumn with
     // `operator_class = Some(ObjectName([Ident("jsonb_path_ops")]))`.
-    // We normalise to lowercase and validate: only `jsonb_ops` and
-    // `jsonb_path_ops` are accepted; unknown opclasses are rejected.
+    // We normalise to lowercase and validate: `jsonb_ops`, `jsonb_path_ops`,
+    // and `tsvector_ops` are accepted; for tsvector columns with no opclass
+    // specified we auto-detect and use `tsvector_ops`.
     let gin_opclass: Option<String> = if access_method_str == "gin" {
         // Extract the operator class from the first indexed column.
         // sqlparser 0.61 parses `(col jsonb_path_ops)` as an IndexColumn with
@@ -2644,12 +2673,41 @@ async fn exec_create_index(
                     .join(".")
             });
         match raw_opclass.as_deref() {
-            None | Some("jsonb_ops") => Some("jsonb_ops".to_string()),
+            // Phase 5.20.E: explicit tsvector_ops opclass.
+            Some("tsvector_ops") => Some("tsvector_ops".to_string()),
+            // No opclass specified — auto-detect based on column type.
+            None => {
+                // Check if the indexed column is a TSVECTOR column; if so,
+                // use tsvector_ops.  Otherwise default to jsonb_ops.
+                // `catalog_columns` has already been built above from the
+                // parsed column list — use its first element.
+                let col_name_opt = catalog_columns.first().cloned();
+                let is_tsvector_col = if let Some(ref col_name) = col_name_opt {
+                    // Look up the table metadata to check the column type.
+                    // We already verified the table exists above; if load fails just
+                    // fall back to jsonb_ops (safe).
+                    if let Ok(meta) = sess.engine.config().catalog.load_table(&sess.project, &table).await {
+                        meta.schema.fields().iter().any(|f| {
+                            f.name() == col_name && crate::types::field_is_tsvector(f)
+                        })
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if is_tsvector_col {
+                    Some("tsvector_ops".to_string())
+                } else {
+                    Some("jsonb_ops".to_string())
+                }
+            }
+            Some("jsonb_ops") => Some("jsonb_ops".to_string()),
             Some("jsonb_path_ops") => Some("jsonb_path_ops".to_string()),
             Some(other) => {
                 return Err(BasinError::InvalidSchema(format!(
                     "CREATE INDEX USING gin: unknown operator class {other:?}; \
-                     accepted: jsonb_ops (default), jsonb_path_ops"
+                     accepted: jsonb_ops (default), jsonb_path_ops, tsvector_ops"
                 )));
             }
         }
@@ -4929,13 +4987,24 @@ async fn exec_select(
         .await?;
     }
 
-    // Phase 5.19.C — GIN file-level pruning.
+    // Phase 5.19.C — GIN file-level pruning (JSONB @> / <@).
     // Use the original (pre-operator-rewrite) SQL so `@>` / `<@` operators
     // are still present in the text.  After `rewrite_json_operators` runs,
     // `@>` becomes `jsonb_contains(…)` and the detector would miss it.
     // On any parse/probe failure this is a silent no-op → full scan.
+    //
+    // Phase 5.20.E — GIN FTS file-level pruning (tsvector @@).
+    // Use the original SQL so `@@` is still present (before
+    // `rewrite_tsvector_at_at` converts it to `tsvector_match_udf(...)`).
     if let Some(orig_sql) = gin_original_sql {
         crate::session::apply_gin_pruning_for_query(
+            &sess.engine,
+            &sess.project,
+            &sess.ctx,
+            orig_sql,
+        )
+        .await?;
+        crate::session::apply_gin_fts_pruning_for_query(
             &sess.engine,
             &sess.project,
             &sess.ctx,
@@ -6804,10 +6873,17 @@ async fn maintain_secondary_indexes_on_insert(
         }
         let col_name = &idx.columns[0];
 
-        // Phase 5.19.C: populate GIN posting list for JSONB containment.
+        // Phase 5.19.C + 5.20.E: populate GIN posting list for JSONB / FTS.
         if idx.access_method == "gin" {
             let opclass = idx.opclass.as_deref().unwrap_or("jsonb_ops");
-            maintain_gin_index_on_insert(gin_registry, &sess.project, table, col_name, opclass, batch, file_path);
+            if opclass == "tsvector_ops" {
+                // Phase 5.20.E: tsvector GIN index — populate FTS posting list.
+                let fts_registry = sess.engine.gin_fts_registry();
+                maintain_gin_fts_index_on_insert(fts_registry, &sess.project, table, col_name, batch, file_path);
+            } else {
+                // Phase 5.19.C: JSONB GIN index — populate JSONB posting list.
+                maintain_gin_index_on_insert(gin_registry, &sess.project, table, col_name, opclass, batch, file_path);
+            }
             // GIN posting list is RAM-only (5.19.E handles persistence); skip
             // the flush call.  Continue to also populate the B-tree registry
             // (which is a no-op for LargeBinary columns — scalar_to_key returns
@@ -6863,6 +6939,41 @@ fn maintain_gin_index_on_insert(
         // We only mark it when the column was present and had a LargeBinary
         // array — i.e., a real JSONB column in this batch.
         gin_registry.mark_file_indexed(project, table, col_name, file_path);
+    }
+}
+
+/// Phase 5.20.E — Populate the GIN FTS posting list for a single tsvector
+/// column from a newly written `batch`.  Iterates every row in the batch,
+/// reads the canonical tsvector string, extracts lexemes, and inserts them
+/// into the FTS registry.
+///
+/// Only `Utf8` columns are handled (Basin stores tsvector as Utf8).
+/// Other column types are silently skipped — the index is best-effort.
+fn maintain_gin_fts_index_on_insert(
+    fts_registry: &Arc<basin_storage::index::gin_tsvector::GinTsvectorRegistry>,
+    project: &basin_common::ProjectId,
+    table: &basin_common::TableName,
+    col_name: &str,
+    batch: &arrow_array::RecordBatch,
+    file_path: &str,
+) {
+    use arrow_array::Array;
+    let Ok(col_idx) = batch.schema().index_of(col_name) else {
+        return;
+    };
+    let col = batch.column(col_idx);
+    // Basin stores tsvector as Utf8 (canonical lexeme text form).
+    if let Some(arr) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
+        for row in 0..arr.len() {
+            if arr.is_null(row) {
+                continue;
+            }
+            let tsv_str = arr.value(row);
+            fts_registry.index_row(project, table, col_name, tsv_str, file_path, 0, row as u64);
+        }
+        // Mark this file as fully indexed so the completeness guard in the
+        // probe path can safely prune to FileCandidates.
+        fts_registry.mark_file_indexed(project, table, col_name, file_path);
     }
 }
 

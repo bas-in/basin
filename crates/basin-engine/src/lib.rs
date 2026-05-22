@@ -187,6 +187,12 @@ pub(crate) struct EngineInner {
     /// with `CREATE INDEX … USING gin`.  Probed at query time to prune file
     /// candidates before the full `jsonb_contains` UDF re-evaluation.
     pub(crate) gin_index_registry: Arc<crate::index_probe::GinIndexRegistry>,
+    /// Phase 5.20.E: process-wide GIN posting-list registry for tsvector
+    /// columns.  One `LexemePostingList` per `(project, table, col)` populated
+    /// at INSERT time for tsvector columns with a GIN index.  Probed at query
+    /// time to prune file candidates before the full `@@` re-evaluation.
+    pub(crate) gin_fts_registry:
+        Arc<basin_storage::index::gin_tsvector::GinTsvectorRegistry>,
 
     /// Phase 5.28.C: process-wide idle-in-transaction session reaper registry.
     /// Sessions register themselves on open; the reaper background task sweeps
@@ -300,6 +306,9 @@ impl Engine {
             ),
             secondary_index_skipped: crate::secondary_index::IndexSkipCounter::new(),
             gin_index_registry: Arc::new(crate::index_probe::GinIndexRegistry::new()),
+            gin_fts_registry: Arc::new(
+                basin_storage::index::gin_tsvector::GinTsvectorRegistry::new(),
+            ),
             reaper_registry: crate::session_reaper::SessionReaperRegistry::new(),
             lock_registry: basin_shard::LockRegistry::new(),
             connection_registry: crate::connection_registry::ConnectionRegistry::new(),
@@ -561,6 +570,16 @@ impl Engine {
     /// Returns a reference to the shared `Arc`; cloning it is cheap.
     pub(crate) fn gin_index_registry(&self) -> &Arc<crate::index_probe::GinIndexRegistry> {
         &self.inner.gin_index_registry
+    }
+
+    // ── Phase 5.20.E: GIN FTS (tsvector) index ───────────────────────────────
+
+    /// Process-wide GIN posting list registry for tsvector FTS probes.
+    /// Returns a reference to the shared `Arc`; cloning it is cheap.
+    pub(crate) fn gin_fts_registry(
+        &self,
+    ) -> &Arc<basin_storage::index::gin_tsvector::GinTsvectorRegistry> {
+        &self.inner.gin_fts_registry
     }
 
     /// Bump the secondary-index file-skip counter by one. Called from

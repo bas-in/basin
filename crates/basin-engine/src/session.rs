@@ -1815,6 +1815,111 @@ pub(crate) async fn apply_gin_pruning_for_query(
     Ok(())
 }
 
+/// Phase 5.20.E — GIN FTS file-level pruning.
+///
+/// Mirrors [`apply_gin_pruning_for_query`] for the tsvector `@@` operator.
+/// After all tables have been refreshed, inspect `sql` (the *original*
+/// pre-rewrite SQL that still contains `@@`) for a tsvector FTS predicate on
+/// a column with a GIN `tsvector_ops` index.  When the FTS posting list
+/// returns `FileCandidates` AND the completeness guard passes (every live file
+/// is in the indexed-files set), replace the table's `ListingTable`
+/// registration with one scoped to the candidate files only.
+///
+/// Correctness contract:
+/// * `FileCandidates` is a conservative superset — no file containing a
+///   real match is ever excluded (the tsvector_match_udf re-evaluates on
+///   every candidate row).
+/// * Pruning only fires when `indexed_files ⊇ live_files`.
+/// * On any error or uncertainty returns `Ok(())` → full scan.
+pub(crate) async fn apply_gin_fts_pruning_for_query(
+    engine: &Engine,
+    project: &ProjectId,
+    ctx: &SessionContext,
+    sql: &str,
+) -> Result<()> {
+    // Fast pre-check: must contain @@ to be relevant.
+    if !sql.contains("@@") {
+        return Ok(());
+    }
+
+    // Detect the FTS predicate shape.
+    let fts_plan = match crate::index_probe::detect_tsvector_match(
+        sql,
+        project,
+        &engine.config().catalog,
+    )
+    .await
+    {
+        Some(p) => p,
+        None => return Ok(()), // query shape not recognised → full scan
+    };
+
+    // Probe the FTS posting list.
+    use basin_storage::index::gin_tsvector::TsvProbeResult;
+    let fts_result = engine.gin_fts_registry().probe_query(
+        project,
+        &fts_plan.table,
+        &fts_plan.col,
+        &fts_plan.tsquery_str,
+    );
+
+    let candidate_files = match fts_result {
+        TsvProbeResult::FileCandidates(files) => files,
+        // Empty is handled before exec_select (short-circuit with 0 rows).
+        // NoIndex → full scan.
+        _ => return Ok(()),
+    };
+
+    // Completeness guard: fetch the live file set from the catalog.
+    let meta = match engine.config().catalog.load_table(project, &fts_plan.table).await {
+        Ok(m) => m,
+        Err(_) => return Ok(()), // can't verify completeness → full scan
+    };
+    let live_files: Vec<DataFileRef> = meta.live_data_files();
+    if live_files.is_empty() {
+        return Ok(());
+    }
+
+    // Check coverage: every live file must appear in the indexed-files set.
+    let indexed = engine.gin_fts_registry().indexed_files_for(
+        project,
+        &fts_plan.table,
+        &fts_plan.col,
+    );
+    let all_covered = live_files.iter().all(|f| indexed.contains(f.path.as_str()));
+    if !all_covered {
+        // At least one live file is not in the posting list → full scan.
+        return Ok(());
+    }
+
+    // Completeness confirmed.  Intersect candidate set with live files.
+    let pruned_paths: Vec<String> = live_files
+        .iter()
+        .filter(|f| candidate_files.contains(f.path.as_str()))
+        .map(|f| f.path.to_string())
+        .collect();
+
+    if pruned_paths.is_empty() || pruned_paths.len() == live_files.len() {
+        // Either no candidates (defensively leave full set) or all files are
+        // candidates (pruning is a no-op).
+        return Ok(());
+    }
+
+    // Re-register with only the pruned file set.
+    let _ = register_pruned_listing_table(
+        engine,
+        ctx,
+        &fts_plan.table,
+        &meta.schema,
+        meta.file_format,
+        &pruned_paths,
+        meta.global_sort_order.as_deref(),
+    )
+    .await;
+
+    Ok(())
+}
+
 /// Inclusive month range covering the rows a query may need.
 #[derive(Copy, Clone, Debug)]
 struct YearMonthRange {

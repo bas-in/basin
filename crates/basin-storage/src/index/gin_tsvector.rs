@@ -36,27 +36,25 @@
 //! evicted in 25% batches when the cap is exceeded.  On engine restart the
 //! registry starts empty and rebuilds lazily from writes.
 //!
-//! # Engine wiring follow-up
+//! # Engine wiring (Phase 5.20.E)
 //!
-//! ```text
-//! // TODO(5.20.E-wiring): wire this registry into the basin-engine `@@` probe
-//! // path.  Concretely:
-//! //
-//! // 1. In `basin-engine/src/index_probe.rs` (or a new `fts_probe.rs`), add a
-//! //    `GinTsvectorPlan` struct and a `detect_gin_fts` fn analogous to
-//! //    `detect_gin_containment` for JSONB.
-//! //
-//! // 2. In the engine's write path (wherever tsvector column values are
-//! //    persisted), call `GinTsvectorRegistry::index_row` with the raw tsvector
-//! //    bytes so the posting list stays up-to-date.
-//! //
-//! // 3. In the `@@` evaluation path, call `GinTsvectorRegistry::probe_query`
-//! //    to obtain `ProbeResult::FileCandidates`; skip non-candidate files before
-//! //    passing them to DataFusion.
-//! //
-//! // 4. Un-ignore the indexed-latency test slice added in Phase 5.20.A once the
-//! //    wiring is confirmed green in CI.
-//! ```
+//! The three wiring stages are implemented in Phase 5.20.E:
+//!
+//! 1. **Populate on write** — `maintain_gin_fts_index_on_insert` in
+//!    `basin-engine/src/executor.rs` calls `index_row` for every tsvector
+//!    column in a newly written Parquet file.  `mark_file_indexed` is called
+//!    after all rows are processed so the completeness guard is valid.
+//!
+//! 2. **Probe at query** — `detect_tsvector_match` in
+//!    `basin-engine/src/index_probe.rs` recognises `col @@ to_tsquery(…)` /
+//!    `@@ plainto_tsquery(…)` on a GIN-indexed tsvector column and returns a
+//!    `GinFtsPlan`.  The executor probes `probe_query` for an `Empty`
+//!    short-circuit.
+//!
+//! 3. **Prune the scan** — `apply_gin_fts_pruning_for_query` in
+//!    `basin-engine/src/session.rs` intersects `FileCandidates` with live
+//!    files and re-registers a pruned `ListingTable` ONLY when the
+//!    completeness guard passes (`indexed_files ⊇ live_files`).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -225,7 +223,13 @@ impl LexemePostingList {
     }
 
     /// Add a `(lexeme, entry)` pair.
-    fn insert(&mut self, lexeme: String, entry: TsvPostingEntry) {
+    ///
+    /// Returns `true` if an eviction occurred during this insert.  The caller
+    /// (`GinTsvectorRegistry::index_row`) uses this signal to wipe the
+    /// `indexed_files` completeness set: once any lexeme has been evicted, the
+    /// posting list no longer has full coverage and file-level pruning must
+    /// not fire until the registry has been fully rebuilt.
+    fn insert(&mut self, lexeme: String, entry: TsvPostingEntry) -> bool {
         let set = self.entries.entry(lexeme.clone()).or_default();
         let is_new_lexeme = set.is_empty();
         set.insert(entry);
@@ -239,6 +243,9 @@ impl LexemePostingList {
 
         if self.total_count > MAX_POSTING_ENTRIES {
             self.evict_oldest();
+            true // eviction happened
+        } else {
+            false
         }
     }
 
@@ -297,14 +304,24 @@ struct RegKey {
 /// `HashMap` of `Arc<Mutex<…>>` pointers; each inner mutex guards one
 /// per-column posting list.  The outer lock is never held while the inner
 /// lock is taken, preventing deadlock.
+///
+/// `indexed_files` tracks, for each `(project, table, col)`, the set of file
+/// paths whose rows have been fully loaded into the posting list.  This is the
+/// completeness guard required by Phase 5.20.E: file-level pruning is only
+/// safe when every live data file appears in this set.
 pub struct GinTsvectorRegistry {
     inner: Mutex<HashMap<RegKey, Arc<Mutex<LexemePostingList>>>>,
+    /// File-completeness tracking: `RegKey → set of fully-indexed file paths`.
+    indexed_files: Mutex<HashMap<RegKey, HashSet<String>>>,
 }
 
 impl GinTsvectorRegistry {
     /// Create a new empty registry.
     pub fn new() -> Self {
-        Self { inner: Mutex::new(HashMap::new()) }
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            indexed_files: Mutex::new(HashMap::new()),
+        }
     }
 
     fn get_or_create(
@@ -339,10 +356,6 @@ impl GinTsvectorRegistry {
     ///
     /// This is called from the engine write path for every row written to a
     /// tsvector column that has a GIN index declared in the catalog.
-    ///
-    /// # TODO(5.20.E-wiring)
-    ///
-    /// The engine write path must call this method.  See module-level doc.
     pub fn index_row(
         &self,
         project: &ProjectId,
@@ -360,8 +373,29 @@ impl GinTsvectorRegistry {
         let arc = self.get_or_create(project, table, col);
         let mut list = arc.lock().expect("LexemePostingList lock poisoned");
         let entry = TsvPostingEntry { file_path: file_path.to_string(), row_group, row };
+        let mut evicted = false;
         for lexeme in lexemes {
-            list.insert(lexeme, entry.clone());
+            if list.insert(lexeme, entry.clone()) {
+                evicted = true;
+            }
+        }
+        // If eviction occurred the posting list lost lexemes that were present
+        // in earlier files.  Those files are no longer fully covered by the
+        // in-RAM index, so the `indexed_files` completeness set must be
+        // cleared.  Any future `mark_file_indexed` calls (for files written
+        // AFTER the eviction) will repopulate the set, but the old files will
+        // not appear until a full reindex (or engine restart + warm-up) —
+        // meaning the completeness check will fail and the engine falls back
+        // to a full scan.  This is the safe and correct behaviour.
+        if evicted {
+            let key = RegKey {
+                project: *project,
+                table: table.clone(),
+                col: col.to_string(),
+            };
+            if let Ok(mut map) = self.indexed_files.lock() {
+                map.remove(&key);
+            }
         }
     }
 
@@ -384,10 +418,6 @@ impl GinTsvectorRegistry {
     /// * [`TsvProbeResult::FileCandidates`] — the set of file paths that
     ///   MIGHT contain matching rows.
     ///
-    /// # TODO(5.20.E-wiring)
-    ///
-    /// The engine `@@` evaluation path must call this method.  See module-level
-    /// doc.
     pub fn probe_query(
         &self,
         project: &ProjectId,
@@ -438,6 +468,10 @@ impl GinTsvectorRegistry {
     /// Remove all posting entries that reference `file_path` for
     /// `(project, table, col)`.  Call this when a Parquet file is compacted
     /// or deleted so the posting list does not return stale candidates.
+    ///
+    /// Also removes `file_path` from the indexed-files completeness set so
+    /// future probes do not erroneously claim full coverage after this file
+    /// is gone.
     pub fn remove_file(
         &self,
         project: &ProjectId,
@@ -448,6 +482,55 @@ impl GinTsvectorRegistry {
         if let Some(arc) = self.get(project, table, col) {
             let mut list = arc.lock().expect("LexemePostingList lock poisoned");
             list.remove_file(file_path);
+        }
+        // Remove from completeness tracking.
+        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        if let Ok(mut map) = self.indexed_files.lock() {
+            if let Some(set) = map.get_mut(&key) {
+                set.remove(file_path);
+            }
+        }
+    }
+
+    /// Record that `file_path` has been fully indexed for `(project, table,
+    /// col)`.  Called immediately after all rows in a new file have been
+    /// passed to [`index_row`].  This is the write side of the completeness
+    /// guard: a file that appears here is safe to use as a prune boundary.
+    pub fn mark_file_indexed(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        col: &str,
+        file_path: &str,
+    ) {
+        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        if let Ok(mut map) = self.indexed_files.lock() {
+            map.entry(key).or_default().insert(file_path.to_string());
+        }
+    }
+
+    /// Return the set of file paths that have been completely indexed for
+    /// `(project, table, col)`.  The caller uses this to decide whether the
+    /// GIN posting list provides FULL coverage of the live file set:
+    ///
+    /// ```text
+    /// completeness = indexed_files ⊇ live_files
+    /// ```
+    ///
+    /// If `completeness` is true, file-level pruning to `FileCandidates` is
+    /// safe.  If any live file is missing from this set, pruning must NOT
+    /// happen (full scan instead, no false negatives).
+    pub fn indexed_files_for(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        col: &str,
+    ) -> HashSet<String> {
+        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        if let Ok(map) = self.indexed_files.lock() {
+            map.get(&key).cloned().unwrap_or_default()
+        } else {
+            HashSet::new()
         }
     }
 

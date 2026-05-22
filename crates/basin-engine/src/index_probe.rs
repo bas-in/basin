@@ -1003,6 +1003,207 @@ fn extract_simple_projection(
     Some(Some(cols))
 }
 
+// ── Phase 5.20.E — FTS (tsvector @@) probe detection ─────────────────────────
+
+/// Detected GIN FTS probe plan for a `col @@ to_tsquery(...)` predicate.
+///
+/// Produced by [`detect_tsvector_match`] when the query (before the
+/// `rewrite_tsvector_at_at` lowering) contains `@@` on a tsvector column
+/// that has a GIN index.
+#[derive(Debug)]
+pub struct GinFtsPlan {
+    /// The table to scan.
+    pub table: TableName,
+    /// The indexed tsvector column.
+    pub col: String,
+    /// The tsquery string extracted from `to_tsquery(...)` / `plainto_tsquery(...)`
+    /// for posting-list probing.  This is the canonical form as returned by the
+    /// tsquery parser.
+    pub tsquery_str: String,
+}
+
+/// Detect `SELECT … FROM table WHERE col @@ to_tsquery('…')` (and the
+/// `plainto_tsquery` / `phraseto_tsquery` / `websearch_to_tsquery` variants)
+/// for GIN posting-list probe acceleration.
+///
+/// The SQL arrives *before* the `rewrite_tsvector_at_at` pass that converts
+/// `col @@ expr` to `tsvector_match_udf(col, expr)`, so the raw `@@` operator
+/// is still present in the text.
+///
+/// Returns `None` for any query that doesn't fit the supported shape or when
+/// the column has no GIN index with `tsvector_ops`.
+///
+/// On any error or uncertainty returns `None` → full scan (safe).
+pub async fn detect_tsvector_match(
+    raw_sql: &str,
+    project: &ProjectId,
+    catalog: &Arc<dyn basin_catalog::Catalog>,
+) -> Option<GinFtsPlan> {
+    // Fast pre-check: must contain @@ to be relevant.
+    if !raw_sql.contains("@@") {
+        return None;
+    }
+
+    // Parse the raw SQL (before operator rewriting).
+    let dialect = sqlparser::dialect::PostgreSqlDialect {};
+    let stmts = sqlparser::parser::Parser::parse_sql(&dialect, raw_sql).ok()?;
+    if stmts.len() != 1 {
+        return None;
+    }
+    let query = match &stmts[0] {
+        sqlparser::ast::Statement::Query(q) => q.as_ref(),
+        _ => return None,
+    };
+    if query.with.is_some() {
+        return None;
+    }
+    let select = match query.body.as_ref() {
+        sqlparser::ast::SetExpr::Select(s) => s,
+        _ => return None,
+    };
+
+    // Single table, no joins.
+    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+        return None;
+    }
+    let table_name = match &select.from[0].relation {
+        sqlparser::ast::TableFactor::Table { name, alias: None, args: None, .. } => {
+            if name.0.len() != 1 {
+                return None;
+            }
+            use crate::pg_ast::ObjectNamePartExt;
+            name.0[0].id_val().clone()
+        }
+        _ => return None,
+    };
+    let table = TableName::new(table_name).ok()?;
+
+    // WHERE must be `col @@ tsquery_expr` where:
+    //   - LHS is a bare column name (or `alias.col`).
+    //   - RHS is a call to `to_tsquery`, `plainto_tsquery`, `phraseto_tsquery`,
+    //     or `websearch_to_tsquery`.
+    let (col_name, tsquery_str) = extract_fts_where(&select.selection)?;
+
+    // Projection check — only `*` or bare column list; fall through otherwise.
+    let _projection = extract_simple_projection(&select.projection)?;
+
+    // Catalog lookup: must have a GIN index on `col_name` with tsvector_ops.
+    let meta = catalog.load_table(project, &table).await.ok()?;
+    let _gin_index = meta.indexes.iter().find(|idx| {
+        idx.access_method == "gin"
+            && idx.columns.len() == 1
+            && idx.columns[0] == col_name
+            && idx.opclass.as_deref().map_or(false, |op| op == "tsvector_ops")
+    })?;
+
+    Some(GinFtsPlan { table, col: col_name, tsquery_str })
+}
+
+/// Extract `(col_name, tsquery_text)` from a WHERE clause of the form
+/// `col @@ to_tsquery(...)` or `col @@ plainto_tsquery(...)`.
+///
+/// `tsquery_text` is the canonical tsquery string used for posting-list probing
+/// (e.g. `"'cat' & 'dog'"`).
+fn extract_fts_where(
+    selection: &Option<sqlparser::ast::Expr>,
+) -> Option<(String, String)> {
+    use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, Value, ValueWithSpan};
+
+    let expr = selection.as_ref()?;
+
+    // sqlparser does not natively parse `@@` as BinaryOp in all versions.
+    // `rewrite_tsvector_at_at` converts it to `tsvector_match_udf(lhs, rhs)`.
+    // However, `detect_tsvector_match` is called with the *raw* SQL before the
+    // rewriter runs.  We therefore parse the raw SQL — sqlparser's PG dialect
+    // does handle `@@` as a custom operator in `BinaryOp`.
+    let (left, op, right) = match expr {
+        Expr::BinaryOp { left, op, right } => (left, op, right),
+        _ => return None,
+    };
+
+    if op.to_string() != "@@" {
+        return None;
+    }
+
+    // LHS: bare column name or `alias.col`.
+    let col_name = match left.as_ref() {
+        Expr::Identifier(id) => id.value.clone(),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => parts[1].value.clone(),
+        _ => return None,
+    };
+
+    // RHS: function call to a tsquery constructor.  We extract the text
+    // argument and derive the canonical query lexemes via the same logic
+    // used by `fts_udf`.
+    let tsquery_str = extract_tsquery_from_expr(right)?;
+
+    Some((col_name, tsquery_str))
+}
+
+/// Extract the canonical tsquery string from a `to_tsquery(...)` /
+/// `plainto_tsquery(...)` / `phraseto_tsquery(...)` / `websearch_to_tsquery(...)`
+/// call, or a bare `'lexeme'::tsquery` cast / string literal.
+///
+/// Returns the tsquery as the GIN posting-list probe lexemes (e.g. `"'cat' & 'dog'"`).
+fn extract_tsquery_from_expr(expr: &sqlparser::ast::Expr) -> Option<String> {
+    use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, Value, ValueWithSpan};
+
+    match expr {
+        // `to_tsquery('english', 'fox & dog')` or `to_tsquery('fox')`
+        // `plainto_tsquery(...)` etc.
+        Expr::Function(f) => {
+            let fn_name = f.name.to_string().to_lowercase();
+            if !matches!(
+                fn_name.as_str(),
+                "to_tsquery" | "plainto_tsquery" | "phraseto_tsquery" | "websearch_to_tsquery"
+            ) {
+                return None;
+            }
+            // Extract the last string argument as the query body.
+            let args: Vec<&FunctionArg> = match &f.args {
+                sqlparser::ast::FunctionArguments::List(l) => l.args.iter().collect(),
+                _ => return None,
+            };
+            // Accept 1-arg (body) or 2-arg (config, body) forms.
+            let body_arg = args.last()?;
+            let body_str = match body_arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => {
+                    extract_string_literal(inner)?
+                }
+                _ => return None,
+            };
+            // For posting-list probe we treat the query body as a list of
+            // AND-ed lexemes (conservative — see gin_tsvector module doc).
+            // Return it verbatim; `extract_query_lexemes` in gin_tsvector will
+            // parse the lexemes from the canonical form.
+            //
+            // For `plainto_tsquery` we want the stemmed canonical form so the
+            // lexemes match what `to_tsvector` stored.  We delegate to the
+            // same `to_tsquery_text` helper used by `fts_udf`.
+            let canonical = crate::fts_udf::to_tsquery_text(&fn_name, None, &body_str).ok()?;
+            Some(canonical)
+        }
+        // `'fox'::tsquery` bare cast — treat the literal as a plain tsquery.
+        Expr::Cast { expr: inner, .. } => extract_tsquery_from_expr(inner),
+        // Bare string literal `'fox'` — treat as plainto_tsquery body.
+        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => {
+            Some(s.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Extract a raw string value from a scalar expression (single-quoted literal
+/// or `::text` / `::varchar` cast thereof).
+fn extract_string_literal(expr: &sqlparser::ast::Expr) -> Option<String> {
+    use sqlparser::ast::{Expr, Value, ValueWithSpan};
+    match expr {
+        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => Some(s.clone()),
+        Expr::Cast { expr: inner, .. } => extract_string_literal(inner),
+        _ => None,
+    }
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
