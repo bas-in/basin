@@ -79,10 +79,13 @@ pub struct PoolConfig {
     pub eviction_interval: Duration,
     /// Connection-assignment granularity.
     ///
-    /// * [`PoolMode::Session`] — classic: sessions are cached and reused
-    ///   across logical-client checkouts.
-    /// * [`PoolMode::Transaction`] (default) — sessions are destroyed on
-    ///   return so no per-session state crosses checkout boundaries.
+    /// * [`PoolMode::Session`] (default) — classic: sessions are cached and
+    ///   reused across logical-client checkouts. This is the default because
+    ///   typical Postgres connections are session-oriented; reuse avoids a cold
+    ///   session-open on every checkout.
+    /// * [`PoolMode::Transaction`] — sessions are destroyed on return so no
+    ///   per-session state crosses checkout boundaries. Opt-in (e.g. for
+    ///   serverless / PgBouncer-style fan-in) via `?pool_mode=transaction`.
     /// * [`PoolMode::Statement`] — placeholder; same as Transaction today.
     pub pool_mode: PoolMode,
 }
@@ -94,7 +97,7 @@ impl Default for PoolConfig {
             idle_ttl: Duration::from_secs(300),
             per_project_cap: 64,
             eviction_interval: Duration::from_secs(60),
-            pool_mode: PoolMode::Transaction,
+            pool_mode: PoolMode::Session,
         }
     }
 }
