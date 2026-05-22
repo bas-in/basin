@@ -1458,21 +1458,21 @@ each implementation task flips a slice of it green.
       `tests/integration/fixtures/pg-compose.yml`.
       Acceptance: harness compiles + reports red against the current
       engine.
-- [ ] **5.22.B — Plain-text SQL dump format** (`pg_dump -F p`
+- [x] **5.22.B — Plain-text SQL dump format** (`pg_dump -F p`
       equivalent) (~1 week). Schema + data emitted as `CREATE TABLE`
       / `CREATE INDEX` / `COPY … FROM stdin` / data rows. Snapshot
       pinned at dump-start for consistency. Files:
       `crates/basin-engine/src/dump/plain.rs` (new).
       Acceptance: plain-format Basin→Basin round-trip slice of
       5.22.A flips green.
-- [ ] **5.22.C — Custom binary format** (`pg_dump -F c` equivalent)
+- [x] **5.22.C — Custom binary format** (`pg_dump -F c` equivalent)
       (~1 week). Compressed, restorable with `pg_restore`. Header
       includes pg_dump version + Basin version markers. Files:
       `crates/basin-engine/src/dump/custom.rs` (new).
       Acceptance: custom-format + cross-tool slices of 5.22.A flip
       green (`pg_restore -l` lists objects; real PG accepts the
       dump modulo skipped features).
-- [ ] **5.22.D — `basin dump` / `basin restore` CLI commands**
+- [x] **5.22.D — `basin dump` / `basin restore` CLI commands**
       (~3-5 days). basin-cli wraps the pgwire-side dump endpoint:
       `basin dump --project=<ref> --format=plain|custom -o dump.sql`,
       `basin restore --project=<ref> dump.sql`. Files:
