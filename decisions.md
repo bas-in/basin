@@ -976,3 +976,32 @@ cross-session contention), external-tool-gated verification (real pg_dump/psql,
 migration-tool CIs, 1M-row soak, docker/npm CI), and upstream-blocked (#40, #63-uuid,
 #43) + the #53/#54 security/stub P1/P2 tails. These need human direction or focused
 solo sessions, not an unsupervised multi-agent sweep. Workspace unit suite green.
+
+---
+
+## 2026-05-22 — JSONB-GIN physical-scan pruning wired (correctness-safe; perf gate honestly deferred)
+
+`85d156a` — the GIN containment/key probe now actually prunes files in the scan
+(was advisory-only). `apply_gin_pruning_for_query` (session.rs) intersects the
+probe's `FileCandidates` with the catalog's live files and re-registers the table's
+DataFusion `ListingTable` scoped to just those files; `exec_select` passes the
+pre-rewrite SQL so `@>`/`<@` stay detectable.
+
+**Correctness guard (the load-bearing part):** `GinIndexRegistry` now tracks
+`indexed_files` per (project,table,col). Pruning fires ONLY when
+`indexed_files ⊇ live_files` (index provably complete). Three fallbacks to FULL
+scan: any live file not yet indexed (pre-index/post-restart data), probe returns
+NoIndex/Empty, or posting-list eviction (>500k entries) wipes the completeness
+marker. So a stale/partial index can never drop a matching file → no wrong results.
+
+Independently verified: `gin_containment_correctness` + `jsonb_diff_1m_row_seed`
+(differential with-index vs full-scan) green; noop 42/42, citext 4/4, smoke_pgx,
+insert_through_shard green.
+
+**Perf gate (`jsonb_index_perf_gate`) still ignored — honest reasons, not a defect:**
+(1) its 250k-row seed exceeds MAX_POSTING_ENTRIES=500k → eviction → completeness
+marker cleared → full-scan fallback; (2) its 50%-selectivity predicate means every
+file holds candidate rows → nothing to prune. A real ≥10× win needs a
+high-selectivity (<5%) test + a larger/raised posting-entry cap. Test-tuning
+follow-up. The same prune pattern now generalizes to tsvector-GIN (5.20.E) and
+interval (5.24.D) when wanted.
