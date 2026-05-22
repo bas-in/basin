@@ -27,7 +27,7 @@ Conventions:
 
 ## Phase 0.1 — Foundation
 
-### T-001 — Packaging + repo scaffold [ ]
+### T-001 — Packaging + repo scaffold [x]
 
 **Files:** `pyproject.toml`, `src/basin/__init__.py`, `src/basin/py.typed`,
 `README.md`, `LICENSE`, `.gitignore`, `ruff.toml` (or `[tool.ruff]` in
@@ -54,7 +54,7 @@ pyproject), `tests/__init__.py`, `.github/workflows/ci.yml`
 
 ---
 
-### T-002 — Error model (`BasinError`) [ ]
+### T-002 — Error model (`BasinError`) [x]
 
 **Files:** `src/basin/errors.py`, `tests/test_errors.py`
 
@@ -77,7 +77,7 @@ pyproject), `tests/__init__.py`, `.github/workflows/ci.yml`
 
 ---
 
-### T-003 — `Client` + `create_client` + transport [ ]
+### T-003 — `Client` + `create_client` + transport [x]
 
 **Files:** `src/basin/client.py`, `src/basin/_http.py`, `tests/test_client.py`
 
@@ -101,7 +101,7 @@ pyproject), `tests/__init__.py`, `.github/workflows/ci.yml`
 
 ---
 
-### T-004 — Query builder: filters + `select` + `await` execute [ ]
+### T-004 — Query builder: filters + `select` + `await` execute [x]
 
 **Files:** `src/basin/postgrest/builder.py`, `src/basin/postgrest/__init__.py`,
 `tests/test_builder.py`; wire `Client.from_(table)`.
@@ -127,7 +127,7 @@ rendering exactly.
 
 ---
 
-### T-005 — Query builder: `insert` / `update` / `upsert` / `delete` [ ]
+### T-005 — Query builder: `insert` / `update` / `upsert` / `delete` [x]
 
 **Files:** `src/basin/postgrest/builder.py`, `tests/test_builder.py`
 
@@ -149,7 +149,7 @@ rendering exactly.
 
 ---
 
-### T-006 — Auth: password + magic-link [ ]
+### T-006 — Auth: password + magic-link [x]
 
 **Files:** `src/basin/auth/client.py`, `src/basin/auth/types.py`,
 `src/basin/auth/__init__.py`, `tests/test_auth.py`; wire `Client.auth`.
@@ -172,7 +172,7 @@ rendering exactly.
 
 ---
 
-### T-007 — Sync facade (`SyncClient`) [ ]
+### T-007 — Sync facade (`SyncClient`) [x]
 
 **Files:** `src/basin/sync_client.py`, `tests/test_sync.py`; export from
 `src/basin/__init__.py`.

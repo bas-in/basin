@@ -25,8 +25,8 @@ the roadmap:
   `pyiceberg`; basin-py just hands back a configured `Catalog` pointed at the
   engine's REST catalog. This is the one place Python leads JS.
 
-### Open decision (resolve in T-001)
+### Resolved in T-001
 
-- **PyPI distribution name.** Prefer `basin` (import package `basin`); if the
-  name is taken on PyPI, fall back to distribution `basin-sdk` keeping the
-  import package `basin`. Record the outcome here.
+- **PyPI distribution name.** `basin` is taken on PyPI (unrelated package).
+  Distribution name is `basin-sdk`; import package remains `basin`.
+  `pyproject.toml` uses `name = "basin-sdk"` with `packages = ["src/basin"]`.
