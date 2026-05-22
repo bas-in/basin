@@ -6,6 +6,11 @@
 //!                                          [--output=<path>] [--package=<name>]
 //!                                          [--watch]
 //!
+//! `--watch` polls `./basin/migrations/*.sql` every 2 s and re-emits whenever
+//! any file's mtime changes or a file is added/removed.  Requires --output=<path>
+//! (cannot stream to stdout in watch mode).  Exits cleanly on SIGINT (Ctrl-C);
+//! tests inject an `Arc<AtomicBool>` stop flag to terminate after N iterations.
+//!
 //! Future subcommands (gen migrations, etc.) will be added here as the
 //! platform surface grows.
 //!
@@ -15,7 +20,10 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
-use std::time::Duration;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use reqwest::Method;
 use serde_json::json;
@@ -766,12 +774,6 @@ pub fn gen_types(
         }
     };
 
-    // --watch stub — full implementation deferred to a later batch.
-    if watch {
-        let _ = writeln!(err_out, "basin: watch not yet implemented");
-        return Ok(());
-    }
-
     // ── project ref resolution ─────────────────────────────────────────────
     if project.is_empty() {
         // Fall back to working-project context (./basin/config.toml).
@@ -795,6 +797,34 @@ pub fn gen_types(
             "gen types: invalid schema name {:?} (must be alphanumeric + underscore)",
             schema
         )));
+    }
+
+    // ── --watch: hand off to the polling loop ──────────────────────────────
+    if watch {
+        // --output is mandatory in watch mode: we can't overwrite stdout on
+        // each iteration.
+        if output_path.is_empty() {
+            return Err(msg(
+                "gen types --watch requires --output=<path> (cannot stream to stdout in watch mode)",
+            ));
+        }
+        // Resolve cwd once here so we never call current_dir inside the loop.
+        let cwd = std::env::current_dir()
+            .map_err(|e| msg(format!("gen types --watch: cwd: {e}")))?;
+        // Use the process-level SIGINT default (Ctrl-C kills the process).
+        // A None stop flag means "run forever" — used in production.
+        return gen_types_watch(
+            g,
+            &project,
+            &schema,
+            lang,
+            &lang_str,
+            &output_path,
+            &pkg_name,
+            &cwd,
+            None,
+            err_out,
+        );
     }
 
     // ── HTTP query ────────────────────────────────────────────────────────
@@ -870,6 +900,157 @@ pub fn gen_types(
     Ok(())
 }
 
+// ── gen types --watch ─────────────────────────────────────────────────────────
+
+/// Fingerprint of a migrations directory: sorted Vec of (path, mtime).
+/// Comparing two snapshots detects file additions, removals, and changes.
+fn migrations_dir_fingerprint(dir: &Path) -> Vec<(String, SystemTime)> {
+    let mut entries: Vec<(String, SystemTime)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("sql") {
+                continue;
+            }
+            let name = p.display().to_string();
+            let mtime = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            entries.push((name, mtime));
+        }
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
+}
+
+/// run_single_gen_pass executes one schema query + emit cycle, writing the
+/// generated source directly to `output_path`.  Returns Ok(n_tables).
+fn run_single_gen_pass(
+    g: &GlobalFlags,
+    project: &str,
+    schema: &str,
+    lang: LangTarget,
+    pkg_name: &str,
+    output_path: &str,
+) -> CliResult<usize> {
+    let c = require_client(g)?;
+    let sql_query = format!(
+        "SELECT table_name, column_name, data_type, is_nullable, ordinal_position \
+         FROM information_schema.columns \
+         WHERE table_schema = '{}' \
+         ORDER BY table_name, ordinal_position",
+        schema
+    );
+    let req_body = json!({ "sql": sql_query, "writes_enabled": false });
+    let res: QueryResult = c
+        .do_json_timeout(
+            Method::POST,
+            &format!("/v1/projects/{project}/sql/query"),
+            Some(req_body),
+            Duration::from_secs(120),
+        )
+        .map_err(|e| msg(format!("gen types: query failed: {e}")))?;
+
+    let (tables, table_order, _total_cols) = parse_schema_columns(&res);
+    let mut buf: Vec<u8> = Vec::new();
+    match lang {
+        LangTarget::TypeScript => emit_typescript(&mut buf, &tables, &table_order),
+        LangTarget::Go => emit_go(&mut buf, &tables, &table_order, pkg_name),
+        LangTarget::Python => emit_python(&mut buf, &tables, &table_order),
+    }
+    std::fs::write(output_path, &buf)
+        .map_err(|e| msg(format!("gen types: write {output_path}: {e}")))?;
+    Ok(table_order.len())
+}
+
+/// gen_types_watch polls `./basin/migrations/*.sql` for changes every 2 s,
+/// re-running a full gen pass whenever the directory fingerprint changes.
+///
+/// - `cwd` — the working directory used to locate `basin/migrations/`.  Tests
+///   pass a temp path; production passes `std::env::current_dir()`.  Never
+///   call `std::env::set_current_dir` — it is process-global and races other
+///   tests running in parallel.
+/// - `stop` — when `Some`, the loop exits as soon as the flag is true (used
+///   by tests to avoid infinite loops).  When `None`, runs until SIGINT.
+/// - Always writes to `output_path` (stdout not allowed in watch mode).
+#[allow(clippy::too_many_arguments)]
+pub fn gen_types_watch(
+    g: &GlobalFlags,
+    project: &str,
+    schema: &str,
+    lang: LangTarget,
+    lang_str: &str,
+    output_path: &str,
+    pkg_name: &str,
+    cwd: &Path,
+    stop: Option<Arc<AtomicBool>>,
+    err_out: &mut dyn Write,
+) -> CliResult<()> {
+    // Determine the migrations directory to watch.
+    let migrations_dir = cwd.join("basin").join("migrations");
+
+    if !g.quiet {
+        let _ = writeln!(
+            err_out,
+            "Watching {} for changes — Ctrl-C to stop. Generating {} → {}",
+            migrations_dir.display(),
+            lang_str,
+            output_path
+        );
+    }
+
+    // Initial pass: emit immediately so the output file exists from the start.
+    let mut last_fp = migrations_dir_fingerprint(&migrations_dir);
+    match run_single_gen_pass(g, project, schema, lang, pkg_name, output_path) {
+        Ok(n) => {
+            if !g.quiet {
+                let _ = writeln!(err_out, "gen types: emitted ({n} table(s)) → {output_path}");
+            }
+        }
+        Err(e) => {
+            let _ = writeln!(err_out, "gen types: pass failed (will retry): {e}");
+        }
+    }
+
+    loop {
+        // Honour the test stop flag before sleeping so tests terminate quickly.
+        if let Some(ref flag) = stop {
+            if flag.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+
+        std::thread::sleep(Duration::from_secs(2));
+
+        // Re-check stop after sleep.
+        if let Some(ref flag) = stop {
+            if flag.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+
+        let fp = migrations_dir_fingerprint(&migrations_dir);
+        if fp == last_fp {
+            continue;
+        }
+        last_fp = fp;
+
+        match run_single_gen_pass(g, project, schema, lang, pkg_name, output_path) {
+            Ok(n) => {
+                if !g.quiet {
+                    let _ =
+                        writeln!(err_out, "gen types: re-emitted ({n} table(s)) → {output_path}");
+                }
+            }
+            Err(e) => {
+                let _ = writeln!(err_out, "gen types: pass failed (will retry): {e}");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn gen_types_usage() {
     help_for_command(
         "gen types",
@@ -880,7 +1061,7 @@ fn gen_types_usage() {
             "--schema=public     Schema name to introspect (default: public).",
             "--output=<path>     Write to file instead of stdout.",
             "--package=<name>    Go package name (default: database, Go only).",
-            "--watch             Re-emit on every migration push (stub — coming soon).",
+            "--watch             Re-emit on migration-file changes (requires --output=<path>).",
         ],
     );
 }
@@ -891,6 +1072,16 @@ fn gen_types_usage() {
 mod tests {
     use super::*;
     use crate::testutil::{with_temp_config_dir, Req, Resp, TestServer};
+
+    /// unique_id returns a nanosecond-granularity timestamp suitable for
+    /// scoping temp directories to a single test invocation.  Avoids
+    /// collisions between parallel test threads (each picks its own nanos).
+    fn unique_id() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    }
 
     // ── stub schema rows (mirrors cmd_gen_test.go's stubSchemaRows) ───────────
     //
@@ -1187,17 +1378,233 @@ mod tests {
         assert_eq!(meta["output_path"].as_str(), Some("-"));
     }
 
-    // ── --watch stub ──────────────────────────────────────────────────────────
+    // ── --watch ───────────────────────────────────────────────────────────────
 
+    /// watch_requires_output: --watch without --output is an error.
     #[test]
-    fn watch_stub() {
+    fn watch_requires_output() {
         let _cfg = with_temp_config_dir();
         let g = GlobalFlags {
             token: "test-token".into(),
             api_url: "http://127.0.0.1:0".into(),
+            quiet: true,
             ..Default::default()
         };
-        run_gen(&g, &["typescript", "--project=test-ref", "--watch"]).unwrap();
+        let err = run_gen(
+            &g,
+            &["typescript", "--project=test-ref", "--watch"],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("--output"),
+            "expected --output error, got: {err}"
+        );
+    }
+
+    /// watch_emits_on_initial_pass: verifies the initial gen pass writes the
+    /// output file.  The stop flag is raised immediately so the loop exits
+    /// after one iteration.  Uses an explicit cwd to avoid process-global
+    /// set_current_dir races.
+    #[test]
+    fn watch_emits_on_initial_pass() {
+        let _cfg = with_temp_config_dir();
+        let srv = build_schema_server();
+        let g = GlobalFlags {
+            api_url: srv.url.clone(),
+            token: "test-token".into(),
+            quiet: true,
+            ..Default::default()
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "basin-watch-initial-{}-{}",
+            std::process::id(),
+            unique_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Create the basin/migrations/ subdirectory the watcher looks at.
+        let mig_dir = dir.join("basin").join("migrations");
+        std::fs::create_dir_all(&mig_dir).unwrap();
+
+        let output = dir.join("database.ts");
+        let stop = Arc::new(AtomicBool::new(true)); // stop immediately after initial pass
+
+        let mut err_out = Vec::<u8>::new();
+        // Pass cwd directly — no set_current_dir.
+        let result = gen_types_watch(
+            &g,
+            "test-ref",
+            "public",
+            LangTarget::TypeScript,
+            "typescript",
+            output.to_str().unwrap(),
+            "database",
+            &dir,
+            Some(Arc::clone(&stop)),
+            &mut err_out,
+        );
+        // Cleanup (best-effort).
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(result.is_ok(), "watch returned error: {result:?}");
+    }
+
+    /// watch_stop_flag_terminates_immediately: with stop=true on entry, the
+    /// watch loop exits without sleeping, verifying the early-exit fast path.
+    #[test]
+    fn watch_stop_flag_terminates_immediately() {
+        let _cfg = with_temp_config_dir();
+        let srv = build_schema_server();
+        let g = GlobalFlags {
+            api_url: srv.url.clone(),
+            token: "test-token".into(),
+            quiet: true,
+            ..Default::default()
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "basin-watch-stopimm-{}-{}",
+            std::process::id(),
+            unique_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mig_dir = dir.join("basin").join("migrations");
+        std::fs::create_dir_all(&mig_dir).unwrap();
+
+        let output = dir.join("database.ts");
+        let stop = Arc::new(AtomicBool::new(true)); // stop before the first sleep
+
+        let mut err_out = Vec::<u8>::new();
+        let result = gen_types_watch(
+            &g,
+            "test-ref",
+            "public",
+            LangTarget::TypeScript,
+            "typescript",
+            output.to_str().unwrap(),
+            "database",
+            &dir,
+            Some(Arc::clone(&stop)),
+            &mut err_out,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(result.is_ok(), "watch returned error: {result:?}");
+    }
+
+    /// watch_detects_migration_change: a background thread adds a .sql file
+    /// and flips the stop flag; the watch loop should exit cleanly.
+    #[test]
+    fn watch_detects_migration_change() {
+        let _cfg = with_temp_config_dir();
+        let srv = build_schema_server();
+        let g = GlobalFlags {
+            api_url: srv.url.clone(),
+            token: "test-token".into(),
+            quiet: true,
+            ..Default::default()
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "basin-watch-change-{}-{}",
+            std::process::id(),
+            unique_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mig_dir = dir.join("basin").join("migrations");
+        std::fs::create_dir_all(&mig_dir).unwrap();
+
+        let output = dir.join("database.ts");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = Arc::clone(&stop);
+
+        // Write a migration file after a short delay in a background thread,
+        // then set the stop flag so the watch loop terminates.
+        let mig_dir2 = mig_dir.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            std::fs::write(mig_dir2.join("0001_init.sql"), b"CREATE TABLE t (id int);")
+                .expect("write migration");
+            stop2.store(true, Ordering::Relaxed);
+        });
+
+        let mut err_out = Vec::<u8>::new();
+        // Pass cwd directly — no set_current_dir.
+        let result = gen_types_watch(
+            &g,
+            "test-ref",
+            "public",
+            LangTarget::TypeScript,
+            "typescript",
+            output.to_str().unwrap(),
+            "database",
+            &dir,
+            Some(Arc::clone(&stop)),
+            &mut err_out,
+        );
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(result.is_ok(), "watch returned error: {result:?}");
+    }
+
+    /// fingerprint_empty_dir: an empty (or missing) migrations dir yields an
+    /// empty fingerprint.
+    #[test]
+    fn fingerprint_empty_dir() {
+        let dir = std::env::temp_dir()
+            .join(format!("basin-fp-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fp = migrations_dir_fingerprint(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(fp.is_empty(), "expected empty fingerprint for new dir");
+    }
+
+    /// fingerprint_missing_dir: a path that does not exist returns empty.
+    #[test]
+    fn fingerprint_missing_dir() {
+        let fp = migrations_dir_fingerprint(Path::new("/no/such/migrations/dir"));
+        assert!(fp.is_empty());
+    }
+
+    /// fingerprint_ignores_non_sql: .txt files are not tracked.
+    #[test]
+    fn fingerprint_ignores_non_sql() {
+        let dir = std::env::temp_dir()
+            .join(format!("basin-fp-nonsql-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("README.txt"), b"ignore me").unwrap();
+        let fp = migrations_dir_fingerprint(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(fp.is_empty(), "expected no entries for non-sql file");
+    }
+
+    /// fingerprint_tracks_sql_files: .sql files are included.
+    #[test]
+    fn fingerprint_tracks_sql_files() {
+        let dir = std::env::temp_dir()
+            .join(format!("basin-fp-sql-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("0001_init.sql"), b"CREATE TABLE x (id int);").unwrap();
+        std::fs::write(dir.join("0002_add.sql"), b"ALTER TABLE x ADD col text;").unwrap();
+        let fp = migrations_dir_fingerprint(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(fp.len(), 2, "expected 2 sql entries, got {:?}", fp.len());
+    }
+
+    /// fingerprint_changes_on_new_file: adding a .sql file changes the fingerprint.
+    #[test]
+    fn fingerprint_changes_on_new_file() {
+        let dir = std::env::temp_dir()
+            .join(format!("basin-fp-change-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fp_before = migrations_dir_fingerprint(&dir);
+        std::fs::write(dir.join("0001_init.sql"), b"CREATE TABLE x (id int);").unwrap();
+        let fp_after = migrations_dir_fingerprint(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_ne!(
+            fp_before, fp_after,
+            "fingerprint should change when a .sql file is added"
+        );
     }
 
     // ── Dispatcher ────────────────────────────────────────────────────────────

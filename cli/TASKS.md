@@ -260,7 +260,7 @@ over `information_schema` queries — no cloud endpoint to add.
 - [ ] `gen types typescript` — query `information_schema.columns` via `POST /v1/projects/{ref}/sql/query`, emit `database.ts` with `type Tables = { ... }` per Postgres-type → TS-type mapping table in `gen_types_map.go`. Tests: enum mapping, nullable mapping, JSONB mapping, vector(N) mapping, snapshot test against a `testdata/expected.ts`.
 - [ ] `gen types go` — same shape; emit `database.go` with one struct per table. Honour `json:"..."` + `db:"..."` tags. Snapshot test against `testdata/expected.go`.
 - [ ] `gen types python` — emit `database.py` with `pydantic.BaseModel` subclasses. Snapshot test against `testdata/expected.py`.
-- [ ] `gen types --watch` — re-emit on every successful `db push`. Implement as a file-watcher on `./basin/migrations/`. Tests: cooperative interrupt (Ctrl-C ⇒ exit 0).
+- [x] `gen types --watch` — re-emit on every successful `db push`. Implement as a file-watcher on `./basin/migrations/`. Tests: cooperative interrupt (Ctrl-C ⇒ exit 0). **Landed**: polls `./basin/migrations/*.sql` mtimes every 2 s; re-emits on any add/remove/change; requires `--output=<path>`; testable via `Arc<AtomicBool>` stop flag; 8 new tests (requires-output error, initial-pass write, stop-flag fast-path, change-detection, 4 fingerprint unit tests).
 - [ ] Type-mapping table in `gen_types_map.go` — exhaustive: bool/int2/int4/int8/float4/float8/numeric/text/bytea/uuid/jsonb/timestamptz/date/time/interval/vector. Doc-comment in the file points at the engine's pgwire OID list.
 
 ---
