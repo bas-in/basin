@@ -6,6 +6,37 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-22 — Capstone `cargo test --workspace --lib --bins` caught 1 real regression + 1 latent bug
+
+Ran the full workspace lib+bin unit suite as the capstone (the loop's "all clear →
+clean test" branch). 2281 passed, **1 failed** — `basin-router::protocol::tests::
+pool_session_factory_reuses_session_across_opens`. Vindicates running it: targeted
+per-wave sweeps had missed this.
+
+Two coupled fixes (`c172cec`-style follow-ups):
+- `fix(pool): default PoolConfig to Session` — Phase 5.27.B had made
+  `PoolMode::Transaction` the GLOBAL default, destroying the session on every
+  checkout → no reuse on the main connection path (perf regression + the failing
+  test). Per the 5.27 spec, transaction-mode is opt-in (`?pool_mode=transaction`);
+  session-reuse is the correct default. Reverted the default to Session.
+- `fix(pool): Session-mode scrub clears cursors + prepared statements` — flipping
+  the default to Session then exposed a LATENT bug: the return-to-pool scrub issued
+  SQL `CLOSE ALL`/`DEALLOCATE ALL` which aren't wired in v0.1, so cursor/prepared
+  state leaked across Session-mode pooled checkouts (the leakage test only "passed"
+  before because Transaction-default destruction masked it). Added
+  `ProjectSession::reset_for_pool_reuse()` (clears the in-memory CursorRegistry +
+  PreparedRegistry) + `CursorRegistry::clear_all` / `PreparedRegistry::clear_all`,
+  and call it from the scrub. `open_cursor_does_not_survive_pool_return` now passes
+  in Session mode for the right reason.
+
+Post-fix: basin-pool 8/8, all pool integration harnesses green, protocol reuse test
+green, txn-mode harnesses green. Workspace unit suite clean. **Lesson:** an agent's
+"(default)" choice for a new mode enum is a high-blast-radius decision — verify the
+default matches the spec + doesn't regress the common path; the workspace capstone
+test is the safety net that catches it.
+
+---
+
 ## 2026-05-22 — 5.19.D/E + partials-cleanup; broad agent-amenable sweep essentially complete
 
 - `9ac7afb` **5.19.D/E** — JSONB GIN key/path probe (`?`/`?&`/`?|`/`->`/`#>`; fixed
