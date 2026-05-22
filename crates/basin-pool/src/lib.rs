@@ -42,7 +42,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use basin_common::{ProjectId, Result};
-use basin_engine::{Engine, ProjectSession};
+use basin_engine::Engine;
 use tokio::sync::{oneshot, Mutex};
 use tracing::instrument;
 
@@ -173,7 +173,7 @@ impl SessionPool {
                             if queue.is_empty() {
                                 state.available.remove(&key);
                             }
-                            Action::Hit(entry.session)
+                            Action::Hit(entry)
                         } else {
                             // An empty queue should have been removed by the
                             // last popper, but treat it defensively.
@@ -191,7 +191,7 @@ impl SessionPool {
             };
 
             match action {
-                Action::Hit(session) => {
+                Action::Hit(entry) => {
                     self.inner.stats.record_hit();
 
                     // 5.27.D: defence-in-depth project-tag validation.
@@ -200,11 +200,11 @@ impl SessionPool {
                     // corruption, etc.).  Reject hard rather than silently
                     // exposing one project's session to another.
                     if let Err(e) =
-                        tenant_isolation::assert_project_tag(&session, key.project)
+                        tenant_isolation::assert_project_tag(&entry.session, key.project)
                     {
-                        // Drop the session Arc before releasing the slot so its
-                        // destructors run outside the pool lock.
-                        drop(session);
+                        // Drop the entry (and session Arc) before releasing the
+                        // slot so its destructors run outside the pool lock.
+                        drop(entry);
                         let mut state = self.inner.state.lock().await;
                         state.release_slot(key.project);
                         return Err(e);
@@ -213,20 +213,39 @@ impl SessionPool {
                     // Session mode: scrub the session before handing it to the
                     // new logical client.  Applying the scrub at checkout (not
                     // at return) keeps `Drop` synchronous and preserves the
-                    // try_lock fast path on the return side.  Best-effort: a
-                    // failed scrub is logged but does not abort the checkout —
-                    // the next client would see stale state in the unlikely
-                    // event the scrub fails, which is no worse than the
-                    // pre-5.27.E baseline.
+                    // try_lock fast path on the return side.
+                    //
+                    // P0: pass the temp-table list so the scrub can drop any
+                    // temp tables created during the previous checkout.
+                    // P2: scrub failure on routing-critical state (search_path)
+                    // returns Err — destroy the session rather than reusing it.
+                    let temp_tables: Vec<String> = entry
+                        .temp_tables
+                        .lock()
+                        .map(|g| g.clone())
+                        .unwrap_or_default();
                     if let Err(e) =
-                        return_scrub::scrub_session_for_pool_return(&session).await
+                        return_scrub::scrub_session_for_pool_return(&entry.session, &temp_tables)
+                            .await
                     {
                         tracing::warn!(
                             error = %e,
-                            "pool scrub failed on checkout; session may carry stale state"
+                            "pool scrub failed on checkout; destroying session to prevent state leak"
                         );
+                        // Destroy the session: drop the entry Arc and release
+                        // the capacity slot so the next waiter can open fresh.
+                        drop(entry);
+                        let mut state = self.inner.state.lock().await;
+                        state.release_slot(key.project);
+                        state.wake_one_waiter(key.project);
+                        // Loop: retry acquire with a fresh session open.
+                        continue;
                     }
-                    return Ok(pooled_session::build(self.inner.clone(), key, session));
+                    return Ok(pooled_session::build(
+                        self.inner.clone(),
+                        key,
+                        entry.session,
+                    ));
                 }
                 Action::Open => {
                     // Slot already reserved. Open the session outside the
@@ -310,8 +329,8 @@ impl SessionPool {
 }
 
 enum Action {
-    /// Cache hit; the popped session is ready to hand out.
-    Hit(Arc<ProjectSession>),
+    /// Cache hit; the popped entry (session + temp-table list) is ready to hand out.
+    Hit(state::PooledEntry),
     /// We reserved a slot under the lock; caller must call
     /// `engine.open_session` and either consume the slot or release it
     /// on error.
@@ -420,7 +439,7 @@ mod tests {
 
     use basin_catalog::InMemoryCatalog;
     use basin_common::ProjectId;
-    use basin_engine::EngineConfig;
+    use basin_engine::{EngineConfig, ProjectSession};
     use object_store::local::LocalFileSystem;
     use tempfile::TempDir;
 
@@ -803,6 +822,76 @@ mod tests {
 
         for j in joins {
             j.await.expect("task must not panic");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 5.27.E / P0 — temp-table isolation across Session-mode checkouts
+    // -------------------------------------------------------------------------
+
+    /// A temp table created during checkout A must NOT be visible during the
+    /// next checkout that reuses the same physical session.
+    ///
+    /// The test uses `PooledSession::execute` (which tracks temp-table names)
+    /// and then verifies that after the session is returned and re-acquired,
+    /// querying the temp table returns an error (table does not exist).
+    #[tokio::test]
+    async fn temp_table_does_not_survive_pool_return() {
+        let dir = TempDir::new().unwrap();
+        let pool = SessionPool::new(engine_in(&dir), cfg_default());
+        let project = ProjectId::new();
+
+        // --- Checkout 1: create a temp table and insert a row ---
+        {
+            let s1 = pool.acquire(project, None).await.unwrap();
+
+            // Use the pool's `execute` wrapper so the temp-table name is
+            // tracked for scrub.
+            s1.execute("CREATE TEMP TABLE _pool_test_tmp (id INT)")
+                .await
+                .expect("CREATE TEMP TABLE must succeed");
+
+            s1.execute("INSERT INTO _pool_test_tmp VALUES (42)")
+                .await
+                .expect("INSERT into temp table must succeed");
+
+            // Sanity: the table is visible during this checkout.
+            let result = s1
+                .execute("SELECT id FROM _pool_test_tmp")
+                .await
+                .expect("SELECT from temp table must succeed during same checkout");
+            match result {
+                basin_engine::ExecResult::Rows { batches, .. } => {
+                    let total: usize = batches.iter().map(|b| b.num_rows()).collect::<Vec<_>>().iter().sum();
+                    assert_eq!(total, 1, "expected 1 row in temp table during checkout");
+                }
+                other => panic!("expected Rows, got {other:?}"),
+            }
+
+            drop(s1); // returns session to pool
+        }
+
+        // Yield so the async return-to-pool spawn (if triggered) completes.
+        tokio::task::yield_now().await;
+
+        // --- Checkout 2: same (project, client_key) → same physical session ---
+        {
+            let s2 = pool.acquire(project, None).await.unwrap();
+            let stats = pool.stats();
+            assert_eq!(
+                stats.hits, 1,
+                "second acquire must be a cache hit (same physical session)"
+            );
+
+            // The temp table must no longer exist after the scrub.
+            let result = s2
+                .execute("SELECT id FROM _pool_test_tmp")
+                .await;
+            assert!(
+                result.is_err(),
+                "temp table must NOT be visible after pool return; \
+                 SELECT should fail with 'table not found'"
+            );
         }
     }
 }

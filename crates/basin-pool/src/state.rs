@@ -29,6 +29,15 @@ pub(crate) struct PoolKey {
 pub(crate) struct PooledEntry {
     pub(crate) session: Arc<ProjectSession>,
     pub(crate) last_used: Instant,
+    /// Temp tables created during the checkout that owns this entry. Populated
+    /// by [`crate::PooledSession::execute`] when it detects a
+    /// `CREATE TEMP[ORARY] TABLE` statement. Drained by the scrub at the next
+    /// checkout so the tables are dropped before the session is re-used.
+    ///
+    /// Uses `std::sync::Mutex` (not tokio) so `PooledSession::execute`'s
+    /// synchronous detection step can push without an `await`. The vec is
+    /// typically empty or tiny (0–2 entries); no contention expected.
+    pub(crate) temp_tables: std::sync::Mutex<Vec<String>>,
 }
 
 /// The state behind the outer mutex.
