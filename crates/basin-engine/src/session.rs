@@ -1182,6 +1182,9 @@ pub(crate) async fn open(
     // automatically removes the entry from pg_stat_activity.
     let connection_handle = engine.connection_registry().connect(&project);
     let session_pid = connection_handle.pid;
+    // Phase 5.31.A: capture the per-session cancel notify from the handle so
+    // the executor can await it alongside DataFusion collect futures.
+    let cancel_notify = connection_handle.cancel_notify.clone();
 
     // Phase 5.23.D: register the session's virtualxid lock with the lock
     // registry. Every active Postgres backend holds a virtualxid lock
@@ -1202,6 +1205,16 @@ pub(crate) async fn open(
         session_pid,
     );
 
+    // Phase 5.31.A: register a per-session `pg_cancel_backend(pid)` UDF.
+    // This captures the engine handle and session_pid so that calling
+    // `SELECT pg_cancel_backend(N)` from another session resolves through
+    // the engine's cancel_backend path, which fires the target's notify and
+    // returns SQLSTATE 57014 to the target's running query.
+    crate::cancel_udf::register_pg_cancel_backend_udf(
+        &ctx,
+        engine.clone(),
+    );
+
     Ok(ProjectSession {
         engine,
         project,
@@ -1213,6 +1226,8 @@ pub(crate) async fn open(
         reaper_id,
         _lock_handle: Some(lock_handle),
         _connection_handle: Some(connection_handle),
+        session_pid,
+        cancel_notify,
         is_system,
     })
 }

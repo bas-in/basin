@@ -520,6 +520,15 @@ impl Engine {
         &self.inner.connection_registry
     }
 
+    /// Phase 5.31.A: signal `pg_cancel_backend(pid)` — notifies the target
+    /// session's executor `select!` branch so it returns SQLSTATE 57014.
+    ///
+    /// Returns `true` if the pid was found (session still live), `false` if
+    /// the pid is unknown (already disconnected or never registered).
+    pub(crate) fn cancel_backend(&self, pid: i32) -> bool {
+        self.inner.connection_registry.notify_cancel(pid)
+    }
+
     /// Phase 5.29.B-D: access the process-wide hypertable registry.
     /// Cheap to clone (`Arc` inside).
     pub(crate) fn hypertable_registry(&self) -> &Arc<crate::hypertable::HypertableRegistry> {
@@ -822,6 +831,14 @@ pub struct ProjectSession {
     /// `ConnectionRegistry`. Dropped when the session is dropped. Uses `Option`
     /// for the same construction-order reason as `_lock_handle`.
     pub(crate) _connection_handle: Option<crate::connection_registry::ConnectionHandle>,
+    /// Phase 5.31.A: the backend pid assigned at session-open time.
+    /// Exposed so the `pg_cancel_backend` UDF can call
+    /// `engine.cancel_backend(pid)` for the target pid from a SQL expression.
+    pub(crate) session_pid: i32,
+    /// Phase 5.31.A: per-session cancel notification handle. Awaited inside
+    /// `exec_select` alongside the DataFusion collect future; fires when
+    /// `pg_cancel_backend(this_pid)` is called from another session.
+    pub(crate) cancel_notify: Arc<tokio::sync::Notify>,
     /// Phase 5.18.C: internal/trusted DDL flag. When `true`, this session is
     /// opened by a trusted system subsystem (basin-auth, basin-cron, basin-net)
     /// and is permitted to:
@@ -959,6 +976,8 @@ pub enum ExecResult {
 mod advisory_lock;
 mod alter;
 mod alter_project;
+/// Phase 5.31.A — `pg_cancel_backend(pid)` per-session UDF.
+pub(crate) mod cancel_udf;
 /// Phase 5.21 — Logical CDC / pgoutput replication infrastructure.
 pub(crate) mod replication;
 pub mod connection_registry;
