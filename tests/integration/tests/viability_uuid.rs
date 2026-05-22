@@ -42,7 +42,6 @@ use object_store::local::LocalFileSystem;
 use serde_json::json;
 use tempfile::TempDir;
 
-#[ignore = "C1: UUID/Vortex read path casts Decimal256(39,0) to FixedSizeBinary(16) — SELECT fails; not the vortex 0.71 metadata fix — still blocked on #40 cluster"]
 #[tokio::test]
 async fn viability_uuid() {
     let dir = TempDir::new().unwrap();

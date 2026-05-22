@@ -1,8 +1,10 @@
 //! Basin-local wrapper around [`vortex_datafusion::VortexFormat`] that patches
 //! `Statistics.total_byte_size` so DataFusion's `join_selection` optimizer rule
-//! gets a real value instead of `Precision::Absent`.
+//! gets a real value instead of `Precision::Absent`, and that applies the
+//! ADR-0024 UUID Decimal256(39,0) → FixedSizeBinary(16) read-side inverse so
+//! DataFusion never sees the on-disk disguise.
 //!
-//! ## Root cause
+//! ## Root cause (W2-1)
 //!
 //! `VortexFormat::infer_stats` folds `total_byte_size` from per-column
 //! `Stat::UncompressedSizeInBytes`.  Because `PRUNING_STATS` in
@@ -20,11 +22,40 @@
 //! compressed on-disk byte count — a valid underestimate and sufficient for the
 //! relative ordering the optimizer needs.  We never overwrite an `Exact` or
 //! `Inexact` value returned upstream.
+//!
+//! ## ADR-0024 UUID read-path fix
+//!
+//! Vortex 0.71 has no `FixedSizeBinary(N)` encoder; UUID columns are stored as
+//! `Decimal256(39, 0)` on disk.  The catalog schema (and DataFusion's registered
+//! table schema) declares those columns as `FixedSizeBinary(16)`.  Without
+//! intervention DataFusion's `DefaultPhysicalExprAdapterFactory` (inside
+//! `VortexOpener`) tries to cast `Decimal256(39,0)` → `FixedSizeBinary(16)` and
+//! fails with "Cannot cast column 'id' from 'Decimal256(39,0)' to
+//! 'FixedSizeBinary(16)'".
+//!
+//! Fix (two-part, single-boundary):
+//!
+//! 1. `BasinVortexFormat::file_source` swaps UUID fields from
+//!    `FixedSizeBinary(16)` to `Decimal256(39, 0)` in the `TableSchema` before
+//!    passing it to the inner `VortexSource`.  Vortex therefore sees a schema
+//!    that matches the on-disk layout and no cast is attempted.
+//!
+//! 2. `BasinVortexFormat::create_physical_plan` wraps the inner plan with
+//!    `UuidDecimal256RestoreExec`, which converts `Decimal256(39, 0)` columns
+//!    carrying `BASIN_TYPE=UUID` metadata back to `FixedSizeBinary(16)` on
+//!    every output batch.  DataFusion above this point sees only
+//!    `FixedSizeBinary(16)`, matching the registered table schema.
+//!
+//! TODO(adr-0024): drop the UUID swapping when Vortex grows native
+//! `FixedSizeBinary(N)` encoding and basin-engine pins the new release.
 
 use std::any::Any;
 use std::fmt;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
+use arrow_array::{Array, ArrayRef, Decimal256Array, FixedSizeBinaryArray, RecordBatch};
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
@@ -33,14 +64,29 @@ use datafusion::common::Statistics;
 use datafusion::common::stats::Precision;
 use datafusion::datasource::file_format::FileFormat;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_expr::{LexOrdering, LexRequirement};
+use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, LexRequirement};
 use datafusion_datasource::TableSchema;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_compression_type::FileCompressionType;
 use datafusion_datasource::file_format::FileMeta;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::file_sink_config::FileSinkConfig;
+use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlanProperties, PlanProperties, Partitioning,
+    SendableRecordBatchStream,
+};
+use datafusion::execution::context::TaskContext;
+use futures::stream::Stream;
 use object_store::{ObjectMeta, ObjectStore};
+
+// ---------------------------------------------------------------------------
+// ADR-0024 constants (mirrors basin-storage::reader private copies).
+// TODO(adr-0024): drop when Vortex grows native FixedSizeBinary(N).
+// ---------------------------------------------------------------------------
+const BASIN_TYPE_KEY: &str = "BASIN_TYPE";
+const BASIN_TYPE_UUID: &str = "UUID";
 
 /// Wraps [`vortex_datafusion::VortexFormat`] and patches `total_byte_size` in
 /// `infer_stats` when the inner format returns `Precision::Absent`.
@@ -166,12 +212,29 @@ impl FileFormat for BasinVortexFormat {
 
     // ---- plan construction --------------------------------------------------
 
+    /// ADR-0024: wrap the inner plan with `UuidDecimal256RestoreExec` when the
+    /// scan schema contains any UUID-disguised `Decimal256(39, 0)` columns.
+    /// This converts those columns back to `FixedSizeBinary(16)` so DataFusion
+    /// above this point sees only the logical UUID type.
+    ///
+    /// The inner `VortexFormat::create_physical_plan` does NOT insert a cast
+    /// because `file_source` (below) already swapped those fields to
+    /// `Decimal256(39, 0)` in the `TableSchema` it received.
+    ///
+    /// TODO(adr-0024): drop wrap when Vortex grows native FixedSizeBinary(N).
     async fn create_physical_plan(
         &self,
         state: &dyn Session,
         conf: FileScanConfig,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.inner.create_physical_plan(state, conf).await
+        let inner_plan = self.inner.create_physical_plan(state, conf).await?;
+        // If the plan's output schema contains any Decimal256(39,0)+BASIN_TYPE=UUID
+        // columns, wrap with the restore exec.  Otherwise pass through unchanged.
+        if schema_has_uuid_decimal256(inner_plan.schema().as_ref()) {
+            Ok(Arc::new(UuidDecimal256RestoreExec::new(inner_plan)))
+        } else {
+            Ok(inner_plan)
+        }
     }
 
     async fn create_writer_physical_plan(
@@ -186,10 +249,261 @@ impl FileFormat for BasinVortexFormat {
             .await
     }
 
+    /// ADR-0024: swap UUID fields from `FixedSizeBinary(16)` to
+    /// `Decimal256(39, 0)` in the `TableSchema` before handing it to the inner
+    /// `VortexSource`.  Vortex stores UUIDs as `Decimal256(39, 0)` on disk;
+    /// supplying the catalog's `FixedSizeBinary(16)` schema causes Vortex's
+    /// `DefaultPhysicalExprAdapterFactory` to attempt an unsupported cast at
+    /// scan time.  By aligning the schema with the physical layout we prevent
+    /// that cast.  `create_physical_plan` (above) restores the FSB(16) type via
+    /// `UuidDecimal256RestoreExec` so the engine sees only the logical type.
+    ///
+    /// Field metadata (including `BASIN_TYPE=UUID`) is preserved verbatim so the
+    /// restore exec can identify which columns to translate.
+    ///
+    /// TODO(adr-0024): drop swap when Vortex grows native FixedSizeBinary(N).
     fn file_source(&self, table_schema: TableSchema) -> Arc<dyn FileSource> {
-        self.inner.file_source(table_schema)
+        let file_schema = table_schema.file_schema().clone();
+        if schema_has_uuid_fsb16(file_schema.as_ref()) {
+            let physical_file_schema = Arc::new(swap_uuid_fsb16_to_decimal256(file_schema.as_ref()));
+            let physical_table_schema = TableSchema::new(
+                physical_file_schema,
+                table_schema.table_partition_cols().clone(),
+            );
+            self.inner.file_source(physical_table_schema)
+        } else {
+            self.inner.file_source(table_schema)
+        }
     }
 }
+
+// ---------------------------------------------------------------------------
+// ADR-0024 helpers — UUID FixedSizeBinary(16) ↔ Decimal256(39,0) for the
+// DataFusion scan path.
+// TODO(adr-0024): drop when Vortex grows native FixedSizeBinary(N).
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if `schema` has at least one field that is
+/// `FixedSizeBinary(16)` with `BASIN_TYPE=UUID` metadata (i.e. a UUID column
+/// that needs to be hidden from Vortex as `Decimal256(39, 0)`).
+fn schema_has_uuid_fsb16(schema: &Schema) -> bool {
+    schema.fields().iter().any(|f| {
+        matches!(f.data_type(), DataType::FixedSizeBinary(16))
+            && f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_UUID)
+    })
+}
+
+/// Returns `true` if `schema` has at least one `Decimal256(39, 0)` field with
+/// `BASIN_TYPE=UUID` metadata (UUID-disguised column coming back from Vortex).
+fn schema_has_uuid_decimal256(schema: &Schema) -> bool {
+    schema.fields().iter().any(|f| {
+        matches!(f.data_type(), DataType::Decimal256(39, 0))
+            && f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_UUID)
+    })
+}
+
+/// Produce a copy of `schema` where every `FixedSizeBinary(16)+BASIN_TYPE=UUID`
+/// field is replaced by `Decimal256(39, 0)` (preserving all other field
+/// metadata).  Used to create a "physical" schema that matches the on-disk
+/// Vortex layout so the scan doesn't attempt an unsupported cast.
+fn swap_uuid_fsb16_to_decimal256(schema: &Schema) -> Schema {
+    let new_fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let is_uuid_fsb = matches!(f.data_type(), DataType::FixedSizeBinary(16))
+                && f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_UUID);
+            if is_uuid_fsb {
+                Field::new(f.name(), DataType::Decimal256(39, 0), f.is_nullable())
+                    .with_metadata(f.metadata().clone())
+            } else {
+                f.as_ref().clone()
+            }
+        })
+        .collect();
+    Schema::new_with_metadata(new_fields, schema.metadata().clone())
+}
+
+/// Produce a copy of `schema` where every `Decimal256(39, 0)+BASIN_TYPE=UUID`
+/// field is replaced by `FixedSizeBinary(16)`.  This is the logical output
+/// schema of `UuidDecimal256RestoreExec`.
+fn swap_uuid_decimal256_to_fsb16(schema: &Schema) -> Schema {
+    let new_fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let is_uuid = matches!(f.data_type(), DataType::Decimal256(39, 0))
+                && f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_UUID);
+            if is_uuid {
+                Field::new(f.name(), DataType::FixedSizeBinary(16), f.is_nullable())
+                    .with_metadata(f.metadata().clone())
+            } else {
+                f.as_ref().clone()
+            }
+        })
+        .collect();
+    Schema::new_with_metadata(new_fields, schema.metadata().clone())
+}
+
+/// Convert one `RecordBatch` whose Decimal256(39,0)+BASIN_TYPE=UUID columns
+/// contain UUID bytes into a batch where those columns are `FixedSizeBinary(16)`.
+///
+/// Mirror of `basin_storage::reader::decimal256_to_uuid_fsb` (kept private in
+/// basin-storage; we re-implement the same logic here to stay within the
+/// basin-engine scope as required by ADR-0024).
+fn restore_uuid_columns(batch: RecordBatch) -> DFResult<RecordBatch> {
+    let schema = batch.schema();
+    let mut new_fields: Vec<Field> = Vec::with_capacity(schema.fields().len());
+    let mut new_cols: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+
+    for (i, f) in schema.fields().iter().enumerate() {
+        let is_uuid = matches!(f.data_type(), DataType::Decimal256(39, 0))
+            && f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_UUID);
+        if is_uuid {
+            let src = batch
+                .column(i)
+                .as_any()
+                .downcast_ref::<Decimal256Array>()
+                .ok_or_else(|| {
+                    datafusion::common::DataFusionError::Internal(format!(
+                        "uuid restore: column '{}' expected Decimal256Array",
+                        f.name()
+                    ))
+                })?;
+            let len = src.len();
+            // The write path left-padded 16 UUID bytes with 16 zero bytes to
+            // form a 32-byte big-endian unsigned i256.  The inverse:
+            // `i256.to_be_bytes()[16..32]` recovers the 16 UUID bytes.
+            let rows = (0..len).map(|r| {
+                if src.is_null(r) {
+                    None
+                } else {
+                    let full = src.value(r).to_be_bytes();
+                    let mut buf = [0u8; 16];
+                    buf.copy_from_slice(&full[16..32]);
+                    Some(buf)
+                }
+            });
+            let arr = FixedSizeBinaryArray::try_from_sparse_iter_with_size(rows, 16)
+                .map_err(|e| {
+                    datafusion::common::DataFusionError::Internal(format!(
+                        "uuid restore: FixedSizeBinaryArray construction: {e}"
+                    ))
+                })?;
+            let new_field =
+                Field::new(f.name(), DataType::FixedSizeBinary(16), f.is_nullable())
+                    .with_metadata(f.metadata().clone());
+            new_fields.push(new_field);
+            new_cols.push(Arc::new(arr) as ArrayRef);
+        } else {
+            new_fields.push(f.as_ref().clone());
+            new_cols.push(batch.column(i).clone());
+        }
+    }
+
+    let new_schema = Arc::new(Schema::new_with_metadata(
+        new_fields,
+        schema.metadata().clone(),
+    ));
+    RecordBatch::try_new(new_schema, new_cols).map_err(|e| {
+        datafusion::common::DataFusionError::ArrowError(Box::new(e), None)
+    })
+}
+
+// ---------------------------------------------------------------------------
+// UuidDecimal256RestoreExec
+// ---------------------------------------------------------------------------
+
+/// A thin `ExecutionPlan` wrapper that translates `Decimal256(39, 0)` columns
+/// carrying `BASIN_TYPE=UUID` metadata back to `FixedSizeBinary(16)` on every
+/// output batch.
+///
+/// Inserted by `BasinVortexFormat::create_physical_plan` immediately above the
+/// inner `DataSourceExec` so DataFusion never observes the on-disk Decimal256
+/// encoding for UUID columns (ADR-0024).
+///
+/// TODO(adr-0024): remove when Vortex grows native FixedSizeBinary(N).
+#[derive(Debug)]
+struct UuidDecimal256RestoreExec {
+    inner: Arc<dyn ExecutionPlan>,
+    /// Output schema with Decimal256(39,0)+UUID fields replaced by FSB(16).
+    output_schema: SchemaRef,
+    /// Cached `PlanProperties` with the corrected output schema.
+    props: Arc<PlanProperties>,
+}
+
+impl UuidDecimal256RestoreExec {
+    fn new(inner: Arc<dyn ExecutionPlan>) -> Self {
+        let output_schema = Arc::new(swap_uuid_decimal256_to_fsb16(inner.schema().as_ref()));
+        let props = Arc::new(Self::compute_properties(&inner, Arc::clone(&output_schema)));
+        Self { inner, output_schema, props }
+    }
+
+    fn compute_properties(inner: &Arc<dyn ExecutionPlan>, schema: SchemaRef) -> PlanProperties {
+        // Derive equivalence properties from the inner plan but rebind to the
+        // new output schema.  Ordering / partitioning are unchanged — the exec
+        // is a row-for-row type-coercion with no reordering or repartitioning.
+        let eq = EquivalenceProperties::new(schema);
+        PlanProperties::new(
+            eq,
+            inner.output_partitioning().clone(),
+            inner.pipeline_behavior(),
+            inner.boundedness(),
+        )
+    }
+}
+
+impl DisplayAs for UuidDecimal256RestoreExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "UuidDecimal256RestoreExec")
+    }
+}
+
+impl ExecutionPlan for UuidDecimal256RestoreExec {
+    fn name(&self) -> &str {
+        "UuidDecimal256RestoreExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.output_schema)
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.props
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.inner]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(UuidDecimal256RestoreExec::new(children.swap_remove(0))))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        let inner_stream = self.inner.execute(partition, context)?;
+        let schema = Arc::clone(&self.output_schema);
+        let mapped = futures::StreamExt::map(inner_stream, move |batch_res| {
+            batch_res.and_then(|batch| restore_uuid_columns(batch))
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, mapped)))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UTF-8 → UTF-8 View promotion helpers (unchanged from original)
+// ---------------------------------------------------------------------------
 
 fn promote_utf8_dtype(dt: &DataType) -> DataType {
     match dt {
