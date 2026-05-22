@@ -6,6 +6,43 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-22 — Wave 3 (3 agents) + reconciliation: found a real GIN eviction bug; 8 stale .A boxes were already done
+
+Agents: F1=engine/catalog (5.18 search_path), F2=basin-pool (5.27.D), F3=reconciliation+CAPABILITIES.
+New policy this wave: **agents do NOT edit TASK.md** (orchestrator does all ticks) — eliminated the
+TASK.md commit-contention seen in Waves 1-2.
+
+- **5.27.D DONE** (`a70faa5`): `tenant_isolation.rs` — `assert_project_tag` at both cache-hit and
+  fresh-open checkout branches; a project-tag mismatch hard-errors. 13 pool tests pass.
+- **5.18.B/D/E DONE** (`44cc1e8`): already fully implemented (search_path, qualified-name
+  resolution, honest information_schema/pg_namespace); F1 only removed a stale `#![allow(dead_code)]`
+  shim. schema_e2e 6/6. **5.18.C deferred** — needs basin-auth/net/cron/blob namespace migration
+  (out of the engine/catalog scope; queued).
+- **5.22.E DONE** (`e1a1a4a`): CAPABILITIES.md documented-exclusions section.
+- **8 stale `.A` harness boxes were ALL already green** (audit-swept, bare-exit): 5.19.A
+  (jsonb_index 2+2ign), 5.20.A (fts 5/5), 5.21.A (cdc 4+3ign), 5.23.A (explain_pg_stat 5+2ign),
+  5.24.A (range 6/6), 5.26.A (pgvector 6/6), 5.29.A (hypertable 5+1ign), 5.30.A (citext 4/4).
+  Ticked. (Ignored sub-tests are perf-gates / external-tool slices — consistent with the [~] CI wiring.)
+
+- **REAL BUG FOUND + FIXED** (`40ebea2`): F1 surfaced a failing unit test
+  `index_probe::tests::eviction_marks_only_affected_files_as_unindexed` — my Wave-0 GIN WIP
+  verification had run the integration harness but NOT the basin-engine *lib* unit tests, so it
+  was missed. Root cause: `evict_oldest` used `posting_budget()/4` (~125k of the 500k default) as
+  the batch size, but the doc says "evict the oldest 25% of *terms*" — so it mass-over-evicts when
+  the list barely exceeds budget, and the 4-term test evicted everything. Fixed in BOTH
+  index_probe.rs (JSONB-GIN) and gin_tsvector.rs (tsvector-GIN) to `insert_order.len()/4`.
+  basin-engine lib 1189/0, basin-storage lib 129/0. **Lesson: per-wave gate must include
+  `cargo test -p <touched-crate> --lib`, not just the integration harnesses.**
+
+- **6.SEC.P1 NOT ticked (correctly open):** 3 of 5 named P1s are closed (OAuth unverified-email,
+  reserved-schema DDL, public-bucket alias) but 6.SEC.T documents UNFIXED findings as `#[ignore]`'d
+  expected-failing tests: P1-1 (WS message filter), P1-3 (redirect_to origin validation), P1-5
+  (admin project binding) + signed-URL rotation. These are real remaining beta-blocker security
+  work — queued for Wave 4.
+
+- **F3 watchdog-stalled** mid-audit (long harness runs, no stream output) AFTER committing
+  CAPABILITIES; its tick-list report was lost, so the orchestrator re-ran the audit directly.
+
 ## 2026-05-22 — Wave 2 (4 agents) green; closed 6.TR.B/#63, list_factors stub, CI wiring, docs; ORCHESTRATION ERROR caught
 
 Dispatched 4 file-disjoint agents: E1=basin-engine (6.TR.B viability_uuid read-path),

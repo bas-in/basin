@@ -1202,7 +1202,7 @@ basin-catalog (no other catalog agent concurrent).
       `public` is default; unqualified + `public.` resolve identically to today.
       InMemory + Postgres impls + round-trip tests. **Foundation — blocks B/C/D/E.**
       Files: `crates/basin-catalog/src/**`.
-- [ ] **5.18.B — Real `search_path` + qualified-name resolution.** Replace the
+- [x] **5.18.B — Real `search_path` + qualified-name resolution.** Replace the
       cosmetic shim in `crates/basin-engine/src/schema_ddl.rs`: resolver walks
       `search_path` (default `public`, `pg_catalog` implicitly first); qualified
       reserved-schema names bind directly; user schemas alias to `public`.
@@ -1213,11 +1213,11 @@ basin-catalog (no other catalog agent concurrent).
       path + migration test per subsystem; MUST NOT regress existing
       auth/storage/cron/net suites. Depends on 5.18.A. Files: `crates/basin-auth`,
       `crates/basin-net`, `crates/basin-cron`, `crates/basin-blob`.
-- [ ] **5.18.D — Honest introspection.** `information_schema.schemata` +
+- [x] **5.18.D — Honest introspection.** `information_schema.schemata` +
       `.tables.table_schema`, `pg_catalog.pg_namespace` + `pg_class.relnamespace`
       report real reserved-schema membership (extend Phase 5.11.M views).
       Depends on 5.18.A.
-- [ ] **5.18.E — Differential + tooling test.** PG tooling
+- [x] **5.18.E — Differential + tooling test.** PG tooling
       (pgAdmin/Prisma/PostgREST) sees `auth.users` / `storage.objects` in the
       right schema; RLS-on-`storage.objects` still scopes; user `CREATE SCHEMA x`
       + `x.t` aliases to `public.t` (documented). Depends on A–D.
@@ -1235,7 +1235,7 @@ without scanning every row.
 the implementation; every implementation task closes against this
 harness.
 
-- [ ] **5.19.A — Differential + ORM-compat test harness** (~1 week,
+- [x] **5.19.A — Differential + ORM-compat test harness** (~1 week,
       lands first). Three layers:
       (1) **Differential correctness:** for a curated battery of
       JSONB queries (`@>`, `<@`, `?`, `?&`, `?|`, `->`, `->>`, `#>`),
@@ -1302,7 +1302,7 @@ Meilisearch/Typesense or leave.
 **Test-first.** The FTS battery + ORM-compat lands first; each
 implementation task flips a slice of the harness green.
 
-- [ ] **5.20.A — FTS battery + ORM-compat test harness** (~1 week,
+- [x] **5.20.A — FTS battery + ORM-compat test harness** (~1 week,
       lands first). Three layers:
       (1) **Type round-trip:** `tsvector` + `tsquery` round-trip
       through psql + binary pgwire (binary parameter binding);
@@ -1360,7 +1360,7 @@ for apps, adapters for data tools."
 Debezium + Fivetran integration tests land first; each
 implementation task closes against this harness.
 
-- [ ] **5.21.A — CDC protocol conformance + tool-integration test
+- [x] **5.21.A — CDC protocol conformance + tool-integration test
       harness** (~1 week, lands first). Three layers:
       (1) **In-process consumer:** test-only Rust client that speaks
       pgwire's replication-protocol subset (`CREATE_REPLICATION_SLOT`,
@@ -1483,7 +1483,7 @@ each implementation task flips a slice of it green.
       Acceptance: end-to-end CLI slice of 5.22.A flips green;
       output is byte-for-byte stable across runs at the same
       snapshot.
-- [ ] **5.22.E — Documented exclusions in `CAPABILITIES.md`**
+- [x] **5.22.E — Documented exclusions in `CAPABILITIES.md`**
       (~1 day). Note any PG features Basin can't dump losslessly
       (extensions, plpgsql); dump output flags them with
       `-- skipped: <feature>` comments so import-into-PG attempts
@@ -1498,7 +1498,7 @@ pgAdmin / pgcli). Plus `EXPLAIN ANALYZE` correctness verification.
 **Test-first.** Admin-view structural correctness + real-tooling
 compat harness lands first.
 
-- [ ] **5.23.A — Admin-view + tooling-compat test harness**
+- [x] **5.23.A — Admin-view + tooling-compat test harness**
       (~3 days, lands first). Three layers:
       (1) **EXPLAIN ANALYZE correctness:** curated query battery
       (point lookup, full scan, join, aggregate, window, CTE);
@@ -1552,7 +1552,7 @@ overlap-detection ergonomics.
 **Test-first.** Range-types semantics + ORM compat + scheduling
 integration harness lands first.
 
-- [ ] **5.24.A — Range types + ORM-compat + scheduling test harness**
+- [x] **5.24.A — Range types + ORM-compat + scheduling test harness**
       (~1 week, lands first). Three layers:
       (1) **Type round-trip:** all six range types
       (`int4range`, `int8range`, `numrange`, `tsrange`, `tstzrange`,
@@ -1666,7 +1666,7 @@ decision that determines drop-in-ability for a huge customer profile.
 + ORM-compat harness lands first; each implementation sub-task
 flips a named slice of the harness from red to green.
 
-- [ ] **5.26.A — pgvector differential + ORM-compat test harness**
+- [x] **5.26.A — pgvector differential + ORM-compat test harness**
       (~3 days, lands first; lands red against current engine).
       Four layers:
       (1) **Reference differential:** spin up the official `pgvector/pgvector`
@@ -1777,7 +1777,7 @@ each impl sub-task flips a named slice green.
       Node.js app + Dockerfile + compose service; CI job runs the
       integration script. Acceptance: closes the
       **`@vercel/postgres` slice** of 5.27.A.
-- [ ] **5.27.D — Per-project isolation enforcement at checkout**
+- [x] **5.27.D — Per-project isolation enforcement at checkout**
       (~3 days). Per-project pool partitions remain isolated even
       under txn-mode sharing; one project's exhaustion doesn't
       starve others (use the per-tenant semaphore pattern from
@@ -1861,7 +1861,7 @@ naturally with the audit-log wedge already named.
 **Test-first.** Time-series workload battery + ORM-compat + 1B-row
 soak lands red first; each impl sub-task flips a named slice green.
 
-- [ ] **5.29.A — Hypertable workload + ORM-compat + soak harness**
+- [x] **5.29.A — Hypertable workload + ORM-compat + soak harness**
       (~3 days, lands first; lands red against current engine).
       Five layers:
       (1) **Auto-partition by time bucket (1d / 1w / 1mo):** insert
@@ -1941,7 +1941,7 @@ extension; Basin ships it native (no extension surface).
 battery lands red first; each impl sub-task flips a named slice
 green.
 
-- [ ] **5.30.A — citext semantics + ORM-compat harness**
+- [x] **5.30.A — citext semantics + ORM-compat harness**
       (~half day, lands first; lands red against current engine).
       Four layers:
       (1) **Type round-trip:** `citext` declared on a column,
