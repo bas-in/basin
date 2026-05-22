@@ -853,6 +853,10 @@ pub(crate) fn session_lock_timeout(state: &SessionState) -> Option<std::time::Du
 }
 
 /// Set `lock_timeout` for this session. `None` disables it.
+///
+/// Updates both the `SessionState.lock_timeout` field (for any callers that
+/// read it directly) and `advisory.lock_timeout` (used by the blocking
+/// `pg_advisory_lock` UDF — ADR 0026).
 pub(crate) fn set_session_lock_timeout(
     state: &SessionState,
     d: Option<std::time::Duration>,
@@ -861,6 +865,9 @@ pub(crate) fn set_session_lock_timeout(
         .lock_timeout
         .lock()
         .expect("lock_timeout lock poisoned") = d;
+    // Mirror into the advisory-lock manager so pg_advisory_lock(key)
+    // honors the new timeout immediately (ADR 0026).
+    state.advisory.set_lock_timeout(d);
 }
 
 /// Read the current `idle_in_transaction_session_timeout` for this session.
@@ -1178,6 +1185,15 @@ pub(crate) async fn open(
     let vtxid = format!("1/{session_pid}");
     let lock_entry = basin_shard::LockEntry::virtualxid_lock(session_pid, &vtxid);
     let lock_handle = engine.lock_registry().acquire(&project, lock_entry);
+
+    // ADR 0026: wire the LockRegistry + project + pid into the advisory-lock
+    // manager so that held advisory locks appear in `pg_locks` and the session
+    // pid is correctly reported.
+    state.advisory.set_registry(
+        engine.lock_registry().clone(),
+        project,
+        session_pid,
+    );
 
     Ok(ProjectSession {
         engine,

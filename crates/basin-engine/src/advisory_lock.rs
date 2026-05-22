@@ -1,4 +1,4 @@
-//! In-process PostgreSQL-faithful advisory-lock subsystem (BUG #138).
+//! In-process PostgreSQL-faithful advisory-lock subsystem (BUG #138 + ADR 0026).
 //!
 //! ## What this replaces
 //!
@@ -9,6 +9,16 @@
 //! effect: applications using advisory locks as distributed mutexes (job
 //! queues, cron singletons, leader election) got **no mutual exclusion** and
 //! were silently told every lock attempt succeeded.
+//!
+//! ## ADR 0026 — blocking with lock_timeout
+//!
+//! Per ADR 0026, Basin uses optimistic concurrency for row writes (conflicts
+//! surface as SQLSTATE 40001 at commit). Advisory locks are the *only*
+//! operations that genuinely block in Basin. This module implements a real
+//! keyed wait queue: a second session requesting a held key spins (using
+//! `basin_shard::lock_wait::bounded_lock_wait_sync`) until the holder
+//! releases or `lock_timeout` fires. On timeout the function returns
+//! `BasinError::LockNotAvailable` → SQLSTATE 55P03.
 //!
 //! ## Scope
 //!
@@ -34,7 +44,8 @@
 //!   into the same per-owner count, matching PG.
 //! * `pg_try_advisory_lock(bigint) -> bool`: non-blocking; `true` if acquired
 //!   (or already owned — bumps the count), `false` if held by another session.
-//! * `pg_advisory_lock(bigint) -> void`: see the blocking-deviation note.
+//! * `pg_advisory_lock(bigint) -> void`: blocks until acquired or
+//!   `lock_timeout` fires (→ SQLSTATE 55P03 via `BasinError::LockNotAvailable`).
 //! * `pg_advisory_unlock(bigint) -> bool`: `true` if this session held it
 //!   (decrements the count, releasing at zero), `false` otherwise. Unlocking
 //!   a key not held by this session returns `false` (PG also emits a WARNING;
@@ -49,29 +60,24 @@
 //! * Session end: every lock still held by the ending session — session- and
 //!   xact-scoped alike — is released (wired via `Drop for SessionState`).
 //!
-//! ## Deviation from PG: the blocking `pg_advisory_lock`
+//! ## lock_timeout enforcement (ADR 0026)
 //!
-//! True indefinite blocking inside DataFusion's synchronous scalar-UDF
-//! `invoke_with_args` path is not available: a UDF cannot `.await`, cannot
-//! park the executor thread without risking a Tokio worker-pool stall, and
-//! the engine has no fairness/queueing primitive wired through the planner.
-//! Faking it (returning immediately while pretending we blocked) would
-//! re-introduce the silent-no-mutual-exclusion bug. Instead, the blocking
-//! variants (`pg_advisory_lock`, `pg_advisory_xact_lock`) perform a
-//! **bounded spin-with-backoff retry** (`ADVISORY_BLOCK_ATTEMPTS` attempts,
-//! ~`ADVISORY_BLOCK_SLEEP` between them, std thread sleep). If the lock is
-//! still held by another session after the bound elapses, the function
-//! returns an explicit error (SQLSTATE 55P03 `lock_not_available`-style) so
-//! the caller is *never* falsely told it holds the lock. For the common
-//! single-contender test/job pattern the lock is free immediately and the
-//! function returns instantly. This deviation (bounded wait + error vs.
-//! indefinite block) is documented precisely here and does not compromise
-//! mutual exclusion — it only changes how a long-contended blocking call
-//! terminates.
+//! The blocking variants use `basin_shard::lock_wait::bounded_lock_wait_sync`
+//! with the session's `lock_timeout` GUC value as the deadline. On expiry
+//! the function returns `BasinError::LockNotAvailable` → SQLSTATE 55P03. A
+//! `None` lock_timeout means wait indefinitely (until the lock is released).
+//!
+//! ## LockRegistry integration (Phase 5.23.D)
+//!
+//! Granted advisory locks are surfaced in the `LockRegistry` so they appear
+//! in `pg_locks`. A `LockHandle` is held for the life of the advisory lock and
+//! dropped on release (RAII). Waiting entries (granted=false) are registered
+//! before blocking and replaced by granted=true on success.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use std::any::Any;
 
@@ -86,10 +92,12 @@ use datafusion::logical_expr::{
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 
-/// Number of retry attempts the blocking variants make before giving up.
-const ADVISORY_BLOCK_ATTEMPTS: u32 = 200;
-/// Sleep between blocking-variant retry attempts.
-const ADVISORY_BLOCK_SLEEP: std::time::Duration = std::time::Duration::from_millis(5);
+use basin_common::BasinError;
+use basin_shard::lock_wait::bounded_lock_wait_sync;
+
+/// Retry cadence for the blocking variants. 2 ms gives low latency for the
+/// common case (held for < 10 ms) while not hammering the CPU on long waits.
+const ADVISORY_RETRY_INTERVAL: Duration = Duration::from_millis(2);
 
 /// Monotonic source of per-session owner tokens. Starts at 1 so that 0 can
 /// stand in for "no owner" if ever needed.
@@ -183,17 +191,42 @@ fn release_all_of(key: i64, owner: u64) {
 /// them lets `pg_advisory_unlock` only touch session-scoped acquisitions
 /// (PG: cannot manually unlock an xact lock) and lets txn-end release only
 /// the xact-scoped portion.
+///
+/// `lock_timeout` mirrors the session's GUC: set by `SET lock_timeout = …`
+/// and read by the blocking acquisition path.
+///
+/// `registry` and `project_id` allow granted advisory locks to appear in
+/// `pg_locks` (Phase 5.23.D). `session_pid` is the synthetic backend pid.
+/// These are set once at session-open time via `set_registry`.
 #[derive(Debug)]
 pub(crate) struct AdvisorySessionLocks {
     /// Unique owner token for this session.
     owner: u64,
-    held: Mutex<HashMap<i64, HeldCounts>>,
+    held: Mutex<HashMap<i64, HeldEntry>>,
+    /// Per-session lock_timeout GUC. `None` = disabled (wait indefinitely).
+    lock_timeout: Mutex<Option<Duration>>,
+    /// LockRegistry for pg_locks observability. Set once via `set_registry`.
+    registry: std::sync::OnceLock<basin_shard::LockRegistry>,
+    /// ProjectId for LockRegistry scoping.
+    project_id: std::sync::OnceLock<basin_common::ProjectId>,
+    /// Synthetic backend pid for LockEntry.
+    session_pid: std::sync::atomic::AtomicI32,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-struct HeldCounts {
+/// Per-key tracking for a single session.
+#[derive(Debug)]
+struct HeldEntry {
     session: u32,
     xact: u32,
+    /// RAII LockHandle(s) for pg_locks. One handle per total acquisition
+    /// (we keep only a single handle and drop it when count reaches zero).
+    _registry_handle: Option<basin_shard::LockHandle>,
+}
+
+impl HeldEntry {
+    fn total(&self) -> u32 {
+        self.session + self.xact
+    }
 }
 
 impl Default for AdvisorySessionLocks {
@@ -207,17 +240,60 @@ impl AdvisorySessionLocks {
         Self {
             owner: OWNER_SEQ.fetch_add(1, Ordering::Relaxed),
             held: Mutex::new(HashMap::new()),
+            lock_timeout: Mutex::new(None),
+            registry: std::sync::OnceLock::new(),
+            project_id: std::sync::OnceLock::new(),
+            session_pid: std::sync::atomic::AtomicI32::new(0),
         }
     }
 
+    /// Wire the LockRegistry and project context so granted locks appear in
+    /// `pg_locks`. Called from `session::open` after the registry + pid are
+    /// known. Must be called at most once (OnceLock semantics).
+    pub(crate) fn set_registry(
+        &self,
+        registry: basin_shard::LockRegistry,
+        project_id: basin_common::ProjectId,
+        session_pid: i32,
+    ) {
+        let _ = self.registry.set(registry);
+        let _ = self.project_id.set(project_id);
+        self.session_pid
+            .store(session_pid, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Update the session's `lock_timeout`. Called by `SET lock_timeout = …`.
+    pub(crate) fn set_lock_timeout(&self, d: Option<Duration>) {
+        *self.lock_timeout.lock().expect("lock_timeout poisoned") = d;
+    }
+
+    /// Read the current `lock_timeout`.
+    pub(crate) fn get_lock_timeout(&self) -> Option<Duration> {
+        *self.lock_timeout.lock().expect("lock_timeout poisoned")
+    }
+
     fn note_acquired(&self, key: i64, xact: bool) {
+        let pid = self.session_pid.load(std::sync::atomic::Ordering::Relaxed);
+        let registry_handle = match (self.registry.get(), self.project_id.get()) {
+            (Some(reg), Some(proj)) => {
+                let entry = basin_shard::LockEntry::advisory_lock(pid, key, true);
+                Some(reg.acquire(proj, entry))
+            }
+            _ => None,
+        };
         let mut h = self.held.lock().expect("AdvisorySessionLocks poisoned");
-        let e = h.entry(key).or_default();
+        let e = h.entry(key).or_insert_with(|| HeldEntry {
+            session: 0,
+            xact: 0,
+            _registry_handle: registry_handle,
+        });
         if xact {
             e.xact += 1;
         } else {
             e.session += 1;
         }
+        // If the entry already existed (reentrant), we don't add a new
+        // registry handle — the existing one covers the combined hold.
     }
 
     /// Record a session-scoped unlock. Returns `true` if a session-scoped
@@ -227,8 +303,8 @@ impl AdvisorySessionLocks {
         match h.get_mut(&key) {
             Some(c) if c.session > 0 => {
                 c.session -= 1;
-                if c.session == 0 && c.xact == 0 {
-                    h.remove(&key);
+                if c.total() == 0 {
+                    h.remove(&key); // drops _registry_handle → pg_locks entry removed
                 }
                 true
             }
@@ -248,23 +324,44 @@ impl AdvisorySessionLocks {
         }
     }
 
-    /// Bounded-blocking acquire (see module deviation note). `Ok(())` once
-    /// held; `Err` if still contended after the bound.
-    pub(crate) fn block_lock(&self, key: i64, xact: bool) -> Result<(), String> {
-        for attempt in 0..ADVISORY_BLOCK_ATTEMPTS {
-            if self.try_lock(key, xact) {
-                return Ok(());
-            }
-            if attempt + 1 < ADVISORY_BLOCK_ATTEMPTS {
-                std::thread::sleep(ADVISORY_BLOCK_SLEEP);
-            }
+    /// Blocking acquire with `lock_timeout` enforcement (ADR 0026).
+    ///
+    /// Spins via `bounded_lock_wait_sync` until the lock is free or the
+    /// session's `lock_timeout` elapses. On expiry returns
+    /// `BasinError::LockNotAvailable` → SQLSTATE 55P03.
+    ///
+    /// The waiter entry (`granted=false`) is registered in `LockRegistry`
+    /// before blocking and replaced by `granted=true` on success.
+    pub(crate) fn block_lock(&self, key: i64, xact: bool) -> Result<(), BasinError> {
+        let pid = self.session_pid.load(std::sync::atomic::Ordering::Relaxed);
+        // Register a waiting entry in pg_locks so observers see the contention.
+        let _wait_handle: Option<basin_shard::LockHandle> =
+            match (self.registry.get(), self.project_id.get()) {
+                (Some(reg), Some(proj)) => {
+                    let entry = basin_shard::LockEntry::advisory_lock(pid, key, false);
+                    Some(reg.acquire(proj, entry))
+                }
+                _ => None,
+            };
+
+        let owner = self.owner;
+        let acquired = bounded_lock_wait_sync(
+            move || try_acquire(key, owner) == AcquireOutcome::Acquired,
+            self.get_lock_timeout(),
+            ADVISORY_RETRY_INTERVAL,
+        );
+
+        // _wait_handle is dropped here — removes the waiting entry from pg_locks.
+        drop(_wait_handle);
+
+        if acquired {
+            self.note_acquired(key, xact);
+            Ok(())
+        } else {
+            Err(BasinError::LockNotAvailable(format!(
+                "canceling statement due to lock timeout on advisory lock {key}"
+            )))
         }
-        Err(format!(
-            "advisory lock {key} is held by another session; \
-             Basin's pg_advisory_lock waits a bounded time then errors \
-             (single-node, see advisory_lock.rs deviation note) rather than \
-             blocking indefinitely or falsely reporting success"
-        ))
     }
 
     /// `pg_advisory_unlock`: release one session-scoped acquisition.
@@ -325,7 +422,7 @@ impl AdvisorySessionLocks {
             if let Some(c) = h.get_mut(&key) {
                 c.xact = 0;
                 if c.session == 0 {
-                    h.remove(&key);
+                    h.remove(&key); // drops _registry_handle
                 }
             }
         }
@@ -340,6 +437,7 @@ impl AdvisorySessionLocks {
         for key in keys {
             release_all_of(key, self.owner);
         }
+        // Clear held map — this drops all _registry_handle entries.
         self.held
             .lock()
             .expect("AdvisorySessionLocks poisoned")
@@ -473,6 +571,10 @@ impl ScalarUDFImpl for TryAdvisoryLockUdf {
 
 // ---------------------------------------------------------------------------
 // UDF: pg_advisory_lock / pg_advisory_xact_lock  -> void (NULL)
+//
+// Blocking variant: waits until the lock is free or lock_timeout elapses.
+// On timeout: returns SQLSTATE 55P03 via DataFusionError::Execution wrapping
+// BasinError::LockNotAvailable (the router maps this to "55P03").
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -517,7 +619,7 @@ impl ScalarUDFImpl for AdvisoryLockUdf {
             if let Some(key) = decode_key(&arrs, i) {
                 self.locks
                     .block_lock(key, self.xact)
-                    .map_err(DataFusionError::Execution)?;
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
             }
         }
         Ok(ColumnarValue::Scalar(ScalarValue::Null))
@@ -791,20 +893,75 @@ mod tests {
     }
 
     #[test]
-    fn block_lock_returns_err_when_contended() {
-        // Sanity: a held key makes the bounded blocking variant give up with
-        // an error rather than ever returning Ok (no fake mutual exclusion).
-        // Keep the bound effect cheap by relying on the documented constants;
-        // this still completes well under a second.
+    fn block_lock_honors_lock_timeout_and_errors() {
+        // When the lock is held and lock_timeout is set, block_lock must
+        // return LockNotAvailable within the timeout window — never falsely
+        // claiming success.
         let a = AdvisorySessionLocks::new();
         let b = AdvisorySessionLocks::new();
         let key = 0x1380_000A_i64;
         assert!(a.try_lock(key, false));
-        let err = b.block_lock(key, false).unwrap_err();
-        assert!(err.contains("held by another session"));
+
+        // B has a 50 ms lock_timeout.
+        b.set_lock_timeout(Some(Duration::from_millis(50)));
+        let t0 = std::time::Instant::now();
+        let err = b.block_lock(key, false).expect_err("should time out");
+        let elapsed = t0.elapsed();
+        // Must not take much longer than the timeout.
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "block_lock took too long: {elapsed:?}"
+        );
+        assert!(
+            matches!(err, BasinError::LockNotAvailable(_)),
+            "unexpected error: {err:?}"
+        );
+
         a.session_unlock(key);
         // Now uncontended -> immediate Ok.
         assert!(b.block_lock(key, false).is_ok());
+        b.session_unlock(key);
+    }
+
+    #[test]
+    fn block_lock_succeeds_after_holder_releases() {
+        // B waits with a generous timeout; A releases mid-wait → B acquires.
+        let a = AdvisorySessionLocks::new();
+        let b = AdvisorySessionLocks::new();
+        let key = 0x1380_000B_i64;
+        assert!(a.try_lock(key, false));
+
+        let a_arc = Arc::new(a);
+        let a_clone = a_arc.clone();
+
+        // Release A's lock in a background thread after 30 ms.
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            a_clone.session_unlock(key);
+        });
+
+        b.set_lock_timeout(Some(Duration::from_millis(500)));
+        b.block_lock(key, false).expect("B must acquire after A releases");
+        b.session_unlock(key);
+    }
+
+    #[test]
+    fn lock_timeout_none_waits_until_free() {
+        // With no lock_timeout, block_lock must wait however long needed.
+        let a = AdvisorySessionLocks::new();
+        let b = AdvisorySessionLocks::new();
+        let key = 0x1380_000C_i64;
+        assert!(a.try_lock(key, false));
+
+        let a_arc = Arc::new(a);
+        let a_clone = a_arc.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            a_clone.session_unlock(key);
+        });
+
+        // No timeout — b.lock_timeout is None (wait indefinitely).
+        b.block_lock(key, false).expect("must acquire once A releases");
         b.session_unlock(key);
     }
 }

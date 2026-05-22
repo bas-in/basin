@@ -103,12 +103,31 @@ impl LockEntry {
             recorded_at: Instant::now(),
         }
     }
+
+    /// Create a granted advisory lock entry.
+    ///
+    /// `key` is the i64 advisory lock key; `pid` is the session's synthetic
+    /// backend pid. `granted` should be `true` once the lock is held, `false`
+    /// while waiting (for `pg_locks` observability of lock wait queues).
+    pub fn advisory_lock(pid: i32, key: i64, granted: bool) -> Self {
+        Self {
+            locktype: "advisory".to_string(),
+            database: None,
+            relation: None,
+            virtualxid: None,
+            mode: "ExclusiveLock".to_string(),
+            granted,
+            pid,
+            table_name: None,
+            recorded_at: Instant::now(),
+        }
+    }
 }
 
 /// Process-wide, project-scoped lock registry.
 ///
 /// Cheap to clone — just an `Arc` ref-count bump.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct LockRegistry {
     /// `project → lock entries` map protected by a `Mutex`.
     ///
@@ -168,6 +187,7 @@ impl LockRegistry {
 /// the owning `ProjectSession` is dropped. The `recorded_at` field (an
 /// `Instant`) serves as the unique key within a project's entry list since two
 /// `Instant`s for different `acquire` calls will differ.
+#[derive(Debug)]
 pub struct LockHandle {
     registry: Arc<Mutex<HashMap<ProjectId, Vec<LockEntry>>>>,
     project: ProjectId,
