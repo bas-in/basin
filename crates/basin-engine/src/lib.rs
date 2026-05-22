@@ -316,7 +316,24 @@ impl Engine {
             shard.set_top_pattern_provider(inner.query_history.clone());
         }
         attach_reactor_sink(&inner, catalog);
-        Self { inner }
+        let engine = Self { inner };
+        // Phase 5.28.C: auto-start the idle-in-transaction session reaper when
+        // a tokio runtime is available.  The reaper sweeps every 100 ms and
+        // flags sessions whose idle-in-transaction timeout has elapsed.  The
+        // spawned task holds a clone of the registry (via Arc) and the tokio
+        // runtime shuts it down at process / test exit.  Sync unit tests that
+        // call `Engine::new()` outside a tokio context don't get the reaper
+        // (they call `registry.sweep()` directly in tests).
+        if let Ok(rt_handle) = tokio::runtime::Handle::try_current() {
+            let registry = engine.inner.reaper_registry.clone();
+            rt_handle.spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    registry.sweep();
+                }
+            });
+        }
+        engine
     }
 
     /// Persist a per-project storage config (KMS routing + provider

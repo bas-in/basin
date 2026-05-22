@@ -31,6 +31,7 @@
 //! Project scoping: every catalog mutator is project-scoped already; the
 //! engine never sees a non-project-qualified `Catalog::set_*` call.
 
+use crate::pg_ast::ObjectNamePartExt;
 use crate::schema_ddl::SchemaState;
 use arrow_schema::{Field, Schema};
 use basin_catalog::{Catalog, CheckConstraint};
@@ -41,8 +42,8 @@ use sqlparser::ast::{
 use std::sync::{Arc, RwLock};
 
 use crate::types::{
-    arrow_data_type, is_tsquery_sql, is_tsvector_sql, BASIN_TYPE_KEY, BASIN_TYPE_TSQUERY,
-    BASIN_TYPE_TSVECTOR,
+    arrow_data_type, basin_type_marker, is_tsquery_sql, is_tsvector_sql, BASIN_TYPE_JSONB,
+    BASIN_TYPE_KEY, BASIN_TYPE_TSQUERY, BASIN_TYPE_TSVECTOR, BASIN_TYPE_UUID,
 };
 
 /// Custom Basin-specific ALTER TABLE extensions that sqlparser doesn't
@@ -913,13 +914,21 @@ async fn add_column(
             }
         }
     }
-    // Carry BASIN_TYPE metadata (TSVECTOR, TSQUERY, etc.) so that the INSERT
-    // coercion path recognises the column type after a schema round-trip.
-    // Without this, Arrow sees DataType::Utf8 with no marker and falls
-    // through to the plain-text coercion branch, which rejects UDF calls
-    // such as `to_tsvector(...)` with "expected string literal".
+    // Carry BASIN_TYPE metadata so that the INSERT coercion path, pgwire
+    // encoder, and info_schema all recognise the logical type after a
+    // schema round-trip via ALTER TABLE ADD COLUMN.  This mirrors the
+    // identical metadata-stamping in `ddl::schema_from_columns`.
     let mut md: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    if is_tsvector_sql(&column_def.data_type) {
+    if is_jsonb_sql_add_col(&column_def.data_type) {
+        md.insert(BASIN_TYPE_KEY.to_string(), BASIN_TYPE_JSONB.to_string());
+    } else if is_uuid_sql_add_col(&column_def.data_type) {
+        md.insert(BASIN_TYPE_KEY.to_string(), BASIN_TYPE_UUID.to_string());
+    } else if let Some(marker) = basin_type_marker(&column_def.data_type) {
+        // Handles: INET, CIDR, MACADDR, MACADDR8, MONEY, BIT(n), VARBIT(n),
+        // CITEXT, XML, and the range types (INT4RANGE, INT8RANGE, NUMRANGE,
+        // DATERANGE, TSRANGE, TSTZRANGE) when spelled as Custom identifiers.
+        md.insert(BASIN_TYPE_KEY.to_string(), marker);
+    } else if is_tsvector_sql(&column_def.data_type) {
         md.insert(BASIN_TYPE_KEY.to_string(), BASIN_TYPE_TSVECTOR.to_string());
     } else if is_tsquery_sql(&column_def.data_type) {
         md.insert(BASIN_TYPE_KEY.to_string(), BASIN_TYPE_TSQUERY.to_string());
@@ -934,6 +943,36 @@ async fn add_column(
     let new_schema = Schema::new(fields);
     catalog.set_schema(project, table, new_schema).await?;
     Ok(())
+}
+
+/// Returns `true` if the SQL type is JSONB or JSON (treated as JSONB synonym
+/// in Basin v0.1). Mirrors `ddl::is_jsonb_sql` for the ADD COLUMN path.
+fn is_jsonb_sql_add_col(sql: &sqlparser::ast::DataType) -> bool {
+    use sqlparser::ast::DataType as SqlDataType;
+    match sql {
+        SqlDataType::JSONB | SqlDataType::JSON => true,
+        SqlDataType::Custom(name, modifiers) => {
+            name.0.len() == 1
+                && name.0[0].id_val().eq_ignore_ascii_case("jsonb")
+                && modifiers.is_empty()
+        }
+        _ => false,
+    }
+}
+
+/// Returns `true` if the SQL type is UUID. Mirrors `ddl::is_uuid_sql` for
+/// the ADD COLUMN path.
+fn is_uuid_sql_add_col(sql: &sqlparser::ast::DataType) -> bool {
+    use sqlparser::ast::DataType as SqlDataType;
+    match sql {
+        SqlDataType::Uuid => true,
+        SqlDataType::Custom(name, modifiers) => {
+            name.0.len() == 1
+                && name.0[0].id_val().eq_ignore_ascii_case("uuid")
+                && modifiers.is_empty()
+        }
+        _ => false,
+    }
 }
 
 fn single_part_object_name(

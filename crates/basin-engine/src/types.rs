@@ -960,6 +960,15 @@ pub(crate) fn basin_type_marker(sql: &SqlDataType) -> Option<String> {
             }
         }
         "CITEXT" if modifiers.is_empty() => Some(BASIN_TYPE_CITEXT.to_string()),
+        // Range types — all stored as Utf8 JSON.
+        "INT4RANGE" if modifiers.is_empty() => Some(BASIN_TYPE_INT4RANGE.to_string()),
+        "INT8RANGE" if modifiers.is_empty() => Some(BASIN_TYPE_INT8RANGE.to_string()),
+        "NUMRANGE" if modifiers.is_empty() => Some(BASIN_TYPE_NUMRANGE.to_string()),
+        "DATERANGE" if modifiers.is_empty() => Some(BASIN_TYPE_DATERANGE.to_string()),
+        "TSRANGE" if modifiers.is_empty() => Some(BASIN_TYPE_TSRANGE.to_string()),
+        "TSTZRANGE" if modifiers.is_empty() => Some(BASIN_TYPE_TSTZRANGE.to_string()),
+        // XML — stored as Utf8.
+        "XML" if modifiers.is_empty() => Some(BASIN_TYPE_XML.to_string()),
         _ => None,
     }
 }

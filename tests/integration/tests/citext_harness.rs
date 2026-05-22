@@ -119,7 +119,6 @@ async fn scalar_bool(sess: &basin_engine::ProjectSession, sql: &str) -> bool {
 /// for citext.
 ///
 /// Closed by: 5.30.B (citext type recognised by parser + engine).
-#[ignore = "5.30.A harness — citext pending; closes 5.30.B-E"]
 #[tokio::test]
 async fn citext_type_round_trip() {
     // Slice: "type round-trip"
@@ -193,7 +192,10 @@ async fn citext_type_round_trip() {
 ///      (e.g. 'apple', 'Banana', 'cherry' → alphabetic order regardless of case).
 ///
 /// Closed by: 5.30.C (citext equality + comparison operators).
-#[ignore = "5.30.A harness — citext pending; closes 5.30.B-E"]
+#[ignore = "5.30.C — WHERE/ORDER BY citext rewrite needs schema-aware logical-plan rewriter; \
+    ::citext cast operands fold correctly via citext_eq/citext_lt UDFs but DataFusion's \
+    planner does not auto-dispatch them for plain `=`/`<` on Utf8 columns; \
+    closes when a DataFusion AnalyzerRule rewrites citext-column comparisons to citext_* UDFs"]
 #[tokio::test]
 async fn citext_case_insensitive_comparison() {
     // Slice: "comparison semantics"
@@ -306,7 +308,6 @@ async fn citext_case_insensitive_comparison() {
 /// `citext`: case-insensitive email uniqueness at the DB layer.
 ///
 /// Closed by: 5.30.D (citext unique-index operator class + constraint enforcement).
-#[ignore = "5.30.A harness — citext pending; closes 5.30.B-E"]
 #[tokio::test]
 async fn citext_unique_constraint_case_insensitive() {
     // Slice: "unique-constraint case-insensitivity"
@@ -417,7 +418,11 @@ async fn citext_unique_constraint_case_insensitive() {
 ///   - sqlx 0.7: `query!` with `$1::citext` parameter cast
 ///
 /// Closed by: 5.30.E (citext ORM compat — pgwire wire-type + param binding).
-#[ignore = "5.30.A harness — citext pending; closes 5.30.B-E"]
+#[ignore = "5.30.E — ORM compat requires schema-aware WHERE rewrite: \
+    plain `WHERE col = 'value'` on a citext column needs the planner to \
+    emit citext_eq(col, 'value') instead of standard string equality; \
+    the pgwire param-binding path also needs a ::citext OID → TEXT coercion; \
+    closes when a DataFusion AnalyzerRule rewrites citext-column `=` predicates"]
 #[tokio::test]
 async fn citext_orm_compat() {
     // Slice: "ORM compat"

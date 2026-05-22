@@ -236,7 +236,14 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
                 .trim_start()
                 .trim_start_matches("SESSION")
                 .trim_start();
-            if after_set.starts_with("SEARCH_PATH") || after_set.starts_with("STATEMENT_TIMEOUT") {
+            // Phase 5.28.B/C: also let lock_timeout and
+            // idle_in_transaction_session_timeout fall through so the executor
+            // stores them in per-session state.
+            if after_set.starts_with("SEARCH_PATH")
+                || after_set.starts_with("STATEMENT_TIMEOUT")
+                || after_set.starts_with("LOCK_TIMEOUT")
+                || after_set.starts_with("IDLE_IN_TRANSACTION_SESSION_TIMEOUT")
+            {
                 None // Let the real executor handler fire.
             } else {
                 Some(ExecResult::Empty { tag: "SET".into() })

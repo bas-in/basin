@@ -279,20 +279,19 @@ async fn enforce_one_unique(
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            // Determine citext positions in this read-back batch's schema
-            // (same columns, but we re-resolve to handle schema evolution).
-            let rb_schema = rb.schema();
-            let rb_citext: std::collections::HashSet<usize> = rb_idx
-                .iter()
-                .enumerate()
-                .filter_map(|(pos, &arr_idx)| {
-                    let field = rb_schema.field(arr_idx);
-                    if field_is_citext(field) { Some(pos) } else { None }
-                })
-                .collect();
+            // Reuse `citext_positions` derived from the INSERT batch's schema
+            // (which HAS Arrow field metadata) rather than re-deriving from the
+            // Parquet-read-back schema.  Parquet's `ArrowWriter` does NOT
+            // preserve Arrow field metadata in the per-batch schema emitted by
+            // the reader — only the `ARROW:schema` blob in the file footer
+            // carries it, and `read_file` reads without a catalog_schema hint
+            // so the re-stamping path does not run here.  The INSERT batch
+            // schema and the on-disk schema have the same columns in the same
+            // logical positions for the columns listed in the constraint, so
+            // reusing `citext_positions` is correct.
             for row in 0..rb.num_rows() {
                 if let Some(k) =
-                    pk_tuple_for_row_citext(&rb, &rb_idx, row, &rb_citext)?
+                    pk_tuple_for_row_citext(&rb, &rb_idx, row, &citext_positions)?
                 {
                     existing.insert(k);
                 }

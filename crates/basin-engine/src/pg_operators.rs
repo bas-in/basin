@@ -4849,6 +4849,46 @@ pub(crate) fn rewrite_uuid_cast(sql: &str) -> String {
     out
 }
 
+// citext cast rewriter
+// ---------------------------------------------------------------------------
+
+/// Rewrite `::citext` casts to `::TEXT` so DataFusion's type system accepts
+/// them.  citext is stored as plain Utf8/TEXT at the Arrow level; the only
+/// distinction is in the BASIN_TYPE field metadata and the citext_* UDF
+/// comparisons.  A literal `'Foo'::citext` must evaluate as `'Foo'` (a
+/// plain string), which `::TEXT` achieves without changing semantics.
+pub(crate) fn rewrite_citext_cast(sql: &str) -> String {
+    // Fast-path: skip if "citext" is absent.
+    if !sql.to_ascii_lowercase().contains("citext") {
+        return sql.to_string();
+    }
+    let lower = sql.to_ascii_lowercase();
+    let mut out = sql.to_string();
+    let needle = "::citext";
+    let mut positions: Vec<usize> = Vec::new();
+    let mut start = 0usize;
+    while let Some(pos) = lower[start..].find(needle) {
+        let abs = start + pos;
+        let end_pos = abs + needle.len();
+        // Only replace if the character after `::citext` is NOT alphanumeric
+        // or `_` (so `::citextarray` is not mangled).
+        let next_is_ident = out
+            .as_bytes()
+            .get(end_pos)
+            .map(|&c| c.is_ascii_alphanumeric() || c == b'_')
+            .unwrap_or(false);
+        if !next_is_ident {
+            positions.push(abs);
+        }
+        start = abs + needle.len();
+    }
+    // Replace right-to-left so byte offsets stay valid.
+    for pos in positions.into_iter().rev() {
+        out.replace_range(pos..pos + needle.len(), "::TEXT");
+    }
+    out
+}
+
 // Bit-string literal rewriter
 // ---------------------------------------------------------------------------
 

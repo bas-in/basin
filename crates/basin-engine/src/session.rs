@@ -331,6 +331,11 @@ pub(crate) fn build_stateless_udf_cache() -> StatelessUdfCache {
     // DataFusion built-in with the same name.
     crate::hypertable::register_time_bucket_udf(&ctx);
     crate::datetime_extras::register_datetime_extras(&ctx);
+    // Phase 5.30.C: register citext comparison UDFs (citext_eq, citext_ne,
+    // citext_lt, citext_le, citext_gt, citext_ge, citext_like).
+    for udf in crate::operators::citext_cmp::citext_udfs() {
+        ctx.register_udf((*udf).clone());
+    }
     let state = ctx.state();
     StatelessUdfCache {
         scalar: state.scalar_functions().values().cloned().collect(),

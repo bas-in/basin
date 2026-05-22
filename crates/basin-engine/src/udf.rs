@@ -1098,7 +1098,34 @@ impl ScalarUDFImpl for PgSleepUdf {
 
         if seconds > 0.0 {
             let dur = std::time::Duration::from_secs_f64(seconds);
-            std::thread::sleep(dur);
+            // Cancellability note (Phase 5.28 / #64):
+            //
+            // DataFusion invokes UDFs synchronously inside physical plan poll().
+            // `block_in_place` evacuates other tasks from the current thread so
+            // they aren't blocked, and `handle.block_on(tokio::time::sleep)`
+            // uses the shared timer wheel rather than an OS sleep, which allows
+            // the outer `statement_timeout` deadline to fire on another tokio
+            // thread.  However the outer `tokio::time::timeout(d, df.collect())`
+            // wrapper cannot preempt this blocking poll(); the timeout future
+            // only fires after poll() returns.  Net effect: the sleep still
+            // runs for its full duration even if statement_timeout fires.
+            //
+            // Full cancellation requires DataFusion's async-UDF support (not yet
+            // stable in the version we vendor) or a per-statement cancellation
+            // token passed into the UDF context.  For now the improvement over
+            // std::thread::sleep is that the rest of the tokio runtime remains
+            // responsive during the sleep (other connections are not stalled).
+            //
+            // Fall back to std::thread::sleep when not in a tokio runtime (e.g.
+            // called from a plain sync test).
+            let handle = tokio::runtime::Handle::try_current();
+            if let Ok(handle) = handle {
+                tokio::task::block_in_place(|| {
+                    handle.block_on(tokio::time::sleep(dur));
+                });
+            } else {
+                std::thread::sleep(dur);
+            }
         }
 
         // Return one NULL row (void semantics).

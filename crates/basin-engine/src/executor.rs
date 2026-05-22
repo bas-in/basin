@@ -1065,6 +1065,9 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     // Rewrite `'...'::UUID` to `'...'::VARCHAR` — DataFusion 53 does not
     // implement the UUID SQL type in CAST expressions.
     let rewritten = crate::pg_operators::rewrite_uuid_cast(&rewritten);
+    // Rewrite `'...'::citext` to `'...'::TEXT` — citext is stored as plain
+    // Utf8 at the Arrow level; the cast is a no-op for the evaluator.
+    let rewritten = crate::pg_operators::rewrite_citext_cast(&rewritten);
     // Rewrite `'HH:MM:SS'::INTERVAL` to `'N seconds'::INTERVAL` — Arrow's
     // interval parser does not accept the PG HH:MM:SS shorthand form.
     let rewritten = crate::pg_operators::rewrite_interval_hms_cast(&rewritten);
