@@ -1276,12 +1276,12 @@ harness.
       `crates/basin-engine/src/planner.rs` (extend).
       Acceptance: containment-slice of 5.19.A flips green
       (differential clean + ≥ 10× speedup).
-- [ ] **5.19.D — Key / path probe** (`?`, `?&`, `?|`, `->`, `->>`,
+- [x] **5.19.D — Key / path probe** (`?`, `?&`, `?|`, `->`, `->>`,
       `#>`) (~1 week). Index probe for key-existence and path
       operators when the column uses `jsonb_ops`.
       Files: `crates/basin-engine/src/index_probe.rs` (extend).
       Acceptance: key/path slice of 5.19.A flips green.
-- [ ] **5.19.E — Index maintenance on UPDATE / DELETE** (~1 week).
+- [x] **5.19.E — Index maintenance on UPDATE / DELETE** (~1 week).
       Copy-on-write aligned: GIN posting lists rebuilt for affected
       row groups on Iceberg snapshot commit. Soft-delete tombstones
       filtered at probe time.
