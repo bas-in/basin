@@ -255,9 +255,31 @@ impl InMemoryCatalog {
         project: &ProjectId,
         table: &TableName,
     ) -> Result<Arc<Mutex<TableState>>> {
-        // Back-compat helper: looks up the table in the `public` schema.
-        self.get_table_qualified(project, &QualifiedTableName::in_public(table.clone()))
-            .await
+        // Phase 5.18.C (ADR 0022): try the public schema first (fast path),
+        // then fall back to searching all schemas for a unique bare-name match.
+        // This allows catalog operations to resolve system-schema tables
+        // (cron.job, auth.users, net._http_response, etc.) by bare name.
+        let pub_qtable = QualifiedTableName::in_public(table.clone());
+        {
+            let tables = self.tables.lock().await;
+            if tables.contains_key(&(*project, pub_qtable.clone())) {
+                drop(tables);
+                return self.get_table_qualified(project, &pub_qtable).await;
+            }
+            // Search non-public schemas for a table with the same bare name.
+            let candidates: Vec<QualifiedTableName> = tables
+                .keys()
+                .filter(|key| key.0 == *project && key.1.name == *table)
+                .map(|key| key.1.clone())
+                .collect();
+            drop(tables);
+            if candidates.len() == 1 {
+                return self.get_table_qualified(project, &candidates[0]).await;
+            }
+        }
+        // Not found in any schema, or ambiguous — return the public-schema
+        // NotFound so callers get the expected error format.
+        self.get_table_qualified(project, &pub_qtable).await
     }
 
     /// Internal helper that persists an index with full access_method + opclass
@@ -351,6 +373,44 @@ impl InMemoryCatalog {
             gc_orphan_paths: state.gc_orphan_paths.clone(),
         }
     }
+
+    /// Phase 5.18.C (ADR 0022): resolve a bare table name to a
+    /// [`QualifiedTableName`] for `project`.
+    ///
+    /// Strategy:
+    /// 1. Try `public.{table}` first (fast path for the common case).
+    /// 2. If not found in `public`, search all schemas for a unique bare-name
+    ///    match. This allows catalog operations to resolve system-schema tables
+    ///    (`cron.job`, `auth.users`, `net._http_response`, etc.) by bare name.
+    /// 3. If not found in any schema, return `public.{table}` as the qualified
+    ///    name (so `get_table_qualified` will produce the expected NotFound error).
+    ///
+    /// This method is SYNCHRONOUS after lock acquisition (no await inside the
+    /// critical section) to avoid holding the tables mutex across awaits.
+    async fn resolve_qtable(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+    ) -> QualifiedTableName {
+        let pub_qtable = QualifiedTableName::in_public(table.clone());
+        let tables = self.tables.lock().await;
+        if tables.contains_key(&(*project, pub_qtable.clone())) {
+            return pub_qtable;
+        }
+        // Search non-public schemas.
+        let mut candidate: Option<QualifiedTableName> = None;
+        for key in tables.keys() {
+            if key.0 == *project && key.1.name == *table {
+                if candidate.is_some() {
+                    // Ambiguous: more than one non-public schema has this table.
+                    // Fall back to public so get_table_qualified returns NotFound.
+                    return pub_qtable;
+                }
+                candidate = Some(key.1.clone());
+            }
+        }
+        candidate.unwrap_or(pub_qtable)
+    }
 }
 
 impl Default for InMemoryCatalog {
@@ -390,13 +450,51 @@ impl Catalog for InMemoryCatalog {
 
     #[instrument(skip(self), fields(project = %project, table = %table))]
     async fn load_table(&self, project: &ProjectId, table: &TableName) -> Result<TableMetadata> {
-        let qtable = QualifiedTableName::in_public(table.clone());
-        self.load_table_qualified(project, &qtable).await
+        // Phase 5.18.C (ADR 0022): try the public schema first (fast path), then
+        // fall back to searching all schemas for a unique bare-name match. This
+        // allows the executor's DML operations (INSERT/UPDATE/DELETE) to resolve
+        // system-schema tables (cron.job, auth.users, net._http_response, etc.)
+        // that are referenced by their bare name after DataFusion schema stripping.
+        let pub_qtable = QualifiedTableName::in_public(table.clone());
+        {
+            let tables = self.tables.lock().await;
+            if tables.contains_key(&(*project, pub_qtable.clone())) {
+                drop(tables);
+                return self.load_table_qualified(project, &pub_qtable).await;
+            }
+            // Search non-public schemas for a table with the same bare name.
+            let candidates: Vec<QualifiedTableName> = tables
+                .keys()
+                .filter(|key| key.0 == *project && key.1.name == *table)
+                .map(|key| key.1.clone())
+                .collect();
+            drop(tables);
+            if candidates.len() == 1 {
+                return self.load_table_qualified(project, &candidates[0]).await;
+            }
+            if candidates.len() > 1 {
+                // Ambiguous bare name — multiple schemas have a table with this
+                // name. Fall through to the NotFound error so callers that care
+                // can use `load_table_qualified` with an explicit schema.
+                return Err(basin_common::BasinError::not_found(format!(
+                    "{project}/{table}: ambiguous bare name (found in schemas: {})",
+                    candidates
+                        .iter()
+                        .map(|qt| qt.schema.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        }
+        // Not found in any schema.
+        Err(basin_common::BasinError::not_found(format!(
+            "{project}/{pub_qtable}"
+        )))
     }
 
     #[instrument(skip(self), fields(project = %project, table = %table))]
     async fn drop_table(&self, project: &ProjectId, table: &TableName) -> Result<()> {
-        let qtable = QualifiedTableName::in_public(table.clone());
+        let qtable = self.resolve_qtable(project, table).await;
         self.drop_table_qualified(project, &qtable).await
     }
 
@@ -407,7 +505,8 @@ impl Catalog for InMemoryCatalog {
         old: &TableName,
         new: &TableName,
     ) -> Result<()> {
-        let qold = QualifiedTableName::in_public(old.clone());
+        let qold = self.resolve_qtable(project, old).await;
+        // For dst, use public schema (new tables always go to public unless qualified)
         let qnew = QualifiedTableName::in_public(new.clone());
         self.rename_table_qualified(project, &qold, &qnew).await
     }
@@ -501,7 +600,7 @@ impl Catalog for InMemoryCatalog {
         expected_snapshot: SnapshotId,
         files: Vec<DataFileRef>,
     ) -> Result<TableMetadata> {
-        let qtable = QualifiedTableName::in_public(table.clone());
+        let qtable = self.resolve_qtable(project, table).await;
         self.append_data_files_qualified(project, &qtable, expected_snapshot, files)
             .await
     }
@@ -524,7 +623,7 @@ impl Catalog for InMemoryCatalog {
         removed_paths: Vec<String>,
         added_files: Vec<DataFileRef>,
     ) -> Result<TableMetadata> {
-        let qtable = QualifiedTableName::in_public(table.clone());
+        let qtable = self.resolve_qtable(project, table).await;
         self.replace_data_files_qualified(
             project,
             &qtable,
@@ -541,7 +640,7 @@ impl Catalog for InMemoryCatalog {
         project: &ProjectId,
         table: &TableName,
     ) -> Result<Vec<Snapshot>> {
-        let qtable = QualifiedTableName::in_public(table.clone());
+        let qtable = self.resolve_qtable(project, table).await;
         self.list_snapshots_qualified(project, &qtable).await
     }
 
@@ -552,7 +651,7 @@ impl Catalog for InMemoryCatalog {
         src_table: &TableName,
         dst_table: &TableName,
     ) -> Result<TableMetadata> {
-        let qsrc = QualifiedTableName::in_public(src_table.clone());
+        let qsrc = self.resolve_qtable(project, src_table).await;
         let qdst = QualifiedTableName::in_public(dst_table.clone());
         self.fork_table_qualified(project, &qsrc, &qdst).await
     }
@@ -564,7 +663,7 @@ impl Catalog for InMemoryCatalog {
         table: &TableName,
         snapshot_id: SnapshotId,
     ) -> Result<TableMetadata> {
-        let qtable = QualifiedTableName::in_public(table.clone());
+        let qtable = self.resolve_qtable(project, table).await;
         self.rollback_to_snapshot_qualified(project, &qtable, snapshot_id)
             .await
     }
@@ -576,7 +675,7 @@ impl Catalog for InMemoryCatalog {
         table: &TableName,
         spec: PartitionSpec,
     ) -> Result<()> {
-        let qtable = QualifiedTableName::in_public(table.clone());
+        let qtable = self.resolve_qtable(project, table).await;
         self.set_partition_spec_qualified(project, &qtable, spec)
             .await
     }
@@ -589,7 +688,7 @@ impl Catalog for InMemoryCatalog {
         rls_enabled: bool,
         policies: Vec<Policy>,
     ) -> Result<()> {
-        let qtable = QualifiedTableName::in_public(table.clone());
+        let qtable = self.resolve_qtable(project, table).await;
         self.set_rls_state_qualified(project, &qtable, rls_enabled, policies)
             .await
     }
@@ -602,7 +701,7 @@ impl Catalog for InMemoryCatalog {
         cold_after_seconds: Option<u64>,
         cold_age_column: Option<String>,
     ) -> Result<()> {
-        let qtable = QualifiedTableName::in_public(table.clone());
+        let qtable = self.resolve_qtable(project, table).await;
         self.set_tier_policy_qualified(project, &qtable, cold_after_seconds, cold_age_column)
             .await
     }
@@ -614,7 +713,7 @@ impl Catalog for InMemoryCatalog {
         table: &TableName,
         columns: Vec<String>,
     ) -> Result<()> {
-        let qtable = QualifiedTableName::in_public(table.clone());
+        let qtable = self.resolve_qtable(project, table).await;
         self.set_bloom_filter_columns_qualified(project, &qtable, columns)
             .await
     }
@@ -626,7 +725,7 @@ impl Catalog for InMemoryCatalog {
         table: &TableName,
         rows: Option<usize>,
     ) -> Result<()> {
-        let qtable = QualifiedTableName::in_public(table.clone());
+        let qtable = self.resolve_qtable(project, table).await;
         self.set_row_group_rows_qualified(project, &qtable, rows)
             .await
     }
@@ -638,7 +737,7 @@ impl Catalog for InMemoryCatalog {
         table: &TableName,
         schema: Schema,
     ) -> Result<()> {
-        let qtable = QualifiedTableName::in_public(table.clone());
+        let qtable = self.resolve_qtable(project, table).await;
         self.set_schema_qualified(project, &qtable, schema).await
     }
 
@@ -649,7 +748,7 @@ impl Catalog for InMemoryCatalog {
         table: &TableName,
         def: Option<CvDef>,
     ) -> Result<()> {
-        let qtable = QualifiedTableName::in_public(table.clone());
+        let qtable = self.resolve_qtable(project, table).await;
         self.set_continuous_aggregate_qualified(project, &qtable, def)
             .await
     }
@@ -661,7 +760,7 @@ impl Catalog for InMemoryCatalog {
         table: &TableName,
         columns: Vec<String>,
     ) -> Result<()> {
-        let qtable = QualifiedTableName::in_public(table.clone());
+        let qtable = self.resolve_qtable(project, table).await;
         self.set_cluster_columns_qualified(project, &qtable, columns)
             .await
     }
@@ -672,7 +771,7 @@ impl Catalog for InMemoryCatalog {
         table: &TableName,
         size: Option<u32>,
     ) -> Result<()> {
-        let qtable = QualifiedTableName::in_public(table.clone());
+        let qtable = self.resolve_qtable(project, table).await;
         let state_arc = self.get_table_qualified(project, &qtable).await?;
         let mut state = state_arc.lock().await;
         state.row_block_size = size;
@@ -685,7 +784,7 @@ impl Catalog for InMemoryCatalog {
         table: &TableName,
         value: Option<bool>,
     ) -> Result<()> {
-        let qtable = QualifiedTableName::in_public(table.clone());
+        let qtable = self.resolve_qtable(project, table).await;
         let state_arc = self.get_table_qualified(project, &qtable).await?;
         let mut state = state_arc.lock().await;
         state.adaptive_sort_override = value;
@@ -701,7 +800,7 @@ impl Catalog for InMemoryCatalog {
         table: &TableName,
         format: TableFileFormat,
     ) -> Result<()> {
-        let qtable = QualifiedTableName::in_public(table.clone());
+        let qtable = self.resolve_qtable(project, table).await;
         let state_arc = self.get_table_qualified(project, &qtable).await?;
         let mut state = state_arc.lock().await;
         state.file_format = format;
@@ -717,7 +816,7 @@ impl Catalog for InMemoryCatalog {
         table: &TableName,
         columns: Vec<String>,
     ) -> Result<()> {
-        let qtable = QualifiedTableName::in_public(table.clone());
+        let qtable = self.resolve_qtable(project, table).await;
         let state_arc = self.get_table_qualified(project, &qtable).await?;
         let mut state = state_arc.lock().await;
         state.global_sort_order = if columns.is_empty() {
@@ -735,7 +834,7 @@ impl Catalog for InMemoryCatalog {
         table: &TableName,
         region: Option<String>,
     ) -> Result<()> {
-        let qtable = QualifiedTableName::in_public(table.clone());
+        let qtable = self.resolve_qtable(project, table).await;
         self.set_home_region_qualified(project, &qtable, region)
             .await
     }
@@ -779,14 +878,14 @@ impl Catalog for InMemoryCatalog {
         columns: &[String],
         if_not_exists: bool,
     ) -> Result<()> {
-        let qtable = QualifiedTableName::in_public(table.clone());
+        let qtable = self.resolve_qtable(project, table).await;
         self.create_index_qualified(project, &qtable, name, columns, if_not_exists)
             .await
     }
 
     #[instrument(skip(self), fields(project = %project, table = %table, name = %name))]
     async fn drop_index(&self, project: &ProjectId, table: &TableName, name: &str) -> Result<()> {
-        let qtable = QualifiedTableName::in_public(table.clone());
+        let qtable = self.resolve_qtable(project, table).await;
         self.drop_index_qualified(project, &qtable, name).await
     }
 
@@ -1371,10 +1470,12 @@ impl Catalog for InMemoryCatalog {
         };
 
         // Identify the target table handle (for its universe).
-        let target_qtable = QualifiedTableName::in_public(table.clone());
+        // Phase 5.18.C: resolve bare name across all schemas (system tables may
+        // live in non-public schemas like cron.job, auth.users, etc.).
+        let resolved_qtable = self.resolve_qtable(project, table).await;
         let target_arc = handles
             .iter()
-            .find(|(qt, _)| qt == &target_qtable)
+            .find(|(qt, _)| qt == &resolved_qtable)
             .map(|(_, arc)| arc.clone())
             .ok_or_else(|| BasinError::not_found(format!("{project}/{table}")))?;
 
@@ -1873,7 +1974,7 @@ impl Catalog for InMemoryCatalog {
         access_method: &str,
         opclass: Option<&str>,
     ) -> Result<()> {
-        let qtable = basin_common::QualifiedTableName::in_public(table.clone());
+        let qtable = self.resolve_qtable(project, table).await;
         self.create_index_qualified_with_method(
             project,
             &qtable,

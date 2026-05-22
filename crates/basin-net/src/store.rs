@@ -96,23 +96,19 @@ impl ResponseStore {
     /// Idempotently create the response table under `project`. Safe to call
     /// before every operation.
     ///
-    /// # Phase 5.18.C back-compat
-    ///
-    /// Checks for both the canonical name (`_http_response`) and the legacy
-    /// name (`_net_http_response`). If neither exists, creates the canonical
-    /// table. If only the legacy table exists it is left in place (data is
-    /// preserved) — queries that reference the legacy name continue to work
-    /// because [`effective_response_table`] falls back to the legacy name when
-    /// only the legacy table is present.
+    /// Phase 5.18.C: the table is created in the reserved `net` schema
+    /// (`net._http_response`) using a trusted system session that bypasses
+    /// the `guard_reserved_schema_for_user_ddl` security check.
+    /// This is a fresh pre-launch project — no legacy data-migration needed.
     pub async fn ensure_tables(&self, project: &ProjectId) -> Result<()> {
-        let sess = self.inner.engine.open_session(*project).await?;
+        // Use a trusted system session so the engine allows DDL in the
+        // reserved `net` schema. User sessions (open_session) cannot do this.
+        let sess = self.inner.engine.open_system_session(*project).await?;
         let existing = list_table_names(&sess).await?;
-        let has_canonical = existing.contains(&RESPONSE_TABLE.to_string());
-        let has_legacy = existing.contains(&LEGACY_RESPONSE_TABLE.to_string());
-        if !has_canonical && !has_legacy {
-            // Neither exists — create the canonical table.
+        // SHOW TABLES returns bare names; RESPONSE_TABLE = "_http_response".
+        if !existing.contains(&RESPONSE_TABLE.to_string()) {
             sess.execute(&format!(
-                "CREATE TABLE {RESPONSE_TABLE} (
+                "CREATE TABLE {RESERVED_SCHEMA}.{RESPONSE_TABLE} (
                     id TEXT NOT NULL,
                     request_id TEXT NOT NULL,
                     status BIGINT NOT NULL,
@@ -124,23 +120,7 @@ impl ResponseStore {
             ))
             .await?;
         }
-        // If only the legacy table exists we leave it in place for back-compat.
-        // A one-time ALTER TABLE RENAME migration can be applied out-of-band.
         Ok(())
-    }
-
-    /// Return the effective table name to use for reads/writes: the canonical
-    /// `_http_response` when the table has been migrated (or newly created),
-    /// falling back to the legacy `_net_http_response` for pre-5.18.C
-    /// deployments.
-    async fn effective_response_table(&self, project: &ProjectId) -> Result<&'static str> {
-        let sess = self.inner.engine.open_session(*project).await?;
-        let existing = list_table_names(&sess).await?;
-        if existing.contains(&RESPONSE_TABLE.to_string()) {
-            Ok(RESPONSE_TABLE)
-        } else {
-            Ok(LEGACY_RESPONSE_TABLE)
-        }
     }
 
     /// Append one row. Used by the async runner once a response has come back
@@ -153,7 +133,7 @@ impl ResponseStore {
         resp: &HttpResponse,
     ) -> Result<()> {
         self.ensure_tables(project).await?;
-        let table = self.effective_response_table(project).await?;
+        let table = RESPONSE_TABLE;
         let sess = self.inner.engine.open_session(*project).await?;
         let headers_json = serde_json::to_string(&resp.headers)
             .map_err(|e| BasinError::internal(format!("headers serialise: {e}")))?;
@@ -182,7 +162,7 @@ impl ResponseStore {
     /// recorded it.
     pub async fn get(&self, project: &ProjectId, id: RequestId) -> Result<Option<ResponseRow>> {
         self.ensure_tables(project).await?;
-        let table = self.effective_response_table(project).await?;
+        let table = RESPONSE_TABLE;
         let sess = self.inner.engine.open_session(*project).await?;
         let res = sess
             .execute(&format!(
@@ -224,7 +204,7 @@ impl ResponseStore {
     /// List every recorded response for `project`. Useful for tests.
     pub async fn list(&self, project: &ProjectId) -> Result<Vec<ResponseRow>> {
         self.ensure_tables(project).await?;
-        let table = self.effective_response_table(project).await?;
+        let table = RESPONSE_TABLE;
         let sess = self.inner.engine.open_session(*project).await?;
         let res = sess
             .execute(&format!(

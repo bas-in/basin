@@ -27,7 +27,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use crate::AuthContext;
 
 use basin_catalog::{DataFileRef, PartitionSpec, SnapshotId, TableFileFormat};
-use basin_common::{BasinError, ProjectId, Result, TableName};
+use basin_common::{BasinError, ProjectId, QualifiedTableName, Result, SchemaName, TableName};
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use datafusion::common::TableReference;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
@@ -914,6 +914,7 @@ pub(crate) async fn open(
     project: ProjectId,
     current_user: String,
     auth_context: Arc<AuthContext>,
+    is_system: bool,
 ) -> Result<ProjectSession> {
     // 1. Idempotent namespace.
     engine.config().catalog.create_namespace(&project).await?;
@@ -1165,9 +1166,15 @@ pub(crate) async fn open(
 
     // 3. Pre-register every table the catalog already knows about. This makes
     //    SELECT work immediately without a per-query refresh.
-    let tables = engine.config().catalog.list_tables(&project).await?;
-    for table in tables {
-        refresh_table(&engine, &project, &ctx, &state, &table).await?;
+    //
+    // Phase 5.18.C: use `list_tables_qualified` so system-schema tables
+    // (cron.job, auth.users, net._http_response, etc.) are also pre-registered
+    // in this session's DataFusion context. DataFusion uses bare table names
+    // (schema stripping happens before SQL reaches DataFusion), so we register
+    // each table under its bare TableName regardless of schema.
+    let qtables = engine.config().catalog.list_tables_qualified(&project).await?;
+    for qtable in qtables {
+        refresh_table_qualified(&engine, &project, &ctx, &state, &qtable).await?;
     }
 
     // Phase 5.23.C: register session with the connection registry. The handle
@@ -1206,6 +1213,7 @@ pub(crate) async fn open(
         reaper_id,
         _lock_handle: Some(lock_handle),
         _connection_handle: Some(connection_handle),
+        is_system,
     })
 }
 
@@ -1350,6 +1358,90 @@ pub(crate) async fn refresh_table(
         .lock()
         .await
         .insert(table.clone(), meta.current_snapshot);
+
+    if meta.partition_spec.is_partitioned() {
+        state
+            .has_partitioned_table
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    Ok(())
+}
+
+/// Phase 5.18.C — schema-qualified variant of [`refresh_table`].
+///
+/// Loads the table from the catalog using `load_table_qualified` (so the
+/// key is `(schema, table)`) and registers it in DataFusion under the bare
+/// table name. DataFusion itself is schema-unaware; schema stripping happens
+/// before SQL reaches DataFusion via `strip_schema_qualifiers_for_session`.
+///
+/// Used by:
+/// - `session::open` (pre-registration of all qualified tables at startup).
+/// - `exec_create_table` for system sessions (post-create registration).
+pub(crate) async fn refresh_table_qualified(
+    engine: &Engine,
+    project: &ProjectId,
+    ctx: &SessionContext,
+    state: &Arc<SessionState>,
+    qtable: &QualifiedTableName,
+) -> Result<()> {
+    // For public-schema tables delegate to the unqualified path (identity).
+    if qtable.schema == basin_common::SchemaName::public() {
+        return refresh_table(engine, project, ctx, state, &qtable.name).await;
+    }
+
+    let meta = engine
+        .config()
+        .catalog
+        .load_table_qualified(project, qtable)
+        .await?;
+    let df_schema = Arc::new(schema_ws_to_df(meta.schema.as_ref())?);
+
+    // Register under the bare table name so that DataFusion can find the
+    // table after schema-qualifier stripping. The schema part is handled at
+    // the SQL rewrite layer, not at the DataFusion registration layer.
+    let bare_name = &qtable.name;
+    let tref = || TableReference::Bare {
+        table: bare_name.as_str().into(),
+    };
+    let _ = ctx.deregister_table(tref());
+
+    let live_files: Vec<DataFileRef> = meta.live_data_files();
+    if live_files.is_empty() {
+        let provider = MemTable::try_new(df_schema, vec![vec![]])
+            .map_err(|e| BasinError::internal(format!("MemTable empty {bare_name}: {e}")))?;
+        ctx.register_table(tref(), Arc::new(provider))
+            .map_err(|e| BasinError::internal(format!("register_table {bare_name}: {e}")))?;
+    } else {
+        let (file_format, file_ext) = listing_file_format(meta.file_format);
+        let mut listing_options =
+            ListingOptions::new(file_format).with_file_extension(file_ext);
+        if let Some(sort_cols) = meta.global_sort_order.as_deref() {
+            listing_options =
+                listing_options.with_file_sort_order(build_file_sort_order(sort_cols));
+        }
+        let mut urls: Vec<ListingTableUrl> = Vec::with_capacity(live_files.len());
+        for f in &live_files {
+            let mut s = String::from(BASIN_URL_BASE);
+            s.push_str(&f.path);
+            let url = ListingTableUrl::parse(&s)
+                .map_err(|e| BasinError::internal(format!("listing url parse {s}: {e}")))?;
+            urls.push(url);
+        }
+        let cfg = ListingTableConfig::new_with_multi_paths(urls)
+            .with_listing_options(listing_options)
+            .with_schema(df_schema);
+        let provider = ListingTable::try_new(cfg)
+            .map_err(|e| BasinError::internal(format!("ListingTable::try_new {bare_name}: {e}")))?;
+        ctx.register_table(tref(), Arc::new(provider))
+            .map_err(|e| BasinError::internal(format!("register_table {bare_name}: {e}")))?;
+    }
+
+    state
+        .snapshots
+        .lock()
+        .await
+        .insert(bare_name.clone(), meta.current_snapshot);
 
     if meta.partition_spec.is_partitioned() {
         state

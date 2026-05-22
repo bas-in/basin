@@ -2224,8 +2224,19 @@ async fn exec_create_table(
     // 6.SEC.P1 — reject user DDL targeting a reserved system schema
     // (`auth`, `storage`, `cron`, `net`, `realtime`, `pg_catalog`,
     // `information_schema`). `public` and bare names pass through.
-    crate::schema_ddl::guard_reserved_schema_for_user_ddl(&ct.name, "CREATE TABLE")?;
+    // Phase 5.18.C: system sessions (is_system = true) bypass this guard so
+    // trusted internal subsystems can create tables in reserved schemas.
+    if !sess.is_system {
+        crate::schema_ddl::guard_reserved_schema_for_user_ddl(&ct.name, "CREATE TABLE")?;
+    }
     let name = single_part_name(&ct.name)?;
+    // Phase 5.18.C: for system sessions with a schema qualifier, resolve the
+    // schema so the catalog key is (schema, table) not (public, table).
+    let schema_str: Option<String> = if ct.name.0.len() >= 2 {
+        Some(ct.name.0[0].id_val().clone())
+    } else {
+        None
+    };
     let table = TableName::new(name)?;
 
     // `CREATE TABLE … AS <query>` (CTAS). `ctas_shape` is `Some` iff
@@ -2368,26 +2379,56 @@ async fn exec_create_table(
         }
     }
 
+    // Phase 5.18.C: system sessions with a reserved-schema qualifier route
+    // through `create_table_qualified` so the catalog key is `(schema, table)`.
+    // All other paths (user sessions, bare names, public schema) use the
+    // existing `create_table` which stores under `(public, table)`.
+    let qtable_for_refresh: Option<basin_common::QualifiedTableName> = if sess.is_system {
+        schema_str.as_deref().and_then(|s| {
+            basin_catalog::reserved_schema::ReservedSchema::from_str(s)
+                .filter(|r| !r.is_public())
+                .map(|r| basin_common::QualifiedTableName::new(r.to_schema_name(), table.clone()))
+        })
+    } else {
+        None
+    };
+
     // If IF NOT EXISTS is set and the table already exists, return success
     // (no-op). The catalog signals "already exists" as BasinError::Catalog;
     // we only suppress that specific variant — unrelated catalog errors still
     // propagate. Without IF NOT EXISTS the error is always fatal.
-    match sess
-        .engine
-        .config()
-        .catalog
-        .create_table(&sess.project, &table, &schema)
-        .await
-    {
-        Ok(_metadata) => {}
-        Err(BasinError::Catalog(_)) if ct.if_not_exists => {
-            // Table already exists and IF NOT EXISTS was specified — PG
-            // behavior: succeed silently (no error, no row change).
-            return Ok(ExecResult::Empty {
-                tag: "CREATE TABLE".into(),
-            });
+    if let Some(ref qt) = qtable_for_refresh {
+        match sess
+            .engine
+            .config()
+            .catalog
+            .create_table_qualified(&sess.project, qt, Arc::new(schema.clone()))
+            .await
+        {
+            Ok(_metadata) => {}
+            Err(BasinError::Catalog(_)) if ct.if_not_exists => {
+                return Ok(ExecResult::Empty {
+                    tag: "CREATE TABLE".into(),
+                });
+            }
+            Err(e) => return Err(e),
         }
-        Err(e) => return Err(e),
+    } else {
+        match sess
+            .engine
+            .config()
+            .catalog
+            .create_table(&sess.project, &table, &schema)
+            .await
+        {
+            Ok(_metadata) => {}
+            Err(BasinError::Catalog(_)) if ct.if_not_exists => {
+                return Ok(ExecResult::Empty {
+                    tag: "CREATE TABLE".into(),
+                });
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     // Register implicit sequences promised by `SERIAL` / `BIGSERIAL` /
@@ -2514,7 +2555,20 @@ async fn exec_create_table(
             .await?;
     }
 
-    refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table).await?;
+    // Phase 5.18.C: if this was a system-session create with a reserved schema,
+    // refresh from the qualified catalog entry. Otherwise use the bare path.
+    if let Some(ref qt) = qtable_for_refresh {
+        crate::session::refresh_table_qualified(
+            &sess.engine,
+            &sess.project,
+            &sess.ctx,
+            &sess.state,
+            qt,
+        )
+        .await?;
+    } else {
+        refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table).await?;
+    }
 
     Ok(ExecResult::Empty {
         tag: "CREATE TABLE".into(),
@@ -2647,7 +2701,10 @@ async fn exec_drop_table(
 ) -> Result<ExecResult> {
     for name in names {
         // 6.SEC.P1 — reject DROP TABLE targeting a reserved system schema.
-        crate::schema_ddl::guard_reserved_schema_for_user_ddl(&name, "DROP TABLE")?;
+        // Phase 5.18.C: system sessions bypass this guard.
+        if !sess.is_system {
+            crate::schema_ddl::guard_reserved_schema_for_user_ddl(&name, "DROP TABLE")?;
+        }
         let n = single_part_name(&name)?;
         let table = TableName::new(n)?;
         match sess
@@ -2707,9 +2764,12 @@ async fn exec_create_index(
 
     // 6.SEC.P1 — reject CREATE INDEX targeting a reserved system schema.
     // Guards both the target table and (when explicit) the index name.
-    crate::schema_ddl::guard_reserved_schema_for_user_ddl(&ci.table_name, "CREATE INDEX")?;
-    if let Some(ref idx_name) = ci.name {
-        crate::schema_ddl::guard_reserved_schema_for_user_ddl(idx_name, "CREATE INDEX")?;
+    // Phase 5.18.C: system sessions bypass this guard.
+    if !sess.is_system {
+        crate::schema_ddl::guard_reserved_schema_for_user_ddl(&ci.table_name, "CREATE INDEX")?;
+        if let Some(ref idx_name) = ci.name {
+            crate::schema_ddl::guard_reserved_schema_for_user_ddl(idx_name, "CREATE INDEX")?;
+        }
     }
 
     let table_name = single_part_name(&ci.table_name)?;
@@ -3089,7 +3149,10 @@ async fn exec_drop_index(
     }
     for n in &names {
         // 6.SEC.P1 — reject DROP INDEX targeting a reserved system schema.
-        crate::schema_ddl::guard_reserved_schema_for_user_ddl(n, "DROP INDEX")?;
+        // Phase 5.18.C: system sessions bypass this guard.
+        if !sess.is_system {
+            crate::schema_ddl::guard_reserved_schema_for_user_ddl(n, "DROP INDEX")?;
+        }
         let index_name = single_part_name(n)?;
         // The catalog stores indexes per-table; we don't track a
         // global (project, index-name) → table mapping. Scan every
@@ -5794,7 +5857,10 @@ async fn exec_alter_table(
     operations: Vec<sqlparser::ast::AlterTableOperation>,
 ) -> Result<ExecResult> {
     // 6.SEC.P1 — reject ALTER TABLE targeting a reserved system schema.
-    crate::schema_ddl::guard_reserved_schema_for_user_ddl(&name, "ALTER TABLE")?;
+    // Phase 5.18.C: system sessions bypass this guard.
+    if !sess.is_system {
+        crate::schema_ddl::guard_reserved_schema_for_user_ddl(&name, "ALTER TABLE")?;
+    }
     let tag = crate::alter::apply_standard_alter_table(
         &sess.engine.config().catalog,
         &sess.project,
@@ -5822,14 +5888,18 @@ async fn exec_alter_table(
 }
 
 async fn exec_show_tables(sess: &ProjectSession) -> Result<ExecResult> {
-    let tables = sess
+    // Phase 5.18.C: use list_tables_qualified so system-schema tables
+    // (cron.job, auth.users, net._http_response, etc.) are also visible.
+    // We return the bare table name (not the qualified form) for back-compat
+    // with callers that check for table names like "job" or "_http_response".
+    let qtables = sess
         .engine
         .config()
         .catalog
-        .list_tables(&sess.project)
+        .list_tables_qualified(&sess.project)
         .await?;
-    let names: Vec<&str> = tables.iter().map(|t| t.as_str()).collect();
-    let arr = StringArray::from(names);
+    let bare_names: Vec<&str> = qtables.iter().map(|qt| qt.name.as_str()).collect();
+    let arr = StringArray::from(bare_names);
     let schema = Arc::new(Schema::new(vec![Field::new(
         "table_name",
         DataType::Utf8,

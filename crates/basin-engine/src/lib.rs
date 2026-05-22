@@ -642,6 +642,7 @@ impl Engine {
             project,
             ANONYMOUS_USER.to_string(),
             Arc::new(AuthContext::anonymous()),
+            false, // is_system
         )
         .await
     }
@@ -667,6 +668,7 @@ impl Engine {
             project,
             current_user.into(),
             Arc::new(AuthContext::anonymous()),
+            false, // is_system
         )
         .await
     }
@@ -683,7 +685,47 @@ impl Engine {
         current_user: impl Into<String>,
         auth: AuthContext,
     ) -> Result<ProjectSession> {
-        crate::session::open(self.clone(), project, current_user.into(), Arc::new(auth)).await
+        crate::session::open(
+            self.clone(),
+            project,
+            current_user.into(),
+            Arc::new(auth),
+            false, // is_system
+        )
+        .await
+    }
+
+    /// Open a **trusted system session** bound to `project`.
+    ///
+    /// ## Security contract
+    ///
+    /// Sessions opened through this method set `is_system = true`, which
+    /// grants two extra capabilities compared to a normal user session:
+    ///
+    /// 1. **Bypass `guard_reserved_schema_for_user_ddl`**: DDL targeting
+    ///    reserved schemas (`auth`, `cron`, `net`, `storage`, `realtime`) is
+    ///    allowed. User sessions opened via `open_session*` always have
+    ///    `is_system = false` and will be rejected by the guard.
+    ///
+    /// 2. **`create_table_qualified` routing**: `CREATE TABLE schema.table`
+    ///    is stored in the catalog under `(schema, table)` instead of
+    ///    `(public, table)`, so the table is keyed as a first-class
+    ///    reserved-schema entry (ADR 0022 / Phase 5.18.C).
+    ///
+    /// **This method must only be called from trusted internal subsystem
+    /// paths** — basin-auth (`EngineAuthStore`), basin-cron (`CronStore`),
+    /// and basin-net (`ResponseStore`). It is never reachable from
+    /// user-submitted SQL over pgwire/REST because those paths always call
+    /// `open_session` / `open_session_as` / `open_session_with_auth`.
+    pub async fn open_system_session(&self, project: ProjectId) -> Result<ProjectSession> {
+        crate::session::open(
+            self.clone(),
+            project,
+            "basin_system".to_string(),
+            Arc::new(AuthContext::anonymous()),
+            true, // is_system
+        )
+        .await
     }
 }
 
@@ -780,6 +822,20 @@ pub struct ProjectSession {
     /// `ConnectionRegistry`. Dropped when the session is dropped. Uses `Option`
     /// for the same construction-order reason as `_lock_handle`.
     pub(crate) _connection_handle: Option<crate::connection_registry::ConnectionHandle>,
+    /// Phase 5.18.C: internal/trusted DDL flag. When `true`, this session is
+    /// opened by a trusted system subsystem (basin-auth, basin-cron, basin-net)
+    /// and is permitted to:
+    ///
+    ///   1. Execute `CREATE TABLE schema.table` targeting reserved schemas
+    ///      (bypasses `guard_reserved_schema_for_user_ddl`).
+    ///   2. Route `CREATE TABLE` to `create_table_qualified` in the catalog so
+    ///      the table is keyed as `(schema, table)` rather than `(public, table)`.
+    ///
+    /// **Security invariant**: this flag is ONLY set by
+    /// [`Engine::open_system_session`]. User-submitted SQL flows through
+    /// `open_session` / `open_session_as` / `open_session_with_auth`, all of
+    /// which set `is_system = false`. There is no SQL statement that sets it.
+    pub(crate) is_system: bool,
 }
 
 impl ProjectSession {
