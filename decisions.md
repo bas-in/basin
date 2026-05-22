@@ -6,6 +6,50 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-22 — Cross-repo completion campaign: all 5 repos audited, fixed, built, tested green
+
+Per the owner's "everything complete, deeply implemented, deep testing" directive, ran a full
+audit → fix → build → test campaign across **basin / basin-cloud / basin-cli / basin-js / basin-py**
+with many parallel sonnet agents. Outcome (STAGE 1 build + STAGE 2 local tests both green):
+
+**Audits (read-only, multi-agent):** cli, js, py each; basin (impl-core + impl-services + dedicated
+security); basin-cloud (impl + dedicated security). Engine core verified genuinely solid (point-query,
+pushdown, JSONB/FTS/vector/GIST indexes + completeness guard, RLS, real transactions/SAVEPOINT, CV,
+hypertables). Recurring theme: roadmap drift (shipped-but-unticked AND ticked-but-unwired) + stale
+audit docstrings (some "gaps" were already done).
+
+**Real findings fixed:**
+- **basin-py was a pure skeleton** → built to basin-js parity (foundation + admin/storage/functions/realtime;
+  62+123 tests). Used the engine's REAL routes (avoided basin-js's OAuth divergence).
+- **basin-js bugs:** OAuth authorize path (`?provider=` → `/oauth/:provider/authorize`), storage
+  signed-URL path (5.17.D #55), server-client static bearer, admin parse. (`e577814`, `10aab5a`)
+- **basin-cli:** P0 functions route 404 (`/rest/v1/functions` → `/v1/projects/:ref/functions`),
+  dump-custom silent degrade, migrate-from-pg → run_restore. (`82e4c55`)
+- **basin engine SECURITY (launch blockers):** P0 plaintext OAuth secrets/MFA seeds → AES-256-GCM
+  fail-closed (`2ede2ae`); P0 temp-table pool-scrub cross-tenant leak (`20748cb`); P1 lock_timeout SHOW
+  masking (`1b08c34`); P1 PK-predicate type-aware quoting (`3dc94c8`).
+- **basin engine FEATURES (were missing/unwired):** W6 JS function runtime dispatch (`69f9636` — was
+  ticked but Noop invoker, never wired); realtime SSE/WS co-mount on the REST port (`045c700` — was
+  separate-port only → SDK/CLI 404); dump REST endpoint (`29515a9`); function invocations/versions/
+  rollback (`fe67ca3`); pg_cancel_backend real cancellation 57014 (`6b577da`).
+- **basin-cloud:** P0 project provisioning (RegisterProject/ProvisionProjectPgwire were TODO →
+  API-created projects had no creds) (`12bbfc5`); analytics-ingest authz, OIDC open-redirect, webhook
+  token redaction, **real SAML XML-DSig** via pure-Rust `bergshamra` (`7a54b14`/`5f9eb2b`/`3adab80`/
+  `92b706d`); P2 Deps wirings (`f091995`); index_advisor/function_mocks confirmed wired (`23ebd2d` etc).
+- **In-house analytics** (Neon control-plane, NOT dogfooded): ingestion + GeoLite2-offline + 0009
+  migration + rollups + query API + realtime SSE + dashboard; raw IP never persisted (compile-time).
+- **In-house docs renderer** (basin-cloud SPA, react-markdown, multi-repo sync + override layer).
+
+**STAGE 2 local tests ALL GREEN:** basin capstone (lib+bins) 0-fail; integration sweep exit=0 (orm 20,
+postgrest 9, security 41, noop 42, jsonb/fts/range/pgvector/hypertable/citext); perf gates
+(perf_regression 10, perf_suite 1); basin-py 123, basin-js 301, cloud-fe 352, cloud-be 1254.
+
+**Genuinely NOT done (by nature, not omission):** Phase-0 customer/business; multi-region + cross-shard
+2PC (ADR-deferred large infra); SAML post-verify session issuance (in flight); the 3-way Neon/Supabase/
+Basin comparative benchmark (STAGE 3, needs the dev deploy). Throwaway dev `.env` secrets left as-is
+per owner. Uncommitted stray WIP left untouched (basin-cli `config_cmd.rs` +289, basin-cloud SQL-editor,
+ROADMAP cross-ref edits) — flagged to owner, 1 cli test fails only in that uncommitted code.
+
 ## 2026-05-22 — 5.18.C completed (user reversed the defer): system tables on reserved schemas, security-safe
 
 Earlier this session 5.18.C was deferred ("needs engine CREATE SCHEMA"). The user corrected that

@@ -1207,7 +1207,7 @@ basin-catalog (no other catalog agent concurrent).
       `search_path` (default `public`, `pg_catalog` implicitly first); qualified
       reserved-schema names bind directly; user schemas alias to `public`.
       Depends on 5.18.A.
-- [~] **5.18.C — Migrate system namespaces off prefix hacks.** auth
+- [x] **5.18.C — Migrate system namespaces off prefix hacks.** auth
       (`basin_auth_*` → `auth.*`), net (`_net_http_response` → `net.*`), cron
       (`cron.job` real), storage (formalize `storage.*`). Back-compat read/alias
       path + migration test per subsystem; MUST NOT regress existing
@@ -1843,7 +1843,7 @@ impl sub-task flips a named slice green.
       `crates/basin-engine/src/session_reaper.rs` (new).
       Closes the **idle-in-txn closes session** slice of 5.28.A
       (timeout_trio_harness green).
-- [~] **5.28.D — Tooling-compat slice green** (~1 day). psql /
+- [x] **5.28.D — Tooling-compat slice green** (~1 day). psql /
       DBeaver / pgcli pre-flight probes (`SHOW lock_timeout`, etc.)
       return PG-shape values; tool-driven `SET` lands cleanly.
       Files: `crates/basin-engine/src/guc.rs` (extend).
@@ -2016,7 +2016,7 @@ exists); each impl sub-task flips a named slice green.
       `.github/workflows/docker-publish.yml`,
       `tests/integration/scripts/docker-smoke.sh`.
       Acceptance: harness compiles + reports red (no image yet).
-- [~] **5.31.B — `Dockerfile` (multi-stage build, distroless or
+- [x] **5.31.B — `Dockerfile` (multi-stage build, distroless or
       alpine)** (~2 days). Rust builder stage + minimal runtime
       base (`gcr.io/distroless/cc` or `alpine`). Final image ≤
       100 MB. Health check via pgwire ping. ENV defaults:
