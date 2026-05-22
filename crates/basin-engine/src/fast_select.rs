@@ -914,16 +914,6 @@ fn literal_value(e: &Expr) -> Option<ScalarValue> {
     }
 }
 
-/// Threshold above which we move the actual scan onto the blocking thread
-/// pool (Change C). The numbers are deliberately conservative: a SELECT that
-/// has to read more than 100 K rows OR 50 MiB of Parquet is heavy enough
-/// that pinning a cooperative tokio worker for the duration of the decode
-/// loop materially hurts other projects on the same runtime. Point queries
-/// (which carry a predicate) always stay on the cooperative pool — they
-/// only touch one row group thanks to predicate pushdown, and the
-/// `spawn_blocking` round-trip would dwarf the actual work.
-const HEAVY_ROW_THRESHOLD: u64 = 100_000;
-const HEAVY_BYTE_THRESHOLD: u64 = 50 * 1024 * 1024;
 
 /// Run a recognised plan against the engine's storage layer (or, when wired
 /// up, the shard's [`ProjectHandle`]). Returns the merged result set ready to
@@ -947,9 +937,8 @@ pub(crate) async fn execute_simple_select(
     let _ = &plan.table;
 
     // Flush the in-RAM tail before we look up the table's metadata so the
-    // post-flush snapshot drives the heavy-read gating below. Without this
-    // the catalog reports zero data files (everything still in WAL) and we'd
-    // misclassify a 5M-row scan as a small one.
+    // post-flush snapshot is used for catalog reads. Without this the catalog
+    // reports zero data files (everything still in WAL).
     if let Some(shard) = sess.engine.config().shard.as_ref() {
         shard.flush_to_parquet().await?;
     }
@@ -1112,23 +1101,6 @@ pub(crate) async fn execute_simple_select(
         // No memtable entry for this table → fall through to cold-tier read.
     }
     // ── End Phase 5.14.C3 probe ──────────────────────────────────────────────
-
-    // Gate Change C off the catalog's reported snapshot size. We treat a read
-    // as "heavy" only when there are no predicates (i.e. we're scanning rather
-    // than point-looking up) and the table is large enough that the decode
-    // loop will dominate. With predicates, row-group pruning keeps the
-    // actual decode small no matter how big the table is, so the
-    // `spawn_blocking` round-trip would be pure overhead.
-    let heavy = plan.predicates.is_empty()
-        && plan.is_null_cols.is_empty()
-        && meta
-            .current()
-            .map(|s| {
-                let rows: u64 = s.data_files.iter().map(|f| f.row_count).sum();
-                let bytes: u64 = s.data_files.iter().map(|f| f.size_bytes).sum();
-                rows >= HEAVY_ROW_THRESHOLD || bytes >= HEAVY_BYTE_THRESHOLD
-            })
-            .unwrap_or(false);
 
     // ── Phase 5.7 B1: secondary index probe ─────────────────────────────────
     //
@@ -1336,30 +1308,39 @@ pub(crate) async fn execute_simple_select(
         let handle = shard
             .get(&sess.project, &PartitionKey::default_key())
             .await?;
-        if heavy {
-            let table = plan.table.clone();
-            run_blocking(move || async move { handle.read(&table, opts).await }).await?
-        } else {
-            handle.read(&plan.table, opts).await?
-        }
+        // Both heavy and light shard reads: await directly. The shard's
+        // `handle.read` drives its own async I/O and WAL-replay cooperatively;
+        // there is no benefit to a nested runtime, and doing so would create
+        // the same fast_select livelock as the non-shard heavy path.
+        handle.read(&plan.table, opts).await?
     } else if live_paths.is_empty() {
         // No live files at this snapshot — return an empty batch set rather
         // than listing the directory (which would see rolled-back files).
         vec![]
-    } else if heavy {
-        let storage = sess.engine.config().storage.clone();
-        let project = sess.project;
-        let schema = Some(meta.schema.clone());
-        run_blocking(move || async move {
-            use futures::StreamExt;
-            let stream = storage
-                .read_paths_with_schema(&project, live_paths, opts, schema)
-                .await?;
-            let collected: Vec<Result<RecordBatch>> = stream.collect().await;
-            collected.into_iter().collect::<Result<Vec<_>>>()
-        })
-        .await?
     } else {
+        // Non-shard path (both heavy and light scans).
+        //
+        // We previously wrapped heavy scans in `run_blocking` (spawn_blocking +
+        // a nested current_thread runtime) to "keep Parquet decode off the
+        // cooperative worker pool". That pattern is the source of the
+        // fast_select livelock: when four concurrent noisy tasks each call
+        // `run_blocking`, their nested `current_thread` runtimes issue their
+        // own `spawn_blocking` calls for LocalFileSystem I/O via
+        // `object_store::maybe_spawn_blocking`. Under load this creates a
+        // deadlock triangle:
+        //
+        //   outer task → outer spawn_blocking (blocks worker) →
+        //   inner runtime → inner spawn_blocking (saturates pool) →
+        //   inner blocking tasks wait for OS-file wakeups, but no worker is
+        //   free to drive the inner reactor → eternal stall.
+        //
+        // The correct fix: `read_paths_with_schema` already drives I/O
+        // cooperatively (the stream is `buffered(4)`, so at most 4 files
+        // are fetched concurrently and the future yields between completions).
+        // The Parquet decode CPU is already dispatched to `spawn_blocking`
+        // tasks *inside* the parquet reader — there is no CPU-pinning on the
+        // cooperative worker. Awaiting the stream directly is both correct and
+        // deadlock-free.
         use futures::StreamExt;
         let schema = Some(meta.schema.clone());
         let stream = sess
@@ -1847,32 +1828,6 @@ fn evaluate_computed_projections(
         .map_err(|e| BasinError::internal(format!("computed projection batch: {e}")))
 }
 
-/// Run an async closure on the blocking thread pool, driving it through a
-/// tiny `current_thread` runtime. The point of this dance is to keep the
-/// heavy parquet-decode loop off the cooperative tokio worker pool: a
-/// `spawn_blocking` task gets its own OS thread, so it can monopolise CPU
-/// without blocking other tasks on the runtime that scheduled it.
-///
-/// We accept `FnOnce` returning a future rather than just an async block so
-/// callers can build the future inside the spawned thread (i.e. with values
-/// that are `Send + 'static` once moved in).
-async fn run_blocking<F, Fut, T>(f: F) -> Result<T>
-where
-    F: FnOnce() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = Result<T>>,
-    T: Send + 'static,
-{
-    let join = tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| BasinError::internal(format!("blocking runtime: {e}")))?;
-        rt.block_on(f())
-    })
-    .await
-    .map_err(|e| BasinError::internal(format!("spawn_blocking join: {e}")))?;
-    join
-}
 
 /// Sort batches by a single column and return the first `limit` rows as one
 /// or more `RecordBatch`es. Uses Arrow's `sort_to_indices` + `take` so the
