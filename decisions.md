@@ -6,6 +6,32 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-22 — Wave 6 (5.19.B) + STOP: autonomous loop reached its stop condition
+
+Final solo agent closed **5.19.B** (`4628acc`): the `CREATE INDEX … USING gin` parser/executor/InMemoryCatalog
+were already present, but **`PostgresCatalog` lacked the `create_index_with_method` override** — so GIN indexes
+created against production Postgres silently degraded to `access_method: "btree"` (a real correctness bug, not
+just a missing feature). Added the override + tests; un-ignored `jsonb_orm_compat` (now green). lib 1194/0,
+jsonb_index_harness 3/0 (1 perf-gate ignored), noop 42/0, `cargo build --workspace` green.
+
+**STOP CONDITION REACHED.** TASK.md open `[ ]` items remaining are all non-agent-amenable:
+- Phase 0 (customer interviews / design partners / PRD / go-no-go) — business.
+- 6.TR.C (Vortex upstream PR) — PARKED per standing user instruction.
+- Multi-region, cross-shard 2PC, TUS resumable uploads — v0.2+ architectural.
+- Open beta / GA / bug bounty / per-phase security review / partner onboarding — process gates.
+- EXCLUDE USING gist — explicitly off-roadmap.
+- 5.15.E–I (basin-cloud docs-site) — **user-gated**: needs a Docusaurus-vs-Mintlify decision + repo/CI/secrets.
+
+`[~]` partials are correctly deferred: external-tool harnesses (CI-only), 5.18.C (needs engine CREATE SCHEMA,
+v0.2), catalog replication / PITR / CoW branching (v0.2), P2 security integration-test assertions (fixes
+shipped + unit-tested; integration harness TODO).
+
+**Session tally:** 6 waves. Net-new code: GIN eviction bug fix, PostgresCatalog GIN-opclass bug fix, P2-1
+signed-URL rotation (blob+rest), 6.SEC P1-1/P1-3 fixes + P2-3/P2-4/P2-7, 5.27.D tenant-isolation assertion,
+OAuth/MFA route mounting, list_factors, 6.TR.B UUID read-path, external-tool CIs, Docker quickstart. The
+majority of "open" work was **stale unticked boxes for already-shipped features** — the roadmap was badly out
+of sync with the code; this session reconciled it.
+
 ## 2026-05-22 — Wave 5 (3 agents): P2-1 rest-wiring done; 5.11.W1-W6 already done; 5.18.C deferred (well-reasoned)
 
 Agents: H1=5.18.C (auth/net/cron/blob), H2=#16 P2-1 rest-wiring (basin-rest), H3=5.11.W (fn/engine/cli).

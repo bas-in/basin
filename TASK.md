@@ -1258,7 +1258,7 @@ harness.
       current (no-index) engine — the harness exists *before* the
       implementation; every implementation task below flips a slice
       of the harness from red to green.
-- [ ] **5.19.B — GIN index type + catalog DDL** (~1 week).
+- [x] **5.19.B — GIN index type + catalog DDL** (~1 week).
       `CREATE INDEX … USING gin (col)` + `CREATE INDEX … USING gin
       (col jsonb_path_ops)` parser + catalog persistence. Two operator
       classes: `jsonb_ops` (key+value indexing, supports more operators)
