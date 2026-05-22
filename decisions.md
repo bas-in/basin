@@ -958,3 +958,21 @@ INCLUDE for CREATE INDEX (else the executor-only reject silently no-ops).
    work — it clobbers them. If a sweep is needed, quiesce agents first.
 3. Worktree isolation per agent would prevent this but was flaky earlier;
    for shared-tree, serialize same-crate agents.
+
+---
+
+## 2026-05-22 — Phase 5.30 citext fully closed (AnalyzerRule); broad sweep concluded
+
+`f13014a` — schema-aware `CitextAnalyzerRule` (DataFusion AnalyzerRule, fires on
+resolved logical plans) auto-folds case for `WHERE`/`ORDER BY`/comparison/LIKE on
+`BASIN_TYPE=CITEXT` columns ONLY (plain text untouched); executor fast-path gated to
+defer citext predicates to DataFusion. citext_harness 4/4 green; noop 42/42, range
+4/2, jsonb 2/2, smoke_pgx green — no regression. This closed the last "deep but
+bounded" engine item; it went cleanly on the shared tree.
+
+**Sweep concluded.** Remaining TASK.md (62 open + 11 partial) is now exclusively the
+moat-architectural set (index-probe→physical-scan perf wiring; lock_timeout
+cross-session contention), external-tool-gated verification (real pg_dump/psql,
+migration-tool CIs, 1M-row soak, docker/npm CI), and upstream-blocked (#40, #63-uuid,
+#43) + the #53/#54 security/stub P1/P2 tails. These need human direction or focused
+solo sessions, not an unsupervised multi-agent sweep. Workspace unit suite green.
