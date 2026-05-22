@@ -41,21 +41,40 @@ READY_MARKER_DIR="${RUN_DIR}/.ready"
 
 log() { printf '[setup] %s\n' "$*" >&2; }
 
-# Build profile for the bench/test binaries. Release is the default: the
-# heavy data-seeding viability/scaling tests (1M–10M synthetic rows) are
-# minutes each on a debug build, so a debug full run cannot fit the ≤10 min
-# budget. The standalone vortex_compare bench already builds --release, so
-# this matches existing harness practice. Override with BENCH_PROFILE=dev.
+# Build profile for the bench/test binaries.
+#
+# Default: bench-fast (opt-level=2, codegen-units=256, debug=0, strip=symbols
+# applied ONLY to the basin-integration-tests package; deps inherit the full
+# release profile incl. opt-level=3, so the timed hot paths in engine/storage
+# are byte-for-byte release-grade). bench-fast slashes clean build time vs.
+# the previous opt-3 / codegen-units=16 release build by parallelising LLVM
+# codegen across up to 256 modules per binary.
+#
+# Override options:
+#   BENCH_PROFILE=release   — full opt-level=3 build (original behaviour,
+#                             use when you need maximum precision on a
+#                             micro-benchmark that is sensitive to opt-3 IR).
+#   BENCH_PROFILE=dev       — unoptimised debug build (not recommended for
+#                             the multi-million-row scaling tests).
+#
 # (Note: scaling_noisy_neighbor livelocks in basin_engine::fast_select at
 # this HEAD in BOTH profiles — a pre-existing engine bug, unrelated to the
 # harness; _group.sh's per-binary timeout isolates it and merge_manifest.py
 # omits its card with a logged reason.)
-BENCH_PROFILE="${BENCH_PROFILE:-release}"
-if [[ "${BENCH_PROFILE}" == "release" ]]; then
-    CARGO_PROFILE_FLAG=( --release )
-else
-    CARGO_PROFILE_FLAG=()
-fi
+BENCH_PROFILE="${BENCH_PROFILE:-bench-fast}"
+case "${BENCH_PROFILE}" in
+    release)
+        CARGO_PROFILE_FLAG=( --release )
+        ;;
+    dev)
+        CARGO_PROFILE_FLAG=()
+        ;;
+    *)
+        # Named profiles (bench-fast, or any user-defined override) use the
+        # --profile <name> flag instead of the --release shorthand.
+        CARGO_PROFILE_FLAG=( --profile "${BENCH_PROFILE}" )
+        ;;
+esac
 export BENCH_PROFILE
 
 # --- 1. build the bench test binaries once ----------------------------------
