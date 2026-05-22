@@ -5815,6 +5815,10 @@ pub(crate) fn rewrite_unqualified_pg_catalog_views(sql: &str) -> String {
         "pg_stat_wal_receiver",
         "pg_stat_subscription",
         "pg_extension",
+        // Phase 5.21.B/E: CDC / logical replication catalog views.
+        "pg_replication_slots",
+        "pg_publication",
+        "pg_publication_tables",
     ];
 
     let mut result = sql.to_string();

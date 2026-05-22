@@ -791,6 +791,49 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
         return crate::cv_ddl::exec_drop_materialized_view(sess, &name, if_exists).await;
     }
 
+    // ── Phase 5.21.B — replication slot management ───────────────────────────
+    // `SELECT … FROM pg_create_logical_replication_slot(name, plugin)`
+    if let Some((slot_name, plugin)) =
+        crate::replication::slot_udf::match_create_replication_slot(sql)
+    {
+        return crate::replication::slot_udf::exec_create_replication_slot(
+            sess,
+            &slot_name,
+            &plugin,
+        )
+        .await;
+    }
+
+    // `SELECT pg_drop_replication_slot(name)`
+    if let Some(slot_name) = crate::replication::slot_udf::match_drop_replication_slot(sql) {
+        return crate::replication::slot_udf::exec_drop_replication_slot(sess, &slot_name).await;
+    }
+
+    // ── Phase 5.21.D — current WAL LSN ───────────────────────────────────────
+    if crate::replication::slot_udf::match_current_wal_lsn(sql) {
+        return crate::replication::slot_udf::exec_current_wal_lsn(sess).await;
+    }
+
+    // ── Phase 5.21.C — logical slot get changes ───────────────────────────────
+    if let Some(slot_name) = crate::replication::slot_udf::match_logical_slot_get_changes(sql) {
+        return crate::replication::slot_udf::exec_logical_slot_get_changes(sess, &slot_name).await;
+    }
+
+    // ── Phase 5.21.E — publication DDL ───────────────────────────────────────
+    // CREATE PUBLICATION / ALTER PUBLICATION / DROP PUBLICATION are not
+    // recognised by sqlparser 0.52's PostgreSQL dialect. Intercept via
+    // text matching before sqlparser sees the SQL.
+    if let Some(intent) = crate::replication::publication_ddl::match_create_publication(sql) {
+        return crate::replication::publication_ddl::exec_create_publication(sess, intent).await;
+    }
+    if let Some(intent) = crate::replication::publication_ddl::match_alter_publication(sql) {
+        return crate::replication::publication_ddl::exec_alter_publication(sess, intent).await;
+    }
+    if let Some(pubname) = crate::replication::publication_ddl::match_drop_publication(sql) {
+        return crate::replication::publication_ddl::exec_drop_publication(sess, &pubname).await;
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     // ALTER SEQUENCE [IF EXISTS] <name> [RESTART [WITH n]]: sqlparser 0.52
     // has no AlterSequence AST node; textual pre-screen handles the full
     // PG grammar.

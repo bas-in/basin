@@ -213,6 +213,20 @@ pub(crate) struct EngineInner {
     /// inside the `DashMap`). Serves `timescaledb_information.chunks` at query
     /// time via [`crate::hypertable_provider::ChunksProvider`].
     pub(crate) hypertable_registry: Arc<crate::hypertable::HypertableRegistry>,
+
+    /// Phase 5.21.B — process-wide logical replication slot registry.
+    ///
+    /// Holds per-project logical replication slots and their pending frame
+    /// queues. Shared across all sessions; per-project isolation is structural
+    /// (each project has its own slot map inside the `Arc<Mutex<HashMap<…>>>`).
+    /// Per-tenant cost is O(bytes) when no slots are active for a project.
+    pub(crate) slot_registry: Arc<basin_catalog::SlotRegistry>,
+
+    /// Phase 5.21.E — process-wide publication registry.
+    ///
+    /// Tracks `CREATE PUBLICATION … FOR TABLE …` declarations per project.
+    /// Consulted by the pgoutput encoder to filter the change stream.
+    pub(crate) publication_registry: Arc<basin_catalog::PublicationRegistry>,
 }
 
 impl Engine {
@@ -291,6 +305,10 @@ impl Engine {
             connection_registry: crate::connection_registry::ConnectionRegistry::new(),
             // Phase 5.29.B-D: process-wide hypertable registry.
             hypertable_registry: Arc::new(crate::hypertable::HypertableRegistry::new()),
+            // Phase 5.21.B: process-wide logical replication slot registry.
+            slot_registry: Arc::new(basin_catalog::SlotRegistry::new()),
+            // Phase 5.21.E: process-wide publication registry.
+            publication_registry: Arc::new(basin_catalog::PublicationRegistry::new()),
         });
         // Phase 5.14.D2: register the query-history adapter with the shard so
         // the compactor can consult observed ORDER BY / GROUP BY patterns.
@@ -470,6 +488,16 @@ impl Engine {
     /// Cheap to clone (`Arc` inside).
     pub(crate) fn hypertable_registry(&self) -> &Arc<crate::hypertable::HypertableRegistry> {
         &self.inner.hypertable_registry
+    }
+
+    /// Phase 5.21.B: access the process-wide logical replication slot registry.
+    pub(crate) fn slot_registry(&self) -> &Arc<basin_catalog::SlotRegistry> {
+        &self.inner.slot_registry
+    }
+
+    /// Phase 5.21.E: access the process-wide publication registry.
+    pub(crate) fn publication_registry(&self) -> &Arc<basin_catalog::PublicationRegistry> {
+        &self.inner.publication_registry
     }
 
     /// Crate-private hook bumped by `executor::execute` when a vector
@@ -809,6 +837,8 @@ pub enum ExecResult {
 mod advisory_lock;
 mod alter;
 mod alter_project;
+/// Phase 5.21 — Logical CDC / pgoutput replication infrastructure.
+pub(crate) mod replication;
 pub mod connection_registry;
 /// Phase 5.29.B-D — TimescaleDB-style hypertable registry and SQL matchers.
 pub(crate) mod hypertable;

@@ -2347,3 +2347,63 @@ pub(crate) fn register_info_schema_providers(
 
     Ok(())
 }
+
+/// Phase 5.21.B/E — register CDC-related virtual table providers in the
+/// `pg_catalog` schema of the given session context.
+///
+/// Registers:
+/// - `pg_replication_slots` — live view of active logical replication slots.
+/// - `pg_publication` — logical replication publication list.
+/// - `pg_publication_tables` — per-publication table membership.
+///
+/// Called from `session::open` after `register_info_schema_providers` so the
+/// pg_catalog schema already exists and we can look it up by name.
+pub(crate) fn register_cdc_providers(
+    ctx: &datafusion::prelude::SessionContext,
+    slot_registry: std::sync::Arc<basin_catalog::SlotRegistry>,
+    publication_registry: std::sync::Arc<basin_catalog::PublicationRegistry>,
+    project: ProjectId,
+) -> DfResult<()> {
+    let catalog_name = ctx.state().config_options().catalog.default_catalog.clone();
+    let df_catalog = ctx.catalog(&catalog_name).ok_or_else(|| {
+        DataFusionError::Internal(format!(
+            "default catalog {catalog_name:?} not registered on session"
+        ))
+    })?;
+
+    // Ensure pg_catalog schema exists (it is created by
+    // register_info_schema_providers but may not be present in test stubs).
+    let pg_catalog_schema = if let Some(s) = df_catalog.schema("pg_catalog") {
+        s
+    } else {
+        let s = std::sync::Arc::new(datafusion::catalog::MemorySchemaProvider::new());
+        df_catalog.register_schema("pg_catalog", s.clone())?;
+        s
+    };
+
+    let repl_slots: std::sync::Arc<dyn TableProvider> = std::sync::Arc::new(
+        crate::replication::slot_udf::PgReplicationSlotsProvider::new(slot_registry, project),
+    );
+    // Ignore already-exists errors (idempotent registration).
+    let _ = pg_catalog_schema
+        .register_table("pg_replication_slots".to_string(), repl_slots);
+
+    let pub_provider: std::sync::Arc<dyn TableProvider> = std::sync::Arc::new(
+        crate::replication::slot_udf::PgPublicationProvider::new(
+            publication_registry.clone(),
+            project,
+        ),
+    );
+    let _ = pg_catalog_schema.register_table("pg_publication".to_string(), pub_provider);
+
+    let pub_tables_provider: std::sync::Arc<dyn TableProvider> = std::sync::Arc::new(
+        crate::replication::slot_udf::PgPublicationTablesProvider::new(
+            publication_registry,
+            project,
+        ),
+    );
+    let _ = pg_catalog_schema
+        .register_table("pg_publication_tables".to_string(), pub_tables_provider);
+
+    Ok(())
+}

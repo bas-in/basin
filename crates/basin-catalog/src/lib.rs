@@ -49,6 +49,10 @@ mod snapshot;
 /// HTTP POST to `/internal/v1/metering/counters`.
 pub mod usage;
 mod views;
+/// Phase 5.21.B — logical replication slot registry.
+pub mod replication_slots;
+/// Phase 5.21.E — publication registry (CREATE/ALTER/DROP PUBLICATION).
+pub mod publications;
 
 use std::sync::Arc;
 
@@ -63,6 +67,8 @@ pub use functions::{
     SqlArgType, SqlFunctionArg, SqlFunctionDef, SqlFunctionLanguage, SqlReturnType,
 };
 pub use in_memory::InMemoryCatalog;
+pub use replication_slots::{lsn_to_pgtext, Lsn, PendingFrame, SlotRegistry, SlotSnapshot};
+pub use publications::{Publication, PublicationRegistry, PublicationTable};
 pub use budgets::{
     BudgetCoordinator, CapKind, InMemoryBudgetCoordinator, ProjectBudget, SliceBudget,
     SliceBudgetView, SliceGate, UsageDelta, UsageSnapshot, SLICE_UNSET,

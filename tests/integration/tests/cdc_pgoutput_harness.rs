@@ -125,7 +125,7 @@ fn require_env(var: &str) -> Option<String> {
 ///     (not NULL, format `XX/XXXXXXXX`)
 ///
 /// Closed by: 5.21.B (logical replication slot management layer).
-#[ignore = "5.21.A harness — logical CDC/pgoutput pending; closes 5.21.B-G"]
+// 5.21.B implemented: replication slot create/drop + pg_replication_slots view.
 #[tokio::test]
 async fn cdc_create_replication_slot() {
     // Slice: "slot mgmt"
@@ -247,7 +247,7 @@ async fn cdc_create_replication_slot() {
 /// logical replication API (no external TCP connection required).
 ///
 /// Closed by: 5.21.C (in-process pgoutput consumer + frame decoder).
-#[ignore = "5.21.A harness — logical CDC/pgoutput pending; closes 5.21.B-G"]
+// 5.21.C implemented: pgoutput encoder + pg_logical_slot_get_changes.
 #[tokio::test]
 async fn cdc_pgoutput_frame_emission() {
     // Slice: "in-process Rust consumer"
@@ -397,7 +397,7 @@ async fn cdc_pgoutput_frame_emission() {
 ///      advances (consumed WAL is freed).
 ///
 /// Closed by: 5.21.D (WAL LSN management + slot restart_lsn tracking).
-#[ignore = "5.21.A harness — logical CDC/pgoutput pending; closes 5.21.B-G"]
+// 5.21.D implemented: pg_current_wal_lsn + confirmed_flush_lsn tracking.
 #[tokio::test]
 async fn cdc_lsn_management_and_retention() {
     // Slice: "replay/retention"
@@ -559,7 +559,7 @@ async fn cdc_lsn_management_and_retention() {
 /// and `pg_publication_tables`; `ALTER PUBLICATION` adds tables.
 ///
 /// Closed by: 5.21.E (publication DDL + pg_publication catalog views).
-#[ignore = "5.21.A harness — logical CDC/pgoutput pending; closes 5.21.B-G"]
+// 5.21.E implemented: CREATE/ALTER/DROP PUBLICATION + pg_publication views.
 #[tokio::test]
 async fn cdc_publication_ddl() {
     // Slice: "publication-shape"

@@ -1092,6 +1092,17 @@ pub(crate) async fn open(
         }
     }
 
+    // Phase 5.21.B/E: register CDC virtual tables (pg_replication_slots,
+    // pg_publication, pg_publication_tables) in the pg_catalog schema.
+    if let Err(e) = crate::info_schema_provider::register_cdc_providers(
+        &ctx,
+        engine.slot_registry().clone(),
+        engine.publication_registry().clone(),
+        project,
+    ) {
+        tracing::warn!("register_cdc_providers: {e}");
+    }
+
     let state = Arc::new(SessionState::new());
 
     // Phase 5.28.C: register with the idle-in-txn reaper.
