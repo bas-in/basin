@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional, TypeVar
 import httpx
 
 from ._http import HttpTransport
+from .admin.client import AdminClient
 from .auth.client import AuthClient
 from .errors import BasinError
 from .postgrest.builder import QueryBuilder
@@ -65,6 +66,11 @@ class Client:
             anon_key=anon_key,
             get_headers=self._current_headers,
             http=self._http,
+        )
+
+        self.admin = AdminClient(
+            http=self._http,
+            get_headers=self._current_headers,
         )
 
     # ── Public surface ─────────────────────────────────────────────────
