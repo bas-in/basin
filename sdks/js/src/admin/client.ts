@@ -65,7 +65,7 @@ export class AdminProjectsClient {
       };
     }
 
-    const connectionString = Object.keys(body as Record<string, unknown>)[0] ?? "";
+    const connectionString = extractConnectionUrl(body);
     return { data: { connectionString }, error: null };
   }
 
@@ -123,7 +123,7 @@ export class AdminProjectsClient {
       };
     }
 
-    const connectionString = Object.keys(body as Record<string, unknown>)[0] ?? "";
+    const connectionString = extractConnectionUrl(body);
     return { data: { connectionString }, error: null };
   }
 
@@ -189,4 +189,24 @@ export class AdminClient {
 function networkErrorMessage(e: unknown): string {
   if (e instanceof Error && e.message) return e.message;
   return "network error reaching admin endpoint";
+}
+
+/**
+ * Extract the connection URL from the engine's provision/rotate response.
+ *
+ * The engine returns `{"project_id":…,"pgwire_user":…,"dbname":…,
+ * "password":…,"connection_url":"postgres://…"}` — use the named
+ * `connection_url` field. Falls back to scanning all string values for a
+ * `postgres://`-prefixed entry so older engine builds that differ in shape
+ * still work rather than silently returning an empty string.
+ */
+function extractConnectionUrl(body: unknown): string {
+  if (body && typeof body === "object") {
+    const rec = body as Record<string, unknown>;
+    if (typeof rec["connection_url"] === "string") return rec["connection_url"];
+    for (const v of Object.values(rec)) {
+      if (typeof v === "string" && v.startsWith("postgres://")) return v;
+    }
+  }
+  return "";
 }

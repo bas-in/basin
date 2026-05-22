@@ -123,7 +123,6 @@ export function createServerClient(
   const baseHeaders: Record<string, string> = {
     "Content-Type": "application/json",
     apikey: key,
-    Authorization: `Bearer ${key}`,
     ...options.headers,
   };
 

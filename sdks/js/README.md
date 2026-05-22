@@ -37,6 +37,33 @@ link state lives on the engine itself. One process. Point `createClient` at
 the engine's HTTP base URL (`http://localhost:5434` by default) and the SDK
 behaves identically to talking to the managed cloud.
 
+**Self-host notes:**
+
+- **Anon key:** mint your own anon key via `POST /auth/v1/api-keys` on your
+  engine (requires an admin JWT). The returned key is the value you pass as
+  the second argument to `createClient`.
+- **Realtime ports:** the SSE and WebSocket transports bind on separate ports
+  from the REST API. Make sure your reverse-proxy forwards both onto the same
+  origin that the SDK talks to:
+  - SSE — `BASIN_REALTIME_BIND` (default 5435)
+  - WebSocket — `BASIN_REALTIME_WS_BIND` (default 5436)
+  Without this, `basin.channel(…).subscribe()` will fail with a CORS or
+  connection error.
+- **Session storage and XSS:** by default `createClient` stores the session
+  JWT in `localStorage`, which is readable by any JavaScript on the same
+  origin. If your app is XSS-vulnerable, a compromised script can steal the
+  token. Alternatives:
+  - **Cookie storage (SSR / Next.js / SvelteKit):** use `createServerClient`
+    from the `./ssr` sub-path export; it stores the session in an `httpOnly`
+    cookie that JavaScript cannot read.
+  - **Memory storage:** pass `storage: undefined` in the `BasinClientOptions`
+    to keep the session only in memory — it is lost on page reload, which is
+    the correct trade-off for highly sensitive contexts.
+  ```ts
+  // Memory-only session (no localStorage):
+  const basin = createClient(url, anonKey, { storage: undefined });
+  ```
+
 ## Quickstart
 
 ```ts

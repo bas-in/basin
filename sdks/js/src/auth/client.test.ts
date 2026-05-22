@@ -381,7 +381,7 @@ describe("auth.signUp", () => {
 });
 
 describe("auth.signInWithOAuth", () => {
-  it("builds the /auth/v1/authorize URL with provider param and no fetch", async () => {
+  it("builds the /auth/v1/oauth/:provider/authorize URL with no fetch (exact shape)", async () => {
     let fetchCalled = false;
     const basin = createClient("https://api.basin.run", "anon", {
       fetch: async () => {
@@ -394,12 +394,14 @@ describe("auth.signInWithOAuth", () => {
     });
     expect(error).toBeNull();
     expect(data?.provider).toBe("google");
-    expect(data?.url).toBe("https://api.basin.run/auth/v1/authorize?provider=google");
+    // Exact path-segment form: GET /auth/v1/oauth/:provider/authorize
+    // (verified against basin-rest/src/server.rs:224).
+    expect(data?.url).toBe("https://api.basin.run/auth/v1/oauth/google/authorize");
     // No network egress — pure URL construction.
     expect(fetchCalled).toBe(false);
   });
 
-  it("includes redirect_to when provided", async () => {
+  it("includes redirect_to as query param when provided", async () => {
     const basin = createClient("https://api.basin.run", "anon", {
       fetch: async () => new Response("{}", { status: 200 }),
     });
@@ -408,8 +410,9 @@ describe("auth.signInWithOAuth", () => {
       redirectTo: "https://myapp.com/auth/callback",
     });
     expect(error).toBeNull();
-    expect(data?.url).toContain("redirect_to=https%3A%2F%2Fmyapp.com%2Fauth%2Fcallback");
-    expect(data?.url).toContain("provider=github");
+    expect(data?.url).toBe(
+      "https://api.basin.run/auth/v1/oauth/github/authorize?redirect_to=https%3A%2F%2Fmyapp.com%2Fauth%2Fcallback",
+    );
   });
 
   it("includes scopes and extra queryParams when provided", async () => {
@@ -421,11 +424,12 @@ describe("auth.signInWithOAuth", () => {
       scopes: "repo,read:user",
       queryParams: { login_hint: "pc@example.com" },
     });
+    expect(data?.url).toContain("/auth/v1/oauth/github/authorize");
     expect(data?.url).toContain("scopes=repo%2Cread%3Auser");
     expect(data?.url).toContain("login_hint=pc%40example.com");
   });
 
-  it("supports all enumerated providers including oidc", async () => {
+  it("supports all enumerated providers including oidc — exact path shape", async () => {
     const providers = [
       "google", "github", "microsoft", "gitlab", "slack", "discord",
       "apple", "x", "bitbucket", "notion", "spotify", "twitch",
@@ -438,7 +442,10 @@ describe("auth.signInWithOAuth", () => {
       const { data, error } = await basin.auth.signInWithOAuth({ provider });
       expect(error).toBeNull();
       expect(data?.provider).toBe(provider);
-      expect(data?.url).toContain(`provider=${provider}`);
+      // Path-segment form — provider is in the URL path, not a query param.
+      expect(data?.url).toMatch(
+        new RegExp(`/auth/v1/oauth/${provider}/authorize`),
+      );
     }
   });
 

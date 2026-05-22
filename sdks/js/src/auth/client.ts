@@ -281,11 +281,13 @@ export class AuthClient {
   /**
    * Sign in with an OAuth provider.
    *
-   * Builds the engine's `GET /auth/v1/authorize?provider=<name>&redirect_to=…`
-   * URL. The engine handles PKCE + signed `state` server-side and completes
-   * the exchange via `GET /auth/v1/callback`. In a browser environment this
-   * method sets `window.location.href` to redirect automatically; in all
-   * other runtimes it returns the URL for the caller to act on.
+   * Builds the engine's `GET /auth/v1/oauth/:provider/authorize?redirect_to=…`
+   * URL (path-segment form; verified against basin-rest/src/server.rs:224).
+   * The engine handles PKCE + signed `state` server-side and completes the
+   * exchange via `GET /auth/v1/oauth/:provider/callback`. In a browser
+   * environment this method sets `window.location.href` to redirect
+   * automatically; in all other runtimes it returns the URL for the caller
+   * to act on.
    *
    * Returns `{data: {url, provider}, error: null}` — the URL is always
    * returned so callers can inspect it before the redirect.
@@ -315,7 +317,7 @@ export class AuthClient {
         ),
       };
     }
-    const params = new URLSearchParams({ provider: input.provider });
+    const params = new URLSearchParams();
     if (input.redirectTo) params.set("redirect_to", input.redirectTo);
     if (input.scopes) params.set("scopes", input.scopes);
     if (input.queryParams) {
@@ -323,7 +325,8 @@ export class AuthClient {
         params.set(k, v);
       }
     }
-    const url = `${this.#url}/authorize?${params.toString()}`;
+    const qs = params.toString();
+    const url = `${this.#url}/oauth/${input.provider}/authorize${qs ? `?${qs}` : ""}`;
     // In browser environments, redirect automatically. Return the URL
     // first so SSR callers can issue a 302 without a window reference.
     if (typeof window !== "undefined" && typeof window.location !== "undefined") {

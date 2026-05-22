@@ -690,15 +690,16 @@ export class PostgrestQueryBuilder<T> implements PromiseLike<PostgrestResponse<T
 
     const count = parseContentRangeCount(res.headers.get("Content-Range"));
 
-    // basin engine v0.1 returns 501 for DELETE. Surface a clear error
-    // rather than a confusing raw 501 — other methods with 501 are
+    // The engine registers DELETE on /rest/v1/:table (server.rs:195).
+    // A 501 here would be a misconfigured or unreachable engine — surface a
+    // clear error rather than a confusing raw 501. Other methods with 501 are
     // genuine server bugs and flow through the generic error path below.
     if (res.status === 501 && this.#pending.method === "DELETE") {
       return {
         data: null,
         error: new BasinError(
           "not_implemented",
-          "DELETE in basin REST v0.1 is not implemented yet — see basin engine v0.2 roadmap",
+          "DELETE returned 501 — check that your basin engine version supports the /rest/v1/:table DELETE route",
           501,
         ),
         count: null,

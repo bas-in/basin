@@ -44,6 +44,18 @@ function rejectFetch(err: Error): typeof fetch {
 
 const SAMPLE_CONNECTION_STRING = "postgres://user:pass@host:5433/db";
 
+// Engine response shape (from basin-rest/src/routes/admin.rs:connection_info_to_json):
+// { project_id, pgwire_user, dbname, password, connection_url }
+function provisionBody(connectionUrl: string) {
+  return {
+    project_id: "proj_x",
+    pgwire_user: "pgwire_user_1",
+    dbname: "basin",
+    password: "secret",
+    connection_url: connectionUrl,
+  };
+}
+
 const SAMPLE_CREDENTIALS: Credential[] = [
   {
     id: "cred-1",
@@ -66,11 +78,11 @@ const SAMPLE_CREDENTIALS: Credential[] = [
 // ── provision ────────────────────────────────────────────────────────
 
 describe("admin.projects.provision", () => {
-  it("happy path — POSTs correct URL/body and returns connectionString", async () => {
+  it("happy path — POSTs correct URL/body and returns connectionString from connection_url field", async () => {
     const captured: { url?: string; method?: string; body?: unknown } = {};
     const basin = createClient(BASE_URL, ANON_KEY, {
       fetch: stubFetch(
-        { body: { [SAMPLE_CONNECTION_STRING]: null } },
+        { body: provisionBody(SAMPLE_CONNECTION_STRING) },
         captured,
       ),
     });
@@ -127,11 +139,11 @@ describe("admin.projects.provision", () => {
 // ── rotateCredentials ─────────────────────────────────────────────────
 
 describe("admin.projects.rotateCredentials", () => {
-  it("happy path — POSTs correct URL and returns connectionString", async () => {
+  it("happy path — POSTs correct URL and returns connectionString from connection_url field", async () => {
     const captured: { url?: string; method?: string } = {};
     const basin = createClient(BASE_URL, ANON_KEY, {
       fetch: stubFetch(
-        { body: { [SAMPLE_CONNECTION_STRING]: null } },
+        { body: provisionBody(SAMPLE_CONNECTION_STRING) },
         captured,
       ),
     });
@@ -147,7 +159,7 @@ describe("admin.projects.rotateCredentials", () => {
   it("encodes special characters in pgwireUser", async () => {
     const captured: { url?: string } = {};
     const basin = createClient(BASE_URL, ANON_KEY, {
-      fetch: stubFetch({ body: { [SAMPLE_CONNECTION_STRING]: null } }, captured),
+      fetch: stubFetch({ body: provisionBody(SAMPLE_CONNECTION_STRING) }, captured),
     });
 
     await basin.admin.projects.rotateCredentials("user/with spaces");

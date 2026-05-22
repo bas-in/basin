@@ -179,3 +179,33 @@ describe("createServerClient — refreshSession", () => {
     expect(error?.code).toBe("no_session");
   });
 });
+
+describe("createServerClient — no static bearer at construction", () => {
+  it("pre-auth request does NOT carry Authorization: Bearer <anonKey>", async () => {
+    const ANON_KEY = "anon-key-value";
+    const capturedHeaders: Record<string, string> = {};
+    const cookies = mockCookieStore();
+    // Capture headers sent by any request made before a session is present.
+    const capturingFetch: typeof fetch = async (input, init) => {
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      for (const [k, v] of Object.entries(headers)) {
+        capturedHeaders[k.toLowerCase()] = v;
+      }
+      return new Response(JSON.stringify({ data: null, error: { code: "invalid_request" } }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    };
+    const client = createServerClient("https://db.example.com", ANON_KEY, {
+      cookies,
+      fetch: capturingFetch,
+    });
+    // Trigger a request before any session is established.
+    await client.auth.signInWithPassword({ email: "x@x.com", password: "p" });
+    // apikey header must be present (identifies the project).
+    expect(capturedHeaders["apikey"]).toBe(ANON_KEY);
+    // Authorization header must NOT equal "Bearer <anonKey>" — only the
+    // session JWT (added per-request by AuthClient) should appear there.
+    expect(capturedHeaders["authorization"]).not.toBe(`Bearer ${ANON_KEY}`);
+  });
+});

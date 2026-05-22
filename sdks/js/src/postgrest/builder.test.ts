@@ -753,13 +753,15 @@ describe("postgrest .paginate()", () => {
 });
 
 describe("T-027: DELETE 501 wrap", () => {
-  it("wraps engine 501 on DELETE as not_implemented BasinError", async () => {
+  it("wraps engine 501 on DELETE as not_implemented BasinError with actionable message", async () => {
     const basin = newClient(stubFetch({ status: 501, bodyText: "Not Implemented" }));
     const { data, error } = await basin.from("t").delete().eq("id", 1);
     expect(data).toBeNull();
     expect(error?.code).toBe("not_implemented");
     expect(error?.message).toContain("DELETE");
-    expect(error?.message).toContain("v0.2");
+    // The engine now registers the DELETE route (server.rs:195); 501 means
+    // a misconfigured or too-old engine, not a missing v0.2 feature.
+    expect(error?.message).toContain("basin engine");
     expect(error?.status).toBe(501);
   });
 

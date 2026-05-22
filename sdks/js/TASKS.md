@@ -306,22 +306,24 @@ table. If the route isn't there, leave the stub and move on.
 
 ### T-020 — Wire `signInWithOAuth` ✅
 
-**Status:** done 2026-05-20 — `GET /auth/v1/authorize?provider=<name>&redirect_to=…` wired.
-Pure URL construction; no fetch. Browser env auto-redirects; all other
-runtimes return `{data: {url, provider}, error: null}`. All provider tests
-pass (15 providers including `oidc`).
+**Status:** done 2026-05-20; corrected 2026-05-22 — URL fixed to the
+path-segment form `GET /auth/v1/oauth/:provider/authorize?redirect_to=…`
+(verified against `basin-rest/src/server.rs:224`). Pure URL construction;
+no fetch. Browser env auto-redirects; all other runtimes return
+`{data: {url, provider}, error: null}`. All provider tests pass (15
+providers including `oidc`).
 
 **Files:** `src/auth/client.ts`, `src/auth/client.test.ts`
 
-**Engine route (final):** `GET /auth/v1/authorize?provider=<name>&redirect_to=…`
-— **corrected** from the earlier guess `/auth/v1/oauth/:provider/authorize`.
-Supabase-shaped.
+**Engine route (final):** `GET /auth/v1/oauth/:provider/authorize`
+(path-segment form; `basin-rest/src/server.rs:224`). Callback at
+`GET /auth/v1/oauth/:provider/callback`.
 
 **Scope:**
-- Build the authorize URL: `${url}/auth/v1/authorize?provider=${provider}&redirect_to=…`.
+- Build the authorize URL: `${url}/auth/v1/oauth/${provider}/authorize?redirect_to=…`.
 - Return `{data: {url, provider}, error: null}` — the caller redirects the
   browser to this URL; the engine handles PKCE + signed `state`
-  server-side, then `GET /auth/v1/callback` completes the exchange.
+  server-side, then `GET /auth/v1/oauth/:provider/callback` completes the exchange.
 - Drop the current `not_implemented` short-circuit.
 
 **Provider list:** presets (Google/GitHub/Apple/…) + generic `oidc` per
