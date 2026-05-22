@@ -593,7 +593,6 @@ async fn jsonb_index_perf_gate() {
 /// Closes when: 5.19.B lands and `CREATE INDEX … USING gin (payload)` is
 /// accepted by the engine's DDL parser + catalog. At that point drop this
 /// `#[ignore]`.
-#[ignore = "5.19.A harness — engine GIN-equivalent pending; closes when 5.19.B/C/D/E land"]
 #[tokio::test]
 async fn jsonb_orm_compat() {
     // Slice: "ORM compat (Diesel / sqlx / Prisma)"

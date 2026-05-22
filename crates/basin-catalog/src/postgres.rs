@@ -1739,6 +1739,70 @@ impl Catalog for PostgresCatalog {
         Ok(())
     }
 
+    /// Phase 5.19.B: PostgresCatalog override that persists `access_method`
+    /// and `opclass` onto the `SecondaryIndex` row, so GIN indexes (and GIST,
+    /// HNSW, etc.) are stored with their correct metadata rather than being
+    /// silently downgraded to "btree" by the default trait implementation.
+    #[instrument(skip(self), fields(project = %project, table = %table, name = %name))]
+    async fn create_index_with_method(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        name: &str,
+        columns: &[String],
+        if_not_exists: bool,
+        access_method: &str,
+        opclass: Option<&str>,
+    ) -> Result<()> {
+        if columns.is_empty() {
+            return Err(BasinError::InvalidSchema(
+                "create_index: column list cannot be empty".into(),
+            ));
+        }
+
+        let mut meta = self.load_table(project, table).await?;
+        for col in columns {
+            if meta.schema.field_with_name(col).is_err() {
+                return Err(BasinError::InvalidSchema(format!(
+                    "create_index: column {col:?} not in table {project}/{table} schema"
+                )));
+            }
+        }
+        if meta.indexes.iter().any(|i| i.name == name) {
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(BasinError::catalog(format!(
+                "create_index: {project}/{table}: index {name:?} already exists"
+            )));
+        }
+        meta.indexes.push(SecondaryIndex {
+            name: name.to_string(),
+            columns: columns.to_vec(),
+            access_method: access_method.to_string(),
+            opclass: opclass.map(|s| s.to_string()),
+        });
+        let indexes_json = serde_json::to_value(&meta.indexes)
+            .map_err(|e| BasinError::catalog(format!("serialise indexes: {e}")))?;
+        let sch = &self.schema;
+        let client = self.client().await?;
+        let n = client
+            .execute(
+                &format!(
+                    "UPDATE {sch}.tables
+                     SET indexes_json = $3
+                     WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2"
+                ),
+                &[&project.to_string(), &table.to_string(), &indexes_json],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("create_index_with_method: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!("{project}/{table}")));
+        }
+        Ok(())
+    }
+
     #[instrument(skip(self), fields(project = %project, table = %table, name = %name))]
     async fn drop_index(&self, project: &ProjectId, table: &TableName, name: &str) -> Result<()> {
         let mut meta = self.load_table(project, table).await?;
@@ -4541,6 +4605,64 @@ mod tests {
         let loaded = cat.load_table(&t, &tbl).await.unwrap();
         assert!(loaded.indexes.is_empty());
         assert_eq!(loaded.unique_constraints[0].name, "users_name_key");
+    }
+
+    /// Phase 5.19.B: verify that `create_index_with_method` persists the
+    /// access_method and opclass fields (not silently downgraded to "btree").
+    #[tokio::test]
+    async fn create_index_with_method_persists_gin_opclass() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let t = ProjectId::new();
+        let tbl = TableName::new("jsonb_table").unwrap();
+        // Reuse the schema() helper (has id + name columns). In production
+        // the column would be JSONB; the catalog stores the opclass string
+        // verbatim without validating the column type.
+        cat.create_table(&t, &tbl, &schema()).await.unwrap();
+
+        // GIN with jsonb_path_ops (the more selective opclass).
+        cat.create_index_with_method(
+            &t,
+            &tbl,
+            "jsonb_table_name_gin",
+            &["name".into()],
+            false,
+            "gin",
+            Some("jsonb_path_ops"),
+        )
+        .await
+        .unwrap();
+
+        let loaded = cat.load_table(&t, &tbl).await.unwrap();
+        assert_eq!(
+            loaded.indexes,
+            vec![SecondaryIndex {
+                name: "jsonb_table_name_gin".into(),
+                columns: vec!["name".into()],
+                access_method: "gin".to_string(),
+                opclass: Some("jsonb_path_ops".to_string()),
+            }]
+        );
+
+        // Default opclass (jsonb_ops) when opclass=None.
+        cat.create_index_with_method(
+            &t,
+            &tbl,
+            "jsonb_table_name_gin_ops",
+            &["name".into()],
+            false,
+            "gin",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let loaded2 = cat.load_table(&t, &tbl).await.unwrap();
+        assert_eq!(loaded2.indexes.len(), 2);
+        let idx2 = &loaded2.indexes[1];
+        assert_eq!(idx2.access_method, "gin");
+        assert_eq!(idx2.opclass, None);
     }
 
     #[tokio::test]

@@ -2862,6 +2862,70 @@ mod tests {
         assert!(matches!(err, BasinError::NotFound(_)), "got {err:?}");
     }
 
+    /// Phase 5.19.B: `create_index_with_method` persists access_method and
+    /// opclass correctly (GIN does not silently degrade to btree).
+    #[tokio::test]
+    async fn create_index_with_method_gin_persists_opclass() {
+        let cat = InMemoryCatalog::new();
+        let t = ProjectId::new();
+        let tbl = TableName::new("gin_test").unwrap();
+        cat.create_table(&t, &tbl, &schema()).await.unwrap();
+
+        // GIN with jsonb_path_ops.
+        cat.create_index_with_method(
+            &t,
+            &tbl,
+            "gin_test_id_path_ops",
+            &["id".into()],
+            false,
+            "gin",
+            Some("jsonb_path_ops"),
+        )
+        .await
+        .unwrap();
+
+        let after = cat.load_table(&t, &tbl).await.unwrap();
+        assert_eq!(after.indexes.len(), 1);
+        let idx = &after.indexes[0];
+        assert_eq!(idx.name, "gin_test_id_path_ops");
+        assert_eq!(idx.access_method, "gin");
+        assert_eq!(idx.opclass, Some("jsonb_path_ops".to_string()));
+
+        // GIN with jsonb_ops (explicit default).
+        cat.create_index_with_method(
+            &t,
+            &tbl,
+            "gin_test_id_ops",
+            &["id".into()],
+            false,
+            "gin",
+            Some("jsonb_ops"),
+        )
+        .await
+        .unwrap();
+
+        let after2 = cat.load_table(&t, &tbl).await.unwrap();
+        assert_eq!(after2.indexes.len(), 2);
+        let idx2 = &after2.indexes[1];
+        assert_eq!(idx2.access_method, "gin");
+        assert_eq!(idx2.opclass, Some("jsonb_ops".to_string()));
+
+        // IF NOT EXISTS is respected for create_index_with_method.
+        cat.create_index_with_method(
+            &t,
+            &tbl,
+            "gin_test_id_ops",
+            &["id".into()],
+            true,
+            "gin",
+            Some("jsonb_ops"),
+        )
+        .await
+        .unwrap(); // must not error
+        let after3 = cat.load_table(&t, &tbl).await.unwrap();
+        assert_eq!(after3.indexes.len(), 2, "IF NOT EXISTS must not add a duplicate");
+    }
+
     /// Migration Manager v0.2: project-wide list returns every table's
     /// every snapshot, sorted by committed_at.
     #[tokio::test]
