@@ -6,6 +6,32 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-22 — Wave 5 (3 agents): P2-1 rest-wiring done; 5.11.W1-W6 already done; 5.18.C deferred (well-reasoned)
+
+Agents: H1=5.18.C (auth/net/cron/blob), H2=#16 P2-1 rest-wiring (basin-rest), H3=5.11.W (fn/engine/cli).
+**Two watchdog stalls again** (H1 + H2) on long cold-cache builds mid-work — re-dispatched as warm-cache
+continuations (H1 fresh, H2 picked up in-tree partial). The watchdog-on-long-builds is now a known,
+recurring tax on this large workspace; continuations with "commit-as-soon-as-it-compiles" recover it.
+
+- **P2-1 rest-wiring DONE** (`b4d76db`): basin-rest now holds `Arc<BlobSigningSecret>`, mints+verifies
+  storage signed-URLs with it (not the JWT secret), and exposes `POST /admin/v1/storage/signing-key/rotate`
+  (is_admin-gated). Tests prove a pre-rotation URL fails post-rotation; fresh URL verifies. 70 rest tests pass.
+  This completes the last piece of 6.SEC P2-1.
+- **5.11.W1-W6 already fully implemented** (`08a914e` added only 5 missing `validate_javascript_body`
+  unit tests): W1 host imports + WIT (basin-fn), W2 handler ABI + /fn/v1 mount, W3 CLI deploy/list/logs/delete
+  (ComponentizeJS/Javy), W4 `@basin/functions` SDK (basin-js, 20 vitest), W5 governance caps (epoch/memory/
+  wall-clock/semaphore), W6 `LANGUAGE javascript` + RLS/aal-aware host query. All test-verified.
+- **5.18.C DEFERRED to v0.2** (no code change — correct call): all 4 subsystems already have the scaffolding
+  (RESERVED_SCHEMA, canonical names, legacy aliases); basin-blob already uses real `CREATE SCHEMA`. Full
+  migration to `auth.users`-style DDL is blocked on basin-engine supporting `CREATE SCHEMA` + schema-qualified
+  DDL (`single_part_name` rejects multi-part ObjectName) — out of the subsystem-crate scope and a genuine v0.2
+  architectural item. Back-compat alias layer is the right v0.1 boundary. Marked `[~]`.
+
+**Session-wide pattern confirmed:** the dominant form of "open" work this session was **stale unticked boxes
+for already-shipped features** (6.X.A, 6.TR.A, all 8 `.A` harnesses, 5.18.B/D/E, 5.11.W1-W6). Real net-new
+implementation was a minority: the GIN eviction bug fix, P2-1 rest-wiring, the 6.SEC P1-1/P1-3 fixes,
+5.27.D tenant-isolation assertion. The roadmap was badly out of sync with the code.
+
 ## 2026-05-22 — Wave 4 (3 agents): closed the 6.SEC P1/P2 security tail
 
 Agents (disjoint crates, none editing the shared `security.rs` — orchestrator un-ignored): G1=basin-realtime

@@ -860,14 +860,14 @@ JS/TS is the headline DX. Critical path: W1 → (W2 ∥ W3) → W4 → W7.
 function-Wasm a host-import interface so it can do real work, on the
 WASI Preview 2 / component model so any guest language targets one ABI.
 
-- [ ] Host imports: `basin:fn/query` (run SQL under the caller's
+- [x] Host imports: `basin:fn/query` (run SQL under the caller's
       identity — RLS applies), `basin:fn/http` (outbound HTTP via
       `basin-net`: allowlist + rate-limit + body-cap + timeout already
       in place), `basin:fn/log` (tracing), `basin:fn/secret` (read a
       project secret, decrypted via `EncryptionProvider`).
-- [ ] WIT interface definitions in `crates/basin-engine` (or a new
+- [x] WIT interface definitions in `crates/basin-engine` (or a new
       `crates/basin-fn`); guest bindings generated from the WIT.
-- [ ] Acceptance: a hand-written Rust→Wasm component calls
+- [x] Acceptance: a hand-written Rust→Wasm component calls
       `basin:fn/query("SELECT 1")` and `basin:fn/http(...)` and gets
       correct results through the host.
 
@@ -878,27 +878,27 @@ request→response handler ABI so a function receives an HTTP request
 (method, headers, body) and returns a response — the edge-function
 ergonomic shape, in Wasm.
 
-- [ ] `basin:fn/handler` WIT export: `handle(request) -> response`.
-- [ ] Mount `ANY /fn/v1/:name` in `basin-rest`; JWT/API-key gated like
+- [x] `basin:fn/handler` WIT export: `handle(request) -> response`.
+- [x] Mount `ANY /fn/v1/:name` in `basin-rest`; JWT/API-key gated like
       other routes; project-scoped.
-- [ ] Acceptance: a JS function `export default (req) => Response.json({...})`
+- [x] Acceptance: a JS function `export default (req) => Response.json({...})`
       compiled to Wasm responds correctly to a `curl` against
       `/fn/v1/<name>`.
 
 ##### 5.11.W3 — JS/TS→Wasm build pipeline in basin-cli (~1.5 weeks, basin-cli)
 
-- [ ] `basin functions deploy ./fn.ts` runs ComponentizeJS/Javy →
+- [x] `basin functions deploy ./fn.ts` runs ComponentizeJS/Javy →
       Wasm component targeting the W1 ABI → uploads + registers.
-- [ ] `basin functions list` / `logs <name>` / `delete <name>`.
-- [ ] Acceptance: round-trip — write a TS handler, `deploy`, invoke via
+- [x] `basin functions list` / `logs <name>` / `delete <name>`.
+- [x] Acceptance: round-trip — write a TS handler, `deploy`, invoke via
       `/fn/v1/<name>`, see logs via `functions logs`.
 
 ##### 5.11.W4 — `@basin/functions` authoring SDK (~1 week, basin-js)
 
-- [ ] Typed bindings for the W1 host imports (`query` / `http` / `log`
+- [x] Typed bindings for the W1 host imports (`query` / `http` / `log`
       / `secret`); a project template; a local test harness that runs a
       function against a mock host without deploying.
-- [ ] Acceptance: `import { query } from '@basin/functions'` type-checks;
+- [x] Acceptance: `import { query } from '@basin/functions'` type-checks;
       template `npm test` runs a handler against the mock host green.
 
 ##### 5.11.W5 — Per-invocation resource governance (~1 week, engine)
@@ -906,21 +906,21 @@ ergonomic shape, in Wasm.
 Extends 5.11.J's caps for the host-import + handler case (functions can
 now block on host calls).
 
-- [ ] Epoch-interrupt CPU cap, linear-memory cap, wall-clock timeout,
+- [x] Epoch-interrupt CPU cap, linear-memory cap, wall-clock timeout,
       per-project concurrency semaphore. Configurable via
       `BASIN_FN_*` env / per-project DDL.
-- [ ] Acceptance: a function that spins / allocates / hangs is killed at
+- [x] Acceptance: a function that spins / allocates / hangs is killed at
       the cap; a noisy project's function load doesn't starve others.
 
 ##### 5.11.W6 — Function catalog + lifecycle (`LANGUAGE javascript`) (~1 week, engine)
 
-- [ ] `CREATE FUNCTION name(...) LANGUAGE javascript AS $$ … $$` sugar —
+- [x] `CREATE FUNCTION name(...) LANGUAGE javascript AS $$ … $$` sugar —
       stores the compiled Wasm component + source; `DROP` / `ALTER …
       RENAME`; version pin. (Compile happens client-side in W3; the
       engine stores + runs the component.)
-- [ ] `basin:fn/query` host call is RLS-aware and `auth.aal()`-aware
+- [x] `basin:fn/query` host call is RLS-aware and `auth.aal()`-aware
       (ADR 0020) so MFA-gated logic works inside functions.
-- [ ] Acceptance: catalog round-trip; RLS enforced on in-function
+- [x] Acceptance: catalog round-trip; RLS enforced on in-function
       queries; cross-project isolation verified.
 
 ##### 5.11.W7 — Differential + soak tests + docs (~1 week) ✅ shipped
@@ -1207,7 +1207,7 @@ basin-catalog (no other catalog agent concurrent).
       `search_path` (default `public`, `pg_catalog` implicitly first); qualified
       reserved-schema names bind directly; user schemas alias to `public`.
       Depends on 5.18.A.
-- [ ] **5.18.C — Migrate system namespaces off prefix hacks.** auth
+- [~] **5.18.C — Migrate system namespaces off prefix hacks.** auth
       (`basin_auth_*` → `auth.*`), net (`_net_http_response` → `net.*`), cron
       (`cron.job` real), storage (formalize `storage.*`). Back-compat read/alias
       path + migration test per subsystem; MUST NOT regress existing
