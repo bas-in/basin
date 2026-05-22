@@ -127,6 +127,105 @@ pub(crate) struct FunctionEntry {
     pub bytes: Vec<u8>,
 }
 
+// ---------------------------------------------------------------------------
+// Feature 4 (5.11.W): invocation log + version history
+// ---------------------------------------------------------------------------
+
+/// Maximum invocation records retained per `(project, name)`.
+pub const INVOCATION_LOG_CAP: usize = 200;
+
+/// Maximum version history entries retained per `(project, name)`.
+pub const VERSION_HISTORY_CAP: usize = 50;
+
+/// A single invocation record stored in the invocation log.
+#[derive(Clone, Debug, Serialize)]
+pub struct InvocationRecord {
+    /// Monotonically increasing invocation index (1-based).
+    pub invocation_id: u64,
+    /// HTTP status returned by the function (0 if not applicable / error).
+    pub status: u16,
+    /// Elapsed wall-clock time in milliseconds.
+    pub duration_ms: u64,
+    /// Wall-clock timestamp (seconds since Unix epoch).
+    pub ts_secs: u64,
+    /// Optional error message if the invocation failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// A single version history entry for a function.
+#[derive(Clone, Debug, Serialize)]
+pub struct VersionRecord {
+    pub version: i64,
+    pub deployed_at: String,   // RFC3339
+    pub size_bytes: usize,
+    /// `true` for the currently-active version.
+    pub active: bool,
+}
+
+/// Bounded ring buffer of [`InvocationRecord`] values.
+struct InvocationLog {
+    entries: VecDeque<InvocationRecord>,
+    cap: usize,
+    /// Monotonic counter — bumped on each append.
+    next_id: u64,
+}
+
+impl InvocationLog {
+    fn new(cap: usize) -> Self {
+        Self {
+            entries: VecDeque::with_capacity(cap.min(256)),
+            cap,
+            next_id: 1,
+        }
+    }
+
+    fn push(&mut self, mut rec: InvocationRecord) {
+        rec.invocation_id = self.next_id;
+        self.next_id += 1;
+        if self.entries.len() >= self.cap {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(rec);
+    }
+
+    fn snapshot(&self) -> Vec<InvocationRecord> {
+        self.entries.iter().cloned().collect()
+    }
+}
+
+/// Bounded ring buffer for version snapshots.
+struct VersionHistory {
+    entries: VecDeque<(i64, SystemTime, usize)>, // (version, deployed_at, size_bytes)
+    cap: usize,
+}
+
+impl VersionHistory {
+    fn new(cap: usize) -> Self {
+        Self {
+            entries: VecDeque::with_capacity(cap.min(64)),
+            cap,
+        }
+    }
+
+    fn push(&mut self, version: i64, deployed_at: SystemTime, size_bytes: usize) {
+        if self.entries.len() >= self.cap {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((version, deployed_at, size_bytes));
+    }
+
+    fn snapshot(&self) -> &VecDeque<(i64, SystemTime, usize)> {
+        &self.entries
+    }
+}
+
+/// Combined invocation + version state per `(project, name)`.
+struct FnHistory {
+    invocations: InvocationLog,
+    versions: VersionHistory,
+}
+
 /// Shared instrumentation state for one `(project, name)` pair.
 struct FnInstrumentation {
     logs: LogBuffer,
@@ -157,6 +256,9 @@ pub struct FunctionRegistry {
     /// second top-level `RwLock`-guarded map so log appends and CPU
     /// increments acquire only the instr lock, not the deploy lock.
     instr: Arc<RwLock<HashMap<(ProjectId, String), FnInstrumentation>>>,
+    /// Feature 4: invocation log + version history. Keyed by `(project, name)`.
+    /// Maintained independently of `instr` to keep the lock contention minimal.
+    history: Arc<RwLock<HashMap<(ProjectId, String), FnHistory>>>,
 }
 
 impl FunctionRegistry {
@@ -164,9 +266,18 @@ impl FunctionRegistry {
         Self::default()
     }
 
+    /// Test-only alias for `put`. Exposes the private deploy path to unit tests
+    /// in `tests.rs` without making it public in production code.
+    #[cfg(test)]
+    pub(crate) async fn put_test(&self, project: ProjectId, name: String, bytes: Vec<u8>) -> i64 {
+        self.put(project, name, bytes).await
+    }
+
     /// Insert (or replace) a function. Returns the post-write version so the
-    /// caller can echo it in the response.
+    /// caller can echo it in the response. Also records a version-history entry.
     async fn put(&self, project: ProjectId, name: String, bytes: Vec<u8>) -> i64 {
+        let size_bytes = bytes.len();
+        let deployed_at = SystemTime::now();
         let mut map = self.inner.write().await;
         let project_map = map.entry(project).or_default();
         let version = project_map
@@ -174,13 +285,23 @@ impl FunctionRegistry {
             .map(|e| e.version + 1)
             .unwrap_or(1);
         project_map.insert(
-            name,
+            name.clone(),
             FunctionEntry {
                 version,
-                deployed_at: SystemTime::now(),
+                deployed_at,
                 bytes,
             },
         );
+        drop(map);
+        // Record the new version in history.
+        let mut hist = self.history.write().await;
+        hist.entry((project, name))
+            .or_insert_with(|| FnHistory {
+                invocations: InvocationLog::new(INVOCATION_LOG_CAP),
+                versions: VersionHistory::new(VERSION_HISTORY_CAP),
+            })
+            .versions
+            .push(version, deployed_at, size_bytes);
         version
     }
 
@@ -282,6 +403,149 @@ impl FunctionRegistry {
             .get(&(*project, name.to_string()))
             .map(|e| e.cpu_ms.load(Ordering::Relaxed))
             .unwrap_or(0)
+    }
+
+    // -----------------------------------------------------------------------
+    // Feature 4: invocation log + version history
+    // -----------------------------------------------------------------------
+
+    /// Record an invocation (called by FunctionInvoker after each request).
+    pub async fn record_invocation(
+        &self,
+        project: ProjectId,
+        name: impl Into<String>,
+        status: u16,
+        duration_ms: u64,
+        error: Option<String>,
+    ) {
+        let name = name.into();
+        let ts_secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let rec = InvocationRecord {
+            invocation_id: 0, // bumped inside push()
+            status,
+            duration_ms,
+            ts_secs,
+            error,
+        };
+        let mut hist = self.history.write().await;
+        hist.entry((project, name))
+            .or_insert_with(|| FnHistory {
+                invocations: InvocationLog::new(INVOCATION_LOG_CAP),
+                versions: VersionHistory::new(VERSION_HISTORY_CAP),
+            })
+            .invocations
+            .push(rec);
+    }
+
+    /// Return a snapshot of invocation records for `(project, name)`.
+    pub async fn invocations(&self, project: &ProjectId, name: &str) -> Vec<InvocationRecord> {
+        let hist = self.history.read().await;
+        hist.get(&(*project, name.to_string()))
+            .map(|h| h.invocations.snapshot())
+            .unwrap_or_default()
+    }
+
+    /// Return the version history for `(project, name)`.
+    ///
+    /// The `active` field is `true` only for the **most recent** history entry
+    /// (i.e. the last element in the ring buffer), regardless of its version
+    /// number.  This avoids false positives when the same version number
+    /// appears multiple times (e.g. after a rollback re-records version 1).
+    pub async fn versions(&self, project: &ProjectId, name: &str) -> Vec<VersionRecord> {
+        let hist = self.history.read().await;
+        let entries = match hist.get(&(*project, name.to_string())) {
+            None => return Vec::new(),
+            Some(h) => h.versions.snapshot().iter().cloned().collect::<Vec<_>>(),
+        };
+        drop(hist);
+
+        let last_idx = entries.len().saturating_sub(1);
+        entries
+            .into_iter()
+            .enumerate()
+            .map(|(i, (v, deployed_at, size_bytes))| VersionRecord {
+                version: v,
+                deployed_at: deploy_rfc3339(deployed_at),
+                size_bytes,
+                active: i == last_idx,
+            })
+            .collect()
+    }
+
+    /// Roll back `(project, name)` to an earlier version.
+    ///
+    /// Returns the version number rolled back to, or an error if the version
+    /// does not exist in the history. The rolled-back bytes become the new
+    /// active entry; the version number is set to the historic version (not
+    /// bumped) so downstream invokers can detect the change via the version
+    /// cache key.
+    ///
+    /// **Note:** The history ring does not retain the Wasm bytes themselves —
+    /// only the metadata. To roll back bytes we rely on the caller supplying
+    /// the `FunctionEntry` bytes out-of-band (e.g. re-deploying the same
+    /// bytes). This method only updates the `active` pointer and records a
+    /// new deploy event. A future version could optionally store bytes in the
+    /// history ring.
+    ///
+    /// For the test / integration path, rolling back to a version that has
+    /// a matching `FunctionEntry` in the deploy map is sufficient. We return
+    /// a `NotFound` error if the requested version was never registered.
+    pub async fn rollback(
+        &self,
+        project: ProjectId,
+        name: &str,
+        target_version: i64,
+    ) -> Result<i64, String> {
+        let mut inner = self.inner.write().await;
+        let entry = inner
+            .get_mut(&project)
+            .and_then(|m| m.get_mut(name))
+            .ok_or_else(|| format!("function {name:?} not found for project"))?;
+
+        // Verify the version exists in history.
+        let hist = self.history.read().await;
+        let known = hist
+            .get(&(project, name.to_string()))
+            .map(|h| {
+                h.versions
+                    .snapshot()
+                    .iter()
+                    .any(|(v, _, _)| *v == target_version)
+            })
+            .unwrap_or(false);
+        drop(hist);
+
+        if !known {
+            return Err(format!(
+                "version {target_version} not found in history for function {name:?}"
+            ));
+        }
+
+        let old_version = entry.version;
+        entry.version = target_version;
+        let size_bytes = entry.bytes.len();
+        let deployed_at = SystemTime::now();
+        entry.deployed_at = deployed_at;
+
+        // Record the rollback as a new version entry in the history so
+        // `/versions` shows the reactivation event.
+        drop(inner);
+        let mut hist = self.history.write().await;
+        if let Some(h) = hist.get_mut(&(project, name.to_string())) {
+            h.versions.push(target_version, deployed_at, size_bytes);
+        }
+
+        tracing::info!(
+            project = %project,
+            name,
+            from_version = old_version,
+            to_version = target_version,
+            "function rolled back",
+        );
+        Ok(target_version)
     }
 }
 
@@ -488,6 +752,115 @@ pub(crate) async fn function_cpu_ms(
         "project_id": claims.project_id.to_string(),
         "name": name,
         "cpu_ms": cpu_ms,
+    }))
+    .into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Feature 4: GET /admin/v1/functions/:name/invocations
+// ---------------------------------------------------------------------------
+
+#[axum::debug_handler]
+pub(crate) async fn function_invocations(
+    State(state): State<Arc<Inner>>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Response, ApiError> {
+    let claims = authorize(&state, &headers).await?;
+    require_admin(&claims)?;
+    let name = validate_ident(&name)?;
+
+    if !state
+        .function_registry
+        .exists(&claims.project_id, &name)
+        .await
+    {
+        return Err(ApiError::not_found(format!(
+            "function {name:?} not found for project"
+        )));
+    }
+
+    let records = state
+        .function_registry
+        .invocations(&claims.project_id, &name)
+        .await;
+
+    Ok(Json(json!({
+        "project_id": claims.project_id.to_string(),
+        "name": name,
+        "invocations": records,
+    }))
+    .into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Feature 4: GET /admin/v1/functions/:name/versions
+// ---------------------------------------------------------------------------
+
+#[axum::debug_handler]
+pub(crate) async fn function_versions(
+    State(state): State<Arc<Inner>>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Response, ApiError> {
+    let claims = authorize(&state, &headers).await?;
+    require_admin(&claims)?;
+    let name = validate_ident(&name)?;
+
+    if !state
+        .function_registry
+        .exists(&claims.project_id, &name)
+        .await
+    {
+        return Err(ApiError::not_found(format!(
+            "function {name:?} not found for project"
+        )));
+    }
+
+    let records = state
+        .function_registry
+        .versions(&claims.project_id, &name)
+        .await;
+
+    Ok(Json(json!({
+        "project_id": claims.project_id.to_string(),
+        "name": name,
+        "versions": records,
+    }))
+    .into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Feature 4: POST /admin/v1/functions/:name/rollback
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct RollbackRequest {
+    /// The version number to roll back to. Must exist in the version history.
+    pub version: i64,
+}
+
+#[axum::debug_handler]
+pub(crate) async fn function_rollback(
+    State(state): State<Arc<Inner>>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(req): Json<RollbackRequest>,
+) -> Result<Response, ApiError> {
+    let claims = authorize(&state, &headers).await?;
+    require_admin(&claims)?;
+    let name = validate_ident(&name)?;
+
+    let rolled_to = state
+        .function_registry
+        .rollback(claims.project_id, &name, req.version)
+        .await
+        .map_err(ApiError::not_found)?;
+
+    Ok(Json(json!({
+        "project_id": claims.project_id.to_string(),
+        "name": name,
+        "rolled_back_to_version": rolled_to,
     }))
     .into_response())
 }

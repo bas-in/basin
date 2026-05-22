@@ -2079,3 +2079,151 @@ async fn mfa_list_returns_enrolled_factor() {
 
     let _ = running.shutdown.send(());
 }
+
+// ─── Feature 3 (5.22.D): dump endpoint route is registered ───────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dump_route_returns_401_not_404() {
+    let Some((running, _svc, _auth, _mailer, _g)) = try_serve().await else {
+        return;
+    };
+    let addr = running.local_addr;
+    let project = ProjectId::new().to_string();
+    // No Authorization header → should get 401, not 404.
+    let r = http_request(
+        addr,
+        "GET",
+        &format!("/admin/v1/projects/{project}/dump"),
+        &[],
+        None,
+    )
+    .await;
+    assert_ne!(
+        r.status, 404,
+        "dump route must be registered (got 404 instead of 401)"
+    );
+    assert_eq!(r.status, 401, "unauthenticated dump must return 401");
+    let _ = running.shutdown.send(());
+}
+
+// ─── Feature 4 (5.11.W): invocations + versions routes registered ─────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invocations_and_versions_routes_registered() {
+    let Some((running, _svc, _auth, _mailer, _g)) = try_serve().await else {
+        return;
+    };
+    let addr = running.local_addr;
+    let r = http_request(
+        addr,
+        "GET",
+        "/admin/v1/functions/myfn/invocations",
+        &[],
+        None,
+    )
+    .await;
+    assert_ne!(
+        r.status, 404,
+        "invocations route must be registered (got 404)"
+    );
+    assert_eq!(r.status, 401, "unauthenticated invocations must return 401");
+
+    let r2 = http_request(
+        addr,
+        "GET",
+        "/admin/v1/functions/myfn/versions",
+        &[],
+        None,
+    )
+    .await;
+    assert_ne!(r2.status, 404, "versions route must be registered");
+    assert_eq!(r2.status, 401, "unauthenticated versions must return 401");
+
+    let _ = running.shutdown.send(());
+}
+
+// ─── Feature 4: FunctionRegistry unit tests (no Postgres needed) ──────────────
+
+#[tokio::test]
+async fn function_invocation_log_roundtrip() {
+    use crate::routes::admin_functions::FunctionRegistry;
+    use basin_common::ProjectId;
+
+    let reg = FunctionRegistry::new();
+    let project = ProjectId::new();
+    let name = "my_fn";
+
+    // Use the internal `put` path via deploy_function logic, but call put_for_test.
+    // Since `put` is private, we test via the public `record_invocation` +
+    // `invocations` surface without needing to deploy bytes.
+    // Pre-populate the inner map so `exists` returns true.
+    let _ver = reg.put_test(project, name.to_string(), b"x".to_vec()).await;
+
+    // Record two invocations.
+    reg.record_invocation(project, name, 200, 42, None).await;
+    reg.record_invocation(project, name, 500, 7, Some("timeout".to_string()))
+        .await;
+
+    let invocations = reg.invocations(&project, name).await;
+    assert_eq!(invocations.len(), 2, "two invocations recorded");
+    assert_eq!(invocations[0].status, 200);
+    assert_eq!(invocations[0].invocation_id, 1);
+    assert_eq!(invocations[1].status, 500);
+    assert_eq!(invocations[1].invocation_id, 2);
+    assert_eq!(invocations[1].error.as_deref(), Some("timeout"));
+}
+
+#[tokio::test]
+async fn function_version_history_roundtrip() {
+    use crate::routes::admin_functions::FunctionRegistry;
+    use basin_common::ProjectId;
+
+    let reg = FunctionRegistry::new();
+    let project = ProjectId::new();
+    let name = "versioned_fn";
+
+    let _ = reg.put_test(project, name.to_string(), b"v1".to_vec()).await;
+    let _ = reg.put_test(project, name.to_string(), b"v2".to_vec()).await;
+
+    let versions = reg.versions(&project, name).await;
+    assert_eq!(versions.len(), 2, "two version entries in history");
+    let v1 = versions.iter().find(|v| v.version == 1).expect("v1");
+    let v2 = versions.iter().find(|v| v.version == 2).expect("v2");
+    assert!(!v1.active, "v1 should not be active after redeploy");
+    assert!(v2.active, "v2 should be active");
+}
+
+#[tokio::test]
+async fn function_rollback_roundtrip() {
+    use crate::routes::admin_functions::FunctionRegistry;
+    use basin_common::ProjectId;
+
+    let reg = FunctionRegistry::new();
+    let project = ProjectId::new();
+    let name = "rollback_fn";
+
+    let _ = reg.put_test(project, name.to_string(), b"v1".to_vec()).await;
+    let _ = reg.put_test(project, name.to_string(), b"v2".to_vec()).await;
+
+    let rolled = reg.rollback(project, name, 1).await.expect("rollback ok");
+    assert_eq!(rolled, 1);
+
+    let versions = reg.versions(&project, name).await;
+    let active: Vec<_> = versions.iter().filter(|v| v.active).collect();
+    assert_eq!(active.len(), 1, "exactly one active version");
+    assert_eq!(active[0].version, 1, "active version is 1 after rollback");
+}
+
+#[tokio::test]
+async fn function_rollback_unknown_version_errors() {
+    use crate::routes::admin_functions::FunctionRegistry;
+    use basin_common::ProjectId;
+
+    let reg = FunctionRegistry::new();
+    let project = ProjectId::new();
+    let name = "fn";
+
+    let _ = reg.put_test(project, name.to_string(), b"v1".to_vec()).await;
+    let err = reg.rollback(project, name, 99).await;
+    assert!(err.is_err(), "rollback to unknown version must return Err");
+}
