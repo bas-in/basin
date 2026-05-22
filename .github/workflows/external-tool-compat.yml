@@ -1,0 +1,140 @@
+name: External-Tool Compat
+
+# Runs the harnesses that require external binaries (postgresql-client,
+# Flyway, golang-migrate) — tools that cannot be installed in the dev
+# sandbox.  Triggered on every push/PR to main so regressions are caught
+# early without the developer needing a local tool install.
+#
+# Tasks wired here:
+#   5.22.A — pg_dump / psql round-trip  (test: pg_dump_harness)
+#   5.25.B — Flyway compat              (test: migration_tool_flyway)
+#   5.25.C — golang-migrate compat      (test: migration_tool_golang_migrate)
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  RUST_TOOLCHAIN: 1.83.0
+  CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+
+jobs:
+  # ── 5.22.A — pg_dump / psql round-trip ─────────────────────────────────────
+  pg-dump-round-trip:
+    name: "5.22.A — pg_dump/psql round-trip"
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install postgresql-client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y postgresql-client
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-external-pg-dump"
+
+      - name: Set env vars for pg_dump harness
+        run: |
+          echo "REAL_PG_URL=postgres://postgres:postgres@localhost:5432/postgres" >> $GITHUB_ENV
+          # BASIN_LOCAL_URL is not set here; the Basin-round-trip slices
+          # will skip cleanly (require_env() prints a notice and returns).
+
+      - name: Run pg_dump harness (--ignored to opt in to external-tool tests)
+        run: |
+          cargo test \
+            -p basin-integration-tests \
+            --test pg_dump_harness \
+            -- --ignored --nocapture
+
+  # ── 5.25.B — Flyway compat ─────────────────────────────────────────────────
+  flyway-compat:
+    name: "5.25.B — Flyway compat"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Flyway
+        run: |
+          wget -qO- \
+            https://download.red-gate.com/maven/release/com/redgate/flyway/flyway-commandline/10.21.0/flyway-commandline-10.21.0-linux-x64.tar.gz \
+            | tar xz -C /opt
+          # The archive unpacks as flyway-10.21.0/
+          echo "/opt/flyway-10.21.0" >> $GITHUB_PATH
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-external-flyway"
+
+      - name: Run Flyway compat harness (--ignored to opt in to external-tool tests)
+        run: |
+          cargo test \
+            -p basin-integration-tests \
+            --test migration_tool_flyway \
+            -- --ignored --nocapture
+
+  # ── 5.25.C — golang-migrate compat ─────────────────────────────────────────
+  golang-migrate-compat:
+    name: "5.25.C — golang-migrate compat"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install golang-migrate
+        run: |
+          curl -sSL \
+            https://github.com/golang-migrate/migrate/releases/download/v4.18.1/migrate.linux-amd64.tar.gz \
+            | tar xz -C /usr/local/bin migrate
+          migrate -version
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-external-golang-migrate"
+
+      - name: Run golang-migrate compat harness (--ignored to opt in to external-tool tests)
+        run: |
+          cargo test \
+            -p basin-integration-tests \
+            --test migration_tool_golang_migrate \
+            -- --ignored --nocapture

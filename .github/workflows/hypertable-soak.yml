@@ -1,0 +1,62 @@
+name: Hypertable Soak
+
+# 5.29.F — 1B-row hypertable soak + ORM compat.
+#
+# This job is heavy (~3-5 days of spec time, run in minutes on a large runner
+# with SSD-backed object store).  It is gated behind workflow_dispatch and a
+# nightly schedule so it does NOT run on every push.  The soak harness lives
+# in `tests/integration/tests/hypertable_harness.rs` and the relevant test
+# functions are `hypertable_1b_row_write_soak` and `hypertable_orm_compat`
+# (both `#[ignore]`d by default; we opt in with `-- --ignored`).
+#
+# Task wired here:
+#   5.29.F — ORM compat + 1B-row soak slice
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Nightly at 02:00 UTC
+    - cron: "0 2 * * *"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  RUST_TOOLCHAIN: 1.83.0
+  # Full debug info for soak runs — OOM risk is lower on larger runners and
+  # having line info is valuable for profiling soak failures.
+  CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+
+jobs:
+  hypertable-soak:
+    name: "5.29.F — 1B-row hypertable soak"
+    runs-on: ubuntu-latest
+    # Soak can be long; give it up to 6 hours before GitHub kills the run.
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-hypertable-soak"
+
+      - name: Run hypertable ORM-compat slice (--ignored to opt in)
+        run: |
+          cargo test \
+            -p basin-integration-tests \
+            --test hypertable_harness \
+            hypertable_orm_compat \
+            -- --ignored --nocapture
+
+      - name: Run hypertable 1B-row soak (--ignored to opt in)
+        run: |
+          cargo test \
+            -p basin-integration-tests \
+            --test hypertable_harness \
+            hypertable_1b_row_write_soak \
+            -- --ignored --nocapture

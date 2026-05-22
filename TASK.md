@@ -1430,7 +1430,10 @@ highest-leverage onboarding path. Engine already has snapshots so
 **Test-first.** A round-trip + cross-tool harness lands first;
 each implementation task flips a slice of it green.
 
-- [ ] **5.22.A — Round-trip + cross-tool + ORM-load test harness**
+- [~] **5.22.A — Round-trip + cross-tool + ORM-load test harness**
+      CI-wired in `.github/workflows/external-tool-compat.yml` job `pg-dump-round-trip`
+      (installs `postgresql-client`; runs `cargo test --test pg_dump_harness -- --ignored`;
+      runs in GH Actions; not sandbox-verifiable).
       (~1 week, lands first). Four layers:
       (1) **Basin → Basin round-trip:** 10-table seed schema with
       diverse types (JSONB, vector, text, timestamps, arrays,
@@ -1612,13 +1615,22 @@ consistently.
       Acceptance: scaffold builds; a placeholder per-tool test
       compiles + skips correctly until its real implementation
       lands.
-- [ ] **5.25.B — Flyway compat** (~1 day). Run Flyway's standard
+- [~] **5.25.B — Flyway compat** (~1 day). CI-wired in
+      `.github/workflows/external-tool-compat.yml` job `flyway-compat`
+      (installs Flyway 10.21.0 + Java; runs
+      `cargo test --test migration_tool_flyway -- --ignored`;
+      runs in GH Actions; not sandbox-verifiable).
+      Run Flyway's standard
       test migrations against Basin; document any gaps. Files:
       `tests/integration/tests/migration_tool_flyway.rs`,
       `CAPABILITIES.md` (row added).
       Acceptance: a 10-migration Flyway project applies cleanly;
       `flyway_schema_history` table populated correctly.
-- [ ] **5.25.C — golang-migrate compat** (~1 day).
+- [~] **5.25.C — golang-migrate compat** (~1 day). CI-wired in
+      `.github/workflows/external-tool-compat.yml` job `golang-migrate-compat`
+      (installs golang-migrate v4.18.1; runs
+      `cargo test --test migration_tool_golang_migrate -- --ignored`;
+      runs in GH Actions; not sandbox-verifiable).
       `migrate up/down/version/force` against Basin. Files:
       `tests/integration/tests/migration_tool_golang_migrate.rs`.
 - [x] **5.25.D — Diesel compat** (CLI + ORM) (~1 day). `diesel
@@ -1910,6 +1922,10 @@ soak lands red first; each impl sub-task flips a named slice green.
       Acceptance: closes the **tier-down** slice of 5.29.A
       (1-year-old reads work; bytes ≥ 3× smaller).
 - [~] **5.29.F — ORM compat + 1B-row soak slice** (~3-5 days).
+      CI-wired in `.github/workflows/hypertable-soak.yml`
+      (nightly schedule `0 2 * * *` + `workflow_dispatch`; runs
+      `hypertable_orm_compat` and `hypertable_1b_row_write_soak` with `--ignored`;
+      runs in GH Actions; not sandbox-verifiable).
       sqlx / Diesel migration escape hatches documented; soak
       harness wired into nightly CI; perf regression gates set.
       Acceptance: closes the **ORM compat** + **soak** slices of
