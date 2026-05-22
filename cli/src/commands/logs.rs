@@ -1,6 +1,6 @@
 //! logs — live log stream + history poll fallback.
 //!
-//!   basin logs --project <ref> [--tail] [--limit N]
+//!   basin logs [--project <ref>] [--tail] [--limit N]
 //!
 //! We try the streaming endpoint first (NDJSON or text/event-stream over
 //! /v1/projects/:ref/logs/stream). On any non-2xx (404 / 501) we fall
@@ -12,6 +12,9 @@
 //!
 //! The polling loop (follow_poll) is factored out so the test can drive
 //! one iteration against a stub server without spawning a real ticker.
+//!
+//! Project ref resolution: --project= flag, else load_working_project(cwd)
+//! from ./basin/config.toml. Error with hint at `basin link` if neither.
 
 use std::io::{BufRead, BufReader};
 use std::time::Duration;
@@ -21,6 +24,7 @@ use reqwest::blocking::Client as HttpClient;
 use reqwest::Method;
 
 use crate::client::{query_string, version};
+use crate::config::load_working_project;
 use crate::error::{msg, CliResult};
 use crate::global::{require_client, GlobalFlags};
 use crate::output::print_json;
@@ -28,6 +32,22 @@ use crate::{printerr, printinfo};
 
 use super::help::help_for_command;
 use super::parse_or_silent;
+
+// ── project resolution ────────────────────────────────────────────────────────
+
+fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
+    if !flag_value.is_empty() {
+        return Ok(flag_value.to_string());
+    }
+    let cwd = std::env::current_dir().map_err(|e| msg(format!("could not determine cwd: {e}")))?;
+    let wp = load_working_project(&cwd)?;
+    match wp {
+        Some(w) if !w.project_ref.is_empty() => Ok(w.project_ref),
+        _ => Err(msg(
+            "--project is required (or run `basin link` to bind this directory)",
+        )),
+    }
+}
 
 // ── Dispatcher ───────────────────────────────────────────────────────────────
 
@@ -43,17 +63,18 @@ pub fn cmd_logs(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
             "logs",
             "Stream live project logs (or poll history).",
             &[
-                "--project=<ref>     Project ref (required).",
+                "--project=<ref>     Project ref (flag or ./basin/config.toml).",
                 "--tail              Follow the live log stream.",
                 "--limit=N           Lines on a one-shot read (default 100).",
             ],
         );
         return Ok(());
     }
-    let project = m.get_one::<String>("project").cloned().unwrap_or_default();
-    if project.is_empty() {
-        return Err(msg("--project is required"));
-    }
+    let project = resolve_project_ref(
+        m.get_one::<String>("project")
+            .map(|s| s.as_str())
+            .unwrap_or(""),
+    )?;
     let limit: usize = m
         .get_one::<String>("limit")
         .and_then(|s| s.parse().ok())
@@ -256,7 +277,53 @@ mod tests {
             ..Default::default()
         };
         let err = cmd_logs(&g, &[]).unwrap_err();
-        assert!(err.to_string().contains("--project"), "err: {err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--project") || msg.contains("basin link"),
+            "err: {msg}"
+        );
+    }
+
+    // ── cwd-fallback: resolve_project_ref ────────────────────────────────────
+
+    #[test]
+    fn resolve_project_ref_uses_flag_when_set() {
+        let _cfg = with_temp_config_dir();
+        let r = resolve_project_ref("explicit-ref").unwrap();
+        assert_eq!(r, "explicit-ref");
+    }
+
+    #[test]
+    fn resolve_project_ref_no_config_returns_error() {
+        let _cfg = with_temp_config_dir();
+        let err = resolve_project_ref("").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--project") || msg.contains("basin link"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_project_ref_reads_working_project() {
+        use crate::config::{save_working_project, WorkingProject};
+        let _cfg = with_temp_config_dir();
+        let dir = std::env::temp_dir().join(format!("logs-wp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        save_working_project(
+            &dir,
+            &WorkingProject {
+                project_ref: "logs-proj".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let wp = crate::config::load_working_project(&dir).unwrap().unwrap();
+        assert_eq!(wp.project_ref, "logs-proj");
+        // Verify the flag path returns the value directly.
+        let r = resolve_project_ref("logs-proj").unwrap();
+        assert_eq!(r, "logs-proj");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

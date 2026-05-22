@@ -4,15 +4,19 @@
 //! `/v1/projects/{ref}/backups/snapshots`.  They are entirely separate from
 //! the project-wide DDL+data backup surface in `backups.rs`.
 //!
-//!   basin snapshots list    --project <ref>
-//!   basin snapshots create  --project <ref> [--name "before-rls"]
-//!   basin snapshots restore <id> --project <ref> [--yes]   confirm-by-typing-ref
+//!   basin snapshots list    [--project <ref>]
+//!   basin snapshots create  [--project <ref>] [--name "before-rls"]
+//!   basin snapshots restore <id> [--project <ref>] [--yes]   confirm-by-typing-ref
+//!
+//! Project ref resolution: --project= flag, else load_working_project(cwd)
+//! from ./basin/config.toml. Error with hint at `basin link` if neither.
 
 use clap::{Arg, ArgAction, Command};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::config::load_working_project;
 use crate::error::{msg, CliResult};
 use crate::global::{require_client, GlobalFlags};
 use crate::output::{print_json, read_line, Table};
@@ -20,6 +24,22 @@ use crate::printerr;
 
 use super::help::help_for_command;
 use super::parse_or_silent;
+
+// ── project resolution ────────────────────────────────────────────────────────
+
+fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
+    if !flag_value.is_empty() {
+        return Ok(flag_value.to_string());
+    }
+    let cwd = std::env::current_dir().map_err(|e| msg(format!("could not determine cwd: {e}")))?;
+    let wp = load_working_project(&cwd)?;
+    match wp {
+        Some(w) if !w.project_ref.is_empty() => Ok(w.project_ref),
+        _ => Err(msg(
+            "--project is required (or run `basin link` to bind this directory)",
+        )),
+    }
+}
 
 // ── Wire shapes ──────────────────────────────────────────────────────────────
 
@@ -94,10 +114,11 @@ fn list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         );
         return Ok(());
     }
-    let project = m.get_one::<String>("project").cloned().unwrap_or_default();
-    if project.is_empty() {
-        return Err(msg("--project is required"));
-    }
+    let project = resolve_project_ref(
+        m.get_one::<String>("project")
+            .map(|s| s.as_str())
+            .unwrap_or(""),
+    )?;
     let c = require_client(g)?;
     let resp: SnapshotsListResp = c.do_json(
         Method::GET,
@@ -147,10 +168,11 @@ fn create(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         );
         return Ok(());
     }
-    let project = m.get_one::<String>("project").cloned().unwrap_or_default();
-    if project.is_empty() {
-        return Err(msg("--project is required"));
-    }
+    let project = resolve_project_ref(
+        m.get_one::<String>("project")
+            .map(|s| s.as_str())
+            .unwrap_or(""),
+    )?;
     let name = m.get_one::<String>("name").cloned().unwrap_or_default();
 
     let c = require_client(g)?;
@@ -215,10 +237,11 @@ fn restore(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         .get_one::<String>("id")
         .cloned()
         .ok_or_else(|| msg("usage: basin snapshots restore <id> --project <ref>"))?;
-    let project = m.get_one::<String>("project").cloned().unwrap_or_default();
-    if project.is_empty() {
-        return Err(msg("--project is required"));
-    }
+    let project = resolve_project_ref(
+        m.get_one::<String>("project")
+            .map(|s| s.as_str())
+            .unwrap_or(""),
+    )?;
     let c = require_client(g)?;
     if !m.get_flag("yes") {
         eprint!(
@@ -321,7 +344,11 @@ mod tests {
             ..Default::default()
         };
         let err = cmd_snapshots(&g, &["list".to_string()]).unwrap_err();
-        assert!(err.to_string().contains("--project"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--project") || msg.contains("basin link"),
+            "err: {msg}"
+        );
     }
 
     #[test]
@@ -391,7 +418,11 @@ mod tests {
             ..Default::default()
         };
         let err = cmd_snapshots(&g, &["create".to_string()]).unwrap_err();
-        assert!(err.to_string().contains("--project"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--project") || msg.contains("basin link"),
+            "err: {msg}"
+        );
     }
 
     #[test]
@@ -503,7 +534,53 @@ mod tests {
             ],
         )
         .unwrap_err();
-        assert!(err.to_string().contains("--project"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--project") || msg.contains("basin link"),
+            "err: {msg}"
+        );
+    }
+
+    // ── cwd-fallback: resolve_project_ref ────────────────────────────────────
+
+    #[test]
+    fn resolve_project_ref_uses_flag_when_set() {
+        let _cfg = with_temp_config_dir();
+        let r = resolve_project_ref("snap-ref").unwrap();
+        assert_eq!(r, "snap-ref");
+    }
+
+    #[test]
+    fn resolve_project_ref_no_config_returns_error() {
+        let _cfg = with_temp_config_dir();
+        let err = resolve_project_ref("").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--project") || msg.contains("basin link"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_project_ref_reads_working_project() {
+        use crate::config::{save_working_project, WorkingProject};
+        let _cfg = with_temp_config_dir();
+        let dir = std::env::temp_dir().join(format!("snap-wp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        save_working_project(
+            &dir,
+            &WorkingProject {
+                project_ref: "snap-proj".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let wp = crate::config::load_working_project(&dir).unwrap().unwrap();
+        assert_eq!(wp.project_ref, "snap-proj");
+        // Verify the flag path returns the value directly.
+        let r = resolve_project_ref("snap-proj").unwrap();
+        assert_eq!(r, "snap-proj");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

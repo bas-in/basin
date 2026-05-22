@@ -1,16 +1,20 @@
-//! secrets — `basin secrets (list | set | rm) --project <ref>`
+//! secrets — `basin secrets (list | set | rm) [--project <ref>]`
 //!
 //! Wraps the project env-override surface at `/v1/projects/:ref/secrets`.
 //!
-//!   basin secrets list  --project <ref>
-//!   basin secrets set   --project <ref> KEY=VALUE [KEY=VALUE ...]
-//!   basin secrets rm    --project <ref> KEY [KEY ...]
+//!   basin secrets list  [--project <ref>]
+//!   basin secrets set   [--project <ref>] KEY=VALUE [KEY=VALUE ...]
+//!   basin secrets rm    [--project <ref>] KEY [KEY ...]
+//!
+//! Project ref resolution: --project= flag, else load_working_project(cwd)
+//! from ./basin/config.toml. Error with hint at `basin link` if neither.
 
 use clap::{Arg, ArgAction, Command};
 use reqwest::Method;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::config::load_working_project;
 use crate::error::{msg, silent, CliResult};
 use crate::global::{require_client, GlobalFlags};
 use crate::output::{print_json, Table};
@@ -18,6 +22,22 @@ use crate::printerr;
 
 use super::help::help_for_command;
 use super::parse_or_silent;
+
+// ── project resolution ────────────────────────────────────────────────────────
+
+fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
+    if !flag_value.is_empty() {
+        return Ok(flag_value.to_string());
+    }
+    let cwd = std::env::current_dir().map_err(|e| msg(format!("could not determine cwd: {e}")))?;
+    let wp = load_working_project(&cwd)?;
+    match wp {
+        Some(w) if !w.project_ref.is_empty() => Ok(w.project_ref),
+        _ => Err(msg(
+            "--project is required (or run `basin link` to bind this directory)",
+        )),
+    }
+}
 
 // ── Wire shapes ──────────────────────────────────────────────────────
 
@@ -84,10 +104,11 @@ fn list(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         );
         return Ok(());
     }
-    let project = m.get_one::<String>("project").cloned().unwrap_or_default();
-    if project.is_empty() {
-        return Err(msg("--project is required"));
-    }
+    let project = resolve_project_ref(
+        m.get_one::<String>("project")
+            .map(|s| s.as_str())
+            .unwrap_or(""),
+    )?;
     let c = require_client(g)?;
     let resp: SecretsListResp = c.do_json(
         Method::GET,
@@ -131,16 +152,20 @@ fn set(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         );
         return Ok(());
     }
-    let project = m.get_one::<String>("project").cloned().unwrap_or_default();
     let pairs: Vec<String> = m
         .get_many::<String>("pairs")
         .map(|v| v.cloned().collect())
         .unwrap_or_default();
-    if project.is_empty() || pairs.is_empty() {
+    if pairs.is_empty() {
         return Err(msg(
-            "usage: basin secrets set --project <ref> KEY=VALUE [KEY=VALUE ...]",
+            "usage: basin secrets set [--project <ref>] KEY=VALUE [KEY=VALUE ...]",
         ));
     }
+    let project = resolve_project_ref(
+        m.get_one::<String>("project")
+            .map(|s| s.as_str())
+            .unwrap_or(""),
+    )?;
     // Parse KEY=VALUE pairs into a map.
     let mut secrets: serde_json::Map<String, serde_json::Value> =
         serde_json::Map::with_capacity(pairs.len());
@@ -188,14 +213,20 @@ fn rm(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         );
         return Ok(());
     }
-    let project = m.get_one::<String>("project").cloned().unwrap_or_default();
     let keys: Vec<String> = m
         .get_many::<String>("keys")
         .map(|v| v.cloned().collect())
         .unwrap_or_default();
-    if project.is_empty() || keys.is_empty() {
-        return Err(msg("usage: basin secrets rm --project <ref> KEY [KEY ...]"));
+    if keys.is_empty() {
+        return Err(msg(
+            "usage: basin secrets rm [--project <ref>] KEY [KEY ...]",
+        ));
     }
+    let project = resolve_project_ref(
+        m.get_one::<String>("project")
+            .map(|s| s.as_str())
+            .unwrap_or(""),
+    )?;
     let c = require_client(g)?;
     for key in &keys {
         c.do_noout(
@@ -224,6 +255,48 @@ mod tests {
             quiet: true,
             ..Default::default()
         }
+    }
+
+    // ── cwd-fallback: resolve_project_ref ────────────────────────────────────
+
+    #[test]
+    fn resolve_project_ref_uses_flag_when_set() {
+        let _cfg = with_temp_config_dir();
+        let r = resolve_project_ref("explicit-ref").unwrap();
+        assert_eq!(r, "explicit-ref");
+    }
+
+    #[test]
+    fn resolve_project_ref_no_config_returns_error() {
+        let _cfg = with_temp_config_dir();
+        let err = resolve_project_ref("").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--project") || msg.contains("basin link"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_project_ref_reads_working_project() {
+        use crate::config::{save_working_project, WorkingProject};
+        let _cfg = with_temp_config_dir();
+        let dir = std::env::temp_dir().join(format!("secrets-wp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        save_working_project(
+            &dir,
+            &WorkingProject {
+                project_ref: "secrets-proj".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let wp = crate::config::load_working_project(&dir).unwrap().unwrap();
+        assert_eq!(wp.project_ref, "secrets-proj");
+        // Verify the flag path returns the value directly.
+        let r = resolve_project_ref("secrets-proj").unwrap();
+        assert_eq!(r, "secrets-proj");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ── arg-parse errors ─────────────────────────────────────────────

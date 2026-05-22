@@ -1,7 +1,10 @@
-//! sql — `basin sql --project <ref> [-e "SELECT 1" | -f query.sql | <stdin>]`
+//! sql — `basin sql [--project <ref>] [-e "SELECT 1" | -f query.sql | <stdin>]`
 //!
 //! SQL source priority: -e/--exec inline, then -f/--file, then stdin.
 //! Empty input is rejected before we hit the network.
+//!
+//! Project ref resolution: --project= flag, else load_working_project(cwd)
+//! from ./basin/config.toml. Error with hint at `basin link` if neither.
 
 use std::time::Duration;
 
@@ -9,6 +12,7 @@ use clap::{Arg, ArgAction, Command};
 use reqwest::Method;
 use serde_json::json;
 
+use crate::config::load_working_project;
 use crate::error::{msg, CliResult};
 use crate::global::{require_client, GlobalFlags};
 use crate::output::{print_json, read_all_stdin, read_maybe_file, stringify_cell, Table};
@@ -16,6 +20,22 @@ use crate::types::QueryResult;
 
 use super::help::help_for_command;
 use super::parse_or_silent;
+
+/// resolve_project_ref resolves the project ref from the --project flag or
+/// the cwd-local ./basin/config.toml. Mirrors the pattern in migrations.rs.
+fn resolve_project_ref(flag_value: &str) -> CliResult<String> {
+    if !flag_value.is_empty() {
+        return Ok(flag_value.to_string());
+    }
+    let cwd = std::env::current_dir().map_err(|e| msg(format!("could not determine cwd: {e}")))?;
+    let wp = load_working_project(&cwd)?;
+    match wp {
+        Some(w) if !w.project_ref.is_empty() => Ok(w.project_ref),
+        _ => Err(msg(
+            "--project is required (or run `basin link` to bind this directory)",
+        )),
+    }
+}
 
 pub fn cmd_sql(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let cmd = Command::new("sql")
@@ -30,7 +50,7 @@ pub fn cmd_sql(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
             "sql",
             "Run a SQL query against a project's basin engine.",
             &[
-                "--project=<ref>      Project ref (required).",
+                "--project=<ref>      Project ref (flag or ./basin/config.toml).",
                 "-e/--exec '<sql>'    Inline query.",
                 "-f/--file <path>     Read SQL from file.",
                 "--writes             Permit DML/DDL (defaults to read-only).",
@@ -39,10 +59,11 @@ pub fn cmd_sql(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         );
         return Ok(());
     }
-    let project = m.get_one::<String>("project").cloned().unwrap_or_default();
-    if project.is_empty() {
-        return Err(msg("--project is required"));
-    }
+    let project = resolve_project_ref(
+        m.get_one::<String>("project")
+            .map(|s| s.as_str())
+            .unwrap_or(""),
+    )?;
 
     let mut sql_body = m.get_one::<String>("exec").cloned().unwrap_or_default();
     if sql_body.is_empty() {
@@ -189,6 +210,58 @@ mod tests {
             token: "tok".into(),
             ..Default::default()
         };
-        assert!(cmd_sql(&g, &["-e".into(), "SELECT 1".into()]).is_err());
+        let err = cmd_sql(&g, &["-e".into(), "SELECT 1".into()]).unwrap_err();
+        // Must hint at --project or basin link (cwd had no config.toml).
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--project") || msg.contains("basin link"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    // ── cwd-fallback: resolve_project_ref ────────────────────────────────────
+
+    #[test]
+    fn resolve_project_ref_uses_flag_when_set() {
+        let _cfg = with_temp_config_dir();
+        let r = resolve_project_ref("explicit-ref").unwrap();
+        assert_eq!(r, "explicit-ref");
+    }
+
+    #[test]
+    fn resolve_project_ref_no_config_returns_error() {
+        let _cfg = with_temp_config_dir();
+        // No basin/config.toml in cwd → must fail with helpful message.
+        let err = resolve_project_ref("").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--project") || msg.contains("basin link"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_project_ref_reads_working_project() {
+        use crate::config::{save_working_project, WorkingProject};
+
+        let _cfg = with_temp_config_dir();
+        // Write a basin/config.toml into a temp dir, then verify
+        // resolve_project_ref returns the stored ref when the flag is empty.
+        let dir = std::env::temp_dir().join(format!("sql-wp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        save_working_project(
+            &dir,
+            &WorkingProject {
+                project_ref: "proj-from-config".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let wp = crate::config::load_working_project(&dir).unwrap().unwrap();
+        assert_eq!(wp.project_ref, "proj-from-config");
+        // Verify the inner helper returns the same value via flag path.
+        let r = resolve_project_ref("proj-from-config").unwrap();
+        assert_eq!(r, "proj-from-config");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
