@@ -2040,7 +2040,7 @@ exists); each impl sub-task flips a named slice green.
       Files: `.github/workflows/docker-publish.yml` (extend).
       Acceptance: closes the **tag-publish to Docker Hub** slice
       of 5.31.A.
-- [ ] **5.31.E — `docs/quickstart-docker.md` — 5-min
+- [x] **5.31.E — `docs/quickstart-docker.md` — 5-min
       one-command setup** (~1-2 days). `docker run` line, connect
       with psql, create a table, insert + select, run basin-cli
       against it. Linked from README + basin.to/docs +
@@ -2106,7 +2106,7 @@ named slice green.
       Acceptance: closes the **`ai-rag-app` builds + runs + tests**
       slice of 5.32.A; works against an OpenAI / Anthropic API key
       provided via env.
-- [ ] **5.32.E — Cross-linked from README.md, docs/index,
+- [x] **5.32.E — Cross-linked from README.md, docs/index,
       CAPABILITIES.md** (~1 day). Every product entry point links
       to the tutorial + both examples within one click. Files:
       `README.md`, `docs/index.md`, `CAPABILITIES.md`.

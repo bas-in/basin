@@ -81,6 +81,12 @@ The [Getting Started / Tutorial](./docs/tutorial.md) walks you through
 CRUD, auth, RLS policies, the REST API, a React/Vite frontend snippet,
 and the first-deployment path — about 15 minutes end-to-end.
 
+**Want to see a complete app?**
+Two reference apps are in [`examples/`](./examples/):
+
+- [`examples/saas-starter/`](./examples/saas-starter/) — multi-tenant SaaS app: Drizzle ORM, basin-auth, RLS policies, basin-rest auto-generated REST surface.
+- [`examples/ai-rag-app/`](./examples/ai-rag-app/) — AI/RAG app: document chunking + embedding pipeline, basin-vector similarity retrieval, Wasm function calling an inference endpoint.
+
 ---
 
 Install basin, point it at a data dir, run. No external object store is needed

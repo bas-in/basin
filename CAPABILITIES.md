@@ -10,6 +10,8 @@ slice, [`docs/deployment.md`](./docs/deployment.md) is the production
 deployment architecture guide, [`docs/decisions/`](./docs/decisions/)
 records every "no" with the trigger that would change our mind.
 
+**Get started:** [5-Minute Docker Quickstart](./docs/quickstart-docker.md) · [Getting Started / Tutorial](./docs/tutorial.md) · [Multi-tenant SaaS sample app](./examples/saas-starter/) · [AI/RAG sample app](./examples/ai-rag-app/)
+
 Status legend: ✅ shipped · 🛠 in progress · ◻️ planned · 🚫 not on roadmap.
 
 Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_coverage.rs`](./tests/integration/tests/feature_coverage.rs) (or its named cross-reference in that file's audit comment). Security invariants verified by [`tests/integration/tests/security.rs`](./tests/integration/tests/security.rs).
