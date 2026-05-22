@@ -30,14 +30,135 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use basin_auth::oauth::PlaintextEncryption;
-use basin_common::ProjectId;
+use basin_auth::oauth::EncryptionProvider;
+use basin_common::{BasinError, ProjectId};
 use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
 
 use crate::errors::ApiError;
 use crate::server::{authorize, Inner};
+
+// ---------------------------------------------------------------------------
+// AES-256-GCM encryption provider
+// ---------------------------------------------------------------------------
+//
+// Implements `basin_auth::oauth::EncryptionProvider` using AES-256-GCM with
+// a random 12-byte nonce per encrypt call.  The ciphertext format is:
+//   base64url( nonce(12) || GCM-ciphertext-with-tag(len+16) )
+// prefixed with `aes:` so future cipher migrations are detectable.
+//
+// Key source: `BASIN_AUTH_ENCRYPTION_KEY` env var — hex-encoded 32 bytes.
+// Fail-closed: if the env var is absent or malformed, construction returns
+// an error (callers surface this as a 500; server operators must set the key).
+
+/// AES-256-GCM backed encryption for OAuth client secrets + MFA seeds.
+struct AesGcmEncryption {
+    key: [u8; 32],
+}
+
+/// Env var name for the AES-256-GCM root key (hex-encoded 32 bytes).
+const AUTH_ENCRYPTION_KEY_ENV: &str = "BASIN_AUTH_ENCRYPTION_KEY";
+
+impl AesGcmEncryption {
+    /// Construct from `BASIN_AUTH_ENCRYPTION_KEY`.  Fails closed if absent.
+    fn from_env() -> std::result::Result<Self, ApiError> {
+        let hex_str = std::env::var(AUTH_ENCRYPTION_KEY_ENV).map_err(|_| {
+            ApiError::internal(format!(
+                "encryption key not configured: env var {AUTH_ENCRYPTION_KEY_ENV} is not set; \
+                 set it to a 64-character lowercase hex string (32 random bytes)"
+            ))
+        })?;
+        let bytes = hex::decode(hex_str.trim()).map_err(|e| {
+            ApiError::internal(format!(
+                "{AUTH_ENCRYPTION_KEY_ENV} is not valid hex: {e}"
+            ))
+        })?;
+        if bytes.len() != 32 {
+            return Err(ApiError::internal(format!(
+                "{AUTH_ENCRYPTION_KEY_ENV} must be exactly 32 bytes (64 hex chars), got {}",
+                bytes.len()
+            )));
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        Ok(Self { key })
+    }
+}
+
+impl EncryptionProvider for AesGcmEncryption {
+    fn encrypt(&self, plaintext: &str) -> basin_common::Result<String> {
+        use aes_gcm::aead::Aead;
+        use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
+        use base64::Engine as _;
+        use rand::RngCore;
+
+        let mut nonce_bytes = [0u8; 12];
+        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+
+        let key = Key::<Aes256Gcm>::from_slice(&self.key);
+        let cipher = Aes256Gcm::new(key);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+
+        let ct = cipher
+            .encrypt(nonce, plaintext.as_bytes())
+            .map_err(|e| BasinError::internal(format!("aes-gcm encrypt: {e}")))?;
+
+        let mut payload = Vec::with_capacity(12 + ct.len());
+        payload.extend_from_slice(&nonce_bytes);
+        payload.extend_from_slice(&ct);
+
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&payload);
+        Ok(format!("aes:{encoded}"))
+    }
+
+    fn decrypt(&self, ciphertext: &str) -> basin_common::Result<String> {
+        use aes_gcm::aead::Aead;
+        use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
+        use base64::Engine as _;
+
+        let b64 = ciphertext.strip_prefix("aes:").ok_or_else(|| {
+            BasinError::internal(
+                "AesGcmEncryption: ciphertext missing 'aes:' prefix (was it encrypted with a different provider?)"
+                    .to_owned(),
+            )
+        })?;
+
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(b64)
+            .map_err(|e| BasinError::internal(format!("aes-gcm decrypt: base64 decode: {e}")))?;
+
+        if payload.len() < 12 + 16 + 1 {
+            return Err(BasinError::internal(format!(
+                "aes-gcm decrypt: payload too short ({} bytes)",
+                payload.len()
+            )));
+        }
+
+        let (nonce_bytes, ct) = payload.split_at(12);
+        let key = Key::<Aes256Gcm>::from_slice(&self.key);
+        let cipher = Aes256Gcm::new(key);
+        let nonce = Nonce::from_slice(nonce_bytes);
+
+        let plain = cipher
+            .decrypt(nonce, ct)
+            .map_err(|_| BasinError::internal("aes-gcm decrypt: authentication failed (wrong key or tampered ciphertext)".to_owned()))?;
+
+        String::from_utf8(plain)
+            .map_err(|e| BasinError::internal(format!("aes-gcm decrypt: utf8: {e}")))
+    }
+}
+
+/// Build the per-request encryption provider, failing closed if the key is
+/// absent or misconfigured.
+fn encryption_provider() -> std::result::Result<AesGcmEncryption, ApiError> {
+    AesGcmEncryption::from_env()
+}
+
+/// Under `#[cfg(test)]` only: the plaintext passthrough so existing test
+/// fixtures that register mock providers with `plain:` prefixes still work.
+#[cfg(test)]
+pub(crate) use basin_auth::oauth::PlaintextEncryption;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct SignupRequest {
@@ -461,7 +582,7 @@ pub(crate) async fn oauth_callback(
         return Err(ApiError::invalid("invalid provider name"));
     }
 
-    let enc = PlaintextEncryption;
+    let enc = encryption_provider()?;
     let result = state
         .cfg
         .auth
@@ -541,7 +662,7 @@ pub(crate) async fn enroll_factor(
     Json(req): Json<EnrollFactorRequest>,
 ) -> Result<Response, ApiError> {
     let claims = authorize(&state, &headers).await?;
-    let enc = PlaintextEncryption;
+    let enc = encryption_provider()?;
 
     let body = match req.factor_type.as_str() {
         "totp" => {
@@ -641,7 +762,7 @@ pub(crate) async fn verify_factor(
 ) -> Result<Response, ApiError> {
     let claims = authorize(&state, &headers).await?;
     let factor_id = parse_uuid(&factor_id_str, "factor_id")?;
-    let enc = PlaintextEncryption;
+    let enc = encryption_provider()?;
 
     let recovery_codes = if let Some(attestation) = req.attestation.as_deref() {
         // WebAuthn path.
@@ -766,7 +887,7 @@ pub(crate) async fn verify_challenge(
     let claims = authorize(&state, &headers).await?;
     let _factor_id = parse_uuid(&factor_id_str, "factor_id")?;
     let challenge_id = parse_uuid(&req.challenge_id, "challenge_id")?;
-    let enc = PlaintextEncryption;
+    let enc = encryption_provider()?;
 
     let result = if let Some(code) = req.code.as_deref() {
         state
@@ -832,4 +953,215 @@ pub(crate) async fn unenroll_factor(
         .map_err(ApiError::from)?;
 
     Ok(Json(json!({ "ok": true })).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests for AesGcmEncryption
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::{AesGcmEncryption, AUTH_ENCRYPTION_KEY_ENV};
+    use basin_auth::oauth::EncryptionProvider;
+    use std::sync::Mutex;
+
+    /// A known 32-byte test key as a hex string (64 chars).
+    const TEST_KEY_HEX: &str =
+        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+
+    /// Process-wide mutex so tests that mutate the env var don't race each
+    /// other.  Cargo runs unit tests on multiple threads; any test that
+    /// touches `AUTH_ENCRYPTION_KEY_ENV` must hold this lock.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Set the test key and return the guard (released when dropped).
+    fn set_test_key() -> std::sync::MutexGuard<'static, ()> {
+        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(AUTH_ENCRYPTION_KEY_ENV, TEST_KEY_HEX);
+        guard
+    }
+
+    fn make_enc() -> AesGcmEncryption {
+        AesGcmEncryption::from_env().expect("test key should be valid")
+    }
+
+    // ------------------------------------------------------------------
+    // P0: encrypted output must NOT be plaintext
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn oauth_secret_is_not_stored_as_plaintext() {
+        let _g = set_test_key();
+        let enc = make_enc();
+        let secret = "super_secret_oauth_client_secret";
+
+        let ct = enc.encrypt(secret).expect("encrypt must succeed");
+
+        // Must NOT have the `plain:` prefix that PlaintextEncryption would emit.
+        assert!(
+            !ct.starts_with("plain:"),
+            "ciphertext must NOT start with 'plain:' prefix; got: {ct:?}"
+        );
+
+        // Must NOT contain the plaintext verbatim anywhere in the ciphertext string.
+        assert!(
+            !ct.contains(secret),
+            "ciphertext must NOT contain the plaintext secret verbatim; got: {ct:?}"
+        );
+
+        // Should use our `aes:` prefix.
+        assert!(
+            ct.starts_with("aes:"),
+            "ciphertext must start with 'aes:' prefix; got: {ct:?}"
+        );
+
+        // Ciphertext must differ from the input.
+        assert_ne!(
+            ct.as_str(),
+            secret,
+            "ciphertext must differ from plaintext"
+        );
+    }
+
+    #[test]
+    fn mfa_seed_is_not_stored_as_plaintext() {
+        let _g = set_test_key();
+        let enc = make_enc();
+        let totp_seed = "JBSWY3DPEHPK3PXP"; // example base32 TOTP seed
+
+        let ct = enc.encrypt(totp_seed).expect("encrypt must succeed");
+
+        assert!(
+            !ct.starts_with("plain:"),
+            "MFA seed ciphertext must NOT have 'plain:' prefix; got: {ct:?}"
+        );
+        assert!(
+            !ct.contains(totp_seed),
+            "MFA seed must NOT appear verbatim in ciphertext; got: {ct:?}"
+        );
+        assert!(
+            ct.starts_with("aes:"),
+            "MFA seed ciphertext must start with 'aes:' prefix; got: {ct:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Round-trip: encrypt → decrypt recovers the original
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn encrypt_decrypt_round_trip_oauth_secret() {
+        let _g = set_test_key();
+        let enc = make_enc();
+        let original = "my-oauth-client-secret-abc123";
+
+        let ct = enc.encrypt(original).expect("encrypt");
+        let recovered = enc.decrypt(&ct).expect("decrypt");
+
+        assert_eq!(
+            recovered, original,
+            "decrypt(encrypt(x)) must equal x for OAuth secrets"
+        );
+    }
+
+    #[test]
+    fn encrypt_decrypt_round_trip_mfa_seed() {
+        let _g = set_test_key();
+        let enc = make_enc();
+        let original = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
+
+        let ct = enc.encrypt(original).expect("encrypt");
+        let recovered = enc.decrypt(&ct).expect("decrypt");
+
+        assert_eq!(
+            recovered, original,
+            "decrypt(encrypt(x)) must equal x for MFA seeds"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Each encrypt call produces a unique ciphertext (random nonce)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn two_encryptions_of_same_plaintext_differ() {
+        let _g = set_test_key();
+        let enc = make_enc();
+        let plain = "same-secret";
+
+        let ct1 = enc.encrypt(plain).expect("encrypt 1");
+        let ct2 = enc.encrypt(plain).expect("encrypt 2");
+
+        assert_ne!(
+            ct1, ct2,
+            "two encrypt calls on the same plaintext must produce different ciphertexts (random nonce)"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Tampered ciphertext fails authentication
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn tampered_ciphertext_fails_decrypt() {
+        let _g = set_test_key();
+        let enc = make_enc();
+        let ct = enc.encrypt("some value").expect("encrypt");
+
+        // Corrupt the last byte of the base64 payload by appending garbage.
+        let bad = format!("{ct}XXXX");
+        let result = enc.decrypt(&bad);
+        assert!(
+            result.is_err(),
+            "tampered ciphertext must fail authentication"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Wrong key fails authentication
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn wrong_key_fails_decrypt() {
+        let _g = set_test_key();
+        let enc_a = make_enc();
+        let ct = enc_a.encrypt("value").expect("encrypt");
+
+        // Build a second provider with a different key (still under the lock).
+        let other_hex = "fffefdfcfbfaf9f8f7f6f5f4f3f2f1f0efeeedecebeae9e8e7e6e5e4e3e2e1e0";
+        std::env::set_var(AUTH_ENCRYPTION_KEY_ENV, other_hex);
+        let enc_b = AesGcmEncryption::from_env().expect("enc_b");
+
+        let result = enc_b.decrypt(&ct);
+        assert!(
+            result.is_err(),
+            "decrypting with a different key must fail authentication"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Missing env var fails closed (returns error, NOT plaintext fallback)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn missing_env_var_fails_closed() {
+        // Acquire the lock, then remove the var while holding it so no other
+        // env-var-touching test can race us.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(AUTH_ENCRYPTION_KEY_ENV);
+
+        let result = AesGcmEncryption::from_env();
+        match result {
+            Ok(_) => panic!(
+                "absent BASIN_AUTH_ENCRYPTION_KEY must return an error, not fall back to plaintext"
+            ),
+            Err(err) => {
+                assert!(
+                    err.message.contains(AUTH_ENCRYPTION_KEY_ENV),
+                    "error message should name the missing env var: {}",
+                    err.message
+                );
+            }
+        }
+    }
 }

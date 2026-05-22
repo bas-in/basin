@@ -34,6 +34,9 @@ hmac.workspace = true
 subtle.workspace = true
 hex.workspace = true
 object_store.workspace = true
+# AES-256-GCM for OAuth secret + MFA seed encryption (P0 security fix).
+aes-gcm = "0.10"
+rand.workspace = true
 
 # HTTP stack.
 axum.workspace = true

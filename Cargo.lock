@@ -1393,6 +1393,7 @@ dependencies = [
 name = "basin-rest"
 version = "0.1.9"
 dependencies = [
+ "aes-gcm",
  "arrow",
  "arrow-array",
  "arrow-schema",
@@ -1413,6 +1414,7 @@ dependencies = [
  "http 1.4.0",
  "hyper 1.9.0",
  "object_store",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "sha2 0.10.9",
