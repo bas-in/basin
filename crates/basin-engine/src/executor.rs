@@ -9012,3 +9012,136 @@ mod pg_cancel_backend_tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// P1 fix: SET lock_timeout GUC wiring — end-to-end tests
+// ---------------------------------------------------------------------------
+// Verifies that `SET lock_timeout = …` stores the value on the session's
+// advisory-lock GUC (so blocking pg_advisory_lock calls honour it) and that
+// `SHOW lock_timeout` reflects it back.  Mirrors the statement_timeout_guc_tests
+// structure to ensure the two GUCs are symmetrically wired.
+#[cfg(test)]
+mod lock_timeout_guc_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use basin_catalog::{Catalog, InMemoryCatalog};
+    use basin_common::ProjectId;
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    use crate::{Engine, EngineConfig, ExecResult};
+
+    fn make_engine(dir: &TempDir) -> Engine {
+        let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
+            object_store: Arc::new(fs),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+        Engine::new(EngineConfig { storage, catalog, shard: None })
+    }
+
+    /// `SET lock_timeout = '500ms'` must be accepted and stored on the session.
+    #[tokio::test]
+    async fn set_lock_timeout_string_form() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("SET lock_timeout = '500ms'")
+            .await
+            .expect("SET lock_timeout '500ms' must succeed");
+        assert_eq!(
+            crate::session::session_lock_timeout(&sess.state),
+            Some(Duration::from_millis(500)),
+            "session lock_timeout should be 500 ms after SET"
+        );
+    }
+
+    /// `SET lock_timeout = 2000` (bare integer milliseconds) must work.
+    #[tokio::test]
+    async fn set_lock_timeout_integer_form() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("SET lock_timeout = 2000")
+            .await
+            .expect("SET lock_timeout 2000 must succeed");
+        assert_eq!(
+            crate::session::session_lock_timeout(&sess.state),
+            Some(Duration::from_millis(2000))
+        );
+    }
+
+    /// `SET lock_timeout = 0` disables the timeout (Postgres semantics).
+    #[tokio::test]
+    async fn set_lock_timeout_zero_disables() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        // First set a non-zero value, then disable it.
+        sess.execute("SET lock_timeout = '1s'").await.unwrap();
+        sess.execute("SET lock_timeout = 0")
+            .await
+            .expect("SET lock_timeout 0 must succeed");
+        assert_eq!(
+            crate::session::session_lock_timeout(&sess.state),
+            None,
+            "lock_timeout should be disabled after SET lock_timeout = 0"
+        );
+    }
+
+    /// `SHOW lock_timeout` must return the value set by `SET lock_timeout`.
+    /// Verifies the SHOW path falls through to the real executor (not noop).
+    #[tokio::test]
+    async fn show_lock_timeout_reflects_set() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("SET lock_timeout = '300ms'")
+            .await
+            .unwrap();
+        let res = sess
+            .execute("SHOW lock_timeout")
+            .await
+            .expect("SHOW lock_timeout must succeed");
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                assert!(!batches.is_empty(), "expected at least one batch");
+                let batch = &batches[0];
+                let col = batch
+                    .column_by_name("lock_timeout")
+                    .expect("column lock_timeout");
+                use arrow_array::StringArray;
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("Utf8 column");
+                let val = arr.value(0);
+                assert_eq!(val, "300ms", "SHOW should reflect 300ms");
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    /// `SET lock_timeout` must also propagate to the advisory-lock manager
+    /// so that `advisory_lock.get_lock_timeout()` returns the new value.
+    #[tokio::test]
+    async fn set_lock_timeout_propagates_to_advisory_lock() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("SET lock_timeout = '750ms'")
+            .await
+            .expect("SET lock_timeout '750ms' must succeed");
+        // Read the value back directly from the advisory lock manager.
+        let advisory_timeout = sess.state.advisory.get_lock_timeout();
+        assert_eq!(
+            advisory_timeout,
+            Some(Duration::from_millis(750)),
+            "advisory lock manager must see the updated lock_timeout"
+        );
+    }
+}

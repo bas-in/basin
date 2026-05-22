@@ -260,6 +260,8 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
             if trimmed == "SHOW TABLES"
                 || trimmed == "SHOW SEARCH_PATH"
                 || trimmed == "SHOW STATEMENT_TIMEOUT"
+                || trimmed == "SHOW LOCK_TIMEOUT"
+                || trimmed == "SHOW IDLE_IN_TRANSACTION_SESSION_TIMEOUT"
             {
                 None
             } else {
