@@ -1680,32 +1680,32 @@ flips a named slice of the harness from red to green.
       `tests/integration/tests/pgvector_orm_compat.rs`.
       Acceptance: harness compiles + reports red against the
       current engine.
-- [ ] **5.26.B — `vector(N)` type alias via basin-vector** (~1 day).
+- [x] **5.26.B — `vector(N)` type alias via basin-vector** (~1 day).
       `vector(384)` as a type literal; round-trip through psql
       binary + text protocol; dimension stored in column metadata,
       validated on insert. Files: `crates/basin-vector/src/type.rs`
       (extend), `crates/basin-engine/src/types.rs` (register).
       Acceptance: closes the **type round-trip** slice of 5.26.A.
-- [ ] **5.26.C — Operators `<->` / `<=>` / `<#>`** (~3-5 days).
+- [x] **5.26.C — Operators `<->` / `<=>` / `<#>`** (~3-5 days).
       Implement (or alias to existing basin-vector operators) the
       three pgvector distance/similarity operators. Files:
       `crates/basin-vector/src/operators.rs` (extend),
       `crates/basin-engine/src/operators/vector.rs` (extend).
       Acceptance: closes the **operator semantics** slice of 5.26.A.
-- [ ] **5.26.D — `USING hnsw (col vector_l2_ops)` DDL** (~2-3 days).
+- [x] **5.26.D — `USING hnsw (col vector_l2_ops)` DDL** (~2-3 days).
       `USING hnsw` parser + planner map to basin-vector's HNSW
       implementation. Operator-class names: `vector_l2_ops`,
       `vector_cosine_ops`, `vector_ip_ops`. Files:
       `crates/basin-engine/src/ddl.rs` (extend),
       `crates/basin-vector/src/index.rs` (extend).
       Acceptance: closes the **DDL — hnsw index** slice of 5.26.A.
-- [ ] **5.26.E — `USING ivfflat` DDL** (~2-3 days). IVFFlat with
+- [x] **5.26.E — `USING ivfflat` DDL** (~2-3 days). IVFFlat with
       `WITH (lists = N)` storage parameter; planner picks ivfflat
       vs hnsw based on index hint or selectivity. Files:
       `crates/basin-engine/src/ddl.rs` (extend),
       `crates/basin-vector/src/ivfflat.rs` (new).
       Acceptance: closes the **DDL — ivfflat index** slice of 5.26.A.
-- [ ] **5.26.F — ORM-compat polish + CAPABILITIES row** (~1-2 days).
+- [x] **5.26.F — ORM-compat polish + CAPABILITIES row** (~1-2 days).
       Whatever the SQLAlchemy / Drizzle / Prisma slices surface
       (psql binary-protocol corner cases, `@db.Vector` shape, etc.)
       gets closed here; CAPABILITIES.md pgvector row marked
