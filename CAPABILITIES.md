@@ -296,7 +296,91 @@ Basin's wedge is multi-project SaaS with audit-log workloads where storage
 cost and per-project isolation dominate. If your shape doesn't match, the
 above are honest recommendations.
 
-## Migration tools
+## Documented exclusions (5.22.E)
+
+This section catalogues PostgreSQL features and behaviors Basin intentionally
+does not support, or supports with material caveats. `pg_dump` output tags
+each affected object with a `-- skipped: <feature>` comment so that
+`psql`/`pg_restore` import attempts have actionable hints.
+
+### SQL statements rejected at parse time (SQLSTATE 0A000)
+
+| Statement / feature | Reason |
+|---|---|
+| `VACUUM` / `VACUUM ANALYZE` | Iceberg-style compaction is handled by the background compactor, not by VACUUM |
+| `CREATE TRIGGER … EXECUTE FUNCTION` (PL/pgSQL triggers) | Basin replaces PL/pgSQL triggers with declarative lifecycle columns and SQL-bodied reactors (ADR 0012); PL/pgSQL interpreter is not shipped |
+| `LISTEN` / `NOTIFY` | Replaced by basin-realtime SSE and WebSocket channels |
+| `CLUSTER` (heap re-order) | Not meaningful for Parquet / Vortex object-store files; use `ALTER TABLE … CLUSTER BY (…)` for physical sort on write |
+| `REINDEX` / `REINDEX CONCURRENTLY` | Index rebuild handled internally; no user-facing command |
+| `LOCK TABLE` | Lock management is internal; advisory locks are used for optimistic concurrency (ADR 0026) |
+| `COPY … FROM file_path` / `COPY … TO file_path` | File-path `COPY` rejected (SQLSTATE 42601); use `COPY … FROM STDIN` / `COPY … TO STDOUT` only |
+| `COPY … (FORMAT BINARY)` | Binary COPY format not implemented; CSV only |
+| `COPY … WITH (DELIMITER '…')` / `NULL '…'` / `QUOTE '…'` | Only the default CSV format is accepted; custom delimiter, NULL marker, and QUOTE options rejected with SQLSTATE 42601 |
+
+### DDL features not supported
+
+| Feature | Caveat / status |
+|---|---|
+| `CREATE EXTENSION` | No loadable `.so` extensions (ADR 0002). The common extensions are covered natively: `pgvector` → `vector(N)`, `citext` → native `CITEXT`, `pg_trgm` → `basin-trgm`, `pgcrypto` → native UDFs, `uuid-ossp` → native UDFs, `pg_cron` → `basin-cron`, `pg_net` → `basin-net`, `PostGIS` subset → `basin-geo`. `pg_dump` output emits `-- skipped: CREATE EXTENSION <name>` for any extension not in this list. |
+| `CREATE LANGUAGE` / `CREATE PROCEDURAL LANGUAGE` | PL/pgSQL, PL/Python, PL/Perl and other procedural languages are not supported. Only `LANGUAGE sql` and `LANGUAGE wasm` are valid in `CREATE FUNCTION` / `CREATE PROCEDURE`. |
+| `CREATE TRIGGER … EXECUTE FUNCTION` (PL/pgSQL body) | See above. Equivalent: `ALTER TABLE … REACT ON {INSERT\|UPDATE\|DELETE} EXECUTE <sql>`. |
+| `ALTER TABLE … RENAME TO` / `ALTER TABLE … RENAME COLUMN` | Column and table renames not yet implemented; rejected at parse time in v0.1. |
+| `CREATE TABLE … INHERITS (parent)` | Table inheritance not supported; use partitioning or separate tables. |
+| `CREATE TYPE … AS (…)` composite types | Composite row types not supported; use JSONB for structured sub-objects. |
+| `CREATE TABLE … (col TEXT[])` / `col INT[]` array column types | Array column types in `CREATE TABLE` DDL are not yet wired through the Arrow schema bridge. `ARRAY[…]` expressions and array functions work on existing columns; DDL for array-typed columns is rejected. |
+| `CREATE INDEX … USING gist` (geometry, `EXCLUDE USING gist`) | GIST geo-index is not on the roadmap. `EXCLUDE USING gist` (e.g. for meeting-room scheduling) is not supported. Use Basin's interval-tree–backed range index (`USING gist` on range columns is mapped to the interval-tree probe for `tstzrange`/`daterange`; geometry spatial index is not available). |
+| `CREATE SEQUENCE … CYCLE` / `OWNED BY` options | Sequences ship; `CYCLE` and `OWNED BY` options are not parsed and will be silently dropped or rejected. |
+| `ALTER TABLE … SET TABLESPACE` | Tablespaces do not exist in Basin; rejected. |
+| `COMMENT ON …` | Object comments are not stored or surfaced in `pg_catalog`. |
+| `GRANT` / `REVOKE` / `REASSIGN OWNED` | Role-based access control is not shipped in v0.1. RLS policies (`CREATE POLICY`) are the isolation primitive. |
+| `CREATE DATABASE` / `DROP DATABASE` | Projects are the Basin unit of isolation; `CREATE DATABASE` is unsupported. Rejected with SQLSTATE 0A000. |
+| `CREATE SCHEMA <name>` for user schemas | User-defined schemas beyond `public` are not supported. Reserved schemas (`basin_auth`, `basin_blob`, `basin_cron`, `basin_net`, `basin_realtime`, `pg_catalog`, `information_schema`, `auth`, `storage`, `realtime`) are guarded against user DDL (SQLSTATE 42501). |
+
+### Type caveats
+
+| Type | Caveat |
+|---|---|
+| `NUMERIC` / `DECIMAL` — binary wire encoding | Text-format only on the pgwire wire (binary `NUMERIC` is varlena-shaped and deferred to v0.2). Drivers that request binary format for NUMERIC will receive text. |
+| `INTERVAL` | Not supported as a column type. `age()` returns an `interval` expression value in query results, but `CREATE TABLE … (col INTERVAL)` is rejected. |
+| `MONEY` | Not supported. |
+| `XML` | Not supported. |
+| `LINESTRING`, `POLYGON`, geometric types beyond `POINT` | Not supported. Only `POINT`-equivalent geometry via `basin-geo`; no `LINESTRING`/`POLYGON`/R-tree. |
+| `citext` — implicit cast in WHERE | `WHERE email = 'FOO@BAR.COM'` against a `CITEXT` column does not automatically fold the literal. Callers must use an explicit `::citext` cast or the `citext_eq(col, $1)` UDF until the planner optimizer rule lands (v0.2). |
+
+### Query / execution caveats
+
+| Feature | Caveat |
+|---|---|
+| `WINDOW … EXCLUDE {CURRENT ROW\|GROUP\|TIES\|NO OTHERS}` | Not parsed by sqlparser 0.61 / DataFusion 53. Queries with an `EXCLUDE` clause on a window frame receive a clean parse error. Will close when sqlparser ships `WindowFrameExclusion`. |
+| `UPDATE … SET col = <expr>` (non-literal RHS) | RHS must be a literal or a single bind parameter. Expressions like `SET count = count + 1` are rejected. Compute the new value client-side. |
+| `UPDATE … WHERE col IN (SELECT …)` / `WHERE EXISTS (SELECT …)` | Subquery in WHERE is rejected in v0.1. Materialise the inner SELECT client-side. |
+| Cross-shard `JOIN` | Joins across projects or across shards are not supported. The router ships consistent-hash shard routing; cross-shard JOIN is deferred to v0.2. |
+| `SELECT … AS OF SNAPSHOT n` / `AS OF TIMESTAMP ts` | Time-travel query syntax deferred to `basin-analytical` v0.2. |
+| `SELECT *` on mixed-type tables | May fail with an Arrow type-projection mismatch on tables that mix `BIGSERIAL PK + TEXT UNIQUE + TIMESTAMPTZ DEFAULT`. Workaround: list columns explicitly. |
+| `GENERATED ALWAYS AS (expr) VIRTUAL` | Only `STORED` generated columns are implemented. `VIRTUAL` is deferred to v0.2. |
+| `RETURNS SETOF type` (single-column SRF) | Not supported in `CREATE FUNCTION`. Use `RETURNS TABLE(col type, …)` instead. |
+| Nested `CALL` inside a procedure body | Rejected at registration in v0.1. |
+| `BEGIN` / `COMMIT` / `ROLLBACK` multi-statement transactions | Single-shard transactions shipped (`f4127e9`). Cross-shard transactions are not supported. Drivers that send `BEGIN TRANSACTION READ WRITE` around prepared-statement loops may get rejected — use multi-row `INSERT … VALUES (…),(…),…` instead. |
+| `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` | Not yet implemented end-to-end in v0.1; deferred. |
+
+### `pg_dump` / `basin dump` output — skipped-feature annotations
+
+Basin's `basin dump` output emits `-- skipped: <reason>` comments for the
+following constructs whenever they appear in the schema being dumped:
+
+- `-- skipped: CREATE EXTENSION <name>` — all extension statements
+- `-- skipped: PL/pgSQL function <name>` — functions whose source contains PL/pgSQL bodies
+- `-- skipped: CREATE TRIGGER <name>` — PL/pgSQL-bodied triggers (Basin reactors are emitted as `ALTER TABLE … REACT ON … EXECUTE …` instead)
+- `-- skipped: GRANT/REVOKE` — privilege statements
+- `-- skipped: COMMENT ON` — object comment statements
+- `-- skipped: CREATE LANGUAGE` — procedural language declarations
+- `-- skipped: TABLESPACE` references — any DDL referencing a named tablespace
+
+When restoring a Basin dump into real PostgreSQL, these skipped objects will
+need to be recreated manually. The `-- skipped:` annotations are stable across
+dump format versions.
+
+
 
 > Full per-tool notes, CI install snippets, fixture locations, and the CI-regeneration
 > contract live in [`docs/migration-tools.md`](./docs/migration-tools.md).
@@ -313,4 +397,4 @@ Summary matrix (see linked doc for caveats and the regeneration plan):
 
 ---
 
-*Last updated: 2026-05-21. This file is hand-maintained; PRs welcome.*
+*Last updated: 2026-05-22. This file is hand-maintained; PRs welcome.*
