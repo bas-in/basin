@@ -72,6 +72,7 @@ use basin_common::{ProjectCounterRegistry, ProjectId};
 
 use crate::{
     error::{BlobError, Result},
+    mime,
     model::{Bucket, BucketId, Object},
     paths,
     rls::{CallerCtx, ObjectPolicy, ObjectPolicyCommand, ObjectRlsStore},
@@ -511,9 +512,25 @@ impl<C: BlobCatalog> BlobStore<C> {
     ///
     /// Enforces bucket policy:
     /// - `file_size_limit` — rejects uploads that exceed the configured limit.
-    /// - `allowed_mime_types` — rejects uploads with a disallowed MIME type
-    ///   (skip if `mime_type` is `None` and the list is non-empty — callers
-    ///   should sniff the content type before calling).
+    /// - `allowed_mime_types` — rejects uploads with a disallowed MIME type.
+    ///
+    /// ## Server-side MIME sniffing (P2-4)
+    ///
+    /// The `mime_type` parameter carries the *client-supplied* Content-Type
+    /// (from the HTTP `Content-Type` header or multipart field).  This method
+    /// **ignores** the client-supplied value and sniffs the actual content type
+    /// from the payload's magic bytes instead.  The sniffed type is stored in
+    /// the object row and used for policy enforcement.
+    ///
+    /// This prevents content-type confusion attacks where an attacker uploads
+    /// an HTML file with `Content-Type: image/png`; the stored (and later
+    /// served) MIME type will be `text/html`, not `image/png`, so servers that
+    /// reflect the stored type back to browsers will not be misled into
+    /// rendering it as HTML.
+    ///
+    /// The `mime_type` parameter is retained in the signature (rather than
+    /// removed) so call sites do not need to be changed; it may be used in a
+    /// future audit log entry.
     ///
     /// The `etag` is the hex-encoded content hash supplied by the caller.  If
     /// the object already exists at this path it is overwritten.
@@ -544,8 +561,24 @@ impl<C: BlobCatalog> BlobStore<C> {
             });
         }
 
-        // Enforce allowed_mime_types.
-        if let Some(ref mt) = mime_type {
+        // P2-4: Server-side MIME sniffing.
+        //
+        // Override the client-supplied Content-Type with the server-sniffed
+        // type.  This prevents content-type confusion (e.g. an HTML file
+        // uploaded as `image/png` would be stored and served as `text/html`,
+        // not as the client-claimed type).
+        //
+        // For non-empty payloads the sniff always returns a non-empty string;
+        // for the empty-payload edge case we fall back to the client type (if
+        // any) or `application/octet-stream`.
+        let effective_mime: Option<String> = if data.is_empty() {
+            mime_type
+        } else {
+            Some(mime::sniff(&data).to_string())
+        };
+
+        // Enforce allowed_mime_types against the *sniffed* type.
+        if let Some(ref mt) = effective_mime {
             if !bucket.allows_mime_type(mt) {
                 return Err(BlobError::MimeTypeNotAllowed(mt.clone()));
             }
@@ -558,12 +591,12 @@ impl<C: BlobCatalog> BlobStore<C> {
             .await
             .map_err(BlobError::ObjectStore)?;
 
-        // Upsert the catalog row.
+        // Upsert the catalog row with the *sniffed* MIME type.
         let object = Object::new(
             bucket.id,
             object_path,
             size,
-            mime_type,
+            effective_mime,
             metadata,
             owner,
             etag,

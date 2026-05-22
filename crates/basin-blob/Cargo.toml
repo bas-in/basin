@@ -20,6 +20,11 @@ serde_json.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 
+# P2-1: signed-URL rotation secret (BlobSigningSecret uses HMAC-SHA256).
+hmac.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+
 # Postgres-backed BlobCatalog (closes #54 P0). Mirrors basin-catalog's
 # deadpool-postgres pool pattern so multi-replica deployments share durable
 # blob metadata instead of per-process in-memory state.

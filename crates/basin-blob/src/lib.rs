@@ -21,16 +21,20 @@
 #![forbid(unsafe_code)]
 
 pub mod error;
+pub mod mime;
 pub mod model;
 pub mod paths;
 pub mod postgres;
 pub mod rls;
+pub mod signing;
 pub mod store;
 
 pub use error::{BlobError, Result};
+pub use mime::sniff as mime_sniff;
 pub use model::{Bucket, BucketId, Object, ObjectId};
 pub use postgres::PostgresBlobCatalog;
 pub use rls::{
     CallerCtx, ObjectPolicy, ObjectPolicyCommand, ObjectRlsStore, ObjectUsing,
 };
+pub use signing::BlobSigningSecret;
 pub use store::{BlobCatalog, BlobStore};
