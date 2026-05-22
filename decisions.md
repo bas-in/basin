@@ -6,6 +6,41 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-22 — Wave 1 (4 file-disjoint agents) landed green; commit-race swept one agent's work into another's (benign)
+
+Dispatched 4 sonnet agents across disjoint crates: A=basin-rest (OAuth/MFA routes),
+B=basin-storage (6.TR.A/B), C=catalog/wal/shard (6.X.A), D=basin-engine (range
+exclusion-constraint). Outcomes after coherence gate (`cargo build --workspace` exit 0)
++ targeted sweep (range_types_harness 6/6 incl. `range_exclusion_constraint_scheduling`,
+noop_accept 42/42, smoke_pgx 1/1, all bare-exit):
+
+- **6.X.A** — already fully implemented in a prior wave (lease table, `LeaseRegistry`,
+  WAL epoch fence, heartbeat); checkbox was just never ticked. Closed by ticking (`4d8e713`).
+- **6.TR.A** — complete (extra_types 9/9: MONEY/INET/CIDR/MACADDR/MACADDR8/BIT/VARBIT/
+  NUMERIC/DECIMAL); `restamp_field_metadata_from_catalog` in reader.rs + vortex-datafusion
+  0.71 metadata preservation. **6.TR.B** — storage boundary done (UUID↔Decimal256(39,0),
+  *not* Decimal128 — 128-bit UUIDs don't fit 38 digits); smoke_pgx + jsonb_uuid_param_binding
+  pass. **Residual:** `viability_uuid` stays ignored — the DataFusion scan path
+  (`basin-engine` `vortex_listing_format.rs`/`session.rs`) returns `Decimal256(39,0)` but the
+  catalog schema says `FixedSizeBinary(16)` → cast failure. Needs an engine read-path
+  rewrite to apply `decimal256_to_uuid_fsb` post-scan. Queued for Wave 2 (#40).
+- **OAuth/MFA routes** — mounted in basin-rest (`1b7deb1`). **Stub:** `GET /auth/v1/factors`
+  returns `[]` pending `AuthService::list_factors` in basin-auth (was out of the rest-only
+  agent's scope). Queued for Wave 2.
+- **Range exclusion-constraint** — enforcement landed in basin-engine (constraints.rs +
+  executor.rs + dml_mutate.rs); `range_exclusion_constraint_scheduling` un-ignored + green.
+
+**Commit race (the handoff-warned hazard, observed):** agent A ran `git commit` while
+agent D had `git add`ed its basin-engine files → A's commit `1b7deb1` swept in D's work.
+Benign this time (workspace built clean + D's test passes), but confirms the lesson: agents
+sharing a tree must stage-and-commit atomically. Future mitigation: have each agent commit
+immediately after its own `git add`, or orchestrator commits per-crate after the wave.
+
+**Watchdog stalls:** agents A and D were first killed by the 600s stream-watchdog mid
+cold-cache build (no streaming output ≠ hang). Re-dispatched as continuation agents that
+picked up the in-tree partial edits with a warm cache — both finished. Lesson: long
+cold-cache builds can trip the watchdog; warm-cache continuations recover cleanly.
+
 ## 2026-05-22 — WIP from 3 prior engine agents was NOT clean-buildable; pipe-masked exit codes hid it
 
 The advisory-lock / GIN-completeness / pg_sleep WIP left uncommitted by the previous
