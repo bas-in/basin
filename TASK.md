@@ -1945,25 +1945,25 @@ green.
       `tests/integration/tests/citext_unique.rs`,
       `tests/integration/tests/citext_orm_compat.rs`.
       Acceptance: harness compiles + reports red.
-- [~] **5.30.B — `citext` type** (~1 day). Catalog type
+- [x] **5.30.B — `citext` type** (~1 day). Catalog type
       registration; binary + text serialisation; Arrow
       representation. Files:
       `crates/basin-common/src/types/citext.rs` (new),
       `crates/basin-engine/src/types.rs` (register).
       Acceptance: closes the **type round-trip** slice of 5.30.A.
-- [~] **5.30.C — Comparison operators** (~1 day). `=`, `<>`, `<`,
+- [x] **5.30.C — Comparison operators** (~1 day). `=`, `<>`, `<`,
       `<=`, `>`, `>=` with case-folded semantics; integrates with
       planner so ORDER BY on citext respects fold.
       Files: `crates/basin-engine/src/operators/citext_cmp.rs` (new).
       Acceptance: closes the **comparison semantics** slice of 5.30.A.
-- [~] **5.30.D — UNIQUE on citext column** (~half day).
+- [x] **5.30.D — UNIQUE on citext column** (~half day).
       Case-folded at index time so UNIQUE rejects equivalents;
       performant at 100k rows. Files:
       `crates/basin-storage/src/index/btree_citext.rs` (new or
       extend).
       Acceptance: closes the **unique-constraint case-insensitivity**
       slice of 5.30.A.
-- [~] **5.30.E — ORM compat + CAPABILITIES row** (~half day).
+- [x] **5.30.E — ORM compat + CAPABILITIES row** (~half day).
       Diesel + Prisma + sqlx slice closed; CAPABILITIES.md citext
       row marked shipped with the "no `CREATE EXTENSION citext;`
       needed — always available" note.
