@@ -1876,7 +1876,7 @@ soak lands red first; each impl sub-task flips a named slice green.
       `tests/integration/tests/hypertable_soak_1b.rs` (gated
       behind `--ignored` for nightly).
       Acceptance: harness compiles + reports red.
-- [ ] **5.29.B — `create_hypertable(table, time_column,
+- [x] **5.29.B — `create_hypertable(table, time_column,
       chunk_interval)` DDL** (~3-5 days). UDF + DDL surface;
       catalog persistence of the hypertable spec (time column,
       bucket interval, dimension partitioning); runtime auto-create
@@ -1885,14 +1885,14 @@ soak lands red first; each impl sub-task flips a named slice green.
       `crates/basin-engine/src/udfs/hypertable.rs` (new),
       `crates/basin-shard/src/auto_partition.rs` (new).
       Acceptance: closes the **auto-partition** slice of 5.29.A.
-- [ ] **5.29.C — Per-chunk routing in executor** (~1 week).
+- [x] **5.29.C — Per-chunk routing in executor** (~1 week).
       Planner prunes chunks based on time-filter; per-chunk scan
       parallelism; chunk-aware aggregation pushdown. Files:
       `crates/basin-engine/src/chunk_router.rs` (new),
       `crates/basin-engine/src/planner.rs` (extend).
       Acceptance: closes the **query routing** slice of 5.29.A
       (≥ 100× speedup gate).
-- [ ] **5.29.D — `add_retention_policy` + cron-driven drop**
+- [x] **5.29.D — `add_retention_policy` + cron-driven drop**
       (~3-5 days). `SELECT basin.add_retention_policy('events',
       INTERVAL '90 days')` — registers a basin-cron job that drops
       partitions older than the threshold;
@@ -1901,14 +1901,14 @@ soak lands red first; each impl sub-task flips a named slice green.
       Files: `crates/basin-cron/src/retention.rs` (new),
       `crates/basin-engine/src/udfs/retention.rs` (new).
       Acceptance: closes the **retention** slice of 5.29.A.
-- [ ] **5.29.E — Compression + tier-down to cold tier** (~1 week).
+- [x] **5.29.E — Compression + tier-down to cold tier** (~1 week).
       Old partitions (configurable threshold) get re-encoded into
       a more compressed Vortex profile + moved to a colder storage
       class. Integrates with basin-hottier (5.14.C) for the read
       path. Files: `crates/basin-shard/src/tier_down.rs` (new).
       Acceptance: closes the **tier-down** slice of 5.29.A
       (1-year-old reads work; bytes ≥ 3× smaller).
-- [ ] **5.29.F — ORM compat + 1B-row soak slice** (~3-5 days).
+- [~] **5.29.F — ORM compat + 1B-row soak slice** (~3-5 days).
       sqlx / Diesel migration escape hatches documented; soak
       harness wired into nightly CI; perf regression gates set.
       Acceptance: closes the **ORM compat** + **soak** slices of

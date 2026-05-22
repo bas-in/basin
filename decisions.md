@@ -6,6 +6,45 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 
 ---
 
+## 2026-05-22 — Engine-phase + isolated-sibling-repo waves: 5.22 pg_dump, 5.26 pgvector, 5.29 hypertable
+
+Cadence that works under engine-serialization + disk limits: ONE engine agent on a
+whole phase (shared tree) + ONE agent in an isolated sibling repo (basin-cli /
+basin-cloud — separate git + Cargo target, zero contention). Each wave
+coherence-gated (`cargo build --workspace` + targeted regression sweep) green.
+
+- **5.22 pg_dump:** `5938e5f` engine plain (`pg_dump -F p`) + custom (`-F c`,
+  Basin-native `BASINDMP` archive) dump/restore API in `basin-engine/src/dump/`;
+  topological FK order, BASIN_TYPE→PG-type DDL rendering. CLI: `9cacd1a` in
+  **basin-cli** — `basin dump`/`restore` over the HTTP API client, with a
+  `// TODO(5.22.D-engine-api)` seam for the eventual server dump endpoint. 5.22.B/C/D
+  done; A-harness + E-docs remain.
+- **5.26 pgvector:** `39d4a1a` — `vector(N)` DDL, `<->`/`<=>`/`<#>` operators
+  (reconciled with existing `l2_distance`), `USING hnsw (col vector_l2_ops)` +
+  `ivfflat` DDL (ivfflat→hnsw fallback, recorded as `ivfflat:` opclass prefix for
+  introspection), `vector_dims/norm/to_text` UDFs. **Key fix:** table registration
+  switched to `TableReference::Bare` so DataFusion stops lowercasing mixed-case
+  quoted table names (`"VectorItem"`) — ORM compat. All 6 slices green; regression-
+  swept (pgvector harness 6/6, noop 42/42, smoke_pgx) clean. **5.26 complete.**
+  CLI sibling: `69cffff` basin-cli `gen types --watch`.
+- **5.29 hypertable:** `create_hypertable` + time-bucketed auto-partition
+  (`HypertableRegistry`, DashMap per project = O(bytes)/idle tenant),
+  `timescaledb_information.chunks` virtual table + `time_bucket()` UDF, per-chunk
+  time-predicate pruning, `add_retention_policy` + chunk drop, `compress_chunk`
+  metadata-mark (rows stay queryable). B–E landed; F soak left ignored (1M-row
+  insert too slow for CI). **Pre-existing bug fixed:** `basin-storage::predicate::
+  evaluate` panicked comparing `Timestamp` columns vs `Int64`(µs) / `Utf8`(PG ts
+  string) scalars — now handles all 4 time units + a `parse_ts_str_to_us` read-path
+  helper. (Agent strayed into basin-storage for this necessary fix; no collision.)
+  Cloud sibling: `40022d0` in **basin-cloud** — T-154 wire `thresholds_crossed`
+  into `check_and_alert` (Vite/React SPA + Axum backend-rs; 1036 backend tests green).
+
+**Net:** ~25 boxes closed across these waves; basin TASK.md down to ~73 open + 14
+partial. Biggest untouched: 5.21 CDC, 5.19.D/E. Deferred index-scan wiring
+(5.19.C/5.20.E/5.24.D) still pending a focused engine wave.
+
+---
+
 ## 2026-05-22 — Shared-tree waves: 5.23 admin views, 5.20.E + 5.24.D index structures, 5.24 range types, ADR 0025
 
 Back to file-disjoint shared-tree waves (no worktrees). Each coherence-gated
