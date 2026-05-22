@@ -792,6 +792,8 @@ mod advisory_lock;
 mod alter;
 mod alter_project;
 pub mod connection_registry;
+/// Phase 5.22.B/C — pg_dump-compatible plain + custom binary dump.
+pub mod dump;
 pub(crate) mod operators;
 mod any_all_rewrite;
 mod approx_count_distinct;
@@ -3164,6 +3166,190 @@ mod tests {
             snap_a.cpu_micros_total > snap_b.cpu_micros_total,
             "A({} micros) should exceed B({} micros) after {n_queries}x more work",
             snap_a.cpu_micros_total, snap_b.cpu_micros_total,
+        );
+    }
+
+    // ─── Phase 5.22.B/C — dump round-trip tests ───────────────────────────
+
+    /// Helper: open a fresh engine + project + session, create a simple
+    /// two-table schema with FK dependency and seed rows.
+    async fn make_dump_engine() -> (Engine, TempDir, ProjectId) {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let project = ProjectId::new();
+        eng.config()
+            .catalog
+            .create_namespace(&project)
+            .await
+            .unwrap();
+        let sess = eng.open_session(project).await.unwrap();
+
+        // Parent table.
+        sess.execute(
+            "CREATE TABLE dump_users (\
+                id       BIGINT  PRIMARY KEY,\
+                username TEXT    NOT NULL,\
+                active   BOOLEAN NOT NULL DEFAULT TRUE,\
+                metadata JSONB\
+            )",
+        )
+        .await
+        .unwrap();
+
+        // Child table with FK.
+        sess.execute(
+            "CREATE TABLE dump_orders (\
+                id      BIGINT          PRIMARY KEY,\
+                user_id BIGINT          NOT NULL REFERENCES dump_users(id),\
+                amount  NUMERIC(12,2)   NOT NULL,\
+                note    TEXT\
+            )",
+        )
+        .await
+        .unwrap();
+
+        sess.execute(
+            "INSERT INTO dump_users (id, username, active, metadata) VALUES \
+             (1, 'alice', TRUE,  '{\"tier\":\"gold\"}'::jsonb), \
+             (2, 'bob',   FALSE, NULL)",
+        )
+        .await
+        .unwrap();
+
+        sess.execute(
+            "INSERT INTO dump_orders (id, user_id, amount, note) VALUES \
+             (101, 1, 99.99, 'first'), \
+             (102, 2, 15.00, NULL)",
+        )
+        .await
+        .unwrap();
+
+        (eng, dir, project)
+    }
+
+    /// Count rows in `table` via SELECT COUNT(*).
+    async fn row_count(eng: &Engine, project: ProjectId, table: &str) -> u64 {
+        let sess = eng.open_session(project).await.unwrap();
+        let res = sess
+            .execute(&format!("SELECT COUNT(*) FROM {table}"))
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                use arrow_array::types::Int64Type;
+                use arrow_array::cast::AsArray;
+                batches[0].column(0).as_primitive::<Int64Type>().value(0) as u64
+            }
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dump_plain_round_trip() {
+        let (eng, _dir, project) = make_dump_engine().await;
+
+        let opts = crate::dump::DumpOptions::new();
+
+        // Dump.
+        let sql = crate::dump::dump_plain(&eng, project, &opts)
+            .await
+            .unwrap();
+
+        // Sanity checks on the dump script.
+        assert!(!sql.is_empty(), "dump must not be empty");
+        assert!(
+            sql.contains("dump_users"),
+            "dump must mention dump_users; got:\n{sql}"
+        );
+        assert!(
+            sql.contains("dump_orders"),
+            "dump must mention dump_orders; got:\n{sql}"
+        );
+        assert!(
+            sql.to_uppercase().contains("INSERT"),
+            "dump must contain INSERT statements"
+        );
+
+        // The parent table (dump_users) must come before dump_orders in the
+        // dump because dump_orders has a FK → dump_users.
+        let users_pos = sql.find("dump_users").unwrap();
+        let orders_pos = sql.find("dump_orders").unwrap();
+        assert!(
+            users_pos < orders_pos,
+            "dump_users must appear before dump_orders (FK dependency order)"
+        );
+
+        // Restore into a FRESH project (separate namespace) so we don't
+        // conflict with old storage files from the source project. This mirrors
+        // the real-world `basin-cli dump | basin-cli restore --url fresh_db`
+        // workflow, and avoids the storage-layer PK check scanning pre-DROP
+        // files that belong to the source project.
+        let dir2 = TempDir::new().unwrap();
+        let eng2 = engine_in(&dir2);
+        let project2 = ProjectId::new();
+        eng2.config()
+            .catalog
+            .create_namespace(&project2)
+            .await
+            .unwrap();
+
+        crate::dump::restore_plain(&eng2, project2, &sql)
+            .await
+            .unwrap();
+
+        // Verify row counts after restore.
+        assert_eq!(
+            row_count(&eng2, project2, "dump_users").await,
+            2,
+            "dump_users must have 2 rows after plain restore"
+        );
+        assert_eq!(
+            row_count(&eng2, project2, "dump_orders").await,
+            2,
+            "dump_orders must have 2 rows after plain restore"
+        );
+    }
+
+    #[tokio::test]
+    async fn dump_custom_round_trip() {
+        let (eng, _dir, project) = make_dump_engine().await;
+
+        let opts = crate::dump::DumpOptions::new();
+
+        // Dump to custom binary format.
+        let archive = crate::dump::dump_custom(&eng, project, &opts)
+            .await
+            .unwrap();
+
+        // Sanity: non-empty, magic bytes correct.
+        assert!(!archive.is_empty(), "custom dump must not be empty");
+        assert_eq!(&archive[..8], b"BASINDMP", "custom dump magic mismatch");
+
+        // Restore into a fresh project (separate engine + namespace) to avoid
+        // storage-layer PK conflicts from old files in the source project.
+        let dir2 = TempDir::new().unwrap();
+        let eng2 = engine_in(&dir2);
+        let project2 = ProjectId::new();
+        eng2.config()
+            .catalog
+            .create_namespace(&project2)
+            .await
+            .unwrap();
+
+        crate::dump::restore_custom(&eng2, project2, &archive)
+            .await
+            .unwrap();
+
+        // Verify row counts after restore.
+        assert_eq!(
+            row_count(&eng2, project2, "dump_users").await,
+            2,
+            "dump_users must have 2 rows after custom restore"
+        );
+        assert_eq!(
+            row_count(&eng2, project2, "dump_orders").await,
+            2,
+            "dump_orders must have 2 rows after custom restore"
         );
     }
 }
