@@ -2988,21 +2988,29 @@ C4 unblocks not just UUID but the entire `BASIN_TYPE`-tagged logical-type
 family (MONEY, INET, CIDR, MACADDR, MACADDR8, BIT, VARBIT) — 7 extra_types
 tests + 3 UUID tests = 10 ignores removed in one wave.
 
-- [ ] **6.TR.A — `BASIN_TYPE` field-level metadata round-trip** (cluster C4).
+- [x] **6.TR.A — `BASIN_TYPE` field-level metadata round-trip** (cluster C4).
       Write path preserves field metadata into Vortex; read path restores
-      it on the way back. The 7 `extra_types` tests already encode the
-      desired behavior — they currently fail because the metadata is lost,
-      so the reader can't tell `Decimal128` from `MONEY`, `FixedSizeBinary(6)`
-      from `MACADDR`, etc. **Blocks 6.TR.B; pays for itself across MONEY,
-      INET, CIDR, MACADDR, MACADDR8, BIT, VARBIT** beyond the UUID work.
-- [ ] **6.TR.B — UUID-as-Decimal128 storage encoding** (cluster C1, ADR 0024).
+      it on the way back. Implemented in `basin-storage/src/reader.rs`
+      (`restamp_field_metadata_from_catalog`) + vortex 0.71 bump which
+      preserves Arrow field-level metadata through the DataFusion scan path.
+      All 9 `extra_types` tests pass (9/9, none ignored): MONEY, INET, CIDR,
+      MACADDR, MACADDR8, BIT(8), VARBIT(16), NUMERIC(10,2), DECIMAL(6,3).
+      Closed by commits `82fc21d`, `e74dfa4`, `9ea3854`.
+- [~] **6.TR.B — UUID-as-Decimal256 storage encoding** (cluster C1, ADR 0024,
+      corrected from Decimal128 → Decimal256 in commit `3fe8945`).
       Single-boundary translation in basin-storage: `FixedSizeBinary(16) +
-      BASIN_TYPE="uuid"` ↔ `Decimal128(38, 0) + BASIN_TYPE="uuid"` (BE
+      BASIN_TYPE="uuid"` ↔ `Decimal256(39, 0) + BASIN_TYPE="uuid"` (BE
       unsigned magnitude). Engine, planner, pgwire, REST keep treating
-      UUID as `FixedSizeBinary(16)` — the translation is hidden below the
-      storage trait. Tag the conditional branches `TODO(adr-0024)` so the
-      eventual upstream-Vortex removal is mechanical. Closes
-      `jsonb_uuid_param_binding`, `smoke_pgx`, `viability_uuid`.
+      UUID as `FixedSizeBinary(16)`. `TODO(adr-0024)` tags in place.
+      **Partially closed:** `jsonb_uuid_param_binding` ✓ (un-ignored `2596a73`),
+      `smoke_pgx` ✓ (un-ignored `7186bf7`). **Residual (blocked):**
+      `viability_uuid` — the `SELECT ... ORDER BY col` (no LIMIT) path routes
+      through `BasinVortexFormat` → `vortex_datafusion` in `basin-engine`,
+      which returns `Decimal256(39,0)` but the catalog schema says
+      `FixedSizeBinary(16)`; DataFusion attempts a naive cast and fails.
+      Fix requires wiring `decimal256_to_uuid_fsb` into the DataFusion scan
+      output in `basin-engine/src/vortex_listing_format.rs` — out of scope
+      for this 6.TR wave (touches engine, not storage). Tracked under #40.
 - [ ] **6.TR.C — Upstream Vortex `FixedSizeBinary(N)` encoder PR** (parallel
       track, no Basin-side blocking work). Open a PR to vortex-data/vortex
       adding the encoder; when it lands and we pin the new version,
