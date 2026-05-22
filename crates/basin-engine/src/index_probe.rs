@@ -141,8 +141,7 @@ impl TermPostingList {
     /// posting entries.  These files must be marked un-indexed by the caller
     /// because at least one of their terms is no longer in the posting list.
     fn evict_oldest(&mut self) -> HashSet<String> {
-        let budget = posting_budget();
-        let evict_count = (budget / 4).max(1);
+        let evict_count = (self.insert_order.len() / 4).max(1);
         let to_evict: Vec<String> =
             self.insert_order.drain(..evict_count.min(self.insert_order.len())).collect();
         let mut evicted_files: HashSet<String> = HashSet::new();

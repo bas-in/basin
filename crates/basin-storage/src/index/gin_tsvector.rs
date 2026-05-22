@@ -278,7 +278,7 @@ impl LexemePostingList {
 
     /// Evict the oldest 25% of lexemes.
     fn evict_oldest(&mut self) {
-        let evict_count = (posting_budget() / 4).max(1);
+        let evict_count = (self.insert_order.len() / 4).max(1);
         let to_evict: Vec<String> =
             self.insert_order.drain(..evict_count.min(self.insert_order.len())).collect();
         for k in &to_evict {
