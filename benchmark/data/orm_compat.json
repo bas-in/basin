@@ -1,10 +1,10 @@
 {
-  "generated_at": "@1779543264",
+  "generated_at": "@1779567054",
   "sections": [
     {
       "orm": "Drizzle",
-      "total": 14,
-      "ok": 14,
+      "total": 24,
+      "ok": 24,
       "typed_error": 0,
       "regression": 0,
       "pass_rate_pct": 100.0,
@@ -64,16 +64,56 @@
         {
           "sql": "SELECT u.id, u.email, sub.order_count\n           FROM \"users\" u\n           JOIN (\n               SELECT \"user_id\", count(*) AS order_count\n               FROM \"orders\" GROUP BY \"user_id\"\n           ) sub ON sub.\"user_id\" = u.id",
           "outcome": "ok"
+        },
+        {
+          "sql": "INSERT INTO \"users\" (\"id\",\"email\",\"name\") VALUES (50,'m1@example.com','M1'),(51,'m2@example.com','M2'),(52,'m3@example.com','M3') ON CONFLICT DO NOTHING",
+          "outcome": "ok"
+        },
+        {
+          "sql": "INSERT INTO \"users\" (\"id\",\"email\",\"name\") VALUES (60,'up@example.com','U')\n           ON CONFLICT (\"id\") DO UPDATE SET \"email\" = excluded.\"email\", \"name\" = excluded.\"name\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"users\".\"id\",\"users\".\"email\",\n               coalesce(json_agg(json_build_object('id',\"orders\".\"id\",'status',\"orders\".\"status\")), '[]'::json) AS \"orders\"\n           FROM \"users\" LEFT JOIN \"orders\" ON \"orders\".\"user_id\" = \"users\".\"id\"\n           GROUP BY \"users\".\"id\",\"users\".\"email\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"users\".\"id\" FROM \"users\" WHERE \"users\".\"id\"::text = $1",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"users\".\"id\",\"users\".\"email\" FROM \"users\" WHERE \"users\".\"id\" = 1 LIMIT 1 FOR UPDATE",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"users\".\"id\" FROM \"users\" WHERE \"users\".\"id\" = 1 FOR SHARE",
+          "outcome": "ok"
+        },
+        {
+          "sql": "WITH \"user_orders\" AS (\n               SELECT \"user_id\", count(*) AS \"cnt\" FROM \"orders\" GROUP BY \"user_id\"\n           )\n           SELECT u.\"id\", u.\"email\", uo.\"cnt\"\n           FROM \"users\" u LEFT JOIN \"user_orders\" uo ON uo.\"user_id\" = u.\"id\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"id\" FROM \"users\" UNION SELECT \"user_id\" AS \"id\" FROM \"orders\" ORDER BY \"id\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"id\",\"user_id\",\"total\",\n               row_number() OVER (PARTITION BY \"user_id\" ORDER BY \"total\" DESC) AS \"rn\"\n           FROM \"orders\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"id\",\"email\" FROM \"users\" WHERE \"id\" > $1 ORDER BY \"id\" ASC LIMIT $2",
+          "outcome": "ok"
         }
       ]
     },
     {
       "orm": "Prisma",
-      "total": 11,
-      "ok": 10,
-      "typed_error": 1,
+      "total": 21,
+      "ok": 18,
+      "typed_error": 3,
       "regression": 0,
-      "pass_rate_pct": 90.9090909090909,
+      "pass_rate_pct": 85.71428571428571,
       "shapes": [
         {
           "sql": "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'User'",
@@ -93,9 +133,7 @@
         },
         {
           "sql": "SELECT \"User\".\"id\",\"User\".\"email\",\n               (SELECT json_agg(o.*) FROM \"Order\" o WHERE o.\"userId\" = \"User\".\"id\") AS \"orders\"\n           FROM \"User\"",
-          "outcome": "typed_error",
-          "sqlstate": "XX000",
-          "message": "internal: execute: This feature is not implemented: Physical plan does not support logical expression Wildcard { qualifier: Some(Bare { table: \"o\" }), options: WildcardOptions { ilike: None, exclude: None, except: None, replace: None, rename: None } }"
+          "outcome": "ok"
         },
         {
           "sql": "SELECT pg_get_serial_sequence('\"User\"', 'id')",
@@ -120,16 +158,62 @@
         {
           "sql": "DELETE FROM \"User\" WHERE \"id\" = 999 RETURNING \"id\"",
           "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"public\".\"User\".\"id\",\"public\".\"User\".\"email\" FROM \"public\".\"User\" WHERE \"public\".\"User\".\"id\" = 1 LIMIT 1 OFFSET 0",
+          "outcome": "ok"
+        },
+        {
+          "sql": "INSERT INTO \"public\".\"User\" (\"id\",\"email\",\"name\") VALUES (200,'p1@example.com','P1') RETURNING \"public\".\"User\".\"id\",\"public\".\"User\".\"email\",\"public\".\"User\".\"name\",\"public\".\"User\".\"createdAt\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "UPDATE \"public\".\"User\" SET \"name\" = 'AliceUpdated' WHERE \"public\".\"User\".\"id\" = 1 RETURNING \"public\".\"User\".\"id\",\"public\".\"User\".\"email\",\"public\".\"User\".\"name\"",
+          "outcome": "typed_error",
+          "sqlstate": "42601",
+          "message": "invalid identifier: schema-qualified names not supported: \"public\".\"User\""
+        },
+        {
+          "sql": "DELETE FROM \"public\".\"User\" WHERE \"public\".\"User\".\"id\" = 998 RETURNING \"public\".\"User\".\"id\",\"public\".\"User\".\"email\"",
+          "outcome": "typed_error",
+          "sqlstate": "42601",
+          "message": "invalid identifier: schema-qualified names not supported: \"public\".\"User\""
+        },
+        {
+          "sql": "SELECT \"public\".\"User\".\"id\",\"public\".\"User\".\"email\",\"public\".\"User\".\"name\",\"public\".\"User\".\"createdAt\" FROM \"public\".\"User\" ORDER BY \"public\".\"User\".\"createdAt\" DESC LIMIT 20 OFFSET 0",
+          "outcome": "ok"
+        },
+        {
+          "sql": "BEGIN; SAVEPOINT \"tx1\"; RELEASE SAVEPOINT \"tx1\"; ROLLBACK;",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"public\".\"User\".\"id\" FROM \"public\".\"User\" WHERE \"public\".\"User\".\"id\" = ANY($1::int8[])",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT att.attname AS column_name, pg_catalog.format_type(att.atttypid, att.atttypmod) AS data_type\n           FROM pg_catalog.pg_attribute att\n           JOIN pg_catalog.pg_class cls ON cls.oid = att.attrelid\n           JOIN pg_catalog.pg_namespace nsp ON nsp.oid = cls.relnamespace\n           WHERE nsp.nspname = 'public' AND cls.relname = 'User' AND att.attnum > 0 AND NOT att.attisdropped\n           ORDER BY att.attnum",
+          "outcome": "typed_error",
+          "sqlstate": "XX000",
+          "message": "internal: plan: Schema error: No field named att.atttypmod. Did you mean 'att.atttypid'?."
+        },
+        {
+          "sql": "SELECT $1::int4 AS \"value\"",
+          "outcome": "ok"
         }
       ]
     },
     {
       "orm": "sqlx",
-      "total": 8,
-      "ok": 7,
-      "typed_error": 1,
+      "total": 19,
+      "ok": 17,
+      "typed_error": 2,
       "regression": 0,
-      "pass_rate_pct": 87.5,
+      "pass_rate_pct": 89.47368421052632,
       "shapes": [
         {
           "sql": "SELECT id, email, name FROM \"users\" WHERE id = $1",
@@ -164,16 +248,62 @@
         {
           "sql": "BEGIN",
           "outcome": "ok"
+        },
+        {
+          "sql": "SELECT id, email, name FROM \"users\" WHERE id = $1 ORDER BY id LIMIT $2",
+          "outcome": "ok"
+        },
+        {
+          "sql": "INSERT INTO \"users\" (id, email) VALUES ($1, $2), ($3, $4) RETURNING id",
+          "outcome": "ok"
+        },
+        {
+          "sql": "UPDATE \"users\" SET name = $1 WHERE id = $2 RETURNING *",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT pg_try_advisory_xact_lock(12345)",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT id, email FROM \"users\" LIMIT 0",
+          "outcome": "ok"
+        },
+        {
+          "sql": "COPY \"users\" (id, email) FROM STDIN",
+          "outcome": "typed_error",
+          "sqlstate": "42601",
+          "message": "expected table name or '(' after COPY"
+        },
+        {
+          "sql": "SELECT id FROM \"users\" u WHERE EXISTS (SELECT 1 FROM \"orders\" o WHERE o.user_id = u.id AND o.status = $1)",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT id FROM \"users\" WHERE name IS NOT NULL",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT id, 'user' AS kind FROM \"users\" UNION ALL SELECT id, 'order' AS kind FROM \"orders\" ORDER BY id",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SET TIME ZONE 'UTC'",
+          "outcome": "ok"
+        },
+        {
+          "sql": "ROLLBACK",
+          "outcome": "ok"
         }
       ]
     },
     {
       "orm": "Diesel",
-      "total": 8,
-      "ok": 8,
-      "typed_error": 0,
+      "total": 19,
+      "ok": 18,
+      "typed_error": 1,
       "regression": 0,
-      "pass_rate_pct": 100.0,
+      "pass_rate_pct": 94.73684210526315,
       "shapes": [
         {
           "sql": "SELECT id, title, body, user_id FROM posts WHERE id = 1",
@@ -206,16 +336,62 @@
         {
           "sql": "SELECT count(*) FROM posts WHERE user_id = 1",
           "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"posts\".\"id\", \"posts\".\"title\", \"posts\".\"body\", \"posts\".\"user_id\" FROM \"posts\" WHERE (\"posts\".\"user_id\" = 1) ORDER BY \"posts\".\"id\" ASC LIMIT 1",
+          "outcome": "ok"
+        },
+        {
+          "sql": "INSERT INTO \"posts\" (\"id\", \"title\", \"body\", \"user_id\") VALUES (101, 'p1', 'b1', 1), (102, 'p2', 'b2', 2)",
+          "outcome": "ok"
+        },
+        {
+          "sql": "UPDATE \"posts\" SET \"title\" = $1, \"body\" = $2 WHERE (\"posts\".\"id\" = $3)",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"posts\".\"id\", \"posts\".\"title\" FROM \"posts\" WHERE (\"posts\".\"id\" = 1) FOR UPDATE",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"posts\".\"id\" FROM \"posts\" WHERE (\"posts\".\"user_id\" = 1) ORDER BY \"posts\".\"id\" ASC LIMIT 1 FOR NO KEY UPDATE SKIP LOCKED",
+          "outcome": "ok"
+        },
+        {
+          "sql": "INSERT INTO \"posts\" (\"id\", \"title\", \"user_id\") VALUES ($1, $2, $3) ON CONFLICT (\"id\") DO UPDATE SET \"title\" = EXCLUDED.\"title\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"posts\".\"id\", \"posts\".\"title\", \"users\".\"email\" FROM \"posts\" INNER JOIN \"users\" ON \"users\".\"id\" = \"posts\".\"user_id\" WHERE (\"users\".\"email\" = 'alice@example.com')",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"posts\".\"user_id\", COUNT(*) FROM \"posts\" GROUP BY \"posts\".\"user_id\" ORDER BY \"posts\".\"user_id\" ASC",
+          "outcome": "ok"
+        },
+        {
+          "sql": "DELETE FROM \"posts\" WHERE (\"posts\".\"id\" = $1) RETURNING \"posts\".\"id\", \"posts\".\"title\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"__diesel_schema_migrations\".\"version\", \"__diesel_schema_migrations\".\"run_on\" FROM \"__diesel_schema_migrations\" ORDER BY \"__diesel_schema_migrations\".\"version\" DESC",
+          "outcome": "typed_error",
+          "sqlstate": "XX000",
+          "message": "internal: plan: Error during planning: table 'datafusion.public.__diesel_schema_migrations' not found"
+        },
+        {
+          "sql": "ROLLBACK",
+          "outcome": "ok"
         }
       ]
     },
     {
       "orm": "TypeORM",
-      "total": 6,
-      "ok": 6,
-      "typed_error": 0,
+      "total": 16,
+      "ok": 15,
+      "typed_error": 1,
       "regression": 0,
-      "pass_rate_pct": 100.0,
+      "pass_rate_pct": 93.75,
       "shapes": [
         {
           "sql": "SELECT \"users\".\"id\" AS \"users_id\",\"users\".\"email\" AS \"users_email\",\"users\".\"name\" AS \"users_name\"\n           FROM \"users\" WHERE \"users\".\"id\" = 1 LIMIT 1",
@@ -240,12 +416,54 @@
         {
           "sql": "INSERT INTO \"orders\" (\"id\",\"user_id\",\"status\",\"total\") VALUES (20,1,'new',5.00) RETURNING \"id\"",
           "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"users\".\"id\" AS \"users_id\", \"users\".\"email\" AS \"users_email\", \"orders\".\"id\" AS \"orders_id\", \"orders\".\"user_id\" AS \"orders_userId\", \"orders\".\"status\" AS \"orders_status\"\n           FROM \"users\" \"users\"\n           LEFT JOIN \"orders\" \"orders\" ON \"orders\".\"user_id\" = \"users\".\"id\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"users\".\"id\" AS \"users_id\" FROM \"users\" \"users\" WHERE \"users\".\"id\" IN ($1, $2, $3)",
+          "outcome": "ok"
+        },
+        {
+          "sql": "INSERT INTO \"users\" (\"id\", \"email\", \"name\") VALUES (310, 't1@example.com', 'T1'), (311, 't2@example.com', 'T2') RETURNING \"id\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "INSERT INTO \"users\" (\"id\", \"email\", \"name\") VALUES (320, 'ts@example.com', 'TS')\n           ON CONFLICT (\"id\") DO UPDATE SET \"email\" = EXCLUDED.\"email\", \"name\" = EXCLUDED.\"name\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "UPDATE \"users\" SET \"name\" = $1 WHERE \"id\" = $2",
+          "outcome": "ok"
+        },
+        {
+          "sql": "UPDATE \"users\" SET \"updated_at\" = NOW() WHERE \"id\" = 1 AND \"updated_at\" IS NOT NULL",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"user\".\"id\" AS \"id\", COUNT(*) AS \"cnt\" FROM \"users\" \"user\" GROUP BY \"user\".\"id\" ORDER BY \"user\".\"id\" ASC",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"outer\".\"id\", \"outer\".\"email\"\n           FROM (SELECT \"users\".\"id\" AS \"id\", \"users\".\"email\" AS \"email\" FROM \"users\" \"users\" WHERE \"users\".\"id\" > 0 LIMIT 25 OFFSET 0) \"outer\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT COUNT(DISTINCT(\"users\".\"id\")) AS \"cnt\" FROM \"users\" \"users\" WHERE \"users\".\"email\" = $1",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT * FROM \"migrations\" ORDER BY \"id\" DESC",
+          "outcome": "typed_error",
+          "sqlstate": "XX000",
+          "message": "internal: plan: Error during planning: table 'datafusion.public.migrations' not found"
         }
       ]
     }
   ],
-  "total_shapes": 47,
-  "total_ok": 45,
-  "total_typed_error": 2,
+  "total_shapes": 99,
+  "total_ok": 92,
+  "total_typed_error": 7,
   "total_regression": 0
 }
