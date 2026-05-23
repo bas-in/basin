@@ -539,7 +539,7 @@ pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result
 
     let pred = match predicate_expr {
         None => None,
-        Some(e) => Some(parse_compound_predicate(e, schema.as_ref())?),
+        Some(e) => Some(parse_compound_predicate(e, schema.as_ref(), table.as_str())?),
     };
 
     let audit_table = crate::types::audit_table_name(schema.as_ref()).map(|s| s.to_string());
@@ -960,7 +960,7 @@ pub(crate) async fn exec_update(
 
     let pred = match &selection {
         None => None,
-        Some(e) => Some(parse_compound_predicate(e, schema.as_ref())?),
+        Some(e) => Some(parse_compound_predicate(e, schema.as_ref(), table.as_str())?),
     };
 
     let audit_table = crate::types::audit_table_name(schema.as_ref()).map(|s| s.to_string());
@@ -3362,25 +3362,29 @@ fn try_literal_to_scalar(expr: &Expr, dt: &DataType, col: &str) -> Result<Option
 /// Anything we can't represent (function calls, subqueries, expressions
 /// on both sides) becomes `InvalidSchema` so the user sees a clean error
 /// rather than a partial mutation.
-fn parse_compound_predicate(expr: &Expr, schema: &Schema) -> Result<CompoundPredicate> {
+fn parse_compound_predicate(
+    expr: &Expr,
+    schema: &Schema,
+    table_name: &str,
+) -> Result<CompoundPredicate> {
     match expr {
-        Expr::Nested(inner) => parse_compound_predicate(inner, schema),
+        Expr::Nested(inner) => parse_compound_predicate(inner, schema, table_name),
         Expr::BinaryOp { left, op, right } => match op {
             BinaryOperator::And => Ok(CompoundPredicate::And(vec![
-                parse_compound_predicate(left, schema)?,
-                parse_compound_predicate(right, schema)?,
+                parse_compound_predicate(left, schema, table_name)?,
+                parse_compound_predicate(right, schema, table_name)?,
             ])),
             BinaryOperator::Or => Ok(CompoundPredicate::Or(vec![
-                parse_compound_predicate(left, schema)?,
-                parse_compound_predicate(right, schema)?,
+                parse_compound_predicate(left, schema, table_name)?,
+                parse_compound_predicate(right, schema, table_name)?,
             ])),
             BinaryOperator::Eq
             | BinaryOperator::Lt
             | BinaryOperator::Gt
             | BinaryOperator::LtEq
-            | BinaryOperator::GtEq => parse_atom(left, op, right, schema),
+            | BinaryOperator::GtEq => parse_atom(left, op, right, schema, table_name),
             BinaryOperator::NotEq => {
-                let atom = parse_atom(left, &BinaryOperator::Eq, right, schema)?;
+                let atom = parse_atom(left, &BinaryOperator::Eq, right, schema, table_name)?;
                 Ok(CompoundPredicate::Not(Box::new(atom)))
             }
             other => Err(BasinError::InvalidSchema(format!(
@@ -3391,17 +3395,17 @@ fn parse_compound_predicate(expr: &Expr, schema: &Schema) -> Result<CompoundPred
             op: UnaryOperator::Not,
             expr: inner,
         } => Ok(CompoundPredicate::Not(Box::new(parse_compound_predicate(
-            inner, schema,
+            inner, schema, table_name,
         )?))),
         Expr::IsNull(col) => {
-            let name = identifier_or_err(col)?;
+            let name = identifier_or_err(col, table_name)?;
             schema
                 .index_of(&name)
                 .map_err(|_| BasinError::InvalidSchema(format!("unknown column {name}")))?;
             Ok(CompoundPredicate::IsNull(name))
         }
         Expr::IsNotNull(col) => {
-            let name = identifier_or_err(col)?;
+            let name = identifier_or_err(col, table_name)?;
             schema
                 .index_of(&name)
                 .map_err(|_| BasinError::InvalidSchema(format!("unknown column {name}")))?;
@@ -3412,7 +3416,7 @@ fn parse_compound_predicate(expr: &Expr, schema: &Schema) -> Result<CompoundPred
             list,
             negated,
         } => {
-            let name = identifier_or_err(col_expr)?;
+            let name = identifier_or_err(col_expr, table_name)?;
             let idx = schema
                 .index_of(&name)
                 .map_err(|_| BasinError::InvalidSchema(format!("unknown column {name}")))?;
@@ -3440,11 +3444,14 @@ fn parse_atom(
     op: &BinaryOperator,
     right: &Expr,
     schema: &Schema,
+    table_name: &str,
 ) -> Result<CompoundPredicate> {
     // `<col> OP <literal>` or the swapped `<literal> OP <col>`.
-    let (col, op, lit) = if let (Some(c), Ok(Some(l))) = (as_identifier(left), as_literal(right)) {
+    let (col, op, lit) = if let (Some(c), Ok(Some(l))) =
+        (as_identifier(left, table_name), as_literal(right))
+    {
         (c, op.clone(), l)
-    } else if let (Some(c), Ok(Some(l))) = (as_identifier(right), as_literal(left)) {
+    } else if let (Some(c), Ok(Some(l))) = (as_identifier(right, table_name), as_literal(left)) {
         (c, mirror_op(op)?, l)
     } else {
         return Err(BasinError::InvalidSchema(format!(
@@ -3494,18 +3501,57 @@ fn mirror_op(op: &BinaryOperator) -> Result<BinaryOperator> {
     })
 }
 
-fn as_identifier(e: &Expr) -> Option<String> {
+/// Try to extract a column name from `e`, accepting both bare identifiers
+/// (`col`) and qualified references against the table being mutated
+/// (`table.col`, `schema.table.col`). Returns `None` when the expression
+/// isn't a recognisable column reference — callers may then try the swapped
+/// form (literal OP col). A qualified reference whose table prefix doesn't
+/// match `table_name` is treated as "not a column ref" (returns `None`) so
+/// the caller can produce the unsupported-shape error instead of silently
+/// mis-routing a cross-table column. Comparisons are case-insensitive to
+/// match how identifiers come back from the parser (and PG itself).
+fn as_identifier(e: &Expr, table_name: &str) -> Option<String> {
     match e {
         Expr::Identifier(i) => Some(i.value.clone()),
-        Expr::Nested(inner) => as_identifier(inner),
+        Expr::Nested(inner) => as_identifier(inner, table_name),
+        Expr::CompoundIdentifier(parts) => match parts.as_slice() {
+            // `table.col`
+            [tbl, col] if tbl.value.eq_ignore_ascii_case(table_name) => Some(col.value.clone()),
+            // `schema.table.col` — accept any schema qualifier (we don't yet
+            // model multi-schema search paths in DML; the surrounding catalog
+            // lookup has already resolved the table). The middle segment must
+            // still match the mutated table.
+            [_schema, tbl, col] if tbl.value.eq_ignore_ascii_case(table_name) => {
+                Some(col.value.clone())
+            }
+            _ => None,
+        },
         _ => None,
     }
 }
 
-fn identifier_or_err(e: &Expr) -> Result<String> {
+fn identifier_or_err(e: &Expr, table_name: &str) -> Result<String> {
     match e {
         Expr::Identifier(i) => Ok(i.value.clone()),
-        Expr::Nested(inner) => identifier_or_err(inner),
+        Expr::Nested(inner) => identifier_or_err(inner, table_name),
+        Expr::CompoundIdentifier(parts) => match parts.as_slice() {
+            [tbl, col] if tbl.value.eq_ignore_ascii_case(table_name) => Ok(col.value.clone()),
+            [_schema, tbl, col] if tbl.value.eq_ignore_ascii_case(table_name) => {
+                Ok(col.value.clone())
+            }
+            // Qualified to a different table: cross-table WHERE in DELETE /
+            // UPDATE is legal in PG but not supported here. Emit a clearer
+            // error so the user isn't left wondering why a qualified ref
+            // "didn't parse".
+            [tbl, _col] | [_, tbl, _col] => Err(BasinError::InvalidSchema(format!(
+                "WHERE references column qualified by {:?}, but mutation targets {:?}; \
+                 cross-table column references are not supported",
+                tbl.value, table_name
+            ))),
+            _ => Err(BasinError::InvalidSchema(format!(
+                "WHERE expects column identifier, got {e}"
+            ))),
+        },
         other => Err(BasinError::InvalidSchema(format!(
             "WHERE expects column identifier, got {other}"
         ))),
@@ -3720,7 +3766,7 @@ async fn exec_soft_delete(
     let mut pred = match predicate_expr {
         None => CompoundPredicate::IsNull(sd_col.clone()),
         Some(e) => {
-            let user_pred = parse_compound_predicate(e, schema.as_ref())?;
+            let user_pred = parse_compound_predicate(e, schema.as_ref(), table.as_str())?;
             CompoundPredicate::And(vec![user_pred, CompoundPredicate::IsNull(sd_col.clone())])
         }
     };
@@ -4304,5 +4350,107 @@ mod tests {
             msg.contains("unsupported PK column type"),
             "error message should mention unsupported type, got: {msg}"
         );
+    }
+
+    // ── qualified column refs in WHERE (TypeORM / Drizzle compat) ────────────
+    //
+    // TypeORM (and other ORMs) emit `WHERE "users"."id" IN ($1)` against the
+    // extended protocol. sqlparser hands that back as `CompoundIdentifier(
+    // ["users", "id"])`, which the WHERE parser used to reject with
+    // "WHERE expects column identifier". These tests pin the fix.
+
+    fn ident(s: &str) -> sqlparser::ast::Ident {
+        sqlparser::ast::Ident::new(s)
+    }
+
+    /// `WHERE "users"."id" = 42` — qualifier matches the mutated table; the
+    /// column name is extracted from the compound identifier.
+    #[test]
+    fn as_identifier_accepts_qualified_matching_table() {
+        let e = Expr::CompoundIdentifier(vec![ident("users"), ident("id")]);
+        assert_eq!(as_identifier(&e, "users"), Some("id".to_string()));
+    }
+
+    /// Qualifier comparison is ASCII-case-insensitive: `"Users"."id"` against
+    /// table `users` resolves the same as the lowercase form.
+    #[test]
+    fn as_identifier_qualifier_case_insensitive() {
+        let e = Expr::CompoundIdentifier(vec![ident("Users"), ident("id")]);
+        assert_eq!(as_identifier(&e, "users"), Some("id".to_string()));
+    }
+
+    /// `"public"."users"."id"` — three-part qualifier; middle segment must
+    /// match the mutated table.
+    #[test]
+    fn as_identifier_accepts_schema_qualified() {
+        let e = Expr::CompoundIdentifier(vec![ident("public"), ident("users"), ident("id")]);
+        assert_eq!(as_identifier(&e, "users"), Some("id".to_string()));
+    }
+
+    /// Qualifier referring to a different table: as_identifier returns None
+    /// so parse_atom falls through to the swapped form (and ultimately the
+    /// generic "WHERE atom must be…" error). identifier_or_err produces the
+    /// explicit cross-table message.
+    #[test]
+    fn as_identifier_rejects_cross_table_qualifier() {
+        let e = Expr::CompoundIdentifier(vec![ident("posts"), ident("id")]);
+        assert_eq!(as_identifier(&e, "users"), None);
+    }
+
+    #[test]
+    fn identifier_or_err_cross_table_message_is_explicit() {
+        let e = Expr::CompoundIdentifier(vec![ident("posts"), ident("id")]);
+        let err = identifier_or_err(&e, "users").expect_err("cross-table must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cross-table"),
+            "error should mention cross-table, got: {msg}"
+        );
+    }
+
+    /// `DELETE FROM "users" WHERE "users"."id" IN (42)` — the literal form
+    /// the bound case rewrites to. End-to-end via parse_compound_predicate.
+    #[test]
+    fn parse_compound_predicate_accepts_qualified_in_list() {
+        use arrow_schema::{DataType, Field};
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let expr = Expr::InList {
+            expr: Box::new(Expr::CompoundIdentifier(vec![ident("users"), ident("id")])),
+            list: vec![Expr::Value(ValueWithSpan {
+                value: Value::Number("42".to_string(), false),
+                span: sqlparser::tokenizer::Span::empty(),
+            })],
+            negated: false,
+        };
+        let pred = parse_compound_predicate(&expr, &schema, "users")
+            .expect("qualified IN list must parse");
+        match pred {
+            CompoundPredicate::In(col, vals) => {
+                assert_eq!(col, "id");
+                assert_eq!(vals.len(), 1);
+            }
+            other => panic!("expected In(_, _), got {other:?}"),
+        }
+    }
+
+    /// `UPDATE "users" SET … WHERE "users"."id" = 42` — the eq atom shape.
+    #[test]
+    fn parse_compound_predicate_accepts_qualified_eq_atom() {
+        use arrow_schema::{DataType, Field};
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::CompoundIdentifier(vec![ident("users"), ident("id")])),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expr::Value(ValueWithSpan {
+                value: Value::Number("42".to_string(), false),
+                span: sqlparser::tokenizer::Span::empty(),
+            })),
+        };
+        let pred = parse_compound_predicate(&expr, &schema, "users")
+            .expect("qualified eq must parse");
+        match pred {
+            CompoundPredicate::Atom(Predicate::Eq(col, _)) => assert_eq!(col, "id"),
+            other => panic!("expected Atom(Eq(…)), got {other:?}"),
+        }
     }
 }
