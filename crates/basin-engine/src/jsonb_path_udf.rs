@@ -1012,8 +1012,30 @@ fn extract_jsonb_value_from_array(
             .map_err(|e| DataFusionError::Execution(format!("{fn_name}: JSON parse error: {e}")))?;
         return Ok(Some(v));
     }
+    // BinaryView (Arrow view-format JSONB; DataFusion 53 surfaces this for
+    // stored columns and any operator that re-buffers JSONB through the
+    // view-format layout).
+    if let Some(bv) = arr
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::BinaryViewArray>()
+    {
+        let bytes = bv.value(i);
+        let v: Value = serde_json::from_slice(bytes)
+            .map_err(|e| DataFusionError::Execution(format!("{fn_name}: JSON parse error: {e}")))?;
+        return Ok(Some(v));
+    }
     // Utf8
     if let Some(sa) = arr.as_any().downcast_ref::<StringArray>() {
+        let s = sa.value(i);
+        let v: Value = serde_json::from_str(s)
+            .map_err(|e| DataFusionError::Execution(format!("{fn_name}: JSON parse error: {e}")))?;
+        return Ok(Some(v));
+    }
+    // Utf8View
+    if let Some(sa) = arr
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::StringViewArray>()
+    {
         let s = sa.value(i);
         let v: Value = serde_json::from_str(s)
             .map_err(|e| DataFusionError::Execution(format!("{fn_name}: JSON parse error: {e}")))?;
@@ -1037,6 +1059,12 @@ fn extract_string_from_array(arr: &ArrayRef, i: usize) -> Option<String> {
         return None;
     }
     if let Some(sa) = arr.as_any().downcast_ref::<StringArray>() {
+        return Some(sa.value(i).to_string());
+    }
+    if let Some(sa) = arr
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::StringViewArray>()
+    {
         return Some(sa.value(i).to_string());
     }
     if let Some(sa) = arr

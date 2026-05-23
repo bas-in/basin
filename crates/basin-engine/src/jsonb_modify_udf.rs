@@ -28,7 +28,8 @@ use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, LargeBinaryArray, LargeListArray, ListArray, StringArray,
+    Array, ArrayRef, BinaryViewArray, BooleanArray, LargeBinaryArray, LargeListArray, ListArray,
+    StringArray, StringViewArray,
 };
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{exec_err, DataFusionError, Result as DFResult};
@@ -103,8 +104,10 @@ pub(crate) fn register_jsonb_modify_udfs(ctx: &SessionContext) {
 // Shared helpers (private to this module)
 // ---------------------------------------------------------------------------
 
-/// Decode a JSONB `LargeBinary` blob or a UTF-8 JSON string into a
-/// `serde_json::Value`.  Returns `None` when the array slot is null.
+/// Decode a JSONB blob (`LargeBinary` / `BinaryView`) or a UTF-8 JSON string
+/// (`Utf8` / `Utf8View`) into a `serde_json::Value`.  Returns `None` when the
+/// array slot is null.  `BinaryView` / `Utf8View` arms cover Arrow's
+/// view-format buffers, which DataFusion 53 surfaces for stored JSONB columns.
 fn extract_json(arr: &ArrayRef, i: usize, fn_name: &str) -> DFResult<Option<Value>> {
     match arr.data_type() {
         DataType::LargeBinary => {
@@ -113,6 +116,20 @@ fn extract_json(arr: &ArrayRef, i: usize, fn_name: &str) -> DFResult<Option<Valu
                 .downcast_ref::<LargeBinaryArray>()
                 .ok_or_else(|| {
                     DataFusionError::Execution(format!("{fn_name}: not a LargeBinaryArray"))
+                })?;
+            if a.is_null(i) {
+                return Ok(None);
+            }
+            serde_json::from_slice(a.value(i))
+                .map(Some)
+                .map_err(|e| DataFusionError::Execution(format!("{fn_name}: json decode: {e}")))
+        }
+        DataType::BinaryView => {
+            let a = arr
+                .as_any()
+                .downcast_ref::<BinaryViewArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!("{fn_name}: not a BinaryViewArray"))
                 })?;
             if a.is_null(i) {
                 return Ok(None);
@@ -132,7 +149,23 @@ fn extract_json(arr: &ArrayRef, i: usize, fn_name: &str) -> DFResult<Option<Valu
                 .map(Some)
                 .map_err(|e| DataFusionError::Execution(format!("{fn_name}: json parse: {e}")))
         }
-        other => exec_err!("{fn_name}: expected LargeBinary or Utf8 for JSON arg, got {other:?}"),
+        DataType::Utf8View => {
+            let a = arr
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!("{fn_name}: not a StringViewArray"))
+                })?;
+            if a.is_null(i) {
+                return Ok(None);
+            }
+            serde_json::from_str(a.value(i))
+                .map(Some)
+                .map_err(|e| DataFusionError::Execution(format!("{fn_name}: json parse: {e}")))
+        }
+        other => exec_err!(
+            "{fn_name}: expected LargeBinary, BinaryView, Utf8, or Utf8View for JSON arg, got {other:?}"
+        ),
     }
 }
 
