@@ -23,7 +23,9 @@ use crate::encryption::{decrypt_envelope, BytesFileReader, EncryptionProvider, W
 use crate::metadata_cache::{CachedParquetMeta, ParquetMetaCache};
 use crate::page_cache::{hash_filters, hash_projection, CacheKey, PageCache};
 use crate::paths::table_tier_prefix;
-use crate::predicate::{self, Predicate, ScalarValue};
+use crate::predicate::{
+    self, evaluate_compound_for_pruning, CompoundPredicate, Predicate, PruneOutcome, ScalarValue,
+};
 use crate::tier::Tier;
 use crate::vortex_footer_cache::VortexFooterCache;
 use crate::writer::wrapped_sidecar_key;
@@ -356,43 +358,6 @@ pub(crate) async fn read(
     table: &TableName,
     opts: ReadOptions,
 ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
-    let store = storage.project_store(project);
-    let project_id_string = project.as_prefix();
-
-    let mut paths: Vec<ObjectPath> = Vec::new();
-    // Walk hot and cold tiers in turn. The reader is tier-agnostic — files
-    // live wherever the (compactor-driven) tier policy put them; here we
-    // just consume both prefixes.
-    for tier in [Tier::Hot, Tier::Cold] {
-        let prefix = table_tier_prefix(storage.root_prefix(), project, table, tier);
-        let mut s = store.list(Some(&prefix));
-        while let Some(meta) = s.next().await {
-            let meta = meta.map_err(|e| BasinError::storage(format!("list: {e}")))?;
-            // Data files are `.parquet` or (opt-in) `.vortex`. List both;
-            // skip everything else (e.g. `.wrapped` encryption sidecars).
-            // Filtering to `.parquet` only made every Vortex data file
-            // invisible to the constraint / FK / UNIQUE / PK and
-            // UPDATE/DELETE row-matching scans (list-then-read), so a dup
-            // INSERT was accepted and post-INSERT UPDATEs matched zero rows.
-            if !(meta.location.as_ref().ends_with(".parquet")
-                || meta.location.as_ref().ends_with(".vortex"))
-            {
-                continue;
-            }
-            // Belt-and-braces: never read a file whose key isn't under the
-            // project prefix. If this ever fired we'd want a P0; we treat it
-            // as `IsolationViolation`, not `Storage`.
-            let expected = format!("projects/{project_id_string}/");
-            if !meta.location.as_ref().contains(&expected) {
-                return Err(BasinError::isolation(format!(
-                    "listed object {} does not contain {}",
-                    meta.location, expected
-                )));
-            }
-            paths.push(meta.location);
-        }
-    }
-
     // Fetch the catalog schema once for the whole read so that
     // `finalize_pipeline` can synthesise NULL-filled columns for fields that
     // exist in the catalog but are absent from pre-ALTER on-disk files.
@@ -402,7 +367,106 @@ pub(crate) async fn read(
     // preserved (will error on missing columns, same as before).
     let catalog_schema = storage.catalog_table_schema(project, table).await?;
 
+    // File-level catalog-stats pruning. When the request carries any
+    // predicate AND we know the table's Arrow schema (catalog attached), we
+    // pull per-file min/max/null-count stats and skip any file whose stats
+    // prove the predicate cannot match. This mirrors the engine-path prune
+    // in `basin-engine::fast_select`, but lifts it into the storage layer
+    // so the wide set of callers that drive `Storage::read` directly
+    // (integration tests, `Storage::read` from sources without their own
+    // catalog walk) get the same pruning win.
+    //
+    // For Vortex this is decisive: opening a Vortex file is far heavier
+    // than a Parquet footer fetch, and the cost we save here is a full
+    // file open per pruned file. For Parquet it saves the per-file footer
+    // fetch (the row-group-level prune inside `read_one` still fires for
+    // surviving files).
+    //
+    // Falls back to the legacy inline-LIST path when filters are empty or
+    // the catalog schema is unavailable — both branches preserve the
+    // pre-prune behaviour exactly.
+    let prune_with_stats = !opts.filters.is_empty() && catalog_schema.is_some();
+    let paths: Vec<ObjectPath> = if prune_with_stats {
+        let schema = catalog_schema
+            .as_ref()
+            .expect("checked is_some above")
+            .as_ref()
+            .clone();
+        let cp = filters_to_compound(&opts.filters);
+        let files = list_data_files_with_stats(storage, project, table).await?;
+        files
+            .into_iter()
+            .filter(|f| {
+                // Files whose stats are empty (no footer parsed, e.g.
+                // envelope-encrypted Parquet or unsupported Vortex types)
+                // skip pruning — `evaluate_compound_for_pruning` will see
+                // no per-column entry and return Mixed, which keeps the
+                // file. This is the same conservative rule the engine
+                // path follows.
+                !matches!(
+                    evaluate_compound_for_pruning(&cp, &f.column_stats, &schema, f.row_count),
+                    PruneOutcome::NoMatch
+                )
+            })
+            .map(|f| f.path)
+            .collect()
+    } else {
+        let store = storage.project_store(project);
+        let project_id_string = project.as_prefix();
+        let mut paths: Vec<ObjectPath> = Vec::new();
+        // Walk hot and cold tiers in turn. The reader is tier-agnostic — files
+        // live wherever the (compactor-driven) tier policy put them; here we
+        // just consume both prefixes.
+        for tier in [Tier::Hot, Tier::Cold] {
+            let prefix = table_tier_prefix(storage.root_prefix(), project, table, tier);
+            let mut s = store.list(Some(&prefix));
+            while let Some(meta) = s.next().await {
+                let meta = meta.map_err(|e| BasinError::storage(format!("list: {e}")))?;
+                // Data files are `.parquet` or (opt-in) `.vortex`. List both;
+                // skip everything else (e.g. `.wrapped` encryption sidecars).
+                // Filtering to `.parquet` only made every Vortex data file
+                // invisible to the constraint / FK / UNIQUE / PK and
+                // UPDATE/DELETE row-matching scans (list-then-read), so a dup
+                // INSERT was accepted and post-INSERT UPDATEs matched zero rows.
+                if !(meta.location.as_ref().ends_with(".parquet")
+                    || meta.location.as_ref().ends_with(".vortex"))
+                {
+                    continue;
+                }
+                // Belt-and-braces: never read a file whose key isn't under the
+                // project prefix. If this ever fired we'd want a P0; we treat it
+                // as `IsolationViolation`, not `Storage`.
+                let expected = format!("projects/{project_id_string}/");
+                if !meta.location.as_ref().contains(&expected) {
+                    return Err(BasinError::isolation(format!(
+                        "listed object {} does not contain {}",
+                        meta.location, expected
+                    )));
+                }
+                paths.push(meta.location);
+            }
+        }
+        paths
+    };
+
     read_paths_inner(storage, project, paths, opts, catalog_schema).await
+}
+
+/// Build a single AND-of-atoms [`CompoundPredicate`] from the read-path's
+/// flat filter list. Mirrors the shape that `basin-engine::fast_select`
+/// builds for catalog-stats pruning so the pruning decision is identical
+/// across both call paths.
+fn filters_to_compound(filters: &[Predicate]) -> CompoundPredicate {
+    let mut atoms: Vec<CompoundPredicate> = filters
+        .iter()
+        .cloned()
+        .map(CompoundPredicate::Atom)
+        .collect();
+    if atoms.len() == 1 {
+        atoms.pop().expect("len==1")
+    } else {
+        CompoundPredicate::And(atoms)
+    }
 }
 
 /// Like [`read`] but reads only the supplied `paths` instead of LIST'ing
