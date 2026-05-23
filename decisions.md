@@ -1317,3 +1317,46 @@ DataFusion scan, each gated by `indexed_files ⊇ live_files` (else full-scan fa
 correctness-safe). JSONB/tsvector perf gates remain ignored only due to adversarial
 test-fixture data shape (low selectivity + posting eviction), NOT a wiring defect —
 test-tuning follow-up.
+
+## 2026-05-23 — Wasm UDF type surface landed (4c6de27)
+
+`crates/basin-engine/src/wasm_udf.rs` (+803 lines / -134) +
+`tests/integration/tests/wasm_udf_types.rs` (new, +537 lines).
+
+**Types now supported in Wasm UDFs (was i32/i64/f64 only):**
+- **TEXT** (Utf8 / LargeUtf8 / Utf8View) via (ptr, len)
+- **BYTEA** (Binary / LargeBinary / BinaryView) via (ptr, len)
+- **JSONB** transported as TEXT (canonical JSON bytes; guest parses)
+- **TIMESTAMPTZ + TIMESTAMP** as i64 microseconds (no marshalling)
+
+**ABI contract** (documented in module docstring):
+- Guests export `memory`, `basin_alloc(i32) -> i32`, `basin_dealloc(i32, i32)`
+- Returns pack `(ret_ptr, ret_len)` into single `i64` (`hi32 | lo32`)
+  so WAT signatures stay single-value across toolchains
+- NULL travels as `len = -1`
+
+**Tests:** 13 unit (was 8) + 7 new integration round-trip tests +
+existing 6 wasm_udf.rs + wasm_functions_differential + soak all green.
+
+**Closes** the "WASM UDFs at i32/i64/f64-only are not useful" strategic
+audit concern. v0.1 cut now includes string-supporting Wasm UDFs.
+
+**Architectural note for v0.2:** the bare-core-Wasm `wasmtime::Module`
+path is v0.1 shape. Unifying with the Component Model + WIT (already
+used by `basin-fn` for HTTP/handler functions) would give free typed
+marshalling via `wit-bindgen` (`string`, `list<u8>`, `record`) — no
+guest allocator contract needed. Biggest available architectural
+improvement; flagged for v0.2.
+
+**Note on scope:** despite task brief pointing at `crates/basin-fn/`,
+the SQL→Wasm UDF type bridge lives in `crates/basin-engine/src/wasm_udf.rs`.
+basin-fn is the unrelated Component Model host-import system.
+
+**Two unrelated findings flagged:**
+- `basin-fn::governance_caps_test::component_harness_run_with_bumps_cpu_micros_per_project`
+  is flaky on CPU timing (1418 vs 1934 micros — within noise).
+- **`dml_mutate.rs:5383` has a pre-existing test-only compile error**
+  from in-flight WIP (Statement::Update.table field rename) — agent
+  noted, not caused by this change. Investigating.
+
+6 agents still in flight: #88 + #92 + #100 + #101 + #102 + #103.
