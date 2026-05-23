@@ -1,0 +1,42 @@
+{
+  "claim": "Curated PG-style .slt suite reaches >= 78% pass rate against basin-engine.",
+  "details": {
+    "framework": "sqllogictest",
+    "framework_version": "0.29",
+    "pass_rate_pct": 80.0,
+    "passed": 40,
+    "threshold_pct": 78.0,
+    "total": 50
+  },
+  "generated_at": "@1779539106",
+  "id": "sql_support_slt",
+  "kind": "viability",
+  "metrics": [
+    {
+      "label": "passed",
+      "unit": "tests",
+      "value": 40.0
+    },
+    {
+      "label": "total",
+      "unit": "tests",
+      "value": 50.0
+    },
+    {
+      "label": "pass_rate",
+      "unit": "%",
+      "value": 80.0
+    }
+  ],
+  "name": "SQL compatibility (sqllogictest)",
+  "passed": true,
+  "primary": {
+    "bar": {
+      "op": "greater_than_or_equal",
+      "value": 78.0
+    },
+    "label": "pass_rate",
+    "unit": "%",
+    "value": 80.0
+  }
+}

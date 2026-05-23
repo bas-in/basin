@@ -1,0 +1,312 @@
+# Curated PG-compatibility cases for basin-engine, driven by sqllogictest.
+#
+# Conventions:
+#   - Type chars: T text, I integer, R floating point.
+#   - We always specify `ORDER BY` and use `nosort` (deterministic order)
+#     so column-ordering bugs are visible.
+#   - NULL is the literal string `NULL` (sqllogictest convention).
+#   - Booleans render as `t` / `f` (PG psql convention).
+#   - The default validator joins each row's values with a single space and
+#     compares against one expected line per row. So multi-column rows go on
+#     ONE line, space-separated.
+#   - One blank line between records (sqllogictest record separator).
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DDL — CREATE TABLE with PG scalar + composite types
+# ─────────────────────────────────────────────────────────────────────────────
+
+statement ok
+CREATE TABLE t_scalar (id INT PRIMARY KEY, n BIGINT, name TEXT, active BOOLEAN, score DOUBLE PRECISION)
+
+statement ok
+CREATE TABLE t_temporal (id INT PRIMARY KEY, ts TIMESTAMPTZ)
+
+statement ok
+CREATE TABLE t_json (id INT PRIMARY KEY, body JSONB)
+
+statement ok
+CREATE TABLE t_arr (id INT PRIMARY KEY, tags TEXT[])
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DML — INSERT
+# ─────────────────────────────────────────────────────────────────────────────
+
+statement ok
+INSERT INTO t_scalar VALUES (1, 100, 'alice',  TRUE,  1.5), (2, 200, 'bob',   FALSE, 2.5), (3, 300, 'carol', TRUE,  3.5)
+
+statement ok
+INSERT INTO t_temporal VALUES (1, TIMESTAMPTZ '2024-01-15 12:00:00+00'), (2, TIMESTAMPTZ '2024-06-30 23:59:59+00')
+
+statement ok
+INSERT INTO t_json VALUES (1, '{"k":"v","n":1}'::jsonb), (2, '{"k":"w","n":2,"tags":["x","y"]}'::jsonb)
+
+statement ok
+INSERT INTO t_arr VALUES (1, ARRAY['red','green']), (2, ARRAY['blue','red','yellow'])
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SELECT / WHERE / ORDER BY / LIMIT / OFFSET
+# ─────────────────────────────────────────────────────────────────────────────
+
+query IT nosort
+SELECT id, name FROM t_scalar ORDER BY id
+----
+1 alice
+2 bob
+3 carol
+
+query IT nosort
+SELECT id, name FROM t_scalar WHERE active = TRUE ORDER BY id
+----
+1 alice
+3 carol
+
+query IT nosort
+SELECT id, name FROM t_scalar ORDER BY id LIMIT 2 OFFSET 1
+----
+2 bob
+3 carol
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Aggregates / GROUP BY / HAVING
+# ─────────────────────────────────────────────────────────────────────────────
+
+query I nosort
+SELECT COUNT(*) FROM t_scalar
+----
+3
+
+query I nosort
+SELECT SUM(n) FROM t_scalar
+----
+600
+
+query R nosort
+SELECT AVG(score) FROM t_scalar
+----
+2.500
+
+query II nosort
+SELECT MIN(n), MAX(n) FROM t_scalar
+----
+100 300
+
+query TI nosort
+SELECT active::TEXT, COUNT(*) FROM t_scalar GROUP BY active ORDER BY active
+----
+f 1
+t 2
+
+query TI nosort
+SELECT active::TEXT, COUNT(*) FROM t_scalar GROUP BY active HAVING COUNT(*) > 1 ORDER BY active
+----
+t 2
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Joins — INNER / LEFT
+# ─────────────────────────────────────────────────────────────────────────────
+
+statement ok
+CREATE TABLE jl (id INT, label TEXT)
+
+statement ok
+CREATE TABLE jr (id INT, value INT)
+
+statement ok
+INSERT INTO jl VALUES (1, 'a'), (2, 'b'), (3, 'c')
+
+statement ok
+INSERT INTO jr VALUES (1, 10), (2, 20), (4, 40)
+
+query ITI nosort
+SELECT jl.id, jl.label, jr.value FROM jl INNER JOIN jr ON jl.id = jr.id ORDER BY jl.id
+----
+1 a 10
+2 b 20
+
+query ITI nosort
+SELECT jl.id, jl.label, jr.value FROM jl LEFT JOIN jr ON jl.id = jr.id ORDER BY jl.id
+----
+1 a 10
+2 b 20
+3 c NULL
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Subqueries — uncorrelated + correlated
+# ─────────────────────────────────────────────────────────────────────────────
+
+query IT nosort
+SELECT id, name FROM t_scalar WHERE n IN (SELECT n FROM t_scalar WHERE active = TRUE) ORDER BY id
+----
+1 alice
+3 carol
+
+query IT nosort
+SELECT id, name FROM t_scalar s WHERE EXISTS (SELECT 1 FROM t_scalar x WHERE x.n = s.n AND x.active = TRUE) ORDER BY id
+----
+1 alice
+3 carol
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CTEs
+# ─────────────────────────────────────────────────────────────────────────────
+
+query II nosort
+WITH agg AS (SELECT active, SUM(n) AS s FROM t_scalar GROUP BY active) SELECT (CASE WHEN active THEN 1 ELSE 0 END)::INT, s FROM agg ORDER BY active
+----
+0 200
+1 400
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Window functions
+# ─────────────────────────────────────────────────────────────────────────────
+
+query II nosort
+SELECT id, ROW_NUMBER() OVER (ORDER BY n) FROM t_scalar ORDER BY id
+----
+1 1
+2 2
+3 3
+
+query II nosort
+SELECT id, RANK() OVER (PARTITION BY active ORDER BY n) FROM t_scalar ORDER BY id
+----
+1 1
+2 1
+3 2
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JSONB ops
+# ─────────────────────────────────────────────────────────────────────────────
+
+query T nosort
+SELECT body->>'k' FROM t_json ORDER BY id
+----
+v
+w
+
+query T nosort
+SELECT (body->'n')::TEXT FROM t_json ORDER BY id
+----
+1
+2
+
+query I nosort
+SELECT id FROM t_json WHERE body ? 'tags' ORDER BY id
+----
+2
+
+query I nosort
+SELECT id FROM t_json WHERE body @> '{"k":"v"}'::jsonb ORDER BY id
+----
+1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Array ops
+# ─────────────────────────────────────────────────────────────────────────────
+
+query T nosort
+SELECT unnest(ARRAY['x','y','z']) ORDER BY 1
+----
+x
+y
+z
+
+query I nosort
+SELECT id FROM t_arr WHERE tags @> ARRAY['red'] ORDER BY id
+----
+1
+2
+
+query I nosort
+SELECT id FROM t_arr WHERE tags && ARRAY['blue','green'] ORDER BY id
+----
+1
+2
+
+# ─────────────────────────────────────────────────────────────────────────────
+# String functions
+# ─────────────────────────────────────────────────────────────────────────────
+
+query T nosort
+SELECT LOWER('HELLO')
+----
+hello
+
+query T nosort
+SELECT UPPER('hello')
+----
+HELLO
+
+query IT nosort
+SELECT id, name FROM t_scalar WHERE name LIKE 'a%' ORDER BY id
+----
+1 alice
+
+query IT nosort
+SELECT id, name FROM t_scalar WHERE name ILIKE 'A%' ORDER BY id
+----
+1 alice
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Date / time functions
+# ─────────────────────────────────────────────────────────────────────────────
+
+query I nosort
+SELECT EXTRACT(YEAR FROM ts)::INT FROM t_temporal ORDER BY id
+----
+2024
+2024
+
+query I nosort
+SELECT EXTRACT(MONTH FROM ts)::INT FROM t_temporal ORDER BY id
+----
+1
+6
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Type casts
+# ─────────────────────────────────────────────────────────────────────────────
+
+query I nosort
+SELECT '42'::INT
+----
+42
+
+query T nosort
+SELECT 123::TEXT
+----
+123
+
+query T nosort
+SELECT ('{"a":1}'::jsonb)->>'a'
+----
+1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UPDATE / DELETE
+# ─────────────────────────────────────────────────────────────────────────────
+
+statement ok
+CREATE TABLE t_mut (id INT PRIMARY KEY, v INT)
+
+statement ok
+INSERT INTO t_mut VALUES (1, 10), (2, 20), (3, 30)
+
+statement ok
+UPDATE t_mut SET v = v + 1 WHERE id = 2
+
+query II nosort
+SELECT id, v FROM t_mut ORDER BY id
+----
+1 10
+2 21
+3 30
+
+statement ok
+DELETE FROM t_mut WHERE id = 1
+
+query II nosort
+SELECT id, v FROM t_mut ORDER BY id
+----
+2 21
+3 30

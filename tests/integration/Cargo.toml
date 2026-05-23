@@ -82,6 +82,12 @@ base64.workspace = true
 basin-fn.workspace = true
 # Phase 5.27.A: txn-mode pool benchmark.
 criterion = { version = "0.5", features = ["html_reports"] }
+# SQL-compat suite: sqllogictest is the de-facto industry framework (DuckDB,
+# RisingWave, Materialize, …) for `.slt`-driven regression tests. We use it
+# to wrap a curated set of PG-style queries around basin-engine and track a
+# pass-rate floor as a CI gate.
+sqllogictest = "0.29"
+thiserror.workspace = true
 
 [lib]
 path = "src/lib.rs"
