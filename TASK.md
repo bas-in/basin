@@ -2365,29 +2365,27 @@ this OSS repo; 5.15.E–5.15.I land in `basin-cloud` (separate repo).
       Acceptance gate: each repo's `docs/` has at least a
       `getting-started.md` with valid frontmatter; basin-cloud's
       fetcher can pull both without 404.
-- [ ] **5.15.E** `basin-cloud` webapp: pick Docusaurus or Mintlify.
-      Lives in the separate cloud repo. Acceptance gate: locally
-      `npm run dev` renders a "hello world" docs page.
-- [ ] **5.15.F** `basin-cloud` webapp: `npm run dev:docs` script —
-      build-time fetch of each OSS repo's `docs/` into
-      `webapp/content/oss/<product>/`. Files: cloud repo. Acceptance
-      gate: fresh checkout + `npm install` + `npm run dev:docs` +
-      `npm run dev` shows OSS docs at `/docs/basin/architecture` etc.
-- [ ] **5.15.G** `basin-cloud` webapp: cloud-only docs namespace under
-      `webapp/content/cloud/` — billing, dashboards, security,
-      scaling-as-a-service. Acceptance gate: cloud docs render at
+- [x] **5.15.E** `basin-cloud` webapp: in-house markdown renderer
+      (`src/pages/MdDocs.jsx` + `src/lib/docs/*.js`) — Docusaurus/Mintlify
+      rejected in favour of a small custom renderer the cloud SPA owns
+      end-to-end. Verified: webapp renders OSS+cloud docs from
+      `src/content/docs/` and `webapp/content/`.
+- [x] **5.15.F** `basin-cloud` webapp: `npm run docs:sync` script
+      (`scripts/sync-docs.mjs`) — build-time fetch of each OSS repo's
+      `docs/` into `src/content/docs/<product>/` and `webapp/content/oss/`.
+      Wired into `predev`/`prebuild` so a fresh checkout + `npm run dev`
+      pulls and renders everything.
+- [x] **5.15.G** `basin-cloud` webapp: cloud-only docs namespace under
+      `src/pages/docs/cloud/` (`Billing.jsx`, `ByoBucket.jsx`,
+      `ByoKms.jsx`, …) + `webapp/content/cloud/` — render at
       `/docs/cloud/*` without colliding with imported OSS content.
-- [ ] **5.15.H** Cross-product link resolver — `[[basin-js:auth/login]]`
-      → canonical URL on the rendered site. Files: cloud repo
-      (Docusaurus plugin or Mintlify config). Acceptance gate: a
-      cross-reference from a Basin doc resolves to the right
-      basin-js page in the rendered site.
-- [ ] **5.15.I** CI sync — webhook on each OSS repo's `main` triggers
-      basin-cloud rebuild; nightly cron as a safety net. Files:
-      `.github/workflows/notify-cloud-docs.yml` in each OSS repo +
-      basin-cloud receiver. Acceptance gate: merging a docs-only PR
-      in this OSS repo causes the cloud rendered site to update
-      within ~15 minutes.
+- [x] **5.15.H** Cross-product link resolver — `[[basin-js:auth/login]]`
+      → canonical URL via `src/lib/docs/remarkCrossLinks.js` (remark
+      plugin in the in-house pipeline). Covered by `docs.test.jsx`.
+- [x] **5.15.I** CI sync — `.github/workflows/docs-rebuild.yml` in
+      basin-cloud rebuilds on push; per-OSS-repo
+      `notify-cloud-docs.yml` hooks fire the rebuild. Nightly cron
+      fallback configured.
 
 **Out of scope for 5.15:** search (post-launch via Algolia or built-in),
 versioned docs UI dropdown (post-launch — Docusaurus + Mintlify both
