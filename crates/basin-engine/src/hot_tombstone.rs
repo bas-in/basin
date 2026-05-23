@@ -285,6 +285,38 @@ fn filter_batch(
     Ok(filtered)
 }
 
+// ── Batch-level convenience wrapper ──────────────────────────────────────────
+
+/// Apply the merge-on-read tombstone filter to an already-collected vector of
+/// `RecordBatch`es and return the surviving rows.
+///
+/// Used by the point-lookup fast path in `fast_select::execute_simple_select`,
+/// which reads cold-tier files directly into `Vec<RecordBatch>` and never
+/// constructs an `ExecutionPlan` we could wrap with `TombstoneFilterExec`.
+///
+/// Callers should only invoke this when `tombstones` is non-empty (a
+/// `snapshot_tombstones` call followed by a `.is_empty()` check) so the happy
+/// path stays zero-overhead. When `tombstones` is empty this still returns
+/// `batches` unchanged but pays one allocation per batch.
+///
+/// Mirrors the behaviour of `TombstoneFilterExec::execute`: rows whose PK
+/// encodes to one of the snapshotted `RowKey` bytes are dropped; batches
+/// missing the PK column pass through unchanged (no safe key to compare).
+pub(crate) fn apply_tombstone_filter_to_batches(
+    batches: Vec<RecordBatch>,
+    tombstones: &HashSet<Vec<u8>>,
+    pk_column: &str,
+    pk_dt: &DataType,
+) -> DFResult<Vec<RecordBatch>> {
+    if tombstones.is_empty() {
+        return Ok(batches);
+    }
+    batches
+        .into_iter()
+        .map(|b| filter_batch(&b, pk_column, pk_dt, tombstones))
+        .collect()
+}
+
 // ── Convenience wrapper ──────────────────────────────────────────────────────
 
 /// Wrap `inner` with a `TombstoneFilterExec` when the table has at least one
@@ -464,6 +496,43 @@ mod tests {
         assert_eq!(col.value(0), 1);
         assert_eq!(col.value(1), 3);
         assert_eq!(col.value(2), 5);
+    }
+
+    #[test]
+    fn apply_tombstone_filter_to_batches_drops_across_batches() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let b1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let b2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![4, 5, 6]))],
+        )
+        .unwrap();
+        let tombstones: HashSet<Vec<u8>> = [2i64, 5]
+            .iter()
+            .map(|v| RowKey::builder().append_i64(*v).finish().as_bytes().to_vec())
+            .collect();
+        let out =
+            apply_tombstone_filter_to_batches(vec![b1, b2], &tombstones, "id", &DataType::Int64)
+                .unwrap();
+        let total: usize = out.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 4);
+    }
+
+    #[test]
+    fn apply_tombstone_filter_to_batches_empty_snapshot_is_passthrough() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let b = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])
+            .unwrap();
+        let empty: HashSet<Vec<u8>> = HashSet::new();
+        let out =
+            apply_tombstone_filter_to_batches(vec![b.clone()], &empty, "id", &DataType::Int64)
+                .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].num_rows(), 3);
     }
 
     #[test]

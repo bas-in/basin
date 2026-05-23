@@ -1228,8 +1228,9 @@ pub(crate) async fn execute_simple_select(
                 });
             }
             // mem_rows is empty but entry exists (tombstone-only or filtered-out).
-            // Fall through to cold-tier read; tombstone suppression in the full
-            // merge path is handled by `exec_select` → `HtapUnionTable`.
+            // Fall through to cold-tier read. The post-read tombstone filter
+            // installed below (see `apply_tombstone_filter_to_batches`) will
+            // suppress any cold-tier rows whose PK has been fast-path deleted.
         }
         // No memtable entry for this table → fall through to cold-tier read.
     }
@@ -1484,6 +1485,41 @@ pub(crate) async fn execute_simple_select(
             .await?;
         let collected: Vec<Result<RecordBatch>> = stream.collect().await;
         collected.into_iter().collect::<Result<Vec<_>>>()?
+    };
+
+    // Merge-on-read tombstone suppression for the DELETE hot-tier fast path.
+    //
+    // `dml_mutate::exec_delete` can shortcut a DELETE by writing
+    // `MemRowValue::Tombstone` entries into the process-wide
+    // `MemTableRegistry` and skipping the cold-tier copy-on-write rewrite.
+    // The cold-tier file we just read above therefore may still carry rows
+    // whose PK has been tombstoned by a more recent fast-path DELETE. Drop
+    // those rows here, mirroring the `TombstoneFilterExec` wrap that
+    // `session::wrap_with_tombstone_filter` installs on the DataFusion path.
+    //
+    // Happy path: `snapshot_tombstones` returns an empty set (the common case
+    // for tables that have not been touched by a fast-path DELETE), so the
+    // helper is a noop and the batches pass through unchanged.
+    let batches = if meta.pk_columns.len() == 1 {
+        let pk_col = &meta.pk_columns[0];
+        let tombs = crate::hot_tombstone::snapshot_tombstones(
+            sess.engine.memtable_registry().as_ref(),
+            &sess.project,
+            &plan.table,
+        );
+        if tombs.is_empty() {
+            batches
+        } else if let Ok(pk_idx) = meta.schema.index_of(pk_col) {
+            let pk_dt = meta.schema.field(pk_idx).data_type().clone();
+            crate::hot_tombstone::apply_tombstone_filter_to_batches(
+                batches, &tombs, pk_col, &pk_dt,
+            )
+            .map_err(|e| BasinError::internal(format!("tombstone filter: {e}")))?
+        } else {
+            batches
+        }
+    } else {
+        batches
     };
 
     // Apply post-read IS NULL filters. `Predicate` has no `IsNull` variant so
