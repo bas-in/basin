@@ -158,10 +158,8 @@ fn run_cmd_with_stdin(program: &str, args: &[&str], stdin_data: &[u8]) -> String
 ///
 /// Slice: "Basin→Basin round-trip".
 ///
-/// Closes when: 5.22.B lands and `basin-cli dump`/`restore` are implemented.
-/// At that point drop this `#[ignore]` and re-run
-/// `cargo test --test pg_dump_harness` to confirm green.
-#[ignore = "5.22.A harness — basin-cli dump/restore + cross-PG migration pending; closes 5.22.B-E"]
+/// Closed by: 5938e5f (5.22.B/C dump emitter) + 29515a9 (5.22.D dump REST
+/// endpoint); `basin-cli dump`/`restore` are now implemented.
 #[test]
 fn pg_dump_basin_to_basin_round_trip() {
     // Slice: "Basin→Basin round-trip"
@@ -346,9 +344,8 @@ fn pg_dump_basin_to_basin_round_trip() {
 ///
 /// Slice: "pg_restore compat".
 ///
-/// Closes when: 5.22.C lands and `basin-cli dump --format=custom` emits a
-/// pg_restore-compatible archive. At that point drop this `#[ignore]`.
-#[ignore = "5.22.A harness — basin-cli dump/restore + cross-PG migration pending; closes 5.22.B-E"]
+/// Closed by: 5938e5f (5.22.C `basin-cli dump --format=custom` emits a
+/// pg_restore-compatible archive) + 29515a9 (dump REST endpoint).
 #[test]
 fn pg_dump_basin_to_real_pg_via_pg_restore() {
     // Slice: "pg_restore compat"
@@ -514,10 +511,8 @@ fn pg_dump_basin_to_real_pg_via_pg_restore() {
 ///
 /// Slice: "real-PG→Basin migration".
 ///
-/// Closes when: 5.22.D lands and Basin's restore path can ingest pg_dump
-/// plain-text output including ENUMs, CHECK constraints, and partial indexes.
-/// At that point drop this `#[ignore]`.
-#[ignore = "5.22.A harness — basin-cli dump/restore + cross-PG migration pending; closes 5.22.B-E"]
+/// Closed by: 5938e5f + 29515a9 (5.22.B–D restore path can ingest pg_dump
+/// plain-text output including ENUMs, CHECK constraints, and partial indexes).
 #[test]
 fn pg_dump_real_pg_to_basin_migration() {
     // Slice: "real-PG→Basin migration"
@@ -716,8 +711,7 @@ fn pg_dump_real_pg_to_basin_migration() {
 ///
 /// Slice: "ORM-load post-restore".
 ///
-/// Closes when: 5.22.E lands. At that point drop this `#[ignore]`.
-#[ignore = "5.22.A harness — basin-cli dump/restore + cross-PG migration pending; closes 5.22.B-E"]
+/// Closed by: 5938e5f + 29515a9 (5.22.B–E dump/restore + REST endpoint).
 #[test]
 fn pg_dump_orm_load_post_restore() {
     // Slice: "ORM-load post-restore"

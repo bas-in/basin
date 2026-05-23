@@ -733,8 +733,8 @@ async fn cdc_publication_ddl() {
 /// Env-gated: requires `BASIN_CDC_DEBEZIUM_URL` and `BASIN_LOCAL_PG_URL`.
 /// Skips cleanly when either is absent. HTTP calls use `curl`.
 ///
-/// Closed by: 5.21.F (logical replication stream + Debezium connector compat).
-#[ignore = "5.21.A harness — logical CDC/pgoutput pending; closes 5.21.B-G"]
+/// Closed by: dae9eb3 (Phase 5.21 B–E — logical CDC / pgoutput replication
+/// slots; Debezium connector compat).
 #[tokio::test]
 async fn cdc_debezium_e2e() {
     // Slice: "Debezium e2e"
@@ -939,8 +939,8 @@ async fn cdc_debezium_e2e() {
 /// Env-gated: requires `BASIN_CDC_FIVETRAN_URL` and `BASIN_LOCAL_PG_URL`.
 /// Skips cleanly when either is absent. HTTP calls use `curl`.
 ///
-/// Closed by: 5.21.G (logical replication stream + Fivetran connector compat).
-#[ignore = "5.21.A harness — logical CDC/pgoutput pending; closes 5.21.B-G"]
+/// Closed by: dae9eb3 (Phase 5.21 B–E — logical CDC / pgoutput replication
+/// slots; Fivetran connector compat).
 #[tokio::test]
 async fn cdc_fivetran_e2e() {
     // Slice: "Fivetran e2e"

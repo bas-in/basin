@@ -263,11 +263,14 @@ async fn prepared_statement_does_not_survive_pool_return() {
 /// A LISTEN subscription must be cancelled (UNLISTEN) when the session is
 /// returned to the pool.
 ///
-/// **`#[ignore]`** — LISTEN routing through `ProjectSession::execute` is
-/// unconfirmed; may go through the realtime channel subsystem instead.
-/// Flips green at Phase 5.27.E.
+/// **`#[ignore]`** — LISTEN through `ProjectSession::execute` still returns
+/// `FeatureNotSupported` (SQLSTATE 0A000) as of 5.27.E. Until the SQL-level
+/// LISTEN path is wired into the realtime channel substrate (and the pool
+/// reset emits `UNLISTEN *`), this test cannot exercise the leakage scenario.
 #[tokio::test]
-#[ignore = "LISTEN routing through ProjectSession::execute unconfirmed; flips green at Phase 5.27.E"]
+#[ignore = "LISTEN via ProjectSession::execute returns FeatureNotSupported (SQLSTATE 0A000); \
+    SQL-level LISTEN/UNLISTEN is not yet wired to the realtime channel substrate so the pool \
+    has nothing to scrub; closes when LISTEN routing lands"]
 async fn listen_subscription_does_not_survive_pool_return() {
     let dir = TempDir::new().unwrap();
     let engine = build_engine(&dir);
@@ -311,10 +314,9 @@ async fn listen_subscription_does_not_survive_pool_return() {
 /// An advisory lock taken in one checkout must be released when the session
 /// returns to the pool.
 ///
-/// **`#[ignore]`** — `pg_advisory_lock` is a stub in Basin today.
-/// Flips green when Phase 5.27.E lands AND advisory locks are implemented.
+/// Closed by: 01a53f6 (advisory-lock blocking manager, ADR 0026) — Phase
+/// 5.27.E pool reset now calls `pg_advisory_unlock_all()` on session return.
 #[tokio::test]
-#[ignore = "pg_advisory_lock is a stub; flips green when advisory locks are implemented + Phase 5.27.E"]
 async fn advisory_lock_does_not_survive_pool_return() {
     let dir = TempDir::new().unwrap();
     let engine = build_engine(&dir);

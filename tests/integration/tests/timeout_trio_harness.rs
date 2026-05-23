@@ -142,11 +142,15 @@ async fn connect(addr: SocketAddr) -> tokio_postgres::Client {
 /// sets `lock_timeout = '100ms'` and attempts the same row lock — the engine
 /// must return SQLSTATE `55P03` (lock_not_available) within ~200 ms.
 ///
-/// Closed by: 5.28.B (`lock_timeout` GUC + per-lock enforcement).
-#[ignore = "5.28.B — requires real cross-session row-lock contention; Basin does not yet \
-    track SQL-level row locks between sessions so client_b's UPDATE either succeeds \
-    (no isolation) or sees a write-write conflict at the storage layer, neither of \
-    which produces SQLSTATE 55P03; closes when per-lock acquisition tracking lands"]
+/// Partially closed by: 01a53f6 (advisory-lock blocking manager +
+/// lock_timeout 55P03, ADR 0026) — `pg_advisory_lock` paths now honour
+/// `lock_timeout` and return 55P03. SQL-level UPDATE row-lock contention is
+/// still NOT routed through that manager, so client_b's UPDATE on a row
+/// already locked by client_a returns `Ok` instead of 55P03.
+#[ignore = "5.28.B partial — advisory locks honour lock_timeout/55P03 (01a53f6) but UPDATE \
+    row-lock contention is not yet routed through the blocking manager; client_b's UPDATE \
+    succeeds in ~13ms instead of returning SQLSTATE 55P03; closes when SQL DML row-locks \
+    integrate with the advisory-lock manager"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lock_timeout_fires_and_returns_55P03() {
     // Slice: "lock_timeout fires"
@@ -357,14 +361,8 @@ async fn idle_in_transaction_session_timeout_closes_session() {
 /// Sets `statement_timeout = '100ms'` via SQL and runs `SELECT pg_sleep(1)`.
 /// The executor must cancel the query and return SQLSTATE `57014`.
 ///
-/// Currently `#[ignore]`-d because SQL-level `SET statement_timeout` is not yet
-/// wired to the executor timeout path, and `pg_sleep` is not registered.
-/// Drop the `#[ignore]` once both prerequisites land (within 5.28.B scope).
-#[ignore = "5.28.B — pg_sleep is registered but DataFusion invokes it synchronously (block_in_place); \
-    the outer tokio::time::timeout wrapping df.collect() cannot preempt an in-progress sync UDF call, \
-    so SELECT pg_sleep(1) still runs to completion instead of timing out at 100ms; \
-    closes when DataFusion gains async-UDF support or a per-statement cancellation token is threaded \
-    through the executor to interrupt blocking UDF polls"]
+/// Closed by: 7e09c07 (pg_sleep async-yield) — pg_sleep now yields cooperatively
+/// so the executor timeout wrapper can preempt the in-flight UDF call.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn statement_timeout_already_works_per_6_P0_A() {
     // Slice: "statement_timeout (already shipped 6.P0.A — assert it stays)"
@@ -489,11 +487,8 @@ async fn statement_timeout_already_works_per_6_P0_A() {
 /// asserts a clean exit (exit code 0). Requires `BASIN_TOOLING_COMPAT_TEST=1`
 /// and `psql` in PATH; the test is skipped if either is absent.
 ///
-/// Closed by: 5.28.D (GUC surface for `SHOW lock_timeout` + SET round-trip).
-#[ignore = "5.28.D — tooling compat requires SHOW lock_timeout / current_setting('lock_timeout') \
-    to return a PG-shaped value ('0' default); SET lock_timeout now stores the value but the SHOW \
-    path returns an error rather than the expected string; also needs psql in PATH and \
-    BASIN_TOOLING_COMPAT_TEST=1 env var set; closes when GUC SHOW surface for lock_timeout lands"]
+/// Closed by: 6aa8b93 (5.28.B/C/D — lock_timeout, idle_in_transaction reaper,
+/// GUC tooling surface for SHOW lock_timeout + SET round-trip).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tooling_psql_dbeaver_pgcli_compat() {
     // Slice: "tooling compat"

@@ -398,9 +398,16 @@ async fn jsonb_diff_1m_row_seed() {
 /// Measurement uses `std::time::Instant`. The ≥ 10× bar matches the TASK.md
 /// 5.19.A specification (p99 ≤ 5 ms indexed vs ≥ 200 ms full-scan).
 ///
-/// Closes when: 5.19.C lands and the engine planner uses the GIN index for
-/// `@>` containment probes. At that point drop this `#[ignore]`.
-#[ignore = "5.19.A harness — engine GIN-equivalent pending; closes when 5.19.B/C/D/E land"]
+/// Partial: 4628acc (5.19.B GIN DDL + opclass) + 85d156a (5.19.C GIN-probe
+/// FileCandidates wired into physical scan) + 9ac7afb (5.19.D/E JSONB GIN
+/// key/path probe + index maintenance) all shipped, but on a 250k-row table
+/// the indexed `@>` path runs at ~0.9× the full-scan time (≪ the required
+/// ≥10×). The probe surfaces the right rows but is not yet effective at
+/// prune-time scale; closes when GIN-probe pruning actually reduces the
+/// scanned row set.
+#[ignore = "5.19 perf gate — GIN DDL/probe code shipped (4628acc, 85d156a, 9ac7afb) but the \
+    indexed @> path runs at ~0.9× full-scan on 250k rows (need ≥10×); probe is wired but not \
+    effective at prune-time; closes when GIN-probe pruning reduces the scanned row set"]
 #[tokio::test]
 async fn jsonb_index_perf_gate() {
     // Slice: "perf gate ≥10×"
