@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use arrow_array::builder::{
     BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, Float32Builder, Float64Builder,
-    Int16Builder, Int32Builder, Int64Builder, LargeBinaryBuilder, StringBuilder,
+    Int16Builder, Int32Builder, Int64Builder, LargeBinaryBuilder, ListBuilder, StringBuilder,
     TimestampMicrosecondBuilder,
 };
 use arrow_array::types::Float32Type;
@@ -23,7 +23,9 @@ use basin_catalog::PartitionSpec;
 use basin_common::{BasinError, PartitionKey, Result};
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use sqlparser::ast::ValueWithSpan;
-use sqlparser::ast::{DataType as SqlDataType, Expr, FunctionArguments, UnaryOperator, Value};
+use sqlparser::ast::{
+    DataType as SqlDataType, Expr, FunctionArguments, TypedString, UnaryOperator, Value,
+};
 
 use crate::types::{
     bit_fixed_len, field_is_bit, field_is_cidr, field_is_inet, field_is_jsonb, field_is_macaddr,
@@ -451,6 +453,20 @@ pub(crate) fn batch_from_rows(schema: Arc<Schema>, rows: &[Vec<Expr>]) -> Result
                     })?;
                 Arc::new(arr)
             }
+            // PG array columns (`TEXT[]`, `INT[]`, `BIGINT[]`, `BOOLEAN[]`,
+            // `DOUBLE PRECISION[]`) → Arrow `List<element_type>`. CREATE TABLE
+            // already lowers the PG syntax in `types::arrow_data_type`; here we
+            // build the per-row `ListArray` from `ARRAY[...]` literals (parsed
+            // by sqlparser as `Expr::Array { elem: Vec<Expr> }`), reusing the
+            // existing per-row scalar coercers for element values. The cell
+            // expression may also be `NULL` (whole-row null) or a `'{...}'`
+            // PG text-array literal — those two surface forms are not handled
+            // yet and are left for follow-up. Nested-list element types and
+            // less common element types (JSONB, TIMESTAMPTZ, UUID, ...) are
+            // also out of scope for this pass.
+            DataType::List(child) => {
+                build_list_column(rows, col_idx, field, child)?
+            }
             other => {
                 return Err(BasinError::InvalidSchema(format!(
                     "unsupported Arrow column type for INSERT: {other:?}"
@@ -467,6 +483,175 @@ pub(crate) fn batch_from_rows(schema: Arc<Schema>, rows: &[Vec<Expr>]) -> Result
 
     RecordBatch::try_new(schema, columns)
         .map_err(|e| BasinError::internal(format!("RecordBatch build: {e}")))
+}
+
+/// Build an Arrow `ListArray` column from `ARRAY[...]` literal cells.
+///
+/// Element-type dispatch covers the PG array variants most users actually
+/// declare in DDL today: `TEXT[]`, `INT[]` / `INTEGER[]` / `INT4[]`,
+/// `BIGINT[]` / `INT8[]`, `DOUBLE PRECISION[]` / `FLOAT8[]`, and `BOOLEAN[]`.
+/// Anything else falls through to an explicit "unsupported element type"
+/// error so the user sees which column tripped the check.
+///
+/// Per-cell shape:
+/// * `Expr::Array { elem }` → emit a non-null list with `elem.len()`
+///   per-element values (`NULL` elements become null slots in the child).
+/// * `Expr::Value(Null)` → emit a null list (whole row is null for this col).
+///   Honours the column's `NOT NULL` flag via `check_null_allowed`.
+fn build_list_column(
+    rows: &[Vec<Expr>],
+    col_idx: usize,
+    field: &arrow_schema::Field,
+    child: &Arc<arrow_schema::Field>,
+) -> Result<ArrayRef> {
+    /// Strip leading `Expr::Cast { expr: inner, .. }` wrappers so an
+    /// `ARRAY[...]::TEXT[]` literal still matches the `Expr::Array` arm.
+    fn unwrap_cast(expr: &Expr) -> &Expr {
+        let mut cur = expr;
+        while let Expr::Cast { expr: inner, .. } = cur {
+            cur = inner.as_ref();
+        }
+        cur
+    }
+
+    /// Try to extract the per-row array literal. Returns:
+    /// * `Ok(Some(&[...]))` — `ARRAY[e1, e2, ...]` literal.
+    /// * `Ok(None)` — `NULL` literal (whole-row null).
+    /// * `Err(...)` — anything else (we only support literals here).
+    fn extract_array<'a>(expr: &'a Expr, col: &str) -> Result<Option<&'a [Expr]>> {
+        match unwrap_cast(expr) {
+            Expr::Array(a) => Ok(Some(a.elem.as_slice())),
+            Expr::Value(ValueWithSpan {
+                value: Value::Null, ..
+            }) => Ok(None),
+            other => Err(BasinError::InvalidSchema(format!(
+                "expected ARRAY[...] literal or NULL for array column {col}, got {other}"
+            ))),
+        }
+    }
+
+    let col_name = field.name();
+    let arr: ArrayRef = match child.data_type() {
+        DataType::Utf8 => {
+            let mut b = ListBuilder::new(StringBuilder::new()).with_field(child.clone());
+            for row in rows {
+                match extract_array(&row[col_idx], col_name)? {
+                    Some(elems) => {
+                        for e in elems {
+                            match coerce_string_ref(e)? {
+                                Some(s) => b.values().append_value(s),
+                                None => b.values().append_null(),
+                            }
+                        }
+                        b.append(true);
+                    }
+                    None => {
+                        check_null_allowed(field)?;
+                        b.append(false);
+                    }
+                }
+            }
+            Arc::new(b.finish())
+        }
+        DataType::Int64 => {
+            let mut b = ListBuilder::new(Int64Builder::new()).with_field(child.clone());
+            for row in rows {
+                match extract_array(&row[col_idx], col_name)? {
+                    Some(elems) => {
+                        for e in elems {
+                            match coerce_i64(e)? {
+                                Some(v) => b.values().append_value(v),
+                                None => b.values().append_null(),
+                            }
+                        }
+                        b.append(true);
+                    }
+                    None => {
+                        check_null_allowed(field)?;
+                        b.append(false);
+                    }
+                }
+            }
+            Arc::new(b.finish())
+        }
+        DataType::Int32 => {
+            let mut b = ListBuilder::new(Int32Builder::new()).with_field(child.clone());
+            for row in rows {
+                match extract_array(&row[col_idx], col_name)? {
+                    Some(elems) => {
+                        for e in elems {
+                            match coerce_i64(e)? {
+                                Some(v) => {
+                                    let v32 = i32::try_from(v).map_err(|_| {
+                                        BasinError::InvalidSchema(format!(
+                                            "integer out of range for INT4 element of {col_name}: {v}"
+                                        ))
+                                    })?;
+                                    b.values().append_value(v32);
+                                }
+                                None => b.values().append_null(),
+                            }
+                        }
+                        b.append(true);
+                    }
+                    None => {
+                        check_null_allowed(field)?;
+                        b.append(false);
+                    }
+                }
+            }
+            Arc::new(b.finish())
+        }
+        DataType::Float64 => {
+            let mut b = ListBuilder::new(Float64Builder::new()).with_field(child.clone());
+            for row in rows {
+                match extract_array(&row[col_idx], col_name)? {
+                    Some(elems) => {
+                        for e in elems {
+                            match coerce_f64(e)? {
+                                Some(v) => b.values().append_value(v),
+                                None => b.values().append_null(),
+                            }
+                        }
+                        b.append(true);
+                    }
+                    None => {
+                        check_null_allowed(field)?;
+                        b.append(false);
+                    }
+                }
+            }
+            Arc::new(b.finish())
+        }
+        DataType::Boolean => {
+            let mut b = ListBuilder::new(BooleanBuilder::new()).with_field(child.clone());
+            for row in rows {
+                match extract_array(&row[col_idx], col_name)? {
+                    Some(elems) => {
+                        for e in elems {
+                            match coerce_bool(e)? {
+                                Some(v) => b.values().append_value(v),
+                                None => b.values().append_null(),
+                            }
+                        }
+                        b.append(true);
+                    }
+                    None => {
+                        check_null_allowed(field)?;
+                        b.append(false);
+                    }
+                }
+            }
+            Arc::new(b.finish())
+        }
+        other => {
+            return Err(BasinError::InvalidSchema(format!(
+                "unsupported array element type for INSERT into column {col_name}: {other:?} \
+                 (supported: TEXT[], INT[], BIGINT[], DOUBLE PRECISION[], BOOLEAN[])"
+            )));
+        }
+    };
+    Ok(arr)
 }
 
 /// If `field` declares a `VARCHAR(n)` / `CHAR(n)` limit, validate every
@@ -1683,6 +1868,37 @@ fn coerce_timestamp_micros(expr: &Expr) -> Result<Option<i64>> {
         Expr::Value(ValueWithSpan {
             value: Value::Null, ..
         }) => return Ok(None),
+        // SQL-standard typed-string literals: `TIMESTAMP '…'`,
+        // `TIMESTAMPTZ '…'`, `TIMESTAMP WITH TIME ZONE '…'`, `DATE '…'`.
+        // sqlparser surfaces these as `Expr::TypedString(TypedString { … })`
+        // rather than `Expr::Cast`, so the existing cast-peel above misses
+        // them. We accept the same TZ-bearing/naive/ISO string forms here as
+        // `parse_timestamp_string` already handles for the cast path; a bare
+        // `DATE 'YYYY-MM-DD'` decodes as midnight-UTC because every column
+        // we land into is TIMESTAMPTZ.
+        Expr::TypedString(TypedString {
+            data_type,
+            value: ValueWithSpan { value: v, .. },
+            ..
+        }) if matches!(
+            data_type,
+            SqlDataType::Timestamp(_, _) | SqlDataType::Date
+        ) =>
+        {
+            let s: &str = match v {
+                Value::SingleQuotedString(s)
+                | Value::DoubleQuotedString(s)
+                | Value::EscapedStringLiteral(s)
+                | Value::NationalStringLiteral(s) => s,
+                Value::Null => return Ok(None),
+                other => {
+                    return Err(BasinError::InvalidSchema(format!(
+                        "expected string-valued typed literal, got {data_type} {other:?}"
+                    )));
+                }
+            };
+            return parse_timestamp_string(s).map(Some);
+        }
         _ => expr,
     };
     match inner {
