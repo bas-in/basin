@@ -346,7 +346,7 @@ naming doesn't get bike-shed-revisited mid-Phase-X.
 - [x] ~~`cmd_realtime.go` — blocked on engine pub/sub~~ **UNBLOCKED 2026-05-20** — engine shipped realtime (basin 5.11.R1–R7). Promoted to **Tier 26**.
 - [ ] `cmd_functions.go` — `deploy/serve` for edge functions. Blocked on cloud Phase 8 (V8). NOTE: `rpc <fn>` *invoke* is unblocked (5.11.L) → **Tier 26**.
 - [x] ~~`cmd_storage_buckets.go` — `list/create/upload/download` for object storage~~ **PORTED 2026-05-20** — `basin storage` command ships `buckets list/create/delete`, `upload`, `download`, `list`, `rm`, `sign` against engine 5.17 routes (`/storage/v1/object/*`, `/storage/v1/bucket/*`). 31 new tests.
-- [ ] `cmd_tx.go` — interactive `begin/commit/rollback`. Engine single-shard transactions **shipped** (BEGIN/COMMIT/ROLLBACK + SAVEPOINT); only the interactive REPL-session scaffolding remains.
+- [x] `commands/tx.rs` — interactive `BEGIN/COMMIT/ROLLBACK/SAVEPOINT` REPL (`b36154d`). `basin tx --project=<ref>` opens a `tokio_postgres` connection seeded from `/v1/projects/<ref>/pgwire/reveal`; rustyline-backed line editor; multi-line SQL terminated by `;`; meta-commands `\q`/`\quit`/`\exit`/`\h`. 14 inline tests against the pure helpers (meta_command / is_terminated / accumulate_sql). Build delta ~30s, binary +15%. CLI test total now 1321.
 - [ ] `cmd_restore_pitr.go` — `restore --as-of=<timestamp>`. Blocked on engine PITR cross-DML physical-GC (catalog-level rollback shipped; GC is v0.2).
 
 ---
