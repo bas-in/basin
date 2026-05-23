@@ -19,6 +19,29 @@
 #
 # Source it (`. _setup.sh`) to inherit the env exports + the EXIT trap, or
 # run it standalone to just prime the build + service. run_all.sh sources it.
+#
+# ----------------------------------------------------------------------------
+# Bench profile model (investigation #97)
+# ----------------------------------------------------------------------------
+# Three test-config TOMLs cover the realism / cost spectrum:
+#
+#   .basin-test.toml                  — pure LocalFS  (~0 ms/op,  fastest CI gate)
+#   .basin-test.seaweedfs.toml        — SeaweedFS LB  (~1 ms/op,  structural-bug detector)
+#   .basin-test.tigris-realistic.toml — LB + 9 ms     (~10 ms/op, Tigris same-region proxy)
+#
+# The tigris-realistic profile uses the SAME SeaweedFS gateway this script
+# already launches; the only difference is `[latency_inject]` in its TOML,
+# which makes `BasinTestConfig::build_object_store` wrap the store in
+# `basin_storage::LatencyStore`. Per-op delay (9 ms) + loopback (~1 ms) ≈
+# the empirical Fly-machine-to-Tigris same-region p50 (5–15 ms).
+#
+# Switch via BASIN_TEST_CONFIG (or SEAWEED_TEST_CONFIG below):
+#
+#   BASIN_TEST_CONFIG=./.basin-test.tigris-realistic.toml \
+#     cargo test -p basin-integration-tests --test <bench> -- --ignored --nocapture
+#
+# Loopback SeaweedFS stays as the default `SEAWEED_TEST_CONFIG` because it's
+# the cheapest harness; flip the env var to run the realistic-cost sweep.
 
 set -euo pipefail
 

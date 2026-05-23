@@ -1013,6 +1013,7 @@ mod executor;
 mod explain;
 mod fast_aggregate;
 mod fast_select;
+mod hot_tombstone;
 mod fts_udf;
 mod is_distinct_rewrite;
 mod function_ddl;
@@ -1045,6 +1046,7 @@ mod query_history;
 pub mod query_shape;
 pub mod query_stats;
 pub mod query_stats_export;
+// pub mod project_usage_view; // orphaned after working-tree reset; restore when module file exists
 mod procedure_ddl;
 mod range_udf;
 pub mod reactor_ddl;
