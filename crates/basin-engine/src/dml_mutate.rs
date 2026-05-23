@@ -3172,6 +3172,56 @@ fn projected_returning_schema(schema: &Schema, items: &[SelectItem]) -> Schema {
     Schema::new(fields)
 }
 
+/// Strip `"public"."t"."col"` / `"t"."col"` table-and-schema qualifiers
+/// down to bare `"col"` in a RETURNING `SelectItem`.
+///
+/// The captured DML output batch is registered under `__basin_returning_src`,
+/// not the user's table name. Without this rewrite a Prisma RETURNING shape
+/// like `RETURNING "public"."User"."id"` would hit DataFusion as a column
+/// reference qualified by `public.User`, which doesn't exist in the
+/// `__basin_returning_src` table.
+///
+/// Scope: only the column-reference shape produced by ORMs is rewritten.
+/// More complex expressions (function calls, arithmetic) pass through
+/// unchanged so any DataFusion-valid expression keeps working. If those
+/// inner expressions ever embed qualified column refs, we extend this
+/// helper rather than auto-walking — keeping it AST-shallow keeps the
+/// surface narrow and avoids accidentally rewriting an inner JOIN
+/// reference some future RETURNING shape might need.
+fn strip_table_qualifier_in_returning_item(item: SelectItem) -> SelectItem {
+    use sqlparser::ast::SelectItem as SI;
+    match item {
+        SI::UnnamedExpr(e) => SI::UnnamedExpr(strip_table_qualifier_in_expr(e)),
+        SI::ExprWithAlias { expr, alias } => SI::ExprWithAlias {
+            expr: strip_table_qualifier_in_expr(expr),
+            alias,
+        },
+        // `"public"."t".*` qualified wildcard collapses to plain `*` —
+        // the captured batch already contains exactly the table's columns.
+        SI::QualifiedWildcard(_, opts) => SI::Wildcard(opts),
+        other => other,
+    }
+}
+
+/// Walk a `SelectItem` expression's outer column references and strip
+/// 2-part / 3-part qualifiers. See `strip_table_qualifier_in_returning_item`
+/// for scope.
+fn strip_table_qualifier_in_expr(expr: Expr) -> Expr {
+    match expr {
+        Expr::CompoundIdentifier(parts) => match parts.as_slice() {
+            // `"t"."col"` → `"col"`
+            [_tbl, col] => Expr::Identifier(col.clone()),
+            // `"public"."t"."col"` → `"col"`
+            [_schema, _tbl, col] => Expr::Identifier(col.clone()),
+            // 4+ parts: not a shape any supported ORM emits — leave as-is
+            // so DataFusion produces its own error message.
+            _ => Expr::CompoundIdentifier(parts),
+        },
+        Expr::Nested(inner) => Expr::Nested(Box::new(strip_table_qualifier_in_expr(*inner))),
+        other => other,
+    }
+}
+
 /// Run the RETURNING projection over the captured input batches. Items
 /// are rendered back to SQL and pushed into one DataFusion SELECT, so
 /// any expression DataFusion understands (column refs, arithmetic,
@@ -3200,7 +3250,22 @@ async fn project_returning(
             .map_err(|e| BasinError::internal(format!("concat returning batches: {e}")))?
     };
     // Build the projection list as comma-separated SQL.
-    let projection = items
+    //
+    // RETURNING items may carry table / schema qualifiers from the
+    // original user SQL (e.g. Prisma emits
+    // `RETURNING "public"."User"."id", "public"."User"."name"`). The
+    // captured input batch is registered under `__basin_returning_src`,
+    // not the user's table name, so a verbatim render would fail with
+    // `No field named public.User.id` from DataFusion. Strip
+    // `"public"."t"."col"` / `"t"."col"` qualifiers down to `"col"`
+    // before rendering — the column names line up with the projected
+    // batch's schema, which carries bare column names.
+    let rewritten_items: Vec<SelectItem> = items
+        .iter()
+        .cloned()
+        .map(strip_table_qualifier_in_returning_item)
+        .collect();
+    let projection = rewritten_items
         .iter()
         .map(|it| it.to_string())
         .collect::<Vec<_>>()
