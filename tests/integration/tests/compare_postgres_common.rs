@@ -2,8 +2,15 @@
 //!
 //! Loaded via `#[path = "compare_postgres_common.rs"] mod common;` from
 //! each `compare_postgres[_<rows>][_parquet].rs` per-scale wrapper. There
-//! are six wrappers — {10k, 100k, 1M} × {Vortex, Parquet} — and they all
-//! call `run_full_compare(...)` here.
+//! are eight wrappers — {10k, 100k, 1M, 10M} × {Vortex, Parquet} — and
+//! they all call `run_full_compare(...)` here.
+//!
+//! Per-scale sample tuning: see `samples_for`. At 10k we run the full
+//! 5/7 samples per metric (matches the original bench); higher scales
+//! halve / quarter / single-shot to keep wall clock within budget. The
+//! heavy-write shapes (single-row UPDATE, bulk UPDATE, DELETE) are
+//! skipped at >1M — they extrapolate to >2h at 10M from the 1M timing.
+//! Skipped metrics emit NaN sentinels (dashboard renders `—`).
 //!
 //! Why a single helper instead of six copies of an 800-line file?
 //!
@@ -358,8 +365,8 @@ async fn pg_p50_explain(pg: &Client, sql_inner: &str, n: usize) -> Option<f64> {
 
 /// Per-scale tuning of the multi-row INSERT batch size. At 10k rows we want a
 /// single batch (warm cache fits the whole table), at 100k we pick 5k, at 1M
-/// we pick 10k — the latter two match the pre-refactor per-file constants so
-/// the timing comparison is apples-to-apples with the older cards.
+/// and 10M we pick 10k — the latter two match the pre-refactor per-file
+/// constants so the timing comparison is apples-to-apples with the older cards.
 fn insert_batch_for(rows: usize) -> usize {
     if rows <= 10_000 {
         rows.max(1)
@@ -368,6 +375,38 @@ fn insert_batch_for(rows: usize) -> usize {
     } else {
         10_000
     }
+}
+
+/// Per-scale sample count scaling factor.
+///
+/// At 10k we run the full sample count from the original suite (5 or 7);
+/// larger scales bleed wall-clock fast because each iteration touches more
+/// data, so we cut samples proportionally. We still want at least one sample
+/// at every scale — a representative p50 is the point, not tight percentiles.
+///
+///   10k  → full count   (5 or 7)
+///   100k → half          (≥ 2)
+///   1M   → quarter       (≥ 2)
+///   10M  → 1 sample      (single representative measurement)
+fn samples_for(rows: usize, full: usize) -> usize {
+    if rows <= 10_000 {
+        full
+    } else if rows <= 100_000 {
+        (full / 2).max(2)
+    } else if rows <= 1_000_000 {
+        (full / 4).max(2)
+    } else {
+        1
+    }
+}
+
+/// Whether the (expensive) bulk-UPDATE / single-row-UPDATE / DELETE shapes
+/// should be skipped entirely at this scale. At 10M rows the bulk UPDATE
+/// (rewrites ~1/3 of the table) extrapolates to >2 hours from the 1M timing
+/// (12 min), which would dominate the bench wall clock. We emit a NaN
+/// sentinel for the affected metrics instead (see `mk_skip` below).
+fn skip_heavy_writes(rows: usize) -> bool {
+    rows > 1_000_000
 }
 
 /// Postgres-side results for the original 14 SaaS+OLAP measurements (mirror
@@ -393,10 +432,16 @@ struct PgCoreResults {
 /// TEXT)` to capture engine time (excludes the network/protocol roundtrip
 /// that would otherwise dominate small queries). Extracted from
 /// `run_full_compare` for the same stack-budget reason as the Basin twin.
+///
+/// `rows` drives the per-scale sample count via `samples_for` so 10M doesn't
+/// drown in repeats of expensive shapes. Heavy-write shapes
+/// (bulk UPDATE, DELETE, single-row UPDATE) get NaN sentinels at scales above
+/// 1M — see `skip_heavy_writes`.
 #[allow(clippy::too_many_arguments)]
 async fn run_pg_core_suite(
     pg: &Client,
     schema: &str,
+    rows: usize,
     target_id: i64,
     range_lo_ts: i64,
     range_hi_ts: i64,
@@ -404,8 +449,11 @@ async fn run_pg_core_suite(
     olap_cutoff_ts: i64,
     delete_in_list: &str,
 ) -> PgCoreResults {
-    let mut point: Vec<f64> = Vec::with_capacity(7);
-    for _ in 0..7 {
+    let s7 = samples_for(rows, 7);
+    let s5 = samples_for(rows, 5);
+    let skip_heavy = skip_heavy_writes(rows);
+    let mut point: Vec<f64> = Vec::with_capacity(s7);
+    for _ in 0..s7 {
         let q = format!(
             "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT * FROM {schema}.events WHERE id = {target_id}"
         );
@@ -413,8 +461,8 @@ async fn run_pg_core_suite(
         if let Some(ms) = parse_pg_exec_time(&r) { point.push(ms); }
     }
 
-    let mut range: Vec<f64> = Vec::with_capacity(7);
-    for _ in 0..7 {
+    let mut range: Vec<f64> = Vec::with_capacity(s7);
+    for _ in 0..s7 {
         let q = format!(
             "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT * FROM {schema}.events \
              WHERE created_at BETWEEN to_timestamp({range_lo_ts}) AND to_timestamp({range_hi_ts})"
@@ -423,8 +471,8 @@ async fn run_pg_core_suite(
         if let Some(ms) = parse_pg_exec_time(&r) { range.push(ms); }
     }
 
-    let mut agg: Vec<f64> = Vec::with_capacity(7);
-    for _ in 0..7 {
+    let mut agg: Vec<f64> = Vec::with_capacity(s7);
+    for _ in 0..s7 {
         let q = format!(
             "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT user_id, COUNT(*), SUM(amount) \
              FROM {schema}.events GROUP BY user_id ORDER BY 2 DESC LIMIT 10"
@@ -433,8 +481,8 @@ async fn run_pg_core_suite(
         if let Some(ms) = parse_pg_exec_time(&r) { agg.push(ms); }
     }
 
-    let mut join: Vec<f64> = Vec::with_capacity(5);
-    for _ in 0..5 {
+    let mut join: Vec<f64> = Vec::with_capacity(s5);
+    for _ in 0..s5 {
         let q = format!(
             "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT u.email, COUNT(e.id) \
              FROM {schema}.users u JOIN {schema}.events e ON e.user_id = u.id \
@@ -444,8 +492,8 @@ async fn run_pg_core_suite(
         if let Some(ms) = parse_pg_exec_time(&r) { join.push(ms); }
     }
 
-    let mut ilike: Vec<f64> = Vec::with_capacity(5);
-    for _ in 0..5 {
+    let mut ilike: Vec<f64> = Vec::with_capacity(s5);
+    for _ in 0..s5 {
         let q = format!(
             "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT id, email FROM {schema}.users \
              WHERE email ILIKE '%@gmail.com'"
@@ -454,8 +502,8 @@ async fn run_pg_core_suite(
         if let Some(ms) = parse_pg_exec_time(&r) { ilike.push(ms); }
     }
 
-    let mut page: Vec<f64> = Vec::with_capacity(5);
-    for _ in 0..5 {
+    let mut page: Vec<f64> = Vec::with_capacity(s5);
+    for _ in 0..s5 {
         let q = format!(
             "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT id, amount, status, created_at \
              FROM {schema}.events ORDER BY created_at DESC LIMIT 50 OFFSET 100"
@@ -464,19 +512,30 @@ async fn run_pg_core_suite(
         if let Some(ms) = parse_pg_exec_time(&r) { page.push(ms); }
     }
 
-    let mut upd1: Vec<f64> = Vec::with_capacity(5);
-    for i in 0..5 {
-        let uid = i as i64;
-        let new_email = format!("rotated{i}@example.org");
-        let q = format!(
-            "EXPLAIN (ANALYZE, FORMAT TEXT) UPDATE {schema}.users \
-             SET email = '{new_email}' WHERE id = {uid}"
-        );
-        let r = pg.simple_query(&q).await.expect("explain upd1");
-        if let Some(ms) = parse_pg_exec_time(&r) { upd1.push(ms); }
-    }
+    // Heavy-write shapes: single-row UPDATE, bulk UPDATE, DELETE. At >1M
+    // rows the bulk UPDATE alone extrapolates to >2h, so we sentinel them
+    // out (NaN) instead. PG side could finish, but we drop both sides
+    // symmetrically so the dashboard ratio cell stays meaningful.
+    let upd1 = if skip_heavy {
+        Vec::new()
+    } else {
+        let mut v: Vec<f64> = Vec::with_capacity(s5);
+        for i in 0..s5 {
+            let uid = i as i64;
+            let new_email = format!("rotated{i}@example.org");
+            let q = format!(
+                "EXPLAIN (ANALYZE, FORMAT TEXT) UPDATE {schema}.users \
+                 SET email = '{new_email}' WHERE id = {uid}"
+            );
+            let r = pg.simple_query(&q).await.expect("explain upd1");
+            if let Some(ms) = parse_pg_exec_time(&r) { v.push(ms); }
+        }
+        v
+    };
 
-    let bulk_upd_ms: f64 = {
+    let bulk_upd_ms: f64 = if skip_heavy {
+        f64::NAN
+    } else {
         let started = Instant::now();
         pg.simple_query(&format!(
             "UPDATE {schema}.events SET status = 'expired' \
@@ -487,7 +546,9 @@ async fn run_pg_core_suite(
         started.elapsed().as_secs_f64() * 1000.0
     };
 
-    let delete_ms: f64 = {
+    let delete_ms: f64 = if skip_heavy {
+        f64::NAN
+    } else {
         let started = Instant::now();
         pg.simple_query(&format!(
             "DELETE FROM {schema}.events WHERE id IN ({delete_in_list})"
@@ -497,8 +558,8 @@ async fn run_pg_core_suite(
         started.elapsed().as_secs_f64() * 1000.0
     };
 
-    let mut count: Vec<f64> = Vec::with_capacity(5);
-    for _ in 0..5 {
+    let mut count: Vec<f64> = Vec::with_capacity(s5);
+    for _ in 0..s5 {
         let q = format!(
             "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT COUNT(*) FROM {schema}.events"
         );
@@ -506,8 +567,8 @@ async fn run_pg_core_suite(
         if let Some(ms) = parse_pg_exec_time(&r) { count.push(ms); }
     }
 
-    let mut trunc: Vec<f64> = Vec::with_capacity(5);
-    for _ in 0..5 {
+    let mut trunc: Vec<f64> = Vec::with_capacity(s5);
+    for _ in 0..s5 {
         let q = format!(
             "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT DATE_TRUNC('day', created_at) AS d, \
                     SUM(amount) FROM {schema}.events GROUP BY 1 ORDER BY 1"
@@ -516,8 +577,8 @@ async fn run_pg_core_suite(
         if let Some(ms) = parse_pg_exec_time(&r) { trunc.push(ms); }
     }
 
-    let mut olap_join: Vec<f64> = Vec::with_capacity(5);
-    for _ in 0..5 {
+    let mut olap_join: Vec<f64> = Vec::with_capacity(s5);
+    for _ in 0..s5 {
         let q = format!(
             "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT u.email, SUM(e.amount) \
              FROM {schema}.users u JOIN {schema}.events e ON e.user_id = u.id \
@@ -537,7 +598,7 @@ async fn run_pg_core_suite(
         join_p50: median(&join),
         ilike_p50: median(&ilike),
         page_p50: median(&page),
-        upd1_p50: median(&upd1),
+        upd1_p50: if upd1.is_empty() { f64::NAN } else { median(&upd1) },
         bulk_upd_ms,
         delete_ms,
         count_p50: median(&count),
@@ -570,9 +631,15 @@ struct BasinCoreResults {
 /// struct of p50/p99 results. Extracted from `run_full_compare` so the
 /// outer function's state machine doesn't accumulate ~14 separate `Vec<f64>`
 /// locals on the worker-thread stack.
+///
+/// `rows` drives per-scale sample counts and gates the heavy-write shapes
+/// (single-row UPDATE, bulk UPDATE, DELETE) above 1M — see `samples_for` /
+/// `skip_heavy_writes`. Skipped metrics are surfaced as NaN sentinels so the
+/// dashboard renders them as missing rather than as a fake 0.
 #[allow(clippy::too_many_arguments)]
 async fn run_basin_core_suite(
     sess: &basin_engine::ProjectSession,
+    rows: usize,
     target_id: i64,
     range_lo_ts: i64,
     range_hi_ts: i64,
@@ -580,14 +647,18 @@ async fn run_basin_core_suite(
     olap_cutoff_ts: i64,
     delete_in_list: &str,
 ) -> BasinCoreResults {
+    let s7 = samples_for(rows, 7);
+    let s5 = samples_for(rows, 5);
+    let skip_heavy = skip_heavy_writes(rows);
+
     // Warm-up: triggers any first-query plan caching so the p99 column
     // reflects steady-state latency rather than first-touch overhead.
     let _ = sess
         .execute(&format!("SELECT id FROM events WHERE id = {target_id}"))
         .await;
 
-    let mut point: Vec<f64> = Vec::with_capacity(7);
-    for _ in 0..7 {
+    let mut point: Vec<f64> = Vec::with_capacity(s7);
+    for _ in 0..s7 {
         point.push(
             basin_timed(
                 sess,
@@ -601,8 +672,8 @@ async fn run_basin_core_suite(
         );
     }
 
-    let mut range: Vec<f64> = Vec::with_capacity(7);
-    for _ in 0..7 {
+    let mut range: Vec<f64> = Vec::with_capacity(s7);
+    for _ in 0..s7 {
         range.push(
             basin_timed(
                 sess,
@@ -616,8 +687,8 @@ async fn run_basin_core_suite(
         );
     }
 
-    let mut agg: Vec<f64> = Vec::with_capacity(7);
-    for _ in 0..7 {
+    let mut agg: Vec<f64> = Vec::with_capacity(s7);
+    for _ in 0..s7 {
         agg.push(
             basin_timed(
                 sess,
@@ -629,8 +700,8 @@ async fn run_basin_core_suite(
         );
     }
 
-    let mut join: Vec<f64> = Vec::with_capacity(5);
-    for _ in 0..5 {
+    let mut join: Vec<f64> = Vec::with_capacity(s5);
+    for _ in 0..s5 {
         join.push(
             basin_timed(
                 sess,
@@ -643,8 +714,8 @@ async fn run_basin_core_suite(
         );
     }
 
-    let mut ilike: Vec<f64> = Vec::with_capacity(5);
-    for _ in 0..5 {
+    let mut ilike: Vec<f64> = Vec::with_capacity(s5);
+    for _ in 0..s5 {
         ilike.push(
             basin_timed(
                 sess,
@@ -655,8 +726,8 @@ async fn run_basin_core_suite(
         );
     }
 
-    let mut page: Vec<f64> = Vec::with_capacity(5);
-    for _ in 0..5 {
+    let mut page: Vec<f64> = Vec::with_capacity(s5);
+    for _ in 0..s5 {
         page.push(
             basin_timed(
                 sess,
@@ -668,17 +739,28 @@ async fn run_basin_core_suite(
         );
     }
 
-    let mut upd1: Vec<f64> = Vec::with_capacity(5);
-    for i in 0..5 {
-        let uid = i as i64;
-        let new_email = format!("rotated{i}@example.org");
-        let q = format!("UPDATE users SET email = '{new_email}' WHERE id = {uid}");
-        let started = Instant::now();
-        sess.execute(&q).await.expect("basin single-row update");
-        upd1.push(started.elapsed().as_secs_f64() * 1000.0);
-    }
+    // Heavy-write shapes: skipped at >1M to keep wall clock sane.
+    // At 1M Basin's bulk UPDATE already takes ~12 min (rewrites ~1/3 of
+    // the table) — 10M would be >2 hours. NaN sentinel surfaces in the
+    // dashboard as a missing cell rather than a misleading 0.
+    let upd1 = if skip_heavy {
+        Vec::new()
+    } else {
+        let mut v: Vec<f64> = Vec::with_capacity(s5);
+        for i in 0..s5 {
+            let uid = i as i64;
+            let new_email = format!("rotated{i}@example.org");
+            let q = format!("UPDATE users SET email = '{new_email}' WHERE id = {uid}");
+            let started = Instant::now();
+            sess.execute(&q).await.expect("basin single-row update");
+            v.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        v
+    };
 
-    let bulk_upd_ms: f64 = {
+    let bulk_upd_ms: f64 = if skip_heavy {
+        f64::NAN
+    } else {
         let started = Instant::now();
         sess.execute(&format!(
             "UPDATE events SET status = 'expired' WHERE created_at < {pagination_threshold}"
@@ -688,7 +770,9 @@ async fn run_basin_core_suite(
         started.elapsed().as_secs_f64() * 1000.0
     };
 
-    let delete_ms: f64 = {
+    let delete_ms: f64 = if skip_heavy {
+        f64::NAN
+    } else {
         let started = Instant::now();
         sess.execute(&format!(
             "DELETE FROM events WHERE id IN ({delete_in_list})"
@@ -698,8 +782,8 @@ async fn run_basin_core_suite(
         started.elapsed().as_secs_f64() * 1000.0
     };
 
-    let mut count: Vec<f64> = Vec::with_capacity(5);
-    for _ in 0..5 {
+    let mut count: Vec<f64> = Vec::with_capacity(s5);
+    for _ in 0..s5 {
         count.push(basin_timed(sess, "SELECT COUNT(*) FROM events", true).await);
     }
 
@@ -708,8 +792,8 @@ async fn run_basin_core_suite(
     // (v0.2 roadmap), so we bucket directly with integer division —
     // `created_at / 86400` = days since unix epoch — same group cardinality
     // and same scan cost as PG's `DATE_TRUNC('day', created_at)`.
-    let mut trunc: Vec<f64> = Vec::with_capacity(5);
-    for _ in 0..5 {
+    let mut trunc: Vec<f64> = Vec::with_capacity(s5);
+    for _ in 0..s5 {
         trunc.push(
             basin_timed(
                 sess,
@@ -721,8 +805,8 @@ async fn run_basin_core_suite(
         );
     }
 
-    let mut olap_join: Vec<f64> = Vec::with_capacity(5);
-    for _ in 0..5 {
+    let mut olap_join: Vec<f64> = Vec::with_capacity(s5);
+    for _ in 0..s5 {
         olap_join.push(
             basin_timed(
                 sess,
@@ -747,7 +831,7 @@ async fn run_basin_core_suite(
         join_p50: median(&join),
         ilike_p50: median(&ilike),
         page_p50: median(&page),
-        upd1_p50: median(&upd1),
+        upd1_p50: if upd1.is_empty() { f64::NAN } else { median(&upd1) },
         bulk_upd_ms,
         delete_ms,
         count_p50: median(&count),
@@ -793,19 +877,23 @@ async fn run_extended_suite(
     pg: &Client,
     sess: &basin_engine::ProjectSession,
     schema: &str,
+    rows: usize,
 ) -> ExtendedResults {
-    const EXT_SAMPLES: usize = 5;
+    // Extended-shape sample count tracks the core suite: 5 at 10k, halved
+    // at 100k, quartered at 1M, single-shot at 10M+ (see `samples_for`).
+    let ext_samples = samples_for(rows, 5);
 
     async fn pair(
         pg: &Client,
         sess: &basin_engine::ProjectSession,
         pg_sql: String,
         basin_sql: &str,
+        n: usize,
     ) -> (Option<f64>, f64) {
-        let p = pg_p50_explain(pg, &pg_sql, EXT_SAMPLES)
+        let p = pg_p50_explain(pg, &pg_sql, n)
             .await
             .unwrap_or(f64::INFINITY);
-        let b = basin_p50_try(sess, basin_sql, EXT_SAMPLES).await;
+        let b = basin_p50_try(sess, basin_sql, n).await;
         (b, p)
     }
 
@@ -814,6 +902,7 @@ async fn run_extended_suite(
         pg, sess,
         format!("SELECT COUNT(DISTINCT user_id) FROM {schema}.events"),
         "SELECT COUNT(DISTINCT user_id) FROM events",
+        ext_samples,
     ).await;
 
     // -- #17 LIKE prefix ----------------------------------------------------
@@ -821,6 +910,7 @@ async fn run_extended_suite(
         pg, sess,
         format!("SELECT id FROM {schema}.events WHERE status LIKE 'pending%' LIMIT 100"),
         "SELECT id FROM events WHERE status LIKE 'pending%' LIMIT 100",
+        ext_samples,
     ).await;
 
     // -- #18 Multi-col GROUP BY + HAVING + ORDER + LIMIT --------------------
@@ -832,6 +922,7 @@ async fn run_extended_suite(
         ),
         "SELECT user_id, status, COUNT(*) FROM events \
          GROUP BY 1, 2 HAVING COUNT(*) > 5 ORDER BY 3 DESC LIMIT 20",
+        ext_samples,
     ).await;
 
     // -- #19 Window LAG OVER (PARTITION BY ... ORDER BY ...) ----------------
@@ -843,6 +934,7 @@ async fn run_extended_suite(
         ),
         "SELECT id, amount, LAG(amount) OVER (PARTITION BY user_id ORDER BY created_at) \
          FROM events LIMIT 1000",
+        ext_samples,
     ).await;
 
     // -- #20 Recursive CTE (Fibonacci to n=30) ------------------------------
@@ -851,7 +943,7 @@ async fn run_extended_suite(
                      UNION ALL \
                      SELECT n+1, b, a+b FROM fib WHERE n < 30) \
                    SELECT n, a FROM fib";
-    let recursive_cte = pair(pg, sess, rec_cte.to_string(), rec_cte).await;
+    let recursive_cte = pair(pg, sess, rec_cte.to_string(), rec_cte, ext_samples).await;
 
     // -- #21 Correlated subquery in SELECT list -----------------------------
     let correlated_sub = pair(
@@ -863,6 +955,7 @@ async fn run_extended_suite(
         ),
         "SELECT u.email, (SELECT COUNT(*) FROM events e WHERE e.user_id = u.id) AS n_events \
          FROM users u LIMIT 100",
+        ext_samples,
     ).await;
 
     // -- #22 EXISTS in WHERE ------------------------------------------------
@@ -875,6 +968,7 @@ async fn run_extended_suite(
         ),
         "SELECT u.id FROM users u \
          WHERE EXISTS (SELECT 1 FROM events e WHERE e.user_id = u.id AND e.amount > 90)",
+        ext_samples,
     ).await;
 
     // -- #23 3-table JOIN (categories ⋈ events ⋈ users via BETWEEN) ---------
@@ -892,6 +986,7 @@ async fn run_extended_suite(
          JOIN events e ON e.amount BETWEEN c.min_amt AND c.max_amt \
          JOIN users u ON e.user_id = u.id \
          GROUP BY 1",
+        ext_samples,
     ).await;
 
     // -- #24 UNION ALL of two filtered scans --------------------------------
@@ -905,6 +1000,7 @@ async fn run_extended_suite(
         "SELECT id, 'paid' AS kind FROM events WHERE status = 'paid' \
          UNION ALL \
          SELECT id, 'pending' FROM events WHERE status = 'pending'",
+        ext_samples,
     ).await;
 
     // -- #25 ORDER BY NULLS LAST + LIMIT ------------------------------------
@@ -916,6 +1012,7 @@ async fn run_extended_suite(
         ),
         "SELECT id, last_login FROM users \
          ORDER BY last_login DESC NULLS LAST LIMIT 50",
+        ext_samples,
     ).await;
 
     // -- #26 Top-N per group (MAX) ------------------------------------------
@@ -927,6 +1024,7 @@ async fn run_extended_suite(
         ),
         "SELECT user_id, MAX(amount) FROM events \
          GROUP BY user_id ORDER BY 2 DESC LIMIT 10",
+        ext_samples,
     ).await;
 
     // -- #27 Numeric range filter on doubles --------------------------------
@@ -934,6 +1032,7 @@ async fn run_extended_suite(
         pg, sess,
         format!("SELECT COUNT(*) FROM {schema}.events WHERE amount BETWEEN 25.5 AND 75.5"),
         "SELECT COUNT(*) FROM events WHERE amount BETWEEN 25.5 AND 75.5",
+        ext_samples,
     ).await;
 
     ExtendedResults {
@@ -1228,6 +1327,7 @@ async fn run_full_compare_inner(
     let pg_core = run_pg_core_suite(
         &pg,
         &schema,
+        rows,
         target_id,
         range_lo_ts,
         range_hi_ts,
@@ -1359,6 +1459,7 @@ async fn run_full_compare_inner(
     // run_extended_suite — see BasinSaasOlapResults docs.
     let basin_core = run_basin_core_suite(
         &sess,
+        rows,
         target_id,
         range_lo_ts,
         range_hi_ts,
@@ -1388,7 +1489,7 @@ async fn run_full_compare_inner(
     // (a flat block here would balloon `run_full_compare` past tokio's
     // default 2 MiB worker-thread stack budget — see ExtendedResults).
     // =======================================================================
-    let ext = run_extended_suite(&pg, &sess, &schema).await;
+    let ext = run_extended_suite(&pg, &sess, &schema, rows).await;
 
     // ---- Cold-start first query -------------------------------------------
     let pg_cold_ms = {
@@ -1472,12 +1573,19 @@ async fn run_full_compare_inner(
         format!("{:.2}x", disk_ratio)
     );
     let row = |label: &str, b: f64, p: f64| {
-        println!(
-            "{label:>34} {:>14.3} {:>14.3} {:>16}",
-            b,
-            p,
-            format!("{:.2}x", p / b.max(1e-9))
-        );
+        if b.is_nan() || p.is_nan() {
+            println!(
+                "{label:>34} {:>14} {:>14} {:>16}",
+                "SKIP", "SKIP", "-"
+            );
+        } else {
+            println!(
+                "{label:>34} {:>14.3} {:>14.3} {:>16}",
+                b,
+                p,
+                format!("{:.2}x", p / b.max(1e-9))
+            );
+        }
     };
     row("point_query_p50_ms", basin_point_p50, pg_point_p50);
     row("point_query_p99_ms", basin_point_p99, pg_point_p99);
@@ -1527,7 +1635,22 @@ async fn run_full_compare_inner(
     // ---- Emit benchmark JSON ----------------------------------------------
     let basin_disk_f = basin_disk_bytes as f64;
     let pg_disk_f = pg_disk_bytes as f64;
+    // mk: emit a CompareMetric. NaN on either side means "scale-skipped"
+    // (heavy-write shapes above 1M — see `skip_heavy_writes`); we relabel
+    // with " (scale-skipped)" and leave both fields as NaN so serde emits
+    // null (dashboard renders as `—`). `which_wins` and the ratio text are
+    // both skipped — there's no meaningful comparison to draw.
     let mk = |label: &str, basin: f64, postgres: f64, unit: &str, with_ratio: bool| -> CompareMetric {
+        if basin.is_nan() || postgres.is_nan() {
+            return CompareMetric {
+                label: format!("{label} (scale-skipped)"),
+                basin: f64::NAN,
+                postgres: f64::NAN,
+                unit: unit.into(),
+                better: WhichWins::Tie,
+                ratio_text: Some("skipped: too expensive at this scale".into()),
+            };
+        }
         CompareMetric {
             label: label.into(),
             basin,
