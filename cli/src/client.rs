@@ -203,7 +203,16 @@ pub fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::as_api_error;
+    use crate::testutil::{Req, Resp, TestServer};
     use crate::types::QueryResult;
+    use serde::Deserialize;
+    use std::error::Error as StdError;
+
+    #[derive(Debug, Deserialize)]
+    struct TestPayload {
+        foo: String,
+    }
 
     #[test]
     fn unwraps_data_envelope() {
@@ -253,5 +262,102 @@ mod tests {
             "?a=1&b=2"
         );
         assert_eq!(query_string(&[("q", "a b")]), "?q=a+b");
+    }
+
+    // ── do_json: envelope unwrap / flat fallback / error mapping ────────────
+
+    #[test]
+    fn do_json_unwraps_data_envelope() {
+        let srv = TestServer::start(|_req: &Req| {
+            Resp::ok(r#"{"data":{"foo":"bar"},"error":null}"#)
+        });
+        let c = Client::new(&srv.url, "tok");
+        let out: TestPayload = c.do_json(Method::GET, "/v1/probe", None).unwrap();
+        assert_eq!(out.foo, "bar");
+    }
+
+    #[test]
+    fn do_json_flat_fallback() {
+        let srv = TestServer::start(|_req: &Req| Resp::ok(r#"{"foo":"baz"}"#));
+        let c = Client::new(&srv.url, "tok");
+        let out: TestPayload = c.do_json(Method::GET, "/v1/probe", None).unwrap();
+        assert_eq!(out.foo, "baz");
+    }
+
+    #[test]
+    fn do_json_maps_error_envelope() {
+        let srv = TestServer::start(|_req: &Req| {
+            Resp::status(409, r#"{"error":{"code":"conflict","message":"taken"}}"#)
+        });
+        let c = Client::new(&srv.url, "tok");
+        let err = c
+            .do_json::<TestPayload>(Method::POST, "/v1/probe", None)
+            .unwrap_err();
+        let ae = as_api_error(err.as_ref()).expect("ApiError downcast");
+        assert_eq!(ae.code, "conflict");
+        assert_eq!(ae.message, "taken");
+        assert_eq!(ae.http_status, 409);
+    }
+
+    // ── do_json_timeout: timeout fires ──────────────────────────────────────
+
+    #[test]
+    fn do_json_timeout_fires() {
+        // Stub sleeps 5s before responding; client's 200ms per-request
+        // timeout must trip before the server writes back.
+        let srv = TestServer::start(|_req: &Req| {
+            std::thread::sleep(Duration::from_secs(5));
+            Resp::ok(r#"{"foo":"late"}"#)
+        });
+        let c = Client::new(&srv.url, "tok");
+        let err = c
+            .do_json_timeout::<TestPayload>(
+                Method::GET,
+                "/v1/slow",
+                None,
+                Duration::from_millis(200),
+            )
+            .unwrap_err();
+        // reqwest's top-level message is "error sending request"; the
+        // timeout flavour lives on the source chain, so walk it.
+        let mut chain = String::new();
+        chain.push_str(&err.to_string());
+        let mut cur: Option<&(dyn StdError + 'static)> = err.source();
+        while let Some(s) = cur {
+            chain.push_str(" :: ");
+            chain.push_str(&s.to_string());
+            cur = s.source();
+        }
+        let chain = chain.to_lowercase();
+        assert!(
+            chain.contains("timeout")
+                || chain.contains("elapsed")
+                || chain.contains("timed out"),
+            "expected timeout-ish error, got chain: {chain}"
+        );
+    }
+
+    // ── do_noout: 2xx empty Ok / 5xx error mapping ──────────────────────────
+
+    #[test]
+    fn do_noout_2xx_empty_body_is_ok() {
+        let srv = TestServer::start(|_req: &Req| Resp::status(204, String::new()));
+        let c = Client::new(&srv.url, "tok");
+        c.do_noout(Method::DELETE, "/v1/thing/1", None).unwrap();
+    }
+
+    #[test]
+    fn do_noout_5xx_propagates_api_error() {
+        let srv = TestServer::start(|_req: &Req| {
+            Resp::status(500, r#"{"error":{"code":"internal","message":"boom"}}"#)
+        });
+        let c = Client::new(&srv.url, "tok");
+        let err = c
+            .do_noout(Method::POST, "/v1/thing", None)
+            .unwrap_err();
+        let ae = as_api_error(err.as_ref()).expect("ApiError downcast");
+        assert_eq!(ae.code, "internal");
+        assert_eq!(ae.message, "boom");
+        assert_eq!(ae.http_status, 500);
     }
 }
