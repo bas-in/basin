@@ -5380,10 +5380,10 @@ mod tests {
         use sqlparser::dialect::PostgreSqlDialect;
         use sqlparser::parser::Parser;
         let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).expect("parse UPDATE");
-        let Statement::Update { table, .. } = stmts.into_iter().next().unwrap() else {
+        let Statement::Update(upd) = stmts.into_iter().next().unwrap() else {
             panic!("expected UPDATE");
         };
-        match table.relation {
+        match upd.table.relation {
             TableFactor::Table { name, .. } => name,
             other => panic!("expected TableFactor::Table, got {other:?}"),
         }
