@@ -1604,22 +1604,9 @@ async fn run_full_compare_inner(
     ))
     .await
     .expect("pg create categories");
-    // Drop PKs so we measure heap-only performance (fair vs Basin substrate).
-    pg.simple_query(&format!(
-        "ALTER TABLE {schema}.users DROP CONSTRAINT users_pkey"
-    ))
-    .await
-    .expect("drop users pkey");
-    pg.simple_query(&format!(
-        "ALTER TABLE {schema}.events DROP CONSTRAINT events_pkey"
-    ))
-    .await
-    .expect("drop events pkey");
-    pg.simple_query(&format!(
-        "ALTER TABLE {schema}.categories DROP CONSTRAINT categories_pkey"
-    ))
-    .await
-    .expect("drop categories pkey");
+    // Keep PKs on both sides — real production tables declare PRIMARY KEY, and
+    // Basin now declares PK too (unlocks the DELETE-WHERE-id-IN fastpath gate
+    // at dml_mutate.rs:656, which requires meta.pk_columns.len() == 1).
 
     // ~10 events per user across all scales.
     let users: usize = (rows / 10).max(100);
@@ -1803,7 +1790,7 @@ async fn run_full_compare_inner(
     // down for why we don't use TIMESTAMPTZ here.
     sess.execute(&format!(
         "CREATE TABLE users (\
-            id BIGINT NOT NULL, \
+            id BIGINT NOT NULL PRIMARY KEY, \
             email TEXT NOT NULL, \
             created_at BIGINT NOT NULL, \
             last_login BIGINT){with_clause}"
@@ -1812,7 +1799,7 @@ async fn run_full_compare_inner(
     .unwrap();
     sess.execute(&format!(
         "CREATE TABLE events (\
-            id BIGINT NOT NULL, \
+            id BIGINT NOT NULL PRIMARY KEY, \
             user_id BIGINT NOT NULL, \
             amount DOUBLE PRECISION NOT NULL, \
             status TEXT NOT NULL, \
@@ -1823,7 +1810,7 @@ async fn run_full_compare_inner(
     .unwrap();
     sess.execute(&format!(
         "CREATE TABLE categories (\
-            id BIGINT NOT NULL, \
+            id BIGINT NOT NULL PRIMARY KEY, \
             name TEXT NOT NULL, \
             min_amt DOUBLE PRECISION NOT NULL, \
             max_amt DOUBLE PRECISION NOT NULL){with_clause}"
@@ -1974,7 +1961,7 @@ async fn run_full_compare_inner(
         cold_sess
             .execute(&format!(
                 "CREATE TABLE events (\
-                    id BIGINT NOT NULL, \
+                    id BIGINT NOT NULL PRIMARY KEY, \
                     user_id BIGINT NOT NULL, \
                     amount DOUBLE PRECISION NOT NULL, \
                     status TEXT NOT NULL, \
