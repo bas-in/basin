@@ -220,6 +220,27 @@ pub fn median(samples: &[f64]) -> f64 {
 }
 
 /// RAII safety-net that drops the schema even on panic.
+///
+/// The clean exit path calls `std::mem::forget(_guard)` at the end of
+/// `run_full_compare_inner`, so this `Drop` impl ONLY fires on a panic
+/// or early return. On panic the inner future is being torn down by
+/// `block_on` on a `current_thread` runtime; we deliberately spawn a
+/// short-lived OS thread with its OWN `current_thread` runtime to do
+/// the PG cleanup, because:
+///   1. `tokio::runtime::Handle::try_current()` from inside a
+///      `current_thread::block_on` returns the *outer* handle whose
+///      runtime is currently entered by another thread — calling
+///      `handle.block_on(...)` from a second thread would deadlock
+///      against the runner thread's `pthread_join` on us.
+///   2. A fresh `current_thread` runtime is allowed from a non-tokio
+///      thread (the OS thread we just spawned) and runs to completion
+///      independently of whatever state the panicking runtime is in.
+///
+/// We join the spawned thread with a tight wall-clock budget so a
+/// permanently-broken PG never wedges the test wrapper; if the join
+/// times out (PG hung / unreachable) we leak the orphan schema. The
+/// schema name is ULID-suffixed so leaked schemas don't collide; a
+/// nightly housekeeping query can sweep them.
 pub struct SchemaGuard {
     pub schema: String,
     pub conn_str: String,
@@ -227,22 +248,44 @@ pub struct SchemaGuard {
 
 impl Drop for SchemaGuard {
     fn drop(&mut self) {
-        let conn_str = self.conn_str.clone();
-        let schema = self.schema.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let _ = std::thread::spawn(move || {
-                handle.block_on(async move {
-                    if let Ok((client, conn)) = tokio_postgres::connect(&conn_str, NoTls).await {
-                        tokio::spawn(async move {
-                            let _ = conn.await;
-                        });
-                        let _ = client
-                            .simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-                            .await;
-                    }
-                });
-            })
-            .join();
+        let conn_str = std::mem::take(&mut self.conn_str);
+        let schema = std::mem::take(&mut self.schema);
+        let handle = std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(_) => return,
+            };
+            rt.block_on(async move {
+                if let Ok((client, conn)) = tokio_postgres::connect(&conn_str, NoTls).await {
+                    tokio::spawn(async move {
+                        let _ = conn.await;
+                    });
+                    let _ = client
+                        .simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+                        .await;
+                }
+            });
+        });
+        // Wall-clock-bounded join. Background-poll the join result so a
+        // wedged PG cleanup never hangs the test binary forever. 5s is
+        // plenty for a local PG DROP SCHEMA CASCADE (typically <100 ms);
+        // if it overruns, the schema leaks (acceptable — ULID-suffixed
+        // and easily swept on a schedule).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if handle.is_finished() {
+                let _ = handle.join();
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                // Leak the thread handle — the OS thread will finish on
+                // its own (or never; the process is about to exit anyway).
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
 }
@@ -1385,6 +1428,16 @@ async fn run_jsonb_suite(
 /// remains `async fn` so the per-scale `#[tokio::test]` files don't need to
 /// change. spawn_blocking would also work but doesn't let us pin the stack
 /// size, and the inner future borrows `&str` arguments that aren't `'static`.
+///
+/// Panic discipline (fail-loud): the inner body is wrapped in `catch_unwind`
+/// so a panic from any per-shape `.expect(...)` is captured, surfaced into
+/// the dashboard JSON as a failed card (`available=false`, `note=`PANIC:
+/// <msg>`), AND re-raised so `cargo test` exits nonzero. Previously a
+/// per-shape panic would tear down the inner runtime but the JSON file
+/// already existed from a prior run, so the dashboard rendered stale numbers
+/// and the bench wrapper scripts treated the run as green — a false-positive
+/// channel. The catch-and-rethrow keeps cargo failing while also writing a
+/// `failed` card that the dashboard can render explicitly.
 pub async fn run_full_compare(
     rows: usize,
     basin_format: BasinFormat,
@@ -1399,6 +1452,10 @@ pub async fn run_full_compare(
     let name = name.to_string();
     let claim = claim.to_string();
     let schema_prefix = schema_prefix.to_string();
+    let id_for_report = id.clone();
+    let name_for_report = name.clone();
+    let claim_for_report = claim.clone();
+    let scale_label = format!("{rows} / {}", basin_format.label());
     let handle = std::thread::Builder::new()
         .name("compare-postgres-runner".into())
         .stack_size(32 * 1024 * 1024)
@@ -1407,22 +1464,74 @@ pub async fn run_full_compare(
                 .enable_all()
                 .build()
                 .expect("build current-thread runtime");
-            rt.block_on(run_full_compare_inner(
-                rows,
-                basin_format,
-                &id,
-                &name,
-                &claim,
-                &schema_prefix,
-            ));
+            // Catch_unwind the entire inner body so we can surface the panic
+            // into the dashboard as a failed card before re-raising. The
+            // inner future is single-threaded (current_thread runtime) so
+            // there's no `Send`-bound issue; `AssertUnwindSafe` covers the
+            // borrows of `&str` args that don't impl `UnwindSafe` (they're
+            // not actually unwind-unsafe — they're plain `&str`).
+            let outcome: std::thread::Result<()> = std::panic::catch_unwind(
+                std::panic::AssertUnwindSafe(|| {
+                    rt.block_on(run_full_compare_inner(
+                        rows,
+                        basin_format,
+                        &id,
+                        &name,
+                        &claim,
+                        &schema_prefix,
+                    ));
+                }),
+            );
+            if let Err(panic_payload) = outcome {
+                let msg = panic_message(&panic_payload);
+                let note = format!(
+                    "PANIC at scale {scale_label}: {msg}. \
+                     Bench harness exits nonzero — this card is a failure marker."
+                );
+                eprintln!("[COMPARE {scale_label}] {note}");
+                // Emit a `failed` JSON card so the dashboard surfaces the
+                // gap with the panic message instead of rendering stale
+                // numbers from a prior green run. `available=false` reuses
+                // the existing "no PG" rendering path on the dashboard
+                // side. The note carries the human-readable panic text.
+                report_postgres_compare(
+                    &id_for_report,
+                    &name_for_report,
+                    &claim_for_report,
+                    false,
+                    vec![],
+                    Some(&note),
+                );
+                // Re-raise so the std::thread::join() sees the panic and
+                // cargo test exits nonzero. Fail-loud is the whole point.
+                std::panic::resume_unwind(panic_payload);
+            }
         })
         .expect("spawn runner thread");
     // Bridge the std::thread join back to async land. join() blocks, but
     // we're already on a tokio worker — spawn_blocking keeps the worker
-    // free for other tasks.
+    // free for other tasks. Any panic from the runner thread re-raised
+    // above resurfaces here via .expect on the join result; cargo test
+    // then renders the test as FAILED with the original panic message.
     tokio::task::spawn_blocking(move || handle.join().expect("runner thread panicked"))
         .await
         .expect("await runner join");
+}
+
+/// Extract a human-readable message from a `Box<dyn Any + Send>` panic
+/// payload. Handles the two payload shapes Rust normally produces:
+/// `panic!("...")` → `String`, and `assert_eq!` / `expect(&str)` →
+/// `&'static str`. Falls back to a debug stub if the payload is some
+/// other type (rare; only happens if user code panics with a custom
+/// payload via `panic_any`).
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = payload.downcast_ref::<&'static str>() {
+        s.to_string()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
 }
 
 async fn run_full_compare_inner(
