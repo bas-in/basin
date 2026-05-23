@@ -470,6 +470,21 @@ fn render(p: &ScalarParam) -> String {
             hex.push_str("'::bytea");
             hex
         }
+        // Render one-dimensional arrays as `ARRAY[a, b, c]` (same form as
+        // the in-process executor in `prepared.rs::render_param`). The
+        // upstream shard will see exactly the SQL a local executor would.
+        ScalarParam::Array(elems) => {
+            let mut out = String::with_capacity(elems.len() * 4 + 8);
+            out.push_str("ARRAY[");
+            for (i, e) in elems.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&render(e));
+            }
+            out.push(']');
+            out
+        }
     }
 }
 

@@ -109,6 +109,12 @@ fn field_is_uuid(f: &Field) -> bool {
 /// the Postgres types we already wire OIDs for in `basin-router::types`. Any
 /// type the driver sends that doesn't fit one of these falls back to `Text`
 /// (the receiving driver does the cast on its end).
+///
+/// `Array` carries the elements of a PG one-dimensional array (`int4[]`,
+/// `int8[]`, `text[]`, `bool[]`, `float8[]`). At substitution time we render
+/// it as `ARRAY[a, b, c]` so the engine's existing `= ANY(ARRAY[…])` →
+/// `IN (…)` rewriter can plan it. Multi-dimensional arrays are not supported
+/// (no ORM emits them through prepared statements in practice).
 #[derive(Clone, Debug, PartialEq)]
 pub enum ScalarParam {
     Null,
@@ -118,6 +124,7 @@ pub enum ScalarParam {
     Float8(f64),
     Text(String),
     Bytea(Vec<u8>),
+    Array(Vec<ScalarParam>),
 }
 
 /// Output of [`ProjectSession::bind`]. Holds the substituted SQL and the
@@ -531,6 +538,18 @@ fn cast_data_type_to_arrow(sql: &SqlDataType) -> Option<DataType> {
             Some(DataType::Decimal128(38, 0))
         }
 
+        // ── Array types: `$1::int[]`, `$1::text[]`, etc. ────────────────────
+        // Drizzle's `DELETE FROM t WHERE id = ANY($1::int[])` cast form lands
+        // here; we surface the matching `List(<elem>)` so ParameterDescription
+        // advertises the right `<elem>[]` array OID.  Bare `ARRAY` (no element)
+        // is unrepresentable and falls through to TEXT.
+        SqlDataType::Array(sqlparser::ast::ArrayElemTypeDef::SquareBracket(elem, _))
+        | SqlDataType::Array(sqlparser::ast::ArrayElemTypeDef::AngleBracket(elem))
+        | SqlDataType::Array(sqlparser::ast::ArrayElemTypeDef::Parenthesis(elem)) => {
+            let elem_dt = cast_data_type_to_arrow(elem)?;
+            Some(DataType::List(Arc::new(Field::new("item", elem_dt, true))))
+        }
+
         // Anything else: fall back to TEXT (safe default).
         _ => None,
     }
@@ -919,11 +938,91 @@ fn walk_pred(
                 }
             }
         }
+        // `<col> = ANY($N)` / `= SOME($N)` — Drizzle's
+        // `.where(inArray(t.col, ids))` shape and the universal
+        // batch-DELETE-by-id pattern. The placeholder is an array whose
+        // element type matches the column. Without this inference the
+        // ParameterDescription falls back to TEXT (OID 25), and strict
+        // drivers like tokio-postgres reject the Bind of a `Vec<i64>` /
+        // `Vec<String>` with WrongType. Also accepts `$N = ANY(col)` (rare,
+        // but symmetric — same array typing applies).
+        //
+        // Both bare-placeholder (`ANY($1)`) and cast-placeholder
+        // (`ANY($1::int[])`) forms feed through `pin_array_pair`; the cast
+        // form has its inner element type pulled from the cast target via
+        // `pin_array_pair_via_cast`.
+        Expr::AnyOp {
+            left,
+            compare_op: _,
+            right,
+            is_some: _,
+        } => {
+            pin_array_pair(left, right, tables, out);
+            pin_array_pair(right, left, tables, out);
+            // Handle `ANY($1::int[])` cast form: the cast's element type is
+            // authoritative.  Set slot N to List(<elem>) and the UUID flag
+            // (if any) propagates from the cast in pin_cast_placeholder, but
+            // for arrays we just fix the data type.
+            pin_array_pair_via_cast(left, right, out);
+            pin_array_pair_via_cast(right, left, out);
+            walk_pred(left, tables, out, is_jsonb_out, is_uuid_out);
+            walk_pred(right, tables, out, is_jsonb_out, is_uuid_out);
+        }
         // Recurse into nested parentheses or NOT expressions.
         Expr::Nested(inner) | Expr::UnaryOp { expr: inner, .. } => {
             walk_pred(inner, tables, out, is_jsonb_out, is_uuid_out);
         }
         _ => {}
+    }
+}
+
+/// If `placeholder` is a `$N` and `column` resolves to a known column on one
+/// of the tables in scope, pin slot `N` to a `List(<col_type>)` so the
+/// pgwire ParameterDescription advertises the matching `<col_type>[]` array
+/// OID (`int4[]`, `int8[]`, `text[]`, …).  JSONB / UUID flags are
+/// intentionally NOT propagated: PG has no `jsonb[]` / `uuid[]` array OIDs
+/// we currently surface, and downgrading to BYTEA / TEXT array element is
+/// the safer default.
+fn pin_array_pair(
+    placeholder: &Expr,
+    column: &Expr,
+    tables: &[(String, arrow_schema::Schema)],
+    out: &mut [DataType],
+) {
+    let n = match placeholder_index(placeholder) {
+        Some(n) => n,
+        None => return,
+    };
+    if let Some((dt, _is_jsonb, _is_uuid)) = resolve_column_meta(column, tables) {
+        if let Some(slot) = out.get_mut(n - 1) {
+            *slot = DataType::List(Arc::new(Field::new("item", dt, true)));
+        }
+    }
+}
+
+/// Pin slot N when the placeholder sits inside an explicit cast:
+/// `$N::int[]`, `$N::text[]`, etc.  The cast target is authoritative —
+/// it's what the user (or ORM) declared the parameter type to be — so it
+/// overrides whatever column-derived type a sibling call to
+/// `pin_array_pair` may have set.  No-op when the form doesn't match.
+fn pin_array_pair_via_cast(placeholder_side: &Expr, _other_side: &Expr, out: &mut [DataType]) {
+    if let Expr::Cast {
+        kind:
+            CastKind::Cast | CastKind::DoubleColon | CastKind::TryCast | CastKind::SafeCast,
+        expr: inner,
+        data_type,
+        ..
+    } = placeholder_side
+    {
+        let n = match placeholder_index(inner) {
+            Some(n) => n,
+            None => return,
+        };
+        if let Some(arrow_dt) = cast_data_type_to_arrow(data_type) {
+            if let Some(slot) = out.get_mut(n - 1) {
+                *slot = arrow_dt;
+            }
+        }
     }
 }
 
@@ -1254,6 +1353,23 @@ fn render_param(p: &ScalarParam) -> String {
             }
             hex.push_str("'::bytea");
             hex
+        }
+        // PG one-dimensional array → `ARRAY[a, b, c]`. The engine's
+        // `rewrite_any_array` pass converts `col = ANY(ARRAY[…])` into the
+        // `IN (…)` form DataFusion can plan, so binding `Vec<i64>` against
+        // `WHERE id = ANY($1)` works end-to-end without touching the
+        // planner. Empty arrays render as `ARRAY[]` which PG accepts.
+        ScalarParam::Array(elems) => {
+            let mut out = String::with_capacity(elems.len() * 4 + 8);
+            out.push_str("ARRAY[");
+            for (i, e) in elems.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&render_param(e));
+            }
+            out.push(']');
+            out
         }
     }
 }
@@ -1627,6 +1743,47 @@ mod tests {
     fn substitute_param_appearing_twice() {
         let out = substitute("SELECT $1 + $1", &[ScalarParam::Int4(5)]).unwrap();
         assert_eq!(out, "SELECT 5 + 5");
+    }
+
+    #[test]
+    fn substitute_array_int() {
+        // Drizzle's `id = ANY($1::int[])` shape; substituted value becomes
+        // an ARRAY literal which the `rewrite_any_array` pass then folds
+        // into `IN (1, 3)` for DataFusion.
+        let out = substitute(
+            "DELETE FROM t WHERE id = ANY($1)",
+            &[ScalarParam::Array(vec![
+                ScalarParam::Int8(1),
+                ScalarParam::Int8(3),
+            ])],
+        )
+        .unwrap();
+        assert_eq!(out, "DELETE FROM t WHERE id = ANY(ARRAY[1, 3])");
+    }
+
+    #[test]
+    fn substitute_array_text_escapes() {
+        // Text elements respect the same single-quote-doubling rule as
+        // scalar Text params, so embedded apostrophes can't break out.
+        let out = substitute(
+            "SELECT $1",
+            &[ScalarParam::Array(vec![
+                ScalarParam::Text("a".into()),
+                ScalarParam::Text("it's".into()),
+            ])],
+        )
+        .unwrap();
+        assert_eq!(out, "SELECT ARRAY['a', 'it''s']");
+    }
+
+    #[test]
+    fn substitute_array_empty() {
+        let out = substitute(
+            "SELECT $1",
+            &[ScalarParam::Array(vec![])],
+        )
+        .unwrap();
+        assert_eq!(out, "SELECT ARRAY[]");
     }
 
     // -------------------------------------------------------------------------

@@ -588,11 +588,168 @@ fn decode_param_text(
             };
             Ok(ScalarParam::Bool(b))
         }
+        // PG one-dimensional array text format: `{1,2,3}` for numeric
+        // arrays, `{a,"b,c"}` for text arrays.  We hand-roll a small
+        // tokeniser that respects double-quoted elements and escaped
+        // characters (the only escape PG uses is `\"` / `\\`). NULL
+        // elements (`NULL` unquoted) become `ScalarParam::Null`.
+        Type::INT2_ARRAY | Type::INT4_ARRAY | Type::INT8_ARRAY => {
+            let elems = parse_pg_array_text(s)?;
+            let mut out = Vec::with_capacity(elems.len());
+            for raw in elems {
+                match raw {
+                    None => out.push(ScalarParam::Null),
+                    Some(t) => {
+                        let v: i64 = t
+                            .parse()
+                            .map_err(|e: std::num::ParseIntError| parse_err("int array element", &e))?;
+                        out.push(ScalarParam::Int8(v));
+                    }
+                }
+            }
+            Ok(ScalarParam::Array(out))
+        }
+        Type::FLOAT4_ARRAY | Type::FLOAT8_ARRAY => {
+            let elems = parse_pg_array_text(s)?;
+            let mut out = Vec::with_capacity(elems.len());
+            for raw in elems {
+                match raw {
+                    None => out.push(ScalarParam::Null),
+                    Some(t) => {
+                        let v: f64 = t.parse().map_err(|e: std::num::ParseFloatError| {
+                            parse_err("float array element", &e)
+                        })?;
+                        out.push(ScalarParam::Float8(v));
+                    }
+                }
+            }
+            Ok(ScalarParam::Array(out))
+        }
+        Type::BOOL_ARRAY => {
+            let elems = parse_pg_array_text(s)?;
+            let mut out = Vec::with_capacity(elems.len());
+            for raw in elems {
+                match raw {
+                    None => out.push(ScalarParam::Null),
+                    Some(t) => {
+                        let b = match t.to_ascii_lowercase().as_str() {
+                            "t" | "true" | "1" => true,
+                            "f" | "false" | "0" => false,
+                            _ => {
+                                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                    "ERROR".to_owned(),
+                                    "22P02".to_owned(),
+                                    format!("invalid bool array element {t:?}"),
+                                ))))
+                            }
+                        };
+                        out.push(ScalarParam::Bool(b));
+                    }
+                }
+            }
+            Ok(ScalarParam::Array(out))
+        }
+        Type::TEXT_ARRAY => {
+            let elems = parse_pg_array_text(s)?;
+            Ok(ScalarParam::Array(
+                elems
+                    .into_iter()
+                    .map(|e| match e {
+                        None => ScalarParam::Null,
+                        Some(t) => ScalarParam::Text(t),
+                    })
+                    .collect(),
+            ))
+        }
         // JSONB / UUID text format passes through verbatim — the engine's
         // INSERT path parses string literals back to the canonical Arrow
         // representation. Same default as every other unmapped type.
         _ => Ok(ScalarParam::Text(s.to_owned())),
     }
+}
+
+/// Parse a PostgreSQL one-dimensional array literal in text form:
+/// `{a, b, NULL, "c,d"}`.  Returns `Some(element)` per cell or `None` for
+/// the unquoted NULL keyword.  Multi-dimensional / explicit-bounds forms
+/// (`[1:3]={…}`) are not supported — drivers rarely emit them in extended-
+/// protocol binds.
+fn parse_pg_array_text(s: &str) -> std::result::Result<Vec<Option<String>>, PgWireError> {
+    let err = |msg: String| {
+        PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".to_owned(),
+            "22P02".to_owned(),
+            msg,
+        )))
+    };
+    let s = s.trim();
+    let bytes = s.as_bytes();
+    if bytes.is_empty() || bytes[0] != b'{' || bytes[bytes.len() - 1] != b'}' {
+        return Err(err(format!(
+            "text-format array must be wrapped in braces, got {s:?}"
+        )));
+    }
+    let inner = &s[1..s.len() - 1];
+    if inner.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<Option<String>> = Vec::new();
+    let bytes = inner.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Skip leading whitespace.
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] == b'"' {
+            // Quoted element — collect until the matching unescaped quote.
+            i += 1;
+            let mut buf = String::new();
+            while i < bytes.len() {
+                let b = bytes[i];
+                if b == b'\\' && i + 1 < bytes.len() {
+                    buf.push(bytes[i + 1] as char);
+                    i += 2;
+                    continue;
+                }
+                if b == b'"' {
+                    i += 1;
+                    break;
+                }
+                buf.push(b as char);
+                i += 1;
+            }
+            out.push(Some(buf));
+        } else {
+            // Unquoted — terminator is `,` or end-of-string.
+            let start = i;
+            while i < bytes.len() && bytes[i] != b',' {
+                i += 1;
+            }
+            let raw = inner[start..i].trim().to_owned();
+            if raw.eq_ignore_ascii_case("null") {
+                out.push(None);
+            } else {
+                out.push(Some(raw));
+            }
+        }
+        // Skip whitespace, then the comma (or end).
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i < bytes.len() {
+            if bytes[i] == b',' {
+                i += 1;
+            } else {
+                return Err(err(format!(
+                    "expected ',' or '}}' at byte {i} of array body {inner:?}"
+                )));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Decode the Postgres binary wire format for the common scalar types. The
@@ -700,6 +857,23 @@ fn decode_param_binary(
             })?;
             Ok(ScalarParam::Text(s.to_owned()))
         }
+        // One-dimensional array binary wire format
+        // (`int4[]` / `int8[]` / `text[]` / `bool[]` / `float8[]`):
+        //   ndim:i32 has_nulls:i32 elem_oid:i32
+        //   { dim_len:i32 dim_lbound:i32 } * ndim
+        //   { elem_len:i32 (-1=NULL) elem_data:bytes(elem_len) } * total
+        // tokio-postgres encodes `Vec<i64>` / `&[i64]` etc. exactly this way.
+        // We decode by re-using the same `decode_param_binary` for the
+        // element OID, dispatching off `elem_oid` from the header rather
+        // than the declared array type so a client that disagrees with our
+        // ParameterDescription doesn't silently misalign.
+        Type::INT2_ARRAY
+        | Type::INT4_ARRAY
+        | Type::INT8_ARRAY
+        | Type::FLOAT4_ARRAY
+        | Type::FLOAT8_ARRAY
+        | Type::BOOL_ARRAY
+        | Type::TEXT_ARRAY => decode_pg_array_binary(bytes),
         // UUID binary wire format: 16 raw RFC 4122 bytes; render canonical
         // hyphenated form so the engine's text-substitution path (which
         // accepts string-quoted UUID literals) coerces back to bytes.
@@ -788,6 +962,81 @@ fn decode_param_binary(
             Ok(ScalarParam::Text(s.to_owned()))
         }
     }
+}
+
+/// Decode the PG binary wire format for a one-dimensional array.  The
+/// element OID is read from the array header itself, so a client that
+/// disagrees with our ParameterDescription (e.g. binds `int4[]` against a
+/// slot we surfaced as `int8[]`) still decodes correctly rather than
+/// silently misaligning.  Multi-dimensional arrays are rejected as
+/// unsupported (no ORM emits them in extended-protocol binds in practice).
+fn decode_pg_array_binary(bytes: &[u8]) -> std::result::Result<ScalarParam, PgWireError> {
+    let short = || {
+        PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".to_owned(),
+            "22P03".to_owned(),
+            "binary array parameter is truncated".to_owned(),
+        )))
+    };
+    if bytes.len() < 12 {
+        return Err(short());
+    }
+    let ndim = i32::from_be_bytes(bytes[0..4].try_into().unwrap());
+    let _has_nulls = i32::from_be_bytes(bytes[4..8].try_into().unwrap());
+    let elem_oid = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
+
+    // Empty array: ndim == 0, no dim block, no elements.
+    if ndim == 0 {
+        return Ok(ScalarParam::Array(Vec::new()));
+    }
+    if ndim != 1 {
+        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".to_owned(),
+            "0A000".to_owned(),
+            format!("multi-dimensional arrays (ndim={ndim}) not supported"),
+        ))));
+    }
+
+    let dim_block_end = 12 + 8; // 1 dim * (length:i32 + lbound:i32)
+    if bytes.len() < dim_block_end {
+        return Err(short());
+    }
+    let dim_len = i32::from_be_bytes(bytes[12..16].try_into().unwrap());
+    if dim_len < 0 {
+        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".to_owned(),
+            "22P03".to_owned(),
+            format!("binary array has negative length {dim_len}"),
+        ))));
+    }
+
+    let elem_type = Type::from_oid(elem_oid).unwrap_or(Type::TEXT);
+
+    let mut out = Vec::with_capacity(dim_len as usize);
+    let mut pos = dim_block_end;
+    for _ in 0..dim_len {
+        if pos + 4 > bytes.len() {
+            return Err(short());
+        }
+        let elen = i32::from_be_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        if elen < 0 {
+            out.push(ScalarParam::Null);
+            continue;
+        }
+        let elen = elen as usize;
+        if pos + elen > bytes.len() {
+            return Err(short());
+        }
+        let elem_bytes = &bytes[pos..pos + elen];
+        pos += elen;
+        // Recursively decode each element using the element OID from the
+        // array header.  Nested arrays would re-enter this same path but
+        // we already rejected ndim != 1 above.
+        let v = decode_param_binary(elem_bytes, &elem_type)?;
+        out.push(v);
+    }
+    Ok(ScalarParam::Array(out))
 }
 
 /// Detect whether `sql` is a DML statement with a `RETURNING` clause and, if
@@ -3199,6 +3448,11 @@ mod tests {
                     ScalarParam::Float8(f) => format!("{f}"),
                     ScalarParam::Text(s) => format!("'{}'", s.replace('\'', "''")),
                     ScalarParam::Bytea(b) => format!("'{:?}'", b),
+                    // Tests don't exercise array params on the mock router
+                    // session today, but the variant must be exhaustive. A
+                    // simple debug rendering is enough — no test asserts on
+                    // it.
+                    ScalarParam::Array(elems) => format!("{:?}", elems),
                 };
                 out = out.replace(&placeholder, &rendered);
             }

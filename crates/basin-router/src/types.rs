@@ -178,6 +178,26 @@ pub(crate) fn arrow_to_pg_type(dt: &DataType) -> Type {
         // sign + weight + dscale + ndigits + base-10000 digit array; lots
         // of edge cases. Lenient drivers tolerate text in a binary slot.)
         DataType::Decimal128(_, _) => Type::NUMERIC,
+        // PG one-dimensional array types.  Used by the extended-query
+        // ParameterDescription path so that `WHERE col = ANY($1)` over a
+        // BIGINT column advertises OID 1016 (`int8[]`), letting tokio-
+        // postgres / sqlx / pgx accept a bound `Vec<i64>` instead of
+        // rejecting it with `WrongType` against a TEXT slot.  Element type
+        // is read from the List's inner field; anything we don't have an
+        // array OID for falls through to TEXT.
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::FixedSizeList(field, _) => match field.data_type() {
+            DataType::Int64 | DataType::UInt32 | DataType::UInt64 => Type::INT8_ARRAY,
+            DataType::Int32 => Type::INT4_ARRAY,
+            DataType::Int16 | DataType::Int8 | DataType::UInt8 | DataType::UInt16 => {
+                Type::INT2_ARRAY
+            }
+            DataType::Boolean => Type::BOOL_ARRAY,
+            DataType::Float64 => Type::FLOAT8_ARRAY,
+            DataType::Utf8 | DataType::LargeUtf8 => Type::TEXT_ARRAY,
+            _ => Type::TEXT,
+        },
         // Everything else gets formatted as text.
         _ => Type::TEXT,
     }
