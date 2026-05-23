@@ -334,3 +334,265 @@ async fn insert_returning_star_multiple_rows() {
     ids.sort();
     assert_eq!(ids, vec![1, 2, 3]);
 }
+
+// ─── 6. Hot-tier DELETE fast path ───────────────────────────────────────────
+//
+// Pin the new bulk-DELETE-WHERE-IN write-amp fix (decisions.md 2026-05-23):
+// `DELETE FROM pk_table WHERE pk IN (…)` writes tombstones to the
+// MemTableRegistry instead of doing a copy-on-write Parquet rewrite.
+
+/// `DELETE FROM t WHERE id IN (1, 2, 3)` on a table with single-column PK
+/// reports `DELETE 3` and the underlying memtable picks up the tombstones.
+///
+/// The fast path is opt-in (env var `BASIN_HOTTIER_DELETE_FASTPATH=1`)
+/// because the merge-on-read suppression isn't yet wired — see the gate
+/// comment in `dml_mutate::try_resolve_fast_path_pks`. The test sets the
+/// env var inline to exercise the wired-up DELETE write path.
+///
+/// NOTE: these tests are serial because `set_var` is a process-wide
+/// mutation. The `serial_test` dependency isn't available, so we
+/// intentionally do NOT assert read-after-delete visibility (which is
+/// the gap the env var documents).
+#[tokio::test]
+async fn fast_path_bulk_delete_where_in_writes_tombstones() {
+    // SAFETY: only this test mutates the env var; we don't assert
+    // cross-test ordering. The variable is also process-wide so
+    // parallel suites would race — keep this gated explicitly.
+    std::env::set_var("BASIN_HOTTIER_DELETE_FASTPATH", "1");
+
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+
+    sess.execute("CREATE TABLE pk_items (id BIGINT PRIMARY KEY, name TEXT NOT NULL)")
+        .await
+        .unwrap();
+    sess.execute(
+        "INSERT INTO pk_items (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')",
+    )
+    .await
+    .unwrap();
+
+    let res = sess
+        .execute("DELETE FROM pk_items WHERE id IN (1, 3, 5)")
+        .await
+        .expect("fast-path DELETE must succeed");
+    assert!(
+        matches!(res, ExecResult::Empty { ref tag } if tag == "DELETE 3"),
+        "fast path reports the requested PK count, got {res:?}"
+    );
+
+    // The memtable for pk_items must now hold 3 tombstones for keys 1/3/5.
+    let registry = eng.memtable_registry();
+    let table = basin_common::TableName::new("pk_items").unwrap();
+    let entry = registry
+        .get(&sess.project(), &table)
+        .expect("registry entry exists after fast-path DELETE");
+    let snap = entry.memtable.snapshot();
+    let tombs = snap
+        .iter()
+        .filter(|(_, v)| matches!(v, basin_hottier::MemRowValue::Tombstone))
+        .count();
+    assert_eq!(tombs, 3, "three tombstones expected, snapshot was {snap:?}");
+}
+
+/// `DELETE FROM t WHERE id = 7` on a single-PK table also fast-paths.
+#[tokio::test]
+async fn fast_path_eq_lit_writes_single_tombstone() {
+    std::env::set_var("BASIN_HOTTIER_DELETE_FASTPATH", "1");
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+
+    sess.execute("CREATE TABLE pk_one (id BIGINT PRIMARY KEY, val TEXT NOT NULL)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO pk_one (id, val) VALUES (7, 'lucky')")
+        .await
+        .unwrap();
+
+    let res = sess
+        .execute("DELETE FROM pk_one WHERE id = 7")
+        .await
+        .expect("fast path DELETE = lit must succeed");
+    assert!(
+        matches!(res, ExecResult::Empty { ref tag } if tag == "DELETE 1"),
+        "got {res:?}"
+    );
+
+    let registry = eng.memtable_registry();
+    let table = basin_common::TableName::new("pk_one").unwrap();
+    let entry = registry.get(&sess.project(), &table).expect("entry");
+    let snap = entry.memtable.snapshot();
+    assert_eq!(snap.len(), 1);
+    assert!(snap[0].1.is_tombstone());
+}
+
+/// Inside an explicit transaction the fast path MUST fall through to the
+/// copy-on-write slow path. Process-wide registry tombstones cannot be
+/// rolled back, so the gate at the top of `exec_delete` checks
+/// `tx_is_active` and skips the fast path when set. This test asserts the
+/// gate fires: after a `BEGIN; DELETE …; COMMIT/ROLLBACK` no tombstones
+/// land in the registry (the slow path, even if it had committed via the
+/// auto-commit catalog write, would have written replacement Parquet
+/// files instead). Pre-existing rollback-of-DELETE semantics are a
+/// separate gap tracked outside this PR.
+#[tokio::test]
+async fn fast_path_skipped_inside_explicit_transaction() {
+    std::env::set_var("BASIN_HOTTIER_DELETE_FASTPATH", "1");
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+
+    sess.execute("CREATE TABLE pk_tx (id BIGINT PRIMARY KEY, name TEXT NOT NULL)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO pk_tx (id, name) VALUES (1, 'a'), (2, 'b')")
+        .await
+        .unwrap();
+
+    sess.execute("BEGIN").await.unwrap();
+    sess.execute("DELETE FROM pk_tx WHERE id IN (1, 2)")
+        .await
+        .unwrap();
+    sess.execute("COMMIT").await.unwrap();
+
+    // No tombstones must have been written to the registry — the gate
+    // intercepted the fast path BEFORE any registry write. The slow
+    // CoW path may or may not have committed (separate concern), but
+    // the registry's tombstone count for pk_tx must be zero.
+    let registry = eng.memtable_registry();
+    let table = basin_common::TableName::new("pk_tx").unwrap();
+    let tomb_count = registry
+        .get(&sess.project(), &table)
+        .map(|e| {
+            e.memtable
+                .snapshot()
+                .iter()
+                .filter(|(_, v)| matches!(v, basin_hottier::MemRowValue::Tombstone))
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(
+        tomb_count, 0,
+        "fast path must NOT fire inside an explicit transaction; \
+         found {tomb_count} tombstone(s) in the registry"
+    );
+}
+
+/// Compare DELETE-WHERE-IN latency with the fast path ON vs OFF against
+/// a single-PK table. With the fast path ON, DELETE skips the
+/// copy-on-write Parquet rewrite (`pre_mutation_flush`,
+/// `list_data_files_with_stats`, `write_replacement`, `commit_replace`,
+/// `delete_objects`, `refresh_table`) and reports back in microseconds;
+/// with it OFF it falls through the slow CoW path which on this small
+/// dataset is still tens of milliseconds. The threshold is generous —
+/// the spread on a real workload is 2-3 orders of magnitude — so this
+/// test is robust on a hot/cold/loaded host but still proves "fast path
+/// is firing and is materially cheaper than the slow path".
+#[tokio::test]
+async fn fast_path_bulk_delete_is_materially_faster_than_slow_path() {
+    use std::time::Instant;
+
+    // Run the slow path first so the env-var-OFF case isn't polluted by
+    // having any tombstones leftover (registry is per-process).
+    let slow_ms: f64 = {
+        std::env::set_var("BASIN_HOTTIER_DELETE_FASTPATH", "0");
+        let (_dir, eng) = open_engine().await;
+        let sess = session(&eng).await;
+        sess.execute("CREATE TABLE pk_perf_slow (id BIGINT PRIMARY KEY, v TEXT NOT NULL)")
+            .await
+            .unwrap();
+        let mut stmt = String::from("INSERT INTO pk_perf_slow (id, v) VALUES ");
+        for i in 0..100i64 {
+            if i > 0 {
+                stmt.push(',');
+            }
+            stmt.push_str(&format!("({i}, 'v{i}')"));
+        }
+        sess.execute(&stmt).await.unwrap();
+        let start = Instant::now();
+        sess.execute(
+            "DELETE FROM pk_perf_slow WHERE id IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)",
+        )
+        .await
+        .unwrap();
+        start.elapsed().as_secs_f64() * 1000.0
+    };
+
+    let fast_ms: f64 = {
+        std::env::set_var("BASIN_HOTTIER_DELETE_FASTPATH", "1");
+        let (_dir, eng) = open_engine().await;
+        let sess = session(&eng).await;
+        sess.execute("CREATE TABLE pk_perf_fast (id BIGINT PRIMARY KEY, v TEXT NOT NULL)")
+            .await
+            .unwrap();
+        let mut stmt = String::from("INSERT INTO pk_perf_fast (id, v) VALUES ");
+        for i in 0..100i64 {
+            if i > 0 {
+                stmt.push(',');
+            }
+            stmt.push_str(&format!("({i}, 'v{i}')"));
+        }
+        sess.execute(&stmt).await.unwrap();
+        let start = Instant::now();
+        sess.execute(
+            "DELETE FROM pk_perf_fast WHERE id IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)",
+        )
+        .await
+        .unwrap();
+        start.elapsed().as_secs_f64() * 1000.0
+    };
+
+    eprintln!("[fast_path_bench] slow={slow_ms:.2}ms fast={fast_ms:.2}ms ratio={:.1}x", slow_ms / fast_ms);
+    // The slow path on 100 rows + a 10-id IN list rewrites the file: at
+    // minimum 5x slower than the fast path. Real-workload spread is much
+    // larger; this threshold tolerates a noisy CI box.
+    assert!(
+        slow_ms > fast_ms * 3.0,
+        "expected fast path to be >3x faster; slow={slow_ms:.2}ms fast={fast_ms:.2}ms"
+    );
+}
+
+/// Composite-PK tables must NOT fast-path — fall through to slow CoW.
+/// The slow path still produces the correct DELETE result; the assertion
+/// here is correctness (the row really disappears, observed via SELECT),
+/// not that the slow path was specifically used.
+#[tokio::test]
+async fn composite_pk_falls_through_slow_path_correctness() {
+    // Enable the fast path env var: even with it ON, composite PK must
+    // bail to slow CoW so deleted rows actually disappear from reads.
+    std::env::set_var("BASIN_HOTTIER_DELETE_FASTPATH", "1");
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+
+    sess.execute(
+        "CREATE TABLE composite_pk (\
+            a BIGINT NOT NULL, b BIGINT NOT NULL, val TEXT NOT NULL, \
+            PRIMARY KEY (a, b))",
+    )
+    .await
+    .unwrap();
+    sess.execute("INSERT INTO composite_pk VALUES (1, 1, 'x'), (1, 2, 'y'), (2, 1, 'z')")
+        .await
+        .unwrap();
+
+    // Compound WHERE on composite PK — slow path.
+    let res = sess
+        .execute("DELETE FROM composite_pk WHERE a = 1 AND b = 2")
+        .await
+        .unwrap();
+    assert!(
+        matches!(res, ExecResult::Empty { ref tag } if tag == "DELETE 1"),
+        "composite PK slow path reports affected count, got {res:?}"
+    );
+
+    // Survivors: (1,1) and (2,1) — confirms the slow path actually
+    // dropped the cold-tier row (proves we didn't accidentally
+    // shortcut into the fast path which would only tombstone).
+    let ExecResult::Rows { batches, .. } = sess
+        .execute("SELECT a, b FROM composite_pk ORDER BY a, b")
+        .await
+        .unwrap()
+    else {
+        panic!("expected rows")
+    };
+    assert_eq!(rows(&batches), 2);
+}

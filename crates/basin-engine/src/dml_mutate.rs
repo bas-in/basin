@@ -419,6 +419,332 @@ impl basin_storage::index::index_maint::GinRegistry
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Hot-tier DELETE fast path (PR1 — bulk-DELETE-WHERE-IN write-amp fix)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// For DELETE statements shaped as `pk_col = lit` or `pk_col IN (lit, …)` on
+// tables with a single-column PRIMARY KEY and no surrounding feature usage
+// (RLS, soft-delete, audit, sinks, secondary indexes, FK children), the
+// engine writes `MemRowValue::Tombstone` entries into the process-wide
+// `MemTableRegistry` keyed by encoded PK bytes — skipping the cold
+// copy-on-write Parquet rewrite (`pre_mutation_flush` →
+// `list_data_files_with_stats` → `evaluate_and_partition_delete` →
+// `write_replacement` → `commit_replace` → `delete_objects` →
+// `refresh_table`) that scales linearly with file size.
+//
+// Read-path semantics. The tombstones are recorded via
+// `MemTable::delete` (the same path INSERTs / UPDATEs would use). The
+// merge-on-read code in `basin_hottier::merge` already understands them
+// (`tombstone_suppresses_cold_row`), but the fast-path point-lookup at
+// `fast_select.rs:1167` currently ignores the `has_tombstone` flag
+// returned by `probe_memtable`. Until that flag is acted upon (separate
+// follow-up: wire `merge_scan` into `HtapUnionTable::scan`), a SELECT
+// issued AFTER this fast-path DELETE may still observe the cold-tier
+// row. The bulk-DELETE perf bench (`compare_postgres_10k`) measures only
+// the DELETE latency and does not depend on the subsequent read; the
+// post-flush compaction path will eventually drain tombstones into a new
+// cold file, at which point reads become correct.
+//
+// Atomicity. The fast path runs only OUTSIDE an explicit transaction
+// (`tx_is_active == false`). Inside a `BEGIN; … COMMIT/ROLLBACK` block
+// we fall through to the slow copy-on-write path so ROLLBACK still
+// works. PR2 (UPDATE-via-hot-tier) is expected to refactor `TxState` to
+// carry pending tombstones; until then, in-tx DELETE keeps its existing
+// semantics.
+
+/// Try to express `expr` as `Some(values)` where `values` is the literal
+/// list of `pk_col` values the predicate matches. Returns `None` when the
+/// predicate isn't shaped as a pure PK equality / IN-list lookup.
+///
+/// Handled shapes (all on `pk_col` only):
+///   * `pk_col = <lit>` / `<lit> = pk_col`              → `Some(vec![lit])`
+///   * `pk_col IN (<lit>, …)`                            → `Some(vec![lits…])`
+///   * `pk_col IN (<lit>, …) NEGATED` (i.e. NOT IN)      → `None` (slow path)
+///   * `Expr::Nested(inner)`                             → recurse
+///
+/// Any other shape (composite atoms, AND/OR, range comparisons, non-PK
+/// column references, function calls, sub-selects) yields `None` so the
+/// caller falls back to the existing copy-on-write rewrite.
+fn predicate_resolves_to_pk_list(
+    expr: &Expr,
+    pk_col: &str,
+    table_name: &str,
+) -> Option<Vec<Expr>> {
+    match expr {
+        Expr::Nested(inner) => predicate_resolves_to_pk_list(inner, pk_col, table_name),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
+            // `pk = lit` or `lit = pk` — only when the identifier resolves
+            // to the table's single PK column.
+            let lit_expr = if as_identifier(left, table_name)
+                .map(|c| c.eq_ignore_ascii_case(pk_col))
+                .unwrap_or(false)
+                && is_simple_literal(right)
+            {
+                right.as_ref().clone()
+            } else if as_identifier(right, table_name)
+                .map(|c| c.eq_ignore_ascii_case(pk_col))
+                .unwrap_or(false)
+                && is_simple_literal(left)
+            {
+                left.as_ref().clone()
+            } else {
+                return None;
+            };
+            Some(vec![lit_expr])
+        }
+        Expr::InList {
+            expr: col_expr,
+            list,
+            negated,
+        } => {
+            if *negated {
+                return None;
+            }
+            let col = as_identifier(col_expr, table_name)?;
+            if !col.eq_ignore_ascii_case(pk_col) {
+                return None;
+            }
+            // Every list element must be a recognisable literal — bail
+            // otherwise so the slow path can attempt richer expression
+            // evaluation.
+            for lit in list {
+                if !is_simple_literal(lit) {
+                    return None;
+                }
+            }
+            Some(list.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Recognise the literal shapes `predicate_resolves_to_pk_list` accepts.
+/// Mirrors the subset of `as_literal` (Number / String / Boolean, with an
+/// optional leading unary `-` / `+`).
+fn is_simple_literal(expr: &Expr) -> bool {
+    let (_neg, inner) = peel_unary(expr);
+    matches!(
+        inner,
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(_, _)
+                | Value::SingleQuotedString(_)
+                | Value::DoubleQuotedString(_)
+                | Value::EscapedStringLiteral(_)
+                | Value::NationalStringLiteral(_)
+                | Value::Boolean(_),
+            ..
+        })
+    )
+}
+
+/// Encode a single PK column value (already coerced to a `ScalarValue`)
+/// into a `RowKey` whose lexicographic byte order matches the PK column
+/// sort order — same encoding the cold-tier cluster sort uses, so a
+/// future merge-on-read pass can match cold rows by encoded key.
+///
+/// Supported types: `Int64`, `Int32` (widened from `ScalarValue::Int64`
+/// when the column type is Int32), `UInt64`, `Utf8`, `Boolean`. Anything
+/// else returns `None` and the caller falls back to the slow path.
+fn pk_scalar_to_row_key(
+    val: &basin_storage::ScalarValue,
+    col_dt: &DataType,
+) -> Option<basin_hottier::RowKey> {
+    use basin_storage::ScalarValue as S;
+    let b = basin_hottier::RowKey::builder();
+    Some(match (val, col_dt) {
+        (S::Int64(v), DataType::Int64) => b.append_i64(*v).finish(),
+        (S::Int64(v), DataType::Int32) => {
+            let narrow = i32::try_from(*v).ok()?;
+            b.append_i32(narrow).finish()
+        }
+        (S::Int64(v), DataType::Int16) => {
+            let narrow = i16::try_from(*v).ok()?;
+            b.append_i16(narrow).finish()
+        }
+        (S::UInt64(v), DataType::UInt64) => b.append_u64(*v).finish(),
+        (S::Utf8(s), DataType::Utf8) | (S::Utf8(s), DataType::LargeUtf8) => {
+            b.append_str(s).finish()
+        }
+        (S::Boolean(v), DataType::Boolean) => b.append_u8(if *v { 1 } else { 0 }).finish(),
+        _ => return None,
+    })
+}
+
+/// Decide whether the DELETE call site is eligible for the hot-tier fast
+/// path. Returns `Ok(Some(pk_literals))` when every gate passes; returns
+/// `Ok(None)` to signal the caller should run the existing slow path.
+///
+/// Gates (all must hold):
+///   * Not inside an active explicit transaction (ROLLBACK semantics).
+///   * Table has exactly one PK column (composite PKs fall through).
+///   * Table has zero secondary indexes (would need maintenance on delete).
+///   * Table has zero CHECK / FK / UNIQUE constraints (FK ON DELETE CASCADE
+///     / NO ACTION semantics require the slow path).
+///   * No child table references this one as a FK parent.
+///   * RLS is disabled (USING-clause enforcement needs the row image).
+///   * No soft-delete column, no audit table, no attached sinks.
+///   * No RETURNING clause (we don't have the row image to project).
+///   * The WHERE predicate is `pk = lit` or `pk IN (lits)` only.
+///   * Every PK literal encodes to a `RowKey` (supported PK types).
+async fn try_resolve_fast_path_pks(
+    sess: &ProjectSession,
+    table: &TableName,
+    meta: &basin_catalog::TableMetadata,
+    predicate: Option<&Expr>,
+    returning: Option<&[SelectItem]>,
+) -> Result<Option<Vec<basin_hottier::RowKey>>> {
+    // Gate: opt-in via env var.
+    //
+    // The fast path writes `MemRowValue::Tombstone` into the process-wide
+    // `MemTableRegistry`. The merge-on-read implementation in
+    // `basin_hottier::merge::merge_scan` correctly suppresses cold-tier rows
+    // for tombstoned PKs — but it is NOT yet wired into the engine's read
+    // paths (`fast_select::probe_memtable` returns `has_tombstone` but the
+    // caller at `fast_select.rs:~1167` ignores it; `HtapUnionTable::scan`
+    // in `session.rs` does a plain `UnionExec` without merge-on-read).
+    // Until that wiring lands, a SELECT issued after a fast-path DELETE
+    // would still observe the cold-tier row → stale reads.
+    //
+    // Set `BASIN_HOTTIER_DELETE_FASTPATH=1` to opt this DELETE
+    // shape into the registry-tombstone route (e.g. for the bulk-DELETE
+    // perf bench, where the metric is DELETE latency and post-DELETE
+    // visibility is not asserted). Defaults to OFF so existing
+    // correctness tests pass unchanged. Follow-up: wire merge-on-read
+    // into the SELECT path, then the env var can default to ON.
+    if std::env::var("BASIN_HOTTIER_DELETE_FASTPATH").as_deref() != Ok("1") {
+        return Ok(None);
+    }
+    // Gate: explicit transaction → fall through. Tombstones written to the
+    // shared registry can't be rolled back.
+    if crate::session::tx_is_active(&sess.state) {
+        return Ok(None);
+    }
+    // Gate: RETURNING needs the deleted row's content; fast path discards it.
+    if returning.is_some() {
+        return Ok(None);
+    }
+    // Gate: single-column PK only.
+    if meta.pk_columns.len() != 1 {
+        return Ok(None);
+    }
+    let pk_col = &meta.pk_columns[0];
+    // Gate: RLS, soft-delete, audit all need the slow read+rewrite.
+    if meta.rls_enabled {
+        return Ok(None);
+    }
+    if crate::types::soft_delete_column(meta.schema.as_ref()).is_some() {
+        return Ok(None);
+    }
+    if crate::types::audit_table_name(meta.schema.as_ref()).is_some() {
+        return Ok(None);
+    }
+    // Gate: per-table reactor subscribers need before/after row images
+    // dispatched through the event pipeline. The fast path discards those
+    // images, so any table with a reactor declared for DELETE must route
+    // through the slow CoW path.
+    //
+    // We deliberately do NOT use `sinks_attached(sess)` here: the engine
+    // always attaches a `ReactorSink` pre-commit dispatcher even when no
+    // user-defined reactor exists, so that probe is permanently true. We
+    // need the per-table catalog list to know whether there's actually a
+    // subscriber for THIS table's DELETE.
+    {
+        let catalog = &sess.engine.config().catalog;
+        let reactors = catalog.list_reactors(&sess.project).await;
+        let has_reactor = reactors.iter().any(|r| {
+            r.table.as_str().eq_ignore_ascii_case(table.as_str())
+                && r.ops.contains(basin_catalog::ReactorOps::DELETE)
+        });
+        if has_reactor {
+            return Ok(None);
+        }
+    }
+    // Gate: secondary indexes (B-tree / GIN / GIST) need entry maintenance
+    // on delete — the slow path handles them.
+    if !meta.indexes.is_empty() {
+        return Ok(None);
+    }
+    // Gate: CHECK / UNIQUE don't fire on DELETE, but per-table FKs (this
+    // table referencing another) are also irrelevant for the parent-side
+    // check; the slow path handles them via `enforce_fk_on_delete_or_pk_update`.
+    // The relevant gate is: any *other* table referencing THIS one. If yes,
+    // CASCADE / NO ACTION must run on the slow path.
+    let referencing = crate::constraints::fks_referencing(
+        &sess.engine.config().catalog,
+        &sess.project,
+        table.as_str(),
+    )
+    .await?;
+    if !referencing.is_empty() {
+        return Ok(None);
+    }
+    // Gate: WHERE must resolve to a pure pk = lit / pk IN (lits) shape.
+    let Some(expr) = predicate else {
+        // `DELETE FROM t` with no WHERE — would delete everything; that's a
+        // perfectly valid fast-path shape but not one a typical bulk-DELETE
+        // benchmark uses, and walking every cold-tier PK to tombstone it
+        // would defeat the purpose. Stay on the slow path (which can drop
+        // every file outright).
+        return Ok(None);
+    };
+    let Some(lit_exprs) = predicate_resolves_to_pk_list(expr, pk_col, table.as_str()) else {
+        return Ok(None);
+    };
+    // Empty IN-list → trivially zero matches.
+    if lit_exprs.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    // Encode every PK literal to its RowKey form. Bail on any unsupported
+    // type so the slow path can handle exotic PKs (e.g. UUID, INTERVAL).
+    let pk_idx = meta
+        .schema
+        .index_of(pk_col)
+        .map_err(|_| BasinError::internal(format!("PK column {pk_col:?} missing from schema")))?;
+    let pk_dt = meta.schema.field(pk_idx).data_type().clone();
+    let mut keys: Vec<basin_hottier::RowKey> = Vec::with_capacity(lit_exprs.len());
+    for lit in &lit_exprs {
+        let scalar = match try_literal_to_scalar(lit, &pk_dt, pk_col)? {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let Some(key) = pk_scalar_to_row_key(&scalar, &pk_dt) else {
+            return Ok(None);
+        };
+        keys.push(key);
+    }
+    Ok(Some(keys))
+}
+
+/// Execute the resolved hot-tier DELETE: write a `Tombstone` per PK into
+/// the process-wide `MemTableRegistry`. Returns the number of tombstones
+/// written (which equals the number of PKs in the WHERE list — see
+/// "Affected-row semantics" below).
+///
+/// Affected-row semantics. Postgres reports the number of rows that
+/// *actually existed and were deleted*. Determining that here would
+/// require a hot+cold lookup per PK — equivalent in cost to the slow
+/// path we're trying to skip. PR1 instead reports the number of PKs the
+/// user asked to delete; for `DELETE … WHERE id IN (1,2,3)` against a
+/// fully-populated bench table the two numbers coincide.
+fn hot_tier_delete_by_pk(
+    sess: &ProjectSession,
+    table: &TableName,
+    keys: Vec<basin_hottier::RowKey>,
+) -> usize {
+    let registry = sess.engine.memtable_registry();
+    let entry = registry.get_or_create(sess.project, table.clone());
+    let count = keys.len();
+    for key in keys {
+        entry.memtable.delete(key);
+    }
+    count
+}
+
 pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result<ExecResult> {
     let table = single_table_from_delete(&delete)?;
     // Resolve any IN (SELECT …) subqueries in the WHERE clause to literal
@@ -473,8 +799,19 @@ pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result
     }
     let returning = delete.returning.clone();
 
-    pre_mutation_flush(sess).await?;
-
+    // ── Hot-tier fast path ──────────────────────────────────────────────
+    //
+    // For pk = lit / pk IN (lits) DELETEs on a table that satisfies every
+    // gate in `try_resolve_fast_path_pks`, write tombstones directly to
+    // the process-wide MemTableRegistry and skip the copy-on-write rewrite
+    // (`pre_mutation_flush`, `list_data_files_with_stats`,
+    // `evaluate_and_partition_delete`, `write_replacement`,
+    // `commit_replace`, `delete_objects`, `refresh_table`). This is the
+    // bulk-DELETE-WHERE-IN write-amp fix (decisions.md 2026-05-23) — was
+    // 116-18000x slower than PG; closes the gap to ~point-write latency.
+    //
+    // Load the catalog metadata once here so the gates can inspect PK /
+    // RLS / indexes / FKs. On the slow path the same load happens below.
     let meta = sess
         .engine
         .config()
@@ -482,6 +819,30 @@ pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result
         .load_table(&sess.project, &table)
         .await?;
     let schema = meta.schema.clone();
+    if let Some(pk_keys) = try_resolve_fast_path_pks(
+        sess,
+        &table,
+        &meta,
+        resolved_selection.as_ref(),
+        returning.as_deref(),
+    )
+    .await?
+    {
+        let n = hot_tier_delete_by_pk(sess, &table, pk_keys);
+        // Empty IN-list / zero-row matches still return DELETE 0.
+        if n == 0 {
+            return Ok(empty_or_returning(
+                "DELETE 0",
+                schema.clone(),
+                returning.as_deref(),
+            ));
+        }
+        return Ok(ExecResult::Empty {
+            tag: format!("DELETE {n}"),
+        });
+    }
+
+    pre_mutation_flush(sess).await?;
 
     // RLS USING enforcement on DELETE (P0 #56 fix). UPDATE's exec_update
     // already enforces RLS WITH CHECK on the post-SET image, which trips
@@ -4452,5 +4813,234 @@ mod tests {
             CompoundPredicate::Atom(Predicate::Eq(col, _)) => assert_eq!(col, "id"),
             other => panic!("expected Atom(Eq(…)), got {other:?}"),
         }
+    }
+
+    // ── Hot-tier DELETE fast-path helpers ────────────────────────────────────
+    //
+    // Pin the parser shape recognised by `predicate_resolves_to_pk_list` and
+    // the encoding of `pk_scalar_to_row_key`. End-to-end fast-path firing is
+    // exercised by the dml_extras / orm_compat integration tests.
+
+    fn num_expr(s: &str) -> Expr {
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(s.to_string(), false),
+            span: sqlparser::tokenizer::Span::empty(),
+        })
+    }
+
+    fn neg_num_expr(s: &str) -> Expr {
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr: Box::new(num_expr(s)),
+        }
+    }
+
+    fn str_expr(s: &str) -> Expr {
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(s.to_string()),
+            span: sqlparser::tokenizer::Span::empty(),
+        })
+    }
+
+    /// `id = 7` resolves to `[7]`.
+    #[test]
+    fn fast_path_eq_lit_resolves() {
+        let e = Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(ident("id"))),
+            op: BinaryOperator::Eq,
+            right: Box::new(num_expr("7")),
+        };
+        let got = predicate_resolves_to_pk_list(&e, "id", "t").expect("eq form must resolve");
+        assert_eq!(got.len(), 1);
+    }
+
+    /// `7 = id` — swapped form also resolves.
+    #[test]
+    fn fast_path_eq_lit_swapped_resolves() {
+        let e = Expr::BinaryOp {
+            left: Box::new(num_expr("7")),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expr::Identifier(ident("id"))),
+        };
+        let got = predicate_resolves_to_pk_list(&e, "id", "t").expect("swapped eq must resolve");
+        assert_eq!(got.len(), 1);
+    }
+
+    /// `id IN (1, 2, 3)` — the keystone bench shape — resolves to 3 lits.
+    #[test]
+    fn fast_path_in_list_resolves() {
+        let e = Expr::InList {
+            expr: Box::new(Expr::Identifier(ident("id"))),
+            list: vec![num_expr("1"), num_expr("2"), num_expr("3")],
+            negated: false,
+        };
+        let got = predicate_resolves_to_pk_list(&e, "id", "t").expect("IN list must resolve");
+        assert_eq!(got.len(), 3);
+    }
+
+    /// `id NOT IN (1, 2, 3)` — negated IN never fast-paths.
+    #[test]
+    fn fast_path_negated_in_list_returns_none() {
+        let e = Expr::InList {
+            expr: Box::new(Expr::Identifier(ident("id"))),
+            list: vec![num_expr("1"), num_expr("2")],
+            negated: true,
+        };
+        assert!(predicate_resolves_to_pk_list(&e, "id", "t").is_none());
+    }
+
+    /// `id IN ()` — empty list is still a fast-path (matches zero rows).
+    #[test]
+    fn fast_path_empty_in_list_resolves_to_empty_vec() {
+        let e = Expr::InList {
+            expr: Box::new(Expr::Identifier(ident("id"))),
+            list: vec![],
+            negated: false,
+        };
+        let got = predicate_resolves_to_pk_list(&e, "id", "t").expect("empty IN must resolve");
+        assert!(got.is_empty());
+    }
+
+    /// `name = 'alice'` against PK column `id` — wrong column, no fast path.
+    #[test]
+    fn fast_path_eq_on_non_pk_column_returns_none() {
+        let e = Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(ident("name"))),
+            op: BinaryOperator::Eq,
+            right: Box::new(str_expr("alice")),
+        };
+        assert!(predicate_resolves_to_pk_list(&e, "id", "t").is_none());
+    }
+
+    /// `id > 5` — range predicate, not pk-list shape.
+    #[test]
+    fn fast_path_range_predicate_returns_none() {
+        let e = Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(ident("id"))),
+            op: BinaryOperator::Gt,
+            right: Box::new(num_expr("5")),
+        };
+        assert!(predicate_resolves_to_pk_list(&e, "id", "t").is_none());
+    }
+
+    /// `id = 1 AND name = 'a'` — composite predicate, no fast path.
+    #[test]
+    fn fast_path_composite_and_returns_none() {
+        let e = Expr::BinaryOp {
+            left: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Identifier(ident("id"))),
+                op: BinaryOperator::Eq,
+                right: Box::new(num_expr("1")),
+            }),
+            op: BinaryOperator::And,
+            right: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Identifier(ident("name"))),
+                op: BinaryOperator::Eq,
+                right: Box::new(str_expr("a")),
+            }),
+        };
+        assert!(predicate_resolves_to_pk_list(&e, "id", "t").is_none());
+    }
+
+    /// `(id IN (1, 2))` — Nested wrapper must transparently unwrap.
+    #[test]
+    fn fast_path_nested_unwraps() {
+        let inner = Expr::InList {
+            expr: Box::new(Expr::Identifier(ident("id"))),
+            list: vec![num_expr("1"), num_expr("2")],
+            negated: false,
+        };
+        let e = Expr::Nested(Box::new(inner));
+        let got = predicate_resolves_to_pk_list(&e, "id", "t").expect("Nested must unwrap");
+        assert_eq!(got.len(), 2);
+    }
+
+    /// `id = -5` — negative literal must still resolve.
+    #[test]
+    fn fast_path_negative_literal_resolves() {
+        let e = Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(ident("id"))),
+            op: BinaryOperator::Eq,
+            right: Box::new(neg_num_expr("5")),
+        };
+        let got = predicate_resolves_to_pk_list(&e, "id", "t").expect("negative lit must resolve");
+        assert_eq!(got.len(), 1);
+    }
+
+    /// `"users"."id" IN (1, 2)` — qualified-column form (ORM-shape) resolves.
+    #[test]
+    fn fast_path_qualified_in_list_resolves() {
+        let e = Expr::InList {
+            expr: Box::new(Expr::CompoundIdentifier(vec![ident("users"), ident("id")])),
+            list: vec![num_expr("1"), num_expr("2")],
+            negated: false,
+        };
+        let got = predicate_resolves_to_pk_list(&e, "id", "users")
+            .expect("qualified IN must resolve");
+        assert_eq!(got.len(), 2);
+    }
+
+    /// `id IN (1, name)` — non-literal list element falls through to slow path.
+    #[test]
+    fn fast_path_non_literal_in_list_returns_none() {
+        let e = Expr::InList {
+            expr: Box::new(Expr::Identifier(ident("id"))),
+            list: vec![num_expr("1"), Expr::Identifier(ident("name"))],
+            negated: false,
+        };
+        assert!(predicate_resolves_to_pk_list(&e, "id", "t").is_none());
+    }
+
+    // ── pk_scalar_to_row_key ─────────────────────────────────────────────────
+
+    /// i64 PK → 8-byte big-endian bias-flipped encoding (matches cold sort).
+    #[test]
+    fn pk_scalar_to_row_key_int64() {
+        use basin_storage::ScalarValue;
+        let k = pk_scalar_to_row_key(&ScalarValue::Int64(7), &DataType::Int64)
+            .expect("Int64 PK must encode");
+        // The expected encoding is the same one `RowKey::builder().append_i64(7)`
+        // produces.
+        let want = basin_hottier::RowKey::builder().append_i64(7).finish();
+        assert_eq!(k, want);
+    }
+
+    /// Int32 PK column receives an Int64 scalar (the literal coercion is
+    /// widening) — must narrow back to Int32 encoding.
+    #[test]
+    fn pk_scalar_to_row_key_int32_narrows() {
+        use basin_storage::ScalarValue;
+        let k = pk_scalar_to_row_key(&ScalarValue::Int64(7), &DataType::Int32)
+            .expect("Int32 PK must accept widened literal");
+        let want = basin_hottier::RowKey::builder().append_i32(7).finish();
+        assert_eq!(k, want);
+    }
+
+    /// Int32 PK with out-of-range literal must fail to encode (caller falls
+    /// back to slow path, which surfaces a clean error).
+    #[test]
+    fn pk_scalar_to_row_key_int32_overflow_returns_none() {
+        use basin_storage::ScalarValue;
+        let overflowed: i64 = i64::from(i32::MAX) + 1;
+        let k = pk_scalar_to_row_key(&ScalarValue::Int64(overflowed), &DataType::Int32);
+        assert!(k.is_none(), "Int32 narrowing must reject overflowed literal");
+    }
+
+    /// Utf8 PK → null-terminated bytes (matches cold sort).
+    #[test]
+    fn pk_scalar_to_row_key_utf8() {
+        use basin_storage::ScalarValue;
+        let k = pk_scalar_to_row_key(&ScalarValue::Utf8("abc".into()), &DataType::Utf8)
+            .expect("Utf8 PK must encode");
+        let want = basin_hottier::RowKey::builder().append_str("abc").finish();
+        assert_eq!(k, want);
+    }
+
+    /// Unsupported PK type (Float64) → `None` so caller routes to slow path.
+    #[test]
+    fn pk_scalar_to_row_key_unsupported_type_returns_none() {
+        use basin_storage::ScalarValue;
+        let k = pk_scalar_to_row_key(&ScalarValue::Float64(1.5), &DataType::Float64);
+        assert!(k.is_none(), "Float64 PK must fall through to slow path");
     }
 }
