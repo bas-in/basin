@@ -8,6 +8,14 @@
 //! groups without reading the column data. The same configuration must
 //! still return the correct row when the `id` exists.
 //!
+//! Pinned to Parquet: this test verifies parquet row-group/bloom-filter
+//! pruning specifically (a parquet-format feature surfaced via
+//! `row_groups_pruned_by_bloom` counters). The engine's Vortex default
+//! (post #161) uses a different chunk-pruning path that has its own
+//! coverage; the `WriteOptions` here explicitly set
+//! `file_format: FileFormat::Parquet` so the assertions still mean what
+//! they say.
+//!
 //! Why this matters. Min/max statistics already prune most files for a
 //! point query when the values are well-clustered (e.g. monotonically
 //! increasing IDs). The interesting case is the opposite: an `id` whose
@@ -38,7 +46,9 @@ use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::{Catalog, InMemoryCatalog};
 use basin_common::{PartitionKey, ProjectId, TableName};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
-use basin_storage::{Predicate, ReadOptions, ScalarValue, Storage, StorageConfig, WriteOptions};
+use basin_storage::{
+    FileFormat, Predicate, ReadOptions, ScalarValue, Storage, StorageConfig, WriteOptions,
+};
 use futures::StreamExt;
 use object_store::local::LocalFileSystem;
 use serde_json::json;
@@ -126,6 +136,7 @@ async fn viability_bloom_filter_pruning() {
 
     let batch = build_shuffled_batch();
     let opts = WriteOptions {
+        file_format: FileFormat::Parquet,
         bloom_filter_columns: meta.bloom_filter_columns.clone(),
         cluster_columns: vec![],
         max_row_group_size: Some(ROW_GROUP_SIZE),
@@ -341,6 +352,7 @@ async fn run_bloom_only_phase(
         RecordBatch::try_new(schema(), vec![Arc::new(id_arr), Arc::new(payload_arr)]).unwrap();
 
     let opts = WriteOptions {
+        file_format: FileFormat::Parquet,
         bloom_filter_columns: vec!["id".to_string()],
         cluster_columns: vec![],
         max_row_group_size: Some(ROW_GROUP_SIZE),

@@ -5,6 +5,13 @@
 //!      strictly fewer than half as many rows on a point query than the
 //!      same data laid out at the default 65,536-row group size.
 //!
+//! Pinned to Parquet: this test verifies parquet row-group sizing
+//! semantics (`row_groups_considered`, `row_groups_scanned`,
+//! `max_row_group_size`) — concepts that exist in the parquet file
+//! format. The engine's Vortex default (post #161) uses a different
+//! chunk-pruning path with its own coverage. Both CREATE TABLEs here
+//! pin `basin.file_format='parquet'` so the assertions still apply.
+//!
 //! Why this matters. Parquet pruning is row-group-granular: the smallest
 //! unit the reader can drop is one row group. With the default 65k-row
 //! group and a 16k-row table, the whole table is one group — every point
@@ -72,12 +79,18 @@ async fn viability_row_group_sizing() {
 
     // Create both tables with identical schema. `events_small` immediately
     // gets the override; `events_default` keeps the writer global default.
-    sess.execute("CREATE TABLE events_default (id BIGINT NOT NULL, payload TEXT NOT NULL)")
-        .await
-        .unwrap();
-    sess.execute("CREATE TABLE events_small (id BIGINT NOT NULL, payload TEXT NOT NULL)")
-        .await
-        .unwrap();
+    sess.execute(
+        "CREATE TABLE events_default (id BIGINT NOT NULL, payload TEXT NOT NULL) \
+         WITH (basin.file_format='parquet')",
+    )
+    .await
+    .unwrap();
+    sess.execute(
+        "CREATE TABLE events_small (id BIGINT NOT NULL, payload TEXT NOT NULL) \
+         WITH (basin.file_format='parquet')",
+    )
+    .await
+    .unwrap();
 
     // Catalog round-trip for the override before any INSERT runs — the
     // INSERT path reads `meta.row_group_rows` and feeds it to the writer.

@@ -9,6 +9,14 @@
 //! the parquet reader's seek path defeated bloom pruning on remote
 //! object stores, this card would catch it.
 //!
+//! Pinned to Parquet: this test verifies parquet row-group/bloom-filter
+//! pruning specifically (a parquet-format feature surfaced via
+//! `row_groups_pruned_by_bloom` counters). The engine's Vortex default
+//! (post #161) uses a different chunk-pruning path that has its own
+//! coverage; the `WriteOptions` here explicitly set
+//! `file_format: FileFormat::Parquet` so the assertions still mean what
+//! they say.
+//!
 //! Skips cleanly when `[s3]` is missing.
 
 #![allow(clippy::print_stdout)]
@@ -21,7 +29,9 @@ use basin_catalog::{Catalog, InMemoryCatalog};
 use basin_common::{PartitionKey, ProjectId, TableName};
 use basin_integration_tests::benchmark::{report_real_viability, BarOp, PrimaryMetric};
 use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop};
-use basin_storage::{Predicate, ReadOptions, ScalarValue, Storage, StorageConfig, WriteOptions};
+use basin_storage::{
+    FileFormat, Predicate, ReadOptions, ScalarValue, Storage, StorageConfig, WriteOptions,
+};
 use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
 use serde_json::json;
@@ -102,6 +112,7 @@ async fn s3_viability_bloom_filter_pruning() {
 
     let batch = build_shuffled_batch();
     let opts = WriteOptions {
+        file_format: FileFormat::Parquet,
         bloom_filter_columns: meta.bloom_filter_columns.clone(),
         cluster_columns: vec![],
         max_row_group_size: Some(ROW_GROUP_SIZE),
@@ -263,6 +274,7 @@ async fn run_bloom_only_phase(
         RecordBatch::try_new(schema(), vec![Arc::new(id_arr), Arc::new(payload_arr)]).unwrap();
 
     let opts = WriteOptions {
+        file_format: FileFormat::Parquet,
         bloom_filter_columns: vec!["id".to_string()],
         cluster_columns: vec![],
         max_row_group_size: Some(ROW_GROUP_SIZE),

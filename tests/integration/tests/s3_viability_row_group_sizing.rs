@@ -5,6 +5,13 @@
 //! half as many rows on a point query than the same data laid out at
 //! the default 65,536-row group size — same ratio as the LocalFS card.
 //!
+//! Pinned to Parquet: this test verifies parquet row-group sizing
+//! semantics (`row_groups_considered`, `row_groups_scanned`,
+//! `max_row_group_size`) — concepts that exist in the parquet file
+//! format. The engine's Vortex default (post #161) uses a different
+//! chunk-pruning path with its own coverage. Both CREATE TABLEs here
+//! pin `basin.file_format='parquet'` so the assertions still apply.
+//!
 //! Method:
 //!   1. Two tables, identical schema.
 //!      * `events_default` — no override (writer default 65k rows / group).
@@ -81,12 +88,18 @@ async fn s3_viability_row_group_sizing() {
     let project = ProjectId::new();
     let sess = engine.open_session(project).await.unwrap();
 
-    sess.execute("CREATE TABLE events_default (id BIGINT NOT NULL, payload TEXT NOT NULL)")
-        .await
-        .unwrap();
-    sess.execute("CREATE TABLE events_small (id BIGINT NOT NULL, payload TEXT NOT NULL)")
-        .await
-        .unwrap();
+    sess.execute(
+        "CREATE TABLE events_default (id BIGINT NOT NULL, payload TEXT NOT NULL) \
+         WITH (basin.file_format='parquet')",
+    )
+    .await
+    .unwrap();
+    sess.execute(
+        "CREATE TABLE events_small (id BIGINT NOT NULL, payload TEXT NOT NULL) \
+         WITH (basin.file_format='parquet')",
+    )
+    .await
+    .unwrap();
 
     sess.execute("ALTER TABLE events_small SET row_group_rows = 4096")
         .await
