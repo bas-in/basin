@@ -60,9 +60,7 @@ pub use scheduler::{ProjectIoStats, Scheduler, DEFAULT_GLOBAL_BUDGET};
 pub use tier::Tier;
 pub use vector_index::{vector_index_segment_key_for_data_file, VectorHit};
 pub use vortex_footer_cache::VortexFooterCache;
-pub use writer::{bloom_from_bytes, FileFormat, WriteOptions};
-// EncodingMode export removed pending #92 (Vortex 2-pass) re-attempt;
-// orphan ref reintroduced multiple times by working-tree resets.
+pub use writer::{bloom_from_bytes, EncodingMode, FileFormat, WriteOptions};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;

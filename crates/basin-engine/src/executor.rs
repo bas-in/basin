@@ -5222,7 +5222,15 @@ fn write_options_for(meta: &TableMetadata) -> WriteOptions {
         // next compaction rewrites the file with `Best`, so the disk-size
         // delta is transient. Hot-tier flushes always use `Fast` and are
         // independent of this env var (see basin-shard ShardFlushBackend).
-        // encoding_mode removed pending #92 (Vortex 2-pass) re-attempt.
+        encoding_mode: if std::env::var_os("BASIN_FAST_BULK_INSERT")
+            .as_deref()
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            basin_storage::EncodingMode::Fast
+        } else {
+            basin_storage::EncodingMode::Best
+        },
     }
 }
 
