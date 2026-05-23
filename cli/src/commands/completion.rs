@@ -143,3 +143,77 @@ fn escape_zsh(s: &str) -> String {
 fn escape_fish(s: &str) -> String {
     s.replace('\'', r"\'")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flags() -> GlobalFlags {
+        GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn no_args_prints_help_and_returns_ok() {
+        // No shell argument — dispatcher renders the help block.
+        assert!(cmd_completion(&flags(), &[]).is_ok());
+    }
+
+    #[test]
+    fn help_flag_returns_ok() {
+        assert!(cmd_completion(&flags(), &["--help".into()]).is_ok());
+        assert!(cmd_completion(&flags(), &["-h".into()]).is_ok());
+        assert!(cmd_completion(&flags(), &["help".into()]).is_ok());
+    }
+
+    #[test]
+    fn unknown_shell_is_silent_error() {
+        let err = cmd_completion(&flags(), &["tcsh".into()]).unwrap_err();
+        assert!(crate::error::is_silent(err.as_ref()), "error: {err}");
+    }
+
+    #[test]
+    fn bash_output_is_non_empty_and_complete() {
+        let mut buf = Vec::<u8>::new();
+        write_bash(&mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(!s.is_empty());
+        // Sanity-check that the dispatch-table name list was inlined.
+        assert!(s.contains("complete -F _basin basin"));
+        assert!(s.contains("--api-url"));
+    }
+
+    #[test]
+    fn zsh_output_starts_with_compdef() {
+        let mut buf = Vec::<u8>::new();
+        write_zsh(&mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.starts_with("#compdef basin"));
+        assert!(s.contains("_arguments"));
+    }
+
+    #[test]
+    fn fish_output_emits_per_subcommand_lines() {
+        let mut buf = Vec::<u8>::new();
+        write_fish(&mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("complete -c basin"));
+        // Every global flag becomes its own `complete -c basin -l <name>` line.
+        assert!(s.contains("-l api-url"));
+        assert!(s.contains("-l json"));
+    }
+
+    #[test]
+    fn command_names_includes_every_dispatch_entry() {
+        let names = command_names();
+        assert!(!names.is_empty());
+        // The five commands we care about all live in the table.
+        assert!(names.contains(&"login"));
+        assert!(names.contains(&"logout"));
+        assert!(names.contains(&"whoami"));
+        assert!(names.contains(&"version"));
+        assert!(names.contains(&"completion"));
+    }
+}

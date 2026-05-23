@@ -10,7 +10,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 /// Captured request passed to a [`TestServer`] handler.
 pub struct Req {
@@ -114,9 +114,16 @@ impl TestServer {
 /// the duration of the returned guard, so config reads/writes don't
 /// touch the developer's real ~/.config/basin. Returns the guard; drop
 /// it (end of test) to restore the previous value.
+///
+/// XDG_CONFIG_HOME is a process-global env var, so parallel tests can
+/// race on it (test A sets it to /tmp/A; test B sets it to /tmp/B
+/// mid-write, and test A's rename target now lives under /tmp/B). The
+/// guard holds a process-wide [`Mutex`] for its lifetime, serialising
+/// every config-touching test. Drop releases the mutex.
 pub struct ConfigDirGuard {
     prev: Option<std::ffi::OsString>,
     _dir: std::path::PathBuf,
+    _lock: MutexGuard<'static, ()>,
 }
 
 impl Drop for ConfigDirGuard {
@@ -128,12 +135,27 @@ impl Drop for ConfigDirGuard {
     }
 }
 
+fn config_dir_mutex() -> &'static Mutex<()> {
+    static M: OnceLock<Mutex<()>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(()))
+}
+
 pub fn with_temp_config_dir() -> ConfigDirGuard {
+    // Take the lock BEFORE touching the env var so concurrent tests serialise
+    // cleanly. A poisoned mutex still works here — we don't share state, just
+    // a critical section, so recover from the poison.
+    let lock = config_dir_mutex()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let prev = std::env::var_os("XDG_CONFIG_HOME");
     let dir = std::env::temp_dir().join(format!("basin-test-{}", unique()));
     std::fs::create_dir_all(&dir).expect("create temp config dir");
     std::env::set_var("XDG_CONFIG_HOME", &dir);
-    ConfigDirGuard { prev, _dir: dir }
+    ConfigDirGuard {
+        prev,
+        _dir: dir,
+        _lock: lock,
+    }
 }
 
 fn unique() -> u128 {
