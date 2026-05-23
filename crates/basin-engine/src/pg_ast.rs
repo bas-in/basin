@@ -255,8 +255,10 @@ impl StmtKind {
     /// `noop_accept::try_accept_as_noop` must be removed from here so
     /// `reject_unsupported` does not block them before noop dispatch runs.
     ///
-    /// LISTEN / NOTIFY / UNLISTEN are explicit non-goals per ADR 0012 and
-    /// remain here — they surface 0A000 intentionally.
+    /// LISTEN / NOTIFY / UNLISTEN are now wired through the engine's SQL
+    /// pub-sub primitive (`crate::notify_registry`) and are no longer
+    /// design exclusions; the executor dispatches them before this gate
+    /// runs.
     /// rejected by [`reject_unsupported`]. Centralised so the executor
     /// and the test suite stay in sync.
     pub fn is_unsupported(&self) -> bool {
@@ -266,11 +268,8 @@ impl StmtKind {
         // implementation; reject_unsupported must let them through.
         matches!(
             self,
-            StmtKind::Listen
-                | StmtKind::Notify
-                | StmtKind::Unlisten
-                // ADR 0012 design exclusions — no PL/pgSQL runtime
-                | StmtKind::DoBlock
+            // ADR 0012 design exclusions — no PL/pgSQL runtime
+            StmtKind::DoBlock
                 // Declarative partitioning — flat-storage design exclusion
                 | StmtKind::CreateTablePartitionOf
         )
@@ -682,6 +681,46 @@ pub enum TxnStmt {
     ReleaseSavepoint(String),
     /// Any other transaction node (PREPARE TRANSACTION, etc.).
     Other,
+}
+
+/// Parsed pub-sub statement (`LISTEN` / `NOTIFY` / `UNLISTEN`) with the
+/// channel name lifted straight from libpg_query's `conditionname` field,
+/// so identifier-quoting and case-folding are handled by the canonical
+/// parser rather than re-scraped from the SQL text. `UNLISTEN *` is
+/// represented as [`PubSubStmt::UnlistenAll`] — libpg_query encodes the
+/// star as an empty `conditionname`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PubSubStmt {
+    /// `LISTEN <channel>`.
+    Listen(String),
+    /// `NOTIFY <channel>[, '<payload>']`.
+    Notify { channel: String, payload: String },
+    /// `UNLISTEN <channel>`.
+    Unlisten(String),
+    /// `UNLISTEN *`.
+    UnlistenAll,
+}
+
+/// Classify `node` as a [`PubSubStmt`] when it is a `ListenStmt` /
+/// `NotifyStmt` / `UnlistenStmt`. Returns `None` for other statement
+/// kinds.
+pub fn pubsub_stmt(node: &Node) -> Option<PubSubStmt> {
+    match node.node.as_ref()? {
+        NodeEnum::ListenStmt(s) => Some(PubSubStmt::Listen(s.conditionname.clone())),
+        NodeEnum::NotifyStmt(s) => Some(PubSubStmt::Notify {
+            channel: s.conditionname.clone(),
+            payload: s.payload.clone(),
+        }),
+        NodeEnum::UnlistenStmt(s) => {
+            // libpg_query: `conditionname` is empty for `UNLISTEN *`.
+            if s.conditionname.is_empty() {
+                Some(PubSubStmt::UnlistenAll)
+            } else {
+                Some(PubSubStmt::Unlisten(s.conditionname.clone()))
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Classify `node` as a [`TxnStmt`] when it is a `TransactionStmt`.
@@ -1569,14 +1608,16 @@ mod tests {
 
     #[test]
     fn reject_unsupported_blocks_each_kind() {
-        // Every kind in `is_unsupported()` must produce a
-        // FeatureNotSupported with SQLSTATE 0A000. Per ADR 0012 only
-        // pub/sub statements are unconditionally rejected; everything else
-        // is either noop-accepted or has a real implementation.
+        // The remaining unconditionally-rejected kinds: PL/pgSQL anonymous
+        // blocks and declarative-partitioning DDL (ADR 0012 design
+        // exclusions). LISTEN/NOTIFY/UNLISTEN are no longer rejected —
+        // they wire through `crate::notify_registry`.
         let cases = [
-            ("LISTEN ch", "LISTEN"),
-            ("NOTIFY ch", "NOTIFY"),
-            ("UNLISTEN ch", "UNLISTEN"),
+            ("DO $$ BEGIN END $$", "DO"),
+            (
+                "CREATE TABLE c PARTITION OF p FOR VALUES IN (1)",
+                "PARTITION OF",
+            ),
         ];
 
         for (sql, label) in cases {
@@ -1595,6 +1636,35 @@ mod tests {
                 }
                 other => panic!("{sql:?}: expected FeatureNotSupported, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn pubsub_stmt_extracts_channel_and_payload() {
+        let cases = [
+            ("LISTEN foo", PubSubStmt::Listen("foo".into())),
+            (
+                "NOTIFY foo, 'hello'",
+                PubSubStmt::Notify {
+                    channel: "foo".into(),
+                    payload: "hello".into(),
+                },
+            ),
+            (
+                "NOTIFY foo",
+                PubSubStmt::Notify {
+                    channel: "foo".into(),
+                    payload: String::new(),
+                },
+            ),
+            ("UNLISTEN foo", PubSubStmt::Unlisten("foo".into())),
+            ("UNLISTEN *", PubSubStmt::UnlistenAll),
+        ];
+        for (sql, want) in cases {
+            let tree = parse(sql).unwrap_or_else(|e| panic!("parse {sql:?}: {e}"));
+            let node = tree.stmts().next().expect("stmt");
+            let got = pubsub_stmt(node).expect("pubsub_stmt");
+            assert_eq!(got, want, "{sql}");
         }
     }
 

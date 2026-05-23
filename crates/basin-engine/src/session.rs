@@ -516,6 +516,13 @@ pub(crate) struct SessionState {
     /// the executor at the start of every `execute()` call; the idle-in-txn
     /// reaper compares this against the current time.
     pub(crate) last_active: std::sync::Mutex<std::time::Instant>,
+
+    /// Per-session SQL `LISTEN` subscriptions and the buffer of pending
+    /// `NOTIFY` payloads queued inside an open transaction (PG buffers
+    /// notifications until COMMIT and discards them on ROLLBACK). All
+    /// state behind one `Mutex` so executor handlers can flip
+    /// subscriptions and drain pending notifies atomically.
+    pub(crate) listen: std::sync::Mutex<ListenState>,
 }
 
 impl Drop for SessionState {
@@ -524,7 +531,36 @@ impl Drop for SessionState {
         // (session- and xact-scoped). Matches PG, which drops all advisory
         // locks held by a backend when the connection terminates.
         self.advisory.release_all_on_session_end();
+        // LISTEN subscriptions are dropped automatically — the broadcast
+        // receivers live inside `ListenState::subscriptions`, which is
+        // owned by this `SessionState`. Once the `Mutex` drops, each
+        // `ListenSubscription` drops its receiver and the NotifyRegistry's
+        // per-channel sender sees the receiver count fall to zero (entry
+        // becomes prunable). No explicit unlisten call is required.
     }
+}
+
+/// Per-session SQL LISTEN / NOTIFY state. Holds the active subscription
+/// handles plus the pending-notify buffer that PG semantics require:
+/// `NOTIFY` issued inside an open transaction is queued and only fanned
+/// out on `COMMIT`; `ROLLBACK` discards the buffer.
+#[derive(Default)]
+pub(crate) struct ListenState {
+    /// Active subscriptions, keyed by lowercased channel name.
+    pub(crate) subscriptions:
+        HashMap<String, Arc<crate::notify_registry::ListenSubscription>>,
+    /// Notifications buffered while a transaction is open. Drained and
+    /// dispatched to the engine `NotifyRegistry` on COMMIT; cleared on
+    /// ROLLBACK. Auto-commit `NOTIFY` bypasses this buffer entirely and
+    /// publishes immediately.
+    pub(crate) pending_tx_notifies: Vec<PendingNotify>,
+}
+
+/// One queued NOTIFY waiting for transaction commit.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingNotify {
+    pub channel: String,
+    pub payload: String,
 }
 
 impl SessionState {
@@ -544,8 +580,79 @@ impl SessionState {
             lock_timeout: std::sync::Mutex::new(None),
             idle_in_transaction_session_timeout: std::sync::Mutex::new(None),
             last_active: std::sync::Mutex::new(std::time::Instant::now()),
+            listen: std::sync::Mutex::new(ListenState::default()),
         }
     }
+}
+
+// ── LISTEN / NOTIFY session-state helpers ───────────────────────────────────
+
+/// Subscribe this session to `channel` in `project`. Idempotent: if the
+/// session is already listening on `channel` (normalised case), the
+/// existing subscription is kept and no second receiver is created.
+pub(crate) fn listen_subscribe(
+    state: &SessionState,
+    registry: &crate::notify_registry::NotifyRegistry,
+    project: ProjectId,
+    channel: &str,
+) {
+    let normalised = channel.to_ascii_lowercase();
+    let mut listen = state.listen.lock().expect("listen lock poisoned");
+    if listen.subscriptions.contains_key(&normalised) {
+        return;
+    }
+    let sub = Arc::new(registry.subscribe(project, &normalised));
+    listen.subscriptions.insert(normalised, sub);
+}
+
+/// Drop a single channel subscription. No-op if absent.
+pub(crate) fn listen_unsubscribe(state: &SessionState, channel: &str) {
+    let normalised = channel.to_ascii_lowercase();
+    let mut listen = state.listen.lock().expect("listen lock poisoned");
+    listen.subscriptions.remove(&normalised);
+}
+
+/// `UNLISTEN *` — drop every subscription this session holds. Also clears
+/// the pending-notify buffer (PG semantics: UNLISTEN does not affect
+/// already-queued notifies, but the pool-return scrub path that calls
+/// this also issues ROLLBACK so any buffered notifies would be dropped
+/// either way).
+pub(crate) fn listen_unsubscribe_all(state: &SessionState) {
+    let mut listen = state.listen.lock().expect("listen lock poisoned");
+    listen.subscriptions.clear();
+    listen.pending_tx_notifies.clear();
+}
+
+/// Snapshot the channel names this session is currently listening on, in
+/// sorted order. Used by `pg_listening_channels()`.
+pub(crate) fn listen_channels(state: &SessionState) -> Vec<String> {
+    let listen = state.listen.lock().expect("listen lock poisoned");
+    let mut chans: Vec<String> = listen.subscriptions.keys().cloned().collect();
+    chans.sort();
+    chans
+}
+
+/// Queue a NOTIFY for delivery on COMMIT. The caller has already checked
+/// that `tx_is_active(state)` is true.
+pub(crate) fn listen_buffer_notify(state: &SessionState, channel: String, payload: String) {
+    let mut listen = state.listen.lock().expect("listen lock poisoned");
+    listen
+        .pending_tx_notifies
+        .push(PendingNotify { channel, payload });
+}
+
+/// Drain the per-session pending-notify buffer. Called on COMMIT to fan
+/// the buffered notifications out to the engine `NotifyRegistry`.
+pub(crate) fn listen_take_pending_notifies(state: &SessionState) -> Vec<PendingNotify> {
+    let mut listen = state.listen.lock().expect("listen lock poisoned");
+    std::mem::take(&mut listen.pending_tx_notifies)
+}
+
+/// Clear the pending-notify buffer without dispatching. Called on
+/// ROLLBACK.
+pub(crate) fn listen_discard_pending_notifies(state: &SessionState) {
+    let mut listen = state.listen.lock().expect("listen lock poisoned");
+    listen.pending_tx_notifies.clear();
 }
 
 /// Mark the start of an explicit transaction. Snapshots the current
@@ -1215,6 +1322,11 @@ pub(crate) async fn open(
         engine.clone(),
     );
 
+    // SQL pub-sub introspection: `pg_listening_channels()` reports the
+    // channels this session is currently listening on. Per-session because
+    // each pgwire backend tracks its own subscription set.
+    crate::notify_registry::register_pg_listening_channels(&ctx, state.clone());
+
     Ok(ProjectSession {
         engine,
         project,
@@ -1360,10 +1472,20 @@ pub(crate) async fn refresh_table(
         }
         let cfg = ListingTableConfig::new_with_multi_paths(urls)
             .with_listing_options(listing_options)
-            .with_schema(df_schema);
+            .with_schema(df_schema.clone());
         let provider = ListingTable::try_new(cfg)
             .map_err(|e| BasinError::internal(format!("ListingTable::try_new {table}: {e}")))?;
-        ctx.register_table(tref(), Arc::new(provider))
+        // Wrap with the merge-on-read tombstone filter so SELECTs after a
+        // fast-path DELETE never observe the now-deleted cold-tier row.
+        let provider = wrap_with_tombstone_filter(
+            Arc::new(provider) as Arc<dyn datafusion::catalog::TableProvider>,
+            engine,
+            project,
+            table,
+            &meta.pk_columns,
+            df_schema,
+        );
+        ctx.register_table(tref(), provider)
             .map_err(|e| BasinError::internal(format!("register_table {table}: {e}")))?;
     }
 
@@ -1381,6 +1503,33 @@ pub(crate) async fn refresh_table(
     }
 
     Ok(())
+}
+
+/// Wrap `cold` with a [`crate::hot_tombstone::TombstoneFilteringTable`] so
+/// follow-up reads after a fast-path DELETE see the tombstoned cold-tier rows
+/// dropped before they reach the SELECT projection.
+///
+/// When the table has a composite PK (or no PK) the wrap is a no-op — the
+/// fast-path DELETE writer rejects those shapes, so no tombstone can exist.
+fn wrap_with_tombstone_filter(
+    cold: Arc<dyn datafusion::catalog::TableProvider>,
+    engine: &Engine,
+    project: &ProjectId,
+    table: &TableName,
+    pk_columns: &[String],
+    catalog_schema: Arc<arrow_schema::Schema>,
+) -> Arc<dyn datafusion::catalog::TableProvider> {
+    if pk_columns.len() != 1 {
+        return cold;
+    }
+    Arc::new(crate::hot_tombstone::TombstoneFilteringTable::new(
+        cold,
+        engine.clone(),
+        *project,
+        table.clone(),
+        pk_columns.to_vec(),
+        catalog_schema,
+    ))
 }
 
 /// Phase 5.18.C — schema-qualified variant of [`refresh_table`].
@@ -1445,10 +1594,19 @@ pub(crate) async fn refresh_table_qualified(
         }
         let cfg = ListingTableConfig::new_with_multi_paths(urls)
             .with_listing_options(listing_options)
-            .with_schema(df_schema);
+            .with_schema(df_schema.clone());
         let provider = ListingTable::try_new(cfg)
             .map_err(|e| BasinError::internal(format!("ListingTable::try_new {bare_name}: {e}")))?;
-        ctx.register_table(tref(), Arc::new(provider))
+        // Merge-on-read tombstone suppression — see `refresh_table`.
+        let provider = wrap_with_tombstone_filter(
+            Arc::new(provider) as Arc<dyn datafusion::catalog::TableProvider>,
+            engine,
+            project,
+            bare_name,
+            &meta.pk_columns,
+            df_schema,
+        );
+        ctx.register_table(tref(), provider)
             .map_err(|e| BasinError::internal(format!("register_table {bare_name}: {e}")))?;
     }
 
@@ -1511,10 +1669,19 @@ pub(crate) async fn refresh_table_with_extra(
     }
     let cfg = ListingTableConfig::new_with_multi_paths(urls)
         .with_listing_options(listing_options)
-        .with_schema(df_schema);
+        .with_schema(df_schema.clone());
     let provider = ListingTable::try_new(cfg)
         .map_err(|e| BasinError::internal(format!("ListingTable::try_new {table}: {e}")))?;
-    ctx.register_table(tref(), Arc::new(provider))
+    // Merge-on-read tombstone suppression — see `refresh_table`.
+    let provider = wrap_with_tombstone_filter(
+        Arc::new(provider) as Arc<dyn datafusion::catalog::TableProvider>,
+        engine,
+        project,
+        table,
+        &meta.pk_columns,
+        df_schema,
+    );
+    ctx.register_table(tref(), provider)
         .map_err(|e| BasinError::internal(format!("register_table {table}: {e}")))?;
 
     state
@@ -1601,8 +1768,15 @@ pub(crate) async fn refresh_table_with_htap(
             ListingTable::try_new(cfg)
                 .map_err(|e| BasinError::internal(format!("ListingTable::try_new {table}: {e}")))?,
         );
-        let union_provider =
-            HtapUnionTable::new(listing_provider, Arc::new(htap_provider), df_schema);
+        let union_provider = HtapUnionTable::new(
+            listing_provider,
+            Arc::new(htap_provider),
+            df_schema,
+            engine.clone(),
+            *project,
+            table.clone(),
+            meta.pk_columns.clone(),
+        );
         ctx.register_table(tref(), Arc::new(union_provider))
             .map_err(|e| BasinError::internal(format!("register_table htap-union {table}: {e}")))?;
     }
@@ -1641,6 +1815,14 @@ struct HtapUnionTable {
     cold: Arc<dyn datafusion::catalog::TableProvider>,
     hot: Arc<dyn datafusion::catalog::TableProvider>,
     schema: Arc<arrow_schema::Schema>,
+    /// Engine handle for the process-wide memtable registry — consulted on
+    /// scan to suppress any cold-tier rows that have been tombstoned by an
+    /// out-of-tx fast-path DELETE. Cheap to clone (`Arc` inside).
+    engine: Engine,
+    project: ProjectId,
+    table: TableName,
+    /// Single-column PK is required for tombstone-key encoding.
+    pk_columns: Vec<String>,
 }
 
 impl std::fmt::Debug for HtapUnionTable {
@@ -1654,8 +1836,20 @@ impl HtapUnionTable {
         cold: Arc<dyn datafusion::catalog::TableProvider>,
         hot: Arc<dyn datafusion::catalog::TableProvider>,
         schema: Arc<arrow_schema::Schema>,
+        engine: Engine,
+        project: ProjectId,
+        table: TableName,
+        pk_columns: Vec<String>,
     ) -> Self {
-        Self { cold, hot, schema }
+        Self {
+            cold,
+            hot,
+            schema,
+            engine,
+            project,
+            table,
+            pk_columns,
+        }
     }
 }
 
@@ -1683,6 +1877,17 @@ impl datafusion::catalog::TableProvider for HtapUnionTable {
         use datafusion::physical_plan::union::UnionExec;
 
         let cold_plan = self.cold.scan(state, projection, filters, limit).await?;
+        // Merge-on-read tombstone suppression: drop cold-tier rows whose
+        // PK has been tombstoned by a fast-path DELETE in the process-wide
+        // registry.
+        let cold_plan = crate::hot_tombstone::maybe_wrap_with_tombstone_filter(
+            cold_plan,
+            self.engine.memtable_registry().as_ref(),
+            &self.project,
+            &self.table,
+            &self.pk_columns,
+            self.schema.as_ref(),
+        );
         let hot_plan = self.hot.scan(state, projection, filters, limit).await?;
         Ok(Arc::new(UnionExec::new(vec![cold_plan, hot_plan])))
     }

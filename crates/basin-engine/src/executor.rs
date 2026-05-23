@@ -93,6 +93,64 @@ use crate::session::refresh_table;
 use crate::{ExecResult, ProjectSession};
 use basin_catalog::PartitionSpec;
 
+/// Dispatch `LISTEN` / `UNLISTEN` / `NOTIFY` through the engine's SQL
+/// pub-sub primitive (`crate::notify_registry`).
+///
+/// PG transaction semantics: `NOTIFY` issued inside an open transaction is
+/// buffered and only fanned out on `COMMIT`; `ROLLBACK` discards it.
+/// `LISTEN` / `UNLISTEN` take effect immediately (they are not transactional
+/// in PG either — the docs explicitly state subscriptions are session state
+/// not txn state).
+async fn exec_pubsub(
+    sess: &ProjectSession,
+    ps: crate::pg_ast::PubSubStmt,
+) -> Result<ExecResult> {
+    use crate::pg_ast::PubSubStmt;
+    let registry = sess.engine.notify_registry();
+    match ps {
+        PubSubStmt::Listen(channel) => {
+            if channel.is_empty() {
+                return Err(BasinError::InvalidSchema(
+                    "LISTEN: channel name is required".into(),
+                ));
+            }
+            crate::session::listen_subscribe(&sess.state, registry, sess.project, &channel);
+            Ok(ExecResult::Empty {
+                tag: "LISTEN".into(),
+            })
+        }
+        PubSubStmt::Unlisten(channel) => {
+            crate::session::listen_unsubscribe(&sess.state, &channel);
+            Ok(ExecResult::Empty {
+                tag: "UNLISTEN".into(),
+            })
+        }
+        PubSubStmt::UnlistenAll => {
+            crate::session::listen_unsubscribe_all(&sess.state);
+            Ok(ExecResult::Empty {
+                tag: "UNLISTEN".into(),
+            })
+        }
+        PubSubStmt::Notify { channel, payload } => {
+            if channel.is_empty() {
+                return Err(BasinError::InvalidSchema(
+                    "NOTIFY: channel name is required".into(),
+                ));
+            }
+            if crate::session::tx_is_active(&sess.state) {
+                // PG semantics: queue until COMMIT; discard on ROLLBACK.
+                crate::session::listen_buffer_notify(&sess.state, channel, payload);
+            } else {
+                // Auto-commit: publish immediately.
+                registry.publish(sess.project, &channel, &payload, sess.session_pid);
+            }
+            Ok(ExecResult::Empty {
+                tag: "NOTIFY".into(),
+            })
+        }
+    }
+}
+
 pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResult> {
     // Phase 5.28.C: touch last-activity timestamp so the idle-in-txn reaper
     // sees that this session is still making progress. Done unconditionally at
@@ -148,14 +206,20 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
         // Collect statement kinds so we can dispatch before sqlparser.
         let kinds: Vec<_> = tree.stmts().map(|n| crate::pg_ast::stmt_kind(n)).collect();
 
-        // Reject LISTEN/NOTIFY/UNLISTEN — not on the roadmap (ADR 0012 / pub/sub).
-        for kind in &kinds {
+        // Dispatch LISTEN / NOTIFY / UNLISTEN through the engine's SQL
+        // pub-sub primitive (`crate::notify_registry`). For multi-statement
+        // bodies we only fast-path single-statement messages here — the
+        // router splits multi-statement simple-query into individual
+        // statements before reaching this entry point, so the common case
+        // is `kinds.len() == 1`.
+        if kinds.len() == 1 {
             use crate::pg_ast::StmtKind;
-            if matches!(kind, StmtKind::Listen | StmtKind::Notify) {
-                return Err(basin_common::BasinError::FeatureNotSupported(format!(
-                    "{} is not supported (SQLSTATE 0A000)",
-                    kind.as_label()
-                )));
+            let kind = kinds[0];
+            if matches!(kind, StmtKind::Listen | StmtKind::Notify | StmtKind::Unlisten) {
+                let node = tree.stmts().next().expect("kinds[0] implies stmts[0]");
+                let ps = crate::pg_ast::pubsub_stmt(node)
+                    .expect("pubsub stmt kind must classify");
+                return exec_pubsub(sess, ps).await;
             }
         }
 
@@ -250,6 +314,24 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                                 table,
                             )
                             .await;
+                        }
+                    }
+                    // Flush any NOTIFY payloads buffered during this
+                    // transaction to the engine's NotifyRegistry. PG
+                    // semantics: notifies queued inside BEGIN..COMMIT only
+                    // fire on COMMIT; they are silently dropped on
+                    // ROLLBACK (handled in the Rollback arm below).
+                    let pending_notifies =
+                        crate::session::listen_take_pending_notifies(&sess.state);
+                    if !pending_notifies.is_empty() {
+                        let registry = sess.engine.notify_registry();
+                        for n in pending_notifies {
+                            registry.publish(
+                                sess.project,
+                                &n.channel,
+                                &n.payload,
+                                sess.session_pid,
+                            );
                         }
                     }
                     return Ok(ExecResult::Empty {
@@ -398,6 +480,12 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                                 )
                                 .await;
                             }
+                            // PG semantics: NOTIFY payloads buffered inside
+                            // this transaction are silently discarded on
+                            // ROLLBACK. Subscriptions themselves are session
+                            // state and survive — only the queued sends
+                            // are dropped.
+                            crate::session::listen_discard_pending_notifies(&sess.state);
                             return Ok(ExecResult::Empty {
                                 tag: "ROLLBACK".into(),
                             });

@@ -219,22 +219,14 @@ async fn open_cursor_does_not_survive_pool_return() {
 // ---------------------------------------------------------------------------
 // Test D: LISTEN subscription must not survive pool return.
 //
-// #[ignore] — LISTEN/UNLISTEN routing through ProjectSession::execute is not
-// yet confirmed; routing may go through the realtime substrate instead.
-// Flips green at Phase 5.27.E once routing is confirmed.
+// Closed by: LISTEN/UNLISTEN/NOTIFY wired through the engine's pub-sub
+// registry (`crate::notify_registry`); `reset_for_pool_reuse` issues
+// `UNLISTEN *` so subscriptions cannot cross a pooled checkout boundary.
 // ---------------------------------------------------------------------------
 
 /// A LISTEN subscription must be cancelled (UNLISTEN) when the session is
 /// returned to the pool.
-///
-/// **`#[ignore]`** — LISTEN through `ProjectSession::execute` still returns
-/// `FeatureNotSupported` (SQLSTATE 0A000) as of 5.27.E. Until the SQL-level
-/// LISTEN path is wired into the realtime channel substrate (and the pool
-/// reset emits `UNLISTEN *`), this test cannot exercise the leakage scenario.
 #[tokio::test]
-#[ignore = "LISTEN via ProjectSession::execute returns FeatureNotSupported (SQLSTATE 0A000); \
-    SQL-level LISTEN/UNLISTEN is not yet wired to the realtime channel substrate so the pool \
-    has nothing to scrub; closes when LISTEN routing lands"]
 async fn listen_subscription_does_not_survive_pool_return() {
     let dir = TempDir::new().unwrap();
     let engine = build_engine(&dir);

@@ -240,6 +240,10 @@ pub(crate) struct EngineInner {
     /// Tracks `CREATE PUBLICATION … FOR TABLE …` declarations per project.
     /// Consulted by the pgoutput encoder to filter the change stream.
     pub(crate) publication_registry: Arc<basin_catalog::PublicationRegistry>,
+
+    /// SQL-level `LISTEN` / `NOTIFY` pub-sub registry. One per process;
+    /// keyed by `(ProjectId, channel-name)` with arbitrary text payloads.
+    pub(crate) notify_registry: crate::notify_registry::NotifyRegistry,
 }
 
 impl Engine {
@@ -328,6 +332,8 @@ impl Engine {
             slot_registry: Arc::new(basin_catalog::SlotRegistry::new()),
             // Phase 5.21.E: process-wide publication registry.
             publication_registry: Arc::new(basin_catalog::PublicationRegistry::new()),
+            // SQL-level LISTEN/NOTIFY registry.
+            notify_registry: crate::notify_registry::NotifyRegistry::new(),
         });
         // Phase 5.14.D2: register the query-history adapter with the shard so
         // the compactor can consult observed ORDER BY / GROUP BY patterns.
@@ -513,6 +519,11 @@ impl Engine {
     /// Phase 5.23.D: access the process-wide lock registry for pg_locks.
     pub(crate) fn lock_registry(&self) -> &basin_shard::LockRegistry {
         &self.inner.lock_registry
+    }
+
+    /// SQL-level `LISTEN` / `NOTIFY` registry accessor.
+    pub fn notify_registry(&self) -> &crate::notify_registry::NotifyRegistry {
+        &self.inner.notify_registry
     }
 
     /// Phase 5.23.C: access the process-wide connection registry for pg_stat_activity.
@@ -1033,6 +1044,7 @@ mod jsonb_udf;
 mod lifecycle;
 mod net_glue;
 mod noisy_detector;
+mod notify_registry;
 mod nullif_rewrite;
 pub mod noop_accept;
 mod pg_agg_udf;
