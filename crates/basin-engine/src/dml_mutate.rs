@@ -86,6 +86,16 @@ use sqlparser::ast::{
 /// result as a literal list and feed it through the normal predicate path.
 /// The function is recursive so nested AND/OR containing IN-subqueries work
 /// too.
+
+/// Maximum number of rows we'll materialise from an `IN (SELECT …)` sub-SELECT
+/// before refusing the rewrite. Beyond this, the literal-list rewrite is
+/// O(N) memory both for the AST and for the per-row predicate eval, so we
+/// stop the user with a typed error pointing at the JOIN form (which is
+/// streamed by DataFusion) before they OOM the engine. Picked at 100k because
+/// `IN (lit, lit, …)` lists under that size still parse + plan in <100ms in
+/// our benchmarks; above that the predicate engine starts dominating.
+pub(crate) const MAX_IN_SUBQUERY_ROWS: usize = 100_000;
+
 pub(crate) async fn resolve_subqueries_in_expr(sess: &ProjectSession, expr: Expr) -> Result<Expr> {
     match expr {
         Expr::InSubquery {
@@ -104,6 +114,12 @@ pub(crate) async fn resolve_subqueries_in_expr(sess: &ProjectSession, expr: Expr
             // Convert from DataFusion's internal arrow version to the workspace
             // arrow version so the column type-check in `arrow_col_value_to_expr`
             // sees the correct trait object.
+            //
+            // Bound the materialisation at `MAX_IN_SUBQUERY_ROWS` so a pathological
+            // sub-SELECT (`WHERE id IN (SELECT id FROM huge_table)`) refuses early
+            // with a clean message instead of OOM'ing the engine. The JOIN form
+            // (`UPDATE t SET … FROM (SELECT id FROM huge_table) src WHERE t.id = src.id`)
+            // streams through DataFusion and is the right shape for large inputs.
             let mut list: Vec<Expr> = Vec::new();
             for df_batch in &df_batches {
                 if df_batch.num_columns() == 0 {
@@ -114,6 +130,14 @@ pub(crate) async fn resolve_subqueries_in_expr(sess: &ProjectSession, expr: Expr
                 for i in 0..col.len() {
                     if col.is_null(i) {
                         continue; // NULL IN (…) never matches; skip
+                    }
+                    if list.len() >= MAX_IN_SUBQUERY_ROWS {
+                        return Err(BasinError::InvalidSchema(format!(
+                            "IN (SELECT …) sub-SELECT returned more than {} rows; \
+                             rewrite as a JOIN (e.g. `UPDATE t SET … FROM (<subquery>) src \
+                             WHERE t.<col> = src.<col>`) so DataFusion can stream the match",
+                            MAX_IN_SUBQUERY_ROWS
+                        )));
                     }
                     let lit = arrow_col_value_to_expr(col.as_ref(), i)?;
                     list.push(lit);
@@ -550,7 +574,7 @@ fn is_simple_literal(expr: &Expr) -> bool {
 /// Supported types: `Int64`, `Int32` (widened from `ScalarValue::Int64`
 /// when the column type is Int32), `UInt64`, `Utf8`, `Boolean`. Anything
 /// else returns `None` and the caller falls back to the slow path.
-fn pk_scalar_to_row_key(
+pub(crate) fn pk_scalar_to_row_key(
     val: &basin_storage::ScalarValue,
     col_dt: &DataType,
 ) -> Option<basin_hottier::RowKey> {
@@ -2845,6 +2869,10 @@ async fn write_replacement(
         file_format: crate::executor::map_file_format(meta.file_format),
         row_block_size: meta.row_block_size,
         bloom_columns: meta.global_sort_order.clone().unwrap_or_default(),
+        // Vortex encoder cascade: legacy default (Best) — copy-on-write
+        // rewrites keep the slower / smaller cascade so disk usage is
+        // unchanged on this path.
+        ..Default::default()
     };
     let df = sess
         .engine
@@ -5042,5 +5070,183 @@ mod tests {
         use basin_storage::ScalarValue;
         let k = pk_scalar_to_row_key(&ScalarValue::Float64(1.5), &DataType::Float64);
         assert!(k.is_none(), "Float64 PK must fall through to slow path");
+    }
+
+    // ── parse_assignments + parse_compound_predicate: ORM-compat shapes ──────
+    //
+    // These exercise the two table-stakes UPDATE forms that every ORM emits
+    // (audit 2026-05-23): column-referencing expressions on the SET RHS and
+    // `WHERE col IN (SELECT …)` on the WHERE side. Both are already wired
+    // end-to-end (AssignmentRhs::Expr → generated_cols::eval_expression for
+    // SET, resolve_subqueries_in_expr → Expr::InList for IN-subquery). These
+    // unit tests pin the parser-side routing so a refactor can't silently
+    // drop an UPDATE shape that real applications depend on.
+
+    /// Parse the SET assignments from a full UPDATE statement, so the
+    /// `Assignment` values we hand to `parse_assignments` are exactly the
+    /// ones sqlparser produces in production.
+    fn parse_set_assignments(sql: &str) -> Vec<Assignment> {
+        use sqlparser::dialect::PostgreSqlDialect;
+        use sqlparser::parser::Parser;
+        let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
+        match stmts.into_iter().next().unwrap() {
+            sqlparser::ast::Statement::Update(sqlparser::ast::Update {
+                assignments, ..
+            }) => assignments,
+            other => panic!("expected UPDATE, got {other:?}"),
+        }
+    }
+
+    /// `SET views = views + 1` routes through the expression fallback
+    /// (AssignmentRhs::Expr) rather than the literal-scalar fast path.
+    /// Asserts the parser correctly identifies the RHS as "not a literal"
+    /// and stashes its textual form for DataFusion to evaluate.
+    #[test]
+    fn parse_assignments_col_plus_literal_uses_expr_path() {
+        let asgs = parse_set_assignments("UPDATE counters SET views = views + 1 WHERE id = 1");
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("views", DataType::Int64, false),
+        ]);
+        let parsed = parse_assignments(&asgs, &schema).expect("must parse");
+        assert_eq!(parsed.len(), 1, "one SET clause");
+        let (idx, rhs) = &parsed[0];
+        assert_eq!(*idx, 1, "views is column 1");
+        match rhs {
+            AssignmentRhs::Expr(text) => {
+                assert!(
+                    text.contains("views") && text.contains("+") && text.contains('1'),
+                    "expected expression text to contain `views`, `+`, `1`; got {text:?}"
+                );
+            }
+            other => panic!("expected AssignmentRhs::Expr, got {other:?}"),
+        }
+    }
+
+    /// `SET balance = balance - 5` (the substituted-bind form of
+    /// `balance - $1`) also routes through Expr — proves the fast-path
+    /// gate doesn't accidentally swallow the `col - lit` shape that
+    /// every "decrement an account" UPDATE emits.
+    #[test]
+    fn parse_assignments_col_minus_substituted_param_uses_expr_path() {
+        // The prepared-statement layer substitutes $1 -> 5 before SQL reaches
+        // dml_mutate, so the parser sees `balance - 5` (a BinaryOp with a
+        // column on the left). This pins that shape to the Expr path.
+        let asgs =
+            parse_set_assignments("UPDATE accounts SET balance = balance - 5 WHERE id = 1");
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("balance", DataType::Int64, false),
+        ]);
+        let parsed = parse_assignments(&asgs, &schema).expect("must parse");
+        assert_eq!(parsed.len(), 1);
+        let (idx, rhs) = &parsed[0];
+        assert_eq!(*idx, 1, "balance is column 1");
+        assert!(
+            matches!(rhs, AssignmentRhs::Expr(t) if t.contains("balance") && t.contains("-")),
+            "balance - lit must route to AssignmentRhs::Expr, got {rhs:?}"
+        );
+    }
+
+    /// `SET updated_at = NOW()` is a function call (no column ref) and still
+    /// belongs on the Expr path because timestamp literals aren't function
+    /// calls. The Timestamp-column branch in `try_literal_to_scalar` only
+    /// matches Number / RFC3339 string literals; everything else (including
+    /// `NOW()`) falls through to Expr where DataFusion evaluates it.
+    #[test]
+    fn parse_assignments_now_function_uses_expr_path() {
+        let asgs = parse_set_assignments(
+            "UPDATE rows SET updated_at = NOW() WHERE id = 1",
+        );
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "updated_at",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+        ]);
+        let parsed = parse_assignments(&asgs, &schema).expect("must parse");
+        let (_, rhs) = &parsed[0];
+        assert!(
+            matches!(rhs, AssignmentRhs::Expr(t) if t.to_uppercase().contains("NOW")),
+            "NOW() must route to AssignmentRhs::Expr, got {rhs:?}"
+        );
+    }
+
+    /// `SET status = CASE WHEN amount > 100 THEN 'high' ELSE 'low' END` —
+    /// the CASE expression is structurally not a literal so it routes to
+    /// the Expr path where DataFusion evaluates it per-row.
+    #[test]
+    fn parse_assignments_case_when_uses_expr_path() {
+        let asgs = parse_set_assignments(
+            "UPDATE t SET status = CASE WHEN amount > 100 THEN 'high' ELSE 'low' END \
+             WHERE id IN (1, 2)",
+        );
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Int64, false),
+            Field::new("status", DataType::Utf8, false),
+        ]);
+        let parsed = parse_assignments(&asgs, &schema).expect("must parse");
+        let (idx, rhs) = &parsed[0];
+        assert_eq!(*idx, 2, "status is column 2");
+        assert!(
+            matches!(rhs, AssignmentRhs::Expr(t) if t.to_uppercase().contains("CASE")),
+            "CASE WHEN must route to AssignmentRhs::Expr, got {rhs:?}"
+        );
+    }
+
+    /// `SET name = COALESCE(nickname, name)` — function call with two column
+    /// references. Same routing target as the rest.
+    #[test]
+    fn parse_assignments_coalesce_uses_expr_path() {
+        let asgs = parse_set_assignments(
+            "UPDATE t SET name = COALESCE(nickname, name) WHERE id = 1",
+        );
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("nickname", DataType::Utf8, true),
+            Field::new("name", DataType::Utf8, false),
+        ]);
+        let parsed = parse_assignments(&asgs, &schema).expect("must parse");
+        let (idx, rhs) = &parsed[0];
+        assert_eq!(*idx, 2, "name is column 2");
+        assert!(
+            matches!(rhs, AssignmentRhs::Expr(t) if t.to_uppercase().contains("COALESCE")),
+            "COALESCE(...) must route to AssignmentRhs::Expr, got {rhs:?}"
+        );
+    }
+
+    /// Bare-literal RHS still hits the fast Scalar path — regression guard so
+    /// the new Expr-routing tests above can't mask a fast-path regression.
+    #[test]
+    fn parse_assignments_bare_literal_uses_scalar_path() {
+        let asgs = parse_set_assignments("UPDATE t SET status = 'low' WHERE id = 1");
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("status", DataType::Utf8, false),
+        ]);
+        let parsed = parse_assignments(&asgs, &schema).expect("must parse");
+        let (_, rhs) = &parsed[0];
+        assert!(
+            matches!(rhs, AssignmentRhs::Scalar(ScalarValue::Utf8(s)) if s == "low"),
+            "bare literal must route to AssignmentRhs::Scalar, got {rhs:?}"
+        );
+    }
+
+    /// MAX_IN_SUBQUERY_ROWS is the documented user-facing limit. Pin its
+    /// value so a refactor can't silently raise/lower it (the audit settled
+    /// on 100k as the threshold past which `IN (lit, lit, …)` predicate
+    /// rewriting becomes pathologically slow vs. the JOIN form). If the
+    /// limit needs to change, update this test AND the docs in the same
+    /// commit so users aren't surprised.
+    #[test]
+    fn max_in_subquery_rows_is_100k() {
+        assert_eq!(
+            MAX_IN_SUBQUERY_ROWS, 100_000,
+            "subquery materialisation cap must stay at 100k; \
+             update docs + JOIN guidance if you change this"
+        );
     }
 }

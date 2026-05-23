@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use arrow_array::{Array, Int64Array, StringArray};
+use arrow_array::{Array, Int64Array, StringArray, TimestampMicrosecondArray};
 use basin_catalog::InMemoryCatalog;
 use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
@@ -613,4 +613,286 @@ async fn composite_pk_falls_through_slow_path_correctness() {
         panic!("expected rows")
     };
     assert_eq!(rows(&batches), 2);
+}
+
+// ─── 6. UPDATE SET … table-stakes ORM shapes (audit 2026-05-23) ────────────
+//
+// These pin the end-to-end behaviour of UPDATE forms that every ORM emits:
+// CASE WHEN on the RHS, COALESCE fallback, IN (SELECT …) with an empty
+// subquery, and the new 100k IN-subquery materialisation cap. The "views
+// increment" and "updated_at" round-trips live below; they prove the
+// AssignmentRhs::Expr path actually mutates storage (not just parses).
+
+/// `UPDATE t SET status = CASE WHEN amount > 100 THEN 'high' ELSE 'low' END
+///  WHERE id IN (1, 2)` — the SET RHS routes to the Expr path and DataFusion
+/// evaluates CASE per row against the pre-update values.
+#[tokio::test]
+async fn update_set_case_when_round_trip() {
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+
+    sess.execute(
+        "CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, amount BIGINT NOT NULL, status TEXT NOT NULL)",
+    )
+    .await
+    .unwrap();
+    sess.execute(
+        "INSERT INTO orders (id, amount, status) VALUES \
+         (1, 50, 'pending'), (2, 200, 'pending'), (3, 999, 'pending')",
+    )
+    .await
+    .unwrap();
+
+    sess.execute(
+        "UPDATE orders SET status = CASE WHEN amount > 100 THEN 'high' ELSE 'low' END \
+         WHERE id IN (1, 2)",
+    )
+    .await
+    .unwrap();
+
+    let ExecResult::Rows { batches, .. } = sess
+        .execute("SELECT id, status FROM orders ORDER BY id")
+        .await
+        .unwrap()
+    else {
+        panic!("expected rows")
+    };
+    let ids = col_i64(&batches, "id");
+    let statuses = col_string(&batches, "status");
+    assert_eq!(ids, vec![1, 2, 3]);
+    // Row 1 (amount=50) → 'low'; row 2 (amount=200) → 'high'; row 3 not touched.
+    assert_eq!(statuses, vec!["low", "high", "pending"]);
+}
+
+/// `UPDATE t SET name = COALESCE(nickname, name)` — when `nickname` is NULL
+/// the name keeps its current value, otherwise the nickname replaces it.
+/// Exercises the function-call-with-column-refs branch of the Expr path.
+#[tokio::test]
+async fn update_set_coalesce_round_trip() {
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+
+    sess.execute(
+        "CREATE TABLE users (id BIGINT NOT NULL PRIMARY KEY, nickname TEXT, name TEXT NOT NULL)",
+    )
+    .await
+    .unwrap();
+    sess.execute(
+        "INSERT INTO users (id, nickname, name) VALUES \
+         (1, 'bee', 'Beatrice'), (2, NULL, 'Charlie')",
+    )
+    .await
+    .unwrap();
+
+    sess.execute("UPDATE users SET name = COALESCE(nickname, name)")
+        .await
+        .unwrap();
+
+    let ExecResult::Rows { batches, .. } = sess
+        .execute("SELECT id, name FROM users ORDER BY id")
+        .await
+        .unwrap()
+    else {
+        panic!("expected rows")
+    };
+    assert_eq!(col_string(&batches, "name"), vec!["bee", "Charlie"]);
+}
+
+/// `UPDATE … WHERE id IN (SELECT id FROM staging)` where staging is empty —
+/// must return 0 rows updated, no error. ORMs do "cascade delete by IDs from
+/// a temp table" routinely; if the staging set happens to be empty (e.g. the
+/// outer transaction already cleared it) we must not crash.
+#[tokio::test]
+async fn update_where_in_subquery_empty() {
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+
+    sess.execute("CREATE TABLE items (id BIGINT NOT NULL PRIMARY KEY, name TEXT NOT NULL)")
+        .await
+        .unwrap();
+    sess.execute("CREATE TABLE staging (sid BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO items (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap();
+    // staging is empty — no INSERT.
+
+    let res = sess
+        .execute("UPDATE items SET name = 'updated' WHERE id IN (SELECT sid FROM staging)")
+        .await
+        .unwrap();
+    assert!(
+        matches!(&res, ExecResult::Empty { tag } if tag == "UPDATE 0"),
+        "empty subquery must report UPDATE 0, got {res:?}"
+    );
+
+    // Confirm no row was touched.
+    let ExecResult::Rows { batches, .. } = sess
+        .execute("SELECT name FROM items ORDER BY id")
+        .await
+        .unwrap()
+    else {
+        panic!("expected rows")
+    };
+    assert_eq!(col_string(&batches, "name"), vec!["a", "b", "c"]);
+}
+
+/// `UPDATE … WHERE id IN (SELECT id FROM huge)` where `huge` exceeds the
+/// 100k materialisation cap → typed error suggesting the JOIN form. We seed
+/// 100_001 rows so we trip exactly past the limit; assert the error mentions
+/// "JOIN" and the row-count threshold so users get actionable guidance.
+#[tokio::test]
+async fn update_where_in_subquery_too_large_refused() {
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+
+    sess.execute("CREATE TABLE items (id BIGINT NOT NULL PRIMARY KEY, name TEXT NOT NULL)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO items (id, name) VALUES (1, 'a')")
+        .await
+        .unwrap();
+
+    sess.execute("CREATE TABLE huge (hid BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    // 100_001 distinct ids — one past MAX_IN_SUBQUERY_ROWS. Insert in chunks so
+    // the SQL parser doesn't choke on a single multi-megabyte literal.
+    let chunk_size: i64 = 1_000;
+    let chunks: i64 = 101; // 101_000 rows ≥ 100_001
+    for c in 0..chunks {
+        let mut values = String::with_capacity(chunk_size as usize * 12);
+        for i in 0..chunk_size {
+            if i > 0 {
+                values.push_str(", ");
+            }
+            let id = c * chunk_size + i;
+            values.push('(');
+            values.push_str(&id.to_string());
+            values.push(')');
+        }
+        sess.execute(&format!("INSERT INTO huge (hid) VALUES {values}"))
+            .await
+            .unwrap();
+    }
+
+    let err = sess
+        .execute("UPDATE items SET name = 'x' WHERE id IN (SELECT hid FROM huge)")
+        .await
+        .expect_err("oversized subquery must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("100000") || msg.contains("100_000"),
+        "error must mention the row limit; got {msg:?}"
+    );
+    assert!(
+        msg.to_uppercase().contains("JOIN"),
+        "error must suggest the JOIN form; got {msg:?}"
+    );
+}
+
+/// Round-trip: increment a counter twice and SELECT it back. Two separate
+/// UPDATE statements so each one reads the row's current value, increments
+/// it, and writes back — the classic "views += 1" pattern every app does.
+#[tokio::test]
+async fn views_increment_round_trip() {
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+
+    sess.execute("CREATE TABLE counters (id BIGINT NOT NULL PRIMARY KEY, views BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO counters (id, views) VALUES (1, 0)")
+        .await
+        .unwrap();
+
+    for _ in 0..2 {
+        sess.execute("UPDATE counters SET views = views + 1 WHERE id = 1")
+            .await
+            .unwrap();
+    }
+
+    let ExecResult::Rows { batches, .. } = sess
+        .execute("SELECT views FROM counters WHERE id = 1")
+        .await
+        .unwrap()
+    else {
+        panic!("expected rows")
+    };
+    assert_eq!(
+        col_i64(&batches, "views"),
+        vec![2],
+        "two increments must land cumulatively"
+    );
+}
+
+/// Round-trip: `UPDATE … SET updated_at = NOW()` actually advances the stored
+/// timestamp. We stamp once, sleep a millisecond, stamp again, and assert
+/// the second value is strictly greater than the first.
+#[tokio::test]
+async fn updated_at_round_trip() {
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+
+    sess.execute(
+        "CREATE TABLE rows (id BIGINT NOT NULL PRIMARY KEY, updated_at TIMESTAMPTZ NOT NULL)",
+    )
+    .await
+    .unwrap();
+    // Seed with a far-past timestamp so the first NOW() update is clearly
+    // observable.
+    sess.execute("INSERT INTO rows (id, updated_at) VALUES (1, '2000-01-01T00:00:00Z')")
+        .await
+        .unwrap();
+
+    sess.execute("UPDATE rows SET updated_at = NOW() WHERE id = 1")
+        .await
+        .unwrap();
+    let first = {
+        let ExecResult::Rows { batches, .. } = sess
+            .execute("SELECT updated_at FROM rows WHERE id = 1")
+            .await
+            .unwrap()
+        else {
+            panic!("expected rows")
+        };
+        batches[0]
+            .column_by_name("updated_at")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap()
+            .value(0)
+    };
+
+    // Sleep so the second NOW() is observably later (timestamps are
+    // microsecond-resolution but the wall clock has nanosecond jitter on
+    // some platforms, hence the explicit small sleep).
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+    sess.execute("UPDATE rows SET updated_at = NOW() WHERE id = 1")
+        .await
+        .unwrap();
+    let second = {
+        let ExecResult::Rows { batches, .. } = sess
+            .execute("SELECT updated_at FROM rows WHERE id = 1")
+            .await
+            .unwrap()
+        else {
+            panic!("expected rows")
+        };
+        batches[0]
+            .column_by_name("updated_at")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap()
+            .value(0)
+    };
+
+    assert!(
+        second > first,
+        "second NOW() ({second}) must be strictly greater than first ({first})"
+    );
 }
