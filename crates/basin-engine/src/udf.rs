@@ -690,7 +690,25 @@ impl ScalarUDFImpl for VectorToTextUdf {
                 // appears on a column that happens to contain a string literal).
                 Ok(ColumnarValue::Array(arr))
             }
-            other => exec_err!("vector_to_text: unsupported input type {other:?}"),
+            // Runtime fallback: the `::text` rewriter in `pg_operators` cannot
+            // tell at parse-time whether a bare identifier is a vector column
+            // or a plain scalar (Boolean/Int/Float/Date/…). When we get here
+            // with a non-vector, non-Utf8 input, the rewrite was synthetic —
+            // delegate to Arrow's cast kernel so `active::TEXT`, `id::TEXT`,
+            // `score::TEXT`, etc. produce the same string the user would get
+            // from a plain `CAST(... AS TEXT)`. This keeps the pgvector
+            // ergonomic (`embedding::text` → bracket notation) intact while
+            // making the rewriter safe to fire on any bare identifier.
+            _ => {
+                let casted = datafusion::arrow::compute::cast(&arr, &DataType::Utf8)
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "vector_to_text: fallback cast to Utf8 failed for {:?}: {e}",
+                            arr.data_type()
+                        ))
+                    })?;
+                Ok(ColumnarValue::Array(casted))
+            }
         }
     }
 }
@@ -3132,6 +3150,79 @@ mod tests {
         let r = rewrite_auth_schema_functions("SELECT auth.uid_column FROM t");
         assert_eq!(r, "SELECT auth.uid_column FROM t");
     }
+
+    // ── vector_to_text runtime fallback for non-vector scalar inputs ────────
+    //
+    // The pre-parse `::text` rewriter in `pg_operators::rewrite_vector_col_text_cast`
+    // routes any `IDENT::text` through `vector_to_text(IDENT)`.  When `IDENT`
+    // is actually a Boolean / Int / Float / Date column the UDF used to error
+    // out at execute time ("vector_to_text: unsupported input type Boolean").
+    // The fallback path delegates to Arrow's cast kernel so these synthetic
+    // calls behave like the standard `CAST(... AS TEXT)` would have.
+
+    fn invoke_vector_to_text(arr: ArrayRef) -> ArrayRef {
+        use datafusion::arrow::datatypes::Field;
+        use datafusion::config::ConfigOptions;
+        use datafusion::logical_expr::ScalarUDFImpl;
+        let udf = VectorToTextUdf {
+            signature: Signature::any(1, Volatility::Immutable),
+        };
+        let n = arr.len();
+        let field = Arc::new(Field::new("x", arr.data_type().clone(), true));
+        let return_field = Arc::new(Field::new("out", DataType::Utf8, true));
+        let args = ScalarFunctionArgs {
+            args: vec![ColumnarValue::Array(arr)],
+            arg_fields: vec![field],
+            number_rows: n,
+            return_field,
+            config_options: Arc::new(ConfigOptions::default()),
+        };
+        let out = udf.invoke_with_args(args).expect("vector_to_text invoke");
+        match out {
+            ColumnarValue::Array(a) => a,
+            ColumnarValue::Scalar(s) => s.to_array_of_size(n).expect("scalar to array"),
+        }
+    }
+
+    #[test]
+    fn vector_to_text_boolean_fallback() {
+        let arr: ArrayRef = Arc::new(BooleanArray::from(vec![true, false, true]));
+        let out = invoke_vector_to_text(arr);
+        let s = out
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Utf8 fallback");
+        // Arrow's cast renders Boolean → Utf8 as "true"/"false" (matches PG).
+        assert_eq!(s.value(0), "true");
+        assert_eq!(s.value(1), "false");
+        assert_eq!(s.value(2), "true");
+    }
+
+    #[test]
+    fn vector_to_text_int64_fallback() {
+        let arr: ArrayRef = Arc::new(Int64Array::from(vec![42i64, -1, 0]));
+        let out = invoke_vector_to_text(arr);
+        let s = out
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Utf8 fallback");
+        assert_eq!(s.value(0), "42");
+        assert_eq!(s.value(1), "-1");
+        assert_eq!(s.value(2), "0");
+    }
+
+    #[test]
+    fn vector_to_text_utf8_passthrough() {
+        // Existing behaviour: Utf8 input is passed through unchanged.
+        let arr: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
+        let out = invoke_vector_to_text(arr);
+        let s = out
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Utf8 passthrough");
+        assert_eq!(s.value(0), "a");
+        assert_eq!(s.value(1), "b");
+    }
 }
 
 /// PG-shape `power(x, y)` — always returns `double precision` (Float64).
@@ -5367,6 +5458,17 @@ mod json_op_rewrite_tests {
             r.contains("'::jsonb'"),
             "literal must be preserved, got: {r}"
         );
+    }
+
+    /// Bare-column-no-space form `body ->> 'k'` (with explicit spaces).
+    /// The pre-pass `pg_operators::rewrite_jsonb_arrow_op_spacing` is what
+    /// closes the no-space variant; this confirms the standard form keeps
+    /// working unchanged.
+    #[test]
+    fn test_slt_body_double_arrow_with_space() {
+        let sql = "SELECT body ->> 'k' FROM t_json ORDER BY id";
+        let r = rewrite_json_operators(sql);
+        assert!(r.contains("json_get_text(body, 'k')"), "got: {r}");
     }
 }
 

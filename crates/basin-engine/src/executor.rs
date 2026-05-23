@@ -1113,6 +1113,14 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     // Phase 5.26.B: rewrite `col::text` → `vector_to_text(col)` before operators.
     let rewritten = crate::pg_operators::rewrite_vector_col_text_cast(&rewritten);
     let rewritten = crate::udf::rewrite_vector_operators(&rewritten);
+    // Normalise whitespace around the PG JSON path operators (`->`, `->>`,
+    // `#>`, `#>>`) before the JSON-op rewriter sees them.  Without this pass,
+    // a bare-column form like `body->>'k'` (no spaces, no `::jsonb` cast)
+    // fails the `rewrite_binary_op_to_fn` `prev_ok` guard and is left for
+    // sqlparser, which doesn't know `->>` and errors out.  Pre-spacing closes
+    // that gap without relaxing the boundary guard (which would risk
+    // mis-matching vector ops like `<->`).
+    let rewritten = crate::pg_operators::rewrite_jsonb_arrow_op_spacing(&rewritten);
     // Rewrite JSON/JSONB infix operators (`->`, `->>`, `#>`, `#>>`, `?`,
     // `?&`, `?|`, `<@`, `@>` for JSON, `||` for JSON concat, `@?` for
     // jsonpath exists) to UDF calls that DataFusion can evaluate.

@@ -6260,6 +6260,160 @@ pub(crate) fn rewrite_vector_cast(sql: &str) -> String {
     out
 }
 
+// ─── JSONB `->` / `->>` / `#>` / `#>>` whitespace pre-normaliser ────────────
+//
+// `udf::rewrite_json_operators` rewrites the PG JSON path operators to UDF
+// calls, but its `rewrite_binary_op_to_fn` helper requires that the previous
+// character not be alphanumeric (to avoid mis-matching inside longer rewritten
+// operators).  In the common shape `body->>'k'` (a bare column followed by
+// the operator with no whitespace) that guard *under-fires*: the byte before
+// `->>` is `y`, so the rewrite is skipped and sqlparser then chokes on `->>`.
+//
+// `strip_jsonb_casts` already inserts a space after a stripped `::jsonb` cast
+// for the same reason, but a bare JSONB-typed column never has a `::jsonb`
+// cast to strip.  This pass closes that gap: it inserts a single space
+// between an identifier (or a closing `)`/`]`/quote) and a directly-adjacent
+// `->` / `->>` / `#>` / `#>>` operator, and likewise after the operator when
+// it abuts a quote / paren / digit.  Once normalised, the existing JSON-op
+// rewriter fires correctly.
+//
+// Runs BEFORE `rewrite_json_operators` in the executor pipeline.  This pass
+// is conservative: it only inserts spaces, never modifies operator semantics
+// or string contents, and respects single-/double-quoted literals + line/block
+// comments.
+//
+// Phase 5.27 (sqllogictest fix): closes the `body->>'k'` no-space gap that
+// caused 2/50 SLT cases to fail with sqlparser "Expected: an expression,
+// found: ," errors.
+pub(crate) fn rewrite_jsonb_arrow_op_spacing(sql: &str) -> String {
+    // Fast path: nothing to do unless we see a `->` or `#>` somewhere.
+    if !sql.contains("->") && !sql.contains("#>") {
+        return sql.to_string();
+    }
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len + 16);
+    let mut i = 0usize;
+    while i < len {
+        let b = bytes[i];
+        // Pass through single-quoted string literals verbatim.
+        if b == b'\'' {
+            let start = i;
+            i += 1;
+            while i < len {
+                if bytes[i] == b'\'' {
+                    if i + 1 < len && bytes[i + 1] == b'\'' {
+                        i += 2;
+                    } else {
+                        i += 1;
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        // Pass through double-quoted identifiers verbatim.
+        if b == b'"' {
+            let start = i;
+            i += 1;
+            while i < len && bytes[i] != b'"' {
+                i += 1;
+            }
+            if i < len {
+                i += 1;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        // Pass through line comments verbatim.
+        if b == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
+            let start = i;
+            i += 2;
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        // Pass through block comments verbatim.
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            let start = i;
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < len {
+                i += 2;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        // Detect the four PG JSON path operators.  Longest-first so `->>`
+        // wins over `->` and `#>>` wins over `#>`.
+        let op: Option<&'static str> = if b == b'-' && i + 2 < len && bytes[i + 1] == b'>' && bytes[i + 2] == b'>' {
+            Some("->>")
+        } else if b == b'-' && i + 1 < len && bytes[i + 1] == b'>' {
+            // Skip `-` that is part of `<-` / `<->` etc. (vector ops) — the
+            // previous char is `<`, so leave it alone.
+            if i > 0 && (bytes[i - 1] == b'<' || out.as_bytes().last() == Some(&b'<')) {
+                None
+            } else {
+                Some("->")
+            }
+        } else if b == b'#' && i + 2 < len && bytes[i + 1] == b'>' && bytes[i + 2] == b'>' {
+            Some("#>>")
+        } else if b == b'#' && i + 1 < len && bytes[i + 1] == b'>' {
+            // Watch out for `#-` (already JSON path-delete) and `##` etc.
+            Some("#>")
+        } else {
+            None
+        };
+        let Some(op_str) = op else {
+            out.push(b as char);
+            i += 1;
+            continue;
+        };
+        // Need a left operand that could be an identifier / paren / quote
+        // close — otherwise this is some other use of `>`/`-` we shouldn't
+        // touch (e.g. `a > -1`).
+        let prev = out.as_bytes().last().copied();
+        let lhs_attaches = matches!(
+            prev,
+            Some(c) if c.is_ascii_alphanumeric()
+                || c == b'_'
+                || c == b')'
+                || c == b']'
+                || c == b'\''
+                || c == b'"'
+        );
+        // Insert a space before the operator when it directly abuts an
+        // identifier-like token.
+        if lhs_attaches {
+            out.push(' ');
+        }
+        out.push_str(op_str);
+        i += op_str.len();
+        // Insert a space after the operator when it directly abuts a
+        // following identifier / quote / paren / digit (the RHS).
+        let next = bytes.get(i).copied();
+        let rhs_attaches = matches!(
+            next,
+            Some(c) if c.is_ascii_alphanumeric()
+                || c == b'_'
+                || c == b'('
+                || c == b'\''
+                || c == b'"'
+        );
+        if rhs_attaches {
+            out.push(' ');
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -7746,5 +7900,97 @@ mod tests {
             !out3.contains("'pg_catalog.pg_locks'"),
             "string literal must not gain schema prefix: {out3}"
         );
+    }
+
+    // ── JSONB `->` / `->>` whitespace pre-normaliser ────────────────────────
+    // These tests pin the behaviour that `rewrite_jsonb_arrow_op_spacing`
+    // inserts spaces so that the downstream `rewrite_json_operators` pass
+    // can fire on bare-column-no-space forms like `body->>'k'`.
+
+    #[test]
+    fn jsonb_arrow_spacing_double_arrow_no_space() {
+        let sql = "SELECT body->>'k' FROM t_json ORDER BY id";
+        let out = rewrite_jsonb_arrow_op_spacing(sql);
+        assert!(out.contains("body ->> 'k'"), "got: {out}");
+    }
+
+    #[test]
+    fn jsonb_arrow_spacing_single_arrow_no_space() {
+        let sql = "SELECT body->'n' FROM t_json";
+        let out = rewrite_jsonb_arrow_op_spacing(sql);
+        assert!(out.contains("body -> 'n'"), "got: {out}");
+    }
+
+    #[test]
+    fn jsonb_arrow_spacing_paren_lhs_arrow_cast() {
+        // `(body->'n')::TEXT` — closing paren is the RHS of the arrow's right side.
+        // We need the LHS `body` separated from `->`.
+        let sql = "SELECT (body->'n')::TEXT FROM t_json";
+        let out = rewrite_jsonb_arrow_op_spacing(sql);
+        assert!(out.contains("body -> 'n'"), "got: {out}");
+    }
+
+    #[test]
+    fn jsonb_arrow_spacing_chained_double_arrow() {
+        let sql = "SELECT body->'a'->>'b' FROM t";
+        let out = rewrite_jsonb_arrow_op_spacing(sql);
+        // Both the `->'a'` and `->>'b'` operators get spaces inserted around
+        // them — the chained form must keep both legible.
+        assert!(out.contains("body -> 'a'"), "got: {out}");
+        assert!(out.contains("'a' ->> 'b'") || out.contains("'a' ->>'b'") || out.contains(" ->> 'b'"), "got: {out}");
+    }
+
+    #[test]
+    fn jsonb_arrow_spacing_hash_arrow() {
+        let sql = "SELECT body#>'{a,b}' FROM t";
+        let out = rewrite_jsonb_arrow_op_spacing(sql);
+        assert!(out.contains("body #> '{a,b}'"), "got: {out}");
+    }
+
+    #[test]
+    fn jsonb_arrow_spacing_hash_double_arrow() {
+        let sql = "SELECT body#>>'{a,b}' FROM t";
+        let out = rewrite_jsonb_arrow_op_spacing(sql);
+        assert!(out.contains("body #>> '{a,b}'"), "got: {out}");
+    }
+
+    #[test]
+    fn jsonb_arrow_spacing_already_spaced_is_idempotent() {
+        let sql = "SELECT body ->> 'k' FROM t";
+        let out = rewrite_jsonb_arrow_op_spacing(sql);
+        // Existing spaces preserved; idempotent (no double-space corruption).
+        assert!(out.contains("body ->> 'k'"), "got: {out}");
+        // Run it again to confirm true idempotency.
+        let out2 = rewrite_jsonb_arrow_op_spacing(&out);
+        assert_eq!(out, out2, "second pass must be a no-op");
+    }
+
+    #[test]
+    fn jsonb_arrow_spacing_does_not_touch_vector_op() {
+        // `<->` is the pgvector L2-distance operator. The `->` inside it must
+        // NOT be split — the vector-op rewriter handles `<->` later.
+        let sql = "SELECT a <-> b FROM t";
+        let out = rewrite_jsonb_arrow_op_spacing(sql);
+        assert!(out.contains("<->"), "must preserve <->: {out}");
+        assert!(
+            !out.contains("< ->") && !out.contains("<- >"),
+            "<-> must be left intact: {out}"
+        );
+    }
+
+    #[test]
+    fn jsonb_arrow_spacing_preserves_string_literals() {
+        // The `->>` inside a string literal must not gain spaces.
+        let sql = "SELECT 'a->>b' AS s";
+        let out = rewrite_jsonb_arrow_op_spacing(sql);
+        assert!(out.contains("'a->>b'"), "literal must be preserved: {out}");
+    }
+
+    #[test]
+    fn jsonb_arrow_spacing_int_index() {
+        // `body->2` (integer array index) — RHS is a digit, also needs spacing.
+        let sql = "SELECT body->2 FROM t";
+        let out = rewrite_jsonb_arrow_op_spacing(sql);
+        assert!(out.contains("body -> 2"), "got: {out}");
     }
 }
