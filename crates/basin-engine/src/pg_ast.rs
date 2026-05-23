@@ -290,7 +290,13 @@ const MAX_PARSE_DEPTH: u32 = 1000;
 /// Pre-scan `sql` and count the maximum parenthesis nesting depth, ignoring
 /// parens inside string literals and comments. Returns `Err` if depth exceeds
 /// [`MAX_PARSE_DEPTH`].
-fn check_parse_depth(sql: &str) -> Result<()> {
+///
+/// Exposed as `pub(crate)` so the executor's hot path can gate sqlparser the
+/// same way `parse()` gates libpg_query — both parsers recurse and either can
+/// overflow the thread stack on deeply nested input. (Caveat: this counter
+/// does not handle dollar-quoted strings — `$tag$ ... $tag$` parens are still
+/// counted — but for an 8 000-ish depth ceiling the overestimate is harmless.)
+pub(crate) fn check_parse_depth(sql: &str) -> Result<()> {
     let bytes = sql.as_bytes();
     let len = bytes.len();
     let mut depth: u32 = 0;

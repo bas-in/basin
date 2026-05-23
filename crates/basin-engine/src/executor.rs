@@ -114,6 +114,19 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     // doesn't know our UDFs.
     let raw_sql = sql;
 
+    // #53 P1 — parser DoS pre-check (depth guard). Both libpg_query (C, called
+    // below via `pg_ast::parse`) and sqlparser (Rust, called further down) use
+    // recursive descent: a deeply nested expression like `(((…1…)))` with
+    // 10 000 levels overflows the thread stack and SIGABRTs the process —
+    // remote-triggerable DoS. The guard scans the SQL string for unbalanced
+    // paren depth (quote- and comment-aware) and rejects with
+    // `BasinError::InvalidSchema` (SQLSTATE 42601) when it exceeds
+    // `MAX_PARSE_DEPTH`. We surface the rejection here (not just inside
+    // `pg_ast::parse`) because the existing call site swallows the error with
+    // `.ok()` and would otherwise hand the same SQL to sqlparser, which would
+    // then blow the stack instead.
+    crate::pg_ast::check_parse_depth(sql)?;
+
     // ADR 0014 Phase 1: parse with the real PostgreSQL parser first.
     // This lets us:
     //   1. Intercept noop-accept statements (VACUUM, ANALYZE, CLUSTER, LOCK,

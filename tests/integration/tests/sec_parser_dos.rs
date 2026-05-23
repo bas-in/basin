@@ -62,17 +62,12 @@ fn make_engine(dir: &TempDir) -> Engine {
 /// a typed `BasinError` (parse error or feature-not-supported) rather than
 /// crashing the process.
 ///
-/// **Gap confirmed:** running this test without `#[ignore]` causes a stack
-/// overflow (SIGABRT) — the parser (libpg_query / pg_query crate) recurses
-/// into the C call-stack without a depth limit, overflowing the thread stack
-/// at ~10 000 nesting levels. The `pg_query` C library does not enforce the
-/// PostgreSQL server's `max_parser_depth` GUC (default 10 000) in the
-/// standalone binding; the Basin layer adds no additional guard either.
-///
-/// Fix path: add a depth-limit pre-check in `basin_engine::pg_ast::parse`
-/// (count opening parens before calling `pg_query::parse`; reject with
-/// `BasinError::InvalidSchema` when depth > 8 000).
-#[ignore = "P1 parser stack overflow — no recursion depth limit; sqlparser default 50 not enforced"]
+/// **Closed by:** `basin_engine::pg_ast::parse` depth pre-check (rejects > 8000
+/// nesting; this test asserts that). The pre-check is quote-aware and
+/// comment-aware: it scans the SQL string before handing it to libpg_query and
+/// returns `BasinError::InvalidSchema` (SQLSTATE 42601) when paren depth
+/// exceeds the configured `MAX_PARSE_DEPTH`, avoiding the C-stack overflow
+/// the unguarded `pg_query::parse` would trigger at ~10 000 levels.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parser_deeply_nested_query_graceful() {
     basin_common::telemetry::try_init_for_tests();
