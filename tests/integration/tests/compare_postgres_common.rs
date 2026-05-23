@@ -60,6 +60,17 @@
 //!    (25)  ORDER BY NULLS LAST     — nullable column sort + LIMIT
 //!    (26)  Top-N per group (MAX)   — analytics "best customer" pattern
 //!    (27)  Numeric range filter    — double-precision BETWEEN pushdown
+//!   JSONB document-store coverage (10) — proves Basin's first-class JSONB
+//!    (28)  `->` get key (object)   — payload->'category' on N rows
+//!    (29)  `->>` get text          — payload->>'category' on N rows
+//!    (30)  `->` deep path          — payload->'device'->>'version'
+//!    (31)  `@>` containment        — COUNT(*) where payload @> '{"category":"…"}'
+//!    (32)  `?` key existence       — COUNT(*) where payload ? 'metadata'
+//!    (33)  `#>` path get           — payload #> '{device,os}'
+//!    (34)  `jsonb_array_length`    — payload->'tags' length on N rows
+//!    (35)  `jsonb_typeof`          — typeof payload->'metadata' on N rows
+//!    (36)  JSONB filter + aggregate — GROUP BY payload->>'category' SUM(score)
+//!    (37)  `jsonb_set` UPDATE      — write-path JSONB mutation on 10 rows
 
 #![allow(dead_code, clippy::print_stdout)]
 
@@ -127,6 +138,50 @@ pub fn status_for(i: i64) -> &'static str {
         2 => "completed",
         _ => "archived",
     }
+}
+
+/// Deterministic JSONB payload for row `i`. Same bytes go to both PG and
+/// Basin so the JSONB-shape metrics (#28-#37) measure engine work, not
+/// payload-distribution drift. Shape mirrors a typical product-analytics
+/// event: `category`, `tags[]`, nested `device.{os,version}`, and a
+/// `metadata.{campaign,score}` object.
+///
+/// Quoting: returns the raw JSON text. Callers wrap it in a SQL string
+/// literal (`'<json>'`). The JSON itself contains no single quotes — we
+/// pick the categorical fields from a fixed small set, so no escaping is
+/// needed on either the PG or Basin INSERT path.
+pub fn payload_for(i: i64) -> String {
+    let category = match i % 3 {
+        0 => "purchase",
+        1 => "signup",
+        _ => "click",
+    };
+    let device_os = if i % 2 == 0 { "ios" } else { "android" };
+    // Deterministic semver-ish version; cycles through 5 minor versions so
+    // a `->>'version'` GROUP BY would have non-trivial cardinality (we
+    // don't ship that shape today but it keeps the field realistic).
+    let major = 1 + (i % 3);
+    let minor = (i / 3) % 5;
+    let patch = i % 10;
+    let version = format!("{major}.{minor}.{patch}");
+    // `tags` length varies 1-3 so jsonb_array_length isn't a constant.
+    let tags = match i % 3 {
+        0 => r#"["red","green"]"#,
+        1 => r#"["blue"]"#,
+        _ => r#"["red","green","blue"]"#,
+    };
+    let campaign = match i % 4 {
+        0 => "promo_2024",
+        1 => "spring_sale",
+        2 => "newsletter",
+        _ => "referral",
+    };
+    // Score: deterministic float in [0.5, 99.5]. Spread across the range so
+    // the SUM(score) GROUP BY aggregate has meaningful per-group totals.
+    let score = 0.5 + ((i % 199) as f64) * 0.5;
+    format!(
+        r#"{{"category":"{category}","tags":{tags},"device":{{"os":"{device_os}","version":"{version}"}},"metadata":{{"campaign":"{campaign}","score":{score}}}}}"#
+    )
 }
 
 /// Sum bytes of every Basin data file under `root`. Counts BOTH `.vortex`
@@ -1051,6 +1106,217 @@ async fn run_extended_suite(
     }
 }
 
+/// Carrier for the 10 JSONB-shape (Basin, PG) p50 pairs. Same
+/// `Option<f64>` / `f64::INFINITY` convention as `ExtendedResults`: Basin
+/// may legitimately not support a shape today (e.g. `jsonb_set` write
+/// path) and we want the dashboard to flag the gap rather than panic the
+/// whole comparison. Surfacing the gap is the whole point of #28-#37 —
+/// the JSONB perf-comparison cards become an engine work-item tracker.
+struct JsonbResults {
+    /// `->` operator: per-row object-key get returning JSONB.
+    get_key: (Option<f64>, f64),
+    /// `->>` operator: per-row object-key get returning TEXT.
+    get_text: (Option<f64>, f64),
+    /// Chained `->` then `->>`: nested object traversal.
+    deep_path: (Option<f64>, f64),
+    /// `@>` containment with a SQL literal RHS.
+    contains: (Option<f64>, f64),
+    /// `?` key-existence — counts rows whose payload has `'metadata'`.
+    key_exists: (Option<f64>, f64),
+    /// `#>` path get with a `{...}` text-path RHS.
+    path_get: (Option<f64>, f64),
+    /// `jsonb_array_length(payload->'tags')`.
+    array_length: (Option<f64>, f64),
+    /// `jsonb_typeof(payload->'metadata')`.
+    typeof_fn: (Option<f64>, f64),
+    /// GROUP BY `payload->>'category'` with SUM of cast text->float — the
+    /// real-world analytics shape on document payloads.
+    filter_agg: (Option<f64>, f64),
+    /// `UPDATE … SET payload = jsonb_set(payload, '{metadata,score}', '99'::jsonb)
+    /// WHERE id < 10` — write-path JSONB mutation.
+    jsonb_set_update: (Option<f64>, f64),
+}
+
+/// Run the 10 JSONB-shape probes (#28-#37) on both PG and Basin. Same
+/// stack-budget pattern as `run_extended_suite` (the inline form would
+/// inflate `run_full_compare_inner`'s state machine past the worker
+/// thread's stack), and the same `pair()` helper convention: Basin failure
+/// becomes `Option::None` so `mk_ext`/`mk_jsonb` can emit a "(basin gap)"
+/// dashboard row instead of crashing the card.
+///
+/// PG-side SQL uses `to_timestamp(..)` for the `created_at` filter and
+/// `::jsonb` casts on literals where needed. Basin-side SQL uses raw
+/// BIGINT comparisons and (where possible) the same `::jsonb` cast for
+/// parity — Basin's parser accepts the cast and treats it as a typed
+/// literal that matches the typed column.
+///
+/// Shape #37 (`jsonb_set` UPDATE) is the only write-path shape: timed
+/// directly (no EXPLAIN ANALYZE on PG, no median) and emitted as a single
+/// measurement because each repetition would compound writes on PG (the
+/// repeated UPDATE is idempotent but VACUUM-relevant). Both sides run
+/// once for symmetry.
+async fn run_jsonb_suite(
+    pg: &Client,
+    sess: &basin_engine::ProjectSession,
+    schema: &str,
+    rows: usize,
+) -> JsonbResults {
+    let ext_samples = samples_for(rows, 5);
+
+    async fn pair(
+        pg: &Client,
+        sess: &basin_engine::ProjectSession,
+        pg_sql: String,
+        basin_sql: &str,
+        n: usize,
+    ) -> (Option<f64>, f64) {
+        let p = pg_p50_explain(pg, &pg_sql, n)
+            .await
+            .unwrap_or(f64::INFINITY);
+        let b = basin_p50_try(sess, basin_sql, n).await;
+        (b, p)
+    }
+
+    // The per-row JSONB getter shapes use `WHERE id < 100` as the row
+    // filter so the work is bounded (100 JSONB ops per query). Smaller
+    // scales still get a 100-row slice — the JSONB-op cost dominates
+    // either way.
+
+    // -- #28 `->` get key (returns JSONB) -----------------------------------
+    let get_key = pair(
+        pg, sess,
+        format!("SELECT payload->'category' FROM {schema}.events WHERE id < 100"),
+        "SELECT payload->'category' FROM events WHERE id < 100",
+        ext_samples,
+    ).await;
+
+    // -- #29 `->>` get text -------------------------------------------------
+    let get_text = pair(
+        pg, sess,
+        format!("SELECT payload->>'category' FROM {schema}.events WHERE id < 100"),
+        "SELECT payload->>'category' FROM events WHERE id < 100",
+        ext_samples,
+    ).await;
+
+    // -- #30 `->` deep path (chained -> + ->>) ------------------------------
+    let deep_path = pair(
+        pg, sess,
+        format!("SELECT payload->'device'->>'version' FROM {schema}.events WHERE id < 100"),
+        "SELECT payload->'device'->>'version' FROM events WHERE id < 100",
+        ext_samples,
+    ).await;
+
+    // -- #31 `@>` containment -----------------------------------------------
+    // Full-table predicate. PG uses GIN if indexed (we don't index here, so
+    // it's a seq scan — same as Basin's seq path). Selectivity ≈ 1/3 of
+    // events (category cycles 0/1/2 → 'purchase').
+    let contains = pair(
+        pg, sess,
+        format!(
+            "SELECT COUNT(*) FROM {schema}.events \
+             WHERE payload @> '{{\"category\":\"purchase\"}}'::jsonb"
+        ),
+        "SELECT COUNT(*) FROM events \
+         WHERE payload @> '{\"category\":\"purchase\"}'::jsonb",
+        ext_samples,
+    ).await;
+
+    // -- #32 `?` key existence ----------------------------------------------
+    // Every row has 'metadata' key → selectivity 100% (worst case for a
+    // key-exists probe; surfaces the per-row JSONB decode cost cleanly).
+    let key_exists = pair(
+        pg, sess,
+        format!("SELECT COUNT(*) FROM {schema}.events WHERE payload ? 'metadata'"),
+        "SELECT COUNT(*) FROM events WHERE payload ? 'metadata'",
+        ext_samples,
+    ).await;
+
+    // -- #33 `#>` path get --------------------------------------------------
+    let path_get = pair(
+        pg, sess,
+        format!("SELECT payload #> '{{device,os}}' FROM {schema}.events WHERE id < 100"),
+        "SELECT payload #> '{device,os}' FROM events WHERE id < 100",
+        ext_samples,
+    ).await;
+
+    // -- #34 jsonb_array_length(payload->'tags') ----------------------------
+    let array_length = pair(
+        pg, sess,
+        format!(
+            "SELECT jsonb_array_length(payload->'tags') FROM {schema}.events WHERE id < 100"
+        ),
+        "SELECT jsonb_array_length(payload->'tags') FROM events WHERE id < 100",
+        ext_samples,
+    ).await;
+
+    // -- #35 jsonb_typeof(payload->'metadata') ------------------------------
+    let typeof_fn = pair(
+        pg, sess,
+        format!(
+            "SELECT jsonb_typeof(payload->'metadata') FROM {schema}.events WHERE id < 100"
+        ),
+        "SELECT jsonb_typeof(payload->'metadata') FROM events WHERE id < 100",
+        ext_samples,
+    ).await;
+
+    // -- #36 JSONB filter + aggregate ---------------------------------------
+    // GROUP BY category, SUM the per-event score. The score field is JSON
+    // number-shaped, but `->>` extracts it as TEXT; `::float` is required
+    // on both sides to do arithmetic. This is the real-world analytics
+    // pattern for document-store workloads.
+    let filter_agg = pair(
+        pg, sess,
+        format!(
+            "SELECT payload->>'category', SUM((payload->'metadata'->>'score')::float) \
+             FROM {schema}.events GROUP BY 1"
+        ),
+        "SELECT payload->>'category', SUM((payload->'metadata'->>'score')::float) \
+         FROM events GROUP BY 1",
+        ext_samples,
+    ).await;
+
+    // -- #37 jsonb_set UPDATE — write-path mutation -------------------------
+    // Single-shot (no median) — repeated UPDATE on the same rows is
+    // idempotent but doesn't reflect repeated work. Bounded to 10 rows so
+    // the write is small and dominated by the JSONB rewrite cost, not by
+    // the heap rewrite.
+    let jsonb_set_pg = format!(
+        "UPDATE {schema}.events SET payload = \
+         jsonb_set(payload, '{{metadata,score}}', '99'::jsonb) WHERE id < 10"
+    );
+    let pg_set_ms = {
+        let started = Instant::now();
+        match pg.simple_query(&jsonb_set_pg).await {
+            Ok(_) => started.elapsed().as_secs_f64() * 1000.0,
+            Err(_) => f64::INFINITY,
+        }
+    };
+    let basin_set_sql =
+        "UPDATE events SET payload = jsonb_set(payload, '{metadata,score}', '99'::jsonb) \
+         WHERE id < 10";
+    let basin_set_ms = {
+        let started = Instant::now();
+        match sess.execute(basin_set_sql).await {
+            Ok(_) => Some(started.elapsed().as_secs_f64() * 1000.0),
+            Err(_) => None,
+        }
+    };
+    let jsonb_set_update = (basin_set_ms, pg_set_ms);
+
+    JsonbResults {
+        get_key,
+        get_text,
+        deep_path,
+        contains,
+        key_exists,
+        path_get,
+        array_length,
+        typeof_fn,
+        filter_agg,
+        jsonb_set_update,
+    }
+}
+
 /// Single-replicated suite that runs the FULL 29-metric comparison and emits
 /// the dashboard JSON card. Each `compare_postgres_*` test file is a 30-line
 /// wrapper that calls this with the right (rows, format, id, name, claim).
@@ -1154,7 +1420,8 @@ async fn run_full_compare_inner(
             user_id BIGINT, \
             amount DOUBLE PRECISION, \
             status TEXT, \
-            created_at TIMESTAMPTZ)"
+            created_at TIMESTAMPTZ, \
+            payload JSONB)"
     ))
     .await
     .expect("pg create events");
@@ -1248,14 +1515,18 @@ async fn run_full_compare_inner(
     }
 
     // ---- PG bulk INSERT N events ------------------------------------------
+    // `payload` is JSONB; PG requires the `::jsonb` cast on the literal
+    // (a bare TEXT in a JSONB column is rejected). Basin accepts the same
+    // literal but doesn't *need* the cast — we use it on both sides so the
+    // INSERT statement is byte-identical modulo `to_timestamp()`.
     let pg_insert_started = Instant::now();
     let mut row_idx: i64 = 0;
     while (row_idx as usize) < rows {
         let remaining = rows - row_idx as usize;
         let batch = remaining.min(insert_batch);
-        let mut stmt = String::with_capacity(batch * 80);
+        let mut stmt = String::with_capacity(batch * 240);
         stmt.push_str(&format!(
-            "INSERT INTO {schema}.events (id, user_id, amount, status, created_at) VALUES "
+            "INSERT INTO {schema}.events (id, user_id, amount, status, created_at, payload) VALUES "
         ));
         for j in 0..batch {
             if j > 0 {
@@ -1265,8 +1536,9 @@ async fn run_full_compare_inner(
             let user_id = id % user_count;
             let amount = (id as f64) * 0.5;
             let status = status_for(id);
+            let payload = payload_for(id);
             stmt.push_str(&format!(
-                "({id}, {user_id}, {amount}, '{status}', to_timestamp({}))",
+                "({id}, {user_id}, {amount}, '{status}', to_timestamp({}), '{payload}'::jsonb)",
                 EPOCH + id
             ));
         }
@@ -1378,7 +1650,8 @@ async fn run_full_compare_inner(
             user_id BIGINT NOT NULL, \
             amount DOUBLE PRECISION NOT NULL, \
             status TEXT NOT NULL, \
-            created_at BIGINT NOT NULL){with_clause}"
+            created_at BIGINT NOT NULL, \
+            payload JSONB){with_clause}"
     ))
     .await
     .unwrap();
@@ -1429,12 +1702,16 @@ async fn run_full_compare_inner(
     }
 
     // ---- Basin bulk INSERT N events ---------------------------------------
+    // `payload` JSONB carries the same per-row content as the PG seed (see
+    // `payload_for`) so the JSONB shape comparisons (#28-#37) are fair. The
+    // `::jsonb` cast is optional on Basin (column is already typed) but
+    // included to keep the literal byte-shape identical to PG.
     let basin_insert_started = Instant::now();
     let mut row_idx: i64 = 0;
     while (row_idx as usize) < rows {
         let remaining = rows - row_idx as usize;
         let batch = remaining.min(insert_batch);
-        let mut stmt = String::with_capacity(batch * 80);
+        let mut stmt = String::with_capacity(batch * 240);
         stmt.push_str("INSERT INTO events VALUES ");
         for j in 0..batch {
             if j > 0 {
@@ -1444,8 +1721,9 @@ async fn run_full_compare_inner(
             let user_id = id % user_count;
             let amount = (id as f64) * 0.5;
             let status = status_for(id);
+            let payload = payload_for(id);
             stmt.push_str(&format!(
-                "({id}, {user_id}, {amount}, '{status}', {})",
+                "({id}, {user_id}, {amount}, '{status}', {}, '{payload}'::jsonb)",
                 EPOCH + id
             ));
         }
@@ -1490,6 +1768,15 @@ async fn run_full_compare_inner(
     // default 2 MiB worker-thread stack budget — see ExtendedResults).
     // =======================================================================
     let ext = run_extended_suite(&pg, &sess, &schema, rows).await;
+
+    // =======================================================================
+    // JSONB document-store suite (#28-#37) — 10 first-class JSONB probes.
+    // Same stack-budget extraction pattern as `run_extended_suite`. Surfaces
+    // any unsupported JSONB op as a "(basin gap)" row rather than panicking
+    // the whole card. Runs AFTER the extended suite so the JSONB writes (#37)
+    // don't perturb earlier scan-based timings.
+    // =======================================================================
+    let jb = run_jsonb_suite(&pg, &sess, &schema, rows).await;
 
     // ---- Cold-start first query -------------------------------------------
     let pg_cold_ms = {
@@ -1632,6 +1919,18 @@ async fn run_full_compare_inner(
     row_opt("top_n_per_group_p50_ms", ext.top_n_per_group.0, ext.top_n_per_group.1);
     row_opt("numeric_range_p50_ms", ext.numeric_range.0, ext.numeric_range.1);
 
+    // JSONB-shape rows: same Option-or-GAP rendering as the extended suite.
+    row_opt("jsonb_get_key_p50_ms", jb.get_key.0, jb.get_key.1);
+    row_opt("jsonb_get_text_p50_ms", jb.get_text.0, jb.get_text.1);
+    row_opt("jsonb_deep_path_p50_ms", jb.deep_path.0, jb.deep_path.1);
+    row_opt("jsonb_contains_p50_ms", jb.contains.0, jb.contains.1);
+    row_opt("jsonb_key_exists_p50_ms", jb.key_exists.0, jb.key_exists.1);
+    row_opt("jsonb_path_get_p50_ms", jb.path_get.0, jb.path_get.1);
+    row_opt("jsonb_array_length_p50_ms", jb.array_length.0, jb.array_length.1);
+    row_opt("jsonb_typeof_p50_ms", jb.typeof_fn.0, jb.typeof_fn.1);
+    row_opt("jsonb_filter_agg_p50_ms", jb.filter_agg.0, jb.filter_agg.1);
+    row_opt("jsonb_set_update_ms", jb.jsonb_set_update.0, jb.jsonb_set_update.1);
+
     // ---- Emit benchmark JSON ----------------------------------------------
     let basin_disk_f = basin_disk_bytes as f64;
     let pg_disk_f = pg_disk_bytes as f64;
@@ -1748,6 +2047,19 @@ async fn run_full_compare_inner(
         mk_ext("ORDER BY NULLS LAST + LIMIT p50", ext.order_nulls_last.0, ext.order_nulls_last.1),
         mk_ext("Top-N per group (MAX) p50", ext.top_n_per_group.0, ext.top_n_per_group.1),
         mk_ext("Numeric range BETWEEN p50", ext.numeric_range.0, ext.numeric_range.1),
+        // JSONB document-store shapes — first-class JSONB head-to-head vs PG.
+        // Uses the same `mk_ext` Option-or-gap helper as #16-#27; "(basin gap)"
+        // suffix and -1.0 sentinel surface unsupported ops cleanly.
+        mk_ext("JSONB -> get key p50", jb.get_key.0, jb.get_key.1),
+        mk_ext("JSONB ->> get text p50", jb.get_text.0, jb.get_text.1),
+        mk_ext("JSONB -> deep path (device.version) p50", jb.deep_path.0, jb.deep_path.1),
+        mk_ext("JSONB @> contains p50", jb.contains.0, jb.contains.1),
+        mk_ext("JSONB ? key exists p50", jb.key_exists.0, jb.key_exists.1),
+        mk_ext("JSONB #> path get p50", jb.path_get.0, jb.path_get.1),
+        mk_ext("JSONB jsonb_array_length(tags) p50", jb.array_length.0, jb.array_length.1),
+        mk_ext("JSONB jsonb_typeof(metadata) p50", jb.typeof_fn.0, jb.typeof_fn.1),
+        mk_ext("JSONB filter+agg (GROUP BY ->>category) p50", jb.filter_agg.0, jb.filter_agg.1),
+        mk_ext("JSONB jsonb_set UPDATE (10 rows)", jb.jsonb_set_update.0, jb.jsonb_set_update.1),
     ];
 
     report_postgres_compare(id, name, claim, true, metrics, None);
