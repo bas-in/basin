@@ -1,0 +1,8 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Show the linked project's live status and migration drift.
+
+USAGE
+  basin status [args]

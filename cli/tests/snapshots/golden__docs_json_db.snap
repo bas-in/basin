@@ -1,0 +1,8 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+{
+  "opened": false,
+  "url": "https://docs.basin.run/cli/db"
+}

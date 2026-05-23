@@ -1,0 +1,11 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+List project activity events.
+
+USAGE
+  basin activity [args]
+
+FLAGS / SUBCOMMANDS
+  list [--project=<ref>] [--limit=N] [--since=<rfc3339>]   List recent project activity.

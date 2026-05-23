@@ -1,0 +1,16 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Replay a dump file into a project (inverse of `basin dump`).
+
+USAGE
+  basin restore [args]
+
+FLAGS / SUBCOMMANDS
+  --project=<ref>   Project ref (required, or auto-detected from ./basin/config.toml).
+  dump.sql          Path to the dump file produced by `basin dump`.
+                    Use `-` to read from stdin (or pipe: basin dump ... | basin restore ...).
+  
+  Engine-native restore endpoint (POST /v1/projects/{ref}/restore) will be wired
+  once basin-engine ships it. See TODO(5.22.D-engine-api) in restore.rs.

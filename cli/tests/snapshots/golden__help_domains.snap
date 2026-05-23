@@ -1,0 +1,15 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Manage custom domains for a project.
+
+USAGE
+  basin domains [args]
+
+FLAGS / SUBCOMMANDS
+  list             [--project=<ref>]           List custom domains.
+  add   <hostname> [--project=<ref>]           Add a custom domain (prints DNS records).
+  verify <id>      [--project=<ref>]           Trigger DNS verification.
+  cert   <id>      [--project=<ref>]           Request TLS certificate issuance.
+  remove <id>      [--project=<ref>] [--yes]   Remove a custom domain.

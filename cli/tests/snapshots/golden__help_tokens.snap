@@ -1,0 +1,16 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Manage org-scoped personal access tokens (PATs).
+
+USAGE
+  basin tokens [args]
+
+FLAGS / SUBCOMMANDS
+  list   --org <slug>                                          List tokens (revoked filtered out).
+  create --org <slug> --name <label> [--scope read|write|admin]
+         [--projects ref,ref] [--ip cidr,...] [--expires <7d|30d|90d|1y|never|RFC3339>]
+                                                               Mint a token (printed ONCE).
+  revoke <id> --org <slug>                                     Mark a token revoked.
+  show   <id> --org <slug>                                     Print token metadata (prefix only).

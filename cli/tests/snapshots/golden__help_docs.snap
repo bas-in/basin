@@ -1,0 +1,13 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Open the Basin CLI documentation in your browser.
+
+USAGE
+  basin docs [args]
+
+FLAGS / SUBCOMMANDS
+  [<subcommand>]   Open the docs page for a specific subcommand.
+                    Omit to open https://docs.basin.run/cli.
+  --json           Print { "url": "...", "opened": false } without launching a browser.

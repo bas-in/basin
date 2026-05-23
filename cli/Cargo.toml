@@ -29,8 +29,12 @@ tungstenite = { version = "0.24", default-features = false, features = ["handsha
 # proptest is the stable-toolchain property-based testing crate we use as
 # a fuzz substitute (Rust nightly's `cargo-fuzz` would otherwise be a
 # nightly-only dependency). See `tests/fuzz_proptest.rs` for the targets.
+# insta is the snapshot-test framework backing `tests/golden.rs` — the
+# Rust analogue of Go's `-update-golden` flag (refresh on intentional UX
+# change via `cargo insta accept` or `INSTA_UPDATE=always cargo test`).
 [dev-dependencies]
 proptest = "1.5"
+insta = { version = "1", features = ["filters"] }
 
 [profile.release]
 strip = true

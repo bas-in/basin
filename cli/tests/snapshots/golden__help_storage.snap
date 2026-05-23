@@ -1,0 +1,20 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Manage object storage buckets and objects (engine 5.17).
+
+USAGE
+  basin storage [args]
+
+FLAGS / SUBCOMMANDS
+  buckets list                              List all buckets.
+  buckets create <name> [--public]          Create a bucket.
+  buckets delete <name>                     Delete a bucket.
+  upload <bucket> <path> --file <file>      Upload an object.
+  download <bucket> <path> [--out <file>]   Download an object.
+  list <bucket> [--prefix p]                List objects in a bucket.
+  rm <bucket> <path…>                       Bulk-delete objects by prefix.
+  sign <bucket> <path> [--expires-in 3600]  Mint a signed URL.
+  
+  Global: --project=<ref>  --json

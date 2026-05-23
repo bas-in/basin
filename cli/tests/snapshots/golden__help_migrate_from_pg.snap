@@ -1,0 +1,14 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Guided Postgres → Basin migration.
+
+USAGE
+  basin migrate-from-pg [args]
+
+FLAGS / SUBCOMMANDS
+  --dsn=<postgres://...>   Source PG connection string (required).
+  --project=<ref>          Target Basin project ref (or auto-detected from ./basin/config.toml).
+  --dry-run                Show what would be migrated without writing.
+  --resume                 Continue a previous migration from the per-table watermark.

@@ -1,0 +1,13 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Stream live project logs (or poll history).
+
+USAGE
+  basin logs [args]
+
+FLAGS / SUBCOMMANDS
+  --project=<ref>     Project ref (flag or ./basin/config.toml).
+  --tail              Follow the live log stream.
+  --limit=N           Lines on a one-shot read (default 100).

@@ -1,0 +1,14 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Manage project-scoped API keys.
+
+USAGE
+  basin api-keys [args]
+
+FLAGS / SUBCOMMANDS
+  list   [--project=<ref>]                                  List API keys (masked secret).
+  create --name=<n> [--project=<ref>] [--scope=read|write|admin]  Create an API key (secret shown ONCE).
+  rotate <id> [--project=<ref>] [--yes]                     Rotate an API key (new secret shown ONCE).
+  revoke <id> [--project=<ref>] [--yes]                     Revoke an API key permanently.

@@ -1,0 +1,11 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Scaffold a basin project directory (./basin/).
+
+USAGE
+  basin init [args]
+
+FLAGS / SUBCOMMANDS
+  --force   Overwrite an existing ./basin/ directory.

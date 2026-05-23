@@ -1,0 +1,12 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Stream real-time events from a project table over SSE or WebSocket.
+
+USAGE
+  basin realtime [args]
+
+FLAGS / SUBCOMMANDS
+  subscribe <table> [--project=<ref>] [--since=<seq>]        SSE single-table subscribe.
+  subscribe --multi <t1>,<t2>,… [--filter=<expr>] [--project=<ref>]  WS multi-table subscribe.

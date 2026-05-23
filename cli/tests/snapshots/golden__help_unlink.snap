@@ -1,0 +1,8 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Remove the project binding from ./basin/config.toml.
+
+USAGE
+  basin unlink [args]

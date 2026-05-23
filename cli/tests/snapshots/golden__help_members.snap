@@ -1,0 +1,14 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Manage org members.
+
+USAGE
+  basin members [args]
+
+FLAGS / SUBCOMMANDS
+  list   --org=<slug>                                          List org members.
+  invite --org=<slug> --email=<e> [--role=member|admin|owner]  Invite a new member.
+  remove --org=<slug> --user-id=<u> [--yes]                   Remove a member.
+  role   --org=<slug> --user-id=<u> --role=<r>                Update a member's role.

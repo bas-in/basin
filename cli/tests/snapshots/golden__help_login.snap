@@ -1,0 +1,13 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Sign in by pasting a personal access token.
+
+USAGE
+  basin login [args]
+
+FLAGS / SUBCOMMANDS
+  --token=<pat>     Provide the token non-interactively.
+  --org=<slug>      Store under tokens.<slug> (per-org). Default writes default_token.
+  --api-url=<url>   Validate against this endpoint.

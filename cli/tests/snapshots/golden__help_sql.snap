@@ -1,0 +1,15 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Run a SQL query against a project's basin engine.
+
+USAGE
+  basin sql [args]
+
+FLAGS / SUBCOMMANDS
+  --project=<ref>      Project ref (flag or ./basin/config.toml).
+  -e/--exec '<sql>'    Inline query.
+  -f/--file <path>     Read SQL from file.
+  --writes             Permit DML/DDL (defaults to read-only).
+  (if neither -e nor -f is set, SQL is read from stdin)

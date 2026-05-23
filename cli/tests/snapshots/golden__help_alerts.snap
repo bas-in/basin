@@ -1,0 +1,18 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Manage project alert rules and events.
+
+USAGE
+  basin alerts [args]
+
+FLAGS / SUBCOMMANDS
+  rules list   [--project=<ref>]                                         List alert rules.
+  rules create --name=<n> --metric=<m> --threshold=<n> --comparator=<op> Create an alert rule.
+  rules get    <id> [--project=<ref>]                                    Get an alert rule.
+  rules patch  <id> [...] [--project=<ref>]                              Update an alert rule.
+  rules delete <id> [--project=<ref>] [--yes]                            Delete an alert rule.
+  rules silence   <id> --until=<rfc3339> [--project=<ref>]               Silence a rule until a time.
+  rules unsilence <id> [--project=<ref>]                                 Remove a silence.
+  events list  [--project=<ref>] [--limit=N] [--since=<rfc3339>]         List fired alert events.

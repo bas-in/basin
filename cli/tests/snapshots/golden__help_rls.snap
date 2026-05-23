@@ -1,0 +1,16 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Enable / disable / manage RLS policies on a project table.
+
+USAGE
+  basin rls [args]
+
+FLAGS / SUBCOMMANDS
+  enable   <table> [--project=<ref>]                                         Enable RLS.
+  disable  <table> [--project=<ref>]                                         Disable RLS.
+  policies list   <table> [--project=<ref>]                                  List policies.
+  policies create <table> --name=<n> --command=<cmd> --using=<sql>           Create a policy.
+                          [--with-check=<sql>] [--roles=<csv>]
+  policies drop   <table> --name=<n> [--project=<ref>] [--yes]               Drop a policy.

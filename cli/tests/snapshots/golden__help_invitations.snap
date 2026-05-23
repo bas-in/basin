@@ -1,0 +1,13 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Manage org invitations.
+
+USAGE
+  basin invitations [args]
+
+FLAGS / SUBCOMMANDS
+  list          --org=<slug>              List pending (and expired) invitations.
+  resend <id>   --org=<slug>              Resend an invitation email.
+  revoke <id>   --org=<slug> [--yes]      Revoke an invitation.

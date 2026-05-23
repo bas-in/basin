@@ -1,0 +1,15 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Manage SAML SSO for an org.
+
+USAGE
+  basin saml [args]
+
+FLAGS / SUBCOMMANDS
+  get     --org=<slug>                                           Show SAML config.
+  put     --org=<slug> --metadata-url=<u> [--entity-id=<id>] [--yes]  Configure SAML IdP.
+  test    --org=<slug>                                           Test IdP connectivity.
+  enable  --org=<slug> [--yes]                                   Enable SAML SSO.
+  disable --org=<slug> [--yes]                                   Disable SAML SSO.

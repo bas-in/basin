@@ -1,0 +1,17 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Manage webhook subscriptions for a project.
+
+USAGE
+  basin webhooks [args]
+
+FLAGS / SUBCOMMANDS
+  list                         [--project=<ref>]                     List webhooks.
+  create --url=<u> --events=<csv> [--project=<ref>]                 Create a webhook (secret shown ONCE).
+  patch  <id> [--url=<u>] [--events=<csv>] [--enabled=bool] [--project=<ref>]  Update a webhook.
+  test   <id>                  [--project=<ref>]                     Send a test delivery.
+  redeliver <id> --delivery=<id> [--project=<ref>]                  Redeliver a past delivery.
+  delete <id>                  [--project=<ref>] [--yes]             Delete a webhook.
+  deliveries <id> [--limit=N]  [--project=<ref>]                    List deliveries for a webhook.

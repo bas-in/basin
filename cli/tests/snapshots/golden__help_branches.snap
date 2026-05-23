@@ -1,0 +1,16 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+List / create / get / merge / delete branch preview environments.
+
+USAGE
+  basin branches [args]
+
+FLAGS / SUBCOMMANDS
+  list   [--project=<ref>]                               List branches for a project.
+  create <name> [--from=<branch_ref>] [--kind=<branch|preview>] [--project=<ref>]  Create a branch.
+  get    <branch_ref> [--project=<ref>]                  Show one branch.
+  merge  <branch_ref> [--project=<ref>] [--yes]          Merge a branch into its parent.
+  delete <branch_ref> [--project=<ref>] [--yes]          Delete (retire) a branch.
+  events [--project=<ref>] [--follow]                    List branch events; --follow polls every 5s.

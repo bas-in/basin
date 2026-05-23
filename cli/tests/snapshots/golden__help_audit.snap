@@ -1,0 +1,11 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+List org-scoped audit log events.
+
+USAGE
+  basin audit [args]
+
+FLAGS / SUBCOMMANDS
+  list --org=<slug> [--since=<rfc3339>] [--until=<rfc3339>] [--limit=N] [--export=<dest>]

@@ -1,0 +1,16 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Read or write CLI config values.
+
+USAGE
+  basin config [args]
+
+FLAGS / SUBCOMMANDS
+  show                          Print the on-disk config.
+  get <key>                     Print one key.
+  set <key> <value>             Persist a key.
+  
+  Keys:
+    telemetry                   on|off  (anonymous usage pings; default off)

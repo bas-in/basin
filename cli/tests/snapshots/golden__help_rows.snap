@@ -1,0 +1,13 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Insert / update / delete rows in a project table.
+
+USAGE
+  basin rows [args]
+
+FLAGS / SUBCOMMANDS
+  insert <table> [--project=<ref>] [--json='{...}']   Insert a row (or batch from stdin NDJSON).
+  update <table> --pk=<val> --json='{...}' [--project=<ref>]  Update a row by primary-key value.
+  delete <table> --where='<sql>' [--project=<ref>] [--yes]    Delete rows matching a predicate.

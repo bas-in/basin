@@ -1,0 +1,11 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Code-generation utilities.
+
+USAGE
+  basin gen [args]
+
+FLAGS / SUBCOMMANDS
+  types <typescript|go|python>   Generate typed database interfaces.

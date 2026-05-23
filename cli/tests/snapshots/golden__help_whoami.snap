@@ -1,0 +1,8 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Print the active user + accessible orgs.
+
+USAGE
+  basin whoami [args]

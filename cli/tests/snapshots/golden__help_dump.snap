@@ -1,0 +1,19 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Export a project's schema + data (pg_dump-shaped).
+
+USAGE
+  basin dump [args]
+
+FLAGS / SUBCOMMANDS
+  --project=<ref>         Project ref (required, or auto-detected from ./basin/config.toml).
+  --format=plain|custom   Output format: plain SQL text (default) or custom.
+                          plain  — pg_dump -F p compatible SQL statements.
+                          custom — reserved for a future engine binary dump endpoint;
+                                   currently exits non-zero with an explanatory error.
+  -f, --file=<path>       Write output to this file (default: stdout).
+  
+  Engine-native dump endpoint (GET /v1/projects/{ref}/dump) will be wired
+  once basin-engine ships it. See TODO(5.22.D-engine-api) in dump.rs.

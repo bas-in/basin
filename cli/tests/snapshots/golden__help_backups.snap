@@ -1,0 +1,17 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Manage project backup policy, snapshots, and restore jobs.
+
+USAGE
+  basin backups [args]
+
+FLAGS / SUBCOMMANDS
+  policy get                                   [--project=<ref>]  Get the backup policy.
+  policy set --retention-days=<n> --schedule=<cron> [--enabled=true|false] [--project=<ref>]  Update the backup policy.
+  snapshots list                               [--project=<ref>]  List backup snapshots.
+  snapshots create [--label=<text>]            [--project=<ref>]  Create a manual backup snapshot.
+  snapshots expire <id> [--yes]                [--project=<ref>]  Expire (delete) a backup snapshot.
+  restore --from=<snapshot_id> [--into=<branch_ref>] [--yes] [--project=<ref>]  Restore from a snapshot.
+  restore-jobs list                            [--project=<ref>]  List restore jobs.
