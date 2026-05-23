@@ -896,3 +896,121 @@ async fn updated_at_round_trip() {
         "second NOW() ({second}) must be strictly greater than first ({first})"
     );
 }
+
+// ─── Prisma `"public"."Table"` qualified DML round-trips ────────────────────
+//
+// Prisma's query compiler emits schema-qualified table names on every
+// `findUnique` / `update` / `delete`:
+//
+//   UPDATE "public"."User" SET "name" = $1
+//     WHERE "public"."User"."id" = $2
+//     RETURNING "public"."User"."id", "public"."User"."name", ...
+//
+// PG resolves `"public"` via `search_path`; Basin's flat-namespace catalog
+// stores everything under bare names. The DML resolver strips the
+// `"public"."` prefix (identity transform under default search_path) so the
+// ORM shape round-trips. Non-public schemas are rejected with a clearer
+// message — see the unit tests in `crates/basin-engine/src/dml_mutate.rs`.
+//
+// These tests pin the verbatim shape; if a refactor regresses the
+// resolver, the ORM-compat corpus loses 2-3 Prisma shapes immediately.
+
+/// Prisma `findUnique` + `update` round-trip: the canonical Prisma
+/// UPDATE statement emitted by `prisma.user.update({where: {id}, data})`.
+/// All three identifier sites are schema-qualified (table, WHERE col,
+/// RETURNING cols).
+#[tokio::test]
+async fn prisma_findunique_update_round_trip() {
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+
+    sess.execute(
+        "CREATE TABLE \"User\" (\
+             \"id\" BIGINT NOT NULL PRIMARY KEY, \
+             \"email\" TEXT NOT NULL, \
+             \"name\" TEXT NOT NULL\
+         )",
+    )
+    .await
+    .unwrap();
+    sess.execute(
+        "INSERT INTO \"User\" (\"id\", \"email\", \"name\") \
+         VALUES (1, 'alice@example.com', 'Alice')",
+    )
+    .await
+    .unwrap();
+
+    // Verbatim Prisma shape — schema-qualified target + WHERE + RETURNING.
+    let res = sess
+        .execute(
+            "UPDATE \"public\".\"User\" SET \"name\" = 'AliceUpdated' \
+             WHERE \"public\".\"User\".\"id\" = 1 \
+             RETURNING \"public\".\"User\".\"id\", \"public\".\"User\".\"name\"",
+        )
+        .await
+        .expect("Prisma-shaped UPDATE must succeed");
+
+    let ExecResult::Rows { batches, .. } = res else {
+        panic!("Prisma UPDATE … RETURNING must produce Rows");
+    };
+    assert_eq!(rows(&batches), 1, "exactly one row matched id=1");
+
+    // The change is visible on a subsequent read.
+    let ExecResult::Rows { batches: rb, .. } = sess
+        .execute("SELECT \"id\", \"name\" FROM \"User\" WHERE \"id\" = 1")
+        .await
+        .unwrap()
+    else {
+        panic!("SELECT must produce Rows");
+    };
+    assert_eq!(col_string(&rb, "name"), vec!["AliceUpdated"]);
+}
+
+/// Prisma `delete` round-trip: the canonical Prisma DELETE statement
+/// emitted by `prisma.user.delete({where: {id}})`. Same shape as the
+/// UPDATE above but with DELETE FROM.
+#[tokio::test]
+async fn prisma_delete_round_trip() {
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+
+    sess.execute(
+        "CREATE TABLE \"User\" (\
+             \"id\" BIGINT NOT NULL PRIMARY KEY, \
+             \"email\" TEXT NOT NULL\
+         )",
+    )
+    .await
+    .unwrap();
+    sess.execute(
+        "INSERT INTO \"User\" (\"id\", \"email\") VALUES \
+         (998, 'doomed@example.com'), (999, 'survivor@example.com')",
+    )
+    .await
+    .unwrap();
+
+    // Verbatim Prisma DELETE shape.
+    let res = sess
+        .execute(
+            "DELETE FROM \"public\".\"User\" \
+             WHERE \"public\".\"User\".\"id\" = 998 \
+             RETURNING \"public\".\"User\".\"id\", \"public\".\"User\".\"email\"",
+        )
+        .await
+        .expect("Prisma-shaped DELETE must succeed");
+
+    let ExecResult::Rows { batches, .. } = res else {
+        panic!("Prisma DELETE … RETURNING must produce Rows");
+    };
+    assert_eq!(rows(&batches), 1, "exactly one row matched id=998");
+
+    // The survivor row is still there; the doomed row is gone.
+    let ExecResult::Rows { batches: rb, .. } = sess
+        .execute("SELECT \"id\" FROM \"User\" ORDER BY \"id\"")
+        .await
+        .unwrap()
+    else {
+        panic!("SELECT must produce Rows");
+    };
+    assert_eq!(col_i64(&rb, "id"), vec![999]);
+}

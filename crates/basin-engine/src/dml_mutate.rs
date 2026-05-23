@@ -4068,13 +4068,47 @@ fn delete_table_alias(d: &Delete) -> Option<String> {
     }
 }
 
+/// Resolve an `ObjectName` (bare or schema-qualified) to the bare table /
+/// column identifier the rest of the DML path expects.
+///
+/// Accepted shapes:
+/// - `"t"` — bare; returned as-is.
+/// - `"public"."t"` — Prisma / TypeORM / Sequelize emit this verbatim on
+///   every `findUnique` / `update` / `delete`. PostgreSQL's default
+///   `search_path` resolves an unqualified table to `public`, so stripping
+///   the qualifier is an identity transform under Basin's flat-namespace
+///   catalog. Case-insensitive ASCII match to `"public"`.
+///
+/// Rejected shapes:
+/// - `"tenant_42"."t"` or any non-`public` schema — emits a clearer
+///   error pointing at `search_path` and naming `public` as the only
+///   supported schema today. Reserved schemas (`auth`, `storage`, …)
+///   fall through the same path: user DML against them is not the right
+///   surface — those schemas are owned by the engine and reach the
+///   catalog via `load_table_qualified`. A user DML statement that names
+///   a reserved schema is rejected here with the same "not in
+///   search_path" message rather than being silently aliased to
+///   `public`, which would mis-route the write.
+/// - Three-or-more-part names (`"db"."public"."t"`) — rejected; PG
+///   `database.schema.table` syntax has never been supported here.
 fn single_part_name(name: &ObjectName) -> Result<&str> {
-    if name.0.len() != 1 {
-        return Err(BasinError::InvalidIdent(format!(
-            "schema-qualified names not supported: {name}"
-        )));
+    match name.0.len() {
+        1 => Ok(name.0[0].id_val()),
+        2 => {
+            let schema = name.0[0].id_val().as_str();
+            if schema.eq_ignore_ascii_case("public") {
+                Ok(name.0[1].id_val())
+            } else {
+                Err(BasinError::InvalidIdent(format!(
+                    "schema {schema:?} not in search_path; basin only supports \
+                     the 'public' schema today (got: {name})"
+                )))
+            }
+        }
+        _ => Err(BasinError::InvalidIdent(format!(
+            "table name must have at most one schema qualifier: {name}"
+        ))),
     }
-    Ok(&name.0[0].id_val())
 }
 
 /// Append `(idx, AssignmentValue::Scalar(now_micros))` to `assignments` for
@@ -5248,5 +5282,188 @@ mod tests {
             "subquery materialisation cap must stay at 100k; \
              update docs + JOIN guidance if you change this"
         );
+    }
+
+    // ── single_part_name: "public"."t" qualifier acceptance ─────────────────
+    //
+    // Prisma / TypeORM / Sequelize emit `UPDATE "public"."t" …` and
+    // `DELETE FROM "public"."t" …` verbatim. PG's default search_path is
+    // `"$user", public`, so an unqualified table name resolves to `public`
+    // — stripping the `"public"."` prefix is an identity transform.
+    // Non-public qualifiers are rejected with a clearer message naming
+    // `search_path` and `public`, so the ORM author can diagnose the gap.
+
+    fn obj_name_2(schema: &str, table: &str) -> ObjectName {
+        ObjectName(vec![
+            sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(schema)),
+            sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(table)),
+        ])
+    }
+
+    fn obj_name_1(table: &str) -> ObjectName {
+        ObjectName(vec![sqlparser::ast::ObjectNamePart::Identifier(
+            sqlparser::ast::Ident::new(table),
+        )])
+    }
+
+    /// `single_part_name(t)` → `"t"` — bare name path is unchanged.
+    #[test]
+    fn single_part_name_bare_table() {
+        let n = obj_name_1("User");
+        assert_eq!(single_part_name(&n).unwrap(), "User");
+    }
+
+    /// `single_part_name("public"."t")` → `"t"` — the Prisma case.
+    #[test]
+    fn single_part_name_public_schema_prefix_stripped() {
+        let n = obj_name_2("public", "User");
+        assert_eq!(single_part_name(&n).unwrap(), "User");
+    }
+
+    /// ASCII-case-insensitive: `"PUBLIC"."User"` matches `"public"`.
+    #[test]
+    fn single_part_name_public_schema_case_insensitive() {
+        let n = obj_name_2("PUBLIC", "User");
+        assert_eq!(single_part_name(&n).unwrap(), "User");
+    }
+
+    /// Non-public schema is rejected with a message pointing at
+    /// `search_path` and naming `public` as the only supported schema.
+    /// The error wording is load-bearing — ORM authors grep for "public"
+    /// and "search_path" in the failure to diagnose the gap.
+    #[test]
+    fn single_part_name_non_public_schema_rejected() {
+        let n = obj_name_2("tenant_42", "users");
+        let err = single_part_name(&n).expect_err("non-public must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tenant_42"),
+            "error should name the offending schema, got: {msg}"
+        );
+        assert!(
+            msg.contains("public"),
+            "error should mention 'public' as the supported schema, got: {msg}"
+        );
+        assert!(
+            msg.contains("search_path"),
+            "error should reference search_path, got: {msg}"
+        );
+    }
+
+    /// Three-part `db.schema.t` (PG fully-qualified form) is rejected —
+    /// Basin doesn't model cross-database refs in DML.
+    #[test]
+    fn single_part_name_three_part_rejected() {
+        let n = ObjectName(vec![
+            sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new("db")),
+            sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new("public")),
+            sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new("t")),
+        ]);
+        let err = single_part_name(&n).expect_err("three-part must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("at most one schema qualifier"),
+            "three-part error must say 'at most one schema qualifier', got: {msg}"
+        );
+    }
+
+    // ── Parser-driven: UPDATE / DELETE with "public"."t" qualifier ──────────
+    //
+    // These exercise the full resolver path that the executor takes when
+    // sqlparser hands back a real `Statement::Update` / `Statement::Delete`
+    // built from the user's SQL. They guard against regressions where a
+    // refactor wires the table-name extraction through a different helper
+    // that bypasses `single_part_name`.
+
+    fn parse_update_target(sql: &str) -> ObjectName {
+        use sqlparser::ast::Statement;
+        use sqlparser::dialect::PostgreSqlDialect;
+        use sqlparser::parser::Parser;
+        let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).expect("parse UPDATE");
+        let Statement::Update { table, .. } = stmts.into_iter().next().unwrap() else {
+            panic!("expected UPDATE");
+        };
+        match table.relation {
+            TableFactor::Table { name, .. } => name,
+            other => panic!("expected TableFactor::Table, got {other:?}"),
+        }
+    }
+
+    fn parse_delete_target(sql: &str) -> ObjectName {
+        use sqlparser::ast::Statement;
+        use sqlparser::dialect::PostgreSqlDialect;
+        use sqlparser::parser::Parser;
+        let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).expect("parse DELETE");
+        let Statement::Delete(d) = stmts.into_iter().next().unwrap() else {
+            panic!("expected DELETE");
+        };
+        let tables = match d.from {
+            FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
+        };
+        match tables.into_iter().next().unwrap().relation {
+            TableFactor::Table { name, .. } => name,
+            other => panic!("expected TableFactor::Table, got {other:?}"),
+        }
+    }
+
+    /// `UPDATE "public"."t" SET col = 1 WHERE id = 1` — Prisma shape;
+    /// the resolver strips `"public"."` and the executor sees bare `"t"`.
+    #[test]
+    fn update_with_public_schema_prefix() {
+        let name = parse_update_target("UPDATE \"public\".\"t\" SET col = 1 WHERE id = 1");
+        assert_eq!(single_part_name(&name).unwrap(), "t");
+    }
+
+    /// `DELETE FROM "public"."t" WHERE id = 1` — Prisma shape; resolver
+    /// strips `"public"."` and the executor sees bare `"t"`.
+    #[test]
+    fn delete_with_public_schema_prefix() {
+        let name = parse_delete_target("DELETE FROM \"public\".\"t\" WHERE id = 1");
+        assert_eq!(single_part_name(&name).unwrap(), "t");
+    }
+
+    /// `UPDATE "public"."t" SET col = 1 WHERE "public"."t"."id" = 1` —
+    /// three-part WHERE column ref combined with two-part table qualifier.
+    /// Resolver strips the table prefix and the existing
+    /// `as_identifier` path handles the 3-part column ref (per #71).
+    #[test]
+    fn update_with_qualified_col_under_schema_prefix() {
+        let name = parse_update_target(
+            "UPDATE \"public\".\"t\" SET col = 1 WHERE \"public\".\"t\".\"id\" = 1",
+        );
+        assert_eq!(single_part_name(&name).unwrap(), "t");
+        // Confirm the WHERE col ref still resolves under "t" after table
+        // qualifier stripping (this is the path the executor takes after
+        // `let table_name = single_part_name(name)?` succeeds).
+        let three_part = Expr::CompoundIdentifier(vec![
+            sqlparser::ast::Ident::new("public"),
+            sqlparser::ast::Ident::new("t"),
+            sqlparser::ast::Ident::new("id"),
+        ]);
+        assert_eq!(as_identifier(&three_part, "t"), Some("id".to_string()));
+    }
+
+    /// `UPDATE "tenant_42"."t" SET col = 1 WHERE id = 1` — non-public
+    /// schema rejected with a clear message naming `public` and
+    /// `search_path`.
+    #[test]
+    fn update_with_non_public_schema_refused() {
+        let name = parse_update_target("UPDATE \"tenant_42\".\"t\" SET col = 1 WHERE id = 1");
+        let err = single_part_name(&name).expect_err("non-public must reject");
+        let msg = err.to_string();
+        assert!(msg.contains("tenant_42"), "must name offending schema: {msg}");
+        assert!(msg.contains("public"), "must mention 'public': {msg}");
+        assert!(msg.contains("search_path"), "must mention search_path: {msg}");
+    }
+
+    /// `DELETE FROM "tenant_42"."t" WHERE id = 1` — same as above.
+    #[test]
+    fn delete_with_non_public_schema_refused() {
+        let name = parse_delete_target("DELETE FROM \"tenant_42\".\"t\" WHERE id = 1");
+        let err = single_part_name(&name).expect_err("non-public must reject");
+        let msg = err.to_string();
+        assert!(msg.contains("tenant_42"), "must name offending schema: {msg}");
+        assert!(msg.contains("public"), "must mention 'public': {msg}");
+        assert!(msg.contains("search_path"), "must mention search_path: {msg}");
     }
 }
