@@ -1,0 +1,44 @@
+{
+  "additionalProperties": true,
+  "properties": {
+    "queries": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "public": {
+            "type": "boolean"
+          },
+          "sql": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "created_at",
+          "id",
+          "name",
+          "public",
+          "sql",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "queries"
+  ],
+  "type": "object"
+}

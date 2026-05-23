@@ -1,0 +1,24 @@
+{
+  "additionalProperties": true,
+  "properties": {
+    "date": {
+      "type": "string"
+    },
+    "os_arch": {
+      "type": "string"
+    },
+    "rustc": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "date",
+    "os_arch",
+    "rustc",
+    "version"
+  ],
+  "type": "object"
+}

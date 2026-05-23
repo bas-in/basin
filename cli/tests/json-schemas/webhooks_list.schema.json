@@ -1,0 +1,43 @@
+{
+  "additionalProperties": true,
+  "properties": {
+    "webhooks": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "events": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "id": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "created_at",
+          "enabled",
+          "events",
+          "id",
+          "url"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "webhooks"
+  ],
+  "type": "object"
+}

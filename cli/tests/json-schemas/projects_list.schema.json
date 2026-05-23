@@ -1,0 +1,48 @@
+{
+  "additionalProperties": true,
+  "properties": {
+    "projects": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "engine_tenant_id": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "ref": {
+            "type": "string"
+          },
+          "region": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "created_at",
+          "engine_tenant_id",
+          "id",
+          "name",
+          "ref",
+          "region",
+          "status"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "projects"
+  ],
+  "type": "object"
+}

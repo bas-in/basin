@@ -1,0 +1,28 @@
+{
+  "additionalProperties": true,
+  "properties": {
+    "providers": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "provider": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "enabled",
+          "provider"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "providers"
+  ],
+  "type": "object"
+}

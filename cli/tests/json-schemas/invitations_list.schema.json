@@ -1,0 +1,36 @@
+{
+  "additionalProperties": true,
+  "properties": {
+    "invitations": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "expires_at": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "email",
+          "expires_at",
+          "id",
+          "role"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "invitations"
+  ],
+  "type": "object"
+}

@@ -1,0 +1,28 @@
+{
+  "additionalProperties": true,
+  "properties": {
+    "events": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "action",
+          "id"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "events"
+  ],
+  "type": "object"
+}
