@@ -106,17 +106,56 @@ build_test_binaries() {
         jobs=$(( ncpu > 3 ? ncpu - 2 : 1 ))
     fi
     log "building ${#bins[@]} bench binaries (${BENCH_PROFILE}, CARGO_BUILD_JOBS=${jobs}) ..."
+    # --message-format=json prints one Cargo build-message per artifact,
+    # including the absolute `executable` path for each test binary. We
+    # capture those into the bin-resolution map so _group.sh can exec the
+    # binaries directly — no per-binary cargo invocation, no target-dir
+    # file-lock contention (the real wall-clock killer at concurrency>1).
+    local build_json="${READY_MARKER_DIR}/build.jsonl"
     (
         cd "${REPO_ROOT}"
         CARGO_BUILD_JOBS="${jobs}" cargo test -p basin-integration-tests \
             "${test_args[@]}" \
             ${CARGO_PROFILE_FLAG[@]+"${CARGO_PROFILE_FLAG[@]}"} --no-run \
-            >&2 2>&1 || {
-            log "ERROR: test-binary build failed"
+            --message-format=json \
+            > "${build_json}" 2> "${READY_MARKER_DIR}/build.err" || {
+            log "ERROR: test-binary build failed — see ${READY_MARKER_DIR}/build.err"
+            tail -30 "${READY_MARKER_DIR}/build.err" >&2 || true
             exit 1
         }
     )
-    log "build complete."
+    # Build the bin→executable map. compiler-artifact records have:
+    #   target.kind:["test"], target.name:"<bin_name>", executable:"/path"
+    local map="${READY_MARKER_DIR}/bench_bins.tsv"
+    : > "${map}"
+    if command -v jq >/dev/null 2>&1; then
+        jq -r 'select(.reason=="compiler-artifact" and .executable!=null
+                      and (.target.kind|index("test"))!=null)
+               | "\(.target.name)\t\(.executable)"' \
+            "${build_json}" > "${map}"
+    else
+        # No jq — pure-python fallback (always available on macOS).
+        python3 - "${build_json}" "${map}" <<'PY'
+import json, sys
+src, dst = sys.argv[1], sys.argv[2]
+with open(src) as f, open(dst, "w") as out:
+    for line in f:
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        if r.get("reason") != "compiler-artifact": continue
+        if not r.get("executable"): continue
+        t = r.get("target") or {}
+        if "test" not in (t.get("kind") or []): continue
+        out.write(f"{t.get('name')}\t{r['executable']}\n")
+PY
+    fi
+    local nbins; nbins="$(wc -l < "${map}" | tr -d ' ')"
+    if [[ "${nbins}" -lt "${#bins[@]}" ]]; then
+        log "WARN: built ${nbins} executable records, expected ${#bins[@]} (some bins may run from cached binaries — that's fine)"
+    fi
+    log "build complete (${nbins} executable records in ${map})."
 }
 
 # --- 2. SeaweedFS lifecycle -------------------------------------------------
@@ -246,6 +285,7 @@ fi
 export BENCH_REPO_ROOT="${REPO_ROOT}"
 export BENCH_RUN_DIR="${RUN_DIR}"
 export BENCH_DIR="${BENCH_DIR}"
+export BENCH_BIN_MAP="${READY_MARKER_DIR}/bench_bins.tsv"
 export SEAWEED_TEST_CONFIG
 export SEAWEED_BUCKET
 

@@ -42,10 +42,17 @@ log() { printf '[group %s] %s\n' "${GROUP}" "$*" >&2; }
 # whole run. On timeout the binary's process tree is killed; it simply
 # does not re-emit its JSON, so merge_manifest.py omits that card with a
 # logged reason. macOS has no `timeout(1)`, so we watchdog it ourselves.
-PER_TEST_TIMEOUT="${PER_TEST_TIMEOUT:-240}"   # 4 min/binary hard cap
+#
+# Was 240s when each binary's "run" actually re-invoked `cargo test --test X`,
+# which paid a per-binary cargo lock-acquire + re-link cost (~30-120s) before
+# the test even started. The fix below execs the prebuilt binary directly, so
+# 240s is now an *all-test* cap — bumped to 600s for binaries that contain
+# multiple #[test] fns (per_project_provisioning has 3 with N=100/50/5).
+PER_TEST_TIMEOUT="${PER_TEST_TIMEOUT:-600}"   # 10 min/binary hard cap
 
-# Per-config environment.
-env_prefix=( CARGO_BUILD_JOBS=1 )
+# Per-config environment for the test binary.
+declare -a env_prefix
+env_prefix=()
 if [[ "${config}" == "seaweedfs" ]]; then
   # Redirect the s3_* report_real_* sidecars into data_seaweedfs/, and
   # point the test-config loader at the SeaweedFS .toml.
@@ -55,21 +62,28 @@ if [[ "${config}" == "seaweedfs" ]]; then
   )
 fi
 
-# Match the build profile _setup.sh used (default release). MUST agree
-# with _setup.sh's selection or this group would recompile every binary
-# under a different profile, wiping out the shared build.
-case "${BENCH_PROFILE:-release}" in
-  release) profile_flag=( --release ) ;;
-  dev)     profile_flag=() ;;
-  *)       profile_flag=( --profile "${BENCH_PROFILE:-release}" ) ;;
-esac
-
+# libtest runner args. The binary itself accepts these directly when invoked
+# without cargo.
 runner_args=( --nocapture --test-threads="${threads}" )
 if [[ "${ignored}" == "1" ]]; then
   runner_args+=( --ignored )
 fi
 
-# Kill a pid and all its descendants (cargo -> test binary -> tokio).
+# bin → executable path map written by _setup.sh.
+BIN_MAP="${BENCH_BIN_MAP:-${RUN_DIR}/.ready/bench_bins.tsv}"
+if [[ ! -f "${BIN_MAP}" ]]; then
+  echo "[group ${GROUP}] missing ${BIN_MAP} — run _setup.sh first" >&2
+  exit 2
+fi
+
+# Resolve <bin_name> -> /path/to/executable (newest matching record, in case
+# of stale entries from a previous run sharing the same .ready dir).
+resolve_bin() {
+  local name="$1"
+  awk -F'\t' -v n="${name}" '$1==n {print $2}' "${BIN_MAP}" | tail -n 1
+}
+
+# Kill a pid and all its descendants (test binary -> tokio worker pool).
 kill_tree() {
   local p="$1" c
   for c in $(pgrep -P "${p}" 2>/dev/null); do kill_tree "${c}"; done
@@ -77,16 +91,20 @@ kill_tree() {
 }
 
 # Run ONE test binary under the watchdog. Returns the binary's rc, or 124
-# if it was killed for exceeding PER_TEST_TIMEOUT.
+# if it was killed for exceeding PER_TEST_TIMEOUT, or 125 if the executable
+# is not on disk (build did not produce it).
 run_one() {
-  local bin="$1" b_start b_pid waited rc
+  local bin="$1" exe b_start b_pid waited rc
+  exe="$(resolve_bin "${bin}")"
+  if [[ -z "${exe}" || ! -x "${exe}" ]]; then
+    log "MISSING: no executable for '${bin}' in ${BIN_MAP} (rebuild needed)"
+    return 125
+  fi
   b_start="$(date +%s)"
   (
     cd "${BENCH_REPO_ROOT}" || exit 1
-    env "${env_prefix[@]}" \
-      cargo test -p basin-integration-tests --test "${bin}" \
-        ${profile_flag[@]+"${profile_flag[@]}"} \
-        --no-fail-fast -- "${runner_args[@]}"
+    env "${env_prefix[@]+"${env_prefix[@]}"}" \
+      "${exe}" "${runner_args[@]}"
   ) &
   b_pid=$!
   waited=0
@@ -111,16 +129,23 @@ log "binaries: ${bins[*]}"
 start_ts="$(date +%s)"
 rc=0
 timed_out=()
+missing=()
 for b in "${bins[@]}"; do
   run_one "${b}"
   brc=$?
   if [[ "${brc}" == "124" ]]; then
     timed_out+=( "${b}" )
     rc=1
+  elif [[ "${brc}" == "125" ]]; then
+    missing+=( "${b}" )
+    rc=1
   elif [[ "${brc}" != "0" ]]; then
     rc=1
   fi
 done
+if (( ${#missing[@]} > 0 )); then
+  log "missing binaries (build did not produce executable): ${missing[*]}"
+fi
 if (( ${#timed_out[@]} > 0 )); then
   log "timed-out binaries (omitted from manifest): ${timed_out[*]}"
 fi
