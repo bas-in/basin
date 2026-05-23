@@ -36,12 +36,22 @@ pub enum Predicate {
     Eq(String, ScalarValue),
     Gt(String, ScalarValue),
     Lt(String, ScalarValue),
+    /// Anchored prefix match: column starts with the given literal.
+    /// Translates `WHERE col LIKE 'foo%'` and `col ILIKE 'foo%'` when the
+    /// pattern is a pure prefix (no `%`/`_` before the trailing `%`).
+    /// `case_insensitive=true` is ILIKE (ASCII-only case folding).
+    StartsWith {
+        column: String,
+        prefix: String,
+        case_insensitive: bool,
+    },
 }
 
 impl Predicate {
     pub fn column(&self) -> &str {
         match self {
             Predicate::Eq(c, _) | Predicate::Gt(c, _) | Predicate::Lt(c, _) => c,
+            Predicate::StartsWith { column, .. } => column,
         }
     }
 }
@@ -68,6 +78,18 @@ pub fn evaluate(
     let col = batch
         .column_by_name(col_name)
         .ok_or_else(|| BasinError::storage(format!("predicate column missing: {col_name}")))?;
+
+    // StartsWith on Utf8/LargeUtf8 — early dispatch so we don't enter the
+    // generic `(predicate, scalar)` matcher below (StartsWith has no
+    // associated ScalarValue).
+    if let Predicate::StartsWith {
+        prefix,
+        case_insensitive,
+        ..
+    } = predicate
+    {
+        return Ok(eval_starts_with(col, prefix, *case_insensitive));
+    }
 
     macro_rules! cmp_primitive {
         ($arrow_ty:ty, $val:expr, $op:tt) => {{
@@ -292,6 +314,12 @@ pub fn evaluate(
                 Predicate::Eq(_, _) => |a, b| a == b,
                 Predicate::Gt(_, _) => |a, b| a > b,
                 Predicate::Lt(_, _) => |a, b| a < b,
+                // Outer match arm above gates on Eq|Gt|Lt — StartsWith
+                // never reaches here. StartsWith on a Timestamp column is
+                // a type-mismatch and is rejected upstream.
+                Predicate::StartsWith { .. } => {
+                    unreachable!("StartsWith routed to timestamp-utf8 path")
+                }
             };
             let mut b = arrow_array::builder::BooleanBuilder::with_capacity(arr.len());
             for i in 0..arr.len() {
@@ -311,6 +339,11 @@ pub fn evaluate(
                 Predicate::Eq(_, _) => |a, b| a == b,
                 Predicate::Gt(_, _) => |a, b| a > b,
                 Predicate::Lt(_, _) => |a, b| a < b,
+                // Outer match gates on Eq|Gt|Lt; StartsWith handled in
+                // the dedicated arm above (see line ~85).
+                Predicate::StartsWith { .. } => {
+                    unreachable!("StartsWith routed to generic utf8 cmp path")
+                }
             };
             let mut b = arrow_array::builder::BooleanBuilder::with_capacity(arr.len());
             for i in 0..arr.len() {
@@ -347,7 +380,83 @@ pub fn evaluate(
 fn predicate_value(p: &Predicate) -> ScalarValue {
     match p {
         Predicate::Eq(_, v) | Predicate::Gt(_, v) | Predicate::Lt(_, v) => v.clone(),
+        // StartsWith is dispatched before this helper is consulted (see
+        // `evaluate`). Returning a sentinel keeps the function total.
+        Predicate::StartsWith { prefix, .. } => ScalarValue::Utf8(prefix.clone()),
     }
+}
+
+/// Evaluate `StartsWith` against a Utf8/LargeUtf8 column. Anything else
+/// (e.g. dictionary-encoded string, FixedSizeBinary) returns an all-false
+/// mask — caller still gets correct semantics (no spurious matches) and we
+/// avoid a panic on unexpected column types.
+fn eval_starts_with(
+    col: &std::sync::Arc<dyn arrow_array::Array>,
+    prefix: &str,
+    case_insensitive: bool,
+) -> arrow_array::BooleanArray {
+    use arrow_array::cast::AsArray;
+    use arrow_array::Array;
+    use arrow_schema::DataType as Dt;
+
+    let dt = col.data_type();
+    let mut b = arrow_array::builder::BooleanBuilder::with_capacity(col.len());
+
+    // Lowercase the prefix once when ILIKE.
+    let prefix_lc: String;
+    let prefix_ref: &str = if case_insensitive {
+        prefix_lc = prefix.to_ascii_lowercase();
+        prefix_lc.as_str()
+    } else {
+        prefix
+    };
+
+    match dt {
+        Dt::Utf8 => {
+            let arr = col.as_string::<i32>();
+            for i in 0..arr.len() {
+                if arr.is_null(i) {
+                    b.append_value(false);
+                } else if case_insensitive {
+                    let v = arr.value(i);
+                    // Cheap length check before lowercasing to avoid
+                    // allocating on rows that obviously can't match.
+                    if v.len() < prefix_ref.len() {
+                        b.append_value(false);
+                    } else {
+                        b.append_value(v.to_ascii_lowercase().starts_with(prefix_ref));
+                    }
+                } else {
+                    b.append_value(arr.value(i).starts_with(prefix_ref));
+                }
+            }
+        }
+        Dt::LargeUtf8 => {
+            let arr = col.as_string::<i64>();
+            for i in 0..arr.len() {
+                if arr.is_null(i) {
+                    b.append_value(false);
+                } else if case_insensitive {
+                    let v = arr.value(i);
+                    if v.len() < prefix_ref.len() {
+                        b.append_value(false);
+                    } else {
+                        b.append_value(v.to_ascii_lowercase().starts_with(prefix_ref));
+                    }
+                } else {
+                    b.append_value(arr.value(i).starts_with(prefix_ref));
+                }
+            }
+        }
+        _ => {
+            // Unsupported column type for prefix match — return all-false so
+            // the caller still gets correct semantics.
+            for _ in 0..col.len() {
+                b.append_value(false);
+            }
+        }
+    }
+    b.finish()
 }
 
 /// A boolean expression over [`Predicate`] atoms plus null-checks and `IN`
@@ -621,6 +730,21 @@ fn prune_atom(
     let dt = field.data_type();
     let value = match atom {
         Predicate::Eq(_, v) | Predicate::Gt(_, v) | Predicate::Lt(_, v) => v,
+        // StartsWith has its own pruning path below — handle it before we
+        // try to extract a ScalarValue (which doesn't exist for prefixes).
+        Predicate::StartsWith {
+            prefix,
+            case_insensitive,
+            ..
+        } => {
+            return prune_starts_with(
+                prefix,
+                *case_insensitive,
+                cs.min_bytes.as_deref(),
+                cs.max_bytes.as_deref(),
+                has_nulls,
+            );
+        }
     };
     let (Some(min), Some(max)) = (cs.min_bytes.as_deref(), cs.max_bytes.as_deref()) else {
         return PruneOutcome::Mixed;
@@ -703,6 +827,10 @@ fn decide_numeric<T: PartialOrd + Copy>(
                 PruneOutcome::Mixed
             }
         }
+        // StartsWith is string-only; this numeric pruner is never the
+        // dispatch target for it. Caller (decide_string) handles the
+        // prefix-range pruning logic for StartsWith.
+        Predicate::StartsWith { .. } => PruneOutcome::Mixed,
     }
 }
 
@@ -741,7 +869,72 @@ fn decide_byte_lex(
                 PruneOutcome::Mixed
             }
         }
+        // StartsWith has its own pruner (`decide_starts_with_bytes` below).
+        // This arm should never fire — caller routes StartsWith there
+        // directly. Return Mixed as a safe fallback.
+        Predicate::StartsWith { .. } => PruneOutcome::Mixed,
     }
+}
+
+/// Prune a `StartsWith` predicate against per-column min/max byte stats.
+///
+/// Semantics: a row matches iff `value` starts with `prefix` (case-sensitive
+/// or ASCII-folded). For pruning we use the lex-ordered min/max bytes:
+///
+/// * If max < prefix (lex) → no value can start with prefix → NoMatch.
+/// * If min > prefix_end (lex) → no value can start with prefix → NoMatch.
+///
+/// For case-insensitive (ILIKE) we conservatively bail to Mixed: the
+/// on-disk min/max is in the column's native casing, so an ILIKE prefix
+/// can match values whose lex-bytes are outside the `[prefix, prefix_end)`
+/// range. Skipping pruning is always safe.
+///
+/// `prefix_end` is computed by incrementing the last byte of `prefix`. If
+/// the last byte is `0xFF` (or the prefix is empty) we give up the upper
+/// bound and only use the `max < prefix` rule. This keeps the function
+/// allocation-light and avoids unicode edge cases.
+fn prune_starts_with(
+    prefix: &str,
+    case_insensitive: bool,
+    min: Option<&[u8]>,
+    max: Option<&[u8]>,
+    _has_nulls: bool,
+) -> PruneOutcome {
+    if case_insensitive {
+        // ASCII-fold pruning would need both min and max folded, plus careful
+        // handling of code points where lowercasing changes byte length.
+        // Skip — the per-row filter still gives us the materialization-cost
+        // win, and an inconclusive Mixed never loses data.
+        return PruneOutcome::Mixed;
+    }
+    if prefix.is_empty() {
+        // Empty prefix matches every non-null value — pruning is uninformative.
+        return PruneOutcome::Mixed;
+    }
+    let (Some(min), Some(max)) = (min, max) else {
+        return PruneOutcome::Mixed;
+    };
+    let pbytes = prefix.as_bytes();
+
+    // Lower bound check: max < prefix → NoMatch.
+    if max < pbytes {
+        return PruneOutcome::NoMatch;
+    }
+
+    // Upper bound: bump the last byte to derive `prefix_end` such that any
+    // string starting with `prefix` is lex < prefix_end. If the last byte
+    // is `0xFF` we can't represent the successor in the same length without
+    // appending — bail to `Mixed` for the upper bound check.
+    let last = *pbytes.last().expect("non-empty prefix");
+    if last != 0xFF {
+        let mut pend = pbytes.to_vec();
+        let n = pend.len();
+        pend[n - 1] = last + 1;
+        if min.as_ref() >= pend.as_slice() {
+            return PruneOutcome::NoMatch;
+        }
+    }
+    PruneOutcome::Mixed
 }
 
 fn decode_i64(b: &[u8]) -> Option<i64> {
@@ -1152,6 +1345,167 @@ mod compound_tests {
             ScalarValue::Utf8("not-a-uuid".into()),
         );
         assert!(evaluate(&batch, &pred).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // StartsWith / LIKE-prefix tests
+    // -----------------------------------------------------------------------
+
+    fn string_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+        let names = StringArray::from(vec![
+            Some("pending_alpha"),
+            Some("pending_beta"),
+            Some("processed_gamma"),
+            None,
+            Some("PENDING_UPPER"),
+            Some("paid"),
+        ]);
+        RecordBatch::try_new(schema, vec![Arc::new(names)]).unwrap()
+    }
+
+    fn mask_to_bools(arr: &BooleanArray) -> Vec<bool> {
+        (0..arr.len())
+            .map(|i| if arr.is_null(i) { false } else { arr.value(i) })
+            .collect()
+    }
+
+    #[test]
+    fn starts_with_case_sensitive_filters_rows() {
+        let batch = string_batch();
+        let pred = Predicate::StartsWith {
+            column: "name".into(),
+            prefix: "pending".into(),
+            case_insensitive: false,
+        };
+        let mask = evaluate(&batch, &pred).unwrap();
+        // "pending_alpha" yes, "pending_beta" yes, processed no, NULL no,
+        // "PENDING_UPPER" no (case-sensitive), "paid" no.
+        assert_eq!(
+            mask_to_bools(&mask),
+            vec![true, true, false, false, false, false]
+        );
+    }
+
+    #[test]
+    fn starts_with_case_insensitive_matches_mixed_case() {
+        let batch = string_batch();
+        let pred = Predicate::StartsWith {
+            column: "name".into(),
+            prefix: "pending".into(),
+            case_insensitive: true,
+        };
+        let mask = evaluate(&batch, &pred).unwrap();
+        // Now "PENDING_UPPER" matches too via ASCII fold.
+        assert_eq!(
+            mask_to_bools(&mask),
+            vec![true, true, false, false, true, false]
+        );
+    }
+
+    #[test]
+    fn starts_with_via_compound_predicate() {
+        let batch = string_batch();
+        let pred = CompoundPredicate::Atom(Predicate::StartsWith {
+            column: "name".into(),
+            prefix: "paid".into(),
+            case_insensitive: false,
+        });
+        let mask = evaluate_compound(&batch, &pred).unwrap();
+        assert_eq!(
+            mask_to_bools(&mask),
+            vec![false, false, false, false, false, true]
+        );
+    }
+
+    #[test]
+    fn starts_with_column_helper_returns_column() {
+        let p = Predicate::StartsWith {
+            column: "status".into(),
+            prefix: "pending".into(),
+            case_insensitive: false,
+        };
+        assert_eq!(p.column(), "status");
+    }
+
+    fn string_stats(min: &str, max: &str, nulls: u64) -> BTreeMap<String, ColumnStats> {
+        let mut m = BTreeMap::new();
+        m.insert(
+            "name".into(),
+            ColumnStats {
+                null_count: Some(nulls),
+                min_bytes: Some(min.as_bytes().to_vec()),
+                max_bytes: Some(max.as_bytes().to_vec()),
+                ..Default::default()
+            },
+        );
+        m
+    }
+
+    fn name_schema() -> Schema {
+        Schema::new(vec![Field::new("name", DataType::Utf8, true)])
+    }
+
+    #[test]
+    fn pruning_starts_with_when_max_below_prefix_is_no_match() {
+        // All values lex-sort before "pending" — no row can start with it.
+        let stats = string_stats("apple", "orange", 0);
+        let pred = CompoundPredicate::Atom(Predicate::StartsWith {
+            column: "name".into(),
+            prefix: "pending".into(),
+            case_insensitive: false,
+        });
+        assert_eq!(
+            evaluate_compound_for_pruning(&pred, &stats, &name_schema(), 1000),
+            PruneOutcome::NoMatch
+        );
+    }
+
+    #[test]
+    fn pruning_starts_with_when_min_above_prefix_end_is_no_match() {
+        // All values lex-sort after "pendinh" (the successor of "pending"),
+        // so no row can start with "pending".
+        let stats = string_stats("zebra", "zulu", 0);
+        let pred = CompoundPredicate::Atom(Predicate::StartsWith {
+            column: "name".into(),
+            prefix: "pending".into(),
+            case_insensitive: false,
+        });
+        assert_eq!(
+            evaluate_compound_for_pruning(&pred, &stats, &name_schema(), 1000),
+            PruneOutcome::NoMatch
+        );
+    }
+
+    #[test]
+    fn pruning_starts_with_overlapping_range_is_mixed() {
+        // Range straddles "pending" — pruning can't decide.
+        let stats = string_stats("apple", "zulu", 0);
+        let pred = CompoundPredicate::Atom(Predicate::StartsWith {
+            column: "name".into(),
+            prefix: "pending".into(),
+            case_insensitive: false,
+        });
+        assert_eq!(
+            evaluate_compound_for_pruning(&pred, &stats, &name_schema(), 1000),
+            PruneOutcome::Mixed
+        );
+    }
+
+    #[test]
+    fn pruning_starts_with_case_insensitive_bails_to_mixed() {
+        // ILIKE pruning is conservative — even when the range clearly excludes
+        // the prefix, we return Mixed to avoid a folding-edge-case bug.
+        let stats = string_stats("apple", "orange", 0);
+        let pred = CompoundPredicate::Atom(Predicate::StartsWith {
+            column: "name".into(),
+            prefix: "pending".into(),
+            case_insensitive: true,
+        });
+        assert_eq!(
+            evaluate_compound_for_pruning(&pred, &stats, &name_schema(), 1000),
+            PruneOutcome::Mixed
+        );
     }
 
     #[test]

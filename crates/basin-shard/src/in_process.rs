@@ -1716,6 +1716,7 @@ fn evaluate_predicate(
 
     let value = match predicate {
         Predicate::Eq(_, v) | Predicate::Gt(_, v) | Predicate::Lt(_, v) => v.clone(),
+        Predicate::StartsWith { prefix, .. } => ScalarValue::Utf8(prefix.clone()),
     };
 
     let mask: BooleanArray = match (predicate, &value) {
@@ -1728,12 +1729,35 @@ fn evaluate_predicate(
         (Predicate::Eq(_, _), ScalarValue::Float64(v)) => cmp_primitive!(Float64Type, *v, ==),
         (Predicate::Gt(_, _), ScalarValue::Float64(v)) => cmp_primitive!(Float64Type, *v, >),
         (Predicate::Lt(_, _), ScalarValue::Float64(v)) => cmp_primitive!(Float64Type, *v, <),
+        (Predicate::StartsWith { case_insensitive, .. }, ScalarValue::Utf8(v)) => {
+            let arr = col.as_string::<i32>();
+            let ci = *case_insensitive;
+            let needle_lc = if ci { v.to_ascii_lowercase() } else { String::new() };
+            let mut b = arrow_array::builder::BooleanBuilder::with_capacity(arr.len());
+            for i in 0..arr.len() {
+                if arr.is_null(i) {
+                    b.append_value(false);
+                } else {
+                    let s = arr.value(i);
+                    let m = if ci {
+                        s.to_ascii_lowercase().starts_with(&needle_lc)
+                    } else {
+                        s.starts_with(v.as_str())
+                    };
+                    b.append_value(m);
+                }
+            }
+            b.finish()
+        }
         (op, ScalarValue::Utf8(v)) => {
             let arr = col.as_string::<i32>();
             let cmp: fn(&str, &str) -> bool = match op {
                 Predicate::Eq(_, _) => |a, b| a == b,
                 Predicate::Gt(_, _) => |a, b| a > b,
                 Predicate::Lt(_, _) => |a, b| a < b,
+                Predicate::StartsWith { .. } => {
+                    unreachable!("StartsWith handled in dedicated arm above")
+                }
             };
             let mut b = arrow_array::builder::BooleanBuilder::with_capacity(arr.len());
             for i in 0..arr.len() {

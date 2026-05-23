@@ -981,6 +981,14 @@ fn predicate_excludes_group_by_idx(
     // Borrow the scalar value directly — no clone needed.
     let value = match filter {
         Predicate::Eq(_, v) | Predicate::Gt(_, v) | Predicate::Lt(_, v) => v,
+        // StartsWith uses a separate pruning rule (lex-bounded by prefix /
+        // prefix_end). Apply it inline and short-circuit before the generic
+        // (predicate, scalar, stats) match below.
+        Predicate::StartsWith {
+            prefix,
+            case_insensitive,
+            ..
+        } => return prune_starts_with_row_group(stats, prefix, *case_insensitive),
     };
 
     match (filter, value, stats) {
@@ -1010,6 +1018,50 @@ fn predicate_excludes_group_by_idx(
         }
         _ => false,
     }
+}
+
+/// Rule out a row group whose ByteArray min/max can prove no value starts
+/// with `prefix`. Mirrors `predicate::prune_starts_with` but operates on
+/// Parquet's `Statistics::ByteArray` (the engine-level pruning path uses
+/// raw `min_bytes` / `max_bytes` from `ColumnStats`).
+///
+/// Returns `true` for "this row group can be skipped". `false` is always
+/// safe (caller will read the file and let the per-row filter decide).
+fn prune_starts_with_row_group(
+    stats: &Statistics,
+    prefix: &str,
+    case_insensitive: bool,
+) -> bool {
+    // ASCII-fold pruning would need both min and max folded plus careful
+    // handling of code points where lowercasing changes byte length.
+    // Conservatively bail — the per-row filter still gets the win.
+    if case_insensitive || prefix.is_empty() {
+        return false;
+    }
+    let Statistics::ByteArray(s) = stats else {
+        return false;
+    };
+    let pbytes = prefix.as_bytes();
+    let min = s.min_opt().map(|b| b.data());
+    let max = s.max_opt().map(|b| b.data());
+
+    if let Some(max_b) = max {
+        if max_b < pbytes {
+            return true;
+        }
+    }
+    let last = *pbytes.last().expect("non-empty prefix");
+    if last != 0xFF {
+        let mut pend = pbytes.to_vec();
+        let n = pend.len();
+        pend[n - 1] = last + 1;
+        if let Some(min_b) = min {
+            if min_b >= pend.as_slice() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Probe for the wrapped-key sidecar; if present, fetch the body, unwrap,
@@ -1622,6 +1674,15 @@ fn vortex_filter_expr(
                     all_pushed = false;
                 }
                 e
+            }
+            // Prefix match isn't expressible in Vortex's scalar Expression
+            // surface here (no `starts_with` builder in this version of the
+            // crate). Mark not-fully-pushed so the engine re-evaluates the
+            // predicate post-decode; the Vortex scan still benefits from
+            // any min/max stats and the projection prune.
+            Predicate::StartsWith { .. } => {
+                all_pushed = false;
+                None
             }
         })
         .collect();

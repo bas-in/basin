@@ -55,10 +55,42 @@ fn decode_ipc_batch(bytes: &[u8]) -> Option<RecordBatch> {
 /// (falling through to the cold-tier path, which is safe but conservative).
 fn batch_matches_predicates(batch: &RecordBatch, predicates: &[Predicate]) -> bool {
     for pred in predicates {
+        // StartsWith doesn't have an associated ScalarValue, so handle it
+        // separately before the generic (col, scalar, op) match.
+        if let Predicate::StartsWith {
+            column,
+            prefix,
+            case_insensitive,
+        } = pred
+        {
+            let Ok(col_idx) = batch.schema().index_of(column) else {
+                return false;
+            };
+            let col = batch.column(col_idx);
+            if col.is_null(0) {
+                return false;
+            }
+            let Some(arr) = col.as_any().downcast_ref::<arrow_array::StringArray>() else {
+                return false;
+            };
+            let v = arr.value(0);
+            let ok = if *case_insensitive {
+                v.to_ascii_lowercase()
+                    .starts_with(&prefix.to_ascii_lowercase())
+            } else {
+                v.starts_with(prefix.as_str())
+            };
+            if !ok {
+                return false;
+            }
+            continue;
+        }
         let (col_name, expected, op) = match pred {
             Predicate::Eq(c, v) => (c, v, "eq"),
             Predicate::Gt(c, v) => (c, v, "gt"),
             Predicate::Lt(c, v) => (c, v, "lt"),
+            // Handled above.
+            Predicate::StartsWith { .. } => unreachable!(),
         };
         let Ok(col_idx) = batch.schema().index_of(col_name) else {
             return false;
@@ -545,12 +577,7 @@ fn parse_projection(
         // Add columns referenced by WHERE predicates / IS NULL so Vortex
         // doesn't have to decode them separately.
         for p in &where_info.predicates {
-            let col = match p {
-                Predicate::Eq(c, _)
-                | Predicate::Gt(c, _)
-                | Predicate::Lt(c, _) => c.clone(),
-            };
-            set.push(col);
+            set.push(p.column().to_string());
         }
         for c in &where_info.is_null_cols {
             set.push(c.clone());
@@ -779,6 +806,45 @@ fn parse_where_into(expr: &Expr, out: &mut ParsedWhere) -> Option<()> {
         return Some(());
     }
 
+    // `<col> LIKE 'foo%'` or `<col> ILIKE 'foo%'` with a literal pattern that
+    // is a pure prefix (no `%` or `_` before the trailing `%`). Translates to
+    // `Predicate::StartsWith` so the storage layer can prune row groups by
+    // min/max bytes and filter per-row without materialising through
+    // DataFusion's generic LIKE evaluator.
+    //
+    // We deliberately reject:
+    //   * NOT LIKE (`negated: true`) — no clean pushdown for negated prefix
+    //   * `LIKE ANY (...)`            — multi-pattern (`any: true`)
+    //   * Patterns with `%`/`_` anywhere except a single trailing `%`
+    //   * Non-literal patterns        — bind params, expressions
+    //   * Custom `escape_char`        — keep the matcher byte-exact
+    if let Expr::Like {
+        negated: false,
+        any: false,
+        expr: like_expr,
+        pattern,
+        escape_char: None,
+    } = expr
+    {
+        if let Some(p) = parse_prefix_like(like_expr, pattern, false) {
+            out.predicates.push(p);
+            return Some(());
+        }
+    }
+    if let Expr::ILike {
+        negated: false,
+        any: false,
+        expr: like_expr,
+        pattern,
+        escape_char: None,
+    } = expr
+    {
+        if let Some(p) = parse_prefix_like(like_expr, pattern, true) {
+            out.predicates.push(p);
+            return Some(());
+        }
+    }
+
     // Single comparison atom.
     let p = parse_predicate(expr)?;
     out.predicates.push(p);
@@ -853,6 +919,73 @@ fn as_identifier(e: &Expr) -> Option<String> {
         Expr::Identifier(i) => Some(i.value.clone()),
         _ => None,
     }
+}
+
+/// Extract a `Predicate::StartsWith` from a parsed LIKE/ILIKE node.
+///
+/// Both arguments come straight from sqlparser's `Expr::Like { expr,
+/// pattern, .. }`. The left side must be an identifier (`col`) and the
+/// pattern must be a string literal whose only wildcard is a trailing `%`.
+fn parse_prefix_like(left: &Expr, pattern: &Expr, case_insensitive: bool) -> Option<Predicate> {
+    let col = as_identifier(left)?;
+    let pat = string_literal_value(pattern)?;
+    let prefix = extract_prefix(pat)?;
+    if prefix.is_empty() {
+        // `LIKE '%'` matches everything; not worth a custom Predicate (would
+        // confuse pruning into NoMatch-by-empty-string-min). Fall through.
+        return None;
+    }
+    Some(Predicate::StartsWith {
+        column: col,
+        prefix,
+        case_insensitive,
+    })
+}
+
+/// Pull a `String` out of an `Expr::Value(SingleQuoted/...)`. Returns
+/// `None` for non-literal patterns (bind params, expressions, NULL).
+fn string_literal_value(e: &Expr) -> Option<&str> {
+    if let Expr::Value(ValueWithSpan { value, .. }) = e {
+        match value {
+            Value::SingleQuotedString(s)
+            | Value::DoubleQuotedString(s)
+            | Value::EscapedStringLiteral(s)
+            | Value::NationalStringLiteral(s) => return Some(s.as_str()),
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Map a LIKE pattern to a literal prefix when the pattern is anchored
+/// (no `%`/`_` except an optional trailing `%`):
+///
+///   `"foo%"`    → `Some("foo".to_string())`
+///   `"foo"`     → `Some("foo".to_string())` — exact match also fits as a
+///                 degenerate prefix; the storage filter then behaves like
+///                 equality (still correct because the row-filter checks
+///                 `starts_with(prefix)` and the equality form just matches
+///                 a superset which the per-row scan then narrows).
+///   `"foo_"`    → `None` (single-char wildcard)
+///   `"foo%bar"` → `None` (interior wildcard)
+///   `"%foo"`    → `None` (leading wildcard — suffix, not prefix)
+///
+/// We do NOT attempt to honour LIKE-escape sequences (`\%`, `\_`) here —
+/// the engine rejected `escape_char: Some(_)` before reaching this helper,
+/// and bare `\` in a LIKE pattern is literal in PostgreSQL's default
+/// (non-standard) mode. This keeps the matcher byte-exact.
+fn extract_prefix(pat: &str) -> Option<String> {
+    // Bail on `_` (single-char wildcard) anywhere.
+    if pat.contains('_') {
+        return None;
+    }
+    // Strip exactly one trailing `%`. If the result still contains `%`,
+    // it's an interior wildcard — bail.
+    let stripped = pat.strip_suffix('%').unwrap_or(pat);
+    if stripped.contains('%') {
+        return None;
+    }
+    Some(stripped.to_string())
 }
 
 /// Recognise the literal forms we can push down: signed integers, strings,

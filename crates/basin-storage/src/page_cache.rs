@@ -231,14 +231,33 @@ pub(crate) fn hash_filters(filters: &[Predicate]) -> u64 {
 
 /// Feed one predicate into a hasher without any intermediate allocation.
 fn hash_one_predicate(h: &mut std::collections::hash_map::DefaultHasher, p: &Predicate) {
-    let (op, col, val) = match p {
-        Predicate::Eq(c, v) => (0u8, c, v),
-        Predicate::Gt(c, v) => (1u8, c, v),
-        Predicate::Lt(c, v) => (2u8, c, v),
-    };
-    op.hash(h);
-    col.hash(h);
-    hash_scalar(h, val);
+    match p {
+        Predicate::Eq(c, v) => {
+            0u8.hash(h);
+            c.hash(h);
+            hash_scalar(h, v);
+        }
+        Predicate::Gt(c, v) => {
+            1u8.hash(h);
+            c.hash(h);
+            hash_scalar(h, v);
+        }
+        Predicate::Lt(c, v) => {
+            2u8.hash(h);
+            c.hash(h);
+            hash_scalar(h, v);
+        }
+        Predicate::StartsWith {
+            column,
+            prefix,
+            case_insensitive,
+        } => {
+            3u8.hash(h);
+            column.hash(h);
+            prefix.hash(h);
+            case_insensitive.hash(h);
+        }
+    }
 }
 
 /// Hash a scalar directly without formatting it as a String.
@@ -274,19 +293,26 @@ fn hash_scalar(h: &mut std::collections::hash_map::DefaultHasher, v: &ScalarValu
 /// Value bytes cover the integer/float cases; strings sort by their content.
 /// This mirrors the ordering that the old string-formatted sort produced.
 fn predicate_sort_key(p: &Predicate) -> (u8, &str, u8) {
-    let (op, col, val) = match p {
-        Predicate::Eq(c, v) => (0u8, c.as_str(), v),
-        Predicate::Gt(c, v) => (1u8, c.as_str(), v),
-        Predicate::Lt(c, v) => (2u8, c.as_str(), v),
+    let (op, col, vd) = match p {
+        Predicate::Eq(c, v) => (0u8, c.as_str(), scalar_disc(v)),
+        Predicate::Gt(c, v) => (1u8, c.as_str(), scalar_disc(v)),
+        Predicate::Lt(c, v) => (2u8, c.as_str(), scalar_disc(v)),
+        // StartsWith carries no `ScalarValue`; use a fixed discriminant for
+        // the value-tag slot so equally-shaped prefix predicates sort
+        // deterministically next to one another.
+        Predicate::StartsWith { column, .. } => (3u8, column.as_str(), 5u8),
     };
-    let vd = match val {
+    (op, col, vd)
+}
+
+fn scalar_disc(v: &ScalarValue) -> u8 {
+    match v {
         ScalarValue::Int64(_) => 0u8,
         ScalarValue::UInt64(_) => 1u8,
         ScalarValue::Float64(_) => 2u8,
         ScalarValue::Utf8(_) => 3u8,
         ScalarValue::Boolean(_) => 4u8,
-    };
-    (op, col, vd)
+    }
 }
 
 /// Default LRU index capacity. The byte budget is the load-bearing
