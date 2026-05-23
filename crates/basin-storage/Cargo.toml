@@ -67,3 +67,9 @@ fastbloom = "0.7"
 [dev-dependencies]
 tempfile.workspace = true
 tokio-test.workspace = true
+
+# Feature flag for test-only helpers (e.g. LatencyStore ObjectStore decorator
+# used by the tigris-realistic bench profile). Gated so the production build
+# doesn't pay for the wrapper.
+[features]
+test-helpers = []

@@ -1,0 +1,52 @@
+# Basin integration-test config — SeaweedFS loopback + injected per-op
+# latency to approximate same-region Tigris RTT.
+#
+# Use with:
+#   BASIN_TEST_CONFIG=./.basin-test.tigris-realistic.toml \
+#     cargo test -p basin-integration-tests --test <bench> -- --ignored --nocapture
+#
+# Why this exists
+# ---------------
+# Investigation #97 surfaced that the existing SeaweedFS loopback profile
+# (~1 ms RTT) is 10× faster than realistic Fly-machine-to-Tigris
+# same-region (~10 ms RTT). Benchmark bars cut on loopback alone make the
+# system look faster than it would be in production. This profile keeps
+# loopback SeaweedFS as the backing store (no Tigris creds, no egress)
+# but wraps the `ObjectStore` in `basin_storage::LatencyStore` so each
+# GET / HEAD / PUT / LIST / DELETE / COPY sleeps `per_op_delay_ms` before
+# the underlying RPC.
+#
+# Three-tier bench profile model
+# ------------------------------
+#   .basin-test.toml                    — pure LocalFS (~0ms/op, fastest CI gate)
+#   .basin-test.seaweedfs.toml          — SeaweedFS loopback (~1ms/op, structural-bug detector)
+#   .basin-test.tigris-realistic.toml   — SeaweedFS + 9ms inject = ~10ms/op (Tigris same-region proxy)
+#
+# The 9 ms inject is calibrated against the empirical Fly-machine-to-Tigris
+# same-region p50 of 5–15 ms — loopback contributes the residual ~1 ms.
+
+[s3]
+bucket = "basin-test"
+region = "us-east-1"
+prefix = "basin-test"
+
+access_key_id     = "basinseaweedadmin"
+secret_access_key = "basinseaweedsecret123"
+session_token     = ""
+
+endpoint   = "http://127.0.0.1:8333"
+allow_http = true
+http2_only = false
+accept_invalid_certs = false
+
+[latency_inject]
+# Per-op delay applied by `LatencyStore` BEFORE each underlying RPC.
+# 9 ms + loopback's ~1 ms ≈ 10 ms — matches Tigris same-region p50.
+per_op_delay_ms = 9
+
+[postgres]
+host     = "127.0.0.1"
+port     = 5432
+user     = "pc"
+password = ""
+dbname   = "basin_test"

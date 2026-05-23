@@ -22,6 +22,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -30,6 +31,44 @@ use serde::Deserialize;
 pub struct BasinTestConfig {
     pub s3: Option<S3Config>,
     pub postgres: Option<PostgresConfig>,
+    /// Investigation #97 — optional per-op artificial latency on top of
+    /// whatever backend `[s3]` resolves to. Wraps the `ObjectStore` in
+    /// [`basin_storage::LatencyStore`] so every GET / HEAD / PUT / LIST /
+    /// DELETE / COPY sleeps `per_op_delay_ms` before the underlying RPC.
+    /// The intended use case is the `tigris-realistic` bench profile,
+    /// where loopback SeaweedFS (~1 ms RTT) is brought up to a Tigris
+    /// same-region (~10 ms RTT) proxy without needing real Tigris creds.
+    /// When the `[latency_inject]` section is absent (the default), the
+    /// wrap is skipped and `build_object_store` is byte-identical to
+    /// `S3Config::build_object_store`.
+    #[serde(default)]
+    pub latency_inject: Option<LatencyInjectConfig>,
+}
+
+/// `[latency_inject]` section. Optional in every config; absent → no wrap.
+#[derive(Debug, Deserialize, Clone)]
+pub struct LatencyInjectConfig {
+    /// Sleep duration applied **before** each underlying object_store RPC.
+    /// Production Fly-machine-to-Tigris same-region RTT is empirically
+    /// 5–15 ms p50; the tigris-realistic profile sets this to 9 to
+    /// budget for loopback SeaweedFS's residual ~1 ms.
+    pub per_op_delay_ms: u64,
+}
+
+/// Convenience newtype the bench harness threads through; mirrors the
+/// `LatencyInjectConfig` toml shape but lives in `Duration` so callers
+/// don't reach for `u64` math.
+#[derive(Debug, Clone, Copy)]
+pub struct LatencyInject {
+    pub per_op_delay: Duration,
+}
+
+impl From<&LatencyInjectConfig> for LatencyInject {
+    fn from(cfg: &LatencyInjectConfig) -> Self {
+        Self {
+            per_op_delay: Duration::from_millis(cfg.per_op_delay_ms),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -131,6 +170,47 @@ impl BasinTestConfig {
                 println!("[skip] {test_name}: [postgres] not in test config");
                 None
             }
+        }
+    }
+
+    /// Resolved `[latency_inject]` view as a [`LatencyInject`], or `None`
+    /// when the section is absent / `per_op_delay_ms = 0`. The zero case
+    /// collapses to "no wrap" so callers don't pay the indirection for a
+    /// no-op decorator.
+    pub fn latency_inject(&self) -> Option<LatencyInject> {
+        self.latency_inject.as_ref().and_then(|cfg| {
+            if cfg.per_op_delay_ms == 0 {
+                None
+            } else {
+                Some(LatencyInject::from(cfg))
+            }
+        })
+    }
+
+    /// Build the configured backing `ObjectStore`, transparently wrapping
+    /// it in [`basin_storage::LatencyStore`] when `[latency_inject]` is
+    /// present. The single entry point every bench / s3_* test should use
+    /// when it needs a store handle — switching profiles (LocalFS →
+    /// SeaweedFS → tigris-realistic) is then a config-file swap, not a
+    /// code edit per call site.
+    ///
+    /// Returns `Ok(None)` (and prints `[skip]`) when neither `[s3]` nor
+    /// any future local backend is configured — keeps the existing test
+    /// skip ergonomics. When `[s3]` is present and `build_object_store`
+    /// fails (creds / network issue), the error is propagated unchanged.
+    pub fn build_object_store(
+        &self,
+        test_name: &str,
+    ) -> Result<Option<Arc<dyn object_store::ObjectStore>>, object_store::Error> {
+        let Some(s3) = self.s3_or_skip(test_name) else {
+            return Ok(None);
+        };
+        let base = s3.build_object_store()?;
+        if let Some(inject) = self.latency_inject() {
+            let wrapped = basin_storage::LatencyStore::new(base, inject.per_op_delay);
+            Ok(Some(Arc::new(wrapped)))
+        } else {
+            Ok(Some(base))
         }
     }
 }

@@ -8,7 +8,9 @@ publish = false
 
 [dependencies]
 basin-common.workspace = true
-basin-storage.workspace = true
+# `test-helpers` re-exports `LatencyStore` for the bench harness wrap
+# (`.basin-test.tigris-realistic.toml` — see `test_config::build_object_store`).
+basin-storage = { workspace = true, features = ["test-helpers"] }
 basin-catalog.workspace = true
 basin-engine.workspace = true
 basin-hottier.workspace = true

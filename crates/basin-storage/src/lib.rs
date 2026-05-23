@@ -19,6 +19,8 @@ mod data_file;
 mod disk_cache;
 pub mod encryption;
 pub mod encryption_static;
+#[cfg(any(test, feature = "test-helpers"))]
+mod latency_store;
 mod metadata_cache;
 mod page_cache;
 mod paths;
@@ -47,6 +49,8 @@ pub use data_file::{ColumnStats, DataFile};
 pub use disk_cache::{DiskCacheConfig, DiskCacheCounters, DiskCachedStore};
 pub use encryption::{EncryptionProvider, WrappedKey};
 pub use encryption_static::{EnvKeyEncryption, StaticKeyEncryption};
+#[cfg(any(test, feature = "test-helpers"))]
+pub use latency_store::LatencyStore;
 pub use page_cache::{PageCache, PageCacheConfig, PageCacheCounters, PageCacheCountersSnapshot};
 pub use predicate::{
     evaluate as evaluate_predicate, evaluate_compound, evaluate_compound_for_pruning,
@@ -56,7 +60,7 @@ pub use scheduler::{ProjectIoStats, Scheduler, DEFAULT_GLOBAL_BUDGET};
 pub use tier::Tier;
 pub use vector_index::{vector_index_segment_key_for_data_file, VectorHit};
 pub use vortex_footer_cache::VortexFooterCache;
-pub use writer::{bloom_from_bytes, FileFormat, WriteOptions};
+pub use writer::{bloom_from_bytes, EncodingMode, FileFormat, WriteOptions};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
