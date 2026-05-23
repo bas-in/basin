@@ -537,10 +537,150 @@ fn value_to_jsonb(v: &Value) -> DFResult<Vec<u8>> {
         .map_err(|e| DataFusionError::Execution(format!("jsonb encode error: {e}")))
 }
 
+/// Typed view over a JSONB-compatible Arrow array, with the `as_any` downcast
+/// performed **once** up front.  Per-row access via [`TypedJsonbArray::value`]
+/// then takes a single `match` branch — avoiding the per-row vtable lookup
+/// that `extract_jsonb_value` pays in the row loop.
+///
+/// Use this in any UDF whose hot path calls `extract_jsonb_value(&arr, i, ...)`
+/// inside a `for i in 0..n` loop: build the typed view once before the loop,
+/// then call `tv.value(i)` per row.
+enum TypedJsonbArray<'a> {
+    LargeBinary(&'a LargeBinaryArray),
+    BinaryView(&'a BinaryViewArray),
+    Utf8(&'a StringArray),
+    Utf8View(&'a StringViewArray),
+}
+
+impl<'a> TypedJsonbArray<'a> {
+    /// Downcast `arr` once.  Returns an error for unsupported types matching
+    /// the same wording as the per-row `extract_jsonb_value` for parity.
+    fn new(arr: &'a ArrayRef, fn_name: &str) -> DFResult<Self> {
+        match arr.data_type() {
+            DataType::LargeBinary => arr
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .map(TypedJsonbArray::LargeBinary)
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!("{fn_name}: not a LargeBinaryArray"))
+                }),
+            DataType::BinaryView => arr
+                .as_any()
+                .downcast_ref::<BinaryViewArray>()
+                .map(TypedJsonbArray::BinaryView)
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!("{fn_name}: not a BinaryViewArray"))
+                }),
+            DataType::Utf8 => arr
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .map(TypedJsonbArray::Utf8)
+                .ok_or_else(|| DataFusionError::Execution(format!("{fn_name}: not a StringArray"))),
+            DataType::Utf8View => arr
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .map(TypedJsonbArray::Utf8View)
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!("{fn_name}: not a StringViewArray"))
+                }),
+            other => exec_err!(
+                "{fn_name}: expected LargeBinary, BinaryView, Utf8, or Utf8View, got {other:?}"
+            ),
+        }
+    }
+
+    /// Per-row decode.  `Ok(None)` when slot is null, otherwise the decoded
+    /// `Value`.  Branches on the typed variant (no `as_any` downcast).
+    #[inline]
+    fn value(&self, i: usize, fn_name: &str) -> DFResult<Option<Value>> {
+        let parse_str = |s: &str| {
+            serde_json::from_str(s)
+                .map_err(|e| DataFusionError::Execution(format!("{fn_name}: json parse: {e}")))
+        };
+        match self {
+            TypedJsonbArray::LargeBinary(a) => {
+                if a.is_null(i) {
+                    Ok(None)
+                } else {
+                    Ok(Some(jsonb_to_value(a.value(i))?))
+                }
+            }
+            TypedJsonbArray::BinaryView(a) => {
+                if a.is_null(i) {
+                    Ok(None)
+                } else {
+                    Ok(Some(jsonb_to_value(a.value(i))?))
+                }
+            }
+            TypedJsonbArray::Utf8(a) => {
+                if a.is_null(i) {
+                    Ok(None)
+                } else {
+                    parse_str(a.value(i)).map(Some)
+                }
+            }
+            TypedJsonbArray::Utf8View(a) => {
+                if a.is_null(i) {
+                    Ok(None)
+                } else {
+                    parse_str(a.value(i)).map(Some)
+                }
+            }
+        }
+    }
+}
+
+/// Typed view over a Utf8 / Utf8View string array, downcast once.  Mirrors
+/// [`TypedJsonbArray`] for path / key string arguments inside row loops.
+enum TypedStringRef<'a> {
+    Utf8(&'a StringArray),
+    Utf8View(&'a StringViewArray),
+}
+
+impl<'a> TypedStringRef<'a> {
+    fn new(arr: &'a ArrayRef, fn_name: &str) -> DFResult<Self> {
+        match arr.data_type() {
+            DataType::Utf8 => arr
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .map(TypedStringRef::Utf8)
+                .ok_or_else(|| DataFusionError::Execution(format!("{fn_name}: not a StringArray"))),
+            DataType::Utf8View => arr
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .map(TypedStringRef::Utf8View)
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!("{fn_name}: not a StringViewArray"))
+                }),
+            other => exec_err!("{fn_name}: path element must be Utf8, got {other:?}"),
+        }
+    }
+
+    #[inline]
+    fn is_null(&self, i: usize) -> bool {
+        match self {
+            TypedStringRef::Utf8(a) => a.is_null(i),
+            TypedStringRef::Utf8View(a) => a.is_null(i),
+        }
+    }
+
+    #[inline]
+    fn value(&self, i: usize) -> &str {
+        match self {
+            TypedStringRef::Utf8(a) => a.value(i),
+            TypedStringRef::Utf8View(a) => a.value(i),
+        }
+    }
+}
+
 /// Extract a `serde_json::Value` from a ColumnarValue row, handling
 /// `LargeBinary` (stored JSONB), `BinaryView` (Arrow view-format JSONB —
 /// emitted by DataFusion 53 / vortex_listing_format for stored columns),
 /// `Utf8` (JSON string literal), and `Utf8View` (view-format string literal).
+///
+/// **Perf note**: this pays an `as_any().downcast_ref()` per call.  In a
+/// row loop, prefer [`TypedJsonbArray::new`] once before the loop and
+/// [`TypedJsonbArray::value`] per row.
 fn extract_jsonb_value(arr: &ArrayRef, i: usize, fn_name: &str) -> DFResult<Option<Value>> {
     match arr.data_type() {
         DataType::LargeBinary => {
@@ -769,24 +909,23 @@ impl ScalarUDFImpl for JsonbTypeofUdf {
         }
         let n = row_count(args);
         let arr = args[0].clone().into_array(n)?;
-        let mut out: Vec<Option<String>> = Vec::with_capacity(n);
+        // Hoist downcast: one match per array, not one per row.
+        let typed = TypedJsonbArray::new(&arr, "jsonb_typeof")?;
+        let mut out: Vec<Option<&'static str>> = Vec::with_capacity(n);
         for i in 0..n {
-            match extract_jsonb_value(&arr, i, "jsonb_typeof")? {
+            match typed.value(i, "jsonb_typeof")? {
                 None => out.push(None),
-                Some(v) => {
-                    let t = match &v {
-                        Value::Object(_) => "object",
-                        Value::Array(_) => "array",
-                        Value::String(_) => "string",
-                        Value::Number(_) => "number",
-                        Value::Bool(_) => "boolean",
-                        Value::Null => "null",
-                    };
-                    out.push(Some(t.to_string()));
-                }
+                Some(v) => out.push(Some(match &v {
+                    Value::Object(_) => "object",
+                    Value::Array(_) => "array",
+                    Value::String(_) => "string",
+                    Value::Number(_) => "number",
+                    Value::Bool(_) => "boolean",
+                    Value::Null => "null",
+                })),
             }
         }
-        let result = StringArray::from(out);
+        let result = StringArray::from_iter(out.into_iter().map(|o| o.map(|s| s.to_string())));
         Ok(ColumnarValue::Array(Arc::new(result)))
     }
 }
@@ -869,9 +1008,11 @@ impl ScalarUDFImpl for JsonbArrayLengthUdf {
         }
         let n = row_count(args);
         let arr = args[0].clone().into_array(n)?;
+        // Hoist downcast: avoid per-row vtable lookup.
+        let typed = TypedJsonbArray::new(&arr, "jsonb_array_length")?;
         let mut out: Vec<Option<i64>> = Vec::with_capacity(n);
         for i in 0..n {
-            match extract_jsonb_value(&arr, i, "jsonb_array_length")? {
+            match typed.value(i, "jsonb_array_length")? {
                 None => out.push(None),
                 Some(Value::Array(a)) => out.push(Some(a.len() as i64)),
                 Some(_) => out.push(Some(0)),
@@ -969,6 +1110,18 @@ impl ScalarUDFImpl for JsonbSetUdf {
             None
         };
 
+        // Hoist downcasts out of the row loop.
+        let path_a = path_arr
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| DataFusionError::Execution("jsonb_set: path must be Utf8".into()))?;
+        let create_a = match &create_arr {
+            Some(ca) => Some(ca.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+                DataFusionError::Execution("jsonb_set: create_missing must be Boolean".into())
+            })?),
+            None => None,
+        };
+
         let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
         for i in 0..n {
             let target = extract_jsonb_value(&target_arr, i, "jsonb_set")?;
@@ -981,35 +1134,25 @@ impl ScalarUDFImpl for JsonbSetUdf {
             let mut root = target.unwrap();
             let new_val = new_val.unwrap();
 
-            // Extract path string
-            let path_str = {
-                let path_a = path_arr
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| {
-                        DataFusionError::Execution("jsonb_set: path must be Utf8".into())
-                    })?;
-                if path_a.is_null(i) {
-                    out.push(None);
-                    continue;
+            if path_a.is_null(i) {
+                out.push(None);
+                continue;
+            }
+            // Borrow path as &str — parse_path takes &str; no per-row String alloc.
+            let path_str: &str = path_a.value(i);
+
+            let create_missing = match create_a {
+                Some(ba) => {
+                    if ba.is_null(i) {
+                        true
+                    } else {
+                        ba.value(i)
+                    }
                 }
-                path_a.value(i).to_string()
+                None => true,
             };
 
-            let create_missing = if let Some(ref ca) = create_arr {
-                let ba = ca.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
-                    DataFusionError::Execution("jsonb_set: create_missing must be Boolean".into())
-                })?;
-                if ba.is_null(i) {
-                    true
-                } else {
-                    ba.value(i)
-                }
-            } else {
-                true
-            };
-
-            let path = parse_path(&path_str);
+            let path = parse_path(path_str);
             if path.is_empty() {
                 // Empty path — replace root
                 out.push(Some(value_to_jsonb(&new_val)?));
@@ -1077,6 +1220,18 @@ impl ScalarUDFImpl for JsonbInsertUdf {
             None
         };
 
+        // Hoist downcasts out of the row loop.
+        let path_a = path_arr
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| DataFusionError::Execution("jsonb_insert: path must be Utf8".into()))?;
+        let insert_after_a = match &insert_after_arr {
+            Some(ia) => Some(ia.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+                DataFusionError::Execution("jsonb_insert: insert_after must be Boolean".into())
+            })?),
+            None => None,
+        };
+
         let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
         for i in 0..n {
             let target = extract_jsonb_value(&target_arr, i, "jsonb_insert")?;
@@ -1089,34 +1244,24 @@ impl ScalarUDFImpl for JsonbInsertUdf {
             let mut root = target.unwrap();
             let new_val = new_val.unwrap();
 
-            let path_str = {
-                let path_a = path_arr
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| {
-                        DataFusionError::Execution("jsonb_insert: path must be Utf8".into())
-                    })?;
-                if path_a.is_null(i) {
-                    out.push(None);
-                    continue;
+            if path_a.is_null(i) {
+                out.push(None);
+                continue;
+            }
+            let path_str: &str = path_a.value(i);
+
+            let insert_after = match insert_after_a {
+                Some(ba) => {
+                    if ba.is_null(i) {
+                        false
+                    } else {
+                        ba.value(i)
+                    }
                 }
-                path_a.value(i).to_string()
+                None => false,
             };
 
-            let insert_after = if let Some(ref ia) = insert_after_arr {
-                let ba = ia.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
-                    DataFusionError::Execution("jsonb_insert: insert_after must be Boolean".into())
-                })?;
-                if ba.is_null(i) {
-                    false
-                } else {
-                    ba.value(i)
-                }
-            } else {
-                false
-            };
-
-            let path = parse_path(&path_str);
+            let path = parse_path(path_str);
             if path.is_empty() {
                 out.push(Some(value_to_jsonb(&root)?));
                 continue;
@@ -1203,16 +1348,25 @@ impl ScalarUDFImpl for JsonbExtractPathUdf {
         let n = row_count(args);
         let target_arr = args[0].clone().into_array(n)?;
 
-        // Collect path keys from remaining args (must all be Utf8).
+        // Collect path keys from remaining args (must all be Utf8 / Utf8View).
         let mut key_arrs: Vec<Arc<dyn Array>> = Vec::with_capacity(args.len() - 1);
         for arg in &args[1..] {
             key_arrs.push(arg.clone().into_array(n)?);
         }
 
+        // Hoist downcasts: do them once per array, before the row loop,
+        // not once per row per key.  For a 100k-row, 3-key extract this
+        // saves ~300k vtable lookups + ~300k key-string allocations.
+        let target_typed = TypedJsonbArray::new(&target_arr, self.name())?;
+        let key_typed: Vec<TypedStringRef<'_>> = key_arrs
+            .iter()
+            .map(|k| TypedStringRef::new(k, self.name()))
+            .collect::<DFResult<Vec<_>>>()?;
+
         if self.return_text {
             let mut out: Vec<Option<String>> = Vec::with_capacity(n);
             for row in 0..n {
-                let val = jsonb_extract_path_row(&target_arr, row, &key_arrs, self.name())?;
+                let val = jsonb_extract_path_row_typed(&target_typed, row, &key_typed, self.name())?;
                 out.push(val.map(|v| match &v {
                     Value::String(s) => s.clone(),
                     other => serde_json::to_string(other).unwrap_or_default(),
@@ -1222,7 +1376,7 @@ impl ScalarUDFImpl for JsonbExtractPathUdf {
         } else {
             let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
             for row in 0..n {
-                let val = jsonb_extract_path_row(&target_arr, row, &key_arrs, self.name())?;
+                let val = jsonb_extract_path_row_typed(&target_typed, row, &key_typed, self.name())?;
                 out.push(val.map(|v| value_to_jsonb(&v)).transpose()?);
             }
             let result = LargeBinaryArray::from_iter(out.iter().map(|o| o.as_deref()));
@@ -1231,39 +1385,30 @@ impl ScalarUDFImpl for JsonbExtractPathUdf {
     }
 }
 
-/// Traverse a JSONB row value through the given text-key path, returning the
-/// sub-value or `None` if the path does not exist or a key is NULL.
-fn jsonb_extract_path_row(
-    target: &ArrayRef,
+/// Typed-array variant of `jsonb_extract_path_row` — downcasts already
+/// performed by the caller.  Walks the root JSON value through the
+/// pre-downcast key arrays without per-row vtable lookups, and reads keys
+/// as `&str` (no per-row `String` allocation in the lookup path; only
+/// allocates when the matched element is an `Object` whose `remove` API
+/// needs an owned `String`).
+fn jsonb_extract_path_row_typed(
+    target: &TypedJsonbArray<'_>,
     row: usize,
-    keys: &[Arc<dyn Array>],
+    keys: &[TypedStringRef<'_>],
     fn_name: &str,
 ) -> DFResult<Option<Value>> {
-    let root = match extract_jsonb_value(target, row, fn_name)? {
+    let root = match target.value(row, fn_name)? {
         Some(v) => v,
         None => return Ok(None),
     };
     let mut cur = root;
-    for key_arr in keys {
-        let key_str = match key_arr.data_type() {
-            DataType::Utf8 => {
-                let a = key_arr
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| {
-                        DataFusionError::Execution(format!(
-                            "{fn_name}: path element not a StringArray"
-                        ))
-                    })?;
-                if a.is_null(row) {
-                    return Ok(None);
-                }
-                a.value(row).to_string()
-            }
-            other => return exec_err!("{fn_name}: path element must be Utf8, got {other:?}"),
-        };
+    for key in keys {
+        if key.is_null(row) {
+            return Ok(None);
+        }
+        let key_str: &str = key.value(row);
         cur = match cur {
-            Value::Object(mut map) => match map.remove(&key_str) {
+            Value::Object(mut map) => match map.remove(key_str) {
                 Some(v) => v,
                 None => return Ok(None),
             },
@@ -4531,5 +4676,79 @@ impl TableFunctionImpl for JsonToRecordsetTf {
             schema,
             batches: vec![batch],
         }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Microbenchmark (opt-in, env-gated — not part of CI)
+// ---------------------------------------------------------------------------
+//
+// Run: `BASIN_JSONB_BENCH=1 cargo test -p basin-engine --lib --release \
+//       jsonb_udf::perf_bench -- --nocapture --ignored`
+#[cfg(test)]
+mod perf_bench {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore = "opt-in: BASIN_JSONB_BENCH=1"]
+    fn bench_extract_path_text_100k() {
+        if std::env::var("BASIN_JSONB_BENCH").as_deref() != Ok("1") {
+            return;
+        }
+        const N: usize = 100_000;
+        let rows: Vec<Vec<u8>> = (0..N)
+            .map(|i| {
+                serde_json::to_vec(&serde_json::json!({
+                    "user": {"name": format!("u{i}"), "age": i % 100},
+                    "tags": ["a", "b", "c"],
+                }))
+                .unwrap()
+            })
+            .collect();
+        let arr: ArrayRef = Arc::new(LargeBinaryArray::from_iter(
+            rows.iter().map(|r| Some(r.as_slice())),
+        ));
+        let k1: ArrayRef =
+            Arc::new(StringArray::from_iter_values(std::iter::repeat("user").take(N)));
+        let k2: ArrayRef =
+            Arc::new(StringArray::from_iter_values(std::iter::repeat("name").take(N)));
+        let keys = [k1, k2];
+
+        // SLOW: pre-optimization shape — per-row downcast + key `to_string()`.
+        let t0 = Instant::now();
+        for row in 0..N {
+            let root = extract_jsonb_value(&arr, row, "b").unwrap().unwrap();
+            let mut cur = root;
+            for ka in &keys {
+                let a = ka.as_any().downcast_ref::<StringArray>().unwrap();
+                let key = a.value(row).to_string();
+                cur = match cur {
+                    Value::Object(mut m) => m.remove(&key).unwrap_or(Value::Null),
+                    _ => Value::Null,
+                };
+            }
+            std::hint::black_box(cur);
+        }
+        let slow = t0.elapsed();
+
+        // FAST: hoisted downcast + &str key access.
+        let tj = TypedJsonbArray::new(&arr, "b").unwrap();
+        let kt: Vec<TypedStringRef<'_>> =
+            keys.iter().map(|k| TypedStringRef::new(k, "b").unwrap()).collect();
+        let t1 = Instant::now();
+        for row in 0..N {
+            let v = jsonb_extract_path_row_typed(&tj, row, &kt, "b").unwrap();
+            std::hint::black_box(v);
+        }
+        let fast = t1.elapsed();
+        eprintln!(
+            "SLOW {:?} ({:.2} M/s) | FAST {:?} ({:.2} M/s) | {:.2}x",
+            slow,
+            N as f64 / slow.as_secs_f64() / 1e6,
+            fast,
+            N as f64 / fast.as_secs_f64() / 1e6,
+            slow.as_secs_f64() / fast.as_secs_f64()
+        );
     }
 }
