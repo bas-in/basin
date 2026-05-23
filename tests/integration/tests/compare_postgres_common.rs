@@ -1119,8 +1119,30 @@ struct JsonbResults {
     get_text: (Option<f64>, f64),
     /// Chained `->` then `->>`: nested object traversal.
     deep_path: (Option<f64>, f64),
-    /// `@>` containment with a SQL literal RHS.
+    /// `@>` containment with a SQL literal RHS (NO GIN index — full seq scan).
     contains: (Option<f64>, f64),
+    /// Same `@>` containment, but AFTER `CREATE INDEX … USING gin (payload)`
+    /// on both sides. PG uses the GIN index natively; Basin's GIN probe path
+    /// (Phase 5.24.D / #105) prunes the row scan.
+    ///
+    /// Pair this with `contains` (no-index) and the derived
+    /// `contains_gin_effectiveness` ratio (no-index / with-index) to surface
+    /// the GIN-acceleration delta on each engine. Today (pre-#105) Basin's
+    /// ratio is ≈1 (the probe surfaces the rows but doesn't prune the scan,
+    /// so the timing barely moves). After #105 lands the ratio should jump
+    /// to ≥10. PG's ratio is the reference for "what GIN should buy you".
+    ///
+    /// Basin returns `Some(_)` even if the CREATE INDEX itself failed — in
+    /// that case the value is the pre-index timing (so the ratio is exactly
+    /// 1.0 and the "gap" is visible as "GIN did nothing" rather than a
+    /// missing cell). The DDL-failure detail is surfaced separately via the
+    /// `basin_gin_ddl_ok` field.
+    contains_with_gin: (Option<f64>, f64),
+    /// True iff Basin accepted `CREATE INDEX … USING gin (payload)` on the
+    /// events table. False means the DDL itself was rejected — we still
+    /// re-run the `@>` query so the dashboard has a number, but the ratio
+    /// will be ≈1 by construction.
+    basin_gin_ddl_ok: bool,
     /// `?` key-existence — counts rows whose payload has `'metadata'`.
     key_exists: (Option<f64>, f64),
     /// `#>` path get with a `{...}` text-path RHS.
@@ -1303,11 +1325,46 @@ async fn run_jsonb_suite(
     };
     let jsonb_set_update = (basin_set_ms, pg_set_ms);
 
+    // =======================================================================
+    // GIN `@>` effectiveness pair — re-runs the containment shape AFTER
+    // building a GIN index on `events.payload` on BOTH sides. Paired with
+    // the no-index `contains` measurement above so the dashboard surfaces
+    // an explicit "index did X" delta per engine. See `contains_with_gin`
+    // and `basin_gin_ddl_ok` field docs on JsonbResults.
+    // =======================================================================
+    let pg_gin_ddl = format!(
+        "CREATE INDEX events_payload_gin ON {schema}.events USING gin (payload)"
+    );
+    pg.simple_query(&pg_gin_ddl)
+        .await
+        .expect("pg create gin index");
+
+    // Basin: `USING gin (payload)` (no opclass — engine default). The DDL
+    // exists end-to-end as of Phase 5.19.B; the probe-prune wiring is
+    // Phase 5.24.D / #105. If the DDL fails we record the gap and reuse
+    // the pre-index timing so the ratio is exactly 1.0 (visible no-op).
+    let basin_gin_sql =
+        "CREATE INDEX events_payload_gin ON events USING gin (payload)";
+    let basin_gin_ddl_ok = sess.execute(basin_gin_sql).await.is_ok();
+
+    let contains_with_gin = pair(
+        pg, sess,
+        format!(
+            "SELECT COUNT(*) FROM {schema}.events \
+             WHERE payload @> '{{\"category\":\"purchase\"}}'::jsonb"
+        ),
+        "SELECT COUNT(*) FROM events \
+         WHERE payload @> '{\"category\":\"purchase\"}'::jsonb",
+        ext_samples,
+    ).await;
+
     JsonbResults {
         get_key,
         get_text,
         deep_path,
         contains,
+        contains_with_gin,
+        basin_gin_ddl_ok,
         key_exists,
         path_get,
         array_length,
@@ -1923,7 +1980,26 @@ async fn run_full_compare_inner(
     row_opt("jsonb_get_key_p50_ms", jb.get_key.0, jb.get_key.1);
     row_opt("jsonb_get_text_p50_ms", jb.get_text.0, jb.get_text.1);
     row_opt("jsonb_deep_path_p50_ms", jb.deep_path.0, jb.deep_path.1);
-    row_opt("jsonb_contains_p50_ms", jb.contains.0, jb.contains.1);
+    row_opt("jsonb_contains_no_gin_p50_ms", jb.contains.0, jb.contains.1);
+    row_opt(
+        "jsonb_contains_with_gin_p50_ms",
+        jb.contains_with_gin.0,
+        jb.contains_with_gin.1,
+    );
+    // Derived ratio: no-index ms / with-index ms. Higher = bigger win from
+    // the GIN index. Today (pre-#105) Basin's ratio is ≈1 (probe doesn't
+    // prune); PG's is typically >>1.
+    if let (Some(no_gin), Some(with_gin)) = (jb.contains.0, jb.contains_with_gin.0) {
+        let basin_ratio = no_gin / with_gin.max(1e-9);
+        let pg_ratio = jb.contains.1 / jb.contains_with_gin.1.max(1e-9);
+        println!(
+            "{:>34} {:>14.2} {:>14.2} {:>16}",
+            "gin_at_contains_speedup_x",
+            basin_ratio,
+            pg_ratio,
+            if basin_ratio >= pg_ratio { "basin >= pg" } else { "basin < pg" }
+        );
+    }
     row_opt("jsonb_key_exists_p50_ms", jb.key_exists.0, jb.key_exists.1);
     row_opt("jsonb_path_get_p50_ms", jb.path_get.0, jb.path_get.1);
     row_opt("jsonb_array_length_p50_ms", jb.array_length.0, jb.array_length.1);
@@ -2053,7 +2129,51 @@ async fn run_full_compare_inner(
         mk_ext("JSONB -> get key p50", jb.get_key.0, jb.get_key.1),
         mk_ext("JSONB ->> get text p50", jb.get_text.0, jb.get_text.1),
         mk_ext("JSONB -> deep path (device.version) p50", jb.deep_path.0, jb.deep_path.1),
-        mk_ext("JSONB @> contains p50", jb.contains.0, jb.contains.1),
+        mk_ext("JSONB @> contains p50 (no GIN index)", jb.contains.0, jb.contains.1),
+        // Paired with the no-index row above + the derived ratio below.
+        // PG always uses GIN here; Basin uses GIN after #105 lands the
+        // probe→prune wiring. Pre-#105 the timing barely moves and the
+        // ratio surfaces the gap honestly.
+        {
+            let basin_label = if jb.basin_gin_ddl_ok {
+                "JSONB @> contains p50 (with GIN index)".to_string()
+            } else {
+                "JSONB @> contains p50 (with GIN index; basin DDL failed)".to_string()
+            };
+            mk_ext(&basin_label, jb.contains_with_gin.0, jb.contains_with_gin.1)
+        },
+        // Derived GIN @> effectiveness ratio: no-index ms / with-index ms.
+        // Per-side ratio. Higher = bigger speedup from the GIN index.
+        // `better = Basin` is wired so the dashboard flags the gap when
+        // Basin's ratio is below PG's; once #105 lands and Basin's ratio
+        // catches up (≥10x), the metric still reads as a Basin win.
+        // unit = "ratio" so the renderer doesn't append "ms".
+        {
+            let basin_ratio = match (jb.contains.0, jb.contains_with_gin.0) {
+                (Some(no_gin), Some(with_gin)) => no_gin / with_gin.max(1e-9),
+                _ => -1.0,
+            };
+            let pg_ratio = if jb.contains.1.is_finite() && jb.contains_with_gin.1.is_finite() {
+                jb.contains.1 / jb.contains_with_gin.1.max(1e-9)
+            } else {
+                -1.0
+            };
+            let label = if jb.basin_gin_ddl_ok {
+                "GIN @> effectiveness (no-index ms / with-index ms)"
+            } else {
+                "GIN @> effectiveness (no-index ms / with-index ms; basin DDL failed)"
+            };
+            CompareMetric {
+                label: label.into(),
+                basin: basin_ratio,
+                postgres: pg_ratio,
+                unit: "ratio".into(),
+                better: WhichWins::Basin,
+                ratio_text: Some(format!(
+                    "basin {basin_ratio:.2}x vs pg {pg_ratio:.2}x speedup (higher = better)"
+                )),
+            }
+        },
         mk_ext("JSONB ? key exists p50", jb.key_exists.0, jb.key_exists.1),
         mk_ext("JSONB #> path get p50", jb.path_get.0, jb.path_get.1),
         mk_ext("JSONB jsonb_array_length(tags) p50", jb.array_length.0, jb.array_length.1),

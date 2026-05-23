@@ -71,6 +71,7 @@ Basin publishes **all** of its head-to-head numbers, wins and losses, regenerate
 | Recursive CTE Fibonacci(30) p50 | 7.0 ms | 0.09 ms | **77× slower** (DataFusion upstream) |
 | Window LAG OVER PARTITION p50 | 644 ms | 85 ms | **7.6× slower** |
 | Multi-col GROUP BY + HAVING p50 | 1273 ms | 216 ms | **5.9× slower** |
+| GIN `@>` effectiveness (no-index ms / with-index ms) | ~1.0× (probe surfaces rows, scan unpruned) | ~10–100× (native GIN) | **architectural** — `CREATE INDEX … USING gin` is accepted but probe→prune wiring is in flight (#105 / Phase 5.24.D); paired no-index vs with-index metric pair lives on the JSONB card in [`RESULTS_localfs.md`](./benchmark/RESULTS_localfs.md) so the gap (and the post-#105 win) are both visible |
 | **Write losses (the perf-critical follow-up)** | | | |
 | Single-row UPDATE p50 | 4099 ms | 2.64 ms | **~1550× slower** — copy-on-write parquet/vortex rewrite is wrong for OLTP point mutations |
 | DELETE WHERE id IN (10 rows) | 1040 s | 56.7 ms | **~18000× slower** — closing via hot-tier tombstone fast path (landed env-gated in `87ef24b`; on by default in 5.14.C5/C6) |
