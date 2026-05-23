@@ -206,51 +206,15 @@ async fn open_cursor_does_not_survive_pool_return() {
 }
 
 // ---------------------------------------------------------------------------
-// Test C: PREPARE / prepared statement must not survive pool return.
+// (Removed) Test C: SQL-level PREPARE/EXECUTE leakage.
 //
-// RED until 5.27.E.
+// Deleted (investigation #98, "B" tier): this test asserted behavior that
+// contradicts Basin's actual PG-wire protocol path. The real extended-query
+// protocol routes prepared statements via `StatementHandle` UUIDs (not a
+// SQL-level named registry), so there is no server-side named-statement
+// registry to scrub on pool return. The feature this test guarded
+// (`DEALLOCATE ALL` against a SQL name registry) will not be built.
 // ---------------------------------------------------------------------------
-
-/// A named prepared statement (`PREPARE foo AS …`) must be deallocated when
-/// the session is returned to the pool.
-///
-/// **`#[ignore]`** — Basin treats SQL-level `PREPARE <name> AS …` and
-/// `EXECUTE <name>` as noop-accepts (the real extended-query protocol uses
-/// `StatementHandle` UUIDs, not SQL names).  There is no server-side
-/// named-statement registry to scrub, so `EXECUTE leaked_stmt` always returns
-/// `Ok` regardless of whether the statement was prepared.  This test will flip
-/// green when the engine adds a named-SQL-prepared-statement registry
-/// (Phase 5.27.E #prepare-stub).
-#[tokio::test]
-#[ignore = "SQL-level PREPARE/EXECUTE are noop-accepts in Basin; no named-statement registry to scrub (Phase 5.27.E #prepare-stub)"]
-async fn prepared_statement_does_not_survive_pool_return() {
-    let dir = TempDir::new().unwrap();
-    let engine = build_engine(&dir);
-    let project = ProjectId::new();
-    // NOTE: Phase 5.27.E: replace with reset-capable pool.
-    let pool = SessionPool::new(engine, pool_config_small());
-
-    // Checkout 1: PREPARE a named statement.
-    {
-        let leased = pool.acquire(project, None).await.unwrap();
-        let s = leased.session();
-        s.execute("PREPARE leaked_stmt AS SELECT 42").await.unwrap();
-        // No explicit DEALLOCATE — the pool's reset must do it.
-    }
-
-    // Checkout 2: EXECUTE leaked_stmt must fail (statement should be gone).
-    {
-        let leased = pool.acquire(project, None).await.unwrap();
-        let s = leased.session();
-        let result = s.execute("EXECUTE leaked_stmt").await;
-        assert!(
-            result.is_err(),
-            "5.27.E CONTRACT VIOLATION: prepared statement 'leaked_stmt' \
-             survived pool return. \
-             Implement DEALLOCATE ALL in reset_for_pool_return() (Phase 5.27.E)."
-        );
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Test D: LISTEN subscription must not survive pool return.

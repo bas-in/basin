@@ -322,61 +322,10 @@ pub async fn run_crud_battery(conn_str: &str, battery: &[CrudQuery]) {
     }
 }
 
-// ── Placeholder smoke test ─────────────────────────────────────────────────────
-//
-// This test is `#[ignore]`'d. It exists to prove the scaffold compiles and
-// that `spawn_basin_server`, `assert_schema_matches_snapshot`, and
-// `run_crud_battery` are all callable. It will be un-ignored (or superseded)
-// when the real per-tool tests in 5.25.B–F land alongside their companion
-// files: migration_tool_flyway.rs, migration_tool_golang_migrate.rs,
-// migration_tool_diesel.rs, migration_tool_sqlx.rs, migration_tool_prisma.rs.
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "placeholder: real test bodies land in 5.25.B-F per-tool files"]
-async fn scaffold_smoke() {
-    // Demonstrate that the launcher compiles and is callable.
-    let server = spawn_basin_server().await;
-    println!("[scaffold_smoke] server up at {}", server.addr);
-
-    // Build a minimal expected snapshot for a trivial schema.
-    let snapshot = SchemaSnapshot::new().add_table(
-        "smoke_table",
-        vec![("id", "integer"), ("name", "text")],
-    );
-
-    // Connect directly and create the table so the introspection helper has
-    // something to assert against.
-    let (client, conn) = tokio_postgres::connect(&server.conn_str, NoTls)
-        .await
-        .expect("connect");
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-    client
-        .simple_query("CREATE TABLE smoke_table (id integer, name text)")
-        .await
-        .expect("CREATE TABLE");
-
-    // Exercise the schema-diff helper.
-    assert_schema_matches_snapshot(&server.conn_str, &snapshot).await;
-
-    // Exercise the CRUD battery helper.
-    run_crud_battery(
-        &server.conn_str,
-        &[
-            CrudQuery {
-                label: "insert",
-                sql: "INSERT INTO smoke_table VALUES (1, 'hello')",
-                expected_first_col: None,
-            },
-            CrudQuery {
-                label: "select count",
-                sql: "SELECT count(*) FROM smoke_table",
-                expected_first_col: Some("1"),
-            },
-        ],
-    )
-    .await;
-
-    println!("[scaffold_smoke] scaffold helpers verified — all callable");
-}
+// The `scaffold_smoke` placeholder test was removed (investigation #98,
+// "B" tier): real test bodies for 5.25.B–F now live in the per-tool files
+// (migration_tool_flyway.rs, migration_tool_golang_migrate.rs,
+// migration_tool_diesel.rs, migration_tool_sqlx.rs, migration_tool_prisma.rs),
+// which reuse the public helpers (`spawn_basin_server`,
+// `assert_schema_matches_snapshot`, `run_crud_battery`, `SchemaSnapshot`,
+// `CrudQuery`) declared above.
