@@ -1,0 +1,143 @@
+{
+  "kind": "compare",
+  "id": "postgres_10k_parquet",
+  "name": "Basin (Parquet) vs Postgres 18 (10k-row SaaS+OLAP workload, no index)",
+  "claim": "Same 10k-row small-project SaaS+OLAP workload as the Vortex card, but Basin is pinned to basin.file_format='parquet'. Honest small-scale baseline for the Parquet path against PG heap and the Vortex card.",
+  "available": true,
+  "metrics": [
+    {
+      "label": "On-disk bytes (users + events)",
+      "basin": 96119.0,
+      "postgres": 868352.0,
+      "unit": "bytes",
+      "better": "basin",
+      "ratio_text": "pg / basin = 9.03x"
+    },
+    {
+      "label": "Point query p50",
+      "basin": 0.730042,
+      "postgres": 1.159,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "pg / basin = 1.59x"
+    },
+    {
+      "label": "Point query p99",
+      "basin": 5.40425,
+      "postgres": 1.519,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.28x"
+    },
+    {
+      "label": "Range scan p50 (~1k rows)",
+      "basin": 0.6677500000000001,
+      "postgres": 1.247,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "pg / basin = 1.87x"
+    },
+    {
+      "label": "Range scan p99",
+      "basin": 6.433167,
+      "postgres": 3.311,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.51x"
+    },
+    {
+      "label": "Aggregate GROUP BY user_id p50",
+      "basin": 9.746792000000001,
+      "postgres": 3.941,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.40x"
+    },
+    {
+      "label": "2-table JOIN GROUP BY p50",
+      "basin": 17.898917,
+      "postgres": 14.978,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.84x"
+    },
+    {
+      "label": "ILIKE '%@gmail.com' p50",
+      "basin": 3.033708,
+      "postgres": 0.457,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.15x"
+    },
+    {
+      "label": "Pagination ORDER BY LIMIT/OFFSET p50",
+      "basin": 15.207375,
+      "postgres": 3.735,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.25x"
+    },
+    {
+      "label": "Single-row UPDATE p50",
+      "basin": 6.751792,
+      "postgres": 0.121,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.02x"
+    },
+    {
+      "label": "Bulk UPDATE (~3333 rows)",
+      "basin": 80.6135,
+      "postgres": 23.783292,
+      "unit": "ms",
+      "better": "postgres"
+    },
+    {
+      "label": "DELETE WHERE id IN (10 rows)",
+      "basin": 70.880708,
+      "postgres": 1.472875,
+      "unit": "ms",
+      "better": "postgres"
+    },
+    {
+      "label": "Bulk INSERT 10000 rows",
+      "basin": 897.494791,
+      "postgres": 172.539416,
+      "unit": "ms",
+      "better": "postgres"
+    },
+    {
+      "label": "Cold-start first query",
+      "basin": 4.302084000000001,
+      "postgres": 8.823915999999999,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "pg / basin = 2.05x"
+    },
+    {
+      "label": "COUNT(*) full table p50",
+      "basin": 0.222375,
+      "postgres": 1.353,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "pg / basin = 6.08x"
+    },
+    {
+      "label": "DATE_TRUNC day + SUM GROUP BY p50",
+      "basin": 9.063208,
+      "postgres": 4.863,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.54x"
+    },
+    {
+      "label": "Analytics JOIN+WHERE (last 3333s window)",
+      "basin": 18.64575,
+      "postgres": 5.445,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.29x"
+    }
+  ],
+  "generated_at": "@1779540938"
+}

@@ -1,0 +1,143 @@
+{
+  "kind": "compare",
+  "id": "postgres_10k",
+  "name": "Basin vs Postgres 18 (10k-row SaaS+OLAP workload, no index)",
+  "claim": "At small-project scale (10k rows = 1k users + 10k events), the entire working set fits in PG's shared_buffers, so PG wins more of the OLTP latency metrics. Basin still leads on the OLAP shapes (COUNT(*), DATE_TRUNC rollup, analytics JOIN) where the win is algorithmic. Honest small-scale baseline for the 100k / 1M siblings.",
+  "available": true,
+  "metrics": [
+    {
+      "label": "On-disk bytes (users + events)",
+      "basin": 13608.0,
+      "postgres": 868352.0,
+      "unit": "bytes",
+      "better": "basin",
+      "ratio_text": "pg / basin = 63.81x"
+    },
+    {
+      "label": "Point query p50",
+      "basin": 0.6997089999999999,
+      "postgres": 0.32,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.46x"
+    },
+    {
+      "label": "Point query p99",
+      "basin": 4.303458,
+      "postgres": 0.326,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.08x"
+    },
+    {
+      "label": "Range scan p50 (~1k rows)",
+      "basin": 0.668292,
+      "postgres": 0.668,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 1.00x"
+    },
+    {
+      "label": "Range scan p99",
+      "basin": 3.3119590000000003,
+      "postgres": 0.706,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.21x"
+    },
+    {
+      "label": "Aggregate GROUP BY user_id p50",
+      "basin": 9.410583,
+      "postgres": 1.387,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.15x"
+    },
+    {
+      "label": "2-table JOIN GROUP BY p50",
+      "basin": 17.039291000000002,
+      "postgres": 3.043,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.18x"
+    },
+    {
+      "label": "ILIKE '%@gmail.com' p50",
+      "basin": 4.408333000000001,
+      "postgres": 0.26,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.06x"
+    },
+    {
+      "label": "Pagination ORDER BY LIMIT/OFFSET p50",
+      "basin": 13.805042,
+      "postgres": 1.674,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.12x"
+    },
+    {
+      "label": "Single-row UPDATE p50",
+      "basin": 58.41275,
+      "postgres": 0.051,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.00x"
+    },
+    {
+      "label": "Bulk UPDATE (~3333 rows)",
+      "basin": 93.318208,
+      "postgres": 3.3133749999999997,
+      "unit": "ms",
+      "better": "postgres"
+    },
+    {
+      "label": "DELETE WHERE id IN (10 rows)",
+      "basin": 83.894041,
+      "postgres": 0.755958,
+      "unit": "ms",
+      "better": "postgres"
+    },
+    {
+      "label": "Bulk INSERT 10000 rows",
+      "basin": 858.197958,
+      "postgres": 73.167875,
+      "unit": "ms",
+      "better": "postgres"
+    },
+    {
+      "label": "Cold-start first query",
+      "basin": 12.218917,
+      "postgres": 9.164167,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.75x"
+    },
+    {
+      "label": "COUNT(*) full table p50",
+      "basin": 0.214625,
+      "postgres": 0.511,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "pg / basin = 2.38x"
+    },
+    {
+      "label": "DATE_TRUNC day + SUM GROUP BY p50",
+      "basin": 7.739167,
+      "postgres": 1.828,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.24x"
+    },
+    {
+      "label": "Analytics JOIN+WHERE (last 3333s window)",
+      "basin": 15.606250000000001,
+      "postgres": 1.724,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.11x"
+    }
+  ],
+  "generated_at": "@1779540933"
+}
