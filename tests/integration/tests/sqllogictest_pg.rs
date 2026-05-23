@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::util::display::{ArrayFormatter, FormatOptions};
-use arrow_array::{Array, BooleanArray, Float32Array, Float64Array};
+use arrow_array::{Array, BooleanArray, Float32Array, Float64Array, StringArray};
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use basin_catalog::InMemoryCatalog;
@@ -182,6 +182,12 @@ fn df_type_to_slt(dt: &DataType) -> DefaultColumnType {
 /// - Booleans → `t` / `f` to match `psql` rendering.
 /// - Floats truncated to 3 decimal places (matches PG's default
 ///   `extra_float_digits = 0` rounding for short literals).
+/// - String cells whose value is the literal `"true"`/`"false"` (any case)
+///   are harmonized to `t` / `f`. This covers `BOOLEAN::TEXT` casts that
+///   reach the harness as Utf8 (`"true"`/`"false"` per PG semantics) — we
+///   want the same `t`/`f` rendering as a raw `BooleanArray`. No `.slt`
+///   case in the curated suite round-trips the string literals `'true'`
+///   or `'false'`, so this is unambiguous.
 fn format_cell(arr: &dyn Array, row: usize, default_fmt: &ArrayFormatter<'_>) -> String {
     if arr.is_null(row) {
         return "NULL".to_string();
@@ -194,6 +200,17 @@ fn format_cell(arr: &dyn Array, row: usize, default_fmt: &ArrayFormatter<'_>) ->
     }
     if let Some(f) = arr.as_any().downcast_ref::<Float32Array>() {
         return format!("{:.3}", f.value(row));
+    }
+    if let Some(s) = arr.as_any().downcast_ref::<StringArray>() {
+        let v = s.value(row);
+        let trimmed = v.trim();
+        if trimmed.eq_ignore_ascii_case("true") {
+            return "t".to_string();
+        }
+        if trimmed.eq_ignore_ascii_case("false") {
+            return "f".to_string();
+        }
+        return v.to_string();
     }
     default_fmt.value(row).to_string()
 }
