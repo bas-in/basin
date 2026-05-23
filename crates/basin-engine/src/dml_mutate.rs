@@ -976,11 +976,18 @@ pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result
                         &f.path,
                         p,
                         want_returning_rows,
+                        schema.as_ref(),
                     )
                     .await?
                 } else {
-                    let kept =
-                        evaluate_and_partition_delete(&storage, &sess.project, &f.path, p).await?;
+                    let kept = evaluate_and_partition_delete(
+                        &storage,
+                        &sess.project,
+                        &f.path,
+                        p,
+                        schema.as_ref(),
+                    )
+                    .await?;
                     (kept, Vec::new(), None)
                 };
                 let kept_rows: usize = kept.iter().map(|b| b.num_rows()).sum();
@@ -2478,6 +2485,7 @@ async fn evaluate_and_partition_delete_capturing(
     path: &object_store::path::Path,
     pred: &CompoundPredicate,
     want_returning: bool,
+    catalog_schema: &Schema,
 ) -> Result<(
     Vec<RecordBatch>,
     Vec<(RecordBatch, usize)>,
@@ -2488,7 +2496,10 @@ async fn evaluate_and_partition_delete_capturing(
     let mut deleted = Vec::new();
     let mut deleted_batches: Vec<RecordBatch> = Vec::new();
     while let Some(batch) = stream.next().await {
-        let batch = batch?;
+        // Reattach catalog schema (and coerce Vortex-narrowed types) so
+        // the kept batches concat cleanly against the catalog schema in
+        // `write_replacement`. See `reattach_catalog_metadata`.
+        let batch = reattach_catalog_metadata(catalog_schema, batch?)?;
         let mask = evaluate_compound(&batch, pred)
             .map_err(|e| BasinError::internal(format!("delete predicate eval: {e}")))?;
         for i in 0..batch.num_rows() {
@@ -2543,7 +2554,9 @@ fn sanitize_mask_local(mask: &BooleanArray) -> BooleanArray {
 }
 
 /// Re-attach the catalog schema's per-field metadata onto a batch read
-/// back from storage.
+/// back from storage AND coerce the per-column physical type back to the
+/// catalog's declared type when storage round-tripped it through a
+/// narrower representation.
 ///
 /// Parquet preserves Arrow field metadata in its key-value footer, so a
 /// batch read from a `.parquet` file already carries the Basin logical-
@@ -2557,31 +2570,80 @@ fn sanitize_mask_local(mask: &BooleanArray) -> BooleanArray {
 /// a Vortex-backed table would silently skip the CHAR/VARCHAR length
 /// limit and never recompute GENERATED columns on UPDATE.
 ///
+/// Type-narrowing also happens on the Vortex read path: a catalog
+/// `LargeBinary` (JSONB's physical type) round-trips through Vortex's
+/// `BinaryView`, which `normalize_view_types_schema` then maps to plain
+/// `Binary` (32-bit offsets). The subsequent UPDATE rewrite tries to
+/// `concat_batches(catalog_schema, …)` — catalog says `LargeBinary`,
+/// batch carries `Binary` — and arrow rejects with "expected LargeBinary
+/// but found Binary at column index N". Before this coercion the bulk
+/// UPDATE bench (`compare_postgres_*`) panicked on the events.payload
+/// JSONB column at scale ≥10k. We cast `Binary → LargeBinary` and
+/// `Utf8 → LargeUtf8` (the symmetric case) here so the rewrite path
+/// always sees catalog-aligned batches. The cast is cheap for the small
+/// row counts UPDATEs touch and is a no-op on Parquet (round-trip type
+/// is already authoritative).
+///
 /// This restores parity: for every batch field that exists in the catalog
-/// schema by name *and* has the same Arrow data type, swap in the catalog
-/// field (carrying its metadata). Fields without a catalog match, or
-/// whose physical type differs, are left exactly as read so this is a
-/// no-op on the Parquet path (the metadata is already identical) and on
-/// any column the catalog doesn't describe.
+/// schema by name, adopt the catalog field's metadata (and cast the
+/// column to the catalog type if it's narrower than the catalog declared).
+/// Fields without a catalog match are left exactly as read so any column
+/// the catalog doesn't describe passes through unchanged.
 fn reattach_catalog_metadata(catalog_schema: &Schema, batch: RecordBatch) -> Result<RecordBatch> {
+    use arrow_array::ArrayRef;
+    use arrow_schema::DataType;
     let read_schema = batch.schema();
     let mut fields: Vec<Arc<Field>> = Vec::with_capacity(read_schema.fields().len());
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(read_schema.fields().len());
     let mut changed = false;
-    for f in read_schema.fields() {
+    for (col_idx, f) in read_schema.fields().iter().enumerate() {
+        let col = batch.column(col_idx).clone();
         match catalog_schema.field_with_name(f.name()) {
-            Ok(cat_f) if cat_f.data_type() == f.data_type() => {
-                // Keep the read-back nullability (Vortex/Parquet decode is
-                // authoritative on physical nullability) but adopt the
-                // catalog field's metadata.
-                if cat_f.metadata() != f.metadata() {
+            Ok(cat_f) => {
+                let cat_dt = cat_f.data_type();
+                let read_dt = f.data_type();
+                // Decide whether the read column needs a physical cast to
+                // match the catalog. Limited to the Vortex round-trip
+                // narrowings we know about (Binary↔LargeBinary,
+                // Utf8↔LargeUtf8) — keeps the surface area small and
+                // avoids surprising implicit conversions on unrelated
+                // type mismatches (those would still flow through to the
+                // downstream validator's error path).
+                let needs_widen = matches!(
+                    (read_dt, cat_dt),
+                    (DataType::Binary, DataType::LargeBinary)
+                        | (DataType::LargeBinary, DataType::Binary)
+                        | (DataType::Utf8, DataType::LargeUtf8)
+                        | (DataType::LargeUtf8, DataType::Utf8)
+                );
+                let coerced = if needs_widen {
+                    changed = true;
+                    arrow::compute::cast(&col, cat_dt).map_err(|e| {
+                        BasinError::internal(format!(
+                            "reattach catalog metadata: cast column {:?} from {:?} to {:?}: {e}",
+                            f.name(),
+                            read_dt,
+                            cat_dt
+                        ))
+                    })?
+                } else {
+                    col
+                };
+                let final_dt = coerced.data_type().clone();
+                let same_type = final_dt == *read_dt;
+                if cat_f.metadata() != f.metadata() || !same_type {
                     changed = true;
                 }
                 fields.push(Arc::new(
-                    Field::new(f.name(), f.data_type().clone(), f.is_nullable())
+                    Field::new(f.name(), final_dt, f.is_nullable())
                         .with_metadata(cat_f.metadata().clone()),
                 ));
+                columns.push(coerced);
             }
-            _ => fields.push(f.clone()),
+            Err(_) => {
+                fields.push(f.clone());
+                columns.push(col);
+            }
         }
     }
     if !changed {
@@ -2591,7 +2653,7 @@ fn reattach_catalog_metadata(catalog_schema: &Schema, batch: RecordBatch) -> Res
         fields,
         read_schema.metadata().clone(),
     ));
-    RecordBatch::try_new(merged, batch.columns().to_vec())
+    RecordBatch::try_new(merged, columns)
         .map_err(|e| BasinError::internal(format!("reattach catalog metadata: {e}")))
 }
 
@@ -2668,16 +2730,26 @@ fn file_outcome(
 
 /// Read a single Parquet file and return only the rows that do NOT match
 /// `pred`. Used by DELETE.
+///
+/// The `catalog_schema` argument is the table's catalog-declared schema; it
+/// is used to coerce any Vortex-narrowed columns (Binary→LargeBinary,
+/// Utf8→LargeUtf8) back to the catalog's authoritative physical type so
+/// the kept batches survive the downstream `concat_batches(catalog_schema,
+/// kept)` in `write_replacement`. See `reattach_catalog_metadata` for the
+/// rationale — the JSONB column on the bench's `events` table is the
+/// canonical trigger. The cast is a no-op when reading Parquet (the
+/// round-trip type is already catalog-aligned).
 async fn evaluate_and_partition_delete(
     storage: &Storage,
     project: &basin_common::ProjectId,
     path: &object_store::path::Path,
     pred: &CompoundPredicate,
+    catalog_schema: &Schema,
 ) -> Result<Vec<RecordBatch>> {
     let mut stream = storage.read_file(project, path).await?;
     let mut kept = Vec::new();
     while let Some(batch) = stream.next().await {
-        let batch = batch?;
+        let batch = reattach_catalog_metadata(catalog_schema, batch?)?;
         let mask = evaluate_compound(&batch, pred)
             .map_err(|e| BasinError::internal(format!("delete predicate eval: {e}")))?;
         let inverse = invert_mask(&mask);
