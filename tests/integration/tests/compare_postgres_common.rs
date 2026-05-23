@@ -22,7 +22,7 @@
 //! binaries, not to the library crate. The `#[path = …] mod common;`
 //! pattern mirrors what `migration_tool_*.rs` already do here.
 //!
-//! Query suite (15 metrics per card):
+//! Query suite (29 metrics per card):
 //!   SaaS / OLTP shapes (12)
 //!     (1)  Point query              — WHERE id = ?
 //!     (2)  Range scan (~1 000 rows) — WHERE created_at BETWEEN ? AND ?
@@ -40,6 +40,19 @@
 //!    (13)  COUNT(*) on whole table  — Vortex col stats vs PG seq scan
 //!    (14)  DATE_TRUNC + GROUP BY    — time-series rollup
 //!    (15)  JOIN + WHERE + GROUP BY  — analytics: "top spenders last N days"
+//!   Extended-shape coverage (12) — for perf-issue triangulation
+//!    (16)  COUNT(DISTINCT user_id) — column-stats / dictionary win for Vortex
+//!    (17)  LIKE prefix (status)    — sargable prefix; parity check
+//!    (18)  Multi-col GROUP BY + HAVING — high-cardinality grouping w/ filter
+//!    (19)  Window LAG OVER PARTITION — window-function plan cost
+//!    (20)  Recursive CTE fib(30)   — engine compat + recursive plan
+//!    (21)  Correlated subquery     — n+1-style select-list subquery
+//!    (22)  EXISTS in WHERE         — semi-join planning
+//!    (23)  3-table JOIN w/ BETWEEN — categories ⋈ events ⋈ users
+//!    (24)  UNION ALL of two scans  — branch-union cost
+//!    (25)  ORDER BY NULLS LAST     — nullable column sort + LIMIT
+//!    (26)  Top-N per group (MAX)   — analytics "best customer" pattern
+//!    (27)  Numeric range filter    — double-precision BETWEEN pushdown
 
 #![allow(dead_code, clippy::print_stdout)]
 
@@ -287,6 +300,62 @@ async fn basin_timed(
     elapsed
 }
 
+/// Like `basin_timed`, but returns `None` if the query errors. Used by the
+/// extended-shape suite (#16-#27) so a single unsupported feature (e.g.
+/// recursive CTE) becomes a NaN-equivalent metric row rather than panicking
+/// the whole 29-row card. The caller decides how to surface the gap.
+///
+/// Row-count assertion is skipped for empty-allowed shapes (LIKE prefix,
+/// EXISTS) — the timing is still meaningful even on a zero-row result.
+async fn basin_timed_try(
+    sess: &basin_engine::ProjectSession,
+    sql: &str,
+) -> Option<f64> {
+    let started = Instant::now();
+    match sess.execute(sql).await {
+        Ok(_) => Some(started.elapsed().as_secs_f64() * 1000.0),
+        Err(_) => None,
+    }
+}
+
+/// Median of N samples, retrying on per-sample failure. If FEWER than half
+/// the samples succeed, returns `None` (treat the whole shape as unsupported).
+async fn basin_p50_try(
+    sess: &basin_engine::ProjectSession,
+    sql: &str,
+    n: usize,
+) -> Option<f64> {
+    let mut samples = Vec::with_capacity(n);
+    for _ in 0..n {
+        if let Some(ms) = basin_timed_try(sess, sql).await {
+            samples.push(ms);
+        }
+    }
+    if samples.len() * 2 < n {
+        return None;
+    }
+    Some(median(&samples))
+}
+
+/// Same as `basin_p50_try` but for PG via EXPLAIN ANALYZE. Returns `None`
+/// if Postgres also fails (kept symmetric so the row gets a sentinel on
+/// both sides rather than a misleading "PG = 0").
+async fn pg_p50_explain(pg: &Client, sql_inner: &str, n: usize) -> Option<f64> {
+    let mut samples = Vec::with_capacity(n);
+    for _ in 0..n {
+        let q = format!("EXPLAIN (ANALYZE, FORMAT TEXT) {sql_inner}");
+        if let Ok(r) = pg.simple_query(&q).await {
+            if let Some(ms) = parse_pg_exec_time(&r) {
+                samples.push(ms);
+            }
+        }
+    }
+    if samples.is_empty() {
+        return None;
+    }
+    Some(median(&samples))
+}
+
 /// Per-scale tuning of the multi-row INSERT batch size. At 10k rows we want a
 /// single batch (warm cache fits the whole table), at 100k we pick 5k, at 1M
 /// we pick 10k — the latter two match the pre-refactor per-file constants so
@@ -301,10 +370,640 @@ fn insert_batch_for(rows: usize) -> usize {
     }
 }
 
-/// Single-replicated suite that runs the FULL 15-metric comparison and emits
+/// Postgres-side results for the original 14 SaaS+OLAP measurements (mirror
+/// of `BasinCoreResults`). Extracted for stack-budget reasons.
+struct PgCoreResults {
+    point_p50: f64,
+    point_p99: f64,
+    range_p50: f64,
+    range_p99: f64,
+    agg_p50: f64,
+    join_p50: f64,
+    ilike_p50: f64,
+    page_p50: f64,
+    upd1_p50: f64,
+    bulk_upd_ms: f64,
+    delete_ms: f64,
+    count_p50: f64,
+    trunc_p50: f64,
+    olap_join_p50: f64,
+}
+
+/// Run the PG-side 14 SaaS+OLAP measurements via `EXPLAIN (ANALYZE, FORMAT
+/// TEXT)` to capture engine time (excludes the network/protocol roundtrip
+/// that would otherwise dominate small queries). Extracted from
+/// `run_full_compare` for the same stack-budget reason as the Basin twin.
+#[allow(clippy::too_many_arguments)]
+async fn run_pg_core_suite(
+    pg: &Client,
+    schema: &str,
+    target_id: i64,
+    range_lo_ts: i64,
+    range_hi_ts: i64,
+    pagination_threshold: i64,
+    olap_cutoff_ts: i64,
+    delete_in_list: &str,
+) -> PgCoreResults {
+    let mut point: Vec<f64> = Vec::with_capacity(7);
+    for _ in 0..7 {
+        let q = format!(
+            "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT * FROM {schema}.events WHERE id = {target_id}"
+        );
+        let r = pg.simple_query(&q).await.expect("explain point");
+        if let Some(ms) = parse_pg_exec_time(&r) { point.push(ms); }
+    }
+
+    let mut range: Vec<f64> = Vec::with_capacity(7);
+    for _ in 0..7 {
+        let q = format!(
+            "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT * FROM {schema}.events \
+             WHERE created_at BETWEEN to_timestamp({range_lo_ts}) AND to_timestamp({range_hi_ts})"
+        );
+        let r = pg.simple_query(&q).await.expect("explain range");
+        if let Some(ms) = parse_pg_exec_time(&r) { range.push(ms); }
+    }
+
+    let mut agg: Vec<f64> = Vec::with_capacity(7);
+    for _ in 0..7 {
+        let q = format!(
+            "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT user_id, COUNT(*), SUM(amount) \
+             FROM {schema}.events GROUP BY user_id ORDER BY 2 DESC LIMIT 10"
+        );
+        let r = pg.simple_query(&q).await.expect("explain agg");
+        if let Some(ms) = parse_pg_exec_time(&r) { agg.push(ms); }
+    }
+
+    let mut join: Vec<f64> = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let q = format!(
+            "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT u.email, COUNT(e.id) \
+             FROM {schema}.users u JOIN {schema}.events e ON e.user_id = u.id \
+             GROUP BY u.email ORDER BY 2 DESC LIMIT 20"
+        );
+        let r = pg.simple_query(&q).await.expect("explain join");
+        if let Some(ms) = parse_pg_exec_time(&r) { join.push(ms); }
+    }
+
+    let mut ilike: Vec<f64> = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let q = format!(
+            "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT id, email FROM {schema}.users \
+             WHERE email ILIKE '%@gmail.com'"
+        );
+        let r = pg.simple_query(&q).await.expect("explain ilike");
+        if let Some(ms) = parse_pg_exec_time(&r) { ilike.push(ms); }
+    }
+
+    let mut page: Vec<f64> = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let q = format!(
+            "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT id, amount, status, created_at \
+             FROM {schema}.events ORDER BY created_at DESC LIMIT 50 OFFSET 100"
+        );
+        let r = pg.simple_query(&q).await.expect("explain pagination");
+        if let Some(ms) = parse_pg_exec_time(&r) { page.push(ms); }
+    }
+
+    let mut upd1: Vec<f64> = Vec::with_capacity(5);
+    for i in 0..5 {
+        let uid = i as i64;
+        let new_email = format!("rotated{i}@example.org");
+        let q = format!(
+            "EXPLAIN (ANALYZE, FORMAT TEXT) UPDATE {schema}.users \
+             SET email = '{new_email}' WHERE id = {uid}"
+        );
+        let r = pg.simple_query(&q).await.expect("explain upd1");
+        if let Some(ms) = parse_pg_exec_time(&r) { upd1.push(ms); }
+    }
+
+    let bulk_upd_ms: f64 = {
+        let started = Instant::now();
+        pg.simple_query(&format!(
+            "UPDATE {schema}.events SET status = 'expired' \
+             WHERE created_at < to_timestamp({pagination_threshold})"
+        ))
+        .await
+        .expect("pg bulk update");
+        started.elapsed().as_secs_f64() * 1000.0
+    };
+
+    let delete_ms: f64 = {
+        let started = Instant::now();
+        pg.simple_query(&format!(
+            "DELETE FROM {schema}.events WHERE id IN ({delete_in_list})"
+        ))
+        .await
+        .expect("pg delete");
+        started.elapsed().as_secs_f64() * 1000.0
+    };
+
+    let mut count: Vec<f64> = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let q = format!(
+            "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT COUNT(*) FROM {schema}.events"
+        );
+        let r = pg.simple_query(&q).await.expect("explain count");
+        if let Some(ms) = parse_pg_exec_time(&r) { count.push(ms); }
+    }
+
+    let mut trunc: Vec<f64> = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let q = format!(
+            "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT DATE_TRUNC('day', created_at) AS d, \
+                    SUM(amount) FROM {schema}.events GROUP BY 1 ORDER BY 1"
+        );
+        let r = pg.simple_query(&q).await.expect("explain date_trunc");
+        if let Some(ms) = parse_pg_exec_time(&r) { trunc.push(ms); }
+    }
+
+    let mut olap_join: Vec<f64> = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let q = format!(
+            "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT u.email, SUM(e.amount) \
+             FROM {schema}.users u JOIN {schema}.events e ON e.user_id = u.id \
+             WHERE e.created_at > to_timestamp({olap_cutoff_ts}) \
+             GROUP BY u.email ORDER BY 2 DESC LIMIT 10"
+        );
+        let r = pg.simple_query(&q).await.expect("explain olap join");
+        if let Some(ms) = parse_pg_exec_time(&r) { olap_join.push(ms); }
+    }
+
+    PgCoreResults {
+        point_p50: median(&point),
+        point_p99: percentile(&point, 99.0),
+        range_p50: median(&range),
+        range_p99: percentile(&range, 99.0),
+        agg_p50: median(&agg),
+        join_p50: median(&join),
+        ilike_p50: median(&ilike),
+        page_p50: median(&page),
+        upd1_p50: median(&upd1),
+        bulk_upd_ms,
+        delete_ms,
+        count_p50: median(&count),
+        trunc_p50: median(&trunc),
+        olap_join_p50: median(&olap_join),
+    }
+}
+
+/// Basin-side results for the original 14 SaaS+OLAP measurements (#1-#11,
+/// #13-#15). Bundled into a struct so the helper can run all of them in its
+/// own async-fn frame (off the `run_full_compare` worker stack).
+struct BasinCoreResults {
+    point_p50: f64,
+    point_p99: f64,
+    range_p50: f64,
+    range_p99: f64,
+    agg_p50: f64,
+    join_p50: f64,
+    ilike_p50: f64,
+    page_p50: f64,
+    upd1_p50: f64,
+    bulk_upd_ms: f64,
+    delete_ms: f64,
+    count_p50: f64,
+    trunc_p50: f64,
+    olap_join_p50: f64,
+}
+
+/// Runs the original 14-measurement Basin SaaS+OLAP suite. Returns a flat
+/// struct of p50/p99 results. Extracted from `run_full_compare` so the
+/// outer function's state machine doesn't accumulate ~14 separate `Vec<f64>`
+/// locals on the worker-thread stack.
+#[allow(clippy::too_many_arguments)]
+async fn run_basin_core_suite(
+    sess: &basin_engine::ProjectSession,
+    target_id: i64,
+    range_lo_ts: i64,
+    range_hi_ts: i64,
+    pagination_threshold: i64,
+    olap_cutoff_ts: i64,
+    delete_in_list: &str,
+) -> BasinCoreResults {
+    // Warm-up: triggers any first-query plan caching so the p99 column
+    // reflects steady-state latency rather than first-touch overhead.
+    let _ = sess
+        .execute(&format!("SELECT id FROM events WHERE id = {target_id}"))
+        .await;
+
+    let mut point: Vec<f64> = Vec::with_capacity(7);
+    for _ in 0..7 {
+        point.push(
+            basin_timed(
+                sess,
+                &format!(
+                    "SELECT id, user_id, amount, status, created_at \
+                     FROM events WHERE id = {target_id}"
+                ),
+                true,
+            )
+            .await,
+        );
+    }
+
+    let mut range: Vec<f64> = Vec::with_capacity(7);
+    for _ in 0..7 {
+        range.push(
+            basin_timed(
+                sess,
+                &format!(
+                    "SELECT id, user_id, amount FROM events \
+                     WHERE created_at BETWEEN {range_lo_ts} AND {range_hi_ts}"
+                ),
+                true,
+            )
+            .await,
+        );
+    }
+
+    let mut agg: Vec<f64> = Vec::with_capacity(7);
+    for _ in 0..7 {
+        agg.push(
+            basin_timed(
+                sess,
+                "SELECT user_id, COUNT(*), SUM(amount) FROM events \
+                 GROUP BY user_id ORDER BY 2 DESC LIMIT 10",
+                true,
+            )
+            .await,
+        );
+    }
+
+    let mut join: Vec<f64> = Vec::with_capacity(5);
+    for _ in 0..5 {
+        join.push(
+            basin_timed(
+                sess,
+                "SELECT u.email, COUNT(e.id) FROM users u \
+                 JOIN events e ON e.user_id = u.id \
+                 GROUP BY u.email ORDER BY 2 DESC LIMIT 20",
+                true,
+            )
+            .await,
+        );
+    }
+
+    let mut ilike: Vec<f64> = Vec::with_capacity(5);
+    for _ in 0..5 {
+        ilike.push(
+            basin_timed(
+                sess,
+                "SELECT id, email FROM users WHERE email ILIKE '%@gmail.com'",
+                true,
+            )
+            .await,
+        );
+    }
+
+    let mut page: Vec<f64> = Vec::with_capacity(5);
+    for _ in 0..5 {
+        page.push(
+            basin_timed(
+                sess,
+                "SELECT id, amount, status, created_at FROM events \
+                 ORDER BY created_at DESC LIMIT 50 OFFSET 100",
+                true,
+            )
+            .await,
+        );
+    }
+
+    let mut upd1: Vec<f64> = Vec::with_capacity(5);
+    for i in 0..5 {
+        let uid = i as i64;
+        let new_email = format!("rotated{i}@example.org");
+        let q = format!("UPDATE users SET email = '{new_email}' WHERE id = {uid}");
+        let started = Instant::now();
+        sess.execute(&q).await.expect("basin single-row update");
+        upd1.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    let bulk_upd_ms: f64 = {
+        let started = Instant::now();
+        sess.execute(&format!(
+            "UPDATE events SET status = 'expired' WHERE created_at < {pagination_threshold}"
+        ))
+        .await
+        .expect("basin bulk update");
+        started.elapsed().as_secs_f64() * 1000.0
+    };
+
+    let delete_ms: f64 = {
+        let started = Instant::now();
+        sess.execute(&format!(
+            "DELETE FROM events WHERE id IN ({delete_in_list})"
+        ))
+        .await
+        .expect("basin delete");
+        started.elapsed().as_secs_f64() * 1000.0
+    };
+
+    let mut count: Vec<f64> = Vec::with_capacity(5);
+    for _ in 0..5 {
+        count.push(basin_timed(sess, "SELECT COUNT(*) FROM events", true).await);
+    }
+
+    // Basin stores `created_at` as BIGINT seconds-since-epoch (vs PG's
+    // TIMESTAMPTZ). Basin's `to_timestamp(numeric)` 1-arg form is gapped
+    // (v0.2 roadmap), so we bucket directly with integer division —
+    // `created_at / 86400` = days since unix epoch — same group cardinality
+    // and same scan cost as PG's `DATE_TRUNC('day', created_at)`.
+    let mut trunc: Vec<f64> = Vec::with_capacity(5);
+    for _ in 0..5 {
+        trunc.push(
+            basin_timed(
+                sess,
+                "SELECT created_at / 86400 AS day_bucket, \
+                        SUM(amount) FROM events GROUP BY 1 ORDER BY 1",
+                true,
+            )
+            .await,
+        );
+    }
+
+    let mut olap_join: Vec<f64> = Vec::with_capacity(5);
+    for _ in 0..5 {
+        olap_join.push(
+            basin_timed(
+                sess,
+                &format!(
+                    "SELECT u.email, SUM(e.amount) FROM users u \
+                     JOIN events e ON e.user_id = u.id \
+                     WHERE e.created_at > {olap_cutoff_ts} \
+                     GROUP BY u.email ORDER BY 2 DESC LIMIT 10"
+                ),
+                true,
+            )
+            .await,
+        );
+    }
+
+    BasinCoreResults {
+        point_p50: median(&point),
+        point_p99: percentile(&point, 99.0),
+        range_p50: median(&range),
+        range_p99: percentile(&range, 99.0),
+        agg_p50: median(&agg),
+        join_p50: median(&join),
+        ilike_p50: median(&ilike),
+        page_p50: median(&page),
+        upd1_p50: median(&upd1),
+        bulk_upd_ms,
+        delete_ms,
+        count_p50: median(&count),
+        trunc_p50: median(&trunc),
+        olap_join_p50: median(&olap_join),
+    }
+}
+
+/// Carrier for the 12 extended-shape (PG, Basin) p50 pairs.
+///
+/// PG values are `f64::INFINITY` when the query errored out (kept finite
+/// 99.99% of the time in practice); Basin values are `Option<f64>` because
+/// the engine may legitimately not support a shape yet (e.g. recursive CTE
+/// in pre-roadmap builds) and we want to surface that as a "(basin gap)"
+/// card row rather than fail the whole comparison.
+struct ExtendedResults {
+    count_distinct: (Option<f64>, f64),
+    like_prefix: (Option<f64>, f64),
+    groupby_having: (Option<f64>, f64),
+    window_lag: (Option<f64>, f64),
+    recursive_cte: (Option<f64>, f64),
+    correlated_sub: (Option<f64>, f64),
+    exists_in_where: (Option<f64>, f64),
+    join3_between: (Option<f64>, f64),
+    union_all: (Option<f64>, f64),
+    order_nulls_last: (Option<f64>, f64),
+    top_n_per_group: (Option<f64>, f64),
+    numeric_range: (Option<f64>, f64),
+}
+
+/// Run all 12 extended-shape probes (#16-#27) and return their (basin, pg)
+/// p50 pairs. Pulled out of `run_full_compare` to keep the outer function's
+/// stack-frame size within the worker-thread default — the 12 inline shape
+/// blocks otherwise overflow on the multi_thread tokio test runtime.
+///
+/// Each shape:
+///   - PG: `EXPLAIN (ANALYZE, FORMAT TEXT) <sql>` × EXT_SAMPLES, median.
+///   - Basin: `sess.execute(<sql>)` × EXT_SAMPLES, median (Option::None if
+///     >half the samples errored — caller treats as a "(basin gap)" row).
+///   - Query text matches PG and Basin modulo schema qualification and the
+///     `created_at BIGINT` clock convention used in Basin's seed.
+async fn run_extended_suite(
+    pg: &Client,
+    sess: &basin_engine::ProjectSession,
+    schema: &str,
+) -> ExtendedResults {
+    const EXT_SAMPLES: usize = 5;
+
+    async fn pair(
+        pg: &Client,
+        sess: &basin_engine::ProjectSession,
+        pg_sql: String,
+        basin_sql: &str,
+    ) -> (Option<f64>, f64) {
+        let p = pg_p50_explain(pg, &pg_sql, EXT_SAMPLES)
+            .await
+            .unwrap_or(f64::INFINITY);
+        let b = basin_p50_try(sess, basin_sql, EXT_SAMPLES).await;
+        (b, p)
+    }
+
+    // -- #16 COUNT(DISTINCT user_id) ----------------------------------------
+    let count_distinct = pair(
+        pg, sess,
+        format!("SELECT COUNT(DISTINCT user_id) FROM {schema}.events"),
+        "SELECT COUNT(DISTINCT user_id) FROM events",
+    ).await;
+
+    // -- #17 LIKE prefix ----------------------------------------------------
+    let like_prefix = pair(
+        pg, sess,
+        format!("SELECT id FROM {schema}.events WHERE status LIKE 'pending%' LIMIT 100"),
+        "SELECT id FROM events WHERE status LIKE 'pending%' LIMIT 100",
+    ).await;
+
+    // -- #18 Multi-col GROUP BY + HAVING + ORDER + LIMIT --------------------
+    let groupby_having = pair(
+        pg, sess,
+        format!(
+            "SELECT user_id, status, COUNT(*) FROM {schema}.events \
+             GROUP BY 1, 2 HAVING COUNT(*) > 5 ORDER BY 3 DESC LIMIT 20"
+        ),
+        "SELECT user_id, status, COUNT(*) FROM events \
+         GROUP BY 1, 2 HAVING COUNT(*) > 5 ORDER BY 3 DESC LIMIT 20",
+    ).await;
+
+    // -- #19 Window LAG OVER (PARTITION BY ... ORDER BY ...) ----------------
+    let window_lag = pair(
+        pg, sess,
+        format!(
+            "SELECT id, amount, LAG(amount) OVER (PARTITION BY user_id ORDER BY created_at) \
+             FROM {schema}.events LIMIT 1000"
+        ),
+        "SELECT id, amount, LAG(amount) OVER (PARTITION BY user_id ORDER BY created_at) \
+         FROM events LIMIT 1000",
+    ).await;
+
+    // -- #20 Recursive CTE (Fibonacci to n=30) ------------------------------
+    let rec_cte = "WITH RECURSIVE fib(n, a, b) AS (\
+                     SELECT 1, 0, 1 \
+                     UNION ALL \
+                     SELECT n+1, b, a+b FROM fib WHERE n < 30) \
+                   SELECT n, a FROM fib";
+    let recursive_cte = pair(pg, sess, rec_cte.to_string(), rec_cte).await;
+
+    // -- #21 Correlated subquery in SELECT list -----------------------------
+    let correlated_sub = pair(
+        pg, sess,
+        format!(
+            "SELECT u.email, (SELECT COUNT(*) FROM {schema}.events e WHERE e.user_id = u.id) \
+                AS n_events \
+             FROM {schema}.users u LIMIT 100"
+        ),
+        "SELECT u.email, (SELECT COUNT(*) FROM events e WHERE e.user_id = u.id) AS n_events \
+         FROM users u LIMIT 100",
+    ).await;
+
+    // -- #22 EXISTS in WHERE ------------------------------------------------
+    let exists_in_where = pair(
+        pg, sess,
+        format!(
+            "SELECT u.id FROM {schema}.users u \
+             WHERE EXISTS (SELECT 1 FROM {schema}.events e \
+                           WHERE e.user_id = u.id AND e.amount > 90)"
+        ),
+        "SELECT u.id FROM users u \
+         WHERE EXISTS (SELECT 1 FROM events e WHERE e.user_id = u.id AND e.amount > 90)",
+    ).await;
+
+    // -- #23 3-table JOIN (categories ⋈ events ⋈ users via BETWEEN) ---------
+    // BETWEEN-join is intentionally expensive — measures predicate-pushdown
+    // coverage when the join key is a range, not equality.
+    let join3_between = pair(
+        pg, sess,
+        format!(
+            "SELECT c.name, SUM(e.amount) FROM {schema}.categories c \
+             JOIN {schema}.events e ON e.amount BETWEEN c.min_amt AND c.max_amt \
+             JOIN {schema}.users u ON e.user_id = u.id \
+             GROUP BY 1"
+        ),
+        "SELECT c.name, SUM(e.amount) FROM categories c \
+         JOIN events e ON e.amount BETWEEN c.min_amt AND c.max_amt \
+         JOIN users u ON e.user_id = u.id \
+         GROUP BY 1",
+    ).await;
+
+    // -- #24 UNION ALL of two filtered scans --------------------------------
+    let union_all = pair(
+        pg, sess,
+        format!(
+            "SELECT id, 'paid' AS kind FROM {schema}.events WHERE status = 'paid' \
+             UNION ALL \
+             SELECT id, 'pending' FROM {schema}.events WHERE status = 'pending'"
+        ),
+        "SELECT id, 'paid' AS kind FROM events WHERE status = 'paid' \
+         UNION ALL \
+         SELECT id, 'pending' FROM events WHERE status = 'pending'",
+    ).await;
+
+    // -- #25 ORDER BY NULLS LAST + LIMIT ------------------------------------
+    let order_nulls_last = pair(
+        pg, sess,
+        format!(
+            "SELECT id, last_login FROM {schema}.users \
+             ORDER BY last_login DESC NULLS LAST LIMIT 50"
+        ),
+        "SELECT id, last_login FROM users \
+         ORDER BY last_login DESC NULLS LAST LIMIT 50",
+    ).await;
+
+    // -- #26 Top-N per group (MAX) ------------------------------------------
+    let top_n_per_group = pair(
+        pg, sess,
+        format!(
+            "SELECT user_id, MAX(amount) FROM {schema}.events \
+             GROUP BY user_id ORDER BY 2 DESC LIMIT 10"
+        ),
+        "SELECT user_id, MAX(amount) FROM events \
+         GROUP BY user_id ORDER BY 2 DESC LIMIT 10",
+    ).await;
+
+    // -- #27 Numeric range filter on doubles --------------------------------
+    let numeric_range = pair(
+        pg, sess,
+        format!("SELECT COUNT(*) FROM {schema}.events WHERE amount BETWEEN 25.5 AND 75.5"),
+        "SELECT COUNT(*) FROM events WHERE amount BETWEEN 25.5 AND 75.5",
+    ).await;
+
+    ExtendedResults {
+        count_distinct,
+        like_prefix,
+        groupby_having,
+        window_lag,
+        recursive_cte,
+        correlated_sub,
+        exists_in_where,
+        join3_between,
+        union_all,
+        order_nulls_last,
+        top_n_per_group,
+        numeric_range,
+    }
+}
+
+/// Single-replicated suite that runs the FULL 29-metric comparison and emits
 /// the dashboard JSON card. Each `compare_postgres_*` test file is a 30-line
 /// wrapper that calls this with the right (rows, format, id, name, claim).
+///
+/// Stack budget: the inner body's combined async state-machine size exceeds
+/// tokio's default 2 MiB worker-thread stack (29 metrics × ~all-on-one-frame
+/// state-machine variants), so we hop onto a dedicated `std::thread` with a
+/// 32 MiB stack and a fresh current-thread tokio runtime. The wrapper
+/// remains `async fn` so the per-scale `#[tokio::test]` files don't need to
+/// change. spawn_blocking would also work but doesn't let us pin the stack
+/// size, and the inner future borrows `&str` arguments that aren't `'static`.
 pub async fn run_full_compare(
+    rows: usize,
+    basin_format: BasinFormat,
+    id: &str,
+    name: &str,
+    claim: &str,
+    schema_prefix: &str,
+) {
+    // Move the &str args into owned Strings so they outlive the wrapper
+    // frame and can cross the thread boundary.
+    let id = id.to_string();
+    let name = name.to_string();
+    let claim = claim.to_string();
+    let schema_prefix = schema_prefix.to_string();
+    let handle = std::thread::Builder::new()
+        .name("compare-postgres-runner".into())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build current-thread runtime");
+            rt.block_on(run_full_compare_inner(
+                rows,
+                basin_format,
+                &id,
+                &name,
+                &claim,
+                &schema_prefix,
+            ));
+        })
+        .expect("spawn runner thread");
+    // Bridge the std::thread join back to async land. join() blocks, but
+    // we're already on a tokio worker — spawn_blocking keeps the worker
+    // free for other tasks.
+    tokio::task::spawn_blocking(move || handle.join().expect("runner thread panicked"))
+        .await
+        .expect("await runner join");
+}
+
+async fn run_full_compare_inner(
     rows: usize,
     basin_format: BasinFormat,
     id: &str,
@@ -345,7 +1044,8 @@ pub async fn run_full_compare(
         "CREATE TABLE {schema}.users (\
             id BIGINT PRIMARY KEY, \
             email TEXT, \
-            created_at TIMESTAMPTZ)"
+            created_at TIMESTAMPTZ, \
+            last_login TIMESTAMPTZ)"
     ))
     .await
     .expect("pg create users");
@@ -359,6 +1059,19 @@ pub async fn run_full_compare(
     ))
     .await
     .expect("pg create events");
+    // Small fixed-shape lookup table used by the 3-table JOIN shape (#23).
+    // Five buckets that together cover the full events.amount domain — Basin
+    // and PG both seed it with the same 5 rows so the join cardinality is
+    // identical on each side.
+    pg.simple_query(&format!(
+        "CREATE TABLE {schema}.categories (\
+            id BIGINT PRIMARY KEY, \
+            name TEXT, \
+            min_amt DOUBLE PRECISION, \
+            max_amt DOUBLE PRECISION)"
+    ))
+    .await
+    .expect("pg create categories");
     // Drop PKs so we measure heap-only performance (fair vs Basin substrate).
     pg.simple_query(&format!(
         "ALTER TABLE {schema}.users DROP CONSTRAINT users_pkey"
@@ -370,6 +1083,11 @@ pub async fn run_full_compare(
     ))
     .await
     .expect("drop events pkey");
+    pg.simple_query(&format!(
+        "ALTER TABLE {schema}.categories DROP CONSTRAINT categories_pkey"
+    ))
+    .await
+    .expect("drop categories pkey");
 
     // ~10 events per user across all scales.
     let users: usize = (rows / 10).max(100);
@@ -378,22 +1096,56 @@ pub async fn run_full_compare(
     let insert_batch = insert_batch_for(rows);
 
     // ---- PG seed users -----------------------------------------------------
+    // `last_login` is NULL for every 10th row so the ORDER BY NULLS LAST
+    // shape (#25) has a non-trivial null cluster.
     {
-        let mut stmt = String::with_capacity(users * 80);
+        let mut stmt = String::with_capacity(users * 90);
         stmt.push_str(&format!(
-            "INSERT INTO {schema}.users (id, email, created_at) VALUES "
+            "INSERT INTO {schema}.users (id, email, created_at, last_login) VALUES "
         ));
         for i in 0..users as i64 {
             if i > 0 {
                 stmt.push(',');
             }
+            let last_login = if i % 10 == 0 {
+                "NULL".to_string()
+            } else {
+                format!("to_timestamp({})", EPOCH + i + 100_000)
+            };
             stmt.push_str(&format!(
-                "({i}, '{}', to_timestamp({}))",
+                "({i}, '{}', to_timestamp({}), {last_login})",
                 email_for(i),
                 EPOCH + i
             ));
         }
         pg.simple_query(&stmt).await.expect("pg seed users");
+    }
+
+    // ---- PG seed categories (5 fixed rows) --------------------------------
+    // Buckets span [0, max_amount] where max_amount = (rows-1) * 0.5. Each
+    // event row lands in exactly one bucket — so `JOIN ... ON e.amount
+    // BETWEEN c.min_amt AND c.max_amt` has rows-cardinality output and the
+    // GROUP BY produces exactly 5 groups.
+    let max_amt = ((row_count - 1) as f64) * 0.5;
+    let cat_rows: [(i64, &str, f64, f64); 5] = [
+        (1, "micro",  0.0,            max_amt * 0.20),
+        (2, "small",  max_amt * 0.20 + 0.001, max_amt * 0.40),
+        (3, "medium", max_amt * 0.40 + 0.001, max_amt * 0.60),
+        (4, "large",  max_amt * 0.60 + 0.001, max_amt * 0.80),
+        (5, "xlarge", max_amt * 0.80 + 0.001, max_amt + 1.0),
+    ];
+    {
+        let mut stmt = String::new();
+        stmt.push_str(&format!(
+            "INSERT INTO {schema}.categories (id, name, min_amt, max_amt) VALUES "
+        ));
+        for (i, (id, name, lo, hi)) in cat_rows.iter().enumerate() {
+            if i > 0 {
+                stmt.push(',');
+            }
+            stmt.push_str(&format!("({id}, '{name}', {lo}, {hi})"));
+        }
+        pg.simple_query(&stmt).await.expect("pg seed categories");
     }
 
     // ---- PG bulk INSERT N events ------------------------------------------
@@ -472,163 +1224,32 @@ pub async fn run_full_compare(
         ))
         .await;
 
-    // ---- PG: 12 SaaS metrics + 3 OLAP metrics ------------------------------
-    let mut pg_point_ms: Vec<f64> = Vec::with_capacity(7);
-    for _ in 0..7 {
-        let q = format!(
-            "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT * FROM {schema}.events WHERE id = {target_id}"
-        );
-        let r = pg.simple_query(&q).await.expect("explain point");
-        if let Some(ms) = parse_pg_exec_time(&r) {
-            pg_point_ms.push(ms);
-        }
-    }
-    let pg_point_p50 = median(&pg_point_ms);
-    let pg_point_p99 = percentile(&pg_point_ms, 99.0);
-
-    let mut pg_range_ms: Vec<f64> = Vec::with_capacity(7);
-    for _ in 0..7 {
-        let q = format!(
-            "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT * FROM {schema}.events \
-             WHERE created_at BETWEEN to_timestamp({range_lo_ts}) AND to_timestamp({range_hi_ts})"
-        );
-        let r = pg.simple_query(&q).await.expect("explain range");
-        if let Some(ms) = parse_pg_exec_time(&r) {
-            pg_range_ms.push(ms);
-        }
-    }
-    let pg_range_p50 = median(&pg_range_ms);
-    let pg_range_p99 = percentile(&pg_range_ms, 99.0);
-
-    let mut pg_agg_ms: Vec<f64> = Vec::with_capacity(7);
-    for _ in 0..7 {
-        let q = format!(
-            "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT user_id, COUNT(*), SUM(amount) \
-             FROM {schema}.events GROUP BY user_id ORDER BY 2 DESC LIMIT 10"
-        );
-        let r = pg.simple_query(&q).await.expect("explain agg");
-        if let Some(ms) = parse_pg_exec_time(&r) {
-            pg_agg_ms.push(ms);
-        }
-    }
-    let pg_agg_p50 = median(&pg_agg_ms);
-
-    let mut pg_join_ms: Vec<f64> = Vec::with_capacity(5);
-    for _ in 0..5 {
-        let q = format!(
-            "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT u.email, COUNT(e.id) \
-             FROM {schema}.users u JOIN {schema}.events e ON e.user_id = u.id \
-             GROUP BY u.email ORDER BY 2 DESC LIMIT 20"
-        );
-        let r = pg.simple_query(&q).await.expect("explain join");
-        if let Some(ms) = parse_pg_exec_time(&r) {
-            pg_join_ms.push(ms);
-        }
-    }
-    let pg_join_p50 = median(&pg_join_ms);
-
-    let mut pg_ilike_ms: Vec<f64> = Vec::with_capacity(5);
-    for _ in 0..5 {
-        let q = format!(
-            "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT id, email FROM {schema}.users \
-             WHERE email ILIKE '%@gmail.com'"
-        );
-        let r = pg.simple_query(&q).await.expect("explain ilike");
-        if let Some(ms) = parse_pg_exec_time(&r) {
-            pg_ilike_ms.push(ms);
-        }
-    }
-    let pg_ilike_p50 = median(&pg_ilike_ms);
-
-    let mut pg_page_ms: Vec<f64> = Vec::with_capacity(5);
-    for _ in 0..5 {
-        let q = format!(
-            "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT id, amount, status, created_at \
-             FROM {schema}.events ORDER BY created_at DESC LIMIT 50 OFFSET 100"
-        );
-        let r = pg.simple_query(&q).await.expect("explain pagination");
-        if let Some(ms) = parse_pg_exec_time(&r) {
-            pg_page_ms.push(ms);
-        }
-    }
-    let pg_page_p50 = median(&pg_page_ms);
-
-    let mut pg_upd1_ms: Vec<f64> = Vec::with_capacity(5);
-    for i in 0..5 {
-        let uid = i as i64;
-        let new_email = format!("rotated{i}@example.org");
-        let q = format!(
-            "EXPLAIN (ANALYZE, FORMAT TEXT) UPDATE {schema}.users \
-             SET email = '{new_email}' WHERE id = {uid}"
-        );
-        let r = pg.simple_query(&q).await.expect("explain upd1");
-        if let Some(ms) = parse_pg_exec_time(&r) {
-            pg_upd1_ms.push(ms);
-        }
-    }
-    let pg_upd1_p50 = median(&pg_upd1_ms);
-
-    let pg_bulk_upd_ms: f64 = {
-        let started = Instant::now();
-        pg.simple_query(&format!(
-            "UPDATE {schema}.events SET status = 'expired' \
-             WHERE created_at < to_timestamp({pagination_threshold})"
-        ))
-        .await
-        .expect("pg bulk update");
-        started.elapsed().as_secs_f64() * 1000.0
-    };
-
-    let pg_delete_ms: f64 = {
-        let started = Instant::now();
-        pg.simple_query(&format!(
-            "DELETE FROM {schema}.events WHERE id IN ({delete_in_list})"
-        ))
-        .await
-        .expect("pg delete");
-        started.elapsed().as_secs_f64() * 1000.0
-    };
-
-    // ---- PG OLAP (3) ------------------------------------------------------
-    let mut pg_count_ms: Vec<f64> = Vec::with_capacity(5);
-    for _ in 0..5 {
-        let q = format!(
-            "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT COUNT(*) FROM {schema}.events"
-        );
-        let r = pg.simple_query(&q).await.expect("explain count");
-        if let Some(ms) = parse_pg_exec_time(&r) {
-            pg_count_ms.push(ms);
-        }
-    }
-    let pg_count_p50 = median(&pg_count_ms);
-
-    let mut pg_trunc_ms: Vec<f64> = Vec::with_capacity(5);
-    for _ in 0..5 {
-        let q = format!(
-            "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT DATE_TRUNC('day', created_at) AS d, \
-                    SUM(amount) FROM {schema}.events GROUP BY 1 ORDER BY 1"
-        );
-        let r = pg.simple_query(&q).await.expect("explain date_trunc");
-        if let Some(ms) = parse_pg_exec_time(&r) {
-            pg_trunc_ms.push(ms);
-        }
-    }
-    let pg_trunc_p50 = median(&pg_trunc_ms);
-
-    let mut pg_olap_join_ms: Vec<f64> = Vec::with_capacity(5);
-    for _ in 0..5 {
-        let q = format!(
-            "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT u.email, SUM(e.amount) \
-             FROM {schema}.users u JOIN {schema}.events e ON e.user_id = u.id \
-             WHERE e.created_at > to_timestamp({olap_cutoff_ts}) \
-             GROUP BY u.email ORDER BY 2 DESC LIMIT 10"
-        );
-        let r = pg.simple_query(&q).await.expect("explain olap join");
-        if let Some(ms) = parse_pg_exec_time(&r) {
-            pg_olap_join_ms.push(ms);
-        }
-    }
-    let pg_olap_join_p50 = median(&pg_olap_join_ms);
+    // ---- PG: 12 SaaS metrics + 3 OLAP metrics (extracted) ----------------
+    let pg_core = run_pg_core_suite(
+        &pg,
+        &schema,
+        target_id,
+        range_lo_ts,
+        range_hi_ts,
+        pagination_threshold,
+        olap_cutoff_ts,
+        delete_in_list.as_str(),
+    )
+    .await;
+    let pg_point_p50 = pg_core.point_p50;
+    let pg_point_p99 = pg_core.point_p99;
+    let pg_range_p50 = pg_core.range_p50;
+    let pg_range_p99 = pg_core.range_p99;
+    let pg_agg_p50 = pg_core.agg_p50;
+    let pg_join_p50 = pg_core.join_p50;
+    let pg_ilike_p50 = pg_core.ilike_p50;
+    let pg_page_p50 = pg_core.page_p50;
+    let pg_upd1_p50 = pg_core.upd1_p50;
+    let pg_bulk_upd_ms = pg_core.bulk_upd_ms;
+    let pg_delete_ms = pg_core.delete_ms;
+    let pg_count_p50 = pg_core.count_p50;
+    let pg_trunc_p50 = pg_core.trunc_p50;
+    let pg_olap_join_p50 = pg_core.olap_join_p50;
 
     // ---- Basin setup ------------------------------------------------------
     let instance = build_basin_engine().await;
@@ -638,11 +1259,16 @@ pub async fn run_full_compare(
         .await
         .unwrap();
     let with_clause = basin_format.with_clause();
+    // `last_login` is BIGINT and nullable so ~10% of rows can be NULL — that
+    // drives shape #25 (ORDER BY NULLS LAST + LIMIT). Basin stores all clock
+    // columns as seconds-since-epoch BIGINT, see the DATE_TRUNC note further
+    // down for why we don't use TIMESTAMPTZ here.
     sess.execute(&format!(
         "CREATE TABLE users (\
             id BIGINT NOT NULL, \
             email TEXT NOT NULL, \
-            created_at BIGINT NOT NULL){with_clause}"
+            created_at BIGINT NOT NULL, \
+            last_login BIGINT){with_clause}"
     ))
     .await
     .unwrap();
@@ -656,18 +1282,50 @@ pub async fn run_full_compare(
     ))
     .await
     .unwrap();
+    sess.execute(&format!(
+        "CREATE TABLE categories (\
+            id BIGINT NOT NULL, \
+            name TEXT NOT NULL, \
+            min_amt DOUBLE PRECISION NOT NULL, \
+            max_amt DOUBLE PRECISION NOT NULL){with_clause}"
+    ))
+    .await
+    .unwrap();
 
     // ---- Basin seed users -------------------------------------------------
+    // Mirrors the PG seed: `last_login` is NULL for every 10th row.
     {
-        let mut stmt = String::with_capacity(users * 70);
+        let mut stmt = String::with_capacity(users * 80);
         stmt.push_str("INSERT INTO users VALUES ");
         for i in 0..users as i64 {
             if i > 0 {
                 stmt.push(',');
             }
-            stmt.push_str(&format!("({i}, '{}', {})", email_for(i), EPOCH + i));
+            let last_login = if i % 10 == 0 {
+                "NULL".to_string()
+            } else {
+                (EPOCH + i + 100_000).to_string()
+            };
+            stmt.push_str(&format!(
+                "({i}, '{}', {}, {last_login})",
+                email_for(i),
+                EPOCH + i
+            ));
         }
         sess.execute(&stmt).await.expect("basin seed users");
+    }
+
+    // ---- Basin seed categories (same 5 buckets as PG) ---------------------
+    {
+        let mut stmt = String::new();
+        stmt.push_str("INSERT INTO categories VALUES ");
+        for (i, (id, name, lo, hi)) in cat_rows.iter().enumerate() {
+            if i > 0 {
+                stmt.push(',');
+            }
+            stmt.push_str(&format!("({id}, '{name}', {lo}, {hi})"));
+        }
+        sess.execute(&stmt).await.expect("basin seed categories");
     }
 
     // ---- Basin bulk INSERT N events ---------------------------------------
@@ -696,182 +1354,41 @@ pub async fn run_full_compare(
     }
     let basin_insert_ms = basin_insert_started.elapsed().as_secs_f64() * 1000.0;
 
-    // ---- Basin warm-up ----------------------------------------------------
-    let _ = sess
-        .execute(&format!("SELECT id FROM events WHERE id = {target_id}"))
-        .await;
+    // ---- Basin SaaS + OLAP measurements (extracted) -----------------------
+    // Pulled out into its own async fn for the same stack-budget reason as
+    // run_extended_suite — see BasinSaasOlapResults docs.
+    let basin_core = run_basin_core_suite(
+        &sess,
+        target_id,
+        range_lo_ts,
+        range_hi_ts,
+        pagination_threshold,
+        olap_cutoff_ts,
+        &delete_in_list,
+    )
+    .await;
+    let basin_point_p50 = basin_core.point_p50;
+    let basin_point_p99 = basin_core.point_p99;
+    let basin_range_p50 = basin_core.range_p50;
+    let basin_range_p99 = basin_core.range_p99;
+    let basin_agg_p50 = basin_core.agg_p50;
+    let basin_join_p50 = basin_core.join_p50;
+    let basin_ilike_p50 = basin_core.ilike_p50;
+    let basin_page_p50 = basin_core.page_p50;
+    let basin_upd1_p50 = basin_core.upd1_p50;
+    let basin_bulk_upd_ms = basin_core.bulk_upd_ms;
+    let basin_delete_ms = basin_core.delete_ms;
+    let basin_count_p50 = basin_core.count_p50;
+    let basin_trunc_p50 = basin_core.trunc_p50;
+    let basin_olap_join_p50 = basin_core.olap_join_p50;
 
-    // ---- Basin: 12 SaaS metrics -------------------------------------------
-    let mut basin_point_ms: Vec<f64> = Vec::with_capacity(7);
-    for _ in 0..7 {
-        basin_point_ms.push(
-            basin_timed(
-                &sess,
-                &format!(
-                    "SELECT id, user_id, amount, status, created_at \
-                     FROM events WHERE id = {target_id}"
-                ),
-                true,
-            )
-            .await,
-        );
-    }
-    let basin_point_p50 = median(&basin_point_ms);
-    let basin_point_p99 = percentile(&basin_point_ms, 99.0);
-
-    let mut basin_range_ms: Vec<f64> = Vec::with_capacity(7);
-    for _ in 0..7 {
-        basin_range_ms.push(
-            basin_timed(
-                &sess,
-                &format!(
-                    "SELECT id, user_id, amount FROM events \
-                     WHERE created_at BETWEEN {range_lo_ts} AND {range_hi_ts}"
-                ),
-                true,
-            )
-            .await,
-        );
-    }
-    let basin_range_p50 = median(&basin_range_ms);
-    let basin_range_p99 = percentile(&basin_range_ms, 99.0);
-
-    let mut basin_agg_ms: Vec<f64> = Vec::with_capacity(7);
-    for _ in 0..7 {
-        basin_agg_ms.push(
-            basin_timed(
-                &sess,
-                "SELECT user_id, COUNT(*), SUM(amount) FROM events \
-                 GROUP BY user_id ORDER BY 2 DESC LIMIT 10",
-                true,
-            )
-            .await,
-        );
-    }
-    let basin_agg_p50 = median(&basin_agg_ms);
-
-    let mut basin_join_ms: Vec<f64> = Vec::with_capacity(5);
-    for _ in 0..5 {
-        basin_join_ms.push(
-            basin_timed(
-                &sess,
-                "SELECT u.email, COUNT(e.id) FROM users u \
-                 JOIN events e ON e.user_id = u.id \
-                 GROUP BY u.email ORDER BY 2 DESC LIMIT 20",
-                true,
-            )
-            .await,
-        );
-    }
-    let basin_join_p50 = median(&basin_join_ms);
-
-    let mut basin_ilike_ms: Vec<f64> = Vec::with_capacity(5);
-    for _ in 0..5 {
-        basin_ilike_ms.push(
-            basin_timed(
-                &sess,
-                "SELECT id, email FROM users WHERE email ILIKE '%@gmail.com'",
-                true,
-            )
-            .await,
-        );
-    }
-    let basin_ilike_p50 = median(&basin_ilike_ms);
-
-    let mut basin_page_ms: Vec<f64> = Vec::with_capacity(5);
-    for _ in 0..5 {
-        basin_page_ms.push(
-            basin_timed(
-                &sess,
-                "SELECT id, amount, status, created_at FROM events \
-                 ORDER BY created_at DESC LIMIT 50 OFFSET 100",
-                true,
-            )
-            .await,
-        );
-    }
-    let basin_page_p50 = median(&basin_page_ms);
-
-    let mut basin_upd1_ms: Vec<f64> = Vec::with_capacity(5);
-    for i in 0..5 {
-        let uid = i as i64;
-        let new_email = format!("rotated{i}@example.org");
-        let q = format!("UPDATE users SET email = '{new_email}' WHERE id = {uid}");
-        let started = Instant::now();
-        sess.execute(&q).await.expect("basin single-row update");
-        basin_upd1_ms.push(started.elapsed().as_secs_f64() * 1000.0);
-    }
-    let basin_upd1_p50 = median(&basin_upd1_ms);
-
-    let basin_bulk_upd_ms: f64 = {
-        let started = Instant::now();
-        sess.execute(&format!(
-            "UPDATE events SET status = 'expired' WHERE created_at < {pagination_threshold}"
-        ))
-        .await
-        .expect("basin bulk update");
-        started.elapsed().as_secs_f64() * 1000.0
-    };
-
-    let basin_delete_ms: f64 = {
-        let started = Instant::now();
-        sess.execute(&format!(
-            "DELETE FROM events WHERE id IN ({delete_in_list})"
-        ))
-        .await
-        .expect("basin delete");
-        started.elapsed().as_secs_f64() * 1000.0
-    };
-
-    // ---- Basin OLAP (3) ---------------------------------------------------
-    let mut basin_count_ms: Vec<f64> = Vec::with_capacity(5);
-    for _ in 0..5 {
-        basin_count_ms.push(
-            basin_timed(&sess, "SELECT COUNT(*) FROM events", true).await,
-        );
-    }
-    let basin_count_p50 = median(&basin_count_ms);
-
-    // Basin stores `created_at` as BIGINT seconds-since-epoch (vs PG's
-    // TIMESTAMPTZ). Basin's `to_timestamp(numeric)` 1-arg form is gapped
-    // (v0.2 roadmap), so we bucket directly with integer division:
-    // `created_at / 86400` = days since unix epoch. Same group cardinality
-    // and same scan cost as PG's `DATE_TRUNC('day', created_at)` over the
-    // synthetic clock (1 second per row, EPOCH = 2023-11-14), so the
-    // measurement is apples-to-apples on the substrate axis. When the
-    // 1-arg `to_timestamp` lands this can flip to `DATE_TRUNC('day',
-    // to_timestamp(created_at))` without changing the timing story.
-    let mut basin_trunc_ms: Vec<f64> = Vec::with_capacity(5);
-    for _ in 0..5 {
-        basin_trunc_ms.push(
-            basin_timed(
-                &sess,
-                "SELECT created_at / 86400 AS day_bucket, \
-                        SUM(amount) FROM events GROUP BY 1 ORDER BY 1",
-                true,
-            )
-            .await,
-        );
-    }
-    let basin_trunc_p50 = median(&basin_trunc_ms);
-
-    let mut basin_olap_join_ms: Vec<f64> = Vec::with_capacity(5);
-    for _ in 0..5 {
-        basin_olap_join_ms.push(
-            basin_timed(
-                &sess,
-                &format!(
-                    "SELECT u.email, SUM(e.amount) FROM users u \
-                     JOIN events e ON e.user_id = u.id \
-                     WHERE e.created_at > {olap_cutoff_ts} \
-                     GROUP BY u.email ORDER BY 2 DESC LIMIT 10"
-                ),
-                true,
-            )
-            .await,
-        );
-    }
-    let basin_olap_join_p50 = median(&basin_olap_join_ms);
+    // =======================================================================
+    // Extended-shape suite (#16-#27) — 12 perf-coverage probes.
+    // Extracted into its own async fn so the outer state machine stays small
+    // (a flat block here would balloon `run_full_compare` past tokio's
+    // default 2 MiB worker-thread stack budget — see ExtendedResults).
+    // =======================================================================
+    let ext = run_extended_suite(&pg, &sess, &schema).await;
 
     // ---- Cold-start first query -------------------------------------------
     let pg_cold_ms = {
@@ -979,6 +1496,34 @@ pub async fn run_full_compare(
     row("date_trunc_groupby_p50_ms", basin_trunc_p50, pg_trunc_p50);
     row("analytics_join_p50_ms", basin_olap_join_p50, pg_olap_join_p50);
 
+    // Extended-shape rows: print the value if Basin succeeded, else "GAP".
+    let row_opt = |label: &str, b: Option<f64>, p: f64| {
+        match b {
+            Some(bv) => println!(
+                "{label:>34} {:>14.3} {:>14.3} {:>16}",
+                bv,
+                p,
+                format!("{:.2}x", p / bv.max(1e-9))
+            ),
+            None => println!(
+                "{label:>34} {:>14} {:>14.3} {:>16}",
+                "GAP", p, "-"
+            ),
+        }
+    };
+    row_opt("count_distinct_p50_ms", ext.count_distinct.0, ext.count_distinct.1);
+    row_opt("like_prefix_p50_ms", ext.like_prefix.0, ext.like_prefix.1);
+    row_opt("groupby_having_p50_ms", ext.groupby_having.0, ext.groupby_having.1);
+    row_opt("window_lag_p50_ms", ext.window_lag.0, ext.window_lag.1);
+    row_opt("recursive_cte_fib30_p50_ms", ext.recursive_cte.0, ext.recursive_cte.1);
+    row_opt("correlated_subq_p50_ms", ext.correlated_sub.0, ext.correlated_sub.1);
+    row_opt("exists_in_where_p50_ms", ext.exists_in_where.0, ext.exists_in_where.1);
+    row_opt("join_3table_between_p50_ms", ext.join3_between.0, ext.join3_between.1);
+    row_opt("union_all_p50_ms", ext.union_all.0, ext.union_all.1);
+    row_opt("order_by_nulls_last_p50_ms", ext.order_nulls_last.0, ext.order_nulls_last.1);
+    row_opt("top_n_per_group_p50_ms", ext.top_n_per_group.0, ext.top_n_per_group.1);
+    row_opt("numeric_range_p50_ms", ext.numeric_range.0, ext.numeric_range.1);
+
     // ---- Emit benchmark JSON ----------------------------------------------
     let basin_disk_f = basin_disk_bytes as f64;
     let pg_disk_f = pg_disk_bytes as f64;
@@ -1002,6 +1547,50 @@ pub async fn run_full_compare(
     let olap_label = format!(
         "Analytics JOIN+WHERE (last {olap_window}s window)"
     );
+
+    // mk_ext: extended-shape variant. If Basin succeeded → normal row.
+    // If Basin errored (Option::None) → label gets a "(basin gap)" suffix,
+    // basin field is -1.0 (JSON-safe sentinel; the dashboard renderer can
+    // skip ratio computation), and `better` is set to Postgres so the card
+    // visibly flags the gap. Postgres failure is mirrored with f64::INFINITY
+    // upstream and yields the same sentinel handling here.
+    let mk_ext = |label: &str, basin: Option<f64>, postgres: f64| -> CompareMetric {
+        match (basin, postgres.is_finite()) {
+            (Some(b), true) => CompareMetric {
+                label: label.into(),
+                basin: b,
+                postgres,
+                unit: "ms".into(),
+                better: which_wins(b, postgres),
+                ratio_text: Some(format!("pg / basin = {:.2}x", postgres / b.max(1e-9))),
+            },
+            (None, true) => CompareMetric {
+                label: format!("{label} (basin gap)"),
+                basin: -1.0,
+                postgres,
+                unit: "ms".into(),
+                better: WhichWins::Postgres,
+                ratio_text: Some("basin: unsupported".into()),
+            },
+            (Some(b), false) => CompareMetric {
+                label: format!("{label} (pg failed)"),
+                basin: b,
+                postgres: -1.0,
+                unit: "ms".into(),
+                better: WhichWins::Basin,
+                ratio_text: Some("postgres: failed".into()),
+            },
+            (None, false) => CompareMetric {
+                label: format!("{label} (both failed)"),
+                basin: -1.0,
+                postgres: -1.0,
+                unit: "ms".into(),
+                better: WhichWins::Tie,
+                ratio_text: Some("both: failed".into()),
+            },
+        }
+    };
+
     let metrics = vec![
         // On-disk
         mk("On-disk bytes (users + events)", basin_disk_f, pg_disk_f, "bytes", true),
@@ -1023,6 +1612,19 @@ pub async fn run_full_compare(
         mk("COUNT(*) full table p50", basin_count_p50, pg_count_p50, "ms", true),
         mk("DATE_TRUNC day + SUM GROUP BY p50", basin_trunc_p50, pg_trunc_p50, "ms", true),
         mk(&olap_label, basin_olap_join_p50, pg_olap_join_p50, "ms", true),
+        // Extended shapes (perf-coverage probes)
+        mk_ext("COUNT(DISTINCT user_id) p50", ext.count_distinct.0, ext.count_distinct.1),
+        mk_ext("LIKE 'pending%' prefix p50", ext.like_prefix.0, ext.like_prefix.1),
+        mk_ext("Multi-col GROUP BY + HAVING p50", ext.groupby_having.0, ext.groupby_having.1),
+        mk_ext("Window LAG OVER PARTITION p50", ext.window_lag.0, ext.window_lag.1),
+        mk_ext("Recursive CTE Fibonacci(30) p50", ext.recursive_cte.0, ext.recursive_cte.1),
+        mk_ext("Correlated subquery in SELECT p50", ext.correlated_sub.0, ext.correlated_sub.1),
+        mk_ext("EXISTS in WHERE p50", ext.exists_in_where.0, ext.exists_in_where.1),
+        mk_ext("3-table JOIN BETWEEN p50", ext.join3_between.0, ext.join3_between.1),
+        mk_ext("UNION ALL two scans p50", ext.union_all.0, ext.union_all.1),
+        mk_ext("ORDER BY NULLS LAST + LIMIT p50", ext.order_nulls_last.0, ext.order_nulls_last.1),
+        mk_ext("Top-N per group (MAX) p50", ext.top_n_per_group.0, ext.top_n_per_group.1),
+        mk_ext("Numeric range BETWEEN p50", ext.numeric_range.0, ext.numeric_range.1),
     ];
 
     report_postgres_compare(id, name, claim, true, metrics, None);
