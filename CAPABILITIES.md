@@ -4,11 +4,21 @@ Honest, public-facing description of what Basin does today, what's planned,
 and what's not on the roadmap. If you're evaluating Basin for a real
 workload, this is the right page to read first.
 
-Cross-references: [`TASK.md`](./TASK.md) is the full Phase 0–7 core-DB
-build plan, [`WEDGE.md`](./WEDGE.md) is the prioritized next-six-months
-slice, [`docs/deployment.md`](./docs/deployment.md) is the production
-deployment architecture guide, [`docs/decisions/`](./docs/decisions/)
-records every "no" with the trigger that would change our mind.
+Cross-references: [`docs/V0_1_SCOPE.md`](./docs/V0_1_SCOPE.md) is the
+v0.1 cut-off (what ships in v0.1, what's parked, unparking triggers),
+[`TASK.md`](./TASK.md) is the full Phase 0–7 core-DB build plan,
+[`WEDGE.md`](./WEDGE.md) is the prioritized next-six-months slice,
+[`docs/deployment.md`](./docs/deployment.md) is the production deployment
+architecture guide, [`docs/decisions/`](./docs/decisions/) records every
+"no" with the trigger that would change our mind.
+
+> **v0.1 scope status.** Every row below carries a per-feature status (✅ /
+> 🛠 / ◻️ / 🚫). For the higher-order question — "is this on the v0.1 cut
+> path or PARKED for v0.2+?" — read [`docs/V0_1_SCOPE.md`](./docs/V0_1_SCOPE.md).
+> Crates flagged as frozen (basin-geo, basin-trgm, basin-cron, basin-net,
+> basin-fn, basin-webhooks) and features flagged as maintenance-mode
+> (basin-realtime extensions, FTS expansion, citext rewrite, etc.) are
+> stable but receive no further v0.1 investment.
 
 **Get started:** [5-Minute Docker Quickstart](./docs/quickstart-docker.md) · [Getting Started / Tutorial](./docs/tutorial.md) · [Multi-tenant SaaS sample app](./examples/saas-starter/) · [AI/RAG sample app](./examples/ai-rag-app/)
 

@@ -30,6 +30,8 @@
 > or contribute. The OLTP write path is architecturally slow until the
 > hot-tier UPDATE/DELETE routes finish landing (see [Status](#status) and
 > [ADR 0016](./docs/decisions/0016-htap-hot-tier-architecture.md)).
+>
+> See [`docs/V0_1_SCOPE.md`](./docs/V0_1_SCOPE.md) for the v0.1 cut-off — required items, what's shipped, and what's parked.
 
 ---
 
