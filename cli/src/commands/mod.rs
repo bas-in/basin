@@ -60,6 +60,7 @@ pub mod status;
 pub mod storage;
 pub mod tables;
 pub mod tokens;
+pub mod tx;
 pub mod transfers;
 pub mod unlink;
 pub mod version;
@@ -147,6 +148,11 @@ pub fn all() -> Vec<Entry> {
             unlink::cmd_unlink
         ),
         entry!("sql", "Run a SQL query against a project.", sql::cmd_sql),
+        entry!(
+            "tx",
+            "Open an interactive transaction REPL (begin/commit/rollback).",
+            tx::cmd_tx
+        ),
         entry!(
             "dump",
             "Export a project's schema + data (pg_dump-shaped, plain or custom format).",

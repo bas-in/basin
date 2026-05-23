@@ -35,6 +35,7 @@ COMMANDS
   status           Show the linked project + migration drift summary.
   unlink           Remove the project binding from ./basin/config.toml.
   sql              Run a SQL query against a project.
+  tx               Open an interactive transaction REPL (begin/commit/rollback).
   dump             Export a project's schema + data (pg_dump-shaped, plain or custom format).
   restore          Replay a dump file into a project (inverse of `basin dump`).
   migrate-from-pg  Guided Postgres → Basin migration with --dry-run + --resume (T27.1).
