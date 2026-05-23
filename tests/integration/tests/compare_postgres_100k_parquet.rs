@@ -1,32 +1,14 @@
-//! Compare Basin vs Postgres 18 at 100k rows — typical SaaS / OLTP working-set size.
+//! Parquet variant of `compare_postgres_100k.rs` — Basin pinned to
+//! `basin.file_format='parquet'` for the 100k-row SaaS / OLTP workload, so
+//! the dashboard renders BOTH Basin storage modes (Vortex default vs
+//! Parquet legacy / read-compat option) head-to-head against PG 18.
 //!
-//! The sibling test `compare_postgres.rs` measures at 1M rows on an audit-log
-//! shape (3 columns). This one targets the much more common SaaS/OLTP working
-//! set: 100k rows split across two tables (users + events) with a richer
-//! workload that includes joins, ILIKE, pagination, single-row + bulk DML,
-//! and DELETE. At this scale the picture shifts compared to the 1M card —
-//! e.g. Basin's bulk-INSERT overhead amortises differently, and PG's heap
-//! benefits from being able to fit hot pages in shared_buffers.
+//! Same query suite, same shape of card, same fairness rules. The ONLY
+//! difference is the `WITH (basin.file_format='parquet')` on each CREATE
+//! TABLE and the report id / name so the cards live side-by-side.
 //!
-//! Skips cleanly if no local Postgres is reachable (emits an
-//! `available: false` card so the dashboard renders a "PG offline" tile).
-//!
-//! Cleanup: a `Drop` guard on the schema removes the test schema even on
-//! panic. We also drop it explicitly at the end on the live connection.
-//!
-//! Query suite:
-//!   (1)  Point query              — WHERE id = ?
-//!   (2)  Range scan (~1 000 rows) — WHERE created_at BETWEEN ? AND ?
-//!   (3)  Aggregate GROUP BY       — SUM/COUNT GROUP BY user_id ORDER BY 2 DESC LIMIT 10
-//!   (4)  Join (2-table)           — users JOIN events GROUP BY email
-//!   (5)  ILIKE pattern            — WHERE email ILIKE '%@gmail.com'
-//!   (6)  ORDER BY LIMIT/OFFSET    — pagination, LIMIT 50 OFFSET 100
-//!   (7)  Bulk INSERT 100k         — batched multi-row VALUES
-//!   (8)  Cold-start first query   — fresh engine, first query latency
-//!   (9)  On-disk bytes            — storage footprint after writes
-//!   (10) Single-row UPDATE        — UPDATE users SET email = ? WHERE id = ?
-//!   (11) Bulk UPDATE              — UPDATE events SET status = ? WHERE created_at < ?
-//!   (12) DELETE WHERE IN (...)    — DELETE FROM events WHERE id IN (10-row list)
+//! See `compare_postgres_100k.rs` for the full doc on the suite of 12
+//! queries, the schema-drop guard, and the bench-card contract.
 
 #![allow(clippy::print_stdout)]
 
@@ -44,8 +26,6 @@ use tokio_postgres::{Client, NoTls};
 const ROWS: usize = 100_000;
 const INSERT_BATCH: usize = 5_000;
 
-/// Deterministic synthetic email for row `i`. ~10% land in `@gmail.com` so the
-/// ILIKE selectivity is meaningful but not the whole table.
 fn email_for(i: i64) -> String {
     let domain = match i % 10 {
         0 => "gmail.com",
@@ -62,7 +42,6 @@ fn email_for(i: i64) -> String {
     format!("user{:08}@{}", i, domain)
 }
 
-/// Deterministic synthetic status per event row.
 fn status_for(i: i64) -> &'static str {
     match i % 4 {
         0 => "pending",
@@ -72,16 +51,10 @@ fn status_for(i: i64) -> &'static str {
     }
 }
 
-/// We use a synthetic clock starting at this epoch so ranges are easy to
-/// reason about without TZ surprises. `created_at` for row i is
-/// `EPOCH + i seconds`.
 const EPOCH: i64 = 1_700_000_000;
 
-/// Sum bytes of every Basin data file under `root`. Counts BOTH `.vortex`
-/// (the engine default, #161) AND `.parquet` (still emitted when a table
-/// pins `basin.file_format='parquet'`). See `compare_postgres.rs` for the
-/// long story on the Vortex flip and why the old `.parquet`-only counter
-/// silently reported zero.
+/// Dual-extension data-file size counter — see `compare_postgres.rs` for
+/// the long story on why this counts both `.vortex` and `.parquet`.
 fn dir_size_data(root: &std::path::Path) -> u64 {
     let mut total = 0u64;
     for entry in walkdir::WalkDir::new(root) {
@@ -115,7 +88,6 @@ fn median(samples: &[f64]) -> f64 {
     percentile(samples, 50.0)
 }
 
-/// RAII guard that drops the schema on Drop. Mirrors `compare_postgres.rs`.
 struct SchemaGuard {
     schema: String,
     conn_str: String,
@@ -241,8 +213,6 @@ async fn build_basin_engine() -> BasinInstance {
     }
 }
 
-/// Run a Basin query and return wall-clock elapsed ms. Asserts ≥1 result row
-/// when `expect_rows` is true.
 async fn basin_timed(
     sess: &basin_engine::ProjectSession,
     sql: &str,
@@ -261,17 +231,17 @@ async fn basin_timed(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn scaling_5_compare_postgres_100k() {
+async fn scaling_5_compare_postgres_100k_parquet() {
     let (pg, conn_str) = match try_connect().await {
         Some(v) => v,
         None => {
-            println!("[COMPARE 100k] postgres unavailable: skipping head-to-head");
+            println!("[COMPARE 100k / PARQUET] postgres unavailable: skipping head-to-head");
             report_postgres_compare(
-                "postgres_100k",
-                "Basin vs Postgres 18 (100k-row SaaS workload, no index)",
-                "At typical SaaS / OLTP scale (100k rows), Basin matches PG on selective \
-                 reads, wins on aggregates over columnar storage, and pays a write tax \
-                 it can amortise. Run measures joins, ILIKE, pagination, and bulk DML.",
+                "postgres_100k_parquet",
+                "Basin (Parquet) vs Postgres 18 (100k-row SaaS workload, no index)",
+                "Same 100k-row SaaS workload as the Vortex card, but Basin is pinned to \
+                 basin.file_format='parquet' so the dashboard can show both Basin storage \
+                 modes side-by-side against PG.",
                 false,
                 vec![],
                 Some("postgres unavailable on 127.0.0.1:5432"),
@@ -281,7 +251,7 @@ async fn scaling_5_compare_postgres_100k() {
     };
 
     let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
-    let schema = format!("basin_compare100k_{suffix}");
+    let schema = format!("basin_compare100kpq_{suffix}");
     let _guard = SchemaGuard {
         schema: schema.clone(),
         conn_str: conn_str.clone(),
@@ -290,7 +260,6 @@ async fn scaling_5_compare_postgres_100k() {
     pg.simple_query(&format!("CREATE SCHEMA {schema}"))
         .await
         .expect("create schema");
-    // Two-table SaaS shape, no indexes — same fairness rule as the 1M card.
     pg.simple_query(&format!(
         "CREATE TABLE {schema}.users (\
             id BIGINT PRIMARY KEY, \
@@ -309,8 +278,6 @@ async fn scaling_5_compare_postgres_100k() {
     ))
     .await
     .expect("pg create events");
-    // PG creates a PK index automatically; drop them so we measure heap-only
-    // performance (the 1M test uses tables without PKs for the same reason).
     pg.simple_query(&format!(
         "ALTER TABLE {schema}.users DROP CONSTRAINT users_pkey"
     ))
@@ -322,11 +289,10 @@ async fn scaling_5_compare_postgres_100k() {
     .await
     .expect("drop events pkey");
 
-    // 10k users, 100k events (10 events per user on average).
     const USERS: usize = 10_000;
     let user_count = USERS as i64;
 
-    // ---- PG seed users (one batch) -----------------------------------------
+    // ---- PG seed users -----------------------------------------------------
     {
         let mut stmt = String::with_capacity(USERS * 80);
         stmt.push_str(&format!(
@@ -371,7 +337,7 @@ async fn scaling_5_compare_postgres_100k() {
     }
     let pg_insert_ms = pg_insert_started.elapsed().as_secs_f64() * 1000.0;
 
-    // ---- PG disk size (users + events combined) ----------------------------
+    // ---- PG disk size ------------------------------------------------------
     let pg_disk_bytes: i64 = {
         let row = pg
             .query_one(
@@ -386,14 +352,9 @@ async fn scaling_5_compare_postgres_100k() {
         row.get::<_, i64>(0)
     };
 
-    // ---- PG warm-up (page cache, plan cache) -------------------------------
-    // Important: the first query against any table on a cold PG runs the
-    // sequential scan from disk. We do one warm-up of each shape so the
-    // measurement reflects steady-state working-set behaviour (which is what
-    // a real OLTP workload sees), not file-system cold reads.
     let target_id: i64 = (ROWS as i64) / 2 + 7;
     let range_lo_ts = EPOCH + (ROWS as i64) / 4;
-    let range_hi_ts = range_lo_ts + 1_000; // ~1 000 rows
+    let range_hi_ts = range_lo_ts + 1_000;
     let pagination_threshold = EPOCH + (ROWS as i64) / 3;
     let _ = pg
         .simple_query(&format!(
@@ -401,7 +362,7 @@ async fn scaling_5_compare_postgres_100k() {
         ))
         .await;
 
-    // ---- PG measure: point query -------------------------------------------
+    // ---- PG measure: point query ------------------------------------------
     let mut pg_point_ms: Vec<f64> = Vec::with_capacity(7);
     for _ in 0..7 {
         let q = format!(
@@ -415,7 +376,7 @@ async fn scaling_5_compare_postgres_100k() {
     let pg_point_p50 = median(&pg_point_ms);
     let pg_point_p99 = percentile(&pg_point_ms, 99.0);
 
-    // ---- PG measure: range scan (~1 000 rows by created_at) ----------------
+    // ---- PG measure: range scan -------------------------------------------
     let mut pg_range_ms: Vec<f64> = Vec::with_capacity(7);
     for _ in 0..7 {
         let q = format!(
@@ -430,7 +391,7 @@ async fn scaling_5_compare_postgres_100k() {
     let pg_range_p50 = median(&pg_range_ms);
     let pg_range_p99 = percentile(&pg_range_ms, 99.0);
 
-    // ---- PG measure: aggregate GROUP BY ------------------------------------
+    // ---- PG measure: aggregate --------------------------------------------
     let mut pg_agg_ms: Vec<f64> = Vec::with_capacity(7);
     for _ in 0..7 {
         let q = format!(
@@ -444,7 +405,7 @@ async fn scaling_5_compare_postgres_100k() {
     }
     let pg_agg_p50 = median(&pg_agg_ms);
 
-    // ---- PG measure: 2-table JOIN ------------------------------------------
+    // ---- PG measure: 2-table JOIN -----------------------------------------
     let mut pg_join_ms: Vec<f64> = Vec::with_capacity(5);
     for _ in 0..5 {
         let q = format!(
@@ -459,7 +420,7 @@ async fn scaling_5_compare_postgres_100k() {
     }
     let pg_join_p50 = median(&pg_join_ms);
 
-    // ---- PG measure: ILIKE pattern -----------------------------------------
+    // ---- PG measure: ILIKE pattern ----------------------------------------
     let mut pg_ilike_ms: Vec<f64> = Vec::with_capacity(5);
     for _ in 0..5 {
         let q = format!(
@@ -473,7 +434,7 @@ async fn scaling_5_compare_postgres_100k() {
     }
     let pg_ilike_p50 = median(&pg_ilike_ms);
 
-    // ---- PG measure: pagination ORDER BY created_at DESC LIMIT 50 OFFSET 100
+    // ---- PG measure: pagination -------------------------------------------
     let mut pg_page_ms: Vec<f64> = Vec::with_capacity(5);
     for _ in 0..5 {
         let q = format!(
@@ -487,7 +448,7 @@ async fn scaling_5_compare_postgres_100k() {
     }
     let pg_page_p50 = median(&pg_page_ms);
 
-    // ---- PG measure: single-row UPDATE -------------------------------------
+    // ---- PG measure: single-row UPDATE ------------------------------------
     let mut pg_upd1_ms: Vec<f64> = Vec::with_capacity(5);
     for i in 0..5 {
         let uid = i as i64;
@@ -503,7 +464,7 @@ async fn scaling_5_compare_postgres_100k() {
     }
     let pg_upd1_p50 = median(&pg_upd1_ms);
 
-    // ---- PG measure: bulk UPDATE (~rows older than threshold → 1 of 4 status)
+    // ---- PG measure: bulk UPDATE ------------------------------------------
     let pg_bulk_upd_ms: f64 = {
         let started = Instant::now();
         pg.simple_query(&format!(
@@ -515,7 +476,7 @@ async fn scaling_5_compare_postgres_100k() {
         started.elapsed().as_secs_f64() * 1000.0
     };
 
-    // ---- PG measure: DELETE WHERE IN (10 ids) ------------------------------
+    // ---- PG measure: DELETE WHERE IN --------------------------------------
     let delete_ids: Vec<i64> = (0..10).map(|k| (ROWS as i64) - 1 - k).collect();
     let delete_in_list = delete_ids
         .iter()
@@ -532,7 +493,7 @@ async fn scaling_5_compare_postgres_100k() {
         started.elapsed().as_secs_f64() * 1000.0
     };
 
-    // ---- Basin setup --------------------------------------------------------
+    // ---- Basin setup (Parquet-pinned) --------------------------------------
     let instance = build_basin_engine().await;
     let sess = instance
         .engine
@@ -543,7 +504,8 @@ async fn scaling_5_compare_postgres_100k() {
         "CREATE TABLE users (\
             id BIGINT NOT NULL, \
             email TEXT NOT NULL, \
-            created_at BIGINT NOT NULL)",
+            created_at BIGINT NOT NULL) \
+         WITH (basin.file_format='parquet')",
     )
     .await
     .unwrap();
@@ -553,17 +515,13 @@ async fn scaling_5_compare_postgres_100k() {
             user_id BIGINT NOT NULL, \
             amount DOUBLE PRECISION NOT NULL, \
             status TEXT NOT NULL, \
-            created_at BIGINT NOT NULL)",
+            created_at BIGINT NOT NULL) \
+         WITH (basin.file_format='parquet')",
     )
     .await
     .unwrap();
 
-    // Basin uses BIGINT seconds-since-epoch for created_at instead of
-    // TIMESTAMPTZ — the dashboard cares about wall-clock perf, not the
-    // PG-wire timestamp encoding overhead. (PG stores TIMESTAMPTZ as int8
-    // microseconds internally, so the bit-budget is identical.)
-
-    // ---- Basin seed users ---------------------------------------------------
+    // ---- Basin seed users -------------------------------------------------
     {
         let mut stmt = String::with_capacity(USERS * 70);
         stmt.push_str("INSERT INTO users VALUES ");
@@ -576,7 +534,7 @@ async fn scaling_5_compare_postgres_100k() {
         sess.execute(&stmt).await.expect("basin seed users");
     }
 
-    // ---- Basin bulk INSERT 100k events --------------------------------------
+    // ---- Basin bulk INSERT 100k events ------------------------------------
     let basin_insert_started = Instant::now();
     let mut row_idx: i64 = 0;
     while (row_idx as usize) < ROWS {
@@ -600,12 +558,12 @@ async fn scaling_5_compare_postgres_100k() {
     }
     let basin_insert_ms = basin_insert_started.elapsed().as_secs_f64() * 1000.0;
 
-    // ---- Basin warm-up (DataFusion plan cache, parquet open) ---------------
+    // ---- Basin warm-up ----------------------------------------------------
     let _ = sess
         .execute(&format!("SELECT id FROM events WHERE id = {target_id}"))
         .await;
 
-    // ---- Basin measure: point query ----------------------------------------
+    // ---- Basin measure: point query ---------------------------------------
     let mut basin_point_ms: Vec<f64> = Vec::with_capacity(7);
     for _ in 0..7 {
         basin_point_ms.push(
@@ -623,7 +581,7 @@ async fn scaling_5_compare_postgres_100k() {
     let basin_point_p50 = median(&basin_point_ms);
     let basin_point_p99 = percentile(&basin_point_ms, 99.0);
 
-    // ---- Basin measure: range scan -----------------------------------------
+    // ---- Basin measure: range scan ----------------------------------------
     let mut basin_range_ms: Vec<f64> = Vec::with_capacity(7);
     for _ in 0..7 {
         basin_range_ms.push(
@@ -641,7 +599,7 @@ async fn scaling_5_compare_postgres_100k() {
     let basin_range_p50 = median(&basin_range_ms);
     let basin_range_p99 = percentile(&basin_range_ms, 99.0);
 
-    // ---- Basin measure: aggregate GROUP BY ---------------------------------
+    // ---- Basin measure: aggregate -----------------------------------------
     let mut basin_agg_ms: Vec<f64> = Vec::with_capacity(7);
     for _ in 0..7 {
         basin_agg_ms.push(
@@ -656,7 +614,7 @@ async fn scaling_5_compare_postgres_100k() {
     }
     let basin_agg_p50 = median(&basin_agg_ms);
 
-    // ---- Basin measure: 2-table JOIN ---------------------------------------
+    // ---- Basin measure: JOIN ----------------------------------------------
     let mut basin_join_ms: Vec<f64> = Vec::with_capacity(5);
     for _ in 0..5 {
         basin_join_ms.push(
@@ -672,7 +630,7 @@ async fn scaling_5_compare_postgres_100k() {
     }
     let basin_join_p50 = median(&basin_join_ms);
 
-    // ---- Basin measure: ILIKE pattern --------------------------------------
+    // ---- Basin measure: ILIKE ---------------------------------------------
     let mut basin_ilike_ms: Vec<f64> = Vec::with_capacity(5);
     for _ in 0..5 {
         basin_ilike_ms.push(
@@ -686,7 +644,7 @@ async fn scaling_5_compare_postgres_100k() {
     }
     let basin_ilike_p50 = median(&basin_ilike_ms);
 
-    // ---- Basin measure: pagination -----------------------------------------
+    // ---- Basin measure: pagination ----------------------------------------
     let mut basin_page_ms: Vec<f64> = Vec::with_capacity(5);
     for _ in 0..5 {
         basin_page_ms.push(
@@ -701,7 +659,7 @@ async fn scaling_5_compare_postgres_100k() {
     }
     let basin_page_p50 = median(&basin_page_ms);
 
-    // ---- Basin measure: single-row UPDATE ----------------------------------
+    // ---- Basin measure: single-row UPDATE ---------------------------------
     let mut basin_upd1_ms: Vec<f64> = Vec::with_capacity(5);
     for i in 0..5 {
         let uid = i as i64;
@@ -713,7 +671,7 @@ async fn scaling_5_compare_postgres_100k() {
     }
     let basin_upd1_p50 = median(&basin_upd1_ms);
 
-    // ---- Basin measure: bulk UPDATE ----------------------------------------
+    // ---- Basin measure: bulk UPDATE ---------------------------------------
     let basin_bulk_upd_ms: f64 = {
         let started = Instant::now();
         sess.execute(&format!(
@@ -724,7 +682,7 @@ async fn scaling_5_compare_postgres_100k() {
         started.elapsed().as_secs_f64() * 1000.0
     };
 
-    // ---- Basin measure: DELETE WHERE IN (10 ids) ---------------------------
+    // ---- Basin measure: DELETE WHERE IN -----------------------------------
     let basin_delete_ms: f64 = {
         let started = Instant::now();
         sess.execute(&format!(
@@ -769,7 +727,8 @@ async fn scaling_5_compare_postgres_100k() {
                     user_id BIGINT NOT NULL, \
                     amount DOUBLE PRECISION NOT NULL, \
                     status TEXT NOT NULL, \
-                    created_at BIGINT NOT NULL)",
+                    created_at BIGINT NOT NULL) \
+                 WITH (basin.file_format='parquet')",
             )
             .await
             .unwrap();
@@ -794,19 +753,26 @@ async fn scaling_5_compare_postgres_100k() {
         elapsed
     };
 
-    // Disk after writes have flushed to Parquet.
     let basin_disk_bytes = dir_size_data(instance.dir.path());
 
-    // ---- Print results table -----------------------------------------------
+    // ---- Print results table ----------------------------------------------
     let basin_mib = basin_disk_bytes as f64 / (1024.0 * 1024.0);
     let pg_mib = pg_disk_bytes as f64 / (1024.0 * 1024.0);
     let disk_ratio = pg_disk_bytes as f64 / basin_disk_bytes.max(1) as f64;
 
-    println!("\n[COMPARE 100k] Basin vs Postgres 18 — 100k-row SaaS workload (no index)");
-    println!("{:>34} {:>14} {:>14} {:>16}", "metric", "basin", "postgres", "pg/basin");
+    println!(
+        "\n[COMPARE 100k / PARQUET] Basin (Parquet) vs Postgres 18 — 100k-row SaaS workload"
+    );
+    println!(
+        "{:>34} {:>14} {:>14} {:>16}",
+        "metric", "basin(parquet)", "postgres", "pg/basin"
+    );
     println!(
         "{:>34} {:>12.2}MiB {:>12.2}MiB {:>16}",
-        "on_disk_bytes", basin_mib, pg_mib, format!("{:.2}x", disk_ratio)
+        "on_disk_bytes",
+        basin_mib,
+        pg_mib,
+        format!("{:.2}x", disk_ratio)
     );
     let row = |label: &str, b: f64, p: f64| {
         println!(
@@ -830,7 +796,7 @@ async fn scaling_5_compare_postgres_100k() {
     row("bulk_insert_100k_ms", basin_insert_ms, pg_insert_ms);
     row("cold_start_first_query_ms", basin_cold_ms, pg_cold_ms);
 
-    // ---- Emit benchmark JSON -----------------------------------------------
+    // ---- Emit benchmark JSON ----------------------------------------------
     let basin_disk_f = basin_disk_bytes as f64;
     let pg_disk_f = pg_disk_bytes as f64;
     let mk = |label: &str, basin: f64, postgres: f64, unit: &str, with_ratio: bool| -> CompareMetric {
@@ -866,12 +832,12 @@ async fn scaling_5_compare_postgres_100k() {
     ];
 
     report_postgres_compare(
-        "postgres_100k",
-        "Basin vs Postgres 18 (100k-row SaaS workload, no index)",
-        "At typical SaaS / OLTP scale (100k rows split across users + events), Basin's \
-         columnar substrate matches or beats Postgres heap on reads (point, range, \
-         aggregate, JOIN, ILIKE, pagination) and pays a per-INSERT tax on bulk writes. \
-         No indexes on either side — measures substrate, not btree machinery.",
+        "postgres_100k_parquet",
+        "Basin (Parquet) vs Postgres 18 (100k-row SaaS workload, no index)",
+        "Sibling of the Vortex 100k card: same SaaS workload (users + events, joins, ILIKE, \
+         pagination, bulk DML) but Basin is pinned to basin.file_format='parquet'. Shows how \
+         the legacy / Iceberg-read-compat Parquet path compares against both PG heap and the \
+         Vortex-default card.",
         true,
         metrics,
         None,
@@ -880,9 +846,6 @@ async fn scaling_5_compare_postgres_100k() {
     instance.bg.shutdown().await;
     instance.wal.close().await.unwrap();
 
-    // Clean up the PG schema explicitly on the live connection, then defuse
-    // the Drop-guard to avoid the re-entrant block_on/join deadlock the 1M
-    // bench documents.
     let _ = pg
         .simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
         .await;

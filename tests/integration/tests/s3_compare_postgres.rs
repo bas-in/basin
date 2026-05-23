@@ -326,7 +326,13 @@ async fn s3_compare_postgres() {
         let mut total = 0u64;
         while let Some(meta) = stream.next().await {
             match meta {
-                Ok(m) if m.location.as_ref().ends_with(".parquet") => {
+                // Count both `.vortex` (current default per #161) and
+                // `.parquet` (legacy / explicitly-pinned tables) so the
+                // figure stays right after the Vortex flip.
+                Ok(m) if {
+                    let loc = m.location.as_ref();
+                    loc.ends_with(".vortex") || loc.ends_with(".parquet")
+                } => {
                     total += m.size as u64;
                 }
                 Ok(_) => {}

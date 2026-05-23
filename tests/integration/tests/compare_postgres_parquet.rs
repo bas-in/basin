@@ -1,23 +1,15 @@
-//! Scaling test 5: head-to-head with a real Postgres 18.
+//! Parquet variant of `compare_postgres.rs` — Basin pinned to
+//! `basin.file_format='parquet'` so we can compare BOTH Basin storage modes
+//! (Vortex default vs Parquet legacy / read-compat option) head-to-head
+//! against a real Postgres 18.
 //!
-//! Claim: For wedge-shaped audit-log data, Basin uses dramatically less disk
-//! than Postgres and matches or beats it on selective queries (without an
-//! index — fair because we're comparing substrates, not Postgres's btree
-//! machinery).
+//! Same workload, same fairness rules, same shape of card; the ONLY
+//! difference is the `WITH (basin.file_format='parquet')` on CREATE TABLE
+//! and the report id / name so the dashboard renders both variants
+//! side-by-side as distinct cards.
 //!
-//! This test connects to a real PG server expected to be running on
-//! 127.0.0.1:5432. If unavailable, it prints a skip line and returns Ok —
-//! this is a best-effort calibration, not a hard CI gate.
-//!
-//! Cleanup: a `Drop` guard on the schema name drops the schema even on
-//! panic. We never leave PG state behind.
-//!
-//! Query suite:
-//!   (a) Point query  — SELECT * WHERE id = N
-//!   (b) Range scan   — SELECT * WHERE id BETWEEN lo AND hi  (~10 000 rows)
-//!   (c) Aggregate    — SELECT ts/1000000 AS bucket, COUNT(*), SUM(id) GROUP BY bucket
-//!   (d) Bulk INSERT  — throughput for 1 M rows
-//!   (e) Cold-start   — first-query latency after a fresh engine/session
+//! See `compare_postgres.rs` for the full doc on test layout, cleanup
+//! guard, the wedge-shape claim, and the per-query suite.
 
 #![allow(clippy::print_stdout)]
 
@@ -41,12 +33,8 @@ fn payload_for(i: i64) -> String {
     format!("payload-{:040}", i)
 }
 
-/// Sum bytes of every Basin data file under `root`. Counts BOTH `.vortex`
-/// (the engine default, #161) AND `.parquet` (the pre-Vortex default, still
-/// emitted when a table pins `basin.file_format='parquet'`) so a single
-/// helper works for both Vortex and Parquet bench variants. Older code that
-/// only matched `.parquet` reported `basin_disk_bytes = 0` after the Vortex
-/// default flipped — see this test's `compare_postgres_parquet.rs` sibling.
+/// Dual-extension data-file size counter — see `compare_postgres.rs` for
+/// the long story on why this counts both `.vortex` and `.parquet`.
 fn dir_size_data(root: &std::path::Path) -> u64 {
     let mut total = 0u64;
     for entry in walkdir::WalkDir::new(root) {
@@ -72,8 +60,7 @@ fn median(samples: &[f64]) -> f64 {
     s[s.len() / 2]
 }
 
-/// RAII guard that drops the schema on Drop. We also offer an explicit
-/// `cleanup()` to surface errors, but Drop is the safety net.
+/// RAII guard that drops the schema on Drop. See `compare_postgres.rs`.
 struct SchemaGuard {
     schema: String,
     conn_str: String,
@@ -81,17 +68,9 @@ struct SchemaGuard {
 
 impl Drop for SchemaGuard {
     fn drop(&mut self) {
-        // Best-effort sync drop. We open a fresh blocking task on the current
-        // runtime if available; failing that, we shell out to `psql` would
-        // require an extra dep. Use `tokio::runtime::Handle` if present.
         let conn_str = self.conn_str.clone();
         let schema = self.schema.clone();
-        // Spawn a detached task on the current handle if there is one. If we
-        // are dropped after the runtime has shut down, this becomes a no-op
-        // and the schema may linger — but in practice the test always drops
-        // the guard before the runtime exits.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            // Block on the cleanup so it actually runs before the test exits.
             let _ = std::thread::spawn(move || {
                 handle.block_on(async move {
                     if let Ok((client, conn)) = tokio_postgres::connect(&conn_str, NoTls).await {
@@ -135,7 +114,6 @@ fn which_wins(basin: f64, postgres: f64) -> WhichWins {
     }
 }
 
-/// Parse "Execution Time: 12.345 ms" out of EXPLAIN ANALYZE TEXT output.
 fn parse_pg_exec_time(rows: &[tokio_postgres::SimpleQueryMessage]) -> Option<f64> {
     for m in rows {
         if let tokio_postgres::SimpleQueryMessage::Row(r) = m {
@@ -164,7 +142,10 @@ struct BasinInstance {
     _wal_dir: TempDir,
 }
 
-/// Build a fresh Basin engine backed by local-filesystem Parquet + WAL.
+/// Build a fresh Basin engine backed by local-filesystem object store + WAL.
+/// The format pin (Vortex vs Parquet) is selected per-table by the test via
+/// `WITH (basin.file_format='…')` on CREATE TABLE — same engine, same
+/// storage layer, just a different on-disk encoding for one table.
 async fn build_basin_engine() -> BasinInstance {
     let dir = TempDir::new().unwrap();
     let wal_dir = TempDir::new().unwrap();
@@ -210,15 +191,17 @@ async fn build_basin_engine() -> BasinInstance {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn scaling_5_compare_postgres() {
+async fn scaling_5_compare_postgres_parquet() {
     let (pg, conn_str) = match try_connect().await {
         Some(v) => v,
         None => {
-            println!("[SCALING 5] postgres unavailable: skipping head-to-head");
+            println!("[SCALING 5 / PARQUET] postgres unavailable: skipping head-to-head");
             report_postgres_compare(
-                "postgres",
-                "Basin vs Postgres 18 (no index, 1M rows)",
-                "On audit-log data, Basin uses much less disk than Postgres heap and matches or beats unindexed point queries.",
+                "postgres_parquet",
+                "Basin (Parquet) vs Postgres 18 (no index, 1M rows)",
+                "Same workload as the Vortex card, but Basin is pinned to \
+                 basin.file_format='parquet' so we can compare both Basin storage \
+                 modes against PG head-to-head.",
                 false,
                 vec![],
                 Some("postgres unavailable"),
@@ -227,9 +210,8 @@ async fn scaling_5_compare_postgres() {
         }
     };
 
-    // Unique schema per run via Ulid (already in deps via basin-common).
     let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
-    let schema = format!("basin_compare_{}", suffix);
+    let schema = format!("basin_compare_pq_{}", suffix);
     let _guard = SchemaGuard {
         schema: schema.clone(),
         conn_str: conn_str.clone(),
@@ -245,8 +227,6 @@ async fn scaling_5_compare_postgres() {
     .expect("create table");
 
     // ---- PG insert ---------------------------------------------------------
-    // Multi-row INSERT batched ROWS / INSERT_BATCH times. Simpler and reliable
-    // through tokio-postgres's simple_query path.
     let pg_insert_started = Instant::now();
     let mut row_idx: i64 = 0;
     while (row_idx as usize) < ROWS {
@@ -315,8 +295,7 @@ async fn scaling_5_compare_postgres() {
     );
     let pg_range_p50 = median(&pg_range_ms);
 
-    // ---- PG aggregate (COUNT + SUM with GROUP BY) --------------------------
-    // Group rows into 1 000-row buckets by ts/1_000_000 (~1 000 groups).
+    // ---- PG aggregate ------------------------------------------------------
     let mut pg_agg_ms: Vec<f64> = Vec::with_capacity(5);
     for _ in 0..5 {
         let q = format!(
@@ -333,15 +312,17 @@ async fn scaling_5_compare_postgres() {
     );
     let pg_agg_p50 = median(&pg_agg_ms);
 
-    // ---- Basin setup -------------------------------------------------------
+    // ---- Basin setup (Parquet-pinned) --------------------------------------
     let instance = build_basin_engine().await;
     let sess = instance
         .engine
         .open_session(instance.project)
         .await
         .unwrap();
+    // Pin Parquet via the WITH clause; same syntax used by perf_suite.rs.
     sess.execute(
-        "CREATE TABLE events (id BIGINT NOT NULL, ts BIGINT NOT NULL, payload TEXT NOT NULL)",
+        "CREATE TABLE events (id BIGINT NOT NULL, ts BIGINT NOT NULL, payload TEXT NOT NULL) \
+         WITH (basin.file_format='parquet')",
     )
     .await
     .unwrap();
@@ -366,7 +347,6 @@ async fn scaling_5_compare_postgres() {
 
     // ---- Basin point query -------------------------------------------------
     let mut basin_point_ms: Vec<f64> = Vec::with_capacity(5);
-    // Warm DataFusion once.
     let _ = sess
         .execute(&format!("SELECT id FROM events WHERE id = {target_id}"))
         .await
@@ -433,12 +413,8 @@ async fn scaling_5_compare_postgres() {
     }
     let basin_agg_p50 = median(&basin_agg_ms);
 
-    // ---- Basin cold-start first-query latency -----------------------------
-    // Build a brand-new engine+session (cold caches) and time the very first
-    // query — the one that triggers WAL-drain + Parquet open from disk.
+    // ---- Cold-start --------------------------------------------------------
     let pg_cold_ms = {
-        // For PG, cold start is a DISCARD ALL + fresh connection's first query.
-        // We use a fresh connection to approximate a cold server cache.
         let conn_str_cold = format!(
             "host=127.0.0.1 port=5432 user={} dbname=postgres",
             if conn_str.contains("user=pc") {
@@ -459,7 +435,7 @@ async fn scaling_5_compare_postgres() {
                 .await;
             cold_start.elapsed().as_secs_f64() * 1000.0
         } else {
-            pg_point_p50 // fallback: reuse warm p50 if fresh connect fails
+            pg_point_p50
         }
     };
 
@@ -468,11 +444,11 @@ async fn scaling_5_compare_postgres() {
         let cold_sess = cold.engine.open_session(cold.project).await.unwrap();
         cold_sess
             .execute(
-                "CREATE TABLE events (id BIGINT NOT NULL, ts BIGINT NOT NULL, payload TEXT NOT NULL)",
+                "CREATE TABLE events (id BIGINT NOT NULL, ts BIGINT NOT NULL, payload TEXT NOT NULL) \
+                 WITH (basin.file_format='parquet')",
             )
             .await
             .unwrap();
-        // Insert a small seed so there's something to read.
         cold_sess
             .execute(&format!(
                 "INSERT INTO events VALUES ({target_id}, {}, '{}')",
@@ -494,7 +470,6 @@ async fn scaling_5_compare_postgres() {
         elapsed
     };
 
-    // Disk measurement after SELECTs so compaction has flushed WAL to Parquet.
     let basin_disk_bytes = dir_size_data(instance.dir.path());
 
     // ---- Print results table -----------------------------------------------
@@ -507,51 +482,47 @@ async fn scaling_5_compare_postgres() {
     let cold_ratio = pg_cold_ms / basin_cold_ms.max(1e-9);
 
     println!(
-        "\n{:>30} {:>15} {:>15} {:>20}",
-        "metric", "basin", "postgres", "ratio (pg/basin)"
+        "\n[SCALING 5 / PARQUET] {:>30} {:>15} {:>15} {:>20}",
+        "metric", "basin(parquet)", "postgres", "ratio (pg/basin)"
     );
     println!(
-        "{:>30} {:>13.2}MiB {:>13.2}MiB {:>20}",
+        "{:>50} {:>13.2}MiB {:>13.2}MiB {:>20}",
         "on_disk_bytes",
         basin_mib,
         pg_mib,
         format!("{:.2}x", disk_ratio)
     );
     println!(
-        "{:>30} {:>15.0} {:>15.0} {:>20}",
+        "{:>50} {:>15.0} {:>15.0} {:>20}",
         "insert_1m_rows_ms", basin_insert_ms, pg_insert_ms, "-"
     );
     println!(
-        "{:>30} {:>15.2} {:>15.2} {:>20}",
+        "{:>50} {:>15.2} {:>15.2} {:>20}",
         "point_query_p50_ms",
         basin_point_p50,
         pg_point_p50,
         format!("{:.2}x", point_ratio)
     );
     println!(
-        "{:>30} {:>15.2} {:>15.2} {:>20}",
+        "{:>50} {:>15.2} {:>15.2} {:>20}",
         "range_scan_p50_ms",
         basin_range_p50,
         pg_range_p50,
         format!("{:.2}x", range_ratio)
     );
     println!(
-        "{:>30} {:>15.2} {:>15.2} {:>20}",
+        "{:>50} {:>15.2} {:>15.2} {:>20}",
         "aggregate_p50_ms",
         basin_agg_p50,
         pg_agg_p50,
         format!("{:.2}x", agg_ratio)
     );
     println!(
-        "{:>30} {:>15.2} {:>15.2} {:>20}",
+        "{:>50} {:>15.2} {:>15.2} {:>20}",
         "cold_start_first_query_ms",
         basin_cold_ms,
         pg_cold_ms,
         format!("{:.2}x", cold_ratio)
-    );
-    println!(
-        "\n[SCALING 5] disk {:.2}x smaller, point-query {:.2}x, range {:.2}x, agg {:.2}x (vs unindexed PG)",
-        disk_ratio, point_ratio, range_ratio, agg_ratio
     );
 
     // ---- Emit benchmark JSON -----------------------------------------------
@@ -609,235 +580,19 @@ async fn scaling_5_compare_postgres() {
     ];
 
     report_postgres_compare(
-        "postgres",
-        "Basin vs Postgres 18 (no index, 1M rows)",
-        "On audit-log data, Basin uses much less disk than Postgres heap and matches or beats unindexed queries across point, range, aggregate, and cold-start workloads.",
+        "postgres_parquet",
+        "Basin (Parquet) vs Postgres 18 (1M rows)",
+        "Sibling of the Vortex card: same audit-log shape and query suite, \
+         but Basin is pinned to basin.file_format='parquet'. Shows how the \
+         legacy / Iceberg-read-compat Parquet path compares against both PG \
+         heap and the Vortex-default card.",
         true,
         metrics,
         None,
     );
 
-    // Cleanly shut down background tasks.
     instance.bg.shutdown().await;
     instance.wal.close().await.unwrap();
 
-    // Drop the schema explicitly first; the guard remains as the safety net.
     drop(_guard);
-}
-
-/// Fast perf + correctness smoke vs local Postgres (10 000 rows, ~seconds).
-///
-/// Loop-able regression signal for the Vortex-default work: it HARD-ASSERTS
-/// result correctness against Postgres (point row, range COUNT/SUM, full
-/// COUNT/SUM) and PRINTS a Basin(Vortex)-vs-PG timing table for the common
-/// query shapes (point / range / aggregate). Perf is logged, not gated
-/// (environment-sensitive); only a catastrophic-regression guard is asserted.
-/// Skips cleanly when no local Postgres is reachable.
-#[tokio::test]
-async fn perf_smoke_pg_10k() {
-    const N: i64 = 10_000;
-    let (pg, conn_str) = match try_connect().await {
-        Some(v) => v,
-        None => {
-            println!("[PERF SMOKE] postgres unavailable on 127.0.0.1:5432 — skipping");
-            return;
-        }
-    };
-    let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
-    let schema = format!("basin_smoke_{suffix}");
-    let _guard = SchemaGuard {
-        schema: schema.clone(),
-        conn_str: conn_str.clone(),
-    };
-    pg.simple_query(&format!("CREATE SCHEMA {schema}"))
-        .await
-        .expect("pg create schema");
-    pg.simple_query(&format!(
-        "CREATE TABLE {schema}.events (id BIGINT, ts BIGINT, payload TEXT)"
-    ))
-    .await
-    .expect("pg create table");
-
-    // Seed both sides identically (single 10k batch).
-    let mut pg_vals = String::with_capacity(N as usize * 48);
-    let mut basin_vals = String::with_capacity(N as usize * 48);
-    for id in 0..N {
-        if id > 0 {
-            pg_vals.push(',');
-            basin_vals.push(',');
-        }
-        let tuple = format!("({id}, {}, '{}')", id * 1000, payload_for(id));
-        pg_vals.push_str(&tuple);
-        basin_vals.push_str(&tuple);
-    }
-    pg.simple_query(&format!(
-        "INSERT INTO {schema}.events (id, ts, payload) VALUES {pg_vals}"
-    ))
-    .await
-    .expect("pg seed");
-
-    let instance = build_basin_engine().await;
-    let sess = instance
-        .engine
-        .open_session(instance.project)
-        .await
-        .unwrap();
-    // No WITH clause → Vortex (the default under test).
-    sess.execute("CREATE TABLE events (id BIGINT NOT NULL, ts BIGINT NOT NULL, payload TEXT NOT NULL)")
-        .await
-        .unwrap();
-    sess.execute(&format!("INSERT INTO events VALUES {basin_vals}"))
-        .await
-        .expect("basin seed");
-
-    let target: i64 = N / 2 + 7;
-    let lo: i64 = N / 4;
-    let hi: i64 = lo + N / 2; // ~5 000-row range
-
-    // ---- Postgres reference values (correctness oracle) ----
-    let pg_i64 = |c: &tokio_postgres::Row, i: usize| c.get::<usize, i64>(i);
-    let pg_point: i64 = {
-        let r = pg
-            .query_one(
-                &format!("SELECT id FROM {schema}.events WHERE id = {target}"),
-                &[],
-            )
-            .await
-            .expect("pg point");
-        pg_i64(&r, 0)
-    };
-    let (pg_range_cnt, pg_range_sum): (i64, i64) = {
-        let r = pg
-            .query_one(
-                &format!(
-                    "SELECT COUNT(*)::bigint, COALESCE(SUM(id),0)::bigint \
-                     FROM {schema}.events WHERE id BETWEEN {lo} AND {hi}"
-                ),
-                &[],
-            )
-            .await
-            .expect("pg range");
-        (pg_i64(&r, 0), pg_i64(&r, 1))
-    };
-    let (pg_all_cnt, pg_all_sum): (i64, i64) = {
-        let r = pg
-            .query_one(
-                &format!("SELECT COUNT(*)::bigint, COALESCE(SUM(id),0)::bigint FROM {schema}.events"),
-                &[],
-            )
-            .await
-            .expect("pg all");
-        (pg_i64(&r, 0), pg_i64(&r, 1))
-    };
-
-    // ---- Basin extraction helpers ----
-    async fn basin_i64s(sess: &basin_engine::ProjectSession, sql: &str) -> Vec<Vec<i64>> {
-        match sess.execute(sql).await.unwrap() {
-            ExecResult::Rows { batches, .. } => {
-                let mut out = Vec::new();
-                for b in &batches {
-                    for row in 0..b.num_rows() {
-                        let mut cols = Vec::with_capacity(b.num_columns());
-                        for c in 0..b.num_columns() {
-                            let a = b
-                                .column(c)
-                                .as_any()
-                                .downcast_ref::<Int64Array>()
-                                .expect("basin smoke expects Int64 result columns");
-                            cols.push(a.value(row));
-                        }
-                        out.push(cols);
-                    }
-                }
-                out
-            }
-            other => panic!("expected rows, got {other:?}"),
-        }
-    }
-    async fn timed(
-        sess: &basin_engine::ProjectSession,
-        sql: String,
-    ) -> (f64, Vec<Vec<i64>>) {
-        let rows = basin_i64s(sess, &sql).await; // warm + result snapshot
-        let mut samples = Vec::with_capacity(3);
-        for _ in 0..3 {
-            let t = Instant::now();
-            let _ = basin_i64s(sess, &sql).await;
-            samples.push(t.elapsed().as_secs_f64() * 1000.0);
-        }
-        (median(&samples), rows)
-    }
-
-    // ---- Correctness (HARD asserts vs Postgres) ----
-    let (basin_point_ms, point_rows) = timed(
-        &sess,
-        format!("SELECT id FROM events WHERE id = {target}"),
-    )
-    .await;
-    assert_eq!(point_rows.len(), 1, "basin point query must return one row");
-    assert_eq!(
-        point_rows[0][0], pg_point,
-        "basin point id must equal postgres"
-    );
-
-    let (basin_range_ms, range_rows) = timed(
-        &sess,
-        format!(
-            "SELECT COUNT(*), SUM(id) FROM events WHERE id BETWEEN {lo} AND {hi}"
-        ),
-    )
-    .await;
-    assert_eq!(
-        range_rows[0][0], pg_range_cnt,
-        "basin range COUNT(*) must equal postgres"
-    );
-    assert_eq!(
-        range_rows[0][1], pg_range_sum,
-        "basin range SUM(id) must equal postgres"
-    );
-
-    let (basin_agg_ms, agg_rows) =
-        timed(&sess, "SELECT COUNT(*), SUM(id) FROM events".to_string()).await;
-    assert_eq!(
-        agg_rows[0][0], pg_all_cnt,
-        "basin full COUNT(*) must equal postgres"
-    );
-    assert_eq!(
-        agg_rows[0][1], pg_all_sum,
-        "basin full SUM(id) must equal postgres"
-    );
-
-    println!(
-        "\n[PERF SMOKE vs Postgres — Vortex default, {N} rows]\n\
-         {:<16}{:>14}\n\
-         {:<16}{:>13.2}ms\n\
-         {:<16}{:>13.2}ms\n\
-         {:<16}{:>13.2}ms\n\
-         (correctness vs Postgres: point/range/aggregate all verified equal)\n",
-        "query", "basin(vortex)",
-        "point", basin_point_ms,
-        "range(~5k)", basin_range_ms,
-        "aggregate(10k)", basin_agg_ms,
-    );
-
-    // Catastrophic-regression guard only (not a perf gate — env-sensitive).
-    assert!(
-        basin_point_ms < 1000.0,
-        "basin point query p50 {basin_point_ms:.1}ms — catastrophic regression"
-    );
-
-    // Clean up the PG schema explicitly on the live async connection,
-    // then DEFUSE the guard with `mem::forget`. `SchemaGuard::drop` does
-    // `thread::spawn(|| handle.block_on(..)).join()`, a re-entrant
-    // block_on + blocking join on a runtime worker that deadlocks under
-    // PG-lock contention — that is the post-print "freeze" this test hit.
-    // The explicit async drop here is the real cleanup; the guard's
-    // unsound Drop must never run for this test.
-    let _ = pg
-        .simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        .await;
-    std::mem::forget(_guard);
-
-    instance.bg.shutdown().await;
-    instance.wal.close().await.unwrap();
 }

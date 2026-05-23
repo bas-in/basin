@@ -159,13 +159,20 @@ async fn s3_project_deletion() {
         .try_collect()
         .await
         .unwrap();
-    let parquet_count = listed_before
+    // Count both `.vortex` (current default per #161) and `.parquet`
+    // (still emitted by tables that pin `basin.file_format='parquet'`) so
+    // the assertion stays correct regardless of which format the engine
+    // wrote — the test is exercising deletion, not format selection.
+    let data_count = listed_before
         .iter()
-        .filter(|m| m.location.as_ref().ends_with(".parquet"))
+        .filter(|m| {
+            let loc = m.location.as_ref();
+            loc.ends_with(".vortex") || loc.ends_with(".parquet")
+        })
         .count();
     assert_eq!(
-        parquet_count, FILES,
-        "expected {FILES} parquet files, found {parquet_count}"
+        data_count, FILES,
+        "expected {FILES} data files (.vortex|.parquet), found {data_count}"
     );
 
     // ---- Reset caches before the timed deletion pass ---------------------

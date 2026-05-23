@@ -42,6 +42,8 @@
     "lifecycle_ops",
     "postgres",
     "postgres_100k",
+    "postgres_parquet",
+    "postgres_100k_parquet",
     "server_lifecycle"
   ]
 }

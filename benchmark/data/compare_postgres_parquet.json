@@ -1,0 +1,57 @@
+{
+  "kind": "compare",
+  "id": "postgres_parquet",
+  "name": "Basin (Parquet) vs Postgres 18 (1M rows)",
+  "claim": "Sibling of the Vortex card: same audit-log shape and query suite, but Basin is pinned to basin.file_format='parquet'. Shows how the legacy / Iceberg-read-compat Parquet path compares against both PG heap and the Vortex-default card.",
+  "available": true,
+  "metrics": [
+    {
+      "label": "On-disk bytes",
+      "basin": 8095517.0,
+      "postgres": 101195776.0,
+      "unit": "bytes",
+      "better": "basin",
+      "ratio_text": "pg / basin = 12.50x"
+    },
+    {
+      "label": "Point query p50",
+      "basin": 0.29354199999999997,
+      "postgres": 13.699,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "pg / basin = 46.67x"
+    },
+    {
+      "label": "Range scan p50 (~10k rows)",
+      "basin": 0.21975,
+      "postgres": 17.283,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "pg / basin = 78.65x"
+    },
+    {
+      "label": "Aggregate COUNT/SUM GROUP BY p50",
+      "basin": 39.606875,
+      "postgres": 49.831,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "pg / basin = 1.26x"
+    },
+    {
+      "label": "Bulk INSERT 1M rows",
+      "basin": 17720.276833,
+      "postgres": 2202.192792,
+      "unit": "ms",
+      "better": "postgres"
+    },
+    {
+      "label": "Cold-start first query",
+      "basin": 2.582042,
+      "postgres": 37.801333,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "pg / basin = 14.64x"
+    }
+  ],
+  "generated_at": "@1779539478"
+}

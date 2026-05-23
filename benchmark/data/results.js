@@ -43,6 +43,9 @@ window.__BASIN_RESULTS = {
       "backup_cost",
       "lifecycle_ops",
       "postgres",
+      "postgres_100k",
+      "postgres_parquet",
+      "postgres_100k_parquet",
       "server_lifecycle"
     ]
   },
@@ -56,11 +59,11 @@ window.__BASIN_RESULTS = {
       "metrics": [
         {
           "label": "Backup wall time",
-          "basin": 0.000122667,
-          "postgres": 0.38366225,
+          "basin": 0.000255083,
+          "postgres": 0.417136458,
           "unit": "s",
           "better": "basin",
-          "ratio_text": "pg / basin = 3128x"
+          "ratio_text": "pg / basin = 1635x"
         },
         {
           "label": "Backup byte size",
@@ -71,7 +74,7 @@ window.__BASIN_RESULTS = {
           "ratio_text": "pg / basin = 7751x"
         }
       ],
-      "generated_at": "@1779497583"
+      "generated_at": "@1779505307"
     },
     "compare_lifecycle_ops": {
       "kind": "compare",
@@ -82,22 +85,22 @@ window.__BASIN_RESULTS = {
       "metrics": [
         {
           "label": "Project deletion (1 project, 100K rows)",
-          "basin": 6.1027499999999995,
-          "postgres": 70.632291,
+          "basin": 4.65175,
+          "postgres": 8.457416,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 11.57x"
+          "ratio_text": "pg / basin = 1.82x"
         },
         {
           "label": "ADD COLUMN on 100K rows",
-          "basin": 2.150167,
-          "postgres": 1.9674580000000002,
+          "basin": 0.8785839999999999,
+          "postgres": 2.8293749999999998,
           "unit": "ms",
-          "better": "postgres",
-          "ratio_text": "pg / basin = 0.92x"
+          "better": "basin",
+          "ratio_text": "pg / basin = 3.22x"
         }
       ],
-      "generated_at": "@1779497587"
+      "generated_at": "@1779505321"
     },
     "compare_postgres": {
       "kind": "compare",
@@ -108,53 +111,348 @@ window.__BASIN_RESULTS = {
       "metrics": [
         {
           "label": "On-disk bytes",
-          "basin": 0.0,
+          "basin": 940024.0,
           "postgres": 101195776.0,
           "unit": "bytes",
           "better": "basin",
-          "ratio_text": "pg / basin = 101195776.00x"
+          "ratio_text": "pg / basin = 107.65x"
         },
         {
           "label": "Point query p50",
-          "basin": 0.274375,
-          "postgres": 13.521,
+          "basin": 0.24925000000000003,
+          "postgres": 15.169,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 49.28x"
+          "ratio_text": "pg / basin = 60.86x"
         },
         {
           "label": "Range scan p50 (~10k rows)",
-          "basin": 0.307333,
-          "postgres": 18.525,
+          "basin": 0.29720799999999997,
+          "postgres": 17.883,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 60.28x"
+          "ratio_text": "pg / basin = 60.17x"
         },
         {
           "label": "Aggregate COUNT/SUM GROUP BY p50",
-          "basin": 14.417917000000001,
-          "postgres": 45.032,
+          "basin": 11.034041,
+          "postgres": 52.398,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 3.12x"
+          "ratio_text": "pg / basin = 4.75x"
         },
         {
           "label": "Bulk INSERT 1M rows",
-          "basin": 19730.907208,
-          "postgres": 6662.253709,
+          "basin": 17995.379166,
+          "postgres": 2278.653584,
           "unit": "ms",
           "better": "postgres"
         },
         {
           "label": "Cold-start first query",
-          "basin": 5.846083999999999,
-          "postgres": 66.891375,
+          "basin": 4.76775,
+          "postgres": 34.984458000000004,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 11.44x"
+          "ratio_text": "pg / basin = 7.34x"
         }
       ],
-      "generated_at": "@1779497622"
+      "generated_at": "@1779539364"
+    },
+    "compare_postgres_100k": {
+      "kind": "compare",
+      "id": "postgres_100k",
+      "name": "Basin vs Postgres 18 (100k-row SaaS workload, no index)",
+      "claim": "At typical SaaS / OLTP scale (100k rows split across users + events), Basin's columnar substrate matches or beats Postgres heap on reads (point, range, aggregate, JOIN, ILIKE, pagination) and pays a per-INSERT tax on bulk writes. No indexes on either side \u2014 measures substrate, not btree machinery.",
+      "available": true,
+      "metrics": [
+        {
+          "label": "On-disk bytes (users + events)",
+          "basin": 190192.0,
+          "postgres": 8036352.0,
+          "unit": "bytes",
+          "better": "basin",
+          "ratio_text": "pg / basin = 42.25x"
+        },
+        {
+          "label": "Point query p50",
+          "basin": 0.33116599999999996,
+          "postgres": 2.617,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 7.90x"
+        },
+        {
+          "label": "Point query p99",
+          "basin": 1.764334,
+          "postgres": 2.657,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 1.51x"
+        },
+        {
+          "label": "Range scan p50 (~1k rows)",
+          "basin": 0.514625,
+          "postgres": 5.454,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 10.60x"
+        },
+        {
+          "label": "Range scan p99",
+          "basin": 1.726708,
+          "postgres": 5.582,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 3.23x"
+        },
+        {
+          "label": "Aggregate GROUP BY user_id p50",
+          "basin": 2.569709,
+          "postgres": 13.465,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 5.24x"
+        },
+        {
+          "label": "2-table JOIN GROUP BY p50",
+          "basin": 5.558292000000001,
+          "postgres": 44.917,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 8.08x"
+        },
+        {
+          "label": "ILIKE '%@gmail.com' p50",
+          "basin": 1.1964160000000001,
+          "postgres": 2.534,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 2.12x"
+        },
+        {
+          "label": "Pagination ORDER BY LIMIT/OFFSET p50",
+          "basin": 10.36425,
+          "postgres": 17.855,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 1.72x"
+        },
+        {
+          "label": "Single-row UPDATE p50",
+          "basin": 13.430375,
+          "postgres": 0.278,
+          "unit": "ms",
+          "better": "postgres",
+          "ratio_text": "pg / basin = 0.02x"
+        },
+        {
+          "label": "Bulk UPDATE (~33k rows)",
+          "basin": 902.048583,
+          "postgres": 40.872833,
+          "unit": "ms",
+          "better": "postgres"
+        },
+        {
+          "label": "DELETE WHERE id IN (10 rows)",
+          "basin": 857.9900419999999,
+          "postgres": 6.196292,
+          "unit": "ms",
+          "better": "postgres"
+        },
+        {
+          "label": "Bulk INSERT 100k rows",
+          "basin": 2454.470875,
+          "postgres": 385.943,
+          "unit": "ms",
+          "better": "postgres"
+        },
+        {
+          "label": "Cold-start first query",
+          "basin": 5.945417,
+          "postgres": 11.688834,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 1.97x"
+        }
+      ],
+      "generated_at": "@1779539415"
+    },
+    "compare_postgres_100k_parquet": {
+      "kind": "compare",
+      "id": "postgres_100k_parquet",
+      "name": "Basin (Parquet) vs Postgres 18 (100k-row SaaS workload, no index)",
+      "claim": "Sibling of the Vortex 100k card: same SaaS workload (users + events, joins, ILIKE, pagination, bulk DML) but Basin is pinned to basin.file_format='parquet'. Shows how the legacy / Iceberg-read-compat Parquet path compares against both PG heap and the Vortex-default card.",
+      "available": true,
+      "metrics": [
+        {
+          "label": "On-disk bytes (users + events)",
+          "basin": 1045017.0,
+          "postgres": 8036352.0,
+          "unit": "bytes",
+          "better": "basin",
+          "ratio_text": "pg / basin = 7.69x"
+        },
+        {
+          "label": "Point query p50",
+          "basin": 0.210166,
+          "postgres": 2.983,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 14.19x"
+        },
+        {
+          "label": "Point query p99",
+          "basin": 3.577333,
+          "postgres": 3.538,
+          "unit": "ms",
+          "better": "postgres",
+          "ratio_text": "pg / basin = 0.99x"
+        },
+        {
+          "label": "Range scan p50 (~1k rows)",
+          "basin": 0.206959,
+          "postgres": 6.313,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 30.50x"
+        },
+        {
+          "label": "Range scan p99",
+          "basin": 3.8934170000000003,
+          "postgres": 6.393,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 1.64x"
+        },
+        {
+          "label": "Aggregate GROUP BY user_id p50",
+          "basin": 3.250709,
+          "postgres": 14.634,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 4.50x"
+        },
+        {
+          "label": "2-table JOIN GROUP BY p50",
+          "basin": 5.378125,
+          "postgres": 46.955,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 8.73x"
+        },
+        {
+          "label": "ILIKE '%@gmail.com' p50",
+          "basin": 0.889625,
+          "postgres": 2.619,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 2.94x"
+        },
+        {
+          "label": "Pagination ORDER BY LIMIT/OFFSET p50",
+          "basin": 10.540125,
+          "postgres": 17.693,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 1.68x"
+        },
+        {
+          "label": "Single-row UPDATE p50",
+          "basin": 4.38175,
+          "postgres": 0.276,
+          "unit": "ms",
+          "better": "postgres",
+          "ratio_text": "pg / basin = 0.06x"
+        },
+        {
+          "label": "Bulk UPDATE (~33k rows)",
+          "basin": 684.3177499999999,
+          "postgres": 61.389916,
+          "unit": "ms",
+          "better": "postgres"
+        },
+        {
+          "label": "DELETE WHERE id IN (10 rows)",
+          "basin": 675.7250409999999,
+          "postgres": 6.388292,
+          "unit": "ms",
+          "better": "postgres"
+        },
+        {
+          "label": "Bulk INSERT 100k rows",
+          "basin": 2030.40575,
+          "postgres": 379.728792,
+          "unit": "ms",
+          "better": "postgres"
+        },
+        {
+          "label": "Cold-start first query",
+          "basin": 2.6480420000000002,
+          "postgres": 19.118333,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 7.22x"
+        }
+      ],
+      "generated_at": "@1779539529"
+    },
+    "compare_postgres_parquet": {
+      "kind": "compare",
+      "id": "postgres_parquet",
+      "name": "Basin (Parquet) vs Postgres 18 (1M rows)",
+      "claim": "Sibling of the Vortex card: same audit-log shape and query suite, but Basin is pinned to basin.file_format='parquet'. Shows how the legacy / Iceberg-read-compat Parquet path compares against both PG heap and the Vortex-default card.",
+      "available": true,
+      "metrics": [
+        {
+          "label": "On-disk bytes",
+          "basin": 8095517.0,
+          "postgres": 101195776.0,
+          "unit": "bytes",
+          "better": "basin",
+          "ratio_text": "pg / basin = 12.50x"
+        },
+        {
+          "label": "Point query p50",
+          "basin": 0.29354199999999997,
+          "postgres": 13.699,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 46.67x"
+        },
+        {
+          "label": "Range scan p50 (~10k rows)",
+          "basin": 0.21975,
+          "postgres": 17.283,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 78.65x"
+        },
+        {
+          "label": "Aggregate COUNT/SUM GROUP BY p50",
+          "basin": 39.606875,
+          "postgres": 49.831,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 1.26x"
+        },
+        {
+          "label": "Bulk INSERT 1M rows",
+          "basin": 17720.276833,
+          "postgres": 2202.192792,
+          "unit": "ms",
+          "better": "postgres"
+        },
+        {
+          "label": "Cold-start first query",
+          "basin": 2.582042,
+          "postgres": 37.801333,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 14.64x"
+        }
+      ],
+      "generated_at": "@1779539478"
     },
     "compare_server_lifecycle": {
       "kind": "compare",
@@ -165,37 +463,37 @@ window.__BASIN_RESULTS = {
       "metrics": [
         {
           "label": "Connection accept latency p50",
-          "basin": 0.721584,
-          "postgres": 1.233584,
+          "basin": 2.342459,
+          "postgres": 1.522,
           "unit": "ms",
-          "better": "basin",
-          "ratio_text": "pg / basin = 1.71x"
+          "better": "postgres",
+          "ratio_text": "pg / basin = 0.65x"
         },
         {
           "label": "Connections held under 1000-conn flood",
           "basin": 1000.0,
-          "postgres": 99.0,
+          "postgres": 100.0,
           "unit": "conns",
           "better": "basin",
-          "ratio_text": "basin / pg = 10.10x"
+          "ratio_text": "basin / pg = 10.00x"
         },
         {
           "label": "Refused conns under 1000-conn flood",
           "basin": 0.0,
-          "postgres": 901.0,
+          "postgres": 900.0,
           "unit": "conns",
           "better": "basin"
         },
         {
           "label": "RSS per held-open connection",
-          "basin": 309.12,
-          "postgres": 7658.08,
+          "basin": 297.12,
+          "postgres": 7732.96,
           "unit": "KiB",
           "better": "basin",
-          "ratio_text": "pg / basin = 24.77x"
+          "ratio_text": "pg / basin = 26.03x"
         }
       ],
-      "generated_at": "@1779497643"
+      "generated_at": "@1779505443"
     },
     "compare_vortex_parquet": {
       "available": true,
@@ -236,7 +534,7 @@ window.__BASIN_RESULTS = {
       "note": "JSON key 'basin'=Parquet, 'postgres'=Vortex (schema reuse from Postgres compare card). Standalone binary: cargo run --manifest-path benchmark/vortex_compare/Cargo.toml --release"
     },
     "orm_compat": {
-      "generated_at": "@1779464749",
+      "generated_at": "@1779538920",
       "sections": [
         {
           "orm": "Drizzle",
@@ -342,7 +640,7 @@ window.__BASIN_RESULTS = {
               "sql": "SELECT pg_get_serial_sequence('\"User\"', 'id')",
               "outcome": "typed_error",
               "sqlstate": "XX000",
-              "message": "internal: plan: Error during planning: Invalid function 'pg_get_serial_sequence'.\nDid you mean 'pg_get_indexdef'?"
+              "message": "internal: plan: Error during planning: Invalid function 'pg_get_serial_sequence'.\nDid you mean 'pg_get_partkeydef'?"
             },
             {
               "sql": "CREATE TABLE IF NOT EXISTS \"Profile\" (\n               \"id\"     BIGINT NOT NULL,\n               \"bio\"    TEXT,\n               \"userId\" BIGINT NOT NULL,\n               PRIMARY KEY (\"id\")\n           )",
@@ -526,36 +824,36 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "load_pct": 19.0,
-          "projects": 19,
+          "load_pct": 27.0,
+          "projects": 27,
           "shard": 0
         },
         {
-          "load_pct": 31.0,
-          "projects": 31,
+          "load_pct": 26.0,
+          "projects": 26,
           "shard": 1
         },
         {
-          "load_pct": 21.0,
-          "projects": 21,
+          "load_pct": 23.0,
+          "projects": 23,
           "shard": 2
         },
         {
-          "load_pct": 29.0,
-          "projects": 29,
+          "load_pct": 24.0,
+          "projects": 24,
           "shard": 3
         }
       ],
       "primary": {
         "label": "max shard load",
-        "value": 31.0,
+        "value": 27.0,
         "unit": "%",
         "bar": {
           "op": "less_than",
           "value": 50.0
         }
       },
-      "generated_at": "@1779497580"
+      "generated_at": "@1779506129"
     },
     "scaling_concurrency": {
       "kind": "scaling",
@@ -587,39 +885,39 @@ window.__BASIN_RESULTS = {
       "rows": [
         {
           "concurrency": 1,
-          "median_latency_us": 27570.0,
-          "per_task_qps": 34.666666666666664,
-          "total_qps": 34.666666666666664
+          "median_latency_us": 542823.0,
+          "per_task_qps": 2.0,
+          "total_qps": 2.0
         },
         {
           "concurrency": 4,
-          "median_latency_us": 544.0,
-          "per_task_qps": 36.333333333333336,
-          "total_qps": 145.33333333333334
+          "median_latency_us": 567092.0,
+          "per_task_qps": 2.5,
+          "total_qps": 10.0
         },
         {
           "concurrency": 16,
-          "median_latency_us": 340.0,
-          "per_task_qps": 19.208333333333332,
-          "total_qps": 307.3333333333333
+          "median_latency_us": 1295.0,
+          "per_task_qps": 1.2916666666666667,
+          "total_qps": 20.666666666666668
         },
         {
           "concurrency": 64,
-          "median_latency_us": 144281.0,
-          "per_task_qps": 4.567708333333333,
-          "total_qps": 292.3333333333333
+          "median_latency_us": 4180392.0,
+          "per_task_qps": 0.5052083333333334,
+          "total_qps": 32.333333333333336
         }
       ],
       "primary": {
         "label": "peak speed-up vs C=1",
-        "value": 8.865384615384615,
+        "value": 16.166666666666668,
         "unit": "x",
         "bar": {
           "op": "greater_than_or_equal",
           "value": 3.5
         }
       },
-      "generated_at": "@1779497595"
+      "generated_at": "@1779506166"
     },
     "scaling_data_size": {
       "kind": "scaling",
@@ -716,40 +1014,40 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "per_project_kib": 3.68,
+          "per_project_kib": 1.6,
           "projects": 100,
-          "provision_ms": 0.19283399999999998,
-          "rss_delta_kib": 368
+          "provision_ms": 3.160542,
+          "rss_delta_kib": 160
         },
         {
-          "per_project_kib": 2.016,
+          "per_project_kib": 1.968,
           "projects": 1000,
-          "provision_ms": 1.536041,
-          "rss_delta_kib": 2016
+          "provision_ms": 24.591417,
+          "rss_delta_kib": 1968
         },
         {
-          "per_project_kib": 1.7344,
+          "per_project_kib": 1.7856,
           "projects": 5000,
-          "provision_ms": 7.660916,
-          "rss_delta_kib": 8672
+          "provision_ms": 77.02825,
+          "rss_delta_kib": 8928
         },
         {
-          "per_project_kib": 2.1408,
+          "per_project_kib": 2.112,
           "projects": 10000,
-          "provision_ms": 17.814583,
-          "rss_delta_kib": 21408
+          "provision_ms": 154.456458,
+          "rss_delta_kib": 21120
         }
       ],
       "primary": {
         "label": "max per_project_kib across scales",
-        "value": 3.68,
+        "value": 2.112,
         "unit": "KiB",
         "bar": {
           "op": "less_than",
           "value": 5.0
         }
       },
-      "generated_at": "@1779497600"
+      "generated_at": "@1779506168"
     },
     "scaling_noisy_neighbor": {
       "kind": "scaling",
@@ -775,31 +1073,31 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "p50_ms": 0.348125,
-          "p99_ms": 0.740125,
+          "p50_ms": 1.0625,
+          "p99_ms": 1.394667,
           "scenario": "baseline"
         },
         {
-          "p50_ms": 0.11587499999999999,
-          "p99_ms": 0.31783300000000003,
+          "p50_ms": 0.26687500000000003,
+          "p99_ms": 0.299708,
           "scenario": "under_load"
         },
         {
-          "p50_ms": 0.3328545780969479,
-          "p99_ms": 0.42943151494679954,
+          "p50_ms": 0.25117647058823533,
+          "p99_ms": 0.2148957421377289,
           "scenario": "ratio"
         }
       ],
       "primary": {
         "label": "p99 ratio (under_load / baseline)",
-        "value": 0.42943151494679954,
+        "value": 0.2148957421377289,
         "unit": "x",
         "bar": {
           "op": "less_than",
           "value": 5.0
         }
       },
-      "generated_at": "@1779497617"
+      "generated_at": "@1779506335"
     },
     "scaling_perf_stack": {
       "kind": "scaling",
@@ -900,40 +1198,40 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "per_project_ram_kib": 1088.0,
+          "per_project_ram_kib": 480.0,
           "project_count": 1,
-          "quiet_p50_ms": 0.208834,
-          "rss_delta_kib": 1088
+          "quiet_p50_ms": 1.012459,
+          "rss_delta_kib": 480
         },
         {
-          "per_project_ram_kib": 120.88888888888889,
+          "per_project_ram_kib": 46.22222222222222,
           "project_count": 10,
-          "quiet_p50_ms": 0.210625,
-          "rss_delta_kib": 1088
+          "quiet_p50_ms": 0.9994170000000001,
+          "rss_delta_kib": 416
         },
         {
-          "per_project_ram_kib": 42.48888888888889,
+          "per_project_ram_kib": 9.244444444444444,
           "project_count": 100,
-          "quiet_p50_ms": 0.202334,
-          "rss_delta_kib": 3824
+          "quiet_p50_ms": 0.9997090000000001,
+          "rss_delta_kib": 832
         },
         {
-          "per_project_ram_kib": 22.488888888888887,
+          "per_project_ram_kib": 7.8933333333333335,
           "project_count": 1000,
-          "quiet_p50_ms": 0.37879199999999996,
-          "rss_delta_kib": 20240
+          "quiet_p50_ms": 1.0063330000000001,
+          "rss_delta_kib": 7104
         }
       ],
       "primary": {
         "label": "quiet_p50_at_max / quiet_p50_at_1",
-        "value": 1.8138425735272992,
+        "value": 0.9939493846170563,
         "unit": "x",
         "bar": {
           "op": "less_than",
           "value": 5.0
         }
       },
-      "generated_at": "@1779497623"
+      "generated_at": "@1779506349"
     },
     "scaling_project_deletion_at_scale": {
       "kind": "scaling",
@@ -959,34 +1257,34 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "basin_ms": 3.9247500000000004,
+          "basin_ms": 4.444166999999999,
           "file_count": 100,
           "pg_skipped": false,
-          "postgres_ms": 69.953666
+          "postgres_ms": 3.381292
         },
         {
-          "basin_ms": 37.807958,
+          "basin_ms": 39.927958,
           "file_count": 1000,
           "pg_skipped": false,
-          "postgres_ms": 25.014916000000003
+          "postgres_ms": 10.202834
         },
         {
-          "basin_ms": 199.688209,
+          "basin_ms": 196.86204199999997,
           "file_count": 5000,
           "pg_skipped": false,
-          "postgres_ms": 3.296167
+          "postgres_ms": 8.821791000000001
         }
       ],
       "primary": {
-        "label": "crossover file count (Basin <= PG)",
-        "value": 100.0,
-        "unit": "files",
+        "label": "basin delete_ms at largest scale",
+        "value": 196.86204199999997,
+        "unit": "ms",
         "bar": {
           "op": "less_than",
-          "value": 5001.0
+          "value": null
         }
       },
-      "generated_at": "@1779497650"
+      "generated_at": "@1779506473"
     },
     "scaling_project_deletion_realistic": {
       "kind": "scaling",
@@ -1012,34 +1310,34 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "basin_ms": 4.339416,
+          "basin_ms": 3.9774579999999995,
           "file_count": 100,
           "pg_skipped": false,
-          "postgres_ms": 5.992667
+          "postgres_ms": 12.191708
         },
         {
-          "basin_ms": 85.78583400000001,
+          "basin_ms": 39.652834,
           "file_count": 1000,
           "pg_skipped": false,
-          "postgres_ms": 22.444125
+          "postgres_ms": 27.67975
         },
         {
-          "basin_ms": 198.02854200000002,
+          "basin_ms": 197.628416,
           "file_count": 5000,
           "pg_skipped": false,
-          "postgres_ms": 15.901333
+          "postgres_ms": 20.253792
         }
       ],
       "primary": {
         "label": "Basin/Postgres ratio at 5000 files (realistic schema)",
-        "value": 12.45358121863117,
+        "value": 9.757600749528779,
         "unit": "ratio",
         "bar": {
           "op": "less_than",
           "value": 1.0000000000000002
         }
       },
-      "generated_at": "@1779497687"
+      "generated_at": "@1779506605"
     },
     "viability_alter_add_column": {
       "kind": "viability",
@@ -1061,7 +1359,7 @@ window.__BASIN_RESULTS = {
         "pre_alter_tags_all_null": true,
         "rows_visible": 10
       },
-      "generated_at": "@1779497579"
+      "generated_at": "@1779506735"
     },
     "viability_alter_table": {
       "kind": "viability",
@@ -1091,7 +1389,7 @@ window.__BASIN_RESULTS = {
           "DISABLE ROW LEVEL SECURITY"
         ]
       },
-      "generated_at": "@1779497582"
+      "generated_at": "@1779506738"
     },
     "viability_analytical": {
       "kind": "viability",
@@ -1165,7 +1463,7 @@ window.__BASIN_RESULTS = {
         "runs_executed": 3,
         "ticks": 3
       },
-      "generated_at": "@1779497584"
+      "generated_at": "@1779506742"
     },
     "viability_basin_net": {
       "kind": "viability",
@@ -1184,14 +1482,14 @@ window.__BASIN_RESULTS = {
       },
       "details": {
         "allowlist_blocks_unknown_host": true,
-        "async_request_id": "c0fd8f98-8181-4198-a9b1-d8b0dadc1d44",
+        "async_request_id": "f30ddf42-16aa-4287-b9c4-3b2eed6bfa44",
         "async_response_recorded": true,
         "async_status": 200,
         "roundtrip_passed": true,
         "sync_body": "ok",
         "sync_status": 200
       },
-      "generated_at": "@1779497587"
+      "generated_at": "@1779506745"
     },
     "viability_bloom_filter_pruning": {
       "kind": "viability",
@@ -1231,7 +1529,7 @@ window.__BASIN_RESULTS = {
         "row_group_size": 100,
         "rows": 1000
       },
-      "generated_at": "@1778866559"
+      "generated_at": "@1779538907"
     },
     "viability_catalog_stats_pruning": {
       "kind": "viability",
@@ -1272,7 +1570,7 @@ window.__BASIN_RESULTS = {
           "range_gets": 0
         }
       },
-      "generated_at": "@1779497592"
+      "generated_at": "@1779506748"
     },
     "viability_cluster_by_sort_overhead": {
       "kind": "viability",
@@ -1282,7 +1580,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "cluster_mean / no_cluster_mean ratio",
-        "value": 0.9687149039364493,
+        "value": 0.9390167997626946,
         "unit": "x",
         "bar": {
           "op": "less_than",
@@ -1291,13 +1589,13 @@ window.__BASIN_RESULTS = {
       },
       "details": {
         "bar_ratio_x": 2.0,
-        "cluster_mean_ms": 7.926550000000001,
+        "cluster_mean_ms": 93.45097520000002,
         "n_iterations": 5,
-        "no_cluster_mean_ms": 8.1825416,
-        "ratio_x": 0.9687149039364493,
+        "no_cluster_mean_ms": 99.52002480000002,
+        "ratio_x": 0.9390167997626946,
         "rows_per_batch": 10000
       },
-      "generated_at": "@1779497579"
+      "generated_at": "@1779507084"
     },
     "viability_cluster_by_sql": {
       "kind": "viability",
@@ -1323,17 +1621,17 @@ window.__BASIN_RESULTS = {
           "e2e: cluster-by sorts file physically"
         ]
       },
-      "generated_at": "@1779497595"
+      "generated_at": "@1779506751"
     },
     "viability_cold_start": {
       "kind": "viability",
       "id": "cold_start",
       "name": "Cold-start latency (LocalFS)",
       "claim": "From process spawn to first `SELECT 1` over pgwire is < 2 s on LocalFS storage.",
-      "passed": false,
+      "passed": true,
       "primary": {
         "label": "cold_start_ms",
-        "value": 3411.585458,
+        "value": 246.29520799999997,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -1341,11 +1639,11 @@ window.__BASIN_RESULTS = {
         }
       },
       "details": {
-        "bind_addr": "127.0.0.1:49504",
-        "cold_start_ms": 3411.585458,
+        "bind_addr": "127.0.0.1:51640",
+        "cold_start_ms": 246.29520799999997,
         "storage": "localfs"
       },
-      "generated_at": "@1779497599"
+      "generated_at": "@1779506752"
     },
     "viability_compression_ratio": {
       "kind": "viability",
@@ -1367,7 +1665,7 @@ window.__BASIN_RESULTS = {
         "parquet_bytes": 1628404,
         "rows": 1000000
       },
-      "generated_at": "@1779497605"
+      "generated_at": "@1779506779"
     },
     "viability_continuous_aggregate": {
       "kind": "viability",
@@ -1398,7 +1696,7 @@ window.__BASIN_RESULTS = {
         "refresh_idempotent": true,
         "refresh_picks_up_new_rows": true
       },
-      "generated_at": "@1779497608"
+      "generated_at": "@1779506782"
     },
     "viability_disk_cache": {
       "kind": "viability",
@@ -1408,7 +1706,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "cold p99 ms",
-        "value": 4.941417,
+        "value": 55.627,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -1423,21 +1721,21 @@ window.__BASIN_RESULTS = {
         "n_iterations": 1000,
         "rows": [
           {
-            "max_ms": 165.286208,
-            "mean_ms": 3.6440318619999994,
-            "min_ms": 2.699458,
-            "p50_ms": 3.2255000000000003,
-            "p999_ms": 26.998333,
-            "p99_ms": 4.941417,
+            "max_ms": 210.743834,
+            "mean_ms": 53.487386842999975,
+            "min_ms": 52.805749999999996,
+            "p50_ms": 53.122667,
+            "p999_ms": 59.383875,
+            "p99_ms": 55.627,
             "phase": "cold"
           },
           {
-            "max_ms": 21.156083,
-            "mean_ms": 3.6606353179999953,
-            "min_ms": 2.575834,
-            "p50_ms": 3.352541,
-            "p999_ms": 18.639833000000003,
-            "p99_ms": 5.554625,
+            "max_ms": 58.628667,
+            "mean_ms": 53.10891516800009,
+            "min_ms": 52.7375,
+            "p50_ms": 53.086458,
+            "p999_ms": 53.805541999999996,
+            "p99_ms": 53.541041,
             "phase": "warm"
           }
         ],
@@ -1447,7 +1745,7 @@ window.__BASIN_RESULTS = {
         "warm_inner_gets": 0,
         "working_set_size": 1000
       },
-      "generated_at": "@1779497617"
+      "generated_at": "@1779506891"
     },
     "viability_durable_catalog": {
       "kind": "viability",
@@ -1467,9 +1765,9 @@ window.__BASIN_RESULTS = {
       "details": {
         "rows_after_restart": 3,
         "rows_inserted": 3,
-        "schema": "basin_catalog_smoke_01ks5p5w2r87vvf1a01eajwnha"
+        "schema": "basin_catalog_smoke_01ks9cpvqrzzsewjtgvwb49vm7"
       },
-      "generated_at": "@1779381236"
+      "generated_at": "@1779505524"
     },
     "viability_extended_protocol": {
       "kind": "viability",
@@ -1491,7 +1789,7 @@ window.__BASIN_RESULTS = {
         "passed_queries": 10,
         "total_queries": 10
       },
-      "generated_at": "@1779381449"
+      "generated_at": "@1779538927"
     },
     "viability_idle_project_ram": {
       "kind": "viability",
@@ -1501,7 +1799,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "per_project_kib",
-        "value": 2.064,
+        "value": 1.936,
         "unit": "KiB",
         "bar": {
           "op": "less_than",
@@ -1510,10 +1808,10 @@ window.__BASIN_RESULTS = {
       },
       "details": {
         "projects": 1000,
-        "rss_after_kib": 9712,
-        "rss_before_kib": 7648
+        "rss_after_kib": 11024,
+        "rss_before_kib": 9088
       },
-      "generated_at": "@1779497619"
+      "generated_at": "@1779506891"
     },
     "viability_isolation_under_load": {
       "kind": "viability",
@@ -1531,11 +1829,11 @@ window.__BASIN_RESULTS = {
         }
       },
       "details": {
-        "elapsed_s": 1.3703109580000001,
+        "elapsed_s": 3.799402167,
         "ops": 2000,
         "projects": 50
       },
-      "generated_at": "@1779497624"
+      "generated_at": "@1779506899"
     },
     "viability_jsonb": {
       "kind": "viability",
@@ -1561,7 +1859,7 @@ window.__BASIN_RESULTS = {
         "rejected_malformed": true,
         "rows_returned": 2
       },
-      "generated_at": "@1779497627"
+      "generated_at": "@1779506902"
     },
     "viability_kms_envelope": {
       "kind": "viability",
@@ -1579,13 +1877,13 @@ window.__BASIN_RESULTS = {
         }
       },
       "details": {
-        "data_file_path": "projects/01KS955YNPWEMVCP4RV7G13CYD/tables/events/data/_default/2026/05/23/01KS955YNZ9ZNH7MG6C60T42DN.vortex",
+        "data_file_path": "projects/01KS9E0Z4GJAJQ5QRFR7K7V5X4/tables/events/data/_default/2026/05/23/01KS9E0Z636VHVANWVEM9QVV3Q.vortex",
         "encrypted_body_bytes": 3280,
         "plaintext_body_bytes": 3252,
         "rows_round_tripped": 100,
         "sidecar_bytes": 33
       },
-      "generated_at": "@1779497630"
+      "generated_at": "@1779506904"
     },
     "viability_large_dataset_pointquery": {
       "kind": "viability",
@@ -1595,7 +1893,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "cold p99 ms",
-        "value": 5.665166999999999,
+        "value": 15.521792,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -1608,30 +1906,30 @@ window.__BASIN_RESULTS = {
         "n_iterations": 1000,
         "rows": [
           {
-            "max_ms": 14.133291,
-            "mean_ms": 1.0282482959999997,
-            "min_ms": 0.084417,
-            "p50_ms": 1.089375,
-            "p999_ms": 12.650958000000001,
-            "p99_ms": 5.665166999999999,
+            "max_ms": 21.536583,
+            "mean_ms": 9.122550762999994,
+            "min_ms": 0.322625,
+            "p50_ms": 14.265,
+            "p999_ms": 18.456,
+            "p99_ms": 15.521792,
             "phase": "cold"
           },
           {
-            "max_ms": 0.183833,
-            "mean_ms": 0.087915509,
-            "min_ms": 0.081958,
-            "p50_ms": 0.08675,
-            "p999_ms": 0.174709,
-            "p99_ms": 0.132,
+            "max_ms": 0.377083,
+            "mean_ms": 0.3290698410000007,
+            "min_ms": 0.316334,
+            "p50_ms": 0.326458,
+            "p999_ms": 0.369333,
+            "p99_ms": 0.36174999999999996,
             "phase": "warm"
           }
         ],
         "seed": 13425777967503634925,
-        "seed_elapsed_s": 15.5300925,
+        "seed_elapsed_s": 116.657994875,
         "total_rows": 10000000,
         "working_set_size": 1000
       },
-      "generated_at": "@1779497649"
+      "generated_at": "@1779507033"
     },
     "viability_migration_manager": {
       "kind": "viability",
@@ -1674,7 +1972,7 @@ window.__BASIN_RESULTS = {
         "project_wide_total_entries": 30,
         "tables": 5
       },
-      "generated_at": "@1779497651"
+      "generated_at": "@1779507036"
     },
     "viability_orm_compat": {
       "kind": "viability",
@@ -1747,7 +2045,7 @@ window.__BASIN_RESULTS = {
         ],
         "total": 7
       },
-      "generated_at": "@1779381375"
+      "generated_at": "@1779505811"
     },
     "viability_page_cache": {
       "kind": "viability",
@@ -1757,7 +2055,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "cold p99 ms",
-        "value": 7.848459,
+        "value": 54.149833,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -1773,21 +2071,21 @@ window.__BASIN_RESULTS = {
         "n_iterations": 1000,
         "rows": [
           {
-            "max_ms": 13.00825,
-            "mean_ms": 3.1004527989999997,
-            "min_ms": 0.172958,
-            "p50_ms": 3.104375,
-            "p999_ms": 11.681708,
-            "p99_ms": 7.848459,
+            "max_ms": 59.70675,
+            "mean_ms": 33.23669730899999,
+            "min_ms": 0.323834,
+            "p50_ms": 53.2605,
+            "p999_ms": 56.959083,
+            "p99_ms": 54.149833,
             "phase": "cold"
           },
           {
-            "max_ms": 4.450166,
-            "mean_ms": 0.438818298,
-            "min_ms": 0.186417,
-            "p50_ms": 0.362042,
-            "p999_ms": 3.655125,
-            "p99_ms": 1.923625,
+            "max_ms": 0.38333300000000003,
+            "mean_ms": 0.33613882100000014,
+            "min_ms": 0.313375,
+            "p50_ms": 0.336333,
+            "p999_ms": 0.380708,
+            "p99_ms": 0.364542,
             "phase": "warm"
           }
         ],
@@ -1797,7 +2095,7 @@ window.__BASIN_RESULTS = {
         "warm_misses_total": 6190,
         "working_set_size": 1000
       },
-      "generated_at": "@1779497656"
+      "generated_at": "@1779507072"
     },
     "viability_partition_pruning": {
       "kind": "viability",
@@ -1827,7 +2125,7 @@ window.__BASIN_RESULTS = {
         "rows_per_month": 100,
         "rows_range_query": 100
       },
-      "generated_at": "@1779497659"
+      "generated_at": "@1779507076"
     },
     "viability_per_project_bcrypt_validate_cost": {
       "kind": "viability",
@@ -1908,7 +2206,7 @@ window.__BASIN_RESULTS = {
         "word_similarity_correct": true,
         "word_similarity_smyth_alyce_smyth": 1.0
       },
-      "generated_at": "@1779497662"
+      "generated_at": "@1779507089"
     },
     "viability_postgis": {
       "kind": "viability",
@@ -1938,7 +2236,7 @@ window.__BASIN_RESULTS = {
         "wkb_roundtrip_correct": true,
         "wkb_total_bytes": 2100
       },
-      "generated_at": "@1779497664"
+      "generated_at": "@1779507090"
     },
     "viability_predicate_pushdown": {
       "kind": "viability",
@@ -1960,7 +2258,7 @@ window.__BASIN_RESULTS = {
         "full_scan_bytes": 1229888,
         "point_query_bytes": 0
       },
-      "generated_at": "@1779497667"
+      "generated_at": "@1779507101"
     },
     "viability_project_deletion": {
       "kind": "viability",
@@ -1970,7 +2268,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "deletion_ms",
-        "value": 3.7885,
+        "value": 4.100124999999999,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -1979,9 +2277,9 @@ window.__BASIN_RESULTS = {
       },
       "details": {
         "files": 100,
-        "setup_ms": 451.729166
+        "setup_ms": 5005.952333
       },
-      "generated_at": "@1779497668"
+      "generated_at": "@1779507107"
     },
     "viability_rls_basic": {
       "kind": "viability",
@@ -2005,7 +2303,7 @@ window.__BASIN_RESULTS = {
         "anonymous_rows_visible": 0,
         "bob_rows_visible": 5
       },
-      "generated_at": "@1779497671"
+      "generated_at": "@1779507111"
     },
     "viability_rls_isolation": {
       "kind": "viability",
@@ -2024,10 +2322,10 @@ window.__BASIN_RESULTS = {
       },
       "details": {
         "cross_project_leak": 0,
-        "project_a": "01KS957AAJSG858GTHN68JXKB9",
-        "project_b": "01KS957AAJCDJ6RVQBTM8M48A7"
+        "project_a": "01KS9E7CD7QW5TRY495V129TEY",
+        "project_b": "01KS9E7CD75NF4NE4ETR3Y46JE"
       },
-      "generated_at": "@1779497675"
+      "generated_at": "@1779507114"
     },
     "viability_row_group_sizing": {
       "kind": "viability",
@@ -2059,7 +2357,7 @@ window.__BASIN_RESULTS = {
         },
         "small_rg_rows": 4096
       },
-      "generated_at": "@1778866763"
+      "generated_at": "@1779538914"
     },
     "viability_shard_insert_path": {
       "kind": "viability",
@@ -2069,7 +2367,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "inserts_per_sec",
-        "value": 2971.674371351573,
+        "value": 926.3579398130685,
         "unit": "inserts/sec",
         "bar": {
           "op": "greater_than_or_equal",
@@ -2077,11 +2375,53 @@ window.__BASIN_RESULTS = {
         }
       },
       "details": {
-        "elapsed_ms": 336.510625,
-        "ms_per_insert": 0.336510625,
+        "elapsed_ms": 1079.496334,
+        "ms_per_insert": 1.079496334,
         "n_inserts": 1000
       },
-      "generated_at": "@1779435955"
+      "generated_at": "@1779505605"
+    },
+    "viability_sql_support_slt": {
+      "claim": "Curated PG-style .slt suite reaches >= 78% pass rate against basin-engine.",
+      "details": {
+        "framework": "sqllogictest",
+        "framework_version": "0.29",
+        "pass_rate_pct": 80.0,
+        "passed": 40,
+        "threshold_pct": 78.0,
+        "total": 50
+      },
+      "generated_at": "@1779539106",
+      "id": "sql_support_slt",
+      "kind": "viability",
+      "metrics": [
+        {
+          "label": "passed",
+          "unit": "tests",
+          "value": 40.0
+        },
+        {
+          "label": "total",
+          "unit": "tests",
+          "value": 50.0
+        },
+        {
+          "label": "pass_rate",
+          "unit": "%",
+          "value": 80.0
+        }
+      ],
+      "name": "SQL compatibility (sqllogictest)",
+      "passed": true,
+      "primary": {
+        "bar": {
+          "op": "greater_than_or_equal",
+          "value": 78.0
+        },
+        "label": "pass_rate",
+        "unit": "%",
+        "value": 80.0
+      }
     },
     "viability_tiered_storage": {
       "kind": "viability",
@@ -2115,7 +2455,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "UPDATE+DELETE elapsed (ms)",
-        "value": 17.084916,
+        "value": 188.93454200000002,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -2123,13 +2463,13 @@ window.__BASIN_RESULTS = {
         }
       },
       "details": {
-        "delete_ms": 7.7519160000000005,
+        "delete_ms": 92.59812500000001,
         "remaining_rows": 9997,
         "rows": 10000,
-        "total_ms": 17.084916,
-        "update_ms": 9.332999999999998
+        "total_ms": 188.93454200000002,
+        "update_ms": 96.336417
       },
-      "generated_at": "@1779497681"
+      "generated_at": "@1779507123"
     },
     "viability_uuid": {
       "kind": "viability",
@@ -2149,12 +2489,12 @@ window.__BASIN_RESULTS = {
       "details": {
         "alice_uuid": "550e8400-e29b-41d4-a716-446655440000",
         "bcrypt_format_correct": true,
-        "bcrypt_sample": "$2b$12$Kg9zAyvmPRQKBuuMVe/Yq.SQ0OPJBhcHM.igLq5E7xUVUp0heB24i",
+        "bcrypt_sample": "$2b$12$RNV6/OleRHUl5TCE22xXuueP4HODfaaMWU5noVwCcdWc1bzuJ6/MK",
         "random_uuid_unique_1000": true,
         "sha256_hex_correct": true,
         "uuid_roundtrip": true
       },
-      "generated_at": "@1779497684"
+      "generated_at": "@1779507127"
     },
     "viability_vector_search": {
       "kind": "viability",
@@ -2164,7 +2504,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "HNSW speed-up vs brute-force",
-        "value": 2.2472771513282304,
+        "value": 2.233465016064268,
         "unit": "x",
         "bar": {
           "op": "greater_than_or_equal",
@@ -2184,7 +2524,7 @@ window.__BASIN_RESULTS = {
           3148,
           1402
         ],
-        "brute_ms": 198.511917,
+        "brute_ms": 197.60079199999998,
         "dim": 64,
         "hnsw_ids": [
           3764,
@@ -2198,13 +2538,13 @@ window.__BASIN_RESULTS = {
           3148,
           1402
         ],
-        "hnsw_ms": 88.334417,
+        "hnsw_ms": 88.47275,
         "overlap": 10,
         "rows": 5000,
         "sql_rows": 100,
         "top_k": 10
       },
-      "generated_at": "@1779382245"
+      "generated_at": "@1779506732"
     }
   }
 };

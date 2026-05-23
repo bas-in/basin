@@ -7,113 +7,113 @@
   "metrics": [
     {
       "label": "On-disk bytes (users + events)",
-      "basin": 0.0,
+      "basin": 190192.0,
       "postgres": 8036352.0,
       "unit": "bytes",
       "better": "basin",
-      "ratio_text": "pg / basin = 8036351999999999.00x"
+      "ratio_text": "pg / basin = 42.25x"
     },
     {
       "label": "Point query p50",
-      "basin": 0.697917,
-      "postgres": 2.84,
+      "basin": 0.33116599999999996,
+      "postgres": 2.617,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 4.07x"
+      "ratio_text": "pg / basin = 7.90x"
     },
     {
       "label": "Point query p99",
-      "basin": 12.660042,
-      "postgres": 3.627,
+      "basin": 1.764334,
+      "postgres": 2.657,
       "unit": "ms",
-      "better": "postgres",
-      "ratio_text": "pg / basin = 0.29x"
+      "better": "basin",
+      "ratio_text": "pg / basin = 1.51x"
     },
     {
       "label": "Range scan p50 (~1k rows)",
-      "basin": 0.6471250000000001,
-      "postgres": 5.789,
+      "basin": 0.514625,
+      "postgres": 5.454,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 8.95x"
+      "ratio_text": "pg / basin = 10.60x"
     },
     {
       "label": "Range scan p99",
-      "basin": 7.233917,
-      "postgres": 6.256,
+      "basin": 1.726708,
+      "postgres": 5.582,
       "unit": "ms",
-      "better": "postgres",
-      "ratio_text": "pg / basin = 0.86x"
+      "better": "basin",
+      "ratio_text": "pg / basin = 3.23x"
     },
     {
       "label": "Aggregate GROUP BY user_id p50",
-      "basin": 35.293290999999996,
-      "postgres": 18.885,
+      "basin": 2.569709,
+      "postgres": 13.465,
       "unit": "ms",
-      "better": "postgres",
-      "ratio_text": "pg / basin = 0.54x"
+      "better": "basin",
+      "ratio_text": "pg / basin = 5.24x"
     },
     {
       "label": "2-table JOIN GROUP BY p50",
-      "basin": 86.611541,
-      "postgres": 47.96,
+      "basin": 5.558292000000001,
+      "postgres": 44.917,
       "unit": "ms",
-      "better": "postgres",
-      "ratio_text": "pg / basin = 0.55x"
+      "better": "basin",
+      "ratio_text": "pg / basin = 8.08x"
     },
     {
       "label": "ILIKE '%@gmail.com' p50",
-      "basin": 13.441291,
-      "postgres": 2.539,
+      "basin": 1.1964160000000001,
+      "postgres": 2.534,
       "unit": "ms",
-      "better": "postgres",
-      "ratio_text": "pg / basin = 0.19x"
+      "better": "basin",
+      "ratio_text": "pg / basin = 2.12x"
     },
     {
       "label": "Pagination ORDER BY LIMIT/OFFSET p50",
-      "basin": 88.72375000000001,
-      "postgres": 17.525,
+      "basin": 10.36425,
+      "postgres": 17.855,
       "unit": "ms",
-      "better": "postgres",
-      "ratio_text": "pg / basin = 0.20x"
+      "better": "basin",
+      "ratio_text": "pg / basin = 1.72x"
     },
     {
       "label": "Single-row UPDATE p50",
-      "basin": 103.29599999999999,
-      "postgres": 0.288,
+      "basin": 13.430375,
+      "postgres": 0.278,
       "unit": "ms",
       "better": "postgres",
-      "ratio_text": "pg / basin = 0.00x"
+      "ratio_text": "pg / basin = 0.02x"
     },
     {
       "label": "Bulk UPDATE (~33k rows)",
-      "basin": 14409.140084,
-      "postgres": 61.377,
+      "basin": 902.048583,
+      "postgres": 40.872833,
       "unit": "ms",
       "better": "postgres"
     },
     {
       "label": "DELETE WHERE id IN (10 rows)",
-      "basin": 14230.420083,
-      "postgres": 7.453125,
+      "basin": 857.9900419999999,
+      "postgres": 6.196292,
       "unit": "ms",
       "better": "postgres"
     },
     {
       "label": "Bulk INSERT 100k rows",
-      "basin": 9146.810792,
-      "postgres": 555.2737500000001,
+      "basin": 2454.470875,
+      "postgres": 385.943,
       "unit": "ms",
       "better": "postgres"
     },
     {
       "label": "Cold-start first query",
-      "basin": 14.416125000000001,
-      "postgres": 18.679917,
+      "basin": 5.945417,
+      "postgres": 11.688834,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 1.30x"
+      "ratio_text": "pg / basin = 1.97x"
     }
   ],
-  "generated_at": "@1779538071"
+  "generated_at": "@1779539415"
 }
