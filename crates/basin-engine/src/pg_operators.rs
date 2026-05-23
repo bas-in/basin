@@ -6152,9 +6152,24 @@ pub(crate) fn rewrite_vector_col_text_cast(sql: &str) -> String {
             };
             let is_ident = ident_len > 0
                 && (first_byte.is_ascii_alphabetic() || first_byte == b'_');
-            if is_ident {
+            // SQL keyword literals like `NULL` / `TRUE` / `FALSE` are
+            // syntactically identifiers but semantically not column refs;
+            // wrapping them in `vector_to_text(…)` causes
+            // `vector_to_text: unsupported input type Null` failures for
+            // any caller that writes e.g. `pg_get_expr(NULL::text, 0)`.
+            // Pass these through so DataFusion's native cast handles them.
+            let ident_str = if is_ident {
+                &out[id_start..ident_end]
+            } else {
+                ""
+            };
+            let is_keyword_literal = matches!(
+                ident_str.to_ascii_uppercase().as_str(),
+                "NULL" | "TRUE" | "FALSE" | "UNKNOWN"
+            );
+            if is_ident && !is_keyword_literal {
                 // Wrap the identifier: `IDENT::text` → `vector_to_text(IDENT)`.
-                let ident = out[id_start..ident_end].to_string();
+                let ident = ident_str.to_string();
                 out.truncate(id_start);
                 out.push_str("vector_to_text(");
                 out.push_str(&ident);
