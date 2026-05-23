@@ -995,6 +995,7 @@ mod approx_count_distinct;
 mod approx_percentile;
 mod catalog_window_exec;
 mod constraints;
+mod constraint_union;
 mod convert;
 mod cost_check;
 mod cron_glue;
