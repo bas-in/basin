@@ -6414,6 +6414,620 @@ pub(crate) fn rewrite_jsonb_arrow_op_spacing(sql: &str) -> String {
     out
 }
 
+// ─── json_agg(<alias>.*) / jsonb_agg(<alias>.*) qualified-wildcard expansion ──
+//
+// Prisma (and other ORMs) emits a correlated-subquery shape like
+//
+//     SELECT u.email,
+//            (SELECT json_agg(o.*) FROM "Order" o WHERE o."userId" = u.id) AS orders
+//     FROM "User" u
+//
+// PostgreSQL accepts `json_agg(o.*)` directly; DataFusion's physical planner
+// does not — it rejects the `Wildcard { qualifier: Some(...) }` form inside a
+// scalar-aggregate argument with `Physical plan does not support logical
+// expression Wildcard { qualifier: Some(Bare { table: "o" }), … }` (XX000).
+//
+// The rewriter expands `json_agg(o.*)` to
+//
+//     json_agg(jsonb_build_object('id', o."id",
+//                                 'userId', o."userId",
+//                                 'status', o."status",
+//                                 'total',  o."total"))
+//
+// which is semantically equivalent and uses only unqualified column refs +
+// the `jsonb_build_object` UDF (both wired end-to-end). The alias→table
+// mapping is built from the `FROM <table> [AS] <alias>` clauses in the SQL,
+// then the catalog is consulted (caller side, async) for the column list.
+//
+// The pure rewriter is split from the async catalog lookup so it can be
+// unit-tested without an engine. The caller is responsible for:
+//   1. calling [`collect_json_agg_star_aliases`] to discover the alias set,
+//   2. calling [`extract_from_alias_table_map`] to map each alias to a
+//      real table name,
+//   3. loading each table from the catalog to grab the column list,
+//   4. handing a `HashMap<alias, Vec<column>>` to
+//      [`rewrite_json_agg_qualified_wildcard`].
+//
+// Aliases that don't resolve to a known table are left unchanged so the
+// rewriter remains a no-op for the false-positive case (DataFusion will
+// surface its normal error if the unqualified-wildcard reference is invalid).
+
+/// Scan `sql` for `json_agg(<ident>.*)` and `jsonb_agg(<ident>.*)` calls and
+/// return the deduplicated set of `<ident>` strings (case-preserved). Both
+/// bare (`o`) and double-quoted (`"o"`) aliases are recognised; the returned
+/// string is always the bare identifier (quotes stripped).
+///
+/// Respects single-/double-quoted literals and `--` / `/* */` comments so
+/// matches inside string contents or comments are ignored.
+pub(crate) fn collect_json_agg_star_aliases(sql: &str) -> Vec<String> {
+    let lower = sql.to_ascii_lowercase();
+    if !lower.contains("json_agg") && !lower.contains("jsonb_agg") {
+        return Vec::new();
+    }
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let lower_bytes = lower.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut i = 0usize;
+    while i < len {
+        let b = bytes[i];
+        // Skip string literals.
+        if b == b'\'' {
+            i = skip_quoted_string(sql, i);
+            continue;
+        }
+        // Skip double-quoted identifiers.
+        if b == b'"' {
+            i += 1;
+            while i < len && bytes[i] != b'"' {
+                i += 1;
+            }
+            if i < len {
+                i += 1;
+            }
+            continue;
+        }
+        // Skip line comments.
+        if b == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Skip block comments.
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < len {
+                i += 2;
+            }
+            continue;
+        }
+        // Look for `json_agg(` or `jsonb_agg(` at this position.
+        let rest_lower = &lower_bytes[i..];
+        let fn_len = if rest_lower.starts_with(b"jsonb_agg(") {
+            10
+        } else if rest_lower.starts_with(b"json_agg(") {
+            9
+        } else {
+            i += 1;
+            continue;
+        };
+        // Word-boundary check on the left.
+        if i > 0 {
+            let prev = bytes[i - 1];
+            if prev.is_ascii_alphanumeric() || prev == b'_' {
+                i += 1;
+                continue;
+            }
+        }
+        // The `(` is at i + fn_len - 1; the arg starts at i + fn_len.
+        let arg_start = i + fn_len;
+        // Skip leading whitespace inside the args.
+        let mut j = arg_start;
+        while j < len && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        // Parse an identifier: either a quoted name `"foo"` or a bare ident.
+        let (alias, after) = if j < len && bytes[j] == b'"' {
+            let id_start = j + 1;
+            let mut k = id_start;
+            while k < len && bytes[k] != b'"' {
+                k += 1;
+            }
+            if k >= len {
+                i += 1;
+                continue;
+            }
+            (sql[id_start..k].to_string(), k + 1)
+        } else {
+            let id_start = j;
+            let mut k = id_start;
+            while k < len && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
+                k += 1;
+            }
+            if k == id_start {
+                i += 1;
+                continue;
+            }
+            (sql[id_start..k].to_string(), k)
+        };
+        // Now expect `.*` (with optional whitespace).
+        let mut k = after;
+        while k < len && bytes[k].is_ascii_whitespace() {
+            k += 1;
+        }
+        if k >= len || bytes[k] != b'.' {
+            i += 1;
+            continue;
+        }
+        k += 1;
+        while k < len && bytes[k].is_ascii_whitespace() {
+            k += 1;
+        }
+        if k >= len || bytes[k] != b'*' {
+            i += 1;
+            continue;
+        }
+        k += 1;
+        while k < len && bytes[k].is_ascii_whitespace() {
+            k += 1;
+        }
+        // Expect closing `)` next to validate this really is the simple
+        // `<fn>(<alias>.*)` form (no extra args like `ORDER BY` etc.).
+        if k >= len || bytes[k] != b')' {
+            i += 1;
+            continue;
+        }
+        if seen.insert(alias.clone()) {
+            out.push(alias);
+        }
+        i = k + 1;
+    }
+    out
+}
+
+/// Scan `sql` for `FROM <table> [AS] <alias>` and `JOIN <table> [AS] <alias>`
+/// clauses and return a map from alias → bare-table-name. Both `<table>` and
+/// `<alias>` may be double-quoted; the returned strings are always the bare
+/// (unquoted) form so they can be used as catalog lookup keys.
+///
+/// The parser is intentionally simple and respects string literals + comments.
+/// It deliberately does NOT try to handle schema-qualified table refs
+/// (`schema.table`); for now the catalog lookup is performed against the
+/// bare table-name only (Basin's primary `Catalog::load_table` is bare-name
+/// keyed). Multi-schema support can be added later.
+pub(crate) fn extract_from_alias_table_map(sql: &str) -> std::collections::HashMap<String, String> {
+    let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let lower = sql.to_ascii_lowercase();
+    if !lower.contains("from") && !lower.contains("join") {
+        return out;
+    }
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let lower_bytes = lower.as_bytes();
+
+    // Token positions where FROM / JOIN keywords appear at a word boundary
+    // outside of any string / comment / quoted ident.
+    let mut i = 0usize;
+    while i < len {
+        let b = bytes[i];
+        // Skip strings / comments / quoted idents.
+        if b == b'\'' {
+            i = skip_quoted_string(sql, i);
+            continue;
+        }
+        if b == b'"' {
+            i += 1;
+            while i < len && bytes[i] != b'"' {
+                i += 1;
+            }
+            if i < len {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < len {
+                i += 2;
+            }
+            continue;
+        }
+        // Match `from ` or `join ` at a word boundary.
+        let prev_ok = i == 0 || {
+            let p = bytes[i - 1];
+            !(p.is_ascii_alphanumeric() || p == b'_')
+        };
+        let kw_len = if prev_ok && lower_bytes[i..].starts_with(b"from")
+            && i + 4 < len
+            && bytes[i + 4].is_ascii_whitespace()
+        {
+            4
+        } else if prev_ok && lower_bytes[i..].starts_with(b"join")
+            && i + 4 < len
+            && bytes[i + 4].is_ascii_whitespace()
+        {
+            4
+        } else {
+            i += 1;
+            continue;
+        };
+        // Walk past the keyword + whitespace.
+        let mut j = i + kw_len;
+        while j < len && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        // Parse the table name. May be `"Table"`, `schema.table`,
+        // `"schema"."table"`, etc. We keep only the *last* component (the
+        // table itself), since catalog lookup is bare-name keyed.
+        let (table_name, after_table) = match parse_qualified_ident_tail(sql, j) {
+            Some(x) => x,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        // Skip the next chunk only if it looks like an alias declaration
+        // (`AS <alias>` or just `<alias>`). Subquery FROMs `FROM (SELECT …) x`
+        // and table-function FROMs `FROM unnest(…) x` are not parsed; the
+        // table_name will be empty in those cases and we just bail out.
+        if table_name.is_empty() {
+            i = j + 1;
+            continue;
+        }
+        let mut k = after_table;
+        while k < len && bytes[k].is_ascii_whitespace() {
+            k += 1;
+        }
+        // Optional `AS`.
+        if k + 2 <= len
+            && (lower_bytes[k..k + 2] == *b"as")
+            && k + 2 < len
+            && bytes[k + 2].is_ascii_whitespace()
+        {
+            k += 2;
+            while k < len && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+        }
+        // Parse the alias identifier (or skip if next token is a SQL keyword
+        // that means "no alias").
+        if k >= len {
+            i = after_table;
+            continue;
+        }
+        let (alias, after_alias) = if bytes[k] == b'"' {
+            let id_start = k + 1;
+            let mut m = id_start;
+            while m < len && bytes[m] != b'"' {
+                m += 1;
+            }
+            if m >= len {
+                i = k + 1;
+                continue;
+            }
+            (sql[id_start..m].to_string(), m + 1)
+        } else if bytes[k].is_ascii_alphabetic() || bytes[k] == b'_' {
+            let id_start = k;
+            let mut m = id_start;
+            while m < len && (bytes[m].is_ascii_alphanumeric() || bytes[m] == b'_') {
+                m += 1;
+            }
+            (sql[id_start..m].to_string(), m)
+        } else {
+            // No alias.
+            i = after_table;
+            continue;
+        };
+        // Reject SQL keywords that aren't aliases.
+        let alias_upper = alias.to_ascii_uppercase();
+        let is_keyword = matches!(
+            alias_upper.as_str(),
+            "WHERE"
+                | "GROUP"
+                | "ORDER"
+                | "LIMIT"
+                | "OFFSET"
+                | "HAVING"
+                | "UNION"
+                | "INTERSECT"
+                | "EXCEPT"
+                | "JOIN"
+                | "INNER"
+                | "LEFT"
+                | "RIGHT"
+                | "FULL"
+                | "CROSS"
+                | "ON"
+                | "USING"
+                | "LATERAL"
+                | "FOR"
+                | "WINDOW"
+                | "FETCH"
+                | "RETURNING"
+        );
+        if is_keyword {
+            i = after_table;
+            continue;
+        }
+        out.insert(alias, table_name);
+        i = after_alias;
+    }
+    out
+}
+
+/// Parse a (possibly schema-qualified, possibly quoted) identifier starting
+/// at `start` and return `(last_component, end_offset)`. Returns
+/// `("", start)` for non-identifier starts (e.g. `(`, digits, etc.) so the
+/// caller can skip subqueries / table functions.
+fn parse_qualified_ident_tail(sql: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    if start >= len {
+        return None;
+    }
+    let mut last_name = String::new();
+    let mut i = start;
+    loop {
+        if i >= len {
+            break;
+        }
+        let b = bytes[i];
+        // Quoted ident.
+        if b == b'"' {
+            let id_start = i + 1;
+            let mut k = id_start;
+            while k < len && bytes[k] != b'"' {
+                k += 1;
+            }
+            if k >= len {
+                return None;
+            }
+            last_name = sql[id_start..k].to_string();
+            i = k + 1;
+        } else if b.is_ascii_alphabetic() || b == b'_' {
+            let id_start = i;
+            let mut k = id_start;
+            while k < len && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
+                k += 1;
+            }
+            last_name = sql[id_start..k].to_string();
+            i = k;
+        } else {
+            // Not an identifier start.
+            if last_name.is_empty() {
+                return Some((String::new(), start));
+            }
+            break;
+        }
+        // Continue across `.` for schema-qualified refs.
+        if i < len && bytes[i] == b'.' {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    Some((last_name, i))
+}
+
+/// Rewrite `json_agg(<alias>.*)` and `jsonb_agg(<alias>.*)` to the explicit
+/// `<fn>(jsonb_build_object('col1', <alias>."col1", 'col2', <alias>."col2", …))`
+/// form, using the supplied `alias_columns` map for the column list.
+///
+/// DataFusion's physical planner rejects the qualified-wildcard form inside a
+/// scalar aggregate (`Physical plan does not support logical expression
+/// Wildcard { qualifier: Some(...) }`). The expanded form is semantically
+/// identical and only uses unqualified column refs + the `jsonb_build_object`
+/// UDF, both of which are wired end-to-end.
+///
+/// Aliases not present in `alias_columns` are left unchanged (the rewriter
+/// is a no-op for the false-positive case where the FROM-clause scan failed
+/// to resolve the alias to a real table — DataFusion will surface its normal
+/// error for genuinely invalid SQL).
+///
+/// Each column key in the produced `jsonb_build_object` matches the column
+/// name verbatim (PostgreSQL's `json_agg(t.*)` preserves the column name as
+/// the JSON key); column refs are double-quoted on the RHS so case-sensitive
+/// names like `"userId"` round-trip correctly.
+pub(crate) fn rewrite_json_agg_qualified_wildcard(
+    sql: &str,
+    alias_columns: &std::collections::HashMap<String, Vec<String>>,
+) -> String {
+    let lower = sql.to_ascii_lowercase();
+    if !lower.contains("json_agg") && !lower.contains("jsonb_agg") {
+        return sql.to_string();
+    }
+    if alias_columns.is_empty() {
+        return sql.to_string();
+    }
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let lower_bytes = lower.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 64);
+    let mut i = 0usize;
+    while i < len {
+        let b = bytes[i];
+        // Pass through string literals verbatim.
+        if b == b'\'' {
+            let end = skip_quoted_string(sql, i);
+            out.push_str(&sql[i..end]);
+            i = end;
+            continue;
+        }
+        // Pass through double-quoted identifiers verbatim.
+        if b == b'"' {
+            let start = i;
+            i += 1;
+            while i < len && bytes[i] != b'"' {
+                i += 1;
+            }
+            if i < len {
+                i += 1;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        // Pass through line comments verbatim.
+        if b == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
+            let start = i;
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        // Pass through block comments verbatim.
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            let start = i;
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < len {
+                i += 2;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        // Look for `json_agg(` / `jsonb_agg(` at a word boundary.
+        let rest_lower = &lower_bytes[i..];
+        let (fn_name, fn_len) = if rest_lower.starts_with(b"jsonb_agg(") {
+            ("jsonb_agg", 10usize)
+        } else if rest_lower.starts_with(b"json_agg(") {
+            ("json_agg", 9usize)
+        } else {
+            out.push(b as char);
+            i += 1;
+            continue;
+        };
+        // Word-boundary check on the left.
+        let prev_ok = out
+            .as_bytes()
+            .last()
+            .map(|c| !(c.is_ascii_alphanumeric() || *c == b'_'))
+            .unwrap_or(true);
+        if !prev_ok {
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        // Parse `<alias>.*` inside the parens.
+        let arg_start = i + fn_len;
+        let mut j = arg_start;
+        while j < len && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        // Parse identifier (quoted or bare).
+        let (alias, after) = if j < len && bytes[j] == b'"' {
+            let id_start = j + 1;
+            let mut k = id_start;
+            while k < len && bytes[k] != b'"' {
+                k += 1;
+            }
+            if k >= len {
+                out.push(b as char);
+                i += 1;
+                continue;
+            }
+            (sql[id_start..k].to_string(), k + 1)
+        } else {
+            let id_start = j;
+            let mut k = id_start;
+            while k < len && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
+                k += 1;
+            }
+            if k == id_start {
+                out.push(b as char);
+                i += 1;
+                continue;
+            }
+            (sql[id_start..k].to_string(), k)
+        };
+        // Optional whitespace, then `.`, optional whitespace, then `*`,
+        // optional whitespace, then `)`.
+        let mut k = after;
+        while k < len && bytes[k].is_ascii_whitespace() {
+            k += 1;
+        }
+        if k >= len || bytes[k] != b'.' {
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        k += 1;
+        while k < len && bytes[k].is_ascii_whitespace() {
+            k += 1;
+        }
+        if k >= len || bytes[k] != b'*' {
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        k += 1;
+        while k < len && bytes[k].is_ascii_whitespace() {
+            k += 1;
+        }
+        if k >= len || bytes[k] != b')' {
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        // Look up the column list. If the alias isn't in the map, leave the
+        // call unchanged (false-positive — DataFusion will report its own
+        // error for genuinely invalid SQL).
+        let Some(columns) = alias_columns.get(&alias) else {
+            out.push(b as char);
+            i += 1;
+            continue;
+        };
+        if columns.is_empty() {
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        // Build the expansion: `<fn>(jsonb_build_object('c1', a."c1", …))`.
+        out.push_str(fn_name);
+        out.push_str("(jsonb_build_object(");
+        for (idx, col) in columns.iter().enumerate() {
+            if idx > 0 {
+                out.push_str(", ");
+            }
+            // Key: PG's json_agg(t.*) uses the column name as the key, with
+            // no quoting. Escape single quotes by doubling them.
+            out.push('\'');
+            for ch in col.chars() {
+                if ch == '\'' {
+                    out.push('\'');
+                }
+                out.push(ch);
+            }
+            out.push_str("', ");
+            // Value: <alias>."col" (alias bare, column double-quoted to
+            // preserve case for names like `userId`).
+            out.push_str(&alias);
+            out.push_str(".\"");
+            out.push_str(col);
+            out.push('"');
+        }
+        out.push_str("))");
+        i = k + 1;
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -7992,5 +8606,184 @@ mod tests {
         let sql = "SELECT body->2 FROM t";
         let out = rewrite_jsonb_arrow_op_spacing(sql);
         assert!(out.contains("body -> 2"), "got: {out}");
+    }
+
+    // ── json_agg(<alias>.*) qualified wildcard expansion ────────────────────
+
+    fn mk_alias_cols(pairs: &[(&str, &[&str])]) -> std::collections::HashMap<String, Vec<String>> {
+        pairs
+            .iter()
+            .map(|(a, cs)| {
+                (
+                    (*a).to_string(),
+                    cs.iter().map(|c| (*c).to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rewrites_json_agg_star_to_object() {
+        let sql = r#"SELECT (SELECT json_agg(o.*) FROM "Order" o WHERE o."userId" = u.id) AS orders FROM "User" u"#;
+        let map = mk_alias_cols(&[("o", &["id", "userId", "status", "total"])]);
+        let out = rewrite_json_agg_qualified_wildcard(sql, &map);
+        assert!(
+            out.contains("json_agg(jsonb_build_object("),
+            "should expand wildcard: {out}"
+        );
+        assert!(out.contains("'id', o.\"id\""), "id key/val: {out}");
+        assert!(out.contains("'userId', o.\"userId\""), "userId key/val: {out}");
+        assert!(out.contains("'status', o.\"status\""), "status key/val: {out}");
+        assert!(out.contains("'total', o.\"total\""), "total key/val: {out}");
+        // The qualified wildcard must be gone.
+        assert!(!out.contains("o.*)"), "qualified wildcard removed: {out}");
+    }
+
+    #[test]
+    fn rewrites_jsonb_agg_star_to_object() {
+        let sql = "SELECT jsonb_agg(o.*) FROM orders o";
+        let map = mk_alias_cols(&[("o", &["id", "user_id"])]);
+        let out = rewrite_json_agg_qualified_wildcard(sql, &map);
+        assert!(
+            out.contains("jsonb_agg(jsonb_build_object("),
+            "should expand jsonb_agg wildcard: {out}"
+        );
+        assert!(out.contains("'id', o.\"id\""), "id pair: {out}");
+        assert!(out.contains("'user_id', o.\"user_id\""), "user_id pair: {out}");
+    }
+
+    #[test]
+    fn preserves_unqualified_json_agg() {
+        // `json_agg(o)` (no `.*`) is a different form (aggregate the whole
+        // row-as-tuple) and must NOT be rewritten.
+        let sql = "SELECT json_agg(o) FROM orders o";
+        let map = mk_alias_cols(&[("o", &["id"])]);
+        let out = rewrite_json_agg_qualified_wildcard(sql, &map);
+        assert_eq!(out, sql, "no rewrite when no .* suffix: {out}");
+    }
+
+    #[test]
+    fn preserves_explicit_column_lists() {
+        // An explicit jsonb_build_object call must pass through unchanged.
+        let sql = "SELECT json_agg(jsonb_build_object('id', o.id)) FROM orders o";
+        let map = mk_alias_cols(&[("o", &["id", "total"])]);
+        let out = rewrite_json_agg_qualified_wildcard(sql, &map);
+        assert_eq!(out, sql, "explicit form unchanged: {out}");
+    }
+
+    #[test]
+    fn handles_unknown_table_alias_gracefully() {
+        // Alias `zzz` not in the map — pass through unchanged.
+        let sql = "SELECT json_agg(zzz.*) FROM something zzz";
+        let map = mk_alias_cols(&[("o", &["id"])]);
+        let out = rewrite_json_agg_qualified_wildcard(sql, &map);
+        assert_eq!(
+            out, sql,
+            "unknown alias leaves SQL unchanged (false-positive guard): {out}"
+        );
+    }
+
+    #[test]
+    fn respects_string_literals() {
+        // The literal `'json_agg(o.*)'` must NOT be expanded.
+        let sql = "SELECT 'json_agg(o.*)' AS s FROM dual";
+        let map = mk_alias_cols(&[("o", &["id"])]);
+        let out = rewrite_json_agg_qualified_wildcard(sql, &map);
+        assert_eq!(out, sql, "literal preserved: {out}");
+    }
+
+    #[test]
+    fn respects_comments() {
+        // A `-- json_agg(o.*)` line comment must NOT be expanded.
+        let sql = "SELECT 1 -- json_agg(o.*) ignore me\nFROM dual";
+        let map = mk_alias_cols(&[("o", &["id"])]);
+        let out = rewrite_json_agg_qualified_wildcard(sql, &map);
+        assert_eq!(out, sql, "line comment preserved: {out}");
+        // Block comment too.
+        let sql2 = "SELECT /* json_agg(o.*) */ 1 FROM dual";
+        let out2 = rewrite_json_agg_qualified_wildcard(sql2, &map);
+        assert_eq!(out2, sql2, "block comment preserved: {out2}");
+    }
+
+    #[test]
+    fn multiple_json_agg_in_same_query() {
+        // Two qualified wildcards in the same statement — both must be expanded.
+        let sql = "SELECT json_agg(o.*) AS a, jsonb_agg(p.*) AS b FROM o, p";
+        let map = mk_alias_cols(&[("o", &["id"]), ("p", &["name"])]);
+        let out = rewrite_json_agg_qualified_wildcard(sql, &map);
+        assert!(
+            out.contains("json_agg(jsonb_build_object('id', o.\"id\"))"),
+            "first expanded: {out}"
+        );
+        assert!(
+            out.contains("jsonb_agg(jsonb_build_object('name', p.\"name\"))"),
+            "second expanded: {out}"
+        );
+    }
+
+    // ── collect_json_agg_star_aliases ───────────────────────────────────────
+
+    #[test]
+    fn collect_finds_simple_alias() {
+        let sql = "SELECT json_agg(o.*) FROM orders o";
+        let mut aliases = collect_json_agg_star_aliases(sql);
+        aliases.sort();
+        assert_eq!(aliases, vec!["o".to_string()]);
+    }
+
+    #[test]
+    fn collect_dedups_and_finds_jsonb_form() {
+        let sql = "SELECT json_agg(o.*), jsonb_agg(o.*), jsonb_agg(p.*) FROM o, p";
+        let mut aliases = collect_json_agg_star_aliases(sql);
+        aliases.sort();
+        assert_eq!(aliases, vec!["o".to_string(), "p".to_string()]);
+    }
+
+    #[test]
+    fn collect_ignores_string_and_comment() {
+        let sql = "SELECT 'json_agg(o.*)' /* json_agg(p.*) */ FROM t";
+        let aliases = collect_json_agg_star_aliases(sql);
+        assert!(aliases.is_empty(), "got: {aliases:?}");
+    }
+
+    // ── extract_from_alias_table_map ────────────────────────────────────────
+
+    #[test]
+    fn extract_simple_bare_alias() {
+        let sql = "SELECT 1 FROM orders o WHERE o.id = 1";
+        let map = extract_from_alias_table_map(sql);
+        assert_eq!(map.get("o").map(String::as_str), Some("orders"));
+    }
+
+    #[test]
+    fn extract_quoted_table_and_alias() {
+        let sql = r#"SELECT 1 FROM "Order" o WHERE o."userId" = 1"#;
+        let map = extract_from_alias_table_map(sql);
+        assert_eq!(map.get("o").map(String::as_str), Some("Order"));
+    }
+
+    #[test]
+    fn extract_as_keyword_alias() {
+        let sql = "SELECT 1 FROM orders AS o";
+        let map = extract_from_alias_table_map(sql);
+        assert_eq!(map.get("o").map(String::as_str), Some("orders"));
+    }
+
+    #[test]
+    fn extract_join_alias() {
+        let sql = "SELECT 1 FROM users u JOIN orders o ON o.user_id = u.id";
+        let map = extract_from_alias_table_map(sql);
+        assert_eq!(map.get("u").map(String::as_str), Some("users"));
+        assert_eq!(map.get("o").map(String::as_str), Some("orders"));
+    }
+
+    #[test]
+    fn extract_skips_no_alias() {
+        let sql = "SELECT * FROM orders WHERE id = 1";
+        let map = extract_from_alias_table_map(sql);
+        assert!(
+            !map.contains_key("WHERE") && !map.contains_key("where"),
+            "must not treat keyword as alias: {map:?}"
+        );
     }
 }

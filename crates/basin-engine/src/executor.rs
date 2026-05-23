@@ -1112,6 +1112,20 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     let rewritten = crate::pg_operators::rewrite_vector_cast(&rewritten);
     // Phase 5.26.B: rewrite `col::text` → `vector_to_text(col)` before operators.
     let rewritten = crate::pg_operators::rewrite_vector_col_text_cast(&rewritten);
+    // Expand `json_agg(<alias>.*)` / `jsonb_agg(<alias>.*)` to the explicit
+    // `jsonb_build_object(...)` form. Prisma's nested-read shape (correlated
+    // subquery returning `json_agg(o.*)`) hits a DataFusion physical-planner
+    // gap: it rejects `Wildcard { qualifier: Some(...) }` inside scalar
+    // aggregates with XX000. The expansion is semantically identical and
+    // only uses unqualified column refs + the wired `jsonb_build_object` UDF.
+    // The catalog lookup builds the alias→columns map; aliases that don't
+    // resolve to a real table fall through unchanged (false-positive guard).
+    let rewritten = rewrite_json_agg_qualified_wildcard_with_catalog(
+        &rewritten,
+        sess.engine.config().catalog.as_ref(),
+        &sess.project,
+    )
+    .await;
     let rewritten = crate::udf::rewrite_vector_operators(&rewritten);
     // Normalise whitespace around the PG JSON path operators (`->`, `->>`,
     // `#>`, `#>>`) before the JSON-op rewriter sees them.  Without this pass,
@@ -2113,6 +2127,63 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
         crate::session::tx_set_aborted(&sess.state);
     }
     result
+}
+
+/// Async wrapper around [`pg_operators::rewrite_json_agg_qualified_wildcard`]
+/// that resolves the alias→table map from the SQL's FROM clauses, loads each
+/// table's column list from the catalog, and hands the resulting
+/// `HashMap<alias, Vec<column>>` to the pure rewriter.
+///
+/// Fast-paths when the SQL contains no `json_agg`/`jsonb_agg` token. The
+/// rewriter is a no-op (returns SQL unchanged) when:
+///   1. No qualified-wildcard `<fn>(<alias>.*)` is present.
+///   2. The alias doesn't appear in a `FROM <table> [AS] <alias>` clause.
+///   3. The resolved table name doesn't exist in the catalog.
+///   4. The catalog load fails (logged at debug, SQL passes through unchanged
+///      so the downstream parser surfaces the original error).
+async fn rewrite_json_agg_qualified_wildcard_with_catalog(
+    sql: &str,
+    catalog: &dyn basin_catalog::Catalog,
+    project: &basin_common::ProjectId,
+) -> String {
+    let aliases = crate::pg_operators::collect_json_agg_star_aliases(sql);
+    if aliases.is_empty() {
+        return sql.to_string();
+    }
+    let alias_table = crate::pg_operators::extract_from_alias_table_map(sql);
+    let mut alias_columns: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for alias in aliases {
+        let Some(table_str) = alias_table.get(&alias) else {
+            continue;
+        };
+        let Ok(table_name) = TableName::new(table_str.clone()) else {
+            continue;
+        };
+        match catalog.load_table(project, &table_name).await {
+            Ok(meta) => {
+                let cols: Vec<String> = meta
+                    .schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect();
+                if !cols.is_empty() {
+                    alias_columns.insert(alias, cols);
+                }
+            }
+            Err(_) => {
+                // Unknown table — leave the json_agg call unchanged so the
+                // user sees the genuine "table not found" error from the
+                // planner rather than a confusing expansion failure.
+                continue;
+            }
+        }
+    }
+    if alias_columns.is_empty() {
+        return sql.to_string();
+    }
+    crate::pg_operators::rewrite_json_agg_qualified_wildcard(sql, &alias_columns)
 }
 
 /// Execute a `VectorSearchPlan` produced by `vector_planner`. Calls
@@ -5144,6 +5215,23 @@ fn write_options_for(meta: &TableMetadata) -> WriteOptions {
             .global_sort_order
             .clone()
             .unwrap_or_default(),
+        // Opt-in Vortex fast-write mode for direct bulk INSERTs. Default
+        // is `Best` so existing call sites are byte-identical; setting
+        // `BASIN_FAST_BULK_INSERT=1` flips every direct INSERT through the
+        // minimal cascade (~3-4x faster encode at ~1.5x disk size). The
+        // next compaction rewrites the file with `Best`, so the disk-size
+        // delta is transient. Hot-tier flushes always use `Fast` and are
+        // independent of this env var (see basin-shard ShardFlushBackend).
+        // Ignored on Parquet tables (writer.rs handles that).
+        encoding_mode: if std::env::var_os("BASIN_FAST_BULK_INSERT")
+            .as_deref()
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            basin_storage::EncodingMode::Fast
+        } else {
+            basin_storage::EncodingMode::Best
+        },
     }
 }
 
