@@ -477,54 +477,68 @@ async fn fast_path_skipped_inside_explicit_transaction() {
     );
 }
 
-/// Compare DELETE-WHERE-IN latency with the fast path ON vs OFF against
-/// a single-PK table. With the fast path ON, DELETE skips the
-/// copy-on-write Parquet rewrite (`pre_mutation_flush`,
-/// `list_data_files_with_stats`, `write_replacement`, `commit_replace`,
-/// `delete_objects`, `refresh_table`) and reports back in microseconds;
-/// with it OFF it falls through the slow CoW path which on this small
-/// dataset is still tens of milliseconds. The threshold is generous —
-/// the spread on a real workload is 2-3 orders of magnitude — so this
-/// test is robust on a hot/cold/loaded host but still proves "fast path
-/// is firing and is materially cheaper than the slow path".
+/// Compare DELETE-WHERE-IN latency: fast path (single PK, env var ON)
+/// vs slow path (composite PK, fast-path gate forces fall-through). The
+/// fast path skips the copy-on-write Parquet rewrite
+/// (`pre_mutation_flush`, `list_data_files_with_stats`,
+/// `write_replacement`, `commit_replace`, `delete_objects`,
+/// `refresh_table`) and reports back in microseconds; the slow path on
+/// this small dataset is still tens of milliseconds.
+///
+/// We deliberately use a *table-shape* trigger (single vs composite PK)
+/// for the slow/fast split instead of toggling the env var mid-test.
+/// `std::env::set_var` is process-wide; sibling cargo tests running in
+/// parallel could flip the var between our two timed runs and produce a
+/// false ratio. The PK-shape split is stable.
+///
+/// The threshold is generous — the spread on a real workload is 2-3
+/// orders of magnitude — so this test is robust on a hot/cold/loaded
+/// host but still proves "fast path is firing and is materially cheaper
+/// than the slow path".
 #[tokio::test]
 async fn fast_path_bulk_delete_is_materially_faster_than_slow_path() {
     use std::time::Instant;
 
-    // Run the slow path first so the env-var-OFF case isn't polluted by
-    // having any tombstones leftover (registry is per-process).
+    // Slow path: composite PK forces the fast-path gate to bail
+    // regardless of the env var.
     let slow_ms: f64 = {
-        std::env::set_var("BASIN_HOTTIER_DELETE_FASTPATH", "0");
         let (_dir, eng) = open_engine().await;
         let sess = session(&eng).await;
-        sess.execute("CREATE TABLE pk_perf_slow (id BIGINT PRIMARY KEY, v TEXT NOT NULL)")
-            .await
-            .unwrap();
-        let mut stmt = String::from("INSERT INTO pk_perf_slow (id, v) VALUES ");
+        sess.execute(
+            "CREATE TABLE pk_perf_composite (\
+                a BIGINT NOT NULL, b BIGINT NOT NULL, v TEXT NOT NULL, \
+                PRIMARY KEY (a, b))",
+        )
+        .await
+        .unwrap();
+        let mut stmt = String::from("INSERT INTO pk_perf_composite (a, b, v) VALUES ");
         for i in 0..100i64 {
             if i > 0 {
                 stmt.push(',');
             }
-            stmt.push_str(&format!("({i}, 'v{i}')"));
+            stmt.push_str(&format!("({i}, 1, 'v{i}')"));
         }
         sess.execute(&stmt).await.unwrap();
+        // Hit one row at a time on the slow path so the work shape
+        // mirrors the fast path's per-PK cost.
         let start = Instant::now();
         sess.execute(
-            "DELETE FROM pk_perf_slow WHERE id IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)",
+            "DELETE FROM pk_perf_composite WHERE a IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10) AND b = 1",
         )
         .await
         .unwrap();
         start.elapsed().as_secs_f64() * 1000.0
     };
 
+    // Fast path: single-column PK + env var on.
     let fast_ms: f64 = {
         std::env::set_var("BASIN_HOTTIER_DELETE_FASTPATH", "1");
         let (_dir, eng) = open_engine().await;
         let sess = session(&eng).await;
-        sess.execute("CREATE TABLE pk_perf_fast (id BIGINT PRIMARY KEY, v TEXT NOT NULL)")
+        sess.execute("CREATE TABLE pk_perf_single (id BIGINT PRIMARY KEY, v TEXT NOT NULL)")
             .await
             .unwrap();
-        let mut stmt = String::from("INSERT INTO pk_perf_fast (id, v) VALUES ");
+        let mut stmt = String::from("INSERT INTO pk_perf_single (id, v) VALUES ");
         for i in 0..100i64 {
             if i > 0 {
                 stmt.push(',');
@@ -534,16 +548,20 @@ async fn fast_path_bulk_delete_is_materially_faster_than_slow_path() {
         sess.execute(&stmt).await.unwrap();
         let start = Instant::now();
         sess.execute(
-            "DELETE FROM pk_perf_fast WHERE id IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)",
+            "DELETE FROM pk_perf_single WHERE id IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)",
         )
         .await
         .unwrap();
         start.elapsed().as_secs_f64() * 1000.0
     };
 
-    eprintln!("[fast_path_bench] slow={slow_ms:.2}ms fast={fast_ms:.2}ms ratio={:.1}x", slow_ms / fast_ms);
+    eprintln!(
+        "[fast_path_bench] slow(composite-pk)={slow_ms:.2}ms fast(single-pk)={fast_ms:.2}ms \
+         ratio={:.1}x",
+        slow_ms / fast_ms.max(1e-6)
+    );
     // The slow path on 100 rows + a 10-id IN list rewrites the file: at
-    // minimum 5x slower than the fast path. Real-workload spread is much
+    // minimum 3x slower than the fast path. Real-workload spread is much
     // larger; this threshold tolerates a noisy CI box.
     assert!(
         slow_ms > fast_ms * 3.0,
