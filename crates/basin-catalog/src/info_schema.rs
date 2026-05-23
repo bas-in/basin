@@ -220,6 +220,8 @@ impl InfoSchemaQuery {
     /// | attrelid       | BIGINT  | the table's pg_class oid                |
     /// | attname        | TEXT    | column name                             |
     /// | atttypid       | BIGINT  | PG type OID (23 = int4, 25 = text, …)   |
+    /// | atttypmod      | INT     | type modifier (VARCHAR(N), NUMERIC(p,s));
+    ///                              -1 = no modifier. v0.1 always emits -1  |
     /// | attnum         | SMALLINT| 1-based                                 |
     /// | attnotnull     | BOOL    | true if column is NOT NULL              |
     /// | atthasdef      | BOOL    | true if column has DEFAULT              |
@@ -229,6 +231,7 @@ impl InfoSchemaQuery {
             Field::new("attrelid", DataType::Int64, false),
             Field::new("attname", DataType::Utf8, false),
             Field::new("atttypid", DataType::Int64, false),
+            Field::new("atttypmod", DataType::Int32, false),
             Field::new("attnum", DataType::Int16, false),
             Field::new("attnotnull", DataType::Boolean, false),
             Field::new("atthasdef", DataType::Boolean, false),
@@ -326,6 +329,7 @@ impl InfoSchemaQuery {
         let mut attrelids: Vec<i64> = Vec::new();
         let mut attnames: Vec<String> = Vec::new();
         let mut atttypids: Vec<i64> = Vec::new();
+        let mut atttypmods: Vec<i32> = Vec::new();
         let mut attnums: Vec<i16> = Vec::new();
         let mut attnotnulls: Vec<bool> = Vec::new();
         let mut atthasdefs: Vec<bool> = Vec::new();
@@ -338,6 +342,12 @@ impl InfoSchemaQuery {
                 attrelids.push(relid);
                 attnames.push(field.name().clone());
                 atttypids.push(pg_type_oid_for_field(field));
+                // v0.1: no per-column type modifier (VARCHAR(N),
+                // NUMERIC(p,s) length/precision aren't tracked yet).
+                // PG returns -1 when no modifier — emit the same so
+                // ORMs like Prisma that filter `atttypmod > 0` see
+                // the correct "unconstrained" signal.
+                atttypmods.push(-1);
                 attnums.push((idx as i16) + 1);
                 attnotnulls.push(!field.is_nullable());
                 // v0.1 only persists default-expression text for
@@ -354,6 +364,7 @@ impl InfoSchemaQuery {
             Arc::new(Int64Array::from(attrelids)),
             Arc::new(StringArray::from(attnames)),
             Arc::new(Int64Array::from(atttypids)),
+            Arc::new(Int32Array::from(atttypmods)),
             Arc::new(Int16Array::from(attnums)),
             Arc::new(BooleanArray::from(attnotnulls)),
             Arc::new(BooleanArray::from(atthasdefs)),
@@ -5137,5 +5148,58 @@ mod tests_5_18_d {
             orders_ns, public_oid,
             "pg_class.relnamespace for public.orders must equal pg_namespace.oid for 'public'"
         );
+    }
+
+    /// `pg_catalog.pg_attribute.atttypmod` must be `-1` for every emitted
+    /// row in v0.1 (Basin doesn't track per-column type modifiers yet).
+    ///
+    /// Prisma's `prisma migrate diff` baseline filters with
+    /// `WHERE att.atttypmod > 0` to find length-constrained columns
+    /// (VARCHAR(N), NUMERIC(p,s)). Returning `-1` lets the query plan and
+    /// produces the canonical "no modifier" PG signal so introspection
+    /// reports "text" / "int4" / etc. without a fabricated length.
+    #[tokio::test]
+    async fn pg_attribute_emits_atttypmod_neg1() {
+        use arrow_array::Int32Array;
+
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+        cat.create_namespace(&p).await.unwrap();
+
+        let qt = QualifiedTableName::in_public(TableName::new("users").unwrap());
+        cat.create_table_qualified(&p, &qt, minimal_schema())
+            .await
+            .unwrap();
+
+        let batch = InfoSchemaQuery::pg_attribute(&cat, &p).await.unwrap();
+
+        // Schema sanity: `atttypmod` is the 4th column (index 3), Int32.
+        let schema = batch.schema();
+        let (idx, field) = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .find(|(_, f)| f.name() == "atttypmod")
+            .expect("pg_attribute must expose atttypmod column");
+        assert_eq!(field.data_type(), &DataType::Int32);
+        assert!(
+            !field.is_nullable(),
+            "atttypmod is NOT NULL in PG; -1 sentinel is the no-modifier value"
+        );
+
+        let atttypmods = batch
+            .column(idx)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("atttypmod must be Int32Array");
+
+        assert!(batch.num_rows() > 0, "minimal_schema has 1 column → 1 row");
+        for i in 0..atttypmods.len() {
+            assert_eq!(
+                atttypmods.value(i),
+                -1,
+                "v0.1 pg_attribute.atttypmod must be -1 (no modifier) for every row; row {i} was not"
+            );
+        }
     }
 }
