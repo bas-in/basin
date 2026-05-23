@@ -1,5 +1,5 @@
 {
-  "generated_at": "@1779541783",
+  "generated_at": "@1779543264",
   "sections": [
     {
       "orm": "Drizzle",
@@ -70,10 +70,10 @@
     {
       "orm": "Prisma",
       "total": 11,
-      "ok": 9,
-      "typed_error": 2,
+      "ok": 10,
+      "typed_error": 1,
       "regression": 0,
-      "pass_rate_pct": 81.81818181818183,
+      "pass_rate_pct": 90.9090909090909,
       "shapes": [
         {
           "sql": "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'User'",
@@ -99,9 +99,7 @@
         },
         {
           "sql": "SELECT pg_get_serial_sequence('\"User\"', 'id')",
-          "outcome": "typed_error",
-          "sqlstate": "XX000",
-          "message": "internal: plan: Error during planning: Invalid function 'pg_get_serial_sequence'.\nDid you mean 'pg_get_partkeydef'?"
+          "outcome": "ok"
         },
         {
           "sql": "CREATE TABLE IF NOT EXISTS \"Profile\" (\n               \"id\"     BIGINT NOT NULL,\n               \"bio\"    TEXT,\n               \"userId\" BIGINT NOT NULL,\n               PRIMARY KEY (\"id\")\n           )",
@@ -214,10 +212,10 @@
     {
       "orm": "TypeORM",
       "total": 6,
-      "ok": 4,
-      "typed_error": 2,
+      "ok": 6,
+      "typed_error": 0,
       "regression": 0,
-      "pass_rate_pct": 66.66666666666666,
+      "pass_rate_pct": 100.0,
       "shapes": [
         {
           "sql": "SELECT \"users\".\"id\" AS \"users_id\",\"users\".\"email\" AS \"users_email\",\"users\".\"name\" AS \"users_name\"\n           FROM \"users\" WHERE \"users\".\"id\" = 1 LIMIT 1",
@@ -237,21 +235,17 @@
         },
         {
           "sql": "DELETE FROM \"users\" WHERE \"users\".\"id\" IN ($1)",
-          "outcome": "typed_error",
-          "sqlstate": "42601",
-          "message": "invalid schema: WHERE expects column identifier, got \"users\".\"id\""
+          "outcome": "ok"
         },
         {
           "sql": "INSERT INTO \"orders\" (\"id\",\"user_id\",\"status\",\"total\") VALUES (20,1,'new',5.00) RETURNING \"id\"",
-          "outcome": "typed_error",
-          "sqlstate": "42601",
-          "message": "invalid schema: ERROR: current transaction is aborted, commands ignored until end of transaction block (SQLSTATE 25P02)"
+          "outcome": "ok"
         }
       ]
     }
   ],
   "total_shapes": 47,
-  "total_ok": 42,
-  "total_typed_error": 5,
+  "total_ok": 45,
+  "total_typed_error": 2,
   "total_regression": 0
 }

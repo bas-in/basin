@@ -214,6 +214,24 @@ fn register_all(ctx: &SessionContext) {
         signature: sig_oid,
     }));
 
+    // ----------- pg_get_serial_sequence -----------
+    // Prisma calls `pg_get_serial_sequence(table, column)` to derive the
+    // underlying SEQUENCE name for a SERIAL/BIGSERIAL column. Basin doesn't
+    // have real sequences (BIGSERIAL is implemented via per-table catalog
+    // counters), so we synthesize the PG naming convention unconditionally:
+    //   `public.<table>_<column>_seq`
+    // This keeps Prisma's introspection display happy without validating
+    // whether the column actually has a sequence.
+    let sig_get_serial_seq = sig_pg_get_serial_sequence();
+    ctx.register_udf(ScalarUDF::from(PgGetSerialSequenceUdf {
+        name: "pg_get_serial_sequence".into(),
+        signature: sig_get_serial_seq.clone(),
+    }));
+    ctx.register_udf(ScalarUDF::from(PgGetSerialSequenceUdf {
+        name: "pg_catalog.pg_get_serial_sequence".into(),
+        signature: sig_get_serial_seq,
+    }));
+
     // ----------- pg_encoding_to_char -----------
     let sig_enc = Signature::one_of(
         vec![
@@ -466,6 +484,21 @@ fn sig_has_privilege() -> Signature {
             TypeSignature::Exact(vec![DataType::Int64, DataType::Utf8]),
             TypeSignature::Exact(vec![DataType::Int32, DataType::Utf8]),
             TypeSignature::Exact(vec![DataType::UInt32, DataType::Utf8]),
+        ],
+        Volatility::Stable,
+    )
+}
+
+/// Signature for `pg_get_serial_sequence(table_name TEXT, column_name TEXT)`.
+/// Accepts (Utf8, Utf8) and the NULL-typed variants that the planner may infer
+/// when literal NULLs are passed.
+fn sig_pg_get_serial_sequence() -> Signature {
+    Signature::one_of(
+        vec![
+            TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8]),
+            TypeSignature::Exact(vec![DataType::Null, DataType::Utf8]),
+            TypeSignature::Exact(vec![DataType::Utf8, DataType::Null]),
+            TypeSignature::Exact(vec![DataType::Null, DataType::Null]),
         ],
         Volatility::Stable,
     )
@@ -882,6 +915,77 @@ impl ScalarUDFImpl for HasPrivilegeUdf {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PgGetSerialSequenceUdf — pg_get_serial_sequence(table, column) -> text
+//
+// Returns the synthetic PG sequence name `public.<table>_<column>_seq` for
+// any (table, column) pair. Basin has no real sequences (BIGSERIAL is backed
+// by per-table catalog counters), but Prisma calls this purely to derive the
+// display name during introspection. Returns NULL if either argument is NULL.
+//
+// Schema-qualified table names like `"my_schema"."users"` are passed through
+// unchanged in the prefix (we always emit `public.` as the schema prefix per
+// PG convention and don't try to parse the input — Prisma uses the result as
+// an opaque display string).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PgGetSerialSequenceUdf {
+    name: String,
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for PgGetSerialSequenceUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+    #[allow(deprecated)]
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
+        let n = num_rows(args);
+
+        // args[0] = table_name, args[1] = column_name. Coerce both to arrays.
+        let table_col = args[0].clone().into_array(n)?;
+        let column_col = args[1].clone().into_array(n)?;
+
+        let mut out: Vec<Option<String>> = Vec::with_capacity(n);
+        for i in 0..n {
+            if table_col.is_null(i) || column_col.is_null(i) {
+                out.push(None);
+                continue;
+            }
+            let table = match table_col.data_type() {
+                DataType::Utf8 => table_col
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .map(|a| a.value(i).to_string())
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            let column = match column_col.data_type() {
+                DataType::Utf8 => column_col
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .map(|a| a.value(i).to_string())
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            out.push(Some(format!("public.{table}_{column}_seq")));
+        }
+        let arr: ArrayRef = Arc::new(StringArray::from(out));
+        Ok(ColumnarValue::Array(arr))
+    }
+}
+
 // (Advisory-lock stub UDFs removed — see BUG #138 / advisory_lock.rs. The
 // PG-faithful, session-scoped implementations live in that module and are
 // registered per-session in session::open.)
@@ -950,5 +1054,73 @@ impl ScalarUDFImpl for SimpleConstInt64Udf {
         let n = num_rows(args);
         let arr: ArrayRef = Arc::new(Int64Array::from(vec![self.value; n]));
         Ok(ColumnarValue::Array(arr))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inline unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::datatypes::Field;
+    use datafusion::config::ConfigOptions;
+
+    fn return_field_utf8() -> Arc<Field> {
+        Arc::new(Field::new("_", DataType::Utf8, true))
+    }
+
+    /// Call `pg_get_serial_sequence(table, column)` directly via UDF impl
+    /// and return the single-row text result (or None for NULL).
+    fn call_pg_get_serial_sequence(table: Option<&str>, column: Option<&str>) -> Option<String> {
+        let udf = PgGetSerialSequenceUdf {
+            name: "pg_get_serial_sequence".into(),
+            signature: sig_pg_get_serial_sequence(),
+        };
+        let table_arr: ArrayRef = Arc::new(StringArray::from(vec![table]));
+        let column_arr: ArrayRef = Arc::new(StringArray::from(vec![column]));
+        let args = ScalarFunctionArgs {
+            args: vec![
+                ColumnarValue::Array(table_arr),
+                ColumnarValue::Array(column_arr),
+            ],
+            arg_fields: vec![],
+            number_rows: 1,
+            return_field: return_field_utf8(),
+            config_options: Arc::new(ConfigOptions::default()),
+        };
+        match udf.invoke_with_args(args).unwrap() {
+            ColumnarValue::Array(arr) => {
+                let sa = arr.as_any().downcast_ref::<StringArray>().unwrap();
+                if sa.is_null(0) {
+                    None
+                } else {
+                    Some(sa.value(0).to_string())
+                }
+            }
+            ColumnarValue::Scalar(s) => match s {
+                ScalarValue::Utf8(v) => v,
+                _ => None,
+            },
+        }
+    }
+
+    #[test]
+    fn pg_get_serial_sequence_returns_synthetic_name() {
+        assert_eq!(
+            call_pg_get_serial_sequence(Some("users"), Some("id")),
+            Some("public.users_id_seq".to_string())
+        );
+    }
+
+    #[test]
+    fn pg_get_serial_sequence_null_table_returns_null() {
+        assert_eq!(call_pg_get_serial_sequence(None, Some("id")), None);
+    }
+
+    #[test]
+    fn pg_get_serial_sequence_null_column_returns_null() {
+        assert_eq!(call_pg_get_serial_sequence(Some("users"), None), None);
     }
 }
