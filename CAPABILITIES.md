@@ -306,6 +306,16 @@ Basin's wedge is multi-project SaaS with audit-log workloads where storage
 cost and per-project isolation dominate. If your shape doesn't match, the
 above are honest recommendations.
 
+### Honest parity gaps
+
+The features in the "Batteries included" matrix have these specific v0.1 limits — listed here so users can decide whether the gap blocks their workload:
+
+- **WASM UDFs** are scalar `i32` / `i64` / `f64` only today. String / JSONB / Arrow argument support requires the shared-memory protocol (Wasmtime exported `alloc` / `free` + a UTF-8 transport), tracked for the next phase. Use SQL `LANGUAGE sql` functions for string transforms until then.
+- **Realtime SSE / WebSocket / presence** is shipped (Phases 5.11.R2–R6) but the end-to-end integration harness has `#[ignore]`-gated slices pending un-ignore. Single-client smoke tests pass; cross-client soak coverage in flight.
+- **Blob storage (`basin-blob`)** is engine-seam-only in v0.1: the storage trait exists and can be wired by an embedder, but the SDK surface, signed-URL endpoint, and quota integration are ongoing. Don't ship a public file-upload product on it yet.
+- **REST RPC mount** (`POST /rest/v1/rpc/:fn`) accepts JSON request bodies; binary / multipart bodies (file upload) wait on blob storage finishing.
+- **Vector** — HNSW per-file segment + planner auto-route shipped; IVF-flat and `pg_vector` wire-format compat are explicit non-goals (see [ADR 0003](./docs/decisions/0003-native-vector-search.md)).
+
 ## Documented exclusions (5.22.E)
 
 This section catalogues PostgreSQL features and behaviors Basin intentionally
