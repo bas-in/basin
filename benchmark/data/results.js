@@ -6,18 +6,19 @@ window.__BASIN_RESULTS = {
       "alter_table",
       "basin_cron",
       "basin_net",
-      "bloom_filter_pruning",
       "catalog_stats_pruning",
       "cluster_by_sort_overhead",
       "cluster_by_sql",
       "cold_start",
       "compression_ratio",
+      "continuous_aggregate",
       "disk_cache",
       "idle_project_ram",
       "isolation_under_load",
       "jsonb",
       "kms_envelope",
       "large_dataset_pointquery",
+      "migration_manager",
       "page_cache",
       "partition_pruning",
       "pg_trgm",
@@ -26,17 +27,14 @@ window.__BASIN_RESULTS = {
       "project_deletion",
       "rls_basic",
       "rls_isolation",
-      "row_group_sizing",
-      "tiered_storage",
       "update_delete",
       "uuid"
     ],
     "scaling": [
       "compute_shards",
       "concurrency",
-      "data_size",
       "idle_projects",
-      "perf_stack",
+      "noisy_neighbor",
       "project_count",
       "project_deletion_at_scale",
       "project_deletion_realistic"
@@ -58,22 +56,22 @@ window.__BASIN_RESULTS = {
       "metrics": [
         {
           "label": "Backup wall time",
-          "basin": 0.000126,
-          "postgres": 0.479885792,
+          "basin": 0.000122667,
+          "postgres": 0.38366225,
           "unit": "s",
           "better": "basin",
-          "ratio_text": "pg / basin = 3809x"
+          "ratio_text": "pg / basin = 3128x"
         },
         {
           "label": "Backup byte size",
-          "basin": 948.0,
+          "basin": 823.0,
           "postgres": 6379236.0,
           "unit": "bytes",
           "better": "basin",
-          "ratio_text": "pg / basin = 6729x"
+          "ratio_text": "pg / basin = 7751x"
         }
       ],
-      "generated_at": "@1778866547"
+      "generated_at": "@1779497583"
     },
     "compare_lifecycle_ops": {
       "kind": "compare",
@@ -84,22 +82,22 @@ window.__BASIN_RESULTS = {
       "metrics": [
         {
           "label": "Project deletion (1 project, 100K rows)",
-          "basin": 8.057042000000001,
-          "postgres": 47.250125,
+          "basin": 6.1027499999999995,
+          "postgres": 70.632291,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 5.86x"
+          "ratio_text": "pg / basin = 11.57x"
         },
         {
           "label": "ADD COLUMN on 100K rows",
-          "basin": 0.423792,
-          "postgres": 51.022833,
+          "basin": 2.150167,
+          "postgres": 1.9674580000000002,
           "unit": "ms",
-          "better": "basin",
-          "ratio_text": "pg / basin = 120.40x"
+          "better": "postgres",
+          "ratio_text": "pg / basin = 0.92x"
         }
       ],
-      "generated_at": "@1778866550"
+      "generated_at": "@1779497587"
     },
     "compare_postgres": {
       "kind": "compare",
@@ -110,53 +108,53 @@ window.__BASIN_RESULTS = {
       "metrics": [
         {
           "label": "On-disk bytes",
-          "basin": 8095517.0,
-          "postgres": 101203968.0,
+          "basin": 0.0,
+          "postgres": 101195776.0,
           "unit": "bytes",
           "better": "basin",
-          "ratio_text": "pg / basin = 12.50x"
+          "ratio_text": "pg / basin = 101195776.00x"
         },
         {
           "label": "Point query p50",
-          "basin": 0.438166,
-          "postgres": 13.407,
+          "basin": 0.274375,
+          "postgres": 13.521,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 30.60x"
+          "ratio_text": "pg / basin = 49.28x"
         },
         {
           "label": "Range scan p50 (~10k rows)",
-          "basin": 6.938833,
-          "postgres": 15.919,
+          "basin": 0.307333,
+          "postgres": 18.525,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 2.29x"
+          "ratio_text": "pg / basin = 60.28x"
         },
         {
           "label": "Aggregate COUNT/SUM GROUP BY p50",
-          "basin": 36.03125,
-          "postgres": 107.751,
+          "basin": 14.417917000000001,
+          "postgres": 45.032,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 2.99x"
+          "ratio_text": "pg / basin = 3.12x"
         },
         {
           "label": "Bulk INSERT 1M rows",
-          "basin": 18830.521459,
-          "postgres": 5904.378291999999,
+          "basin": 19730.907208,
+          "postgres": 6662.253709,
           "unit": "ms",
           "better": "postgres"
         },
         {
           "label": "Cold-start first query",
-          "basin": 4.590000000000001,
-          "postgres": 49.792708999999995,
+          "basin": 5.846083999999999,
+          "postgres": 66.891375,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 10.85x"
+          "ratio_text": "pg / basin = 11.44x"
         }
       ],
-      "generated_at": "@1778866580"
+      "generated_at": "@1779497622"
     },
     "compare_server_lifecycle": {
       "kind": "compare",
@@ -167,29 +165,37 @@ window.__BASIN_RESULTS = {
       "metrics": [
         {
           "label": "Connection accept latency p50",
-          "basin": 0.677792,
-          "postgres": 1.194125,
+          "basin": 0.721584,
+          "postgres": 1.233584,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 1.76x"
+          "ratio_text": "pg / basin = 1.71x"
         },
         {
           "label": "Connections held under 1000-conn flood",
           "basin": 1000.0,
-          "postgres": 100.0,
+          "postgres": 99.0,
           "unit": "conns",
           "better": "basin",
-          "ratio_text": "basin / pg = 10.00x"
+          "ratio_text": "basin / pg = 10.10x"
         },
         {
           "label": "Refused conns under 1000-conn flood",
           "basin": 0.0,
-          "postgres": 900.0,
+          "postgres": 901.0,
           "unit": "conns",
           "better": "basin"
+        },
+        {
+          "label": "RSS per held-open connection",
+          "basin": 309.12,
+          "postgres": 7658.08,
+          "unit": "KiB",
+          "better": "basin",
+          "ratio_text": "pg / basin = 24.77x"
         }
       ],
-      "generated_at": "@1778866593"
+      "generated_at": "@1779497643"
     },
     "compare_vortex_parquet": {
       "available": true,
@@ -229,6 +235,273 @@ window.__BASIN_RESULTS = {
       "name": "Parquet (ZSTD) vs Vortex \u2014 audit-log 1M rows",
       "note": "JSON key 'basin'=Parquet, 'postgres'=Vortex (schema reuse from Postgres compare card). Standalone binary: cargo run --manifest-path benchmark/vortex_compare/Cargo.toml --release"
     },
+    "orm_compat": {
+      "generated_at": "@1779464749",
+      "sections": [
+        {
+          "orm": "Drizzle",
+          "total": 14,
+          "ok": 12,
+          "typed_error": 2,
+          "regression": 0,
+          "pass_rate_pct": 85.71428571428571,
+          "shapes": [
+            {
+              "sql": "SELECT \"users\".\"id\", \"users\".\"email\" FROM \"users\" WHERE \"users\".\"email\" = 'alice@example.com' LIMIT 1",
+              "outcome": "ok"
+            },
+            {
+              "sql": "SELECT \"users\".\"id\", \"users\".\"email\" FROM \"users\" WHERE \"users\".\"email\" = $1 LIMIT 1",
+              "outcome": "typed_error",
+              "sqlstate": "XX000",
+              "message": "internal: execute: Execution error: Placeholder '$1' was not provided a value for execution."
+            },
+            {
+              "sql": "INSERT INTO \"users\" (\"id\",\"email\",\"created_at\") VALUES (3,'carol@example.com',NOW()) RETURNING \"id\"",
+              "outcome": "ok"
+            },
+            {
+              "sql": "UPDATE \"users\" SET \"email\" = 'alice2@example.com', \"updated_at\" = NOW() WHERE \"id\" = 1 RETURNING *",
+              "outcome": "ok"
+            },
+            {
+              "sql": "DELETE FROM \"users\" WHERE \"id\" = ANY($1::int[])",
+              "outcome": "typed_error",
+              "sqlstate": "42601",
+              "message": "invalid schema: UPDATE SET id: expected literal of type Int64, got $1::INT[]"
+            },
+            {
+              "sql": "SELECT \"users\".\"id\",\"users\".\"email\",\n               (SELECT count(*) FROM \"orders\" WHERE \"orders\".\"user_id\" = \"users\".\"id\") AS \"order_count\"\n           FROM \"users\"",
+              "outcome": "ok"
+            },
+            {
+              "sql": "SELECT \"users\".\"id\",\"users\".\"email\",\"users\".\"created_at\"\n           FROM \"users\" ORDER BY \"users\".\"created_at\" DESC LIMIT 10 OFFSET 0",
+              "outcome": "ok"
+            },
+            {
+              "sql": "SELECT \"users\".\"id\",\"users\".\"email\",\"orders\".\"id\" AS \"order_id\",\"orders\".\"status\"\n           FROM \"users\"\n           INNER JOIN \"orders\" ON \"orders\".\"user_id\" = \"users\".\"id\"\n           WHERE \"orders\".\"status\" = 'completed'",
+              "outcome": "ok"
+            },
+            {
+              "sql": "SELECT \"users\".\"id\",\"users\".\"email\" FROM \"users\" WHERE \"users\".\"id\" IN (1,2)",
+              "outcome": "ok"
+            },
+            {
+              "sql": "SELECT count(*) AS \"count\" FROM \"users\"",
+              "outcome": "ok"
+            },
+            {
+              "sql": "INSERT INTO \"users\" (\"id\",\"email\") VALUES (99,'dup@example.com') ON CONFLICT DO NOTHING",
+              "outcome": "ok"
+            },
+            {
+              "sql": "SELECT \"users\".\"id\",\"users\".\"email\" FROM \"users\" WHERE \"users\".\"name\" IS NULL",
+              "outcome": "ok"
+            },
+            {
+              "sql": "SELECT \"orders\".\"id\",\"orders\".\"total\" FROM \"orders\" WHERE \"orders\".\"total\" BETWEEN 10.0 AND 100.0",
+              "outcome": "ok"
+            },
+            {
+              "sql": "SELECT u.id, u.email, sub.order_count\n           FROM \"users\" u\n           JOIN (\n               SELECT \"user_id\", count(*) AS order_count\n               FROM \"orders\" GROUP BY \"user_id\"\n           ) sub ON sub.\"user_id\" = u.id",
+              "outcome": "ok"
+            }
+          ]
+        },
+        {
+          "orm": "Prisma",
+          "total": 11,
+          "ok": 9,
+          "typed_error": 2,
+          "regression": 0,
+          "pass_rate_pct": 81.81818181818183,
+          "shapes": [
+            {
+              "sql": "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'User'",
+              "outcome": "ok"
+            },
+            {
+              "sql": "SELECT \"User\".\"id\",\"User\".\"email\",\"User\".\"name\",\"User\".\"createdAt\" FROM \"User\" WHERE \"User\".\"id\" = 1 LIMIT 1",
+              "outcome": "ok"
+            },
+            {
+              "sql": "SELECT \"User\".\"id\",\"User\".\"email\",\"User\".\"name\",\"User\".\"createdAt\" FROM \"User\"",
+              "outcome": "ok"
+            },
+            {
+              "sql": "SELECT count(*) FROM \"Order\"",
+              "outcome": "ok"
+            },
+            {
+              "sql": "SELECT \"User\".\"id\",\"User\".\"email\",\n               (SELECT json_agg(o.*) FROM \"Order\" o WHERE o.\"userId\" = \"User\".\"id\") AS \"orders\"\n           FROM \"User\"",
+              "outcome": "typed_error",
+              "sqlstate": "XX000",
+              "message": "internal: execute: This feature is not implemented: Physical plan does not support logical expression Wildcard { qualifier: Some(Bare { table: \"o\" }), options: WildcardOptions { ilike: None, exclude: None, except: None, replace: None, rename: None } }"
+            },
+            {
+              "sql": "SELECT pg_get_serial_sequence('\"User\"', 'id')",
+              "outcome": "typed_error",
+              "sqlstate": "XX000",
+              "message": "internal: plan: Error during planning: Invalid function 'pg_get_serial_sequence'.\nDid you mean 'pg_get_indexdef'?"
+            },
+            {
+              "sql": "CREATE TABLE IF NOT EXISTS \"Profile\" (\n               \"id\"     BIGINT NOT NULL,\n               \"bio\"    TEXT,\n               \"userId\" BIGINT NOT NULL,\n               PRIMARY KEY (\"id\")\n           )",
+              "outcome": "ok"
+            },
+            {
+              "sql": "INSERT INTO \"User\" (\"id\",\"email\",\"name\")\n           VALUES (5,'eve@example.com','Eve')\n           ON CONFLICT (\"id\") DO UPDATE SET \"email\" = EXCLUDED.\"email\"\n           RETURNING \"id\",\"email\"",
+              "outcome": "ok"
+            },
+            {
+              "sql": "SELECT \"userId\", count(*) AS \"_count\" FROM \"Order\" GROUP BY \"userId\" ORDER BY \"userId\"",
+              "outcome": "ok"
+            },
+            {
+              "sql": "SELECT relname, relkind FROM pg_class WHERE relname = 'User' AND relkind = 'r'",
+              "outcome": "ok"
+            },
+            {
+              "sql": "DELETE FROM \"User\" WHERE \"id\" = 999 RETURNING \"id\"",
+              "outcome": "ok"
+            }
+          ]
+        },
+        {
+          "orm": "sqlx",
+          "total": 8,
+          "ok": 5,
+          "typed_error": 3,
+          "regression": 0,
+          "pass_rate_pct": 62.5,
+          "shapes": [
+            {
+              "sql": "SELECT id, email, name FROM \"users\" WHERE id = $1",
+              "outcome": "typed_error",
+              "sqlstate": "XX000",
+              "message": "internal: execute: Execution error: Placeholder '$1' was not provided a value for execution."
+            },
+            {
+              "sql": "INSERT INTO \"users\" (id, email, name, created_at)\n           VALUES (4,'dave@example.com','Dave',NOW()) RETURNING id, email",
+              "outcome": "ok"
+            },
+            {
+              "sql": "UPDATE \"users\" SET name = 'David' WHERE id = 4",
+              "outcome": "ok"
+            },
+            {
+              "sql": "DELETE FROM \"users\" WHERE id = 4",
+              "outcome": "ok"
+            },
+            {
+              "sql": "SELECT id, email FROM \"users\" WHERE email = $1 AND id > $2",
+              "outcome": "typed_error",
+              "sqlstate": "XX000",
+              "message": "internal: execute: Execution error: Placeholder '$1' was not provided a value for execution."
+            },
+            {
+              "sql": "LISTEN mychannel",
+              "outcome": "typed_error",
+              "sqlstate": "0A000",
+              "message": "feature not supported: LISTEN is not supported (SQLSTATE 0A000)"
+            },
+            {
+              "sql": "SHOW server_version",
+              "outcome": "ok"
+            },
+            {
+              "sql": "BEGIN",
+              "outcome": "ok"
+            }
+          ]
+        },
+        {
+          "orm": "Diesel",
+          "total": 8,
+          "ok": 8,
+          "typed_error": 0,
+          "regression": 0,
+          "pass_rate_pct": 100.0,
+          "shapes": [
+            {
+              "sql": "SELECT id, title, body, user_id FROM posts WHERE id = 1",
+              "outcome": "ok"
+            },
+            {
+              "sql": "INSERT INTO posts (id, title, body, user_id)\n           VALUES (3,'Third Post','New content',1) RETURNING id, title",
+              "outcome": "ok"
+            },
+            {
+              "sql": "UPDATE posts SET title = 'Updated Title' WHERE id = 1 RETURNING id, title",
+              "outcome": "ok"
+            },
+            {
+              "sql": "DELETE FROM posts WHERE id = 999",
+              "outcome": "ok"
+            },
+            {
+              "sql": "SELECT posts.id, posts.title, posts.body, posts.user_id\n           FROM posts\n           INNER JOIN \"users\" ON posts.user_id = \"users\".\"id\"\n           WHERE \"users\".\"email\" = 'alice@example.com'",
+              "outcome": "ok"
+            },
+            {
+              "sql": "SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = 'public'",
+              "outcome": "ok"
+            },
+            {
+              "sql": "SELECT id, title, body, user_id FROM posts ORDER BY id ASC LIMIT 10 OFFSET 0",
+              "outcome": "ok"
+            },
+            {
+              "sql": "SELECT count(*) FROM posts WHERE user_id = 1",
+              "outcome": "ok"
+            }
+          ]
+        },
+        {
+          "orm": "TypeORM",
+          "total": 6,
+          "ok": 3,
+          "typed_error": 3,
+          "regression": 0,
+          "pass_rate_pct": 50.0,
+          "shapes": [
+            {
+              "sql": "SELECT \"users\".\"id\" AS \"users_id\",\"users\".\"email\" AS \"users_email\",\"users\".\"name\" AS \"users_name\"\n           FROM \"users\" WHERE \"users\".\"id\" = 1 LIMIT 1",
+              "outcome": "ok"
+            },
+            {
+              "sql": "SELECT \"users\".\"id\" AS \"users_id\",\"users\".\"email\" AS \"users_email\",\n                  \"orders\".\"id\" AS \"orders_id\",\"orders\".\"status\" AS \"orders_status\"\n           FROM \"users\"\n           LEFT JOIN \"orders\" ON \"orders\".\"user_id\" = \"users\".\"id\"\n           WHERE \"orders\".\"status\" = 'completed'",
+              "outcome": "ok"
+            },
+            {
+              "sql": "SELECT count(\"users\".\"id\") AS \"cnt\" FROM \"users\"",
+              "outcome": "ok"
+            },
+            {
+              "sql": "SELECT \"users\".\"id\",\"users\".\"email\" FROM \"users\" WHERE \"users\".\"id\" = $1",
+              "outcome": "typed_error",
+              "sqlstate": "XX000",
+              "message": "internal: execute: Execution error: Placeholder '$1' was not provided a value for execution."
+            },
+            {
+              "sql": "DELETE FROM \"users\" WHERE \"users\".\"id\" IN ($1)",
+              "outcome": "typed_error",
+              "sqlstate": "42601",
+              "message": "invalid schema: ERROR: current transaction is aborted, commands ignored until end of transaction block (SQLSTATE 25P02)"
+            },
+            {
+              "sql": "INSERT INTO \"orders\" (\"id\",\"user_id\",\"status\",\"total\") VALUES (20,1,'new',5.00) RETURNING \"id\"",
+              "outcome": "typed_error",
+              "sqlstate": "42601",
+              "message": "invalid schema: ERROR: current transaction is aborted, commands ignored until end of transaction block (SQLSTATE 25P02)"
+            }
+          ]
+        }
+      ],
+      "total_shapes": 47,
+      "total_ok": 37,
+      "total_typed_error": 10,
+      "total_regression": 0
+    },
     "scaling_compute_shards": {
       "kind": "scaling",
       "id": "compute_shards",
@@ -253,36 +526,36 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "load_pct": 25.0,
-          "projects": 25,
+          "load_pct": 19.0,
+          "projects": 19,
           "shard": 0
         },
         {
-          "load_pct": 24.0,
-          "projects": 24,
+          "load_pct": 31.0,
+          "projects": 31,
           "shard": 1
         },
         {
-          "load_pct": 27.0,
-          "projects": 27,
+          "load_pct": 21.0,
+          "projects": 21,
           "shard": 2
         },
         {
-          "load_pct": 24.0,
-          "projects": 24,
+          "load_pct": 29.0,
+          "projects": 29,
           "shard": 3
         }
       ],
       "primary": {
         "label": "max shard load",
-        "value": 27.0,
+        "value": 31.0,
         "unit": "%",
         "bar": {
           "op": "less_than",
           "value": 50.0
         }
       },
-      "generated_at": "@1778866546"
+      "generated_at": "@1779497580"
     },
     "scaling_concurrency": {
       "kind": "scaling",
@@ -314,39 +587,39 @@ window.__BASIN_RESULTS = {
       "rows": [
         {
           "concurrency": 1,
-          "median_latency_us": 1819.0,
-          "per_task_qps": 515.0,
-          "total_qps": 515.0
+          "median_latency_us": 27570.0,
+          "per_task_qps": 34.666666666666664,
+          "total_qps": 34.666666666666664
         },
         {
           "concurrency": 4,
-          "median_latency_us": 254.0,
-          "per_task_qps": 457.0,
-          "total_qps": 1828.0
+          "median_latency_us": 544.0,
+          "per_task_qps": 36.333333333333336,
+          "total_qps": 145.33333333333334
         },
         {
           "concurrency": 16,
-          "median_latency_us": 5019.0,
-          "per_task_qps": 123.39583333333333,
-          "total_qps": 1974.3333333333333
+          "median_latency_us": 340.0,
+          "per_task_qps": 19.208333333333332,
+          "total_qps": 307.3333333333333
         },
         {
           "concurrency": 64,
-          "median_latency_us": 13849.0,
-          "per_task_qps": 40.927083333333336,
-          "total_qps": 2619.3333333333335
+          "median_latency_us": 144281.0,
+          "per_task_qps": 4.567708333333333,
+          "total_qps": 292.3333333333333
         }
       ],
       "primary": {
         "label": "peak speed-up vs C=1",
-        "value": 5.086084142394823,
+        "value": 8.865384615384615,
         "unit": "x",
         "bar": {
           "op": "greater_than_or_equal",
           "value": 3.5
         }
       },
-      "generated_at": "@1778866559"
+      "generated_at": "@1779497595"
     },
     "scaling_data_size": {
       "kind": "scaling",
@@ -443,46 +716,46 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "per_project_kib": 1.6,
+          "per_project_kib": 3.68,
           "projects": 100,
-          "provision_ms": 0.080292,
-          "rss_delta_kib": 160
+          "provision_ms": 0.19283399999999998,
+          "rss_delta_kib": 368
         },
         {
-          "per_project_kib": 1.056,
+          "per_project_kib": 2.016,
           "projects": 1000,
-          "provision_ms": 0.721834,
-          "rss_delta_kib": 1056
+          "provision_ms": 1.536041,
+          "rss_delta_kib": 2016
         },
         {
-          "per_project_kib": 0.9408,
+          "per_project_kib": 1.7344,
           "projects": 5000,
-          "provision_ms": 3.5248329999999997,
-          "rss_delta_kib": 4704
+          "provision_ms": 7.660916,
+          "rss_delta_kib": 8672
         },
         {
-          "per_project_kib": 1.0848,
+          "per_project_kib": 2.1408,
           "projects": 10000,
-          "provision_ms": 7.71425,
-          "rss_delta_kib": 10848
+          "provision_ms": 17.814583,
+          "rss_delta_kib": 21408
         }
       ],
       "primary": {
         "label": "max per_project_kib across scales",
-        "value": 1.6,
+        "value": 3.68,
         "unit": "KiB",
         "bar": {
           "op": "less_than",
           "value": 5.0
         }
       },
-      "generated_at": "@1778866569"
+      "generated_at": "@1779497600"
     },
     "scaling_noisy_neighbor": {
       "kind": "scaling",
       "id": "noisy_neighbor",
       "name": "Noisy-neighbor degradation",
-      "claim": "A heavy noisy tenant doesn't crater a quiet tenant's p99 latency.",
+      "claim": "A heavy noisy project doesn't crater a quiet project's p99 latency.",
       "passed": true,
       "x_axis": {
         "key": "scenario",
@@ -502,38 +775,38 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "p50_ms": 2.533916,
-          "p99_ms": 2.976125,
+          "p50_ms": 0.348125,
+          "p99_ms": 0.740125,
           "scenario": "baseline"
         },
         {
-          "p50_ms": 0.522042,
-          "p99_ms": 1.257791,
+          "p50_ms": 0.11587499999999999,
+          "p99_ms": 0.31783300000000003,
           "scenario": "under_load"
         },
         {
-          "p50_ms": 0.2060218255064493,
-          "p99_ms": 0.42262707379562353,
+          "p50_ms": 0.3328545780969479,
+          "p99_ms": 0.42943151494679954,
           "scenario": "ratio"
         }
       ],
       "primary": {
         "label": "p99 ratio (under_load / baseline)",
-        "value": 0.42262707379562353,
+        "value": 0.42943151494679954,
         "unit": "x",
         "bar": {
           "op": "less_than",
           "value": 5.0
         }
       },
-      "generated_at": "@1778393193"
+      "generated_at": "@1779497617"
     },
     "scaling_perf_stack": {
       "kind": "scaling",
       "id": "perf_stack",
       "name": "Full perf stack on a WAN-class point query",
       "claim": "Same SELECT \u2026 WHERE id = X measured four ways under a 1000-iteration random-working-set point-query workload (1000 hot ids, fixed PRNG seed) with a 50 ms-per-RPC latency injector standing in for cross-region S3: (a) no cache, (b) +disk cache, (c) +page cache, (d) +bloom filter. Layer (a) shows the cold WAN cost (>200 ms p50), layer (d) lands cold p99 under 1500 ms (the tail is dominated by the fraction of iterations whose id wasn't yet cached and paid the full miss cost), and the headline claim is speedup \u2265 100\u00d7 from (a)'s cold p50 to (d)'s cold p50.",
-      "passed": true,
+      "passed": false,
       "x_axis": {
         "key": "stack_layer",
         "label": "Stack layer"
@@ -553,55 +826,55 @@ window.__BASIN_RESULTS = {
       "rows": [
         {
           "label": "(a) no cache",
-          "max_ms": 1051.3457500000002,
-          "mean_ms": 578.5289381549997,
-          "min_ms": 475.17616699999996,
-          "p50_ms": 576.449209,
-          "p999_ms": 1051.3457500000002,
-          "p99_ms": 582.502375,
+          "max_ms": 348.40862500000003,
+          "mean_ms": 228.67126981,
+          "min_ms": 195.043084,
+          "p50_ms": 224.86945799999998,
+          "p999_ms": 348.40862500000003,
+          "p99_ms": 284.94691700000004,
           "stack_layer": "a_baseline"
         },
         {
           "label": "(b) +disk cache",
-          "max_ms": 1068.3715,
-          "mean_ms": 48.037229294999996,
-          "min_ms": 0.757583,
-          "p50_ms": 1.681208,
-          "p999_ms": 1068.3715,
-          "p99_ms": 592.592333,
+          "max_ms": 314.78099999999995,
+          "mean_ms": 105.81670916500003,
+          "min_ms": 63.874375,
+          "p50_ms": 78.586,
+          "p999_ms": 314.78099999999995,
+          "p99_ms": 291.00175,
           "stack_layer": "b_disk"
         },
         {
           "label": "(c) +page cache",
-          "max_ms": 1062.363666,
-          "mean_ms": 47.530902105,
-          "min_ms": 0.230416,
-          "p50_ms": 1.528583,
-          "p999_ms": 1062.363666,
-          "p99_ms": 589.661333,
+          "max_ms": 910.890084,
+          "mean_ms": 144.17594332000007,
+          "min_ms": 0.6483749999999999,
+          "p50_ms": 145.38458300000002,
+          "p999_ms": 910.890084,
+          "p99_ms": 653.042875,
           "stack_layer": "c_disk_page"
         },
         {
           "label": "(d) +bloom filter",
-          "max_ms": 959.830958,
-          "mean_ms": 64.19164123499999,
-          "min_ms": 0.239125,
-          "p50_ms": 1.384083,
-          "p999_ms": 959.830958,
-          "p99_ms": 648.606625,
+          "max_ms": 302.13275,
+          "mean_ms": 113.34927813000002,
+          "min_ms": 0.653458,
+          "p50_ms": 146.554375,
+          "p999_ms": 302.13275,
+          "p99_ms": 278.15433299999995,
           "stack_layer": "d_full"
         }
       ],
       "primary": {
         "label": "speedup p50 (a\u2192d)",
-        "value": 416.48456703824843,
+        "value": 1.5343756063235914,
         "unit": "x",
         "bar": {
           "op": "greater_than_or_equal",
           "value": 100.0
         }
       },
-      "generated_at": "@1778866747"
+      "generated_at": "@1779363296"
     },
     "scaling_project_count": {
       "kind": "scaling",
@@ -627,40 +900,40 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "per_project_ram_kib": 96.0,
+          "per_project_ram_kib": 1088.0,
           "project_count": 1,
-          "quiet_p50_ms": 0.30075,
-          "rss_delta_kib": 96
+          "quiet_p50_ms": 0.208834,
+          "rss_delta_kib": 1088
         },
         {
-          "per_project_ram_kib": 76.44444444444444,
+          "per_project_ram_kib": 120.88888888888889,
           "project_count": 10,
-          "quiet_p50_ms": 0.27345800000000003,
-          "rss_delta_kib": 688
+          "quiet_p50_ms": 0.210625,
+          "rss_delta_kib": 1088
         },
         {
-          "per_project_ram_kib": 7.644444444444445,
+          "per_project_ram_kib": 42.48888888888889,
           "project_count": 100,
-          "quiet_p50_ms": 0.252375,
-          "rss_delta_kib": 688
+          "quiet_p50_ms": 0.202334,
+          "rss_delta_kib": 3824
         },
         {
-          "per_project_ram_kib": 5.44,
+          "per_project_ram_kib": 22.488888888888887,
           "project_count": 1000,
-          "quiet_p50_ms": 0.227458,
-          "rss_delta_kib": 4896
+          "quiet_p50_ms": 0.37879199999999996,
+          "rss_delta_kib": 20240
         }
       ],
       "primary": {
         "label": "quiet_p50_at_max / quiet_p50_at_1",
-        "value": 0.7563025768911055,
+        "value": 1.8138425735272992,
         "unit": "x",
         "bar": {
           "op": "less_than",
           "value": 5.0
         }
       },
-      "generated_at": "@1778866814"
+      "generated_at": "@1779497623"
     },
     "scaling_project_deletion_at_scale": {
       "kind": "scaling",
@@ -686,34 +959,34 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "basin_ms": 5.5672500000000005,
+          "basin_ms": 3.9247500000000004,
           "file_count": 100,
           "pg_skipped": false,
-          "postgres_ms": 4.185208
+          "postgres_ms": 69.953666
         },
         {
-          "basin_ms": 34.881958,
+          "basin_ms": 37.807958,
           "file_count": 1000,
           "pg_skipped": false,
-          "postgres_ms": 9.449375
+          "postgres_ms": 25.014916000000003
         },
         {
-          "basin_ms": 173.74629099999999,
+          "basin_ms": 199.688209,
           "file_count": 5000,
           "pg_skipped": false,
-          "postgres_ms": 1.922542
+          "postgres_ms": 3.296167
         }
       ],
       "primary": {
-        "label": "basin delete_ms at largest scale",
-        "value": 173.74629099999999,
-        "unit": "ms",
+        "label": "crossover file count (Basin <= PG)",
+        "value": 100.0,
+        "unit": "files",
         "bar": {
           "op": "less_than",
-          "value": null
+          "value": 5001.0
         }
       },
-      "generated_at": "@1778866819"
+      "generated_at": "@1779497650"
     },
     "scaling_project_deletion_realistic": {
       "kind": "scaling",
@@ -739,34 +1012,34 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "basin_ms": 5.930834,
+          "basin_ms": 4.339416,
           "file_count": 100,
           "pg_skipped": false,
-          "postgres_ms": 6.262125
+          "postgres_ms": 5.992667
         },
         {
-          "basin_ms": 34.584042000000004,
+          "basin_ms": 85.78583400000001,
           "file_count": 1000,
           "pg_skipped": false,
-          "postgres_ms": 26.773374999999998
+          "postgres_ms": 22.444125
         },
         {
-          "basin_ms": 176.620875,
+          "basin_ms": 198.02854200000002,
           "file_count": 5000,
           "pg_skipped": false,
-          "postgres_ms": 12.400708999999999
+          "postgres_ms": 15.901333
         }
       ],
       "primary": {
         "label": "Basin/Postgres ratio at 5000 files (realistic schema)",
-        "value": 14.242804584802371,
+        "value": 12.45358121863117,
         "unit": "ratio",
         "bar": {
           "op": "less_than",
           "value": 1.0000000000000002
         }
       },
-      "generated_at": "@1778866829"
+      "generated_at": "@1779497687"
     },
     "viability_alter_add_column": {
       "kind": "viability",
@@ -788,7 +1061,7 @@ window.__BASIN_RESULTS = {
         "pre_alter_tags_all_null": true,
         "rows_visible": 10
       },
-      "generated_at": "@1778866546"
+      "generated_at": "@1779497579"
     },
     "viability_alter_table": {
       "kind": "viability",
@@ -818,7 +1091,7 @@ window.__BASIN_RESULTS = {
           "DISABLE ROW LEVEL SECURITY"
         ]
       },
-      "generated_at": "@1778866551"
+      "generated_at": "@1779497582"
     },
     "viability_analytical": {
       "kind": "viability",
@@ -892,7 +1165,7 @@ window.__BASIN_RESULTS = {
         "runs_executed": 3,
         "ticks": 3
       },
-      "generated_at": "@1778866555"
+      "generated_at": "@1779497584"
     },
     "viability_basin_net": {
       "kind": "viability",
@@ -911,14 +1184,14 @@ window.__BASIN_RESULTS = {
       },
       "details": {
         "allowlist_blocks_unknown_host": true,
-        "async_request_id": "49d495df-d3cf-4f08-ba5a-75a6e4ad1cef",
+        "async_request_id": "c0fd8f98-8181-4198-a9b1-d8b0dadc1d44",
         "async_response_recorded": true,
         "async_status": 200,
         "roundtrip_passed": true,
         "sync_body": "ok",
         "sync_status": 200
       },
-      "generated_at": "@1778866558"
+      "generated_at": "@1779497587"
     },
     "viability_bloom_filter_pruning": {
       "kind": "viability",
@@ -983,23 +1256,23 @@ window.__BASIN_RESULTS = {
           "range_gets": 0
         },
         "pre_a4_legacy_io_same_predicate": {
-          "gets": 0,
-          "heads": 2,
+          "gets": 2,
+          "heads": 0,
           "lists": 2,
-          "range_gets": 4
+          "range_gets": 0
         },
         "predicates": {
           "all_out": "id = 1500 (outside both file ranges)",
           "selective": "id = 750 (only in file-B's range)"
         },
         "selective_post_a4_io_one_surviving_file": {
-          "gets": 0,
+          "gets": 1,
           "heads": 0,
           "lists": 0,
-          "range_gets": 2
+          "range_gets": 0
         }
       },
-      "generated_at": "@1778866561"
+      "generated_at": "@1779497592"
     },
     "viability_cluster_by_sort_overhead": {
       "kind": "viability",
@@ -1009,7 +1282,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "cluster_mean / no_cluster_mean ratio",
-        "value": 1.0690826427712357,
+        "value": 0.9687149039364493,
         "unit": "x",
         "bar": {
           "op": "less_than",
@@ -1018,13 +1291,13 @@ window.__BASIN_RESULTS = {
       },
       "details": {
         "bar_ratio_x": 2.0,
-        "cluster_mean_ms": 2.02225,
+        "cluster_mean_ms": 7.926550000000001,
         "n_iterations": 5,
-        "no_cluster_mean_ms": 1.891575,
-        "ratio_x": 1.0690826427712357,
+        "no_cluster_mean_ms": 8.1825416,
+        "ratio_x": 0.9687149039364493,
         "rows_per_batch": 10000
       },
-      "generated_at": "@1778866544"
+      "generated_at": "@1779497579"
     },
     "viability_cluster_by_sql": {
       "kind": "viability",
@@ -1050,7 +1323,7 @@ window.__BASIN_RESULTS = {
           "e2e: cluster-by sorts file physically"
         ]
       },
-      "generated_at": "@1778866563"
+      "generated_at": "@1779497595"
     },
     "viability_cold_start": {
       "kind": "viability",
@@ -1060,7 +1333,7 @@ window.__BASIN_RESULTS = {
       "passed": false,
       "primary": {
         "label": "cold_start_ms",
-        "value": 0.0,
+        "value": 3411.585458,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -1068,9 +1341,11 @@ window.__BASIN_RESULTS = {
         }
       },
       "details": {
-        "skip_reason": "basin-server binary not found"
+        "bind_addr": "127.0.0.1:49504",
+        "cold_start_ms": 3411.585458,
+        "storage": "localfs"
       },
-      "generated_at": "@1778866565"
+      "generated_at": "@1779497599"
     },
     "viability_compression_ratio": {
       "kind": "viability",
@@ -1080,7 +1355,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "ratio (csv / parquet)",
-        "value": 20.21422372016493,
+        "value": 77.69196894628115,
         "unit": "x",
         "bar": {
           "op": "greater_than_or_equal",
@@ -1089,10 +1364,10 @@ window.__BASIN_RESULTS = {
       },
       "details": {
         "csv_bytes": 126513913,
-        "parquet_bytes": 6258658,
+        "parquet_bytes": 1628404,
         "rows": 1000000
       },
-      "generated_at": "@1778866568"
+      "generated_at": "@1779497605"
     },
     "viability_continuous_aggregate": {
       "kind": "viability",
@@ -1123,7 +1398,7 @@ window.__BASIN_RESULTS = {
         "refresh_idempotent": true,
         "refresh_picks_up_new_rows": true
       },
-      "generated_at": "@1778437429"
+      "generated_at": "@1779497608"
     },
     "viability_disk_cache": {
       "kind": "viability",
@@ -1133,7 +1408,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "cold p99 ms",
-        "value": 1.794542,
+        "value": 4.941417,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -1144,25 +1419,25 @@ window.__BASIN_RESULTS = {
         "bar_cold_p99_ms": 250.0,
         "batches": 10,
         "cache_budget_bytes": 268435456,
-        "cold_inner_gets": 50,
+        "cold_inner_gets": 10,
         "n_iterations": 1000,
         "rows": [
           {
-            "max_ms": 577.455791,
-            "mean_ms": 2.0940999259999993,
-            "min_ms": 0.509333,
-            "p50_ms": 0.564417,
-            "p999_ms": 106.730542,
-            "p99_ms": 1.794542,
+            "max_ms": 165.286208,
+            "mean_ms": 3.6440318619999994,
+            "min_ms": 2.699458,
+            "p50_ms": 3.2255000000000003,
+            "p999_ms": 26.998333,
+            "p99_ms": 4.941417,
             "phase": "cold"
           },
           {
-            "max_ms": 0.829958,
-            "mean_ms": 0.5638520499999998,
-            "min_ms": 0.507,
-            "p50_ms": 0.560667,
-            "p999_ms": 0.7971659999999999,
-            "p99_ms": 0.625417,
+            "max_ms": 21.156083,
+            "mean_ms": 3.6606353179999953,
+            "min_ms": 2.575834,
+            "p50_ms": 3.352541,
+            "p999_ms": 18.639833000000003,
+            "p99_ms": 5.554625,
             "phase": "warm"
           }
         ],
@@ -1172,7 +1447,7 @@ window.__BASIN_RESULTS = {
         "warm_inner_gets": 0,
         "working_set_size": 1000
       },
-      "generated_at": "@1778866575"
+      "generated_at": "@1779497617"
     },
     "viability_durable_catalog": {
       "kind": "viability",
@@ -1192,9 +1467,9 @@ window.__BASIN_RESULTS = {
       "details": {
         "rows_after_restart": 3,
         "rows_inserted": 3,
-        "schema": "basin_catalog_smoke_01krme112pz6qx24fft96ayns4"
+        "schema": "basin_catalog_smoke_01ks5p5w2r87vvf1a01eajwnha"
       },
-      "generated_at": "@1778802263"
+      "generated_at": "@1779381236"
     },
     "viability_extended_protocol": {
       "kind": "viability",
@@ -1216,7 +1491,7 @@ window.__BASIN_RESULTS = {
         "passed_queries": 10,
         "total_queries": 10
       },
-      "generated_at": "@1778802352"
+      "generated_at": "@1779381449"
     },
     "viability_idle_project_ram": {
       "kind": "viability",
@@ -1226,7 +1501,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "per_project_kib",
-        "value": 1.184,
+        "value": 2.064,
         "unit": "KiB",
         "bar": {
           "op": "less_than",
@@ -1235,10 +1510,10 @@ window.__BASIN_RESULTS = {
       },
       "details": {
         "projects": 1000,
-        "rss_after_kib": 7984,
-        "rss_before_kib": 6800
+        "rss_after_kib": 9712,
+        "rss_before_kib": 7648
       },
-      "generated_at": "@1778866577"
+      "generated_at": "@1779497619"
     },
     "viability_isolation_under_load": {
       "kind": "viability",
@@ -1256,11 +1531,11 @@ window.__BASIN_RESULTS = {
         }
       },
       "details": {
-        "elapsed_s": 0.378126667,
+        "elapsed_s": 1.3703109580000001,
         "ops": 2000,
         "projects": 50
       },
-      "generated_at": "@1778866580"
+      "generated_at": "@1779497624"
     },
     "viability_jsonb": {
       "kind": "viability",
@@ -1286,7 +1561,7 @@ window.__BASIN_RESULTS = {
         "rejected_malformed": true,
         "rows_returned": 2
       },
-      "generated_at": "@1778866583"
+      "generated_at": "@1779497627"
     },
     "viability_kms_envelope": {
       "kind": "viability",
@@ -1304,13 +1579,13 @@ window.__BASIN_RESULTS = {
         }
       },
       "details": {
-        "data_file_path": "projects/01KRPBBZRN4WCHZ9ZY0FG3TSNP/tables/events/data/_default/2026/05/15/01KRPBBZRRZMRYHSJG89YY9B5G.parquet",
-        "encrypted_body_bytes": 1187,
-        "plaintext_body_bytes": 1159,
+        "data_file_path": "projects/01KS955YNPWEMVCP4RV7G13CYD/tables/events/data/_default/2026/05/23/01KS955YNZ9ZNH7MG6C60T42DN.vortex",
+        "encrypted_body_bytes": 3280,
+        "plaintext_body_bytes": 3252,
         "rows_round_tripped": 100,
         "sidecar_bytes": 33
       },
-      "generated_at": "@1778866585"
+      "generated_at": "@1779497630"
     },
     "viability_large_dataset_pointquery": {
       "kind": "viability",
@@ -1320,7 +1595,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "cold p99 ms",
-        "value": 3.26575,
+        "value": 5.665166999999999,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -1333,30 +1608,73 @@ window.__BASIN_RESULTS = {
         "n_iterations": 1000,
         "rows": [
           {
-            "max_ms": 8.065249999999999,
-            "mean_ms": 1.593444892000001,
-            "min_ms": 0.21845799999999999,
-            "p50_ms": 2.1285420000000004,
-            "p999_ms": 3.679125,
-            "p99_ms": 3.26575,
+            "max_ms": 14.133291,
+            "mean_ms": 1.0282482959999997,
+            "min_ms": 0.084417,
+            "p50_ms": 1.089375,
+            "p999_ms": 12.650958000000001,
+            "p99_ms": 5.665166999999999,
             "phase": "cold"
           },
           {
-            "max_ms": 0.316459,
-            "mean_ms": 0.24425507199999982,
-            "min_ms": 0.231292,
-            "p50_ms": 0.242291,
-            "p999_ms": 0.30925,
-            "p99_ms": 0.27216700000000005,
+            "max_ms": 0.183833,
+            "mean_ms": 0.087915509,
+            "min_ms": 0.081958,
+            "p50_ms": 0.08675,
+            "p999_ms": 0.174709,
+            "p99_ms": 0.132,
             "phase": "warm"
           }
         ],
         "seed": 13425777967503634925,
-        "seed_elapsed_s": 1.014573083,
+        "seed_elapsed_s": 15.5300925,
         "total_rows": 10000000,
         "working_set_size": 1000
       },
-      "generated_at": "@1778866590"
+      "generated_at": "@1779497649"
+    },
+    "viability_migration_manager": {
+      "kind": "viability",
+      "id": "migration_manager",
+      "name": "Migration Manager v0.2 catalog ops end-to-end",
+      "claim": "Boot engine over InMemoryCatalog, CREATE 5 tables, INSERT first batch, capture wall time, INSERT second batch; list_snapshots_project_wide returns every table's snapshots in commit order; rollback_to_snapshot_project_wide(captured_time) rewinds every table to its first-batch state (count(*) = 3).",
+      "passed": true,
+      "primary": {
+        "label": "tables_rolled_back",
+        "value": 5.0,
+        "unit": "tables",
+        "bar": {
+          "op": "equal",
+          "value": 5.0
+        }
+      },
+      "details": {
+        "post_rollback_counts": [
+          [
+            "t_a",
+            3
+          ],
+          [
+            "t_b",
+            3
+          ],
+          [
+            "t_c",
+            3
+          ],
+          [
+            "t_d",
+            3
+          ],
+          [
+            "t_e",
+            3
+          ]
+        ],
+        "project_wide_total_entries": 30,
+        "tables": 5
+      },
+      "generated_at": "@1779497651"
     },
     "viability_orm_compat": {
       "kind": "viability",
@@ -1429,7 +1747,7 @@ window.__BASIN_RESULTS = {
         ],
         "total": 7
       },
-      "generated_at": "@1778802324"
+      "generated_at": "@1779381375"
     },
     "viability_page_cache": {
       "kind": "viability",
@@ -1439,7 +1757,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "cold p99 ms",
-        "value": 0.79475,
+        "value": 7.848459,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -1455,21 +1773,21 @@ window.__BASIN_RESULTS = {
         "n_iterations": 1000,
         "rows": [
           {
-            "max_ms": 2.828333,
-            "mean_ms": 0.432296959,
-            "min_ms": 0.160458,
-            "p50_ms": 0.5536249999999999,
-            "p999_ms": 0.981167,
-            "p99_ms": 0.79475,
+            "max_ms": 13.00825,
+            "mean_ms": 3.1004527989999997,
+            "min_ms": 0.172958,
+            "p50_ms": 3.104375,
+            "p999_ms": 11.681708,
+            "p99_ms": 7.848459,
             "phase": "cold"
           },
           {
-            "max_ms": 0.21125000000000002,
-            "mean_ms": 0.17027820199999996,
-            "min_ms": 0.144708,
-            "p50_ms": 0.16866599999999998,
-            "p999_ms": 0.209375,
-            "p99_ms": 0.193458,
+            "max_ms": 4.450166,
+            "mean_ms": 0.438818298,
+            "min_ms": 0.186417,
+            "p50_ms": 0.362042,
+            "p999_ms": 3.655125,
+            "p99_ms": 1.923625,
             "phase": "warm"
           }
         ],
@@ -1479,7 +1797,7 @@ window.__BASIN_RESULTS = {
         "warm_misses_total": 6190,
         "working_set_size": 1000
       },
-      "generated_at": "@1778866596"
+      "generated_at": "@1779497656"
     },
     "viability_partition_pruning": {
       "kind": "viability",
@@ -1489,7 +1807,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "partition_bytes_ratio (range / full)",
-        "value": 0.12079072087802445,
+        "value": 0.16656830923576277,
         "unit": "ratio",
         "bar": {
           "op": "less_than",
@@ -1497,19 +1815,19 @@ window.__BASIN_RESULTS = {
         }
       },
       "details": {
-        "full_scan_bytes": 32072,
+        "full_scan_bytes": 54224,
         "full_scan_gets": 12,
-        "full_scan_range_gets": 36,
+        "full_scan_range_gets": 0,
         "months": 12,
-        "range_scan_bytes": 3874,
+        "range_scan_bytes": 9032,
         "range_scan_gets": 1,
-        "range_scan_range_gets": 2,
-        "ratio": 0.12079072087802445,
+        "range_scan_range_gets": 1,
+        "ratio": 0.16656830923576277,
         "rows_full_scan": 1200,
         "rows_per_month": 100,
         "rows_range_query": 100
       },
-      "generated_at": "@1778866598"
+      "generated_at": "@1779497659"
     },
     "viability_per_project_bcrypt_validate_cost": {
       "kind": "viability",
@@ -1590,7 +1908,7 @@ window.__BASIN_RESULTS = {
         "word_similarity_correct": true,
         "word_similarity_smyth_alyce_smyth": 1.0
       },
-      "generated_at": "@1778866750"
+      "generated_at": "@1779497662"
     },
     "viability_postgis": {
       "kind": "viability",
@@ -1620,7 +1938,7 @@ window.__BASIN_RESULTS = {
         "wkb_roundtrip_correct": true,
         "wkb_total_bytes": 2100
       },
-      "generated_at": "@1778866752"
+      "generated_at": "@1779497664"
     },
     "viability_predicate_pushdown": {
       "kind": "viability",
@@ -1630,7 +1948,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "reduction_x (full_scan_bytes / point_query_bytes)",
-        "value": 101.24365067577602,
+        "value": 1229888.0,
         "unit": "x",
         "bar": {
           "op": "greater_than_or_equal",
@@ -1638,11 +1956,11 @@ window.__BASIN_RESULTS = {
         }
       },
       "details": {
-        "file_bytes": 5457088,
-        "full_scan_bytes": 5453388,
-        "point_query_bytes": 53864
+        "file_bytes": 1229888,
+        "full_scan_bytes": 1229888,
+        "point_query_bytes": 0
       },
-      "generated_at": "@1778866754"
+      "generated_at": "@1779497667"
     },
     "viability_project_deletion": {
       "kind": "viability",
@@ -1652,7 +1970,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "deletion_ms",
-        "value": 4.0747919999999995,
+        "value": 3.7885,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -1661,9 +1979,9 @@ window.__BASIN_RESULTS = {
       },
       "details": {
         "files": 100,
-        "setup_ms": 42.873416999999996
+        "setup_ms": 451.729166
       },
-      "generated_at": "@1778866756"
+      "generated_at": "@1779497668"
     },
     "viability_rls_basic": {
       "kind": "viability",
@@ -1687,7 +2005,7 @@ window.__BASIN_RESULTS = {
         "anonymous_rows_visible": 0,
         "bob_rows_visible": 5
       },
-      "generated_at": "@1778866759"
+      "generated_at": "@1779497671"
     },
     "viability_rls_isolation": {
       "kind": "viability",
@@ -1706,10 +2024,10 @@ window.__BASIN_RESULTS = {
       },
       "details": {
         "cross_project_leak": 0,
-        "project_a": "01KRPBHB9D9R2DF4DC0DFDBYX8",
-        "project_b": "01KRPBHB9D8J2SVEQXV24BSVBK"
+        "project_a": "01KS957AAJSG858GTHN68JXKB9",
+        "project_b": "01KS957AAJCDJ6RVQBTM8M48A7"
       },
-      "generated_at": "@1778866761"
+      "generated_at": "@1779497675"
     },
     "viability_row_group_sizing": {
       "kind": "viability",
@@ -1751,7 +2069,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "inserts_per_sec",
-        "value": 3302.8494094711687,
+        "value": 2971.674371351573,
         "unit": "inserts/sec",
         "bar": {
           "op": "greater_than_or_equal",
@@ -1759,11 +2077,11 @@ window.__BASIN_RESULTS = {
         }
       },
       "details": {
-        "elapsed_ms": 302.768875,
-        "ms_per_insert": 0.302768875,
+        "elapsed_ms": 336.510625,
+        "ms_per_insert": 0.336510625,
         "n_inserts": 1000
       },
-      "generated_at": "@1778802294"
+      "generated_at": "@1779435955"
     },
     "viability_tiered_storage": {
       "kind": "viability",
@@ -1797,7 +2115,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "UPDATE+DELETE elapsed (ms)",
-        "value": 7.352208,
+        "value": 17.084916,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -1805,13 +2123,13 @@ window.__BASIN_RESULTS = {
         }
       },
       "details": {
-        "delete_ms": 2.888,
+        "delete_ms": 7.7519160000000005,
         "remaining_rows": 9997,
         "rows": 10000,
-        "total_ms": 7.352208,
-        "update_ms": 4.464208
+        "total_ms": 17.084916,
+        "update_ms": 9.332999999999998
       },
-      "generated_at": "@1778866767"
+      "generated_at": "@1779497681"
     },
     "viability_uuid": {
       "kind": "viability",
@@ -1831,12 +2149,12 @@ window.__BASIN_RESULTS = {
       "details": {
         "alice_uuid": "550e8400-e29b-41d4-a716-446655440000",
         "bcrypt_format_correct": true,
-        "bcrypt_sample": "$2b$12$LGjGOG1XPispVbSpq.8jP.QHUDvtj.lcYw92lv5ouuvL5dwxZHBHG",
+        "bcrypt_sample": "$2b$12$Kg9zAyvmPRQKBuuMVe/Yq.SQ0OPJBhcHM.igLq5E7xUVUp0heB24i",
         "random_uuid_unique_1000": true,
         "sha256_hex_correct": true,
         "uuid_roundtrip": true
       },
-      "generated_at": "@1778866769"
+      "generated_at": "@1779497684"
     },
     "viability_vector_search": {
       "kind": "viability",
@@ -1846,7 +2164,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "HNSW speed-up vs brute-force",
-        "value": 1.9207060163211553,
+        "value": 2.2472771513282304,
         "unit": "x",
         "bar": {
           "op": "greater_than_or_equal",
@@ -1866,7 +2184,7 @@ window.__BASIN_RESULTS = {
           3148,
           1402
         ],
-        "brute_ms": 200.394542,
+        "brute_ms": 198.511917,
         "dim": 64,
         "hnsw_ids": [
           3764,
@@ -1880,13 +2198,13 @@ window.__BASIN_RESULTS = {
           3148,
           1402
         ],
-        "hnsw_ms": 104.33379199999999,
+        "hnsw_ms": 88.334417,
         "overlap": 10,
         "rows": 5000,
         "sql_rows": 100,
         "top_k": 10
       },
-      "generated_at": "@1778393286"
+      "generated_at": "@1779382245"
     }
   }
 };

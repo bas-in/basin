@@ -1,5 +1,5 @@
 {
-  "generated_at": "@1779381372",
+  "generated_at": "@1779464749",
   "sections": [
     {
       "orm": "Drizzle",
@@ -74,10 +74,10 @@
     {
       "orm": "Prisma",
       "total": 11,
-      "ok": 5,
-      "typed_error": 6,
+      "ok": 9,
+      "typed_error": 2,
       "regression": 0,
-      "pass_rate_pct": 45.45454545454545,
+      "pass_rate_pct": 81.81818181818183,
       "shapes": [
         {
           "sql": "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'User'",
@@ -85,15 +85,11 @@
         },
         {
           "sql": "SELECT \"User\".\"id\",\"User\".\"email\",\"User\".\"name\",\"User\".\"createdAt\" FROM \"User\" WHERE \"User\".\"id\" = 1 LIMIT 1",
-          "outcome": "typed_error",
-          "sqlstate": "XX000",
-          "message": "internal: plan: Error during planning: table 'datafusion.public.User' not found"
+          "outcome": "ok"
         },
         {
           "sql": "SELECT \"User\".\"id\",\"User\".\"email\",\"User\".\"name\",\"User\".\"createdAt\" FROM \"User\"",
-          "outcome": "typed_error",
-          "sqlstate": "XX000",
-          "message": "internal: plan: Error during planning: table 'datafusion.public.User' not found"
+          "outcome": "ok"
         },
         {
           "sql": "SELECT count(*) FROM \"Order\"",
@@ -103,13 +99,13 @@
           "sql": "SELECT \"User\".\"id\",\"User\".\"email\",\n               (SELECT json_agg(o.*) FROM \"Order\" o WHERE o.\"userId\" = \"User\".\"id\") AS \"orders\"\n           FROM \"User\"",
           "outcome": "typed_error",
           "sqlstate": "XX000",
-          "message": "internal: plan: Error during planning: table 'datafusion.public.User' not found"
+          "message": "internal: execute: This feature is not implemented: Physical plan does not support logical expression Wildcard { qualifier: Some(Bare { table: \"o\" }), options: WildcardOptions { ilike: None, exclude: None, except: None, replace: None, rename: None } }"
         },
         {
           "sql": "SELECT pg_get_serial_sequence('\"User\"', 'id')",
           "outcome": "typed_error",
           "sqlstate": "XX000",
-          "message": "internal: plan: Error during planning: Invalid function 'pg_get_serial_sequence'.\nDid you mean 'pg_get_partkeydef'?"
+          "message": "internal: plan: Error during planning: Invalid function 'pg_get_serial_sequence'.\nDid you mean 'pg_get_indexdef'?"
         },
         {
           "sql": "CREATE TABLE IF NOT EXISTS \"Profile\" (\n               \"id\"     BIGINT NOT NULL,\n               \"bio\"    TEXT,\n               \"userId\" BIGINT NOT NULL,\n               PRIMARY KEY (\"id\")\n           )",
@@ -121,15 +117,11 @@
         },
         {
           "sql": "SELECT \"userId\", count(*) AS \"_count\" FROM \"Order\" GROUP BY \"userId\" ORDER BY \"userId\"",
-          "outcome": "typed_error",
-          "sqlstate": "XX000",
-          "message": "internal: plan: Error during planning: table 'datafusion.public.Order' not found"
+          "outcome": "ok"
         },
         {
           "sql": "SELECT relname, relkind FROM pg_class WHERE relname = 'User' AND relkind = 'r'",
-          "outcome": "typed_error",
-          "sqlstate": "XX000",
-          "message": "internal: plan: Error during planning: table 'datafusion.public.pg_class' not found"
+          "outcome": "ok"
         },
         {
           "sql": "DELETE FROM \"User\" WHERE \"id\" = 999 RETURNING \"id\"",
@@ -269,7 +261,7 @@
     }
   ],
   "total_shapes": 47,
-  "total_ok": 33,
-  "total_typed_error": 14,
+  "total_ok": 37,
+  "total_typed_error": 10,
   "total_regression": 0
 }

@@ -27,38 +27,38 @@
   ],
   "rows": [
     {
-      "per_project_kib": 2.88,
+      "per_project_kib": 3.68,
       "projects": 100,
-      "provision_ms": 3.273875,
-      "rss_delta_kib": 288
+      "provision_ms": 0.19283399999999998,
+      "rss_delta_kib": 368
     },
     {
-      "per_project_kib": 1.92,
+      "per_project_kib": 2.016,
       "projects": 1000,
-      "provision_ms": 23.385583,
-      "rss_delta_kib": 1920
+      "provision_ms": 1.536041,
+      "rss_delta_kib": 2016
     },
     {
-      "per_project_kib": 1.744,
+      "per_project_kib": 1.7344,
       "projects": 5000,
-      "provision_ms": 76.432417,
-      "rss_delta_kib": 8720
+      "provision_ms": 7.660916,
+      "rss_delta_kib": 8672
     },
     {
-      "per_project_kib": 2.16,
+      "per_project_kib": 2.1408,
       "projects": 10000,
-      "provision_ms": 156.86529199999998,
-      "rss_delta_kib": 21600
+      "provision_ms": 17.814583,
+      "rss_delta_kib": 21408
     }
   ],
   "primary": {
     "label": "max per_project_kib across scales",
-    "value": 2.88,
+    "value": 3.68,
     "unit": "KiB",
     "bar": {
       "op": "less_than",
       "value": 5.0
     }
   },
-  "generated_at": "@1779381705"
+  "generated_at": "@1779497600"
 }

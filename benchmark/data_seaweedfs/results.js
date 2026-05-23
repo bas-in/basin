@@ -18,13 +18,10 @@ window.__BASIN_RESULTS = {
       "page_cache",
       "partition_pruning",
       "predicate_pushdown",
-      "project_deletion",
       "rls_basic",
       "rls_isolation",
-      "row_group_sizing",
       "s3_credentials_smoke",
       "shard_insert_path",
-      "tiered_storage",
       "update_delete",
       "vector_search"
     ],
@@ -33,6 +30,7 @@ window.__BASIN_RESULTS = {
       "concurrency",
       "data_size",
       "idle_projects",
+      "noisy_neighbor",
       "perf_stack",
       "project_count",
       "project_deletion_at_scale",
@@ -55,22 +53,22 @@ window.__BASIN_RESULTS = {
       "metrics": [
         {
           "label": "Backup wall time",
-          "basin": 0.000155375,
-          "postgres": 0.243354667,
+          "basin": 8.6166e-05,
+          "postgres": 0.191713667,
           "unit": "s",
           "better": "basin",
-          "ratio_text": "pg / basin = 1566x"
+          "ratio_text": "pg / basin = 2225x"
         },
         {
           "label": "Backup byte size",
-          "basin": 1009.0,
+          "basin": 884.0,
           "postgres": 6379236.0,
           "unit": "bytes",
           "better": "basin",
-          "ratio_text": "pg / basin = 6322x"
+          "ratio_text": "pg / basin = 7216x"
         }
       ],
-      "generated_at": "@1778866944"
+      "generated_at": "@1779497669"
     },
     "compare_lifecycle_ops": {
       "kind": "compare",
@@ -81,22 +79,22 @@ window.__BASIN_RESULTS = {
       "metrics": [
         {
           "label": "Project deletion (1 project, 100K rows in 100 files; basin on S3)",
-          "basin": 9.983749999999999,
-          "postgres": 9.852,
+          "basin": 11.887583,
+          "postgres": 3.744958,
           "unit": "ms",
           "better": "postgres",
-          "ratio_text": "pg / basin = 0.99x"
+          "ratio_text": "pg / basin = 0.32x"
         },
         {
           "label": "ADD COLUMN on 100K rows",
-          "basin": 0.42054199999999997,
-          "postgres": 1.438667,
+          "basin": 0.57625,
+          "postgres": 1.656709,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 3.42x"
+          "ratio_text": "pg / basin = 2.87x"
         }
       ],
-      "generated_at": "@1778866947",
+      "generated_at": "@1779497674",
       "note": "Basin storage on real S3 \u2014 project deletion is catalog-first parallel DELETE plus a parallel LIST mop-up, not unlinked inodes."
     },
     "compare_postgres": {
@@ -108,29 +106,29 @@ window.__BASIN_RESULTS = {
       "metrics": [
         {
           "label": "On-disk bytes",
-          "basin": 820884.0,
+          "basin": 0.0,
           "postgres": 10149888.0,
           "unit": "bytes",
           "better": "basin",
-          "ratio_text": "pg / basin = 12.36x"
+          "ratio_text": "pg / basin = 10149888.00x"
         },
         {
           "label": "Point query p50",
-          "basin": 1.6544999999999999,
-          "postgres": 8.882,
+          "basin": 0.8182079999999999,
+          "postgres": 3.183,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 5.37x"
+          "ratio_text": "pg / basin = 3.89x"
         },
         {
           "label": "Insert 100K rows",
-          "basin": 2063.316334,
-          "postgres": 522.978417,
+          "basin": 1810.756458,
+          "postgres": 577.1541249999999,
           "unit": "ms",
           "better": "postgres"
         }
       ],
-      "generated_at": "@1778866952",
+      "generated_at": "@1779497679",
       "note": "Basin storage on real S3; PG on local 18. Insert path: WAL + shard with in-RAM WAL store."
     },
     "compare_server_lifecycle": {
@@ -142,29 +140,37 @@ window.__BASIN_RESULTS = {
       "metrics": [
         {
           "label": "Connection accept latency p50",
-          "basin": 0.703375,
-          "postgres": 2.13,
+          "basin": 0.6895,
+          "postgres": 1.227125,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 3.03x"
+          "ratio_text": "pg / basin = 1.78x"
         },
         {
           "label": "Connections held under 1000-conn flood",
           "basin": 1000.0,
-          "postgres": 100.0,
+          "postgres": 99.0,
           "unit": "conns",
           "better": "basin",
-          "ratio_text": "basin / pg = 10.00x"
+          "ratio_text": "basin / pg = 10.10x"
         },
         {
           "label": "Refused conns under 1000-conn flood",
           "basin": 0.0,
-          "postgres": 900.0,
+          "postgres": 901.0,
           "unit": "conns",
           "better": "basin"
+        },
+        {
+          "label": "RSS per held-open connection",
+          "basin": 298.72,
+          "postgres": 7752.0,
+          "unit": "KiB",
+          "better": "basin",
+          "ratio_text": "pg / basin = 25.95x"
         }
       ],
-      "generated_at": "@1778866968"
+      "generated_at": "@1779497695"
     },
     "scaling_compute_shards": {
       "kind": "scaling",
@@ -219,7 +225,7 @@ window.__BASIN_RESULTS = {
           "value": 50.0
         }
       },
-      "generated_at": "@1778866942"
+      "generated_at": "@1779497647"
     },
     "scaling_concurrency": {
       "kind": "scaling",
@@ -251,46 +257,46 @@ window.__BASIN_RESULTS = {
       "rows": [
         {
           "concurrency": 1,
-          "median_latency_us": 2559.0,
-          "per_task_qps": 371.3333333333333,
-          "total_qps": 371.3333333333333
+          "median_latency_us": 29274.0,
+          "per_task_qps": 31.333333333333332,
+          "total_qps": 31.333333333333332
         },
         {
           "concurrency": 4,
-          "median_latency_us": 821.0,
-          "per_task_qps": 337.25,
-          "total_qps": 1349.0
+          "median_latency_us": 1877.0,
+          "per_task_qps": 29.583333333333332,
+          "total_qps": 118.33333333333333
         },
         {
           "concurrency": 16,
-          "median_latency_us": 6075.0,
-          "per_task_qps": 88.1875,
-          "total_qps": 1411.0
+          "median_latency_us": 2106.0,
+          "per_task_qps": 14.916666666666666,
+          "total_qps": 238.66666666666666
         },
         {
           "concurrency": 64,
-          "median_latency_us": 21406.0,
-          "per_task_qps": 28.276041666666668,
-          "total_qps": 1809.6666666666667
+          "median_latency_us": 212352.0,
+          "per_task_qps": 3.546875,
+          "total_qps": 227.0
         }
       ],
       "primary": {
         "label": "peak speed-up vs C=1",
-        "value": 4.873429084380611,
+        "value": 7.617021276595745,
         "unit": "x",
         "bar": {
           "op": "greater_than_or_equal",
           "value": 3.5
         }
       },
-      "generated_at": "@1778866956"
+      "generated_at": "@1779497662"
     },
     "scaling_data_size": {
       "kind": "scaling",
       "id": "data_size",
       "name": "Single-project data size scale-up (real S3)",
       "claim": "On real S3, storage is linear in row count and point-query latency stays bounded.",
-      "passed": true,
+      "passed": false,
       "x_axis": {
         "key": "rows",
         "label": "row count"
@@ -319,37 +325,37 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "bytes_per_row": 9.1374,
-          "disk_mib": 0.08714103698730469,
-          "point_ms_p50": 2.087125,
+          "bytes_per_row": 1.4264,
+          "disk_mib": 0.01360321044921875,
+          "point_ms_p50": 1.296167,
           "rows": 10000,
-          "scan_ms_p50": 1.6917499999999999
+          "scan_ms_p50": 1.1988750000000001
         },
         {
-          "bytes_per_row": 9.05831,
-          "disk_mib": 0.8638677597045898,
-          "point_ms_p50": 2.104458,
+          "bytes_per_row": 1.348,
+          "disk_mib": 0.1285552978515625,
+          "point_ms_p50": 4.063542,
           "rows": 100000,
-          "scan_ms_p50": 10.034834
+          "scan_ms_p50": 3.9375
         },
         {
-          "bytes_per_row": 9.048944,
-          "disk_mib": 8.629745483398438,
-          "point_ms_p50": 3.403625,
+          "bytes_per_row": 1.338272,
+          "disk_mib": 1.276275634765625,
+          "point_ms_p50": 49.836042,
           "rows": 1000000,
-          "scan_ms_p50": 103.018667
+          "scan_ms_p50": 40.339958
         }
       ],
       "primary": {
         "label": "point query p50 growth (1M / 10K)",
-        "value": 1.6307719949691561,
+        "value": 38.448781677052416,
         "unit": "x",
         "bar": {
           "op": "less_than",
           "value": 5.0
         }
       },
-      "generated_at": "@1778866960"
+      "generated_at": "@1779497666"
     },
     "scaling_idle_projects": {
       "kind": "scaling",
@@ -380,46 +386,46 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "per_project_kib": 0.32,
+          "per_project_kib": 0.8,
           "projects": 100,
-          "provision_ms": 0.066709,
-          "rss_delta_kib": 32
+          "provision_ms": 0.166,
+          "rss_delta_kib": 80
         },
         {
-          "per_project_kib": 0.816,
+          "per_project_kib": 1.904,
           "projects": 1000,
-          "provision_ms": 0.648959,
-          "rss_delta_kib": 816
+          "provision_ms": 1.571208,
+          "rss_delta_kib": 1904
         },
         {
-          "per_project_kib": 0.8608,
+          "per_project_kib": 1.7248,
           "projects": 5000,
-          "provision_ms": 3.3379999999999996,
-          "rss_delta_kib": 4304
+          "provision_ms": 8.162667,
+          "rss_delta_kib": 8624
         },
         {
-          "per_project_kib": 1.0864,
+          "per_project_kib": 2.1168,
           "projects": 10000,
-          "provision_ms": 7.201207999999999,
-          "rss_delta_kib": 10864
+          "provision_ms": 19.212540999999998,
+          "rss_delta_kib": 21168
         }
       ],
       "primary": {
         "label": "max per_project_kib across scales",
-        "value": 1.0864,
+        "value": 2.1168,
         "unit": "KiB",
         "bar": {
           "op": "less_than",
           "value": 5.0
         }
       },
-      "generated_at": "@1778866963"
+      "generated_at": "@1779497668"
     },
     "scaling_noisy_neighbor": {
       "kind": "scaling",
       "id": "noisy_neighbor",
       "name": "Noisy-neighbor degradation (real S3)",
-      "claim": "On real S3, a heavy noisy tenant doesn't crater a quiet tenant's p99 latency.",
+      "claim": "On real S3, a heavy noisy project doesn't crater a quiet project's p99 latency.",
       "passed": true,
       "x_axis": {
         "key": "scenario",
@@ -439,31 +445,31 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "p50_ms": 1022.7894170000001,
-          "p99_ms": 1330.3209169999998,
+          "p50_ms": 0.2075,
+          "p99_ms": 0.448459,
           "scenario": "baseline"
         },
         {
-          "p50_ms": 1022.2426250000001,
-          "p99_ms": 1527.7091249999999,
+          "p50_ms": 0.15341700000000003,
+          "p99_ms": 1.616375,
           "scenario": "under_load"
         },
         {
-          "p50_ms": 0.999465391417909,
-          "p99_ms": 1.1483763845833,
+          "p50_ms": 0.7393590361445784,
+          "p99_ms": 3.604287125467434,
           "scenario": "ratio"
         }
       ],
       "primary": {
         "label": "p99 ratio (under_load / baseline)",
-        "value": 1.1483763845833,
+        "value": 3.604287125467434,
         "unit": "x",
         "bar": {
           "op": "less_than",
           "value": 5.0
         }
       },
-      "generated_at": "@1778208545"
+      "generated_at": "@1779497675"
     },
     "scaling_perf_stack": {
       "kind": "scaling",
@@ -490,55 +496,55 @@ window.__BASIN_RESULTS = {
       "rows": [
         {
           "label": "(a) no cache",
-          "max_ms": 13.625791,
-          "mean_ms": 6.929407090000001,
-          "min_ms": 5.407084,
-          "p50_ms": 6.862333,
-          "p999_ms": 13.625791,
-          "p99_ms": 7.427582999999999,
+          "max_ms": 8.720459,
+          "mean_ms": 4.54759165,
+          "min_ms": 3.7124580000000003,
+          "p50_ms": 4.143,
+          "p999_ms": 8.720459,
+          "p99_ms": 7.608333,
           "stack_layer": "a_baseline"
         },
         {
           "label": "(b) +disk cache",
-          "max_ms": 18.886166,
-          "mean_ms": 3.2155779500000006,
-          "min_ms": 1.7484169999999999,
-          "p50_ms": 2.5865839999999998,
-          "p999_ms": 18.886166,
-          "p99_ms": 11.345792000000001,
+          "max_ms": 7.227167,
+          "mean_ms": 3.8196279699999995,
+          "min_ms": 3.4129590000000003,
+          "p50_ms": 3.711208,
+          "p999_ms": 7.227167,
+          "p99_ms": 4.995083,
           "stack_layer": "b_disk"
         },
         {
           "label": "(c) +page cache",
-          "max_ms": 18.069374999999997,
-          "mean_ms": 3.1011837699999996,
-          "min_ms": 1.003167,
-          "p50_ms": 2.590583,
-          "p999_ms": 18.069374999999997,
-          "p99_ms": 11.559583,
+          "max_ms": 5.735958,
+          "mean_ms": 3.0986683400000015,
+          "min_ms": 0.7436670000000001,
+          "p50_ms": 3.427917,
+          "p999_ms": 5.735958,
+          "p99_ms": 4.13375,
           "stack_layer": "c_disk_page"
         },
         {
           "label": "(d) +bloom filter",
-          "max_ms": 18.134833999999998,
-          "mean_ms": 3.310024579999998,
-          "min_ms": 1.031583,
-          "p50_ms": 3.107125,
-          "p999_ms": 18.134833999999998,
-          "p99_ms": 11.50725,
+          "max_ms": 5.714208,
+          "mean_ms": 3.02784701,
+          "min_ms": 0.764417,
+          "p50_ms": 3.3606249999999998,
+          "p999_ms": 5.714208,
+          "p99_ms": 3.8148750000000002,
           "stack_layer": "d_full"
         }
       ],
       "primary": {
         "label": "speedup p50 (a\u2192d)",
-        "value": 2.2085796355151466,
+        "value": 1.2328063976194905,
         "unit": "x",
         "bar": {
           "op": "greater_than_or_equal",
           "value": 3.0
         }
       },
-      "generated_at": "@1778867209"
+      "generated_at": "@1779497680"
     },
     "scaling_project_count": {
       "kind": "scaling",
@@ -564,34 +570,34 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "per_project_ram_kib": 96.0,
+          "per_project_ram_kib": 384.0,
           "project_count": 1,
-          "quiet_p50_ms": 1.780166,
-          "rss_delta_kib": 96
+          "quiet_p50_ms": 0.47758300000000004,
+          "rss_delta_kib": 384
         },
         {
-          "per_project_ram_kib": 49.77777777777778,
+          "per_project_ram_kib": 126.22222222222223,
           "project_count": 10,
-          "quiet_p50_ms": 1.74825,
-          "rss_delta_kib": 448
+          "quiet_p50_ms": 0.5355829999999999,
+          "rss_delta_kib": 1136
         },
         {
-          "per_project_ram_kib": 4.622222222222222,
+          "per_project_ram_kib": 15.28888888888889,
           "project_count": 100,
-          "quiet_p50_ms": 1.7243339999999998,
-          "rss_delta_kib": 416
+          "quiet_p50_ms": 0.516375,
+          "rss_delta_kib": 1376
         }
       ],
       "primary": {
         "label": "quiet_p50_at_max / quiet_p50_at_1",
-        "value": 0.9686366327634613,
+        "value": 1.0812256717680486,
         "unit": "x",
         "bar": {
           "op": "less_than",
           "value": 5.0
         }
       },
-      "generated_at": "@1778867212"
+      "generated_at": "@1779497685"
     },
     "scaling_project_deletion_at_scale": {
       "kind": "scaling",
@@ -617,34 +623,34 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "basin_ms": 30.002667,
+          "basin_ms": 20.089541999999998,
           "file_count": 100,
           "pg_skipped": false,
-          "postgres_ms": 1.760625
+          "postgres_ms": 0.901
         },
         {
-          "basin_ms": 290.4045,
+          "basin_ms": 204.224625,
           "file_count": 1000,
           "pg_skipped": false,
-          "postgres_ms": 2.567458
+          "postgres_ms": 2.3083750000000003
         },
         {
-          "basin_ms": 500.328625,
+          "basin_ms": 339.765875,
           "file_count": 5000,
           "pg_skipped": false,
-          "postgres_ms": 1.829917
+          "postgres_ms": 1.3425
         }
       ],
       "primary": {
         "label": "basin delete_ms at largest scale",
-        "value": 500.328625,
+        "value": 339.765875,
         "unit": "ms",
         "bar": {
           "op": "less_than",
           "value": null
         }
       },
-      "generated_at": "@1778867222"
+      "generated_at": "@1779497704"
     },
     "scaling_project_deletion_realistic": {
       "kind": "scaling",
@@ -670,34 +676,34 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "basin_ms": 29.41975,
+          "basin_ms": 20.974333,
           "file_count": 100,
           "pg_skipped": false,
-          "postgres_ms": 2.887625
+          "postgres_ms": 1.8679160000000001
         },
         {
-          "basin_ms": 291.521291,
+          "basin_ms": 204.67095799999998,
           "file_count": 1000,
           "pg_skipped": false,
-          "postgres_ms": 13.124625
+          "postgres_ms": 13.133584
         },
         {
-          "basin_ms": 504.52904200000006,
+          "basin_ms": 333.922917,
           "file_count": 5000,
           "pg_skipped": false,
-          "postgres_ms": 12.365915999999999
+          "postgres_ms": 8.674332999999999
         }
       ],
       "primary": {
         "label": "Basin/Postgres ratio at 5000 files (realistic schema, real S3)",
-        "value": 40.79997324905006,
+        "value": 38.49551510185279,
         "unit": "ratio",
         "bar": {
           "op": "less_than",
           "value": 1.0000000000000002
         }
       },
-      "generated_at": "@1778867246"
+      "generated_at": "@1779497730"
     },
     "viability_alter_add_column": {
       "kind": "viability",
@@ -721,7 +727,7 @@ window.__BASIN_RESULTS = {
         "pre_alter_tags_all_null": true,
         "rows_visible": 10
       },
-      "generated_at": "@1778866940"
+      "generated_at": "@1779497583"
     },
     "viability_alter_table": {
       "kind": "viability",
@@ -753,7 +759,7 @@ window.__BASIN_RESULTS = {
           "DISABLE ROW LEVEL SECURITY"
         ]
       },
-      "generated_at": "@1778866943"
+      "generated_at": "@1779497586"
     },
     "viability_analytical": {
       "kind": "viability",
@@ -835,17 +841,17 @@ window.__BASIN_RESULTS = {
         "runs_executed": 3,
         "ticks": 3
       },
-      "generated_at": "@1778866947"
+      "generated_at": "@1779497590"
     },
     "viability_bloom_filter_pruning": {
       "kind": "viability",
       "id": "bloom_filter_pruning",
       "name": "Bloom filter pruning for absent point queries (real S3)",
       "claim": "On a multi-row-group Parquet file living on real S3 with `bloom_filter_columns = [\"id\"]`, an in-range point query for a non-existent id prunes \u226580% of row groups via the per-group bloom filter, even when min/max stats cannot.",
-      "passed": true,
+      "passed": false,
       "primary": {
         "label": "row_groups_pruned_by_bloom / row_groups_considered",
-        "value": 0.9,
+        "value": 0.0,
         "unit": "fraction",
         "bar": {
           "op": "greater_than_or_equal",
@@ -855,29 +861,29 @@ window.__BASIN_RESULTS = {
       "details": {
         "absent_in_range_target": "550 (outside [500, 600) gap)",
         "bloom_only_phase": {
-          "groups_considered": 10,
-          "groups_scanned": 1,
-          "pruned_by_bloom": 9,
+          "groups_considered": 0,
+          "groups_scanned": 0,
+          "pruned_by_bloom": 0,
           "pruned_by_stats": 0
         },
         "bucket": "basin-test",
         "endpoint": "http://127.0.0.1:8333",
         "existing_phase": {
-          "groups_considered": 10,
-          "groups_scanned": 1,
-          "pruned_by_bloom": 8,
-          "pruned_by_stats": 1
-        },
-        "out_of_range_absent_phase": {
-          "groups_considered": 10,
+          "groups_considered": 0,
           "groups_scanned": 0,
           "pruned_by_bloom": 0,
-          "pruned_by_stats": 10
+          "pruned_by_stats": 0
+        },
+        "out_of_range_absent_phase": {
+          "groups_considered": 0,
+          "groups_scanned": 0,
+          "pruned_by_bloom": 0,
+          "pruned_by_stats": 0
         },
         "row_group_size": 100,
         "rows": 1000
       },
-      "generated_at": "@1778866950"
+      "generated_at": "@1779497591"
     },
     "viability_cold_start": {
       "kind": "viability",
@@ -887,7 +893,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "cold_start_ms",
-        "value": 17.571042,
+        "value": 20.849125,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -895,12 +901,12 @@ window.__BASIN_RESULTS = {
         }
       },
       "details": {
-        "bind_addr": "127.0.0.1:57834",
+        "bind_addr": "127.0.0.1:49496",
         "bucket": "basin-test",
-        "cold_start_ms": 17.571042,
+        "cold_start_ms": 20.849125,
         "endpoint": "http://127.0.0.1:8333"
       },
-      "generated_at": "@1778866954"
+      "generated_at": "@1779497594"
     },
     "viability_compression_ratio": {
       "kind": "viability",
@@ -910,7 +916,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "ratio (csv / parquet)",
-        "value": 20.21422372016493,
+        "value": 77.69196894628115,
         "unit": "x",
         "bar": {
           "op": "greater_than_or_equal",
@@ -921,10 +927,10 @@ window.__BASIN_RESULTS = {
         "bucket": "basin-test",
         "csv_bytes": 126513913,
         "endpoint": "http://127.0.0.1:8333",
-        "parquet_bytes": 6258658,
+        "parquet_bytes": 1628404,
         "rows": 1000000
       },
-      "generated_at": "@1778866984"
+      "generated_at": "@1779497628"
     },
     "viability_disk_cache": {
       "kind": "viability",
@@ -934,7 +940,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "cold p99 ms",
-        "value": 22.409459,
+        "value": 7.082875,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -946,26 +952,26 @@ window.__BASIN_RESULTS = {
         "batches": 10,
         "bucket": "basin-test",
         "cache_budget_bytes": 268435456,
-        "cold_to_warm_p50_ratio": 2.4109486828198397,
+        "cold_to_warm_p50_ratio": 0.8692577954974894,
         "endpoint": "http://127.0.0.1:8333",
         "n_iterations": 200,
         "rows": [
           {
-            "max_ms": 79.405917,
-            "mean_ms": 4.45476191,
-            "min_ms": 1.3622079999999999,
-            "p50_ms": 3.0954580000000003,
-            "p999_ms": 79.405917,
-            "p99_ms": 22.409459,
+            "max_ms": 8.195875000000001,
+            "mean_ms": 3.4111664499999996,
+            "min_ms": 2.932292,
+            "p50_ms": 3.24925,
+            "p999_ms": 8.195875000000001,
+            "p99_ms": 7.082875,
             "phase": "cold"
           },
           {
-            "max_ms": 13.547334,
-            "mean_ms": 2.0495190050000005,
-            "min_ms": 1.047667,
-            "p50_ms": 1.2839170000000002,
-            "p999_ms": 13.547334,
-            "p99_ms": 6.456625,
+            "max_ms": 6.305333,
+            "mean_ms": 3.8995535799999983,
+            "min_ms": 3.1342499999999998,
+            "p50_ms": 3.737959,
+            "p999_ms": 6.305333,
+            "p99_ms": 5.828083,
             "phase": "warm"
           }
         ],
@@ -973,7 +979,7 @@ window.__BASIN_RESULTS = {
         "total_rows": 100000,
         "working_set_size": 1000
       },
-      "generated_at": "@1778866957"
+      "generated_at": "@1779497597"
     },
     "viability_durable_catalog": {
       "kind": "viability",
@@ -995,9 +1001,9 @@ window.__BASIN_RESULTS = {
         "endpoint": "http://127.0.0.1:8333",
         "rows_after_restart": 3,
         "rows_inserted": 3,
-        "schema": "basin_s3_durable_catalog_01krpbqe103cyajdgv13yb9b6m"
+        "schema": "basin_s3_durable_catalog_01ks9551ed1dge4cgm0s1q1rd2"
       },
-      "generated_at": "@1778866960"
+      "generated_at": "@1779497600"
     },
     "viability_extended_protocol": {
       "kind": "viability",
@@ -1021,7 +1027,7 @@ window.__BASIN_RESULTS = {
         "passed_queries": 10,
         "total_queries": 10
       },
-      "generated_at": "@1778866964"
+      "generated_at": "@1779497604"
     },
     "viability_idle_project_ram": {
       "kind": "viability",
@@ -1031,7 +1037,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "per_project_kib",
-        "value": 0.432,
+        "value": 1.664,
         "unit": "KiB",
         "bar": {
           "op": "less_than",
@@ -1042,10 +1048,10 @@ window.__BASIN_RESULTS = {
         "bucket": "basin-test",
         "endpoint": "http://127.0.0.1:8333",
         "projects": 1000,
-        "rss_after_kib": 14784,
-        "rss_before_kib": 14352
+        "rss_after_kib": 15216,
+        "rss_before_kib": 13552
       },
-      "generated_at": "@1778866966"
+      "generated_at": "@1779497607"
     },
     "viability_isolation_under_load": {
       "kind": "viability",
@@ -1064,12 +1070,12 @@ window.__BASIN_RESULTS = {
       },
       "details": {
         "bucket": "basin-test",
-        "elapsed_s": 0.1915225,
+        "elapsed_s": 0.658933292,
         "endpoint": "http://127.0.0.1:8333",
         "ops": 1000,
         "projects": 50
       },
-      "generated_at": "@1778866986"
+      "generated_at": "@1779497630"
     },
     "viability_large_dataset_pointquery": {
       "kind": "viability",
@@ -1079,7 +1085,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "cold p99 ms",
-        "value": 7.226583,
+        "value": 4.088208000000001,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -1094,30 +1100,30 @@ window.__BASIN_RESULTS = {
         "n_iterations": 1000,
         "rows": [
           {
-            "max_ms": 13.638416000000001,
-            "mean_ms": 3.1292371659999993,
-            "min_ms": 0.7506659999999999,
-            "p50_ms": 3.0829579999999996,
-            "p999_ms": 7.821791999999999,
-            "p99_ms": 7.226583,
+            "max_ms": 7.403459000000001,
+            "mean_ms": 1.3825564680000006,
+            "min_ms": 0.089333,
+            "p50_ms": 1.5558340000000002,
+            "p999_ms": 5.987208,
+            "p99_ms": 4.088208000000001,
             "phase": "cold"
           },
           {
-            "max_ms": 5.537375,
-            "mean_ms": 1.258053792000001,
-            "min_ms": 1.12825,
-            "p50_ms": 1.249542,
-            "p999_ms": 2.965834,
-            "p99_ms": 1.429458,
+            "max_ms": 0.861042,
+            "mean_ms": 0.09548517299999992,
+            "min_ms": 0.085542,
+            "p50_ms": 0.092291,
+            "p999_ms": 0.318292,
+            "p99_ms": 0.204542,
             "phase": "warm"
           }
         ],
         "seed": 13425777967503634925,
-        "seed_elapsed_s": 0.942979666,
+        "seed_elapsed_s": 11.43788475,
         "total_rows": 10000000,
         "working_set_size": 1000
       },
-      "generated_at": "@1778866993"
+      "generated_at": "@1779497647"
     },
     "viability_orm_compat": {
       "kind": "viability",
@@ -1192,7 +1198,7 @@ window.__BASIN_RESULTS = {
         ],
         "total": 7
       },
-      "generated_at": "@1778866968"
+      "generated_at": "@1779497610"
     },
     "viability_page_cache": {
       "kind": "viability",
@@ -1202,7 +1208,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "cold p99 ms",
-        "value": 2.1840409999999997,
+        "value": 7.816791,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -1216,26 +1222,26 @@ window.__BASIN_RESULTS = {
         "cache_budget_bytes": 268435456,
         "cold_hits": 190,
         "cold_misses": 1810,
-        "cold_to_warm_p50_ratio": 2.4049583890909956,
+        "cold_to_warm_p50_ratio": 4.753357880908821,
         "endpoint": "http://127.0.0.1:8333",
         "n_iterations": 200,
         "rows": [
           {
-            "max_ms": 6.184583,
-            "mean_ms": 1.8607895699999994,
-            "min_ms": 0.755708,
-            "p50_ms": 1.928375,
-            "p999_ms": 6.184583,
-            "p99_ms": 2.1840409999999997,
+            "max_ms": 16.851084,
+            "mean_ms": 4.981301629999999,
+            "min_ms": 1.077334,
+            "p50_ms": 5.14175,
+            "p999_ms": 16.851084,
+            "p99_ms": 7.816791,
             "phase": "cold"
           },
           {
-            "max_ms": 0.876583,
-            "mean_ms": 0.7984193999999998,
-            "min_ms": 0.7010000000000001,
-            "p50_ms": 0.8018329999999999,
-            "p999_ms": 0.876583,
-            "p99_ms": 0.864792,
+            "max_ms": 1.674667,
+            "mean_ms": 1.0945716649999995,
+            "min_ms": 0.871667,
+            "p50_ms": 1.081709,
+            "p999_ms": 1.674667,
+            "p99_ms": 1.273416,
             "phase": "warm"
           }
         ],
@@ -1245,7 +1251,7 @@ window.__BASIN_RESULTS = {
         "warm_misses_total": 1810,
         "working_set_size": 1000
       },
-      "generated_at": "@1778866970"
+      "generated_at": "@1779497612"
     },
     "viability_partition_pruning": {
       "kind": "viability",
@@ -1255,7 +1261,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "partition_bytes_ratio (range / full)",
-        "value": 0.12079072087802445,
+        "value": 0.16656830923576277,
         "unit": "ratio",
         "bar": {
           "op": "less_than",
@@ -1265,17 +1271,17 @@ window.__BASIN_RESULTS = {
       "details": {
         "bucket": "basin-test",
         "endpoint": "http://127.0.0.1:8333",
-        "full_scan_bytes": 32072,
+        "full_scan_bytes": 54224,
         "full_scan_gets": 12,
-        "full_scan_range_gets": 36,
+        "full_scan_range_gets": 0,
         "months": 12,
-        "range_scan_bytes": 3874,
+        "range_scan_bytes": 9032,
         "range_scan_gets": 1,
-        "range_scan_range_gets": 2,
-        "ratio": 0.12079072087802445,
+        "range_scan_range_gets": 1,
+        "ratio": 0.16656830923576277,
         "rows_per_month": 100
       },
-      "generated_at": "@1778866972"
+      "generated_at": "@1779497614"
     },
     "viability_predicate_pushdown": {
       "kind": "viability",
@@ -1285,7 +1291,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "reduction_x (full_scan_bytes / point_query_bytes)",
-        "value": 101.24365067577602,
+        "value": 1229888.0,
         "unit": "x",
         "bar": {
           "op": "greater_than_or_equal",
@@ -1295,10 +1301,10 @@ window.__BASIN_RESULTS = {
       "details": {
         "bucket": "basin-test",
         "endpoint": "http://127.0.0.1:8333",
-        "full_scan_bytes": 5453388,
-        "point_query_bytes": 53864
+        "full_scan_bytes": 1229888,
+        "point_query_bytes": 0
       },
-      "generated_at": "@1778866996"
+      "generated_at": "@1779497650"
     },
     "viability_project_deletion": {
       "kind": "viability",
@@ -1347,7 +1353,7 @@ window.__BASIN_RESULTS = {
         "bucket": "basin-test",
         "endpoint": "http://127.0.0.1:8333"
       },
-      "generated_at": "@1778866974"
+      "generated_at": "@1779497616"
     },
     "viability_rls_isolation": {
       "kind": "viability",
@@ -1368,10 +1374,10 @@ window.__BASIN_RESULTS = {
         "bucket": "basin-test",
         "cross_project_leak": 0,
         "endpoint": "http://127.0.0.1:8333",
-        "project_a": "01KRPBQXBTZKM9RQPHCJEMWVFS",
-        "project_b": "01KRPBQXBTKHDX595S71A3912P"
+        "project_a": "01KS955JKKE9PSKFRDKRW1RB57",
+        "project_b": "01KS955JKKYHGJ7VPSHTHWCQS2"
       },
-      "generated_at": "@1778866976"
+      "generated_at": "@1779497618"
     },
     "viability_row_group_sizing": {
       "kind": "viability",
@@ -1415,7 +1421,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "PUT+GET+LIST+DELETE total",
-        "value": 3.0,
+        "value": 6.0,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -1424,15 +1430,15 @@ window.__BASIN_RESULTS = {
       },
       "details": {
         "bucket": "basin-test",
-        "delete_ms": 1,
+        "delete_ms": 0,
         "endpoint": "http://127.0.0.1:8333",
-        "get_ms": 0,
+        "get_ms": 1,
         "list_ms": 0,
         "payload_bytes": 61,
-        "put_ms": 2,
+        "put_ms": 5,
         "region": "us-east-1"
       },
-      "generated_at": "@1778866942"
+      "generated_at": "@1779497686"
     },
     "viability_shard_insert_path": {
       "kind": "viability",
@@ -1442,7 +1448,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "inserts_per_sec",
-        "value": 8402.875884271392,
+        "value": 4105.148586222542,
         "unit": "inserts/sec",
         "bar": {
           "op": "greater_than_or_equal",
@@ -1451,12 +1457,12 @@ window.__BASIN_RESULTS = {
       },
       "details": {
         "bucket": "basin-test",
-        "elapsed_ms": 119.006875,
+        "elapsed_ms": 243.596542,
         "endpoint": "http://127.0.0.1:8333",
-        "ms_per_insert": 0.119006875,
+        "ms_per_insert": 0.243596542,
         "n_inserts": 1000
       },
-      "generated_at": "@1778867001"
+      "generated_at": "@1779497654"
     },
     "viability_tiered_storage": {
       "kind": "viability",
@@ -1492,7 +1498,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "UPDATE+DELETE elapsed (ms)",
-        "value": 15.214833,
+        "value": 22.635749,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -1501,14 +1507,14 @@ window.__BASIN_RESULTS = {
       },
       "details": {
         "bucket": "basin-test",
-        "delete_ms": 6.336083,
+        "delete_ms": 10.263958,
         "endpoint": "http://127.0.0.1:8333",
         "remaining_rows": 9997,
         "rows": 10000,
-        "total_ms": 15.214833,
-        "update_ms": 8.87875
+        "total_ms": 22.635749,
+        "update_ms": 12.371791
       },
-      "generated_at": "@1778866982"
+      "generated_at": "@1779497624"
     },
     "viability_vector_search": {
       "kind": "viability",
@@ -1526,18 +1532,18 @@ window.__BASIN_RESULTS = {
         }
       },
       "details": {
-        "brute_ms": 62.20225,
+        "brute_ms": 38.091166,
         "bucket": "basin-test",
         "dim": 64,
         "endpoint": "http://127.0.0.1:8333",
-        "hnsw_ms": 18.837084,
-        "hnsw_speedup_x": 3.302116718277627,
+        "hnsw_ms": 12.723708,
+        "hnsw_speedup_x": 2.993715825606812,
         "overlap": 10,
         "rows": 5000,
         "sql_rows": 100,
         "top_k": 10
       },
-      "generated_at": "@1778867008"
+      "generated_at": "@1779497662"
     }
   }
 };

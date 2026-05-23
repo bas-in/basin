@@ -22,32 +22,32 @@
   ],
   "rows": [
     {
-      "basin_ms": 30.002667,
+      "basin_ms": 20.089541999999998,
       "file_count": 100,
       "pg_skipped": false,
-      "postgres_ms": 1.760625
+      "postgres_ms": 0.901
     },
     {
-      "basin_ms": 290.4045,
+      "basin_ms": 204.224625,
       "file_count": 1000,
       "pg_skipped": false,
-      "postgres_ms": 2.567458
+      "postgres_ms": 2.3083750000000003
     },
     {
-      "basin_ms": 500.328625,
+      "basin_ms": 339.765875,
       "file_count": 5000,
       "pg_skipped": false,
-      "postgres_ms": 1.829917
+      "postgres_ms": 1.3425
     }
   ],
   "primary": {
     "label": "basin delete_ms at largest scale",
-    "value": 500.328625,
+    "value": 339.765875,
     "unit": "ms",
     "bar": {
       "op": "less_than",
       "value": null
     }
   },
-  "generated_at": "@1778867222"
+  "generated_at": "@1779497704"
 }
