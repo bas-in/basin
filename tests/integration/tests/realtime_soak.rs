@@ -342,7 +342,7 @@ async fn soak_short_10_projects_5_conns() {
 ///   production a `RetryQueue` would be attached; here we assert that the drop
 ///   does NOT propagate to other tenants.
 /// - Total wall-clock ~1 hour (36 000 events × ~0.1 ms/event per tenant).
-#[ignore]
+#[ignore = "1h realtime soak; opt-in"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn soak_long_100_projects_10_conns() {
     let start = Instant::now();

@@ -81,7 +81,7 @@ fn collect_all_rows(result: ExecResult) -> Vec<EventRow> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore]
+#[ignore = "live S3 / .basin-test.toml-gated; run with --ignored"]
 async fn s3_viability_alter_add_column() {
     basin_common::telemetry::try_init_for_tests();
 

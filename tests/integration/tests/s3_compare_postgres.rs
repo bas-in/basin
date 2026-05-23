@@ -96,7 +96,7 @@ fn which_wins(basin: f64, postgres: f64) -> WhichWins {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
+#[ignore = "live S3 / .basin-test.toml-gated; run with --ignored"]
 async fn s3_compare_postgres() {
     let cfg = match BasinTestConfig::load() {
         Ok(c) => c,

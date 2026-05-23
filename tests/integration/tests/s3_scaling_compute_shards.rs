@@ -73,7 +73,7 @@ async fn shard_for_project(cluster: &Cluster, project: &ProjectId) -> Option<usi
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore]
+#[ignore = "live S3 / .basin-test.toml-gated; run with --ignored"]
 async fn s3_scaling_compute_shards() {
     basin_common::telemetry::try_init_for_tests();
 

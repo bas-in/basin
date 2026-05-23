@@ -49,7 +49,7 @@ const SMALL_RG_ROWS: usize = 4_096;
 const DEFAULT_RG_ROWS: usize = 65_536;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore]
+#[ignore = "live S3 / .basin-test.toml-gated; run with --ignored"]
 async fn s3_viability_row_group_sizing() {
     basin_common::telemetry::try_init_for_tests();
 

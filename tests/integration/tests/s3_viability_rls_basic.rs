@@ -33,7 +33,7 @@ fn rows_seen(res: ExecResult) -> usize {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore]
+#[ignore = "live S3 / .basin-test.toml-gated; run with --ignored"]
 async fn s3_viability_rls_basic() {
     let cfg = match BasinTestConfig::load() {
         Ok(c) => c,

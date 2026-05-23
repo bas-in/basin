@@ -299,7 +299,7 @@ async fn open_idle(conn_str: &str, n: usize) -> HeldConns {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore]
+#[ignore = "live S3 / .basin-test.toml-gated; run with --ignored"]
 async fn s3_compare_server_lifecycle() {
     let cfg = match BasinTestConfig::load() {
         Ok(c) => c,

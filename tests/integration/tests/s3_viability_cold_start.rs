@@ -37,7 +37,7 @@ const TEST_NAME: &str = "s3_viability_cold_start";
 const BAR_COLD_START_MS: f64 = 5_000.0;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore]
+#[ignore = "live S3 / .basin-test.toml-gated; run with --ignored"]
 async fn s3_viability_cold_start() {
     let cfg = match BasinTestConfig::load() {
         Ok(c) => c,

@@ -98,7 +98,7 @@ fn build_batch() -> RecordBatch {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "live S3 / .basin-test.toml-gated; run with --ignored"]
 async fn s3_compression_ratio() {
     let cfg = match BasinTestConfig::load() {
         Ok(c) => c,

@@ -156,7 +156,7 @@ fn render_pg_error(err: &tokio_postgres::Error) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore]
+#[ignore = "live S3 / .basin-test.toml-gated; run with --ignored"]
 async fn s3_viability_orm_compat() {
     let cfg = match BasinTestConfig::load() {
         Ok(c) => c,

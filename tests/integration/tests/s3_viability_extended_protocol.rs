@@ -102,7 +102,7 @@ async fn connect(addr: SocketAddr, user: &str) -> tokio_postgres::Client {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore]
+#[ignore = "live S3 / .basin-test.toml-gated; run with --ignored"]
 async fn s3_viability_extended_protocol() {
     let cfg = match BasinTestConfig::load() {
         Ok(c) => c,

@@ -53,7 +53,7 @@ fn median(samples: &[f64]) -> f64 {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore]
+#[ignore = "live S3 / .basin-test.toml-gated; run with --ignored"]
 async fn s3_scaling_project_count() {
     let cfg = match BasinTestConfig::load() {
         Ok(c) => c,

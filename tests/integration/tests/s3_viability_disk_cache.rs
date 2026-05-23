@@ -110,7 +110,7 @@ async fn point_query(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore]
+#[ignore = "live S3 / .basin-test.toml-gated; run with --ignored"]
 async fn s3_viability_disk_cache() {
     basin_common::telemetry::try_init_for_tests();
 

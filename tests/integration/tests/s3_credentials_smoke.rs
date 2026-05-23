@@ -29,7 +29,7 @@ const TEST_NAME: &str = "s3_credentials_smoke";
 const PAYLOAD: &[u8] = b"basin smoke test payload - if you can read this, sigv4 worked";
 
 #[tokio::test]
-#[ignore]
+#[ignore = "live S3 / .basin-test.toml-gated; run with --ignored"]
 async fn s3_credentials_smoke() {
     let cfg = match BasinTestConfig::load() {
         Ok(c) => c,

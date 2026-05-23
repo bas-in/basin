@@ -67,7 +67,7 @@ fn build_batch(start_id: i64, n: usize, days_ago: i64) -> RecordBatch {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore]
+#[ignore = "live S3 / .basin-test.toml-gated; run with --ignored"]
 async fn s3_viability_tiered_storage() {
     basin_common::telemetry::try_init_for_tests();
 

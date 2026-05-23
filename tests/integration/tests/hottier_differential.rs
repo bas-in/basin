@@ -1018,7 +1018,7 @@ async fn hottier_differential_10k() {
 ///     -- --ignored --nocapture
 /// ```
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "100k-row slow smoke; run with --ignored or set BASIN_SMOKE_ROWS_LARGE"]
 async fn hottier_differential_100k() {
     let total: i64 = std::env::var("BASIN_SMOKE_ROWS_LARGE")
         .ok()
