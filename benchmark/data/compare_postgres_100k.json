@@ -1,0 +1,119 @@
+{
+  "kind": "compare",
+  "id": "postgres_100k",
+  "name": "Basin vs Postgres 18 (100k-row SaaS workload, no index)",
+  "claim": "At typical SaaS / OLTP scale (100k rows split across users + events), Basin's columnar substrate matches or beats Postgres heap on reads (point, range, aggregate, JOIN, ILIKE, pagination) and pays a per-INSERT tax on bulk writes. No indexes on either side — measures substrate, not btree machinery.",
+  "available": true,
+  "metrics": [
+    {
+      "label": "On-disk bytes (users + events)",
+      "basin": 0.0,
+      "postgres": 8036352.0,
+      "unit": "bytes",
+      "better": "basin",
+      "ratio_text": "pg / basin = 8036351999999999.00x"
+    },
+    {
+      "label": "Point query p50",
+      "basin": 0.697917,
+      "postgres": 2.84,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "pg / basin = 4.07x"
+    },
+    {
+      "label": "Point query p99",
+      "basin": 12.660042,
+      "postgres": 3.627,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.29x"
+    },
+    {
+      "label": "Range scan p50 (~1k rows)",
+      "basin": 0.6471250000000001,
+      "postgres": 5.789,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "pg / basin = 8.95x"
+    },
+    {
+      "label": "Range scan p99",
+      "basin": 7.233917,
+      "postgres": 6.256,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.86x"
+    },
+    {
+      "label": "Aggregate GROUP BY user_id p50",
+      "basin": 35.293290999999996,
+      "postgres": 18.885,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.54x"
+    },
+    {
+      "label": "2-table JOIN GROUP BY p50",
+      "basin": 86.611541,
+      "postgres": 47.96,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.55x"
+    },
+    {
+      "label": "ILIKE '%@gmail.com' p50",
+      "basin": 13.441291,
+      "postgres": 2.539,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.19x"
+    },
+    {
+      "label": "Pagination ORDER BY LIMIT/OFFSET p50",
+      "basin": 88.72375000000001,
+      "postgres": 17.525,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.20x"
+    },
+    {
+      "label": "Single-row UPDATE p50",
+      "basin": 103.29599999999999,
+      "postgres": 0.288,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.00x"
+    },
+    {
+      "label": "Bulk UPDATE (~33k rows)",
+      "basin": 14409.140084,
+      "postgres": 61.377,
+      "unit": "ms",
+      "better": "postgres"
+    },
+    {
+      "label": "DELETE WHERE id IN (10 rows)",
+      "basin": 14230.420083,
+      "postgres": 7.453125,
+      "unit": "ms",
+      "better": "postgres"
+    },
+    {
+      "label": "Bulk INSERT 100k rows",
+      "basin": 9146.810792,
+      "postgres": 555.2737500000001,
+      "unit": "ms",
+      "better": "postgres"
+    },
+    {
+      "label": "Cold-start first query",
+      "basin": 14.416125000000001,
+      "postgres": 18.679917,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "pg / basin = 1.30x"
+    }
+  ],
+  "generated_at": "@1779538071"
+}

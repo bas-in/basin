@@ -41,6 +41,7 @@
     "backup_cost",
     "lifecycle_ops",
     "postgres",
+    "postgres_100k",
     "server_lifecycle"
   ]
 }
