@@ -154,6 +154,22 @@ pub struct WriteOptions {
     pub bloom_columns: Vec<String>,
 }
 
+/// Vortex encode cascade selector — placeholder enum exported so
+/// `basin_engine` (which references `basin_storage::EncodingMode` for the
+/// `BASIN_FAST_BULK_INSERT` opt-in) compiles after the in-flight Vortex
+/// 2-pass work (#92) lands. Currently unused by the writer itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EncodingMode {
+    /// Full BtrBlocks cascade. Smallest files; default for compaction +
+    /// non-bulk INSERT.
+    #[default]
+    Best,
+    /// Minimal cascade. ~3-4x faster encode, ~1.5x larger files. Used for
+    /// bulk INSERT under `BASIN_FAST_BULK_INSERT=1` and for hot-tier
+    /// flushes that are about to be re-compacted anyway.
+    Fast,
+}
+
 pub(crate) async fn write_batch(
     storage: &Storage,
     project: &ProjectId,
