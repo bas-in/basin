@@ -1095,14 +1095,6 @@ async fn fast_path_delete_then_select_omits_tombstoned_rows() {
 }
 
 /// 2. Same setup, SELECT COUNT(*) reports the post-suppression count.
-///
-/// FIXME(#88-F): COUNT(*) returns 5 (the raw cold-tier row count) instead of 3.
-/// DataFusion's aggregate optimizer uses Parquet row-group statistics for
-/// `count(*)` and bypasses `TableProvider::scan` entirely, so the wrapping
-/// `TombstoneFilterExec` never runs. Fix in `hot_tombstone.rs::TombstoneFilteringTable`:
-/// override the stats-based count shortcut (likely via `statistics()` returning
-/// `Statistics::default()` so the optimizer can't take the shortcut).
-#[ignore = "FIXME(#88-F): COUNT(*) uses row-group stats shortcut, bypasses tombstone filter"]
 #[tokio::test]
 async fn fast_path_delete_then_count_excludes_tombstoned() {
     std::env::set_var("BASIN_HOTTIER_DELETE_FASTPATH", "1");
@@ -1150,16 +1142,6 @@ async fn fast_path_delete_then_count_excludes_tombstoned() {
 /// 3. WHERE-clause pushdown must still compose correctly with tombstone
 ///    suppression. The same WHERE-by-PK query that returns 1 row for a live
 ///    PK must return 0 rows for a tombstoned PK.
-///
-/// FIXME(#88-F): SELECT WHERE pk = <tombstoned> returns 1 ghost row instead of 0.
-/// `TombstoneFilteringTable::supports_filters_pushdown` (hot_tombstone.rs:415)
-/// delegates to the cold provider, so the predicate is pushed down into the
-/// Parquet scan and reaches `TombstoneFilterExec` only AFTER cold has already
-/// returned the (still-physically-present) row. Either the filter must be
-/// applied above the wrapper, or the wrapper must re-check tombstones for
-/// pushdown-filtered batches. Simplest fix: return `Unsupported` for filter
-/// pushdown when tombstones are non-empty.
-#[ignore = "FIXME(#88-F): predicate pushdown bypasses tombstone filter"]
 #[tokio::test]
 async fn fast_path_delete_then_select_with_where_clause() {
     std::env::set_var("BASIN_HOTTIER_DELETE_FASTPATH", "1");

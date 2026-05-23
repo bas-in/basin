@@ -428,22 +428,105 @@ impl datafusion::catalog::TableProvider for TombstoneFilteringTable {
         filters: &[datafusion::logical_expr::Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let cold_plan = self.cold.scan(state, projection, filters, limit).await?;
         let registry = self.engine.memtable_registry();
-        Ok(maybe_wrap_with_tombstone_filter(
+        let tombs = snapshot_tombstones(registry.as_ref(), &self.project, &self.table);
+
+        // No tombstones → zero-overhead pass-through. Hand the cold provider
+        // the original projection / filters / limit and skip the wrap.
+        if tombs.is_empty() || self.pk_columns.len() != 1 {
+            let cold_plan = self.cold.scan(state, projection, filters, limit).await?;
+            return Ok(cold_plan);
+        }
+
+        let pk_col = &self.pk_columns[0];
+        let Ok(pk_idx_in_schema) = self.catalog_schema.index_of(pk_col) else {
+            // PK column missing from catalog schema (defensive — would be a
+            // catalog corruption). Fall back to the pass-through so we never
+            // crash a read just because of bad metadata.
+            let cold_plan = self.cold.scan(state, projection, filters, limit).await?;
+            return Ok(cold_plan);
+        };
+        let pk_dt = self.catalog_schema.field(pk_idx_in_schema).data_type().clone();
+
+        // If the caller's projection omits the PK column we must add it so the
+        // tombstone filter has the key bytes to compare. We then strip the
+        // augmented column back out with a `ProjectionExec` so the surrounding
+        // plan sees the originally-requested schema. This is the fix for
+        // `SELECT COUNT(*)` / `SELECT non_pk_col` after a fast-path DELETE:
+        // without the PK in the cold batch the filter has nothing to key on
+        // and tombstoned rows leak into aggregates / non-PK projections.
+        //
+        // Limit pushdown is also dropped when augmenting because the limit
+        // applies to post-filter rows; passing a limit to the cold scan would
+        // truncate before tombstone removal and under-count survivors.
+        let (cold_projection_owned, augmented, effective_limit) = match projection {
+            Some(p) if !p.contains(&pk_idx_in_schema) => {
+                let mut p2 = p.clone();
+                p2.push(pk_idx_in_schema);
+                (Some(p2), true, None)
+            }
+            Some(p) => (Some(p.clone()), false, limit),
+            None => (None, false, limit),
+        };
+        let cold_projection_ref = cold_projection_owned.as_ref();
+        let cold_plan = self
+            .cold
+            .scan(state, cold_projection_ref, filters, effective_limit)
+            .await?;
+
+        // Wrap with the row-filter.
+        let filtered: Arc<dyn ExecutionPlan> = Arc::new(TombstoneFilterExec::new(
             cold_plan,
-            registry.as_ref(),
-            &self.project,
-            &self.table,
-            &self.pk_columns,
-            self.catalog_schema.as_ref(),
-        ))
+            pk_col.clone(),
+            pk_dt,
+            Arc::new(tombs),
+        ));
+
+        if !augmented {
+            return Ok(filtered);
+        }
+
+        // Strip the appended PK column so the outer plan sees the schema it
+        // originally asked for. The original projection lives in the first
+        // `p.len()` output columns of `filtered`.
+        use datafusion::physical_expr::expressions::Column;
+        use datafusion::physical_plan::projection::{ProjectionExec, ProjectionExpr};
+        let filtered_schema = filtered.schema();
+        let original_len = cold_projection_owned
+            .as_ref()
+            .map(|p| p.len() - 1)
+            .unwrap_or(0);
+        let exprs: Vec<ProjectionExpr> = (0..original_len)
+            .map(|i| {
+                let field = filtered_schema.field(i);
+                ProjectionExpr {
+                    expr: Arc::new(Column::new(field.name(), i)),
+                    alias: field.name().to_owned(),
+                }
+            })
+            .collect();
+        let projected = ProjectionExec::try_new(exprs, filtered)?;
+        Ok(Arc::new(projected))
     }
 
     fn supports_filters_pushdown(
         &self,
         filters: &[&datafusion::logical_expr::Expr],
     ) -> DFResult<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
+        // When tombstones are present we disable predicate pushdown into the
+        // cold scan. Otherwise the cold provider may evaluate predicates
+        // BEFORE the tombstone filter runs, and a row that satisfies the
+        // predicate but is tombstoned would leak through. Returning
+        // `Unsupported` keeps the filter ABOVE this provider's output in the
+        // plan tree, which runs AFTER our `TombstoneFilterExec`.
+        let registry = self.engine.memtable_registry();
+        let tombs = snapshot_tombstones(registry.as_ref(), &self.project, &self.table);
+        if !tombs.is_empty() {
+            return Ok(vec![
+                datafusion::logical_expr::TableProviderFilterPushDown::Unsupported;
+                filters.len()
+            ]);
+        }
         self.cold.supports_filters_pushdown(filters)
     }
 }
