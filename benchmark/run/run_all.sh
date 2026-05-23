@@ -80,10 +80,9 @@ _run_all_cleanup() {
       kill_tree "${p}"
     fi
   done
-  # Belt-and-braces: nuke any of our test binaries still alive
-  # (release or debug profile).
-  pkill -9 -f "target/release/deps/.*-[0-9a-f]* --nocapture" 2>/dev/null || true
-  pkill -9 -f "target/debug/deps/.*-[0-9a-f]* --nocapture" 2>/dev/null || true
+  # Belt-and-braces: nuke any of our test binaries still alive, regardless
+  # of which profile dir they ran from (bench-fast / release / debug).
+  pkill -9 -f "target/[^/]*/deps/.*-[0-9a-f]* --nocapture" 2>/dev/null || true
   # _setup.sh installed its own EXIT trap (SeaweedFS). Invoke it now so
   # SeaweedFS is also torn down on this path.
   if declare -f _setup_cleanup >/dev/null 2>&1; then

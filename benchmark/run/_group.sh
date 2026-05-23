@@ -55,12 +55,14 @@ if [[ "${config}" == "seaweedfs" ]]; then
   )
 fi
 
-# Match the build profile _setup.sh used (default release).
-if [[ "${BENCH_PROFILE:-release}" == "release" ]]; then
-  profile_flag=( --release )
-else
-  profile_flag=()
-fi
+# Match the build profile _setup.sh used (default release). MUST agree
+# with _setup.sh's selection or this group would recompile every binary
+# under a different profile, wiping out the shared build.
+case "${BENCH_PROFILE:-release}" in
+  release) profile_flag=( --release ) ;;
+  dev)     profile_flag=() ;;
+  *)       profile_flag=( --profile "${BENCH_PROFILE:-release}" ) ;;
+esac
 
 runner_args=( --nocapture --test-threads="${threads}" )
 if [[ "${ignored}" == "1" ]]; then
