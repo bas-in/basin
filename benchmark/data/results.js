@@ -822,15 +822,15 @@ window.__BASIN_RESULTS = {
       "note": "JSON key 'basin'=Parquet, 'postgres'=Vortex (schema reuse from Postgres compare card). Standalone binary: cargo run --manifest-path benchmark/vortex_compare/Cargo.toml --release"
     },
     "orm_compat": {
-      "generated_at": "@1779539934",
+      "generated_at": "@1779541783",
       "sections": [
         {
           "orm": "Drizzle",
           "total": 14,
-          "ok": 12,
-          "typed_error": 2,
+          "ok": 14,
+          "typed_error": 0,
           "regression": 0,
-          "pass_rate_pct": 85.71428571428571,
+          "pass_rate_pct": 100.0,
           "shapes": [
             {
               "sql": "SELECT \"users\".\"id\", \"users\".\"email\" FROM \"users\" WHERE \"users\".\"email\" = 'alice@example.com' LIMIT 1",
@@ -838,9 +838,7 @@ window.__BASIN_RESULTS = {
             },
             {
               "sql": "SELECT \"users\".\"id\", \"users\".\"email\" FROM \"users\" WHERE \"users\".\"email\" = $1 LIMIT 1",
-              "outcome": "typed_error",
-              "sqlstate": "XX000",
-              "message": "internal: execute: Execution error: Placeholder '$1' was not provided a value for execution."
+              "outcome": "ok"
             },
             {
               "sql": "INSERT INTO \"users\" (\"id\",\"email\",\"created_at\") VALUES (3,'carol@example.com',NOW()) RETURNING \"id\"",
@@ -852,9 +850,7 @@ window.__BASIN_RESULTS = {
             },
             {
               "sql": "DELETE FROM \"users\" WHERE \"id\" = ANY($1::int[])",
-              "outcome": "typed_error",
-              "sqlstate": "42601",
-              "message": "invalid schema: UPDATE SET id: expected literal of type Int64, got $1::INT[]"
+              "outcome": "ok"
             },
             {
               "sql": "SELECT \"users\".\"id\",\"users\".\"email\",\n               (SELECT count(*) FROM \"orders\" WHERE \"orders\".\"user_id\" = \"users\".\"id\") AS \"order_count\"\n           FROM \"users\"",
@@ -955,16 +951,14 @@ window.__BASIN_RESULTS = {
         {
           "orm": "sqlx",
           "total": 8,
-          "ok": 5,
-          "typed_error": 3,
+          "ok": 7,
+          "typed_error": 1,
           "regression": 0,
-          "pass_rate_pct": 62.5,
+          "pass_rate_pct": 87.5,
           "shapes": [
             {
               "sql": "SELECT id, email, name FROM \"users\" WHERE id = $1",
-              "outcome": "typed_error",
-              "sqlstate": "XX000",
-              "message": "internal: execute: Execution error: Placeholder '$1' was not provided a value for execution."
+              "outcome": "ok"
             },
             {
               "sql": "INSERT INTO \"users\" (id, email, name, created_at)\n           VALUES (4,'dave@example.com','Dave',NOW()) RETURNING id, email",
@@ -980,9 +974,7 @@ window.__BASIN_RESULTS = {
             },
             {
               "sql": "SELECT id, email FROM \"users\" WHERE email = $1 AND id > $2",
-              "outcome": "typed_error",
-              "sqlstate": "XX000",
-              "message": "internal: execute: Execution error: Placeholder '$1' was not provided a value for execution."
+              "outcome": "ok"
             },
             {
               "sql": "LISTEN mychannel",
@@ -1045,10 +1037,10 @@ window.__BASIN_RESULTS = {
         {
           "orm": "TypeORM",
           "total": 6,
-          "ok": 3,
-          "typed_error": 3,
+          "ok": 4,
+          "typed_error": 2,
           "regression": 0,
-          "pass_rate_pct": 50.0,
+          "pass_rate_pct": 66.66666666666666,
           "shapes": [
             {
               "sql": "SELECT \"users\".\"id\" AS \"users_id\",\"users\".\"email\" AS \"users_email\",\"users\".\"name\" AS \"users_name\"\n           FROM \"users\" WHERE \"users\".\"id\" = 1 LIMIT 1",
@@ -1064,15 +1056,13 @@ window.__BASIN_RESULTS = {
             },
             {
               "sql": "SELECT \"users\".\"id\",\"users\".\"email\" FROM \"users\" WHERE \"users\".\"id\" = $1",
-              "outcome": "typed_error",
-              "sqlstate": "XX000",
-              "message": "internal: execute: Execution error: Placeholder '$1' was not provided a value for execution."
+              "outcome": "ok"
             },
             {
               "sql": "DELETE FROM \"users\" WHERE \"users\".\"id\" IN ($1)",
               "outcome": "typed_error",
               "sqlstate": "42601",
-              "message": "invalid schema: ERROR: current transaction is aborted, commands ignored until end of transaction block (SQLSTATE 25P02)"
+              "message": "invalid schema: WHERE expects column identifier, got \"users\".\"id\""
             },
             {
               "sql": "INSERT INTO \"orders\" (\"id\",\"user_id\",\"status\",\"total\") VALUES (20,1,'new',5.00) RETURNING \"id\"",
@@ -1084,8 +1074,8 @@ window.__BASIN_RESULTS = {
         }
       ],
       "total_shapes": 47,
-      "total_ok": 37,
-      "total_typed_error": 10,
+      "total_ok": 42,
+      "total_typed_error": 5,
       "total_regression": 0
     },
     "scaling_compute_shards": {

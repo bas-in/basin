@@ -1,13 +1,13 @@
 {
-  "generated_at": "@1779464749",
+  "generated_at": "@1779541783",
   "sections": [
     {
       "orm": "Drizzle",
       "total": 14,
-      "ok": 12,
-      "typed_error": 2,
+      "ok": 14,
+      "typed_error": 0,
       "regression": 0,
-      "pass_rate_pct": 85.71428571428571,
+      "pass_rate_pct": 100.0,
       "shapes": [
         {
           "sql": "SELECT \"users\".\"id\", \"users\".\"email\" FROM \"users\" WHERE \"users\".\"email\" = 'alice@example.com' LIMIT 1",
@@ -15,9 +15,7 @@
         },
         {
           "sql": "SELECT \"users\".\"id\", \"users\".\"email\" FROM \"users\" WHERE \"users\".\"email\" = $1 LIMIT 1",
-          "outcome": "typed_error",
-          "sqlstate": "XX000",
-          "message": "internal: execute: Execution error: Placeholder '$1' was not provided a value for execution."
+          "outcome": "ok"
         },
         {
           "sql": "INSERT INTO \"users\" (\"id\",\"email\",\"created_at\") VALUES (3,'carol@example.com',NOW()) RETURNING \"id\"",
@@ -29,9 +27,7 @@
         },
         {
           "sql": "DELETE FROM \"users\" WHERE \"id\" = ANY($1::int[])",
-          "outcome": "typed_error",
-          "sqlstate": "42601",
-          "message": "invalid schema: UPDATE SET id: expected literal of type Int64, got $1::INT[]"
+          "outcome": "ok"
         },
         {
           "sql": "SELECT \"users\".\"id\",\"users\".\"email\",\n               (SELECT count(*) FROM \"orders\" WHERE \"orders\".\"user_id\" = \"users\".\"id\") AS \"order_count\"\n           FROM \"users\"",
@@ -105,7 +101,7 @@
           "sql": "SELECT pg_get_serial_sequence('\"User\"', 'id')",
           "outcome": "typed_error",
           "sqlstate": "XX000",
-          "message": "internal: plan: Error during planning: Invalid function 'pg_get_serial_sequence'.\nDid you mean 'pg_get_indexdef'?"
+          "message": "internal: plan: Error during planning: Invalid function 'pg_get_serial_sequence'.\nDid you mean 'pg_get_partkeydef'?"
         },
         {
           "sql": "CREATE TABLE IF NOT EXISTS \"Profile\" (\n               \"id\"     BIGINT NOT NULL,\n               \"bio\"    TEXT,\n               \"userId\" BIGINT NOT NULL,\n               PRIMARY KEY (\"id\")\n           )",
@@ -132,16 +128,14 @@
     {
       "orm": "sqlx",
       "total": 8,
-      "ok": 5,
-      "typed_error": 3,
+      "ok": 7,
+      "typed_error": 1,
       "regression": 0,
-      "pass_rate_pct": 62.5,
+      "pass_rate_pct": 87.5,
       "shapes": [
         {
           "sql": "SELECT id, email, name FROM \"users\" WHERE id = $1",
-          "outcome": "typed_error",
-          "sqlstate": "XX000",
-          "message": "internal: execute: Execution error: Placeholder '$1' was not provided a value for execution."
+          "outcome": "ok"
         },
         {
           "sql": "INSERT INTO \"users\" (id, email, name, created_at)\n           VALUES (4,'dave@example.com','Dave',NOW()) RETURNING id, email",
@@ -157,9 +151,7 @@
         },
         {
           "sql": "SELECT id, email FROM \"users\" WHERE email = $1 AND id > $2",
-          "outcome": "typed_error",
-          "sqlstate": "XX000",
-          "message": "internal: execute: Execution error: Placeholder '$1' was not provided a value for execution."
+          "outcome": "ok"
         },
         {
           "sql": "LISTEN mychannel",
@@ -222,10 +214,10 @@
     {
       "orm": "TypeORM",
       "total": 6,
-      "ok": 3,
-      "typed_error": 3,
+      "ok": 4,
+      "typed_error": 2,
       "regression": 0,
-      "pass_rate_pct": 50.0,
+      "pass_rate_pct": 66.66666666666666,
       "shapes": [
         {
           "sql": "SELECT \"users\".\"id\" AS \"users_id\",\"users\".\"email\" AS \"users_email\",\"users\".\"name\" AS \"users_name\"\n           FROM \"users\" WHERE \"users\".\"id\" = 1 LIMIT 1",
@@ -241,15 +233,13 @@
         },
         {
           "sql": "SELECT \"users\".\"id\",\"users\".\"email\" FROM \"users\" WHERE \"users\".\"id\" = $1",
-          "outcome": "typed_error",
-          "sqlstate": "XX000",
-          "message": "internal: execute: Execution error: Placeholder '$1' was not provided a value for execution."
+          "outcome": "ok"
         },
         {
           "sql": "DELETE FROM \"users\" WHERE \"users\".\"id\" IN ($1)",
           "outcome": "typed_error",
           "sqlstate": "42601",
-          "message": "invalid schema: ERROR: current transaction is aborted, commands ignored until end of transaction block (SQLSTATE 25P02)"
+          "message": "invalid schema: WHERE expects column identifier, got \"users\".\"id\""
         },
         {
           "sql": "INSERT INTO \"orders\" (\"id\",\"user_id\",\"status\",\"total\") VALUES (20,1,'new',5.00) RETURNING \"id\"",
@@ -261,7 +251,7 @@
     }
   ],
   "total_shapes": 47,
-  "total_ok": 37,
-  "total_typed_error": 10,
+  "total_ok": 42,
+  "total_typed_error": 5,
   "total_regression": 0
 }

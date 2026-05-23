@@ -32,6 +32,7 @@ use basin_common::ProjectId;
 use basin_router::{ServerConfig, StaticProjectResolver};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
+use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, NoTls};
 
 // =============================================================================
@@ -1058,6 +1059,61 @@ async fn data_modifying_cte_insert_returning_then_select() {
 //     the planner returns a typed error, which is the correct behaviour.
 // =============================================================================
 
+/// Strongly-typed sample parameter for a corpus SQL shape.
+///
+/// Each variant maps 1:1 to a Postgres wire-type the engine's extended
+/// protocol (Parse/Bind/Describe/Execute) accepts.  Corpus authors choose
+/// the variant that matches the column the placeholder binds against; the
+/// engine's Describe response determines the actual OID sent on the wire.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+enum ParamValue {
+    I32(i32),
+    I64(i64),
+    Text(&'static str),
+    Bool(bool),
+    Int4Array(&'static [i32]),
+    Int8Array(&'static [i64]),
+}
+
+impl ParamValue {
+    /// Box the inner value as a `dyn ToSql + Sync` trait object so it can be
+    /// collected into a heterogeneous `&[&(dyn ToSql + Sync)]` for
+    /// `client.execute` / `client.query`.
+    fn to_boxed(&self) -> Box<dyn ToSql + Sync + Send> {
+        match self {
+            ParamValue::I32(v) => Box::new(*v),
+            ParamValue::I64(v) => Box::new(*v),
+            ParamValue::Text(s) => Box::new(*s),
+            ParamValue::Bool(b) => Box::new(*b),
+            ParamValue::Int4Array(xs) => Box::new(xs.to_vec()),
+            ParamValue::Int8Array(xs) => Box::new(xs.to_vec()),
+        }
+    }
+}
+
+/// One ORM-emitted SQL shape plus an optional set of sample parameters.
+///
+/// When `params` is non-empty the harness drives the extended-protocol
+/// path (`client.execute`).  When `params` is empty the harness uses
+/// `simple_query` (required for multi-statement scripts and DDL that the
+/// extended protocol rejects).
+#[derive(Debug, Clone)]
+struct Shape {
+    sql: &'static str,
+    params: &'static [ParamValue],
+}
+
+impl Shape {
+    const fn raw(sql: &'static str) -> Self {
+        Shape { sql, params: &[] }
+    }
+
+    const fn with(sql: &'static str, params: &'static [ParamValue]) -> Self {
+        Shape { sql, params }
+    }
+}
+
 /// The outcome of executing one ORM-emitted SQL shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ShapeOutcome {
@@ -1067,11 +1123,26 @@ enum ShapeOutcome {
     TypedError { sqlstate: String, message: String },
 }
 
-/// Execute `sql` via simple_query and classify the outcome.
-/// Returns `Err(String)` only on a connection-level failure (panic-grade).
-async fn run_shape(client: &Client, sql: &str) -> Result<ShapeOutcome, String> {
-    match client.simple_query(sql).await {
-        Ok(_) => Ok(ShapeOutcome::Ok),
+/// Execute one shape and classify the outcome.
+///
+/// Routes parameter-free shapes through `simple_query` (covers DDL +
+/// multi-statement seeds) and parameterised shapes through `client.execute`
+/// (covers the extended Parse/Bind/Describe/Execute path every ORM driver
+/// takes).  Returns `Err(String)` only on a connection-level failure
+/// (panic-grade).
+async fn run_shape(client: &Client, shape: &Shape) -> Result<ShapeOutcome, String> {
+    let result: Result<(), tokio_postgres::Error> = if shape.params.is_empty() {
+        client.simple_query(shape.sql).await.map(|_| ())
+    } else {
+        let boxed: Vec<Box<dyn ToSql + Sync + Send>> =
+            shape.params.iter().map(|p| p.to_boxed()).collect();
+        let refs: Vec<&(dyn ToSql + Sync)> =
+            boxed.iter().map(|b| b.as_ref() as &(dyn ToSql + Sync)).collect();
+        client.execute(shape.sql, &refs[..]).await.map(|_| ())
+    };
+
+    match result {
+        Ok(()) => Ok(ShapeOutcome::Ok),
         Err(e) => {
             if let Some(dbe) = e.as_db_error() {
                 let code = dbe.code().code().to_string();
@@ -1130,15 +1201,16 @@ struct OrmCompatReport {
 async fn run_orm_section(
     client: &Client,
     orm: &str,
-    shapes: &[&str],
+    shapes: &[Shape],
 ) -> OrmSection {
     let mut shape_results = Vec::new();
     let mut ok = 0usize;
     let mut typed = 0usize;
     let mut reg = 0usize;
 
-    for &sql in shapes {
-        match run_shape(client, sql).await {
+    for shape in shapes {
+        let sql = shape.sql;
+        match run_shape(client, shape).await {
             Ok(ShapeOutcome::Ok) => {
                 ok += 1;
                 shape_results.push(ShapeResult {
@@ -1306,7 +1378,8 @@ async fn orm_compat_corpus() {
 
     println!("\n[orm_compat_corpus] bootstrapping schema...");
     for ddl in &bootstrap {
-        match run_shape(&client, ddl).await {
+        let shape = Shape::raw(*ddl);
+        match run_shape(&client, &shape).await {
             Ok(_) => {}
             Err(e) => panic!("schema bootstrap failed: {e}\nSQL: {ddl}"),
         }
@@ -1316,51 +1389,55 @@ async fn orm_compat_corpus() {
     // ── Drizzle ORM (TypeScript, cloud-app stack) ───────────────────────────
     //
     // Drizzle emits double-quoted identifiers + $N positional params.  Shapes
-    // with $N cause typed planner errors (simple_query can't bind params); that
-    // is correct behaviour — we are testing parse + plan acceptance, not the
-    // full data round-trip (which is covered by the extended-protocol tests
-    // above in this file).
-    let drizzle: &[&str] = &[
+    // with placeholders are driven through `client.execute` so the engine's
+    // extended Parse/Bind/Describe/Execute path (the path every ORM driver
+    // takes) is exercised end-to-end.
+    let drizzle: &[Shape] = &[
         // 1. Basic SELECT with WHERE equality + LIMIT.
-        r#"SELECT "users"."id", "users"."email" FROM "users" WHERE "users"."email" = 'alice@example.com' LIMIT 1"#,
-        // 2. Parameterised SELECT — $1 → typed planner error (expected).
-        r#"SELECT "users"."id", "users"."email" FROM "users" WHERE "users"."email" = $1 LIMIT 1"#,
+        Shape::raw(r#"SELECT "users"."id", "users"."email" FROM "users" WHERE "users"."email" = 'alice@example.com' LIMIT 1"#),
+        // 2. Parameterised SELECT — $1 bound via extended protocol.
+        Shape::with(
+            r#"SELECT "users"."id", "users"."email" FROM "users" WHERE "users"."email" = $1 LIMIT 1"#,
+            &[ParamValue::Text("alice@example.com")],
+        ),
         // 3. INSERT with RETURNING.
-        r#"INSERT INTO "users" ("id","email","created_at") VALUES (3,'carol@example.com',NOW()) RETURNING "id""#,
+        Shape::raw(r#"INSERT INTO "users" ("id","email","created_at") VALUES (3,'carol@example.com',NOW()) RETURNING "id""#),
         // 4. UPDATE … SET … WHERE … RETURNING *.
-        r#"UPDATE "users" SET "email" = 'alice2@example.com', "updated_at" = NOW() WHERE "id" = 1 RETURNING *"#,
+        Shape::raw(r#"UPDATE "users" SET "email" = 'alice2@example.com', "updated_at" = NOW() WHERE "id" = 1 RETURNING *"#),
         // 5. DELETE … WHERE id = ANY($1::int[]) — Drizzle bulk-delete pattern.
-        //    ANY($1::int[]) needs binding; typed error expected.
-        r#"DELETE FROM "users" WHERE "id" = ANY($1::int[])"#,
+        Shape::with(
+            r#"DELETE FROM "users" WHERE "id" = ANY($1::int[])"#,
+            &[ParamValue::Int4Array(&[100, 101, 102])],
+        ),
         // 6. Correlated scalar subquery — order count per user.
-        r#"SELECT "users"."id","users"."email",
+        Shape::raw(r#"SELECT "users"."id","users"."email",
                (SELECT count(*) FROM "orders" WHERE "orders"."user_id" = "users"."id") AS "order_count"
-           FROM "users""#,
+           FROM "users""#),
         // 7. SELECT with ORDER BY + LIMIT + OFFSET.
-        r#"SELECT "users"."id","users"."email","users"."created_at"
-           FROM "users" ORDER BY "users"."created_at" DESC LIMIT 10 OFFSET 0"#,
+        Shape::raw(r#"SELECT "users"."id","users"."email","users"."created_at"
+           FROM "users" ORDER BY "users"."created_at" DESC LIMIT 10 OFFSET 0"#),
         // 8. INNER JOIN.
-        r#"SELECT "users"."id","users"."email","orders"."id" AS "order_id","orders"."status"
+        Shape::raw(r#"SELECT "users"."id","users"."email","orders"."id" AS "order_id","orders"."status"
            FROM "users"
            INNER JOIN "orders" ON "orders"."user_id" = "users"."id"
-           WHERE "orders"."status" = 'completed'"#,
+           WHERE "orders"."status" = 'completed'"#),
         // 9. IN clause (literal list).
-        r#"SELECT "users"."id","users"."email" FROM "users" WHERE "users"."id" IN (1,2)"#,
+        Shape::raw(r#"SELECT "users"."id","users"."email" FROM "users" WHERE "users"."id" IN (1,2)"#),
         // 10. COUNT(*) aggregation.
-        r#"SELECT count(*) AS "count" FROM "users""#,
+        Shape::raw(r#"SELECT count(*) AS "count" FROM "users""#),
         // 11. ON CONFLICT DO NOTHING.
-        r#"INSERT INTO "users" ("id","email") VALUES (99,'dup@example.com') ON CONFLICT DO NOTHING"#,
+        Shape::raw(r#"INSERT INTO "users" ("id","email") VALUES (99,'dup@example.com') ON CONFLICT DO NOTHING"#),
         // 12. IS NULL predicate.
-        r#"SELECT "users"."id","users"."email" FROM "users" WHERE "users"."name" IS NULL"#,
+        Shape::raw(r#"SELECT "users"."id","users"."email" FROM "users" WHERE "users"."name" IS NULL"#),
         // 13. BETWEEN range.
-        r#"SELECT "orders"."id","orders"."total" FROM "orders" WHERE "orders"."total" BETWEEN 10.0 AND 100.0"#,
+        Shape::raw(r#"SELECT "orders"."id","orders"."total" FROM "orders" WHERE "orders"."total" BETWEEN 10.0 AND 100.0"#),
         // 14. Aliased subquery in FROM (Drizzle join helper).
-        r#"SELECT u.id, u.email, sub.order_count
+        Shape::raw(r#"SELECT u.id, u.email, sub.order_count
            FROM "users" u
            JOIN (
                SELECT "user_id", count(*) AS order_count
                FROM "orders" GROUP BY "user_id"
-           ) sub ON sub."user_id" = u.id"#,
+           ) sub ON sub."user_id" = u.id"#),
     ];
 
     println!("\n=== Drizzle ORM ({} shapes) ===", drizzle.len());
@@ -1372,41 +1449,41 @@ async fn orm_compat_corpus() {
     // schema introspection.  These are the shapes most likely to expose Basin
     // catalog-compatibility gaps.  Known unsupported: pg_get_serial_sequence,
     // information_schema.columns — both return typed errors, not panics.
-    let prisma: &[&str] = &[
+    let prisma: &[Shape] = &[
         // 1. Schema introspection — information_schema.columns probe.
-        r#"SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'User'"#,
+        Shape::raw(r#"SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'User'"#),
         // 2. findUnique — PK equality.
-        r#"SELECT "User"."id","User"."email","User"."name","User"."createdAt" FROM "User" WHERE "User"."id" = 1 LIMIT 1"#,
+        Shape::raw(r#"SELECT "User"."id","User"."email","User"."name","User"."createdAt" FROM "User" WHERE "User"."id" = 1 LIMIT 1"#),
         // 3. findMany — no predicates.
-        r#"SELECT "User"."id","User"."email","User"."name","User"."createdAt" FROM "User""#,
+        Shape::raw(r#"SELECT "User"."id","User"."email","User"."name","User"."createdAt" FROM "User""#),
         // 4. count query.
-        r#"SELECT count(*) FROM "Order""#,
+        Shape::raw(r#"SELECT count(*) FROM "Order""#),
         // 5. json_agg relation hydration (correlated subquery).
-        r#"SELECT "User"."id","User"."email",
+        Shape::raw(r#"SELECT "User"."id","User"."email",
                (SELECT json_agg(o.*) FROM "Order" o WHERE o."userId" = "User"."id") AS "orders"
-           FROM "User""#,
+           FROM "User""#),
         // 6. pg_get_serial_sequence probe — KNOWN UNSUPPORTED.
         //    Prisma calls this to find the sequence for auto-increment columns.
         //    Basin does not wire up pg_get_serial_sequence; returns typed error.
-        r#"SELECT pg_get_serial_sequence('"User"', 'id')"#,
+        Shape::raw(r#"SELECT pg_get_serial_sequence('"User"', 'id')"#),
         // 7. CREATE TABLE IF NOT EXISTS with camelCase columns.
-        r#"CREATE TABLE IF NOT EXISTS "Profile" (
+        Shape::raw(r#"CREATE TABLE IF NOT EXISTS "Profile" (
                "id"     BIGINT NOT NULL,
                "bio"    TEXT,
                "userId" BIGINT NOT NULL,
                PRIMARY KEY ("id")
-           )"#,
+           )"#),
         // 8. Upsert — INSERT … ON CONFLICT … DO UPDATE … RETURNING.
-        r#"INSERT INTO "User" ("id","email","name")
+        Shape::raw(r#"INSERT INTO "User" ("id","email","name")
            VALUES (5,'eve@example.com','Eve')
            ON CONFLICT ("id") DO UPDATE SET "email" = EXCLUDED."email"
-           RETURNING "id","email""#,
+           RETURNING "id","email""#),
         // 9. Relation count — COUNT with GROUP BY.
-        r#"SELECT "userId", count(*) AS "_count" FROM "Order" GROUP BY "userId" ORDER BY "userId""#,
+        Shape::raw(r#"SELECT "userId", count(*) AS "_count" FROM "Order" GROUP BY "userId" ORDER BY "userId""#),
         // 10. pg_class probe — KNOWN UNSUPPORTED (catalog not fully exposed).
-        r#"SELECT relname, relkind FROM pg_class WHERE relname = 'User' AND relkind = 'r'"#,
+        Shape::raw(r#"SELECT relname, relkind FROM pg_class WHERE relname = 'User' AND relkind = 'r'"#),
         // 11. DELETE by PK.
-        r#"DELETE FROM "User" WHERE "id" = 999 RETURNING "id""#,
+        Shape::raw(r#"DELETE FROM "User" WHERE "id" = 999 RETURNING "id""#),
     ];
 
     println!("\n=== Prisma ({} shapes) ===", prisma.len());
@@ -1418,27 +1495,33 @@ async fn orm_compat_corpus() {
     //   LISTEN / NOTIFY — not supported (0A000).
     //   COPY FROM/TO STDIN — bulk-loader sub-protocol not implemented.
     //   $1 params — typed planner error from simple_query (expected).
-    let sqlx: &[&str] = &[
-        // 1. Basic SELECT with $1 param (typed planner error — expected).
-        r#"SELECT id, email, name FROM "users" WHERE id = $1"#,
+    let sqlx: &[Shape] = &[
+        // 1. Basic SELECT with $1 param — bound via extended protocol.
+        Shape::with(
+            r#"SELECT id, email, name FROM "users" WHERE id = $1"#,
+            &[ParamValue::I64(1)],
+        ),
         // 2. INSERT … RETURNING.
-        r#"INSERT INTO "users" (id, email, name, created_at)
-           VALUES (4,'dave@example.com','Dave',NOW()) RETURNING id, email"#,
+        Shape::raw(r#"INSERT INTO "users" (id, email, name, created_at)
+           VALUES (4,'dave@example.com','Dave',NOW()) RETURNING id, email"#),
         // 3. UPDATE.
-        r#"UPDATE "users" SET name = 'David' WHERE id = 4"#,
+        Shape::raw(r#"UPDATE "users" SET name = 'David' WHERE id = 4"#),
         // 4. DELETE.
-        r#"DELETE FROM "users" WHERE id = 4"#,
+        Shape::raw(r#"DELETE FROM "users" WHERE id = 4"#),
         // 5. Multi-param SELECT.
-        r#"SELECT id, email FROM "users" WHERE email = $1 AND id > $2"#,
+        Shape::with(
+            r#"SELECT id, email FROM "users" WHERE email = $1 AND id > $2"#,
+            &[ParamValue::Text("alice@example.com"), ParamValue::I64(0)],
+        ),
         // 6. LISTEN — KNOWN UNSUPPORTED.
         //    sqlx uses LISTEN for real-time notify patterns.  Basin does not
         //    implement the NOTIFY fanout channel.  Must return typed 0A000,
         //    NOT a panic.
-        r#"LISTEN mychannel"#,
+        Shape::raw(r#"LISTEN mychannel"#),
         // 7. SHOW server_version — sqlx probes this for version detection.
-        r#"SHOW server_version"#,
+        Shape::raw(r#"SHOW server_version"#),
         // 8. BEGIN — Basin is auto-commit; noop-accepted.
-        r#"BEGIN"#,
+        Shape::raw(r#"BEGIN"#),
     ];
 
     println!("\n=== sqlx ({} shapes) ===", sqlx.len());
@@ -1448,28 +1531,28 @@ async fn orm_compat_corpus() {
     //
     // Diesel generates SQL from a compile-time schema.  It emits unquoted
     // identifiers (snake_case) and uses $1-style params.
-    let diesel: &[&str] = &[
+    let diesel: &[Shape] = &[
         // 1. SELECT columns explicitly.
-        r#"SELECT id, title, body, user_id FROM posts WHERE id = 1"#,
+        Shape::raw(r#"SELECT id, title, body, user_id FROM posts WHERE id = 1"#),
         // 2. INSERT … RETURNING — Diesel uses this for identity columns.
-        r#"INSERT INTO posts (id, title, body, user_id)
-           VALUES (3,'Third Post','New content',1) RETURNING id, title"#,
+        Shape::raw(r#"INSERT INTO posts (id, title, body, user_id)
+           VALUES (3,'Third Post','New content',1) RETURNING id, title"#),
         // 3. UPDATE with RETURNING.
-        r#"UPDATE posts SET title = 'Updated Title' WHERE id = 1 RETURNING id, title"#,
+        Shape::raw(r#"UPDATE posts SET title = 'Updated Title' WHERE id = 1 RETURNING id, title"#),
         // 4. DELETE by primary key.
-        r#"DELETE FROM posts WHERE id = 999"#,
+        Shape::raw(r#"DELETE FROM posts WHERE id = 999"#),
         // 5. SELECT with JOIN.
-        r#"SELECT posts.id, posts.title, posts.body, posts.user_id
+        Shape::raw(r#"SELECT posts.id, posts.title, posts.body, posts.user_id
            FROM posts
            INNER JOIN "users" ON posts.user_id = "users"."id"
-           WHERE "users"."email" = 'alice@example.com'"#,
+           WHERE "users"."email" = 'alice@example.com'"#),
         // 6. pg_catalog.pg_tables probe — Diesel migration check.
         //    KNOWN POTENTIALLY UNSUPPORTED: Basin may not expose pg_tables.
-        r#"SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = 'public'"#,
+        Shape::raw(r#"SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = 'public'"#),
         // 7. ORDER BY + LIMIT (pagination).
-        r#"SELECT id, title, body, user_id FROM posts ORDER BY id ASC LIMIT 10 OFFSET 0"#,
+        Shape::raw(r#"SELECT id, title, body, user_id FROM posts ORDER BY id ASC LIMIT 10 OFFSET 0"#),
         // 8. COUNT aggregate.
-        r#"SELECT count(*) FROM posts WHERE user_id = 1"#,
+        Shape::raw(r#"SELECT count(*) FROM posts WHERE user_id = 1"#),
     ];
 
     println!("\n=== Diesel ({} shapes) ===", diesel.len());
@@ -1480,24 +1563,30 @@ async fn orm_compat_corpus() {
     // TypeORM mixes snake_case + camelCase aliases and emits verbose LEFT JOIN
     // chains.  Flagged as FUTURE in the ORM priority matrix; shapes are
     // included to catch parse regressions.
-    let typeorm: &[&str] = &[
+    let typeorm: &[Shape] = &[
         // 1. findOne with camelCase aliases.
-        r#"SELECT "users"."id" AS "users_id","users"."email" AS "users_email","users"."name" AS "users_name"
-           FROM "users" WHERE "users"."id" = 1 LIMIT 1"#,
+        Shape::raw(r#"SELECT "users"."id" AS "users_id","users"."email" AS "users_email","users"."name" AS "users_name"
+           FROM "users" WHERE "users"."id" = 1 LIMIT 1"#),
         // 2. LEFT JOIN with ON + WHERE chain.
-        r#"SELECT "users"."id" AS "users_id","users"."email" AS "users_email",
+        Shape::raw(r#"SELECT "users"."id" AS "users_id","users"."email" AS "users_email",
                   "orders"."id" AS "orders_id","orders"."status" AS "orders_status"
            FROM "users"
            LEFT JOIN "orders" ON "orders"."user_id" = "users"."id"
-           WHERE "orders"."status" = 'completed'"#,
+           WHERE "orders"."status" = 'completed'"#),
         // 3. COUNT with alias.
-        r#"SELECT count("users"."id") AS "cnt" FROM "users""#,
-        // 4. Parameterised query (typed planner error — expected).
-        r#"SELECT "users"."id","users"."email" FROM "users" WHERE "users"."id" = $1"#,
-        // 5. DELETE with parameterised WHERE (typed error — expected).
-        r#"DELETE FROM "users" WHERE "users"."id" IN ($1)"#,
+        Shape::raw(r#"SELECT count("users"."id") AS "cnt" FROM "users""#),
+        // 4. Parameterised query — $1 bound via extended protocol.
+        Shape::with(
+            r#"SELECT "users"."id","users"."email" FROM "users" WHERE "users"."id" = $1"#,
+            &[ParamValue::I64(1)],
+        ),
+        // 5. DELETE with parameterised WHERE — $1 bound via extended protocol.
+        Shape::with(
+            r#"DELETE FROM "users" WHERE "users"."id" IN ($1)"#,
+            &[ParamValue::I64(999)],
+        ),
         // 6. INSERT with RETURNING.
-        r#"INSERT INTO "orders" ("id","user_id","status","total") VALUES (20,1,'new',5.00) RETURNING "id""#,
+        Shape::raw(r#"INSERT INTO "orders" ("id","user_id","status","total") VALUES (20,1,'new',5.00) RETURNING "id""#),
     ];
 
     println!("\n=== TypeORM / FUTURE ({} shapes) ===", typeorm.len());
