@@ -229,10 +229,10 @@ Today's `tables` reads. Mirror the write surface + RLS.
 
 Distinct from the org-level PATs (`basin tokens`).
 
-- [ ] `cmd_api_keys.go` — `list`, `create`, `rotate`, `revoke`. Routes: `/v1/projects/{ref}/api-keys`. Tests: full CRUD round-trip, JSON shape, masked-secret output (only print full secret on create).
-- [ ] `cmd_pgwire.go` — `show`, `reveal`, `rotate`. Routes: `/v1/projects/{ref}/pgwire`. Reuses Tier 9's client helpers. Tests: show (masked password), reveal (full), rotate (confirmation flow).
-- [ ] `cmd_pgwire.go` — `engine-keys list/rotate`. Routes: `/v1/projects/{ref}/engine-keys`, `/engine-keys/rotate`. Tests: list shape, rotate confirmation.
-- [ ] Client: `ListAPIKeys`, `CreateAPIKey`, `RotateAPIKey`, `RevokeAPIKey`, `GetEngineKeys`, `RotateEngineKey`.
+- [x] `cmd_api_keys.go` — `list`, `create`, `rotate`, `revoke`. Routes: `/v1/projects/{ref}/api-keys`. Tests: full CRUD round-trip, JSON shape, masked-secret output (only print full secret on create). — Rust port landed in `src/commands/api_keys.rs` (4 subcommands wired via match arms, 24 tests).
+- [x] `cmd_pgwire.go` — `show`, `reveal`, `rotate`. Routes: `/v1/projects/{ref}/pgwire`. Reuses Tier 9's client helpers. Tests: show (masked password), reveal (full), rotate (confirmation flow). — Rust port landed in `src/commands/pgwire.rs` (show/reveal/rotate match arms, 29 tests cover all three plus engine-keys).
+- [x] `cmd_pgwire.go` — `engine-keys list/rotate`. Routes: `/v1/projects/{ref}/engine-keys`, `/engine-keys/rotate`. Tests: list shape, rotate confirmation. — Rust port landed in `src/commands/pgwire.rs` (`engine-keys` sub-dispatcher with `list`/`rotate` arms).
+- [x] Client: `ListAPIKeys`, `CreateAPIKey`, `RotateAPIKey`, `RevokeAPIKey`, `GetEngineKeys`, `RotateEngineKey`. — Rust port: HTTP calls inline via `Client.do_json`/`do_noout` directly in `src/commands/api_keys.rs` and `src/commands/pgwire.rs` (same pattern as the already-ticked Tier 21 client row).
 
 ---
 
@@ -240,14 +240,14 @@ Distinct from the org-level PATs (`basin tokens`).
 
 `snapshots` ships; flesh out the rest of `/backups/*`.
 
-- [ ] `cmd_backups.go` — `policy get/set`, `snapshots list/create/expire`, `restore`, `restore-jobs list`. Routes: `/v1/projects/{ref}/backups/policy`, `/snapshots`, `/restore`, `/restore/jobs`.
-- [ ] `backups policy get` — GET. Tests: default policy, custom policy.
-- [ ] `backups policy set --retention-days=<n> --schedule=<cron>` — PUT. Tests: validation (retention > 0), success, server error.
-- [ ] `backups snapshots create [--label=...]` — POST. Tests: label honoured, no-label, server in-progress error.
-- [ ] `backups snapshots expire <id>` — POST. Tests: success, 404, already-expired.
-- [ ] `backups restore --from=<snapshot> [--into=<branch>]` — POST. Tests: same-project, into-branch, conflict.
-- [ ] `backups restore-jobs list` — GET. Tests: empty, populated, in-flight status.
-- [ ] Client: `GetBackupPolicy`, `PutBackupPolicy`, `ListBackupSnapshots`, `CreateBackupSnapshot`, `ExpireBackupSnapshot`, `RestoreBackup`, `ListRestoreJobs`. (Reuse `snapshots` client code where it overlaps.)
+- [x] `cmd_backups.go` — `policy get/set`, `snapshots list/create/expire`, `restore`, `restore-jobs list`. Routes: `/v1/projects/{ref}/backups/policy`, `/snapshots`, `/restore`, `/restore/jobs`. — Rust port landed in `src/commands/backups.rs` (policy/snapshots/restore/restore-jobs dispatchers, 30 tests).
+- [x] `backups policy get` — GET. Tests: default policy, custom policy. — Rust port: `policy_get` handler in `src/commands/backups.rs`.
+- [x] `backups policy set --retention-days=<n> --schedule=<cron>` — PUT. Tests: validation (retention > 0), success, server error. — Rust port: `policy_set` handler in `src/commands/backups.rs`.
+- [x] `backups snapshots create [--label=...]` — POST. Tests: label honoured, no-label, server in-progress error. — Rust port: `snapshots_create` handler in `src/commands/backups.rs`.
+- [x] `backups snapshots expire <id>` — POST. Tests: success, 404, already-expired. — Rust port: `snapshots_expire` handler in `src/commands/backups.rs`.
+- [x] `backups restore --from=<snapshot> [--into=<branch>]` — POST. Tests: same-project, into-branch, conflict. — Rust port: `restore` handler in `src/commands/backups.rs`.
+- [x] `backups restore-jobs list` — GET. Tests: empty, populated, in-flight status. — Rust port: `restore_jobs_list` handler in `src/commands/backups.rs`.
+- [x] Client: `GetBackupPolicy`, `PutBackupPolicy`, `ListBackupSnapshots`, `CreateBackupSnapshot`, `ExpireBackupSnapshot`, `RestoreBackup`, `ListRestoreJobs`. (Reuse `snapshots` client code where it overlaps.) — Rust port: HTTP calls inline via `Client.do_json`/`do_noout` in `src/commands/backups.rs` (same pattern as the already-ticked Tier 21 client row).
 
 ---
 
@@ -256,12 +256,12 @@ Distinct from the org-level PATs (`basin tokens`).
 Highest-leverage single feature after `db push`. Pure CLI assembly
 over `information_schema` queries — no cloud endpoint to add.
 
-- [ ] `cmd_gen.go` — dispatcher `gen types <lang>`. Languages: `typescript`, `go`, `python`.
-- [ ] `gen types typescript` — query `information_schema.columns` via `POST /v1/projects/{ref}/sql/query`, emit `database.ts` with `type Tables = { ... }` per Postgres-type → TS-type mapping table in `gen_types_map.go`. Tests: enum mapping, nullable mapping, JSONB mapping, vector(N) mapping, snapshot test against a `testdata/expected.ts`.
-- [ ] `gen types go` — same shape; emit `database.go` with one struct per table. Honour `json:"..."` + `db:"..."` tags. Snapshot test against `testdata/expected.go`.
-- [ ] `gen types python` — emit `database.py` with `pydantic.BaseModel` subclasses. Snapshot test against `testdata/expected.py`.
+- [x] `cmd_gen.go` — dispatcher `gen types <lang>`. Languages: `typescript`, `go`, `python`. — Rust port landed in `src/commands/gen.rs` (`LangTarget::{TypeScript,Go,Python}` enum + `cmd_gen_types` dispatcher, 40 tests).
+- [x] `gen types typescript` — query `information_schema.columns` via `POST /v1/projects/{ref}/sql/query`, emit `database.ts` with `type Tables = { ... }` per Postgres-type → TS-type mapping table in `gen_types_map.go`. Tests: enum mapping, nullable mapping, JSONB mapping, vector(N) mapping, snapshot test against a `testdata/expected.ts`. — Rust port: `emit_typescript` in `src/commands/gen.rs`; snapshot fixture at `testdata/expected.ts`.
+- [x] `gen types go` — same shape; emit `database.go` with one struct per table. Honour `json:"..."` + `db:"..."` tags. Snapshot test against `testdata/expected.go`. — Rust port: `emit_go` in `src/commands/gen.rs`; snapshot fixture at `testdata/expected.go`.
+- [x] `gen types python` — emit `database.py` with `pydantic.BaseModel` subclasses. Snapshot test against `testdata/expected.py`. — Rust port: `emit_python` in `src/commands/gen.rs`; snapshot fixture at `testdata/expected.py`.
 - [x] `gen types --watch` — re-emit on every successful `db push`. Implement as a file-watcher on `./basin/migrations/`. Tests: cooperative interrupt (Ctrl-C ⇒ exit 0). **Landed**: polls `./basin/migrations/*.sql` mtimes every 2 s; re-emits on any add/remove/change; requires `--output=<path>`; testable via `Arc<AtomicBool>` stop flag; 8 new tests (requires-output error, initial-pass write, stop-flag fast-path, change-detection, 4 fingerprint unit tests).
-- [ ] Type-mapping table in `gen_types_map.go` — exhaustive: bool/int2/int4/int8/float4/float8/numeric/text/bytea/uuid/jsonb/timestamptz/date/time/interval/vector. Doc-comment in the file points at the engine's pgwire OID list.
+- [x] Type-mapping table in `gen_types_map.go` — exhaustive: bool/int2/int4/int8/float4/float8/numeric/text/bytea/uuid/jsonb/timestamptz/date/time/interval/vector. Doc-comment in the file points at the engine's pgwire OID list. — Rust port landed inline in `src/commands/gen.rs` (`type_table()` returns a `HashMap<&str, PgRow>` covering the listed pg types; `map_type(pg_name, lang) -> Option<MappedType>` does the lookup; completeness test at `map_type_table_completeness`).
 
 ---
 
@@ -269,41 +269,41 @@ over `information_schema` queries — no cloud endpoint to add.
 
 Cloud has the full surface (`/v1/orgs/{slug}/members*`).
 
-- [ ] `cmd_members.go` — `list`, `invite`, `remove`, `role`. Routes: `/v1/orgs/{slug}/members`, `/members/invite`, `/members/{user_id}`. Tests: list shape, invite by email, role update, removal confirmation.
-- [ ] `cmd_invitations.go` — `list`, `resend`, `revoke`. Routes: `/v1/orgs/{slug}/invitations`, `/invitations/{id}/resend`. Tests: pending vs expired, resend, revoke.
-- [ ] Extend `cmd_orgs.go` — add `create`, `update`, `delete`. Routes already wired (`POST /v1/orgs`, `PATCH /v1/orgs/{slug}`, `DELETE /v1/orgs/{slug}`). Tests: CRUD round-trip, JSON shape, confirmation on delete.
-- [ ] `cmd_orgs.go` — `branding get/put`. Routes: `/v1/orgs/{slug}/branding`. Tests: get default, put custom, validation errors.
-- [ ] Client: `ListMembers`, `InviteMember`, `RemoveMember`, `UpdateMemberRole`, `ListInvitations`, `ResendInvitation`, `RevokeInvitation`, `CreateOrg`, `UpdateOrg`, `DeleteOrg`, `GetOrgBranding`, `PutOrgBranding`.
+- [x] `cmd_members.go` — `list`, `invite`, `remove`, `role`. Routes: `/v1/orgs/{slug}/members`, `/members/invite`, `/members/{user_id}`. Tests: list shape, invite by email, role update, removal confirmation. — Rust port landed in `src/commands/members.rs` (4 subcommands wired via match arms, 20 tests).
+- [x] `cmd_invitations.go` — `list`, `resend`, `revoke`. Routes: `/v1/orgs/{slug}/invitations`, `/invitations/{id}/resend`. Tests: pending vs expired, resend, revoke. — Rust port landed in `src/commands/invitations.rs` (list/resend/revoke match arms, 19 tests).
+- [x] Extend `cmd_orgs.go` — add `create`, `update`, `delete`. Routes already wired (`POST /v1/orgs`, `PATCH /v1/orgs/{slug}`, `DELETE /v1/orgs/{slug}`). Tests: CRUD round-trip, JSON shape, confirmation on delete. — Rust port landed in `src/commands/orgs.rs` (`create`/`update`/`delete` handlers wired in the dispatcher, 27 tests cover all three).
+- [x] `cmd_orgs.go` — `branding get/put`. Routes: `/v1/orgs/{slug}/branding`. Tests: get default, put custom, validation errors. — Rust port landed in `src/commands/orgs.rs` (`branding` sub-dispatcher with `get`/`put`/`delete` handlers).
+- [x] Client: `ListMembers`, `InviteMember`, `RemoveMember`, `UpdateMemberRole`, `ListInvitations`, `ResendInvitation`, `RevokeInvitation`, `CreateOrg`, `UpdateOrg`, `DeleteOrg`, `GetOrgBranding`, `PutOrgBranding`. — Rust port: HTTP calls inline via `Client.do_json`/`do_noout` in `src/commands/members.rs`, `src/commands/invitations.rs`, and `src/commands/orgs.rs` (same pattern as the already-ticked Tier 21 client row).
 
 ---
 
 ## Tier 17 — Operations & observability
 
-- [ ] `cmd_domains.go` — `add`, `verify`, `cert`, `list`, `remove`. Routes: `/v1/projects/{ref}/domains/*`. Tests: full CRUD, verify dns flow, cert issuance polling.
-- [ ] `cmd_webhooks.go` — `list`, `create`, `patch`, `test`, `redeliver`, `delete`, `deliveries`. Routes: `/v1/projects/{ref}/webhooks/*`. Tests: full lifecycle, test-send, redeliver by delivery id.
-- [ ] `cmd_alerts.go` — `rules list/create/get/patch/delete/silence/unsilence`, `events list`. Routes: `/v1/projects/{ref}/alerts/*`. Tests: rule CRUD, silence + unsilence, event listing pagination.
-- [ ] `cmd_audit.go` — `list [--export=<dest>]`. Routes: `/v1/orgs/{slug}/audit`. With `--export`: route to `/audit/export/destinations`. Tests: list, since/until filtering, export.
-- [ ] `cmd_activity.go` — `list`. Route: `/v1/projects/{ref}/activity`. Tests: list shape, pagination.
-- [ ] `cmd_metrics.go` — `--range=24h` etc. Routes: `/v1/projects/{ref}/metrics`, `/v1/orgs/{slug}/metrics`. Tests: range parsing, JSON shape lock.
-- [ ] `cmd_erd.go` — `export [--format=svg|dot]`. Route: `/v1/projects/{ref}/erd`. Tests: svg export, dot export.
-- [ ] Client: corresponding methods for each route above.
+- [x] `cmd_domains.go` — `add`, `verify`, `cert`, `list`, `remove`. Routes: `/v1/projects/{ref}/domains/*`. Tests: full CRUD, verify dns flow, cert issuance polling. — Rust port landed in `src/commands/domains.rs` (5 subcommands wired via match arms, 19 tests).
+- [x] `cmd_webhooks.go` — `list`, `create`, `patch`, `test`, `redeliver`, `delete`, `deliveries`. Routes: `/v1/projects/{ref}/webhooks/*`. Tests: full lifecycle, test-send, redeliver by delivery id. — Rust port landed in `src/commands/webhooks.rs` (7 subcommands wired via match arms, 32 tests).
+- [x] `cmd_alerts.go` — `rules list/create/get/patch/delete/silence/unsilence`, `events list`. Routes: `/v1/projects/{ref}/alerts/*`. Tests: rule CRUD, silence + unsilence, event listing pagination. — Rust port landed in `src/commands/alerts.rs` (`rules` + `events` sub-dispatchers covering all seven rule actions plus events list, 30 tests).
+- [ ] `cmd_audit.go` — `list [--export=<dest>]`. Routes: `/v1/orgs/{slug}/audit`. With `--export`: route to `/audit/export/destinations`. Tests: list, since/until filtering, export. — *Partial*: `src/commands/audit.rs` ships the `list` happy path + `--since`/`--until`/`--limit` filtering, but `--export=<dest>` is accepted as a deferred stub (prints `audit export deferred` and exits 0 without routing to `/audit/export/destinations`); leave unchecked until the export path is wired.
+- [x] `cmd_activity.go` — `list`. Route: `/v1/projects/{ref}/activity`. Tests: list shape, pagination. — Rust port landed in `src/commands/activity.rs` (`list` subcommand with cursor pagination, 12 tests).
+- [x] `cmd_metrics.go` — `--range=24h` etc. Routes: `/v1/projects/{ref}/metrics`, `/v1/orgs/{slug}/metrics`. Tests: range parsing, JSON shape lock. — Rust port landed in `src/commands/metrics.rs` (single-entry command with `--range`/`--metric`/`--project`/`--org` flags routed to both project and org endpoints, 10 tests).
+- [x] `cmd_erd.go` — `export [--format=svg|dot]`. Route: `/v1/projects/{ref}/erd`. Tests: svg export, dot export. — Rust port landed in `src/commands/erd.rs` (`export` subcommand handling json/svg/dot formats, 12 tests).
+- [x] Client: corresponding methods for each route above. — Rust port: HTTP calls inline via `Client.do_json`/`do_noout` in `src/commands/domains.rs`, `webhooks.rs`, `alerts.rs`, `activity.rs`, `metrics.rs`, and `erd.rs` (same pattern as the already-ticked Tier 21 client row). Audit client surface lives in `src/commands/audit.rs` (export route still pending).
 
 ---
 
 ## Tier 18 — Engine knobs
 
-- [ ] `cmd_engine_pin.go` — `get/put/delete/events`. Routes: `/v1/projects/{ref}/engine-version/pin`, `/pin/events`. Tests: get default, pin a version, unpin, event audit trail.
-- [ ] `cmd_extensions.go` — `list`. Route: `/v1/projects/{ref}/extensions/catalog`. Tests: list shape, JSON output.
-- [ ] `cmd_oauth_providers.go` — `list/get/set/delete`. Routes: `/v1/projects/{ref}/oauth-providers/*`. Tests: provider CRUD per slug. **Spec ready 2026-05-20**: engine OAuth landed as basin ADR 0020 (presets + generic OIDC; engine task 5.10.O). This CLI command drives the cloud provider-config management API; gated on cloud adopting it.
-- [ ] `cmd_email.go` — `templates get/put/delete/test`, `allowance`. Routes: `/v1/projects/{ref}/email/*`. Tests: template CRUD, test-send, allowance lookup.
-- [ ] Client: methods for each route.
+- [x] `cmd_engine_pin.go` — `get/put/delete/events`. Routes: `/v1/projects/{ref}/engine-version/pin`, `/pin/events`. Tests: get default, pin a version, unpin, event audit trail. — Rust port landed in `src/commands/engine_pin.rs` (get/put/delete/events match arms, 19 tests).
+- [x] `cmd_extensions.go` — `list`. Route: `/v1/projects/{ref}/extensions/catalog`. Tests: list shape, JSON output. — Rust port landed in `src/commands/extensions.rs` (`list` subcommand, 11 tests).
+- [x] `cmd_oauth_providers.go` — `list/get/set/delete`. Routes: `/v1/projects/{ref}/oauth-providers/*`. Tests: provider CRUD per slug. **Spec ready 2026-05-20**: engine OAuth landed as basin ADR 0020 (presets + generic OIDC; engine task 5.10.O). This CLI command drives the cloud provider-config management API; gated on cloud adopting it. — Rust port landed in `src/commands/oauth_providers.rs` (list/get/set/delete match arms, 18 tests).
+- [x] `cmd_email.go` — `templates get/put/delete/test`, `allowance`. Routes: `/v1/projects/{ref}/email/*`. Tests: template CRUD, test-send, allowance lookup. — Rust port landed in `src/commands/email.rs` (`templates` sub-dispatcher with get/put/delete/test + top-level `allowance`, 23 tests).
+- [x] Client: methods for each route. — Rust port: HTTP calls inline via `Client.do_json`/`do_noout` in `src/commands/engine_pin.rs`, `extensions.rs`, `oauth_providers.rs`, and `email.rs` (same pattern as the already-ticked Tier 21 client row).
 
 ---
 
 ## Tier 19 — Saved queries & history
 
-- [ ] `cmd_queries.go` — `save`, `list`, `get`, `fork`, `delete`, `history`, `history --clear`. Routes: `/v1/projects/{ref}/queries/*`. Tests: full lifecycle, fork preserves ancestry, history clear with confirmation.
-- [ ] Client: `SaveQuery`, `ListSavedQueries`, `GetSavedQuery`, `UpdateSavedQuery`, `DeleteSavedQuery`, `ForkSavedQuery`, `ListQueryHistory`, `ClearQueryHistory`.
+- [x] `cmd_queries.go` — `save`, `list`, `get`, `fork`, `delete`, `history`, `history --clear`. Routes: `/v1/projects/{ref}/queries/*`. Tests: full lifecycle, fork preserves ancestry, history clear with confirmation. — Rust port landed in `src/commands/queries.rs` (save/list/get/fork/delete/history subcommands; `history --clear --yes` routes to `DELETE /v1/projects/{ref}/sql/history`; 26 tests).
+- [x] Client: `SaveQuery`, `ListSavedQueries`, `GetSavedQuery`, `UpdateSavedQuery`, `DeleteSavedQuery`, `ForkSavedQuery`, `ListQueryHistory`, `ClearQueryHistory`. — Rust port: HTTP calls inline via `Client.do_json`/`do_noout` in `src/commands/queries.rs` (same pattern as the already-ticked Tier 21 client row).
 
 ---
 
@@ -331,9 +331,9 @@ Plan-gated on the cloud side; CLI surface still useful.
 
 ## Tier 22 — Transfers
 
-- [ ] Extend `cmd_projects.go` with `transfers list/create/cancel`. Routes: `/v1/projects/{ref}/transfers/*`. Tests: pending listing, accept/decline as receiving org.
-- [ ] Extend `cmd_orgs.go` with `ownership-transfers list/create/cancel/accept/decline`. Routes: `/v1/orgs/{slug}/ownership-transfers/*`. Tests: full bidirectional flow.
-- [ ] Client: methods for each route.
+- [x] Extend `cmd_projects.go` with `transfers list/create/cancel`. Routes: `/v1/projects/{ref}/transfers/*`. Tests: pending listing, accept/decline as receiving org. — Rust port landed in `src/commands/transfers.rs` (`cmd_projects_transfers` with list/create/cancel arms; mounted from `src/commands/projects.rs` as `projects transfers <sub>`; 29 tests across the file).
+- [x] Extend `cmd_orgs.go` with `ownership-transfers list/create/cancel/accept/decline`. Routes: `/v1/orgs/{slug}/ownership-transfers/*`. Tests: full bidirectional flow. — Rust port landed in `src/commands/transfers.rs` (`cmd_orgs_ownership_transfers` with list/create/cancel/accept/decline arms; mounted from `src/commands/orgs.rs`; companion `incoming-project-transfers` sub-dispatcher for the receiving-org side).
+- [x] Client: methods for each route. — Rust port: HTTP calls inline via `Client.do_json`/`do_noout` in `src/commands/transfers.rs` (same pattern as the already-ticked Tier 21 client row).
 
 ---
 
@@ -378,8 +378,8 @@ Drift-control for the docs as the surface fans out.
 - [ ] **Per-command `man` pages.** Generate from the `commandEntry.help` field + each subcommand's `flag.FlagSet` usage. Embedded in the binary via `go:embed`; surfaced as `basin <cmd> --help` and (eventually) `man basin-<cmd>`. Tests: every `commands()` entry produces a non-empty man page.
 - [ ] **`README.md` example block** grows with every new tier — keep the count at 9–12 representative one-liners, not exhaustive.
 - [ ] **`docs/` directory** — per-area markdown explainers (`docs/db-workflow.md`, `docs/branches.md`, `docs/types.md`, …). Cross-linked from `README.md`. Each one ends with a "tests covering this surface" pointer.
-- [ ] **Changelog discipline.** Every tier completion adds a `CHANGELOG.md` entry under `## Unreleased`. Tags flush `Unreleased` into a dated section.
-- [ ] **`basin docs <cmd>`** — opens `https://docs.basin.run/cli/<cmd>` in the default browser (no `os/exec` of `open`/`xdg-open` mismatch — go via `runtime.GOOS` dispatch). Tests: each OS branch returns the expected command name.
+- [x] **Changelog discipline.** Every tier completion adds a `CHANGELOG.md` entry under `## Unreleased`. Tags flush `Unreleased` into a dated section. — Landed: `CHANGELOG.md` follows the Keep-a-Changelog format with a populated `## Unreleased` section (Tiers 8-11, 15, 20-21, 26, 27, plus storage and dump/restore) and an `## Earlier work (pre-changelog)` section; ~32 bullet entries today.
+- [x] **`basin docs <cmd>`** — opens `https://docs.basin.run/cli/<cmd>` in the default browser (no `os/exec` of `open`/`xdg-open` mismatch — go via `runtime.GOOS` dispatch). Tests: each OS branch returns the expected command name. — Rust port landed in `src/commands/docs.rs` (OS dispatch via `std::env::consts::OS` → `open` on macos / `cmd /c start` on windows / `xdg-open` elsewhere; `--json` is the CI-safe path that prints the URL with `"opened": false` and does not exec; 11 tests).
 
 ---
 
