@@ -1,0 +1,43 @@
+{
+  "name": "whoami",
+  "description": "GET /auth/v1/user followed by GET /v1/orgs; renders the active user + accessible orgs.",
+  "steps": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/auth/v1/user"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "user": {
+            "id": "u_1",
+            "email": "alice@example.com",
+            "name": "Alice"
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/v1/orgs"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "orgs": [
+            {
+              "id": "o_acme",
+              "slug": "acme",
+              "name": "Acme Inc",
+              "plan": "pro"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "command": ["whoami"],
+  "expect_stdout_contains": ["alice@example.com", "acme"]
+}

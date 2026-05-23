@@ -1,0 +1,28 @@
+{
+  "name": "webhooks_list",
+  "description": "GET /v1/projects/{ref}/webhooks returns the webhooks envelope; table render prints the id, url and events.",
+  "steps": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/v1/projects/p_x/webhooks"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "webhooks": [
+            {
+              "id": "wh_1",
+              "url": "https://hooks.example.com/basin",
+              "events": ["project.created", "branch.merged"],
+              "enabled": true,
+              "created_at": "2026-01-01T00:00:00Z"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "command": ["webhooks", "list", "--project=p_x"],
+  "expect_stdout_contains": ["wh_1", "https://hooks.example.com/basin", "project.created"]
+}

@@ -1,0 +1,27 @@
+{
+  "name": "orgs_list",
+  "description": "GET /v1/orgs returns the orgs envelope; table render prints the slug + plan.",
+  "steps": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/v1/orgs"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "orgs": [
+            {
+              "id": "o_acme",
+              "slug": "acme",
+              "name": "Acme Inc",
+              "plan": "pro"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "command": ["orgs", "list"],
+  "expect_stdout_contains": ["acme", "Acme Inc", "pro"]
+}

@@ -1,0 +1,24 @@
+{
+  "name": "error_404",
+  "description": "GET /v1/projects/{ref} with an unknown ref returns a typed 404 envelope; CLI exits non-zero with the error code on stderr.",
+  "steps": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/v1/projects/p_missing"
+      },
+      "response": {
+        "status": 404,
+        "body": {
+          "error": {
+            "code": "not_found",
+            "message": "project not found"
+          }
+        }
+      }
+    }
+  ],
+  "command": ["projects", "get", "p_missing"],
+  "expect_exit_code": 1,
+  "expect_stderr_contains": ["not_found", "project not found"]
+}
