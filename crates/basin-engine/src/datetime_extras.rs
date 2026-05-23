@@ -60,6 +60,7 @@ pub(crate) fn register_datetime_extras(ctx: &SessionContext) {
     // array_dims(list) -> Utf8
     ctx.register_udf(ScalarUDF::from(ArrayDimsUdf {
         signature: Signature::any(1, Volatility::Immutable),
+        aliases: vec!["list_dims".to_string()],
     }));
 
     // array_lower(arr, dim) -> Int64  — stub returning 1 (all PG arrays are 1-indexed)
@@ -246,6 +247,17 @@ impl ScalarUDFImpl for InfinityTimestampUdf {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ArrayDimsUdf {
     signature: Signature,
+    /// DataFusion's built-in `array_dims` (in `datafusion-functions-nested`)
+    /// registers itself under both `array_dims` and the alias `list_dims`,
+    /// so the session-state map has TWO keys pointing to the same Arc.
+    /// `SessionContext::register_udf` only overwrites the canonical name —
+    /// the alias key still references the built-in. When we then collect
+    /// `state.scalar_functions().values()` into a Vec for `with_scalar_functions`,
+    /// BOTH entries get re-inserted and HashMap iteration order decides which
+    /// one wins, so `array_dims` would non-deterministically return either
+    /// our PG-compatible `Utf8` or DataFusion's `List(UInt64)`. Declaring the
+    /// same alias here makes our registration overwrite both keys.
+    aliases: Vec<String>,
 }
 
 impl ScalarUDFImpl for ArrayDimsUdf {
@@ -257,6 +269,9 @@ impl ScalarUDFImpl for ArrayDimsUdf {
     }
     fn signature(&self) -> &Signature {
         &self.signature
+    }
+    fn aliases(&self) -> &[String] {
+        &self.aliases
     }
     fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
         match &arg_types[0] {
