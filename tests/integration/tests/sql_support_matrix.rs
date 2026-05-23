@@ -5807,8 +5807,9 @@ To suggest an addition to the matrix, edit `tests/integration/tests/sql_support_
 // Test entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn sql_support_matrix() {
+#[test]
+fn sql_support_matrix() {
+    basin_integration_tests::big_stack::run(async {
     basin_common::telemetry::try_init_for_tests();
 
     // ── Pass 0: Default (no env vars) ────────────────────────────────────────
@@ -5937,4 +5938,5 @@ async fn sql_support_matrix() {
         default_ok >= 20,
         "expected at least 20 OK rows in default config, got {default_ok}"
     );
+    });
 }

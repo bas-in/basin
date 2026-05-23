@@ -99,8 +99,9 @@ fn row_count(batches: &[arrow_array::RecordBatch]) -> usize {
 /// `CALL archive_project(42)` inserts the matching row into `archive`
 /// and deletes it from `projects`. Both statements execute in order
 /// and the result is committed atomically.
-#[tokio::test]
-async fn archive_project_round_trip() {
+#[test]
+fn archive_project_round_trip() {
+    basin_integration_tests::big_stack::run(async {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
@@ -163,6 +164,7 @@ async fn archive_project_round_trip() {
     let ids = col_i64(&batches, "id");
     assert!(!ids.contains(&42), "project 42 should be gone: {ids:?}");
     assert_eq!(ids.len(), 2, "99 and 7 should remain: {ids:?}");
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -171,8 +173,9 @@ async fn archive_project_round_trip() {
 
 /// Project A registers `archive_project`; project B must NOT be able to
 /// call it (procedure lookup is scoped per-project).
-#[tokio::test]
-async fn multi_project_isolation() {
+#[test]
+fn multi_project_isolation() {
+    basin_integration_tests::big_stack::run(async {
     let dir = TempDir::new().unwrap();
     let cat: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
     let eng_a = shared_engine(&dir, cat.clone());
@@ -235,6 +238,7 @@ async fn multi_project_isolation() {
         matches!(err, BasinError::NotFound(_)) || format!("{err}").contains("not found"),
         "expected cross-project table access to fail, got: {err:?}"
     );
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -245,8 +249,9 @@ async fn multi_project_isolation() {
 /// rolled back — the implicit transaction wrapping CALL is all-or-nothing.
 /// (The transaction machinery works reliably for INSERT; DELETE inside a
 /// transaction commits eagerly — that is a separate future phase.)
-#[tokio::test]
-async fn failure_mid_procedure_rolls_back() {
+#[test]
+fn failure_mid_procedure_rolls_back() {
+    basin_integration_tests::big_stack::run(async {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
@@ -291,6 +296,7 @@ async fn failure_mid_procedure_rolls_back() {
         "first INSERT must be rolled back; got {} rows",
         row_count(&batches)
     );
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -302,8 +308,9 @@ async fn failure_mid_procedure_rolls_back() {
 /// SAVEPOINT. The outer transaction is aborted (same as any failing
 /// statement inside a transaction — requires ROLLBACK to recover).
 /// This matches PostgreSQL semantics: a failing CALL aborts the outer txn.
-#[tokio::test]
-async fn call_inside_outer_transaction_procedure_writes_rolled_back() {
+#[test]
+fn call_inside_outer_transaction_procedure_writes_rolled_back() {
+    basin_integration_tests::big_stack::run(async {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
@@ -355,6 +362,7 @@ async fn call_inside_outer_transaction_procedure_writes_rolled_back() {
         0,
         "both the outer and procedure INSERTs must be rolled back"
     );
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -364,8 +372,9 @@ async fn call_inside_outer_transaction_procedure_writes_rolled_back() {
 /// When CALL succeeds inside an outer `BEGIN` block, the procedure's
 /// writes remain pending (not yet committed to disk) until the outer
 /// COMMIT. Rolling back the outer transaction rolls them back too.
-#[tokio::test]
-async fn successful_call_inside_outer_tx_rolls_back_with_outer() {
+#[test]
+fn successful_call_inside_outer_tx_rolls_back_with_outer() {
+    basin_integration_tests::big_stack::run(async {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
@@ -398,4 +407,5 @@ async fn successful_call_inside_outer_tx_rolls_back_with_outer() {
         0,
         "log must be empty after outer ROLLBACK"
     );
+    });
 }
