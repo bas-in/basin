@@ -927,7 +927,7 @@ impl InProcessShard {
             // A missing catalog row is unusual but non-fatal; fall back to
             // safe defaults so the whole compaction tick doesn't error out.
             let (file_format, declared_cluster_cols, adaptive_sort_override,
-                 gin_indexes, row_group_rows, row_block_size) =
+                 gin_indexes, row_group_rows, row_block_size, promoted_paths) =
                 match self.cfg.catalog.load_table(project, &table).await {
                     Ok(m) => (
                         shard_map_file_format(m.file_format),
@@ -936,6 +936,7 @@ impl InProcessShard {
                         m.indexes.clone(),
                         m.row_group_rows,
                         m.row_block_size,
+                        m.promoted_jsonb_paths,
                     ),
                     Err(_) => (
                         basin_storage::FileFormat::default(),
@@ -944,6 +945,7 @@ impl InProcessShard {
                         Vec::new(),
                         None,
                         None,
+                        Vec::new(),
                     ),
                 };
 
@@ -999,6 +1001,12 @@ impl InProcessShard {
                 max_row_group_size: row_group_rows,
                 ..Default::default()
             };
+            // ADR 0027 Phase 4 backfill: extend the merged batch with shadow
+            // columns for any promoted JSONB paths, so rows written BEFORE the
+            // path was promoted also carry the shadow value in the compacted
+            // file (otherwise they'd read NULL via DataFusion's missing-column
+            // fill). No-op when the table has no promoted paths.
+            let merged = backfill_promoted_columns(merged, &promoted_paths)?;
             let data_file = self
                 .cfg
                 .storage
@@ -1881,6 +1889,107 @@ fn evaluate_predicate(
     };
 
     Ok(mask)
+}
+
+// ── ADR 0027 Phase 4 — promoted JSONB shadow-column backfill at compaction ───
+//
+// When a JSONB path is promoted AFTER rows were already written, the existing
+// cold-tier files lack the `__promoted$col$key` shadow column and read NULL.
+// Compaction rewrites those rows into a merged file; here we extend the merged
+// batch with the shadow column so old + new rows all carry the materialised
+// value. The extraction matches `json_get_text` / the engine INSERT-path
+// `materialize_promoted_columns` exactly (absent key / JSON null → SQL NULL).
+// `extract_promoted_key` is duplicated here (shard cannot depend on
+// basin-engine — circular dep); the canonical engine copy is
+// `promoted_columns::extract_promoted_key_text`.
+fn backfill_promoted_columns(
+    batch: RecordBatch,
+    promoted_paths: &[basin_catalog::PromotedJsonbPath],
+) -> Result<RecordBatch> {
+    use arrow_array::{Array, ArrayRef, LargeBinaryArray, StringArray};
+    use arrow_schema::{DataType, Field};
+
+    if promoted_paths.is_empty() {
+        return Ok(batch);
+    }
+
+    let n = batch.num_rows();
+    let mut new_fields: Vec<Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
+    let mut new_columns: Vec<ArrayRef> = batch.columns().to_vec();
+
+    for path in promoted_paths {
+        let shadow_name = path.shadow_col_name();
+
+        // Skip if the shadow column is already present (e.g. row was written
+        // after the path was promoted and the INSERT path already added it).
+        if batch.schema().field_with_name(&shadow_name).is_ok() {
+            continue;
+        }
+
+        let shadow_col: ArrayRef = match batch.schema().index_of(&path.source_col) {
+            Ok(col_idx) => {
+                let src = batch.column(col_idx);
+                match src.data_type() {
+                    DataType::LargeBinary => {
+                        let arr = src
+                            .as_any()
+                            .downcast_ref::<LargeBinaryArray>()
+                            .expect("LargeBinary downcast");
+                        let mut values: Vec<Option<String>> = Vec::with_capacity(n);
+                        for i in 0..n {
+                            if arr.is_null(i) {
+                                values.push(None);
+                            } else {
+                                values.push(extract_promoted_key(arr.value(i), &path.json_key)?);
+                            }
+                        }
+                        std::sync::Arc::new(StringArray::from(values)) as ArrayRef
+                    }
+                    _ => std::sync::Arc::new(StringArray::from(vec![None::<String>; n])) as ArrayRef,
+                }
+            }
+            Err(_) => std::sync::Arc::new(StringArray::from(vec![None::<String>; n])) as ArrayRef,
+        };
+
+        new_fields.push(Field::new(&shadow_name, DataType::Utf8, true));
+        new_columns.push(shadow_col);
+    }
+
+    let new_schema = std::sync::Arc::new(arrow_schema::Schema::new(new_fields));
+    RecordBatch::try_new(new_schema, new_columns)
+        .map_err(|e| BasinError::internal(format!("backfill_promoted_columns: {e}")))
+}
+
+/// Extract the text value of `json_key` from raw JSONB bytes.
+/// Returns None for SQL-NULL, absent key, or JSON null.
+/// Matches the semantics of `json_get_text` / `payload->>'key'`.
+fn extract_promoted_key(bytes: &[u8], json_key: &str) -> Result<Option<String>> {
+    // Tolerate an optional leading 0x01 version byte (historical pgwire path).
+    let payload = if bytes.first() == Some(&0x01) && bytes.len() > 1 {
+        &bytes[1..]
+    } else {
+        bytes
+    };
+    let doc: serde_json::Value = serde_json::from_slice(payload)
+        .map_err(|e| BasinError::internal(format!("promoted col jsonb parse: {e}")))?;
+    let val = match &doc {
+        serde_json::Value::Object(map) => map.get(json_key).cloned(),
+        _ => None,
+    };
+    Ok(match val {
+        None => None,
+        Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => Some(s),
+        Some(other) => Some(
+            serde_json::to_string(&other)
+                .map_err(|e| BasinError::internal(format!("promoted col json serialize: {e}")))?,
+        ),
+    })
 }
 
 // ── GIN row-group re-index for compacted files ───────────────────────────────
