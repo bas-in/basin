@@ -4493,6 +4493,186 @@ async fn exec_insert_default_values(
 }
 
 // ---------------------------------------------------------------------------
+// copy_ingest fast path — pre-built RecordBatch ingest
+// ---------------------------------------------------------------------------
+
+/// Ingest a pre-built [`RecordBatch`] into `table`, bypassing SQL parse and
+/// Arrow literal-coercion.  Called by `crate::copy_ingest::exec_copy_from_batch`
+/// after it builds the batch from CSV text rows.
+///
+/// Runs the same post-batch pipeline as `exec_insert` (generated columns,
+/// enum/domain checks, constraints, write, commit/refresh).  The shard path
+/// and the synchronous-Parquet path are both handled.  Partitioned tables are
+/// not supported (caller must gate on `PartitionSpec::Unpartitioned`).
+///
+/// Returns the number of rows written on success.
+pub(crate) async fn exec_ingest_batch(
+    sess: &ProjectSession,
+    table: &TableName,
+    batch: RecordBatch,
+) -> Result<u64> {
+    let meta = sess
+        .engine
+        .config()
+        .catalog
+        .load_table(&sess.project, table)
+        .await?;
+
+    let batch = crate::generated_cols::materialise_generated_columns(
+        &sess.engine.config().catalog,
+        &sess.project,
+        batch,
+    )
+    .await?;
+    crate::type_ddl::enforce_enum_labels(&sess.engine.config().catalog, &sess.project, &batch)
+        .await?;
+    crate::type_ddl::enforce_domain_checks(&sess.engine.config().catalog, &sess.project, &batch)
+        .await?;
+    crate::constraints::enforce_check_constraints(
+        &sess.engine.config().storage,
+        &sess.project,
+        table,
+        table.as_str(),
+        meta.schema.as_ref(),
+        &meta.check_constraints,
+        &batch,
+    )
+    .await?;
+    crate::rls::enforce_with_check(
+        &sess.auth_context,
+        table.as_str(),
+        meta.rls_enabled,
+        &meta.policies,
+        &sess.current_user,
+        basin_catalog::PolicyCommand::Insert,
+        &batch,
+    )
+    .await?;
+    crate::constraints::enforce_fk_on_insert(
+        &sess.engine.config().catalog,
+        &sess.engine.config().storage,
+        &sess.project,
+        table.as_str(),
+        &meta.foreign_keys,
+        &batch,
+    )
+    .await?;
+    crate::constraints::enforce_pk_on_insert(
+        &sess.engine.config().storage,
+        &sess.project,
+        table,
+        table.as_str(),
+        &meta.pk_columns,
+        &batch,
+        Some((&*sess.engine.memtable_registry(), &sess.project)),
+    )
+    .await?;
+    crate::constraints::enforce_unique_on_insert(
+        &sess.engine.config().storage,
+        &sess.project,
+        table,
+        table.as_str(),
+        &meta.unique_constraints,
+        &batch,
+    )
+    .await?;
+
+    let row_count = batch.num_rows() as u64;
+    let part = PartitionKey::default_key();
+
+    // Shard path (auto-commit only — same guard as exec_insert).
+    if let Some(shard) = sess.engine.config().shard.as_ref() {
+        if !crate::session::tx_is_active(&sess.state) {
+            let handle = shard.get(&sess.project, &part).await?;
+            handle.write_batch(table, batch).await?;
+            return Ok(row_count);
+        }
+    }
+
+    // Synchronous Parquet path (no shard or inside a transaction).
+    let opts = write_options_for(&meta, crate::session::tx_is_active(&sess.state));
+    let events = build_insert_events(sess, table, std::slice::from_ref(&batch))?;
+    let df = sess
+        .engine
+        .config()
+        .storage
+        .write_batch_with_options(&sess.project, table, &part, &batch, &opts)
+        .await?;
+    let file_ref = DataFileRef {
+        path: df.path.as_ref().to_string(),
+        size_bytes: df.size_bytes,
+        row_count: df.row_count,
+        column_stats: df.column_stats.clone(),
+        bloom_filters: df.bloom_filters.clone(),
+        hll_sketches: std::collections::BTreeMap::new(),
+        tdigest_sketches: std::collections::BTreeMap::new(),
+    };
+
+    if crate::session::tx_is_active(&sess.state) {
+        htap_emit_wal_begin_lazy(sess).await;
+        crate::session::tx_htap_push_batch(&sess.state, table, batch.clone());
+        crate::session::tx_push_pending_file(&sess.state, table, file_ref);
+        let pending = crate::session::tx_pending_files_for(&sess.state, table);
+        let htap_batches = crate::session::tx_htap_batches_for(&sess.state, table);
+        if let Err(e) = crate::session::refresh_table_with_htap(
+            &sess.engine,
+            &sess.project,
+            &sess.ctx,
+            &sess.state,
+            table,
+            &pending,
+            htap_batches,
+        )
+        .await
+        {
+            crate::session::tx_set_aborted(&sess.state);
+            return Err(e);
+        }
+        return Ok(row_count);
+    }
+
+    // Auto-commit: pre-commit hook → catalog commit → refresh.
+    if let Err(e) = crate::session::refresh_table_with_extra(
+        &sess.engine,
+        &sess.project,
+        &sess.ctx,
+        &sess.state,
+        table,
+        std::slice::from_ref(&file_ref),
+    )
+    .await
+    {
+        let _ = sess
+            .engine
+            .config()
+            .storage
+            .delete_file(&sess.project, &df.path)
+            .await;
+        return Err(e);
+    }
+    if let Err(e) = dispatch_pre_commit(&sess.engine, &events).await {
+        let _ = sess
+            .engine
+            .config()
+            .storage
+            .delete_file(&sess.project, &df.path)
+            .await;
+        let _ = refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, table).await;
+        return Err(e);
+    }
+    commit_with_retry(sess, table, meta.current_snapshot, vec![file_ref]).await?;
+    dispatch_post_commit(&sess.engine, events);
+    refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, table).await?;
+    write_insert_audit_rows(sess, meta.schema.as_ref(), std::slice::from_ref(&batch)).await?;
+    Ok(row_count)
+}
+
+/// Expose `write_options_for` to `copy_ingest` (same crate, different module).
+pub(crate) fn write_options_for_copy(meta: &TableMetadata, in_tx: bool) -> WriteOptions {
+    write_options_for(meta, in_tx)
+}
+
+// ---------------------------------------------------------------------------
 // INSERT … ON CONFLICT (col) DO UPDATE SET …
 // ---------------------------------------------------------------------------
 
@@ -5102,6 +5282,18 @@ async fn apply_column_defaults(
         }
     }
     Ok(())
+}
+
+/// Public(crate) wrapper for `apply_column_defaults`, called from
+/// `copy_ingest::apply_column_defaults_to_batch` to fill DEFAULT expressions
+/// for columns not listed in a `COPY t (col_list) FROM STDIN` statement.
+pub(crate) async fn apply_column_defaults_pub(
+    sess: &ProjectSession,
+    schema: &Schema,
+    insert_columns: &[sqlparser::ast::Ident],
+    rows: &mut [Vec<sqlparser::ast::Expr>],
+) -> Result<()> {
+    apply_column_defaults(sess, schema, insert_columns, rows).await
 }
 
 /// Gate IDENTITY-column writes on the `OVERRIDING { SYSTEM | USER }

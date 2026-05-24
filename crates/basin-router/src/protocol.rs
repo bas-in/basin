@@ -139,6 +139,25 @@ pub(crate) trait Session: Send + Sync {
     async fn describe_statement(&self, handle: &StatementHandle) -> Result<StatementSchema>;
 
     async fn close_statement(&self, handle: &StatementHandle);
+
+    /// Ingest a pre-parsed CSV batch into `table_name`, bypassing SQL parse.
+    ///
+    /// Returns the number of rows ingested.  On
+    /// `BasinError::FeatureNotSupported` the caller should fall back to the
+    /// per-row INSERT path (e.g. partitioned tables).  The default
+    /// implementation returns `Err(FeatureNotSupported)` so test fakes that
+    /// don't implement the fast path compile and fail gracefully.
+    async fn ingest_csv_batch(
+        &self,
+        _table_name: &str,
+        _full_schema: std::sync::Arc<arrow_schema::Schema>,
+        _column_names: Option<&[String]>,
+        _rows: Vec<Vec<Option<String>>>,
+    ) -> Result<u64> {
+        Err(basin_common::BasinError::FeatureNotSupported(
+            "ingest_csv_batch not implemented for this session type".into(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -173,6 +192,16 @@ impl Session for ProjectSession {
 
     async fn close_statement(&self, handle: &StatementHandle) {
         ProjectSession::close_statement(self, handle).await
+    }
+
+    async fn ingest_csv_batch(
+        &self,
+        table_name: &str,
+        full_schema: std::sync::Arc<arrow_schema::Schema>,
+        column_names: Option<&[String]>,
+        rows: Vec<Vec<Option<String>>>,
+    ) -> Result<u64> {
+        ProjectSession::ingest_csv_batch(self, table_name, full_schema, column_names, rows).await
     }
 }
 
@@ -1809,7 +1838,16 @@ where
                     return ExecuteOutcome::error_info(info);
                 }
             };
-            let mut state = crate::copy::CopyInState::new(table.clone(), cols, with_header, opts);
+            let full_schema = std::sync::Arc::new(arrow_schema::Schema::new(
+                table_cols.iter().cloned().collect::<Vec<_>>(),
+            ));
+            let mut state = crate::copy::CopyInState::new(
+                table.clone(),
+                full_schema,
+                cols,
+                with_header,
+                opts,
+            );
             if let Some(list) = columns.clone() {
                 state = state.with_column_list(list);
             }
@@ -2756,8 +2794,16 @@ impl<S: Session + 'static> BasinSimpleQueryHandlerSlot<S> {
                         return finish_copy_error(client, info.into()).await;
                     }
                 };
-                let mut state =
-                    crate::copy::CopyInState::new(table.clone(), cols, with_header, opts);
+                let full_schema = std::sync::Arc::new(arrow_schema::Schema::new(
+                    table_cols.iter().cloned().collect::<Vec<_>>(),
+                ));
+                let mut state = crate::copy::CopyInState::new(
+                    table.clone(),
+                    full_schema,
+                    cols,
+                    with_header,
+                    opts,
+                );
                 if let Some(list) = columns.clone() {
                     state = state.with_column_list(list);
                 }

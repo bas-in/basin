@@ -992,6 +992,28 @@ impl ProjectSession {
     pub async fn close_statement(&self, handle: &StatementHandle) {
         crate::prepared::close_statement(self, handle).await
     }
+
+    /// Ingest a pre-parsed batch of CSV rows into `table_name`, bypassing SQL
+    /// parse.  Called by the pgwire `COPY FROM STDIN` framing layer.
+    ///
+    /// `full_schema` is the full Arrow schema of the target table.
+    /// `column_names` is the ordered COPY column list (`None` = all columns).
+    /// `rows[i][j]` is the value for row `i`, column `j` in `column_names`
+    /// order (or schema order when `column_names` is `None`).
+    ///
+    /// Returns the number of rows written.  On
+    /// `BasinError::FeatureNotSupported` the caller must fall back to the
+    /// per-row INSERT path (e.g. partitioned tables).
+    pub async fn ingest_csv_batch(
+        &self,
+        table_name: &str,
+        full_schema: std::sync::Arc<arrow_schema::Schema>,
+        column_names: Option<&[String]>,
+        rows: Vec<Vec<Option<String>>>,
+    ) -> Result<u64> {
+        crate::copy_ingest::exec_copy_from_batch(self, table_name, full_schema, column_names, rows)
+            .await
+    }
 }
 
 impl Drop for ProjectSession {
@@ -1040,6 +1062,7 @@ pub(crate) mod operators;
 /// Phase 5.30.C/E — schema-aware citext logical-plan rewrite.
 mod citext_analyzer;
 mod any_all_rewrite;
+pub(crate) mod copy_ingest;
 mod approx_count_distinct;
 mod approx_percentile;
 mod catalog_window_exec;

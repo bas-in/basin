@@ -120,15 +120,17 @@ pub(crate) enum CopyCommand {
 /// any sticky error captured mid-stream.
 pub(crate) struct CopyInState {
     pub(crate) table: String,
-    /// Field shape we use to render INSERT VALUES — same Arrow `Field`s the
-    /// engine returns from a `prepare("SELECT * FROM <table>")`. When a
-    /// column list was supplied, this carries only those listed columns
-    /// (in list order). When no column list was supplied, this carries
-    /// the full table schema.
+    /// Full table schema (all columns, in declaration order).  Used by the
+    /// fast-path `ingest_csv_batch` call to build the Arrow RecordBatch
+    /// without going through SQL parse.
+    pub(crate) full_schema: std::sync::Arc<arrow_schema::Schema>,
+    /// Field shape we use for column-count validation and (fallback) INSERT
+    /// VALUES rendering.  When a column list was supplied, this carries only
+    /// those listed columns (in list order).  When no column list was
+    /// supplied, this is identical to `full_schema`'s field list.
     pub(crate) columns: Vec<Field>,
     /// User-supplied column list, if any. Populated only when the COPY
-    /// statement included `(col1, col2, ...)`. Used to build
-    /// `INSERT INTO t (col1, col2) VALUES (...)`.
+    /// statement included `(col1, col2, ...)`.
     pub(crate) column_list: Option<Vec<String>>,
     /// Bytes received but not yet split into a complete row.
     pub(crate) buffer: Vec<u8>,
@@ -141,17 +143,30 @@ pub(crate) struct CopyInState {
     pub(crate) header_pending: bool,
     /// CSV format options (delimiter, null, quote, escape).
     pub(crate) opts: CopyOptions,
+    /// Pending rows accumulated for a batch `ingest_csv_batch` call.
+    /// Rows are held here until `INGEST_BATCH_SIZE` is reached or the
+    /// COPY stream ends (`final_chunk = true`).
+    pub(crate) pending_rows: Vec<Vec<Option<String>>>,
 }
+
+/// Number of parsed CSV rows to accumulate before issuing one
+/// `ingest_csv_batch` call.  Large enough to amortise the per-batch overhead
+/// (Arrow builder setup, shard.write_batch WAL append) but small enough to
+/// keep peak memory reasonable for wide tables.  10 000 matches the bench
+/// INSERT batch size.
+const INGEST_BATCH_SIZE: usize = 10_000;
 
 impl CopyInState {
     pub(crate) fn new(
         table: String,
+        full_schema: std::sync::Arc<arrow_schema::Schema>,
         columns: Vec<Field>,
         with_header: bool,
         opts: CopyOptions,
     ) -> Self {
         Self {
             table,
+            full_schema,
             columns,
             column_list: None,
             buffer: Vec::new(),
@@ -159,6 +174,7 @@ impl CopyInState {
             error: None,
             header_pending: with_header,
             opts,
+            pending_rows: Vec::new(),
         }
     }
 
@@ -734,6 +750,13 @@ pub(crate) fn copy_out_response(n: usize) -> CopyOutResponse {
 /// to contain unescaped newlines. Trailing partial bytes stay in the
 /// buffer for the next chunk.
 ///
+/// **Fast path**: rows are accumulated in `state.pending_rows` until
+/// `INGEST_BATCH_SIZE` is reached or `final_chunk` is true, then flushed
+/// via `session.ingest_csv_batch`.  This bypasses SQL parse entirely for
+/// common table types.  On `FeatureNotSupported` (e.g. partitioned table)
+/// the function falls back to the original per-row INSERT path for the
+/// current batch.
+///
 /// Stops processing on the first engine error, which gets latched into
 /// `state.error`. Subsequent calls fall through (drain mode).
 pub(crate) async fn process_buffered_rows<S: Session + ?Sized>(
@@ -749,7 +772,14 @@ pub(crate) async fn process_buffered_rows<S: Session + ?Sized>(
     loop {
         let consumed = match split_record(&state.buffer, final_chunk, state.opts.quote) {
             Some((record, n)) => (record, n),
-            None => return,
+            None => {
+                // No more complete records in the buffer.  If this is the
+                // final chunk, flush whatever is pending.
+                if final_chunk && !state.pending_rows.is_empty() {
+                    flush_pending_rows(state, session).await;
+                }
+                return;
+            }
         };
         let (record_bytes, n) = consumed;
         // Header rows: skip exactly one without inserting.
@@ -760,6 +790,10 @@ pub(crate) async fn process_buffered_rows<S: Session + ?Sized>(
         }
         // Skip blank lines (CSV exports often end with one).
         if record_bytes.is_empty() {
+            state.buffer.drain(..n);
+            continue;
+        }
+        if state.error.is_some() {
             state.buffer.drain(..n);
             continue;
         }
@@ -786,6 +820,68 @@ pub(crate) async fn process_buffered_rows<S: Session + ?Sized>(
             state.buffer.clear();
             return;
         }
+        // Accumulate row for the batch fast path.
+        state.pending_rows.push(record);
+        state.buffer.drain(..n);
+
+        // Flush when the batch is full.
+        if state.pending_rows.len() >= INGEST_BATCH_SIZE {
+            flush_pending_rows(state, session).await;
+            if state.error.is_some() {
+                return;
+            }
+        }
+    }
+}
+
+/// Flush `state.pending_rows` via `session.ingest_csv_batch` (fast path) or,
+/// on `FeatureNotSupported`, fall back to the per-row INSERT path.
+async fn flush_pending_rows<S: Session + ?Sized>(state: &mut CopyInState, session: &S) {
+    if state.pending_rows.is_empty() || state.error.is_some() {
+        return;
+    }
+    let rows = std::mem::take(&mut state.pending_rows);
+    let n = rows.len() as u64;
+
+    let result = session
+        .ingest_csv_batch(
+            &state.table,
+            state.full_schema.clone(),
+            state.column_list.as_deref(),
+            rows.clone(),
+        )
+        .await;
+
+    match result {
+        Ok(ingested) => {
+            state.row_count += ingested;
+        }
+        Err(e) if is_feature_not_supported(&e) => {
+            // Partitioned table or other unsupported case: fall back to the
+            // per-row INSERT path for this batch.
+            fallback_insert_rows(state, session, rows).await;
+        }
+        Err(e) => {
+            state.error = Some(format!("COPY batch (rows {}–{}): {e}", state.row_count + 1, state.row_count + n));
+        }
+    }
+}
+
+fn is_feature_not_supported(e: &basin_common::BasinError) -> bool {
+    matches!(e, basin_common::BasinError::FeatureNotSupported(_))
+}
+
+/// Fallback: insert `rows` one at a time via the original SQL-per-row path.
+/// Used for partitioned tables and other cases the fast path does not support.
+async fn fallback_insert_rows<S: Session + ?Sized>(
+    state: &mut CopyInState,
+    session: &S,
+    rows: Vec<Vec<Option<String>>>,
+) {
+    for record in rows {
+        if state.error.is_some() {
+            break;
+        }
         let sql = match build_insert_sql(
             &state.table,
             state.column_list.as_deref(),
@@ -795,24 +891,18 @@ pub(crate) async fn process_buffered_rows<S: Session + ?Sized>(
             Ok(s) => s,
             Err(e) => {
                 state.error = Some(e);
-                state.buffer.clear();
                 return;
             }
         };
-        // Execute synchronously. Any engine error halts further inserts but
-        // not the COPY-IN drain — see module-level "protocol-state-machine
-        // guarantee".
         match session.execute(&sql).await {
             Ok(ExecResult::Empty { .. }) | Ok(ExecResult::Rows { .. }) => {
                 state.row_count += 1;
             }
             Err(e) => {
                 state.error = Some(format!("COPY row {}: {e}", state.row_count + 1));
-                state.buffer.clear();
                 return;
             }
         }
-        state.buffer.drain(..n);
     }
 }
 
