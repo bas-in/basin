@@ -297,11 +297,112 @@ async fn explain_filter_below_jsonb_projection() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Debug: print full plan for the bench-shape query (no ORDER BY / LIMIT).
+// 4. EXPLAIN structural assertion: bench shape (no ORDER BY / LIMIT).
+// ---------------------------------------------------------------------------
+//
+// The bench shape `SELECT payload ->> 'category' FROM events WHERE id < 100`
+// has NO ORDER BY and NO LIMIT.  DataFusion's `ProjectionPushdown` optimizer
+// used to fuse `json_get_text` directly into `DataSourceExec` (bug: the UDF
+// ran on every row before the predicate discarded non-matching rows).
+//
+// The `UdfPushdownGuard` wrapper ensures that expression-bearing projections
+// are NOT pushed into `DataSourceExec`.  This test verifies that:
+//
+//  a) `json_get_text` appears in a `ProjectionExec` line, NOT in the
+//     `DataSourceExec` line.
+//  b) The `DataSourceExec` line carries the predicate (`id < 100`).
+
+#[tokio::test]
+async fn explain_bench_shape_udf_not_in_datasourceexec() {
+    let (_dir, engine) = open_engine().await;
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+    seed_events(&sess, 5_000).await;
+
+    let plan_text = explain_plan(
+        &sess,
+        "SELECT payload ->> 'category' FROM events WHERE id < 100",
+    )
+    .await;
+
+    println!("--- bench shape physical plan ---\n{plan_text}\n---");
+
+    let lines: Vec<&str> = plan_text.lines().collect();
+
+    // json_get_text must appear in a ProjectionExec line.
+    let proj_udf_line = lines.iter().position(|l| {
+        let lower = l.to_ascii_lowercase();
+        lower.contains("projectionexec") && lower.contains("json_get_text")
+    });
+    assert!(
+        proj_udf_line.is_some(),
+        "Expected a ProjectionExec line containing json_get_text in:\n{plan_text}"
+    );
+
+    // json_get_text must NOT appear in the DataSourceExec line.
+    let datasource_udf_line = lines.iter().position(|l| {
+        let lower = l.to_ascii_lowercase();
+        lower.contains("datasourceexec") && lower.contains("json_get_text")
+    });
+    assert!(
+        datasource_udf_line.is_none(),
+        "json_get_text must NOT be fused into DataSourceExec (UdfPushdownGuard regression).\
+         \nPlan:\n{plan_text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 5. Wall-clock proof: bench shape (no ORDER BY / LIMIT) on 50k rows is fast.
+// ---------------------------------------------------------------------------
+//
+// If the UDF is evaluated on all rows (the regression) this query takes
+// O(N) time w.r.t. table size.  When the guard is in place the UDF only runs
+// on the ~99 post-filter rows, so wall-clock stays small regardless of N.
+//
+// This test seeds 50k rows and expects sub-500 ms; the broken plan would
+// take many seconds at debug-opt levels.
+
+#[tokio::test]
+async fn bench_shape_udf_is_fast() {
+    let (_dir, engine) = open_engine().await;
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+    seed_events(&sess, 50_000).await;
+
+    let _warm = sess
+        .execute("SELECT id FROM events WHERE id = 1 LIMIT 1")
+        .await
+        .expect("warmup");
+
+    let sql = "SELECT payload ->> 'category' FROM events WHERE id < 100";
+
+    let t0 = Instant::now();
+    let res = sess.execute(sql).await.expect("execute");
+    let elapsed = t0.elapsed();
+
+    // Correctness: 99 rows back (id 1..=99).
+    let batches = match &res {
+        ExecResult::Rows { batches, .. } => batches,
+        other => panic!("expected Rows, got: {other:?}"),
+    };
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 99, "expected 99 rows (id 1..=99), got {total}");
+
+    // Latency: the UDF should only run on ~99 rows.  A 750 ms ceiling on a
+    // 50k-row table is intentionally loose for debug builds; the broken plan
+    // takes seconds (10-50× slower than release at debug-opt).
+    assert!(
+        elapsed.as_millis() < 750,
+        "bench-shape UDF should evaluate on ~99 rows only, not all 50k.  \
+         Elapsed: {elapsed:?}.  A slow result indicates the UDF is running \
+         before the predicate (UdfPushdownGuard regression)."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6. Debug: print full plan for the bench-shape query (no ORDER BY / LIMIT).
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "debug-only: prints plan for inspection"]
+#[ignore = "debug-only: prints plan for inspection, not a regression gate"]
 async fn debug_plan_for_bench_shape() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();

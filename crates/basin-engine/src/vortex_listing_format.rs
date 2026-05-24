@@ -61,6 +61,7 @@ use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::Result as DFResult;
 use datafusion::common::Statistics;
+use datafusion::common::config::ConfigOptions;
 use datafusion::common::stats::Precision;
 use datafusion::datasource::file_format::FileFormat;
 use datafusion::physical_plan::ExecutionPlan;
@@ -69,15 +70,23 @@ use datafusion_datasource::TableSchema;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_compression_type::FileCompressionType;
 use datafusion_datasource::file_format::FileMeta;
-use datafusion_datasource::file_scan_config::FileScanConfig;
+use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
+use datafusion_datasource::source::DataSourceExec;
 use datafusion_datasource::file_sink_config::FileSinkConfig;
+use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion_physical_plan::filter_pushdown::FilterPushdownPropagation;
+use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlanProperties, PlanProperties, Partitioning,
     SendableRecordBatchStream,
 };
+use datafusion_physical_plan::SortOrderPushdownResult;
+use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::execution::context::TaskContext;
+use datafusion::physical_plan::PhysicalExpr;
 use futures::stream::Stream;
 use object_store::{ObjectMeta, ObjectStore};
 
@@ -212,31 +221,6 @@ impl FileFormat for BasinVortexFormat {
 
     // ---- plan construction --------------------------------------------------
 
-    /// ADR-0024: wrap the inner plan with `UuidDecimal256RestoreExec` when the
-    /// scan schema contains any UUID-disguised `Decimal256(39, 0)` columns.
-    /// This converts those columns back to `FixedSizeBinary(16)` so DataFusion
-    /// above this point sees only the logical UUID type.
-    ///
-    /// The inner `VortexFormat::create_physical_plan` does NOT insert a cast
-    /// because `file_source` (below) already swapped those fields to
-    /// `Decimal256(39, 0)` in the `TableSchema` it received.
-    ///
-    /// TODO(adr-0024): drop wrap when Vortex grows native FixedSizeBinary(N).
-    async fn create_physical_plan(
-        &self,
-        state: &dyn Session,
-        conf: FileScanConfig,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let inner_plan = self.inner.create_physical_plan(state, conf).await?;
-        // If the plan's output schema contains any Decimal256(39,0)+BASIN_TYPE=UUID
-        // columns, wrap with the restore exec.  Otherwise pass through unchanged.
-        if schema_has_uuid_decimal256(inner_plan.schema().as_ref()) {
-            Ok(Arc::new(UuidDecimal256RestoreExec::new(inner_plan)))
-        } else {
-            Ok(inner_plan)
-        }
-    }
-
     async fn create_writer_physical_plan(
         &self,
         input: Arc<dyn ExecutionPlan>,
@@ -261,10 +245,15 @@ impl FileFormat for BasinVortexFormat {
     /// Field metadata (including `BASIN_TYPE=UUID`) is preserved verbatim so the
     /// restore exec can identify which columns to translate.
     ///
+    /// Also wraps the inner source with `UdfPushdownGuard` so that DataFusion's
+    /// `ProjectionPushdown` optimizer cannot fuse UDF expressions (e.g.
+    /// `json_get_text`) into the `DataSourceExec` scan.  Column-only projections
+    /// are still accepted by the guard and passed through to the inner source.
+    ///
     /// TODO(adr-0024): drop swap when Vortex grows native FixedSizeBinary(N).
     fn file_source(&self, table_schema: TableSchema) -> Arc<dyn FileSource> {
         let file_schema = table_schema.file_schema().clone();
-        if schema_has_uuid_fsb16(file_schema.as_ref()) {
+        let inner_source = if schema_has_uuid_fsb16(file_schema.as_ref()) {
             let physical_file_schema = Arc::new(swap_uuid_fsb16_to_decimal256(file_schema.as_ref()));
             let physical_table_schema = TableSchema::new(
                 physical_file_schema,
@@ -273,8 +262,253 @@ impl FileFormat for BasinVortexFormat {
             self.inner.file_source(physical_table_schema)
         } else {
             self.inner.file_source(table_schema)
+        };
+        Arc::new(UdfPushdownGuard { inner: inner_source })
+    }
+
+    /// ADR-0024 + UDF guard: calls `VortexFormat::create_physical_plan` normally
+    /// (the conf always arrives with `VortexSource` as the file_source because
+    /// `FileScanConfigBuilder` unwraps our wrapper on the way in), then
+    /// re-wraps the resulting `DataSourceExec`'s `VortexSource` in a fresh
+    /// `UdfPushdownGuard`.
+    ///
+    /// Re-wrapping is essential: DataFusion's `ProjectionPushdown` physical
+    /// optimizer rule runs *after* `create_physical_plan` returns and calls
+    /// `DataSourceExec::try_swapping_with_projection` → `FileScanConfig::
+    /// try_swapping_with_projection` → `file_source.try_pushdown_projection`.
+    /// Without the guard the raw `VortexSource` accepts every projection
+    /// (including UDF expressions), fusing `json_get_text` into the scan.
+    /// With the guard in place, expression projections get declined and
+    /// `ProjectionPushdown` keeps a `ProjectionExec` node above the scan.
+    async fn create_physical_plan(
+        &self,
+        state: &dyn Session,
+        conf: FileScanConfig,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Strip the UdfPushdownGuard wrapper so that VortexFormat sees its own
+        // VortexSource directly (it downcasts file_source and errors otherwise).
+        let maybe_inner: Option<Arc<dyn FileSource>> = conf
+            .file_source()
+            .as_any()
+            .downcast_ref::<UdfPushdownGuard>()
+            .map(|guard| Arc::clone(&guard.inner));
+        let unwrapped_conf = if let Some(inner_source) = maybe_inner {
+            FileScanConfigBuilder::from(conf)
+                .with_source(inner_source)
+                .build()
+        } else {
+            conf
+        };
+
+        let inner_plan = self.inner.create_physical_plan(state, unwrapped_conf).await?;
+
+        // Re-wrap the VortexSource inside the DataSourceExec with UdfPushdownGuard
+        // so that the ProjectionPushdown optimizer (which runs after this method
+        // returns) cannot fuse UDF expressions into the scan.
+        let inner_plan = rewrap_datasource_with_guard(inner_plan);
+
+        // If the plan's output schema contains any Decimal256(39,0)+BASIN_TYPE=UUID
+        // columns, wrap with the restore exec.  Otherwise pass through unchanged.
+        if schema_has_uuid_decimal256(inner_plan.schema().as_ref()) {
+            Ok(Arc::new(UuidDecimal256RestoreExec::new(inner_plan)))
+        } else {
+            Ok(inner_plan)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// UdfPushdownGuard — keeps UDF expressions out of DataSourceExec
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if `projection` contains at least one expression that is not
+/// a plain column reference.  Used by `UdfPushdownGuard` to decide whether to
+/// accept or decline a projection pushdown.
+fn projection_has_expressions(projection: &ProjectionExprs) -> bool {
+    projection
+        .iter()
+        .any(|pe| pe.expr.as_any().downcast_ref::<Column>().is_none())
+}
+
+/// A thin [`FileSource`] wrapper around an inner `FileSource` (always a
+/// `VortexSource` in practice) that declines projection pushdown when the
+/// projection contains computed expressions (UDFs, arithmetic, etc.).
+///
+/// ## Why this exists
+///
+/// DataFusion's `ProjectionPushdown` physical optimizer rule calls
+/// `try_pushdown_projection` on every [`FileSource`] it finds.
+/// `VortexSource::try_pushdown_projection` unconditionally accepts every
+/// projection, including ones that carry JSONB UDFs (`json_get_text`, etc.).
+/// That fuses the UDF into the `DataSourceExec`, causing it to run on *every
+/// materialized row* before the row filter (`vortex_predicate` = `id < 100`)
+/// has had a chance to discard non-matching rows.  The result is O(N) UDF
+/// evaluation instead of O(filtered_rows).
+///
+/// By declining expression-bearing projections the optimizer is forced to keep
+/// a separate `ProjectionExec` node above the scan.  DataFusion's
+/// `FilterPushdown` rule already pushed the predicate into the Vortex scan, so
+/// the resulting plan is:
+///
+/// ```text
+/// ProjectionExec [json_get_text(payload@0, 'category')]
+///   DataSourceExec  predicate=id<100, scan=[id, payload]
+/// ```
+///
+/// Column-only projections are still forwarded to the inner source so that
+/// unnecessary column reads continue to be avoided.
+#[derive(Clone)]
+struct UdfPushdownGuard {
+    inner: Arc<dyn FileSource>,
+}
+
+impl fmt::Debug for UdfPushdownGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UdfPushdownGuard")
+            .field("inner_type", &self.inner.file_type())
+            .finish()
+    }
+}
+
+impl FileSource for UdfPushdownGuard {
+    // ---- required methods ---------------------------------------------------
+
+    fn create_file_opener(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        base_config: &FileScanConfig,
+        partition: usize,
+    ) -> DFResult<Arc<dyn datafusion_datasource::file_stream::FileOpener>> {
+        self.inner.create_file_opener(object_store, base_config, partition)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn table_schema(&self) -> &TableSchema {
+        self.inner.table_schema()
+    }
+
+    fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {
+        Arc::new(UdfPushdownGuard {
+            inner: self.inner.with_batch_size(batch_size),
+        })
+    }
+
+    fn metrics(&self) -> &ExecutionPlanMetricsSet {
+        self.inner.metrics()
+    }
+
+    fn file_type(&self) -> &str {
+        self.inner.file_type()
+    }
+
+    // ---- optional delegation ------------------------------------------------
+
+    fn filter(&self) -> Option<Arc<dyn PhysicalExpr>> {
+        self.inner.filter()
+    }
+
+    fn projection(&self) -> Option<&ProjectionExprs> {
+        self.inner.projection()
+    }
+
+    fn fmt_extra(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        self.inner.fmt_extra(t, f)
+    }
+
+    fn supports_repartitioning(&self) -> bool {
+        self.inner.supports_repartitioning()
+    }
+
+    fn try_pushdown_filters(
+        &self,
+        filters: Vec<Arc<dyn PhysicalExpr>>,
+        config: &ConfigOptions,
+    ) -> DFResult<FilterPushdownPropagation<Arc<dyn FileSource>>> {
+        // Delegate to the inner source and re-wrap the returned updated_node in
+        // a new UdfPushdownGuard so the guard survives filter-pushdown rewrites.
+        let inner_result = self.inner.try_pushdown_filters(filters, config)?;
+        let updated_node = inner_result.updated_node.map(|updated| {
+            Arc::new(UdfPushdownGuard { inner: updated }) as Arc<dyn FileSource>
+        });
+        Ok(FilterPushdownPropagation {
+            filters: inner_result.filters,
+            updated_node,
+        })
+    }
+
+    fn try_pushdown_sort(
+        &self,
+        order: &[PhysicalSortExpr],
+        eq_properties: &EquivalenceProperties,
+    ) -> DFResult<SortOrderPushdownResult<Arc<dyn FileSource>>> {
+        let result = self.inner.try_pushdown_sort(order, eq_properties)?;
+        // Re-wrap any returned inner source in UdfPushdownGuard.
+        Ok(result.map(|inner_source| {
+            Arc::new(UdfPushdownGuard { inner: inner_source }) as Arc<dyn FileSource>
+        }))
+    }
+
+    /// Accept column-only projections; decline expression projections so that
+    /// `ProjectionPushdown` cannot fuse UDFs (e.g. `json_get_text`) into
+    /// `DataSourceExec`.  The caller will keep a separate `ProjectionExec` node
+    /// for those expressions, which runs on post-filter rows only.
+    fn try_pushdown_projection(
+        &self,
+        projection: &ProjectionExprs,
+    ) -> DFResult<Option<Arc<dyn FileSource>>> {
+        if projection_has_expressions(projection) {
+            // Decline — DataFusion keeps a ProjectionExec above the scan.
+            return Ok(None);
+        }
+        // Column-only projection: forward to inner source and re-wrap.
+        match self.inner.try_pushdown_projection(projection)? {
+            Some(new_inner) => Ok(Some(Arc::new(UdfPushdownGuard { inner: new_inner }))),
+            None => Ok(None),
+        }
+    }
+}
+
+/// If `plan` is a `DataSourceExec` backed by a `FileScanConfig` whose
+/// `file_source` is a `VortexSource` (not yet guarded), wrap that source in a
+/// fresh `UdfPushdownGuard` and return a new `DataSourceExec`.  Otherwise
+/// return `plan` unchanged.
+///
+/// Called from `BasinVortexFormat::create_physical_plan` immediately after the
+/// inner `VortexFormat` builds the `DataSourceExec`.  The guard must be present
+/// before DataFusion's `ProjectionPushdown` optimizer pass so that expression
+/// projections (e.g. JSONB UDFs) are NOT fused into the scan.
+fn rewrap_datasource_with_guard(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    // Get the DataSourceExec, if any.
+    let Some(ds_exec) = plan.as_any().downcast_ref::<DataSourceExec>() else {
+        return plan;
+    };
+    // Get the FileScanConfig inside the DataSourceExec.
+    let Some(fsc) = ds_exec
+        .data_source()
+        .as_any()
+        .downcast_ref::<FileScanConfig>()
+    else {
+        return plan;
+    };
+    // Already guarded — don't double-wrap.
+    if fsc.file_source()
+        .as_any()
+        .downcast_ref::<UdfPushdownGuard>()
+        .is_some()
+    {
+        return plan;
+    }
+    // Build a new FileScanConfig with the guard around the existing file source.
+    let guarded_source = Arc::new(UdfPushdownGuard {
+        inner: Arc::clone(fsc.file_source()),
+    });
+    let new_fsc = FileScanConfigBuilder::from(fsc.clone())
+        .with_source(guarded_source)
+        .build();
+    DataSourceExec::from_data_source(new_fsc)
 }
 
 // ---------------------------------------------------------------------------
