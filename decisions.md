@@ -1533,3 +1533,160 @@ In flight: #88 (read-path tombstone) + #104 (LISTEN/NOTIFY).
   4. regexp_match / substring / split_part — string fns missing
   5. WHERE col = ANY(int[]) — common sqlx batch-fetch shape missing
 - P/B2 (abf763ab9d1793c80) still in flight — basin-storage build broken (E0425, WriteOptions.encoding_mode WIP). Engine queue blocked until P commits + tree builds green.
+
+## 2026-05-24 — Scaling to parallel engine agents on DISJOINT FILES
+- User pushed for more parallelism. Re-derived the real constraint: not "one engine agent" but "shared target/ (no worktrees) + no same-file edits". Builds serialize on cargo lock regardless; file-disjoint avoids git conflicts + WIP-sweep.
+- PR2 footprint (in flight): dml_mutate.rs, executor.rs, fast_select.rs, hot_tombstone.rs, constraint_union.rs, basin-hottier/*. 698 insertions.
+- Dispatched R (af4ca77b0539b5733) IN PARALLEL on udf.rs + pg_ast.rs (disjoint from PR2) for JSONB read-side gaps (deep-path #> chains + GROUP-BY-on-extract). Instructed: commit ONLY its 2 files by explicit path, never `git add -A`/broad, to avoid sweeping PR2 WIP.
+- jsonb_set UPDATE writeback (rest of #126) deferred — touches dml_mutate.rs (PR2's), serialize after.
+- PLAN once PR2 lands: dispatch partitioned wave — PK-probe(#125)→fast_select.rs, plan-quality(#127)→executor.rs, C1(#123)→new jsonb_binary module+udf.rs+storage, C2(#124)→index_probe.rs+storage/index/gin. Partition by file; each commits own paths only.
+
+## 2026-05-24 — PR2 landed (3a52efc), C2-storage dispatched in parallel
+- PR2 (a6dc7d1a5982de75b) commit 3a52efc: hot-tier UPDATE fastpath, 7/7 tests, 1314 lib pass. New MemRowValue::Update variant; UpdateOverlayExec + apply_update_overlay_to_batches for read-path merge (HtapUnion did NOT already prefer hot — extended it). BONUS: fixed latent COUNT(*) bug — fast_aggregate metadata-aggregate bypassed tombstones/updates (was a silent DELETE correctness gap too); now defers to real scan when memtable has tombstones/overrides.
+- 2 agents now in flight: R (udf.rs/pg_ast.rs, JSONB read-side) + C2-storage (a1187823b9692b9f7, basin-storage GIN row-groups — independent of R's udf.rs WIP since basin-storage doesn't depend on basin-engine).
+- Engine fan-out (PK-probe, plan-quality, C1-engine, jsonb_set-UPDATE) waits for R to land (any new engine agent's cargo check would trip on R's uncommitted udf.rs).
+
+## 2026-05-24 — Engine fan-out: 3 parallel agents on disjoint files + C2-storage landed
+- R landed (3c961e9): JSONB deep-path + GROUP-BY-on-extract — single chained-operator lowering bug in udf.rs (extract_left_operand didn't absorb leading ->/->> chain). 2 gaps closed, 8 tests.
+- C2-storage landed (6f05358): row-group GIN bloom summaries, rowgroups_maybe_containing API, 10 tests, backward-compat (Unknown→fallback). 151 storage tests pass.
+- Engine fan-out (3 agents, file-disjoint, commit-own-paths-only, commit-only-when-green):
+  - S (adce1a50ac4e31598) #125: PK point-probe → fast_select.rs + index_probe.rs
+  - T (a2c2874f45cd9acf9) #127: plan-quality → executor.rs (NULLS-LAST TopK, EXISTS semijoin, Window LAG, LIKE-100k cost anomaly)
+  - U (ace3d4264f13eca8f) #123+rest-of-126: simd-json JSONB scalar parse + jsonb_set UPDATE → udf.rs + dml_mutate.rs + Cargo.toml
+- QUEUED (serialize after S/T/U): C2-engine-wiring (index_probe.rs @> probe — conflicts with S), B3-engine-wiring (ILIKE→trgm), then N (full bench rerun with all 3 fastpath env flags ON to capture every win at once).
+
+## 2026-05-24 — STANDING RULE: benchmark integrity (no hardcoding, no bias)
+- User requirement: "get everything as fast or faster, best effort, all scales, but make sure NOTHING is hardcoded to beat tests, no biasing testing/benchmarking for perf vs PG on localfs."
+- FAIRNESS INVARIANT (all perf agents, current + future, MUST honor):
+  1. Basin and PG get identical schema (incl. PRIMARY KEY both sides — verified bdc3508 removed the old DROP CONSTRAINT that stripped PG's PK).
+  2. Identical data/row-counts seeded to both.
+  3. Symmetric warm-up (both warmed or both cold; only cold-start shape measures cold).
+  4. PG runs reasonable defaults — not hobbled (tiny buffers/fsync) nor specially tuned.
+  5. Fastpath gates (DELETE/UPDATE/BULK_INSERT env flags) key on STRUCTURE (single-col PK + eq/IN), NEVER on bench-specific table/column/literal names. No query-text or literal pattern-matching anywhere in engine/storage.
+  6. No result caching that short-circuits timed work (plan cache OK, result cache NOT).
+  7. Unsupported shapes = honest -1.0 "(basin gap)" — NEVER counted as a win/0ms/faster.
+  8. Full work timed on both sides; same percentile math + iteration counts.
+- Dispatched read-only integrity audit (a0fcac91e3008c119) covering all 8 + the already-landed perf commits. Will audit S/T/U diffs specifically when they land.
+- ENFORCEMENT: after each perf commit, grep the diff for bench literals ('pending%', '@gmail.com', 'device', 'category', hardcoded counts) before trusting. Any FAIL → revert.
+
+## 2026-05-24 — Integrity audit VERDICT: FAIR (a0fcac91e3008c119)
+- All 9 checks PASS except #3 warm-up (SUSPICIOUS-minor, not a cheat). Key evidence:
+  - #5 (the big one): grep of ALL bench literals (pending/@gmail.com/device/version/category/purchase/expired/rotated) in basin-engine+basin-storage = ZERO matches. Fastpaths gate on STRUCTURE only: predicate_resolves_to_pk_list (dml_mutate.rs:493-548) accepts pk=lit / pk IN(lits) generically; UPDATE/DELETE gates key on pk_columns.len()==1 + no RLS/FK/reactor. BASIN_FAST_BULK_INSERT is a global encoding flip.
+  - #6: NO result cache, NO plan cache anywhere — every query runs fresh.
+  - #4: PG at stock defaults (127.0.0.1:5432), no ALTER SYSTEM / shared_buffers / fsync / jit tuning. Not hobbled, not boosted.
+  - #1/#2: identical schema (PK both sides) + identical deterministic data generators. created_at TIMESTAMPTZ(PG)/BIGINT(Basin) handled symmetrically.
+  - #7: -1.0 gaps never counted as wins; dashboard has no aggregate win-tally to inflate.
+  - #8: TWO biases run AGAINST Basin — PG timed via EXPLAIN ANALYZE Execution Time (strips network/protocol), Basin pays full in-process await; same percentile math both sides.
+  - #9: Basin = LocalFileSystem over TempDir, disk bytes from real files; fastpaths OFF in compare runner (only set in correctness tests).
+- ACTION for N: (a) warm-up tightening — make Basin+PG warm with identical statement (currently Basin warms exact point-query ~L754, PG warms COUNT ~L2759); (b) when running with fastpath flags ON, LABEL dashboard as opt-in documented-flag config so numbers stay honest+reproducible.
+- Conclusion: benchmark credibility intact. Safe to keep closing gaps. Will still grep each new perf diff for bench literals before trusting (S/T/U pending).
+
+## 2026-05-24 — U scope-mismatch → U2 dispatched
+- U (ace3d4264f13eca8f) commit 0155831: JSONB UDFs were refactored OUT of udf.rs into jsonb_udf.rs + jsonb_modify_udf.rs — outside U's allowed set. U stayed disciplined: committed only an #[ignore]'d executable-spec test (tests/integration/tests/jsonb_set_update.rs, 3 tests) documenting both exact fixes; touched no peer files.
+  - PART A (simd-json): hot cost confirmed = jsonb_to_value→serde_json::from_slice (jsonb_udf.rs:530), per-row via 6 UDFs. Not done (wrong file scope).
+  - PART B (jsonb_set UPDATE): dml_mutate.rs writeback already correct; sole blocker = generated_cols.rs eval_expression builds a SessionContext WITHOUT registering JSONB UDFs (~line 88-93). One-line fix.
+- U2 (a991b526bd5c40791) dispatched: jsonb_udf.rs + jsonb_modify_udf.rs (simd-json) + generated_cols.rs (register fix) + un-ignore the 3 tests + Cargo.toml. Disjoint from S(fast_select/index_probe) + T(executor). FAIRNESS reminded: simd-json must be a GENERAL parse speedup, no bench-key special-casing; honest measurement required (simd-json may not beat serde on small payloads — document either way).
+- Now 3 engine agents in flight: S, T, U2 (disjoint files).
+
+## 2026-05-24 — T landed (3a13792): executor already optimal, no fake fix
+- T (a2c2874f45cd9acf9) integrity-respecting outcome: investigated all 4 plan-quality gaps via EXPLAIN, found executor ALREADY lowers each optimally → changed NO executor code, added regression-lock tests only (plan_quality.rs, 5 tests). Honest "no fix warranted."
+  - NULLS LAST+LIMIT → already SortExec TopK(fetch) (not full sort)
+  - EXISTS → already LeftSemi HashJoinExec (decorrelated, single outer scan)
+  - LIKE prefix → predicate+limit already pushed to DataSourceExec; 100k 527x spike is SCALE-dependent storage effect = Vortex prefix-pruning cost model in the cold provider (hot_tombstone.rs), NOT executor. STORAGE follow-up if persists.
+  - Window LAG → single SortExec + BoundedWindowAggExec Sorted-mode = DF-optimal; 5.9x is DF-internal (parked).
+- #127 closed. S (fast_select PK-probe) + U2 (jsonb simd-json+jsonb_set) still in flight.
+- NEXT after S+U2: C2-engine-wiring (index_probe.rs @> → new row-group GIN API), B3-engine-wiring (ILIKE→trgm candidates), then N full rerun. LIKE-100k storage investigation optional.
+
+## 2026-05-24 — Engine wave 1 (S/T/U/U2) all landed green; wave 2 dispatched
+- Merged build green at 922cb53. Landed: d42d9e3 (S PK-probe), 3a13792 (T plan-quality locks, no fix needed), 58be615+922cb53 (U2 simd-json honest-negative + jsonb_set fix).
+- INTEGRITY WINS this wave: T refused to fake a fix (executor already optimal); U2 measured simd-json at 1.03-1.14x and REVERTED rather than claim a win. Both exactly the no-bias discipline.
+- HONEST OPEN GAP: JSONB scalar speed (130-273x) — simd-json insufficient; bottleneck is serde_json::Value full-tree alloc per row. X agent attacking with lazy/targeted extraction (pull 1 key without full tree).
+- Wave 2 (2 agents, file-disjoint):
+  - W (ac695cfe2921494fa) #124: wire C2 @> row-group prune + B3 ILIKE trigram → index_probe.rs + fast_select.rs. Correctness: index returns superset, predicate re-checked.
+  - X (abac6afaec7d29ce1) #123: lazy JSONB extraction → jsonb_udf.rs. Honest measurement required; ZERO bench-literal special-casing (audit will grep).
+- After W+X: N full bench rerun (all fastpath flags ON + symmetric warm-up + honest labeling). Then workspace test capstone.
+
+## 2026-05-24 — W landed (a42ad30) partial; 4 agents now in flight (X/Y/Z + W done)
+- W: @> row-group GIN prune-decision + (I)LIKE trigram candidate-prune wired in index_probe.rs (29 unit + 4 integration tests). Fairness-grepped: only test-data uses bench-like patterns (general fn params); ZERO engine hardcoding. CLEAN.
+- W HONEST LIMIT: prune DECISIONS computed+tested but NOT connected to I/O reduction — reader plumbing (session.rs register_pruned_listing_table + basin-storage ReadOptions row-group selection) + B3 persisted trigram (Cargo.toml basin-trgm dep) are outside W's file scope. So @> 88x / ILIKE wins won't show in bench until P2 plumbing lands.
+- Created P2 task (reader plumbing) — serialized AFTER Y (both touch basin-storage reader.rs).
+- In flight: X (jsonb_udf lazy extract), Y (basin-storage LIKE-100k prefix prune), Z (executor.rs aggregate tuning).
+- User requested more parallelism — now running X/Y/Z (3) + W just completed. Capacity-limited by cargo build lock (serialized builds) but editing overlaps.
+
+## 2026-05-24 — X landed (e55bb40): JSONB lazy extraction 7.5-8.1x — REAL measured win
+- X: zero-copy RawJson byte-scanner in jsonb_udf.rs — locates just the requested key/path/structure without building serde_json::Value tree for siblings. Measured 7.51x (locate+reparse) / 8.12x (locate-only) on ~2KB doc worst-case. Full parity (nested/unicode/emoji/escape/dup-key/numbers); malformed → fallback to old path. Fairness CLEAN (independently grepped engine logic: zero key-name branching).
+- JSONB scalar gap was 130-273x → est ~16-34x after this. Won't reach PG's near-zero (PG binary jsonb) without a storage-format change, but this is the honest best-effort win. #123 closed.
+- Pre-existing parity note: unquoted int array index (-> 1) returns NULL (shared extract_string Int64 limitation); X preserved parity, didn't change out-of-scope.
+- Still in flight: Y (basin-storage LIKE-100k prefix prune), Z (executor.rs aggregate tuning).
+
+## 2026-05-24 — Z landed (6733168): GROUP BY/aggregate cluster confirmed DF-internal (honest no-fix)
+- Z: suspected small-input over-partitioning lever DOESN'T EXIST — session.rs already pins target_partitions=1. EXPLAIN proves GROUP BY = AggregateExec mode=Single (zero RepartitionExec), UNION ALL = UnionScanCollapse to single DataSourceExec. repartition_* flags moot at target_partitions=1.
+- Residual 5-8x@10k (→2-4x@scale) = intrinsic DF per-batch hash-aggregate + scan startup, amortized at scale. NOT Basin-tunable. Documented with plan evidence + 7 regression-lock tests (aggregate_tuning.rs). Fairness clean.
+- 3 consecutive honest-negatives this session (T plan-quality, U2 simd-json, Z aggregate) — agents correctly refusing to fake fixes. Integrity discipline holding.
+- CONFIRMED-PARKED (DF-internal, need upstream DF work, not Basin-fixable): GROUP BY aggregate cluster, Window LAG, recursive CTE, the 2-4x@scale join/agg residuals.
+- Only Y (basin-storage LIKE-100k prefix prune) still in flight. After Y: P2 reader plumbing (needs basin-storage, serialized after Y), then N full rerun.
+
+## 2026-05-24 — Wave 2 (W/X/Y/Z) all landed; AA solo cross-crate dispatched
+- All 4 of wave 2 in: a42ad30 (W @> prune-decision), e55bb40 (X JSONB lazy 7.5x), 213f3f0 (Y honest-no-fix + LIMIT-pushdown lead), 6733168 (Z honest-no-fix + target_partitions=1 already optimal).
+- 4 consecutive honest-negatives this run (T/U2/Z/Y) — fairness discipline holding, no fake wins. AUDIT'd one more diff, all clean.
+- Y's residual finding is the actual lever: storage ReadOptions has no `limit` field, so LIKE/pagination LIMIT pushdown doesn't reduce I/O. Also W's row-group prune decision needs a `row_group_selection` field to reduce I/O. BOTH same underlying gap → folded into AA agent (addc8ef9025292943) — SOLO cross-crate atomic in basin-storage + basin-engine (session.rs+index_probe.rs+fast_select.rs). Can't run parallel-safely with another engine agent.
+- After AA lands: N full bench rerun (all fastpath env flags ON + symmetric warm-up fix + honest opt-in labeling). Then workspace test capstone.
+- B3 persisted-trigram index split off to optional future task (basin-engine→basin-trgm Cargo.toml dep + storage build) — ILIKE in-memory candidate prune already wired (a42ad30) but persistence is a separate scope. Defer.
+
+## 2026-05-24 — 4 agents now in parallel (AA + AB/AC/AD all file-disjoint)
+- AA (addc8ef9025292943) #130: cross-crate ReadOptions.limit + .row_group_selection (LIKE-100k 527x + pagination 16x + @> 88x end-to-end). SOLO cross-crate atomic.
+- AB (a5aaa00c9c4fd28ab): new basin-storage/src/index/trigram_rowgroup.rs (persisted B3, mirrors gin_rowgroup). Disjoint — NEW file only.
+- AC (a8af3793736868d5e): regexp_match/substring/split_part UDFs (udf.rs) + col=ANY(int[])→IN-list (pg_ast.rs). Closes 2 of M's new-gap shapes.
+- AD (af82c99c50a5c39c0): bench compare_postgres_common.rs warm-up symmetry (audit nit #3). Pre-stage for N.
+- Disjoint matrix: AA owns reader.rs+lib.rs+session.rs+index_probe.rs+fast_select.rs; AB only new index file; AC udf.rs+pg_ast.rs; AD test harness only. ZERO file overlap.
+- After: N full bench rerun with all fastpath flags + symmetric warm-up + honest opt-in labeling. Then workspace test capstone.
+
+## 2026-05-24 — AB+AC+AD landed; AA cross-crate still in flight
+- AB (2ef34f0): persisted trigram-rowgroup index (basin-storage/src/index/trigram_rowgroup.rs, both-case bloom serves LIKE+ILIKE, 17 tests, fairness clean).
+- AC (ff36b37): honest investigation found 3 of 4 string fns already existed (string_dt_udf.rs/regex_udf.rs); real gap was ANY('{...}'::T[])→IN-list lowering. Added in pg_ast.rs. 9 pass, 2 ignored+FIXME (peer-file 1-line fixes documented). Closes M-surfaced #5 (ANY) + partly #4 (string fns).
+- AD (c62c5ff): warm-up symmetric Basin+PG with header invariant.
+- Still in flight: AA (#130/#124 ReadOptions.limit + .row_group_selection cross-crate, addc8ef9025292943).
+- M-surfaced gaps RESIDUAL after this wave: ROLLBACK drops rows (correctness — investigate next), Savepoint nest+ROLLBACK TO (roadmap docs), Long-txn snapshot isolation (concern), regexp_match NULL semantics (1-line peer fix in string_dt_udf.rs:679).
+
+## 2026-05-24 — Picked up 2 genuine follow-ups from AC's findings
+- AE (aba7854306cf3b9ac): 1-line PG-parity fix in string_dt_udf.rs:679 — regexp_match returns NULL not empty-array on no-match. Un-ignores AC's 2 FIXME tests. Disjoint from AA.
+- AF (aa5ba2a3971a87ad0): ROLLBACK-drops-rows correctness bug from M's robustness audit (#119 finding #1). Likely root cause: fastpath INSERT bypasses tx-buffer → ROLLBACK has nothing to revert. Either gate fastpaths off in tx OR wire tx-staging. CORRECTNESS BEATS SPEED reminded. Disjoint from AA (dml_mutate+executor only, no session.rs).
+- Both real fixes, not padding — AC's investigation produced 1 honest peer-file FIXME, M's audit produced 1 correctness flag.
+- Now 3 in flight: AA + AE + AF. After AA: P2 plumbing(if not folded into AA) + N rerun + workspace test capstone.
+
+## 2026-05-24 — AA landed (a73a043): scan short-circuit complete
+- AA single commit: ReadOptions.limit + .row_group_selection across basin-storage/lib.rs+reader.rs + basin-engine/fast_select.rs+fast_aggregate.rs + basin-shard/in_process.rs + 1 test fix. 10 new tests + full smoke green. Fairness clean.
+- Correctness preserved: LIMIT pushdown only fires when post-read overlays/ORDER BY would NOT shrink results (preserves ≥n when more exist semantics).
+- Closes the cross-crate plumbing for: @> 88x (C2 end-to-end), LIKE-100k 527x (Y's identified lever), pagination 16x.
+- AE + AF still in flight. After they land: N full bench rerun with all fastpath flags + symmetric warm-up (AD) + honest opt-in labeling.
+
+## 2026-05-24 — AF landed (dccca4c): real ACID bug, fastpath-off-in-tx
+- AF found a REAL correctness bug, not just bench-shape failure: exec_insert (executor.rs:3746) had a shard fast-path with NO tx_is_active gate. In-tx INSERTs bypassed TxState.pending_files/htap_rows, landed straight in shard WAL+memtable. tx_rollback only drained TxState, so rolled-back rows resurrected on next SELECT (shard flush_to_parquet → append_data_files).
+- Fix: ~10 LOC executor.rs — gate shard branch on !tx_is_active. Falls through to existing slow-path which correctly tx_htap_push_batch + tx_push_pending_file. UPDATE/DELETE were ALREADY correct (commit_replace + catalog.replace_data_files + rollback_to_snapshot — verified).
+- 10/10 new rollback_correctness tests. Bench #42 (ROLLBACK drops rows) + #43 (Savepoint nest) BOTH close. M-surfaced residual: long-txn snapshot isolation (cross-session, separate scope). Fairness clean.
+- ALL ENGINE WORK COMPLETE for the perf-discipline scope:
+  - DELETE fastpath (PR1A end-to-end including read-path tombstone overlay)
+  - UPDATE fastpath (PR2 mirror w/ update overlay)
+  - PK point-probe (S, bloom+zonemap)
+  - JSONB lazy extract (X, 7.5x)
+  - JSONB deep-path + GROUP BY + jsonb_set (R+U2)
+  - Vortex Fast bulk-insert (B2 + executor wiring)
+  - ReadOptions.limit + .row_group_selection (AA cross-crate)
+  - Row-group GIN summaries (C2) + trigram (B3 persisted) + W's prune-decision wiring
+  - regexp_match NULL (AE), ANY-IN-list (AC), 25 robustness shapes (M)
+  - ROLLBACK ACID (AF), pg_cancel_backend (L), LISTEN/NOTIFY (#104)
+- READY FOR N: full bench rerun with all 3 fastpath env flags ON + symmetric warm-up (AD) + honest opt-in labeling. Then workspace test capstone.
+
+## 2026-05-24 — N landed (ddfd8a8): MASSIVE wins + significant regressions to triage
+- HEADLINE WINS (vs prior committed):
+  - DELETE WHERE id IN @1M: 18362x slower → **3.8x FASTER than PG** (~70,000x Basin speedup). 100k 2407x→1.6x. 10k 2.5x→1.3x.
+  - Single-row UPDATE: 10k 8098x→89.8x, 100k 427x→166x, 1M 1553x→94.7x (16-90x Basin speedup).
+  - JSONB @> with-GIN @10k: 88x→72x. Range scan 1M 3.7x FASTER. LATERAL JOIN 1M 5.7x FASTER. COUNT(col)-vs-COUNT(*) wins.
+- REAL REGRESSIONS surfaced (these are BUGS, not bench bugs):
+  1. COUNT(*) full table: 92x FASTER → 12x slower @1M. Likely PR2's COUNT(*) metadata-aggregate gate is firing TOO OFTEN (gated off when memtable has tombstones/updates — should also include zero-memtable bypass).
+  2. JSONB scalar @100k/1M: scales linearly in N despite WHERE id<100 filter. Predicate-pushdown not reaching JSONB UDF. UDF rewrite happens before predicate or selectivity-estimator wrong.
+  3. Point query @1M: 16x FASTER → 4697x slower. Massive regression. PK-probe may not be firing for the 1M shape (likely the 1M front-end's events table seeding doesn't have PK declared, OR AA's plan.limit pushdown interacts badly with the PK-probe path).
+  4. regexp_match @all scales: from unsup → 242-298ms (regressed in absolute since it was previously unsup; comparison meaningful only if the bench's regexp_match shape is now actually using a slow UDF rather than reporting unsup. Verify shape selectivity.)
+  5. txn_insert_x100 @10k: 38ms → 1042ms (27x regression). N flagged BASIN_FAST_BULK_INSERT=1 adds per-stmt overhead in tx; need to gate it off when in-tx (mirror AF's pattern).
+  6. WHERE x IS NULL @100k/1M: regressed. WHERE x = NULL = 0 (3VL) 304-448x slower (correctness or perf?).
+- Dispatching triage agents on the regressions — each one a small, focused fix on its own file.
