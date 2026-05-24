@@ -1392,21 +1392,21 @@ pub(crate) async fn execute_simple_select(
     //   * Only the exact single-PK-Eq shape (one Eq predicate on the table's
     //     sole PK column, no other atoms, no IS NULL).  Anything richer uses
     //     the general per-file prune below.
-    //   * Skipped on the shard path: a shard read (`handle.read`) merges its
-    //     own in-RAM tail and ignores `live_paths`, so a cold-tier-only prune
-    //     would be unsound there.
     //   * The memtable probe above already returned for any hot-tier live row,
     //     so reaching here means the answer (if any) is in the cold tier; the
     //     probe therefore correctly reflects cold-tier presence.
+    //   * Shard path: `shard.flush_to_parquet()` ran above (line 1077), so the
+    //     shard's in-RAM tail is drained to cold-tier Parquet. The engine's
+    //     `MemTableRegistry` was probed above. So both hot caches are clear of
+    //     the queried key — a cold-tier prune is sound. When the probe yields
+    //     pruned paths, the shard-branch read below detects this and reads
+    //     those paths directly via `storage.read_paths_with_schema` (bypassing
+    //     `handle.read`'s full file discovery, which would defeat the prune).
     //
     // When the probe yields a candidate subset we feed those exact paths into
     // the reader, skipping the general prune loop entirely for this shape.
-    let pk_probe_paths: Option<Vec<object_store::path::Path>> = if sess
-        .engine
-        .config()
-        .shard
-        .is_none()
-        && plan.aggregates.is_none()
+    let pk_probe_paths: Option<Vec<object_store::path::Path>> = if
+        plan.aggregates.is_none()
         && plan.is_null_cols.is_empty()
         && plan.predicates.len() == 1
         && meta.pk_columns.len() == 1
@@ -1484,6 +1484,7 @@ pub(crate) async fn execute_simple_select(
     // is never opened — decisive for Vortex, whose per-file open is far
     // heavier than a Parquet footer read, and a win for Parquet too
     // (point/range/compound/IS NULL queries touch fewer files).
+    let had_pk_probe = pk_probe_paths.is_some();
     let live_files = meta.live_data_files();
     let live_paths: Vec<object_store::path::Path> = if let Some(paths) = pk_probe_paths {
         // The PK point-probe already pruned the live set to its candidates
@@ -1573,7 +1574,34 @@ pub(crate) async fn execute_simple_select(
             .collect()
     };
 
-    let batches = if let Some(shard) = sess.engine.config().shard.as_ref() {
+    let batches = if had_pk_probe {
+        // Single-PK-Eq fast path: the PK probe already narrowed the cold
+        // tier to at most a handful of candidate files (typically 0-1).
+        // Read those paths directly, bypassing `handle.read`'s full file
+        // discovery — which would re-list every live data file and defeat
+        // the prune. Safety:
+        //   * Hot tier covered: the engine's `MemTableRegistry` was probed
+        //     above (line ~1209); a hit returned early. Reaching here means
+        //     the queried PK is NOT in the engine memtable.
+        //   * Shard tail drained: `shard.flush_to_parquet()` ran above
+        //     (line ~1077), so the shard's in-RAM `state.tail` was flushed
+        //     to cold-tier Parquet before the probe consumed `live_files`.
+        //   * Tombstone overlay applied below as on the non-shard path.
+        if live_paths.is_empty() {
+            vec![]
+        } else {
+            use futures::StreamExt;
+            let schema = Some(meta.schema.clone());
+            let stream = sess
+                .engine
+                .config()
+                .storage
+                .read_paths_with_schema(&sess.project, live_paths, opts, schema)
+                .await?;
+            let collected: Vec<Result<RecordBatch>> = stream.collect().await;
+            collected.into_iter().collect::<Result<Vec<_>>>()?
+        }
+    } else if let Some(shard) = sess.engine.config().shard.as_ref() {
         // Shard path: this read merges the in-RAM tail with the Parquet base.
         // The pre-flush above already drained the tail into Parquet so this
         // read is bounded, then `handle.read` only has to scan whatever new
