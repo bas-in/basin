@@ -101,6 +101,12 @@ makes evals stick.
 
 ## Wave N+4 — Performance follow-ups (after Wave 2 lands)
 
+> **Note:** any item that bottoms out in **DataFusion-internal cost** is
+> tagged `DF-upstream` and is **deferred for user discussion** — do not
+> dispatch agents on those without an explicit go-ahead. Basin-side
+> levers come first.
+
+
 12. **Memtable-resident JSONB path** — payload values written via
     `INSERT ... VALUES ('<json>'::jsonb)` should land in the memtable as
     pre-parsed Value bytes (or a small structured form) so the read-side
@@ -119,10 +125,11 @@ makes evals stick.
 15. **Bulk INSERT 1M throughput** (6.5x slower than PG at 1M) — profile
     encoder + batch-size + WAL fsync rate. Likely a combination of
     Vortex Fast encoder cascade overhead and per-batch shard.tail push.
-16. **Recursive CTE / Window LAG / GROUP BY + HAVING** — these are
-    DataFusion-internal slowness. The Basin-side levers are exhausted.
-    Queue an upstream DF profile / contribution if these become a
-    blocking signal in customer interviews.
+16. **Recursive CTE / Window LAG / GROUP BY + HAVING** — DataFusion-
+    internal slowness. The Basin-side levers are exhausted on these.
+    **DEFERRED — user-flagged "leave for last, for discussion".** Do not
+    open upstream DF issues / PRs without an explicit go-ahead. Documented
+    here so the wave triage doesn't accidentally pick them up.
 
 ---
 
