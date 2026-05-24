@@ -6,13 +6,18 @@
 //! they all call `run_full_compare(...)` here.
 //!
 //! Fairness invariant — ALL WARM-UPS ARE SYMMETRIC.
-//! Before any timed sample, BOTH engines run the identical statement
-//! shape (`SELECT id FROM events WHERE id = <target_id>`) once. There
-//! are exactly two warm-up sites in this file: the Basin warm-up at the
-//! top of `run_basin_core_suite`, and the PG warm-up immediately before
-//! `run_pg_core_suite` is invoked in `run_full_compare`. If you add a
-//! warm-up on one side you MUST mirror it on the other — see audit nit
-//! (3) in the fairness audit log.
+//! Before any timed sample, BOTH engines run the identical statement —
+//! including the identical PROJECTION — that the point query times
+//! (`SELECT id, user_id, amount, status, created_at FROM events WHERE
+//! id = <target_id>`) once. The projection must match the timed query
+//! because Basin is columnar: warming only `id` would leave the other
+//! four column chunks cold and the first timed sample would pay a ~10ms
+//! cold decode, which at 1M (2 samples, median-picks-higher) would be
+//! mis-reported as the p50. There are exactly two warm-up sites in this
+//! file: the Basin warm-up at the top of `run_basin_core_suite`, and the
+//! PG warm-up immediately before `run_pg_core_suite` is invoked in
+//! `run_full_compare`. If you add a warm-up on one side you MUST mirror
+//! it on the other — see audit nit (3) + its columnar refinement.
 //!
 //! Per-scale sample tuning: see `samples_for`. At 10k we run the full
 //! 5/7 samples per metric (matches the original bench); higher scales
@@ -759,14 +764,31 @@ async fn run_basin_core_suite(
     let s5 = samples_for(rows, 5);
     let skip_heavy = skip_heavy_writes(rows);
 
-    // Warm-up: triggers any first-query plan caching so the p99 column
-    // reflects steady-state latency rather than first-touch overhead.
-    // SYMMETRY: the PG side runs the identical statement shape
-    // (`SELECT id FROM events WHERE id = <target_id>`) before its timed
-    // samples — see the warm-up just above the `run_pg_core_suite` call in
-    // `run_full_compare`. Closes fairness-audit nit #3.
+    // Warm-up: triggers first-query plan caching AND page-caches the exact
+    // column chunks the timed point query reads, so the p50/p99 columns
+    // reflect steady-state latency rather than first-touch decode overhead.
+    //
+    // The warm-up projection MUST match the timed point query's projection
+    // (`id, user_id, amount, status, created_at`). A row store (PG) warms the
+    // whole heap row by touching the page, so projecting only `id` warms all
+    // columns for free — but Basin is COLUMNAR: warming `id` alone decodes
+    // only the `id` column chunk and leaves the other four cold, so the first
+    // timed sample would pay a ~10ms cold column-chunk decode. At 1M the
+    // suite takes only 2 samples (samples_for) and `median` of 2 returns the
+    // higher element, so that single cold sample would be reported as the p50
+    // — a measurement artifact, not real latency (the warm point query is
+    // ~0.1ms at 1M). Matching the projection is the fair fix: it's the same
+    // statement on both engines and it warms what's actually measured.
+    //
+    // SYMMETRY: the PG side runs the identical statement shape before its
+    // timed samples — see the warm-up just above the `run_pg_core_suite` call
+    // in `run_full_compare`. Closes fairness-audit nit #3 (and its columnar
+    // refinement).
     let _ = sess
-        .execute(&format!("SELECT id FROM events WHERE id = {target_id}"))
+        .execute(&format!(
+            "SELECT id, user_id, amount, status, created_at \
+             FROM events WHERE id = {target_id}"
+        ))
         .await;
 
     let mut point: Vec<f64> = Vec::with_capacity(s7);
@@ -3154,13 +3176,18 @@ async fn run_full_compare_inner(
         .collect::<Vec<_>>()
         .join(",");
 
-    // Warm-up: identical statement shape to Basin's warm-up at the top of
-    // `run_basin_core_suite` so neither engine gets an asymmetric edge
-    // (closes fairness-audit nit #3). Both engines page-cache the same
-    // single row of `events` at `id = target_id` before timed samples.
+    // Warm-up: identical statement shape (and identical projection) to
+    // Basin's warm-up at the top of `run_basin_core_suite` so neither engine
+    // gets an asymmetric edge (closes fairness-audit nit #3 + its columnar
+    // refinement). Both engines page-cache the same `events` row AND the same
+    // five column values at `id = target_id` before timed samples. Projecting
+    // the full timed-query column list matters for the column store (Basin)
+    // and is harmless for the row store (PG) — see the long comment at the
+    // Basin warm-up site for the full rationale.
     let _ = pg
         .simple_query(&format!(
-            "SELECT id FROM {schema}.events WHERE id = {target_id}"
+            "SELECT id, user_id, amount, status, created_at \
+             FROM {schema}.events WHERE id = {target_id}"
         ))
         .await;
 
