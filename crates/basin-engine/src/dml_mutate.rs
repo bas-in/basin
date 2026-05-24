@@ -1454,6 +1454,18 @@ async fn hot_tier_update_by_pk(
     }
     // 2. Cold-tier fill for PKs not in the memtable. Read matched rows via the
     //    PK predicate and slice out one batch row per PK.
+    //
+    // Scalable file prune: for each missing key we run `pk_point_probe`
+    // against the catalog's per-file zone-map + bloom and union the candidate
+    // file paths. Pre-fix the loop scanned EVERY live data file for the
+    // target PK (single-row UPDATE was 166x slower than PG at 100k because
+    // `list_data_files_with_stats` returned ~50-100 files and each read every
+    // row). With the probe the file set typically collapses to 0 or 1 file
+    // per key — making the cold-tier read O(matching files) rather than
+    // O(total files). Falls back to the unpruned scan for non-Int64/Utf8
+    // PK types where decoding the RowKey back to a ScalarValue isn't
+    // supported (the probe is purely an optimisation; the per-row mask
+    // below still enforces correctness).
     let missing: Vec<&basin_hottier::RowKey> = keys
         .iter()
         .filter(|k| !current.contains_key(k.as_bytes()))
@@ -1464,10 +1476,58 @@ async fn hot_tier_update_by_pk(
             BasinError::internal(format!("PK column {pk_col:?} missing from schema"))
         })?;
         let pk_dt = schema.field(pk_idx).data_type().clone();
+
+        // Decode each missing RowKey back to a ScalarValue so we can run the
+        // catalog probe. None means "this type isn't supported by the probe"
+        // → bail to the full-scan path for correctness (we can't lose rows).
+        let probe_scalars: Option<Vec<basin_storage::ScalarValue>> = missing
+            .iter()
+            .map(|k| pk_row_key_to_scalar(k, &pk_dt))
+            .collect();
+
+        let catalog_files = meta.live_data_files();
+        let pruned_paths: Option<std::collections::HashSet<String>> = match probe_scalars {
+            Some(scalars) => {
+                let mut paths: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for scalar in &scalars {
+                    match crate::index_probe::pk_point_probe(
+                        pk_col,
+                        scalar,
+                        &catalog_files,
+                        schema.as_ref(),
+                    ) {
+                        crate::index_probe::PkProbeOutcome::Absent { .. } => {
+                            // No live file can contain this PK — the
+                            // assignment loop below will skip it as
+                            // "PK matched no live row".
+                        }
+                        crate::index_probe::PkProbeOutcome::Candidates {
+                            paths: cands, ..
+                        } => {
+                            for p in cands {
+                                paths.insert(p.to_string());
+                            }
+                        }
+                    }
+                }
+                Some(paths)
+            }
+            None => None,
+        };
+
         let data_files = storage.list_data_files_with_stats(&sess.project, table).await?;
         'files: for f in &data_files {
             if current.len() == want.len() {
                 break 'files;
+            }
+            // Skip files that the catalog probe ruled out for every missing
+            // PK. When the probe couldn't run (`None`) we fall through to
+            // the full scan as before.
+            if let Some(ref allow) = pruned_paths {
+                if !allow.contains(f.path.as_ref()) {
+                    continue;
+                }
             }
             let mut stream = storage.read_file(&sess.project, &f.path).await?;
             while let Some(batch) = stream.next().await {
@@ -1521,6 +1581,63 @@ fn decode_ipc_single_row(bytes: &[u8]) -> Option<RecordBatch> {
     let cursor = std::io::Cursor::new(bytes);
     let mut reader = StreamReader::try_new(cursor, None).ok()?;
     reader.next()?.ok()
+}
+
+/// Decode the `RowKey` encoding back to a `ScalarValue` for the UPDATE
+/// fastpath's catalog probe. The `RowKey` wire format is the order-preserving
+/// encoding from `basin_hottier::RowKeyBuilder` — Int64 is bias-flipped
+/// big-endian (XOR sign bit), Utf8 is raw bytes with `0x00` escaping (`0x00`
+/// → `0x00 0xFF`) and a final `0x00` terminator.
+///
+/// Returns `None` for unsupported column types so the caller can degrade
+/// gracefully to a full data-file scan rather than mis-decode and skip
+/// rows. This is purely an optimisation hook — the per-row PK match in
+/// the cold-tier loop remains the source of truth.
+fn pk_row_key_to_scalar(
+    key: &basin_hottier::RowKey,
+    dt: &arrow_schema::DataType,
+) -> Option<basin_storage::ScalarValue> {
+    use arrow_schema::DataType as Dt;
+    let bytes = key.as_bytes();
+    match dt {
+        Dt::Int64 => {
+            if bytes.len() != 8 {
+                return None;
+            }
+            let arr: [u8; 8] = bytes.try_into().ok()?;
+            let u = u64::from_be_bytes(arr);
+            let v = (u ^ 0x8000_0000_0000_0000u64) as i64;
+            Some(basin_storage::ScalarValue::Int64(v))
+        }
+        Dt::Utf8 | Dt::LargeUtf8 => {
+            // Reverse the NUL-escape encoding: `0x00 0xFF` → `0x00`; an
+            // unescaped `0x00` is the terminator.
+            let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+            let mut i = 0;
+            while i < bytes.len() {
+                let b = bytes[i];
+                if b == 0x00 {
+                    if i + 1 < bytes.len() && bytes[i + 1] == 0xFF {
+                        out.push(0x00);
+                        i += 2;
+                    } else {
+                        // Unescaped 0x00 → terminator.
+                        break;
+                    }
+                } else {
+                    out.push(b);
+                    i += 1;
+                }
+            }
+            String::from_utf8(out)
+                .ok()
+                .map(basin_storage::ScalarValue::Utf8)
+        }
+        // Other types (UUID, Decimal, etc.) — the probe would need a
+        // type-specific bloom encoding that may not yet exist; return None
+        // so the caller falls back to the unpruned scan.
+        _ => None,
+    }
 }
 
 /// Encode a single-row `RecordBatch` to Arrow IPC stream bytes (memtable wire
