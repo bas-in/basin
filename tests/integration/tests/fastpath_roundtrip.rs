@@ -330,17 +330,7 @@ async fn delete_fastpath_then_count_excludes_tombstone() {
 ///
 /// The tombstone must be overridden by the re-INSERT so the row is visible
 /// with the new value.
-///
-/// NOTE: surfaces a separate bug from the HtapUnionTable overlay fix:
-/// the PK unique-constraint check on INSERT does not consult registry
-/// tombstones, so re-INSERTing a fast-path-DELETEd PK errors with
-/// `UniqueViolation` even though the row is logically gone. Tracked as
-/// a follow-up punch-list item — needs the unique-constraint check
-/// (`crates/basin-engine/src/constraint_union.rs` or `executor.rs`
-/// INSERT pre-check) to treat a tombstone for the same PK as "not
-/// present". Re-enable once that fix lands.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "blocked on unique-constraint check consulting registry tombstones (separate from #2)"]
 async fn delete_then_reinsert_same_pk_visible() {
     let _g = ENV_LOCK.lock().await;
     let _del = set_env("BASIN_HOTTIER_DELETE_FASTPATH");

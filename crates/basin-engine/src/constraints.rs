@@ -49,6 +49,11 @@ use crate::types::field_is_citext;
 /// Reject the new batch if any row's PK tuple already exists in the
 /// table, OR if two rows in the same batch share a PK tuple.
 ///
+/// The optional `registry` parameter gates tombstone-aware filtering: when
+/// `Some`, any cold-tier row whose PK RowKey has a `MemRowValue::Tombstone`
+/// in the registry is treated as logically absent.  This allows re-INSERT
+/// of a fast-path-DELETEd PK without a spurious `UniqueViolation`.
+///
 /// Cost note: this scans the entire `(project, table)` data file set
 /// once per call. v0.2 (Phase 5.7 B1) secondary indexes will replace
 /// the scan with a B-tree probe. For v0.1 the per-INSERT cost is
@@ -60,6 +65,7 @@ pub(crate) async fn enforce_pk_on_insert(
     table_name_str: &str,
     pk_columns: &[String],
     batch: &RecordBatch,
+    registry: Option<(&basin_hottier::MemTableRegistry, &ProjectId)>,
 ) -> Result<()> {
     if pk_columns.is_empty() || batch.num_rows() == 0 {
         return Ok(());
@@ -105,6 +111,36 @@ pub(crate) async fn enforce_pk_on_insert(
     if data_files.is_empty() {
         return Ok(());
     }
+
+    // Pre-compute the tombstone set from the registry once, outside the file
+    // loop.  We only attempt tombstone filtering for single-column PKs (the
+    // only shape the hot-tier fast-path tombstone writer produces today).
+    // For composite PKs `tombstone_keys` stays empty and all cold rows are
+    // included in `existing` — the conservative (but always-correct) path.
+    let tombstone_keys: std::collections::HashSet<Vec<u8>> = if let Some((reg, proj)) = registry {
+        if pk_columns.len() == 1 {
+            collect_tombstone_keys(reg, proj, table)
+        } else {
+            std::collections::HashSet::new()
+        }
+    } else {
+        std::collections::HashSet::new()
+    };
+    // DataType of the single PK column — needed for tombstone RowKey encoding.
+    // Derived from the batch schema (authoritative for this INSERT).
+    let pk_dt_for_tombstone: Option<DataType> = if tombstone_keys.is_empty() {
+        None
+    } else {
+        // pk_columns.len() == 1 is guaranteed by the branch above.
+        pk_columns.first().and_then(|c| {
+            batch
+                .schema()
+                .field_with_name(c)
+                .ok()
+                .map(|f| f.data_type().clone())
+        })
+    };
+
     let mut existing: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
     for f in &data_files {
         let mut stream = storage.read_file(project, &f.path).await?;
@@ -119,6 +155,20 @@ pub(crate) async fn enforce_pk_on_insert(
                 })
                 .collect::<Result<Vec<_>>>()?;
             for row in 0..rb.num_rows() {
+                // Tombstone suppression: if a tombstone for this PK exists in
+                // the hot-tier registry the row is logically deleted — skip it.
+                if !tombstone_keys.is_empty() {
+                    if let Some(dt) = &pk_dt_for_tombstone {
+                        let col = rb.column(rb_pk_idx[0]);
+                        if let Some(rk) =
+                            crate::constraint_union::array_value_to_row_key(col.as_ref(), row, dt)
+                        {
+                            if tombstone_keys.contains(rk.as_bytes()) {
+                                continue; // logically absent — allow re-INSERT
+                            }
+                        }
+                    }
+                }
                 if let Some(k) = pk_tuple_for_row(&rb, &rb_pk_idx, row)? {
                     existing.insert(k);
                 }
@@ -139,6 +189,28 @@ pub(crate) async fn enforce_pk_on_insert(
         }
     }
     Ok(())
+}
+
+/// Snapshot the tombstone `RowKey` bytes from the registry for `(project, table)`.
+/// Returns an empty set when the registry has no entry for the table.
+fn collect_tombstone_keys(
+    registry: &basin_hottier::MemTableRegistry,
+    project: &ProjectId,
+    table: &TableName,
+) -> std::collections::HashSet<Vec<u8>> {
+    let Some(entry) = registry.get(project, table) else {
+        return std::collections::HashSet::new();
+    };
+    let snap = entry.memtable.snapshot();
+    snap.into_iter()
+        .filter_map(|(key, val)| {
+            if matches!(val, basin_hottier::MemRowValue::Tombstone) {
+                Some(key.as_bytes().to_vec())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Reject the new batch if any row's UNIQUE-constraint tuple already

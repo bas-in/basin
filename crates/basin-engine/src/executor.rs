@@ -3902,6 +3902,39 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
     commit_with_retry(sess, &table, meta.current_snapshot, vec![file_ref]).await?;
     dispatch_post_commit(&sess.engine, events);
 
+    // Punch-list #10: if any inserted PK had a tombstone (from a prior fast-path
+    // DELETE), the tombstone would suppress the newly inserted cold-tier row on
+    // subsequent reads.  Repair: promote each tombstone-hitting row to a
+    // MemRowValue::Update so the merge-on-read overlay shows the new value.
+    //
+    // This is cheap — it only fires when there is an existing registry entry
+    // for the table AND at least one row in the batch matches a tombstoned PK.
+    // The fast-path is to pre-check whether the registry even has an entry;
+    // only then do we compute the pk_col info and scan the batch.
+    if !meta.pk_columns.is_empty()
+        && sess
+            .engine
+            .memtable_registry()
+            .get(&sess.project, &table)
+            .is_some()
+    {
+        // Derive (col_idx, DataType) pairs for PK columns from the batch schema.
+        let pk_col_info: Option<Vec<(usize, arrow_schema::DataType)>> = meta
+            .pk_columns
+            .iter()
+            .map(|c| {
+                batch
+                    .schema()
+                    .index_of(c)
+                    .ok()
+                    .map(|idx| (idx, batch.schema().field(idx).data_type().clone()))
+            })
+            .collect();
+        if let Some(pk_cols) = pk_col_info {
+            promote_tombstone_overrides_on_reinsert(sess, &table, &batch, &pk_cols);
+        }
+    }
+
     // Post-commit: re-register the table from the now-authoritative catalog
     // snapshot (no extra files).  This ensures the DataFusion provider
     // reflects exactly the committed state and no longer carries the
@@ -7554,6 +7587,51 @@ async fn htap_promote_to_registry(
         }
     }
     Ok(())
+}
+
+/// After a successful INSERT that overwrote a tombstoned PK, the registry still
+/// holds the stale `Tombstone` entry.  Any subsequent cold-tier read would then
+/// suppress the newly inserted row — making the re-INSERT invisible.
+///
+/// This helper repairs that: for each row in `batch` whose PK-encoded key is
+/// currently a `Tombstone` in the registry, we write the row as
+/// `MemRowValue::Update` (which replaces the tombstone and acts as an update
+/// overlay on the cold tier, suppressing old cold-tier copies while surfacing
+/// the new value).  Rows whose PKs are not tombstoned are left untouched —
+/// they're visible through normal cold-tier reads.
+///
+/// Called from the VALUES auto-commit INSERT path after a successful
+/// `commit_with_retry`.  Best-effort: errors are silently ignored so a
+/// promotion failure never blocks the INSERT response.
+fn promote_tombstone_overrides_on_reinsert(
+    sess: &ProjectSession,
+    table: &TableName,
+    batch: &arrow_array::RecordBatch,
+    pk_cols: &[(usize, arrow_schema::DataType)],
+) {
+    let registry = sess.engine.memtable_registry();
+    let entry = registry.get(&sess.project, table);
+    let entry = match entry {
+        Some(e) => e,
+        None => return, // no registry entry → no tombstones to worry about
+    };
+
+    for row_idx in 0..batch.num_rows() {
+        let Some(key) = build_pk_row_key(batch, row_idx, pk_cols) else {
+            continue;
+        };
+        // Only act when the current registry value IS a tombstone.
+        if matches!(entry.memtable.get(&key), Some(basin_hottier::MemRowValue::Tombstone)) {
+            // Encode this row as IPC and write as Update, replacing the tombstone.
+            // `Update` semantics: suppresses the stale cold-tier row at this PK
+            // and provides the new value to merge-on-read.
+            let row_batch = batch.slice(row_idx, 1);
+            let row_bytes = encode_batch_to_ipc(&row_batch);
+            entry
+                .memtable
+                .insert(key, basin_hottier::MemRowValue::update(row_bytes, 0));
+        }
+    }
 }
 
 /// Build a [`basin_hottier::RowKey`] from the PK columns of a single row in
