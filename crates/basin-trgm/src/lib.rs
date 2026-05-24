@@ -16,6 +16,13 @@
 //! - [`trigram::extract`] — the underlying byte-trigram extractor.
 //!   Exposed for callers that want to compute and persist their own
 //!   trigram sets (the v0.2 GIN-style index will use this).
+//! - [`gin_like::TrigramGinIndex`] — `LIKE`/`ILIKE` candidate pruning.
+//!   Given a SQL pattern such as `'%@gmail.com'`, returns the superset of
+//!   rows that could match so the engine can prune a sequential scan to a
+//!   handful of candidates and re-check. See
+//!   [`gin_like::trigrams_for_pattern`] for the wildcard-aware extractor.
+//!   Crate-level only; the engine wires it into the `(I)LIKE` execution
+//!   path in a separate step.
 //!
 //! ## SQL-surface staging
 //!
@@ -48,10 +55,12 @@
 #![forbid(unsafe_code)]
 
 pub mod gin;
+pub mod gin_like;
 pub mod similarity;
 pub mod trigram;
 
 pub use gin::TrigramIndex;
+pub use gin_like::{trigrams_for_pattern, Candidates, RowId, TrigramGinIndex};
 pub use similarity::{similarity, word_similarity};
 pub use trigram::{extract, set_bytes, Trigram};
 
