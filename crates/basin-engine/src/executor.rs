@@ -3743,14 +3743,31 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
     // and lets its background compactor drain into Parquet + commit through the
     // catalog later. We do *not* call `append_data_files` ourselves here: that
     // would race the compactor's own commit and produce a duplicate snapshot.
+    //
+    // ACID gate: the shard's WAL + memtable are a shared durability surface
+    // that the session-scoped `TxState` cannot rewind. Any INSERT routed
+    // through the shard while a BEGIN block is open survives ROLLBACK
+    // (the catalog snapshot is rewound, but the shard's tail compacts into
+    // a new file at the *next* SELECT's `shard.flush_to_parquet()` and is
+    // appended at a fresh snapshot, resurrecting the row). Fall through to
+    // the legacy synchronous path inside an explicit transaction so the
+    // write lands in `TxState::pending_files` + `htap_rows`, where ROLLBACK
+    // can actually discard it. Bench-shape #42 (`rollback_drops_rows`)
+    // regression.
     if let Some(shard) = sess.engine.config().shard.as_ref() {
-        let handle = shard.get(&sess.project, &part).await?;
-        handle.write_batch(&table, batch).await?;
-        // SELECT-side handles tail-visibility (Option A: force-compact). Skip
-        // the DataFusion ListingTable refresh here; reads will trigger it.
-        return Ok(ExecResult::Empty {
-            tag: format!("INSERT 0 {row_count}"),
-        });
+        if !crate::session::tx_is_active(&sess.state) {
+            let handle = shard.get(&sess.project, &part).await?;
+            handle.write_batch(&table, batch).await?;
+            // SELECT-side handles tail-visibility (Option A: force-compact). Skip
+            // the DataFusion ListingTable refresh here; reads will trigger it.
+            return Ok(ExecResult::Empty {
+                tag: format!("INSERT 0 {row_count}"),
+            });
+        }
+        // In-tx: fall through to the synchronous Parquet+TxState path below.
+        // Any prior auto-commit writes still in the shard's tail will be
+        // flushed by `pre_mutation_flush` (UPDATE/DELETE) or by the SELECT
+        // path's `shard.flush_to_parquet()`; no extra flush is needed here.
     }
 
     // Legacy synchronous path (no shard configured).
