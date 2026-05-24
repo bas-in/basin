@@ -187,6 +187,15 @@ pub(crate) struct EngineInner {
     /// with `CREATE INDEX … USING gin`.  Probed at query time to prune file
     /// candidates before the full `jsonb_contains` UDF re-evaluation.
     pub(crate) gin_index_registry: Arc<crate::index_probe::GinIndexRegistry>,
+    /// Phase C2 (row-group GIN prune): process-wide per-row-group bloom-filter
+    /// summaries for JSONB `@>` containment probes.  One bloom per
+    /// `(project, table, col, file, row_group_id)` populated at INSERT time
+    /// alongside the file-level posting list.  Probed at query time (in
+    /// `apply_gin_pruning_for_query`) to narrow file-level candidates to the
+    /// specific row-groups that *might* contain a matching row, so the Parquet
+    /// reader can skip the rest.
+    pub(crate) gin_rowgroup_registry:
+        Arc<basin_storage::index::gin_rowgroup::GinRowGroupRegistry>,
     /// Phase 5.20.E: process-wide GIN posting-list registry for tsvector
     /// columns.  One `LexemePostingList` per `(project, table, col)` populated
     /// at INSERT time for tsvector columns with a GIN index.  Probed at query
@@ -317,6 +326,9 @@ impl Engine {
             ),
             secondary_index_skipped: crate::secondary_index::IndexSkipCounter::new(),
             gin_index_registry: Arc::new(crate::index_probe::GinIndexRegistry::new()),
+            gin_rowgroup_registry: Arc::new(
+                basin_storage::index::gin_rowgroup::GinRowGroupRegistry::new(),
+            ),
             gin_fts_registry: Arc::new(
                 basin_storage::index::gin_tsvector::GinTsvectorRegistry::new(),
             ),
@@ -600,6 +612,15 @@ impl Engine {
     /// Returns a reference to the shared `Arc`; cloning it is cheap.
     pub(crate) fn gin_index_registry(&self) -> &Arc<crate::index_probe::GinIndexRegistry> {
         &self.inner.gin_index_registry
+    }
+
+    /// Process-wide per-row-group bloom-filter registry for JSONB `@>`
+    /// containment probes (C2 row-group GIN prune).
+    /// Returns a reference to the shared `Arc`; cloning it is cheap.
+    pub(crate) fn gin_rowgroup_registry(
+        &self,
+    ) -> &Arc<basin_storage::index::gin_rowgroup::GinRowGroupRegistry> {
+        &self.inner.gin_rowgroup_registry
     }
 
     // ── Phase 5.20.E: GIN FTS (tsvector) index ───────────────────────────────
@@ -1026,6 +1047,7 @@ mod fast_aggregate;
 mod fast_select;
 mod hot_tombstone;
 mod fts_udf;
+mod gin_rowgroup_scan;
 mod is_distinct_rewrite;
 mod function_ddl;
 mod generated_cols;

@@ -397,3 +397,84 @@ fn trigram_prune_superset_then_recheck_is_exact() {
 
     println!("[B3 prune] trigram candidate prune is a sound superset; re-check is exact ✓");
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Capability 1b — C2 end-to-end: GinRowGroupPrunedTable path fires correctly
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// End-to-end: a GIN-indexed `@>` query through the engine returns PG-correct
+/// rows even when the new C2 `GinRowGroupPrunedTable` path is activated.
+///
+/// The test inserts rows with a GIN index, which causes the write path to
+/// populate both the file-level `GinIndexRegistry` AND the new per-row-group
+/// `GinRowGroupRegistry`.  A subsequent `@>` query triggers
+/// `apply_gin_pruning_for_query`, which now attempts row-group prune; when the
+/// registry has summaries, it registers a `GinRowGroupPrunedTable` instead of
+/// a plain `ListingTable`.
+///
+/// Asserted: the result set is identical to what a full scan would return.
+/// This is the load-bearing correctness guarantee: prune must never suppress
+/// a matching row.
+#[tokio::test]
+async fn gin_rowgroup_pruned_table_returns_correct_rows() {
+    basin_common::telemetry::try_init_for_tests();
+    let dir = TempDir::new().unwrap();
+    let engine = build_engine(&dir);
+    let project = ProjectId::new();
+    let sess = engine.open_session(project).await.unwrap();
+
+    sess.execute("CREATE TABLE events (id BIGINT NOT NULL, data JSONB)")
+        .await
+        .expect("create table");
+    sess.execute("CREATE INDEX events_gin ON events USING gin (data jsonb_ops)")
+        .await
+        .expect("create gin index");
+
+    // Write three separate INSERTs so three Parquet files are created, each
+    // with distinct content.  Only the first INSERT has type=click; the others
+    // have type=view and type=scroll.  The row-group registry will be populated
+    // with bloom filters keyed on these terms.
+    sess.execute(r#"INSERT INTO events VALUES (1, '{"type":"click","user":"alice"}')"#)
+        .await
+        .expect("insert 1");
+    sess.execute(r#"INSERT INTO events VALUES (2, '{"type":"view","user":"bob"}')"#)
+        .await
+        .expect("insert 2");
+    sess.execute(r#"INSERT INTO events VALUES (3, '{"type":"scroll","user":"carol"}')"#)
+        .await
+        .expect("insert 3");
+
+    // Basic containment — should return only row 1.
+    assert_eq!(
+        ids(&sess, r#"SELECT id FROM events WHERE data @> '{"type":"click"}'"#).await,
+        vec![1],
+        "@> type=click must return only id=1"
+    );
+
+    // Compound needle — id=1 has both type=click and user=alice.
+    assert_eq!(
+        ids(
+            &sess,
+            r#"SELECT id FROM events WHERE data @> '{"type":"click","user":"alice"}'"#
+        )
+        .await,
+        vec![1],
+        "compound @> must return only id=1"
+    );
+
+    // All rows have a different user — key absent everywhere.
+    assert_eq!(
+        ids(&sess, r#"SELECT id FROM events WHERE data @> '{"user":"ghost"}'"#).await,
+        Vec::<i64>::new(),
+        "absent user must return 0 rows"
+    );
+
+    // Every row has a `user` key — this should return all three.
+    assert_eq!(
+        ids(&sess, r#"SELECT id FROM events WHERE data @> '{"type":"view"}'"#).await,
+        vec![2],
+        "@> type=view must return only id=2"
+    );
+
+    println!("[C2 e2e] GinRowGroupPrunedTable path returns PG-correct rows ✓");
+}

@@ -7706,6 +7706,9 @@ async fn maintain_secondary_indexes_on_insert(
             } else {
                 // Phase 5.19.C: JSONB GIN index — populate JSONB posting list.
                 maintain_gin_index_on_insert(gin_registry, &sess.project, table, col_name, opclass, batch, file_path);
+                // C2: also populate the per-row-group bloom-filter registry.
+                let rg_registry = sess.engine.gin_rowgroup_registry();
+                maintain_gin_rowgroup_index_on_insert(rg_registry, &sess.project, table, col_name, opclass, batch, file_path);
             }
             // GIN posting list is RAM-only (5.19.E handles persistence); skip
             // the flush call.  Continue to also populate the B-tree registry
@@ -7771,6 +7774,53 @@ fn maintain_gin_index_on_insert(
         // We only mark it when the column was present and had a LargeBinary
         // array — i.e., a real JSONB column in this batch.
         gin_registry.mark_file_indexed(project, table, col_name, file_path);
+    }
+}
+
+/// C2 — Populate the per-row-group bloom-filter registry for a single JSONB
+/// column from a newly written `batch`.  Each row in the batch belongs to
+/// row-group 0 (Basin writes one Parquet row-group per INSERT batch).  The
+/// same structure-keyed GIN term atoms used by the file-level posting list
+/// (`crate::index_probe::extract_terms`) are fed into the row-group bloom so
+/// that at query time `rowgroup_prune_for_containment` can narrow to only the
+/// row-groups that MIGHT contain a match for a given `@>` needle.
+///
+/// Only `LargeBinary` columns are handled (Basin's canonical JSONB wire type).
+/// Silently skips non-JSONB columns and NULL values — best-effort.
+fn maintain_gin_rowgroup_index_on_insert(
+    rg_registry: &Arc<basin_storage::index::gin_rowgroup::GinRowGroupRegistry>,
+    project: &basin_common::ProjectId,
+    table: &basin_common::TableName,
+    col_name: &str,
+    opclass: &str,
+    batch: &arrow_array::RecordBatch,
+    file_path: &str,
+) {
+    use arrow_array::Array;
+    let Ok(col_idx) = batch.schema().index_of(col_name) else {
+        return;
+    };
+    let col = batch.column(col_idx);
+    if let Some(arr) = col.as_any().downcast_ref::<arrow_array::LargeBinaryArray>() {
+        // Basin writes a single Parquet row-group per INSERT batch, so every
+        // row in this batch belongs to row-group 0 of `file_path`.
+        const ROW_GROUP: u32 = 0;
+        for row in 0..arr.len() {
+            if arr.is_null(row) {
+                continue;
+            }
+            let bytes = arr.value(row);
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+                continue;
+            };
+            let terms = crate::index_probe::extract_terms(&value, opclass);
+            if terms.is_empty() {
+                continue;
+            }
+            rg_registry.index_row(project, table, col_name, &terms, file_path, ROW_GROUP);
+        }
+        // Seal the file after all rows have been fed into the bloom(s).
+        rg_registry.mark_file_indexed(project, table, col_name, file_path);
     }
 }
 

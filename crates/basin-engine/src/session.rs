@@ -2222,23 +2222,91 @@ pub(crate) async fn apply_gin_pruning_for_query(
         return Ok(());
     }
 
-    if pruned_paths.len() == live_files.len() {
-        // All files are candidates — pruning would be a no-op.
+    // Note: even when all files are candidates at file level (pruned_paths.len()
+    // == live_files.len()), we still try row-group prune below — the row-group
+    // prune might narrow individual files to fewer row-groups.
+
+    // C2 — attempt row-group-granular prune using the per-row-group bloom
+    // registry.  If the registry has summaries for at least some of the
+    // candidate files, narrow further to only the surviving row-groups.
+    // Falls back to file-level pruning (or no pruning) when the registry
+    // has no summaries yet.
+    let rg_prune = crate::index_probe::rowgroup_prune_for_containment(
+        engine.gin_rowgroup_registry(),
+        project,
+        &gin_plan.table,
+        &gin_plan.col,
+        &gin_plan.opclass,
+        &gin_plan.needle,
+        &pruned_paths,
+    );
+
+    if let crate::index_probe::RowGroupPrune::PerFile(rg_map) = rg_prune {
+        // Row-group-level prune available.  Register a custom provider that
+        // drives Basin's native storage reader with `row_group_selection` set,
+        // bypassing DataFusion's ListingTable / ParquetExec path entirely.
+        //
+        // Correctness: `rg_map` is a conservative superset (bloom false
+        // positives are fine); `jsonb_contains` UDF re-checks every emitted
+        // row.  Files absent from `rg_map` are NOT in `row_group_selection`
+        // and are therefore read in full (no false negatives).
+        let df_schema = match schema_ws_to_df(&meta.schema) {
+            Ok(s) => Arc::new(s),
+            Err(_) => {
+                // Schema conversion failed — fall through to file-level prune.
+                return register_pruned_listing_table_if_narrowed(
+                    engine, ctx, &gin_plan.table, &meta, &pruned_paths, &live_files,
+                )
+                .await;
+            }
+        };
+        let provider = crate::gin_rowgroup_scan::GinRowGroupPrunedTable::new(
+            df_schema,
+            engine.config().storage.clone(),
+            *project,
+            gin_plan.table.clone(),
+            meta.file_format,
+            pruned_paths.clone(),
+            rg_map,
+        );
+        let tref = TableReference::Bare { table: gin_plan.table.as_str().into() };
+        let _ = ctx.deregister_table(tref.clone());
+        ctx.register_table(tref, Arc::new(provider))
+            .map_err(|e| BasinError::internal(format!("register rg-pruned table: {e}")))?;
         return Ok(());
     }
 
-    // Re-register with only the pruned file set.
+    // No row-group summaries — fall back to file-level prune (the existing path).
+    register_pruned_listing_table_if_narrowed(
+        engine, ctx, &gin_plan.table, &meta, &pruned_paths, &live_files,
+    )
+    .await
+}
+
+/// Re-register the table as a file-pruned `ListingTable` when `pruned_paths`
+/// is a strict subset of `live_files`.  When all files are candidates this
+/// is a no-op (avoids a pointless deregister+re-register round-trip).
+async fn register_pruned_listing_table_if_narrowed(
+    engine: &Engine,
+    ctx: &SessionContext,
+    table: &TableName,
+    meta: &basin_catalog::TableMetadata,
+    pruned_paths: &[String],
+    live_files: &[basin_catalog::DataFileRef],
+) -> Result<()> {
+    if pruned_paths.is_empty() || pruned_paths.len() == live_files.len() {
+        return Ok(());
+    }
     let _ = register_pruned_listing_table(
         engine,
         ctx,
-        &gin_plan.table,
+        table,
         &meta.schema,
         meta.file_format,
-        &pruned_paths,
+        pruned_paths,
         meta.global_sort_order.as_deref(),
     )
     .await;
-
     Ok(())
 }
 
