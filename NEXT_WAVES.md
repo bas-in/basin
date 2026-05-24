@@ -225,6 +225,53 @@ makes evals stick.
 
 ---
 
+## Wave N+5 — GPU acceleration (opt-in, background-only, far-future)
+
+> **Explicitly NOT for hot OLTP.** Single-row UPDATE / point query / WAL
+> fsync are sequencing-bound and PCIe round-trip latency (~10-100µs per
+> kernel launch) makes GPU strictly worse for those shapes. The wedge
+> here is **background and bulk work** where GPU's parallelism amortizes
+> the round-trip. Queue this only after Wave NOW + binary-JSONB +
+> memtable contention land — GPU is a 5× faster *version* of fixes
+> Basin can already ship on CPU, not a different fix.
+
+17. **GPU-accelerated background JSONB transcoder.** The hot cost of a
+    binary-JSONB rewrite (item #13) is JSON parsing during cold-tier
+    compaction. cuDF / Spark RAPIDS already does GPU JSON parse at
+    10-100× CPU throughput. Background compaction is latency-insensitive
+    so the PCIe round-trip is irrelevant. Net effect: Basin can transcode
+    aggressively on every compaction without a compute budget concern,
+    closing the JSONB cluster structurally with no wall-clock penalty.
+    **Acceptance:** opt-in via env / shard config — base CPU path stays
+    the default; operators with NVIDIA hardware point a flag at it.
+
+18. **GPU vector-search worker pool.** basin-vector already ships HNSW.
+    CAGRA / Faiss-GPU are 10× faster on large indices. Extends an existing
+    wedge rather than fixing a loss; ROI depends on customer signal for
+    billion-vector multi-tenant SaaS (most workloads are smaller). Same
+    opt-in shape as #17 — base CPU path remains the default.
+
+19. **GPU OLAP scan + aggregation** for heavy `JOIN + GROUP BY` shapes at
+    10M+ rows. Basin already wins these at 100k-1M (122× faster on
+    correlated subquery at 1M); GPU compounds the win further. Not the
+    highest-ROI item because Basin's wedge isn't "fastest analytical
+    engine" — it's "good-enough analytical on cheap storage with PG
+    semantics." Queue last among the GPU items.
+
+**Hard constraints on any GPU item:**
+- Never required. Basin's target deployment is cheap object storage +
+  commodity compute; mandating GPU breaks the `$0.10/tenant/month`
+  substrate-economics pitch.
+- Opt-in only — env var + shard config flag. CPU path is the default
+  and must keep passing the same test surface.
+- Background workers only (compaction, transcode, index build). The
+  hot read/write path stays CPU. Per-request GPU usage is out of scope.
+- Honest-negative outcomes valued: if a GPU path doesn't beat the CPU
+  path by ≥3× at the operator's batch size, ship the negative and
+  recommend the CPU path. The benchmark integrity rule applies.
+
+---
+
 ## How this list is maintained
 
 - Items are added when the user / strategic thread mentions them and
