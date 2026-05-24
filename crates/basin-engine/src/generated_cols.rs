@@ -91,6 +91,13 @@ pub(crate) async fn eval_expression(
     crate::udf::register_pg_compat_udfs(&ctx);
     // FTS stub UDFs — needed for GENERATED ALWAYS AS (to_tsvector(...) STORED) columns.
     crate::fts_udf::register_fts_udfs(&ctx);
+    // JSONB UDFs — needed for SET-RHS expressions like
+    // `UPDATE … SET col = jsonb_set(col, '{a,b}', '…')`, which route through
+    // this same eval_expression projection path. Mirror session.rs: register
+    // the base JSONB UDFs first, then the modify UDFs so the latter's
+    // `jsonb_set` / `jsonb_insert` implementations shadow the earlier stubs.
+    crate::jsonb_udf::register_jsonb_udfs(&ctx);
+    crate::jsonb_modify_udf::register_jsonb_modify_udfs(&ctx);
 
     // Cross the arrow-version bridge: the workspace batch becomes a
     // datafusion-arrow batch for the MemTable, and the projection's

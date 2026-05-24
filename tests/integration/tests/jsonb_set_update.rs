@@ -128,7 +128,6 @@ async fn id_count(sess: &basin_engine::ProjectSession) -> i64 {
 /// writeback path in dml_mutate.rs (AssignmentRhs::Expr → eval_expression)
 /// already handles a UDF-valued RHS correctly.
 #[tokio::test]
-#[ignore = "needs register_jsonb_udfs in generated_cols::eval_expression (peer file)"]
 async fn jsonb_set_update_replaces_existing_nested_value() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -174,7 +173,6 @@ async fn jsonb_set_update_replaces_existing_nested_value() {
 ///
 /// IGNORED for the same reason as `jsonb_set_update_replaces_existing_nested_value`.
 #[tokio::test]
-#[ignore = "needs register_jsonb_udfs in generated_cols::eval_expression (peer file)"]
 async fn jsonb_set_update_creates_missing_nested_value() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
@@ -203,7 +201,6 @@ async fn jsonb_set_update_creates_missing_nested_value() {
 ///
 /// IGNORED for the same reason as `jsonb_set_update_replaces_existing_nested_value`.
 #[tokio::test]
-#[ignore = "needs register_jsonb_udfs in generated_cols::eval_expression (peer file)"]
 async fn jsonb_set_update_top_level_and_numeric_value() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
