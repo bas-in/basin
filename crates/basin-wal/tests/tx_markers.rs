@@ -236,7 +236,7 @@ async fn suppress_false_emits_all_entries_including_rolled_back() {
         .unwrap();
 
     // With suppression ON, the 10 rolled-back entries are discarded.
-    let suppress_on = replay_wal(events.clone(), &WalReplayConfig { suppress_rolled_back: true });
+    let suppress_on = replay_wal(events.clone(), &WalReplayConfig { suppress_rolled_back: true, require_explicit_commit: true });
     assert_eq!(
         suppress_on.len(),
         0,
@@ -244,7 +244,7 @@ async fn suppress_false_emits_all_entries_including_rolled_back() {
     );
 
     // With suppression OFF, all 10 entries are emitted regardless.
-    let suppress_off = replay_wal(events, &WalReplayConfig { suppress_rolled_back: false });
+    let suppress_off = replay_wal(events, &WalReplayConfig { suppress_rolled_back: false, require_explicit_commit: false });
     assert_eq!(
         suppress_off.len(),
         10,

@@ -44,8 +44,8 @@ use ulid::Ulid;
 
 use crate::segment::{
     decode_segment, decode_segment_full, entry_record, frame_into, handoff_record,
-    tx_begin_record, tx_rollback_record, DecodedRecord, EntryRecord, SegmentHeader, SegmentRecord,
-    FORMAT_VERSION,
+    tx_begin_record, tx_commit_record, tx_rollback_record, DecodedRecord, EntryRecord,
+    SegmentHeader, SegmentRecord, FORMAT_VERSION,
 };
 use crate::state::{BufferRecord, ClosedSegment, PartitionState};
 use crate::{Lsn, WalConfig, WalEntry, WalEvent, WalImpl};
@@ -172,6 +172,9 @@ impl Inner {
                 }
                 BufferRecord::TxRollback { tx_id, .. } => {
                     frame_into(&mut buf, &tx_rollback_record(*tx_id))?;
+                }
+                BufferRecord::TxCommit { tx_id, .. } => {
+                    frame_into(&mut buf, &tx_commit_record(*tx_id))?;
                 }
                 BufferRecord::Handoff {
                     to_holder,
@@ -588,6 +591,32 @@ impl WalImpl for FileWal {
         Ok(lsn)
     }
 
+    #[tracing::instrument(skip(self), fields(project=%project, partition=%partition, tx_id))]
+    async fn append_tx_commit(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        tx_id: u64,
+    ) -> Result<Lsn> {
+        let state = self.inner.get_or_create_partition(project, partition).await;
+        let (lsn, should_flush) = {
+            let mut guard = state.lock().await;
+            let lsn = guard.next_lsn;
+            guard.next_lsn = lsn.next();
+            guard.buffer.push(BufferRecord::TxCommit { lsn, tx_id });
+            // Markers are tiny; use a fixed overhead for the pressure heuristic.
+            guard.buffer_bytes += 32;
+            let pressure = guard.buffer_bytes >= self.inner.flush_max_bytes;
+            (lsn, pressure)
+        };
+        if should_flush {
+            if let Err(e) = self.inner.flush_one(&state).await {
+                tracing::warn!(error = %e, "buffer-pressure flush failed (tx_commit)");
+            }
+        }
+        Ok(lsn)
+    }
+
     #[tracing::instrument(skip(self), fields(project=%project, partition=%partition, %to_holder, at_epoch))]
     async fn append_handoff_marker(
         &self,
@@ -675,6 +704,9 @@ impl WalImpl for FileWal {
                     DecodedRecord::TxRollback { tx_id } => {
                         events.push(WalEvent::Rollback { tx_id });
                     }
+                    DecodedRecord::TxCommit { tx_id } => {
+                        events.push(WalEvent::Commit { tx_id });
+                    }
                     DecodedRecord::Handoff {
                         to_holder,
                         at_epoch,
@@ -695,6 +727,9 @@ impl WalImpl for FileWal {
                 BufferRecord::TxBegin { tx_id, .. } => events.push(WalEvent::Begin { tx_id }),
                 BufferRecord::TxRollback { tx_id, .. } => {
                     events.push(WalEvent::Rollback { tx_id })
+                }
+                BufferRecord::TxCommit { tx_id, .. } => {
+                    events.push(WalEvent::Commit { tx_id })
                 }
                 BufferRecord::Handoff {
                     to_holder,

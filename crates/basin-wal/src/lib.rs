@@ -100,6 +100,14 @@ pub enum WalEvent {
     Begin { tx_id: u64 },
     /// Marks that all buffered entries for `tx_id` should be discarded.
     Rollback { tx_id: u64 },
+    /// ADR 0020 §6 — explicit commit marker. Paired with the matching
+    /// `Begin { tx_id }` to indicate the transaction committed durably.
+    /// Replay only honours entries whose transaction has a matching `Commit`
+    /// marker. Transactions that reach EOF without a `Commit` were written by
+    /// a post-ADR-0020-§6 writer that crashed mid-transaction; their entries
+    /// are discarded. Legacy segments written before this variant existed
+    /// use the implicit-commit-at-EOF heuristic for back-compat.
+    Commit { tx_id: u64 },
     /// Phase 6.X.C (ADR 0023) — voluntary lease-handoff marker emitted by an
     /// outgoing leaseholder just before it releases the lease. Replay treats
     /// it as a **no-op** (informational only); the marker exists so the new
@@ -130,34 +138,58 @@ pub struct WalReplayConfig {
     /// When `false` all entries are emitted regardless of transaction markers
     /// (v0.1-compat mode).
     pub suppress_rolled_back: bool,
+    /// ADR 0020 §6 — require an explicit `Commit { tx_id }` marker for every
+    /// transaction before honouring its entries on replay.
+    ///
+    /// When `true` (the default) a `Begin { tx_id }` whose matching `Commit`
+    /// is absent at EOF means the writer crashed mid-transaction; those entries
+    /// are discarded.
+    ///
+    /// When `false` (legacy back-compat) an open transaction at EOF is treated
+    /// as implicitly committed — the pre-ADR-0020-§6 behaviour. The
+    /// [`replay_wal`] function also falls back to this mode automatically when
+    /// it detects a segment written before `TxCommit` markers existed (i.e.
+    /// the event stream contains `Begin` records but zero `Commit` records).
+    pub require_explicit_commit: bool,
 }
 
 impl Default for WalReplayConfig {
     fn default() -> Self {
         Self {
             suppress_rolled_back: true,
+            require_explicit_commit: true,
         }
     }
 }
 
 /// Replay a sequence of [`WalEvent`]s, suppressing entries that belong to
-/// explicitly rolled-back transactions.
+/// rolled-back or crashed-mid-transaction transactions.
 ///
 /// ## Behaviour
 ///
-/// - Events with no surrounding `Begin`/`Rollback` markers are emitted
-///   verbatim (back-compat: pre-marker WAL files produce identical output).
+/// - Events with no surrounding `Begin`/`Rollback`/`Commit` markers are
+///   emitted verbatim (back-compat: pre-marker WAL files produce identical
+///   output).
 /// - A `Begin { tx_id }` starts collecting entries tagged with `tx_id`.
 /// - A `Rollback { tx_id }` discards all collected entries for that `tx_id`.
-/// - End-of-input with no matching `Rollback` is an **implicit commit**: all
-///   buffered entries for the open transaction are emitted in LSN order.
+/// - A `Commit { tx_id }` (ADR 0020 §6) flushes all buffered entries for
+///   `tx_id` to the committed set.
+/// - End-of-input with an open transaction (no `Commit` / `Rollback` seen):
+///   - If the event stream contains **any** `Commit` markers (indicating a
+///     post-ADR-0020-§6 writer) AND `config.require_explicit_commit` is `true`,
+///     the open transaction is treated as a crash victim and its entries are
+///     discarded. A `WARN`-level log is emitted once.
+///   - Otherwise (legacy segment, no `Commit` markers present anywhere, or
+///     `require_explicit_commit = false`): the old implicit-commit-at-EOF
+///     rule applies and entries are emitted. This preserves backward
+///     compatibility with segments written before this variant existed.
 /// - Multiple concurrent transactions (interleaved `Begin` markers) are
 ///   tracked independently.
 ///
 /// ## `WalReplayConfig::suppress_rolled_back = false`
 ///
-/// Disables the suppression logic. Every `Entry` event in `events` is emitted
-/// regardless of surrounding markers. This is the v0.1-compat mode.
+/// Disables all suppression logic. Every `Entry` event is emitted verbatim.
+/// This is the v0.1-compat mode.
 pub fn replay_wal(events: Vec<WalEvent>, config: &WalReplayConfig) -> Vec<WalEntry> {
     if !config.suppress_rolled_back {
         // Fast path: emit all data entries, ignore markers.
@@ -167,15 +199,24 @@ pub fn replay_wal(events: Vec<WalEvent>, config: &WalReplayConfig) -> Vec<WalEnt
                 WalEvent::Entry(e) => Some(e),
                 WalEvent::Begin { .. }
                 | WalEvent::Rollback { .. }
+                | WalEvent::Commit { .. }
                 | WalEvent::Handoff { .. } => None,
             })
             .collect();
     }
 
+    // ADR 0020 §6 back-compat detection: if we see at least one Commit marker
+    // in the stream, the segment was written by a post-§6 writer and we can
+    // enforce explicit-commit semantics at EOF. If no Commit markers are
+    // present, the segment is legacy and we fall back to implicit-commit-at-EOF.
+    let has_any_commit = events
+        .iter()
+        .any(|ev| matches!(ev, WalEvent::Commit { .. }));
+
     // tx_id -> buffered entries collected since the matching Begin.
     let mut open_txs: std::collections::HashMap<u64, Vec<WalEntry>> =
         std::collections::HashMap::new();
-    // Entries not inside any open transaction (or from implicit-commit tx).
+    // Entries not inside any open transaction (or from already-committed tx).
     let mut committed: Vec<WalEntry> = Vec::new();
     // Track which tx_id is "current" for the most recent Begin, so that
     // interleaved entries are routed correctly. An entry that arrives while
@@ -198,6 +239,13 @@ pub fn replay_wal(events: Vec<WalEvent>, config: &WalReplayConfig) -> Vec<WalEnt
                 open_txs.remove(&tx_id);
                 open_tx_order.retain(|id| *id != tx_id);
             }
+            WalEvent::Commit { tx_id } => {
+                // ADR 0020 §6: explicit commit — flush buffered entries.
+                if let Some(mut buffered) = open_txs.remove(&tx_id) {
+                    committed.append(&mut buffered);
+                }
+                open_tx_order.retain(|id| *id != tx_id);
+            }
             WalEvent::Entry(entry) => {
                 if let Some(&current_tx) = open_tx_order.last() {
                     // Inside an open transaction — buffer against it.
@@ -215,11 +263,32 @@ pub fn replay_wal(events: Vec<WalEvent>, config: &WalReplayConfig) -> Vec<WalEnt
         }
     }
 
-    // End-of-input: implicit commit for any still-open transactions.
-    // Emit in the order the transactions were opened.
-    for tx_id in open_tx_order {
-        if let Some(mut buffered) = open_txs.remove(&tx_id) {
-            committed.append(&mut buffered);
+    // End-of-input: handle any still-open transactions.
+    if !open_tx_order.is_empty() {
+        let enforce_explicit = config.require_explicit_commit && has_any_commit;
+        if enforce_explicit {
+            // Post-§6 segment: open transactions at EOF are crash victims.
+            // Discard their entries.
+            static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            WARNED.get_or_init(|| {
+                tracing::warn!(
+                    open_tx_count = open_tx_order.len(),
+                    "WAL replay: discarding {} open transaction(s) at EOF \
+                     (crash-mid-tx; no TxCommit marker present). \
+                     Entries will not be replayed.",
+                    open_tx_order.len()
+                );
+            });
+            // Drop without emitting.
+        } else {
+            // Legacy segment (no TxCommit markers observed) or
+            // require_explicit_commit disabled: apply the old
+            // implicit-commit-at-EOF rule so pre-§6 data is not lost.
+            for tx_id in open_tx_order {
+                if let Some(mut buffered) = open_txs.remove(&tx_id) {
+                    committed.append(&mut buffered);
+                }
+            }
         }
     }
 
@@ -361,6 +430,25 @@ pub trait Wal: Send + Sync + std::fmt::Debug {
     ) -> Result<Lsn> {
         Err(basin_common::BasinError::feature_not_supported(
             "append_tx_rollback",
+        ))
+    }
+
+    /// ADR 0020 §6 — append an explicit `COMMIT` transaction marker for
+    /// `tx_id` to the log for `(project, partition)`. Returns the LSN assigned
+    /// to the marker. Must be called at every COMMIT so that WAL replay can
+    /// distinguish committed transactions from crash-mid-tx aborts.
+    ///
+    /// Default implementation returns
+    /// [`basin_common::BasinError::FeatureNotSupported`] — concrete backends
+    /// override this (e.g. [`LocalWal`]).
+    async fn append_tx_commit(
+        &self,
+        _project: &ProjectId,
+        _partition: &PartitionKey,
+        _tx_id: u64,
+    ) -> Result<Lsn> {
+        Err(basin_common::BasinError::feature_not_supported(
+            "append_tx_commit",
         ))
     }
 
@@ -532,6 +620,17 @@ impl Wal for LocalWal {
             .await
     }
 
+    async fn append_tx_commit(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        tx_id: u64,
+    ) -> Result<Lsn> {
+        self.inner
+            .append_tx_commit(project, partition, tx_id)
+            .await
+    }
+
     async fn append_handoff_marker(
         &self,
         project: &ProjectId,
@@ -609,6 +708,13 @@ pub(crate) trait WalImpl: Send + Sync {
         tx_id: u64,
     ) -> Result<Lsn>;
     async fn append_tx_rollback(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        tx_id: u64,
+    ) -> Result<Lsn>;
+    /// ADR 0020 §6 — append an explicit commit marker.
+    async fn append_tx_commit(
         &self,
         project: &ProjectId,
         partition: &PartitionKey,
