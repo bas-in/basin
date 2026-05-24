@@ -225,50 +225,88 @@ makes evals stick.
 
 ---
 
-## Wave N+5 — GPU acceleration (opt-in, background-only, far-future)
+## Wave N+5 — Accelerator acceleration (vendor-neutral, opt-in, background-only, far-future)
 
 > **Explicitly NOT for hot OLTP.** Single-row UPDATE / point query / WAL
-> fsync are sequencing-bound and PCIe round-trip latency (~10-100µs per
-> kernel launch) makes GPU strictly worse for those shapes. The wedge
-> here is **background and bulk work** where GPU's parallelism amortizes
-> the round-trip. Queue this only after Wave NOW + binary-JSONB +
-> memtable contention land — GPU is a 5× faster *version* of fixes
-> Basin can already ship on CPU, not a different fix.
+> fsync are sequencing-bound and host↔device round-trip latency
+> (~10-100µs per kernel launch on PCIe; lower on unified memory
+> architectures but still non-zero) makes any accelerator strictly worse
+> for those shapes. The wedge here is **background and bulk work** where
+> SIMT parallelism amortizes the round-trip. Queue this only after Wave
+> NOW + binary-JSONB + memtable contention land — accelerators are a
+> faster *version* of fixes Basin can already ship on CPU, not a
+> different fix.
+>
+> **Vendor-neutral by construction.** Basin's deployment matrix already
+> covers Linux x86_64 / aarch64, macOS arm64 (dev + small deploys), and
+> a future Windows surface via WSL. A GPU/accelerator integration that
+> only works on NVIDIA breaks that matrix. The abstraction layer below
+> is mandatory; concrete backends land per ROI signal.
 
-17. **GPU-accelerated background JSONB transcoder.** The hot cost of a
-    binary-JSONB rewrite (item #13) is JSON parsing during cold-tier
-    compaction. cuDF / Spark RAPIDS already does GPU JSON parse at
-    10-100× CPU throughput. Background compaction is latency-insensitive
-    so the PCIe round-trip is irrelevant. Net effect: Basin can transcode
-    aggressively on every compaction without a compute budget concern,
-    closing the JSONB cluster structurally with no wall-clock penalty.
-    **Acceptance:** opt-in via env / shard config — base CPU path stays
-    the default; operators with NVIDIA hardware point a flag at it.
+**Backend abstraction (prerequisite for any accelerator work).** Before
+landing #17-#19, factor a Basin-side `AcceleratorBackend` trait with the
+minimum surface every backend can implement: batch JSON parse, batch
+vector ANN probe, batch hash-aggregate. Concrete backends:
 
-18. **GPU vector-search worker pool.** basin-vector already ships HNSW.
-    CAGRA / Faiss-GPU are 10× faster on large indices. Extends an existing
-    wedge rather than fixing a loss; ROI depends on customer signal for
-    billion-vector multi-tenant SaaS (most workloads are smaller). Same
-    opt-in shape as #17 — base CPU path remains the default.
+| Backend | Library / surface | Maturity | Target audience |
+|---|---|---|---|
+| **CPU** (default) | SIMD via std::simd / portable-simd; `serde_json` / `simd-json`; `usearch` for ANN | Mature | Everyone; non-negotiable baseline |
+| **NVIDIA** | CUDA via cuDF / RAPIDS for JSON; CAGRA / Faiss-GPU for ANN; cuDF/CUB for hash-agg | Mature ecosystem | Datacenter operators with H100/A100/L4 |
+| **AMD** | ROCm-aware Arrow; ROCm Faiss; rocSPARSE / rocBLAS as needed | Less mature but real | Datacenter operators with MI300/MI250; cost-sensitive deploys |
+| **Apple Silicon** | Metal Performance Shaders; MLX; Apple's Accelerate framework for some kernels | Growing | Dev machines + small Mac-server deploys; unified memory eliminates the PCIe round-trip entirely |
+| **Intel** | oneAPI / SYCL; Intel Arc / Data Center GPU Max; oneDPL | Growing | Intel Arc on commodity desktops; Data Center GPU Max for analytics |
+| **Vendor-neutral fallback** | `wgpu` (WebGPU implementation) / Vulkan compute / SYCL | Portable but slower than native | Heterogeneous fleets; CI; "works everywhere" guarantee |
 
-19. **GPU OLAP scan + aggregation** for heavy `JOIN + GROUP BY` shapes at
-    10M+ rows. Basin already wins these at 100k-1M (122× faster on
-    correlated subquery at 1M); GPU compounds the win further. Not the
-    highest-ROI item because Basin's wedge isn't "fastest analytical
-    engine" — it's "good-enough analytical on cheap storage with PG
-    semantics." Queue last among the GPU items.
+Backend selection at runtime via `BASIN_ACCELERATOR_BACKEND={cpu,cuda,rocm,metal,oneapi,wgpu}` (default `cpu`), with per-shard / per-project override. Auto-detect when set to `auto`. Honest-negative built in: if the selected backend can't beat CPU at the operator's batch size, log a warn and fall through to CPU.
 
-**Hard constraints on any GPU item:**
-- Never required. Basin's target deployment is cheap object storage +
-  commodity compute; mandating GPU breaks the `$0.10/tenant/month`
-  substrate-economics pitch.
-- Opt-in only — env var + shard config flag. CPU path is the default
-  and must keep passing the same test surface.
-- Background workers only (compaction, transcode, index build). The
-  hot read/write path stays CPU. Per-request GPU usage is out of scope.
-- Honest-negative outcomes valued: if a GPU path doesn't beat the CPU
-  path by ≥3× at the operator's batch size, ship the negative and
-  recommend the CPU path. The benchmark integrity rule applies.
+17. **Accelerator-assisted background JSONB transcoder.** The hot cost of
+    a binary-JSONB rewrite (item #13) is JSON parsing during cold-tier
+    compaction. NVIDIA's cuDF does GPU JSON parse at 10-100× CPU
+    throughput; ROCm and SYCL implementations are following. Apple
+    Silicon's unified memory is especially attractive here — no PCIe
+    copy, so even modest GPU throughput wins on smaller batches.
+    Background compaction is latency-insensitive, amortizing whatever
+    host↔device shape the chosen backend has. **Acceptance:** the
+    `AcceleratorBackend::parse_json_batch` interface works against at
+    least two backends (CPU baseline + one of NVIDIA / Apple Silicon),
+    each ≥3× faster than CPU at the configured compaction batch size.
+
+18. **Accelerator-assisted vector-search worker pool.** basin-vector
+    already ships HNSW. CAGRA (NVIDIA) and ROCm-Faiss (AMD) and MLX-ANN
+    (Apple) all expose ≥10× speedups on million-vector indices. Extends
+    an existing wedge rather than fixing a loss; ROI depends on customer
+    signal for billion-vector multi-tenant SaaS (most workloads are
+    smaller). Same opt-in shape as #17 — base CPU `usearch` HNSW remains
+    the default.
+
+19. **Accelerator-assisted OLAP scan + aggregation** for heavy
+    `JOIN + GROUP BY` shapes at 10M+ rows. Basin already wins these at
+    100k-1M (122× faster on correlated subquery at 1M); accelerators
+    compound the win further. Not the highest-ROI item because Basin's
+    wedge isn't "fastest analytical engine" — it's "good-enough
+    analytical on cheap storage with PG semantics." Queue last among the
+    accelerator items.
+
+**Hard constraints on any accelerator item:**
+- **Never required.** Basin's target deployment is cheap object storage
+  + commodity compute; mandating any accelerator (or any specific
+  vendor) breaks the `$0.10/tenant/month` substrate-economics pitch.
+- **Opt-in only** — env var + shard config flag. CPU path is the default
+  and must keep passing the same test surface across every supported
+  platform.
+- **Background workers only** (compaction, transcode, index build). The
+  hot read/write path stays CPU. Per-request accelerator usage is out of
+  scope until kernel-launch latency drops below memtable lookup cost
+  (probably never on PCIe; possibly someday on next-gen unified memory).
+- **Vendor-neutral surface.** No accelerator work lands without the
+  `AcceleratorBackend` trait + at least one non-NVIDIA backend (even if
+  it's only the CPU fallback at first). This keeps the abstraction
+  honest and prevents implicit NVIDIA-only assumptions from leaking into
+  the engine.
+- **Honest-negative outcomes valued:** if an accelerator path doesn't
+  beat CPU by ≥3× at the operator's batch size, ship the negative and
+  recommend CPU. The benchmark integrity rule applies (no bench-literal
+  hardcoding, no special-casing to flatter a vendor).
 
 ---
 
