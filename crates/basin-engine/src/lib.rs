@@ -1058,7 +1058,7 @@ mod query_history;
 pub mod query_shape;
 pub mod query_stats;
 pub mod query_stats_export;
-// pub mod project_usage_view; // orphaned after working-tree reset; restore when module file exists
+pub(crate) mod project_usage_view;
 mod procedure_ddl;
 mod range_udf;
 pub mod reactor_ddl;

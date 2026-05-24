@@ -1327,6 +1327,13 @@ pub(crate) async fn open(
     // each pgwire backend tracks its own subscription set.
     crate::notify_registry::register_pg_listening_channels(&ctx, state.clone());
 
+    crate::project_usage_view::register_basin_project_usage(
+        &ctx,
+        engine.project_counters_registry().clone(),
+        project.clone(),
+    )
+    .map_err(|e| BasinError::internal(format!("basin_project_usage: {e}")))?;
+
     Ok(ProjectSession {
         engine,
         project,
