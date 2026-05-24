@@ -186,14 +186,105 @@ fn batch_matches_predicates(batch: &RecordBatch, predicates: &[Predicate]) -> bo
 ///
 /// This is the Phase 5.14.C3 point-lookup probe: `execute_simple_select` calls
 /// this for Eq-predicate queries before (or instead of) reading the cold tier.
+///
+/// Fast path (single PK Eq predicate). When `predicates` is exactly one
+/// `Eq(pk_col, lit)` against the table's primary-key column and the literal
+/// encodes to a `RowKey`, a single `BTreeMap::get(&pk_key)` resolves the lookup
+/// in O(log n) under a short read-lock — bypassing the O(n) BTreeMap clone
+/// that `snapshot()` performs.  This is correct *only* for entries keyed by
+/// the encoded PK (`MemRowValue::Update` and `MemRowValue::Tombstone`, both
+/// written by the hot-tier UPDATE / DELETE fast paths in `dml_mutate.rs`).
+///
+/// `MemRowValue::Row` entries written by `htap_promote_to_registry` are keyed
+/// by a monotonic counter (see [`MemRowValue::Update`] doc comment) and would
+/// be missed by a PK-keyed `get`.  When the PK-keyed `get` returns `None` we
+/// therefore fall through to the snapshot-walk path so any counter-keyed
+/// HTAP-cached row whose PK happens to match the predicate is still found.
+///
+/// Lock contention. The snapshot path holds the read-lock for the entire
+/// BTreeMap clone (cost grows with memtable size). The direct-get path holds
+/// it only for the O(log n) lookup. For workloads where the memtable is hot
+/// with PK-keyed UPDATE/DELETE overlays (read+write mix), this cuts the
+/// critical-section length proportionally to the memtable population.
 fn probe_memtable(
     sess: &ProjectSession,
     table: &TableName,
     predicates: &[Predicate],
+    meta: &TableMetadata,
 ) -> Option<(Vec<RecordBatch>, bool)> {
     let registry = sess.engine.memtable_registry();
     let entry = registry.get(&sess.project, table)?;
 
+    // ── PK direct-get fast path ──────────────────────────────────────────────
+    //
+    // Only fires for the canonical point-lookup shape:
+    //   * exactly one predicate, an `Eq(col, lit)`;
+    //   * `col` matches the table's single PK column;
+    //   * `lit` encodes to a `RowKey` via the same encoding the cold-tier
+    //     cluster-sort uses (i.e. supported PK types: Int64/Int32/Int16/
+    //     UInt64/Utf8/Boolean).
+    //
+    // When all three hold we attempt a direct `get(&pk_row_key)`.
+    //   * `Some(Update { .. })` — a PK-keyed override (hot UPDATE).  Decode &
+    //     return it; this row supersedes any counter-keyed `Row` that may also
+    //     exist for the same logical PK (merge semantics: Update wins).
+    //   * `Some(Tombstone)` — return `(vec![], has_tombstone=true)` so the
+    //     caller's overlay logic suppresses the cold-tier row.
+    //   * `Some(Row { .. })` — a PK-keyed Row (test helpers; not the
+    //     production INSERT path which is counter-keyed).  Treat as a hit.
+    //   * `None` — fall through to the snapshot path: a counter-keyed
+    //     HTAP-cached row may match the predicate via `batch_matches_predicates`.
+    if predicates.len() == 1 && meta.pk_columns.len() == 1 {
+        if let Predicate::Eq(col, val) = &predicates[0] {
+            if col == &meta.pk_columns[0] {
+                // Encode the literal to a RowKey using the SAME helper the
+                // hot-tier UPDATE / DELETE fast paths use (`dml_mutate::
+                // pk_scalar_to_row_key`).  Identical encoding is load-bearing:
+                // an Update/Tombstone written by those paths will only be
+                // found here if our `RowKey` matches byte-for-byte.
+                if let Ok(pk_idx) = meta.schema.index_of(col) {
+                    let pk_dt = meta.schema.field(pk_idx).data_type().clone();
+                    if let Some(pk_key) = crate::dml_mutate::pk_scalar_to_row_key(val, &pk_dt) {
+                        match entry.memtable.get(&pk_key) {
+                            Some(basin_hottier::MemRowValue::Update { bytes, .. })
+                            | Some(basin_hottier::MemRowValue::Row { bytes, .. }) => {
+                                // Decode and re-validate the predicate against
+                                // the decoded row (cheap; one row).  An Update
+                                // SET col = ? doesn't change the PK column, but
+                                // re-checking is defence-in-depth in case the
+                                // entry's PK column value isn't what the
+                                // predicate expects.
+                                if let Some(batch) = decode_ipc_batch(&bytes) {
+                                    if batch_matches_predicates(&batch, predicates) {
+                                        return Some((vec![batch], false));
+                                    }
+                                    // Predicate mismatch on a PK-keyed entry is
+                                    // a contradiction (the key encodes the PK
+                                    // value).  Fall through to snapshot in case
+                                    // of an encoding edge we missed.
+                                }
+                            }
+                            Some(basin_hottier::MemRowValue::Tombstone) => {
+                                return Some((Vec::new(), true));
+                            }
+                            None => {
+                                // PK not present in memtable under the PK-keyed
+                                // half.  A counter-keyed Row (HTAP cache) may
+                                // still match — fall through to snapshot.
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Snapshot fallback ────────────────────────────────────────────────────
+    // The slow but always-correct path: clone the entire memtable BTreeMap
+    // under a read-lock, then filter via `batch_matches_predicates`.  Required
+    // for predicate shapes the direct-get can't handle (non-PK Eq, multi-
+    // predicate, range), and as a safety net for counter-keyed HTAP-cached
+    // INSERT rows.
     let snapshot = entry.memtable.snapshot();
     if snapshot.is_empty() {
         return None;
@@ -1311,7 +1402,7 @@ pub(crate) async fn execute_simple_select(
         .any(|p| matches!(p, Predicate::Eq(..)));
     if is_point_lookup && plan.aggregates.is_none() {
         if let Some((mem_rows, _has_tombstone)) =
-            probe_memtable(sess, &plan.table, &plan.predicates)
+            probe_memtable(sess, &plan.table, &plan.predicates, &meta)
         {
             if !mem_rows.is_empty() {
                 // Hot-tier hit: apply projection + limit and return immediately.
