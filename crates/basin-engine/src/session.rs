@@ -1882,19 +1882,111 @@ impl datafusion::catalog::TableProvider for HtapUnionTable {
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         use datafusion::physical_plan::union::UnionExec;
+        use crate::hot_tombstone::{
+            snapshot_tombstones, snapshot_updates,
+            TombstoneFilterExec, UpdateOverlayExec,
+        };
 
-        let cold_plan = self.cold.scan(state, projection, filters, limit).await?;
-        // Merge-on-read tombstone suppression: drop cold-tier rows whose
-        // PK has been tombstoned by a fast-path DELETE in the process-wide
-        // registry.
-        let cold_plan = crate::hot_tombstone::maybe_wrap_with_tombstone_filter(
-            cold_plan,
-            self.engine.memtable_registry().as_ref(),
-            &self.project,
-            &self.table,
-            &self.pk_columns,
-            self.schema.as_ref(),
-        );
+        let registry = self.engine.memtable_registry();
+        let tombs = snapshot_tombstones(registry.as_ref(), &self.project, &self.table);
+        let updates = snapshot_updates(registry.as_ref(), &self.project, &self.table);
+
+        // Single-PK gate: fast-path DELETE/UPDATE only writes to single-column-PK
+        // tables. Composite-PK or no-PK tables can never have tombstones/updates in
+        // the registry, so skip the overhead.
+        let apply_overlay = (self.pk_columns.len() == 1)
+            && (!tombs.is_empty() || !updates.is_empty());
+
+        if !apply_overlay {
+            // Zero-overhead pass-through: no tombstones and no UPDATE overrides.
+            let cold_plan = self.cold.scan(state, projection, filters, limit).await?;
+            let hot_plan = self.hot.scan(state, projection, filters, limit).await?;
+            return Ok(Arc::new(UnionExec::new(vec![cold_plan, hot_plan])));
+        }
+
+        let pk_col = &self.pk_columns[0];
+        let Ok(pk_idx_in_schema) = self.schema.index_of(pk_col) else {
+            // PK column missing from schema (defensive). Fall through to plain
+            // union — never crash a read due to bad metadata.
+            let cold_plan = self.cold.scan(state, projection, filters, limit).await?;
+            let hot_plan = self.hot.scan(state, projection, filters, limit).await?;
+            return Ok(Arc::new(UnionExec::new(vec![cold_plan, hot_plan])));
+        };
+        let pk_dt = self.schema.field(pk_idx_in_schema).data_type().clone();
+
+        // If the caller's projection omits the PK column, augment it so the
+        // tombstone filter / update overlay has the key bytes to compare on.
+        // We then strip the extra column back out with a ProjectionExec.
+        //
+        // Limit pushdown is dropped when augmenting: the limit applies to
+        // post-filter rows, and passing it to the cold scan would truncate
+        // before tombstone/override removal and under-count survivors.
+        let (cold_projection_owned, augmented, effective_limit) = match projection {
+            Some(p) if !p.contains(&pk_idx_in_schema) => {
+                let mut p2 = p.clone();
+                p2.push(pk_idx_in_schema);
+                (Some(p2), true, None)
+            }
+            Some(p) => (Some(p.clone()), false, limit),
+            None => (None, false, limit),
+        };
+
+        let cold_projection_ref = cold_projection_owned.as_ref();
+        let cold_plan = self
+            .cold
+            .scan(state, cold_projection_ref, filters, effective_limit)
+            .await?;
+
+        // Apply tombstone row-filter (no-op when no tombstones).
+        let mut filtered: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
+            if tombs.is_empty() {
+                cold_plan
+            } else {
+                Arc::new(TombstoneFilterExec::new(
+                    cold_plan,
+                    pk_col.clone(),
+                    pk_dt.clone(),
+                    Arc::new(tombs),
+                ))
+            };
+
+        // Apply UPDATE override overlay: suppress overridden cold rows and
+        // append the post-SET row images. The overlay reprojects overrides to
+        // the (possibly PK-augmented) cold scan schema inside the exec.
+        if !updates.is_empty() {
+            filtered = Arc::new(UpdateOverlayExec::new(
+                filtered,
+                pk_col.clone(),
+                pk_dt,
+                Arc::new(updates),
+            ));
+        }
+
+        // Strip the appended PK column when we augmented the projection so the
+        // outer plan sees the originally-requested schema.
+        let cold_plan = if augmented {
+            use datafusion::physical_expr::expressions::Column;
+            use datafusion::physical_plan::projection::{ProjectionExec, ProjectionExpr};
+            let filtered_schema = filtered.schema();
+            let original_len = cold_projection_owned
+                .as_ref()
+                .map(|p| p.len() - 1)
+                .unwrap_or(0);
+            let exprs: Vec<ProjectionExpr> = (0..original_len)
+                .map(|i| {
+                    let field = filtered_schema.field(i);
+                    ProjectionExpr {
+                        expr: Arc::new(Column::new(field.name(), i)),
+                        alias: field.name().to_owned(),
+                    }
+                })
+                .collect();
+            Arc::new(ProjectionExec::try_new(exprs, filtered)?)
+                as Arc<dyn datafusion::physical_plan::ExecutionPlan>
+        } else {
+            filtered
+        };
+
         let hot_plan = self.hot.scan(state, projection, filters, limit).await?;
         Ok(Arc::new(UnionExec::new(vec![cold_plan, hot_plan])))
     }
