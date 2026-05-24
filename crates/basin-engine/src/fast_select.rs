@@ -1337,6 +1337,100 @@ pub(crate) async fn execute_simple_select(
         });
     }
 
+    // ── PK point-probe: bloom + zone-map file prune for `WHERE pk = <lit>` ────
+    //
+    // The dominant cost of a small-scale point lookup is opening a file body
+    // (footer fetch + row-group/page decode + per-row filter) for a key that
+    // either does not exist or lives in exactly one file.  When the WHERE
+    // clause is a *single-column primary-key equality* we can decide this from
+    // catalog metadata alone — the per-file zone-map (min/max) and the catalog
+    // bloom filter — without touching a single file body.  A definitive miss
+    // (every live file pruned) returns zero rows immediately.
+    //
+    // Gating:
+    //   * Only the exact single-PK-Eq shape (one Eq predicate on the table's
+    //     sole PK column, no other atoms, no IS NULL).  Anything richer uses
+    //     the general per-file prune below.
+    //   * Skipped on the shard path: a shard read (`handle.read`) merges its
+    //     own in-RAM tail and ignores `live_paths`, so a cold-tier-only prune
+    //     would be unsound there.
+    //   * The memtable probe above already returned for any hot-tier live row,
+    //     so reaching here means the answer (if any) is in the cold tier; the
+    //     probe therefore correctly reflects cold-tier presence.
+    //
+    // When the probe yields a candidate subset we feed those exact paths into
+    // the reader, skipping the general prune loop entirely for this shape.
+    let pk_probe_paths: Option<Vec<object_store::path::Path>> = if sess
+        .engine
+        .config()
+        .shard
+        .is_none()
+        && plan.aggregates.is_none()
+        && plan.is_null_cols.is_empty()
+        && plan.predicates.len() == 1
+        && meta.pk_columns.len() == 1
+    {
+        match &plan.predicates[0] {
+            Predicate::Eq(col, val) if col == &meta.pk_columns[0] => {
+                let live_files = meta.live_data_files();
+                match crate::index_probe::pk_point_probe(
+                    col,
+                    val,
+                    &live_files,
+                    meta.schema.as_ref(),
+                ) {
+                    crate::index_probe::PkProbeOutcome::Absent { files_pruned } => {
+                        // Definitive bloom/zone-map miss — every live file ruled
+                        // out.  Return empty without opening any file body.  We
+                        // still consult the tombstone/update overlay invariant
+                        // implicitly: a hot-tier live row would have returned in
+                        // the memtable probe above, so an empty cold tier here
+                        // means the key genuinely has no row.
+                        for _ in 0..files_pruned {
+                            sess.engine.note_bloom_skipped();
+                        }
+                        let output_schema = match &plan.projection {
+                            None => meta.schema.clone(),
+                            Some(items) => {
+                                let idxs: Result<Vec<usize>, _> = items
+                                    .iter()
+                                    .filter_map(|item| match item {
+                                        ProjectionItem::Column(c) => Some(meta.schema.index_of(c)),
+                                        _ => None,
+                                    })
+                                    .collect();
+                                match idxs {
+                                    Ok(ix) => Arc::new(
+                                        meta.schema
+                                            .project(&ix)
+                                            .unwrap_or_else(|_| meta.schema.as_ref().clone()),
+                                    ),
+                                    Err(_) => meta.schema.clone(),
+                                }
+                            }
+                        };
+                        return Ok(ExecResult::Rows {
+                            schema: output_schema,
+                            batches: vec![],
+                        });
+                    }
+                    crate::index_probe::PkProbeOutcome::Candidates {
+                        paths,
+                        files_pruned,
+                    } => {
+                        for _ in 0..files_pruned {
+                            sess.engine.note_bloom_skipped();
+                        }
+                        Some(paths)
+                    }
+                }
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     // Build the catalog-driven live file list. `live_data_files()` replays the
     // snapshot chain up to `current_snapshot`, so after a rollback it returns
     // only the pre-rollback files — physical files from post-rollback snapshots
@@ -1350,9 +1444,12 @@ pub(crate) async fn execute_simple_select(
     // heavier than a Parquet footer read, and a win for Parquet too
     // (point/range/compound/IS NULL queries touch fewer files).
     let live_files = meta.live_data_files();
-    let live_paths: Vec<object_store::path::Path> = if plan.predicates.is_empty()
-        && plan.is_null_cols.is_empty()
-    {
+    let live_paths: Vec<object_store::path::Path> = if let Some(paths) = pk_probe_paths {
+        // The PK point-probe already pruned the live set to its candidates
+        // (zone-map + catalog bloom) for the single-PK-Eq shape; reuse them
+        // directly and skip the general per-file prune loop.
+        paths
+    } else if plan.predicates.is_empty() && plan.is_null_cols.is_empty() {
         live_files
             .into_iter()
             .map(|f| object_store::path::Path::from(f.path.as_str()))

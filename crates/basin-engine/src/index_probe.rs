@@ -1469,6 +1469,122 @@ fn extract_range_literal_str(expr: &sqlparser::ast::Expr) -> Option<String> {
     }
 }
 
+// ── Phase 5.x — PK point-probe (bloom + zone-map file prune) ──────────────────
+
+/// Outcome of a single-column primary-key equality point probe against the
+/// live data-file set.
+///
+/// The probe consults two per-file artefacts that the catalog already records
+/// for every data file (Parquet *and* Vortex):
+///   * the **zone-map** (`column_stats` min/max), and
+///   * the **catalog bloom filter** (`bloom_filters`, when the PK column was
+///     bloomed at write time).
+///
+/// It never opens a file body — it works purely off the catalog metadata that
+/// `live_data_files()` returns.  The decisive answer is [`PkProbeOutcome::Absent`]:
+/// when *every* live file's zone-map or bloom proves the key cannot be present,
+/// a `WHERE pk = <lit>` lookup can return zero rows without a single file open.
+///
+/// CORRECTNESS: pruning is conservative.  A file is only dropped from the
+/// candidate set when the zone-map says `NoMatch` *or* the bloom says
+/// "definitely absent".  Any inconclusive answer keeps the file, so the probe
+/// can never hide a row that actually exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PkProbeOutcome {
+    /// Every live file was pruned — the key cannot be present in the cold tier.
+    /// The caller returns an empty result set without opening any file body.
+    /// The `usize` is the number of files that were skipped (for counters).
+    Absent { files_pruned: usize },
+    /// The key may be present in the listed files (a subset of the live set).
+    /// The caller restricts its read to exactly these paths.  `files_pruned`
+    /// counts how many live files the probe ruled out.
+    Candidates {
+        paths: Vec<object_store::path::Path>,
+        files_pruned: usize,
+    },
+}
+
+/// Probe the live data-file set for a single-column primary-key equality
+/// lookup (`WHERE pk = <scalar>`), pruning files whose zone-map or catalog
+/// bloom filter prove the key is absent.
+///
+/// `pk_eq` is the `(column, value)` pair from the recognised `Predicate::Eq`.
+/// `live_files` is the catalog's live data-file set for the table.  `schema`
+/// is the table's Arrow schema (used to decode the zone-map bytes).
+///
+/// Returns:
+///   * [`PkProbeOutcome::Absent`] when no live file can contain the key — the
+///     bloom-miss / out-of-range fast path: zero rows, zero file opens.
+///   * [`PkProbeOutcome::Candidates`] with the surviving file paths otherwise.
+///
+/// This consolidates the two per-file prune checks (zone-map via
+/// [`evaluate_compound_for_pruning`] and the catalog bloom via
+/// [`bloom_from_bytes`]) into one focused, testable point-probe so the common
+/// `WHERE pk = ?` shape gets a single, cheap metadata-only gate before any
+/// Parquet/Vortex footer is touched.
+pub(crate) fn pk_point_probe(
+    pk_col: &str,
+    pk_val: &basin_storage::ScalarValue,
+    live_files: &[basin_catalog::DataFileRef],
+    schema: &arrow_schema::Schema,
+) -> PkProbeOutcome {
+    use basin_storage::{
+        bloom_from_bytes, evaluate_compound_for_pruning, CompoundPredicate, Predicate,
+        PruneOutcome, ScalarValue,
+    };
+
+    let atom = Predicate::Eq(pk_col.to_string(), pk_val.clone());
+    let cp = CompoundPredicate::Atom(atom);
+
+    let mut paths: Vec<object_store::path::Path> = Vec::with_capacity(live_files.len());
+    let mut pruned = 0usize;
+
+    for f in live_files {
+        // 1. Zone-map (min/max) prune: a `NoMatch` proves the key falls
+        //    outside this file's recorded range for the PK column.
+        if matches!(
+            evaluate_compound_for_pruning(&cp, &f.column_stats, schema, f.row_count),
+            PruneOutcome::NoMatch
+        ) {
+            pruned += 1;
+            continue;
+        }
+
+        // 2. Catalog bloom prune: when the PK column was bloomed at write
+        //    time, a definitive "not present" lets us skip the file body.
+        //    A bloom hit (may-contain) only KEEPS the file; it never alone
+        //    decides to keep — the zone-map already passed above.
+        if let Some(bloom_bytes) = f.bloom_filters.get(pk_col) {
+            if let Some(filter) = bloom_from_bytes(bloom_bytes) {
+                let absent = match pk_val {
+                    ScalarValue::Int64(v) => !filter.contains(v.to_le_bytes().as_ref()),
+                    ScalarValue::UInt64(v) => !filter.contains(v.to_le_bytes().as_ref()),
+                    ScalarValue::Utf8(s) => !filter.contains(s.as_bytes()),
+                    // No bloom encoding defined for other types — don't prune.
+                    _ => false,
+                };
+                if absent {
+                    pruned += 1;
+                    continue;
+                }
+            }
+        }
+
+        paths.push(object_store::path::Path::from(f.path.as_str()));
+    }
+
+    if paths.is_empty() {
+        PkProbeOutcome::Absent {
+            files_pruned: pruned,
+        }
+    } else {
+        PkProbeOutcome::Candidates {
+            paths,
+            files_pruned: pruned,
+        }
+    }
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1815,6 +1931,86 @@ mod tests {
     }
 
     // ── Phase 5.19.E — posting-list maintenance tests ────────────────────────
+
+    // ── PK point-probe (zone-map + catalog bloom) unit tests ─────────────────
+
+    fn i64_stat(min: i64, max: i64) -> basin_catalog::ColumnStats {
+        basin_catalog::ColumnStats {
+            null_count: Some(0),
+            min_bytes: Some(min.to_le_bytes().to_vec()),
+            max_bytes: Some(max.to_le_bytes().to_vec()),
+            sum_bytes: None,
+        }
+    }
+
+    fn file_with_pk_range(path: &str, min: i64, max: i64) -> basin_catalog::DataFileRef {
+        let mut column_stats = std::collections::BTreeMap::new();
+        column_stats.insert("pk".to_string(), i64_stat(min, max));
+        basin_catalog::DataFileRef {
+            path: path.to_string(),
+            size_bytes: 0,
+            row_count: (max - min + 1).max(1) as u64,
+            column_stats,
+            bloom_filters: std::collections::BTreeMap::new(),
+            hll_sketches: std::collections::BTreeMap::new(),
+            tdigest_sketches: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn pk_schema() -> arrow_schema::Schema {
+        use arrow_schema::{DataType, Field};
+        arrow_schema::Schema::new(vec![Field::new("pk", DataType::Int64, false)])
+    }
+
+    #[test]
+    fn pk_probe_out_of_range_key_is_absent() {
+        // Two files covering [0,99] and [100,199]; key 500 is in neither.
+        let files = vec![
+            file_with_pk_range("f0.parquet", 0, 99),
+            file_with_pk_range("f1.parquet", 100, 199),
+        ];
+        let outcome = pk_point_probe(
+            "pk",
+            &basin_storage::ScalarValue::Int64(500),
+            &files,
+            &pk_schema(),
+        );
+        assert_eq!(outcome, PkProbeOutcome::Absent { files_pruned: 2 });
+    }
+
+    #[test]
+    fn pk_probe_in_range_key_yields_single_candidate() {
+        // Key 150 falls only inside f1's zone-map; f0 is pruned by min/max.
+        let files = vec![
+            file_with_pk_range("f0.parquet", 0, 99),
+            file_with_pk_range("f1.parquet", 100, 199),
+        ];
+        let outcome = pk_point_probe(
+            "pk",
+            &basin_storage::ScalarValue::Int64(150),
+            &files,
+            &pk_schema(),
+        );
+        match outcome {
+            PkProbeOutcome::Candidates { paths, files_pruned } => {
+                assert_eq!(files_pruned, 1, "f0 should be pruned by zone-map");
+                assert_eq!(paths.len(), 1);
+                assert_eq!(paths[0].as_ref(), "f1.parquet");
+            }
+            other => panic!("expected single candidate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pk_probe_empty_live_set_is_absent() {
+        let outcome = pk_point_probe(
+            "pk",
+            &basin_storage::ScalarValue::Int64(1),
+            &[],
+            &pk_schema(),
+        );
+        assert_eq!(outcome, PkProbeOutcome::Absent { files_pruned: 0 });
+    }
 
     #[test]
     fn rebuild_file_entries_repopulates_after_remove() {
