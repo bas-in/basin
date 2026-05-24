@@ -393,6 +393,13 @@ pub(crate) struct SimpleSelectPlan {
     /// Catalog-level pruning uses `CompoundPredicate::IsNull` to skip files
     /// where `null_count == 0` for the column.
     pub is_null_cols: Vec<String>,
+    /// `col IN (lit, lit, …)` predicates carried separately from
+    /// [`predicates`] because `Predicate` has no `In` variant and
+    /// `ReadOptions.filters` only accepts `Vec<Predicate>`.  Applied as a
+    /// post-read Arrow filter via [`CompoundPredicate::In`].  When the column
+    /// is the sole primary-key column the execution path also feeds these
+    /// values into the bloom+zone-map IN-list probe to prune cold-tier files.
+    pub in_list_preds: Vec<(String, Vec<ScalarValue>)>,
     pub limit: Option<usize>,
     /// `Some((column, ascending))` for a single-column ORDER BY recognised by
     /// the fast path. `ascending=true` means ASC (or no direction specified);
@@ -532,6 +539,7 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
         None => ParsedWhere {
             predicates: vec![],
             is_null_cols: vec![],
+            in_list_preds: vec![],
             always_false: false,
         },
         Some(expr) => parse_where(expr)?,
@@ -558,6 +566,7 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
             aggregates: Some(aggs),
             predicates: parsed_where.predicates,
             is_null_cols: parsed_where.is_null_cols,
+            in_list_preds: parsed_where.in_list_preds,
             limit: None,
             order_by: None,
             always_empty: parsed_where.always_false,
@@ -594,6 +603,7 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
         aggregates: None,
         predicates: parsed_where.predicates,
         is_null_cols: parsed_where.is_null_cols,
+        in_list_preds: parsed_where.in_list_preds,
         limit,
         order_by,
         always_empty: parsed_where.always_false,
@@ -676,12 +686,15 @@ fn parse_projection(
                 }
             }
         }
-        // Add columns referenced by WHERE predicates / IS NULL so Vortex
-        // doesn't have to decode them separately.
+        // Add columns referenced by WHERE predicates / IS NULL / IN so
+        // Vortex doesn't have to decode them separately.
         for p in &where_info.predicates {
             set.push(p.column().to_string());
         }
         for c in &where_info.is_null_cols {
+            set.push(c.clone());
+        }
+        for (c, _) in &where_info.in_list_preds {
             set.push(c.clone());
         }
         set.sort_unstable();
@@ -838,6 +851,14 @@ fn parse_single_col_agg_arg(func: &sqlparser::ast::Function) -> Option<String> {
 struct ParsedWhere {
     predicates: Vec<Predicate>,
     is_null_cols: Vec<String>,
+    /// `col IN (lit, lit, …)` atoms parsed from the WHERE clause.  These
+    /// cannot be pushed into `ReadOptions.filters` (which takes
+    /// `Vec<Predicate>` — a conjunction of atoms with no `In` variant) so
+    /// they are carried separately and applied as a post-read Arrow filter.
+    /// For a single-column PK column they also feed the bloom+zone-map
+    /// IN-list probe that prunes cold-tier files before any file body is
+    /// opened.
+    in_list_preds: Vec<(String, Vec<ScalarValue>)>,
     /// `true` when any conjunctive atom in the WHERE clause is provably
     /// always-FALSE under 3VL — currently just `<col> = NULL`, `NULL = <col>`,
     /// `<col> <> NULL`, `NULL <> <col>`. Inside an AND tree any such atom
@@ -862,6 +883,7 @@ fn parse_where(expr: &Expr) -> Option<ParsedWhere> {
     let mut out = ParsedWhere {
         predicates: Vec::new(),
         is_null_cols: Vec::new(),
+        in_list_preds: Vec::new(),
         always_false: false,
     };
     parse_where_into(expr, &mut out)?;
@@ -995,6 +1017,27 @@ fn parse_where_into(expr: &Expr, out: &mut ParsedWhere) -> Option<()> {
             out.predicates.push(p);
             return Some(());
         }
+    }
+
+    // `col IN (lit, lit, …)` — non-negated only.  All list elements must be
+    // recognisable literals; otherwise fall through to DataFusion.  An empty
+    // IN-list is 3VL-FALSE (SQL semantics: `x IN ()` is always false), so we
+    // mark the WHERE clause as always-empty.
+    if let Expr::InList {
+        expr: col_expr,
+        list,
+        negated: false,
+    } = expr
+    {
+        let col = as_identifier(col_expr)?;
+        if list.is_empty() {
+            out.always_false = true;
+            return Some(());
+        }
+        let vals: Option<Vec<ScalarValue>> = list.iter().map(literal_value).collect();
+        let vals = vals?; // any non-literal element → fall through to DataFusion
+        out.in_list_preds.push((col, vals));
+        return Some(());
     }
 
     // Single comparison atom.
@@ -1337,6 +1380,7 @@ pub(crate) async fn execute_simple_select(
     // shrinks bound the final result — this preserves the "≥ n when more
     // exist" guarantee.
     let post_read_shrinking = !plan.is_null_cols.is_empty()
+        || !plan.in_list_preds.is_empty()
         || {
             // Probe the memtable registry for any overlay activity on this
             // (project, table). Both probes are O(1) HashMap lookups; we
@@ -1573,95 +1617,144 @@ pub(crate) async fn execute_simple_select(
         });
     }
 
-    // ── PK point-probe: bloom + zone-map file prune for `WHERE pk = <lit>` ────
+    // ── PK probe: bloom + zone-map file prune for `WHERE pk = <lit>` and
+    //    `WHERE pk IN (v1, …, vN)` ──────────────────────────────────────────
     //
-    // The dominant cost of a small-scale point lookup is opening a file body
-    // (footer fetch + row-group/page decode + per-row filter) for a key that
-    // either does not exist or lives in exactly one file.  When the WHERE
-    // clause is a *single-column primary-key equality* we can decide this from
-    // catalog metadata alone — the per-file zone-map (min/max) and the catalog
-    // bloom filter — without touching a single file body.  A definitive miss
-    // (every live file pruned) returns zero rows immediately.
+    // The dominant cost of a point lookup (or a small IN-list batch fetch) is
+    // opening every live file body when most of them cannot contain any of the
+    // queried keys.  When the WHERE clause is a single-column PK equality OR a
+    // non-negated IN-list on the sole PK column we can decide which files to
+    // open using catalog metadata alone (per-file zone-map + bloom).  A
+    // definitive miss (every live file pruned) returns zero rows immediately.
     //
-    // Gating:
-    //   * Only the exact single-PK-Eq shape (one Eq predicate on the table's
-    //     sole PK column, no other atoms, no IS NULL).  Anything richer uses
-    //     the general per-file prune below.
-    //   * The memtable probe above already returned for any hot-tier live row,
-    //     so reaching here means the answer (if any) is in the cold tier; the
-    //     probe therefore correctly reflects cold-tier presence.
-    //   * Shard path: `shard.flush_to_parquet()` ran above (line 1077), so the
-    //     shard's in-RAM tail is drained to cold-tier Parquet. The engine's
-    //     `MemTableRegistry` was probed above. So both hot caches are clear of
-    //     the queried key — a cold-tier prune is sound. When the probe yields
-    //     pruned paths, the shard-branch read below detects this and reads
-    //     those paths directly via `storage.read_paths_with_schema` (bypassing
-    //     `handle.read`'s full file discovery, which would defeat the prune).
+    // Gating (both shapes):
+    //   * single-column PK (meta.pk_columns.len() == 1)
+    //   * no aggregate, no IS NULL atoms
+    //   * for Eq:     exactly one Predicate::Eq on the PK column, no IN-list
+    //   * for IN-list: exactly one in_list_preds entry on the PK column,
+    //                  no other Predicate atoms
     //
-    // When the probe yields a candidate subset we feed those exact paths into
-    // the reader, skipping the general prune loop entirely for this shape.
+    // Shard correctness: `shard.flush_to_parquet()` ran above (line ~1077) so
+    // the shard in-RAM tail is drained to cold-tier Parquet; the engine
+    // `MemTableRegistry` was probed above. Both hot caches are clear, so a
+    // cold-tier prune is sound. When the probe yields candidates the shard
+    // branch reads those paths directly via `storage.read_paths_with_schema`
+    // (bypassing `handle.read`'s full file discovery).
+    //
+    // Correctness: the probe is conservative — it returns a superset.  The
+    // per-row predicate (Eq equality or the IN post-read filter) re-checks
+    // every surviving row so no false negatives escape.
+
+    /// Build the empty-result response for a definitive all-files-pruned miss.
+    fn empty_probe_result(
+        plan: &SimpleSelectPlan,
+        meta: &TableMetadata,
+    ) -> ExecResult {
+        let output_schema = match &plan.projection {
+            None => meta.schema.clone(),
+            Some(items) => {
+                let idxs: std::result::Result<Vec<usize>, _> = items
+                    .iter()
+                    .filter_map(|item| match item {
+                        ProjectionItem::Column(c) => Some(meta.schema.index_of(c)),
+                        _ => None,
+                    })
+                    .collect();
+                match idxs {
+                    Ok(ix) => Arc::new(
+                        meta.schema
+                            .project(&ix)
+                            .unwrap_or_else(|_| meta.schema.as_ref().clone()),
+                    ),
+                    Err(_) => meta.schema.clone(),
+                }
+            }
+        };
+        ExecResult::Rows {
+            schema: output_schema,
+            batches: vec![],
+        }
+    }
+
     let pk_probe_paths: Option<Vec<object_store::path::Path>> = if
         plan.aggregates.is_none()
         && plan.is_null_cols.is_empty()
-        && plan.predicates.len() == 1
         && meta.pk_columns.len() == 1
     {
-        match &plan.predicates[0] {
-            Predicate::Eq(col, val) if col == &meta.pk_columns[0] => {
-                let live_files = meta.live_data_files();
-                match crate::index_probe::pk_point_probe(
-                    col,
-                    val,
-                    &live_files,
-                    meta.schema.as_ref(),
-                ) {
-                    crate::index_probe::PkProbeOutcome::Absent { files_pruned } => {
-                        // Definitive bloom/zone-map miss — every live file ruled
-                        // out.  Return empty without opening any file body.  We
-                        // still consult the tombstone/update overlay invariant
-                        // implicitly: a hot-tier live row would have returned in
-                        // the memtable probe above, so an empty cold tier here
-                        // means the key genuinely has no row.
-                        for _ in 0..files_pruned {
-                            sess.engine.note_bloom_skipped();
-                        }
-                        let output_schema = match &plan.projection {
-                            None => meta.schema.clone(),
-                            Some(items) => {
-                                let idxs: Result<Vec<usize>, _> = items
-                                    .iter()
-                                    .filter_map(|item| match item {
-                                        ProjectionItem::Column(c) => Some(meta.schema.index_of(c)),
-                                        _ => None,
-                                    })
-                                    .collect();
-                                match idxs {
-                                    Ok(ix) => Arc::new(
-                                        meta.schema
-                                            .project(&ix)
-                                            .unwrap_or_else(|_| meta.schema.as_ref().clone()),
-                                    ),
-                                    Err(_) => meta.schema.clone(),
-                                }
+        let pk_col = &meta.pk_columns[0];
+
+        // ── Single Eq probe (`WHERE pk = <lit>`) ────────────────────────────
+        if plan.predicates.len() == 1
+            && plan.in_list_preds.is_empty()
+        {
+            if let Predicate::Eq(col, val) = &plan.predicates[0] {
+                if col == pk_col {
+                    let live_files = meta.live_data_files();
+                    match crate::index_probe::pk_point_probe(
+                        col,
+                        val,
+                        &live_files,
+                        meta.schema.as_ref(),
+                    ) {
+                        crate::index_probe::PkProbeOutcome::Absent { files_pruned } => {
+                            for _ in 0..files_pruned {
+                                sess.engine.note_bloom_skipped();
                             }
-                        };
-                        return Ok(ExecResult::Rows {
-                            schema: output_schema,
-                            batches: vec![],
-                        });
-                    }
-                    crate::index_probe::PkProbeOutcome::Candidates {
-                        paths,
-                        files_pruned,
-                    } => {
-                        for _ in 0..files_pruned {
-                            sess.engine.note_bloom_skipped();
+                            return Ok(empty_probe_result(&plan, &meta));
                         }
-                        Some(paths)
+                        crate::index_probe::PkProbeOutcome::Candidates {
+                            paths,
+                            files_pruned,
+                        } => {
+                            for _ in 0..files_pruned {
+                                sess.engine.note_bloom_skipped();
+                            }
+                            Some(paths)
+                        }
                     }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        // ── IN-list probe (`WHERE pk IN (v1, …, vN)`) ───────────────────────
+        //
+        // Gating: exactly one IN-list predicate on the sole PK column, no
+        // other Predicate atoms.  An empty IN-list was already turned into
+        // `always_empty = true` in the parser so we cannot reach here with
+        // an empty value vector.
+        else if plan.predicates.is_empty()
+            && plan.in_list_preds.len() == 1
+            && plan.in_list_preds[0].0 == *pk_col
+        {
+            let vals = &plan.in_list_preds[0].1;
+            let live_files = meta.live_data_files();
+            match crate::index_probe::pk_point_probe_multi(
+                pk_col,
+                vals,
+                &live_files,
+                meta.schema.as_ref(),
+            ) {
+                crate::index_probe::PkProbeOutcome::Absent { files_pruned } => {
+                    for _ in 0..files_pruned {
+                        sess.engine.note_bloom_skipped();
+                    }
+                    return Ok(empty_probe_result(&plan, &meta));
+                }
+                crate::index_probe::PkProbeOutcome::Candidates {
+                    paths,
+                    files_pruned,
+                } => {
+                    for _ in 0..files_pruned {
+                        sess.engine.note_bloom_skipped();
+                    }
+                    Some(paths)
                 }
             }
-            _ => None,
+        } else {
+            None
         }
     } else {
         None
@@ -1908,6 +2001,19 @@ pub(crate) async fn execute_simple_select(
         batches
     } else {
         apply_is_null_filter(batches, &plan.is_null_cols)?
+    };
+
+    // Apply post-read IN-list filters. `ReadOptions.filters` only accepts
+    // `Vec<Predicate>` (no `In` variant), so IN predicates are applied here
+    // as a row-level Arrow filter using `CompoundPredicate::In`.  The PK
+    // bloom+zone-map probe above (when fired) already narrowed the file set
+    // so most surviving rows DO match — this filter is the correctness check
+    // for the probe's conservative superset (and handles non-PK IN-list cases
+    // that did not benefit from the probe).
+    let batches = if plan.in_list_preds.is_empty() {
+        batches
+    } else {
+        apply_in_list_filter(batches, &plan.in_list_preds)?
     };
 
     // If this is an aggregate query, compute the aggregate functions over the
@@ -2477,6 +2583,57 @@ fn apply_is_null_filter(
     Ok(out)
 }
 
+/// Apply one or more `col IN (lits)` filters to `batches`.  Each entry in
+/// `in_list_preds` is a `(column_name, values)` pair; a row survives when
+/// ALL listed IN-predicates match (AND semantics over the predicates, OR
+/// semantics within each value list).
+///
+/// Uses [`basin_storage::evaluate_compound`] with [`CompoundPredicate::In`]
+/// so the filter is bit-exact with the storage-layer IN semantics.  This is
+/// the correctness re-check for the bloom+zone-map IN-list probe (which is
+/// conservative) and the sole filter for non-PK IN columns.
+///
+/// NULL mask entries (rows where the column is NULL) are treated as
+/// non-matching — consistent with SQL three-valued-logic WHERE semantics.
+/// `filter_record_batch` already skips NULL/false mask entries, so no
+/// explicit null-to-false conversion is needed.
+fn apply_in_list_filter(
+    batches: Vec<RecordBatch>,
+    in_list_preds: &[(String, Vec<ScalarValue>)],
+) -> Result<Vec<RecordBatch>> {
+    use arrow_select::filter::filter_record_batch;
+    use basin_storage::{evaluate_compound, CompoundPredicate as CP};
+
+    let mut out = Vec::with_capacity(batches.len());
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        // Build one CompoundPredicate::In per entry, then AND them together.
+        let mut mask: Option<arrow_array::BooleanArray> = None;
+        for (col, vals) in in_list_preds {
+            let pred = CP::In(col.clone(), vals.clone());
+            let col_mask = evaluate_compound(&batch, &pred)
+                .map_err(|e| BasinError::internal(format!("in_list filter eval: {e}")))?;
+            mask = Some(match mask {
+                None => col_mask,
+                Some(prev) => arrow::compute::and_kleene(&prev, &col_mask)
+                    .map_err(|e| BasinError::internal(format!("in_list and: {e}")))?,
+            });
+        }
+        if let Some(m) = mask {
+            let filtered = filter_record_batch(&batch, &m)
+                .map_err(|e| BasinError::internal(format!("in_list filter_batch: {e}")))?;
+            if filtered.num_rows() > 0 {
+                out.push(filtered);
+            }
+        } else {
+            out.push(batch);
+        }
+    }
+    Ok(out)
+}
+
 /// Truncate the merged batches to at most `limit` rows total. Empty batches
 /// are dropped so the caller doesn't see zero-row trailers.
 fn apply_limit(batches: Vec<RecordBatch>, limit: usize) -> Vec<RecordBatch> {
@@ -2916,6 +3073,76 @@ mod tests {
     fn rejects_expression_in_projection() {
         let stmt = parse_one("SELECT id + 1 FROM t");
         assert!(match_simple_select(&stmt).is_none());
+    }
+
+    // ── IN-list recogniser tests ──────────────────────────────────────────────
+
+    #[test]
+    fn matches_in_list_of_int_literals() {
+        let stmt = parse_one("SELECT * FROM t WHERE id IN (1, 2, 3)");
+        let plan = match_simple_select(&stmt).expect("in-list should match fast path");
+        assert!(plan.predicates.is_empty(), "no Predicate atoms for IN-list");
+        assert_eq!(plan.in_list_preds.len(), 1);
+        let (col, vals) = &plan.in_list_preds[0];
+        assert_eq!(col, "id");
+        assert_eq!(
+            vals,
+            &[
+                ScalarValue::Int64(1),
+                ScalarValue::Int64(2),
+                ScalarValue::Int64(3)
+            ]
+        );
+    }
+
+    #[test]
+    fn matches_in_list_of_string_literals() {
+        let stmt = parse_one("SELECT * FROM t WHERE name IN ('alice', 'bob')");
+        let plan = match_simple_select(&stmt).expect("string in-list should match fast path");
+        assert_eq!(plan.in_list_preds.len(), 1);
+        let (col, vals) = &plan.in_list_preds[0];
+        assert_eq!(col, "name");
+        assert_eq!(
+            vals,
+            &[ScalarValue::Utf8("alice".to_string()), ScalarValue::Utf8("bob".to_string())]
+        );
+    }
+
+    #[test]
+    fn empty_in_list_is_always_empty() {
+        // SQL semantics: `x IN ()` is always false → always_empty = true.
+        // sqlparser rejects `IN ()` (empty list is a syntax error in the
+        // PostgreSQL dialect), so this test exercises our fallback behaviour
+        // by constructing the AST node directly, bypassing the SQL text parser.
+        let col_expr = Box::new(Expr::Identifier(sqlparser::ast::Ident::new("id")));
+        let empty_in = Expr::InList {
+            expr: col_expr,
+            list: vec![],
+            negated: false,
+        };
+        let result = parse_where(&empty_in);
+        let pw = result.expect("empty IN-list should produce a ParsedWhere");
+        assert!(pw.always_false, "empty IN-list must mark always_false");
+    }
+
+    #[test]
+    fn negated_in_list_falls_through_to_datafusion() {
+        // NOT IN is not handled by the fast path.
+        let stmt = parse_one("SELECT * FROM t WHERE id NOT IN (1, 2, 3)");
+        assert!(
+            match_simple_select(&stmt).is_none(),
+            "NOT IN should fall through to DataFusion"
+        );
+    }
+
+    #[test]
+    fn in_list_with_non_literal_element_falls_through() {
+        // A subquery or column reference in the list is not a literal.
+        let stmt = parse_one("SELECT * FROM t WHERE id IN (1, id)");
+        assert!(
+            match_simple_select(&stmt).is_none(),
+            "non-literal IN element should fall through to DataFusion"
+        );
     }
 
     /// Timing micro-bench: measures median latency of the fast-path SELECT

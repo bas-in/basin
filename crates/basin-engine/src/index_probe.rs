@@ -1585,6 +1585,105 @@ pub(crate) fn pk_point_probe(
     }
 }
 
+/// Probe the live data-file set for a multi-value IN-list on a single-column
+/// primary key (`WHERE pk IN (v1, v2, …, vN)`).
+///
+/// This is the IN-list generalisation of [`pk_point_probe`]: for each live
+/// file we ask whether ANY of the `pk_vals` could be present (zone-map OR of
+/// Eq atoms, plus bloom OR across every value).  Files where no value can
+/// possibly be present are pruned; the remaining candidate set is the UNION
+/// of all per-value surviving files — a conservative superset.
+///
+/// The per-row IN predicate is always re-applied after the read so false
+/// positives from bloom or zone-map approximation are harmless.
+///
+/// Returns [`PkProbeOutcome::Absent`] when every live file was pruned (all
+/// values definitively absent), or [`PkProbeOutcome::Candidates`] with the
+/// surviving file paths otherwise.
+pub(crate) fn pk_point_probe_multi(
+    pk_col: &str,
+    pk_vals: &[basin_storage::ScalarValue],
+    live_files: &[basin_catalog::DataFileRef],
+    schema: &arrow_schema::Schema,
+) -> PkProbeOutcome {
+    use basin_storage::{
+        bloom_from_bytes, evaluate_compound_for_pruning, CompoundPredicate, Predicate,
+        PruneOutcome, ScalarValue,
+    };
+
+    if pk_vals.is_empty() {
+        // Empty IN-list is always false — no files needed.
+        return PkProbeOutcome::Absent {
+            files_pruned: live_files.len(),
+        };
+    }
+
+    // Build the OR-of-Eq compound predicate for zone-map pruning once.
+    let or_pred: CompoundPredicate = {
+        let alts: Vec<CompoundPredicate> = pk_vals
+            .iter()
+            .map(|v| {
+                CompoundPredicate::Atom(Predicate::Eq(pk_col.to_string(), v.clone()))
+            })
+            .collect();
+        if alts.len() == 1 {
+            alts.into_iter().next().unwrap()
+        } else {
+            CompoundPredicate::Or(alts)
+        }
+    };
+
+    let mut paths: Vec<object_store::path::Path> = Vec::with_capacity(live_files.len());
+    let mut pruned = 0usize;
+
+    'file: for f in live_files {
+        // 1. Zone-map (min/max) prune: if no value in the list falls within
+        //    this file's recorded [min, max] range for the PK column, the
+        //    whole file can be skipped.  Uses the existing OR-of-Eq prune
+        //    logic already present in `evaluate_compound_for_pruning`.
+        if matches!(
+            evaluate_compound_for_pruning(&or_pred, &f.column_stats, schema, f.row_count),
+            PruneOutcome::NoMatch
+        ) {
+            pruned += 1;
+            continue;
+        }
+
+        // 2. Bloom prune: if the file carries a bloom for the PK column,
+        //    check all values in the IN-list.  If EVERY value is definitively
+        //    absent (bloom says "no") the file can be skipped.  If ANY value
+        //    might be present (bloom says "maybe") the file is a candidate.
+        if let Some(bloom_bytes) = f.bloom_filters.get(pk_col) {
+            if let Some(filter) = bloom_from_bytes(bloom_bytes) {
+                let all_absent = pk_vals.iter().all(|v| match v {
+                    ScalarValue::Int64(n) => !filter.contains(n.to_le_bytes().as_ref()),
+                    ScalarValue::UInt64(n) => !filter.contains(n.to_le_bytes().as_ref()),
+                    ScalarValue::Utf8(s) => !filter.contains(s.as_bytes()),
+                    // No bloom encoding for other types — treat as "maybe".
+                    _ => false,
+                });
+                if all_absent {
+                    pruned += 1;
+                    continue 'file;
+                }
+            }
+        }
+
+        paths.push(object_store::path::Path::from(f.path.as_str()));
+    }
+
+    if paths.is_empty() {
+        PkProbeOutcome::Absent {
+            files_pruned: pruned,
+        }
+    } else {
+        PkProbeOutcome::Candidates {
+            paths,
+            files_pruned: pruned,
+        }
+    }
+}
+
 // ── Capability 1 — C2 row-group GIN prune for JSONB `@>` ──────────────────────
 //
 // The engine's existing `@>` probe (`GinIndexRegistry::probe_containment`) is
@@ -2353,6 +2452,80 @@ mod tests {
             &pk_schema(),
         );
         assert_eq!(outcome, PkProbeOutcome::Absent { files_pruned: 0 });
+    }
+
+    // ── pk_point_probe_multi unit tests ──────────────────────────────────────
+
+    #[test]
+    fn pk_probe_multi_all_out_of_range_is_absent() {
+        // Three files: [0,99], [100,199], [200,299].  All values in the
+        // IN-list (500, 600) are outside every range → all pruned.
+        let files = vec![
+            file_with_pk_range("f0.parquet", 0, 99),
+            file_with_pk_range("f1.parquet", 100, 199),
+            file_with_pk_range("f2.parquet", 200, 299),
+        ];
+        let vals = vec![
+            basin_storage::ScalarValue::Int64(500),
+            basin_storage::ScalarValue::Int64(600),
+        ];
+        let outcome = pk_point_probe_multi("pk", &vals, &files, &pk_schema());
+        assert_eq!(outcome, PkProbeOutcome::Absent { files_pruned: 3 });
+    }
+
+    #[test]
+    fn pk_probe_multi_spans_two_files() {
+        // Values 50 (in f0) and 150 (in f1) — f2 should be pruned.
+        let files = vec![
+            file_with_pk_range("f0.parquet", 0, 99),
+            file_with_pk_range("f1.parquet", 100, 199),
+            file_with_pk_range("f2.parquet", 200, 299),
+        ];
+        let vals = vec![
+            basin_storage::ScalarValue::Int64(50),
+            basin_storage::ScalarValue::Int64(150),
+        ];
+        let outcome = pk_point_probe_multi("pk", &vals, &files, &pk_schema());
+        match outcome {
+            PkProbeOutcome::Candidates { paths, files_pruned } => {
+                assert_eq!(files_pruned, 1, "f2 should be pruned by zone-map");
+                let path_strs: Vec<&str> = paths.iter().map(|p| p.as_ref()).collect();
+                assert!(path_strs.contains(&"f0.parquet"), "f0 must be a candidate");
+                assert!(path_strs.contains(&"f1.parquet"), "f1 must be a candidate");
+                assert!(!path_strs.contains(&"f2.parquet"), "f2 must be pruned");
+            }
+            other => panic!("expected Candidates, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pk_probe_multi_empty_vals_is_absent() {
+        // Empty IN-list: SQL semantics → always false, prune all files.
+        let files = vec![
+            file_with_pk_range("f0.parquet", 0, 99),
+            file_with_pk_range("f1.parquet", 100, 199),
+        ];
+        let outcome = pk_point_probe_multi("pk", &[], &files, &pk_schema());
+        assert_eq!(outcome, PkProbeOutcome::Absent { files_pruned: 2 });
+    }
+
+    #[test]
+    fn pk_probe_multi_single_val_matches_single_file() {
+        // One value that fits only in f1 — behaves identically to pk_point_probe.
+        let files = vec![
+            file_with_pk_range("f0.parquet", 0, 99),
+            file_with_pk_range("f1.parquet", 100, 199),
+        ];
+        let vals = vec![basin_storage::ScalarValue::Int64(150)];
+        let outcome = pk_point_probe_multi("pk", &vals, &files, &pk_schema());
+        match outcome {
+            PkProbeOutcome::Candidates { paths, files_pruned } => {
+                assert_eq!(files_pruned, 1, "f0 should be pruned");
+                assert_eq!(paths.len(), 1);
+                assert_eq!(paths[0].as_ref(), "f1.parquet");
+            }
+            other => panic!("expected Candidates for single-val probe, got {other:?}"),
+        }
     }
 
     #[test]
