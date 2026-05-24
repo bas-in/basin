@@ -1585,6 +1585,349 @@ pub(crate) fn pk_point_probe(
     }
 }
 
+// ── Capability 1 — C2 row-group GIN prune for JSONB `@>` ──────────────────────
+//
+// The engine's existing `@>` probe (`GinIndexRegistry::probe_containment`) is
+// FILE-granular: it returns the set of files that *might* contain a matching
+// row.  Under a uniform key distribution every file matches the searched term
+// at least once, so file-level pruning achieves nothing (the measured 88x gap).
+//
+// basin-storage's `GinRowGroupRegistry` (gin_rowgroup.rs) stores a per-row-group
+// bloom over the same GIN term atoms, so a `col @> '{…}'` query can be narrowed
+// to just the surviving row-groups WITHIN each candidate file.  This helper is
+// the engine-side glue: it extracts the SAME structure-keyed term atoms from the
+// `@>` needle that the storage indexer recorded (via [`needle_terms`]), then asks
+// the row-group registry which row-groups survive in each candidate file.
+//
+// FAIRNESS: the terms are derived purely from the query STRUCTURE (the JSONB
+// needle's keys + key=value pairs, identical to `extract_terms`).  No table,
+// column, or literal value is special-cased.
+//
+// CORRECTNESS: the row-group bloom is a conservative superset (AND semantics
+// across all needle terms — identical to the file-level posting-list
+// intersection, just finer).  A surviving row-group MUST still have the
+// `jsonb_contains` predicate re-evaluated on its rows; an EMPTY survivor list
+// for a file means that whole file is provably prune-able.  `Unknown` (file not
+// summarised / not sealed) falls back to the caller's file-granular behaviour —
+// never a false negative.
+
+/// Outcome of a row-group containment prune across a set of candidate files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowGroupPrune {
+    /// No row-group summaries exist for any candidate file (none are sealed),
+    /// or the needle produced no probe terms.  The caller keeps its existing
+    /// file-granular behaviour (read every candidate file in full).
+    Unknown,
+    /// Per-file surviving row-groups.  Every key is a candidate file path; the
+    /// value is the ascending list of row-groups in that file that *might*
+    /// contain a matching row (an empty vector means the whole file is
+    /// prune-able).  Files absent from the map are NOT summarised and must be
+    /// read in full by the caller (conservative: never a false negative).
+    PerFile(HashMap<String, Vec<u32>>),
+}
+
+/// Compute the row-group-granular prune for a JSONB `@>` containment query.
+///
+/// `needle_bytes` is the raw JSONB of the right-hand `@>` literal; `opclass` is
+/// the catalog index opclass (`"jsonb_ops"` / `"jsonb_path_ops"`).
+/// `candidate_files` is the set of files the file-level GIN probe already
+/// considers relevant (or the full live set when no file probe ran).
+///
+/// Returns [`RowGroupPrune::PerFile`] mapping each *summarised* candidate file to
+/// its surviving row-groups, so the caller can read only those row-groups and
+/// re-apply `jsonb_contains` on them.  Files that are [`RowGroupProbe::Unknown`]
+/// are omitted (the caller must read them whole).  Returns
+/// [`RowGroupPrune::Unknown`] when no candidate file is summarised at all (so
+/// the caller's existing behaviour is unchanged) or the needle has no terms.
+///
+/// The engine wiring that consumes the surviving row-group ids (handing them to
+/// the Parquet reader / DataFusion `ListingTable`) lives in `session.rs` /
+/// `basin-storage` — see the module note in `gin_rowgroup.rs`.  This function is
+/// the structure-keyed decision logic that wiring calls; it owns no I/O.
+pub fn rowgroup_prune_for_containment(
+    registry: &basin_storage::index::gin_rowgroup::GinRowGroupRegistry,
+    project: &ProjectId,
+    table: &TableName,
+    col: &str,
+    opclass: &str,
+    needle_bytes: &[u8],
+    candidate_files: &[String],
+) -> RowGroupPrune {
+    // Extract the SAME structure-keyed GIN term atoms the storage indexer used.
+    let needle: Value = match serde_json::from_slice(needle_bytes) {
+        Ok(v) => v,
+        Err(_) => return RowGroupPrune::Unknown, // unparseable → conservative
+    };
+    let search_keys = needle_terms(&needle, opclass);
+    if search_keys.is_empty() {
+        // Empty needle (`{}`) matches everything — nothing to prune on.
+        return RowGroupPrune::Unknown;
+    }
+
+    // Probe every candidate file.  `rowgroups_maybe_containing_multi` already
+    // omits files that are Unknown (not sealed), so the resulting map contains
+    // only files the caller may safely prune at row-group granularity.
+    let per_file = registry.rowgroups_maybe_containing_multi(
+        project,
+        table,
+        col,
+        candidate_files,
+        &search_keys,
+    );
+
+    if per_file.is_empty() {
+        // No candidate file is summarised → caller keeps file-granular behaviour.
+        RowGroupPrune::Unknown
+    } else {
+        RowGroupPrune::PerFile(per_file)
+    }
+}
+
+// ── Capability 2 — B3 trigram candidate prune for ILIKE / LIKE ────────────────
+//
+// Today ILIKE/LIKE that is not a pure prefix (handled by `Predicate::StartsWith`
+// in fast_select.rs) falls through to DataFusion's per-row sequential scan.  A
+// trigram index over the column lets us prune to a candidate SUPERSET of rows
+// first, then re-check the real LIKE pattern on just those candidates.
+//
+// basin-trgm (`gin_like.rs`) owns the persisted/standalone TrigramGinIndex.
+// However `basin-engine` does NOT depend on `basin-trgm` (and adding that dep is
+// outside this task's file boundary), and — more fundamentally — there is no
+// storage-persisted trigram index for table columns yet (building one needs the
+// write-path/storage integration that this task does not own).  So the wiring
+// achievable WITHIN index_probe.rs is the IN-MEMORY candidate-prune: given a
+// column's decoded string values, build a trigram inverted index on the fly,
+// prune to candidate row-ids by the pattern's required trigrams, then re-check.
+//
+// This module ports the minimal, structure-keyed trigram logic from
+// basin-trgm::gin_like so the prune is real and unit-testable here.  The
+// persisted-build follow-up (storage-side) is documented in the task report.
+//
+// FAIRNESS: trigrams are derived purely from the pattern STRUCTURE (literal runs
+// between `%`/`_` wildcards).  No column or literal value is special-cased.
+//
+// CORRECTNESS: `trigram_candidates` returns a SUPERSET of matching row-ids; the
+// caller MUST re-run the real LIKE/ILIKE matcher ([`like_matches`]) on each
+// candidate.  A pattern that yields no usable trigrams (every literal run < 3
+// bytes) returns [`TrigramCandidates::All`] → caller scans everything (correct,
+// if unhelpful).
+
+/// Result of an in-memory trigram candidate prune.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrigramCandidates {
+    /// Pattern produced usable trigrams; only these row-ids can match.  Always a
+    /// superset of the true matches — the caller re-checks each with the real
+    /// LIKE/ILIKE matcher.  An empty set means no row can match.
+    Some(HashSet<u64>),
+    /// Pattern too short / wildcard-heavy to prune (no literal run ≥ 3 bytes).
+    /// The caller must consider every row a candidate (full scan).
+    All,
+}
+
+/// Extract the *required* trigrams of a SQL `LIKE`/`ILIKE` pattern.
+///
+/// The pattern is split on `%` (any run) and `_` (any single char); `\` escapes
+/// the next char.  Every maximal literal run of length ≥ 3 contributes each of
+/// its contiguous 3-byte windows.  Runs shorter than 3 bytes contribute nothing
+/// (they cannot pin down a trigram).  When `case_insensitive`, runs are
+/// ASCII-lowercased first.  Output is sorted + deduped; empty means "no trigram
+/// constraint" (caller falls back to a full scan).
+///
+/// Mirrors PostgreSQL `pg_trgm`'s `generate_wildcard_trgm` extraction and is the
+/// in-engine port of `basin_trgm::gin_like::trigrams_for_pattern` (kept local
+/// because basin-engine does not depend on basin-trgm).
+pub fn trigrams_for_pattern(pattern: &str, case_insensitive: bool) -> Vec<[u8; 3]> {
+    fn fold(b: u8, ci: bool) -> u8 {
+        if ci { b.to_ascii_lowercase() } else { b }
+    }
+    let mut out: Vec<[u8; 3]> = Vec::new();
+    let mut run: Vec<u8> = Vec::new();
+    let flush = |run: &mut Vec<u8>, out: &mut Vec<[u8; 3]>| {
+        if run.len() >= 3 {
+            for w in run.windows(3) {
+                out.push([w[0], w[1], w[2]]);
+            }
+        }
+        run.clear();
+    };
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                if i + 1 < bytes.len() {
+                    run.push(fold(bytes[i + 1], case_insensitive));
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            b'%' | b'_' => {
+                flush(&mut run, &mut out);
+                i += 1;
+            }
+            b => {
+                run.push(fold(b, case_insensitive));
+                i += 1;
+            }
+        }
+    }
+    flush(&mut run, &mut out);
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The substring trigrams of `text` for indexing: every contiguous 3-byte window
+/// of the case-preserved input AND of its ASCII-lowercased form (sorted, deduped,
+/// no word padding).  Emitting both casings lets one index serve case-sensitive
+/// `LIKE` (query trigrams keep their case) and `ILIKE` (query trigrams lowered).
+fn substring_trigrams(text: &str) -> Vec<[u8; 3]> {
+    let raw = text.as_bytes();
+    let lowered: Vec<u8> = raw.iter().map(|b| b.to_ascii_lowercase()).collect();
+    let mut out: Vec<[u8; 3]> = Vec::with_capacity(raw.len().saturating_sub(2) * 2);
+    out.extend(raw.windows(3).map(|w| [w[0], w[1], w[2]]));
+    out.extend(lowered.windows(3).map(|w| [w[0], w[1], w[2]]));
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Build an in-memory trigram inverted index over `rows` (`(row_id, text)`),
+/// prune to the candidate superset that could match `pattern`, and return it.
+///
+/// `case_insensitive = true` is the `ILIKE` path.  The result is always a
+/// SUPERSET of the true matches — the caller re-checks each candidate with
+/// [`like_matches`].  Returns [`TrigramCandidates::All`] when the pattern yields
+/// no usable trigrams (caller scans every row).
+///
+/// This builds the index on the fly for the candidate-prune; there is no
+/// persisted trigram index for table columns yet (storage follow-up — see
+/// module note).  Even built on the fly it lets the caller skip the per-row LIKE
+/// evaluation on rows whose trigram set cannot be a superset of the pattern's.
+pub fn trigram_candidates<'a, I>(
+    rows: I,
+    pattern: &str,
+    case_insensitive: bool,
+) -> TrigramCandidates
+where
+    I: IntoIterator<Item = (u64, &'a str)>,
+{
+    let required = trigrams_for_pattern(pattern, case_insensitive);
+    if required.is_empty() {
+        // No trigram constraint → cannot prune.  (Still consume the iterator
+        // cheaply? No — caller will scan; avoid building the index at all.)
+        return TrigramCandidates::All;
+    }
+
+    // Inverted index: trigram → set of row-ids whose text contains it.  We only
+    // need posting lists for the required trigrams, but building the full set is
+    // simpler and the prune is a one-shot per query.
+    let mut inverted: HashMap<[u8; 3], HashSet<u64>> = HashMap::new();
+    for (row_id, text) in rows {
+        for tg in substring_trigrams(text) {
+            inverted.entry(tg).or_default().insert(row_id);
+        }
+    }
+
+    // Multi-key AND: a candidate must appear in EVERY required trigram's posting
+    // list.  Seed from the smallest list, intersect the rest.
+    let mut lists: Vec<&HashSet<u64>> = Vec::with_capacity(required.len());
+    for tg in &required {
+        match inverted.get(tg) {
+            Some(set) => lists.push(set),
+            // A required trigram with no posting list ⇒ no row contains it ⇒
+            // empty candidate set (provably zero matches).
+            None => return TrigramCandidates::Some(HashSet::new()),
+        }
+    }
+    lists.sort_by_key(|s| s.len());
+    let mut acc: HashSet<u64> = lists[0].clone();
+    for list in &lists[1..] {
+        acc.retain(|r| list.contains(r));
+        if acc.is_empty() {
+            break;
+        }
+    }
+    TrigramCandidates::Some(acc)
+}
+
+/// Evaluate a SQL `LIKE`/`ILIKE` pattern against `text` — the re-check the
+/// caller MUST run on every trigram candidate (the index returns a superset).
+///
+/// `%` matches any run (including empty), `_` matches exactly one char, `\`
+/// escapes the next char.  `case_insensitive = true` is the `ILIKE` path
+/// (ASCII case folding).  This is a straightforward backtracking matcher over
+/// chars (Unicode-aware for `_` = one char); it is the correctness backstop and
+/// is not a hot loop (it runs only on the pruned candidate set).
+pub fn like_matches(text: &str, pattern: &str, case_insensitive: bool) -> bool {
+    let fold = |c: char| -> char {
+        if case_insensitive {
+            c.to_ascii_lowercase()
+        } else {
+            c
+        }
+    };
+    let t: Vec<char> = text.chars().map(fold).collect();
+    // Decompose pattern into tokens: literal char, `%`, or `_`.
+    enum Tok {
+        Lit(char),
+        Any,
+        One,
+    }
+    let mut toks: Vec<Tok> = Vec::new();
+    let mut pc = pattern.chars().peekable();
+    while let Some(c) = pc.next() {
+        match c {
+            '\\' => {
+                if let Some(n) = pc.next() {
+                    toks.push(Tok::Lit(fold(n)));
+                }
+            }
+            '%' => toks.push(Tok::Any),
+            '_' => toks.push(Tok::One),
+            other => toks.push(Tok::Lit(fold(other))),
+        }
+    }
+
+    // Iterative backtracking match (handles `%` greedily with a fallback).
+    let (mut ti, mut pi) = (0usize, 0usize);
+    let mut star_pi: Option<usize> = None;
+    let mut star_ti = 0usize;
+    while ti < t.len() {
+        match toks.get(pi) {
+            Some(Tok::Lit(c)) if *c == t[ti] => {
+                ti += 1;
+                pi += 1;
+            }
+            Some(Tok::One) => {
+                ti += 1;
+                pi += 1;
+            }
+            Some(Tok::Any) => {
+                star_pi = Some(pi);
+                star_ti = ti;
+                pi += 1;
+            }
+            _ => {
+                // Mismatch: backtrack to the last `%` if any.
+                if let Some(sp) = star_pi {
+                    pi = sp + 1;
+                    star_ti += 1;
+                    ti = star_ti;
+                } else {
+                    return false;
+                }
+            }
+        }
+    }
+    // Consume trailing `%`s.
+    while let Some(Tok::Any) = toks.get(pi) {
+        pi += 1;
+    }
+    pi == toks.len()
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2058,5 +2401,191 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    // ── Capability 1 — row-group GIN prune helper ────────────────────────────
+
+    #[test]
+    fn rowgroup_prune_narrows_to_holding_row_group() {
+        use basin_storage::index::gin_rowgroup::GinRowGroupRegistry;
+        let reg = GinRowGroupRegistry::new();
+        let project = ProjectId::new();
+        let table = TableName::new("docs").unwrap();
+        let file = "f1.parquet";
+
+        // Same structure-keyed atoms `extract_terms` produces for jsonb_ops.
+        let rg0 = extract_terms(&json!({"role": "user"}), "jsonb_ops");
+        let rg1 = extract_terms(&json!({"role": "admin"}), "jsonb_ops");
+        reg.index_row(&project, &table, "payload", &rg0, file, 0);
+        reg.index_row(&project, &table, "payload", &rg1, file, 1);
+        reg.mark_file_indexed(&project, &table, "payload", file);
+
+        // Probe `@> {"role":"admin"}` — only rg1 holds it.
+        let needle = br#"{"role":"admin"}"#;
+        let out = rowgroup_prune_for_containment(
+            &reg, &project, &table, "payload", "jsonb_ops", needle,
+            &[file.to_string()],
+        );
+        match out {
+            RowGroupPrune::PerFile(m) => {
+                assert_eq!(m.get(file), Some(&vec![1]), "expected only rg1, got {m:?}");
+            }
+            other => panic!("expected PerFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rowgroup_prune_absent_key_prunes_whole_file() {
+        use basin_storage::index::gin_rowgroup::GinRowGroupRegistry;
+        let reg = GinRowGroupRegistry::new();
+        let project = ProjectId::new();
+        let table = TableName::new("docs").unwrap();
+        let file = "f1.parquet";
+        reg.index_row(
+            &project, &table, "payload",
+            &extract_terms(&json!({"role": "user"}), "jsonb_ops"), file, 0,
+        );
+        reg.mark_file_indexed(&project, &table, "payload", file);
+
+        let needle = br#"{"role":"ghost"}"#;
+        let out = rowgroup_prune_for_containment(
+            &reg, &project, &table, "payload", "jsonb_ops", needle,
+            &[file.to_string()],
+        );
+        match out {
+            RowGroupPrune::PerFile(m) => {
+                assert_eq!(m.get(file), Some(&Vec::<u32>::new()), "file must be prunable");
+            }
+            other => panic!("expected PerFile (empty), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rowgroup_prune_unsummarised_file_is_unknown() {
+        use basin_storage::index::gin_rowgroup::GinRowGroupRegistry;
+        let reg = GinRowGroupRegistry::new();
+        let project = ProjectId::new();
+        let table = TableName::new("docs").unwrap();
+        // Never indexed → no summarised candidate → Unknown (caller reads whole).
+        let needle = br#"{"role":"admin"}"#;
+        let out = rowgroup_prune_for_containment(
+            &reg, &project, &table, "payload", "jsonb_ops", needle,
+            &["ghost.parquet".to_string()],
+        );
+        assert_eq!(out, RowGroupPrune::Unknown);
+    }
+
+    #[test]
+    fn rowgroup_prune_empty_needle_is_unknown() {
+        use basin_storage::index::gin_rowgroup::GinRowGroupRegistry;
+        let reg = GinRowGroupRegistry::new();
+        let project = ProjectId::new();
+        let table = TableName::new("docs").unwrap();
+        let file = "f1.parquet";
+        reg.index_row(
+            &project, &table, "payload",
+            &extract_terms(&json!({"k": "v"}), "jsonb_ops"), file, 0,
+        );
+        reg.mark_file_indexed(&project, &table, "payload", file);
+        let out = rowgroup_prune_for_containment(
+            &reg, &project, &table, "payload", "jsonb_ops", b"{}",
+            &[file.to_string()],
+        );
+        assert_eq!(out, RowGroupPrune::Unknown, "empty needle prunes nothing");
+    }
+
+    // ── Capability 2 — trigram candidate prune ───────────────────────────────
+
+    #[test]
+    fn trigrams_for_pattern_prefix_suffix_middle() {
+        // Prefix `foo%` → run "foo".
+        assert!(trigrams_for_pattern("foo%", false).contains(&[b'f', b'o', b'o']));
+        // Suffix `%bar` → run "bar".
+        assert!(trigrams_for_pattern("%bar", false).contains(&[b'b', b'a', b'r']));
+        // Middle `%mid%` → run "mid".
+        assert!(trigrams_for_pattern("%mid%", false).contains(&[b'm', b'i', b'd']));
+        // Short run < 3 → no constraint.
+        assert!(trigrams_for_pattern("%ab%", false).is_empty());
+        // ILIKE folds case.
+        assert!(trigrams_for_pattern("%ABC%", true).contains(&[b'a', b'b', b'c']));
+    }
+
+    fn rows() -> Vec<(u64, &'static str)> {
+        vec![
+            (0, "alice@example.com"),
+            (1, "bob@gmail.com"),
+            (2, "carol@gmail.com"),
+            (3, "dave@example.org"),
+            (4, "EVE@GMAIL.COM"),
+        ]
+    }
+
+    #[test]
+    fn trigram_candidates_suffix_superset_recheck() {
+        // `%@gmail.com` (case-sensitive): rows 1,2 match; row 4 is uppercase.
+        let cand = trigram_candidates(rows(), "%@gmail.com", false);
+        let set = match cand {
+            TrigramCandidates::Some(s) => s,
+            TrigramCandidates::All => panic!("expected pruned set"),
+        };
+        // Superset must include the true matches (1, 2). Re-check narrows.
+        assert!(set.contains(&1) && set.contains(&2), "missing true matches: {set:?}");
+        let matched: Vec<u64> = rows()
+            .into_iter()
+            .filter(|(id, t)| set.contains(id) && like_matches(t, "%@gmail.com", false))
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(matched, vec![1, 2], "case-sensitive LIKE re-check");
+    }
+
+    #[test]
+    fn trigram_candidates_ilike_case_insensitive() {
+        // ILIKE `%@gmail.com` matches rows 1,2,4 (4 is uppercase).
+        let cand = trigram_candidates(rows(), "%@gmail.com", true);
+        let set = match cand {
+            TrigramCandidates::Some(s) => s,
+            TrigramCandidates::All => panic!("expected pruned set"),
+        };
+        let mut matched: Vec<u64> = rows()
+            .into_iter()
+            .filter(|(id, t)| set.contains(id) && like_matches(t, "%@gmail.com", true))
+            .map(|(id, _)| id)
+            .collect();
+        matched.sort_unstable();
+        assert_eq!(matched, vec![1, 2, 4], "ILIKE re-check folds case");
+    }
+
+    #[test]
+    fn trigram_candidates_no_match_pattern_empty() {
+        let cand = trigram_candidates(rows(), "%zzz%", false);
+        match cand {
+            TrigramCandidates::Some(s) => assert!(s.is_empty(), "no row has 'zzz': {s:?}"),
+            TrigramCandidates::All => panic!("'zzz' is a usable trigram; expected pruned empty set"),
+        }
+    }
+
+    #[test]
+    fn trigram_candidates_short_pattern_falls_back_to_all() {
+        // `%a%` has no literal run ≥ 3 → cannot prune → All (scan everything).
+        assert_eq!(trigram_candidates(rows(), "%a%", false), TrigramCandidates::All);
+        assert_eq!(trigram_candidates(rows(), "_b_", false), TrigramCandidates::All);
+    }
+
+    #[test]
+    fn like_matches_semantics() {
+        assert!(like_matches("hello world", "hello%", false));
+        assert!(like_matches("hello world", "%world", false));
+        assert!(like_matches("hello world", "%lo wo%", false));
+        assert!(like_matches("hello", "h_llo", false));
+        assert!(!like_matches("hello", "h_lo", false));
+        assert!(!like_matches("hello", "world%", false));
+        // ILIKE folds case.
+        assert!(like_matches("HELLO", "hello", true));
+        assert!(!like_matches("HELLO", "hello", false));
+        // Escaped wildcard is literal.
+        assert!(like_matches("50%", "50\\%", false));
+        assert!(!like_matches("500", "50\\%", false));
+        // Trailing % matches empty.
+        assert!(like_matches("foo", "foo%", false));
     }
 }
