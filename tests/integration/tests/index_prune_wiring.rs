@@ -478,3 +478,69 @@ async fn gin_rowgroup_pruned_table_returns_correct_rows() {
 
     println!("[C2 e2e] GinRowGroupPrunedTable path returns PG-correct rows ✓");
 }
+
+/// Multi-row-group soundness: a single INSERT batch larger than the table's
+/// row-group cap produces a Parquet file with MULTIPLE row-groups. The GIN
+/// row-group indexer must record each row under its TRUE row-group
+/// (`row_idx / row_group_size`), not all under row-group 0 — otherwise an
+/// `@>` probe could prune row-groups 1+ and silently drop matches that live
+/// past the first row-group boundary.
+///
+/// We force a small `basin.row_block_size=256` so a 600-row batch spans three
+/// row-groups (0: rows 0-255, 1: rows 256-511, 2: rows 512-599), then place a
+/// uniquely-keyed needle in a row that lands in row-group 2. The `@>` query
+/// must still find it.
+#[tokio::test]
+async fn gin_rowgroup_prune_multi_row_group_no_false_negative() {
+    basin_common::telemetry::try_init_for_tests();
+    let dir = TempDir::new().unwrap();
+    let engine = build_engine(&dir);
+    let project = ProjectId::new();
+    let sess = engine.open_session(project).await.unwrap();
+
+    // row_block_size=256 → the writer flushes a new row-group every 256 rows.
+    sess.execute(
+        "CREATE TABLE big (id BIGINT NOT NULL, payload JSONB) WITH (basin.row_block_size=256)",
+    )
+    .await
+    .expect("create table");
+    sess.execute("CREATE INDEX big_gin ON big USING gin (payload jsonb_ops)")
+        .await
+        .expect("create gin index");
+
+    // One INSERT of 600 rows → one Parquet file with 3 row-groups. Most rows
+    // share a common `kind=filler`; exactly one row (id=530, which lands in
+    // row-group 2 = 530/256) carries a unique `kind=needle` marker.
+    let mut tuples: Vec<String> = Vec::with_capacity(600);
+    for i in 0..600i64 {
+        let kind = if i == 530 { "needle" } else { "filler" };
+        tuples.push(format!(r#"({i}, '{{"kind":"{kind}","seq":{i}}}')"#));
+    }
+    sess.execute(&format!("INSERT INTO big VALUES {}", tuples.join(", ")))
+        .await
+        .expect("bulk insert 600 rows");
+
+    // The needle lives in row-group 2. If the indexer had recorded every row
+    // under row-group 0, the probe would return {file: [0]} and the reader
+    // would skip row-groups 1 and 2 — dropping id=530. This assertion fails
+    // loudly in that case.
+    assert_eq!(
+        ids(&sess, r#"SELECT id FROM big WHERE payload @> '{"kind":"needle"}'"#).await,
+        vec![530],
+        "@> must find the needle in row-group 2 — multi-row-group prune must \
+         not produce a false negative"
+    );
+
+    // Sanity: the common key matches every row across all three row-groups.
+    let all = ids(&sess, r#"SELECT id FROM big WHERE payload @> '{"kind":"filler"}'"#).await;
+    assert_eq!(all.len(), 599, "filler must match the other 599 rows");
+
+    // Absent key across all row-groups → 0 rows.
+    assert_eq!(
+        ids(&sess, r#"SELECT id FROM big WHERE payload @> '{"kind":"ghost"}'"#).await,
+        Vec::<i64>::new(),
+        "absent key must return 0 rows even across multiple row-groups"
+    );
+
+    println!("[C2 e2e] multi-row-group prune is sound (no false negatives) ✓");
+}

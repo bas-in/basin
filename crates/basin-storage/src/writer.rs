@@ -75,7 +75,12 @@ pub(crate) fn encrypt_envelope(data_key: &[u8], plaintext: &[u8]) -> Result<Vec<
 /// small relative to the data, small enough that statistics pruning still
 /// drops most of a file on selective queries. Production tuning will move to
 /// per-table catalog options once the catalog grows them.
-const DEFAULT_MAX_ROW_GROUP_SIZE: usize = 65_536;
+///
+/// Exported so the engine's GIN row-group indexer can map each written row to
+/// its true row-group (`row_idx / DEFAULT_MAX_ROW_GROUP_SIZE`) when the table
+/// has no `row_group_rows` override — keeping the index's row-group boundaries
+/// identical to the writer's.
+pub const DEFAULT_MAX_ROW_GROUP_SIZE: usize = 65_536;
 
 /// Default expected number of distinct values per row group for a bloom-
 /// filtered column. The bitset size (and therefore the false-positive rate)

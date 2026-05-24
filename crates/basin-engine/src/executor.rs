@@ -7707,8 +7707,15 @@ async fn maintain_secondary_indexes_on_insert(
                 // Phase 5.19.C: JSONB GIN index — populate JSONB posting list.
                 maintain_gin_index_on_insert(gin_registry, &sess.project, table, col_name, opclass, batch, file_path);
                 // C2: also populate the per-row-group bloom-filter registry.
+                // The Parquet writer splits a batch into row-groups of
+                // `meta.row_group_rows` (default DEFAULT_MAX_ROW_GROUP_SIZE)
+                // rows, so a >cap batch spans multiple row-groups — pass the
+                // cap so each row is recorded under its true row-group index.
                 let rg_registry = sess.engine.gin_rowgroup_registry();
-                maintain_gin_rowgroup_index_on_insert(rg_registry, &sess.project, table, col_name, opclass, batch, file_path);
+                let rg_size = meta
+                    .row_group_rows
+                    .unwrap_or(basin_storage::DEFAULT_MAX_ROW_GROUP_SIZE);
+                maintain_gin_rowgroup_index_on_insert(rg_registry, &sess.project, table, col_name, opclass, batch, file_path, rg_size);
             }
             // GIN posting list is RAM-only (5.19.E handles persistence); skip
             // the flush call.  Continue to also populate the B-tree registry
@@ -7795,16 +7802,20 @@ fn maintain_gin_rowgroup_index_on_insert(
     opclass: &str,
     batch: &arrow_array::RecordBatch,
     file_path: &str,
+    row_group_size: usize,
 ) {
     use arrow_array::Array;
     let Ok(col_idx) = batch.schema().index_of(col_name) else {
         return;
     };
+    // The Parquet writer flushes a row-group every `row_group_size` rows
+    // (WriterProperties::max_row_group_size), so row `r` of this single-batch
+    // write lands in row-group `r / row_group_size`. Recording every row under
+    // row-group 0 would be a false-negative bug: a probe could then prune
+    // row-groups 1+ and drop real matches for any batch larger than the cap.
+    let rg_size = row_group_size.max(1);
     let col = batch.column(col_idx);
     if let Some(arr) = col.as_any().downcast_ref::<arrow_array::LargeBinaryArray>() {
-        // Basin writes a single Parquet row-group per INSERT batch, so every
-        // row in this batch belongs to row-group 0 of `file_path`.
-        const ROW_GROUP: u32 = 0;
         for row in 0..arr.len() {
             if arr.is_null(row) {
                 continue;
@@ -7817,7 +7828,8 @@ fn maintain_gin_rowgroup_index_on_insert(
             if terms.is_empty() {
                 continue;
             }
-            rg_registry.index_row(project, table, col_name, &terms, file_path, ROW_GROUP);
+            let row_group = (row / rg_size) as u32;
+            rg_registry.index_row(project, table, col_name, &terms, file_path, row_group);
         }
         // Seal the file after all rows have been fed into the bloom(s).
         rg_registry.mark_file_indexed(project, table, col_name, file_path);
