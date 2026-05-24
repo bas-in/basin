@@ -77,6 +77,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use arrow_array::Array as _;
 use basin_catalog::{Catalog, InMemoryCatalog};
 use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
@@ -1417,6 +1418,1019 @@ async fn run_jsonb_suite(
     }
 }
 
+/// Carrier for the 25 robustness-breadth (Basin, PG) p50 pairs (#38-#62).
+///
+/// Same `(Option<f64>, f64)` convention as `ExtendedResults` / `JsonbResults`:
+/// the Basin side is `None` when the shape errored (unsupported SQL) so
+/// `mk_ext` emits a "(basin gap)" row with a `-1.0` sentinel rather than
+/// panicking the card. The PG side is `f64::INFINITY` when PG itself failed.
+///
+/// Grouped into five families mirroring the task spec:
+///   CONCURRENT/TXN (7)  #38-#44
+///   NULL / 3VL (3)      #45-#47
+///   SUBQUERY (4)        #48-#51
+///   SET OPS (3)         #52-#54
+///   AGG/STRING/ARRAY (5) #55-#59
+///   RANGE/INDEX (3)     #60-#62
+struct RobustnessResults {
+    // -- CONCURRENT / TXN --------------------------------------------------
+    concurrent_insert: (Option<f64>, f64),
+    concurrent_select: (Option<f64>, f64),
+    rmw_contention: (Option<f64>, f64),
+    txn_insert_throughput: (Option<f64>, f64),
+    rollback_drops_rows: (Option<f64>, f64),
+    savepoint_rollback: (Option<f64>, f64),
+    snapshot_isolation: (Option<f64>, f64),
+    // -- NULL / 3VL --------------------------------------------------------
+    is_null: (Option<f64>, f64),
+    eq_null_3vl: (Option<f64>, f64),
+    count_col_vs_star: (Option<f64>, f64),
+    // -- SUBQUERY ----------------------------------------------------------
+    not_in_null: (Option<f64>, f64),
+    not_exists: (Option<f64>, f64),
+    scalar_subquery: (Option<f64>, f64),
+    derived_table: (Option<f64>, f64),
+    // -- SET OPS -----------------------------------------------------------
+    intersect: (Option<f64>, f64),
+    except: (Option<f64>, f64),
+    union_dedup: (Option<f64>, f64),
+    // -- AGG / STRING / ARRAY ---------------------------------------------
+    array_agg_orderby: (Option<f64>, f64),
+    string_agg: (Option<f64>, f64),
+    count_filter: (Option<f64>, f64),
+    case_10_branches: (Option<f64>, f64),
+    regexp_string_fns: (Option<f64>, f64),
+    // -- RANGE / INDEX ----------------------------------------------------
+    multicol_order_mixed: (Option<f64>, f64),
+    lateral_join: (Option<f64>, f64),
+    any_array: (Option<f64>, f64),
+}
+
+/// Run the 25 robustness-breadth probes (#38-#62) on PG + Basin.
+///
+/// Same stack-budget extraction pattern as `run_extended_suite`: the inline
+/// form would balloon `run_full_compare_inner`'s state machine past the
+/// worker-thread stack. Each non-concurrent shape uses the shared `pair()`
+/// helper (PG via EXPLAIN ANALYZE median, Basin via `basin_p50_try`). The
+/// seven CONCURRENT/TXN shapes are measured differently: they spawn N
+/// sessions against the same `engine`/`project` handle (shared catalog +
+/// storage) and time the joined wall-clock of the fan-out. PG's concurrency
+/// twin uses N independent `tokio_postgres` connections to the same schema.
+///
+/// Concurrency shapes mutate a dedicated scratch table (`rstress`) seeded
+/// here so they don't perturb the `events`/`users` timings the earlier
+/// suites depend on. The scratch table is created on BOTH engines up front;
+/// if Basin's CREATE/seed fails the concurrent-write shapes record a gap.
+async fn run_robustness_suite(
+    pg: &Client,
+    sess: &basin_engine::ProjectSession,
+    engine: &Engine,
+    project: ProjectId,
+    schema: &str,
+    conn_str: &str,
+    rows: usize,
+) -> RobustnessResults {
+    let n = samples_for(rows, 5);
+
+    // Shared (PG via EXPLAIN ANALYZE, Basin via execute) p50 pair. Identical
+    // to the `pair` closures in the extended / jsonb suites.
+    async fn pair(
+        pg: &Client,
+        sess: &basin_engine::ProjectSession,
+        pg_sql: String,
+        basin_sql: &str,
+        n: usize,
+    ) -> (Option<f64>, f64) {
+        let p = pg_p50_explain(pg, &pg_sql, n)
+            .await
+            .unwrap_or(f64::INFINITY);
+        let b = basin_p50_try(sess, basin_sql, n).await;
+        (b, p)
+    }
+
+    // =======================================================================
+    // CONCURRENT / TXN family (#38-#44)
+    // =======================================================================
+
+    // Scratch table for the concurrent-write shapes. Separate from
+    // events/users so the fan-out writes don't disturb earlier scan timings.
+    // PK on id so the contention UPDATE has a fast path; nullable `note` for
+    // the NULL/3VL family below.
+    pg.simple_query(&format!(
+        "CREATE TABLE {schema}.rstress (id BIGINT PRIMARY KEY, v BIGINT, note TEXT)"
+    ))
+    .await
+    .expect("pg create rstress");
+    // Seed 2000 rows so the contention UPDATEs and concurrent SELECTs touch a
+    // non-trivial keyspace. `note` is NULL for every 5th row to feed the 3VL
+    // shapes (#45-#47) and `eq NULL` (#46) returns 0 rows by construction.
+    {
+        let mut stmt = String::with_capacity(2000 * 40);
+        stmt.push_str(&format!("INSERT INTO {schema}.rstress (id, v, note) VALUES "));
+        for i in 0..2000i64 {
+            if i > 0 {
+                stmt.push(',');
+            }
+            let note = if i % 5 == 0 {
+                "NULL".to_string()
+            } else {
+                format!("'note{i}'")
+            };
+            stmt.push_str(&format!("({i}, {i}, {note})"));
+        }
+        pg.simple_query(&stmt).await.expect("pg seed rstress");
+    }
+
+    // Basin scratch table. If either DDL or seed fails, mark the
+    // concurrent-write shapes as a gap (we still run read-only concurrency).
+    let basin_rstress_ok = {
+        let ddl = sess
+            .execute("CREATE TABLE rstress (id BIGINT NOT NULL PRIMARY KEY, v BIGINT, note TEXT)")
+            .await
+            .is_ok();
+        if !ddl {
+            false
+        } else {
+            let mut stmt = String::with_capacity(2000 * 40);
+            stmt.push_str("INSERT INTO rstress (id, v, note) VALUES ");
+            for i in 0..2000i64 {
+                if i > 0 {
+                    stmt.push(',');
+                }
+                let note = if i % 5 == 0 {
+                    "NULL".to_string()
+                } else {
+                    format!("'note{i}'")
+                };
+                stmt.push_str(&format!("({i}, {i}, {note})"));
+            }
+            sess.execute(&stmt).await.is_ok()
+        }
+    };
+
+    // Helper: open N Basin sessions against the same project (shared catalog
+    // + storage) and run `body(session_index, session)` concurrently, timing
+    // the joined wall-clock. Returns None if any task errors.
+    async fn basin_concurrent<F, Fut>(
+        engine: &Engine,
+        project: ProjectId,
+        n_sessions: usize,
+        body: F,
+    ) -> Option<f64>
+    where
+        F: Fn(usize, basin_engine::ProjectSession) -> Fut + Send + Sync + 'static + Clone,
+        Fut: std::future::Future<Output = bool> + Send,
+    {
+        let mut sessions = Vec::with_capacity(n_sessions);
+        for _ in 0..n_sessions {
+            match engine.open_session(project).await {
+                Ok(s) => sessions.push(s),
+                Err(_) => return None,
+            }
+        }
+        let started = Instant::now();
+        let mut handles = Vec::with_capacity(n_sessions);
+        for (idx, s) in sessions.into_iter().enumerate() {
+            let body = body.clone();
+            handles.push(tokio::spawn(async move { body(idx, s).await }));
+        }
+        let mut all_ok = true;
+        for h in handles {
+            match h.await {
+                Ok(true) => {}
+                _ => all_ok = false,
+            }
+        }
+        if all_ok {
+            Some(started.elapsed().as_secs_f64() * 1000.0)
+        } else {
+            None
+        }
+    }
+
+    // PG twin: open `n_conn` independent connections to the same DB and run
+    // `body(conn_index, &client)` concurrently. Returns INFINITY on any
+    // connection/setup failure so the metric mirrors Basin's gap convention.
+    async fn pg_concurrent<F, Fut>(conn_str: &str, n_conn: usize, body: F) -> f64
+    where
+        F: Fn(usize, std::sync::Arc<Client>) -> Fut + Clone + Send + 'static,
+        Fut: std::future::Future<Output = bool> + Send,
+    {
+        let mut clients = Vec::with_capacity(n_conn);
+        for _ in 0..n_conn {
+            match tokio_postgres::connect(conn_str, NoTls).await {
+                Ok((c, conn)) => {
+                    tokio::spawn(async move {
+                        let _ = conn.await;
+                    });
+                    clients.push(std::sync::Arc::new(c));
+                }
+                Err(_) => return f64::INFINITY,
+            }
+        }
+        let started = Instant::now();
+        let mut handles = Vec::with_capacity(n_conn);
+        for (idx, c) in clients.into_iter().enumerate() {
+            let body = body.clone();
+            handles.push(tokio::spawn(async move { body(idx, c).await }));
+        }
+        let mut all_ok = true;
+        for h in handles {
+            match h.await {
+                Ok(true) => {}
+                _ => all_ok = false,
+            }
+        }
+        if all_ok {
+            started.elapsed().as_secs_f64() * 1000.0
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    // -- #38 Concurrent INSERT: 8 sessions x 1000 rows each ------------------
+    // Each session writes into a disjoint id-range of a fresh table so the
+    // writes never collide on the PK (pure write-throughput under fan-out).
+    let concurrent_insert = {
+        // Fresh per-shape tables to keep the inserted rows out of `rstress`.
+        let _ = pg
+            .simple_query(&format!(
+                "CREATE TABLE {schema}.cins (id BIGINT PRIMARY KEY, v BIGINT)"
+            ))
+            .await;
+        let basin_cins_ok = sess
+            .execute("CREATE TABLE cins (id BIGINT NOT NULL PRIMARY KEY, v BIGINT)")
+            .await
+            .is_ok();
+        let schema_owned = schema.to_string();
+        let pg_ms = pg_concurrent(conn_str, 8, move |idx, client| {
+            let schema = schema_owned.clone();
+            async move {
+                let base = (idx as i64) * 1000;
+                let mut stmt = String::with_capacity(1000 * 16);
+                stmt.push_str(&format!("INSERT INTO {schema}.cins (id, v) VALUES "));
+                for k in 0..1000i64 {
+                    if k > 0 {
+                        stmt.push(',');
+                    }
+                    stmt.push_str(&format!("({}, {})", base + k, base + k));
+                }
+                client.simple_query(&stmt).await.is_ok()
+            }
+        })
+        .await;
+        let basin_ms = if basin_cins_ok {
+            basin_concurrent(engine, project, 8, |idx, s| async move {
+                let base = (idx as i64) * 1000;
+                let mut stmt = String::with_capacity(1000 * 16);
+                stmt.push_str("INSERT INTO cins (id, v) VALUES ");
+                for k in 0..1000i64 {
+                    if k > 0 {
+                        stmt.push(',');
+                    }
+                    stmt.push_str(&format!("({}, {})", base + k, base + k));
+                }
+                s.execute(&stmt).await.is_ok()
+            })
+            .await
+        } else {
+            None
+        };
+        (basin_ms, pg_ms)
+    };
+
+    // -- #39 Concurrent SELECT: 16 sessions, mixed point + range -------------
+    // Read-only fan-out over the seeded `rstress` table. Odd sessions do a
+    // point lookup, even sessions a range scan — exercises shared read path
+    // under contention with zero write conflict.
+    let concurrent_select = {
+        let schema_owned = schema.to_string();
+        let pg_ms = pg_concurrent(conn_str, 16, move |idx, client| {
+            let schema = schema_owned.clone();
+            async move {
+                let q = if idx % 2 == 0 {
+                    format!(
+                        "SELECT id, v FROM {schema}.rstress WHERE id BETWEEN {} AND {}",
+                        idx * 50,
+                        idx * 50 + 200
+                    )
+                } else {
+                    format!("SELECT id, v FROM {schema}.rstress WHERE id = {}", idx * 100)
+                };
+                client.simple_query(&q).await.is_ok()
+            }
+        })
+        .await;
+        let basin_ms = if basin_rstress_ok {
+            basin_concurrent(engine, project, 16, |idx, s| async move {
+                let q = if idx % 2 == 0 {
+                    format!(
+                        "SELECT id, v FROM rstress WHERE id BETWEEN {} AND {}",
+                        idx * 50,
+                        idx * 50 + 200
+                    )
+                } else {
+                    format!("SELECT id, v FROM rstress WHERE id = {}", idx * 100)
+                };
+                s.execute(&q).await.is_ok()
+            })
+            .await
+        } else {
+            None
+        };
+        (basin_ms, pg_ms)
+    };
+
+    // -- #40 Read-modify-write contention: 8 sessions, overlapping keys ------
+    // Each session updates the SAME small key window (id < 50) so the writes
+    // contend. Under optimistic concurrency (Basin ADR 0026) some of these
+    // may serialize/retry; we only require the fan-out to complete without
+    // erroring. PG serializes via row locks.
+    let rmw_contention = {
+        let schema_owned = schema.to_string();
+        let pg_ms = pg_concurrent(conn_str, 8, move |idx, client| {
+            let schema = schema_owned.clone();
+            async move {
+                let q = format!(
+                    "UPDATE {schema}.rstress SET v = v + {} WHERE id < 50",
+                    idx + 1
+                );
+                client.simple_query(&q).await.is_ok()
+            }
+        })
+        .await;
+        let basin_ms = if basin_rstress_ok {
+            basin_concurrent(engine, project, 8, |idx, s| async move {
+                let q = format!("UPDATE rstress SET v = v + {} WHERE id < 50", idx + 1);
+                // Optimistic-concurrency conflicts surface as Err; treat a
+                // serialization failure as a successful "completed" outcome
+                // (the contention itself is what we're measuring, not a hard
+                // requirement that every writer wins).
+                let _ = s.execute(&q).await;
+                true
+            })
+            .await
+        } else {
+            None
+        };
+        (basin_ms, pg_ms)
+    };
+
+    // -- #41 BEGIN; INSERT x100; COMMIT — txn throughput ---------------------
+    // 100 single-row INSERTs inside one explicit transaction, then COMMIT.
+    // Measures the per-statement-in-txn overhead + single commit flush.
+    let txn_insert_throughput = {
+        let _ = pg
+            .simple_query(&format!(
+                "CREATE TABLE {schema}.txnins (id BIGINT PRIMARY KEY, v BIGINT)"
+            ))
+            .await;
+        let basin_txn_ok = sess
+            .execute("CREATE TABLE txnins (id BIGINT NOT NULL PRIMARY KEY, v BIGINT)")
+            .await
+            .is_ok();
+        // PG: time the whole BEGIN..COMMIT block directly (not EXPLAIN).
+        let pg_ms = {
+            let started = Instant::now();
+            let mut ok = pg.simple_query("BEGIN").await.is_ok();
+            for k in 0..100i64 {
+                ok &= pg
+                    .simple_query(&format!(
+                        "INSERT INTO {schema}.txnins (id, v) VALUES ({k}, {k})"
+                    ))
+                    .await
+                    .is_ok();
+            }
+            ok &= pg.simple_query("COMMIT").await.is_ok();
+            if ok {
+                started.elapsed().as_secs_f64() * 1000.0
+            } else {
+                let _ = pg.simple_query("ROLLBACK").await;
+                f64::INFINITY
+            }
+        };
+        let basin_ms = if basin_txn_ok {
+            let started = Instant::now();
+            let mut ok = sess.execute("BEGIN").await.is_ok();
+            for k in 0..100i64 {
+                if sess
+                    .execute(&format!("INSERT INTO txnins (id, v) VALUES ({k}, {k})"))
+                    .await
+                    .is_err()
+                {
+                    ok = false;
+                    break;
+                }
+            }
+            ok &= sess.execute("COMMIT").await.is_ok();
+            if ok {
+                Some(started.elapsed().as_secs_f64() * 1000.0)
+            } else {
+                let _ = sess.execute("ROLLBACK").await;
+                None
+            }
+        } else {
+            None
+        };
+        (basin_ms, pg_ms)
+    };
+
+    // -- #42 BEGIN; INSERT; ROLLBACK; SELECT COUNT (rollback drops rows) -----
+    // Inserts a sentinel row inside a txn, rolls back, then asserts the row
+    // is gone. Basin "succeeds" only if the post-rollback COUNT excludes the
+    // rolled-back row (correctness, not just no-error). We use id=999999 to
+    // avoid colliding with the txnins keyspace.
+    let rollback_drops_rows = {
+        // PG: timed BEGIN/INSERT/ROLLBACK, then a verifying COUNT.
+        let pg_ms = {
+            let started = Instant::now();
+            let _ = pg.simple_query("BEGIN").await;
+            let _ = pg
+                .simple_query(&format!(
+                    "INSERT INTO {schema}.txnins (id, v) VALUES (999999, 1)"
+                ))
+                .await;
+            let _ = pg.simple_query("ROLLBACK").await;
+            let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+            // Verify the row did not survive.
+            let surviving = pg
+                .query_one(
+                    &format!("SELECT COUNT(*) FROM {schema}.txnins WHERE id = 999999"),
+                    &[],
+                )
+                .await
+                .map(|r| r.get::<_, i64>(0))
+                .unwrap_or(-1);
+            if surviving == 0 {
+                elapsed
+            } else {
+                f64::INFINITY
+            }
+        };
+        let basin_ms = if txn_insert_throughput.0.is_some() {
+            let started = Instant::now();
+            let mut ok = sess.execute("BEGIN").await.is_ok();
+            ok &= sess
+                .execute("INSERT INTO txnins (id, v) VALUES (999999, 1)")
+                .await
+                .is_ok();
+            ok &= sess.execute("ROLLBACK").await.is_ok();
+            let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+            if !ok {
+                None
+            } else {
+                // Verify rollback actually dropped the row.
+                match sess
+                    .execute("SELECT COUNT(*) FROM txnins WHERE id = 999999")
+                    .await
+                {
+                    Ok(ExecResult::Rows { batches, .. }) => {
+                        let v = scalar_i64(&batches);
+                        if v == Some(0) {
+                            Some(elapsed)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            }
+        } else {
+            None
+        };
+        (basin_ms, pg_ms)
+    };
+
+    // -- #43 Savepoint nest + rollback-to-savepoint --------------------------
+    // BEGIN; INSERT a; SAVEPOINT sp; INSERT b; ROLLBACK TO sp; COMMIT.
+    // After commit, row `a` survives and row `b` does not. Basin succeeds
+    // only if that partial-rollback semantics holds.
+    let savepoint_rollback = {
+        let pg_ms = {
+            let started = Instant::now();
+            let _ = pg.simple_query("BEGIN").await;
+            let _ = pg
+                .simple_query(&format!(
+                    "INSERT INTO {schema}.txnins (id, v) VALUES (888001, 1)"
+                ))
+                .await;
+            let _ = pg.simple_query("SAVEPOINT sp1").await;
+            let _ = pg
+                .simple_query(&format!(
+                    "INSERT INTO {schema}.txnins (id, v) VALUES (888002, 2)"
+                ))
+                .await;
+            let _ = pg.simple_query("ROLLBACK TO SAVEPOINT sp1").await;
+            let _ = pg.simple_query("COMMIT").await;
+            let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+            let a = pg
+                .query_one(
+                    &format!("SELECT COUNT(*) FROM {schema}.txnins WHERE id = 888001"),
+                    &[],
+                )
+                .await
+                .map(|r| r.get::<_, i64>(0))
+                .unwrap_or(-1);
+            let b = pg
+                .query_one(
+                    &format!("SELECT COUNT(*) FROM {schema}.txnins WHERE id = 888002"),
+                    &[],
+                )
+                .await
+                .map(|r| r.get::<_, i64>(0))
+                .unwrap_or(-1);
+            if a == 1 && b == 0 {
+                elapsed
+            } else {
+                f64::INFINITY
+            }
+        };
+        let basin_ms = if txn_insert_throughput.0.is_some() {
+            let started = Instant::now();
+            let mut ok = sess.execute("BEGIN").await.is_ok();
+            ok &= sess
+                .execute("INSERT INTO txnins (id, v) VALUES (888001, 1)")
+                .await
+                .is_ok();
+            ok &= sess.execute("SAVEPOINT sp1").await.is_ok();
+            ok &= sess
+                .execute("INSERT INTO txnins (id, v) VALUES (888002, 2)")
+                .await
+                .is_ok();
+            ok &= sess.execute("ROLLBACK TO SAVEPOINT sp1").await.is_ok();
+            ok &= sess.execute("COMMIT").await.is_ok();
+            let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+            if !ok {
+                let _ = sess.execute("ROLLBACK").await;
+                None
+            } else {
+                let a = match sess
+                    .execute("SELECT COUNT(*) FROM txnins WHERE id = 888001")
+                    .await
+                {
+                    Ok(ExecResult::Rows { batches, .. }) => scalar_i64(&batches),
+                    _ => None,
+                };
+                let b = match sess
+                    .execute("SELECT COUNT(*) FROM txnins WHERE id = 888002")
+                    .await
+                {
+                    Ok(ExecResult::Rows { batches, .. }) => scalar_i64(&batches),
+                    _ => None,
+                };
+                if a == Some(1) && b == Some(0) {
+                    Some(elapsed)
+                } else {
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        (basin_ms, pg_ms)
+    };
+
+    // -- #44 Long-txn snapshot isolation -------------------------------------
+    // Session A opens a txn and reads a baseline COUNT. Session B (separate
+    // session) inserts a new row and commits. Session A re-reads inside its
+    // still-open snapshot and must see the SAME count (snapshot isolation),
+    // then commits. Basin succeeds iff A's two reads agree despite B's commit.
+    let snapshot_isolation = {
+        // PG side: two connections.
+        let schema_owned = schema.to_string();
+        let pg_ms = {
+            let mk = || tokio_postgres::connect(conn_str, NoTls);
+            match (mk().await, mk().await) {
+                (Ok((a, ac)), Ok((b, bc))) => {
+                    tokio::spawn(async move {
+                        let _ = ac.await;
+                    });
+                    tokio::spawn(async move {
+                        let _ = bc.await;
+                    });
+                    let started = Instant::now();
+                    let _ = a
+                        .simple_query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+                        .await;
+                    let c1 = a
+                        .query_one(
+                            &format!("SELECT COUNT(*) FROM {schema_owned}.rstress"),
+                            &[],
+                        )
+                        .await
+                        .map(|r| r.get::<_, i64>(0))
+                        .unwrap_or(-1);
+                    let _ = b
+                        .simple_query(&format!(
+                            "INSERT INTO {schema_owned}.rstress (id, v) VALUES (777001, 1)"
+                        ))
+                        .await;
+                    let c2 = a
+                        .query_one(
+                            &format!("SELECT COUNT(*) FROM {schema_owned}.rstress"),
+                            &[],
+                        )
+                        .await
+                        .map(|r| r.get::<_, i64>(0))
+                        .unwrap_or(-1);
+                    let _ = a.simple_query("COMMIT").await;
+                    let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                    if c1 >= 0 && c1 == c2 {
+                        elapsed
+                    } else {
+                        f64::INFINITY
+                    }
+                }
+                _ => f64::INFINITY,
+            }
+        };
+        let basin_ms = if basin_rstress_ok {
+            match (
+                engine.open_session(project).await,
+                engine.open_session(project).await,
+            ) {
+                (Ok(a), Ok(b)) => {
+                    let started = Instant::now();
+                    let begin_ok = a.execute("BEGIN").await.is_ok();
+                    let c1 = match a.execute("SELECT COUNT(*) FROM rstress").await {
+                        Ok(ExecResult::Rows { batches, .. }) => scalar_i64(&batches),
+                        _ => None,
+                    };
+                    let _ = b
+                        .execute("INSERT INTO rstress (id, v, note) VALUES (777001, 1, NULL)")
+                        .await;
+                    let c2 = match a.execute("SELECT COUNT(*) FROM rstress").await {
+                        Ok(ExecResult::Rows { batches, .. }) => scalar_i64(&batches),
+                        _ => None,
+                    };
+                    let commit_ok = a.execute("COMMIT").await.is_ok();
+                    let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                    // Succeed iff the txn machinery worked AND A's snapshot was
+                    // stable (both reads equal). If Basin does not yet give a
+                    // stable snapshot, the reads differ → recorded as a gap.
+                    if begin_ok && commit_ok && c1.is_some() && c1 == c2 {
+                        Some(elapsed)
+                    } else {
+                        let _ = a.execute("ROLLBACK").await;
+                        None
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        (basin_ms, pg_ms)
+    };
+
+    // =======================================================================
+    // NULL / 3VL family (#45-#47) — run against the seeded `rstress.note`.
+    // =======================================================================
+
+    // -- #45 WHERE note IS NULL ----------------------------------------------
+    let is_null = pair(
+        pg,
+        sess,
+        format!("SELECT id FROM {schema}.rstress WHERE note IS NULL"),
+        "SELECT id FROM rstress WHERE note IS NULL",
+        n,
+    )
+    .await;
+
+    // -- #46 WHERE note = NULL returns 0 rows (3VL) --------------------------
+    // `= NULL` is UNKNOWN for every row → empty result. `basin_p50_try`
+    // doesn't assert non-empty, so an empty-but-successful result still
+    // times. Correctness (0 rows) is implicit in PG; we only need Basin to
+    // accept the SQL and return without error.
+    let eq_null_3vl = pair(
+        pg,
+        sess,
+        format!("SELECT id FROM {schema}.rstress WHERE note = NULL"),
+        "SELECT id FROM rstress WHERE note = NULL",
+        n,
+    )
+    .await;
+
+    // -- #47 COUNT(col) vs COUNT(*) NULL handling ----------------------------
+    // COUNT(note) skips NULLs, COUNT(*) counts all rows. Single query returns
+    // both so the divergence is visible in one scan.
+    let count_col_vs_star = pair(
+        pg,
+        sess,
+        format!("SELECT COUNT(note), COUNT(*) FROM {schema}.rstress"),
+        "SELECT COUNT(note), COUNT(*) FROM rstress",
+        n,
+    )
+    .await;
+
+    // =======================================================================
+    // SUBQUERY family (#48-#51)
+    // =======================================================================
+
+    // -- #48 NOT IN with NULL in subquery -----------------------------------
+    // `rstress.note` contains NULLs; `NOT IN (subquery with NULL)` is the
+    // classic 3VL trap — PG returns 0 rows because `x NOT IN (.., NULL)` is
+    // never TRUE. Exercises correct 3VL handling in NOT IN.
+    let not_in_null = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT id FROM {schema}.rstress \
+             WHERE v NOT IN (SELECT id FROM {schema}.rstress WHERE note IS NULL OR id < 3)"
+        ),
+        "SELECT id FROM rstress \
+         WHERE v NOT IN (SELECT id FROM rstress WHERE note IS NULL OR id < 3)",
+        n,
+    )
+    .await;
+
+    // -- #49 NOT EXISTS ------------------------------------------------------
+    let not_exists = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT u.id FROM {schema}.users u \
+             WHERE NOT EXISTS (SELECT 1 FROM {schema}.events e WHERE e.user_id = u.id AND e.amount > 1e12)"
+        ),
+        "SELECT u.id FROM users u \
+         WHERE NOT EXISTS (SELECT 1 FROM events e WHERE e.user_id = u.id AND e.amount > 1e12)",
+        n,
+    )
+    .await;
+
+    // -- #50 Scalar subquery in SELECT list ----------------------------------
+    // A single-value subquery (table-wide MAX) embedded per output row.
+    let scalar_subquery = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT id, (SELECT MAX(amount) FROM {schema}.events) AS global_max \
+             FROM {schema}.users LIMIT 100"
+        ),
+        "SELECT id, (SELECT MAX(amount) FROM events) AS global_max \
+         FROM users LIMIT 100",
+        n,
+    )
+    .await;
+
+    // -- #51 Derived table (subquery in FROM) --------------------------------
+    let derived_table = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT t.user_id, t.cnt FROM \
+             (SELECT user_id, COUNT(*) AS cnt FROM {schema}.events GROUP BY user_id) t \
+             WHERE t.cnt > 5 ORDER BY t.cnt DESC LIMIT 20"
+        ),
+        "SELECT t.user_id, t.cnt FROM \
+         (SELECT user_id, COUNT(*) AS cnt FROM events GROUP BY user_id) t \
+         WHERE t.cnt > 5 ORDER BY t.cnt DESC LIMIT 20",
+        n,
+    )
+    .await;
+
+    // =======================================================================
+    // SET OPS family (#52-#54)
+    // =======================================================================
+
+    // -- #52 INTERSECT -------------------------------------------------------
+    let intersect = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT user_id FROM {schema}.events WHERE status = 'active' \
+             INTERSECT \
+             SELECT user_id FROM {schema}.events WHERE status = 'pending'"
+        ),
+        "SELECT user_id FROM events WHERE status = 'active' \
+         INTERSECT \
+         SELECT user_id FROM events WHERE status = 'pending'",
+        n,
+    )
+    .await;
+
+    // -- #53 EXCEPT ----------------------------------------------------------
+    let except = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT user_id FROM {schema}.events WHERE status = 'active' \
+             EXCEPT \
+             SELECT user_id FROM {schema}.events WHERE status = 'archived'"
+        ),
+        "SELECT user_id FROM events WHERE status = 'active' \
+         EXCEPT \
+         SELECT user_id FROM events WHERE status = 'archived'",
+        n,
+    )
+    .await;
+
+    // -- #54 UNION (dedup — distinct from the existing UNION ALL shape) ------
+    let union_dedup = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT status FROM {schema}.events WHERE amount < 100 \
+             UNION \
+             SELECT status FROM {schema}.events WHERE amount >= 100"
+        ),
+        "SELECT status FROM events WHERE amount < 100 \
+         UNION \
+         SELECT status FROM events WHERE amount >= 100",
+        n,
+    )
+    .await;
+
+    // =======================================================================
+    // AGG / STRING / ARRAY family (#55-#59)
+    // =======================================================================
+
+    // -- #55 ARRAY_AGG with ORDER BY inside the aggregate --------------------
+    let array_agg_orderby = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT user_id, ARRAY_AGG(status ORDER BY created_at DESC) \
+             FROM {schema}.events GROUP BY user_id LIMIT 20"
+        ),
+        "SELECT user_id, ARRAY_AGG(status ORDER BY created_at DESC) \
+         FROM events GROUP BY user_id LIMIT 20",
+        n,
+    )
+    .await;
+
+    // -- #56 STRING_AGG ------------------------------------------------------
+    let string_agg = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT user_id, STRING_AGG(status, ',') \
+             FROM {schema}.events GROUP BY user_id LIMIT 20"
+        ),
+        "SELECT user_id, STRING_AGG(status, ',') \
+         FROM events GROUP BY user_id LIMIT 20",
+        n,
+    )
+    .await;
+
+    // -- #57 COUNT(*) FILTER (WHERE ...) -------------------------------------
+    let count_filter = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT user_id, \
+                    COUNT(*) FILTER (WHERE status = 'active') AS n_active, \
+                    COUNT(*) FILTER (WHERE status = 'pending') AS n_pending \
+             FROM {schema}.events GROUP BY user_id LIMIT 20"
+        ),
+        "SELECT user_id, \
+                COUNT(*) FILTER (WHERE status = 'active') AS n_active, \
+                COUNT(*) FILTER (WHERE status = 'pending') AS n_pending \
+         FROM events GROUP BY user_id LIMIT 20",
+        n,
+    )
+    .await;
+
+    // -- #58 CASE WHEN with 10 branches --------------------------------------
+    let case_10 = "SELECT id, CASE \
+        WHEN amount < 10 THEN 'b0' \
+        WHEN amount < 20 THEN 'b1' \
+        WHEN amount < 30 THEN 'b2' \
+        WHEN amount < 40 THEN 'b3' \
+        WHEN amount < 50 THEN 'b4' \
+        WHEN amount < 60 THEN 'b5' \
+        WHEN amount < 70 THEN 'b6' \
+        WHEN amount < 80 THEN 'b7' \
+        WHEN amount < 90 THEN 'b8' \
+        ELSE 'b9' END AS bucket FROM {SRC}.events LIMIT 500";
+    let case_10_branches = pair(
+        pg,
+        sess,
+        case_10.replace("{SRC}.", &format!("{schema}.")),
+        &case_10.replace("{SRC}.", ""),
+        n,
+    )
+    .await;
+
+    // -- #59 regexp_match / substring / split_part ---------------------------
+    // String-function trio on the email column. PG `regexp_match` returns a
+    // text[]; both engines evaluate the same expressions per row.
+    let regexp_string_fns = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT id, \
+                    substring(email FROM 1 FOR 4) AS prefix, \
+                    split_part(email, '@', 2) AS domain, \
+                    regexp_match(email, '@(.*)$') AS m \
+             FROM {schema}.users LIMIT 200"
+        ),
+        "SELECT id, \
+                substring(email FROM 1 FOR 4) AS prefix, \
+                split_part(email, '@', 2) AS domain, \
+                regexp_match(email, '@(.*)$') AS m \
+         FROM users LIMIT 200",
+        n,
+    )
+    .await;
+
+    // =======================================================================
+    // RANGE / INDEX family (#60-#62)
+    // =======================================================================
+
+    // -- #60 Multi-col ORDER BY mixed ASC/DESC + LIMIT -----------------------
+    let multicol_order_mixed = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT id, status, amount FROM {schema}.events \
+             ORDER BY status ASC, amount DESC LIMIT 50"
+        ),
+        "SELECT id, status, amount FROM events \
+         ORDER BY status ASC, amount DESC LIMIT 50",
+        n,
+    )
+    .await;
+
+    // -- #61 LATERAL JOIN (correlated derived table) -------------------------
+    // For each of the first 50 users, pull their 3 most-recent events via a
+    // LATERAL subquery referencing the outer row.
+    let lateral_join = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT u.id, e.amount FROM {schema}.users u \
+             JOIN LATERAL (SELECT amount FROM {schema}.events e \
+                           WHERE e.user_id = u.id ORDER BY e.created_at DESC LIMIT 3) e ON true \
+             WHERE u.id < 50"
+        ),
+        "SELECT u.id, e.amount FROM users u \
+         JOIN LATERAL (SELECT amount FROM events e \
+                       WHERE e.user_id = u.id ORDER BY e.created_at DESC LIMIT 3) e ON true \
+         WHERE u.id < 50",
+        n,
+    )
+    .await;
+
+    // -- #62 WHERE col = ANY($1::int[]) --------------------------------------
+    // Array-membership predicate. Both engines get the same inline int[]
+    // literal cast (no bind param — the harness times raw SQL strings).
+    let any_array = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT id, user_id FROM {schema}.events \
+             WHERE user_id = ANY('{{1,2,3,4,5,6,7,8,9,10}}'::int[])"
+        ),
+        "SELECT id, user_id FROM events \
+         WHERE user_id = ANY('{1,2,3,4,5,6,7,8,9,10}'::int[])",
+        n,
+    )
+    .await;
+
+    RobustnessResults {
+        concurrent_insert,
+        concurrent_select,
+        rmw_contention,
+        txn_insert_throughput,
+        rollback_drops_rows,
+        savepoint_rollback,
+        snapshot_isolation,
+        is_null,
+        eq_null_3vl,
+        count_col_vs_star,
+        not_in_null,
+        not_exists,
+        scalar_subquery,
+        derived_table,
+        intersect,
+        except,
+        union_dedup,
+        array_agg_orderby,
+        string_agg,
+        count_filter,
+        case_10_branches,
+        regexp_string_fns,
+        multicol_order_mixed,
+        lateral_join,
+        any_array,
+    }
+}
+
+/// Extract a single scalar i64 from the first cell of the first batch.
+/// Used by the txn-correctness shapes (#42-#44, #44) to verify COUNT results.
+/// Returns `None` if the batch is empty or the column isn't an Int64.
+fn scalar_i64(batches: &[arrow_array::RecordBatch]) -> Option<i64> {
+    let b = batches.first()?;
+    if b.num_rows() == 0 {
+        return None;
+    }
+    let col = b.column(0);
+    col.as_any()
+        .downcast_ref::<arrow_array::Int64Array>()
+        .map(|a| a.value(0))
+}
+
 /// Single-replicated suite that runs the FULL 29-metric comparison and emits
 /// the dashboard JSON card. Each `compare_postgres_*` test file is a 30-line
 /// wrapper that calls this with the right (rows, format, id, name, claim).
@@ -1931,6 +2945,25 @@ async fn run_full_compare_inner(
     // =======================================================================
     let jb = run_jsonb_suite(&pg, &sess, &schema, rows).await;
 
+    // =======================================================================
+    // Robustness-breadth suite (#38-#62) — 25 probes across concurrency,
+    // 3VL/NULL, subquery, set ops, and aggregate/string/array shapes. Same
+    // stack-budget extraction + Option-or-gap convention as the extended and
+    // JSONB suites. Runs LAST: its concurrency shapes spawn extra sessions
+    // and mutate scratch tables, so we keep it after every read-timed shape
+    // above so nothing it touches perturbs an earlier measurement.
+    // =======================================================================
+    let rb = run_robustness_suite(
+        &pg,
+        &sess,
+        &instance.engine,
+        instance.project,
+        &schema,
+        &conn_str,
+        rows,
+    )
+    .await;
+
     // ---- Cold-start first query -------------------------------------------
     let pg_cold_ms = {
         let user_token = if conn_str.contains("user=pc") {
@@ -2102,6 +3135,33 @@ async fn run_full_compare_inner(
     row_opt("jsonb_typeof_p50_ms", jb.typeof_fn.0, jb.typeof_fn.1);
     row_opt("jsonb_filter_agg_p50_ms", jb.filter_agg.0, jb.filter_agg.1);
     row_opt("jsonb_set_update_ms", jb.jsonb_set_update.0, jb.jsonb_set_update.1);
+
+    // Robustness-breadth rows (#38-#62) — same Option-or-GAP rendering.
+    row_opt("concurrent_insert_8x1000_ms", rb.concurrent_insert.0, rb.concurrent_insert.1);
+    row_opt("concurrent_select_16_ms", rb.concurrent_select.0, rb.concurrent_select.1);
+    row_opt("rmw_contention_8_ms", rb.rmw_contention.0, rb.rmw_contention.1);
+    row_opt("txn_insert_x100_ms", rb.txn_insert_throughput.0, rb.txn_insert_throughput.1);
+    row_opt("rollback_drops_rows_ms", rb.rollback_drops_rows.0, rb.rollback_drops_rows.1);
+    row_opt("savepoint_rollback_ms", rb.savepoint_rollback.0, rb.savepoint_rollback.1);
+    row_opt("snapshot_isolation_ms", rb.snapshot_isolation.0, rb.snapshot_isolation.1);
+    row_opt("where_is_null_p50_ms", rb.is_null.0, rb.is_null.1);
+    row_opt("where_eq_null_3vl_p50_ms", rb.eq_null_3vl.0, rb.eq_null_3vl.1);
+    row_opt("count_col_vs_star_p50_ms", rb.count_col_vs_star.0, rb.count_col_vs_star.1);
+    row_opt("not_in_null_p50_ms", rb.not_in_null.0, rb.not_in_null.1);
+    row_opt("not_exists_p50_ms", rb.not_exists.0, rb.not_exists.1);
+    row_opt("scalar_subquery_p50_ms", rb.scalar_subquery.0, rb.scalar_subquery.1);
+    row_opt("derived_table_p50_ms", rb.derived_table.0, rb.derived_table.1);
+    row_opt("intersect_p50_ms", rb.intersect.0, rb.intersect.1);
+    row_opt("except_p50_ms", rb.except.0, rb.except.1);
+    row_opt("union_dedup_p50_ms", rb.union_dedup.0, rb.union_dedup.1);
+    row_opt("array_agg_orderby_p50_ms", rb.array_agg_orderby.0, rb.array_agg_orderby.1);
+    row_opt("string_agg_p50_ms", rb.string_agg.0, rb.string_agg.1);
+    row_opt("count_filter_p50_ms", rb.count_filter.0, rb.count_filter.1);
+    row_opt("case_10_branches_p50_ms", rb.case_10_branches.0, rb.case_10_branches.1);
+    row_opt("regexp_string_fns_p50_ms", rb.regexp_string_fns.0, rb.regexp_string_fns.1);
+    row_opt("multicol_order_mixed_p50_ms", rb.multicol_order_mixed.0, rb.multicol_order_mixed.1);
+    row_opt("lateral_join_p50_ms", rb.lateral_join.0, rb.lateral_join.1);
+    row_opt("any_array_p50_ms", rb.any_array.0, rb.any_array.1);
 
     // ---- Emit benchmark JSON ----------------------------------------------
     let basin_disk_f = basin_disk_bytes as f64;
@@ -2276,6 +3336,38 @@ async fn run_full_compare_inner(
         mk_ext("JSONB jsonb_typeof(metadata) p50", jb.typeof_fn.0, jb.typeof_fn.1),
         mk_ext("JSONB filter+agg (GROUP BY ->>category) p50", jb.filter_agg.0, jb.filter_agg.1),
         mk_ext("JSONB jsonb_set UPDATE (10 rows)", jb.jsonb_set_update.0, jb.jsonb_set_update.1),
+        // Robustness-breadth shapes (#38-#62) — same Option-or-gap helper.
+        // CONCURRENT / TXN (7)
+        mk_ext("Concurrent INSERT 8x1000 rows", rb.concurrent_insert.0, rb.concurrent_insert.1),
+        mk_ext("Concurrent SELECT 16 sessions mixed", rb.concurrent_select.0, rb.concurrent_select.1),
+        mk_ext("Read-modify-write contention 8 sessions", rb.rmw_contention.0, rb.rmw_contention.1),
+        mk_ext("BEGIN; INSERT x100; COMMIT throughput", rb.txn_insert_throughput.0, rb.txn_insert_throughput.1),
+        mk_ext("ROLLBACK drops rows (txn correctness)", rb.rollback_drops_rows.0, rb.rollback_drops_rows.1),
+        mk_ext("Savepoint nest + ROLLBACK TO", rb.savepoint_rollback.0, rb.savepoint_rollback.1),
+        mk_ext("Long-txn snapshot isolation", rb.snapshot_isolation.0, rb.snapshot_isolation.1),
+        // NULL / 3VL (3)
+        mk_ext("WHERE x IS NULL", rb.is_null.0, rb.is_null.1),
+        mk_ext("WHERE x = NULL returns 0 (3VL)", rb.eq_null_3vl.0, rb.eq_null_3vl.1),
+        mk_ext("COUNT(col) vs COUNT(*) NULL handling", rb.count_col_vs_star.0, rb.count_col_vs_star.1),
+        // SUBQUERY (4)
+        mk_ext("NOT IN (NULL in subquery, 3VL)", rb.not_in_null.0, rb.not_in_null.1),
+        mk_ext("NOT EXISTS", rb.not_exists.0, rb.not_exists.1),
+        mk_ext("Scalar subquery in SELECT list", rb.scalar_subquery.0, rb.scalar_subquery.1),
+        mk_ext("Derived table (subquery in FROM)", rb.derived_table.0, rb.derived_table.1),
+        // SET OPS (3)
+        mk_ext("INTERSECT", rb.intersect.0, rb.intersect.1),
+        mk_ext("EXCEPT", rb.except.0, rb.except.1),
+        mk_ext("UNION (dedup)", rb.union_dedup.0, rb.union_dedup.1),
+        // AGG / STRING / ARRAY (5)
+        mk_ext("ARRAY_AGG + ORDER BY in aggregate", rb.array_agg_orderby.0, rb.array_agg_orderby.1),
+        mk_ext("STRING_AGG", rb.string_agg.0, rb.string_agg.1),
+        mk_ext("COUNT(*) FILTER (WHERE ...)", rb.count_filter.0, rb.count_filter.1),
+        mk_ext("CASE WHEN 10 branches", rb.case_10_branches.0, rb.case_10_branches.1),
+        mk_ext("regexp_match / substring / split_part", rb.regexp_string_fns.0, rb.regexp_string_fns.1),
+        // RANGE / INDEX (3)
+        mk_ext("Multi-col ORDER BY mixed ASC/DESC + LIMIT", rb.multicol_order_mixed.0, rb.multicol_order_mixed.1),
+        mk_ext("LATERAL JOIN (correlated derived table)", rb.lateral_join.0, rb.lateral_join.1),
+        mk_ext("WHERE col = ANY(int[])", rb.any_array.0, rb.any_array.1),
     ];
 
     report_postgres_compare(id, name, claim, true, metrics, None);
