@@ -2164,6 +2164,83 @@ pub(crate) async fn apply_gin_pruning_for_query(
         None => return Ok(()), // query shape not recognised → full scan
     };
 
+    // Fetch the live file set from the catalog.  Needed both for the
+    // file-level completeness guard and the row-group-direct path.
+    let meta = match engine.config().catalog.load_table(project, &gin_plan.table).await {
+        Ok(m) => m,
+        Err(_) => return Ok(()), // can't verify completeness → full scan
+    };
+    let live_files: Vec<DataFileRef> = meta.live_data_files();
+    if live_files.is_empty() {
+        // No live files — the Empty short-circuit handles this; nothing to prune.
+        return Ok(());
+    }
+    let live_paths: Vec<String> =
+        live_files.iter().map(|f| f.path.to_string()).collect();
+
+    // ── Direct row-group prune path (for compaction-indexed files) ────────────
+    //
+    // On the shard INSERT path, the engine's `maintain_secondary_indexes_on_insert`
+    // is bypassed (INSERTs go to WAL+tail without touching GinIndexRegistry).
+    // The compactor re-indexes JSONB GIN columns into `GinRowGroupRegistry` at
+    // flush time, making row-group summaries the *only* GIN metadata for
+    // shard-written data — the file-level posting list is empty.
+    //
+    // To let row-group pruning fire even when the file-level GIN index is absent,
+    // we first check whether the row-group registry has sealed summaries for
+    // EVERY live file.  If so, we can prune directly from the row-group registry
+    // without consulting the posting list at all.
+    //
+    // Correctness: the row-group registry is a conservative superset (bloom
+    // false positives are tolerated; `jsonb_contains` UDF re-checks every emitted
+    // row).  Files absent from the registry are read in full (no false negatives).
+    {
+        let all_rg_indexed = live_paths.iter().all(|p| {
+            engine.gin_rowgroup_registry().is_file_indexed(
+                project,
+                &gin_plan.table,
+                &gin_plan.col,
+                p,
+            )
+        });
+        if all_rg_indexed {
+            let rg_prune = crate::index_probe::rowgroup_prune_for_containment(
+                engine.gin_rowgroup_registry(),
+                project,
+                &gin_plan.table,
+                &gin_plan.col,
+                &gin_plan.opclass,
+                &gin_plan.needle,
+                &live_paths,
+            );
+            if let crate::index_probe::RowGroupPrune::PerFile(rg_map) = rg_prune {
+                let df_schema = match schema_ws_to_df(&meta.schema) {
+                    Ok(s) => Arc::new(s),
+                    Err(_) => return Ok(()), // schema error → full scan
+                };
+                let provider = crate::gin_rowgroup_scan::GinRowGroupPrunedTable::new(
+                    df_schema,
+                    engine.config().storage.clone(),
+                    *project,
+                    gin_plan.table.clone(),
+                    meta.file_format,
+                    live_paths.clone(),
+                    rg_map,
+                );
+                let tref = TableReference::Bare { table: gin_plan.table.as_str().into() };
+                let _ = ctx.deregister_table(tref.clone());
+                ctx.register_table(tref, Arc::new(provider))
+                    .map_err(|e| BasinError::internal(format!("register rg-pruned table: {e}")))?;
+                return Ok(());
+            }
+            // Row-group registry covers all files but needle has no terms
+            // (RowGroupPrune::Unknown).  Fall through to the posting-list path
+            // and then to full scan — safe, never a false negative.
+        }
+    }
+
+    // ── File-level posting-list path (for direct-INSERT / non-shard data) ─────
+
     // Probe the posting list.
     let gin_result = engine.gin_index_registry().probe_containment(
         project,
@@ -2179,17 +2256,6 @@ pub(crate) async fn apply_gin_pruning_for_query(
         // NoIndex → full scan.
         _ => return Ok(()),
     };
-
-    // Completeness guard: fetch the live file set from the catalog.
-    let meta = match engine.config().catalog.load_table(project, &gin_plan.table).await {
-        Ok(m) => m,
-        Err(_) => return Ok(()), // can't verify completeness → full scan
-    };
-    let live_files: Vec<DataFileRef> = meta.live_data_files();
-    if live_files.is_empty() {
-        // No live files — the Empty short-circuit handles this; nothing to prune.
-        return Ok(());
-    }
 
     // Check coverage: every live file must appear in the indexed-files set.
     let indexed = engine.gin_index_registry().indexed_files_for(

@@ -298,6 +298,23 @@ impl Shard {
         self.inner.set_top_pattern_provider(provider);
     }
 
+    /// Wire the engine's GIN row-group bloom registry into the compactor.
+    ///
+    /// Called once from `Engine::new` so the compactor can re-index compacted
+    /// files into the same registry the engine's `@>` prune reads from.  On
+    /// the shard path, INSERT writes go directly to WAL + tail (bypassing the
+    /// engine's `maintain_secondary_indexes_on_insert`), so compaction is the
+    /// only point where GIN row-group summaries can be populated for
+    /// compacted files.  Without this, the completeness guard in
+    /// `apply_gin_pruning_for_query` would always see un-indexed live files
+    /// and fall back to a full scan.
+    pub fn set_gin_rowgroup_registry(
+        &self,
+        registry: Arc<basin_storage::index::gin_rowgroup::GinRowGroupRegistry>,
+    ) {
+        self.inner.set_gin_rowgroup_registry(registry);
+    }
+
     /// Phase 6.X.C (ADR 0023) — voluntarily hand off the lease for
     /// `(project, partition)` to `to_holder`. While the handoff is in
     /// progress new writes against this partition fail with
@@ -439,6 +456,14 @@ pub(crate) trait ShardImpl: Send + Sync {
     }
     /// Phase 5.14.D2: register the top-pattern provider. Default no-op.
     fn set_top_pattern_provider(&self, _provider: Arc<dyn TopPatternProvider>) {}
+    /// Wire the GIN row-group registry (populated at INSERT time by the engine
+    /// and read at query time for `@>` prune decisions) into the compactor so
+    /// newly compacted files are also indexed.  Default no-op.
+    fn set_gin_rowgroup_registry(
+        &self,
+        _registry: Arc<basin_storage::index::gin_rowgroup::GinRowGroupRegistry>,
+    ) {
+    }
     /// Phase 6.X.C — voluntary lease handoff. Default returns Ok (a backend
     /// that doesn't model leases has nothing to hand off).
     async fn yield_partition(

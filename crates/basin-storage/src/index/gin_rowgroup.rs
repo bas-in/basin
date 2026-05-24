@@ -51,6 +51,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use arrow_array::RecordBatch;
 use basin_common::{ProjectId, TableName};
 use fastbloom::BloomFilter;
 
@@ -385,6 +386,137 @@ impl Default for GinRowGroupRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ── Batch-level indexing helper ───────────────────────────────────────────────
+
+/// Populate the per-row-group bloom-filter registry for a single JSONB
+/// column from a `RecordBatch`.  Each row is assigned to its Parquet
+/// row-group via `row_idx / row_group_size` — the same partitioning used by
+/// the Parquet writer's `WriterProperties::max_row_group_size`.
+///
+/// Only `LargeBinary` columns are handled (Basin's canonical JSONB wire
+/// type).  Non-JSONB columns and NULL values are silently skipped
+/// (best-effort).  After all rows have been fed into the bloom summaries,
+/// [`GinRowGroupRegistry::mark_file_indexed`] is called so the file is
+/// eligible for row-group-level prune decisions.
+///
+/// This is the shared implementation used by both the engine's INSERT path
+/// and the shard compactor so the term extraction logic is identical.
+pub fn index_batch_jsonb_gin(
+    registry: &GinRowGroupRegistry,
+    project: &ProjectId,
+    table: &TableName,
+    col_name: &str,
+    opclass: &str,
+    batch: &RecordBatch,
+    file_path: &str,
+    row_group_size: usize,
+) {
+    use arrow_array::Array;
+    let Ok(col_idx) = batch.schema().index_of(col_name) else {
+        return;
+    };
+    let col = batch.column(col_idx);
+    let Some(arr) = col
+        .as_any()
+        .downcast_ref::<arrow_array::LargeBinaryArray>()
+    else {
+        return;
+    };
+    let rg_size = row_group_size.max(1);
+    for row in 0..arr.len() {
+        if arr.is_null(row) {
+            continue;
+        }
+        let bytes = arr.value(row);
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+            continue;
+        };
+        let terms = gin_extract_terms(&value, opclass);
+        if terms.is_empty() {
+            continue;
+        }
+        let row_group = (row / rg_size) as u32;
+        registry.index_row(project, table, col_name, &terms, file_path, row_group);
+    }
+    registry.mark_file_indexed(project, table, col_name, file_path);
+}
+
+/// Extract GIN term atoms from a JSONB value for indexing / probing.
+///
+/// Mirrors the engine's `extract_terms` in `basin-engine/src/index_probe.rs`.
+/// Both functions MUST produce identical term sets for the prune to be
+/// conservative (no false negatives).  Any change here requires a matching
+/// change there.
+///
+/// For `jsonb_ops`: emits `key:<k>` and `kv:<k>=<v>` for every top-level
+/// key, recursing into nested objects.
+/// For `jsonb_path_ops`: emits `path_hash:<h>` (FNV-1a hash of the full
+/// root-to-leaf path + value) for every leaf, recursing into nested objects.
+pub fn gin_extract_terms(value: &serde_json::Value, opclass: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    gin_extract_terms_inner(value, opclass, "", &mut terms);
+    terms
+}
+
+fn gin_extract_terms_inner(
+    value: &serde_json::Value,
+    opclass: &str,
+    path_prefix: &str,
+    out: &mut Vec<String>,
+) {
+    if let serde_json::Value::Object(map) = value {
+        for (k, v) in map {
+            let path = if path_prefix.is_empty() {
+                k.clone()
+            } else {
+                format!("{path_prefix}.{k}")
+            };
+            if opclass == "jsonb_path_ops" {
+                let leaf_repr = gin_compact_value(v);
+                let hash_input = format!("{path}={leaf_repr}");
+                let hash = gin_simple_hash(&hash_input);
+                out.push(format!("path_hash:{hash}"));
+                if matches!(v, serde_json::Value::Object(_)) {
+                    gin_extract_terms_inner(v, opclass, &path, out);
+                }
+            } else {
+                // jsonb_ops: key presence + key=value terms.
+                out.push(format!("key:{k}"));
+                let leaf_repr = gin_compact_value(v);
+                out.push(format!("kv:{k}={leaf_repr}"));
+                if matches!(v, serde_json::Value::Object(_)) {
+                    gin_extract_terms_inner(v, opclass, &path, out);
+                }
+            }
+        }
+    }
+    // Top-level arrays and scalars produce no terms.
+}
+
+fn gin_compact_value(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => format!("\"{s}\""),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            let s = v.to_string();
+            if s.len() > 200 { s[..200].to_string() } else { s }
+        }
+    }
+}
+
+fn gin_simple_hash(s: &str) -> u64 {
+    const FNV_OFFSET: u64 = 14695981039346656037;
+    const FNV_PRIME: u64 = 1099511628211;
+    let mut hash = FNV_OFFSET;
+    for byte in s.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

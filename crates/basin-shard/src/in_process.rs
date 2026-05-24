@@ -117,6 +117,13 @@ pub(crate) struct InProcessShard {
     pub(crate) partitions: Arc<Mutex<PartitionMap>>,
     stats: Arc<Mutex<ShardStats>>,
     top_pattern_provider: std::sync::RwLock<Option<Arc<dyn TopPatternProvider>>>,
+    /// GIN row-group bloom registry.  Written once from `Engine::new` via
+    /// `Shard::set_gin_rowgroup_registry` (before the compaction loop
+    /// starts); read by `compact_one` to re-index compacted files.
+    /// `None` until the engine wires it in (safe: compactor skips indexing).
+    gin_rowgroup_registry: std::sync::RwLock<
+        Option<Arc<basin_storage::index::gin_rowgroup::GinRowGroupRegistry>>,
+    >,
     /// Phase 6.X.A — leases held by this replica + their granted epoch.
     held_leases: HeldLeases,
     /// Phase 6.X.C — partitions whose lease is mid-handoff. While present in
@@ -132,6 +139,7 @@ impl InProcessShard {
             partitions: Arc::new(Mutex::new(HashMap::new())),
             stats: Arc::new(Mutex::new(ShardStats::default())),
             top_pattern_provider: std::sync::RwLock::new(None),
+            gin_rowgroup_registry: std::sync::RwLock::new(None),
             held_leases: Arc::new(Mutex::new(HashMap::new())),
             draining: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -143,11 +151,17 @@ impl InProcessShard {
             .read()
             .expect("top_pattern_provider lock poisoned")
             .clone();
+        let rg_registry = self
+            .gin_rowgroup_registry
+            .read()
+            .expect("gin_rowgroup_registry lock poisoned")
+            .clone();
         Self {
             cfg: self.cfg.clone(),
             partitions: self.partitions.clone(),
             stats: self.stats.clone(),
             top_pattern_provider: std::sync::RwLock::new(provider),
+            gin_rowgroup_registry: std::sync::RwLock::new(rg_registry),
             held_leases: self.held_leases.clone(),
             draining: self.draining.clone(),
         }
@@ -908,18 +922,29 @@ impl InProcessShard {
             let merged = arrow::compute::concat_batches(&schema, &batches)
                 .map_err(|e| BasinError::storage(format!("concat batches: {e}")))?;
 
-            // Resolve per-table metadata: on-disk format, cluster columns, and
-            // adaptive-sort override.  A missing catalog row is unusual but
-            // non-fatal; fall back to safe defaults so the whole compaction
-            // tick doesn't error out.
-            let (file_format, declared_cluster_cols, adaptive_sort_override) =
+            // Resolve per-table metadata: on-disk format, cluster columns,
+            // adaptive-sort override, GIN indexes, and row-group size.
+            // A missing catalog row is unusual but non-fatal; fall back to
+            // safe defaults so the whole compaction tick doesn't error out.
+            let (file_format, declared_cluster_cols, adaptive_sort_override,
+                 gin_indexes, row_group_rows, row_block_size) =
                 match self.cfg.catalog.load_table(project, &table).await {
                     Ok(m) => (
                         shard_map_file_format(m.file_format),
                         m.cluster_columns,
                         m.adaptive_sort_override.unwrap_or(false),
+                        m.indexes.clone(),
+                        m.row_group_rows,
+                        m.row_block_size,
                     ),
-                    Err(_) => (basin_storage::FileFormat::default(), Vec::new(), false),
+                    Err(_) => (
+                        basin_storage::FileFormat::default(),
+                        Vec::new(),
+                        false,
+                        Vec::new(),
+                        None,
+                        None,
+                    ),
                 };
 
             // Phase 5.14.D2: consult the query-pattern history and decide
@@ -964,6 +989,14 @@ impl InProcessShard {
             let write_opts = basin_storage::WriteOptions {
                 file_format,
                 cluster_columns: sort_cols,
+                // Honour the table's row-group size (set via
+                // `WITH (basin.row_block_size = N)` at CREATE TABLE time or
+                // via `SET row_group_rows`).  Without this the compactor
+                // always writes at the default 65 536-row cap, preventing
+                // multi-row-group layouts even when the table was configured
+                // with a smaller block size.
+                row_block_size,
+                max_row_group_size: row_group_rows,
                 ..Default::default()
             };
             let data_file = self
@@ -984,6 +1017,49 @@ impl InProcessShard {
 
             self.commit_with_retry(project, &table, &merged, file_ref)
                 .await?;
+
+            // Re-index the compacted file's JSONB GIN columns into the
+            // row-group bloom registry so the engine's `@>` row-group prune
+            // fires on compacted files.
+            //
+            // This is the ONLY place GIN row-group summaries are populated on
+            // the shard path: INSERT writes go directly to WAL+tail (the
+            // executor's `maintain_gin_rowgroup_index_on_insert` is not called
+            // on the shard fast path), so compaction is where all indexing
+            // happens for shard-written data.
+            //
+            // Correctness: the registry is a conservative superset (bloom
+            // false positives are fine; `jsonb_contains` re-checks every
+            // surviving row at read time).  Skipping indexing (when the
+            // registry is None) is safe — the completeness guard in
+            // `apply_gin_pruning_for_query` falls back to full scan for
+            // un-indexed files, never producing false negatives.
+            //
+            // Eviction of stale entries: on the current shard path,
+            // INSERT never populates the registry (tail batches are never
+            // indexed), so the registry starts empty before the first
+            // compaction.  The compacted file is always NEW — there is no
+            // pre-existing entry to evict.  If a future Parquet-merge
+            // compactor (that merges existing cold-tier files into fewer
+            // larger files) is added, it should call
+            // `GinRowGroupRegistry::remove_file` for each superseded file
+            // to reclaim memory.  That path doesn't exist today.
+            //
+            // The effective row-group size mirrors the writer's priority:
+            // row_block_size (WITH clause) > row_group_rows (ALTER TABLE) > default.
+            let effective_rg_size = row_block_size
+                .map(|v| v as usize)
+                .or(row_group_rows)
+                .unwrap_or(basin_storage::DEFAULT_MAX_ROW_GROUP_SIZE);
+            reindex_compacted_file_gin(
+                &self.gin_rowgroup_registry,
+                project,
+                &table,
+                &gin_indexes,
+                effective_rg_size,
+                &merged,
+                data_file.path.as_ref().as_ref(),
+            );
 
             if used_adaptive_sort {
                 any_adaptive_sort = true;
@@ -1215,6 +1291,17 @@ impl ShardImpl for InProcessShard {
             .write()
             .expect("top_pattern_provider lock poisoned");
         *guard = Some(provider);
+    }
+
+    fn set_gin_rowgroup_registry(
+        &self,
+        registry: Arc<basin_storage::index::gin_rowgroup::GinRowGroupRegistry>,
+    ) {
+        let mut guard = self
+            .gin_rowgroup_registry
+            .write()
+            .expect("gin_rowgroup_registry lock poisoned");
+        *guard = Some(registry);
     }
 
     async fn flush_to_parquet(&self) -> Result<()> {
@@ -1794,6 +1881,73 @@ fn evaluate_predicate(
     };
 
     Ok(mask)
+}
+
+// ── GIN row-group re-index for compacted files ───────────────────────────────
+
+/// Populate the per-row-group GIN bloom registry for every JSONB GIN column
+/// declared on `table` after a compaction writes a new merged Parquet file.
+///
+/// This is the compactor's counterpart to `maintain_gin_rowgroup_index_on_insert`
+/// in `basin-engine/src/executor.rs`.  On the shard INSERT path the executor's
+/// index-maintenance is bypassed (INSERTs go directly to WAL + tail), so
+/// compaction is the only point where GIN row-group summaries can be populated
+/// for shard-written data.
+///
+/// `rg_registry_lock` is `None` until `Engine::new` calls
+/// `Shard::set_gin_rowgroup_registry`; skip indexing in that case.
+/// `gin_indexes` lists the table's declared secondary indexes (only `gin`
+/// access-method, single-column, `LargeBinary`-typed entries are processed).
+/// `rg_size` is the effective row-group row count used by the Parquet writer
+/// for this compaction (mirrors the writer's priority logic:
+/// `row_block_size > row_group_rows > DEFAULT_MAX_ROW_GROUP_SIZE`).
+fn reindex_compacted_file_gin(
+    rg_registry_lock: &std::sync::RwLock<
+        Option<Arc<basin_storage::index::gin_rowgroup::GinRowGroupRegistry>>,
+    >,
+    project: &ProjectId,
+    table: &TableName,
+    gin_indexes: &[basin_catalog::SecondaryIndex],
+    rg_size: usize,
+    batch: &arrow_array::RecordBatch,
+    file_path: &str,
+) {
+    // Snapshot the Arc without holding the lock across potentially long
+    // indexing work.  `None` means the engine hasn't wired the registry yet;
+    // skip silently (compactor is safe: no false negatives, just no prune).
+    let registry = {
+        let guard = rg_registry_lock
+            .read()
+            .expect("gin_rowgroup_registry lock poisoned");
+        match guard.as_ref() {
+            Some(r) => r.clone(),
+            None => return,
+        }
+    };
+
+    for idx in gin_indexes {
+        // Only single-column JSONB GIN indexes are row-group-indexed.
+        if idx.access_method != "gin" || idx.columns.len() != 1 {
+            continue;
+        }
+        let opclass = idx.opclass.as_deref().unwrap_or("jsonb_ops");
+        // tsvector GIN columns are handled by a separate FTS registry;
+        // skip them here.
+        if opclass == "tsvector_ops" {
+            continue;
+        }
+        let col_name = &idx.columns[0];
+        basin_storage::index::gin_rowgroup::index_batch_jsonb_gin(
+            &registry,
+            project,
+            table,
+            col_name,
+            opclass,
+            batch,
+            file_path,
+            rg_size,
+        );
+    }
 }
 
 #[cfg(test)]

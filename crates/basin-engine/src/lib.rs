@@ -352,6 +352,15 @@ impl Engine {
         if let Some(shard) = inner.cfg.shard.as_ref() {
             shard.set_top_pattern_provider(inner.query_history.clone());
         }
+        // C2 / compaction re-index: wire the engine's GIN row-group registry
+        // into the shard compactor so that compacted files are re-indexed into
+        // the same registry the engine's `@>` prune reads from.  On the shard
+        // INSERT path the executor's `maintain_gin_rowgroup_index_on_insert` is
+        // bypassed (INSERTs go to WAL+tail), making compaction the only
+        // opportunity to populate row-group summaries for shard-written data.
+        if let Some(shard) = inner.cfg.shard.as_ref() {
+            shard.set_gin_rowgroup_registry(inner.gin_rowgroup_registry.clone());
+        }
         attach_reactor_sink(&inner, catalog);
         let engine = Self { inner };
         // Phase 5.28.C: auto-start the idle-in-transaction session reaper when
@@ -621,6 +630,14 @@ impl Engine {
         &self,
     ) -> &Arc<basin_storage::index::gin_rowgroup::GinRowGroupRegistry> {
         &self.inner.gin_rowgroup_registry
+    }
+
+    /// Public accessor for integration tests that need to inspect the
+    /// GIN row-group bloom registry (e.g. to verify compaction re-indexing).
+    pub fn gin_rowgroup_registry_for_test(
+        &self,
+    ) -> Arc<basin_storage::index::gin_rowgroup::GinRowGroupRegistry> {
+        self.inner.gin_rowgroup_registry.clone()
     }
 
     // ── Phase 5.20.E: GIN FTS (tsvector) index ───────────────────────────────
