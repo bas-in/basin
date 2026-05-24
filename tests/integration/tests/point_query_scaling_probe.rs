@@ -64,7 +64,7 @@ async fn point_query_file_scaling() {
     .unwrap();
 
     let batch = 10_000i64;
-    for scale in [200_000i64, 1_000_000] {
+    for scale in [1_000_000i64, 10_000_000] {
         // Seed up to `scale` in 10k batches (each batch → one Parquet file
         // after flush, disjoint id range).
         let already = {
@@ -104,9 +104,12 @@ async fn point_query_file_scaling() {
         }
 
         let target = scale / 2 + 7;
-        // Warm-up (force flush + plan cache).
+        // Warm-up — MUST match the timed query's projection (mirrors the
+        // fixed bench warm-up, efd07d1) so the first timed sample is warm.
         let _ = sess
-            .execute(&format!("SELECT id FROM events WHERE id = {target}"))
+            .execute(&format!(
+                "SELECT id, user_id, amount, status, created_at FROM events WHERE id = {target}"
+            ))
             .await
             .unwrap();
 
