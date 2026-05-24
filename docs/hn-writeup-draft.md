@@ -60,9 +60,12 @@ grows (COUNT(*), window LAG, INTERSECT, …).
   structurally faster on point mutations. We closed this from a brutal
   **1550× slower** (118ms) by landing an on-by-default hot-tier write path
   this month — but PG still wins the absolute number.
-- **Point query `WHERE pk = ?`**: PG answers in ~7µs (sub-network); Basin is
-  in the millisecond range. For a single point read PG's heap is just the
-  right shape. Bounded, not scaling-divergent, but a real loss.
+- **Point query `WHERE pk = ?`**: ~32× slower at 1M — Basin ~0.23ms vs PG
+  ~7µs. PG answers a heap index probe from shared_buffers in microseconds;
+  Basin's bloom + zone-map prune narrows to one file and reads it in a
+  fraction of a millisecond. 0.23ms is fine in absolute terms; the 32× is
+  just PG being sub-microsecond. Bounded and flat across scales (0.1-0.23ms
+  from 10k to 1M).
 - **JSONB scalar extract** (`->>`, `->`, `#>`): 100-2000× slower at scale.
   This is the honest big one — Basin parses JSON per-row where PG has a
   binary jsonb format. We shipped the GIN row-group prune infrastructure for
