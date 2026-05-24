@@ -1430,3 +1430,106 @@ In flight: #88 (read-path tombstone) + #104 (LISTEN/NOTIFY).
 - D agent's last comment surfaced a NEW bench-harness bug: both 10k OLTP runs panicked at bulk-update step BEFORE reaching DELETE; test framework swallowed panic and exited 0. Bench harness needs to fail-loud on panics. Filed against #110 redispatch.
 - F agent reported "Build is clean" before kill — fix likely correct, just needs rebuild after target wipe. Safe to redispatch unchanged.
 - Next loop tick: redispatch D + F (will incur full cold rebuild — ~10-15 min combined).
+
+## 2026-05-24 — Post-cleanup wave (3 agents)
+- decisions.md committed (9d1d0a3).
+- F-resume (a21838cc4c8d2b5e2): F's pre-kill WIP preserved in tree (hot_tombstone +99, dml_extras -18); resume agent verifies + commits rather than restarting from scratch.
+- G (a7c920a67b9ae4041): Part A — fix bench harness panic-swallow (D's finding: silent false-green). Part B — investigate + fix-or-repro the bulk-update panic. Disjoint from F (touches compare_postgres_common.rs + maybe dml_mutate.rs, not hot_tombstone or dml_extras).
+- H (a6475e50ffca588c4): READ-ONLY triage of 10 uncommitted files of uncertain provenance (REVERT/COMMIT/LEAVE).
+- All cold rebuilds (target wiped). F-resume + G may take 10-15 min each; H is read-only.
+
+## 2026-05-24 — H landed: 4 commits, 3 orphans parked
+- H (a6475e50ffca588c4) audited 10 files: COMMIT 6, REVERT 4. Acted on it as 4 commits:
+  - 27800ad — CAPABILITIES.md parity-gaps section (basin_project_usage row dropped from H's COMMIT list because the engine module is orphaned/commented out at lib.rs:1061)
+  - 68ee2a7 — README batteries matrix + docs/batteries.md (linked together so no dangling link)
+  - b8fe879 — writer.rs EncodingMode placeholder
+  - 0e749f3 — bench data + dashboard refresh (Prisma 85→100%, sqlx 89→94%)
+- 3 untracked orphans LEFT in tree pending revive-or-delete decision:
+  - crates/basin-engine/src/project_usage_view.rs (263 LoC, mod commented out at lib.rs:1061, register fn signature pub(crate) fn register_basin_project_usage(ctx, registry, project) -> DfResult<()>)
+  - docs/operators/quotas.md (85 LoC operator guide)
+  - tests/integration/tests/basin_project_usage.rs (210 LoC test)
+- Revival cost: ~3 LoC (uncomment lib.rs:1061, call register_basin_project_usage from session.rs alongside register_pg_listening_channels at session.rs:1328). Defer until user explicitly wants the basin_project_usage view shipped.
+- F-resume + G still in flight on cold rebuild.
+
+## 2026-05-24 — Loop tick: yield (in-flight wave still rebuilding)
+- No new commits since 0e749f3. F-resume + G in flight, target dir at 9 GB (cold rebuild in progress). Adding more agents would thrash cargo's lock. Stop condition met (TASK.md only non-agent items, moat absorbed by F+G).
+
+## 2026-05-24 — F landed: #88 closed
+- F-resume (a21838cc4c8d2b5e2) commit b13970f. F's pre-kill WIP was complete + correct — both bugs addressed, the verifier just had to compile + commit.
+- Approach for COUNT(*) bug was different from my suggestion (statistics() override): F augments projection to include PK, wraps with TombstoneFilterExec, strips PK via ProjectionExec. More semantically correct — preserves cold's stats for non-tombstoned reads.
+- Approach for pushdown bug was as suggested: supports_filters_pushdown returns Unsupported when snapshot non-empty.
+- 8 fast-path tests pass, 0 ignored. Bench tag: fast path 83× faster than slow CoW (PR1A's main win confirmed end-to-end).
+- #88 closed. G still in flight (bench harness + bulk-update panic).
+
+## 2026-05-24 — Loop tick: G in progress (now touching dml_mutate.rs)
+- F landed (b13970f). G actively editing compare_postgres_common.rs + dml_mutate.rs (suggests G is fixing the bulk-update panic root cause, not just writing a reproducer — promising). Target 15 GB.
+- No file-disjoint work to dispatch without scope-creep (reviving project_usage_view orphan = unasked feature work). Yielding.
+
+## 2026-05-24 — G landed (2 commits) + baseline bench captured
+- G commits aec429b (Part A: bench fail-loud + non-deadlocking SchemaGuard) + af29297 (Part B: real engine bug — Binary↔LargeBinary cast in DML rewrite, JSONB column).
+- Baseline 10k bench from G's run committed as 84ee120. Key numbers (Basin vs PG):
+  - WINS: COUNT(*) full table 2.3× faster, correlated subquery 2.2× faster
+  - GAPS: single-row UPDATE 1630× (PR2 not shipped), recursive CTE 194×, DELETE 180× (fastpath off), JSONB @> with GIN 81× (uniform-distribution known), bulk INSERT 24×, ILIKE 18×, ORDER BY NULLS LAST + LIMIT 16× (#77 SortExec TopK fusion may not be effective on this shape — flag for follow-up), point query p99 15×, recursive CTE 194×
+- D-redo dispatched: rerun with BASIN_HOTTIER_DELETE_FASTPATH=1 to measure fastpath delta. PR1A unit test said 83× faster — bench should show DELETE drop ~176ms → <5ms.
+
+## 2026-05-24 — D-redo: fastpath gated out by bench schema, I dispatched
+- D-redo (a13f0cc0f8ab71b94) commit 2e23246. With BASIN_HOTTIER_DELETE_FASTPATH=1: DELETE 170.66ms (was 176.24ms). −3.2% = noise. Fastpath did NOT fire.
+- Root cause D found: bench `events` table declared `id BIGINT NOT NULL` (no PRIMARY KEY). Gate `meta.pk_columns.len() == 1` at dml_mutate.rs:656 short-circuits → falls to CoW slow path.
+- I checked: all 3 bench tables (users, events, categories at lines 1575/1584/1599/1805/1814/1825/1976) missing PRIMARY KEY. Unrealistic schemas (real apps declare PK).
+- Dispatched I agent: add PRIMARY KEY to all 3 tables (mechanical edit, both Basin + PG sides), rerun with fastpath ON, commit. This is fair (PG gets btree benefit too) and more realistic.
+
+## 2026-05-24 — I landed: DELETE 180× → 2.5× behind PG (~290× Basin speedup)
+- I (a0e7319e514c85675) commit bdc3508. Added PRIMARY KEY to all 7 CREATE TABLE statements (3 PG + 3 Basin + 1 cold-start), removed 3 ALTER TABLE DROP CONSTRAINT *_pkey calls that had been deliberately stripping PG PKs to match Basin's no-PK schema (now fair: both have PK).
+- DELETE WHERE id IN (10 rows): pre-PK 176ms / post-PK fastpath-OFF 190ms (PR stayed gated by env, expected) / **post-PK fastpath-ON 0.597ms vs PG 0.237ms** — gap closed from 180× to 2.5×.
+- Side findings:
+  - Basin POINT query did NOT speed up despite having PK — PK-probe path not wired into fast_select read path. Future optimization candidate.
+  - PG bulk_update sped up 33% (now uses PK probe for IN-clause). Comparison stays fair.
+  - Some shape noise (union_all, numeric_range, correlated_subq ±34-126%) — single-run small-shape variance.
+- All decomposed #88 work done. Running cargo test --workspace for full regression check before yielding.
+
+## 2026-05-24 — Workspace test: orphan kill + restart
+- First workspace test (bariw0mpl) sat at 0% CPU for 20+ min. Root cause: orphan compare_postgres_10k binary from G's 12:01 AM bench run (PIDs 38215 + 40907, stuck ~80 min) was holding the cargo target lock. Killed both orphans; first workspace test exited 144 (SIGTERM from my kill).
+- Lesson: cargo bench/test orphans can hold the target lock indefinitely if the test panics post-fork. Worth adding to harness: timeout-kill in the SchemaGuard finalize. (G already fixed the deadlock case; this is a separate path — the binary itself running long-pending teardown.)
+- Restarted clean workspace test as bw8zhooro. Cold compile + test run estimated 25-40 min.
+
+## 2026-05-24 — Workspace test complete (exit 101): 12 failing, 3 fix waves dispatched
+- Workspace test bw8zhooro finished. 6 binaries failed, 12 tests total:
+  - basin-engine --lib: 1 fail (`executor::pg_cancel_backend_tests::cancel_running_query_returns_57014`)
+  - basin_project_usage (orphan): 3 fail (all 3 tests in the file)
+  - coverage_errorpaths: 1 fail (`error_listen_notify_unlisten_0a000`)
+  - noop_accept: 3 fail (`listen/notify/unlisten_is_still_rejected_with_0a000`)
+  - pg_query_compat: 3 fail (`listen/notify/unlisten_is_rejected`)
+  - regression_engine_bugs: 1 fail (`error_listen_notify_unlisten_rejected`)
+- Diagnosis: 8 of 12 are stale assertions made obsolete by #104 (LISTEN/NOTIFY implementation in 2a3f925). 3 are orphan tests for the unrevived basin_project_usage view. 1 is a likely race in pg_cancel_backend.
+- Dispatched 3 file-disjoint agents:
+  - J (af84cd5018e213bd2): revive basin_project_usage feature, restore CAPABILITIES row
+  - K (a0633c36ea876a8bb): flip-or-delete 8 stale LISTEN/NOTIFY rejection tests across 4 files
+  - L (aa80f71de0c5efebf): diagnose pg_cancel_backend test (3-run flakiness check first)
+
+## 2026-05-24 — SCOPE CHANGE: pull v0.2+ perf roadmap into this version
+- User decision: all "fixable-by-us" perf items (previously split v0.1-quick vs v0.2-roadmap) now in scope for THIS version. Loop until all done.
+- In scope now: PR2 hot-tier UPDATE, B2 Vortex 2-pass, C1 binary JSONB, C2 GIN row-group prune, B3 trigram, Vortex #4034 pagination workaround, + 9 quick wins, + 25 new bench shapes, + N rerun at scale.
+- Tasks #119-128 created. NOT pulled in: pure-DataFusion-upstream items (recursive CTE, join partition tuning, DF aggregate rewrites) — those stay parked (can't fix without DF PRs).
+- Dispatch constraint (memory feedback_no_worktree_isolation_rust): ONE basin-engine agent per wave (shared tree, no worktree; engine agents conflict + race the build). Other crates (basin-storage, basin-trgm, tests/integration) can run parallel in same wave.
+- L still holds basin-engine (executor.rs, pg_cancel_backend). So wave 1 = 3 crate-disjoint non-engine agents:
+  - M (#119): 25 bench shapes → tests/integration
+  - P/B2 (#120): Vortex 2-pass → basin-storage
+  - Q/B3-core (#121): trigram core → basin-trgm
+- Engine queue (serialized, post-L): PR2, C1, PK-probe, JSONB-unsup, plan-quality, then C2+B3 engine-wiring.
+
+## 2026-05-24 — L landed (57bb31d), engine free but build blocked by P's WIP
+- L (aa80f71de0c5efebf) commit 57bb31d: pg_cancel_backend test was a 3-defect test-side sync bug (current_thread runtime starvation + too-shallow join completing before cancel + session dropped mid-spawn deregistering pid). Impl was correct. Fixed to multi_thread + Arc-shared session + 5-way join that yields between batches. 10/10 then 3/3 green.
+- basin-engine now FREE for engine queue. BUT: P/B2 (Vortex 2-pass) is mid-edit in basin-storage — `cargo check -p basin-engine` fails with E0425 in basin-storage (P's WIP). Since basin-engine depends on basin-storage, the whole tree won't build until P lands.
+- LESSON: P/B2 edits WriteOptions (a public struct consumed by basin-engine executor.rs::write_options_for). This is NOT truly file-disjoint from engine — cross-crate build coupling. P was told to keep the field Default-safe; verifying that holds when P commits. L's report confirmed an earlier transient break from exactly this (encoding_mode added without executor call-site update).
+- Decision: do NOT dispatch engine queue into broken-build tree. Wait for P (+M, Q) to land. Engine wave goes next tick once cargo check is green.
+
+## 2026-05-24 — Wave 1 nearly done: Q + M landed, P/B2 still in flight
+- Q/B3-core (a867ac38446a3d491) commit b8f669a: basin-trgm gin_like module — trigrams_for_pattern + TrigramGinIndex.candidates() for (I)LIKE pruning. 18 new tests, indexes both case-preserved + lowercased so one index serves LIKE+ILIKE. Found+fixed a case-sensitivity false-negative bug. NOT wired to engine (serialized later).
+- M (ab95d5667d1476850) commit bc32cfd: +25 bench shapes (#38-62). 20 supported / 5 gaps. Zero panics.
+- NEW GAPS M surfaced (net-new, beyond perf scope — candidates for later):
+  1. ROLLBACK drops rows — FAILED (rollback may not be dropping uncommitted rows — CORRECTNESS concern, investigate)
+  2. Savepoint nest + ROLLBACK TO SAVEPOINT — roadmap (documented non-goal)
+  3. Long-txn snapshot isolation — reads not stable across concurrent commit (isolation-level concern)
+  4. regexp_match / substring / split_part — string fns missing
+  5. WHERE col = ANY(int[]) — common sqlx batch-fetch shape missing
+- P/B2 (abf763ab9d1793c80) still in flight — basin-storage build broken (E0425, WriteOptions.encoding_mode WIP). Engine queue blocked until P commits + tree builds green.
