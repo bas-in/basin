@@ -1994,32 +1994,145 @@ impl ScalarUDFImpl for JsonbExtractPathUdf {
         // Hoist downcasts: do them once per array, before the row loop,
         // not once per row per key.  For a 100k-row, 3-key extract this
         // saves ~300k vtable lookups + ~300k key-string allocations.
-        let target_typed = TypedJsonbArray::new(&target_arr, self.name())?;
         let key_typed: Vec<TypedStringRef<'_>> = key_arrs
             .iter()
             .map(|k| TypedStringRef::new(k, self.name()))
             .collect::<DFResult<Vec<_>>>()?;
 
+        // Lazy fast path: walk the byte-scanner along the requested key list,
+        // pulling out ONLY the addressed sub-slice.  Same scanner used by `#>`
+        // and `#>>` (raw_walk_path), so semantics are byte-for-byte identical.
+        // On any malformed-payload edge the scanner returns `Err(())` and we
+        // fall back to the full Value-tree parse path for that row.
         if self.return_text {
             let mut out: Vec<Option<String>> = Vec::with_capacity(n);
             for row in 0..n {
-                let val = jsonb_extract_path_row_typed(&target_typed, row, &key_typed, self.name())?;
-                out.push(val.map(|v| match &v {
-                    Value::String(s) => s.clone(),
-                    other => serde_json::to_string(other).unwrap_or_default(),
-                }));
+                let bytes = match extract_jsonb_bytes(&target_arr, row, self.name())? {
+                    Some(b) => b,
+                    None => {
+                        out.push(None);
+                        continue;
+                    }
+                };
+                let mut any_key_null = false;
+                let mut segs: Vec<String> = Vec::with_capacity(key_typed.len());
+                for k in &key_typed {
+                    if k.is_null(row) {
+                        any_key_null = true;
+                        break;
+                    }
+                    segs.push(k.value(row).to_string());
+                }
+                if any_key_null {
+                    out.push(None);
+                    continue;
+                }
+                match raw_walk_path(bytes, &segs) {
+                    Ok(Some(slice)) => {
+                        // jsonb_extract_path_text preserves the existing engine
+                        // semantics: Value::Null renders to "null" (PG itself
+                        // returns NULL here — a known parity quirk that the
+                        // full-parse path already had; preserve it byte-for-byte).
+                        out.push(Some(raw_slice_to_extract_path_text(slice)?));
+                    }
+                    Ok(None) => out.push(None),
+                    Err(()) => {
+                        // Malformed for the scanner — fall back to the existing
+                        // full-parse + Value-walk implementation for this row.
+                        let val = jsonb_extract_path_fallback(bytes, &segs, self.name())?;
+                        out.push(val.map(|v| match &v {
+                            Value::String(s) => s.clone(),
+                            other => serde_json::to_string(other).unwrap_or_default(),
+                        }));
+                    }
+                }
             }
             Ok(ColumnarValue::Array(Arc::new(StringArray::from(out))))
         } else {
             let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
             for row in 0..n {
-                let val = jsonb_extract_path_row_typed(&target_typed, row, &key_typed, self.name())?;
-                out.push(val.map(|v| value_to_jsonb(&v)).transpose()?);
+                let bytes = match extract_jsonb_bytes(&target_arr, row, self.name())? {
+                    Some(b) => b,
+                    None => {
+                        out.push(None);
+                        continue;
+                    }
+                };
+                let mut any_key_null = false;
+                let mut segs: Vec<String> = Vec::with_capacity(key_typed.len());
+                for k in &key_typed {
+                    if k.is_null(row) {
+                        any_key_null = true;
+                        break;
+                    }
+                    segs.push(k.value(row).to_string());
+                }
+                if any_key_null {
+                    out.push(None);
+                    continue;
+                }
+                match raw_walk_path(bytes, &segs) {
+                    Ok(Some(slice)) => {
+                        out.push(Some(value_to_jsonb(&raw_slice_to_value(slice)?)?));
+                    }
+                    Ok(None) => out.push(None),
+                    Err(()) => {
+                        let val = jsonb_extract_path_fallback(bytes, &segs, self.name())?;
+                        out.push(val.map(|v| value_to_jsonb(&v)).transpose()?);
+                    }
+                }
             }
             let result = LargeBinaryArray::from_iter(out.iter().map(|o| o.as_deref()));
             Ok(ColumnarValue::Array(Arc::new(result)))
         }
     }
+}
+
+/// Render a located raw slice using `jsonb_extract_path_text` semantics
+/// (preserves the historical full-parse path: a `Value::String` yields its
+/// unescaped content; any other value — including `Null` — renders as its
+/// canonical JSON text).
+fn raw_slice_to_extract_path_text(slice: &[u8]) -> DFResult<String> {
+    let mut q = 0usize;
+    skip_ws(slice, &mut q);
+    match type_at(slice, q) {
+        Some(RawType::String) => {
+            let mut p = q;
+            parse_string(slice, &mut p)
+                .map_err(|_| DataFusionError::Execution("jsonb decode error: string".into()))
+        }
+        Some(_) => {
+            let v = raw_slice_to_value(slice)?;
+            Ok(serde_json::to_string(&v).unwrap_or_default())
+        }
+        None => Err(DataFusionError::Execution("jsonb decode error".into())),
+    }
+}
+
+/// Full-parse fallback for `jsonb_extract_path` / `_text`, used only when the
+/// byte-scanner reports malformed input.  Mirrors the historical Value-walk:
+/// remove on objects, indexed-get on arrays.
+fn jsonb_extract_path_fallback(
+    bytes: &[u8],
+    segs: &[String],
+    fn_name: &str,
+) -> DFResult<Option<Value>> {
+    let mut cur = jsonb_to_value(bytes)
+        .map_err(|e| DataFusionError::Execution(format!("{fn_name}: {e}")))?;
+    for key_str in segs {
+        cur = match cur {
+            Value::Object(mut map) => match map.remove(key_str.as_str()) {
+                Some(v) => v,
+                None => return Ok(None),
+            },
+            Value::Array(arr) => match key_str.parse::<usize>() {
+                Ok(idx) if idx < arr.len() => arr.into_iter().nth(idx).unwrap(),
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+    }
+    Ok(Some(cur))
 }
 
 /// Typed-array variant of `jsonb_extract_path_row` — downcasts already
@@ -3287,16 +3400,26 @@ impl ScalarUDFImpl for JsonTypeofUdf {
         let arr = args[0].clone().into_array(n)?;
         let mut out: Vec<Option<String>> = Vec::with_capacity(n);
         for i in 0..n {
-            match extract_jsonb_value(&arr, i, "json_typeof")? {
+            // Lazy: classify the top-level value from its first byte only,
+            // no full-tree parse.  Fall back only on unrecognised leading byte.
+            match extract_jsonb_bytes(&arr, i, "json_typeof")? {
                 None => out.push(None),
-                Some(v) => {
-                    let t = match &v {
-                        Value::Object(_) => "object",
-                        Value::Array(_) => "array",
-                        Value::String(_) => "string",
-                        Value::Number(_) => "number",
-                        Value::Bool(_) => "boolean",
-                        Value::Null => "null",
+                Some(bytes) => {
+                    let t = match RawJson::new(bytes).top_type() {
+                        Some(RawType::Object) => "object",
+                        Some(RawType::Array) => "array",
+                        Some(RawType::String) => "string",
+                        Some(RawType::Number) => "number",
+                        Some(RawType::Bool) => "boolean",
+                        Some(RawType::Null) => "null",
+                        None => match jsonb_to_value(bytes)? {
+                            Value::Object(_) => "object",
+                            Value::Array(_) => "array",
+                            Value::String(_) => "string",
+                            Value::Number(_) => "number",
+                            Value::Bool(_) => "boolean",
+                            Value::Null => "null",
+                        },
                     };
                     out.push(Some(t.to_string()));
                 }
