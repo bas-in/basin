@@ -5,6 +5,15 @@
 //! are eight wrappers — {10k, 100k, 1M, 10M} × {Vortex, Parquet} — and
 //! they all call `run_full_compare(...)` here.
 //!
+//! Fairness invariant — ALL WARM-UPS ARE SYMMETRIC.
+//! Before any timed sample, BOTH engines run the identical statement
+//! shape (`SELECT id FROM events WHERE id = <target_id>`) once. There
+//! are exactly two warm-up sites in this file: the Basin warm-up at the
+//! top of `run_basin_core_suite`, and the PG warm-up immediately before
+//! `run_pg_core_suite` is invoked in `run_full_compare`. If you add a
+//! warm-up on one side you MUST mirror it on the other — see audit nit
+//! (3) in the fairness audit log.
+//!
 //! Per-scale sample tuning: see `samples_for`. At 10k we run the full
 //! 5/7 samples per metric (matches the original bench); higher scales
 //! halve / quarter / single-shot to keep wall clock within budget. The
@@ -752,6 +761,10 @@ async fn run_basin_core_suite(
 
     // Warm-up: triggers any first-query plan caching so the p99 column
     // reflects steady-state latency rather than first-touch overhead.
+    // SYMMETRY: the PG side runs the identical statement shape
+    // (`SELECT id FROM events WHERE id = <target_id>`) before its timed
+    // samples — see the warm-up just above the `run_pg_core_suite` call in
+    // `run_full_compare`. Closes fairness-audit nit #3.
     let _ = sess
         .execute(&format!("SELECT id FROM events WHERE id = {target_id}"))
         .await;
@@ -2756,9 +2769,13 @@ async fn run_full_compare_inner(
         .collect::<Vec<_>>()
         .join(",");
 
+    // Warm-up: identical statement shape to Basin's warm-up at the top of
+    // `run_basin_core_suite` so neither engine gets an asymmetric edge
+    // (closes fairness-audit nit #3). Both engines page-cache the same
+    // single row of `events` at `id = target_id` before timed samples.
     let _ = pg
         .simple_query(&format!(
-            "SELECT COUNT(*) FROM {schema}.events WHERE id = {target_id}"
+            "SELECT id FROM {schema}.events WHERE id = {target_id}"
         ))
         .await;
 
