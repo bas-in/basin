@@ -94,6 +94,14 @@ rust-stemmers.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tokio-test.workspace = true
+# simd-json — SIMD-accelerated JSON parser (port of simdjson). Evaluated as a
+# faster replacement for serde_json in the JSONB parse hot path
+# (jsonb_udf::jsonb_to_value) but NOT adopted: it mutates its input in place
+# (forcing a buffer copy of the read-only stored bytes) and still builds the
+# same serde_json::Value tree, so the win was only ~1.03x at ~2KB / ~1.14x at
+# ~62KB. Kept as a dev-dep solely so the opt-in `bench_simd_vs_serde_parse`
+# micro-benchmark and the `jsonb_parse_parity` cross-check stay reproducible.
+simd-json = "0.17"
 # wasm_udf unit tests compile WAT text to WASM bytes via the `wat` crate.
 # `wat` is already a transitive dep of `wasmtime` (the `wat` feature is
 # enabled by default) so no extra network download is required.
