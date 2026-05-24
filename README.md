@@ -339,6 +339,10 @@ Neon is serverless Postgres with branching — terrific for **single-DB workload
 
 Supabase is "BaaS in a box" — Postgres + Auth + Edge Functions + Storage + Realtime. Basin covers the SQL + Auth + REST surface in one binary, with `auth.uid()` / `auth.role()` / `auth.jwt()` working identically. Where Basin differs is the data-layer economics: Vortex/Parquet on S3 instead of Postgres heap on block storage. Multi-project SaaS that has outgrown Supabase's per-project pricing can migrate the database to Basin via pgwire and keep Supabase Auth / Edge Functions / Realtime for the parts of the stack they handle well. Edge Functions / Realtime / Storage are out of scope per ADRs 0005/0006.
 
+### vs Nile
+
+Nile is "Postgres for multi-tenant SaaS" — same problem space as Basin, but built directly on real PostgreSQL with per-tenant virtual databases. That choice gives Nile real PG semantics, real OLTP, real JSONB, real extensions, and real PL/pgSQL for free, which is exactly where Basin still trails today. Basin's structural answer is the substrate economics: Nile's per-tenant cost is bounded by the underlying PG instance's per-tenant cost (heap pages, connection slots, autovacuum overhead); Basin's per-tenant cost is O(bytes-on-S3) with shared compute, so cold or low-traffic tenants stay near-zero. The right card to read is **cost per tenant per month at p99 latency, at scale** — single-instance PG-based multi-tenancy gets expensive at 10k+ tenants in a way object-storage-native multi-tenancy doesn't. If your workload is point-mutation-heavy and JSONB-heavy and you have <1k tenants, Nile is probably the easier answer today. If you have many idle or low-traffic tenants, append-shaped data, or want columnar bytes-at-rest economics, Basin is the cheaper substrate.
+
 ### vs Turso / libSQL
 
 Turso is the right answer for **edge-distributed apps** with many tiny SQLite-class databases. Basin is for centralized apps that want **Postgres SQL on cheap object storage** with a real wire-protocol surface that ORMs already speak.
@@ -351,7 +355,7 @@ ClickHouse and DuckDB are analytical engines — phenomenal at OLAP scans, not d
 
 Per the ADRs:
 
-- **Single-project high-frequency OLTP** → Postgres / Aurora / Neon
+- **Single-project high-frequency OLTP** → Postgres / Aurora / Neon / Nile
 - **Edge / local-first** → Turso / libSQL / Cloudflare D1
 - **Geospatial primary store** → PostGIS
 - **Embedding-only workload** → dedicated vector DB (Qdrant, Pinecone) — but Basin's native `vector(N)` works fine *alongside* tabular data
@@ -443,4 +447,4 @@ Contributions welcome. The project is opinionated about scope ([`docs/decisions/
 
 ## Keywords for search
 
-Basin is a **Postgres-compatible, bucket-native, multi-tenant database on object storage**, with **Vortex** (default columnar, LFAI) and **Apache Parquet** (opt-in, interchange) storage, an **Apache Iceberg** catalog, a file-backed WAL with a Raft WAL simulation toward distributed v0.2, **native vector search** (HNSW), per-file **catalog bloom filters** for point-query pruning, **HTAP hot tier** on the roadmap ([ADR 0016](./docs/decisions/0016-htap-hot-tier-architecture.md)), and **pgwire** protocol support that works with `psql`, `tokio-postgres`, `asyncpg`, JDBC, Diesel, SeaORM, and any other Postgres driver. Basin compares to **Postgres**, **Neon**, **Supabase**, **Turso**, **PlanetScale**, **Aurora**, **ClickHouse**, **SingleStore**, **DuckDB**, and **CockroachDB** for cheap-storage SaaS, audit-log, RAG / vector, HTAP, and multi-project use cases. Self-hostable, **Apache-2.0** licensed, written in **Rust**.
+Basin is a **Postgres-compatible, bucket-native, multi-tenant database on object storage**, with **Vortex** (default columnar, LFAI) and **Apache Parquet** (opt-in, interchange) storage, an **Apache Iceberg** catalog, a file-backed WAL with a Raft WAL simulation toward distributed v0.2, **native vector search** (HNSW), per-file **catalog bloom filters** for point-query pruning, **HTAP hot tier** on the roadmap ([ADR 0016](./docs/decisions/0016-htap-hot-tier-architecture.md)), and **pgwire** protocol support that works with `psql`, `tokio-postgres`, `asyncpg`, JDBC, Diesel, SeaORM, and any other Postgres driver. Basin compares to **Postgres**, **Neon**, **Supabase**, **Nile**, **Turso**, **PlanetScale**, **Aurora**, **ClickHouse**, **SingleStore**, **DuckDB**, and **CockroachDB** for cheap-storage SaaS, audit-log, RAG / vector, HTAP, and multi-project use cases. Self-hostable, **Apache-2.0** licensed, written in **Rust**.
