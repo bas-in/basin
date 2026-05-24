@@ -64,7 +64,7 @@
       <div class="page-header__title">
         <h1>Basin — LocalFS<span class="page-header__badges"><span class="env-tag local">self-hosted</span><span class="storage-tag">localfs</span><span class="compute-tag">single-process</span></span></h1>
         <p class="page-header__subtitle">
-          LocalFS-backed synthetic benchmarks. The fastest, most stable story — no network, no server-side concurrency limits, just the pure architectural numbers.
+          LocalFS-backed synthetic benchmarks. The fastest, most stable story — no network, no server-side concurrency limits, just the pure architectural numbers.<br><br><strong>Config (Postgres head-to-head cards):</strong> run with documented opt-in env flags <code>BASIN_HOTTIER_DELETE_FASTPATH=1</code>, <code>BASIN_HOTTIER_UPDATE_FASTPATH=1</code>, <code>BASIN_FAST_BULK_INSERT=1</code>. Without these flags, write shapes use the slower cold-tier copy-on-write path (still correct, less performant). Read shapes (point query, range, COUNT, JSONB, <code>@&gt;</code>) need no env flags.
         </p>
         <nav class="page-header__nav">
           Other dashboards: <a href="index_real.html">real cloud</a> · <a href="index_seaweedfs.html">SeaweedFS</a> · <a href="index_three_way.html">Basin Cloud — Frankfurt 3-way</a>
