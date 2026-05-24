@@ -28,6 +28,20 @@ pub enum MemRowValue {
         /// added/dropped columns introduced by subsequent `ALTER TABLE` DDL.
         schema_version: u32,
     },
+    /// A full-row replacement written by the hot-tier UPDATE fast path
+    /// (`BASIN_HOTTIER_UPDATE_FASTPATH`). Semantically identical to `Row`
+    /// (an Arrow-IPC single-row `RecordBatch` that wins over the cold tier on
+    /// PK collision), but kept as a distinct variant so the read paths can
+    /// tell apart a PK-keyed UPDATE override from a counter-keyed HTAP INSERT
+    /// row. The INSERT path keys rows by a monotonic counter, so without this
+    /// tag a `Row` snapshot could not be safely matched against cold-tier PKs.
+    /// `Update` entries are *always* keyed by the encoded primary key.
+    Update {
+        /// Arrow IPC wire encoding of the post-SET single-row `RecordBatch`.
+        bytes: Vec<u8>,
+        /// Schema version at update time (mirrors `Row`).
+        schema_version: u32,
+    },
     /// The row has been deleted.  Tombstones suppress matching rows returned
     /// from the Vortex cold tier during read-merge (C3).
     Tombstone,
@@ -42,9 +56,24 @@ impl MemRowValue {
         }
     }
 
-    /// Return `true` if this is a live row (not a tombstone).
+    /// Construct an `Update` variant from pre-encoded IPC bytes. Written by
+    /// the hot-tier UPDATE fast path; keyed by the encoded primary key.
+    pub fn update(bytes: Vec<u8>, schema_version: u32) -> Self {
+        Self::Update {
+            bytes,
+            schema_version,
+        }
+    }
+
+    /// Return `true` if this is a live row — either an INSERT (`Row`) or an
+    /// UPDATE override (`Update`). Tombstones are excluded.
     pub fn is_row(&self) -> bool {
-        matches!(self, Self::Row { .. })
+        matches!(self, Self::Row { .. } | Self::Update { .. })
+    }
+
+    /// Return `true` if this is a PK-keyed UPDATE override.
+    pub fn is_update(&self) -> bool {
+        matches!(self, Self::Update { .. })
     }
 
     /// Return `true` if this is a tombstone.
@@ -55,7 +84,7 @@ impl MemRowValue {
     /// Byte size for memory accounting purposes.  Tombstones are zero.
     pub fn heap_bytes(&self) -> usize {
         match self {
-            Self::Row { bytes, .. } => bytes.len(),
+            Self::Row { bytes, .. } | Self::Update { bytes, .. } => bytes.len(),
             Self::Tombstone => 0,
         }
     }

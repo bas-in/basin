@@ -436,7 +436,11 @@ impl FlushWorker {
 
         for (key, value) in &snapshot {
             match value {
-                MemRowValue::Row { bytes, .. } => {
+                // `Update` is a PK-keyed full-row override written by the
+                // hot-tier UPDATE fast path; flushed identically to a `Row`
+                // (it becomes a fresh cold-tier row that shadows the stale
+                // one once the old cold file is compacted away).
+                MemRowValue::Row { bytes, .. } | MemRowValue::Update { bytes, .. } => {
                     live_rows.push(bytes.clone());
                 }
                 MemRowValue::Tombstone => {
@@ -583,7 +587,9 @@ mod tests {
 
         for (k, v) in &snapshot {
             match v {
-                MemRowValue::Row { bytes, .. } => live.push(bytes.clone()),
+                MemRowValue::Row { bytes, .. } | MemRowValue::Update { bytes, .. } => {
+                    live.push(bytes.clone())
+                }
                 MemRowValue::Tombstone => tombs.push(k.clone()),
             }
         }

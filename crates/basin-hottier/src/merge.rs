@@ -122,7 +122,7 @@ where
                             // Tombstone with no cold-side match — skip.
                             continue;
                         }
-                        MemRowValue::Row { bytes, .. } => {
+                        MemRowValue::Row { bytes, .. } | MemRowValue::Update { bytes, .. } => {
                             return decode_ipc_row(&bytes);
                         }
                     }
@@ -137,7 +137,8 @@ where
                             let (_, value) = self.mem.next().unwrap();
                             match value {
                                 MemRowValue::Tombstone => continue,
-                                MemRowValue::Row { bytes, .. } => {
+                                MemRowValue::Row { bytes, .. }
+                                | MemRowValue::Update { bytes, .. } => {
                                     return decode_ipc_row(&bytes);
                                 }
                             }
@@ -154,7 +155,8 @@ where
                             match mem_value {
                                 // Tombstone: row is deleted — suppress and continue.
                                 MemRowValue::Tombstone => continue,
-                                MemRowValue::Row { bytes, .. } => {
+                                MemRowValue::Row { bytes, .. }
+                                | MemRowValue::Update { bytes, .. } => {
                                     return decode_ipc_row(&bytes);
                                 }
                             }

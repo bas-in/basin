@@ -72,6 +72,51 @@ pub(crate) fn snapshot_tombstones(
     out
 }
 
+// ── UPDATE-override snapshot ───────────────────────────────────────────────────
+
+/// Decode one Arrow IPC stream blob into the first `RecordBatch`. Mirrors
+/// `fast_select::decode_ipc_batch` / `merge::decode_ipc_row`.
+fn decode_ipc_row(bytes: &[u8]) -> Option<RecordBatch> {
+    use arrow::ipc::reader::StreamReader;
+    let cursor = std::io::Cursor::new(bytes);
+    let mut reader = StreamReader::try_new(cursor, None).ok()?;
+    reader.next()?.ok()
+}
+
+/// Gather every `MemRowValue::Update` override registered for `(project,
+/// table)` as a map from raw `RowKey` bytes (the encoded PK) to the decoded
+/// post-SET single-row `RecordBatch`.
+///
+/// These are written by the hot-tier UPDATE fast path
+/// (`BASIN_HOTTIER_UPDATE_FASTPATH`). On the read path each override must (a)
+/// suppress the stale cold-tier row at the same PK and (b) be surfaced in its
+/// place. Returns an empty map when the table has no overrides — the common
+/// case, which keeps the read path zero-overhead.
+///
+/// The override map is bounded like the tombstone snapshot: overrides live in
+/// the memtable only between the UPDATE and the next compaction/flush.
+pub(crate) fn snapshot_updates(
+    registry: &MemTableRegistry,
+    project: &ProjectId,
+    table: &TableName,
+) -> std::collections::HashMap<Vec<u8>, RecordBatch> {
+    let mut out: std::collections::HashMap<Vec<u8>, RecordBatch> = std::collections::HashMap::new();
+    let Some(entry) = registry.get(project, table) else {
+        return out;
+    };
+    let snap = entry.memtable.snapshot();
+    for (key, value) in snap {
+        if let MemRowValue::Update { bytes, .. } = value {
+            if let Some(rb) = decode_ipc_row(&bytes) {
+                if rb.num_rows() > 0 {
+                    out.insert(key.as_bytes().to_vec(), rb);
+                }
+            }
+        }
+    }
+    out
+}
+
 // ── Array → RowKey encoder ───────────────────────────────────────────────────
 
 /// Encode the single value at `row_idx` in `array` (whose declared logical
@@ -255,6 +300,132 @@ impl ExecutionPlan for TombstoneFilterExec {
     }
 }
 
+// ── UPDATE override overlay ExecutionPlan ──────────────────────────────────────
+
+/// Drops every cold row whose PK matches an `Update` override key, then emits
+/// the override (post-SET) rows once the inner stream is exhausted.
+///
+/// This is the DataFusion-plan twin of [`apply_update_overlay_to_batches`]:
+/// the `fast_select` point-lookup path uses the `Vec<RecordBatch>` helper,
+/// while the catalog-registered read path (`refresh_table` →
+/// `TombstoneFilteringTable`) wraps the cold scan with this plan so bulk
+/// SELECTs / COUNT(*) / ORDER BY after a fast-path UPDATE surface the new
+/// values and never the stale cold ones.
+///
+/// Single-column PKs only — the fast-path UPDATE writer rejects composite PKs,
+/// so the override map is always empty for those tables and the wrap is a
+/// no-op.
+#[derive(Debug)]
+pub(crate) struct UpdateOverlayExec {
+    inner: Arc<dyn ExecutionPlan>,
+    pk_column: String,
+    pk_dt: DataType,
+    /// Override rows reprojected to `inner`'s output schema, keyed by encoded
+    /// PK bytes. The keys double as the suppression set for cold rows.
+    updates: Arc<std::collections::HashMap<Vec<u8>, RecordBatch>>,
+    props: Arc<PlanProperties>,
+}
+
+impl UpdateOverlayExec {
+    pub(crate) fn new(
+        inner: Arc<dyn ExecutionPlan>,
+        pk_column: String,
+        pk_dt: DataType,
+        updates: Arc<std::collections::HashMap<Vec<u8>, RecordBatch>>,
+    ) -> Self {
+        let props = Arc::new(PlanProperties::new(
+            inner.equivalence_properties().clone(),
+            inner.output_partitioning().clone(),
+            inner.pipeline_behavior(),
+            inner.boundedness(),
+        ));
+        Self {
+            inner,
+            pk_column,
+            pk_dt,
+            updates,
+            props,
+        }
+    }
+}
+
+impl DisplayAs for UpdateOverlayExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "UpdateOverlayExec: pk={} overridden={}",
+            self.pk_column,
+            self.updates.len()
+        )
+    }
+}
+
+impl ExecutionPlan for UpdateOverlayExec {
+    fn name(&self) -> &str {
+        "UpdateOverlayExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.inner.schema()
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.props
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.inner]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(UpdateOverlayExec::new(
+            children.swap_remove(0),
+            self.pk_column.clone(),
+            self.pk_dt.clone(),
+            Arc::clone(&self.updates),
+        )))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        let schema = self.inner.schema();
+        // Only the first partition appends the override rows; otherwise an
+        // N-partition cold scan would surface each override N times. All
+        // partitions still suppress overridden cold rows.
+        let inner_stream = self.inner.execute(partition, context)?;
+        let pk_column = self.pk_column.clone();
+        let pk_dt = self.pk_dt.clone();
+        let updates = Arc::clone(&self.updates);
+        let suppress: HashSet<Vec<u8>> = updates.keys().cloned().collect();
+        // Reproject the override rows to the output schema once.
+        let appended: Vec<RecordBatch> = if partition == 0 {
+            updates
+                .values()
+                .map(|ov| reproject_row(ov, &schema))
+                .collect::<DFResult<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        let suppressed = inner_stream.map(move |batch_res| {
+            batch_res.and_then(|batch| filter_batch(&batch, &pk_column, &pk_dt, &suppress))
+        });
+        // Chain the suppressed cold stream with the override rows.
+        let tail = futures::stream::iter(appended.into_iter().map(Ok));
+        let combined = suppressed.chain(tail);
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, combined)))
+    }
+}
+
 /// Build a `BooleanArray` mask that drops rows whose PK is in `tombstones`.
 /// Returns the input batch unchanged when the PK column is absent (we can't
 /// safely evaluate the filter — see `TombstoneFilterExec` docs).
@@ -315,6 +486,67 @@ pub(crate) fn apply_tombstone_filter_to_batches(
         .into_iter()
         .map(|b| filter_batch(&b, pk_column, pk_dt, tombstones))
         .collect()
+}
+
+/// Apply the merge-on-read **UPDATE override** overlay to an already-collected
+/// `Vec<RecordBatch>` of cold-tier rows: drop every cold row whose PK matches
+/// an `Update` override key, then append the override (post-SET) rows.
+///
+/// Used by the point-lookup fast path in `fast_select::execute_simple_select`
+/// (which reads cold-tier files into `Vec<RecordBatch>` and never builds an
+/// `ExecutionPlan`). Mirrors the suppression-then-surface semantics of the
+/// DataFusion `UpdateOverlayExec` so both read paths agree.
+///
+/// Override rows are reprojected to the cold batches' schema so a SELECT with
+/// a column projection still lines up. When a batch is missing the PK column
+/// it passes through unchanged (no safe key to compare) — the same
+/// conservative degradation as the tombstone filter.
+///
+/// `tombstones` is the union of true tombstones AND the override PK keys; the
+/// caller passes the override map separately so the appended rows can be
+/// reprojected. When `updates` is empty this is a zero-overhead pass-through.
+pub(crate) fn apply_update_overlay_to_batches(
+    batches: Vec<RecordBatch>,
+    updates: &std::collections::HashMap<Vec<u8>, RecordBatch>,
+    pk_column: &str,
+    pk_dt: &DataType,
+) -> DFResult<Vec<RecordBatch>> {
+    if updates.is_empty() {
+        return Ok(batches);
+    }
+    // Suppress cold rows whose PK has been overridden.
+    let suppress: HashSet<Vec<u8>> = updates.keys().cloned().collect();
+    let mut out: Vec<RecordBatch> =
+        apply_tombstone_filter_to_batches(batches, &suppress, pk_column, pk_dt)?;
+    // Determine the output schema to reproject overrides onto. Prefer an
+    // existing cold batch (which already carries the requested projection);
+    // fall back to the override row's own (full) schema when the cold side is
+    // empty (every matched row was an override over an absent/flushed file).
+    let target_schema = out.first().map(|b| b.schema());
+    for ov in updates.values() {
+        let row = match &target_schema {
+            Some(schema) => reproject_row(ov, schema)?,
+            None => ov.clone(),
+        };
+        out.push(row);
+    }
+    Ok(out)
+}
+
+/// Reproject a (full-schema) override row to `target` by selecting the
+/// `target` columns by name. Missing columns degrade to passing the override
+/// row through unchanged (defensive — the caller's projection should always be
+/// a subset of the full row schema).
+fn reproject_row(row: &RecordBatch, target: &SchemaRef) -> DFResult<RecordBatch> {
+    let mut idxs: Vec<usize> = Vec::with_capacity(target.fields().len());
+    for f in target.fields() {
+        match row.schema().index_of(f.name()) {
+            Ok(i) => idxs.push(i),
+            Err(_) => return Ok(row.clone()),
+        }
+    }
+    row.project(&idxs)
+        .map_err(|e| datafusion::common::DataFusionError::ArrowError(Box::new(e), None))
 }
 
 // ── Convenience wrapper ──────────────────────────────────────────────────────
@@ -430,10 +662,11 @@ impl datafusion::catalog::TableProvider for TombstoneFilteringTable {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let registry = self.engine.memtable_registry();
         let tombs = snapshot_tombstones(registry.as_ref(), &self.project, &self.table);
+        let updates = snapshot_updates(registry.as_ref(), &self.project, &self.table);
 
-        // No tombstones → zero-overhead pass-through. Hand the cold provider
-        // the original projection / filters / limit and skip the wrap.
-        if tombs.is_empty() || self.pk_columns.len() != 1 {
+        // No tombstones AND no UPDATE overrides → zero-overhead pass-through.
+        // Hand the cold provider the original projection / filters / limit.
+        if (tombs.is_empty() && updates.is_empty()) || self.pk_columns.len() != 1 {
             let cold_plan = self.cold.scan(state, projection, filters, limit).await?;
             return Ok(cold_plan);
         }
@@ -449,16 +682,17 @@ impl datafusion::catalog::TableProvider for TombstoneFilteringTable {
         let pk_dt = self.catalog_schema.field(pk_idx_in_schema).data_type().clone();
 
         // If the caller's projection omits the PK column we must add it so the
-        // tombstone filter has the key bytes to compare. We then strip the
-        // augmented column back out with a `ProjectionExec` so the surrounding
-        // plan sees the originally-requested schema. This is the fix for
-        // `SELECT COUNT(*)` / `SELECT non_pk_col` after a fast-path DELETE:
-        // without the PK in the cold batch the filter has nothing to key on
-        // and tombstoned rows leak into aggregates / non-PK projections.
+        // tombstone filter / update overlay has the key bytes to compare. We
+        // then strip the augmented column back out with a `ProjectionExec` so
+        // the surrounding plan sees the originally-requested schema. This is
+        // the fix for `SELECT COUNT(*)` / `SELECT non_pk_col` after a fast-path
+        // DELETE/UPDATE: without the PK in the cold batch the filter has
+        // nothing to key on and stale rows leak into aggregates / non-PK
+        // projections.
         //
         // Limit pushdown is also dropped when augmenting because the limit
         // applies to post-filter rows; passing a limit to the cold scan would
-        // truncate before tombstone removal and under-count survivors.
+        // truncate before tombstone/override removal and under-count survivors.
         let (cold_projection_owned, augmented, effective_limit) = match projection {
             Some(p) if !p.contains(&pk_idx_in_schema) => {
                 let mut p2 = p.clone();
@@ -474,13 +708,29 @@ impl datafusion::catalog::TableProvider for TombstoneFilteringTable {
             .scan(state, cold_projection_ref, filters, effective_limit)
             .await?;
 
-        // Wrap with the row-filter.
-        let filtered: Arc<dyn ExecutionPlan> = Arc::new(TombstoneFilterExec::new(
-            cold_plan,
-            pk_col.clone(),
-            pk_dt,
-            Arc::new(tombs),
-        ));
+        // Wrap with the tombstone row-filter (no-op when no tombstones).
+        let mut filtered: Arc<dyn ExecutionPlan> = if tombs.is_empty() {
+            cold_plan
+        } else {
+            Arc::new(TombstoneFilterExec::new(
+                cold_plan,
+                pk_col.clone(),
+                pk_dt.clone(),
+                Arc::new(tombs),
+            ))
+        };
+
+        // Wrap with the UPDATE override overlay: suppress overridden cold rows
+        // and append the post-SET rows. The override rows are reprojected to
+        // the (possibly PK-augmented) cold scan schema inside the exec.
+        if !updates.is_empty() {
+            filtered = Arc::new(UpdateOverlayExec::new(
+                filtered,
+                pk_col.clone(),
+                pk_dt,
+                Arc::new(updates),
+            ));
+        }
 
         if !augmented {
             return Ok(filtered);
@@ -521,7 +771,8 @@ impl datafusion::catalog::TableProvider for TombstoneFilteringTable {
         // plan tree, which runs AFTER our `TombstoneFilterExec`.
         let registry = self.engine.memtable_registry();
         let tombs = snapshot_tombstones(registry.as_ref(), &self.project, &self.table);
-        if !tombs.is_empty() {
+        let updates = snapshot_updates(registry.as_ref(), &self.project, &self.table);
+        if !tombs.is_empty() || !updates.is_empty() {
             return Ok(vec![
                 datafusion::logical_expr::TableProviderFilterPushDown::Unsupported;
                 filters.len()

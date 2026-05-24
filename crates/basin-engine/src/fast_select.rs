@@ -204,7 +204,8 @@ fn probe_memtable(
 
     for (_key, value) in snapshot {
         match value {
-            basin_hottier::MemRowValue::Row { bytes, .. } => {
+            basin_hottier::MemRowValue::Row { bytes, .. }
+            | basin_hottier::MemRowValue::Update { bytes, .. } => {
                 if let Some(batch) = decode_ipc_batch(&bytes) {
                     if predicates.is_empty() || batch_matches_predicates(&batch, predicates) {
                         live_matches.push(batch);
@@ -1502,19 +1503,33 @@ pub(crate) async fn execute_simple_select(
     // helper is a noop and the batches pass through unchanged.
     let batches = if meta.pk_columns.len() == 1 {
         let pk_col = &meta.pk_columns[0];
+        let registry = sess.engine.memtable_registry();
         let tombs = crate::hot_tombstone::snapshot_tombstones(
-            sess.engine.memtable_registry().as_ref(),
+            registry.as_ref(),
             &sess.project,
             &plan.table,
         );
-        if tombs.is_empty() {
+        // Merge-on-read UPDATE overlay for the hot-tier fast path: drop cold
+        // rows whose PK has an `Update` override and append the post-SET rows.
+        // Mirrors the `UpdateOverlayExec` wrap on the DataFusion read path so
+        // a fast-path UPDATE is visible to bulk fast-path SELECTs too.
+        let updates = crate::hot_tombstone::snapshot_updates(
+            registry.as_ref(),
+            &sess.project,
+            &plan.table,
+        );
+        if tombs.is_empty() && updates.is_empty() {
             batches
         } else if let Ok(pk_idx) = meta.schema.index_of(pk_col) {
             let pk_dt = meta.schema.field(pk_idx).data_type().clone();
-            crate::hot_tombstone::apply_tombstone_filter_to_batches(
+            let batches = crate::hot_tombstone::apply_tombstone_filter_to_batches(
                 batches, &tombs, pk_col, &pk_dt,
             )
-            .map_err(|e| BasinError::internal(format!("tombstone filter: {e}")))?
+            .map_err(|e| BasinError::internal(format!("tombstone filter: {e}")))?;
+            crate::hot_tombstone::apply_update_overlay_to_batches(
+                batches, &updates, pk_col, &pk_dt,
+            )
+            .map_err(|e| BasinError::internal(format!("update overlay: {e}")))?
         } else {
             batches
         }

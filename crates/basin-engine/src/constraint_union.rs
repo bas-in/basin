@@ -262,6 +262,17 @@ pub(crate) fn snapshot_memtable(
                     }
                 }
             }
+            // A PK-keyed UPDATE override: the new image is a live row, AND its
+            // PK key suppresses the stale cold-tier row so the union does not
+            // double-count the pre-update version.
+            MemRowValue::Update { bytes, .. } => {
+                tombstones.insert(key.as_bytes().to_vec());
+                if let Some(rb) = decode_ipc_batch(&bytes) {
+                    if rb.num_rows() > 0 {
+                        live_rows.push(rb);
+                    }
+                }
+            }
             MemRowValue::Tombstone => {
                 tombstones.insert(key.as_bytes().to_vec());
             }

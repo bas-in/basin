@@ -1236,6 +1236,305 @@ pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result
     })
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Hot-tier UPDATE fast path (PR2 — mirrors the DELETE fast path)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// For UPDATE statements shaped as `SET col = lit[, …] WHERE pk = lit` or
+// `… WHERE pk IN (lit, …)` on tables with a single-column PRIMARY KEY and no
+// surrounding feature usage (RLS, audit, generated columns, secondary indexes,
+// CHECK/FK/UNIQUE constraints, FK children, reactors, RETURNING), the engine
+// reads the matched row image (hot tier first, then cold tier), applies the
+// SET, and writes a `MemRowValue::Update` (full-row replacement keyed by the
+// encoded PK) into the process-wide `MemTableRegistry` — skipping the cold-tier
+// copy-on-write Parquet rewrite that scales linearly with file size.
+//
+// Read-path semantics. The override row wins over the stale cold-tier row on
+// every read path: the merge-on-read overlay (`hot_tombstone::UpdateOverlayExec`
+// on the DataFusion path, `apply_update_overlay_to_batches` on the fast-select
+// cold path, and the `probe_memtable` point-lookup) suppress the cold row by PK
+// and surface the new image. See `hot_tombstone.rs`.
+//
+// Atomicity. Like the DELETE fast path, this runs only OUTSIDE an explicit
+// transaction (`tx_is_active == false`) so ROLLBACK semantics are unaffected.
+//
+// Assignment support. Only literal / bind-param SET RHS (the `AssignmentRhs::
+// Scalar` path) is eligible — expression RHS (`col + 1`, `now()`, `upper(col)`)
+// falls through to the cold CoW path, where the per-batch DataFusion evaluation
+// already lives.
+
+/// Resolve the matched PK keys + scalar assignments when the UPDATE call site
+/// is eligible for the hot-tier fast path. Returns `Ok(Some((keys, assigns)))`
+/// when every gate passes; `Ok(None)` to fall through to the cold path.
+///
+/// Gates mirror `try_resolve_fast_path_pks` (DELETE) plus the UPDATE-specific
+/// ones: scalar-only assignments, no generated columns, no CHECK/FK/UNIQUE,
+/// PK columns not touched by the SET (a PK rewrite needs the slow path's PK
+/// uniqueness check + key re-encoding).
+async fn try_resolve_fast_path_update(
+    sess: &ProjectSession,
+    table: &TableName,
+    meta: &basin_catalog::TableMetadata,
+    assignments: &[Assignment],
+    predicate: Option<&Expr>,
+    returning: Option<&[sqlparser::ast::SelectItem]>,
+) -> Result<Option<(Vec<basin_hottier::RowKey>, Vec<(usize, AssignmentRhs)>)>> {
+    // Gate: opt-in via env var (defaults OFF, like the DELETE fast path).
+    if std::env::var("BASIN_HOTTIER_UPDATE_FASTPATH").as_deref() != Ok("1") {
+        return Ok(None);
+    }
+    // Gate: explicit transaction → fall through (no rollback for shared registry).
+    if crate::session::tx_is_active(&sess.state) {
+        return Ok(None);
+    }
+    // Gate: RETURNING needs the post-image projected; cold path handles it.
+    if returning.is_some() {
+        return Ok(None);
+    }
+    // Gate: single-column PK only.
+    if meta.pk_columns.len() != 1 {
+        return Ok(None);
+    }
+    let pk_col = &meta.pk_columns[0];
+    // Gate: RLS / audit need the slow read+rewrite (row images, WITH CHECK).
+    if meta.rls_enabled {
+        return Ok(None);
+    }
+    if crate::types::soft_delete_column(meta.schema.as_ref()).is_some() {
+        return Ok(None);
+    }
+    if crate::types::audit_table_name(meta.schema.as_ref()).is_some() {
+        return Ok(None);
+    }
+    // Gate: generated columns must be recomputed per-row on the slow path.
+    if meta
+        .schema
+        .fields()
+        .iter()
+        .any(|f| crate::types::field_is_generated(f).is_some())
+    {
+        return Ok(None);
+    }
+    // Gate: AUTO_UPDATE columns inject a fresh now() on the slow path.
+    {
+        let mut probe: Vec<(usize, AssignmentRhs)> = Vec::new();
+        inject_auto_update_assignments(meta.schema.as_ref(), &mut probe);
+        if !probe.is_empty() {
+            return Ok(None);
+        }
+    }
+    // Gate: constraints (CHECK / FK / UNIQUE) need post-image enforcement.
+    if !meta.check_constraints.is_empty()
+        || !meta.foreign_keys.is_empty()
+        || !meta.unique_constraints.is_empty()
+    {
+        return Ok(None);
+    }
+    // Gate: secondary indexes (B-tree / GIN / GIST) need entry maintenance.
+    if !meta.indexes.is_empty() {
+        return Ok(None);
+    }
+    // Gate: any child table referencing this one (FK ON UPDATE) → slow path.
+    let referencing = crate::constraints::fks_referencing(
+        &sess.engine.config().catalog,
+        &sess.project,
+        table.as_str(),
+    )
+    .await?;
+    if !referencing.is_empty() {
+        return Ok(None);
+    }
+    // Gate: per-table UPDATE reactor needs before/after row images.
+    {
+        let catalog = &sess.engine.config().catalog;
+        let reactors = catalog.list_reactors(&sess.project).await;
+        let has_reactor = reactors.iter().any(|r| {
+            r.table.as_str().eq_ignore_ascii_case(table.as_str())
+                && r.ops.contains(basin_catalog::ReactorOps::UPDATE)
+        });
+        if has_reactor {
+            return Ok(None);
+        }
+    }
+    // Gate: WHERE must resolve to a pure pk = lit / pk IN (lits) shape.
+    let Some(expr) = predicate else {
+        // `UPDATE t SET …` with no WHERE rewrites every row; walking every
+        // cold PK to override it would defeat the purpose. Slow path.
+        return Ok(None);
+    };
+    let Some(lit_exprs) = predicate_resolves_to_pk_list(expr, pk_col, table.as_str()) else {
+        return Ok(None);
+    };
+    // Gate: every assignment must be a plain scalar; reject expression RHS and
+    // any assignment that touches the PK column (key re-encoding / uniqueness).
+    let parsed = parse_assignments(assignments, meta.schema.as_ref())?;
+    if parsed.iter().any(|(_, rhs)| matches!(rhs, AssignmentRhs::Expr(_))) {
+        return Ok(None);
+    }
+    let pk_idx = meta
+        .schema
+        .index_of(pk_col)
+        .map_err(|_| BasinError::internal(format!("PK column {pk_col:?} missing from schema")))?;
+    if parsed.iter().any(|(idx, _)| *idx == pk_idx) {
+        return Ok(None);
+    }
+    // Empty IN-list → zero matches (UPDATE 0); return empty key set.
+    if lit_exprs.is_empty() {
+        return Ok(Some((Vec::new(), parsed)));
+    }
+    // Encode every PK literal to its RowKey form; bail on unsupported types.
+    let pk_dt = meta.schema.field(pk_idx).data_type().clone();
+    let mut keys: Vec<basin_hottier::RowKey> = Vec::with_capacity(lit_exprs.len());
+    for lit in &lit_exprs {
+        let scalar = match try_literal_to_scalar(lit, &pk_dt, pk_col)? {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let Some(key) = pk_scalar_to_row_key(&scalar, &pk_dt) else {
+            return Ok(None);
+        };
+        keys.push(key);
+    }
+    Ok(Some((keys, parsed)))
+}
+
+/// Execute the resolved hot-tier UPDATE: for each matched PK read the current
+/// row image (memtable override first, else cold-tier), apply the scalar
+/// assignments, and write a `MemRowValue::Update` keyed by the encoded PK.
+/// Returns the number of rows that actually existed and were updated.
+///
+/// Affected-row semantics. Unlike the DELETE fast path (which reports the
+/// number of requested PKs), UPDATE reports the number of PKs that resolved to
+/// an existing row — a PK that matches no live row contributes nothing, exactly
+/// like Postgres.
+async fn hot_tier_update_by_pk(
+    sess: &ProjectSession,
+    table: &TableName,
+    meta: &basin_catalog::TableMetadata,
+    keys: &[basin_hottier::RowKey],
+    assignments: &[(usize, AssignmentRhs)],
+) -> Result<usize> {
+    use std::collections::HashMap;
+    let schema = meta.schema.clone();
+    let storage = sess.engine.config().storage.clone();
+    let catalog = &sess.engine.config().catalog;
+    let registry = sess.engine.memtable_registry();
+    let entry = registry.get_or_create(sess.project, table.clone());
+
+    // Build the set of target PK keys for fast membership + a stable order.
+    let want: std::collections::HashSet<Vec<u8>> =
+        keys.iter().map(|k| k.as_bytes().to_vec()).collect();
+
+    // 1. Gather current row images keyed by PK bytes. Memtable first (a prior
+    //    fast-path Update/Insert wins over cold for the same PK), then cold for
+    //    any PK not yet present in the memtable.
+    let mut current: HashMap<Vec<u8>, RecordBatch> = HashMap::new();
+    {
+        let snap = entry.memtable.snapshot();
+        for (k, v) in snap {
+            let kb = k.as_bytes().to_vec();
+            if !want.contains(&kb) {
+                continue;
+            }
+            match v {
+                basin_hottier::MemRowValue::Row { bytes, .. }
+                | basin_hottier::MemRowValue::Update { bytes, .. } => {
+                    if let Some(rb) = decode_ipc_single_row(&bytes) {
+                        current.insert(kb, reattach_catalog_metadata(schema.as_ref(), rb)?);
+                    }
+                }
+                // A tombstone for this PK means the row was deleted; an UPDATE
+                // must not resurrect it. Mark it present-but-dead by inserting
+                // a zero-row sentinel so the cold read below skips it.
+                basin_hottier::MemRowValue::Tombstone => {
+                    current.insert(kb, RecordBatch::new_empty(schema.clone()));
+                }
+            }
+        }
+    }
+    // 2. Cold-tier fill for PKs not in the memtable. Read matched rows via the
+    //    PK predicate and slice out one batch row per PK.
+    let missing: Vec<&basin_hottier::RowKey> = keys
+        .iter()
+        .filter(|k| !current.contains_key(k.as_bytes()))
+        .collect();
+    if !missing.is_empty() {
+        let pk_col = &meta.pk_columns[0];
+        let pk_idx = schema.index_of(pk_col).map_err(|_| {
+            BasinError::internal(format!("PK column {pk_col:?} missing from schema"))
+        })?;
+        let pk_dt = schema.field(pk_idx).data_type().clone();
+        let data_files = storage.list_data_files_with_stats(&sess.project, table).await?;
+        'files: for f in &data_files {
+            if current.len() == want.len() {
+                break 'files;
+            }
+            let mut stream = storage.read_file(&sess.project, &f.path).await?;
+            while let Some(batch) = stream.next().await {
+                let batch = reattach_catalog_metadata(schema.as_ref(), batch?)?;
+                let pk_array = batch.column(pk_idx);
+                for row in 0..batch.num_rows() {
+                    let Some(rk) =
+                        crate::hot_tombstone::array_value_to_row_key(pk_array.as_ref(), row, &pk_dt)
+                    else {
+                        continue;
+                    };
+                    let kb = rk.as_bytes().to_vec();
+                    if want.contains(&kb) && !current.contains_key(&kb) {
+                        current.insert(kb, batch.slice(row, 1));
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Apply the SET to each present, live row image; write the override.
+    let mut updated = 0usize;
+    for key in keys {
+        let kb = key.as_bytes().to_vec();
+        let Some(row_batch) = current.get(&kb) else {
+            continue; // PK matched no live row.
+        };
+        if row_batch.num_rows() == 0 {
+            continue; // tombstoned (deleted) — UPDATE skips it.
+        }
+        let mask = BooleanArray::from(vec![true; row_batch.num_rows()]);
+        let new_batch = apply_assignments(catalog, &sess.project, row_batch, &mask, assignments).await?;
+        // Encode the (single) row and store as an Update override keyed by PK.
+        let one_row = if new_batch.num_rows() == 1 {
+            new_batch
+        } else {
+            new_batch.slice(0, 1)
+        };
+        let bytes = encode_single_row_ipc(&one_row);
+        entry
+            .memtable
+            .insert(key.clone(), basin_hottier::MemRowValue::update(bytes, 0));
+        updated += 1;
+    }
+    Ok(updated)
+}
+
+/// Decode one Arrow IPC stream blob into the first `RecordBatch`.
+fn decode_ipc_single_row(bytes: &[u8]) -> Option<RecordBatch> {
+    use arrow::ipc::reader::StreamReader;
+    let cursor = std::io::Cursor::new(bytes);
+    let mut reader = StreamReader::try_new(cursor, None).ok()?;
+    reader.next()?.ok()
+}
+
+/// Encode a single-row `RecordBatch` to Arrow IPC stream bytes (memtable wire
+/// format — mirrors `executor::encode_batch_to_ipc`).
+fn encode_single_row_ipc(batch: &RecordBatch) -> Vec<u8> {
+    use arrow::ipc::writer::StreamWriter;
+    let mut buf = Vec::new();
+    let mut writer = StreamWriter::try_new(&mut buf, batch.schema_ref())
+        .expect("IPC StreamWriter init");
+    writer.write(batch).expect("IPC write");
+    writer.finish().expect("IPC finish");
+    buf
+}
+
 pub(crate) async fn exec_update(
     sess: &ProjectSession,
     table_with_joins: TableWithJoins,
@@ -1326,6 +1625,38 @@ pub(crate) async fn exec_update(
         .await?;
     let schema = meta.schema.clone();
     let storage = sess.engine.config().storage.clone();
+
+    // ── Hot-tier fast path ──────────────────────────────────────────────
+    //
+    // For `SET col = lit WHERE pk = lit / pk IN (lits)` on a table that
+    // satisfies every gate in `try_resolve_fast_path_update`, read the
+    // matched row image (hot then cold), apply SET, and write a
+    // `MemRowValue::Update` override to the process-wide MemTableRegistry —
+    // skipping the copy-on-write rewrite (`list_data_files_with_stats` →
+    // per-file read+SET → `write_replacement` → `commit_replace` →
+    // `delete_objects` → `refresh_table`). Mirrors the DELETE fast path.
+    if let Some((pk_keys, fp_assigns)) = try_resolve_fast_path_update(
+        sess,
+        &table,
+        &meta,
+        &assignments,
+        selection.as_ref(),
+        returning.as_deref(),
+    )
+    .await?
+    {
+        let n = hot_tier_update_by_pk(sess, &table, &meta, &pk_keys, &fp_assigns).await?;
+        if n == 0 {
+            return Ok(empty_or_returning(
+                "UPDATE 0",
+                schema.clone(),
+                returning.as_deref(),
+            ));
+        }
+        return Ok(ExecResult::Empty {
+            tag: format!("UPDATE {n}"),
+        });
+    }
 
     // Resolve assignments to (column_index, AssignmentValue).
     // Literals become Scalar; anything else (column refs, arithmetic,

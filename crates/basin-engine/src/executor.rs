@@ -1818,7 +1818,27 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                         let has_rls = meta.rls_enabled;
                         let has_soft_delete =
                             crate::types::soft_delete_column(meta.schema.as_ref()).is_some();
-                        if !is_view && !has_rls && !has_soft_delete {
+                        // Hot-tier merge-on-read gate: when the process-wide
+                        // memtable holds tombstones (fast-path DELETE) or
+                        // UPDATE overrides (fast-path UPDATE) for this table,
+                        // the catalog `live_data_files()` row counts are stale
+                        // — a tombstone removes a counted cold row and an
+                        // override shadows one. Skip the metadata-only path so
+                        // the aggregate is computed over the merged hot+cold
+                        // row set (where the overlay / tombstone filter runs).
+                        let has_hot_overlay = {
+                            let registry = sess.engine.memtable_registry();
+                            registry
+                                .get(&sess.project, &plan.table)
+                                .map(|e| {
+                                    e.memtable
+                                        .snapshot()
+                                        .iter()
+                                        .any(|(_, v)| !v.is_row() || v.is_update())
+                                })
+                                .unwrap_or(false)
+                        };
+                        if !is_view && !has_rls && !has_soft_delete && !has_hot_overlay {
                             if let Some(result) =
                                 crate::fast_aggregate::execute_metadata_aggregate(
                                     sess, plan, table_meta,
