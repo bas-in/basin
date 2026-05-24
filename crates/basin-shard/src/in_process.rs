@@ -1339,6 +1339,7 @@ impl basin_hottier::FlushBackend for ShardFlushBackend {
                                 projection: None,
                                 filters: vec![],
                                 partition: Some(partition.clone()),
+                                ..Default::default()
                             },
                         )
                         .await?;
@@ -1502,11 +1503,15 @@ impl ProjectHandleImpl for InProcessProjectHandle {
 
     #[instrument(skip(self, opts), fields(project = %self.project, partition = %self.partition, table = %table))]
     async fn read(&self, table: &TableName, opts: ReadOptions) -> Result<Vec<RecordBatch>> {
-        // Stream the Parquet base.
+        // Stream the Parquet base. Forward all knobs from the caller's opts
+        // (including LIMIT and row-group selection) so storage-level
+        // pushdowns reach the reader.
         let parquet_opts = ReadOptions {
             projection: opts.projection.clone(),
             filters: opts.filters.clone(),
             partition: opts.partition.clone(),
+            limit: opts.limit,
+            row_group_selection: opts.row_group_selection.clone(),
         };
         let stream = self
             .cfg

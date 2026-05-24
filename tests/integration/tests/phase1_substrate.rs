@@ -230,6 +230,7 @@ async fn phase1_substrate_one_million_rows_one_hundred_projects() {
                 projection: Some(vec!["id".into(), "project_marker".into()]),
                 filters: vec![Predicate::Eq("id".into(), ScalarValue::Int64(42))],
                 partition: None,
+                ..Default::default()
             },
         )
         .await

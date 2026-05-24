@@ -549,6 +549,7 @@ async fn read_paths_inner(
         None
     };
     let project_owned = *project;
+    let limit = opts.limit;
     let stream = futures::stream::iter(paths)
         .map(move |p| {
             let store = store_for_stream.clone();
@@ -588,7 +589,7 @@ async fn read_paths_inner(
         )
         .flatten();
 
-    Ok(stream.boxed())
+    Ok(apply_limit_to_stream(stream.boxed(), limit))
 }
 
 /// Public entry for reading a single data file's contents. Mirrors what
@@ -1344,6 +1345,10 @@ where
                     counters
                         .row_groups_considered
                         .fetch_add(total, Ordering::Relaxed);
+                    // Index-probe row-group allowlist for this file (if any).
+                    // None or missing-file = scan every row-group (legacy
+                    // behaviour). Files in the map honour only the listed ids.
+                    let rg_allow = rowgroup_allow_for_file(opts.as_ref(), &path);
                     let mut kept = Vec::with_capacity(row_groups.len());
                     let mut pruned = 0u64;
                     let resolved: Vec<(usize, &Predicate)> = if opts.filters.is_empty() {
@@ -1357,6 +1362,14 @@ where
                             .collect()
                     };
                     for (i, rg) in row_groups.iter().enumerate() {
+                        // Index allowlist applied first; the predicate-stats
+                        // prune below is still authoritative for the rest.
+                        if let Some(allow) = rg_allow.as_ref() {
+                            if !allow.contains(&(i as u32)) {
+                                pruned += 1;
+                                continue;
+                            }
+                        }
                         if row_group_pruned_resolved(rg, &resolved) {
                             pruned += 1;
                         } else {
@@ -1457,6 +1470,9 @@ where
         counters
             .row_groups_considered
             .fetch_add(total, Ordering::Relaxed);
+        // Index-probe row-group allowlist for this file (if any). None or
+        // missing-file means scan every row-group (legacy behaviour).
+        let rg_allow = rowgroup_allow_for_file(opts.as_ref(), &path);
         let mut kept = Vec::with_capacity(row_groups.len());
         let mut pruned = 0u64;
         // Pre-resolve (col_index, predicate_ref) once per file rather than
@@ -1474,6 +1490,15 @@ where
                 .collect()
         };
         for (i, rg) in row_groups.iter().enumerate() {
+            // The index allowlist is a structural pre-filter (a superset of
+            // matching row-groups, per the GIN row-group prune contract); we
+            // intersect with it before the stats-based prune.
+            if let Some(allow) = rg_allow.as_ref() {
+                if !allow.contains(&(i as u32)) {
+                    pruned += 1;
+                    continue;
+                }
+            }
             if row_group_pruned_resolved(rg, &resolved) {
                 pruned += 1;
             } else {
@@ -2014,6 +2039,81 @@ fn synthesise_missing_columns(
 
     RecordBatch::try_new(output_schema.clone(), columns)
         .map_err(|e| BasinError::storage(format!("synthesise_missing_columns: {e}")))
+}
+
+/// Look up the surviving row-group ids for `path` in the read-options
+/// allowlist. Returns `None` when no allowlist is set OR when the file is
+/// not summarised (W's API contract: a missing file = "Unknown" = read all
+/// row-groups). Returns `Some(&allow)` when the caller's prune decision
+/// applies to this file. Membership is checked with a `HashSet`-style probe
+/// by the caller (small surviving lists are typical: a Vec scan is fine).
+fn rowgroup_allow_for_file<'a>(
+    opts: &'a ReadOptions,
+    path: &ObjectPath,
+) -> Option<&'a Vec<u32>> {
+    let map = opts.row_group_selection.as_ref()?;
+    map.get(path.as_ref())
+}
+
+/// Wrap a record-batch stream with a post-filter row limit. When `limit` is
+/// `None` the stream is returned unchanged (byte-identical to the
+/// pre-limit-pushdown path). When `Some(n)`, the wrapper counts emitted
+/// rows (which are already post-predicate, post-projection — i.e. only the
+/// rows that pass `ReadOptions::filters`), slices the batch crossing the
+/// boundary so exactly `n` rows are returned, and stops pulling further
+/// batches from the upstream. Matches PG btree-scan LIMIT semantics: the
+/// limit applies AFTER the filter, so a query like `WHERE col = X LIMIT 100`
+/// returns 100 *matches* (not 100 candidate rows).
+fn apply_limit_to_stream(
+    stream: BoxStream<'static, Result<RecordBatch>>,
+    limit: Option<usize>,
+) -> BoxStream<'static, Result<RecordBatch>> {
+    let Some(mut remaining) = limit else {
+        return stream;
+    };
+    if remaining == 0 {
+        // A LIMIT 0 query yields the schema with zero rows. Drop the upstream
+        // entirely — DataFusion's planner will already have short-circuited
+        // most of these, but be defensive.
+        return futures::stream::empty().boxed();
+    }
+    // `take_while` would let through batches that overflow `remaining`. Use
+    // `scan` so we can SLICE the boundary batch to exactly `remaining` rows
+    // and terminate. The state carries the remaining-budget across yields;
+    // once exhausted we emit None and the wrapper completes.
+    let limited = stream
+        .scan((), move |_, item| {
+            let res = match item {
+                Err(e) => Some(Some(Err(e))),
+                Ok(batch) => {
+                    if remaining == 0 {
+                        // Already satisfied; ignore any trailing batches the
+                        // upstream emits (e.g. page-cache terminator).
+                        Some(None)
+                    } else {
+                        let n = batch.num_rows();
+                        if n <= remaining {
+                            remaining -= n;
+                            Some(Some(Ok(batch)))
+                        } else {
+                            let take = remaining;
+                            remaining = 0;
+                            Some(Some(Ok(batch.slice(0, take))))
+                        }
+                    }
+                }
+            };
+            async move { res }
+        })
+        // After we've emitted the boundary-slice batch, every subsequent
+        // poll returns `Some(None)`. `take_while` on Option-Some lets us
+        // terminate the stream once `remaining == 0`.
+        .take_while(|opt| {
+            let cont = opt.is_some();
+            async move { cont }
+        })
+        .filter_map(|opt| async move { opt });
+    limited.boxed()
 }
 
 #[cfg(test)]

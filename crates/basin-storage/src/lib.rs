@@ -205,11 +205,34 @@ impl std::fmt::Debug for StorageConfig {
 pub const DEFAULT_PROJECT_CONCURRENCY: usize = 16;
 
 /// Read knobs for [`Storage::read`]. Filters are ANDed together.
+///
+/// `limit` (when `Some`) is a hint to stop emitting batches once `n` rows
+/// have passed the predicate filter (post-filter count, matching PG
+/// btree-scan LIMIT semantics). `None` (the default) preserves the legacy
+/// behaviour of fully materialising the result.
+///
+/// `row_group_selection` (when `Some`) is a per-file allowlist of surviving
+/// row-group indices, populated by upstream index probes (e.g. the JSONB
+/// row-group GIN prune in
+/// `basin-engine::index_probe::rowgroup_prune_for_containment`). The reader
+/// looks up each scanned file in the map: a file present in the map reads
+/// ONLY the listed row-groups; a file absent from the map reads every
+/// row-group (so the un-summarised / never-indexed path is preserved
+/// byte-identically). The predicate is still re-evaluated on every emitted
+/// row — the selection is a SUPERSET filter on which row-groups to open,
+/// not a substitute for the row-level filter.
 #[derive(Clone, Debug, Default)]
 pub struct ReadOptions {
     pub projection: Option<Vec<String>>,
     pub filters: Vec<Predicate>,
     pub partition: Option<basin_common::PartitionKey>,
+    /// Optional cap on the number of rows the reader emits (post-filter).
+    /// `None` = unlimited.
+    pub limit: Option<usize>,
+    /// Optional per-file row-group allowlist. Files absent from the map are
+    /// scanned in full; files present are restricted to the listed groups.
+    /// `None` = scan every row-group of every file.
+    pub row_group_selection: Option<HashMap<String, Vec<u32>>>,
 }
 
 /// Project-aware Parquet store. Cheap to clone (`Arc` inside).

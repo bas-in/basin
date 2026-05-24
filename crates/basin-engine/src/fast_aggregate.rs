@@ -918,11 +918,14 @@ pub(crate) async fn execute_groupby_low_card(
         .map(|f| object_store::path::Path::from(f.path.as_str()))
         .collect();
 
-    // Read ONLY the key column from all files.
+    // Read ONLY the key column from all files. No LIMIT pushdown: a GROUP
+    // BY aggregate has to see every row.
     let opts = basin_storage::ReadOptions {
         projection: Some(vec![plan.key_col.clone()]),
         filters: vec![],
         partition: None,
+        limit: None,
+        row_group_selection: None,
     };
     let schema_ref = Some(meta.schema.clone());
 

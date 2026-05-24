@@ -1130,10 +1130,51 @@ pub(crate) async fn execute_simple_select(
     // Build read options using the storage-superset column list. For plain
     // column projections this is identical to the user list; for computed
     // projections it is the union of all source columns + filter columns.
+    //
+    // LIMIT pushdown: when the query carries a `LIMIT n` AND there is no
+    // ORDER BY (no global sort needed) AND no aggregate (which folds every
+    // row) AND no post-read shrinking filter (IS NULL post-filter, or a
+    // live tombstone / UPDATE-overlay for this table — which can REMOVE
+    // cold-tier rows the limit just admitted), pass the cap into
+    // ReadOptions so the storage layer can stop emitting batches once `n`
+    // post-filter rows have been produced. Otherwise leave the read
+    // unbounded and let the existing `apply_limit` pass after the post-read
+    // shrinks bound the final result — this preserves the "≥ n when more
+    // exist" guarantee.
+    let post_read_shrinking = !plan.is_null_cols.is_empty()
+        || {
+            // Probe the memtable registry for any overlay activity on this
+            // (project, table). Both probes are O(1) HashMap lookups; we
+            // only consult them on the LIMIT-pushdown gate, so the work is
+            // bounded and proportional to "does the engine have any
+            // outstanding fast-path DELETE/UPDATE for this table".
+            let registry = sess.engine.memtable_registry();
+            let tombs = crate::hot_tombstone::snapshot_tombstones(
+                registry.as_ref(),
+                &sess.project,
+                &plan.table,
+            );
+            let updates = crate::hot_tombstone::snapshot_updates(
+                registry.as_ref(),
+                &sess.project,
+                &plan.table,
+            );
+            !tombs.is_empty() || !updates.is_empty()
+        };
+    let pushdown_limit = if plan.order_by.is_none()
+        && plan.aggregates.is_none()
+        && !post_read_shrinking
+    {
+        plan.limit
+    } else {
+        None
+    };
     let opts = ReadOptions {
         projection: plan.read_cols.clone(),
         filters: plan.predicates.clone(),
         partition: None,
+        limit: pushdown_limit,
+        row_group_selection: None,
     };
 
     // ── Phase 5.14.C3: memtable point-lookup probe ───────────────────────────
