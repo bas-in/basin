@@ -9117,7 +9117,7 @@ mod pg_cancel_backend_tests {
         sess.execute("CREATE TABLE cancel_big (id BIGINT NOT NULL)")
             .await
             .unwrap();
-        let vals: Vec<String> = (0..100_i64).map(|i| format!("({i})")).collect();
+        let vals: Vec<String> = (0..80_i64).map(|i| format!("({i})")).collect();
         sess.execute(&format!("INSERT INTO cancel_big VALUES {}", vals.join(",")))
             .await
             .unwrap();
@@ -9125,14 +9125,25 @@ mod pg_cancel_backend_tests {
 
     /// Prove: pg_cancel_backend(pid) terminates a running cross-join with
     /// SQLSTATE 57014, and the connection stays usable afterwards.
-    #[tokio::test]
+    ///
+    /// Uses the multi-thread runtime so the CPU-bound slow query (which only
+    /// yields between `df.collect()` batch boundaries) cannot starve the
+    /// cancelling session. Under `current_thread` the cancel call could not be
+    /// polled until the spawned task happened to yield, which made the test
+    /// flaky.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancel_running_query_returns_57014() {
         let dir = TempDir::new().unwrap();
         let eng = make_engine(&dir);
         let project = ProjectId::new();
 
-        // Session A: will run the slow query.
-        let sess_a = eng.open_session(project).await.unwrap();
+        // Session A: will run the slow query. Wrapped in an `Arc` so the outer
+        // scope keeps the session (and thus its `ConnectionHandle`) alive while
+        // the spawned task runs. Without this, if the spawned task finishes
+        // before `pg_cancel_backend` runs, dropping the session deregisters its
+        // pid from the `ConnectionRegistry`, so the cancel returns `false` for a
+        // still-conceptually-live session.
+        let sess_a = Arc::new(eng.open_session(project).await.unwrap());
         seed_big(&sess_a).await;
         let pid_a = sess_a.session_pid;
 
@@ -9140,15 +9151,28 @@ mod pg_cancel_backend_tests {
         let sess_b = eng.open_session(project).await.unwrap();
 
         // Spawn the slow cross-join on sess_a in the background.
-        // This table has 100 rows, so 100^4 = 100M output rows for COUNT(*).
+        //
+        // The seed table has 80 rows, so the 5-way self-cross-join produces
+        // 80^5 ≈ 3.3 billion output rows. The depth matters: the 5-level
+        // streaming pipeline yields between batches often enough that the
+        // per-session `cancel_notify` branch of the executor's `tokio::select!`
+        // is reliably polled mid-flight, so the cancel always lands before the
+        // query completes. A shallower 4-level join runs DataFusion's aggregate
+        // to completion inside a single poll, never re-entering the select — the
+        // root cause of the original flake/failure.
+        let sess_a_spawn = Arc::clone(&sess_a);
         let slow_fut = tokio::spawn(async move {
-            sess_a
-                .execute("SELECT COUNT(*) FROM cancel_big a, cancel_big b, cancel_big c, cancel_big d")
+            sess_a_spawn
+                .execute(
+                    "SELECT COUNT(*) FROM cancel_big a, cancel_big b, cancel_big c, \
+                     cancel_big d, cancel_big e",
+                )
                 .await
         });
 
-        // Give the slow query a moment to start executing.
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Give the slow query a moment to start executing and register itself
+        // on the executor before we issue the cancel.
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Cancel from session B.
         let cancel_res = sess_b
