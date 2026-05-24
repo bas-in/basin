@@ -266,15 +266,13 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                     });
                 }
                 crate::pg_ast::StmtKind::Commit => {
-                    // Phase 5.14.C2: promote hot-tier rows to the shared
-                    // MemTableRegistry and emit WAL Commit markers before
-                    // clearing TxState.
+                    // Phase 5.14.C2 / ADR 0020 §6: promote hot-tier rows to
+                    // the shared MemTableRegistry and emit an explicit WAL
+                    // TxCommit marker so crash-recovery replay can distinguish
+                    // committed transactions from crash-mid-tx aborts.
                     //
-                    // ADR 0020 §"Commit": a committed transaction is one whose
-                    // Begin marker is NOT followed by a Rollback.  There is no
-                    // explicit Commit WAL marker today — implicit commit on
-                    // absence of Rollback.  The Rollback marker IS emitted for
-                    // cancelled transactions (see the ROLLBACK arm below).
+                    // Capture tx_id *before* tx_commit() clears TxState.
+                    let commit_tx_id = crate::session::tx_get_id(&sess.state);
                     let htap_rows = crate::session::tx_htap_take_all(&sess.state);
 
                     // Promote committed HTAP batches to the process-wide registry.
@@ -333,6 +331,21 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                                 sess.session_pid,
                             );
                         }
+                    }
+                    // ADR 0020 §6: emit explicit TxCommit WAL marker so that
+                    // crash-recovery replay can distinguish committed transactions
+                    // from crash-mid-tx aborts.  Only emitted when the executor
+                    // had a WAL-backed tx_id (i.e. at least one DML was executed
+                    // inside this BEGIN block, which triggers htap_emit_wal_begin_lazy).
+                    // Best-effort: WAL marker failures must not block commit.
+                    if let (Some(shard), Some(tx_id)) =
+                        (sess.engine.config().shard.as_ref(), commit_tx_id)
+                    {
+                        let part = basin_common::PartitionKey::default_key();
+                        let _ = shard
+                            .wal()
+                            .append_tx_commit(&sess.project, &part, tx_id)
+                            .await;
                     }
                     return Ok(ExecResult::Empty {
                         tag: "COMMIT".into(),
@@ -3622,6 +3635,7 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
                 table.as_str(),
                 &meta.pk_columns,
                 &batch,
+                Some((&*sess.engine.memtable_registry(), &sess.project)),
             )
             .await?;
             crate::constraints::enforce_unique_on_insert(
@@ -3725,6 +3739,7 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
         table.as_str(),
         &meta.pk_columns,
         &batch,
+        Some((&*sess.engine.memtable_registry(), &sess.project)),
     )
     .await?;
     crate::constraints::enforce_unique_on_insert(
@@ -4119,6 +4134,7 @@ async fn exec_insert_select(
         table.as_str(),
         &meta.pk_columns,
         &batch,
+        Some((&*sess.engine.memtable_registry(), &sess.project)),
     )
     .await?;
     crate::constraints::enforce_unique_on_insert(
@@ -4333,6 +4349,7 @@ async fn exec_insert_default_values(
         table.as_str(),
         &meta.pk_columns,
         &batch,
+        Some((&*sess.engine.memtable_registry(), &sess.project)),
     )
     .await?;
     crate::constraints::enforce_unique_on_insert(
@@ -7432,8 +7449,58 @@ async fn htap_promote_to_registry(
         return Ok(());
     }
     let registry = sess.engine.memtable_registry();
+    let catalog = &sess.engine.config().catalog;
     for (table, batches) in htap_rows {
         let entry = registry.get_or_create(sess.project, table.clone());
+
+        // Pre-fetch table metadata once per table so the hot loop below does
+        // not call load_table() per row.  On catalog miss (e.g. mid-DROP) fall
+        // back to the monotonic-counter key for the whole table.
+        let pk_info: Option<Vec<(usize, arrow_schema::DataType)>> =
+            match catalog.load_table(&sess.project, table).await {
+                Ok(meta) if !meta.pk_columns.is_empty() => {
+                    // For each PK column resolve: (batch column index, DataType).
+                    // We validate against the first batch's schema — all batches
+                    // for the same table share the same schema within a session.
+                    let first_batch = batches.first();
+                    first_batch.and_then(|fb| {
+                        let schema = fb.schema();
+                        let mut cols: Vec<(usize, arrow_schema::DataType)> =
+                            Vec::with_capacity(meta.pk_columns.len());
+                        for pk_col in &meta.pk_columns {
+                            match schema.index_of(pk_col) {
+                                Ok(idx) => {
+                                    let dt = schema.field(idx).data_type().clone();
+                                    cols.push((idx, dt));
+                                }
+                                Err(_) => {
+                                    // PK column missing from batch schema — degrade
+                                    // to counter key for the whole table.
+                                    tracing::warn!(
+                                        table = %table,
+                                        pk_col = %pk_col,
+                                        "htap_promote_to_registry: PK column missing \
+                                         from batch schema — falling back to counter key"
+                                    );
+                                    return None;
+                                }
+                            }
+                        }
+                        Some(cols)
+                    })
+                }
+                Ok(_) => None, // no PK declared
+                Err(_) => {
+                    // Catalog unavailable — degrade gracefully.
+                    tracing::warn!(
+                        table = %table,
+                        "htap_promote_to_registry: catalog miss for table \
+                         — falling back to counter key"
+                    );
+                    None
+                }
+            };
+
         for batch in batches {
             let approx_bytes = batch.get_array_memory_size() as u64;
             // Budget gate.
@@ -7452,17 +7519,34 @@ async fn htap_promote_to_registry(
                     ));
                 }
             }
-            // Encode each row as IPC and store under a monotonic key.
             for row_idx in 0..batch.num_rows() {
                 let row_batch = batch.slice(row_idx, 1);
                 let row_bytes = encode_batch_to_ipc(&row_batch);
-                // Use a counter key scoped per-entry to avoid collisions across
-                // transactions.  A monotonic atomic on the entry would be ideal
-                // for production; here we use row_idx within the batch as a
-                // best-effort key (sufficient for C2 correctness guarantees).
-                let key = basin_hottier::RowKey::builder()
-                    .append_u64(entry.memtable.total_count() as u64)
-                    .finish();
+
+                // Derive the RowKey from the encoded PK columns so that:
+                // 1. The memtable PK direct-get fast path can find the row.
+                // 2. Future merge-on-read can dedupe hot vs cold by PK.
+                //
+                // Falls back to a monotonic counter key when the PK cannot be
+                // encoded (unsupported type, NULL PK, or no PK declared).
+                let key = if let Some(ref pk_cols) = pk_info {
+                    build_pk_row_key(batch, row_idx, pk_cols)
+                        .unwrap_or_else(|| {
+                            // Unsupported PK type or NULL — use counter fallback.
+                            // warn! is rate-limited by the one-per-table pre-fetch
+                            // warning above; only log here for NULL PK values which
+                            // are unexpected on a table with a PK constraint.
+                            basin_hottier::RowKey::builder()
+                                .append_u64(entry.memtable.total_count() as u64)
+                                .finish()
+                        })
+                } else {
+                    // No PK info — monotonic counter key.
+                    basin_hottier::RowKey::builder()
+                        .append_u64(entry.memtable.total_count() as u64)
+                        .finish()
+                };
+
                 entry
                     .memtable
                     .insert(key, basin_hottier::MemRowValue::row(row_bytes, 0));
@@ -7470,6 +7554,34 @@ async fn htap_promote_to_registry(
         }
     }
     Ok(())
+}
+
+/// Build a [`basin_hottier::RowKey`] from the PK columns of a single row in
+/// `batch` at `row_idx`, using the same per-type encoding as
+/// `dml_mutate::pk_scalar_to_row_key` / `constraint_union::array_value_to_row_key`.
+///
+/// `pk_cols` is a slice of `(column_index_in_batch, declared_DataType)` in PK
+/// declaration order.  For single-column PKs a single segment is produced;
+/// for composite PKs every column's bytes are concatenated in order.
+///
+/// Returns `None` when any PK column contains a NULL value or has an
+/// unsupported type — the caller should fall back to a monotonic counter key.
+fn build_pk_row_key(
+    batch: &arrow_array::RecordBatch,
+    row_idx: usize,
+    pk_cols: &[(usize, arrow_schema::DataType)],
+) -> Option<basin_hottier::RowKey> {
+    // Collect each column's encoded bytes into one contiguous buffer.
+    // `array_value_to_row_key` returns `None` on NULL or unsupported type,
+    // propagating `?` so we fall back to counter key on the first failure.
+    let mut composite: Vec<u8> = Vec::new();
+    for (col_idx, col_dt) in pk_cols {
+        let array = batch.column(*col_idx);
+        let segment =
+            crate::constraint_union::array_value_to_row_key(array.as_ref(), row_idx, col_dt)?;
+        composite.extend_from_slice(segment.as_bytes());
+    }
+    Some(basin_hottier::RowKey::from_bytes(composite))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
