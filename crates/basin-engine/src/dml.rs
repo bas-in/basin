@@ -955,10 +955,21 @@ fn coerce_jsonb(expr: &Expr, col: &str) -> Result<Option<Vec<u8>>> {
     let canonical = canonicalize_json(parsed);
     let json_bytes = serde_json::to_vec(&canonical)
         .map_err(|e| BasinError::internal(format!("re-serialising JSON for column {col}: {e}")))?;
-    // ADR 0027 Phase 2: attempt to encode with the binary offset table (0x02 tag).
-    // Falls back to bare JSON bytes on any encode error or for non-object roots.
-    let bytes = encode_jsonb_v2(&json_bytes).unwrap_or(json_bytes);
-    Ok(Some(bytes))
+    // ADR 0027 Phase 2 (write-side) REVERTED: stored JSONB is bare canonical
+    // JSON, not the `0x02` binary offset table. The offset table gave a 15x
+    // micro-bench speedup on `RawJson::member` but ZERO end-to-end bench
+    // improvement (the JSONB bench bottleneck is the row-count the UDF runs on
+    // + payload-blob decode, fixed by filter-pushdown + Phase 4 promoted
+    // columns — not per-document parse speed). Meanwhile emitting `0x02`
+    // silently broke every consumer of stored JSONB bytes that parses raw JSON
+    // (GIN row-group + file-level indexers, JSONPath, jsonb aggregates,
+    // json_build) — they were never taught to detect the tag. Net-negative, so
+    // we stop writing it. The read-side `0x02` detection (jsonb_udf::RawJson)
+    // is intentionally KEPT so any rows written during the Phase 2 window still
+    // decode correctly. `encode_jsonb_v2` is retained (dead on the write path)
+    // for that historical-decode test coverage + a possible future re-enable
+    // once all consumers share a 0x02-aware decode helper.
+    Ok(Some(json_bytes))
 }
 
 // ---------------------------------------------------------------------------
