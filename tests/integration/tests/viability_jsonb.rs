@@ -65,6 +65,47 @@ fn canonical_bytes(s: &str) -> Vec<u8> {
     serde_json::to_vec(&canonicalize(v)).expect("test JSON re-serialise")
 }
 
+/// Extract the canonical JSON payload bytes from a stored JSONB cell,
+/// stripping any version tag (ADR 0027 Phase 2's `0x02` prefix or the
+/// PG wire `0x01` prefix). Returns a slice of the original bytes.
+fn extract_json_payload(stored: &[u8]) -> &[u8] {
+    match stored.first() {
+        // 0x01: PG wire prefix — skip one byte.
+        Some(&0x01) if stored.len() > 1 => &stored[1..],
+        // 0x02: ADR 0027 Phase 2 binary offset table.
+        // Layout: [0x02][u32_le num_entries][entries...][json_bytes]
+        // Entry:  [u16_le key_len][key_bytes][u32_le val_start][u32_le val_end]
+        Some(&0x02) => {
+            if stored.len() < 5 {
+                return stored;
+            }
+            let num_entries = u32::from_le_bytes(
+                stored[1..5].try_into().unwrap_or([0; 4]),
+            ) as usize;
+            let mut p = 5usize;
+            for _ in 0..num_entries {
+                if p + 2 > stored.len() {
+                    return stored;
+                }
+                let kl = u16::from_le_bytes(
+                    stored[p..p + 2].try_into().unwrap_or([0; 2]),
+                ) as usize;
+                p += 2 + kl + 4 + 4;
+                if p > stored.len() {
+                    return stored;
+                }
+            }
+            if p <= stored.len() {
+                &stored[p..]
+            } else {
+                stored
+            }
+        }
+        // Bare JSON — return unchanged.
+        _ => stored,
+    }
+}
+
 #[tokio::test]
 async fn viability_jsonb() {
     let dir = TempDir::new().unwrap();
@@ -166,10 +207,11 @@ async fn viability_jsonb() {
     assert_eq!(rows.len(), 2, "expected 2 rows back, got {}", rows.len());
 
     // Parse the stored bytes back into JSON values for the semantic checks.
+    // Use extract_json_payload to strip any version tag (ADR 0027 Phase 2).
     let alice_json: serde_json::Value =
-        serde_json::from_slice(&rows[0].1).expect("alice payload not valid JSON");
+        serde_json::from_slice(extract_json_payload(&rows[0].1)).expect("alice payload not valid JSON");
     let bob_json: serde_json::Value =
-        serde_json::from_slice(&rows[1].1).expect("bob payload not valid JSON");
+        serde_json::from_slice(extract_json_payload(&rows[1].1)).expect("bob payload not valid JSON");
 
     // Logical content checks (the "round-trip passed" half of the bar).
     assert_eq!(rows[0].0, 1, "first row should be id=1");
@@ -190,28 +232,31 @@ async fn viability_jsonb() {
     // (alphabetical).
     let alice_canonical = canonical_bytes(r#"{"name":"alice","tags":["a","b"]}"#);
     let bob_canonical = canonical_bytes(r#"{"tags":["c"],"name":"bob"}"#);
+    // ADR 0027 Phase 2: stored bytes are v2-encoded; extract the JSON section.
+    let alice_stored_json = extract_json_payload(&rows[0].1);
+    let bob_stored_json = extract_json_payload(&rows[1].1);
     assert_eq!(
-        rows[0].1,
-        alice_canonical,
-        "alice's stored bytes don't match canonical form;\n  got: {:?}\n  expected: {:?}",
-        String::from_utf8_lossy(&rows[0].1),
+        alice_stored_json,
+        alice_canonical.as_slice(),
+        "alice's canonical JSON section doesn't match expected;\n  got: {:?}\n  expected: {:?}",
+        String::from_utf8_lossy(alice_stored_json),
         String::from_utf8_lossy(&alice_canonical),
     );
     assert_eq!(
-        rows[1].1,
-        bob_canonical,
-        "bob's stored bytes don't match canonical form;\n  got: {:?}\n  expected: {:?}",
-        String::from_utf8_lossy(&rows[1].1),
+        bob_stored_json,
+        bob_canonical.as_slice(),
+        "bob's canonical JSON section doesn't match expected;\n  got: {:?}\n  expected: {:?}",
+        String::from_utf8_lossy(bob_stored_json),
         String::from_utf8_lossy(&bob_canonical),
     );
 
-    // Bonus check: bob's stored bytes must start with `{"name"` (not
+    // Bonus check: bob's canonical JSON section must start with `{"name"` (not
     // `{"tags"`) — this is the load-bearing observable proof that
     // canonicalisation rearranged the keys we wrote.
     assert!(
-        rows[1].1.starts_with(br#"{"name""#),
-        "bob's bytes should start with `{{\"name\"` after key sort; got {:?}",
-        String::from_utf8_lossy(&rows[1].1),
+        bob_stored_json.starts_with(br#"{"name""#),
+        "bob's canonical JSON section should start with `{{\"name\"` after key sort; got {:?}",
+        String::from_utf8_lossy(bob_stored_json),
     );
 
     // Bonus check: invalid JSON literals should be rejected with a clean
@@ -228,8 +273,10 @@ async fn viability_jsonb() {
         .expect("NULL JSONB INSERT should succeed");
 
     let roundtrip_passed = true;
+    // ADR 0027 Phase 2: stored bytes may be v2-encoded; check the JSON section.
+    let bob_json_section = extract_json_payload(&rows[1].1);
     let canonical_form_observed =
-        rows[1].1.starts_with(br#"{"name""#) && rows[1].1 == bob_canonical;
+        bob_json_section.starts_with(br#"{"name""#) && bob_json_section == bob_canonical.as_slice();
     let pass = roundtrip_passed && canonical_form_observed;
 
     println!(

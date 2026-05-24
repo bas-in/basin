@@ -522,6 +522,11 @@ pub(crate) fn register_jsonb_udtfs(ctx: &SessionContext) {
 /// Decode JSONB bytes to a serde_json Value.
 /// Basin stores JSONB as canonical JSON bytes (no version prefix).
 ///
+/// Handles version tags:
+///   - bare JSON: parsed directly
+///   - `0x01` prefix (PG wire): stripped, then parsed
+///   - `0x02` prefix (ADR 0027 Phase 2): header skipped, embedded JSON parsed
+///
 /// **Perf note (simd-json evaluated, NOT adopted)**: this hot path was
 /// benchmarked against `simd_json::from_slice::<Value>` (a SIMD port of
 /// simdjson) on realistic JSONB payloads. simd-json mutates its input buffer
@@ -537,15 +542,48 @@ pub(crate) fn register_jsonb_udtfs(ctx: &SessionContext) {
 /// generic-parser measurement.
 #[inline]
 fn jsonb_to_value(bytes: &[u8]) -> DFResult<Value> {
-    // Tolerate an optional leading 0x01 version byte (Postgres wire format)
-    // in case data came through the pgwire layer.
-    let payload = if bytes.first() == Some(&0x01) && bytes.len() > 1 {
-        &bytes[1..]
-    } else {
-        bytes
-    };
+    let payload = strip_version_tag(bytes);
     serde_json::from_slice(payload)
         .map_err(|e| DataFusionError::Execution(format!("jsonb decode error: {e}")))
+}
+
+/// Strip any version tag from stored JSONB bytes, returning the raw JSON slice.
+///
+/// - `0x01` prefix (PG wire byte): return `&bytes[1..]`
+/// - `0x02` prefix (ADR 0027 Phase 2): skip the offset-table header, return
+///   the embedded JSON section at the end of the buffer.
+/// - bare JSON: return unchanged.
+#[inline]
+fn strip_version_tag(bytes: &[u8]) -> &[u8] {
+    match bytes.first() {
+        Some(&0x01) if bytes.len() > 1 => &bytes[1..],
+        Some(&0x02) => {
+            // Parse the header to find the json section start.
+            // Layout: [0x02][u32 num_entries][entries...][json_bytes]
+            // Entry: [u16 key_len][key_bytes][u32 val_start][u32 val_end]
+            if bytes.len() < 5 {
+                return bytes;
+            }
+            let num_entries = u32::from_le_bytes(
+                bytes[1..5].try_into().unwrap_or([0; 4])
+            ) as usize;
+            let mut p = 5usize;
+            for _ in 0..num_entries {
+                if p + 2 > bytes.len() {
+                    return bytes;
+                }
+                let kl = u16::from_le_bytes(
+                    bytes[p..p + 2].try_into().unwrap_or([0; 2])
+                ) as usize;
+                p += 2 + kl + 4 + 4; // key + val_start + val_end
+                if p > bytes.len() {
+                    return bytes;
+                }
+            }
+            if p <= bytes.len() { &bytes[p..] } else { bytes }
+        }
+        _ => bytes,
+    }
 }
 
 /// Encode a serde_json Value to canonical JSONB bytes.
@@ -589,8 +627,86 @@ enum RawType {
 }
 
 /// Zero-copy cursor over the raw JSON payload of a JSONB cell.
+///
+/// ADR 0027 Phase 2: when the stored bytes start with `0x02`, `RawJson`
+/// additionally holds a pre-parsed reference to the binary offset table so
+/// that `member()` can serve top-level key lookups in O(1) instead of
+/// O(doc_size). For all other tags the byte-scan path is unchanged.
 struct RawJson<'a> {
+    /// The raw canonical JSON bytes for this document (without any version tag).
     b: &'a [u8],
+    /// Phase 2 offset table, present when the stored tag is `0x02`.
+    /// Each entry is `(decoded_key, val_start, val_end)` where the offsets
+    /// are into `self.b`.
+    v2_table: Option<V2OffsetTable<'a>>,
+}
+
+/// Parsed representation of the ADR 0027 Phase 2 offset table.
+/// Entries are (key_bytes, val_start, val_end) relative to the json section.
+struct V2OffsetTable<'a> {
+    entries: Vec<(&'a [u8], u32, u32)>,
+    /// The json_bytes section (part of the original buffer, after the header).
+    json: &'a [u8],
+}
+
+impl<'a> V2OffsetTable<'a> {
+    /// Try to parse a `0x02`-tagged buffer. Returns `None` on malformed input.
+    fn parse(buf: &'a [u8]) -> Option<Self> {
+        // buf[0] == 0x02 (already checked by caller)
+        if buf.len() < 5 {
+            return None;
+        }
+        let num_entries = u32::from_le_bytes(buf[1..5].try_into().ok()?) as usize;
+        let mut p = 5usize;
+        let mut entries = Vec::with_capacity(num_entries);
+        for _ in 0..num_entries {
+            // key_len: u16_le
+            if p + 2 > buf.len() {
+                return None;
+            }
+            let kl = u16::from_le_bytes(buf[p..p + 2].try_into().ok()?) as usize;
+            p += 2;
+            // key bytes
+            if p + kl > buf.len() {
+                return None;
+            }
+            let key_bytes = &buf[p..p + kl];
+            p += kl;
+            // val_start: u32_le
+            if p + 4 > buf.len() {
+                return None;
+            }
+            let val_start = u32::from_le_bytes(buf[p..p + 4].try_into().ok()?);
+            p += 4;
+            // val_end: u32_le
+            if p + 4 > buf.len() {
+                return None;
+            }
+            let val_end = u32::from_le_bytes(buf[p..p + 4].try_into().ok()?);
+            p += 4;
+            entries.push((key_bytes, val_start, val_end));
+        }
+        // Remainder is the json section.
+        let json = &buf[p..];
+        Some(V2OffsetTable { entries, json })
+    }
+
+    /// Look up a top-level key in O(num_entries) (typically <16 entries).
+    /// Returns the raw value slice within `self.json`, or `None` if absent.
+    /// Last-wins for duplicate keys (matches serde_json semantics).
+    #[inline]
+    fn lookup(&self, key: &str) -> Option<&'a [u8]> {
+        let key_bytes = key.as_bytes();
+        let mut found: Option<&'a [u8]> = None;
+        for &(kbytes, vs, ve) in &self.entries {
+            if kbytes == key_bytes {
+                let vs = vs as usize;
+                let ve = ve as usize;
+                found = self.json.get(vs..ve);
+            }
+        }
+        found
+    }
 }
 
 /// A located raw value: the byte slice spanning exactly one JSON value.
@@ -598,15 +714,38 @@ type RawResult<'a> = Result<Option<&'a [u8]>, ()>;
 
 impl<'a> RawJson<'a> {
     /// Wrap raw JSONB bytes, tolerating the optional leading 0x01 version byte
-    /// (matching `jsonb_to_value`).
+    /// (matching `jsonb_to_value`) and the Phase 2 `0x02` binary offset table
+    /// (ADR 0027). For `0x02` bytes, parses the offset table once so that
+    /// `member()` lookups are O(num_top_level_keys) — no full-doc scan.
     #[inline]
     fn new(bytes: &'a [u8]) -> Self {
-        let b = if bytes.first() == Some(&0x01) && bytes.len() > 1 {
-            &bytes[1..]
-        } else {
-            bytes
-        };
-        RawJson { b }
+        match bytes.first() {
+            Some(&0x01) if bytes.len() > 1 => RawJson {
+                b: &bytes[1..],
+                v2_table: None,
+            },
+            Some(&0x02) => {
+                // ADR 0027 Phase 2: binary offset table.
+                if let Some(table) = V2OffsetTable::parse(bytes) {
+                    let json = table.json;
+                    RawJson {
+                        b: json,
+                        v2_table: Some(table),
+                    }
+                } else {
+                    // Malformed header — fall back to treating as bare JSON
+                    // (skip the 0x02 tag byte, may still be parseable).
+                    RawJson {
+                        b: if bytes.len() > 1 { &bytes[1..] } else { bytes },
+                        v2_table: None,
+                    }
+                }
+            }
+            _ => RawJson {
+                b: bytes,
+                v2_table: None,
+            },
+        }
     }
 
     /// Determine the top-level value type cheaply (first non-ws byte).
@@ -651,6 +790,10 @@ impl<'a> RawJson<'a> {
     /// contain the string element `key` — matching `jsonb_has_key` semantics.)
     /// Returns `Err(())` if the document is malformed (caller falls back).
     fn has_key(&self, key: &str) -> Result<bool, ()> {
+        // Phase 2 fast path for object key presence.
+        if let Some(ref table) = self.v2_table {
+            return Ok(table.lookup(key).is_some());
+        }
         let mut p = 0usize;
         skip_ws(self.b, &mut p);
         match self.b.get(p) {
@@ -690,7 +833,18 @@ impl<'a> RawJson<'a> {
     /// Locate the raw byte-slice for object member `key`. Duplicate keys:
     /// last occurrence wins (serde_json semantics). `Ok(None)` if the key is
     /// absent or the top level is not an object.
+    ///
+    /// ADR 0027 Phase 2: when a `0x02` offset table is present, serves the
+    /// lookup from the pre-parsed table in O(num_entries) without scanning the
+    /// JSON bytes. For bare JSON / `0x01` bytes, uses the scanner path unchanged.
     fn member(&self, key: &str) -> RawResult<'a> {
+        // Fast path: use the Phase 2 offset table when available.
+        if let Some(ref table) = self.v2_table {
+            // The v2 table is only built for top-level objects; self.b is the
+            // embedded JSON, which must start with '{'.
+            return Ok(table.lookup(key));
+        }
+        // Slow path: byte scanner (Phase 1 / pre-Phase-2 data).
         let mut p = 0usize;
         skip_ws(self.b, &mut p);
         if self.b.get(p) != Some(&b'{') {
@@ -1084,7 +1238,7 @@ fn raw_get_key<'a>(doc: &RawJson<'a>, key: &str) -> Result<Option<&'a [u8]>, ()>
 fn raw_walk_path<'a>(bytes: &'a [u8], segments: &[String]) -> Result<Option<&'a [u8]>, ()> {
     let mut cur: &'a [u8] = RawJson::new(bytes).b;
     for seg in segments {
-        let node = RawJson { b: cur };
+        let node = RawJson { b: cur, v2_table: None };
         let next = match node.top_type() {
             Some(RawType::Object) => node.member(seg)?,
             Some(RawType::Array) => match seg.parse::<usize>() {
@@ -6498,6 +6652,196 @@ mod perf_bench {
         assert!(
             speedup > 1.0,
             "batch index should be faster than k independent scans for k={k}: {speedup:.2}x"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR 0027 Phase 2 — binary offset table parity + single-UDF bench
+    // -----------------------------------------------------------------------
+
+    /// Round-trip every payload in the parity battery through the Phase 2
+    /// encoder (`encode_jsonb_v2`) and verify that `RawJson::new` + `member()`
+    /// produces byte-identical results to the plain-text scanner for every key.
+    ///
+    /// This is the mandatory parity test for ADR 0027 Phase 2: if any key
+    /// lookup diverges, the encoder must fall back to bare JSON (the encoder
+    /// must NOT be enabled for that document). This test verifies the fast path
+    /// produces identical results to the scanner path.
+    #[test]
+    fn phase2_encode_decode_parity() {
+        use crate::dml::encode_jsonb_v2;
+
+        let mut payloads = parity_payloads();
+        // Extra edge cases matching lazy_extract_parity.
+        payloads.push(r#"{"k":1,"k":2,"k":3}"#.to_string()); // dup keys: last wins
+        payloads.push(r#"{"a\"b":"v1","c\\d":"v2","e/f":"v3"}"#.to_string()); // escaped keys
+        payloads.push(r#"{"emoji":"😀","bmp":"é ☃","name":"naïve"}"#.to_string()); // unicode
+        payloads.push(r#"{"arr":[10,20,30],"obj":{"x":1},"n":null,"b":true}"#.to_string());
+        payloads.push(r#"{"empty_obj":{},"empty_arr":[]}"#.to_string());
+        payloads.push(r#"{}"#.to_string()); // empty object
+        // Non-object roots: encoder must fall back (return Err), so these are
+        // tested to verify that encode_jsonb_v2 rejects them.
+        let non_objects = [
+            r#"[1,2,3]"#,
+            r#"null"#,
+            r#"42"#,
+            r#""string""#,
+            r#"true"#,
+        ];
+        for doc in &non_objects {
+            let bytes = doc.as_bytes();
+            assert!(
+                encode_jsonb_v2(bytes).is_err(),
+                "encode_jsonb_v2 must fail for non-object: {doc}"
+            );
+        }
+
+        for p in &payloads {
+            let json_bytes = p.as_bytes();
+            let v = jsonb_to_value(json_bytes).unwrap();
+
+            // Phase 2 encode — must succeed for top-level objects.
+            let encoded = match encode_jsonb_v2(json_bytes) {
+                Ok(b) => b,
+                Err(()) => {
+                    // Non-object root falls back to bare JSON — that's correct.
+                    continue;
+                }
+            };
+            assert_eq!(encoded[0], 0x02, "Phase 2 tag must be 0x02: payload={p}");
+
+            // Derive probe keys generically from the document structure.
+            let mut keys = vec![
+                "0".to_string(),
+                "__absent__".to_string(),
+            ];
+            probe_keys(&v, &mut keys);
+            keys.sort();
+            keys.dedup();
+
+            for key in &keys {
+                // Oracle: RawJson scanner on the plain JSON bytes.
+                let oracle_raw = RawJson::new(json_bytes).member(key).unwrap();
+                let oracle_text = oracle_get_text(json_bytes, key);
+
+                // Phase 2 path: RawJson on the encoded (0x02-tagged) bytes.
+                let p2_raw = RawJson::new(&encoded).member(key).unwrap();
+                let p2_text = match p2_raw {
+                    Some(slice) => raw_slice_to_text(slice).unwrap(),
+                    None => None,
+                };
+
+                // Byte-identical value slice.
+                assert_eq!(
+                    oracle_raw, p2_raw,
+                    "Phase 2 member() slice != scanner for key={key:?} payload={p}"
+                );
+                // Identical text result.
+                assert_eq!(
+                    oracle_text, p2_text,
+                    "Phase 2 text result != scanner for key={key:?} payload={p}"
+                );
+            }
+
+            // Also verify that jsonb_to_value on the encoded bytes produces the
+            // same serde_json::Value tree as on the plain bytes.
+            let decoded_v = jsonb_to_value(&encoded).expect("jsonb_to_value on v2 bytes");
+            assert_eq!(
+                v, decoded_v,
+                "jsonb_to_value on Phase 2 bytes must match plain-bytes parse: payload={p}"
+            );
+        }
+    }
+
+    /// Micro-benchmark for Phase 2: single-UDF, single-key extraction over a
+    /// batch of N rows. Measures:
+    ///   1. SCANNER  — `RawJson::new(bare_json).member(key)` (pre-Phase-2 shape)
+    ///   2. V2_TABLE — `RawJson::new(v2_encoded).member(key)` (Phase 2 offset table)
+    ///
+    /// Reports the speedup. Gated by `BASIN_JSONB_BENCH=1`.
+    #[test]
+    #[ignore = "opt-in: BASIN_JSONB_BENCH=1"]
+    fn bench_phase2_single_udf_single_key() {
+        if std::env::var("BASIN_JSONB_BENCH").as_deref() != Ok("1") {
+            return;
+        }
+        use crate::dml::encode_jsonb_v2;
+        const N: usize = 100_000;
+
+        // Use the largest payload from the parity battery (~1KB).
+        let template = parity_payloads().into_iter().max_by_key(|s| s.len()).unwrap();
+        let json_bytes = template.as_bytes();
+        eprintln!("payload: {} bytes", json_bytes.len());
+
+        // Pick the LAST top-level key (worst-case for the scanner — it scans
+        // past all preceding members). Key is derived structurally from the
+        // document, not hardcoded.
+        let v = jsonb_to_value(json_bytes).unwrap();
+        let key = match &v {
+            serde_json::Value::Object(m) => m.keys().last().unwrap().clone(),
+            _ => panic!("expected object template"),
+        };
+        eprintln!("probing last key: {key:?}");
+
+        // Encode once.
+        let encoded = encode_jsonb_v2(json_bytes).expect("encode_jsonb_v2 failed");
+
+        // Verify parity before measuring.
+        let oracle = oracle_get_text(json_bytes, &key);
+        let p2_slice = RawJson::new(&encoded).member(&key).unwrap();
+        let p2_text = p2_slice.and_then(|s| raw_slice_to_text(s).unwrap());
+        assert_eq!(oracle, p2_text, "parity check before bench");
+
+        // Build arrays.
+        let bare_rows: Vec<Vec<u8>> = (0..N).map(|_| json_bytes.to_vec()).collect();
+        let v2_rows: Vec<Vec<u8>> = (0..N).map(|_| encoded.clone()).collect();
+
+        // Warmup.
+        for _ in 0..2_000 {
+            let _ = std::hint::black_box(RawJson::new(&bare_rows[0]).member(&key).unwrap());
+            let _ = std::hint::black_box(RawJson::new(&v2_rows[0]).member(&key).unwrap());
+        }
+
+        // 1. Scanner path (bare JSON, no offset table).
+        let t0 = Instant::now();
+        for i in 0..N {
+            let doc = RawJson::new(&bare_rows[i]);
+            let slice = std::hint::black_box(doc.member(&key).unwrap());
+            if let Some(s) = slice {
+                std::hint::black_box(raw_slice_to_text(s).unwrap());
+            }
+        }
+        let scanner_dur = t0.elapsed();
+
+        // 2. Phase 2 offset table path (v2-encoded).
+        let t1 = Instant::now();
+        for i in 0..N {
+            let doc = RawJson::new(&v2_rows[i]);
+            let slice = std::hint::black_box(doc.member(&key).unwrap());
+            if let Some(s) = slice {
+                std::hint::black_box(raw_slice_to_text(s).unwrap());
+            }
+        }
+        let v2_dur = t1.elapsed();
+
+        let speedup = scanner_dur.as_secs_f64() / v2_dur.as_secs_f64();
+        eprintln!(
+            "SCANNER  {:?} ({:.2} M/s)",
+            scanner_dur,
+            N as f64 / scanner_dur.as_secs_f64() / 1e6
+        );
+        eprintln!(
+            "V2_TABLE {:?} ({:.2} M/s) | speedup {:.2}x",
+            v2_dur,
+            N as f64 / v2_dur.as_secs_f64() / 1e6,
+            speedup
+        );
+
+        // The offset table must be strictly faster for a last-key lookup on a
+        // multi-key document (the scanner must walk past all preceding members).
+        assert!(
+            speedup > 1.0,
+            "Phase 2 offset table should be faster than scanner for last-key lookup: {speedup:.2}x"
         );
     }
 }

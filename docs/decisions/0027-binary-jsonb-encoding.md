@@ -8,7 +8,7 @@ tags: [jsonb, performance, encoding, storage]
 
 # 0027 — Binary / columnar JSONB representation
 
-- **Status:** Accepted — Phase 1 (per-batch top-level index) landed.
+- **Status:** Accepted — Phase 1 (per-batch top-level index) landed; Phase 2 (write-time binary offset table) landed.
 - **Tags:** jsonb, performance, encoding, storage
 - **Driving issue:** `viability_jsonb` bench: `payload->>'key'`, `payload->'key'`,
   `payload #> '{a,b}'`, `jsonb_typeof`, `jsonb_array_length` measure 100–2200×

@@ -953,9 +953,335 @@ fn coerce_jsonb(expr: &Expr, col: &str) -> Result<Option<Vec<u8>>> {
         BasinError::InvalidSchema(format!("invalid JSON literal for column {col}: {e}"))
     })?;
     let canonical = canonicalize_json(parsed);
-    let bytes = serde_json::to_vec(&canonical)
+    let json_bytes = serde_json::to_vec(&canonical)
         .map_err(|e| BasinError::internal(format!("re-serialising JSON for column {col}: {e}")))?;
+    // ADR 0027 Phase 2: attempt to encode with the binary offset table (0x02 tag).
+    // Falls back to bare JSON bytes on any encode error or for non-object roots.
+    let bytes = encode_jsonb_v2(&json_bytes).unwrap_or(json_bytes);
     Ok(Some(bytes))
+}
+
+// ---------------------------------------------------------------------------
+// ADR 0027 Phase 2 — write-time binary offset table encoder
+//
+// Layout of a 0x02-tagged JSONB value (all integers little-endian):
+//
+//   [0x02]                              — 1 byte version tag
+//   [u32_le: num_entries]               — 4 bytes: number of top-level keys
+//   for each entry (in document order):
+//     [u16_le: key_len]                 — 2 bytes: byte length of key
+//     [key_bytes: key_len bytes]        — key encoded as raw decoded UTF-8
+//     [u32_le: val_start]               — 4 bytes: start offset of value in json_section
+//     [u32_le: val_end]                 — 4 bytes: end offset of value in json_section
+//   [json_bytes: the original canonical JSON bytes]
+//
+// val_start / val_end are offsets into `json_bytes` (relative to the first
+// byte of json_section, which immediately follows the entry table). They
+// point at the exact raw JSON value slice for that key, matching what
+// `RawJson::scan_object_for` would return.
+//
+// Fallback cases (returns Err, caller uses bare JSON):
+//   - top-level value is not a JSON object
+//   - any key decodes to > 65535 bytes (u16_le overflow)
+//   - num_entries > u32::MAX (theoretical)
+//   - any malformed JSON in the canonical bytes
+// ---------------------------------------------------------------------------
+
+/// Encode canonical `json_bytes` into the ADR 0027 Phase 2 binary format.
+/// Returns `Ok(encoded)` on success, `Err(())` when the document should be
+/// stored as bare JSON (the caller falls back silently).
+pub(crate) fn encode_jsonb_v2(json_bytes: &[u8]) -> std::result::Result<Vec<u8>, ()> {
+    // Must start with '{' (a top-level object) after optional whitespace.
+    let mut p = 0usize;
+    skip_ws_dml(json_bytes, &mut p);
+    if json_bytes.get(p) != Some(&b'{') {
+        return Err(()); // not an object — bare JSON fallback
+    }
+    p += 1; // past '{'
+
+    // Scan the object once to collect (decoded_key, val_start, val_end) triples.
+    // val_start/val_end are offsets into json_bytes (the raw canonical document).
+    let mut entries: Vec<(String, u32, u32)> = Vec::new();
+    skip_ws_dml(json_bytes, &mut p);
+    if json_bytes.get(p) == Some(&b'}') {
+        // Empty object — valid, produce a zero-entry offset table.
+    } else {
+        loop {
+            skip_ws_dml(json_bytes, &mut p);
+            if json_bytes.get(p) != Some(&b'"') {
+                return Err(()); // malformed
+            }
+            // Decode the key using the same logic as parse_string in jsonb_udf.rs
+            // so escaped keys (\uXXXX, \\, \") compare correctly.
+            let key = parse_string_dml(json_bytes, &mut p).ok_or(())?;
+            if key.len() > 65535 {
+                return Err(()); // key too long for u16_le
+            }
+            skip_ws_dml(json_bytes, &mut p);
+            if json_bytes.get(p) != Some(&b':') {
+                return Err(());
+            }
+            p += 1;
+            skip_ws_dml(json_bytes, &mut p);
+            let val_start = p as u32;
+            skip_value_dml(json_bytes, &mut p).ok_or(())?;
+            let val_end = p as u32;
+            // Duplicate keys: last wins — insert replaces earlier entry.
+            if let Some(existing) = entries.iter_mut().find(|(k, _, _)| k == &key) {
+                *existing = (key, val_start, val_end);
+            } else {
+                entries.push((key, val_start, val_end));
+            }
+            skip_ws_dml(json_bytes, &mut p);
+            match json_bytes.get(p) {
+                Some(&b',') => p += 1,
+                Some(&b'}') => break,
+                _ => return Err(()),
+            }
+        }
+    }
+
+    let num_entries = entries.len();
+    if num_entries > u32::MAX as usize {
+        return Err(());
+    }
+
+    // Compute encoded size:
+    //   1 (version) + 4 (num_entries) +
+    //   sum_i (2 + key_i.len() + 4 + 4) +
+    //   json_bytes.len()
+    let header_size = 1 + 4 + entries.iter().map(|(k, _, _)| 2 + k.len() + 4 + 4).sum::<usize>();
+    let total = header_size + json_bytes.len();
+
+    let mut out = Vec::with_capacity(total);
+    out.push(0x02u8);
+    out.extend_from_slice(&(num_entries as u32).to_le_bytes());
+    for (key, val_start, val_end) in &entries {
+        let kl = key.len() as u16;
+        out.extend_from_slice(&kl.to_le_bytes());
+        out.extend_from_slice(key.as_bytes());
+        out.extend_from_slice(&val_start.to_le_bytes());
+        out.extend_from_slice(&val_end.to_le_bytes());
+    }
+    out.extend_from_slice(json_bytes);
+    debug_assert_eq!(out.len(), total, "encode_jsonb_v2: size mismatch");
+    Ok(out)
+}
+
+/// Minimal whitespace-skip for the DML encoder (mirrors `skip_ws` in jsonb_udf).
+#[inline]
+fn skip_ws_dml(b: &[u8], p: &mut usize) {
+    while let Some(&c) = b.get(*p) {
+        if c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' {
+            *p += 1;
+        } else {
+            break;
+        }
+    }
+}
+
+/// Skip a single JSON value (object/array/string/number/literal) in `b`,
+/// advancing `*p` past it. Returns `None` on malformed input.
+fn skip_value_dml(b: &[u8], p: &mut usize) -> Option<()> {
+    skip_ws_dml(b, p);
+    match b.get(*p)? {
+        b'{' => skip_object_dml(b, p),
+        b'[' => skip_array_dml(b, p),
+        b'"' => skip_string_dml(b, p),
+        b't' => skip_lit_dml(b, p, b"true"),
+        b'f' => skip_lit_dml(b, p, b"false"),
+        b'n' => skip_lit_dml(b, p, b"null"),
+        b'-' | b'0'..=b'9' => {
+            while let Some(&c) = b.get(*p) {
+                match c {
+                    b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E' => *p += 1,
+                    _ => break,
+                }
+            }
+            Some(())
+        }
+        _ => None,
+    }
+}
+
+fn skip_object_dml(b: &[u8], p: &mut usize) -> Option<()> {
+    *p += 1;
+    skip_ws_dml(b, p);
+    if b.get(*p) == Some(&b'}') {
+        *p += 1;
+        return Some(());
+    }
+    loop {
+        skip_ws_dml(b, p);
+        if b.get(*p) != Some(&b'"') {
+            return None;
+        }
+        skip_string_dml(b, p)?;
+        skip_ws_dml(b, p);
+        if b.get(*p) != Some(&b':') {
+            return None;
+        }
+        *p += 1;
+        skip_value_dml(b, p)?;
+        skip_ws_dml(b, p);
+        match b.get(*p) {
+            Some(&b',') => *p += 1,
+            Some(&b'}') => {
+                *p += 1;
+                return Some(());
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn skip_array_dml(b: &[u8], p: &mut usize) -> Option<()> {
+    *p += 1;
+    skip_ws_dml(b, p);
+    if b.get(*p) == Some(&b']') {
+        *p += 1;
+        return Some(());
+    }
+    loop {
+        skip_value_dml(b, p)?;
+        skip_ws_dml(b, p);
+        match b.get(*p) {
+            Some(&b',') => *p += 1,
+            Some(&b']') => {
+                *p += 1;
+                return Some(());
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn skip_string_dml(b: &[u8], p: &mut usize) -> Option<()> {
+    if b.get(*p) != Some(&b'"') {
+        return None;
+    }
+    *p += 1;
+    loop {
+        match b.get(*p)? {
+            b'\\' => *p += 2,
+            b'"' => {
+                *p += 1;
+                return Some(());
+            }
+            _ => *p += 1,
+        }
+    }
+}
+
+fn skip_lit_dml(b: &[u8], p: &mut usize, lit: &[u8]) -> Option<()> {
+    if b.len() >= *p + lit.len() && &b[*p..*p + lit.len()] == lit {
+        *p += lit.len();
+        Some(())
+    } else {
+        None
+    }
+}
+
+/// Parse a JSON string token at `*p` into a decoded Rust String.
+/// Mirrors `parse_string` in jsonb_udf.rs; returns `None` on error.
+fn parse_string_dml(b: &[u8], p: &mut usize) -> Option<String> {
+    if b.get(*p) != Some(&b'"') {
+        return None;
+    }
+    *p += 1;
+    let start = *p;
+    let mut has_escape = false;
+    while let Some(&c) = b.get(*p) {
+        match c {
+            b'\\' => {
+                has_escape = true;
+                break;
+            }
+            b'"' => {
+                let s = std::str::from_utf8(&b[start..*p]).ok()?.to_string();
+                *p += 1;
+                return Some(s);
+            }
+            _ => *p += 1,
+        }
+    }
+    if !has_escape {
+        return None; // unterminated
+    }
+    // Slow path: handle escapes.
+    let mut out = std::str::from_utf8(&b[start..*p]).ok()?.to_string();
+    while let Some(&c) = b.get(*p) {
+        match c {
+            b'"' => {
+                *p += 1;
+                return Some(out);
+            }
+            b'\\' => {
+                *p += 1;
+                let esc = *b.get(*p)?;
+                match esc {
+                    b'"' => out.push('"'),
+                    b'\\' => out.push('\\'),
+                    b'/' => out.push('/'),
+                    b'b' => out.push('\u{0008}'),
+                    b'f' => out.push('\u{000C}'),
+                    b'n' => out.push('\n'),
+                    b'r' => out.push('\r'),
+                    b't' => out.push('\t'),
+                    b'u' => {
+                        let cp = parse_hex4_dml(b, *p + 1)?;
+                        *p += 4;
+                        if (0xD800..=0xDBFF).contains(&cp) {
+                            if b.get(*p + 1) == Some(&b'\\') && b.get(*p + 2) == Some(&b'u') {
+                                let low = parse_hex4_dml(b, *p + 3)?;
+                                *p += 6;
+                                if (0xDC00..=0xDFFF).contains(&low) {
+                                    let ch = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                                    out.push(char::from_u32(ch)?);
+                                } else {
+                                    return None;
+                                }
+                            } else {
+                                return None;
+                            }
+                        } else if (0xDC00..=0xDFFF).contains(&cp) {
+                            return None;
+                        } else {
+                            out.push(char::from_u32(cp)?);
+                        }
+                    }
+                    _ => return None,
+                }
+                *p += 1;
+            }
+            _ => {
+                let run_start = *p;
+                while let Some(&cc) = b.get(*p) {
+                    if cc == b'"' || cc == b'\\' {
+                        break;
+                    }
+                    *p += 1;
+                }
+                out.push_str(std::str::from_utf8(&b[run_start..*p]).ok()?);
+            }
+        }
+    }
+    None
+}
+
+fn parse_hex4_dml(b: &[u8], at: usize) -> Option<u32> {
+    let mut v = 0u32;
+    for i in 0..4 {
+        let c = *b.get(at + i)?;
+        let d = match c {
+            b'0'..=b'9' => (c - b'0') as u32,
+            b'a'..=b'f' => (c - b'a' + 10) as u32,
+            b'A'..=b'F' => (c - b'A' + 10) as u32,
+            _ => return None,
+        };
+        v = (v << 4) | d;
+    }
+    Some(v)
 }
 
 /// Decode a UUID literal into its 16-byte RFC 4122 representation.
