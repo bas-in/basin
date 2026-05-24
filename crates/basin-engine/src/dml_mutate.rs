@@ -625,21 +625,23 @@ async fn try_resolve_fast_path_pks(
     // Gate: opt-in via env var.
     //
     // The fast path writes `MemRowValue::Tombstone` into the process-wide
-    // `MemTableRegistry`. The merge-on-read implementation in
-    // `basin_hottier::merge::merge_scan` correctly suppresses cold-tier rows
-    // for tombstoned PKs — but it is NOT yet wired into the engine's read
-    // paths (`fast_select::probe_memtable` returns `has_tombstone` but the
-    // caller at `fast_select.rs:~1167` ignores it; `HtapUnionTable::scan`
-    // in `session.rs` does a plain `UnionExec` without merge-on-read).
-    // Until that wiring lands, a SELECT issued after a fast-path DELETE
-    // would still observe the cold-tier row → stale reads.
+    // `MemTableRegistry`. Merge-on-read wiring status (as of current code):
     //
-    // Set `BASIN_HOTTIER_DELETE_FASTPATH=1` to opt this DELETE
-    // shape into the registry-tombstone route (e.g. for the bulk-DELETE
-    // perf bench, where the metric is DELETE latency and post-DELETE
-    // visibility is not asserted). Defaults to OFF so existing
-    // correctness tests pass unchanged. Follow-up: wire merge-on-read
-    // into the SELECT path, then the env var can default to ON.
+    //   * `fast_select::execute_simple_select` — WIRED. Calls
+    //     `apply_tombstone_filter_to_batches` (fast_select.rs:~1886) then
+    //     `apply_update_overlay_to_batches` (fast_select.rs:~1890).
+    //   * `TombstoneFilteringTable::scan` (DataFusion non-HTAP path) — WIRED.
+    //     Applies both `TombstoneFilterExec` and `UpdateOverlayExec` via the
+    //     PK-augment / projection-strip pattern in hot_tombstone.rs:~656.
+    //   * `HtapUnionTable::scan` (DataFusion in-tx HTAP path) — WIRED.
+    //     Applies both `TombstoneFilterExec` and `UpdateOverlayExec` with the
+    //     same PK-augment / projection-strip pattern as TombstoneFilteringTable.
+    //
+    // The env var remains default-OFF because the gate-matrix integration
+    // tests are not yet pinned to the fast path, and a single mis-locked
+    // test that flips the var process-wide could produce flaky failures.
+    // Set `BASIN_HOTTIER_DELETE_FASTPATH=1` to opt this DELETE shape into
+    // the registry-tombstone route (e.g. for the bulk-DELETE perf bench).
     if std::env::var("BASIN_HOTTIER_DELETE_FASTPATH").as_deref() != Ok("1") {
         return Ok(None);
     }
