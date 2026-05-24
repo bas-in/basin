@@ -21,7 +21,7 @@ use crate::enums::{self, EnumError, EnumTypeDef};
 use crate::functions::SqlFunctionDef;
 use crate::metadata::{
     CheckConstraint, CvDef, DataFileRef, ForeignKeyDef, PartitionSpec, Policy, ProjectMetadata,
-    SecondaryIndex, TableFileFormat, TableMetadata, UniqueConstraint,
+    PromotedJsonbPath, SecondaryIndex, TableFileFormat, TableMetadata, UniqueConstraint,
 };
 use crate::inbound_webhooks::{self, InboundWebhookDef, InboundWebhookError};
 use crate::procedures::{self, ProcedureError, SqlProcedureDef};
@@ -64,6 +64,8 @@ struct TableState {
     /// `gc_orphaned_files` can identify them as physically deletable even
     /// though the snapshot records that added them have been pruned.
     gc_orphan_paths: Vec<String>,
+    /// ADR 0027 Phase 4 — promoted JSONB top-level paths.
+    promoted_jsonb_paths: Vec<PromotedJsonbPath>,
 }
 
 impl TableState {
@@ -107,6 +109,7 @@ impl TableState {
             global_sort_order: None,
             adaptive_sort_override: None,
             gc_orphan_paths: Vec::new(),
+            promoted_jsonb_paths: Vec::new(),
         }
     }
 }
@@ -371,6 +374,7 @@ impl InMemoryCatalog {
             global_sort_order: state.global_sort_order.clone(),
             adaptive_sort_override: state.adaptive_sort_override,
             gc_orphan_paths: state.gc_orphan_paths.clone(),
+            promoted_jsonb_paths: state.promoted_jsonb_paths.clone(),
         }
     }
 
@@ -887,6 +891,32 @@ impl Catalog for InMemoryCatalog {
     async fn drop_index(&self, project: &ProjectId, table: &TableName, name: &str) -> Result<()> {
         let qtable = self.resolve_qtable(project, table).await;
         self.drop_index_qualified(project, &qtable, name).await
+    }
+
+    /// ADR 0027 Phase 4: declare a promoted JSONB top-level path.
+    async fn promote_jsonb_path(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        source_col: &str,
+        json_key: &str,
+    ) -> Result<()> {
+        let qtable = self.resolve_qtable(project, table).await;
+        let tables = self.tables.lock().await;
+        let entry = tables.get(&(*project, qtable)).ok_or_else(|| {
+            BasinError::not_found(format!("{project}: table {table}"))
+        })?;
+        let mut state = entry.lock().await;
+        let already = state.promoted_jsonb_paths.iter().any(|p| {
+            p.source_col == source_col && p.json_key == json_key
+        });
+        if !already {
+            state.promoted_jsonb_paths.push(PromotedJsonbPath {
+                source_col: source_col.to_string(),
+                json_key: json_key.to_string(),
+            });
+        }
+        Ok(())
     }
 
     #[instrument(skip(self, def), fields(project = %def.project, name = %def.name))]
@@ -1783,6 +1813,9 @@ impl Catalog for InMemoryCatalog {
                 // that were orphaned in the source before this fork are the
                 // source's problem, not the fork's.
                 gc_orphan_paths: Vec::new(),
+                // Fork inherits the promoted JSONB paths so queries against
+                // the fork benefit from the same shadow columns.
+                promoted_jsonb_paths: s.promoted_jsonb_paths.clone(),
             }
         };
 

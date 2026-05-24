@@ -734,6 +734,7 @@ impl Catalog for PostgresCatalog {
             global_sort_order: None,
             adaptive_sort_override: None,
             gc_orphan_paths: Vec::new(),
+            promoted_jsonb_paths: Vec::new(),
         })
     }
 
@@ -883,6 +884,7 @@ impl Catalog for PostgresCatalog {
             global_sort_order: None,
             adaptive_sort_override: None,
             gc_orphan_paths: Vec::new(),
+            promoted_jsonb_paths: Vec::new(),
         })
     }
 
@@ -3469,6 +3471,7 @@ impl Catalog for PostgresCatalog {
             global_sort_order: None,
             adaptive_sort_override: None,
             gc_orphan_paths: Vec::new(),
+            promoted_jsonb_paths: Vec::new(),
         })
     }
 
@@ -3622,6 +3625,7 @@ impl Catalog for PostgresCatalog {
             global_sort_order: None,
             adaptive_sort_override: None,
             gc_orphan_paths: Vec::new(),
+            promoted_jsonb_paths: Vec::new(),
         })
     }
 

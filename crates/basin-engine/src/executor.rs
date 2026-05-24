@@ -1240,6 +1240,14 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     // `?&`, `?|`, `<@`, `@>` for JSON, `||` for JSON concat, `@?` for
     // jsonpath exists) to UDF calls that DataFusion can evaluate.
     let rewritten = crate::udf::rewrite_json_operators(&rewritten);
+    // ADR 0027 Phase 4: rewrite `json_get_text(col, 'key')` → shadow column
+    // for any promoted JSONB paths on tables referenced in the query.
+    let rewritten = rewrite_promoted_cols_for_query(
+        &rewritten,
+        sess.engine.config().catalog.as_ref(),
+        &sess.project,
+    )
+    .await;
     // Rewrite `json_to_record(J) AS t(coldefs)` / `jsonb_to_record(J) AS t(coldefs)`
     // → `SELECT * FROM json_to_recordset([J]) AS t(coldefs)` so that sqlparser
     // does not choke on the typed coldef list in scalar-SELECT / FROM position.
@@ -1967,12 +1975,37 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                         .as_ref()
                         .map(|(col, _)| schema_field_is_citext(col.as_str()))
                         .unwrap_or(false);
+                    // ADR 0027 Phase 4: promoted shadow columns are kept out of
+                    // `meta.schema` (they are only visible in DataFusion's
+                    // extended schema) so fast_select's schema-based column
+                    // validation would reject them.  Route through DataFusion
+                    // whenever the rewritten query references a shadow column.
+                    let has_promoted_col = plan
+                        .read_cols
+                        .as_ref()
+                        .map(|cols| {
+                            cols.iter().any(|c| c.starts_with("__promoted$"))
+                        })
+                        .unwrap_or(false)
+                        || plan
+                            .projection
+                            .as_ref()
+                            .map(|items| {
+                                items.iter().any(|it| match it {
+                                    crate::fast_select::ProjectionItem::Column(c) => {
+                                        c.starts_with("__promoted$")
+                                    }
+                                    _ => false,
+                                })
+                            })
+                            .unwrap_or(false);
                     if !is_view
                         && !has_rls
                         && !has_soft_delete
                         && !in_txn
                         && !has_citext_predicate
                         && !has_citext_order_by
+                        && !has_promoted_col
                     {
                         return execute_simple_select(sess, plan, table_meta).await;
                     }
@@ -2305,6 +2338,53 @@ async fn rewrite_json_agg_qualified_wildcard_with_catalog(
         return sql.to_string();
     }
     crate::pg_operators::rewrite_json_agg_qualified_wildcard(sql, &alias_columns)
+}
+
+/// ADR 0027 Phase 4: rewrite `json_get_text(col, 'key')` to the shadow column
+/// `__promoted$col$key` for any promoted JSONB paths on tables referenced in
+/// `sql`.  Called after `rewrite_json_operators` so the operator forms have
+/// already been lowered to `json_get_text(...)`.
+///
+/// Fast-path: if the SQL contains no `json_get_text(` token, return unchanged.
+/// On any catalog failure the SQL passes through unchanged (graceful fallback
+/// to the UDF path).
+async fn rewrite_promoted_cols_for_query(
+    sql: &str,
+    catalog: &dyn basin_catalog::Catalog,
+    project: &basin_common::ProjectId,
+) -> String {
+    // Cheap bail-out: if there's no json_get_text call there's nothing to rewrite.
+    if !sql.to_ascii_lowercase().contains("json_get_text(") {
+        return sql.to_string();
+    }
+    // Parse to extract bare table references from FROM clauses.
+    let table_refs: Vec<String> = sqlparser::parser::Parser::parse_sql(
+        &sqlparser::dialect::PostgreSqlDialect {},
+        sql,
+    )
+    .ok()
+    .and_then(|mut stmts| stmts.pop())
+    .and_then(|stmt| {
+        if let sqlparser::ast::Statement::Query(q) = stmt {
+            Some(crate::session::collect_table_refs(&q))
+        } else {
+            None
+        }
+    })
+    .unwrap_or_default();
+
+    // Accumulate all promoted paths across all referenced tables.
+    let mut all_paths: Vec<basin_catalog::PromotedJsonbPath> = Vec::new();
+    for table_str in table_refs {
+        let Ok(table_name) = basin_common::TableName::new(table_str) else { continue; };
+        if let Ok(meta) = catalog.load_table(project, &table_name).await {
+            all_paths.extend(meta.promoted_jsonb_paths);
+        }
+    }
+    if all_paths.is_empty() {
+        return sql.to_string();
+    }
+    crate::promoted_columns::rewrite_promoted_columns(sql, &all_paths)
 }
 
 /// Execute a `VectorSearchPlan` produced by `vector_planner`. Calls
@@ -3753,6 +3833,13 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
     .await?;
     let row_count = batch.num_rows();
     let part = PartitionKey::default_key();
+
+    // ADR 0027 Phase 4: materialise promoted JSONB shadow columns into the
+    // batch before writing to storage.  No-op when no paths are promoted.
+    let batch = crate::promoted_columns::materialize_promoted_columns(
+        &batch,
+        &meta.promoted_jsonb_paths,
+    )?;
 
     // Shard-enabled path. The shard owner appends to its WAL, acks once durable,
     // and lets its background compactor drain into Parquet + commit through the

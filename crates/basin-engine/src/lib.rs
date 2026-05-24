@@ -1117,6 +1117,7 @@ pub mod pg_plan;
 mod pg_scalar_aliases;
 mod prepared;
 mod query_history;
+pub(crate) mod promoted_columns;
 pub mod query_shape;
 pub mod query_stats;
 pub mod query_stats_export;
@@ -3622,6 +3623,183 @@ mod tests {
             row_count(&eng2, project2, "dump_orders").await,
             2,
             "dump_orders must have 2 rows after custom restore"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR 0027 Phase 4 — promoted JSONB column parity and performance
+    // -----------------------------------------------------------------------
+
+    /// End-to-end parity: `SELECT payload->>'k' FROM t` must return identical
+    /// results whether or not the path is promoted to a shadow column.
+    #[tokio::test]
+    async fn promoted_jsonb_parity() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let project = ProjectId::new();
+        let sess = eng.open_session(project).await.unwrap();
+
+        // Create a table and insert rows with various JSONB patterns.
+        sess.execute("CREATE TABLE events (id BIGINT, payload JSONB)").await.unwrap();
+        let inserts = vec![
+            r#"INSERT INTO events VALUES (1, '{"category":"books","price":9.99}')"#,
+            r#"INSERT INTO events VALUES (2, '{"price":1.0}')"#,          // absent key
+            r#"INSERT INTO events VALUES (3, '{"category":null}')"#,       // JSON null → SQL NULL
+            r#"INSERT INTO events VALUES (4, '{"category":42}')"#,         // numeric value
+            r#"INSERT INTO events VALUES (5, '{"category":"café"}')"#,     // unicode
+            r#"INSERT INTO events VALUES (6, NULL)"#,                      // NULL JSONB row
+        ];
+        for sql in &inserts {
+            sess.execute(sql).await.unwrap();
+        }
+
+        // Collect baseline results WITHOUT promotion.
+        let baseline_sql = "SELECT id, payload->>'category' AS cat FROM events ORDER BY id";
+        let ExecResult::Rows { batches, .. } = sess.execute(baseline_sql).await.unwrap() else {
+            panic!("expected query result");
+        };
+        let base_cats: Vec<Option<String>> = {
+            let mut out = Vec::new();
+            for b in &batches {
+                let arr = b.column_by_name("cat").unwrap();
+                let sa = arr.as_any().downcast_ref::<StringArray>().unwrap();
+                for i in 0..sa.len() {
+                    out.push(if sa.is_null(i) { None } else { Some(sa.value(i).to_string()) });
+                }
+            }
+            out
+        };
+
+        // Now promote the path and re-run the SAME query.
+        eng.config()
+            .catalog
+            .promote_jsonb_path(&project, &basin_common::TableName::new("events").unwrap(), "payload", "category")
+            .await
+            .unwrap();
+
+        // Re-insert data so the promoted column is written into new files.
+        // (Old files without the shadow column fall back to the UDF path.)
+        sess.execute("DROP TABLE events").await.unwrap();
+        sess.execute("CREATE TABLE events (id BIGINT, payload JSONB)").await.unwrap();
+        for sql in &inserts {
+            sess.execute(sql).await.unwrap();
+        }
+
+        let ExecResult::Rows { batches: promo_batches, .. } = sess.execute(baseline_sql).await.unwrap() else {
+            panic!("expected query result");
+        };
+        let promo_cats: Vec<Option<String>> = {
+            let mut out = Vec::new();
+            for b in &promo_batches {
+                let arr = b.column_by_name("cat").unwrap();
+                let sa = arr.as_any().downcast_ref::<StringArray>().unwrap();
+                for i in 0..sa.len() {
+                    out.push(if sa.is_null(i) { None } else { Some(sa.value(i).to_string()) });
+                }
+            }
+            out
+        };
+
+        assert_eq!(
+            base_cats, promo_cats,
+            "promoted path must produce identical results to the UDF path"
+        );
+        // Spot-check: row 1 → "books", row 2 → None (absent key), row 3 → None (JSON null).
+        assert_eq!(promo_cats[0], Some("books".into()), "row 1 category");
+        assert_eq!(promo_cats[1], None, "absent key → NULL");
+        assert_eq!(promo_cats[2], None, "JSON null → SQL NULL");
+        assert_eq!(promo_cats[3], Some("42".into()), "numeric as text");
+        assert_eq!(promo_cats[4], Some("café".into()), "unicode");
+        assert_eq!(promo_cats[5], None, "NULL JSONB row → NULL");
+    }
+
+    /// ADR 0027 Phase 4 benchmark: promoted column vs UDF path over 10k rows.
+    ///
+    /// Run: `BASIN_PROMOTED_BENCH=1 cargo test -p basin-engine --lib \
+    ///       promoted_jsonb_bench -- --nocapture --ignored`
+    #[tokio::test]
+    #[ignore = "opt-in: BASIN_PROMOTED_BENCH=1"]
+    async fn promoted_jsonb_bench() {
+        if std::env::var("BASIN_PROMOTED_BENCH").as_deref() != Ok("1") {
+            return;
+        }
+        const N: usize = 10_000;
+
+        // ---- UDF path (no promotion) ----
+        let dir_udf = TempDir::new().unwrap();
+        let eng_udf = engine_in(&dir_udf);
+        let project_udf = ProjectId::new();
+        let sess_udf = eng_udf.open_session(project_udf).await.unwrap();
+        sess_udf.execute("CREATE TABLE bench_events (id BIGINT, payload JSONB)").await.unwrap();
+        // Batch-insert N rows.
+        {
+            let vals: String = (0..N)
+                .map(|i| {
+                    let cat = ["electronics","books","clothing","food","sports"][i % 5];
+                    format!("({i}, '{{\"category\":\"{cat}\",\"score\":{i},\"active\":true}}')")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            sess_udf
+                .execute(&format!("INSERT INTO bench_events VALUES {vals}"))
+                .await
+                .unwrap();
+        }
+        let udf_sql = "SELECT payload->>'category' FROM bench_events";
+        let t0 = std::time::Instant::now();
+        let _r = sess_udf.execute(udf_sql).await.unwrap();
+        let udf_elapsed = t0.elapsed();
+        let udf_us_per_row = udf_elapsed.as_micros() as f64 / N as f64;
+
+        // ---- Promoted path ----
+        let dir_promo = TempDir::new().unwrap();
+        let eng_promo = engine_in(&dir_promo);
+        let project_promo = ProjectId::new();
+        let sess_promo = eng_promo.open_session(project_promo).await.unwrap();
+        // Create the table first so the catalog knows it exists.
+        sess_promo.execute("CREATE TABLE bench_events (id BIGINT, payload JSONB)").await.unwrap();
+        // Then declare the promotion — subsequent INSERTs will materialise the shadow column.
+        eng_promo
+            .config()
+            .catalog
+            .promote_jsonb_path(
+                &project_promo,
+                &basin_common::TableName::new("bench_events").unwrap(),
+                "payload",
+                "category",
+            )
+            .await
+            .unwrap();
+        {
+            let vals: String = (0..N)
+                .map(|i| {
+                    let cat = ["electronics","books","clothing","food","sports"][i % 5];
+                    format!("({i}, '{{\"category\":\"{cat}\",\"score\":{i},\"active\":true}}')")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            sess_promo
+                .execute(&format!("INSERT INTO bench_events VALUES {vals}"))
+                .await
+                .unwrap();
+        }
+        // Same SQL — the planner rewrites it to a column projection.
+        let t1 = std::time::Instant::now();
+        let _r = sess_promo.execute(udf_sql).await.unwrap();
+        let promo_elapsed = t1.elapsed();
+        let promo_us_per_row = promo_elapsed.as_micros() as f64 / N as f64;
+
+        let speedup = udf_elapsed.as_secs_f64() / promo_elapsed.as_secs_f64();
+        eprintln!(
+            "\n=== ADR 0027 Phase 4 promoted column benchmark ({N} rows) ===\n\
+             UDF path:     {:>8.3} ms total  ({:.4} µs/row)\n\
+             Promoted path:{:>8.3} ms total  ({:.4} µs/row)\n\
+             Speedup:       {:.1}x\n",
+            udf_elapsed.as_secs_f64() * 1000.0,
+            udf_us_per_row,
+            promo_elapsed.as_secs_f64() * 1000.0,
+            promo_us_per_row,
+            speedup,
         );
     }
 }

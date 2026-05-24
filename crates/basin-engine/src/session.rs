@@ -26,7 +26,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::AuthContext;
 
-use basin_catalog::{DataFileRef, PartitionSpec, SnapshotId, TableFileFormat};
+use basin_catalog::{DataFileRef, PartitionSpec, PromotedJsonbPath, SnapshotId, TableFileFormat};
 use basin_common::{BasinError, ProjectId, QualifiedTableName, Result, SchemaName, TableName};
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use datafusion::common::TableReference;
@@ -1425,7 +1425,15 @@ pub(crate) async fn refresh_table(
     let meta = engine.config().catalog.load_table(project, table).await?;
     // The catalog hands us a workspace-version schema; convert into the
     // version DataFusion's `register_listing_table` expects.
-    let df_schema = Arc::new(schema_ws_to_df(meta.schema.as_ref())?);
+    let base_df_schema = schema_ws_to_df(meta.schema.as_ref())?;
+    // ADR 0027 Phase 4: extend the DataFusion schema with shadow columns for
+    // any promoted JSONB paths.  These are written as real Utf8 columns in
+    // the Parquet files but are kept OUT of the user-visible catalog schema
+    // (so `information_schema.columns` stays clean).  DataFusion's
+    // ListingTable picks them up via the extended schema below.
+    let df_schema = Arc::new(
+        extend_schema_with_promoted_cols(base_df_schema, &meta.promoted_jsonb_paths)
+    );
 
     // Drop any stale registration before re-registering. `deregister_table`
     // returns Ok(None) for the first-time path, which is exactly what we want.
@@ -1566,7 +1574,8 @@ pub(crate) async fn refresh_table_qualified(
         .catalog
         .load_table_qualified(project, qtable)
         .await?;
-    let df_schema = Arc::new(schema_ws_to_df(meta.schema.as_ref())?);
+    let base_df_schema = schema_ws_to_df(meta.schema.as_ref())?;
+    let df_schema = Arc::new(extend_schema_with_promoted_cols(base_df_schema, &meta.promoted_jsonb_paths));
 
     // Register under the bare table name so that DataFusion can find the
     // table after schema-qualifier stripping. The schema part is handled at
@@ -2667,7 +2676,7 @@ fn parse_partition_segments(path: &str) -> Option<(i32, u32)> {
 /// Walk `query`'s top-level FROM list and return each referenced bare table
 /// name. We don't follow CTEs, subqueries, or schema-qualified names — the
 /// PoC has none of those so the simple form covers our cases.
-fn collect_table_refs(query: &Query) -> Vec<String> {
+pub(crate) fn collect_table_refs(query: &Query) -> Vec<String> {
     let mut out = Vec::new();
     if let SetExpr::Select(select) = query.body.as_ref() {
         for from in &select.from {
@@ -2847,6 +2856,33 @@ fn parse_timestamp_string_for_pruning(s: &str) -> Option<i64> {
         return Some(DateTime::<Utc>::from_naive_utc_and_offset(n, Utc).timestamp_micros());
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// ADR 0027 Phase 4 — schema extension helpers
+// ---------------------------------------------------------------------------
+
+/// Extend a DataFusion Arrow schema with `Utf8` fields for each promoted JSONB
+/// path that isn't already in the schema.  The user-visible catalog schema is
+/// NOT modified — these fields only exist in the DataFusion registration so the
+/// planner can resolve the shadow-column names emitted by
+/// [`crate::promoted_columns::rewrite_promoted_columns`].
+fn extend_schema_with_promoted_cols(
+    base: arrow_schema::Schema,
+    paths: &[PromotedJsonbPath],
+) -> arrow_schema::Schema {
+    if paths.is_empty() {
+        return base;
+    }
+    let mut fields: Vec<arrow_schema::Field> =
+        base.fields().iter().map(|f| f.as_ref().clone()).collect();
+    for path in paths {
+        let name = crate::promoted_columns::shadow_col_name(&path.source_col, &path.json_key);
+        if base.field_with_name(&name).is_err() {
+            fields.push(arrow_schema::Field::new(&name, arrow_schema::DataType::Utf8, true));
+        }
+    }
+    arrow_schema::Schema::new_with_metadata(fields, base.metadata().clone())
 }
 
 #[cfg(test)]

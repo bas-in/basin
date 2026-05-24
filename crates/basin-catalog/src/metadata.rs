@@ -317,6 +317,30 @@ pub enum TableFileFormat {
     Vortex,
 }
 
+/// ADR 0027 Phase 4 — one promoted JSONB top-level path.
+///
+/// `source_col` is the JSONB column name (e.g. `"payload"`), `json_key` is
+/// the top-level key to promote (e.g. `"category"`).  The physical shadow
+/// column name is `__promoted$<source_col>$<json_key>` (a `Utf8` column).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromotedJsonbPath {
+    /// The JSONB column that owns the document (e.g. `"payload"`).
+    pub source_col: String,
+    /// Top-level JSON object key to extract (e.g. `"category"`).
+    pub json_key: String,
+}
+
+impl PromotedJsonbPath {
+    /// Canonical shadow-column name: `__promoted$<source_col>$<json_key>`.
+    ///
+    /// The `__promoted$` prefix is long enough to be collision-free with any
+    /// user-defined column (Postgres disallows leading `$` in unquoted idents;
+    /// the underscore prefix also escapes accidental join on `*`).
+    pub fn shadow_col_name(&self) -> String {
+        format!("__promoted${}${}", self.source_col, self.json_key)
+    }
+}
+
 /// Materialized view of a table at one point in time.
 ///
 /// `current_snapshot` is the head of the history; `snapshots` is the full
@@ -487,6 +511,19 @@ pub struct TableMetadata {
     /// checks against the cross-table live set.  Empty by default (back-compat:
     /// pre-GC catalog rows simply have no accumulated orphan list).
     pub gc_orphan_paths: Vec<String>,
+    /// ADR 0027 Phase 4 — promoted JSONB shadow columns.
+    ///
+    /// Each entry `(source_col, json_key)` declares that the top-level path
+    /// `<source_col>->>'<json_key>'` is materialised at write time as a real
+    /// `Utf8` column named `__promoted$<source_col>$<json_key>`.  The planner
+    /// rewrites matching `json_get_text(source_col, 'json_key')` calls to a
+    /// direct column projection, bypassing the per-row UDF dispatch entirely.
+    ///
+    /// Populated via `Catalog::promote_jsonb_path` (test API; production
+    /// auto-promotion driven by `QueryHistory` is a follow-up task).
+    /// Empty (the default) preserves byte-identical behaviour for every
+    /// existing table.
+    pub promoted_jsonb_paths: Vec<PromotedJsonbPath>,
 }
 
 // ---------------------------------------------------------------------------

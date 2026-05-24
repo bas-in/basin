@@ -78,8 +78,8 @@ pub use leases::{
 };
 pub use metadata::{
     CheckConstraint, ColumnStats, CvDef, DataFileRef, ForeignKeyDef, PartitionSpec, Policy,
-    PolicyCommand, RefAction, S3Config, SecondaryIndex, TableFileFormat, TableMetadata,
-    ProjectMetadata, UniqueConstraint,
+    PolicyCommand, PromotedJsonbPath, RefAction, S3Config, SecondaryIndex, TableFileFormat,
+    TableMetadata, ProjectMetadata, UniqueConstraint,
 };
 pub use postgres::PostgresCatalog;
 pub use procedures::{ProcedureError, SqlProcedureDef};
@@ -797,6 +797,29 @@ pub trait Catalog: Send + Sync {
         Err(basin_common::BasinError::Internal(
             "drop_index not implemented for this catalog backend".into(),
         ))
+    }
+
+    /// ADR 0027 Phase 4: declare a promoted JSONB top-level path for
+    /// `(project, table)`.
+    ///
+    /// If the `(source_col, json_key)` pair is already promoted this is a
+    /// no-op.  The catalog records the declaration; the engine's write path
+    /// then materialises a shadow column `__promoted$<source_col>$<json_key>`
+    /// at INSERT time, and the planner substitutes a direct column read for
+    /// matching `payload->>'key'` expressions.
+    ///
+    /// Default impl is a no-op (returns `Ok(())`) so the stub `RestCatalog`
+    /// and future backends stay buildable without changes.  In-memory backend
+    /// overrides to persist the declaration.
+    async fn promote_jsonb_path(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        source_col: &str,
+        json_key: &str,
+    ) -> Result<()> {
+        let _ = (project, table, source_col, json_key);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
