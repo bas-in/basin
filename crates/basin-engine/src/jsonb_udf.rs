@@ -24,6 +24,8 @@
 //! evaluating, surfacing the gap clearly in the SQL support matrix.
 
 use std::any::Any;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
@@ -1097,6 +1099,198 @@ fn raw_walk_path<'a>(bytes: &'a [u8], segments: &[String]) -> Result<Option<&'a 
         }
     }
     Ok(Some(cur))
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1 of ADR 0027 — per-batch top-level object key index
+//
+// When a query projects multiple JSONB fields from the same column —
+//   SELECT payload->>'a', payload->>'b', payload->>'c' FROM t
+// DataFusion invokes json_get_text THREE times on the same batch, each call
+// independently scanning every row's bytes with RawJson::member. For k UDF
+// calls, n rows, and d-byte average document size the work is O(k×n×d).
+//
+// JsonbBatchIndex builds a per-row index of top-level object keys in one
+// O(n×d) pass and caches it in a thread-local keyed by the LargeBinaryArray's
+// raw buffer pointer + length. Subsequent UDF calls on the same batch column
+// look up the cached index (O(1) per key per row) instead of re-scanning.
+//
+// Scope: only LargeBinaryArray columns (the primary stored JSONB format).
+// Utf8/BinaryView columns arrive as scalar literals or intermediate results and
+// are typically not re-accessed by a second UDF call; the RawJson scanner path
+// continues to handle them. This is a pure read-side optimization — no storage
+// format change, no write-side cost.
+// ---------------------------------------------------------------------------
+
+/// Per-row entry in the batch index: either a map of top-level keys to their
+/// raw value byte-ranges within the document, or `None` for null / non-object /
+/// malformed rows (those fall back to `RawJson::member`).
+///
+/// The byte ranges are relative to the start of the row's value slice within
+/// the `LargeBinaryArray`'s value buffer (i.e. the pointer returned by
+/// `LargeBinaryArray::value(i)`). They span exactly one JSON value, matching
+/// what `RawJson::scan_object_for` returns.
+type RowKeyIndex = Option<HashMap<String, (usize, usize)>>;
+
+/// Batch-level index for a single `LargeBinaryArray` column.
+/// `rows[i]` is the key index for row `i`.
+struct JsonbBatchIndex {
+    rows: Vec<RowKeyIndex>,
+}
+
+impl JsonbBatchIndex {
+    /// Build the index for all rows in `arr`.
+    /// Only object-typed top-level documents are indexed; null rows, arrays,
+    /// scalars, and malformed bytes leave `rows[i] = None` (RawJson fallback).
+    /// Generic over any JSON content — no key names are special-cased.
+    fn build(arr: &LargeBinaryArray) -> Self {
+        let n = arr.len();
+        let mut rows = Vec::with_capacity(n);
+        for i in 0..n {
+            if arr.is_null(i) {
+                rows.push(None);
+                continue;
+            }
+            let bytes = arr.value(i);
+            let doc = RawJson::new(bytes);
+            // Only index top-level objects; arrays need integer-index lookup
+            // which is handled cheaply by RawJson::index.
+            match doc.top_type() {
+                Some(RawType::Object) => {
+                    rows.push(build_object_key_index(doc.b));
+                }
+                _ => rows.push(None),
+            }
+        }
+        JsonbBatchIndex { rows }
+    }
+
+    /// Look up `key` for row `i`. Returns the raw value slice (relative to the
+    /// start of row `i`'s bytes within the array buffer) when the key is
+    /// present and was successfully indexed.
+    ///
+    /// Returns `None` when the row is null, was not indexed (non-object), or
+    /// the key is absent. Returns `Err(())` when the row was not indexed due
+    /// to a malformed document — callers should fall back to `RawJson::member`.
+    #[inline]
+    fn lookup<'a>(
+        &self,
+        arr: &'a LargeBinaryArray,
+        i: usize,
+        key: &str,
+    ) -> Result<Option<&'a [u8]>, ()> {
+        match &self.rows[i] {
+            None => {
+                // Row is null, non-object, or malformed — signal fallback.
+                if arr.is_null(i) {
+                    Ok(None)
+                } else {
+                    // Fall back to the byte scanner for non-object rows.
+                    Err(())
+                }
+            }
+            Some(map) => match map.get(key) {
+                None => Ok(None),
+                Some(&(start, end)) => {
+                    let doc_bytes = arr.value(i);
+                    let b = RawJson::new(doc_bytes).b;
+                    Ok(b.get(start..end))
+                }
+            },
+        }
+    }
+}
+
+/// Scan the top-level keys of a JSON object (cursor at the first byte of the
+/// normalised document, which must start with `{`) and build a map of each key
+/// to its value's byte range within `b`. Generic: no key names are special-cased.
+///
+/// Returns `None` on any malformed input (the row will fall back to RawJson).
+fn build_object_key_index(b: &[u8]) -> Option<HashMap<String, (usize, usize)>> {
+    let mut p = 0usize;
+    skip_ws(b, &mut p);
+    if b.get(p) != Some(&b'{') {
+        return None;
+    }
+    p += 1;
+    skip_ws(b, &mut p);
+    if b.get(p) == Some(&b'}') {
+        // Empty object — valid, return an empty map.
+        return Some(HashMap::new());
+    }
+
+    // We want last-occurrence-wins for duplicate keys (serde_json semantics).
+    // Build into a Vec first then dedup by key.
+    let mut entries: Vec<(String, (usize, usize))> = Vec::new();
+    loop {
+        skip_ws(b, &mut p);
+        if b.get(p) != Some(&b'"') {
+            return None; // malformed
+        }
+        let key = parse_string(b, &mut p).ok()?;
+        skip_ws(b, &mut p);
+        if b.get(p) != Some(&b':') {
+            return None;
+        }
+        p += 1;
+        skip_ws(b, &mut p);
+        let val_start = p;
+        skip_value(b, &mut p).ok()?;
+        let val_end = p;
+        entries.push((key, (val_start, val_end)));
+        skip_ws(b, &mut p);
+        match b.get(p) {
+            Some(&b',') => p += 1,
+            Some(&b'}') => break,
+            _ => return None,
+        }
+    }
+    // Build map with last-wins for duplicate keys.
+    let mut map = HashMap::with_capacity(entries.len());
+    for (k, v) in entries {
+        map.insert(k, v);
+    }
+    Some(map)
+}
+
+// Thread-local cache: maps (buffer_ptr as usize, num_rows) to the batch index.
+// The key uniquely identifies a LargeBinaryArray batch within the current thread.
+// The cache holds exactly ONE entry (most recent batch). DataFusion evaluates
+// UDFs within a batch sequentially on one thread before moving to the next, so
+// a single-entry cache is sufficient for the multi-field-projection case.
+thread_local! {
+    static BATCH_INDEX_CACHE: RefCell<Option<((usize, usize), JsonbBatchIndex)>> =
+        const { RefCell::new(None) };
+}
+
+/// Get (or build) the `JsonbBatchIndex` for `arr`, then call `f` with it.
+///
+/// Caller-facing API for UDF hot paths. On the first call for a given batch
+/// (identified by buffer pointer + length), the index is built in O(n×d) and
+/// stored. Subsequent calls on the same batch return the cached index in O(1).
+///
+/// `f` receives the index and must not escape it (borrow scoped to the closure).
+fn with_batch_index<R>(arr: &LargeBinaryArray, f: impl FnOnce(&JsonbBatchIndex) -> R) -> R {
+    // Identify the batch by the raw pointer of the value-data buffer and the
+    // number of rows. This is stable within a batch: Arrow buffers are
+    // reference-counted and are not re-allocated between UDF invocations on
+    // the same physical plan node.
+    let ptr = arr.values().as_ptr() as usize;
+    let len = arr.len();
+    let key = (ptr, len);
+
+    BATCH_INDEX_CACHE.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if guard.as_ref().map(|(k, _)| k) != Some(&key) {
+            // Cache miss — build and store.
+            let idx = JsonbBatchIndex::build(arr);
+            *guard = Some((key, idx));
+        }
+        // SAFETY: we hold `guard` (a RefMut) which ensures exclusive access.
+        // The closure receives a shared ref to the index inside the Option.
+        // The index cannot escape because `f` does not return a reference.
+        f(&guard.as_ref().unwrap().1)
+    })
 }
 
 /// Get the raw JSONB payload bytes for row `i` of a JSONB-bearing array,
@@ -3791,6 +3985,15 @@ impl ScalarUDFImpl for JsonArrayElementsTextUdf {
 
 // ---------------------------------------------------------------------------
 // json_get(jsonb, key_or_idx) -> jsonb   (operator ->)
+//
+// Phase 1 of ADR 0027: for LargeBinaryArray inputs (stored JSONB columns),
+// use the per-batch top-level key index (`JsonbBatchIndex` / `with_batch_index`)
+// so that repeated json_get calls on the same batch column (e.g.
+// `payload->'a'`, `payload->'b'` in the same SELECT) each pay O(1) per row
+// on the 2nd+ call instead of O(doc_size). The index is built lazily on the
+// first UDF invocation and cached in a thread-local; see `with_batch_index`.
+// Non-LargeBinaryArray inputs (Utf8 literals, BinaryView) continue to use
+// the RawJson byte-scanner path unchanged.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -3822,6 +4025,71 @@ impl ScalarUDFImpl for JsonGetUdf {
         let doc_arr = args[0].clone().into_array(n)?;
         let key_arr = args[1].clone().into_array(n)?;
         let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
+
+        // Fast path: LargeBinaryArray — use the per-batch index (ADR 0027 Phase 1).
+        if doc_arr.data_type() == &DataType::LargeBinary {
+            let lb = doc_arr
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution("json_get: downcast to LargeBinaryArray failed".into())
+                })?;
+            return with_batch_index(lb, |idx| -> DFResult<ColumnarValue> {
+                for i in 0..n {
+                    let key = match extract_string(&key_arr, i) {
+                        Some(k) => k,
+                        None => {
+                            out.push(None);
+                            continue;
+                        }
+                    };
+                    // Try the batch index for object keys; fall through to RawJson for
+                    // arrays (integer index) and malformed documents.
+                    let lookup = idx.lookup(lb, i, &key);
+                    match lookup {
+                        Ok(None) if !lb.is_null(i) => {
+                            // Index says absent — but could be an array doc needing integer
+                            // index lookup. Check with RawJson (cheap: just top_type + index).
+                            let bytes = lb.value(i);
+                            let doc = RawJson::new(bytes);
+                            match doc.top_type() {
+                                Some(RawType::Array) => match key.parse::<i64>() {
+                                    Ok(idx_val) => match doc.index(idx_val) {
+                                        Ok(Some(slice)) => out.push(Some(value_to_jsonb(&raw_slice_to_value(slice)?)?)),
+                                        Ok(None) => out.push(None),
+                                        Err(()) => {
+                                            let v = jsonb_get_fallback(bytes, &key, "json_get")?;
+                                            out.push(v.map(|v| value_to_jsonb(&v)).transpose()?);
+                                        }
+                                    },
+                                    Err(_) => out.push(None),
+                                },
+                                _ => out.push(None),
+                            }
+                        }
+                        Ok(None) => out.push(None), // null row
+                        Ok(Some(slice)) => out.push(Some(value_to_jsonb(&raw_slice_to_value(slice)?)?)),
+                        Err(()) => {
+                            // Non-indexed row (non-object or malformed) — RawJson fallback.
+                            let bytes = lb.value(i);
+                            let doc = RawJson::new(bytes);
+                            match raw_get_key(&doc, &key) {
+                                Ok(Some(slice)) => out.push(Some(value_to_jsonb(&raw_slice_to_value(slice)?)?)),
+                                Ok(None) => out.push(None),
+                                Err(()) => {
+                                    let v = jsonb_get_fallback(bytes, &key, "json_get")?;
+                                    out.push(v.map(|v| value_to_jsonb(&v)).transpose()?);
+                                }
+                            }
+                        }
+                    }
+                }
+                let result = LargeBinaryArray::from_iter(out.iter().map(|o| o.as_deref()));
+                Ok(ColumnarValue::Array(Arc::new(result)))
+            });
+        }
+
+        // Fallback path: non-LargeBinary (Utf8 literals, BinaryView, etc.)
         for i in 0..n {
             let bytes = match extract_jsonb_bytes(&doc_arr, i, "json_get")? {
                 Some(b) => b,
@@ -3892,6 +4160,11 @@ fn jsonb_get_fallback(bytes: &[u8], key: &str, fn_name: &str) -> DFResult<Option
 
 // ---------------------------------------------------------------------------
 // json_get_text(jsonb, key_or_idx) -> text   (operator ->>)
+//
+// Phase 1 of ADR 0027: same per-batch index optimisation as json_get.
+// The ->> operator is the highest-frequency JSONB operation in typical SaaS
+// queries (ORMs project 3-8 text fields per SELECT). This is where the
+// multi-UDF redundant scanning cost is largest.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -3923,6 +4196,80 @@ impl ScalarUDFImpl for JsonGetTextUdf {
         let doc_arr = args[0].clone().into_array(n)?;
         let key_arr = args[1].clone().into_array(n)?;
         let mut out: Vec<Option<String>> = Vec::with_capacity(n);
+
+        // Fast path: LargeBinaryArray — use the per-batch index (ADR 0027 Phase 1).
+        if doc_arr.data_type() == &DataType::LargeBinary {
+            let lb = doc_arr
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "json_get_text: downcast to LargeBinaryArray failed".into(),
+                    )
+                })?;
+            return with_batch_index(lb, |idx| -> DFResult<ColumnarValue> {
+                for i in 0..n {
+                    let key = match extract_string(&key_arr, i) {
+                        Some(k) => k,
+                        None => {
+                            out.push(None);
+                            continue;
+                        }
+                    };
+                    let lookup = idx.lookup(lb, i, &key);
+                    match lookup {
+                        Ok(None) if !lb.is_null(i) => {
+                            // Absent key or array document — check for integer index.
+                            let bytes = lb.value(i);
+                            let doc = RawJson::new(bytes);
+                            match doc.top_type() {
+                                Some(RawType::Array) => match key.parse::<i64>() {
+                                    Ok(idx_val) => match doc.index(idx_val) {
+                                        Ok(Some(slice)) => out.push(raw_slice_to_text(slice)?),
+                                        Ok(None) => out.push(None),
+                                        Err(()) => {
+                                            let child = jsonb_get_fallback(bytes, &key, "json_get_text")?;
+                                            out.push(match child {
+                                                None => None,
+                                                Some(Value::String(s)) => Some(s),
+                                                Some(Value::Null) => None,
+                                                Some(v) => Some(serde_json::to_string(&v).unwrap_or_default()),
+                                            });
+                                        }
+                                    },
+                                    Err(_) => out.push(None),
+                                },
+                                _ => out.push(None),
+                            }
+                        }
+                        Ok(None) => out.push(None), // null row
+                        Ok(Some(slice)) => out.push(raw_slice_to_text(slice)?),
+                        Err(()) => {
+                            // Non-indexed (non-object or malformed) — RawJson fallback.
+                            let bytes = lb.value(i);
+                            let doc = RawJson::new(bytes);
+                            match raw_get_key(&doc, &key) {
+                                Ok(Some(slice)) => out.push(raw_slice_to_text(slice)?),
+                                Ok(None) => out.push(None),
+                                Err(()) => {
+                                    let child = jsonb_get_fallback(bytes, &key, "json_get_text")?;
+                                    out.push(match child {
+                                        None => None,
+                                        Some(Value::String(s)) => Some(s),
+                                        Some(Value::Null) => None,
+                                        Some(v) => Some(serde_json::to_string(&v).unwrap_or_default()),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                let result = StringArray::from(out);
+                Ok(ColumnarValue::Array(Arc::new(result)))
+            });
+        }
+
+        // Fallback path: non-LargeBinary (Utf8 literals, BinaryView, etc.)
         for i in 0..n {
             let bytes = match extract_jsonb_bytes(&doc_arr, i, "json_get_text")? {
                 Some(b) => b,
@@ -5931,6 +6278,226 @@ mod perf_bench {
             locate,
             N as f64 / locate.as_secs_f64() / 1e6,
             full.as_secs_f64() / locate.as_secs_f64()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR 0027 Phase 1 — JsonbBatchIndex parity and micro-benchmark
+    // -----------------------------------------------------------------------
+
+    /// Correctness: `JsonbBatchIndex::lookup` must return byte-identical value
+    /// slices to `RawJson::member` across the full parity payload battery
+    /// (nested objects, arrays, unicode, escaped keys, duplicate keys,
+    /// empty containers, scalar roots). No key names are special-cased.
+    #[test]
+    fn batch_index_parity() {
+        let mut payloads = parity_payloads();
+        // Edge cases mirroring `lazy_extract_parity`.
+        payloads.push(r#"{"k":1,"k":2,"k":3}"#.to_string()); // duplicate keys: last wins
+        payloads.push(r#"{"a\"b":"v1","c\\d":"v2","e/f":"v3"}"#.to_string()); // escaped keys
+        payloads.push(r#"{"emoji":"😀","bmp":"é ☃"}"#.to_string()); // unicode
+        payloads.push(r#"{"arr":[10,20,30,40],"nested":{"deep":{"x":[true,null,"s"]}}}"#.to_string());
+        payloads.push(r#"{"empty_obj":{},"empty_arr":[],"n":null}"#.to_string()); // empty containers
+        // Non-object roots: the index must leave these as None (RawJson fallback).
+        payloads.push(r#"[{"id":0},{"id":1}]"#.to_string()); // array root
+        payloads.push(r#"null"#.to_string()); // null root
+        payloads.push(r#"42"#.to_string()); // number root
+
+        for p in &payloads {
+            let bytes = p.as_bytes();
+            let v = jsonb_to_value(bytes).unwrap();
+
+            // Derive probe keys generically from the document structure.
+            let mut keys = vec![
+                "0".to_string(),
+                "1".to_string(),
+                "__absent__".to_string(),
+            ];
+            probe_keys(&v, &mut keys);
+            keys.sort();
+            keys.dedup();
+
+            // Build the batch index for a single-row LargeBinaryArray.
+            let arr = LargeBinaryArray::from_iter(
+                std::iter::once(Some(bytes)),
+            );
+            let idx = JsonbBatchIndex::build(&arr);
+
+            // For object-root documents: each key lookup must match RawJson::member.
+            if matches!(v, Value::Object(_)) {
+                let row_idx = idx.rows[0].as_ref().expect(
+                    "object-root document must produce a non-None index entry",
+                );
+                for key in &keys {
+                    // Oracle: RawJson::member.
+                    let oracle_slice = RawJson::new(bytes).member(key).unwrap();
+
+                    // Batch index lookup via JsonbBatchIndex::lookup.
+                    let got = idx.lookup(&arr, 0, key);
+
+                    match (oracle_slice, got) {
+                        (None, Ok(None)) => {}
+                        (Some(oracle), Ok(Some(got_slice))) => {
+                            assert_eq!(
+                                oracle, got_slice,
+                                "batch index slice != RawJson slice for key={key:?} payload={p}"
+                            );
+                        }
+                        (None, Ok(Some(_))) => panic!(
+                            "batch index returned Some but RawJson returned None: key={key:?} payload={p}"
+                        ),
+                        (Some(_), Ok(None)) => {
+                            // Key is in the map (row_idx.contains_key) but lookup
+                            // returned None. This should only happen if the entry
+                            // maps to an out-of-bounds range — a bug.
+                            if row_idx.contains_key(key.as_str()) {
+                                panic!(
+                                    "batch index map has key {key:?} but lookup returned None: payload={p}"
+                                );
+                            }
+                            // Key not in map AND not in RawJson: absent key — OK.
+                        }
+                        (oracle, Err(())) => {
+                            // Err means "non-indexed row, fall back". For well-formed
+                            // object documents the index must always succeed (None means
+                            // absent key, not error).
+                            panic!(
+                                "batch index returned Err (non-indexed) for object doc: key={key:?} oracle={oracle:?} payload={p}"
+                            );
+                        }
+                    }
+
+                    // Cross-check: RawJson::member and batch index -> both produce
+                    // the same final text result via raw_slice_to_text.
+                    let oracle_txt = oracle_get_text(bytes, key);
+                    let got_txt = match idx.lookup(&arr, 0, key) {
+                        Ok(Some(slice)) => raw_slice_to_text(slice).unwrap(),
+                        Ok(None) => None,
+                        Err(()) => {
+                            let raw = RawJson::new(bytes);
+                            match raw_get_key(&raw, key) {
+                                Ok(Some(s)) => raw_slice_to_text(s).unwrap(),
+                                Ok(None) => None,
+                                Err(()) => None,
+                            }
+                        }
+                    };
+                    assert_eq!(
+                        got_txt, oracle_txt,
+                        "text result mismatch: key={key:?} payload={p}"
+                    );
+                }
+            } else {
+                // Non-object root: the batch index must produce a None row entry,
+                // and lookup must return Err(()) signalling fallback.
+                assert!(
+                    idx.rows[0].is_none(),
+                    "non-object root must produce None index entry: payload={p}"
+                );
+                for key in &keys {
+                    let got = idx.lookup(&arr, 0, key);
+                    // Expect Err(()) since row is not indexed.
+                    assert!(
+                        matches!(got, Err(())),
+                        "non-object root must return Err(()) from lookup: key={key:?} payload={p}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Micro-benchmark: simulated multi-UDF same-batch scenario.
+    ///
+    /// Models `SELECT payload->>'a', payload->>'b', payload->>'c', ... FROM t`
+    /// — k json_get_text calls on the same batch. Measures:
+    ///   - BASELINE: k independent RawJson::member scans (the pre-ADR-0027 shape)
+    ///   - CACHED: one JsonbBatchIndex build + k O(1) HashMap lookups
+    ///
+    /// Gated by BASIN_JSONB_BENCH=1 (timing is noisy in CI).
+    /// Uses arbitrary JSON with generically-derived keys — no bench literals.
+    #[test]
+    #[ignore = "opt-in: BASIN_JSONB_BENCH=1"]
+    fn bench_batch_index_multi_field() {
+        if std::env::var("BASIN_JSONB_BENCH").as_deref() != Ok("1") {
+            return;
+        }
+        const N: usize = 100_000;
+
+        // ~1 KB arbitrary nested document (last of the parity battery).
+        let template = parity_payloads().into_iter().max_by_key(|s| s.len()).unwrap();
+        let v = jsonb_to_value(template.as_bytes()).unwrap();
+        // Extract up to 4 top-level keys generically (no names hardcoded).
+        let probe_keys_top: Vec<String> = match &v {
+            Value::Object(m) => m.keys().take(4).cloned().collect(),
+            _ => panic!("expected object template"),
+        };
+        assert!(
+            probe_keys_top.len() >= 2,
+            "need at least 2 top-level keys for this bench"
+        );
+        let k = probe_keys_top.len();
+        eprintln!(
+            "payload size: {} bytes | probing {} keys: {:?}",
+            template.len(),
+            k,
+            probe_keys_top
+        );
+
+        // Build a 100k-row batch where each row is the same template document.
+        let rows: Vec<Vec<u8>> = (0..N).map(|_| template.as_bytes().to_vec()).collect();
+        let arr = Arc::new(LargeBinaryArray::from_iter(
+            rows.iter().map(|r| Some(r.as_slice())),
+        ));
+
+        // Warmup.
+        for _ in 0..1_000 {
+            for key in &probe_keys_top {
+                for i in 0..10 {
+                    let doc = RawJson::new(arr.value(i));
+                    std::hint::black_box(doc.member(key).unwrap());
+                }
+            }
+        }
+
+        // BASELINE: k independent RawJson scans per row, no shared index.
+        let t0 = Instant::now();
+        for key in &probe_keys_top {
+            for i in 0..N {
+                let doc = RawJson::new(arr.value(i));
+                std::hint::black_box(doc.member(key).unwrap());
+            }
+        }
+        let baseline = t0.elapsed();
+
+        // CACHED: build the index once, then k O(1) HashMap lookups per row.
+        let t1 = Instant::now();
+        let idx = JsonbBatchIndex::build(&arr);
+        for key in &probe_keys_top {
+            for i in 0..N {
+                std::hint::black_box(idx.lookup(&arr, i, key).unwrap());
+            }
+        }
+        let cached = t1.elapsed();
+
+        let speedup = baseline.as_secs_f64() / cached.as_secs_f64();
+        eprintln!(
+            "BASELINE (k={k} × {N} RawJson scans): {:?} ({:.2} M/s)",
+            baseline,
+            (k * N) as f64 / baseline.as_secs_f64() / 1e6,
+        );
+        eprintln!(
+            "CACHED  (build + k={k} × {N} map lookups): {:?} ({:.2} M/s)",
+            cached,
+            (k * N) as f64 / cached.as_secs_f64() / 1e6,
+        );
+        eprintln!("Speedup: {:.2}x for k={k} concurrent fields", speedup);
+
+        // For k ≥ 2 fields on documents with >8 top-level keys, the cache should
+        // be strictly faster because the amortised index build is sub-linear in k.
+        // We assert speedup > 1 at minimum to catch obvious regressions.
+        assert!(
+            speedup > 1.0,
+            "batch index should be faster than k independent scans for k={k}: {speedup:.2}x"
         );
     }
 }
