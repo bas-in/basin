@@ -309,6 +309,10 @@ pub(crate) struct SimpleSelectPlan {
     /// all decoded rows by this column and applies the limit post-sort.
     /// Always `None` for aggregate queries.
     pub order_by: Option<(String, bool)>,
+    /// `true` when the WHERE clause is provably 3VL-FALSE (e.g. `x = NULL`
+    /// or `x <> NULL`). `execute_simple_select` returns an empty row set
+    /// immediately without consulting storage or running aggregates.
+    pub always_empty: bool,
 }
 
 /// Recognise the supported "simple SELECT" shape. Returns `None` if any
@@ -434,7 +438,11 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
     // OR, IS NOT NULL, expressions, nested ANDs beyond the cap — falls through
     // to DataFusion.
     let parsed_where: ParsedWhere = match &select.selection {
-        None => ParsedWhere { predicates: vec![], is_null_cols: vec![] },
+        None => ParsedWhere {
+            predicates: vec![],
+            is_null_cols: vec![],
+            always_false: false,
+        },
         Some(expr) => parse_where(expr)?,
     };
 
@@ -461,6 +469,7 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
             is_null_cols: parsed_where.is_null_cols,
             limit: None,
             order_by: None,
+            always_empty: parsed_where.always_false,
         });
     }
 
@@ -496,6 +505,7 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
         is_null_cols: parsed_where.is_null_cols,
         limit,
         order_by,
+        always_empty: parsed_where.always_false,
     })
 }
 
@@ -737,6 +747,14 @@ fn parse_single_col_agg_arg(func: &sqlparser::ast::Function) -> Option<String> {
 struct ParsedWhere {
     predicates: Vec<Predicate>,
     is_null_cols: Vec<String>,
+    /// `true` when any conjunctive atom in the WHERE clause is provably
+    /// always-FALSE under 3VL — currently just `<col> = NULL`, `NULL = <col>`,
+    /// `<col> <> NULL`, `NULL <> <col>`. Inside an AND tree any such atom
+    /// poisons the whole WHERE to FALSE (`F AND X ≡ F`), so the query
+    /// returns zero rows without touching storage. OR-trees never reach this
+    /// recogniser (parse rejects them), so the AND-only short-circuit is
+    /// sound.
+    always_false: bool,
 }
 
 /// Parse the WHERE expression into a [`ParsedWhere`]. Returns `None` to fall
@@ -753,15 +771,57 @@ fn parse_where(expr: &Expr) -> Option<ParsedWhere> {
     let mut out = ParsedWhere {
         predicates: Vec::new(),
         is_null_cols: Vec::new(),
+        always_false: false,
     };
     parse_where_into(expr, &mut out)?;
     Some(out)
+}
+
+/// Detect a 3VL-FALSE atom: `<col> = NULL`, `NULL = <col>`, `<col> <> NULL`,
+/// or `NULL <> <col>`. All of these evaluate to NULL under SQL three-valued
+/// logic, and a NULL in WHERE filters the row out — so the conjunctive
+/// predicate is logically FALSE.
+///
+/// Returns `true` if `expr` is one of these shapes. The caller treats the
+/// containing WHERE clause as always-empty.
+fn is_3vl_false_atom(expr: &Expr) -> bool {
+    let Expr::BinaryOp { op, left, right } = expr else {
+        return false;
+    };
+    if !matches!(op, BinaryOperator::Eq | BinaryOperator::NotEq) {
+        return false;
+    }
+    let is_null = |e: &Expr| {
+        matches!(
+            e,
+            Expr::Value(ValueWithSpan {
+                value: Value::Null,
+                ..
+            })
+        )
+    };
+    // One side NULL literal AND the other side a column reference (anything
+    // else — expr-on-expr — falls through to DataFusion for correctness).
+    (is_null(left) && as_identifier(right).is_some())
+        || (is_null(right) && as_identifier(left).is_some())
 }
 
 /// Recursively populate `out` with atoms from `expr`. Returns `None` to
 /// signal "fall through to DataFusion" when a non-fast-path expression is
 /// encountered or when the combined atom count exceeds the cap.
 fn parse_where_into(expr: &Expr, out: &mut ParsedWhere) -> Option<()> {
+    // 3VL-FALSE short-circuit: `col = NULL` / `NULL = col` / `col <> NULL` /
+    // `NULL <> col`. Any such atom inside an AND chain makes the whole
+    // WHERE clause logically FALSE — the query returns zero rows. Mark the
+    // ParsedWhere and bail out of further atom parsing; execute_simple_select
+    // honours `always_false` by returning an empty row set without touching
+    // storage. Closes the `WHERE x = NULL returns 0 (3VL)` bench gap that
+    // ran ~300x slower than PG.
+    if is_3vl_false_atom(expr) {
+        out.always_false = true;
+        return Some(());
+    }
+
     // `col IS NULL`
     if let Expr::IsNull(inner) = expr {
         let col = as_identifier(inner.as_ref())?;
@@ -1088,6 +1148,50 @@ pub(crate) async fn execute_simple_select(
                 .await?
         }
     };
+
+    // 3VL constant-fold: a WHERE clause containing `<col> = NULL` (or its
+    // variants — see `is_3vl_false_atom`) returns the empty set under SQL
+    // three-valued logic. Return an empty row or empty aggregate result
+    // without consulting storage. `apply_aggregates` over an empty
+    // `Vec<RecordBatch>` produces the empty-relation answer naturally
+    // (count=0, sum/min/max=NULL).
+    if plan.always_empty {
+        if let Some(aggs) = &plan.aggregates {
+            return apply_aggregates(Vec::new(), aggs, &meta.schema);
+        }
+        // Row-returning path: project the requested schema and return zero
+        // rows. Mirrors the PkProbeOutcome::Absent branch below.
+        let output_schema = match &plan.projection {
+            None => meta.schema.clone(),
+            Some(items) => {
+                let idxs: Result<Vec<usize>> = items
+                    .iter()
+                    .filter_map(|item| match item {
+                        ProjectionItem::Column(c) => Some(
+                            meta.schema
+                                .index_of(c)
+                                .map_err(|_| {
+                                    BasinError::InvalidSchema(format!("unknown column {c}"))
+                                }),
+                        ),
+                        _ => None,
+                    })
+                    .collect();
+                match idxs {
+                    Ok(ix) => Arc::new(
+                        meta.schema
+                            .project(&ix)
+                            .unwrap_or_else(|_| meta.schema.as_ref().clone()),
+                    ),
+                    Err(_) => meta.schema.clone(),
+                }
+            }
+        };
+        return Ok(ExecResult::Rows {
+            schema: output_schema,
+            batches: vec![],
+        });
+    }
 
     // Validate the read-superset columns against the schema. For computed
     // projections `read_cols` is the union of all source columns + filter
