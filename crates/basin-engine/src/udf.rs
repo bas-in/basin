@@ -808,14 +808,64 @@ fn operand_looks_like_range(expr: &str) -> bool {
     false
 }
 
-/// Walk back from `end` capturing one operand. Returns the inclusive
-/// `(start, end)` byte range of the operand within `s`, where `end` is the
-/// exclusive upper bound. Operands recognised:
+/// Walk back from `end` capturing the full left operand. Returns the
+/// inclusive `(start, end)` byte range of the operand within `s`, where `end`
+/// is the exclusive upper bound. Operands recognised:
 /// - parenthesised group `(...)`
 /// - bracketed array `[...]`
 /// - quoted string `'...'`
 /// - identifier / number run (alphanumeric, `_`, `.`)
+///
+/// Chained JSON path operators are absorbed: when the captured unit is itself
+/// preceded by a `->` / `->>` / `#>` / `#>>` operator, the walk continues so
+/// that the *entire* left-hand JSON expression is captured as one operand.
+/// This is what makes chained deep-path extracts like
+/// `payload -> 'device' ->> 'version'` lower correctly: the `->>` pass must
+/// grab `payload -> 'device'` (not just the bare `'device'` key) as its LHS so
+/// the later `->` pass can recurse into the now-inner expression.
 fn extract_left_operand(s: &str, end: usize) -> (usize, usize) {
+    let (mut start, operand_end) = capture_left_unit(s, end);
+    // Greedily absorb a preceding JSON-arrow operator chain. Each iteration
+    // checks whether the byte run immediately before `start` (skipping
+    // whitespace) is a JSON path operator; if so it captures the operator's
+    // own left operand and continues. The operand_end never moves — only the
+    // start extends leftward.
+    let bytes = s.as_bytes();
+    loop {
+        // Skip whitespace before the current operand start.
+        let mut j = start;
+        while j > 0 && bytes[j - 1].is_ascii_whitespace() {
+            j -= 1;
+        }
+        // Detect a JSON path operator ending at `j`: `->>`, `->`, `#>>`, `#>`.
+        let op_len = if j >= 3 && &bytes[j - 3..j] == b"->>" {
+            3
+        } else if j >= 3 && &bytes[j - 3..j] == b"#>>" {
+            3
+        } else if j >= 2 && &bytes[j - 2..j] == b"->" {
+            2
+        } else if j >= 2 && &bytes[j - 2..j] == b"#>" {
+            2
+        } else {
+            0
+        };
+        if op_len == 0 {
+            break;
+        }
+        // Capture the operand to the left of this operator and extend `start`.
+        let (prev_start, _) = capture_left_unit(s, j - op_len);
+        if prev_start >= start {
+            // No progress (degenerate input) — stop to avoid looping.
+            break;
+        }
+        start = prev_start;
+    }
+    (start, operand_end)
+}
+
+/// Walk back from `end` capturing exactly one operand unit (no chaining).
+/// See [`extract_left_operand`] for the recognised operand shapes.
+fn capture_left_unit(s: &str, end: usize) -> (usize, usize) {
     let bytes = s.as_bytes();
     let mut i = end;
     // Skip whitespace.
@@ -5292,6 +5342,40 @@ mod json_op_rewrite_tests {
     fn test_arrow_op() {
         let r = rewrite_json_operators("SELECT data -> 'key' FROM t");
         assert!(r.contains("json_get(data, 'key')"), "got: {r}");
+    }
+
+    /// Chained deep-path lowering: the `->>` pass must capture the whole
+    /// preceding `->` chain as its left operand so the later `->` pass can
+    /// recurse. Regression guard for the deep-path basin-gap shape.
+    #[test]
+    fn test_chained_deep_path() {
+        let spaced = crate::pg_operators::rewrite_jsonb_arrow_op_spacing(
+            "SELECT payload->'device'->>'version' FROM events",
+        );
+        let r = rewrite_json_operators(&spaced);
+        assert!(
+            r.contains("json_get_text(json_get(payload, 'device'), 'version')"),
+            "chained deep path must nest the UDFs, got: {r}"
+        );
+    }
+
+    /// GROUP-BY-on-extract lowering: the extract in projection AND the deep
+    /// extract inside the aggregate both lower to nested UDF calls.
+    #[test]
+    fn test_group_by_on_extract() {
+        let spaced = crate::pg_operators::rewrite_jsonb_arrow_op_spacing(
+            "SELECT payload->>'category', SUM((payload->'metadata'->>'score')::float) \
+             FROM events GROUP BY 1",
+        );
+        let r = rewrite_json_operators(&spaced);
+        assert!(
+            r.contains("json_get_text(payload, 'category')"),
+            "GROUP BY key extract must lower, got: {r}"
+        );
+        assert!(
+            r.contains("json_get_text(json_get(payload, 'metadata'), 'score')"),
+            "deep extract inside SUM must nest, got: {r}"
+        );
     }
 
     #[test]
