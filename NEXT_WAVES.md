@@ -82,6 +82,20 @@ partially stale; #1 below is already done, #2 is the load-bearing gap):
    "shipped". Note: `CAPABILITIES.md` is owned by the other-chat
    workstream per memory — coordinate or hand off.
 
+8. **Re-key HTAP-cached `MemRowValue::Row` by encoded PK.** Today
+   `htap_promote_to_registry` (`executor.rs:7424`) inserts cached rows
+   under a monotonic-counter `RowKey`, not the row's PK-encoded key. Two
+   consequences: (a) the memtable PK direct-get fast path (`79ee848`)
+   returns `None` against INSERT-cached rows and falls back to the O(n)
+   snapshot path — so the Concurrent SELECT bench (48× at 1M) doesn't
+   move; (b) any future read-side merge that wants to dedupe hot vs cold
+   by PK has no key to dedupe on. Fix: derive the PK bytes from the
+   inserted batch (mirror `dml_mutate::pk_scalar_to_row_key`) and use
+   that as the `RowKey`. Multi-crate touch: `basin-engine/executor.rs` +
+   `basin-hottier/merge.rs` semantics (Row vs Update vs Tombstone must
+   keep their distinct meanings under the PK-keyed regime). **Real fix
+   for the Concurrent SELECT 16 sessions perf gap.**
+
 **What this unlocks** (user-quoted, verbatim):
 - "Single-row UPDATE p50: <5ms, on par with Postgres + index"
 - Pre-alpha caveat gone from the front page
