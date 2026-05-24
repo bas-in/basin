@@ -5625,6 +5625,26 @@ async fn exec_select(
     // non-shard paths share the same reference point.
     let statement_deadline: Option<Instant> =
         timeout.map(|d| Instant::now() + d);
+    // Aggregate / GROUP-BY / UNION-ALL partitioning note (investigated; no
+    // Basin lever). A cluster of GROUP-BY-shaped queries runs several× slower
+    // than PostgreSQL at 10k rows, with the gap NARROWING as the table grows
+    // (≈8× @10k → ≈2-4× @100k/1M) — the signature of a per-query FIXED
+    // overhead, not an algorithmic blow-up. The hypothesis was that DataFusion
+    // over-partitions small inputs (Partial→Repartition→Final fan-out whose
+    // exchange + merge cost dwarfs a 10k-row aggregate). EXPLAIN of these
+    // shapes (see `tests/aggregate_tuning.rs`) shows that is NOT happening:
+    // because `open_session` pins `datafusion.execution.target_partitions = 1`
+    // (session.rs), every aggregate plans as `AggregateExec: mode=Single` with
+    // ZERO `RepartitionExec` and all files in a single file_group, and the two
+    // UNION-ALL branches are collapsed by `UnionScanCollapse` into one scan
+    // with an OR predicate. With `target_partitions = 1` the repartition flags
+    // (`repartition_aggregations` / `_joins` / `_file_scans`) are moot —
+    // `EnforceDistribution` emits no exchanges. So the optimal partition lever
+    // is already pulled; the residual gap is intrinsic DataFusion execution
+    // cost (per-batch hash-aggregate setup + scan startup) amortized away at
+    // scale, which is exactly why the gap narrows as the row count grows. There
+    // is no further Basin-side config knob here to make this faster without
+    // regressing other shapes; documenting honestly rather than faking a fix.
     let df_batches = if sess.engine.config().shard.is_some() {
         let plan = df
             .create_physical_plan()
