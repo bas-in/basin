@@ -19,6 +19,84 @@ Rules:
 
 ---
 
+## Wave NOW — OLTP fastpaths default-on (the real load-bearing wave)
+
+This is the gate that unlocks the README rewrite, removes the
+"do-not-run-in-production / pre-alpha" caveat, and flips the OLTP
+customer conversation from "still in flight" to "shipped". Until these
+land, the env vars `BASIN_HOTTIER_DELETE_FASTPATH=1` and
+`BASIN_HOTTIER_UPDATE_FASTPATH=1` are opt-in by default because flipping
+them would produce wrong results on at least one read path. See
+`crates/basin-engine/src/dml_mutate.rs:637` for the in-code note.
+
+Current state (verified 2026-05-24 — the dml_mutate.rs:637 comment is
+partially stale; #1 below is already done, #2 is the load-bearing gap):
+
+0. **[DONE] Tombstone visibility in `fast_select::execute_simple_select`**
+   — wired at `fast_select.rs:1886` via `apply_tombstone_filter_to_batches`,
+   and the DataFusion-path `TombstoneFilteringTable` wraps cold with both
+   `TombstoneFilterExec` + `UpdateOverlayExec`. The stale comment in
+   dml_mutate.rs:637 should be updated to reflect this.
+
+1. **Wire `UpdateOverlayExec` into `HtapUnionTable::scan`**
+   (`session.rs:1890`). Today it applies `maybe_wrap_with_tombstone_filter`
+   but **not** the Update overlay — meaning a SELECT routed through the
+   HtapUnionTable provider after a fast-path UPDATE sees the stale cold
+   row alongside the new in-memory row image (duplicates). Mirror the
+   pattern from `TombstoneFilteringTable::scan` at
+   `hot_tombstone.rs:712-733`. **Load-bearing.**
+
+2. **Extend the C6 differential harness with a 4th mode: `fastpath-on`.**
+   88 shapes × {empty, memtable, split, fastpath-on} = 352 sub-assertions.
+   Round-trips: DELETE-then-SELECT, UPDATE-then-SELECT. Gate matrix:
+   RETURNING, multi-col PK, RLS-enabled, soft-delete, audit-table, reactor
+   — each must still route to the slow CoW path.
+
+3. **Gate-matrix tests** (`dml_mutate.rs:660-700`). Gates already exist;
+   just need one test per route that proves the slow path triggers when
+   the gate condition holds. Most are one-line gate checks already
+   working in production; tests pin them in place against regression.
+
+4. **Flip the defaults.** `BASIN_HOTTIER_DELETE_FASTPATH` and
+   `BASIN_HOTTIER_UPDATE_FASTPATH` default `1` instead of `0`. Add a
+   kill-switch `BASIN_HOTTIER_FASTPATH_DISABLE=1` for operator rollback
+   without a deploy.
+
+5. **Resolve the deferred TxCommit WAL marker** (`decisions.md:1113`,
+   ADR 0020 §6). ADR specified explicit `WalEvent::Commit { tx_id: u64 }`;
+   shipped impl uses implicit commit-at-EOF. Bounded correctness gap on
+   hot-tier in-memory rebuild after crash mid-tx. Add the variant + emit
+   from executor at COMMIT; teach `replay_wal_into` to require matched
+   BEGIN/COMMIT pairs.
+
+6. **Regen the perf battery** with the new defaults.
+   `compare_postgres*.json` rerun with no env vars set. **Acceptance:**
+   single-row UPDATE p50 drops from ~118 ms (1M-row card) to <5 ms (the
+   C2 acceptance gate). DELETE WHERE id IN (10) stays fast across all
+   scales.
+
+7. **README + CAPABILITIES.md rewrite** once #1-6 land. Remove "OLTP
+   write path is architecturally slow until the hot-tier UPDATE/DELETE
+   routes finish landing" and the "do not run in production" caveat
+   around point UPDATE. Update Phase 5.14 status from "in flight" to
+   "shipped". Note: `CAPABILITIES.md` is owned by the other-chat
+   workstream per memory — coordinate or hand off.
+
+**What this unlocks** (user-quoted, verbatim):
+- "Single-row UPDATE p50: <5ms, on par with Postgres + index"
+- Pre-alpha caveat gone from the front page
+- 1M-row PG comparison flips from "1550× slower on UPDATE" to "within
+  2-4× of PG on the OLTP shapes"
+- Phase 5.14 flips from "in flight" to "shipped"
+- OLTP customer conversation becomes possible — mutation-heavy SaaS,
+  not just append-shaped
+- Phase 0 customer interviews can finally land against a real product
+
+Realistic effort: 3-5 weeks at the punch-list pace; faster in tight
+sub-agent waves because the items partition cleanly by file.
+
+---
+
 ## Wave N+1 — Beat Nile (the harder fight)
 
 Nile is Basin's direct competitor on the multi-tenant Postgres pitch.
