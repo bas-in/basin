@@ -572,6 +572,36 @@ fn is_simple_literal(expr: &Expr) -> bool {
 /// future merge-on-read pass can match cold rows by encoded key.
 ///
 /// Supported types: `Int64`, `Int32` (widened from `ScalarValue::Int64`
+/// Decide whether the named hot-tier fast-path env var is active.
+///
+/// Phase 5.14 closure flipped these from default-OFF to default-ON. The
+/// resolution order, highest precedence first:
+///
+///   1. **Global kill-switch** `BASIN_HOTTIER_FASTPATH_DISABLE=1` — forces
+///      *every* hot-tier fast path off regardless of per-shape settings.
+///      Operators use this to roll back without a redeploy.
+///   2. **Per-shape override** (`BASIN_HOTTIER_DELETE_FASTPATH` or
+///      `BASIN_HOTTIER_UPDATE_FASTPATH`):
+///        * `0` — fast path off
+///        * `1` — fast path on (the historical opt-in value still works)
+///        * unset — fast path on (Phase 5.14 default)
+///   3. **Default** — on.
+///
+/// Why an env var and not a config struct: shard processes spawn from a
+/// single binary and the kill-switch needs to take effect on the next
+/// SQL statement after the var is set, without restarting any process.
+/// The lookup is cheap (a syscall returning a small string), and only
+/// runs on the fast-path eligibility check — not in tight loops.
+pub(crate) fn hottier_fastpath_enabled(per_shape_key: &str) -> bool {
+    if std::env::var("BASIN_HOTTIER_FASTPATH_DISABLE").as_deref() == Ok("1") {
+        return false;
+    }
+    match std::env::var(per_shape_key).as_deref() {
+        Ok("0") => false,
+        _ => true,
+    }
+}
+
 /// when the column type is Int32), `UInt64`, `Utf8`, `Boolean`. Anything
 /// else returns `None` and the caller falls back to the slow path.
 pub(crate) fn pk_scalar_to_row_key(
@@ -622,27 +652,24 @@ async fn try_resolve_fast_path_pks(
     predicate: Option<&Expr>,
     returning: Option<&[SelectItem]>,
 ) -> Result<Option<Vec<basin_hottier::RowKey>>> {
-    // Gate: opt-in via env var.
+    // Gate: hot-tier DELETE fast path. **Default ON** since Phase 5.14
+    // closure (HtapUnionTable Update overlay landed in d8020f7; gate-matrix
+    // and round-trip tests landed in 6cbe224). All read paths
+    // (`fast_select::execute_simple_select`, `TombstoneFilteringTable::scan`,
+    // `HtapUnionTable::scan`) apply `apply_tombstone_filter_to_batches` +
+    // `apply_update_overlay_to_batches`, so post-DELETE SELECT sees the
+    // correct logical state.
     //
-    // The fast path writes `MemRowValue::Tombstone` into the process-wide
-    // `MemTableRegistry`. Merge-on-read wiring status (as of current code):
-    //
-    //   * `fast_select::execute_simple_select` — WIRED. Calls
-    //     `apply_tombstone_filter_to_batches` (fast_select.rs:~1886) then
-    //     `apply_update_overlay_to_batches` (fast_select.rs:~1890).
-    //   * `TombstoneFilteringTable::scan` (DataFusion non-HTAP path) — WIRED.
-    //     Applies both `TombstoneFilterExec` and `UpdateOverlayExec` via the
-    //     PK-augment / projection-strip pattern in hot_tombstone.rs:~656.
-    //   * `HtapUnionTable::scan` (DataFusion in-tx HTAP path) — WIRED.
-    //     Applies both `TombstoneFilterExec` and `UpdateOverlayExec` with the
-    //     same PK-augment / projection-strip pattern as TombstoneFilteringTable.
-    //
-    // The env var remains default-OFF because the gate-matrix integration
-    // tests are not yet pinned to the fast path, and a single mis-locked
-    // test that flips the var process-wide could produce flaky failures.
-    // Set `BASIN_HOTTIER_DELETE_FASTPATH=1` to opt this DELETE shape into
-    // the registry-tombstone route (e.g. for the bulk-DELETE perf bench).
-    if std::env::var("BASIN_HOTTIER_DELETE_FASTPATH").as_deref() != Ok("1") {
+    // Operator overrides:
+    //   * `BASIN_HOTTIER_FASTPATH_DISABLE=1` — global kill-switch, forces
+    //     every hot-tier fast path off without a redeploy. Use this if
+    //     production tracing surfaces a correctness regression.
+    //   * `BASIN_HOTTIER_DELETE_FASTPATH=0` — disable just the DELETE
+    //     fast path, leaving UPDATE on.
+    //   * `BASIN_HOTTIER_DELETE_FASTPATH=1` (or unset) — DELETE fast path
+    //     active. The historical opt-in value is still respected for
+    //     operators with existing pinned configs.
+    if !crate::dml_mutate::hottier_fastpath_enabled("BASIN_HOTTIER_DELETE_FASTPATH") {
         return Ok(None);
     }
     // Gate: explicit transaction → fall through. Tombstones written to the
@@ -1281,8 +1308,11 @@ async fn try_resolve_fast_path_update(
     predicate: Option<&Expr>,
     returning: Option<&[sqlparser::ast::SelectItem]>,
 ) -> Result<Option<(Vec<basin_hottier::RowKey>, Vec<(usize, AssignmentRhs)>)>> {
-    // Gate: opt-in via env var (defaults OFF, like the DELETE fast path).
-    if std::env::var("BASIN_HOTTIER_UPDATE_FASTPATH").as_deref() != Ok("1") {
+    // Gate: hot-tier UPDATE fast path. **Default ON** since Phase 5.14
+    // closure. See `try_hot_tier_delete` for the kill-switch semantics —
+    // `BASIN_HOTTIER_FASTPATH_DISABLE=1` (global) and
+    // `BASIN_HOTTIER_UPDATE_FASTPATH=0` (per-shape) override the default.
+    if !crate::dml_mutate::hottier_fastpath_enabled("BASIN_HOTTIER_UPDATE_FASTPATH") {
         return Ok(None);
     }
     // Gate: explicit transaction → fall through (no rollback for shared registry).
