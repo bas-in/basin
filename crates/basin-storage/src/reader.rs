@@ -688,6 +688,19 @@ async fn read_one(
     // file is therefore decodable from nothing but its bytes, exactly like
     // a Parquet file — so Vortex is safe on every read path, not just the
     // table-aware one.
+    //
+    // NOTE: `ReadOptions::row_group_selection` is a PARQUET-ONLY pruning
+    // hint. Vortex has no concept of "row group" (its layout is a column-
+    // chunk tree pruned natively via zone maps + the pushed-down filter
+    // we hand `decode_with_cache`). The engine's index_probe builds
+    // selection maps using parquet row-group ordinals from the
+    // `TrigramRowGroupRegistry` / per-file GIN summary — those ordinals
+    // are meaningless on a Vortex file. We therefore intentionally
+    // ignore `row_group_selection` for Vortex files; the Vortex scan
+    // still gets the projection + predicate pushdown above, which is
+    // its native equivalent. Wiring index-probe → Vortex chunk prune is
+    // separate, larger work (it needs a `ChunkProbeRegistry` keyed on
+    // Vortex layout offsets, not parquet row-group ids).
     if path.as_ref().ends_with(".vortex") {
         // ADR 0024 — UUID-as-Decimal256 storage encoding. The catalog
         // schema reports UUID columns as `FixedSizeBinary(16)`, but on
