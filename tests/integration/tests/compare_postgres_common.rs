@@ -2430,6 +2430,391 @@ async fn run_robustness_suite(
     }
 }
 
+/// Carrier for the 10 OLTP-extra (Basin, PG) p50 pairs (#63-#72). Same
+/// `(Option<f64>, f64)` / "(basin gap)" convention as the other suites.
+///
+/// Coverage rationale per shape (closes the OLTP gaps in the existing 62
+/// metric set):
+///   #63 upsert            — INSERT … ON CONFLICT DO UPDATE; absent today.
+///   #64 large_in_list     — WHERE id IN (~100 values); ANY('{...}') is in
+///                           #62 but only 10 values, not the sqlx-batch shape.
+///   #65 rank_partition    — RANK() OVER (PARTITION BY …); only LAG is in
+///                           #19, so analytic ranking is uncovered.
+///   #66 distinct_on       — DISTINCT ON / first-row-per-group; #26 has
+///                           MAX-per-group but not the full first-row shape.
+///   #67 conditional_update— UPDATE … SET col = CASE WHEN …; #58 has CASE
+///                           in SELECT but not in UPDATE write-path.
+///   #68 composite_range   — WHERE created_at BETWEEN … AND amount BETWEEN
+///                           …; the existing range scan filters only on
+///                           created_at.
+///   #69 json_eq_lookup    — WHERE payload->>'category' = '…'; existing
+///                           JSONB shapes project/contain but don't filter
+///                           equality on a JSON-derived text.
+///   #70 string_concat     — SELECT email || ' (' || id || ')'; string ||
+///                           is not covered by #55/56/59.
+///   #71 hour_bucket       — date_trunc('hour', to_timestamp(created_at));
+///                           #14 is day-trunc only, hour cardinality is
+///                           much higher.
+///   #72 window_lead       — LEAD() OVER (PARTITION BY …); pairs with #19
+///                           LAG — the lookahead-side window function.
+///
+/// Per-shape stability:
+///   - #63 / #67 are write shapes. Each PG EXPLAIN ANALYZE iteration
+///     actually mutates the table; we use a dedicated scratch table seeded
+///     identically on both sides so the writes don't perturb earlier read
+///     measurements. UPSERT on a fixed id is idempotent (DO UPDATE sets
+///     the same value). Conditional UPDATE is idempotent too (CASE collapses
+///     after the first run).
+///   - All other shapes are read-only.
+struct OltpExtraResults {
+    upsert: (Option<f64>, f64),
+    large_in_list: (Option<f64>, f64),
+    rank_partition: (Option<f64>, f64),
+    distinct_on: (Option<f64>, f64),
+    conditional_update: (Option<f64>, f64),
+    composite_range: (Option<f64>, f64),
+    json_eq_lookup: (Option<f64>, f64),
+    string_concat: (Option<f64>, f64),
+    hour_bucket: (Option<f64>, f64),
+    window_lead: (Option<f64>, f64),
+}
+
+/// Run the 10 OLTP-extra probes (#63-#72) on PG + Basin.
+///
+/// Same stack-budget extraction pattern as `run_extended_suite`. Both
+/// engines see identical schema + seed on a scratch `oltp_extra` table so
+/// the write shapes (#63 upsert, #67 conditional update) can mutate freely
+/// without touching the earlier `events`/`users` measurements.
+///
+/// Fairness invariant: every shape goes through the shared `pair()` helper
+/// → same sample count from `samples_for(rows, 5)`, same PG-via-EXPLAIN-ANALYZE
+/// + Basin-via-execute timing. The scratch seed is the only side-state and
+/// it's symmetric on both sides; if either CREATE TABLE / seed fails, the
+/// write shapes record a basin/pg gap.
+async fn run_oltp_extra_suite(
+    pg: &Client,
+    sess: &basin_engine::ProjectSession,
+    schema: &str,
+    rows: usize,
+) -> OltpExtraResults {
+    let n = samples_for(rows, 5);
+
+    async fn pair(
+        pg: &Client,
+        sess: &basin_engine::ProjectSession,
+        pg_sql: String,
+        basin_sql: &str,
+        n: usize,
+    ) -> (Option<f64>, f64) {
+        let p = pg_p50_explain(pg, &pg_sql, n)
+            .await
+            .unwrap_or(f64::INFINITY);
+        let b = basin_p50_try(sess, basin_sql, n).await;
+        (b, p)
+    }
+
+    // Scratch table for the write shapes (#63 upsert, #67 conditional
+    // update). 500 rows is enough that the conditional UPDATE rewrites a
+    // meaningful slice but small enough not to bloat 1M wall clock.
+    let scratch_rows: i64 = 500;
+    let pg_scratch_ok = pg
+        .simple_query(&format!(
+            "CREATE TABLE {schema}.oltp_extra (\
+                id BIGINT PRIMARY KEY, \
+                amount DOUBLE PRECISION, \
+                status TEXT)"
+        ))
+        .await
+        .is_ok();
+    if pg_scratch_ok {
+        let mut stmt = String::with_capacity((scratch_rows as usize) * 32);
+        stmt.push_str(&format!(
+            "INSERT INTO {schema}.oltp_extra (id, amount, status) VALUES "
+        ));
+        for i in 0..scratch_rows {
+            if i > 0 {
+                stmt.push(',');
+            }
+            stmt.push_str(&format!("({i}, {}, '{}')", (i as f64) * 0.5, status_for(i)));
+        }
+        let _ = pg.simple_query(&stmt).await;
+    }
+    let basin_scratch_ok = {
+        let ddl = sess
+            .execute(
+                "CREATE TABLE oltp_extra (\
+                    id BIGINT NOT NULL PRIMARY KEY, \
+                    amount DOUBLE PRECISION, \
+                    status TEXT)",
+            )
+            .await
+            .is_ok();
+        if !ddl {
+            false
+        } else {
+            let mut stmt = String::with_capacity((scratch_rows as usize) * 32);
+            stmt.push_str("INSERT INTO oltp_extra (id, amount, status) VALUES ");
+            for i in 0..scratch_rows {
+                if i > 0 {
+                    stmt.push(',');
+                }
+                stmt.push_str(&format!(
+                    "({i}, {}, '{}')",
+                    (i as f64) * 0.5,
+                    status_for(i)
+                ));
+            }
+            sess.execute(&stmt).await.is_ok()
+        }
+    };
+
+    // -- #63 UPSERT (INSERT ... ON CONFLICT (id) DO UPDATE) -----------------
+    // Single-row upsert on a fixed id inside the scratch keyspace. The id
+    // already exists → DO UPDATE fires every iteration. Idempotent under
+    // repetition (the SET assigns the same value), so EXPLAIN ANALYZE
+    // re-runs on PG are stable. Records a gap on either side if the scratch
+    // setup failed.
+    let upsert_pg_sql = format!(
+        "INSERT INTO {schema}.oltp_extra (id, amount, status) \
+         VALUES (42, 99.5, 'active') \
+         ON CONFLICT (id) DO UPDATE SET amount = EXCLUDED.amount, status = EXCLUDED.status"
+    );
+    let upsert_basin_sql =
+        "INSERT INTO oltp_extra (id, amount, status) \
+         VALUES (42, 99.5, 'active') \
+         ON CONFLICT (id) DO UPDATE SET amount = EXCLUDED.amount, status = EXCLUDED.status";
+    let upsert = if pg_scratch_ok && basin_scratch_ok {
+        pair(pg, sess, upsert_pg_sql, upsert_basin_sql, n).await
+    } else {
+        let p = if pg_scratch_ok {
+            pg_p50_explain(pg, &upsert_pg_sql, n).await.unwrap_or(f64::INFINITY)
+        } else {
+            f64::INFINITY
+        };
+        let b = if basin_scratch_ok {
+            basin_p50_try(sess, upsert_basin_sql, n).await
+        } else {
+            None
+        };
+        (b, p)
+    };
+
+    // -- #64 Large IN-list (~100 values) -----------------------------------
+    // Sqlx-batch-fetch shape: a long literal IN-list. Both sides get the
+    // SAME 100 ids drawn deterministically from the events keyspace so the
+    // selectivity is identical. Tests planner handling of large constant
+    // lists (PG flips to hash for >~10 elements; Basin should match-or-better).
+    let in_list: String = (0..100i64)
+        .map(|k| (k * 7 + 1).to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let large_in_list = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT id, user_id, amount FROM {schema}.events WHERE id IN ({in_list})"
+        ),
+        &format!("SELECT id, user_id, amount FROM events WHERE id IN ({in_list})"),
+        n,
+    )
+    .await;
+
+    // -- #65 RANK() OVER (PARTITION BY ...) --------------------------------
+    // Analytic ranking — distinct from LAG (#19) which projects a sibling
+    // row's value. RANK assigns a dense ordinal within each partition;
+    // tests the window-function plan + partition-sort path.
+    let rank_partition = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT id, user_id, amount, \
+                    RANK() OVER (PARTITION BY user_id ORDER BY amount DESC) AS r \
+             FROM {schema}.events LIMIT 1000"
+        ),
+        "SELECT id, user_id, amount, \
+                RANK() OVER (PARTITION BY user_id ORDER BY amount DESC) AS r \
+         FROM events LIMIT 1000",
+        n,
+    )
+    .await;
+
+    // -- #66 DISTINCT ON (first-row per group) -----------------------------
+    // PG DISTINCT ON is a clean first-row-per-group syntax. Basin may not
+    // accept the DISTINCT ON syntax yet (lowering through DataFusion); if
+    // not, surfaces as a basin gap. Distinct from MAX-per-group (#26) — the
+    // shape returns the FULL row, not just the aggregated column.
+    let distinct_on = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT DISTINCT ON (user_id) user_id, id, amount, created_at \
+             FROM {schema}.events ORDER BY user_id, created_at DESC LIMIT 100"
+        ),
+        "SELECT DISTINCT ON (user_id) user_id, id, amount, created_at \
+         FROM events ORDER BY user_id, created_at DESC LIMIT 100",
+        n,
+    )
+    .await;
+
+    // -- #67 Conditional UPDATE (SET col = CASE WHEN ...) ------------------
+    // Re-bucketises `status` based on an `amount` threshold using a CASE
+    // expression in the write target. Idempotent under repetition: after
+    // the first run every row's status is already correct, so subsequent
+    // EXPLAIN ANALYZE iterations measure the same write-path cost without
+    // the rows changing further. Runs on the scratch table to avoid
+    // perturbing earlier `events` reads.
+    let conditional_update_pg_sql = format!(
+        "UPDATE {schema}.oltp_extra SET status = CASE \
+            WHEN amount < 50 THEN 'low' \
+            WHEN amount < 150 THEN 'mid' \
+            ELSE 'high' END"
+    );
+    let conditional_update_basin_sql =
+        "UPDATE oltp_extra SET status = CASE \
+            WHEN amount < 50 THEN 'low' \
+            WHEN amount < 150 THEN 'mid' \
+            ELSE 'high' END";
+    let conditional_update = if pg_scratch_ok && basin_scratch_ok {
+        pair(
+            pg,
+            sess,
+            conditional_update_pg_sql,
+            conditional_update_basin_sql,
+            n,
+        )
+        .await
+    } else {
+        let p = if pg_scratch_ok {
+            pg_p50_explain(pg, &conditional_update_pg_sql, n)
+                .await
+                .unwrap_or(f64::INFINITY)
+        } else {
+            f64::INFINITY
+        };
+        let b = if basin_scratch_ok {
+            basin_p50_try(sess, conditional_update_basin_sql, n).await
+        } else {
+            None
+        };
+        (b, p)
+    };
+
+    // -- #68 Multi-col composite range -------------------------------------
+    // `WHERE created_at BETWEEN … AND amount BETWEEN …` — two range
+    // predicates on different columns. Tests composite-predicate pushdown:
+    // Basin's row-group selection should prune on both bounds, PG falls
+    // back to a heap scan (no composite btree here on purpose).
+    let cr_amount_lo = ((rows as f64) * 0.25 * 0.5).floor();
+    let cr_amount_hi = ((rows as f64) * 0.50 * 0.5).floor();
+    let cr_ts_lo = EPOCH + (rows as i64) / 4;
+    let cr_ts_hi = cr_ts_lo + 5_000;
+    let composite_range = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT id, amount FROM {schema}.events \
+             WHERE created_at BETWEEN to_timestamp({cr_ts_lo}) AND to_timestamp({cr_ts_hi}) \
+               AND amount BETWEEN {cr_amount_lo} AND {cr_amount_hi}"
+        ),
+        &format!(
+            "SELECT id, amount FROM events \
+             WHERE created_at BETWEEN {cr_ts_lo} AND {cr_ts_hi} \
+               AND amount BETWEEN {cr_amount_lo} AND {cr_amount_hi}"
+        ),
+        n,
+    )
+    .await;
+
+    // -- #69 JSON pseudo-secondary lookup ----------------------------------
+    // `WHERE payload->>'category' = '…'` — filter rows on a JSON-derived
+    // text value. Distinct from `@>` containment (#31): equality on the
+    // extracted text exercises a different predicate-pushdown path
+    // (`->>` then string-eq, vs `@>` jsonb-containment). No GIN index here
+    // so it's a full scan on both sides — measures the per-row JSONB
+    // decode + text-compare cost.
+    let json_eq_lookup = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT COUNT(*) FROM {schema}.events WHERE payload->>'category' = 'purchase'"
+        ),
+        "SELECT COUNT(*) FROM events WHERE payload->>'category' = 'purchase'",
+        n,
+    )
+    .await;
+
+    // -- #70 String concatenation in SELECT --------------------------------
+    // `SELECT email || ' (' || id || ')'` — multi-operand string ||. Tests
+    // the per-row string-fn projection cost. id is BIGINT on both sides, so
+    // PG requires the `::text` cast to concat; Basin does the same. We use
+    // the explicit cast on both sides for parity.
+    let string_concat = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT email || ' (' || id::text || ')' AS label \
+             FROM {schema}.users LIMIT 500"
+        ),
+        "SELECT email || ' (' || id::text || ')' AS label FROM users LIMIT 500",
+        n,
+    )
+    .await;
+
+    // -- #71 Time-bucket aggregation (hour) --------------------------------
+    // PG: `date_trunc('hour', to_timestamp(created_at))`. Basin stores
+    // `created_at` as BIGINT seconds; `to_timestamp(numeric)` is a v0.2
+    // gap (see the DATE_TRUNC note in `run_basin_core_suite`), so we bucket
+    // via integer division — `created_at / 3600` is exactly the same group
+    // cardinality as PG's hour-trunc and the same scan cost.
+    //
+    // Distinct from the day-trunc shape in the core suite (#14): hour
+    // buckets have ~24x more groups, so the aggregation hash builds a
+    // larger table and the ORDER BY sort dominates more of the wall clock.
+    let hour_bucket = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT date_trunc('hour', to_timestamp(created_at)) AS h, COUNT(*) \
+             FROM {schema}.events GROUP BY 1 ORDER BY 1 LIMIT 100"
+        ),
+        "SELECT created_at / 3600 AS h, COUNT(*) \
+         FROM events GROUP BY 1 ORDER BY 1 LIMIT 100",
+        n,
+    )
+    .await;
+
+    // -- #72 Window LEAD() OVER (PARTITION BY ...) -------------------------
+    // Lookahead twin of #19 LAG. Same partition/order shape; LEAD returns
+    // the NEXT row's value instead of the PREVIOUS one. Tests the symmetric
+    // window-function path; either both succeed or both surface the same
+    // unsupported-window-fn gap.
+    let window_lead = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT id, amount, LEAD(amount) OVER (PARTITION BY user_id ORDER BY created_at) \
+             FROM {schema}.events LIMIT 1000"
+        ),
+        "SELECT id, amount, LEAD(amount) OVER (PARTITION BY user_id ORDER BY created_at) \
+         FROM events LIMIT 1000",
+        n,
+    )
+    .await;
+
+    OltpExtraResults {
+        upsert,
+        large_in_list,
+        rank_partition,
+        distinct_on,
+        conditional_update,
+        composite_range,
+        json_eq_lookup,
+        string_concat,
+        hour_bucket,
+        window_lead,
+    }
+}
+
 /// Extract a single scalar i64 from the first cell of the first batch.
 /// Used by the txn-correctness shapes (#42-#44, #44) to verify COUNT results.
 /// Returns `None` if the batch is empty or the column isn't an Int64.
@@ -2981,6 +3366,17 @@ async fn run_full_compare_inner(
     )
     .await;
 
+    // =======================================================================
+    // OLTP-extra suite (#63-#72) — 10 OLTP-realistic shapes that close
+    // residual coverage gaps in the 62-metric set (upsert, large IN-list,
+    // RANK/LEAD window fns, DISTINCT ON, conditional UPDATE, composite range,
+    // JSON-derived eq filter, string ||, hour-truncated time buckets). Runs
+    // AFTER the robustness suite so its scratch table doesn't share the
+    // `rstress`/`cins`/`txnins` keyspace and the writes here can't perturb
+    // earlier read timings.
+    // =======================================================================
+    let oe = run_oltp_extra_suite(&pg, &sess, &schema, rows).await;
+
     // ---- Cold-start first query -------------------------------------------
     let pg_cold_ms = {
         let user_token = if conn_str.contains("user=pc") {
@@ -3179,6 +3575,18 @@ async fn run_full_compare_inner(
     row_opt("multicol_order_mixed_p50_ms", rb.multicol_order_mixed.0, rb.multicol_order_mixed.1);
     row_opt("lateral_join_p50_ms", rb.lateral_join.0, rb.lateral_join.1);
     row_opt("any_array_p50_ms", rb.any_array.0, rb.any_array.1);
+
+    // OLTP-extra rows (#63-#72) — same Option-or-GAP rendering.
+    row_opt("upsert_p50_ms", oe.upsert.0, oe.upsert.1);
+    row_opt("large_in_list_100_p50_ms", oe.large_in_list.0, oe.large_in_list.1);
+    row_opt("rank_partition_p50_ms", oe.rank_partition.0, oe.rank_partition.1);
+    row_opt("distinct_on_p50_ms", oe.distinct_on.0, oe.distinct_on.1);
+    row_opt("conditional_update_p50_ms", oe.conditional_update.0, oe.conditional_update.1);
+    row_opt("composite_range_p50_ms", oe.composite_range.0, oe.composite_range.1);
+    row_opt("json_eq_lookup_p50_ms", oe.json_eq_lookup.0, oe.json_eq_lookup.1);
+    row_opt("string_concat_p50_ms", oe.string_concat.0, oe.string_concat.1);
+    row_opt("hour_bucket_p50_ms", oe.hour_bucket.0, oe.hour_bucket.1);
+    row_opt("window_lead_p50_ms", oe.window_lead.0, oe.window_lead.1);
 
     // ---- Emit benchmark JSON ----------------------------------------------
     let basin_disk_f = basin_disk_bytes as f64;
@@ -3385,6 +3793,18 @@ async fn run_full_compare_inner(
         mk_ext("Multi-col ORDER BY mixed ASC/DESC + LIMIT", rb.multicol_order_mixed.0, rb.multicol_order_mixed.1),
         mk_ext("LATERAL JOIN (correlated derived table)", rb.lateral_join.0, rb.lateral_join.1),
         mk_ext("WHERE col = ANY(int[])", rb.any_array.0, rb.any_array.1),
+        // OLTP-extra shapes (#63-#72) — close residual OLTP coverage gaps.
+        // Same Option-or-gap helper as the other extended suites.
+        mk_ext("UPSERT (INSERT ON CONFLICT DO UPDATE)", oe.upsert.0, oe.upsert.1),
+        mk_ext("Large IN-list (~100 values)", oe.large_in_list.0, oe.large_in_list.1),
+        mk_ext("RANK() OVER (PARTITION BY) p50", oe.rank_partition.0, oe.rank_partition.1),
+        mk_ext("DISTINCT ON first-row per group p50", oe.distinct_on.0, oe.distinct_on.1),
+        mk_ext("Conditional UPDATE (SET = CASE WHEN)", oe.conditional_update.0, oe.conditional_update.1),
+        mk_ext("Composite range (created_at AND amount)", oe.composite_range.0, oe.composite_range.1),
+        mk_ext("JSON pseudo-secondary lookup (->>='…') p50", oe.json_eq_lookup.0, oe.json_eq_lookup.1),
+        mk_ext("String concatenation (email || id) p50", oe.string_concat.0, oe.string_concat.1),
+        mk_ext("Hour-bucket time aggregation p50", oe.hour_bucket.0, oe.hour_bucket.1),
+        mk_ext("Window LEAD() OVER (PARTITION BY) p50", oe.window_lead.0, oe.window_lead.1),
     ];
 
     report_postgres_compare(id, name, claim, true, metrics, None);
