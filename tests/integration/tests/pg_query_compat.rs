@@ -165,44 +165,12 @@ fn cte_select_is_accepted() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Unsupported-rejection tests — reject_unsupported returns Err with 0A000
+// LISTEN / NOTIFY / UNLISTEN — real pub-sub implementation (PR #104) means
+// these are no longer in is_unsupported(); reject_unsupported passes them
+// through. End-to-end acceptance / dispatch is covered by the dedicated
+// pub-sub integration tests. (The previous `assert_rejected` helper went away
+// with these tests since no other test in this file used it.)
 // ──────────────────────────────────────────────────────────────────────────────
-
-/// Assert that `reject_unsupported` returns a `FeatureNotSupported` error
-/// whose message contains "0A000".
-fn assert_rejected(sql: &str) {
-    let tree = pg_ast::parse(sql).unwrap_or_else(|e| panic!("parse {sql:?} failed: {e}"));
-    let err =
-        pg_ast::reject_unsupported(&tree).expect_err(&format!("{sql:?} should have been rejected"));
-    match err {
-        BasinError::FeatureNotSupported(msg) => {
-            assert!(
-                msg.contains("0A000"),
-                "{sql:?}: expected SQLSTATE 0A000 in rejection message, got: {msg}",
-            );
-        }
-        other => panic!("{sql:?}: expected FeatureNotSupported, got {other:?}"),
-    }
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// LISTEN / NOTIFY / UNLISTEN — remain in is_unsupported(); rejected with 0A000
-// ──────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn listen_is_rejected() {
-    assert_rejected("LISTEN ch1");
-}
-
-#[test]
-fn notify_is_rejected() {
-    assert_rejected("NOTIFY ch1, 'hi'");
-}
-
-#[test]
-fn unlisten_is_rejected() {
-    assert_rejected("UNLISTEN ch1");
-}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Noop-accepted statements — reject_unsupported passes them through (Ok)

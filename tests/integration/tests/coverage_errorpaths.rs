@@ -760,35 +760,6 @@ async fn error_fk_violation_on_insert() {
 }
 
 // ---------------------------------------------------------------------------
-// Unsupported features (SQLSTATE 0A000)
-// ---------------------------------------------------------------------------
-
-/// LISTEN, NOTIFY, UNLISTEN are explicit non-goals (ADR 0012).
-/// They must return a 0A000 / "not supported" error, not silently succeed.
-#[tokio::test]
-async fn error_listen_notify_unlisten_0a000() {
-    basin_common::telemetry::try_init_for_tests();
-    let dir = TempDir::new().unwrap();
-    let eng = make_engine(&dir);
-    let sess = eng.open_session(ProjectId::new()).await.unwrap();
-
-    for stmt in ["LISTEN mychan", "NOTIFY mychan", "UNLISTEN mychan"] {
-        let err = sess
-            .execute(stmt)
-            .await
-            .expect_err(&format!("{stmt} must be rejected with 0A000"));
-        let msg = err.to_string();
-        assert!(
-            msg.contains("0A000")
-                || msg.contains("not supported")
-                || msg.contains("not implemented"),
-            "{stmt}: expected 0A000/not-supported, got: {msg}"
-        );
-        println!("[error_paths] {stmt} rejected: {msg}");
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Ambiguous column
 // ---------------------------------------------------------------------------
 

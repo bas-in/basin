@@ -13,8 +13,8 @@
 //!   agent a0f45b8b5d58608d0.
 //! - DECLARE CURSOR / FETCH / CLOSE / MOVE — real cursor lifecycle shipped by
 //!   sibling agent a193aadd56ce5cb56.
-//! - LISTEN / NOTIFY / UNLISTEN — explicit non-goals per ADR 0012; they remain
-//!   rejected with SQLSTATE 0A000 and are NOT tested here.
+//! - LISTEN / NOTIFY / UNLISTEN — real pub-sub registry shipped in PR #104;
+//!   covered by the dedicated pub-sub integration tests, not here.
 //! Integration tests for the no-op-accept dispatch table.
 //!
 //! Each test verifies that a statement in the noop-accept set returns `Ok`
@@ -323,55 +323,10 @@ async fn reindex_index_is_accepted() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Regression — LISTEN / NOTIFY / UNLISTEN must still be rejected
+// LISTEN / NOTIFY / UNLISTEN — formerly rejected here as a regression guard,
+// now implemented by PR #104 (pub-sub registry). End-to-end coverage lives in
+// the dedicated pub-sub integration tests; nothing to assert in this file.
 // ──────────────────────────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn listen_is_still_rejected_with_0a000() {
-    // LISTEN is an explicit non-goal per ADR 0012 and must NOT be in the
-    // noop-accept set. This test proves it was not accidentally accepted.
-    let (_dir, engine) = open_engine().await;
-    let sess = open_session_with_engine(&engine).await;
-    let err = sess
-        .execute("LISTEN my_channel")
-        .await
-        .expect_err("LISTEN must be rejected");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("0A000") || msg.contains("not supported"),
-        "expected 0A000 rejection for LISTEN, got: {msg}"
-    );
-}
-
-#[tokio::test]
-async fn notify_is_still_rejected_with_0a000() {
-    let (_dir, engine) = open_engine().await;
-    let sess = open_session_with_engine(&engine).await;
-    let err = sess
-        .execute("NOTIFY my_channel")
-        .await
-        .expect_err("NOTIFY must be rejected");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("0A000") || msg.contains("not supported"),
-        "expected 0A000 rejection for NOTIFY, got: {msg}"
-    );
-}
-
-#[tokio::test]
-async fn unlisten_is_still_rejected_with_0a000() {
-    let (_dir, engine) = open_engine().await;
-    let sess = open_session_with_engine(&engine).await;
-    let err = sess
-        .execute("UNLISTEN my_channel")
-        .await
-        .expect_err("UNLISTEN must be rejected");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("0A000") || msg.contains("not supported"),
-        "expected 0A000 rejection for UNLISTEN, got: {msg}"
-    );
-}
 
 /// Assert that `sql` executes without error and returns `ExecResult::Empty`.
 async fn assert_empty(sess: &basin_engine::ProjectSession, sql: &str) {

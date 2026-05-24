@@ -1281,31 +1281,6 @@ async fn dml_update_no_match_is_ok() {
     assert_eq!(n, 2, "UPDATE with no match must leave row count unchanged");
 }
 
-/// LISTEN / NOTIFY / UNLISTEN must be rejected with a meaningful error
-/// (they are explicit non-goals; ADR 0012).
-#[tokio::test]
-async fn error_listen_notify_unlisten_rejected() {
-    basin_common::telemetry::try_init_for_tests();
-
-    let dir = TempDir::new().unwrap();
-    let eng = make_engine(&dir);
-    let sess = eng.open_session(ProjectId::new()).await.unwrap();
-
-    for stmt in ["LISTEN ch", "NOTIFY ch", "UNLISTEN ch"] {
-        let err = sess
-            .execute(stmt)
-            .await
-            .expect_err(&format!("{stmt} must be rejected"));
-        let msg = err.to_string();
-        assert!(
-            msg.contains("0A000")
-                || msg.contains("not supported")
-                || msg.contains("not implemented"),
-            "{stmt}: expected 0A000 / not-supported error, got: {msg}"
-        );
-    }
-}
-
 /// Verify empty-table SELECT returns zero rows (not an error).
 #[tokio::test]
 async fn select_empty_table_returns_zero_rows() {
