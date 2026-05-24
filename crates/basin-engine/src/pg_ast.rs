@@ -770,12 +770,21 @@ pub fn rewrite_tsvector_at_at(sql: &str) -> String {
     //   1. Strip `::tsvector` / `::tsquery` casts (Basin stores both as Utf8).
     //      DataFusion's planner rejects these as unsupported cast targets.
     //   2. Lower the `@@` operator to `tsvector_match_udf(lhs, rhs)`.
+    //   3. Lower `<expr> = ANY('{…}'::<type>[])` to `<expr> IN (…)` so
+    //      DataFusion's IN-list planner picks it up.  Runs here (the first
+    //      pg_ast text rewriter in the executor chain) so it sees the raw
+    //      curly-brace cast before `pg_operators::rewrite_pg_array_literal_
+    //      casts` lowers it to `make_array(…)`.  The `ARRAY[…]` form is
+    //      still handled by the later `pg_operators::rewrite_any_array`
+    //      pass; this rewrite is a strict superset that closes the gap for
+    //      sqlx / Drizzle's `'{1,2,3}'::int[]` batch-fetch shape.
     //
     // The cast strip must happen BEFORE the `@@` rewrite so that the
     // operand-capture logic sees a stripped (and thus shorter) operand to
     // capture. Without this ordering the operand captures the bare value
     // and the trailing `::type` becomes a syntax error.
     let stripped = strip_fts_casts(sql);
+    let stripped = lower_any_curly_array_to_in_list(&stripped);
     if !stripped.contains("@@") {
         return stripped;
     }
@@ -2186,5 +2195,385 @@ pub fn index_column_name(col: &sqlparser::ast::IndexColumn) -> String {
     match &col.column.expr {
         sqlparser::ast::Expr::Identifier(ident) => ident.value.clone(),
         other => other.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ANY(<curly-brace array literal cast>) → IN (<elements>)
+// ---------------------------------------------------------------------------
+
+/// Rewrite `<expr> = ANY('{1,2,3}'::<type>[])` (and `= SOME`, and `<>`/`!= ANY`)
+/// to the equivalent `<expr> IN (1,2,3)` / `<expr> NOT IN (…)` IN-list form
+/// at SQL-text level.
+///
+/// ## Why this lives here (and not in `pg_operators::rewrite_any_array`)
+///
+/// `pg_operators::rewrite_any_array` only matches `ANY(ARRAY[…])` — the
+/// constructor form. The sqlx / Drizzle / PG-canonical batch-fetch shape is
+/// the curly-brace cast form: `WHERE id = ANY($1::int[])` substitutes to
+/// `WHERE id = ANY('{1,3,5}'::int[])`. Running here, in `pg_ast`'s first
+/// text rewriter, means we see the raw cast before
+/// `rewrite_pg_array_literal_casts` lowers it to `make_array(…)` (a shape
+/// DataFusion's `= ANY(…)` planner cannot type-coerce against a scalar
+/// lhs). Lowering to `IN (…)` reuses DataFusion's existing InList planner,
+/// which is exactly what PG's optimizer does internally for this shape.
+///
+/// ## Supported element forms
+///
+/// Element tokens between the curly braces are passed through verbatim, so
+/// any element type the IN-list planner already accepts works — `int`,
+/// `bigint`, `text`, `uuid`, mixed numeric, etc. Single-quoted strings
+/// inside the curly literal (PG `'{a,b}'::text[]` form, where elements are
+/// bare or unquoted) are NOT supported in this rewrite (PG's curly text
+/// literal has its own quoting rules incompatible with SQL identifier
+/// quoting); those fall through to `rewrite_pg_array_literal_casts` and the
+/// downstream planner.  The common case — integer IDs — is the one that
+/// matters for the sqlx batch-fetch shape.
+///
+/// ## Word-boundary care
+///
+/// `ANY` and `SOME` matches are bounded so we don't accidentally rewrite
+/// substrings of identifiers (`company`, `some_col`, etc.). Detection
+/// scans the whole string once (no allocation in the no-match fast path)
+/// and recurses textually on the rewritten output so multiple `= ANY(…)`
+/// shapes in one query all fire.
+pub(crate) fn lower_any_curly_array_to_in_list(sql: &str) -> String {
+    // Fast-path: must contain `any` or `some` AND `{` AND `::` to be a
+    // candidate. The bare substring check is O(n) and overwhelmingly the
+    // common case is no match.
+    if !sql.contains('{') || !sql.contains("::") {
+        return sql.to_string();
+    }
+    let lower = sql.to_ascii_lowercase();
+    if !lower.contains("any") && !lower.contains("some") {
+        return sql.to_string();
+    }
+
+    let mut s = sql.to_string();
+    // Two passes per quantifier: positive ("= any" / "= some") and negative
+    // ("<> any" / "!= any" / "<> some" / "!= some"). PG defines `<> ANY` as
+    // "at least one element differs", which is NOT the same as `NOT IN` —
+    // `NOT IN` means "no element equals". For a single-element array the
+    // two coincide; for multi-element arrays they diverge. We therefore
+    // ONLY rewrite the positive form here. The negative form is left for
+    // the existing optimizer path, which handles it correctly with proper
+    // NULL semantics.
+    s = rewrite_one(&s, "any");
+    s = rewrite_one(&s, "some");
+    s
+}
+
+/// Scan for `<equals> <whitespace>* <kw> <whitespace>* ( '{…}'::<type>[] )`,
+/// where `<kw>` is the case-insensitive `any` or `some` token, and
+/// `<equals>` is a bare `=` (not part of `>=` / `<=` / `!=`). On match,
+/// rewrite the entire `= ANY(<curly>)` window to `IN (<csv>)`.
+fn rewrite_one(sql: &str, kw_lower: &str) -> String {
+    let mut s = sql.to_string();
+    let mut search_from = 0usize;
+    loop {
+        let lower = s.to_ascii_lowercase();
+        let Some(rel) = lower[search_from..].find(kw_lower) else {
+            break;
+        };
+        let kw_start = search_from + rel;
+        let kw_end = kw_start + kw_lower.len();
+        let bytes = s.as_bytes();
+
+        // Word boundary AFTER the keyword (must be `(` or whitespace).
+        let post_ok = kw_end >= s.len() || {
+            let b = bytes[kw_end];
+            b == b'(' || b == b' ' || b == b'\t' || b == b'\n' || b == b'\r'
+        };
+        if !post_ok {
+            search_from = kw_end;
+            continue;
+        }
+        // Word boundary BEFORE the keyword (so `many` doesn't match `any`,
+        // `awesome` doesn't match `some`).
+        let pre_ok = kw_start == 0 || {
+            let prev = bytes[kw_start - 1];
+            !prev.is_ascii_alphanumeric() && prev != b'_'
+        };
+        if !pre_ok {
+            search_from = kw_end;
+            continue;
+        }
+
+        // Walk backward over whitespace and require a bare `=` operator.
+        let mut p = kw_start;
+        while p > 0 && bytes[p - 1].is_ascii_whitespace() {
+            p -= 1;
+        }
+        if p == 0 || bytes[p - 1] != b'=' {
+            search_from = kw_end;
+            continue;
+        }
+        let eq_pos = p - 1;
+        // Reject `>=`, `<=`, `!=` (the `=` must stand on its own).
+        if eq_pos > 0 {
+            let pc = bytes[eq_pos - 1];
+            if pc == b'>' || pc == b'<' || pc == b'!' {
+                search_from = kw_end;
+                continue;
+            }
+        }
+
+        // Skip whitespace after the keyword and find `(`.
+        let mut j = kw_end;
+        while j < s.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= s.len() || bytes[j] != b'(' {
+            search_from = kw_end;
+            continue;
+        }
+
+        // Find the matching `)` of the outer parens.
+        let Some(outer_end) = find_matching_paren(&s, j) else {
+            search_from = kw_end;
+            continue;
+        };
+
+        let inner = s[j + 1..outer_end].trim();
+
+        // Inner must be `'{…}'::<type>[]`. Parse:
+        //   1. Single-quoted string literal whose interior starts with `{`
+        //      and ends with `}`.
+        //   2. Followed by `::<typename>[]` (optional whitespace).
+        let Some(list_csv) = parse_curly_array_cast(inner) else {
+            // Not the curly-array-cast shape; leave for the next pass.
+            search_from = kw_end;
+            continue;
+        };
+
+        // Replace `= ANY(...)` (including any whitespace between `=` and the
+        // closing paren) with `IN (...)`.
+        let replacement = format!("IN ({list_csv})");
+        s.replace_range(eq_pos..outer_end + 1, &replacement);
+        search_from = eq_pos + replacement.len();
+    }
+    s
+}
+
+/// Find the index of the matching `)` for the `(` at `open_idx` in `s`.
+/// Handles nested parens and single-quoted string literals (so `(`/`)`
+/// inside `'…'` don't perturb the count).
+fn find_matching_paren(s: &str, open_idx: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    debug_assert!(open_idx < len && bytes[open_idx] == b'(');
+    let mut depth = 1usize;
+    let mut i = open_idx + 1;
+    let mut in_str = false;
+    while i < len {
+        match bytes[i] {
+            b'\'' if !in_str => {
+                in_str = true;
+                i += 1;
+            }
+            b'\'' if in_str => {
+                if i + 1 < len && bytes[i + 1] == b'\'' {
+                    i += 2;
+                } else {
+                    in_str = false;
+                    i += 1;
+                }
+            }
+            b'(' if !in_str => {
+                depth += 1;
+                i += 1;
+            }
+            b')' if !in_str => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Parse `'{…}'::<typename>[]` and return the CSV interior on success.
+///
+/// Examples:
+/// - `'{1,2,3}'::int[]`     → Some("1,2,3")
+/// - `'{1,2,3}'::bigint[]`  → Some("1,2,3")
+/// - `'{}'::int[]`          → None  (empty IN-list is a SQL syntax error;
+///                                   leave to downstream so the user gets
+///                                   the same diagnostic PG would emit)
+/// - `'{{1,2},{3,4}}'::int[][]` → None  (multi-dim, out of scope)
+/// - `ARRAY[1,2,3]`         → None  (constructor form, handled elsewhere)
+fn parse_curly_array_cast(inner: &str) -> Option<String> {
+    let inner = inner.trim();
+    // Must start with single quote.
+    if !inner.starts_with('\'') {
+        return None;
+    }
+    // Find the closing quote (no `''` escapes expected inside a numeric
+    // curly literal — if any appear, bail).
+    let bytes = inner.as_bytes();
+    let mut q_end: Option<usize> = None;
+    let mut i = 1usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            // Reject `''` escape — not used in numeric curly literals.
+            if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                return None;
+            }
+            q_end = Some(i);
+            break;
+        }
+        i += 1;
+    }
+    let q_end = q_end?;
+    let body = &inner[1..q_end]; // between the quotes
+    // Body must be `{…}`.
+    if !(body.starts_with('{') && body.ends_with('}')) {
+        return None;
+    }
+    let body_inner = &body[1..body.len() - 1];
+    // Reject multi-dim (`{{` inside).
+    if body_inner.contains('{') || body_inner.contains('}') {
+        return None;
+    }
+
+    // After the closing quote, expect `::<typename>[]` (with optional whitespace).
+    let after = &inner[q_end + 1..];
+    let after = after.trim_start();
+    if !after.starts_with("::") {
+        return None;
+    }
+    let after = &after[2..];
+    // Scan a type name: alphanumeric + underscore (e.g. `int`, `bigint`,
+    // `int4`, `int8`, `text`, `varchar`). Stop at `[`.
+    let tn_bytes = after.as_bytes();
+    let mut k = 0usize;
+    while k < tn_bytes.len()
+        && (tn_bytes[k].is_ascii_alphanumeric() || tn_bytes[k] == b'_')
+    {
+        k += 1;
+    }
+    if k == 0 {
+        return None;
+    }
+    let rest = &after[k..];
+    let rest = rest.trim_start();
+    if !rest.starts_with("[]") {
+        return None;
+    }
+    // After `[]` only optional whitespace should remain (the outer-paren
+    // matcher has already trimmed the boundary).
+    let tail = rest[2..].trim();
+    if !tail.is_empty() {
+        return None;
+    }
+
+    // Element CSV must be non-empty (PG `'{}'::int[]` is a legal empty
+    // array, but an empty SQL IN-list is invalid). Bail in that case so
+    // the user sees the downstream "= ANY(make_array())" error rather than
+    // a confusing "IN ()" syntax error.
+    let csv = body_inner.trim();
+    if csv.is_empty() {
+        return None;
+    }
+    Some(csv.to_string())
+}
+
+#[cfg(test)]
+mod any_curly_array_tests {
+    use super::lower_any_curly_array_to_in_list as lower;
+
+    #[test]
+    fn rewrites_eq_any_int_curly() {
+        let sql = "SELECT id FROM t WHERE id = ANY('{1,2,3}'::int[])";
+        let out = lower(sql);
+        assert!(out.contains("IN (1,2,3)"), "got: {out}");
+        assert!(!out.to_ascii_lowercase().contains("any"), "ANY should be gone: {out}");
+    }
+
+    #[test]
+    fn rewrites_eq_any_bigint_curly() {
+        let sql = "SELECT id FROM t WHERE id = ANY('{10,20}'::bigint[])";
+        let out = lower(sql);
+        assert!(out.contains("IN (10,20)"), "got: {out}");
+    }
+
+    #[test]
+    fn rewrites_eq_some_int_curly() {
+        // `= SOME` is a PG synonym for `= ANY` — must also be lowered.
+        let sql = "SELECT 1 WHERE 2 = SOME('{1,2,3}'::int[])";
+        let out = lower(sql);
+        assert!(out.contains("IN (1,2,3)"), "got: {out}");
+    }
+
+    #[test]
+    fn leaves_array_constructor_form_alone() {
+        // `ARRAY[…]` form must NOT be touched here — it has its own
+        // rewriter (`pg_operators::rewrite_any_array`).
+        let sql = "SELECT id FROM t WHERE id = ANY(ARRAY[1,2,3])";
+        let out = lower(sql);
+        assert_eq!(out, sql, "ARRAY[…] form must pass through: {out}");
+    }
+
+    #[test]
+    fn leaves_subquery_form_alone() {
+        // Subquery form is handled by DataFusion's planner / our
+        // any_some_subquery rewriter — must not be intercepted.
+        let sql = "SELECT id FROM t WHERE id = ANY(SELECT id FROM u)";
+        let out = lower(sql);
+        assert_eq!(out, sql, "subquery form must pass through: {out}");
+    }
+
+    #[test]
+    fn leaves_multidim_alone() {
+        // Multi-dim is out of scope; fall through to the existing pipeline.
+        let sql = "SELECT 1 WHERE 1 = ANY('{{1,2},{3,4}}'::int[][])";
+        let out = lower(sql);
+        assert_eq!(out, sql, "multi-dim must pass through: {out}");
+    }
+
+    #[test]
+    fn leaves_empty_array_alone() {
+        // PG `'{}'::int[]` is a legal empty array; SQL `IN ()` is a syntax
+        // error. Leaving the rewrite to fail loudly downstream is better
+        // than emitting a malformed IN list.
+        let sql = "SELECT 1 WHERE 1 = ANY('{}'::int[])";
+        let out = lower(sql);
+        assert_eq!(out, sql, "empty array must pass through: {out}");
+    }
+
+    #[test]
+    fn does_not_match_inside_identifier() {
+        // `many = …` must not be picked up as `any = …`.
+        let sql = "SELECT * FROM t WHERE many = 1";
+        let out = lower(sql);
+        assert_eq!(out, sql, "identifier substring must not trigger: {out}");
+    }
+
+    #[test]
+    fn no_curly_no_change() {
+        // Fast-path: no `{` anywhere means we never even build the lower
+        // string.
+        let sql = "SELECT * FROM t WHERE id = 5";
+        let out = lower(sql);
+        assert_eq!(out, sql);
+    }
+
+    #[test]
+    fn handles_many_ids() {
+        // The sqlx batch-fetch shape with the bench's 10-id list.
+        let sql = "SELECT id, v FROM t WHERE id = ANY('{1,2,3,4,5,6,7,8,9,10}'::int[])";
+        let out = lower(sql);
+        assert!(out.contains("IN (1,2,3,4,5,6,7,8,9,10)"), "got: {out}");
+    }
+
+    #[test]
+    fn whitespace_tolerant() {
+        let sql = "SELECT 1 WHERE id  =  ANY  ( '{1,2}'::int[] )";
+        let out = lower(sql);
+        assert!(out.contains("IN (1,2)"), "got: {out}");
     }
 }
