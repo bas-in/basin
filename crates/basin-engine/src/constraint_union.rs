@@ -303,7 +303,10 @@ fn decode_ipc_batch(bytes: &[u8]) -> Option<RecordBatch> {
 /// match the declared `col_dt`. The fast-path writer rejects writes outside
 /// these types so a `None` here means no tombstone match is possible — the
 /// caller should keep the row.
-fn array_value_to_row_key(
+///
+/// `pub(crate)` so the executor's `htap_promote_to_registry` can reuse the
+/// same encoding when keying INSERT rows by PK.
+pub(crate) fn array_value_to_row_key(
     array: &dyn Array,
     row_idx: usize,
     col_dt: &DataType,
