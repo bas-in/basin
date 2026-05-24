@@ -654,12 +654,14 @@ impl ScalarUDFImpl for RegexpMatchUdf {
 
         let mut values: Vec<Option<String>> = Vec::new();
         let mut offsets: Vec<i32> = vec![0i32];
+        let mut validity: Vec<bool> = Vec::with_capacity(n);
 
         for i in 0..n {
             let start = *offsets.last().unwrap();
             match (&strings[i], &patterns[i]) {
                 (None, _) | (_, None) => {
                     offsets.push(start);
+                    validity.push(false);
                 }
                 (Some(s), Some(pat)) => {
                     let flag_str = flags.as_ref().and_then(|f| f[i].as_deref()).unwrap_or("");
@@ -675,9 +677,12 @@ impl ScalarUDFImpl for RegexpMatchUdf {
                         let cnt = groups.len() as i32;
                         values.extend(groups);
                         offsets.push(start + cnt);
+                        validity.push(true);
                     } else {
-                        // No match → empty list (PG returns NULL row for regexp_match)
+                        // No match → SQL NULL (PG semantics: regexp_match returns
+                        // NULL when the pattern does not match the input).
                         offsets.push(start);
+                        validity.push(false);
                     }
                 }
             }
@@ -688,7 +693,8 @@ impl ScalarUDFImpl for RegexpMatchUdf {
         ));
         let offsets_buf = OffsetBuffer::new(offsets.into());
         let field = Arc::new(Field::new("item", DataType::Utf8, true));
-        let list_arr = ListArray::new(field, offsets_buf, values_arr, None);
+        let nulls = datafusion::arrow::buffer::NullBuffer::from(validity);
+        let list_arr = ListArray::new(field, offsets_buf, values_arr, Some(nulls));
         Ok(ColumnarValue::Array(Arc::new(list_arr)))
     }
 }
