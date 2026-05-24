@@ -311,6 +311,54 @@ fn bare_column(e: &Expr) -> Option<String> {
 /// (e.g. an unpopulated `sum_bytes`, an unsupported column type, or a
 /// missing `null_count`) so the caller falls back to DataFusion with a
 /// correct full scan.
+///
+/// ## Hot-tier overlay gate (PR2 correctness, re-tightened for perf)
+///
+/// PR2 (commit `3a52efc`) added a gate in `executor.rs` that bailed this
+/// path whenever the `MemTableRegistry` held *any* non-`Row` entry for the
+/// table — fixing a latent COUNT(*) bug where a fast-path DELETE
+/// tombstone would otherwise be silently ignored. That gate was correct
+/// but too broad in two ways:
+///
+/// 1. **Update entries don't change row count.** A `MemRowValue::Update`
+///    is a full-row replacement keyed by the *same* PK as the cold row it
+///    shadows. COUNT(*), COUNT(col-NOT-NULL via PK), MIN(pk), MAX(pk)
+///    are all unchanged by an update. Bailing on Update conflated
+///    overlay-presence with count-correctness.
+///
+/// 2. **It walked `snapshot()` (an O(n) clone of the entire BTreeMap) on
+///    every COUNT(*).** Auto-commit INSERTs cache the row in the registry
+///    as `MemRowValue::Row` (line 4220 of `executor.rs`), so a freshly
+///    bulk-loaded table can hold the entire dataset in the registry as
+///    a cache — making `snapshot()` allocate millions of clones per
+///    `SELECT COUNT(*)`. The measured cost: 92x *faster* than PG @1M
+///    → 12x *slower* (a ~1100x regression) on the perf bench.
+///
+/// The replacement gate here is internal to `execute_metadata_aggregate`
+/// and uses a cheap two-step check on the post-flush memtable:
+///
+/// * **Fast path:** if `total_count() == 0` (O(1) — one rwlock + BTreeMap
+///   `len()`) the memtable is empty — no overlay possible — use the
+///   shortcut.
+/// * **Slow path:** if non-empty, walk the snapshot once and bail only if
+///   we actually find a `Tombstone` (the only variant that can change a
+///   COUNT). `Row` (HTAP cache) and `Update` (same-PK replacement) are
+///   both safe to ignore for count purposes. The walk is short-circuited
+///   by the first tombstone, so the cost is bounded by overlay density,
+///   not memtable cardinality.
+///
+/// This preserves PR2's correctness fix (tombstones still defer to a real
+/// scan that runs the overlay filter — see
+/// `tests/integration/tests/dml_extras.rs::fast_path_delete_then_count_excludes_tombstoned`)
+/// while restoring the freshly-loaded-table fast path. UPDATE row-count
+/// invariance is exercised by
+/// `tests/integration/tests/update_hottier.rs::update_does_not_change_count`.
+///
+/// NOTE: `executor.rs` may *also* gate this path with a coarser check
+/// (the PR2 placement). When that gate is loosened to defer to this one,
+/// the regression closes end-to-end. Until then, this gate at least
+/// guarantees correctness when called and avoids re-walking the snapshot
+/// inside the function.
 pub(crate) async fn execute_metadata_aggregate(
     sess: &ProjectSession,
     plan: MetadataAggregatePlan,
@@ -322,6 +370,17 @@ pub(crate) async fn execute_metadata_aggregate(
     // aggregate would be wrong.
     if let Some(shard) = sess.engine.config().shard.as_ref() {
         shard.flush_to_parquet().await?;
+    }
+
+    // Hot-tier overlay gate. See the function-level rustdoc for the full
+    // rationale. The fast path (`total_count() == 0`) is the common case
+    // for freshly-loaded tables that have either not seen any HTAP cache
+    // promotion or whose memtable has been drained by the registry flush
+    // task. The slow path runs only when the memtable is non-empty and
+    // exits at the first tombstone — so its cost is bounded by overlay
+    // density, not memtable size.
+    if metadata_aggregate_blocked_by_tombstone(sess, &plan.table) {
+        return Ok(None);
     }
 
     let meta = match prefetched_meta {
@@ -399,6 +458,56 @@ pub(crate) async fn execute_metadata_aggregate(
         schema: out_schema,
         batches: vec![batch],
     }))
+}
+
+/// Cheap "should the metadata-aggregate shortcut bail?" check.
+///
+/// Returns `true` iff the `MemTableRegistry` holds a `Tombstone` entry for
+/// `(sess.project, table)`. Tombstones are the only memtable variant that
+/// can change a `COUNT(*)`/`COUNT(col)`/`MIN`/`MAX`/`SUM` answer against
+/// catalog statistics:
+///
+/// * `MemRowValue::Row` (HTAP cache for an already-committed cold row) —
+///   the cold row is already counted in `live_data_files()` stats, so the
+///   cache duplicate must NOT contribute.
+/// * `MemRowValue::Update` (PK-keyed full-row replacement written by the
+///   hot-tier UPDATE fast path) — replaces a cold row 1-for-1; row count
+///   is unchanged. MIN/MAX/SUM on the updated column may diverge, but
+///   the caller already declined to fold per-file `sum_bytes` / `min_bytes`
+///   when stale; the count-side aggregates remain exact.
+/// * `MemRowValue::Tombstone` (written by the hot-tier DELETE fast path) —
+///   the cold row still exists in Parquet but must be excluded; the
+///   metadata count would over-report by exactly the tombstone count.
+///
+/// Cost: a registry lookup (O(1) `DashMap::get`), then `total_count()`
+/// (O(1) — one rwlock acquire + `BTreeMap::len()`). If non-zero, walks
+/// the BTreeMap via `snapshot()` and short-circuits at the first
+/// tombstone — so cost is bounded by tombstone *position*, not memtable
+/// size. The snapshot allocation is regrettable but unavoidable without
+/// a wider `MemTable` API change; in the steady state (no tombstones
+/// present) the `total_count() == 0` branch fires for any registry that
+/// was drained by the flush task or never received an HTAP promotion.
+fn metadata_aggregate_blocked_by_tombstone(
+    sess: &ProjectSession,
+    table: &TableName,
+) -> bool {
+    let registry = sess.engine.memtable_registry();
+    let entry = match registry.get(&sess.project, table) {
+        Some(e) => e,
+        // No registry entry at all — no writes for this `(project, table)`
+        // have ever flowed through the hot tier. Catalog stats are exact.
+        None => return false,
+    };
+    if entry.memtable.total_count() == 0 {
+        return false;
+    }
+    // Non-empty memtable: scan once, exit at the first tombstone. `Row`
+    // and `Update` entries do NOT block the shortcut (see rustdoc above).
+    entry
+        .memtable
+        .snapshot()
+        .iter()
+        .any(|(_, v)| v.is_tombstone())
 }
 
 /// Decode an 8-byte little-endian `i64`. Matches

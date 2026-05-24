@@ -3561,7 +3561,7 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
         // project slice and the multi-partition fan-out hasn't been wired
         // through compaction yet. Fall through to the synchronous Parquet
         // write path below.
-        let opts = write_options_for(&meta);
+        let opts = write_options_for(&meta, crate::session::tx_is_active(&sess.state));
         let mut materialised_groups: Vec<(PartitionKey, RecordBatch)> =
             Vec::with_capacity(groups.len());
         for (pkey, group_rows) in groups {
@@ -3776,7 +3776,7 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
     // with extra; else: dispatch pre-commit → commit catalog → refresh).
     let events = build_insert_events(sess, &table, std::slice::from_ref(&batch))?;
 
-    let opts = write_options_for(&meta);
+    let opts = write_options_for(&meta, crate::session::tx_is_active(&sess.state));
     let df = sess
         .engine
         .config()
@@ -4134,7 +4134,7 @@ async fn exec_insert_select(
     let part = PartitionKey::default_key();
     let events = build_insert_events(sess, table, std::slice::from_ref(&batch))?;
 
-    let opts = write_options_for(&meta);
+    let opts = write_options_for(&meta, crate::session::tx_is_active(&sess.state));
     let written = sess
         .engine
         .config()
@@ -4347,7 +4347,7 @@ async fn exec_insert_default_values(
 
     let row_count = batch.num_rows();
     let part = PartitionKey::default_key();
-    let opts = write_options_for(&meta);
+    let opts = write_options_for(&meta, crate::session::tx_is_active(&sess.state));
 
     let events = build_insert_events(sess, &table, std::slice::from_ref(&batch))?;
     let df = sess
@@ -5322,7 +5322,15 @@ pub(crate) fn map_file_format(fmt: basin_catalog::TableFileFormat) -> FileFormat
 ///
 /// When neither is configured the result is `WriteOptions::default()`,
 /// which is byte-equivalent to the pre-Phase-5.7 write path.
-fn write_options_for(meta: &TableMetadata) -> WriteOptions {
+///
+/// `in_tx` mirrors AF's fastpath-off-in-tx rule: `BASIN_FAST_BULK_INSERT=1`
+/// only flips encoding to `Fast` when executing outside an explicit
+/// transaction. Inside `BEGIN..COMMIT` the per-statement Fast-encoder setup
+/// cost dominates the single-row INSERT shape and produced a 27x regression
+/// on the `txn_insert_x100` bench (38ms -> 1042ms at 10k scale,
+/// commit ddfd8a8). When `in_tx` is true we fall through to `Best` so the
+/// in-tx path is byte-identical to the pre-env-gate behaviour.
+fn write_options_for(meta: &TableMetadata, in_tx: bool) -> WriteOptions {
     WriteOptions {
         bloom_filter_columns: meta.bloom_filter_columns.clone(),
         max_row_group_size: meta.row_group_rows,
@@ -5347,7 +5355,17 @@ fn write_options_for(meta: &TableMetadata) -> WriteOptions {
         // next compaction rewrites the file with `Best`, so the disk-size
         // delta is transient. Hot-tier flushes always use `Fast` and are
         // independent of this env var (see basin-shard ShardFlushBackend).
-        encoding_mode: if std::env::var("BASIN_FAST_BULK_INSERT").as_deref() == Ok("1") {
+        //
+        // The `!in_tx` gate mirrors AF's fastpath-off-in-tx pattern:
+        // inside BEGIN..COMMIT the per-statement Fast-encoder setup cost
+        // dominates and regresses `BEGIN; INSERT x100; COMMIT` by ~27x
+        // (single-row inserts don't amortise the Fast cascade's fixed
+        // setup). Tx rollback semantics are preserved because encoding
+        // mode only affects on-disk bytes; the in-tx pending-files queue
+        // (see `tx_pending_files_for`) is independent.
+        encoding_mode: if !in_tx
+            && std::env::var("BASIN_FAST_BULK_INSERT").as_deref() == Ok("1")
+        {
             basin_storage::EncodingMode::Fast
         } else {
             basin_storage::EncodingMode::Best
