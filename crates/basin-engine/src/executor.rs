@@ -1793,6 +1793,22 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
             // sort.  Best-effort; only fires for simple single-table SELECTs.
             record_query_patterns(sess, query);
 
+            // ADR 0027 Phase 4 auto-promotion: observe JSON-path accesses and
+            // fire promote_jsonb_path when the threshold is crossed.  This is
+            // best-effort and non-blocking; the catalog call is spawned
+            // fire-and-forget.  Recording is purely frequency-based — no
+            // hardcoded column or key names.
+            {
+                let table_refs = crate::session::collect_table_refs(query);
+                crate::jsonb_promotion::observe_and_maybe_promote(
+                    sql,
+                    &sess.project,
+                    &table_refs,
+                    sess.engine.jsonb_promotion_registry(),
+                    sess.engine.config().catalog.clone(),
+                );
+            }
+
             // Try the point-query fast path first. It only matches a tightly
             // constrained shape; on any rejection we fall back to DataFusion.
             //

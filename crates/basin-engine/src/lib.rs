@@ -253,6 +253,13 @@ pub(crate) struct EngineInner {
     /// SQL-level `LISTEN` / `NOTIFY` pub-sub registry. One per process;
     /// keyed by `(ProjectId, channel-name)` with arbitrary text payloads.
     pub(crate) notify_registry: crate::notify_registry::NotifyRegistry,
+
+    /// ADR 0027 Phase 4 auto-promotion: per-`(project, table, col, key)`
+    /// access-frequency registry.  Records JSON-path hits at query time and
+    /// triggers `catalog.promote_jsonb_path` when a path crosses
+    /// [`crate::jsonb_promotion::AUTO_PROMOTE_MIN_HITS`].
+    pub(crate) jsonb_promotion_registry:
+        Arc<crate::jsonb_promotion::JsonbPromotionRegistry>,
 }
 
 impl Engine {
@@ -346,6 +353,10 @@ impl Engine {
             publication_registry: Arc::new(basin_catalog::PublicationRegistry::new()),
             // SQL-level LISTEN/NOTIFY registry.
             notify_registry: crate::notify_registry::NotifyRegistry::new(),
+            // ADR 0027 Phase 4 auto-promotion registry.
+            jsonb_promotion_registry: Arc::new(
+                crate::jsonb_promotion::JsonbPromotionRegistry::new(),
+            ),
         });
         // Phase 5.14.D2: register the query-history adapter with the shard so
         // the compactor can consult observed ORDER BY / GROUP BY patterns.
@@ -638,6 +649,28 @@ impl Engine {
         &self,
     ) -> Arc<basin_storage::index::gin_rowgroup::GinRowGroupRegistry> {
         self.inner.gin_rowgroup_registry.clone()
+    }
+
+    // ── ADR 0027 Phase 4 auto-promotion ──────────────────────────────────────
+
+    /// Crate-private: process-wide JSONB auto-promotion registry.
+    pub(crate) fn jsonb_promotion_registry(
+        &self,
+    ) -> &Arc<crate::jsonb_promotion::JsonbPromotionRegistry> {
+        &self.inner.jsonb_promotion_registry
+    }
+
+    /// Public accessor for integration tests: inspect the JSONB
+    /// auto-promotion registry (hit counts, promoted flags).
+    ///
+    /// Use this to assert that:
+    /// - a path queried ≥ [`crate::jsonb_promotion::AUTO_PROMOTE_MIN_HITS`]
+    ///   times shows `is_promoted = true`, and
+    /// - a path queried fewer times shows `is_promoted = false`.
+    pub fn jsonb_promotion_registry_for_test(
+        &self,
+    ) -> Arc<crate::jsonb_promotion::JsonbPromotionRegistry> {
+        self.inner.jsonb_promotion_registry.clone()
     }
 
     // ── Phase 5.20.E: GIN FTS (tsvector) index ───────────────────────────────
@@ -1118,6 +1151,7 @@ mod pg_scalar_aliases;
 mod prepared;
 mod query_history;
 pub(crate) mod promoted_columns;
+pub mod jsonb_promotion;
 pub mod query_shape;
 pub mod query_stats;
 pub mod query_stats_export;
