@@ -552,6 +552,602 @@ fn value_to_jsonb(v: &Value) -> DFResult<Vec<u8>> {
         .map_err(|e| DataFusionError::Execution(format!("jsonb encode error: {e}")))
 }
 
+// ---------------------------------------------------------------------------
+// Lazy / targeted JSONB extraction (no full Value-tree allocation)
+// ---------------------------------------------------------------------------
+//
+// The 6 single-field extract UDFs (`->`, `->>`, `#>`, `#>>`, `jsonb_typeof`,
+// `jsonb_array_length`, `?`) previously parsed the WHOLE document into a
+// `serde_json::Value` tree (every Map/Vec/String node allocated) and then
+// indexed one key. For a 1 KB nested doc where the query wants ONE field that
+// is mostly wasted allocation.
+//
+// `RawJson` walks the raw bytes directly. It can:
+//   * locate the raw byte-slice of an object member (`member`) or array
+//     element (`index`) WITHOUT materialising siblings;
+//   * report the top-level type / array length / key presence by scanning
+//     structure only (no value materialisation);
+//   * decode the located slice to a `Value` (or its text form) on demand.
+//
+// This is a fully generic scanner over arbitrary JSON — it special-cases NO
+// key names or values. Correctness is byte-for-byte identical to the
+// full-parse path (verified by a parity battery); on any malformed/edge input
+// the scanner returns `Err`/`None` and callers fall back to the full parser.
+
+/// The structural type of a JSON value, determined from its first byte
+/// (after whitespace) without parsing the body.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RawType {
+    Object,
+    Array,
+    String,
+    Number,
+    Bool,
+    Null,
+}
+
+/// Zero-copy cursor over the raw JSON payload of a JSONB cell.
+struct RawJson<'a> {
+    b: &'a [u8],
+}
+
+/// A located raw value: the byte slice spanning exactly one JSON value.
+type RawResult<'a> = Result<Option<&'a [u8]>, ()>;
+
+impl<'a> RawJson<'a> {
+    /// Wrap raw JSONB bytes, tolerating the optional leading 0x01 version byte
+    /// (matching `jsonb_to_value`).
+    #[inline]
+    fn new(bytes: &'a [u8]) -> Self {
+        let b = if bytes.first() == Some(&0x01) && bytes.len() > 1 {
+            &bytes[1..]
+        } else {
+            bytes
+        };
+        RawJson { b }
+    }
+
+    /// Determine the top-level value type cheaply (first non-ws byte).
+    #[inline]
+    fn top_type(&self) -> Option<RawType> {
+        let mut p = 0usize;
+        skip_ws(self.b, &mut p);
+        type_at(self.b, p)
+    }
+
+    /// Number of elements in the top-level array, or `None` if not an array.
+    fn array_len(&self) -> Option<usize> {
+        let mut p = 0usize;
+        skip_ws(self.b, &mut p);
+        if self.b.get(p) != Some(&b'[') {
+            return None;
+        }
+        p += 1;
+        skip_ws(self.b, &mut p);
+        if self.b.get(p) == Some(&b']') {
+            return Some(0);
+        }
+        let mut count = 0usize;
+        loop {
+            if skip_value(self.b, &mut p).is_err() {
+                return None;
+            }
+            count += 1;
+            skip_ws(self.b, &mut p);
+            match self.b.get(p) {
+                Some(&b',') => {
+                    p += 1;
+                    skip_ws(self.b, &mut p);
+                }
+                Some(&b']') => return Some(count),
+                _ => return None,
+            }
+        }
+    }
+
+    /// Does the top-level object contain `key`? (Or, for arrays, does it
+    /// contain the string element `key` — matching `jsonb_has_key` semantics.)
+    /// Returns `Err(())` if the document is malformed (caller falls back).
+    fn has_key(&self, key: &str) -> Result<bool, ()> {
+        let mut p = 0usize;
+        skip_ws(self.b, &mut p);
+        match self.b.get(p) {
+            Some(&b'{') => {
+                p += 1;
+                self.scan_object_for(key, p).map(|slice| slice.is_some())
+            }
+            Some(&b'[') => {
+                // array: true if any string element equals `key`
+                p += 1;
+                skip_ws(self.b, &mut p);
+                if self.b.get(p) == Some(&b']') {
+                    return Ok(false);
+                }
+                loop {
+                    skip_ws(self.b, &mut p);
+                    if self.b.get(p) == Some(&b'"') {
+                        let s = parse_string(self.b, &mut p)?;
+                        if s == key {
+                            return Ok(true);
+                        }
+                    } else if skip_value(self.b, &mut p).is_err() {
+                        return Err(());
+                    }
+                    skip_ws(self.b, &mut p);
+                    match self.b.get(p) {
+                        Some(&b',') => p += 1,
+                        Some(&b']') => return Ok(false),
+                        _ => return Err(()),
+                    }
+                }
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Locate the raw byte-slice for object member `key`. Duplicate keys:
+    /// last occurrence wins (serde_json semantics). `Ok(None)` if the key is
+    /// absent or the top level is not an object.
+    fn member(&self, key: &str) -> RawResult<'a> {
+        let mut p = 0usize;
+        skip_ws(self.b, &mut p);
+        if self.b.get(p) != Some(&b'{') {
+            return Ok(None);
+        }
+        p += 1;
+        self.scan_object_for(key, p)
+    }
+
+    /// Scan an object (cursor just past the opening `{`) for `key`, returning
+    /// the raw value slice of the LAST matching member (dup-key last-wins).
+    fn scan_object_for(&self, key: &str, mut p: usize) -> RawResult<'a> {
+        skip_ws(self.b, &mut p);
+        if self.b.get(p) == Some(&b'}') {
+            return Ok(None);
+        }
+        let mut found: Option<&'a [u8]> = None;
+        loop {
+            skip_ws(self.b, &mut p);
+            if self.b.get(p) != Some(&b'"') {
+                return Err(());
+            }
+            let this_key = parse_string(self.b, &mut p)?;
+            skip_ws(self.b, &mut p);
+            if self.b.get(p) != Some(&b':') {
+                return Err(());
+            }
+            p += 1;
+            skip_ws(self.b, &mut p);
+            let start = p;
+            if skip_value(self.b, &mut p).is_err() {
+                return Err(());
+            }
+            if this_key == key {
+                found = Some(&self.b[start..p]);
+            }
+            skip_ws(self.b, &mut p);
+            match self.b.get(p) {
+                Some(&b',') => p += 1,
+                Some(&b'}') => return Ok(found),
+                _ => return Err(()),
+            }
+        }
+    }
+
+    /// Locate the raw byte-slice for array element `idx` (negative resolves
+    /// from the end, matching `->`). `Ok(None)` if out of range / not an array.
+    fn index(&self, idx: i64) -> RawResult<'a> {
+        let mut p = 0usize;
+        skip_ws(self.b, &mut p);
+        if self.b.get(p) != Some(&b'[') {
+            return Ok(None);
+        }
+        p += 1;
+        skip_ws(self.b, &mut p);
+        if self.b.get(p) == Some(&b']') {
+            return Ok(None);
+        }
+        // Collect element slices; arrays needing a negative index require the
+        // length, so we scan once and remember spans.
+        let mut spans: Vec<&'a [u8]> = Vec::new();
+        loop {
+            skip_ws(self.b, &mut p);
+            let start = p;
+            if skip_value(self.b, &mut p).is_err() {
+                return Err(());
+            }
+            spans.push(&self.b[start..p]);
+            skip_ws(self.b, &mut p);
+            match self.b.get(p) {
+                Some(&b',') => p += 1,
+                Some(&b']') => break,
+                _ => return Err(()),
+            }
+        }
+        let resolved = if idx < 0 {
+            let pos = spans.len() as i64 + idx;
+            if pos < 0 {
+                return Ok(None);
+            }
+            pos as usize
+        } else {
+            idx as usize
+        };
+        Ok(spans.get(resolved).copied())
+    }
+}
+
+/// Classify the JSON value type from the byte at position `p`.
+#[inline]
+fn type_at(b: &[u8], p: usize) -> Option<RawType> {
+    match b.get(p)? {
+        b'{' => Some(RawType::Object),
+        b'[' => Some(RawType::Array),
+        b'"' => Some(RawType::String),
+        b't' | b'f' => Some(RawType::Bool),
+        b'n' => Some(RawType::Null),
+        b'-' | b'0'..=b'9' => Some(RawType::Number),
+        _ => None,
+    }
+}
+
+/// Advance `*p` past ASCII JSON whitespace.
+#[inline]
+fn skip_ws(b: &[u8], p: &mut usize) {
+    while let Some(&c) = b.get(*p) {
+        if c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' {
+            *p += 1;
+        } else {
+            break;
+        }
+    }
+}
+
+/// Advance `*p` past exactly one JSON value (object/array/string/number/
+/// literal), recursing into nested structures. `Err(())` on malformed input.
+fn skip_value(b: &[u8], p: &mut usize) -> Result<(), ()> {
+    skip_ws(b, p);
+    match b.get(*p).ok_or(())? {
+        b'{' => skip_object(b, p),
+        b'[' => skip_array(b, p),
+        b'"' => skip_string(b, p),
+        b't' => skip_lit(b, p, b"true"),
+        b'f' => skip_lit(b, p, b"false"),
+        b'n' => skip_lit(b, p, b"null"),
+        b'-' | b'0'..=b'9' => {
+            skip_number(b, p);
+            Ok(())
+        }
+        _ => Err(()),
+    }
+}
+
+fn skip_object(b: &[u8], p: &mut usize) -> Result<(), ()> {
+    *p += 1; // past '{'
+    skip_ws(b, p);
+    if b.get(*p) == Some(&b'}') {
+        *p += 1;
+        return Ok(());
+    }
+    loop {
+        skip_ws(b, p);
+        if b.get(*p) != Some(&b'"') {
+            return Err(());
+        }
+        skip_string(b, p)?;
+        skip_ws(b, p);
+        if b.get(*p) != Some(&b':') {
+            return Err(());
+        }
+        *p += 1;
+        skip_value(b, p)?;
+        skip_ws(b, p);
+        match b.get(*p) {
+            Some(&b',') => *p += 1,
+            Some(&b'}') => {
+                *p += 1;
+                return Ok(());
+            }
+            _ => return Err(()),
+        }
+    }
+}
+
+fn skip_array(b: &[u8], p: &mut usize) -> Result<(), ()> {
+    *p += 1; // past '['
+    skip_ws(b, p);
+    if b.get(*p) == Some(&b']') {
+        *p += 1;
+        return Ok(());
+    }
+    loop {
+        skip_value(b, p)?;
+        skip_ws(b, p);
+        match b.get(*p) {
+            Some(&b',') => *p += 1,
+            Some(&b']') => {
+                *p += 1;
+                return Ok(());
+            }
+            _ => return Err(()),
+        }
+    }
+}
+
+/// Advance `*p` past a JSON string token (`*p` must point at the opening `"`).
+fn skip_string(b: &[u8], p: &mut usize) -> Result<(), ()> {
+    if b.get(*p) != Some(&b'"') {
+        return Err(());
+    }
+    *p += 1;
+    loop {
+        match b.get(*p).ok_or(())? {
+            b'\\' => *p += 2, // skip escape pair (\\, \", \uXXXX handled byte-wise)
+            b'"' => {
+                *p += 1;
+                return Ok(());
+            }
+            _ => *p += 1,
+        }
+    }
+}
+
+fn skip_number(b: &[u8], p: &mut usize) {
+    while let Some(&c) = b.get(*p) {
+        match c {
+            b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E' => *p += 1,
+            _ => break,
+        }
+    }
+}
+
+fn skip_lit(b: &[u8], p: &mut usize, lit: &[u8]) -> Result<(), ()> {
+    if b.len() >= *p + lit.len() && &b[*p..*p + lit.len()] == lit {
+        *p += lit.len();
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+/// Decode a JSON string token at `*p` into a Rust `String`, handling escapes
+/// (`\" \\ \/ \b \f \n \r \t` and `\uXXXX` incl. surrogate pairs). Advances
+/// `*p` past the closing quote. Used for matching object keys against the
+/// requested key (so escaped keys compare correctly).
+fn parse_string(b: &[u8], p: &mut usize) -> Result<String, ()> {
+    if b.get(*p) != Some(&b'"') {
+        return Err(());
+    }
+    *p += 1;
+    let start = *p;
+    // Fast path: no escapes → borrow the slice and validate utf8.
+    let mut has_escape = false;
+    while let Some(&c) = b.get(*p) {
+        match c {
+            b'\\' => {
+                has_escape = true;
+                break;
+            }
+            b'"' => {
+                let s = std::str::from_utf8(&b[start..*p]).map_err(|_| ())?;
+                *p += 1;
+                return Ok(s.to_string());
+            }
+            _ => *p += 1,
+        }
+    }
+    if !has_escape {
+        return Err(()); // unterminated
+    }
+    // Slow path: rebuild with escape decoding.
+    let mut out = String::new();
+    out.push_str(std::str::from_utf8(&b[start..*p]).map_err(|_| ())?);
+    while let Some(&c) = b.get(*p) {
+        match c {
+            b'"' => {
+                *p += 1;
+                return Ok(out);
+            }
+            b'\\' => {
+                *p += 1;
+                let esc = *b.get(*p).ok_or(())?;
+                match esc {
+                    b'"' => out.push('"'),
+                    b'\\' => out.push('\\'),
+                    b'/' => out.push('/'),
+                    b'b' => out.push('\u{0008}'),
+                    b'f' => out.push('\u{000C}'),
+                    b'n' => out.push('\n'),
+                    b'r' => out.push('\r'),
+                    b't' => out.push('\t'),
+                    b'u' => {
+                        let cp = parse_hex4(b, *p + 1)?;
+                        *p += 4;
+                        if (0xD800..=0xDBFF).contains(&cp) {
+                            // high surrogate: expect a following \uXXXX low surrogate
+                            if b.get(*p + 1) == Some(&b'\\') && b.get(*p + 2) == Some(&b'u') {
+                                let low = parse_hex4(b, *p + 3)?;
+                                *p += 6;
+                                if (0xDC00..=0xDFFF).contains(&low) {
+                                    let c = 0x10000
+                                        + ((cp - 0xD800) << 10)
+                                        + (low - 0xDC00);
+                                    out.push(char::from_u32(c).ok_or(())?);
+                                } else {
+                                    return Err(());
+                                }
+                            } else {
+                                return Err(());
+                            }
+                        } else if (0xDC00..=0xDFFF).contains(&cp) {
+                            return Err(()); // lone low surrogate
+                        } else {
+                            out.push(char::from_u32(cp).ok_or(())?);
+                        }
+                    }
+                    _ => return Err(()),
+                }
+                *p += 1;
+            }
+            _ => {
+                // copy a run of literal bytes (valid utf8 continuation safe:
+                // we copy whole bytes and validate via from_utf8 at the end of
+                // the run boundary — but pushing byte-by-byte as char is wrong
+                // for multibyte. Collect the literal run then validate.)
+                let run_start = *p;
+                while let Some(&cc) = b.get(*p) {
+                    if cc == b'"' || cc == b'\\' {
+                        break;
+                    }
+                    *p += 1;
+                }
+                out.push_str(std::str::from_utf8(&b[run_start..*p]).map_err(|_| ())?);
+            }
+        }
+    }
+    Err(())
+}
+
+/// Parse 4 hex digits at offset `at` into a u32 code unit.
+fn parse_hex4(b: &[u8], at: usize) -> Result<u32, ()> {
+    let mut v = 0u32;
+    for i in 0..4 {
+        let c = *b.get(at + i).ok_or(())?;
+        let d = match c {
+            b'0'..=b'9' => (c - b'0') as u32,
+            b'a'..=b'f' => (c - b'a' + 10) as u32,
+            b'A'..=b'F' => (c - b'A' + 10) as u32,
+            _ => return Err(()),
+        };
+        v = (v << 4) | d;
+    }
+    Ok(v)
+}
+
+/// Parse a raw JSON value slice into a `serde_json::Value`. Only ever called
+/// on the single located slice, so the allocation is bounded to that subtree.
+#[inline]
+fn raw_slice_to_value(slice: &[u8]) -> DFResult<Value> {
+    serde_json::from_slice(slice)
+        .map_err(|e| DataFusionError::Execution(format!("jsonb decode error: {e}")))
+}
+
+/// Text rendering of a located raw slice for the `->>` / `#>>` operators:
+/// a JSON string yields its unescaped contents; `null` yields `None`; any
+/// other value yields its canonical JSON text. Mirrors the full-parse path
+/// (`Value::String(s) => s`, `Null => None`, else `to_string`).
+fn raw_slice_to_text(slice: &[u8]) -> DFResult<Option<String>> {
+    let mut q = 0usize;
+    skip_ws(slice, &mut q);
+    match type_at(slice, q) {
+        Some(RawType::String) => {
+            let mut p = q;
+            parse_string(slice, &mut p)
+                .map(Some)
+                .map_err(|_| DataFusionError::Execution("jsonb decode error: string".into()))
+        }
+        Some(RawType::Null) => Ok(None),
+        Some(_) => {
+            // Canonical re-serialisation (parse the bounded slice then emit).
+            let v = raw_slice_to_value(slice)?;
+            Ok(Some(serde_json::to_string(&v).unwrap_or_default()))
+        }
+        None => Err(DataFusionError::Execution("jsonb decode error".into())),
+    }
+}
+
+/// Resolve a `->`/`->>`-style key against a raw document: an object member by
+/// name, or — when the doc is an array and `key` parses as an integer index
+/// (negative counts from the end) — an array element. Returns the located raw
+/// value slice, or `Ok(None)` when absent / type-mismatch. `Err(())` on
+/// malformed input so the caller can fall back to the full parser.
+#[inline]
+fn raw_get_key<'a>(doc: &RawJson<'a>, key: &str) -> Result<Option<&'a [u8]>, ()> {
+    match doc.top_type() {
+        Some(RawType::Object) => doc.member(key),
+        Some(RawType::Array) => match key.parse::<i64>() {
+            Ok(idx) => doc.index(idx),
+            Err(_) => Ok(None),
+        },
+        _ => Ok(None),
+    }
+}
+
+/// Walk a `#>` / `#>>` path of text segments through a raw document, returning
+/// the located raw slice of the value at the end of the path. Each segment is
+/// an object member name, or — for arrays — a NON-negative integer index
+/// (matching the historical `seg.parse::<usize>()` full-parse semantics).
+/// `Ok(None)` when any segment is absent / type-mismatched; `Err(())` on
+/// malformed input (caller falls back to the full parser).
+fn raw_walk_path<'a>(bytes: &'a [u8], segments: &[String]) -> Result<Option<&'a [u8]>, ()> {
+    let mut cur: &'a [u8] = RawJson::new(bytes).b;
+    for seg in segments {
+        let node = RawJson { b: cur };
+        let next = match node.top_type() {
+            Some(RawType::Object) => node.member(seg)?,
+            Some(RawType::Array) => match seg.parse::<usize>() {
+                Ok(idx) => node.index(idx as i64)?,
+                Err(_) => None,
+            },
+            _ => None,
+        };
+        match next {
+            Some(slice) => cur = slice,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(cur))
+}
+
+/// Get the raw JSONB payload bytes for row `i` of a JSONB-bearing array,
+/// without parsing. `Ok(None)` for null slots; `Ok(Some(None))` is not used —
+/// non-JSONB-binary types (Utf8 string literals) return their UTF-8 bytes so
+/// the byte-scanner works uniformly. Unsupported types yield `Err`.
+fn extract_jsonb_bytes<'a>(
+    arr: &'a ArrayRef,
+    i: usize,
+    fn_name: &str,
+) -> DFResult<Option<&'a [u8]>> {
+    match arr.data_type() {
+        DataType::LargeBinary => {
+            let a = arr
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!("{fn_name}: not a LargeBinaryArray"))
+                })?;
+            Ok((!a.is_null(i)).then(|| a.value(i)))
+        }
+        DataType::BinaryView => {
+            let a = arr
+                .as_any()
+                .downcast_ref::<BinaryViewArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!("{fn_name}: not a BinaryViewArray"))
+                })?;
+            Ok((!a.is_null(i)).then(|| a.value(i)))
+        }
+        DataType::Utf8 => {
+            let a = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                DataFusionError::Execution(format!("{fn_name}: not a StringArray"))
+            })?;
+            Ok((!a.is_null(i)).then(|| a.value(i).as_bytes()))
+        }
+        DataType::Utf8View => {
+            let a = arr
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!("{fn_name}: not a StringViewArray"))
+                })?;
+            Ok((!a.is_null(i)).then(|| a.value(i).as_bytes()))
+        }
+        other => exec_err!(
+            "{fn_name}: expected LargeBinary, BinaryView, Utf8, or Utf8View, got {other:?}"
+        ),
+    }
+}
+
 /// Typed view over a JSONB-compatible Arrow array, with the `as_any` downcast
 /// performed **once** up front.  Per-row access via [`TypedJsonbArray::value`]
 /// then takes a single `match` branch — avoiding the per-row vtable lookup
@@ -924,19 +1520,28 @@ impl ScalarUDFImpl for JsonbTypeofUdf {
         }
         let n = row_count(args);
         let arr = args[0].clone().into_array(n)?;
-        // Hoist downcast: one match per array, not one per row.
-        let typed = TypedJsonbArray::new(&arr, "jsonb_typeof")?;
         let mut out: Vec<Option<&'static str>> = Vec::with_capacity(n);
         for i in 0..n {
-            match typed.value(i, "jsonb_typeof")? {
+            match extract_jsonb_bytes(&arr, i, "jsonb_typeof")? {
                 None => out.push(None),
-                Some(v) => out.push(Some(match &v {
-                    Value::Object(_) => "object",
-                    Value::Array(_) => "array",
-                    Value::String(_) => "string",
-                    Value::Number(_) => "number",
-                    Value::Bool(_) => "boolean",
-                    Value::Null => "null",
+                // Lazy: classify the top-level value from its first byte only,
+                // no full-tree parse. Fall back to the full parser only if the
+                // leading byte is not a recognised JSON start.
+                Some(bytes) => out.push(Some(match RawJson::new(bytes).top_type() {
+                    Some(RawType::Object) => "object",
+                    Some(RawType::Array) => "array",
+                    Some(RawType::String) => "string",
+                    Some(RawType::Number) => "number",
+                    Some(RawType::Bool) => "boolean",
+                    Some(RawType::Null) => "null",
+                    None => match jsonb_to_value(bytes)? {
+                        Value::Object(_) => "object",
+                        Value::Array(_) => "array",
+                        Value::String(_) => "string",
+                        Value::Number(_) => "number",
+                        Value::Bool(_) => "boolean",
+                        Value::Null => "null",
+                    },
                 })),
             }
         }
@@ -1023,14 +1628,31 @@ impl ScalarUDFImpl for JsonbArrayLengthUdf {
         }
         let n = row_count(args);
         let arr = args[0].clone().into_array(n)?;
-        // Hoist downcast: avoid per-row vtable lookup.
-        let typed = TypedJsonbArray::new(&arr, "jsonb_array_length")?;
         let mut out: Vec<Option<i64>> = Vec::with_capacity(n);
         for i in 0..n {
-            match typed.value(i, "jsonb_array_length")? {
+            match extract_jsonb_bytes(&arr, i, "jsonb_array_length")? {
                 None => out.push(None),
-                Some(Value::Array(a)) => out.push(Some(a.len() as i64)),
-                Some(_) => out.push(Some(0)),
+                Some(bytes) => {
+                    let doc = RawJson::new(bytes);
+                    match doc.top_type() {
+                        // Lazy: only structural commas at array top-level are
+                        // counted — element bodies are skipped, not parsed.
+                        Some(RawType::Array) => match doc.array_len() {
+                            Some(len) => out.push(Some(len as i64)),
+                            // malformed array → full-parse fallback
+                            None => match jsonb_to_value(bytes)? {
+                                Value::Array(a) => out.push(Some(a.len() as i64)),
+                                _ => out.push(Some(0)),
+                            },
+                        },
+                        Some(_) => out.push(Some(0)),
+                        // unrecognised leading byte → fallback
+                        None => match jsonb_to_value(bytes)? {
+                            Value::Array(a) => out.push(Some(a.len() as i64)),
+                            _ => out.push(Some(0)),
+                        },
+                    }
+                }
             }
         }
         let result = Int64Array::from(out);
@@ -3078,8 +3700,8 @@ impl ScalarUDFImpl for JsonGetUdf {
         let key_arr = args[1].clone().into_array(n)?;
         let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
         for i in 0..n {
-            let doc = match extract_jsonb_value(&doc_arr, i, "json_get")? {
-                Some(v) => v,
+            let bytes = match extract_jsonb_bytes(&doc_arr, i, "json_get")? {
+                Some(b) => b,
                 None => {
                     out.push(None);
                     continue;
@@ -3092,36 +3714,57 @@ impl ScalarUDFImpl for JsonGetUdf {
                     continue;
                 }
             };
-            let result = match &doc {
-                Value::Object(map) => map.get(&key).cloned(),
-                Value::Array(arr) => key
-                    .parse::<usize>()
-                    .ok()
-                    .and_then(|idx| arr.get(idx).cloned())
-                    .or_else(|| {
-                        key.parse::<i64>().ok().and_then(|idx| {
-                            if idx < 0 {
-                                let pos = arr.len() as i64 + idx;
-                                if pos >= 0 {
-                                    arr.get(pos as usize).cloned()
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
-                        })
-                    }),
-                _ => None,
-            };
-            match result {
-                Some(v) => out.push(Some(value_to_jsonb(&v)?)),
-                None => out.push(None),
+            // Lazy path: locate the value's raw slice; re-emit it canonically.
+            // The bounded re-serialisation matches the old `value_to_jsonb`
+            // (canonical key-sorted form) for object/array slices.
+            let doc = RawJson::new(bytes);
+            match raw_get_key(&doc, &key) {
+                Ok(Some(slice)) => out.push(Some(value_to_jsonb(&raw_slice_to_value(slice)?)?)),
+                Ok(None) => out.push(None),
+                Err(()) => {
+                    // Malformed for the scanner — fall back to the full parser.
+                    let v = jsonb_get_fallback(bytes, &key, "json_get")?;
+                    match v {
+                        Some(v) => out.push(Some(value_to_jsonb(&v)?)),
+                        None => out.push(None),
+                    }
+                }
             }
         }
         let result = LargeBinaryArray::from_iter(out.iter().map(|o| o.as_deref()));
         Ok(ColumnarValue::Array(Arc::new(result)))
     }
+}
+
+/// Full-parse fallback for `->`/`->>` single-key extraction, used only when
+/// the byte-scanner reports malformed input. Identical semantics to the
+/// historical full-parse path.
+fn jsonb_get_fallback(bytes: &[u8], key: &str, fn_name: &str) -> DFResult<Option<Value>> {
+    let doc = jsonb_to_value(bytes).map_err(|e| {
+        DataFusionError::Execution(format!("{fn_name}: {e}"))
+    })?;
+    Ok(match &doc {
+        Value::Object(map) => map.get(key).cloned(),
+        Value::Array(arr) => key
+            .parse::<usize>()
+            .ok()
+            .and_then(|idx| arr.get(idx).cloned())
+            .or_else(|| {
+                key.parse::<i64>().ok().and_then(|idx| {
+                    if idx < 0 {
+                        let pos = arr.len() as i64 + idx;
+                        if pos >= 0 {
+                            arr.get(pos as usize).cloned()
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+            }),
+        _ => None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3158,8 +3801,8 @@ impl ScalarUDFImpl for JsonGetTextUdf {
         let key_arr = args[1].clone().into_array(n)?;
         let mut out: Vec<Option<String>> = Vec::with_capacity(n);
         for i in 0..n {
-            let doc = match extract_jsonb_value(&doc_arr, i, "json_get_text")? {
-                Some(v) => v,
+            let bytes = match extract_jsonb_bytes(&doc_arr, i, "json_get_text")? {
+                Some(b) => b,
                 None => {
                     out.push(None);
                     continue;
@@ -3172,35 +3815,20 @@ impl ScalarUDFImpl for JsonGetTextUdf {
                     continue;
                 }
             };
-            let child = match &doc {
-                Value::Object(map) => map.get(&key).cloned(),
-                Value::Array(arr) => key
-                    .parse::<usize>()
-                    .ok()
-                    .and_then(|idx| arr.get(idx).cloned())
-                    .or_else(|| {
-                        key.parse::<i64>().ok().and_then(|idx| {
-                            if idx < 0 {
-                                let pos = arr.len() as i64 + idx;
-                                if pos >= 0 {
-                                    arr.get(pos as usize).cloned()
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
-                        })
-                    }),
-                _ => None,
-            };
-            let text = match child {
-                None => None,
-                Some(Value::String(s)) => Some(s),
-                Some(Value::Null) => None,
-                Some(v) => Some(serde_json::to_string(&v).unwrap_or_default()),
-            };
-            out.push(text);
+            let doc = RawJson::new(bytes);
+            match raw_get_key(&doc, &key) {
+                Ok(Some(slice)) => out.push(raw_slice_to_text(slice)?),
+                Ok(None) => out.push(None),
+                Err(()) => {
+                    let child = jsonb_get_fallback(bytes, &key, "json_get_text")?;
+                    out.push(match child {
+                        None => None,
+                        Some(Value::String(s)) => Some(s),
+                        Some(Value::Null) => None,
+                        Some(v) => Some(serde_json::to_string(&v).unwrap_or_default()),
+                    });
+                }
+            }
         }
         let result = StringArray::from(out);
         Ok(ColumnarValue::Array(Arc::new(result)))
@@ -3241,8 +3869,8 @@ impl ScalarUDFImpl for JsonPathExtractUdf {
         let path_arr = args[1].clone().into_array(n)?;
         let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
         for i in 0..n {
-            let doc = match extract_jsonb_value(&doc_arr, i, "json_path_extract")? {
-                Some(v) => v,
+            let bytes = match extract_jsonb_bytes(&doc_arr, i, "json_path_extract")? {
+                Some(b) => b,
                 None => {
                     out.push(None);
                     continue;
@@ -3257,35 +3885,49 @@ impl ScalarUDFImpl for JsonPathExtractUdf {
             };
             // path_str is like '{a,b,c}' or 'a.b.c'
             let segments = parse_path(&path_str);
-            let mut cur = doc;
-            let mut found = true;
-            for seg in &segments {
-                let tmp = std::mem::replace(&mut cur, Value::Null);
-                let next = match tmp {
-                    Value::Object(mut map) => map.remove(seg.as_str()),
-                    Value::Array(mut arr) => match seg.parse::<usize>().ok() {
-                        Some(idx) if idx < arr.len() => Some(arr.swap_remove(idx)),
-                        _ => None,
-                    },
-                    _ => None,
-                };
-                match next {
-                    Some(v) => cur = v,
-                    None => {
-                        found = false;
-                        break;
+            match raw_walk_path(bytes, &segments) {
+                Ok(Some(slice)) => out.push(Some(value_to_jsonb(&raw_slice_to_value(slice)?)?)),
+                Ok(None) => out.push(None),
+                Err(()) => {
+                    match jsonb_path_fallback(bytes, &segments, "json_path_extract")? {
+                        Some(v) => out.push(Some(value_to_jsonb(&v)?)),
+                        None => out.push(None),
                     }
                 }
-            }
-            if found {
-                out.push(Some(value_to_jsonb(&cur)?));
-            } else {
-                out.push(None);
             }
         }
         let result = LargeBinaryArray::from_iter(out.iter().map(|o| o.as_deref()));
         Ok(ColumnarValue::Array(Arc::new(result)))
     }
+}
+
+/// Full-parse fallback for `#>` / `#>>` path extraction; used only when the
+/// byte-scanner reports malformed input. Identical semantics to the historical
+/// full-parse path (object key remove; non-negative array index).
+fn jsonb_path_fallback(
+    bytes: &[u8],
+    segments: &[String],
+    fn_name: &str,
+) -> DFResult<Option<Value>> {
+    let doc = jsonb_to_value(bytes)
+        .map_err(|e| DataFusionError::Execution(format!("{fn_name}: {e}")))?;
+    let mut cur = doc;
+    for seg in segments {
+        let tmp = std::mem::replace(&mut cur, Value::Null);
+        let next = match tmp {
+            Value::Object(mut map) => map.remove(seg.as_str()),
+            Value::Array(mut arr) => match seg.parse::<usize>().ok() {
+                Some(idx) if idx < arr.len() => Some(arr.swap_remove(idx)),
+                _ => None,
+            },
+            _ => None,
+        };
+        match next {
+            Some(v) => cur = v,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(cur))
 }
 
 // ---------------------------------------------------------------------------
@@ -3325,8 +3967,8 @@ impl ScalarUDFImpl for JsonPathExtractTextUdf {
         let path_arr = args[1].clone().into_array(n)?;
         let mut out: Vec<Option<String>> = Vec::with_capacity(n);
         for i in 0..n {
-            let doc = match extract_jsonb_value(&doc_arr, i, "json_path_extract_text")? {
-                Some(v) => v,
+            let bytes = match extract_jsonb_bytes(&doc_arr, i, "json_path_extract_text")? {
+                Some(b) => b,
                 None => {
                     out.push(None);
                     continue;
@@ -3340,38 +3982,17 @@ impl ScalarUDFImpl for JsonPathExtractTextUdf {
                 }
             };
             let segments = parse_path(&path_str);
-            let mut cur = doc;
-            let mut found = true;
-            for seg in &segments {
-                let tmp = std::mem::replace(&mut cur, Value::Null);
-                let next = match tmp {
-                    Value::Object(mut map) => map.remove(seg.as_str()),
-                    Value::Array(mut arr) => match seg.parse::<usize>().ok() {
-                        Some(idx) if idx < arr.len() => Some(arr.swap_remove(idx)),
-                        _ => None,
-                    },
-                    _ => None,
-                };
-                match next {
-                    Some(v) => cur = v,
-                    None => {
-                        found = false;
-                        break;
-                    }
+            match raw_walk_path(bytes, &segments) {
+                Ok(Some(slice)) => out.push(raw_slice_to_text(slice)?),
+                Ok(None) => out.push(None),
+                Err(()) => {
+                    let v = jsonb_path_fallback(bytes, &segments, "json_path_extract_text")?;
+                    out.push(match v {
+                        Some(Value::String(s)) => Some(s),
+                        Some(Value::Null) | None => None,
+                        Some(v) => Some(serde_json::to_string(&v).unwrap_or_default()),
+                    });
                 }
-            }
-            if found {
-                let text = match cur {
-                    Value::String(s) => s,
-                    Value::Null => {
-                        out.push(None);
-                        continue;
-                    }
-                    v => serde_json::to_string(&v).unwrap_or_default(),
-                };
-                out.push(Some(text));
-            } else {
-                out.push(None);
             }
         }
         let result = StringArray::from(out);
@@ -3537,8 +4158,8 @@ impl ScalarUDFImpl for JsonbHasKeyUdf {
         let key_arr = args[1].clone().into_array(n)?;
         let mut out: Vec<Option<bool>> = Vec::with_capacity(n);
         for i in 0..n {
-            let doc = match extract_jsonb_value(&doc_arr, i, "jsonb_has_key")? {
-                Some(v) => v,
+            let bytes = match extract_jsonb_bytes(&doc_arr, i, "jsonb_has_key")? {
+                Some(b) => b,
                 None => {
                     out.push(None);
                     continue;
@@ -3551,14 +4172,22 @@ impl ScalarUDFImpl for JsonbHasKeyUdf {
                     continue;
                 }
             };
-            let found = match &doc {
-                Value::Object(map) => map.contains_key(&key),
-                Value::Array(arr) => arr
-                    .iter()
-                    .any(|v| matches!(v, Value::String(s) if s == &key)),
-                _ => false,
-            };
-            out.push(Some(found));
+            // Lazy: scan object keys / array string elements; stop at first
+            // match without materialising the document.
+            match RawJson::new(bytes).has_key(&key) {
+                Ok(found) => out.push(Some(found)),
+                Err(()) => {
+                    let doc = jsonb_to_value(bytes)?;
+                    let found = match &doc {
+                        Value::Object(map) => map.contains_key(&key),
+                        Value::Array(arr) => arr
+                            .iter()
+                            .any(|v| matches!(v, Value::String(s) if s == &key)),
+                        _ => false,
+                    };
+                    out.push(Some(found));
+                }
+            }
         }
         let result = BooleanArray::from(out);
         Ok(ColumnarValue::Array(Arc::new(result)))
@@ -4896,5 +5525,289 @@ mod perf_bench {
                 ratio
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Lazy targeted extraction — parity oracles (the OLD full-parse path)
+    // -----------------------------------------------------------------------
+
+    /// OLD `->` semantics via a full `serde_json::Value` parse. Oracle for the
+    /// lazy `raw_get_key` + `value_to_jsonb` path.
+    fn oracle_get(bytes: &[u8], key: &str) -> Option<Value> {
+        let doc = jsonb_to_value(bytes).unwrap();
+        match &doc {
+            Value::Object(map) => map.get(key).cloned(),
+            Value::Array(arr) => key
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| arr.get(i).cloned())
+                .or_else(|| {
+                    key.parse::<i64>().ok().and_then(|i| {
+                        if i < 0 {
+                            let p = arr.len() as i64 + i;
+                            (p >= 0).then(|| arr.get(p as usize).cloned()).flatten()
+                        } else {
+                            None
+                        }
+                    })
+                }),
+            _ => None,
+        }
+    }
+
+    /// OLD `->>` semantics. Oracle for the lazy `raw_slice_to_text` path.
+    fn oracle_get_text(bytes: &[u8], key: &str) -> Option<String> {
+        match oracle_get(bytes, key) {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(s),
+            Some(v) => Some(serde_json::to_string(&v).unwrap_or_default()),
+        }
+    }
+
+    /// OLD `#>` semantics. Oracle for the lazy `raw_walk_path` path.
+    fn oracle_path(bytes: &[u8], segs: &[String]) -> Option<Value> {
+        let mut cur = jsonb_to_value(bytes).unwrap();
+        for seg in segs {
+            let tmp = std::mem::replace(&mut cur, Value::Null);
+            let next = match tmp {
+                Value::Object(mut m) => m.remove(seg.as_str()),
+                Value::Array(mut a) => match seg.parse::<usize>().ok() {
+                    Some(i) if i < a.len() => Some(a.swap_remove(i)),
+                    _ => None,
+                },
+                _ => None,
+            };
+            match next {
+                Some(v) => cur = v,
+                None => return None,
+            }
+        }
+        Some(cur)
+    }
+
+    /// Candidate keys to probe — derived structurally from each payload (all of
+    /// its object keys at every level, plus numeric indices and absent keys).
+    /// NOT a fixed list, so no key name is special-cased.
+    fn probe_keys(v: &Value, out: &mut Vec<String>) {
+        match v {
+            Value::Object(m) => {
+                for (k, child) in m {
+                    out.push(k.clone());
+                    probe_keys(child, out);
+                }
+            }
+            Value::Array(a) => {
+                for child in a {
+                    probe_keys(child, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// All single-key / path / structural operations must match the old
+    /// full-parse oracle byte-for-byte across the arbitrary payload battery.
+    #[test]
+    fn lazy_extract_parity() {
+        let mut payloads = parity_payloads();
+        // extra edge cases: duplicate keys (last wins), escaped key names,
+        // unicode surrogate-pair escape, negative-index array, nested empties.
+        payloads.push(r#"{"k":1,"k":2,"k":3}"#.to_string());
+        payloads.push(r#"{"a\"b":"v1","c\\d":"v2","e/f":"v3"}"#.to_string());
+        payloads.push(r#"{"emoji":"😀","bmp":"é ☃"}"#.to_string());
+        payloads.push(r#"{"arr":[10,20,30,40],"nested":{"deep":{"x":[true,null,"s"]}}}"#.to_string());
+        payloads.push(r#"{"empty_obj":{},"empty_arr":[],"n":null}"#.to_string());
+        payloads.push(r#"[{"id":0},{"id":1},{"id":2}]"#.to_string());
+
+        for p in &payloads {
+            let bytes = p.as_bytes();
+            let v = jsonb_to_value(bytes).unwrap();
+
+            // Probe set: structural keys + numeric indices + a guaranteed-absent
+            // key. Built generically from the payload.
+            let mut keys = vec![
+                "0".to_string(),
+                "1".to_string(),
+                "2".to_string(),
+                "-1".to_string(),
+                "__definitely_absent__".to_string(),
+            ];
+            probe_keys(&v, &mut keys);
+            keys.sort();
+            keys.dedup();
+
+            let raw = RawJson::new(bytes);
+            for key in &keys {
+                // -> (json_get)
+                let got = match raw_get_key(&raw, key).unwrap() {
+                    Some(slice) => Some(raw_slice_to_value(slice).unwrap()),
+                    None => None,
+                };
+                assert_eq!(got, oracle_get(bytes, key), "-> key={key:?} payload={p}");
+
+                // ->> (json_get_text)
+                let got_txt = match raw_get_key(&raw, key).unwrap() {
+                    Some(slice) => raw_slice_to_text(slice).unwrap(),
+                    None => None,
+                };
+                assert_eq!(
+                    got_txt,
+                    oracle_get_text(bytes, key),
+                    "->> key={key:?} payload={p}"
+                );
+
+                // #> single-segment path (json_path_extract)
+                let segs = vec![key.clone()];
+                let got_path = match raw_walk_path(bytes, &segs).unwrap() {
+                    Some(slice) => Some(raw_slice_to_value(slice).unwrap()),
+                    None => None,
+                };
+                assert_eq!(got_path, oracle_path(bytes, &segs), "#> seg={key:?} payload={p}");
+
+                // ? (jsonb_has_key)
+                let has = RawJson::new(bytes).has_key(key).unwrap();
+                let has_oracle = match &v {
+                    Value::Object(m) => m.contains_key(key),
+                    Value::Array(a) => {
+                        a.iter().any(|e| matches!(e, Value::String(s) if s == key))
+                    }
+                    _ => false,
+                };
+                assert_eq!(has, has_oracle, "? key={key:?} payload={p}");
+            }
+
+            // Multi-segment nested paths built from the structure.
+            for seg_pair in nested_paths(&v) {
+                let got = match raw_walk_path(bytes, &seg_pair).unwrap() {
+                    Some(slice) => Some(raw_slice_to_value(slice).unwrap()),
+                    None => None,
+                };
+                assert_eq!(
+                    got,
+                    oracle_path(bytes, &seg_pair),
+                    "#> nested path={seg_pair:?} payload={p}"
+                );
+            }
+
+            // jsonb_typeof
+            let typ = match RawJson::new(bytes).top_type() {
+                Some(RawType::Object) => "object",
+                Some(RawType::Array) => "array",
+                Some(RawType::String) => "string",
+                Some(RawType::Number) => "number",
+                Some(RawType::Bool) => "boolean",
+                Some(RawType::Null) => "null",
+                None => unreachable!(),
+            };
+            let typ_oracle = match &v {
+                Value::Object(_) => "object",
+                Value::Array(_) => "array",
+                Value::String(_) => "string",
+                Value::Number(_) => "number",
+                Value::Bool(_) => "boolean",
+                Value::Null => "null",
+            };
+            assert_eq!(typ, typ_oracle, "typeof payload={p}");
+
+            // jsonb_array_length
+            let len = RawJson::new(bytes).array_len();
+            let len_oracle = match &v {
+                Value::Array(a) => Some(a.len()),
+                _ => None,
+            };
+            assert_eq!(len, len_oracle, "array_length payload={p}");
+        }
+    }
+
+    /// Build a handful of 2-level paths from the structure (object→key→key)
+    /// for nested `#>` parity, generically (no fixed key names).
+    fn nested_paths(v: &Value) -> Vec<Vec<String>> {
+        let mut paths = Vec::new();
+        if let Value::Object(m) = v {
+            for (k1, child) in m {
+                match child {
+                    Value::Object(c) => {
+                        for k2 in c.keys() {
+                            paths.push(vec![k1.clone(), k2.clone()]);
+                        }
+                    }
+                    Value::Array(a) => {
+                        if !a.is_empty() {
+                            paths.push(vec![k1.clone(), "0".to_string()]);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        paths
+    }
+
+    /// Honest timed comparison: OLD full-parse-then-index vs NEW lazy targeted
+    /// extraction, on a realistic ~1KB nested doc where only ONE top-level
+    /// field is wanted. Gated by BASIN_JSONB_BENCH=1.
+    #[test]
+    #[ignore = "opt-in: BASIN_JSONB_BENCH=1"]
+    fn bench_lazy_vs_full_single_field() {
+        if std::env::var("BASIN_JSONB_BENCH").as_deref() != Ok("1") {
+            return;
+        }
+        // ~1KB arbitrary nested doc (last of the parity battery).
+        let payload = parity_payloads().into_iter().max_by_key(|s| s.len()).unwrap();
+        let bytes = payload.as_bytes();
+        eprintln!("payload size: {} bytes", bytes.len());
+        // Probe the LAST top-level key (worst case for the scanner: it must
+        // walk past all preceding members). Picked structurally, not by name.
+        let v = jsonb_to_value(bytes).unwrap();
+        let key = match &v {
+            Value::Object(m) => m.keys().last().unwrap().clone(),
+            _ => panic!("expected object payload"),
+        };
+        const N: usize = 300_000;
+
+        // warmup
+        for _ in 0..5_000 {
+            std::hint::black_box(oracle_get(bytes, &key));
+            let raw = RawJson::new(bytes);
+            std::hint::black_box(raw_get_key(&raw, &key).unwrap());
+        }
+
+        let t0 = Instant::now();
+        for _ in 0..N {
+            std::hint::black_box(oracle_get(bytes, &key));
+        }
+        let full = t0.elapsed();
+
+        let t1 = Instant::now();
+        for _ in 0..N {
+            let raw = RawJson::new(bytes);
+            let slice = raw_get_key(&raw, &key).unwrap();
+            std::hint::black_box(slice.map(|s| raw_slice_to_value(s).unwrap()));
+        }
+        let lazy = t1.elapsed();
+
+        eprintln!(
+            "FULL-parse {:?} ({:.2} M/s) | LAZY {:?} ({:.2} M/s) | {:.2}x",
+            full,
+            N as f64 / full.as_secs_f64() / 1e6,
+            lazy,
+            N as f64 / lazy.as_secs_f64() / 1e6,
+            full.as_secs_f64() / lazy.as_secs_f64()
+        );
+
+        // Also time the pure-locate (no re-parse) cost — what `->>` on a string
+        // field or `?`/typeof pays.
+        let t2 = Instant::now();
+        for _ in 0..N {
+            let raw = RawJson::new(bytes);
+            std::hint::black_box(raw_get_key(&raw, &key).unwrap());
+        }
+        let locate = t2.elapsed();
+        eprintln!(
+            "LOCATE-only {:?} ({:.2} M/s) | {:.2}x vs full",
+            locate,
+            N as f64 / locate.as_secs_f64() / 1e6,
+            full.as_secs_f64() / locate.as_secs_f64()
+        );
     }
 }
