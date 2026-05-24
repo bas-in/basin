@@ -152,21 +152,34 @@ pub struct WriteOptions {
     /// Only `Int64` and `Utf8` columns are bloomed; all others are silently
     /// skipped.
     pub bloom_columns: Vec<String>,
+    /// #92 — Vortex encode cascade selector. [`EncodingMode::Best`] (the
+    /// default) keeps the full BtrBlocks cascade — smallest files, slowest
+    /// encode — exactly the pre-#92 behaviour, so existing callers are
+    /// unaffected. [`EncodingMode::Fast`] skips the expensive per-column
+    /// encoding search (dictionary / FSST / RLE / Pco) and writes larger
+    /// row blocks, trading a little compression for a much faster encode on
+    /// the bulk-INSERT hot path. Ignored for [`FileFormat::Parquet`] (its
+    /// ZSTD-1 path is already fast).
+    pub encoding_mode: EncodingMode,
 }
 
-/// Vortex encode cascade selector — placeholder enum exported so
-/// `basin_engine` (which references `basin_storage::EncodingMode` for the
-/// `BASIN_FAST_BULK_INSERT` opt-in) compiles after the in-flight Vortex
-/// 2-pass work (#92) lands. Currently unused by the writer itself.
+/// Vortex encode cascade selector (#92). Consumed by
+/// [`crate::vortex_format::encode_with_mode`]; `basin_engine` selects it via
+/// [`WriteOptions::encoding_mode`] for the `BASIN_FAST_BULK_INSERT` opt-in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EncodingMode {
-    /// Full BtrBlocks cascade. Smallest files; default for compaction +
-    /// non-bulk INSERT.
+    /// Full BtrBlocks cascade (`with_compact`: every scheme, ~1%-sample
+    /// per-column ratio search, zstd strings + pco numerics). Smallest
+    /// files; default for compaction + non-bulk INSERT.
     #[default]
     Best,
-    /// Minimal cascade. ~3-4x faster encode, ~1.5x larger files. Used for
-    /// bulk INSERT under `BASIN_FAST_BULK_INSERT=1` and for hot-tier
-    /// flushes that are about to be re-compacted anyway.
+    /// Minimal cascade. Drops the expensive search schemes (dictionary /
+    /// FSST / RLE / Pco) and writes larger row blocks, so each column takes
+    /// a single cheap structure-preserving encoding (constant / FoR /
+    /// bit-packing / ALP / decimal / temporal) with a Zstd fallback for
+    /// strings — no per-column sampling search. ~3-4x faster encode, ~1.5x
+    /// larger files. Used for bulk INSERT under `BASIN_FAST_BULK_INSERT=1`
+    /// and for hot-tier flushes that are about to be re-compacted anyway.
     Fast,
 }
 
@@ -262,7 +275,12 @@ pub(crate) async fn write_batch_with_options(
     let bytes = match opts.file_format {
         FileFormat::Parquet => encode_parquet(batch_for_encode, opts)?,
         FileFormat::Vortex => {
-            crate::vortex_format::encode(batch_for_encode, opts.row_block_size).await?
+            crate::vortex_format::encode_with_mode(
+                batch_for_encode,
+                opts.row_block_size,
+                opts.encoding_mode,
+            )
+            .await?
         }
     };
     let row_count = batch_to_write.num_rows() as u64;

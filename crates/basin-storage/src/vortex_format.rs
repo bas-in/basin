@@ -16,8 +16,11 @@ use vortex_array::arrow::{ArrowArrayExecutor, FromArrowArray};
 use vortex_array::scalar_fn::session::ScalarFnSession;
 use vortex_array::session::ArraySession;
 use vortex_array::{ArrayRef, VortexSessionExecute};
-use vortex_btrblocks::BtrBlocksCompressorBuilder;
+use vortex_btrblocks::schemes::{float, integer, string};
+use vortex_btrblocks::{BtrBlocksCompressorBuilder, SchemeExt};
 use vortex_buffer::ByteBufferMut;
+
+use crate::writer::EncodingMode;
 use vortex_file::{
     register_default_encodings, OpenOptionsSessionExt, WriteOptionsSessionExt, WriteStrategyBuilder,
 };
@@ -42,13 +45,43 @@ fn session() -> &'static VortexSession {
     })
 }
 
-/// Encode one Arrow `RecordBatch` into a self-describing Vortex byte blob using
-/// the aggressive BtrBlocks cascade (zstd for strings/binary, pco for numerics).
+/// Larger row block for [`EncodingMode::Fast`] when the caller hasn't pinned
+/// one via `basin.row_block_size`. The default is 8192; a bigger block means
+/// fewer chunk boundaries / zone maps per column, which cuts the per-chunk
+/// compressor-dispatch and stats-accumulation overhead on a big bulk batch.
+/// Stays well under a typical 65k+ bulk batch so multi-chunk files still form.
+const FAST_DEFAULT_ROW_BLOCK_SIZE: usize = 32_768;
+
+/// Encode with the legacy aggressive cascade ([`EncodingMode::Best`]). Kept as
+/// a thin wrapper so existing call sites and tests that don't care about the
+/// 2-pass selector stay byte-identical to the pre-#92 path.
+pub(crate) async fn encode(batch: &RecordBatch, row_block_size: Option<u32>) -> Result<Vec<u8>> {
+    encode_with_mode(batch, row_block_size, EncodingMode::Best).await
+}
+
+/// Encode one Arrow `RecordBatch` into a self-describing Vortex byte blob.
+///
+/// `mode` selects the BtrBlocks cascade (#92):
+/// * [`EncodingMode::Best`] — the full `with_compact` cascade (zstd strings +
+///   pco numerics, every scheme, ~1%-sample per-column ratio search). Smallest
+///   files; byte-identical to the pre-#92 write path.
+/// * [`EncodingMode::Fast`] — drops the expensive *search* schemes
+///   (dictionary / FSST / RLE / Pco), so each column takes a single cheap
+///   structure-preserving encoding (constant / FoR / bit-packing / ALP /
+///   decimal / temporal) with a Zstd fallback for strings — skipping the
+///   per-column sampling search that dominates bulk-INSERT encode time. When
+///   the caller hasn't pinned `row_block_size`, Fast also widens the default
+///   block to [`FAST_DEFAULT_ROW_BLOCK_SIZE`].
 ///
 /// `row_block_size` – when `Some(n)`, forwards `n` to
 /// `WriteStrategyBuilder::with_row_block_size` to control Vortex chunk
-/// granularity. `None` keeps the Vortex default (8192 rows / chunk).
-pub(crate) async fn encode(batch: &RecordBatch, row_block_size: Option<u32>) -> Result<Vec<u8>> {
+/// granularity. `None` keeps the per-mode default (8192 for Best, the wider
+/// [`FAST_DEFAULT_ROW_BLOCK_SIZE`] for Fast).
+pub(crate) async fn encode_with_mode(
+    batch: &RecordBatch,
+    row_block_size: Option<u32>,
+    mode: EncodingMode,
+) -> Result<Vec<u8>> {
     // Arrow RecordBatch -> Vortex struct array. The top-level struct must be
     // NON-nullable: vortex 0.70's `FileStatsAccumulator` rejects nullable
     // top-level structs ("Use Validity::NonNullable"). Per-COLUMN nullability
@@ -57,11 +90,14 @@ pub(crate) async fn encode(batch: &RecordBatch, row_block_size: Option<u32>) -> 
     let varr: ArrayRef = FromArrowArray::from_arrow(batch, false)
         .map_err(|e| BasinError::storage(format!("vortex: from_arrow encode: {e}")))?;
 
-    // BtrBlocks with `with_compact` = the proven aggressive strategy.
-    let compressor = BtrBlocksCompressorBuilder::default().with_compact();
+    let compressor = btrblocks_builder_for(mode);
     let mut builder = WriteStrategyBuilder::default().with_btrblocks_builder(compressor);
-    if let Some(sz) = row_block_size {
-        builder = builder.with_row_block_size(sz as usize);
+    match row_block_size {
+        Some(sz) => builder = builder.with_row_block_size(sz as usize),
+        None if mode == EncodingMode::Fast => {
+            builder = builder.with_row_block_size(FAST_DEFAULT_ROW_BLOCK_SIZE)
+        }
+        None => {} // Best mode keeps the Vortex default (8192).
     }
     let strategy = builder.build();
 
@@ -74,6 +110,38 @@ pub(crate) async fn encode(batch: &RecordBatch, row_block_size: Option<u32>) -> 
         .map_err(|e| BasinError::storage(format!("vortex: write: {e}")))?;
 
     Ok(buf.as_slice().to_vec())
+}
+
+/// Build the BtrBlocks compressor for the given [`EncodingMode`].
+///
+/// * `Best`: `default().with_compact()` — every scheme, the proven aggressive
+///   strategy (zstd strings + pco numerics). Each candidate scheme estimates
+///   its ratio by compressing a ~1% sample of the column, then the best wins;
+///   that per-column search is exactly what makes Best slow.
+/// * `Fast`: starts from the same `with_compact` set, then *excludes* the
+///   schemes whose `matches` / ratio estimate is expensive — the integer and
+///   string dictionaries, FSST, the integer/float run-length encoders, and the
+///   Pco integer/float codecs. What remains is cheap structure-preserving
+///   encodings (constant, FoR, ZigZag, bit-packing, sparse, ALP/ALP-RD,
+///   decimal, temporal) plus the Zstd string fallback, so every Basin column
+///   type still has at least one applicable scheme and round-trips losslessly
+///   — including UUID-as-Decimal256 (DecimalScheme is retained).
+fn btrblocks_builder_for(mode: EncodingMode) -> BtrBlocksCompressorBuilder {
+    let builder = BtrBlocksCompressorBuilder::default().with_compact();
+    match mode {
+        EncodingMode::Best => builder,
+        EncodingMode::Fast => builder.exclude_schemes([
+            integer::IntDictScheme.id(),
+            integer::IntRLEScheme.id(),
+            integer::RunEndScheme.id(),
+            integer::PcoScheme.id(),
+            float::FloatDictScheme.id(),
+            float::FloatRLEScheme.id(),
+            float::PcoScheme.id(),
+            string::StringDictScheme.id(),
+            string::FSSTScheme.id(),
+        ]),
+    }
 }
 
 
@@ -723,6 +791,121 @@ mod tests {
         assert_eq!(
             g_vals, o_vals,
             "FixedSizeList<Float32,4> values must round-trip (vector column)"
+        );
+    }
+
+    /// #92 — `EncodingMode::Fast` must round-trip identically to `Best`
+    /// (lossless), produce valid Vortex output, and not be slower than the
+    /// full cascade on a large bulk batch. Uses a 100k-row batch shaped like a
+    /// bulk INSERT: an Int64 id, a moderately-cardinal Utf8 label (the kind of
+    /// column the dropped dictionary/FSST search is expensive on), and a
+    /// Float64 measure.
+    #[tokio::test]
+    async fn fast_mode_round_trips_and_is_not_slower() {
+        use std::time::Instant;
+
+        const N: usize = 100_000;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("label", DataType::Utf8, false),
+            Field::new("measure", DataType::Float64, false),
+        ]));
+        let id = Int64Array::from((0i64..N as i64).collect::<Vec<_>>());
+        // 500 distinct labels → dictionary/FSST would normally win the search;
+        // Fast skips that search but must still round-trip exactly.
+        let label = StringArray::from(
+            (0..N).map(|i| format!("label_{}", i % 500)).collect::<Vec<_>>(),
+        );
+        let measure = Float64Array::from((0..N).map(|i| (i as f64) * 0.25).collect::<Vec<_>>());
+        let original = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(id), Arc::new(label), Arc::new(measure)],
+        )
+        .expect("build bulk batch");
+
+        // Encode both modes. Time them; warm the codec first (session init +
+        // encoding registration is one-time and would otherwise be charged to
+        // whichever mode runs first).
+        let _warm = encode_with_mode(&original, None, EncodingMode::Best)
+            .await
+            .expect("warm encode");
+
+        let t_best = Instant::now();
+        let best_bytes = encode_with_mode(&original, None, EncodingMode::Best)
+            .await
+            .expect("encode best");
+        let best_elapsed = t_best.elapsed();
+
+        let t_fast = Instant::now();
+        let fast_bytes = encode_with_mode(&original, None, EncodingMode::Fast)
+            .await
+            .expect("encode fast");
+        let fast_elapsed = t_fast.elapsed();
+
+        assert!(!fast_bytes.is_empty(), "Fast mode must produce a non-empty blob");
+        assert!(!best_bytes.is_empty(), "Best mode must produce a non-empty blob");
+
+        // Fast must skip the expensive per-column search, so it should not be
+        // materially slower than Best. Allow a 25% slack for scheduler / cache
+        // noise on a loaded CI box — the assertion is "Fast is not a
+        // regression", not a tight micro-benchmark.
+        assert!(
+            fast_elapsed <= best_elapsed.mul_f64(1.25),
+            "Fast encode ({fast_elapsed:?}) should not be slower than Best ({best_elapsed:?})"
+        );
+
+        // Round-trip: Fast-encoded bytes decode back to the exact input.
+        let (decoded, _) =
+            decode(bytes::Bytes::from(fast_bytes), Some(schema.clone()), None, None)
+                .await
+                .expect("decode fast blob");
+        let total_rows: usize = decoded.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, N, "Fast round-trip must preserve every row");
+
+        // Concatenate the decoded chunks (Fast widens row blocks → may be
+        // multi-chunk) and compare column-for-column with the original.
+        let decoded_refs: Vec<&RecordBatch> = decoded.iter().collect();
+        let merged = arrow::compute::concat_batches(&schema, decoded_refs)
+            .expect("concat decoded chunks");
+
+        let g_id = merged
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id Int64");
+        let o_id = original
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(g_id, o_id, "Int64 column must round-trip under Fast mode");
+
+        let g_label = merged
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("label Utf8");
+        let o_label = original
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(g_label, o_label, "Utf8 column must round-trip under Fast mode");
+
+        let g_measure = merged
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("measure Float64");
+        let o_measure = original
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(
+            g_measure, o_measure,
+            "Float64 column must round-trip under Fast mode"
         );
     }
 
