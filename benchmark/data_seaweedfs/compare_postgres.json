@@ -7,28 +7,28 @@
   "metrics": [
     {
       "label": "On-disk bytes",
-      "basin": 0.0,
+      "basin": 99160.0,
       "postgres": 10149888.0,
       "unit": "bytes",
       "better": "basin",
-      "ratio_text": "pg / basin = 10149888.00x"
+      "ratio_text": "pg / basin = 102.36x"
     },
     {
       "label": "Point query p50",
-      "basin": 0.8182079999999999,
-      "postgres": 3.183,
+      "basin": 1.2591670000000001,
+      "postgres": 2.723,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 3.89x"
+      "ratio_text": "pg / basin = 2.16x"
     },
     {
       "label": "Insert 100K rows",
-      "basin": 1810.756458,
-      "postgres": 577.1541249999999,
+      "basin": 1720.8386249999999,
+      "postgres": 293.04666699999996,
       "unit": "ms",
       "better": "postgres"
     }
   ],
-  "generated_at": "@1779497679",
+  "generated_at": "@1779752587",
   "note": "Basin storage on real S3; PG on local 18. Insert path: WAL + shard with in-RAM WAL store."
 }

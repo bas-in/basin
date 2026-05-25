@@ -22,13 +22,13 @@
   ],
   "rows": [
     {
-      "load_pct": 24.0,
-      "projects": 6,
+      "load_pct": 32.0,
+      "projects": 8,
       "shard": 0
     },
     {
-      "load_pct": 24.0,
-      "projects": 6,
+      "load_pct": 28.0,
+      "projects": 7,
       "shard": 1
     },
     {
@@ -37,8 +37,8 @@
       "shard": 2
     },
     {
-      "load_pct": 32.0,
-      "projects": 8,
+      "load_pct": 20.0,
+      "projects": 5,
       "shard": 3
     }
   ],
@@ -51,5 +51,5 @@
       "value": 50.0
     }
   },
-  "generated_at": "@1779497647"
+  "generated_at": "@1779752642"
 }

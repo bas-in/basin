@@ -6,7 +6,7 @@
   "passed": false,
   "primary": {
     "label": "cold_start_ms",
-    "value": 3411.585458,
+    "value": 0.0,
     "unit": "ms",
     "bar": {
       "op": "less_than",
@@ -14,9 +14,7 @@
     }
   },
   "details": {
-    "bind_addr": "127.0.0.1:49504",
-    "cold_start_ms": 3411.585458,
-    "storage": "localfs"
+    "skip_reason": "basin-server binary not found"
   },
-  "generated_at": "@1779497599"
+  "generated_at": "@1779751858"
 }

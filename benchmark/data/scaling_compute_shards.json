@@ -22,34 +22,34 @@
   ],
   "rows": [
     {
-      "load_pct": 19.0,
-      "projects": 19,
+      "load_pct": 25.0,
+      "projects": 25,
       "shard": 0
     },
     {
-      "load_pct": 31.0,
-      "projects": 31,
+      "load_pct": 23.0,
+      "projects": 23,
       "shard": 1
     },
     {
-      "load_pct": 21.0,
-      "projects": 21,
+      "load_pct": 28.0,
+      "projects": 28,
       "shard": 2
     },
     {
-      "load_pct": 29.0,
-      "projects": 29,
+      "load_pct": 24.0,
+      "projects": 24,
       "shard": 3
     }
   ],
   "primary": {
     "label": "max shard load",
-    "value": 31.0,
+    "value": 28.0,
     "unit": "%",
     "bar": {
       "op": "less_than",
       "value": 50.0
     }
   },
-  "generated_at": "@1779497580"
+  "generated_at": "@1779751778"
 }

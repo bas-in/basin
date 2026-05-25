@@ -1,5 +1,5 @@
 {
-  "generated_at": "@1779573256",
+  "generated_at": "@1779751776",
   "sections": [
     {
       "orm": "Drizzle",
@@ -110,10 +110,10 @@
     {
       "orm": "Prisma",
       "total": 21,
-      "ok": 21,
-      "typed_error": 0,
+      "ok": 19,
+      "typed_error": 2,
       "regression": 0,
-      "pass_rate_pct": 100.0,
+      "pass_rate_pct": 90.47619047619048,
       "shapes": [
         {
           "sql": "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'User'",
@@ -177,7 +177,9 @@
         },
         {
           "sql": "SELECT \"public\".\"User\".\"id\",\"public\".\"User\".\"email\",\"public\".\"User\".\"name\",\"public\".\"User\".\"createdAt\" FROM \"public\".\"User\" ORDER BY \"public\".\"User\".\"createdAt\" DESC LIMIT 20 OFFSET 0",
-          "outcome": "ok"
+          "outcome": "typed_error",
+          "sqlstate": "57014",
+          "message": "canceling statement due to statement timeout: exceeded statement_timeout (30000 ms)"
         },
         {
           "sql": "BEGIN; SAVEPOINT \"tx1\"; RELEASE SAVEPOINT \"tx1\"; ROLLBACK;",
@@ -189,7 +191,9 @@
         },
         {
           "sql": "SELECT \"public\".\"User\".\"id\" FROM \"public\".\"User\" WHERE \"public\".\"User\".\"id\" = ANY($1::int8[])",
-          "outcome": "ok"
+          "outcome": "typed_error",
+          "sqlstate": "57014",
+          "message": "canceling statement due to statement timeout: exceeded statement_timeout (30000 ms)"
         },
         {
           "sql": "SELECT att.attname AS column_name, pg_catalog.format_type(att.atttypid, att.atttypmod) AS data_type\n           FROM pg_catalog.pg_attribute att\n           JOIN pg_catalog.pg_class cls ON cls.oid = att.attrelid\n           JOIN pg_catalog.pg_namespace nsp ON nsp.oid = cls.relnamespace\n           WHERE nsp.nspname = 'public' AND cls.relname = 'User' AND att.attnum > 0 AND NOT att.attisdropped\n           ORDER BY att.attnum",
@@ -455,7 +459,7 @@
     }
   ],
   "total_shapes": 99,
-  "total_ok": 96,
-  "total_typed_error": 3,
+  "total_ok": 94,
+  "total_typed_error": 5,
   "total_regression": 0
 }

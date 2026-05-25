@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "deletion_ms",
-    "value": 29.150833000000002,
+    "value": 21.395459,
     "unit": "ms",
     "bar": {
       "op": "less_than",
@@ -17,7 +17,7 @@
     "bucket": "basin-test",
     "endpoint": "http://127.0.0.1:8333",
     "files": 100,
-    "setup_ms": 39.379083
+    "setup_ms": 114.185041
   },
-  "generated_at": "@1778866997"
+  "generated_at": "@1779752642"
 }

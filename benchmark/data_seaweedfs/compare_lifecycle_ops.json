@@ -7,21 +7,21 @@
   "metrics": [
     {
       "label": "Project deletion (1 project, 100K rows in 100 files; basin on S3)",
-      "basin": 11.887583,
-      "postgres": 3.744958,
+      "basin": 11.299583,
+      "postgres": 4.0712090000000005,
       "unit": "ms",
       "better": "postgres",
-      "ratio_text": "pg / basin = 0.32x"
+      "ratio_text": "pg / basin = 0.36x"
     },
     {
       "label": "ADD COLUMN on 100K rows",
-      "basin": 0.57625,
-      "postgres": 1.656709,
+      "basin": 1.840875,
+      "postgres": 2.64225,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 2.87x"
+      "ratio_text": "pg / basin = 1.44x"
     }
   ],
-  "generated_at": "@1779497674",
+  "generated_at": "@1779752585",
   "note": "Basin storage on real S3 — project deletion is catalog-first parallel DELETE plus a parallel LIST mop-up, not unlinked inodes."
 }
