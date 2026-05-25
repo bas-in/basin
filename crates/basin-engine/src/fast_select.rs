@@ -1267,19 +1267,34 @@ pub(crate) async fn execute_simple_select(
     // Flush the in-RAM tail before we look up the table's metadata so the
     // post-flush snapshot is used for catalog reads. Without this the catalog
     // reports zero data files (everything still in WAL).
-    if let Some(shard) = sess.engine.config().shard.as_ref() {
+    //
+    // Correctness: the `prefetched_meta` passed by the executor gate was
+    // loaded BEFORE `flush_to_parquet()` runs, so it reflects a snapshot
+    // that may have zero data files (all rows still in the shard tail).
+    // When the shard is configured we MUST reload after the flush so that
+    // the newly-committed Parquet files are visible to `live_data_files()`.
+    // When no shard is configured the pre-fetch is always current (writes go
+    // directly to storage + catalog synchronously) and can be reused as-is.
+    let meta = if let Some(shard) = sess.engine.config().shard.as_ref() {
         shard.flush_to_parquet().await?;
-    }
-    // Use the pre-fetched metadata when available (saves one catalog round-trip
-    // that the fast-path gate already paid). Fall back to loading when not.
-    let meta = match prefetched_meta {
-        Some(m) => m,
-        None => {
-            sess.engine
-                .config()
-                .catalog
-                .load_table(&sess.project, &plan.table)
-                .await?
+        // Reload after flush — the pre-fetched snapshot is now stale.
+        sess.engine
+            .config()
+            .catalog
+            .load_table(&sess.project, &plan.table)
+            .await?
+    } else {
+        // No shard: use the pre-fetched metadata when available (saves one
+        // catalog round-trip that the fast-path gate already paid).
+        match prefetched_meta {
+            Some(m) => m,
+            None => {
+                sess.engine
+                    .config()
+                    .catalog
+                    .load_table(&sess.project, &plan.table)
+                    .await?
+            }
         }
     };
 
@@ -1408,9 +1423,55 @@ pub(crate) async fn execute_simple_select(
     } else {
         None
     };
+    // Synthesise bounding-range predicates from IN-list predicates so the
+    // Parquet row-group pruner sees a compact `[min, max]` filter rather than
+    // nothing.  The actual IN-list re-check (`apply_in_list_filter` below)
+    // still runs as the correctness filter; the range is strictly a superset
+    // and is therefore safe.
+    //
+    // Why this helps: `ReadOptions.filters` is a `Vec<Predicate>` (no `In`
+    // variant).  When `in_list_preds` is non-empty and `predicates` is empty,
+    // the Parquet reader receives zero pushdown predicates and cannot prune any
+    // row-groups inside a file, even when every queried value falls inside a
+    // narrow range.  Converting `id IN (1,8,...,694)` into
+    // `Gt(id, 0) AND Lt(id, 695)` lets the per-file row-group stats pruner
+    // skip all row-groups whose [min,max] doesn't overlap [1,694].
+    //
+    // Correctness invariant: the range is a superset of the IN-list.  Any row
+    // that matches the IN-list also matches the range; a row that matches the
+    // range but not the IN-list is filtered out by `apply_in_list_filter`.
+    // There are NO false negatives.
+    //
+    // Scope: only Int64 scalars (the bench PK type).  Other scalar types
+    // (`Utf8`, `UInt64`) are skipped — string lex-range pruning is brittle for
+    // arbitrary IN-lists and the other types are uncommon for PK lookups.  A
+    // type we can't handle just produces no extra filter atoms, which is the
+    // same conservative behaviour as before this change.
+    let mut augmented_filters: Vec<Predicate> = plan.predicates.clone();
+    for (col, vals) in &plan.in_list_preds {
+        // Compute the tight [min, max] of Int64 scalars in this IN-list.
+        let mut min_v: Option<i64> = None;
+        let mut max_v: Option<i64> = None;
+        for v in vals {
+            if let ScalarValue::Int64(n) = v {
+                min_v = Some(match min_v { None => *n, Some(cur) => cur.min(*n) });
+                max_v = Some(match max_v { None => *n, Some(cur) => cur.max(*n) });
+            }
+        }
+        if let (Some(lo), Some(hi)) = (min_v, max_v) {
+            // Gt(col, lo-1) encodes `col >= lo`; Lt(col, hi+1) encodes `col <= hi`.
+            // Use checked arithmetic to avoid wrapping at i64 boundaries.
+            if let Some(lo_pred) = lo.checked_sub(1) {
+                augmented_filters.push(Predicate::Gt(col.clone(), ScalarValue::Int64(lo_pred)));
+            }
+            if let Some(hi_pred) = hi.checked_add(1) {
+                augmented_filters.push(Predicate::Lt(col.clone(), ScalarValue::Int64(hi_pred)));
+            }
+        }
+    }
     let opts = ReadOptions {
         projection: plan.read_cols.clone(),
-        filters: plan.predicates.clone(),
+        filters: augmented_filters,
         partition: None,
         limit: pushdown_limit,
         row_group_selection: None,
@@ -3133,6 +3194,24 @@ mod tests {
             match_simple_select(&stmt).is_none(),
             "NOT IN should fall through to DataFusion"
         );
+    }
+
+    #[test]
+    fn matches_100_element_in_list_with_multi_col_projection() {
+        // Exactly the bench shape: SELECT id, user_id, amount FROM events WHERE id IN (...)
+        // with 100 integer values.
+        let vals: String = (0..100i64).map(|k| (k * 7 + 1).to_string()).collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT id, user_id, amount FROM events WHERE id IN ({vals})");
+        let stmt = parse_one(&sql);
+        let plan = match_simple_select(&stmt).expect("100-element IN-list with multi-col projection must match fast path");
+        assert!(plan.predicates.is_empty(), "no Predicate atoms — only in_list_preds");
+        assert_eq!(plan.in_list_preds.len(), 1);
+        let (col, vals_out) = &plan.in_list_preds[0];
+        assert_eq!(col, "id");
+        assert_eq!(vals_out.len(), 100);
+        // Check projection has 3 columns.
+        let proj = plan.projection.as_ref().expect("must have projection");
+        assert_eq!(proj.len(), 3);
     }
 
     #[test]
