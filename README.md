@@ -139,7 +139,7 @@ near zero."*
 
 Long-form companion with code samples per piece: [`docs/batteries.md`](./docs/batteries.md). Fine-grained matrix: [`CAPABILITIES.md`](./CAPABILITIES.md).
 
-This is the *and-the-rest-of-the-stack-is-here* line. The structural primitive (project = bucket prefix, 165 KiB/conn) is the wedge; this is what closes the sale.
+This is the *and-the-rest-of-the-stack-is-here* line. The structural primitive (project = bucket prefix, 298 KiB/conn) is the wedge; this is what closes the sale.
 
 ---
 
@@ -186,7 +186,8 @@ for local development.
 BASIN_DATA_DIR=/tmp/basin cargo run -p basin-server
 ```
 
-That gives you pgwire on `127.0.0.1:5433`, durable WAL + Parquet under
+That gives you pgwire on `127.0.0.1:5433`, durable WAL + Vortex columnar
+files (the catalog default; Parquet is opt-in per-table) under
 `/tmp/basin/`, and a volatile in-memory catalog for fast local iteration.
 Set `BASIN_CATALOG=postgres://...` for restart-safe metadata.
 

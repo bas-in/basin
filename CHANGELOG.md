@@ -8,6 +8,40 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-05-25 — Selective-read pushdown + benchmark fairness
+
+### Engine — filter pushdown through the merge-on-read path
+- `TombstoneFilterExec` now implements DataFusion's physical filter-pushdown API
+  as a transparent passthrough (`gather_filters_for_pushdown` /
+  `handle_child_pushdown_result`). Tombstone suppression commutes with a row
+  filter, so a selective predicate is pushed through it into the cold
+  Vortex/Parquet scan. Previously the predicate was stuck above it and the cold
+  scan read every row — a selective `WHERE id < 100` on a table with DELETE
+  tombstones was a full-table scan. Root-cause fix for the JSONB-`->>`-at-1M
+  regression: `payload->>'k' WHERE id < 100` at 1M rows drops from ~45-88 ms to
+  ~1.5-2.8 ms (scan reads ~100 rows / 14 KB instead of 1 M rows / 144 MB).
+  Correctness pinned by `tombstone_filter_pushdown.rs` + the htap/overlay/delete
+  suites + the PG result oracle (`9d9e040`).
+- `HtapUnionTable` propagates filter pushdown to its cold child (delegates to the
+  cold provider, capped at `Inexact` since the union also merges the hot tier)
+  (`055b289`).
+- Promoted-column backfill sweep rewrites ALL cold files (not just the
+  compaction tail) so an auto-promoted JSONB shadow column is materialised
+  across the whole live file set; `backfill_promoted_columns` accepts
+  LargeBinary/Binary/Utf8/LargeUtf8 source columns (`1313e04`).
+- Parquet page-index `RowSelection` prunes within a surviving row group
+  (sub-row-group pruning for point/IN probes on Parquet tables) (`d3bda33`).
+
+### Benchmark harness — steady-state fairness
+- Small-sample suites now take a symmetric untimed warm-up before timing on
+  BOTH engines, and `median()` returns a true median (averages the two middle
+  values for even N) instead of the upper element. The prior combination
+  reported `max(cold_first_read, warm)` as "p50", surfacing Basin's one-time
+  cold-file open while Postgres's just-seeded data was hot in `shared_buffers`.
+  `large_in_list_100` at 1M reads its true warm latency (~1 ms) instead of a
+  ~23 ms cold artefact. The JSONB steady-state suite awaits the async
+  auto-promotion before sweeping so it can't lose the race (`1320d0a`).
+
 ## 2026-05-21 — Phase 6.X+ wave
 
 ### Phase 6.X — Lease-based ownership (ADR 0023)
