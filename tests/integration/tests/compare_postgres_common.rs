@@ -337,8 +337,24 @@ pub fn percentile(samples: &[f64], p: f64) -> f64 {
     s[idx.min(s.len() - 1)]
 }
 
+/// True median: for an even sample count, average the two middle values
+/// rather than returning the upper one. `percentile(50)` rounds the index up,
+/// so for `n == 2` it returns the LARGER sample (effectively a max) — which
+/// turned a cold-first-read + one warm sample into a "p50" dominated by the
+/// cold read. Averaging the two middle values is the standard median and makes
+/// the small-sample suites report a representative steady-state latency.
 pub fn median(samples: &[f64]) -> f64 {
-    percentile(samples, 50.0)
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let mut s = samples.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = s.len();
+    if n % 2 == 1 {
+        s[n / 2]
+    } else {
+        (s[n / 2 - 1] + s[n / 2]) / 2.0
+    }
 }
 
 /// RAII safety-net that drops the schema even on panic.
@@ -565,6 +581,17 @@ async fn basin_p50_try(
     sql: &str,
     n: usize,
 ) -> Option<f64> {
+    // Symmetric warm-up: one untimed execute before the timed window. The
+    // small-sample suites take only `samples_for(rows) == 2` samples at 1M,
+    // so without warm-up the FIRST sample pays Basin's one-time cold cost
+    // (Vortex footer fetch + first column-chunk decode, ~25ms on wide rows)
+    // while PG's just-seeded data is already hot in shared_buffers — an
+    // asymmetric, non-steady-state measurement. The `pg_p50_explain` side
+    // runs the identical untimed warm-up below. The one-time cold-open cost
+    // is measured separately and fairly by the `cold_start_first_query`
+    // shape; the per-shape p50 is meant to be steady-state. The core
+    // point/range suite already does the same two-pass warm-up.
+    let _ = basin_timed_try(sess, sql).await;
     let mut samples = Vec::with_capacity(n);
     for _ in 0..n {
         if let Some(ms) = basin_timed_try(sess, sql).await {
@@ -581,6 +608,13 @@ async fn basin_p50_try(
 /// if Postgres also fails (kept symmetric so the row gets a sentinel on
 /// both sides rather than a misleading "PG = 0").
 async fn pg_p50_explain(pg: &Client, sql_inner: &str, n: usize) -> Option<f64> {
+    // Symmetric warm-up to match `basin_p50_try` — one untimed EXPLAIN ANALYZE
+    // before the timed window. For PG this is usually a no-op (data is already
+    // hot in shared_buffers post-seed), but running it keeps the protocol
+    // identical on both sides.
+    let _ = pg
+        .simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {sql_inner}"))
+        .await;
     let mut samples = Vec::with_capacity(n);
     for _ in 0..n {
         let q = format!("EXPLAIN (ANALYZE, FORMAT TEXT) {sql_inner}");
@@ -1419,6 +1453,7 @@ async fn run_jsonb_suite(
     pg: &Client,
     sess: &basin_engine::ProjectSession,
     shard: &basin_shard::Shard,
+    catalog: &Arc<dyn Catalog>,
     schema: &str,
     rows: usize,
     project: basin_common::ProjectId,
@@ -1538,8 +1573,30 @@ async fn run_jsonb_suite(
     // is the only asymmetric action in the protocol, and it is fair because
     // it mirrors what any Basin deployment would do — background compaction
     // runs continuously.
-    let _ = shard.flush_to_parquet().await;
     if let Ok(events_table) = basin_common::TableName::new("events") {
+        // Await the async auto-promotion before sweeping. `observe_and_maybe_
+        // promote` fires `catalog.promote_jsonb_path` as a FIRE-AND-FORGET
+        // tokio task once a path crosses AUTO_PROMOTE_MIN_HITS; if the sweep
+        // runs before that task commits the path to the catalog, it finds no
+        // promoted paths, skips the backfill, and the "steady-state" query
+        // silently falls back to the per-row JSONB UDF (measured ~45ms at 1M
+        // instead of the ~1ms shadow-column read). A live deployment's
+        // promotion always completes — the table is queried continuously and
+        // the task commits within milliseconds — so polling the catalog until
+        // the path is registered measures the real steady state, not a race.
+        // Bounded so a genuine promotion failure can't hang the bench.
+        for _ in 0..40 {
+            let promoted = catalog
+                .load_table(&project, &events_table)
+                .await
+                .map(|m| !m.promoted_jsonb_paths.is_empty())
+                .unwrap_or(false);
+            if promoted {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let _ = shard.flush_to_parquet().await;
         let _ = shard
             .run_promoted_column_backfill_sweep(&project, &events_table)
             .await;
@@ -3718,7 +3775,16 @@ async fn run_full_compare_inner(
     // the whole card. Runs AFTER the extended suite so the JSONB writes (#37)
     // don't perturb earlier scan-based timings.
     // =======================================================================
-    let jb = run_jsonb_suite(&pg, &sess, &instance.shard, &schema, rows, instance.project).await;
+    let jb = run_jsonb_suite(
+        &pg,
+        &sess,
+        &instance.shard,
+        &instance.engine.config().catalog,
+        &schema,
+        rows,
+        instance.project,
+    )
+    .await;
 
     // =======================================================================
     // Robustness-breadth suite (#38-#62) — 25 probes across concurrency,
