@@ -1999,6 +1999,35 @@ impl datafusion::catalog::TableProvider for HtapUnionTable {
         let hot_plan = self.hot.scan(state, projection, filters, limit).await?;
         Ok(Arc::new(UnionExec::new(vec![cold_plan, hot_plan])))
     }
+
+    /// Offer the cold provider's filter-pushdown ability to DataFusion.
+    ///
+    /// Without this, the default `Unsupported` meant DataFusion handed
+    /// `scan()` an EMPTY filter slice — so the cold-tier (Vortex/Parquet)
+    /// scan pruned nothing and decoded every row. On any table with hot-tier
+    /// rows or an UPDATE/DELETE overlay (i.e. any mutated table — common in
+    /// the differential bench after bulk UPDATE/DELETE), a selective
+    /// `WHERE id < 100` therefore became a full-table scan.
+    ///
+    /// We delegate to the cold provider but never claim `Exact`: the union
+    /// also scans the hot-tier MemTable and applies the tombstone/UPDATE
+    /// overlay, so DataFusion must keep a `FilterExec` above to re-apply every
+    /// predicate authoritatively. `Inexact` lets the cold scan prune rows via
+    /// pushdown while preserving correctness on the merged output.
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&datafusion::logical_expr::Expr],
+    ) -> datafusion::error::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
+        use datafusion::logical_expr::TableProviderFilterPushDown as Pd;
+        let cold = self.cold.supports_filters_pushdown(filters)?;
+        Ok(cold
+            .into_iter()
+            .map(|p| match p {
+                Pd::Unsupported => Pd::Unsupported,
+                _ => Pd::Inexact,
+            })
+            .collect())
+    }
 }
 
 /// Inspect `sql` for tables with [`PartitionSpec::RangeMonthly`] and, if the
