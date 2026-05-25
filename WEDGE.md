@@ -38,10 +38,19 @@ and now ship as part of the open-source bundle (Phase 5.10 in
 pool, ADR 0007). All three are wired into `basin-server` behind opt-in
 env vars; defaults preserve the original PoC behaviour.
 
-**What's next, in priority order (engine / open-source repo only;
-hosted-cloud product lives in a separate repo):**
+> **PRIORITY UPDATE — 2026-05-25.** The technical critical path is complete
+> (HTAP hot tier, fastpaths default-on, JSONB `->>` selective-read pushdown
+> all shipped — see CHANGELOG 2026-05-25 and NEXT_WAVES.md). The binding
+> constraint is now **distribution / first reference customer**, not engine
+> work. So the live #1 is **Phase 0 customer interviews** (item #4 below) —
+> the engine phases (5.14/5.15/5.16) are largely shipped or deferred. The
+> ordered list below is retained as the engineering backlog; do not read its
+> numbering as current priority.
 
-1. **Phase 5.14 — Durable Basin moat (HTAP hot tier + catalog-driven optimization, IN FLIGHT).** Phase 5.14.A1-A4 (catalog blooms), 5.14.B3 (APPROX_COUNT_DISTINCT), 5.14.B4 (APPROX_PERCENTILE), 5.14.D3 (catalog-aware WindowExec sort elision) have shipped this session. Remaining: 5.14.B1-B2 (sketch fields in catalog + writer-side computation, so the APPROX UDFs can short-circuit instead of streaming), 5.14.C1-C6 (HTAP hot tier per [ADR 0016](./docs/decisions/0016-htap-hot-tier-architecture.md) — the 3-month architectural moat), 5.14.D1-D2 (adaptive write-time multi-sort + query history). Detailed sub-item decomposition in TASK.md Phase 5.14.
+**Engineering backlog (was "what's next, in priority order"; engine /
+open-source repo only; hosted-cloud product lives in a separate repo):**
+
+1. **Phase 5.14 — Durable Basin moat (HTAP hot tier + catalog-driven optimization — largely SHIPPED; HTAP hot tier landed per ADR 0016).** Phase 5.14.A1-A4 (catalog blooms), 5.14.B3 (APPROX_COUNT_DISTINCT), 5.14.B4 (APPROX_PERCENTILE), 5.14.D3 (catalog-aware WindowExec sort elision) have shipped this session. Remaining: 5.14.B1-B2 (sketch fields in catalog + writer-side computation, so the APPROX UDFs can short-circuit instead of streaming), 5.14.C1-C6 (HTAP hot tier per [ADR 0016](./docs/decisions/0016-htap-hot-tier-architecture.md) — the 3-month architectural moat), 5.14.D1-D2 (adaptive write-time multi-sort + query history). Detailed sub-item decomposition in TASK.md Phase 5.14.
 2. **Phase 5.16 — Query insights (per-shape stats, scale-regression detection).** Stats system to identify bad query paths commonly used at scale — both for customers (self-service "your slowest queries" view) and for Basin's own product roadmap evidence. OSS side ships plan-shape hashing + per-shape p50/p95/p99 histograms + scale-dependent regression tracking; cloud side ships ingest pipeline + UI + cross-customer anonymized aggregates. Closes the feedback loop on whether our perf commits actually pay off in production, not just in benchmark. Detailed 8-item decomposition in TASK.md Phase 5.16. Bridges OSS ↔ cloud — see [basin-cloud-roadmap.md](./docs/basin-cloud-roadmap.md) for the cloud-side companion items.
 3. **Phase 5.15 — Unified docs platform.** Each OSS repo (`basin`, future `basin-js`, future `basin-cli`) keeps its `docs/` as standard markdown with YAML frontmatter ([spec](./docs/frontmatter-spec.md)). `basin-cloud`'s webapp has `npm run dev:docs` which build-time-fetches each OSS repo and renders the union via Docusaurus or Mintlify. OSS side (5.15.A/B/C — frontmatter spec, migrate 24 existing docs, top-level index, CI gate) shipped in commit d5ffbe1; cloud side (5.15.E-I) deferred to the basin-cloud repo. Detailed 9-item decomposition in TASK.md Phase 5.15.
 4. **Phase 0 customer interviews** — strategic, not engineering. Architecture is done; what's missing is paying customers.

@@ -1,5 +1,15 @@
 # Basin — next-session handoff (2026-05-22)
 
+> **SUPERSEDED — 2026-05-25.** This 2026-05-22 handoff is stale (its §0
+> uncommitted-WIP and in-flight items are long resolved). Current state:
+> the technical critical path is **complete** — HTAP fastpaths default-on,
+> JSONB `->>` selective-read pushdown, and the perf wave all shipped (see
+> CHANGELOG 2026-05-25 and the STATUS banner atop `NEXT_WAVES.md`). The
+> live priority is **distribution / first reference customer** (Phase 0
+> interviews, `docs/customer-interview-script.md`), not engine work. Treat
+> the rest of this file as historical; regenerate it at the start of the
+> next working session.
+
 Hand this to a fresh chat. Full per-wave history is in `decisions.md` (newest at
 top); roadmap detail in `TASK.md`. Counts as of writing: **345 done / 62 open /
 9 partial** boxes in `TASK.md`.

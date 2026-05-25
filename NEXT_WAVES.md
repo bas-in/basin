@@ -6,8 +6,21 @@ Supabase, Neon). The current performance wave is tracked in `decisions.md`
 session logs and in-flight commits; this file is the **next-wave queue**
 that picks up after performance parity is the default.
 
-The current wave's focus is **performance**. Items below are queued for
-follow-up — none of them blocks shipping the perf work that's in flight.
+> **STATUS — 2026-05-25.** The performance wave is **done** and "Wave NOW"
+> below is **SHIPPED** (OLTP fastpaths default-on, HTAP overlay merge,
+> PK-keyed RowKey, JSONB `->>` selective-read pushdown — see CHANGELOG
+> 2026-05-25). The technical critical path is complete; the binding
+> constraint is no longer engineering, it is **distribution / first
+> reference customer**. Live priority is therefore **Phase 0 customer
+> interviews** (formerly buried at Wave N+3 #9 — now the top of the list;
+> use `docs/customer-interview-script.md`). The engine waves below
+> (N+1 … N+5, including the far-future accelerator wave) are **deferred**
+> until a dependent customer pulls a specific capability — do not start a
+> new engine wave ahead of a customer signal.
+
+The previous wave's focus was **performance** (now landed). Items below are
+queued for follow-up; most "Wave NOW" work already shipped (see the SHIPPED
+marker on that section).
 
 Rules:
 - Each item names a clear deliverable, a measurable acceptance bar, and
@@ -19,15 +32,21 @@ Rules:
 
 ---
 
-## Wave NOW — OLTP fastpaths default-on (the real load-bearing wave)
+## Wave NOW — OLTP fastpaths default-on (the real load-bearing wave) — ✅ SHIPPED (2026-05-25)
 
-This is the gate that unlocks the README rewrite, removes the
-"do-not-run-in-production / pre-alpha" caveat, and flips the OLTP
-customer conversation from "still in flight" to "shipped". Until these
-land, the env vars `BASIN_HOTTIER_DELETE_FASTPATH=1` and
-`BASIN_HOTTIER_UPDATE_FASTPATH=1` are opt-in by default because flipping
-them would produce wrong results on at least one read path. See
-`crates/basin-engine/src/dml_mutate.rs:637` for the in-code note.
+> **SHIPPED.** `hottier_fastpath_enabled` now defaults ON (`dml_mutate.rs`,
+> the `_ => true` arm); the `BASIN_HOTTIER_*` env vars are kill-switches,
+> not opt-ins. The HTAP overlay merge, PK-keyed RowKey, and the JSONB
+> `->>` selective-read pushdown all landed. The section below is retained
+> as the historical record of the wave; the `dml_mutate.rs:637` note it
+> references is itself stale.
+
+This was the gate that unlocked the README rewrite, removed the
+"do-not-run-in-production / pre-alpha" caveat, and flipped the OLTP
+customer conversation from "still in flight" to "shipped". When written,
+the env vars `BASIN_HOTTIER_DELETE_FASTPATH=1` and
+`BASIN_HOTTIER_UPDATE_FASTPATH=1` were opt-in because flipping
+them would produce wrong results on at least one read path.
 
 Current state (verified 2026-05-24 — the dml_mutate.rs:637 comment is
 partially stale; #1 below is already done, #2 is the load-bearing gap):

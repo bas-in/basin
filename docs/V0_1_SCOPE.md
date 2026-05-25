@@ -48,13 +48,13 @@ without a commit hash are not yet done.
 - [x] DELETE hot-tier route (env-gated, default OFF) — closes the
       single-row / bulk DELETE-WHERE-IN cliff (shipped: `87ef24b`,
       microbench 46.97 ms → 1.31 ms = 35.8× speedup).
-- [ ] DELETE hot-tier route **always-on** — gated on read-path tombstone
-      suppression (in flight as #88; `fast_select.rs:1167` +
-      `HtapUnionTable::scan` merge-on-read). Default
-      `BASIN_HOTTIER_DELETE_FASTPATH=1` once #88 lands.
-- [ ] UPDATE hot-tier route — closes the ~1500× single-row UPDATE gap
-      (prereq landed: `e2f73c5` constraint helper against memtable+cold
-      union; PR2 dispatch queued after #88).
+- [x] DELETE hot-tier route **always-on** — SHIPPED (2026-05-25).
+      `hottier_fastpath_enabled` defaults ON (the `BASIN_HOTTIER_*` env
+      vars are kill-switches now); read-path tombstone suppression landed
+      (`TombstoneFilterExec` + `HtapUnionTable::scan` merge-on-read, and
+      the filter-pushdown passthrough so selective reads still prune).
+- [x] UPDATE hot-tier route — SHIPPED (default-on via the same
+      `hottier_fastpath_enabled` gate; UPDATE overlay merge-on-read).
 - [ ] WAL `MutationKind::Delete` + `Update` records + replay (closes
       crash-safety gap surfaced in `decisions.md` 2026-05-23 DELETE
       hot-tier entry; today tombstones are lost on engine restart before
