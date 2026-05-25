@@ -35,6 +35,11 @@ use basin_hottier::{MemRowValue, MemTableRegistry, RowKey};
 use datafusion::common::Result as DFResult;
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::config::ConfigOptions;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::filter_pushdown::{
+    ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
+};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
     SendableRecordBatchStream,
@@ -281,6 +286,37 @@ impl ExecutionPlan for TombstoneFilterExec {
             self.pk_dt.clone(),
             Arc::clone(&self.tombstones),
         )))
+    }
+
+    // ── Physical filter pushdown (transparent passthrough) ───────────────────
+    //
+    // TombstoneFilterExec ONLY suppresses rows whose PK is tombstoned — it
+    // never adds or transforms rows. A row filter therefore commutes with the
+    // suppression: `filter(suppress(scan)) == suppress(filter(scan))`. So a
+    // predicate can be pushed transparently to the cold child scan (which can
+    // then prune via Vortex/Parquet pushdown) AND removed from above us.
+    //
+    // Without these two methods the default `all_unsupported` blocks pushdown:
+    // the `FilterExec` stays stuck above us and the cold scan reads EVERY row
+    // (a selective `WHERE id < 100` on a table with any DELETE tombstone became
+    // a full-table scan — the JSONB-at-1M regression). Mirrors the transparent
+    // passthrough that `CoalesceBatchesExec` uses.
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> DFResult<FilterDescription> {
+        FilterDescription::from_children(parent_filters, &self.children())
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        _phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> DFResult<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        Ok(FilterPushdownPropagation::if_all(child_pushdown_result))
     }
 
     fn execute(
@@ -763,20 +799,39 @@ impl datafusion::catalog::TableProvider for TombstoneFilteringTable {
         &self,
         filters: &[&datafusion::logical_expr::Expr],
     ) -> DFResult<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
-        // When tombstones are present we disable predicate pushdown into the
-        // cold scan. Otherwise the cold provider may evaluate predicates
-        // BEFORE the tombstone filter runs, and a row that satisfies the
-        // predicate but is tombstoned would leak through. Returning
-        // `Unsupported` keeps the filter ABOVE this provider's output in the
-        // plan tree, which runs AFTER our `TombstoneFilterExec`.
+        use datafusion::logical_expr::TableProviderFilterPushDown as Pd;
+        // When tombstones / UPDATE overrides are present, offer the cold
+        // provider's pushdown ability but cap it at `Inexact` (never `Exact`).
+        //
+        // Pushing the predicate into the cold scan only PRE-FILTERS the cold
+        // rows; it is still correct because:
+        //   * `TombstoneFilterExec` wraps the cold scan INSIDE this provider's
+        //     `scan()` output, so deleted rows are suppressed regardless of
+        //     pushdown — a tombstoned row that matches the predicate cannot
+        //     leak through.
+        //   * `UpdateOverlayExec` appends every override's post-SET row
+        //     UNCONDITIONALLY (see its `execute`: the tail is built from
+        //     `updates.values()`, not gated on the cold stream), so a row
+        //     updated to NEWLY match the predicate is never dropped by the
+        //     cold pre-filter.
+        //   * `Inexact` makes DataFusion keep a `FilterExec` ABOVE this
+        //     provider, which re-applies every predicate authoritatively after
+        //     the tombstone/overlay merge.
+        // The previous `Unsupported` was over-conservative: it handed the cold
+        // (Vortex/Parquet) scan zero filters, so a selective `WHERE id < 100`
+        // on a table with any DELETE/UPDATE overlay became a full-column scan.
         let registry = self.engine.memtable_registry();
         let tombs = snapshot_tombstones(registry.as_ref(), &self.project, &self.table);
         let updates = snapshot_updates(registry.as_ref(), &self.project, &self.table);
         if !tombs.is_empty() || !updates.is_empty() {
-            return Ok(vec![
-                datafusion::logical_expr::TableProviderFilterPushDown::Unsupported;
-                filters.len()
-            ]);
+            let cold = self.cold.supports_filters_pushdown(filters)?;
+            return Ok(cold
+                .into_iter()
+                .map(|p| match p {
+                    Pd::Unsupported => Pd::Unsupported,
+                    _ => Pd::Inexact,
+                })
+                .collect());
         }
         self.cold.supports_filters_pushdown(filters)
     }
