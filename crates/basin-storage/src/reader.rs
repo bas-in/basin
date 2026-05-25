@@ -11,11 +11,13 @@ use futures::stream::{BoxStream, StreamExt};
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::arrow::arrow_reader::{
-    ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions, RowFilter,
+    ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions, RowFilter, RowSelection,
+    RowSelector,
 };
 use parquet::arrow::async_reader::ParquetObjectReader;
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
-use parquet::file::metadata::RowGroupMetaData;
+use parquet::file::metadata::{PageIndexPolicy, RowGroupMetaData};
+use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use parquet::file::statistics::Statistics;
 
 use crate::data_file::{ColumnStats, DataFile};
@@ -837,11 +839,20 @@ async fn read_one(
     //
     // On miss we do the full HEAD + footer-fetch path and populate the
     // cache for next time.
+    //
+    // Page index (column min/max per data page) is loaded so that
+    // `finalize_pipeline` can build a `RowSelection` and skip data pages
+    // within a kept row group whose stats prove no predicate can match.
+    // This is the sub-row-group pruning tier that narrows the IN-list
+    // bounding-range from "one row group (~65k rows)" to "the few pages
+    // that actually hold the matching IDs".
+    let page_index_opts =
+        ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional);
     let (builder, file_size) = if let Some(cached) = meta_cache.get(&path) {
         let size = cached.size;
         let reader = ParquetObjectReader::new(store, path.clone()).with_file_size(size);
         let arrow_meta =
-            ArrowReaderMetadata::try_new(cached.meta, ArrowReaderOptions::default())
+            ArrowReaderMetadata::try_new(cached.meta, page_index_opts)
                 .map_err(|e| BasinError::storage(format!("rehydrate parquet meta {path}: {e}")))?;
         (
             ParquetRecordBatchStreamBuilder::new_with_metadata(reader, arrow_meta),
@@ -855,9 +866,12 @@ async fn read_one(
         let size = head.size;
         let mut reader = ParquetObjectReader::new(store, path.clone()).with_file_size(size);
         let arrow_meta =
-            ArrowReaderMetadata::load_async(&mut reader, ArrowReaderOptions::default())
-                .await
-                .map_err(|e| BasinError::storage(format!("open parquet {path}: {e}")))?;
+            ArrowReaderMetadata::load_async(
+                &mut reader,
+                ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional),
+            )
+            .await
+            .map_err(|e| BasinError::storage(format!("open parquet {path}: {e}")))?;
         meta_cache.insert(
             path.clone(),
             CachedParquetMeta {
@@ -1216,9 +1230,12 @@ async fn finalize_encrypted_stream(
         bytes: bytes::Bytes::from(plaintext),
     };
     let arrow_meta =
-        ArrowReaderMetadata::load_async(&mut bytes_reader, ArrowReaderOptions::default())
-            .await
-            .map_err(|e| BasinError::storage(format!("open encrypted parquet {path}: {e}")))?;
+        ArrowReaderMetadata::load_async(
+            &mut bytes_reader,
+            ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional),
+        )
+        .await
+        .map_err(|e| BasinError::storage(format!("open encrypted parquet {path}: {e}")))?;
 
     let builder = ParquetRecordBatchStreamBuilder::new_with_metadata(bytes_reader, arrow_meta);
     finalize_pipeline(
@@ -1231,6 +1248,278 @@ async fn finalize_encrypted_stream(
         catalog_schema,
     )
     .await
+}
+
+/// Build a Parquet [`RowSelection`] from per-page min/max stats (the column
+/// index) for the supplied list of surviving row groups.
+///
+/// For each kept row group we inspect the column index of a **single
+/// representative column** (the first predicate column that has a column
+/// index entry). For each data page in that row group we apply the same
+/// `Gt` / `Lt` / `Eq` logic used at row-group level: if the page's min/max
+/// stats prove no row can satisfy ANY of the supplied predicates we skip that
+/// page; otherwise we keep it. The result is a contiguous `RowSelection`
+/// spanning all kept row groups.
+///
+/// Predicate shapes handled at page granularity:
+/// * `Gt(col, v)` — skip page if `page_max <= v` (entire page is ≤ v, so
+///   no row satisfies `> v`).
+/// * `Lt(col, v)` — skip page if `page_min >= v` (entire page is ≥ v, so
+///   no row satisfies `< v`).
+/// * `Eq(col, v)` — skip page if `v < page_min || v > page_max`.
+///
+/// Predicate shapes NOT handled (`StartsWith`, `In`, multi-column conjuncts
+/// where the representative column isn't covered) fall through to keep-all
+/// pages, which is conservative and always correct — the per-row `RowFilter`
+/// re-checks every materialized row.
+///
+/// Returns `None` when:
+/// * `filters` is empty, or
+/// * no predicate column has a column index, or
+/// * the metadata has no column index (file written without page index).
+///
+/// In all `None` cases the caller should not call `with_row_selection` and
+/// the read proceeds as a full row-group scan (existing behaviour).
+fn build_page_row_selection(
+    metadata: &parquet::file::metadata::ParquetMetaData,
+    kept_row_groups: &[usize],
+    filters: &[Predicate],
+    arrow_schema: &SchemaRef,
+) -> Option<(RowSelection, u64)> {
+    if filters.is_empty() || kept_row_groups.is_empty() {
+        return None;
+    }
+
+    // Require both column index and offset index to be present.
+    let col_idx_all = metadata.column_index()?;
+    let off_idx_all = metadata.offset_index()?;
+
+    // Resolve (parquet-column-index, Predicate) pairs for range predicates only.
+    // We handle Gt / Lt / Eq; StartsWith falls through (keep all pages).
+    // We pick the FIRST predicate that has a column index in the file to drive
+    // page pruning. Using one column is conservative: if the column index for
+    // that column says "page can be skipped" we skip it; we never skip a page
+    // that might match another predicate. More predicates could be intersected
+    // (AND semantics) for a tighter prune, but one is enough for the IN-list
+    // range atoms (Gt(min-1) AND Lt(max+1) on the same pk column).
+    //
+    // For each filter find its parquet column position in the arrow schema.
+    let range_filters: Vec<(usize, &Predicate)> = filters
+        .iter()
+        .filter(|f| matches!(f, Predicate::Gt(..) | Predicate::Lt(..) | Predicate::Eq(..)))
+        .filter_map(|f| arrow_schema.index_of(f.column()).ok().map(|idx| (idx, f)))
+        .collect();
+
+    if range_filters.is_empty() {
+        return None;
+    }
+
+    let mut selectors: Vec<RowSelector> = Vec::new();
+    let mut total_selected: u64 = 0;
+    let mut any_page_pruned = false;
+
+    for &rg_idx in kept_row_groups {
+        // Get the offset index for this row group — it tells us the
+        // first_row_index of each data page per column.
+        let off_rg = match off_idx_all.get(rg_idx) {
+            Some(v) => v,
+            None => {
+                // No offset index for this row group — keep all rows.
+                let n_rows = metadata.row_group(rg_idx).num_rows() as usize;
+                total_selected += n_rows as u64;
+                selectors.push(RowSelector::select(n_rows));
+                continue;
+            }
+        };
+        let col_rg = match col_idx_all.get(rg_idx) {
+            Some(v) => v,
+            None => {
+                let n_rows = metadata.row_group(rg_idx).num_rows() as usize;
+                total_selected += n_rows as u64;
+                selectors.push(RowSelector::select(n_rows));
+                continue;
+            }
+        };
+
+        // Collect ALL (page_locations, col_index, predicate) triples that have
+        // usable page stats. A page is excluded when ANY predicate in this list
+        // proves no row can satisfy it (AND-conjunction semantics: excluding on
+        // one predicate is sufficient because all must hold simultaneously).
+        type PageTuple<'a> = (
+            &'a [parquet::file::page_index::offset_index::PageLocation],
+            &'a ColumnIndexMetaData,
+            &'a Predicate,
+        );
+        let mut active: Vec<PageTuple<'_>> = Vec::with_capacity(range_filters.len());
+        for &(col_idx, pred) in &range_filters {
+            let off_col = match off_rg.get(col_idx) {
+                Some(o) => o,
+                None => continue,
+            };
+            let col_col = match col_rg.get(col_idx) {
+                Some(c) => c,
+                None => continue,
+            };
+            if matches!(col_col, ColumnIndexMetaData::NONE) {
+                continue;
+            }
+            active.push((off_col.page_locations(), col_col, pred));
+        }
+
+        let rg_num_rows = metadata.row_group(rg_idx).num_rows() as usize;
+
+        if active.is_empty() {
+            // No usable page index for any predicate column in this row group.
+            total_selected += rg_num_rows as u64;
+            selectors.push(RowSelector::select(rg_num_rows));
+            continue;
+        }
+
+        // Use the page locations from the first active predicate's column for
+        // determining page boundaries (row count per page). All columns share the
+        // same page boundaries (same number of rows per data page) within a row
+        // group, so any column's offset index gives the correct row spans.
+        let page_locs = active[0].0;
+        let n_pages = page_locs.len();
+
+        if n_pages == 0 {
+            total_selected += rg_num_rows as u64;
+            selectors.push(RowSelector::select(rg_num_rows));
+            continue;
+        }
+
+        // Walk pages: compute each page's row span from first_row_index values.
+        for page_i in 0..n_pages {
+            let first_row = page_locs[page_i].first_row_index as usize;
+            let next_first_row = if page_i + 1 < n_pages {
+                page_locs[page_i + 1].first_row_index as usize
+            } else {
+                rg_num_rows
+            };
+            let page_rows = next_first_row - first_row;
+            if page_rows == 0 {
+                continue;
+            }
+
+            // A page is skipped when ANY predicate in the AND-conjunction can prove
+            // no row in this page could satisfy it. We check each (col_index, pred)
+            // pair; skipping is also safe for all-null pages (NULLs never match
+            // Eq/Gt/Lt against non-null literals).
+            let should_skip = active.iter().any(|(_, col_index, pred)| {
+                if col_index.is_null_page(page_i) {
+                    // Null-only page: no value can satisfy Eq/Gt/Lt against a
+                    // non-null literal. Safe to skip.
+                    true
+                } else {
+                    page_excluded_by_predicate(col_index, page_i, pred)
+                }
+            });
+
+            if should_skip {
+                any_page_pruned = true;
+                selectors.push(RowSelector::skip(page_rows));
+            } else {
+                total_selected += page_rows as u64;
+                selectors.push(RowSelector::select(page_rows));
+            }
+        }
+    }
+
+    if !any_page_pruned {
+        // No page was actually pruned — don't install a selection that
+        // would add overhead for zero benefit.
+        return None;
+    }
+
+    let selection = RowSelection::from(selectors);
+    Some((selection, total_selected))
+}
+
+/// Decide whether a single data page can be skipped for a given predicate,
+/// using the page-level column index min/max. Returns `true` (skip) only
+/// when the stats **prove** no row in the page can satisfy the predicate.
+/// Returns `false` (keep) on any uncertainty (missing stats, type mismatch,
+/// or overlap).
+///
+/// Correctness guarantee: a `true` result is only returned when the page's
+/// min > predicate-max or page's max < predicate-min for range predicates, or
+/// the literal is entirely outside [page_min, page_max] for Eq. Any `false`
+/// return is safe — it only means we decode the page unnecessarily, but never
+/// lose matching rows.
+fn page_excluded_by_predicate(
+    col_index: &ColumnIndexMetaData,
+    page_i: usize,
+    pred: &Predicate,
+) -> bool {
+    match (pred, col_index) {
+        // --- Int64 column vs Int64 scalar ---
+        (Predicate::Gt(_, ScalarValue::Int64(v)), ColumnIndexMetaData::INT64(idx)) => {
+            // Skip if page_max <= v (no value in page is > v).
+            idx.max_values().get(page_i).map_or(false, |max| *max <= *v)
+        }
+        (Predicate::Lt(_, ScalarValue::Int64(v)), ColumnIndexMetaData::INT64(idx)) => {
+            // Skip if page_min >= v (no value in page is < v).
+            idx.min_values().get(page_i).map_or(false, |min| *min >= *v)
+        }
+        (Predicate::Eq(_, ScalarValue::Int64(v)), ColumnIndexMetaData::INT64(idx)) => {
+            let min = idx.min_values().get(page_i).copied();
+            let max = idx.max_values().get(page_i).copied();
+            match (min, max) {
+                (Some(mn), Some(mx)) => *v < mn || *v > mx,
+                _ => false,
+            }
+        }
+        // --- Int32 column vs Int64 scalar (widen to i64) ---
+        (Predicate::Gt(_, ScalarValue::Int64(v)), ColumnIndexMetaData::INT32(idx)) => {
+            idx.max_values().get(page_i).map_or(false, |max| (*max as i64) <= *v)
+        }
+        (Predicate::Lt(_, ScalarValue::Int64(v)), ColumnIndexMetaData::INT32(idx)) => {
+            idx.min_values().get(page_i).map_or(false, |min| (*min as i64) >= *v)
+        }
+        (Predicate::Eq(_, ScalarValue::Int64(v)), ColumnIndexMetaData::INT32(idx)) => {
+            let min = idx.min_values().get(page_i).map(|x| *x as i64);
+            let max = idx.max_values().get(page_i).map(|x| *x as i64);
+            match (min, max) {
+                (Some(mn), Some(mx)) => *v < mn || *v > mx,
+                _ => false,
+            }
+        }
+        // --- Float64 column vs Float64 scalar ---
+        (Predicate::Gt(_, ScalarValue::Float64(v)), ColumnIndexMetaData::DOUBLE(idx)) => {
+            idx.max_values().get(page_i).map_or(false, |max| *max <= *v)
+        }
+        (Predicate::Lt(_, ScalarValue::Float64(v)), ColumnIndexMetaData::DOUBLE(idx)) => {
+            idx.min_values().get(page_i).map_or(false, |min| *min >= *v)
+        }
+        (Predicate::Eq(_, ScalarValue::Float64(v)), ColumnIndexMetaData::DOUBLE(idx)) => {
+            let min = idx.min_values().get(page_i).copied();
+            let max = idx.max_values().get(page_i).copied();
+            match (min, max) {
+                (Some(mn), Some(mx)) => *v < mn || *v > mx,
+                _ => false,
+            }
+        }
+        // --- Utf8 / ByteArray column vs Utf8 scalar (byte-lex order) ---
+        (Predicate::Gt(_, ScalarValue::Utf8(v)), ColumnIndexMetaData::BYTE_ARRAY(idx)) => {
+            let vb = v.as_bytes();
+            idx.max_value(page_i).map_or(false, |max| max <= vb)
+        }
+        (Predicate::Lt(_, ScalarValue::Utf8(v)), ColumnIndexMetaData::BYTE_ARRAY(idx)) => {
+            let vb = v.as_bytes();
+            idx.min_value(page_i).map_or(false, |min| min >= vb)
+        }
+        (Predicate::Eq(_, ScalarValue::Utf8(v)), ColumnIndexMetaData::BYTE_ARRAY(idx)) => {
+            let vb = v.as_bytes();
+            let min = idx.min_value(page_i);
+            let max = idx.max_value(page_i);
+            match (min, max) {
+                (Some(mn), Some(mx)) => vb < mn || vb > mx,
+                _ => false,
+            }
+        }
+        // All other type/predicate combinations: conservative keep.
+        _ => false,
+    }
 }
 
 /// Shared post-builder pipeline: projection mask, row-group stats
@@ -1407,7 +1696,27 @@ where
                 counters
                     .row_groups_scanned
                     .fetch_add(kept.len() as u64, Ordering::Relaxed);
+
+                // Build a page-level RowSelection for the surviving row groups
+                // using the column index (per-page min/max stats). This narrows
+                // decoding from "all ~65k rows in the kept row group" to only
+                // the data pages whose stats don't rule out a predicate match.
+                let page_selection = build_page_row_selection(
+                    builder.metadata(),
+                    &kept,
+                    &opts.filters,
+                    &arrow_schema,
+                );
+                if let Some((_, rows_sel)) = &page_selection {
+                    counters
+                        .rows_selected_by_page_index
+                        .fetch_add(*rows_sel, Ordering::Relaxed);
+                }
+
                 let mut builder = builder.with_row_groups(kept);
+                if let Some((sel, _)) = page_selection {
+                    builder = builder.with_row_selection(sel);
+                }
 
                 if !opts.filters.is_empty() {
                     let predicates =
@@ -1536,7 +1845,29 @@ where
     counters
         .row_groups_scanned
         .fetch_add(kept.len() as u64, Ordering::Relaxed);
+
+    // Build a page-level RowSelection for the surviving row groups using the
+    // column index (per-page min/max stats). This narrows decoding within each
+    // kept row group from all rows to only the data pages whose stats don't
+    // rule out a predicate match. Critical for IN-list queries: the
+    // bounding-range atoms (Gt(min-1), Lt(max+1)) synthesised by the engine
+    // target only a narrow band of pages in an otherwise large row group.
+    let page_selection = build_page_row_selection(
+        builder.metadata(),
+        &kept,
+        &opts.filters,
+        &arrow_schema,
+    );
+    if let Some((_, rows_sel)) = &page_selection {
+        counters
+            .rows_selected_by_page_index
+            .fetch_add(*rows_sel, Ordering::Relaxed);
+    }
+
     let mut builder = builder.with_row_groups(kept);
+    if let Some((sel, _)) = page_selection {
+        builder = builder.with_row_selection(sel);
+    }
 
     if !opts.filters.is_empty() {
         let predicates = build_row_filter(&opts.filters, &arrow_schema, &parquet_schema)?;

@@ -5715,6 +5715,11 @@ fn write_options_for(meta: &TableMetadata, in_tx: bool) -> WriteOptions {
         } else {
             basin_storage::EncodingMode::Best
         },
+        // Page-index sub-row-group pruning: keep the writer's default data
+        // page size (None). The Parquet writer now always emits per-page
+        // statistics (EnabledStatistics::Page) so the reader can build a
+        // RowSelection regardless of this knob.
+        data_pagesize_limit: None,
     }
 }
 

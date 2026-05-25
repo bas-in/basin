@@ -331,6 +331,9 @@ pub struct ReadCounters {
     pub row_groups_scanned: AtomicU64,
     pub row_groups_pruned_by_stats: AtomicU64,
     pub row_groups_pruned_by_bloom: AtomicU64,
+    /// Number of rows selected (not skipped) by the page-index RowSelection
+    /// within the surviving row groups. Zero when no page-index pruning fired.
+    pub rows_selected_by_page_index: AtomicU64,
 }
 
 impl ReadCounters {
@@ -340,6 +343,7 @@ impl ReadCounters {
             row_groups_scanned: self.row_groups_scanned.load(Ordering::Relaxed),
             row_groups_pruned_by_stats: self.row_groups_pruned_by_stats.load(Ordering::Relaxed),
             row_groups_pruned_by_bloom: self.row_groups_pruned_by_bloom.load(Ordering::Relaxed),
+            rows_selected_by_page_index: self.rows_selected_by_page_index.load(Ordering::Relaxed),
         }
     }
 
@@ -348,6 +352,7 @@ impl ReadCounters {
         self.row_groups_scanned.store(0, Ordering::Relaxed);
         self.row_groups_pruned_by_stats.store(0, Ordering::Relaxed);
         self.row_groups_pruned_by_bloom.store(0, Ordering::Relaxed);
+        self.rows_selected_by_page_index.store(0, Ordering::Relaxed);
     }
 }
 
@@ -358,6 +363,9 @@ pub struct ReadCountersSnapshot {
     pub row_groups_scanned: u64,
     pub row_groups_pruned_by_stats: u64,
     pub row_groups_pruned_by_bloom: u64,
+    /// Rows selected (kept) by the page-index RowSelection. Zero when no
+    /// page-level pruning fired (all pages kept or no page index present).
+    pub rows_selected_by_page_index: u64,
 }
 
 /// Default capacity for the Parquet footer cache. 1024 entries is a few MB

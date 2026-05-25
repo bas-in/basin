@@ -166,6 +166,11 @@ pub struct WriteOptions {
     /// the bulk-INSERT hot path. Ignored for [`FileFormat::Parquet`] (its
     /// ZSTD-1 path is already fast).
     pub encoding_mode: EncodingMode,
+    /// Override the Parquet data-page size limit in bytes. `None` keeps the
+    /// writer's built-in default (~1 MiB). Tests set this small to force many
+    /// data pages per row group so the page-index RowSelection pruning path is
+    /// observable. Production callers should leave this as `None`.
+    pub data_pagesize_limit: Option<usize>,
 }
 
 /// Vortex encode cascade selector (#92). Consumed by
@@ -553,12 +558,24 @@ fn encode_parquet(batch: &RecordBatch, opts: &WriteOptions) -> Result<Vec<u8>> {
         .map(|v| v as usize)
         .or(opts.max_row_group_size)
         .unwrap_or(DEFAULT_MAX_ROW_GROUP_SIZE);
+    // EnabledStatistics::Page writes both row-group-level (Chunk) stats AND
+    // per-page column/offset index. The column index gives per-page min/max
+    // values that the reader uses for sub-row-group RowSelection pruning —
+    // critical for IN-list queries where the bounding-range atoms can skip
+    // all but a few data pages in an otherwise large row group. The overhead
+    // is ~1 KB of footer data per row group per column, well below the ZSTD
+    // payload. This is the Parquet-format default; we previously overrode it
+    // to Chunk only to keep footer size down, but the pruning win dominates.
     let mut builder = WriterProperties::builder()
         .set_max_row_group_size(max_row_group_size)
-        .set_statistics_enabled(parquet::file::properties::EnabledStatistics::Chunk)
+        .set_statistics_enabled(parquet::file::properties::EnabledStatistics::Page)
         .set_compression(parquet::basic::Compression::ZSTD(
             parquet::basic::ZstdLevel::try_new(1).expect("ZSTD level 1 is valid"),
         ));
+
+    if let Some(limit) = opts.data_pagesize_limit {
+        builder = builder.set_data_page_size_limit(limit);
+    }
 
     // Bloom filters are configured per-column. We only enable them on
     // columns the caller asked for so the default (empty list) is
