@@ -53,11 +53,11 @@ window.__BASIN_RESULTS = {
       "metrics": [
         {
           "label": "Backup wall time",
-          "basin": 8.6166e-05,
-          "postgres": 0.191713667,
+          "basin": 0.000155084,
+          "postgres": 0.352560542,
           "unit": "s",
           "better": "basin",
-          "ratio_text": "pg / basin = 2225x"
+          "ratio_text": "pg / basin = 2273x"
         },
         {
           "label": "Backup byte size",
@@ -68,7 +68,7 @@ window.__BASIN_RESULTS = {
           "ratio_text": "pg / basin = 7216x"
         }
       ],
-      "generated_at": "@1779497669"
+      "generated_at": "@1779749923"
     },
     "compare_lifecycle_ops": {
       "kind": "compare",
@@ -79,22 +79,22 @@ window.__BASIN_RESULTS = {
       "metrics": [
         {
           "label": "Project deletion (1 project, 100K rows in 100 files; basin on S3)",
-          "basin": 11.887583,
-          "postgres": 3.744958,
+          "basin": 8.996542,
+          "postgres": 7.182208,
           "unit": "ms",
           "better": "postgres",
-          "ratio_text": "pg / basin = 0.32x"
+          "ratio_text": "pg / basin = 0.80x"
         },
         {
           "label": "ADD COLUMN on 100K rows",
-          "basin": 0.57625,
-          "postgres": 1.656709,
+          "basin": 0.361834,
+          "postgres": 1.660834,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 2.87x"
+          "ratio_text": "pg / basin = 4.59x"
         }
       ],
-      "generated_at": "@1779497674",
+      "generated_at": "@1779749925",
       "note": "Basin storage on real S3 \u2014 project deletion is catalog-first parallel DELETE plus a parallel LIST mop-up, not unlinked inodes."
     },
     "compare_postgres": {
@@ -106,29 +106,29 @@ window.__BASIN_RESULTS = {
       "metrics": [
         {
           "label": "On-disk bytes",
-          "basin": 0.0,
+          "basin": 99160.0,
           "postgres": 10149888.0,
           "unit": "bytes",
           "better": "basin",
-          "ratio_text": "pg / basin = 10149888.00x"
+          "ratio_text": "pg / basin = 102.36x"
         },
         {
           "label": "Point query p50",
-          "basin": 0.8182079999999999,
-          "postgres": 3.183,
+          "basin": 0.977625,
+          "postgres": 2.62,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 3.89x"
+          "ratio_text": "pg / basin = 2.68x"
         },
         {
           "label": "Insert 100K rows",
-          "basin": 1810.756458,
-          "postgres": 577.1541249999999,
+          "basin": 1695.904834,
+          "postgres": 294.691625,
           "unit": "ms",
           "better": "postgres"
         }
       ],
-      "generated_at": "@1779497679",
+      "generated_at": "@1779749929",
       "note": "Basin storage on real S3; PG on local 18. Insert path: WAL + shard with in-RAM WAL store."
     },
     "compare_server_lifecycle": {
@@ -140,37 +140,29 @@ window.__BASIN_RESULTS = {
       "metrics": [
         {
           "label": "Connection accept latency p50",
-          "basin": 0.6895,
-          "postgres": 1.227125,
+          "basin": 0.735792,
+          "postgres": 1.426334,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 1.78x"
+          "ratio_text": "pg / basin = 1.94x"
         },
         {
           "label": "Connections held under 1000-conn flood",
           "basin": 1000.0,
-          "postgres": 99.0,
+          "postgres": 100.0,
           "unit": "conns",
           "better": "basin",
-          "ratio_text": "basin / pg = 10.10x"
+          "ratio_text": "basin / pg = 10.00x"
         },
         {
           "label": "Refused conns under 1000-conn flood",
           "basin": 0.0,
-          "postgres": 901.0,
+          "postgres": 900.0,
           "unit": "conns",
           "better": "basin"
-        },
-        {
-          "label": "RSS per held-open connection",
-          "basin": 298.72,
-          "postgres": 7752.0,
-          "unit": "KiB",
-          "better": "basin",
-          "ratio_text": "pg / basin = 25.95x"
         }
       ],
-      "generated_at": "@1779497695"
+      "generated_at": "@1779749942"
     },
     "scaling_compute_shards": {
       "kind": "scaling",
@@ -257,39 +249,39 @@ window.__BASIN_RESULTS = {
       "rows": [
         {
           "concurrency": 1,
-          "median_latency_us": 29274.0,
-          "per_task_qps": 31.333333333333332,
-          "total_qps": 31.333333333333332
+          "median_latency_us": 27757.0,
+          "per_task_qps": 36.0,
+          "total_qps": 36.0
         },
         {
           "concurrency": 4,
-          "median_latency_us": 1877.0,
-          "per_task_qps": 29.583333333333332,
-          "total_qps": 118.33333333333333
+          "median_latency_us": 1718.0,
+          "per_task_qps": 41.166666666666664,
+          "total_qps": 164.66666666666666
         },
         {
           "concurrency": 16,
-          "median_latency_us": 2106.0,
-          "per_task_qps": 14.916666666666666,
-          "total_qps": 238.66666666666666
+          "median_latency_us": 3863.0,
+          "per_task_qps": 21.833333333333332,
+          "total_qps": 349.3333333333333
         },
         {
           "concurrency": 64,
-          "median_latency_us": 212352.0,
-          "per_task_qps": 3.546875,
-          "total_qps": 227.0
+          "median_latency_us": 154264.0,
+          "per_task_qps": 4.484375,
+          "total_qps": 287.0
         }
       ],
       "primary": {
         "label": "peak speed-up vs C=1",
-        "value": 7.617021276595745,
+        "value": 9.703703703703702,
         "unit": "x",
         "bar": {
           "op": "greater_than_or_equal",
           "value": 3.5
         }
       },
-      "generated_at": "@1779497662"
+      "generated_at": "@1779749956"
     },
     "scaling_data_size": {
       "kind": "scaling",
@@ -386,40 +378,40 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "per_project_kib": 0.8,
+          "per_project_kib": 0.16,
           "projects": 100,
-          "provision_ms": 0.166,
-          "rss_delta_kib": 80
+          "provision_ms": 0.162958,
+          "rss_delta_kib": 16
         },
         {
-          "per_project_kib": 1.904,
+          "per_project_kib": 1.984,
           "projects": 1000,
-          "provision_ms": 1.571208,
-          "rss_delta_kib": 1904
+          "provision_ms": 1.5234580000000002,
+          "rss_delta_kib": 1984
         },
         {
-          "per_project_kib": 1.7248,
+          "per_project_kib": 1.7792,
           "projects": 5000,
-          "provision_ms": 8.162667,
-          "rss_delta_kib": 8624
+          "provision_ms": 7.494,
+          "rss_delta_kib": 8896
         },
         {
-          "per_project_kib": 2.1168,
+          "per_project_kib": 2.144,
           "projects": 10000,
-          "provision_ms": 19.212540999999998,
-          "rss_delta_kib": 21168
+          "provision_ms": 17.157875,
+          "rss_delta_kib": 21440
         }
       ],
       "primary": {
         "label": "max per_project_kib across scales",
-        "value": 2.1168,
+        "value": 2.144,
         "unit": "KiB",
         "bar": {
           "op": "less_than",
           "value": 5.0
         }
       },
-      "generated_at": "@1779497668"
+      "generated_at": "@1779749957"
     },
     "scaling_noisy_neighbor": {
       "kind": "scaling",
