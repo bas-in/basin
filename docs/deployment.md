@@ -37,10 +37,11 @@ basin-server is a single process. To deploy it you set:
 | Var | Purpose |
 |---|---|
 | `BASIN_BIND` | pgwire listener, e.g. `0.0.0.0:5433` |
-| `BASIN_DATA_DIR` | Parquet + catalog directory (durable volume) |
+| `BASIN_DATA_DIR` | Vortex (default) / Parquet data + catalog directory (durable volume) |
 | `BASIN_WAL_DIR` | WAL directory (durable volume, ideally NVMe) |
-| `BASIN_PROJECTS` | Static project list, e.g. `acme=*,beta=*`. basin-auth's reserved entry `basin_auth=<reserved-ulid>` is auto-injected, so operators do not list it. |
-| `BASIN_AUTH_ENABLED=1` | Enables the auth subsystem (signup, JWT, refresh). Auth state lives in the embedded catalog over the loopback pgwire — no separate database. SMTP vars from [ADR 0005](./decisions/0005-auth-system.md) become required when this is on. |
+| `BASIN_PROJECTS` | Static project list, e.g. `acme=*,beta=*`. |
+| `BASIN_AUTH_ENABLED=1` | Enables the auth subsystem (signup, JWT, refresh). Per [ADR 0013](./decisions/0013-auth-per-project-schema.md), auth state lives in each project's own storage under the `basin_auth` schema prefix and is reached in-process (`EngineAuthStore` over `ProjectSession`) — no loopback pgwire connection, no reserved internal project, no separate database. SMTP vars from [ADR 0005](./decisions/0005-auth-system.md) become required when this is on. |
+| `BASIN_AUTH_CATALOG_DSN` | Optional escape hatch (ADR 0013): point auth state at an external pgwire-speaking Postgres for separate blast radius. Unset = the default in-process per-project-schema path. |
 
 That is the full required surface for a single-region deploy. No external
 Postgres, no external catalog service. See `BASIN_BIND` / `BASIN_DATA_DIR`
@@ -136,7 +137,7 @@ Per-region resource shape, rough sizing for the first 1k–10k projects:
 | Router | Fly Performance 1× × 2 (HA) | ~$30/mo. Stateless; scales linearly with connection count. |
 | Shard owners | Fly Performance 4× × 2 | ~$240/mo. Each handles ~5k projects' working set. Add more as project count grows. |
 | Object store bucket | regional, public-bucket-disabled | Tigris: ~$0.02/GB + $0.01/GB egress (Fly-internal is free). AWS S3: $0.023/GB + $0.09/GB egress. |
-| Catalog backend | none — embedded | Catalog state (project list, table schemas, snapshot manifests, file refs, plus `basin-auth`'s `auth.users` / `auth.refresh_tokens`) lives in the engine's own pgwire loopback, durable on the WAL volume. ~50 MB per 10k projects. No external Postgres to provision. |
+| Catalog backend | none — embedded | Catalog state (project list, table schemas, snapshot manifests, file refs) lives in the embedded catalog, durable on the WAL volume. Auth state (`basin_auth_users` / `basin_auth_refresh_tokens` / …) lives in each project's own storage under the `basin_auth` schema and is reached in-process (ADR 0013) — no loopback, no external Postgres to provision. ~50 MB per 10k projects. |
 | Optional: NVMe disk cache | Fly volume, 50 GB | Phase 5.7-A1 cache. ~$5/mo. Cuts cold S3 fetches from ~50 ms → ~100 µs. |
 
 **Total cost for one region with 10k projects × 100 MB each, mostly cached:** ~$300–500/month all-in.
@@ -248,10 +249,13 @@ This mirrors what Snowflake and BigQuery do. Supabase / Neon's per-project prici
 
 ## Optional: external auth catalog
 
-By default `basin-auth` stores `auth.users`, `auth.refresh_tokens`, and
-`auth.email_tokens` in the same engine catalog as application tables, over
-the loopback pgwire. One process, one durability domain, one backup target.
-That is the recommended shape for ≥ 99% of self-hosted deploys.
+By default (ADR 0013) `basin-auth` stores `basin_auth_users`,
+`basin_auth_refresh_tokens`, and `basin_auth_email_tokens` in each project's
+own storage under the `basin_auth` schema prefix, reached in-process via
+`EngineAuthStore` over a `ProjectSession` — no loopback pgwire hop. One
+process, one durability domain, one backup target. That is the recommended
+shape for ≥ 99% of self-hosted deploys. Set `BASIN_AUTH_CATALOG_DSN` to
+route auth state at an external Postgres instead (the escape hatch below).
 
 Some operators prefer to keep identity tables on a separate OLTP store:
 durability isolation (a Basin engine crash that loses uncompacted WAL is
@@ -282,11 +286,11 @@ catalog matures; it is not the default.
 
 ## Resetting basin-auth state
 
-Because basin-auth's tables live inside the engine catalog (the loopback
-shape described above), wiping them does not require destroying the WAL or
-the application data tables — it is just a series of `DROP TABLE`s scoped
-to the `basin_auth_*` namespace. The `basinctl reset-auth` command bundles
-that into one safe call.
+Because basin-auth's tables live in the project's own `basin_auth` schema
+(the in-process shape described above), wiping them does not require
+destroying the WAL or the application data tables — it is just a series of
+`DROP TABLE`s scoped to the `basin_auth_*` namespace. The
+`basinctl reset-auth` command bundles that into one safe call.
 
 **When to use it**
 
@@ -308,15 +312,14 @@ basinctl reset-auth --yes
 # every customer out of the pgwire endpoint until creds are re-issued.
 basinctl reset-auth --yes --include-project-creds
 
-# Point at a non-default engine endpoint.
+# External-auth-catalog deploys (BASIN_AUTH_CATALOG_DSN set): point at it.
 basinctl reset-auth --yes \
-  --engine-url postgres://basin_auth:basin_auth@10.0.0.7:5433/basin?sslmode=disable
+  --engine-url postgres://user:pass@10.0.0.7:5432/basin?sslmode=disable
 ```
 
-The command refuses to run without `--yes`. It connects as the reserved
-`basin_auth` user (whose creds the static resolver maps via the
-auto-injected reserved project) and runs `DROP TABLE IF EXISTS` for each
-`basin_auth_*` table in child-before-parent order. By default the
+The command refuses to run without `--yes`. It runs `DROP TABLE IF EXISTS`
+for each `basin_auth_*` table in the project's `basin_auth` schema in
+child-before-parent order. By default the
 per-project pgwire-credentials table (`basin_auth_auth_project_credentials`)
 is left intact — pass `--include-project-creds` to drop it as well.
 
@@ -326,8 +329,8 @@ is left intact — pass `--include-project-creds` to drop it as well.
   `basin_auth_*` namespace are affected.
 - WAL segments, Iceberg snapshots, object-store buckets — there is no object-store
   cleanup involved.
-- The reserved `basin_auth` project entry on the router — that is
-  auto-injected on every start.
+- Application project entries on the router — auth tables are rebootstrapped
+  in each project's `basin_auth` schema on next start (ADR 0013).
 
 **After running**
 
