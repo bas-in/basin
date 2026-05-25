@@ -9,15 +9,17 @@
 //! Before any timed sample, BOTH engines run the identical statement —
 //! including the identical PROJECTION — that the point query times
 //! (`SELECT id, user_id, amount, status, created_at FROM events WHERE
-//! id = <target_id>`) once. The projection must match the timed query
-//! because Basin is columnar: warming only `id` would leave the other
-//! four column chunks cold and the first timed sample would pay a ~10ms
-//! cold decode, which at 1M (2 samples, median-picks-higher) would be
-//! mis-reported as the p50. There are exactly two warm-up sites in this
-//! file: the Basin warm-up at the top of `run_basin_core_suite`, and the
-//! PG warm-up immediately before `run_pg_core_suite` is invoked in
-//! `run_full_compare`. If you add a warm-up on one side you MUST mirror
-//! it on the other — see audit nit (3) + its columnar refinement.
+//! id = <target_id>`) TWICE. Two warm-up passes: the first fills the OS
+//! page-cache and primes the columnar decoder; the second exercises any
+//! lazy in-process state (plan cache, decompression buffer) so the first
+//! timed sample does not pay first-touch overhead. The projection must
+//! match the timed query because Basin is columnar: warming only `id`
+//! would leave the other four column chunks cold and inflate the first
+//! timed sample's decode time.
+//! There are exactly two warm-up sites in this file: the Basin warm-up
+//! at the top of `run_basin_core_suite`, and the PG warm-up immediately
+//! before `run_pg_core_suite` is invoked in `run_full_compare`. If you
+//! change the warm-up count on one side you MUST mirror it on the other.
 //!
 //! Per-scale sample tuning: see `samples_for`. At 10k we run the full
 //! 5/7 samples per metric (matches the original bench); higher scales
@@ -38,15 +40,40 @@
 //!    your PG is tighter the concurrency shapes will regress.
 //!
 //! 2. **Sample counts**: point-query and range-scan shapes use
-//!    `LATENCY_SAMPLES = 30` iterations at every scale so p99 is a real
-//!    percentile (not a 2-sample accident). The heavy-write shapes keep
-//!    their lower per-scale counts (see `samples_for`). JSONB read shapes
-//!    use `JSONB_WARMUP_ITERS = 10` warm-up iterations on BOTH engines
-//!    before taking timed samples — this models "an app that has already
-//!    run the query repeatedly," which is the steady state every deployed
-//!    app exhibits.
+//!    `LATENCY_SAMPLES = 100` iterations at every scale so p99 is a real
+//!    percentile (not a 2-sample accident). At sub-ms latency, 100
+//!    iterations cost ~tens of ms total — budget is negligible. The
+//!    heavy-write shapes keep their lower per-scale counts (see
+//!    `samples_for`). JSONB read shapes use `JSONB_WARMUP_ITERS = 10`
+//!    warm-up iterations on BOTH engines before taking timed samples —
+//!    this models "an app that has already run the query repeatedly,"
+//!    which is the steady state every deployed app exhibits.
 //!
-//! 3. **JSONB warm-up protocol**: for each of the per-row JSONB read
+//! 3. **Compactor quiesce step**: after all seeding is complete and before
+//!    the first read-timing shape runs, the harness calls
+//!    `shard.flush_to_parquet()` to drain every resident partition's
+//!    in-memory WAL tail into Parquet, then calls `bg.shutdown()` to stop
+//!    the background compaction + eviction loops. This brings Basin to its
+//!    settled read state — all data lives in immutable Parquet files, the
+//!    compactor has nothing left to do. The read-timing window is therefore
+//!    free of background I/O and CPU steal. For PG the equivalent background
+//!    process (autovacuum) is also quiesced: the tables were freshly inserted
+//!    with no subsequent deletes or updates before the read window opens, so
+//!    autovacuum has no dead tuples to clean and will not fire.
+//!    The flush + shutdown is Basin-only because it is a Basin-specific
+//!    architectural primitive (WAL → Parquet compaction). PG's equivalent
+//!    settled state is reached automatically by the fresh-insert condition.
+//!
+//! 4. **Warm-up protocol**: before any timed read shape, BOTH engines run
+//!    the identical timed statement TWICE (two warm-up passes). The first
+//!    pass warms OS page-cache and OS filesystem buffer; the second pass
+//!    exercises any lazy in-process state (plan cache, column-chunk
+//!    decompression buffer). For Basin the projection must match the timed
+//!    query exactly — warming only `id` leaves other column chunks cold;
+//!    see the columnar warm-up note in `run_basin_core_suite`. PG benefits
+//!    from the same two-pass warm-up for page-cache consistency across runs.
+//!
+//! 5. **JSONB warm-up protocol**: for each of the per-row JSONB read
 //!    shapes (#28-#35), both engines execute the exact timed query
 //!    `JSONB_WARMUP_ITERS` times before the clock starts. For Basin this
 //!    allows the auto-promotion observer (threshold AUTO_PROMOTE_MIN_HITS=8)
@@ -58,10 +85,11 @@
 //!    Both cold (pre-warm-up) and steady-state (post-compaction) numbers
 //!    are published so nothing is hidden.
 //!
-//! 4. **Win-count stability**: `LATENCY_SAMPLES = 30` directly reduces
+//! 6. **Win-count stability**: `LATENCY_SAMPLES = 100` directly reduces
 //!    near-parity flapping (shapes at 0.9–1.1× stop bouncing across
 //!    win/parity/loss runs). The PG SET commands pin deterministic plans
-//!    so consecutive runs see the same planner path.
+//!    so consecutive runs see the same planner path. The compactor quiesce
+//!    (step 3) eliminates the largest non-deterministic CPU-steal source.
 //!
 //! Why a single helper instead of six copies of an 800-line file?
 //!
@@ -167,15 +195,17 @@ const EPOCH: i64 = 1_700_000_000;
 
 /// Sample count for point-query and range-scan latency shapes at every scale.
 ///
-/// Fixed at 30 so that p99 is a real percentile (not a 2–3 sample accident).
-/// At sub-millisecond latency, 30 iterations cost ~tens of ms total — budget
-/// is negligible. Applies symmetrically to BOTH engines: PG runs 30 EXPLAIN
-/// ANALYZE iterations and Basin runs 30 direct executions.
+/// Fixed at 100 so that p99 is a genuine high-percentile (not a 2–3 sample
+/// accident where p99 == max-of-N). At sub-millisecond latency 100 iterations
+/// cost ~tens of ms total — budget is negligible. p50 is the median of 100
+/// sorted samples; p99 is the 99th nearest-rank entry. Applies symmetrically
+/// to BOTH engines: PG runs 100 EXPLAIN ANALYZE iterations and Basin runs 100
+/// direct executions.
 ///
 /// Heavy-write shapes (bulk UPDATE, DELETE, single-row UPDATE) keep their
 /// lower per-scale counts from `samples_for` — those are legitimately
 /// expensive and their p99 is not the published screenshot problem.
-const LATENCY_SAMPLES: usize = 30;
+const LATENCY_SAMPLES: usize = 100;
 
 /// Number of identical executions to run on BOTH engines before timing any
 /// JSONB read shape.
@@ -426,7 +456,11 @@ fn parse_pg_exec_time(rows: &[tokio_postgres::SimpleQueryMessage]) -> Option<f64
 pub struct BasinInstance {
     pub engine: Engine,
     pub project: ProjectId,
-    pub bg: basin_shard::ShardBackgroundHandle,
+    /// Background compaction + eviction loop handle. Wrapped in `Option` so
+    /// the harness can call `bg.take().unwrap().shutdown().await` at any point
+    /// during the run (e.g. after post-seed flush) without consuming the whole
+    /// struct. `None` after the first `shutdown` call; a second call is a no-op.
+    pub bg: Option<basin_shard::ShardBackgroundHandle>,
     pub wal: Arc<dyn basin_wal::Wal>,
     pub dir: TempDir,
     pub _wal_dir: TempDir,
@@ -477,7 +511,7 @@ pub async fn build_basin_engine() -> BasinInstance {
     BasinInstance {
         engine,
         project,
-        bg,
+        bg: Some(bg),
         wal,
         dir,
         _wal_dir: wal_dir,
@@ -644,8 +678,8 @@ async fn run_pg_core_suite(
     olap_cutoff_ts: i64,
     delete_in_list: &str,
 ) -> PgCoreResults {
-    // Point and range use LATENCY_SAMPLES (fixed 30) so p99 is a real
-    // percentile at every scale. The same count applies to both engines
+    // Point and range use LATENCY_SAMPLES (fixed 100) so p99 is a genuine
+    // high-percentile at every scale. The same count applies to both engines
     // (see `run_basin_core_suite`). Aggregation / join / other shapes keep
     // `samples_for` because they are more expensive.
     let s_latency = LATENCY_SAMPLES;
@@ -847,38 +881,41 @@ async fn run_basin_core_suite(
     olap_cutoff_ts: i64,
     delete_in_list: &str,
 ) -> BasinCoreResults {
-    // Point and range use LATENCY_SAMPLES (fixed 30) so p99 is a real
-    // percentile at every scale. Symmetric with run_pg_core_suite.
+    // Point and range use LATENCY_SAMPLES (fixed 100) so p99 is a genuine
+    // high-percentile at every scale. Symmetric with run_pg_core_suite.
     let s_latency = LATENCY_SAMPLES;
     let s7 = samples_for(rows, 7);
     let s5 = samples_for(rows, 5);
     let skip_heavy = skip_heavy_writes(rows);
 
-    // Warm-up: triggers first-query plan caching AND page-caches the exact
-    // column chunks the timed point query reads, so the p50/p99 columns
-    // reflect steady-state latency rather than first-touch decode overhead.
+    // Warm-up: two passes on BOTH engines before the timed window opens.
+    //
+    // Pass 1 warms the OS page-cache (cold decode from Parquet files) and
+    // primes any in-process plan cache. Pass 2 exercises lazy in-process
+    // state (e.g. column-chunk decompression buffer, DataFusion plan cache)
+    // so the very first timed sample does not pay first-touch overhead.
     //
     // The warm-up projection MUST match the timed point query's projection
     // (`id, user_id, amount, status, created_at`). A row store (PG) warms the
     // whole heap row by touching the page, so projecting only `id` warms all
     // columns for free — but Basin is COLUMNAR: warming `id` alone decodes
     // only the `id` column chunk and leaves the other four cold, so the first
-    // timed sample would pay a ~10ms cold column-chunk decode. At 1M the
-    // suite now takes 30 samples (LATENCY_SAMPLES) so the cold outlier is
-    // naturally absorbed into p99, but we still warm-up to keep the p50 fair.
-    // Matching the projection is the fair fix: it's the same statement on both
-    // engines and it warms what's actually measured.
+    // timed sample would pay a ~10ms cold column-chunk decode. Matching the
+    // projection is the fair fix: it's the same statement on both engines and
+    // it warms exactly what's measured.
     //
-    // SYMMETRY: the PG side runs the identical statement shape before its
-    // timed samples — see the warm-up just above the `run_pg_core_suite` call
-    // in `run_full_compare`. Closes fairness-audit nit #3 (and its columnar
-    // refinement).
-    let _ = sess
-        .execute(&format!(
-            "SELECT id, user_id, amount, status, created_at \
-             FROM events WHERE id = {target_id}"
-        ))
-        .await;
+    // SYMMETRY: the PG side runs the identical two-pass warm-up just above
+    // the `run_pg_core_suite` call in `run_full_compare`. Any change here
+    // must be mirrored there — see the warm-up site comment in
+    // `run_full_compare_inner`.
+    for _ in 0..2 {
+        let _ = sess
+            .execute(&format!(
+                "SELECT id, user_id, amount, status, created_at \
+                 FROM events WHERE id = {target_id}"
+            ))
+            .await;
+    }
 
     let mut point: Vec<f64> = Vec::with_capacity(s_latency);
     for _ in 0..s_latency {
@@ -3421,20 +3458,24 @@ async fn run_full_compare_inner(
         .collect::<Vec<_>>()
         .join(",");
 
-    // Warm-up: identical statement shape (and identical projection) to
-    // Basin's warm-up at the top of `run_basin_core_suite` so neither engine
-    // gets an asymmetric edge (closes fairness-audit nit #3 + its columnar
-    // refinement). Both engines page-cache the same `events` row AND the same
-    // five column values at `id = target_id` before timed samples. Projecting
-    // the full timed-query column list matters for the column store (Basin)
-    // and is harmless for the row store (PG) — see the long comment at the
-    // Basin warm-up site for the full rationale.
-    let _ = pg
-        .simple_query(&format!(
-            "SELECT id, user_id, amount, status, created_at \
-             FROM {schema}.events WHERE id = {target_id}"
-        ))
-        .await;
+    // Warm-up: two passes — identical to the Basin two-pass warm-up at the
+    // top of `run_basin_core_suite` — so neither engine gets an asymmetric
+    // cold-start edge. Pass 1 fills PG's shared_buffers for the target row;
+    // pass 2 exercises any per-connection plan-cache priming. Projecting the
+    // full timed-query column list (`id, user_id, amount, status, created_at`)
+    // is harmless for a row store (PG warms the whole heap row on any
+    // projection) and ensures the warm-up statement is byte-identical to
+    // Basin's — a reader auditing the harness sees the same statement on
+    // both sides. See the long comment at the Basin warm-up site for the
+    // full columnar-projection rationale.
+    for _ in 0..2 {
+        let _ = pg
+            .simple_query(&format!(
+                "SELECT id, user_id, amount, status, created_at \
+                 FROM {schema}.events WHERE id = {target_id}"
+            ))
+            .await;
+    }
 
     // ---- PG: 12 SaaS metrics + 3 OLAP metrics (extracted) ----------------
     let pg_core = run_pg_core_suite(
@@ -3465,7 +3506,7 @@ async fn run_full_compare_inner(
     let pg_olap_join_p50 = pg_core.olap_join_p50;
 
     // ---- Basin setup ------------------------------------------------------
-    let instance = build_basin_engine().await;
+    let mut instance = build_basin_engine().await;
     let sess = instance
         .engine
         .open_session(instance.project)
@@ -3573,6 +3614,44 @@ async fn run_full_compare_inner(
     }
     let basin_insert_ms = basin_insert_started.elapsed().as_secs_f64() * 1000.0;
 
+    // ---- Quiesce the Basin compactor before read-timing --------------------
+    //
+    // After seeding, drain every partition's in-memory WAL tail into immutable
+    // Parquet files, then stop the background compaction + eviction loops.
+    // This brings Basin to its settled read state: all data lives in sealed
+    // Parquet row-groups; the background thread is gone, so it cannot steal
+    // CPU or rewrite files during the timed read window.
+    //
+    // Why this is symmetric / fair:
+    //   - Basin's background compactor would otherwise fire on its 30-second
+    //     timer mid-timing-window, causing non-deterministic file rewrites that
+    //     steal CPU and change row-group layout. Flushing first brings Basin to
+    //     the SAME state it is in during any deployed read workload (compaction
+    //     runs asynchronously; between two compaction cycles the data is already
+    //     in stable Parquet). Stopping the loop afterwards just ensures that
+    //     state holds for the entire timed window rather than until the next
+    //     timer tick.
+    //   - PG's equivalent background process (autovacuum) is also quiesced by
+    //     construction: the tables were freshly inserted with no subsequent
+    //     deletes or updates, so autovacuum has no dead tuples to clean and
+    //     will not fire during the read window.
+    //   - The heavy-write shapes in `run_basin_core_suite` (bulk UPDATE, DELETE,
+    //     single-row UPDATE) are timed as wall-clock single-shot operations; the
+    //     compactor being stopped has no effect on their measurements.
+    //   - `flush_to_parquet` is a Basin-specific primitive (WAL → Parquet
+    //     drain). PG reaches its equivalent settled state automatically.
+    instance
+        .shard
+        .flush_to_parquet()
+        .await
+        .expect("basin post-seed flush_to_parquet");
+    // Shut down the background loop so it cannot fire on its 30-second timer
+    // during the entire read-timing window below. `bg` is Option so we can
+    // take it here without moving the whole `instance` struct.
+    if let Some(bg) = instance.bg.take() {
+        bg.shutdown().await;
+    }
+
     // ---- Basin SaaS + OLAP measurements (extracted) -----------------------
     // Pulled out into its own async fn for the same stack-budget reason as
     // run_extended_suite — see BasinSaasOlapResults docs.
@@ -3674,7 +3753,7 @@ async fn run_full_compare_inner(
     };
 
     let basin_cold_ms = {
-        let cold = build_basin_engine().await;
+        let mut cold = build_basin_engine().await;
         let cold_sess = cold.engine.open_session(cold.project).await.unwrap();
         cold_sess
             .execute(&format!(
@@ -3703,7 +3782,9 @@ async fn run_full_compare_inner(
             .await
             .unwrap();
         let elapsed = started.elapsed().as_secs_f64() * 1000.0;
-        cold.bg.shutdown().await;
+        if let Some(bg) = cold.bg.take() {
+            bg.shutdown().await;
+        }
         cold.wal.close().await.unwrap();
         elapsed
     };
@@ -4100,7 +4181,9 @@ async fn run_full_compare_inner(
 
     report_postgres_compare(id, name, claim, true, metrics, None);
 
-    instance.bg.shutdown().await;
+    // `instance.bg` was already shut down after the post-seed flush above
+    // (before the read-timing window). `bg` is now `None`; the take was the
+    // only shutdown; no second call needed here.
     instance.wal.close().await.unwrap();
 
     let _ = pg

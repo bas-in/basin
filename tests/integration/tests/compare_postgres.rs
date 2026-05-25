@@ -103,7 +103,7 @@ async fn perf_smoke_pg_10k() {
     .await
     .expect("pg seed");
 
-    let instance = build_basin_engine().await;
+    let mut instance = build_basin_engine().await;
     let sess = instance
         .engine
         .open_session(instance.project)
@@ -266,6 +266,8 @@ async fn perf_smoke_pg_10k() {
         .await;
     std::mem::forget(_guard);
 
-    instance.bg.shutdown().await;
+    if let Some(bg) = instance.bg.take() {
+        bg.shutdown().await;
+    }
     instance.wal.close().await.unwrap();
 }
