@@ -12,12 +12,12 @@ test runs on every CI pass and writes a machine-readable report to
 
 | ORM     | Priority | Shapes | OK  | Typed-Err | Regression | OK-Rate |
 |---------|----------|--------|-----|-----------|------------|---------|
-| Drizzle | HIGH     | 14     | 12  | 2         | 0          | 86 %    |
-| Prisma  | HIGH     | 11     | 5   | 6         | 0          | 45 %    |
-| sqlx    | MEDIUM   | 8      | 5   | 3         | 0          | 62 %    |
-| Diesel  | MEDIUM   | 8      | 8   | 0         | 0          | 100 %   |
-| TypeORM | FUTURE   | 6      | 3   | 3         | 0          | 50 %    |
-| **Total** |        | **47** | **33** | **14** | **0**    | **70 %** |
+| Drizzle | HIGH     | 24     | 24  | 0         | 0          | 100 %   |
+| Prisma  | HIGH     | 21     | 19  | 2         | 0          | 90 %    |
+| sqlx    | MEDIUM   | 19     | 18  | 1         | 0          | 95 %    |
+| Diesel  | MEDIUM   | 19     | 18  | 1         | 0          | 95 %    |
+| TypeORM | FUTURE   | 16     | 15  | 1         | 0          | 94 %    |
+| **Total** |        | **99** | **94** | **5**  | **0**    | **95 %** |
 
 **Regression = 0** across all ORMs. This is the critical invariant: no shape
 causes a server panic or garbled wire response.
