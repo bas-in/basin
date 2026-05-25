@@ -240,3 +240,164 @@ async fn promoted_column_compaction_backfill() {
 
     wal.close().await.unwrap();
 }
+
+/// ADR 0027 Phase 4 — cold-file backfill sweep: multi-file coverage.
+///
+/// Inserts rows across MULTIPLE cold-tier Parquet files (by flushing the
+/// tail between INSERT batches), THEN promotes a JSONB path.  At that
+/// point the cold files were written before promotion, so they lack the
+/// shadow column.  Calling `run_promoted_column_backfill_sweep()` should
+/// rewrite every old file so that `SELECT payload->>'event_type'` over
+/// ALL rows (not just the tail batch) returns the correct value instead
+/// of NULL, and the value must match `json_get_text`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn promoted_column_cold_file_sweep() {
+    basin_common::telemetry::try_init_for_tests();
+
+    let storage_dir = TempDir::new().unwrap();
+    let wal_dir = TempDir::new().unwrap();
+
+    let storage = Storage::new(StorageConfig {
+        object_store: Arc::new(
+            LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap(),
+        ),
+        root_prefix: None,
+        disk_cache: None,
+        page_cache: None,
+    });
+    let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+    let wal: Arc<dyn Wal> = Arc::new(
+        LocalWal::open(WalConfig {
+            object_store: Arc::new(
+                LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap(),
+            ),
+            root_prefix: None,
+            flush_interval: Duration::from_millis(50),
+            flush_max_bytes: 1024 * 1024,
+        })
+        .await
+        .unwrap(),
+    );
+
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
+
+    let engine = Engine::new(EngineConfig {
+        storage: storage.clone(),
+        catalog: catalog.clone(),
+        shard: Some(shard.clone()),
+    });
+
+    let project = ProjectId::new();
+    catalog.create_namespace(&project).await.unwrap();
+
+    let sess = engine.open_session(project).await.unwrap();
+    sess.execute(
+        "CREATE TABLE events (\
+            id      BIGINT NOT NULL,\
+            payload JSONB\
+         ) WITH (basin.row_block_size = '256')",
+    )
+    .await
+    .unwrap();
+
+    // ── Insert first batch and flush to Parquet (cold file #1) ──────────────
+    sess.execute(
+        "INSERT INTO events (id, payload) VALUES \
+           (1, '{\"event_type\": \"login\", \"user\": \"alice\"}'),\
+           (2, '{\"event_type\": \"signup\", \"user\": \"bob\"}'),\
+           (3, '{\"user\": \"carol\"}')",
+    )
+    .await
+    .unwrap();
+    shard.flush_to_parquet().await.unwrap();
+
+    // ── Insert second batch and flush to Parquet (cold file #2) ─────────────
+    sess.execute(
+        "INSERT INTO events (id, payload) VALUES \
+           (4, '{\"event_type\": \"purchase\", \"user\": \"dave\"}'),\
+           (5, '{\"event_type\": null, \"user\": \"eve\"}'),\
+           (6, '{\"event_type\": 99, \"user\": \"frank\"}')",
+    )
+    .await
+    .unwrap();
+    shard.flush_to_parquet().await.unwrap();
+
+    let table = TableName::new("events").unwrap();
+
+    // Verify we have at least 2 cold-tier files before promotion.
+    let files_before = storage.list_data_files(&project, &table).await.unwrap();
+    assert!(
+        files_before.len() >= 2,
+        "expected ≥2 cold files before sweep, got {}",
+        files_before.len()
+    );
+
+    // ── Promote the JSONB path AFTER the cold files were written ─────────────
+    catalog
+        .promote_jsonb_path(&project, &table, "payload", "event_type")
+        .await
+        .unwrap();
+
+    // ── Run the cold-file backfill sweep ─────────────────────────────────────
+    let rewritten = shard
+        .run_promoted_column_backfill_sweep(&project, &table)
+        .await
+        .unwrap();
+
+    assert!(
+        rewritten >= 2,
+        "expected ≥2 files rewritten by the sweep, got {rewritten}"
+    );
+
+    // ── Assert all 6 rows return correct shadow-column values ─────────────────
+    let shadow_vals = query_string_col(
+        &sess,
+        "SELECT \"__promoted$payload$event_type\" FROM events ORDER BY id",
+    )
+    .await;
+
+    assert_eq!(shadow_vals.len(), 6, "expected 6 rows");
+
+    // Row 1: "login"
+    assert_eq!(shadow_vals[0], Some("login".to_string()), "row 1");
+    // Row 2: "signup"
+    assert_eq!(shadow_vals[1], Some("signup".to_string()), "row 2");
+    // Row 3: absent key → NULL
+    assert_eq!(shadow_vals[2], None, "row 3 (absent key)");
+    // Row 4: "purchase"
+    assert_eq!(shadow_vals[3], Some("purchase".to_string()), "row 4");
+    // Row 5: JSON null → NULL
+    assert_eq!(shadow_vals[4], None, "row 5 (JSON null)");
+    // Row 6: 99 (number) → "99"
+    assert_eq!(shadow_vals[5], Some("99".to_string()), "row 6 (number)");
+
+    // ── Parity: shadow column == json_get_text over ALL rows ──────────────────
+    let jsonb_vals = query_string_col(
+        &sess,
+        "SELECT json_get_text(payload, 'event_type') FROM events ORDER BY id",
+    )
+    .await;
+
+    assert_eq!(
+        shadow_vals, jsonb_vals,
+        "shadow column values must be byte-identical to json_get_text for ALL cold-file rows.\n\
+         shadow: {shadow_vals:?}\n\
+         jsonb:  {jsonb_vals:?}"
+    );
+
+    // ── Idempotency: re-running the sweep on already-backfilled files ─────────
+    let rewritten2 = shard
+        .run_promoted_column_backfill_sweep(&project, &table)
+        .await
+        .unwrap();
+    assert_eq!(
+        rewritten2, 0,
+        "sweep is idempotent: second pass should rewrite 0 files, got {rewritten2}"
+    );
+
+    wal.close().await.unwrap();
+}

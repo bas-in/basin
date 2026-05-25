@@ -263,6 +263,29 @@ impl Shard {
         self.inner.run_tiering_sweep().await
     }
 
+    /// ADR 0027 Phase 4 — rewrite every cold-tier data file for `(project,
+    /// table)` that is missing the table's promoted JSONB shadow column(s).
+    ///
+    /// This is what a Basin background compactor does over time ("eventual
+    /// backfill").  Calling this eagerly models the steady state of a live
+    /// deployment where the compactor has had time to cover every file.
+    ///
+    /// Idempotent: files that already carry all shadow columns are skipped.
+    /// Returns the count of files that were rewritten.
+    ///
+    /// The bench calls this after `flush_to_parquet()` in the JSONB
+    /// steady-state path to ensure all seeded cold-tier files carry the
+    /// shadow column before the timed measurement.
+    pub async fn run_promoted_column_backfill_sweep(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+    ) -> Result<usize> {
+        self.inner
+            .run_promoted_column_backfill_sweep(project, table)
+            .await
+    }
+
     /// Run one CV refresh sweep across every resident project. Returns the
     /// count of CVs that were re-materialised this pass.
     ///
@@ -446,6 +469,17 @@ pub(crate) trait ShardImpl: Send + Sync {
     fn wal(&self) -> &Arc<dyn basin_wal::Wal>;
     async fn flush_to_parquet(&self) -> Result<()>;
     async fn run_tiering_sweep(&self) -> Result<()>;
+    /// ADR 0027 Phase 4 — rewrite all cold-tier data files that are missing
+    /// the promoted JSONB shadow column(s) for `(project, table)`.  Returns
+    /// the count of files that were rewritten.  Default: returns 0 (no-op for
+    /// backends that do not carry per-file cold data).
+    async fn run_promoted_column_backfill_sweep(
+        &self,
+        _project: &ProjectId,
+        _table: &TableName,
+    ) -> Result<usize> {
+        Ok(0)
+    }
     /// Projects the shard has resident state for. Used by the CV
     /// refresher (which only refreshes CVs whose project is currently
     /// loaded) and any future per-project background driver. Default

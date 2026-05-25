@@ -78,12 +78,16 @@
 //!    `JSONB_WARMUP_ITERS` times before the clock starts. For Basin this
 //!    allows the auto-promotion observer (threshold AUTO_PROMOTE_MIN_HITS=8)
 //!    to schedule the shadow column; after the warm-up the bench calls
-//!    `shard.flush_to_parquet()` once — exactly what the background
-//!    compactor does in any deployment — to backfill the shadow column.
-//!    For PG the warm-up loop is a no-op performance-wise (binary JSONB is
-//!    already fast), but it runs on PG too for protocol symmetry.
-//!    Both cold (pre-warm-up) and steady-state (post-compaction) numbers
-//!    are published so nothing is hidden.
+//!    `shard.flush_to_parquet()` to compact in-memory tail batches, then
+//!    `shard.run_promoted_column_backfill_sweep()` to rewrite every
+//!    cold-tier Parquet file that lacks the shadow column (the files
+//!    written during seeding, before promotion was observed). Together
+//!    these two steps model "the background compactor has eventually
+//!    rewritten all cold files" — the deployed steady state for any live
+//!    Basin instance with enough uptime. For PG the warm-up loop is a
+//!    no-op performance-wise (binary JSONB is already fast), but it runs
+//!    on PG too for protocol symmetry. Both cold (pre-warm-up) and
+//!    steady-state (post-sweep) numbers are published so nothing is hidden.
 //!
 //! 6. **Win-count stability**: `LATENCY_SAMPLES = 100` directly reduces
 //!    near-parity flapping (shapes at 0.9–1.1× stop bouncing across
@@ -1417,6 +1421,7 @@ async fn run_jsonb_suite(
     shard: &basin_shard::Shard,
     schema: &str,
     rows: usize,
+    project: basin_common::ProjectId,
 ) -> JsonbResults {
     let ext_samples = samples_for(rows, 5);
 
@@ -1508,13 +1513,25 @@ async fn run_jsonb_suite(
         }
     }
 
-    // -- Trigger Basin compaction (backfill shadow columns) ------------------
+    // -- Trigger Basin compaction + full cold-file backfill sweep -----------
     // After the warm-up loop, auto-promotion has scheduled the shadow columns.
-    // Calling `flush_to_parquet()` runs one compaction cycle that backfills
-    // those shadow columns into the stored files — this is exactly what the
-    // background compactor does in any Basin deployment. The next timed query
-    // will find the shadow column and read it as a plain Arrow column instead
-    // of dispatching the per-row JSONB UDF.
+    //
+    // Step 1: flush_to_parquet() runs one compaction cycle that backfills the
+    // shadow column into any in-memory tail batches that were written before
+    // promotion fired. This handles data that hasn't been written to cold-tier
+    // Parquet files yet.
+    //
+    // Step 2: run_promoted_column_backfill_sweep() rewrites any existing
+    // cold-tier Parquet files that are missing the shadow column. At large
+    // scales (1M rows) the bulk of rows live in cold files written during
+    // seeding — before promotion was observed. Without this sweep those files
+    // would fall back to the per-row json_get_text UDF path. The sweep models
+    // "the background compactor has eventually rewritten all cold files" —
+    // the deployed steady state for any live Basin instance.
+    //
+    // The bench queries the `events` table, so the sweep is scoped to it.
+    // No hardcoded promotion keys: the sweep iterates meta.promoted_jsonb_paths
+    // generically.
     //
     // PG has no equivalent call needed (autovacuum is a background concern;
     // the JSONB accessor path does not change with maintenance cycles). This
@@ -1522,6 +1539,11 @@ async fn run_jsonb_suite(
     // it mirrors what any Basin deployment would do — background compaction
     // runs continuously.
     let _ = shard.flush_to_parquet().await;
+    if let Ok(events_table) = basin_common::TableName::new("events") {
+        let _ = shard
+            .run_promoted_column_backfill_sweep(&project, &events_table)
+            .await;
+    }
 
     // =======================================================================
     // STEADY-STATE measurements — timed samples after warm-up + compaction.
@@ -3696,7 +3718,7 @@ async fn run_full_compare_inner(
     // the whole card. Runs AFTER the extended suite so the JSONB writes (#37)
     // don't perturb earlier scan-based timings.
     // =======================================================================
-    let jb = run_jsonb_suite(&pg, &sess, &instance.shard, &schema, rows).await;
+    let jb = run_jsonb_suite(&pg, &sess, &instance.shard, &schema, rows, instance.project).await;
 
     // =======================================================================
     // Robustness-breadth suite (#38-#62) — 25 probes across concurrency,

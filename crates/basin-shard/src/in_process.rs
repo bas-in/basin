@@ -860,6 +860,254 @@ impl InProcessShard {
         Ok(())
     }
 
+    /// ADR 0027 Phase 4 — promoted-column cold-file backfill sweep.
+    ///
+    /// Iterates every live data file for `(project, table)` and rewrites any
+    /// file that is MISSING the shadow column(s) for the table's
+    /// `promoted_jsonb_paths`.  Files that already carry all shadow columns are
+    /// skipped (idempotent).  The rewritten file is committed to the catalog
+    /// via the same `replace_data_files` / `CommitConflict`-retry pattern used
+    /// by the tiering sweep so snapshots and refcounts stay correct.
+    ///
+    /// This is the eager equivalent of "the background compactor has eventually
+    /// rewritten all cold-tier files" — it models the steady state of any live
+    /// Basin deployment where compaction has had time to cover every file.
+    ///
+    /// Returns the count of files that were rewritten.
+    ///
+    /// # Skipping Vortex files
+    ///
+    /// The sweep reads each file through `Storage::read_file`, which handles
+    /// both Parquet and Vortex.  The rewritten file is written via
+    /// `write_batch_with_options` with the format taken from the catalog's
+    /// `file_format` setting (same as `compact_one`).  Vortex files are
+    /// therefore rewritten as Vortex — the Arrow schema after backfill carries
+    /// the extra Utf8 column and the Vortex writer accepts it.  If a Vortex
+    /// file fails to rewrite (encoding error), we log a warning and skip it
+    /// rather than aborting the whole sweep.
+    async fn promoted_column_backfill_sweep(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+    ) -> Result<usize> {
+        // Load table metadata: promoted paths + file format + catalog snapshot.
+        let meta = match self.cfg.catalog.load_table(project, table).await {
+            Ok(m) => m,
+            Err(basin_common::BasinError::NotFound(_)) => return Ok(0),
+            Err(e) => return Err(e),
+        };
+
+        if meta.promoted_jsonb_paths.is_empty() {
+            return Ok(0); // Nothing to backfill.
+        }
+
+        let promoted_paths = meta.promoted_jsonb_paths.clone();
+        let file_format = shard_map_file_format(meta.file_format);
+
+        // The shadow-column names we expect every file to carry after the sweep.
+        let expected_shadows: Vec<String> = promoted_paths
+            .iter()
+            .map(|p| p.shadow_col_name())
+            .collect();
+
+        // Iterate the live data-file list.  We do NOT use list_data_files_with_stats
+        // to avoid pulling Parquet footers for every file — we only need the paths.
+        // We will read the full batch below for any file that needs backfilling.
+        let files = self.cfg.storage.list_data_files(project, table).await?;
+
+        // Use the default partition key (consistent with compact_one).
+        let partition = PartitionKey::default_key();
+
+        let write_opts = basin_storage::WriteOptions {
+            file_format,
+            ..Default::default()
+        };
+
+        let mut rewritten = 0usize;
+
+        for file in &files {
+            // Collect all batches from this file via read_file.
+            // read_file reads the raw Arrow data regardless of predicate pushdown.
+            let stream = match self
+                .cfg
+                .storage
+                .read_file(project, &file.path)
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        %project,
+                        %table,
+                        path = %file.path,
+                        error = %e,
+                        "promoted_column_backfill_sweep: read_file failed; skipping",
+                    );
+                    continue;
+                }
+            };
+
+            let batches: Vec<RecordBatch> = stream
+                .collect::<Vec<Result<RecordBatch>>>()
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+
+            if batches.is_empty() {
+                continue; // Empty file — no schema to check.
+            }
+
+            // Check whether any expected shadow column is absent.
+            let first_schema = batches[0].schema();
+            let needs_backfill = expected_shadows
+                .iter()
+                .any(|name| first_schema.field_with_name(name).is_err());
+
+            if !needs_backfill {
+                continue; // All shadow columns already present — skip.
+            }
+
+            // Concatenate batches and run backfill.
+            let schema = batches[0].schema();
+            let merged = match arrow::compute::concat_batches(&schema, &batches) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(
+                        %project,
+                        %table,
+                        path = %file.path,
+                        error = %e,
+                        "promoted_column_backfill_sweep: concat_batches failed; skipping",
+                    );
+                    continue;
+                }
+            };
+
+            let backfilled = match backfill_promoted_columns(merged, &promoted_paths) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(
+                        %project,
+                        %table,
+                        path = %file.path,
+                        error = %e,
+                        "promoted_column_backfill_sweep: backfill failed; skipping",
+                    );
+                    continue;
+                }
+            };
+
+            // Write the rewritten file to storage.
+            let new_file = match self
+                .cfg
+                .storage
+                .write_batch_with_options(
+                    project,
+                    table,
+                    &partition,
+                    &backfilled,
+                    &write_opts,
+                )
+                .await
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    warn!(
+                        %project,
+                        %table,
+                        path = %file.path,
+                        error = %e,
+                        "promoted_column_backfill_sweep: write_batch_with_options failed; skipping",
+                    );
+                    continue;
+                }
+            };
+
+            let added = basin_catalog::DataFileRef {
+                path: new_file.path.as_ref().to_string(),
+                size_bytes: new_file.size_bytes,
+                row_count: new_file.row_count,
+                column_stats: new_file.column_stats.clone(),
+                bloom_filters: ::std::collections::BTreeMap::new(),
+                hll_sketches: ::std::collections::BTreeMap::new(),
+                tdigest_sketches: ::std::collections::BTreeMap::new(),
+            };
+            let removed = vec![file.path.as_ref().to_string()];
+
+            // Commit with retry on CommitConflict (same pattern as tiering_sweep).
+            let commit_result = 'commit: {
+                for attempt in 0..3 {
+                    let snapshot = match self.cfg.catalog.load_table(project, table).await {
+                        Ok(m) => m.current_snapshot,
+                        Err(e) => break 'commit Err(e),
+                    };
+                    match self
+                        .cfg
+                        .catalog
+                        .replace_data_files(
+                            project,
+                            table,
+                            snapshot,
+                            removed.clone(),
+                            vec![added.clone()],
+                        )
+                        .await
+                    {
+                        Ok(_) => break 'commit Ok(()),
+                        Err(basin_common::BasinError::CommitConflict(_)) if attempt < 2 => {
+                            // Retry: snapshot advanced concurrently.
+                            continue;
+                        }
+                        Err(e) => break 'commit Err(e),
+                    }
+                }
+                Err(basin_common::BasinError::CommitConflict(format!(
+                    "{project}/{table}: backfill sweep lost commit race (3 attempts)"
+                )))
+            };
+
+            match commit_result {
+                Ok(()) => {
+                    // Delete the old file best-effort (same pattern as tiering sweep).
+                    if let Err(e) = self
+                        .cfg
+                        .storage
+                        .delete_file(project, &file.path)
+                        .await
+                    {
+                        warn!(
+                            path = %file.path,
+                            error = %e,
+                            "promoted_column_backfill_sweep: old file delete failed (orphan)",
+                        );
+                    }
+                    rewritten += 1;
+                }
+                Err(e) => {
+                    warn!(
+                        %project,
+                        %table,
+                        path = %file.path,
+                        error = %e,
+                        "promoted_column_backfill_sweep: catalog commit failed; skipping",
+                    );
+                    // Best-effort: delete the orphaned new file.
+                    let _ = self.cfg.storage.delete_file(project, &new_file.path).await;
+                }
+            }
+        }
+
+        if rewritten > 0 {
+            tracing::info!(
+                %project,
+                %table,
+                rewritten,
+                "promoted_column_backfill_sweep: cold-file backfill complete",
+            );
+        }
+        Ok(rewritten)
+    }
+
     /// Drain every partition's tail into Parquet, committing through the
     /// catalog and truncating the WAL on success.
     async fn compact_all(&self) -> Result<()> {
@@ -1318,6 +1566,14 @@ impl ShardImpl for InProcessShard {
 
     async fn run_tiering_sweep(&self) -> Result<()> {
         self.tiering_sweep().await
+    }
+
+    async fn run_promoted_column_backfill_sweep(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+    ) -> Result<usize> {
+        self.promoted_column_backfill_sweep(project, table).await
     }
 
     async fn yield_partition(
@@ -1906,7 +2162,9 @@ fn backfill_promoted_columns(
     batch: RecordBatch,
     promoted_paths: &[basin_catalog::PromotedJsonbPath],
 ) -> Result<RecordBatch> {
-    use arrow_array::{Array, ArrayRef, LargeBinaryArray, StringArray};
+    use arrow_array::{
+        Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray,
+    };
     use arrow_schema::{DataType, Field};
 
     if promoted_paths.is_empty() {
@@ -1933,25 +2191,36 @@ fn backfill_promoted_columns(
 
         let shadow_col: ArrayRef = match batch.schema().index_of(&path.source_col) {
             Ok(col_idx) => {
+                // JSONB round-trips through the cold tier as LargeBinary, Binary,
+                // or Utf8 depending on the on-disk encoder. Match the engine's
+                // `extract_promoted_value` and accept all three rather than a
+                // single `data_type()` arm — a too-narrow match silently emits an
+                // all-NULL shadow column.
                 let src = batch.column(col_idx);
-                match src.data_type() {
-                    DataType::LargeBinary => {
-                        let arr = src
-                            .as_any()
-                            .downcast_ref::<LargeBinaryArray>()
-                            .expect("LargeBinary downcast");
-                        let mut values: Vec<Option<String>> = Vec::with_capacity(n);
-                        for i in 0..n {
-                            if arr.is_null(i) {
-                                values.push(None);
-                            } else {
-                                values.push(extract_promoted_key(arr.value(i), &path.json_key)?);
-                            }
-                        }
-                        std::sync::Arc::new(StringArray::from(values)) as ArrayRef
+                let lb = src.as_any().downcast_ref::<LargeBinaryArray>();
+                let b = src.as_any().downcast_ref::<BinaryArray>();
+                let sa = src.as_any().downcast_ref::<StringArray>();
+                let lsa = src.as_any().downcast_ref::<LargeStringArray>();
+
+                let mut values: Vec<Option<String>> = Vec::with_capacity(n);
+                for i in 0..n {
+                    let raw: Option<&[u8]> = if let Some(a) = lb {
+                        (!a.is_null(i)).then(|| a.value(i))
+                    } else if let Some(a) = b {
+                        (!a.is_null(i)).then(|| a.value(i))
+                    } else if let Some(a) = sa {
+                        (!a.is_null(i)).then(|| a.value(i).as_bytes())
+                    } else if let Some(a) = lsa {
+                        (!a.is_null(i)).then(|| a.value(i).as_bytes())
+                    } else {
+                        None
+                    };
+                    match raw {
+                        Some(bytes) => values.push(extract_promoted_key(bytes, &path.json_key)?),
+                        None => values.push(None),
                     }
-                    _ => std::sync::Arc::new(StringArray::from(vec![None::<String>; n])) as ArrayRef,
                 }
+                std::sync::Arc::new(StringArray::from(values)) as ArrayRef
             }
             Err(_) => std::sync::Arc::new(StringArray::from(vec![None::<String>; n])) as ArrayRef,
         };
