@@ -1402,12 +1402,14 @@ async fn try_resolve_fast_path_update(
     // any assignment that touches the PK column (key re-encoding / uniqueness).
     //
     // NOTE: routing read-modify-write (`SET col = f(col)`) UPDATEs through this
-    // hot-tier overlay path is a ~20x win (172ms -> 8ms on cold rows), but it is
-    // NOT safe until the overlay is reconciled with cold-path mutations: a
-    // subsequent range UPDATE/DELETE takes the cold copy-on-write path, which
-    // rewrites the cold file WITHOUT seeing the hot-tier UPDATE overlay, and the
-    // overlay then shadows the cold rewrite on read (lost update). See
-    // rmw_update_correctness.rs + the overlay/cold-path reconciliation follow-up.
+    // hot-tier overlay path would be a ~20x win (8ms vs 172ms on cold rows), and
+    // the data-loss hazard (overlay shadowing a later cold rewrite) is now
+    // closed by materialize_hot_overlay_into_cold. But the overlay's repeated-
+    // RMW + materialization path still has correctness bugs (repeated `SET v=v+1`
+    // does not accumulate, and row duplication under materialization — see
+    // rmw_update_correctness.rs). So RMW stays on the cold path until that
+    // overlay path is fixed. Do NOT remove this gate without re-running
+    // rmw_update_correctness.
     let parsed = parse_assignments(assignments, meta.schema.as_ref())?;
     if parsed.iter().any(|(_, rhs)| matches!(rhs, AssignmentRhs::Expr(_))) {
         return Ok(None);
