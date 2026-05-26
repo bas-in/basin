@@ -896,6 +896,7 @@ pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result
     }
 
     pre_mutation_flush(sess).await?;
+    materialize_hot_overlay_into_cold(sess, &table).await?;
 
     // RLS USING enforcement on DELETE (P0 #56 fix). UPDATE's exec_update
     // already enforces RLS WITH CHECK on the post-SET image, which trips
@@ -1399,6 +1400,14 @@ async fn try_resolve_fast_path_update(
     };
     // Gate: every assignment must be a plain scalar; reject expression RHS and
     // any assignment that touches the PK column (key re-encoding / uniqueness).
+    //
+    // NOTE: routing read-modify-write (`SET col = f(col)`) UPDATEs through this
+    // hot-tier overlay path is a ~20x win (172ms -> 8ms on cold rows), but it is
+    // NOT safe until the overlay is reconciled with cold-path mutations: a
+    // subsequent range UPDATE/DELETE takes the cold copy-on-write path, which
+    // rewrites the cold file WITHOUT seeing the hot-tier UPDATE overlay, and the
+    // overlay then shadows the cold rewrite on read (lost update). See
+    // rmw_update_correctness.rs + the overlay/cold-path reconciliation follow-up.
     let parsed = parse_assignments(assignments, meta.schema.as_ref())?;
     if parsed.iter().any(|(_, rhs)| matches!(rhs, AssignmentRhs::Expr(_))) {
         return Ok(None);
@@ -1765,6 +1774,7 @@ pub(crate) async fn exec_update(
     };
 
     pre_mutation_flush(sess).await?;
+    materialize_hot_overlay_into_cold(sess, &table).await?;
 
     let meta = sess
         .engine
@@ -2601,6 +2611,7 @@ async fn exec_delete_via_df_rowset(
     );
 
     pre_mutation_flush(sess).await?;
+    materialize_hot_overlay_into_cold(sess, table).await?;
 
     // Re-load metadata after the flush (snapshot id must be current).
     let meta = sess
@@ -3372,6 +3383,111 @@ async fn check_update_pk(
 async fn pre_mutation_flush(sess: &ProjectSession) -> Result<()> {
     if let Some(shard) = sess.engine.config().shard.as_ref() {
         shard.flush_to_parquet().await?;
+    }
+    Ok(())
+}
+
+/// Materialize the hot-tier UPDATE/DELETE overlay for `table` into the cold
+/// tier, then clear exactly the materialized overlay keys.
+///
+/// The hot-tier fast path writes `MemRowValue::Update` / `Tombstone` entries
+/// into the process-wide `MemTableRegistry`; those are applied to reads via
+/// `TombstoneFilterExec` / `UpdateOverlayExec`, but a cold-path copy-on-write
+/// UPDATE/DELETE reads the RAW cold files (it does not see the overlay). So a
+/// hot-tier UPDATE/DELETE followed by a cold-path UPDATE/DELETE on the same row
+/// would rewrite stale cold data while the un-cleared overlay shadows the
+/// result on read — silently losing the cold-path mutation (bug #94).
+///
+/// `pre_mutation_flush` already drains the shard INSERT tail; this drains the
+/// UPDATE/DELETE overlay too, so the cold path reads a consistent base with an
+/// empty overlay. No-op (a cheap registry probe) when the overlay is empty —
+/// the overwhelmingly common case. Only fires when a row has a pending hot
+/// overlay AND a cold-path mutation is about to touch its table; cold-path
+/// mutations are already full-file rewrites, so the extra rewrite is in budget.
+async fn materialize_hot_overlay_into_cold(
+    sess: &ProjectSession,
+    table: &TableName,
+) -> Result<()> {
+    let registry = sess.engine.memtable_registry();
+    let tombstones =
+        crate::hot_tombstone::snapshot_tombstones(registry.as_ref(), &sess.project, table);
+    let updates =
+        crate::hot_tombstone::snapshot_updates(registry.as_ref(), &sess.project, table);
+    if tombstones.is_empty() && updates.is_empty() {
+        return Ok(());
+    }
+
+    let meta = sess
+        .engine
+        .config()
+        .catalog
+        .load_table(&sess.project, table)
+        .await?;
+    // The overlay is only ever written for single-PK tables; defensively skip
+    // (and clear) otherwise so we never wedge.
+    if meta.pk_columns.len() != 1 {
+        registry.remove(&sess.project, table);
+        return Ok(());
+    }
+    let pk_col = meta.pk_columns[0].clone();
+    let pk_dt = meta
+        .schema
+        .field_with_name(&pk_col)
+        .map_err(|_| BasinError::internal(format!("PK column {pk_col:?} missing from schema")))?
+        .data_type()
+        .clone();
+
+    // Read all live cold rows (RAW — without the overlay) for this table.
+    let live = meta.live_data_files();
+    let removed: Vec<String> = live.iter().map(|f| f.path.clone()).collect();
+    let paths: Vec<object_store::path::Path> = live
+        .iter()
+        .map(|f| object_store::path::Path::from(f.path.as_str()))
+        .collect();
+    let mut batches: Vec<RecordBatch> = Vec::new();
+    if !paths.is_empty() {
+        let mut stream = sess
+            .engine
+            .config()
+            .storage
+            .read_paths(&sess.project, paths, basin_storage::ReadOptions::default())
+            .await?;
+        while let Some(b) = stream.next().await {
+            batches.push(b?);
+        }
+    }
+
+    // Apply the overlay exactly as the read path does: drop tombstoned rows,
+    // suppress overridden cold rows, append the post-SET override rows.
+    let batches = crate::hot_tombstone::apply_tombstone_filter_to_batches(
+        batches,
+        &tombstones,
+        &pk_col,
+        &pk_dt,
+    )
+    .map_err(|e| BasinError::internal(format!("materialize overlay (tombstones): {e}")))?;
+    let batches = crate::hot_tombstone::apply_update_overlay_to_batches(
+        batches,
+        &updates,
+        &pk_col,
+        &pk_dt,
+    )
+    .map_err(|e| BasinError::internal(format!("materialize overlay (updates): {e}")))?;
+
+    // Replace ALL old cold files with the merged result, then clear EXACTLY the
+    // overlay keys we materialized (targeted — a concurrent overlay write on a
+    // different key is preserved). The overlay is cleared only AFTER the commit
+    // succeeds, so a crash mid-way leaves the overlay intact and replayable.
+    let added = write_replacement(sess, table, meta.schema.clone(), batches).await?;
+    commit_replace(sess, table, meta.current_snapshot, removed, added).await?;
+    if let Some(entry) = registry.get(&sess.project, table) {
+        let keys: Vec<basin_hottier::RowKey> = tombstones
+            .iter()
+            .cloned()
+            .chain(updates.keys().cloned())
+            .map(basin_hottier::RowKey::from_bytes)
+            .collect();
+        entry.memtable.remove_flushed(&keys);
     }
     Ok(())
 }
