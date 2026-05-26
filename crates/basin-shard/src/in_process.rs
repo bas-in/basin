@@ -704,15 +704,45 @@ impl InProcessShard {
         let storage = &self.cfg.storage;
         let files = storage.list_data_files_with_stats(project, table).await?;
 
+        // The storage footer re-read does not surface min/max for every Vortex
+        // dtype — a Timestamp column is a Vortex extension type over i64, which
+        // `footer_meta` leaves as None (it only emits stats for bare i64/f64).
+        // The catalog, however, persists the authoritative column_stats captured
+        // at write time (which DO include timestamps). Build a path→stats
+        // fallback from the catalog so age-based tiering works on Vortex tables
+        // (the default format), not only Parquet. This was the gap behind
+        // viability_tiered_storage's #[ignore]: tiering moved 0 files because the
+        // age column's stat was invisible to the sweep on Vortex.
+        let catalog_stats: std::collections::HashMap<String, _> = meta
+            .live_data_files()
+            .into_iter()
+            .map(|d| (d.path, d.column_stats))
+            .collect();
+
         let mut migrated = 0usize;
         for f in files {
             if matches!(f.tier, basin_storage::Tier::Cold) {
                 continue;
             }
-            let Some(stats) = f.column_stats.get(&age_column) else {
-                continue;
-            };
-            let Some(max_bytes) = stats.max_bytes.as_deref() else {
+            // Resolve the age column's max at the MAX_BYTES level, not the
+            // key level: `footer_meta` inserts a column_stats entry for every
+            // column (carrying null_count) but leaves max_bytes None for a
+            // Vortex Timestamp column (extension dtype, not bare i64). So
+            // `f.column_stats.get("ts")` is Some-with-no-max — a key-level
+            // fallback would never fire. Prefer the storage footer's max when
+            // present, else fall back to the catalog's authoritative stat
+            // (populated at write time via column_stats_from_batch, which DOES
+            // emit timestamp min/max). This is what lets age-based tiering work
+            // on Vortex tables, the default format.
+            let storage_max = f
+                .column_stats
+                .get(&age_column)
+                .and_then(|s| s.max_bytes.as_deref());
+            let catalog_max = catalog_stats
+                .get(f.path.as_ref())
+                .and_then(|cs| cs.get(&age_column))
+                .and_then(|s| s.max_bytes.as_deref());
+            let Some(max_bytes) = storage_max.or(catalog_max) else {
                 continue;
             };
             // Decode max as either i64 microseconds (TIMESTAMPTZ) or

@@ -89,7 +89,6 @@ fn build_batch(start_id: i64, n: usize, days_ago: i64) -> RecordBatch {
     .unwrap()
 }
 
-#[ignore = "Misc: tiered-storage compactor sweep moves 0 files to cold tier — hot/cold classification not wired to file-age — blocked on #40 cluster"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn viability_tiered_storage_compactor_moves_old_files() {
     basin_common::telemetry::try_init_for_tests();

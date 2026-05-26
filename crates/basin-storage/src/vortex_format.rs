@@ -157,7 +157,11 @@ fn btrblocks_builder_for(mode: EncodingMode) -> BtrBlocksCompressorBuilder {
 pub(crate) fn column_stats_from_batch(
     batch: &RecordBatch,
 ) -> std::collections::BTreeMap<String, crate::data_file::ColumnStats> {
-    use arrow_array::{Array, Float64Array, Int64Array};
+    use arrow_array::{
+        Array, Float64Array, Int64Array, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray,
+    };
+    use arrow_schema::TimeUnit;
 
     let mut out = std::collections::BTreeMap::new();
     let schema = batch.schema();
@@ -189,6 +193,53 @@ pub(crate) fn column_stats_from_batch(
                     arrow::compute::min(a).map(|v| v.to_le_bytes().to_vec()),
                     arrow::compute::max(a).map(|v| v.to_le_bytes().to_vec()),
                     arrow::compute::sum(a).map(|v| v.to_le_bytes().to_vec()),
+                )
+            }
+            // Timestamp columns: emit min/max as native-unit i64-LE, matching
+            // the Parquet TIMESTAMPTZ stat contract (int64 in the column's
+            // unit) so Vortex and Parquet tables behave identically for
+            // catalog stats pruning AND the tiering sweep's cold-age
+            // classification (which decodes max_bytes as i64). Without this,
+            // Vortex (the default format) had no timestamp stats, so
+            // age-based tiering moved 0 files — the gap behind
+            // viability_tiered_storage's #[ignore]. sum_bytes stays None
+            // (SUM over a timestamp is not a metadata-aggregate shape, and
+            // fast_aggregate type-gates to Int64/Float64 so it ignores these).
+            DataType::Timestamp(unit, _) => {
+                let (mn, mx): (Option<i64>, Option<i64>) = match unit {
+                    TimeUnit::Second => {
+                        let a = col
+                            .as_any()
+                            .downcast_ref::<TimestampSecondArray>()
+                            .expect("TimestampSecond column");
+                        (arrow::compute::min(a), arrow::compute::max(a))
+                    }
+                    TimeUnit::Millisecond => {
+                        let a = col
+                            .as_any()
+                            .downcast_ref::<TimestampMillisecondArray>()
+                            .expect("TimestampMillisecond column");
+                        (arrow::compute::min(a), arrow::compute::max(a))
+                    }
+                    TimeUnit::Microsecond => {
+                        let a = col
+                            .as_any()
+                            .downcast_ref::<TimestampMicrosecondArray>()
+                            .expect("TimestampMicrosecond column");
+                        (arrow::compute::min(a), arrow::compute::max(a))
+                    }
+                    TimeUnit::Nanosecond => {
+                        let a = col
+                            .as_any()
+                            .downcast_ref::<TimestampNanosecondArray>()
+                            .expect("TimestampNanosecond column");
+                        (arrow::compute::min(a), arrow::compute::max(a))
+                    }
+                };
+                (
+                    mn.map(|v| v.to_le_bytes().to_vec()),
+                    mx.map(|v| v.to_le_bytes().to_vec()),
+                    None,
                 )
             }
             _ => (None, None, None),

@@ -121,8 +121,9 @@ impl FileFormat {
 /// keep using [`write_batch`] without churn.
 #[derive(Clone, Debug, Default)]
 pub struct WriteOptions {
-    /// On-disk format for this write. Default [`FileFormat::Parquet`] keeps
-    /// the legacy path byte-for-byte.
+    /// On-disk format for this write. Default is [`FileFormat::Vortex`]
+    /// (the catalog default since ADR 0015); pass `FileFormat::Parquet`
+    /// explicitly for the interchange format.
     pub file_format: FileFormat,
     /// Columns that should get a native Parquet bloom filter section. Empty
     /// (the default) is the pre-bloom behaviour: no filter is written, the
