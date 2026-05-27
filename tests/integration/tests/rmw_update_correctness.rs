@@ -125,6 +125,29 @@ async fn rmw_update_through_hot_tier_is_correct() {
     wal.close().await.unwrap();
 }
 
+/// Does COUNT(*) over-count when a row has a hot-tier UPDATE overlay? Uses a
+/// SCALAR UPDATE (always routes to the overlay — no env flag needed), so this
+/// detects whether the count bug is PRE-EXISTING (independent of the RMW perf
+/// experiment). An UPDATE replaces a row; it must not change COUNT(*).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn count_star_after_scalar_hot_update_is_correct() {
+    let (_sd, _wd, engine, shard, bg, wal) = build().await;
+    bg.shutdown().await;
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO t VALUES (1, 10), (2, 20)").await.unwrap();
+    shard.flush_to_parquet().await.unwrap();
+    let c0 = int_at(&sess, "SELECT COUNT(*) FROM t").await;
+    sess.execute("UPDATE t SET v = 99 WHERE id = 1").await.unwrap(); // scalar -> overlay
+    let c1 = int_at(&sess, "SELECT COUNT(*) FROM t").await;
+    println!("[count-overlay] COUNT before update={c0} after scalar hot update={c1} (want 2 and 2)");
+    assert_eq!(c0, 2, "baseline");
+    assert_eq!(c1, 2, "COUNT(*) must stay 2 after a hot-tier UPDATE (replace, not insert)");
+    wal.close().await.unwrap();
+}
+
 /// Guards the hot-tier-overlay vs cold-path-mutation interaction: a scalar
 /// hot-tier UPDATE (overlay) followed by a RANGE UPDATE (cold copy-on-write
 /// path) on the SAME row must not lose the cold-path update. If the overlay
