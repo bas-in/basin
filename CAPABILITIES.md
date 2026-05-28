@@ -417,4 +417,4 @@ Summary matrix (see linked doc for caveats and the regeneration plan):
 
 ---
 
-*Last updated: 2026-05-22. This file is hand-maintained; PRs welcome.*
+*Last updated: 2026-05-29. This file is hand-maintained; PRs welcome.*

@@ -378,9 +378,18 @@ The common extensions are covered natively — see the table above and
 
 ### `LISTEN` / `NOTIFY`
 
-Not shipped. Replaced by `basin-realtime` SSE + WebSocket, which give
-fan-out across processes / regions instead of just within one
-Postgres connection.
+Shipped — SQL-level pub/sub via a per-engine notify registry
+(`notify_registry.rs`), dispatched in `executor.rs`. PG-accurate
+transaction buffering: `NOTIFY` inside a transaction is queued and
+fanned out only on `COMMIT`, discarded on `ROLLBACK`; channel names
+are case-insensitive; `pg_listening_channels()` reflects session
+state. Covered end-to-end by
+[`tests/integration/tests/listen_notify.rs`](../tests/integration/tests/listen_notify.rs).
+
+`basin-realtime` SSE + WebSocket is the complementary fan-out layer
+for change-data delivery across processes / regions — pick the right
+tool: `LISTEN/NOTIFY` for in-database pub/sub, `basin-realtime` for
+out-of-band push to web clients.
 
 ---
 
