@@ -3481,7 +3481,17 @@ async fn materialize_hot_overlay_into_cold(
     // different key is preserved). The overlay is cleared only AFTER the commit
     // succeeds, so a crash mid-way leaves the overlay intact and replayable.
     let added = write_replacement(sess, table, meta.schema.clone(), batches).await?;
-    commit_replace(sess, table, meta.current_snapshot, removed, added).await?;
+    commit_replace(sess, table, meta.current_snapshot, removed.clone(), added).await?;
+    // Physically delete the just-replaced files so a subsequent
+    // `list_data_files_with_stats` (which lists the object store directly, not
+    // the catalog) doesn't return them alongside the new merged file. Without
+    // this the cold-path UPDATE/DELETE that triggered the materialize would
+    // re-read the stale base, rewrite it with the SET applied, and emit a file
+    // containing rows duplicated against the materialized file — yielding the
+    // "+1 lost on the overlaid row" failure mode in #95. Mirrors every other
+    // commit_replace site (exec_update / exec_delete / soft_delete) which also
+    // pairs the catalog swap with the physical delete.
+    delete_objects(sess, table, meta.schema.as_ref(), &removed).await?;
     if let Some(entry) = registry.get(&sess.project, table) {
         let keys: Vec<basin_hottier::RowKey> = tombstones
             .iter()

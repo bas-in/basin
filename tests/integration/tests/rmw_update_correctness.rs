@@ -152,15 +152,16 @@ async fn count_star_after_scalar_hot_update_is_correct() {
 /// hot-tier UPDATE (overlay) followed by a RANGE UPDATE (cold copy-on-write
 /// path) on the SAME row must not lose the cold-path update.
 ///
-/// `#[ignore]`d because it is FLAKY (~60% pass): `materialize_hot_overlay_into_cold`
-/// (b38d6fa) REDUCED this from a deterministic data-loss to an intermittent one,
-/// but a race remains in the cold-path materialize-then-read sequence — the
-/// subsequent read occasionally observes pre-materialize state, so the +1 is
-/// still sometimes lost. Isolated to this path: count_star_after_scalar_hot_update
-/// (overlay, no materialize) and rmw_update_through_hot_tier (no overlay) are
-/// both deterministically green. Tracked in #95 — the data-loss fix is PARTIAL,
-/// not complete. Un-ignore once the materialize/read sequence is made consistent.
-#[ignore = "flaky (~60%): cold-path materialize-then-read race; data-loss fix is partial — see #95"]
+/// History: this was deterministically broken (#94), then flaky-~60% pass after
+/// b38d6fa added `materialize_hot_overlay_into_cold` — the materialize committed
+/// the catalog swap but did NOT physically delete the replaced cold files, so the
+/// subsequent cold-path UPDATE's `list_data_files_with_stats` (which lists the
+/// object store directly, not the catalog) saw BOTH the stale base and the
+/// freshly-materialized file. Rewriting both produced a file with the row
+/// duplicated (one copy with +1 from stale base, one with +1 from the overlay),
+/// and SELECT could pick the stale-base copy, losing the overlaid value. The fix
+/// in materialize_hot_overlay_into_cold pairs `commit_replace` with
+/// `delete_objects` like every other rewrite site. Tracked in #95.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scalar_overlay_then_cold_range_update_composes() {
     let (_sd, _wd, engine, shard, bg, wal) = build().await;
