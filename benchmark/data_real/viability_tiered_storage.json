@@ -14,13 +14,13 @@
     }
   },
   "details": {
-    "bucket": "baisn-test",
+    "bucket": "basin-test",
     "cold_after_seconds": 2592000,
     "cold_age_column": "ts",
     "cold_files_after_sweep": 1,
-    "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
+    "endpoint": "http://127.0.0.1:8333",
     "hot_files_after_sweep": 1,
     "total_rows_visible": 20
   },
-  "generated_at": "@1778110506"
+  "generated_at": "@1779755707"
 }

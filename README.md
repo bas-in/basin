@@ -134,9 +134,9 @@ near zero."*
 | **Auth** (signup, signin, magic-link, JWT, refresh, OAuth) | ✅ Shipped | Per-project schema; `auth.uid()` / `auth.role()` work in RLS policies. |
 | **REST API** (PostgREST-compatible) | ✅ Shipped | `GET`/`POST`/`PATCH`/`DELETE` on `/rest/v1/<table>`; RPC mount for SQL + Wasm functions. |
 | **Realtime** (SSE + WebSocket + presence) | ✅ Shipped, harness-gated | Implementation complete; some integration harness slices `#[ignore]`-gated pending un-gate. |
-| **Blob storage** (`basin-blob`) | 🛠 v0.1 partial | Engine seam shipped; full SDK + signed-URL surface ongoing. See [`CAPABILITIES.md`](./CAPABILITIES.md). |
+| **Blob storage** (`basin-blob`) | ✅ v1 | Catalog-backed object storage (ADR 0021). Full `/storage/v1/` REST surface in `basin-rest`: bucket CRUD, object upload/download/list/bulk-delete, public fast path, signed-URL mint + verify (HMAC-SHA256, expiry, key rotation), per-object RLS, and per-project byte-quota counters. HEAD / COPY / resumable multipart deferred to v1.1. See [`CAPABILITIES.md`](./CAPABILITIES.md). |
 | **Vector search** (native `vector(N)`, HNSW, `<->`/`<#>`/`<=>`) | ✅ Shipped | Planner auto-routes `ORDER BY x <-> $1 LIMIT k`. No `pg_vector` install needed. |
-| **WASM UDFs** (`CREATE FUNCTION … LANGUAGE wasm`) | 🛠 v0.1 scalar | `i32`/`i64`/`f64` only today; string / JSONB support deferred to next phase. Suitable for math / validation UDFs, not bulk transforms. |
+| **WASM UDFs** (`CREATE FUNCTION … LANGUAGE wasm`) | ✅ v0.1 scalar | `i32`/`i64`/`f64` plus `text`/`bytea`/`timestamptz` args + returns (variable-length values cross a `basin_alloc`/`basin_dealloc` `(ptr,len)` ABI); JSONB rides the `text` path. Per-row invocation; a dedicated `jsonb` arg type and vectorized (whole-array) calls are deferred. |
 | **Cron, HTTP-from-SQL, trgm, geo, continuous matviews** | ✅ via Basin-flavored crates | See ["Postgres-extension equivalents"](./CAPABILITIES.md#postgres-extension-equivalents). No `CREATE EXTENSION` required. |
 
 **What we don't ship** — and on purpose:
@@ -157,13 +157,15 @@ This is the *and-the-rest-of-the-stack-is-here* line. The structural primitive (
 | **sqllogictest** (curated PG-style suite) | **100% (50/50)** as of [`b7114e8`](https://github.com/bas-in/basin/commit/b7114e8) |
 | **ORM corpus** (Drizzle / Prisma / sqlx / Diesel / TypeORM, 99 representative shapes) | **95% (94/99)** — Drizzle 100%, Prisma 90%, sqlx 95%, Diesel 95%, TypeORM 94% |
 | **Per-fragment SQL matrix** ([`docs/sql-support.md`](./docs/sql-support.md), 697 fragments tested) | **~91% Default config / ~94% non-excluded** (629/667) |
-| **Wasm UDFs** | `i32 / i64 / f64` shipped; `text / bytea / JSONB` in flight |
+| **Wasm UDFs** | `i32 / i64 / f64` plus `text / bytea / timestamptz` args + returns shipped (via a `basin_alloc`/`basin_dealloc` + linear-memory `(ptr,len)` ABI); JSONB rides the `text` path. Deferred: a dedicated `jsonb` arg type and vectorized (whole-Arrow-array) args |
 | **Wire protocol** | pgwire v3, simple + extended query, TLS (rustls), `COPY FROM STDIN / TO STDOUT`, prepared statements with binary parameters (native JSONB / UUID / BYTEA / NUMERIC varlena / ARRAY binary wire formats) |
 | **Differential PG-oracle harness** | [`tests/integration/tests/differential_pg.rs`](./tests/integration/tests/differential_pg.rs) — every release runs identical SQL against Basin and a real PostgreSQL; build fails on any cell-level divergence |
 
 Per-statement breakdown with every red row linked to its planner / parser / executor owner: [`docs/sql-support.md`](./docs/sql-support.md). Public capability matrix: [`CAPABILITIES.md`](./CAPABILITIES.md).
 
-**Intentionally out of scope** (per [ADR 0002](./docs/decisions/0002-no-postgres-extensions.md)): `LISTEN/NOTIFY`, `CREATE TRIGGER`, `CREATE OPERATOR`, composite `CREATE TYPE`, multirange / `OID` / `REGCLASS` / `BIT` / `PG_LSN`.
+**Intentionally out of scope** (per [ADR 0002](./docs/decisions/0002-no-postgres-extensions.md)): `CREATE TRIGGER`, `CREATE OPERATOR`, composite `CREATE TYPE`, multirange / `OID` / `REGCLASS` / `BIT` / `PG_LSN`.
+
+`LISTEN` / `NOTIFY` / `UNLISTEN` **are supported** — SQL-level pub/sub via a per-engine notify registry, with PG-accurate transaction buffering (`NOTIFY` inside a transaction is queued and fanned out only on `COMMIT`, discarded on `ROLLBACK`). See [`tests/integration/tests/listen_notify.rs`](./tests/integration/tests/listen_notify.rs).
 
 ---
 
@@ -332,7 +334,7 @@ The full capability matrix (with what's planned and what's deferred): [`CAPABILI
 | **5.10** | Identity + REST (basin-auth, basin-rest, OpenAPI, pagination, streaming, API keys, refresh rotation, per-project connection URLs, **`auth.uid()` / `auth.role()` / `auth.jwt()`** session functions) | **shipped** |
 | **5.11** | Multi-schema isolation | **phase A shipped** — `SchemaName`/`QualifiedTableName` types, schema-aware in-memory + Postgres catalog, `basin_schemas` table, `CREATE/DROP SCHEMA` + cross-schema queries with differential coverage. **Phases B–E in progress** — full qualified-name resolution, `search_path` semantics, wider schema-scoped DDL |
 | **6** | Production hardening | **partial** — telemetry / pooling / rate-limit / cost-rejection / catalog-PITR / fork shipped; multi-region (ADR 0009), catalog replication (ADR 0010), cross-shard 2PC (ADR 0011) all locked architecturally and gated on customer demand |
-| **6.x** | SQL long-tail (still pending) | **planned** — `COPY FROM STDIN` ergonomics, server-side `PREPARE/EXECUTE` over text protocol edge cases, `LISTEN/NOTIFY`, plpgsql `DO` blocks, full `MERGE`, exotic types (multirange / `BIT` / `OID` / `REGCLASS`), and the parser-refused exotic DDL forms |
+| **6.x** | SQL long-tail (still pending) | **planned** — `COPY FROM STDIN` ergonomics, server-side `PREPARE/EXECUTE` over text protocol edge cases, plpgsql `DO` blocks, full `MERGE`, exotic types (multirange / `BIT` / `OID` / `REGCLASS`), and the parser-refused exotic DDL forms |
 | **7** | Launch | gated on Phase 0 |
 
 Six-month wedge slice: [`WEDGE.md`](./WEDGE.md). Full plan: [`TASK.md`](./TASK.md). Decision log: [`docs/decisions/`](./docs/decisions/).

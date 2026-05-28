@@ -237,10 +237,27 @@ pub(crate) async fn enforce_unique_on_insert(
     table_name_str: &str,
     unique_constraints: &[UniqueConstraint],
     batch: &RecordBatch,
+    // Tombstone-aware: `registry` + `pk_columns` let the cold scan skip rows
+    // freed by a prior hot-tier DELETE, so re-INSERTing a UNIQUE value of a
+    // deleted row succeeds (mirrors `enforce_pk_on_insert`).
+    registry: Option<(&basin_hottier::MemTableRegistry, &ProjectId)>,
+    pk_columns: &[String],
 ) -> Result<()> {
     if unique_constraints.is_empty() || batch.num_rows() == 0 {
         return Ok(());
     }
+    // Single-PK tombstone set + dtype, computed once for all constraints.
+    let tombstone_keys: std::collections::HashSet<Vec<u8>> = match registry {
+        Some((reg, proj)) if pk_columns.len() == 1 => collect_tombstone_keys(reg, proj, table),
+        _ => std::collections::HashSet::new(),
+    };
+    let pk_dt: Option<DataType> = if tombstone_keys.is_empty() {
+        None
+    } else {
+        pk_columns.first().and_then(|c| {
+            batch.schema().field_with_name(c).ok().map(|f| f.data_type().clone())
+        })
+    };
     for u in unique_constraints {
         enforce_one_unique(
             storage,
@@ -251,6 +268,9 @@ pub(crate) async fn enforce_unique_on_insert(
             &u.columns,
             batch,
             &[],
+            &tombstone_keys,
+            pk_dt.as_ref(),
+            pk_columns,
         )
         .await?;
     }
@@ -284,6 +304,11 @@ pub(crate) async fn enforce_unique_on_update(
                 &u.columns,
                 b,
                 replaced_paths,
+                // UPDATE path excludes rewritten files via `replaced_paths`;
+                // tombstone suppression is not threaded here (no registry).
+                &std::collections::HashSet::new(),
+                None,
+                &[],
             )
             .await?;
         }
@@ -305,6 +330,14 @@ async fn enforce_one_unique(
     columns: &[String],
     batch: &RecordBatch,
     replaced_paths: &[String],
+    // Tombstone suppression (single-column PK only): cold rows whose PK is
+    // tombstoned in the hot-tier registry are logically deleted and must NOT
+    // count as existing values — otherwise a re-INSERT of a UNIQUE value freed
+    // by a prior hot-tier DELETE wrongly fails (the delete_then_reinsert bug).
+    // Empty `tombstone_keys` (composite PK / no registry) = conservative scan.
+    tombstone_keys: &std::collections::HashSet<Vec<u8>>,
+    pk_dt: Option<&DataType>,
+    pk_columns: &[String],
 ) -> Result<()> {
     if columns.is_empty() || batch.num_rows() == 0 {
         return Ok(());
@@ -351,6 +384,14 @@ async fn enforce_one_unique(
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
+            // PK column index in this cold batch, for tombstone suppression
+            // (single-column PK only — same shape the hot-tier tombstone writer
+            // produces). None disables suppression (composite PK / no PK col).
+            let rb_pk_idx: Option<usize> = if tombstone_keys.is_empty() || pk_dt.is_none() {
+                None
+            } else {
+                pk_columns.first().and_then(|c| rb.schema().index_of(c).ok())
+            };
             // Reuse `citext_positions` derived from the INSERT batch's schema
             // (which HAS Arrow field metadata) rather than re-deriving from the
             // Parquet-read-back schema.  Parquet's `ArrowWriter` does NOT
@@ -362,6 +403,19 @@ async fn enforce_one_unique(
             // logical positions for the columns listed in the constraint, so
             // reusing `citext_positions` is correct.
             for row in 0..rb.num_rows() {
+                // Skip rows whose PK is tombstoned (logically deleted) so a
+                // re-INSERT of a freed UNIQUE value is allowed.
+                if let (Some(pk_i), Some(dt)) = (rb_pk_idx, pk_dt) {
+                    if let Some(rk) = crate::constraint_union::array_value_to_row_key(
+                        rb.column(pk_i).as_ref(),
+                        row,
+                        dt,
+                    ) {
+                        if tombstone_keys.contains(rk.as_bytes()) {
+                            continue;
+                        }
+                    }
+                }
                 if let Some(k) =
                     pk_tuple_for_row_citext(&rb, &rb_idx, row, &citext_positions)?
                 {

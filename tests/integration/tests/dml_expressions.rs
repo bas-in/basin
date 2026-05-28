@@ -366,3 +366,59 @@ async fn delete_all_returning() {
     let remaining = int64_col(sess.execute("SELECT id FROM scratch").await.unwrap(), "id");
     assert!(remaining.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Regression: `WHERE int_col = 'string_literal'` must coerce the text literal
+// to the column type (PG semantics) instead of panicking the worker on an
+// unchecked Arrow `as_string()` downcast over a non-string array.
+// Covers SELECT / UPDATE / DELETE — every predicate path.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn where_int_col_eq_string_literal_coerces_not_panics() {
+    let dir = TempDir::new().unwrap();
+    let eng = make_engine(&dir);
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+    sess.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO t VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')")
+        .await
+        .unwrap();
+
+    // SELECT: int column = string literal — must return the matching row.
+    let names = str_col(
+        sess.execute("SELECT name FROM t WHERE id = '1'")
+            .await
+            .unwrap(),
+        "name",
+    );
+    assert_eq!(names, vec!["alice".to_string()]);
+
+    // UPDATE: the exact repro from the bug report.
+    let res = sess
+        .execute("UPDATE t SET name = 'x' WHERE id = '1'")
+        .await
+        .unwrap();
+    assert_eq!(tag(res), "UPDATE 1");
+    let names = str_col(
+        sess.execute("SELECT name FROM t WHERE id = 1")
+            .await
+            .unwrap(),
+        "name",
+    );
+    assert_eq!(names, vec!["x".to_string()]);
+
+    // DELETE: int column = string literal.
+    let res = sess
+        .execute("DELETE FROM t WHERE id = '2'")
+        .await
+        .unwrap();
+    assert_eq!(tag(res), "DELETE 1");
+    let remaining = int64_col(
+        sess.execute("SELECT id FROM t ORDER BY id").await.unwrap(),
+        "id",
+    );
+    assert_eq!(remaining, vec![1, 3]);
+}

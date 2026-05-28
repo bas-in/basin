@@ -75,6 +75,25 @@ pub(crate) struct PartitionState {
     /// In-memory tail keyed by table. Each `(lsn, batch)` pair tracks the WAL
     /// entry that produced it so the compactor knows what range to truncate.
     tail: HashMap<TableName, Vec<(Lsn, RecordBatch)>>,
+    /// Per-partition compaction serialization lock (#95).
+    ///
+    /// `compact_one` snapshots the tail, writes a Parquet file, commits it to
+    /// the catalog, then prunes the drained entries. Those steps are NOT atomic
+    /// w.r.t. the tail: two concurrent `compact_one` calls (e.g. two pooled
+    /// sessions' synchronous `flush_to_parquet()` before SELECT, or a session
+    /// racing the background compactor) would each snapshot the SAME entries
+    /// and each commit a file — duplicating every row in the cold tier and
+    /// over-counting on read.
+    ///
+    /// Held for the whole `compact_one` body so a given partition compacts one
+    /// at a time. A second caller blocks until the in-flight compaction
+    /// finishes; it then snapshots the now-drained tail and does nothing —
+    /// which is exactly the visibility guarantee the synchronous pre-SELECT
+    /// flush needs (the racing compaction already made the rows durable).
+    ///
+    /// Stored as an `Arc` so it can be cloned out under a brief read lock and
+    /// held across the compaction without holding the `PartitionState` RwLock.
+    compact_lock: Arc<Mutex<()>>,
 }
 
 impl PartitionState {
@@ -86,6 +105,7 @@ impl PartitionState {
             last_compacted_lsn: Lsn::ZERO,
             schemas: HashMap::new(),
             tail: HashMap::new(),
+            compact_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -1167,6 +1187,18 @@ impl InProcessShard {
         partition: &PartitionKey,
         state: Arc<RwLock<PartitionState>>,
     ) -> Result<()> {
+        // Serialize compaction per partition (#95). Clone the compaction lock
+        // out under a brief read lock, then hold it across the whole body so a
+        // concurrent `compact_one` on the same partition cannot snapshot and
+        // re-commit the same tail entries (which duplicated rows in the cold
+        // tier and over-counted on read). A blocked caller resumes after the
+        // in-flight compaction drains the tail and then finds nothing to do.
+        let compact_lock = {
+            let guard = state.read().await;
+            guard.compact_lock.clone()
+        };
+        let _compact_guard = compact_lock.lock().await;
+
         // Snapshot the tail under the inner write lock. Holding it briefly is
         // fine; the lock is per-partition and we drop it before any I/O.
         let tail_snapshot: Vec<(TableName, Vec<(Lsn, RecordBatch)>)> = {
@@ -2514,6 +2546,52 @@ mod tests {
         // value or higher, never resetting to ZERO. Just call it to ensure
         // truncate didn't error out.
         let _ = wal.high_water(&project, &partition).await.unwrap();
+    }
+
+    /// Regression for the concurrent-compaction over-count (#95).
+    ///
+    /// Two pooled sessions issuing a `SELECT` each call `flush_to_parquet()`
+    /// (→ `compact_all` → `compact_one`) before reading the cold tier. With no
+    /// per-partition serialization, both `compact_one` calls snapshot the SAME
+    /// tail entries, both write a Parquet file, and both commit to the catalog
+    /// (the second wins the `commit_with_retry` conflict path against the
+    /// already-advanced snapshot). The rows end up duplicated across two cold
+    /// files, so a subsequent read returns 2*N rows for N inserted rows.
+    ///
+    /// Asserts the post-flush read count is EXACTLY N, never more.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_compaction_does_not_double_count() {
+        const N: usize = 50;
+        let (shard, _sd, _wd, _storage, _cat, _wal) = fresh_shard().await;
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+        let table = TableName::new("events").unwrap();
+
+        let handle = shard.get(&project, &partition).await.unwrap();
+        // Insert N rows (1 row per batch) into the in-memory tail.
+        for i in 0..N as i64 {
+            handle.write_batch(&table, batch(i, 1, "v-")).await.unwrap();
+        }
+
+        // Fire many concurrent flush_to_parquet() calls against the SAME
+        // partition, mirroring multiple pooled sessions racing a flush.
+        let mut joins = Vec::new();
+        for _ in 0..8 {
+            let s = shard.clone();
+            joins.push(tokio::spawn(async move { s.flush_to_parquet().await }));
+        }
+        for j in joins {
+            j.await.unwrap().unwrap();
+        }
+
+        // After all flushes, the row count must be exactly N.
+        let read = handle.read(&table, ReadOptions::default()).await.unwrap();
+        assert_eq!(
+            rows_in(&read),
+            N,
+            "concurrent compaction must not duplicate rows (got {}, want {N})",
+            rows_in(&read),
+        );
     }
 
     #[tokio::test]

@@ -91,6 +91,18 @@ pub fn evaluate(
         return Ok(eval_starts_with(col, prefix, *case_insensitive));
     }
 
+    // PG coerces an unknown/text literal to the column's type before
+    // comparing (e.g. `WHERE int_col = '1'` parses '1' as int8). Without
+    // this, a `ScalarValue::Utf8` against a numeric/boolean column would
+    // fall through to the generic Utf8 arm and call `as_string()` on a
+    // non-string Arrow array — an unchecked downcast that panics
+    // ("string array", arrow cast.rs). Coerce here and re-dispatch so the
+    // typed comparison arms handle it. Text/timestamp/UUID columns keep the
+    // Utf8 scalar (they have dedicated arms below).
+    if let Some(coerced) = coerce_utf8_scalar_for_column(predicate, col.data_type())? {
+        return evaluate(batch, &coerced);
+    }
+
     macro_rules! cmp_primitive {
         ($arrow_ty:ty, $val:expr, $op:tt) => {{
             let arr = col.as_primitive::<$arrow_ty>();
@@ -384,6 +396,89 @@ fn predicate_value(p: &Predicate) -> ScalarValue {
         // `evaluate`). Returning a sentinel keeps the function total.
         Predicate::StartsWith { prefix, .. } => ScalarValue::Utf8(prefix.clone()),
     }
+}
+
+/// PG-style coercion of an unknown/text literal to the column's type.
+///
+/// When a comparison's literal arrives as [`ScalarValue::Utf8`] (every
+/// single-quoted SQL literal does) but the column is numeric or boolean,
+/// PostgreSQL coerces the text literal to the column type before comparing
+/// (`WHERE int_col = '1'` parses `'1'` as int8). This returns a rewritten
+/// [`Predicate`] carrying the coerced scalar so the caller can re-dispatch
+/// through [`evaluate`]'s typed arms.
+///
+/// Returns `Ok(None)` when no coercion is needed — the scalar isn't `Utf8`,
+/// or the column type already has a dedicated `Utf8` arm (text, timestamp,
+/// UUID/FixedSizeBinary). Returns `Err` (a typed SQL error, never a panic)
+/// when the literal can't be parsed as the column type, matching PG's
+/// "invalid input syntax for type …".
+fn coerce_utf8_scalar_for_column(
+    predicate: &Predicate,
+    col_type: &arrow_schema::DataType,
+) -> Result<Option<Predicate>> {
+    use arrow_schema::DataType as Dt;
+
+    // Only Eq/Gt/Lt carry a comparable scalar; StartsWith is handled earlier.
+    let (col, val) = match predicate {
+        Predicate::Eq(c, v) | Predicate::Gt(c, v) | Predicate::Lt(c, v) => (c, v),
+        Predicate::StartsWith { .. } => return Ok(None),
+    };
+    let ScalarValue::Utf8(s) = val else {
+        return Ok(None);
+    };
+
+    // Determine the target scalar for the column type. Text, timestamp,
+    // and UUID columns keep the Utf8 scalar (dedicated arms handle them).
+    let coerced: ScalarValue = match col_type {
+        Dt::Int8 | Dt::Int16 | Dt::Int32 | Dt::Int64 => {
+            let n: i64 = s.trim().parse().map_err(|_| {
+                BasinError::storage(format!(
+                    "invalid input syntax for type integer: {s:?}"
+                ))
+            })?;
+            ScalarValue::Int64(n)
+        }
+        Dt::UInt8 | Dt::UInt16 | Dt::UInt32 | Dt::UInt64 => {
+            let n: u64 = s.trim().parse().map_err(|_| {
+                BasinError::storage(format!(
+                    "invalid input syntax for type integer: {s:?}"
+                ))
+            })?;
+            ScalarValue::UInt64(n)
+        }
+        Dt::Float16 | Dt::Float32 | Dt::Float64 => {
+            let n: f64 = s.trim().parse().map_err(|_| {
+                BasinError::storage(format!(
+                    "invalid input syntax for type double precision: {s:?}"
+                ))
+            })?;
+            ScalarValue::Float64(n)
+        }
+        Dt::Boolean => {
+            // PG accepts t/f/true/false/yes/no/on/off/1/0 (case-insensitive).
+            let b = match s.trim().to_ascii_lowercase().as_str() {
+                "t" | "true" | "yes" | "on" | "1" => true,
+                "f" | "false" | "no" | "off" | "0" => false,
+                _ => {
+                    return Err(BasinError::storage(format!(
+                        "invalid input syntax for type boolean: {s:?}"
+                    )));
+                }
+            };
+            ScalarValue::Boolean(b)
+        }
+        // Utf8/LargeUtf8, Timestamp(..), FixedSizeBinary (UUID), and any
+        // other type keep the Utf8 scalar — no coercion needed/possible here.
+        _ => return Ok(None),
+    };
+
+    let col = col.clone();
+    Ok(Some(match predicate {
+        Predicate::Eq(..) => Predicate::Eq(col, coerced),
+        Predicate::Gt(..) => Predicate::Gt(col, coerced),
+        Predicate::Lt(..) => Predicate::Lt(col, coerced),
+        Predicate::StartsWith { .. } => unreachable!("StartsWith handled above"),
+    }))
 }
 
 /// Evaluate `StartsWith` against a Utf8/LargeUtf8 column. Anything else
@@ -1119,6 +1214,77 @@ mod compound_tests {
             collect_mask(&mask),
             vec![Some(true), Some(true), Some(true), Some(false), Some(true)]
         );
+    }
+
+    /// Regression: `WHERE int_col = '1'` (string literal vs integer column)
+    /// must coerce the literal to the column type like PostgreSQL, not panic
+    /// by calling `as_string()` on a non-string Arrow array.
+    ///
+    /// This is the SELECT/UPDATE/DELETE predicate path — every WHERE clause
+    /// against this storage layer routes through `evaluate_compound`, so a
+    /// single mask assertion covers all three statement kinds.
+    #[test]
+    fn utf8_literal_vs_int_column_coerces_no_panic() {
+        // Eq: '1' against Int64 id column.
+        let pred = CompoundPredicate::Atom(Predicate::Eq("id".into(), ScalarValue::Utf8("1".into())));
+        let mask = evaluate_compound(&small_batch(), &pred).unwrap();
+        // ids: 1,2,NULL,4,5 → only the first row (id=1) matches.
+        assert_eq!(
+            collect_mask(&mask),
+            vec![Some(true), Some(false), Some(false), Some(false), Some(false)]
+        );
+
+        // Gt: id > '1' (string) → coerced to int8.
+        let pred = CompoundPredicate::Atom(Predicate::Gt("id".into(), ScalarValue::Utf8("1".into())));
+        let mask = evaluate_compound(&small_batch(), &pred).unwrap();
+        assert_eq!(
+            collect_mask(&mask),
+            vec![Some(false), Some(true), Some(false), Some(true), Some(true)]
+        );
+
+        // Lt: id < '5' (string) → coerced to int8.
+        let pred = CompoundPredicate::Atom(Predicate::Lt("id".into(), ScalarValue::Utf8("5".into())));
+        let mask = evaluate_compound(&small_batch(), &pred).unwrap();
+        assert_eq!(
+            collect_mask(&mask),
+            vec![Some(true), Some(true), Some(false), Some(true), Some(false)]
+        );
+
+        // A non-numeric string against an int column is a typed error, never
+        // a panic (PG: "invalid input syntax for type integer").
+        let pred = CompoundPredicate::Atom(Predicate::Eq("id".into(), ScalarValue::Utf8("abc".into())));
+        assert!(evaluate_compound(&small_batch(), &pred).is_err());
+
+        // The Utf8-column path is unaffected: '1' against the name column
+        // still compares as a string.
+        let pred = CompoundPredicate::Atom(Predicate::Eq("name".into(), ScalarValue::Utf8("a".into())));
+        let mask = evaluate_compound(&small_batch(), &pred).unwrap();
+        assert_eq!(
+            collect_mask(&mask),
+            vec![Some(true), Some(false), Some(false), Some(false), Some(false)]
+        );
+    }
+
+    /// Float and boolean columns also coerce a Utf8 literal rather than
+    /// panicking on the unchecked `as_string()` downcast.
+    #[test]
+    fn utf8_literal_vs_float_and_bool_columns_coerce() {
+        use arrow_array::{BooleanArray, Float64Array};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("f", DataType::Float64, true),
+            Field::new("b", DataType::Boolean, true),
+        ]));
+        let f = Float64Array::from(vec![Some(1.5), Some(2.0), None]);
+        let b = BooleanArray::from(vec![Some(true), Some(false), None]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(f), Arc::new(b)]).unwrap();
+
+        let pred = CompoundPredicate::Atom(Predicate::Eq("f".into(), ScalarValue::Utf8("2.0".into())));
+        let mask = evaluate_compound(&batch, &pred).unwrap();
+        assert_eq!(collect_mask(&mask), vec![Some(false), Some(true), Some(false)]);
+
+        let pred = CompoundPredicate::Atom(Predicate::Eq("b".into(), ScalarValue::Utf8("true".into())));
+        let mask = evaluate_compound(&batch, &pred).unwrap();
+        assert_eq!(collect_mask(&mask), vec![Some(true), Some(false), Some(false)]);
     }
 
     #[test]

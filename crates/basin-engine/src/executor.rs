@@ -3741,6 +3741,8 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
                 table.as_str(),
                 &meta.unique_constraints,
                 &batch,
+                Some((&*sess.engine.memtable_registry(), &sess.project)),
+                &meta.pk_columns,
             )
             .await?;
             materialised_groups.push((pkey, batch));
@@ -3845,6 +3847,8 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
         table.as_str(),
         &meta.unique_constraints,
         &batch,
+        Some((&*sess.engine.memtable_registry(), &sess.project)),
+        &meta.pk_columns,
     )
     .await?;
     let row_count = batch.num_rows();
@@ -4280,6 +4284,8 @@ async fn exec_insert_select(
         table.as_str(),
         &meta.unique_constraints,
         &batch,
+        Some((&*sess.engine.memtable_registry(), &sess.project)),
+        &meta.pk_columns,
     )
     .await?;
 
@@ -4495,6 +4501,8 @@ async fn exec_insert_default_values(
         table.as_str(),
         &meta.unique_constraints,
         &batch,
+        Some((&*sess.engine.memtable_registry(), &sess.project)),
+        &meta.pk_columns,
     )
     .await?;
 
@@ -4677,6 +4685,8 @@ pub(crate) async fn exec_ingest_batch(
         table.as_str(),
         &meta.unique_constraints,
         &batch,
+        Some((&*sess.engine.memtable_registry(), &sess.project)),
+        &meta.pk_columns,
     )
     .await?;
 

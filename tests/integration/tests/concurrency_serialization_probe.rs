@@ -195,11 +195,25 @@ async fn concurrency_serialization_probe() {
     // key — and print per-op wall time. A healthy engine does this in low-ms;
     // seconds means a retry storm / cold-path rewrite under contention. Capped
     // at N=2 so a regression can't hang the suite for minutes.
-    let single_upd = {
+    // Reconcile the bench (single-row UPDATE = 8ms) vs RMW (221ms): the
+    // difference is whether SET reads the old value. `SET col = <literal>` is
+    // write-only; `SET col = col + 1` is read-modify-write and must read the
+    // old row first. Time both on cold rows on the SAME table.
+    let upd_literal = {
         let t = Instant::now();
-        let _ = sess.execute("UPDATE events SET amount = amount + 1.0 WHERE id = 7").await;
+        let _ = sess.execute("UPDATE events SET status = 'x' WHERE id = 5").await;
         t.elapsed().as_secs_f64() * 1000.0
     };
+    let upd_rmw = {
+        let t = Instant::now();
+        let _ = sess.execute("UPDATE events SET amount = amount + 1.0 WHERE id = 6").await;
+        t.elapsed().as_secs_f64() * 1000.0
+    };
+    println!(
+        "[concurrency] UPDATE SET=literal (write-only)={upd_literal:.3}ms  SET=col+1 (read-modify-write)={upd_rmw:.3}ms  rmw/literal={:.1}x",
+        upd_rmw / upd_literal.max(1e-9)
+    );
+    let single_upd = upd_rmw;
     let contended_wall = concurrent_wall(&engine, project, 2, move |_idx, s| async move {
         let _ = s.execute("UPDATE events SET amount = amount + 1.0 WHERE id = 9").await;
     })

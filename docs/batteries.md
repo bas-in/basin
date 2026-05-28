@@ -186,23 +186,28 @@ Code: [`crates/basin-realtime/`](../crates/basin-realtime/).
 
 ## Blob storage (`basin-blob`)
 
-Status: 🛠 v0.1 partial. Engine seam shipped; SDK surface ongoing.
+Status: ✅ v1 shipped (ADR 0021).
 
-The storage trait + per-project bucket prefix + quota integration
-points are wired. The HTTP surface (signed-URL upload / download,
-range reads, content-type negotiation, lifecycle policies) is in
-flight per [ADR 0021](./decisions/0021-object-storage.md).
+The catalog-backed `BlobStore` (`basin-blob`) plus the public `/storage/v1/`
+REST surface in `basin-rest` are wired end-to-end:
 
-What works today: an embedder linking `basin-blob` directly can
-register handlers against the engine seam and persist objects under
-the project's bucket prefix with the same IAM-boundary guarantees as
-the SQL data path. What's not done: the public REST endpoint, the
-basin-js client surface, signed-URL minting with bucket-policy
-matching, and quota integration.
+- **Buckets:** create / get / delete (delete purges orphaned objects).
+- **Objects:** upload (server-side MIME sniffing), download, list with
+  prefix + paging, single delete, bulk delete by prefix.
+- **Public fast path:** `GET /storage/v1/object/public/:project/:bucket/*path`
+  serves objects in public buckets without a JWT.
+- **Signed URLs:** mint (JWT-gated) + verify (no JWT) — HMAC-SHA256 over
+  `(project, bucket, path, expiry)`, constant-time verification, and
+  independent signing-key rotation that invalidates outstanding tokens.
+- **Per-object RLS:** `OwnerEqAuthUid` / role / true / false predicates with
+  Postgres permissive OR-merge semantics, enforced on download and list.
+- **Quota:** per-project `bytes_written_total` counter, incremented on upload
+  and decremented on delete.
 
-Don't ship a public file-upload product on `basin-blob` in v0.1 — use
-it for engine-internal blob persistence (e.g. wide BYTEA columns
-offloaded to object storage), not as a user-facing upload service.
+Deferred to v1.1: `HEAD` (metadata-only) and `COPY` object operations,
+resumable multipart / TUS uploads, image transforms, object versioning, and
+cross-project object sharing. Cloud-side quota *enforcement* (rejecting writes
+past a limit), billing, and CDN integration live above this crate.
 
 Code: [`crates/basin-blob/`](../crates/basin-blob/).
 ADR: [0021](./decisions/0021-object-storage.md).
@@ -248,36 +253,46 @@ ADR: [0003](./decisions/0003-native-vector-search.md).
 
 ## WASM UDFs (`basin-fn`)
 
-Status: 🛠 v0.1 scalar (`i32` / `i64` / `f64`).
+Status: ✅ v0.1 scalar — `i32` / `i64` / `f64` plus `text` / `bytea` /
+`timestamptz` args and returns.
 
 In-engine compute via WebAssembly, sandboxed by `wasmtime`. The
-function body is a Wasm component compiled from Rust / Zig / Go /
+function body is a bare Wasm module compiled from Rust / Zig / Go /
 AssemblyScript — anything that targets `wasm32-unknown-unknown` and
 respects the host ABI.
 
 ```sql
--- Register a sandboxed Rust UDF (i32 → i32 today; strings deferred).
+-- Numeric UDF.
 CREATE FUNCTION square(n INT) RETURNS INT
 LANGUAGE wasm AS '<base64-encoded-wasm-module>';
 
 SELECT square(5);  -- → 25
+
+-- String UDF: text/bytea cross the boundary over the (ptr,len) ABI.
+CREATE FUNCTION upper_ascii(s TEXT) RETURNS TEXT
+LANGUAGE wasm AS '<base64-encoded-wasm-module>';
 ```
 
 Resource caps land per call (linear-memory ceiling, instruction
 budget via Wasmtime epoch interruption, fuel limit). A runaway UDF
 gets epoch-interrupted instead of pinning a thread.
 
-Honest caveat: scalar numeric arguments only in v0.1. Passing a
-string, JSONB, or Arrow array into a Wasm UDF needs the shared-
-memory protocol (Wasmtime exported `alloc` / `free` + a UTF-8 / Arrow
-transport), which is tracked for the phase after v0.1. Until then:
+Variable-length values (`text` / `bytea`) cross the host↔guest boundary
+over a `(ptr, len)` linear-memory ABI: the module exports `memory`,
+`basin_alloc(i32) -> i32`, and `basin_dealloc(i32, i32)`; the host writes
+the bytes into guest memory and the guest packs its return as a
+`(ptr << 32) | len` `i64` (`len = -1` signals SQL `NULL`).
 
-- Use `LANGUAGE sql` for string / JSONB transforms — the SQL surface
-  covers `regexp_match`, `jsonb_path_query`, `jsonb_set`, `format`,
-  `encode`/`decode`, and the rest of the JSONB-mutating + regex
+Honest caveats:
+
+- **JSONB** is passed by declaring the argument as `text` and parsing the
+  canonical JSON bytes inside the module — there is no dedicated `jsonb`
+  arg type yet.
+- Execution is **per-row**; vectorized (whole-Arrow-array) invocation is
+  deferred. For bulk string/JSONB transforms, prefer `LANGUAGE sql` — the
+  SQL surface covers `regexp_match`, `jsonb_path_query`, `jsonb_set`,
+  `format`, `encode`/`decode`, and the rest of the JSONB-mutating + regex
   families.
-- Use `LANGUAGE wasm` for numeric math, validation, signature checks,
-  and any pure-numeric per-row UDF.
 
 Why Wasm and not V8 / Deno: cleaner per-project isolation (linear
 memory + epoch-interrupt vs V8 isolate quotas), simpler maintenance

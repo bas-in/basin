@@ -21,7 +21,7 @@ SQL fragments tested: 975 total / 2610 green (across all three configurations).
 | 🛠 | Parsed + planned, runtime exec error |
 | 📜 | Planner/executor rejected (plan-time error) |
 | ❌ | Parser refused (sqlparser / pg_query syntax error) |
-| 🚫 | Explicitly out-of-scope (LISTEN/NOTIFY/VACUUM etc.) |
+| 🚫 | Explicitly out-of-scope (VACUUM/CLUSTER/REINDEX etc.) |
 
 ## Admin/Sessions
 
