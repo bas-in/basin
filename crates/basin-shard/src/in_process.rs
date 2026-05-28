@@ -1656,6 +1656,37 @@ impl ShardImpl for InProcessShard {
         seen.into_iter().collect()
     }
 
+    async fn drop_table(&self, project: &ProjectId, table: &TableName) -> Result<()> {
+        // Snapshot the relevant partition states under the outer mutex,
+        // then release the mutex before touching each per-partition
+        // RwLock so we don't hold the global map lock across awaits.
+        let snapshot: Vec<Arc<RwLock<PartitionState>>> = {
+            let map = self.partitions.lock().await;
+            map.iter()
+                .filter(|((p, _), _)| p == project)
+                .map(|(_, state)| state.clone())
+                .collect()
+        };
+        for state in snapshot {
+            let mut g = state.write().await;
+            g.tail.remove(table);
+            g.schemas.remove(table);
+            g.touch();
+        }
+        // Also drop the hot-tier MemTableRegistry entry, if one is wired
+        // in.  Today's INSERT path through `InProcessProjectHandle`
+        // writes to the partition tail above, not the registry, but the
+        // engine carries its own MemTableRegistry that some code paths
+        // populate (e.g. constraint enforcement snapshots).  Belt + braces:
+        // engine-level callers also `remove` from their own registry in
+        // `exec_drop_table`; this branch keeps the shard internally
+        // consistent if a future flush task routes through the registry.
+        if let Some(reg) = &self.cfg.memtable_registry {
+            reg.remove(project, table);
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn as_in_process(&self) -> Option<Arc<InProcessShard>> {
         Some(Arc::new(self.share_clone()))

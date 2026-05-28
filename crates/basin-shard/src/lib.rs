@@ -366,6 +366,21 @@ impl Shard {
             .await
     }
 
+    /// Drop the shard's in-memory tail (and cached schema) for
+    /// `(project, table)` across every resident partition.
+    ///
+    /// SECURITY (sec_catalog_leakage P1): without this, rows that were
+    /// INSERTed into a table and never flushed past the shard's tail
+    /// survive `DROP TABLE` — the catalog row is removed but the read
+    /// path still merges the tail batches over the (now-absent) cold
+    /// tier, leaking data to a fresh session that re-issues
+    /// `SELECT * FROM <dropped>` (or even re-creates the same table
+    /// name). `exec_drop_table` calls this immediately after the
+    /// catalog-side `drop_table` succeeds.
+    pub async fn drop_table(&self, project: &ProjectId, table: &TableName) -> Result<()> {
+        self.inner.drop_table(project, table).await
+    }
+
     /// Test-only: pull out the concrete in-process implementation so the
     /// inline tests can drive its synchronous helpers. Returns `None` if a
     /// future backend swap replaces the in-process map.
@@ -506,6 +521,15 @@ pub(crate) trait ShardImpl: Send + Sync {
         _partition: &PartitionKey,
         _to_holder: &str,
     ) -> Result<()> {
+        Ok(())
+    }
+    /// Drop all in-memory tail and cached schema entries for
+    /// `(project, table)` across every resident partition. Called from
+    /// `exec_drop_table` so a freshly-opened session can't read rows that
+    /// were inserted into the dropped table but never flushed past the
+    /// shard's tail (sec_catalog_leakage P1). Default no-op for backends
+    /// that don't keep an in-memory tail.
+    async fn drop_table(&self, _project: &ProjectId, _table: &TableName) -> Result<()> {
         Ok(())
     }
     /// Test-only downcast for the inline test suite.

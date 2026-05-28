@@ -288,6 +288,88 @@ mod tests {
         );
     }
 
+    // SECURITY regression: the bare `StaticProjectResolver` accepts ANY
+    // password — its impl of `ProjectResolver` does NOT override
+    // `resolve_credentials`, so the trait's default forwards the call to
+    // `resolve(username)`, completely ignoring the password slot. With a
+    // populated map this means a single name in the map (the old default
+    // `BASIN_PROJECTS=alice=*`) silently authenticates any pgwire client
+    // that types that username — regardless of the password they send.
+    //
+    // This test pins both halves of the contract:
+    //
+    // 1. A populated static resolver returns the mapped project for ANY
+    //    password — the load-bearing observation that motivates leaving
+    //    it OUT of the production stack unless explicitly populated.
+    //
+    // 2. An EMPTY static resolver (the new default `BASIN_PROJECTS=""`)
+    //    returns NotFound for every username, password pair — confirming
+    //    that if basin-server skips appending it (because the operator
+    //    didn't set BASIN_PROJECTS) we do not silently let any user in.
+    //
+    // The basin-server fix is structural: only `push` the static resolver
+    // into the resolver-stack vec when `static_resolver_has_entries` is
+    // true. The test below is the unit-level check that "empty static map
+    // means no auth bypass" — exactly the property the production wiring
+    // now relies on.
+    #[tokio::test]
+    async fn static_resolver_accepts_any_password_when_populated() {
+        let t = ProjectId::new();
+        let r = StaticProjectResolver::default().with_entry("alice", t);
+        // Any password works — this is exactly why we keep it out of the
+        // stack when empty.
+        assert_eq!(
+            r.resolve_credentials("alice", "wrong-password").await.unwrap(),
+            t
+        );
+        assert_eq!(
+            r.resolve_credentials("alice", "").await.unwrap(),
+            t
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_static_resolver_rejects_unknown_user() {
+        // Matches the production wiring when BASIN_PROJECTS is unset:
+        // the static resolver is built with no entries (or omitted from
+        // the stack entirely). Either way, lookups must surface NotFound,
+        // never auto-provision or fall through to a default.
+        let r = StaticProjectResolver::default();
+        let err = r.resolve("alice").await.unwrap_err();
+        assert!(matches!(err, BasinError::NotFound(_)), "got {err:?}");
+        let err = r
+            .resolve_credentials("alice", "any-password")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BasinError::NotFound(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn stack_without_static_rejects_unknown_user() {
+        // Simulates the new production stack when BASIN_PROJECTS is unset:
+        // only credential / JWT / API-key resolvers are mounted, all of
+        // which return errors for an unknown username. The stack must
+        // surface that as NotFound rather than ever falling through to a
+        // static map.
+        //
+        // We model the cred / JWT / API-key resolvers with plain
+        // `StaticProjectResolver::default()` instances (empty maps) since
+        // their failure shape — NotFound for an unmatched username — is
+        // what the stack consumes. The point of this test is the *absence*
+        // of the populated static resolver at the tail of the vec.
+        let stacked = StackedProjectResolver::new(vec![
+            Arc::new(StaticProjectResolver::default()),
+            Arc::new(StaticProjectResolver::default()),
+            Arc::new(StaticProjectResolver::default()),
+            // ↑ no populated static resolver appended at the tail.
+        ]);
+        let err = stacked
+            .resolve_credentials("alice", "any-password")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BasinError::NotFound(_)), "got {err:?}");
+    }
+
     // --- JwtProjectResolver tests --------------------------------------------
     //
     // These tests stand up a live `AuthService` against PG. They mirror the

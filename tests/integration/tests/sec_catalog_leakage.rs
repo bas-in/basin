@@ -87,19 +87,19 @@ fn row_count(res: ExecResult) -> usize {
 // ---------------------------------------------------------------------------
 // 1. After DROP, a FRESH session can't query the table.
 //
-// FINDING (sec_catalog_leakage, 2026-05-29): when the engine is constructed
-// with `Shard` attached and rows live ONLY in the memtable (no
-// `flush_to_parquet`), a `DROP TABLE` removes the catalog row but the
-// memtable rows remain readable by a freshly-opened session of the same
-// project. This is a P1 data-after-drop leak surface: it survives a session
-// boundary as long as the engine process persists. The repro is
-// deterministic; see the assertion below. The mitigation is for
-// `exec_drop_table` to also tombstone / purge the in-flight memtable
-// partitions for the dropped table.
+// SECURITY P1 (sec_catalog_leakage): when rows live ONLY in the hot tier
+// (no `flush_to_parquet` between INSERT and DROP), `DROP TABLE` must purge
+// the shard's in-memory tail AND the hot-tier MemTableRegistry entry for
+// `(project, table)`. Without it, the catalog row is removed but the
+// in-RAM overlay survives the session boundary — a fresh session of the
+// same project can still `SELECT * FROM <dropped_table>` and retrieve
+// every memtable row. Mitigation: `exec_drop_table` calls
+// `shard.drop_table(project, table)` and `MemTableRegistry::remove(...)`
+// after the catalog drop succeeds.
 //
-// This test pins the CURRENT (incorrect) behaviour with a documented
-// finding so the suite stays green; a future fix should flip the
-// assertion direction and remove the finding comment.
+// Test asserts STRICTLY: a fresh session must NOT see any rows from the
+// dropped table — either an error (table not found) or an empty result
+// is acceptable; a non-zero row count is the leak this test pins.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -118,29 +118,23 @@ async fn dropped_table_is_unreachable_on_new_session() {
     s1.execute("DROP TABLE ephemeral").await.unwrap();
     drop(s1);
 
-    // Fresh session: today's engine leaks the dropped rows from the
-    // memtable. Flag the finding and do not fail the suite.
+    // Fresh session: the dropped rows must NOT be reachable. Either an
+    // error (table not found) or an empty result is acceptable; a
+    // non-zero row count is the P1 leak.
     let s2 = eng.open_session(p).await.unwrap();
     let r = s2.execute("SELECT * FROM ephemeral").await;
     match r {
         Ok(res) => {
             let n = row_count(res);
-            if n > 0 {
-                eprintln!(
-                    "[sec_catalog_leakage] FINDING: SELECT FROM dropped table 'ephemeral' \
-                     returned {n} rows on a fresh session — P1 data-after-drop leak; \
-                     DROP TABLE does not purge memtable rows. Mitigation: tombstone the \
-                     hot-tier partitions for the dropped table in exec_drop_table."
-                );
-            } else {
-                // Surprising — engine returned an empty result. Acceptable.
-            }
-        }
-        Err(e) => {
-            // The desired outcome: NotFound (or similar typed error).
-            eprintln!(
-                "[sec_catalog_leakage] OK: dropped table errored as expected: {e}"
+            assert_eq!(
+                n, 0,
+                "SECURITY P1: SELECT from dropped table returned {n} rows on a fresh session — \
+                 hot-tier overlay survived DROP. exec_drop_table must purge the shard tail \
+                 and MemTableRegistry entry for (project, table)."
             );
+        }
+        Err(_e) => {
+            // Desired outcome: a typed error from the read path.
         }
     }
 }

@@ -324,6 +324,16 @@ async fn main() -> Result<()> {
     };
 
     // Build the static resolver from `BASIN_PROJECTS`.
+    //
+    // SECURITY: `StaticProjectResolver` accepts ANY password (its
+    // `ProjectResolver` impl falls through to the trait's default
+    // `resolve_credentials`, which drops the password slot). The previous
+    // default `BASIN_PROJECTS=alice=*` therefore made the static map an
+    // open relay for `user=alice` when combined with a public pgwire
+    // listener. We now default `BASIN_PROJECTS` to empty (see config
+    // parse), and only mount the static resolver into the stack below
+    // when at least one user mapping was explicitly provided.
+    let static_resolver_has_entries = !cfg.projects.is_empty();
     let mut static_resolver = StaticProjectResolver::default();
     for (user, project) in cfg.projects {
         tracing::info!(%user, %project, "project registered");
@@ -413,15 +423,26 @@ async fn main() -> Result<()> {
     // AuthService right now (no deferred slot needed), so we wire up the
     // full JWT + API-key + credentials + static stack immediately.
     // In the minimal build (no `auth` feature), only the static resolver is used.
+    //
+    // SECURITY: the static resolver is only appended when an operator
+    // explicitly populated `BASIN_PROJECTS`. Empty map => no static fallback
+    // (otherwise an attacker who lands on `user=<any-static-mapping>` would
+    // bypass credential / JWT / API-key auth via the trait's default
+    // `resolve_credentials` that drops the password slot).
     #[cfg(feature = "auth")]
     let project_resolver: Arc<dyn ProjectResolver> = if let Some(ref auth) = auth_service {
-        tracing::info!("pgwire resolver: credentials + JWT + API-key + static");
-        Arc::new(StackedProjectResolver::new(vec![
+        let mut stack: Vec<Arc<dyn ProjectResolver>> = vec![
             Arc::new(ProjectCredentialsResolver::new(auth.clone())),
             Arc::new(JwtProjectResolver::new(auth.clone())),
             Arc::new(ApiKeyProjectResolver::new(auth.clone())),
-            Arc::new(static_resolver),
-        ]))
+        ];
+        if static_resolver_has_entries {
+            tracing::info!("pgwire resolver: credentials + JWT + API-key + static");
+            stack.push(Arc::new(static_resolver));
+        } else {
+            tracing::info!("pgwire resolver: credentials + JWT + API-key (static disabled)");
+        }
+        Arc::new(StackedProjectResolver::new(stack))
     } else {
         tracing::info!("pgwire resolver: static (auth disabled)");
         Arc::new(static_resolver)
@@ -674,7 +695,17 @@ impl Cfg {
             .unwrap_or_else(|_| "127.0.0.1:5434".to_string())
             .parse()
             .context("BASIN_REST_BIND must be host:port")?;
-        let raw = std::env::var("BASIN_PROJECTS").unwrap_or_else(|_| "alice=*".to_string());
+        // BASIN_PROJECTS — static `user=project` map for the dev / bootstrap
+        // resolver. Default is **empty**: a previous default of `"alice=*"`
+        // silently provisioned a `user=alice` mapping that the static
+        // resolver would then accept with ANY password (the trait's
+        // default `resolve_credentials` impl drops the password slot).
+        // Combined with a public pgwire listener, that silently turned any
+        // basin-server into an open relay for `user=alice`. Empty default
+        // closes the hole; operators (and dev scripts like
+        // `basin-cloud/scripts/local-engine.sh`) that need the static map
+        // still set `BASIN_PROJECTS` explicitly.
+        let raw = std::env::var("BASIN_PROJECTS").unwrap_or_default();
         let mut projects = Vec::new();
         for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             let (user, tid) = entry
@@ -691,7 +722,9 @@ impl Cfg {
             projects.push((user.to_owned(), project));
         }
         if projects.is_empty() {
-            return Err(anyhow!("BASIN_PROJECTS produced no entries"));
+            tracing::info!(
+                "BASIN_PROJECTS not set — static resolver disabled (cred/JWT/API-key only)"
+            );
         }
         let catalog = parse_catalog_env()?;
         let storage_root_prefix = parse_object_prefix_env("BASIN_STORAGE_ROOT_PREFIX")?;

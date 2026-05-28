@@ -3031,6 +3031,36 @@ async fn exec_drop_table(
                 // table is harmless for the next request (which opens a new
                 // session).
                 let _ = sess.ctx.deregister_table(table.as_str());
+
+                // SECURITY (sec_catalog_leakage P1): purge any rows that
+                // live in the hot tier — both the engine's
+                // `MemTableRegistry` AND, when shard is wired, the
+                // shard's per-partition in-memory `tail`. Without these,
+                // rows that were INSERTed in the same session but never
+                // flushed past the hot tier survive the catalog DROP and
+                // are still visible to a freshly-opened session of the
+                // same project (the read path merges overlay ∪ cold; the
+                // catalog row is gone but the overlay still has values).
+                //
+                // The MemTableRegistry path covers code paths that route
+                // through it (e.g. constraint enforcement); the shard
+                // `drop_table` path covers the actual INSERT route used
+                // when a `Shard` is attached — `InProcessProjectHandle::
+                // write_batch` writes to `PartitionState.tail`, not the
+                // registry, so the registry-only fix is insufficient on
+                // the shard path. Both are O(partition-count-for-project)
+                // and idempotent; calling both is the belt + braces fix.
+                sess.engine
+                    .memtable_registry()
+                    .remove(&sess.project, &table);
+                if let Some(shard) = sess.engine.config().shard.as_ref() {
+                    // Errors here are best-effort: the catalog drop
+                    // already succeeded; a stale shard tail entry for a
+                    // table that no longer exists is not a correctness
+                    // problem for any future statement (the table can't
+                    // be looked up via the catalog).
+                    let _ = shard.drop_table(&sess.project, &table).await;
+                }
             }
             Err(BasinError::NotFound(_)) if if_exists => {
                 // IF EXISTS — silently ignore missing tables.

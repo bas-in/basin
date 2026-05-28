@@ -251,13 +251,39 @@ pub fn evaluate(
         {
             cmp_narrow_int_as_i64!(TimestampSecondType, *v, <)
         }
-        // Fallback: Int64 scalar vs any remaining int type (original arms).
-        (Predicate::Eq(_, _), ScalarValue::Int64(v)) => cmp_primitive!(Int64Type, *v, ==),
-        (Predicate::Gt(_, _), ScalarValue::Int64(v)) => cmp_primitive!(Int64Type, *v, >),
-        (Predicate::Lt(_, _), ScalarValue::Int64(v)) => cmp_primitive!(Int64Type, *v, <),
-        (Predicate::Eq(_, _), ScalarValue::UInt64(v)) => cmp_primitive!(UInt64Type, *v, ==),
-        (Predicate::Gt(_, _), ScalarValue::UInt64(v)) => cmp_primitive!(UInt64Type, *v, >),
-        (Predicate::Lt(_, _), ScalarValue::UInt64(v)) => cmp_primitive!(UInt64Type, *v, <),
+        // Int64 / UInt64 fallback. The earlier arms cover Int64/Int32/Int16
+        // and every Timestamp unit; ANY other column type reaching this
+        // point (Date32, Decimal128, UInt32, Duration, Interval, Time*,
+        // …) would previously have hit an unchecked
+        // `as_primitive::<Int64Type>()` downcast and panicked — a DoS-class
+        // bug under PG's permissive numeric coercion. Bubble a typed error
+        // instead. Same shape as the Utf8 fallback at the tail of the
+        // string arm.
+        (Predicate::Eq(_, _), ScalarValue::Int64(v))
+        | (Predicate::Gt(_, _), ScalarValue::Int64(v))
+        | (Predicate::Lt(_, _), ScalarValue::Int64(v)) => {
+            return Err(BasinError::storage(format!(
+                "unsupported predicate: integer literal {v} against column type {:?}",
+                col.data_type()
+            )));
+        }
+        (Predicate::Eq(_, _), ScalarValue::UInt64(v)) if *col.data_type() == Dt::UInt64 => {
+            cmp_primitive!(UInt64Type, *v, ==)
+        }
+        (Predicate::Gt(_, _), ScalarValue::UInt64(v)) if *col.data_type() == Dt::UInt64 => {
+            cmp_primitive!(UInt64Type, *v, >)
+        }
+        (Predicate::Lt(_, _), ScalarValue::UInt64(v)) if *col.data_type() == Dt::UInt64 => {
+            cmp_primitive!(UInt64Type, *v, <)
+        }
+        (Predicate::Eq(_, _), ScalarValue::UInt64(v))
+        | (Predicate::Gt(_, _), ScalarValue::UInt64(v))
+        | (Predicate::Lt(_, _), ScalarValue::UInt64(v)) => {
+            return Err(BasinError::storage(format!(
+                "unsupported predicate: unsigned integer literal {v} against column type {:?}",
+                col.data_type()
+            )));
+        }
         // FLOAT8 column vs Float64 scalar — direct.
         (Predicate::Eq(_, _), ScalarValue::Float64(v)) if *col.data_type() == Dt::Float64 => {
             cmp_primitive!(Float64Type, *v, ==)
@@ -278,9 +304,18 @@ pub fn evaluate(
         (Predicate::Lt(_, _), ScalarValue::Float64(v)) if *col.data_type() == Dt::Float32 => {
             cmp_f32_as_f64!(*v, <)
         }
-        (Predicate::Eq(_, _), ScalarValue::Float64(v)) => cmp_primitive!(Float64Type, *v, ==),
-        (Predicate::Gt(_, _), ScalarValue::Float64(v)) => cmp_primitive!(Float64Type, *v, >),
-        (Predicate::Lt(_, _), ScalarValue::Float64(v)) => cmp_primitive!(Float64Type, *v, <),
+        // Float64 fallback. The guarded arms above handle Dt::Float64 and
+        // Dt::Float32; any other column type (Float16, Decimal*, …) would
+        // previously have hit an unchecked `as_primitive::<Float64Type>()`
+        // downcast. Bubble a typed error instead.
+        (Predicate::Eq(_, _), ScalarValue::Float64(v))
+        | (Predicate::Gt(_, _), ScalarValue::Float64(v))
+        | (Predicate::Lt(_, _), ScalarValue::Float64(v)) => {
+            return Err(BasinError::storage(format!(
+                "unsupported predicate: float literal {v} against column type {:?}",
+                col.data_type()
+            )));
+        }
         // UUID column: Arrow stores UUIDs as FixedSizeBinary(16) (RFC 4122
         // big-endian bytes). The predicate value arrives as a
         // `ScalarValue::Utf8` canonical hyphenated string (e.g.
@@ -426,7 +461,11 @@ pub fn evaluate(
                 }
             }
         }
-        (Predicate::Eq(_, _), ScalarValue::Boolean(v)) => {
+        // Boolean scalar — gate on the column actually being Boolean.
+        // Without the guard, `col.as_boolean()` would panic on any other
+        // physical type (Int*, Utf8, Decimal*, …) — same DoS-class shape
+        // as the int / float / string fallbacks above.
+        (Predicate::Eq(_, _), ScalarValue::Boolean(v)) if *col.data_type() == Dt::Boolean => {
             let arr = col.as_boolean();
             let mut b = arrow_array::builder::BooleanBuilder::with_capacity(arr.len());
             for i in 0..arr.len() {
@@ -437,6 +476,12 @@ pub fn evaluate(
                 }
             }
             b.finish()
+        }
+        (Predicate::Eq(_, _), ScalarValue::Boolean(v)) => {
+            return Err(BasinError::storage(format!(
+                "unsupported predicate: boolean literal {v} against column type {:?}",
+                col.data_type()
+            )));
         }
         (op, val) => {
             return Err(BasinError::storage(format!(
@@ -1498,6 +1543,126 @@ mod compound_tests {
         let pred = CompoundPredicate::Atom(Predicate::Eq("b".into(), ScalarValue::Utf8("true".into())));
         let mask = evaluate_compound(&batch, &pred).unwrap();
         assert_eq!(collect_mask(&mask), vec![Some(true), Some(false), Some(false)]);
+    }
+
+    /// Regression for the adjacent unchecked-downcast arms in `predicate.rs`:
+    /// the Utf8 / Timestamp / Boolean coercion arms got dedicated fixes
+    /// (commits `68b1ba8` and `coerce_utf8_scalar_for_column`) but the FALLBACK
+    /// arms for the OTHER scalar types still called
+    /// `cmp_primitive!(Int64Type, …)` / `cmp_primitive!(UInt64Type, …)` /
+    /// `cmp_primitive!(Float64Type, …)` / `col.as_boolean()` with no
+    /// `col.data_type()` guard — so an Int64 / UInt64 / Float64 / Boolean
+    /// scalar against a column with an unhandled physical type
+    /// (Date32, Decimal128, UInt32, Float32-via-Float64, Int64-via-Boolean)
+    /// would hit the unchecked Arrow downcast inside the macro and panic.
+    ///
+    /// Same DoS-class shape as the original Utf8 panic. Fixed by gating the
+    /// numeric arms on `col.data_type()` and returning a typed
+    /// `BasinError::storage` for unsupported pairings.
+    #[test]
+    fn numeric_and_bool_literals_against_unsupported_columns_return_error() {
+        use arrow_array::{
+            BooleanArray, Date32Array, Decimal128Array, Float32Array, Int64Array, UInt32Array,
+        };
+        use arrow_schema::{DataType, Field, Schema};
+
+        // ── Int64 literal vs Date32 column ──────────────────────────────
+        // Previously: as_primitive::<Int64Type>() on a Date32Array panics.
+        // Now: typed `BasinError::storage`.
+        let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, true)]));
+        let arr = Date32Array::from(vec![Some(19_357), None]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+        let pred = Predicate::Eq("d".into(), ScalarValue::Int64(19_357));
+        let err = evaluate(&batch, &pred).unwrap_err();
+        assert!(
+            matches!(err, basin_common::BasinError::Storage(_)),
+            "expected typed storage error, got {err:?}"
+        );
+
+        // ── Int64 literal vs Decimal128 column ──────────────────────────
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "x",
+            DataType::Decimal128(10, 2),
+            true,
+        )]));
+        let arr = Decimal128Array::from(vec![Some(12345), None])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+        let pred = Predicate::Gt("x".into(), ScalarValue::Int64(100));
+        let err = evaluate(&batch, &pred).unwrap_err();
+        assert!(
+            matches!(err, basin_common::BasinError::Storage(_)),
+            "expected typed storage error, got {err:?}"
+        );
+
+        // ── Int64 literal vs UInt32 column ──────────────────────────────
+        let schema = Arc::new(Schema::new(vec![Field::new("u", DataType::UInt32, true)]));
+        let arr = UInt32Array::from(vec![Some(7u32), None]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+        let pred = Predicate::Lt("u".into(), ScalarValue::Int64(10));
+        let err = evaluate(&batch, &pred).unwrap_err();
+        assert!(
+            matches!(err, basin_common::BasinError::Storage(_)),
+            "expected typed storage error, got {err:?}"
+        );
+
+        // ── Float64 literal vs Float32 column — coerce path stays intact ──
+        // This was already a guarded arm (Float32-widen). Sanity-check
+        // the typed-comparison still works and was not regressed by the
+        // fallback-arm rewrite.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "f",
+            DataType::Float32,
+            true,
+        )]));
+        let arr = Float32Array::from(vec![Some(1.5_f32), Some(2.5_f32), None]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+        let pred = Predicate::Gt("f".into(), ScalarValue::Float64(2.0));
+        let mask = evaluate(&batch, &pred).unwrap();
+        assert_eq!(
+            collect_mask(&mask),
+            vec![Some(false), Some(true), Some(false)]
+        );
+
+        // ── Float64 literal vs Int64 column — typed error, not a panic ──
+        // Float64Type downcast on an Int64Array previously panicked.
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, true)]));
+        let arr = Int64Array::from(vec![Some(1), Some(2), None]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+        let pred = Predicate::Eq("i".into(), ScalarValue::Float64(1.5));
+        let err = evaluate(&batch, &pred).unwrap_err();
+        assert!(
+            matches!(err, basin_common::BasinError::Storage(_)),
+            "expected typed storage error, got {err:?}"
+        );
+
+        // ── Boolean literal vs Int64 column — typed error, not a panic ──
+        // `col.as_boolean()` on an Int64Array previously panicked.
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, true)]));
+        let arr = Int64Array::from(vec![Some(1), Some(0), None]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+        let pred = Predicate::Eq("i".into(), ScalarValue::Boolean(true));
+        let err = evaluate(&batch, &pred).unwrap_err();
+        assert!(
+            matches!(err, basin_common::BasinError::Storage(_)),
+            "expected typed storage error, got {err:?}"
+        );
+
+        // Boolean literal vs Boolean column — sanity check the matched arm.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "b",
+            DataType::Boolean,
+            true,
+        )]));
+        let arr = BooleanArray::from(vec![Some(true), Some(false), None]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+        let pred = Predicate::Eq("b".into(), ScalarValue::Boolean(true));
+        let mask = evaluate(&batch, &pred).unwrap();
+        assert_eq!(
+            collect_mask(&mask),
+            vec![Some(true), Some(false), Some(false)]
+        );
     }
 
     #[test]
