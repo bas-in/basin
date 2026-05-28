@@ -311,9 +311,15 @@ pub fn evaluate(
             b.finish()
         }
         // Timestamp column vs Utf8 scalar — parse the string as a PG/ISO-8601
-        // timestamp and compare as i64 microseconds.  This handles pushdown of
-        // queries like `WHERE ts < '2023-02-01 00:00:00+00'` where the literal
-        // arrives as a Utf8 scalar from `fast_select::literal_value`.
+        // timestamp and compare as i64 in the COLUMN's time unit.  This
+        // handles pushdown of queries like
+        // `WHERE ts < '2023-02-01 00:00:00+00'` where the literal arrives as a
+        // Utf8 scalar from `fast_select::literal_value`.
+        //
+        // We parse the literal once to microseconds (the canonical PG storage
+        // unit) and then rescale to whatever unit the column physically uses
+        // — Ns/Ms/Sec all reach this arm and previously panicked on an
+        // unchecked `as_primitive::<TimestampMicrosecondType>()` downcast.
         (Predicate::Eq(_, _), ScalarValue::Utf8(v))
         | (Predicate::Gt(_, _), ScalarValue::Utf8(v))
         | (Predicate::Lt(_, _), ScalarValue::Utf8(v))
@@ -321,7 +327,6 @@ pub fn evaluate(
         {
             // Parse the timestamp string into microseconds since epoch.
             let us: i64 = parse_ts_str_to_us(v);
-            let arr = col.as_primitive::<TimestampMicrosecondType>();
             let op: fn(i64, i64) -> bool = match predicate {
                 Predicate::Eq(_, _) => |a, b| a == b,
                 Predicate::Gt(_, _) => |a, b| a > b,
@@ -333,20 +338,54 @@ pub fn evaluate(
                     unreachable!("StartsWith routed to timestamp-utf8 path")
                 }
             };
-            let mut b = arrow_array::builder::BooleanBuilder::with_capacity(arr.len());
-            for i in 0..arr.len() {
-                if arr.is_null(i) {
-                    b.append_value(false);
-                } else {
-                    b.append_value(op(arr.value(i), us));
-                }
+
+            // Helper: scan a primitive timestamp column against a rescaled
+            // needle. Saturating arithmetic on the rescale keeps the sentinel
+            // `i64::MIN` (returned by `parse_ts_str_to_us` on parse failure)
+            // from overflowing; the comparison still evaluates to false on
+            // every real timestamp, matching today's semantics.
+            macro_rules! cmp_ts {
+                ($arrow_ty:ty, $needle:expr) => {{
+                    let arr = col.as_primitive::<$arrow_ty>();
+                    let n: i64 = $needle;
+                    let mut b = arrow_array::builder::BooleanBuilder::with_capacity(arr.len());
+                    for i in 0..arr.len() {
+                        if arr.is_null(i) {
+                            b.append_value(false);
+                        } else {
+                            b.append_value(op(arr.value(i), n));
+                        }
+                    }
+                    b.finish()
+                }};
             }
-            b.finish()
+
+            match col.data_type() {
+                Dt::Timestamp(arrow_schema::TimeUnit::Microsecond, _) => {
+                    cmp_ts!(TimestampMicrosecondType, us)
+                }
+                Dt::Timestamp(arrow_schema::TimeUnit::Nanosecond, _) => {
+                    cmp_ts!(TimestampNanosecondType, us.saturating_mul(1_000))
+                }
+                Dt::Timestamp(arrow_schema::TimeUnit::Millisecond, _) => {
+                    // Floor-divide so a literal like `…:00.000001` (1 µs)
+                    // doesn't accidentally round up to 1 ms.
+                    cmp_ts!(TimestampMillisecondType, us.div_euclid(1_000))
+                }
+                Dt::Timestamp(arrow_schema::TimeUnit::Second, _) => {
+                    cmp_ts!(TimestampSecondType, us.div_euclid(1_000_000))
+                }
+                // Outer guard restricts us to `Dt::Timestamp(..)`.
+                _ => unreachable!("non-Timestamp routed to timestamp-utf8 path"),
+            }
         }
+        // String column vs Utf8 scalar — dispatch on the column's string
+        // variant. `Utf8` (i32 offsets), `LargeUtf8` (i64 offsets), and
+        // `Utf8View` are all valid string Arrow encodings and an unchecked
+        // `as_string::<i32>()` on the latter two panics.
         (Predicate::Eq(_, _), ScalarValue::Utf8(v))
         | (Predicate::Gt(_, _), ScalarValue::Utf8(v))
         | (Predicate::Lt(_, _), ScalarValue::Utf8(v)) => {
-            let arr = col.as_string::<i32>();
             let op: fn(&str, &str) -> bool = match predicate {
                 Predicate::Eq(_, _) => |a, b| a == b,
                 Predicate::Gt(_, _) => |a, b| a > b,
@@ -357,15 +396,35 @@ pub fn evaluate(
                     unreachable!("StartsWith routed to generic utf8 cmp path")
                 }
             };
-            let mut b = arrow_array::builder::BooleanBuilder::with_capacity(arr.len());
-            for i in 0..arr.len() {
-                if arr.is_null(i) {
-                    b.append_value(false);
-                } else {
-                    b.append_value(op(arr.value(i), v.as_str()));
+            macro_rules! cmp_str {
+                ($arr:expr, $needle:expr) => {{
+                    let arr = $arr;
+                    let n: &str = $needle;
+                    let mut b = arrow_array::builder::BooleanBuilder::with_capacity(arr.len());
+                    for i in 0..arr.len() {
+                        if arr.is_null(i) {
+                            b.append_value(false);
+                        } else {
+                            b.append_value(op(arr.value(i), n));
+                        }
+                    }
+                    b.finish()
+                }};
+            }
+            match col.data_type() {
+                Dt::Utf8 => cmp_str!(col.as_string::<i32>(), v.as_str()),
+                Dt::LargeUtf8 => cmp_str!(col.as_string::<i64>(), v.as_str()),
+                Dt::Utf8View => cmp_str!(col.as_string_view(), v.as_str()),
+                // Non-string column type with a Utf8 scalar that wasn't
+                // coerced upstream — this is a user-facing type error, not
+                // a panic-class bug. Bubble it up so the caller surfaces a
+                // PG-style "operator does not exist" message.
+                other => {
+                    return Err(BasinError::storage(format!(
+                        "unsupported predicate: text literal {v:?} against column type {other:?}"
+                    )));
                 }
             }
-            b.finish()
         }
         (Predicate::Eq(_, _), ScalarValue::Boolean(v)) => {
             let arr = col.as_boolean();
@@ -1262,6 +1321,160 @@ mod compound_tests {
         assert_eq!(
             collect_mask(&mask),
             vec![Some(true), Some(false), Some(false), Some(false), Some(false)]
+        );
+    }
+
+    /// Regression: `WHERE str_col = 'foo'` against a `LargeUtf8` or `Utf8View`
+    /// column must dispatch to the matching string-array downcast — not
+    /// `as_string::<i32>()` (the `Utf8` arm), which panics on either of those
+    /// physical encodings. Same DoS-class shape as the int-column panic above.
+    #[test]
+    fn utf8_literal_vs_largeutf8_and_utf8view_columns_no_panic() {
+        use arrow_array::{LargeStringArray, StringViewArray};
+        // LargeUtf8 column ----------------------------------------------------
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "name",
+            DataType::LargeUtf8,
+            true,
+        )]));
+        let names = LargeStringArray::from(vec![
+            Some("alpha"),
+            Some("beta"),
+            None,
+            Some("gamma"),
+        ]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(names)]).unwrap();
+
+        // Eq
+        let pred = Predicate::Eq("name".into(), ScalarValue::Utf8("beta".into()));
+        let mask = evaluate(&batch, &pred).unwrap();
+        assert_eq!(
+            collect_mask(&mask),
+            vec![Some(false), Some(true), Some(false), Some(false)]
+        );
+        // Gt — lex-greater than "beta": only "gamma" matches.
+        let pred = Predicate::Gt("name".into(), ScalarValue::Utf8("beta".into()));
+        let mask = evaluate(&batch, &pred).unwrap();
+        assert_eq!(
+            collect_mask(&mask),
+            vec![Some(false), Some(false), Some(false), Some(true)]
+        );
+        // Lt — lex-less than "beta": only "alpha" matches.
+        let pred = Predicate::Lt("name".into(), ScalarValue::Utf8("beta".into()));
+        let mask = evaluate(&batch, &pred).unwrap();
+        assert_eq!(
+            collect_mask(&mask),
+            vec![Some(true), Some(false), Some(false), Some(false)]
+        );
+
+        // Utf8View column -----------------------------------------------------
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "name",
+            DataType::Utf8View,
+            true,
+        )]));
+        let names = StringViewArray::from(vec![
+            Some("alpha"),
+            Some("beta"),
+            None,
+            Some("gamma"),
+        ]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(names)]).unwrap();
+
+        let pred = Predicate::Eq("name".into(), ScalarValue::Utf8("gamma".into()));
+        let mask = evaluate(&batch, &pred).unwrap();
+        assert_eq!(
+            collect_mask(&mask),
+            vec![Some(false), Some(false), Some(false), Some(true)]
+        );
+        let pred = Predicate::Lt("name".into(), ScalarValue::Utf8("beta".into()));
+        let mask = evaluate(&batch, &pred).unwrap();
+        assert_eq!(
+            collect_mask(&mask),
+            vec![Some(true), Some(false), Some(false), Some(false)]
+        );
+    }
+
+    /// Regression: `WHERE ts < '…'` against a non-microsecond Timestamp column
+    /// must dispatch to the matching `Timestamp<TimeUnit>` primitive type
+    /// rather than always downcasting to `TimestampMicrosecondType` (which
+    /// panics on Ns/Ms/Sec columns). Covers Ns / Ms / Sec.
+    #[test]
+    fn timestamp_non_microsecond_utf8_literal_no_panic() {
+        use arrow_array::{
+            TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
+        };
+        use arrow_schema::TimeUnit;
+
+        // Reference moment: 2023-02-01 00:00:00+00 = 1675209600 s = 1675209600000 ms
+        // = 1675209600000000 µs = 1675209600000000000 ns.
+        let lit = "2023-02-01 00:00:00+00";
+
+        // ── Nanosecond ────────────────────────────────────────────────────
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        )]));
+        // One ns before, one ns at, one ns after the reference moment, one null.
+        let arr = TimestampNanosecondArray::from(vec![
+            Some(1_675_209_599_999_999_999),
+            Some(1_675_209_600_000_000_000),
+            Some(1_675_209_600_000_000_001),
+            None,
+        ]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+        let pred = Predicate::Lt("ts".into(), ScalarValue::Utf8(lit.into()));
+        let mask = evaluate(&batch, &pred).unwrap();
+        assert_eq!(
+            collect_mask(&mask),
+            vec![Some(true), Some(false), Some(false), Some(false)]
+        );
+        let pred = Predicate::Eq("ts".into(), ScalarValue::Utf8(lit.into()));
+        let mask = evaluate(&batch, &pred).unwrap();
+        assert_eq!(
+            collect_mask(&mask),
+            vec![Some(false), Some(true), Some(false), Some(false)]
+        );
+
+        // ── Millisecond ───────────────────────────────────────────────────
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            true,
+        )]));
+        let arr = TimestampMillisecondArray::from(vec![
+            Some(1_675_209_599_999),
+            Some(1_675_209_600_000),
+            Some(1_675_209_600_001),
+            None,
+        ]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+        let pred = Predicate::Gt("ts".into(), ScalarValue::Utf8(lit.into()));
+        let mask = evaluate(&batch, &pred).unwrap();
+        assert_eq!(
+            collect_mask(&mask),
+            vec![Some(false), Some(false), Some(true), Some(false)]
+        );
+
+        // ── Second ────────────────────────────────────────────────────────
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Second, None),
+            true,
+        )]));
+        let arr = TimestampSecondArray::from(vec![
+            Some(1_675_209_599),
+            Some(1_675_209_600),
+            Some(1_675_209_601),
+            None,
+        ]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+        let pred = Predicate::Eq("ts".into(), ScalarValue::Utf8(lit.into()));
+        let mask = evaluate(&batch, &pred).unwrap();
+        assert_eq!(
+            collect_mask(&mask),
+            vec![Some(false), Some(true), Some(false), Some(false)]
         );
     }
 

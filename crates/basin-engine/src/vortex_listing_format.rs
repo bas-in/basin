@@ -76,7 +76,9 @@ use datafusion_datasource::file_sink_config::FileSinkConfig;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion_physical_plan::filter_pushdown::FilterPushdownPropagation;
+use datafusion_physical_plan::filter_pushdown::{
+    ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
+};
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{
@@ -719,6 +721,41 @@ impl ExecutionPlan for UuidDecimal256RestoreExec {
         mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(UuidDecimal256RestoreExec::new(children.swap_remove(0))))
+    }
+
+    // ── Physical filter pushdown (transparent passthrough) ───────────────────
+    //
+    // `UuidDecimal256RestoreExec` is a per-row column-type restorer: it
+    // translates `Decimal256(39,0)` UUID columns back to `FixedSizeBinary(16)`
+    // on every output batch. It does NOT add, remove, reorder, or recombine
+    // rows. Therefore a row filter commutes with the restoration:
+    // `filter(restore(scan)) == restore(filter(scan))` for ANY predicate,
+    // including ones that touch the restored UUID column (the parent's filter
+    // is expressed in the post-restore schema, but only its row-selection
+    // semantics matter — pushdown infrastructure will rebind column indices
+    // through `with_new_children`).
+    //
+    // Without these two methods the default `all_unsupported` blocks pushdown:
+    // any `WHERE pk = …` predicate stays as a `FilterExec` stuck above us and
+    // the cold Vortex/Parquet reader loses row-group pruning — same #88 shape
+    // as `UpdateOverlayExec`. Mirrors `TombstoneFilterExec`'s transparent
+    // passthrough.
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> DFResult<FilterDescription> {
+        FilterDescription::from_children(parent_filters, &self.children())
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        _phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> DFResult<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        Ok(FilterPushdownPropagation::if_all(child_pushdown_result))
     }
 
     fn execute(
