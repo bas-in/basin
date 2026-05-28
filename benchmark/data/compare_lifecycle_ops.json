@@ -7,20 +7,20 @@
   "metrics": [
     {
       "label": "Project deletion (1 project, 100K rows)",
-      "basin": 5.1355,
-      "postgres": 13.018958000000001,
+      "basin": 5.312167,
+      "postgres": 51.406292,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 2.54x"
+      "ratio_text": "pg / basin = 9.68x"
     },
     {
       "label": "ADD COLUMN on 100K rows",
-      "basin": 1.912125,
-      "postgres": 1.545541,
+      "basin": 2.114042,
+      "postgres": 170.54525,
       "unit": "ms",
-      "better": "postgres",
-      "ratio_text": "pg / basin = 0.81x"
+      "better": "basin",
+      "ratio_text": "pg / basin = 80.67x"
     }
   ],
-  "generated_at": "@1779751306"
+  "generated_at": "@1780001875"
 }

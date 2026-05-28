@@ -25,6 +25,7 @@
     "project_deletion",
     "rls_basic",
     "rls_isolation",
+    "tiered_storage",
     "update_delete",
     "uuid"
   ],
@@ -41,11 +42,6 @@
     "backup_cost",
     "lifecycle_ops",
     "postgres",
-    "postgres_10k",
-    "postgres_100k",
-    "postgres_parquet",
-    "postgres_10k_parquet",
-    "postgres_100k_parquet",
     "server_lifecycle"
   ]
 }
