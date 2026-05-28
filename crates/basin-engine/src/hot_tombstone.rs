@@ -38,7 +38,8 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::config::ConfigOptions;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::filter_pushdown::{
-    ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
+    ChildFilterDescription, ChildPushdownResult, FilterDescription, FilterPushdownPhase,
+    FilterPushdownPropagation,
 };
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
@@ -427,6 +428,96 @@ impl ExecutionPlan for UpdateOverlayExec {
             self.pk_dt.clone(),
             Arc::clone(&self.updates),
         )))
+    }
+
+    // ── Physical filter pushdown (conservative: PK-only into child) ──────────
+    //
+    // `UpdateOverlayExec` does TWO things to its child stream:
+    //   1. Suppresses cold rows whose PK matches an override key.
+    //   2. UNCONDITIONALLY appends every override (post-SET) row at the tail.
+    //
+    // (1) commutes with a row filter (just like `TombstoneFilterExec`). But (2)
+    // does NOT: the appended rows are produced from `self.updates.values()`
+    // regardless of any predicate the cold child was given. So if a parent
+    // `WHERE col = X` filter is pushed into the cold scan and the upper
+    // `FilterExec` is then removed, override rows that don't match the
+    // predicate would leak into the output.
+    //
+    // Two-axis strategy:
+    //
+    //   * To the **child**: declare the filter "supported" iff it references
+    //     ONLY the PK column. The cold scan can then use it for I/O reduction
+    //     (Vortex/Parquet row-group prune, GIN row-group selection, predicate
+    //     pushdown). Filters touching any non-PK column stay unsupported at
+    //     the child so they are not pushed into the cold scan (the overlay
+    //     may have set that column to a value the cold pre-filter would have
+    //     dropped — see safety note below).
+    //
+    //   * To the **parent**: ALWAYS report `unsupported`, regardless of
+    //     whether the child accepted. This keeps the upper `FilterExec` in
+    //     place so it re-evaluates the predicate above us, removing any
+    //     appended override row that does not match. Without this the
+    //     unconditional-append path (2) leaks non-matching overrides.
+    //
+    // Safety analysis (PK-only is conservative-correct):
+    //   * The hot-tier UPDATE fast path rejects assignments that touch the PK
+    //     (`dml_mutate::try_resolve_fast_path_pks` / `hot_tier_update_by_pk`),
+    //     so an override row's PK is byte-identical to the cold row's PK.
+    //     Therefore a `WHERE pk = …` predicate evaluated on the cold scan
+    //     gives exactly the same row-set as if it were evaluated post-overlay.
+    //   * For any non-PK column, the override is a full-row replacement — the
+    //     fast-path writer does not know which columns SQL assigned, so the
+    //     overlay must be treated as if it could have changed any non-PK
+    //     value. Pushing a non-PK filter into the cold scan could drop a row
+    //     whose cold value fails the predicate but whose overlay value
+    //     satisfies it. Hence: non-PK filters stay above the overlay.
+    //
+    // Net effect: I/O reduction at the cold scan for PK predicates (the bug
+    // #88 win), correctness re-enforced by the retained upper `FilterExec`
+    // for the appended override rows. When no override is in flight
+    // (`updates.is_empty()`) the wrap is skipped by `TombstoneFilteringTable`,
+    // so the steady-state read path is unchanged.
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> DFResult<FilterDescription> {
+        // Resolve the PK column's index in our (= the child's) schema. If the
+        // PK isn't in the schema (e.g. a projection that omitted it — the
+        // overlay's `filter_batch` already degrades to pass-through in that
+        // case) we have no safe filter to push, so mark every filter
+        // unsupported and let the upper `FilterExec` handle them.
+        let schema = self.inner.schema();
+        let Ok(pk_idx) = schema.index_of(&self.pk_column) else {
+            return Ok(FilterDescription::new()
+                .with_child(ChildFilterDescription::all_unsupported(&parent_filters)));
+        };
+        let mut allowed = HashSet::new();
+        allowed.insert(pk_idx);
+        let child = &self.inner;
+        let desc = ChildFilterDescription::from_child_with_allowed_indices(
+            &parent_filters,
+            allowed,
+            child,
+        )?;
+        Ok(FilterDescription::new().with_child(desc))
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        _phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> DFResult<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        // Tell the parent NONE of the filters are fully evaluated by us so the
+        // upper `FilterExec` stays in place. The child may still have used the
+        // PK predicate for I/O reduction inside its scan, but we cannot claim
+        // exactness because of the unconditional override-row append in
+        // `execute`. See the safety note on `gather_filters_for_pushdown`.
+        Ok(FilterPushdownPropagation::all_unsupported(
+            child_pushdown_result,
+        ))
     }
 
     fn execute(
