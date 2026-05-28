@@ -6,3 +6,27 @@
 # step. CI relies on Swatinem/rust-cache instead. Set RUSTC_WRAPPER in
 # your local env if you want sccache for dev builds.
 incremental = false
+
+# Stack size for std::thread::spawn (including cargo-test worker threads and
+# tokio runtime worker threads spawned via tokio's default builder). The Rust
+# default is 2 MiB.
+#
+# Debug builds of basin-engine's DataFusion EXISTS / NOT EXISTS decorrelation
+# path (DELETE / UPDATE WHERE [NOT] EXISTS ...) consume ~2.5 MiB of stack in
+# the `Box::pin(sess.execute(rowset_sql))` re-entry that lowers the correlated
+# subquery to a semi/anti join, because debug-built async frames are very
+# large (DataFusion + sqlparser + Basin's SessionContext stack frames). The
+# recursion depth is *constant* for the query shape (independent of input).
+# Release builds run the same path in ~512 KiB, well under the 2 MiB default,
+# so the production server (basin-server is `#[tokio::main]` release build)
+# is unaffected — this is purely a debug-build async-frame-size headroom
+# issue that surfaces under `cargo test`.
+#
+# 4 MiB gives ~2x headroom over the observed debug-build requirement and
+# matches Linux/macOS `ulimit -s` defaults so any future code path that
+# pushes a little more stack still has room. Setting this here (rather than
+# per-test) keeps all current and future EXISTS/NOT EXISTS lib tests green
+# without per-test boilerplate, and keeps cargo-test stack behaviour
+# consistent across the workspace.
+[env]
+RUST_MIN_STACK = "4194304"
