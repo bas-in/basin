@@ -407,10 +407,30 @@ pub struct ReadCountersSnapshot {
     pub rows_selected_by_page_index: u64,
 }
 
-/// Default capacity for the Parquet footer cache. 1024 entries is a few MB
-/// of footer in the pessimistic case and sufficient to cover the working set
-/// of every benchmark currently in `tests/integration`.
-const DEFAULT_PARQUET_META_CACHE_CAP: usize = 1024;
+/// Default capacity for the Parquet footer cache. Bumped from 1024 to 16384
+/// after the scalability audit flagged cache thrash on multi-tenant fleets:
+/// at 10k projects × ~5 tables × ~10 files = 500k live footers, the prior
+/// cap re-fetched the cold tail on every promote. 16384 gives ~16× headroom
+/// for ~10k tenants with light table density; in the pessimistic footer-size
+/// case (a few KB each) the cache costs O(tens of MB) of resident RAM —
+/// negligible against the bytes-per-tenant budget. Override at process start
+/// with `BASIN_STORAGE_PARQUET_META_CACHE_CAP` (positive `usize`); any
+/// unset / unparseable / zero value keeps the default.
+const DEFAULT_PARQUET_META_CACHE_CAP: usize = 16_384;
+
+/// Resolve the Parquet footer cache capacity, honoring
+/// `BASIN_STORAGE_PARQUET_META_CACHE_CAP` when present and parseable to a
+/// positive `usize`. Falls back to [`DEFAULT_PARQUET_META_CACHE_CAP`].
+pub fn resolve_parquet_meta_cache_cap() -> usize {
+    if let Ok(v) = std::env::var("BASIN_STORAGE_PARQUET_META_CACHE_CAP") {
+        if let Ok(n) = v.parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    DEFAULT_PARQUET_META_CACHE_CAP
+}
 
 /// Default capacity for the HNSW segment cache. 256 segments at "few MB
 /// each" is the largest we'd want to hold in process; in practice the cache
@@ -463,7 +483,7 @@ impl Storage {
                 object_store,
                 root_prefix: cfg.root_prefix,
                 parquet_meta_cache: Arc::new(metadata_cache::ParquetMetaCache::new(
-                    DEFAULT_PARQUET_META_CACHE_CAP,
+                    resolve_parquet_meta_cache_cap(),
                 )),
                 hnsw_segment_cache: Arc::new(metadata_cache::HnswSegmentCache::new(
                     DEFAULT_HNSW_SEGMENT_CACHE_CAP,
@@ -928,6 +948,25 @@ impl Storage {
         table: &TableName,
     ) -> Result<Vec<DataFile>> {
         reader::list_data_files(self, project, table).await
+    }
+
+    /// Streaming variant of [`list_data_files`](Self::list_data_files):
+    /// yields each [`DataFile`] as the underlying object-store LIST
+    /// produces it, instead of materialising the full set in memory.
+    /// Callers that only need a prefix (LIMIT, "stop on first match", …)
+    /// should prefer this so the cold tail of the listing is never
+    /// fetched — the scalability fix at >100k files/table.
+    ///
+    /// The returned stream borrows `self` for the lifetime of the call.
+    /// Consumers that need a `'static` stream (e.g. to spawn on a
+    /// background task) should clone the [`Storage`] handle first.
+    #[tracing::instrument(skip(self), fields(project=%project, table=%table))]
+    pub fn list_data_files_stream<'a>(
+        &'a self,
+        project: &'a ProjectId,
+        table: &'a TableName,
+    ) -> BoxStream<'a, Result<DataFile>> {
+        reader::list_data_files_stream(self, project, table)
     }
 
     /// Like [`list_data_files`](Self::list_data_files) but populates each
@@ -2259,5 +2298,65 @@ mod tests {
             remaining.is_empty(),
             "no objects should remain after shared-project deletion"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Parquet footer cache cap — default + env override
+    // -----------------------------------------------------------------------
+
+    /// Single combined test for the cap constant + env-override resolver.
+    /// The default must be the audit-driven 16384 and the env var must
+    /// supersede it; zero / unparseable values must fall back to the
+    /// default. Combined into one test (rather than split) because
+    /// `BASIN_STORAGE_PARQUET_META_CACHE_CAP` is a process-global env var
+    /// — running each assertion in its own parallel `#[test]` would race.
+    #[test]
+    fn parquet_meta_cache_cap_resolver() {
+        let key = "BASIN_STORAGE_PARQUET_META_CACHE_CAP";
+        let prior = std::env::var(key).ok();
+
+        std::env::remove_var(key);
+        assert_eq!(resolve_parquet_meta_cache_cap(), 16_384);
+        assert_eq!(DEFAULT_PARQUET_META_CACHE_CAP, 16_384);
+
+        // Default propagates through Storage::new.
+        {
+            let dir = TempDir::new().unwrap();
+            let s = storage_in(&dir);
+            assert_eq!(s.inner.parquet_meta_cache.cap(), 16_384);
+        }
+
+        // Explicit override is honored.
+        std::env::set_var(key, "4096");
+        assert_eq!(resolve_parquet_meta_cache_cap(), 4096);
+        {
+            let dir = TempDir::new().unwrap();
+            let s = storage_in(&dir);
+            assert_eq!(
+                s.inner.parquet_meta_cache.cap(),
+                4096,
+                "override must thread through Storage::new",
+            );
+        }
+
+        // Zero falls back to default.
+        std::env::set_var(key, "0");
+        assert_eq!(
+            resolve_parquet_meta_cache_cap(),
+            DEFAULT_PARQUET_META_CACHE_CAP,
+        );
+
+        // Unparseable falls back to default.
+        std::env::set_var(key, "not-a-number");
+        assert_eq!(
+            resolve_parquet_meta_cache_cap(),
+            DEFAULT_PARQUET_META_CACHE_CAP,
+        );
+
+        // Restore.
+        match prior {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
     }
 }

@@ -91,6 +91,27 @@ impl ParquetMetaCache {
         let mut g = self.inner.lock().expect("ParquetMetaCache mutex poisoned");
         g.put(k, v);
     }
+
+    /// Current number of cached entries. Used by tests to assert the LRU
+    /// bound is honored under load; not on any hot path.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("ParquetMetaCache mutex poisoned")
+            .len()
+    }
+
+    /// Maximum number of entries this cache will hold before evicting. Used
+    /// by tests to assert the configured cap is respected.
+    #[cfg(test)]
+    pub fn cap(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("ParquetMetaCache mutex poisoned")
+            .cap()
+            .get()
+    }
 }
 
 /// Bounded LRU cache mapping `ObjectPath` → `Arc<HnswIndex>`. Same shape and
@@ -179,6 +200,27 @@ mod tests {
         for k in &keys[1..] {
             assert!(cache.get(k).is_some(), "newer entry {k} should still hit");
         }
+    }
+
+    /// Regression: the LRU must not grow past its configured capacity even
+    /// when callers insert N >> cap distinct keys (scalability audit:
+    /// 10k-tenant cold tail must not balloon the cache to unbounded RAM).
+    #[test]
+    fn parquet_meta_cache_never_exceeds_cap_under_load() {
+        let cap = 64usize;
+        let cache = ParquetMetaCache::new(cap);
+        for i in 0..(cap * 10) {
+            cache.insert(p(&format!("file-{i}.parquet")), fake_meta());
+            assert!(
+                cache.len() <= cap,
+                "cache grew to {} past cap {}",
+                cache.len(),
+                cap,
+            );
+        }
+        // Final state: full but not over.
+        assert_eq!(cache.len(), cap, "expected cache to settle at exactly cap");
+        assert_eq!(cache.cap(), cap, "configured cap should be retained");
     }
 
     #[tokio::test]

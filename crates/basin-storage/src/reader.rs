@@ -7,7 +7,7 @@ use std::sync::Arc;
 use arrow_array::{new_null_array, RecordBatch};
 use arrow_schema::{Field, Schema, SchemaRef};
 use basin_common::{BasinError, ProjectId, Result, TableName};
-use futures::stream::{BoxStream, StreamExt};
+use futures::stream::{self, BoxStream, StreamExt};
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::arrow::arrow_reader::{
@@ -34,46 +34,105 @@ use crate::writer::wrapped_sidecar_key;
 use crate::{ReadCounters, ReadOptions, Storage};
 use basin_catalog::ProjectStorageConfig;
 
+/// Default upper bound on the number of files
+/// [`list_data_files_with_stats`] will accept before returning
+/// [`BasinError::QueryCostExceeded`]. Override at process start with
+/// `BASIN_STORAGE_MAX_LISTED_FILES` (positive `usize`); any unset /
+/// unparseable / zero value keeps this default.
+///
+/// This is a SAFETY NET, not a performance target. The real fix at
+/// >100k files/table is on the caller: prefix-filter, paginate via
+/// [`list_data_files_stream`], or list per-partition. We hit the cap and
+/// raise a typed error rather than OOM the worker walking the full list.
+pub(crate) const DEFAULT_MAX_LISTED_FILES: usize = 50_000;
+
+/// Resolve [`DEFAULT_MAX_LISTED_FILES`], honoring
+/// `BASIN_STORAGE_MAX_LISTED_FILES` when present and parseable to a
+/// positive `usize`.
+pub(crate) fn resolve_max_listed_files() -> usize {
+    if let Ok(v) = std::env::var("BASIN_STORAGE_MAX_LISTED_FILES") {
+        if let Ok(n) = v.parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    DEFAULT_MAX_LISTED_FILES
+}
+
+/// Streaming listing: yields each [`DataFile`] (path + size + tier; no
+/// footer stats) as it comes off the object-store LIST. Walks both
+/// `data/` and `cold/` prefixes in sequence — readers that LIMIT can
+/// short-circuit and avoid materialising the full set in RAM, which is
+/// the scalability fix at >100k files/table. The existing `Vec`-returning
+/// [`list_data_files`] is a thin wrapper that drains this stream.
+///
+/// Filter rules match [`list_data_files`]: `.parquet` and `.vortex`
+/// suffixes only — sidecar `.wrapped` files and other auxiliary objects
+/// are skipped silently.
+pub(crate) fn list_data_files_stream<'a>(
+    storage: &'a Storage,
+    project: &'a ProjectId,
+    table: &'a TableName,
+) -> BoxStream<'a, Result<DataFile>> {
+    let store = storage.project_store(project);
+    let root_prefix = storage.root_prefix().cloned();
+    let project = project.clone();
+    let table = table.clone();
+
+    // We can't borrow `storage` across the async stream because callers
+    // expect a `'static`-ish stream; clone the cheap handles up front and
+    // build the per-tier listing inside `try_unfold`. We use
+    // `stream::iter` over the two tiers and `flat_map` so the entire
+    // listing is consumed lazily.
+    let store_for_stream = store.clone();
+    stream::iter([Tier::Hot, Tier::Cold])
+        .flat_map(move |tier| {
+            let prefix = table_tier_prefix(root_prefix.as_ref(), &project, &table, tier);
+            let store = store_for_stream.clone();
+            let listing = store.list(Some(&prefix));
+            listing.filter_map(|res| async move {
+                match res {
+                    Err(e) => Some(Err(BasinError::storage(format!("list: {e}")))),
+                    Ok(meta) => {
+                        // Filter to recognised data-file extensions; skip
+                        // sidecars and other auxiliary objects.
+                        if !(meta.location.as_ref().ends_with(".parquet")
+                            || meta.location.as_ref().ends_with(".vortex"))
+                        {
+                            return None;
+                        }
+                        let resolved_tier = Tier::from_path(meta.location.as_ref());
+                        Some(Ok(DataFile {
+                            path: meta.location,
+                            size_bytes: meta.size as u64,
+                            row_count: 0,
+                            column_stats: BTreeMap::new(),
+                            bloom_filters: BTreeMap::new(),
+                            hll_sketches: BTreeMap::new(),
+                            tdigest_sketches: BTreeMap::new(),
+                            tier: resolved_tier,
+                        }))
+                    }
+                }
+            })
+        })
+        .boxed()
+}
+
 pub(crate) async fn list_data_files(
     storage: &Storage,
     project: &ProjectId,
     table: &TableName,
 ) -> Result<Vec<DataFile>> {
-    // Walk both tier prefixes. Phase 5.5 introduces `tables/<t>/cold/`
-    // alongside the existing `tables/<t>/data/` so reads transparently see
-    // files migrated by the tiering compactor. Each file's `tier` field is
-    // derived from its path so callers don't have to know which prefix the
-    // listing came from.
-    let store = storage.project_store(project);
+    // Backward-compat thin wrapper: drains the streaming variant into a
+    // `Vec`. Callers that need to short-circuit on LIMIT should use
+    // [`list_data_files_stream`] directly so they don't pay for the cold
+    // tail of the listing.
+    let mut stream = list_data_files_stream(storage, project, table);
     let mut files = Vec::new();
-    for tier in [Tier::Hot, Tier::Cold] {
-        let prefix = table_tier_prefix(storage.root_prefix(), project, table, tier);
-        let mut stream = store.list(Some(&prefix));
-        while let Some(meta) = stream.next().await {
-            let meta = meta.map_err(|e| BasinError::storage(format!("list: {e}")))?;
-            // Data files are `.parquet` or (opt-in) `.vortex`. List both;
-            // skip everything else (e.g. `.wrapped` encryption sidecars).
-            // Filtering to `.parquet` only made every Vortex data file
-            // invisible to the constraint / FK / UNIQUE / PK and
-            // UPDATE/DELETE row-matching scans (list-then-read), so a dup
-            // INSERT was accepted and post-INSERT UPDATEs matched zero rows.
-            if !(meta.location.as_ref().ends_with(".parquet")
-                || meta.location.as_ref().ends_with(".vortex"))
-            {
-                continue;
-            }
-            let resolved_tier = Tier::from_path(meta.location.as_ref());
-            files.push(DataFile {
-                path: meta.location,
-                size_bytes: meta.size as u64,
-                row_count: 0,
-                column_stats: BTreeMap::new(),
-                bloom_filters: BTreeMap::new(),
-                hll_sketches: BTreeMap::new(),
-                tdigest_sketches: BTreeMap::new(),
-                tier: resolved_tier,
-            });
-        }
+    while let Some(item) = stream.next().await {
+        files.push(item?);
     }
     Ok(files)
 }
@@ -89,6 +148,21 @@ pub(crate) async fn list_data_files_with_stats(
     table: &TableName,
 ) -> Result<Vec<DataFile>> {
     let mut files = list_data_files(storage, project, table).await?;
+    // Safety net: bail out before per-file footer fan-out OOMs the worker
+    // on a table that has somehow accumulated >MAX listed files. This is
+    // NOT a substitute for the caller pruning the file set up front
+    // (catalog-stats prune, prefix filtering, per-partition listing); it
+    // exists so a runaway tenant can't burst the per-tenant memory
+    // budget. Surfaces as SQLSTATE 54000 (`program_limit_exceeded`).
+    let max_listed = resolve_max_listed_files();
+    if files.len() > max_listed {
+        return Err(BasinError::QueryCostExceeded(format!(
+            "list_data_files_with_stats: table {table} has {n} files; \
+             configured cap is {max_listed} (BASIN_STORAGE_MAX_LISTED_FILES). \
+             Use catalog-stats pruning, prefix filtering, or per-partition listing.",
+            n = files.len(),
+        )));
+    }
     let store = storage.project_store(project);
     let cache = storage.parquet_meta_cache().clone();
 
@@ -2693,5 +2767,153 @@ mod tests {
             .downcast_ref::<Float64Array>()
             .unwrap();
         assert_eq!(g_score, o_score, "Float64 column must round-trip");
+    }
+
+    // -----------------------------------------------------------------------
+    // list_data_files streaming + cap tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a tiny Storage with an `InMemory` object store and
+    /// no encryption / no catalog. Pairs with `write_small` below.
+    fn fresh_storage() -> Storage {
+        Storage::new(StorageConfig {
+            object_store: Arc::new(InMemory::new()),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        })
+    }
+
+    fn small_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]))
+    }
+
+    fn small_batch(start: i64, len: usize) -> RecordBatch {
+        let ids: Int64Array = (start..start + len as i64).collect();
+        RecordBatch::try_new(small_schema(), vec![Arc::new(ids)]).unwrap()
+    }
+
+    /// Write N small files into one (project, table). Returns the project
+    /// and table so the caller can list them back.
+    async fn write_n_files(storage: &Storage, n: usize) -> (ProjectId, TableName) {
+        let project = ProjectId::new();
+        let table = TableName::new("scl").unwrap();
+        let part = PartitionKey::default_key();
+        for i in 0..n {
+            storage
+                .write_batch(&project, &table, &part, &small_batch(i as i64 * 10, 3))
+                .await
+                .expect("write_batch");
+        }
+        (project, table)
+    }
+
+    /// The streaming variant must yield the same set of files (as a set, not
+    /// necessarily the same order) as the Vec wrapper. The wrapper is now
+    /// implemented in terms of the stream, so this also guards against any
+    /// future drift.
+    #[tokio::test]
+    async fn list_data_files_stream_matches_vec() {
+        let storage = fresh_storage();
+        let (project, table) = write_n_files(&storage, 5).await;
+
+        let vec_paths: Vec<String> = list_data_files(&storage, &project, &table)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path.as_ref().to_string())
+            .collect();
+
+        let mut stream_paths: Vec<String> = list_data_files_stream(&storage, &project, &table)
+            .map(|r| r.unwrap().path.as_ref().to_string())
+            .collect()
+            .await;
+
+        let mut sorted_vec = vec_paths.clone();
+        sorted_vec.sort();
+        stream_paths.sort();
+        assert_eq!(
+            sorted_vec, stream_paths,
+            "stream and Vec must enumerate the same files",
+        );
+        assert_eq!(vec_paths.len(), 5);
+    }
+
+    /// A streaming consumer that takes only `LIMIT` items must not be forced
+    /// to walk the entire listing. We can't directly observe "did the
+    /// remaining LIST fetches fire" with `InMemory`, but we can at least
+    /// confirm the API supports early termination (the underlying object
+    /// store's stream is dropped when the consumer drops, which is the
+    /// short-circuit the cliff fix relies on).
+    #[tokio::test]
+    async fn list_data_files_stream_supports_early_termination() {
+        let storage = fresh_storage();
+        let (project, table) = write_n_files(&storage, 5).await;
+
+        let first_two: Vec<DataFile> = list_data_files_stream(&storage, &project, &table)
+            .take(2)
+            .map(|r| r.unwrap())
+            .collect()
+            .await;
+        assert_eq!(first_two.len(), 2, "take(2) must yield exactly 2");
+    }
+
+    /// Combined coverage of the safety-net cap on `list_data_files_with_stats`:
+    ///
+    /// - Default cap is 50_000 (matches the audit recommendation).
+    /// - `BASIN_STORAGE_MAX_LISTED_FILES` overrides on positive parses.
+    /// - Zero / unparseable values fall back to default.
+    /// - When the listing exceeds the cap, the call returns the typed
+    ///   `BasinError::QueryCostExceeded` rather than walking the footers.
+    /// - When the cap is raised above the listing, the call succeeds.
+    ///
+    /// Merged into a single test (rather than split) because the env var
+    /// is process-global and parallel `#[test]` execution would race.
+    #[tokio::test]
+    async fn list_data_files_with_stats_cap_resolver_and_safety_net() {
+        let key = "BASIN_STORAGE_MAX_LISTED_FILES";
+        let prior = std::env::var(key).ok();
+
+        // --- resolver: default ---
+        std::env::remove_var(key);
+        assert_eq!(resolve_max_listed_files(), 50_000);
+        assert_eq!(DEFAULT_MAX_LISTED_FILES, 50_000);
+
+        // --- resolver: positive override ---
+        std::env::set_var(key, "7");
+        assert_eq!(resolve_max_listed_files(), 7);
+
+        // --- resolver: zero falls back ---
+        std::env::set_var(key, "0");
+        assert_eq!(resolve_max_listed_files(), DEFAULT_MAX_LISTED_FILES);
+
+        // --- resolver: garbage falls back ---
+        std::env::set_var(key, "garbage");
+        assert_eq!(resolve_max_listed_files(), DEFAULT_MAX_LISTED_FILES);
+
+        // --- safety-net: cap exceeded → typed error ---
+        let storage = fresh_storage();
+        let (project, table) = write_n_files(&storage, 4).await;
+        std::env::set_var(key, "2");
+        let err = list_data_files_with_stats(&storage, &project, &table)
+            .await
+            .expect_err("cap-exceeded must return Err");
+        assert!(
+            matches!(err, BasinError::QueryCostExceeded(_)),
+            "cap-exceeded must surface as QueryCostExceeded, got {err:?}",
+        );
+
+        // --- safety-net: under cap → success, listing complete ---
+        std::env::set_var(key, "100");
+        let ok = list_data_files_with_stats(&storage, &project, &table)
+            .await
+            .expect("under-cap call must succeed");
+        assert_eq!(ok.len(), 4);
+
+        // Restore.
+        match prior {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
     }
 }
