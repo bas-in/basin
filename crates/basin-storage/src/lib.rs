@@ -204,7 +204,46 @@ impl std::fmt::Debug for StorageConfig {
 /// scales to 1M projects. v0.2 surfaces the value per project from the
 /// catalog so a noisy project can be capped without throttling quiet
 /// projects.
-pub const DEFAULT_PROJECT_CONCURRENCY: usize = 16;
+pub const DEFAULT_PROJECT_CONCURRENCY: usize = 64;
+
+/// Resolve the per-project concurrency cap.
+///
+/// `BASIN_STORAGE_PROJECT_CONCURRENCY`, when present and parseable to a
+/// nonzero `usize`, overrides the default. Otherwise we use
+/// `max(DEFAULT_PROJECT_CONCURRENCY, 4 * num_cpus)` so a fat host gets a
+/// proportionally larger pool. The old constant of 16 was sized to
+/// preserve the ADR 0008 floor on a 4-core CI box; on modern hardware
+/// and concurrent-reader workloads (C=64) it became the binding wall —
+/// every additional concurrent reader past 16 queued behind a busy
+/// permit. The new floor of 64 keeps the per-project semaphore from
+/// dominating the C=64 scaling card.
+pub fn resolve_project_concurrency() -> usize {
+    if let Ok(v) = std::env::var("BASIN_STORAGE_PROJECT_CONCURRENCY") {
+        if let Ok(n) = v.parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
+    std::cmp::max(DEFAULT_PROJECT_CONCURRENCY, 4 * cpus)
+}
+
+/// Resolve the scheduler's global RPC budget. `BASIN_STORAGE_GLOBAL_BUDGET`,
+/// when present and parseable to a nonzero `usize`, overrides the default
+/// computed by [`scheduler::default_global_budget`].
+pub fn resolve_global_budget() -> usize {
+    if let Ok(v) = std::env::var("BASIN_STORAGE_GLOBAL_BUDGET") {
+        if let Ok(n) = v.parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    scheduler::default_global_budget()
+}
 
 /// Read knobs for [`Storage::read`]. Filters are ANDed together.
 ///
@@ -430,7 +469,7 @@ impl Storage {
                     DEFAULT_HNSW_SEGMENT_CACHE_CAP,
                 )),
                 project_semaphores: Mutex::new(HashMap::new()),
-                default_project_concurrency: DEFAULT_PROJECT_CONCURRENCY,
+                default_project_concurrency: resolve_project_concurrency(),
                 read_counters: Arc::new(ReadCounters::default()),
                 page_cache,
                 // Vortex footer cache: always enabled with the default capacity.
@@ -445,7 +484,7 @@ impl Storage {
                 encryption: OnceLock::new(),
                 catalog: OnceLock::new(),
                 project_config_cache: RwLock::new(HashMap::new()),
-                scheduler: Scheduler::new(DEFAULT_GLOBAL_BUDGET),
+                scheduler: Scheduler::new(resolve_global_budget()),
                 byo_object_stores: Mutex::new(HashMap::new()),
             }),
         }
@@ -1039,6 +1078,66 @@ impl Storage {
             tdigest_sketches: std::collections::BTreeMap::new(),
             tier: Tier::Cold,
         })
+    }
+
+    /// Bulk-delete the supplied object paths under one project. Returns
+    /// the number of objects actually removed.
+    ///
+    /// Uses the same fan-out the project-prefix wipe path uses:
+    /// `AmazonS3` rides its native `DeleteObjects` batch (1000 keys per
+    /// RPC, 20 in flight), every other backend gets a 64-way
+    /// `buffer_unordered` over per-key `delete()`. That's a ~6× speedup
+    /// over the old `for p in paths { store.delete(&p).await }` loop on
+    /// LocalFS / S3-mock backends.
+    ///
+    /// Project-prefix enforcement: every path must contain
+    /// `projects/{project_id}/`; otherwise the whole call returns
+    /// [`basin_common::BasinError::IsolationViolation`] without touching
+    /// the store. Page-cache entries for each deleted file are
+    /// invalidated on success — same hook as [`Storage::delete_file`].
+    ///
+    /// Errors on individual deletes are logged and swallowed; the
+    /// catalog commit that authoritatively removed these files has
+    /// already advanced the snapshot, so straggler files on disk are
+    /// inefficiency, not correctness — same contract as the
+    /// post-rewrite cleanup path in `basin_engine::dml_mutate::delete_objects`.
+    pub async fn bulk_delete_files(
+        &self,
+        project: &ProjectId,
+        paths: Vec<ObjectPath>,
+    ) -> Result<usize> {
+        if paths.is_empty() {
+            return Ok(0);
+        }
+        let expected_prefix = format!("projects/{}/", project.as_prefix());
+        for p in &paths {
+            if !p.as_ref().contains(&expected_prefix) {
+                return Err(basin_common::BasinError::isolation(format!(
+                    "bulk_delete_files: {p} missing project prefix {expected_prefix}"
+                )));
+            }
+        }
+        // Use the per-project gated store so the deletes count against
+        // this project's permit pool (the same contract as `delete_file`).
+        let inner: Arc<dyn ObjectStore> = self.project_store(project);
+        let n = paths.len();
+        let _ = bulk_delete(&inner, paths.clone()).await.map_err(|e| {
+            // Same shape as `delete_project_prefix`: we still report the
+            // count attempted in the success path; per-key errors are
+            // logged below. Aggregate failures only surface here.
+            tracing::warn!(target: "basin_storage", error = %e, "bulk_delete_files: aggregate error");
+            basin_common::BasinError::storage(format!("bulk_delete_files({project}): {e}"))
+        })?;
+        // Invalidate page-cache entries for every deleted file. The
+        // disk-cache layer (when present) already invalidates on its
+        // own `delete()` interception, but the page cache sits above
+        // and needs its own hook (same as `delete_file`).
+        if let Some(pc) = self.page_cache_handle() {
+            for p in &paths {
+                pc.invalidate_path(p);
+            }
+        }
+        Ok(n)
     }
 
     /// Best-effort delete of one project-owned object. Used by the tiering

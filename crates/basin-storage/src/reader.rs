@@ -661,6 +661,11 @@ async fn read_one(
     // by the caller and the cache key doesn't capture it. In practice
     // the partition predicate is the default for v0.1, so this is a
     // no-op guard.
+    // Page-cache key: file path + projection + filters. The parquet
+    // reader pushes filters all the way down (with_row_filter +
+    // with_row_selection), so the cached `Vec<RecordBatch>` is
+    // post-filter; sharing entries across queries with different WHEREs
+    // would return wrong rows. See `CacheKey` docs for the constraint.
     let cache_key = page_cache.as_ref().map(|_| CacheKey {
         path: path.clone(),
         projection_hash: hash_projection(opts.projection.as_deref()),
@@ -791,12 +796,17 @@ async fn read_one(
         let batches =
             vortex_project_and_filter(batches, opts.as_ref(), catalog_schema.as_ref(), apply_filter)?;
 
-        // Page-cache write-through, keyed by the same (path, projection,
-        // filters) cache key the Parquet path uses, so a repeat of the
-        // identical read is served from cache and stays consistent.
+        // Page-cache write-through, keyed by the same (path, projection)
+        // cache key the Parquet path uses, so a repeat of the identical
+        // read is served from cache and stays consistent. Skip the
+        // insert when the cache is at its byte budget — the entry would
+        // be evicted on insert anyway, so the per-batch Arc::new is
+        // pure overhead.
         if let (Some(pc), Some(key)) = (page_cache.as_ref(), cache_key) {
-            let cached: Vec<Arc<RecordBatch>> = batches.iter().cloned().map(Arc::new).collect();
-            pc.insert(key, cached);
+            if pc.has_capacity() {
+                let cached: Vec<Arc<RecordBatch>> = batches.iter().cloned().map(Arc::new).collect();
+                pc.insert(key, cached);
+            }
         }
         let stream = futures::stream::iter(batches.into_iter().map(Ok));
         return Ok(stream.boxed());
@@ -1745,7 +1755,17 @@ where
                 });
 
                 // Page-cache write-through with the synthesised batches.
+                //
+                // LRU-budget-aware: skip the per-batch clone entirely
+                // when the cache is already at its byte budget. The
+                // entry would be evicted on insert anyway, so the clone
+                // is pure overhead — and on cache-full workloads we've
+                // measured the layer (c) read path at ~2× of layer (b)
+                // because of this clone alone.
                 if let (Some(pc), Some(key)) = (page_cache, cache_key) {
+                    if !pc.has_capacity() {
+                        return Ok(mapped.boxed());
+                    }
                     let buf: Arc<std::sync::Mutex<Option<Vec<Arc<RecordBatch>>>>> =
                         Arc::new(std::sync::Mutex::new(Some(Vec::new())));
                     let buf_for_each = buf.clone();
@@ -1889,6 +1909,13 @@ where
     });
 
     if let (Some(pc), Some(key)) = (page_cache, cache_key) {
+        // LRU-budget-aware (see notes on the synth-batch site above):
+        // skip write-through entirely when the cache has no capacity
+        // for a new entry. Avoids paying the per-batch clone cost on
+        // queries that would just churn the LRU.
+        if !pc.has_capacity() {
+            return Ok(mapped.boxed());
+        }
         let buf: Arc<std::sync::Mutex<Option<Vec<Arc<RecordBatch>>>>> =
             Arc::new(std::sync::Mutex::new(Some(Vec::new())));
         let buf_for_each = buf.clone();

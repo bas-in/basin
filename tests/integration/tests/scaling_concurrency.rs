@@ -190,7 +190,27 @@ async fn scaling_3_concurrency() {
         .map(|r| r.concurrency)
         .unwrap_or(0);
     let ratio = peak / qps1.max(1e-9);
-    let pass = ratio >= BAR_FANOUT_RATIO;
+
+    // Extra bar (Fix #2 follow-up): C=64 must not be a throughput
+    // cliff vs C=16. Pre-fix, total_qps(64) was ≈ total_qps(16) (the
+    // 4-slot global scheduler budget queued every C=64 request behind
+    // the parquet range fan-out). Post-fix (priority-split scheduler,
+    // raised per-project semaphore floor) we expect ≥ 1.5× throughput
+    // at C=64 over C=16 on this LocalFS card.
+    let qps_16 = report
+        .iter()
+        .find(|r| r.concurrency == 16)
+        .map(|r| r.total_qps)
+        .unwrap_or(0.0);
+    let qps_64 = report
+        .iter()
+        .find(|r| r.concurrency == 64)
+        .map(|r| r.total_qps)
+        .unwrap_or(0.0);
+    let qps_ratio_64_over_16 = if qps_16 > 0.0 { qps_64 / qps_16 } else { 0.0 };
+    let cliff_pass = qps_ratio_64_over_16 >= 1.5;
+
+    let pass = ratio >= BAR_FANOUT_RATIO && cliff_pass;
 
     println!(
         "[SCALING 3] concurrency: peak={:.1} qps at C={}, baseline={:.1} qps at C=1, speedup={:.2}x (bar >={}x) {}",
@@ -251,7 +271,8 @@ async fn scaling_3_concurrency() {
 
     if !pass {
         panic!(
-            "FAIL: peak={peak:.1} (at C={peak_c}) / total_qps(1)={qps1:.1} = {ratio:.2}x, bar {BAR_FANOUT_RATIO}x"
+            "FAIL: peak={peak:.1} (at C={peak_c}) / total_qps(1)={qps1:.1} = {ratio:.2}x, bar {BAR_FANOUT_RATIO}x; \
+             total_qps(64)/total_qps(16) = {qps_ratio_64_over_16:.2}x, bar 1.5x"
         );
     }
 }

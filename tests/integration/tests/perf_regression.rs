@@ -71,9 +71,19 @@ fn p99(mut s: Vec<f64>) -> f64 {
     s[keep.saturating_sub(1).min(s.len() - 1)]
 }
 
+fn p50(mut s: Vec<f64>) -> f64 {
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    s[s.len() / 2]
+}
+
 fn chk(shape: &str, p99_ms: f64, bar: f64) {
     println!("[perf_regression] {shape}: p99={p99_ms:.2}ms bar<={bar:.0}ms");
     assert!(p99_ms <= bar, "{shape} p99 {p99_ms:.2}ms exceeded {bar:.0}ms bar");
+}
+
+fn chk_p50(shape: &str, p50_ms: f64, bar: f64) {
+    println!("[perf_regression] {shape}: p50={p50_ms:.2}ms bar<={bar:.0}ms");
+    assert!(p50_ms <= bar, "{shape} p50 {p50_ms:.2}ms exceeded {bar:.0}ms bar");
 }
 
 /// Insert rows (id, cat, label) in batches of 500.
@@ -267,14 +277,25 @@ async fn perf_reg_06_single_row_update_by_pk() {
         }
     }
     ex(&sess, "UPDATE t SET val='warm' WHERE id=0").await;
+    // First, hit each id once to seed the materialize-overlay shape that
+    // iteration 2 onwards will exercise (per fix #94/#95 regression).
+    for i in 0..ITERS as i64 {
+        let id = (i + 1) % ROWS;
+        ex(&sess, &format!("UPDATE t SET val='first' WHERE id={id}")).await;
+    }
     let mut s = Vec::with_capacity(ITERS);
     for i in 0..ITERS as i64 {
-        let id = i % ROWS;
+        let id = (i + 1) % ROWS;
         let t = Instant::now();
         ex(&sess, &format!("UPDATE t SET val='updated' WHERE id={id}")).await;
         s.push(t.elapsed().as_secs_f64() * 1e3);
     }
-    chk("single_row_update_by_pk", p99(s), 500.0);
+    // p99 bar is the headline regression catcher; p50 bar guards
+    // against the #94/#95 follow-up regression where the synchronous
+    // post-commit physical delete added ~44 ms to the single-row
+    // UPDATE p50 at 1 M scale.
+    chk("single_row_update_by_pk", p99(s.clone()), 500.0);
+    chk_p50("single_row_update_by_pk", p50(s), 30.0);
 }
 
 // ── Shape 7 ──────────────────────────────────────────────────────────────────

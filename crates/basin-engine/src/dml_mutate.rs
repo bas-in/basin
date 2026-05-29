@@ -946,6 +946,14 @@ pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result
     let data_files = storage
         .list_data_files_with_stats(&sess.project, &table)
         .await?;
+    // Defense-in-depth (#94/#95): a fire-and-forget physical delete may
+    // not have completed by the time we re-list, but the catalog is
+    // authoritative — intersect with `live_data_files()` so any stale
+    // on-disk file the lister returned is filtered out here, before any
+    // read decision is made on it. Re-load the meta because earlier
+    // helpers (pre_mutation_flush / materialize_hot_overlay_into_cold)
+    // may have advanced the snapshot since `meta` was first loaded.
+    let data_files = filter_to_live_data_files(sess, &table, data_files).await?;
     if data_files.is_empty() {
         return Ok(ExecResult::Empty {
             tag: "DELETE 0".into(),
@@ -1560,6 +1568,9 @@ async fn hot_tier_update_by_pk(
         };
 
         let data_files = storage.list_data_files_with_stats(&sess.project, table).await?;
+        // Defense-in-depth (#94/#95): drop any files the cold-path
+        // lister returned that the catalog already considers removed.
+        let data_files = filter_to_live_data_files(sess, table, data_files).await?;
         'files: for f in &data_files {
             if current.len() == want.len() {
                 break 'files;
@@ -1836,6 +1847,9 @@ pub(crate) async fn exec_update(
     let data_files = storage
         .list_data_files_with_stats(&sess.project, &table)
         .await?;
+    // Defense-in-depth (#94/#95): filter out files the catalog
+    // already removed even if the async cleanup hasn't unlinked them.
+    let data_files = filter_to_live_data_files(sess, &table, data_files).await?;
     if data_files.is_empty() {
         return Ok(ExecResult::Empty {
             tag: "UPDATE 0".into(),
@@ -2092,8 +2106,7 @@ pub(crate) async fn exec_update(
     });
     if assignments_touch_pk && !meta.pk_columns.is_empty() {
         check_update_pk(
-            &sess.engine.config().storage,
-            &sess.project,
+            sess,
             &table,
             table.as_str(),
             &meta.pk_columns,
@@ -2626,9 +2639,13 @@ async fn exec_delete_via_df_rowset(
     let storage = sess.engine.config().storage.clone();
 
     // Count total rows BEFORE deletion so we can report DELETE <n>.
-    let total_rows_before: usize = storage
+    // Defense-in-depth (#94/#95): filter out files the catalog
+    // already removed before counting.
+    let listed_files = storage
         .list_data_files_with_stats(&sess.project, table)
-        .await?
+        .await?;
+    let live_files = filter_to_live_data_files(sess, table, listed_files).await?;
+    let total_rows_before: usize = live_files
         .iter()
         .map(|f| f.row_count as usize)
         .sum();
@@ -2663,6 +2680,9 @@ async fn exec_delete_via_df_rowset(
     let data_files = storage
         .list_data_files_with_stats(&sess.project, table)
         .await?;
+    // Defense-in-depth (#94/#95): exclude any files the catalog has
+    // already removed even if the async cleanup hasn't unlinked them.
+    let data_files = filter_to_live_data_files(sess, table, data_files).await?;
     let all_paths: Vec<String> = data_files
         .iter()
         .map(|f| f.path.as_ref().to_string())
@@ -3315,8 +3335,7 @@ async fn read_and_apply_assignments_mixed(
 /// files NOT in `replaced_paths` and validate the post-SET batches
 /// against that plus their own intra-batch duplicates.
 async fn check_update_pk(
-    storage: &Storage,
-    project: &basin_common::ProjectId,
+    sess: &ProjectSession,
     table: &TableName,
     table_name_str: &str,
     pk_columns: &[String],
@@ -3327,8 +3346,14 @@ async fn check_update_pk(
         return Ok(());
     }
     use std::collections::HashSet;
+    let storage = &sess.engine.config().storage;
+    let project = &sess.project;
     let replaced: HashSet<&str> = replaced_paths.iter().map(|s| s.as_str()).collect();
     let data_files = storage.list_data_files_with_stats(project, table).await?;
+    // Defense-in-depth (#94/#95): the cold-path lister can include
+    // files that the catalog has already removed; treat the catalog as
+    // truth so a stale on-disk Parquet doesn't reintroduce phantom PKs.
+    let data_files = filter_to_live_data_files(sess, table, data_files).await?;
     let mut existing: HashSet<Vec<String>> = HashSet::new();
     for f in &data_files {
         if replaced.contains(f.path.as_ref()) {
@@ -3504,6 +3529,42 @@ async fn materialize_hot_overlay_into_cold(
     Ok(())
 }
 
+/// Defense-in-depth filter for the cold-path lister output.
+///
+/// The cold-path lister (`Storage::list_data_files_with_stats`) scans
+/// the object store directly. Post-#94/#95 the physical delete that
+/// follows `commit_replace` is fire-and-forget, so a freshly-listed
+/// directory can briefly include files that the catalog already
+/// considers removed. Intersecting with `meta.live_data_files()`
+/// (which is computed by walking snapshots and applying every
+/// `removed_paths`) filters those ghosts out before any read decision
+/// is made on them. The catalog is the source of truth — this filter
+/// just enforces it on the cold path.
+async fn filter_to_live_data_files(
+    sess: &ProjectSession,
+    table: &TableName,
+    listed: Vec<DataFile>,
+) -> Result<Vec<DataFile>> {
+    if listed.is_empty() {
+        return Ok(listed);
+    }
+    let meta = sess
+        .engine
+        .config()
+        .catalog
+        .load_table(&sess.project, table)
+        .await?;
+    let live: std::collections::HashSet<String> = meta
+        .live_data_files()
+        .into_iter()
+        .map(|f| f.path)
+        .collect();
+    Ok(listed
+        .into_iter()
+        .filter(|f| live.contains(f.path.as_ref()))
+        .collect())
+}
+
 /// Write the replacement batches as one new Parquet file (none if `batches`
 /// is empty). We concat first because `Storage::write_batch` is one-batch-
 /// per-call; a multi-batch table would otherwise produce N replacement files
@@ -3631,8 +3692,12 @@ async fn delete_objects(
     schema: &Schema,
     paths: &[String],
 ) -> Result<()> {
-    let storage = &sess.engine.config().storage;
-    let store = storage.project_object_store(&sess.project);
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let storage = sess.engine.config().storage.clone();
+    let project = sess.project;
+    let store = storage.project_object_store(&project);
     let root = storage.root_prefix_handle();
     let vector_columns: Vec<String> = schema
         .fields()
@@ -3645,35 +3710,62 @@ async fn delete_objects(
         })
         .collect();
 
+    // Build the full list of objects to delete (data files + any HNSW
+    // sidecars). Then hand off to a fire-and-forget tokio task so the
+    // caller's UPDATE/DELETE returns as soon as the catalog commit has
+    // landed. Defense-in-depth against #94/#95 is provided at every
+    // `list_data_files_with_stats` call site via the
+    // `live_data_files` HashSet intersect — even if a stale physical
+    // file lingers on disk briefly, the cold-path lister cannot see it.
+    type ObjectPath = object_store::path::Path;
+    let mut all_paths: Vec<ObjectPath> = Vec::with_capacity(paths.len());
+    let mut sidecars: Vec<ObjectPath> = Vec::new();
     for p in paths {
-        let obj = object_store::path::Path::from(p.as_str());
-        if let Err(e) = store.delete(&obj).await {
-            tracing::warn!(path = %p, error = %e, "post-replace object delete failed");
-        }
-        // Best-effort sidecar sweep. We don't probe the store first; a
-        // missing sidecar (most files don't have one) returns NotFound,
-        // which we swallow.
+        all_paths.push(object_store::path::Path::from(p.as_str()));
         for column in &vector_columns {
             if let Some(sidecar) = vector_index_segment_key_for_data_file(
                 root.as_ref(),
-                &sess.project,
+                &project,
                 table,
                 column,
                 p,
             ) {
-                if let Err(e) = store.delete(&sidecar).await {
-                    // NotFound is the normal case for files that never had
-                    // an index sidecar; demote to debug.
-                    let msg = format!("{e}");
-                    if msg.contains("NotFound") || msg.contains("not found") {
-                        tracing::debug!(path = %sidecar, "no hnsw sidecar to delete");
-                    } else {
-                        tracing::warn!(path = %sidecar, error = %e, "hnsw sidecar delete failed");
-                    }
-                }
+                sidecars.push(sidecar);
             }
         }
     }
+
+    let store_for_task = store.clone();
+    let storage_for_task = storage.clone();
+    tokio::spawn(async move {
+        // Native batch path for the data files (S3 DeleteObjects on AWS,
+        // 64-way buffer_unordered everywhere else) via the storage helper
+        // so page-cache entries are invalidated atomically with the
+        // physical deletes.
+        if let Err(e) = storage_for_task
+            .bulk_delete_files(&project, all_paths.clone())
+            .await
+        {
+            tracing::warn!(
+                target: "basin_engine",
+                error = %e,
+                "post-replace bulk delete failed; relying on catalog as source of truth"
+            );
+        }
+        // Sidecars are best-effort — most files never have one. Issue
+        // them through the per-file `delete` so NotFound on the missing
+        // case is cheap.
+        for sidecar in sidecars {
+            if let Err(e) = store_for_task.delete(&sidecar).await {
+                let msg = format!("{e}");
+                if msg.contains("NotFound") || msg.contains("not found") {
+                    tracing::debug!(path = %sidecar, "no hnsw sidecar to delete");
+                } else {
+                    tracing::warn!(path = %sidecar, error = %e, "hnsw sidecar delete failed");
+                }
+            }
+        }
+    });
     Ok(())
 }
 
@@ -4948,6 +5040,9 @@ async fn exec_soft_delete(
     let data_files = storage
         .list_data_files_with_stats(&sess.project, &table)
         .await?;
+    // Defense-in-depth (#94/#95): exclude any files the catalog
+    // already removed even if the async cleanup hasn't unlinked them.
+    let data_files = filter_to_live_data_files(sess, &table, data_files).await?;
     if data_files.is_empty() {
         return Ok(empty_or_returning(
             "DELETE 0",

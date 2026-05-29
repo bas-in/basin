@@ -140,6 +140,21 @@ impl PageCacheCounters {
 /// Composite cache key. We hash the projection and filter set so two
 /// reads with different `SELECT` columns or different `WHERE` clauses
 /// never share an entry.
+///
+/// NOTE on filter-in-key: an earlier draft of the page-cache perf
+/// follow-up dropped the filter from the key on the assumption that
+/// DataFusion's `FilterExec` re-applies the WHERE above the storage
+/// adapter, so a cache hit under a different filter yields the same
+/// final result. That assumption does not hold in this codebase: the
+/// parquet reader pushes the filter all the way down via
+/// `with_row_filter` + page-level `with_row_selection`, so the cached
+/// `Vec<RecordBatch>` is **post-filter**. Sharing such an entry across
+/// queries with different WHEREs returns wrong rows (regression caught
+/// by `rmw_update_through_hot_tier_is_correct`). The filter therefore
+/// stays in the key. The other half of the Phase 5.7 follow-up —
+/// LRU-budget-aware write-through opt-out — is still applied
+/// independently in `reader.rs` and yields the layer (c) speedup
+/// directly.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CacheKey {
     pub path: ObjectPath,
@@ -460,6 +475,17 @@ impl PageCache {
         self.counters
             .current_bytes
             .store(g.current_bytes, Ordering::Relaxed);
+    }
+
+    /// Heuristic: is there room in the byte budget for another
+    /// write-through? Used by the reader to skip the per-batch clone
+    /// when the cache is already saturated — the entry would be
+    /// evicted on insert anyway, and the buffer is pure overhead in
+    /// that case (the read path returns the same batches whether or
+    /// not they got cached).
+    pub(crate) fn has_capacity(&self) -> bool {
+        let g = self.state.lock().expect("page cache mutex poisoned");
+        g.current_bytes < self.max_bytes
     }
 
     /// For tests: how many entries the cache currently holds.

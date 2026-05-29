@@ -231,10 +231,7 @@ async fn point_query(
     Ok(())
 }
 
-#[ignore = "Engine deficiency (backlog): 5-run measurement (2026-05-21) shows a.p50 ≈ 225 ms and d.p50 ≈ 63–147 ms → speedup 1.5×–3.7×, far below the ≥100× bar. \
-Root cause: layer (d) p50 never drops below ~62 ms — matching one injected RPC latency (50 ms) — which means disk+page cache reads are still routing through the latency-injected ObjectStore rather than being served from local cache. \
-The bar is reachable only when: (1) disk/page cache hits bypass object_store::get_opts entirely (no injected latency), AND (2) the baseline pays ≥10 RPCs per query (a.p50 ≥ 500 ms); currently a.p50 ≈ 225 ms indicates ~4–5 RPCs per query with the 200-id working set across 10 files. \
-Fix in basin-storage: cache hit path must not call get_opts on the latency store; serve row-group pages from the local disk/page cache without going back to the ObjectStore."]
+#[ignore = "Phase 5.7 perf-pass kept the LRU-budget-aware write-through opt-out but reverted the filter-from-key drop (the drop broke `rmw_update_through_hot_tier_is_correct`: the parquet reader pushes filters via with_row_filter so cached batches are post-filter; sharing across different WHEREs returns wrong rows). The remaining cache speedup is bounded by the 200-distinct-id working set with filter-in-key: ~99% misses → speedup stays in the 1.5×–3.7× range, well below the 20×/100× bars. Reaching the bar requires caching pre-filter batches (decoder change) or another reader-side restructure outside this perf pass."]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn viability_perf_stack() {
     basin_common::telemetry::try_init_for_tests();

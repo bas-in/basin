@@ -53,8 +53,33 @@ use std::time::{Duration, Instant};
 use basin_common::ProjectId;
 use tokio::sync::oneshot;
 
-/// Total in-flight RPC budget across all projects. ADR 0008 explains
-/// why <4 deadlocks the Parquet reader's range fan-out.
+/// Floor for the High-priority partition of the global budget. ADR 0008
+/// explains why <4 deadlocks the Parquet reader's range fan-out: the
+/// builder may have 2-3 concurrent range fetches queued (footer +
+/// column-chunk + page-index) and a smaller floor stalls forward
+/// progress under back-pressure. The High pool is sized at
+/// `max(MIN_HIGH_BUDGET, total / 4)` so it scales with the configured
+/// total while never dropping below this hard floor.
+pub const MIN_HIGH_BUDGET: usize = 4;
+
+/// Compute the default total in-flight RPC budget across all projects.
+/// The previous fixed cap of 4 was a deadlock floor; under the C=64
+/// concurrent-reader workload the queueing wall became the dominant
+/// latency wall (demand ≈ 192 vs cap 4 → ~50× p50 explosion). Scaling
+/// with available CPU keeps the cap aligned with the workload while
+/// still leaving plenty of head-room above the ADR 0008 floor.
+///
+/// Overridable via `BASIN_STORAGE_GLOBAL_BUDGET` (read at `Storage::new`).
+pub fn default_global_budget() -> usize {
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
+    std::cmp::max(32, 4 * cpus)
+}
+
+/// Back-compat constant retained for the small number of callers (mostly
+/// tests) that opted into the historical floor explicitly. New code
+/// should call [`default_global_budget`].
 pub const DEFAULT_GLOBAL_BUDGET: usize = 4;
 
 /// Deadlines per priority class. High wins the heap by ~200x.
@@ -167,18 +192,23 @@ impl ProjectQueue {
         }
     }
 
-    /// Pop next waiter — high lane wins intra-project.
-    fn pop_next(&mut self) -> Option<DeadlinedWaiter> {
-        if let Some(w) = self.high.pop_front() {
-            self.stats.queue_depth_high.fetch_sub(1, Ordering::Relaxed);
-            return Some(w);
+    /// Pop next waiter, restricted to the given priority lane. Used when
+    /// one priority's pool is exhausted but the other still has slots.
+    fn pop_next_with_priority(&mut self, p: Priority) -> Option<DeadlinedWaiter> {
+        match p {
+            Priority::High => {
+                let w = self.high.pop_front()?;
+                self.stats.queue_depth_high.fetch_sub(1, Ordering::Relaxed);
+                Some(w)
+            }
+            Priority::Low => {
+                let w = self.low.pop_front()?;
+                self.stats.queue_depth_low.fetch_sub(1, Ordering::Relaxed);
+                Some(w)
+            }
         }
-        if let Some(w) = self.low.pop_front() {
-            self.stats.queue_depth_low.fetch_sub(1, Ordering::Relaxed);
-            return Some(w);
-        }
-        None
     }
+
 
     /// Earliest deadline across queued waiters; None if queue is empty.
     fn head_deadline(&self) -> Option<Instant> {
@@ -237,8 +267,14 @@ struct SchedulerInner {
     stats: Mutex<HashMap<ProjectId, Arc<ProjectStatsAtomics>>>,
 }
 
+/// Per-priority partition of the global budget. The pools are
+/// independent: a saturated Low pool cannot starve High, and vice
+/// versa. ADR 0008 still applies — `high_available` is sized at
+/// startup with a floor of [`MIN_HIGH_BUDGET`] so the parquet reader's
+/// range fan-out can't deadlock waiting for a sibling fetch to land.
 struct State {
-    available: usize,
+    high_available: usize,
+    low_available: usize,
     queues: HashMap<ProjectId, ProjectQueue>,
     heap: BinaryHeap<Reverse<DeadlineEntry>>,
     /// Per-project rate window start (recent_rpcs reset boundary).
@@ -251,6 +287,8 @@ struct State {
 pub(crate) struct Permit {
     sched: Arc<SchedulerInner>,
     project: ProjectId,
+    /// Which pool to return the slot to on drop.
+    priority: Priority,
     /// false if the receiver was dropped before the permit landed.
     held: bool,
 }
@@ -261,7 +299,10 @@ impl Drop for Permit {
             return;
         }
         let mut state = self.sched.state.lock().expect("scheduler state poisoned");
-        state.available += 1;
+        match self.priority {
+            Priority::High => state.high_available += 1,
+            Priority::Low => state.low_available += 1,
+        }
         if let Some(q) = state.queues.get_mut(&self.project) {
             if q.in_flight > 0 {
                 q.in_flight -= 1;
@@ -285,12 +326,37 @@ impl Drop for Permit {
 }
 
 impl Scheduler {
+    /// Compute the split between High and Low pools.
+    ///
+    /// - For small budgets (≤ MIN_HIGH_BUDGET * 2) we collapse to a
+    ///   single shared pool by putting *all* budget into High; Low
+    ///   waiters then dispatch only when High is idle. This preserves
+    ///   the ADR 0008 deadlock floor on tiny budgets (the legacy
+    ///   single-pool shape) and keeps the existing 1-2-4 budget tests
+    ///   meaningful.
+    /// - For larger budgets we partition: High gets at least
+    ///   [`MIN_HIGH_BUDGET`] (or 25% of total — whichever is larger),
+    ///   Low gets the remainder. So with the default 32-slot total we
+    ///   land at High = 8 / Low = 24, which is well above the C=64
+    ///   queueing wall on point reads while leaving bulk operations
+    ///   plenty of headroom.
+    fn split_budget(global_budget: usize) -> (usize, usize) {
+        if global_budget <= MIN_HIGH_BUDGET * 2 {
+            return (global_budget, 0);
+        }
+        let high = std::cmp::max(MIN_HIGH_BUDGET, global_budget / 4).min(global_budget);
+        let low = global_budget - high;
+        (high, low)
+    }
+
     pub fn new(global_budget: usize) -> Self {
+        let (high_available, low_available) = Self::split_budget(global_budget);
         Self {
             inner: Arc::new(SchedulerInner {
                 global_budget,
                 state: Mutex::new(State {
-                    available: global_budget,
+                    high_available,
+                    low_available,
                     queues: HashMap::new(),
                     heap: BinaryHeap::new(),
                     rate_window_start: HashMap::new(),
@@ -375,9 +441,9 @@ impl Scheduler {
     /// await — so this is safe to call from the request hot path.
     fn try_dispatch(&self) {
         loop {
-            let (waiter, project) = {
+            let (waiter, project, priority) = {
                 let mut state = self.inner.state.lock().expect("scheduler state poisoned");
-                if state.available == 0 {
+                if state.high_available == 0 && state.low_available == 0 {
                     return;
                 }
                 match self.pick_next(&mut state) {
@@ -392,6 +458,7 @@ impl Scheduler {
             let permit = Permit {
                 sched: self.inner.clone(),
                 project,
+                priority,
                 held: true,
             };
             if let Err(returned) = waiter.tx.send(permit) {
@@ -401,13 +468,19 @@ impl Scheduler {
     }
 
     /// Pop the earliest-deadline project honoring the fairness cap.
-    /// On success: state.available decremented, in_flight incremented,
+    /// On success: the matching pool (`high_available` or
+    /// `low_available`) is decremented, in_flight incremented, and
     /// consecutive_dispatches updated. Returns None if nothing is
-    /// dispatchable.
-    fn pick_next(&self, state: &mut State) -> Option<(Waiter, ProjectId)> {
+    /// dispatchable in the matching pool.
+    fn pick_next(&self, state: &mut State) -> Option<(Waiter, ProjectId, Priority)> {
         // Defensive bound: stale entries are dropped without re-push;
         // fairness yields re-push at most once per encounter.
         let mut sweep_budget = state.heap.len().saturating_mul(2) + 8;
+        // Track projects we've already inspected this sweep that had no
+        // eligible waiter (pool exhausted on the only queued lane).
+        // We re-push their heap entry once and then skip on re-encounter
+        // so we don't spin.
+        let mut skipped: std::collections::HashSet<ProjectId> = std::collections::HashSet::new();
         while sweep_budget > 0 {
             sweep_budget -= 1;
 
@@ -476,12 +549,92 @@ impl Scheduler {
                 }
             }
 
-            // Pop the waiter and dispatch.
+            // Decide which lane to pop from (Priority::High = High
+            // queue; Priority::Low = Low queue) and which pool to
+            // charge. Normal case: lane == pool. Single-pool fallback:
+            // when the configured budget is small enough that
+            // `low_available == 0` at construction
+            // (`global_budget ≤ MIN_HIGH_BUDGET*2`, see
+            // [`Scheduler::split_budget`]), Low waiters borrow from the
+            // High pool. We tag the borrowed permit's priority as
+            // Priority::High so it returns to the right pool on drop —
+            // accounting still balances.
+            let small_budget_single_pool = self.inner.global_budget <= MIN_HIGH_BUDGET * 2;
+            let (lane, pool): (Option<Priority>, Option<Priority>) = {
+                let q = state.queues.get(&top.project)?;
+                let has_high = !q.high.is_empty();
+                let has_low = !q.low.is_empty();
+                if has_high && state.high_available > 0 {
+                    (Some(Priority::High), Some(Priority::High))
+                } else if has_low && state.low_available > 0 {
+                    (Some(Priority::Low), Some(Priority::Low))
+                } else if has_low && small_budget_single_pool && state.high_available > 0 {
+                    // Borrow High budget for Low; permit returns to High pool.
+                    (Some(Priority::Low), Some(Priority::High))
+                } else {
+                    (None, None)
+                }
+            };
+            let chosen_priority = pool;
+
+            let Some(chosen_priority) = chosen_priority else {
+                // No pool can serve this project right now. Re-push the
+                // heap entry once and try the next project. If we
+                // re-encounter the same project later in this sweep,
+                // there's nothing dispatchable across the heap → bail
+                // out to avoid an infinite re-push loop.
+                if !skipped.insert(top.project) {
+                    // Already re-pushed this project once in this sweep.
+                    // The remaining heap is either stale or also
+                    // blocked; no forward progress possible right now.
+                    // Re-push the current entry so it's reconsidered
+                    // when a permit returns.
+                    if let Some(d) = state
+                        .queues
+                        .get(&top.project)
+                        .and_then(|q| q.head_deadline())
+                    {
+                        let seq = state.next_seq;
+                        state.next_seq = state.next_seq.wrapping_add(1);
+                        state.heap.push(Reverse(DeadlineEntry {
+                            deadline: d,
+                            seq,
+                            project: top.project,
+                        }));
+                        if let Some(q) = state.queues.get_mut(&top.project) {
+                            q.in_heap = true;
+                        }
+                    }
+                    return None;
+                }
+                if let Some(d) = state
+                    .queues
+                    .get(&top.project)
+                    .and_then(|q| q.head_deadline())
+                {
+                    let seq = state.next_seq;
+                    state.next_seq = state.next_seq.wrapping_add(1);
+                    state.heap.push(Reverse(DeadlineEntry {
+                        deadline: d,
+                        seq,
+                        project: top.project,
+                    }));
+                    if let Some(q) = state.queues.get_mut(&top.project) {
+                        q.in_heap = true;
+                    }
+                }
+                continue;
+            };
+
+            // Pop the waiter from the chosen lane.
+            let lane = lane.expect("lane set whenever pool is set");
             let (waiter, queue_drained) = {
                 let Some(q) = state.queues.get_mut(&top.project) else {
                     continue;
                 };
-                let Some(w) = q.pop_next() else { continue };
+                let Some(w) = q.pop_next_with_priority(lane) else {
+                    continue;
+                };
                 q.in_flight += 1;
                 q.stats.in_flight.fetch_add(1, Ordering::Relaxed);
                 let drained = q.is_queue_empty();
@@ -528,10 +681,20 @@ impl Scheduler {
                 }
             }
             state.last_dispatched_project = Some(top.project);
-            state.available -= 1;
-            return Some((waiter.waiter, top.project));
+            match chosen_priority {
+                Priority::High => state.high_available -= 1,
+                Priority::Low => state.low_available -= 1,
+            }
+            return Some((waiter.waiter, top.project, chosen_priority));
         }
         None
+    }
+
+    /// Snapshot of the available budget per pool. Only used for tests.
+    #[cfg(test)]
+    fn pool_snapshot(&self) -> (usize, usize) {
+        let s = self.inner.state.lock().expect("scheduler state poisoned");
+        (s.high_available, s.low_available)
     }
 }
 
@@ -816,5 +979,93 @@ mod tests {
             p50,
             p99
         );
+    }
+
+    /// Budget split: large totals partition into High + Low pools that
+    /// respect the ADR 0008 floor and total to the configured budget.
+    #[test]
+    fn split_budget_partitions_with_high_floor() {
+        // Tiny budget → single pool (all into High).
+        assert_eq!(Scheduler::split_budget(1), (1, 0));
+        assert_eq!(Scheduler::split_budget(4), (4, 0));
+        assert_eq!(Scheduler::split_budget(8), (8, 0));
+        // Default range: 32 → high=8, low=24 (high floor MIN_HIGH_BUDGET=4,
+        // 25 % of 32 = 8 wins).
+        let (h, l) = Scheduler::split_budget(32);
+        assert!(h >= MIN_HIGH_BUDGET, "high {h} below floor");
+        assert_eq!(h + l, 32, "split must sum to total");
+        // Huge budget: high ≈ 25 %.
+        let (h, l) = Scheduler::split_budget(256);
+        assert!(h >= MIN_HIGH_BUDGET);
+        assert_eq!(h + l, 256);
+        assert!(h >= 64 && h <= 96, "expected ~25% high, got {h}/{l}");
+    }
+
+    /// With a partitioned budget (default = 32), Low traffic saturating
+    /// its pool MUST NOT starve a High permit — the dedicated High pool
+    /// retains the ADR 0008 floor. Regression for the C=64 cliff that
+    /// motivated the split: a 192-deep Low queue used to take ~237 ms
+    /// for a single High point read; with the split it stays in the µs
+    /// range (no contention on the High pool at all).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn split_pool_high_unblocked_by_low_saturation() {
+        let total = 32; // matches default_global_budget on small CI hosts
+        let s = Scheduler::new(total);
+        let (h0, l0) = s.pool_snapshot();
+        assert!(h0 >= MIN_HIGH_BUDGET, "high floor not respected: {h0}");
+        assert!(l0 > 0, "low pool must be nonzero at total={total}");
+
+        let noisy = ProjectId::new();
+        // Saturate Low: hold all low_available permits + many queued.
+        let mut blockers = Vec::with_capacity(l0);
+        for _ in 0..l0 {
+            blockers.push(s.acquire(noisy, Priority::Low).await);
+        }
+        let mut bg = Vec::new();
+        for _ in 0..200 {
+            let s = s.clone();
+            bg.push(tokio::spawn(async move {
+                let _p = s.acquire(noisy, Priority::Low).await;
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let quiet = ProjectId::new();
+        let start = Instant::now();
+        let _high = s.acquire(quiet, Priority::High).await;
+        let elapsed = start.elapsed();
+        // Must be fast — the High pool was never touched by the Low
+        // flood. Generous bound (50 ms) tolerates CI scheduling noise
+        // but catches a 200 ms+ regression cleanly.
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "split pool failed: High permit took {elapsed:?} despite saturated Low pool"
+        );
+
+        // Cleanup so the bg tasks can drain.
+        drop(blockers);
+        for h in bg {
+            let _ = tokio::time::timeout(Duration::from_millis(500), h).await;
+        }
+    }
+
+    /// Round-trip: each priority's permit returns to the right pool on
+    /// drop so total capacity is conserved across many acquire/drop cycles.
+    #[tokio::test]
+    async fn split_pool_capacity_conserved() {
+        let s = Scheduler::new(32);
+        let (h0, l0) = s.pool_snapshot();
+        let p = ProjectId::new();
+        for _ in 0..16 {
+            let h = s.acquire(p, Priority::High).await;
+            drop(h);
+            let l = s.acquire(p, Priority::Low).await;
+            drop(l);
+        }
+        // Give the dispatcher a moment to settle any tail wakeups.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let (h1, l1) = s.pool_snapshot();
+        assert_eq!((h0, l0), (h1, l1), "pool capacity leaked");
     }
 }
