@@ -1005,6 +1005,21 @@ impl Storage {
         reader::read_file(self, project, path).await
     }
 
+    /// Like [`read_file`] but threads a [`ReadOptions`] through so callers
+    /// can push down a column projection (and any other read option). The
+    /// constraint enforcers (PK / UNIQUE / FK / EXCLUSION) use this with a
+    /// `projection` set to only the constraint column(s), which skips JSONB
+    /// / TEXT payload decode and yields the bulk-INSERT perf fix (Tier 1).
+    #[tracing::instrument(skip(self, opts), fields(project=%project, path=%path))]
+    pub async fn read_file_with_options(
+        &self,
+        project: &ProjectId,
+        path: &ObjectPath,
+        opts: ReadOptions,
+    ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+        reader::read_file_with_options(self, project, path, opts).await
+    }
+
     /// Copy a hot-tier data file to its cold-tier sibling and return the new
     /// [`DataFile`] descriptor. The original hot file is **left in place** —
     /// callers must atomically commit the catalog swap (`replace_data_files`)

@@ -3762,6 +3762,7 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
                 &meta.pk_columns,
                 &batch,
                 Some((&*sess.engine.memtable_registry(), &sess.project)),
+                Some(sess.engine.pk_set_cache().as_ref()),
             )
             .await?;
             crate::constraints::enforce_unique_on_insert(
@@ -3868,6 +3869,7 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
         &meta.pk_columns,
         &batch,
         Some((&*sess.engine.memtable_registry(), &sess.project)),
+        Some(sess.engine.pk_set_cache().as_ref()),
     )
     .await?;
     crate::constraints::enforce_unique_on_insert(
@@ -4305,6 +4307,7 @@ async fn exec_insert_select(
         &meta.pk_columns,
         &batch,
         Some((&*sess.engine.memtable_registry(), &sess.project)),
+        Some(sess.engine.pk_set_cache().as_ref()),
     )
     .await?;
     crate::constraints::enforce_unique_on_insert(
@@ -4522,6 +4525,7 @@ async fn exec_insert_default_values(
         &meta.pk_columns,
         &batch,
         Some((&*sess.engine.memtable_registry(), &sess.project)),
+        Some(sess.engine.pk_set_cache().as_ref()),
     )
     .await?;
     crate::constraints::enforce_unique_on_insert(
@@ -4706,6 +4710,7 @@ pub(crate) async fn exec_ingest_batch(
         &meta.pk_columns,
         &batch,
         Some((&*sess.engine.memtable_registry(), &sess.project)),
+        Some(sess.engine.pk_set_cache().as_ref()),
     )
     .await?;
     crate::constraints::enforce_unique_on_insert(

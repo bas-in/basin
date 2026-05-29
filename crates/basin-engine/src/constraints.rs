@@ -24,7 +24,8 @@
 //! published events; CHECK fires inside the write path.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, RwLock};
 
 use arrow_array::{
     Array, BooleanArray, FixedSizeBinaryArray, Float64Array, Int16Array, Int32Array, Int64Array,
@@ -41,6 +42,104 @@ use futures::StreamExt;
 
 use crate::convert::{batch_df_to_ws, batch_ws_to_df};
 use crate::types::field_is_citext;
+
+// --------------------------------------------------------------------
+// Tier 2 — PK / UNIQUE set memoization across batches
+// --------------------------------------------------------------------
+
+/// Per-`(project, table)` cached "existing PK set" for the bulk-INSERT
+/// constraint scan. Between compactions (the common case) the on-disk file
+/// set for a table does not change, so the `existing` HashSet rebuilt on
+/// each batch in [`enforce_pk_on_insert`] is byte-identical to the previous
+/// batch's set. The cache reuses the prior set when the current file-set
+/// signature matches the cached one, and falls back to a full rebuild
+/// otherwise.
+///
+/// **Correctness contract**: the cache reflects only what is on disk via
+/// `list_data_files_with_stats`. The shard fast-path memtable + WAL are
+/// **not** consulted here; the existing `enforce_pk_on_insert` body has
+/// always ignored them for non-tombstone reasons (see the long comment in
+/// `enforce_pk_on_insert`), so the cache preserves byte-identical
+/// semantics. The signature is the FNV-1a hash of the sorted file paths;
+/// any UPDATE/DELETE/COMPACT that drops or replaces a file changes the
+/// signature and the cached entry is rebuilt from scratch.
+///
+/// **Tombstone interaction**: when tombstone suppression is active (single
+/// PK + a `MemTableRegistry`), the cached set excludes rows whose PK is
+/// tombstoned at cache-build time. A later tombstone added between batches
+/// would not invalidate the cache — so the cache is **bypassed** when the
+/// caller supplies a non-empty tombstone set. The common bench / bulk-INSERT
+/// case has no tombstones, so the bypass does not regress the hot path.
+pub(crate) struct PkSetCache {
+    inner: RwLock<HashMap<(ProjectId, TableName), Arc<CachedPkSet>>>,
+}
+
+pub(crate) struct CachedPkSet {
+    pub files_sig: u64,
+    /// On-disk PK tuples — string-canonical form, matching the shape the
+    /// constraint comparator hashes on (`scalar_to_canonical_string`).
+    pub set: Arc<std::collections::HashSet<Vec<String>>>,
+    /// Fast-path for single Int64 PKs. When `Some`, callers may avoid the
+    /// `Vec<String>` allocation per cold row and probe directly. When the
+    /// PK shape is anything else this is `None` and callers fall back to
+    /// `set` above. See Tier 3.
+    pub set_i64: Option<Arc<std::collections::HashSet<i64>>>,
+}
+
+impl PkSetCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn get(&self, project: &ProjectId, table: &TableName) -> Option<Arc<CachedPkSet>> {
+        self.inner
+            .read()
+            .expect("pk_set_cache poisoned")
+            .get(&(*project, table.clone()))
+            .cloned()
+    }
+
+    fn put(&self, project: &ProjectId, table: &TableName, entry: Arc<CachedPkSet>) {
+        self.inner
+            .write()
+            .expect("pk_set_cache poisoned")
+            .insert((*project, table.clone()), entry);
+    }
+
+    /// Drop any cached entry for `(project, table)`. Called whenever the
+    /// on-disk file set for the table changes (UPDATE/DELETE replace, DROP
+    /// TABLE, COMPACT, etc.). Cheap: O(1) write-lock + remove.
+    pub(crate) fn invalidate(&self, project: &ProjectId, table: &TableName) {
+        self.inner
+            .write()
+            .expect("pk_set_cache poisoned")
+            .remove(&(*project, table.clone()));
+    }
+
+    /// Drop every cached entry for `project`. Used on project deletion.
+    #[allow(dead_code)]
+    pub(crate) fn invalidate_project(&self, project: &ProjectId) {
+        self.inner
+            .write()
+            .expect("pk_set_cache poisoned")
+            .retain(|(p, _), _| p != project);
+    }
+}
+
+/// FNV-1a hash of the sorted file paths in the current `(project, table)`
+/// data-file set. Stable across calls when the set is unchanged.
+fn files_signature(files: &[basin_storage::DataFile]) -> u64 {
+    let mut paths: Vec<&str> = files.iter().map(|f| f.path.as_ref()).collect();
+    paths.sort_unstable();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for p in &paths {
+        p.hash(&mut hasher);
+        0u8.hash(&mut hasher); // separator
+    }
+    hasher.finish()
+}
 
 // --------------------------------------------------------------------
 // PRIMARY KEY enforcement
@@ -66,6 +165,7 @@ pub(crate) async fn enforce_pk_on_insert(
     pk_columns: &[String],
     batch: &RecordBatch,
     registry: Option<(&basin_hottier::MemTableRegistry, &ProjectId)>,
+    pk_cache: Option<&PkSetCache>,
 ) -> Result<()> {
     if pk_columns.is_empty() || batch.num_rows() == 0 {
         return Ok(());
@@ -81,6 +181,15 @@ pub(crate) async fn enforce_pk_on_insert(
                 .map_err(|_| BasinError::internal(format!("PK column {c:?} missing from batch")))
         })
         .collect::<Result<Vec<_>>>()?;
+
+    // Tier 3 fast-path detection: single Int64 PK. Avoids the `Vec<String>`
+    // allocation per cold row when probing the existing set.
+    let single_i64_pk = pk_columns.len() == 1
+        && batch
+            .schema()
+            .field(pk_idx[0])
+            .data_type()
+            == &DataType::Int64;
 
     // 1. Intra-batch dup check.
     let mut seen: std::collections::HashSet<Vec<String>> =
@@ -141,9 +250,89 @@ pub(crate) async fn enforce_pk_on_insert(
         })
     };
 
+    // Tier 1 (projection pushdown) + Tier 2 (cross-batch memoization) +
+    // Tier 3 (i64 fast-path) all converge here.
+    //
+    // The cache stores the on-disk PK set keyed by the FNV-1a hash of the
+    // sorted file paths. Between compactions (the common bulk-INSERT case),
+    // the file set does not change → cache hit → no cold scan at all.
+    // When the file set changes (a new file appears, an old one is
+    // replaced) the signature differs and we rebuild from scratch.
+    //
+    // Tombstone-active paths bypass the cache entirely (the cached set
+    // was built against an older tombstone snapshot and might admit a
+    // re-INSERT that should now be allowed, or vice-versa). Bypass is
+    // safe — it falls back to the old (still-correct) full scan path.
+    let files_sig = files_signature(&data_files);
+    let cache_eligible = tombstone_keys.is_empty();
+    let cached_entry: Option<Arc<CachedPkSet>> = if cache_eligible {
+        pk_cache
+            .and_then(|c| c.get(project, table))
+            .filter(|entry| entry.files_sig == files_sig)
+    } else {
+        None
+    };
+
+    if let Some(entry) = cached_entry {
+        // Cache hit. Probe directly against the cached set.
+        if single_i64_pk {
+            if let Some(set_i64) = entry.set_i64.as_ref() {
+                let arr = batch
+                    .column(pk_idx[0])
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| BasinError::internal("Int64Array downcast (batch PK)"))?;
+                for row in 0..batch.num_rows() {
+                    if arr.is_null(row) {
+                        continue;
+                    }
+                    let v = arr.value(row);
+                    if set_i64.contains(&v) {
+                        return Err(BasinError::UniqueViolation(format!(
+                            "duplicate key value violates unique constraint \"{table_name_str}_pkey\": \
+                             Key ({})=({}) already exists.",
+                            pk_columns.join(", "),
+                            v
+                        )));
+                    }
+                }
+                return Ok(());
+            }
+        }
+        // Composite-key / other-type path.
+        for row in 0..batch.num_rows() {
+            let Some(k) = pk_tuple_for_row(batch, &pk_idx, row)? else {
+                continue;
+            };
+            if entry.set.contains(&k) {
+                return Err(BasinError::UniqueViolation(format!(
+                    "duplicate key value violates unique constraint \"{table_name_str}_pkey\": \
+                     Key ({})=({}) already exists.",
+                    pk_columns.join(", "),
+                    k.join(", ")
+                )));
+            }
+        }
+        return Ok(());
+    }
+
+    // Cache miss (or cache-ineligible): rebuild the existing set from the
+    // current on-disk file set, using projection pushdown to skip the
+    // JSONB / TEXT payload columns entirely.
+    let read_opts = basin_storage::ReadOptions {
+        projection: Some(pk_columns.to_vec()),
+        ..Default::default()
+    };
     let mut existing: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
+    let mut existing_i64: Option<std::collections::HashSet<i64>> = if single_i64_pk {
+        Some(std::collections::HashSet::new())
+    } else {
+        None
+    };
     for f in &data_files {
-        let mut stream = storage.read_file(project, &f.path).await?;
+        let mut stream = storage
+            .read_file_with_options(project, &f.path, read_opts.clone())
+            .await?;
         while let Some(rb) = stream.next().await {
             let rb = rb?;
             let rb_pk_idx: Vec<usize> = pk_columns
@@ -154,25 +343,115 @@ pub(crate) async fn enforce_pk_on_insert(
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            for row in 0..rb.num_rows() {
-                // Tombstone suppression: if a tombstone for this PK exists in
-                // the hot-tier registry the row is logically deleted — skip it.
-                if !tombstone_keys.is_empty() {
-                    if let Some(dt) = &pk_dt_for_tombstone {
-                        let col = rb.column(rb_pk_idx[0]);
-                        if let Some(rk) =
-                            crate::constraint_union::array_value_to_row_key(col.as_ref(), row, dt)
-                        {
-                            if tombstone_keys.contains(rk.as_bytes()) {
-                                continue; // logically absent — allow re-INSERT
+            // Tier 3 hot loop for single-Int64 PKs. We still build the
+            // string `existing` set in parallel so cache fill and the
+            // tombstone path remain byte-compatible; the i64 probe is
+            // additive.
+            if single_i64_pk {
+                let arr = rb
+                    .column(rb_pk_idx[0])
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| BasinError::internal("Int64Array downcast (cold PK)"))?;
+                for row in 0..rb.num_rows() {
+                    if arr.is_null(row) {
+                        continue;
+                    }
+                    // Tombstone suppression on the same row.
+                    if !tombstone_keys.is_empty() {
+                        if let Some(dt) = &pk_dt_for_tombstone {
+                            let col = rb.column(rb_pk_idx[0]);
+                            if let Some(rk) = crate::constraint_union::array_value_to_row_key(
+                                col.as_ref(),
+                                row,
+                                dt,
+                            ) {
+                                if tombstone_keys.contains(rk.as_bytes()) {
+                                    continue;
+                                }
                             }
                         }
                     }
+                    let v = arr.value(row);
+                    if let Some(s) = existing_i64.as_mut() {
+                        s.insert(v);
+                    }
+                    existing.insert(vec![v.to_string()]);
                 }
-                if let Some(k) = pk_tuple_for_row(&rb, &rb_pk_idx, row)? {
-                    existing.insert(k);
+            } else {
+                for row in 0..rb.num_rows() {
+                    if !tombstone_keys.is_empty() {
+                        if let Some(dt) = &pk_dt_for_tombstone {
+                            let col = rb.column(rb_pk_idx[0]);
+                            if let Some(rk) = crate::constraint_union::array_value_to_row_key(
+                                col.as_ref(),
+                                row,
+                                dt,
+                            ) {
+                                if tombstone_keys.contains(rk.as_bytes()) {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(k) = pk_tuple_for_row(&rb, &rb_pk_idx, row)? {
+                        existing.insert(k);
+                    }
                 }
             }
+        }
+    }
+
+    // Probe the batch against the freshly-built set.
+    if single_i64_pk {
+        if let Some(set_i64) = existing_i64.as_ref() {
+            let arr = batch
+                .column(pk_idx[0])
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| BasinError::internal("Int64Array downcast (batch PK)"))?;
+            for row in 0..batch.num_rows() {
+                if arr.is_null(row) {
+                    continue;
+                }
+                let v = arr.value(row);
+                if set_i64.contains(&v) {
+                    // Fill cache before returning so a retry sees the same set.
+                    if cache_eligible {
+                        if let Some(c) = pk_cache {
+                            c.put(
+                                project,
+                                table,
+                                Arc::new(CachedPkSet {
+                                    files_sig,
+                                    set: Arc::new(existing),
+                                    set_i64: Some(Arc::new(set_i64.clone())),
+                                }),
+                            );
+                        }
+                    }
+                    return Err(BasinError::UniqueViolation(format!(
+                        "duplicate key value violates unique constraint \"{table_name_str}_pkey\": \
+                         Key ({})=({}) already exists.",
+                        pk_columns.join(", "),
+                        v
+                    )));
+                }
+            }
+            if cache_eligible {
+                if let Some(c) = pk_cache {
+                    c.put(
+                        project,
+                        table,
+                        Arc::new(CachedPkSet {
+                            files_sig,
+                            set: Arc::new(existing),
+                            set_i64: Some(Arc::new(set_i64.clone())),
+                        }),
+                    );
+                }
+            }
+            return Ok(());
         }
     }
     for row in 0..batch.num_rows() {
@@ -180,12 +459,38 @@ pub(crate) async fn enforce_pk_on_insert(
             continue;
         };
         if existing.contains(&k) {
+            if cache_eligible {
+                if let Some(c) = pk_cache {
+                    c.put(
+                        project,
+                        table,
+                        Arc::new(CachedPkSet {
+                            files_sig,
+                            set: Arc::new(existing),
+                            set_i64: existing_i64.map(Arc::new),
+                        }),
+                    );
+                }
+            }
             return Err(BasinError::UniqueViolation(format!(
                 "duplicate key value violates unique constraint \"{table_name_str}_pkey\": \
                  Key ({})=({}) already exists.",
                 pk_columns.join(", "),
                 k.join(", ")
             )));
+        }
+    }
+    if cache_eligible {
+        if let Some(c) = pk_cache {
+            c.put(
+                project,
+                table,
+                Arc::new(CachedPkSet {
+                    files_sig,
+                    set: Arc::new(existing),
+                    set_i64: existing_i64.map(Arc::new),
+                }),
+            );
         }
     }
     Ok(())
@@ -368,12 +673,29 @@ async fn enforce_one_unique(
     let replaced: std::collections::HashSet<&str> =
         replaced_paths.iter().map(|s| s.as_str()).collect();
     let data_files = storage.list_data_files_with_stats(project, table).await?;
+    // Tier 1: projection pushdown — read only the UNIQUE columns (plus the
+    // PK column when tombstone suppression is active, so we can look up the
+    // RowKey). Skips JSONB / TEXT payload decode entirely.
+    let mut projection_cols: Vec<String> = columns.to_vec();
+    if !tombstone_keys.is_empty() {
+        if let Some(pk_col) = pk_columns.first() {
+            if !projection_cols.iter().any(|c| c == pk_col) {
+                projection_cols.push(pk_col.clone());
+            }
+        }
+    }
+    let read_opts = basin_storage::ReadOptions {
+        projection: Some(projection_cols),
+        ..Default::default()
+    };
     let mut existing: std::collections::HashSet<Vec<String>> = Default::default();
     for f in &data_files {
         if replaced.contains(f.path.as_ref()) {
             continue;
         }
-        let mut stream = storage.read_file(project, &f.path).await?;
+        let mut stream = storage
+            .read_file_with_options(project, &f.path, read_opts.clone())
+            .await?;
         while let Some(rb) = stream.next().await {
             let rb = rb?;
             let rb_idx: Vec<usize> = columns
@@ -1092,8 +1414,15 @@ async fn collect_pk_tuples(
     let data_files = storage
         .list_data_files_with_stats(project, &meta.table)
         .await?;
+    // Tier 1: projection pushdown — only the referenced-PK columns matter.
+    let read_opts = basin_storage::ReadOptions {
+        projection: Some(pk_cols.to_vec()),
+        ..Default::default()
+    };
     for f in &data_files {
-        let mut stream = storage.read_file(project, &f.path).await?;
+        let mut stream = storage
+            .read_file_with_options(project, &f.path, read_opts.clone())
+            .await?;
         while let Some(rb) = stream.next().await {
             let rb = rb?;
             let idx: Vec<usize> = pk_cols

@@ -260,6 +260,15 @@ pub(crate) struct EngineInner {
     /// [`crate::jsonb_promotion::AUTO_PROMOTE_MIN_HITS`].
     pub(crate) jsonb_promotion_registry:
         Arc<crate::jsonb_promotion::JsonbPromotionRegistry>,
+
+    /// Bulk-INSERT PK / UNIQUE constraint-set memoization cache (Tier 2 of
+    /// the bulk-INSERT perf fix). Keyed by `(project, table)` with the
+    /// on-disk file-set FNV-1a hash as the freshness signature. Between
+    /// compactions the cached set is reused for every subsequent batch's
+    /// constraint scan — eliminating the per-batch full cold-tier read that
+    /// otherwise dominates bulk-INSERT cost. Invalidated by any mutation
+    /// that adds, removes, or replaces a data file for the table.
+    pub(crate) pk_set_cache: Arc<crate::constraints::PkSetCache>,
 }
 
 impl Engine {
@@ -357,6 +366,8 @@ impl Engine {
             jsonb_promotion_registry: Arc::new(
                 crate::jsonb_promotion::JsonbPromotionRegistry::new(),
             ),
+            // Tier 2 bulk-INSERT PK set cache.
+            pk_set_cache: Arc::new(crate::constraints::PkSetCache::new()),
         });
         // Phase 5.14.D2: register the query-history adapter with the shard so
         // the compactor can consult observed ORDER BY / GROUP BY patterns.
@@ -523,6 +534,14 @@ impl Engine {
     /// reference the registry via the engine handle.
     pub fn memtable_registry(&self) -> Arc<basin_hottier::MemTableRegistry> {
         self.inner.memtable_registry.clone()
+    }
+
+    /// Bulk-INSERT PK constraint-set memoization cache (Tier 2). Crate-
+    /// internal; the executor's INSERT path threads this into
+    /// [`crate::constraints::enforce_pk_on_insert`] and the mutation paths
+    /// invalidate the entry whenever the table's data-file set changes.
+    pub(crate) fn pk_set_cache(&self) -> &Arc<crate::constraints::PkSetCache> {
+        &self.inner.pk_set_cache
     }
 
     /// Per-shape HDR histogram registry (Phase 5.16.B).

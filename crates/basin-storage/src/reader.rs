@@ -605,7 +605,21 @@ pub(crate) async fn read_file(
     project: &ProjectId,
     path: &ObjectPath,
 ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
-    let opts = Arc::new(ReadOptions::default());
+    read_file_with_options(storage, project, path, ReadOptions::default()).await
+}
+
+/// Same as [`read_file`] but accepts a [`ReadOptions`] so callers can push
+/// down a column projection (the PK / UNIQUE constraint scans need only one
+/// or a few columns and benefit enormously from skipping JSONB / TEXT
+/// payload decode). All other options (filters, partition, limit,
+/// row_group_selection) are honoured exactly like the table-wide path.
+pub(crate) async fn read_file_with_options(
+    storage: &Storage,
+    project: &ProjectId,
+    path: &ObjectPath,
+    opts: ReadOptions,
+) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+    let opts = Arc::new(opts);
     let store = storage.project_store(project);
     let cache = storage.parquet_meta_cache().clone();
     let counters = storage.read_counters().clone();
