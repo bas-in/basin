@@ -949,11 +949,16 @@ fn coerce_jsonb(expr: &Expr, col: &str) -> Result<Option<Vec<u8>>> {
             )));
         }
     };
-    let parsed: serde_json::Value = serde_json::from_str(s).map_err(|e| {
+    // SIMD-accelerated parse via sonic-rs, then canonicalise (key-sort) and
+    // re-serialise. sonic_rs::from_str parses straight into a
+    // `serde_json::Value`, so the canonicalisation pass and downstream
+    // consumers (which all parse the stored bytes as raw JSON via
+    // serde_json) are unchanged.
+    let parsed: serde_json::Value = sonic_rs::from_str(s).map_err(|e| {
         BasinError::InvalidSchema(format!("invalid JSON literal for column {col}: {e}"))
     })?;
     let canonical = canonicalize_json(parsed);
-    let json_bytes = serde_json::to_vec(&canonical)
+    let json_bytes = sonic_rs::to_vec(&canonical)
         .map_err(|e| BasinError::internal(format!("re-serialising JSON for column {col}: {e}")))?;
     // ADR 0027 Phase 2 (write-side) REVERTED: stored JSONB is bare canonical
     // JSON, not the `0x02` binary offset table. The offset table gave a 15x

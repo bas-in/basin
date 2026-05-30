@@ -48,6 +48,10 @@ thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# SIMD JSON parse on the bulk-INSERT JSONB hot path (`coerce_jsonb`).
+# Parses straight into `serde_json::Value` so the existing canonicalisation
+# (BTreeMap key-sort, semantic-preserving) is reused unchanged.
+sonic-rs.workspace = true
 uuid.workspace = true
 url = "2"
 chrono.workspace = true

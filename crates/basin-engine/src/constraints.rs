@@ -192,26 +192,62 @@ pub(crate) async fn enforce_pk_on_insert(
             == &DataType::Int64;
 
     // 1. Intra-batch dup check.
-    let mut seen: std::collections::HashSet<Vec<String>> =
-        std::collections::HashSet::with_capacity(batch.num_rows());
-    for row in 0..batch.num_rows() {
-        let key = pk_tuple_for_row(batch, &pk_idx, row)?;
-        // Any null in the PK is a hard error — PK columns are NOT
-        // NULL by construction, but defend against future regressions.
-        if key.is_none() {
-            return Err(BasinError::CheckViolation(format!(
-                "null value in column violates not-null constraint on PRIMARY KEY of \
-                 \"{table_name_str}\""
-            )));
+    //
+    // Tier-3 fastpath: when the PK is a single Int64 column the generic
+    // `pk_tuple_for_row` -> `Vec<String>` -> `HashSet<Vec<String>>` path
+    // allocates two strings + a vec per row. For bulk INSERT (10k+ rows)
+    // that dominates this stage. Probe a `HashSet<i64>` directly off the
+    // Int64Array and only fall through to the generic path for other PK
+    // shapes (composite, non-i64).
+    if single_i64_pk {
+        let arr = batch
+            .column(pk_idx[0])
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                BasinError::internal("single_i64_pk detected but column is not Int64Array")
+            })?;
+        let mut seen_i64: std::collections::HashSet<i64> =
+            std::collections::HashSet::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            if arr.is_null(row) {
+                return Err(BasinError::CheckViolation(format!(
+                    "null value in column violates not-null constraint on PRIMARY KEY of \
+                     \"{table_name_str}\""
+                )));
+            }
+            let v = arr.value(row);
+            if !seen_i64.insert(v) {
+                return Err(BasinError::UniqueViolation(format!(
+                    "duplicate key value violates unique constraint \"{table_name_str}_pkey\": \
+                     Key ({})=({}) already exists.",
+                    pk_columns.join(", "),
+                    v
+                )));
+            }
         }
-        let k = key.unwrap();
-        if !seen.insert(k.clone()) {
-            return Err(BasinError::UniqueViolation(format!(
-                "duplicate key value violates unique constraint \"{table_name_str}_pkey\": \
-                 Key ({})=({}) already exists.",
-                pk_columns.join(", "),
-                k.join(", ")
-            )));
+    } else {
+        let mut seen: std::collections::HashSet<Vec<String>> =
+            std::collections::HashSet::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            let key = pk_tuple_for_row(batch, &pk_idx, row)?;
+            // Any null in the PK is a hard error — PK columns are NOT
+            // NULL by construction, but defend against future regressions.
+            if key.is_none() {
+                return Err(BasinError::CheckViolation(format!(
+                    "null value in column violates not-null constraint on PRIMARY KEY of \
+                     \"{table_name_str}\""
+                )));
+            }
+            let k = key.unwrap();
+            if !seen.insert(k.clone()) {
+                return Err(BasinError::UniqueViolation(format!(
+                    "duplicate key value violates unique constraint \"{table_name_str}_pkey\": \
+                     Key ({})=({}) already exists.",
+                    pk_columns.join(", "),
+                    k.join(", ")
+                )));
+            }
         }
     }
 
