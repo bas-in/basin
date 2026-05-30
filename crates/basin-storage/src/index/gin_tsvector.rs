@@ -492,6 +492,105 @@ impl GinTsvectorRegistry {
         }
     }
 
+    /// Probe the posting list at row-group granularity.
+    ///
+    /// Same correctness contract as [`Self::probe_query`] — the result is a
+    /// conservative superset and the caller MUST re-evaluate the full `@@`
+    /// predicate on every emitted row.  This variant preserves the
+    /// per-row-group granularity stored in the underlying posting list so the
+    /// read path can drive `ReadOptions.row_group_selection`, opening only
+    /// the surviving row-groups within each candidate file.
+    ///
+    /// Multi-lexeme `tsquery` semantics: AND-merge at the *file* level
+    /// (a candidate file must contain every lexeme) and the union of all
+    /// row-groups for those lexemes within each surviving file (a row-group
+    /// is a candidate if any lexeme touches it — the row-level re-evaluation
+    /// pass then filters false positives).  Tighter row-group intersection
+    /// would risk false negatives across row-group boundaries (`'cat'` in
+    /// rg=0 and `'dog'` in rg=1 of the same file can still satisfy
+    /// `'cat' & 'dog'` if the `@@` re-evaluation later sees both lexemes
+    /// jointly through a UDF-level recheck, but only when row-group level
+    /// re-evaluation considers both rg=0 and rg=1).  The union strategy
+    /// matches the existing JSONB GIN row-group prune behaviour.
+    pub fn probe_query_with_row_groups(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        col: &str,
+        tsquery_str: &str,
+    ) -> TsvProbeRowGroupResult {
+        let lexemes = extract_query_lexemes(tsquery_str);
+        if lexemes.is_empty() {
+            return TsvProbeRowGroupResult::NoIndex;
+        }
+
+        let arc = match self.get(project, table, col) {
+            Some(a) => a,
+            None => return TsvProbeRowGroupResult::NoIndex,
+        };
+        let list = arc.lock().expect("LexemePostingList lock poisoned");
+
+        // Per-lexeme: file -> set of row-groups.  Then file-level
+        // AND-intersection with per-file row-group union.
+        let mut per_lexeme: Vec<HashMap<String, HashSet<u32>>> =
+            Vec::with_capacity(lexemes.len());
+        for lexeme in &lexemes {
+            match list.probe_lexeme(lexeme) {
+                None => return TsvProbeRowGroupResult::NoIndex,
+                Some(entries) => {
+                    let mut by_file: HashMap<String, HashSet<u32>> = HashMap::new();
+                    for e in entries {
+                        by_file
+                            .entry(e.file_path.clone())
+                            .or_default()
+                            .insert(e.row_group);
+                    }
+                    per_lexeme.push(by_file);
+                }
+            }
+        }
+
+        // AND-intersect file sets across lexemes; union row-groups for each
+        // surviving file.
+        let mut iter = per_lexeme.into_iter();
+        let first = match iter.next() {
+            Some(m) => m,
+            None => return TsvProbeRowGroupResult::NoIndex,
+        };
+        let mut merged: HashMap<String, HashSet<u32>> = first;
+        for next in iter {
+            // Keep only files present in `next`; union their row-groups.
+            let kept_keys: Vec<String> =
+                merged.keys().filter(|k| next.contains_key(*k)).cloned().collect();
+            let mut new_merged: HashMap<String, HashSet<u32>> =
+                HashMap::with_capacity(kept_keys.len());
+            for k in kept_keys {
+                let mut rgs = merged.remove(&k).unwrap_or_default();
+                if let Some(other) = next.get(&k) {
+                    rgs.extend(other.iter().copied());
+                }
+                new_merged.insert(k, rgs);
+            }
+            merged = new_merged;
+        }
+
+        if merged.is_empty() {
+            return TsvProbeRowGroupResult::Empty;
+        }
+
+        // Materialise as sorted Vec<u32> per file (the shape expected by
+        // `GinRowGroupPrunedTable::row_group_selection`).
+        let out: HashMap<String, Vec<u32>> = merged
+            .into_iter()
+            .map(|(file, rgs)| {
+                let mut v: Vec<u32> = rgs.into_iter().collect();
+                v.sort_unstable();
+                (file, v)
+            })
+            .collect();
+        TsvProbeRowGroupResult::FileRowGroups(out)
+    }
+
     /// Remove all posting entries that reference `file_path` for
     /// `(project, table, col)`.  Call this when a Parquet file is compacted
     /// or deleted so the posting list does not return stale candidates.
@@ -597,6 +696,25 @@ pub enum TsvProbeResult {
     /// The set of file paths that may contain matching rows.  The caller reads
     /// only these files and re-applies the full `@@` predicate for correctness.
     FileCandidates(HashSet<String>),
+}
+
+/// Row-group-granular variant of [`TsvProbeResult`].
+///
+/// Same conservative-superset contract as [`TsvProbeResult`].  Returned by
+/// [`GinTsvectorRegistry::probe_query_with_row_groups`] for callers that can
+/// drive `ReadOptions.row_group_selection` (e.g. the read-path
+/// `GinRowGroupPrunedTable` provider).  The per-file `Vec<u32>` is sorted in
+/// ascending order.
+#[derive(Debug)]
+pub enum TsvProbeRowGroupResult {
+    /// No posting list, or a required lexeme was missing/evicted.
+    NoIndex,
+    /// The AND-intersection is empty across all lexemes — short-circuit
+    /// with zero rows.
+    Empty,
+    /// `file_path → sorted row-group indices`.  Files absent from this map
+    /// must be read in full (no false negatives).
+    FileRowGroups(HashMap<String, Vec<u32>>),
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -832,6 +950,36 @@ mod tests {
         // Probe on "body" — different column, no index.
         let result = reg.probe_query(&proj, &tbl, "body", "'cat'");
         assert!(matches!(result, TsvProbeResult::NoIndex));
+    }
+
+    // ── GinTsvectorRegistry: row-group granularity round-trip ────────────────
+
+    #[test]
+    fn probe_query_with_row_groups_preserves_granularity() {
+        let reg = GinTsvectorRegistry::new();
+        let proj = ProjectId::new();
+        let tbl = TableName::new("docs").unwrap();
+
+        // f1: "cat" in rg 0 and rg 2, "dog" in rg 2.
+        reg.index_row(&proj, &tbl, "body", "'cat':1", "f1.parquet", 0, 0);
+        reg.index_row(&proj, &tbl, "body", "'cat':1 'dog':2", "f1.parquet", 2, 7);
+        // f2: "cat" only — must be excluded by the AND-merge below.
+        reg.index_row(&proj, &tbl, "body", "'cat':1", "f2.parquet", 5, 0);
+
+        let result =
+            reg.probe_query_with_row_groups(&proj, &tbl, "body", "'cat' & 'dog'");
+        match result {
+            TsvProbeRowGroupResult::FileRowGroups(map) => {
+                // Only f1 satisfies both lexemes (file-level AND).
+                assert_eq!(map.len(), 1, "expected only f1, got {map:?}");
+                let rgs = map.get("f1.parquet").expect("f1 missing");
+                // Union of row-groups touched by "cat" (rg 0, rg 2) and "dog"
+                // (rg 2) within f1: {0, 2}.  Sorted ascending.
+                assert_eq!(rgs, &vec![0u32, 2u32], "row-group set wrong: {rgs:?}");
+                assert!(!map.contains_key("f2.parquet"), "f2 must be excluded");
+            }
+            other => panic!("expected FileRowGroups, got {other:?}"),
+        }
     }
 
     // ── Smoke test: 50k rows ──────────────────────────────────────────────────

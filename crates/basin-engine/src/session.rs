@@ -2453,17 +2453,21 @@ pub(crate) async fn apply_gin_fts_pruning_for_query(
         None => return Ok(()), // query shape not recognised → full scan
     };
 
-    // Probe the FTS posting list.
-    use basin_storage::index::gin_tsvector::TsvProbeResult;
-    let fts_result = engine.gin_fts_registry().probe_query(
+    // Probe the FTS posting list at row-group granularity.  The registry
+    // stores `(file, row_group, row)` for every posting; the row-group-aware
+    // probe preserves that detail so we can drive
+    // `ReadOptions.row_group_selection` via `GinRowGroupPrunedTable` instead
+    // of opening every row-group of every candidate file.
+    use basin_storage::index::gin_tsvector::TsvProbeRowGroupResult;
+    let fts_rg_result = engine.gin_fts_registry().probe_query_with_row_groups(
         project,
         &fts_plan.table,
         &fts_plan.col,
         &fts_plan.tsquery_str,
     );
 
-    let candidate_files = match fts_result {
-        TsvProbeResult::FileCandidates(files) => files,
+    let rg_map: std::collections::HashMap<String, Vec<u32>> = match fts_rg_result {
+        TsvProbeRowGroupResult::FileRowGroups(m) => m,
         // Empty is handled before exec_select (short-circuit with 0 rows).
         // NoIndex → full scan.
         _ => return Ok(()),
@@ -2494,28 +2498,65 @@ pub(crate) async fn apply_gin_fts_pruning_for_query(
     // Completeness confirmed.  Intersect candidate set with live files.
     let pruned_paths: Vec<String> = live_files
         .iter()
-        .filter(|f| candidate_files.contains(f.path.as_str()))
+        .filter(|f| rg_map.contains_key(f.path.as_str()))
         .map(|f| f.path.to_string())
         .collect();
 
-    if pruned_paths.is_empty() || pruned_paths.len() == live_files.len() {
-        // Either no candidates (defensively leave full set) or all files are
-        // candidates (pruning is a no-op).
+    if pruned_paths.is_empty() {
+        // Defensively leave full set registered (the Empty short-circuit in
+        // the executor should already have caught a truly empty probe).
         return Ok(());
     }
 
-    // Re-register with only the pruned file set.
-    let _ = register_pruned_listing_table(
-        engine,
-        ctx,
-        &fts_plan.table,
-        &meta.schema,
-        meta.file_format,
-        &pruned_paths,
-        meta.global_sort_order.as_deref(),
-    )
-    .await;
+    // Restrict `rg_map` to the live, pruned file set so we don't carry
+    // stale (compacted-away) keys into `GinRowGroupPrunedTable`.
+    let live_path_set: std::collections::HashSet<&str> =
+        pruned_paths.iter().map(|s| s.as_str()).collect();
+    let rg_map_live: std::collections::HashMap<String, Vec<u32>> = rg_map
+        .into_iter()
+        .filter(|(f, _)| live_path_set.contains(f.as_str()))
+        .collect();
 
+    // Row-group-granular path: register a `GinRowGroupPrunedTable` that
+    // drives Basin's native storage reader with `row_group_selection` so
+    // DataFusion's Parquet reader only opens the surviving row-groups of
+    // each candidate file.  Correctness: the row-group set per file is a
+    // conservative superset of the posting-list rows that touched the
+    // query lexemes; the full `@@` UDF re-evaluates every emitted row.
+    let df_schema = match schema_ws_to_df(&meta.schema) {
+        Ok(s) => Arc::new(s),
+        Err(_) => {
+            // Schema conversion failed — fall back to file-level prune
+            // (still safe; just opens all row-groups of each candidate file).
+            if pruned_paths.len() == live_files.len() {
+                return Ok(());
+            }
+            let _ = register_pruned_listing_table(
+                engine,
+                ctx,
+                &fts_plan.table,
+                &meta.schema,
+                meta.file_format,
+                &pruned_paths,
+                meta.global_sort_order.as_deref(),
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    let provider = crate::gin_rowgroup_scan::GinRowGroupPrunedTable::new(
+        df_schema,
+        engine.config().storage.clone(),
+        *project,
+        fts_plan.table.clone(),
+        meta.file_format,
+        pruned_paths,
+        rg_map_live,
+    );
+    let tref = TableReference::Bare { table: fts_plan.table.as_str().into() };
+    let _ = ctx.deregister_table(tref.clone());
+    ctx.register_table(tref, Arc::new(provider))
+        .map_err(|e| BasinError::internal(format!("register fts rg-pruned table: {e}")))?;
     Ok(())
 }
 
