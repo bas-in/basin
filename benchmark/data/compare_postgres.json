@@ -7,15 +7,15 @@
   "metrics": [
     {
       "label": "On-disk bytes (users + events)",
-      "basin": 152416356.0,
-      "postgres": 305831936.0,
+      "basin": 152475012.0,
+      "postgres": 305840128.0,
       "unit": "bytes",
       "better": "basin",
       "ratio_text": "pg / basin = 2.01x"
     },
     {
       "label": "Point query p50",
-      "basin": 0.119146,
+      "basin": 0.09929199999999999,
       "postgres": 0.003,
       "unit": "ms",
       "better": "postgres",
@@ -23,604 +23,604 @@
     },
     {
       "label": "Point query p99",
-      "basin": 0.150709,
-      "postgres": 0.017,
+      "basin": 0.122875,
+      "postgres": 0.019,
       "unit": "ms",
       "better": "postgres",
-      "ratio_text": "pg / basin = 0.11x"
+      "ratio_text": "pg / basin = 0.15x"
     },
     {
       "label": "Range scan p50 (~1k rows)",
-      "basin": 13.7721665,
-      "postgres": 64.175,
+      "basin": 14.288499999999999,
+      "postgres": 59.826499999999996,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 4.66x"
+      "ratio_text": "pg / basin = 4.19x"
     },
     {
       "label": "Range scan p99",
-      "basin": 17.160666000000003,
-      "postgres": 139.012,
+      "basin": 18.033458,
+      "postgres": 250.158,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 8.10x"
+      "ratio_text": "pg / basin = 13.87x"
     },
     {
       "label": "Aggregate GROUP BY user_id p50",
-      "basin": 28.4169375,
-      "postgres": 246.5535,
+      "basin": 25.852083,
+      "postgres": 248.2735,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 8.68x"
+      "ratio_text": "pg / basin = 9.60x"
     },
     {
       "label": "2-table JOIN GROUP BY p50",
-      "basin": 33.4025415,
-      "postgres": 1360.308,
+      "basin": 37.4261875,
+      "postgres": 370.5765,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 40.72x"
+      "ratio_text": "pg / basin = 9.90x"
     },
     {
       "label": "ILIKE '%@gmail.com' p50",
-      "basin": 4.517729,
-      "postgres": 36.7615,
+      "basin": 6.8370625,
+      "postgres": 29.0565,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 8.14x"
+      "ratio_text": "pg / basin = 4.25x"
     },
     {
       "label": "Pagination ORDER BY LIMIT/OFFSET p50",
-      "basin": 76.571979,
-      "postgres": 174.79399999999998,
+      "basin": 82.520542,
+      "postgres": 92.061,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 2.28x"
+      "ratio_text": "pg / basin = 1.12x"
     },
     {
       "label": "Single-row UPDATE p50",
-      "basin": 162.2240835,
-      "postgres": 9.2525,
+      "basin": 170.7418335,
+      "postgres": 0.395,
       "unit": "ms",
       "better": "postgres",
-      "ratio_text": "pg / basin = 0.06x"
+      "ratio_text": "pg / basin = 0.00x"
     },
     {
       "label": "Bulk UPDATE (~333333 rows)",
-      "basin": 5291.494541,
-      "postgres": 5483.823791,
+      "basin": 4335.699458,
+      "postgres": 2568.495666,
       "unit": "ms",
-      "better": "basin"
+      "better": "postgres"
     },
     {
       "label": "DELETE WHERE id IN (10 rows)",
-      "basin": 0.458125,
-      "postgres": 4.1551670000000005,
+      "basin": 0.241,
+      "postgres": 43.692083,
       "unit": "ms",
       "better": "basin"
     },
     {
       "label": "Bulk INSERT 1000000 rows",
-      "basin": 76756.027416,
-      "postgres": 10002.180292000001,
+      "basin": 65323.844082999996,
+      "postgres": 18776.755957999998,
       "unit": "ms",
       "better": "postgres"
     },
     {
       "label": "Cold-start first query",
-      "basin": 3.441459,
-      "postgres": 13.8705,
+      "basin": 4.356167,
+      "postgres": 15.305791,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 4.03x"
+      "ratio_text": "pg / basin = 3.51x"
     },
     {
       "label": "COUNT(*) full table p50",
-      "basin": 77.9421875,
-      "postgres": 186.72050000000002,
+      "basin": 78.496,
+      "postgres": 3380.784,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 2.40x"
+      "ratio_text": "pg / basin = 43.07x"
     },
     {
       "label": "DATE_TRUNC day + SUM GROUP BY p50",
-      "basin": 51.252167,
-      "postgres": 274.81600000000003,
+      "basin": 53.153875,
+      "postgres": 119.86349999999999,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 5.36x"
+      "ratio_text": "pg / basin = 2.26x"
     },
     {
       "label": "Analytics JOIN+WHERE (last 333333s window)",
-      "basin": 40.9454795,
-      "postgres": 1396.1475,
+      "basin": 41.627187500000005,
+      "postgres": 239.36950000000002,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 34.10x"
+      "ratio_text": "pg / basin = 5.75x"
     },
     {
       "label": "COUNT(DISTINCT user_id) p50",
-      "basin": 47.7792495,
-      "postgres": 237.652,
+      "basin": 47.8467505,
+      "postgres": 224.99200000000002,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 4.97x"
+      "ratio_text": "pg / basin = 4.70x"
     },
     {
       "label": "LIKE 'pending%' prefix p50",
-      "basin": 21.074437,
-      "postgres": 0.109,
+      "basin": 22.709103999999996,
+      "postgres": 0.084,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.00x"
+    },
+    {
+      "label": "Multi-col GROUP BY + HAVING p50",
+      "basin": 72.15018699999999,
+      "postgres": 266.991,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "pg / basin = 3.70x"
+    },
+    {
+      "label": "Window LAG OVER PARTITION p50",
+      "basin": 60.432396,
+      "postgres": 125.07650000000001,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "pg / basin = 2.07x"
+    },
+    {
+      "label": "Recursive CTE Fibonacci(30) p50",
+      "basin": 1.4227295,
+      "postgres": 0.2225,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.16x"
+    },
+    {
+      "label": "Correlated subquery in SELECT p50",
+      "basin": 52.502770999999996,
+      "postgres": 7876.049,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "pg / basin = 150.01x"
+    },
+    {
+      "label": "EXISTS in WHERE p50",
+      "basin": 55.942333500000004,
+      "postgres": 235.879,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "pg / basin = 4.22x"
+    },
+    {
+      "label": "3-table JOIN BETWEEN p50",
+      "basin": 84.09537499999999,
+      "postgres": 502.01349999999996,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "pg / basin = 5.97x"
+    },
+    {
+      "label": "UNION ALL two scans p50",
+      "basin": 18.296979,
+      "postgres": 186.835,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "pg / basin = 10.21x"
+    },
+    {
+      "label": "ORDER BY NULLS LAST + LIMIT p50",
+      "basin": 9.8388545,
+      "postgres": 13.975999999999999,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "pg / basin = 1.42x"
+    },
+    {
+      "label": "Top-N per group (MAX) p50",
+      "basin": 122.9893125,
+      "postgres": 298.64099999999996,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "pg / basin = 2.43x"
+    },
+    {
+      "label": "Numeric range BETWEEN p50",
+      "basin": 6.1069995,
+      "postgres": 72.48150000000001,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "pg / basin = 11.87x"
+    },
+    {
+      "label": "JSONB -> get key p50 (cold, first-query)",
+      "basin": 9.789833,
+      "postgres": 0.067,
       "unit": "ms",
       "better": "postgres",
       "ratio_text": "pg / basin = 0.01x"
     },
     {
-      "label": "Multi-col GROUP BY + HAVING p50",
-      "basin": 75.15593799999999,
-      "postgres": 296.68949999999995,
-      "unit": "ms",
-      "better": "basin",
-      "ratio_text": "pg / basin = 3.95x"
-    },
-    {
-      "label": "Window LAG OVER PARTITION p50",
-      "basin": 69.5485625,
-      "postgres": 124.18200000000002,
-      "unit": "ms",
-      "better": "basin",
-      "ratio_text": "pg / basin = 1.79x"
-    },
-    {
-      "label": "Recursive CTE Fibonacci(30) p50",
-      "basin": 1.3647915,
-      "postgres": 0.0675,
-      "unit": "ms",
-      "better": "postgres",
-      "ratio_text": "pg / basin = 0.05x"
-    },
-    {
-      "label": "Correlated subquery in SELECT p50",
-      "basin": 46.0408335,
-      "postgres": 7684.546,
-      "unit": "ms",
-      "better": "basin",
-      "ratio_text": "pg / basin = 166.91x"
-    },
-    {
-      "label": "EXISTS in WHERE p50",
-      "basin": 51.701021,
-      "postgres": 285.964,
-      "unit": "ms",
-      "better": "basin",
-      "ratio_text": "pg / basin = 5.53x"
-    },
-    {
-      "label": "3-table JOIN BETWEEN p50",
-      "basin": 87.861729,
-      "postgres": 473.92600000000004,
-      "unit": "ms",
-      "better": "basin",
-      "ratio_text": "pg / basin = 5.39x"
-    },
-    {
-      "label": "UNION ALL two scans p50",
-      "basin": 21.829166999999998,
-      "postgres": 153.57,
-      "unit": "ms",
-      "better": "basin",
-      "ratio_text": "pg / basin = 7.04x"
-    },
-    {
-      "label": "ORDER BY NULLS LAST + LIMIT p50",
-      "basin": 9.592061999999999,
-      "postgres": 20.192500000000003,
-      "unit": "ms",
-      "better": "basin",
-      "ratio_text": "pg / basin = 2.11x"
-    },
-    {
-      "label": "Top-N per group (MAX) p50",
-      "basin": 67.7476255,
-      "postgres": 244.11149999999998,
-      "unit": "ms",
-      "better": "basin",
-      "ratio_text": "pg / basin = 3.60x"
-    },
-    {
-      "label": "Numeric range BETWEEN p50",
-      "basin": 5.467249499999999,
-      "postgres": 37.01349999999999,
-      "unit": "ms",
-      "better": "basin",
-      "ratio_text": "pg / basin = 6.77x"
-    },
-    {
-      "label": "JSONB -> get key p50 (cold, first-query)",
-      "basin": 2.7516670000000003,
-      "postgres": 0.047,
-      "unit": "ms",
-      "better": "postgres",
-      "ratio_text": "pg / basin = 0.02x"
-    },
-    {
       "label": "JSONB -> get key p50 (steady-state, promoted)",
-      "basin": 2.8530625,
-      "postgres": 0.10450000000000001,
+      "basin": 3.4181665,
+      "postgres": 0.1225,
       "unit": "ms",
       "better": "postgres",
       "ratio_text": "pg / basin = 0.04x"
     },
     {
       "label": "JSONB ->> get text p50 (cold, first-query)",
-      "basin": 2.381667,
-      "postgres": 0.022,
+      "basin": 10.538250000000001,
+      "postgres": 0.082,
       "unit": "ms",
       "better": "postgres",
       "ratio_text": "pg / basin = 0.01x"
     },
     {
       "label": "JSONB ->> get text p50 (steady-state, promoted)",
-      "basin": 1.540771,
-      "postgres": 0.045,
+      "basin": 1.5363755000000001,
+      "postgres": 0.1015,
       "unit": "ms",
       "better": "postgres",
-      "ratio_text": "pg / basin = 0.03x"
+      "ratio_text": "pg / basin = 0.07x"
     },
     {
       "label": "JSONB -> deep path p50 (cold, first-query)",
-      "basin": 2.230417,
-      "postgres": 0.023,
+      "basin": 11.823916,
+      "postgres": 0.053,
       "unit": "ms",
       "better": "postgres",
-      "ratio_text": "pg / basin = 0.01x"
+      "ratio_text": "pg / basin = 0.00x"
     },
     {
       "label": "JSONB -> deep path p50 (steady-state, promoted)",
-      "basin": 2.0744375,
-      "postgres": 0.1115,
+      "basin": 3.131438,
+      "postgres": 0.112,
       "unit": "ms",
       "better": "postgres",
-      "ratio_text": "pg / basin = 0.05x"
+      "ratio_text": "pg / basin = 0.04x"
     },
     {
       "label": "JSONB @> contains p50 (no GIN index)",
-      "basin": 1100.8632705,
-      "postgres": 53.078500000000005,
+      "basin": 1048.3247084999998,
+      "postgres": 50.897,
       "unit": "ms",
       "better": "postgres",
       "ratio_text": "pg / basin = 0.05x"
     },
     {
       "label": "JSONB @> contains p50 (with GIN index)",
-      "basin": 1097.834354,
-      "postgres": 69.43100000000001,
+      "basin": 1041.9583954999998,
+      "postgres": 69.382,
       "unit": "ms",
       "better": "postgres",
-      "ratio_text": "pg / basin = 0.06x"
+      "ratio_text": "pg / basin = 0.07x"
     },
     {
       "label": "GIN @> effectiveness (no-index ms / with-index ms)",
-      "basin": 1.002758992273255,
-      "postgres": 0.7644784030188244,
+      "basin": 1.006109949329546,
+      "postgres": 0.7335764319275893,
       "unit": "ratio",
       "better": "basin",
-      "ratio_text": "basin 1.00x vs pg 0.76x speedup (higher = better)"
+      "ratio_text": "basin 1.01x vs pg 0.73x speedup (higher = better)"
     },
     {
       "label": "JSONB ? key exists p50",
-      "basin": 350.84458300000006,
-      "postgres": 50.775,
+      "basin": 328.38397899999995,
+      "postgres": 48.6755,
       "unit": "ms",
       "better": "postgres",
-      "ratio_text": "pg / basin = 0.14x"
+      "ratio_text": "pg / basin = 0.15x"
     },
     {
       "label": "JSONB #> path get p50",
-      "basin": 2.4631665,
-      "postgres": 0.063,
+      "basin": 4.2936875,
+      "postgres": 0.1855,
       "unit": "ms",
       "better": "postgres",
-      "ratio_text": "pg / basin = 0.03x"
+      "ratio_text": "pg / basin = 0.04x"
     },
     {
       "label": "JSONB jsonb_array_length(tags) p50",
-      "basin": 3.5404795,
-      "postgres": 0.0485,
+      "basin": 3.6955415,
+      "postgres": 0.029500000000000002,
       "unit": "ms",
       "better": "postgres",
       "ratio_text": "pg / basin = 0.01x"
     },
     {
       "label": "JSONB jsonb_typeof(metadata) p50",
-      "basin": 2.1480835000000003,
-      "postgres": 0.114,
+      "basin": 3.067104,
+      "postgres": 0.064,
       "unit": "ms",
       "better": "postgres",
-      "ratio_text": "pg / basin = 0.05x"
+      "ratio_text": "pg / basin = 0.02x"
     },
     {
       "label": "JSONB filter+agg (GROUP BY ->>category) p50",
-      "basin": 1248.513625,
-      "postgres": 125.79249999999999,
+      "basin": 1154.4111665,
+      "postgres": 104.1945,
       "unit": "ms",
       "better": "postgres",
-      "ratio_text": "pg / basin = 0.10x"
+      "ratio_text": "pg / basin = 0.09x"
     },
     {
       "label": "JSONB jsonb_set UPDATE (10 rows, structural: CoW rewrite) (basin gap)",
       "basin": -1.0,
-      "postgres": 1.9906250000000003,
+      "postgres": 1.0687909999999998,
       "unit": "ms",
       "better": "postgres",
       "ratio_text": "basin: unsupported"
     },
     {
       "label": "Concurrent INSERT 8x1000 rows",
-      "basin": 68.82195800000001,
-      "postgres": 14.673458,
+      "basin": 64.773083,
+      "postgres": 20.527209000000003,
       "unit": "ms",
       "better": "postgres",
-      "ratio_text": "pg / basin = 0.21x"
+      "ratio_text": "pg / basin = 0.32x"
     },
     {
       "label": "Concurrent SELECT 16 sessions mixed",
-      "basin": 13.848625,
-      "postgres": 6.382334,
+      "basin": 19.251875000000002,
+      "postgres": 6.66575,
       "unit": "ms",
       "better": "postgres",
-      "ratio_text": "pg / basin = 0.46x"
+      "ratio_text": "pg / basin = 0.35x"
     },
     {
       "label": "Read-modify-write contention 8 sessions",
-      "basin": 54.055958000000004,
-      "postgres": 4.917333,
+      "basin": 77.51670800000001,
+      "postgres": 10.947541999999999,
       "unit": "ms",
       "better": "postgres",
-      "ratio_text": "pg / basin = 0.09x"
+      "ratio_text": "pg / basin = 0.14x"
     },
     {
       "label": "BEGIN; INSERT x100; COMMIT throughput",
-      "basin": 181.948375,
-      "postgres": 13.147666000000001,
+      "basin": 184.78204200000002,
+      "postgres": 13.844624999999999,
       "unit": "ms",
       "better": "postgres",
       "ratio_text": "pg / basin = 0.07x"
     },
     {
       "label": "ROLLBACK drops rows (txn correctness)",
-      "basin": 3.033875,
-      "postgres": 0.640583,
+      "basin": 2.9667090000000003,
+      "postgres": 0.63575,
       "unit": "ms",
       "better": "postgres",
       "ratio_text": "pg / basin = 0.21x"
     },
     {
       "label": "Savepoint nest + ROLLBACK TO",
-      "basin": 5.690125,
-      "postgres": 0.727667,
+      "basin": 5.859416,
+      "postgres": 1.05875,
       "unit": "ms",
       "better": "postgres",
-      "ratio_text": "pg / basin = 0.13x"
+      "ratio_text": "pg / basin = 0.18x"
     },
     {
       "label": "Long-txn snapshot isolation (basin gap)",
       "basin": -1.0,
-      "postgres": 4.702292,
+      "postgres": 5.165375,
       "unit": "ms",
       "better": "postgres",
       "ratio_text": "basin: unsupported"
     },
     {
       "label": "WHERE x IS NULL",
-      "basin": 0.26502099999999995,
-      "postgres": 0.48,
+      "basin": 0.2822705,
+      "postgres": 0.34850000000000003,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 1.81x"
+      "ratio_text": "pg / basin = 1.23x"
     },
     {
       "label": "WHERE x = NULL returns 0 (3VL)",
-      "basin": 0.06462499999999999,
-      "postgres": 0.006500000000000001,
+      "basin": 0.06600049999999999,
+      "postgres": 0.006,
       "unit": "ms",
       "better": "postgres",
-      "ratio_text": "pg / basin = 0.10x"
+      "ratio_text": "pg / basin = 0.09x"
     },
     {
       "label": "COUNT(col) vs COUNT(*) NULL handling",
-      "basin": 0.069521,
-      "postgres": 0.5725,
+      "basin": 0.0701455,
+      "postgres": 0.6495,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 8.23x"
+      "ratio_text": "pg / basin = 9.26x"
     },
     {
       "label": "NOT IN (NULL in subquery, 3VL)",
-      "basin": 1.2532915,
-      "postgres": 1.8375,
+      "basin": 1.4274369999999998,
+      "postgres": 1.937,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 1.47x"
+      "ratio_text": "pg / basin = 1.36x"
     },
     {
       "label": "NOT EXISTS",
-      "basin": 9.3010205,
-      "postgres": 48.2585,
+      "basin": 10.844333500000001,
+      "postgres": 44.5315,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 5.19x"
+      "ratio_text": "pg / basin = 4.11x"
     },
     {
       "label": "Scalar subquery in SELECT list",
-      "basin": 43.251041,
-      "postgres": 44.509,
+      "basin": 42.524249999999995,
+      "postgres": 40.67,
       "unit": "ms",
-      "better": "basin",
-      "ratio_text": "pg / basin = 1.03x"
+      "better": "postgres",
+      "ratio_text": "pg / basin = 0.96x"
     },
     {
       "label": "Derived table (subquery in FROM)",
-      "basin": 46.8106665,
-      "postgres": 149.01749999999998,
+      "basin": 47.8668545,
+      "postgres": 155.024,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 3.18x"
+      "ratio_text": "pg / basin = 3.24x"
     },
     {
       "label": "INTERSECT",
-      "basin": 32.469146,
-      "postgres": 156.255,
+      "basin": 33.659313000000004,
+      "postgres": 156.4085,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 4.81x"
+      "ratio_text": "pg / basin = 4.65x"
     },
     {
       "label": "EXCEPT",
-      "basin": 32.1824165,
-      "postgres": 161.949,
+      "basin": 32.937062499999996,
+      "postgres": 161.1535,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 5.03x"
+      "ratio_text": "pg / basin = 4.89x"
     },
     {
       "label": "UNION (dedup)",
-      "basin": 60.2411045,
-      "postgres": 231.90699999999998,
+      "basin": 61.0435,
+      "postgres": 223.72699999999998,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 3.85x"
+      "ratio_text": "pg / basin = 3.67x"
     },
     {
       "label": "ARRAY_AGG + ORDER BY in aggregate",
-      "basin": 638.7812080000001,
-      "postgres": 106.128,
+      "basin": 607.6396875,
+      "postgres": 98.2585,
       "unit": "ms",
       "better": "postgres",
-      "ratio_text": "pg / basin = 0.17x"
+      "ratio_text": "pg / basin = 0.16x"
     },
     {
       "label": "STRING_AGG",
-      "basin": 201.780667,
-      "postgres": 214.7025,
+      "basin": 200.2530415,
+      "postgres": 204.143,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 1.06x"
+      "ratio_text": "pg / basin = 1.02x"
     },
     {
       "label": "COUNT(*) FILTER (WHERE ...)",
-      "basin": 66.38225,
-      "postgres": 111.5705,
+      "basin": 68.8326045,
+      "postgres": 106.9805,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 1.68x"
+      "ratio_text": "pg / basin = 1.55x"
     },
     {
       "label": "CASE WHEN 10 branches",
-      "basin": 2.7756040000000004,
-      "postgres": 0.911,
+      "basin": 1.7009585,
+      "postgres": 0.875,
       "unit": "ms",
       "better": "postgres",
-      "ratio_text": "pg / basin = 0.33x"
+      "ratio_text": "pg / basin = 0.51x"
     },
     {
       "label": "regexp_match / substring / split_part",
-      "basin": 14.381229000000001,
-      "postgres": 1.2505000000000002,
+      "basin": 14.317542,
+      "postgres": 1.282,
       "unit": "ms",
       "better": "postgres",
       "ratio_text": "pg / basin = 0.09x"
     },
     {
       "label": "Multi-col ORDER BY mixed ASC/DESC + LIMIT",
-      "basin": 83.766333,
-      "postgres": 110.543,
+      "basin": 56.3018755,
+      "postgres": 113.7065,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 1.32x"
+      "ratio_text": "pg / basin = 2.02x"
     },
     {
       "label": "LATERAL JOIN (correlated derived table)",
-      "basin": 15.6998335,
-      "postgres": 3395.8805,
+      "basin": 18.7734795,
+      "postgres": 3264.446,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 216.30x"
+      "ratio_text": "pg / basin = 173.89x"
     },
     {
       "label": "WHERE col = ANY(int[])",
-      "basin": 13.792021,
-      "postgres": 49.4765,
+      "basin": 13.514728999999999,
+      "postgres": 44.573,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 3.59x"
+      "ratio_text": "pg / basin = 3.30x"
     },
     {
       "label": "UPSERT (INSERT ON CONFLICT DO UPDATE)",
-      "basin": 0.397188,
-      "postgres": 0.011,
+      "basin": 0.389084,
+      "postgres": 0.0095,
       "unit": "ms",
       "better": "postgres",
-      "ratio_text": "pg / basin = 0.03x"
+      "ratio_text": "pg / basin = 0.02x"
     },
     {
       "label": "Large IN-list (~100 values)",
-      "basin": 1.119729,
-      "postgres": 0.028999999999999998,
+      "basin": 1.0868745,
+      "postgres": 0.03,
       "unit": "ms",
       "better": "postgres",
       "ratio_text": "pg / basin = 0.03x"
     },
     {
       "label": "RANK() OVER (PARTITION BY) p50",
-      "basin": 67.533937,
-      "postgres": 105.25049999999999,
+      "basin": 55.939645999999996,
+      "postgres": 103.524,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 1.56x"
+      "ratio_text": "pg / basin = 1.85x"
     },
     {
       "label": "DISTINCT ON first-row per group p50",
-      "basin": 340.73195799999996,
-      "postgres": 150.36149999999998,
+      "basin": 313.127979,
+      "postgres": 123.60249999999999,
       "unit": "ms",
       "better": "postgres",
-      "ratio_text": "pg / basin = 0.44x"
+      "ratio_text": "pg / basin = 0.39x"
     },
     {
       "label": "Conditional UPDATE (SET = CASE WHEN)",
-      "basin": 7.244313,
-      "postgres": 3.067,
+      "basin": 7.3054585,
+      "postgres": 4.3495,
       "unit": "ms",
       "better": "postgres",
-      "ratio_text": "pg / basin = 0.42x"
+      "ratio_text": "pg / basin = 0.60x"
     },
     {
       "label": "Composite range (created_at AND amount)",
-      "basin": 3.2753544999999997,
-      "postgres": 62.7875,
+      "basin": 4.4655205,
+      "postgres": 41.48350000000001,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 19.17x"
+      "ratio_text": "pg / basin = 9.29x"
     },
     {
       "label": "JSON pseudo-secondary lookup (->>='…') p50 (basin gap)",
       "basin": -1.0,
-      "postgres": 61.708,
+      "postgres": 61.585499999999996,
       "unit": "ms",
       "better": "postgres",
       "ratio_text": "basin: unsupported"
     },
     {
       "label": "String concatenation (email || id) p50",
-      "basin": 1.9870215,
-      "postgres": 0.1045,
+      "basin": 1.926396,
+      "postgres": 0.096,
       "unit": "ms",
       "better": "postgres",
       "ratio_text": "pg / basin = 0.05x"
     },
     {
       "label": "Hour-bucket time aggregation p50 (pg failed)",
-      "basin": 45.599146000000005,
+      "basin": 43.5807085,
       "postgres": -1.0,
       "unit": "ms",
       "better": "basin",
@@ -628,12 +628,12 @@
     },
     {
       "label": "Window LEAD() OVER (PARTITION BY) p50",
-      "basin": 63.5783335,
-      "postgres": 144.6605,
+      "basin": 55.872667,
+      "postgres": 115.0625,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 2.28x"
+      "ratio_text": "pg / basin = 2.06x"
     }
   ],
-  "generated_at": "@1780002082"
+  "generated_at": "@1780105795"
 }

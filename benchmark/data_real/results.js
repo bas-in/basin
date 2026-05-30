@@ -283,7 +283,7 @@ window.__BASIN_RESULTS = {
     "scaling_data_size": {
       "kind": "scaling",
       "id": "data_size",
-      "name": "Single-tenant data size scale-up (real S3)",
+      "name": "Single-project data size scale-up (real S3)",
       "claim": "On real S3, storage is linear in row count and point-query latency stays bounded.",
       "passed": true,
       "x_axis": {
@@ -314,37 +314,37 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "bytes_per_row": 9.0222,
-          "disk_mib": 0.08604240417480469,
-          "point_ms_p50": 2078.5984169999997,
+          "bytes_per_row": 1.4264,
+          "disk_mib": 0.01360321044921875,
+          "point_ms_p50": 1.5404170000000001,
           "rows": 10000,
-          "scan_ms_p50": 1602.5415839999998
+          "scan_ms_p50": 1.243417
         },
         {
-          "bytes_per_row": 8.96126,
-          "disk_mib": 0.8546123504638672,
-          "point_ms_p50": 1999.279834,
+          "bytes_per_row": 1.348,
+          "disk_mib": 0.1285552978515625,
+          "point_ms_p50": 4.266875,
           "rows": 100000,
-          "scan_ms_p50": 6474.653375
+          "scan_ms_p50": 3.54075
         },
         {
-          "bytes_per_row": 8.952667,
-          "disk_mib": 8.537928581237793,
-          "point_ms_p50": 2623.26025,
+          "bytes_per_row": 1.338272,
+          "disk_mib": 1.276275634765625,
+          "point_ms_p50": 31.094791999999998,
           "rows": 1000000,
-          "scan_ms_p50": 55702.516291
+          "scan_ms_p50": 28.49575
         }
       ],
       "primary": {
         "label": "point query p50 growth (1M / 10K)",
-        "value": 1.262033218415561,
+        "value": 20.185957438797413,
         "unit": "x",
         "bar": {
           "op": "less_than",
           "value": 5.0
         }
       },
-      "generated_at": "@1778114894"
+      "generated_at": "@1779754909"
     },
     "scaling_idle_projects": {
       "kind": "scaling",
@@ -485,55 +485,55 @@ window.__BASIN_RESULTS = {
       "rows": [
         {
           "label": "(a) no cache",
-          "max_ms": 12003.133125,
-          "mean_ms": 6738.928107030002,
-          "min_ms": 5658.255042000001,
-          "p50_ms": 6663.639667,
-          "p999_ms": 12003.133125,
-          "p99_ms": 7763.070833000001,
+          "max_ms": 7.263292,
+          "mean_ms": 4.15721583,
+          "min_ms": 3.746667,
+          "p50_ms": 4.087667,
+          "p999_ms": 7.263292,
+          "p99_ms": 4.991207999999999,
           "stack_layer": "a_baseline"
         },
         {
           "label": "(b) +disk cache",
-          "max_ms": 11220.940708,
-          "mean_ms": 1890.8440079500006,
-          "min_ms": 924.487292,
-          "p50_ms": 1455.717209,
-          "p999_ms": 11220.940708,
-          "p99_ms": 6867.605541999999,
+          "max_ms": 5.5283750000000005,
+          "mean_ms": 3.5033254499999997,
+          "min_ms": 3.220125,
+          "p50_ms": 3.443958,
+          "p999_ms": 5.5283750000000005,
+          "p99_ms": 5.126958,
           "stack_layer": "b_disk"
         },
         {
           "label": "(c) +page cache",
-          "max_ms": 11596.693708,
-          "mean_ms": 1938.3871186900003,
-          "min_ms": 966.6479999999999,
-          "p50_ms": 1488.5623329999999,
-          "p999_ms": 11596.693708,
-          "p99_ms": 7343.228625,
+          "max_ms": 5.538,
+          "mean_ms": 3.0681032900000003,
+          "min_ms": 0.811916,
+          "p50_ms": 3.366666,
+          "p999_ms": 5.538,
+          "p99_ms": 3.9250830000000003,
           "stack_layer": "c_disk_page"
         },
         {
           "label": "(d) +bloom filter",
-          "max_ms": 12978.539625,
-          "mean_ms": 2263.22371958,
-          "min_ms": 939.688458,
-          "p50_ms": 1945.7398329999999,
-          "p999_ms": 12978.539625,
-          "p99_ms": 7706.170833,
+          "max_ms": 7.406625,
+          "mean_ms": 3.347377460000002,
+          "min_ms": 0.8211660000000001,
+          "p50_ms": 3.4814580000000004,
+          "p999_ms": 7.406625,
+          "p99_ms": 6.20475,
           "stack_layer": "d_full"
         }
       ],
       "primary": {
         "label": "speedup p50 (a\u2192d)",
-        "value": 3.4247331292620973,
+        "value": 1.1741250361199242,
         "unit": "x",
         "bar": {
           "op": "greater_than_or_equal",
           "value": 3.0
         }
       },
-      "generated_at": "@1778183808"
+      "generated_at": "@1779754911"
     },
     "scaling_project_count": {
       "kind": "scaling",
@@ -1416,15 +1416,15 @@ window.__BASIN_RESULTS = {
         }
       },
       "details": {
-        "bucket": "baisn-test",
+        "bucket": "basin-test",
         "cold_after_seconds": 2592000,
         "cold_age_column": "ts",
         "cold_files_after_sweep": 1,
-        "endpoint": "https://c3f084cbb17eda349ea8e61fee4a07a9.r2.cloudflarestorage.com",
+        "endpoint": "http://127.0.0.1:8333",
         "hot_files_after_sweep": 1,
         "total_rows_visible": 20
       },
-      "generated_at": "@1778110506"
+      "generated_at": "@1779755707"
     },
     "viability_update_delete": {
       "kind": "viability",

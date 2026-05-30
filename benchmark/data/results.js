@@ -57,11 +57,11 @@ window.__BASIN_RESULTS = {
       "metrics": [
         {
           "label": "Backup wall time",
-          "basin": 0.000164167,
-          "postgres": 0.72769825,
+          "basin": 0.000126833,
+          "postgres": 0.605261542,
           "unit": "s",
           "better": "basin",
-          "ratio_text": "pg / basin = 4433x"
+          "ratio_text": "pg / basin = 4772x"
         },
         {
           "label": "Backup byte size",
@@ -72,7 +72,7 @@ window.__BASIN_RESULTS = {
           "ratio_text": "pg / basin = 7751x"
         }
       ],
-      "generated_at": "@1780001869"
+      "generated_at": "@1780105591"
     },
     "compare_lifecycle_ops": {
       "kind": "compare",
@@ -83,22 +83,22 @@ window.__BASIN_RESULTS = {
       "metrics": [
         {
           "label": "Project deletion (1 project, 100K rows)",
-          "basin": 5.312167,
-          "postgres": 51.406292,
+          "basin": 6.44775,
+          "postgres": 11.811042,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 9.68x"
+          "ratio_text": "pg / basin = 1.83x"
         },
         {
           "label": "ADD COLUMN on 100K rows",
-          "basin": 2.114042,
-          "postgres": 170.54525,
+          "basin": 0.784042,
+          "postgres": 130.913792,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 80.67x"
+          "ratio_text": "pg / basin = 166.97x"
         }
       ],
-      "generated_at": "@1780001875"
+      "generated_at": "@1780105597"
     },
     "compare_postgres": {
       "kind": "compare",
@@ -109,15 +109,15 @@ window.__BASIN_RESULTS = {
       "metrics": [
         {
           "label": "On-disk bytes (users + events)",
-          "basin": 152416356.0,
-          "postgres": 305831936.0,
+          "basin": 152475012.0,
+          "postgres": 305840128.0,
           "unit": "bytes",
           "better": "basin",
           "ratio_text": "pg / basin = 2.01x"
         },
         {
           "label": "Point query p50",
-          "basin": 0.119146,
+          "basin": 0.09929199999999999,
           "postgres": 0.003,
           "unit": "ms",
           "better": "postgres",
@@ -125,604 +125,604 @@ window.__BASIN_RESULTS = {
         },
         {
           "label": "Point query p99",
-          "basin": 0.150709,
-          "postgres": 0.017,
+          "basin": 0.122875,
+          "postgres": 0.019,
           "unit": "ms",
           "better": "postgres",
-          "ratio_text": "pg / basin = 0.11x"
+          "ratio_text": "pg / basin = 0.15x"
         },
         {
           "label": "Range scan p50 (~1k rows)",
-          "basin": 13.7721665,
-          "postgres": 64.175,
+          "basin": 14.288499999999999,
+          "postgres": 59.826499999999996,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 4.66x"
+          "ratio_text": "pg / basin = 4.19x"
         },
         {
           "label": "Range scan p99",
-          "basin": 17.160666000000003,
-          "postgres": 139.012,
+          "basin": 18.033458,
+          "postgres": 250.158,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 8.10x"
+          "ratio_text": "pg / basin = 13.87x"
         },
         {
           "label": "Aggregate GROUP BY user_id p50",
-          "basin": 28.4169375,
-          "postgres": 246.5535,
+          "basin": 25.852083,
+          "postgres": 248.2735,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 8.68x"
+          "ratio_text": "pg / basin = 9.60x"
         },
         {
           "label": "2-table JOIN GROUP BY p50",
-          "basin": 33.4025415,
-          "postgres": 1360.308,
+          "basin": 37.4261875,
+          "postgres": 370.5765,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 40.72x"
+          "ratio_text": "pg / basin = 9.90x"
         },
         {
           "label": "ILIKE '%@gmail.com' p50",
-          "basin": 4.517729,
-          "postgres": 36.7615,
+          "basin": 6.8370625,
+          "postgres": 29.0565,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 8.14x"
+          "ratio_text": "pg / basin = 4.25x"
         },
         {
           "label": "Pagination ORDER BY LIMIT/OFFSET p50",
-          "basin": 76.571979,
-          "postgres": 174.79399999999998,
+          "basin": 82.520542,
+          "postgres": 92.061,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 2.28x"
+          "ratio_text": "pg / basin = 1.12x"
         },
         {
           "label": "Single-row UPDATE p50",
-          "basin": 162.2240835,
-          "postgres": 9.2525,
+          "basin": 170.7418335,
+          "postgres": 0.395,
           "unit": "ms",
           "better": "postgres",
-          "ratio_text": "pg / basin = 0.06x"
+          "ratio_text": "pg / basin = 0.00x"
         },
         {
           "label": "Bulk UPDATE (~333333 rows)",
-          "basin": 5291.494541,
-          "postgres": 5483.823791,
+          "basin": 4335.699458,
+          "postgres": 2568.495666,
           "unit": "ms",
-          "better": "basin"
+          "better": "postgres"
         },
         {
           "label": "DELETE WHERE id IN (10 rows)",
-          "basin": 0.458125,
-          "postgres": 4.1551670000000005,
+          "basin": 0.241,
+          "postgres": 43.692083,
           "unit": "ms",
           "better": "basin"
         },
         {
           "label": "Bulk INSERT 1000000 rows",
-          "basin": 76756.027416,
-          "postgres": 10002.180292000001,
+          "basin": 65323.844082999996,
+          "postgres": 18776.755957999998,
           "unit": "ms",
           "better": "postgres"
         },
         {
           "label": "Cold-start first query",
-          "basin": 3.441459,
-          "postgres": 13.8705,
+          "basin": 4.356167,
+          "postgres": 15.305791,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 4.03x"
+          "ratio_text": "pg / basin = 3.51x"
         },
         {
           "label": "COUNT(*) full table p50",
-          "basin": 77.9421875,
-          "postgres": 186.72050000000002,
+          "basin": 78.496,
+          "postgres": 3380.784,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 2.40x"
+          "ratio_text": "pg / basin = 43.07x"
         },
         {
           "label": "DATE_TRUNC day + SUM GROUP BY p50",
-          "basin": 51.252167,
-          "postgres": 274.81600000000003,
+          "basin": 53.153875,
+          "postgres": 119.86349999999999,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 5.36x"
+          "ratio_text": "pg / basin = 2.26x"
         },
         {
           "label": "Analytics JOIN+WHERE (last 333333s window)",
-          "basin": 40.9454795,
-          "postgres": 1396.1475,
+          "basin": 41.627187500000005,
+          "postgres": 239.36950000000002,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 34.10x"
+          "ratio_text": "pg / basin = 5.75x"
         },
         {
           "label": "COUNT(DISTINCT user_id) p50",
-          "basin": 47.7792495,
-          "postgres": 237.652,
+          "basin": 47.8467505,
+          "postgres": 224.99200000000002,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 4.97x"
+          "ratio_text": "pg / basin = 4.70x"
         },
         {
           "label": "LIKE 'pending%' prefix p50",
-          "basin": 21.074437,
-          "postgres": 0.109,
+          "basin": 22.709103999999996,
+          "postgres": 0.084,
+          "unit": "ms",
+          "better": "postgres",
+          "ratio_text": "pg / basin = 0.00x"
+        },
+        {
+          "label": "Multi-col GROUP BY + HAVING p50",
+          "basin": 72.15018699999999,
+          "postgres": 266.991,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 3.70x"
+        },
+        {
+          "label": "Window LAG OVER PARTITION p50",
+          "basin": 60.432396,
+          "postgres": 125.07650000000001,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 2.07x"
+        },
+        {
+          "label": "Recursive CTE Fibonacci(30) p50",
+          "basin": 1.4227295,
+          "postgres": 0.2225,
+          "unit": "ms",
+          "better": "postgres",
+          "ratio_text": "pg / basin = 0.16x"
+        },
+        {
+          "label": "Correlated subquery in SELECT p50",
+          "basin": 52.502770999999996,
+          "postgres": 7876.049,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 150.01x"
+        },
+        {
+          "label": "EXISTS in WHERE p50",
+          "basin": 55.942333500000004,
+          "postgres": 235.879,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 4.22x"
+        },
+        {
+          "label": "3-table JOIN BETWEEN p50",
+          "basin": 84.09537499999999,
+          "postgres": 502.01349999999996,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 5.97x"
+        },
+        {
+          "label": "UNION ALL two scans p50",
+          "basin": 18.296979,
+          "postgres": 186.835,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 10.21x"
+        },
+        {
+          "label": "ORDER BY NULLS LAST + LIMIT p50",
+          "basin": 9.8388545,
+          "postgres": 13.975999999999999,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 1.42x"
+        },
+        {
+          "label": "Top-N per group (MAX) p50",
+          "basin": 122.9893125,
+          "postgres": 298.64099999999996,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 2.43x"
+        },
+        {
+          "label": "Numeric range BETWEEN p50",
+          "basin": 6.1069995,
+          "postgres": 72.48150000000001,
+          "unit": "ms",
+          "better": "basin",
+          "ratio_text": "pg / basin = 11.87x"
+        },
+        {
+          "label": "JSONB -> get key p50 (cold, first-query)",
+          "basin": 9.789833,
+          "postgres": 0.067,
           "unit": "ms",
           "better": "postgres",
           "ratio_text": "pg / basin = 0.01x"
         },
         {
-          "label": "Multi-col GROUP BY + HAVING p50",
-          "basin": 75.15593799999999,
-          "postgres": 296.68949999999995,
-          "unit": "ms",
-          "better": "basin",
-          "ratio_text": "pg / basin = 3.95x"
-        },
-        {
-          "label": "Window LAG OVER PARTITION p50",
-          "basin": 69.5485625,
-          "postgres": 124.18200000000002,
-          "unit": "ms",
-          "better": "basin",
-          "ratio_text": "pg / basin = 1.79x"
-        },
-        {
-          "label": "Recursive CTE Fibonacci(30) p50",
-          "basin": 1.3647915,
-          "postgres": 0.0675,
-          "unit": "ms",
-          "better": "postgres",
-          "ratio_text": "pg / basin = 0.05x"
-        },
-        {
-          "label": "Correlated subquery in SELECT p50",
-          "basin": 46.0408335,
-          "postgres": 7684.546,
-          "unit": "ms",
-          "better": "basin",
-          "ratio_text": "pg / basin = 166.91x"
-        },
-        {
-          "label": "EXISTS in WHERE p50",
-          "basin": 51.701021,
-          "postgres": 285.964,
-          "unit": "ms",
-          "better": "basin",
-          "ratio_text": "pg / basin = 5.53x"
-        },
-        {
-          "label": "3-table JOIN BETWEEN p50",
-          "basin": 87.861729,
-          "postgres": 473.92600000000004,
-          "unit": "ms",
-          "better": "basin",
-          "ratio_text": "pg / basin = 5.39x"
-        },
-        {
-          "label": "UNION ALL two scans p50",
-          "basin": 21.829166999999998,
-          "postgres": 153.57,
-          "unit": "ms",
-          "better": "basin",
-          "ratio_text": "pg / basin = 7.04x"
-        },
-        {
-          "label": "ORDER BY NULLS LAST + LIMIT p50",
-          "basin": 9.592061999999999,
-          "postgres": 20.192500000000003,
-          "unit": "ms",
-          "better": "basin",
-          "ratio_text": "pg / basin = 2.11x"
-        },
-        {
-          "label": "Top-N per group (MAX) p50",
-          "basin": 67.7476255,
-          "postgres": 244.11149999999998,
-          "unit": "ms",
-          "better": "basin",
-          "ratio_text": "pg / basin = 3.60x"
-        },
-        {
-          "label": "Numeric range BETWEEN p50",
-          "basin": 5.467249499999999,
-          "postgres": 37.01349999999999,
-          "unit": "ms",
-          "better": "basin",
-          "ratio_text": "pg / basin = 6.77x"
-        },
-        {
-          "label": "JSONB -> get key p50 (cold, first-query)",
-          "basin": 2.7516670000000003,
-          "postgres": 0.047,
-          "unit": "ms",
-          "better": "postgres",
-          "ratio_text": "pg / basin = 0.02x"
-        },
-        {
           "label": "JSONB -> get key p50 (steady-state, promoted)",
-          "basin": 2.8530625,
-          "postgres": 0.10450000000000001,
+          "basin": 3.4181665,
+          "postgres": 0.1225,
           "unit": "ms",
           "better": "postgres",
           "ratio_text": "pg / basin = 0.04x"
         },
         {
           "label": "JSONB ->> get text p50 (cold, first-query)",
-          "basin": 2.381667,
-          "postgres": 0.022,
+          "basin": 10.538250000000001,
+          "postgres": 0.082,
           "unit": "ms",
           "better": "postgres",
           "ratio_text": "pg / basin = 0.01x"
         },
         {
           "label": "JSONB ->> get text p50 (steady-state, promoted)",
-          "basin": 1.540771,
-          "postgres": 0.045,
+          "basin": 1.5363755000000001,
+          "postgres": 0.1015,
           "unit": "ms",
           "better": "postgres",
-          "ratio_text": "pg / basin = 0.03x"
+          "ratio_text": "pg / basin = 0.07x"
         },
         {
           "label": "JSONB -> deep path p50 (cold, first-query)",
-          "basin": 2.230417,
-          "postgres": 0.023,
+          "basin": 11.823916,
+          "postgres": 0.053,
           "unit": "ms",
           "better": "postgres",
-          "ratio_text": "pg / basin = 0.01x"
+          "ratio_text": "pg / basin = 0.00x"
         },
         {
           "label": "JSONB -> deep path p50 (steady-state, promoted)",
-          "basin": 2.0744375,
-          "postgres": 0.1115,
+          "basin": 3.131438,
+          "postgres": 0.112,
           "unit": "ms",
           "better": "postgres",
-          "ratio_text": "pg / basin = 0.05x"
+          "ratio_text": "pg / basin = 0.04x"
         },
         {
           "label": "JSONB @> contains p50 (no GIN index)",
-          "basin": 1100.8632705,
-          "postgres": 53.078500000000005,
+          "basin": 1048.3247084999998,
+          "postgres": 50.897,
           "unit": "ms",
           "better": "postgres",
           "ratio_text": "pg / basin = 0.05x"
         },
         {
           "label": "JSONB @> contains p50 (with GIN index)",
-          "basin": 1097.834354,
-          "postgres": 69.43100000000001,
+          "basin": 1041.9583954999998,
+          "postgres": 69.382,
           "unit": "ms",
           "better": "postgres",
-          "ratio_text": "pg / basin = 0.06x"
+          "ratio_text": "pg / basin = 0.07x"
         },
         {
           "label": "GIN @> effectiveness (no-index ms / with-index ms)",
-          "basin": 1.002758992273255,
-          "postgres": 0.7644784030188244,
+          "basin": 1.006109949329546,
+          "postgres": 0.7335764319275893,
           "unit": "ratio",
           "better": "basin",
-          "ratio_text": "basin 1.00x vs pg 0.76x speedup (higher = better)"
+          "ratio_text": "basin 1.01x vs pg 0.73x speedup (higher = better)"
         },
         {
           "label": "JSONB ? key exists p50",
-          "basin": 350.84458300000006,
-          "postgres": 50.775,
+          "basin": 328.38397899999995,
+          "postgres": 48.6755,
           "unit": "ms",
           "better": "postgres",
-          "ratio_text": "pg / basin = 0.14x"
+          "ratio_text": "pg / basin = 0.15x"
         },
         {
           "label": "JSONB #> path get p50",
-          "basin": 2.4631665,
-          "postgres": 0.063,
+          "basin": 4.2936875,
+          "postgres": 0.1855,
           "unit": "ms",
           "better": "postgres",
-          "ratio_text": "pg / basin = 0.03x"
+          "ratio_text": "pg / basin = 0.04x"
         },
         {
           "label": "JSONB jsonb_array_length(tags) p50",
-          "basin": 3.5404795,
-          "postgres": 0.0485,
+          "basin": 3.6955415,
+          "postgres": 0.029500000000000002,
           "unit": "ms",
           "better": "postgres",
           "ratio_text": "pg / basin = 0.01x"
         },
         {
           "label": "JSONB jsonb_typeof(metadata) p50",
-          "basin": 2.1480835000000003,
-          "postgres": 0.114,
+          "basin": 3.067104,
+          "postgres": 0.064,
           "unit": "ms",
           "better": "postgres",
-          "ratio_text": "pg / basin = 0.05x"
+          "ratio_text": "pg / basin = 0.02x"
         },
         {
           "label": "JSONB filter+agg (GROUP BY ->>category) p50",
-          "basin": 1248.513625,
-          "postgres": 125.79249999999999,
+          "basin": 1154.4111665,
+          "postgres": 104.1945,
           "unit": "ms",
           "better": "postgres",
-          "ratio_text": "pg / basin = 0.10x"
+          "ratio_text": "pg / basin = 0.09x"
         },
         {
           "label": "JSONB jsonb_set UPDATE (10 rows, structural: CoW rewrite) (basin gap)",
           "basin": -1.0,
-          "postgres": 1.9906250000000003,
+          "postgres": 1.0687909999999998,
           "unit": "ms",
           "better": "postgres",
           "ratio_text": "basin: unsupported"
         },
         {
           "label": "Concurrent INSERT 8x1000 rows",
-          "basin": 68.82195800000001,
-          "postgres": 14.673458,
+          "basin": 64.773083,
+          "postgres": 20.527209000000003,
           "unit": "ms",
           "better": "postgres",
-          "ratio_text": "pg / basin = 0.21x"
+          "ratio_text": "pg / basin = 0.32x"
         },
         {
           "label": "Concurrent SELECT 16 sessions mixed",
-          "basin": 13.848625,
-          "postgres": 6.382334,
+          "basin": 19.251875000000002,
+          "postgres": 6.66575,
           "unit": "ms",
           "better": "postgres",
-          "ratio_text": "pg / basin = 0.46x"
+          "ratio_text": "pg / basin = 0.35x"
         },
         {
           "label": "Read-modify-write contention 8 sessions",
-          "basin": 54.055958000000004,
-          "postgres": 4.917333,
+          "basin": 77.51670800000001,
+          "postgres": 10.947541999999999,
           "unit": "ms",
           "better": "postgres",
-          "ratio_text": "pg / basin = 0.09x"
+          "ratio_text": "pg / basin = 0.14x"
         },
         {
           "label": "BEGIN; INSERT x100; COMMIT throughput",
-          "basin": 181.948375,
-          "postgres": 13.147666000000001,
+          "basin": 184.78204200000002,
+          "postgres": 13.844624999999999,
           "unit": "ms",
           "better": "postgres",
           "ratio_text": "pg / basin = 0.07x"
         },
         {
           "label": "ROLLBACK drops rows (txn correctness)",
-          "basin": 3.033875,
-          "postgres": 0.640583,
+          "basin": 2.9667090000000003,
+          "postgres": 0.63575,
           "unit": "ms",
           "better": "postgres",
           "ratio_text": "pg / basin = 0.21x"
         },
         {
           "label": "Savepoint nest + ROLLBACK TO",
-          "basin": 5.690125,
-          "postgres": 0.727667,
+          "basin": 5.859416,
+          "postgres": 1.05875,
           "unit": "ms",
           "better": "postgres",
-          "ratio_text": "pg / basin = 0.13x"
+          "ratio_text": "pg / basin = 0.18x"
         },
         {
           "label": "Long-txn snapshot isolation (basin gap)",
           "basin": -1.0,
-          "postgres": 4.702292,
+          "postgres": 5.165375,
           "unit": "ms",
           "better": "postgres",
           "ratio_text": "basin: unsupported"
         },
         {
           "label": "WHERE x IS NULL",
-          "basin": 0.26502099999999995,
-          "postgres": 0.48,
+          "basin": 0.2822705,
+          "postgres": 0.34850000000000003,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 1.81x"
+          "ratio_text": "pg / basin = 1.23x"
         },
         {
           "label": "WHERE x = NULL returns 0 (3VL)",
-          "basin": 0.06462499999999999,
-          "postgres": 0.006500000000000001,
+          "basin": 0.06600049999999999,
+          "postgres": 0.006,
           "unit": "ms",
           "better": "postgres",
-          "ratio_text": "pg / basin = 0.10x"
+          "ratio_text": "pg / basin = 0.09x"
         },
         {
           "label": "COUNT(col) vs COUNT(*) NULL handling",
-          "basin": 0.069521,
-          "postgres": 0.5725,
+          "basin": 0.0701455,
+          "postgres": 0.6495,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 8.23x"
+          "ratio_text": "pg / basin = 9.26x"
         },
         {
           "label": "NOT IN (NULL in subquery, 3VL)",
-          "basin": 1.2532915,
-          "postgres": 1.8375,
+          "basin": 1.4274369999999998,
+          "postgres": 1.937,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 1.47x"
+          "ratio_text": "pg / basin = 1.36x"
         },
         {
           "label": "NOT EXISTS",
-          "basin": 9.3010205,
-          "postgres": 48.2585,
+          "basin": 10.844333500000001,
+          "postgres": 44.5315,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 5.19x"
+          "ratio_text": "pg / basin = 4.11x"
         },
         {
           "label": "Scalar subquery in SELECT list",
-          "basin": 43.251041,
-          "postgres": 44.509,
+          "basin": 42.524249999999995,
+          "postgres": 40.67,
           "unit": "ms",
-          "better": "basin",
-          "ratio_text": "pg / basin = 1.03x"
+          "better": "postgres",
+          "ratio_text": "pg / basin = 0.96x"
         },
         {
           "label": "Derived table (subquery in FROM)",
-          "basin": 46.8106665,
-          "postgres": 149.01749999999998,
+          "basin": 47.8668545,
+          "postgres": 155.024,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 3.18x"
+          "ratio_text": "pg / basin = 3.24x"
         },
         {
           "label": "INTERSECT",
-          "basin": 32.469146,
-          "postgres": 156.255,
+          "basin": 33.659313000000004,
+          "postgres": 156.4085,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 4.81x"
+          "ratio_text": "pg / basin = 4.65x"
         },
         {
           "label": "EXCEPT",
-          "basin": 32.1824165,
-          "postgres": 161.949,
+          "basin": 32.937062499999996,
+          "postgres": 161.1535,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 5.03x"
+          "ratio_text": "pg / basin = 4.89x"
         },
         {
           "label": "UNION (dedup)",
-          "basin": 60.2411045,
-          "postgres": 231.90699999999998,
+          "basin": 61.0435,
+          "postgres": 223.72699999999998,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 3.85x"
+          "ratio_text": "pg / basin = 3.67x"
         },
         {
           "label": "ARRAY_AGG + ORDER BY in aggregate",
-          "basin": 638.7812080000001,
-          "postgres": 106.128,
+          "basin": 607.6396875,
+          "postgres": 98.2585,
           "unit": "ms",
           "better": "postgres",
-          "ratio_text": "pg / basin = 0.17x"
+          "ratio_text": "pg / basin = 0.16x"
         },
         {
           "label": "STRING_AGG",
-          "basin": 201.780667,
-          "postgres": 214.7025,
+          "basin": 200.2530415,
+          "postgres": 204.143,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 1.06x"
+          "ratio_text": "pg / basin = 1.02x"
         },
         {
           "label": "COUNT(*) FILTER (WHERE ...)",
-          "basin": 66.38225,
-          "postgres": 111.5705,
+          "basin": 68.8326045,
+          "postgres": 106.9805,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 1.68x"
+          "ratio_text": "pg / basin = 1.55x"
         },
         {
           "label": "CASE WHEN 10 branches",
-          "basin": 2.7756040000000004,
-          "postgres": 0.911,
+          "basin": 1.7009585,
+          "postgres": 0.875,
           "unit": "ms",
           "better": "postgres",
-          "ratio_text": "pg / basin = 0.33x"
+          "ratio_text": "pg / basin = 0.51x"
         },
         {
           "label": "regexp_match / substring / split_part",
-          "basin": 14.381229000000001,
-          "postgres": 1.2505000000000002,
+          "basin": 14.317542,
+          "postgres": 1.282,
           "unit": "ms",
           "better": "postgres",
           "ratio_text": "pg / basin = 0.09x"
         },
         {
           "label": "Multi-col ORDER BY mixed ASC/DESC + LIMIT",
-          "basin": 83.766333,
-          "postgres": 110.543,
+          "basin": 56.3018755,
+          "postgres": 113.7065,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 1.32x"
+          "ratio_text": "pg / basin = 2.02x"
         },
         {
           "label": "LATERAL JOIN (correlated derived table)",
-          "basin": 15.6998335,
-          "postgres": 3395.8805,
+          "basin": 18.7734795,
+          "postgres": 3264.446,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 216.30x"
+          "ratio_text": "pg / basin = 173.89x"
         },
         {
           "label": "WHERE col = ANY(int[])",
-          "basin": 13.792021,
-          "postgres": 49.4765,
+          "basin": 13.514728999999999,
+          "postgres": 44.573,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 3.59x"
+          "ratio_text": "pg / basin = 3.30x"
         },
         {
           "label": "UPSERT (INSERT ON CONFLICT DO UPDATE)",
-          "basin": 0.397188,
-          "postgres": 0.011,
+          "basin": 0.389084,
+          "postgres": 0.0095,
           "unit": "ms",
           "better": "postgres",
-          "ratio_text": "pg / basin = 0.03x"
+          "ratio_text": "pg / basin = 0.02x"
         },
         {
           "label": "Large IN-list (~100 values)",
-          "basin": 1.119729,
-          "postgres": 0.028999999999999998,
+          "basin": 1.0868745,
+          "postgres": 0.03,
           "unit": "ms",
           "better": "postgres",
           "ratio_text": "pg / basin = 0.03x"
         },
         {
           "label": "RANK() OVER (PARTITION BY) p50",
-          "basin": 67.533937,
-          "postgres": 105.25049999999999,
+          "basin": 55.939645999999996,
+          "postgres": 103.524,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 1.56x"
+          "ratio_text": "pg / basin = 1.85x"
         },
         {
           "label": "DISTINCT ON first-row per group p50",
-          "basin": 340.73195799999996,
-          "postgres": 150.36149999999998,
+          "basin": 313.127979,
+          "postgres": 123.60249999999999,
           "unit": "ms",
           "better": "postgres",
-          "ratio_text": "pg / basin = 0.44x"
+          "ratio_text": "pg / basin = 0.39x"
         },
         {
           "label": "Conditional UPDATE (SET = CASE WHEN)",
-          "basin": 7.244313,
-          "postgres": 3.067,
+          "basin": 7.3054585,
+          "postgres": 4.3495,
           "unit": "ms",
           "better": "postgres",
-          "ratio_text": "pg / basin = 0.42x"
+          "ratio_text": "pg / basin = 0.60x"
         },
         {
           "label": "Composite range (created_at AND amount)",
-          "basin": 3.2753544999999997,
-          "postgres": 62.7875,
+          "basin": 4.4655205,
+          "postgres": 41.48350000000001,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 19.17x"
+          "ratio_text": "pg / basin = 9.29x"
         },
         {
           "label": "JSON pseudo-secondary lookup (->>='\u2026') p50 (basin gap)",
           "basin": -1.0,
-          "postgres": 61.708,
+          "postgres": 61.585499999999996,
           "unit": "ms",
           "better": "postgres",
           "ratio_text": "basin: unsupported"
         },
         {
           "label": "String concatenation (email || id) p50",
-          "basin": 1.9870215,
-          "postgres": 0.1045,
+          "basin": 1.926396,
+          "postgres": 0.096,
           "unit": "ms",
           "better": "postgres",
           "ratio_text": "pg / basin = 0.05x"
         },
         {
           "label": "Hour-bucket time aggregation p50 (pg failed)",
-          "basin": 45.599146000000005,
+          "basin": 43.5807085,
           "postgres": -1.0,
           "unit": "ms",
           "better": "basin",
@@ -730,14 +730,14 @@ window.__BASIN_RESULTS = {
         },
         {
           "label": "Window LEAD() OVER (PARTITION BY) p50",
-          "basin": 63.5783335,
-          "postgres": 144.6605,
+          "basin": 55.872667,
+          "postgres": 115.0625,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 2.28x"
+          "ratio_text": "pg / basin = 2.06x"
         }
       ],
-      "generated_at": "@1780002082"
+      "generated_at": "@1780105795"
     },
     "compare_postgres_100k": {
       "kind": "compare",
@@ -3943,37 +3943,37 @@ window.__BASIN_RESULTS = {
       "metrics": [
         {
           "label": "Connection accept latency p50",
-          "basin": 0.84375,
-          "postgres": 1.666583,
+          "basin": 0.856958,
+          "postgres": 1.418791,
           "unit": "ms",
           "better": "basin",
-          "ratio_text": "pg / basin = 1.98x"
+          "ratio_text": "pg / basin = 1.66x"
         },
         {
           "label": "Connections held under 1000-conn flood",
           "basin": 1000.0,
-          "postgres": 98.0,
+          "postgres": 100.0,
           "unit": "conns",
           "better": "basin",
-          "ratio_text": "basin / pg = 10.20x"
+          "ratio_text": "basin / pg = 10.00x"
         },
         {
           "label": "Refused conns under 1000-conn flood",
           "basin": 0.0,
-          "postgres": 902.0,
+          "postgres": 900.0,
           "unit": "conns",
           "better": "basin"
         },
         {
           "label": "RSS per held-open connection",
-          "basin": 265.28,
-          "postgres": 8059.36,
+          "basin": 265.76,
+          "postgres": 8108.64,
           "unit": "KiB",
           "better": "basin",
-          "ratio_text": "pg / basin = 30.38x"
+          "ratio_text": "pg / basin = 30.51x"
         }
       ],
-      "generated_at": "@1780002098"
+      "generated_at": "@1780105810"
     },
     "compare_vortex_parquet": {
       "available": true,
@@ -4502,43 +4502,43 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "load_pct": 23.0,
-          "projects": 23,
+          "load_pct": 21.0,
+          "projects": 21,
           "shard": 0
         },
         {
-          "load_pct": 28.0,
-          "projects": 28,
+          "load_pct": 24.0,
+          "projects": 24,
           "shard": 1
         },
         {
-          "load_pct": 20.0,
-          "projects": 20,
+          "load_pct": 23.0,
+          "projects": 23,
           "shard": 2
         },
         {
-          "load_pct": 29.0,
-          "projects": 29,
+          "load_pct": 32.0,
+          "projects": 32,
           "shard": 3
         }
       ],
       "primary": {
         "label": "max shard load",
-        "value": 29.0,
+        "value": 32.0,
         "unit": "%",
         "bar": {
           "op": "less_than",
           "value": 50.0
         }
       },
-      "generated_at": "@1780001868"
+      "generated_at": "@1780105585"
     },
     "scaling_concurrency": {
       "kind": "scaling",
       "id": "concurrency",
       "name": "Concurrent reader fan-out",
       "claim": "Read throughput scales as more concurrent readers are added.",
-      "passed": true,
+      "passed": false,
       "x_axis": {
         "key": "concurrency",
         "label": "concurrent readers"
@@ -4563,39 +4563,39 @@ window.__BASIN_RESULTS = {
       "rows": [
         {
           "concurrency": 1,
-          "median_latency_us": 41857.0,
-          "per_task_qps": 22.666666666666668,
-          "total_qps": 22.666666666666668
+          "median_latency_us": 25815.0,
+          "per_task_qps": 38.666666666666664,
+          "total_qps": 38.666666666666664
         },
         {
           "concurrency": 4,
-          "median_latency_us": 498.0,
-          "per_task_qps": 23.083333333333332,
-          "total_qps": 92.33333333333333
+          "median_latency_us": 324.0,
+          "per_task_qps": 44.583333333333336,
+          "total_qps": 178.33333333333334
         },
         {
           "concurrency": 16,
-          "median_latency_us": 345.0,
-          "per_task_qps": 12.125,
-          "total_qps": 194.0
+          "median_latency_us": 362.0,
+          "per_task_qps": 24.8125,
+          "total_qps": 397.0
         },
         {
           "concurrency": 64,
-          "median_latency_us": 237976.0,
-          "per_task_qps": 3.0677083333333335,
-          "total_qps": 196.33333333333334
+          "median_latency_us": 65810.0,
+          "per_task_qps": 6.713541666666667,
+          "total_qps": 429.6666666666667
         }
       ],
       "primary": {
         "label": "peak speed-up vs C=1",
-        "value": 8.661764705882353,
+        "value": 11.112068965517242,
         "unit": "x",
         "bar": {
           "op": "greater_than_or_equal",
           "value": 3.5
         }
       },
-      "generated_at": "@1780001884"
+      "generated_at": "@1780105915"
     },
     "scaling_data_size": {
       "kind": "scaling",
@@ -4692,40 +4692,40 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "per_project_kib": 2.08,
+          "per_project_kib": 1.92,
           "projects": 100,
-          "provision_ms": 0.168542,
-          "rss_delta_kib": 208
+          "provision_ms": 0.17283300000000001,
+          "rss_delta_kib": 192
         },
         {
-          "per_project_kib": 1.936,
+          "per_project_kib": 2.48,
           "projects": 1000,
-          "provision_ms": 1.5630410000000001,
-          "rss_delta_kib": 1936
+          "provision_ms": 1.8375,
+          "rss_delta_kib": 2480
         },
         {
-          "per_project_kib": 1.7792,
+          "per_project_kib": 1.7728,
           "projects": 5000,
-          "provision_ms": 8.214917,
-          "rss_delta_kib": 8896
+          "provision_ms": 9.4975,
+          "rss_delta_kib": 8864
         },
         {
-          "per_project_kib": 2.0896,
+          "per_project_kib": 2.12,
           "projects": 10000,
-          "provision_ms": 18.811917,
-          "rss_delta_kib": 20896
+          "provision_ms": 25.136083,
+          "rss_delta_kib": 21200
         }
       ],
       "primary": {
         "label": "max per_project_kib across scales",
-        "value": 2.0896,
+        "value": 2.48,
         "unit": "KiB",
         "bar": {
           "op": "less_than",
           "value": 5.0
         }
       },
-      "generated_at": "@1780001887"
+      "generated_at": "@1780105605"
     },
     "scaling_noisy_neighbor": {
       "kind": "scaling",
@@ -4751,31 +4751,31 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "p50_ms": 0.312875,
-          "p99_ms": 0.9805409999999999,
+          "p50_ms": 0.208042,
+          "p99_ms": 0.326,
           "scenario": "baseline"
         },
         {
-          "p50_ms": 0.17375,
-          "p99_ms": 0.352709,
+          "p50_ms": 0.077666,
+          "p99_ms": 0.318834,
           "scenario": "under_load"
         },
         {
-          "p50_ms": 0.5553335996803834,
-          "p99_ms": 0.3597085690450476,
+          "p50_ms": 0.37331884907855145,
+          "p99_ms": 0.9780184049079754,
           "scenario": "ratio"
         }
       ],
       "primary": {
         "label": "p99 ratio (under_load / baseline)",
-        "value": 0.3597085690450476,
+        "value": 0.9780184049079754,
         "unit": "x",
         "bar": {
           "op": "less_than",
           "value": 5.0
         }
       },
-      "generated_at": "@1780001909"
+      "generated_at": "@1780105626"
     },
     "scaling_perf_stack": {
       "kind": "scaling",
@@ -4876,40 +4876,40 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "per_project_ram_kib": 1376.0,
+          "per_project_ram_kib": 1328.0,
           "project_count": 1,
-          "quiet_p50_ms": 0.6443329999999999,
-          "rss_delta_kib": 1376
+          "quiet_p50_ms": 0.33358299999999996,
+          "rss_delta_kib": 1328
         },
         {
-          "per_project_ram_kib": 272.0,
+          "per_project_ram_kib": 250.66666666666666,
           "project_count": 10,
-          "quiet_p50_ms": 0.398791,
-          "rss_delta_kib": 2448
+          "quiet_p50_ms": 0.392208,
+          "rss_delta_kib": 2256
         },
         {
-          "per_project_ram_kib": 34.31111111111111,
+          "per_project_ram_kib": 44.08888888888889,
           "project_count": 100,
-          "quiet_p50_ms": 0.46037500000000003,
-          "rss_delta_kib": 3088
+          "quiet_p50_ms": 0.346292,
+          "rss_delta_kib": 3968
         },
         {
-          "per_project_ram_kib": 23.30666666666667,
+          "per_project_ram_kib": 10.471111111111112,
           "project_count": 1000,
-          "quiet_p50_ms": 0.575958,
-          "rss_delta_kib": 20976
+          "quiet_p50_ms": 0.271667,
+          "rss_delta_kib": 9424
         }
       ],
       "primary": {
         "label": "quiet_p50_at_max / quiet_p50_at_1",
-        "value": 0.8938825110618268,
+        "value": 0.8143910211251774,
         "unit": "x",
         "bar": {
           "op": "less_than",
           "value": 5.0
         }
       },
-      "generated_at": "@1780001916"
+      "generated_at": "@1780105630"
     },
     "scaling_project_deletion_at_scale": {
       "kind": "scaling",
@@ -4935,22 +4935,22 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "basin_ms": 8.106167,
+          "basin_ms": 4.235041,
           "file_count": 100,
           "pg_skipped": false,
-          "postgres_ms": 9.87825
+          "postgres_ms": 85.051583
         },
         {
-          "basin_ms": 60.448292,
+          "basin_ms": 39.933,
           "file_count": 1000,
           "pg_skipped": false,
-          "postgres_ms": 7.967166
+          "postgres_ms": 11.940167
         },
         {
-          "basin_ms": 223.934084,
+          "basin_ms": 258.777667,
           "file_count": 5000,
           "pg_skipped": false,
-          "postgres_ms": 8.186499999999999
+          "postgres_ms": 2.0915410000000003
         }
       ],
       "primary": {
@@ -4962,14 +4962,14 @@ window.__BASIN_RESULTS = {
           "value": 5001.0
         }
       },
-      "generated_at": "@1780001944"
+      "generated_at": "@1780105663"
     },
     "scaling_project_deletion_realistic": {
       "kind": "scaling",
       "id": "project_deletion_realistic",
       "name": "Project deletion at scale, realistic SaaS schema (Basin vs Postgres)",
       "claim": "Real production tables have 5-20 indexes and 1-3 FK constraints. PG's DROP SCHEMA CASCADE walks every row \u00d7 every index + validates every FK on the cascade; Basin's project teardown stays O(file_count). The crossover from the simple card moves dramatically left under this schema profile.",
-      "passed": false,
+      "passed": true,
       "x_axis": {
         "key": "file_count",
         "label": "files per project"
@@ -4988,34 +4988,34 @@ window.__BASIN_RESULTS = {
       ],
       "rows": [
         {
-          "basin_ms": 3.703292,
+          "basin_ms": 4.356167,
           "file_count": 100,
           "pg_skipped": false,
-          "postgres_ms": 12.447583
+          "postgres_ms": 5.331875
         },
         {
-          "basin_ms": 42.3545,
+          "basin_ms": 37.212042000000004,
           "file_count": 1000,
           "pg_skipped": false,
-          "postgres_ms": 264.54366699999997
+          "postgres_ms": 9.114125000000001
         },
         {
-          "basin_ms": 295.5315,
+          "basin_ms": 198.943834,
           "file_count": 5000,
           "pg_skipped": false,
-          "postgres_ms": 18.625833
+          "postgres_ms": 1584.861458
         }
       ],
       "primary": {
         "label": "Basin/Postgres ratio at 5000 files (realistic schema)",
-        "value": 15.866753449362506,
+        "value": 0.12552758665167818,
         "unit": "ratio",
         "bar": {
           "op": "less_than",
           "value": 1.0000000000000002
         }
       },
-      "generated_at": "@1780001980"
+      "generated_at": "@1780105703"
     },
     "viability_alter_add_column": {
       "kind": "viability",
@@ -5037,7 +5037,7 @@ window.__BASIN_RESULTS = {
         "pre_alter_tags_all_null": true,
         "rows_visible": 10
       },
-      "generated_at": "@1780001865"
+      "generated_at": "@1780105586"
     },
     "viability_alter_table": {
       "kind": "viability",
@@ -5067,7 +5067,7 @@ window.__BASIN_RESULTS = {
           "DISABLE ROW LEVEL SECURITY"
         ]
       },
-      "generated_at": "@1780001868"
+      "generated_at": "@1780105589"
     },
     "viability_analytical": {
       "kind": "viability",
@@ -5141,7 +5141,7 @@ window.__BASIN_RESULTS = {
         "runs_executed": 3,
         "ticks": 3
       },
-      "generated_at": "@1780001871"
+      "generated_at": "@1780105592"
     },
     "viability_basin_net": {
       "kind": "viability",
@@ -5160,14 +5160,14 @@ window.__BASIN_RESULTS = {
       },
       "details": {
         "allowlist_blocks_unknown_host": true,
-        "async_request_id": "9b269b96-75e9-4aeb-8e56-f65555e8fafb",
+        "async_request_id": "c90705e2-b3cd-4c98-be9c-94c8208e3459",
         "async_response_recorded": true,
         "async_status": 200,
         "roundtrip_passed": true,
         "sync_body": "ok",
         "sync_status": 200
       },
-      "generated_at": "@1780001875"
+      "generated_at": "@1780105597"
     },
     "viability_bloom_filter_pruning": {
       "kind": "viability",
@@ -5248,7 +5248,7 @@ window.__BASIN_RESULTS = {
           "range_gets": 0
         }
       },
-      "generated_at": "@1780001880"
+      "generated_at": "@1780105604"
     },
     "viability_cluster_by_sort_overhead": {
       "kind": "viability",
@@ -5258,7 +5258,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "cluster_mean / no_cluster_mean ratio",
-        "value": 0.9783634004038021,
+        "value": 0.9726452288967249,
         "unit": "x",
         "bar": {
           "op": "less_than",
@@ -5267,13 +5267,13 @@ window.__BASIN_RESULTS = {
       },
       "details": {
         "bar_ratio_x": 2.0,
-        "cluster_mean_ms": 9.406100200000001,
+        "cluster_mean_ms": 8.075216800000002,
         "n_iterations": 5,
-        "no_cluster_mean_ms": 9.614117,
-        "ratio_x": 0.9783634004038021,
+        "no_cluster_mean_ms": 8.302325,
+        "ratio_x": 0.9726452288967249,
         "rows_per_batch": 10000
       },
-      "generated_at": "@1780001861"
+      "generated_at": "@1780105584"
     },
     "viability_cluster_by_sql": {
       "kind": "viability",
@@ -5299,7 +5299,7 @@ window.__BASIN_RESULTS = {
           "e2e: cluster-by sorts file physically"
         ]
       },
-      "generated_at": "@1780001884"
+      "generated_at": "@1780105606"
     },
     "viability_cold_start": {
       "kind": "viability",
@@ -5309,7 +5309,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "cold_start_ms",
-        "value": 175.346,
+        "value": 79.69925,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -5317,11 +5317,11 @@ window.__BASIN_RESULTS = {
         }
       },
       "details": {
-        "bind_addr": "127.0.0.1:57083",
-        "cold_start_ms": 175.346,
+        "bind_addr": "127.0.0.1:56484",
+        "cold_start_ms": 79.69925,
         "storage": "localfs"
       },
-      "generated_at": "@1780001886"
+      "generated_at": "@1780105885"
     },
     "viability_compression_ratio": {
       "kind": "viability",
@@ -5343,7 +5343,7 @@ window.__BASIN_RESULTS = {
         "parquet_bytes": 1628404,
         "rows": 1000000
       },
-      "generated_at": "@1780001890"
+      "generated_at": "@1780105617"
     },
     "viability_continuous_aggregate": {
       "kind": "viability",
@@ -5374,7 +5374,7 @@ window.__BASIN_RESULTS = {
         "refresh_idempotent": true,
         "refresh_picks_up_new_rows": true
       },
-      "generated_at": "@1780001893"
+      "generated_at": "@1780105621"
     },
     "viability_disk_cache": {
       "kind": "viability",
@@ -5384,7 +5384,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "cold p99 ms",
-        "value": 6.063291,
+        "value": 6.724625,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -5399,21 +5399,21 @@ window.__BASIN_RESULTS = {
         "n_iterations": 1000,
         "rows": [
           {
-            "max_ms": 161.872667,
-            "mean_ms": 3.877712423000002,
-            "min_ms": 2.929792,
-            "p50_ms": 3.574584,
-            "p999_ms": 17.1955,
-            "p99_ms": 6.063291,
+            "max_ms": 164.563625,
+            "mean_ms": 3.831106198999997,
+            "min_ms": 2.992625,
+            "p50_ms": 3.528959,
+            "p999_ms": 20.678458,
+            "p99_ms": 6.724625,
             "phase": "cold"
           },
           {
-            "max_ms": 26.278125,
-            "mean_ms": 3.8498641449999975,
-            "min_ms": 3.313917,
-            "p50_ms": 3.6673750000000003,
-            "p999_ms": 15.34675,
-            "p99_ms": 6.0025,
+            "max_ms": 7.786458,
+            "mean_ms": 3.4162480019999983,
+            "min_ms": 2.888625,
+            "p50_ms": 3.301459,
+            "p999_ms": 6.523791,
+            "p99_ms": 5.380709,
             "phase": "warm"
           }
         ],
@@ -5423,7 +5423,7 @@ window.__BASIN_RESULTS = {
         "warm_inner_gets": 0,
         "working_set_size": 1000
       },
-      "generated_at": "@1780001901"
+      "generated_at": "@1780105629"
     },
     "viability_durable_catalog": {
       "kind": "viability",
@@ -5489,7 +5489,7 @@ window.__BASIN_RESULTS = {
         "rss_after_kib": 9376,
         "rss_before_kib": 7136
       },
-      "generated_at": "@1780001903"
+      "generated_at": "@1780105631"
     },
     "viability_isolation_under_load": {
       "kind": "viability",
@@ -5507,11 +5507,11 @@ window.__BASIN_RESULTS = {
         }
       },
       "details": {
-        "elapsed_s": 1.7492292090000001,
+        "elapsed_s": 0.910364875,
         "ops": 2000,
         "projects": 50
       },
-      "generated_at": "@1780001909"
+      "generated_at": "@1780105636"
     },
     "viability_jsonb": {
       "kind": "viability",
@@ -5537,7 +5537,7 @@ window.__BASIN_RESULTS = {
         "rejected_malformed": true,
         "rows_returned": 2
       },
-      "generated_at": "@1780001911"
+      "generated_at": "@1780105638"
     },
     "viability_kms_envelope": {
       "kind": "viability",
@@ -5555,13 +5555,13 @@ window.__BASIN_RESULTS = {
         }
       },
       "details": {
-        "data_file_path": "projects/01KSR63ES198EHFGR5HHK8FMVE/tables/events/data/_default/2026/05/28/01KSR63ESD96KGH335HCGW5Q39.vortex",
+        "data_file_path": "projects/01KSV90Y41EW7FDZCFZRWER1VV/tables/events/data/_default/2026/05/30/01KSV90Y4CJGVDNHT9QZTYPFCG.vortex",
         "encrypted_body_bytes": 3280,
         "plaintext_body_bytes": 3252,
         "rows_round_tripped": 100,
         "sidecar_bytes": 33
       },
-      "generated_at": "@1780001913"
+      "generated_at": "@1780105640"
     },
     "viability_large_dataset_pointquery": {
       "kind": "viability",
@@ -5571,7 +5571,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "cold p99 ms",
-        "value": 2.874542,
+        "value": 2.812625,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -5584,30 +5584,30 @@ window.__BASIN_RESULTS = {
         "n_iterations": 1000,
         "rows": [
           {
-            "max_ms": 5.455125,
-            "mean_ms": 1.0436028399999995,
-            "min_ms": 0.094709,
-            "p50_ms": 1.2827920000000002,
-            "p999_ms": 5.320709,
-            "p99_ms": 2.874542,
+            "max_ms": 5.142833,
+            "mean_ms": 1.0416946710000008,
+            "min_ms": 0.092542,
+            "p50_ms": 1.252916,
+            "p999_ms": 4.620667,
+            "p99_ms": 2.812625,
             "phase": "cold"
           },
           {
-            "max_ms": 0.180083,
-            "mean_ms": 0.09812369199999987,
-            "min_ms": 0.091542,
-            "p50_ms": 0.098375,
-            "p999_ms": 0.157458,
-            "p99_ms": 0.121208,
+            "max_ms": 4.74075,
+            "mean_ms": 0.10507361400000001,
+            "min_ms": 0.091625,
+            "p50_ms": 0.094208,
+            "p999_ms": 0.547417,
+            "p99_ms": 0.221542,
             "phase": "warm"
           }
         ],
         "seed": 13425777967503634925,
-        "seed_elapsed_s": 16.38033,
+        "seed_elapsed_s": 16.509562708,
         "total_rows": 10000000,
         "working_set_size": 1000
       },
-      "generated_at": "@1780001934"
+      "generated_at": "@1780105660"
     },
     "viability_migration_manager": {
       "kind": "viability",
@@ -5650,7 +5650,7 @@ window.__BASIN_RESULTS = {
         "project_wide_total_entries": 30,
         "tables": 5
       },
-      "generated_at": "@1780001937"
+      "generated_at": "@1780105663"
     },
     "viability_orm_compat": {
       "kind": "viability",
@@ -5733,7 +5733,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "cold p99 ms",
-        "value": 3.9752499999999995,
+        "value": 4.8292910000000004,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -5749,21 +5749,21 @@ window.__BASIN_RESULTS = {
         "n_iterations": 1000,
         "rows": [
           {
-            "max_ms": 8.607999999999999,
-            "mean_ms": 2.175061453,
-            "min_ms": 0.193917,
-            "p50_ms": 3.224542,
-            "p999_ms": 4.589541,
-            "p99_ms": 3.9752499999999995,
+            "max_ms": 124.619416,
+            "mean_ms": 2.246913571,
+            "min_ms": 0.17066699999999999,
+            "p50_ms": 2.779667,
+            "p999_ms": 18.668125,
+            "p99_ms": 4.8292910000000004,
             "phase": "cold"
           },
           {
-            "max_ms": 0.519625,
-            "mean_ms": 0.20474324800000007,
-            "min_ms": 0.187416,
-            "p50_ms": 0.197542,
-            "p999_ms": 0.418625,
-            "p99_ms": 0.294792,
+            "max_ms": 2.609208,
+            "mean_ms": 0.23360415599999995,
+            "min_ms": 0.17133299999999999,
+            "p50_ms": 0.195792,
+            "p999_ms": 2.3415,
+            "p99_ms": 0.570125,
             "phase": "warm"
           }
         ],
@@ -5773,7 +5773,7 @@ window.__BASIN_RESULTS = {
         "warm_misses_total": 6190,
         "working_set_size": 1000
       },
-      "generated_at": "@1780001940"
+      "generated_at": "@1780105667"
     },
     "viability_partition_pruning": {
       "kind": "viability",
@@ -5803,7 +5803,7 @@ window.__BASIN_RESULTS = {
         "rows_per_month": 100,
         "rows_range_query": 100
       },
-      "generated_at": "@1780001943"
+      "generated_at": "@1780105669"
     },
     "viability_per_project_bcrypt_validate_cost": {
       "kind": "viability",
@@ -5884,7 +5884,30 @@ window.__BASIN_RESULTS = {
         "word_similarity_correct": true,
         "word_similarity_smyth_alyce_smyth": 1.0
       },
-      "generated_at": "@1780001946"
+      "generated_at": "@1780105672"
+    },
+    "viability_pk_bulk_insert": {
+      "kind": "viability",
+      "id": "pk_bulk_insert",
+      "name": "Bulk INSERT with PRIMARY KEY",
+      "claim": "After the projection+memoization+i64-fastpath fix, the per-batch cold-tier PK scan no longer dominates bulk INSERT \u2014 wall-clock with a PK column stays within 3x of the no-PK shape.",
+      "passed": true,
+      "primary": {
+        "label": "pk_to_nopk_ratio",
+        "value": 1.1240067169837835,
+        "unit": "x",
+        "bar": {
+          "op": "less_than",
+          "value": 3.0
+        }
+      },
+      "details": {
+        "batch_size": 2000,
+        "n_batches": 50,
+        "nopk_ms": 6934.170083,
+        "pk_ms": 7794.05375
+      },
+      "generated_at": "@1780102457"
     },
     "viability_postgis": {
       "kind": "viability",
@@ -5914,7 +5937,7 @@ window.__BASIN_RESULTS = {
         "wkb_roundtrip_correct": true,
         "wkb_total_bytes": 2100
       },
-      "generated_at": "@1780001948"
+      "generated_at": "@1780105674"
     },
     "viability_predicate_pushdown": {
       "kind": "viability",
@@ -5936,7 +5959,7 @@ window.__BASIN_RESULTS = {
         "full_scan_bytes": 1229888,
         "point_query_bytes": 0
       },
-      "generated_at": "@1780001951"
+      "generated_at": "@1780105677"
     },
     "viability_project_deletion": {
       "kind": "viability",
@@ -5946,7 +5969,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "deletion_ms",
-        "value": 5.769375,
+        "value": 3.7239579999999997,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -5955,9 +5978,9 @@ window.__BASIN_RESULTS = {
       },
       "details": {
         "files": 100,
-        "setup_ms": 600.99625
+        "setup_ms": 479.495792
       },
-      "generated_at": "@1780001952"
+      "generated_at": "@1780105678"
     },
     "viability_rls_basic": {
       "kind": "viability",
@@ -5981,7 +6004,7 @@ window.__BASIN_RESULTS = {
         "anonymous_rows_visible": 0,
         "bob_rows_visible": 5
       },
-      "generated_at": "@1780001955"
+      "generated_at": "@1780105681"
     },
     "viability_rls_isolation": {
       "kind": "viability",
@@ -6000,10 +6023,10 @@ window.__BASIN_RESULTS = {
       },
       "details": {
         "cross_project_leak": 0,
-        "project_a": "01KSR64SMC3A22AYJWJ2JBM04S",
-        "project_b": "01KSR64SMCE6DKQGSN9372PZVF"
+        "project_a": "01KSV928PJ64XM9CKFARBXVN67",
+        "project_b": "01KSV928PJTYR7Y64C47SHW4RA"
       },
-      "generated_at": "@1780001957"
+      "generated_at": "@1780105683"
     },
     "viability_row_group_sizing": {
       "kind": "viability",
@@ -6045,7 +6068,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "inserts_per_sec",
-        "value": 2986.114570234524,
+        "value": 3317.945894734079,
         "unit": "inserts/sec",
         "bar": {
           "op": "greater_than_or_equal",
@@ -6053,11 +6076,11 @@ window.__BASIN_RESULTS = {
         }
       },
       "details": {
-        "elapsed_ms": 334.883333,
-        "ms_per_insert": 0.334883333,
+        "elapsed_ms": 301.39129199999996,
+        "ms_per_insert": 0.301391292,
         "n_inserts": 1000
       },
-      "generated_at": "@1779973839"
+      "generated_at": "@1780075715"
     },
     "viability_sql_support_slt": {
       "claim": "Curated PG-style .slt suite reaches >= 78% pass rate against basin-engine.",
@@ -6123,7 +6146,7 @@ window.__BASIN_RESULTS = {
         "hot_files_after_sweep": 1,
         "total_rows_visible": 20
       },
-      "generated_at": "@1780001960"
+      "generated_at": "@1780105686"
     },
     "viability_update_delete": {
       "kind": "viability",
@@ -6133,7 +6156,7 @@ window.__BASIN_RESULTS = {
       "passed": true,
       "primary": {
         "label": "UPDATE+DELETE elapsed (ms)",
-        "value": 35.065167,
+        "value": 22.356668,
         "unit": "ms",
         "bar": {
           "op": "less_than",
@@ -6141,13 +6164,13 @@ window.__BASIN_RESULTS = {
         }
       },
       "details": {
-        "delete_ms": 19.749917,
+        "delete_ms": 9.678459,
         "remaining_rows": 9997,
         "rows": 10000,
-        "total_ms": 35.065167,
-        "update_ms": 15.31525
+        "total_ms": 22.356668,
+        "update_ms": 12.678208999999999
       },
-      "generated_at": "@1780001963"
+      "generated_at": "@1780105689"
     },
     "viability_uuid": {
       "kind": "viability",
@@ -6167,12 +6190,12 @@ window.__BASIN_RESULTS = {
       "details": {
         "alice_uuid": "550e8400-e29b-41d4-a716-446655440000",
         "bcrypt_format_correct": true,
-        "bcrypt_sample": "$2b$12$jxgKG1NXPugjn01XcXxhQOWkNe8qR3.krCYSDNbDPFOlVXfKInqS2",
+        "bcrypt_sample": "$2b$12$RJksSKTtPNE/uBPpSVgRVel7jgD1A.D7CKSxZEQs6hk73LYddX.ye",
         "random_uuid_unique_1000": true,
         "sha256_hex_correct": true,
         "uuid_roundtrip": true
       },
-      "generated_at": "@1780001965"
+      "generated_at": "@1780105691"
     },
     "viability_vector_search": {
       "kind": "viability",
