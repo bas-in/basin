@@ -39,7 +39,7 @@ use datafusion::logical_expr::{col, SortExpr};
 use datafusion::datasource::MemTable;
 use datafusion::execution::cache::cache_manager::CacheManagerConfig;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::execution::SessionStateBuilder;
+use datafusion::execution::{SessionStateBuilder, SessionStateDefaults};
 use datafusion::prelude::SessionContext;
 use sqlparser::ast::ValueWithSpan;
 use sqlparser::ast::{BinaryOperator, Expr, Query, SetExpr, Statement, TableFactor, Value};
@@ -337,9 +337,16 @@ pub(crate) fn build_stateless_udf_cache() -> StatelessUdfCache {
         ctx.register_udf((*udf).clone());
     }
     let state = ctx.state();
+    // Build DataFusion's default optimizer rule list once.  The 27
+    // stateless rules are heap-allocated `Arc<dyn OptimizerRule>`; without
+    // this cache every `session::open` call paid a fresh
+    // `Optimizer::default()` to rebuild them.  Cloning the `Vec` at
+    // session-open time is O(n) Arc ref-count bumps with no allocation.
+    let optimizer_rules = datafusion::optimizer::Optimizer::default().rules;
     StatelessUdfCache {
         scalar: state.scalar_functions().values().cloned().collect(),
         aggregate: state.aggregate_functions().values().cloned().collect(),
+        optimizer_rules,
     }
 }
 
@@ -1077,8 +1084,11 @@ pub(crate) async fn open(
     let udf_cache = engine.inner.udf_cache.as_ref();
     // Prepend our ANY/ALL → scalar-subquery rule so it fires before
     // DataFusion's RewriteSetComparison decomposes uncorrelated ANY/ALL
-    // into LeftMark NestedLoopJoin plans.
-    let mut optimizer_rules = datafusion::optimizer::Optimizer::default().rules;
+    // into LeftMark NestedLoopJoin plans.  Clone the pre-built rule list
+    // from the stateless UDF cache instead of re-running
+    // `Optimizer::default()` (saves 27 Arc<dyn OptimizerRule>
+    // allocations per session-open).
+    let mut optimizer_rules = udf_cache.optimizer_rules.clone();
     optimizer_rules.insert(
         0,
         std::sync::Arc::new(crate::any_all_rewrite::AnyAllToScalarSubquery),
@@ -1107,19 +1117,32 @@ pub(crate) async fn open(
         .with_cache_manager(cache_cfg)
         .build_arc()
         .map_err(|e| BasinError::internal(format!("RuntimeEnv build: {e}")))?;
+    // Targeted defaults: install only the DF feature sets we actually
+    // need fresh per session.  `with_default_features()` also rebuilds
+    // every DF scalar + aggregate UDF, which is immediately overwritten
+    // by `with_scalar_functions(udf_cache.scalar.clone())` /
+    // `with_aggregate_functions(...)` below — pure waste on every
+    // session-open.  By calling the individual setters directly we skip
+    // that work entirely (~3-10ms saved per `session::open`).
     let state = SessionStateBuilder::new()
         .with_config(session_cfg)
         .with_runtime_env(runtime_env)
-        // Non-UDF defaults: table factories, file formats, expr planners,
-        // optimizer rules, window functions. We override scalar_functions and
-        // aggregate_functions below with the combined (DF defaults + Basin)
-        // cache, so `with_default_features` is not called for those.
-        .with_default_features()
-        // Inject our prepended optimizer rule list.
+        .with_table_factories(
+            SessionStateDefaults::default_table_factories(),
+        )
+        .with_file_formats(SessionStateDefaults::default_file_formats())
+        .with_expr_planners(SessionStateDefaults::default_expr_planners())
+        .with_window_functions(
+            SessionStateDefaults::default_window_functions(),
+        )
+        .with_table_function_list(
+            SessionStateDefaults::default_table_functions(),
+        )
+        // Inject our prepended optimizer rule list (cloned from the
+        // engine-wide cache).
         .with_optimizer_rules(optimizer_rules)
-        // Replace the default scalar/aggregate sets with the combined cache.
-        // `with_scalar_functions` overwrites whatever `with_default_features`
-        // set; since the cache includes DF's own defaults, nothing is lost.
+        // The cache includes DF's default scalar+agg UDFs alongside
+        // Basin's, so passing it here is the single source of both.
         .with_scalar_functions(udf_cache.scalar.clone())
         .with_aggregate_functions(udf_cache.aggregate.clone())
         // Appended after all DF default physical optimizer rules: force

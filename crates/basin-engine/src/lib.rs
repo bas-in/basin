@@ -68,6 +68,13 @@ use uuid::Uuid;
 pub(crate) struct StatelessUdfCache {
     pub(crate) scalar: Vec<Arc<datafusion::logical_expr::ScalarUDF>>,
     pub(crate) aggregate: Vec<Arc<datafusion::logical_expr::AggregateUDF>>,
+    /// DataFusion's default optimizer rule list, built once at engine
+    /// construction.  Each session-open clones this `Vec` (Arc ref-count
+    /// bumps for the 27 stateless rules — no per-session struct
+    /// allocation) and prepends Basin's custom rules.  Replaces a
+    /// `datafusion::optimizer::Optimizer::default()` call per session.
+    pub(crate) optimizer_rules:
+        Vec<Arc<dyn datafusion::optimizer::OptimizerRule + Send + Sync>>,
 }
 
 /// Engine configuration.
