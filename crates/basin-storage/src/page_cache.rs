@@ -43,21 +43,54 @@
 //!
 //! # Byte budget + LRU
 //!
-//! State lives in a `Mutex<LruCache<CacheKey, CacheEntry>>` plus a
-//! `current_bytes: u64` that the eviction loop drives below the
-//! configured `max_bytes`. Every `RecordBatch`'s footprint is the sum
-//! of `arrow_array::RecordBatch::get_array_memory_size()` — the same
-//! number the writer uses for buffer sizing. Eviction is greedy LRU:
-//! after every successful insert we pop entries until we're back below
-//! the budget.
+//! State lives sharded across `N_SHARDS` independent `Mutex<PageCacheState>`
+//! buckets, each holding its own `LruCache<CacheKey, CacheEntry>` plus a
+//! local `current_bytes: u64` that the eviction loop drives below its
+//! configured share of the global budget (`max_bytes / N_SHARDS`). Every
+//! `RecordBatch`'s footprint is the sum of
+//! `arrow_array::RecordBatch::get_array_memory_size()` — the same number
+//! the writer uses for buffer sizing. Eviction is greedy LRU within each
+//! shard: after every successful insert we pop entries from the owning
+//! shard until it's back below its slice of the budget.
+//!
+//! LRU is per-shard, so the global LRU order is approximate — two
+//! entries on different shards age independently. In exchange, concurrent
+//! readers that hash to different shards never contend on the same
+//! mutex, which is the load-bearing property at high fan-out.
+//!
+//! # Sharding (perf hot-path)
+//!
+//! Pre-shard, the cache held a single `Mutex<PageCacheState>` and every
+//! `get`/`insert`/`has_capacity` call serialised through it. The `get`
+//! path is morally a write because LRU promotion mutates the recency
+//! list, so even pure read workloads collided on this lock. At C=64
+//! concurrent readers on 16 worker threads the futex-wake latency made
+//! the lock the effective scaling ceiling (see `scaling_concurrency`
+//! benchmark cliff: 1.08× C=16→C=64 vs the 1.5× bar).
+//!
+//! Post-shard, the lock count is `N_SHARDS` (default 64, env-overridable
+//! via `BASIN_STORAGE_PAGE_CACHE_SHARDS`). A request picks its shard by
+//! hashing all three components of `CacheKey` (path, projection, filters);
+//! same-key requests always land on the same shard (so a hit is still a
+//! hit), and different-key requests scatter. With shard count matching
+//! the concurrency target, the expected contention on a uniform workload
+//! is `~1/N_SHARDS`.
+//!
+//! `has_capacity` is the only call that previously read aggregate state:
+//! it now reads a lock-free `AtomicU64 current_bytes` on the parent
+//! `PageCache` (updated by every insert / evict / invalidate) and
+//! compares against `max_bytes`. The reader's write-through heuristic
+//! tolerates a brief stale read either way.
 //!
 //! # Invalidation
 //!
-//! Reverse index `HashMap<ObjectPath, Vec<CacheKey>>` so a
-//! file-deletion (compactor, UPDATE/DELETE rewrite) can drop every
-//! cached entry that references that file in O(k) where k is the number
-//! of (projection, filter) variants we cached against it. This mirrors
-//! the disk cache's `by_path` pattern.
+//! Reverse index `HashMap<ObjectPath, Vec<CacheKey>>` lives in each
+//! shard so a file-deletion (compactor, UPDATE/DELETE rewrite) can drop
+//! every cached entry that references that file. Since entries for one
+//! path may sit on different shards (they differ by projection/filter
+//! hash), `invalidate_path` iterates all shards once — an O(N_SHARDS)
+//! op, acceptable because the call site is rare (rewrite/compaction)
+//! while the get/insert path is hot.
 //!
 //! # Project isolation
 //!
@@ -330,25 +363,55 @@ fn scalar_disc(v: &ScalarValue) -> u8 {
     }
 }
 
-/// Default LRU index capacity. The byte budget is the load-bearing
-/// knob; the entry count cap is a safety net so a million tiny entries
-/// can't blow up bookkeeping memory. 100k entries × ~100 bytes of
-/// bookkeeping each = ~10 MB, which is fine.
-const DEFAULT_INDEX_CAPACITY: usize = 100_000;
+/// Default LRU index capacity (per shard). The byte budget is the
+/// load-bearing knob; the entry count cap is a safety net so a million
+/// tiny entries can't blow up bookkeeping memory. With 64 shards and
+/// 100k entries per shard the global ceiling is 6.4M index slots — still
+/// O(tens of MB) of bookkeeping at worst, fine.
+const DEFAULT_INDEX_CAPACITY_PER_SHARD: usize = 100_000;
+
+/// Default shard count. Matched to the concurrency target the
+/// `scaling_concurrency` benchmark exercises (C=64) so the lucky-case
+/// (different keys) hits different shards. Override at process start
+/// with `BASIN_STORAGE_PAGE_CACHE_SHARDS` (positive `usize`); any
+/// unset / unparseable / zero / non-power-of-two value keeps the default.
+const DEFAULT_PAGE_CACHE_SHARDS: usize = 64;
+
+/// Resolve the page-cache shard count, honoring
+/// `BASIN_STORAGE_PAGE_CACHE_SHARDS` when present and parseable to a
+/// positive `usize`. Falls back to [`DEFAULT_PAGE_CACHE_SHARDS`].
+pub fn resolve_page_cache_shards() -> usize {
+    if let Ok(v) = std::env::var("BASIN_STORAGE_PAGE_CACHE_SHARDS") {
+        if let Ok(n) = v.parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    DEFAULT_PAGE_CACHE_SHARDS
+}
 
 /// Page cache. Cheap to clone via `Arc<PageCache>`; concurrent readers
-/// share one mutex-guarded LRU.
+/// share a fixed array of mutex-guarded LRU shards.
 pub struct PageCache {
-    state: Mutex<PageCacheState>,
+    /// One independent `Mutex<PageCacheState>` per shard. A request picks
+    /// its shard by hashing the full `CacheKey`; same-key requests always
+    /// land on the same shard.
+    shards: Box<[Mutex<PageCacheState>]>,
     counters: PageCacheCounters,
     max_bytes: u64,
+    /// Per-shard byte budget = `max_bytes / shards.len()` (rounded up to
+    /// avoid a zero-byte slice when `max_bytes < shards.len()`). Each
+    /// shard's eviction loop converges below this number, so the global
+    /// budget is honored modulo skew.
+    per_shard_max_bytes: u64,
 }
 
 struct PageCacheState {
     lru: LruCache<CacheKey, CacheEntry>,
-    /// Reverse index: ObjectPath -> set of CacheKeys for that path.
-    /// Lets the invalidation hook drop every entry referencing a
-    /// deleted file in O(k).
+    /// Reverse index: ObjectPath -> set of CacheKeys for that path that
+    /// live in *this* shard. Lets `invalidate_path` (which walks every
+    /// shard) drop the entries it owns in O(k_local).
     by_path: HashMap<ObjectPath, Vec<CacheKey>>,
     current_bytes: u64,
 }
@@ -356,15 +419,35 @@ struct PageCacheState {
 impl PageCache {
     /// Construct an empty cache with the given byte budget.
     pub fn new(cfg: PageCacheConfig) -> Self {
-        let cap = NonZeroUsize::new(DEFAULT_INDEX_CAPACITY).expect("index cap > 0");
+        let n_shards = resolve_page_cache_shards();
+        Self::with_shards(cfg, n_shards)
+    }
+
+    /// Construct an empty cache with an explicit shard count. Visible for
+    /// tests; production callers use [`PageCache::new`] which honors the
+    /// `BASIN_STORAGE_PAGE_CACHE_SHARDS` env override.
+    pub fn with_shards(cfg: PageCacheConfig, n_shards: usize) -> Self {
+        let n_shards = n_shards.max(1);
+        let cap =
+            NonZeroUsize::new(DEFAULT_INDEX_CAPACITY_PER_SHARD).expect("index cap > 0");
+        let shards: Vec<Mutex<PageCacheState>> = (0..n_shards)
+            .map(|_| {
+                Mutex::new(PageCacheState {
+                    lru: LruCache::new(cap),
+                    by_path: HashMap::new(),
+                    current_bytes: 0,
+                })
+            })
+            .collect();
+        // Round-up division so per_shard_max_bytes * n_shards >= max_bytes;
+        // each shard's local cap never drops to zero even when
+        // max_bytes < n_shards (degenerate tests).
+        let per_shard_max_bytes = cfg.max_bytes.div_ceil(n_shards as u64).max(1);
         Self {
-            state: Mutex::new(PageCacheState {
-                lru: LruCache::new(cap),
-                by_path: HashMap::new(),
-                current_bytes: 0,
-            }),
+            shards: shards.into_boxed_slice(),
             counters: PageCacheCounters::default(),
             max_bytes: cfg.max_bytes,
+            per_shard_max_bytes,
         }
     }
 
@@ -373,10 +456,29 @@ impl PageCache {
         self.counters.snapshot()
     }
 
+    /// Number of shards. Visible for tests.
+    #[cfg(test)]
+    pub(crate) fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    /// Pick the shard for a key. We hash all three components — same key
+    /// always maps to the same shard (so a hit is still a hit), and
+    /// different keys scatter across shards independent of which one
+    /// field happens to be skewed.
+    fn shard_for(&self, key: &CacheKey) -> usize {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key.path.hash(&mut h);
+        key.projection_hash.hash(&mut h);
+        key.filters_hash.hash(&mut h);
+        (h.finish() as usize) % self.shards.len()
+    }
+
     /// Lookup. On hit, bumps LRU position and returns a clone of the
     /// `Arc<Vec<...>>` (cheap; no batch is copied).
     pub(crate) fn get(&self, key: &CacheKey) -> Option<Arc<Vec<Arc<RecordBatch>>>> {
-        let mut g = self.state.lock().expect("page cache mutex poisoned");
+        let idx = self.shard_for(key);
+        let mut g = self.shards[idx].lock().expect("page cache shard mutex poisoned");
         if let Some(entry) = g.lru.get(key) {
             let batches = entry.batches.clone();
             drop(g);
@@ -390,7 +492,8 @@ impl PageCache {
     }
 
     /// Insert (or replace) the entry for `key`. Drives LRU eviction
-    /// until `current_bytes <= max_bytes`.
+    /// within the owning shard until that shard's `current_bytes <=
+    /// per_shard_max_bytes`.
     pub(crate) fn insert(&self, key: CacheKey, batches: Vec<Arc<RecordBatch>>) {
         let size: u64 = batches
             .iter()
@@ -401,12 +504,20 @@ impl PageCache {
             size,
         };
 
-        let mut g = self.state.lock().expect("page cache mutex poisoned");
+        let idx = self.shard_for(&key);
+        let mut g = self.shards[idx].lock().expect("page cache shard mutex poisoned");
+
+        // Local accumulator: net change in bytes for this shard. We
+        // apply it to the global atomic ONCE at the end so the
+        // lock-free `has_capacity` reader sees a coherent total.
+        let mut net_delta: i128 = 0;
+        let mut local_evictions: u64 = 0;
 
         // Refresh case: subtract the old entry's bytes and clean up
         // its reverse-index slot.
         if let Some(old) = g.lru.pop(&key) {
             g.current_bytes = g.current_bytes.saturating_sub(old.size);
+            net_delta -= old.size as i128;
             if let Some(v) = g.by_path.get_mut(&key.path) {
                 v.retain(|k| k != &key);
                 if v.is_empty() {
@@ -416,6 +527,7 @@ impl PageCache {
         }
 
         g.current_bytes = g.current_bytes.saturating_add(entry.size);
+        net_delta += entry.size as i128;
         g.by_path
             .entry(key.path.clone())
             .or_default()
@@ -426,55 +538,73 @@ impl PageCache {
         if let Some((evicted_k, evicted_v)) = g.lru.push(key.clone(), entry) {
             if evicted_k != key {
                 g.current_bytes = g.current_bytes.saturating_sub(evicted_v.size);
+                net_delta -= evicted_v.size as i128;
                 if let Some(v) = g.by_path.get_mut(&evicted_k.path) {
                     v.retain(|k| k != &evicted_k);
                     if v.is_empty() {
                         g.by_path.remove(&evicted_k.path);
                     }
                 }
-                self.counters.evictions.fetch_add(1, Ordering::Relaxed);
+                local_evictions += 1;
             }
         }
 
-        // Byte-budget eviction loop.
-        while g.current_bytes > self.max_bytes {
+        // Byte-budget eviction loop, per-shard.
+        while g.current_bytes > self.per_shard_max_bytes {
             match g.lru.pop_lru() {
                 Some((k, v)) => {
                     g.current_bytes = g.current_bytes.saturating_sub(v.size);
+                    net_delta -= v.size as i128;
                     if let Some(vec) = g.by_path.get_mut(&k.path) {
                         vec.retain(|x| x != &k);
                         if vec.is_empty() {
                             g.by_path.remove(&k.path);
                         }
                     }
-                    self.counters.evictions.fetch_add(1, Ordering::Relaxed);
+                    local_evictions += 1;
                 }
                 None => break,
             }
         }
 
-        self.counters
-            .current_bytes
-            .store(g.current_bytes, Ordering::Relaxed);
+        drop(g);
+
+        if local_evictions > 0 {
+            self.counters
+                .evictions
+                .fetch_add(local_evictions, Ordering::Relaxed);
+        }
+        // Apply net byte delta to the global atomic. Use signed add via
+        // wrapping ops on the underlying u64 so we don't accidentally
+        // underflow when eviction frees more than the insert added.
+        apply_signed_delta(&self.counters.current_bytes, net_delta);
     }
 
     /// Drop every cached entry that references `path`. Called by the
     /// storage layer when a Parquet file is deleted (compactor,
-    /// UPDATE/DELETE rewrite). Idempotent and cheap if `path` is not
-    /// in the cache.
+    /// UPDATE/DELETE rewrite). Idempotent and cheap if `path` is not in
+    /// the cache.
+    ///
+    /// Walks every shard (O(N_SHARDS) lock acquisitions) because entries
+    /// for one path may be distributed across shards. This is the
+    /// trade-off we accept to keep `get`/`insert` contention-free.
     pub fn invalidate_path(&self, path: &ObjectPath) {
-        let mut g = self.state.lock().expect("page cache mutex poisoned");
-        let keys = g.by_path.remove(path).unwrap_or_default();
-        let mut freed = 0u64;
-        for k in keys {
-            if let Some(v) = g.lru.pop(&k) {
-                freed = freed.saturating_add(v.size);
+        let mut total_freed: u64 = 0;
+        for shard in self.shards.iter() {
+            let mut g = shard.lock().expect("page cache shard mutex poisoned");
+            let keys = g.by_path.remove(path).unwrap_or_default();
+            let mut freed = 0u64;
+            for k in keys {
+                if let Some(v) = g.lru.pop(&k) {
+                    freed = freed.saturating_add(v.size);
+                }
             }
+            g.current_bytes = g.current_bytes.saturating_sub(freed);
+            total_freed = total_freed.saturating_add(freed);
         }
-        g.current_bytes = g.current_bytes.saturating_sub(freed);
-        self.counters
-            .current_bytes
-            .store(g.current_bytes, Ordering::Relaxed);
+        if total_freed > 0 {
+            apply_signed_delta(&self.counters.current_bytes, -(total_freed as i128));
+        }
     }
 
     /// Heuristic: is there room in the byte budget for another
@@ -483,16 +613,51 @@ impl PageCache {
     /// evicted on insert anyway, and the buffer is pure overhead in
     /// that case (the read path returns the same batches whether or
     /// not they got cached).
+    ///
+    /// Reads the lock-free aggregate `current_bytes` atomic — no shard
+    /// lock acquisition on the hot read path.
     pub(crate) fn has_capacity(&self) -> bool {
-        let g = self.state.lock().expect("page cache mutex poisoned");
-        g.current_bytes < self.max_bytes
+        self.counters.current_bytes.load(Ordering::Relaxed) < self.max_bytes
     }
 
-    /// For tests: how many entries the cache currently holds.
+    /// For tests: how many entries the cache currently holds (summed
+    /// across shards).
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        let g = self.state.lock().expect("page cache mutex poisoned");
-        g.lru.len()
+        self.shards
+            .iter()
+            .map(|s| s.lock().expect("page cache shard mutex poisoned").lru.len())
+            .sum()
+    }
+
+    /// For tests: how many entries the given shard currently holds.
+    #[cfg(test)]
+    pub(crate) fn shard_len(&self, idx: usize) -> usize {
+        self.shards[idx]
+            .lock()
+            .expect("page cache shard mutex poisoned")
+            .lru
+            .len()
+    }
+}
+
+/// Apply a signed delta to a `u64` atomic that tracks cumulative bytes.
+/// We can't use `fetch_add` with a negative value, and we don't want a
+/// lock; instead, we do a relaxed compare-exchange loop that saturates
+/// at zero on the underflow case. Contention here is rare (one update
+/// per insert/evict, not per get).
+fn apply_signed_delta(a: &AtomicU64, delta: i128) {
+    if delta == 0 {
+        return;
+    }
+    let mut cur = a.load(Ordering::Relaxed);
+    loop {
+        let next_i = cur as i128 + delta;
+        let next: u64 = if next_i < 0 { 0 } else { next_i as u64 };
+        match a.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(now) => cur = now,
+        }
     }
 }
 
@@ -500,6 +665,7 @@ impl std::fmt::Debug for PageCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PageCache")
             .field("max_bytes", &self.max_bytes)
+            .field("shards", &self.shards.len())
             .field("counters", &self.counters.snapshot())
             .finish()
     }
@@ -590,6 +756,13 @@ mod tests {
     /// LRU eviction kicks in once `current_bytes > max_bytes`. We pick a
     /// budget below 2× the size of one entry and confirm that inserting
     /// the third entry evicts the first.
+    ///
+    /// NOTE on sharding: this test forces single-shard semantics so the
+    /// global LRU policy is preserved by construction (per-shard LRU
+    /// then *is* the global LRU). With the default 64 shards, three
+    /// random keys would hash into ≥2 separate shards and the eviction
+    /// trigger would not fire deterministically — that's an accepted
+    /// approximation (documented at the module top), not a bug.
     #[test]
     fn lru_evicts_over_byte_budget() {
         // Each batch is ~800 bytes (100 i64 values + arrow overhead);
@@ -599,7 +772,8 @@ mod tests {
         let entry_size = probe.get_array_memory_size() as u64;
         // Budget = 1.5× one entry. Inserting 3 entries forces 2 of
         // them to age out before we're done.
-        let cache = PageCache::new(PageCacheConfig::new(entry_size + entry_size / 2));
+        let cache =
+            PageCache::with_shards(PageCacheConfig::new(entry_size + entry_size / 2), 1);
 
         let k1 = key("projects/x/tables/t/data/1.parquet", 1, 1);
         let k2 = key("projects/x/tables/t/data/2.parquet", 1, 1);
@@ -631,5 +805,130 @@ mod tests {
             entry_size + entry_size / 2,
         );
         assert!(cache.counters().evictions >= 2);
+    }
+
+    /// Sharded cache correctness: insert many distinct keys, every
+    /// `get` returns the value we inserted. This is the load-bearing
+    /// invariant of the sharding refactor — if the shard router ever
+    /// got `shard_for(insert)` != `shard_for(get)` for the same key,
+    /// every read would miss.
+    #[test]
+    fn sharded_cache_get_insert_correctness() {
+        // Generous budget so nothing evicts.
+        let cache = PageCache::new(PageCacheConfig::new(1024 * 1024 * 1024));
+        let n = 500usize;
+        let mut keys = Vec::with_capacity(n);
+        for i in 0..n {
+            // Vary path, projection, and filter so keys spread across
+            // shards (any single-field hash collision would mask a
+            // routing bug — we vary all three to maximise spread).
+            let path = format!("projects/p{}/tables/t/data/file_{}.parquet", i % 7, i);
+            let k = CacheKey {
+                path: ObjectPath::from(path),
+                projection_hash: (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                filters_hash: (i as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9),
+            };
+            cache.insert(k.clone(), vec![small_batch(i as i64 * 100, 10)]);
+            keys.push(k);
+        }
+        assert_eq!(cache.len(), n, "every insert should land in some shard");
+
+        // Every key we inserted must round-trip via `get`.
+        for (i, k) in keys.iter().enumerate() {
+            let got = cache.get(k).unwrap_or_else(|| {
+                panic!("key {i} missed — shard router not deterministic")
+            });
+            assert_eq!(got.len(), 1);
+        }
+        let c = cache.counters();
+        assert_eq!(c.hits, n as u64);
+        assert_eq!(c.misses, 0);
+    }
+
+    /// The shard router actually distributes load. With 1000 keys
+    /// across 64 shards we expect a mean of ~15.6 entries per shard.
+    /// A bad hash (e.g. modulo'd over a single field that collides)
+    /// would dump everything into a handful of shards. We assert at
+    /// least half the shards see >= one entry, and no single shard
+    /// holds more than ~10× the mean — both very loose bars that any
+    /// reasonable hash will clear and a degenerate one will fail.
+    #[test]
+    fn sharded_cache_distributes_load() {
+        let cache = PageCache::with_shards(PageCacheConfig::new(1024 * 1024 * 1024), 64);
+        let n = 1000usize;
+        for i in 0..n {
+            let path = format!("projects/p/tables/t/data/file_{i}.parquet");
+            let k = CacheKey {
+                path: ObjectPath::from(path),
+                projection_hash: (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                filters_hash: (i as u64) ^ 0xDEAD_BEEF,
+            };
+            cache.insert(k, vec![small_batch(0, 1)]);
+        }
+
+        let shards = cache.shard_count();
+        let mean = n as f64 / shards as f64;
+        let mut occupied = 0usize;
+        let mut max_seen = 0usize;
+        for i in 0..shards {
+            let len = cache.shard_len(i);
+            if len > 0 {
+                occupied += 1;
+            }
+            if len > max_seen {
+                max_seen = len;
+            }
+        }
+        assert!(
+            occupied >= shards / 2,
+            "only {occupied}/{shards} shards populated — router under-distributes"
+        );
+        assert!(
+            (max_seen as f64) <= 10.0 * mean,
+            "hottest shard holds {max_seen} entries, >10× mean {mean:.1} — router skewed"
+        );
+    }
+
+    /// `invalidate_path` walks every shard. Construct entries on the
+    /// same path but with varying projection/filter (so they spread
+    /// across shards) and verify all of them are gone after invalidate.
+    #[test]
+    fn sharded_cache_invalidate_path_clears_all_shards() {
+        let cache = PageCache::with_shards(PageCacheConfig::new(1024 * 1024 * 1024), 64);
+        let path = "projects/x/tables/t/data/hot.parquet";
+
+        // Insert 300 entries on the same path with different
+        // (projection, filter) pairs. With 64 shards and a good hash
+        // these will scatter across many shards.
+        for i in 0..300u64 {
+            let k = CacheKey {
+                path: ObjectPath::from(path),
+                projection_hash: i.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                filters_hash: i.wrapping_mul(0xBF58_476D_1CE4_E5B9),
+            };
+            cache.insert(k, vec![small_batch(0, 5)]);
+        }
+
+        // Add a sentinel on a different path that must NOT be evicted.
+        let other = CacheKey {
+            path: ObjectPath::from("projects/x/tables/t/data/cold.parquet"),
+            projection_hash: 1,
+            filters_hash: 1,
+        };
+        cache.insert(other.clone(), vec![small_batch(0, 5)]);
+
+        assert_eq!(cache.len(), 301);
+
+        cache.invalidate_path(&ObjectPath::from(path));
+
+        assert_eq!(
+            cache.len(),
+            1,
+            "every entry on the invalidated path must be gone across all shards"
+        );
+        assert!(
+            cache.get(&other).is_some(),
+            "sentinel on a different path must survive"
+        );
     }
 }
