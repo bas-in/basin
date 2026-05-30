@@ -86,7 +86,8 @@
 //! component naming convention and is the simplest contract a WAT author
 //! can satisfy.
 
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arrow_array::builder::{
@@ -172,6 +173,106 @@ fn global_engine() -> Arc<Engine> {
 }
 
 // ---------------------------------------------------------------------------
+// Compiled Module cache
+// ---------------------------------------------------------------------------
+
+/// Default cap on cached compiled [`wasmtime::Module`] instances. WASM UDFs
+/// are user-provided, so cardinality is bounded by the number of distinct
+/// `LANGUAGE wasm` function bodies a single process has ever evaluated; 1024
+/// covers all realistic multi-tenant workloads with headroom. Override with
+/// [`MODULE_CACHE_CAP_ENV`].
+const DEFAULT_MODULE_CACHE_CAP: usize = 1024;
+
+/// Env override for the module cache cap. Mirrors the
+/// `BASIN_STORAGE_PARQUET_META_CACHE_CAP` shape: a positive `usize` parsed at
+/// every resolve; unset / unparseable / zero falls back to
+/// [`DEFAULT_MODULE_CACHE_CAP`].
+const MODULE_CACHE_CAP_ENV: &str = "BASIN_ENGINE_WASM_MODULE_CACHE_CAP";
+
+/// Resolve the module cache capacity, honoring [`MODULE_CACHE_CAP_ENV`] when
+/// present and parseable to a positive `usize`.
+fn resolve_module_cache_cap() -> usize {
+    if let Ok(v) = std::env::var(MODULE_CACHE_CAP_ENV) {
+        if let Ok(n) = v.parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    DEFAULT_MODULE_CACHE_CAP
+}
+
+/// FIFO-eviction cache of compiled [`wasmtime::Module`] instances keyed by
+/// xxh3-64 of the source bytes. The `order` deque records insertion order so
+/// the oldest entry is dropped when we hit the cap; this is intentionally
+/// simpler than LRU because UDF cardinality is small and recompilation is
+/// only catastrophic for *currently-running* queries, which the cache
+/// guarantees never happens via the get-or-insert path.
+struct ModuleCache {
+    map: HashMap<u64, Arc<Module>>,
+    order: VecDeque<u64>,
+    cap: usize,
+}
+
+impl ModuleCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            cap,
+        }
+    }
+
+    fn insert(&mut self, key: u64, module: Arc<Module>) {
+        // Evict oldest entries until we're back under cap. We evict *before*
+        // inserting the new entry so a cap of N means the cache holds at most
+        // N entries at all times.
+        while self.map.len() >= self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            } else {
+                break;
+            }
+        }
+        self.map.insert(key, module);
+        self.order.push_back(key);
+    }
+}
+
+static MODULE_CACHE: std::sync::OnceLock<Mutex<ModuleCache>> = std::sync::OnceLock::new();
+
+fn module_cache() -> &'static Mutex<ModuleCache> {
+    MODULE_CACHE.get_or_init(|| Mutex::new(ModuleCache::new(resolve_module_cache_cap())))
+}
+
+/// Hash the source bytes with xxh3-64. Same-bytes → same-key is the only
+/// invariant; we don't need cryptographic strength because a hash collision
+/// just means two distinct UDF bodies share a compiled module, which would
+/// be a defect detected by the export-name lookup at instantiation time.
+fn hash_wasm_source(bytes: &[u8]) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(bytes)
+}
+
+/// Compile `wasm_bytes` against `engine`, or return the cached `Arc<Module>`
+/// if an identical body has already been compiled. The lock is held across
+/// the compile so two threads racing on a cache miss for the same source
+/// pay the compilation cost exactly once.
+pub(crate) fn get_or_compile_module(
+    engine: &Engine,
+    wasm_bytes: &[u8],
+) -> wasmtime::Result<Arc<Module>> {
+    let key = hash_wasm_source(wasm_bytes);
+    let cache = module_cache();
+    let mut guard = cache.lock().expect("module cache mutex poisoned");
+    if let Some(hit) = guard.map.get(&key) {
+        return Ok(Arc::clone(hit));
+    }
+    let module = Arc::new(Module::new(engine, wasm_bytes)?);
+    guard.insert(key, Arc::clone(&module));
+    Ok(module)
+}
+
+// ---------------------------------------------------------------------------
 // DataFusion ScalarUDF wrapper
 // ---------------------------------------------------------------------------
 
@@ -249,7 +350,12 @@ impl ScalarUDFImpl for WasmUdfImpl {
         args: datafusion::logical_expr::ScalarFunctionArgs,
     ) -> datafusion::error::Result<ColumnarValue> {
         let engine = global_engine();
-        let module = Module::new(&engine, &self.wasm_bytes).map_err(|e| {
+        // Cache compiled modules across batches: identical WASM bytes hash to
+        // the same xxh3-64 key, so a UDF that runs over N batches only pays
+        // the compilation cost on the first invocation. The cached `Module`
+        // is wrapped in `Arc` for cheap cloning; instantiation still happens
+        // per-call because every call needs a fresh `Store`.
+        let module = get_or_compile_module(&engine, &self.wasm_bytes).map_err(|e| {
             datafusion::error::DataFusionError::Execution(format!(
                 "WASM UDF {}: failed to compile module: {e}",
                 self.name
@@ -1415,6 +1521,98 @@ mod tests {
             read_bytes_from_guest("echo_text", &mut store, &memory, out_ptr, out_len as usize)
                 .expect("read");
         assert_eq!(std::str::from_utf8(&bytes).unwrap(), payload);
+    }
+
+    // -----------------------------------------------------------------------
+    // Module cache — unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wasm_module_cache_hit_returns_same_arc() {
+        // Compiling the same source twice through the process-wide cache
+        // must yield Arc::ptr_eq-equal `Arc<Module>` instances; the second
+        // call must NOT recompile.
+        let wasm = compile_wat(ADD_WAT);
+        let engine = global_engine();
+        let m1 = get_or_compile_module(&engine, &wasm).expect("first compile");
+        let m2 = get_or_compile_module(&engine, &wasm).expect("second compile");
+        assert!(
+            Arc::ptr_eq(&m1, &m2),
+            "second get_or_compile_module call must return the cached Arc<Module>"
+        );
+    }
+
+    #[test]
+    fn wasm_module_cache_distinct_sources_distinct_modules() {
+        // Two distinct WASM bodies must produce two distinct cache entries
+        // (Arc::ptr_eq false).
+        let wasm_add = compile_wat(ADD_WAT);
+        let wasm_double = compile_wat(DOUBLE_WAT);
+        assert_ne!(
+            hash_wasm_source(&wasm_add),
+            hash_wasm_source(&wasm_double),
+            "test precondition: distinct sources must hash differently"
+        );
+        let engine = global_engine();
+        let m_add = get_or_compile_module(&engine, &wasm_add).expect("compile add");
+        let m_double = get_or_compile_module(&engine, &wasm_double).expect("compile double");
+        assert!(
+            !Arc::ptr_eq(&m_add, &m_double),
+            "distinct sources must produce distinct cached modules"
+        );
+    }
+
+    #[test]
+    fn wasm_module_cache_cap_enforced() {
+        // Construct a fresh ModuleCache directly (bypassing the
+        // process-global OnceLock, which is fixed by env at process start)
+        // and verify that inserting past the cap drops oldest entries so
+        // `map.len()` never exceeds `cap`. The cap=2 fixture exercises the
+        // FIFO eviction loop on every insert past the second.
+        let wasm_a = compile_wat(ADD_WAT);
+        let wasm_b = compile_wat(DOUBLE_WAT);
+        const INC_WAT: &str = r#"
+            (module
+              (func $inc (export "inc") (param i32) (result i32)
+                local.get 0
+                i32.const 1
+                i32.add)
+            )
+        "#;
+        let wasm_c = compile_wat(INC_WAT);
+        let engine = global_engine();
+        let m_a = Arc::new(Module::new(&engine, &wasm_a).unwrap());
+        let m_b = Arc::new(Module::new(&engine, &wasm_b).unwrap());
+        let m_c = Arc::new(Module::new(&engine, &wasm_c).unwrap());
+
+        let cap = 2;
+        let mut cache = ModuleCache::new(cap);
+        cache.insert(hash_wasm_source(&wasm_a), m_a);
+        assert!(cache.map.len() <= cap);
+        cache.insert(hash_wasm_source(&wasm_b), m_b);
+        assert!(cache.map.len() <= cap, "cache must stay within cap");
+        cache.insert(hash_wasm_source(&wasm_c), m_c);
+        assert!(
+            cache.map.len() <= cap,
+            "cache must stay within cap after eviction, got {}",
+            cache.map.len()
+        );
+        // Oldest insert (a) must have been evicted; newest (c) must be present.
+        assert!(!cache.map.contains_key(&hash_wasm_source(&wasm_a)));
+        assert!(cache.map.contains_key(&hash_wasm_source(&wasm_c)));
+
+        // Also exercise the env-override resolver: a positive override wins,
+        // zero / unparseable falls back to default.
+        // SAFETY: env var mutation here is OK in cfg(test); resolve is called
+        // only inside this test scope.
+        std::env::set_var(MODULE_CACHE_CAP_ENV, "7");
+        assert_eq!(resolve_module_cache_cap(), 7);
+        std::env::set_var(MODULE_CACHE_CAP_ENV, "0");
+        assert_eq!(resolve_module_cache_cap(), DEFAULT_MODULE_CACHE_CAP);
+        std::env::set_var(MODULE_CACHE_CAP_ENV, "not-a-number");
+        assert_eq!(resolve_module_cache_cap(), DEFAULT_MODULE_CACHE_CAP);
+        std::env::remove_var(MODULE_CACHE_CAP_ENV);
+        assert_eq!(resolve_module_cache_cap(), DEFAULT_MODULE_CACHE_CAP);
     }
 
     #[test]
