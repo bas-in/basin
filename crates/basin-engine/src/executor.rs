@@ -93,6 +93,123 @@ use crate::session::refresh_table;
 use crate::{ExecResult, ProjectSession};
 use basin_catalog::PartitionSpec;
 
+// ---------------------------------------------------------------------------
+// sqlparser Statement parse-cache (perf-impl-w2 Commit B)
+// ---------------------------------------------------------------------------
+//
+// `sqlparser::Parser::parse_sql` is ~20–40µs per call, and for repeat-shape
+// workloads (a hot loop running the same SELECT over and over) it fires on
+// every execute even after Commit A's rewrite-pipeline pre-screen.
+//
+// Cache strategy: process-global LRU keyed by xxh3_64 of the SQL string
+// handed to `Parser::parse_sql`.  That string is purely text-deterministic
+// (catalog state never enters it; the only inputs are the raw SQL and the
+// pre-screens above, all of which are pure text transforms or sit inside
+// `run_full_rewrite_pipeline` which produces SQL whose hash captures any
+// catalog-influenced rewrite output).  Same hash ⇒ sqlparser would
+// produce the same `Statement`, so returning the cached one is correct.
+//
+// Why process-global, not per-session: with per-session caches a connection
+// pool that round-robins across N sessions sees N cold misses for the same
+// SQL.  The Statement is purely a function of the (post-rewrite) SQL bytes
+// — there is no session-specific state inside sqlparser's AST construction
+// — so sharing across sessions is safe and lets warm caches stay warm.
+//
+// Cap: 256 entries by default, overridable via BASIN_ENGINE_PARSE_CACHE_SIZE.
+// Entries are `Arc<Statement>` so a hit is a cheap pointer clone, and the
+// dispatch sites that need to consume by value (the existing `stmts.pop()`)
+// clone out of the Arc — sqlparser's `Statement` implements `Clone` cheaply
+// for the structurally-shallow ASTs the cache is hit by in practice
+// (point-queries, single-row INSERTs).
+
+use lru::LruCache;
+use std::num::NonZeroUsize;
+use std::sync::{Mutex, OnceLock};
+use xxhash_rust::xxh3::xxh3_64;
+
+fn parse_cache_size() -> NonZeroUsize {
+    let cap = std::env::var("BASIN_ENGINE_PARSE_CACHE_SIZE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(256);
+    NonZeroUsize::new(cap).expect("cap > 0 enforced above")
+}
+
+fn parse_cache() -> &'static Mutex<LruCache<u64, Arc<Statement>>> {
+    static CACHE: OnceLock<Mutex<LruCache<u64, Arc<Statement>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(LruCache::new(parse_cache_size())))
+}
+
+/// Parse `sql` via sqlparser, consulting the process-global Statement cache.
+/// On cache hit returns the cached `Arc<Statement>`; on miss parses and
+/// inserts.  Multi-statement SQL is parsed but not cached (the cache stores
+/// exactly one Statement per entry — the executor enforces `stmts.len() == 1`
+/// downstream anyway).
+fn parse_sql_cached(sql: &str) -> Result<Arc<Statement>> {
+    let key = xxh3_64(sql.as_bytes());
+
+    if let Ok(mut g) = parse_cache().lock() {
+        if let Some(cached) = g.get(&key) {
+            return Ok(Arc::clone(cached));
+        }
+    }
+
+    let dialect = PostgreSqlDialect {};
+    let mut stmts = Parser::parse_sql(&dialect, sql).map_err(|e| {
+        let msg = format!("{e}");
+        if msg.contains("Expected: STORED") {
+            BasinError::FeatureNotSupported(
+                "VIRTUAL generated columns deferred to v0.2; use STORED".to_string(),
+            )
+        } else {
+            BasinError::internal(format!("parse error: {e}"))
+        }
+    })?;
+
+    if stmts.len() != 1 {
+        // Mirror the downstream guard so the caller still produces the
+        // canonical "expected exactly one statement" diagnostic — but emit
+        // it here, without caching, so the cache never holds an entry that
+        // a future identical call could mis-route.
+        return Err(BasinError::internal(format!(
+            "expected exactly one statement, got {}",
+            stmts.len()
+        )));
+    }
+    let stmt = Arc::new(stmts.pop().unwrap());
+
+    if let Ok(mut g) = parse_cache().lock() {
+        g.put(key, Arc::clone(&stmt));
+    }
+    Ok(stmt)
+}
+
+#[cfg(test)]
+pub(crate) fn parse_cache_contains_for_test(sql: &str) -> bool {
+    let key = xxh3_64(sql.as_bytes());
+    parse_cache()
+        .lock()
+        .map(|mut g| g.contains(&key))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+pub(crate) fn parse_cache_cap_for_test() -> usize {
+    parse_cache()
+        .lock()
+        .map(|g| g.cap().get())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+pub(crate) fn parse_cache_resize_for_test(cap: usize) {
+    if let (Ok(mut g), Some(nz)) = (parse_cache().lock(), NonZeroUsize::new(cap)) {
+        g.resize(nz);
+        g.clear();
+    }
+}
+
 /// Dispatch `LISTEN` / `UNLISTEN` / `NOTIFY` through the engine's SQL
 /// pub-sub primitive (`crate::notify_registry`).
 ///
@@ -1545,38 +1662,13 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     // design-exclusion kind (LISTEN/NOTIFY/UNLISTEN). The redundant second
     // gate that previously lived here (ADR 0014 Phase 1 dual path) has been
     // removed; sqlparser now only sees DML/DDL that needs its AST.
-    let dialect = PostgreSqlDialect {};
-    let mut stmts = Parser::parse_sql(&dialect, sql).map_err(|e| {
-        // sqlparser's PostgreSqlDialect requires `STORED` after a
-        // `GENERATED ALWAYS AS (...)` block. Map both the `VIRTUAL`
-        // alternative and the bare-paren omit-`STORED` form to PG's
-        // SQLSTATE 0A000 (feature_not_supported), matching what the
-        // engine produces when `VIRTUAL` slips through to the AST
-        // walker. Keeps every "no STORED" surface consistent.
-        let msg = format!("{e}");
-        if msg.contains("Expected: STORED") {
-            BasinError::FeatureNotSupported(
-                "VIRTUAL generated columns deferred to v0.2; use STORED".to_string(),
-            )
-        } else {
-            BasinError::internal(format!("parse error: {e}"))
-        }
-    })?;
-
-    // Each call to `execute` handles exactly one statement. Multi-statement
-    // simple-query messages (`tokio_postgres::batch_execute`, `psql -f
-    // setup.sql`) are split into individual statements by the router-side
-    // pgwire handler before they reach the engine — see
-    // `basin_router::protocol::split_simple_query`. This guard is the
-    // safety net for callers that bypass the router (and a defensive
-    // assertion against future regressions in the splitter).
-    if stmts.len() != 1 {
-        return Err(BasinError::internal(format!(
-            "expected exactly one statement, got {}",
-            stmts.len()
-        )));
-    }
-    let stmt = stmts.pop().unwrap();
+    //
+    // The cached parse returns an `Arc<Statement>`; we materialise an owned
+    // `Statement` via `Arc::try_unwrap` (single-owner fast path) or `Clone`
+    // (shared, e.g. another session is mid-parse on the same SQL).  The
+    // downstream dispatch consumes `stmt` by value.
+    let stmt_arc = parse_sql_cached(sql)?;
+    let stmt: Statement = Arc::try_unwrap(stmt_arc).unwrap_or_else(|arc| (*arc).clone());
 
     // Phase 6 cost-based query rejection. Cheap when disabled (one
     // `OnceLock::get`); when enabled, one catalog round-trip per
@@ -10152,5 +10244,88 @@ mod rewrite_pipeline_prescreen_tests {
         // `@>` triggers JSON/array/range containment.
         assert!(needs_rewrite_pipeline("SELECT * FROM t WHERE j @> '{}'"));
         assert!(needs_rewrite_pipeline("SELECT * FROM t WHERE j <@ '{}'"));
+    }
+}
+
+#[cfg(test)]
+mod parse_cache_tests {
+    use super::{
+        parse_cache_cap_for_test, parse_cache_contains_for_test, parse_cache_resize_for_test,
+        parse_sql_cached,
+    };
+
+    // The parse cache is process-global; the eviction test resizes the
+    // shared LRU, which would race other tests if they ran in parallel.
+    // Guard with a module-local mutex.  The other two tests use SQL keys
+    // unique to their case so they're parallel-safe even without the
+    // mutex; we still take it for symmetry.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn parse_cache_returns_cached_statement_for_repeat_sql() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        // SQL string chosen to be unique to this test (no other test or
+        // production path will parse it), so the cache assertions are
+        // independent of what else happens to share the process cache.
+        let sql = "SELECT id FROM t_pcache_repeat WHERE id = 4242";
+        let first = parse_sql_cached(sql).expect("first parse must succeed");
+        let second = parse_sql_cached(sql).expect("second parse must succeed");
+
+        // Cache hit returns the same Arc instance (Arc::ptr_eq).
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "repeat parse must return the cached Arc<Statement>"
+        );
+        assert!(
+            parse_cache_contains_for_test(sql),
+            "cache must contain the parsed entry"
+        );
+    }
+
+    #[test]
+    fn parse_cache_distinct_sql_distinct_entries() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let a = "SELECT 1 AS pcache_distinct_a";
+        let b = "SELECT 2 AS pcache_distinct_b";
+        let c = "SELECT 3 AS pcache_distinct_c";
+
+        let _ = parse_sql_cached(a).unwrap();
+        let _ = parse_sql_cached(b).unwrap();
+        let _ = parse_sql_cached(c).unwrap();
+
+        assert!(parse_cache_contains_for_test(a));
+        assert!(parse_cache_contains_for_test(b));
+        assert!(parse_cache_contains_for_test(c));
+    }
+
+    #[test]
+    fn parse_cache_eviction_under_cap() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Shrink to 2; the resize helper also clears so no foreign entries
+        // contaminate the bound under test.
+        let original_cap = parse_cache_cap_for_test();
+        parse_cache_resize_for_test(2);
+
+        let a = "SELECT 100 AS pcache_evict_a";
+        let b = "SELECT 200 AS pcache_evict_b";
+        let c = "SELECT 300 AS pcache_evict_c";
+
+        let _ = parse_sql_cached(a).unwrap();
+        let _ = parse_sql_cached(b).unwrap();
+        // LRU now contains [b, a]; touch `b` so `a` becomes oldest.
+        let _ = parse_sql_cached(b).unwrap();
+        // Insert `c`; cap=2 evicts the LRU entry — `a`.
+        let _ = parse_sql_cached(c).unwrap();
+
+        assert!(parse_cache_contains_for_test(b), "b must still be cached");
+        assert!(parse_cache_contains_for_test(c), "c must be cached");
+        assert!(
+            !parse_cache_contains_for_test(a),
+            "a must be evicted when cap=2 and c is most recently inserted"
+        );
+
+        // Restore default cap for other tests.
+        parse_cache_resize_for_test(original_cap.max(1));
     }
 }
