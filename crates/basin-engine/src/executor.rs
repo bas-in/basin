@@ -151,6 +151,345 @@ async fn exec_pubsub(
     }
 }
 
+/// Conservative pre-screen for the ~40-pass string-rewrite pipeline.
+///
+/// Returns `true` if the SQL contains any token that any rewrite pass might
+/// fire on; `false` when none of the markers are present and the pipeline is
+/// guaranteed to be a no-op for this query.
+///
+/// Design contract: false-positives (returning `true` when no rewrite would
+/// fire) are free — we just spend ~80–100µs running a pipeline that produces
+/// no change. False-negatives (returning `false` when a rewrite was needed)
+/// would silently produce wrong results, so any plausible trigger must be
+/// listed here. When in doubt, add the marker.
+///
+/// The markers are derived from the rewrite chain in `run_full_rewrite_pipeline`:
+/// each rewrite pass has at least one distinguishing token it scans for; we
+/// union them all here.
+pub(crate) fn needs_rewrite_pipeline(sql: &str) -> bool {
+    // ASCII-only fast-path screen.  The byte-substring searches below are
+    // case-sensitive; for keywords we check both common cases.  All current
+    // markers are ASCII so a single pass over the bytes is sufficient.
+    let bytes = sql.as_bytes();
+
+    // ── 1. Symbol / operator markers — single byte scan, cheap ──────────────
+    //
+    // `::` — every cast (vector, uuid, citext, interval, text on vec, range,
+    //         pg array literal `{…}::int[]`, infinity timestamp).
+    // `->` — JSON arrow ops (covers `->`, `->>`, `#>`, `#>>` via spacing pass
+    //         and the json_operators rewriter).
+    // `@`  — `@>`, `<@`, `@@`, `@?` (json, range, array containment, tsvector,
+    //         jsonpath).
+    // `~`  — POSIX regex (`~`, `!~`, `~*`, `!~*`) and PG unary bitwise NOT.
+    // `?`  — JSON `?`, `?&`, `?|` (also the pgwire bind-param marker; benign
+    //         since simple-protocol point queries don't carry `?`).
+    // `&`  — array overlap `&&`, range `&&`, json `?&`.
+    // `|`  — json `?|`, json `||` concat (also `||` string concat — rewriter
+    //         is a no-op for non-jsonb operands but the scan must catch it).
+    // `#`  — PG bitwise XOR `#` (DataFusion gap), and the `#>` / `#>>` json
+    //         path operators.
+    // `B'` — bit-string literal (`B'1010'`).
+    // `(`  — function-call syntax; many passes scan for `name(` (every(,
+    //         variance(, make_interval(, json_to_record(, SUBSTRING(, EXTRACT(,
+    //         OVERLAPS, FILTER(, ANY(, ALL(, SOME(, generate_series(, …).
+    //         A trivial point-query has zero `(` so this is a safe trigger.
+    let has_symbol_marker = bytes
+        .windows(2)
+        .any(|w| matches!(w, b"::" | b"->" | b"<-" | b"<#" | b"<=" | b"B'"))
+        || bytes.iter().any(|&b| matches!(b, b'@' | b'~' | b'?' | b'&' | b'|' | b'#' | b'('));
+    if has_symbol_marker {
+        return true;
+    }
+
+    // ── 2. Schema-dot prefixes ──────────────────────────────────────────────
+    // `auth.`, `cron.`, `net.`, `pg_` — qualifying / catalog-view rewrites.
+    // Check case-insensitively via a lowercase copy (only when none of the
+    // cheap symbol triggers fired, so this is the slow path).
+    let lower = sql.to_ascii_lowercase();
+    if lower.contains("auth.")
+        || lower.contains("cron.")
+        || lower.contains("net.")
+        || lower.contains("pg_")
+    {
+        return true;
+    }
+
+    // ── 3. Keyword markers ──────────────────────────────────────────────────
+    // Words that trigger a rewrite when present at SQL-token granularity.
+    // We only fire on substring presence (cheap, false-positive-tolerant).
+    //
+    //  LATERAL                 — every lateral-join rewriter
+    //  MATERIALIZED            — `WITH cte AS [NOT] MATERIALIZED`
+    //  RECURSIVE               — `WITH RECURSIVE` column-alias injector
+    //  ONLY                    — `FROM ONLY` / `JOIN ONLY` strip (handled
+    //                            upstream of this pre-screen, but still a
+    //                            keyword we don't expect in trivial queries)
+    //  OVERLAPS                — `(s,e) OVERLAPS (s,e)`
+    //  FILTER                  — `agg(x) FILTER (WHERE …)`
+    //  SYMMETRIC               — `BETWEEN SYMMETRIC`
+    //  IGNORE                  — `IGNORE NULLS` window arg rewrite
+    //  AT TIME ZONE            — at_time_zone rewrite
+    //  SUBSTRING               — `SUBSTRING(x FROM '…regex…')`
+    //  EXTRACT                 — `EXTRACT(SECOND|EPOCH FROM …)`
+    //  ANY / ALL / SOME        — array / subquery quantifier rewrites
+    //  INFINITY                — `'infinity'::timestamp`
+    //  NEXTVAL / CURRVAL /
+    //   SETVAL                 — sequence call rewrites
+    //  JSON_AGG / JSONB_AGG    — wildcard expansion
+    //  JSON_TO_RECORD /
+    //   JSONB_TO_RECORD        — FROM-position rewrite
+    //  JSONB_ARRAY_ELEMENTS    — SRF lift
+    //  EVERY / VARIANCE /
+    //   STDDEV / VAR_SAMP /
+    //   MAKE_INTERVAL          — aggregate / interval alias rewrites
+    //  TSVECTOR / TSQUERY      — `@@` rewrite (also caught by `@` above; kept
+    //                            here for documentation symmetry)
+    //  GENERATE_SERIES         — lateral generate_series decorrelation
+    //  RANGE                   — substring matches int4range / numrange / etc
+    const KEYWORD_MARKERS: &[&str] = &[
+        "lateral",
+        "materialized",
+        "recursive",
+        " only ",
+        "only\n",
+        "only\t",
+        "overlaps",
+        "filter",
+        "symmetric",
+        "ignore",
+        "at time zone",
+        "substring",
+        "extract",
+        " any",
+        " all",
+        " some",
+        "infinity",
+        "nextval",
+        "currval",
+        "setval",
+        "json_agg",
+        "jsonb_agg",
+        "json_to_record",
+        "jsonb_to_record",
+        "jsonb_array_elements",
+        "every",
+        "variance",
+        "stddev",
+        "var_samp",
+        "make_interval",
+        "tsvector",
+        "tsquery",
+        "generate_series",
+        "range",
+    ];
+    KEYWORD_MARKERS.iter().any(|m| lower.contains(m))
+}
+
+/// Runs the full ~40-pass string-rewrite pipeline.  Only invoked when
+/// `needs_rewrite_pipeline` says at least one pass might fire.
+async fn run_full_rewrite_pipeline(sess: &ProjectSession, sql: &str) -> Result<String> {
+    // Rewrite `auth.uid()` / `auth.role()` / `auth.jwt()` to their
+    // underscore-namespaced UDF equivalents before handing SQL to sqlparser.
+    // DataFusion's SQL parser does not support schema-qualified function names
+    // in call position; this rewrite is safe (identifier-boundary checked)
+    // and always runs, even when auth is disabled — the UDFs simply return
+    // NULL/`'anon'` for unauthenticated sessions.
+    let sql = crate::udf::rewrite_auth_schema_functions(sql);
+    // Phase 5.8.A: rewrite cron.schedule/unschedule and net.http_get/post.
+    let sql = crate::cron_glue::rewrite_cron_schema_functions(&sql);
+    let sql = crate::net_glue::rewrite_net_schema_functions(&sql);
+    // Phase 5.23.D: qualify unqualified pg_catalog system view names so that
+    // DataFusion resolves them in `pg_catalog` rather than `public`. E.g.
+    // `FROM pg_locks` → `FROM pg_catalog.pg_locks`.
+    let sql = crate::pg_operators::rewrite_unqualified_pg_catalog_views(&sql);
+    let sql = sql.as_str();
+
+    // Translate the pg_vector operator forms (`<->`, `<#>`, `<=>`) into the
+    // matching UDF calls before handing the SQL to sqlparser. See
+    // `udf::rewrite_vector_operators` for the strategy and its limits.
+    // Lower `tsvector @@ tsquery` to the `ts_match(...)` UDF before sqlparser
+    // sees the SQL — sqlparser doesn't have AtAt in its operator table.
+    let rewritten = crate::pg_ast::rewrite_tsvector_at_at(sql);
+    // Phase 5.26.C: strip `::vector` / `::vector(N)` casts BEFORE the operator
+    // rewriter so that `'[1,0,0]'::vector <-> '[0,1,0]'::vector` becomes
+    // `'[1,0,0]' <-> '[0,1,0]'` before the operator is expanded to l2_distance().
+    // Also strip `::text` on vector columns before the operator rewrites see them.
+    let rewritten = crate::pg_operators::rewrite_vector_cast(&rewritten);
+    // Phase 5.26.B: rewrite `col::text` → `vector_to_text(col)` before operators.
+    let rewritten = crate::pg_operators::rewrite_vector_col_text_cast(&rewritten);
+    // Expand `json_agg(<alias>.*)` / `jsonb_agg(<alias>.*)` to the explicit
+    // `jsonb_build_object(...)` form. Prisma's nested-read shape (correlated
+    // subquery returning `json_agg(o.*)`) hits a DataFusion physical-planner
+    // gap: it rejects `Wildcard { qualifier: Some(...) }` inside scalar
+    // aggregates with XX000. The expansion is semantically identical and
+    // only uses unqualified column refs + the wired `jsonb_build_object` UDF.
+    // The catalog lookup builds the alias→columns map; aliases that don't
+    // resolve to a real table fall through unchanged (false-positive guard).
+    let rewritten = rewrite_json_agg_qualified_wildcard_with_catalog(
+        &rewritten,
+        sess.engine.config().catalog.as_ref(),
+        &sess.project,
+    )
+    .await;
+    let rewritten = crate::udf::rewrite_vector_operators(&rewritten);
+    // Normalise whitespace around the PG JSON path operators (`->`, `->>`,
+    // `#>`, `#>>`) before the JSON-op rewriter sees them.  Without this pass,
+    // a bare-column form like `body->>'k'` (no spaces, no `::jsonb` cast)
+    // fails the `rewrite_binary_op_to_fn` `prev_ok` guard and is left for
+    // sqlparser, which doesn't know `->>` and errors out.  Pre-spacing closes
+    // that gap without relaxing the boundary guard (which would risk
+    // mis-matching vector ops like `<->`).
+    let rewritten = crate::pg_operators::rewrite_jsonb_arrow_op_spacing(&rewritten);
+    // Rewrite JSON/JSONB infix operators (`->`, `->>`, `#>`, `#>>`, `?`,
+    // `?&`, `?|`, `<@`, `@>` for JSON, `||` for JSON concat, `@?` for
+    // jsonpath exists) to UDF calls that DataFusion can evaluate.
+    let rewritten = crate::udf::rewrite_json_operators(&rewritten);
+    // ADR 0027 Phase 4: rewrite `json_get_text(col, 'key')` → shadow column
+    // for any promoted JSONB paths on tables referenced in the query.
+    let rewritten = rewrite_promoted_cols_for_query(
+        &rewritten,
+        sess.engine.config().catalog.as_ref(),
+        &sess.project,
+    )
+    .await;
+    // Rewrite `json_to_record(J) AS t(coldefs)` / `jsonb_to_record(J) AS t(coldefs)`
+    // → `SELECT * FROM json_to_recordset([J]) AS t(coldefs)` so that sqlparser
+    // does not choke on the typed coldef list in scalar-SELECT / FROM position.
+    let rewritten = crate::pg_operators::rewrite_json_to_record(&rewritten);
+    // Rewrite a FROM-less `SELECT jsonb_array_elements('[…]'::jsonb)` (and the
+    // other JSON/JSONB set-returning functions) into
+    // `SELECT * FROM jsonb_array_elements('[…]'::jsonb)` so the row-expanding
+    // table function (UDTF) is used instead of the single-row scalar stub.
+    // PostgreSQL expands SRFs in the SELECT list to a row set; this restores
+    // that behaviour for the common ORM array-/object-expansion idiom.
+    let rewritten = crate::pg_operators::rewrite_jsonb_srf_scalar_select(&rewritten);
+    // Rewrite PostgreSQL POSIX regex operators (`~`, `!~`, `~*`, `!~*`) to
+    // `regexp_like(…)` calls DataFusion accepts; expand `BETWEEN SYMMETRIC`;
+    // rewrite array containment / overlap operators (`@>`, `<@`, `&&`) for
+    // array-typed operands. See `pg_operators` for the full operator table.
+    let rewritten = crate::pg_operators::rewrite_posix_regex_operators(&rewritten);
+    // JSONPath @? / @@ operator rewrites → jsonb_path_exists / jsonb_path_match.
+    let rewritten = crate::jsonb_path_udf::rewrite_jsonpath_operators(&rewritten);
+    let rewritten = crate::window_extras::rewrite_ignore_nulls_in_args(&rewritten);
+    let rewritten = crate::pg_operators::rewrite_between_symmetric(&rewritten);
+    // Rewrite `'{1,2,3}'::int[]` curly-brace array literal casts to
+    // `make_array(1,2,3)` before the array-operator pass sees them.
+    let rewritten = crate::pg_operators::rewrite_pg_array_literal_casts(&rewritten);
+    let rewritten = crate::pg_operators::rewrite_array_operators(&rewritten);
+    // Rewrite `B'1010'` (bit-string literals) to plain string literals `'1010'`
+    // before sqlparser/DataFusion sees them. DataFusion 53 does not handle
+    // sqlparser's `SingleQuotedByteStringLiteral` value variant.
+    let rewritten = crate::pg_operators::rewrite_bit_string_literal(&rewritten);
+    // Rewrite `'...'::UUID` to `'...'::VARCHAR` — DataFusion 53 does not
+    // implement the UUID SQL type in CAST expressions.
+    let rewritten = crate::pg_operators::rewrite_uuid_cast(&rewritten);
+    // Rewrite `'...'::citext` to `'...'::TEXT` — citext is stored as plain
+    // Utf8 at the Arrow level; the cast is a no-op for the evaluator.
+    let rewritten = crate::pg_operators::rewrite_citext_cast(&rewritten);
+    // Rewrite `'HH:MM:SS'::INTERVAL` to `'N seconds'::INTERVAL` — Arrow's
+    // interval parser does not accept the PG HH:MM:SS shorthand form.
+    let rewritten = crate::pg_operators::rewrite_interval_hms_cast(&rewritten);
+    // Rewrite PG bitwise operators that DataFusion's GenericDialect doesn't
+    // understand: `A # B` (XOR) → `A ^ B`; `~expr` (unary NOT) →
+    // `(-1 ^ (expr))`.
+    let rewritten = crate::pg_operators::rewrite_pg_bitwise_operators(&rewritten);
+    // Rewrite `expr = ANY(ARRAY[...])` / `= SOME(ARRAY[...])` → `expr IN (...)`.
+    // DataFusion cannot plan the ARRAY-literal form of ANY/SOME; `IN` is the
+    // exact PG equivalent for equality quantification over an inline array.
+    // Also handles `<> ANY(ARRAY[...])` → `NOT IN (...)`.
+    // This must run BEFORE the subquery ANY rewriter so the subquery rewriter
+    // only sees subquery forms.
+    let rewritten = crate::pg_operators::rewrite_any_array(&rewritten);
+    // Rewrite `expr OP ALL(ARRAY[...])` to a VALUES subquery so the existing
+    // all-subquery rewriter can reduce it to a scalar aggregate comparison.
+    let rewritten = crate::pg_operators::rewrite_all_array(&rewritten);
+    // Rewrite `= ANY (subquery)` / `= SOME (subquery)` → `IN (subquery)`.
+    // DataFusion's ANY subquery planner has type-coercion issues; the IN form
+    // is equivalent for equality comparisons and works reliably.
+    let rewritten = crate::pg_operators::rewrite_any_some_subquery(&rewritten);
+    // Rewrite `LATERAL unnest(...)` → `unnest(...)` so sqlparser sees
+    // TableFactor::UNNEST (handled by DataFusion) instead of
+    // TableFactor::Function { lateral: true } (not a registered table fn).
+    let rewritten = crate::pg_operators::rewrite_lateral_unnest(&rewritten);
+    // Rewrite uncorrelated `LATERAL (subquery)` → `(subquery)`.  When the
+    // subquery body has zero references to outer FROM columns, LATERAL is
+    // semantically identical to a plain join.  Stripping it lets DataFusion
+    // plan it without needing the (unimplemented) correlated-lateral physical
+    // operator.  Correlated LATERAL is left untouched (DataFusion upstream
+    // limitation: physical plan does not support OuterReferenceColumn paths).
+    let rewritten = crate::pg_operators::rewrite_lateral_uncorrelated(&rewritten);
+    // Rewrite the common ORM nested-read pattern:
+    //   `LEFT JOIN LATERAL (SELECT agg(...) FROM child WHERE child.fk=outer.pk) sub ON true`
+    // → `LEFT JOIN (SELECT child.fk, agg(...) FROM child GROUP BY child.fk) sub ON sub.fk=outer.pk`
+    // Only fires when ALL projection items are aggregate functions and there is
+    // exactly ONE correlation predicate.  ORDER BY / LIMIT inside the subquery,
+    // non-aggregate projections, or multiple correlation predicates cause the
+    // rewriter to defer (leaving the query to fail with the upstream error).
+    let rewritten = crate::pg_operators::rewrite_lateral_nested_agg(&rewritten);
+    // Rewrite correlated non-aggregate LATERAL subqueries into ordinary JOINs.
+    let rewritten = crate::pg_operators::rewrite_lateral_correlated_row(&rewritten);
+    // Rewrite correlated LATERAL bodies with ORDER BY + LIMIT into window-function joins.
+    let rewritten = crate::pg_operators::rewrite_lateral_order_limit(&rewritten);
+    // Decorrelate `JOIN LATERAL generate_series(<lo>, <tbl>.<col>)` into a bounded
+    // recursive-CTE JOIN.
+    let rewritten = crate::pg_operators::rewrite_lateral_generate_series(&rewritten);
+    // Rewrite `(s1, e1) OVERLAPS (s2, e2)` → `overlaps(s1, e1, s2, e2)`.
+    let rewritten = crate::pg_operators::rewrite_overlaps(&rewritten);
+    // Rewrite `agg(x) FILTER (WHERE cond)` → `agg(CASE WHEN cond THEN x END)`.
+    let rewritten = crate::pg_operators::rewrite_aggregate_filter(&rewritten);
+    // Strip `[NOT] MATERIALIZED` hint from `WITH cte AS [NOT] MATERIALIZED (…)`.
+    let rewritten = crate::pg_operators::rewrite_cte_materialized(&rewritten);
+    // Inject explicit `AS col` aliases into the base case of recursive CTEs.
+    let rewritten = crate::pg_operators::rewrite_recursive_cte_column_aliases(&rewritten);
+    // Rewrite `'[lo,hi)'::int4range = '[lo,hi)'::int4range` to range_eq.
+    let rewritten = crate::range_udf::rewrite_range_equality(&rewritten);
+    // Translate PG range infix operators (`@>`, `<@`, `&&`, `<<`, `>>`, `-|-`)
+    // into UDF calls.
+    let rewritten = crate::range_udf::rewrite_range_operators(&rewritten);
+    // Rewrite `'...'::int4range` / `'...'::daterange` etc. to just `'...'`.
+    let rewritten = crate::range_udf::rewrite_range_casts(&rewritten);
+    // Rewrite `SUBSTRING(<expr> FROM '<regex>')` into `substring_regex(...)`.
+    let rewritten = crate::regex_udf::rewrite_substring_regex(&rewritten);
+    // Route `EXTRACT(SECOND FROM <expr>)` to the Basin UDF.
+    let rewritten = crate::udf::rewrite_extract_second(&rewritten);
+    // Rewrite `expr AT TIME ZONE 'tz'` to `at_time_zone(expr, 'tz')`.
+    let rewritten = crate::interval_tz_udf::rewrite_at_time_zone(&rewritten);
+    // Rewrite `EXTRACT(EPOCH FROM interval_expr)` to the interval-specific UDF.
+    let rewritten = crate::interval_tz_udf::rewrite_extract_epoch_interval(&rewritten);
+    // Rewrite `make_interval(years => 1, days => 30)` to the positional form.
+    let rewritten = crate::pg_scalar_aliases::rewrite_make_interval_named_args(&rewritten);
+    // Rewrite `every(...)` → `bool_and(...) AS every`.
+    let rewritten = crate::pg_scalar_aliases::rewrite_every_to_bool_and(&rewritten);
+    // PG aggregate name aliases: `variance(x)` → `var(x)`.
+    let rewritten = crate::udf::rewrite_pg_agg_aliases(&rewritten);
+    // Add explicit AS aliases to known aliased aggregates.
+    let rewritten = crate::pg_scalar_aliases::rewrite_agg_unique_aliases(&rewritten);
+    // Rewrite `'infinity'::timestamp` / `'-infinity'::timestamp` to UDF form.
+    let rewritten = crate::datetime_extras::rewrite_infinity_timestamp(&rewritten);
+    // User-defined `LANGUAGE sql` function inlining.
+    let inlined = crate::sql_functions::rewrite_sql_inlining_functions(
+        &sess.engine.config().catalog,
+        &sess.project,
+        &rewritten,
+    )
+    .await?;
+    // Rewrite sequence calls (`nextval('seq')` / `currval('seq')` / `setval`).
+    let seq_ctx = crate::seq_udf::SequenceContext {
+        catalog: &sess.engine.config().catalog,
+        project: sess.project,
+        session_cache: &sess.state.sequence_cache,
+    };
+    let seq_rewritten = crate::seq_udf::rewrite_sequence_calls(&inlined, &seq_ctx).await?;
+    // Enum-column ordering rewrite.
+    let enum_rewritten = crate::enum_ordinal::rewrite_enum_ordering(
+        &sess.engine.config().catalog,
+        &sess.project,
+        &seq_rewritten,
+    )
+    .await?;
+    Ok(enum_rewritten)
+}
+
 pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResult> {
     // Phase 5.28.C: touch last-activity timestamp so the idle-in-txn reaper
     // sees that this session is still making progress. Done unconditionally at
@@ -1184,275 +1523,21 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
         }
     }
 
-    // Rewrite `auth.uid()` / `auth.role()` / `auth.jwt()` to their
-    // underscore-namespaced UDF equivalents before handing SQL to sqlparser.
-    // DataFusion's SQL parser does not support schema-qualified function names
-    // in call position; this rewrite is safe (identifier-boundary checked)
-    // and always runs, even when auth is disabled — the UDFs simply return
-    // NULL/`'anon'` for unauthenticated sessions.
-    let sql = crate::udf::rewrite_auth_schema_functions(sql);
-    // Phase 5.8.A: rewrite cron.schedule/unschedule and net.http_get/post.
-    let sql = crate::cron_glue::rewrite_cron_schema_functions(&sql);
-    let sql = crate::net_glue::rewrite_net_schema_functions(&sql);
-    // Phase 5.23.D: qualify unqualified pg_catalog system view names so that
-    // DataFusion resolves them in `pg_catalog` rather than `public`. E.g.
-    // `FROM pg_locks` → `FROM pg_catalog.pg_locks`.
-    let sql = crate::pg_operators::rewrite_unqualified_pg_catalog_views(&sql);
-    let sql = sql.as_str();
-
-    // Translate the pg_vector operator forms (`<->`, `<#>`, `<=>`) into the
-    // matching UDF calls before handing the SQL to sqlparser. See
-    // `udf::rewrite_vector_operators` for the strategy and its limits.
-    // Lower `tsvector @@ tsquery` to the `ts_match(...)` UDF before sqlparser
-    // sees the SQL — sqlparser doesn't have AtAt in its operator table.
-    let rewritten = crate::pg_ast::rewrite_tsvector_at_at(sql);
-    // Phase 5.26.C: strip `::vector` / `::vector(N)` casts BEFORE the operator
-    // rewriter so that `'[1,0,0]'::vector <-> '[0,1,0]'::vector` becomes
-    // `'[1,0,0]' <-> '[0,1,0]'` before the operator is expanded to l2_distance().
-    // Also strip `::text` on vector columns before the operator rewrites see them.
-    let rewritten = crate::pg_operators::rewrite_vector_cast(&rewritten);
-    // Phase 5.26.B: rewrite `col::text` → `vector_to_text(col)` before operators.
-    let rewritten = crate::pg_operators::rewrite_vector_col_text_cast(&rewritten);
-    // Expand `json_agg(<alias>.*)` / `jsonb_agg(<alias>.*)` to the explicit
-    // `jsonb_build_object(...)` form. Prisma's nested-read shape (correlated
-    // subquery returning `json_agg(o.*)`) hits a DataFusion physical-planner
-    // gap: it rejects `Wildcard { qualifier: Some(...) }` inside scalar
-    // aggregates with XX000. The expansion is semantically identical and
-    // only uses unqualified column refs + the wired `jsonb_build_object` UDF.
-    // The catalog lookup builds the alias→columns map; aliases that don't
-    // resolve to a real table fall through unchanged (false-positive guard).
-    let rewritten = rewrite_json_agg_qualified_wildcard_with_catalog(
-        &rewritten,
-        sess.engine.config().catalog.as_ref(),
-        &sess.project,
-    )
-    .await;
-    let rewritten = crate::udf::rewrite_vector_operators(&rewritten);
-    // Normalise whitespace around the PG JSON path operators (`->`, `->>`,
-    // `#>`, `#>>`) before the JSON-op rewriter sees them.  Without this pass,
-    // a bare-column form like `body->>'k'` (no spaces, no `::jsonb` cast)
-    // fails the `rewrite_binary_op_to_fn` `prev_ok` guard and is left for
-    // sqlparser, which doesn't know `->>` and errors out.  Pre-spacing closes
-    // that gap without relaxing the boundary guard (which would risk
-    // mis-matching vector ops like `<->`).
-    let rewritten = crate::pg_operators::rewrite_jsonb_arrow_op_spacing(&rewritten);
-    // Rewrite JSON/JSONB infix operators (`->`, `->>`, `#>`, `#>>`, `?`,
-    // `?&`, `?|`, `<@`, `@>` for JSON, `||` for JSON concat, `@?` for
-    // jsonpath exists) to UDF calls that DataFusion can evaluate.
-    let rewritten = crate::udf::rewrite_json_operators(&rewritten);
-    // ADR 0027 Phase 4: rewrite `json_get_text(col, 'key')` → shadow column
-    // for any promoted JSONB paths on tables referenced in the query.
-    let rewritten = rewrite_promoted_cols_for_query(
-        &rewritten,
-        sess.engine.config().catalog.as_ref(),
-        &sess.project,
-    )
-    .await;
-    // Rewrite `json_to_record(J) AS t(coldefs)` / `jsonb_to_record(J) AS t(coldefs)`
-    // → `SELECT * FROM json_to_recordset([J]) AS t(coldefs)` so that sqlparser
-    // does not choke on the typed coldef list in scalar-SELECT / FROM position.
-    let rewritten = crate::pg_operators::rewrite_json_to_record(&rewritten);
-    // Rewrite a FROM-less `SELECT jsonb_array_elements('[…]'::jsonb)` (and the
-    // other JSON/JSONB set-returning functions) into
-    // `SELECT * FROM jsonb_array_elements('[…]'::jsonb)` so the row-expanding
-    // table function (UDTF) is used instead of the single-row scalar stub.
-    // PostgreSQL expands SRFs in the SELECT list to a row set; this restores
-    // that behaviour for the common ORM array-/object-expansion idiom.
-    let rewritten = crate::pg_operators::rewrite_jsonb_srf_scalar_select(&rewritten);
-    // Rewrite PostgreSQL POSIX regex operators (`~`, `!~`, `~*`, `!~*`) to
-    // `regexp_like(…)` calls DataFusion accepts; expand `BETWEEN SYMMETRIC`;
-    // rewrite array containment / overlap operators (`@>`, `<@`, `&&`) for
-    // array-typed operands. See `pg_operators` for the full operator table.
-    let rewritten = crate::pg_operators::rewrite_posix_regex_operators(&rewritten);
-    // JSONPath @? / @@ operator rewrites → jsonb_path_exists / jsonb_path_match.
-    let rewritten = crate::jsonb_path_udf::rewrite_jsonpath_operators(&rewritten);
-    let rewritten = crate::window_extras::rewrite_ignore_nulls_in_args(&rewritten);
-    let rewritten = crate::pg_operators::rewrite_between_symmetric(&rewritten);
-    // Rewrite `'{1,2,3}'::int[]` curly-brace array literal casts to
-    // `make_array(1,2,3)` before the array-operator pass sees them.
-    let rewritten = crate::pg_operators::rewrite_pg_array_literal_casts(&rewritten);
-    let rewritten = crate::pg_operators::rewrite_array_operators(&rewritten);
-    // Rewrite `B'1010'` (bit-string literals) to plain string literals `'1010'`
-    // before sqlparser/DataFusion sees them. DataFusion 53 does not handle
-    // sqlparser's `SingleQuotedByteStringLiteral` value variant.
-    let rewritten = crate::pg_operators::rewrite_bit_string_literal(&rewritten);
-    // Rewrite `'...'::UUID` to `'...'::VARCHAR` — DataFusion 53 does not
-    // implement the UUID SQL type in CAST expressions.
-    let rewritten = crate::pg_operators::rewrite_uuid_cast(&rewritten);
-    // Rewrite `'...'::citext` to `'...'::TEXT` — citext is stored as plain
-    // Utf8 at the Arrow level; the cast is a no-op for the evaluator.
-    let rewritten = crate::pg_operators::rewrite_citext_cast(&rewritten);
-    // Rewrite `'HH:MM:SS'::INTERVAL` to `'N seconds'::INTERVAL` — Arrow's
-    // interval parser does not accept the PG HH:MM:SS shorthand form.
-    let rewritten = crate::pg_operators::rewrite_interval_hms_cast(&rewritten);
-    // Rewrite PG bitwise operators that DataFusion's GenericDialect doesn't
-    // understand: `A # B` (XOR) → `A ^ B`; `~expr` (unary NOT) →
-    // `(-1 ^ (expr))`.
-    let rewritten = crate::pg_operators::rewrite_pg_bitwise_operators(&rewritten);
-    // Rewrite `expr = ANY(ARRAY[...])` / `= SOME(ARRAY[...])` → `expr IN (...)`.
-    // DataFusion cannot plan the ARRAY-literal form of ANY/SOME; `IN` is the
-    // exact PG equivalent for equality quantification over an inline array.
-    // Also handles `<> ANY(ARRAY[...])` → `NOT IN (...)`.
-    // This must run BEFORE the subquery ANY rewriter so the subquery rewriter
-    // only sees subquery forms.
-    let rewritten = crate::pg_operators::rewrite_any_array(&rewritten);
-    // Rewrite `expr OP ALL(ARRAY[...])` to a VALUES subquery so the existing
-    // all-subquery rewriter can reduce it to a scalar aggregate comparison.
-    let rewritten = crate::pg_operators::rewrite_all_array(&rewritten);
-    // Rewrite `= ANY (subquery)` / `= SOME (subquery)` → `IN (subquery)`.
-    // DataFusion's ANY subquery planner has type-coercion issues; the IN form
-    // is equivalent for equality comparisons and works reliably.
-    let rewritten = crate::pg_operators::rewrite_any_some_subquery(&rewritten);
-    // Rewrite `LATERAL unnest(...)` → `unnest(...)` so sqlparser sees
-    // TableFactor::UNNEST (handled by DataFusion) instead of
-    // TableFactor::Function { lateral: true } (not a registered table fn).
-    let rewritten = crate::pg_operators::rewrite_lateral_unnest(&rewritten);
-    // Rewrite uncorrelated `LATERAL (subquery)` → `(subquery)`.  When the
-    // subquery body has zero references to outer FROM columns, LATERAL is
-    // semantically identical to a plain join.  Stripping it lets DataFusion
-    // plan it without needing the (unimplemented) correlated-lateral physical
-    // operator.  Correlated LATERAL is left untouched (DataFusion upstream
-    // limitation: physical plan does not support OuterReferenceColumn paths).
-    let rewritten = crate::pg_operators::rewrite_lateral_uncorrelated(&rewritten);
-    // Rewrite the common ORM nested-read pattern:
-    //   `LEFT JOIN LATERAL (SELECT agg(...) FROM child WHERE child.fk=outer.pk) sub ON true`
-    // → `LEFT JOIN (SELECT child.fk, agg(...) FROM child GROUP BY child.fk) sub ON sub.fk=outer.pk`
-    // Only fires when ALL projection items are aggregate functions and there is
-    // exactly ONE correlation predicate.  ORDER BY / LIMIT inside the subquery,
-    // non-aggregate projections, or multiple correlation predicates cause the
-    // rewriter to defer (leaving the query to fail with the upstream error).
-    let rewritten = crate::pg_operators::rewrite_lateral_nested_agg(&rewritten);
-    // Rewrite correlated non-aggregate LATERAL subqueries into ordinary JOINs.
-    //   `FROM t, LATERAL (SELECT col FROM u WHERE u.col = t.col) sub`
-    //     → `FROM t INNER JOIN (SELECT col FROM u) sub ON sub.col = t.col`
-    //   `LEFT JOIN LATERAL (SELECT col FROM u WHERE u.col = t.col) sub ON true`
-    //     → `LEFT JOIN (SELECT col FROM u) sub ON sub.col = t.col`
-    //   `JOIN LATERAL (SELECT expr AS a FROM u WHERE u.col = t.col) sub ON true`
-    //     → `INNER JOIN (SELECT u.col, expr AS a FROM u) sub ON sub.col = t.col`
-    // Only fires for non-aggregate, single-predicate, no-ORDER-BY/LIMIT bodies.
-    let rewritten = crate::pg_operators::rewrite_lateral_correlated_row(&rewritten);
-    // Rewrite correlated LATERAL bodies with ORDER BY + LIMIT into window-function
-    // joins.  `LEFT JOIN LATERAL (SELECT col FROM u WHERE u.fk = t.pk ORDER BY col
-    // LIMIT n) sub ON true` → `LEFT JOIN (SELECT col, u.fk, ROW_NUMBER() OVER
-    // (PARTITION BY u.fk ORDER BY col) AS __basin_rn FROM u) sub ON
-    // sub.fk = t.pk AND sub.__basin_rn <= n`.  Fires after the no-ORDER-BY/LIMIT
-    // row-rewriter so both paths get a chance; only fires when ORDER BY + LIMIT are
-    // present at depth-0 in the body and all other guards pass.
-    let rewritten = crate::pg_operators::rewrite_lateral_order_limit(&rewritten);
-    // Decorrelate `[CROSS] JOIN LATERAL generate_series(<lo>, <tbl>.<col>)
-    // <alias>` (and the comma form) into a bounded recursive-CTE JOIN. The
-    // built-in `generate_series` table function rejects non-literal args
-    // (correlated column refs AND scalar subqueries alike), so the textbook
-    // `generate_series(1, (SELECT max(t.id) FROM t))` rewrite is NOT viable on
-    // DataFusion 53 — a recursive series bounded by the table max plus a
-    // per-row range predicate reproduces exact PG semantics. Must run BEFORE
-    // the recursive-CTE column-alias rewriter (below) so the emitted
-    // `WITH RECURSIVE name(value) AS (SELECT …)` base case is normalised.
-    // No-op unless the 2nd arg is a correlated `tbl.col`; the constant/constant
-    // `generate_series(1, 3)` form is left untouched (already works).
-    let rewritten = crate::pg_operators::rewrite_lateral_generate_series(&rewritten);
-    // Rewrite `(s1, e1) OVERLAPS (s2, e2)` → `overlaps(s1, e1, s2, e2)`.
-    let rewritten = crate::pg_operators::rewrite_overlaps(&rewritten);
-    // Rewrite `agg(x) FILTER (WHERE cond)` → `agg(CASE WHEN cond THEN x END)`.
-    let rewritten = crate::pg_operators::rewrite_aggregate_filter(&rewritten);
-    // Strip `[NOT] MATERIALIZED` hint from `WITH cte AS [NOT] MATERIALIZED (…)`.
-    let rewritten = crate::pg_operators::rewrite_cte_materialized(&rewritten);
-    // Inject explicit `AS col` aliases into the base case of
-    // `WITH RECURSIVE cte(col1, col2) AS (SELECT expr1, expr2 UNION ALL ...)`.
-    // DataFusion builds the working-table schema from the static term's schema
-    // before applying the CTE column list; unnamed literals (e.g. `SELECT 1`)
-    // get auto-names like `"Int64(1)"` which break the recursive term's
-    // field references.  Adding `AS col` in the base case fixes the schema.
-    let rewritten = crate::pg_operators::rewrite_recursive_cte_column_aliases(&rewritten);
-    // Rewrite `'[lo,hi)'::int4range = '[lo,hi)'::int4range` to
-    // `range_eq('...', '...', 'int4range')` BEFORE the generic operator
-    // rewriter and BEFORE cast-stripping, so the subtype is captured.
-    let rewritten = crate::range_udf::rewrite_range_equality(&rewritten);
-    // Translate PG range infix operators (`@>`, `<@`, `&&`, `<<`, `>>`,
-    // `-|-`) into UDF calls. Must run before sqlparser sees the SQL because
-    // sqlparser's PostgreSqlDialect does not model these operators.
-    // The rewriter is type-heuristic: `@>` / `<@` are only rewritten when
-    // at least one operand textually starts with a range constructor call
-    // (int4range, numrange, …) so future JSONB `@>` rewrites won't collide.
-    let rewritten = crate::range_udf::rewrite_range_operators(&rewritten);
-    // Rewrite `'...'::int4range` / `'...'::daterange` etc. to just `'...'`
-    // because Basin stores range values as plain Utf8; the cast suffix confuses
-    // DataFusion's planner which doesn't know these custom types.
-    let rewritten = crate::range_udf::rewrite_range_casts(&rewritten);
-    // Rewrite `SUBSTRING(<expr> FROM '<regex>')` (single-quoted-string FROM
-    // argument, not numeric) into `substring_regex(<expr>, '<regex>')` so the
-    // POSIX-regex form (PG-style) routes to the regex UDF. Numeric `SUBSTRING
-    // FROM int FOR int` continues to use DataFusion's built-in.
-    let rewritten = crate::regex_udf::rewrite_substring_regex(&rewritten);
-    // Route `EXTRACT(SECOND FROM <expr>)` to the Basin UDF that returns
-    // Float64 with sub-second precision (PG's `extract(second ...)` shape).
-    // Other EXTRACT fields fall through to DataFusion's `date_part`.
-    let rewritten = crate::udf::rewrite_extract_second(&rewritten);
-    // Rewrite `expr AT TIME ZONE 'tz'` to `at_time_zone(expr, 'tz')` so
-    // DataFusion's sqlparser sees a regular function call instead of the
-    // AT TIME ZONE infix operator, which it may not handle for all types.
-    let rewritten = crate::interval_tz_udf::rewrite_at_time_zone(&rewritten);
-    // Rewrite `EXTRACT(EPOCH FROM interval_expr)` to
-    // `extract_epoch_from_interval(interval_expr)` — DataFusion's built-in
-    // `EXTRACT(EPOCH FROM x)` handles timestamps but not interval values.
-    let rewritten = crate::interval_tz_udf::rewrite_extract_epoch_interval(&rewritten);
-    // Rewrite `make_interval(years => 1, days => 30)` (PG named-arg form) to
-    // the positional form `make_interval(1, 0, 0, 30, 0, 0, 0)` so DataFusion's
-    // planner accepts it (named arguments are not supported by the UDF machinery).
-    let rewritten = crate::pg_scalar_aliases::rewrite_make_interval_named_args(&rewritten);
-    // Rewrite `every(...)` → `bool_and(...) AS every` — PG alias for the same
-    // aggregate. The AS alias preserves a distinct output column name so that
-    // DataFusion doesn't see two expressions both resolving to `bool_and`.
-    let rewritten = crate::pg_scalar_aliases::rewrite_every_to_bool_and(&rewritten);
-    // Rewrite PG aggregate name aliases that DataFusion exposes under a
-    // different name: `variance(x)` → `var(x)`.
-    let rewritten = crate::udf::rewrite_pg_agg_aliases(&rewritten);
-    // Add explicit AS aliases to known aliased aggregates that would otherwise
-    // produce duplicate column names when DataFusion normalises them to the
-    // primary UDAF name: `stddev_samp(x)` → `stddev_samp(x) AS stddev_samp`;
-    // `var_samp(x)` → `var_samp(x) AS var_samp`.
-    let rewritten = crate::pg_scalar_aliases::rewrite_agg_unique_aliases(&rewritten);
-    // Rewrite `'infinity'::timestamp` / `'-infinity'::timestamp` to the
-    // `cast_infinity_timestamp(...)` UDF before sqlparser sees the SQL.
-    let rewritten = crate::datetime_extras::rewrite_infinity_timestamp(&rewritten);
-    // User-defined `LANGUAGE sql` function inlining. The rewriter is a
-    // no-op for projects with no registered functions and for statements
-    // that contain no function calls at all (the cheap pre-gate runs
-    // before any catalog hop). Anything else gets rewritten so DataFusion
-    // sees the body inlined into the call site.
-    let inlined = crate::sql_functions::rewrite_sql_inlining_functions(
-        &sess.engine.config().catalog,
-        &sess.project,
-        &rewritten,
-    )
-    .await?;
-    // Rewrite sequence calls (`nextval('seq')` / `currval('seq')` /
-    // `setval('seq', n[, advance])`) to BIGINT literals before sqlparser
-    // sees the SQL. Each call dispatches to the catalog (advancing
-    // sequence state for `nextval` / `setval`); the per-session
-    // `currval` cache is updated as part of the dispatch. No-op for
-    // SQL with no sequence call sites.
-    let seq_ctx = crate::seq_udf::SequenceContext {
-        catalog: &sess.engine.config().catalog,
-        project: sess.project,
-        session_cache: &sess.state.sequence_cache,
+    // Perf: skip the entire 40-pass string-rewrite pipeline when the SQL
+    // contains no marker tokens that any pass could fire on.  For a trivial
+    // point-query like `SELECT id FROM events WHERE id = 5000` the chain
+    // costs ~80–100µs of per-statement overhead and produces zero changes.
+    // `needs_rewrite_pipeline` is conservative: false-positives (running
+    // the pipeline when no rewrite would fire) are free; false-negatives
+    // (skipping when a rewrite was needed) would silently produce wrong
+    // results, so any marker token forces the full chain.
+    let rewrite_pipeline_owned: String;
+    let sql: &str = if needs_rewrite_pipeline(sql) {
+        rewrite_pipeline_owned = run_full_rewrite_pipeline(sess, sql).await?;
+        rewrite_pipeline_owned.as_str()
+    } else {
+        sql
     };
-    let seq_rewritten = crate::seq_udf::rewrite_sequence_calls(&inlined, &seq_ctx).await?;
-    // Phase 5.11.K2 follow-up: enum columns referenced in ORDER BY or
-    // ordering comparisons (`<`, `>`, `<=`, `>=`, BETWEEN) need to be
-    // sorted/compared by declaration-order ordinal, not by Arrow's
-    // lexicographic Utf8 compare. We swap the column reference for a
-    // `CASE WHEN col = 'lbl0' THEN 0 ... END` expression so the planner
-    // sees integer ordinals at sort/range time. Best-effort: queries
-    // with joins / derived tables / ambiguous column refs silently
-    // skip the rewrite and fall back to label-string compare.
-    let enum_rewritten = crate::enum_ordinal::rewrite_enum_ordering(
-        &sess.engine.config().catalog,
-        &sess.project,
-        &seq_rewritten,
-    )
-    .await?;
-    let sql = enum_rewritten.as_str();
 
     // Phase 5.13.C — the noop-accept + explicit-reject gates above (early
     // in the hot path, before any string-rewrite pipeline) already dispatch
@@ -10031,5 +10116,41 @@ mod lock_timeout_guc_tests {
             Some(Duration::from_millis(750)),
             "advisory lock manager must see the updated lock_timeout"
         );
+    }
+}
+
+#[cfg(test)]
+mod rewrite_pipeline_prescreen_tests {
+    use super::needs_rewrite_pipeline;
+
+    #[test]
+    fn needs_rewrite_pipeline_skips_trivial_select() {
+        // Trivial point-query: no marker tokens, no rewrite pass would fire.
+        assert!(!needs_rewrite_pipeline("SELECT id FROM t WHERE id = 5"));
+        assert!(!needs_rewrite_pipeline(
+            "SELECT id, name FROM events WHERE id = 5000"
+        ));
+        assert!(!needs_rewrite_pipeline("SELECT 1"));
+    }
+
+    #[test]
+    fn needs_rewrite_pipeline_fires_on_json_arrow() {
+        // `->` triggers the JSON arrow operator rewriter.
+        assert!(needs_rewrite_pipeline("SELECT j -> 'k' FROM t"));
+        assert!(needs_rewrite_pipeline("SELECT j->>'k' FROM t"));
+    }
+
+    #[test]
+    fn needs_rewrite_pipeline_fires_on_vector_cast() {
+        // `::vector` is caught by the `::` cast marker.
+        assert!(needs_rewrite_pipeline("SELECT '[1,2]'::vector"));
+        assert!(needs_rewrite_pipeline("SELECT col::int FROM t"));
+    }
+
+    #[test]
+    fn needs_rewrite_pipeline_fires_on_at_contains() {
+        // `@>` triggers JSON/array/range containment.
+        assert!(needs_rewrite_pipeline("SELECT * FROM t WHERE j @> '{}'"));
+        assert!(needs_rewrite_pipeline("SELECT * FROM t WHERE j <@ '{}'"));
     }
 }
