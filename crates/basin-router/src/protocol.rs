@@ -950,6 +950,146 @@ fn decode_param_binary(
             let s = dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
             Ok(ScalarParam::Text(s))
         }
+        // NUMERIC binary wire format (#118 — mirror of `encode_numeric_binary`
+        // in `types.rs`). Wire body (big-endian, NO outer length prefix here
+        // because the `Bind` framer already stripped it):
+        //
+        //   u16 ndigits   — number of base-10000 digits
+        //   i16 weight    — positional weight of the first digit (units = 0)
+        //   u16 sign      — 0x0000 positive, 0x4000 negative, 0xC000 NaN,
+        //                   0xD000 -Infinity, 0xF000 +Infinity
+        //   u16 dscale    — display scale (decimal digits after the point)
+        //   u16 digits[ndigits]
+        //
+        // We materialise to a decimal string (`ScalarParam::Text`) because
+        // `ScalarParam` has no Numeric variant; the engine's text-substitution
+        // path quotes/coerces it as a NUMERIC literal. NaN / ±Infinity are
+        // rejected with `22P03` because the encoder never emits them and the
+        // engine's NUMERIC type cannot represent them.
+        Type::NUMERIC => {
+            const HEADER_LEN: usize = 8;
+            if bytes.len() < HEADER_LEN {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "22P03".to_owned(),
+                    format!(
+                        "binary NUMERIC parameter shorter than 8-byte header: got {} bytes",
+                        bytes.len()
+                    ),
+                ))));
+            }
+            let ndigits = u16::from_be_bytes([bytes[0], bytes[1]]);
+            let weight = i16::from_be_bytes([bytes[2], bytes[3]]);
+            let sign = u16::from_be_bytes([bytes[4], bytes[5]]);
+            let dscale = u16::from_be_bytes([bytes[6], bytes[7]]);
+            let expected = HEADER_LEN + (ndigits as usize) * 2;
+            if bytes.len() != expected {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "22P03".to_owned(),
+                    format!(
+                        "binary NUMERIC body length mismatch: ndigits={ndigits} expects {expected} bytes, got {}",
+                        bytes.len()
+                    ),
+                ))));
+            }
+            // Reject NaN / ±Infinity — the engine has no representation for
+            // them and the encoder never emits them. Pos = 0x0000, Neg = 0x4000.
+            const NUMERIC_POS: u16 = 0x0000;
+            const NUMERIC_NEG: u16 = 0x4000;
+            if sign != NUMERIC_POS && sign != NUMERIC_NEG {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "22P03".to_owned(),
+                    format!(
+                        "binary NUMERIC sign 0x{sign:04x} (NaN / Infinity) not representable as a NUMERIC literal"
+                    ),
+                ))));
+            }
+            // Parse the base-10000 digit groups.
+            let mut digits: Vec<u16> = Vec::with_capacity(ndigits as usize);
+            for i in 0..ndigits as usize {
+                let off = HEADER_LEN + i * 2;
+                let d = u16::from_be_bytes([bytes[off], bytes[off + 1]]);
+                if d >= 10000 {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "22P03".to_owned(),
+                        format!("binary NUMERIC digit group out of range: {d}"),
+                    ))));
+                }
+                digits.push(d);
+            }
+
+            // Render to a decimal string. Each digit covers exactly 4 decimal
+            // places. The digit at index `i` represents `digit * 10^((weight - i) * 4)`.
+            // Strategy: build an integer-digit string from groups whose position
+            // (`weight - i`) is >= 0, padding leading zeros for missing positions,
+            // and a fractional-digit string from groups whose position is < 0
+            // (also padded). Finally, trim or extend the fractional part to
+            // exactly `dscale` decimal places to honour the declared scale.
+            let mut int_part = String::new();
+            let mut frac_part = String::new();
+            // The most-significant integer position is `weight` (0 means units).
+            // If `weight < 0` there are no integer digits at all.
+            // The integer digit groups cover positions weight, weight-1, …, 0.
+            if weight >= 0 {
+                let int_groups_needed = (weight as usize) + 1;
+                for pos in (0..int_groups_needed).rev() {
+                    // Group index whose positional weight is `pos`:
+                    //   i = weight - pos   (i is the index into `digits`)
+                    let i_signed = weight as i32 - pos as i32;
+                    let group = if (0..ndigits as i32).contains(&i_signed) {
+                        digits[i_signed as usize]
+                    } else {
+                        0
+                    };
+                    if int_part.is_empty() {
+                        // Most-significant group: no leading-zero pad.
+                        int_part.push_str(&format!("{group}"));
+                    } else {
+                        int_part.push_str(&format!("{group:04}"));
+                    }
+                }
+            }
+            if int_part.is_empty() {
+                int_part.push('0');
+            }
+            // Fractional digit groups cover positions -1, -2, … each group is
+            // 4 decimal places. The number of frac groups we need to render to
+            // cover `dscale` decimal places is `ceil(dscale / 4)`.
+            let frac_groups_needed = (dscale as usize).div_ceil(4);
+            for k in 0..frac_groups_needed {
+                // Positional index of this frac group (negative): -1 - k.
+                // Corresponding index into `digits`: i = weight - (-1 - k)
+                //                                     = weight + 1 + k
+                let i_signed = weight as i32 + 1 + k as i32;
+                let group = if (0..ndigits as i32).contains(&i_signed) {
+                    digits[i_signed as usize]
+                } else {
+                    0
+                };
+                frac_part.push_str(&format!("{group:04}"));
+            }
+            // Truncate / extend the frac string to exactly `dscale` digits.
+            if frac_part.len() > dscale as usize {
+                frac_part.truncate(dscale as usize);
+            } else {
+                while frac_part.len() < dscale as usize {
+                    frac_part.push('0');
+                }
+            }
+            let mut s = String::new();
+            if sign == NUMERIC_NEG && !(int_part == "0" && frac_part.chars().all(|c| c == '0')) {
+                s.push('-');
+            }
+            s.push_str(&int_part);
+            if !frac_part.is_empty() {
+                s.push('.');
+                s.push_str(&frac_part);
+            }
+            Ok(ScalarParam::Text(s))
+        }
         // DATE binary wire format: 4-byte big-endian i32 days since the
         // Postgres epoch 2000-01-01 (NOT Unix epoch 1970-01-01).
         Type::DATE => {
@@ -3772,6 +3912,105 @@ mod tests {
     fn decode_param_binary_uuid_wrong_length_is_22p03() {
         let err =
             super::decode_param_binary(&[0u8; 15], &Type::UUID).expect_err("short UUID must error");
+        match err {
+            PgWireError::UserError(info) => assert_eq!(info.code, "22P03"),
+            other => panic!("expected UserError, got {other:?}"),
+        }
+    }
+
+    // ── NUMERIC binary decode (#118) ─────────────────────────────────────────
+    //
+    // Wire body (no outer length prefix — the Bind framer already stripped it):
+    //   u16 ndigits | i16 weight | u16 sign | u16 dscale | u16 digits[ndigits]
+    //
+    // Helper: assemble the body for given (ndigits, weight, sign, dscale, digits).
+    fn numeric_body(weight: i16, sign: u16, dscale: u16, digits: &[u16]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(8 + digits.len() * 2);
+        v.extend_from_slice(&(digits.len() as u16).to_be_bytes());
+        v.extend_from_slice(&weight.to_be_bytes());
+        v.extend_from_slice(&sign.to_be_bytes());
+        v.extend_from_slice(&dscale.to_be_bytes());
+        for d in digits {
+            v.extend_from_slice(&d.to_be_bytes());
+        }
+        v
+    }
+
+    /// Zero: ndigits=0, weight=0, sign=0x0000, dscale=0 → "0".
+    #[test]
+    fn decode_param_binary_numeric_zero() {
+        let body = numeric_body(0, 0x0000, 0, &[]);
+        let p = super::decode_param_binary(&body, &Type::NUMERIC).expect("decode");
+        match p {
+            ScalarParam::Text(s) => assert_eq!(s, "0"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    /// Negative scale-zero integer: -1 → ndigits=1, weight=0, sign=0x4000,
+    /// dscale=0, digits=[1] → "-1".
+    #[test]
+    fn decode_param_binary_numeric_negative_one() {
+        let body = numeric_body(0, 0x4000, 0, &[1]);
+        let p = super::decode_param_binary(&body, &Type::NUMERIC).expect("decode");
+        match p {
+            ScalarParam::Text(s) => assert_eq!(s, "-1"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    /// Large positive with fractional part: 1234567890.1234 →
+    ///   int_part = 1234567890 → groups [12, 3456, 7890], weight=2
+    ///   frac_part = .1234 → group [1234], dscale=4
+    ///   ndigits=4, weight=2, sign=0, dscale=4, digits=[12,3456,7890,1234]
+    /// Expected output: "1234567890.1234".
+    #[test]
+    fn decode_param_binary_numeric_large_positive_with_fraction() {
+        let body = numeric_body(2, 0x0000, 4, &[12, 3456, 7890, 1234]);
+        let p = super::decode_param_binary(&body, &Type::NUMERIC).expect("decode");
+        match p {
+            ScalarParam::Text(s) => assert_eq!(s, "1234567890.1234"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    /// Round-trip through types::encode_numeric_binary: encode raw=12345,
+    /// scale=2 (= 123.45) and re-decode. The encoder prefixes a 4-byte body
+    /// length; skip it to get the decoder's input.
+    #[test]
+    fn decode_param_binary_numeric_round_trip_123_45() {
+        // Body (hand-assembled to match encode_numeric_binary's output):
+        // raw=12345, scale=2 → int=123, frac=45
+        // int_digits=[123], frac_groups=1, padded=4500 → digits=[123,4500]
+        // weight=0, sign=0, dscale=2.
+        let body = numeric_body(0, 0x0000, 2, &[123, 4500]);
+        let p = super::decode_param_binary(&body, &Type::NUMERIC).expect("decode");
+        match p {
+            ScalarParam::Text(s) => assert_eq!(s, "123.45"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    /// NaN sign (0xC000) is rejected with 22P03 — the encoder never emits it
+    /// and the engine has no NUMERIC NaN representation.
+    #[test]
+    fn decode_param_binary_numeric_nan_rejected() {
+        let body = numeric_body(0, 0xC000, 0, &[]);
+        let err = super::decode_param_binary(&body, &Type::NUMERIC)
+            .expect_err("NaN must be rejected");
+        match err {
+            PgWireError::UserError(info) => assert_eq!(info.code, "22P03"),
+            other => panic!("expected UserError, got {other:?}"),
+        }
+    }
+
+    /// Malformed: header says 2 digits but only 1 digit follows → 22P03.
+    #[test]
+    fn decode_param_binary_numeric_short_body_rejected() {
+        let mut body = numeric_body(0, 0x0000, 0, &[1, 2]);
+        body.truncate(body.len() - 2); // drop the last digit
+        let err = super::decode_param_binary(&body, &Type::NUMERIC)
+            .expect_err("short body must be rejected");
         match err {
             PgWireError::UserError(info) => assert_eq!(info.code, "22P03"),
             other => panic!("expected UserError, got {other:?}"),
