@@ -3464,8 +3464,33 @@ async fn materialize_hot_overlay_into_cold(
         .data_type()
         .clone();
 
-    // Read all live cold rows (RAW — without the overlay) for this table.
-    let live = meta.live_data_files();
+    // Narrow the rewrite to the cold files that actually contain the overlay
+    // keys we're materializing. Pre-narrowing every single-row UPDATE folded
+    // the entire cold tier; for a 10k-row table this was the dominant cost.
+    //
+    // Safety contract: any RowKey we cannot localize (unsupported PK type, or
+    // a key the probe couldn't decode) forces a fall-back to the full live
+    // set. A key whose probe is *definitively* Absent contributes zero files
+    // (apply_update_overlay_to_batches still appends the override row, so the
+    // overlay rewrite is durable even when no cold file holds the row).
+    let live_all = meta.live_data_files();
+    let overlay_keys: Vec<&[u8]> = tombstones
+        .iter()
+        .map(|v| v.as_slice())
+        .chain(updates.keys().map(|v| v.as_slice()))
+        .collect();
+    let narrowed_paths: Option<std::collections::HashSet<String>> =
+        narrow_materialize_files(&overlay_keys, &pk_col, &pk_dt, &live_all, meta.schema.as_ref());
+    let live: Vec<DataFileRef> = match &narrowed_paths {
+        Some(allow) => live_all
+            .iter()
+            .filter(|f| allow.contains(f.path.as_str()))
+            .cloned()
+            .collect(),
+        None => live_all.clone(),
+    };
+
+    // Read the narrowed cold rows (RAW — without the overlay) for this table.
     let removed: Vec<String> = live.iter().map(|f| f.path.clone()).collect();
     let paths: Vec<object_store::path::Path> = live
         .iter()
@@ -3527,6 +3552,49 @@ async fn materialize_hot_overlay_into_cold(
         entry.memtable.remove_flushed(&keys);
     }
     Ok(())
+}
+
+/// Compute the subset of `live_files` whose PK zone-map/bloom indicates the
+/// file MAY contain at least one of the overlay's `keys`. This is the
+/// row-targeted narrowing for `materialize_hot_overlay_into_cold`.
+///
+/// Returns:
+/// * `Some(set)` — narrow the rewrite to these file paths. An empty set means
+///   no cold file needs to be rewritten (override rows can still be appended
+///   into a fresh file).
+/// * `None` — fall back to the full live set. Triggered when (a) the table
+///   doesn't have a single-column PK, (b) any overlay key's PK type isn't
+///   supported by [`pk_row_key_to_scalar`] (e.g. UUID, Decimal), or (c) the
+///   PK column is missing from the schema. The safety contract: any key we
+///   cannot localize MUST be materialized against the full live-file set so
+///   the merge can't lose its cold counterpart.
+fn narrow_materialize_files(
+    keys: &[&[u8]],
+    pk_col: &str,
+    pk_dt: &arrow_schema::DataType,
+    live_files: &[DataFileRef],
+    schema: &arrow_schema::Schema,
+) -> Option<std::collections::HashSet<String>> {
+    if keys.is_empty() {
+        return Some(std::collections::HashSet::new());
+    }
+    // Decode every key to a ScalarValue up front. If ANY decode fails the
+    // probe is unsafe (we'd silently drop a possible cold match), so we bail
+    // to the full-scan path.
+    let mut scalars: Vec<basin_storage::ScalarValue> = Vec::with_capacity(keys.len());
+    for raw in keys {
+        let rk = basin_hottier::RowKey::from_bytes(raw.to_vec());
+        let s = pk_row_key_to_scalar(&rk, pk_dt)?;
+        scalars.push(s);
+    }
+    match crate::index_probe::pk_point_probe_multi(pk_col, &scalars, live_files, schema) {
+        crate::index_probe::PkProbeOutcome::Absent { .. } => {
+            Some(std::collections::HashSet::new())
+        }
+        crate::index_probe::PkProbeOutcome::Candidates { paths, .. } => {
+            Some(paths.into_iter().map(|p| p.to_string()).collect())
+        }
+    }
 }
 
 /// Defense-in-depth filter for the cold-path lister output.
@@ -6305,5 +6373,197 @@ mod tests {
         assert!(msg.contains("tenant_42"), "must name offending schema: {msg}");
         assert!(msg.contains("public"), "must mention 'public': {msg}");
         assert!(msg.contains("search_path"), "must mention search_path: {msg}");
+    }
+
+    // ── narrow_materialize_files (row-targeted UPDATE rewrite) ────────────────
+    //
+    // These tests cover the cold-tier narrowing the `materialize_hot_overlay_into_cold`
+    // path runs to avoid folding the whole live data-file set for a PK-targeted
+    // UPDATE. The helper is a pure decision over (overlay keys, PK schema, live
+    // files, table schema) — the call site in `materialize_hot_overlay_into_cold`
+    // is mechanical.
+
+    fn i64_pk_file_ref(path: &str, min: i64, max: i64) -> DataFileRef {
+        let mut column_stats = std::collections::BTreeMap::new();
+        column_stats.insert(
+            "id".to_string(),
+            basin_catalog::ColumnStats {
+                null_count: Some(0),
+                min_bytes: Some(min.to_le_bytes().to_vec()),
+                max_bytes: Some(max.to_le_bytes().to_vec()),
+                sum_bytes: None,
+            },
+        );
+        DataFileRef {
+            path: path.to_string(),
+            size_bytes: 0,
+            row_count: (max - min + 1).max(1) as u64,
+            column_stats,
+            bloom_filters: std::collections::BTreeMap::new(),
+            hll_sketches: std::collections::BTreeMap::new(),
+            tdigest_sketches: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn int64_pk_schema() -> arrow_schema::Schema {
+        arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("val", DataType::Utf8, true),
+        ])
+    }
+
+    fn row_key_i64(v: i64) -> Vec<u8> {
+        basin_hottier::RowKey::builder()
+            .append_i64(v)
+            .finish()
+            .as_bytes()
+            .to_vec()
+    }
+
+    /// One overlay row whose PK lives in exactly one of N live files → only
+    /// that file is in the narrow rewrite set. This is the headline win: a
+    /// 1000-file cold tier collapses to 1 file rewrite per single-row UPDATE.
+    #[test]
+    fn materialize_narrowing_single_overlay_row_rewrites_one_file() {
+        let files = vec![
+            i64_pk_file_ref("a.parquet", 0, 999),
+            i64_pk_file_ref("b.parquet", 1000, 1999),
+            i64_pk_file_ref("c.parquet", 2000, 2999),
+        ];
+        let key = row_key_i64(1500);
+        let keys: Vec<&[u8]> = vec![key.as_slice()];
+        let schema = int64_pk_schema();
+        let out = narrow_materialize_files(&keys, "id", &DataType::Int64, &files, &schema)
+            .expect("Int64 PK must produce a narrowed set");
+        assert_eq!(out.len(), 1, "exactly one file should match: {out:?}");
+        assert!(out.contains("b.parquet"), "expected b.parquet, got {out:?}");
+    }
+
+    /// Two overlay rows that land in different files → both files in the
+    /// narrow set, others pruned.
+    #[test]
+    fn materialize_narrowing_overlay_rows_span_two_files() {
+        let files = vec![
+            i64_pk_file_ref("a.parquet", 0, 999),
+            i64_pk_file_ref("b.parquet", 1000, 1999),
+            i64_pk_file_ref("c.parquet", 2000, 2999),
+        ];
+        let k1 = row_key_i64(50);
+        let k2 = row_key_i64(2500);
+        let keys: Vec<&[u8]> = vec![k1.as_slice(), k2.as_slice()];
+        let schema = int64_pk_schema();
+        let out = narrow_materialize_files(&keys, "id", &DataType::Int64, &files, &schema)
+            .expect("Int64 PK must produce a narrowed set");
+        assert_eq!(out.len(), 2, "two files should match: {out:?}");
+        assert!(out.contains("a.parquet"), "expected a.parquet in {out:?}");
+        assert!(out.contains("c.parquet"), "expected c.parquet in {out:?}");
+        assert!(!out.contains("b.parquet"), "b.parquet should be pruned in {out:?}");
+    }
+
+    /// An overlay row whose PK is outside the zone-map range of every live
+    /// file (e.g. the row only exists in the hot overlay, never landed in
+    /// cold) → narrow set is empty. The full materialize path still appends
+    /// the override row via `apply_update_overlay_to_batches`, so correctness
+    /// is preserved even without a cold file to rewrite. The narrow set being
+    /// Some({}) (NOT None) is the load-bearing signal that we trust the probe.
+    #[test]
+    fn materialize_narrowing_overlay_row_not_in_any_file_falls_back_to_full() {
+        let files = vec![
+            i64_pk_file_ref("a.parquet", 0, 999),
+            i64_pk_file_ref("b.parquet", 1000, 1999),
+        ];
+        let key = row_key_i64(9_999_999);
+        let keys: Vec<&[u8]> = vec![key.as_slice()];
+        let schema = int64_pk_schema();
+        let out = narrow_materialize_files(&keys, "id", &DataType::Int64, &files, &schema)
+            .expect("Int64 PK must produce a narrowed set, even when Absent");
+        assert!(
+            out.is_empty(),
+            "Absent probe must yield zero-file rewrite (override is appended on the fresh file): {out:?}"
+        );
+    }
+
+    /// Live files with NO column stats (no zone-map, no bloom) → the probe
+    /// can't prune anything → narrow set is the full live set. This protects
+    /// older-format tables that were written before the catalog started
+    /// recording PK stats.
+    #[test]
+    fn materialize_narrowing_pk_index_missing_falls_back_to_full() {
+        // Build files with empty column_stats so the zone-map prune path
+        // can't fire — the probe is conservative and returns Candidates
+        // containing every file.
+        let mk = |path: &str| DataFileRef {
+            path: path.to_string(),
+            size_bytes: 0,
+            row_count: 1000,
+            column_stats: std::collections::BTreeMap::new(),
+            bloom_filters: std::collections::BTreeMap::new(),
+            hll_sketches: std::collections::BTreeMap::new(),
+            tdigest_sketches: std::collections::BTreeMap::new(),
+        };
+        let files = vec![mk("a.parquet"), mk("b.parquet"), mk("c.parquet")];
+        let key = row_key_i64(42);
+        let keys: Vec<&[u8]> = vec![key.as_slice()];
+        let schema = int64_pk_schema();
+        let out = narrow_materialize_files(&keys, "id", &DataType::Int64, &files, &schema)
+            .expect("missing stats fall back to keep-all, not None");
+        assert_eq!(
+            out.len(),
+            3,
+            "with no zone-map every file must remain a candidate: {out:?}"
+        );
+    }
+
+    /// Composite-PK and other unsupported encodings: `materialize_hot_overlay_into_cold`
+    /// itself early-returns for composite PKs (the overlay isn't written for
+    /// them), but the narrowing helper still has to make the right call on
+    /// non-supported PK types — fall back to None so the caller scans every
+    /// file. Modelled here as a non-Int64 PK type that
+    /// `pk_row_key_to_scalar` doesn't decode (Int16, Decimal, etc.).
+    #[test]
+    fn materialize_narrowing_composite_pk_works() {
+        // Use a Decimal PK type — pk_row_key_to_scalar returns None for it,
+        // so the narrowing helper must return None (fall back to full set).
+        let schema = arrow_schema::Schema::new(vec![Field::new(
+            "id",
+            DataType::Decimal128(10, 0),
+            false,
+        )]);
+        let files = vec![i64_pk_file_ref("a.parquet", 0, 999)];
+        // The key bytes don't matter — decoding will reject the type before
+        // the probe even runs.
+        let key = vec![0u8; 8];
+        let keys: Vec<&[u8]> = vec![key.as_slice()];
+        let out = narrow_materialize_files(
+            &keys,
+            "id",
+            &DataType::Decimal128(10, 0),
+            &files,
+            &schema,
+        );
+        assert!(
+            out.is_none(),
+            "unsupported PK type must fall back to full set (None): got {out:?}"
+        );
+    }
+
+    /// UUID PK: `pk_row_key_to_scalar` returns None for UUID (FixedSizeBinary
+    /// in current Arrow), so the helper must conservatively return None →
+    /// full-set rewrite. This is the safety contract that protects UUID-keyed
+    /// tables from silently dropping their cold counterpart during a
+    /// hot-overlay materialize.
+    #[test]
+    fn materialize_narrowing_uuid_pk_works() {
+        // UUID is stored as FixedSizeBinary(16) in Basin's catalog.
+        let uuid_dt = DataType::FixedSizeBinary(16);
+        let schema = arrow_schema::Schema::new(vec![Field::new("id", uuid_dt.clone(), false)]);
+        let files = vec![i64_pk_file_ref("a.parquet", 0, 999)];
+        let key = vec![0u8; 16];
+        let keys: Vec<&[u8]> = vec![key.as_slice()];
+        let out = narrow_materialize_files(&keys, "id", &uuid_dt, &files, &schema);
+        assert!(
+            out.is_none(),
+            "UUID PK must fall back to full set (None): got {out:?}"
+        );
     }
 }
