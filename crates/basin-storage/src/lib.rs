@@ -231,6 +231,46 @@ pub fn resolve_project_concurrency() -> usize {
     std::cmp::max(DEFAULT_PROJECT_CONCURRENCY, 4 * cpus)
 }
 
+/// Default TTL (seconds) after which an untouched per-project semaphore is
+/// evicted from `project_semaphores`. The map grows monotonically as
+/// projects are touched; on a long-running fleet host serving 100k+
+/// projects this is the dominant per-project residency cost. Each entry is
+/// ~140 bytes (Arc + Semaphore + HashMap slot + last_touched), so 100k
+/// entries is ~14 MB — bounded but worth bounding. Default 30 minutes
+/// matches the cloud pgwire-pool eviction TTL (which itself sits at 10 min
+/// in front of this layer). Override with
+/// `BASIN_STORAGE_PROJECT_STATE_TTL_SECS`; `0` or `off` disables eviction
+/// entirely.
+pub const DEFAULT_PROJECT_STATE_TTL_SECS: u64 = 1800;
+
+/// How many candidate entries the inline-on-insert sweep is allowed to
+/// scan per call. The HashMap's iterator order is randomised, so over many
+/// inserts every entry is eventually inspected; bounding per-call work
+/// keeps the insert latency bounded (a few hundred map probes) even when
+/// the map is large. 256 is a heuristic — large enough that 100k stale
+/// entries clear within a few hundred inserts, small enough that the
+/// per-insert tail latency stays in the µs range.
+const PROJECT_STATE_SWEEP_BUDGET: usize = 256;
+
+/// Resolve the per-project-state TTL in seconds. Returns `None` when the
+/// env var is `0` / `off` / `disabled` (eviction off entirely), `Some(n)`
+/// otherwise. Falls back to [`DEFAULT_PROJECT_STATE_TTL_SECS`] when unset.
+pub fn resolve_project_state_ttl_secs() -> Option<u64> {
+    match std::env::var("BASIN_STORAGE_PROJECT_STATE_TTL_SECS") {
+        Ok(v) => {
+            let trimmed = v.trim();
+            if matches!(trimmed.to_ascii_lowercase().as_str(), "0" | "off" | "disabled") {
+                None
+            } else if let Ok(n) = trimmed.parse::<u64>() {
+                Some(n)
+            } else {
+                Some(DEFAULT_PROJECT_STATE_TTL_SECS)
+            }
+        }
+        Err(_) => Some(DEFAULT_PROJECT_STATE_TTL_SECS),
+    }
+}
+
 /// Resolve the scheduler's global RPC budget. `BASIN_STORAGE_GLOBAL_BUDGET`,
 /// when present and parseable to a nonzero `usize`, overrides the default
 /// computed by [`scheduler::default_global_budget`].
@@ -282,6 +322,43 @@ pub struct Storage {
     inner: Arc<Inner>,
 }
 
+/// Per-project semaphore entry tracked by `Inner::project_semaphores`. The
+/// `last_touched` field is an UNIX-seconds timestamp bumped on every
+/// accessor call; the inline-on-insert sweep evicts entries whose
+/// `last_touched` is older than the configured TTL. See #119.
+struct ProjectSemaphoreEntry {
+    sem: Arc<Semaphore>,
+    last_touched: AtomicU64,
+}
+
+/// Current UNIX-seconds clock, monotonised against the test clock when
+/// present. Tests can install a fake clock via [`set_project_state_now_secs`]
+/// to advance time deterministically without sleeping for minutes.
+#[cfg(test)]
+static TEST_PROJECT_STATE_NOW_SECS: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn project_state_now_secs() -> u64 {
+    #[cfg(test)]
+    {
+        let v = TEST_PROJECT_STATE_NOW_SECS.load(Ordering::Relaxed);
+        if v != 0 {
+            return v;
+        }
+    }
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Test-only: pin the clock used by [`project_state_now_secs`]. `0` releases
+/// the pin (falls back to `SystemTime::now`).
+#[cfg(test)]
+fn set_project_state_now_secs(v: u64) {
+    TEST_PROJECT_STATE_NOW_SECS.store(v, Ordering::Relaxed);
+}
+
 struct Inner {
     object_store: Arc<dyn ObjectStore>,
     root_prefix: Option<ObjectPath>,
@@ -298,7 +375,19 @@ struct Inner {
     /// for nanoseconds and never across an `await`. We accept the cost
     /// of one map lookup per RPC; on the hot path it's a HashMap probe
     /// with `ProjectId` (a [`Ulid`] under the hood, so cheap to hash).
-    project_semaphores: Mutex<HashMap<ProjectId, Arc<Semaphore>>>,
+    ///
+    /// #119 — each entry carries a `last_touched` UNIX-seconds timestamp
+    /// that is bumped on every accessor call. On insert we run a bounded
+    /// inline sweep (`PROJECT_STATE_SWEEP_BUDGET` candidates) and drop any
+    /// entry whose `last_touched` is older than
+    /// `project_state_ttl_secs`. This bounds the map's residency on
+    /// long-running multi-tenant hosts where projects are touched once
+    /// then go quiet.
+    project_semaphores: Mutex<HashMap<ProjectId, ProjectSemaphoreEntry>>,
+    /// TTL (seconds) after which an untouched per-project semaphore is
+    /// evicted by the inline sweep. `None` disables eviction (legacy
+    /// behaviour). Set at construction by [`resolve_project_state_ttl_secs`].
+    project_state_ttl_secs: Option<u64>,
     /// Default permit count for a newly-created project semaphore.
     default_project_concurrency: usize,
     /// Process-wide counters incremented by the read path so tests can
@@ -489,6 +578,7 @@ impl Storage {
                     DEFAULT_HNSW_SEGMENT_CACHE_CAP,
                 )),
                 project_semaphores: Mutex::new(HashMap::new()),
+                project_state_ttl_secs: resolve_project_state_ttl_secs(),
                 default_project_concurrency: resolve_project_concurrency(),
                 read_counters: Arc::new(ReadCounters::default()),
                 page_cache,
@@ -799,18 +889,87 @@ impl Storage {
     /// Per-project semaphore handle. Used internally to gate every
     /// underlying object_store RPC behind a project-scoped permit pool.
     /// Lazy-allocates on first call for a given project.
+    ///
+    /// #119 — every call bumps the entry's `last_touched` UNIX-seconds
+    /// timestamp. On insert (first touch for a project) we run a bounded
+    /// inline sweep of stale entries — see [`Self::sweep_stale_project_state`].
     fn project_semaphore(&self, project: &ProjectId) -> Arc<Semaphore> {
+        let now = project_state_now_secs();
         let mut map = self
             .inner
             .project_semaphores
             .lock()
             .expect("project semaphore map poisoned");
-        if let Some(s) = map.get(project) {
-            return s.clone();
+        if let Some(entry) = map.get(project) {
+            entry.last_touched.store(now, Ordering::Relaxed);
+            return entry.sem.clone();
         }
-        let s = Arc::new(Semaphore::new(self.inner.default_project_concurrency));
-        map.insert(*project, s.clone());
-        s
+        // First touch for this project: opportunistically evict stale entries
+        // before inserting the new one. Bounded by PROJECT_STATE_SWEEP_BUDGET
+        // so the worst-case insert latency stays predictable.
+        if let Some(ttl) = self.inner.project_state_ttl_secs {
+            Self::sweep_stale_project_state(&mut map, now, ttl, PROJECT_STATE_SWEEP_BUDGET);
+        }
+        let sem = Arc::new(Semaphore::new(self.inner.default_project_concurrency));
+        map.insert(
+            *project,
+            ProjectSemaphoreEntry {
+                sem: sem.clone(),
+                last_touched: AtomicU64::new(now),
+            },
+        );
+        sem
+    }
+
+    /// Inline sweep: scan up to `budget` entries and drop any whose
+    /// `last_touched` is older than `now - ttl_secs`. Called from
+    /// `project_semaphore` on insert (cold-path). The HashMap iterator
+    /// order is randomised by the default `RandomState` hasher, so over
+    /// many inserts every entry is eventually examined; bounding per-call
+    /// work keeps the insert tail latency in the µs range even at 1M
+    /// entries.
+    ///
+    /// Note: evicting an entry only drops the map's `Arc<Semaphore>`
+    /// handle — any concurrent caller holding a clone (e.g. a permit
+    /// guard) keeps the Semaphore alive until they release. After
+    /// eviction, the next call to `project_semaphore` for the same
+    /// project allocates a fresh Semaphore (new permit pool), which is
+    /// the desired "cold project woke up" semantics.
+    fn sweep_stale_project_state(
+        map: &mut HashMap<ProjectId, ProjectSemaphoreEntry>,
+        now: u64,
+        ttl_secs: u64,
+        budget: usize,
+    ) {
+        if map.is_empty() || budget == 0 {
+            return;
+        }
+        let cutoff = now.saturating_sub(ttl_secs);
+        let mut to_drop: Vec<ProjectId> = Vec::new();
+        let mut scanned = 0usize;
+        for (id, entry) in map.iter() {
+            if scanned >= budget {
+                break;
+            }
+            scanned += 1;
+            if entry.last_touched.load(Ordering::Relaxed) <= cutoff {
+                to_drop.push(*id);
+            }
+        }
+        for id in to_drop {
+            map.remove(&id);
+        }
+    }
+
+    /// Process-internal accessor: number of live per-project state entries.
+    /// Exposed for tests (#119) and operator observability.
+    #[doc(hidden)]
+    pub fn project_state_len(&self) -> usize {
+        self.inner
+            .project_semaphores
+            .lock()
+            .expect("project semaphore map poisoned")
+            .len()
     }
 
     /// Project-scoped view of the underlying object store. Every RPC
@@ -1621,6 +1780,146 @@ mod tests {
             disk_cache: None,
             page_cache: None,
         })
+    }
+
+    // ── #119: per-project state TTL eviction ─────────────────────────────────
+    //
+    // These tests share a process-wide fake clock and the
+    // `BASIN_STORAGE_PROJECT_STATE_TTL_SECS` env var; serialise them through
+    // `TTL_TEST_LOCK` so the parallel test runner can't stomp them.
+    static TTL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Insert N projects with the fake clock at t=1000, advance the clock past
+    /// the TTL, then insert one more project. The inline sweep should evict
+    /// every stale entry within `PROJECT_STATE_SWEEP_BUDGET` candidates, so
+    /// the final live-entry count is 1 (only the post-advance project).
+    ///
+    /// Uses the test-only fake clock to avoid sleeping for minutes.
+    #[test]
+    fn project_state_ttl_evicts_stale_entries() {
+        let _g = TTL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = TempDir::new().unwrap();
+        let s = storage_in(&dir);
+        // Pin the fake clock so the resolved TTL (1800s by default in
+        // production; we resolve it at construction time above) compares
+        // against deterministic seconds.
+        super::set_project_state_now_secs(1000);
+        // Insert N projects. N is well within PROJECT_STATE_SWEEP_BUDGET (256)
+        // so a single sweep covers all of them.
+        let n: usize = 64;
+        for _ in 0..n {
+            let _ = s.project_semaphore(&ProjectId::new());
+        }
+        assert_eq!(s.project_state_len(), n, "all N projects must be live");
+        // Advance past the default TTL (1800s).
+        super::set_project_state_now_secs(1000 + super::DEFAULT_PROJECT_STATE_TTL_SECS + 1);
+        // First touch of a brand-new project triggers the inline sweep, which
+        // sees every existing entry as stale (last_touched=1000 < cutoff).
+        let _ = s.project_semaphore(&ProjectId::new());
+        assert_eq!(
+            s.project_state_len(),
+            1,
+            "all N stale entries should be evicted, leaving only the fresh insert"
+        );
+        // Release the clock pin for other tests.
+        super::set_project_state_now_secs(0);
+    }
+
+    /// Accessor on an existing project must bump `last_touched` and prevent
+    /// eviction even when other entries become stale.
+    #[test]
+    fn project_state_touch_resets_ttl() {
+        let _g = TTL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = TempDir::new().unwrap();
+        let s = storage_in(&dir);
+        super::set_project_state_now_secs(2000);
+        let warm = ProjectId::new();
+        let cold = ProjectId::new();
+        let _ = s.project_semaphore(&warm);
+        let _ = s.project_semaphore(&cold);
+        // Advance halfway through the TTL: nothing should be stale yet.
+        super::set_project_state_now_secs(2000 + super::DEFAULT_PROJECT_STATE_TTL_SECS / 2);
+        let _ = s.project_semaphore(&warm); // bump warm
+        // Advance the rest of the way past TTL relative to the initial
+        // insert (2000). `cold` is now stale (last_touched=2000),
+        // `warm` is still fresh (last_touched=2000+ttl/2).
+        super::set_project_state_now_secs(2000 + super::DEFAULT_PROJECT_STATE_TTL_SECS + 1);
+        // Trigger sweep via a new insert.
+        let _ = s.project_semaphore(&ProjectId::new());
+        // After sweep: `cold` evicted, `warm` retained, new project inserted.
+        assert_eq!(s.project_state_len(), 2);
+        super::set_project_state_now_secs(0);
+    }
+
+    /// TTL=0/off disables eviction entirely.
+    #[test]
+    fn project_state_ttl_off_disables_eviction() {
+        let _g = TTL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Best-effort isolation: set the env var, build a fresh Storage so
+        // `resolve_project_state_ttl_secs` sees the override. Use a guarded
+        // restore so we don't leak the var to peer tests.
+        struct EnvGuard(&'static str, Option<String>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.1 {
+                    Some(v) => std::env::set_var(self.0, v),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+        let prev = std::env::var("BASIN_STORAGE_PROJECT_STATE_TTL_SECS").ok();
+        std::env::set_var("BASIN_STORAGE_PROJECT_STATE_TTL_SECS", "0");
+        let _guard = EnvGuard("BASIN_STORAGE_PROJECT_STATE_TTL_SECS", prev);
+
+        let dir = TempDir::new().unwrap();
+        let s = storage_in(&dir);
+        super::set_project_state_now_secs(3000);
+        for _ in 0..16 {
+            let _ = s.project_semaphore(&ProjectId::new());
+        }
+        // Advance a million seconds; nothing should be evicted.
+        super::set_project_state_now_secs(3000 + 1_000_000);
+        let _ = s.project_semaphore(&ProjectId::new());
+        assert_eq!(
+            s.project_state_len(),
+            17,
+            "eviction off → map grows monotonically"
+        );
+        super::set_project_state_now_secs(0);
+    }
+
+    /// Parallel inserts + accesses must not panic and must not double-allocate
+    /// the same project (HashMap guarantee). The mutex never crosses an
+    /// `await`, so this is purely a sanity check that the new TTL plumbing
+    /// hasn't introduced poison or a lock-order regression.
+    #[test]
+    fn project_state_ttl_concurrent_inserts_no_panic() {
+        let _g = TTL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = TempDir::new().unwrap();
+        let s = Arc::new(storage_in(&dir));
+        super::set_project_state_now_secs(4000);
+        // Use a shared pool of N project IDs so half the threads insert
+        // while the other half touch existing entries.
+        let ids: Arc<Vec<ProjectId>> = Arc::new((0..32).map(|_| ProjectId::new()).collect());
+        let threads: Vec<_> = (0..16)
+            .map(|t| {
+                let s = s.clone();
+                let ids = ids.clone();
+                std::thread::spawn(move || {
+                    for k in 0..256 {
+                        let id = ids[(t * 256 + k) % ids.len()];
+                        let _ = s.project_semaphore(&id);
+                    }
+                })
+            })
+            .collect();
+        for h in threads {
+            h.join().expect("worker panic");
+        }
+        // All 32 distinct IDs end up in the map (no eviction since the clock
+        // never advanced past TTL).
+        assert_eq!(s.project_state_len(), 32);
+        super::set_project_state_now_secs(0);
     }
 
     #[tokio::test]
