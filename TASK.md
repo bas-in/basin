@@ -283,6 +283,78 @@ the corresponding `ScalarUDF`s.
 - [x] **basin-geo** — PostGIS subset. `Point`, `Box2d`, `ST_MakePoint`,
       `ST_X`, `ST_Y`, `ST_Distance` (Haversine WGS84), `ST_DWithin`,
       `ST_Contains`. No `LINESTRING`/`POLYGON`/spatial index in v0.1.
+
+### PostGIS v0.2 → v0.4 — full spatial ladder (customer-pulled, 2026-05-30)
+
+Driver: dependent customer needs PostGIS-shape workloads to perform
+at scale. v0.1 (above) is Rust-API correctness only — no SQL surface,
+no spatial index, no polygon ops, no PROJ. Design doc:
+[`docs/postgis-rtree-design.md`](./docs/postgis-rtree-design.md).
+
+Five-wave ladder (Option B from §9 of the design doc — substrate +
+pushdown bundled separately because the substrate pieces are
+interdependent):
+
+- [ ] **PG-Wave α — Spatial substrate** (v0.2; ~600-800 LOC; bundles
+      old waves 1+2 + half of 4). Five interdependent pieces in one
+      coherent wave:
+      (1) wire `geo_glue::install()` ScalarUDFs (`ST_MakePoint`,
+      `ST_X`, `ST_Y`, `ST_Distance`, `ST_DWithin`, `ST_Contains`,
+      `ST_AsText`, `ST_AsWKB`, `ST_GeomFromText`, `ST_GeomFromWKB`);
+      (2) change POINT DDL mapping Utf8 → `FixedSizeBinary(21)` at
+      `crates/basin-engine/src/types.rs:852`;
+      (3) add `access_method = "gist"` to `SecondaryIndex` + parser
+      for `CREATE INDEX … USING gist`;
+      (4) new `crates/basin-storage/src/index/rtree.rs` with
+      `RTreeRegistry` + `build_rtree_for_batch` + bincode round-trip
+      (`rstar = "0.12"` with `serde` feature);
+      (5) hook in `compact_one` calling `reindex_compacted_file_rtree`
+      mirroring `reindex_compacted_file_gin` at `in_process.rs:1452`,
+      writing sidecar files at `projects/{p}/tables/{t}/index/{col}.rtree/{ulid}.rtree`.
+      After this wave: end-to-end spatial storage + query works,
+      scan-based (no pushdown yet). Bench: `viability_postgis_storage`
+      stores + retrieves 10k points byte-exact.
+- [ ] **PG-Wave β — Spatial pushdown** (v0.3; 2-3 weeks; bundles
+      other half of old wave 4 + segment cache + warm-up). Blocks on α.
+      (1) `crates/basin-engine/src/rtree_rowgroup_scan.rs` cloning
+      `gin_rowgroup_scan.rs`;
+      (2) `detect_spatial_predicate()` in `index_probe.rs` returning
+      `SpatialPredicate` enum (`DWithin` Inexact, `BboxIntersects` +
+      `PointEq` Exact);
+      (3) `apply_rtree_pruning_for_query()` in `session.rs` mirroring
+      `apply_gin_pruning_for_query` (line 2181);
+      (4) `RTreeSegmentCache` in `metadata_cache.rs` analogous to
+      `HnswSegmentCache` at line 252, with background warm-up task;
+      (5) `viability_large_spatial_dwithin` at 1M points.
+      Acceptance: ≥100× speedup vs scan-based at 1M with ≤1%
+      selectivity for `ST_DWithin`.
+- [ ] **PG-Wave 3 — Expanded predicate library** (v0.3; 1 week,
+      ~300 LOC + dep). Can land in parallel with β. Vendor
+      `geo = "0.28"` (MIT/Apache, pure Rust) for polygon ops. Bind:
+      `ST_Intersects`, `ST_Within`, `ST_Crosses`, `ST_Touches`,
+      `ST_Disjoint`, `ST_Overlaps`, `ST_Area`, `ST_Perimeter`,
+      `ST_Centroid`, `ST_Buffer`, `ST_Envelope`, `ST_NumPoints`,
+      `ST_PointN`, `ST_StartPoint`, `ST_EndPoint`. Tests: each
+      predicate matches PostGIS on a known truth set of ~20 shape
+      pairs. Still O(N) at this wave — the GIST pushdown β shipped
+      lifts these once the R-tree's `BboxIntersects` arm subsumes
+      most polygon ops via their bounding boxes.
+- [ ] **PG-Wave 5 — SRID + PROJ projections** (v0.4.A; 2-3 weeks).
+      Add `srid` field to `GEOMETRY` (default 4326). Wire `proj`
+      crate (C dep; needs Fly platform check). Implement
+      `ST_Transform`, `ST_SRID`, `ST_SetSRID`. Distinguish
+      `GEOMETRY` (planar) from `GEOGRAPHY` (spheroidal) for distance
+      ops. Bench: `viability_postgis_proj` round-trips WGS84 ↔
+      UTM31N within 1cm of PostGIS reference.
+- [ ] **PG-Wave 6 — Spatial bench suite + PG comparison**
+      (v0.4.B; 1-2 weeks). `compare_postgres_postgis_*.json` benches
+      mirroring the OLAP bench shape: radius search, nearest-
+      neighbour, polygon overlay, `ST_Within(point, polygon)` at
+      10k / 100k / 1M. Side-by-side basin vs `postgres + postgis +
+      gist`. Acceptance: basin ≥ 0.5× PostGIS+GIST on the four core
+      shapes at 1M points (we won't beat GIST on tuned queries;
+      "competitive" is the bar).
+
 - [x] **JSONB type** — Arrow `LargeBinary` + field metadata
       `BASIN_TYPE=JSONB`; canonical-form normalization on insert; pgwire OID 3802.
 - [x] **UUID type** — Arrow `FixedSizeBinary(16)` + field metadata

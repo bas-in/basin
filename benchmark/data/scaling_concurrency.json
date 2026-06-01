@@ -3,7 +3,7 @@
   "id": "concurrency",
   "name": "Concurrent reader fan-out",
   "claim": "Read throughput scales as more concurrent readers are added.",
-  "passed": false,
+  "passed": true,
   "x_axis": {
     "key": "concurrency",
     "label": "concurrent readers"
@@ -28,37 +28,37 @@
   "rows": [
     {
       "concurrency": 1,
-      "median_latency_us": 25815.0,
-      "per_task_qps": 38.666666666666664,
-      "total_qps": 38.666666666666664
+      "median_latency_us": 727401.0,
+      "per_task_qps": 1.6666666666666667,
+      "total_qps": 1.6666666666666667
     },
     {
       "concurrency": 4,
-      "median_latency_us": 324.0,
-      "per_task_qps": 44.583333333333336,
-      "total_qps": 178.33333333333334
+      "median_latency_us": 677207.0,
+      "per_task_qps": 1.9166666666666667,
+      "total_qps": 7.666666666666667
     },
     {
       "concurrency": 16,
-      "median_latency_us": 362.0,
-      "per_task_qps": 24.8125,
-      "total_qps": 397.0
+      "median_latency_us": 1499.0,
+      "per_task_qps": 1.1458333333333333,
+      "total_qps": 18.333333333333332
     },
     {
       "concurrency": 64,
-      "median_latency_us": 65810.0,
-      "per_task_qps": 6.713541666666667,
-      "total_qps": 429.6666666666667
+      "median_latency_us": 976326.0,
+      "per_task_qps": 0.5677083333333334,
+      "total_qps": 36.333333333333336
     }
   ],
   "primary": {
     "label": "peak speed-up vs C=1",
-    "value": 11.112068965517242,
+    "value": 21.8,
     "unit": "x",
     "bar": {
       "op": "greater_than_or_equal",
       "value": 3.5
     }
   },
-  "generated_at": "@1780105915"
+  "generated_at": "@1780139502"
 }

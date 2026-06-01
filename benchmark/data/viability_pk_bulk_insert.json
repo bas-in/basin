@@ -1,0 +1,23 @@
+{
+  "kind": "viability",
+  "id": "pk_bulk_insert",
+  "name": "Bulk INSERT with PRIMARY KEY",
+  "claim": "After the projection+memoization+i64-fastpath fix, the per-batch cold-tier PK scan no longer dominates bulk INSERT — wall-clock with a PK column stays within 3x of the no-PK shape.",
+  "passed": true,
+  "primary": {
+    "label": "pk_to_nopk_ratio",
+    "value": 1.112225981914179,
+    "unit": "x",
+    "bar": {
+      "op": "less_than",
+      "value": 3.0
+    }
+  },
+  "details": {
+    "batch_size": 2000,
+    "n_batches": 50,
+    "nopk_ms": 8740.976459000001,
+    "pk_ms": 9721.941125000001
+  },
+  "generated_at": "@1780146626"
+}
