@@ -35,9 +35,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::RwLock as StdRwLock;
 use std::time::Instant;
 
 use arrow::ipc::reader::StreamReader;
@@ -134,48 +132,6 @@ type HeldLeases = Arc<Mutex<HashMap<(ProjectId, PartitionKey), i64>>>;
 /// new owner once the handoff completes. Reads are unaffected.
 type DrainingSet = Arc<Mutex<HashSet<(ProjectId, PartitionKey)>>>;
 
-/// Per-(project, table) write/flush sequence counters. Implements the
-/// `has_pending_data` fast-select gate (task #142):
-///
-/// * `pending` advances on every `write_batch` AFTER the row lands in the
-///   tail. Monotone, never decreases.
-/// * `flushed` advances at the end of `compact_all` to the value of
-///   `pending` sampled at the START of that compaction. `fetch_max` keeps it
-///   monotone in the face of concurrent flushers.
-///
-/// `has_pending() == pending > flushed`. Writes that occur DURING a flush
-/// increment `pending` after the snapshot, so `flushed < pending` post-flush
-/// → the next reader still sees `has_pending() == true` and re-flushes. This
-/// eliminates the false-negative (skip flush while tail still has data ⇒
-/// stale read) case spelled out in the task. False positives (flush an
-/// already-clean tail) are wasted work but not a correctness bug.
-#[derive(Default)]
-pub(crate) struct DirtyCounter {
-    pending: AtomicU64,
-    flushed: AtomicU64,
-}
-
-impl DirtyCounter {
-    fn has_pending(&self) -> bool {
-        self.pending.load(Ordering::SeqCst) > self.flushed.load(Ordering::SeqCst)
-    }
-    fn mark_write(&self) {
-        self.pending.fetch_add(1, Ordering::SeqCst);
-    }
-    fn snapshot_pending(&self) -> u64 {
-        self.pending.load(Ordering::SeqCst)
-    }
-    fn mark_flushed_to(&self, seq: u64) {
-        self.flushed.fetch_max(seq, Ordering::SeqCst);
-    }
-}
-
-/// Map keyed by `(ProjectId, TableName)`. Entries are created on first
-/// write; the read-side (`has_pending_data`) does NOT auto-insert, so an
-/// untouched table returns `false` without contending with writers.
-pub(crate) type PendingMap =
-    Arc<StdRwLock<HashMap<(ProjectId, TableName), Arc<DirtyCounter>>>>;
-
 pub(crate) struct InProcessShard {
     pub(crate) cfg: ShardConfig,
     pub(crate) partitions: Arc<Mutex<PartitionMap>>,
@@ -194,11 +150,6 @@ pub(crate) struct InProcessShard {
     /// this set the write path returns `LeaseHandoffInProgress`; the read
     /// path is unaffected. Cleared once the handoff completes or aborts.
     draining: DrainingSet,
-    /// Per-(project, table) write/flush sequence counters. Read by
-    /// `has_pending_data` so fast-select can skip `flush_to_parquet()` when
-    /// no writes have landed since the last flush. See [`DirtyCounter`] for
-    /// the ordering invariant that makes false-negatives impossible.
-    pending_map: PendingMap,
 }
 
 impl InProcessShard {
@@ -211,7 +162,6 @@ impl InProcessShard {
             gin_rowgroup_registry: std::sync::RwLock::new(None),
             held_leases: Arc::new(Mutex::new(HashMap::new())),
             draining: Arc::new(Mutex::new(HashSet::new())),
-            pending_map: Arc::new(StdRwLock::new(HashMap::new())),
         }
     }
 
@@ -234,7 +184,6 @@ impl InProcessShard {
             gin_rowgroup_registry: std::sync::RwLock::new(rg_registry),
             held_leases: self.held_leases.clone(),
             draining: self.draining.clone(),
-            pending_map: self.pending_map.clone(),
         }
     }
 
@@ -1226,33 +1175,11 @@ impl InProcessShard {
         use futures::stream::{FuturesUnordered, StreamExt as _};
         use tokio::sync::Semaphore;
 
-        // Task #142: snapshot each (project, table)'s `pending` counter
-        // BEFORE we begin the drain. After compaction succeeds, advance
-        // `flushed` to this snapshot. Writes that land DURING compaction
-        // increment `pending` past the snapshot ⇒ `has_pending_data` stays
-        // true ⇒ the next reader re-flushes. This is what keeps the gate
-        // free of false negatives (the stale-read bug the task calls out).
-        let pending_snapshot: Vec<((ProjectId, TableName), Arc<DirtyCounter>, u64)> = {
-            let map = self
-                .pending_map
-                .read()
-                .expect("pending_map lock poisoned");
-            map.iter()
-                .map(|(k, c)| (k.clone(), c.clone(), c.snapshot_pending()))
-                .collect()
-        };
-
         let snapshot: PartitionSnapshot = {
             let map = self.partitions.lock().await;
             map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
         };
         if snapshot.is_empty() {
-            // Even with no resident partitions, pending counters can advance
-            // through the no-op path (back-compat with writers that bypass
-            // partition state). Mark flushed so the gate clears.
-            for (_k, c, seq) in &pending_snapshot {
-                c.mark_flushed_to(*seq);
-            }
             return Ok(());
         }
 
@@ -1276,28 +1203,16 @@ impl InProcessShard {
                 (project, partition, res)
             });
         }
-        let mut any_failed = false;
         while let Some((project, partition, res)) = futs.next().await {
             if let Err(e) = res {
                 // A failure to compact one partition must not stall others.
                 // Surface via tracing; the next tick will retry.
-                any_failed = true;
                 warn!(
                     %project,
                     %partition,
                     error = %e,
                     "compaction failed for partition; will retry next tick",
                 );
-            }
-        }
-        // Advance `flushed` to the pre-compaction snapshot for every key.
-        // We only do this when ALL partition compactions succeeded — a
-        // failed partition might still carry data the gate should not
-        // mistakenly clear. `fetch_max` keeps `flushed` monotone across
-        // concurrent flushers.
-        if !any_failed {
-            for (_k, c, seq) in &pending_snapshot {
-                c.mark_flushed_to(*seq);
             }
         }
         Ok(())
@@ -1622,7 +1537,6 @@ impl ShardImpl for InProcessShard {
             cfg: self.cfg.clone(),
             held_leases: self.held_leases.clone(),
             draining: self.draining.clone(),
-            pending_map: self.pending_map.clone(),
         });
         Ok(ProjectHandle { inner })
     }
@@ -1747,22 +1661,6 @@ impl ShardImpl for InProcessShard {
 
     async fn flush_to_parquet(&self) -> Result<()> {
         self.compact_all().await
-    }
-
-    fn has_pending_data(&self, project: &ProjectId, table: &TableName) -> bool {
-        let map = self
-            .pending_map
-            .read()
-            .expect("pending_map lock poisoned");
-        match map.get(&(*project, table.clone())) {
-            Some(c) => c.has_pending(),
-            // Untouched (project, table) ⇒ no writes have landed ⇒ no
-            // pending data. Skipping the flush here is safe because the
-            // first write will create the counter and `mark_write` before
-            // the writer's caller can observe the post-write state through
-            // any other channel.
-            None => false,
-        }
     }
 
     async fn run_tiering_sweep(&self) -> Result<()> {
@@ -2037,10 +1935,6 @@ struct InProcessProjectHandle {
     /// partition is draining so the router can retry against the new owner.
     /// Reads are unaffected.
     draining: DrainingSet,
-    /// Shared per-(project, table) write/flush counters. `write_batch`
-    /// advances `pending` for `(self.project, table)` after the row lands
-    /// in the tail so `Shard::has_pending_data` can gate `flush_to_parquet`.
-    pending_map: PendingMap,
 }
 
 #[async_trait]
@@ -2085,34 +1979,6 @@ impl ProjectHandleImpl for InProcessProjectHandle {
             .entry(table.clone())
             .or_insert_with(|| batch.schema());
         guard.touch();
-        drop(guard);
-
-        // Dirty-bit gate (task #142): mark (project, table) as having
-        // pending tail data. Ordering matters — the increment happens AFTER
-        // the row is in the tail, so any reader that observes the
-        // post-increment counter is guaranteed to also see the tail entry
-        // (no false-negative on has_pending_data).
-        let key = (self.project, table.clone());
-        // Fast path: counter already exists (read lock).
-        if let Some(c) = self
-            .pending_map
-            .read()
-            .expect("pending_map lock poisoned")
-            .get(&key)
-            .cloned()
-        {
-            c.mark_write();
-        } else {
-            // First write for this (project, table) — promote to write lock.
-            let counter = self
-                .pending_map
-                .write()
-                .expect("pending_map lock poisoned")
-                .entry(key)
-                .or_insert_with(|| Arc::new(DirtyCounter::default()))
-                .clone();
-            counter.mark_write();
-        }
         Ok(())
     }
 
@@ -3705,73 +3571,5 @@ mod tests {
         let inner = impl_of(&shard);
         inner.run_heartbeat_once().await;
         // Survival is the assertion.
-    }
-
-    // ── Task #142 — flush_to_parquet dirty-bit gate ──────────────────────────
-    //
-    // Covers the two halves of the invariant the gate relies on:
-    //  * post-write, pre-flush ⇒ `has_pending_data == true`
-    //  * post-flush ⇒ `has_pending_data == false`
-    // The shape mirrors `write_then_read_returns_tail` / `compaction_drains_…`.
-
-    #[tokio::test]
-    async fn has_pending_data_true_after_write() {
-        let (shard, _sd, _wd, _storage, _cat, _wal) = fresh_shard().await;
-        let project = ProjectId::new();
-        let partition = PartitionKey::default_key();
-        let table = TableName::new("events").unwrap();
-
-        // Untouched (project, table) ⇒ no pending data.
-        assert!(
-            !shard.has_pending_data(&project, &table),
-            "fresh shard reports no pending data for an untouched table"
-        );
-
-        let handle = shard.get(&project, &partition).await.unwrap();
-        handle
-            .write_batch(&table, batch(0, 10, "v-"))
-            .await
-            .unwrap();
-
-        assert!(
-            shard.has_pending_data(&project, &table),
-            "after write the gate must report pending data — otherwise \
-             fast-select would skip the flush and serve a stale read"
-        );
-    }
-
-    #[tokio::test]
-    async fn has_pending_data_false_after_flush_completes() {
-        let (shard, _sd, _wd, _storage, _cat, _wal) = fresh_shard().await;
-        let project = ProjectId::new();
-        let partition = PartitionKey::default_key();
-        let table = TableName::new("events").unwrap();
-
-        let handle = shard.get(&project, &partition).await.unwrap();
-        for i in 0..3 {
-            handle
-                .write_batch(&table, batch(i * 10, 10, "v-"))
-                .await
-                .unwrap();
-        }
-        assert!(shard.has_pending_data(&project, &table));
-
-        shard.flush_to_parquet().await.unwrap();
-
-        assert!(
-            !shard.has_pending_data(&project, &table),
-            "after a successful flush the gate must clear — otherwise \
-             fast-select would needlessly re-flush on every read"
-        );
-
-        // Writes that land AFTER the flush must re-arm the gate.
-        handle
-            .write_batch(&table, batch(100, 5, "post-"))
-            .await
-            .unwrap();
-        assert!(
-            shard.has_pending_data(&project, &table),
-            "post-flush write re-arms the gate"
-        );
     }
 }

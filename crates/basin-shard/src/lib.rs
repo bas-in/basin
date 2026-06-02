@@ -250,21 +250,6 @@ impl Shard {
         self.inner.flush_to_parquet().await
     }
 
-    /// Task #142: returns `true` iff `(project, table)` has writes that have
-    /// not yet been flushed to Parquet. The fast-select gate
-    /// (`fast_select::execute_simple_select`) uses this to skip the
-    /// `flush_to_parquet()` call (with its async mutex + per-partition
-    /// HashMap clone) when no writes have landed since the last flush.
-    ///
-    /// Correctness: a `false` return is a positive assertion that
-    /// every write happens-before-this-call is already durable in the
-    /// catalog. The in-process shard maintains per-(project, table)
-    /// pending/flushed counters with `SeqCst` ordering to make
-    /// false-negatives impossible (see `DirtyCounter` in `in_process.rs`).
-    pub fn has_pending_data(&self, project: &ProjectId, table: &TableName) -> bool {
-        self.inner.has_pending_data(project, table)
-    }
-
     /// Run one pass of the tiered-storage sweep. For every `(project, table)`
     /// the shard has touched (i.e. has resident state for, OR has been seen
     /// to live in the catalog under a known project), copy data files older
@@ -498,18 +483,6 @@ pub(crate) trait ShardImpl: Send + Sync {
     fn clone_arc(&self) -> Arc<dyn ShardImpl>;
     fn wal(&self) -> &Arc<dyn basin_wal::Wal>;
     async fn flush_to_parquet(&self) -> Result<()>;
-    /// Task #142 dirty-bit gate: does this shard have writes for
-    /// `(project, table)` that have NOT yet been flushed to Parquet?
-    ///
-    /// `false` means it is safe for a read path to skip
-    /// [`flush_to_parquet`](Self::flush_to_parquet). The implementation
-    /// must guarantee that `false` is returned only when every write that
-    /// happened-before this call is durable in the catalog. Default impl
-    /// returns `true` (conservative) so a backend that has not wired the
-    /// counter still flushes on every read — correctness first.
-    fn has_pending_data(&self, _project: &ProjectId, _table: &TableName) -> bool {
-        true
-    }
     async fn run_tiering_sweep(&self) -> Result<()>;
     /// ADR 0027 Phase 4 — rewrite all cold-tier data files that are missing
     /// the promoted JSONB shadow column(s) for `(project, table)`.  Returns

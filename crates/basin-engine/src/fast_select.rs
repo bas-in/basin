@@ -1276,30 +1276,13 @@ pub(crate) async fn execute_simple_select(
     // When no shard is configured the pre-fetch is always current (writes go
     // directly to storage + catalog synchronously) and can be reused as-is.
     let meta = if let Some(shard) = sess.engine.config().shard.as_ref() {
-        // Task #142 dirty-bit gate: skip the per-select `flush_to_parquet()`
-        // (async mutex + HashMap clone of every resident partition) when
-        // the shard has no pending writes for this (project, table). The
-        // gate's `false` return is correctness-safe (see
-        // `DirtyCounter`/`has_pending_data` in basin-shard).
-        if shard.has_pending_data(&sess.project, &plan.table) {
-            shard.flush_to_parquet().await?;
-            // Reload after flush — the pre-fetched snapshot is now stale.
-            sess.engine
-                .config()
-                .catalog
-                .load_table(&sess.project, &plan.table)
-                .await?
-        } else if let Some(m) = prefetched_meta {
-            // Gate said no pending data ⇒ the pre-fetched snapshot is
-            // current. Reuse it (saves a catalog round-trip).
-            m
-        } else {
-            sess.engine
-                .config()
-                .catalog
-                .load_table(&sess.project, &plan.table)
-                .await?
-        }
+        shard.flush_to_parquet().await?;
+        // Reload after flush — the pre-fetched snapshot is now stale.
+        sess.engine
+            .config()
+            .catalog
+            .load_table(&sess.project, &plan.table)
+            .await?
     } else {
         // No shard: use the pre-fetched metadata when available (saves one
         // catalog round-trip that the fast-path gate already paid).
