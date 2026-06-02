@@ -367,7 +367,8 @@ pub(crate) enum OverridingKind {
 
 /// A single savepoint frame — captures the per-table pending-file watermark
 /// at the moment `SAVEPOINT <name>` was issued.  Rolling back to this
-/// savepoint discards all files appended after the watermark.
+/// savepoint discards all files (and tx-buffered htap batches) appended
+/// after the watermark.
 #[derive(Debug)]
 pub(crate) struct SavepointFrame {
     /// Name of the savepoint (case-sensitive, per PG).
@@ -376,12 +377,21 @@ pub(crate) struct SavepointFrame {
     /// existed at savepoint time. Files at or beyond this index are the ones
     /// that would be rolled back if we `ROLLBACK TO <name>`.
     pub(crate) file_offsets: HashMap<TableName, usize>,
+    /// For each table with tx-buffered htap batches at savepoint time, the
+    /// `Vec<RecordBatch>` length.  perf-w7-txn: INSERTs in an open tx are
+    /// buffered in `htap_rows` instead of being written to Parquet, so the
+    /// savepoint must rewind that buffer too.
+    pub(crate) htap_offsets: HashMap<TableName, usize>,
 }
 
 impl SavepointFrame {
     /// Clone the `file_offsets` map for use during rollback-to-savepoint.
     fn clone_offsets(&self) -> HashMap<TableName, usize> {
         self.file_offsets.clone()
+    }
+    /// Clone the `htap_offsets` map for use during rollback-to-savepoint.
+    fn clone_htap_offsets(&self) -> HashMap<TableName, usize> {
+        self.htap_offsets.clone()
     }
 }
 
@@ -775,9 +785,15 @@ pub(crate) fn tx_push_savepoint(state: &SessionState, name: String) {
         .iter()
         .map(|(t, v)| (t.clone(), v.len()))
         .collect();
+    let htap_offsets: HashMap<TableName, usize> = tx
+        .htap_rows
+        .iter()
+        .map(|(t, v)| (t.clone(), v.len()))
+        .collect();
     tx.savepoints.push(SavepointFrame {
         name,
         file_offsets: offsets,
+        htap_offsets,
     });
 }
 
@@ -834,6 +850,7 @@ pub(crate) fn tx_rollback_to_savepoint(
     // The target frame's recorded watermarks remain valid because we are
     // about to discard every pending file beyond them.
     let target_frame = tx.savepoints[pos].clone_offsets();
+    let target_htap = tx.savepoints[pos].clone_htap_offsets();
     tx.savepoints.truncate(pos + 1);
 
     // Collect the abandoned tail for each table.
@@ -847,6 +864,19 @@ pub(crate) fn tx_rollback_to_savepoint(
     }
     // Remove tables that now have zero pending files.
     tx.pending_files.retain(|_, v| !v.is_empty());
+
+    // perf-w7-txn: truncate tx-buffered htap batches to the savepoint
+    // watermark.  INSERTs are now buffered there, so a ROLLBACK TO must
+    // discard the batches written after the savepoint or those rows would
+    // resurrect on COMMIT.  Unlike pending files there's no on-disk cleanup
+    // to do — just drop the batches.
+    for (table, batches) in tx.htap_rows.iter_mut() {
+        let offset = target_htap.get(table).copied().unwrap_or(0);
+        if batches.len() > offset {
+            batches.truncate(offset);
+        }
+    }
+    tx.htap_rows.retain(|_, v| !v.is_empty());
 
     // Clear aborted state — ROLLBACK TO SAVEPOINT recovers the txn.
     tx.aborted = false;
@@ -867,16 +897,16 @@ pub(crate) fn tx_pending_files_for(state: &SessionState, table: &TableName) -> V
         .unwrap_or_default()
 }
 
-/// Returns all tables that have pending files.
+/// Returns all tables that have pending files OR tx-buffered htap batches.
+/// perf-w7-txn: INSERT-only tables no longer add to pending_files (they go
+/// into htap_rows), so the rollback-to-savepoint refresh-loop must consult
+/// both maps to find every table whose visible state changed.
 pub(crate) fn tx_touched_tables(state: &SessionState) -> Vec<TableName> {
-    state
-        .tx_state
-        .lock()
-        .expect("tx_state lock poisoned")
-        .pending_files
-        .keys()
-        .cloned()
-        .collect()
+    let tx = state.tx_state.lock().expect("tx_state lock poisoned");
+    let mut set: std::collections::HashSet<TableName> =
+        tx.pending_files.keys().cloned().collect();
+    set.extend(tx.htap_rows.keys().cloned());
+    set.into_iter().collect()
 }
 
 // ── Phase 5.14.C2 HTAP helpers ────────────────────────────────────────────────

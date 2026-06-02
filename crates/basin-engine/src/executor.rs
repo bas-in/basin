@@ -734,10 +734,106 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                     // Promote committed HTAP batches to the process-wide registry.
                     htap_promote_to_registry(sess, &htap_rows).await?;
 
+                    // perf-w7-txn: write buffered INSERT batches to ONE Parquet
+                    // file per table.  Replaces the old per-INSERT writes that
+                    // dominated `BEGIN; INSERT x100; COMMIT` cost.  Each table's
+                    // files (htap-derived + any UPDATE/DELETE pending files) are
+                    // committed together so the catalog snapshot advances once.
+                    let mut buffered_files: std::collections::HashMap<
+                        TableName,
+                        Vec<DataFileRef>,
+                    > = std::collections::HashMap::new();
+                    for (table, batches) in &htap_rows {
+                        if batches.is_empty() {
+                            continue;
+                        }
+                        // Load table metadata to derive write options.
+                        let meta = match sess
+                            .engine
+                            .config()
+                            .catalog
+                            .load_table(&sess.project, table)
+                            .await
+                        {
+                            Ok(m) => m,
+                            Err(e) => {
+                                crate::session::tx_set_aborted(&sess.state);
+                                return Err(e);
+                            }
+                        };
+                        // Concat all buffered batches into one.  `concat_batches`
+                        // shares Arrow buffers where possible; for the typical
+                        // single-row-per-INSERT shape this is a cheap copy.
+                        let schema = batches[0].schema();
+                        let combined = match arrow::compute::concat_batches(&schema, batches) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                crate::session::tx_set_aborted(&sess.state);
+                                return Err(BasinError::internal(format!(
+                                    "concat_batches at COMMIT for {table}: {e}"
+                                )));
+                            }
+                        };
+                        let opts = write_options_for(&meta, false);
+                        let part = basin_common::PartitionKey::default_key();
+                        let df = match sess
+                            .engine
+                            .config()
+                            .storage
+                            .write_batch_with_options(
+                                &sess.project,
+                                table,
+                                &part,
+                                &combined,
+                                &opts,
+                            )
+                            .await
+                        {
+                            Ok(d) => d,
+                            Err(e) => {
+                                crate::session::tx_set_aborted(&sess.state);
+                                return Err(e);
+                            }
+                        };
+                        // Maintain secondary indexes against the COMMIT-time
+                        // file path (deferred from the in-tx INSERT path
+                        // because no real file existed then).
+                        maintain_secondary_indexes_on_insert(
+                            sess,
+                            table,
+                            &meta,
+                            &combined,
+                            df.path.as_ref(),
+                        )
+                        .await;
+                        buffered_files.insert(
+                            table.clone(),
+                            vec![DataFileRef {
+                                path: df.path.as_ref().to_string(),
+                                size_bytes: df.size_bytes,
+                                row_count: df.row_count,
+                                column_stats: df.column_stats.clone(),
+                                bloom_filters: df.bloom_filters.clone(),
+                                hll_sketches: std::collections::BTreeMap::new(),
+                                tdigest_sketches: std::collections::BTreeMap::new(),
+                            }],
+                        );
+                    }
+
                     // Flush pending files to the catalog (real COMMIT).
+                    // `pending` contains UPDATE/DELETE-generated files (INSERT
+                    // batches are no longer staged as pending files — they were
+                    // just written above into `buffered_files`).
                     let pending = crate::session::tx_commit(&sess.state);
-                    if !pending.is_empty() {
-                        for (table, files) in &pending {
+                    // Merge buffered (htap-INSERT) + pending (UPDATE/DELETE)
+                    // files per table so each table commits once.
+                    let mut commits: std::collections::HashMap<TableName, Vec<DataFileRef>> =
+                        buffered_files;
+                    for (table, files) in pending {
+                        commits.entry(table).or_default().extend(files);
+                    }
+                    if !commits.is_empty() {
+                        for (table, files) in &commits {
                             // Load the current snapshot id for this table.
                             let snap = {
                                 let snaps = sess.state.snapshots.lock().await;
@@ -851,19 +947,29 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                                         }
                                     }
                                     // Refresh DataFusion ctx for affected tables.
+                                    // perf-w7-txn: must use refresh_table_with_htap
+                                    // so the truncated htap_rows are reflected
+                                    // (savepoint may have rolled back buffered
+                                    // INSERT batches but kept earlier ones).
                                     let touched = crate::session::tx_touched_tables(&sess.state);
                                     for table in &touched {
                                         let pending = crate::session::tx_pending_files_for(
                                             &sess.state,
                                             table,
                                         );
-                                        let _ = crate::session::refresh_table_with_extra(
+                                        let htap_batches =
+                                            crate::session::tx_htap_batches_for(
+                                                &sess.state,
+                                                table,
+                                            );
+                                        let _ = crate::session::refresh_table_with_htap(
                                             &sess.engine,
                                             &sess.project,
                                             &sess.ctx,
                                             &sess.state,
                                             table,
                                             &pending,
+                                            htap_batches,
                                         )
                                         .await;
                                     }
@@ -4082,9 +4188,8 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
     // a new file at the *next* SELECT's `shard.flush_to_parquet()` and is
     // appended at a fresh snapshot, resurrecting the row). Fall through to
     // the legacy synchronous path inside an explicit transaction so the
-    // write lands in `TxState::pending_files` + `htap_rows`, where ROLLBACK
-    // can actually discard it. Bench-shape #42 (`rollback_drops_rows`)
-    // regression.
+    // write lands in `TxState::htap_rows`, where ROLLBACK can actually
+    // discard it. Bench-shape #42 (`rollback_drops_rows`) regression.
     if let Some(shard) = sess.engine.config().shard.as_ref() {
         if !crate::session::tx_is_active(&sess.state) {
             let handle = shard.get(&sess.project, &part).await?;
@@ -4101,13 +4206,76 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
         // path's `shard.flush_to_parquet()`; no extra flush is needed here.
     }
 
-    // Legacy synchronous path (no shard configured).
+    // ── Transaction-deferred path (THE BIG OLTP WIN) ────────────────────
+    // When inside an explicit transaction, buffer the Arrow batch in the
+    // tx-local HTAP store and SKIP the per-INSERT Parquet write + per-INSERT
+    // ListingTable refresh.  COMMIT drains the buffer, concats per-table,
+    // and emits ONE Parquet write + ONE catalog commit per table.
+    // `BEGIN; INSERT x100; COMMIT` goes from ~185ms to ~10-20ms.
     //
-    // Order: write parquet → (if in txn: defer to pending_files + refresh
-    // with extra; else: dispatch pre-commit → commit catalog → refresh).
+    // Intra-tx read-your-own-writes is served by `refresh_table_with_htap`
+    // (HtapUnionTable provider).  ROLLBACK discards the buffer with zero
+    // storage cleanup — no orphan Parquet files exist.
+    //
+    // Cross-INSERT PK / UNIQUE dedup (which previously rode on the per-INSERT
+    // pending file appearing in storage LIST) is enforced by
+    // `enforce_intra_tx_uniqueness` against the prior buffered batches before
+    // we accept this INSERT.
+    if crate::session::tx_is_active(&sess.state) {
+        // Cross-INSERT dedup against prior tx-buffered batches.  Must run
+        // BEFORE pushing the current batch so we don't compare against
+        // ourselves.  enforce_pk_on_insert + enforce_unique_on_insert
+        // already ran above against on-disk files, so this just covers the
+        // tx-local gap.
+        enforce_intra_tx_uniqueness(
+            sess,
+            &table,
+            table.as_str(),
+            &meta.pk_columns,
+            &meta.unique_constraints,
+            &batch,
+        )?;
+        // Lazy WAL Begin — idempotent within a tx.
+        htap_emit_wal_begin_lazy(sess).await;
+        // Buffer batch for tx-local read-your-own-writes.
+        crate::session::tx_htap_push_batch(&sess.state, &table, batch.clone());
+        let htap_batches = crate::session::tx_htap_batches_for(&sess.state, &table);
+        if let Err(e) = crate::session::refresh_table_with_htap(
+            &sess.engine,
+            &sess.project,
+            &sess.ctx,
+            &sess.state,
+            &table,
+            &[],
+            htap_batches,
+        )
+        .await
+        {
+            // If refresh fails, mark the txn aborted and propagate.
+            crate::session::tx_set_aborted(&sess.state);
+            return Err(e);
+        }
+        // Secondary index maintenance is deferred to COMMIT (when the real
+        // Parquet path exists).  Intra-tx SELECTs fall back to a full scan
+        // against the HtapUnionTable provider, which is correct (no index
+        // means no GIN/B-tree pruning — same semantics as a fresh table).
+        if ins.returning.is_some() {
+            return Ok(ExecResult::Rows {
+                schema: batch.schema(),
+                batches: vec![batch],
+            });
+        }
+        return Ok(ExecResult::Empty {
+            tag: format!("INSERT 0 {row_count}"),
+        });
+    }
+
+    // Legacy synchronous path (auto-commit, no shard).
+    //
+    // Order: write parquet → dispatch pre-commit → commit catalog → refresh.
     let events = build_insert_events(sess, &table, std::slice::from_ref(&batch))?;
 
-    let opts = write_options_for(&meta, crate::session::tx_is_active(&sess.state));
+    let opts = write_options_for(&meta, false);
     let df = sess
         .engine
         .config()
@@ -4124,51 +4292,6 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
         hll_sketches: std::collections::BTreeMap::new(),
         tdigest_sketches: std::collections::BTreeMap::new(),
     };
-
-    // ── Transaction-deferred path ────────────────────────────────────────
-    // When inside an explicit transaction, defer catalog commit.  The file
-    // has been written to storage; add it to the session's pending list and
-    // register it with DataFusion so within-tx SELECTs can see it.
-    //
-    // Phase 5.14.C2: also buffer the Arrow batch in the tx-local HTAP store
-    // so that projection-scan queries (not just COUNT(*)) can see uncommitted
-    // rows from the same transaction.  WAL Begin marker is emitted lazily on
-    // the first DML inside the tx.
-    if crate::session::tx_is_active(&sess.state) {
-        // Lazy WAL Begin — idempotent within a tx.
-        htap_emit_wal_begin_lazy(sess).await;
-        // Buffer batch for tx-local read-your-own-writes.
-        crate::session::tx_htap_push_batch(&sess.state, &table, batch.clone());
-        crate::session::tx_push_pending_file(&sess.state, &table, file_ref);
-        let pending = crate::session::tx_pending_files_for(&sess.state, &table);
-        let htap_batches = crate::session::tx_htap_batches_for(&sess.state, &table);
-        if let Err(e) = crate::session::refresh_table_with_htap(
-            &sess.engine,
-            &sess.project,
-            &sess.ctx,
-            &sess.state,
-            &table,
-            &pending,
-            htap_batches,
-        )
-        .await
-        {
-            // If refresh fails, mark the txn aborted and propagate.
-            crate::session::tx_set_aborted(&sess.state);
-            return Err(e);
-        }
-        // Phase 5.7 B1: maintain secondary indexes on INSERT (tx-active path).
-        maintain_secondary_indexes_on_insert(sess, &table, &meta, &batch, df.path.as_ref()).await;
-        if ins.returning.is_some() {
-            return Ok(ExecResult::Rows {
-                schema: batch.schema(),
-                batches: vec![batch],
-            });
-        }
-        return Ok(ExecResult::Empty {
-            tag: format!("INSERT 0 {row_count}"),
-        });
-    }
 
     // ── Auto-commit path ─────────────────────────────────────────────────
     // Register the just-written (not-yet-catalogued) file as an "extra" so
@@ -4500,9 +4623,44 @@ async fn exec_insert_select(
     .await?;
 
     let part = PartitionKey::default_key();
+
+    // ── Phase 5.14.C3: INSERT-SELECT HTAP wiring (transaction-deferred path) ──
+    // Big OLTP win: buffer the batch in the tx-local HTAP store and SKIP the
+    // per-INSERT Parquet write.  COMMIT emits ONE write per table.
+    if crate::session::tx_is_active(&sess.state) {
+        enforce_intra_tx_uniqueness(
+            sess,
+            table,
+            table.as_str(),
+            &meta.pk_columns,
+            &meta.unique_constraints,
+            &batch,
+        )?;
+        htap_emit_wal_begin_lazy(sess).await;
+        crate::session::tx_htap_push_batch(&sess.state, table, batch.clone());
+        let htap_batches = crate::session::tx_htap_batches_for(&sess.state, table);
+        if let Err(e) = crate::session::refresh_table_with_htap(
+            &sess.engine,
+            &sess.project,
+            &sess.ctx,
+            &sess.state,
+            table,
+            &[],
+            htap_batches,
+        )
+        .await
+        {
+            crate::session::tx_set_aborted(&sess.state);
+            return Err(e);
+        }
+        return Ok(ExecResult::Empty {
+            tag: format!("INSERT 0 {row_count}"),
+        });
+    }
+
     let events = build_insert_events(sess, table, std::slice::from_ref(&batch))?;
 
-    let opts = write_options_for(&meta, crate::session::tx_is_active(&sess.state));
+    let opts = write_options_for(&meta, false);
     let written = sess
         .engine
         .config()
@@ -4519,36 +4677,6 @@ async fn exec_insert_select(
         hll_sketches: std::collections::BTreeMap::new(),
         tdigest_sketches: std::collections::BTreeMap::new(),
     };
-
-    // ── Phase 5.14.C3: INSERT-SELECT HTAP wiring (transaction-deferred path) ──
-    // When inside an explicit transaction, mirror the VALUES path: buffer the
-    // batch in the tx-local HTAP store and defer the catalog commit.
-    if crate::session::tx_is_active(&sess.state) {
-        // Lazy WAL Begin — idempotent within a tx.
-        htap_emit_wal_begin_lazy(sess).await;
-        // Buffer batch for tx-local read-your-own-writes.
-        crate::session::tx_htap_push_batch(&sess.state, table, batch.clone());
-        crate::session::tx_push_pending_file(&sess.state, table, file_ref);
-        let pending = crate::session::tx_pending_files_for(&sess.state, table);
-        let htap_batches = crate::session::tx_htap_batches_for(&sess.state, table);
-        if let Err(e) = crate::session::refresh_table_with_htap(
-            &sess.engine,
-            &sess.project,
-            &sess.ctx,
-            &sess.state,
-            table,
-            &pending,
-            htap_batches,
-        )
-        .await
-        {
-            crate::session::tx_set_aborted(&sess.state);
-            return Err(e);
-        }
-        return Ok(ExecResult::Empty {
-            tag: format!("INSERT 0 {row_count}"),
-        });
-    }
 
     // Pre-commit: expose the new file to DataFusion so reactor hooks can
     // see it.  Mirror the auto-commit VALUES path: use refresh_table_with_extra
@@ -4719,35 +4847,21 @@ async fn exec_insert_default_values(
 
     let row_count = batch.num_rows();
     let part = PartitionKey::default_key();
-    let opts = write_options_for(&meta, crate::session::tx_is_active(&sess.state));
-
-    let events = build_insert_events(sess, &table, std::slice::from_ref(&batch))?;
-    let df = sess
-        .engine
-        .config()
-        .storage
-        .write_batch_with_options(&sess.project, &table, &part, &batch, &opts)
-        .await?;
-    let file_ref = DataFileRef {
-        path: df.path.as_ref().to_string(),
-        size_bytes: df.size_bytes,
-        row_count: df.row_count,
-        column_stats: df.column_stats.clone(),
-        bloom_filters: df.bloom_filters.clone(),
-        hll_sketches: std::collections::BTreeMap::new(),
-        tdigest_sketches: std::collections::BTreeMap::new(),
-    };
 
     // ── Phase 5.14.C3: DEFAULT VALUES HTAP wiring (transaction-deferred path) ─
-    // When inside an explicit transaction, mirror the VALUES path: buffer the
-    // batch in the tx-local HTAP store and defer the catalog commit.
+    // Big OLTP win: buffer the batch in the tx-local HTAP store and SKIP the
+    // per-INSERT Parquet write.  COMMIT emits ONE write per table.
     if crate::session::tx_is_active(&sess.state) {
-        // Lazy WAL Begin — idempotent within a tx.
+        enforce_intra_tx_uniqueness(
+            sess,
+            &table,
+            table.as_str(),
+            &meta.pk_columns,
+            &meta.unique_constraints,
+            &batch,
+        )?;
         htap_emit_wal_begin_lazy(sess).await;
-        // Buffer batch for tx-local read-your-own-writes.
         crate::session::tx_htap_push_batch(&sess.state, &table, batch.clone());
-        crate::session::tx_push_pending_file(&sess.state, &table, file_ref);
-        let pending = crate::session::tx_pending_files_for(&sess.state, &table);
         let htap_batches = crate::session::tx_htap_batches_for(&sess.state, &table);
         if let Err(e) = crate::session::refresh_table_with_htap(
             &sess.engine,
@@ -4755,7 +4869,7 @@ async fn exec_insert_default_values(
             &sess.ctx,
             &sess.state,
             &table,
-            &pending,
+            &[],
             htap_batches,
         )
         .await
@@ -4773,6 +4887,24 @@ async fn exec_insert_default_values(
             tag: format!("INSERT 0 {row_count}"),
         });
     }
+
+    let opts = write_options_for(&meta, false);
+    let events = build_insert_events(sess, &table, std::slice::from_ref(&batch))?;
+    let df = sess
+        .engine
+        .config()
+        .storage
+        .write_batch_with_options(&sess.project, &table, &part, &batch, &opts)
+        .await?;
+    let file_ref = DataFileRef {
+        path: df.path.as_ref().to_string(),
+        size_bytes: df.size_bytes,
+        row_count: df.row_count,
+        column_stats: df.column_stats.clone(),
+        bloom_filters: df.bloom_filters.clone(),
+        hll_sketches: std::collections::BTreeMap::new(),
+        tdigest_sketches: std::collections::BTreeMap::new(),
+    };
 
     // Pre-commit: register the new file as "extra" so reactor hooks see it
     // before the catalog snapshot advances (mirrors the VALUES path fix).
@@ -6022,15 +6154,19 @@ async fn exec_select(
         for table in &tables {
             if in_tx {
                 // Within a transaction: include pending (not-yet-committed)
-                // files so reads can see within-tx writes.
+                // files (UPDATE/DELETE rewrites) AND tx-buffered htap batches
+                // (INSERTs deferred until COMMIT — perf-w7-txn) so reads see
+                // within-tx writes.
                 let pending = crate::session::tx_pending_files_for(&sess.state, table);
-                crate::session::refresh_table_with_extra(
+                let htap_batches = crate::session::tx_htap_batches_for(&sess.state, table);
+                crate::session::refresh_table_with_htap(
                     &sess.engine,
                     &sess.project,
                     &sess.ctx,
                     &sess.state,
                     table,
                     &pending,
+                    htap_batches,
                 )
                 .await?;
             } else {
@@ -7947,6 +8083,132 @@ fn record_query_patterns(sess: &ProjectSession, query: &sqlparser::ast::Query) {
 }
 
 // ── Phase 5.14.C2 HTAP helpers ────────────────────────────────────────────────
+
+/// Cross-INSERT PK / UNIQUE dedup for the tx-deferred INSERT path.
+///
+/// `enforce_pk_on_insert` / `enforce_unique_on_insert` already ran against
+/// on-disk files (committed snapshot + any pending files from UPDATE/DELETE
+/// rewrites).  With the OLTP-write optimisation (perf-w7-txn), per-INSERT
+/// Parquet writes are deferred until COMMIT — prior in-tx INSERTs live only
+/// as buffered `RecordBatch`es in `TxState::htap_rows`.  This helper closes
+/// that gap by probing the current batch's PK / UNIQUE tuples against the
+/// prior buffered batches.
+///
+/// Cheap: O(prior_rows + batch_rows) per call.  Skipped when the table has
+/// no constraints or no prior buffered batches.
+fn enforce_intra_tx_uniqueness(
+    sess: &ProjectSession,
+    table: &TableName,
+    table_name_str: &str,
+    pk_columns: &[String],
+    unique_constraints: &[basin_catalog::UniqueConstraint],
+    batch: &arrow_array::RecordBatch,
+) -> Result<()> {
+    if batch.num_rows() == 0 {
+        return Ok(());
+    }
+    if pk_columns.is_empty() && unique_constraints.is_empty() {
+        return Ok(());
+    }
+    let prior = crate::session::tx_htap_batches_for(&sess.state, table);
+    if prior.is_empty() {
+        return Ok(());
+    }
+
+    // PK check.
+    if !pk_columns.is_empty() {
+        let pk_idx_curr: Vec<usize> = pk_columns
+            .iter()
+            .map(|c| {
+                batch.schema().index_of(c).map_err(|_| {
+                    BasinError::internal(format!("PK column {c:?} missing from batch"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut existing: std::collections::HashSet<Vec<String>> =
+            std::collections::HashSet::new();
+        for rb in &prior {
+            let idx: Vec<usize> = pk_columns
+                .iter()
+                .map(|c| {
+                    rb.schema().index_of(c).map_err(|_| {
+                        BasinError::internal(format!(
+                            "PK column {c:?} missing from tx-buffered batch"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for row in 0..rb.num_rows() {
+                if let Some(k) = crate::constraints::pk_tuple_for_row(rb, &idx, row)? {
+                    existing.insert(k);
+                }
+            }
+        }
+        for row in 0..batch.num_rows() {
+            if let Some(k) = crate::constraints::pk_tuple_for_row(batch, &pk_idx_curr, row)? {
+                if existing.contains(&k) {
+                    return Err(BasinError::UniqueViolation(format!(
+                        "duplicate key value violates unique constraint \
+                         \"{table_name_str}_pkey\": Key ({})=({}) already exists.",
+                        pk_columns.join(", "),
+                        k.join(", ")
+                    )));
+                }
+            }
+        }
+    }
+
+    // UNIQUE constraints (per-constraint NULL-skip semantics, mirroring
+    // `enforce_one_unique`).
+    for u in unique_constraints {
+        if u.columns.is_empty() {
+            continue;
+        }
+        let curr_idx: Vec<usize> = u
+            .columns
+            .iter()
+            .map(|c| {
+                batch.schema().index_of(c).map_err(|_| {
+                    BasinError::internal(format!("UNIQUE column {c:?} missing from batch"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut existing: std::collections::HashSet<Vec<String>> =
+            std::collections::HashSet::new();
+        for rb in &prior {
+            let idx: Vec<usize> = u
+                .columns
+                .iter()
+                .map(|c| {
+                    rb.schema().index_of(c).map_err(|_| {
+                        BasinError::internal(format!(
+                            "UNIQUE column {c:?} missing from tx-buffered batch"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for row in 0..rb.num_rows() {
+                if let Some(k) = crate::constraints::pk_tuple_for_row(rb, &idx, row)? {
+                    existing.insert(k);
+                }
+            }
+        }
+        for row in 0..batch.num_rows() {
+            if let Some(k) = crate::constraints::pk_tuple_for_row(batch, &curr_idx, row)? {
+                if existing.contains(&k) {
+                    return Err(BasinError::UniqueViolation(format!(
+                        "duplicate key value violates unique constraint \"{}\": \
+                         Key ({})=({}) already exists.",
+                        u.name,
+                        u.columns.join(", "),
+                        k.join(", ")
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Emit a WAL `Begin` marker the first time a DML statement runs inside an
 /// explicit transaction.  The marker is lazy: it is emitted once per tx, on
