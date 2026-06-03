@@ -2205,7 +2205,7 @@ fn vortex_filter_expr(
     catalog_schema: Option<&Schema>,
 ) -> (Option<vortex_array::expr::Expression>, bool) {
     use arrow_schema::DataType;
-    use vortex_array::expr::{and_collect, col, eq, gt, lit, lt, Expression};
+    use vortex_array::expr::{and_collect, col, eq, gt, like, lit, lt, Expression};
 
     if filters.is_empty() {
         return (None, true);
@@ -2251,14 +2251,45 @@ fn vortex_filter_expr(
                 }
                 e
             }
-            // Prefix match isn't expressible in Vortex's scalar Expression
-            // surface here (no `starts_with` builder in this version of the
-            // crate). Mark not-fully-pushed so the engine re-evaluates the
-            // predicate post-decode; the Vortex scan still benefits from
-            // any min/max stats and the projection prune.
-            Predicate::StartsWith { .. } => {
-                all_pushed = false;
-                None
+            // Prefix match → Vortex `LIKE 'escaped_prefix%'`. The kernel
+            // requires both child and pattern to be UTF8 dtype, and its
+            // `stat_falsification` does min/max zone-map pruning for the
+            // `LIKE 'prefix%'` shape (when not negated, not ILIKE) — so
+            // pushing this is a real prune win, not just a post-decode
+            // cost shift. ILIKE is left to the post-decode re-evaluation
+            // (Vortex's stat-falsification doesn't handle case-insensitive).
+            //
+            // Type-safety mirrors the scalar arms above: only push when
+            // the catalog schema proves the column is Arrow `Utf8`.
+            // `LargeUtf8` / `Utf8View` are NOT pushed (avoid the dtype
+            // mismatch panic in the spawned scan task).
+            Predicate::StartsWith {
+                column,
+                prefix,
+                case_insensitive,
+            } => {
+                let dt_utf8 = schema
+                    .field_with_name(column)
+                    .ok()
+                    .map(|f| matches!(f.data_type(), DataType::Utf8))
+                    .unwrap_or(false);
+                if *case_insensitive || !dt_utf8 {
+                    all_pushed = false;
+                    None
+                } else {
+                    // Escape LIKE metacharacters in the literal prefix
+                    // (`\`, `%`, `_`) so a pattern like `100%off` matches
+                    // literally up to the appended `%`.
+                    let mut escaped = String::with_capacity(prefix.len() + 1);
+                    for ch in prefix.chars() {
+                        if ch == '\\' || ch == '%' || ch == '_' {
+                            escaped.push('\\');
+                        }
+                        escaped.push(ch);
+                    }
+                    escaped.push('%');
+                    Some(like(col(column.as_str()), lit(escaped)))
+                }
             }
         })
         .collect();
