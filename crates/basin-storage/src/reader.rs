@@ -1822,6 +1822,16 @@ where
                     builder = builder.with_row_filter(predicates);
                 }
 
+                // LIMIT pushdown into the Parquet builder. parquet-rs
+                // `with_limit` does BOTH inter-row-group skip (stops decoding
+                // entire row groups once N rows are produced) AND
+                // intra-row-group early-exit (stops mid-batch). The
+                // `apply_limit_to_stream` wrapper at the call site is kept as
+                // a belt-and-braces guard (no-op when the builder exits first).
+                if let Some(lim) = opts.limit {
+                    builder = builder.with_limit(lim);
+                }
+
                 let stream = builder
                     .build()
                     .map_err(|e| BasinError::storage(format!("parquet build {path}: {e}")))?;
@@ -1850,7 +1860,14 @@ where
                 // is pure overhead — and on cache-full workloads we've
                 // measured the layer (c) read path at ~2× of layer (b)
                 // because of this clone alone.
-                if let (Some(pc), Some(key)) = (page_cache, cache_key) {
+                // Page-cache write-through is keyed on (file, projection,
+                // filters) but NOT on LIMIT. Caching a partial (LIMIT-bounded)
+                // result would later satisfy unlimited / larger-N callers from
+                // a too-short entry, corrupting query results. Skip the
+                // write-through whenever a LIMIT is in effect.
+                if let (Some(pc), Some(key), true) =
+                    (page_cache, cache_key, opts.limit.is_none())
+                {
                     if !pc.has_capacity() {
                         return Ok(mapped.boxed());
                     }
@@ -1982,6 +1999,12 @@ where
         builder = builder.with_row_filter(predicates);
     }
 
+    // LIMIT pushdown into the Parquet builder (see notes on the
+    // synth-batch site above): inter- and intra-row-group early-exit.
+    if let Some(lim) = opts.limit {
+        builder = builder.with_limit(lim);
+    }
+
     let stream = builder
         .build()
         .map_err(|e| BasinError::storage(format!("parquet build {path}: {e}")))?;
@@ -1996,7 +2019,12 @@ where
         Ok(restamp_field_metadata_from_catalog(batch, catalog_schema_for_stamp.as_ref()))
     });
 
-    if let (Some(pc), Some(key)) = (page_cache, cache_key) {
+    // Page-cache write-through is keyed on (file, projection, filters)
+    // but NOT on LIMIT. Caching a partial (LIMIT-bounded) result would
+    // later satisfy unlimited / larger-N callers from a too-short
+    // entry, corrupting query results. Skip the write-through whenever
+    // a LIMIT is in effect.
+    if let (Some(pc), Some(key), true) = (page_cache, cache_key, opts.limit.is_none()) {
         // LRU-budget-aware (see notes on the synth-batch site above):
         // skip write-through entirely when the cache has no capacity
         // for a new entry. Avoids paying the per-batch clone cost on
