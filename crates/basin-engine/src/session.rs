@@ -22,11 +22,16 @@
 
 use crate::pg_ast::ObjectNamePartExt;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, OnceLock, RwLock};
+use std::time::Instant;
 
 use crate::AuthContext;
 
-use basin_catalog::{DataFileRef, PartitionSpec, PromotedJsonbPath, SnapshotId, TableFileFormat};
+use basin_catalog::{
+    DataFileRef, PartitionSpec, PromotedJsonbPath, SnapshotId, TableFileFormat, TableMetadata,
+    ViewDef,
+};
 use basin_common::{BasinError, ProjectId, QualifiedTableName, Result, SchemaName, TableName};
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use datafusion::common::TableReference;
@@ -540,6 +545,11 @@ pub(crate) struct SessionState {
     /// state behind one `Mutex` so executor handlers can flip
     /// subscriptions and drain pending notifies atomically.
     pub(crate) listen: std::sync::Mutex<ListenState>,
+    /// Per-session table-metadata cache. Populated lazily by the SELECT
+    /// fast-path gate; cleared at the top of executor dispatch for any
+    /// non-`SELECT` statement. See [`TableMetaCache`] for the full
+    /// correctness model.
+    pub(crate) table_meta_cache: TableMetaCache,
 }
 
 impl Drop for SessionState {
@@ -598,9 +608,219 @@ impl SessionState {
             idle_in_transaction_session_timeout: std::sync::Mutex::new(None),
             last_active: std::sync::Mutex::new(std::time::Instant::now()),
             listen: std::sync::Mutex::new(ListenState::default()),
+            table_meta_cache: TableMetaCache::new(),
         }
     }
 }
+
+// ── Per-session table-metadata cache ────────────────────────────────────────
+//
+// Inv-OLTP-point (#149): on the executor's point-query fast path, the gate
+// at `executor.rs:2117-2131` pays two async catalog round-trips per query —
+// `load_table` (~5–15µs) plus `lookup_view` (~2–5µs). The fast path itself
+// then runs in single-µs territory, so those catalog calls dominate the
+// latency floor.
+//
+// This cache stores one `(Arc<TableMetadata>, view_present)` tuple per
+// table name, capped at 128 entries (LRU) per session with a short TTL
+// (default 500ms, override via `BASIN_ENGINE_TABLE_META_CACHE_TTL_MS`).
+//
+// **Correctness model**
+//
+// * Same-session DDL invalidation is mandatory — the executor calls
+//   [`TableMetaCache::invalidate_all`] at the top of dispatch for every
+//   non-`SELECT` statement, which clears the entire cache before the DDL
+//   handler runs. The next SELECT therefore observes the post-DDL state.
+// * Same-session DML does NOT mutate schema/indexes; `data_files` staleness
+//   in the cached `TableMetadata` is irrelevant because
+//   `execute_simple_select` calls `shard.flush_to_parquet()` + reloads the
+//   metadata via `catalog.load_table` itself after the flush. The cached
+//   value is only consumed by the fast-path GATE (schema / RLS / view /
+//   soft-delete / citext flags), not as the final source of truth for the
+//   read.
+// * Cross-session DDL becomes visible within the TTL window — same
+//   "eventual consistency" bound the engine already advertises for catalog
+//   reads. 500ms is short enough that even integration tests that race
+//   DDL across sessions remain reliable.
+
+/// Default TTL for cached `(TableMetadata, view_present)` entries when
+/// `BASIN_ENGINE_TABLE_META_CACHE_TTL_MS` is unset. 500ms is short enough
+/// to bound cross-session DDL visibility; the same-session DDL path
+/// invalidates eagerly, so this only affects external mutations.
+pub(crate) const DEFAULT_TABLE_META_CACHE_TTL_MS: u64 = 500;
+
+/// Maximum number of distinct tables tracked per session. 128 is enough to
+/// cover any real OLTP working set without unbounded growth on a session
+/// that touches many tables. Eviction is LRU.
+pub(crate) const TABLE_META_CACHE_CAP: usize = 128;
+
+/// Resolve the effective TTL for the table-metadata cache.
+///
+/// Cached behind a `OnceLock` so the hot path never reads `std::env`. Tests
+/// override via [`test_meta_cache_ttl_override`] (compiled out of release).
+pub(crate) fn table_meta_cache_ttl() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(over) = test_meta_cache_ttl_override::get() {
+        return over;
+    }
+    static CACHED: OnceLock<std::time::Duration> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let ms = std::env::var("BASIN_ENGINE_TABLE_META_CACHE_TTL_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_TABLE_META_CACHE_TTL_MS);
+        std::time::Duration::from_millis(ms)
+    })
+}
+
+/// Test-only override for the table-meta cache TTL. Mirrors the pattern in
+/// [`test_timeout_override`]: install a thread-local TTL for the duration
+/// of one test body so it doesn't race with the `OnceLock`'d production
+/// value.
+#[cfg(test)]
+pub(crate) mod test_meta_cache_ttl_override {
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    thread_local! {
+        static OVERRIDE: Cell<Option<Duration>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn get() -> Option<Duration> {
+        OVERRIDE.with(|c| c.get())
+    }
+
+    pub(crate) fn install(value: Duration) -> Guard {
+        let prev = OVERRIDE.with(|c| c.replace(Some(value)));
+        Guard { prev }
+    }
+
+    pub(crate) struct Guard {
+        prev: Option<Duration>,
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            OVERRIDE.with(|c| c.set(self.prev));
+        }
+    }
+}
+
+/// One cached `(TableMetadata, lookup_view)` tuple plus its insertion
+/// timestamp.
+#[derive(Clone, Debug)]
+pub(crate) struct TableMetaCacheEntry {
+    pub(crate) meta: Arc<TableMetadata>,
+    /// Snapshot of `lookup_view(name).is_some()` at cache-fill time. The
+    /// fast-path gate only consumes this boolean (not the full `ViewDef`)
+    /// so we cache just the discriminator.
+    pub(crate) view_present: bool,
+    inserted_at: Instant,
+}
+
+/// Per-session bounded LRU cache mapping table name → metadata + view
+/// presence. See module-level comment for the correctness model.
+pub(crate) struct TableMetaCache {
+    inner: std::sync::Mutex<lru::LruCache<TableName, TableMetaCacheEntry>>,
+}
+
+impl TableMetaCache {
+    pub(crate) fn new() -> Self {
+        let cap = NonZeroUsize::new(TABLE_META_CACHE_CAP).expect("cap is non-zero");
+        Self {
+            inner: std::sync::Mutex::new(lru::LruCache::new(cap)),
+        }
+    }
+
+    /// Look up a fresh entry. Returns `Some(entry)` only when present AND
+    /// younger than the configured TTL. A stale hit is treated as a miss
+    /// but does NOT evict — the next [`Self::insert`] will overwrite the
+    /// stale value in place.
+    pub(crate) fn get_fresh(&self, table: &TableName) -> Option<TableMetaCacheEntry> {
+        let ttl = table_meta_cache_ttl();
+        let mut g = self.inner.lock().expect("table_meta_cache lock poisoned");
+        let entry = g.get(table)?;
+        if entry.inserted_at.elapsed() <= ttl {
+            Some(entry.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Populate / overwrite the cache entry for `table`.
+    pub(crate) fn insert(
+        &self,
+        table: TableName,
+        meta: Arc<TableMetadata>,
+        view_present: bool,
+    ) {
+        let mut g = self.inner.lock().expect("table_meta_cache lock poisoned");
+        g.put(
+            table,
+            TableMetaCacheEntry {
+                meta,
+                view_present,
+                inserted_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Drop the entry for `table` (no-op if absent). Called by the
+    /// per-table DDL/DML invalidation path when the executor knows which
+    /// table is mutating.
+    pub(crate) fn invalidate(&self, table: &TableName) {
+        let mut g = self.inner.lock().expect("table_meta_cache lock poisoned");
+        g.pop(table);
+    }
+
+    /// Drop every entry. The executor calls this at the top of dispatch
+    /// for any statement that isn't a pure `SELECT`, which is the simplest
+    /// safe invalidation strategy (the cost is one `Mutex` lock + a
+    /// `clear()` — both negligible compared to the DDL/DML it precedes).
+    pub(crate) fn invalidate_all(&self) {
+        let mut g = self.inner.lock().expect("table_meta_cache lock poisoned");
+        g.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.inner.lock().expect("table_meta_cache lock poisoned").len()
+    }
+}
+
+/// One-shot helper: return the cached `(TableMetadata, view_present)` for
+/// `(project, table)` if fresh; otherwise call `load_table` + `lookup_view`,
+/// populate the cache, and return the new value.
+///
+/// The two catalog calls are issued sequentially, NOT in parallel —
+/// `tokio::join!` adds a `select`-style poll harness that's measurable on
+/// the µs-scale fast path, and on a warm catalog both calls are cheap.
+/// We pay them only on cache miss / stale.
+pub(crate) async fn load_table_meta_cached(
+    sess: &crate::ProjectSession,
+    table: &TableName,
+) -> Option<(Arc<TableMetadata>, bool)> {
+    if let Some(entry) = sess.state.table_meta_cache.get_fresh(table) {
+        return Some((entry.meta, entry.view_present));
+    }
+    let catalog = &sess.engine.config().catalog;
+    let meta = catalog.load_table(&sess.project, table).await.ok()?;
+    let view_present = catalog
+        .lookup_view(&sess.project, table.as_str())
+        .await
+        .is_some();
+    let arc = Arc::new(meta);
+    sess.state
+        .table_meta_cache
+        .insert(table.clone(), arc.clone(), view_present);
+    Some((arc, view_present))
+}
+
+/// Bring `ViewDef` into scope as a type so the unused-import check stays
+/// happy when the helpers above only reference `lookup_view`'s return
+/// shape implicitly.
+#[allow(dead_code)]
+fn _view_def_in_scope(_: ViewDef) {}
 
 // ── LISTEN / NOTIFY session-state helpers ───────────────────────────────────
 

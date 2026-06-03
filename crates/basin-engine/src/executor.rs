@@ -1776,6 +1776,21 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     let stmt_arc = parse_sql_cached(sql)?;
     let stmt: Statement = Arc::try_unwrap(stmt_arc).unwrap_or_else(|arc| (*arc).clone());
 
+    // Inv-OLTP-point (#149) — per-session table-meta cache invalidation.
+    // The simple-SELECT fast-path gate consults a per-session
+    // `(TableMetadata, view_present)` cache to skip two catalog round-trips
+    // per query. Any statement that is NOT a pure `SELECT` may mutate
+    // schema (DDL), indexes, RLS state, view bindings, or data files in a
+    // way the cached snapshot wouldn't reflect — clear the cache so the
+    // next SELECT re-loads from the catalog. This is the simple-safe
+    // pattern documented on [`crate::session::TableMetaCache`]: one
+    // `Mutex` lock + `clear()`, negligible relative to the DDL/DML it
+    // precedes. `Statement::Query` is the SELECT-shape carve-out; every
+    // other variant invalidates.
+    if !matches!(stmt, Statement::Query(_)) {
+        sess.state.table_meta_cache.invalidate_all();
+    }
+
     // Phase 6 cost-based query rejection. Cheap when disabled (one
     // `OnceLock::get`); when enabled, one catalog round-trip per
     // simple-shape Query. Multi-FROM / JOIN / sub-query / explicit-LIMIT
@@ -2120,21 +2135,18 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
             // (which merges the pending tail). Pure flag read — no I/O.
             if !crate::session::tx_is_active(&sess.state) {
                 if let Some(plan) = crate::fast_aggregate::match_metadata_aggregate(&stmt) {
-                    let table_meta = sess
-                        .engine
-                        .config()
-                        .catalog
-                        .load_table(&sess.project, &plan.table)
-                        .await
-                        .ok();
+                    // Inv-OLTP-point (#149): per-session table-meta cache.
+                    // First call serves from catalog; subsequent calls inside
+                    // the TTL window skip both catalog round-trips. Any DDL
+                    // / DML in this session has already invalidated the cache
+                    // (see invalidation block at the top of `execute`).
+                    let cached =
+                        crate::session::load_table_meta_cached(sess, &plan.table).await;
+                    let (table_meta, is_view) = match cached {
+                        Some((arc, vp)) => (Some((*arc).clone()), vp),
+                        None => (None, false),
+                    };
                     if let Some(ref meta) = table_meta {
-                        let is_view = sess
-                            .engine
-                            .config()
-                            .catalog
-                            .lookup_view(&sess.project, plan.table.as_str())
-                            .await
-                            .is_some();
                         let has_rls = meta.rls_enabled;
                         let has_soft_delete =
                             crate::types::soft_delete_column(meta.schema.as_ref()).is_some();
@@ -2179,21 +2191,15 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                 // range exceeds the low-cardinality threshold or catalog stats
                 // are absent).
                 if let Some(plan) = crate::fast_aggregate::match_groupby_low_card(&stmt) {
-                    let table_meta = sess
-                        .engine
-                        .config()
-                        .catalog
-                        .load_table(&sess.project, &plan.table)
-                        .await
-                        .ok();
+                    // Inv-OLTP-point (#149): same per-session cache as the
+                    // metadata-aggregate path above.
+                    let cached =
+                        crate::session::load_table_meta_cached(sess, &plan.table).await;
+                    let (table_meta, is_view) = match cached {
+                        Some((arc, vp)) => (Some((*arc).clone()), vp),
+                        None => (None, false),
+                    };
                     if let Some(ref meta) = table_meta {
-                        let is_view = sess
-                            .engine
-                            .config()
-                            .catalog
-                            .lookup_view(&sess.project, plan.table.as_str())
-                            .await
-                            .is_some();
                         let has_rls = meta.rls_enabled;
                         let has_soft_delete =
                             crate::types::soft_delete_column(meta.schema.as_ref()).is_some();
@@ -2220,21 +2226,20 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                 //
                 // We still need lookup_view because views and tables live in
                 // separate catalog maps and can share a name in principle.
-                let table_meta = sess
-                    .engine
-                    .config()
-                    .catalog
-                    .load_table(&sess.project, &plan.table)
-                    .await
-                    .ok();
+                //
+                // Inv-OLTP-point (#149): when both calls are served from the
+                // per-session cache (`load_table_meta_cached`) the gate pays
+                // a single `Mutex` lock + `LruCache::get` instead of two
+                // async catalog round-trips. The OLTP point-query loop —
+                // identical SELECT shape repeated — hits the cache after
+                // the first miss; the TTL is 500ms by default.
+                let cached =
+                    crate::session::load_table_meta_cached(sess, &plan.table).await;
+                let (table_meta, is_view) = match cached {
+                    Some((arc, vp)) => (Some((*arc).clone()), vp),
+                    None => (None, false),
+                };
                 if let Some(ref meta) = table_meta {
-                    let is_view = sess
-                        .engine
-                        .config()
-                        .catalog
-                        .lookup_view(&sess.project, plan.table.as_str())
-                        .await
-                        .is_some();
                     let has_rls = meta.rls_enabled;
                     let has_soft_delete =
                         crate::types::soft_delete_column(meta.schema.as_ref()).is_some();
@@ -10589,5 +10594,224 @@ mod parse_cache_tests {
 
         // Restore default cap for other tests.
         parse_cache_resize_for_test(original_cap.max(1));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inv-OLTP-point (#149) — per-session table-meta cache tests
+// ---------------------------------------------------------------------------
+// Three properties under test:
+//   1. Repeated lookups of the same table inside the TTL window hit the
+//      cache (no second catalog round-trip).
+//   2. Any same-session DDL (here: CREATE INDEX) invalidates the cache so
+//      the very next SELECT observes the post-DDL schema/indexes.
+//   3. Expired entries (TTL elapsed) are treated as misses and re-loaded
+//      from the catalog.
+#[cfg(test)]
+mod table_meta_cache_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use basin_catalog::{Catalog, InMemoryCatalog};
+    use basin_common::{ProjectId, TableName};
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    use crate::{Engine, EngineConfig, ExecResult};
+
+    fn make_engine(dir: &TempDir) -> Engine {
+        let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
+            object_store: Arc::new(fs),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+        Engine::new(EngineConfig {
+            storage,
+            catalog,
+            shard: None,
+        })
+    }
+
+    /// Two identical point-lookup SELECTs run back-to-back: the second one
+    /// must find the cache populated by the first. We assert against the
+    /// session-state cache directly rather than counting catalog calls
+    /// (the in-memory catalog has no observable round-trip counter).
+    #[tokio::test]
+    async fn table_meta_cache_hits_repeated_lookup() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+        sess.execute("CREATE TABLE pkq (id BIGINT NOT NULL, payload TEXT)")
+            .await
+            .unwrap();
+        sess.execute("INSERT INTO pkq VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+            .await
+            .unwrap();
+
+        // CREATE TABLE / INSERT both invalidate the whole cache via the
+        // dispatcher's `!matches!(stmt, Statement::Query(_))` branch.
+        assert_eq!(
+            sess.state.table_meta_cache.len(),
+            0,
+            "post-DML the cache must be empty"
+        );
+
+        // First SELECT: cache miss, populates the entry.
+        let _ = sess
+            .execute("SELECT * FROM pkq WHERE id = 2")
+            .await
+            .unwrap();
+        let tbl = TableName::new("pkq").unwrap();
+        let after_first = sess.state.table_meta_cache.len();
+        assert_eq!(
+            after_first, 1,
+            "first SELECT populates the cache for the touched table"
+        );
+        assert!(
+            sess.state.table_meta_cache.get_fresh(&tbl).is_some(),
+            "first SELECT must leave a fresh cache entry"
+        );
+
+        // Second SELECT (same shape): cache hit — the entry survives, and
+        // no other table got cached.
+        let _ = sess
+            .execute("SELECT * FROM pkq WHERE id = 3")
+            .await
+            .unwrap();
+        assert_eq!(
+            sess.state.table_meta_cache.len(),
+            1,
+            "second SELECT must reuse the cached entry — no new keys"
+        );
+        assert!(
+            sess.state.table_meta_cache.get_fresh(&tbl).is_some(),
+            "cache entry stays fresh inside the TTL window"
+        );
+    }
+
+    /// In-session DDL (CREATE INDEX) MUST be visible to subsequent reads
+    /// even though the cached `TableMetadata` predates the new index. We
+    /// verify by:
+    ///   1. SELECT once to populate the cache.
+    ///   2. CREATE INDEX — must invalidate the cache.
+    ///   3. Assert the cache is empty after the DDL.
+    ///   4. Re-run SELECT; assert it succeeds (catalog re-loaded) and
+    ///      that the catalog now lists the new index on the table.
+    #[tokio::test]
+    async fn table_meta_cache_ddl_in_session_evicts() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+        sess.execute("CREATE TABLE pkidx (id BIGINT NOT NULL, k BIGINT NOT NULL)")
+            .await
+            .unwrap();
+        sess.execute("INSERT INTO pkidx VALUES (1, 10), (2, 20), (3, 30)")
+            .await
+            .unwrap();
+
+        // Populate the cache.
+        let _ = sess
+            .execute("SELECT * FROM pkidx WHERE id = 1")
+            .await
+            .unwrap();
+        let tbl = TableName::new("pkidx").unwrap();
+        assert!(
+            sess.state.table_meta_cache.get_fresh(&tbl).is_some(),
+            "SELECT must populate the cache"
+        );
+
+        // DDL: CREATE INDEX. This is not a `Statement::Query` so the
+        // dispatcher invalidates the entire session cache before the
+        // handler runs.
+        sess.execute("CREATE INDEX pkidx_k_idx ON pkidx (k)")
+            .await
+            .unwrap();
+        assert_eq!(
+            sess.state.table_meta_cache.len(),
+            0,
+            "CREATE INDEX must invalidate the per-session table-meta cache"
+        );
+
+        // Second SELECT: re-loads from catalog. The fresh metadata must
+        // now list the index we just created.
+        let _ = sess
+            .execute("SELECT * FROM pkidx WHERE k = 20")
+            .await
+            .unwrap();
+        let entry = sess
+            .state
+            .table_meta_cache
+            .get_fresh(&tbl)
+            .expect("post-DDL SELECT must repopulate the cache");
+        let idx_names: Vec<&str> = entry
+            .meta
+            .indexes
+            .iter()
+            .map(|ix| ix.name.as_str())
+            .collect();
+        assert!(
+            idx_names.iter().any(|n| *n == "pkidx_k_idx"),
+            "post-DDL cached metadata must include the new index \
+             pkidx_k_idx (got {idx_names:?})"
+        );
+    }
+
+    /// Stale entries (TTL elapsed) are treated as misses. We install a
+    /// 1ms TTL override on the current test thread, populate the cache,
+    /// wait past the TTL, then verify `get_fresh` returns `None`. The
+    /// override uses the same thread-local pattern as
+    /// `test_timeout_override` so it doesn't race the production
+    /// `OnceLock`.
+    #[tokio::test]
+    async fn table_meta_cache_ttl_expires() {
+        let _g = crate::session::test_meta_cache_ttl_override::install(
+            Duration::from_millis(1),
+        );
+
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+        sess.execute("CREATE TABLE pkt (id BIGINT NOT NULL)")
+            .await
+            .unwrap();
+        sess.execute("INSERT INTO pkt VALUES (1)").await.unwrap();
+
+        // Populate the cache.
+        let _ = sess
+            .execute("SELECT * FROM pkt WHERE id = 1")
+            .await
+            .unwrap();
+        let tbl = TableName::new("pkt").unwrap();
+        // The override only takes effect on the current thread; the
+        // tokio multi-thread runtime can park the test future on a
+        // different worker, so we can't assert `get_fresh().is_some()`
+        // here. Instead, advance past the TTL on the *same* thread the
+        // assertion below runs on.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // The entry exists in the map (insert succeeded) but is stale
+        // → `get_fresh` returns `None`. Underlying LRU is unchanged
+        // until the next `insert`, which is the documented behaviour.
+        let stale = sess.state.table_meta_cache.get_fresh(&tbl);
+        assert!(
+            stale.is_none(),
+            "1ms TTL must expire after 20ms sleep — got {stale:?}"
+        );
+
+        // A subsequent SELECT must re-populate the entry (cache miss →
+        // load_table → insert). We rely on `ExecResult::Rows` here just
+        // to make sure the query succeeds without choking on the stale
+        // entry.
+        let res = sess
+            .execute("SELECT * FROM pkt WHERE id = 1")
+            .await
+            .unwrap();
+        assert!(matches!(res, ExecResult::Rows { .. }));
     }
 }
