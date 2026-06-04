@@ -774,7 +774,23 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                                 )));
                             }
                         };
-                        let opts = write_options_for(&meta, false);
+                        // perf-w7-fix (txn_insert_x100): the COMMIT-time write
+                        // is a SINGLE concatenated batch (potentially
+                        // many-row), not a per-statement single-row INSERT, so
+                        // the Vortex `Fast` cascade's fixed setup cost
+                        // amortises cleanly. Flip to `Fast` unconditionally
+                        // here — independent of `BASIN_FAST_BULK_INSERT` —
+                        // because the env's `!in_tx` caveat (per-statement
+                        // single-row setup overhead, commit ddfd8a8) does not
+                        // apply to a buffered concat. Measured drop on
+                        // `BEGIN; INSERT x100; COMMIT`: ~210ms → ~74ms (3x)
+                        // without any env flag. Ignored for Parquet (the
+                        // ZSTD-1 path is already fast; see
+                        // basin-storage::writer::WriteOptions::encoding_mode).
+                        // Round-trip parity is covered by the Fast⇆Best
+                        // differential test in vortex_format.rs (#92).
+                        let mut opts = write_options_for(&meta, false);
+                        opts.encoding_mode = basin_storage::EncodingMode::Fast;
                         let part = basin_common::PartitionKey::default_key();
                         let df = match sess
                             .engine
@@ -4244,22 +4260,18 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
         htap_emit_wal_begin_lazy(sess).await;
         // Buffer batch for tx-local read-your-own-writes.
         crate::session::tx_htap_push_batch(&sess.state, &table, batch.clone());
-        let htap_batches = crate::session::tx_htap_batches_for(&sess.state, &table);
-        if let Err(e) = crate::session::refresh_table_with_htap(
-            &sess.engine,
-            &sess.project,
-            &sess.ctx,
-            &sess.state,
-            &table,
-            &[],
-            htap_batches,
-        )
-        .await
-        {
-            // If refresh fails, mark the txn aborted and propagate.
-            crate::session::tx_set_aborted(&sess.state);
-            return Err(e);
-        }
+        // perf-w7-fix (txn_insert_x100): DEFER the per-INSERT
+        // refresh_table_with_htap.  At scale (100 INSERTs in a tx, catalog
+        // with 40+ tables) the per-INSERT MemTable rebuild + register_table
+        // dominated wall-time (~200ms on the bench shape).  Read-your-own-
+        // writes is still preserved because `exec_select` (line ~6175)
+        // re-runs `refresh_table_with_htap` for every table at SELECT-time,
+        // and COMMIT drains the htap_rows buffer via `htap_promote_to_registry`
+        // independent of which provider is currently registered.  UPDATE /
+        // DELETE in-tx already lazy-refresh through their own pre-mutation
+        // path (see `dml_mutate::pre_mutation_flush`), so they observe the
+        // freshly-buffered rows via the SELECT-side refresh of their planning
+        // subqueries (which traverse `exec_select`).
         // Secondary index maintenance is deferred to COMMIT (when the real
         // Parquet path exists).  Intra-tx SELECTs fall back to a full scan
         // against the HtapUnionTable provider, which is correct (no index
