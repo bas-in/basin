@@ -7,11 +7,11 @@
   "metrics": [
     {
       "label": "Connection accept latency p50",
-      "basin": 0.856958,
-      "postgres": 1.418791,
+      "basin": 0.752,
+      "postgres": 1.532584,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "pg / basin = 1.66x"
+      "ratio_text": "pg / basin = 2.04x"
     },
     {
       "label": "Connections held under 1000-conn flood",
@@ -27,15 +27,7 @@
       "postgres": 900.0,
       "unit": "conns",
       "better": "basin"
-    },
-    {
-      "label": "RSS per held-open connection",
-      "basin": 265.76,
-      "postgres": 8108.64,
-      "unit": "KiB",
-      "better": "basin",
-      "ratio_text": "pg / basin = 30.51x"
     }
   ],
-  "generated_at": "@1780105810"
+  "generated_at": "@1780496384"
 }

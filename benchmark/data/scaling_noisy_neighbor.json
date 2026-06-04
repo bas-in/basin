@@ -22,29 +22,29 @@
   ],
   "rows": [
     {
-      "p50_ms": 0.208042,
-      "p99_ms": 0.326,
+      "p50_ms": 0.292792,
+      "p99_ms": 0.517,
       "scenario": "baseline"
     },
     {
-      "p50_ms": 0.077666,
-      "p99_ms": 0.318834,
+      "p50_ms": 0.0725,
+      "p99_ms": 0.582375,
       "scenario": "under_load"
     },
     {
-      "p50_ms": 0.37331884907855145,
-      "p99_ms": 0.9780184049079754,
+      "p50_ms": 0.2476160550834722,
+      "p99_ms": 1.1264506769825917,
       "scenario": "ratio"
     }
   ],
   "primary": {
     "label": "p99 ratio (under_load / baseline)",
-    "value": 0.9780184049079754,
+    "value": 1.1264506769825917,
     "unit": "x",
     "bar": {
       "op": "less_than",
       "value": 5.0
     }
   },
-  "generated_at": "@1780105626"
+  "generated_at": "@1780496111"
 }

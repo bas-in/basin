@@ -14,11 +14,11 @@
     }
   },
   "details": {
-    "data_file_path": "projects/01KSV90Y41EW7FDZCFZRWER1VV/tables/events/data/_default/2026/05/30/01KSV90Y4CJGVDNHT9QZTYPFCG.vortex",
+    "data_file_path": "projects/01KT6XDGT480TYTCTWQRH2B967/tables/events/data/_default/2026/06/03/01KT6XDGTG2ZPVHCZ8HZY0DTT4.vortex",
     "encrypted_body_bytes": 3280,
     "plaintext_body_bytes": 3252,
     "rows_round_tripped": 100,
     "sidecar_bytes": 33
   },
-  "generated_at": "@1780105640"
+  "generated_at": "@1780496122"
 }

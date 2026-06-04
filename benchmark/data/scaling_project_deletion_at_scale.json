@@ -22,22 +22,22 @@
   ],
   "rows": [
     {
-      "basin_ms": 4.235041,
+      "basin_ms": 4.352334,
       "file_count": 100,
       "pg_skipped": false,
-      "postgres_ms": 85.051583
+      "postgres_ms": 6.813084
     },
     {
-      "basin_ms": 39.933,
+      "basin_ms": 78.95824999999999,
       "file_count": 1000,
       "pg_skipped": false,
-      "postgres_ms": 11.940167
+      "postgres_ms": 16.066167
     },
     {
-      "basin_ms": 258.777667,
+      "basin_ms": 516.284583,
       "file_count": 5000,
       "pg_skipped": false,
-      "postgres_ms": 2.0915410000000003
+      "postgres_ms": 6.278166
     }
   ],
   "primary": {
@@ -49,5 +49,5 @@
       "value": 5001.0
     }
   },
-  "generated_at": "@1780105663"
+  "generated_at": "@1780496161"
 }

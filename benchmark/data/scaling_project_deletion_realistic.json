@@ -3,7 +3,7 @@
   "id": "project_deletion_realistic",
   "name": "Project deletion at scale, realistic SaaS schema (Basin vs Postgres)",
   "claim": "Real production tables have 5-20 indexes and 1-3 FK constraints. PG's DROP SCHEMA CASCADE walks every row × every index + validates every FK on the cascade; Basin's project teardown stays O(file_count). The crossover from the simple card moves dramatically left under this schema profile.",
-  "passed": true,
+  "passed": false,
   "x_axis": {
     "key": "file_count",
     "label": "files per project"
@@ -22,32 +22,32 @@
   ],
   "rows": [
     {
-      "basin_ms": 4.356167,
+      "basin_ms": 6.489042,
       "file_count": 100,
       "pg_skipped": false,
-      "postgres_ms": 5.331875
+      "postgres_ms": 9.628875
     },
     {
-      "basin_ms": 37.212042000000004,
+      "basin_ms": 154.731,
       "file_count": 1000,
       "pg_skipped": false,
-      "postgres_ms": 9.114125000000001
+      "postgres_ms": 232.832208
     },
     {
-      "basin_ms": 198.943834,
+      "basin_ms": 335.518166,
       "file_count": 5000,
       "pg_skipped": false,
-      "postgres_ms": 1584.861458
+      "postgres_ms": 35.195125
     }
   ],
   "primary": {
     "label": "Basin/Postgres ratio at 5000 files (realistic schema)",
-    "value": 0.12552758665167818,
+    "value": 9.533086357840753,
     "unit": "ratio",
     "bar": {
       "op": "less_than",
       "value": 1.0000000000000002
     }
   },
-  "generated_at": "@1780105703"
+  "generated_at": "@1780496223"
 }

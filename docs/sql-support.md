@@ -2,8 +2,8 @@
 
 Run `cargo test -p basin-integration-tests --test sql_support_matrix` to refresh.
 
-Last run: 1779628592 (Unix epoch)
-SQL fragments tested: 975 total / 2610 green (across all three configurations).
+Last run: 1780443604 (Unix epoch)
+SQL fragments tested: 975 total / 2616 green (across all three configurations).
 
 ## Configurations
 
@@ -21,7 +21,7 @@ SQL fragments tested: 975 total / 2610 green (across all three configurations).
 | 🛠 | Parsed + planned, runtime exec error |
 | 📜 | Planner/executor rejected (plan-time error) |
 | ❌ | Parser refused (sqlparser / pg_query syntax error) |
-| 🚫 | Explicitly out-of-scope (VACUUM/CLUSTER/REINDEX etc.) |
+| 🚫 | Explicitly out-of-scope (LISTEN/NOTIFY/VACUUM etc.) |
 
 ## Admin/Sessions
 
@@ -247,8 +247,8 @@ SQL fragments tested: 975 total / 2610 green (across all three configurations).
 | `SELECT CAST(1 AS TEXT)` | ✅ | ✅ | ✅ |  |
 | `SELECT 'a' \|\| 'b'` | ✅ | ✅ | ✅ |  |
 | `SELECT 'abc' LIKE 'a%'` | ✅ | ✅ | ✅ |  |
-| `SELECT CASE id WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END FROM t` | 📜 | 📜 | 📜 | internal: execute: Execution error: CASE expr WHEN form is not yet supported,… |
-| `SELECT id, CASE WHEN id < 0 THEN 'neg' WHEN id = 0 THEN 'zero' ELSE 'pos' END FROM t` | 🛠 | 🛠 | 🛠 | internal: execute: Arrow error: Schema error: Unable to get field named "CASE… |
+| `SELECT CASE id WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END FROM t` | ✅ | ✅ | ✅ |  |
+| `SELECT id, CASE WHEN id < 0 THEN 'neg' WHEN id = 0 THEN 'zero' ELSE 'pos' END FROM t` | ✅ | ✅ | ✅ |  |
 | `SELECT 1::BIGINT + 2::BIGINT` | ✅ | ✅ | ✅ |  |
 | `SELECT '2024-01-01'::DATE` | ✅ | ✅ | ✅ |  |
 | `SELECT '12:00:00'::TIME` | ✅ | ✅ | ✅ |  |

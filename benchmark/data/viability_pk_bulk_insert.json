@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "pk_to_nopk_ratio",
-    "value": 1.112225981914179,
+    "value": 1.121952703230633,
     "unit": "x",
     "bar": {
       "op": "less_than",
@@ -16,8 +16,8 @@
   "details": {
     "batch_size": 2000,
     "n_batches": 50,
-    "nopk_ms": 8740.976459000001,
-    "pk_ms": 9721.941125000001
+    "nopk_ms": 12101.796458,
+    "pk_ms": 13577.64325
   },
-  "generated_at": "@1780146626"
+  "generated_at": "@1780443461"
 }
