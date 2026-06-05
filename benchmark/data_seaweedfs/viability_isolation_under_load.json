@@ -15,10 +15,10 @@
   },
   "details": {
     "bucket": "basin-test",
-    "elapsed_s": 0.451469667,
+    "elapsed_s": 0.596016541,
     "endpoint": "http://127.0.0.1:8333",
     "ops": 1000,
     "projects": 50
   },
-  "generated_at": "@1780640878"
+  "generated_at": "@1780680836"
 }

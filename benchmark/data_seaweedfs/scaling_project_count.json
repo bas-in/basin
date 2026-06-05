@@ -22,32 +22,32 @@
   ],
   "rows": [
     {
-      "per_project_ram_kib": 272.0,
+      "per_project_ram_kib": 480.0,
       "project_count": 1,
-      "quiet_p50_ms": 0.48054199999999997,
-      "rss_delta_kib": 272
+      "quiet_p50_ms": 0.40175,
+      "rss_delta_kib": 480
     },
     {
-      "per_project_ram_kib": 138.66666666666666,
+      "per_project_ram_kib": 158.22222222222223,
       "project_count": 10,
-      "quiet_p50_ms": 0.41079099999999996,
-      "rss_delta_kib": 1248
+      "quiet_p50_ms": 0.393667,
+      "rss_delta_kib": 1424
     },
     {
-      "per_project_ram_kib": 9.777777777777779,
+      "per_project_ram_kib": 81.77777777777777,
       "project_count": 100,
-      "quiet_p50_ms": 0.45725,
-      "rss_delta_kib": 880
+      "quiet_p50_ms": 0.48579199999999995,
+      "rss_delta_kib": 7360
     }
   ],
   "primary": {
     "label": "quiet_p50_at_max / quiet_p50_at_1",
-    "value": 0.9515297310120656,
+    "value": 1.2091897946484131,
     "unit": "x",
     "bar": {
       "op": "less_than",
       "value": 5.0
     }
   },
-  "generated_at": "@1780640862"
+  "generated_at": "@1780680821"
 }
