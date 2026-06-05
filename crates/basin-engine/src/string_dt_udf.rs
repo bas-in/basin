@@ -34,7 +34,7 @@
 //! They are NOT re-registered here.
 
 use std::any::Any;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use datafusion::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Int32Array, Int64Array, ListArray, StringArray,
@@ -1152,10 +1152,70 @@ impl ScalarUDFImpl for IsFiniteUdf {
 }
 
 // ---------------------------------------------------------------------------
+// Process-global compiled-regex cache
+// ---------------------------------------------------------------------------
+
+/// Default capacity: 1 024 entries.  Override with `BASIN_ENGINE_REGEX_CACHE_CAP`.
+const DEFAULT_REGEX_CACHE_CAP: usize = 1024;
+
+fn regex_cache_cap() -> usize {
+    std::env::var("BASIN_ENGINE_REGEX_CACHE_CAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_REGEX_CACHE_CAP)
+}
+
+type RegexCache = lru::LruCache<u64, Arc<regex::Regex>>;
+
+static REGEX_CACHE: OnceLock<Mutex<RegexCache>> = OnceLock::new();
+
+fn regex_cache() -> &'static Mutex<RegexCache> {
+    REGEX_CACHE.get_or_init(|| {
+        let cap = std::num::NonZeroUsize::new(regex_cache_cap()).unwrap_or(
+            std::num::NonZeroUsize::new(DEFAULT_REGEX_CACHE_CAP).unwrap(),
+        );
+        Mutex::new(lru::LruCache::new(cap))
+    })
+}
+
+/// Return a cached `Arc<Regex>` for `(pattern, flags)`, compiling on first use.
+///
+/// The cache key is the xxh3-64 hash of `pattern + '\0' + flags`; a collision
+/// (astronomically unlikely) would simply yield a wrong but non-silent result
+/// (the regex match would fail or succeed differently), so the tradeoff is fine.
+/// `flags` must be the normalised flag string (e.g. `"i"`, `"gi"`, `""`).
+pub(crate) fn get_or_compile_regex(
+    pattern: &str,
+    flags: &str,
+) -> DFResult<Arc<regex::Regex>> {
+    let key = xxhash_rust::xxh3::xxh3_64(
+        format!("{pattern}\x00{flags}").as_bytes(),
+    );
+    let cache = regex_cache();
+    {
+        let mut guard = cache.lock().expect("regex cache mutex poisoned");
+        if let Some(hit) = guard.get(&key) {
+            return Ok(Arc::clone(hit));
+        }
+    }
+    // Compile outside the lock so a slow compile doesn't block other threads.
+    let re = Arc::new(compile_regex(pattern, flags)?);
+    {
+        let mut guard = cache.lock().expect("regex cache mutex poisoned");
+        // Another thread may have inserted it while we compiled — that's fine;
+        // we just overwrite with an equivalent compiled regex.
+        guard.put(key, Arc::clone(&re));
+    }
+    Ok(re)
+}
+
+// ---------------------------------------------------------------------------
 // Regex builder helper
 // ---------------------------------------------------------------------------
 
-fn build_regex(pattern: &str, flags: &str) -> DFResult<regex::Regex> {
+/// Compile `pattern` with `flags` into a `regex::Regex`.  Not cached; callers
+/// should prefer `get_or_compile_regex` to avoid per-row compilation cost.
+fn compile_regex(pattern: &str, flags: &str) -> DFResult<regex::Regex> {
     let mut builder = regex::RegexBuilder::new(pattern);
     for f in flags.chars() {
         match f {
@@ -1178,4 +1238,51 @@ fn build_regex(pattern: &str, flags: &str) -> DFResult<regex::Regex> {
     builder.build().map_err(|e| {
         DataFusionError::Execution(format!("regexp: invalid pattern {pattern:?}: {e}"))
     })
+}
+
+fn build_regex(pattern: &str, flags: &str) -> DFResult<regex::Regex> {
+    // Delegate to the cached path; clone the Arc out so callers that expect a
+    // plain `Regex` by value still compile.  Hot path: lock + LRU probe is
+    // O(1) and avoids the expensive RegexBuilder allocation entirely.
+    get_or_compile_regex(pattern, flags).map(|arc| (*arc).clone())
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests for the regex cache
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod regex_cache_tests {
+    use super::get_or_compile_regex;
+    use std::sync::Arc;
+
+    #[test]
+    fn regex_cache_hit_returns_same_arc() {
+        let a = get_or_compile_regex("[0-9]+", "").unwrap();
+        let b = get_or_compile_regex("[0-9]+", "").unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "second lookup must return the cached Arc");
+    }
+
+    #[test]
+    fn regex_cache_distinct_patterns_distinct() {
+        let a = get_or_compile_regex("[a-z]+", "").unwrap();
+        let b = get_or_compile_regex("[A-Z]+", "").unwrap();
+        assert!(
+            !Arc::ptr_eq(&a, &b),
+            "distinct patterns must produce distinct cache entries"
+        );
+    }
+
+    #[test]
+    fn regex_cache_case_sensitive_vs_insensitive_distinct() {
+        let cs = get_or_compile_regex("hello", "").unwrap();
+        let ci = get_or_compile_regex("hello", "i").unwrap();
+        assert!(
+            !Arc::ptr_eq(&cs, &ci),
+            "same pattern with different flags must be distinct cache entries"
+        );
+        // Verify functional difference: case-insensitive should match "HELLO".
+        assert!(!cs.is_match("HELLO"), "case-sensitive must not match HELLO");
+        assert!(ci.is_match("HELLO"), "case-insensitive must match HELLO");
+    }
 }

@@ -244,13 +244,21 @@ impl ScalarUDFImpl for RegexpReplaceUdf {
                 .map(|f| !f.is_null(i) && f.value(i).contains('g'))
                 .unwrap_or(false);
 
-            // Compile regex. Invalid regex → execution error.
-            let re = regex::Regex::new(pat).map_err(|e| {
-                DataFusionError::Execution(format!(
+            // Compile regex (cached process-globally to avoid per-row cost).
+            let flags = if flags_opt
+                .as_ref()
+                .map(|f| !f.is_null(i) && f.value(i).contains('i'))
+                .unwrap_or(false)
+            {
+                "i"
+            } else {
+                ""
+            };
+            let re = crate::string_dt_udf::get_or_compile_regex(pat, flags)
+                .map_err(|e| DataFusionError::Execution(format!(
                     "regexp_replace: invalid regular expression {:?}: {e}",
                     pat
-                ))
-            })?;
+                )))?;
 
             // Translate PG back-references \1..\9 → ${1}..${9} for the regex crate.
             let repl = translate_backrefs(repl_raw);

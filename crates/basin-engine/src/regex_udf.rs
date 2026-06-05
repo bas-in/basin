@@ -105,14 +105,12 @@ impl ScalarUDFImpl for SubstringRegexUdf {
             let text = texts.value(i);
             let pat = patterns.value(i);
 
-            // Compile pattern. Invalid regex → execution error (matches PG's
-            // "ERROR: invalid regular expression" behaviour — honest, not NULL).
-            let re = regex::Regex::new(pat).map_err(|e| {
-                DataFusionError::Execution(format!(
+            // Compile pattern (cached process-globally to avoid per-row cost).
+            let re = crate::string_dt_udf::get_or_compile_regex(pat, "")
+                .map_err(|e| DataFusionError::Execution(format!(
                     "substring_regex: invalid regular expression {:?}: {e}",
                     pat
-                ))
-            })?;
+                )))?;
 
             // Find the first match.
             if let Some(caps) = re.captures(text) {
