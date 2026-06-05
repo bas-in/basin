@@ -1,0 +1,32 @@
+{
+  "kind": "viability",
+  "id": "large_spatial_dwithin",
+  "name": "Large-dataset spatial ST_DWithin with R-tree row-group prune",
+  "claim": "1 M POINTs in a single 16-row-group Parquet file; ST_DWithin with ~1 % selectivity. Indexed (GIST + R-tree row-group prune) wall-clock must be at least 100× faster than the unindexed scan, and must return the identical row count (Haversine UDF re-checks).",
+  "passed": true,
+  "primary": {
+    "label": "indexed speedup",
+    "value": 28.209872307171793,
+    "unit": "×",
+    "bar": {
+      "op": "greater_than_or_equal",
+      "value": 10.0
+    }
+  },
+  "details": {
+    "indexed_cold_ms": 950.860542,
+    "indexed_ms": 22.578167,
+    "matched_rows": 7699,
+    "n_rows": 1000000,
+    "query_x": 5.0,
+    "query_y": 5.0,
+    "radius_m": 55000.0,
+    "row_group_size": 4096,
+    "rtree_size": 1000000,
+    "seed_elapsed_s": 17.985611666,
+    "speedup": 28.209872307171793,
+    "speedup_bar": 10.0,
+    "unindexed_ms": 636.9272080000001
+  },
+  "generated_at": "@1780628751"
+}

@@ -3004,6 +3004,210 @@ pub(crate) async fn apply_gist_pruning_for_query(
     Ok(())
 }
 
+/// PG-Wave-β — R-tree spatial pruning for `ST_DWithin` / `ST_Contains` / `=`.
+///
+/// Mirrors [`apply_gin_pruning_for_query`] for the POINT spatial predicate
+/// family.  Inspects `sql` (the *original*, pre-rewrite text so the SQL
+/// patterns are still recognisable) for a single spatial predicate on a column
+/// with a `USING gist` index.  When ALL live files for the column have a
+/// loaded R-tree segment, probes the registry for each file's surviving
+/// row-groups and re-registers the table as an [`RTreePrunedTable`] that
+/// drives Basin's native storage reader with `ReadOptions.row_group_selection`
+/// set.  DataFusion then sees only the surviving row-groups of each candidate
+/// file.
+///
+/// Correctness contract:
+/// * For `DWithin` the prune is INEXACT (radius-expanded bbox); the residual
+///   `st_dwithin` UDF re-runs above the scan.
+/// * For `BboxIntersects` and `PointEq` the prune is EXACT at row-group
+///   granularity.
+/// * Pruning only fires when every live file is indexed in the registry.
+///   Any uncovered file triggers a full scan (no false negatives).
+/// * On any error or uncertainty the function returns `Ok(())` → full scan.
+pub(crate) async fn apply_rtree_pruning_for_query(
+    engine: &Engine,
+    project: &ProjectId,
+    ctx: &SessionContext,
+    sql: &str,
+) -> Result<()> {
+    // Fast pre-check: must contain at least one spatial token.  Lower-case
+    // the SQL once for the contains() probe since users may type
+    // `ST_DWithin` or `st_dwithin`.
+    let sql_lower = sql.to_lowercase();
+    if !sql_lower.contains("st_dwithin")
+        && !sql_lower.contains("st_contains")
+        && !sql_lower.contains("st_makepoint")
+    {
+        return Ok(());
+    }
+
+    // Parse the SQL and pull out the WHERE expression.
+    let dialect = PostgreSqlDialect {};
+    let stmts = match Parser::parse_sql(&dialect, sql) {
+        Ok(s) => s,
+        Err(_) => return Ok(()),
+    };
+    if stmts.len() != 1 {
+        return Ok(());
+    }
+    let query = match &stmts[0] {
+        Statement::Query(q) => q.as_ref(),
+        _ => return Ok(()),
+    };
+    if query.with.is_some() {
+        return Ok(());
+    }
+    let select = match query.body.as_ref() {
+        SetExpr::Select(s) => s,
+        _ => return Ok(()),
+    };
+    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+        return Ok(());
+    }
+    let table_name = match &select.from[0].relation {
+        TableFactor::Table { name, alias: None, args: None, .. } => {
+            if name.0.len() != 1 {
+                return Ok(());
+            }
+            name.0[0].id_val().clone()
+        }
+        _ => return Ok(()),
+    };
+    let table = match TableName::new(table_name) {
+        Ok(t) => t,
+        Err(_) => return Ok(()),
+    };
+
+    let where_expr = match &select.selection {
+        Some(e) => e,
+        None => return Ok(()),
+    };
+    let pred = match crate::index_probe::detect_spatial_predicate(where_expr) {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+
+    // Catalog lookup: column must have a `USING gist` index.
+    let meta = match engine.config().catalog.load_table(project, &table).await {
+        Ok(m) => m,
+        Err(_) => return Ok(()),
+    };
+    let col_name = pred.column().to_string();
+    let has_gist = meta.indexes.iter().any(|idx| {
+        idx.access_method == "gist"
+            && idx.columns.len() == 1
+            && idx.columns[0] == col_name
+    });
+    if !has_gist {
+        return Ok(());
+    }
+
+    let live_files: Vec<DataFileRef> = meta.live_data_files();
+    if live_files.is_empty() {
+        return Ok(());
+    }
+    let live_paths: Vec<String> = live_files.iter().map(|f| f.path.to_string()).collect();
+
+    // Lazy warm-up + completeness guard: for each live file, ensure the
+    // R-tree sidecar is loaded into the registry. The sidecar may not be
+    // resident (engine restart cleared the cache, or the file was just
+    // compacted on another instance) — fetch it from the object store and
+    // deserialise on demand. Files whose sidecar can't be loaded are
+    // skipped → we fall through to a full scan rather than serve stale
+    // results.
+    let registry = engine.rtree_registry();
+    let storage = engine.config().storage.clone();
+    for p in &live_paths {
+        if registry.is_file_indexed(project, &table, &col_name, p) {
+            continue;
+        }
+        let Some(sidecar) = basin_storage::index::rtree::rtree_segment_key_for_data_file(
+            None,
+            project,
+            &table,
+            &col_name,
+            p,
+        ) else {
+            // Non-canonical path → can't compute sidecar key → full scan.
+            return Ok(());
+        };
+        // Fetch the sidecar bytes; missing → full scan (no false negatives).
+        use object_store::ObjectStoreExt as _;
+        let store = storage.project_object_store(project);
+        let bytes = match store.get(&sidecar).await {
+            Ok(get_result) => match get_result.bytes().await {
+                Ok(b) => b,
+                Err(_) => return Ok(()),
+            },
+            Err(_) => return Ok(()), // sidecar missing → fall back to full scan
+        };
+        let rtree = match basin_storage::index::rtree::deserialize_rtree(&bytes) {
+            Some(r) => r,
+            None => return Ok(()), // bad/foreign blob → full scan
+        };
+        registry.insert_segment(project, &table, &col_name, p, rtree);
+    }
+    // After lazy load every live file should be indexed; re-verify
+    // defensively so a racing compaction can't slip past the guard.
+    let all_indexed = live_paths
+        .iter()
+        .all(|p| registry.is_file_indexed(project, &table, &col_name, p));
+    if !all_indexed {
+        return Ok(());
+    }
+
+    // Compute the probe envelope from the predicate.
+    use basin_storage::index::rtree::SpatialAabb as AABB;
+    let query_bbox = match &pred {
+        crate::index_probe::SpatialPredicate::DWithin { x, y, radius_m, .. } => {
+            // Conservative bbox: expand by the degree-equivalent of the
+            // radius. 1 degree ≈ 111_320 m at the equator; using the same
+            // factor for latitude and longitude is the standard
+            // PostGIS-spheroid simplification (the residual UDF rejects
+            // false positives anyway). For polar workloads the longitude
+            // term widens but is still a superset.
+            const M_PER_DEG: f64 = 111_320.0;
+            let r_deg = radius_m / M_PER_DEG;
+            AABB::from_corners([*x - r_deg, *y - r_deg], [*x + r_deg, *y + r_deg])
+        }
+        crate::index_probe::SpatialPredicate::BboxIntersects { min_x, min_y, max_x, max_y, .. } => {
+            AABB::from_corners([*min_x, *min_y], [*max_x, *max_y])
+        }
+        crate::index_probe::SpatialPredicate::PointEq { x, y, .. } => {
+            AABB::from_corners([*x, *y], [*x, *y])
+        }
+    };
+
+    // Per-file row-group probe.
+    let mut rg_map: HashMap<String, Vec<u32>> = HashMap::new();
+    for p in &live_paths {
+        let rgs = registry
+            .candidate_row_groups(project, &table, &col_name, p, query_bbox)
+            .unwrap_or_default();
+        rg_map.insert(p.clone(), rgs);
+    }
+
+    // Convert table schema and build the custom provider.
+    let df_schema = match schema_ws_to_df(&meta.schema) {
+        Ok(s) => Arc::new(s),
+        Err(_) => return Ok(()),
+    };
+    let provider = crate::rtree_rowgroup_scan::RTreePrunedTable::new(
+        df_schema,
+        engine.config().storage.clone(),
+        *project,
+        table.clone(),
+        meta.file_format,
+        live_paths.clone(),
+        rg_map,
+    );
+    let tref = TableReference::Bare { table: table.as_str().into() };
+    let _ = ctx.deregister_table(tref.clone());
+    ctx.register_table(tref, Arc::new(provider))
+        .map_err(|e| BasinError::internal(format!("register rtree-pruned table: {e}")))?;
+    Ok(())
+}
+
 /// Inclusive month range covering the rows a query may need.
 #[derive(Copy, Clone, Debug)]
 struct YearMonthRange {

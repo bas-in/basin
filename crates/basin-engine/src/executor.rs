@@ -6354,6 +6354,18 @@ async fn exec_select(
             orig_sql,
         )
         .await?;
+        // PG-Wave-β — R-tree row-group spatial pruning
+        // (ST_DWithin / ST_Contains / = on a GIST-indexed POINT column).
+        // Probes the per-file R-tree registry to narrow each candidate file
+        // to the surviving row-groups and re-registers the table as a custom
+        // RTreePrunedTable for the duration of this query.
+        crate::session::apply_rtree_pruning_for_query(
+            &sess.engine,
+            &sess.project,
+            &sess.ctx,
+            orig_sql,
+        )
+        .await?;
     }
 
     // View-reference rewriting: replace any reference to a known plain view

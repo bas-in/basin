@@ -33,6 +33,11 @@ use rstar::{primitives::Rectangle, RTree, RTreeObject, AABB};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+/// Re-export of `rstar`'s axis-aligned bounding box type so engine callers
+/// can construct probe envelopes without taking a direct dependency on
+/// the `rstar` crate. Keeps the workspace dep graph compact.
+pub use rstar::AABB as SpatialAabb;
+
 /// Identifier for a single row-group within a file. Matches the
 /// `RowGroupId` shape used by [`super::gin_rowgroup`].
 pub type RowGroupId = u32;

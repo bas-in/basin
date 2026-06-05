@@ -2027,6 +2027,208 @@ pub fn like_matches(text: &str, pattern: &str, case_insensitive: bool) -> bool {
     pi == toks.len()
 }
 
+// ── PG-Wave-β — spatial GIST probe detection ──────────────────────────────────
+//
+// Pattern-recognise WHERE-clause spatial predicates that an R-tree on a POINT
+// column can prune at row-group granularity.  Three shapes are supported:
+//
+// 1. `ST_DWithin(col, ST_MakePoint(x, y), r)` (or commutative form) →
+//    [`SpatialPredicate::DWithin`] — INEXACT: the R-tree probes a bounding
+//    box of degrees on each side derived from `r` (meters); the Haversine UDF
+//    re-runs above the scan to cull false positives.
+//
+// 2. `ST_Contains(box_literal, col)` → [`SpatialPredicate::BboxIntersects`] —
+//    EXACT at row-group granularity.  Today the engine has no first-class
+//    BOX2D literal syntax; we accept a parenthesised pair of `ST_MakePoint`
+//    expressions as the bounding rectangle (lower-left, upper-right corners).
+//
+// 3. `col = ST_MakePoint(x, y)` → [`SpatialPredicate::PointEq`] — EXACT.
+//
+// CORRECTNESS: every shape falls through to a full scan when any condition
+// fails to match (col-on-col comparisons, non-literal coordinates, missing
+// GIST index — caller's responsibility) so the prune is purely additive.
+// No false negatives are possible at this layer.
+
+/// A spatial predicate the R-tree pushdown layer can act on.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SpatialPredicate {
+    /// `ST_DWithin(col, ST_MakePoint(x, y), r)` — INEXACT.
+    ///
+    /// R-tree probes an axis-aligned bounding box of the column expanded by
+    /// the degree-equivalent of `radius_m` on every side; surviving rows are
+    /// re-checked by the residual `st_dwithin` UDF (the engine keeps a
+    /// FilterExec above the scan).
+    DWithin { col: String, x: f64, y: f64, radius_m: f64 },
+    /// `ST_Contains(bbox_literal, col)` (a BOX2D-shaped rectangle) — EXACT
+    /// at row-group granularity.  The R-tree envelope test is the predicate.
+    BboxIntersects {
+        col: String,
+        min_x: f64,
+        min_y: f64,
+        max_x: f64,
+        max_y: f64,
+    },
+    /// `col = ST_MakePoint(x, y)` — EXACT, row-group-level point equality.
+    PointEq { col: String, x: f64, y: f64 },
+}
+
+impl SpatialPredicate {
+    /// The column referenced by this predicate (used to pick the catalog
+    /// GIST index entry to consult).
+    pub fn column(&self) -> &str {
+        match self {
+            SpatialPredicate::DWithin { col, .. }
+            | SpatialPredicate::BboxIntersects { col, .. }
+            | SpatialPredicate::PointEq { col, .. } => col,
+        }
+    }
+}
+
+/// Recognise a single spatial predicate from a WHERE expression.
+///
+/// Returns `Some(SpatialPredicate)` only for the EXACT shapes documented
+/// above.  Sub-expressions, col-on-col comparisons, and non-literal
+/// coordinates all fall through to `None` (full scan).
+pub fn detect_spatial_predicate(expr: &sqlparser::ast::Expr) -> Option<SpatialPredicate> {
+    use sqlparser::ast::{BinaryOperator, Expr};
+    match expr {
+        // Recurse into `AND` and pick the first matching arm (today the
+        // pushdown only fires for a single spatial predicate at a time;
+        // multiple spatial predicates would compose via FilterExec residue).
+        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+            detect_spatial_predicate(left).or_else(|| detect_spatial_predicate(right))
+        }
+        // `col = ST_MakePoint(x, y)` (and commutative).
+        Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+            let (col, x, y) = match (extract_col_name(left), extract_make_point(right)) {
+                (Some(c), Some((x, y))) => (c, x, y),
+                _ => match (extract_make_point(left), extract_col_name(right)) {
+                    (Some((x, y)), Some(c)) => (c, x, y),
+                    _ => return None,
+                },
+            };
+            Some(SpatialPredicate::PointEq { col, x, y })
+        }
+        // `ST_DWithin(a, b, r)` or `ST_Contains(box, col)`.
+        Expr::Function(f) => detect_spatial_function(f),
+        _ => None,
+    }
+}
+
+/// Recognise a spatial function call (`ST_DWithin` / `ST_Contains`).
+fn detect_spatial_function(f: &sqlparser::ast::Function) -> Option<SpatialPredicate> {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+    let name = f.name.to_string().to_lowercase();
+    let args: Vec<&FunctionArg> = match &f.args {
+        FunctionArguments::List(l) => l.args.iter().collect(),
+        _ => return None,
+    };
+    fn unwrap(a: &FunctionArg) -> Option<&sqlparser::ast::Expr> {
+        match a {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+            _ => None,
+        }
+    }
+    match (name.as_str(), args.len()) {
+        ("st_dwithin", 3) => {
+            let (a, b, r) = (unwrap(args[0])?, unwrap(args[1])?, unwrap(args[2])?);
+            let radius_m = extract_numeric_literal(r)?;
+            if radius_m <= 0.0 || !radius_m.is_finite() {
+                return None;
+            }
+            // Either (col, ST_MakePoint(...), r) or (ST_MakePoint(...), col, r).
+            let (col, x, y) = match (extract_col_name(a), extract_make_point(b)) {
+                (Some(c), Some((x, y))) => (c, x, y),
+                _ => match (extract_make_point(a), extract_col_name(b)) {
+                    (Some((x, y)), Some(c)) => (c, x, y),
+                    _ => return None,
+                },
+            };
+            Some(SpatialPredicate::DWithin { col, x, y, radius_m })
+        }
+        ("st_contains", 2) => {
+            // `ST_Contains(box, col)` — the engine has no BOX2D literal
+            // syntax today, so we accept the form
+            // `ST_Contains(ST_MakeEnvelope(min_x, min_y, max_x, max_y), col)`
+            // when the first arg is an envelope-shaped function call.
+            let (env, col_e) = (unwrap(args[0])?, unwrap(args[1])?);
+            let col = extract_col_name(col_e)?;
+            let (min_x, min_y, max_x, max_y) = extract_envelope(env)?;
+            Some(SpatialPredicate::BboxIntersects { col, min_x, min_y, max_x, max_y })
+        }
+        _ => None,
+    }
+}
+
+/// Extract `(x, y)` from a literal `ST_MakePoint(x, y)` call.  Both
+/// arguments must be numeric literals (or `-numeric` / cast thereof).
+fn extract_make_point(expr: &sqlparser::ast::Expr) -> Option<(f64, f64)> {
+    use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
+    match expr {
+        Expr::Cast { expr: inner, .. } => extract_make_point(inner),
+        Expr::Function(f) => {
+            let name = f.name.to_string().to_lowercase();
+            if name != "st_makepoint" && name != "st_point" {
+                return None;
+            }
+            let args: Vec<&FunctionArg> = match &f.args {
+                FunctionArguments::List(l) => l.args.iter().collect(),
+                _ => return None,
+            };
+            if args.len() != 2 {
+                return None;
+            }
+            fn unwrap(a: &FunctionArg) -> Option<&sqlparser::ast::Expr> {
+                match a {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                    _ => None,
+                }
+            }
+            let x = extract_numeric_literal(unwrap(args[0])?)?;
+            let y = extract_numeric_literal(unwrap(args[1])?)?;
+            Some((x, y))
+        }
+        _ => None,
+    }
+}
+
+/// Extract `(min_x, min_y, max_x, max_y)` from a PostGIS-style envelope
+/// expression.  Accepted forms:
+///   * `ST_MakeEnvelope(min_x, min_y, max_x, max_y)` (PostGIS canonical)
+///   * `ST_MakeEnvelope(min_x, min_y, max_x, max_y, srid)` (5-arg ignored
+///     SRID)
+fn extract_envelope(expr: &sqlparser::ast::Expr) -> Option<(f64, f64, f64, f64)> {
+    use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
+    match expr {
+        Expr::Cast { expr: inner, .. } => extract_envelope(inner),
+        Expr::Function(f) => {
+            let name = f.name.to_string().to_lowercase();
+            if name != "st_makeenvelope" && name != "st_envelope" {
+                return None;
+            }
+            let args: Vec<&FunctionArg> = match &f.args {
+                FunctionArguments::List(l) => l.args.iter().collect(),
+                _ => return None,
+            };
+            if args.len() != 4 && args.len() != 5 {
+                return None;
+            }
+            fn unwrap(a: &FunctionArg) -> Option<&sqlparser::ast::Expr> {
+                match a {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                    _ => None,
+                }
+            }
+            let min_x = extract_numeric_literal(unwrap(args[0])?)?;
+            let min_y = extract_numeric_literal(unwrap(args[1])?)?;
+            let max_x = extract_numeric_literal(unwrap(args[2])?)?;
+            let max_y = extract_numeric_literal(unwrap(args[3])?)?;
+            Some((min_x, min_y, max_x, max_y))
+        }
+        _ => None,
+    }
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2760,5 +2962,112 @@ mod tests {
         assert!(!like_matches("500", "50\\%", false));
         // Trailing % matches empty.
         assert!(like_matches("foo", "foo%", false));
+    }
+
+    // ── PG-Wave-β — spatial predicate detection ──────────────────────────────
+
+    fn parse_where(sql: &str) -> sqlparser::ast::Expr {
+        let dialect = sqlparser::dialect::PostgreSqlDialect {};
+        let stmts = sqlparser::parser::Parser::parse_sql(&dialect, sql).unwrap();
+        let q = match &stmts[0] {
+            sqlparser::ast::Statement::Query(q) => q,
+            _ => panic!("not a query"),
+        };
+        let sel = match q.body.as_ref() {
+            sqlparser::ast::SetExpr::Select(s) => s,
+            _ => panic!("not a select"),
+        };
+        sel.selection.clone().expect("WHERE missing")
+    }
+
+    #[test]
+    fn detect_dwithin_col_lhs() {
+        let w = parse_where(
+            "SELECT * FROM t WHERE ST_DWithin(geom, ST_MakePoint(2.3, 48.8), 1000)",
+        );
+        match detect_spatial_predicate(&w) {
+            Some(SpatialPredicate::DWithin { col, x, y, radius_m }) => {
+                assert_eq!(col, "geom");
+                assert!((x - 2.3).abs() < 1e-9);
+                assert!((y - 48.8).abs() < 1e-9);
+                assert!((radius_m - 1000.0).abs() < 1e-9);
+            }
+            other => panic!("expected DWithin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detect_dwithin_col_rhs_commutative() {
+        let w = parse_where(
+            "SELECT * FROM t WHERE ST_DWithin(ST_MakePoint(0.0, 0.0), p, 500)",
+        );
+        match detect_spatial_predicate(&w) {
+            Some(SpatialPredicate::DWithin { col, x, y, radius_m }) => {
+                assert_eq!(col, "p");
+                assert_eq!(x, 0.0);
+                assert_eq!(y, 0.0);
+                assert_eq!(radius_m, 500.0);
+            }
+            other => panic!("expected DWithin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detect_point_eq() {
+        let w = parse_where("SELECT * FROM t WHERE geom = ST_MakePoint(1.0, 2.0)");
+        match detect_spatial_predicate(&w) {
+            Some(SpatialPredicate::PointEq { col, x, y }) => {
+                assert_eq!(col, "geom");
+                assert_eq!(x, 1.0);
+                assert_eq!(y, 2.0);
+            }
+            other => panic!("expected PointEq, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detect_st_contains_envelope() {
+        let w = parse_where(
+            "SELECT * FROM t WHERE ST_Contains(ST_MakeEnvelope(0.0, 0.0, 10.0, 10.0), geom)",
+        );
+        match detect_spatial_predicate(&w) {
+            Some(SpatialPredicate::BboxIntersects { col, min_x, min_y, max_x, max_y }) => {
+                assert_eq!(col, "geom");
+                assert_eq!(min_x, 0.0);
+                assert_eq!(min_y, 0.0);
+                assert_eq!(max_x, 10.0);
+                assert_eq!(max_y, 10.0);
+            }
+            other => panic!("expected BboxIntersects, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detect_dwithin_via_and_clause() {
+        // The probe should pick the spatial arm out of an AND chain so that
+        // composite WHERE clauses still get the row-group prune.
+        let w = parse_where(
+            "SELECT * FROM t WHERE id > 0 AND ST_DWithin(geom, ST_MakePoint(0.0, 0.0), 100)",
+        );
+        match detect_spatial_predicate(&w) {
+            Some(SpatialPredicate::DWithin { col, .. }) => assert_eq!(col, "geom"),
+            other => panic!("expected DWithin via AND, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detect_no_match_col_on_col() {
+        // col-on-col comparisons can't be pruned by an R-tree.
+        let w = parse_where("SELECT * FROM t WHERE a = b");
+        assert!(detect_spatial_predicate(&w).is_none());
+    }
+
+    #[test]
+    fn detect_no_match_non_literal_radius() {
+        // Non-literal radius (a column) can't be pruned.
+        let w = parse_where(
+            "SELECT * FROM t WHERE ST_DWithin(geom, ST_MakePoint(0.0, 0.0), some_col)",
+        );
+        assert!(detect_spatial_predicate(&w).is_none());
     }
 }

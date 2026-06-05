@@ -217,6 +217,15 @@ pub(crate) struct EngineInner {
     pub(crate) interval_registry:
         Arc<basin_storage::index::interval::IntervalRegistry>,
 
+    /// PG-Wave-β: process-wide R-tree registry for POINT columns with a
+    /// `USING gist` index.  One parsed `rstar::RTree<SpatialEntry>` per
+    /// `(project, table, col, file)` lazily populated from sidecar files at
+    /// engine startup (and on first access for files written after startup).
+    /// Probed at query time by `apply_rtree_pruning_for_query` to narrow the
+    /// per-file row-group set before `ST_DWithin` / `ST_Contains` / `=`
+    /// re-evaluation.
+    pub(crate) rtree_registry: Arc<basin_storage::index::rtree::RTreeRegistry>,
+
     /// Phase 5.28.C: process-wide idle-in-transaction session reaper registry.
     /// Sessions register themselves on open; the reaper background task sweeps
     /// the registry on a fixed cadence and flags expired sessions.
@@ -357,6 +366,9 @@ impl Engine {
             ),
             interval_registry: Arc::new(
                 basin_storage::index::interval::IntervalRegistry::new(),
+            ),
+            rtree_registry: Arc::new(
+                basin_storage::index::rtree::RTreeRegistry::new(),
             ),
             reaper_registry: crate::session_reaper::SessionReaperRegistry::new(),
             lock_registry: basin_shard::LockRegistry::new(),
@@ -717,6 +729,24 @@ impl Engine {
         &self,
     ) -> &Arc<basin_storage::index::interval::IntervalRegistry> {
         &self.inner.interval_registry
+    }
+
+    // ── PG-Wave-β: R-tree registry for spatial POINT GIST index ──────────────
+
+    /// Process-wide R-tree registry for POINT columns with a `USING gist`
+    /// index. Returns a reference to the shared `Arc`; cloning it is cheap.
+    pub(crate) fn rtree_registry(
+        &self,
+    ) -> &Arc<basin_storage::index::rtree::RTreeRegistry> {
+        &self.inner.rtree_registry
+    }
+
+    /// Public accessor for integration tests that need to seed or inspect
+    /// the R-tree registry directly (used by the spatial viability bench).
+    pub fn rtree_registry_for_test(
+        &self,
+    ) -> Arc<basin_storage::index::rtree::RTreeRegistry> {
+        self.inner.rtree_registry.clone()
     }
 
     /// Bump the secondary-index file-skip counter by one. Called from
@@ -1147,6 +1177,7 @@ mod fast_select;
 mod hot_tombstone;
 mod fts_udf;
 mod gin_rowgroup_scan;
+mod rtree_rowgroup_scan;
 mod is_distinct_rewrite;
 mod function_ddl;
 mod generated_cols;
