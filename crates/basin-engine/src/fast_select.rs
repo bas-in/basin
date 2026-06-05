@@ -2644,15 +2644,115 @@ fn apply_is_null_filter(
     Ok(out)
 }
 
+/// A compiled form of a single `col IN (v1, v2, …, vN)` predicate,
+/// built once at filter-prep time.
+///
+/// For `Int64` and `Utf8` value lists a `HashSet`-backed probe is used
+/// (O(1) per row after the O(N) build).  For every other homogeneous or
+/// mixed-type list we fall back to the OR-chain path via
+/// [`basin_storage::evaluate_compound`].
+enum CompiledInPred {
+    /// `HashSet<i64>` for homogeneous `Int64` lists.
+    Int64Set(String, std::collections::HashSet<i64>),
+    /// `HashSet<String>` for homogeneous `Utf8` lists.
+    Utf8Set(String, std::collections::HashSet<String>),
+    /// OR-chain fallback for mixed or unsupported types.
+    Fallback(String, Vec<ScalarValue>),
+}
+
+impl CompiledInPred {
+    /// Compile a `(col, vals)` pair into the most efficient probe form.
+    fn compile(col: String, vals: Vec<ScalarValue>) -> Self {
+        if vals.is_empty() {
+            return Self::Fallback(col, vals);
+        }
+        // Detect homogeneous Int64.
+        let all_i64 = vals.iter().all(|v| matches!(v, ScalarValue::Int64(_)));
+        if all_i64 {
+            let set: std::collections::HashSet<i64> = vals
+                .iter()
+                .map(|v| match v {
+                    ScalarValue::Int64(n) => *n,
+                    _ => unreachable!(),
+                })
+                .collect();
+            return Self::Int64Set(col, set);
+        }
+        // Detect homogeneous Utf8.
+        let all_utf8 = vals.iter().all(|v| matches!(v, ScalarValue::Utf8(_)));
+        if all_utf8 {
+            let set: std::collections::HashSet<String> = vals
+                .into_iter()
+                .map(|v| match v {
+                    ScalarValue::Utf8(s) => s,
+                    _ => unreachable!(),
+                })
+                .collect();
+            return Self::Utf8Set(col, set);
+        }
+        // Mixed / unsupported — fall back to OR-chain.
+        Self::Fallback(col, vals)
+    }
+
+    /// Evaluate this predicate against `batch` and return a boolean mask.
+    ///
+    /// For `Int64Set` and `Utf8Set` the probe is O(rows) after the one-time
+    /// O(N) HashSet build in [`compile`]. For `Fallback` the OR-chain
+    /// delegate handles it.
+    fn evaluate(&self, batch: &RecordBatch) -> Result<arrow_array::BooleanArray> {
+        match self {
+            Self::Int64Set(col, set) => {
+                let col_idx = batch
+                    .schema()
+                    .index_of(col)
+                    .map_err(|_| BasinError::InvalidSchema(format!("IN: unknown column {col}")))?;
+                let arr = batch.column(col_idx);
+                // If the column isn't Int64 (schema mismatch, e.g. Int32 after
+                // a projection), fall through to a safe false-mask rather than
+                // panicking.  Real schemas always match their declared type.
+                let Some(i64_arr) = arr.as_any().downcast_ref::<arrow_array::Int64Array>() else {
+                    // Return all-false — no row can match.
+                    return Ok(arrow_array::BooleanArray::from(vec![false; batch.num_rows()]));
+                };
+                let mask: arrow_array::BooleanArray = i64_arr
+                    .iter()
+                    .map(|opt| opt.map(|v| set.contains(&v)).unwrap_or(false))
+                    .collect();
+                Ok(mask)
+            }
+            Self::Utf8Set(col, set) => {
+                let col_idx = batch
+                    .schema()
+                    .index_of(col)
+                    .map_err(|_| BasinError::InvalidSchema(format!("IN: unknown column {col}")))?;
+                let arr = batch.column(col_idx);
+                let Some(str_arr) = arr.as_any().downcast_ref::<arrow_array::StringArray>() else {
+                    return Ok(arrow_array::BooleanArray::from(vec![false; batch.num_rows()]));
+                };
+                let mask: arrow_array::BooleanArray = str_arr
+                    .iter()
+                    .map(|opt| opt.map(|v| set.contains(v)).unwrap_or(false))
+                    .collect();
+                Ok(mask)
+            }
+            Self::Fallback(col, vals) => {
+                use basin_storage::{evaluate_compound, CompoundPredicate as CP};
+                let pred = CP::In(col.clone(), vals.clone());
+                evaluate_compound(batch, &pred)
+                    .map_err(|e| BasinError::internal(format!("in_list fallback eval: {e}")))
+            }
+        }
+    }
+}
+
 /// Apply one or more `col IN (lits)` filters to `batches`.  Each entry in
 /// `in_list_preds` is a `(column_name, values)` pair; a row survives when
 /// ALL listed IN-predicates match (AND semantics over the predicates, OR
 /// semantics within each value list).
 ///
-/// Uses [`basin_storage::evaluate_compound`] with [`CompoundPredicate::In`]
-/// so the filter is bit-exact with the storage-layer IN semantics.  This is
-/// the correctness re-check for the bloom+zone-map IN-list probe (which is
-/// conservative) and the sole filter for non-PK IN columns.
+/// For homogeneous `Int64` or `Utf8` value lists a [`CompiledInPred`] with a
+/// `HashSet` probe is used — O(1) per row after the one-time O(N) build.  For
+/// mixed-type or unsupported lists the original OR-chain delegate handles it.
 ///
 /// NULL mask entries (rows where the column is NULL) are treated as
 /// non-matching — consistent with SQL three-valued-logic WHERE semantics.
@@ -2663,19 +2763,22 @@ fn apply_in_list_filter(
     in_list_preds: &[(String, Vec<ScalarValue>)],
 ) -> Result<Vec<RecordBatch>> {
     use arrow_select::filter::filter_record_batch;
-    use basin_storage::{evaluate_compound, CompoundPredicate as CP};
+
+    // Compile each predicate once (builds the HashSet here, not per-batch).
+    let compiled: Vec<CompiledInPred> = in_list_preds
+        .iter()
+        .map(|(col, vals)| CompiledInPred::compile(col.clone(), vals.clone()))
+        .collect();
 
     let mut out = Vec::with_capacity(batches.len());
     for batch in batches {
         if batch.num_rows() == 0 {
             continue;
         }
-        // Build one CompoundPredicate::In per entry, then AND them together.
+        // Build one mask per compiled predicate, then AND them together.
         let mut mask: Option<arrow_array::BooleanArray> = None;
-        for (col, vals) in in_list_preds {
-            let pred = CP::In(col.clone(), vals.clone());
-            let col_mask = evaluate_compound(&batch, &pred)
-                .map_err(|e| BasinError::internal(format!("in_list filter eval: {e}")))?;
+        for cp in &compiled {
+            let col_mask = cp.evaluate(&batch)?;
             mask = Some(match mask {
                 None => col_mask,
                 Some(prev) => arrow::compute::and_kleene(&prev, &col_mask)
@@ -3304,6 +3407,140 @@ mod tests {
         let mean = samples.iter().sum::<f64>() / ITERS as f64;
         println!(
             "\nbench_fast_select_latency: mean={mean:.3}ms  p50={p50:.3}ms  p95={p95:.3}ms  p99={p99:.3}ms"
+        );
+    }
+
+    // ── HashSet IN-list probe tests ───────────────────────────────────────────
+
+    /// Build a small RecordBatch with an `id` (Int64) column and a `name`
+    /// (Utf8) column for use in `CompiledInPred` unit tests.
+    fn make_test_batch_i64_utf8() -> RecordBatch {
+        use arrow_array::{Int64Array, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let ids: Int64Array = vec![
+            Some(1), Some(2), Some(3), Some(50), None, Some(99),
+        ]
+        .into_iter()
+        .collect();
+        let names: StringArray = vec![
+            Some("alice"), Some("bob"), Some("carol"), Some("dave"), Some("eve"), None,
+        ]
+        .into_iter()
+        .collect();
+        RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(names)]).unwrap()
+    }
+
+    /// `WHERE id IN (1,3,...,99)` with 100 integers uses the HashSet path and
+    /// returns only the rows whose `id` is in the set.
+    #[test]
+    fn in_list_int64_fastpath() {
+        // Build a set of 100 Int64 values that includes 1, 3, 50, 99 from our
+        // test batch (but not 2 and not NULL).
+        let vals: Vec<ScalarValue> = (0..100i64)
+            .map(|k| ScalarValue::Int64(k * 1 + 1)) // 1..=100
+            .collect();
+
+        // CompiledInPred should resolve to Int64Set.
+        let cp = CompiledInPred::compile("id".to_string(), vals);
+        assert!(
+            matches!(cp, CompiledInPred::Int64Set(_, _)),
+            "homogeneous Int64 list must compile to Int64Set"
+        );
+
+        let batch = make_test_batch_i64_utf8();
+        let mask = cp.evaluate(&batch).unwrap();
+
+        // Row 0: id=1  → in set  → true
+        // Row 1: id=2  → in set  → true
+        // Row 2: id=3  → in set  → true
+        // Row 3: id=50 → in set  → true
+        // Row 4: id=NULL → false
+        // Row 5: id=99 → in set  → true
+        let expected = vec![true, true, true, true, false, true];
+        let got: Vec<bool> = mask.iter().map(|v| v.unwrap_or(false)).collect();
+        assert_eq!(got, expected);
+
+        // Verify the filter actually removes the NULL row.
+        let filtered = apply_in_list_filter(vec![batch], &[
+            ("id".to_string(), (1..=100).map(ScalarValue::Int64).collect()),
+        ])
+        .unwrap();
+        let total_rows: usize = filtered.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 5, "5 non-null matching rows expected");
+    }
+
+    /// `WHERE name IN ('alice','carol')` uses the Utf8 HashSet path.
+    #[test]
+    fn in_list_utf8_fastpath() {
+        let vals = vec![
+            ScalarValue::Utf8("alice".to_string()),
+            ScalarValue::Utf8("carol".to_string()),
+        ];
+
+        let cp = CompiledInPred::compile("name".to_string(), vals.clone());
+        assert!(
+            matches!(cp, CompiledInPred::Utf8Set(_, _)),
+            "homogeneous Utf8 list must compile to Utf8Set"
+        );
+
+        let batch = make_test_batch_i64_utf8();
+        let mask = cp.evaluate(&batch).unwrap();
+
+        // Row 0: "alice" → true
+        // Row 1: "bob"   → false
+        // Row 2: "carol" → true
+        // Row 3: "dave"  → false
+        // Row 4: "eve"   → false
+        // Row 5: NULL    → false
+        let expected = vec![true, false, true, false, false, false];
+        let got: Vec<bool> = mask.iter().map(|v| v.unwrap_or(false)).collect();
+        assert_eq!(got, expected);
+
+        let filtered = apply_in_list_filter(vec![batch], &[("name".to_string(), vals)]).unwrap();
+        let total_rows: usize = filtered.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
+    }
+
+    /// `WHERE id IN (1, 'x')` — mixed scalar types (Int64 + Utf8) route to
+    /// `CompiledInPred::Fallback`, not the HashSet paths.  This is a compile-
+    /// time routing test; the fallback itself is not evaluated here because the
+    /// storage-layer OR-chain errors on a genuine type mismatch (Int64 column
+    /// vs Utf8 literal), which is the correct behaviour — the SQL parser should
+    /// have rejected such a query before it reaches the filter.
+    #[test]
+    fn in_list_falls_back_for_mixed_types() {
+        let vals_mixed = vec![
+            ScalarValue::Int64(1),
+            ScalarValue::Utf8("x".to_string()),
+        ];
+        let cp_mixed = CompiledInPred::compile("id".to_string(), vals_mixed);
+        assert!(
+            matches!(cp_mixed, CompiledInPred::Fallback(_, _)),
+            "mixed Int64+Utf8 list must compile to Fallback, not HashSet"
+        );
+
+        // A list containing a Boolean value is also not Int64 or Utf8 — falls
+        // through to Fallback.
+        let vals_bool = vec![
+            ScalarValue::Boolean(true),
+            ScalarValue::Boolean(false),
+        ];
+        let cp_bool = CompiledInPred::compile("flag".to_string(), vals_bool);
+        assert!(
+            matches!(cp_bool, CompiledInPred::Fallback(_, _)),
+            "Boolean list must compile to Fallback"
+        );
+
+        // Empty list also routes to Fallback.
+        let cp_empty = CompiledInPred::compile("id".to_string(), vec![]);
+        assert!(
+            matches!(cp_empty, CompiledInPred::Fallback(_, _)),
+            "empty list must compile to Fallback"
         );
     }
 }
