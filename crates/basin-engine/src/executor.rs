@@ -6337,6 +6337,21 @@ async fn exec_select(
             orig_sql,
         )
         .await?;
+        // Inv-W5 / W9 — JSONB `@>` posting-list row-group prune.
+        // Runs AFTER `apply_gin_pruning_for_query` so the precise
+        // per-`(key, value)` posting list takes precedence over the
+        // bloom row-group prune: when the posting registry covers all
+        // live files it re-registers the table with a tighter
+        // row-group selection.  When the posting registry is cold /
+        // partial / NoIndex, the bloom path's earlier registration
+        // remains in effect.
+        crate::session::apply_jsonb_posting_pruning_for_query(
+            &sess.engine,
+            &sess.project,
+            &sess.ctx,
+            orig_sql,
+        )
+        .await?;
         crate::session::apply_gin_fts_pruning_for_query(
             &sess.engine,
             &sess.project,

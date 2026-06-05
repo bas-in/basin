@@ -2879,6 +2879,278 @@ pub(crate) async fn apply_gin_fts_pruning_for_query(
     Ok(())
 }
 
+/// Inv-W5 / W9 — relaxed JSONB `@>` shape detector for the posting-list
+/// prune.  Mirrors [`crate::index_probe::detect_gin_containment`] but is
+/// permissive about the projection (accepts `count(*)`, `SELECT col1, agg(x)`,
+/// etc.) and ignores trailing clauses (ORDER BY, LIMIT).  Returns the table,
+/// column, opclass, and needle bytes when the shape is
+/// `SELECT … FROM <table> WHERE <col> @> '<literal>'`.
+async fn detect_jsonb_containment_for_prune(
+    sql: &str,
+    project: &ProjectId,
+    catalog: &Arc<dyn basin_catalog::Catalog>,
+) -> Option<JsonbContainmentPrunePlan> {
+    if !sql.contains("@>") {
+        return None;
+    }
+    let dialect = PostgreSqlDialect {};
+    let stmts = Parser::parse_sql(&dialect, sql).ok()?;
+    if stmts.len() != 1 {
+        return None;
+    }
+    let query = match &stmts[0] {
+        Statement::Query(q) => q.as_ref(),
+        _ => return None,
+    };
+    if query.with.is_some() {
+        return None;
+    }
+    let select = match query.body.as_ref() {
+        SetExpr::Select(s) => s,
+        _ => return None,
+    };
+    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+        return None;
+    }
+    let table_name = match &select.from[0].relation {
+        TableFactor::Table { name, alias: None, args: None, .. } => {
+            if name.0.len() != 1 {
+                return None;
+            }
+            name.0[0].id_val().clone()
+        }
+        _ => return None,
+    };
+    let table = TableName::new(table_name).ok()?;
+
+    // WHERE must contain `col @> 'literal'` as the top-level expression
+    // (or as one conjunct of a top-level AND — we walk for it).
+    let (col_name, needle_str) = find_top_level_at_gt(select.selection.as_ref()?)?;
+
+    // Catalog: table must have a GIN index on `col` and the opclass must be
+    // `jsonb_ops` (the only opclass our posting-list registry indexes for).
+    let meta = catalog.load_table(project, &table).await.ok()?;
+    let gin_index = meta.indexes.iter().find(|idx| {
+        idx.access_method == "gin"
+            && idx.columns.len() == 1
+            && idx.columns[0] == col_name
+    })?;
+    let opclass = gin_index.opclass.clone().unwrap_or_else(|| "jsonb_ops".to_string());
+    if opclass != "jsonb_ops" {
+        // `jsonb_path_ops` uses hashed paths — the posting list's `(key,
+        // value)` atom shape doesn't apply directly.  Skip and let the
+        // bloom path handle it.
+        return None;
+    }
+
+    let needle_bytes = needle_str.as_bytes().to_vec();
+    let _: serde_json::Value = serde_json::from_slice(&needle_bytes).ok()?;
+    Some(JsonbContainmentPrunePlan {
+        table,
+        col: col_name,
+        needle: needle_bytes,
+    })
+}
+
+/// Walk `expr` looking for a top-level `col @> 'literal'` predicate
+/// (possibly nested inside an AND chain).  Returns the first match found,
+/// which is sufficient for the prune because additional conjuncts only
+/// further narrow the result — they cannot expand it.
+fn find_top_level_at_gt(expr: &Expr) -> Option<(String, String)> {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            let op_str = op.to_string();
+            if op_str == "@>" {
+                let col = match left.as_ref() {
+                    Expr::Identifier(id) => id.value.clone(),
+                    _ => return None,
+                };
+                let literal = crate::index_probe::extract_json_literal_for_prune(right)?;
+                return Some((col, literal));
+            }
+            if matches!(op, BinaryOperator::And) {
+                if let Some(found) = find_top_level_at_gt(left) {
+                    return Some(found);
+                }
+                if let Some(found) = find_top_level_at_gt(right) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Expr::Nested(inner) => find_top_level_at_gt(inner),
+        _ => None,
+    }
+}
+
+#[derive(Debug)]
+struct JsonbContainmentPrunePlan {
+    table: TableName,
+    col: String,
+    needle: Vec<u8>,
+}
+
+/// Inv-W5 / W9 — JSONB `@>` row-group pruning via posting list.
+///
+/// Mirrors [`apply_gin_pruning_for_query`] but drives the per-`(key, value)`
+/// posting list ([`basin_storage::index::jsonb_posting::JsonbPostingRegistry`])
+/// instead of the bloom row-group registry.  The posting list is the precise
+/// inverted index needed for `@>` queries whose searched terms saturate the
+/// bloom (every row-group has the term → bloom prunes nothing).
+///
+/// Detection re-uses [`crate::index_probe::detect_gin_containment`] so the
+/// same `col @> '{…}'` shape is recognised.  Probe returns a per-file
+/// row-group selection; if all live files are covered the registered
+/// `ListingTable` is swapped for a [`crate::jsonb_posting_scan::JsonbPostingPrunedTable`].
+///
+/// Lazy sidecar load: at probe time, any live file that is not resident in
+/// the registry is fetched from `projects/{p}/tables/{t}/index/{col}.jsonb_post/{ulid}.bin`
+/// (the bincode sidecar written by the compactor).  Failed loads fall
+/// through to the full scan — no false negatives.
+///
+/// Correctness contract:
+/// * The posting list is a conservative superset (file-level AND of needle
+///   atoms; per-file row-group UNION across atoms).  The `jsonb_contains`
+///   UDF re-evaluates every emitted row.
+/// * Pruning only fires when every live file is loaded into the registry
+///   (after the lazy-load step).  Any uncovered file triggers a full scan.
+/// * On any error returns `Ok(())` → full scan.
+pub(crate) async fn apply_jsonb_posting_pruning_for_query(
+    engine: &Engine,
+    project: &ProjectId,
+    ctx: &SessionContext,
+    sql: &str,
+) -> Result<()> {
+    // Fast pre-check: must contain @> to be relevant.
+    if !sql.contains("@>") {
+        return Ok(());
+    }
+
+    // Detect the `… FROM table WHERE col @> 'literal' …` shape directly.
+    // The existing `detect_gin_containment` is too strict (it rejects
+    // anything other than bare-column projections / SELECT *) for queries
+    // like `SELECT count(*)`, but the prune decision only depends on the
+    // FROM table + WHERE shape — the projection doesn't change which
+    // files we open.  We use a relaxed detector that ignores projection
+    // and any trailing clauses (ORDER BY, LIMIT, etc.).
+    let gin_plan = match detect_jsonb_containment_for_prune(
+        sql,
+        project,
+        &engine.config().catalog,
+    )
+    .await
+    {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+
+    // Parse the needle now so we can probe.
+    let needle: serde_json::Value = match serde_json::from_slice(&gin_plan.needle) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+
+    let meta = match engine.config().catalog.load_table(project, &gin_plan.table).await {
+        Ok(m) => m,
+        Err(_) => return Ok(()),
+    };
+    let live_files: Vec<DataFileRef> = meta.live_data_files();
+    if live_files.is_empty() {
+        return Ok(());
+    }
+    let live_paths: Vec<String> =
+        live_files.iter().map(|f| f.path.to_string()).collect();
+
+    // Lazy sidecar load: for each live file not in the registry, fetch the
+    // bincode sidecar and ingest it.  If any sidecar is missing or
+    // unparseable, fall through to a full scan (the bloom path or the raw
+    // scan path still runs, so correctness holds).
+    let registry = engine.jsonb_posting_registry();
+    let storage = engine.config().storage.clone();
+    for p in &live_paths {
+        if registry.is_file_indexed(project, &gin_plan.table, &gin_plan.col, p) {
+            continue;
+        }
+        let Some(sidecar) =
+            basin_storage::index::jsonb_posting::posting_sidecar_key_for_data_file(
+                project,
+                &gin_plan.table,
+                &gin_plan.col,
+                p,
+            )
+        else {
+            return Ok(());
+        };
+        use object_store::ObjectStoreExt as _;
+        let store = storage.project_object_store(project);
+        let bytes = match store.get(&sidecar).await {
+            Ok(get_result) => match get_result.bytes().await {
+                Ok(b) => b,
+                Err(_) => return Ok(()),
+            },
+            Err(_) => return Ok(()), // sidecar missing → full scan
+        };
+        if !registry.ingest_sidecar(project, &gin_plan.table, &gin_plan.col, &bytes) {
+            return Ok(());
+        }
+    }
+
+    // After lazy load every live file should be indexed; re-verify
+    // defensively so a racing compaction can't slip past the guard.
+    let all_indexed = live_paths
+        .iter()
+        .all(|p| registry.is_file_indexed(project, &gin_plan.table, &gin_plan.col, p));
+    if !all_indexed {
+        return Ok(());
+    }
+
+    // Probe the posting list.
+    use basin_storage::index::jsonb_posting::JsonbProbeResult;
+    let probe = registry.probe(project, &gin_plan.table, &gin_plan.col, &needle);
+    let rg_map: HashMap<String, Vec<u32>> = match probe {
+        JsonbProbeResult::FileRowGroups(m) => m,
+        // Empty is handled by the existing short-circuit / DataFusion (zero rows).
+        // NoIndex → fall through to bloom / full scan.
+        _ => return Ok(()),
+    };
+
+    // Restrict to live files.  Files that the probe omitted are provably
+    // empty for this query (at least one needle atom is absent from the
+    // file), so we want to skip them entirely.  Per the storage contract
+    // (`ReadOptions::row_group_selection`), a file present in the map
+    // with an empty Vec opens ZERO row-groups (skip entirely); a file
+    // absent from the map opens every row-group (scan in full).  So we
+    // pad omitted live files with `Vec::new()` to skip them.
+    let live_set: std::collections::HashSet<&str> =
+        live_paths.iter().map(|s| s.as_str()).collect();
+    let mut rg_map_live: HashMap<String, Vec<u32>> = rg_map
+        .into_iter()
+        .filter(|(f, _)| live_set.contains(f.as_str()))
+        .collect();
+    for p in &live_paths {
+        rg_map_live.entry(p.clone()).or_default();
+    }
+
+    let df_schema = match schema_ws_to_df(&meta.schema) {
+        Ok(s) => Arc::new(s),
+        Err(_) => return Ok(()),
+    };
+    let provider = crate::jsonb_posting_scan::JsonbPostingPrunedTable::new(
+        df_schema,
+        engine.config().storage.clone(),
+        *project,
+        gin_plan.table.clone(),
+        meta.file_format,
+        live_paths,
+        rg_map_live,
+    );
+    let tref = TableReference::Bare { table: gin_plan.table.as_str().into() };
+    let _ = ctx.deregister_table(tref.clone());
+    ctx.register_table(tref, Arc::new(provider))
+        .map_err(|e| BasinError::internal(format!("register jsonb-posting-pruned table: {e}")))?;
+    Ok(())
+}
+
 /// Phase 5.24.D — GIST interval-tree file-level pruning.
 ///
 /// Mirrors [`apply_gin_pruning_for_query`] for range `@>` / `&&` / `<@`

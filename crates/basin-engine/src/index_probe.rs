@@ -1018,13 +1018,20 @@ fn extract_key_array_literal(expr: &sqlparser::ast::Expr) -> Option<Vec<String>>
 /// * `'{"key":"val"}'` — single-quoted string literal
 /// * `'{"key":"val"}'::jsonb` — with a jsonb cast suffix
 fn extract_json_literal(expr: &sqlparser::ast::Expr) -> Option<String> {
+    extract_json_literal_for_prune(expr)
+}
+
+/// Pub(crate) alias for [`extract_json_literal`].  Exposed so the Inv-W5
+/// JSONB-posting-prune detector in `session.rs` can reuse the same shape
+/// matcher without duplicating it.
+pub(crate) fn extract_json_literal_for_prune(expr: &sqlparser::ast::Expr) -> Option<String> {
     use sqlparser::ast::{Expr, Value, ValueWithSpan};
     match expr {
         Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => {
             Some(s.clone())
         }
         // `'literal'::jsonb` cast
-        Expr::Cast { expr: inner, .. } => extract_json_literal(inner),
+        Expr::Cast { expr: inner, .. } => extract_json_literal_for_prune(inner),
         _ => None,
     }
 }

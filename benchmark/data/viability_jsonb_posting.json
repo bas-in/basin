@@ -1,0 +1,38 @@
+{
+  "kind": "viability",
+  "id": "jsonb_posting",
+  "name": "JSONB @> via posting-list row-group prune",
+  "claim": "JSONB `@>` containment with a GIN index AND-merges per-`(key, value)` posting lists at compaction time and probes them at query time to narrow the per-file row-group set.  Replaces the bloom registry for `@>` queries whose terms saturate every row-group (the bench cycles category through 3 values and region through 5 — every term is in every row-group).",
+  "passed": true,
+  "primary": {
+    "label": "speedup_indexed_vs_unindexed",
+    "value": 1.9457164976809675,
+    "unit": "x",
+    "bar": {
+      "op": "greater_than_or_equal",
+      "value": 1.5
+    }
+  },
+  "details": {
+    "compact_ms": 8446.387959000002,
+    "expected_count": 13333,
+    "indexed_all_ms": [
+      400.00704199999996,
+      401.695292,
+      396.286
+    ],
+    "indexed_best_ms": 396.286,
+    "match_count": 13333,
+    "n_rows": 200000,
+    "posting_registry_entries": 214,
+    "row_block": 2048,
+    "speedup_x": 1.9457164976809675,
+    "unindexed_all_ms": [
+      771.060208,
+      774.159,
+      772.8804580000001
+    ],
+    "unindexed_best_ms": 771.060208
+  },
+  "generated_at": "@1780632921"
+}

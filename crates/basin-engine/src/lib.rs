@@ -210,6 +210,16 @@ pub(crate) struct EngineInner {
     pub(crate) gin_fts_registry:
         Arc<basin_storage::index::gin_tsvector::GinTsvectorRegistry>,
 
+    /// Inv-W5 / W9: process-wide JSONB `(key, value)` posting-list
+    /// registry.  One [`basin_storage::index::jsonb_posting::JsonbPostingRegistry`]
+    /// per process.  Populated at compaction time (mirrors
+    /// `gin_rowgroup_registry`) and probed at query time by
+    /// `apply_jsonb_posting_pruning_for_query` for `@>` containment.
+    /// Existing `gin_rowgroup_registry` (bloom) stays wired for `?`
+    /// key-exists queries.
+    pub(crate) jsonb_posting_registry:
+        Arc<basin_storage::index::jsonb_posting::JsonbPostingRegistry>,
+
     /// Phase 5.24.D: process-wide interval-tree registry for range-typed columns
     /// with a GIST index.  One [`IntervalTree`] per `(project, table, col)`
     /// populated at INSERT time.  Probed at query time for `@>` / `&&` / `<@`
@@ -364,6 +374,9 @@ impl Engine {
             gin_fts_registry: Arc::new(
                 basin_storage::index::gin_tsvector::GinTsvectorRegistry::new(),
             ),
+            jsonb_posting_registry: Arc::new(
+                basin_storage::index::jsonb_posting::JsonbPostingRegistry::new(),
+            ),
             interval_registry: Arc::new(
                 basin_storage::index::interval::IntervalRegistry::new(),
             ),
@@ -401,6 +414,7 @@ impl Engine {
         // opportunity to populate row-group summaries for shard-written data.
         if let Some(shard) = inner.cfg.shard.as_ref() {
             shard.set_gin_rowgroup_registry(inner.gin_rowgroup_registry.clone());
+            shard.set_jsonb_posting_registry(inner.jsonb_posting_registry.clone());
         }
         attach_reactor_sink(&inner, catalog);
         let engine = Self { inner };
@@ -719,6 +733,24 @@ impl Engine {
         &self,
     ) -> &Arc<basin_storage::index::gin_tsvector::GinTsvectorRegistry> {
         &self.inner.gin_fts_registry
+    }
+
+    // ── Inv-W5 / W9: JSONB `@>` posting-list registry ─────────────────────────
+
+    /// Process-wide JSONB posting-list registry for `@>` containment.
+    /// Returns a reference to the shared `Arc`; cloning it is cheap.
+    pub(crate) fn jsonb_posting_registry(
+        &self,
+    ) -> &Arc<basin_storage::index::jsonb_posting::JsonbPostingRegistry> {
+        &self.inner.jsonb_posting_registry
+    }
+
+    /// Public accessor for integration tests that need to inspect the
+    /// JSONB posting registry (e.g. to verify compaction re-indexing).
+    pub fn jsonb_posting_registry_for_test(
+        &self,
+    ) -> Arc<basin_storage::index::jsonb_posting::JsonbPostingRegistry> {
+        self.inner.jsonb_posting_registry.clone()
     }
 
     // ── Phase 5.24.D: GIST interval-tree index for range types ───────────────
@@ -1177,6 +1209,7 @@ mod fast_select;
 mod hot_tombstone;
 mod fts_udf;
 mod gin_rowgroup_scan;
+mod jsonb_posting_scan;
 mod rtree_rowgroup_scan;
 mod is_distinct_rewrite;
 mod function_ddl;

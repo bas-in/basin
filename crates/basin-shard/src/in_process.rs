@@ -144,6 +144,14 @@ pub(crate) struct InProcessShard {
     gin_rowgroup_registry: std::sync::RwLock<
         Option<Arc<basin_storage::index::gin_rowgroup::GinRowGroupRegistry>>,
     >,
+    /// JSONB posting-list registry (Inv-W5 / W9 — replaces the bloom for
+    /// `@>` containment).  Same lifecycle as `gin_rowgroup_registry`:
+    /// wired once at engine startup, read by `compact_one` to build the
+    /// per-`(key, value)` posting list for newly written files.  `None`
+    /// until the engine wires it in.
+    jsonb_posting_registry: std::sync::RwLock<
+        Option<Arc<basin_storage::index::jsonb_posting::JsonbPostingRegistry>>,
+    >,
     /// Phase 6.X.A — leases held by this replica + their granted epoch.
     held_leases: HeldLeases,
     /// Phase 6.X.C — partitions whose lease is mid-handoff. While present in
@@ -160,6 +168,7 @@ impl InProcessShard {
             stats: Arc::new(Mutex::new(ShardStats::default())),
             top_pattern_provider: std::sync::RwLock::new(None),
             gin_rowgroup_registry: std::sync::RwLock::new(None),
+            jsonb_posting_registry: std::sync::RwLock::new(None),
             held_leases: Arc::new(Mutex::new(HashMap::new())),
             draining: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -176,12 +185,18 @@ impl InProcessShard {
             .read()
             .expect("gin_rowgroup_registry lock poisoned")
             .clone();
+        let jp_registry = self
+            .jsonb_posting_registry
+            .read()
+            .expect("jsonb_posting_registry lock poisoned")
+            .clone();
         Self {
             cfg: self.cfg.clone(),
             partitions: self.partitions.clone(),
             stats: self.stats.clone(),
             top_pattern_provider: std::sync::RwLock::new(provider),
             gin_rowgroup_registry: std::sync::RwLock::new(rg_registry),
+            jsonb_posting_registry: std::sync::RwLock::new(jp_registry),
             held_leases: self.held_leases.clone(),
             draining: self.draining.clone(),
         }
@@ -1416,6 +1431,34 @@ impl InProcessShard {
                 data_file.path.as_ref().as_ref(),
             );
 
+            // Inv-W5 / W9: build the JSONB posting list (per-(key, value)
+            // → set of (file, row_group) inverted index) for any GIN
+            // index on a JSONB column.  This is the prune primitive for
+            // `@>` containment — the existing bloom registry above stays
+            // wired for `?` key-exists queries.  Best-effort: a sidecar
+            // write failure is logged but does not abort the commit
+            // (queries fall back to the bloom / full-scan path).
+            if let Err(e) = reindex_compacted_file_jsonb_posting(
+                &self.jsonb_posting_registry,
+                self.cfg.storage.clone(),
+                project,
+                &table,
+                &gin_indexes,
+                effective_rg_size,
+                &merged,
+                data_file.path.as_ref(),
+            )
+            .await
+            {
+                tracing::warn!(
+                    project = %project,
+                    table = %table,
+                    file = %data_file.path.as_ref(),
+                    error = %e,
+                    "Inv-W5: JSONB posting-list sidecar write failed; @> falls back to bloom prune"
+                );
+            }
+
             // PG-Wave-α: write `.rtree` sidecars for any GIST index on a
             // POINT column. The probe path (RTreePrunedTable +
             // apply_rtree_pruning_for_query) lands in PG-Wave-β; the
@@ -1683,6 +1726,17 @@ impl ShardImpl for InProcessShard {
             .gin_rowgroup_registry
             .write()
             .expect("gin_rowgroup_registry lock poisoned");
+        *guard = Some(registry);
+    }
+
+    fn set_jsonb_posting_registry(
+        &self,
+        registry: Arc<basin_storage::index::jsonb_posting::JsonbPostingRegistry>,
+    ) {
+        let mut guard = self
+            .jsonb_posting_registry
+            .write()
+            .expect("jsonb_posting_registry lock poisoned");
         *guard = Some(registry);
     }
 
@@ -2572,6 +2626,113 @@ async fn reindex_compacted_file_rtree(
                     "R-tree sidecar put {sidecar}: {e}"
                 ))
             })?;
+    }
+    Ok(())
+}
+
+// ── JSONB posting-list re-index for compacted files ──────────────────────────
+
+/// Build the JSONB `(key, value)` posting list for every JSONB GIN
+/// column declared on `table` after a compaction writes a new merged
+/// Parquet file.  Mirrors `reindex_compacted_file_gin` (the bloom
+/// registry) — both registries are populated from the same merged
+/// batch but indexed differently:
+///
+/// * `gin_rowgroup` (bloom) — answers `?` key-exists queries fast
+///   when the term is sparse; useless when the term is in every
+///   row-group.
+/// * `jsonb_posting` (inverted index) — answers `@>` containment by
+///   AND-merging per-`(key, value)` posting lists at file + row-group
+///   granularity; precise even when individual terms saturate the
+///   bloom.
+///
+/// The posting list is also persisted to a bincode sidecar at
+/// `index/{col}.jsonb_post/{ulid}.bin` so a fresh engine instance can
+/// lazy-load the index without re-scanning the data file.
+///
+/// Best-effort: errors are returned to the caller for logging; a
+/// failure here means `@>` queries against this file fall back to the
+/// bloom / full-scan path.
+async fn reindex_compacted_file_jsonb_posting(
+    jp_registry_lock: &std::sync::RwLock<
+        Option<Arc<basin_storage::index::jsonb_posting::JsonbPostingRegistry>>,
+    >,
+    storage: basin_storage::Storage,
+    project: &ProjectId,
+    table: &TableName,
+    gin_indexes: &[basin_catalog::SecondaryIndex],
+    rg_size: usize,
+    batch: &arrow_array::RecordBatch,
+    file_path: &str,
+) -> Result<()> {
+    use object_store::ObjectStoreExt;
+    let registry = {
+        let guard = jp_registry_lock
+            .read()
+            .expect("jsonb_posting_registry lock poisoned");
+        match guard.as_ref() {
+            Some(r) => r.clone(),
+            None => return Ok(()),
+        }
+    };
+
+    let schema = batch.schema();
+    for idx in gin_indexes {
+        // Only single-column JSONB GIN indexes are posting-indexed.
+        if idx.access_method != "gin" || idx.columns.len() != 1 {
+            continue;
+        }
+        let opclass = idx.opclass.as_deref().unwrap_or("jsonb_ops");
+        // tsvector GIN columns are FTS — separate registry.
+        if opclass == "tsvector_ops" {
+            continue;
+        }
+        let col_name = &idx.columns[0];
+        let Ok(col_idx) = schema.index_of(col_name) else {
+            continue;
+        };
+        let field = schema.field(col_idx);
+        let is_jsonb = field
+            .metadata()
+            .get("BASIN_TYPE")
+            .map(|s| s == "JSONB")
+            .unwrap_or(false);
+        if !is_jsonb {
+            continue;
+        }
+
+        registry.index_batch(project, table, col_name, batch, col_idx, rg_size, file_path);
+
+        // Persist the posting list as a sidecar so a restarted engine
+        // can lazy-load it at probe time.  Skip silently for over-budget
+        // / empty files (the registry returns `None`).
+        if let Some(bytes) = registry.serialize_file(project, table, col_name, file_path) {
+            let Some(sidecar) =
+                basin_storage::index::jsonb_posting::posting_sidecar_key_for_data_file(
+                    project, table, col_name, file_path,
+                )
+            else {
+                tracing::debug!(
+                    project = %project,
+                    table = %table,
+                    file = %file_path,
+                    "Inv-W5: non-canonical data path; skipping JSONB posting sidecar"
+                );
+                continue;
+            };
+            storage
+                .project_object_store(project)
+                .put(
+                    &sidecar,
+                    object_store::PutPayload::from_bytes(bytes::Bytes::from(bytes)),
+                )
+                .await
+                .map_err(|e| {
+                    basin_common::BasinError::storage(format!(
+                        "JSONB posting sidecar put {sidecar}: {e}"
+                    ))
+                })?;
+        }
     }
     Ok(())
 }

@@ -338,6 +338,16 @@ impl Shard {
         self.inner.set_gin_rowgroup_registry(registry);
     }
 
+    /// Wire the engine's JSONB posting-list registry into the compactor
+    /// (Inv-W5 / W9).  Same lifecycle as the GIN row-group registry above;
+    /// see `set_gin_rowgroup_registry` for rationale.
+    pub fn set_jsonb_posting_registry(
+        &self,
+        registry: Arc<basin_storage::index::jsonb_posting::JsonbPostingRegistry>,
+    ) {
+        self.inner.set_jsonb_posting_registry(registry);
+    }
+
     /// Phase 6.X.C (ADR 0023) — voluntarily hand off the lease for
     /// `(project, partition)` to `to_holder`. While the handoff is in
     /// progress new writes against this partition fail with
@@ -511,6 +521,14 @@ pub(crate) trait ShardImpl: Send + Sync {
     fn set_gin_rowgroup_registry(
         &self,
         _registry: Arc<basin_storage::index::gin_rowgroup::GinRowGroupRegistry>,
+    ) {
+    }
+    /// Wire the JSONB posting-list registry (Inv-W5 / W9) into the compactor.
+    /// Mirrors `set_gin_rowgroup_registry` — populated lazily on first wire-up.
+    /// Default no-op.
+    fn set_jsonb_posting_registry(
+        &self,
+        _registry: Arc<basin_storage::index::jsonb_posting::JsonbPostingRegistry>,
     ) {
     }
     /// Phase 6.X.C — voluntary lease handoff. Default returns Ok (a backend
