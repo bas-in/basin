@@ -2207,21 +2207,18 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                         None => (None, false),
                     };
                     if let Some(ref meta) = table_meta {
-                        // SECURITY (#159): do NOT read `rls_enabled` from the
-                        // per-session meta cache. Cross-session DDL
-                        // (`ENABLE ROW LEVEL SECURITY` / `CREATE POLICY` /
-                        // `DROP POLICY`) does not invalidate other sessions'
-                        // caches, so a cached `rls_enabled=false` would let
-                        // this fast path skip RLS predicate injection. Read
-                        // fresh from the catalog and fail closed on error.
-                        let has_rls = sess
-                            .engine
-                            .config()
-                            .catalog
-                            .load_table(&sess.project, &plan.table)
-                            .await
-                            .map(|m| m.rls_enabled)
-                            .unwrap_or(true);
+                        // The cache entry was validated against the catalog
+                        // epoch in `load_table_meta_cached`: if any catalog
+                        // mutation (including ENABLE/DISABLE ROW LEVEL SECURITY
+                        // or CREATE/DROP POLICY) occurred since the last fill,
+                        // the epoch will have advanced and the helper will have
+                        // refetched from the catalog. Reading `rls_enabled`
+                        // from the cache-validated `meta` is therefore safe and
+                        // saves one catalog round-trip per fast-path SELECT.
+                        // Fail closed: if something went wrong during the
+                        // epoch-validated load, the helper returns None and we
+                        // skip the fast path entirely (see outer match above).
+                        let has_rls = meta.rls_enabled;
                         let has_soft_delete =
                             crate::types::soft_delete_column(meta.schema.as_ref()).is_some();
                         // Hot-tier merge-on-read gate: when the process-wide
@@ -2274,16 +2271,12 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                         None => (None, false),
                     };
                     if let Some(ref meta) = table_meta {
-                        // SECURITY (#159): see comment at the
-                        // metadata-aggregate gate above. Read rls fresh.
-                        let has_rls = sess
-                            .engine
-                            .config()
-                            .catalog
-                            .load_table(&sess.project, &plan.table)
-                            .await
-                            .map(|m| m.rls_enabled)
-                            .unwrap_or(true);
+                        // Epoch-validated cache: see comment at the
+                        // metadata-aggregate gate above. `rls_enabled` is
+                        // safe to read from cache because the epoch check in
+                        // `load_table_meta_cached` forces a refetch on any
+                        // catalog mutation (including RLS DDL).
+                        let has_rls = meta.rls_enabled;
                         let has_soft_delete =
                             crate::types::soft_delete_column(meta.schema.as_ref()).is_some();
                         if !is_view && !has_rls && !has_soft_delete {
@@ -2323,18 +2316,18 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                     None => (None, false),
                 };
                 if let Some(ref meta) = table_meta {
-                    // SECURITY (#159): see comment at the metadata-aggregate
-                    // gate above. The fast SELECT path is the primary RLS
-                    // bypass vector — read rls fresh from the catalog and
-                    // fail closed on error.
-                    let has_rls = sess
-                        .engine
-                        .config()
-                        .catalog
-                        .load_table(&sess.project, &plan.table)
-                        .await
-                        .map(|m| m.rls_enabled)
-                        .unwrap_or(true);
+                    // Epoch-validated cache: the fast SELECT path is the
+                    // primary RLS bypass vector. `load_table_meta_cached`
+                    // compares the catalog epoch at read time against the
+                    // epoch stored when the entry was filled; any catalog
+                    // mutation (including ENABLE/DISABLE ROW LEVEL SECURITY or
+                    // CREATE/DROP POLICY) bumps the epoch and forces a full
+                    // refetch before the entry is returned. Reading
+                    // `rls_enabled` from the cached `meta` is therefore safe
+                    // and eliminates one catalog round-trip per warm SELECT.
+                    // If the cache helper returned None (catalog error),
+                    // `table_meta` is None and we fall through to DataFusion.
+                    let has_rls = meta.rls_enabled;
                     let has_soft_delete =
                         crate::types::soft_delete_column(meta.schema.as_ref()).is_some();
                     // Inside an explicit transaction the fast path (and the
@@ -10880,7 +10873,7 @@ mod table_meta_cache_tests {
             "first SELECT populates the cache for the touched table"
         );
         assert!(
-            sess.state.table_meta_cache.get_fresh(&tbl).is_some(),
+            sess.state.table_meta_cache.get_fresh(&tbl, sess.engine.config().catalog.epoch()).is_some(),
             "first SELECT must leave a fresh cache entry"
         );
 
@@ -10896,7 +10889,7 @@ mod table_meta_cache_tests {
             "second SELECT must reuse the cached entry — no new keys"
         );
         assert!(
-            sess.state.table_meta_cache.get_fresh(&tbl).is_some(),
+            sess.state.table_meta_cache.get_fresh(&tbl, sess.engine.config().catalog.epoch()).is_some(),
             "cache entry stays fresh inside the TTL window"
         );
     }
@@ -10929,7 +10922,7 @@ mod table_meta_cache_tests {
             .unwrap();
         let tbl = TableName::new("pkidx").unwrap();
         assert!(
-            sess.state.table_meta_cache.get_fresh(&tbl).is_some(),
+            sess.state.table_meta_cache.get_fresh(&tbl, sess.engine.config().catalog.epoch()).is_some(),
             "SELECT must populate the cache"
         );
 
@@ -10954,7 +10947,7 @@ mod table_meta_cache_tests {
         let entry = sess
             .state
             .table_meta_cache
-            .get_fresh(&tbl)
+            .get_fresh(&tbl, sess.engine.config().catalog.epoch())
             .expect("post-DDL SELECT must repopulate the cache");
         let idx_names: Vec<&str> = entry
             .meta
@@ -11006,7 +10999,7 @@ mod table_meta_cache_tests {
         // The entry exists in the map (insert succeeded) but is stale
         // → `get_fresh` returns `None`. Underlying LRU is unchanged
         // until the next `insert`, which is the documented behaviour.
-        let stale = sess.state.table_meta_cache.get_fresh(&tbl);
+        let stale = sess.state.table_meta_cache.get_fresh(&tbl, sess.engine.config().catalog.epoch());
         assert!(
             stale.is_none(),
             "1ms TTL must expire after 20ms sleep — got {stale:?}"

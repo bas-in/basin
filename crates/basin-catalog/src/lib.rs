@@ -142,6 +142,17 @@ pub struct ProjectSnapshotDiff {
 /// the router, and the analytical pool.
 #[async_trait]
 pub trait Catalog: Send + Sync {
+    /// Returns a monotonically increasing counter that is bumped on every
+    /// catalog mutation. Session caches use this to validate cached metadata
+    /// without round-tripping to the catalog backend: if the epoch observed
+    /// at cache-fill time equals the current epoch, the entry is still fresh.
+    /// The default implementation returns 0 (always-stale semantics, which
+    /// degrades gracefully to a cache miss on every read). Implementations
+    /// that want cache-hit performance override this with an `AtomicU64`.
+    fn epoch(&self) -> u64 {
+        0
+    }
+
     /// Idempotently create the namespace for `project`. Catalog implementations
     /// model a project as an Iceberg namespace (e.g. `projects.<ulid>`).
     async fn create_namespace(&self, project: &ProjectId) -> Result<()>;

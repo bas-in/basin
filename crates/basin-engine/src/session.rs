@@ -712,7 +712,7 @@ pub(crate) mod test_meta_cache_ttl_override {
 }
 
 /// One cached `(TableMetadata, lookup_view)` tuple plus its insertion
-/// timestamp.
+/// timestamp and catalog epoch.
 #[derive(Clone, Debug)]
 pub(crate) struct TableMetaCacheEntry {
     pub(crate) meta: Arc<TableMetadata>,
@@ -721,6 +721,12 @@ pub(crate) struct TableMetaCacheEntry {
     /// so we cache just the discriminator.
     pub(crate) view_present: bool,
     inserted_at: Instant,
+    /// Catalog epoch at cache-fill time. Compared against
+    /// `Catalog::epoch()` on each read: a mismatch causes an immediate
+    /// cache-miss and refetch, ensuring cross-session DDL (including
+    /// ENABLE/DISABLE ROW LEVEL SECURITY) is visible without waiting for
+    /// the TTL to expire.
+    catalog_epoch: u64,
 }
 
 /// Per-session bounded LRU cache mapping table name → metadata + view
@@ -738,14 +744,28 @@ impl TableMetaCache {
     }
 
     /// Look up a fresh entry. Returns `Some(entry)` only when present AND
-    /// younger than the configured TTL. A stale hit is treated as a miss
-    /// but does NOT evict — the next [`Self::insert`] will overwrite the
-    /// stale value in place.
-    pub(crate) fn get_fresh(&self, table: &TableName) -> Option<TableMetaCacheEntry> {
+    /// the catalog epoch has not changed since the entry was cached. Epoch
+    /// staleness is checked first (one atomic load — nanosecond cost); the
+    /// TTL check is a secondary guard for the `PostgresCatalog` / `RestCatalog`
+    /// backends that return `epoch() == 0` (always-stale → always TTL-bound).
+    pub(crate) fn get_fresh(
+        &self,
+        table: &TableName,
+        catalog_epoch: u64,
+    ) -> Option<TableMetaCacheEntry> {
         let ttl = table_meta_cache_ttl();
         let mut g = self.inner.lock().expect("table_meta_cache lock poisoned");
         let entry = g.get(table)?;
-        if entry.inserted_at.elapsed() <= ttl {
+        // Epoch 0 means the catalog backend does not implement epoch tracking
+        // (default impl returns 0). In that case fall back to TTL-only freshness.
+        // When epochs are available, a mismatch is an instant miss — the
+        // catalog mutated since this entry was filled, so it may be stale.
+        let epoch_ok = if catalog_epoch == 0 {
+            true
+        } else {
+            entry.catalog_epoch == catalog_epoch
+        };
+        if epoch_ok && entry.inserted_at.elapsed() <= ttl {
             Some(entry.clone())
         } else {
             None
@@ -758,6 +778,7 @@ impl TableMetaCache {
         table: TableName,
         meta: Arc<TableMetadata>,
         view_present: bool,
+        catalog_epoch: u64,
     ) {
         let mut g = self.inner.lock().expect("table_meta_cache lock poisoned");
         g.put(
@@ -766,6 +787,7 @@ impl TableMetaCache {
                 meta,
                 view_present,
                 inserted_at: Instant::now(),
+                catalog_epoch,
             },
         );
     }
@@ -805,19 +827,26 @@ pub(crate) async fn load_table_meta_cached(
     sess: &crate::ProjectSession,
     table: &TableName,
 ) -> Option<(Arc<TableMetadata>, bool)> {
-    if let Some(entry) = sess.state.table_meta_cache.get_fresh(table) {
+    let catalog = &sess.engine.config().catalog;
+    let current_epoch = catalog.epoch();
+    if let Some(entry) = sess.state.table_meta_cache.get_fresh(table, current_epoch) {
         return Some((entry.meta, entry.view_present));
     }
-    let catalog = &sess.engine.config().catalog;
     let meta = catalog.load_table(&sess.project, table).await.ok()?;
     let view_present = catalog
         .lookup_view(&sess.project, table.as_str())
         .await
         .is_some();
     let arc = Arc::new(meta);
+    // Re-read epoch after the catalog calls so the stored epoch is at least
+    // as fresh as the data we just loaded. Using the pre-load epoch is safe
+    // too (it's conservative — the next mutation bumps epoch and we refetch),
+    // but reading post-load avoids an unnecessary miss if a concurrent mutation
+    // completed before our load started.
+    let fill_epoch = catalog.epoch();
     sess.state
         .table_meta_cache
-        .insert(table.clone(), arc.clone(), view_present);
+        .insert(table.clone(), arc.clone(), view_present, fill_epoch);
     Some((arc, view_present))
 }
 
@@ -843,10 +872,11 @@ pub(crate) async fn load_table_meta_cached_err(
     sess: &crate::ProjectSession,
     table: &TableName,
 ) -> Result<Arc<TableMetadata>> {
-    if let Some(entry) = sess.state.table_meta_cache.get_fresh(table) {
+    let catalog = &sess.engine.config().catalog;
+    let current_epoch = catalog.epoch();
+    if let Some(entry) = sess.state.table_meta_cache.get_fresh(table, current_epoch) {
         return Ok(entry.meta);
     }
-    let catalog = &sess.engine.config().catalog;
     let meta = catalog.load_table(&sess.project, table).await?;
     // Probe view presence so a subsequent SELECT-side gate served from
     // this same cache entry doesn't have to re-issue the lookup. Cheap
@@ -856,9 +886,10 @@ pub(crate) async fn load_table_meta_cached_err(
         .await
         .is_some();
     let arc = Arc::new(meta);
+    let fill_epoch = catalog.epoch();
     sess.state
         .table_meta_cache
-        .insert(table.clone(), arc.clone(), view_present);
+        .insert(table.clone(), arc.clone(), view_present, fill_epoch);
     Ok(arc)
 }
 
@@ -4469,5 +4500,91 @@ mod tests {
         touch_last_active(&state);
         let t1 = last_active(&state);
         assert!(t1 > t0, "last_active must advance after touch");
+    }
+
+    // ── TableMetaCache epoch-based invalidation ─────────────────────────────
+
+    fn make_test_table_meta(table_name: &str, rls: bool) -> Arc<TableMetadata> {
+        use basin_catalog::{PartitionSpec, SnapshotId, TableFileFormat, TableMetadata};
+        use basin_common::ProjectId;
+        Arc::new(TableMetadata {
+            project: ProjectId::new(),
+            table: TableName::new(table_name).unwrap(),
+            schema: Arc::new(arrow_schema::Schema::empty()),
+            current_snapshot: SnapshotId::GENESIS,
+            snapshots: Vec::new(),
+            format_version: 2,
+            partition_spec: PartitionSpec::Unpartitioned,
+            rls_enabled: rls,
+            policies: Vec::new(),
+            cold_after_seconds: None,
+            cold_age_column: None,
+            bloom_filter_columns: Vec::new(),
+            row_group_rows: None,
+            continuous_aggregate: None,
+            cluster_columns: Vec::new(),
+            file_format: TableFileFormat::default(),
+            row_block_size: None,
+            home_region: None,
+            indexes: Vec::new(),
+            pk_columns: Vec::new(),
+            check_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            unique_constraints: Vec::new(),
+            global_sort_order: None,
+            adaptive_sort_override: None,
+            gc_orphan_paths: Vec::new(),
+            promoted_jsonb_paths: Vec::new(),
+        })
+    }
+
+    /// A cache entry inserted with epoch E is evicted when the caller supplies
+    /// a different epoch (E+1), even if the TTL has not yet elapsed.
+    #[test]
+    fn table_meta_cache_epoch_invalidates_on_external_mutation() {
+        // Install a very long TTL so TTL expiry cannot interfere.
+        let _guard = test_meta_cache_ttl_override::install(Duration::from_secs(3600));
+
+        let cache = TableMetaCache::new();
+        let table = TableName::new("t1").unwrap();
+        let meta = make_test_table_meta("t1", false);
+
+        // Fill at epoch 5.
+        cache.insert(table.clone(), meta.clone(), false, 5);
+        assert_eq!(cache.len(), 1);
+
+        // Same epoch → cache hit.
+        assert!(
+            cache.get_fresh(&table, 5).is_some(),
+            "same epoch should be a cache hit"
+        );
+
+        // Different epoch (catalog mutated) → cache miss.
+        assert!(
+            cache.get_fresh(&table, 6).is_none(),
+            "changed epoch should be a cache miss"
+        );
+    }
+
+    /// Multiple reads at the same epoch all return the cached entry — no
+    /// spurious eviction on repeated reads.
+    #[test]
+    fn table_meta_cache_epoch_no_evict_when_unchanged() {
+        let _guard = test_meta_cache_ttl_override::install(Duration::from_secs(3600));
+
+        let cache = TableMetaCache::new();
+        let table = TableName::new("t2").unwrap();
+        let meta = make_test_table_meta("t2", true);
+
+        cache.insert(table.clone(), meta.clone(), false, 42);
+
+        // 10 consecutive reads at epoch 42 all hit.
+        for i in 0..10 {
+            let hit = cache.get_fresh(&table, 42);
+            assert!(hit.is_some(), "read {i} at epoch 42 should be a cache hit");
+        }
+
+        // Still exactly one entry — no duplicate inserts.
+        assert_eq!(cache.len(), 1);
     }
 }

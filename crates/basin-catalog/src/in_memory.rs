@@ -5,6 +5,7 @@
 //! we can unit-test the wiring without standing up a real catalog.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::Arc;
 
 use arrow_schema::Schema;
@@ -133,6 +134,11 @@ type TableMap = HashMap<(ProjectId, QualifiedTableName), Arc<Mutex<TableState>>>
 /// holds the per-table guard across `.await` points and a poisoned `std`
 /// mutex would force every method to handle poisoning.
 pub struct InMemoryCatalog {
+    /// Monotonically increasing mutation counter. Bumped by SeqCst fetch_add
+    /// on every method that changes catalog state. Session caches store the
+    /// epoch at fill time and compare against this on each read; a mismatch
+    /// causes an immediate cache-miss refetch.
+    epoch: AtomicU64,
     tables: Mutex<TableMap>,
     namespaces: Mutex<HashSet<ProjectId>>,
     /// Per-project registered SQL functions. One shared `HashMap` keyed by
@@ -236,6 +242,7 @@ struct SequenceEntry {
 impl InMemoryCatalog {
     pub fn new() -> Self {
         Self {
+            epoch: AtomicU64::new(0),
             tables: Mutex::new(HashMap::new()),
             namespaces: Mutex::new(HashSet::new()),
             sql_functions: Mutex::new(HashMap::new()),
@@ -251,6 +258,14 @@ impl InMemoryCatalog {
             leases: Mutex::new(HashMap::new()),
             project_metadata: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Bump the mutation epoch. Called at the start of every method that
+    /// changes catalog state so session caches can detect staleness via a
+    /// single atomic load rather than a full catalog round-trip.
+    #[inline(always)]
+    fn bump_epoch(&self) {
+        self.epoch.fetch_add(1, SeqCst);
     }
 
     async fn get_table(
@@ -299,6 +314,7 @@ impl InMemoryCatalog {
         access_method: &str,
         opclass: Option<&str>,
     ) -> Result<()> {
+        self.bump_epoch();
         let state_arc = self.get_table_qualified(project, qtable).await?;
         let mut state = state_arc.lock().await;
         if columns.is_empty() {
@@ -425,6 +441,10 @@ impl Default for InMemoryCatalog {
 
 #[async_trait]
 impl Catalog for InMemoryCatalog {
+    fn epoch(&self) -> u64 {
+        self.epoch.load(SeqCst)
+    }
+
     #[instrument(skip(self), fields(project = %project))]
     async fn create_namespace(&self, project: &ProjectId) -> Result<()> {
         self.namespaces.lock().await.insert(*project);
@@ -775,6 +795,7 @@ impl Catalog for InMemoryCatalog {
         table: &TableName,
         size: Option<u32>,
     ) -> Result<()> {
+        self.bump_epoch();
         let qtable = self.resolve_qtable(project, table).await;
         let state_arc = self.get_table_qualified(project, &qtable).await?;
         let mut state = state_arc.lock().await;
@@ -788,6 +809,7 @@ impl Catalog for InMemoryCatalog {
         table: &TableName,
         value: Option<bool>,
     ) -> Result<()> {
+        self.bump_epoch();
         let qtable = self.resolve_qtable(project, table).await;
         let state_arc = self.get_table_qualified(project, &qtable).await?;
         let mut state = state_arc.lock().await;
@@ -804,6 +826,7 @@ impl Catalog for InMemoryCatalog {
         table: &TableName,
         format: TableFileFormat,
     ) -> Result<()> {
+        self.bump_epoch();
         let qtable = self.resolve_qtable(project, table).await;
         let state_arc = self.get_table_qualified(project, &qtable).await?;
         let mut state = state_arc.lock().await;
@@ -820,6 +843,7 @@ impl Catalog for InMemoryCatalog {
         table: &TableName,
         columns: Vec<String>,
     ) -> Result<()> {
+        self.bump_epoch();
         let qtable = self.resolve_qtable(project, table).await;
         let state_arc = self.get_table_qualified(project, &qtable).await?;
         let mut state = state_arc.lock().await;
@@ -852,6 +876,7 @@ impl Catalog for InMemoryCatalog {
         check_constraints: Vec<CheckConstraint>,
         foreign_keys: Vec<ForeignKeyDef>,
     ) -> Result<()> {
+        self.bump_epoch();
         let state_arc = self.get_table(project, table).await?;
         let mut state = state_arc.lock().await;
         state.pk_columns = pk_columns;
@@ -867,6 +892,7 @@ impl Catalog for InMemoryCatalog {
         table: &TableName,
         unique_constraints: Vec<UniqueConstraint>,
     ) -> Result<()> {
+        self.bump_epoch();
         let state_arc = self.get_table(project, table).await?;
         let mut state = state_arc.lock().await;
         state.unique_constraints = unique_constraints;
@@ -901,6 +927,7 @@ impl Catalog for InMemoryCatalog {
         source_col: &str,
         json_key: &str,
     ) -> Result<()> {
+        self.bump_epoch();
         let qtable = self.resolve_qtable(project, table).await;
         let tables = self.tables.lock().await;
         let entry = tables.get(&(*project, qtable)).ok_or_else(|| {
@@ -921,6 +948,7 @@ impl Catalog for InMemoryCatalog {
 
     #[instrument(skip(self, def), fields(project = %def.project, name = %def.name))]
     async fn register_sql_function(&self, mut def: SqlFunctionDef) -> Result<()> {
+        self.bump_epoch();
         let key = (def.project, def.name.clone());
         let mut map = self.sql_functions.lock().await;
         // Phase 5.11.W6: bump `version` on REPLACE so callers (CDN
@@ -936,6 +964,7 @@ impl Catalog for InMemoryCatalog {
 
     #[instrument(skip(self), fields(project = %project, name = %name))]
     async fn drop_sql_function(&self, project: &ProjectId, name: &str) -> Result<()> {
+        self.bump_epoch();
         let key = (*project, name.to_string());
         let mut map = self.sql_functions.lock().await;
         if map.remove(&key).is_none() {
@@ -964,6 +993,7 @@ impl Catalog for InMemoryCatalog {
 
     #[instrument(skip(self, def), fields(project = %def.project, name = %def.name))]
     async fn create_sequence(&self, def: SequenceDef) -> Result<()> {
+        self.bump_epoch();
         if def.increment == 0 {
             return Err(BasinError::InvalidSchema(
                 "sequence increment must be non-zero".into(),
@@ -988,6 +1018,7 @@ impl Catalog for InMemoryCatalog {
 
     #[instrument(skip(self), fields(project = %project, name = %name))]
     async fn drop_sequence(&self, project: &ProjectId, name: &str) -> Result<()> {
+        self.bump_epoch();
         let key = (*project, name.to_string());
         let mut map = self.sequences.lock().await;
         if map.remove(&key).is_none() {
@@ -1088,6 +1119,7 @@ impl Catalog for InMemoryCatalog {
 
     #[instrument(skip(self, def), fields(project = %def.project, table = %def.table, name = %def.name))]
     async fn register_reactor(&self, def: ReactorDef) -> Result<()> {
+        self.bump_epoch();
         if def.ops.is_empty() {
             return Err(BasinError::InvalidSchema(
                 "reactor ops bitset is empty".into(),
@@ -1114,6 +1146,7 @@ impl Catalog for InMemoryCatalog {
 
     #[instrument(skip(self), fields(project = %project, table = %table, name = %name))]
     async fn drop_reactor(&self, project: &ProjectId, table: &TableName, name: &str) -> Result<()> {
+        self.bump_epoch();
         let key = (*project, format!("{table}:{name}"));
         let mut state = self.reactors.lock().await;
         if state.map.remove(&key).is_none() {
@@ -1159,6 +1192,7 @@ impl Catalog for InMemoryCatalog {
 
     #[instrument(skip(self, def), fields(project = %def.project, name = %def.name))]
     async fn register_enum_type(&self, def: EnumTypeDef) -> Result<()> {
+        self.bump_epoch();
         enums::validate_new(&def).map_err(enum_err_to_basin)?;
         let key = (def.project, def.name.clone());
         let mut enums_map = self.enum_types.lock().await;
@@ -1192,6 +1226,7 @@ impl Catalog for InMemoryCatalog {
 
     #[instrument(skip(self), fields(project = %project, name = %name, value = %value))]
     async fn add_enum_value(&self, project: &ProjectId, name: &str, value: &str) -> Result<()> {
+        self.bump_epoch();
         if value.is_empty() {
             return Err(BasinError::InvalidSchema(
                 "ALTER TYPE ADD VALUE: label cannot be empty".into(),
@@ -1213,6 +1248,7 @@ impl Catalog for InMemoryCatalog {
 
     #[instrument(skip(self), fields(project = %project, name = %name))]
     async fn drop_enum_type(&self, project: &ProjectId, name: &str) -> Result<()> {
+        self.bump_epoch();
         // Refcount: scan every table the project owns and reject the
         // drop when any column carries `BASIN_ENUM_TYPE=<name>`. v0.1
         // has no CASCADE; the message tells the caller to drop the
@@ -1245,6 +1281,7 @@ impl Catalog for InMemoryCatalog {
 
     #[instrument(skip(self, def), fields(project = %def.project, name = %def.name))]
     async fn register_domain(&self, def: DomainDef) -> Result<()> {
+        self.bump_epoch();
         domains::validate_new(&def).map_err(domain_err_to_basin)?;
         let key = (def.project, def.name.clone());
         let mut doms = self.domains.lock().await;
@@ -1275,6 +1312,7 @@ impl Catalog for InMemoryCatalog {
 
     #[instrument(skip(self), fields(project = %project, name = %name))]
     async fn drop_domain(&self, project: &ProjectId, name: &str) -> Result<()> {
+        self.bump_epoch();
         let referencing = self.tables_referencing_type(project, name, false).await;
         if !referencing.is_empty() {
             return Err(BasinError::catalog(format!(
@@ -1310,6 +1348,7 @@ impl Catalog for InMemoryCatalog {
 
     #[instrument(skip(self, def), fields(project = %def.project, name = %def.name))]
     async fn register_procedure(&self, def: SqlProcedureDef) -> Result<()> {
+        self.bump_epoch();
         procedures::validate_new(&def).map_err(procedure_err_to_basin)?;
         let key = (def.project, def.name.clone());
         let mut map = self.procedures.lock().await;
@@ -1325,6 +1364,7 @@ impl Catalog for InMemoryCatalog {
 
     #[instrument(skip(self), fields(project = %project, name = %name))]
     async fn drop_procedure(&self, project: &ProjectId, name: &str) -> Result<()> {
+        self.bump_epoch();
         let key = (*project, name.to_string());
         let mut map = self.procedures.lock().await;
         if map.remove(&key).is_none() {
@@ -1357,6 +1397,7 @@ impl Catalog for InMemoryCatalog {
         project: &ProjectId,
         config: ProjectStorageConfig,
     ) -> Result<()> {
+        self.bump_epoch();
         let mut map = self.project_storage_config.lock().await;
         map.insert(*project, config);
         Ok(())
@@ -1377,6 +1418,7 @@ impl Catalog for InMemoryCatalog {
         project: &ProjectId,
         meta: ProjectMetadata,
     ) -> Result<()> {
+        self.bump_epoch();
         let mut map = self.project_metadata.lock().await;
         map.insert(*project, meta);
         Ok(())
@@ -1389,6 +1431,7 @@ impl Catalog for InMemoryCatalog {
     }
 
     async fn register_view(&self, def: ViewDef, or_replace: bool) -> Result<()> {
+        self.bump_epoch();
         let key = (def.project, def.name.to_ascii_lowercase());
         let mut map = self.views.lock().await;
         if !or_replace && map.contains_key(&key) {
@@ -1402,6 +1445,7 @@ impl Catalog for InMemoryCatalog {
     }
 
     async fn drop_view(&self, project: &ProjectId, name: &str, if_exists: bool) -> Result<()> {
+        self.bump_epoch();
         let key = (*project, name.to_ascii_lowercase());
         let mut map = self.views.lock().await;
         if map.remove(&key).is_none() && !if_exists {
@@ -1431,6 +1475,7 @@ impl Catalog for InMemoryCatalog {
     // -----------------------------------------------------------------------
 
     async fn register_inbound_webhook(&self, def: InboundWebhookDef) -> Result<()> {
+        self.bump_epoch();
         inbound_webhooks::validate_body(&def.body).map_err(inbound_webhook_err_to_basin)?;
         let key = (def.project, def.name.clone());
         let mut map = self.inbound_webhooks.lock().await;
@@ -1445,6 +1490,7 @@ impl Catalog for InMemoryCatalog {
     }
 
     async fn drop_inbound_webhook(&self, project: &ProjectId, name: &str) -> Result<()> {
+        self.bump_epoch();
         let key = (*project, name.to_string());
         let mut map = self.inbound_webhooks.lock().await;
         if map.remove(&key).is_none() {
@@ -1595,6 +1641,7 @@ impl Catalog for InMemoryCatalog {
         qtable: &QualifiedTableName,
         schema: Arc<arrow_schema::Schema>,
     ) -> Result<TableMetadata> {
+        self.bump_epoch();
         // Auto-create the namespace on first table; the dedicated
         // `create_namespace` call is for callers that want the explicit step.
         self.namespaces.lock().await.insert(*project);
@@ -1636,6 +1683,7 @@ impl Catalog for InMemoryCatalog {
         project: &ProjectId,
         qtable: &QualifiedTableName,
     ) -> Result<()> {
+        self.bump_epoch();
         let key = (*project, qtable.clone());
         let mut tables = self.tables.lock().await;
         tables
@@ -1650,6 +1698,7 @@ impl Catalog for InMemoryCatalog {
         old: &QualifiedTableName,
         new: &QualifiedTableName,
     ) -> Result<()> {
+        self.bump_epoch();
         let old_key = (*project, old.clone());
         let new_key = (*project, new.clone());
         let mut tables = self.tables.lock().await;
@@ -1686,6 +1735,7 @@ impl Catalog for InMemoryCatalog {
         expected_snapshot: SnapshotId,
         files: Vec<DataFileRef>,
     ) -> Result<TableMetadata> {
+        self.bump_epoch();
         let state_arc = self.get_table_qualified(project, qtable).await?;
         let mut state = state_arc.lock().await;
 
@@ -1729,6 +1779,7 @@ impl Catalog for InMemoryCatalog {
         removed_paths: Vec<String>,
         added_files: Vec<DataFileRef>,
     ) -> Result<TableMetadata> {
+        self.bump_epoch();
         let state_arc = self.get_table_qualified(project, qtable).await?;
         let mut state = state_arc.lock().await;
 
@@ -1781,6 +1832,7 @@ impl Catalog for InMemoryCatalog {
         src: &QualifiedTableName,
         dst: &QualifiedTableName,
     ) -> Result<TableMetadata> {
+        self.bump_epoch();
         // Read source state then drop the per-table guard before grabbing
         // the table-map guard for the insert.
         let cloned_state = {
@@ -1840,6 +1892,7 @@ impl Catalog for InMemoryCatalog {
         qtable: &QualifiedTableName,
         snapshot_id: SnapshotId,
     ) -> Result<TableMetadata> {
+        self.bump_epoch();
         let state_arc = self.get_table_qualified(project, qtable).await?;
         let mut state = state_arc.lock().await;
 
@@ -1877,6 +1930,7 @@ impl Catalog for InMemoryCatalog {
         qtable: &QualifiedTableName,
         spec: PartitionSpec,
     ) -> Result<()> {
+        self.bump_epoch();
         let state_arc = self.get_table_qualified(project, qtable).await?;
         let mut state = state_arc.lock().await;
         state.partition_spec = spec;
@@ -1890,6 +1944,7 @@ impl Catalog for InMemoryCatalog {
         rls_enabled: bool,
         policies: Vec<Policy>,
     ) -> Result<()> {
+        self.bump_epoch();
         let state_arc = self.get_table_qualified(project, qtable).await?;
         let mut state = state_arc.lock().await;
         state.rls_enabled = rls_enabled;
@@ -1904,6 +1959,7 @@ impl Catalog for InMemoryCatalog {
         cold_after_seconds: Option<u64>,
         cold_age_column: Option<String>,
     ) -> Result<()> {
+        self.bump_epoch();
         let state_arc = self.get_table_qualified(project, qtable).await?;
         let mut state = state_arc.lock().await;
         state.cold_after_seconds = cold_after_seconds;
@@ -1917,6 +1973,7 @@ impl Catalog for InMemoryCatalog {
         qtable: &QualifiedTableName,
         columns: Vec<String>,
     ) -> Result<()> {
+        self.bump_epoch();
         let state_arc = self.get_table_qualified(project, qtable).await?;
         let mut state = state_arc.lock().await;
         state.bloom_filter_columns = columns;
@@ -1929,6 +1986,7 @@ impl Catalog for InMemoryCatalog {
         qtable: &QualifiedTableName,
         rows: Option<usize>,
     ) -> Result<()> {
+        self.bump_epoch();
         let state_arc = self.get_table_qualified(project, qtable).await?;
         let mut state = state_arc.lock().await;
         state.row_group_rows = rows;
@@ -1941,6 +1999,7 @@ impl Catalog for InMemoryCatalog {
         qtable: &QualifiedTableName,
         schema: arrow_schema::Schema,
     ) -> Result<()> {
+        self.bump_epoch();
         let state_arc = self.get_table_qualified(project, qtable).await?;
         let mut state = state_arc.lock().await;
         state.schema = Arc::new(schema);
@@ -1953,6 +2012,7 @@ impl Catalog for InMemoryCatalog {
         qtable: &QualifiedTableName,
         def: Option<crate::metadata::CvDef>,
     ) -> Result<()> {
+        self.bump_epoch();
         let state_arc = self.get_table_qualified(project, qtable).await?;
         let mut state = state_arc.lock().await;
         state.continuous_aggregate = def;
@@ -1965,6 +2025,7 @@ impl Catalog for InMemoryCatalog {
         qtable: &QualifiedTableName,
         columns: Vec<String>,
     ) -> Result<()> {
+        self.bump_epoch();
         let state_arc = self.get_table_qualified(project, qtable).await?;
         let mut state = state_arc.lock().await;
         state.cluster_columns = columns;
@@ -1977,6 +2038,7 @@ impl Catalog for InMemoryCatalog {
         qtable: &QualifiedTableName,
         region: Option<String>,
     ) -> Result<()> {
+        self.bump_epoch();
         let state_arc = self.get_table_qualified(project, qtable).await?;
         let mut state = state_arc.lock().await;
         state.home_region = region;
@@ -2026,6 +2088,7 @@ impl Catalog for InMemoryCatalog {
         qtable: &QualifiedTableName,
         name: &str,
     ) -> Result<()> {
+        self.bump_epoch();
         let state_arc = self.get_table_qualified(project, qtable).await?;
         let mut state = state_arc.lock().await;
         let before = state.indexes.len();
@@ -2053,6 +2116,7 @@ impl Catalog for InMemoryCatalog {
     }
 
     async fn create_schema(&self, project: &ProjectId, schema: &SchemaName) -> Result<()> {
+        self.bump_epoch();
         self.schemas
             .lock()
             .await
@@ -2068,6 +2132,7 @@ impl Catalog for InMemoryCatalog {
         schema: &SchemaName,
         cascade: bool,
     ) -> Result<()> {
+        self.bump_epoch();
         if schema == &SchemaName::public() {
             return Err(BasinError::catalog("cannot drop the public schema"));
         }
