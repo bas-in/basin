@@ -17,6 +17,8 @@
     "partition_pruning",
     "predicate_pushdown",
     "project_deletion",
+    "rls_basic",
+    "rls_isolation",
     "row_group_sizing",
     "s3_credentials_smoke",
     "shard_insert_path",
