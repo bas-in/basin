@@ -1207,6 +1207,7 @@ mod explain;
 mod fast_aggregate;
 mod fast_select;
 mod hot_tombstone;
+mod tombstone_cold_scan;
 mod fts_udf;
 mod gin_rowgroup_scan;
 mod jsonb_posting_scan;

@@ -556,7 +556,7 @@ impl ExecutionPlan for UpdateOverlayExec {
 /// Build a `BooleanArray` mask that drops rows whose PK is in `tombstones`.
 /// Returns the input batch unchanged when the PK column is absent (we can't
 /// safely evaluate the filter — see `TombstoneFilterExec` docs).
-fn filter_batch(
+pub(crate) fn filter_batch(
     batch: &RecordBatch,
     pk_column: &str,
     pk_dt: &DataType,

@@ -1820,38 +1820,84 @@ pub(crate) async fn refresh_table(
         // `Storage::list_data_files` emits and that `register_pruned_listing_table`
         // already handles the same way. Prepend the synthetic `basin://engine/`
         // scheme so DataFusion routes I/O through the registered ObjectStore.
-        let (file_format, file_ext) = listing_file_format(meta.file_format);
-        let mut listing_options =
-            ListingOptions::new(file_format).with_file_extension(file_ext);
-        if let Some(sort_cols) = meta.global_sort_order.as_deref() {
-            listing_options =
-                listing_options.with_file_sort_order(build_file_sort_order(sort_cols));
+        // Non-HTAP cold-only path. When tombstones are present for a
+        // single-PK table, substitute `TombstoneColdTable` — drives storage
+        // reads directly and suppresses tombstoned rows inline (same pattern
+        // as GinRowGroupPrunedTable / RTreePrunedTable / JsonbPostingPrunedTable).
+        // Otherwise register a plain ListingTable (tombstone-free common case,
+        // no wrapper overhead).
+        let cold_tomb_info: Option<(String, arrow_schema::DataType, std::collections::HashSet<Vec<u8>>)> =
+            if meta.pk_columns.len() == 1 {
+                use crate::hot_tombstone::snapshot_tombstones;
+                let reg = engine.memtable_registry();
+                let tombs = snapshot_tombstones(reg.as_ref(), project, table);
+                if !tombs.is_empty() {
+                    let pk_col = meta.pk_columns[0].clone();
+                    // If PK is absent from the schema (defensive — catalog
+                    // corruption), skip the substitution and fall through.
+                    if let Ok(pk_idx) = df_schema.index_of(&pk_col) {
+                        let pk_dt = df_schema.field(pk_idx).data_type().clone();
+                        Some((pk_col, pk_dt, tombs))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        if let Some((pk_col, pk_dt, tombs)) = cold_tomb_info {
+            // Substitution branch: TombstoneColdTable reads storage directly.
+            use object_store::path::Path as ObjectPath;
+            let paths: Vec<ObjectPath> = live_files
+                .iter()
+                .map(|f| ObjectPath::from(f.path.as_str()))
+                .collect();
+            let provider = crate::tombstone_cold_scan::TombstoneColdTable::new(
+                df_schema,
+                engine.config().storage.clone(),
+                *project,
+                table.clone(),
+                paths,
+                Arc::new(tombs),
+                pk_col,
+                pk_dt,
+            );
+            ctx.register_table(tref(), Arc::new(provider))
+                .map_err(|e| BasinError::internal(format!("register_table {table}: {e}")))?;
+        } else {
+            // Build per-file listing URLs. Each `DataFileRef::path` is a full
+            // bucket-relative key (no scheme, no leading slash) that already
+            // includes any configured `root_prefix` — identical to the paths that
+            // `Storage::list_data_files` emits and that `register_pruned_listing_table`
+            // already handles the same way. Prepend the synthetic `basin://engine/`
+            // scheme so DataFusion routes I/O through the registered ObjectStore.
+            let (file_format, file_ext) = listing_file_format(meta.file_format);
+            let mut listing_options =
+                ListingOptions::new(file_format).with_file_extension(file_ext);
+            if let Some(sort_cols) = meta.global_sort_order.as_deref() {
+                listing_options =
+                    listing_options.with_file_sort_order(build_file_sort_order(sort_cols));
+            }
+            let mut urls: Vec<ListingTableUrl> = Vec::with_capacity(live_files.len());
+            for f in &live_files {
+                let mut s = String::from(BASIN_URL_BASE);
+                s.push_str(&f.path);
+                let url = ListingTableUrl::parse(&s)
+                    .map_err(|e| BasinError::internal(format!("listing url parse {s}: {e}")))?;
+                urls.push(url);
+            }
+            let cfg = ListingTableConfig::new_with_multi_paths(urls)
+                .with_listing_options(listing_options)
+                .with_schema(df_schema.clone());
+            let provider = ListingTable::try_new(cfg)
+                .map_err(|e| BasinError::internal(format!("ListingTable::try_new {table}: {e}")))?;
+            // Tombstone-free path: no wrapper needed.
+            ctx.register_table(tref(), Arc::new(provider))
+                .map_err(|e| BasinError::internal(format!("register_table {table}: {e}")))?;
         }
-        let mut urls: Vec<ListingTableUrl> = Vec::with_capacity(live_files.len());
-        for f in &live_files {
-            let mut s = String::from(BASIN_URL_BASE);
-            s.push_str(&f.path);
-            let url = ListingTableUrl::parse(&s)
-                .map_err(|e| BasinError::internal(format!("listing url parse {s}: {e}")))?;
-            urls.push(url);
-        }
-        let cfg = ListingTableConfig::new_with_multi_paths(urls)
-            .with_listing_options(listing_options)
-            .with_schema(df_schema.clone());
-        let provider = ListingTable::try_new(cfg)
-            .map_err(|e| BasinError::internal(format!("ListingTable::try_new {table}: {e}")))?;
-        // Wrap with the merge-on-read tombstone filter so SELECTs after a
-        // fast-path DELETE never observe the now-deleted cold-tier row.
-        let provider = wrap_with_tombstone_filter(
-            Arc::new(provider) as Arc<dyn datafusion::catalog::TableProvider>,
-            engine,
-            project,
-            table,
-            &meta.pk_columns,
-            df_schema,
-        );
-        ctx.register_table(tref(), provider)
-            .map_err(|e| BasinError::internal(format!("register_table {table}: {e}")))?;
     }
 
     // Cache the snapshot id for this session's INSERT path.
@@ -1870,32 +1916,6 @@ pub(crate) async fn refresh_table(
     Ok(())
 }
 
-/// Wrap `cold` with a [`crate::hot_tombstone::TombstoneFilteringTable`] so
-/// follow-up reads after a fast-path DELETE see the tombstoned cold-tier rows
-/// dropped before they reach the SELECT projection.
-///
-/// When the table has a composite PK (or no PK) the wrap is a no-op — the
-/// fast-path DELETE writer rejects those shapes, so no tombstone can exist.
-fn wrap_with_tombstone_filter(
-    cold: Arc<dyn datafusion::catalog::TableProvider>,
-    engine: &Engine,
-    project: &ProjectId,
-    table: &TableName,
-    pk_columns: &[String],
-    catalog_schema: Arc<arrow_schema::Schema>,
-) -> Arc<dyn datafusion::catalog::TableProvider> {
-    if pk_columns.len() != 1 {
-        return cold;
-    }
-    Arc::new(crate::hot_tombstone::TombstoneFilteringTable::new(
-        cold,
-        engine.clone(),
-        *project,
-        table.clone(),
-        pk_columns.to_vec(),
-        catalog_schema,
-    ))
-}
 
 /// Phase 5.18.C — schema-qualified variant of [`refresh_table`].
 ///
@@ -1943,37 +1963,70 @@ pub(crate) async fn refresh_table_qualified(
         ctx.register_table(tref(), Arc::new(provider))
             .map_err(|e| BasinError::internal(format!("register_table {bare_name}: {e}")))?;
     } else {
-        let (file_format, file_ext) = listing_file_format(meta.file_format);
-        let mut listing_options =
-            ListingOptions::new(file_format).with_file_extension(file_ext);
-        if let Some(sort_cols) = meta.global_sort_order.as_deref() {
-            listing_options =
-                listing_options.with_file_sort_order(build_file_sort_order(sort_cols));
+        // Same substitution as `refresh_table`: use TombstoneColdTable when
+        // tombstones are present on the non-HTAP cold-only path.
+        let cold_tomb_info_q: Option<(String, arrow_schema::DataType, std::collections::HashSet<Vec<u8>>)> =
+            if meta.pk_columns.len() == 1 {
+                use crate::hot_tombstone::snapshot_tombstones;
+                let reg = engine.memtable_registry();
+                let tombs = snapshot_tombstones(reg.as_ref(), project, bare_name);
+                if !tombs.is_empty() {
+                    let pk_col = meta.pk_columns[0].clone();
+                    if let Ok(pk_idx) = df_schema.index_of(&pk_col) {
+                        let pk_dt = df_schema.field(pk_idx).data_type().clone();
+                        Some((pk_col, pk_dt, tombs))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        if let Some((pk_col, pk_dt, tombs)) = cold_tomb_info_q {
+            use object_store::path::Path as ObjectPath;
+            let paths: Vec<ObjectPath> = live_files
+                .iter()
+                .map(|f| ObjectPath::from(f.path.as_str()))
+                .collect();
+            let provider = crate::tombstone_cold_scan::TombstoneColdTable::new(
+                df_schema,
+                engine.config().storage.clone(),
+                *project,
+                bare_name.clone(),
+                paths,
+                Arc::new(tombs),
+                pk_col,
+                pk_dt,
+            );
+            ctx.register_table(tref(), Arc::new(provider))
+                .map_err(|e| BasinError::internal(format!("register_table {bare_name}: {e}")))?;
+        } else {
+            let (file_format, file_ext) = listing_file_format(meta.file_format);
+            let mut listing_options =
+                ListingOptions::new(file_format).with_file_extension(file_ext);
+            if let Some(sort_cols) = meta.global_sort_order.as_deref() {
+                listing_options =
+                    listing_options.with_file_sort_order(build_file_sort_order(sort_cols));
+            }
+            let mut urls: Vec<ListingTableUrl> = Vec::with_capacity(live_files.len());
+            for f in &live_files {
+                let mut s = String::from(BASIN_URL_BASE);
+                s.push_str(&f.path);
+                let url = ListingTableUrl::parse(&s)
+                    .map_err(|e| BasinError::internal(format!("listing url parse {s}: {e}")))?;
+                urls.push(url);
+            }
+            let cfg = ListingTableConfig::new_with_multi_paths(urls)
+                .with_listing_options(listing_options)
+                .with_schema(df_schema.clone());
+            let provider = ListingTable::try_new(cfg)
+                .map_err(|e| BasinError::internal(format!("ListingTable::try_new {bare_name}: {e}")))?;
+            ctx.register_table(tref(), Arc::new(provider))
+                .map_err(|e| BasinError::internal(format!("register_table {bare_name}: {e}")))?;
         }
-        let mut urls: Vec<ListingTableUrl> = Vec::with_capacity(live_files.len());
-        for f in &live_files {
-            let mut s = String::from(BASIN_URL_BASE);
-            s.push_str(&f.path);
-            let url = ListingTableUrl::parse(&s)
-                .map_err(|e| BasinError::internal(format!("listing url parse {s}: {e}")))?;
-            urls.push(url);
-        }
-        let cfg = ListingTableConfig::new_with_multi_paths(urls)
-            .with_listing_options(listing_options)
-            .with_schema(df_schema.clone());
-        let provider = ListingTable::try_new(cfg)
-            .map_err(|e| BasinError::internal(format!("ListingTable::try_new {bare_name}: {e}")))?;
-        // Merge-on-read tombstone suppression — see `refresh_table`.
-        let provider = wrap_with_tombstone_filter(
-            Arc::new(provider) as Arc<dyn datafusion::catalog::TableProvider>,
-            engine,
-            project,
-            bare_name,
-            &meta.pk_columns,
-            df_schema,
-        );
-        ctx.register_table(tref(), provider)
-            .map_err(|e| BasinError::internal(format!("register_table {bare_name}: {e}")))?;
     }
 
     state
@@ -2019,36 +2072,69 @@ pub(crate) async fn refresh_table_with_extra(
     let mut all_files: Vec<DataFileRef> = meta.live_data_files();
     all_files.extend_from_slice(extra_files);
 
-    let (file_format, file_ext) = listing_file_format(meta.file_format);
-    let mut listing_options = ListingOptions::new(file_format).with_file_extension(file_ext);
-    if let Some(sort_cols) = meta.global_sort_order.as_deref() {
-        listing_options =
-            listing_options.with_file_sort_order(build_file_sort_order(sort_cols));
+    // Same substitution as `refresh_table`: use TombstoneColdTable when
+    // tombstones are present on the non-HTAP cold-only path.
+    let cold_tomb_info_x: Option<(String, arrow_schema::DataType, std::collections::HashSet<Vec<u8>>)> =
+        if meta.pk_columns.len() == 1 {
+            use crate::hot_tombstone::snapshot_tombstones;
+            let reg = engine.memtable_registry();
+            let tombs = snapshot_tombstones(reg.as_ref(), project, table);
+            if !tombs.is_empty() {
+                let pk_col = meta.pk_columns[0].clone();
+                if let Ok(pk_idx) = df_schema.index_of(&pk_col) {
+                    let pk_dt = df_schema.field(pk_idx).data_type().clone();
+                    Some((pk_col, pk_dt, tombs))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+    if let Some((pk_col, pk_dt, tombs)) = cold_tomb_info_x {
+        use object_store::path::Path as ObjectPath;
+        let paths: Vec<ObjectPath> = all_files
+            .iter()
+            .map(|f| ObjectPath::from(f.path.as_str()))
+            .collect();
+        let provider = crate::tombstone_cold_scan::TombstoneColdTable::new(
+            df_schema,
+            engine.config().storage.clone(),
+            *project,
+            table.clone(),
+            paths,
+            Arc::new(tombs),
+            pk_col,
+            pk_dt,
+        );
+        ctx.register_table(tref(), Arc::new(provider))
+            .map_err(|e| BasinError::internal(format!("register_table {table}: {e}")))?;
+    } else {
+        let (file_format, file_ext) = listing_file_format(meta.file_format);
+        let mut listing_options = ListingOptions::new(file_format).with_file_extension(file_ext);
+        if let Some(sort_cols) = meta.global_sort_order.as_deref() {
+            listing_options =
+                listing_options.with_file_sort_order(build_file_sort_order(sort_cols));
+        }
+        let mut urls: Vec<ListingTableUrl> = Vec::with_capacity(all_files.len());
+        for f in &all_files {
+            let mut s = String::from(BASIN_URL_BASE);
+            s.push_str(&f.path);
+            let url = ListingTableUrl::parse(&s)
+                .map_err(|e| BasinError::internal(format!("listing url parse {s}: {e}")))?;
+            urls.push(url);
+        }
+        let cfg = ListingTableConfig::new_with_multi_paths(urls)
+            .with_listing_options(listing_options)
+            .with_schema(df_schema.clone());
+        let provider = ListingTable::try_new(cfg)
+            .map_err(|e| BasinError::internal(format!("ListingTable::try_new {table}: {e}")))?;
+        ctx.register_table(tref(), Arc::new(provider))
+            .map_err(|e| BasinError::internal(format!("register_table {table}: {e}")))?;
     }
-    let mut urls: Vec<ListingTableUrl> = Vec::with_capacity(all_files.len());
-    for f in &all_files {
-        let mut s = String::from(BASIN_URL_BASE);
-        s.push_str(&f.path);
-        let url = ListingTableUrl::parse(&s)
-            .map_err(|e| BasinError::internal(format!("listing url parse {s}: {e}")))?;
-        urls.push(url);
-    }
-    let cfg = ListingTableConfig::new_with_multi_paths(urls)
-        .with_listing_options(listing_options)
-        .with_schema(df_schema.clone());
-    let provider = ListingTable::try_new(cfg)
-        .map_err(|e| BasinError::internal(format!("ListingTable::try_new {table}: {e}")))?;
-    // Merge-on-read tombstone suppression — see `refresh_table`.
-    let provider = wrap_with_tombstone_filter(
-        Arc::new(provider) as Arc<dyn datafusion::catalog::TableProvider>,
-        engine,
-        project,
-        table,
-        &meta.pk_columns,
-        df_schema,
-    );
-    ctx.register_table(tref(), provider)
-        .map_err(|e| BasinError::internal(format!("register_table {table}: {e}")))?;
 
     state
         .snapshots
