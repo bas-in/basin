@@ -748,12 +748,17 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                             continue;
                         }
                         // Load table metadata to derive write options.
-                        let meta = match sess
-                            .engine
-                            .config()
-                            .catalog
-                            .load_table(&sess.project, table)
-                            .await
+                        // Inv-OLTP-write (#155): served from the per-session
+                        // cache populated by the in-tx INSERTs above (the
+                        // invalidation carve-out keeps the entry hot across
+                        // INSERT batches; COMMIT is also not an invalidating
+                        // statement kind — it's a transaction control
+                        // intercepted before the dispatch table-meta-cache
+                        // invalidation block).
+                        let meta = match crate::session::load_table_meta_cached_err(
+                            sess, table,
+                        )
+                        .await
                         {
                             Ok(m) => m,
                             Err(e) => {
@@ -870,6 +875,17 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                                     return Err(e);
                                 }
                             }
+                            // Inv-OLTP-write (#155): COMMIT just advanced the
+                            // catalog for this table — the cached
+                            // `TableMetadata` (populated by the in-tx INSERTs)
+                            // now has a stale `live_data_files()` snapshot.
+                            // Invalidate the per-table entry so the FIRST
+                            // post-COMMIT SELECT re-loads. Without this,
+                            // metadata-only aggregates (e.g. COUNT(*)) would
+                            // be answered from the pre-INSERT snapshot.
+                            // Correctness gate:
+                            // `coverage_txn_schema::txn_multi_statement_all_rows_visible_after_commit`.
+                            sess.state.table_meta_cache.invalidate(table);
                             // Refresh the session's DataFusion context so
                             // the committed files are visible via catalog.
                             let _ = refresh_table(
@@ -1795,15 +1811,43 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     // Inv-OLTP-point (#149) — per-session table-meta cache invalidation.
     // The simple-SELECT fast-path gate consults a per-session
     // `(TableMetadata, view_present)` cache to skip two catalog round-trips
-    // per query. Any statement that is NOT a pure `SELECT` may mutate
-    // schema (DDL), indexes, RLS state, view bindings, or data files in a
-    // way the cached snapshot wouldn't reflect — clear the cache so the
-    // next SELECT re-loads from the catalog. This is the simple-safe
-    // pattern documented on [`crate::session::TableMetaCache`]: one
-    // `Mutex` lock + `clear()`, negligible relative to the DDL/DML it
-    // precedes. `Statement::Query` is the SELECT-shape carve-out; every
-    // other variant invalidates.
-    if !matches!(stmt, Statement::Query(_)) {
+    // per query. Any statement that is NOT a pure `SELECT` *or* an INSERT
+    // inside an explicit transaction may mutate schema (DDL), indexes, RLS
+    // state, view bindings, or data files in a way the cached snapshot
+    // wouldn't reflect — clear the cache so the next SELECT re-loads from
+    // the catalog. This is the simple-safe pattern documented on
+    // [`crate::session::TableMetaCache`]: one `Mutex` lock + `clear()`,
+    // negligible relative to the DDL/DML it precedes.
+    //
+    // Inv-OLTP-write (#155, perf-w7-more): in-tx `Statement::Insert` is
+    // also a carve-out — INSERTs do NOT mutate `TableMetadata`'s cached
+    // fields (schema, pk_columns, unique_constraints, foreign_keys,
+    // check_constraints, policies, rls_enabled, partition_spec). The only
+    // field they CAN advance is `current_snapshot` (via deferred
+    // `append_data_files` at COMMIT), and the in-tx INSERT path never
+    // consumes that field: the COMMIT handler re-reads the pinned snapshot
+    // from `TxState`, and `commit_with_retry` retries on stale-snapshot
+    // conflict. The `live_data_files()` embedded in cached `TableMetadata`
+    // does NOT change inside the transaction either — in-tx INSERTs buffer
+    // batches in `TxState::htap_rows` and only emit Parquet at COMMIT —
+    // and intra-tx SELECTs route through `HtapUnionTable` for read-your-
+    // own-writes regardless of the cached snapshot.
+    //
+    // CRITICAL: auto-commit INSERTs DO advance the catalog per statement
+    // (the synchronous `commit_with_retry` path), so the next SELECT must
+    // see the freshly-committed `live_data_files()`. We therefore restrict
+    // the carve-out to the in-tx case; auto-commit INSERTs still
+    // invalidate, matching W6 behaviour and preserving the RYOW contract
+    // (`executor::auto_commit_ryow_tests`).
+    //
+    // Same-session DDL always flushes the cache because ALTER/CREATE/DROP
+    // variants are not `Insert`. Net effect on `BEGIN; INSERT x100;
+    // COMMIT`: 100 cold catalog round-trips → 1 cold-fill + 99 LRU hits
+    // on the same `TableName` key; auto-commit RYOW unchanged.
+    let in_txn_for_cache = crate::session::tx_is_active(&sess.state);
+    let stmt_keeps_cache = matches!(stmt, Statement::Query(_))
+        || (in_txn_for_cache && matches!(stmt, Statement::Insert(_)));
+    if !stmt_keeps_cache {
         sess.state.table_meta_cache.invalidate_all();
     }
 
@@ -3898,12 +3942,12 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
         _ => unreachable!("checked above"),
     };
 
-    let meta = sess
-        .engine
-        .config()
-        .catalog
-        .load_table(&sess.project, &table)
-        .await?;
+    // Inv-OLTP-write (#155): served from the per-session table-meta cache
+    // on the 2nd..Nth INSERT within a tx (see invalidation carve-out at
+    // the top of `execute`). The cached `TableMetadata` is `Arc`-shared
+    // — we keep `meta` as `Arc<TableMetadata>` so subsequent borrows
+    // (`meta.schema`, `meta.pk_columns`, …) cost nothing.
+    let meta = crate::session::load_table_meta_cached_err(sess, &table).await?;
     let schema = meta.schema.clone();
     let mut row_count = rows_raw.len();
 
@@ -4111,6 +4155,13 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
         }
 
         commit_with_retry(sess, &table, meta.current_snapshot, file_refs).await?;
+        // Inv-OLTP-write (#155): auto-commit INSERT advances the catalog
+        // for this specific table, so the cached `TableMetadata` is now
+        // stale (`live_data_files()` misses the just-committed file).
+        // Invalidate just this entry so the next SELECT re-loads — the
+        // SELECT fast-path's RYOW contract (`auto_commit_ryow_tests`)
+        // depends on it.
+        sess.state.table_meta_cache.invalidate(&table);
         dispatch_post_commit(&sess.engine, events);
         refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table).await?;
         write_insert_audit_rows(sess, meta.schema.as_ref(), &preview_batches).await?;
@@ -4215,6 +4266,16 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
         if !crate::session::tx_is_active(&sess.state) {
             let handle = shard.get(&sess.project, &part).await?;
             handle.write_batch(&table, batch).await?;
+            // Inv-OLTP-write (#155): the shard's compactor advances the
+            // catalog out-of-band when it flushes the WAL tail into Parquet
+            // (e.g. on `flush_to_parquet()` or the auto-flush threshold).
+            // The cached `TableMetadata` populated by this INSERT's pre-
+            // write `load_table_meta_cached_err` will then be stale on the
+            // next SELECT (`live_data_files()` misses the freshly-committed
+            // file). Invalidate just this entry so the SELECT fast-path
+            // gate re-loads from the catalog. RYOW correctness gate:
+            // `rmw_update_correctness::count_star_after_scalar_hot_update_is_correct`.
+            sess.state.table_meta_cache.invalidate(&table);
             // SELECT-side handles tail-visibility (Option A: force-compact). Skip
             // the DataFusion ListingTable refresh here; reads will trigger it.
             return Ok(ExecResult::Empty {
@@ -4356,6 +4417,11 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
     }
 
     commit_with_retry(sess, &table, meta.current_snapshot, vec![file_ref]).await?;
+    // Inv-OLTP-write (#155): auto-commit advanced the catalog — invalidate
+    // the cached `TableMetadata` for this table so the next SELECT's
+    // fast-path gate reloads the fresh `live_data_files()`. See the
+    // partitioned arm above for the full rationale.
+    sess.state.table_meta_cache.invalidate(&table);
     dispatch_post_commit(&sess.engine, events);
 
     // Punch-list #10: if any inserted PK had a tombstone (from a prior fast-path
@@ -4430,12 +4496,10 @@ async fn exec_insert_select(
     use crate::convert::batch_df_to_ws;
     use arrow_array::{ArrayRef, RecordBatch};
 
-    let meta = sess
-        .engine
-        .config()
-        .catalog
-        .load_table(&sess.project, table)
-        .await?;
+    // Inv-OLTP-write (#155): cached on the 2nd..Nth INSERT-SELECT against
+    // the same table within a tx — same correctness model as the VALUES
+    // path above.
+    let meta = crate::session::load_table_meta_cached_err(sess, table).await?;
     let schema = meta.schema.clone();
 
     if matches!(meta.partition_spec, PartitionSpec::RangeMonthly { .. }) {
@@ -4728,6 +4792,9 @@ async fn exec_insert_select(
     }
 
     commit_with_retry(sess, table, meta.current_snapshot, vec![file_ref]).await?;
+    // Inv-OLTP-write (#155): same per-table cache invalidation as the
+    // VALUES auto-commit path — `live_data_files()` advanced.
+    sess.state.table_meta_cache.invalidate(table);
     dispatch_post_commit(&sess.engine, events);
 
     // ── Phase 5.14.C3: auto-commit INSERT-SELECT → memtable registry ─────────
@@ -4770,12 +4837,10 @@ async fn exec_insert_default_values(
     let name = single_part_name(crate::pg_ast::insert_object_name(&ins)?)?;
     let table = TableName::new(name)?;
 
-    let meta = sess
-        .engine
-        .config()
-        .catalog
-        .load_table(&sess.project, &table)
-        .await?;
+    // Inv-OLTP-write (#155): cached on the 2nd..Nth `INSERT INTO t
+    // DEFAULT VALUES` against the same table within a tx — same
+    // correctness model as the VALUES path.
+    let meta = crate::session::load_table_meta_cached_err(sess, &table).await?;
     let schema = meta.schema.clone();
 
     // Build one all-NULL row spanning all schema columns.
@@ -4936,6 +5001,8 @@ async fn exec_insert_default_values(
     .await?;
     dispatch_pre_commit(&sess.engine, &events).await?;
     commit_with_retry(sess, &table, meta.current_snapshot, vec![file_ref]).await?;
+    // Inv-OLTP-write (#155): per-table cache invalidation after auto-commit.
+    sess.state.table_meta_cache.invalidate(&table);
     dispatch_post_commit(&sess.engine, events);
 
     // ── Phase 5.14.C3: auto-commit DEFAULT VALUES → memtable registry ─────────
@@ -8283,15 +8350,20 @@ async fn htap_promote_to_registry(
         return Ok(());
     }
     let registry = sess.engine.memtable_registry();
-    let catalog = &sess.engine.config().catalog;
     for (table, batches) in htap_rows {
         let entry = registry.get_or_create(sess.project, table.clone());
 
         // Pre-fetch table metadata once per table so the hot loop below does
         // not call load_table() per row.  On catalog miss (e.g. mid-DROP) fall
         // back to the monotonic-counter key for the whole table.
+        //
+        // Inv-OLTP-write (#155): the per-session table-meta cache is hot here
+        // — the in-tx INSERTs that produced these `htap_rows` populated it,
+        // and the COMMIT match arm does not invalidate (see the carve-out
+        // and the COMMIT-handler routing above the dispatch invalidation
+        // block).
         let pk_info: Option<Vec<(usize, arrow_schema::DataType)>> =
-            match catalog.load_table(&sess.project, table).await {
+            match crate::session::load_table_meta_cached_err(sess, table).await {
                 Ok(meta) if !meta.pk_columns.is_empty() => {
                     // For each PK column resolve: (batch column index, DataType).
                     // We validate against the first batch's schema — all batches

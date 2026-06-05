@@ -821,6 +821,47 @@ pub(crate) async fn load_table_meta_cached(
     Some((arc, view_present))
 }
 
+/// Result-returning counterpart of [`load_table_meta_cached`]: the INSERT
+/// path treats a missing table as a hard error (so it can return a clean
+/// `NotFound` rather than degrade to a silent skip). Same cache semantics
+/// as the SELECT-side helper — populates `view_present = false` on the
+/// fresh path because the INSERT call site doesn't consume that flag.
+///
+/// Inv-OLTP-write (#155, perf-w7-more): the txn_insert_x100 bench drives
+/// 100 INSERTs against the same table inside `BEGIN..COMMIT`; serving each
+/// one from the per-session cache (post the invalidation carve-out for
+/// `Statement::Insert` in `executor::execute`) collapses 100 catalog
+/// `load_table` round-trips to a single cold-fill + 99 LRU hits.
+///
+/// Why a separate fn from [`load_table_meta_cached`]: the SELECT-side
+/// returns `Option<(_, bool)>` so the fast-path gate can fall through
+/// silently on catalog miss; the INSERT path needs `BasinError`
+/// propagation (`?`), and decorating the missing-table case with a
+/// dedicated `NotFound` keeps the error surface identical to the previous
+/// `catalog.load_table().await?` shape.
+pub(crate) async fn load_table_meta_cached_err(
+    sess: &crate::ProjectSession,
+    table: &TableName,
+) -> Result<Arc<TableMetadata>> {
+    if let Some(entry) = sess.state.table_meta_cache.get_fresh(table) {
+        return Ok(entry.meta);
+    }
+    let catalog = &sess.engine.config().catalog;
+    let meta = catalog.load_table(&sess.project, table).await?;
+    // Probe view presence so a subsequent SELECT-side gate served from
+    // this same cache entry doesn't have to re-issue the lookup. Cheap
+    // (one in-RAM map probe in the in-memory catalog).
+    let view_present = catalog
+        .lookup_view(&sess.project, table.as_str())
+        .await
+        .is_some();
+    let arc = Arc::new(meta);
+    sess.state
+        .table_meta_cache
+        .insert(table.clone(), arc.clone(), view_present);
+    Ok(arc)
+}
+
 /// Bring `ViewDef` into scope as a type so the unused-import check stays
 /// happy when the helpers above only reference `lookup_view`'s return
 /// shape implicitly.
