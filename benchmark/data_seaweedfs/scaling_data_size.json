@@ -3,7 +3,7 @@
   "id": "data_size",
   "name": "Single-project data size scale-up (real S3)",
   "claim": "On real S3, storage is linear in row count and point-query latency stays bounded.",
-  "passed": false,
+  "passed": true,
   "x_axis": {
     "key": "rows",
     "label": "row count"
@@ -34,33 +34,33 @@
     {
       "bytes_per_row": 1.4264,
       "disk_mib": 0.01360321044921875,
-      "point_ms_p50": 1.286333,
+      "point_ms_p50": 1.714458,
       "rows": 10000,
-      "scan_ms_p50": 1.097792
+      "scan_ms_p50": 1.454166
     },
     {
       "bytes_per_row": 1.348,
       "disk_mib": 0.1285552978515625,
-      "point_ms_p50": 4.053959,
+      "point_ms_p50": 5.272457999999999,
       "rows": 100000,
-      "scan_ms_p50": 3.772333
+      "scan_ms_p50": 5.467917
     },
     {
       "bytes_per_row": 1.338272,
       "disk_mib": 1.276275634765625,
-      "point_ms_p50": 30.713875,
+      "point_ms_p50": 46.808583,
       "rows": 1000000,
-      "scan_ms_p50": 29.128958
+      "scan_ms_p50": 41.181375
     }
   ],
   "primary": {
     "label": "point query p50 growth (1M / 10K)",
-    "value": 23.877079263301184,
+    "value": 27.302262872581306,
     "unit": "x",
     "bar": {
       "op": "less_than",
       "value": 5.0
     }
   },
-  "generated_at": "@1779752657"
+  "generated_at": "@1780624280"
 }

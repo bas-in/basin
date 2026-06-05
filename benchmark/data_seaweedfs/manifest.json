@@ -16,10 +16,11 @@
     "page_cache",
     "partition_pruning",
     "predicate_pushdown",
-    "rls_basic",
-    "rls_isolation",
+    "project_deletion",
+    "row_group_sizing",
     "s3_credentials_smoke",
     "shard_insert_path",
+    "tiered_storage",
     "update_delete",
     "vector_search"
   ],

@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "cold p99 ms",
-    "value": 3.549375,
+    "value": 8.22225,
     "unit": "ms",
     "bar": {
       "op": "less_than",
@@ -18,26 +18,26 @@
     "batches": 10,
     "bucket": "basin-test",
     "cache_budget_bytes": 268435456,
-    "cold_to_warm_p50_ratio": 1.007847510533744,
+    "cold_to_warm_p50_ratio": 0.974867477112412,
     "endpoint": "http://127.0.0.1:8333",
     "n_iterations": 200,
     "rows": [
       {
-        "max_ms": 8.039208,
-        "mean_ms": 3.1647133399999983,
-        "min_ms": 2.946917,
-        "p50_ms": 3.1305840000000003,
-        "p999_ms": 8.039208,
-        "p99_ms": 3.549375,
+        "max_ms": 12.409292,
+        "mean_ms": 6.592965265,
+        "min_ms": 5.404292,
+        "p50_ms": 6.495542,
+        "p999_ms": 12.409292,
+        "p99_ms": 8.22225,
         "phase": "cold"
       },
       {
-        "max_ms": 3.5317920000000003,
-        "mean_ms": 3.1217687499999998,
-        "min_ms": 2.989833,
-        "p50_ms": 3.106208,
-        "p999_ms": 3.5317920000000003,
-        "p99_ms": 3.361584,
+        "max_ms": 13.913666,
+        "mean_ms": 6.837716305,
+        "min_ms": 5.894,
+        "p50_ms": 6.662999999999999,
+        "p999_ms": 13.913666,
+        "p99_ms": 9.217915999999999,
         "phase": "warm"
       }
     ],
@@ -45,5 +45,5 @@
     "total_rows": 100000,
     "working_set_size": 1000
   },
-  "generated_at": "@1779752724"
+  "generated_at": "@1780624180"
 }

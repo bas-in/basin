@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "per_project_kib",
-    "value": 1.504,
+    "value": 1.744,
     "unit": "KiB",
     "bar": {
       "op": "less_than",
@@ -17,8 +17,8 @@
     "bucket": "basin-test",
     "endpoint": "http://127.0.0.1:8333",
     "projects": 1000,
-    "rss_after_kib": 14704,
-    "rss_before_kib": 13200
+    "rss_after_kib": 26560,
+    "rss_before_kib": 24816
   },
-  "generated_at": "@1779752728"
+  "generated_at": "@1780624187"
 }

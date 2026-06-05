@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "partition_bytes_ratio (range / full)",
-    "value": 0.16657311254560764,
+    "value": 0.16656830923576277,
     "unit": "ratio",
     "bar": {
       "op": "less_than",
@@ -16,15 +16,15 @@
   "details": {
     "bucket": "basin-test",
     "endpoint": "http://127.0.0.1:8333",
-    "full_scan_bytes": 57008,
+    "full_scan_bytes": 54224,
     "full_scan_gets": 12,
     "full_scan_range_gets": 0,
     "months": 12,
-    "range_scan_bytes": 9496,
+    "range_scan_bytes": 9032,
     "range_scan_gets": 1,
     "range_scan_range_gets": 1,
-    "ratio": 0.16657311254560764,
+    "ratio": 0.16656830923576277,
     "rows_per_month": 100
   },
-  "generated_at": "@1779752733"
+  "generated_at": "@1780624196"
 }
