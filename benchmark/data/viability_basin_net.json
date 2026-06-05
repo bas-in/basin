@@ -15,12 +15,12 @@
   },
   "details": {
     "allowlist_blocks_unknown_host": true,
-    "async_request_id": "98e63e1d-1492-44d1-80a5-306c6d21e90c",
+    "async_request_id": "8d16683a-1a35-4b2b-92c3-938f09febecf",
     "async_response_recorded": true,
     "async_status": 200,
     "roundtrip_passed": true,
     "sync_body": "ok",
     "sync_status": 200
   },
-  "generated_at": "@1780496072"
+  "generated_at": "@1780680504"
 }
