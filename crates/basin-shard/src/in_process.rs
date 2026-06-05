@@ -1416,6 +1416,33 @@ impl InProcessShard {
                 data_file.path.as_ref().as_ref(),
             );
 
+            // PG-Wave-α: write `.rtree` sidecars for any GIST index on a
+            // POINT column. The probe path (RTreePrunedTable +
+            // apply_rtree_pruning_for_query) lands in PG-Wave-β; the
+            // sidecar must already exist for that wave to wire onto.
+            // Best-effort: a sidecar write failure is logged but does
+            // not abort the compaction commit (the data is already
+            // catalogued, future queries fall back to a full scan).
+            if let Err(e) = reindex_compacted_file_rtree(
+                self.cfg.storage.clone(),
+                project,
+                &table,
+                &gin_indexes,
+                effective_rg_size as u32,
+                &merged,
+                data_file.path.as_ref(),
+            )
+            .await
+            {
+                tracing::warn!(
+                    project = %project,
+                    table = %table,
+                    file = %data_file.path.as_ref(),
+                    error = %e,
+                    "PG-Wave-α R-tree sidecar write failed; queries fall back to full scan"
+                );
+            }
+
             if used_adaptive_sort {
                 any_adaptive_sort = true;
             }
@@ -2456,6 +2483,97 @@ fn reindex_compacted_file_gin(
             rg_size,
         );
     }
+}
+
+/// PG-Wave-α: build an R-tree spatial index segment for any `USING gist`
+/// SecondaryIndex on a POINT column of the compacted file. The sidecar
+/// is written under
+/// `projects/{p}/tables/{t}/index/{col}.rtree/{ulid}.rtree`, exactly
+/// mirroring the HNSW vector-index layout. The engine pushdown path
+/// (`RTreePrunedTable` + `apply_rtree_pruning_for_query`) lands in
+/// PG-Wave-β and consumes these sidecars; until then the only side
+/// effect is the sidecar object in storage.
+///
+/// Indexes that aren't `gist` access-method or whose target column
+/// isn't a POINT (FixedSizeBinary(21) with `BASIN_TYPE=POINT`) are
+/// skipped silently. Errors are propagated so the caller can log
+/// (the call site treats this as best-effort).
+async fn reindex_compacted_file_rtree(
+    storage: basin_storage::Storage,
+    project: &ProjectId,
+    table: &TableName,
+    indexes: &[basin_catalog::SecondaryIndex],
+    rg_size: u32,
+    batch: &arrow_array::RecordBatch,
+    file_path: &str,
+) -> basin_common::Result<()> {
+    use arrow_schema::DataType as Dt;
+    use object_store::ObjectStoreExt;
+    for idx in indexes {
+        if idx.access_method != "gist" || idx.columns.len() != 1 {
+            continue;
+        }
+        let col_name = &idx.columns[0];
+        let schema = batch.schema();
+        let Ok(col_idx) = schema.index_of(col_name) else {
+            continue;
+        };
+        let field = schema.field(col_idx);
+        // POINT marker: BASIN_TYPE=POINT AND physical FixedSizeBinary(21).
+        let is_point = field
+            .metadata()
+            .get("BASIN_TYPE")
+            .map(|s| s == "POINT")
+            .unwrap_or(false);
+        if !is_point {
+            // Non-POINT GIST indexes (e.g. range-ops on int4range) use
+            // the legacy interval-tree path; skip here.
+            continue;
+        }
+        if !matches!(field.data_type(), Dt::FixedSizeBinary(n) if *n == basin_geo::POINT_WKB_LEN as i32)
+        {
+            continue;
+        }
+
+        let rtree = basin_storage::index::rtree::build_rtree_for_batch(batch, col_idx, rg_size);
+        if rtree.size() == 0 {
+            // No spatial entries — nothing to write. Common when a
+            // newly compacted file has the column but every row is
+            // NULL.
+            continue;
+        }
+        let bytes = basin_storage::index::rtree::serialize_rtree(&rtree).map_err(|e| {
+            basin_common::BasinError::storage(format!("R-tree serialize: {e}"))
+        })?;
+        let Some(sidecar) = basin_storage::index::rtree::rtree_segment_key_for_data_file(
+            None,
+            project,
+            table,
+            col_name,
+            file_path,
+        ) else {
+            tracing::debug!(
+                project = %project,
+                table = %table,
+                file = %file_path,
+                "PG-Wave-α: data file path not in canonical layout; skipping R-tree sidecar"
+            );
+            continue;
+        };
+        storage
+            .project_object_store(project)
+            .put(
+                &sidecar,
+                object_store::PutPayload::from_bytes(bytes::Bytes::from(bytes)),
+            )
+            .await
+            .map_err(|e| {
+                basin_common::BasinError::storage(format!(
+                    "R-tree sidecar put {sidecar}: {e}"
+                ))
+            })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3571,5 +3689,145 @@ mod tests {
         let inner = impl_of(&shard);
         inner.run_heartbeat_once().await;
         // Survival is the assertion.
+    }
+
+    /// PG-Wave-α: `reindex_compacted_file_rtree` writes the `.rtree`
+    /// sidecar at the canonical sidecar path when the table has a GIST
+    /// index on a POINT column. With no GIST index nothing is written;
+    /// with a GIST index on a non-POINT column the helper skips the
+    /// index quietly. Run direct against the helper (no shard plumbing)
+    /// so the assertion is precise: the sidecar key is what the engine
+    /// pushdown layer will probe in PG-Wave-β.
+    #[tokio::test]
+    async fn compactor_writes_rtree_sidecar_when_gist_present() {
+        use arrow_array::builder::{FixedSizeBinaryBuilder, Int64Builder};
+        use arrow_schema::{DataType, Field, Schema};
+        use basin_storage::{Storage, StorageConfig};
+        use object_store::local::LocalFileSystem;
+        use object_store::ObjectStoreExt;
+
+        let dir = TempDir::new().unwrap();
+        let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let storage = Storage::new(StorageConfig {
+            object_store: Arc::new(fs),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let project = ProjectId::new();
+        let table = TableName::new("locs").unwrap();
+
+        // Build a small batch: 8 POINT rows (x=0..8, y=0..8).
+        let mut ids = Int64Builder::with_capacity(8);
+        let mut pts =
+            FixedSizeBinaryBuilder::with_capacity(8, basin_geo::POINT_WKB_LEN as i32);
+        for i in 0..8i64 {
+            ids.append_value(i);
+            let bytes = basin_geo::encode_point(&basin_geo::Point::new(i as f64, i as f64));
+            pts.append_value(bytes).unwrap();
+        }
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("BASIN_TYPE".to_string(), "POINT".to_string());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "p",
+                DataType::FixedSizeBinary(basin_geo::POINT_WKB_LEN as i32),
+                true,
+            )
+            .with_metadata(meta),
+        ]));
+        let batch = arrow_array::RecordBatch::try_new(
+            schema,
+            vec![Arc::new(ids.finish()), Arc::new(pts.finish())],
+        )
+        .unwrap();
+
+        // The data file's logical path — what `compact_one` would have
+        // written. We don't actually write it; we just need a valid
+        // canonical path so the sidecar key derives.
+        let data_file_path = format!(
+            "projects/{}/tables/locs/data/01J7Z0FZ0K0K0K0K0K0K0K0K0K.parquet",
+            project.as_prefix()
+        );
+
+        // Indexes vec mimicking what the catalog returns.
+        let gist_on_p = basin_catalog::SecondaryIndex {
+            name: "locs_p_gist".into(),
+            columns: vec!["p".into()],
+            access_method: "gist".into(),
+            opclass: Some("range_ops".into()),
+        };
+        let gist_on_unknown = basin_catalog::SecondaryIndex {
+            name: "locs_other_gist".into(),
+            columns: vec!["other_col".into()],
+            access_method: "gist".into(),
+            opclass: None,
+        };
+        let gin_jsonb = basin_catalog::SecondaryIndex {
+            name: "locs_doc_gin".into(),
+            columns: vec!["doc".into()],
+            access_method: "gin".into(),
+            opclass: Some("jsonb_ops".into()),
+        };
+
+        // 1) No GIST index → no sidecar.
+        reindex_compacted_file_rtree(
+            storage.clone(),
+            &project,
+            &table,
+            &[gin_jsonb.clone()],
+            4u32,
+            &batch,
+            &data_file_path,
+        )
+        .await
+        .expect("no-op when only GIN");
+
+        // 2) GIST on a column that isn't on the batch → no sidecar.
+        reindex_compacted_file_rtree(
+            storage.clone(),
+            &project,
+            &table,
+            &[gist_on_unknown.clone()],
+            4u32,
+            &batch,
+            &data_file_path,
+        )
+        .await
+        .expect("skip unknown-column gist");
+
+        // 3) GIST on POINT column → sidecar exists.
+        reindex_compacted_file_rtree(
+            storage.clone(),
+            &project,
+            &table,
+            &[gist_on_p, gin_jsonb, gist_on_unknown],
+            4u32,
+            &batch,
+            &data_file_path,
+        )
+        .await
+        .expect("gist-on-point sidecar must be written");
+
+        let expected = basin_storage::index::rtree::rtree_segment_key_for_data_file(
+            None,
+            &project,
+            &table,
+            "p",
+            &data_file_path,
+        )
+        .expect("canonical data path");
+        let got = storage
+            .project_object_store(&project)
+            .get(&expected)
+            .await
+            .expect("R-tree sidecar must exist at canonical path");
+        let bytes = got.bytes().await.unwrap();
+        assert!(bytes.starts_with(b"BR1\n"), "sidecar carries magic header");
+
+        let rtree = basin_storage::index::rtree::deserialize_rtree(&bytes)
+            .expect("sidecar bytes deserialise");
+        assert_eq!(rtree.size(), 8, "all 8 POINT rows indexed");
     }
 }

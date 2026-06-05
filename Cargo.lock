@@ -1127,6 +1127,7 @@ dependencies = [
  "base64 0.22.1",
  "basin-catalog",
  "basin-common",
+ "basin-geo",
  "basin-hottier",
  "basin-shard",
  "basin-sketch",
@@ -1515,6 +1516,7 @@ dependencies = [
  "async-trait",
  "basin-catalog",
  "basin-common",
+ "basin-geo",
  "basin-hottier",
  "basin-storage",
  "basin-wal",
@@ -1548,8 +1550,10 @@ dependencies = [
  "async-trait",
  "basin-catalog",
  "basin-common",
+ "basin-geo",
  "basin-sketch",
  "basin-vector",
+ "bincode",
  "bytes",
  "chrono",
  "fastbloom",
@@ -1559,6 +1563,7 @@ dependencies = [
  "object_store",
  "parquet",
  "rand 0.8.6",
+ "rstar",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -7231,6 +7236,7 @@ checksum = "421400d13ccfd26dfa5858199c30a5d76f9c54e0dba7575273025b43c5175dbb"
 dependencies = [
  "heapless",
  "num-traits",
+ "serde",
  "smallvec",
 ]
 

@@ -58,6 +58,13 @@ pub const BASIN_TYPE_MONEY: &str = "MONEY";
 // XML — UTF-8 text with marker for OID 142.
 pub const BASIN_TYPE_XML: &str = "XML";
 
+/// `POINT` — PostGIS-style 2D point. Rides on `FixedSizeBinary(21)`; the
+/// bytes are little-endian WKB (1-byte endian + 4-byte type + 8-byte X +
+/// 8-byte Y), matching what `basin_geo::encode_point` emits. The marker
+/// lets pgwire surface the column to clients (today rendered as WKB hex
+/// in text format; binary-format clients can read the raw 21 bytes).
+pub const BASIN_TYPE_POINT: &str = "POINT";
+
 /// `CITEXT` — case-insensitive text. Stored as plain `Utf8` in Arrow; the
 /// marker tells comparison operators, UNIQUE enforcement, and ORDER BY to
 /// apply case-folding (lower()) before comparing values. PG OID 25 (same as
@@ -324,6 +331,12 @@ pub(crate) fn field_is_tsvector(field: &arrow_schema::Field) -> bool {
 /// Returns `true` if `field` carries the `TSQUERY` metadata marker.
 pub(crate) fn field_is_tsquery(field: &arrow_schema::Field) -> bool {
     field.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_TSQUERY)
+}
+
+/// Returns `true` if `field` carries the `POINT` metadata marker
+/// (Arrow physical: `FixedSizeBinary(21)`, content: WKB).
+pub(crate) fn field_is_point(field: &arrow_schema::Field) -> bool {
+    field.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_POINT)
 }
 
 /// Returns `true` if `field` carries any of the six PG range-type markers
@@ -848,8 +861,16 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
                 // Case-insensitive text. Stored as plain Utf8 in Basin v0.1.
                 "CITEXT" if modifiers.is_empty() => Ok(DataType::Utf8),
                 // ── POINT ────────────────────────────────────────────────
-                // PG geometric point type. Stored as Utf8 "(x,y)" for v0.1.
-                "POINT" if modifiers.is_empty() => Ok(DataType::Utf8),
+                // PostGIS-style POINT — stored as 21-byte little-endian WKB
+                // (1 endian + 4 type + 8 X + 8 Y) in `FixedSizeBinary(21)`.
+                // The BASIN_TYPE=POINT marker (added in `basin_type_marker`)
+                // tells the INSERT-coercion + pgwire-encoder paths to treat
+                // these bytes as a POINT logical value rather than opaque
+                // bytea. ST_MakePoint / ST_X / ST_Y UDFs in `geo_glue` round-
+                // trip the same 21-byte encoding.
+                "POINT" if modifiers.is_empty() => Ok(DataType::FixedSizeBinary(
+                    basin_geo::POINT_WKB_LEN as i32,
+                )),
                 _ => Err(BasinError::InvalidSchema(format!(
                     "unsupported custom type: {name}"
                 ))),
@@ -985,6 +1006,9 @@ pub(crate) fn basin_type_marker(sql: &SqlDataType) -> Option<String> {
         "TSTZRANGE" if modifiers.is_empty() => Some(BASIN_TYPE_TSTZRANGE.to_string()),
         // XML — stored as Utf8.
         "XML" if modifiers.is_empty() => Some(BASIN_TYPE_XML.to_string()),
+        // POINT — PostGIS-style 2D point stored as 21-byte WKB
+        // (FixedSizeBinary(21)).
+        "POINT" if modifiers.is_empty() => Some(BASIN_TYPE_POINT.to_string()),
         _ => None,
     }
 }

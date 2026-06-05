@@ -63,6 +63,12 @@ vortex-buffer = "0.71"
 # serialises via as_slice() (Vec<u64>) — stable across restarts on the same
 # platform (little-endian u64, deterministic DefaultHasher seed).
 fastbloom = "0.7"
+# R-tree spatial index sidecar format (Phase PG-Wave-α). bincode-serialised
+# rstar::RTree<SpatialEntry> mirroring the HNSW sidecar layout. See
+# crates/basin-storage/src/index/rtree.rs and docs/postgis-rtree-design.md.
+rstar = { workspace = true }
+bincode = { workspace = true }
+basin-geo = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

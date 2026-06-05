@@ -11,6 +11,13 @@ basin-common.workspace = true
 basin-storage.workspace = true
 basin-catalog.workspace = true
 basin-vector.workspace = true
+# PostGIS-shape spatial layer. Engine depends on basin-geo for:
+# - POINT column physical type (`FixedSizeBinary(POINT_WKB_LEN)`)
+# - ST_MakePoint / ST_X / ST_Y / ST_Distance / ST_DWithin / ST_AsText etc.
+#   scalar UDFs registered from `geo_glue::install_udfs`.
+# basin-geo has no dependency on basin-engine, so this is dependency-cycle-
+# free (basin-geo -> basin-common only).
+basin-geo.workspace = true
 basin-shard.workspace = true
 basin-wal.workspace = true
 basin-hottier.workspace = true

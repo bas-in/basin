@@ -393,6 +393,34 @@ pub(crate) fn batch_from_rows(schema: Arc<Schema>, rows: &[Vec<Expr>]) -> Result
                 }
                 Arc::new(b.finish())
             }
+            DataType::FixedSizeBinary(n)
+                if *n == basin_geo::POINT_WKB_LEN as i32 && crate::types::field_is_point(field) =>
+            {
+                // PG-Wave-α: POINT column. Accept either a WKT string
+                // literal (`'POINT(x y)'`) or the `ST_MakePoint(x, y)`
+                // constructor — both produce the 21-byte little-endian
+                // WKB blob that round-trips through ST_X / ST_Y and the
+                // pgwire encoder.
+                let mut b =
+                    FixedSizeBinaryBuilder::with_capacity(rows.len(), basin_geo::POINT_WKB_LEN as i32);
+                for row in rows {
+                    match coerce_point(&row[col_idx], field.name())? {
+                        Some(bytes) => {
+                            b.append_value(bytes).map_err(|e| {
+                                BasinError::internal(format!(
+                                    "POINT append for column {}: {e}",
+                                    field.name()
+                                ))
+                            })?;
+                        }
+                        None => {
+                            check_null_allowed(field)?;
+                            b.append_null();
+                        }
+                    }
+                }
+                Arc::new(b.finish())
+            }
             DataType::FixedSizeList(child, dim) => {
                 if *child.data_type() != DataType::Float32 {
                     return Err(BasinError::InvalidSchema(format!(
@@ -1365,6 +1393,152 @@ fn coerce_uuid(expr: &Expr, col: &str) -> Result<Option<[u8; 16]>> {
             "expected UUID literal or gen_random_uuid()/uuid_generate_v4() for column {col}, got {other}"
         ))),
     }
+}
+
+/// PG-Wave-α: decode a POINT literal into a 21-byte WKB blob.
+///
+/// Accepts:
+/// - `ST_MakePoint(x, y)` — both args must be numeric literals (the
+///   INSERT path doesn't evaluate UDFs; the constructor is folded
+///   directly here for ergonomic literals).
+/// - A WKT string literal (`'POINT(x y)'`, case-insensitive on the
+///   leading keyword). Engine implicitly calls `ST_GeomFromText` here so
+///   plain `INSERT INTO t VALUES ('POINT(1 2)')` works.
+/// - A `Cast` wrapper (`'POINT(1 2)'::point`) — peeled and recursed.
+/// - `NULL`.
+fn coerce_point(expr: &Expr, col: &str) -> Result<Option<[u8; basin_geo::POINT_WKB_LEN]>> {
+    match expr {
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(s),
+            ..
+        })
+        | Expr::Value(ValueWithSpan {
+            value: Value::DoubleQuotedString(s),
+            ..
+        })
+        | Expr::Value(ValueWithSpan {
+            value: Value::EscapedStringLiteral(s),
+            ..
+        })
+        | Expr::Value(ValueWithSpan {
+            value: Value::NationalStringLiteral(s),
+            ..
+        }) => parse_wkt_point(s, col).map(Some),
+        Expr::Value(ValueWithSpan {
+            value: Value::Null, ..
+        }) => Ok(None),
+        Expr::Cast { expr: inner, .. } => coerce_point(inner.as_ref(), col),
+        Expr::TypedString(TypedString { value, .. }) => match &value.value {
+            Value::SingleQuotedString(s)
+            | Value::DoubleQuotedString(s)
+            | Value::EscapedStringLiteral(s)
+            | Value::NationalStringLiteral(s) => parse_wkt_point(s, col).map(Some),
+            _ => Err(BasinError::InvalidSchema(format!(
+                "POINT column {col}: TypedString must wrap a string literal"
+            ))),
+        },
+        Expr::Function(f) => {
+            let fname = f
+                .name
+                .0
+                .last()
+                .map(|i| i.id_val().to_ascii_lowercase())
+                .unwrap_or_default();
+            if fname != "st_makepoint" {
+                return Err(BasinError::InvalidSchema(format!(
+                    "expected ST_MakePoint(x, y) or WKT literal for POINT column {col}, got {fname}(...)"
+                )));
+            }
+            let arg_exprs = match &f.args {
+                FunctionArguments::List(list) => list
+                    .args
+                    .iter()
+                    .filter_map(|a| match a {
+                        sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(e),
+                        ) => Some(e.clone()),
+                        sqlparser::ast::FunctionArg::Named { arg, .. } => match arg {
+                            sqlparser::ast::FunctionArgExpr::Expr(e) => Some(e.clone()),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            };
+            if arg_exprs.len() != 2 {
+                return Err(BasinError::InvalidSchema(format!(
+                    "ST_MakePoint expects 2 numeric arguments for column {col}, got {}",
+                    arg_exprs.len()
+                )));
+            }
+            let x = coerce_f64(&arg_exprs[0])?.ok_or_else(|| {
+                BasinError::InvalidSchema(format!(
+                    "ST_MakePoint: X must be a non-NULL numeric for column {col}"
+                ))
+            })?;
+            let y = coerce_f64(&arg_exprs[1])?.ok_or_else(|| {
+                BasinError::InvalidSchema(format!(
+                    "ST_MakePoint: Y must be a non-NULL numeric for column {col}"
+                ))
+            })?;
+            Ok(Some(basin_geo::encode_point(&basin_geo::Point::new(x, y))))
+        }
+        other => Err(BasinError::InvalidSchema(format!(
+            "expected ST_MakePoint(...) or WKT literal for POINT column {col}, got {other}"
+        ))),
+    }
+}
+
+fn parse_wkt_point(s: &str, col: &str) -> Result<[u8; basin_geo::POINT_WKB_LEN]> {
+    let trimmed = s.trim();
+    let after = trimmed
+        .strip_prefix("POINT")
+        .or_else(|| trimmed.strip_prefix("point"))
+        .or_else(|| trimmed.strip_prefix("Point"))
+        .ok_or_else(|| {
+            BasinError::InvalidSchema(format!(
+                "POINT column {col}: expected WKT like 'POINT(x y)', got {trimmed:?}"
+            ))
+        })?
+        .trim_start();
+    let inside = after
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .ok_or_else(|| {
+            BasinError::InvalidSchema(format!(
+                "POINT column {col}: expected parenthesised POINT(x y), got {trimmed:?}"
+            ))
+        })?;
+    let mut parts = inside.split_whitespace();
+    let x: f64 = parts
+        .next()
+        .ok_or_else(|| {
+            BasinError::InvalidSchema(format!("POINT column {col}: missing X coordinate"))
+        })?
+        .parse()
+        .map_err(|e| {
+            BasinError::InvalidSchema(format!(
+                "POINT column {col}: X coordinate not a number: {e}"
+            ))
+        })?;
+    let y: f64 = parts
+        .next()
+        .ok_or_else(|| {
+            BasinError::InvalidSchema(format!("POINT column {col}: missing Y coordinate"))
+        })?
+        .parse()
+        .map_err(|e| {
+            BasinError::InvalidSchema(format!(
+                "POINT column {col}: Y coordinate not a number: {e}"
+            ))
+        })?;
+    if parts.next().is_some() {
+        return Err(BasinError::InvalidSchema(format!(
+            "POINT column {col}: only 2D POINT(x y) is supported in v0.1"
+        )));
+    }
+    Ok(basin_geo::encode_point(&basin_geo::Point::new(x, y)))
 }
 
 // ── Network / bit-string coercions ──────────────────────────────────────────

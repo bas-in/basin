@@ -807,9 +807,14 @@ async fn read_one(
         // re-stamp the BASIN_TYPE marker and reinterpret the buffer
         // back to FSB(16) so the engine never sees the disguise.
         // TODO(adr-0024): drop when vortex grows native FSB(N) support.
-        let schema = catalog_schema
-            .as_ref()
-            .map(|s| Arc::new(catalog_schema_uuid_to_decimal256(s.as_ref())));
+        let schema = catalog_schema.as_ref().map(|s| {
+            // First UUID FSB(16) → Decimal256, then POINT FSB(21) →
+            // LargeBinary. The two translations key on disjoint
+            // physical types so order is incidental.
+            let s = catalog_schema_uuid_to_decimal256(s.as_ref());
+            let s = catalog_schema_point_to_large_binary(&s);
+            Arc::new(s)
+        });
 
         // Two byte-acquisition paths must feed the Vortex decoder:
         //   (a) envelope-encrypted: a `<path>.wrapped` sidecar exists, so we
@@ -2174,6 +2179,13 @@ fn vortex_project_and_filter(
         // Decimal256 from a genuine wide-precision NUMERIC column.
         // TODO(adr-0024): drop when vortex grows native FixedSizeBinary(N).
         let restored = decimal256_to_uuid_fsb(restamped);
+        // PG-Wave-α — POINT-as-LargeBinary read-side inverse. The write
+        // path reinterprets `FixedSizeBinary(21) + BASIN_TYPE=POINT`
+        // columns as `LargeBinary` for Vortex; restore the FSB(21)
+        // layout here so downstream layers keep seeing POINT. Same
+        // metadata pre-condition applies (the restamp above retags the
+        // column with `BASIN_TYPE=POINT`).
+        let restored = large_binary_to_point_fsb(restored);
         out.push(restored);
     }
     Ok(out)
@@ -2393,6 +2405,10 @@ const BASIN_TYPE_KEY: &str = "BASIN_TYPE";
 /// `BASIN_TYPE` value for UUID columns. Mirrors
 /// `basin_engine::types::BASIN_TYPE_UUID`.
 const BASIN_TYPE_UUID: &str = "UUID";
+/// PG-Wave-α: `BASIN_TYPE` value for POINT columns. Mirrors
+/// `basin_engine::types::BASIN_TYPE_POINT`. Vortex stores POINT as
+/// `LargeBinary`; restamping uses this marker to rebuild FSB(21).
+const BASIN_TYPE_POINT: &str = "POINT";
 
 /// ADR 0024 — translate the catalog schema so UUID columns claim
 /// `Decimal256(39, 0)` instead of `FixedSizeBinary(16)`. Vortex 0.70 has
@@ -2497,6 +2513,161 @@ fn decimal256_to_uuid_fsb(batch: RecordBatch) -> RecordBatch {
     ));
     RecordBatch::try_new(new_schema, new_cols)
         .expect("decimal256_to_uuid_fsb: schema swap cannot fail")
+}
+
+/// PG-Wave-α — catalog-schema reinterpretation: POINT FSB(21) →
+/// LargeBinary so the Vortex executor sees the physical type it can
+/// actually decode. The post-decode inverse `large_binary_to_point_fsb`
+/// rebuilds FSB(21) before handing the batch above the storage trait.
+fn catalog_schema_point_to_large_binary(schema: &Schema) -> Schema {
+    let new_fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let is_point_fsb = matches!(
+                f.data_type(),
+                arrow_schema::DataType::FixedSizeBinary(n)
+                    if *n == basin_geo::POINT_WKB_LEN as i32
+            ) && f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str())
+                == Some(BASIN_TYPE_POINT);
+            if is_point_fsb {
+                Field::new(f.name(), arrow_schema::DataType::LargeBinary, f.is_nullable())
+                    .with_metadata(f.metadata().clone())
+            } else {
+                f.as_ref().clone()
+            }
+        })
+        .collect();
+    Schema::new_with_metadata(new_fields, schema.metadata().clone())
+}
+
+/// PG-Wave-α — read-side inverse of `writer::point_fsb_to_large_binary`.
+/// For every column with Arrow type `LargeBinary` + `BASIN_TYPE=POINT`,
+/// rebuild the `FixedSizeBinary(21)` layout so the rest of basin keeps
+/// seeing the canonical POINT physical type.
+fn large_binary_to_point_fsb(batch: RecordBatch) -> RecordBatch {
+    use arrow_array::{Array, BinaryArray, BinaryViewArray, FixedSizeBinaryArray, LargeBinaryArray};
+
+    let schema = batch.schema();
+    // Vortex 0.71 surfaces the on-disk LargeBinary column as either
+    // LargeBinary, Binary, or BinaryView depending on layout. Accept
+    // all three so the inverse fires regardless of the codec's choice.
+    fn is_byte_array(dt: &arrow_schema::DataType) -> bool {
+        matches!(
+            dt,
+            arrow_schema::DataType::LargeBinary
+                | arrow_schema::DataType::Binary
+                | arrow_schema::DataType::BinaryView
+        )
+    }
+    let needs_xlate = schema.fields().iter().any(|f| {
+        is_byte_array(f.data_type())
+            && f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_POINT)
+    });
+    if !needs_xlate {
+        return batch;
+    }
+    let mut new_fields: Vec<Field> = Vec::with_capacity(schema.fields().len());
+    let mut new_cols: Vec<arrow_array::ArrayRef> = Vec::with_capacity(batch.num_columns());
+    for (i, f) in schema.fields().iter().enumerate() {
+        let is_point = is_byte_array(f.data_type())
+            && f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_POINT);
+        if is_point {
+            let col = batch.column(i);
+            let len = col.len();
+            let rows: Vec<Option<[u8; basin_geo::POINT_WKB_LEN]>> = match col.data_type() {
+                arrow_schema::DataType::LargeBinary => {
+                    let a = col
+                        .as_any()
+                        .downcast_ref::<LargeBinaryArray>()
+                        .expect("LargeBinaryArray for POINT");
+                    (0..len)
+                        .map(|r| {
+                            if a.is_null(r) {
+                                None
+                            } else {
+                                let v = a.value(r);
+                                if v.len() == basin_geo::POINT_WKB_LEN {
+                                    let mut buf = [0u8; basin_geo::POINT_WKB_LEN];
+                                    buf.copy_from_slice(v);
+                                    Some(buf)
+                                } else {
+                                    None
+                                }
+                            }
+                        })
+                        .collect()
+                }
+                arrow_schema::DataType::Binary => {
+                    let a = col
+                        .as_any()
+                        .downcast_ref::<BinaryArray>()
+                        .expect("BinaryArray for POINT");
+                    (0..len)
+                        .map(|r| {
+                            if a.is_null(r) {
+                                None
+                            } else {
+                                let v = a.value(r);
+                                if v.len() == basin_geo::POINT_WKB_LEN {
+                                    let mut buf = [0u8; basin_geo::POINT_WKB_LEN];
+                                    buf.copy_from_slice(v);
+                                    Some(buf)
+                                } else {
+                                    None
+                                }
+                            }
+                        })
+                        .collect()
+                }
+                arrow_schema::DataType::BinaryView => {
+                    let a = col
+                        .as_any()
+                        .downcast_ref::<BinaryViewArray>()
+                        .expect("BinaryViewArray for POINT");
+                    (0..len)
+                        .map(|r| {
+                            if a.is_null(r) {
+                                None
+                            } else {
+                                let v = a.value(r);
+                                if v.len() == basin_geo::POINT_WKB_LEN {
+                                    let mut buf = [0u8; basin_geo::POINT_WKB_LEN];
+                                    buf.copy_from_slice(v);
+                                    Some(buf)
+                                } else {
+                                    None
+                                }
+                            }
+                        })
+                        .collect()
+                }
+                _ => unreachable!("checked by is_byte_array above"),
+            };
+            let arr = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                rows.into_iter(),
+                basin_geo::POINT_WKB_LEN as i32,
+            )
+            .expect("FixedSizeBinary(POINT_WKB_LEN) construction cannot fail");
+            let new_field = Field::new(
+                f.name(),
+                arrow_schema::DataType::FixedSizeBinary(basin_geo::POINT_WKB_LEN as i32),
+                f.is_nullable(),
+            )
+            .with_metadata(f.metadata().clone());
+            new_fields.push(new_field);
+            new_cols.push(Arc::new(arr));
+        } else {
+            new_fields.push(f.as_ref().clone());
+            new_cols.push(batch.column(i).clone());
+        }
+    }
+    let new_schema = Arc::new(Schema::new_with_metadata(
+        new_fields,
+        schema.metadata().clone(),
+    ));
+    RecordBatch::try_new(new_schema, new_cols)
+        .expect("large_binary_to_point_fsb: schema swap cannot fail")
 }
 
 fn synthesise_missing_columns(

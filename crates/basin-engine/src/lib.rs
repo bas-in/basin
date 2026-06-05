@@ -3862,4 +3862,108 @@ mod tests {
             speedup,
         );
     }
+
+    // ── PG-Wave-α: POINT + ST_* end-to-end ────────────────────────────────────
+
+    #[tokio::test]
+    async fn point_type_round_trip_via_sql() {
+        // CREATE TABLE with POINT column, INSERT a POINT via ST_MakePoint
+        // and a WKT literal, SELECT back ST_X / ST_Y. Verifies the type
+        // mapping (FixedSizeBinary(21) + BASIN_TYPE=POINT), the
+        // ScalarUDF wiring, and the DML coercion path all line up.
+        use arrow_array::Float64Array;
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+        sess.execute(
+            "CREATE TABLE locs (id BIGINT NOT NULL, p POINT) WITH (basin.file_format='parquet')",
+        )
+        .await
+        .unwrap();
+        sess.execute(
+            "INSERT INTO locs VALUES (1, ST_MakePoint(1.0, 2.0)), (2, 'POINT(3.5 4.25)'), (3, NULL)",
+        )
+        .await
+        .unwrap();
+        let res = sess
+            .execute("SELECT id, ST_X(p) AS x, ST_Y(p) AS y FROM locs ORDER BY id")
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                assert_eq!(total_rows(&batches), 3);
+                assert_eq!(col_i64(&batches, "id"), vec![1, 2, 3]);
+                let xs: Vec<Option<f64>> = batches
+                    .iter()
+                    .flat_map(|b| {
+                        let a = b
+                            .column_by_name("x")
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<Float64Array>()
+                            .unwrap();
+                        (0..a.len()).map(move |i| {
+                            if a.is_null(i) {
+                                None
+                            } else {
+                                Some(a.value(i))
+                            }
+                        })
+                    })
+                    .collect();
+                let ys: Vec<Option<f64>> = batches
+                    .iter()
+                    .flat_map(|b| {
+                        let a = b
+                            .column_by_name("y")
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<Float64Array>()
+                            .unwrap();
+                        (0..a.len()).map(move |i| {
+                            if a.is_null(i) {
+                                None
+                            } else {
+                                Some(a.value(i))
+                            }
+                        })
+                    })
+                    .collect();
+                assert_eq!(xs, vec![Some(1.0), Some(3.5), None]);
+                assert_eq!(ys, vec![Some(2.0), Some(4.25), None]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn gist_index_ddl_parsed_and_stored() {
+        // CREATE INDEX … USING gist (col) on a POINT column. The
+        // catalog must persist `access_method = "gist"` so the compactor
+        // hook + (PG-Wave-β) probe path can find the spatial index.
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("CREATE TABLE locs (id BIGINT NOT NULL, p POINT)")
+            .await
+            .unwrap();
+        sess.execute("CREATE INDEX locs_p_gist ON locs USING gist (p)")
+            .await
+            .unwrap();
+        let table = basin_common::TableName::new("locs").unwrap();
+        let meta = eng
+            .config()
+            .catalog
+            .load_table(&sess.project(), &table)
+            .await
+            .unwrap();
+        let gist = meta
+            .indexes
+            .iter()
+            .find(|i| i.name == "locs_p_gist")
+            .expect("locs_p_gist index must be in catalog");
+        assert_eq!(gist.access_method, "gist");
+        assert_eq!(gist.columns, vec!["p".to_string()]);
+    }
 }

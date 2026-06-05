@@ -12,11 +12,16 @@ basin-storage.workspace = true
 basin-catalog.workspace = true
 basin-wal.workspace = true
 basin-hottier.workspace = true
+# PG-Wave-α: shard compaction hook checks for GIST-on-POINT secondary
+# indexes and writes `.rtree` sidecars. Need `basin_geo::POINT_WKB_LEN`
+# to identify the FixedSizeBinary(21) physical type.
+basin-geo.workspace = true
 
 tokio.workspace = true
 futures.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
+object_store.workspace = true
 arrow.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
@@ -29,4 +34,3 @@ thiserror.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tokio-test.workspace = true
-object_store.workspace = true

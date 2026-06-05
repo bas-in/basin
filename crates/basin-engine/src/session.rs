@@ -341,6 +341,11 @@ pub(crate) fn build_stateless_udf_cache() -> StatelessUdfCache {
     for udf in crate::operators::citext_cmp::citext_udfs() {
         ctx.register_udf((*udf).clone());
     }
+    // PG-Wave-α: PostGIS-shape ST_* UDFs (ST_MakePoint, ST_X, ST_Y,
+    // ST_Distance, ST_DWithin, ST_AsText, ST_AsEWKB, ST_GeomFromText,
+    // ST_GeomFromWKB). Registered last so case-insensitive lookups
+    // resolve to the basin-geo implementation.
+    crate::geo_glue::install_udfs(&ctx);
     let state = ctx.state();
     // Build DataFusion's default optimizer rule list once.  The 27
     // stateless rules are heap-allocated `Arc<dyn OptimizerRule>`; without

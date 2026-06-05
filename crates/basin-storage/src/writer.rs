@@ -273,14 +273,33 @@ pub(crate) async fn write_batch_with_options(
     // every uuid-disguised Decimal256 file already on disk is identifiable
     // by its BASIN_TYPE=UUID field marker.
     let uuid_xlated_owned;
+    let point_xlated_owned;
     let batch_for_encode = match opts.file_format {
-        FileFormat::Vortex => match uuid_fsb_to_decimal256(batch_to_write) {
-            Some(b) => {
-                uuid_xlated_owned = b;
-                &uuid_xlated_owned
+        FileFormat::Vortex => {
+            // First UUID FSB(16) → Decimal256, then POINT FSB(21) →
+            // LargeBinary. The two translations key on disjoint
+            // physical types so order is incidental. The POINT
+            // translation is the write half only — full DataFusion
+            // read-path integration via `vortex_listing_format` is
+            // PG-Wave-β work; today POINT columns only fully round-trip
+            // on `WITH (basin.file_format='parquet')` tables. The write
+            // path is in place so existing Vortex tables that grow a
+            // POINT column don't error during compaction.
+            let after_uuid = match uuid_fsb_to_decimal256(batch_to_write) {
+                Some(b) => {
+                    uuid_xlated_owned = b;
+                    &uuid_xlated_owned
+                }
+                None => batch_to_write,
+            };
+            match point_fsb_to_large_binary(after_uuid) {
+                Some(b) => {
+                    point_xlated_owned = b;
+                    &point_xlated_owned
+                }
+                None => after_uuid,
             }
-            None => batch_to_write,
-        },
+        }
         FileFormat::Parquet => batch_to_write,
     };
     let bytes = match opts.file_format {
@@ -445,6 +464,13 @@ const BASIN_TYPE_KEY: &str = "BASIN_TYPE";
 /// `basin_engine::types::BASIN_TYPE_UUID`.
 const BASIN_TYPE_UUID: &str = "UUID";
 
+/// PG-Wave-α: `BASIN_TYPE` value for POINT columns. Mirrors
+/// `basin_engine::types::BASIN_TYPE_POINT`. Stored physical type at the
+/// catalog level is `FixedSizeBinary(21)`; we reinterpret it as
+/// `LargeBinary` for Vortex (which has no FSB(N) encoder) and rebuild
+/// the FSB layout on read.
+const BASIN_TYPE_POINT: &str = "POINT";
+
 /// Returns `true` iff `field` carries the `BASIN_TYPE=UUID` marker AND has
 /// the physical type `FixedSizeBinary(16)` (the catalog-declared shape for
 /// UUID). Both predicates must hold so an unrelated `FixedSizeBinary(16)`
@@ -541,6 +567,72 @@ fn uuid_fsb_to_decimal256(batch: &RecordBatch) -> Option<RecordBatch> {
     Some(
         RecordBatch::try_new(new_schema, new_cols)
             .expect("uuid_fsb_to_decimal256: metadata-only schema replacement cannot fail"),
+    )
+}
+
+/// PG-Wave-α: returns `true` iff `field` is a POINT column —
+/// `FixedSizeBinary(21)` with `BASIN_TYPE=POINT`. Both must hold so an
+/// unrelated FSB(21) column isn't miscoerced.
+fn field_is_point_fsb(field: &Field) -> bool {
+    matches!(field.data_type(), DataType::FixedSizeBinary(n) if *n == basin_geo::POINT_WKB_LEN as i32)
+        && field.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_POINT)
+}
+
+/// PG-Wave-α — write-side reinterpretation. Vortex 0.71 has no
+/// `FixedSizeBinary(N)` encoder; reinterpret POINT FSB(21) columns as
+/// `LargeBinary` for Vortex. Field metadata (BASIN_TYPE=POINT) is
+/// preserved so the read path can rebuild FSB(21).
+///
+/// Returns `None` when no column needs translation — caller reuses the
+/// original batch without an Arc-clone.
+///
+/// TODO(adr-0024 follow-up): drop when Vortex grows native FSB(N)
+/// encoding. The on-disk file is identifiable by its BASIN_TYPE=POINT
+/// marker.
+fn point_fsb_to_large_binary(batch: &RecordBatch) -> Option<RecordBatch> {
+    use arrow_array::{FixedSizeBinaryArray, LargeBinaryArray};
+
+    let schema = batch.schema();
+    let needs_xlate = schema.fields().iter().any(|f| field_is_point_fsb(f));
+    if !needs_xlate {
+        return None;
+    }
+    let mut new_fields: Vec<Field> = Vec::with_capacity(schema.fields().len());
+    let mut new_cols: Vec<arrow_array::ArrayRef> = Vec::with_capacity(batch.num_columns());
+    for (i, f) in schema.fields().iter().enumerate() {
+        if field_is_point_fsb(f) {
+            let src = batch
+                .column(i)
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .expect("POINT column must be FixedSizeBinaryArray");
+            let len = src.len();
+            let mut builder =
+                arrow_array::builder::LargeBinaryBuilder::with_capacity(len, len * basin_geo::POINT_WKB_LEN);
+            for r in 0..len {
+                if src.is_null(r) {
+                    builder.append_null();
+                } else {
+                    builder.append_value(src.value(r));
+                }
+            }
+            let arr: LargeBinaryArray = builder.finish();
+            let new_field = Field::new(f.name(), DataType::LargeBinary, f.is_nullable())
+                .with_metadata(f.metadata().clone());
+            new_fields.push(new_field);
+            new_cols.push(std::sync::Arc::new(arr));
+        } else {
+            new_fields.push(f.as_ref().clone());
+            new_cols.push(batch.column(i).clone());
+        }
+    }
+    let new_schema = std::sync::Arc::new(Schema::new_with_metadata(
+        new_fields,
+        schema.metadata().clone(),
+    ));
+    Some(
+        RecordBatch::try_new(new_schema, new_cols)
+            .expect("point_fsb_to_large_binary: metadata-only schema replacement cannot fail"),
     )
 }
 
