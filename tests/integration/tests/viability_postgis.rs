@@ -30,9 +30,17 @@
 
 #![allow(clippy::print_stdout)]
 
+use std::sync::Arc;
+
+use basin_catalog::InMemoryCatalog;
+use basin_common::ProjectId;
+use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_geo::{decode_point, dwithin, encode_point, haversine_meters, Point, POINT_WKB_LEN};
 use basin_integration_tests::benchmark::{report_viability, BarOp, PrimaryMetric};
+use basin_storage::{Storage, StorageConfig};
+use object_store::local::LocalFileSystem;
 use serde_json::json;
+use tempfile::TempDir;
 
 /// Centroid-ish reference point near Paris, used as the radius origin
 /// for the `ST_DWithin` portion of the test.
@@ -163,4 +171,81 @@ async fn viability_postgis() {
     );
 
     assert!(pass);
+}
+
+// ---------------------------------------------------------------------------
+// SQL end-to-end: PG-Wave 3 ST_Intersects exercised through the engine
+// ---------------------------------------------------------------------------
+
+async fn open_engine() -> (TempDir, Engine) {
+    let dir = TempDir::new().unwrap();
+    let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+    let storage = Storage::new(StorageConfig {
+        object_store: Arc::new(fs),
+        root_prefix: None,
+        disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
+        page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
+    });
+    let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
+    let engine = Engine::new(EngineConfig {
+        storage,
+        catalog,
+        shard: None,
+    });
+    (dir, engine)
+}
+
+/// End-to-end SQL test for PG-Wave 3 ST_Intersects UDF.
+///
+/// ```sql
+/// CREATE TABLE t (p POINT) WITH (basin.file_format='parquet');
+/// INSERT INTO t VALUES (ST_MakePoint(1.0, 2.0)), (ST_MakePoint(3.0, 4.0));
+/// SELECT ST_Intersects(p, ST_MakePoint(1.0, 2.0)) FROM t ORDER BY ST_X(p);
+/// -- expect: [true, false]
+/// ```
+#[tokio::test]
+async fn st_intersects_sql_end_to_end() {
+    let (_dir, engine) = open_engine().await;
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    sess.execute(
+        "CREATE TABLE t (p POINT) WITH (basin.file_format='parquet')",
+    )
+    .await
+    .unwrap();
+
+    sess.execute(
+        "INSERT INTO t VALUES (ST_MakePoint(1.0, 2.0)), (ST_MakePoint(3.0, 4.0))",
+    )
+    .await
+    .unwrap();
+
+    let result = sess
+        .execute("SELECT ST_Intersects(p, ST_MakePoint(1.0, 2.0)) FROM t ORDER BY ST_X(p)")
+        .await
+        .unwrap();
+
+    let batches = match result {
+        ExecResult::Rows { batches, .. } => batches,
+        other => panic!("expected Rows, got {other:?}"),
+    };
+
+    // Flatten all rows across batches.
+    let mut values: Vec<bool> = Vec::new();
+    for batch in &batches {
+        let col = batch.column(0);
+        let bools = col
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .unwrap_or_else(|| panic!("expected BooleanArray, got {:?}", col.data_type()));
+        for i in 0..bools.len() {
+            values.push(bools.value(i));
+        }
+    }
+
+    println!(
+        "[ST_Intersects SQL] result = {:?} (expect [true, false])",
+        values
+    );
+    assert_eq!(values, vec![true, false], "ST_Intersects result mismatch");
 }

@@ -124,6 +124,11 @@ bincode = "1.3"
 # already in arrow). See docs/postgis-rtree-design.md §6.
 rstar = { version = "0.12", features = ["serde"] }
 
+# Pure-Rust geometry algorithms backing the PG-Wave 3 ST_* predicate library.
+# MIT/Apache dual-licence. `default-features = false` drops the optional
+# spatial-index features (rstar, spade) that basin manages itself.
+geo = { version = "0.28", default-features = false }
+
 # Bounded LRU caches: parquet footer metadata in basin-storage::reader and
 # parsed HNSW segments in basin-storage::vector_index. Keeps hot reads off
 # the metadata round-trip / re-parse path.

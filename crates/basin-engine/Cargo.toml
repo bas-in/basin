@@ -101,6 +101,8 @@ dashmap = "6"
 lru.workspace = true
 # Snowball English stemmer for FTS to_tsvector (Phase 5.20.C).
 rust-stemmers.workspace = true
+# Pure-Rust geometry algorithms for PG-Wave 3 ST_* predicates (geo_glue.rs).
+geo.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
