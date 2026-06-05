@@ -72,10 +72,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod epsg_table;
 pub mod geojson;
+pub mod transform;
 pub mod types;
 pub mod wkb;
 
+pub use transform::{st_transform, st_transform_xy, GeoError as TransformError};
 pub use types::{Box2d, GeometryError, LineString, Point, Polygon, SRID_WGS84};
 pub use wkb::{decode_point, encode_point, from_hex, to_hex, WkbError, POINT_WKB_LEN};
 

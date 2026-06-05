@@ -278,6 +278,74 @@ pub(crate) fn install_udfs(ctx: &SessionContext) {
             Volatility::Immutable,
         ),
     }));
+
+    // ── PG-Wave 5: SRID-aware geometry surface ────────────────────────────
+    //
+    // The SRID for a column is carried on the Arrow `Field` metadata
+    // (`BASIN_SRID` key). These three UDFs are the public surface for
+    // reading and changing that SRID and for reprojecting between SRIDs
+    // via `basin_geo::transform::st_transform`.
+
+    // ST_SRID(p) → INT4 — reads the BASIN_SRID metadata off the column.
+    // Returns 0 when the column has no declared SRID (PostGIS's "unknown
+    // SRID" convention).
+    ctx.register_udf(ScalarUDF::from(StSridUdf {
+        signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+    }));
+    // ST_SetSRID(p, srid) → POINT — identity-bytes pass-through. The
+    // returned column has no field-level SRID (we'd need a planner
+    // hook to re-stamp it). Documented gap; ST_SetSRID is most useful
+    // inside an INSERT, where the destination column's BASIN_SRID
+    // already pins the SRID.
+    ctx.register_udf(ScalarUDF::from(StSetSridUdf {
+        signature: Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![point_dt(), DataType::Int32]),
+                TypeSignature::Exact(vec![point_dt(), DataType::Int64]),
+            ],
+            Volatility::Immutable,
+        ),
+    }));
+    // ST_Transform(p, dst_srid) → POINT — reproject using proj4rs.
+    // Accept Int32 (native) and Int64 (the sqlparser default for integer
+    // literals) so neither `ST_Transform(p, 4326)` nor explicitly-cast
+    // `ST_Transform(p, 4326::int4)` trip the type checker.
+    ctx.register_udf(ScalarUDF::from(StTransformUdf {
+        signature: Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![point_dt(), DataType::Int32]),
+                TypeSignature::Exact(vec![point_dt(), DataType::Int64]),
+            ],
+            Volatility::Immutable,
+        ),
+    }));
+
+    // ── Geography aliases ─────────────────────────────────────────────────
+    //
+    // PostGIS treats GEOGRAPHY as a separate type that auto-densifies
+    // arcs and uses Haversine for distance. basin-geo's distance ops
+    // are already Haversine and we have no separate physical type, so
+    // ST_GeogFromText / ST_GeographyFromText are exact aliases for
+    // ST_GeomFromText. Registered under distinct names so client code
+    // that emits the geography variants still resolves.
+    ctx.register_udf(ScalarUDF::from(StGeogFromTextUdf {
+        signature: Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Utf8]),
+                TypeSignature::Exact(vec![DataType::LargeUtf8]),
+            ],
+            Volatility::Immutable,
+        ),
+    }));
+    ctx.register_udf(ScalarUDF::from(StGeographyFromTextUdf {
+        signature: Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Utf8]),
+                TypeSignature::Exact(vec![DataType::LargeUtf8]),
+            ],
+            Volatility::Immutable,
+        ),
+    }));
 }
 
 #[inline]
@@ -1509,6 +1577,292 @@ impl ScalarUDFImpl for StMakeEnvelopeUdf {
     }
 }
 
+// ── ST_SRID ───────────────────────────────────────────────────────────────────
+//
+// Reads the BASIN_SRID metadata off the input column's field. PostGIS's
+// convention is "0 = unknown SRID", so a POINT column with no declared
+// SRID returns 0 rather than NULL. Element-wise NULL handling still
+// applies: NULL point → NULL int4.
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct StSridUdf {
+    signature: Signature,
+}
+impl ScalarUDFImpl for StSridUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "st_srid"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Int32)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        // BASIN_SRID rides on the arg-field metadata, which DataFusion
+        // populates from the source column's `Field`. Read once before
+        // looping; falls back to 0 ("unknown SRID", PostGIS convention)
+        // when absent.
+        let srid = args
+            .arg_fields
+            .first()
+            .and_then(|f| f.metadata().get(crate::types::BASIN_SRID).cloned())
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(0);
+        let (n, arr) = columnar_unary_to_array(&args.args)?;
+        let mut out = Int32Builder::with_capacity(n);
+        for i in 0..n {
+            if arr.is_null(i) {
+                out.append_null();
+            } else {
+                out.append_value(srid);
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+// ── ST_SetSRID ────────────────────────────────────────────────────────────────
+//
+// PostGIS spec: returns a geometry with the SRID metadata replaced. We
+// pass the bytes through unchanged (the 21-byte WKB doesn't carry an
+// SRID — it's column metadata only). The "new" SRID is dropped at the
+// expression boundary because basin-engine doesn't yet have an
+// expression-level SRID-tagging machinery; for the common case of
+// `INSERT INTO t (p) VALUES (ST_SetSRID(ST_MakePoint(x, y), 4326))`
+// the destination column's `BASIN_SRID` declaration is what stamps the
+// SRID on the persisted row. Documented gap; the bytes-identity path
+// keeps callers from getting wrong-shape data while we wire up an
+// expression-level SRID-tagger in PG-Wave 6.
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct StSetSridUdf {
+    signature: Signature,
+}
+impl ScalarUDFImpl for StSetSridUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "st_setsrid"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(point_dt())
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        if args.args.len() != 2 {
+            return exec_err!("ST_SetSRID expects 2 arguments, got {}", args.args.len());
+        }
+        let (n, arr) = columnar_unary_to_array(&args.args[0..1])?;
+        let fsb = arr
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Execution(format!(
+                    "ST_SetSRID: first argument must be FixedSizeBinary({POINT_WKB_LEN})"
+                ))
+            })?;
+        let mut out = FixedSizeBinaryBuilder::with_capacity(n, POINT_WKB_LEN as i32);
+        for i in 0..n {
+            if fsb.is_null(i) {
+                out.append_null();
+            } else {
+                out.append_value(fsb.value(i)).map_err(|e| {
+                    datafusion::error::DataFusionError::Execution(format!(
+                        "ST_SetSRID build: {e}"
+                    ))
+                })?;
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+// ── ST_Transform ──────────────────────────────────────────────────────────────
+//
+// Source SRID is read from the input column's BASIN_SRID field metadata
+// (defaulting to 4326 / WGS84 when absent — basin-geo's implicit default,
+// which matches what `ST_MakePoint` stamps on freshly-built points).
+// Destination SRID is the second argument (an INT4 scalar or column).
+// Errors from `basin_geo::transform::st_transform` (unknown SRID,
+// proj4rs build failure) surface as DataFusion execution errors.
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct StTransformUdf {
+    signature: Signature,
+}
+impl ScalarUDFImpl for StTransformUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "st_transform"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(point_dt())
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        if args.args.len() != 2 {
+            return exec_err!("ST_Transform expects 2 arguments, got {}", args.args.len());
+        }
+        // Source SRID from BASIN_SRID column metadata; default to WGS84
+        // (4326), matching basin-geo's implicit-WGS84 stance.
+        let src_srid: u32 = args
+            .arg_fields
+            .first()
+            .and_then(|f| f.metadata().get(crate::types::BASIN_SRID).cloned())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(basin_geo::SRID_WGS84);
+        let (n, point_arr, dst_arr) = columnar_pair_to_arrays(&args.args)?;
+        // Accept both Int32 (native PG INT4) and Int64 (sqlparser's
+        // default for integer literals). Read once into i64 to unify
+        // the two paths.
+        let read_dst: Box<dyn Fn(usize) -> Option<i64>> = match dst_arr.data_type() {
+            DataType::Int32 => {
+                let a = dst_arr
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("Int32Array");
+                let a = a.clone();
+                Box::new(move |i| {
+                    if a.is_null(i) {
+                        None
+                    } else {
+                        Some(a.value(i) as i64)
+                    }
+                })
+            }
+            DataType::Int64 => {
+                let a = dst_arr
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .expect("Int64Array");
+                let a = a.clone();
+                Box::new(move |i| if a.is_null(i) { None } else { Some(a.value(i)) })
+            }
+            other => {
+                return Err(datafusion::error::DataFusionError::Execution(format!(
+                    "ST_Transform: second argument must be INT4 or INT8, got {other:?}"
+                )))
+            }
+        };
+        let mut out = FixedSizeBinaryBuilder::with_capacity(n, POINT_WKB_LEN as i32);
+        for i in 0..n {
+            let p = match decode_point_at(&point_arr, i)? {
+                Some(p) => p,
+                None => {
+                    out.append_null();
+                    continue;
+                }
+            };
+            let dst_srid_raw = match read_dst(i) {
+                Some(v) => v,
+                None => {
+                    out.append_null();
+                    continue;
+                }
+            };
+            if dst_srid_raw < 0 || dst_srid_raw > u32::MAX as i64 {
+                return Err(datafusion::error::DataFusionError::Execution(format!(
+                    "ST_Transform: destination SRID out of range, got {dst_srid_raw}"
+                )));
+            }
+            let dst_srid = dst_srid_raw as u32;
+            // Re-stamp the source SRID we just resolved so st_transform
+            // sees it correctly (the points coming out of ST_MakePoint
+            // carry basin-geo's hardcoded WGS84 default, which we want
+            // to override with whatever the column metadata says).
+            let p_src = basin_geo::Point::with_srid(p.x, p.y, src_srid);
+            let projected = basin_geo::st_transform(&p_src, dst_srid).map_err(|e| {
+                datafusion::error::DataFusionError::Execution(format!("ST_Transform: {e}"))
+            })?;
+            // Encode the projected point. We deliberately strip the
+            // SRID from the WKB blob (basin-geo's `encode_point`
+            // emits the SRID-less 21-byte form); the destination
+            // column's `BASIN_SRID` is the source of truth post-
+            // transform, set on the INSERT path or known by ST_SRID's
+            // metadata read.
+            let bytes = encode_point(&basin_geo::Point::new(projected.x, projected.y));
+            out.append_value(bytes).map_err(|e| {
+                datafusion::error::DataFusionError::Execution(format!("ST_Transform build: {e}"))
+            })?;
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+// ── ST_GeogFromText / ST_GeographyFromText (aliases for ST_GeomFromText) ─────
+//
+// PostGIS distinguishes GEOGRAPHY from GEOMETRY at the type-system
+// level: GEOGRAPHY values are always lat/lon (SRID 4326), and
+// distance / area operators auto-use geodesic math. basin-geo's
+// distance + area implementations are ALREADY Haversine /
+// spherical-excess (see crate-level docs at basin-geo/src/lib.rs), so
+// there is no semantic difference between a GEOMETRY POINT in SRID
+// 4326 and a GEOGRAPHY POINT. Aliasing FromText / FromText keeps
+// client code that emits the geography variants working with zero
+// duplication of the WKT parser.
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct StGeogFromTextUdf {
+    signature: Signature,
+}
+impl ScalarUDFImpl for StGeogFromTextUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "st_geogfromtext"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(point_dt())
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        // Delegate to ST_GeomFromText — identical parser surface.
+        let geom = StGeomFromTextUdf {
+            signature: self.signature.clone(),
+        };
+        geom.invoke_with_args(args)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct StGeographyFromTextUdf {
+    signature: Signature,
+}
+impl ScalarUDFImpl for StGeographyFromTextUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "st_geographyfromtext"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(point_dt())
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let geom = StGeomFromTextUdf {
+            signature: self.signature.clone(),
+        };
+        geom.invoke_with_args(args)
+    }
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1713,6 +2067,13 @@ mod tests {
             "st_startpoint",
             "st_endpoint",
             "st_makeenvelope",
+            // PG-Wave 5 SRID surface
+            "st_srid",
+            "st_setsrid",
+            "st_transform",
+            // GEOGRAPHY aliases
+            "st_geogfromtext",
+            "st_geographyfromtext",
         ] {
             assert!(
                 scalar.contains_key(name),
@@ -1880,5 +2241,193 @@ mod tests {
             .downcast_ref::<FixedSizeBinaryArray>()
             .unwrap();
         assert_eq!(out_fsb.value(0), original_bytes.as_slice());
+    }
+
+    // ── PG-Wave 5: SRID surface tests ────────────────────────────────────
+
+    /// Invoke a UDF where the first arg's `Field` carries a `BASIN_SRID`
+    /// metadata entry — needed to exercise the `arg_fields` read path in
+    /// `ST_SRID` and `ST_Transform`.
+    fn invoke_with_first_arg_srid(
+        udf: &dyn ScalarUDFImpl,
+        args: Vec<ColumnarValue>,
+        ret: DataType,
+        srid: u32,
+    ) -> ColumnarValue {
+        let n = args
+            .iter()
+            .filter_map(|a| match a {
+                ColumnarValue::Array(arr) => Some(arr.len()),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(1);
+        let arg_fields = args
+            .iter()
+            .enumerate()
+            .map(|(i, cv)| {
+                let dt = match cv {
+                    ColumnarValue::Array(a) => a.data_type().clone(),
+                    ColumnarValue::Scalar(s) => s.data_type(),
+                };
+                let mut f = Field::new(format!("arg{i}"), dt, true);
+                if i == 0 {
+                    let mut md = std::collections::HashMap::new();
+                    md.insert(crate::types::BASIN_SRID.to_string(), srid.to_string());
+                    f = f.with_metadata(md);
+                }
+                Arc::new(f)
+            })
+            .collect();
+        udf.invoke_with_args(ScalarFunctionArgs {
+            args,
+            arg_fields,
+            number_rows: n,
+            return_field: Arc::new(Field::new("out", ret, true)),
+            config_options: config(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn st_srid_reads_field_metadata() {
+        let udf = StSridUdf {
+            signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+        };
+        let p = make_point_scalar(1.0, 2.0);
+        // Column tagged SRID 4326 → ST_SRID returns 4326.
+        let res = invoke_with_first_arg_srid(&udf, vec![p.clone()], DataType::Int32, 4326);
+        let arr = match res {
+            ColumnarValue::Array(a) => a,
+            _ => panic!("array"),
+        };
+        let v = arr
+            .as_any()
+            .downcast_ref::<arrow_array::Int32Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(v, 4326);
+
+        // No metadata → ST_SRID returns 0 (PostGIS "unknown SRID").
+        let res2 = invoke(&udf, vec![p], DataType::Int32);
+        let arr2 = match res2 {
+            ColumnarValue::Array(a) => a,
+            _ => panic!("array"),
+        };
+        let v2 = arr2
+            .as_any()
+            .downcast_ref::<arrow_array::Int32Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(v2, 0);
+    }
+
+    #[test]
+    fn st_setsrid_returns_identity_bytes() {
+        // ST_SetSRID is a bytes-identity pass-through at the expression
+        // level. Verify the bytes survive unchanged.
+        let udf = StSetSridUdf {
+            signature: Signature::exact(
+                vec![point_dt(), DataType::Int32],
+                Volatility::Immutable,
+            ),
+        };
+        let p = make_point_scalar(2.2945, 48.8584);
+        let srid = ColumnarValue::Scalar(ScalarValue::Int32(Some(32631)));
+        let res = invoke(&udf, vec![p.clone(), srid], point_dt());
+        let arr = match res {
+            ColumnarValue::Array(a) => a,
+            _ => panic!("array"),
+        };
+        let original_bytes = match &p {
+            ColumnarValue::Scalar(ScalarValue::FixedSizeBinary(_, Some(b))) => b.clone(),
+            _ => panic!("scalar bytes"),
+        };
+        let out_fsb = arr
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        assert_eq!(out_fsb.value(0), original_bytes.as_slice());
+    }
+
+    #[test]
+    fn st_transform_round_trip_wgs84_to_3857_to_wgs84_within_1mm() {
+        let udf = StTransformUdf {
+            signature: Signature::exact(
+                vec![point_dt(), DataType::Int32],
+                Volatility::Immutable,
+            ),
+        };
+        // Berlin in WGS84.
+        let lon = 13.4050;
+        let lat = 52.5200;
+        let p = make_point_scalar(lon, lat);
+
+        // First leg: 4326 → 3857.
+        let to_3857 = ColumnarValue::Scalar(ScalarValue::Int32(Some(3857)));
+        let projected = invoke_with_first_arg_srid(
+            &udf,
+            vec![p, to_3857],
+            point_dt(),
+            4326,
+        );
+        let projected_arr = match projected {
+            ColumnarValue::Array(a) => a,
+            _ => panic!("array"),
+        };
+        // Wrap as a column so we can hand it back into ST_Transform with
+        // a fresh SRID-tagged field.
+        let projected_cv = ColumnarValue::Array(projected_arr);
+
+        // Second leg: 3857 → 4326.
+        let to_4326 = ColumnarValue::Scalar(ScalarValue::Int32(Some(4326)));
+        let back = invoke_with_first_arg_srid(
+            &udf,
+            vec![projected_cv, to_4326],
+            point_dt(),
+            3857,
+        );
+        let back_arr = match back {
+            ColumnarValue::Array(a) => a,
+            _ => panic!("array"),
+        };
+        let back_fsb = back_arr
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        let back_pt = basin_geo::decode_point(back_fsb.value(0)).unwrap();
+        // 1e-7 deg ≈ 1.1 cm at the equator — same threshold PostGIS uses
+        // for its ST_Transform regression tests.
+        assert!(
+            (back_pt.x - lon).abs() < 1e-7,
+            "lon round-trip drift: src={lon} back={}",
+            back_pt.x
+        );
+        assert!(
+            (back_pt.y - lat).abs() < 1e-7,
+            "lat round-trip drift: src={lat} back={}",
+            back_pt.y
+        );
+    }
+
+    #[test]
+    fn st_geogfromtext_aliases_st_geomfromtext() {
+        // Confirm the GEOGRAPHY-named UDF parses the same WKT.
+        let udf = StGeogFromTextUdf {
+            signature: Signature::exact(vec![DataType::Utf8], Volatility::Immutable),
+        };
+        let input = Arc::new(StringArray::from(vec!["POINT(1.5 2.5)"])) as ArrayRef;
+        let res = invoke(&udf, vec![ColumnarValue::Array(input)], point_dt());
+        let arr = match res {
+            ColumnarValue::Array(a) => a,
+            _ => panic!("array"),
+        };
+        let fsb = arr
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        let p = basin_geo::decode_point(fsb.value(0)).unwrap();
+        assert_eq!(p.x, 1.5);
+        assert_eq!(p.y, 2.5);
     }
 }

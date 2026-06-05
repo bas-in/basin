@@ -20,6 +20,13 @@ thiserror.workspace = true
 # are planar / Cartesian and would silently drop us into degree-units
 # accuracy near the poles. WGS84-correct surface-area and great-circle
 # arc length are computed directly in this crate against `EARTH_RADIUS_M`.
-geo = "0.33"
+# Pinned via workspace deps so basin-engine sees the same version
+# (avoids the previous 0.28-in-workspace + 0.33-in-basin-geo duplicate-
+# version compile).
+geo.workspace = true
+
+# Pure-Rust PROJ4 backing `transform::st_transform`. See workspace
+# Cargo.toml for the rationale (no native deps, no NTv2 datum grids).
+proj4rs.workspace = true
 
 [dev-dependencies]

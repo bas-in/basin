@@ -127,7 +127,20 @@ rstar = { version = "0.12", features = ["serde"] }
 # Pure-Rust geometry algorithms backing the PG-Wave 3 ST_* predicate library.
 # MIT/Apache dual-licence. `default-features = false` drops the optional
 # spatial-index features (rstar, spade) that basin manages itself.
-geo = { version = "0.28", default-features = false }
+# Pinned to 0.33 across the workspace (was previously dual-pinned at 0.28
+# in workspace deps + 0.33 in basin-geo's local Cargo.toml, causing a
+# duplicate-version compile). 0.33 keeps the same `Intersects` / `Within`
+# trait surface basin-engine::geo_glue uses against POINT × POINT; the
+# topology trait signatures are unchanged 0.28 → 0.33.
+geo = { version = "0.33", default-features = false }
+
+# Pure-Rust PROJ4 implementation. Powers `ST_Transform` and the
+# `basin_geo::transform` module. Zero native deps — no libproj system
+# package required on the Fly.io build image. Supports the
+# PROJ4-string-representable SRID universe (UTM, Lambert Conformal,
+# Mercator, Albers, Web Mercator, common national grids, WGS84/NAD83).
+# Does NOT support NTv2 / NADCON datum-shift grids — documented.
+proj4rs = "0.1"
 
 # Bounded LRU caches: parquet footer metadata in basin-storage::reader and
 # parsed HNSW segments in basin-storage::vector_index. Keeps hot reads off

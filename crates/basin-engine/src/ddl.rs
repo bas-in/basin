@@ -13,16 +13,17 @@ use sqlparser::ast::{
 
 use crate::lifecycle::CreateTableLifecycle;
 use crate::types::{
-    arrow_data_type, basin_type_marker, charlen_marker, is_cidr_sql, is_daterange_sql, is_inet_sql,
-    is_int4range_sql, is_int8range_sql, is_macaddr8_sql, is_macaddr_sql, is_money_sql,
-    is_numrange_sql, is_tsrange_sql, is_tstzrange_sql, is_xml_sql, serial_kind,
-    BASIN_AUDIT_TABLE_KEY, BASIN_AUTO_UPDATE_KEY, BASIN_CHARLEN_KEY, BASIN_COLUMN_DEFAULT,
-    BASIN_GENERATED_AS, BASIN_IDENTITY, BASIN_IDENTITY_ALWAYS, BASIN_IDENTITY_BY_DEFAULT,
-    BASIN_IDENTITY_SEQ, BASIN_SOFT_DELETE_KEY, BASIN_TYPE_CIDR, BASIN_TYPE_DATERANGE,
-    BASIN_TYPE_INET, BASIN_TYPE_INT4RANGE, BASIN_TYPE_INT8RANGE, BASIN_TYPE_JSONB, BASIN_TYPE_KEY,
+    arrow_data_type, basin_type_marker, charlen_marker, geometry_srid_marker, is_cidr_sql,
+    is_daterange_sql, is_inet_sql, is_int4range_sql, is_int8range_sql, is_macaddr8_sql,
+    is_macaddr_sql, is_money_sql, is_numrange_sql, is_tsrange_sql, is_tstzrange_sql, is_xml_sql,
+    serial_kind, BASIN_AUDIT_TABLE_KEY, BASIN_AUTO_UPDATE_KEY, BASIN_CHARLEN_KEY,
+    BASIN_COLUMN_DEFAULT, BASIN_GENERATED_AS, BASIN_IDENTITY, BASIN_IDENTITY_ALWAYS,
+    BASIN_IDENTITY_BY_DEFAULT, BASIN_IDENTITY_SEQ, BASIN_SOFT_DELETE_KEY, BASIN_SRID,
+    BASIN_TYPE_CIDR, BASIN_TYPE_CITEXT, BASIN_TYPE_DATERANGE, BASIN_TYPE_INET,
+    BASIN_TYPE_INT4RANGE, BASIN_TYPE_INT8RANGE, BASIN_TYPE_JSONB, BASIN_TYPE_KEY,
     BASIN_TYPE_MACADDR, BASIN_TYPE_MACADDR8, BASIN_TYPE_MONEY, BASIN_TYPE_NUMRANGE,
-    BASIN_TYPE_CITEXT, BASIN_TYPE_TSQUERY, BASIN_TYPE_TSRANGE, BASIN_TYPE_TSTZRANGE,
-    BASIN_TYPE_TSVECTOR, BASIN_TYPE_UUID, BASIN_TYPE_XML,
+    BASIN_TYPE_TSQUERY, BASIN_TYPE_TSRANGE, BASIN_TYPE_TSTZRANGE, BASIN_TYPE_TSVECTOR,
+    BASIN_TYPE_UUID, BASIN_TYPE_XML,
 };
 
 /// One implicit sequence promised by a `SERIAL` / `BIGSERIAL` /
@@ -594,6 +595,14 @@ pub(crate) fn schema_and_constraints_from_columns(
         // columns) so it is inserted unconditionally when present.
         if let Some(cl) = charlen_marker(&col.data_type) {
             md.insert(BASIN_CHARLEN_KEY.to_string(), cl);
+        }
+        // BASIN_SRID — column-level Spatial Reference IDentifier for
+        // `GEOMETRY(POINT, srid)` columns. Bare `POINT` and
+        // `GEOMETRY(POINT)` get nothing here (= "unknown SRID", read as
+        // 0 by ST_SRID per PostGIS convention). Zero per-row storage
+        // cost — the SRID is column metadata, not per-row.
+        if let Some(srid) = geometry_srid_marker(&col.data_type) {
+            md.insert(BASIN_SRID.to_string(), srid.to_string());
         }
         if let Some(expr_text) = generated_expr.as_ref() {
             md.insert(BASIN_GENERATED_AS.to_string(), expr_text.clone());

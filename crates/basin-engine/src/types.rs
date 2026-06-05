@@ -65,6 +65,25 @@ pub const BASIN_TYPE_XML: &str = "XML";
 /// in text format; binary-format clients can read the raw 21 bytes).
 pub const BASIN_TYPE_POINT: &str = "POINT";
 
+/// Per-column SRID for PostGIS-shape geometry columns.
+///
+/// Stored as Arrow `Field` metadata under this key with a decimal-string
+/// value (e.g. `"4326"`). Zero per-row cost — the WKB blob in
+/// `FixedSizeBinary(21)` stays bit-identical regardless of declared SRID;
+/// the SRID rides on the column schema, not on individual rows.
+///
+/// Set by `ddl::schema_from_columns` when the DDL spells out an explicit
+/// SRID (e.g. `GEOMETRY(POINT, 4326)`). Read by:
+/// - `ST_SRID(p)` UDF — returns the declared SRID (or 0 if missing,
+///   matching PostGIS's "unknown SRID" convention).
+/// - `ST_Transform(p, dst)` UDF — uses it as the source SRID for the
+///   reprojection.
+///
+/// Bare `POINT` columns (no SRID) get no metadata entry and behave
+/// exactly as before this constant was introduced (implicit WGS84 at
+/// the Rust level, "unknown SRID = 0" at the SQL level).
+pub const BASIN_SRID: &str = "BASIN_SRID";
+
 /// `CITEXT` — case-insensitive text. Stored as plain `Utf8` in Arrow; the
 /// marker tells comparison operators, UNIQUE enforcement, and ORDER BY to
 /// apply case-folding (lower()) before comparing values. PG OID 25 (same as
@@ -871,6 +890,17 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
                 "POINT" if modifiers.is_empty() => Ok(DataType::FixedSizeBinary(
                     basin_geo::POINT_WKB_LEN as i32,
                 )),
+                // ── GEOMETRY(POINT [, srid]) ─────────────────────────────
+                // PostGIS-style parameterised geometry. Today we accept
+                // exactly the POINT subtype; LineString / Polygon are
+                // physical-storage gaps tracked in the basin-geo v0.2
+                // roadmap. The optional SRID modifier is recorded as
+                // BASIN_SRID column metadata by `basin_type_marker`
+                // (zero per-row cost — the WKB blob is unchanged).
+                "GEOMETRY" => {
+                    parse_geometry_modifiers(modifiers)?;
+                    Ok(DataType::FixedSizeBinary(basin_geo::POINT_WKB_LEN as i32))
+                }
                 _ => Err(BasinError::InvalidSchema(format!(
                     "unsupported custom type: {name}"
                 ))),
@@ -1009,8 +1039,91 @@ pub(crate) fn basin_type_marker(sql: &SqlDataType) -> Option<String> {
         // POINT — PostGIS-style 2D point stored as 21-byte WKB
         // (FixedSizeBinary(21)).
         "POINT" if modifiers.is_empty() => Some(BASIN_TYPE_POINT.to_string()),
+        // GEOMETRY(POINT [, srid]) — same physical column as bare POINT,
+        // BASIN_TYPE marker recovered the same way. SRID (if any) rides
+        // on a separate BASIN_SRID metadata key set by
+        // ddl::schema_from_columns, NOT here, because basin_type_marker
+        // returns a single BASIN_TYPE value and the SRID needs its own
+        // key.
+        "GEOMETRY" => {
+            // Validate the modifier list parses; we only commit to the
+            // POINT subtype today. parse_geometry_modifiers returns an
+            // error for unsupported subtypes (LINESTRING / POLYGON) and
+            // for malformed SRID literals.
+            parse_geometry_modifiers(modifiers).ok()?;
+            Some(BASIN_TYPE_POINT.to_string())
+        }
         _ => None,
     }
+}
+
+/// Returned by [`parse_geometry_modifiers`] for `GEOMETRY(...)` DDL.
+/// `subtype_kw` is always `"POINT"` today; `srid` is `None` for a bare
+/// `GEOMETRY(POINT)` and `Some(n)` for `GEOMETRY(POINT, n)`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct GeometryModifiers {
+    pub subtype_kw: String,
+    pub srid: Option<u32>,
+}
+
+/// Parse the `modifiers` list of a `GEOMETRY(...)` DDL spec.
+///
+/// Accepted forms:
+/// - `GEOMETRY(POINT)` — modifiers = `["POINT"]`
+/// - `GEOMETRY(POINT, 4326)` — modifiers = `["POINT", "4326"]`
+///
+/// Returns `InvalidSchema` for anything else (e.g. unsupported subtype,
+/// missing subtype, non-integer SRID, too many modifiers). Keeping the
+/// surface narrow now means a future widening to LineString/Polygon is
+/// an additive change here rather than a parser revamp.
+pub(crate) fn parse_geometry_modifiers(
+    modifiers: &[String],
+) -> Result<GeometryModifiers> {
+    if modifiers.is_empty() || modifiers.len() > 2 {
+        return Err(BasinError::InvalidSchema(format!(
+            "GEOMETRY type: expected GEOMETRY(POINT) or GEOMETRY(POINT, srid), got {} modifier(s)",
+            modifiers.len()
+        )));
+    }
+    let subtype = modifiers[0].trim().to_ascii_uppercase();
+    if subtype != "POINT" {
+        return Err(BasinError::InvalidSchema(format!(
+            "GEOMETRY({subtype}): only POINT subtype supported today (LINESTRING/POLYGON deferred)"
+        )));
+    }
+    let srid = if modifiers.len() == 2 {
+        let raw = modifiers[1].trim();
+        let n: u32 = raw.parse().map_err(|_| {
+            BasinError::InvalidSchema(format!(
+                "GEOMETRY(POINT, srid): srid must be a non-negative integer, got {raw:?}"
+            ))
+        })?;
+        Some(n)
+    } else {
+        None
+    };
+    Ok(GeometryModifiers {
+        subtype_kw: subtype,
+        srid,
+    })
+}
+
+/// Extract the SRID modifier from a `GEOMETRY(POINT, srid)` column DDL
+/// node, returning `None` for bare `POINT` / `GEOMETRY(POINT)` columns.
+/// Returns `None` (not an error) for any non-GEOMETRY DataType so the
+/// `ddl::schema_from_columns` call site can stay declarative.
+pub(crate) fn geometry_srid_marker(sql: &SqlDataType) -> Option<u32> {
+    let SqlDataType::Custom(name, modifiers) = sql else {
+        return None;
+    };
+    if name.0.len() != 1 {
+        return None;
+    }
+    let kw = name.0[0].id_val().to_ascii_uppercase();
+    if kw != "GEOMETRY" {
+        return None;
+    }
+    parse_geometry_modifiers(modifiers).ok().and_then(|m| m.srid)
 }
 
 /// Pull the dimensionality out of `vector(N)`'s modifier list. sqlparser
