@@ -8255,34 +8255,97 @@ fn enforce_intra_tx_uniqueness(
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let mut existing: std::collections::HashSet<Vec<String>> =
-            std::collections::HashSet::new();
-        for rb in &prior {
-            let idx: Vec<usize> = pk_columns
-                .iter()
-                .map(|c| {
-                    rb.schema().index_of(c).map_err(|_| {
-                        BasinError::internal(format!(
-                            "PK column {c:?} missing from tx-buffered batch"
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            for row in 0..rb.num_rows() {
-                if let Some(k) = crate::constraints::pk_tuple_for_row(rb, &idx, row)? {
-                    existing.insert(k);
+
+        // Tier-3 fastpath: single Int64 PK. Avoids the `Vec<String>` per-row
+        // allocation that dominates the O(k²) cost for large bulk-INSERT
+        // transactions. Mirrors the same pattern in constraints.rs.
+        let single_i64_pk = pk_columns.len() == 1
+            && batch
+                .schema()
+                .field(pk_idx_curr[0])
+                .data_type()
+                == &DataType::Int64;
+
+        if single_i64_pk {
+            use arrow_array::Array as _;
+            let curr_arr = batch
+                .column(pk_idx_curr[0])
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+                .ok_or_else(|| {
+                    BasinError::internal(
+                        "single_i64_pk detected but current batch column is not Int64Array",
+                    )
+                })?;
+            let prior_row_count: usize = prior.iter().map(|rb| rb.num_rows()).sum();
+            let mut existing_i64: std::collections::HashSet<i64> =
+                std::collections::HashSet::with_capacity(prior_row_count);
+            for rb in &prior {
+                let prior_idx = rb.schema().index_of(&pk_columns[0]).map_err(|_| {
+                    BasinError::internal(format!(
+                        "PK column {:?} missing from tx-buffered batch",
+                        pk_columns[0]
+                    ))
+                })?;
+                let prior_arr = rb
+                    .column(prior_idx)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .ok_or_else(|| {
+                        BasinError::internal(
+                            "single_i64_pk detected but prior batch column is not Int64Array",
+                        )
+                    })?;
+                for row in 0..rb.num_rows() {
+                    if !prior_arr.is_null(row) {
+                        existing_i64.insert(prior_arr.value(row));
+                    }
                 }
             }
-        }
-        for row in 0..batch.num_rows() {
-            if let Some(k) = crate::constraints::pk_tuple_for_row(batch, &pk_idx_curr, row)? {
-                if existing.contains(&k) {
-                    return Err(BasinError::UniqueViolation(format!(
-                        "duplicate key value violates unique constraint \
-                         \"{table_name_str}_pkey\": Key ({})=({}) already exists.",
-                        pk_columns.join(", "),
-                        k.join(", ")
-                    )));
+            for row in 0..batch.num_rows() {
+                if !curr_arr.is_null(row) {
+                    let v = curr_arr.value(row);
+                    if existing_i64.contains(&v) {
+                        return Err(BasinError::UniqueViolation(format!(
+                            "duplicate key value violates unique constraint \
+                             \"{table_name_str}_pkey\": Key ({})=({}) already exists.",
+                            pk_columns[0], v
+                        )));
+                    }
+                }
+            }
+        } else {
+            let mut existing: std::collections::HashSet<Vec<String>> =
+                std::collections::HashSet::new();
+            for rb in &prior {
+                let idx: Vec<usize> = pk_columns
+                    .iter()
+                    .map(|c| {
+                        rb.schema().index_of(c).map_err(|_| {
+                            BasinError::internal(format!(
+                                "PK column {c:?} missing from tx-buffered batch"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                for row in 0..rb.num_rows() {
+                    if let Some(k) = crate::constraints::pk_tuple_for_row(rb, &idx, row)? {
+                        existing.insert(k);
+                    }
+                }
+            }
+            for row in 0..batch.num_rows() {
+                if let Some(k) =
+                    crate::constraints::pk_tuple_for_row(batch, &pk_idx_curr, row)?
+                {
+                    if existing.contains(&k) {
+                        return Err(BasinError::UniqueViolation(format!(
+                            "duplicate key value violates unique constraint \
+                             \"{table_name_str}_pkey\": Key ({})=({}) already exists.",
+                            pk_columns.join(", "),
+                            k.join(", ")
+                        )));
+                    }
                 }
             }
         }
@@ -10943,5 +11006,101 @@ mod table_meta_cache_tests {
             .await
             .unwrap();
         assert!(matches!(res, ExecResult::Rows { .. }));
+    }
+}
+
+#[cfg(test)]
+mod enforce_intra_tx_uniqueness_tests {
+    use std::sync::Arc;
+
+    use basin_catalog::{Catalog, InMemoryCatalog};
+    use basin_common::ProjectId;
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    use crate::{Engine, EngineConfig};
+
+    fn make_engine(dir: &TempDir) -> Engine {
+        let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
+            object_store: Arc::new(fs),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+        Engine::new(EngineConfig {
+            storage,
+            catalog,
+            shard: None,
+        })
+    }
+
+    /// Single-column i64 PK fastpath must detect a duplicate across two
+    /// batches buffered within the same open transaction.
+    #[tokio::test]
+    async fn enforce_intra_tx_uniqueness_i64_pk_detects_dup() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+        sess.execute("CREATE TABLE itu_i64 (id BIGINT PRIMARY KEY, v TEXT)")
+            .await
+            .unwrap();
+
+        // Open an explicit transaction so inserts stay buffered.
+        sess.execute("BEGIN").await.unwrap();
+        sess.execute("INSERT INTO itu_i64 VALUES (1, 'a'), (2, 'b')")
+            .await
+            .unwrap();
+        // Second insert with a duplicate id must be rejected.
+        let err = sess
+            .execute("INSERT INTO itu_i64 VALUES (3, 'c'), (1, 'd')")
+            .await;
+        assert!(
+            err.is_err(),
+            "second INSERT with duplicate i64 PK must be rejected"
+        );
+        let msg = format!("{:?}", err.unwrap_err());
+        assert!(
+            msg.contains("duplicate key") || msg.contains("UniqueViolation"),
+            "error must be a uniqueness violation, got: {msg}"
+        );
+        sess.execute("ROLLBACK").await.unwrap();
+    }
+
+    /// Composite PK falls through to the generic `HashSet<Vec<String>>` path
+    /// without panicking and still detects duplicates correctly.
+    #[tokio::test]
+    async fn enforce_intra_tx_uniqueness_falls_back_for_composite_pk() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+        sess.execute(
+            "CREATE TABLE itu_comp (a BIGINT NOT NULL, b BIGINT NOT NULL, \
+             v TEXT, PRIMARY KEY (a, b))",
+        )
+        .await
+        .unwrap();
+
+        sess.execute("BEGIN").await.unwrap();
+        sess.execute("INSERT INTO itu_comp VALUES (1, 1, 'x'), (1, 2, 'y')")
+            .await
+            .unwrap();
+        // (1, 1) is a duplicate of the first row.
+        let err = sess
+            .execute("INSERT INTO itu_comp VALUES (2, 3, 'z'), (1, 1, 'dup')")
+            .await;
+        assert!(
+            err.is_err(),
+            "composite PK duplicate must be rejected via the generic path"
+        );
+        let msg = format!("{:?}", err.unwrap_err());
+        assert!(
+            msg.contains("duplicate key") || msg.contains("UniqueViolation"),
+            "error must be a uniqueness violation, got: {msg}"
+        );
+        sess.execute("ROLLBACK").await.unwrap();
     }
 }
