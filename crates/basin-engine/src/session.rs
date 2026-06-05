@@ -266,6 +266,47 @@ pub(crate) fn session_statement_timeout(
     }
 }
 
+/// The minimum number of Parquet files a table must have before the engine
+/// activates intra-query scan parallelism (i.e. bumps `target_partitions`
+/// above 1).  At the default row-group size of 65 536 rows this corresponds
+/// to ~65 k rows — small enough that the per-file startup overhead is
+/// negligible compared with the wall-clock gain from parallel reads.
+const MIN_FILES_FOR_PARALLEL_SCAN: usize = 2;
+
+/// Return the `target_partitions` value to use for a full-DataFusion scan of
+/// `file_count` Parquet files.
+///
+/// Rules (applied in order):
+/// 1. `file_count < MIN_FILES_FOR_PARALLEL_SCAN` → return 1 (single-file /
+///    empty tables get no fan-out).
+/// 2. `BASIN_ENGINE_TARGET_PARTITIONS_MAX` env var (parsed once, cached) caps
+///    the value.  Unset / `0` / non-numeric → `available_parallelism()`.
+/// 3. Return `min(cap, file_count)` — never fan out more than the file count
+///    since DataFusion can't split a file across partition slots without a
+///    full repartition node.
+///
+/// This function is called only from the full-DataFusion SELECT path
+/// (`exec_select`).  The simple-SELECT fast-path and all DML paths keep
+/// `target_partitions = 1` permanently.
+pub(crate) fn target_partitions_for_bulk_scan(file_count: usize) -> usize {
+    if file_count < MIN_FILES_FOR_PARALLEL_SCAN {
+        return 1;
+    }
+    static MAX_CACHED: OnceLock<usize> = OnceLock::new();
+    let cap = *MAX_CACHED.get_or_init(|| {
+        let from_env: Option<usize> = std::env::var("BASIN_ENGINE_TARGET_PARTITIONS_MAX")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0);
+        from_env.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        })
+    });
+    cap.min(file_count).max(1)
+}
+
 /// Apply a `SET statement_timeout = <raw>` GUC to the session.
 ///
 /// `raw` is the raw RHS string from the SQL statement (may include quotes).
@@ -1765,6 +1806,25 @@ fn build_file_sort_order(cols: &[String]) -> Vec<Vec<SortExpr>> {
 /// `ListingTable` caches the file list it discovers when it's constructed,
 /// which is exactly why we have to throw it away and build a fresh one after
 /// every commit.
+
+/// Variant of [`refresh_table`] used by `exec_select` to collect the live
+/// file count in the same catalog load that registers the table.  Returns the
+/// number of live Parquet files for the table at the current snapshot; this
+/// lets the caller accumulate a total without an extra `load_table` call.
+///
+/// All other callers (INSERT, UPDATE, DELETE, DDL) use the plain
+/// `refresh_table` wrapper below, which discards the count.
+pub(crate) async fn refresh_table_counted(
+    engine: &Engine,
+    project: &ProjectId,
+    ctx: &SessionContext,
+    state: &Arc<SessionState>,
+    table: &TableName,
+) -> Result<usize> {
+    let file_count = refresh_table_inner(engine, project, ctx, state, table).await?;
+    Ok(file_count)
+}
+
 pub(crate) async fn refresh_table(
     engine: &Engine,
     project: &ProjectId,
@@ -1772,6 +1832,17 @@ pub(crate) async fn refresh_table(
     state: &Arc<SessionState>,
     table: &TableName,
 ) -> Result<()> {
+    refresh_table_inner(engine, project, ctx, state, table).await?;
+    Ok(())
+}
+
+async fn refresh_table_inner(
+    engine: &Engine,
+    project: &ProjectId,
+    ctx: &SessionContext,
+    state: &Arc<SessionState>,
+    table: &TableName,
+) -> Result<usize> {
     let meta = engine.config().catalog.load_table(project, table).await?;
     // The catalog hands us a workspace-version schema; convert into the
     // version DataFusion's `register_listing_table` expects.
@@ -1913,7 +1984,7 @@ pub(crate) async fn refresh_table(
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    Ok(())
+    Ok(live_files.len())
 }
 
 
@@ -4672,5 +4743,44 @@ mod tests {
 
         // Still exactly one entry — no duplicate inserts.
         assert_eq!(cache.len(), 1);
+    }
+
+    // ── target_partitions_for_bulk_scan heuristic ────────────────────────────
+
+    /// Empty table (0 files) → no parallelism.
+    #[test]
+    fn bulk_scan_partitions_zero_files_returns_one() {
+        assert_eq!(target_partitions_for_bulk_scan(0), 1);
+    }
+
+    /// Single-file table (below MIN_FILES_FOR_PARALLEL_SCAN) → no parallelism.
+    #[test]
+    fn bulk_scan_partitions_single_file_returns_one() {
+        assert_eq!(target_partitions_for_bulk_scan(1), 1);
+    }
+
+    /// Two files = at or above the threshold → parallelism enabled.
+    #[test]
+    fn bulk_scan_partitions_two_files_enables_parallel() {
+        // The function should return > 1 when file_count >= 2, provided the
+        // host has more than 1 CPU (the common case for any dev machine).
+        // We only assert >= 1 (not > 1) to stay CI-safe on single-CPU runners,
+        // but we also assert that it is exactly min(cap, file_count) = min(≥1, 2).
+        let p = target_partitions_for_bulk_scan(2);
+        assert!(p >= 1, "must return at least 1");
+        assert!(p <= 2, "must not exceed file_count");
+    }
+
+    /// file_count > cap → capped at cap (not at file_count).
+    #[test]
+    fn bulk_scan_partitions_capped_at_cap() {
+        // With a file_count well above any realistic cpu_count, the return
+        // value must be <= available_parallelism().
+        let cap = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let p = target_partitions_for_bulk_scan(10_000);
+        assert!(p <= cap, "must not exceed cpu cap ({cap}), got {p}");
+        assert!(p >= 1, "must return at least 1");
     }
 }

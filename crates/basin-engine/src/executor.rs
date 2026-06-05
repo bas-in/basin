@@ -89,7 +89,7 @@ use crate::fast_select::{execute_simple_select, match_simple_select};
 use crate::lifecycle::{
     extract_create_table_lifecycle, extract_select_include_deleted, CreateTableLifecycle,
 };
-use crate::session::refresh_table;
+use crate::session::{refresh_table, refresh_table_counted};
 use crate::{ExecResult, ProjectSession};
 use basin_catalog::PartitionSpec;
 
@@ -6452,6 +6452,42 @@ async fn commit_with_retry(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Parallel-scan target_partitions guard (Inv-E #132)
+// ---------------------------------------------------------------------------
+// For full-table scans (no PK fast-path, non-trivial file count), temporarily
+// raise the DataFusion `target_partitions` on the session context so the scan
+// fans out across multiple CPU cores.  The guard restores all changed options
+// on drop — covering both the success and error paths.
+//
+// The fast-path (`execute_simple_select`) never reaches this code; it keeps
+// `target_partitions = 1` permanently.  OLTP point-queries are served by the
+// fast path and are unaffected.
+//
+// With `target_partitions > 1` DataFusion's planner also enables
+// `repartition_aggregations` and `repartition_joins` by default, which adds
+// Partial→Repartition→Final overhead that HURTS performance for aggregate
+// shapes (per the investigation at line ~6742, the exchange cost swamps the
+// aggregate for the table sizes Basin targets).  We explicitly disable both
+// so only the file-group fan-out benefits, while aggregates keep the cheaper
+// `mode=Single` plan that DataFusion emits when repartition is off.
+struct TargetPartitionsGuard<'a> {
+    ctx: &'a datafusion::prelude::SessionContext,
+    restore_partitions: usize,
+    restore_repart_agg: bool,
+    restore_repart_joins: bool,
+}
+impl Drop for TargetPartitionsGuard<'_> {
+    fn drop(&mut self) {
+        let state_ref = self.ctx.state_ref();
+        let mut state = state_ref.write();
+        let opts = state.config_mut().options_mut();
+        opts.execution.target_partitions = self.restore_partitions;
+        opts.optimizer.repartition_aggregations = self.restore_repart_agg;
+        opts.optimizer.repartition_joins = self.restore_repart_joins;
+    }
+}
+
 // `gin_original_sql`: the original (pre-operator-rewrite) SQL for GIN pruning
 // detection.  `None` when calling from internal paths that have no original SQL
 // (e.g. CTAS, DML SELECT sub-selects).  When `Some`, `apply_gin_pruning_for_query`
@@ -6480,6 +6516,16 @@ async fn exec_select(
     if let Some(shard) = sess.engine.config().shard.as_ref() {
         shard.flush_to_parquet().await?;
     }
+    // Inv-E #132: accumulate live-file count during the existing refresh loop
+    // so we can pick target_partitions below without an extra catalog round-trip.
+    //
+    // We track the MAXIMUM file count of any single table (not the sum across
+    // all tables) because a query can only scan the files of its own table(s).
+    // Using the sum would over-estimate for small tables in a project that also
+    // has large tables, causing DataFusion to fan out scans needlessly (e.g.
+    // a 2000-row scratch table would be given 8 scan partitions just because
+    // another table in the same project has 15 files).
+    let mut max_single_table_files: usize = 0;
     {
         let tables: Vec<_> = sess
             .engine
@@ -6506,8 +6552,10 @@ async fn exec_select(
                     htap_batches,
                 )
                 .await?;
+                // In-transaction: skip file count (parallelism heuristic is
+                // non-critical; counting would require an extra catalog call).
             } else {
-                crate::session::refresh_table(
+                let n = refresh_table_counted(
                     &sess.engine,
                     &sess.project,
                     &sess.ctx,
@@ -6515,9 +6563,64 @@ async fn exec_select(
                     table,
                 )
                 .await?;
+                if n > max_single_table_files {
+                    max_single_table_files = n;
+                }
             }
         }
     }
+
+    // Inv-E #132 — intra-query parallelism for full-table DataFusion scans.
+    //
+    // Every query that reaches exec_select has already bypassed the simple-SELECT
+    // fast-path (execute_simple_select) — i.e. it is either a full-table scan, an
+    // aggregate, a JOIN, or a query with RLS/soft-delete predicates.  For these
+    // shapes, raising target_partitions from 1 to min(cpu_count, file_count) lets
+    // DataFusion split the Parquet file list across parallel scan streams.
+    //
+    // `max_single_table_files` was accumulated for free during the refresh loop
+    // above — no extra catalog calls.  `target_partitions_for_bulk_scan` applies
+    // the MIN_FILES_FOR_PARALLEL_SCAN gate (returns 1 for tiny tables) and the
+    // BASIN_ENGINE_TARGET_PARTITIONS_MAX env-var cap.
+    //
+    // The TargetPartitionsGuard restores the session value to 1 on drop, covering
+    // both the success path and any early-return via `?`.
+    let _tp_guard: Option<TargetPartitionsGuard<'_>> = {
+        let new_tp = crate::session::target_partitions_for_bulk_scan(max_single_table_files);
+        let (restore_partitions, restore_repart_agg, restore_repart_joins) = {
+            let state_ref = sess.ctx.state_ref();
+            let state = state_ref.read();
+            let cfg = state.config();
+            let opts = cfg.options();
+            (
+                cfg.target_partitions(),
+                opts.optimizer.repartition_aggregations,
+                opts.optimizer.repartition_joins,
+            )
+        };
+        if new_tp != restore_partitions {
+            {
+                let state_ref = sess.ctx.state_ref();
+                let mut state = state_ref.write();
+                let opts = state.config_mut().options_mut();
+                opts.execution.target_partitions = new_tp;
+                // Disable aggregate and join repartition so DataFusion keeps
+                // AggregateExec in mode=Single: the exchange overhead exceeds
+                // the aggregate benefit at Basin's typical table sizes.  File
+                // scan parallelism (independent file groups) is unaffected.
+                opts.optimizer.repartition_aggregations = false;
+                opts.optimizer.repartition_joins = false;
+            }
+            Some(TargetPartitionsGuard {
+                ctx: &sess.ctx,
+                restore_partitions,
+                restore_repart_agg,
+                restore_repart_joins,
+            })
+        } else {
+            None
+        }
+    };
 
     // Phase 5.5 partition pruning: if this session has seen a partitioned
     // table at least once, walk the SQL's AST and (if the WHERE clause
