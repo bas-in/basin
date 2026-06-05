@@ -169,6 +169,16 @@ impl ColumnIndex {
             files
         })
     }
+
+    /// Probe the index for an exact-match key, returning the full
+    /// `(file_path, row_group, row)` location tuples.
+    ///
+    /// Returns `None` when the key is absent from the index (fall back to full
+    /// scan). Returns `Some(vec![])` when the key was indexed and later deleted
+    /// (known-absent — no files to scan).
+    pub fn probe_locations(&self, key: &str) -> Option<Vec<IndexLocation>> {
+        self.entries.get(key).map(|locs| locs.clone())
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -340,6 +350,28 @@ impl ProjectIndexRegistry {
         };
         let idx = arc.lock().expect("column index lock poisoned");
         idx.probe(key)
+    }
+
+    /// Probe the index for `(project, table, col)` with an exact-match key,
+    /// returning full `(file_path, row_group, row)` location tuples.
+    ///
+    /// Returns `Some(locations)` when the key is present in the index.
+    /// Returns `None` when the index is not loaded or the key is absent.
+    /// Callers MUST treat `None` as "unknown — fall through to full scan".
+    pub fn probe_locations(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        col: &str,
+        key: &str,
+    ) -> Option<Vec<IndexLocation>> {
+        let arc = {
+            let map = self.inner.lock().expect("index registry lock poisoned");
+            map.get(&RegKey { project: *project, table: table.clone(), col: col.to_string() })?
+                .clone()
+        };
+        let idx = arc.lock().expect("column index lock poisoned");
+        idx.probe_locations(key)
     }
 
     /// Check whether an index has been loaded into RAM for `(project, table, col)`.
@@ -737,6 +769,73 @@ mod tests {
         assert_eq!(entries[0].1.file_path, "data/f1.parquet");
         assert_eq!(entries[0].1.row, 0);
         assert_eq!(entries[1].1.row, 1);
+    }
+
+    #[test]
+    fn probe_locations_returns_row_groups() {
+        let mut idx = ColumnIndex::new();
+        idx.insert(
+            "val".to_string(),
+            IndexLocation { file_path: "f1.parquet".to_string(), row_group: 2, row: 5 },
+        );
+        let locs = idx.probe_locations("val").unwrap();
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].file_path, "f1.parquet");
+        assert_eq!(locs[0].row_group, 2);
+        assert_eq!(locs[0].row, 5);
+        assert!(idx.probe_locations("absent").is_none());
+    }
+
+    #[test]
+    fn probe_locations_groups_by_file() {
+        let mut idx = ColumnIndex::new();
+        idx.insert(
+            "k".to_string(),
+            IndexLocation { file_path: "f1.parquet".to_string(), row_group: 0, row: 1 },
+        );
+        idx.insert(
+            "k".to_string(),
+            IndexLocation { file_path: "f1.parquet".to_string(), row_group: 3, row: 7 },
+        );
+        idx.insert(
+            "k".to_string(),
+            IndexLocation { file_path: "f2.parquet".to_string(), row_group: 1, row: 0 },
+        );
+        let locs = idx.probe_locations("k").unwrap();
+        assert_eq!(locs.len(), 3);
+        // Collect distinct row groups per file using a simple grouping.
+        let mut rg_map: std::collections::HashMap<String, Vec<u32>> =
+            std::collections::HashMap::new();
+        for l in &locs {
+            rg_map.entry(l.file_path.clone()).or_default().push(l.row_group);
+        }
+        let mut f1_rgs = rg_map["f1.parquet"].clone();
+        f1_rgs.sort_unstable();
+        assert_eq!(f1_rgs, vec![0, 3]);
+        assert_eq!(rg_map["f2.parquet"], vec![1]);
+    }
+
+    #[test]
+    fn probe_locations_dedups_same_rg() {
+        let mut idx = ColumnIndex::new();
+        // Two rows in the same (file, row_group) — different rows.
+        idx.insert(
+            "x".to_string(),
+            IndexLocation { file_path: "f.parquet".to_string(), row_group: 0, row: 10 },
+        );
+        idx.insert(
+            "x".to_string(),
+            IndexLocation { file_path: "f.parquet".to_string(), row_group: 0, row: 20 },
+        );
+        let locs = idx.probe_locations("x").unwrap();
+        assert_eq!(locs.len(), 2); // Two raw location entries...
+        // ...but when deduped by (file, rg) → only one row-group entry.
+        let mut rg_set: std::collections::HashSet<(String, u32)> =
+            std::collections::HashSet::new();
+        for l in &locs {
+            rg_set.insert((l.file_path.clone(), l.row_group));
+        }
+        assert_eq!(rg_set.len(), 1, "same (file, rg) should collapse to one row-group entry");
     }
 
     #[test]

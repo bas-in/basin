@@ -1469,7 +1469,7 @@ pub(crate) async fn execute_simple_select(
             }
         }
     }
-    let opts = ReadOptions {
+    let mut opts = ReadOptions {
         projection: plan.read_cols.clone(),
         filters: augmented_filters,
         partition: None,
@@ -1594,9 +1594,19 @@ pub(crate) async fn execute_simple_select(
     //
     // The probe runs for exactly ONE Eq predicate.  If the query has multiple
     // Eq predicates we use the first indexed column found.
-    let secondary_index_file_allowlist: Option<Option<std::collections::HashSet<String>>> = {
+    // secondary_index_probe_result:
+    //   None              → index not consulted / not loaded (full scan)
+    //   Some(None)        → key definitively absent (return empty)
+    //   Some(Some(locs))  → file allowlist + row-group map derived from locations
+    struct SecondaryIndexHit {
+        /// Files that may contain the key (for catalog-level file pruning).
+        allowlist: std::collections::HashSet<String>,
+        /// Per-file row-group allowlist for the reader (deduped).
+        rg_selection: std::collections::HashMap<String, Vec<u32>>,
+    }
+    let secondary_index_file_allowlist: Option<Option<SecondaryIndexHit>> = {
         let registry = sess.engine.secondary_index_registry();
-        let mut result: Option<Option<std::collections::HashSet<String>>> = None;
+        let mut result: Option<Option<SecondaryIndexHit>> = None;
 
         if plan.aggregates.is_none() {
             for pred in &plan.predicates {
@@ -1623,21 +1633,30 @@ pub(crate) async fn execute_simple_select(
                         .await;
                     }
 
-                    // Now probe the in-RAM index.
+                    // Now probe the in-RAM index for full locations.
                     if let Some(key_text) = crate::secondary_index::scalar_to_key(val) {
-                        if let Some(files) = registry.probe(
+                        if let Some(locs) = registry.probe_locations(
                             &sess.project,
                             &plan.table,
                             col,
                             &key_text,
                         ) {
-                            // Index is loaded and has a definitive answer.
+                            // Build file allowlist and per-file row-group map.
+                            // Dedup same (file, rg) pairs — multiple rows in the
+                            // same row group still only need one row-group entry.
+                            let mut rg_map: std::collections::HashMap<String, Vec<u32>> =
+                                std::collections::HashMap::new();
+                            for loc in &locs {
+                                let rgs = rg_map.entry(loc.file_path.clone()).or_default();
+                                if !rgs.contains(&loc.row_group) {
+                                    rgs.push(loc.row_group);
+                                }
+                            }
                             let allowlist: std::collections::HashSet<String> =
-                                files.into_iter().collect();
-                            result = Some(Some(allowlist));
+                                rg_map.keys().cloned().collect();
+                            result = Some(Some(SecondaryIndexHit { allowlist, rg_selection: rg_map }));
                         } else if registry.is_loaded(&sess.project, &plan.table, col) {
                             // Index is loaded but key is absent → no match.
-                            // Return empty immediately.
                             result = Some(None); // None means "definitely empty"
                         }
                         // If probe returned None and index not loaded, fall through.
@@ -1648,6 +1667,12 @@ pub(crate) async fn execute_simple_select(
         }
         result
     };
+
+    // Wire the row-group selection from the secondary index probe into the
+    // ReadOptions so the Parquet reader can skip non-matching row groups.
+    if let Some(Some(ref hit)) = secondary_index_file_allowlist {
+        opts.row_group_selection = Some(hit.rg_selection.clone());
+    }
 
     // If the secondary index says the key is definitely absent, return empty
     // without opening any files.
@@ -1871,8 +1896,8 @@ pub(crate) async fn execute_simple_select(
                 // Phase 5.7 B1: secondary index allowlist pruning.
                 // If the index has a definitive answer for which files contain
                 // the queried key, skip any file NOT in that set.
-                if let Some(Some(ref allowlist)) = secondary_index_file_allowlist {
-                    if !allowlist.contains(f.path.as_str()) {
+                if let Some(Some(ref hit)) = secondary_index_file_allowlist {
+                    if !hit.allowlist.contains(f.path.as_str()) {
                         sess.engine.note_secondary_index_skipped();
                         return false;
                     }
