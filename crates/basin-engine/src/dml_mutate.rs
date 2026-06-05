@@ -4456,7 +4456,11 @@ fn literal_to_scalar(expr: &Expr, dt: &DataType, col: &str) -> Result<ScalarValu
 /// expression fallback. NOTE: `try_*` still returns `Err(...)` for
 /// malformed literals (bad timestamp string, etc.) — those would be
 /// errors on the expression path too, so we don't paper them over.
-fn try_literal_to_scalar(expr: &Expr, dt: &DataType, col: &str) -> Result<Option<ScalarValue>> {
+pub(crate) fn try_literal_to_scalar(
+    expr: &Expr,
+    dt: &DataType,
+    col: &str,
+) -> Result<Option<ScalarValue>> {
     let (negated, inner) = peel_unary(expr);
     match (dt, inner) {
         // BIGINT / INT8 column — 64-bit signed.

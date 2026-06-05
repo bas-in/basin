@@ -5422,33 +5422,47 @@ async fn filter_rows_do_nothing(
                 continue 'row;
             }
 
-            // Existing-table existence check via a SELECT 1 ... WHERE.
-            let where_parts: Vec<String> = cols
-                .iter()
-                .zip(idxs.iter())
-                .map(|(col, &idx)| {
-                    let expr = &row[idx];
-                    // Strings need quoting. The expr Display includes literal
-                    // quotes for Value::SingleQuotedString so use it directly.
-                    format!("{col} = {expr}")
-                })
-                .collect();
-            let where_clause = where_parts.join(" AND ");
-            let check_sql = format!(
-                "SELECT 1 FROM {} WHERE {} LIMIT 1",
-                table.as_str(),
-                where_clause
-            );
-            let exists = match sess.ctx.sql(&check_sql).await {
-                Ok(df) => {
-                    let batches = df.collect().await.map_err(|e| {
-                        BasinError::internal(format!("ON CONFLICT DO NOTHING existence check: {e}"))
-                    })?;
-                    batches.iter().any(|b| b.num_rows() > 0)
-                }
-                Err(_) => {
-                    // Table may be empty or not yet registered — no conflict.
-                    false
+            // Existing-table existence check. Try the cheap memtable +
+            // zone-map/bloom probe first (when the constraint group IS the
+            // table's single-column PK); only fall back to the authoritative
+            // SELECT 1 when the probe can't answer definitively. Mirrors the
+            // ON CONFLICT DO UPDATE existence-check fast path above.
+            let fast_exists =
+                fast_pk_exists_check(sess, table, meta, cols, &row).await?;
+            let exists = match fast_exists {
+                Some(b) => b,
+                None => {
+                    let where_parts: Vec<String> = cols
+                        .iter()
+                        .zip(idxs.iter())
+                        .map(|(col, &idx)| {
+                            let expr = &row[idx];
+                            // Strings need quoting. The expr Display includes
+                            // literal quotes for Value::SingleQuotedString so
+                            // use it directly.
+                            format!("{col} = {expr}")
+                        })
+                        .collect();
+                    let where_clause = where_parts.join(" AND ");
+                    let check_sql = format!(
+                        "SELECT 1 FROM {} WHERE {} LIMIT 1",
+                        table.as_str(),
+                        where_clause
+                    );
+                    match sess.ctx.sql(&check_sql).await {
+                        Ok(df) => {
+                            let batches = df.collect().await.map_err(|e| {
+                                BasinError::internal(format!(
+                                    "ON CONFLICT DO NOTHING existence check: {e}"
+                                ))
+                            })?;
+                            batches.iter().any(|b| b.num_rows() > 0)
+                        }
+                        Err(_) => {
+                            // Table may be empty or not yet registered — no conflict.
+                            false
+                        }
+                    }
                 }
             };
             if exists {
@@ -5466,6 +5480,84 @@ async fn filter_rows_do_nothing(
     }
 
     Ok(survivors)
+}
+
+/// Cheap existence probe for a single-row ON CONFLICT (pk) shape.
+///
+/// Skips the DataFusion `SELECT 1 ... WHERE pk = lit` round-trip by checking
+/// the hot-tier memtable for a definitive answer, then asking the catalog's
+/// per-file zone-map + bloom whether any cold-tier file *could* contain the
+/// key. Returns:
+///   * `Some(true)`  — row is definitively present (hot-tier Row/Update).
+///   * `Some(false)` — row is definitively absent (hot-tier Tombstone OR
+///                     every live cold file was pruned by zone-map / bloom).
+///   * `None`        — can't decide cheaply (e.g. PK type not supported by
+///                     the probe, conflict target is not the table PK, cold
+///                     file may contain the key). Caller falls back to the
+///                     authoritative SELECT 1 path.
+///
+/// This is purely an optimisation. The follow-up UPDATE issued by the caller
+/// re-applies the PK predicate against the canonical row image, so a false
+/// "present" answer would still surface 0 updated rows and the upsert would
+/// then fall through to INSERT correctly. We only return `Some(false)` when
+/// the probe is *certain* the row is absent.
+async fn fast_pk_exists_check(
+    sess: &ProjectSession,
+    table: &TableName,
+    meta: &TableMetadata,
+    conflict_cols: &[String],
+    row_expanded: &[Expr],
+) -> Result<Option<bool>> {
+    // Gate: only single-column PK target. Composite PK / non-PK UNIQUE
+    // constraint target falls through to the SELECT 1 authoritative path.
+    if meta.pk_columns.len() != 1 || conflict_cols.len() != 1 {
+        return Ok(None);
+    }
+    let pk_col = &meta.pk_columns[0];
+    if !pk_col.eq_ignore_ascii_case(&conflict_cols[0]) {
+        return Ok(None);
+    }
+    let schema = meta.schema.as_ref();
+    let pk_idx = match schema.index_of(pk_col) {
+        Ok(i) => i,
+        Err(_) => return Ok(None),
+    };
+    let pk_dt = schema.field(pk_idx).data_type().clone();
+
+    // Coerce the proposed-row PK expression to a ScalarValue. If the
+    // expression isn't a plain literal (e.g. a bind param node we haven't
+    // pre-evaluated, a function call) bail to the slow path.
+    let pk_expr = &row_expanded[pk_idx];
+    let pk_scalar = match crate::dml_mutate::try_literal_to_scalar(pk_expr, &pk_dt, pk_col)? {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+
+    // 1) Memtable: a definitive answer when the PK key is present.
+    if let Some(rk) = crate::dml_mutate::pk_scalar_to_row_key(&pk_scalar, &pk_dt) {
+        let registry = sess.engine.memtable_registry();
+        let entry = registry.get_or_create(sess.project, table.clone());
+        match entry.memtable.get(&rk) {
+            Some(basin_hottier::MemRowValue::Row { .. })
+            | Some(basin_hottier::MemRowValue::Update { .. }) => return Ok(Some(true)),
+            Some(basin_hottier::MemRowValue::Tombstone) => return Ok(Some(false)),
+            None => { /* fall through to cold-tier probe */ }
+        }
+    }
+
+    // 2) Cold tier zone-map + bloom probe. `Absent` is decisive ("no live
+    //    file can contain this PK"); `Candidates` is inconclusive (a file
+    //    *may* contain it — we'd need to actually scan to know for sure,
+    //    so we hand back to the SELECT 1 caller).
+    let live_files = meta.live_data_files();
+    if live_files.is_empty() {
+        // No cold tier + memtable miss → definitively absent.
+        return Ok(Some(false));
+    }
+    match crate::index_probe::pk_point_probe(pk_col, &pk_scalar, &live_files, schema) {
+        crate::index_probe::PkProbeOutcome::Absent { .. } => Ok(Some(false)),
+        crate::index_probe::PkProbeOutcome::Candidates { .. } => Ok(None),
+    }
 }
 
 /// Pre-check strategy for ON CONFLICT DO UPDATE (upsert).
@@ -5542,18 +5634,33 @@ async fn try_on_conflict_do_update(
     }
     let where_clause = where_parts.join(" AND ");
 
-    // Run the existence check.
-    let check_sql = format!("SELECT 1 FROM {} WHERE {}", table.as_str(), where_clause);
-    let exists = match sess.ctx.sql(&check_sql).await {
-        Ok(df) => {
-            let batches = df.collect().await.map_err(|e| {
-                BasinError::internal(format!("ON CONFLICT existence check execute: {e}"))
-            })?;
-            batches.iter().any(|b| b.num_rows() > 0)
-        }
-        Err(_) => {
-            // Table may be empty (no parquet file yet) → no conflict.
-            false
+    // Existence check. Try the cheap memtable + zone-map/bloom probe first
+    // (single-PK conflict target, supported literal type). The probe can
+    // answer "definitely present" or "definitely absent" in O(1); when it
+    // can't decide (e.g. cold file *may* contain the key) we fall back to
+    // the authoritative SELECT 1 ... WHERE pk = lit path. This is the
+    // single-row UPSERT hot loop in the OLTP bench — was 0.03x vs PG with
+    // the unconditional SELECT 1 round-trip; the probe avoids the DF plan
+    // entirely on the 2nd+ iteration when the row lives in the memtable
+    // overlay as a prior MemRowValue::Update.
+    let fast_exists =
+        fast_pk_exists_check(sess, table, &meta, &conflict_cols, &rows_expanded[0]).await?;
+    let exists = match fast_exists {
+        Some(b) => b,
+        None => {
+            let check_sql = format!("SELECT 1 FROM {} WHERE {}", table.as_str(), where_clause);
+            match sess.ctx.sql(&check_sql).await {
+                Ok(df) => {
+                    let batches = df.collect().await.map_err(|e| {
+                        BasinError::internal(format!("ON CONFLICT existence check execute: {e}"))
+                    })?;
+                    batches.iter().any(|b| b.num_rows() > 0)
+                }
+                Err(_) => {
+                    // Table may be empty (no parquet file yet) → no conflict.
+                    false
+                }
+            }
         }
     };
 
@@ -11110,5 +11217,245 @@ mod enforce_intra_tx_uniqueness_tests {
             "error must be a uniqueness violation, got: {msg}"
         );
         sess.execute("ROLLBACK").await.unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UPSERT (ON CONFLICT) fast-path tests
+// ---------------------------------------------------------------------------
+//
+// Cover the four shapes the OLTP-W3 fast path targets:
+//   * INSERT … ON CONFLICT (pk) DO UPDATE  → row not yet present (INSERT)
+//   * INSERT … ON CONFLICT (pk) DO UPDATE  → row present         (UPDATE)
+//   * INSERT … ON CONFLICT (pk) DO NOTHING → row present         (no-op)
+//   * INSERT … SET col = col + EXCLUDED.col → must NOT lose data
+//     even though the literal-only hot-tier UPDATE fast path can't
+//     evaluate the expression (falls through to slow path).
+
+#[cfg(test)]
+mod upsert_fastpath_tests {
+    use std::sync::Arc;
+
+    use basin_catalog::{Catalog, InMemoryCatalog};
+    use basin_common::ProjectId;
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    use crate::{Engine, EngineConfig, ExecResult};
+
+    fn make_engine(dir: &TempDir) -> Engine {
+        let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
+            object_store: Arc::new(fs),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+        Engine::new(EngineConfig {
+            storage,
+            catalog,
+            shard: None,
+        })
+    }
+
+    /// Empty table → INSERT … ON CONFLICT DO UPDATE should land the row as a
+    /// fresh INSERT (no rows match the existence probe; the DataFusion
+    /// SELECT-1 fallback also returns 0 rows since the table is empty).
+    #[tokio::test]
+    async fn upsert_fastpath_insert_new() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+        sess.execute("CREATE TABLE u_kv (k BIGINT PRIMARY KEY, v TEXT NOT NULL)")
+            .await
+            .unwrap();
+
+        let res = sess
+            .execute(
+                "INSERT INTO u_kv (k, v) VALUES (1, 'fresh') \
+                 ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v",
+            )
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Empty { tag } => assert!(tag.starts_with("INSERT"), "got tag {tag}"),
+            other => panic!("expected Empty tag, got {other:?}"),
+        }
+
+        let r = sess
+            .execute("SELECT v FROM u_kv WHERE k = 1")
+            .await
+            .unwrap();
+        let ExecResult::Rows { batches, .. } = r else {
+            panic!("expected rows")
+        };
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 1, "row must be present after fresh upsert");
+    }
+
+    /// Existing row + same conflicting PK → the fast path should route to
+    /// UPDATE (return an UPDATE 1 tag) and the new EXCLUDED value must
+    /// surface on the next SELECT. This is the bench's hot loop.
+    #[tokio::test]
+    async fn upsert_fastpath_update_existing() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+        sess.execute("CREATE TABLE u_kv2 (k BIGINT PRIMARY KEY, v TEXT NOT NULL)")
+            .await
+            .unwrap();
+        sess.execute("INSERT INTO u_kv2 (k, v) VALUES (42, 'old')")
+            .await
+            .unwrap();
+
+        let res = sess
+            .execute(
+                "INSERT INTO u_kv2 (k, v) VALUES (42, 'new') \
+                 ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v",
+            )
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Empty { tag } => assert!(
+                tag.starts_with("UPDATE") || tag.starts_with("INSERT"),
+                "got tag {tag}"
+            ),
+            other => panic!("expected Empty tag, got {other:?}"),
+        }
+
+        let r = sess
+            .execute("SELECT v FROM u_kv2 WHERE k = 42")
+            .await
+            .unwrap();
+        let ExecResult::Rows { batches, .. } = r else {
+            panic!("expected rows")
+        };
+        // Pull the single string value.
+        let mut got: Vec<String> = Vec::new();
+        for b in &batches {
+            use arrow_array::Array;
+            let arr = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap();
+            for i in 0..arr.len() {
+                got.push(arr.value(i).to_string());
+            }
+        }
+        assert_eq!(got, vec!["new".to_string()], "row must be updated");
+    }
+
+    /// Existing row + ON CONFLICT DO NOTHING → row stays unchanged. This
+    /// exercises the DO NOTHING existence-probe fast path on the PK.
+    #[tokio::test]
+    async fn upsert_do_nothing_existing() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+        sess.execute("CREATE TABLE u_kv3 (k BIGINT PRIMARY KEY, v TEXT NOT NULL)")
+            .await
+            .unwrap();
+        sess.execute("INSERT INTO u_kv3 (k, v) VALUES (7, 'keep')")
+            .await
+            .unwrap();
+
+        let _ = sess
+            .execute(
+                "INSERT INTO u_kv3 (k, v) VALUES (7, 'lose') \
+                 ON CONFLICT (k) DO NOTHING",
+            )
+            .await
+            .unwrap();
+
+        let r = sess
+            .execute("SELECT v FROM u_kv3 WHERE k = 7")
+            .await
+            .unwrap();
+        let ExecResult::Rows { batches, .. } = r else {
+            panic!("expected rows")
+        };
+        let mut got: Vec<String> = Vec::new();
+        for b in &batches {
+            use arrow_array::Array;
+            let arr = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap();
+            for i in 0..arr.len() {
+                got.push(arr.value(i).to_string());
+            }
+        }
+        assert_eq!(
+            got,
+            vec!["keep".to_string()],
+            "DO NOTHING must leave the existing row untouched"
+        );
+    }
+
+    /// Read-modify-write SET (`col = col + EXCLUDED.col`) is out of scope for
+    /// the literal-only hot-tier UPDATE fast path; it MUST fall through to
+    /// the slow path (currently routed via the DataFusion UPDATE planner).
+    /// Correctness — not performance — is what we test here: the existing
+    /// row's `n` must reflect the addition after the upsert.
+    #[tokio::test]
+    async fn upsert_complex_set_falls_back() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+        sess.execute("CREATE TABLE u_counter (k BIGINT PRIMARY KEY, n BIGINT NOT NULL)")
+            .await
+            .unwrap();
+        sess.execute("INSERT INTO u_counter (k, n) VALUES (1, 10)")
+            .await
+            .unwrap();
+
+        // `n = n + EXCLUDED.n` adds the proposed-row value (5) to the
+        // existing-row value (10). EXCLUDED.n is rewritten to the literal
+        // 5; the bare `n` on the RHS stays referring to the existing row,
+        // so this should resolve to `n = n + 5` → 15. The literal-only
+        // UPDATE fast path can't evaluate `n + 5` and must fall back.
+        let res = sess
+            .execute(
+                "INSERT INTO u_counter (k, n) VALUES (1, 5) \
+                 ON CONFLICT (k) DO UPDATE SET n = n + EXCLUDED.n",
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(res, ExecResult::Empty { .. }),
+            "expected Empty result"
+        );
+
+        let r = sess
+            .execute("SELECT n FROM u_counter WHERE k = 1")
+            .await
+            .unwrap();
+        let ExecResult::Rows { batches, .. } = r else {
+            panic!("expected rows")
+        };
+        let mut got: Vec<i64> = Vec::new();
+        for b in &batches {
+            use arrow_array::Array;
+            let arr = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+                .unwrap();
+            for i in 0..arr.len() {
+                got.push(arr.value(i));
+            }
+        }
+        assert_eq!(
+            got,
+            vec![15],
+            "RMW SET (n = n + EXCLUDED.n) must accumulate via the slow path"
+        );
     }
 }
