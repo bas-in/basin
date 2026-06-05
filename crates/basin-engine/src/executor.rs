@@ -2207,7 +2207,21 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                         None => (None, false),
                     };
                     if let Some(ref meta) = table_meta {
-                        let has_rls = meta.rls_enabled;
+                        // SECURITY (#159): do NOT read `rls_enabled` from the
+                        // per-session meta cache. Cross-session DDL
+                        // (`ENABLE ROW LEVEL SECURITY` / `CREATE POLICY` /
+                        // `DROP POLICY`) does not invalidate other sessions'
+                        // caches, so a cached `rls_enabled=false` would let
+                        // this fast path skip RLS predicate injection. Read
+                        // fresh from the catalog and fail closed on error.
+                        let has_rls = sess
+                            .engine
+                            .config()
+                            .catalog
+                            .load_table(&sess.project, &plan.table)
+                            .await
+                            .map(|m| m.rls_enabled)
+                            .unwrap_or(true);
                         let has_soft_delete =
                             crate::types::soft_delete_column(meta.schema.as_ref()).is_some();
                         // Hot-tier merge-on-read gate: when the process-wide
@@ -2260,7 +2274,16 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                         None => (None, false),
                     };
                     if let Some(ref meta) = table_meta {
-                        let has_rls = meta.rls_enabled;
+                        // SECURITY (#159): see comment at the
+                        // metadata-aggregate gate above. Read rls fresh.
+                        let has_rls = sess
+                            .engine
+                            .config()
+                            .catalog
+                            .load_table(&sess.project, &plan.table)
+                            .await
+                            .map(|m| m.rls_enabled)
+                            .unwrap_or(true);
                         let has_soft_delete =
                             crate::types::soft_delete_column(meta.schema.as_ref()).is_some();
                         if !is_view && !has_rls && !has_soft_delete {
@@ -2300,7 +2323,18 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                     None => (None, false),
                 };
                 if let Some(ref meta) = table_meta {
-                    let has_rls = meta.rls_enabled;
+                    // SECURITY (#159): see comment at the metadata-aggregate
+                    // gate above. The fast SELECT path is the primary RLS
+                    // bypass vector — read rls fresh from the catalog and
+                    // fail closed on error.
+                    let has_rls = sess
+                        .engine
+                        .config()
+                        .catalog
+                        .load_table(&sess.project, &plan.table)
+                        .await
+                        .map(|m| m.rls_enabled)
+                        .unwrap_or(true);
                     let has_soft_delete =
                         crate::types::soft_delete_column(meta.schema.as_ref()).is_some();
                     // Inside an explicit transaction the fast path (and the
