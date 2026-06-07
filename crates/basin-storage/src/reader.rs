@@ -895,12 +895,44 @@ async fn read_one(
         // insert when the cache is at its byte budget — the entry would
         // be evicted on insert anyway, so the per-batch Arc::new is
         // pure overhead.
+        // Cache the FULL (untruncated) result so a later query with a
+        // larger or absent LIMIT can still be served from cache correctly.
         if let (Some(pc), Some(key)) = (page_cache.as_ref(), cache_key) {
             if pc.has_capacity() {
                 let cached: Vec<Arc<RecordBatch>> = batches.iter().cloned().map(Arc::new).collect();
                 pc.insert(key, cached);
             }
         }
+
+        // Per-file LIMIT gate: when a row cap is set, trim the batch list
+        // so this file contributes at most `lim` post-filter rows to the
+        // output stream.  `apply_limit_to_stream` in `read_paths_inner`
+        // still handles the cross-file cap, but by cutting early here we
+        // let that combinator close the stream sooner — cancelling decode
+        // futures for files that are still in-flight in the `buffered(4)`
+        // pipeline.  The page-cache write-through above stores the full
+        // batch list, so truncation only affects the stream handed back to
+        // the caller, not the cache entry.
+        let batches = if let Some(lim) = opts.limit {
+            let mut kept = Vec::with_capacity(batches.len());
+            let mut seen = 0usize;
+            for b in batches {
+                if seen >= lim {
+                    break;
+                }
+                let take = (lim - seen).min(b.num_rows());
+                seen += take;
+                if take == b.num_rows() {
+                    kept.push(b);
+                } else {
+                    kept.push(b.slice(0, take));
+                }
+            }
+            kept
+        } else {
+            batches
+        };
+
         let stream = futures::stream::iter(batches.into_iter().map(Ok));
         return Ok(stream.boxed());
     }
@@ -1033,6 +1065,56 @@ fn build_row_filter(
             Err(_) => continue,
         };
         let mask = ProjectionMask::roots(parquet_schema, [col_idx]);
+
+        // `StartsWith` (case-sensitive LIKE prefix) gets a direct fast path
+        // that avoids the predicate::evaluate dispatch and explicitly handles
+        // Utf8, LargeUtf8, and Utf8View — parquet-rs may decode strings as
+        // any of the three depending on Arrow version and writer config.
+        // Case-insensitive (ILIKE) is left to the generic path below.
+        if let Predicate::StartsWith {
+            prefix,
+            case_insensitive: false,
+            ..
+        } = filter
+        {
+            let prefix_str = prefix.clone();
+            let pred = ArrowPredicateFn::new(mask, move |batch: RecordBatch| {
+                use arrow_array::cast::AsArray;
+                use arrow_array::BooleanArray;
+                let col = batch.column(0);
+                Ok(match col.data_type() {
+                    arrow_schema::DataType::Utf8 => {
+                        let arr = col.as_string::<i32>();
+                        BooleanArray::from_iter(
+                            arr.iter()
+                                .map(|v| v.map(|s| s.starts_with(prefix_str.as_str()))),
+                        )
+                    }
+                    arrow_schema::DataType::LargeUtf8 => {
+                        let arr = col.as_string::<i64>();
+                        BooleanArray::from_iter(
+                            arr.iter()
+                                .map(|v| v.map(|s| s.starts_with(prefix_str.as_str()))),
+                        )
+                    }
+                    arrow_schema::DataType::Utf8View => {
+                        let arr = col.as_string_view();
+                        BooleanArray::from_iter(
+                            arr.iter()
+                                .map(|v| v.map(|s| s.starts_with(prefix_str.as_str()))),
+                        )
+                    }
+                    _ => {
+                        // Non-string column: conservative all-false mask so
+                        // no spurious rows pass through to the result set.
+                        BooleanArray::from(vec![false; batch.num_rows()])
+                    }
+                })
+            });
+            predicates.push(Box::new(pred));
+            continue;
+        }
+
         let f = filter.clone();
         let pred = ArrowPredicateFn::new(mask, move |batch: RecordBatch| {
             predicate::evaluate(&batch, &f)
