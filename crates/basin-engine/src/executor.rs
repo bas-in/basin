@@ -6476,6 +6476,7 @@ struct TargetPartitionsGuard<'a> {
     restore_partitions: usize,
     restore_repart_agg: bool,
     restore_repart_joins: bool,
+    restore_repart_windows: bool,
 }
 impl Drop for TargetPartitionsGuard<'_> {
     fn drop(&mut self) {
@@ -6485,6 +6486,7 @@ impl Drop for TargetPartitionsGuard<'_> {
         opts.execution.target_partitions = self.restore_partitions;
         opts.optimizer.repartition_aggregations = self.restore_repart_agg;
         opts.optimizer.repartition_joins = self.restore_repart_joins;
+        opts.optimizer.repartition_windows = self.restore_repart_windows;
     }
 }
 
@@ -6587,7 +6589,7 @@ async fn exec_select(
     // both the success path and any early-return via `?`.
     let _tp_guard: Option<TargetPartitionsGuard<'_>> = {
         let new_tp = crate::session::target_partitions_for_bulk_scan(max_single_table_files);
-        let (restore_partitions, restore_repart_agg, restore_repart_joins) = {
+        let (restore_partitions, restore_repart_agg, restore_repart_joins, restore_repart_windows) = {
             let state_ref = sess.ctx.state_ref();
             let state = state_ref.read();
             let cfg = state.config();
@@ -6596,6 +6598,7 @@ async fn exec_select(
                 cfg.target_partitions(),
                 opts.optimizer.repartition_aggregations,
                 opts.optimizer.repartition_joins,
+                opts.optimizer.repartition_windows,
             )
         };
         if new_tp != restore_partitions {
@@ -6604,18 +6607,23 @@ async fn exec_select(
                 let mut state = state_ref.write();
                 let opts = state.config_mut().options_mut();
                 opts.execution.target_partitions = new_tp;
-                // Disable aggregate and join repartition so DataFusion keeps
-                // AggregateExec in mode=Single: the exchange overhead exceeds
-                // the aggregate benefit at Basin's typical table sizes.  File
-                // scan parallelism (independent file groups) is unaffected.
+                // Disable aggregate, join, and window repartition so DataFusion
+                // keeps AggregateExec/WindowAggExec in mode=Single: the exchange
+                // overhead exceeds the benefit at Basin's typical table sizes, and
+                // repartition_windows=true (DataFusion 53.1 default) inserts
+                // exchange nodes around WindowAggExec breaking LAG/LEAD/RANK
+                // queries when target_partitions > 1.  File scan parallelism
+                // (independent file groups) is unaffected.
                 opts.optimizer.repartition_aggregations = false;
                 opts.optimizer.repartition_joins = false;
+                opts.optimizer.repartition_windows = false;
             }
             Some(TargetPartitionsGuard {
                 ctx: &sess.ctx,
                 restore_partitions,
                 restore_repart_agg,
                 restore_repart_joins,
+                restore_repart_windows,
             })
         } else {
             None
