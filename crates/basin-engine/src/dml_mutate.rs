@@ -1886,6 +1886,14 @@ pub(crate) async fn exec_update(
     let mut updated_total: usize = 0;
     let mut replaced_paths: Vec<String> = Vec::new();
     let mut replacement_batches: Vec<RecordBatch> = Vec::new();
+    // Bulk-W4 / Inv-bulk-UPDATE #182: per-source-file grouping of the
+    // post-SET batches. The write path turns each `(old_path, batches)`
+    // entry into its OWN replacement file (preserving on-disk granularity)
+    // rather than concat-ing every file's rows into one mega-file. The flat
+    // `replacement_batches` / `replaced_paths` above are still derived from
+    // these groups for the constraint / RLS / CDC / RETURNING passes that
+    // don't care about file boundaries.
+    let mut replacement_groups: Vec<(String, Vec<RecordBatch>)> = Vec::new();
     let mut event_payloads: Vec<RowChange> = Vec::new();
     // Post-update rows that matched (RETURNING input). Each entry is one
     // filtered batch with only the matched rows.
@@ -1937,6 +1945,8 @@ pub(crate) async fn exec_update(
                     }
                     updated_total += f.row_count as usize;
                     replaced_paths.push(f.path.as_ref().to_string());
+                    replacement_groups
+                        .push((f.path.as_ref().to_string(), new_batches.clone()));
                     capture_update_events(&befores, &new_batches, None, &mut event_payloads)?;
                     if want_returning_rows {
                         // AllMatch: every row matches; the unfiltered
@@ -1988,6 +1998,8 @@ pub(crate) async fn exec_update(
                     }
                     updated_total += rows_matched;
                     replaced_paths.push(f.path.as_ref().to_string());
+                    replacement_groups
+                        .push((f.path.as_ref().to_string(), new_batches.clone()));
                     capture_update_events(
                         &befores,
                         &new_batches,
@@ -2058,8 +2070,9 @@ pub(crate) async fn exec_update(
         updates.sort_by(|a, b| a.path.cmp(&b.path));
         for u in updates {
             updated_total += u.rows_matched;
-            replaced_paths.push(u.path);
-            replacement_batches.extend(u.batches);
+            replaced_paths.push(u.path.clone());
+            replacement_batches.extend(u.batches.clone());
+            replacement_groups.push((u.path, u.batches));
         }
     }
 
@@ -2173,13 +2186,27 @@ pub(crate) async fn exec_update(
         Vec::new()
     };
     let events = build_events(sess, &table, ChangeOp::Update, event_payloads);
-    // Phase 5.19.E: clone replacement batches for GIN posting-list maintenance
-    // BEFORE write_replacement consumes them.
-    let gin_replacement_batches: Vec<RecordBatch> = replacement_batches.iter().cloned().collect();
+    // Phase 5.19.E / Bulk-W4: clone replacement batches per source file for
+    // GIN/GIST posting-list maintenance BEFORE the write consumes the groups.
+    // Keyed by old_path so each old file's purge is paired with the SAME new
+    // file that now physically holds its post-SET rows.
+    let gin_batches_by_old_path: std::collections::HashMap<String, Vec<RecordBatch>> =
+        replacement_groups
+            .iter()
+            .map(|(p, b)| (p.clone(), b.clone()))
+            .collect();
+    drop(replacement_batches);
     // Pre-commit before writing the replacement file so a rejecting
     // sink leaves no orphan parquet on disk.
     dispatch_pre_commit(&sess.engine, &events).await?;
-    let added_files = write_replacement(sess, &table, schema.clone(), replacement_batches).await?;
+    // Bulk-W4: write N replacement files (one per source file) in parallel
+    // instead of concat-ing every file's rows into a single serial encode.
+    // `per_file` is `(old_path, new DataFileRef)` sorted by old_path; we
+    // derive the flat `added_files` for the commit and keep the mapping for
+    // precise per-file index maintenance below.
+    let per_file =
+        write_replacement_per_file(sess, &table, schema.clone(), replacement_groups).await?;
+    let added_files: Vec<DataFileRef> = per_file.iter().map(|(_, df)| df.clone()).collect();
     commit_replace(
         sess,
         &table,
@@ -2190,9 +2217,10 @@ pub(crate) async fn exec_update(
     .await?;
     dispatch_post_commit(&sess.engine, events);
 
-    // Phase 5.19.E — GIN posting-list maintenance for UPDATE.
-    // Every replaced file's old entries are purged; the new replacement
-    // file's entries are rebuilt from the post-SET batches.
+    // Phase 5.19.E / Bulk-W4 — GIN posting-list maintenance for UPDATE.
+    // Each replaced file's old entries are purged and re-emitted against the
+    // SPECIFIC new file that now holds its post-SET rows (per-file granularity
+    // — was a single lumped new file before Bulk-W4's multi-file write).
     {
         use basin_storage::index::index_maint::GinPostingListMaintainer;
         if let Some(maint) = GinPostingListMaintainer::new(
@@ -2201,17 +2229,27 @@ pub(crate) async fn exec_update(
             &table,
             &meta,
         ) {
-            if let Some(new_file) = added_files.first() {
-                for old_path in &replaced_paths {
-                    maint.on_file_replaced(old_path, &new_file.path, &gin_replacement_batches);
+            let rewritten: std::collections::HashSet<&str> =
+                per_file.iter().map(|(p, _)| p.as_str()).collect();
+            for (old_path, new_file) in &per_file {
+                if let Some(batches) = gin_batches_by_old_path.get(old_path) {
+                    maint.on_file_replaced(old_path, &new_file.path, batches);
+                }
+            }
+            // Defensive: a replaced file that produced no new file (empty
+            // post-SET result) still must have its old posting-list entries
+            // purged so we never serve stale postings.
+            for old_path in &replaced_paths {
+                if !rewritten.contains(old_path.as_str()) {
+                    maint.on_file_removed(old_path);
                 }
             }
         }
     }
 
-    // Phase 5.24.D — GIST interval-tree maintenance for UPDATE.
-    // Every replaced file's entries are purged; the new file's entries are
-    // rebuilt from the post-SET batches.
+    // Phase 5.24.D / Bulk-W4 — GIST interval-tree maintenance for UPDATE.
+    // Each replaced file's entries are purged; the matching new file's entries
+    // are rebuilt from that file's own post-SET batches.
     {
         let gist_cols: Vec<String> = meta
             .indexes
@@ -2221,12 +2259,21 @@ pub(crate) async fn exec_update(
             .collect();
         if !gist_cols.is_empty() {
             let ireg = sess.engine.interval_registry();
-            if let Some(new_file) = added_files.first() {
-                for col in &gist_cols {
-                    for old_path in &replaced_paths {
+            let rewritten: std::collections::HashSet<&str> =
+                per_file.iter().map(|(p, _)| p.as_str()).collect();
+            for col in &gist_cols {
+                // Purge any replaced file that produced no new file.
+                for old_path in &replaced_paths {
+                    if !rewritten.contains(old_path.as_str()) {
                         ireg.remove_file(&sess.project, &table, col, old_path);
                     }
-                    for batch in &gin_replacement_batches {
+                }
+                for (old_path, new_file) in &per_file {
+                    ireg.remove_file(&sess.project, &table, col, old_path);
+                    let Some(batches) = gin_batches_by_old_path.get(old_path) else {
+                        continue;
+                    };
+                    for batch in batches {
                         use arrow_array::Array;
                         if let Ok(col_idx) = batch.schema().index_of(col) {
                             let col_arr = batch.column(col_idx);
@@ -3800,6 +3847,106 @@ async fn write_replacement(
         hll_sketches: std::collections::BTreeMap::new(),
         tdigest_sketches: std::collections::BTreeMap::new(),
     }])
+}
+
+/// Inv-bulk-UPDATE #182 / Bulk-W4: write the replacement batches as N files,
+/// one per source file, preserving the original on-disk granularity instead
+/// of concat-ing 1M rows into a single mega-file and serial-encoding it.
+///
+/// Each `(old_path, batches)` group becomes its own output file. Groups whose
+/// batches sum to zero rows (an UPDATE that deleted everything in that file —
+/// not currently produced by the SET path, but defensive) are skipped so we
+/// don't emit empty Parquet. The PUTs are independent object-store writes, so
+/// we fan them out with `buffer_unordered`; on S3 the N parallel uploads
+/// compound the read-loop parallelism Bulk-W3 added.
+///
+/// Returns `(old_path, DataFileRef)` pairs sorted by `old_path`, so the
+/// caller's GIN/GIST/JSONB index maintenance can map each replaced file to
+/// the precise new file that now holds its rows (vs. the old single-file
+/// path that lumped every old file onto one new file).
+async fn write_replacement_per_file(
+    sess: &ProjectSession,
+    table: &TableName,
+    schema: Arc<Schema>,
+    groups: Vec<(String, Vec<RecordBatch>)>,
+) -> Result<Vec<(String, DataFileRef)>> {
+    if groups.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Load writer overrides ONCE (not per file) so N parallel writes don't
+    // hammer the catalog. Mirrors `write_replacement`'s option derivation.
+    let meta = sess
+        .engine
+        .config()
+        .catalog
+        .load_table(&sess.project, table)
+        .await?;
+    let opts = Arc::new(basin_storage::WriteOptions {
+        bloom_filter_columns: meta.bloom_filter_columns.clone(),
+        max_row_group_size: meta.row_group_rows,
+        cluster_columns: meta.cluster_columns.clone(),
+        file_format: crate::executor::map_file_format(meta.file_format),
+        row_block_size: meta.row_block_size,
+        bloom_columns: meta.global_sort_order.clone().unwrap_or_default(),
+        ..Default::default()
+    });
+
+    let storage = sess.engine.config().storage.clone();
+    let project = sess.project.clone();
+    let table_owned = table.clone();
+    let concurrency = update_scan_concurrency(groups.len());
+
+    let mut results: Vec<(String, DataFileRef)> = futures::stream::iter(groups.into_iter())
+        .map(|(old_path, batches)| {
+            let storage = storage.clone();
+            let project = project.clone();
+            let table = table_owned.clone();
+            let schema = schema.clone();
+            let opts = opts.clone();
+            async move {
+                let merged = if batches.len() == 1 {
+                    batches.into_iter().next().unwrap()
+                } else {
+                    let refs: Vec<&RecordBatch> = batches.iter().collect();
+                    arrow_select::concat::concat_batches(&schema, refs).map_err(|e| {
+                        BasinError::internal(format!("concat batches for per-file rewrite: {e}"))
+                    })?
+                };
+                if merged.num_rows() == 0 {
+                    // Defensive: a file whose every row vanished — nothing to
+                    // write, the old file is still removed via replaced_paths.
+                    return Ok::<Option<(String, DataFileRef)>, BasinError>(None);
+                }
+                let part = PartitionKey::default_key();
+                let df = storage
+                    .write_batch_with_options(&project, &table, &part, &merged, &opts)
+                    .await?;
+                Ok(Some((
+                    old_path,
+                    DataFileRef {
+                        path: df.path.as_ref().to_string(),
+                        size_bytes: df.size_bytes,
+                        row_count: df.row_count,
+                        column_stats: df.column_stats.clone(),
+                        bloom_filters: df.bloom_filters.clone(),
+                        hll_sketches: std::collections::BTreeMap::new(),
+                        tdigest_sketches: std::collections::BTreeMap::new(),
+                    },
+                )))
+            }
+        })
+        .buffer_unordered(concurrency)
+        .collect::<Vec<Result<Option<(String, DataFileRef)>>>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<Option<(String, DataFileRef)>>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+
+    // Deterministic commit order: independent of buffer_unordered completion.
+    results.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(results)
 }
 
 /// Commit the swap with one optimistic-conflict retry. Mirrors
