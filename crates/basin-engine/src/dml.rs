@@ -2006,28 +2006,61 @@ fn coerce_money(expr: &Expr, precision: u8, scale: i8, col: &str) -> Result<Opti
 }
 
 /// Recursively rebuild `v` so every object node iterates its keys in sorted
-/// order. We do it via `BTreeMap<String, Value>` rather than re-implementing
-/// a serializer because (a) `serde_json::Value` already round-trips and
-/// (b) `BTreeMap` serialises in key order, which is what canonical-form
-/// JSON wants.
+/// order. Canonical form = keys sorted ascending, last value wins on any
+/// duplicate key, no insignificant whitespace.
+///
+/// Two performance refinements over the original `BTreeMap` round-trip
+/// (Inv-jsonb-canon #183), both byte-identical to the prior output:
+///
+///   A. **Detect-sorted fast path** — `object_keys_sorted` does one O(n)
+///      `windows(2)` pass per object level. If every object in the document
+///      already has its keys in ascending order *and* no duplicates, we only
+///      recurse into the values to normalise nested objects — no reorder, no
+///      per-object container churn. (sonic-rs builds a `serde_json::Map`,
+///      which in this build is `BTreeMap`-backed, so keys typically arrive
+///      already sorted — but we never *rely* on that; the check is what makes
+///      the skip sound.)
+///
+///   B. **Vec-sort rebuild** — when an object is *not* already sorted we
+///      collect into a `Vec<(String, Value)>` and `sort_unstable_by` on the
+///      key, rather than inserting into a `BTreeMap`. One Vec allocation per
+///      object level instead of N per-node heap allocations. Duplicate keys
+///      are deduplicated **last-wins** to match the prior `BTreeMap`/Map
+///      semantics exactly.
 fn canonicalize_json(v: serde_json::Value) -> serde_json::Value {
     use serde_json::Value;
     match v {
         Value::Object(map) => {
-            let sorted: std::collections::BTreeMap<String, Value> = map
-                .into_iter()
-                .map(|(k, val)| (k, canonicalize_json(val)))
-                .collect();
-            // Round-trip through serde_json::Value so the outer container is
-            // a `Value::Object` again (rather than a `Map`-shaped value the
-            // caller's BTreeMap returns directly). serde_json's `Map`
-            // preserves insertion order, so we feed the BTreeMap's already-
-            // sorted iteration into a fresh `Map`.
-            let mut out = serde_json::Map::with_capacity(sorted.len());
-            for (k, vv) in sorted {
-                out.insert(k, vv);
+            if object_keys_sorted(&map) {
+                // Change A: keys already canonical at this level. Just recurse
+                // into the values (nested objects still need normalising) and
+                // re-wrap in place — no reorder, no extra container.
+                let mut out = serde_json::Map::with_capacity(map.len());
+                for (k, val) in map {
+                    out.insert(k, canonicalize_json(val));
+                }
+                Value::Object(out)
+            } else {
+                // Change B: Vec-sort instead of BTreeMap. Collect, sort by key,
+                // then rebuild keeping the LAST value for any duplicate key
+                // (matches the overwrite-on-insert semantics of the prior
+                // BTreeMap path).
+                let mut entries: Vec<(String, Value)> = map
+                    .into_iter()
+                    .map(|(k, val)| (k, canonicalize_json(val)))
+                    .collect();
+                // Stable sort by key so that, among equal keys, original
+                // (insertion) order is preserved and the *last* survives dedup.
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                let mut out = serde_json::Map::with_capacity(entries.len());
+                for (k, vv) in entries {
+                    // BTreeMap insert overwrote on duplicate keys (last wins);
+                    // serde_json::Map::insert does the same, so re-inserting in
+                    // sorted order reproduces that behaviour byte-for-byte.
+                    out.insert(k, vv);
+                }
+                Value::Object(out)
             }
-            Value::Object(out)
         }
         Value::Array(items) => {
             // Canonical form preserves array order — only object key order
@@ -2037,6 +2070,26 @@ fn canonicalize_json(v: serde_json::Value) -> serde_json::Value {
         }
         other => other,
     }
+}
+
+/// True iff this object's keys are already in strictly-ascending order (no
+/// duplicates). A single O(n) `windows(2)` pass over the key sequence. Returns
+/// `true` for the empty / single-key cases. When this is `true`, sorting would
+/// be a no-op and duplicate-dedup is unnecessary, so `canonicalize_json` can
+/// skip the rebuild and only recurse into values.
+fn object_keys_sorted(map: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let mut prev: Option<&str> = None;
+    for k in map.keys() {
+        if let Some(p) = prev {
+            // Strict `<`: equal keys (duplicates) force the rebuild path so
+            // last-wins dedup runs.
+            if p >= k.as_str() {
+                return false;
+            }
+        }
+        prev = Some(k.as_str());
+    }
+    true
 }
 
 fn check_null_allowed(field: &arrow_schema::Field) -> Result<()> {
@@ -2850,6 +2903,86 @@ mod tests {
         match *source.body {
             SetExpr::Values(v) => v.rows,
             _ => panic!("expected VALUES"),
+        }
+    }
+
+    /// Parse `input` as JSON, canonicalize, and return the serialized bytes —
+    /// exactly what `coerce_jsonb` stores. Panics on parse error.
+    fn canon_bytes(input: &str) -> String {
+        let parsed: serde_json::Value = sonic_rs::from_str(input).unwrap();
+        let canonical = canonicalize_json(parsed);
+        String::from_utf8(sonic_rs::to_vec(&canonical).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn canonicalize_json_is_byte_identical_to_hand_form() {
+        // Object keys are sorted ascending regardless of input order.
+        assert_eq!(canon_bytes(r#"{"b":2,"a":1}"#), r#"{"a":1,"b":2}"#);
+        // Already-sorted input (Change A fast path) is unchanged.
+        assert_eq!(canon_bytes(r#"{"a":1,"b":2}"#), r#"{"a":1,"b":2}"#);
+        // Nested objects are canonicalised recursively.
+        assert_eq!(canon_bytes(r#"{"z":{"y":2,"x":1}}"#), r#"{"z":{"x":1,"y":2}}"#);
+        // Duplicate top-level keys: last value wins.
+        assert_eq!(canon_bytes(r#"{"a":1,"a":2}"#), r#"{"a":2}"#);
+        // Duplicate keys, reversed-on-arrival ordering: still last wins.
+        assert_eq!(canon_bytes(r#"{"b":1,"a":1,"a":2}"#), r#"{"a":2,"b":1}"#);
+        // Insignificant whitespace is stripped (canonical PG form).
+        assert_eq!(canon_bytes(r#"{ "a" : 1 }"#), r#"{"a":1}"#);
+        // Arrays preserve element order; nested objects within still sort.
+        assert_eq!(
+            canon_bytes(r#"[{"b":2,"a":1},{"d":4,"c":3}]"#),
+            r#"[{"a":1,"b":2},{"c":3,"d":4}]"#
+        );
+        // Deeply nested mix of arrays + objects.
+        assert_eq!(
+            canon_bytes(r#"{"k":[{"q":1,"p":{"n":2,"m":1}}]}"#),
+            r#"{"k":[{"p":{"m":1,"n":2},"q":1}]}"#
+        );
+        // Scalars and empty containers pass through unchanged.
+        assert_eq!(canon_bytes(r#"{}"#), r#"{}"#);
+        assert_eq!(canon_bytes(r#"[]"#), r#"[]"#);
+        assert_eq!(canon_bytes(r#"42"#), r#"42"#);
+        assert_eq!(canon_bytes(r#""s""#), r#""s""#);
+        assert_eq!(canon_bytes(r#"null"#), r#"null"#);
+    }
+
+    /// Cross-check: the Vec-sort/fast-path implementation must produce the
+    /// same bytes as a reference BTreeMap-based canonicaliser for arbitrary
+    /// key orders (the byte-equality contract `viability_jsonb` asserts).
+    #[test]
+    fn canonicalize_json_matches_btreemap_reference() {
+        fn reference(v: serde_json::Value) -> serde_json::Value {
+            use serde_json::Value;
+            match v {
+                Value::Object(map) => {
+                    let sorted: std::collections::BTreeMap<String, Value> =
+                        map.into_iter().map(|(k, val)| (k, reference(val))).collect();
+                    let mut out = serde_json::Map::with_capacity(sorted.len());
+                    for (k, vv) in sorted {
+                        out.insert(k, vv);
+                    }
+                    Value::Object(out)
+                }
+                Value::Array(items) => {
+                    Value::Array(items.into_iter().map(reference).collect())
+                }
+                other => other,
+            }
+        }
+        let inputs = [
+            r#"{"b":2,"a":1}"#,
+            r#"{"z":{"y":2,"x":1},"a":[3,2,1]}"#,
+            r#"{"a":1,"a":2,"a":3}"#,
+            r#"[{"c":3,"b":2,"a":1}]"#,
+            r#"{"nested":{"deep":{"q":1,"p":2,"o":3}}}"#,
+            r#"{ "x" : { "z" : 1 , "a" : 2 } }"#,
+            r#"{"":1,"a":2}"#,
+        ];
+        for inp in inputs {
+            let parsed: serde_json::Value = sonic_rs::from_str(inp).unwrap();
+            let mine = sonic_rs::to_vec(&canonicalize_json(parsed.clone())).unwrap();
+            let refd = sonic_rs::to_vec(&reference(parsed)).unwrap();
+            assert_eq!(mine, refd, "mismatch for input {inp}");
         }
     }
 
