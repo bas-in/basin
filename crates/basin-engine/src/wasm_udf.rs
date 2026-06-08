@@ -94,7 +94,8 @@ use arrow_array::builder::{
     BinaryBuilder, Float64Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
 };
 use arrow_array::{
-    Array, BinaryArray, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray,
+    Array, BinaryArray, BinaryViewArray, Float64Array, Int64Array, LargeBinaryArray,
+    LargeStringArray, StringArray, StringViewArray, TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType as ArrowDataType, TimeUnit};
 use basin_catalog::{SqlArgType, SqlFunctionDef, SqlReturnType};
@@ -300,6 +301,13 @@ struct WasmUdfImpl {
     epoch_deadline: u64,
     /// Maximum linear-memory bytes allowed.
     max_mem_bytes: usize,
+    /// Lazily-built, cached pre-linked instance for this UDF's module. All
+    /// basin WASM UDFs are import-free, so the `Linker` is empty and
+    /// `instantiate_pre` resolves it once; every subsequent batch reuses this
+    /// `InstancePre` and `instantiate(&mut store)` skips linker resolution.
+    /// `InstancePre<T>` is `Send + Sync` (it stores no `T`, only a
+    /// `PhantomData<fn() -> T>`), so it sits behind an `OnceLock`.
+    instance_pre: std::sync::OnceLock<wasmtime::InstancePre<wasmtime::StoreLimits>>,
 }
 
 impl std::fmt::Debug for WasmUdfImpl {
@@ -350,17 +358,36 @@ impl ScalarUDFImpl for WasmUdfImpl {
         args: datafusion::logical_expr::ScalarFunctionArgs,
     ) -> datafusion::error::Result<ColumnarValue> {
         let engine = global_engine();
-        // Cache compiled modules across batches: identical WASM bytes hash to
-        // the same xxh3-64 key, so a UDF that runs over N batches only pays
-        // the compilation cost on the first invocation. The cached `Module`
-        // is wrapped in `Arc` for cheap cloning; instantiation still happens
-        // per-call because every call needs a fresh `Store`.
-        let module = get_or_compile_module(&engine, &self.wasm_bytes).map_err(|e| {
-            datafusion::error::DataFusionError::Execution(format!(
-                "WASM UDF {}: failed to compile module: {e}",
-                self.name
-            ))
-        })?;
+
+        // Build (or reuse) the pre-linked instance. The first batch compiles
+        // the module (via the xxh3-64 keyed `Module` cache) and runs the
+        // linker once to produce an `InstancePre`; every subsequent batch
+        // skips both the module compile and the linker resolution and goes
+        // straight to `instance_pre.instantiate(&mut store)` on a fresh Store.
+        let instance_pre = match self.instance_pre.get() {
+            Some(pre) => pre,
+            None => {
+                let module = get_or_compile_module(&engine, &self.wasm_bytes).map_err(|e| {
+                    datafusion::error::DataFusionError::Execution(format!(
+                        "WASM UDF {}: failed to compile module: {e}",
+                        self.name
+                    ))
+                })?;
+                let linker: Linker<wasmtime::StoreLimits> = Linker::new(&engine);
+                let pre = linker.instantiate_pre(&module).map_err(|e| {
+                    datafusion::error::DataFusionError::Execution(format!(
+                        "WASM UDF {}: failed to pre-link module: {e}",
+                        self.name
+                    ))
+                })?;
+                // If two threads race, the loser's `pre` is dropped and we use
+                // the winner's — both are equivalent (same module bytes).
+                let _ = self.instance_pre.set(pre);
+                self.instance_pre
+                    .get()
+                    .expect("instance_pre was just set")
+            }
+        };
 
         // Build a StoreLimits to cap linear memory.
         let limiter = StoreLimitsBuilder::new()
@@ -372,8 +399,7 @@ impl ScalarUDFImpl for WasmUdfImpl {
         store.set_epoch_deadline(self.epoch_deadline);
         store.limiter(|state| state as &mut dyn wasmtime::ResourceLimiter);
 
-        let linker: Linker<wasmtime::StoreLimits> = Linker::new(&engine);
-        let instance = linker.instantiate(&mut store, &module).map_err(|e| {
+        let instance = instance_pre.instantiate(&mut store).map_err(|e| {
             datafusion::error::DataFusionError::Execution(format!(
                 "WASM UDF {}: failed to instantiate module: {e}",
                 self.name
@@ -583,44 +609,24 @@ fn extract_row_into_wasm_args(
     alloc: Option<&wasmtime::TypedFunc<i32, i32>>,
     memory: Option<&Memory>,
 ) -> Result<()> {
-    // Pull the value at row index. For scalar args, all rows see the same value.
-    let sv: datafusion::scalar::ScalarValue = match cv {
-        ColumnarValue::Scalar(sv) => sv.clone(),
-        ColumnarValue::Array(arr) => {
-            datafusion::scalar::ScalarValue::try_from_array(arr.as_ref(), row).map_err(|e| {
-                BasinError::InvalidSchema(format!(
-                    "WASM UDF {fn_name}: failed to extract row {row} from array: {e}"
-                ))
-            })?
-        }
-    };
-
     if is_dynamic_bytes(sql_type) {
-        // NULL → (0, -1). Empty → (alloc_ptr, 0).
-        let bytes: Option<Vec<u8>> = match (sql_type, &sv) {
-            (SqlArgType::Text, datafusion::scalar::ScalarValue::Utf8(Some(s)))
-            | (SqlArgType::Text, datafusion::scalar::ScalarValue::LargeUtf8(Some(s)))
-            | (SqlArgType::Text, datafusion::scalar::ScalarValue::Utf8View(Some(s))) => {
-                Some(s.as_bytes().to_vec())
+        // Fast path for `Array` inputs: downcast directly to the concrete
+        // Arrow array and borrow the row's bytes, skipping the
+        // `ScalarValue::try_from_array` detour (which would clone into an
+        // owned `ScalarValue::Utf8(String)` / `Binary(Vec)` and then we'd
+        // re-clone via `as_bytes().to_vec()` — two heap allocs per row).
+        // The borrowed `&[u8]` is written straight into guest linear memory.
+        let null_bytes: Option<&[u8]> = match cv {
+            ColumnarValue::Array(arr) => {
+                if arr.is_null(row) {
+                    None
+                } else {
+                    Some(downcast_row_bytes(fn_name, arr.as_ref(), row, sql_type)?)
+                }
             }
-            (SqlArgType::Text, datafusion::scalar::ScalarValue::Utf8(None))
-            | (SqlArgType::Text, datafusion::scalar::ScalarValue::LargeUtf8(None))
-            | (SqlArgType::Text, datafusion::scalar::ScalarValue::Utf8View(None)) => None,
-            (SqlArgType::Bytea, datafusion::scalar::ScalarValue::Binary(Some(b)))
-            | (SqlArgType::Bytea, datafusion::scalar::ScalarValue::LargeBinary(Some(b)))
-            | (SqlArgType::Bytea, datafusion::scalar::ScalarValue::BinaryView(Some(b))) => {
-                Some(b.clone())
-            }
-            (SqlArgType::Bytea, datafusion::scalar::ScalarValue::Binary(None))
-            | (SqlArgType::Bytea, datafusion::scalar::ScalarValue::LargeBinary(None))
-            | (SqlArgType::Bytea, datafusion::scalar::ScalarValue::BinaryView(None)) => None,
-            (_, other) => {
-                return Err(BasinError::InvalidSchema(format!(
-                    "WASM UDF {fn_name}: expected {sql_type:?} argument, got {other:?}"
-                )));
-            }
+            ColumnarValue::Scalar(sv) => scalar_dynamic_bytes(fn_name, sv, sql_type)?,
         };
-        match bytes {
+        match null_bytes {
             None => {
                 // NULL marker: ptr=0, len=-1.
                 wasm_args.push(wasmtime::Val::I32(0));
@@ -632,7 +638,7 @@ fn extract_row_into_wasm_args(
                     store,
                     alloc.expect("dynamic arg requires alloc"),
                     memory.expect("dynamic arg requires memory"),
-                    &b,
+                    b,
                 )?;
                 wasm_args.push(wasmtime::Val::I32(ptr));
                 wasm_args.push(wasmtime::Val::I32(len));
@@ -641,10 +647,94 @@ fn extract_row_into_wasm_args(
         return Ok(());
     }
 
-    // Numeric arms (Int / BigInt / Double / Timestamp / TimestampTz).
+    // Numeric arms (Int / BigInt / Double / Timestamp / TimestampTz). Pull the
+    // value at row index. For scalar args, all rows see the same value.
+    let sv: datafusion::scalar::ScalarValue = match cv {
+        ColumnarValue::Scalar(sv) => sv.clone(),
+        ColumnarValue::Array(arr) => {
+            datafusion::scalar::ScalarValue::try_from_array(arr.as_ref(), row).map_err(|e| {
+                BasinError::InvalidSchema(format!(
+                    "WASM UDF {fn_name}: failed to extract row {row} from array: {e}"
+                ))
+            })?
+        }
+    };
     let val = scalar_to_numeric_val(fn_name, &sv, sql_type)?;
     wasm_args.push(val);
     Ok(())
+}
+
+/// Borrow the `row`-th value of a Text/Bytea Arrow `arr` as `&[u8]` via a
+/// direct concrete-type downcast — no `ScalarValue` allocation. Handles the
+/// `Utf8`/`LargeUtf8`/`Utf8View` and `Binary`/`LargeBinary`/`BinaryView`
+/// physical encodings DataFusion may present. Caller has already verified the
+/// row is non-NULL.
+fn downcast_row_bytes<'a>(
+    fn_name: &str,
+    arr: &'a dyn Array,
+    row: usize,
+    sql_type: SqlArgType,
+) -> Result<&'a [u8]> {
+    let any = arr.as_any();
+    let out: Option<&[u8]> = match sql_type {
+        SqlArgType::Text => {
+            if let Some(a) = any.downcast_ref::<StringArray>() {
+                Some(a.value(row).as_bytes())
+            } else if let Some(a) = any.downcast_ref::<LargeStringArray>() {
+                Some(a.value(row).as_bytes())
+            } else if let Some(a) = any.downcast_ref::<StringViewArray>() {
+                Some(a.value(row).as_bytes())
+            } else {
+                None
+            }
+        }
+        SqlArgType::Bytea => {
+            if let Some(a) = any.downcast_ref::<BinaryArray>() {
+                Some(a.value(row))
+            } else if let Some(a) = any.downcast_ref::<LargeBinaryArray>() {
+                Some(a.value(row))
+            } else if let Some(a) = any.downcast_ref::<BinaryViewArray>() {
+                Some(a.value(row))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    out.ok_or_else(|| {
+        BasinError::InvalidSchema(format!(
+            "WASM UDF {fn_name}: expected {sql_type:?} argument, got array of type {:?}",
+            arr.data_type()
+        ))
+    })
+}
+
+/// Borrow the bytes of a scalar Text/Bytea `ScalarValue`, returning `None`
+/// for NULL. Used only on the scalar-input path (no per-row allocation to
+/// remove there since the scalar is already materialised).
+fn scalar_dynamic_bytes<'a>(
+    fn_name: &str,
+    sv: &'a datafusion::scalar::ScalarValue,
+    sql_type: SqlArgType,
+) -> Result<Option<&'a [u8]>> {
+    use datafusion::scalar::ScalarValue as SV;
+    match (sql_type, sv) {
+        (SqlArgType::Text, SV::Utf8(Some(s)))
+        | (SqlArgType::Text, SV::LargeUtf8(Some(s)))
+        | (SqlArgType::Text, SV::Utf8View(Some(s))) => Ok(Some(s.as_bytes())),
+        (SqlArgType::Text, SV::Utf8(None))
+        | (SqlArgType::Text, SV::LargeUtf8(None))
+        | (SqlArgType::Text, SV::Utf8View(None)) => Ok(None),
+        (SqlArgType::Bytea, SV::Binary(Some(b)))
+        | (SqlArgType::Bytea, SV::LargeBinary(Some(b)))
+        | (SqlArgType::Bytea, SV::BinaryView(Some(b))) => Ok(Some(b.as_slice())),
+        (SqlArgType::Bytea, SV::Binary(None))
+        | (SqlArgType::Bytea, SV::LargeBinary(None))
+        | (SqlArgType::Bytea, SV::BinaryView(None)) => Ok(None),
+        (_, other) => Err(BasinError::InvalidSchema(format!(
+            "WASM UDF {fn_name}: expected {sql_type:?} argument, got {other:?}"
+        ))),
+    }
 }
 
 /// Numeric-arm extractor — the original v0.1 logic, plus Timestamp /
@@ -1134,6 +1224,7 @@ pub(crate) fn make_wasm_scalar_udf(def: &SqlFunctionDef) -> Option<Arc<ScalarUDF
         return_sql_type,
         epoch_deadline: 1, // 1 epoch ≈ epoch_ms ms
         max_mem_bytes: mem_bytes(),
+        instance_pre: std::sync::OnceLock::new(),
     };
 
     Some(Arc::new(ScalarUDF::new_from_impl(udf_impl)))
