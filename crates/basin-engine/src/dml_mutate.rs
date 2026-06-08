@@ -48,6 +48,7 @@
 use crate::pg_ast::ObjectNamePartExt;
 use object_store::ObjectStoreExt;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use arrow_array::builder::{
     BooleanBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder,
@@ -1890,68 +1891,53 @@ pub(crate) async fn exec_update(
     // filtered batch with only the matched rows.
     let mut returning_input: Vec<RecordBatch> = Vec::new();
 
-    for f in &data_files {
-        let outcome = file_outcome(pred.as_ref(), f, schema.as_ref());
-        match (outcome, &pred) {
-            (PruneOutcome::NoMatch, Some(_)) => {
-                // Pass-through. No read, no write.
-            }
-            // AllMatch with predicate, or no predicate at all: every row is
-            // matched. We still need the file's contents to apply SET.
-            (PruneOutcome::AllMatch, _) | (PruneOutcome::Mixed, None) => {
-                let catalog = &sess.engine.config().catalog;
-                let (mut new_batches, before_batches, all_true_masks) = if capture_events {
+    // Inv-bulk-UPDATE #182: the serial read-modify-write loop over data
+    // files is the dominant cost (80-90%) of bulk UPDATE. Files are
+    // independent in the NO-SINK / no-capture common case, so we fan the
+    // read+mask+apply out with `buffer_unordered` and reassemble in a
+    // deterministic order afterwards.
+    //
+    // The capture_events path (CDC sinks, audit, generated columns,
+    // expression RHS, RETURNING) keeps the serial loop: event ordering and
+    // the per-file before/after pairing are correctness-load-bearing there.
+    if capture_events {
+        for f in &data_files {
+            let outcome = file_outcome(pred.as_ref(), f, schema.as_ref());
+            match (outcome, &pred) {
+                (PruneOutcome::NoMatch, Some(_)) => {
+                    // Pass-through. No read, no write.
+                }
+                // AllMatch with predicate, or no predicate at all: every row
+                // is matched. We still need the file's contents to apply SET.
+                (PruneOutcome::AllMatch, _) | (PruneOutcome::Mixed, None) => {
+                    let catalog = &sess.engine.config().catalog;
                     let befores =
                         read_file_to_batches(&storage, &sess.project, &f.path, schema.as_ref())
                             .await?;
-                    let mut all_masks = Vec::with_capacity(befores.len());
-                    for b in &befores {
-                        all_masks.push(BooleanArray::from(vec![true; b.num_rows()]));
-                    }
-                    let news = apply_assignments_all(
+                    let mut new_batches = apply_assignments_all(
                         &sess.engine.config().catalog,
                         &sess.project,
                         &befores,
                         &assignments,
                     )
                     .await?;
-                    (news, befores, all_masks)
-                } else {
-                    let news = read_and_apply_assignments(
-                        &sess.engine.config().catalog,
-                        &storage,
-                        &sess.project,
-                        &f.path,
-                        None,
-                        &assignments,
-                        schema.as_ref(),
-                    )
-                    .await?;
-                    (news, Vec::new(), Vec::new())
-                };
-                if has_generated_cols {
-                    let mut rebuilt = Vec::with_capacity(new_batches.len());
-                    for b in new_batches {
-                        rebuilt.push(
-                            crate::generated_cols::materialise_generated_columns(
-                                catalog,
-                                &sess.project,
-                                b,
-                            )
-                            .await?,
-                        );
+                    if has_generated_cols {
+                        let mut rebuilt = Vec::with_capacity(new_batches.len());
+                        for b in new_batches {
+                            rebuilt.push(
+                                crate::generated_cols::materialise_generated_columns(
+                                    catalog,
+                                    &sess.project,
+                                    b,
+                                )
+                                .await?,
+                            );
+                        }
+                        new_batches = rebuilt;
                     }
-                    new_batches = rebuilt;
-                }
-                updated_total += f.row_count as usize;
-                replaced_paths.push(f.path.as_ref().to_string());
-                if capture_events {
-                    capture_update_events(
-                        &before_batches,
-                        &new_batches,
-                        None,
-                        &mut event_payloads,
-                    )?;
+                    updated_total += f.row_count as usize;
+                    replaced_paths.push(f.path.as_ref().to_string());
+                    capture_update_events(&befores, &new_batches, None, &mut event_payloads)?;
                     if want_returning_rows {
                         // AllMatch: every row matches; the unfiltered
                         // post-update batches feed RETURNING directly.
@@ -1959,72 +1945,51 @@ pub(crate) async fn exec_update(
                             returning_input.push(b.clone());
                         }
                     }
+                    replacement_batches.extend(new_batches);
                 }
-                let _ = all_true_masks; // silence unused when capture_events ran
-                replacement_batches.extend(new_batches);
-            }
-            (PruneOutcome::Mixed, Some(p)) => {
-                let catalog = &sess.engine.config().catalog;
-                let (rows_matched, mut new_batches, before_batches, mask_per_batch) =
-                    if capture_events {
-                        let befores =
-                            read_file_to_batches(&storage, &sess.project, &f.path, schema.as_ref())
-                                .await?;
-                        let mut masks = Vec::with_capacity(befores.len());
-                        let mut news = Vec::with_capacity(befores.len());
-                        let mut matched = 0usize;
-                        for b in &befores {
-                            let mask = evaluate_compound(b, p).map_err(|e| {
-                                BasinError::internal(format!("update predicate eval: {e}"))
-                            })?;
-                            matched += mask.iter().filter(|x| matches!(x, Some(true))).count();
-                            news.push(
-                                apply_assignments(catalog, &sess.project, b, &mask, &assignments)
-                                    .await?,
-                            );
-                            masks.push(mask);
-                        }
-                        (matched, news, befores, masks)
-                    } else {
-                        let (matched, news) = read_and_apply_assignments_mixed(
-                            catalog,
-                            &storage,
-                            &sess.project,
-                            &f.path,
-                            p,
-                            &assignments,
-                            schema.as_ref(),
-                        )
-                        .await?;
-                        (matched, news, Vec::new(), Vec::new())
-                    };
-                if rows_matched == 0 {
-                    // Stats said maybe-match but no rows actually matched —
-                    // pass through instead of pointlessly rewriting.
-                    continue;
-                }
-                if has_generated_cols {
-                    // We took the capture_events branch above, so masks
-                    // are populated 1:1 with new_batches.
-                    let mut rebuilt = Vec::with_capacity(new_batches.len());
-                    for (b, m) in new_batches.into_iter().zip(mask_per_batch.iter()) {
-                        rebuilt.push(
-                            crate::generated_cols::materialise_generated_columns_masked(
-                                &sess.engine.config().catalog,
-                                &sess.project,
-                                b,
-                                m,
-                            )
-                            .await?,
+                (PruneOutcome::Mixed, Some(p)) => {
+                    let catalog = &sess.engine.config().catalog;
+                    let befores =
+                        read_file_to_batches(&storage, &sess.project, &f.path, schema.as_ref())
+                            .await?;
+                    let mut mask_per_batch = Vec::with_capacity(befores.len());
+                    let mut new_batches = Vec::with_capacity(befores.len());
+                    let mut rows_matched = 0usize;
+                    for b in &befores {
+                        let mask = evaluate_compound(b, p).map_err(|e| {
+                            BasinError::internal(format!("update predicate eval: {e}"))
+                        })?;
+                        rows_matched += mask.iter().filter(|x| matches!(x, Some(true))).count();
+                        new_batches.push(
+                            apply_assignments(catalog, &sess.project, b, &mask, &assignments)
+                                .await?,
                         );
+                        mask_per_batch.push(mask);
                     }
-                    new_batches = rebuilt;
-                }
-                updated_total += rows_matched;
-                replaced_paths.push(f.path.as_ref().to_string());
-                if capture_events {
+                    if rows_matched == 0 {
+                        // Stats said maybe-match but no rows actually matched
+                        // — pass through instead of pointlessly rewriting.
+                        continue;
+                    }
+                    if has_generated_cols {
+                        let mut rebuilt = Vec::with_capacity(new_batches.len());
+                        for (b, m) in new_batches.into_iter().zip(mask_per_batch.iter()) {
+                            rebuilt.push(
+                                crate::generated_cols::materialise_generated_columns_masked(
+                                    &sess.engine.config().catalog,
+                                    &sess.project,
+                                    b,
+                                    m,
+                                )
+                                .await?,
+                            );
+                        }
+                        new_batches = rebuilt;
+                    }
+                    updated_total += rows_matched;
+                    replaced_paths.push(f.path.as_ref().to_string());
                     capture_update_events(
-                        &before_batches,
+                        &befores,
                         &new_batches,
                         Some(&mask_per_batch),
                         &mut event_payloads,
@@ -2042,12 +2007,59 @@ pub(crate) async fn exec_update(
                             }
                         }
                     }
+                    replacement_batches.extend(new_batches);
                 }
-                replacement_batches.extend(new_batches);
+                // AllMatch + None handled above; this branch is unreachable
+                // in practice but kept for the exhaustive match.
+                (PruneOutcome::NoMatch, None) => unreachable!(),
             }
-            // AllMatch + None handled above; this branch is unreachable in
-            // practice but kept for the exhaustive match.
-            (PruneOutcome::NoMatch, None) => unreachable!(),
+        }
+    } else {
+        // Parallel read-modify-apply. Each file is independent: the
+        // predicate and SET assignments are read-only shared state, every
+        // file produces its own replacement batches with no cross-file
+        // mutation. We collect `Option<PerFileUpdate>` (None = pruned /
+        // no-op pass-through) and sort by original file path so the
+        // downstream commit, PK/UNIQUE enforcement, and GIN/GIST index
+        // maintenance see a deterministic file order.
+        // Shared state captured by each per-file future is wrapped in `Arc`
+        // (or is already cheaply clonable) so the spawned futures own their
+        // captures — borrowing `&str`/`&ProjectSession` across the
+        // `buffer_unordered` await points trips a higher-ranked `Send`
+        // inference failure when the whole UPDATE future is later spawned
+        // (reactor sink path), so we hand each file an owned clone instead.
+        let catalog = sess.engine.config().catalog.clone();
+        let storage_arc = storage.clone();
+        let assignments_arc = Arc::new(assignments.clone());
+        let pred_arc = Arc::new(pred.clone());
+        let project_id = sess.project.clone();
+        let concurrency = update_scan_concurrency(data_files.len());
+        let results: Vec<Option<PerFileUpdate>> = futures::stream::iter(data_files.iter().cloned())
+            .map(|f| {
+                let catalog = catalog.clone();
+                let storage = storage_arc.clone();
+                let assignments = assignments_arc.clone();
+                let pred = pred_arc.clone();
+                let project = project_id.clone();
+                let schema = schema.clone();
+                apply_update_to_file(catalog, storage, project, schema, pred, assignments, f)
+            })
+            .buffer_unordered(concurrency)
+            .collect::<Vec<Result<Option<PerFileUpdate>>>>()
+            .await
+            .into_iter()
+            // Propagate the first error — never silently drop a failed file.
+            .collect::<Result<Vec<Option<PerFileUpdate>>>>()?;
+
+        // Deterministic reassembly: sort by original file path so
+        // replaced_paths and replacement_batches stay in a stable order
+        // independent of buffer_unordered completion order.
+        let mut updates: Vec<PerFileUpdate> = results.into_iter().flatten().collect();
+        updates.sort_by(|a, b| a.path.cmp(&b.path));
+        for u in updates {
+            updated_total += u.rows_matched;
+            replaced_paths.push(u.path);
+            replacement_batches.extend(u.batches);
         }
     }
 
@@ -3230,6 +3242,26 @@ fn capture_update_events(
 
 /// Wrap the pruning evaluator: returns `Mixed` if the predicate is `None`
 /// so callers can branch uniformly.
+/// Concurrency for the parallel bulk-UPDATE/DELETE read-modify-apply fan-out
+/// (Inv-bulk-UPDATE #182). Defaults to `available_parallelism()`, capped at
+/// 16, overridable via `BASIN_UPDATE_SCAN_CONCURRENCY`. Never fans out wider
+/// than the file count, and is at least 1.
+fn update_scan_concurrency(file_count: usize) -> usize {
+    static CAP: OnceLock<usize> = OnceLock::new();
+    let cap = *CAP.get_or_init(|| {
+        let from_env: Option<usize> = std::env::var("BASIN_UPDATE_SCAN_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0);
+        from_env.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        })
+    });
+    cap.min(16).min(file_count.max(1)).max(1)
+}
+
 fn file_outcome(
     pred: Option<&CompoundPredicate>,
     file: &DataFile,
@@ -3273,6 +3305,76 @@ async fn evaluate_and_partition_delete(
         }
     }
     Ok(kept)
+}
+
+/// One file's contribution to a bulk UPDATE: the original file path, the
+/// number of rows that matched (= rewritten), and the post-SET replacement
+/// batches. Produced by the parallel no-capture fan-out and reassembled in
+/// deterministic path order by the caller.
+struct PerFileUpdate {
+    path: String,
+    rows_matched: usize,
+    batches: Vec<RecordBatch>,
+}
+
+/// Read+mask+apply for a single data file in the parallel (no-capture)
+/// bulk-UPDATE path. All shared state is owned (`Arc`/clone) so the future
+/// is fully `Send` and can be driven by `buffer_unordered` even when the
+/// enclosing UPDATE future is later spawned. Returns `None` for a pruned or
+/// no-op (stats-said-maybe-but-matched-nothing) file.
+async fn apply_update_to_file(
+    catalog: Arc<dyn basin_catalog::Catalog>,
+    storage: Storage,
+    project: ProjectId,
+    schema: Arc<Schema>,
+    pred: Arc<Option<CompoundPredicate>>,
+    assignments: Arc<Vec<(usize, AssignmentRhs)>>,
+    f: DataFile,
+) -> Result<Option<PerFileUpdate>> {
+    let outcome = file_outcome(pred.as_ref().as_ref(), &f, schema.as_ref());
+    match (outcome, pred.as_ref()) {
+        (PruneOutcome::NoMatch, Some(_)) => Ok(None),
+        (PruneOutcome::AllMatch, _) | (PruneOutcome::Mixed, None) => {
+            let news = read_and_apply_assignments(
+                &catalog,
+                &storage,
+                &project,
+                &f.path,
+                None,
+                assignments.as_ref(),
+                schema.as_ref(),
+            )
+            .await?;
+            Ok(Some(PerFileUpdate {
+                path: f.path.as_ref().to_string(),
+                rows_matched: f.row_count as usize,
+                batches: news,
+            }))
+        }
+        (PruneOutcome::Mixed, Some(p)) => {
+            let (matched, news) = read_and_apply_assignments_mixed(
+                &catalog,
+                &storage,
+                &project,
+                &f.path,
+                p,
+                assignments.as_ref(),
+                schema.as_ref(),
+            )
+            .await?;
+            if matched == 0 {
+                // Stats said maybe-match but no rows actually matched —
+                // pass through, no rewrite.
+                return Ok(None);
+            }
+            Ok(Some(PerFileUpdate {
+                path: f.path.as_ref().to_string(),
+                rows_matched: matched,
+                batches: news,
+            }))
+        }
+        (PruneOutcome::NoMatch, None) => unreachable!(),
+    }
 }
 
 /// Read a single Parquet file and apply SET to every row (when `pred` is
