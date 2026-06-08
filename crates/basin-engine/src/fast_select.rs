@@ -1578,6 +1578,86 @@ pub(crate) async fn execute_simple_select(
     }
     // ── End Phase 5.14.C3 probe ──────────────────────────────────────────────
 
+    // ── PK row cache context (correctness-critical; gated OFF by default) ─────
+    //
+    // Build the cache descriptor for the canonical single-PK-Eq point-lookup
+    // shape. We only enter this when:
+    //   * the feature flag `BASIN_PK_ROW_CACHE=1` is set (default OFF);
+    //   * the table has RLS DISABLED (`!meta.rls_enabled`) — a cached row is the
+    //     RAW row, never an RLS-filtered view, so it must NEVER be served for an
+    //     RLS table (bug family #159). NB: `execute_simple_select` is already
+    //     only reached when `!has_rls` (executor gate), so this is defence in
+    //     depth, never the sole guard;
+    //   * exactly one Eq predicate on the sole PK column, no IN-list, no IS NULL,
+    //     no aggregate, no computed projection — i.e. a plain `SELECT cols FROM t
+    //     WHERE pk = X`;
+    //   * the PK literal encodes to a `RowKey` (same encoding the cold tier +
+    //     hot-tier DML use).
+    //
+    // The two watermarks are captured HERE (epoch + snapshot) and re-checked on
+    // GET. The hot-tier epoch was already advanced by any fast-path DML; the
+    // snapshot id moves on any cold-tier commit (incl. other replicas).
+    //
+    // Reaching this point means the memtable probe above found NO hot row for
+    // this PK (it returned early on a hit) and NO tombstone forcing suppression
+    // for this key — so the cold-tier read is authoritative and cacheable.
+    let pk_cache_ctx: Option<(basin_hottier::RowKey, u64, u64, u64)> =
+        if crate::pk_row_cache::PkRowCache::enabled()
+            && !meta.rls_enabled
+            && meta.pk_columns.len() == 1
+            && plan.aggregates.is_none()
+            && plan.in_list_preds.is_empty()
+            && plan.is_null_cols.is_empty()
+            && plan.predicates.len() == 1
+            && plan
+                .projection
+                .as_ref()
+                .map(|items| {
+                    items
+                        .iter()
+                        .all(|it| matches!(it, ProjectionItem::Column(_)))
+                })
+                .unwrap_or(true)
+        {
+            let pk_col = &meta.pk_columns[0];
+            match &plan.predicates[0] {
+                Predicate::Eq(col, val) if col == pk_col => {
+                    if let Ok(pk_idx) = meta.schema.index_of(col) {
+                        let pk_dt = meta.schema.field(pk_idx).data_type().clone();
+                        crate::dml_mutate::pk_scalar_to_row_key(val, &pk_dt).map(|rk| {
+                            let hot_epoch = sess
+                                .engine
+                                .memtable_registry()
+                                .hot_tier_epoch(&sess.project, &plan.table);
+                            let snap = meta.current_snapshot.0;
+                            let proj_hash =
+                                crate::pk_row_cache::hash_read_cols(plan.read_cols.as_deref());
+                            (rk, hot_epoch, snap, proj_hash)
+                        })
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+    // PK row cache GET: on a valid dual-watermark hit, serve the cached cold-row
+    // batches directly and skip the secondary-index probe, file pruning, and
+    // Parquet decode entirely. The cached batches are in `read_cols` order (the
+    // shape the cold read produced), exactly what the projection code below
+    // expects — so a hit short-circuits straight into the shared projection.
+    let pk_cache_hit: Option<Vec<RecordBatch>> = pk_cache_ctx.as_ref().and_then(
+        |(rk, hot_epoch, snap, proj_hash)| {
+            sess.engine
+                .pk_row_cache()
+                .get(&sess.project, &plan.table, rk, *hot_epoch, *snap, *proj_hash)
+                .map(|arc| (*arc).clone())
+        },
+    );
+
     // ── Phase 5.7 B1: secondary index probe ─────────────────────────────────
     //
     // For Eq-predicate point queries, check if we have a loaded secondary
@@ -1763,6 +1843,14 @@ pub(crate) async fn execute_simple_select(
     }
 
     let pk_probe_paths: Option<Vec<object_store::path::Path>> = if
+        // PK row cache hit: the cached batches already answer this point query;
+        // skip the zone-map + bloom probe (and its possible Absent early-return)
+        // entirely so the warm path is a pure in-RAM HashMap lookup. The cache's
+        // valid watermark guarantees the cold files are unchanged, so the probe
+        // would only re-derive what we already hold.
+        pk_cache_hit.is_some() {
+        None
+    } else if
         plan.aggregates.is_none()
         && plan.is_null_cols.is_empty()
         && meta.pk_columns.len() == 1
@@ -1948,7 +2036,16 @@ pub(crate) async fn execute_simple_select(
             .collect()
     };
 
-    let batches = if had_pk_probe {
+    // PK row cache HIT short-circuit: when the dual-watermark GET above
+    // succeeded we already hold the post-overlay cold-row batches (in
+    // `read_cols` order). Skip the cold read AND the hot-overlay below — a
+    // valid hot_epoch watermark means the memtable is byte-for-byte unchanged
+    // since the entry was cached, so re-applying tombstone/update overlay would
+    // be a no-op anyway. Fall straight into the shared projection.
+    let pk_cache_served = pk_cache_hit.is_some();
+    let batches = if let Some(cached) = pk_cache_hit {
+        cached
+    } else if had_pk_probe {
         // Single-PK-Eq fast path: the PK probe already narrowed the cold
         // tier to at most a handful of candidate files (typically 0-1).
         // Read those paths directly, bypassing `handle.read`'s full file
@@ -2041,7 +2138,12 @@ pub(crate) async fn execute_simple_select(
     // Happy path: `snapshot_tombstones` returns an empty set (the common case
     // for tables that have not been touched by a fast-path DELETE), so the
     // helper is a noop and the batches pass through unchanged.
-    let batches = if meta.pk_columns.len() == 1 {
+    let batches = if pk_cache_served {
+        // A cache hit already returned post-overlay batches; the valid
+        // hot_epoch watermark proves the memtable is unchanged, so re-running
+        // the overlay would be a no-op. Skip it.
+        batches
+    } else if meta.pk_columns.len() == 1 {
         let pk_col = &meta.pk_columns[0];
         let registry = sess.engine.memtable_registry();
         let tombs = crate::hot_tombstone::snapshot_tombstones(
@@ -2076,6 +2178,34 @@ pub(crate) async fn execute_simple_select(
     } else {
         batches
     };
+
+    // PK row cache POPULATE (miss path only): we have the authoritative
+    // post-overlay cold-row batches in `read_cols` order. For the cacheable
+    // shape there are no IS NULL / IN-list post-filters (gated out when
+    // building `pk_cache_ctx`), so these batches are the final per-PK cold-row
+    // content. Store them with the two watermarks captured BEFORE the read —
+    // capturing pre-read is conservative: if a concurrent DML advanced the
+    // epoch/snapshot during our read, the stored watermark is older than the
+    // live one, so the very next GET sees a mismatch and refuses the entry
+    // (no stale serve). We only cache 0- or 1-row results (a PK point lookup
+    // yields at most one row); a multi-row result would indicate a non-PK
+    // shape and is left uncached.
+    if !pk_cache_served {
+        if let Some((rk, hot_epoch, snap, proj_hash)) = pk_cache_ctx {
+            let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+            if row_count <= 1 {
+                sess.engine.pk_row_cache().insert(
+                    &sess.project,
+                    &plan.table,
+                    rk,
+                    hot_epoch,
+                    snap,
+                    proj_hash,
+                    batches.clone(),
+                );
+            }
+        }
+    }
 
     // Apply post-read IS NULL filters. `Predicate` has no `IsNull` variant so
     // these cannot be pushed into the storage layer; we apply them here using

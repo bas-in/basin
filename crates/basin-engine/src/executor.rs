@@ -1962,6 +1962,17 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
         || (in_txn_for_cache && matches!(stmt, Statement::Insert(_)));
     if !stmt_keeps_cache {
         sess.state.table_meta_cache.invalidate_all();
+        // PK row cache (gated OFF by default): the same statement classes that
+        // flush the table-meta cache — any non-SELECT, plus DML — can change a
+        // table's schema or rewrite its rows. Most are caught by the cache's
+        // dual watermark (snapshot id + hot epoch), but metadata-only DDL (e.g.
+        // ENABLE ROW LEVEL SECURITY, ADD COLUMN with no rewrite) may not bump
+        // `current_snapshot`; clear the project's PK rows here so a schema or
+        // policy change can never serve a stale/old-shape row. Cheap no-op when
+        // the flag is off or the cache is empty for this project.
+        if crate::pk_row_cache::PkRowCache::enabled() {
+            sess.engine.pk_row_cache().invalidate_project(&sess.project);
+        }
     }
 
     // Phase 6 cost-based query rejection. Cheap when disabled (one

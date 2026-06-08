@@ -106,6 +106,14 @@ pub struct MemTable {
     /// `u64::MAX` = empty (no writes since last drain).  Used by the flush
     /// task's age-based trigger without acquiring the BTree lock.
     oldest_insert_secs: AtomicU64,
+    /// Monotonic mutation counter (Fix A — PK row cache invalidation).
+    /// Bumped on EVERY memtable mutation: insert / upsert / delete.
+    /// A PK-row-cache entry caches this value as a watermark; on lookup,
+    /// a mismatch means the memtable changed since the entry was cached →
+    /// the entry is treated as stale. This catches fast-path DML
+    /// (INSERT/UPDATE/DELETE that writes only the memtable, not the catalog
+    /// snapshot). Starts at 0; first mutation makes it 1.
+    epoch: AtomicU64,
 }
 
 impl MemTable {
@@ -115,7 +123,23 @@ impl MemTable {
             inner: RwLock::new(BTreeMap::new()),
             bytes_allocated: AtomicU64::new(0),
             oldest_insert_secs: AtomicU64::new(u64::MAX),
+            epoch: AtomicU64::new(0),
         }
+    }
+
+    /// Current mutation epoch (Fix A). Cheap — single atomic load, no lock.
+    /// Bumped on every insert / upsert / delete. Used as the hot-tier
+    /// watermark for the PK row cache: an entry is valid only if this value
+    /// matches the value captured when the entry was inserted.
+    #[inline]
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    /// Bump the mutation epoch. Called by every mutation path.
+    #[inline]
+    fn bump_epoch(&self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
     }
 
     // ── Age tracking ──────────────────────────────────────────────────────────
@@ -173,6 +197,7 @@ impl MemTable {
             Ordering::Relaxed,
         );
         self.record_write_time();
+        self.bump_epoch();
     }
 
     /// Upsert a row: insert or overwrite.  Same semantics as `insert`.
@@ -196,6 +221,7 @@ impl MemTable {
             Ordering::Relaxed,
         );
         self.record_write_time();
+        self.bump_epoch();
     }
 
     // ── Reads ─────────────────────────────────────────────────────────────────
@@ -345,6 +371,57 @@ mod tests {
         mt.delete(key(5));
         mt.upsert(key(5), row(0xBB));
         assert!(mt.get(&key(5)).unwrap().is_row());
+    }
+
+    // ── epoch (Fix A — PK row cache invalidation) ─────────────────────────────
+
+    #[test]
+    fn epoch_starts_at_zero() {
+        let mt = MemTable::new();
+        assert_eq!(mt.epoch(), 0);
+    }
+
+    #[test]
+    fn epoch_increases_on_insert() {
+        let mt = MemTable::new();
+        let e0 = mt.epoch();
+        mt.insert(key(1), row(0x01));
+        let e1 = mt.epoch();
+        assert!(e1 > e0, "epoch must increase after insert: {e0} -> {e1}");
+    }
+
+    #[test]
+    fn epoch_increases_on_upsert() {
+        let mt = MemTable::new();
+        mt.insert(key(1), row(0x01));
+        let e1 = mt.epoch();
+        mt.upsert(key(1), row(0x02));
+        let e2 = mt.epoch();
+        assert!(e2 > e1, "epoch must increase after upsert: {e1} -> {e2}");
+    }
+
+    #[test]
+    fn epoch_increases_on_delete() {
+        let mt = MemTable::new();
+        mt.insert(key(1), row(0x01));
+        let e1 = mt.epoch();
+        mt.delete(key(1));
+        let e2 = mt.epoch();
+        assert!(e2 > e1, "epoch must increase after delete: {e1} -> {e2}");
+    }
+
+    #[test]
+    fn epoch_monotonic_across_mixed_mutations() {
+        let mt = MemTable::new();
+        let mut last = mt.epoch();
+        for i in 0..10i64 {
+            mt.insert(key(i), row(i as u8));
+            let now = mt.epoch();
+            assert!(now > last, "epoch not monotonic at insert {i}");
+            last = now;
+        }
+        mt.delete(key(0));
+        assert!(mt.epoch() > last);
     }
 
     // ── schema_version ────────────────────────────────────────────────────────

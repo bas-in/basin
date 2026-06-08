@@ -213,6 +213,23 @@ impl MemTableRegistry {
             .clone()
     }
 
+    /// Current hot-tier mutation epoch for `(project, table)` (Fix A).
+    ///
+    /// Returns the memtable's monotonic mutation counter, bumped on every
+    /// insert / upsert / delete. Returns `0` when the project/table has never
+    /// received a write (no memtable entry exists) — which matches a freshly
+    /// constructed memtable's epoch, so the watermark is consistent across the
+    /// lazy-allocation boundary.
+    ///
+    /// Used by the PK row cache as one of the two invalidation watermarks: a
+    /// cached entry is valid only if `entry.hot_epoch == hot_tier_epoch(...)`.
+    pub fn hot_tier_epoch(&self, project: &ProjectId, table: &TableName) -> u64 {
+        self.tables
+            .get(&(*project, table.clone()))
+            .map(|e| e.memtable.epoch())
+            .unwrap_or(0)
+    }
+
     /// Look up an existing entry without creating one.
     pub fn get(&self, project: &ProjectId, table: &TableName) -> Option<Arc<MemTableEntry>> {
         self.tables
@@ -621,5 +638,46 @@ mod tests {
     fn project_bytes_returns_zero_for_unknown_project() {
         let reg = MemTableRegistry::new();
         assert_eq!(reg.project_bytes(&proj()), 0);
+    }
+
+    // ── hot_tier_epoch (Fix A — PK row cache invalidation) ────────────────────
+
+    #[test]
+    fn hot_tier_epoch_zero_for_untouched_table() {
+        let reg = MemTableRegistry::new();
+        let p = proj();
+        assert_eq!(reg.hot_tier_epoch(&p, &tbl("never_written")), 0);
+    }
+
+    #[test]
+    fn hot_tier_epoch_bumps_on_insert_delete_update() {
+        let reg = MemTableRegistry::new();
+        let p = proj();
+        let t = tbl("orders");
+        let e0 = reg.hot_tier_epoch(&p, &t);
+        let entry = reg.get_or_create(p, t.clone());
+        entry.memtable.insert(key(1), row_val());
+        let e1 = reg.hot_tier_epoch(&p, &t);
+        assert!(e1 > e0, "insert must bump epoch: {e0} -> {e1}");
+        // "update" = upsert in the memtable model
+        entry.memtable.upsert(key(1), row_val());
+        let e2 = reg.hot_tier_epoch(&p, &t);
+        assert!(e2 > e1, "update must bump epoch: {e1} -> {e2}");
+        entry.memtable.delete(key(1));
+        let e3 = reg.hot_tier_epoch(&p, &t);
+        assert!(e3 > e2, "delete must bump epoch: {e2} -> {e3}");
+    }
+
+    #[test]
+    fn hot_tier_epoch_isolated_per_table() {
+        let reg = MemTableRegistry::new();
+        let p = proj();
+        let t1 = tbl("a");
+        let t2 = tbl("b");
+        reg.get_or_create(p, t1.clone())
+            .memtable
+            .insert(key(1), row_val());
+        assert!(reg.hot_tier_epoch(&p, &t1) > 0);
+        assert_eq!(reg.hot_tier_epoch(&p, &t2), 0);
     }
 }

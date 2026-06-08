@@ -295,6 +295,10 @@ pub(crate) struct EngineInner {
     /// otherwise dominates bulk-INSERT cost. Invalidated by any mutation
     /// that adds, removes, or replaces a data file for the table.
     pub(crate) pk_set_cache: Arc<crate::constraints::PkSetCache>,
+    /// Process-global PK → Row hot cache (correctness-critical; gated behind
+    /// `BASIN_PK_ROW_CACHE=1`, default OFF). Dual-watermark invalidation
+    /// (hot_tier_epoch + snapshot_id); see [`crate::pk_row_cache`].
+    pub(crate) pk_row_cache: Arc<crate::pk_row_cache::PkRowCache>,
 }
 
 impl Engine {
@@ -400,6 +404,7 @@ impl Engine {
             ),
             // Tier 2 bulk-INSERT PK set cache.
             pk_set_cache: Arc::new(crate::constraints::PkSetCache::new()),
+            pk_row_cache: Arc::new(crate::pk_row_cache::PkRowCache::from_env()),
         });
         // Phase 5.14.D2: register the query-history adapter with the shard so
         // the compactor can consult observed ORDER BY / GROUP BY patterns.
@@ -575,6 +580,29 @@ impl Engine {
     /// invalidate the entry whenever the table's data-file set changes.
     pub(crate) fn pk_set_cache(&self) -> &Arc<crate::constraints::PkSetCache> {
         &self.inner.pk_set_cache
+    }
+
+    /// Process-global PK → Row hot cache (gated behind `BASIN_PK_ROW_CACHE=1`,
+    /// default OFF). The fast SELECT point-query path consults it; DML
+    /// invalidation rides on the hot_tier_epoch watermark automatically and
+    /// DDL calls `invalidate_table`. The returned `Arc` is cheap to clone.
+    pub(crate) fn pk_row_cache(&self) -> &Arc<crate::pk_row_cache::PkRowCache> {
+        &self.inner.pk_row_cache
+    }
+
+    /// Public snapshot of PK row cache counters (hits / misses /
+    /// stale_evictions / inserts / evictions / current_bytes). Exposed for
+    /// correctness tests that assert the cache served a hit, refused a stale
+    /// entry, or was bypassed entirely.
+    pub fn pk_row_cache_counters(&self) -> crate::pk_row_cache::PkRowCacheCountersSnapshot {
+        self.inner.pk_row_cache.counters().snapshot()
+    }
+
+    /// Number of PK-row-cache entries for `project`. Project-scoped so a
+    /// correctness test can assert invalidation cleared exactly this project's
+    /// rows without cross-test interference on the process-global cache.
+    pub fn pk_row_cache_entries(&self, project: ProjectId) -> usize {
+        self.inner.pk_row_cache.entries_for_project(&project)
     }
 
     /// Per-shape HDR histogram registry (Phase 5.16.B).
@@ -1147,6 +1175,7 @@ impl Drop for ProjectSession {
     }
 }
 
+pub use crate::pk_row_cache::PkRowCacheCountersSnapshot;
 pub use crate::prepared::{BoundStatement, ScalarParam, StatementHandle, StatementSchema};
 
 /// Outcome of one SQL statement.
@@ -1241,6 +1270,7 @@ mod pg_operators;
 pub mod pg_plan;
 mod pg_scalar_aliases;
 mod prepared;
+mod pk_row_cache;
 mod query_history;
 pub mod jsonb_promotion;
 pub mod query_shape;
