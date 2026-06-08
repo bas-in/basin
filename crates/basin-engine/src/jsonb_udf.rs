@@ -1208,7 +1208,20 @@ fn raw_slice_to_text(slice: &[u8]) -> DFResult<Option<String>> {
             let v = raw_slice_to_value(slice)?;
             Ok(Some(serde_json::to_string(&v).unwrap_or_default()))
         }
-        None => Err(DataFusionError::Execution("jsonb decode error".into())),
+        None => {
+            // Defense-in-depth: a `None` type at the start of a located slice
+            // means the slice does not begin a well-formed JSON value. PG never
+            // errors on valid stored JSONB, so rather than failing the query we
+            // degrade to the slow-but-correct full-parse path on the slice.
+            // (A correct index never produces such a slice; this guards against
+            //  any future index regression — see `JsonbBatchIndex`.)
+            let v = raw_slice_to_value(slice)?;
+            match v {
+                Value::String(s) => Ok(Some(s)),
+                Value::Null => Ok(None),
+                other => Ok(Some(serde_json::to_string(&other).unwrap_or_default())),
+            }
+        }
     }
 }
 
@@ -1346,6 +1359,13 @@ impl JsonbBatchIndex {
             Some(map) => match map.get(key) {
                 None => Ok(None),
                 Some(&(start, end)) => {
+                    // Guard: a zero-length (start == end) range is never a valid
+                    // JSON value slice — treat as "not indexed" so the caller
+                    // falls back to the byte scanner rather than handing out an
+                    // empty slice.
+                    if start >= end {
+                        return Err(());
+                    }
                     let doc_bytes = arr.value(i);
                     let b = RawJson::new(doc_bytes).b;
                     Ok(b.get(start..end))
@@ -1407,13 +1427,26 @@ fn build_object_key_index(b: &[u8]) -> Option<HashMap<String, (usize, usize)>> {
     Some(map)
 }
 
-// Thread-local cache: maps (buffer_ptr as usize, num_rows) to the batch index.
-// The key uniquely identifies a LargeBinaryArray batch within the current thread.
-// The cache holds exactly ONE entry (most recent batch). DataFusion evaluates
-// UDFs within a batch sequentially on one thread before moving to the next, so
-// a single-entry cache is sufficient for the multi-field-projection case.
+// Cache key for a LargeBinaryArray batch:
+//   (values_ptr, values_len, offsets_ptr, num_rows)
+//
+// The value-buffer pointer + row count alone is NOT a unique identifier:
+// Arrow re-uses freed buffer allocations, so a *different* batch with the same
+// number of rows can land at the exact same value-buffer address. Two such
+// batches then collide on `(ptr, num_rows)`, and the second batch is served the
+// FIRST batch's stale index — handing out value byte-ranges that point into the
+// wrong document (e.g. into the middle of a 10 KiB string). Including the total
+// value-buffer length AND the offset-buffer pointer makes a collision require
+// two distinct batches that share value-ptr, value-len, offset-ptr and row count
+// simultaneously, which does not occur in practice.
+type BatchIndexKey = (usize, usize, usize, usize);
+
+// Thread-local cache holding exactly ONE entry (most recent batch). DataFusion
+// evaluates UDFs within a batch sequentially on one thread before moving to the
+// next, so a single-entry cache is sufficient for the multi-field-projection
+// case.
 thread_local! {
-    static BATCH_INDEX_CACHE: RefCell<Option<((usize, usize), JsonbBatchIndex)>> =
+    static BATCH_INDEX_CACHE: RefCell<Option<(BatchIndexKey, JsonbBatchIndex)>> =
         const { RefCell::new(None) };
 }
 
@@ -1425,13 +1458,17 @@ thread_local! {
 ///
 /// `f` receives the index and must not escape it (borrow scoped to the closure).
 fn with_batch_index<R>(arr: &LargeBinaryArray, f: impl FnOnce(&JsonbBatchIndex) -> R) -> R {
-    // Identify the batch by the raw pointer of the value-data buffer and the
-    // number of rows. This is stable within a batch: Arrow buffers are
-    // reference-counted and are not re-allocated between UDF invocations on
-    // the same physical plan node.
-    let ptr = arr.values().as_ptr() as usize;
+    // Identify the batch by value-buffer pointer + value-buffer length +
+    // offset-buffer pointer + row count. All four are stable within a batch
+    // (Arrow buffers are reference-counted and not re-allocated between UDF
+    // invocations on the same physical plan node), and together they reliably
+    // distinguish two *different* batches that happen to reuse the same freed
+    // value-buffer address — see `BatchIndexKey`.
+    let values_ptr = arr.values().as_ptr() as usize;
+    let values_len = arr.values().len();
+    let offsets_ptr = arr.value_offsets().as_ptr() as usize;
     let len = arr.len();
-    let key = (ptr, len);
+    let key = (values_ptr, values_len, offsets_ptr, len);
 
     BATCH_INDEX_CACHE.with(|cell| {
         let mut guard = cell.borrow_mut();
