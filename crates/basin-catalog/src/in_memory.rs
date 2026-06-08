@@ -447,6 +447,7 @@ impl Catalog for InMemoryCatalog {
 
     #[instrument(skip(self), fields(project = %project))]
     async fn create_namespace(&self, project: &ProjectId) -> Result<()> {
+        self.bump_epoch();
         self.namespaces.lock().await.insert(*project);
         // Phase 5.18.A: pre-seed ALL reserved schemas so that schema-qualified
         // catalog operations on any reserved schema work without an explicit
@@ -551,6 +552,7 @@ impl Catalog for InMemoryCatalog {
 
     #[instrument(skip(self), fields(project = %project))]
     async fn drop_namespace(&self, project: &ProjectId) -> Result<()> {
+        self.bump_epoch();
         // Single-pass: hold the table-map mutex once, drop every entry whose
         // project matches. Cheaper than the default-impl loop (N small awaits)
         // and atomic w.r.t. concurrent list_tables on the same in-memory map.
@@ -4100,5 +4102,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rc4, 0, "after fork drop, rc_only_src has refcount 0");
+    }
+
+    /// `create_namespace` must bump the catalog epoch so that any session
+    /// cache built before the project was created is invalidated on the next
+    /// epoch check.
+    #[tokio::test]
+    async fn epoch_bumps_on_create_namespace() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+        let epoch_before = cat.epoch();
+        cat.create_namespace(&p).await.unwrap();
+        assert!(
+            cat.epoch() > epoch_before,
+            "epoch must increase after create_namespace (was {epoch_before}, now {})",
+            cat.epoch()
+        );
+    }
+
+    /// `drop_namespace` wipes all per-project catalog state. Any session that
+    /// cached table metadata before the drop must detect the staleness via the
+    /// epoch counter rather than serving stale schema.
+    #[tokio::test]
+    async fn epoch_bumps_on_drop_namespace() {
+        let cat = InMemoryCatalog::new();
+        let p = ProjectId::new();
+        cat.create_namespace(&p).await.unwrap();
+        let tbl = TableName::new("t").unwrap();
+        cat.create_table(&p, &tbl, &schema()).await.unwrap();
+        let epoch_before = cat.epoch();
+        cat.drop_namespace(&p).await.unwrap();
+        assert!(
+            cat.epoch() > epoch_before,
+            "epoch must increase after drop_namespace (was {epoch_before}, now {})",
+            cat.epoch()
+        );
     }
 }
