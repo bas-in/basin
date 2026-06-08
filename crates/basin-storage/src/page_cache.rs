@@ -224,22 +224,18 @@ pub(crate) fn hash_projection(projection: Option<&[String]>) -> u64 {
         }
         Some(cols) => {
             b"PROJ".hash(&mut h);
-            match cols.len() {
-                0 => {}
-                1 => {
-                    // Single column: no sort needed, no allocation.
-                    cols[0].hash(&mut h);
-                }
-                _ => {
-                    // Multiple columns: sort indices rather than cloning
-                    // strings, so we allocate one Vec<usize> instead of
-                    // a Vec<&String> of the same size.
-                    let mut order: Vec<usize> = (0..cols.len()).collect();
-                    order.sort_by_key(|&i| cols[i].as_str());
-                    for i in order {
-                        cols[i].hash(&mut h);
-                    }
-                }
+            // Order-SENSITIVE: the reader reassembles each cached batch into the
+            // requested projection ORDER (not just the projected column set), so
+            // two requests for the same columns in different orders must map to
+            // distinct cache entries — otherwise a cache hit could return a
+            // batch whose physical column layout disagrees with the caller's
+            // declared schema (the bug that surfaced as
+            // "expected <T> but found <U> at column index N" via the
+            // TombstoneColdScanExec projection-order path). Hash in projection
+            // order; do NOT sort.
+            cols.len().hash(&mut h);
+            for c in cols {
+                c.hash(&mut h);
             }
         }
     }

@@ -1354,3 +1354,96 @@ async fn dml_drop_table_unsupported_in_poc() {
         .expect_err("SELECT from dropped table must error");
     println!("[dml] DROP TABLE succeeded; table gone (fix #49)");
 }
+
+/// Regression: tombstone-cold-scan projection order must match the declared
+/// exec schema.
+///
+/// After a DELETE creates tombstones, the cold-only scan path registers a
+/// `TombstoneColdTable`. Its `scan` augments the caller's projection with the
+/// PK column and declares the exec's output schema in *projection* order
+/// (e.g. `[amount, created_at, id]`). The Parquet reader, however, delivered
+/// the selected columns in *file-schema* order (`[amount, created_at]` happen
+/// to come back as whatever their file positions imply) without reordering on
+/// the all-columns-present fall-through. DataFusion then validated the emitted
+/// batch against the declared schema and failed with
+/// `column types must match schema types, expected Float64 but found Int64 at
+/// column index 0` for a projection whose first column is the Float64 `amount`
+/// but whose first physical column was the Int64 `id`/`created_at`.
+///
+/// This pins the fix in `basin-storage` `finalize_pipeline`: the all-present
+/// projection path now reorders each batch into the requested projection order
+/// (the missing-column synth path already did). The aggregate below projects a
+/// non-PK-first subset (`amount`, `created_at`) which is exactly the shape that
+/// tripped the mismatch. Must succeed and return one row per distinct bucket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tombstone_cold_scan_projection_order_parquet() {
+    use basin_shard::{Shard, ShardConfig};
+    use basin_wal::{LocalWal, Wal, WalConfig};
+    use std::time::Duration;
+    basin_common::telemetry::try_init_for_tests();
+    let storage_dir = TempDir::new().unwrap();
+    let wal_dir = TempDir::new().unwrap();
+    let storage = Storage::new(StorageConfig {
+        object_store: Arc::new(LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap()),
+        root_prefix: None,
+        disk_cache: None,
+        page_cache: None,
+    });
+    let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+    let wal: Arc<dyn Wal> = Arc::new(
+        LocalWal::open(WalConfig {
+            object_store: Arc::new(LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap()),
+            root_prefix: None,
+            flush_interval: Duration::from_millis(50),
+            flush_max_bytes: 1024 * 1024,
+        })
+        .await
+        .unwrap(),
+    );
+    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let eng = Engine::new(EngineConfig {
+        storage: storage.clone(),
+        catalog: catalog.clone(),
+        shard: Some(shard.clone()),
+    });
+    let project = ProjectId::new();
+    catalog.create_namespace(&project).await.unwrap();
+    let sess = eng.open_session(project).await.unwrap();
+    sess.execute(
+        "CREATE TABLE events (id BIGINT NOT NULL PRIMARY KEY, user_id BIGINT NOT NULL, \
+         amount DOUBLE PRECISION NOT NULL, status TEXT NOT NULL, created_at BIGINT NOT NULL, \
+         payload JSONB) WITH (basin.file_format='parquet')",
+    )
+    .await
+    .unwrap();
+    // Insert >8 rows so W4 write-striping spreads across multiple partition files.
+    let mut vals = Vec::new();
+    for id in 0..40i64 {
+        let amount = (id as f64) * 0.5; // mix of whole + half values
+        vals.push(format!("({id},{id},{amount},'a',{},'{{}}')", 100000 + id * 10000));
+    }
+    sess.execute(&format!("INSERT INTO events VALUES {}", vals.join(",")))
+        .await
+        .unwrap();
+    shard.flush_to_parquet().await.unwrap();
+    // A DELETE registers tombstones → the events scan becomes a TombstoneColdTable.
+    sess.execute("DELETE FROM events WHERE id IN (7, 13, 21)")
+        .await
+        .unwrap();
+    // Projection whose first column is the Float64 `amount` (NOT the PK) — the
+    // shape that surfaced the column-order mismatch before the fix.
+    let res = sess
+        .execute(
+            "SELECT created_at / 86400 AS day_bucket, SUM(amount) \
+             FROM events GROUP BY 1 ORDER BY 1",
+        )
+        .await
+        .expect("day-bucket aggregate over tombstoned parquet table must not error");
+    match res {
+        ExecResult::Rows { batches, .. } => {
+            let n: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert!(n > 0, "expected at least one aggregate bucket, got {n}");
+        }
+        other => panic!("expected Rows, got {other:?}"),
+    }
+}

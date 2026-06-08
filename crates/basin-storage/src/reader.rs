@@ -1936,7 +1936,7 @@ where
                     // the catalog schema — Parquet's `ArrowWriter` round-trip
                     // does not re-apply the `ARROW:schema` blob's field
                     // metadata to the per-batch schema the reader emits.
-                    Ok(restamp_field_metadata_from_catalog(synth, catalog_schema_for_stamp.as_ref()))
+                    restamp_field_metadata_from_catalog(synth, catalog_schema_for_stamp.as_ref())
                 });
 
                 // Page-cache write-through with the synthesised batches.
@@ -2096,14 +2096,35 @@ where
         .build()
         .map_err(|e| BasinError::storage(format!("parquet build {path}: {e}")))?;
     let catalog_schema_for_stamp = catalog_schema.clone();
+    // Projection-order reassembly: `ProjectionMask::roots` selects the
+    // requested columns but the Parquet reader delivers them in *file-schema*
+    // order, not in the caller's requested `opts.projection` order. Callers
+    // that build an output schema in projection order (e.g.
+    // `TombstoneColdScanExec`, which augments the projection with the PK
+    // column and declares its exec schema in that order) then see a batch
+    // whose physical column layout disagrees with the declared schema —
+    // surfacing downstream as a DataFusion "expected <T> but found <U> at
+    // column index N" error. Reorder each batch by the requested projection
+    // names so the emitted column order always matches what the caller asked
+    // for. `None` projection (read all columns) is unaffected. The
+    // missing-column synth path above already reorders, so this only covers
+    // the all-present fall-through. The reorder is a metadata + Arc-pointer
+    // shuffle (no data motion) and is a no-op when the file order already
+    // matches the projection order.
+    let projection_order: Option<Arc<Vec<String>>> =
+        opts.projection.as_ref().map(|p| Arc::new(p.clone()));
     let mapped = stream.map(move |res| {
         let batch = res.map_err(|e| BasinError::storage(format!("parquet read: {e}")))?;
+        let batch = match &projection_order {
+            Some(names) => reorder_batch_to_projection(batch, names)?,
+            None => batch,
+        };
         // Re-stamp BASIN_TYPE field metadata from the catalog schema —
         // Parquet's `ArrowWriter` round-trip does not re-apply the
         // `ARROW:schema` blob's field metadata to the per-batch schema the
         // reader emits, so semantic types (MONEY, INET, …) would otherwise
         // be downgraded to their physical Arrow type post-storage.
-        Ok(restamp_field_metadata_from_catalog(batch, catalog_schema_for_stamp.as_ref()))
+        restamp_field_metadata_from_catalog(batch, catalog_schema_for_stamp.as_ref())
     });
 
     // Page-cache write-through is keyed on (file, projection, filters)
@@ -2250,7 +2271,7 @@ fn vortex_project_and_filter(
         // Vortex's `DType::to_arrow_schema` drops field metadata wholesale
         // on decode, so semantic types (MONEY, INET, …) would otherwise be
         // downgraded to their physical Arrow type post-storage.
-        let restamped = restamp_field_metadata_from_catalog(projected, catalog_schema);
+        let restamped = restamp_field_metadata_from_catalog(projected, catalog_schema)?;
         // ADR 0024 — UUID-as-Decimal256 read-side inverse. The write path
         // reinterprets `FixedSizeBinary(16) + BASIN_TYPE=UUID` columns as
         // `Decimal256(39, 0)` before handing to Vortex; restore the UUID
@@ -2435,9 +2456,9 @@ fn vortex_read_projection(opts: &ReadOptions) -> Option<Vec<String>> {
 fn restamp_field_metadata_from_catalog(
     batch: RecordBatch,
     catalog_schema: Option<&SchemaRef>,
-) -> RecordBatch {
+) -> Result<RecordBatch> {
     let Some(catalog) = catalog_schema else {
-        return batch;
+        return Ok(batch);
     };
     let in_schema = batch.schema();
     // Cheap probe: bail out when no field in the batch has a catalog
@@ -2452,7 +2473,7 @@ fn restamp_field_metadata_from_catalog(
             .unwrap_or(false)
     });
     if !needs_rewrap {
-        return batch;
+        return Ok(batch);
     }
     let new_fields: Vec<arrow_schema::FieldRef> = in_schema
         .fields()
@@ -2474,10 +2495,19 @@ fn restamp_field_metadata_from_catalog(
         new_fields,
         in_schema.metadata().clone(),
     ));
-    // Reuse the column arrays — no data motion.
+    // Reuse the column arrays — no data motion. This is a metadata-only
+    // rewrap (field names, types and column arrays are unchanged — only the
+    // per-field metadata map is adopted from the catalog), so it cannot fail
+    // under normal invariants. We surface any failure as a clean BasinError
+    // rather than a non-string panic so a future schema-shape drift (e.g. a
+    // type divergence that slips past the metadata-only contract) reports as
+    // an error the caller can handle instead of aborting the worker thread.
     let cols = batch.columns().to_vec();
-    RecordBatch::try_new(new_schema, cols)
-        .expect("restamp: metadata-only rewrap cannot fail")
+    RecordBatch::try_new(new_schema, cols).map_err(|e| {
+        BasinError::storage(format!(
+            "restamp_field_metadata_from_catalog: metadata-only rewrap failed: {e}"
+        ))
+    })
 }
 
 /// Field-metadata key the engine plants on UUID columns. Mirrors
@@ -2750,6 +2780,45 @@ fn large_binary_to_point_fsb(batch: RecordBatch) -> RecordBatch {
     ));
     RecordBatch::try_new(new_schema, new_cols)
         .expect("large_binary_to_point_fsb: schema swap cannot fail")
+}
+
+/// Reassemble `batch`'s columns into the order named by `projection`.
+///
+/// The Parquet reader's `ProjectionMask` selects the requested columns but
+/// emits them in *file-schema* order; callers that requested a specific
+/// projection order (and declared an output schema in that order) need the
+/// batch reordered to match. When the batch's column order already equals the
+/// projection order this returns the batch unchanged (no allocation). Columns
+/// named in `projection` but absent from the batch are left to the caller's
+/// missing-column synthesis path — here we only reorder columns that are
+/// present, and fall back to the original batch if any name is missing (the
+/// non-projected / all-columns read path passes `projection=None` and never
+/// reaches this function).
+fn reorder_batch_to_projection(batch: RecordBatch, projection: &[String]) -> Result<RecordBatch> {
+    let schema = batch.schema();
+    // Fast path: already in projection order (and same arity).
+    if schema.fields().len() == projection.len()
+        && schema
+            .fields()
+            .iter()
+            .zip(projection.iter())
+            .all(|(f, name)| f.name() == name)
+    {
+        return Ok(batch);
+    }
+    // Build the new column order by name. If any projected name is missing from
+    // the batch, bail out unchanged — that case is handled by the
+    // missing-column synthesis path, not here.
+    let mut indices: Vec<usize> = Vec::with_capacity(projection.len());
+    for name in projection {
+        match schema.index_of(name) {
+            Ok(i) => indices.push(i),
+            Err(_) => return Ok(batch),
+        }
+    }
+    batch
+        .project(&indices)
+        .map_err(|e| BasinError::storage(format!("reorder_batch_to_projection: {e}")))
 }
 
 fn synthesise_missing_columns(
