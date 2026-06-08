@@ -6715,11 +6715,18 @@ async fn exec_select(
         // Probes the per-file R-tree registry to narrow each candidate file
         // to the surviving row-groups and re-registers the table as a custom
         // RTreePrunedTable for the duration of this query.
+        //
+        // First normalize the PostGIS bbox-overlap idiom
+        // `geom && ST_MakeEnvelope(...)` into the `ST_Contains(env, geom)`
+        // form that `detect_spatial_predicate` recognizes, so the native
+        // `&&` operator routes through the R-tree pushdown rather than a
+        // full scan.  Non-bbox `&&` (array overlap) is left untouched.
+        let rtree_sql = crate::pg_operators::rewrite_bbox_amp_amp(orig_sql.to_string());
         crate::session::apply_rtree_pruning_for_query(
             &sess.engine,
             &sess.project,
             &sess.ctx,
-            orig_sql,
+            &rtree_sql,
         )
         .await?;
     }

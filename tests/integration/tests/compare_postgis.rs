@@ -14,7 +14,7 @@
 //! Four spatial shapes (per scoping a85de3):
 //!   S1 radius      — `count(*)` within R metres of (qx,qy)        (ST_DWithin)
 //!   S4 radius-id   — `id` list within R metres                    (ST_DWithin)
-//!   S2 bbox        — count within an axis-aligned box             (&& / X-Y BETWEEN)
+//!   S2 bbox        — count within an axis-aligned box             (&& ST_MakeEnvelope)
 //!   S3 KNN         — 10 nearest neighbours by distance            (PG-only, <->)
 //!
 //! ── FAIRNESS INVARIANT (ENFORCED) ────────────────────────────────────────
@@ -74,8 +74,8 @@ const QUERY_Y: f64 = 5.0;
 const RADIUS_M: f64 = 55_000.0;
 
 /// S2 bbox: a 1°×1° box centred on the query origin (degrees, native units
-/// for `&&` / `ST_X`-`ST_Y` BETWEEN — no geographic cast here, bbox is a
-/// planar envelope test on both sides).
+/// for the `geom && ST_MakeEnvelope(...)` overlap test — no geographic cast
+/// here, the bbox is a planar envelope test on both sides).
 const BBOX_X0: f64 = 4.5;
 const BBOX_Y0: f64 = 4.5;
 const BBOX_X1: f64 = 5.5;
@@ -435,18 +435,19 @@ async fn compare_postgis() {
 
     // ── S2 bbox: count within an axis-aligned box ────────────────────────
     //
-    // PG uses the native `&&` bbox-intersection operator against an envelope.
-    // Basin has no BOX2D / `&&` surface yet, so we APPROXIMATE the same set
-    // via `ST_X(geom) BETWEEN .. AND ST_Y(geom) BETWEEN ..` — same result
-    // set for points, but no index pushdown (documented approximation).
+    // Both engines now use the IDENTICAL native PostGIS idiom:
+    // `geom && ST_MakeEnvelope(...)`.  On the basin side the operator-rewrite
+    // pass normalizes `geom && ST_MakeEnvelope(a,b,c,d)` →
+    // `ST_Contains(ST_MakeEnvelope(a,b,c,d), geom)`, which the spatial
+    // predicate detector recognizes and routes through the R-tree row-group
+    // pushdown (GIST index) instead of a full scan.
     let s2_pg_sql = format!(
         "SELECT count(*) FROM {schema}.pts \
          WHERE geom && ST_MakeEnvelope({BBOX_X0},{BBOX_Y0},{BBOX_X1},{BBOX_Y1},4326)"
     );
     let s2_basin_sql = format!(
         "SELECT count(*) FROM pts \
-         WHERE ST_X(geom) BETWEEN {BBOX_X0} AND {BBOX_X1} \
-           AND ST_Y(geom) BETWEEN {BBOX_Y0} AND {BBOX_Y1}"
+         WHERE geom && ST_MakeEnvelope({BBOX_X0},{BBOX_Y0},{BBOX_X1},{BBOX_Y1},4326)"
     );
     let pg_s2_count: i64 = {
         let r = pg
@@ -464,9 +465,16 @@ async fn compare_postgis() {
     let basin_s2_count =
         basin_count(sess.execute(&s2_basin_sql).await.expect("basin s2 count"));
     println!(
-        "[compare_postgis] S2 bbox count: pg(&&)={pg_s2_count} basin(X/Y BETWEEN)={basin_s2_count} \
-         (note: PG && is an envelope-overlap test, the X/Y-BETWEEN approximation \
-         is exact for POINT geometry so these should match)"
+        "[compare_postgis] S2 bbox count: pg(&&)={pg_s2_count} basin(&&→ST_Contains)={basin_s2_count} \
+         (identical native idiom; basin rewrites to ST_Contains + R-tree pushdown)"
+    );
+    // Correctness guard: the rewrite must be semantically exact, not just
+    // faster — basin's bbox count must equal PG's.
+    let s2_count_match = pg_s2_count == basin_s2_count;
+    assert_eq!(
+        basin_s2_count, pg_s2_count,
+        "S2 bbox count mismatch: basin={basin_s2_count} pg={pg_s2_count} \
+         (&& → ST_Contains rewrite must be semantically exact)"
     );
     let s2_pg = pg_p50(&pg, &s2_pg_sql, samples).await;
     let s2_basin = basin_p50(&sess, &s2_basin_sql, samples).await;
@@ -487,13 +495,14 @@ async fn compare_postgis() {
          {:<18}{:>12.3}ms{:>12.3}ms\n\
          {:<18}{:>12.3}ms{:>12.3}ms\n\
          {:<18}{:>14}{:>12.3}ms\n\
-         S1 count-match guard: {}\n",
+         S1 count-match guard: {} | S2 count-match guard: {}\n",
         "shape", "basin", "postgis",
         "S1 radius count", s1_basin, s1_pg,
         "S4 radius id-list", s4_basin, s4_pg,
         "S2 bbox count", s2_basin, s2_pg,
         "S3 KNN (PG-only)", "n/a", s3_pg,
         if count_match { "PASS" } else { "FAIL" },
+        if s2_count_match { "PASS" } else { "FAIL" },
     );
 
     let metrics = vec![
@@ -514,7 +523,7 @@ async fn compare_postgis() {
             ratio_text: ratio_text(s4_basin, s4_pg),
         },
         CompareMetric {
-            label: "S2 bbox count (&& / X-Y BETWEEN)".into(),
+            label: "S2 bbox count (&& → ST_Contains R-tree)".into(),
             basin: s2_basin,
             postgres: s2_pg,
             unit: "ms".into(),
@@ -538,15 +547,17 @@ async fn compare_postgis() {
          + GIST; Basin uses POINT (FSB-21) + USING gist R-tree row-group prune. \
          ST_DWithin radius queries cast PG operands to ::geography so BOTH engines \
          measure metres with the same radius (fairness invariant). S1 result counts \
-         are hard-asserted equal (correctness guard). S2 bbox uses PG's && envelope \
-         operator vs a Basin X/Y-BETWEEN approximation (BOX2D deferred). S3 KNN is \
-         PG-only — Basin ships no <-> operator yet.",
+         are hard-asserted equal (correctness guard). S2 bbox uses the IDENTICAL \
+         native PostGIS idiom on both sides (geom && ST_MakeEnvelope(...)); Basin \
+         rewrites it to ST_Contains(envelope, geom) and routes it through the GIST \
+         R-tree row-group pushdown, with the bbox count hard-asserted equal to PG. \
+         S3 KNN is PG-only — Basin ships no <-> operator yet.",
         true,
         metrics,
-        Some(if count_match {
-            "S1 count-match guard: PASS"
+        Some(if count_match && s2_count_match {
+            "S1 + S2 count-match guards: PASS"
         } else {
-            "S1 count-match guard: FAIL"
+            "count-match guard: FAIL"
         }),
     );
 

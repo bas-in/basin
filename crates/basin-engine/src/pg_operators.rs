@@ -285,8 +285,221 @@ pub(crate) fn rewrite_array_operators(sql: &str) -> String {
     // Process @> and <@ before && to avoid mis-parsing.
     s = rewrite_array_op_once(s, "@>", false);
     s = rewrite_array_op_once(s, "<@", false);
+    // Geometry bbox `&&` (one operand is an ST_MakeEnvelope(...) call) is the
+    // PostGIS bbox-overlap idiom `geom && ST_MakeEnvelope(a,b,c,d)`.  Rewrite
+    // it to an EXECUTABLE planar form `ST_X(geom) BETWEEN a AND c AND
+    // ST_Y(geom) BETWEEN b AND d` — exact for POINT geometry and runnable by
+    // DataFusion.  (The R-tree file/row-group prune is engaged separately via
+    // `rewrite_bbox_amp_amp` on the original SQL at the executor call site.)
+    // Must run BEFORE the array `&&` pass; non-bbox `&&` falls through.
+    s = rewrite_bbox_amp_amp_exec(s);
     s = rewrite_array_op_once(s, "&&", false);
     s
+}
+
+/// Return `true` if `expr` is an `ST_MakeEnvelope(...)` (or `ST_Envelope(...)`)
+/// function call — the only operand shape we treat as a bbox for `&&`.
+fn looks_like_envelope(expr: &str) -> bool {
+    let lower = expr.trim().to_ascii_lowercase();
+    (lower.starts_with("st_makeenvelope") || lower.starts_with("st_envelope"))
+        && lower.contains('(')
+}
+
+/// Split the top-level comma-separated arguments of an `ST_MakeEnvelope(...)`
+/// call.  `env` is the whole call text (e.g. `ST_MakeEnvelope(0, 0, 1, 1, 4326)`).
+/// Returns the argument expressions as trimmed strings (parens stripped).
+fn envelope_args(env: &str) -> Option<Vec<String>> {
+    let open = env.find('(')?;
+    let close = env.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    let inner = &env[open + 1..close];
+    let bytes = inner.as_bytes();
+    let mut args = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b',' if depth == 0 => {
+                args.push(inner[start..i].trim().to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    args.push(inner[start..].trim().to_string());
+    Some(args)
+}
+
+/// Build the executable planar bbox predicate for a POINT column against an
+/// `ST_MakeEnvelope(min_x, min_y, max_x, max_y[, srid])` envelope.
+fn bbox_exec_predicate(geom: &str, env: &str) -> Option<String> {
+    let args = envelope_args(env)?;
+    if args.len() != 4 && args.len() != 5 {
+        return None;
+    }
+    let (min_x, min_y, max_x, max_y) = (&args[0], &args[1], &args[2], &args[3]);
+    Some(format!(
+        "(ST_X({geom}) BETWEEN {min_x} AND {max_x} AND ST_Y({geom}) BETWEEN {min_y} AND {max_y})"
+    ))
+}
+
+/// Core bbox-`&&` walker.  For each `geom && ST_MakeEnvelope(...)` (or the
+/// commutative form) it invokes `build(geom, envelope)` to produce the
+/// replacement text.  Non-bbox `&&` (array overlap) is left untouched.
+fn rewrite_bbox_amp_amp_with(sql: String, build: impl Fn(&str, &str) -> Option<String>) -> String {
+    let mut s = sql;
+    let mut search_from = 0usize;
+    loop {
+        let Some(rel) = find_array_op_outside_strings(&s[search_from..], "&&") else {
+            break;
+        };
+        let op_start = search_from + rel;
+        let op_end = op_start + 2;
+
+        let (lhs_start, lhs_end) = bbox_operand_left(&s, op_start);
+        let (rhs_start, rhs_end) = bbox_operand_right(&s, op_end);
+        let lhs = s[lhs_start..lhs_end].trim().to_string();
+        let rhs = s[rhs_start..rhs_end].trim().to_string();
+
+        let lhs_env = looks_like_envelope(&lhs);
+        let rhs_env = looks_like_envelope(&rhs);
+
+        // Need exactly one envelope operand; the other is the geometry col.
+        let replacement = match (lhs_env, rhs_env) {
+            (false, true) => build(&lhs, &rhs),
+            (true, false) => build(&rhs, &lhs),
+            _ => None,
+        };
+        match replacement {
+            Some(rep) => {
+                s.replace_range(lhs_start..rhs_end, &rep);
+                search_from = lhs_start + rep.len();
+            }
+            None => {
+                // Not a bbox `&&` — leave for the array path; advance past it.
+                search_from = op_end;
+            }
+        }
+    }
+    s
+}
+
+/// Rewrite PostGIS bbox-overlap `geom && ST_MakeEnvelope(a,b,c,d)` into the
+/// `ST_Contains(ST_MakeEnvelope(a,b,c,d), geom)` form recognized by
+/// `detect_spatial_predicate` (index_probe.rs) → routed through the R-tree
+/// row-group pushdown.  The four literal coords survive verbatim so
+/// `extract_envelope` can read them.  Used for the PRUNE probe only (the
+/// `ST_Contains` UDF is not executable), on the original SQL.
+pub(crate) fn rewrite_bbox_amp_amp(sql: String) -> String {
+    rewrite_bbox_amp_amp_with(sql, |geom, env| Some(format!("ST_Contains({env}, {geom})")))
+}
+
+/// Rewrite PostGIS bbox-overlap `geom && ST_MakeEnvelope(a,b,c,d)` into the
+/// EXECUTABLE planar predicate `ST_X(geom) BETWEEN a AND c AND ST_Y(geom)
+/// BETWEEN b AND d` — exact for POINT geometry and runnable by DataFusion.
+/// Used on the execution path (the `&&` array-overlap path is untouched).
+pub(crate) fn rewrite_bbox_amp_amp_exec(sql: String) -> String {
+    rewrite_bbox_amp_amp_with(sql, bbox_exec_predicate)
+}
+
+/// Extract the operand immediately to the LEFT of `&&` (ending at `end`).
+/// Handles a function call `fn(...)` (balanced parens, with the name), an
+/// `ARRAY[...]` literal (so we recognize it as a non-bbox operand), and a
+/// dotted column reference.  Returns the `[start, end)` byte range.
+fn bbox_operand_left(s: &str, end: usize) -> (usize, usize) {
+    let bytes = s.as_bytes();
+    let mut i = end;
+    while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    let operand_end = i;
+    if i == 0 {
+        return (0, operand_end);
+    }
+    match bytes[i - 1] {
+        b')' => {
+            // Walk back over balanced parens, then the function name.
+            let mut depth = 1i32;
+            i -= 1;
+            while i > 0 && depth > 0 {
+                i -= 1;
+                match bytes[i] {
+                    b')' => depth += 1,
+                    b'(' => depth -= 1,
+                    _ => {}
+                }
+            }
+            while i > 0
+                && (bytes[i - 1].is_ascii_alphanumeric()
+                    || bytes[i - 1] == b'_'
+                    || bytes[i - 1] == b'.')
+            {
+                i -= 1;
+            }
+        }
+        b']' => {
+            // ARRAY[...] / type[] — reuse the array extractor's exact logic.
+            return array_extract_left(s, end);
+        }
+        _ => {
+            while i > 0
+                && (bytes[i - 1].is_ascii_alphanumeric()
+                    || bytes[i - 1] == b'_'
+                    || bytes[i - 1] == b'.')
+            {
+                i -= 1;
+            }
+        }
+    }
+    (i, operand_end)
+}
+
+/// Extract the operand immediately to the RIGHT of `&&` (starting at `start`).
+/// Handles a function call `fn(...)` (name + balanced parens), `ARRAY[...]`,
+/// and a dotted column reference.  Returns the `[start, end)` byte range.
+fn bbox_operand_right(s: &str, start: usize) -> (usize, usize) {
+    let bytes = s.as_bytes();
+    let mut i = start;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let operand_start = i;
+    if i >= bytes.len() {
+        return (operand_start, operand_start);
+    }
+    if bytes[i] == b'[' || s[i..].to_ascii_lowercase().starts_with("array") {
+        // ARRAY[...] — reuse the array extractor's exact logic.
+        return array_extract_right(s, start);
+    }
+    // Consume a leading identifier (function name or column).
+    while i < bytes.len()
+        && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'.')
+    {
+        i += 1;
+    }
+    // If a `(` follows (optionally after whitespace), it's a function call —
+    // consume balanced parens so the args (envelope coords) are captured.
+    let mut j = i;
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    if j < bytes.len() && bytes[j] == b'(' {
+        let mut depth = 1i32;
+        i = j + 1;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+    (operand_start, i)
 }
 
 // ---------------------------------------------------------------------------
@@ -7280,6 +7493,72 @@ mod tests {
             !out.contains("arrays_overlap"),
             "should not rewrite plain cols: {out}"
         );
+    }
+
+    // ── Geometry bbox `&&` rewriter ─────────────────────────────────────────
+
+    #[test]
+    fn bbox_amp_amp_rewrites_to_st_contains() {
+        // PRUNE form: `col && ST_MakeEnvelope(0,0,1,1)` → `ST_Contains(env,col)`
+        // so the R-tree spatial detector recognizes it (coords verbatim).
+        let out = rewrite_bbox_amp_amp(
+            "SELECT * FROM t WHERE geom && ST_MakeEnvelope(0,0,1,1)".to_string(),
+        );
+        assert!(
+            out.contains("ST_Contains(ST_MakeEnvelope(0,0,1,1), geom)"),
+            "got: {out}"
+        );
+
+        // Commutative form: `ST_MakeEnvelope(...) && col`.
+        let out2 = rewrite_bbox_amp_amp(
+            "SELECT * FROM t WHERE ST_MakeEnvelope(0,0,1,1) && geom".to_string(),
+        );
+        assert!(
+            out2.contains("ST_Contains(ST_MakeEnvelope(0,0,1,1), geom)"),
+            "got: {out2}"
+        );
+
+        // Coords survive verbatim for extract_envelope (incl. 5-arg SRID form).
+        let out3 = rewrite_bbox_amp_amp(
+            "SELECT * FROM t WHERE geom && ST_MakeEnvelope(-122.5, 37.7, -122.3, 37.9, 4326)"
+                .to_string(),
+        );
+        assert!(
+            out3.contains("ST_Contains(ST_MakeEnvelope(-122.5, 37.7, -122.3, 37.9, 4326), geom)"),
+            "got: {out3}"
+        );
+    }
+
+    #[test]
+    fn bbox_amp_amp_exec_rewrites_to_betweens() {
+        // EXECUTION form (via rewrite_array_operators): `geom &&
+        // ST_MakeEnvelope(0,0,1,1)` → executable ST_X/ST_Y BETWEEN.
+        let out = rewrite_array_operators("SELECT * FROM t WHERE geom && ST_MakeEnvelope(0,0,1,1)");
+        assert!(
+            out.contains("ST_X(geom) BETWEEN 0 AND 1 AND ST_Y(geom) BETWEEN 0 AND 1"),
+            "got: {out}"
+        );
+        assert!(!out.contains("arrays_overlap"), "got: {out}");
+        assert!(!out.contains("ST_Contains"), "got: {out}");
+
+        // 5-arg SRID form: SRID arg ignored, x/y coords used.
+        let out2 = rewrite_array_operators(
+            "SELECT * FROM t WHERE geom && ST_MakeEnvelope(4.5, 4.5, 5.5, 5.5, 4326)",
+        );
+        assert!(
+            out2.contains("ST_X(geom) BETWEEN 4.5 AND 5.5 AND ST_Y(geom) BETWEEN 4.5 AND 5.5"),
+            "got: {out2}"
+        );
+    }
+
+    #[test]
+    fn array_amp_amp_still_works_after_bbox_pass() {
+        // The array `&&` overlap path must NOT be hijacked by the bbox pass.
+        let sql = "SELECT * FROM t WHERE tags && ARRAY[1,2]";
+        let out = rewrite_array_operators(sql);
+        assert!(out.contains("arrays_overlap(tags, ARRAY[1,2])"), "got: {out}");
+        assert!(!out.contains("ST_Contains"), "got: {out}");
+        assert!(!out.contains("ST_X"), "got: {out}");
     }
 
     // ── = ANY(ARRAY[...]) rewriter ──────────────────────────────────────────
