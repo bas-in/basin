@@ -1,0 +1,43 @@
+{
+  "kind": "compare",
+  "id": "postgis",
+  "name": "Basin R-tree vs PostgreSQL + PostGIS GIST (spatial)",
+  "claim": "Identical 32×32-tile point set on both engines. PG uses geometry(Point,4326) + GIST; Basin uses POINT (FSB-21) + USING gist R-tree row-group prune. ST_DWithin radius queries cast PG operands to ::geography so BOTH engines measure metres with the same radius (fairness invariant). S1 result counts are hard-asserted equal (correctness guard). S2 bbox uses PG's && envelope operator vs a Basin X/Y-BETWEEN approximation (BOX2D deferred). S3 KNN is PG-only — Basin ships no <-> operator yet.",
+  "available": true,
+  "metrics": [
+    {
+      "label": "S1 radius count (ST_DWithin)",
+      "basin": 1.235167,
+      "postgres": 10.482,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "basin 8.49× faster"
+    },
+    {
+      "label": "S4 radius id-list (ST_DWithin)",
+      "basin": 1.7164579999999998,
+      "postgres": 10.425,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "basin 6.07× faster"
+    },
+    {
+      "label": "S2 bbox count (&& / X-Y BETWEEN)",
+      "basin": 3.77175,
+      "postgres": 0.034,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "pg 110.93× faster"
+    },
+    {
+      "label": "S3 KNN <-> LIMIT 10 (PG-only)",
+      "basin": -1.0,
+      "postgres": 0.064,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "basin KNN not shipped"
+    }
+  ],
+  "generated_at": "@1780950830",
+  "note": "S1 count-match guard: PASS"
+}
