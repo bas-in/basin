@@ -27,6 +27,7 @@
 
 use std::sync::Arc;
 
+use arrow_array::Array;
 use basin_catalog::InMemoryCatalog;
 use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
@@ -433,4 +434,270 @@ async fn update_returning_expression_falls_back_cold() {
 
     // The underlying value is also correct after the cold rewrite.
     assert_eq!(scalar_at(&sess, "t", "val", 1).await, Some(50));
+}
+
+// ── Tests: read-modify-write (computed SET RHS) on the fast path ─────────────────
+//
+// These exercise the RMW allowlist (`rmw_rhs_is_fast_path_eligible`): with the
+// fast path ON, `SET col = <allowlisted expr>` routes through the hot-tier
+// overlay (reading the LATEST value: memtable Update > PK cache > cold) and the
+// post-image is byte-identical to the cold DataFusion path. A non-allowlisted
+// expression still falls to the cold path and must remain correct.
+
+/// `SELECT <col> FROM <table> WHERE id = <id>` → `Some(true)` when the single
+/// matched cell is SQL NULL, `Some(false)` when it holds a value, `None` when
+/// no row matched. Distinguishes a NULL cell from a missing row (which
+/// `scalar_at` cannot, since it returns the array's default for a null cell).
+async fn is_null_at(sess: &ProjectSession, table: &str, col: &str, id: i64) -> Option<bool> {
+    let sql = format!("SELECT {col} FROM {table} WHERE id = {id}");
+    let batches = match sess.execute(&sql).await.unwrap() {
+        ExecResult::Rows { batches, .. } => batches,
+        ExecResult::Empty { .. } => return None,
+    };
+    for b in &batches {
+        if b.num_rows() == 0 {
+            continue;
+        }
+        return Some(b.column(0).is_null(0));
+    }
+    None
+}
+
+/// 10 consecutive `SET v = v + 1` on the same cold-seeded PK must accumulate
+/// (each RMW reads the latest overlay, not the stale cold base), and COUNT(*)
+/// must be unchanged (UPDATE replaces, never inserts).
+#[tokio::test]
+async fn rmw_increment_fastpath_accumulates() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = open(&eng).await;
+    seed(&sess, "t", 5).await;
+
+    let before = count_rows(&sess, "t").await;
+    with_fastpath_on(async {
+        for _ in 0..10 {
+            exec(&sess, "UPDATE t SET val = val + 1 WHERE id = 3").await;
+        }
+    })
+    .await;
+
+    // Seed value for id=3 is 3*10 = 30; ten +1 increments → 40.
+    assert_eq!(
+        scalar_at(&sess, "t", "val", 3).await,
+        Some(40),
+        "ten v=v+1 increments must accumulate from the cold base (30+10=40)"
+    );
+    // Full-table read must agree (overlay suppresses the stale cold row).
+    assert_eq!(
+        all_rows(&sess, "t").await,
+        vec![(1, 10), (2, 20), (3, 40), (4, 40), (5, 50)],
+        "only id=3 changed; the accumulated overlay is the value seen on bulk read"
+    );
+    assert_eq!(
+        count_rows(&sess, "t").await,
+        before,
+        "RMW UPDATE must not add or remove rows"
+    );
+}
+
+/// `SET val = CASE WHEN val > <lit> THEN <lit> ELSE val END` on the fast path
+/// must produce the same result as the cold DataFusion path.
+#[tokio::test]
+async fn rmw_case_when_fastpath() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = open(&eng).await;
+    seed(&sess, "t", 5).await; // vals 10,20,30,40,50
+
+    with_fastpath_on(async {
+        // id=2 (val 20): 20 > 25 is false → ELSE keeps 20.
+        exec(
+            &sess,
+            "UPDATE t SET val = CASE WHEN val > 25 THEN 0 ELSE val END WHERE id = 2",
+        )
+        .await;
+        // id=4 (val 40): 40 > 25 is true → 0.
+        exec(
+            &sess,
+            "UPDATE t SET val = CASE WHEN val > 25 THEN 0 ELSE val END WHERE id = 4",
+        )
+        .await;
+    })
+    .await;
+
+    assert_eq!(scalar_at(&sess, "t", "val", 2).await, Some(20), "20>25 false → unchanged");
+    assert_eq!(scalar_at(&sess, "t", "val", 4).await, Some(0), "40>25 true → 0");
+    assert_eq!(count_rows(&sess, "t").await, 5);
+}
+
+/// Regression for the Int32-PK crossed-value race (was ~60% flaky):
+///
+/// On an `INT PRIMARY KEY` (physical Int32) table, two fast-path CASE UPDATEs
+/// write PK-keyed overlay entries for id=2 (→20) and id=4 (→0). Before the fix,
+/// `batch_matches_predicates` did a strict `downcast::<Int64Array>` so the
+/// Int32-decoded overlay row failed re-validation in the point-lookup probe —
+/// dropping the SELECT onto the cold path, where `apply_update_overlay_to_batches`
+/// appended BOTH override rows (id=2 AND id=4) regardless of the `WHERE id = k`
+/// filter. The result batches were `[(2,20),(4,0)]` in nondeterministic HashMap
+/// order, so a point SELECT returned the wrong key's row.
+///
+/// Two fixes are exercised here: (1) numeric coercion in
+/// `batch_matches_predicates` so the overlay direct-get hit is served, and (2)
+/// `apply_update_overlay_to_batches` re-applies the query predicate to appended
+/// override rows. The point SELECTs must return EXACTLY one row with the correct
+/// value, and a single batch from each point lookup must hold at most one row.
+/// Run the assert loop several times to flush out any residual nondeterminism.
+#[tokio::test]
+async fn rmw_case_when_int32_pk_no_crossed_values() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = open(&eng).await;
+    seed(&sess, "t", 5).await; // INT PK (Int32), vals 10,20,30,40,50
+
+    with_fastpath_on(async {
+        exec(
+            &sess,
+            "UPDATE t SET val = CASE WHEN val > 25 THEN 0 ELSE val END WHERE id = 2",
+        )
+        .await;
+        exec(
+            &sess,
+            "UPDATE t SET val = CASE WHEN val > 25 THEN 0 ELSE val END WHERE id = 4",
+        )
+        .await;
+    })
+    .await;
+
+    // Repeat the point-SELECT battery to catch any HashMap-order nondeterminism.
+    for _ in 0..20 {
+        // id=2: 20 > 25 false → unchanged 20. Must NOT cross to id=4's 0.
+        let v2 = point_select_exactly_one(&sess, "t", "val", 2).await;
+        assert_eq!(v2, 20, "id=2 must read its own value, never id=4's post-image");
+        // id=4: 40 > 25 true → 0. Must NOT cross to id=2's 20.
+        let v4 = point_select_exactly_one(&sess, "t", "val", 4).await;
+        assert_eq!(v4, 0, "id=4 must read its own value, never id=2's value");
+        // Untouched rows.
+        assert_eq!(point_select_exactly_one(&sess, "t", "val", 1).await, 10);
+        assert_eq!(point_select_exactly_one(&sess, "t", "val", 3).await, 30);
+        assert_eq!(point_select_exactly_one(&sess, "t", "val", 5).await, 50);
+    }
+    assert_eq!(count_rows(&sess, "t").await, 5);
+    // Full-table read must also reflect exactly the post-update state.
+    assert_eq!(
+        all_rows(&sess, "t").await,
+        vec![(1, 10), (2, 20), (3, 30), (4, 0), (5, 50)],
+    );
+}
+
+/// `SELECT <col> FROM <table> WHERE id = <id>` asserting the result has EXACTLY
+/// one row across all batches (a crossed-value bug surfaced as a SECOND appended
+/// override row for the non-matching key). Returns the single value.
+async fn point_select_exactly_one(
+    sess: &ProjectSession,
+    table: &str,
+    col: &str,
+    id: i64,
+) -> i64 {
+    let sql = format!("SELECT {col} FROM {table} WHERE id = {id}");
+    let batches = match sess.execute(&sql).await.unwrap() {
+        ExecResult::Rows { batches, .. } => batches,
+        ExecResult::Empty { .. } => panic!("id={id} returned no rows"),
+    };
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total, 1,
+        "WHERE id={id} must match exactly one row, got {total} (crossed-value overlay leak)"
+    );
+    for b in &batches {
+        if b.num_rows() == 1 {
+            return int_value(b.column(0), 0);
+        }
+    }
+    unreachable!("total==1 guarantees a single-row batch");
+}
+
+/// NULL propagation: `SET v = v + 1` where `v` is SQL NULL must stay NULL
+/// (NULL + 1 = NULL), identical to the cold DataFusion path. Uses a table with
+/// a nullable column seeded NULL on the cold tier.
+#[tokio::test]
+async fn rmw_null_propagation() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = open(&eng).await;
+    exec(&sess, "CREATE TABLE n (id BIGINT NOT NULL PRIMARY KEY, v BIGINT)").await;
+    exec(&sess, "INSERT INTO n (id, v) VALUES (1, NULL), (2, 7)").await;
+
+    with_fastpath_on(async {
+        exec(&sess, "UPDATE n SET v = v + 1 WHERE id = 1").await; // NULL + 1 = NULL
+        exec(&sess, "UPDATE n SET v = v + 1 WHERE id = 2").await; // 7 + 1 = 8
+    })
+    .await;
+
+    assert_eq!(
+        is_null_at(&sess, "n", "v", 1).await,
+        Some(true),
+        "NULL + 1 must stay NULL (matching DataFusion null propagation)"
+    );
+    assert_eq!(
+        is_null_at(&sess, "n", "v", 2).await,
+        Some(false),
+        "7 + 1 = 8 is non-null"
+    );
+    assert_eq!(scalar_at(&sess, "n", "v", 2).await, Some(8));
+    assert_eq!(count_rows(&sess, "n").await, 2);
+}
+
+/// Cross-column RMW: `SET a = b + 1` must read the pre-image of column `b`
+/// (the other column), not the post-image of `a`.
+#[tokio::test]
+async fn rmw_cross_column() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = open(&eng).await;
+    exec(
+        &sess,
+        "CREATE TABLE c (id BIGINT NOT NULL PRIMARY KEY, a BIGINT, b BIGINT)",
+    )
+    .await;
+    exec(&sess, "INSERT INTO c (id, a, b) VALUES (1, 5, 100), (2, 6, 200)").await;
+
+    with_fastpath_on(exec(&sess, "UPDATE c SET a = b + 1 WHERE id = 1")).await;
+
+    let a = match sess.execute("SELECT a FROM c WHERE id = 1").await.unwrap() {
+        ExecResult::Rows { batches, .. } => int_value(batches[0].column(0), 0),
+        other => panic!("expected rows, got {other:?}"),
+    };
+    assert_eq!(a, 101, "a must be b(100)+1 = 101 (reads pre-image b)");
+    // b is untouched; the other row is untouched.
+    let b = match sess.execute("SELECT b FROM c WHERE id = 1").await.unwrap() {
+        ExecResult::Rows { batches, .. } => int_value(batches[0].column(0), 0),
+        other => panic!("expected rows, got {other:?}"),
+    };
+    assert_eq!(b, 100, "b must be unchanged");
+    assert_eq!(count_rows(&sess, "c").await, 2);
+}
+
+/// A non-allowlisted RMW expression (`SET v = abs(v)` — a function call) is NOT
+/// on the fast-path allowlist, so it falls through to the cold copy-on-write
+/// path. The result must still be correct.
+#[tokio::test]
+async fn rmw_unsupported_falls_back_cold() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = open(&eng).await;
+    exec(&sess, "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, v BIGINT)").await;
+    exec(&sess, "INSERT INTO u (id, v) VALUES (1, -5), (2, 9)").await;
+
+    // `abs(v)` is a function call → excluded from the allowlist → cold path,
+    // even with the fast-path env on. Must still be correct.
+    let val = with_fastpath_on(async {
+        exec(&sess, "UPDATE u SET v = abs(v) WHERE id = 1").await;
+        match sess.execute("SELECT v FROM u WHERE id = 1").await.unwrap() {
+            ExecResult::Rows { batches, .. } => int_value(batches[0].column(0), 0),
+            other => panic!("expected rows, got {other:?}"),
+        }
+    })
+    .await;
+    assert_eq!(val, 5, "abs(-5) = 5 via the cold path");
+    assert_eq!(count_rows(&sess, "u").await, 2, "no rows added/removed");
 }

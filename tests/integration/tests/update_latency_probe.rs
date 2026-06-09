@@ -166,3 +166,92 @@ async fn update_latency_probe() {
     bg.shutdown().await;
     wal.close().await.unwrap();
 }
+
+/// Diagnostic: read-modify-write (`SET v = v + 1`) single-row UPDATE latency.
+///
+/// RMW was the worst shape in the product: before the allowlist widening,
+/// `SET v = v + 1 WHERE id = k` was REJECTED by the hot-tier fast-path gate and
+/// fell to the cold copy-on-write rewrite — 2.7–16.5s per statement at 1M rows
+/// (the whole file is read, the SET re-evaluated, and the file rewritten).
+/// Once the gate admits the row-local RMW allowlist, each RMW takes the same
+/// memtable-overlay + WAL path as a scalar UPDATE (~20ms), reading the LATEST
+/// value so consecutive increments on the same key accumulate.
+///
+/// Same convention as `update_latency_probe`: seed via the engine INSERT path,
+/// quiesce cold with `flush_to_parquet`, warm up, then time N=200 consecutive
+/// `SET v = v + 1` UPDATEs each hitting a DIFFERENT id across the key space.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "diagnostic — run explicitly with --ignored"]
+async fn rmw_update_latency_probe() {
+    let (_sd, _wd, engine, shard, bg, wal) = build().await;
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    let batch = 10_000i64;
+    for scale in [100_000i64, 1_000_000] {
+        let table = format!("rmw{scale}");
+        sess.execute(&format!("CREATE TABLE {table} (id BIGINT PRIMARY KEY, v BIGINT)"))
+            .await
+            .unwrap();
+        let mut id = 0i64;
+        while id < scale {
+            let lo = id;
+            let hi = (id + batch).min(scale);
+            let mut stmt = String::with_capacity((hi - lo) as usize * 16);
+            stmt.push_str(&format!("INSERT INTO {table} VALUES "));
+            for k in lo..hi {
+                if k > lo {
+                    stmt.push(',');
+                }
+                stmt.push_str(&format!("({k},{k})"));
+            }
+            sess.execute(&stmt).await.unwrap();
+            id = hi;
+        }
+
+        // Quiesce all seeded rows to cold Parquet so each RMW exercises the
+        // cold-read-or-cache + overlay path (the shape the cold CoW used to
+        // dominate), not a hot memtable.
+        shard.flush_to_parquet().await.unwrap();
+
+        // Warm-up discard: pay first-touch costs before timing.
+        match sess
+            .execute(&format!("UPDATE {table} SET v = v + 1 WHERE id = 1"))
+            .await
+            .unwrap()
+        {
+            ExecResult::Empty { tag } => assert_eq!(tag, "UPDATE 1", "warm-up RMW affected !=1"),
+            other => panic!("warm-up RMW returned non-Empty: {other:?}"),
+        }
+
+        // Timed loop: N consecutive `SET v = v + 1`, each a DIFFERENT id spread
+        // across the key space.
+        let n: usize = 200;
+        let mut times = Vec::with_capacity(n);
+        for i in 0..n {
+            let target = ((i as i64) * (scale / n as i64) + 2) % scale;
+            let t0 = Instant::now();
+            let res = sess
+                .execute(&format!("UPDATE {table} SET v = v + 1 WHERE id = {target}"))
+                .await
+                .unwrap();
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            times.push(ms);
+            match res {
+                ExecResult::Empty { tag } => {
+                    assert_eq!(tag, "UPDATE 1", "RMW id={target} affected != 1 row");
+                }
+                other => panic!("RMW UPDATE returned non-Empty: {other:?}"),
+            }
+            assert!(ms.is_finite(), "RMW latency must be finite");
+        }
+
+        let mut sorted = times.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p50 = percentile(&sorted, 0.50);
+        let p99 = percentile(&sorted, 0.99);
+        println!("[rmw-latency] scale={scale} p50={p50:.3}ms p99={p99:.3}ms");
+    }
+
+    bg.shutdown().await;
+    wal.close().await.unwrap();
+}

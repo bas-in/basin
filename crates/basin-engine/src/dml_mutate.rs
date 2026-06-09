@@ -1330,10 +1330,15 @@ pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result
 // Atomicity. Like the DELETE fast path, this runs only OUTSIDE an explicit
 // transaction (`tx_is_active == false`) so ROLLBACK semantics are unaffected.
 //
-// Assignment support. Only literal / bind-param SET RHS (the `AssignmentRhs::
-// Scalar` path) is eligible — expression RHS (`col + 1`, `now()`, `upper(col)`)
-// falls through to the cold CoW path, where the per-batch DataFusion evaluation
-// already lives.
+// Assignment support. Literal / bind-param SET RHS (the `AssignmentRhs::
+// Scalar` path) is always fast-path eligible. Expression RHS (`AssignmentRhs::
+// Expr`) is eligible only for the row-local, deterministic read-modify-write
+// allowlist in `rmw_rhs_is_fast_path_eligible` (`col + 1`, `CASE …`, `a = b`,
+// simple casts); non-allowlisted expressions (`now()`, `upper(col)`, division,
+// subqueries, …) fall through to the cold CoW path. Both paths share the same
+// per-batch DataFusion evaluator (`apply_assignments` →
+// `generated_cols::eval_expression`), so an allowlisted RMW post-image is
+// byte-identical hot vs cold.
 
 /// Return `true` when every item in a RETURNING list can be projected directly
 /// from the post-image `RecordBatch` without a DataFusion evaluation context.
@@ -1362,12 +1367,140 @@ fn returning_is_fast_path_eligible(items: &[SelectItem]) -> bool {
     true
 }
 
+/// Return `true` when a SET-RHS expression is on the read-modify-write
+/// allowlist for the single-row PK-eq UPDATE fast path.
+///
+/// The post-image is produced by `apply_assignments` →
+/// `generated_cols::eval_expression`, the SAME DataFusion evaluator the cold
+/// path uses, run against the pre-image row batch. So the only safety
+/// requirement for the hot path is that the expression be **row-local and
+/// deterministic**: its value for a row must depend only on that row's column
+/// values, never on other rows, external state, or evaluation time. Every
+/// shape below satisfies that, so the fast-path result is byte-identical to
+/// cold (matching NULL propagation, integer overflow, and type coercion,
+/// because it is the same evaluator on the same base row).
+///
+/// Allowlist (recursive):
+///   * a literal `Value` (incl. NULL) — also handled by the Scalar path, but
+///     harmless if it reaches here inside a larger expression;
+///   * a bare `Identifier` / two-part `CompoundIdentifier` that resolves to a
+///     real column in `schema` (an unknown ident → cold path, which produces
+///     the canonical error);
+///   * `+`, `-`, `*` arithmetic where both operands are allowlisted;
+///   * unary `+` / `-` of an allowlisted operand;
+///   * a `CAST(expr AS ty)` (plain `CAST` kind only) of an allowlisted operand;
+///   * a parenthesized (`Nested`) allowlisted expression;
+///   * `CASE` (searched or simple) whose operand (if any), every WHEN
+///     condition, every THEN result, and the ELSE result are allowlisted, and
+///     whose conditions use only comparison / boolean connectives.
+///
+/// Deliberately EXCLUDED (kept on the cold path):
+///   * function calls (`some_function(v)`, `NOW()`, `COALESCE`, `UPPER`, …) —
+///     a UDF or time function need not be row-local/deterministic;
+///   * `/` (Divide) and `%` (Modulo) — division-by-zero and integer-vs-float
+///     coercion behaviour is subtle; "when in doubt, exclude";
+///   * `TRY_CAST` / `SAFE_CAST` and casts with a FORMAT clause;
+///   * subqueries, EXISTS, IN, window/aggregate constructs, and anything else.
+fn rmw_rhs_is_fast_path_eligible(expr: &Expr, schema: &Schema) -> bool {
+    use sqlparser::ast::CastKind;
+    match expr {
+        // Literals (including NULL) are row-local constants.
+        Expr::Value(_) => true,
+        // Bare column reference — must resolve to a real column.
+        Expr::Identifier(ident) => schema.index_of(&ident.value).is_ok(),
+        // `tbl.col` / `schema.col` — resolve on the final part.
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .is_some_and(|ident| schema.index_of(&ident.value).is_ok()),
+        // Parentheses.
+        Expr::Nested(inner) => rmw_rhs_is_fast_path_eligible(inner, schema),
+        // Unary +/- (e.g. `-v`, `+amount`).
+        Expr::UnaryOp { op, expr: inner } => {
+            matches!(op, UnaryOperator::Minus | UnaryOperator::Plus)
+                && rmw_rhs_is_fast_path_eligible(inner, schema)
+        }
+        // Arithmetic: +, -, * only (no /, %).
+        Expr::BinaryOp { left, op, right } => {
+            matches!(
+                op,
+                BinaryOperator::Plus | BinaryOperator::Minus | BinaryOperator::Multiply
+            ) && rmw_rhs_is_fast_path_eligible(left, schema)
+                && rmw_rhs_is_fast_path_eligible(right, schema)
+        }
+        // Plain CAST of an allowlisted operand (no TRY_CAST / SAFE_CAST /
+        // FORMAT / multi-valued ARRAY cast).
+        Expr::Cast {
+            kind: CastKind::Cast,
+            expr: inner,
+            array: false,
+            format: None,
+            ..
+        } => rmw_rhs_is_fast_path_eligible(inner, schema),
+        // CASE — every sub-expression must be allowlisted, and each WHEN
+        // condition must be a comparison / boolean connective tree.
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                if !rmw_rhs_is_fast_path_eligible(op, schema) {
+                    return false;
+                }
+            }
+            for when in conditions {
+                if !rmw_case_condition_is_eligible(&when.condition, schema) {
+                    return false;
+                }
+                if !rmw_rhs_is_fast_path_eligible(&when.result, schema) {
+                    return false;
+                }
+            }
+            match else_result {
+                Some(e) => rmw_rhs_is_fast_path_eligible(e, schema),
+                None => true,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Return `true` when a CASE-WHEN condition is a comparison or boolean
+/// combination of allowlisted (row-local, deterministic) sub-expressions.
+/// Used only by `rmw_rhs_is_fast_path_eligible`.
+fn rmw_case_condition_is_eligible(cond: &Expr, schema: &Schema) -> bool {
+    match cond {
+        Expr::Nested(inner) => rmw_case_condition_is_eligible(inner, schema),
+        Expr::BinaryOp { left, op, right } => match op {
+            // Comparisons of two allowlisted value expressions.
+            BinaryOperator::Gt
+            | BinaryOperator::Lt
+            | BinaryOperator::GtEq
+            | BinaryOperator::LtEq
+            | BinaryOperator::Eq
+            | BinaryOperator::NotEq => {
+                rmw_rhs_is_fast_path_eligible(left, schema)
+                    && rmw_rhs_is_fast_path_eligible(right, schema)
+            }
+            // Boolean connectives of two allowlisted conditions.
+            BinaryOperator::And | BinaryOperator::Or => {
+                rmw_case_condition_is_eligible(left, schema)
+                    && rmw_case_condition_is_eligible(right, schema)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// Resolve the matched PK keys + scalar assignments when the UPDATE call site
 /// is eligible for the hot-tier fast path. Returns `Ok(Some((keys, assigns)))`
 /// when every gate passes; `Ok(None)` to fall through to the cold path.
 ///
 /// Gates mirror `try_resolve_fast_path_pks` (DELETE) plus the UPDATE-specific
-/// ones: scalar-only assignments, no generated columns, no CHECK/FK/UNIQUE,
+/// ones: scalar OR allowlisted-RMW assignments (see
+/// `rmw_rhs_is_fast_path_eligible`), no generated columns, no CHECK/FK/UNIQUE,
 /// PK columns not touched by the SET (a PK rewrite needs the slow path's PK
 /// uniqueness check + key re-encoding).
 async fn try_resolve_fast_path_update(
@@ -1473,21 +1606,41 @@ async fn try_resolve_fast_path_update(
     let Some(lit_exprs) = predicate_resolves_to_pk_list(expr, pk_col, table.as_str()) else {
         return Ok(None);
     };
-    // Gate: every assignment must be a plain scalar; reject expression RHS and
-    // any assignment that touches the PK column (key re-encoding / uniqueness).
+    // Gate: every assignment must be either a plain scalar OR an allowlisted
+    // read-modify-write expression; reject anything else, and reject any
+    // assignment that touches the PK column (key re-encoding / uniqueness).
     //
-    // NOTE: routing read-modify-write (`SET col = f(col)`) UPDATEs through this
-    // hot-tier overlay path would be a ~20x win (8ms vs 172ms on cold rows), and
-    // the data-loss hazard (overlay shadowing a later cold rewrite) is now
-    // closed by materialize_hot_overlay_into_cold. But the overlay's repeated-
-    // RMW + materialization path still has correctness bugs (repeated `SET v=v+1`
-    // does not accumulate, and row duplication under materialization — see
-    // rmw_update_correctness.rs). So RMW stays on the cold path until that
-    // overlay path is fixed. Do NOT remove this gate without re-running
-    // rmw_update_correctness.
+    // Read-modify-write (`SET col = col + 1`, `SET col = CASE …`, `SET a = b`)
+    // is the single worst-performing UPDATE shape: at 1M rows the cold
+    // copy-on-write rewrite is 2.7–16.5s vs ~20ms on the hot overlay. Routing
+    // it through the overlay is safe because:
+    //   * `apply_assignments` already evaluates `AssignmentRhs::Expr` against
+    //     the pre-image batch via the SAME `generated_cols::eval_expression`
+    //     DataFusion projection the cold path uses — so for any row-local,
+    //     deterministic expression the post-image is byte-identical to cold
+    //     (NULL propagation, integer overflow, and type coercion all match
+    //     because it is literally the same evaluator on the same base row);
+    //   * `hot_tier_update_by_pk` reads the LATEST value (memtable Update
+    //     overlay > PK row cache > cold), so repeated `SET v = v + 1`
+    //     accumulates rather than re-reading the stale cold base;
+    //   * the overlay-vs-cold-rewrite data-loss hazard is closed by
+    //     `materialize_hot_overlay_into_cold` (see rmw_update_correctness.rs).
+    //
+    // We therefore admit an EXPLICIT allowlist of expression shapes whose
+    // evaluation is row-local and deterministic (column refs, +/-/* arithmetic,
+    // comparison-based CASE, simple casts, and nestings thereof — see
+    // `rmw_rhs_is_fast_path_eligible`). Anything outside the allowlist
+    // (function calls, division/modulo, subqueries, NOW(), …) still falls to
+    // the cold path, which remains the semantics oracle. Do NOT widen the
+    // allowlist without re-running rmw_update_correctness + update_hottier.
     let parsed = parse_assignments(assignments, meta.schema.as_ref())?;
-    if parsed.iter().any(|(_, rhs)| matches!(rhs, AssignmentRhs::Expr(_))) {
-        return Ok(None);
+    debug_assert_eq!(parsed.len(), assignments.len());
+    for ((_, rhs), assignment) in parsed.iter().zip(assignments.iter()) {
+        if matches!(rhs, AssignmentRhs::Expr(_))
+            && !rmw_rhs_is_fast_path_eligible(&assignment.value, meta.schema.as_ref())
+        {
+            return Ok(None);
+        }
     }
     let pk_idx = meta
         .schema
@@ -2073,9 +2226,11 @@ pub(crate) async fn exec_update(
 
     // ── Hot-tier fast path ──────────────────────────────────────────────
     //
-    // For `SET col = lit WHERE pk = lit / pk IN (lits)` on a table that
-    // satisfies every gate in `try_resolve_fast_path_update`, read the
-    // matched row image (hot then cold), apply SET, and write a
+    // For `SET col = lit` (scalar) OR an allowlisted read-modify-write
+    // `SET col = <expr>` (`col + 1`, `CASE …`, `a = b`, simple casts — see
+    // `rmw_rhs_is_fast_path_eligible`), with `WHERE pk = lit / pk IN (lits)`,
+    // on a table that satisfies every gate in `try_resolve_fast_path_update`,
+    // read the matched row image (hot then cold), apply SET, and write a
     // `MemRowValue::Update` override to the process-wide MemTableRegistry —
     // skipping the copy-on-write rewrite (`list_data_files_with_stats` →
     // per-file read+SET → `write_replacement` → `commit_replace` →
@@ -2134,8 +2289,8 @@ pub(crate) async fn exec_update(
     // list the base files. This runs only on the cold fall-through (the fast
     // path above never reaches here), so an update-heavy fast-path loop no
     // longer pays the eager re-encode + commit on every UPDATE (#205).
-    // RMW `SET col = <expr>` is forced cold-path by `try_resolve_fast_path_update`,
-    // so it still materializes here — preserved.
+    // Only the shapes the fast path declined (non-PK-eq WHERE, non-allowlisted
+    // RMW expressions, constrained tables, …) reach this materialization.
     materialize_hot_overlay_into_cold(sess, &table).await?;
     // Re-load metadata: materialize advances the table snapshot, so `meta`
     // (and the schema/live-files derived from it) must reflect the post-
@@ -4001,11 +4156,15 @@ async fn materialize_hot_overlay_into_cold(
         &pk_dt,
     )
     .map_err(|e| BasinError::internal(format!("materialize overlay (tombstones): {e}")))?;
+    // Full materialization: append EVERY override row (no query predicate to
+    // restrict to — this rewrites the entire overlay into cold storage). Pass
+    // an empty predicate slice so `override_row_matches` keeps all rows.
     let batches = crate::hot_tombstone::apply_update_overlay_to_batches(
         batches,
         &updates,
         &pk_col,
         &pk_dt,
+        &[],
     )
     .map_err(|e| BasinError::internal(format!("materialize overlay (updates): {e}")))?;
 

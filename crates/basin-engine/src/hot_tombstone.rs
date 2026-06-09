@@ -632,11 +632,24 @@ pub(crate) fn apply_tombstone_filter_to_batches(
 /// `tombstones` is the union of true tombstones AND the override PK keys; the
 /// caller passes the override map separately so the appended rows can be
 /// reprojected. When `updates` is empty this is a zero-overhead pass-through.
+///
+/// `predicates` is the query's pushed-down conjunctive WHERE filter. It is
+/// applied to each override row BEFORE it is appended — without it the overlay
+/// surfaces EVERY outstanding hot UPDATE override regardless of the query's
+/// WHERE clause. On the `Vec<RecordBatch>` fast path there is no downstream
+/// `FilterExec` to drop the non-matching overrides (unlike the DataFusion
+/// `UpdateOverlayExec` twin, which always has a `FilterExec` above it), so a
+/// `SELECT … WHERE pk = 4` would otherwise also emit the override row for
+/// `pk = 2`, producing the nondeterministic crossed-value results that the
+/// HashMap iteration order selected between. An override row whose full-schema
+/// form fails any predicate is skipped; an override missing a predicate column
+/// (e.g. a projection that dropped it) is conservatively kept.
 pub(crate) fn apply_update_overlay_to_batches(
     batches: Vec<RecordBatch>,
     updates: &std::collections::HashMap<Vec<u8>, RecordBatch>,
     pk_column: &str,
     pk_dt: &DataType,
+    predicates: &[basin_storage::Predicate],
 ) -> DFResult<Vec<RecordBatch>> {
     if updates.is_empty() {
         return Ok(batches);
@@ -651,6 +664,15 @@ pub(crate) fn apply_update_overlay_to_batches(
     // empty (every matched row was an override over an absent/flushed file).
     let target_schema = out.first().map(|b| b.schema());
     for ov in updates.values() {
+        // Re-apply the query's WHERE filter to the override row. The override
+        // carries the FULL row schema, so every predicate column is present —
+        // evaluate against `ov` (not the reprojected row, whose projection may
+        // have dropped a filter column). A predicate column genuinely absent
+        // from the override schema bubbles an error from `evaluate_predicate`;
+        // treat that as "keep" (conservative — never hide a live row).
+        if !override_row_matches(ov, predicates) {
+            continue;
+        }
         let row = match &target_schema {
             Some(schema) => reproject_row(ov, schema)?,
             None => ov.clone(),
@@ -658,6 +680,30 @@ pub(crate) fn apply_update_overlay_to_batches(
         out.push(row);
     }
     Ok(out)
+}
+
+/// Test whether the single-row override batch `ov` satisfies every conjunctive
+/// `predicate`. Returns `true` (keep) when there are no predicates or when a
+/// predicate cannot be evaluated against the row (missing column / unsupported
+/// type) — the conservative choice that never hides a live override.
+fn override_row_matches(ov: &RecordBatch, predicates: &[basin_storage::Predicate]) -> bool {
+    if ov.num_rows() == 0 {
+        return false;
+    }
+    for p in predicates {
+        match basin_storage::evaluate_predicate(ov, p) {
+            Ok(mask) => {
+                // Row matches the atom only if the (row 0) mask bit is a
+                // non-null true. A null or false drops the override.
+                if mask.is_null(0) || !mask.value(0) {
+                    return false;
+                }
+            }
+            // Column missing / unsupported coercion: keep conservatively.
+            Err(_) => continue,
+        }
+    }
+    true
 }
 
 /// Reproject a (full-schema) override row to `target` by selecting the

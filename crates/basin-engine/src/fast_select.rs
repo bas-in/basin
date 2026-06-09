@@ -70,10 +70,18 @@ fn batch_matches_predicates(batch: &RecordBatch, predicates: &[Predicate]) -> bo
             if col.is_null(0) {
                 return false;
             }
-            let Some(arr) = col.as_any().downcast_ref::<arrow_array::StringArray>() else {
-                return false;
+            // Match by VALUE across every string-encoded column variant
+            // (Utf8 / LargeUtf8 / Utf8View). A strict `StringArray` downcast
+            // would silently reject LargeUtf8 / Utf8View overlays — the same
+            // class of hole the numeric arms below close.
+            use arrow_array::cast::AsArray;
+            use arrow_schema::DataType as Dt;
+            let v: &str = match col.data_type() {
+                Dt::Utf8 => col.as_string::<i32>().value(0),
+                Dt::LargeUtf8 => col.as_string::<i64>().value(0),
+                Dt::Utf8View => col.as_string_view().value(0),
+                _ => return false,
             };
-            let v = arr.value(0);
             let ok = if *case_insensitive {
                 v.to_ascii_lowercase()
                     .starts_with(&prefix.to_ascii_lowercase())
@@ -101,29 +109,56 @@ fn batch_matches_predicates(batch: &RecordBatch, predicates: &[Predicate]) -> bo
         }
         let matches = match expected {
             ScalarValue::Int64(expected_v) => {
-                if let Some(arr) = col.as_any().downcast_ref::<arrow_array::Int64Array>() {
-                    let v = arr.value(0);
-                    match op {
+                // Coerce numerically: an `Int64` scalar must compare by VALUE
+                // against any narrower-or-equal integer column (Int16/Int32/
+                // Int64) and the unsigned UInt32 column.  Widen the array's
+                // element to i64 and compare there.  A strict
+                // `downcast::<Int64Array>` here was the root of the Int32-PK
+                // bug: overlay entries decoded as Int32 arrays failed the
+                // re-validation in `probe_memtable`, making the hot UPDATE
+                // overlay invisible to the point-SELECT direct-get hit.
+                use arrow_array::cast::AsArray;
+                use arrow_array::types::{Int16Type, Int32Type, Int64Type, UInt32Type};
+                use arrow_schema::DataType as Dt;
+                let widened: Option<i64> = match col.data_type() {
+                    Dt::Int64 => Some(col.as_primitive::<Int64Type>().value(0)),
+                    Dt::Int32 => Some(col.as_primitive::<Int32Type>().value(0) as i64),
+                    Dt::Int16 => Some(col.as_primitive::<Int16Type>().value(0) as i64),
+                    Dt::UInt32 => Some(col.as_primitive::<UInt32Type>().value(0) as i64),
+                    _ => None,
+                };
+                match widened {
+                    Some(v) => match op {
                         "eq" => v == *expected_v,
                         "gt" => v > *expected_v,
                         "lt" => v < *expected_v,
                         _ => false,
-                    }
-                } else {
-                    false
+                    },
+                    None => false,
                 }
             }
             ScalarValue::Utf8(expected_s) => {
-                if let Some(arr) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
-                    let v = arr.value(0);
-                    match op {
+                // Compare by VALUE against any string-encoded column variant:
+                // Utf8 (i32 offsets), LargeUtf8 (i64 offsets), Utf8View.  A
+                // strict `downcast::<StringArray>` would have made overlays on
+                // LargeUtf8 / Utf8View columns invisible — the same class of
+                // bug as the Int32 hole above.
+                use arrow_array::cast::AsArray;
+                use arrow_schema::DataType as Dt;
+                let v: Option<&str> = match col.data_type() {
+                    Dt::Utf8 => Some(col.as_string::<i32>().value(0)),
+                    Dt::LargeUtf8 => Some(col.as_string::<i64>().value(0)),
+                    Dt::Utf8View => Some(col.as_string_view().value(0)),
+                    _ => None,
+                };
+                match v {
+                    Some(v) => match op {
                         "eq" => v == expected_s.as_str(),
                         "gt" => v > expected_s.as_str(),
                         "lt" => v < expected_s.as_str(),
                         _ => false,
-                    }
-                } else {
-                    false
+                    },
+                    None => false,
                 }
             }
             ScalarValue::Boolean(expected_b) => {
@@ -151,16 +186,25 @@ fn batch_matches_predicates(batch: &RecordBatch, predicates: &[Predicate]) -> bo
                 }
             }
             ScalarValue::Float64(expected_v) => {
-                if let Some(arr) = col.as_any().downcast_ref::<arrow_array::Float64Array>() {
-                    let v = arr.value(0);
-                    match op {
+                // Coerce Float32 columns by widening the element to f64, the
+                // same widening `basin_storage::predicate::evaluate` performs
+                // for a Float64 scalar vs a Float32 (FLOAT4) column.
+                use arrow_array::cast::AsArray;
+                use arrow_array::types::{Float32Type, Float64Type};
+                use arrow_schema::DataType as Dt;
+                let widened: Option<f64> = match col.data_type() {
+                    Dt::Float64 => Some(col.as_primitive::<Float64Type>().value(0)),
+                    Dt::Float32 => Some(col.as_primitive::<Float32Type>().value(0) as f64),
+                    _ => None,
+                };
+                match widened {
+                    Some(v) => match op {
                         "eq" => (v - *expected_v).abs() < f64::EPSILON,
                         "gt" => v > *expected_v,
                         "lt" => v < *expected_v,
                         _ => false,
-                    }
-                } else {
-                    false
+                    },
+                    None => false,
                 }
             }
         };
@@ -2298,7 +2342,7 @@ pub(crate) async fn execute_simple_select(
             )
             .map_err(|e| BasinError::internal(format!("tombstone filter: {e}")))?;
             crate::hot_tombstone::apply_update_overlay_to_batches(
-                batches, &updates, pk_col, &pk_dt,
+                batches, &updates, pk_col, &pk_dt, &plan.predicates,
             )
             .map_err(|e| BasinError::internal(format!("update overlay: {e}")))?
         } else {
@@ -3266,6 +3310,104 @@ mod tests {
     fn parse_one(sql: &str) -> Statement {
         let mut s = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
         s.pop().unwrap()
+    }
+
+    // ── batch_matches_predicates numeric coercion ────────────────────────────
+    //
+    // Regression for the Int32-PK crossed-value race: an `Int64` scalar
+    // predicate must compare BY VALUE against narrower integer columns
+    // (Int16/Int32) and string-variant columns, not via a strict same-type
+    // downcast. A strict downcast made hot UPDATE overlays (decoded as Int32
+    // arrays) invisible to the point-SELECT probe, dropping the query onto a
+    // cold path that nondeterministically served another key's row.
+    fn one_row_batch(field: arrow_schema::Field, col: ArrayRef) -> RecordBatch {
+        use arrow_schema::Schema as ArrowSchema;
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
+        RecordBatch::try_new(schema, vec![col]).unwrap()
+    }
+
+    use arrow_array::ArrayRef;
+
+    #[test]
+    fn batch_matches_int32_column_vs_int64_scalar() {
+        use arrow_schema::{DataType, Field};
+        let b = one_row_batch(
+            Field::new("id", DataType::Int32, false),
+            Arc::new(arrow_array::Int32Array::from(vec![4])),
+        );
+        // Eq matches by value across the Int32/Int64 width gap.
+        assert!(batch_matches_predicates(
+            &b,
+            &[Predicate::Eq("id".into(), ScalarValue::Int64(4))]
+        ));
+        assert!(!batch_matches_predicates(
+            &b,
+            &[Predicate::Eq("id".into(), ScalarValue::Int64(2))]
+        ));
+        // Gt / Lt also widen.
+        assert!(batch_matches_predicates(
+            &b,
+            &[Predicate::Gt("id".into(), ScalarValue::Int64(3))]
+        ));
+        assert!(batch_matches_predicates(
+            &b,
+            &[Predicate::Lt("id".into(), ScalarValue::Int64(5))]
+        ));
+        assert!(!batch_matches_predicates(
+            &b,
+            &[Predicate::Gt("id".into(), ScalarValue::Int64(4))]
+        ));
+    }
+
+    #[test]
+    fn batch_matches_int16_column_vs_int64_scalar() {
+        use arrow_schema::{DataType, Field};
+        let b = one_row_batch(
+            Field::new("k", DataType::Int16, false),
+            Arc::new(arrow_array::Int16Array::from(vec![20i16])),
+        );
+        assert!(batch_matches_predicates(
+            &b,
+            &[Predicate::Eq("k".into(), ScalarValue::Int64(20))]
+        ));
+        assert!(!batch_matches_predicates(
+            &b,
+            &[Predicate::Eq("k".into(), ScalarValue::Int64(21))]
+        ));
+    }
+
+    #[test]
+    fn batch_matches_largeutf8_column_vs_utf8_scalar() {
+        use arrow_schema::{DataType, Field};
+        let b = one_row_batch(
+            Field::new("name", DataType::LargeUtf8, false),
+            Arc::new(arrow_array::LargeStringArray::from(vec!["hi"])),
+        );
+        assert!(batch_matches_predicates(
+            &b,
+            &[Predicate::Eq("name".into(), ScalarValue::Utf8("hi".into()))]
+        ));
+        assert!(!batch_matches_predicates(
+            &b,
+            &[Predicate::Eq("name".into(), ScalarValue::Utf8("bye".into()))]
+        ));
+    }
+
+    #[test]
+    fn batch_matches_float32_column_vs_float64_scalar() {
+        use arrow_schema::{DataType, Field};
+        let b = one_row_batch(
+            Field::new("x", DataType::Float32, false),
+            Arc::new(arrow_array::Float32Array::from(vec![2.5f32])),
+        );
+        assert!(batch_matches_predicates(
+            &b,
+            &[Predicate::Eq("x".into(), ScalarValue::Float64(2.5))]
+        ));
+        assert!(batch_matches_predicates(
+            &b,
+            &[Predicate::Gt("x".into(), ScalarValue::Float64(2.0))]
+        ));
     }
 
     #[test]
