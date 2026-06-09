@@ -118,6 +118,13 @@ pub(crate) struct EngineInner {
     /// measure the empirical false-positive rate without a separate counter
     /// store.
     pub(crate) blooms_skipped: AtomicU64,
+    /// Cumulative number of `SELECT … <col>->>'<key>' …` queries that
+    /// `fast_select` served by reading a promoted `__promoted$col$key` shadow
+    /// column directly (ADR 0027 Phase 4 read path), bypassing DataFusion.
+    /// Incremented once per such query that takes the fast path. Used by
+    /// integration tests to prove the promoted read path actually engaged
+    /// rather than falling back to the DataFusion / UDF path.
+    pub(crate) promoted_fast_select_count: AtomicU64,
     /// Per-project noisy-project detector. Reads its bit when a session is
     /// opened (to choose `target_partitions`) and bumps it after every
     /// successful `ProjectSession::execute`. See `noisy_detector` module
@@ -356,6 +363,7 @@ impl Engine {
             vector_routing_count: AtomicU64::new(0),
             pg_plan_routing_count: AtomicU64::new(0),
             blooms_skipped: AtomicU64::new(0),
+            promoted_fast_select_count: AtomicU64::new(0),
             noisy_detector: crate::noisy_detector::NoisyDetector::new(),
             project_counters,
             event_sinks: RwLock::new(registry),
@@ -694,6 +702,24 @@ impl Engine {
     /// integration tests that verify the false-positive rate.
     pub fn blooms_skipped_count(&self) -> u64 {
         self.inner.blooms_skipped.load(Ordering::Relaxed)
+    }
+
+    /// Crate-private hook bumped by `fast_select` each time it serves a
+    /// promoted `<col>->>'<key>'` query by reading the shadow column directly
+    /// (ADR 0027 Phase 4 read path) instead of routing through DataFusion.
+    pub(crate) fn note_promoted_fast_select(&self) {
+        self.inner
+            .promoted_fast_select_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Cumulative count of promoted `<col>->>'<key>'` queries served by the
+    /// `fast_select` shadow-column read path since this `Engine` was created.
+    /// Exposed for integration tests that verify the promoted read path
+    /// actually engaged (rather than falling back to the DataFusion / UDF
+    /// path).
+    pub fn promoted_fast_select_count(&self) -> u64 {
+        self.inner.promoted_fast_select_count.load(Ordering::Relaxed)
     }
 
     // ── Phase 5.7 B1: secondary index ────────────────────────────────────────

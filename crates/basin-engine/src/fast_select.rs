@@ -1258,6 +1258,8 @@ pub(crate) async fn execute_simple_select(
     sess: &ProjectSession,
     plan: SimpleSelectPlan,
     prefetched_meta: Option<TableMetadata>,
+    raw_sql: &str,
+    include_deleted: bool,
 ) -> Result<ExecResult> {
     // Phase 5.16.A: fast path bypasses DataFusion (no LogicalPlan); shape
     // hash is computed on the DataFusion path (executor::exec_select).
@@ -1296,6 +1298,121 @@ pub(crate) async fn execute_simple_select(
                     .await?
             }
         }
+    };
+
+    // ── ADR 0027 Phase 4: promoted JSONB shadow-column read path ─────────────
+    //
+    // The SQL rewriter swaps `json_get_text(col,'key')` for the materialised
+    // shadow column `__promoted$col$key` (a plain `Utf8` column) when the path
+    // is promoted, so `plan.read_cols` / `plan.projection` may reference shadow
+    // columns that are absent from `meta.schema` (shadow columns are kept out
+    // of the catalog schema; they live only in the physical files).
+    //
+    // To read them we (1) verify the correctness guard, then (2) extend the
+    // working `meta.schema` with a `Utf8` field per referenced shadow column.
+    // After step (2) every downstream `meta.schema` lookup (projection,
+    // read_cols validation, the reader's `catalog_schema`) transparently
+    // includes the shadow columns — no other code path needs to change.
+    let referenced_shadow_cols: Vec<String> = {
+        let mut cols: Vec<String> = Vec::new();
+        if let Some(rc) = plan.read_cols.as_ref() {
+            for c in rc {
+                if c.starts_with("__promoted$") && !cols.contains(c) {
+                    cols.push(c.clone());
+                }
+            }
+        }
+        if let Some(items) = plan.projection.as_ref() {
+            for it in items {
+                if let ProjectionItem::Column(c) = it {
+                    if c.starts_with("__promoted$") && !cols.contains(c) {
+                        cols.push(c.clone());
+                    }
+                }
+            }
+        }
+        cols
+    };
+    let meta = if referenced_shadow_cols.is_empty() {
+        // No shadow column referenced — the common case, untouched.
+        meta
+    } else {
+        // Correctness guard: a shadow column exists only in files
+        // written/backfilled AFTER the path was promoted.  The reader
+        // null-fills any projected column absent from a file's Arrow schema
+        // (see `reader::read_paths_inner`), so reading the shadow column from a
+        // pre-promotion file would yield a spurious NULL — a WRONG answer, not
+        // just a slow one.  The authoritative per-file presence signal is the
+        // catalog's `DataFileRef::column_stats`: the writer inserts one entry
+        // per physical column for both Parquet and Vortex
+        // (`writer::extract_column_stats` / `vortex_format::column_stats_from_batch`
+        // iterate every batch field), so a shadow column appears in
+        // `column_stats` iff the file carries it.  We take the fast path only
+        // when EVERY live data file has EVERY referenced shadow column; if any
+        // file is missing one we delegate to the DataFusion / UDF path
+        // (`exec_select`), which computes the value from the source JSONB and
+        // is therefore always correct (slow but never wrong).
+        //
+        // This runs against the post-flush `meta` reloaded above, so the shard
+        // tail has already been drained to cold-tier files and the file set is
+        // authoritative.
+        //
+        // Hot-tier exception: the engine's `MemTableRegistry` holds post-COMMIT
+        // HTAP-cached rows (and fast-path UPDATE/DELETE overlays) that are NOT
+        // covered by the cold-file `column_stats` guard.  A row INSERTed before
+        // the path was promoted and still resident in the memtable would carry
+        // no shadow column, so the fast-path read (which reads the shadow
+        // column physically from cold files only and would not see this hot
+        // row's correct extracted value) could be wrong.  Whenever the memtable
+        // has ANY live entry for this table we therefore delegate to the
+        // DataFusion path, whose `HtapUnionTable` merges hot+cold and computes
+        // `json_get_text` from the source JSONB for every row.  This is the
+        // common-case-fast / rare-case-correct split: a freshly-written table
+        // pays the DataFusion cost until its tail drains, then the fast path
+        // engages.
+        let memtable_has_entries = sess
+            .engine
+            .memtable_registry()
+            .get(&sess.project, &plan.table)
+            .map(|e| !e.memtable.snapshot().is_empty())
+            .unwrap_or(false);
+        let live_files = meta.live_data_files();
+        let all_present = !memtable_has_entries
+            && live_files.iter().all(|f| {
+                referenced_shadow_cols
+                    .iter()
+                    .all(|sc| f.column_stats.contains_key(sc))
+            });
+        if !all_present {
+            // At least one file predates promotion (or backfill has not yet
+            // covered it).  Fall back to the correct DataFusion path.
+            return crate::executor::exec_select(sess, raw_sql, include_deleted, Some(raw_sql))
+                .await;
+        }
+        // Every file carries the shadow column(s).  Extend the working schema
+        // with a `Utf8` field per shadow column so the projection / validation
+        // / reader code below treats them as first-class projectable columns.
+        let mut fields: Vec<arrow_schema::FieldRef> =
+            meta.schema.fields().iter().cloned().collect();
+        for sc in &referenced_shadow_cols {
+            if meta.schema.field_with_name(sc).is_err() {
+                fields.push(Arc::new(arrow_schema::Field::new(
+                    sc,
+                    arrow_schema::DataType::Utf8,
+                    true,
+                )));
+            }
+        }
+        let extended_schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+            fields,
+            meta.schema.metadata().clone(),
+        ));
+        // Record that the promoted shadow-column read path actually engaged
+        // (test introspection: proves we did NOT fall back to DataFusion).
+        sess.engine.note_promoted_fast_select();
+        let mut m = meta;
+        m.schema = extended_schema;
+        m
     };
 
     // 3VL constant-fold: a WHERE clause containing `<col> = NULL` (or its

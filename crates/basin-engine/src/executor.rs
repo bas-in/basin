@@ -576,12 +576,7 @@ async fn run_full_rewrite_pipeline(sess: &ProjectSession, sql: &str) -> Result<S
     let rewritten = crate::udf::rewrite_json_operators(&rewritten);
     // ADR 0027 Phase 4: rewrite `json_get_text(col, 'key')` → shadow column
     // for any promoted JSONB paths on tables referenced in the query.
-    let rewritten = rewrite_promoted_cols_for_query(
-        &rewritten,
-        sess.engine.config().catalog.as_ref(),
-        &sess.project,
-    )
-    .await;
+    let rewritten = rewrite_promoted_cols_for_query(&rewritten, sess).await;
     // Rewrite `json_to_record(J) AS t(coldefs)` / `jsonb_to_record(J) AS t(coldefs)`
     // → `SELECT * FROM json_to_recordset([J]) AS t(coldefs)` so that sqlparser
     // does not choke on the typed coldef list in scalar-SELECT / FROM position.
@@ -2518,37 +2513,34 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                         .unwrap_or(false);
                     // ADR 0027 Phase 4: promoted shadow columns are kept out of
                     // `meta.schema` (they are only visible in DataFusion's
-                    // extended schema) so fast_select's schema-based column
-                    // validation would reject them.  Route through DataFusion
-                    // whenever the rewritten query references a shadow column.
-                    let has_promoted_col = plan
-                        .read_cols
-                        .as_ref()
-                        .map(|cols| {
-                            cols.iter().any(|c| c.starts_with("__promoted$"))
-                        })
-                        .unwrap_or(false)
-                        || plan
-                            .projection
-                            .as_ref()
-                            .map(|items| {
-                                items.iter().any(|it| match it {
-                                    crate::fast_select::ProjectionItem::Column(c) => {
-                                        c.starts_with("__promoted$")
-                                    }
-                                    _ => false,
-                                })
-                            })
-                            .unwrap_or(false);
+                    // extended schema).  `fast_select` CAN read them directly
+                    // (see `execute_simple_select`, which extends its working
+                    // schema with the referenced shadow fields), but only when
+                    // every file it scans physically carries the shadow column.
+                    //
+                    // The correctness guard is enforced INSIDE
+                    // `execute_simple_select` (it must run against the
+                    // post-flush authoritative file set, which the function
+                    // reloads after draining the shard tail).  When the guard
+                    // fails the function transparently delegates to the
+                    // DataFusion / UDF path via `exec_select`.  So the gate here
+                    // imposes no shadow-column restriction: a referenced shadow
+                    // column is allowed through and self-guards downstream.
                     if !is_view
                         && !has_rls
                         && !has_soft_delete
                         && !in_txn
                         && !has_citext_predicate
                         && !has_citext_order_by
-                        && !has_promoted_col
                     {
-                        return execute_simple_select(sess, plan, table_meta).await;
+                        return execute_simple_select(
+                            sess,
+                            plan,
+                            table_meta,
+                            raw_sql,
+                            include_deleted,
+                        )
+                        .await;
                     }
                 }
             }
@@ -2889,15 +2881,32 @@ async fn rewrite_json_agg_qualified_wildcard_with_catalog(
 /// Fast-path: if the SQL contains no `json_get_text(` token, return unchanged.
 /// On any catalog failure the SQL passes through unchanged (graceful fallback
 /// to the UDF path).
-async fn rewrite_promoted_cols_for_query(
-    sql: &str,
-    catalog: &dyn basin_catalog::Catalog,
-    project: &basin_common::ProjectId,
-) -> String {
+///
+/// ## Correctness guard — only rewrite when every file carries the shadow column
+///
+/// A shadow column physically exists only in files written / backfilled AFTER
+/// the path was promoted.  The reader null-fills any projected column absent
+/// from a file's Arrow schema (see `basin_storage::reader::read_paths_inner`),
+/// so a rewrite that targets a shadow column missing from a pre-promotion file
+/// would yield a spurious NULL on BOTH the `fast_select` and the DataFusion
+/// read paths — a WRONG answer, not just a slow one.  We therefore rewrite a
+/// path ONLY when every live data file already carries its shadow column; any
+/// path that fails this test is left as `json_get_text(...)` so the value is
+/// computed from the source JSONB (correct, slower).  The authoritative
+/// per-file presence signal is the catalog's `DataFileRef::column_stats`: the
+/// writer inserts one entry per physical column for both Parquet and Vortex.
+///
+/// The shard tail is drained to cold-tier files first so the file set is
+/// authoritative; the engine `MemTableRegistry` is then checked because it can
+/// hold post-COMMIT HTAP-cached rows (inserted before promotion) that carry no
+/// shadow column and are not covered by `column_stats`.
+async fn rewrite_promoted_cols_for_query(sql: &str, sess: &ProjectSession) -> String {
     // Cheap bail-out: if there's no json_get_text call there's nothing to rewrite.
     if !sql.to_ascii_lowercase().contains("json_get_text(") {
         return sql.to_string();
     }
+    let catalog = sess.engine.config().catalog.as_ref();
+    let project = &sess.project;
     // Parse to extract bare table references from FROM clauses.
     let table_refs: Vec<String> = sqlparser::parser::Parser::parse_sql(
         &sqlparser::dialect::PostgreSqlDialect {},
@@ -2914,12 +2923,51 @@ async fn rewrite_promoted_cols_for_query(
     })
     .unwrap_or_default();
 
-    // Accumulate all promoted paths across all referenced tables.
+    // Accumulate the promoted paths that are SAFE to rewrite (every live file
+    // for the owning table carries the shadow column, and no uncovered hot-tier
+    // rows exist).  Paths that fail the guard are dropped here so they keep
+    // their `json_get_text` form.
     let mut all_paths: Vec<basin_catalog::PromotedJsonbPath> = Vec::new();
+    let mut flushed = false;
     for table_str in table_refs {
         let Ok(table_name) = basin_common::TableName::new(table_str) else { continue; };
-        if let Ok(meta) = catalog.load_table(project, &table_name).await {
-            all_paths.extend(meta.promoted_jsonb_paths);
+        let Ok(meta_pre) = catalog.load_table(project, &table_name).await else { continue; };
+        if meta_pre.promoted_jsonb_paths.is_empty() {
+            continue;
+        }
+        // Drain the shard tail once (only when a promoted path is in play) so
+        // the cold-file set we test against is authoritative, then reload meta.
+        if !flushed {
+            if let Some(shard) = sess.engine.config().shard.as_ref() {
+                if shard.flush_to_parquet().await.is_err() {
+                    // Flush failure: conservatively skip the rewrite for this
+                    // statement (leave json_get_text → correct UDF path).
+                    return sql.to_string();
+                }
+            }
+            flushed = true;
+        }
+        let meta = match catalog.load_table(project, &table_name).await {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        // Any uncovered hot-tier row for this table forbids ALL of its paths.
+        let memtable_has_entries = sess
+            .engine
+            .memtable_registry()
+            .get(project, &table_name)
+            .map(|e| !e.memtable.snapshot().is_empty())
+            .unwrap_or(false);
+        let live_files = meta.live_data_files();
+        for path in meta.promoted_jsonb_paths {
+            let shadow = path.shadow_col_name();
+            let all_present = !memtable_has_entries
+                && live_files
+                    .iter()
+                    .all(|f| f.column_stats.contains_key(&shadow));
+            if all_present {
+                all_paths.push(path);
+            }
         }
     }
     if all_paths.is_empty() {
@@ -6532,7 +6580,7 @@ impl Drop for TargetPartitionsGuard<'_> {
 // (e.g. CTAS, DML SELECT sub-selects).  When `Some`, `apply_gin_pruning_for_query`
 // uses this to detect `@>` / `<@` before the JSON operator rewriter converts them
 // to `jsonb_contains(...)`.
-async fn exec_select(
+pub(crate) async fn exec_select(
     sess: &ProjectSession,
     sql: &str,
     include_deleted: bool,
