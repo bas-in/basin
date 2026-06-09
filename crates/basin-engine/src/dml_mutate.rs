@@ -655,11 +655,17 @@ async fn try_resolve_fast_path_pks(
 ) -> Result<Option<Vec<basin_hottier::RowKey>>> {
     // Gate: hot-tier DELETE fast path. **Default ON** since Phase 5.14
     // closure (HtapUnionTable Update overlay landed in d8020f7; gate-matrix
-    // and round-trip tests landed in 6cbe224). All read paths
-    // (`fast_select::execute_simple_select`, `TombstoneFilteringTable::scan`,
-    // `HtapUnionTable::scan`) apply `apply_tombstone_filter_to_batches` +
-    // `apply_update_overlay_to_batches`, so post-DELETE SELECT sees the
-    // correct logical state.
+    // and round-trip tests landed in 6cbe224). All read paths apply the
+    // tombstone + UPDATE-override overlay so post-DELETE/UPDATE SELECT sees the
+    // correct logical state:
+    //   * the simple-SELECT point-lookup fast path
+    //     (`fast_select::execute_simple_select`) merges overrides inline;
+    //   * the transactional projection-scan path wraps the cold scan in
+    //     `TombstoneFilterExec` + `UpdateOverlayExec` via `HtapUnionTable::scan`;
+    //   * the non-transactional DataFusion read path reaches the SAME two
+    //     overlay exec nodes through `session::register_cold_with_overlay`,
+    //     which registers an empty-hot `HtapUnionTable` when the registry holds
+    //     tombstones or overrides for the table.
     //
     // Operator overrides:
     //   * `BASIN_HOTTIER_FASTPATH_DISABLE=1` — global kill-switch, forces

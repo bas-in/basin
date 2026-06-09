@@ -84,16 +84,22 @@ where
     out
 }
 
+/// Run `fut` with the hot-tier fast path genuinely DISABLED, so the UPDATE
+/// takes the cold copy-on-write rewrite. The UPDATE fast-path gate **defaults
+/// ON** when `BASIN_HOTTIER_UPDATE_FASTPATH` is unset, so merely removing that
+/// var does NOT force the cold path — we must assert the global kill-switch
+/// `BASIN_HOTTIER_FASTPATH_DISABLE=1` (read by `dml_mutate`).
 async fn with_fastpath_off<F, R>(fut: F) -> R
 where
     F: std::future::Future<Output = R>,
 {
     let _g = ENV_LOCK.lock().await;
-    let prev = std::env::var("BASIN_HOTTIER_UPDATE_FASTPATH").ok();
-    std::env::remove_var("BASIN_HOTTIER_UPDATE_FASTPATH");
+    let prev_disable = std::env::var("BASIN_HOTTIER_FASTPATH_DISABLE").ok();
+    std::env::set_var("BASIN_HOTTIER_FASTPATH_DISABLE", "1");
     let out = fut.await;
-    if let Some(v) = prev {
-        std::env::set_var("BASIN_HOTTIER_UPDATE_FASTPATH", v);
+    match prev_disable {
+        Some(v) => std::env::set_var("BASIN_HOTTIER_FASTPATH_DISABLE", v),
+        None => std::env::remove_var("BASIN_HOTTIER_FASTPATH_DISABLE"),
     }
     out
 }
