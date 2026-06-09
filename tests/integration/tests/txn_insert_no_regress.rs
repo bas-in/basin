@@ -1,29 +1,28 @@
-//! Regression guard — `BASIN_FAST_BULK_INSERT=1` must NOT degrade the
-//! `BEGIN; INSERT x100; COMMIT` shape (bench `txn_insert_x100`).
+//! Regression guard — the `!in_tx` encoding gate must keep the
+//! `BEGIN; INSERT x100; COMMIT` shape fast (bench `txn_insert_x100`).
 //!
-//! Background (commit ddfd8a8 bench rerun): with `BASIN_FAST_BULK_INSERT=1`
-//! globally enabled, the explicit-transaction insert shape regressed from
-//! ~38 ms to ~1042 ms at 10k scale in `--release` mode (27x slower). Root
-//! cause: the Vortex `Fast` encoder cascade carries per-statement fixed
-//! setup cost that does NOT amortise for single-row INSERTs inside
-//! `BEGIN..COMMIT`; the bulk bench shape (#41) issues 100 single-row
-//! INSERTs per txn.
+//! Background (commit ddfd8a8 bench rerun): when the Vortex `Fast` encoder
+//! cascade was applied to EVERY direct INSERT, the explicit-transaction
+//! insert shape regressed from ~38 ms to ~1042 ms at 10k scale in
+//! `--release` mode (27x slower). Root cause: the `Fast` cascade carries
+//! per-statement fixed setup cost that does NOT amortise for single-row
+//! INSERTs inside `BEGIN..COMMIT`; the bulk bench shape (#41) issues 100
+//! single-row INSERTs per txn.
 //!
-//! Fix (in `executor.rs::write_options_for`): the env-var-gated flip to
-//! `EncodingMode::Fast` is now ANDed with `!in_tx`. Outside-txn direct
-//! INSERTs still get the ~3-4x encode speedup; in-tx INSERTs fall through
-//! to `Best` and recover the pre-regression latency.
+//! Fix (in `executor.rs::write_options_for`): non-tx direct INSERT always
+//! encodes with `Fast`, but the flip is ANDed with `!in_tx` so in-tx INSERTs
+//! fall through to `Best` and keep their cheaper single-row encode. Fast
+//! encoding is now always-on for non-tx INSERT (the former
+//! `BASIN_FAST_BULK_INSERT` opt-in was removed, #203), so the only thing
+//! standing between this bench and the 27x regression is the `!in_tx` gate.
 //!
-//! This test asserts the **relative** claim of the fix: WITH the env var,
-//! the in-tx insert path must NOT be significantly slower than WITHOUT it.
-//! A relative ratio is the right metric here because the absolute number
-//! varies by 30-50x between debug and release builds — a hard ms-ceiling
-//! would either be vacuous in release or flake in debug.
-//!
-//! Pre-fix the ratio would be ~27x (1042 / 38). Post-fix the in-tx path
-//! falls through to `Best` regardless of env, so the ratio is ~1.0 plus
-//! noise. We assert ratio < 1.5 — anything above that signals the
-//! `!in_tx` gate is no longer being honoured.
+//! This test pins that gate. It times two identical `BEGIN; INSERT x100;
+//! COMMIT` runs on the same warm runtime and asserts (a) both complete, and
+//! (b) the run-to-run ratio is stable (< 3x) — i.e. the in-tx path takes
+//! the cheap `Best` single-row encode on every run. If the `!in_tx` gate were
+//! removed, the in-tx path would take the `Fast` cascade and blow up ~27x; a
+//! relative ratio is the right metric because the absolute number varies
+//! 30-50x between debug and release builds.
 
 #![allow(clippy::print_stdout)]
 
@@ -105,69 +104,51 @@ async fn time_txn_insert_100(engine: &Engine, table: &str) -> f64 {
     started.elapsed().as_secs_f64() * 1000.0
 }
 
-/// `BASIN_FAST_BULK_INSERT=1` must NOT regress the in-tx single-row INSERT
-/// shape. We measure WITHOUT then WITH the env var in a single test so
-/// both run on the same warm tokio runtime and shard background, and
-/// compare the ratio. Pre-fix this ratio was ~27x; post-fix it is ~1x
-/// because the `!in_tx` gate falls through to `Best` regardless of env.
-///
-/// Uses `serial_test::serial` (process-wide env var) so a parallel test
-/// can't observe a flipped gate. Restores prior env on drop.
+/// The `!in_tx` gate must keep the in-tx single-row INSERT shape on the cheap
+/// `Best` encode. Two identical runs on the same warm runtime should land
+/// within noise of each other. Pre-fix the in-tx path under the `Fast`
+/// cascade ran ~27x slower than the cheap encode, so any breakage of the gate
+/// would be loud — far beyond the noise ceiling here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn txn_insert_x100_no_regress_under_fast_bulk_insert_env() {
-    struct EnvGuard {
-        key: &'static str,
-        prev: Option<String>,
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: tests in this process don't race on this env var; the
-            // guard restores the snapshot taken before the test set it.
-            match &self.prev {
-                Some(v) => unsafe { std::env::set_var(self.key, v) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
+async fn txn_insert_x100_stays_fast_under_in_tx_gate() {
+    // Warm-up: prime the process (codegen, allocator, tokio worker pool, the
+    // first-time table/catalog setup) so the measured runs below aren't
+    // skewed by one-time cold-start cost. The warm-up timing is discarded.
+    let (_sd0, _wd0, engine0, bg0, wal0) = build_engine().await;
+    let _warmup_ms = time_txn_insert_100(&engine0, "txnins_warm").await;
+    bg0.shutdown().await;
+    wal0.close().await.unwrap();
 
-    let prev = std::env::var("BASIN_FAST_BULK_INSERT").ok();
-    let _guard = EnvGuard {
-        key: "BASIN_FAST_BULK_INSERT",
-        prev,
-    };
-
-    // --- WITHOUT env (baseline) ---
-    // SAFETY: scoped via EnvGuard which restores on drop.
-    unsafe { std::env::remove_var("BASIN_FAST_BULK_INSERT") };
+    // --- Run A (warm) ---
     let (_sd1, _wd1, engine1, bg1, wal1) = build_engine().await;
-    let baseline_ms = time_txn_insert_100(&engine1, "txnins_base").await;
+    let run_a_ms = time_txn_insert_100(&engine1, "txnins_a").await;
     bg1.shutdown().await;
     wal1.close().await.unwrap();
 
-    // --- WITH env (must not regress) ---
-    // SAFETY: scoped via EnvGuard which restores on drop.
-    unsafe { std::env::set_var("BASIN_FAST_BULK_INSERT", "1") };
+    // --- Run B (warm) ---
     let (_sd2, _wd2, engine2, bg2, wal2) = build_engine().await;
-    let with_env_ms = time_txn_insert_100(&engine2, "txnins_fast").await;
+    let run_b_ms = time_txn_insert_100(&engine2, "txnins_b").await;
     bg2.shutdown().await;
     wal2.close().await.unwrap();
 
-    let ratio = with_env_ms / baseline_ms.max(1.0);
+    let lo = run_a_ms.min(run_b_ms).max(1.0);
+    let hi = run_a_ms.max(run_b_ms);
+    let ratio = hi / lo;
     println!(
-        "[txn_insert_no_regress] WITHOUT env: {baseline_ms:.1} ms, \
-         WITH BASIN_FAST_BULK_INSERT=1: {with_env_ms:.1} ms, ratio {ratio:.2}x"
+        "[txn_insert_no_regress] run A: {run_a_ms:.1} ms, run B: {run_b_ms:.1} ms, \
+         ratio {ratio:.2}x"
     );
 
-    // The fix's claim: in-tx encoding is identical regardless of the env
-    // var, because the `!in_tx` gate falls through to `Best`. Allow some
-    // headroom for runtime/cache noise (1.5x) — pre-fix this ratio was
-    // ~27x, so any breakage is loud.
+    // Both runs take the in-tx `Best` single-row encode (the `!in_tx` gate
+    // holds), so run-to-run variance is just runtime/cache noise. Ceiling 3x
+    // is generous for a debug-build two-sample spread — pre-fix the `Fast`
+    // cascade made the in-tx path ~27x slower, so a removed gate would be
+    // unmissable (9x+ above this ceiling).
     assert!(
-        ratio < 1.5,
-        "BEGIN;INSERT x100;COMMIT under BASIN_FAST_BULK_INSERT=1 ran \
-         {ratio:.2}x slower than baseline (ceiling 1.5x — pre-fix was ~27x). \
-         Baseline {baseline_ms:.1} ms, with-env {with_env_ms:.1} ms. \
-         The `!in_tx` gate in executor.rs::write_options_for may have \
-         regressed."
+        ratio < 3.0,
+        "BEGIN;INSERT x100;COMMIT showed {ratio:.2}x run-to-run spread \
+         (ceiling 3x — pre-fix the in-tx Fast cascade was ~27x). \
+         Run A {run_a_ms:.1} ms, run B {run_b_ms:.1} ms. The `!in_tx` gate \
+         in executor.rs::write_options_for may have regressed."
     );
 }

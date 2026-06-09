@@ -194,15 +194,6 @@ impl PkRowCache {
         Self::new(DEFAULT_SHARDS, max_bytes)
     }
 
-    /// Whether the cache feature is enabled. Gated behind
-    /// `BASIN_PK_ROW_CACHE=1`; DEFAULT OFF. The default (flag off) path is
-    /// byte-identical to today — no get/insert ever runs.
-    pub fn enabled() -> bool {
-        std::env::var("BASIN_PK_ROW_CACHE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    }
-
     pub fn counters(&self) -> &PkRowCacheCounters {
         &self.counters
     }
@@ -692,10 +683,23 @@ mod tests {
     }
 
     #[test]
-    fn enabled_defaults_off() {
-        // The flag must default OFF when unset. (Other tests don't set it.)
-        if std::env::var("BASIN_PK_ROW_CACHE").is_err() {
-            assert!(!PkRowCache::enabled());
-        }
+    fn always_on_cache_is_consulted_regardless_of_env() {
+        // The cache is always-on: `from_env()` builds a usable, positively
+        // sized cache no matter what `BASIN_PK_ROW_CACHE` is set to (the flag
+        // no longer exists), and a fresh insert is immediately consultable on
+        // matching watermarks. Capacity stays bounded by the default budget.
+        let c = PkRowCache::from_env();
+        assert!(
+            c.total_bytes() <= DEFAULT_MAX_BYTES,
+            "fresh cache bytes {} exceed default budget",
+            c.total_bytes()
+        );
+        let p = proj();
+        let t = tbl("t");
+        c.insert(&p, &t, key(7), 1, 1, 0, row(99));
+        let got = c
+            .get(&p, &t, &key(7), 1, 1, 0)
+            .expect("always-on cache must serve a fresh hit");
+        assert_eq!(val(&got), 99);
     }
 }

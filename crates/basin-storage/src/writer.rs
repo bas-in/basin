@@ -176,7 +176,8 @@ pub struct WriteOptions {
 
 /// Vortex encode cascade selector (#92). Consumed by
 /// [`crate::vortex_format::encode_with_mode`]; `basin_engine` selects it via
-/// [`WriteOptions::encoding_mode`] for the `BASIN_FAST_BULK_INSERT` opt-in.
+/// [`WriteOptions::encoding_mode`] (always `Fast` for non-tx direct INSERT,
+/// `Best` for in-tx INSERT, compaction, and hot-tier flush).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EncodingMode {
     /// Full BtrBlocks cascade (`with_compact`: every scheme, ~1%-sample
@@ -189,8 +190,8 @@ pub enum EncodingMode {
     /// a single cheap structure-preserving encoding (constant / FoR /
     /// bit-packing / ALP / decimal / temporal) with a Zstd fallback for
     /// strings — no per-column sampling search. ~3-4x faster encode, ~1.5x
-    /// larger files. Used for bulk INSERT under `BASIN_FAST_BULK_INSERT=1`
-    /// and for hot-tier flushes that are about to be re-compacted anyway.
+    /// larger files. Used for every non-tx direct bulk INSERT and for
+    /// hot-tier flushes that are about to be re-compacted anyway.
     Fast,
 }
 

@@ -1,9 +1,10 @@
 //! Correctness guard for the process-global PK → Row hot cache
-//! (`crate::pk_row_cache`, gated behind `BASIN_PK_ROW_CACHE=1`).
+//! (`crate::pk_row_cache`, always-on; capacity bounded by
+//! `BASIN_PK_ROW_CACHE_BYTES`, default 64 MiB).
 //!
 //! This cache is in the RLS-bypass bug family (#159): a stale entry silently
-//! serves deleted / old / RLS-bypassed rows. Every test here runs with the
-//! flag ON and pins the dual-watermark invalidation (hot_tier_epoch +
+//! serves deleted / old / RLS-bypassed rows. The cache is always consulted;
+//! every test here pins the dual-watermark invalidation (hot_tier_epoch +
 //! snapshot_id) end-to-end through a real `Engine`:
 //!
 //! - `pk_cache_hit_returns_correct_row` — warm + second read hits, correct value.
@@ -17,8 +18,9 @@
 //!   that bypasses the policy predicate. THE other canary.
 //! - `pk_cache_ddl_invalidates` — ALTER TABLE clears the cache.
 //!
-//! The flag is set per process at the top of every test (cargo runs them in the
-//! same binary; they all want it ON). The cache reads the flag fresh per query.
+//! The cache is always-on, so no per-test setup is needed; the structural
+//! eligibility guards in `fast_select` (single PK, single Eq, no RLS, simple
+//! projection) decide when it is consulted.
 
 #![allow(clippy::print_stdout)]
 
@@ -34,12 +36,6 @@ use basin_storage::{Storage, StorageConfig};
 use basin_wal::{LocalWal, Wal, WalConfig};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
-
-/// Set the cache flag ON for this process. Idempotent; safe under concurrent
-/// test execution (all tests in this file want it ON).
-fn enable_cache() {
-    std::env::set_var("BASIN_PK_ROW_CACHE", "1");
-}
 
 /// Shard-backed engine so rows can be flushed into cold Parquet — the cache
 /// only fires on cold-tier point lookups (a hot memtable hit returns earlier).
@@ -112,7 +108,6 @@ async fn rows_seen(sess: &basin_engine::ProjectSession, sql: &str) -> usize {
 ///    value (and the hit counter advances).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pk_cache_hit_returns_correct_row() {
-    enable_cache();
     let (_sd, _wd, engine, shard, bg, wal) = build().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT)")
@@ -149,7 +144,6 @@ async fn pk_cache_hit_returns_correct_row() {
 ///    not the cached stale one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pk_cache_invalidated_by_update() {
-    enable_cache();
     let (_sd, _wd, engine, shard, bg, wal) = build().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT)")
@@ -174,7 +168,6 @@ async fn pk_cache_invalidated_by_update() {
 ///    advance). The cached row must NOT be served — the row must be GONE.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pk_cache_invalidated_by_delete() {
-    enable_cache();
     let (_sd, _wd, engine, shard, bg, wal) = build().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT)")
@@ -209,7 +202,6 @@ async fn pk_cache_invalidated_by_delete() {
 ///    cached entry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pk_cache_invalidated_by_cold_write() {
-    enable_cache();
     let (_sd, _wd, engine, shard, bg, wal) = build().await;
     // Shut the background flusher so we control flushing; range UPDATE still
     // rewrites cold files synchronously.
@@ -246,7 +238,6 @@ async fn pk_cache_invalidated_by_cold_write() {
 ///    must only see their own rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pk_cache_bypassed_under_rls() {
-    enable_cache();
     let (_sd, _wd, engine, shard, bg, wal) = build().await;
     let admin = engine.open_session(ProjectId::new()).await.unwrap();
     let project = admin.project();
@@ -311,7 +302,6 @@ async fn pk_cache_bypassed_under_rls() {
 ///    invalidation wiring directly, independent of any post-ALTER read path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pk_cache_ddl_invalidates() {
-    enable_cache();
     let (_sd, _wd, engine, shard, bg, wal) = build().await;
     let project = ProjectId::new();
     let sess = engine.open_session(project).await.unwrap();

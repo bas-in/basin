@@ -892,8 +892,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                         // many-row), not a per-statement single-row INSERT, so
                         // the Vortex `Fast` cascade's fixed setup cost
                         // amortises cleanly. Flip to `Fast` unconditionally
-                        // here — independent of `BASIN_FAST_BULK_INSERT` —
-                        // because the env's `!in_tx` caveat (per-statement
+                        // here — the `!in_tx` caveat (per-statement
                         // single-row setup overhead, commit ddfd8a8) does not
                         // apply to a buffered concat. Measured drop on
                         // `BEGIN; INSERT x100; COMMIT`: ~210ms → ~74ms (3x)
@@ -1983,17 +1982,15 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
         || (in_txn_for_cache && matches!(stmt, Statement::Insert(_)));
     if !stmt_keeps_cache {
         sess.state.table_meta_cache.invalidate_all();
-        // PK row cache (gated OFF by default): the same statement classes that
+        // PK row cache (always-on): the same statement classes that
         // flush the table-meta cache — any non-SELECT, plus DML — can change a
         // table's schema or rewrite its rows. Most are caught by the cache's
         // dual watermark (snapshot id + hot epoch), but metadata-only DDL (e.g.
         // ENABLE ROW LEVEL SECURITY, ADD COLUMN with no rewrite) may not bump
         // `current_snapshot`; clear the project's PK rows here so a schema or
         // policy change can never serve a stale/old-shape row. Cheap no-op when
-        // the flag is off or the cache is empty for this project.
-        if crate::pk_row_cache::PkRowCache::enabled() {
-            sess.engine.pk_row_cache().invalidate_project(&sess.project);
-        }
+        // the cache is empty for this project.
+        sess.engine.pk_row_cache().invalidate_project(&sess.project);
     }
 
     // Phase 6 cost-based query rejection. Cheap when disabled (one
@@ -6448,13 +6445,12 @@ pub(crate) fn map_file_format(fmt: basin_catalog::TableFileFormat) -> FileFormat
 /// When neither is configured the result is `WriteOptions::default()`,
 /// which is byte-equivalent to the pre-Phase-5.7 write path.
 ///
-/// `in_tx` mirrors AF's fastpath-off-in-tx rule: `BASIN_FAST_BULK_INSERT=1`
-/// only flips encoding to `Fast` when executing outside an explicit
-/// transaction. Inside `BEGIN..COMMIT` the per-statement Fast-encoder setup
-/// cost dominates the single-row INSERT shape and produced a 27x regression
-/// on the `txn_insert_x100` bench (38ms -> 1042ms at 10k scale,
+/// `in_tx` mirrors AF's fastpath-off-in-tx rule: non-tx direct INSERT always
+/// encodes with `Fast`. Inside `BEGIN..COMMIT` the per-statement Fast-encoder
+/// setup cost dominates the single-row INSERT shape and produced a 27x
+/// regression on the `txn_insert_x100` bench (38ms -> 1042ms at 10k scale,
 /// commit ddfd8a8). When `in_tx` is true we fall through to `Best` so the
-/// in-tx path is byte-identical to the pre-env-gate behaviour.
+/// in-tx path keeps its cheaper single-row encode.
 fn write_options_for(meta: &TableMetadata, in_tx: bool) -> WriteOptions {
     WriteOptions {
         bloom_filter_columns: meta.bloom_filter_columns.clone(),
@@ -6480,24 +6476,24 @@ fn write_options_for(meta: &TableMetadata, in_tx: bool) -> WriteOptions {
             .global_sort_order
             .clone()
             .unwrap_or_default(),
-        // Opt-in Vortex fast-write mode for direct bulk INSERTs. Default
-        // is `Best` so existing call sites are byte-identical; setting
-        // `BASIN_FAST_BULK_INSERT=1` flips every direct INSERT through the
-        // minimal cascade (~3-4x faster encode at ~1.5x disk size). The
-        // next compaction rewrites the file with `Best`, so the disk-size
-        // delta is transient. Hot-tier flushes always use `Fast` and are
-        // independent of this env var (see basin-shard ShardFlushBackend).
+        // Always-on Vortex fast-write mode for non-tx direct bulk INSERTs:
+        // every non-tx direct INSERT runs through the minimal cascade
+        // (~3-4x faster encode at ~1.5x disk size). The next compaction
+        // rewrites the file with `Best`, so the disk-size delta is
+        // transient. `Best` is NOT a correctness fallback — it is just a
+        // more exhaustive encoder cascade — so always-Fast for non-tx
+        // INSERT is safe. Hot-tier flushes always use `Fast` (see
+        // basin-shard ShardFlushBackend).
         //
         // The `!in_tx` gate mirrors AF's fastpath-off-in-tx pattern:
         // inside BEGIN..COMMIT the per-statement Fast-encoder setup cost
         // dominates and regresses `BEGIN; INSERT x100; COMMIT` by ~27x
         // (single-row inserts don't amortise the Fast cascade's fixed
-        // setup). Tx rollback semantics are preserved because encoding
-        // mode only affects on-disk bytes; the in-tx pending-files queue
-        // (see `tx_pending_files_for`) is independent.
-        encoding_mode: if !in_tx
-            && std::env::var("BASIN_FAST_BULK_INSERT").as_deref() == Ok("1")
-        {
+        // setup), so in-tx INSERTs keep `Best`. Tx rollback semantics are
+        // preserved because encoding mode only affects on-disk bytes; the
+        // in-tx pending-files queue (see `tx_pending_files_for`) is
+        // independent.
+        encoding_mode: if !in_tx {
             basin_storage::EncodingMode::Fast
         } else {
             basin_storage::EncodingMode::Best

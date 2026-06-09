@@ -9,15 +9,15 @@
 //!      encoding is NOT on this path (it happens on the background flush).
 //!
 //!   2. Vortex flush encode — `flush_to_parquet` drains the tail and encodes
-//!      to Vortex. EncodingMode::Best (default) runs the full BtrBlocks
-//!      cascade (smallest files, slowest); EncodingMode::Fast
-//!      (BASIN_FAST_BULK_INSERT=1) skips the encoding search.
+//!      to Vortex. EncodingMode::Fast (the always-on mode for non-tx direct
+//!      INSERT and hot-tier flush) skips the encoding search;
+//!      EncodingMode::Best runs the full BtrBlocks cascade (smallest files,
+//!      slowest) and is reserved for in-tx INSERT + compaction.
 //!
-//! By timing (1) and (2) separately, under Best vs Fast, we learn:
-//!   - If Best vs Fast barely changes the INSERT-loop time, the tax is in
-//!     SQL parse + WAL, NOT the cascade → COPY path / WAL work is the lever.
-//!   - If the flush time dominates and Fast >> Best, the cascade is the lever
-//!     → defer Best-encode to compaction (LSM pattern).
+//! By timing (1) and (2) separately we learn:
+//!   - If the INSERT-loop time dominates, the tax is in SQL parse + WAL, NOT
+//!     the cascade → COPY path / WAL work is the lever.
+//!   - If the flush time dominates, the Vortex encode is the lever.
 //!
 //! Run: cargo test --release -p basin-integration-tests \
 //!        --test insert_write_tax_probe -- --ignored --nocapture
@@ -110,11 +110,10 @@ async fn measure(engine: &Engine, rows: i64, label: &str) {
         .unwrap();
     let flush_ms = flush_started.elapsed().as_secs_f64() * 1000.0;
 
-    let mode = if std::env::var("BASIN_FAST_BULK_INSERT").as_deref() == Ok("1") {
-        "Fast"
-    } else {
-        "Best"
-    };
+    // Non-tx direct INSERT is always-on `Fast` (#203 removed the opt-in env
+    // gate); the in-tx path keeps `Best`. This probe issues non-tx INSERTs,
+    // so the encode is `Fast`.
+    let mode = "Fast";
     println!(
         "[write-tax] {label:>6} rows={rows:>7} mode={mode:<4} \
          insert-loop={insert_loop_ms:8.1}ms ({:.1}us/row)  first-SELECT(incl flush)={flush_ms:8.1}ms",
@@ -124,20 +123,21 @@ async fn measure(engine: &Engine, rows: i64, label: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "diagnostic — run explicitly with --ignored"]
-async fn write_tax_best_mode() {
-    // NB: run this WITHOUT BASIN_FAST_BULK_INSERT to measure Best (default).
+async fn write_tax_200k() {
+    // Non-tx direct INSERT is always-on `Fast` (#203); this measures that
+    // path at 200k rows.
     let (_sd, _wd, engine, bg, wal) = build().await;
-    measure(&engine, 200_000, "best").await;
+    measure(&engine, 200_000, "200k").await;
     bg.shutdown().await;
     wal.close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "diagnostic — run explicitly with --ignored + BASIN_FAST_BULK_INSERT=1"]
-async fn write_tax_fast_mode() {
-    // NB: run this WITH BASIN_FAST_BULK_INSERT=1 to measure Fast.
+#[ignore = "diagnostic — run explicitly with --ignored"]
+async fn write_tax_1m() {
+    // Same always-on `Fast` non-tx path, at 1M rows (the bench scale).
     let (_sd, _wd, engine, bg, wal) = build().await;
-    measure(&engine, 200_000, "fast").await;
+    measure(&engine, 1_000_000, "1m").await;
     bg.shutdown().await;
     wal.close().await.unwrap();
 }

@@ -1705,11 +1705,11 @@ pub(crate) async fn execute_simple_select(
     }
     // ── End Phase 5.14.C3 probe ──────────────────────────────────────────────
 
-    // ── PK row cache context (correctness-critical; gated OFF by default) ─────
+    // ── PK row cache context (correctness-critical; always-on) ───────────────
     //
     // Build the cache descriptor for the canonical single-PK-Eq point-lookup
-    // shape. We only enter this when:
-    //   * the feature flag `BASIN_PK_ROW_CACHE=1` is set (default OFF);
+    // shape. The cache is always consulted (capacity bounded by
+    // `BASIN_PK_ROW_CACHE_BYTES`, default 64 MiB). We only enter this when:
     //   * the table has RLS DISABLED (`!meta.rls_enabled`) — a cached row is the
     //     RAW row, never an RLS-filtered view, so it must NEVER be served for an
     //     RLS table (bug family #159). NB: `execute_simple_select` is already
@@ -1729,8 +1729,7 @@ pub(crate) async fn execute_simple_select(
     // this PK (it returned early on a hit) and NO tombstone forcing suppression
     // for this key — so the cold-tier read is authoritative and cacheable.
     let pk_cache_ctx: Option<(basin_hottier::RowKey, u64, u64, u64)> =
-        if crate::pk_row_cache::PkRowCache::enabled()
-            && !meta.rls_enabled
+        if !meta.rls_enabled
             && meta.pk_columns.len() == 1
             && plan.aggregates.is_none()
             && plan.in_list_preds.is_empty()

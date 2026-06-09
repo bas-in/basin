@@ -302,9 +302,10 @@ pub(crate) struct EngineInner {
     /// otherwise dominates bulk-INSERT cost. Invalidated by any mutation
     /// that adds, removes, or replaces a data file for the table.
     pub(crate) pk_set_cache: Arc<crate::constraints::PkSetCache>,
-    /// Process-global PK → Row hot cache (correctness-critical; gated behind
-    /// `BASIN_PK_ROW_CACHE=1`, default OFF). Dual-watermark invalidation
-    /// (hot_tier_epoch + snapshot_id); see [`crate::pk_row_cache`].
+    /// Process-global PK → Row hot cache (correctness-critical; always-on,
+    /// capacity bounded by `BASIN_PK_ROW_CACHE_BYTES`, default 64 MiB).
+    /// Dual-watermark invalidation (hot_tier_epoch + snapshot_id); see
+    /// [`crate::pk_row_cache`].
     pub(crate) pk_row_cache: Arc<crate::pk_row_cache::PkRowCache>,
 }
 
@@ -590,10 +591,11 @@ impl Engine {
         &self.inner.pk_set_cache
     }
 
-    /// Process-global PK → Row hot cache (gated behind `BASIN_PK_ROW_CACHE=1`,
-    /// default OFF). The fast SELECT point-query path consults it; DML
-    /// invalidation rides on the hot_tier_epoch watermark automatically and
-    /// DDL calls `invalidate_table`. The returned `Arc` is cheap to clone.
+    /// Process-global PK → Row hot cache (always-on; capacity bounded by
+    /// `BASIN_PK_ROW_CACHE_BYTES`, default 64 MiB). The fast SELECT
+    /// point-query path consults it; DML invalidation rides on the
+    /// hot_tier_epoch watermark automatically and DDL calls
+    /// `invalidate_table`. The returned `Arc` is cheap to clone.
     pub(crate) fn pk_row_cache(&self) -> &Arc<crate::pk_row_cache::PkRowCache> {
         &self.inner.pk_row_cache
     }
