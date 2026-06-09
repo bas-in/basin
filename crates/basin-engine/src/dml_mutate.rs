@@ -1506,6 +1506,38 @@ async fn hot_tier_update_by_pk(
     let registry = sess.engine.memtable_registry();
     let entry = registry.get_or_create(sess.project, table.clone());
 
+    // ── PK row cache context for the read-before-write ───────────────────────
+    //
+    // The merge below needs the FULL current row image so unset columns are
+    // preserved. The always-on `PkRowCache` already holds full-schema cold-row
+    // images populated by the canonical `SELECT * WHERE pk = X` fast path (and
+    // by this function's own cold-read populate below). Consulting it lets a
+    // single-row UPDATE skip the cold point-lookup entirely on a warm hit,
+    // which is the scale-dependent cost that made the 1M-row UPDATE ~10× slower
+    // than the 100k case (the cold read grows with file count).
+    //
+    // We mirror the SELECT-path guard exactly:
+    //   * RLS DISABLED — a cached row is the RAW row, never an RLS-filtered
+    //     view, so it must never seed an RLS-table merge (bug family #159);
+    //   * single-column PK only — multi-column / non-single PK tables don't
+    //     share the `RowKey` point shape and are left on the cold path;
+    //   * `proj_hash = hash_read_cols(None)` — we need the FULL row, so we only
+    //     match (and only populate) the all-columns cache shape; a SELECT that
+    //     cached a column subset has a different `proj_hash` and is ignored.
+    //
+    // Watermarks are captured HERE, before this function writes any overlay, so
+    // a concurrent mutation that raced our read advances the live watermark past
+    // the captured one and the next reader rejects the (now stale) entry. We do
+    // NOT re-populate with the POST-update image: the UPDATE writes a
+    // `MemRowValue::Update` overlay that the memtable point-lookup probe serves
+    // directly (fast_select returns early on that hit before ever consulting
+    // this cache), and the overlay bumps `hot_tier_epoch` so any cold entry we
+    // read/populated auto-invalidates on its next GET — never a stale serve.
+    let pk_cache_full_proj = crate::pk_row_cache::hash_read_cols(None);
+    let pk_cache_enabled = !meta.rls_enabled && meta.pk_columns.len() == 1;
+    let pk_cache_hot_epoch = registry.hot_tier_epoch(&sess.project, table);
+    let pk_cache_snapshot = meta.current_snapshot.0;
+
     // Build the set of target PK keys for fast membership + a stable order.
     let want: std::collections::HashSet<Vec<u8>> =
         keys.iter().map(|k| k.as_bytes().to_vec()).collect();
@@ -1537,8 +1569,49 @@ async fn hot_tier_update_by_pk(
             }
         }
     }
-    // 2. Cold-tier fill for PKs not in the memtable. Read matched rows via the
-    //    PK predicate and slice out one batch row per PK.
+    // 2a. PK row cache fill: for keys not satisfied by the memtable, consult the
+    //     always-on PK-row cache for a full-schema cold-row image. On a valid
+    //     dual-watermark hit we use it as the merge base and skip the cold
+    //     point-lookup for that key. Only the all-columns shape
+    //     (`hash_read_cols(None)`) is reused — anything else is a different
+    //     projection and would lose columns the merge must preserve.
+    if pk_cache_enabled {
+        let cache = sess.engine.pk_row_cache();
+        for k in keys {
+            let kb = k.as_bytes().to_vec();
+            if current.contains_key(&kb) {
+                continue;
+            }
+            if let Some(rows) = cache.get(
+                &sess.project,
+                table,
+                k,
+                pk_cache_hot_epoch,
+                pk_cache_snapshot,
+                pk_cache_full_proj,
+            ) {
+                // The cache stores 0- or 1-row full-schema batches. A 1-row hit
+                // is the live cold row; a 0-row hit means the cold tier had no
+                // such PK (the merge loop will skip it, exactly as a cold read
+                // returning nothing would). Reattach catalog metadata so the
+                // image matches the schema the merge expects.
+                let row_count: usize = rows.iter().map(|b| b.num_rows()).sum();
+                if row_count == 0 {
+                    continue; // no live cold row — leave it for the (empty) cold pass.
+                }
+                if row_count == 1 {
+                    let rb = rows
+                        .iter()
+                        .find(|b| b.num_rows() == 1)
+                        .expect("row_count==1 implies one non-empty batch")
+                        .clone();
+                    current.insert(kb, reattach_catalog_metadata(schema.as_ref(), rb)?);
+                }
+            }
+        }
+    }
+
+    // 2b. Cold-tier fill for PKs still not resolved (memtable miss + cache miss).
     //
     // Scalable file prune: for each missing key we run `pk_point_probe`
     // against the catalog's per-file zone-map + bloom and union the candidate
@@ -1629,7 +1702,25 @@ async fn hot_tier_update_by_pk(
                     };
                     let kb = rk.as_bytes().to_vec();
                     if want.contains(&kb) && !current.contains_key(&kb) {
-                        current.insert(kb, batch.slice(row, 1));
+                        let one = batch.slice(row, 1);
+                        // Populate the PK row cache with the full-schema cold
+                        // image (all columns → `hash_read_cols(None)`) so a
+                        // later UPDATE (or `SELECT *`) for this PK skips the
+                        // cold point-lookup. Watermarks were captured at entry,
+                        // before this function writes any overlay. Same gate as
+                        // the read above: single-PK, RLS-disabled tables only.
+                        if pk_cache_enabled {
+                            sess.engine.pk_row_cache().insert(
+                                &sess.project,
+                                table,
+                                rk.clone(),
+                                pk_cache_hot_epoch,
+                                pk_cache_snapshot,
+                                pk_cache_full_proj,
+                                vec![one.clone()],
+                            );
+                        }
+                        current.insert(kb, one);
                     }
                 }
             }
