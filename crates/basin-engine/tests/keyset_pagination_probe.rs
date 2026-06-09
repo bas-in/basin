@@ -33,7 +33,7 @@ fn engine_in(dir: &TempDir) -> Engine {
         object_store: Arc::new(fs),
         root_prefix: None,
         disk_cache: None,
-        page_cache: None,
+        page_cache: Some(basin_storage::PageCacheConfig::new(256 * 1024 * 1024)),
     });
     let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
     Engine::new(EngineConfig {

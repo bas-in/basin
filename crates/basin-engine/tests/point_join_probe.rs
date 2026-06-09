@@ -373,11 +373,13 @@ async fn point_join_latency_100k() {
     // Batch the inserts so seeding doesn't dominate wall-clock.
     let mut u = String::from("INSERT INTO users (id, email) VALUES ");
     let mut e = String::from("INSERT INTO events (id, user_id, payload) VALUES ");
+    let mut batch_start = true;
     for i in 1..=N {
-        if i > 1 {
+        if !batch_start {
             u.push(',');
             e.push(',');
         }
+        batch_start = false;
         u.push_str(&format!("({i}, 'user{i}@x.com')"));
         e.push_str(&format!("({i}, {i}, 'p{i}')"));
         // Flush the statement every 10k rows to keep the SQL string bounded.
@@ -386,6 +388,7 @@ async fn point_join_latency_100k() {
             exec(&sess, &e).await;
             u = String::from("INSERT INTO users (id, email) VALUES ");
             e = String::from("INSERT INTO events (id, user_id, payload) VALUES ");
+            batch_start = true;
         }
     }
 

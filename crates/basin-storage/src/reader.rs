@@ -828,6 +828,58 @@ async fn read_one(
             Arc::new(s)
         });
 
+        // ── Pre-GET unfiltered-decode cache short-circuit ────────────────────
+        //
+        // The unfiltered-decode reuse below caches a file's raw (read-projected,
+        // no-filter) batches under a key of `(path, read_proj, EMPTY filters)`.
+        // That key is computable WITHOUT the file bytes.  When the entry is
+        // already warm we can answer the read by Arrow-filtering the cached
+        // batches and never issue the object-store GET (which on localfs still
+        // copies the whole compressed blob into RAM, and on cloud is a network
+        // RTT) — the dominant per-query cost once the decode is cached.
+        //
+        // Gated identically to the post-GET `unfiltered_eligible` path EXCEPT
+        // for the size check (the entry's mere presence proves it passed the
+        // size gate at insert time) and the schema-inference fallback (we only
+        // short-circuit when the authoritative catalog schema is present, so we
+        // never need to infer a schema from bytes we haven't fetched).  When
+        // any gate fails we fall straight through to the GET, byte-for-byte
+        // unchanged.
+        {
+            let unfiltered_cache_disabled =
+                std::env::var("BASIN_UNFILTERED_DECODE_CACHE_DISABLE").as_deref() == Ok("1");
+            if !opts.filters.is_empty()
+                && !unfiltered_cache_disabled
+                && catalog_schema.is_some()
+            {
+                if let Some(pc) = page_cache.as_ref() {
+                    let read_proj = vortex_read_projection(opts.as_ref());
+                    let unfiltered_key = CacheKey {
+                        path: path.clone(),
+                        projection_hash: hash_projection(read_proj.as_deref()),
+                        filters_hash: hash_filters(&[]),
+                    };
+                    if let Some(cached) = pc.get(&unfiltered_key) {
+                        let raw: Vec<RecordBatch> =
+                            cached.iter().map(|b| (**b).clone()).collect();
+                        // Early per-call LIMIT cut inside the filter pass so the
+                        // projection + restamp work touches at most `limit` rows
+                        // (the caller re-applies the same cap; this is purely a
+                        // work-saving early cut).
+                        let batches = vortex_project_and_filter_limited(
+                            raw,
+                            opts.as_ref(),
+                            catalog_schema.as_ref(),
+                            true,
+                            opts.limit,
+                        )?;
+                        let stream = futures::stream::iter(batches.into_iter().map(Ok));
+                        return Ok(stream.boxed());
+                    }
+                }
+            }
+        }
+
         // Two byte-acquisition paths must feed the Vortex decoder:
         //   (a) envelope-encrypted: a `<path>.wrapped` sidecar exists, so we
         //       unwrap + AES-GCM decrypt to recover the plaintext blob;
@@ -1007,29 +1059,17 @@ async fn read_one(
             // Apply the authoritative predicate + projection in Arrow over
             // the (shared) unfiltered batches. `apply_filter = true` always:
             // the cached batches are unfiltered, so the WHERE must run here.
-            let batches =
-                vortex_project_and_filter(raw, opts.as_ref(), catalog_schema.as_ref(), true)?;
-
-            // Per-file LIMIT gate (mirrors the pushdown path below).
-            let batches = if let Some(lim) = opts.limit {
-                let mut kept = Vec::with_capacity(batches.len());
-                let mut seen = 0usize;
-                for b in batches {
-                    if seen >= lim {
-                        break;
-                    }
-                    let take = (lim - seen).min(b.num_rows());
-                    seen += take;
-                    if take == b.num_rows() {
-                        kept.push(b);
-                    } else {
-                        kept.push(b.slice(0, take));
-                    }
-                }
-                kept
-            } else {
-                batches
-            };
+            // The early per-call LIMIT cut (mirrors the pushdown path below)
+            // is folded INTO the filter pass so projection + restamp touch at
+            // most `limit` rows; this raw-batch path never write-throughs the
+            // post-filter result, so an early cut is sound.
+            let batches = vortex_project_and_filter_limited(
+                raw,
+                opts.as_ref(),
+                catalog_schema.as_ref(),
+                true,
+                opts.limit,
+            )?;
 
             let stream = futures::stream::iter(batches.into_iter().map(Ok));
             return Ok(stream.boxed());
@@ -2382,8 +2422,42 @@ fn vortex_project_and_filter(
     catalog_schema: Option<&SchemaRef>,
     apply_filter: bool,
 ) -> Result<Vec<RecordBatch>> {
+    vortex_project_and_filter_limited(batches, opts, catalog_schema, apply_filter, None)
+}
+
+/// Same as [`vortex_project_and_filter`] but with an optional early per-call
+/// row cap (`early_limit`).  When `Some(lim)`, the running post-filter row
+/// total is truncated to `lim` BEFORE the per-column projection + metadata
+/// restamp passes, so those passes touch at most `lim` rows rather than every
+/// surviving row of the file.
+///
+/// This is the keyset-pagination win: each cold file is ASC-sorted on the
+/// cluster column, so the first `lim` post-filter rows are exactly that file's
+/// top-`lim` contribution.  The caller applies the identical truncation
+/// afterwards, so this is a pure work-saving early cut, not a semantic change.
+///
+/// IMPORTANT: this MUST NOT be used on a code path that write-throughs the
+/// post-filter result into the page cache (the normal pushdown decode does),
+/// because a truncated entry would be served — wrongly — to a later query with
+/// a larger or absent LIMIT.  Only the unfiltered-decode-reuse paths (which
+/// cache the RAW pre-filter batches, never this truncated output) pass a
+/// non-`None` `early_limit`.
+fn vortex_project_and_filter_limited(
+    batches: Vec<RecordBatch>,
+    opts: &ReadOptions,
+    catalog_schema: Option<&SchemaRef>,
+    apply_filter: bool,
+    early_limit: Option<usize>,
+) -> Result<Vec<RecordBatch>> {
+    let limit = early_limit;
+    let mut seen = 0usize;
     let mut out = Vec::with_capacity(batches.len());
     for batch in batches {
+        if let Some(lim) = limit {
+            if seen >= lim {
+                break;
+            }
+        }
         // 1) Filter (predicate columns referenced by name; pre-projection).
         let filtered = if !apply_filter || opts.filters.is_empty() {
             batch
@@ -2402,6 +2476,21 @@ fn vortex_project_and_filter(
                     .map_err(|e| BasinError::storage(format!("vortex filter: {e}")))?,
                 None => batch,
             }
+        };
+
+        // Early per-call LIMIT cut: slice the post-filter batch to the rows
+        // still needed before any per-column projection / restamp work.
+        let filtered = if let Some(lim) = limit {
+            let remaining = lim - seen;
+            let take = remaining.min(filtered.num_rows());
+            seen += take;
+            if take == filtered.num_rows() {
+                filtered
+            } else {
+                filtered.slice(0, take)
+            }
+        } else {
+            filtered
         };
 
         // 2) Projection (subset + reorder by name; missing → typed NULL).
