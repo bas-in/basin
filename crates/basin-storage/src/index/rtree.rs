@@ -29,7 +29,7 @@ use std::sync::Arc;
 use arrow_array::{Array, FixedSizeBinaryArray, RecordBatch};
 use basin_common::{ProjectId, TableName};
 use object_store::path::Path as ObjectPath;
-use rstar::{primitives::Rectangle, RTree, RTreeObject, AABB};
+use rstar::{primitives::Rectangle, PointDistance, RTree, RTreeObject, AABB};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -75,6 +75,24 @@ impl RTreeObject for SpatialEntry {
 
     fn envelope(&self) -> Self::Envelope {
         AABB::from_corners(self.min_corner, self.max_corner)
+    }
+}
+
+/// Squared L2 distance (in degree-space) from `query` to the entry's
+/// envelope, so `nearest_neighbor_iter` can order candidates. For a POINT
+/// (zero-area envelope) this is the squared distance to the point itself; for
+/// a BOX2D it is the squared distance to the nearest point on the rectangle
+/// (zero when inside). `rstar` re-ranks by this value during the NN walk; the
+/// engine then re-ranks the L2-degree candidates by exact Haversine meters.
+impl PointDistance for SpatialEntry {
+    fn distance_2(&self, query: &[f64; 2]) -> f64 {
+        // Clamp the query to the entry's envelope per axis; the squared
+        // distance to that clamped point is the envelope-to-point distance.
+        let cx = query[0].clamp(self.min_corner[0], self.max_corner[0]);
+        let cy = query[1].clamp(self.min_corner[1], self.max_corner[1]);
+        let dx = query[0] - cx;
+        let dy = query[1] - cy;
+        dx * dx + dy * dy
     }
 }
 
@@ -347,6 +365,48 @@ impl RTreeRegistry {
         rgs.sort_unstable();
         rgs.dedup();
         Some(rgs)
+    }
+
+    /// Nearest-neighbour probe for KNN spatial queries.
+    ///
+    /// Returns up to `take` entries from `file_path`'s R-tree in ascending
+    /// L2-degree distance from `query` (`[x, y]`), or `None` if the file has
+    /// no segment loaded.  The caller over-fetches (more than the user's
+    /// `LIMIT k`) and re-ranks the union of per-file candidates by the exact
+    /// Haversine metric — L2-degree order is only an approximation of
+    /// great-circle order, so the over-fetch + re-rank is what makes the
+    /// final top-k correct (see `rtree_knn_scan`).
+    ///
+    /// Entries are returned as `(row_group_id, row_id_in_group, x, y)`.
+    pub fn nearest_entries(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        col: &str,
+        file_path: &str,
+        query: [f64; 2],
+        take: usize,
+    ) -> Option<Vec<(RowGroupId, u32, f64, f64)>> {
+        let arc = {
+            let map = self.inner.lock().expect("RTreeRegistry outer lock poisoned");
+            map.get(&RegKey {
+                project: *project,
+                table: table.clone(),
+                col: col.to_string(),
+            })
+            .cloned()
+        }?;
+        let files = arc.lock().expect("RTreeRegistry file table lock poisoned");
+        let rtree = files.by_file.get(file_path)?.clone();
+        let out: Vec<(RowGroupId, u32, f64, f64)> = rtree
+            .nearest_neighbor_iter(&query)
+            .take(take)
+            .map(|e| {
+                // For a POINT the envelope is zero-area, so min == max == coord.
+                (e.row_group_id, e.row_id_in_group, e.min_corner[0], e.min_corner[1])
+            })
+            .collect();
+        Some(out)
     }
 
     /// Drop the segment for `file_path` (called on compaction so

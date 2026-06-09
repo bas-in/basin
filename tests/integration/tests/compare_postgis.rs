@@ -479,13 +479,68 @@ async fn compare_postgis() {
     let s2_pg = pg_p50(&pg, &s2_pg_sql, samples).await;
     let s2_basin = basin_p50(&sess, &s2_basin_sql, samples).await;
 
-    // ── S3 KNN: PG-only (basin has no <-> operator / KNN scan) ────────────
+    // ── S3 KNN: <-> nearest-neighbour, now SHIPPED on basin ───────────────
+    //
+    // Basin routes `ORDER BY geom <-> ST_MakePoint(x,y) LIMIT k` through the
+    // R-tree nearest-neighbour path (over-fetch in L2-degree order, exact
+    // Haversine re-rank). PG uses GIST index-ordered `<->` (planar distance on
+    // geometry(Point,4326)). At this near-equatorial seed area `[0,10]²` the
+    // planar-degree order and the Haversine-metre order coincide for the top-k,
+    // so the SET of 10 nearest ids must match between the engines — a real
+    // correctness guard, not a sentinel.
     let s3_pg_sql = format!(
         "SELECT id FROM {schema}.pts \
          ORDER BY geom <-> ST_SetSRID(ST_MakePoint({QUERY_X},{QUERY_Y}),4326) LIMIT 10"
     );
+    let s3_basin_sql = format!(
+        "SELECT id FROM pts \
+         ORDER BY geom <-> ST_MakePoint({QUERY_X},{QUERY_Y}) LIMIT 10"
+    );
+    // Pull both id-lists and compare as sorted sets (top-10 nearest).
+    let pg_s3_ids: Vec<i64> = {
+        let rows = pg.query(&s3_pg_sql, &[]).await.expect("pg s3 knn");
+        rows.iter().map(|r| r.get::<usize, i64>(0)).collect()
+    };
+    let basin_s3_ids: Vec<i64> = {
+        let res = sess.execute(&s3_basin_sql).await.expect("basin s3 knn");
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                let mut out = Vec::new();
+                for b in &batches {
+                    let idx = b.schema().index_of("id").expect("id col");
+                    let a = b.column(idx).as_any().downcast_ref::<Int64Array>().expect("id i64");
+                    for i in 0..a.len() {
+                        out.push(a.value(i));
+                    }
+                }
+                out
+            }
+            ExecResult::Empty { .. } => Vec::new(),
+        }
+    };
+    let mut pg_sorted = pg_s3_ids.clone();
+    let mut basin_sorted = basin_s3_ids.clone();
+    pg_sorted.sort_unstable();
+    basin_sorted.sort_unstable();
+    let s3_count_match = pg_s3_ids.len() == basin_s3_ids.len();
+    let s3_set_match = pg_sorted == basin_sorted;
+    println!(
+        "[compare_postgis] S3 KNN: pg_ids={pg_s3_ids:?} basin_ids={basin_s3_ids:?} \
+         count_match={s3_count_match} set_match={s3_set_match}"
+    );
+    assert_eq!(
+        basin_s3_ids.len(),
+        10,
+        "S3 KNN: basin must return exactly 10 nearest (got {})",
+        basin_s3_ids.len()
+    );
+    assert_eq!(
+        basin_sorted, pg_sorted,
+        "S3 KNN set mismatch: basin top-10 nearest != PG top-10 nearest \
+         (basin={basin_sorted:?} pg={pg_sorted:?})"
+    );
     let s3_pg = pg_p50(&pg, &s3_pg_sql, samples).await;
-    let s3_basin = -1.0; // sentinel: not shipped
+    let s3_basin = basin_p50(&sess, &s3_basin_sql, samples).await;
 
     // ── Report ───────────────────────────────────────────────────────────
     println!(
@@ -494,15 +549,16 @@ async fn compare_postgis() {
          {:<18}{:>12.3}ms{:>12.3}ms\n\
          {:<18}{:>12.3}ms{:>12.3}ms\n\
          {:<18}{:>12.3}ms{:>12.3}ms\n\
-         {:<18}{:>14}{:>12.3}ms\n\
-         S1 count-match guard: {} | S2 count-match guard: {}\n",
+         {:<18}{:>12.3}ms{:>12.3}ms\n\
+         S1 count-match: {} | S2 count-match: {} | S3 KNN set-match: {}\n",
         "shape", "basin", "postgis",
         "S1 radius count", s1_basin, s1_pg,
         "S4 radius id-list", s4_basin, s4_pg,
         "S2 bbox count", s2_basin, s2_pg,
-        "S3 KNN (PG-only)", "n/a", s3_pg,
+        "S3 KNN id-list", s3_basin, s3_pg,
         if count_match { "PASS" } else { "FAIL" },
         if s2_count_match { "PASS" } else { "FAIL" },
+        if s3_set_match { "PASS" } else { "FAIL" },
     );
 
     let metrics = vec![
@@ -531,12 +587,12 @@ async fn compare_postgis() {
             ratio_text: ratio_text(s2_basin, s2_pg),
         },
         CompareMetric {
-            label: "S3 KNN <-> LIMIT 10 (PG-only)".into(),
+            label: "S3 KNN <-> LIMIT 10 (R-tree NN)".into(),
             basin: s3_basin,
             postgres: s3_pg,
             unit: "ms".into(),
-            better: WhichWins::Postgres,
-            ratio_text: Some("basin KNN not shipped".into()),
+            better: which_wins(s3_basin, s3_pg),
+            ratio_text: ratio_text(s3_basin, s3_pg),
         },
     ];
 
@@ -551,13 +607,15 @@ async fn compare_postgis() {
          native PostGIS idiom on both sides (geom && ST_MakeEnvelope(...)); Basin \
          rewrites it to ST_Contains(envelope, geom) and routes it through the GIST \
          R-tree row-group pushdown, with the bbox count hard-asserted equal to PG. \
-         S3 KNN is PG-only — Basin ships no <-> operator yet.",
+         S3 KNN (ORDER BY geom <-> ST_MakePoint(...) LIMIT 10) now routes through \
+         Basin's R-tree nearest-neighbour path (over-fetch + exact Haversine re-rank); \
+         the set of 10 nearest ids is hard-asserted equal to PG's GIST <-> result.",
         true,
         metrics,
-        Some(if count_match && s2_count_match {
-            "S1 + S2 count-match guards: PASS"
+        Some(if count_match && s2_count_match && s3_set_match {
+            "S1 + S2 count-match + S3 KNN set-match guards: PASS"
         } else {
-            "count-match guard: FAIL"
+            "compare guard: FAIL"
         }),
     );
 

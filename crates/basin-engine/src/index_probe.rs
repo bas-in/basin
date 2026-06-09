@@ -2236,6 +2236,342 @@ fn extract_envelope(expr: &sqlparser::ast::Expr) -> Option<(f64, f64, f64, f64)>
     }
 }
 
+// ── PG-Wave KNN — `ORDER BY point_col <-> ST_MakePoint(x,y) LIMIT k` ──────────
+//
+// Nearest-neighbour spatial search over a POINT column backed by the R-tree
+// sidecar.  Mirrors the pgvector HNSW planner (`vector_planner.rs`) but for
+// POINT geometry: the order operator is `<->`, the right-hand side is a
+// literal `ST_MakePoint(x, y)` (optionally wrapped in `ST_SetSRID(...)`), and
+// the column is a `BASIN_TYPE=POINT` column (NOT a `vector(N)` column — that
+// is the existing HNSW path).
+//
+// DISAMBIGUATION FROM pgvector: the vector planner runs first in the executor
+// hot path; for a POINT column its `extract_distance_call` parses the RHS as a
+// `vector(N)` literal, which fails (the RHS is an `ST_MakePoint(...)` call, not
+// a quoted vector literal), so the vector planner returns `None`.  The KNN
+// recognizer then keys on (a) RHS being `ST_MakePoint`/`ST_SetSRID(...)` and
+// (b) the LHS column carrying `BASIN_TYPE=POINT` in the catalog schema.  The
+// two paths are structurally exclusive at the RHS shape and confirmed exclusive
+// at the column-type check.
+
+/// Detected KNN nearest-neighbour plan for a POINT column.
+///
+/// Produced by [`detect_knn_predicate`] when the query matches
+/// `SELECT <proj> FROM <table> ORDER BY <col> <-> ST_MakePoint(x, y) LIMIT k`
+/// and `<col>` is a `BASIN_TYPE=POINT` column.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpatialKnnPlan {
+    /// Projected output columns. `None` means `SELECT *`.
+    pub projection: Option<Vec<String>>,
+    /// The table to scan.
+    pub table: TableName,
+    /// The POINT column being ordered by distance.
+    pub col: String,
+    /// Query-point longitude (x).
+    pub qx: f64,
+    /// Query-point latitude (y).
+    pub qy: f64,
+    /// `LIMIT k` — number of nearest rows to return.
+    pub k: usize,
+}
+
+/// Detect `SELECT … FROM t ORDER BY <col> <-> ST_MakePoint(x,y) LIMIT k` on a
+/// POINT column.
+///
+/// `raw_sql` MUST be the original SQL, before the `<->`→UDF rewrite (same
+/// invariant as the pgvector planner — once `<->` becomes `l2_distance(...)`
+/// the structural signal is gone).  The catalog is consulted to confirm the
+/// ORDER BY column is a `BASIN_TYPE=POINT` column on the named table; a vector
+/// column, a missing column, or a missing table all return `None` so the
+/// existing pipeline (pgvector HNSW or brute-force) takes over unchanged.
+///
+/// Returns `None` (caller falls back) on ANY off-shape query.
+pub async fn detect_knn_predicate(
+    raw_sql: &str,
+    project: &ProjectId,
+    catalog: &Arc<dyn basin_catalog::Catalog>,
+) -> Option<SpatialKnnPlan> {
+    use crate::pg_ast::{ObjectNamePartExt, OrderByExt, QueryClauseExt};
+    use sqlparser::ast::{
+        Expr, GroupByExpr, SetExpr, Statement, TableFactor, Value, ValueWithSpan,
+    };
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    // Fast pre-gate: must contain `<->` AND a point constructor.
+    if !raw_sql.contains("<->") {
+        return None;
+    }
+    let lower = raw_sql.to_lowercase();
+    if !lower.contains("st_makepoint") && !lower.contains("st_point") {
+        return None;
+    }
+
+    // sqlparser 0.52 does not natively parse `<->`; rewrite the single
+    // `<col> <-> <rhs>` occurrence into `__basin_vop_l2(<col>, <rhs>)` so the
+    // operator survives parsing as a function call. Unlike the pgvector
+    // planner (whose RHS is always a quoted vector literal), the KNN RHS is an
+    // `ST_MakePoint(...)` / `ST_SetSRID(ST_MakePoint(...), srid)` function
+    // call, so the rewrite must balance parentheses on the RHS. The marker
+    // namespace can never collide with a user UDF.
+    let prepared = match mark_knn_distance_op(raw_sql) {
+        Some(s) => s,
+        None => return None,
+    };
+    let dialect = PostgreSqlDialect {};
+    let stmts = Parser::parse_sql(&dialect, &prepared).ok()?;
+    if stmts.len() != 1 {
+        return None;
+    }
+    let query = match &stmts[0] {
+        Statement::Query(q) => q.as_ref(),
+        _ => return None,
+    };
+
+    // LIMIT k — constant positive integer.
+    let k = match query.ext_limit() {
+        Some(Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. })) => {
+            match s.parse::<i64>() {
+                Ok(n) if n > 0 => n as usize,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+
+    // Reject auxiliary clauses we'd silently lose when routing.
+    if query.with.is_some()
+        || !query.ext_limit_by().is_empty()
+        || query.ext_offset().is_some()
+        || query.fetch.is_some()
+        || !query.locks.is_empty()
+        || query.for_clause.is_some()
+        || query.settings.is_some()
+        || query.format_clause.is_some()
+    {
+        return None;
+    }
+
+    // Exactly one ORDER BY expression, ASC, no NULLS FIRST/LAST.
+    let order = query.order_by.as_ref()?;
+    if order.ext_exprs().len() != 1 {
+        return None;
+    }
+    let order_expr = &order.ext_exprs()[0];
+    if let Some(false) = order_expr.options.asc {
+        return None;
+    }
+    if order_expr.options.nulls_first.is_some() {
+        return None;
+    }
+
+    let select = match query.body.as_ref() {
+        SetExpr::Select(s) => s.as_ref(),
+        _ => return None,
+    };
+    if select.distinct.is_some()
+        || select.top.is_some()
+        || select.into.is_some()
+        || !select.lateral_views.is_empty()
+        || select.prewhere.is_some()
+        || select.selection.is_some()
+        || !select.cluster_by.is_empty()
+        || !select.distribute_by.is_empty()
+        || !select.sort_by.is_empty()
+        || select.having.is_some()
+        || !select.named_window.is_empty()
+        || select.qualify.is_some()
+    {
+        return None;
+    }
+    match &select.group_by {
+        GroupByExpr::Expressions(exprs, mods) if exprs.is_empty() && mods.is_empty() => {}
+        _ => return None,
+    }
+
+    // Single bare table, no joins/aliases.
+    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+        return None;
+    }
+    let table_name = match &select.from[0].relation {
+        TableFactor::Table { name, alias: None, args: None, .. } => {
+            if name.0.len() != 1 {
+                return None;
+            }
+            name.0[0].id_val().clone()
+        }
+        _ => return None,
+    };
+    let table = TableName::new(table_name).ok()?;
+
+    // ORDER BY expr must be `__basin_vop_l2(<col>, ST_MakePoint(x,y))`.
+    let (col, qx, qy) = extract_knn_distance_call(&order_expr.expr)?;
+
+    // Projection: `*` or a list of bare identifiers.
+    let projection = extract_simple_projection(&select.projection)?;
+
+    // Confirm `col` is a POINT column (NOT a vector column → that is HNSW).
+    let meta = catalog.load_table(project, &table).await.ok()?;
+    let field = meta.schema.field_with_name(&col).ok()?;
+    if !crate::types::field_is_point(field) {
+        return None;
+    }
+
+    Some(SpatialKnnPlan { projection, table, col, qx, qy, k })
+}
+
+/// Rewrite the first `<col> <-> <rhs>` into `__basin_vop_l2(<col>, <rhs>)`,
+/// where `<col>` is a bare identifier (or `alias.col`) and `<rhs>` is a
+/// function-call expression with balanced parentheses (e.g.
+/// `ST_MakePoint(0.0, 0.0)` or `ST_SetSRID(ST_MakePoint(0,0), 4326)`).
+///
+/// Returns `None` when no `<->` is present, the LHS is not a bare identifier,
+/// or the RHS is not a balanced function call — all of which mean "not the KNN
+/// shape", so the caller falls back.
+fn mark_knn_distance_op(sql: &str) -> Option<String> {
+    let bytes = sql.as_bytes();
+    let op_pos = sql.find("<->")?;
+    let op_end = op_pos + 3;
+
+    // ── LHS: scan left over whitespace, then an identifier run. ──
+    let mut i = op_pos;
+    while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    let lhs_end = i;
+    while i > 0 {
+        let b = bytes[i - 1];
+        if b.is_ascii_alphanumeric() || b == b'_' || b == b'.' {
+            i -= 1;
+        } else {
+            break;
+        }
+    }
+    let lhs_start = i;
+    if lhs_start == lhs_end {
+        return None;
+    }
+    let lhs = &sql[lhs_start..lhs_end];
+
+    // ── RHS: skip whitespace, expect an identifier then a balanced `(...)`. ──
+    let mut j = op_end;
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    let rhs_start = j;
+    while j < bytes.len() {
+        let b = bytes[j];
+        if b.is_ascii_alphanumeric() || b == b'_' || b == b'.' {
+            j += 1;
+        } else {
+            break;
+        }
+    }
+    // Skip whitespace between the function name and its open paren.
+    let mut k = j;
+    while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+        k += 1;
+    }
+    if k >= bytes.len() || bytes[k] != b'(' {
+        return None; // RHS is not a function call → not the KNN shape.
+    }
+    let mut depth = 0i32;
+    let mut end = k;
+    while end < bytes.len() {
+        match bytes[end] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end += 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+        end += 1;
+    }
+    if depth != 0 {
+        return None; // unbalanced parens.
+    }
+    let rhs = &sql[rhs_start..end];
+
+    let marker = format!("__basin_vop_l2({lhs}, {rhs})");
+    let mut out = String::with_capacity(sql.len() + marker.len());
+    out.push_str(&sql[..lhs_start]);
+    out.push_str(&marker);
+    out.push_str(&sql[end..]);
+    Some(out)
+}
+
+/// Recognise `__basin_vop_l2(<col>, ST_MakePoint(x, y))` (the KNN order
+/// expression).  The distance op must be `<->` (L2); `<#>`/`<=>` are not
+/// spatial metrics and return `None`.  The RHS must be a literal
+/// `ST_MakePoint` (optionally wrapped in `ST_SetSRID(...)`).
+fn extract_knn_distance_call(expr: &sqlparser::ast::Expr) -> Option<(String, f64, f64)> {
+    use crate::pg_ast::ObjectNamePartExt;
+    use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
+    let func = match expr {
+        Expr::Function(f) => f,
+        _ => return None,
+    };
+    if func.name.0.len() != 1 {
+        return None;
+    }
+    // Only L2 (`<->`) is the spatial NN metric.
+    if func.name.0[0].id_val().as_str() != "__basin_vop_l2" {
+        return None;
+    }
+    let args: Vec<&FunctionArg> = match &func.args {
+        FunctionArguments::List(l) => l.args.iter().collect(),
+        _ => return None,
+    };
+    if args.len() != 2 {
+        return None;
+    }
+    fn unwrap(a: &FunctionArg) -> Option<&Expr> {
+        match a {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+            _ => None,
+        }
+    }
+    let col = extract_col_name(unwrap(args[0])?)?;
+    let (qx, qy) = extract_make_point_with_srid(unwrap(args[1])?)?;
+    Some((col, qx, qy))
+}
+
+/// Extract `(x, y)` from `ST_MakePoint(x, y)`, also unwrapping a surrounding
+/// `ST_SetSRID(ST_MakePoint(...), srid)` (the SRID arg is ignored — every
+/// point is interpreted as WGS84).
+fn extract_make_point_with_srid(expr: &sqlparser::ast::Expr) -> Option<(f64, f64)> {
+    use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
+    match expr {
+        Expr::Nested(inner) => extract_make_point_with_srid(inner),
+        Expr::Cast { expr: inner, .. } => extract_make_point_with_srid(inner),
+        Expr::Function(f) => {
+            let name = f.name.to_string().to_lowercase();
+            if name == "st_setsrid" {
+                // `ST_SetSRID(ST_MakePoint(x,y), srid)` — recurse into arg 0.
+                let args: Vec<&FunctionArg> = match &f.args {
+                    FunctionArguments::List(l) => l.args.iter().collect(),
+                    _ => return None,
+                };
+                if args.is_empty() {
+                    return None;
+                }
+                if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = args[0] {
+                    return extract_make_point_with_srid(e);
+                }
+                None
+            } else {
+                // Delegate to the shared ST_MakePoint extractor.
+                extract_make_point(expr)
+            }
+        }
+        _ => None,
+    }
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

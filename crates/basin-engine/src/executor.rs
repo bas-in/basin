@@ -1891,6 +1891,32 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
         }
     }
 
+    // PG-Wave KNN — auto-route `ORDER BY <point_col> <-> ST_MakePoint(x,y)
+    // LIMIT k` to the R-tree nearest-neighbour path. Runs AFTER the pgvector
+    // planner (which declines POINT columns: the RHS is an ST_MakePoint call,
+    // not a vector literal) so the two `<->` paths are exclusive — vector
+    // column → HNSW above, POINT column → spatial KNN here. `detect_knn_predicate`
+    // confirms the ORDER BY column carries `BASIN_TYPE=POINT`; a vector column
+    // returns None and brute-force takes over (correctness preserved). An
+    // `Ok(None)` from `execute_knn_plan` (sidecar coverage gap) also falls back.
+    if let Some(knn_plan) = crate::index_probe::detect_knn_predicate(
+        sql,
+        &sess.project,
+        &sess.engine.config().catalog,
+    )
+    .await
+    {
+        match crate::rtree_knn_scan::execute_knn_plan(sess, knn_plan).await {
+            Ok(Some(res)) => return Ok(res),
+            Ok(None) => {
+                tracing::debug!("knn planner declined (coverage gap); falling back");
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "knn planner errored; falling back");
+            }
+        }
+    }
+
     // Perf: skip the entire 40-pass string-rewrite pipeline when the SQL
     // contains no marker tokens that any pass could fire on.  For a trivial
     // point-query like `SELECT id FROM events WHERE id = 5000` the chain

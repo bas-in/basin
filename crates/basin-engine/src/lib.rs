@@ -1241,6 +1241,8 @@ mod fts_udf;
 mod gin_rowgroup_scan;
 mod jsonb_posting_scan;
 mod rtree_rowgroup_scan;
+/// PG-Wave KNN — nearest-neighbour spatial top-k execution.
+mod rtree_knn_scan;
 mod is_distinct_rewrite;
 mod function_ddl;
 mod generated_cols;
