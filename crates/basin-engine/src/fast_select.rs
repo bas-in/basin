@@ -1968,6 +1968,15 @@ pub(crate) async fn execute_simple_select(
         }
     }
 
+    // Build the catalog-driven live file list. `live_data_files()` replays the
+    // snapshot chain up to `current_snapshot`, so after a rollback it returns
+    // only the pre-rollback files — physical files from post-rollback snapshots
+    // are never included (bug #41 fix). Computed ONCE here and reused by the
+    // PK probes and the `live_paths` build below: every call clones each
+    // DataFileRef (including bloom-filter blobs), and `meta` is not reloaded
+    // between these uses so one snapshot replay is authoritative for all of them.
+    let live_files = meta.live_data_files();
+
     let pk_probe_paths: Option<Vec<object_store::path::Path>> = if
         // PK row cache hit: the cached batches already answer this point query;
         // skip the zone-map + bloom probe (and its possible Absent early-return)
@@ -1989,7 +1998,6 @@ pub(crate) async fn execute_simple_select(
         {
             if let Predicate::Eq(col, val) = &plan.predicates[0] {
                 if col == pk_col {
-                    let live_files = meta.live_data_files();
                     match crate::index_probe::pk_point_probe(
                         col,
                         val,
@@ -2030,7 +2038,6 @@ pub(crate) async fn execute_simple_select(
             && plan.in_list_preds[0].0 == *pk_col
         {
             let vals = &plan.in_list_preds[0].1;
-            let live_files = meta.live_data_files();
             match crate::index_probe::pk_point_probe_multi(
                 pk_col,
                 vals,
@@ -2060,11 +2067,8 @@ pub(crate) async fn execute_simple_select(
         None
     };
 
-    // Build the catalog-driven live file list. `live_data_files()` replays the
-    // snapshot chain up to `current_snapshot`, so after a rollback it returns
-    // only the pre-rollback files — physical files from post-rollback snapshots
-    // are never included (bug #41 fix). Convert each path string to an
-    // `ObjectPath` for `storage.read_paths`.
+    // Convert each live file's path string to an `ObjectPath` for
+    // `storage.read_paths`.
     // Catalog-stats file pruning: skip any data file whose per-file
     // column_stats (min/max/null-count, populated at write time for BOTH
     // Parquet and Vortex) prove the predicate cannot match a single row
@@ -2073,7 +2077,6 @@ pub(crate) async fn execute_simple_select(
     // heavier than a Parquet footer read, and a win for Parquet too
     // (point/range/compound/IS NULL queries touch fewer files).
     let had_pk_probe = pk_probe_paths.is_some();
-    let live_files = meta.live_data_files();
     let live_paths: Vec<object_store::path::Path> = if let Some(paths) = pk_probe_paths {
         // The PK point-probe already pruned the live set to its candidates
         // (zone-map + catalog bloom) for the single-PK-Eq shape; reuse them
