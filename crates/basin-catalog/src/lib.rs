@@ -170,6 +170,55 @@ pub trait Catalog: Send + Sync {
     /// [`basin_common::BasinError::NotFound`] if the table does not exist.
     async fn load_table(&self, project: &ProjectId, table: &TableName) -> Result<TableMetadata>;
 
+    /// Load metadata for `(project, table)` as it appeared at a historical
+    /// `snapshot_id`, for transaction snapshot-stable reads (REPEATABLE READ).
+    ///
+    /// The returned [`TableMetadata`] is the current metadata with
+    /// `current_snapshot` rewound to `snapshot_id`, so that
+    /// [`TableMetadata::live_data_files`] (which the engine's read path calls)
+    /// reconstructs exactly the file set that was live at `snapshot_id`. The
+    /// snapshot *chain* itself is left intact (it always contains a superset),
+    /// because `live_data_files` already caps replay at `current_snapshot`.
+    ///
+    /// ## Default implementation
+    ///
+    /// The default loads current metadata and, if `snapshot_id` is present in
+    /// the retained chain, rewinds `current_snapshot` to it. Schema is taken
+    /// from the *current* metadata: Basin's snapshot model versions only the
+    /// data-file set, not the schema, so an in-flight `ALTER TABLE` is not
+    /// time-travelled (acceptable — DDL inside a concurrent writer's tx is out
+    /// of scope for read snapshot stability, and matches the fact that the
+    /// snapshot chain carries no per-snapshot schema).
+    ///
+    /// This works correctly for every backend that returns the full snapshot
+    /// chain from [`load_table`](Catalog::load_table) — which is both
+    /// `InMemoryCatalog` and `PostgresCatalog`. If `snapshot_id` is **not** in
+    /// the retained chain (e.g. it was pruned by a `rollback_to_snapshot`, or
+    /// the backend — like the `RestCatalog` stub — does not retain history),
+    /// the call returns [`basin_common::BasinError::FeatureNotSupported`] so
+    /// the caller can fall back to a current read rather than silently serving
+    /// the wrong point-in-time.
+    async fn load_table_at_snapshot(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        snapshot_id: SnapshotId,
+    ) -> Result<TableMetadata> {
+        let mut meta = self.load_table(project, table).await?;
+        if snapshot_id == meta.current_snapshot {
+            return Ok(meta);
+        }
+        if meta.snapshots.iter().any(|s| s.id == snapshot_id) {
+            meta.current_snapshot = snapshot_id;
+            Ok(meta)
+        } else {
+            Err(basin_common::BasinError::FeatureNotSupported(format!(
+                "load_table_at_snapshot: snapshot {snapshot_id} for table \
+                 {table} is not retained in the catalog snapshot chain"
+            )))
+        }
+    }
+
     /// Drop the table. Does not delete the underlying object-store data; that
     /// is the storage layer's responsibility (and may be deferred for
     /// time-travel / point-in-time-restore in Phase 6).

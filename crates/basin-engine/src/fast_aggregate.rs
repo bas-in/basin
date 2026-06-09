@@ -368,9 +368,19 @@ pub(crate) async fn execute_metadata_aggregate(
     // the catalog snapshot reflects every committed row. Without this a
     // shard-backed table would report stale (or zero) stats and the
     // aggregate would be wrong.
-    if let Some(shard) = sess.engine.config().shard.as_ref() {
+    // When a shard is wired in, `prefetched_meta` was captured by the caller
+    // *before* this flush. The flush can advance the catalog (e.g. this
+    // session's own just-INSERTed rows leave the in-RAM tail and become a new
+    // Parquet snapshot), so the prefetched metadata would under-count by the
+    // freshly-flushed rows. Discard it and reload below from the post-flush
+    // catalog head. Without a shard there is nothing to flush and the
+    // prefetched meta is exact, so we keep it (saves a catalog round-trip).
+    let prefetched_meta = if let Some(shard) = sess.engine.config().shard.as_ref() {
         shard.flush_to_parquet().await?;
-    }
+        None
+    } else {
+        prefetched_meta
+    };
 
     // Hot-tier overlay gate. See the function-level rustdoc for the full
     // rationale. The fast path (`total_count() == 0`) is the common case

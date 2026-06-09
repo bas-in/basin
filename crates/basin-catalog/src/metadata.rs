@@ -599,18 +599,43 @@ impl TableMetadata {
     /// files, including those logically removed by rollback. Using this
     /// method instead makes the read path catalog-driven and correct.
     pub fn live_data_files(&self) -> Vec<DataFileRef> {
+        self.live_data_files_at(self.current_snapshot)
+    }
+
+    /// Like [`live_data_files`](Self::live_data_files) but reconstructs the
+    /// live file set as it was at an arbitrary historical `snapshot_id`,
+    /// rather than at `current_snapshot`.
+    ///
+    /// This is the read-side primitive for transaction snapshot-stable reads
+    /// (REPEATABLE READ): a transaction pins the snapshot id it observed at
+    /// `BEGIN` (or at first touch of a table) and every in-transaction read
+    /// reconstructs the file set at that pinned id, so writes committed by
+    /// other sessions after `BEGIN` — which advance the catalog head to a
+    /// *higher* snapshot id — are invisible to this transaction.
+    ///
+    /// Correctness relies on the catalog retaining the full snapshot chain
+    /// (snapshots are append-only; only `rollback_to_snapshot` prunes ids
+    /// `> target`). Both `InMemoryCatalog` and `PostgresCatalog` load the
+    /// complete chain into [`TableMetadata::snapshots`], so this method
+    /// reconstructs any retained historical snapshot exactly.
+    ///
+    /// Snapshots with `id > snapshot_id` are ignored — identical to how
+    /// [`live_data_files`](Self::live_data_files) ignores ids beyond
+    /// `current_snapshot`.
+    pub fn live_data_files_at(&self, snapshot_id: SnapshotId) -> Vec<DataFileRef> {
         use std::collections::HashMap;
-        // Walk snapshots in id order (genesis → current) and maintain the
+        // Walk snapshots in id order (genesis → target) and maintain the
         // live set as a path → DataFileRef map so we can apply removes in O(1).
         let mut live: HashMap<String, DataFileRef> = HashMap::new();
         let mut ordered: Vec<&Snapshot> = self.snapshots.iter().collect();
         ordered.sort_by_key(|s| s.id);
         for snap in ordered {
-            if snap.id > self.current_snapshot {
-                // Snapshots beyond the head are not part of the live set.
-                // This can occur if the metadata was loaded before a concurrent
-                // rollback fully flushed; being defensive here is cheaper than
-                // enforcing strict ordering at every commit site.
+            if snap.id > snapshot_id {
+                // Snapshots beyond the requested point-in-time are not part of
+                // the live set. For the `live_data_files()` (current head)
+                // caller this also defends against metadata loaded mid-rollback;
+                // for the snapshot-pinned caller it is the load-bearing cut that
+                // hides writes committed after the transaction's pinned id.
                 break;
             }
             // Remove any paths this snapshot replaced (Replace operation).

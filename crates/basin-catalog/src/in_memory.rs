@@ -2541,6 +2541,70 @@ mod tests {
         assert_eq!(snaps.last().unwrap().id, SnapshotId(1));
     }
 
+    // ── Transaction snapshot-stable reads: load_table_at_snapshot ──────────
+    //
+    // The InMemoryCatalog retains the full append-only snapshot chain, so the
+    // default `load_table_at_snapshot` trait impl reconstructs any historical
+    // point-in-time by rewinding `current_snapshot` and replaying
+    // `live_data_files()`. This is the catalog primitive behind the engine's
+    // REPEATABLE-READ-ish transaction read-view.
+    #[tokio::test]
+    async fn load_table_at_snapshot_reconstructs_history() {
+        let cat = InMemoryCatalog::new();
+        let t = ProjectId::new();
+        let tbl = TableName::new("events").unwrap();
+        cat.create_table(&t, &tbl, &schema()).await.unwrap();
+
+        // Snapshot 1: one file (10 rows).
+        cat.append_data_files(&t, &tbl, SnapshotId::GENESIS, vec![file("p/1.parquet", 10, 100)])
+            .await
+            .unwrap();
+        // Snapshot 2: a second file (5 rows).
+        cat.append_data_files(&t, &tbl, SnapshotId(1), vec![file("p/2.parquet", 5, 50)])
+            .await
+            .unwrap();
+
+        // Live head sees both files → 15 rows.
+        let head = cat.load_table(&t, &tbl).await.unwrap();
+        assert_eq!(head.current_snapshot, SnapshotId(2));
+        let head_rows: u64 = head.live_data_files().iter().map(|f| f.row_count).sum();
+        assert_eq!(head_rows, 15);
+
+        // Pinned at snapshot 1: only the first file is live → 10 rows.
+        let at1 = cat
+            .load_table_at_snapshot(&t, &tbl, SnapshotId(1))
+            .await
+            .unwrap();
+        assert_eq!(at1.current_snapshot, SnapshotId(1));
+        let at1_rows: u64 = at1.live_data_files().iter().map(|f| f.row_count).sum();
+        assert_eq!(at1_rows, 10, "snapshot-1 view must not see the file added at snapshot 2");
+
+        // Pinned at genesis: no files.
+        let at0 = cat
+            .load_table_at_snapshot(&t, &tbl, SnapshotId::GENESIS)
+            .await
+            .unwrap();
+        assert!(at0.live_data_files().is_empty(), "genesis view has no files");
+
+        // Asking for current head is identity.
+        let at_head = cat
+            .load_table_at_snapshot(&t, &tbl, SnapshotId(2))
+            .await
+            .unwrap();
+        assert_eq!(at_head.current_snapshot, SnapshotId(2));
+
+        // A snapshot id that was never minted → FeatureNotSupported (caller
+        // degrades to a read-committed current read rather than serving wrong
+        // point-in-time).
+        let missing = cat
+            .load_table_at_snapshot(&t, &tbl, SnapshotId(99))
+            .await;
+        assert!(
+            matches!(missing, Err(BasinError::FeatureNotSupported(_))),
+            "unminted snapshot must return FeatureNotSupported, got {missing:?}"
+        );
+    }
+
     #[tokio::test]
     async fn concurrent_append_one_wins() {
         let cat = Arc::new(InMemoryCatalog::new());

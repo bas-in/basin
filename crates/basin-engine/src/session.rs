@@ -479,6 +479,18 @@ pub(crate) struct TxState {
     /// Snapshot IDs of tables as they appeared when `BEGIN` was issued.
     /// Used by `ROLLBACK` to restore catalog heads.
     pub(crate) pre_tx_snapshots: HashMap<TableName, SnapshotId>,
+    /// Transaction read-view: the catalog snapshot id each table is *pinned*
+    /// to for the lifetime of this transaction (REPEATABLE-READ-ish snapshot
+    /// stability). A table's read snapshot is captured the first time the
+    /// transaction touches it (its first in-tx SELECT/DML), *not* at `BEGIN`:
+    /// the read path flushes the shard tail before loading the table, so the
+    /// first-touch head is the snapshot that read actually observes (see
+    /// [`tx_read_snapshot_for`] and [`tx_begin`]). Every in-transaction read
+    /// reconstructs the table's file set at this pinned id via
+    /// `Catalog::load_table_at_snapshot`, so writes committed by *other*
+    /// sessions after `BEGIN` (which advance the catalog head) stay invisible.
+    /// Cleared on COMMIT / ROLLBACK alongside the rest of the tx state.
+    pub(crate) read_snapshots: HashMap<TableName, SnapshotId>,
     /// Data files written during the open transaction that have not yet
     /// been committed to the catalog.
     pub(crate) pending_files: HashMap<TableName, Vec<DataFileRef>>,
@@ -1022,6 +1034,22 @@ pub(crate) fn tx_begin(state: &SessionState, current_snapshots: HashMap<TableNam
     if !tx.active {
         tx.active = true;
         tx.aborted = false;
+        // The transaction read-view is captured *lazily on first touch* of each
+        // table inside the transaction (see `tx_read_snapshot_for`), NOT seeded
+        // here from the session's pre-BEGIN observed heads.
+        //
+        // Why: the first in-tx SELECT flushes the shard tail to Parquet
+        // (`exec_select` → `shard.flush_to_parquet()`) *before* it loads the
+        // table. Seeding `read_snapshots` at BEGIN would pin the pre-flush head;
+        // the first read would then rewind to that older snapshot and miss rows
+        // this session wrote before BEGIN but had not yet flushed (counting 0
+        // instead of N). Pinning on first touch — after that read's own flush —
+        // captures the snapshot the first read actually observes, so repeated
+        // reads stay stable at that value.
+        //
+        // `pre_tx_snapshots` IS seeded here: it is the ROLLBACK restore set and
+        // must reflect the heads as of BEGIN; it is never mutated afterwards.
+        tx.read_snapshots.clear();
         tx.pre_tx_snapshots = current_snapshots;
         tx.pending_files.clear();
         tx.savepoints.clear();
@@ -1041,6 +1069,7 @@ pub(crate) fn tx_commit(state: &SessionState) -> HashMap<TableName, Vec<DataFile
     tx.active = false;
     tx.aborted = false;
     tx.pre_tx_snapshots.clear();
+    tx.read_snapshots.clear();
     tx.savepoints.clear();
     tx.tx_id = None;
     tx.htap_rows.clear();
@@ -1063,6 +1092,7 @@ pub(crate) fn tx_rollback(
     let mut tx = state.tx_state.lock().expect("tx_state lock poisoned");
     let pending = std::mem::take(&mut tx.pending_files);
     let snapshots = std::mem::take(&mut tx.pre_tx_snapshots);
+    tx.read_snapshots.clear();
     tx.active = false;
     tx.aborted = false;
     tx.savepoints.clear();
@@ -1085,6 +1115,58 @@ pub(crate) fn tx_is_active(state: &SessionState) -> bool {
         .lock()
         .expect("tx_state lock poisoned")
         .active
+}
+
+/// Resolve the catalog snapshot id `table` should be read at *for the current
+/// transaction's read-view*, implementing snapshot-stable (REPEATABLE-READ-ish)
+/// reads.
+///
+/// Returns `None` when no explicit transaction is active — auto-commit reads
+/// always see the live head, so the caller should fall through to the normal
+/// current-snapshot `load_table` path.
+///
+/// When a transaction is active:
+///   * If the table is already pinned in `TxState::read_snapshots` (captured on
+///     a prior touch this transaction), returns that pinned id.
+///   * Otherwise this is the transaction's *first touch* of the table:
+///     `current_head` (the table's current catalog head, which the caller has
+///     just loaded or is about to) is recorded as the pin and returned, so
+///     every subsequent read in this transaction reuses it.
+///
+/// `current_head` is only consulted on the first-touch path; pass the table's
+/// live `current_snapshot`.
+pub(crate) fn tx_read_snapshot_for(
+    state: &SessionState,
+    table: &TableName,
+    current_head: SnapshotId,
+) -> Option<SnapshotId> {
+    let mut tx = state.tx_state.lock().expect("tx_state lock poisoned");
+    if !tx.active {
+        return None;
+    }
+    if let Some(pinned) = tx.read_snapshots.get(table) {
+        return Some(*pinned);
+    }
+    // First touch inside this transaction: pin the current head.
+    tx.read_snapshots.insert(table.clone(), current_head);
+    Some(current_head)
+}
+
+/// Non-capturing peek at the transaction's pinned read snapshot for `table`.
+/// Unlike [`tx_read_snapshot_for`] this NEVER pins on first touch — callers
+/// that cannot guarantee the pre-pin flush ordering (e.g. the fast-path
+/// SELECT gate, which runs before any tail flush) must use this and fall to
+/// the DataFusion path when no pin exists yet, so the pin is always captured
+/// by `load_table_for_read` after the read's own flush.
+pub(crate) fn tx_read_snapshot_peek(
+    state: &SessionState,
+    table: &TableName,
+) -> Option<SnapshotId> {
+    let tx = state.tx_state.lock().expect("tx_state lock poisoned");
+    if !tx.active {
+        return None;
+    }
+    tx.read_snapshots.get(table).copied()
 }
 
 /// Returns `true` if the current transaction is in the aborted state
@@ -1898,6 +1980,81 @@ async fn register_cold_with_overlay(
     Ok(())
 }
 
+/// Load `(project, table)` metadata using the current transaction's read-view
+/// when an explicit transaction is active, so in-transaction reads are
+/// snapshot-stable (REPEATABLE-READ-ish).
+///
+/// Behaviour:
+///   * No active transaction → plain `load_table` (the live head). Auto-commit
+///     reads always see the latest committed state.
+///   * Active transaction → resolve the table's pinned read snapshot via
+///     [`tx_read_snapshot_for`]. On first touch the just-loaded current head is
+///     pinned and returned unchanged (no second round-trip). On a later read,
+///     if the table's head has since advanced past the pin (another session
+///     committed), reload the *historical* metadata at the pinned snapshot via
+///     `Catalog::load_table_at_snapshot` so `live_data_files()` reconstructs
+///     the file set this transaction is supposed to see.
+///
+/// Falls back to the freshly-loaded current metadata if the pinned snapshot is
+/// no longer retained in the catalog chain (the catalog returns
+/// `FeatureNotSupported`) — degrading to read-committed for that one read
+/// rather than erroring the query.
+///
+/// ## Hot-tier limitation (documented, not yet closed)
+///
+/// This pins the *cold* (catalog) snapshot only. Rows another session writes
+/// via the hot-tier DELETE/UPDATE fast path land in the shared
+/// `MemTableRegistry` as tombstones / overrides that carry **no sequence or
+/// LSN**, so the overlay union in `register_cold_with_overlay` /
+/// `HtapUnionTable::scan` cannot filter them by a transaction watermark. An
+/// INSERT by another session is *not* a hot-tier overlay entry — it flushes to
+/// Parquet and advances the catalog snapshot, which this pinning hides
+/// correctly. So the common harness shape (concurrent INSERT + COMMIT) is
+/// fully isolated; concurrent hot-tier UPDATE/DELETE of the same rows can still
+/// leak. Closing that needs a sequence field on `MemRowValue` (basin-hottier).
+/// Returns `(read_metadata, live_head)`:
+///   * `read_metadata` is what the reader should register (pinned to the
+///     transaction read-view inside a tx, live head otherwise).
+///   * `live_head` is the table's *current* catalog head observed during this
+///     load — callers cache this in `state.snapshots` so the INSERT/commit
+///     optimistic-concurrency baseline keeps meaning "latest head this session
+///     saw", NOT the rewound read snapshot (which would otherwise force a
+///     CommitConflict-retry at COMMIT).
+async fn load_table_for_read(
+    engine: &Engine,
+    project: &ProjectId,
+    state: &Arc<SessionState>,
+    table: &TableName,
+) -> Result<(TableMetadata, SnapshotId)> {
+    let meta = engine.config().catalog.load_table(project, table).await?;
+    let live_head = meta.current_snapshot;
+    let Some(pinned) = tx_read_snapshot_for(state, table, live_head) else {
+        // Auto-commit: live head.
+        return Ok((meta, live_head));
+    };
+    if pinned == live_head {
+        // First touch, or head hasn't moved since the pin: the metadata we just
+        // loaded already reflects the read-view.
+        return Ok((meta, live_head));
+    }
+    // Head advanced past our pin (a concurrent committer): reconstruct the
+    // historical metadata at the pinned snapshot.
+    match engine
+        .config()
+        .catalog
+        .load_table_at_snapshot(project, table, pinned)
+        .await
+    {
+        Ok(historical) => Ok((historical, live_head)),
+        Err(BasinError::FeatureNotSupported(_)) => {
+            // Pinned snapshot no longer retained / backend lacks history:
+            // degrade to read-committed for this read rather than failing.
+            Ok((meta, live_head))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Variant of [`refresh_table`] used by `exec_select` to collect the live
 /// file count in the same catalog load that registers the table.  Returns the
 /// number of live Parquet files for the table at the current snapshot; this
@@ -1934,7 +2091,10 @@ async fn refresh_table_inner(
     state: &Arc<SessionState>,
     table: &TableName,
 ) -> Result<usize> {
-    let meta = engine.config().catalog.load_table(project, table).await?;
+    // Transaction-aware load: in an explicit tx this pins the table's read
+    // snapshot (REPEATABLE-READ-ish) so a concurrent committer's new rows stay
+    // invisible; in auto-commit it is exactly `load_table` (the live head).
+    let (meta, live_head) = load_table_for_read(engine, project, state, table).await?;
     // The catalog hands us a workspace-version schema; convert into the
     // version DataFusion's `register_listing_table` expects.
     let base_df_schema = schema_ws_to_df(meta.schema.as_ref())?;
@@ -1996,12 +2156,13 @@ async fn refresh_table_inner(
         .await?;
     }
 
-    // Cache the snapshot id for this session's INSERT path.
+    // Cache the *live* head (not the rewound read snapshot) for this session's
+    // INSERT/commit optimistic-concurrency baseline. See `load_table_for_read`.
     state
         .snapshots
         .lock()
         .await
-        .insert(table.clone(), meta.current_snapshot);
+        .insert(table.clone(), live_head);
 
     if meta.partition_spec.is_partitioned() {
         state
@@ -2109,7 +2270,10 @@ pub(crate) async fn refresh_table_with_extra(
         return refresh_table(engine, project, ctx, state, table).await;
     }
 
-    let meta = engine.config().catalog.load_table(project, table).await?;
+    // Transaction-aware load (see `load_table_for_read`): the catalog-live half
+    // is reconstructed at this transaction's pinned read snapshot, while the
+    // pending (in-tx) `extra_files` below remain visible (read-your-own-writes).
+    let (meta, live_head) = load_table_for_read(engine, project, state, table).await?;
     let df_schema = Arc::new(schema_ws_to_df(meta.schema.as_ref())?);
     let tref = || TableReference::Bare { table: table.as_str().into() };
     let _ = ctx.deregister_table(tref());
@@ -2134,11 +2298,13 @@ pub(crate) async fn refresh_table_with_extra(
     )
     .await?;
 
+    // Cache the *live* head, not the rewound read snapshot — see
+    // `load_table_for_read` / `refresh_table_inner`.
     state
         .snapshots
         .lock()
         .await
-        .insert(table.clone(), meta.current_snapshot);
+        .insert(table.clone(), live_head);
 
     if meta.partition_spec.is_partitioned() {
         state
@@ -2176,7 +2342,11 @@ pub(crate) async fn refresh_table_with_htap(
         return refresh_table_with_extra(engine, project, ctx, state, table, extra_files).await;
     }
 
-    let meta = engine.config().catalog.load_table(project, table).await?;
+    // Transaction-aware load (see `load_table_for_read`): the catalog-live half
+    // is read at this transaction's pinned snapshot. The tx-local `extra_files`
+    // (UPDATE/DELETE rewrites) and `htap_batches` (buffered INSERTs) are this
+    // session's own uncommitted writes and stay visible below.
+    let (meta, live_head) = load_table_for_read(engine, project, state, table).await?;
     let df_schema = Arc::new(schema_ws_to_df(meta.schema.as_ref())?);
     let tref = || TableReference::Bare { table: table.as_str().into() };
     let _ = ctx.deregister_table(tref());
@@ -2231,11 +2401,13 @@ pub(crate) async fn refresh_table_with_htap(
             .map_err(|e| BasinError::internal(format!("register_table htap-union {table}: {e}")))?;
     }
 
+    // Cache the *live* head, not the rewound read snapshot — see
+    // `load_table_for_read` / `refresh_table_inner`.
     state
         .snapshots
         .lock()
         .await
-        .insert(table.clone(), meta.current_snapshot);
+        .insert(table.clone(), live_head);
 
     if meta.partition_spec.is_partitioned() {
         state
