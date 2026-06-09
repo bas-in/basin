@@ -1315,7 +1315,7 @@ pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result
 // For UPDATE statements shaped as `SET col = lit[, …] WHERE pk = lit` or
 // `… WHERE pk IN (lit, …)` on tables with a single-column PRIMARY KEY and no
 // surrounding feature usage (RLS, audit, generated columns, secondary indexes,
-// CHECK/FK/UNIQUE constraints, FK children, reactors, RETURNING), the engine
+// CHECK/FK/UNIQUE constraints, FK children, reactors), the engine
 // reads the matched row image (hot tier first, then cold tier), applies the
 // SET, and writes a `MemRowValue::Update` (full-row replacement keyed by the
 // encoded PK) into the process-wide `MemTableRegistry` — skipping the cold-tier
@@ -1334,6 +1334,33 @@ pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result
 // Scalar` path) is eligible — expression RHS (`col + 1`, `now()`, `upper(col)`)
 // falls through to the cold CoW path, where the per-batch DataFusion evaluation
 // already lives.
+
+/// Return `true` when every item in a RETURNING list can be projected directly
+/// from the post-image `RecordBatch` without a DataFusion evaluation context.
+///
+/// Allowlist (fast path):
+///   * `*` / `tbl.*` / `schema.tbl.*` — wildcard expands all columns.
+///   * `col` (bare identifier, `UnnamedExpr(Identifier)`) — plain column ref.
+///   * `col AS alias` (`ExprWithAlias { expr: Identifier, .. }`) — column ref
+///     with an output alias; the alias is carried through in the projected schema.
+///
+/// Anything else (arithmetic, function calls, casts, literals, compound
+/// expressions) returns `false` → the caller falls through to the cold path
+/// which runs the full `project_returning` DataFusion round-trip.
+fn returning_is_fast_path_eligible(items: &[SelectItem]) -> bool {
+    for item in items {
+        match item {
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {}
+            SelectItem::UnnamedExpr(Expr::Identifier(_)) => {}
+            SelectItem::ExprWithAlias {
+                expr: Expr::Identifier(_),
+                ..
+            } => {}
+            _ => return false,
+        }
+    }
+    true
+}
 
 /// Resolve the matched PK keys + scalar assignments when the UPDATE call site
 /// is eligible for the hot-tier fast path. Returns `Ok(Some((keys, assigns)))`
@@ -1362,9 +1389,15 @@ async fn try_resolve_fast_path_update(
     if crate::session::tx_is_active(&sess.state) {
         return Ok(None);
     }
-    // Gate: RETURNING needs the post-image projected; cold path handles it.
-    if returning.is_some() {
-        return Ok(None);
+    // Gate: RETURNING with non-trivial expressions (anything beyond plain
+    // column references and `*`) cannot be projected from the post-image
+    // batch without a DataFusion context — fall through to the cold path.
+    // Plain column refs and wildcards are handled inline after the fast-path
+    // write (see `hot_tier_update_by_pk` caller).
+    if let Some(items) = returning {
+        if !returning_is_fast_path_eligible(items) {
+            return Ok(None);
+        }
     }
     // Gate: single-column PK only.
     if meta.pk_columns.len() != 1 {
@@ -1486,7 +1519,12 @@ async fn try_resolve_fast_path_update(
 /// Execute the resolved hot-tier UPDATE: for each matched PK read the current
 /// row image (memtable override first, else cold-tier), apply the scalar
 /// assignments, and write a `MemRowValue::Update` keyed by the encoded PK.
-/// Returns the number of rows that actually existed and were updated.
+/// Returns `(updated_count, returning_batches)`.
+///
+/// When `returning` is `Some(items)` (pre-validated by
+/// `returning_is_fast_path_eligible`), `returning_batches` contains the
+/// post-update row images projected to the requested columns, in key order.
+/// When `returning` is `None` the second element is always empty.
 ///
 /// Affected-row semantics. Unlike the DELETE fast path (which reports the
 /// number of requested PKs), UPDATE reports the number of PKs that resolved to
@@ -1498,7 +1536,8 @@ async fn hot_tier_update_by_pk(
     meta: &basin_catalog::TableMetadata,
     keys: &[basin_hottier::RowKey],
     assignments: &[(usize, AssignmentRhs)],
-) -> Result<usize> {
+    returning: Option<&[sqlparser::ast::SelectItem]>,
+) -> Result<(usize, Vec<RecordBatch>)> {
     use std::collections::HashMap;
     let schema = meta.schema.clone();
     let storage = sess.engine.config().storage.clone();
@@ -1758,6 +1797,8 @@ async fn hot_tier_update_by_pk(
 
     // 3. Apply the SET to each present, live row image; write the override.
     let mut updated = 0usize;
+    // Post-update row images collected for RETURNING (allocated only when needed).
+    let mut returning_rows: Vec<RecordBatch> = Vec::new();
     for key in keys {
         let kb = key.as_bytes().to_vec();
         let Some(row_batch) = current.get(&kb) else {
@@ -1779,8 +1820,13 @@ async fn hot_tier_update_by_pk(
             .memtable
             .insert(key.clone(), basin_hottier::MemRowValue::update(bytes, 0));
         updated += 1;
+        // Collect the post-image for RETURNING if requested.
+        if let Some(items) = returning {
+            let projected = project_post_image_for_returning(&one_row, schema.as_ref(), items)?;
+            returning_rows.push(projected);
+        }
     }
-    Ok(updated)
+    Ok((updated, returning_rows))
 }
 
 /// Decode one Arrow IPC stream blob into the first `RecordBatch`.
@@ -1789,6 +1835,74 @@ fn decode_ipc_single_row(bytes: &[u8]) -> Option<RecordBatch> {
     let cursor = std::io::Cursor::new(bytes);
     let mut reader = StreamReader::try_new(cursor, None).ok()?;
     reader.next()?.ok()
+}
+
+/// Project a single post-update row batch to the columns requested in a
+/// RETURNING list, for use in the hot-tier UPDATE fast path.
+///
+/// The items slice must have passed `returning_is_fast_path_eligible` —
+/// only `*`, `col`, and `col AS alias` are handled; anything else is a
+/// logic error that returns an `InvalidSchema` error rather than panicking.
+///
+/// Output schema: columns appear in the order the RETURNING list specifies.
+/// `*` expands to all columns in left-to-right schema order. `col AS alias`
+/// renames the output field to `alias`.
+fn project_post_image_for_returning(
+    row: &RecordBatch,
+    schema: &Schema,
+    items: &[SelectItem],
+) -> Result<RecordBatch> {
+    use arrow_schema::FieldRef;
+    let mut columns: Vec<ArrayRef> = Vec::new();
+    let mut fields: Vec<FieldRef> = Vec::new();
+    for item in items {
+        match item {
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
+                for (i, f) in schema.fields().iter().enumerate() {
+                    columns.push(row.column(i).clone());
+                    fields.push(f.clone());
+                }
+            }
+            SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
+                let idx = schema.index_of(&ident.value).map_err(|_| {
+                    BasinError::InvalidSchema(format!(
+                        "RETURNING: unknown column {:?}",
+                        ident.value
+                    ))
+                })?;
+                columns.push(row.column(idx).clone());
+                fields.push(schema.field(idx).clone().into());
+            }
+            SelectItem::ExprWithAlias {
+                expr: Expr::Identifier(ident),
+                alias,
+            } => {
+                let idx = schema.index_of(&ident.value).map_err(|_| {
+                    BasinError::InvalidSchema(format!(
+                        "RETURNING: unknown column {:?}",
+                        ident.value
+                    ))
+                })?;
+                let orig = schema.field(idx);
+                let renamed = Arc::new(arrow_schema::Field::new(
+                    alias.value.as_str(),
+                    orig.data_type().clone(),
+                    orig.is_nullable(),
+                ));
+                columns.push(row.column(idx).clone());
+                fields.push(renamed);
+            }
+            other => {
+                return Err(BasinError::internal(format!(
+                    "project_post_image_for_returning: unexpected item {other} (should have \
+                     been rejected by returning_is_fast_path_eligible)"
+                )));
+            }
+        }
+    }
+    let out_schema = Arc::new(Schema::new(fields));
+    RecordBatch::try_new(out_schema, columns)
+        .map_err(|e| BasinError::internal(format!("RETURNING fast-path projection: {e}")))
 }
 
 /// Decode the `RowKey` encoding back to a `ScalarValue` for the UPDATE
@@ -1976,13 +2090,34 @@ pub(crate) async fn exec_update(
     )
     .await?
     {
-        let n = hot_tier_update_by_pk(sess, &table, &meta, &pk_keys, &fp_assigns).await?;
+        let (n, ret_batches) = hot_tier_update_by_pk(
+            sess,
+            &table,
+            &meta,
+            &pk_keys,
+            &fp_assigns,
+            returning.as_deref(),
+        )
+        .await?;
         if n == 0 {
             return Ok(empty_or_returning(
                 "UPDATE 0",
                 schema.clone(),
                 returning.as_deref(),
             ));
+        }
+        // Fast-path RETURNING: the post-image batches were already projected
+        // inside `hot_tier_update_by_pk`; just wrap them in ExecResult::Rows.
+        if let Some(items) = returning.as_deref() {
+            let ret_schema = if let Some(first) = ret_batches.first() {
+                first.schema()
+            } else {
+                Arc::new(projected_returning_schema(schema.as_ref(), items))
+            };
+            return Ok(ExecResult::Rows {
+                schema: ret_schema,
+                batches: ret_batches,
+            });
         }
         return Ok(ExecResult::Empty {
             tag: format!("UPDATE {n}"),

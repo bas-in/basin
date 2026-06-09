@@ -328,3 +328,109 @@ async fn update_with_env_unset_cold_path_correct() {
     );
     assert_eq!(count_rows(&sess, "t").await, 5);
 }
+
+// ── Tests: RETURNING on the fast path ──────────────────────────────────────────
+
+/// `UPDATE … RETURNING id, val` with the fast path ON must return the
+/// post-update column values — not the stale cold-tier values.
+#[tokio::test]
+async fn update_returning_fastpath_returns_new_values() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = open(&eng).await;
+    seed(&sess, "t", 5).await;
+
+    let result = with_fastpath_on(
+        sess.execute("UPDATE t SET val = 888 WHERE id = 3 RETURNING id, val"),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("UPDATE … RETURNING failed: {e:?}"));
+
+    let batches = match result {
+        ExecResult::Rows { batches, .. } => batches,
+        ExecResult::Empty { tag } => panic!("expected Rows from RETURNING, got Empty({tag})"),
+    };
+    // Exactly one row must be returned.
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 1, "RETURNING must return the one updated row");
+
+    let b = batches.iter().find(|b| b.num_rows() > 0).unwrap();
+    let id_col = b.column_by_name("id").expect("id column in RETURNING");
+    let val_col = b.column_by_name("val").expect("val column in RETURNING");
+    assert_eq!(int_value(id_col, 0), 3, "RETURNING id must be 3");
+    assert_eq!(int_value(val_col, 0), 888, "RETURNING val must be the new value 888");
+
+    // Confirm the overlay is still correct on a subsequent read.
+    assert_eq!(scalar_at(&sess, "t", "val", 3).await, Some(888));
+}
+
+/// `UPDATE … RETURNING *` on the fast path must return all columns of the
+/// post-update row.
+#[tokio::test]
+async fn update_returning_star_fastpath() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = open(&eng).await;
+    seed(&sess, "t", 3).await;
+
+    let result = with_fastpath_on(
+        sess.execute("UPDATE t SET val = 777 WHERE id = 2 RETURNING *"),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("UPDATE … RETURNING * failed: {e:?}"));
+
+    let batches = match result {
+        ExecResult::Rows { batches, .. } => batches,
+        ExecResult::Empty { tag } => panic!("expected Rows from RETURNING *, got Empty({tag})"),
+    };
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 1, "RETURNING * must return exactly one row");
+
+    let b = batches.iter().find(|b| b.num_rows() > 0).unwrap();
+    // Schema must include both id and val (the full table schema).
+    let id_col = b.column_by_name("id").expect("id column in RETURNING *");
+    let val_col = b.column_by_name("val").expect("val column in RETURNING *");
+    assert_eq!(int_value(id_col, 0), 2, "id must be 2");
+    assert_eq!(int_value(val_col, 0), 777, "val must be the new value 777");
+
+    // The overlay is correct on a subsequent point lookup.
+    assert_eq!(scalar_at(&sess, "t", "val", 2).await, Some(777));
+}
+
+/// `UPDATE … RETURNING val + 1` contains an expression, not a plain column
+/// ref, so the fast path MUST fall back to the cold path. The result must
+/// still be correct (the expression evaluated against the post-update value).
+#[tokio::test]
+async fn update_returning_expression_falls_back_cold() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = open(&eng).await;
+    seed(&sess, "t", 4).await;
+
+    // Even with the fast-path env set, `val + 1` is not a plain column ref
+    // so routing falls through to the cold copy-on-write path.
+    let result = with_fastpath_on(
+        sess.execute("UPDATE t SET val = 50 WHERE id = 1 RETURNING val + 1"),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("UPDATE … RETURNING expr failed: {e:?}"));
+
+    let batches = match result {
+        ExecResult::Rows { batches, .. } => batches,
+        ExecResult::Empty { tag } => panic!("expected Rows from RETURNING expr, got Empty({tag})"),
+    };
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 1, "RETURNING expr must return one row");
+
+    let b = batches.iter().find(|b| b.num_rows() > 0).unwrap();
+    // val was set to 50, so val + 1 = 51.
+    let expr_col = b.column(0);
+    assert_eq!(
+        int_value(expr_col, 0),
+        51,
+        "val + 1 must be 51 (new val=50, +1)"
+    );
+
+    // The underlying value is also correct after the cold rewrite.
+    assert_eq!(scalar_at(&sess, "t", "val", 1).await, Some(50));
+}
