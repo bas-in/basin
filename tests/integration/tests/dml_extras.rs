@@ -1294,3 +1294,257 @@ async fn fast_path_delete_with_no_tombstones_is_zero_overhead() {
         "COUNT(*) on no-tombstone table must be 5"
     );
 }
+
+// ─── 9. Multi-row ON CONFLICT DO UPDATE (bulk upsert) ───────────────────────
+//
+// These tests pin the multi-row upsert path added to `try_on_conflict_do_update`
+// in executor.rs.  Before the fix the function bailed out with `Ok(None)` for
+// any batch with more than one row, causing the caller to attempt a plain INSERT
+// of the entire batch — which hit the PK constraint on every id that already
+// existed.
+//
+// PG semantics for ON CONFLICT DO UPDATE:
+//   * Each row is checked independently: conflict → UPDATE, no conflict → INSERT.
+//   * If the VALUES list contains two rows with the same conflict-key tuple PG
+//     errors with "ON CONFLICT DO UPDATE command cannot affect row a second time".
+//     We match that behaviour.
+
+/// 50 rows all exist → all must be updated, row count stays 50.
+#[tokio::test]
+async fn bulk_upsert_all_conflict() {
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+
+    sess.execute(
+        "CREATE TABLE upsert_all (id BIGINT NOT NULL PRIMARY KEY, amount BIGINT NOT NULL)",
+    )
+    .await
+    .unwrap();
+
+    // Seed ids 100..149 with amount=0.
+    let mut seed = String::from("INSERT INTO upsert_all (id, amount) VALUES ");
+    for i in 100i64..150 {
+        if i > 100 {
+            seed.push(',');
+        }
+        seed.push_str(&format!("({i}, 0)"));
+    }
+    sess.execute(&seed).await.unwrap();
+
+    // Upsert the same 50 ids with amount=99.
+    let mut upsert = String::from(
+        "INSERT INTO upsert_all (id, amount) VALUES ",
+    );
+    for i in 100i64..150 {
+        if i > 100 {
+            upsert.push(',');
+        }
+        upsert.push_str(&format!("({i}, 99)"));
+    }
+    upsert.push_str(
+        " ON CONFLICT (id) DO UPDATE SET amount = EXCLUDED.amount",
+    );
+
+    let res = sess
+        .execute(&upsert)
+        .await
+        .expect("bulk upsert all-conflict must not error");
+    assert!(
+        matches!(res, ExecResult::Empty { .. }),
+        "expected Empty result, got {res:?}"
+    );
+
+    // Row count must still be 50.
+    let ExecResult::Rows { batches, .. } = sess
+        .execute("SELECT COUNT(*) AS n FROM upsert_all")
+        .await
+        .unwrap()
+    else {
+        panic!("expected Rows from COUNT(*)")
+    };
+    assert_eq!(col_i64(&batches, "n"), vec![50], "COUNT must stay 50");
+
+    // All amounts must now be 99.
+    let ExecResult::Rows { batches, .. } = sess
+        .execute("SELECT COUNT(*) AS n FROM upsert_all WHERE amount = 99")
+        .await
+        .unwrap()
+    else {
+        panic!("expected Rows from COUNT(*)")
+    };
+    assert_eq!(
+        col_i64(&batches, "n"),
+        vec![50],
+        "all 50 rows must have amount=99 after upsert"
+    );
+}
+
+/// Half-existing, half-new → updates for existing + inserts for new.
+/// Total count must equal 50 (25 original + 25 new).
+#[tokio::test]
+async fn bulk_upsert_mixed() {
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+
+    sess.execute(
+        "CREATE TABLE upsert_mixed (id BIGINT NOT NULL PRIMARY KEY, status TEXT NOT NULL)",
+    )
+    .await
+    .unwrap();
+
+    // Seed ids 0..24 with status='old'.
+    let mut seed = String::from("INSERT INTO upsert_mixed (id, status) VALUES ");
+    for i in 0i64..25 {
+        if i > 0 {
+            seed.push(',');
+        }
+        seed.push_str(&format!("({i}, 'old')"));
+    }
+    sess.execute(&seed).await.unwrap();
+
+    // Upsert ids 0..49: ids 0..24 exist (→ UPDATE), ids 25..49 are new (→ INSERT).
+    let mut upsert = String::from("INSERT INTO upsert_mixed (id, status) VALUES ");
+    for i in 0i64..50 {
+        if i > 0 {
+            upsert.push(',');
+        }
+        upsert.push_str(&format!("({i}, 'new')"));
+    }
+    upsert.push_str(" ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status");
+
+    let res = sess
+        .execute(&upsert)
+        .await
+        .expect("bulk upsert mixed must not error");
+    assert!(
+        matches!(res, ExecResult::Empty { .. }),
+        "expected Empty result, got {res:?}"
+    );
+
+    // Total row count must be 50.
+    let ExecResult::Rows { batches, .. } = sess
+        .execute("SELECT COUNT(*) AS n FROM upsert_mixed")
+        .await
+        .unwrap()
+    else {
+        panic!("expected Rows from COUNT(*)")
+    };
+    assert_eq!(col_i64(&batches, "n"), vec![50], "total must be 50");
+
+    // All rows must have status='new'.
+    let ExecResult::Rows { batches, .. } = sess
+        .execute("SELECT COUNT(*) AS n FROM upsert_mixed WHERE status = 'new'")
+        .await
+        .unwrap()
+    else {
+        panic!("expected Rows from COUNT(*)")
+    };
+    assert_eq!(
+        col_i64(&batches, "n"),
+        vec![50],
+        "all 50 rows must have status='new'"
+    );
+
+    // The 25 previously-seeded rows must have been updated (not duplicated).
+    let ExecResult::Rows { batches, .. } = sess
+        .execute("SELECT COUNT(*) AS n FROM upsert_mixed WHERE status = 'old'")
+        .await
+        .unwrap()
+    else {
+        panic!("expected Rows from COUNT(*)")
+    };
+    assert_eq!(
+        col_i64(&batches, "n"),
+        vec![0],
+        "no 'old' rows must remain after upsert"
+    );
+}
+
+/// ON CONFLICT DO NOTHING with multiple rows — both the all-conflict and mixed
+/// cases must work without surfacing a constraint error.
+///
+/// This exercises the same root-cause path: the `filter_rows_do_nothing`
+/// function already handles multi-row batches correctly; this test confirms
+/// the wiring in `exec_insert` routes there for multi-row batches too.
+#[tokio::test]
+async fn bulk_upsert_do_nothing() {
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+
+    sess.execute(
+        "CREATE TABLE upsert_nothing (id BIGINT NOT NULL PRIMARY KEY, val TEXT NOT NULL)",
+    )
+    .await
+    .unwrap();
+
+    // Seed ids 1..5.
+    sess.execute(
+        "INSERT INTO upsert_nothing (id, val) VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e')",
+    )
+    .await
+    .unwrap();
+
+    // Re-insert ids 1..5 with different values — all must be suppressed.
+    let res = sess
+        .execute(
+            "INSERT INTO upsert_nothing (id, val) VALUES \
+             (1,'x'),(2,'x'),(3,'x'),(4,'x'),(5,'x') \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .await
+        .expect("multi-row DO NOTHING on existing rows must not error");
+    assert!(
+        matches!(res, ExecResult::Empty { .. }),
+        "expected Empty result, got {res:?}"
+    );
+
+    // Count must still be 5 and values unchanged.
+    let ExecResult::Rows { batches, .. } = sess
+        .execute("SELECT COUNT(*) AS n FROM upsert_nothing")
+        .await
+        .unwrap()
+    else {
+        panic!("expected Rows")
+    };
+    assert_eq!(col_i64(&batches, "n"), vec![5], "count must stay 5");
+
+    let ExecResult::Rows { batches, .. } = sess
+        .execute("SELECT COUNT(*) AS n FROM upsert_nothing WHERE val = 'x'")
+        .await
+        .unwrap()
+    else {
+        panic!("expected Rows")
+    };
+    assert_eq!(
+        col_i64(&batches, "n"),
+        vec![0],
+        "DO NOTHING must not overwrite existing values"
+    );
+
+    // Mixed: ids 1..5 exist, ids 6..8 are new → 3 new rows inserted.
+    let res = sess
+        .execute(
+            "INSERT INTO upsert_nothing (id, val) VALUES \
+             (1,'y'),(2,'y'),(3,'y'),(6,'new'),(7,'new'),(8,'new') \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .await
+        .expect("mixed DO NOTHING must not error");
+    assert!(
+        matches!(res, ExecResult::Empty { .. }),
+        "expected Empty result, got {res:?}"
+    );
+
+    let ExecResult::Rows { batches, .. } = sess
+        .execute("SELECT COUNT(*) AS n FROM upsert_nothing")
+        .await
+        .unwrap()
+    else {
+        panic!("expected Rows")
+    };
+    assert_eq!(
+        col_i64(&batches, "n"),
+        vec![8],
+        "3 new rows must have been inserted; existing 5 unchanged"
+    );
+}

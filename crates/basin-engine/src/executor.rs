@@ -5767,9 +5767,23 @@ async fn fast_pk_exists_check(
 
 /// Pre-check strategy for ON CONFLICT DO UPDATE (upsert).
 ///
-/// Returns `Some(result)` if the conflict row was found and an UPDATE was
-/// applied. Returns `Ok(None)` when no conflict exists, so the caller falls
-/// through to a plain INSERT.
+/// Handles both single-row and multi-row VALUES lists with full PG semantics:
+///
+/// * Each row is checked independently for a conflict on `conflict_cols`.
+/// * Conflicting rows are routed to UPDATE (with EXCLUDED.* bindings resolved
+///   to the proposed-row literal values).
+/// * Non-conflicting rows are collected and submitted as a plain INSERT at
+///   the end.
+///
+/// Returns `Some(result)` when at least one row conflicted (so all rows were
+/// handled here).  Returns `Ok(None)` only when zero rows in the batch
+/// conflict, in which case the caller falls through to a normal INSERT that
+/// will succeed without any constraint violation.
+///
+/// Intra-statement duplicate keys follow PG semantics: if the VALUES list
+/// contains two rows with the same conflict-column tuple, this function
+/// returns an error — "ON CONFLICT DO UPDATE command cannot affect row a
+/// second time" — matching the SQLSTATE 21000 PG surfaces.
 async fn try_on_conflict_do_update(
     sess: &ProjectSession,
     table: &TableName,
@@ -5783,7 +5797,7 @@ async fn try_on_conflict_do_update(
         OnConflictAction::DoNothing => return Ok(None),
     };
 
-    // Extract the conflict column(s). We support the `(col)` form for v0.1.
+    // Extract the conflict column(s). We support the `(col, ...)` form.
     let conflict_cols: Vec<String> = match &on_conflict.conflict_target {
         Some(ConflictTarget::Columns(idents)) => idents.iter().map(|i| i.value.clone()).collect(),
         _ => {
@@ -5796,7 +5810,7 @@ async fn try_on_conflict_do_update(
         return Ok(None);
     }
 
-    // Resolve the inserted row to get the conflict-column value(s).
+    // Resolve the inserted rows.
     let source = match ins.source.as_ref() {
         Some(s) => s,
         None => return Ok(None),
@@ -5806,12 +5820,6 @@ async fn try_on_conflict_do_update(
         _ => return Ok(None),
     };
     if rows_raw.is_empty() {
-        return Ok(None);
-    }
-    // Only handle the single-row case for v0.1 upsert.
-    // Multi-row upserts fall through to the normal INSERT path which will
-    // surface a constraint error on conflict.
-    if rows_raw.len() != 1 {
         return Ok(None);
     }
 
@@ -5824,105 +5832,192 @@ async fn try_on_conflict_do_update(
         .await?;
     let schema = meta.schema.clone();
 
-    // Expand the row to schema-width so we can look up conflict-col positions.
+    // Expand all rows to schema-width and apply column defaults once.
     let mut rows_expanded = expand_insert_rows(schema.as_ref(), &ins.columns, rows_raw)?;
     apply_column_defaults(sess, schema.as_ref(), &ins.columns, &mut rows_expanded).await?;
 
-    // Build WHERE conflict_col = value AND ... for the pre-check SELECT.
-    let mut where_parts: Vec<String> = Vec::with_capacity(conflict_cols.len());
-    for col_name in &conflict_cols {
-        let col_idx = schema.index_of(col_name).map_err(|_| {
-            BasinError::InvalidSchema(format!("ON CONFLICT: unknown column {col_name:?}"))
-        })?;
-        let col_expr = &rows_expanded[0][col_idx];
-        where_parts.push(format!("{} = {}", col_name, col_expr));
-    }
-    let where_clause = where_parts.join(" AND ");
+    // Pre-compute schema column indices for each conflict column.
+    let conflict_idxs: Vec<usize> = conflict_cols
+        .iter()
+        .map(|c| {
+            schema
+                .index_of(c)
+                .map_err(|_| BasinError::InvalidSchema(format!("ON CONFLICT: unknown column {c:?}")))
+        })
+        .collect::<Result<_>>()?;
 
-    // Existence check. Try the cheap memtable + zone-map/bloom probe first
-    // (single-PK conflict target, supported literal type). The probe can
-    // answer "definitely present" or "definitely absent" in O(1); when it
-    // can't decide (e.g. cold file *may* contain the key) we fall back to
-    // the authoritative SELECT 1 ... WHERE pk = lit path. This is the
-    // single-row UPSERT hot loop in the OLTP bench — was 0.03x vs PG with
-    // the unconditional SELECT 1 round-trip; the probe avoids the DF plan
-    // entirely on the 2nd+ iteration when the row lives in the memtable
-    // overlay as a prior MemRowValue::Update.
-    let fast_exists =
-        fast_pk_exists_check(sess, table, &meta, &conflict_cols, &rows_expanded[0]).await?;
-    let exists = match fast_exists {
-        Some(b) => b,
-        None => {
-            let check_sql = format!("SELECT 1 FROM {} WHERE {}", table.as_str(), where_clause);
-            match sess.ctx.sql(&check_sql).await {
-                Ok(df) => {
-                    let batches = df.collect().await.map_err(|e| {
-                        BasinError::internal(format!("ON CONFLICT existence check execute: {e}"))
-                    })?;
-                    batches.iter().any(|b| b.num_rows() > 0)
-                }
-                Err(_) => {
-                    // Table may be empty (no parquet file yet) → no conflict.
-                    false
-                }
-            }
-        }
-    };
-
-    if !exists {
-        return Ok(None); // No conflict — let the caller do a normal INSERT.
-    }
-
-    // Build EXCLUDED map: col_name_lowercase → proposed-row expr.
-    // This lets us resolve `EXCLUDED.col` in the DO UPDATE expressions.
-    let mut excluded_map: std::collections::HashMap<String, Expr> =
-        std::collections::HashMap::with_capacity(schema.fields().len());
-    for (i, field) in schema.fields().iter().enumerate() {
-        excluded_map.insert(
-            field.name().to_ascii_lowercase(),
-            rows_expanded[0][i].clone(),
-        );
-    }
-
-    // The bare table name (last component) for resolving `tablename.col`
-    // references → existing-row column in the UPDATE context.
+    // The bare table name (last component) for resolving `tablename.col`.
     let table_bare = table.as_str().to_ascii_lowercase();
 
-    // Conflict found. Build and execute an UPDATE.
-    //
-    // Before formatting each assignment's RHS expression, rewrite any
-    // `EXCLUDED.col` references to the literal proposed-row value and any
-    // `tablename.col` references to a bare `col` identifier (the existing row
-    // in the UPDATE context).  Unqualified `col` references are left as-is
-    // and naturally bind to the existing row — matching PG semantics.
-    let set_parts: Result<Vec<String>> = do_update
+    // Build the SET clause template once — the RHS will be rewritten per row
+    // using that row's EXCLUDED values, but the column names are constant.
+    // We validate assignments once here; each per-row UPDATE fills in the
+    // row-specific `excluded_map`.
+    let assignment_cols: Vec<String> = do_update
         .assignments
         .iter()
-        .map(|a| {
-            let col = match &a.target {
-                AssignmentTarget::ColumnName(n) => {
-                    n.0.last().map(|i| i.id_val().clone()).unwrap_or_default()
+        .map(|a| match &a.target {
+            AssignmentTarget::ColumnName(n) => {
+                let col = n.0.last().map(|i| i.id_val().clone()).unwrap_or_default();
+                if col.is_empty() {
+                    Err(BasinError::InvalidSchema(
+                        "ON CONFLICT DO UPDATE: malformed assignment".into(),
+                    ))
+                } else {
+                    Ok(col)
                 }
-                AssignmentTarget::Tuple(_) => String::new(),
-            };
-            if col.is_empty() {
-                return Err(BasinError::InvalidSchema(
-                    "ON CONFLICT DO UPDATE: malformed assignment".into(),
-                ));
             }
-            let rhs = rewrite_do_update_expr(a.value.clone(), &table_bare, &excluded_map);
-            Ok(format!("{col} = {rhs}"))
+            AssignmentTarget::Tuple(_) => Err(BasinError::InvalidSchema(
+                "ON CONFLICT DO UPDATE: malformed assignment".into(),
+            )),
         })
-        .collect();
-    let set_parts = set_parts?;
-    let update_sql = format!(
-        "UPDATE {} SET {} WHERE {}",
-        table.as_str(),
-        set_parts.join(", "),
-        where_clause
-    );
-    let result = Box::pin(sess.execute(&update_sql)).await?;
-    Ok(Some(result))
+        .collect::<Result<_>>()?;
+
+    // Track intra-statement conflict-key duplicates. PG errors with
+    // "ON CONFLICT DO UPDATE command cannot affect row a second time"
+    // (SQLSTATE 21000) when the VALUES list contains two rows with the
+    // same conflict-column tuple. We match that behaviour here.
+    let mut seen_in_batch: std::collections::HashSet<Vec<String>> =
+        std::collections::HashSet::new();
+
+    // Rows that had no conflict and must be INSERTed.
+    let mut insert_rows: Vec<Vec<sqlparser::ast::Expr>> = Vec::new();
+    // Count of rows processed via the UPDATE (conflict) path.
+    let mut update_count: usize = 0;
+    // Whether at least one row conflicted — determines the return path.
+    let mut any_conflict = false;
+
+    for row in &rows_expanded {
+        // Build the string-tuple key for intra-batch dup detection.
+        let key_tuple: Vec<String> = conflict_idxs
+            .iter()
+            .map(|&idx| format!("{}", row[idx]))
+            .collect();
+
+        if !seen_in_batch.insert(key_tuple.clone()) {
+            // PG: "ON CONFLICT DO UPDATE command cannot affect row a second
+            // time" — two rows in the same VALUES list share the same
+            // conflict-column tuple.
+            return Err(BasinError::InvalidSchema(
+                "ON CONFLICT DO UPDATE command cannot affect row a second time".into(),
+            ));
+        }
+
+        // Build WHERE conflict_col = value AND ... for existence check + UPDATE.
+        let where_clause: String = conflict_cols
+            .iter()
+            .zip(conflict_idxs.iter())
+            .map(|(col, &idx)| format!("{} = {}", col, row[idx]))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+
+        // Existence check — cheap memtable/bloom probe first, then SELECT 1.
+        let fast_exists = fast_pk_exists_check(sess, table, &meta, &conflict_cols, row).await?;
+        let exists = match fast_exists {
+            Some(b) => b,
+            None => {
+                let check_sql =
+                    format!("SELECT 1 FROM {} WHERE {} LIMIT 1", table.as_str(), where_clause);
+                match sess.ctx.sql(&check_sql).await {
+                    Ok(df) => {
+                        let batches = df.collect().await.map_err(|e| {
+                            BasinError::internal(format!(
+                                "ON CONFLICT existence check execute: {e}"
+                            ))
+                        })?;
+                        batches.iter().any(|b| b.num_rows() > 0)
+                    }
+                    Err(_) => {
+                        // Table may be empty (no Parquet file yet) → no conflict.
+                        false
+                    }
+                }
+            }
+        };
+
+        if !exists {
+            insert_rows.push(row.clone());
+            continue;
+        }
+
+        // Conflict found. Build and execute an UPDATE for this row.
+        any_conflict = true;
+
+        // Build EXCLUDED map: col_name_lowercase → proposed-row expr.
+        let mut excluded_map: std::collections::HashMap<String, Expr> =
+            std::collections::HashMap::with_capacity(schema.fields().len());
+        for (i, field) in schema.fields().iter().enumerate() {
+            excluded_map.insert(field.name().to_ascii_lowercase(), row[i].clone());
+        }
+
+        let set_parts: Vec<String> = assignment_cols
+            .iter()
+            .zip(do_update.assignments.iter())
+            .map(|(col, a)| {
+                let rhs = rewrite_do_update_expr(a.value.clone(), &table_bare, &excluded_map);
+                format!("{col} = {rhs}")
+            })
+            .collect();
+
+        let update_sql = format!(
+            "UPDATE {} SET {} WHERE {}",
+            table.as_str(),
+            set_parts.join(", "),
+            where_clause
+        );
+        Box::pin(sess.execute(&update_sql)).await?;
+        update_count += 1;
+    }
+
+    if !any_conflict {
+        // No row in the batch conflicted — let the caller do a normal INSERT.
+        return Ok(None);
+    }
+
+    // At least one row conflicted. Handle the non-conflicting rows here too
+    // (we cannot return None and let the caller INSERT them because the
+    // schema-expand + default-apply pass has already been done; more
+    // importantly, a plain INSERT of the full original batch would re-try the
+    // conflicting keys and hit the PK constraint).
+    let insert_count = insert_rows.len();
+    if !insert_rows.is_empty() {
+        // Reconstruct a VALUES literal from the already-expanded rows and
+        // re-execute as a plain INSERT (without ON CONFLICT, so the normal
+        // INSERT path handles PK enforcement, identity columns, etc.).
+        // The column list uses the schema field names in order because
+        // `expand_insert_rows` already filled every position.
+        let col_list: String = schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let value_rows: String = insert_rows
+            .iter()
+            .map(|row| {
+                let vals = row
+                    .iter()
+                    .map(|e| format!("{e}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("({vals})")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let plain_insert_sql = format!(
+            "INSERT INTO {} ({}) VALUES {}",
+            table.as_str(),
+            col_list,
+            value_rows
+        );
+        Box::pin(sess.execute(&plain_insert_sql)).await?;
+    }
+
+    // PG returns "INSERT 0 N" for a multi-row upsert where N is the total
+    // number of rows processed (both updated and inserted).
+    Ok(Some(ExecResult::Empty {
+        tag: format!("INSERT 0 {}", update_count + insert_count),
+    }))
 }
 
 /// Rewrite a DO UPDATE SET RHS expression to resolve PostgreSQL upsert
