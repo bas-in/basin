@@ -710,16 +710,126 @@ fn override_row_matches(ov: &RecordBatch, predicates: &[basin_storage::Predicate
 /// `target` columns by name. Missing columns degrade to passing the override
 /// row through unchanged (defensive — the caller's projection should always be
 /// a subset of the full row schema).
+///
+/// After projection the row is normalized to `target`'s physical types via
+/// [`normalize_batch_to_schema`]. This is the load-bearing step for the JSONB
+/// concat bug: the override row is decoded from the memtable's Arrow-IPC blob,
+/// which preserves the WRITER's catalog types (JSONB → `LargeBinary`). The
+/// `target` schema, however, is the COLD scan's output schema, which for a
+/// Vortex table round-trips JSONB through `BinaryView` → plain `Binary`
+/// (`normalize_view_types_schema`). Chaining a `LargeBinary` override row into
+/// a stream / concat of `Binary` cold batches makes arrow reject with
+/// "It is not possible to concatenate arrays of different data types
+/// (Binary, LargeBinary)". Casting to `target` here keeps the appended override
+/// row physically identical to the cold batches it is unioned with.
 fn reproject_row(row: &RecordBatch, target: &SchemaRef) -> DFResult<RecordBatch> {
     let mut idxs: Vec<usize> = Vec::with_capacity(target.fields().len());
     for f in target.fields() {
         match row.schema().index_of(f.name()) {
             Ok(i) => idxs.push(i),
-            Err(_) => return Ok(row.clone()),
+            Err(_) => return Ok(normalize_batch_to_schema(row.clone(), target)),
         }
     }
-    row.project(&idxs)
-        .map_err(|e| datafusion::common::DataFusionError::ArrowError(Box::new(e), None))
+    let projected = row
+        .project(&idxs)
+        .map_err(|e| datafusion::common::DataFusionError::ArrowError(Box::new(e), None))?;
+    Ok(normalize_batch_to_schema(projected, target))
+}
+
+/// Cast any column whose physical Arrow type differs from `target`'s
+/// same-named field across the byte-string width/view family
+/// (`Binary`↔`LargeBinary`, `Utf8`↔`LargeUtf8`↔`Utf8View`) so the returned
+/// batch is physically concat-compatible with batches that already carry
+/// `target`'s types. This normalizes at the READ/merge boundary only — the
+/// on-disk writer output is untouched (casting there would orphan existing
+/// files; see `dml_mutate::materialize_hot_overlay_into_cold`).
+///
+/// Producers that diverge for the same logical column:
+///   * Vortex cold decode → JSONB (`LargeBinary` in the catalog) surfaces as
+///     `Binary`; `VARCHAR`/`TEXT` (`Utf8`) may surface as `Utf8View`/`Utf8`.
+///   * Memtable Arrow-IPC override rows → carry the writer's catalog types
+///     verbatim (JSONB → `LargeBinary`, text → `Utf8`).
+///   * Parquet cold decode → catalog-aligned already (this is a no-op there).
+///
+/// Only the listed string/binary families are coerced; any other type mismatch
+/// is left untouched so a genuine schema bug still surfaces downstream rather
+/// than being silently papered over. Field NAME (not index) is the join key, so
+/// a projected override missing some `target` columns is handled per-column.
+/// The cast is `arrow::compute::cast`, which is zero-copy for the offset-only
+/// widenings arrow can do without re-buffering and cheap for the small
+/// (single-row override / UPDATE-touched) batches on these paths.
+pub(crate) fn normalize_batch_to_schema(
+    batch: RecordBatch,
+    target: &arrow_schema::Schema,
+) -> RecordBatch {
+    use arrow_array::ArrayRef;
+    let read_schema = batch.schema();
+    let mut changed = false;
+    let mut fields: Vec<Arc<arrow_schema::Field>> =
+        Vec::with_capacity(read_schema.fields().len());
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(read_schema.fields().len());
+    for (idx, f) in read_schema.fields().iter().enumerate() {
+        let col = batch.column(idx).clone();
+        let want = target
+            .field_with_name(f.name())
+            .ok()
+            .map(|cf| cf.data_type().clone());
+        let coerce_to = match (&want, f.data_type()) {
+            (Some(w), have) if w != have && is_str_bin_family_pair(have, w) => Some(w.clone()),
+            _ => None,
+        };
+        match coerce_to {
+            Some(w) => match arrow::compute::cast(&col, &w) {
+                Ok(casted) => {
+                    changed = true;
+                    fields.push(Arc::new(
+                        arrow_schema::Field::new(f.name(), w, f.is_nullable())
+                            .with_metadata(f.metadata().clone()),
+                    ));
+                    columns.push(casted);
+                }
+                // A cast we expected to be infallible failed — fall back to the
+                // original column. The downstream concat/stream will then surface
+                // the type mismatch with its own diagnostic rather than us masking
+                // it here.
+                Err(_) => {
+                    fields.push(f.clone());
+                    columns.push(col);
+                }
+            },
+            None => {
+                fields.push(f.clone());
+                columns.push(col);
+            }
+        }
+    }
+    if !changed {
+        return batch;
+    }
+    let schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+        fields,
+        read_schema.metadata().clone(),
+    ));
+    // Infallible: column count/lengths are unchanged and each cast preserves
+    // row count. Fall back to the input on the impossible error branch.
+    RecordBatch::try_new(schema, columns).unwrap_or(batch)
+}
+
+/// True iff `have`→`want` is one of the byte-string width/view widenings or
+/// narrowings we treat as a safe read-boundary normalization.
+fn is_str_bin_family_pair(have: &DataType, want: &DataType) -> bool {
+    use DataType::{Binary, LargeBinary, LargeUtf8, Utf8, Utf8View};
+    matches!(
+        (have, want),
+        (Binary, LargeBinary)
+            | (LargeBinary, Binary)
+            | (Utf8, LargeUtf8)
+            | (LargeUtf8, Utf8)
+            | (Utf8, Utf8View)
+            | (Utf8View, Utf8)
+            | (LargeUtf8, Utf8View)
+            | (Utf8View, LargeUtf8)
+    )
 }
 
 // ── Convenience wrapper ──────────────────────────────────────────────────────
@@ -1072,5 +1182,98 @@ mod tests {
             .collect();
         let out = filter_batch(&batch, "id", &DataType::Int64, &tombstones).unwrap();
         assert_eq!(out.num_rows(), 2);
+    }
+
+    #[test]
+    fn normalize_casts_binary_to_largebinary_for_jsonb() {
+        use arrow_array::{BinaryArray, LargeBinaryArray};
+        // Source batch: JSONB column decoded as plain `Binary` (the Vortex
+        // cold-decode shape). Target schema: catalog `LargeBinary` (JSONB).
+        let src_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("payload", DataType::Binary, true),
+        ]));
+        let src = RecordBatch::try_new(
+            src_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(BinaryArray::from(vec![
+                    Some(b"{}".as_ref()),
+                    Some(b"[]".as_ref()),
+                ])),
+            ],
+        )
+        .unwrap();
+        let target = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("payload", DataType::LargeBinary, true),
+        ]);
+        let out = normalize_batch_to_schema(src, &target);
+        assert_eq!(out.schema().field(1).data_type(), &DataType::LargeBinary);
+        let col = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .expect("payload normalized to LargeBinary");
+        assert_eq!(col.value(0), b"{}");
+        assert_eq!(col.value(1), b"[]");
+    }
+
+    #[test]
+    fn normalize_makes_mixed_binary_batches_concat_compatible() {
+        use arrow_array::{BinaryArray, LargeBinaryArray};
+        // A `Binary` cold batch and a `LargeBinary` override row — exactly the
+        // pre-fix mismatch. After normalizing both to the catalog
+        // `LargeBinary`, arrow concat must succeed.
+        let target = Schema::new(vec![Field::new("payload", DataType::LargeBinary, true)]);
+        let cold = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "payload",
+                DataType::Binary,
+                true,
+            )])),
+            vec![Arc::new(BinaryArray::from(vec![Some(b"cold".as_ref())]))],
+        )
+        .unwrap();
+        let overlay = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "payload",
+                DataType::LargeBinary,
+                true,
+            )])),
+            vec![Arc::new(LargeBinaryArray::from(vec![Some(
+                b"overlay".as_ref(),
+            )]))],
+        )
+        .unwrap();
+        let target_ref = Arc::new(target);
+        let n_cold = normalize_batch_to_schema(cold, &target_ref);
+        let n_overlay = normalize_batch_to_schema(overlay, &target_ref);
+        let merged =
+            arrow_select::concat::concat_batches(&target_ref, &[n_cold, n_overlay]).unwrap();
+        assert_eq!(merged.num_rows(), 2);
+        assert_eq!(merged.schema().field(0).data_type(), &DataType::LargeBinary);
+    }
+
+    #[test]
+    fn normalize_is_noop_when_types_match() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let b =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
+                .unwrap();
+        let out = normalize_batch_to_schema(b, schema.as_ref());
+        assert_eq!(out.num_rows(), 2);
+        assert_eq!(out.schema().field(0).data_type(), &DataType::Int64);
+    }
+
+    #[test]
+    fn normalize_leaves_unrelated_type_mismatch_untouched() {
+        // Int64 source vs Int32 target is NOT in the str/bin family — must be
+        // left as-is so a genuine bug still surfaces downstream.
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let b = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
+        let target = Schema::new(vec![Field::new("v", DataType::Int32, false)]);
+        let out = normalize_batch_to_schema(b, &target);
+        assert_eq!(out.schema().field(0).data_type(), &DataType::Int64);
     }
 }

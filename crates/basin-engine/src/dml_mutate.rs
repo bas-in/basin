@@ -4168,10 +4168,21 @@ async fn materialize_hot_overlay_into_cold(
     )
     .map_err(|e| BasinError::internal(format!("materialize overlay (updates): {e}")))?;
 
-    // Replace ALL old cold files with the merged result, then clear EXACTLY the
-    // overlay keys we materialized (targeted — a concurrent overlay write on a
-    // different key is preserved). The overlay is cleared only AFTER the commit
-    // succeeds, so a crash mid-way leaves the overlay intact and replayable.
+    // Normalize every merged batch to the CATALOG physical types before the
+    // `write_replacement` concat. The cold batches were read RAW (no
+    // `reattach_catalog_metadata`), so on a Vortex table a JSONB column comes
+    // back as `Binary` while the override rows decoded from the memtable IPC
+    // blob carry the writer's catalog `LargeBinary`. Mixed Binary/LargeBinary
+    // batches make `concat_batches(meta.schema, …)` fail with
+    // "concatenate arrays of different data types (Binary, LargeBinary)" —
+    // the exact bug this guards. Casting to `meta.schema` here makes the cold
+    // batches and the appended override rows uniformly catalog-typed; the
+    // writer then re-encodes to disk in its own format (we do NOT change what
+    // lands on disk, only what feeds the in-memory concat).
+    let batches: Vec<RecordBatch> = batches
+        .into_iter()
+        .map(|b| crate::hot_tombstone::normalize_batch_to_schema(b, meta.schema.as_ref()))
+        .collect();
     let added = write_replacement(sess, table, meta.schema.clone(), batches).await?;
     commit_replace(sess, table, meta.current_snapshot, removed.clone(), added).await?;
     // Physically delete the just-replaced files so a subsequent
@@ -4288,6 +4299,17 @@ async fn write_replacement(
     if batches.is_empty() {
         return Ok(Vec::new());
     }
+    // Normalize each batch to the target (catalog) physical types so a mix of
+    // Vortex-cold-decoded (`Binary`/`Utf8View`) and memtable-IPC-decoded
+    // (`LargeBinary`/`Utf8`) batches concat cleanly. Without this a JSONB
+    // column round-tripped through Vortex (catalog `LargeBinary`, decoded
+    // `Binary`) makes `concat_batches` fail with
+    // "concatenate arrays of different data types (Binary, LargeBinary)".
+    // No-op for Parquet tables and any caller whose batches already match.
+    let batches: Vec<RecordBatch> = batches
+        .into_iter()
+        .map(|b| crate::hot_tombstone::normalize_batch_to_schema(b, schema.as_ref()))
+        .collect();
     let merged = if batches.len() == 1 {
         batches.into_iter().next().unwrap()
     } else {
@@ -4410,6 +4432,17 @@ async fn write_replacement_per_file(
             let schema = schema.clone();
             let opts = opts.clone();
             async move {
+                // Normalize to catalog physical types before concat (same
+                // Binary/LargeBinary + Utf8 view-family rationale as
+                // `write_replacement`). The bulk-UPDATE-by-range path that
+                // feeds this fn is the canonical trigger for the JSONB
+                // `events.payload` concat failure at scale ≥10k.
+                let batches: Vec<RecordBatch> = batches
+                    .into_iter()
+                    .map(|b| {
+                        crate::hot_tombstone::normalize_batch_to_schema(b, schema.as_ref())
+                    })
+                    .collect();
                 let merged = if batches.len() == 1 {
                     batches.into_iter().next().unwrap()
                 } else {
