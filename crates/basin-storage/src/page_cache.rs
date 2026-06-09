@@ -616,6 +616,15 @@ impl PageCache {
         self.counters.current_bytes.load(Ordering::Relaxed) < self.max_bytes
     }
 
+    /// Per-shard byte budget. A single cache entry larger than this would
+    /// immediately push its owning shard over budget and start evicting on
+    /// the very next insert, so this is the natural ceiling for "is this
+    /// file small enough to cache its whole unfiltered decode under one
+    /// shared key?" (see the unfiltered-decode reuse path in `reader.rs`).
+    pub(crate) fn per_shard_budget(&self) -> u64 {
+        self.per_shard_max_bytes
+    }
+
     /// For tests: how many entries the cache currently holds (summed
     /// across shards).
     #[cfg(test)]

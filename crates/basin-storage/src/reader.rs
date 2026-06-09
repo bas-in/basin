@@ -46,6 +46,18 @@ use basin_catalog::ProjectStorageConfig;
 /// raise a typed error rather than OOM the worker walking the full list.
 pub(crate) const DEFAULT_MAX_LISTED_FILES: usize = 50_000;
 
+/// Conservative compressed-→-decoded expansion factor used to estimate
+/// whether a `.vortex` file's full unfiltered decode would fit one page-cache
+/// shard's byte budget before we attempt the shared unfiltered-decode reuse
+/// path (see the fresh-key point-read fast path in [`read_one`]). We multiply
+/// the on-disk (compressed) blob size by this factor and compare against
+/// `PageCache::per_shard_budget()`. Deliberately generous: over-estimating
+/// only declines the optimisation for a borderline file (it falls back to the
+/// existing pushdown decode), whereas under-estimating could let an oversized
+/// decode thrash a shard. Vortex's lightweight encodings rarely exceed ~8× on
+/// Basin-shaped data; the conservative bound keeps the gate honest.
+const VORTEX_UNFILTERED_DECODE_EXPANSION: u64 = 8;
+
 /// Resolve [`DEFAULT_MAX_LISTED_FILES`], honoring
 /// `BASIN_STORAGE_MAX_LISTED_FILES` when present and parseable to a
 /// positive `usize`.
@@ -908,6 +920,121 @@ async fn read_one(
             Some(s) => Some(s),
             None => inferred_schema.as_deref(),
         };
+        // ── Unfiltered-decode reuse (fresh-key point-read fast path) ──
+        //
+        // A point read pushes a PK-equality filter into the scan, so the
+        // post-filter `Vec<RecordBatch>` we'd cache under the normal
+        // `cache_key` is keyed on `filters_hash(<that key value>)`. Every
+        // DIFFERENT key value is therefore a cold miss: the file's
+        // surviving chunks are re-fetched + re-decoded per key. At 1M rows
+        // that's ~5–15 ms per file per fresh key.
+        //
+        // Instead, when filters are present and the file's decoded size is
+        // expected to fit one shard's byte budget, we decode the file ONCE
+        // *without* a filter and cache those raw (pre-project/-filter)
+        // batches under a single shared key — `filters_hash(EMPTY)` plus
+        // the SAME read-projection every point lookup of this file uses. The
+        // first fresh key pays the decode; every later fresh key is then an
+        // Arrow filter over in-memory batches (sub-ms) via the SAME
+        // `vortex_project_and_filter` path that already enforces the
+        // authoritative predicate + NULL semantics, so the result is
+        // byte-identical to the pushdown path.
+        //
+        // Gates (all must hold, else fall straight through to the existing
+        // pushdown decode below, byte-for-byte unchanged):
+        //   (a) filters present                — point-lookup-ish; a full
+        //       analytical scan has no filter and must not start decoding
+        //       unfiltered;
+        //   (b) decoded size fits one shard's budget — `size_bytes` (the
+        //       compressed Vortex blob) × a conservative expansion factor
+        //       must be ≤ `per_shard_budget()`; a big file bypasses so large
+        //       scans never materialise the whole unfiltered decode;
+        //   (c) the page cache exists (nowhere to share the decode otherwise);
+        //   (d) the kill switch is unset.
+        //
+        // Eviction correctness rides on the existing invariants: the key
+        // carries `path`, and `.vortex` files are immutable — compaction /
+        // rewrite writes a NEW path and calls `invalidate_path` on the old
+        // one, dropping every variant (including this unfiltered entry).
+        let unfiltered_cache_disabled =
+            std::env::var("BASIN_UNFILTERED_DECODE_CACHE_DISABLE").as_deref() == Ok("1");
+        let unfiltered_eligible = !opts.filters.is_empty()
+            && !unfiltered_cache_disabled
+            && page_cache.is_some()
+            && size_bytes.saturating_mul(VORTEX_UNFILTERED_DECODE_EXPANSION)
+                <= page_cache
+                    .as_ref()
+                    .map(|pc| pc.per_shard_budget())
+                    .unwrap_or(0);
+
+        if unfiltered_eligible {
+            // Shared key: same path + same READ projection (`read_proj`,
+            // which already folds the filter columns in) + EMPTY filter set.
+            // Disjoint from the normal post-filter key (which hashes
+            // `opts.projection` and the real filters), so the two never
+            // collide.
+            let unfiltered_key = CacheKey {
+                path: path.clone(),
+                projection_hash: hash_projection(read_proj.as_deref()),
+                filters_hash: hash_filters(&[]),
+            };
+            let pc = page_cache.as_ref().expect("eligibility implies page cache");
+
+            // Raw unfiltered decode batches (read-projection columns, no
+            // predicate applied). On hit we reuse the cached Arc; on miss we
+            // decode once with NO filter, cache, then proceed.
+            let raw: Vec<RecordBatch> = if let Some(cached) = pc.get(&unfiltered_key) {
+                cached.iter().map(|b| (**b).clone()).collect()
+            } else {
+                let (decoded, _) = crate::vortex_format::decode_with_cache(
+                    bytes,
+                    schema,
+                    read_proj.as_deref(),
+                    None,
+                    Some(&vortex_cache),
+                    &path,
+                    size_bytes,
+                )
+                .await?;
+                if pc.has_capacity() {
+                    let cached: Vec<Arc<RecordBatch>> =
+                        decoded.iter().cloned().map(Arc::new).collect();
+                    pc.insert(unfiltered_key, cached);
+                }
+                decoded
+            };
+
+            // Apply the authoritative predicate + projection in Arrow over
+            // the (shared) unfiltered batches. `apply_filter = true` always:
+            // the cached batches are unfiltered, so the WHERE must run here.
+            let batches =
+                vortex_project_and_filter(raw, opts.as_ref(), catalog_schema.as_ref(), true)?;
+
+            // Per-file LIMIT gate (mirrors the pushdown path below).
+            let batches = if let Some(lim) = opts.limit {
+                let mut kept = Vec::with_capacity(batches.len());
+                let mut seen = 0usize;
+                for b in batches {
+                    if seen >= lim {
+                        break;
+                    }
+                    let take = (lim - seen).min(b.num_rows());
+                    seen += take;
+                    if take == b.num_rows() {
+                        kept.push(b);
+                    } else {
+                        kept.push(b.slice(0, take));
+                    }
+                }
+                kept
+            } else {
+                batches
+            };
+
+            let stream = futures::stream::iter(batches.into_iter().map(Ok));
+            return Ok(stream.boxed());
+        }
+
         let (push_filter, all_filters_pushed) =
             vortex_filter_expr(&opts.filters, filter_schema);
         let (batches, decode_used_filter) = crate::vortex_format::decode_with_cache(
@@ -3192,6 +3319,269 @@ mod tests {
             .downcast_ref::<Float64Array>()
             .unwrap();
         assert_eq!(g_score, o_score, "Float64 column must round-trip");
+    }
+
+    // -----------------------------------------------------------------------
+    // Unfiltered-decode reuse (fresh-key point-read fast path)
+    // -----------------------------------------------------------------------
+
+    /// Storage with the page cache ENABLED at an explicit byte budget. The
+    /// unfiltered-decode reuse path only fires when a page cache is present;
+    /// these tests need that handle plus its hit/miss counters.
+    fn paged_storage(max_bytes: u64) -> Storage {
+        Storage::new(StorageConfig {
+            object_store: Arc::new(InMemory::new()),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: Some(crate::PageCacheConfig::new(max_bytes)),
+        })
+    }
+
+    /// Schema with an Int64 PK plus a nullable Utf8 payload, so the parity
+    /// test can exercise NULL semantics through the Arrow post-filter.
+    fn pk_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("note", DataType::Utf8, true),
+        ]))
+    }
+
+    /// `len` rows: id = start..start+len, note NULL on every 3rd row.
+    fn pk_batch(start: i64, len: usize) -> RecordBatch {
+        let id: Int64Array = (start..start + len as i64).collect();
+        let note: StringArray = (0..len)
+            .map(|i| {
+                if i % 3 == 0 {
+                    None
+                } else {
+                    Some(format!("n{}", start + i as i64))
+                }
+            })
+            .collect();
+        RecordBatch::try_new(pk_schema(), vec![Arc::new(id), Arc::new(note)]).unwrap()
+    }
+
+    /// Write `batch` as a `.vortex` file under one (project, table), forcing
+    /// `row_block_size` so a small batch still produces multiple Vortex
+    /// chunks (the multi-chunk parity surface). Returns the file path.
+    async fn write_vortex(
+        storage: &Storage,
+        project: &ProjectId,
+        table: &TableName,
+        batch: &RecordBatch,
+        row_block_size: Option<u32>,
+    ) -> ObjectPath {
+        let part = PartitionKey::default_key();
+        let df = storage
+            .write_batch_with_options(
+                project,
+                table,
+                &part,
+                batch,
+                &WriteOptions {
+                    file_format: FileFormat::Vortex,
+                    row_block_size,
+                    ..WriteOptions::default()
+                },
+            )
+            .await
+            .expect("write vortex");
+        assert!(df.path.as_ref().ends_with(".vortex"));
+        df.path
+    }
+
+    /// Read one `.vortex` file through `read_one` with an `Eq(id, v)` filter,
+    /// returning the concatenated decoded rows' `id` column values.
+    async fn read_eq_ids(
+        storage: &Storage,
+        project: &ProjectId,
+        path: &ObjectPath,
+        schema: Arc<Schema>,
+        eq: i64,
+    ) -> Vec<i64> {
+        let project_config = storage
+            .project_storage_config_cached(project)
+            .await
+            .unwrap();
+        let opts = ReadOptions {
+            filters: vec![Predicate::Eq("id".into(), ScalarValue::Int64(eq))],
+            ..ReadOptions::default()
+        };
+        let stream = read_one(
+            storage.project_store(project),
+            path.clone(),
+            Arc::new(opts),
+            storage.parquet_meta_cache().clone(),
+            storage.read_counters().clone(),
+            storage.page_cache_handle().cloned(),
+            storage.vortex_footer_cache_handle().clone(),
+            storage.project_counters(project),
+            storage.encryption_provider(),
+            project_config,
+            project.clone(),
+            Some(schema),
+        )
+        .await
+        .expect("read_one");
+        let batches: Vec<RecordBatch> = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|b| b.expect("batch"))
+            .collect();
+        let mut out = Vec::new();
+        for b in &batches {
+            let ids = b
+                .column(b.schema().index_of("id").unwrap())
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            out.extend(ids.values().iter().copied());
+        }
+        out
+    }
+
+    /// The unfiltered key a small no-projection point read shares.
+    fn unfiltered_key_for(path: &ObjectPath) -> CacheKey {
+        CacheKey {
+            path: path.clone(),
+            projection_hash: hash_projection(None),
+            filters_hash: hash_filters(&[]),
+        }
+    }
+
+    /// All behaviours of the unfiltered-decode reuse path in ONE test. The
+    /// kill switch (`BASIN_UNFILTERED_DECODE_CACHE_DISABLE`) is a
+    /// process-global env var, so parallel `#[test]` execution would race —
+    /// we sequence the cases here, exactly as
+    /// `list_data_files_with_stats_cap_resolver_and_safety_net` does for its
+    /// env knob.
+    ///
+    /// Covers:
+    ///  1. fresh-key-after-warm: two distinct `Eq` keys on the same file
+    ///     return correct disjoint rows, and the SECOND fresh key is served
+    ///     from the shared unfiltered cache entry (page-cache hit counter
+    ///     advances without a re-decode);
+    ///  2. size cap respected: a tiny-budget cache bypasses the path and
+    ///     never populates the shared key, yet stays correct;
+    ///  3. kill switch reverts to the pushdown path (shared key never made);
+    ///  4. parity: unfiltered+Arrow-filter == pushdown across present /
+    ///     NULL-payload / absent keys on a multi-chunk file with NULLs.
+    #[tokio::test]
+    async fn unfiltered_decode_reuse_behaviours() {
+        let key_env = "BASIN_UNFILTERED_DECODE_CACHE_DISABLE";
+        let prior = std::env::var(key_env).ok();
+        let project = ProjectId::new();
+        let schema = pk_schema();
+
+        // ───────────── 1. fresh-key-after-warm hits unfiltered cache ────────
+        std::env::remove_var(key_env);
+        let storage = paged_storage(64 * 1024 * 1024);
+        let table = TableName::new("pts").unwrap();
+        // 12 rows / row_block_size 4 -> 3 Vortex chunks.
+        let path = write_vortex(&storage, &project, &table, &pk_batch(0, 12), Some(4)).await;
+
+        let ids0 = read_eq_ids(&storage, &project, &path, schema.clone(), 5).await;
+        assert_eq!(ids0, vec![5], "Eq(id,5) returns exactly that row");
+        let after_first = storage.page_cache().unwrap().counters();
+
+        let ids1 = read_eq_ids(&storage, &project, &path, schema.clone(), 8).await;
+        assert_eq!(ids1, vec![8], "Eq(id,8) returns exactly that row");
+        let after_second = storage.page_cache().unwrap().counters();
+        assert!(
+            after_second.hits > after_first.hits,
+            "second fresh key must hit the shared unfiltered entry (hits {} -> {})",
+            after_first.hits,
+            after_second.hits,
+        );
+
+        let ids_none = read_eq_ids(&storage, &project, &path, schema.clone(), 9999).await;
+        assert!(ids_none.is_empty(), "absent key returns no rows");
+
+        // ───────────── 2. size cap bypasses (tiny budget) ──────────────────
+        let storage_small = Storage::new(StorageConfig {
+            object_store: Arc::new(InMemory::new()),
+            root_prefix: None,
+            disk_cache: None,
+            // 16-byte budget -> per_shard_budget is tiny; any real file's
+            // `size_bytes * EXPANSION` exceeds it, so the gate trips.
+            page_cache: Some(crate::PageCacheConfig::new(16)),
+        });
+        let table_s = TableName::new("big").unwrap();
+        let path_s =
+            write_vortex(&storage_small, &project, &table_s, &pk_batch(0, 12), Some(4)).await;
+        let ids_s = read_eq_ids(&storage_small, &project, &path_s, schema.clone(), 7).await;
+        assert_eq!(ids_s, vec![7], "result still correct on the bypass path");
+        assert!(
+            storage_small
+                .page_cache()
+                .unwrap()
+                .get(&unfiltered_key_for(&path_s))
+                .is_none(),
+            "size-capped file must NOT populate the shared unfiltered entry"
+        );
+
+        // ───────────── 3. kill switch reverts to pushdown ──────────────────
+        std::env::set_var(key_env, "1");
+        let storage_ks = paged_storage(64 * 1024 * 1024);
+        let table_k = TableName::new("ks").unwrap();
+        let path_k =
+            write_vortex(&storage_ks, &project, &table_k, &pk_batch(0, 12), Some(4)).await;
+        let ids_k = read_eq_ids(&storage_ks, &project, &path_k, schema.clone(), 6).await;
+        assert_eq!(ids_k, vec![6], "result correct with kill switch on");
+        assert!(
+            storage_ks
+                .page_cache()
+                .unwrap()
+                .get(&unfiltered_key_for(&path_k))
+                .is_none(),
+            "kill switch must suppress the shared unfiltered entry"
+        );
+
+        // ───────────── 4. parity: unfiltered+Arrow == pushdown ─────────────
+        // Two independent stores so cache state can't bleed between paths.
+        let batch = pk_batch(100, 12);
+        let storage_unf = paged_storage(64 * 1024 * 1024);
+        let storage_push = paged_storage(64 * 1024 * 1024);
+        let table_p = TableName::new("par").unwrap();
+
+        std::env::remove_var(key_env);
+        let path_unf =
+            write_vortex(&storage_unf, &project, &table_p, &batch, Some(4)).await;
+        // The pushdown-path file is written ONCE under the kill switch; the
+        // env var only affects the READ path, so writing it here is fine.
+        std::env::set_var(key_env, "1");
+        let path_push =
+            write_vortex(&storage_push, &project, &table_p, &batch, Some(4)).await;
+        std::env::remove_var(key_env);
+
+        // Keys: present-with-note, present-NULL-note (id%3==0 → 100/103/106/109),
+        // and absent.
+        for eq in [100i64, 103, 106, 109, 105, 99999] {
+            std::env::remove_var(key_env);
+            let cold = read_eq_ids(&storage_unf, &project, &path_unf, schema.clone(), eq).await;
+            let warm = read_eq_ids(&storage_unf, &project, &path_unf, schema.clone(), eq).await;
+
+            std::env::set_var(key_env, "1");
+            let pushed =
+                read_eq_ids(&storage_push, &project, &path_push, schema.clone(), eq).await;
+            std::env::remove_var(key_env);
+
+            assert_eq!(cold, warm, "cold vs warm disagree for Eq(id,{eq})");
+            assert_eq!(cold, pushed, "unfiltered vs pushdown disagree for Eq(id,{eq})");
+            let expected: Vec<i64> = if (100..112).contains(&eq) {
+                vec![eq]
+            } else {
+                vec![]
+            };
+            assert_eq!(cold, expected, "wrong rows for Eq(id,{eq})");
+        }
+
+        // Restore the env var to whatever it was before the test.
+        match prior {
+            Some(v) => std::env::set_var(key_env, v),
+            None => std::env::remove_var(key_env),
+        }
     }
 
     // -----------------------------------------------------------------------
