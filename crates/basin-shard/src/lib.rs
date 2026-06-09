@@ -391,6 +391,17 @@ impl Shard {
         self.inner.drop_table(project, table).await
     }
 
+    /// Cheap O(resident-partitions) predicate: does any resident partition
+    /// hold un-flushed in-memory tail rows for `(project, table)`?
+    ///
+    /// This is the no-flush correctness signal a read path uses to decide
+    /// whether cold-file-only guarantees are authoritative.  It never lists
+    /// or scans object storage and never drains the tail — it only inspects
+    /// the resident per-partition tail maps. See [`ShardImpl::has_pending_tail`].
+    pub async fn has_pending_tail(&self, project: &ProjectId, table: &TableName) -> bool {
+        self.inner.has_pending_tail(project, table).await
+    }
+
     /// Test-only: pull out the concrete in-process implementation so the
     /// inline tests can drive its synchronous helpers. Returns `None` if a
     /// future backend swap replaces the in-process map.
@@ -549,6 +560,19 @@ pub(crate) trait ShardImpl: Send + Sync {
     /// that don't keep an in-memory tail.
     async fn drop_table(&self, _project: &ProjectId, _table: &TableName) -> Result<()> {
         Ok(())
+    }
+    /// Cheap O(resident-partitions) check: is there any un-flushed in-memory
+    /// tail data for `(project, table)`?  Returns `true` when at least one
+    /// resident partition holds a non-empty tail batch for the table.
+    ///
+    /// Unlike `flush_to_parquet`, this does NOT list or scan object storage
+    /// and does NOT drain anything — it only inspects the resident
+    /// per-partition tail maps under their locks.  Read paths use it to decide
+    /// whether tail rows might be uncovered by a cold-file presence guard,
+    /// WITHOUT paying a flush.  Default `false` for backends that keep no
+    /// in-memory tail (their writes land directly in the cold tier).
+    async fn has_pending_tail(&self, _project: &ProjectId, _table: &TableName) -> bool {
+        false
     }
     /// Test-only downcast for the inline test suite.
     #[cfg(test)]

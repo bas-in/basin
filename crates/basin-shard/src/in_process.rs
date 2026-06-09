@@ -1805,6 +1805,26 @@ impl ShardImpl for InProcessShard {
         Ok(())
     }
 
+    async fn has_pending_tail(&self, project: &ProjectId, table: &TableName) -> bool {
+        // Snapshot this project's resident partition states under the outer
+        // mutex, then release it before touching the per-partition RwLocks so
+        // we never hold the global map lock across an await.
+        let snapshot: Vec<Arc<RwLock<PartitionState>>> = {
+            let map = self.partitions.lock().await;
+            map.iter()
+                .filter(|((p, _), _)| p == project)
+                .map(|(_, state)| state.clone())
+                .collect()
+        };
+        for state in snapshot {
+            let g = state.read().await;
+            if g.tail.get(table).map(|v| !v.is_empty()).unwrap_or(false) {
+                return true;
+            }
+        }
+        false
+    }
+
     #[cfg(test)]
     fn as_in_process(&self) -> Option<Arc<InProcessShard>> {
         Some(Arc::new(self.share_clone()))
