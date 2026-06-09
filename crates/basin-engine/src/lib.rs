@@ -2179,12 +2179,21 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
 
-        let after_paths: std::collections::HashSet<String> = storage
-            .list_data_files(&sess.project(), &table)
+        // Assert against the catalog (synchronous source of truth), not a
+        // raw object-store LIST: an UPDATE spawns a fire-and-forget async
+        // delete of the rewritten file that may not have landed yet, so the
+        // physical LIST races and is flaky. The catalog snapshot is always
+        // correct.
+        let after = eng
+            .config()
+            .catalog
+            .load_table(&sess.project(), &table)
             .await
-            .unwrap()
+            .unwrap();
+        let after_paths: std::collections::HashSet<String> = after
+            .live_data_files()
             .into_iter()
-            .map(|f| f.path.as_ref().to_string())
+            .map(|f| f.path)
             .collect();
         let kept_unchanged: Vec<&String> = after_paths
             .iter()
@@ -2196,12 +2205,6 @@ mod tests {
             "expected 1 of 2 parent files to pass through unchanged"
         );
 
-        let after = eng
-            .config()
-            .catalog
-            .load_table(&sess.project(), &table)
-            .await
-            .unwrap();
         let head = after.current().unwrap();
         assert_eq!(head.summary.removed_files, 1);
     }
@@ -2256,12 +2259,21 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
 
-        let after_paths: std::collections::HashSet<String> = storage
-            .list_data_files(&sess.project(), &table)
+        // Assert against the catalog (synchronous source of truth), not a
+        // raw object-store LIST: a DELETE spawns a fire-and-forget async
+        // delete of the rewritten file that may not have landed yet, so the
+        // physical LIST races and is flaky. The catalog snapshot is always
+        // correct.
+        let after = eng
+            .config()
+            .catalog
+            .load_table(&sess.project(), &table)
             .await
-            .unwrap()
+            .unwrap();
+        let after_paths: std::collections::HashSet<String> = after
+            .live_data_files()
             .into_iter()
-            .map(|f| f.path.as_ref().to_string())
+            .map(|f| f.path)
             .collect();
         let kept_unchanged: Vec<&String> = after_paths
             .iter()
@@ -2275,12 +2287,6 @@ mod tests {
             FILE_COUNT
         );
 
-        let after = eng
-            .config()
-            .catalog
-            .load_table(&sess.project(), &table)
-            .await
-            .unwrap();
         let head = after.current().unwrap();
         assert_eq!(head.summary.removed_files, 1);
 
