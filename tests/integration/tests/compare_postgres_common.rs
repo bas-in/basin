@@ -2786,7 +2786,7 @@ async fn run_robustness_suite(
     }
 }
 
-/// Carrier for the 10 OLTP-extra (Basin, PG) p50 pairs (#63-#72). Same
+/// Carrier for the 15 OLTP-extra (Basin, PG) p50 pairs (#63-#77). Same
 /// `(Option<f64>, f64)` / "(basin gap)" convention as the other suites.
 ///
 /// Coverage rationale per shape (closes the OLTP gaps in the existing 62
@@ -2813,14 +2813,32 @@ async fn run_robustness_suite(
 ///                           much higher.
 ///   #72 window_lead       — LEAD() OVER (PARTITION BY …); pairs with #19
 ///                           LAG — the lookahead-side window function.
+///   #73 keyset_pagination — WHERE id > … ORDER BY id LIMIT; seek-based
+///                           pagination, contrasts with the OFFSET shape
+///                           in the core suite (#6).
+///   #74 limit_no_order    — SELECT * … WHERE status = '…' LIMIT 100 with
+///                           no ORDER BY; early-exit scan, no sort.
+///   #75 insert_returning  — single-row INSERT … RETURNING id; the
+///                           write-then-read-back round trip is absent
+///                           from #63 (no RETURNING there).
+///   #76 update_returning  — single-row UPDATE … RETURNING; pairs with
+///                           #75 on the update side.
+///   #77 bulk_upsert_50    — one INSERT statement with 50 VALUES rows +
+///                           ON CONFLICT DO UPDATE; the batch-upsert
+///                           shape (sqlx/ORM bulk sync), vs #63's
+///                           single-row upsert.
 ///
 /// Per-shape stability:
-///   - #63 / #67 are write shapes. Each PG EXPLAIN ANALYZE iteration
-///     actually mutates the table; we use a dedicated scratch table seeded
-///     identically on both sides so the writes don't perturb earlier read
-///     measurements. UPSERT on a fixed id is idempotent (DO UPDATE sets
-///     the same value). Conditional UPDATE is idempotent too (CASE collapses
-///     after the first run).
+///   - #63 / #67 / #75 / #76 / #77 are write shapes. Each PG EXPLAIN
+///     ANALYZE iteration actually mutates the table; we use a dedicated
+///     scratch table seeded identically on both sides so the writes don't
+///     perturb earlier read measurements. UPSERT on a fixed id is
+///     idempotent (DO UPDATE sets the same value). Conditional UPDATE is
+///     idempotent too (CASE collapses after the first run). INSERT
+///     RETURNING uses ON CONFLICT DO UPDATE on a fixed out-of-seed id so
+///     re-runs never dup-key; UPDATE RETURNING re-assigns the same value;
+///     the bulk upsert re-writes the seed values, so every iteration fires
+///     the DO UPDATE arm with identical effect.
 ///   - All other shapes are read-only.
 struct OltpExtraResults {
     upsert: (Option<f64>, f64),
@@ -2833,14 +2851,20 @@ struct OltpExtraResults {
     string_concat: (Option<f64>, f64),
     hour_bucket: (Option<f64>, f64),
     window_lead: (Option<f64>, f64),
+    keyset_pagination: (Option<f64>, f64),
+    limit_no_order: (Option<f64>, f64),
+    insert_returning: (Option<f64>, f64),
+    update_returning: (Option<f64>, f64),
+    bulk_upsert_50: (Option<f64>, f64),
 }
 
-/// Run the 10 OLTP-extra probes (#63-#72) on PG + Basin.
+/// Run the 15 OLTP-extra probes (#63-#77) on PG + Basin.
 ///
 /// Same stack-budget extraction pattern as `run_extended_suite`. Both
 /// engines see identical schema + seed on a scratch `oltp_extra` table so
-/// the write shapes (#63 upsert, #67 conditional update) can mutate freely
-/// without touching the earlier `events`/`users` measurements.
+/// the write shapes (#63 upsert, #67 conditional update, #75-#77
+/// RETURNING/bulk-upsert) can mutate freely without touching the earlier
+/// `events`/`users` measurements.
 ///
 /// Fairness invariant: every shape goes through the shared `pair()` helper
 /// → same sample count from `samples_for(rows, 5)`, same PG-via-EXPLAIN-ANALYZE
@@ -2870,8 +2894,9 @@ async fn run_oltp_extra_suite(
     }
 
     // Scratch table for the write shapes (#63 upsert, #67 conditional
-    // update). 500 rows is enough that the conditional UPDATE rewrites a
-    // meaningful slice but small enough not to bloat 1M wall clock.
+    // update, #75-#77 RETURNING/bulk-upsert). 500 rows is enough that the
+    // conditional UPDATE rewrites a meaningful slice but small enough not
+    // to bloat 1M wall clock.
     let scratch_rows: i64 = 500;
     let pg_scratch_ok = pg
         .simple_query(&format!(
@@ -3157,6 +3182,151 @@ async fn run_oltp_extra_suite(
     )
     .await;
 
+    // -- #73 Keyset pagination (WHERE id > … ORDER BY id LIMIT) -------------
+    // Seek-based pagination — the "page N" shape every ORM cursor API emits.
+    // Contrasts with the core-suite OFFSET shape (#6): the seek predicate
+    // lets a btree (PG) / sorted pruning (Basin) skip straight to the page
+    // start instead of scanning-and-discarding OFFSET rows. Threshold is
+    // mid-keyspace (events ids are 0..rows) so selectivity is identical at
+    // every scale.
+    let keyset_threshold = (rows as i64) / 2;
+    let keyset_pagination = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT id, amount FROM {schema}.events \
+             WHERE id > {keyset_threshold} ORDER BY id LIMIT 50"
+        ),
+        &format!(
+            "SELECT id, amount FROM events \
+             WHERE id > {keyset_threshold} ORDER BY id LIMIT 50"
+        ),
+        n,
+    )
+    .await;
+
+    // -- #74 LIMIT without ORDER BY (early-exit scan) ------------------------
+    // `SELECT * … WHERE status = '…' LIMIT 100` — no sort, so the engine may
+    // stop scanning as soon as 100 matches surface. status = 'pending' is
+    // 1-in-4 rows (see `status_for`), so the limit fills almost immediately;
+    // measures how quickly each engine short-circuits the scan.
+    let limit_no_order = pair(
+        pg,
+        sess,
+        format!("SELECT * FROM {schema}.events WHERE status = 'pending' LIMIT 100"),
+        "SELECT * FROM events WHERE status = 'pending' LIMIT 100",
+        n,
+    )
+    .await;
+
+    // -- #75 INSERT ... RETURNING id (single row) ----------------------------
+    // Write-then-read-back round trip on the scratch table. The fixed id
+    // (600) is OUTSIDE the seeded 0..499 keyspace and unused by any other
+    // shape, so the first iteration inserts and every subsequent one fires
+    // the ON CONFLICT DO UPDATE arm — never a duplicate-key error under
+    // repetition, same repeatability trick as #63. RETURNING id is the
+    // point of the shape; if Basin rejects RETURNING it surfaces as a
+    // basin gap.
+    let insert_returning_pg_sql = format!(
+        "INSERT INTO {schema}.oltp_extra (id, amount, status) \
+         VALUES (600, 7.25, 'new') \
+         ON CONFLICT (id) DO UPDATE SET amount = EXCLUDED.amount, status = EXCLUDED.status \
+         RETURNING id"
+    );
+    let insert_returning_basin_sql =
+        "INSERT INTO oltp_extra (id, amount, status) \
+         VALUES (600, 7.25, 'new') \
+         ON CONFLICT (id) DO UPDATE SET amount = EXCLUDED.amount, status = EXCLUDED.status \
+         RETURNING id";
+    let insert_returning = if pg_scratch_ok && basin_scratch_ok {
+        pair(pg, sess, insert_returning_pg_sql, insert_returning_basin_sql, n).await
+    } else {
+        let p = if pg_scratch_ok {
+            pg_p50_explain(pg, &insert_returning_pg_sql, n)
+                .await
+                .unwrap_or(f64::INFINITY)
+        } else {
+            f64::INFINITY
+        };
+        let b = if basin_scratch_ok {
+            basin_p50_try(sess, insert_returning_basin_sql, n).await
+        } else {
+            None
+        };
+        (b, p)
+    };
+
+    // -- #76 UPDATE ... RETURNING (single row) -------------------------------
+    // Single-row update with read-back. id 7 is inside the seeded scratch
+    // keyspace and untouched by the other fixed-id shapes (#63 uses 42,
+    // #75 uses 600, #77 uses 100..149). Idempotent under repetition: every
+    // iteration assigns the same 'paid' value to the same row.
+    let update_returning_pg_sql = format!(
+        "UPDATE {schema}.oltp_extra SET status = 'paid' WHERE id = 7 \
+         RETURNING id, status"
+    );
+    let update_returning_basin_sql =
+        "UPDATE oltp_extra SET status = 'paid' WHERE id = 7 RETURNING id, status";
+    let update_returning = if pg_scratch_ok && basin_scratch_ok {
+        pair(pg, sess, update_returning_pg_sql, update_returning_basin_sql, n).await
+    } else {
+        let p = if pg_scratch_ok {
+            pg_p50_explain(pg, &update_returning_pg_sql, n)
+                .await
+                .unwrap_or(f64::INFINITY)
+        } else {
+            f64::INFINITY
+        };
+        let b = if basin_scratch_ok {
+            basin_p50_try(sess, update_returning_basin_sql, n).await
+        } else {
+            None
+        };
+        (b, p)
+    };
+
+    // -- #77 Bulk UPSERT (50 rows, one statement) ----------------------------
+    // One INSERT with 50 VALUES rows + ON CONFLICT DO UPDATE — the
+    // batch-sync shape ORMs/sqlx emit for bulk writes. ids 100..149 all
+    // exist in the seed, so the DO UPDATE arm fires for every row, and the
+    // assigned amount equals the seeded value (id * 0.5) — fully idempotent
+    // under EXPLAIN ANALYZE repetition.
+    let mut bulk_upsert_vals = String::with_capacity(50 * 24);
+    for k in 0..50i64 {
+        if k > 0 {
+            bulk_upsert_vals.push(',');
+        }
+        let bid = 100 + k;
+        bulk_upsert_vals.push_str(&format!("({bid}, {}, 'bulk')", (bid as f64) * 0.5));
+    }
+    let bulk_upsert_pg_sql = format!(
+        "INSERT INTO {schema}.oltp_extra (id, amount, status) \
+         VALUES {bulk_upsert_vals} \
+         ON CONFLICT (id) DO UPDATE SET amount = EXCLUDED.amount"
+    );
+    let bulk_upsert_basin_sql = format!(
+        "INSERT INTO oltp_extra (id, amount, status) \
+         VALUES {bulk_upsert_vals} \
+         ON CONFLICT (id) DO UPDATE SET amount = EXCLUDED.amount"
+    );
+    let bulk_upsert_50 = if pg_scratch_ok && basin_scratch_ok {
+        pair(pg, sess, bulk_upsert_pg_sql, &bulk_upsert_basin_sql, n).await
+    } else {
+        let p = if pg_scratch_ok {
+            pg_p50_explain(pg, &bulk_upsert_pg_sql, n)
+                .await
+                .unwrap_or(f64::INFINITY)
+        } else {
+            f64::INFINITY
+        };
+        let b = if basin_scratch_ok {
+            basin_p50_try(sess, &bulk_upsert_basin_sql, n).await
+        } else {
+            None
+        };
+        (b, p)
+    };
+
     OltpExtraResults {
         upsert,
         large_in_list,
@@ -3168,6 +3338,11 @@ async fn run_oltp_extra_suite(
         string_concat,
         hour_bucket,
         window_lead,
+        keyset_pagination,
+        limit_no_order,
+        insert_returning,
+        update_returning,
+        bulk_upsert_50,
     }
 }
 
@@ -3806,10 +3981,11 @@ async fn run_full_compare_inner(
     .await;
 
     // =======================================================================
-    // OLTP-extra suite (#63-#72) — 10 OLTP-realistic shapes that close
+    // OLTP-extra suite (#63-#77) — 15 OLTP-realistic shapes that close
     // residual coverage gaps in the 62-metric set (upsert, large IN-list,
     // RANK/LEAD window fns, DISTINCT ON, conditional UPDATE, composite range,
-    // JSON-derived eq filter, string ||, hour-truncated time buckets). Runs
+    // JSON-derived eq filter, string ||, hour-truncated time buckets, keyset
+    // pagination, no-sort LIMIT, INSERT/UPDATE RETURNING, bulk upsert). Runs
     // AFTER the robustness suite so its scratch table doesn't share the
     // `rstress`/`cins`/`txnins` keyspace and the writes here can't perturb
     // earlier read timings.
@@ -4021,7 +4197,7 @@ async fn run_full_compare_inner(
     row_opt("lateral_join_p50_ms", rb.lateral_join.0, rb.lateral_join.1);
     row_opt("any_array_p50_ms", rb.any_array.0, rb.any_array.1);
 
-    // OLTP-extra rows (#63-#72) — same Option-or-GAP rendering.
+    // OLTP-extra rows (#63-#77) — same Option-or-GAP rendering.
     row_opt("upsert_p50_ms", oe.upsert.0, oe.upsert.1);
     row_opt("large_in_list_100_p50_ms", oe.large_in_list.0, oe.large_in_list.1);
     row_opt("rank_partition_p50_ms", oe.rank_partition.0, oe.rank_partition.1);
@@ -4032,6 +4208,11 @@ async fn run_full_compare_inner(
     row_opt("string_concat_p50_ms", oe.string_concat.0, oe.string_concat.1);
     row_opt("hour_bucket_p50_ms", oe.hour_bucket.0, oe.hour_bucket.1);
     row_opt("window_lead_p50_ms", oe.window_lead.0, oe.window_lead.1);
+    row_opt("keyset_pagination_p50_ms", oe.keyset_pagination.0, oe.keyset_pagination.1);
+    row_opt("limit_no_order_p50_ms", oe.limit_no_order.0, oe.limit_no_order.1);
+    row_opt("insert_returning_p50_ms", oe.insert_returning.0, oe.insert_returning.1);
+    row_opt("update_returning_p50_ms", oe.update_returning.0, oe.update_returning.1);
+    row_opt("bulk_upsert_50_p50_ms", oe.bulk_upsert_50.0, oe.bulk_upsert_50.1);
 
     // ---- Emit benchmark JSON ----------------------------------------------
     let basin_disk_f = basin_disk_bytes as f64;
@@ -4253,7 +4434,7 @@ async fn run_full_compare_inner(
         mk_ext("Multi-col ORDER BY mixed ASC/DESC + LIMIT", rb.multicol_order_mixed.0, rb.multicol_order_mixed.1),
         mk_ext("LATERAL JOIN (correlated derived table)", rb.lateral_join.0, rb.lateral_join.1),
         mk_ext("WHERE col = ANY(int[])", rb.any_array.0, rb.any_array.1),
-        // OLTP-extra shapes (#63-#72) — close residual OLTP coverage gaps.
+        // OLTP-extra shapes (#63-#77) — close residual OLTP coverage gaps.
         // Same Option-or-gap helper as the other extended suites.
         mk_ext("UPSERT (INSERT ON CONFLICT DO UPDATE)", oe.upsert.0, oe.upsert.1),
         mk_ext("Large IN-list (~100 values)", oe.large_in_list.0, oe.large_in_list.1),
@@ -4265,6 +4446,11 @@ async fn run_full_compare_inner(
         mk_ext("String concatenation (email || id) p50", oe.string_concat.0, oe.string_concat.1),
         mk_ext("Hour-bucket time aggregation p50", oe.hour_bucket.0, oe.hour_bucket.1),
         mk_ext("Window LEAD() OVER (PARTITION BY) p50", oe.window_lead.0, oe.window_lead.1),
+        mk_ext("Keyset pagination (WHERE id > … ORDER BY LIMIT) p50", oe.keyset_pagination.0, oe.keyset_pagination.1),
+        mk_ext("LIMIT without ORDER BY (early-exit scan) p50", oe.limit_no_order.0, oe.limit_no_order.1),
+        mk_ext("INSERT … RETURNING id (single row)", oe.insert_returning.0, oe.insert_returning.1),
+        mk_ext("UPDATE … RETURNING (single row)", oe.update_returning.0, oe.update_returning.1),
+        mk_ext("Bulk UPSERT (50 rows, one statement)", oe.bulk_upsert_50.0, oe.bulk_upsert_50.1),
     ];
 
     report_postgres_compare(id, name, claim, true, metrics, None);
