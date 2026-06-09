@@ -864,6 +864,13 @@ pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result
     // bulk-DELETE-WHERE-IN write-amp fix (decisions.md 2026-05-23) — was
     // 116-18000x slower than PG; closes the gap to ~point-write latency.
     //
+    // Flush the INSERT tail only when one exists, BEFORE the fast-path gate
+    // so a just-INSERTed-same-row is visible to BOTH the fast-path read and
+    // the cold read. The cold `materialize_hot_overlay_into_cold` is moved to
+    // the cold fall-through below — the fast path writes tombstones by PK that
+    // shadow any prior overlay on read, so it does not need materializing (#205).
+    pre_mutation_flush_if_tail(sess, &table).await?;
+
     // Load the catalog metadata once here so the gates can inspect PK /
     // RLS / indexes / FKs. On the slow path the same load happens below.
     let meta = sess
@@ -896,8 +903,28 @@ pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result
         });
     }
 
-    pre_mutation_flush(sess).await?;
+    // ── Cold copy-on-write path ─────────────────────────────────────────
+    //
+    // The cold rewrite reads the RAW base via `list_data_files_with_stats`,
+    // which is NOT overlay-aware: a prior hot-tier UPDATE/DELETE override
+    // would not be seen, so without materializing it first the rewrite would
+    // operate on stale cold data while the un-cleared overlay shadows the
+    // result on read (#94/#95). Materialize the overlay into cold BEFORE we
+    // list the base files. This runs only on the cold fall-through (the fast
+    // path above never reaches here), so a delete-heavy fast-path loop no
+    // longer pays the eager re-encode + commit on every DELETE (#205). The
+    // INSERT-tail flush already happened above (gated on `has_pending_tail`).
     materialize_hot_overlay_into_cold(sess, &table).await?;
+    // Re-load metadata: materialize advances the table snapshot, so `meta`
+    // (and the schema derived from it) must reflect the post-materialize state
+    // before any cold read/RLS/commit decision.
+    let meta = sess
+        .engine
+        .config()
+        .catalog
+        .load_table(&sess.project, &table)
+        .await?;
+    let schema = meta.schema.clone();
 
     // RLS USING enforcement on DELETE (P0 #56 fix). UPDATE's exec_update
     // already enforces RLS WITH CHECK on the post-SET image, which trips
@@ -1787,8 +1814,13 @@ pub(crate) async fn exec_update(
         resolved
     };
 
-    pre_mutation_flush(sess).await?;
-    materialize_hot_overlay_into_cold(sess, &table).await?;
+    // Flush the INSERT tail only when one exists, BEFORE the fast-path gate
+    // so a just-INSERTed-same-row is visible to BOTH the fast-path read and
+    // the cold read. The cold `materialize_hot_overlay_into_cold` is moved to
+    // the cold fall-through below — the fast path (`hot_tier_update_by_pk`)
+    // reads memtable-override-first, so a prior overlay is already visible and
+    // does not need materializing (#205).
+    pre_mutation_flush_if_tail(sess, &table).await?;
 
     let meta = sess
         .engine
@@ -1830,6 +1862,30 @@ pub(crate) async fn exec_update(
             tag: format!("UPDATE {n}"),
         });
     }
+
+    // ── Cold copy-on-write path ─────────────────────────────────────────
+    //
+    // The cold rewrite reads the RAW base via `list_data_files_with_stats`,
+    // which is NOT overlay-aware: a prior hot-tier UPDATE/DELETE override
+    // would not be seen, so without materializing it first the rewrite would
+    // operate on stale cold data while the un-cleared overlay shadows the
+    // result on read (#94/#95). Materialize the overlay into cold BEFORE we
+    // list the base files. This runs only on the cold fall-through (the fast
+    // path above never reaches here), so an update-heavy fast-path loop no
+    // longer pays the eager re-encode + commit on every UPDATE (#205).
+    // RMW `SET col = <expr>` is forced cold-path by `try_resolve_fast_path_update`,
+    // so it still materializes here — preserved.
+    materialize_hot_overlay_into_cold(sess, &table).await?;
+    // Re-load metadata: materialize advances the table snapshot, so `meta`
+    // (and the schema/live-files derived from it) must reflect the post-
+    // materialize state before any cold read/commit decision.
+    let meta = sess
+        .engine
+        .config()
+        .catalog
+        .load_table(&sess.project, &table)
+        .await?;
+    let schema = meta.schema.clone();
 
     // Resolve assignments to (column_index, AssignmentValue).
     // Literals become Scalar; anything else (column refs, arithmetic,
@@ -3559,6 +3615,23 @@ async fn check_update_pk(
 async fn pre_mutation_flush(sess: &ProjectSession) -> Result<()> {
     if let Some(shard) = sess.engine.config().shard.as_ref() {
         shard.flush_to_parquet().await?;
+    }
+    Ok(())
+}
+
+/// Flush the shard INSERT tail to Parquet only when `(project, table)` has a
+/// resident, un-flushed tail. INSERT populates the shard TAIL, not the
+/// memtable; a fast-path UPDATE/DELETE's read-before-write reads
+/// memtable+cold (not the tail), so a just-INSERTed-same-row would be invisible
+/// without this flush (read-your-writes break). `has_pending_tail` is an O(1)
+/// resident-map probe that neither lists object storage nor drains the tail, so
+/// the common no-tail case (an update-heavy loop) pays nothing while the
+/// read-your-writes guarantee is preserved whenever a tail exists.
+async fn pre_mutation_flush_if_tail(sess: &ProjectSession, table: &TableName) -> Result<()> {
+    if let Some(shard) = sess.engine.config().shard.as_ref() {
+        if shard.has_pending_tail(&sess.project, table).await {
+            shard.flush_to_parquet().await?;
+        }
     }
     Ok(())
 }

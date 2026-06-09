@@ -132,6 +132,42 @@ async fn build_engine_with_shard() -> (
     (storage_dir, wal_dir, engine, bg, wal)
 }
 
+/// Shard + WAL engine with **no background flush task spawned**. The INSERT
+/// tail therefore never auto-drains, so a test can observe `has_pending_tail`
+/// being true and assert the synchronous read-your-writes flush gate. Returns
+/// a clone of the `Shard` handle so the test can probe the tail directly.
+async fn build_engine_with_unflushed_shard() -> (TempDir, TempDir, Engine, Shard, Arc<dyn Wal>) {
+    let storage_dir = TempDir::new().unwrap();
+    let wal_dir = TempDir::new().unwrap();
+    let storage = Storage::new(StorageConfig {
+        object_store: Arc::new(LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap()),
+        root_prefix: None,
+        disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
+        page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
+    });
+    let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+    let wal: Arc<dyn Wal> = Arc::new(
+        LocalWal::open(WalConfig {
+            object_store: Arc::new(LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap()),
+            root_prefix: None,
+            flush_interval: Duration::from_secs(3600),
+            flush_max_bytes: 1024 * 1024 * 1024,
+        })
+        .await
+        .unwrap(),
+    );
+    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    // Deliberately do NOT call `shard.spawn_background()` — the tail must stay
+    // resident so the read-your-writes gate is the only thing that can flush it.
+    let shard_probe = shard.clone();
+    let engine = Engine::new(EngineConfig {
+        storage,
+        catalog,
+        shard: Some(shard),
+    });
+    (storage_dir, wal_dir, engine, shard_probe, wal)
+}
+
 async fn open(eng: &Engine) -> ProjectSession {
     eng.open_session(ProjectId::new()).await.unwrap()
 }
@@ -415,5 +451,66 @@ async fn tombstone_survives_compaction() {
     );
 
     bg.shutdown().await;
+    wal.close().await.unwrap();
+}
+
+/// Read-your-writes through the shard INSERT tail (#205).
+///
+/// INSERT populates the shard *tail*, not the memtable. A fast-path UPDATE's
+/// read-before-write reads memtable + cold (NOT the tail), so if the eager
+/// `pre_mutation_flush` were skipped unconditionally, a just-INSERTed-same-row
+/// would be invisible to the UPDATE's read and the UPDATE would no-op — a
+/// read-your-writes regression.
+///
+/// The fix gates the flush on `Shard::has_pending_tail`: when a tail exists the
+/// flush still fires synchronously *before* the fast-path read, so the row is
+/// drained to cold and the UPDATE sees it. This test runs with **no background
+/// flush task spawned**, so the only thing that can drain the tail is the
+/// gate itself. We assert: (1) the tail is genuinely pending right after the
+/// INSERT, and (2) the UPDATE in the same session takes effect on SELECT.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn insert_then_update_same_row_with_pending_tail_takes_effect() {
+    let _g = ENV_LOCK.lock().await;
+    let _upd = set_env("BASIN_HOTTIER_UPDATE_FASTPATH");
+
+    let (_sd, _wd, engine, shard, wal) = build_engine_with_unflushed_shard().await;
+    let project = ProjectId::new();
+    let sess = engine.open_session(project).await.unwrap();
+
+    exec(
+        &sess,
+        "CREATE TABLE ryw (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)",
+    )
+    .await;
+
+    // INSERT lands in the shard tail (no flush task is running to drain it).
+    exec(&sess, "INSERT INTO ryw (id, v) VALUES (1, 10)").await;
+
+    // Sanity: the tail is genuinely pending and un-flushed at this point —
+    // otherwise the test would not be exercising the gate it claims to.
+    let table = basin_common::TableName::new("ryw").unwrap();
+    assert!(
+        shard.has_pending_tail(&project, &table).await,
+        "INSERT must leave a pending tail before the UPDATE — \
+         the read-your-writes gate is only meaningful with a tail present"
+    );
+
+    // UPDATE the just-INSERTed row in the same session. The gate must flush the
+    // tail first so the fast-path read sees v=10 and writes the override.
+    exec(&sess, "UPDATE ryw SET v = 999 WHERE id = 1").await;
+
+    let v = fetch_v(&sess, "ryw", 1).await;
+    assert_eq!(
+        v,
+        Some(999),
+        "UPDATE of a just-INSERTed (tail-resident) row must take effect; \
+         got {v:?} — the has_pending_tail flush gate failed to surface the \
+         tail row to the UPDATE's read-before-write (read-your-writes break)"
+    );
+
+    // Row count must be exactly 1 (no duplicate, no resurrection).
+    let n = row_count(&sess, "SELECT * FROM ryw WHERE id = 1").await;
+    assert_eq!(n, 1, "expected exactly one row for id=1; got {n}");
+
     wal.close().await.unwrap();
 }
