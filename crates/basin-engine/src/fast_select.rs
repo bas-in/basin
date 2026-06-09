@@ -1376,8 +1376,18 @@ pub(crate) async fn execute_simple_select(
             .get(&sess.project, &plan.table)
             .map(|e| !e.memtable.snapshot().is_empty())
             .unwrap_or(false);
+        // Defense-in-depth: also reject when the shard holds un-flushed tail
+        // rows (a row written before promotion, not yet a cold file, carries no
+        // shadow column).  This is a cheap O(1) no-flush probe — it never lists
+        // or drains storage — and closes any cross-session window between the
+        // SQL rewrite's guard and execution here.
+        let has_pending_tail = match sess.engine.config().shard.as_ref() {
+            Some(shard) => shard.has_pending_tail(&sess.project, &plan.table).await,
+            None => false,
+        };
         let live_files = meta.live_data_files();
         let all_present = !memtable_has_entries
+            && !has_pending_tail
             && live_files.iter().all(|f| {
                 referenced_shadow_cols
                     .iter()

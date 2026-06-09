@@ -2928,43 +2928,47 @@ async fn rewrite_promoted_cols_for_query(sql: &str, sess: &ProjectSession) -> St
     // rows exist).  Paths that fail the guard are dropped here so they keep
     // their `json_get_text` form.
     let mut all_paths: Vec<basin_catalog::PromotedJsonbPath> = Vec::new();
-    let mut flushed = false;
     for table_str in table_refs {
         let Ok(table_name) = basin_common::TableName::new(table_str) else { continue; };
-        let Ok(meta_pre) = catalog.load_table(project, &table_name).await else { continue; };
-        if meta_pre.promoted_jsonb_paths.is_empty() {
+        let Ok(meta) = catalog.load_table(project, &table_name).await else { continue; };
+        if meta.promoted_jsonb_paths.is_empty() {
             continue;
         }
-        // Drain the shard tail once (only when a promoted path is in play) so
-        // the cold-file set we test against is authoritative, then reload meta.
-        if !flushed {
-            if let Some(shard) = sess.engine.config().shard.as_ref() {
-                if shard.flush_to_parquet().await.is_err() {
-                    // Flush failure: conservatively skip the rewrite for this
-                    // statement (leave json_get_text → correct UDF path).
-                    return sql.to_string();
-                }
-            }
-            flushed = true;
-        }
-        let meta = match catalog.load_table(project, &table_name).await {
-            Ok(m) => m,
-            Err(_) => continue,
+        // Correctness without flushing: the cold-file `column_stats` guard below
+        // is authoritative ONLY if no un-flushed tail rows exist for this table
+        // (a row written before promotion and still resident in the shard tail
+        // or engine memtable carries no shadow column, and the reader would
+        // null-fill it on the fast path → a WRONG answer).  We check this with
+        // two O(1) no-flush signals: `Shard::has_pending_tail` (inspects the
+        // resident per-partition tail maps; never lists/scans/drains storage)
+        // and the engine `MemTableRegistry` (post-COMMIT HTAP-cached + fast-path
+        // UPDATE/DELETE overlays).  If either is non-empty we skip ALL of this
+        // table's paths so they keep their `json_get_text` form and route to the
+        // correct DataFusion/UDF path.  A SELECT must NEVER trigger a flush:
+        // `flush_to_parquet` is not a cheap no-op on a drained tail (it
+        // LISTs/scans every partition), which previously added ~56ms/query at
+        // 1M scale — the whole point of this no-flush guard.
+        let has_pending_tail = match sess.engine.config().shard.as_ref() {
+            Some(shard) => shard.has_pending_tail(project, &table_name).await,
+            None => false,
         };
-        // Any uncovered hot-tier row for this table forbids ALL of its paths.
         let memtable_has_entries = sess
             .engine
             .memtable_registry()
             .get(project, &table_name)
             .map(|e| !e.memtable.snapshot().is_empty())
             .unwrap_or(false);
+        if has_pending_tail || memtable_has_entries {
+            continue;
+        }
         let live_files = meta.live_data_files();
         for path in meta.promoted_jsonb_paths {
             let shadow = path.shadow_col_name();
-            let all_present = !memtable_has_entries
-                && live_files
-                    .iter()
-                    .all(|f| f.column_stats.contains_key(&shadow));
+            // Tail/memtable already proven empty above; the cold-file
+            // `column_stats` presence check is now authoritative.
+            let all_present = live_files
+                .iter()
+                .all(|f| f.column_stats.contains_key(&shadow));
             if all_present {
                 all_paths.push(path);
             }
