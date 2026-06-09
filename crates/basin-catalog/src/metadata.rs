@@ -624,5 +624,176 @@ impl TableMetadata {
         }
         live.into_values().collect()
     }
+
+    #[cfg(test)]
+    fn empty_for_test() -> TableMetadata {
+        TableMetadata {
+            project: ProjectId::new(),
+            table: TableName::new("t").unwrap(),
+            schema: Arc::new(Schema::empty()),
+            current_snapshot: SnapshotId::GENESIS,
+            snapshots: Vec::new(),
+            format_version: 2,
+            partition_spec: PartitionSpec::Unpartitioned,
+            rls_enabled: false,
+            policies: Vec::new(),
+            cold_after_seconds: None,
+            cold_age_column: None,
+            bloom_filter_columns: Vec::new(),
+            row_group_rows: None,
+            continuous_aggregate: None,
+            cluster_columns: Vec::new(),
+            file_format: TableFileFormat::default(),
+            row_block_size: None,
+            home_region: None,
+            indexes: Vec::new(),
+            pk_columns: Vec::new(),
+            check_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            unique_constraints: Vec::new(),
+            global_sort_order: None,
+            adaptive_sort_override: None,
+            gc_orphan_paths: Vec::new(),
+            promoted_jsonb_paths: Vec::new(),
+        }
+    }
+
+    /// Point-query scaling (#204): the cluster/sort columns a writer should
+    /// physically sort cold files by, defaulting to the single-column primary
+    /// key when the table declares no explicit clustering.
+    ///
+    /// When a cold file is sorted by the PK, the per-row-group / per-zone
+    /// `[min, max]` ranges become disjoint, so the reader's existing
+    /// min/max pruning (Parquet row-group stats + page index; Vortex native
+    /// zone-maps) isolates the ~1 group/zone holding `WHERE pk = $1` instead
+    /// of scanning the whole file as the table grows.
+    ///
+    /// Policy (deliberately conservative):
+    ///  * Only kicks in when BOTH `cluster_columns` AND `global_sort_order`
+    ///    are empty — an explicit `WITH (basin.cluster_by=…)` /
+    ///    `basin.sort_by=…` always wins and is returned by the caller instead.
+    ///  * Only single-column primary keys (a composite PK doesn't give a
+    ///    single prunable order for `pk = $1`).
+    ///  * Only PK column types that the read path actually prunes on. The
+    ///    Vortex pushdown gate (`vortex_filter_expr`) accepts
+    ///    Int64/Float64/Boolean/UInt64; Parquet stats cover the full integer
+    ///    and float width family. We type-gate to integer / float / bool and
+    ///    skip text/timestamp/decimal/uuid (a later task can widen).
+    ///
+    /// Returns an empty vec when the policy does not apply, so callers can
+    /// pass the result straight through to `WriteOptions.cluster_columns`.
+    pub fn default_cluster_cols(&self) -> Vec<String> {
+        use arrow_schema::DataType;
+
+        // Explicit clustering / sort declarations always take precedence.
+        if !self.cluster_columns.is_empty() {
+            return Vec::new();
+        }
+        if self
+            .global_sort_order
+            .as_ref()
+            .is_some_and(|s| !s.is_empty())
+        {
+            return Vec::new();
+        }
+        // Single-column PK only.
+        let [pk] = self.pk_columns.as_slice() else {
+            return Vec::new();
+        };
+        // Type-gate to what the read path prunes on.
+        let prunable = self
+            .schema
+            .field_with_name(pk)
+            .ok()
+            .map(|f| {
+                matches!(
+                    f.data_type(),
+                    DataType::Int8
+                        | DataType::Int16
+                        | DataType::Int32
+                        | DataType::Int64
+                        | DataType::UInt8
+                        | DataType::UInt16
+                        | DataType::UInt32
+                        | DataType::UInt64
+                        | DataType::Float16
+                        | DataType::Float32
+                        | DataType::Float64
+                        | DataType::Boolean
+                )
+            })
+            .unwrap_or(false);
+        if prunable {
+            vec![pk.clone()]
+        } else {
+            Vec::new()
+        }
+    }
 }
 
+
+#[cfg(test)]
+mod default_cluster_cols_tests {
+    use super::*;
+    use arrow_schema::{DataType, Field};
+
+    fn with_pk(pk: &[&str], fields: &[(&str, DataType)]) -> TableMetadata {
+        let mut m = TableMetadata::empty_for_test();
+        m.schema = Arc::new(Schema::new(
+            fields
+                .iter()
+                .map(|(n, dt)| Field::new(*n, dt.clone(), false))
+                .collect::<Vec<_>>(),
+        ));
+        m.pk_columns = pk.iter().map(|s| s.to_string()).collect();
+        m
+    }
+
+    #[test]
+    fn single_int_pk_drives_default() {
+        let m = with_pk(&["id"], &[("id", DataType::Int64)]);
+        assert_eq!(m.default_cluster_cols(), vec!["id".to_string()]);
+    }
+
+    #[test]
+    fn float_and_bool_pk_are_prunable() {
+        let mf = with_pk(&["k"], &[("k", DataType::Float64)]);
+        assert_eq!(mf.default_cluster_cols(), vec!["k".to_string()]);
+        let mb = with_pk(&["k"], &[("k", DataType::Boolean)]);
+        assert_eq!(mb.default_cluster_cols(), vec!["k".to_string()]);
+    }
+
+    #[test]
+    fn text_pk_is_skipped() {
+        let m = with_pk(&["id"], &[("id", DataType::Utf8)]);
+        assert!(m.default_cluster_cols().is_empty());
+    }
+
+    #[test]
+    fn composite_pk_is_skipped() {
+        let m = with_pk(&["a", "b"], &[("a", DataType::Int64), ("b", DataType::Int64)]);
+        assert!(m.default_cluster_cols().is_empty());
+    }
+
+    #[test]
+    fn no_pk_is_empty() {
+        let m = with_pk(&[], &[("id", DataType::Int64)]);
+        assert!(m.default_cluster_cols().is_empty());
+    }
+
+    #[test]
+    fn explicit_cluster_cols_take_precedence() {
+        let mut m = with_pk(&["id"], &[("id", DataType::Int64)]);
+        m.cluster_columns = vec!["id".to_string()];
+        // Explicit clustering means the caller uses cluster_columns directly;
+        // the PK default must NOT also fire (would be a redundant override).
+        assert!(m.default_cluster_cols().is_empty());
+    }
+
+    #[test]
+    fn explicit_sort_order_take_precedence() {
+        let mut m = with_pk(&["id"], &[("id", DataType::Int64)]);
+        m.global_sort_order = Some(vec!["id".to_string()]);
+        assert!(m.default_cluster_cols().is_empty());
+    }
+}

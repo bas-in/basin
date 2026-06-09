@@ -6459,7 +6459,14 @@ fn write_options_for(meta: &TableMetadata, in_tx: bool) -> WriteOptions {
     WriteOptions {
         bloom_filter_columns: meta.bloom_filter_columns.clone(),
         max_row_group_size: meta.row_group_rows,
-        cluster_columns: meta.cluster_columns.clone(),
+        // #204: an explicit `WITH (basin.cluster_by=…)` wins; otherwise
+        // default to the single-column PK so cold files are sorted by the
+        // key and the reader's min/max prune isolates `WHERE pk = $1`.
+        cluster_columns: if meta.cluster_columns.is_empty() {
+            meta.default_cluster_cols()
+        } else {
+            meta.cluster_columns.clone()
+        },
         // Phase 3: honour the table's persisted on-disk format. Defaults
         // to Parquet (catalog default), keeping the legacy write path
         // byte-identical for every Parquet table.

@@ -983,8 +983,18 @@ impl InProcessShard {
         // Use the default partition key (consistent with compact_one).
         let partition = PartitionKey::default_key();
 
+        // #204: keep the rewritten file in the same PK-sorted layout the
+        // table is written in elsewhere (explicit clustering wins; otherwise
+        // the single-column PK), so the backfill sweep doesn't undo the
+        // disjoint zone / row-group ranges the point-query prune relies on.
+        let cluster_columns = if meta.cluster_columns.is_empty() {
+            meta.default_cluster_cols()
+        } else {
+            meta.cluster_columns.clone()
+        };
         let write_opts = basin_storage::WriteOptions {
             file_format,
+            cluster_columns,
             ..Default::default()
         };
 
@@ -1288,18 +1298,27 @@ impl InProcessShard {
             // adaptive-sort override, GIN indexes, and row-group size.
             // A missing catalog row is unusual but non-fatal; fall back to
             // safe defaults so the whole compaction tick doesn't error out.
+            // #204: `pk_default_cluster_cols` is the single-column PK the file
+            // should be sorted by when the table declares no explicit
+            // clustering — sorting by it makes per-row-group / zone ranges
+            // disjoint so the reader's min/max prune isolates `WHERE pk = $1`.
             let (file_format, declared_cluster_cols, adaptive_sort_override,
-                 gin_indexes, row_group_rows, row_block_size, promoted_paths) =
+                 gin_indexes, row_group_rows, row_block_size, promoted_paths,
+                 pk_default_cluster_cols) =
                 match self.cfg.catalog.load_table(project, &table).await {
-                    Ok(m) => (
-                        shard_map_file_format(m.file_format),
-                        m.cluster_columns,
-                        m.adaptive_sort_override.unwrap_or(false),
-                        m.indexes.clone(),
-                        m.row_group_rows,
-                        m.row_block_size,
-                        m.promoted_jsonb_paths,
-                    ),
+                    Ok(m) => {
+                        let pk_default = m.default_cluster_cols();
+                        (
+                            shard_map_file_format(m.file_format),
+                            m.cluster_columns,
+                            m.adaptive_sort_override.unwrap_or(false),
+                            m.indexes.clone(),
+                            m.row_group_rows,
+                            m.row_block_size,
+                            m.promoted_jsonb_paths,
+                            pk_default,
+                        )
+                    }
                     Err(_) => (
                         basin_storage::FileFormat::default(),
                         Vec::new(),
@@ -1307,6 +1326,7 @@ impl InProcessShard {
                         Vec::new(),
                         None,
                         None,
+                        Vec::new(),
                         Vec::new(),
                     ),
                 };
@@ -1347,7 +1367,11 @@ impl InProcessShard {
                 (false, Some(obs), true) => (obs.clone(), true),
                 (false, None, true) => (declared_cluster_cols, false),
                 (false, _, false) => (declared_cluster_cols, false),
-                (true, None, _) => (Vec::new(), false),
+                // #204: no declared clustering and no observed query pattern —
+                // fall back to the single-column PK (empty when the table has
+                // no prunable single-column PK) so the flushed file is
+                // PK-sorted and its zone / row-group ranges are disjoint.
+                (true, None, _) => (pk_default_cluster_cols, false),
             };
 
             let write_opts = basin_storage::WriteOptions {
@@ -1852,6 +1876,7 @@ impl basin_hottier::FlushBackend for ShardFlushBackend {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<basin_hottier::WrittenFile>> + Send + '_>>
     {
         let storage = self.storage.clone();
+        let catalog = self.catalog.clone();
         let partition = self.partition.clone();
         let project = *project;
         let table = table.clone();
@@ -1881,8 +1906,21 @@ impl basin_hottier::FlushBackend for ShardFlushBackend {
             let merged = arrow::compute::concat_batches(&schema, &batches)
                 .map_err(|e| BasinError::storage(format!("flush concat batches: {e}")))?;
 
-            // Write to storage using default options (format, cluster columns).
-            let write_opts = basin_storage::WriteOptions::default();
+            // #204: the hot-tier flush is one of the cold-file write paths, so
+            // it must honour the same PK-sort policy. Sort the whole merged
+            // batch by the table's clustering (explicit, else the single-column
+            // PK) so the flushed file's zone / row-group ranges are disjoint.
+            // A missing catalog row (first flush before the table is created)
+            // is non-fatal — fall through to the default empty cluster spec.
+            let cluster_columns = match catalog.load_table(&project, &table).await {
+                Ok(meta) if !meta.cluster_columns.is_empty() => meta.cluster_columns.clone(),
+                Ok(meta) => meta.default_cluster_cols(),
+                Err(_) => Vec::new(),
+            };
+            let write_opts = basin_storage::WriteOptions {
+                cluster_columns,
+                ..Default::default()
+            };
             let data_file = storage
                 .write_batch_with_options(&project, &table, &partition, &merged, &write_opts)
                 .await?;

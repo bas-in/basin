@@ -3819,7 +3819,14 @@ async fn write_replacement(
     let opts = basin_storage::WriteOptions {
         bloom_filter_columns: meta.bloom_filter_columns.clone(),
         max_row_group_size: meta.row_group_rows,
-        cluster_columns: meta.cluster_columns.clone(),
+        // #204: default to the single-column PK when no explicit clustering
+        // is declared, so the rewritten (whole-file-merged) replacement is
+        // PK-sorted and its row-group / zone ranges are disjoint.
+        cluster_columns: if meta.cluster_columns.is_empty() {
+            meta.default_cluster_cols()
+        } else {
+            meta.cluster_columns.clone()
+        },
         // Phase 3: honour the table's persisted on-disk format so the
         // copy-on-write replacement file matches the rest of the table.
         // Defaults to Parquet (catalog default) — byte-identical to the
@@ -3884,7 +3891,13 @@ async fn write_replacement_per_file(
     let opts = Arc::new(basin_storage::WriteOptions {
         bloom_filter_columns: meta.bloom_filter_columns.clone(),
         max_row_group_size: meta.row_group_rows,
-        cluster_columns: meta.cluster_columns.clone(),
+        // #204: default to the single-column PK when no explicit clustering
+        // is declared (per-file rewrite still sorts each merged output file).
+        cluster_columns: if meta.cluster_columns.is_empty() {
+            meta.default_cluster_cols()
+        } else {
+            meta.cluster_columns.clone()
+        },
         file_format: crate::executor::map_file_format(meta.file_format),
         row_block_size: meta.row_block_size,
         bloom_columns: meta.global_sort_order.clone().unwrap_or_default(),
@@ -6817,6 +6830,197 @@ mod tests {
         assert!(
             out.is_none(),
             "UUID PK must fall back to full set (None): got {out:?}"
+        );
+    }
+
+    // ── #204: PK-sort drives point-query row-group pruning ──────────────────
+    //
+    // ROOT CAUSE the fix addresses: the Parquet reader already prunes
+    // row-groups whose `[min,max]` stats can't contain the `WHERE pk = $1`
+    // literal. But un-sorted cold files have every row-group spanning the
+    // whole key domain, so nothing prunes. Defaulting `cluster_columns` to the
+    // single-column PK makes the whole-file-sorted write produce DISJOINT
+    // per-row-group id ranges, so the existing prune isolates ~1 row-group.
+    //
+    // This test inserts rows in REVERSE PK order through the real INSERT write
+    // path (`write_options_for`) into ONE cold Parquet file with a small
+    // row-group cap, then runs a point query and asserts the reader pruned
+    // row-groups by stats — which is only possible if the file came out
+    // PK-sorted. Scale validation across 10k/100k/1M and the Vortex zone-map
+    // equivalent is deferred to #206 (Vortex exposes no per-zone prune counter
+    // today, so this Parquet counter is the unambiguous proof of the fix).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pk_sort_enables_point_query_row_group_prune() {
+        use std::sync::Arc;
+
+        use crate::{Engine, EngineConfig, ExecResult};
+        use arrow_array::Int64Array;
+        use basin_catalog::{Catalog, InMemoryCatalog};
+        use basin_common::{ProjectId, TableName};
+        use futures::StreamExt;
+        use object_store::local::LocalFileSystem;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
+            object_store: Arc::new(fs),
+            root_prefix: None,
+            // Caches off so each read is a deterministic decode and the
+            // row-group prune counter reflects the physical layout.
+            disk_cache: None,
+            page_cache: None,
+        });
+        let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+        let engine = Engine::new(EngineConfig {
+            storage,
+            catalog,
+            shard: None,
+        });
+
+        let project = ProjectId::new();
+        let table = TableName::new("pk_sort_t").unwrap();
+        let sess = engine.open_session(project).await.unwrap();
+
+        // Single-column integer PK — the prunable shape the policy targets.
+        // Force Parquet: the catalog default is Vortex, whose per-zone prune
+        // has no exposed counter today, so the row-group stats counter
+        // (`row_groups_pruned_by_stats`) is only observable on Parquet. The
+        // same PK-sort policy applies identically to Vortex zone-maps; its
+        // scale validation is deferred to #206.
+        sess.execute(
+            "CREATE TABLE pk_sort_t (id BIGINT PRIMARY KEY, payload TEXT) \
+             WITH (basin.file_format='parquet')",
+        )
+        .await
+        .unwrap();
+
+        // Force a small Parquet row-group cap so 4096 rows span multiple
+        // groups in a single file. This is the only knob `WITH (...)` doesn't
+        // expose at the SQL layer, so we set it on the catalog directly; it is
+        // read fresh by `write_options_for` on the next INSERT (the set bumps
+        // the catalog epoch, invalidating any cached metadata).
+        const ROWS: i64 = 4096;
+        const RG: usize = 512;
+        engine
+            .config()
+            .catalog
+            .set_row_group_rows(&project, &table, Some(RG))
+            .await
+            .unwrap();
+
+        // Confirm the policy decision before exercising it: with no explicit
+        // clustering and a single prunable PK, the default is exactly [id].
+        let meta = engine
+            .config()
+            .catalog
+            .load_table(&project, &table)
+            .await
+            .unwrap();
+        assert_eq!(
+            meta.default_cluster_cols(),
+            vec!["id".to_string()],
+            "single-column integer PK must auto-drive cluster_columns",
+        );
+
+        // Insert in REVERSE PK order in one statement → one cold file. If the
+        // write path did NOT sort by the PK, the row-groups would each span
+        // the full id domain and nothing could prune.
+        let tuples: Vec<String> = (0..ROWS)
+            .rev()
+            .map(|i| format!("({i}, 'p-{i:06}')"))
+            .collect();
+        sess.execute(&format!(
+            "INSERT INTO pk_sort_t VALUES {}",
+            tuples.join(",")
+        ))
+        .await
+        .unwrap();
+
+        // (1) End-to-end correctness through the engine's point-query path.
+        // NB: the engine takes a PK fastpath (OLTP / pk-row-cache) for
+        // `WHERE pk = $1` that bypasses the Parquet row-group reader, so this
+        // arm proves the answer is right but cannot observe the row-group
+        // prune counter — that is asserted in (2) below.
+        let mid = ROWS / 2;
+        let res = sess
+            .execute(&format!("SELECT id FROM pk_sort_t WHERE id = {mid}"))
+            .await
+            .unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+                assert_eq!(total, 1, "point query must return exactly one row");
+                let col = batches[0]
+                    .column_by_name("id")
+                    .expect("id column")
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id is Int64Array");
+                assert_eq!(col.value(0), mid, "returned the wrong row");
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+
+        // (2) The win: read the cold file the INSERT wrote back through the
+        // Parquet reader with the same `pk = mid` Eq predicate the planner
+        // pushes down, and assert the reader's min/max row-group pruning
+        // fired. This is the load-bearing assertion — it can ONLY pass if the
+        // file came out PK-sorted (so per-row-group [min,max] ranges are
+        // disjoint). The read path itself is unchanged by #204; sorting at
+        // write is what makes the existing prune effective.
+        let files = engine
+            .config()
+            .storage
+            .list_data_files(&project, &table)
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 1, "expected exactly one cold file");
+        let paths = vec![files[0].path.clone()];
+
+        engine.config().storage.read_counters().reset();
+        let opts = basin_storage::ReadOptions {
+            filters: vec![basin_storage::Predicate::Eq(
+                "id".to_string(),
+                basin_storage::ScalarValue::Int64(mid),
+            )],
+            ..Default::default()
+        };
+        let mut stream = engine
+            .config()
+            .storage
+            .read_paths_with_schema(&project, paths, opts, Some(meta.schema.clone()))
+            .await
+            .unwrap();
+        // Drain (and re-check correctness on the physical read path too).
+        let mut matched = 0usize;
+        while let Some(b) = stream.next().await {
+            let b = b.unwrap();
+            let col = b
+                .column_by_name("id")
+                .expect("id column")
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id is Int64Array");
+            for v in col.iter().flatten() {
+                if v == mid {
+                    matched += 1;
+                }
+            }
+        }
+        assert_eq!(matched, 1, "physical read must surface the one matching row");
+
+        // 4096 rows / 512-row groups = 8 row-groups; the point key lives in
+        // one, so a PK-sorted file lets the reader prune the other 7 by stats.
+        let c = engine.config().storage.read_counters().snapshot();
+        assert!(
+            c.row_groups_considered > 1,
+            "expected a multi-row-group file; counters were {c:?}",
+        );
+        assert!(
+            c.row_groups_pruned_by_stats > 0,
+            "PK-sorted cold file must let the reader prune row-groups by stats; \
+             counters were {c:?} (no prune ⇒ the file was not PK-sorted)",
         );
     }
 }
