@@ -1304,10 +1304,22 @@ impl InProcessShard {
             // disjoint so the reader's min/max prune isolates `WHERE pk = $1`.
             let (file_format, declared_cluster_cols, adaptive_sort_override,
                  gin_indexes, row_group_rows, row_block_size, promoted_paths,
-                 pk_default_cluster_cols) =
+                 pk_default_cluster_cols, bloom_cols) =
                 match self.cfg.catalog.load_table(project, &table).await {
                     Ok(m) => {
                         let pk_default = m.default_cluster_cols();
+                        // #212: bloom the single-column PK (plus any declared
+                        // sort-by columns, mirroring the engine INSERT path) so
+                        // `pk_point_probe` can rule compacted stripe files in or
+                        // out without opening them. Round-robin striping spreads
+                        // PKs across every stripe, so without per-file blooms a
+                        // point UPDATE's cold pre-image read visits ~all of them.
+                        let mut bloom = m.global_sort_order.clone().unwrap_or_default();
+                        if let [pk] = m.pk_columns.as_slice() {
+                            if !bloom.contains(pk) {
+                                bloom.push(pk.clone());
+                            }
+                        }
                         (
                             shard_map_file_format(m.file_format),
                             m.cluster_columns,
@@ -1317,6 +1329,7 @@ impl InProcessShard {
                             m.row_block_size,
                             m.promoted_jsonb_paths,
                             pk_default,
+                            bloom,
                         )
                     }
                     Err(_) => (
@@ -1326,6 +1339,7 @@ impl InProcessShard {
                         Vec::new(),
                         None,
                         None,
+                        Vec::new(),
                         Vec::new(),
                         Vec::new(),
                     ),
@@ -1385,6 +1399,7 @@ impl InProcessShard {
                 // with a smaller block size.
                 row_block_size,
                 max_row_group_size: row_group_rows,
+                bloom_columns: bloom_cols,
                 ..Default::default()
             };
             // ADR 0027 Phase 4 backfill: extend the merged batch with shadow
@@ -1404,7 +1419,7 @@ impl InProcessShard {
                 size_bytes: data_file.size_bytes,
                 row_count: data_file.row_count,
                 column_stats: data_file.column_stats.clone(),
-                bloom_filters: ::std::collections::BTreeMap::new(),
+                bloom_filters: data_file.bloom_filters.clone(),
                 hll_sketches: ::std::collections::BTreeMap::new(),
                 tdigest_sketches: ::std::collections::BTreeMap::new(),
             };

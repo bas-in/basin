@@ -1644,11 +1644,11 @@ async fn hot_tier_update_by_pk(
             .collect();
 
         let catalog_files = meta.live_data_files();
-        let pruned_paths: Option<std::collections::HashSet<String>> = match probe_scalars {
+        let pruned_paths: Option<std::collections::HashSet<String>> = match probe_scalars.as_ref() {
             Some(scalars) => {
                 let mut paths: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
-                for scalar in &scalars {
+                for scalar in scalars {
                     match crate::index_probe::pk_point_probe(
                         pk_col,
                         scalar,
@@ -1674,6 +1674,22 @@ async fn hot_tier_update_by_pk(
             None => None,
         };
 
+        // #212: single-key UPDATEs push an exact PK equality predicate into
+        // the cold file read. The reader turns it into within-file pruning
+        // (Parquet row-group stats/bloom/page prune, Vortex native zone
+        // maps), so a PK-sorted stripe file costs O(row-group) instead of
+        // O(file) — the dominant term at 1M rows where round-robin striping
+        // makes every candidate file ~10× bigger than at 100k. Multi-key
+        // UPDATEs keep the unfiltered scan: `ReadOptions::filters` is a
+        // conjunction, so per-key equality cannot express an OR across keys.
+        // The per-row PK match below remains the source of truth either way.
+        let single_eq: Option<basin_storage::Predicate> = match probe_scalars.as_deref() {
+            Some([scalar]) => {
+                Some(basin_storage::Predicate::Eq(pk_col.clone(), scalar.clone()))
+            }
+            _ => None,
+        };
+
         let data_files = storage.list_data_files_with_stats(&sess.project, table).await?;
         // Defense-in-depth (#94/#95): drop any files the cold-path
         // lister returned that the catalog already considers removed.
@@ -1690,7 +1706,20 @@ async fn hot_tier_update_by_pk(
                     continue;
                 }
             }
-            let mut stream = storage.read_file(&sess.project, &f.path).await?;
+            // No projection: the merge needs the FULL row image, so only the
+            // predicate (row-group / zone-map prune) is pushed down.
+            let mut stream = match single_eq.as_ref() {
+                Some(pred) => {
+                    let opts = basin_storage::ReadOptions {
+                        filters: vec![pred.clone()],
+                        ..Default::default()
+                    };
+                    storage
+                        .read_file_with_options(&sess.project, &f.path, opts)
+                        .await?
+                }
+                None => storage.read_file(&sess.project, &f.path).await?,
+            };
             while let Some(batch) = stream.next().await {
                 let batch = reattach_catalog_metadata(schema.as_ref(), batch?)?;
                 let pk_array = batch.column(pk_idx);
