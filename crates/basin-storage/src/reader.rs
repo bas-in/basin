@@ -870,8 +870,46 @@ async fn read_one(
         // `bytes.len()` is captured before moving `bytes` into the decoder.
         let size_bytes = bytes.len() as u64;
         let read_proj = vortex_read_projection(opts.as_ref());
+
+        // Filter pushdown drives Vortex's native zone-map chunk pruning. The
+        // type-safety gate in `vortex_filter_expr` needs the column's exact
+        // Arrow type, which normally comes from the catalog schema. But the
+        // schema-less read paths (`read_file_with_options`: the UPDATE
+        // pre-image / constraint-probe scans) pass `catalog_schema = None`,
+        // so WITHOUT a schema nothing is pushed — every surviving chunk then
+        // decodes in full and the predicate is applied only by the Arrow
+        // post-filter, defeating the prune. A Vortex file is self-describing,
+        // so we recover the physical Arrow schema from the file's own footer
+        // (reusing the footer cache — parse-free on a warm file) purely to
+        // type-check the pushdown. This is a pure optimisation: the inferred
+        // schema is used ONLY to decide what is safe to push, and we keep the
+        // Arrow post-filter pass ACTIVE whenever it drove the push (see
+        // `apply_filter` below), so the final row set is byte-identical to
+        // the no-pushdown path. Kill switch: `BASIN_VORTEX_SELECTIVE_DECODE_
+        // DISABLE=1` reverts to the prior (no inferred-schema push) behaviour.
+        let selective_decode_disabled =
+            std::env::var("BASIN_VORTEX_SELECTIVE_DECODE_DISABLE").as_deref() == Ok("1");
+        let inferred_schema: Option<Arc<Schema>> = if catalog_schema.is_none()
+            && !opts.filters.is_empty()
+            && !selective_decode_disabled
+        {
+            crate::vortex_format::infer_arrow_schema(
+                &bytes,
+                Some(&vortex_cache),
+                Some(&path),
+                size_bytes,
+            )
+            .ok()
+            .map(Arc::new)
+        } else {
+            None
+        };
+        let filter_schema: Option<&Schema> = match catalog_schema.as_deref() {
+            Some(s) => Some(s),
+            None => inferred_schema.as_deref(),
+        };
         let (push_filter, all_filters_pushed) =
-            vortex_filter_expr(&opts.filters, catalog_schema.as_deref());
+            vortex_filter_expr(&opts.filters, filter_schema);
         let (batches, decode_used_filter) = crate::vortex_format::decode_with_cache(
             bytes,
             schema,
@@ -884,8 +922,14 @@ async fn read_one(
         .await?;
         // Skip the Arrow re-filter only when Vortex handled ALL predicates
         // natively (all_filters_pushed) AND the scan actually ran with
-        // pushdown (decode_used_filter, i.e. did not fall back).
-        let apply_filter = !(all_filters_pushed && decode_used_filter);
+        // pushdown (decode_used_filter, i.e. did not fall back) AND we had the
+        // authoritative catalog schema. When the push was driven by the
+        // *inferred* file schema (no catalog), keep the post-filter active for
+        // defence in depth — it is cheap on the few surviving rows and removes
+        // any doubt about inferred-type vs catalog-type semantics, leaving this
+        // change a pure prune optimisation with an identical final row set.
+        let apply_filter =
+            !(all_filters_pushed && decode_used_filter && catalog_schema.is_some());
         let batches =
             vortex_project_and_filter(batches, opts.as_ref(), catalog_schema.as_ref(), apply_filter)?;
 

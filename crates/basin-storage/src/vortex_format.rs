@@ -414,6 +414,58 @@ pub(crate) async fn decode(
     }
 }
 
+/// Recover the Arrow schema a Vortex file describes itself with, normalised
+/// to Basin-canonical types (the same normalisation [`decode_inner`] applies
+/// to its inferred full schema — `Utf8View`/`BinaryView` → `Utf8`/`Binary`).
+///
+/// A Vortex file is self-describing: its footer carries the DType, so the
+/// schema is recoverable from the bytes alone, with no catalog. The footer
+/// cache is reused (and populated on miss) exactly as [`decode_with_cache`]
+/// does, so on a warm file this is a parse-free probe.
+///
+/// Callers that read a `.vortex` file *without* an authoritative catalog
+/// schema (e.g. the UPDATE pre-image / `read_file_with_options` path) use
+/// this to recover the physical column types so a point-read `Eq` predicate
+/// can be type-safe-pushed into the scan — which is what activates Vortex's
+/// native zone-map chunk pruning + selective (mask-applied) decode. Without
+/// it, no filter is pushed, every surviving chunk decodes in full, and the
+/// predicate is only applied by the Arrow post-filter pass.
+pub(crate) fn infer_arrow_schema(
+    bytes: &bytes::Bytes,
+    cache: Option<&crate::vortex_footer_cache::VortexFooterCache>,
+    path: Option<&object_store::path::Path>,
+    size_bytes: u64,
+) -> Result<Schema> {
+    let cached_footer = match (cache, path) {
+        (Some(c), Some(p)) => c.get(p, size_bytes),
+        _ => None,
+    };
+
+    let vf = if let Some(footer) = cached_footer {
+        session()
+            .open_options()
+            .with_footer(footer)
+            .open_buffer(bytes.clone())
+            .map_err(|e| {
+                BasinError::storage(format!("vortex: open_buffer (cached footer): {e}"))
+            })?
+    } else {
+        let vf = session()
+            .open_options()
+            .open_buffer(bytes.clone())
+            .map_err(|e| BasinError::storage(format!("vortex: open_buffer: {e}")))?;
+        if let (Some(c), Some(p)) = (cache, path) {
+            c.insert(p.clone(), size_bytes, vf.footer().clone());
+        }
+        vf
+    };
+
+    let inferred = vf.dtype().to_arrow_schema().map_err(|e| {
+        BasinError::storage(format!("vortex: infer arrow schema from file dtype: {e}"))
+    })?;
+    Ok(normalize_view_types_schema(&inferred))
+}
+
 /// Like [`decode`] but threads a [`VortexFooterCache`] through so repeated
 /// queries to the same physical file skip the per-file flatbuffer footer parse.
 ///
@@ -1054,5 +1106,245 @@ mod tests {
             g_flag, o_flag,
             "Boolean incl. nulls must round-trip self-describing"
         );
+    }
+
+    // ---- Selective-decode / pushed-filter equivalence ----------------------
+    //
+    // These prove that reading a Vortex file with an `Eq` filter pushed into
+    // the scan (which drives zone-map chunk pruning + Vortex's mask-applied
+    // selective decode) yields the EXACT row set the unfiltered decode would
+    // yield after an Arrow post-filter. The pushed path is a pure
+    // optimisation; the assertion is row-set equality, never just row count.
+
+    /// A wide multi-chunk fixture: `n` rows of (id Int64 PK, name Utf8 nullable,
+    /// val Float64), encoded with a tiny `row_block_size` so the file is split
+    /// into several Vortex chunks. `null_ids` get a NULL name to exercise the
+    /// NULL-in-filter-column case.
+    fn multi_chunk_batch(n: i64, null_ids: &[i64]) -> (Arc<Schema>, RecordBatch) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("val", DataType::Float64, false),
+        ]));
+        let ids: Vec<i64> = (0..n).collect();
+        let names: Vec<Option<String>> = (0..n)
+            .map(|i| {
+                if null_ids.contains(&i) {
+                    None
+                } else {
+                    Some(format!("row-{i}"))
+                }
+            })
+            .collect();
+        let vals: Vec<f64> = (0..n).map(|i| i as f64 * 1.5).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(names)),
+                Arc::new(Float64Array::from(vals)),
+            ],
+        )
+        .expect("build multi-chunk batch");
+        (schema, batch)
+    }
+
+    /// Collect all `id` values present across a set of decoded batches, in
+    /// order — the canonical "row set" projection used for equivalence checks.
+    fn ids_of(batches: &[RecordBatch]) -> Vec<i64> {
+        let mut out = Vec::new();
+        for b in batches {
+            let col = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id Int64");
+            for i in 0..col.len() {
+                out.push(col.value(i));
+            }
+        }
+        out
+    }
+
+    /// Decode WITHOUT any pushdown, then apply an `id == target` filter in
+    /// Arrow — the reference row set the pushed-filter decode must match.
+    async fn reference_eq_ids(bytes: &bytes::Bytes, schema: &Arc<Schema>, target: i64) -> Vec<i64> {
+        let (batches, _) = decode(bytes.clone(), Some(schema.clone()), None, None)
+            .await
+            .expect("reference full decode");
+        let mut out = Vec::new();
+        for b in &batches {
+            let col = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id Int64");
+            for i in 0..col.len() {
+                if !col.is_null(i) && col.value(i) == target {
+                    out.push(col.value(i));
+                }
+            }
+        }
+        out
+    }
+
+    /// Drive the pushed-filter decode for `id == target` and return the
+    /// resulting `id` row set.
+    async fn pushed_eq_ids(bytes: &bytes::Bytes, schema: &Arc<Schema>, target: i64) -> Vec<i64> {
+        use vortex_array::expr::{col, eq, lit};
+        let filter = eq(col("id"), lit(target));
+        let (batches, used_filter) = decode(bytes.clone(), Some(schema.clone()), None, Some(filter))
+            .await
+            .expect("pushed-filter decode");
+        assert!(used_filter, "decode must report the filter was used (no fallback)");
+        ids_of(&batches)
+    }
+
+    /// Match in the FIRST chunk vs match in the LAST chunk: both must return
+    /// exactly the one matching row, identical to the Arrow-filtered reference.
+    #[tokio::test]
+    async fn pushed_eq_first_and_last_chunk_match() {
+        let (schema, batch) = multi_chunk_batch(5000, &[]);
+        // row_block_size = 512 -> ~10 chunks.
+        let bytes = bytes::Bytes::from(encode(&batch, Some(512)).await.expect("encode"));
+
+        for target in [3i64, 4999i64] {
+            let mut got = pushed_eq_ids(&bytes, &schema, target).await;
+            let mut want = reference_eq_ids(&bytes, &schema, target).await;
+            got.sort_unstable();
+            want.sort_unstable();
+            assert_eq!(want, vec![target], "reference must isolate exactly the target");
+            assert_eq!(got, want, "pushed Eq row set must equal Arrow-filtered reference (target={target})");
+        }
+    }
+
+    /// No matching row anywhere: pushed decode must yield an empty row set,
+    /// matching the empty Arrow-filtered reference.
+    #[tokio::test]
+    async fn pushed_eq_no_match() {
+        let (schema, batch) = multi_chunk_batch(2000, &[]);
+        let bytes = bytes::Bytes::from(encode(&batch, Some(256)).await.expect("encode"));
+
+        let got = pushed_eq_ids(&bytes, &schema, 999_999).await;
+        let want = reference_eq_ids(&bytes, &schema, 999_999).await;
+        assert!(want.is_empty(), "reference must be empty for an absent key");
+        assert_eq!(got, want, "pushed Eq must yield the same empty row set");
+    }
+
+    /// NULL values in a non-filter column must not perturb an Eq filter on the
+    /// PK: the matching row (whose name is NULL) is still returned exactly.
+    #[tokio::test]
+    async fn pushed_eq_with_nulls_in_payload() {
+        // Make the target row's name NULL, plus some other NULLs.
+        let target = 1234i64;
+        let (schema, batch) = multi_chunk_batch(3000, &[0, 1, target, 2999]);
+        let bytes = bytes::Bytes::from(encode(&batch, Some(300)).await.expect("encode"));
+
+        let got = pushed_eq_ids(&bytes, &schema, target).await;
+        let want = reference_eq_ids(&bytes, &schema, target).await;
+        assert_eq!(want, vec![target], "reference must isolate the (NULL-name) target");
+        assert_eq!(got, want, "pushed Eq must match exactly even when payload column is NULL");
+    }
+
+    /// Multiple matching rows for the same key: the pushed decode must return
+    /// every match, in the same set as the Arrow-filtered reference.
+    #[tokio::test]
+    async fn pushed_eq_multiple_matches() {
+        // Build a batch where id repeats: id = i % 100, so key 7 appears 30x.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("val", DataType::Float64, false),
+        ]));
+        let n = 3000i64;
+        let ids: Vec<i64> = (0..n).map(|i| i % 100).collect();
+        let vals: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let expected_count = ids.iter().filter(|&&v| v == 7).count();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(ids)), Arc::new(Float64Array::from(vals))],
+        )
+        .expect("build repeated-key batch");
+        let bytes = bytes::Bytes::from(encode(&batch, Some(256)).await.expect("encode"));
+
+        let mut got = pushed_eq_ids(&bytes, &schema, 7).await;
+        let mut want = reference_eq_ids(&bytes, &schema, 7).await;
+        got.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(want.len(), expected_count, "reference must find every duplicate");
+        assert_eq!(got, want, "pushed Eq must return every matching row");
+    }
+
+    /// String PK Eq: Basin does NOT push string predicates into Vortex (the
+    /// dtype-compare panic risk), so the scan runs unfiltered and the engine
+    /// post-filters. Reading with no pushed filter and applying the predicate
+    /// in Arrow must still isolate exactly the matching row — this guards the
+    /// non-pushed branch the selective-decode optimisation deliberately leaves
+    /// to the Arrow post-filter.
+    #[tokio::test]
+    async fn string_pk_eq_post_filter_equivalence() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("sk", DataType::Utf8, false),
+            Field::new("val", DataType::Float64, false),
+        ]));
+        let n = 2000i64;
+        let keys: Vec<String> = (0..n).map(|i| format!("k-{i:06}")).collect();
+        let vals: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(keys)),
+                Arc::new(Float64Array::from(vals)),
+            ],
+        )
+        .expect("build string-pk batch");
+        let bytes = bytes::Bytes::from(encode(&batch, Some(256)).await.expect("encode"));
+
+        // No filter pushed (mirrors `vortex_filter_expr` declining strings);
+        // full decode then Arrow-filter on the string key.
+        let (batches, _) = decode(bytes, Some(schema.clone()), None, None)
+            .await
+            .expect("string-pk full decode");
+        let target = "k-001234";
+        let mut matched: Vec<String> = Vec::new();
+        for b in &batches {
+            let col = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("sk Utf8");
+            for i in 0..col.len() {
+                if !col.is_null(i) && col.value(i) == target {
+                    matched.push(col.value(i).to_string());
+                }
+            }
+        }
+        assert_eq!(matched, vec![target.to_string()], "string-PK Eq must isolate exactly one row via Arrow post-filter");
+    }
+
+    /// `infer_arrow_schema` recovers the physical column types from the file
+    /// footer alone (no catalog) — this is what lets the schema-less read path
+    /// type-check an Int64 PK Eq and push it. Names + canonical types must
+    /// match the original schema (view-normalised).
+    #[tokio::test]
+    async fn infer_arrow_schema_recovers_types() {
+        let (schema, batch) = multi_chunk_batch(64, &[]);
+        let bytes = bytes::Bytes::from(encode(&batch, Some(16)).await.expect("encode"));
+
+        let inferred = infer_arrow_schema(&bytes, None, None, 0).expect("infer schema");
+        let names: Vec<&str> = inferred.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["id", "name", "val"], "names recovered from footer");
+        assert_eq!(
+            inferred.field_with_name("id").unwrap().data_type(),
+            &DataType::Int64,
+            "Int64 PK type must be recoverable for pushdown type-check"
+        );
+        assert_eq!(
+            inferred.field_with_name("name").unwrap().data_type(),
+            &DataType::Utf8,
+            "Utf8View must be normalised to canonical Utf8"
+        );
+        // Sanity: the recovered schema agrees with the original (modulo
+        // metadata, which Vortex drops).
+        assert_eq!(inferred.fields().len(), schema.fields().len());
     }
 }
