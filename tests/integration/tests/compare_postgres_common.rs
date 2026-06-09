@@ -2786,8 +2786,8 @@ async fn run_robustness_suite(
     }
 }
 
-/// Carrier for the 15 OLTP-extra (Basin, PG) p50 pairs (#63-#77). Same
-/// `(Option<f64>, f64)` / "(basin gap)" convention as the other suites.
+/// Carrier for the 21 OLTP-extra (Basin, PG) p50 pairs (#63-#77 + #90-#95).
+/// Same `(Option<f64>, f64)` / "(basin gap)" convention as the other suites.
 ///
 /// Coverage rationale per shape (closes the OLTP gaps in the existing 62
 /// metric set):
@@ -2827,6 +2827,29 @@ async fn run_robustness_suite(
 ///                           ON CONFLICT DO UPDATE; the batch-upsert
 ///                           shape (sqlx/ORM bulk sync), vs #63's
 ///                           single-row upsert.
+///   #90 select_for_update — BEGIN; SELECT … FOR UPDATE; UPDATE; COMMIT —
+///                           the row-lock-then-mutate txn an ORM emits for
+///                           a guarded read-modify-write. Multi-statement
+///                           (cannot use pair); timed as a whole txn like
+///                           the #41/#43 BEGIN..COMMIT shapes.
+///   #91 bulk_delete_range — DELETE WHERE id BETWEEN … on a dedicated 1k-row
+///                           scratch table re-seeded per measurement.
+///                           Destructive → single timed run (mirrors the
+///                           bulk-UPDATE single-shot convention of #8).
+///   #92 fk_cascade_delete — parent/child tables with ON DELETE CASCADE;
+///                           DELETE FROM parent cascades to children.
+///                           Single-shot; if Basin rejects the FK DDL the
+///                           shape is a GAP.
+///   #93 in_list_1000      — WHERE id IN (1000 literals) — 10x the #64
+///                           IN-list, stresses IN-list planning.
+///   #94 count_filtered_low_card — selective, zone-map-prunable COUNT(*) on a
+///                           status filter. The spec names 'paid' but
+///                           `status_for` never emits it (would match 0
+///                           rows); we use 'completed' (a real 1-in-4 value)
+///                           so the prune runs against actual matching
+///                           row-groups, not against everything.
+///   #95 point_join_lookup — point query + FK hydrate (events ⋈ users on
+///                           e.id = mid-key) — the canonical ORM load.
 ///
 /// Per-shape stability:
 ///   - #63 / #67 / #75 / #76 / #77 are write shapes. Each PG EXPLAIN
@@ -2856,15 +2879,31 @@ struct OltpExtraResults {
     insert_returning: (Option<f64>, f64),
     update_returning: (Option<f64>, f64),
     bulk_upsert_50: (Option<f64>, f64),
+    // -- #90-#95: second OLTP-extra batch --------------------------------
+    select_for_update: (Option<f64>, f64),
+    bulk_delete_range: (Option<f64>, f64),
+    fk_cascade_delete: (Option<f64>, f64),
+    in_list_1000: (Option<f64>, f64),
+    count_filtered_low_card: (Option<f64>, f64),
+    point_join_lookup: (Option<f64>, f64),
 }
 
-/// Run the 15 OLTP-extra probes (#63-#77) on PG + Basin.
+/// Run the 21 OLTP-extra probes (#63-#77 + #90-#95) on PG + Basin.
 ///
 /// Same stack-budget extraction pattern as `run_extended_suite`. Both
 /// engines see identical schema + seed on a scratch `oltp_extra` table so
 /// the write shapes (#63 upsert, #67 conditional update, #75-#77
-/// RETURNING/bulk-upsert) can mutate freely without touching the earlier
-/// `events`/`users` measurements.
+/// RETURNING/bulk-upsert, #90 FOR-UPDATE txn) can mutate freely without
+/// touching the earlier `events`/`users` measurements. The destructive
+/// batch-2 shapes (#91 bulk-delete, #92 FK-cascade) use their OWN dedicated
+/// scratch tables (`del_scratch`, `fk_parent`/`fk_child`) re-seeded per
+/// measurement, so they never disturb `oltp_extra` either. The read-only
+/// batch-2 shapes (#93/#94/#95) query the seeded `events`/`users` tables.
+///
+/// Most shapes go through the shared `pair()` helper; the multi-statement
+/// txn (#90) and the destructive single-shot writes (#91/#92) time the whole
+/// operation directly (no `pair()`), mirroring the BEGIN..COMMIT timing of
+/// #41/#43 and the single-shot bulk-UPDATE convention of #8.
 ///
 /// Fairness invariant: every shape goes through the shared `pair()` helper
 /// → same sample count from `samples_for(rows, 5)`, same PG-via-EXPLAIN-ANALYZE
@@ -3327,6 +3366,332 @@ async fn run_oltp_extra_suite(
         (b, p)
     };
 
+    // =======================================================================
+    // Second OLTP-extra batch (#90-#95). These shapes either span multiple
+    // statements (so they cannot go through the single-`pair()` helper) or
+    // are destructive single-shot writes (mirroring #8 / the bulk-UPDATE
+    // convention). Each Basin failure → Option::None → GAP, never a panic.
+    // =======================================================================
+
+    // -- #90 SELECT ... FOR UPDATE then UPDATE inside one txn ----------------
+    // BEGIN; SELECT * FROM <scratch> WHERE id = 7 FOR UPDATE; UPDATE … +1;
+    // COMMIT. The whole txn is timed (multi-statement, so no `pair()`), the
+    // same way #41/#43 time a BEGIN..COMMIT block directly. Idempotent across
+    // EXPLAIN-equivalent re-runs only in effect-direction (amount keeps
+    // incrementing), but we run it once per call so the small drift is
+    // immaterial to the timing. Basin tolerates a missing FOR UPDATE
+    // (optimistic concurrency, ADR 0026) — if any statement errors the shape
+    // records a gap. Operates on the seeded `oltp_extra` scratch table.
+    let select_for_update = {
+        let pg_ms = if pg_scratch_ok {
+            let started = Instant::now();
+            let mut ok = pg.simple_query("BEGIN").await.is_ok();
+            ok &= pg
+                .simple_query(&format!(
+                    "SELECT * FROM {schema}.oltp_extra WHERE id = 7 FOR UPDATE"
+                ))
+                .await
+                .is_ok();
+            ok &= pg
+                .simple_query(&format!(
+                    "UPDATE {schema}.oltp_extra SET amount = amount + 1 WHERE id = 7"
+                ))
+                .await
+                .is_ok();
+            ok &= pg.simple_query("COMMIT").await.is_ok();
+            if ok {
+                started.elapsed().as_secs_f64() * 1000.0
+            } else {
+                let _ = pg.simple_query("ROLLBACK").await;
+                f64::INFINITY
+            }
+        } else {
+            f64::INFINITY
+        };
+        let basin_ms = if basin_scratch_ok {
+            let started = Instant::now();
+            let mut ok = sess.execute("BEGIN").await.is_ok();
+            ok &= sess
+                .execute("SELECT * FROM oltp_extra WHERE id = 7 FOR UPDATE")
+                .await
+                .is_ok();
+            ok &= sess
+                .execute("UPDATE oltp_extra SET amount = amount + 1 WHERE id = 7")
+                .await
+                .is_ok();
+            ok &= sess.execute("COMMIT").await.is_ok();
+            if ok {
+                Some(started.elapsed().as_secs_f64() * 1000.0)
+            } else {
+                let _ = sess.execute("ROLLBACK").await;
+                None
+            }
+        } else {
+            None
+        };
+        (basin_ms, pg_ms)
+    };
+
+    // -- #91 Bulk DELETE over a key range ------------------------------------
+    // Destructive, so a single timed run per side after a fresh re-seed (the
+    // bulk-UPDATE single-shot convention of #8 — no median, just one
+    // wall-clock measurement). A dedicated cheap 1k-row table (`del_scratch`)
+    // is created + seeded here so the DELETE never touches the shared
+    // `oltp_extra`/`events` keyspace. DELETE … WHERE id BETWEEN 100 AND 400.
+    let bulk_delete_range = {
+        let pg_del_ok = {
+            let _ = pg
+                .simple_query(&format!("DROP TABLE IF EXISTS {schema}.del_scratch"))
+                .await;
+            let ddl = pg
+                .simple_query(&format!(
+                    "CREATE TABLE {schema}.del_scratch (id BIGINT PRIMARY KEY, v BIGINT)"
+                ))
+                .await
+                .is_ok();
+            if ddl {
+                let mut stmt = String::with_capacity(1000 * 16);
+                stmt.push_str(&format!(
+                    "INSERT INTO {schema}.del_scratch (id, v) VALUES "
+                ));
+                for i in 0..1000i64 {
+                    if i > 0 {
+                        stmt.push(',');
+                    }
+                    stmt.push_str(&format!("({i}, {i})"));
+                }
+                pg.simple_query(&stmt).await.is_ok()
+            } else {
+                false
+            }
+        };
+        let pg_ms = if pg_del_ok {
+            let started = Instant::now();
+            let ok = pg
+                .simple_query(&format!(
+                    "DELETE FROM {schema}.del_scratch WHERE id BETWEEN 100 AND 400"
+                ))
+                .await
+                .is_ok();
+            if ok {
+                started.elapsed().as_secs_f64() * 1000.0
+            } else {
+                f64::INFINITY
+            }
+        } else {
+            f64::INFINITY
+        };
+        let basin_del_ok = {
+            let _ = sess.execute("DROP TABLE IF EXISTS del_scratch").await;
+            let ddl = sess
+                .execute("CREATE TABLE del_scratch (id BIGINT NOT NULL PRIMARY KEY, v BIGINT)")
+                .await
+                .is_ok();
+            if ddl {
+                let mut stmt = String::with_capacity(1000 * 16);
+                stmt.push_str("INSERT INTO del_scratch (id, v) VALUES ");
+                for i in 0..1000i64 {
+                    if i > 0 {
+                        stmt.push(',');
+                    }
+                    stmt.push_str(&format!("({i}, {i})"));
+                }
+                sess.execute(&stmt).await.is_ok()
+            } else {
+                false
+            }
+        };
+        let basin_ms = if basin_del_ok {
+            let started = Instant::now();
+            match sess
+                .execute("DELETE FROM del_scratch WHERE id BETWEEN 100 AND 400")
+                .await
+            {
+                Ok(_) => Some(started.elapsed().as_secs_f64() * 1000.0),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        (basin_ms, pg_ms)
+    };
+
+    // -- #92 FK ON DELETE CASCADE --------------------------------------------
+    // Parent/child tables with a FOREIGN KEY ... ON DELETE CASCADE. Seed one
+    // parent + several children, then DELETE the parent and let the cascade
+    // remove the children. Single-shot (destructive). If Basin rejects the
+    // FK DDL the shape is a GAP — we still run PG so the dashboard has a
+    // reference number. Distinct names (`fk_parent`/`fk_child`) avoid any
+    // collision with the other scratch tables.
+    let fk_cascade_delete = {
+        let pg_fk_ok = {
+            let _ = pg
+                .simple_query(&format!("DROP TABLE IF EXISTS {schema}.fk_child"))
+                .await;
+            let _ = pg
+                .simple_query(&format!("DROP TABLE IF EXISTS {schema}.fk_parent"))
+                .await;
+            let p_ddl = pg
+                .simple_query(&format!(
+                    "CREATE TABLE {schema}.fk_parent (id BIGINT PRIMARY KEY, name TEXT)"
+                ))
+                .await
+                .is_ok();
+            let c_ddl = pg
+                .simple_query(&format!(
+                    "CREATE TABLE {schema}.fk_child (\
+                        id BIGINT PRIMARY KEY, \
+                        parent_id BIGINT REFERENCES {schema}.fk_parent(id) ON DELETE CASCADE, \
+                        v BIGINT)"
+                ))
+                .await
+                .is_ok();
+            let seed_ok = if p_ddl && c_ddl {
+                let mut ok = pg
+                    .simple_query(&format!(
+                        "INSERT INTO {schema}.fk_parent (id, name) VALUES (1, 'root')"
+                    ))
+                    .await
+                    .is_ok();
+                let mut stmt = String::with_capacity(50 * 24);
+                stmt.push_str(&format!(
+                    "INSERT INTO {schema}.fk_child (id, parent_id, v) VALUES "
+                ));
+                for k in 0..50i64 {
+                    if k > 0 {
+                        stmt.push(',');
+                    }
+                    stmt.push_str(&format!("({k}, 1, {k})"));
+                }
+                ok &= pg.simple_query(&stmt).await.is_ok();
+                ok
+            } else {
+                false
+            };
+            p_ddl && c_ddl && seed_ok
+        };
+        let pg_ms = if pg_fk_ok {
+            let started = Instant::now();
+            let ok = pg
+                .simple_query(&format!("DELETE FROM {schema}.fk_parent WHERE id = 1"))
+                .await
+                .is_ok();
+            if ok {
+                started.elapsed().as_secs_f64() * 1000.0
+            } else {
+                f64::INFINITY
+            }
+        } else {
+            f64::INFINITY
+        };
+        // Basin: same DDL. If the FK / ON DELETE CASCADE clause is rejected the
+        // setup fails → None → GAP. Drop in child-then-parent order so a
+        // re-run never trips a dangling reference.
+        let basin_fk_ok = {
+            let _ = sess.execute("DROP TABLE IF EXISTS fk_child").await;
+            let _ = sess.execute("DROP TABLE IF EXISTS fk_parent").await;
+            let p_ddl = sess
+                .execute("CREATE TABLE fk_parent (id BIGINT NOT NULL PRIMARY KEY, name TEXT)")
+                .await
+                .is_ok();
+            let c_ddl = if p_ddl {
+                sess.execute(
+                    "CREATE TABLE fk_child (\
+                        id BIGINT NOT NULL PRIMARY KEY, \
+                        parent_id BIGINT REFERENCES fk_parent(id) ON DELETE CASCADE, \
+                        v BIGINT)",
+                )
+                .await
+                .is_ok()
+            } else {
+                false
+            };
+            if p_ddl && c_ddl {
+                let mut ok = sess
+                    .execute("INSERT INTO fk_parent (id, name) VALUES (1, 'root')")
+                    .await
+                    .is_ok();
+                let mut stmt = String::with_capacity(50 * 24);
+                stmt.push_str("INSERT INTO fk_child (id, parent_id, v) VALUES ");
+                for k in 0..50i64 {
+                    if k > 0 {
+                        stmt.push(',');
+                    }
+                    stmt.push_str(&format!("({k}, 1, {k})"));
+                }
+                ok &= sess.execute(&stmt).await.is_ok();
+                ok
+            } else {
+                false
+            }
+        };
+        let basin_ms = if basin_fk_ok {
+            let started = Instant::now();
+            match sess.execute("DELETE FROM fk_parent WHERE id = 1").await {
+                Ok(_) => Some(started.elapsed().as_secs_f64() * 1000.0),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        (basin_ms, pg_ms)
+    };
+
+    // -- #93 IN-list with 1000 literals --------------------------------------
+    // 10x the #64 large_in_list. Spreads 1000 ids across the events keyspace
+    // (stride keeps them in-range at every scale) so the planner can't fold
+    // the list to a range. Read-only → routed through the shared `pair()`.
+    let stride_1000 = (rows as i64 / 1000).max(1);
+    let in_list_1k: String = (0..1000i64)
+        .map(|k| ((k * stride_1000) % (rows as i64).max(1)).to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let in_list_1000 = pair(
+        pg,
+        sess,
+        format!("SELECT id, user_id, amount FROM {schema}.events WHERE id IN ({in_list_1k})"),
+        &format!("SELECT id, user_id, amount FROM events WHERE id IN ({in_list_1k})"),
+        n,
+    )
+    .await;
+
+    // -- #94 Selective low-card COUNT ----------------------------------------
+    // `COUNT(*) WHERE status = '…'` — a zone-map-prunable selective count.
+    // The spec names 'paid', but `status_for` only ever emits
+    // pending/active/completed/archived, so we use 'completed' (a real
+    // 1-in-4 value) — same selective-count execution shape, but non-empty so
+    // the prune is exercised against actual matching row-groups rather than
+    // pruning everything. Read-only → shared `pair()`.
+    let count_filtered_low_card = pair(
+        pg,
+        sess,
+        format!("SELECT COUNT(*) FROM {schema}.events WHERE status = 'completed'"),
+        "SELECT COUNT(*) FROM events WHERE status = 'completed'",
+        n,
+    )
+    .await;
+
+    // -- #95 Point query + FK hydrate ----------------------------------------
+    // `SELECT e.*, u.email FROM events e JOIN users u ON e.user_id = u.id
+    //  WHERE e.id = <mid-key>` — the canonical ORM "load entity + its parent"
+    // round trip: a single-row point lookup that then hydrates the FK target.
+    // mid-key id is in-range at every scale so it always matches one row.
+    let point_join_id = (rows as i64) / 2;
+    let point_join_lookup = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT e.*, u.email FROM {schema}.events e \
+             JOIN {schema}.users u ON e.user_id = u.id WHERE e.id = {point_join_id}"
+        ),
+        &format!(
+            "SELECT e.*, u.email FROM events e \
+             JOIN users u ON e.user_id = u.id WHERE e.id = {point_join_id}"
+        ),
+        n,
+    )
+    .await;
+
     OltpExtraResults {
         upsert,
         large_in_list,
@@ -3343,6 +3708,329 @@ async fn run_oltp_extra_suite(
         insert_returning,
         update_returning,
         bulk_upsert_50,
+        select_for_update,
+        bulk_delete_range,
+        fk_cascade_delete,
+        in_list_1000,
+        count_filtered_low_card,
+        point_join_lookup,
+    }
+}
+
+/// Carrier for the 12 OLAP (Basin, PG) p50 pairs (#78-#89). Same
+/// `(Option<f64>, f64)` / "(basin gap)" convention as the extended / oltp-extra
+/// suites: Basin `None` → a "(basin gap)" dashboard row, PG `f64::INFINITY` →
+/// "(pg failed)". These are the analytical shapes a columnar engine is built
+/// for — multi-dimensional rollups, ordered-set aggregates, window frames,
+/// high-cardinality grouping, star-schema joins.
+///
+/// Coverage rationale (closes the OLAP gaps in the existing metric set; the
+/// core suite has only day-trunc rollup + a 2-/3-table join):
+///   #78 rollup_agg            — GROUP BY ROLLUP(status, user_id%10): hierarchical
+///                               subtotals + grand total in one pass.
+///   #79 cube_agg              — GROUP BY CUBE(…): all 2^n grouping combinations.
+///   #80 grouping_sets         — explicit GROUPING SETS ((a),(b),()): arbitrary
+///                               grouping tuples, the general form of #78/#79.
+///   #81 percentile_cont       — PERCENTILE_CONT(0.5) WITHIN GROUP — ordered-set
+///                               aggregate (median per status), not a plain agg.
+///   #82 window_frame_rows     — SUM OVER (… ROWS BETWEEN 5 PRECEDING AND CURRENT
+///                               ROW): a bounded moving-window frame.
+///   #83 topn_per_group_window — ROW_NUMBER() partition filter rn<=3: the classic
+///                               "top-3 per group" analytic.
+///   #84 high_card_groupby     — GROUP BY user_id with NO limit: full
+///                               materialisation at user-cardinality.
+///   #85 approx_distinct       — status, COUNT(DISTINCT user_id) GROUP BY status:
+///                               distinct-within-groups (distinct from the
+///                               table-wide COUNT DISTINCT in #16).
+///   #86 full_sort_high_card   — ORDER BY amount DESC, id LIMIT 1000: deep
+///                               top-K sort over wide rows.
+///   #87 case_pivot            — SUM(CASE WHEN status=…) per user: manual pivot.
+///   #88 star_join_agg         — 3-way events ⋈ users ⋈ categories star join +
+///                               GROUP BY + ORDER BY + LIMIT.
+///   #89 delta_window_lag_filter — amount - LAG(amount) … then post-filter
+///                               delta>100: window expression in a derived
+///                               table with an outer predicate.
+struct OlapResults {
+    rollup_agg: (Option<f64>, f64),
+    cube_agg: (Option<f64>, f64),
+    grouping_sets: (Option<f64>, f64),
+    percentile_cont: (Option<f64>, f64),
+    window_frame_rows: (Option<f64>, f64),
+    topn_per_group_window: (Option<f64>, f64),
+    high_card_groupby: (Option<f64>, f64),
+    approx_distinct: (Option<f64>, f64),
+    full_sort_high_card: (Option<f64>, f64),
+    case_pivot: (Option<f64>, f64),
+    star_join_agg: (Option<f64>, f64),
+    delta_window_lag_filter: (Option<f64>, f64),
+}
+
+/// Run the 12 OLAP probes (#78-#89) on PG + Basin. Same stack-budget
+/// extraction + shared `pair()` helper as `run_extended_suite` /
+/// `run_oltp_extra_suite`: every shape times PG via EXPLAIN ANALYZE median and
+/// Basin via `basin_p50_try` median over `samples_for(rows, 5)` iterations,
+/// and the SQL is byte-identical on both sides modulo the `{schema}.` prefix.
+///
+/// All shapes are read-only over the seeded `events` / `users` / `categories`
+/// tables, so the suite is freely re-runnable and order-independent with
+/// respect to the other read suites. Standard SQL is used on BOTH sides for
+/// the multi-dimensional aggregates (ROLLUP / CUBE / GROUPING SETS) so neither
+/// engine gets a syntax handicap.
+async fn run_olap_suite(
+    pg: &Client,
+    sess: &basin_engine::ProjectSession,
+    schema: &str,
+    rows: usize,
+) -> OlapResults {
+    let n = samples_for(rows, 5);
+
+    async fn pair(
+        pg: &Client,
+        sess: &basin_engine::ProjectSession,
+        pg_sql: String,
+        basin_sql: &str,
+        n: usize,
+    ) -> (Option<f64>, f64) {
+        let p = pg_p50_explain(pg, &pg_sql, n)
+            .await
+            .unwrap_or(f64::INFINITY);
+        let b = basin_p50_try(sess, basin_sql, n).await;
+        (b, p)
+    }
+
+    // -- #78 ROLLUP aggregate ----------------------------------------------
+    // Hierarchical subtotals: per (status, user_id%10), per status, and the
+    // grand total — all in one pass. `user_id % 10` is repeated in the
+    // SELECT and the ROLLUP so PG and DataFusion both group on the expression.
+    let rollup_agg = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT status, user_id % 10, SUM(amount) FROM {schema}.events \
+             GROUP BY ROLLUP(status, user_id % 10)"
+        ),
+        "SELECT status, user_id % 10, SUM(amount) FROM events \
+         GROUP BY ROLLUP(status, user_id % 10)",
+        n,
+    )
+    .await;
+
+    // -- #79 CUBE aggregate -------------------------------------------------
+    // All 2^2 grouping combinations of (status, user_id%10).
+    let cube_agg = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT status, user_id % 10, SUM(amount) FROM {schema}.events \
+             GROUP BY CUBE(status, user_id % 10)"
+        ),
+        "SELECT status, user_id % 10, SUM(amount) FROM events \
+         GROUP BY CUBE(status, user_id % 10)",
+        n,
+    )
+    .await;
+
+    // -- #80 GROUPING SETS --------------------------------------------------
+    // Explicit grouping tuples: by status, by user_id%10, and the grand
+    // total (the empty set). The general form behind ROLLUP/CUBE.
+    let grouping_sets = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT status, user_id % 10, SUM(amount) FROM {schema}.events \
+             GROUP BY GROUPING SETS ((status), (user_id % 10), ())"
+        ),
+        "SELECT status, user_id % 10, SUM(amount) FROM events \
+         GROUP BY GROUPING SETS ((status), (user_id % 10), ())",
+        n,
+    )
+    .await;
+
+    // -- #81 PERCENTILE_CONT (ordered-set aggregate) ------------------------
+    // Median amount per status. An ordered-set aggregate — a distinct plan
+    // node from the hash-aggregate path; surfaces it as a gap if unsupported.
+    let percentile_cont = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT status, PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY amount) \
+             FROM {schema}.events GROUP BY status"
+        ),
+        "SELECT status, PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY amount) \
+         FROM events GROUP BY status",
+        n,
+    )
+    .await;
+
+    // -- #82 Window frame (ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) --------
+    // A bounded moving-window SUM per user, ordered by time. LIMIT bounds the
+    // output so the timing isn't dominated by materialising the whole table.
+    let window_frame_rows = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT id, user_id, \
+                    SUM(amount) OVER (PARTITION BY user_id ORDER BY created_at \
+                        ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS moving_sum \
+             FROM {schema}.events LIMIT 1000"
+        ),
+        "SELECT id, user_id, \
+                SUM(amount) OVER (PARTITION BY user_id ORDER BY created_at \
+                    ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS moving_sum \
+         FROM events LIMIT 1000",
+        n,
+    )
+    .await;
+
+    // -- #83 Top-N per group via ROW_NUMBER ---------------------------------
+    // The canonical "top-3 rows per partition" analytic: rank within each
+    // user by amount, keep rn<=3. LIMIT bounds output across scales.
+    let topn_per_group_window = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT * FROM (\
+                SELECT user_id, amount, \
+                       ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY amount DESC) AS rn \
+                FROM {schema}.events) t \
+             WHERE rn <= 3 LIMIT 100"
+        ),
+        "SELECT * FROM (\
+            SELECT user_id, amount, \
+                   ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY amount DESC) AS rn \
+            FROM events) t \
+         WHERE rn <= 3 LIMIT 100",
+        n,
+    )
+    .await;
+
+    // -- #84 High-cardinality GROUP BY (full materialisation) ---------------
+    // GROUP BY user_id with NO limit — the group count equals user
+    // cardinality (rows/10), so the whole aggregate table is materialised.
+    // Stresses the hash-aggregate build at high group count.
+    let high_card_groupby = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT user_id, COUNT(*), SUM(amount) FROM {schema}.events GROUP BY user_id"
+        ),
+        "SELECT user_id, COUNT(*), SUM(amount) FROM events GROUP BY user_id",
+        n,
+    )
+    .await;
+
+    // -- #85 Distinct-within-groups -----------------------------------------
+    // `status, COUNT(DISTINCT user_id) GROUP BY status` — distinct counted
+    // per group, a different execution shape from the table-wide COUNT
+    // DISTINCT in #16. Same SQL both sides (no approx_distinct dependency).
+    let approx_distinct = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT status, COUNT(DISTINCT user_id) FROM {schema}.events GROUP BY status"
+        ),
+        "SELECT status, COUNT(DISTINCT user_id) FROM events GROUP BY status",
+        n,
+    )
+    .await;
+
+    // -- #86 Deep top-K sort over wide rows ---------------------------------
+    // ORDER BY amount DESC, id LIMIT 1000 — a deep top-K sort projecting the
+    // full (wide) row. `id` is the stable tiebreaker so the ordering is
+    // deterministic on both engines.
+    let full_sort_high_card = pair(
+        pg,
+        sess,
+        format!("SELECT * FROM {schema}.events ORDER BY amount DESC, id LIMIT 1000"),
+        "SELECT * FROM events ORDER BY amount DESC, id LIMIT 1000",
+        n,
+    )
+    .await;
+
+    // -- #87 Manual CASE pivot ----------------------------------------------
+    // One SUM(CASE WHEN status=…) column per status value — the hand-rolled
+    // pivot every BI tool emits when it lacks native PIVOT. The status set
+    // matches `status_for` (pending/active/completed/archived); we pivot the
+    // three highest-traffic values plus a catch-all is unnecessary here.
+    let case_pivot = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT user_id, \
+                    SUM(CASE WHEN status='active' THEN amount ELSE 0 END), \
+                    SUM(CASE WHEN status='pending' THEN amount ELSE 0 END), \
+                    SUM(CASE WHEN status='completed' THEN amount ELSE 0 END) \
+             FROM {schema}.events GROUP BY user_id LIMIT 100"
+        ),
+        "SELECT user_id, \
+                SUM(CASE WHEN status='active' THEN amount ELSE 0 END), \
+                SUM(CASE WHEN status='pending' THEN amount ELSE 0 END), \
+                SUM(CASE WHEN status='completed' THEN amount ELSE 0 END) \
+         FROM events GROUP BY user_id LIMIT 100",
+        n,
+    )
+    .await;
+
+    // -- #88 Star-schema 3-way join + aggregate -----------------------------
+    // events ⋈ users (PK eq) ⋈ categories (amount BETWEEN range), grouped by
+    // (email, category name), ranked by total amount. The categories table is
+    // seeded with the same 5 buckets on both sides (see the seed block) so the
+    // join cardinality is identical. The BETWEEN join is intentionally the
+    // expensive arm — measures range-join planning under a star schema.
+    let star_join_agg = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT u.email, c.name, SUM(e.amount) FROM {schema}.events e \
+             JOIN {schema}.users u ON e.user_id = u.id \
+             JOIN {schema}.categories c ON e.amount BETWEEN c.min_amt AND c.max_amt \
+             GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 20"
+        ),
+        "SELECT u.email, c.name, SUM(e.amount) FROM events e \
+         JOIN users u ON e.user_id = u.id \
+         JOIN categories c ON e.amount BETWEEN c.min_amt AND c.max_amt \
+         GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 20",
+        n,
+    )
+    .await;
+
+    // -- #89 Window LAG delta + post-filter ---------------------------------
+    // Per-user period-over-period delta `amount - LAG(amount)`, then an outer
+    // predicate `delta > 100`. The post-window filter forces the window to be
+    // computed first and filtered after — a different plan shape from a plain
+    // WHERE-then-window. LIMIT bounds output.
+    let delta_window_lag_filter = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT * FROM (\
+                SELECT id, amount - LAG(amount) OVER (PARTITION BY user_id ORDER BY created_at) \
+                       AS delta \
+                FROM {schema}.events) t \
+             WHERE delta > 100 LIMIT 100"
+        ),
+        "SELECT * FROM (\
+            SELECT id, amount - LAG(amount) OVER (PARTITION BY user_id ORDER BY created_at) \
+                   AS delta \
+            FROM events) t \
+         WHERE delta > 100 LIMIT 100",
+        n,
+    )
+    .await;
+
+    OlapResults {
+        rollup_agg,
+        cube_agg,
+        grouping_sets,
+        percentile_cont,
+        window_frame_rows,
+        topn_per_group_window,
+        high_card_groupby,
+        approx_distinct,
+        full_sort_high_card,
+        case_pivot,
+        star_join_agg,
+        delta_window_lag_filter,
     }
 }
 
@@ -3992,6 +4680,20 @@ async fn run_full_compare_inner(
     // =======================================================================
     let oe = run_oltp_extra_suite(&pg, &sess, &schema, rows).await;
 
+    // =======================================================================
+    // OLAP suite (#78-#89) — 12 analytical shapes a columnar engine is built
+    // for: multi-dimensional rollups (ROLLUP / CUBE / GROUPING SETS), an
+    // ordered-set aggregate (PERCENTILE_CONT), a bounded window frame,
+    // top-N-per-group, high-cardinality grouping, distinct-within-groups, a
+    // deep top-K sort, a manual CASE pivot, a 3-way star join, and a
+    // window-delta-then-filter. Same stack-budget extraction + Option-or-gap
+    // convention as the other extended suites. All read-only over the seeded
+    // events/users/categories tables, so it's order-independent with the
+    // other read suites; placed here after the write-mutating suites so its
+    // scans see the settled post-seed state.
+    // =======================================================================
+    let ol = run_olap_suite(&pg, &sess, &schema, rows).await;
+
     // ---- Cold-start first query -------------------------------------------
     let pg_cold_ms = {
         let user_token = if conn_str.contains("user=pc") {
@@ -4213,6 +4915,27 @@ async fn run_full_compare_inner(
     row_opt("insert_returning_p50_ms", oe.insert_returning.0, oe.insert_returning.1);
     row_opt("update_returning_p50_ms", oe.update_returning.0, oe.update_returning.1);
     row_opt("bulk_upsert_50_p50_ms", oe.bulk_upsert_50.0, oe.bulk_upsert_50.1);
+    // OLTP-extra batch 2 (#90-#95) — same Option-or-GAP rendering.
+    row_opt("select_for_update_txn_ms", oe.select_for_update.0, oe.select_for_update.1);
+    row_opt("bulk_delete_range_ms", oe.bulk_delete_range.0, oe.bulk_delete_range.1);
+    row_opt("fk_cascade_delete_ms", oe.fk_cascade_delete.0, oe.fk_cascade_delete.1);
+    row_opt("in_list_1000_p50_ms", oe.in_list_1000.0, oe.in_list_1000.1);
+    row_opt("count_filtered_low_card_p50_ms", oe.count_filtered_low_card.0, oe.count_filtered_low_card.1);
+    row_opt("point_join_lookup_p50_ms", oe.point_join_lookup.0, oe.point_join_lookup.1);
+
+    // OLAP rows (#78-#89) — same Option-or-GAP rendering.
+    row_opt("rollup_agg_p50_ms", ol.rollup_agg.0, ol.rollup_agg.1);
+    row_opt("cube_agg_p50_ms", ol.cube_agg.0, ol.cube_agg.1);
+    row_opt("grouping_sets_p50_ms", ol.grouping_sets.0, ol.grouping_sets.1);
+    row_opt("percentile_cont_p50_ms", ol.percentile_cont.0, ol.percentile_cont.1);
+    row_opt("window_frame_rows_p50_ms", ol.window_frame_rows.0, ol.window_frame_rows.1);
+    row_opt("topn_per_group_window_p50_ms", ol.topn_per_group_window.0, ol.topn_per_group_window.1);
+    row_opt("high_card_groupby_p50_ms", ol.high_card_groupby.0, ol.high_card_groupby.1);
+    row_opt("approx_distinct_p50_ms", ol.approx_distinct.0, ol.approx_distinct.1);
+    row_opt("full_sort_high_card_p50_ms", ol.full_sort_high_card.0, ol.full_sort_high_card.1);
+    row_opt("case_pivot_p50_ms", ol.case_pivot.0, ol.case_pivot.1);
+    row_opt("star_join_agg_p50_ms", ol.star_join_agg.0, ol.star_join_agg.1);
+    row_opt("delta_window_lag_filter_p50_ms", ol.delta_window_lag_filter.0, ol.delta_window_lag_filter.1);
 
     // ---- Emit benchmark JSON ----------------------------------------------
     let basin_disk_f = basin_disk_bytes as f64;
@@ -4451,6 +5174,28 @@ async fn run_full_compare_inner(
         mk_ext("INSERT … RETURNING id (single row)", oe.insert_returning.0, oe.insert_returning.1),
         mk_ext("UPDATE … RETURNING (single row)", oe.update_returning.0, oe.update_returning.1),
         mk_ext("Bulk UPSERT (50 rows, one statement)", oe.bulk_upsert_50.0, oe.bulk_upsert_50.1),
+        // OLTP-extra batch 2 (#90-#95) — multi-statement txn, destructive
+        // single-shot writes, big IN-list, selective count, point+FK hydrate.
+        mk_ext("SELECT … FOR UPDATE + UPDATE (one txn)", oe.select_for_update.0, oe.select_for_update.1),
+        mk_ext("Bulk DELETE range (id BETWEEN, 1k scratch)", oe.bulk_delete_range.0, oe.bulk_delete_range.1),
+        mk_ext("FK ON DELETE CASCADE", oe.fk_cascade_delete.0, oe.fk_cascade_delete.1),
+        mk_ext("Large IN-list (1000 values)", oe.in_list_1000.0, oe.in_list_1000.1),
+        mk_ext("Selective low-card COUNT (status filter)", oe.count_filtered_low_card.0, oe.count_filtered_low_card.1),
+        mk_ext("Point query + FK hydrate (events ⋈ users)", oe.point_join_lookup.0, oe.point_join_lookup.1),
+        // OLAP shapes (#78-#89) — analytical workloads (rollups, ordered-set
+        // aggregates, window frames, star joins). Same Option-or-gap helper.
+        mk_ext("ROLLUP(status, user_id%10) SUM p50", ol.rollup_agg.0, ol.rollup_agg.1),
+        mk_ext("CUBE(status, user_id%10) SUM p50", ol.cube_agg.0, ol.cube_agg.1),
+        mk_ext("GROUPING SETS ((status),(user%10),()) p50", ol.grouping_sets.0, ol.grouping_sets.1),
+        mk_ext("PERCENTILE_CONT(0.5) per status p50", ol.percentile_cont.0, ol.percentile_cont.1),
+        mk_ext("Window frame SUM (5 PRECEDING) p50", ol.window_frame_rows.0, ol.window_frame_rows.1),
+        mk_ext("Top-N per group ROW_NUMBER rn<=3 p50", ol.topn_per_group_window.0, ol.topn_per_group_window.1),
+        mk_ext("High-card GROUP BY user_id (no limit) p50", ol.high_card_groupby.0, ol.high_card_groupby.1),
+        mk_ext("COUNT(DISTINCT user_id) per status p50", ol.approx_distinct.0, ol.approx_distinct.1),
+        mk_ext("Deep top-K sort ORDER BY amount LIMIT 1000 p50", ol.full_sort_high_card.0, ol.full_sort_high_card.1),
+        mk_ext("Manual CASE pivot per user p50", ol.case_pivot.0, ol.case_pivot.1),
+        mk_ext("Star join (events ⋈ users ⋈ categories) p50", ol.star_join_agg.0, ol.star_join_agg.1),
+        mk_ext("Window LAG delta + post-filter p50", ol.delta_window_lag_filter.0, ol.delta_window_lag_filter.1),
     ];
 
     report_postgres_compare(id, name, claim, true, metrics, None);
