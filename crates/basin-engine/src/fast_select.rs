@@ -1227,6 +1227,13 @@ fn extract_prefix(pat: &str) -> Option<String> {
     Some(stripped.to_string())
 }
 
+/// Crate-visible wrapper over [`literal_value`] for sibling fast-path modules
+/// (e.g. `point_join`) that need the same WHERE-literal recognition without
+/// duplicating the signed-integer / string / boolean parsing rules.
+pub(crate) fn literal_value_pub(e: &Expr) -> Option<ScalarValue> {
+    literal_value(e)
+}
+
 /// Recognise the literal forms we can push down: signed integers, strings,
 /// booleans. Anything richer (NULL, casts, vectors, floats) drops us out of
 /// the fast path.
@@ -1593,6 +1600,70 @@ pub(crate) async fn execute_simple_select(
         plan.limit
     } else {
         None
+    };
+
+    // ── Keyset-pagination per-file LIMIT pushdown ────────────────────────────
+    //
+    // Shape:  `SELECT … FROM t WHERE k > $1 ORDER BY k ASC LIMIT n`
+    // where `k` is the table's single effective cluster column (the column the
+    // writer physically sorts each file on; see `effective_cluster_col`).
+    //
+    // Why this is a win.  The recogniser already pushes the `Gt` predicate, but
+    // the ORDER BY gates the LIMIT pushdown OFF (above) because the storage
+    // layer's stream LIMIT is GLOBAL across paths and would truncate the merge
+    // input before the global sort.  Each cold file is, however, internally
+    // sorted ASC on `k` (writer `sort_batch_by_cluster_cols`, ascending), so
+    // the first `n` rows of each file that survive the `k > $1` filter are a
+    // SUPERSET of that file's contribution to the global top-`n`.  Reading each
+    // candidate file with its OWN per-file LIMIT therefore bounds the total
+    // merge input to `n_files × n` rows (tiny), and the existing
+    // `apply_order_by_limit` (concat + sort_to_indices + take) then produces the
+    // exact global top-`n` cheaply — the dominant cost (reading every surviving
+    // row of every file in full) is eliminated.
+    //
+    // Direction.  Files are sorted ASC, so the first `n` rows are the SMALLEST
+    // `k`.  This superset reasoning holds ONLY for ASC + Gt (we want the
+    // smallest matching keys).  A DESC + Lt query wants the LARGEST matching
+    // keys, which are at the END of each file — a leading per-file LIMIT would
+    // drop exactly the rows we need.  DESC therefore does NOT get the pushdown;
+    // it reads files in full and the existing path produces the correct answer
+    // (slower, but never wrong).
+    //
+    // Correctness guards.  We DISABLE the pushdown whenever `post_read_shrinking`
+    // is set — i.e. there is an IS NULL / IN post-filter, or any live hot-tier
+    // tombstone / UPDATE overlay for this table.  Reason: a tombstone can
+    // suppress a cold row that the per-file LIMIT already admitted, leaving a
+    // shortfall whose backfill lives PAST the per-file cap; an UPDATE overlay
+    // can move a row out of the window.  Rather than reason about a slack
+    // margin, we fall back to the unbounded full-file read (the existing
+    // `apply_order_by_limit` path) which is provably correct.  With NO overlays
+    // and NO post-filter, no cold row can be removed after admission, so a
+    // per-file LIMIT of exactly `query_limit` is sufficient — no slack needed.
+    //
+    // RLS / soft-delete / views: the executor gate (`exec_select`) already
+    // refuses to call `execute_simple_select` for those, so the keyset path
+    // inherits the exclusion — no extra check here.
+    let effective_cluster = effective_cluster_col(&meta);
+    let keyset_per_file_limit: Option<usize> = match (&plan.order_by, plan.limit) {
+        (Some((ob_col, ascending)), Some(limit))
+            if !post_read_shrinking
+                && plan.aggregates.is_none()
+                && plan.is_null_cols.is_empty()
+                && plan.in_list_preds.is_empty()
+                && plan.predicates.len() == 1
+                && effective_cluster
+                    .as_deref()
+                    .is_some_and(|c| c == ob_col.as_str()) =>
+        {
+            match &plan.predicates[0] {
+                // ASC + `k > $1`: smallest matching keys are the file head.
+                Predicate::Gt(col, _) if *ascending && col == ob_col => Some(limit),
+                // DESC + `k < $1` (and every other shape) is not eligible for
+                // the per-file head LIMIT — leave it to the full-file path.
+                _ => None,
+            }
+        }
+        _ => None,
     };
     // Synthesise bounding-range predicates from IN-list predicates so the
     // Parquet row-group pruner sees a compact `[min, max]` filter rather than
@@ -2218,6 +2289,48 @@ pub(crate) async fn execute_simple_select(
     let pk_cache_served = pk_cache_hit.is_some();
     let batches = if let Some(cached) = pk_cache_hit {
         cached
+    } else if let Some(per_file_limit) = keyset_per_file_limit {
+        // ── Keyset-pagination read: per-file LIMIT, no global cut ────────────
+        //
+        // Each candidate cold file is read with its OWN `LIMIT per_file_limit`.
+        // We deliberately do NOT use the multi-path `read_paths_with_schema`
+        // call with a single `opts.limit`, because that combinator applies the
+        // limit GLOBALLY across the path stream (`apply_limit_to_stream`) — it
+        // would stop after the first `per_file_limit` rows total and never open
+        // the later files, dropping rows the global sort needs.  Issuing one
+        // single-path `read_paths_with_schema` call per file makes the stream
+        // limit coincide with the per-file limit (one path ⇒ global == per-file)
+        // while still threading the catalog schema for schema-evolution
+        // null-fill.  Total rows read ≤ n_files × per_file_limit; the head of
+        // each ASC-sorted file is a superset of its top-`limit` contribution, so
+        // `apply_order_by_limit` below produces the exact global top-`limit`.
+        //
+        // Shard correctness mirrors the `had_pk_probe` branch: the top-of-fn
+        // `flush_to_parquet()` drained the shard tail to cold files and the
+        // engine memtable was probed, so reading `live_paths` directly (instead
+        // of `handle.read`) is sound — and `keyset_per_file_limit` is only
+        // `Some` when there are no live tombstones / UPDATE overlays.
+        use futures::StreamExt;
+        let mut keyset_opts = opts.clone();
+        keyset_opts.limit = Some(per_file_limit);
+        let mut all: Vec<RecordBatch> = Vec::new();
+        for path in live_paths {
+            let schema = Some(meta.schema.clone());
+            let stream = sess
+                .engine
+                .config()
+                .storage
+                .read_paths_with_schema(
+                    &sess.project,
+                    vec![path],
+                    keyset_opts.clone(),
+                    schema,
+                )
+                .await?;
+            let collected: Vec<Result<RecordBatch>> = stream.collect().await;
+            all.extend(collected.into_iter().collect::<Result<Vec<_>>>()?);
+        }
+        all
     } else if had_pk_probe {
         // Single-PK-Eq fast path: the PK probe already narrowed the cold
         // tier to at most a handful of candidate files (typically 0-1).
@@ -2498,6 +2611,17 @@ pub(crate) async fn execute_simple_select(
                 }
             }
         };
+
+    // Normalize cold scan batches to the catalog-typed projected_schema:
+    // Vortex decode narrows LargeBinary (JSONB) to Binary, while memtable
+    // overlay rows keep the catalog type — mixed batches would fail any
+    // downstream concat (including apply_order_by_limit below) and the
+    // result batches must be physically consistent with their declared
+    // schema either way.
+    let batches: Vec<RecordBatch> = batches
+        .into_iter()
+        .map(|b| crate::hot_tombstone::normalize_batch_to_schema(b, projected_schema.as_ref()))
+        .collect();
 
     // ORDER BY + LIMIT: merge batches into one, sort by the column, take
     // the first `limit` rows. We only reach here when `order_by.is_some()`
@@ -2868,6 +2992,32 @@ fn evaluate_computed_projections(
         .map_err(|e| BasinError::internal(format!("computed projection batch: {e}")))
 }
 
+
+/// The single effective cluster column the writer physically sorts every cold
+/// file on, or `None` when the table is not single-column clustered.
+///
+/// Resolution order matches the write path's `WriteOptions.cluster_columns`
+/// source:
+///   1. An explicit `CLUSTER BY (col)` / `basin.cluster_by=col` —
+///      `meta.cluster_columns` (used verbatim by the writer).
+///   2. Otherwise the implicit single-PK clustering — `default_cluster_cols()`
+///      (which already type-gates to prunable PK types and returns empty for
+///      composite PKs or an explicit `global_sort_order`).
+///
+/// Only a single-column result qualifies for the keyset fast path; anything
+/// composite returns `None` so the caller stays on the full-file path.
+fn effective_cluster_col(meta: &TableMetadata) -> Option<String> {
+    if !meta.cluster_columns.is_empty() {
+        return match meta.cluster_columns.as_slice() {
+            [only] => Some(only.clone()),
+            _ => None,
+        };
+    }
+    match meta.default_cluster_cols().as_slice() {
+        [only] => Some(only.clone()),
+        _ => None,
+    }
+}
 
 /// Sort batches by a single column and return the first `limit` rows as one
 /// or more `RecordBatch`es. Uses Arrow's `sort_to_indices` + `take` so the

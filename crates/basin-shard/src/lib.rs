@@ -348,6 +348,19 @@ impl Shard {
         self.inner.set_jsonb_posting_registry(registry);
     }
 
+    /// Wire the engine's secondary B-tree index registry into the compactor.
+    ///
+    /// Called once from `Engine::new`. On the shard path INSERT writes go
+    /// straight to WAL + tail (bypassing the engine's
+    /// `maintain_secondary_indexes_on_insert`), so compaction is the only
+    /// point where a single-column index's `(value → file/row-group/row)`
+    /// locations can be populated for shard-written data. Without this the
+    /// secondary-index probe never has entries under any compacted file path
+    /// and every point query falls back to a full scan.
+    pub fn set_secondary_index_registry(&self, registry: Arc<dyn SecondaryIndexSink>) {
+        self.inner.set_secondary_index_registry(registry);
+    }
+
     /// Phase 6.X.C (ADR 0023) — voluntarily hand off the lease for
     /// `(project, partition)` to `to_holder`. While the handoff is in
     /// progress new writes against this partition fail with
@@ -463,6 +476,43 @@ impl ShardBackgroundHandle {
     }
 }
 
+/// Sink for the per-`(project, table, col)` secondary B-tree index.
+///
+/// The concrete registry (`basin_engine::secondary_index::ProjectIndexRegistry`)
+/// lives in `basin-engine`, which depends on `basin-shard` — so the compactor
+/// cannot name that type directly without closing a dependency cycle. This
+/// trait is the same escape hatch [`TopPatternProvider`] uses: the engine
+/// implements it on its registry and wires it in via
+/// [`Shard::set_secondary_index_registry`] at startup; the compactor calls it
+/// when it writes a new compacted file.
+///
+/// Locations are passed as primitive tuples (`key`, `file_path`, `row_group`,
+/// `row`) rather than the engine's `IndexLocation` for the same
+/// dependency-direction reason.
+pub trait SecondaryIndexSink: Send + Sync {
+    /// Insert a batch of `(key_text, file_path, row_group, row)` locations
+    /// into the in-RAM index for `(project, table, col)`. Mirrors
+    /// `ProjectIndexRegistry::insert_batch`.
+    fn insert_batch_locations(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        col: &str,
+        entries: Vec<(String, String, u32, u64)>,
+    );
+
+    /// Remove every index location that references `file_path` for
+    /// `(project, table, col)`. Used when a compaction replaces files.
+    /// Mirrors `ProjectIndexRegistry::remove_file_from_index`.
+    fn remove_file(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        col: &str,
+        file_path: &str,
+    );
+}
+
 /// Driver the shard hands each resident project to during
 /// [`Shard::run_cv_refresh`]. Implementations live in `basin-cv`
 /// (`CvRefresher` is the canonical one); the trait sits in `basin-shard`
@@ -542,6 +592,11 @@ pub(crate) trait ShardImpl: Send + Sync {
         _registry: Arc<basin_storage::index::jsonb_posting::JsonbPostingRegistry>,
     ) {
     }
+    /// Wire the secondary B-tree index sink into the compactor so newly
+    /// compacted files register their single-column index values. Mirrors
+    /// `set_gin_rowgroup_registry` — populated lazily on first wire-up.
+    /// Default no-op.
+    fn set_secondary_index_registry(&self, _registry: Arc<dyn SecondaryIndexSink>) {}
     /// Phase 6.X.C — voluntary lease handoff. Default returns Ok (a backend
     /// that doesn't model leases has nothing to hand off).
     async fn yield_partition(

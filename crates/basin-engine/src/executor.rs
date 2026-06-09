@@ -2435,6 +2435,20 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                 }
             }
 
+            // Point-lookup INNER-JOIN fast path (ORM hydrate). Recognise the
+            // two-table PK-probe + PK-lookup join syntactically, then let
+            // `execute_point_join` validate the metadata invariants (PK-ness,
+            // view/RLS/soft-delete/txn/citext gates) and run two reused
+            // `execute_simple_select` point lookups. `Ok(None)` on any failed
+            // gate falls through to the DataFusion path below.
+            if let Some(pj_plan) = crate::point_join::match_point_join(&stmt) {
+                if let Some(res) =
+                    crate::point_join::execute_point_join(sess, pj_plan, raw_sql).await?
+                {
+                    return Ok(res);
+                }
+            }
+
             if let Some(plan) = match_simple_select(&stmt) {
                 // Fast-path gate: load the table metadata exactly once and
                 // derive all three guard conditions from that single result.
@@ -2523,10 +2537,33 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                     // DataFusion / UDF path via `exec_select`.  So the gate here
                     // imposes no shadow-column restriction: a referenced shadow
                     // column is allowed through and self-guards downstream.
+                    // In-tx exception to the bail above: when THIS table has
+                    // no pending in-tx writes AND the txn's pinned read
+                    // snapshot (peeked, never captured here — capturing
+                    // pre-flush would pin a head older than the read's actual
+                    // view) equals the current head, the committed-snapshot
+                    // read the fast path performs is exactly the txn's
+                    // repeatable-read view. No pin yet, pending writes, or a
+                    // moved head → DataFusion, which rewinds via
+                    // load_table_for_read.
+                    let in_tx_fast_ok = if !in_txn {
+                        true
+                    } else {
+                        let untouched = crate::session::tx_pending_files_for(
+                            &sess.state,
+                            &plan.table,
+                        )
+                        .is_empty()
+                            && crate::session::tx_htap_batches_for(&sess.state, &plan.table)
+                                .is_empty();
+                        untouched
+                            && crate::session::tx_read_snapshot_peek(&sess.state, &plan.table)
+                                == Some(meta.current_snapshot)
+                    };
                     if !is_view
                         && !has_rls
                         && !has_soft_delete
-                        && !in_txn
+                        && in_tx_fast_ok
                         && !has_citext_predicate
                         && !has_citext_order_by
                     {
@@ -4042,9 +4079,382 @@ async fn exec_create_index(
         refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table).await?;
     }
 
+    // FIX 1 / FIX 2(b) — backfill the index over PRE-EXISTING live files.
+    //
+    // The catalog now records the index, but the in-RAM registries that drive
+    // pruning (GIN row-group bloom + JSONB posting list for `USING gin`; the
+    // secondary B-tree registry for plain single-column indexes) are populated
+    // only by INSERT-path maintenance and by compaction — both of which run
+    // AFTER the index exists. Files written before this CREATE INDEX would
+    // never be indexed, so the read-path completeness guards
+    // (`gin_rowgroup_registry().is_file_indexed`, the posting-list lazy-load,
+    // and the secondary probe) would force a full scan forever.
+    //
+    // We do a one-time synchronous scan here. This is DDL, so a blocking scan
+    // is acceptable; a very large table would benefit from doing this
+    // asynchronously / incrementally in a future revision (TODO).  Backfill is
+    // best-effort: a read error on any file is logged and the file is left
+    // un-indexed (the completeness guard then falls back to a full scan for
+    // that file — correct, just slower).
+    if catalog_columns.len() == 1 {
+        backfill_index_over_live_files(
+            sess,
+            &table,
+            &index_name,
+            &catalog_columns[0],
+            &access_method_str,
+            gin_opclass.as_deref(),
+        )
+        .await;
+    }
+
     Ok(ExecResult::Empty {
         tag: "CREATE INDEX".into(),
     })
+}
+
+/// FIX 1 / FIX 2(b) — backfill a freshly-created single-column index over the
+/// table's existing live data files.
+///
+/// Dispatches on access method:
+///   * `gin` (JSONB, non-tsvector) → populate the GIN row-group bloom registry
+///     and the file-level JSONB posting list + sidecar, then seal each file so
+///     `apply_gin_pruning_for_query`'s completeness guards pass.
+///   * `btree` (plain single-column) → extract `(value → file/row-group/row)`
+///     locations into the secondary B-tree registry and flush it to disk.
+///   * `gist` / `hnsw` / `ivfflat` / tsvector-GIN → not backfilled here (those
+///     use sidecar-based indexes built at compaction time; out of scope for
+///     this fix).
+///
+/// Row-group ordinal semantics: the Parquet/Vortex writer flushes a row-group
+/// every `rg_size` rows in stored row order. We thread a running per-file row
+/// offset across the read stream's batches and compute
+/// `row_group = (file_row_offset + local_row) / rg_size`, exactly mirroring
+/// `maintain_gin_rowgroup_index_on_insert`. `rg_size` follows the same priority
+/// the compactor uses (`row_block_size` > `row_group_rows` > default) so the
+/// ordinals line up with how the file was actually written. For Vortex the
+/// read path ignores the per-location row-group (file-level allow-list wins),
+/// so the ordinal is harmless there.
+async fn backfill_index_over_live_files(
+    sess: &ProjectSession,
+    table: &TableName,
+    index_name: &str,
+    col_name: &str,
+    access_method: &str,
+    gin_opclass: Option<&str>,
+) {
+    use futures::StreamExt;
+
+    // tsvector GIN, gist, and vector indexes are not backfilled here.
+    let is_plain_gin = access_method == "gin" && gin_opclass != Some("tsvector_ops");
+    let is_btree = access_method == "btree";
+    if !is_plain_gin && !is_btree {
+        return;
+    }
+
+    let meta = match sess.engine.config().catalog.load_table(&sess.project, table).await {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    let live_files = meta.live_data_files();
+    if live_files.is_empty() {
+        return;
+    }
+
+    // Effective row-group size — mirror the compactor's writer priority so the
+    // computed row-group ordinals match the on-disk layout.
+    let rg_size = meta
+        .row_block_size
+        .map(|v| v as usize)
+        .or(meta.row_group_rows)
+        .unwrap_or(basin_storage::DEFAULT_MAX_ROW_GROUP_SIZE)
+        .max(1);
+
+    let storage = sess.engine.config().storage.clone();
+    let project = sess.project;
+    let opclass = gin_opclass.unwrap_or("jsonb_ops");
+
+    for f in &live_files {
+        let path = object_store::path::Path::from(f.path.as_str());
+        let opts = basin_storage::ReadOptions {
+            projection: Some(vec![col_name.to_string()]),
+            ..Default::default()
+        };
+        let mut stream = match storage
+            .read_file_with_options(&project, &path, opts)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    index = %index_name,
+                    table = %table,
+                    file = %f.path,
+                    err = %e,
+                    "CREATE INDEX backfill: read failed; file left un-indexed (falls back to full scan)"
+                );
+                continue;
+            }
+        };
+
+        // Running row offset within this file (across the stream's batches).
+        let mut file_row_off: usize = 0;
+        let mut had_data = false;
+
+        while let Some(batch_res) = stream.next().await {
+            let batch = match batch_res {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(
+                        index = %index_name,
+                        file = %f.path,
+                        err = %e,
+                        "CREATE INDEX backfill: batch read error; partial file index (full-scan fallback for this file)"
+                    );
+                    // Leave the file un-sealed so the completeness guard treats
+                    // it as not-indexed and full-scans it (no false negatives).
+                    had_data = false;
+                    break;
+                }
+            };
+            had_data = true;
+            if is_plain_gin {
+                backfill_gin_batch(
+                    sess, table, col_name, opclass, &batch, &f.path, rg_size, file_row_off,
+                );
+            } else {
+                backfill_btree_batch(
+                    sess, table, col_name, &batch, &f.path, rg_size, file_row_off,
+                );
+            }
+            file_row_off += batch.num_rows();
+        }
+
+        if !had_data {
+            continue;
+        }
+
+        if is_plain_gin {
+            // Seal the file in both GIN registries so the read-path
+            // completeness guards (`is_file_indexed`) pass for this file.
+            sess.engine.gin_rowgroup_registry().mark_file_indexed(
+                &project, table, col_name, &f.path,
+            );
+            sess.engine.gin_index_registry().mark_file_indexed(
+                &project, table, col_name, &f.path,
+            );
+            // Persist the file-level posting list as a sidecar so the
+            // `apply_jsonb_posting_pruning_for_query` lazy-load path (which
+            // reads sidecars when its registry is cold) also sees this file.
+            backfill_write_jsonb_posting_sidecar(sess, table, col_name, &f.path).await;
+        }
+    }
+
+    if is_btree {
+        // Persist the secondary B-tree index so a restart can lazy-load it.
+        crate::secondary_index::flush_index(
+            sess.engine.secondary_index_registry(),
+            &storage,
+            &project,
+            table,
+            col_name,
+        )
+        .await;
+    }
+}
+
+/// Feed one batch (read from an existing file at `file_row_off` rows into the
+/// file) into the GIN row-group bloom registry and file-level posting list.
+/// Mirrors `maintain_gin_rowgroup_index_on_insert` / `maintain_gin_index_on_insert`
+/// but offsets the row index by `file_row_off` so multi-batch reads of a single
+/// file land in the correct row-group.
+fn backfill_gin_batch(
+    sess: &ProjectSession,
+    table: &TableName,
+    col_name: &str,
+    opclass: &str,
+    batch: &arrow_array::RecordBatch,
+    file_path: &str,
+    rg_size: usize,
+    file_row_off: usize,
+) {
+    use arrow_array::Array;
+    let Ok(col_idx) = batch.schema().index_of(col_name) else {
+        return;
+    };
+    let col = batch.column(col_idx);
+    // The JSONB column's runtime Arrow encoding depends on the source file
+    // format: freshly-written batches carry `LargeBinary` (the catalog JSONB
+    // type), but the Vortex reader round-trips JSONB through `BinaryView` →
+    // plain `Binary`. Backfill reads from cold-tier files, so we must accept
+    // all three or the downcast fails silently — leaving the file with no
+    // row-group entries, so the subsequent `mark_file_indexed` (which only
+    // seals files that already have an entry) no-ops and the file is never
+    // sealed (bug: gin_create_index_backfills_preexisting_shard_files).
+    enum BinCol<'a> {
+        Large(&'a arrow_array::LargeBinaryArray),
+        Small(&'a arrow_array::BinaryArray),
+        View(&'a arrow_array::BinaryViewArray),
+    }
+    let bin = if let Some(a) = col.as_any().downcast_ref::<arrow_array::LargeBinaryArray>() {
+        BinCol::Large(a)
+    } else if let Some(a) = col.as_any().downcast_ref::<arrow_array::BinaryArray>() {
+        BinCol::Small(a)
+    } else if let Some(a) = col.as_any().downcast_ref::<arrow_array::BinaryViewArray>() {
+        BinCol::View(a)
+    } else {
+        return;
+    };
+    let row_bytes = |r: usize| -> Option<&[u8]> {
+        match &bin {
+            BinCol::Large(a) => (!a.is_null(r)).then(|| a.value(r)),
+            BinCol::Small(a) => (!a.is_null(r)).then(|| a.value(r)),
+            BinCol::View(a) => (!a.is_null(r)).then(|| a.value(r)),
+        }
+    };
+    let rg_registry = sess.engine.gin_rowgroup_registry();
+    let posting_registry = sess.engine.gin_index_registry();
+    let project = sess.project;
+    for row in 0..batch.num_rows() {
+        let Some(bytes) = row_bytes(row) else {
+            continue;
+        };
+        let file_row = file_row_off + row;
+        let row_group = (file_row / rg_size) as u32;
+        // Row-group bloom (drives the direct row-group prune path).
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
+            let terms = crate::index_probe::extract_terms(&value, opclass);
+            if !terms.is_empty() {
+                rg_registry.index_row(&project, table, col_name, &terms, file_path, row_group);
+            }
+        }
+        // File-level posting list (drives the posting-list prune path).
+        posting_registry.index_row(
+            &project, table, col_name, opclass, bytes, file_path, row_group, file_row as u64,
+        );
+    }
+}
+
+/// Feed one batch into the secondary B-tree registry, offsetting the row index
+/// by `file_row_off`. Mirrors `extract_entries_from_batch` + `insert_batch`.
+fn backfill_btree_batch(
+    sess: &ProjectSession,
+    table: &TableName,
+    col_name: &str,
+    batch: &arrow_array::RecordBatch,
+    file_path: &str,
+    rg_size: usize,
+    file_row_off: usize,
+) {
+    use arrow_array::Array;
+    let Ok(col_idx) = batch.schema().index_of(col_name) else {
+        return;
+    };
+    let col = batch.column(col_idx);
+    let mut entries: Vec<(String, crate::secondary_index::IndexLocation)> = Vec::new();
+    macro_rules! extract_typed {
+        ($arr_ty:ty, $fmt:expr) => {{
+            if let Some(arr) = col.as_any().downcast_ref::<$arr_ty>() {
+                for row in 0..arr.len() {
+                    if arr.is_null(row) {
+                        continue;
+                    }
+                    let key: String = $fmt(arr.value(row));
+                    let file_row = file_row_off + row;
+                    entries.push((
+                        key,
+                        crate::secondary_index::IndexLocation {
+                            file_path: file_path.to_string(),
+                            row_group: (file_row / rg_size) as u32,
+                            row: file_row as u64,
+                        },
+                    ));
+                }
+            }
+        }};
+    }
+    use arrow_array::{
+        BooleanArray, Float64Array, Int64Array, LargeStringArray, StringArray, UInt64Array,
+    };
+    extract_typed!(Int64Array, |v: i64| v.to_string());
+    extract_typed!(UInt64Array, |v: u64| v.to_string());
+    extract_typed!(Float64Array, |v: f64| format!("{v:?}"));
+    extract_typed!(StringArray, |v: &str| v.to_string());
+    extract_typed!(LargeStringArray, |v: &str| v.to_string());
+    extract_typed!(BooleanArray, |v: bool| if v { "t" } else { "f" }.to_string());
+
+    if !entries.is_empty() {
+        sess.engine
+            .secondary_index_registry()
+            .insert_batch(&sess.project, table, col_name, entries);
+    }
+}
+
+/// Serialise the in-RAM JSONB file-level posting list for `file_path` and write
+/// it to the canonical sidecar object so the engine's lazy-load probe path can
+/// pick it up. Best-effort: any error is logged and ignored (the row-group
+/// bloom path still works).
+async fn backfill_write_jsonb_posting_sidecar(
+    sess: &ProjectSession,
+    table: &TableName,
+    col_name: &str,
+    file_path: &str,
+) {
+    let registry = sess.engine.jsonb_posting_registry();
+    // The jsonb_posting registry is populated by the read-path lazy loader and
+    // by compaction, NOT by the file-level GinIndexRegistry we just filled.
+    // Re-index the file directly into the posting registry from storage so the
+    // sidecar reflects the just-backfilled file. We read the JSONB column once
+    // more here; for the common small-table CREATE INDEX this is cheap.
+    let Some(sidecar) = basin_storage::index::jsonb_posting::posting_sidecar_key_for_data_file(
+        &sess.project, table, col_name, file_path,
+    ) else {
+        return;
+    };
+    // Load the table schema to find the JSONB column index.
+    let meta = match sess.engine.config().catalog.load_table(&sess.project, table).await {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    let rg_size = meta
+        .row_block_size
+        .map(|v| v as usize)
+        .or(meta.row_group_rows)
+        .unwrap_or(basin_storage::DEFAULT_MAX_ROW_GROUP_SIZE)
+        .max(1);
+    let storage = sess.engine.config().storage.clone();
+    let path = object_store::path::Path::from(file_path);
+    let opts = basin_storage::ReadOptions {
+        projection: Some(vec![col_name.to_string()]),
+        ..Default::default()
+    };
+    let mut stream = match storage.read_file_with_options(&sess.project, &path, opts).await {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    use futures::StreamExt;
+    while let Some(Ok(batch)) = stream.next().await {
+        let Ok(col_idx) = batch.schema().index_of(col_name) else {
+            continue;
+        };
+        registry.index_batch(&sess.project, table, col_name, &batch, col_idx, rg_size, file_path);
+    }
+    if let Some(bytes) = registry.serialize_file(&sess.project, table, col_name, file_path) {
+        use object_store::ObjectStoreExt as _;
+        let store = storage.project_object_store(&sess.project);
+        if let Err(e) = store
+            .put(
+                &sidecar,
+                object_store::PutPayload::from_bytes(bytes::Bytes::from(bytes)),
+            )
+            .await
+        {
+            tracing::warn!(
+                table = %table, col = %col_name, file = %file_path, err = %e,
+                "CREATE INDEX backfill: JSONB posting sidecar write failed (non-fatal)"
+            );
+        }
+    }
 }
 
 /// `DROP INDEX [IF EXISTS] <name>`. Removes the catalog row only —
@@ -6728,9 +7138,22 @@ pub(crate) async fn exec_select(
                 // Within a transaction: include pending (not-yet-committed)
                 // files (UPDATE/DELETE rewrites) AND tx-buffered htap batches
                 // (INSERTs deferred until COMMIT — perf-w7-txn) so reads see
-                // within-tx writes.
+                // within-tx writes. When THIS table has neither, the cheap
+                // refresh suffices — snapshot pinning still applies because
+                // it lives in load_table_for_read inside refresh_table_inner,
+                // not in the htap overlay.
                 let pending = crate::session::tx_pending_files_for(&sess.state, table);
                 let htap_batches = crate::session::tx_htap_batches_for(&sess.state, table);
+                if pending.is_empty() && htap_batches.is_empty() {
+                    crate::session::refresh_table(
+                        &sess.engine,
+                        &sess.project,
+                        &sess.ctx,
+                        &sess.state,
+                        table,
+                    )
+                    .await?;
+                } else {
                 crate::session::refresh_table_with_htap(
                     &sess.engine,
                     &sess.project,
@@ -6741,6 +7164,7 @@ pub(crate) async fn exec_select(
                     htap_batches,
                 )
                 .await?;
+                }
                 // In-transaction: skip file count (parallelism heuristic is
                 // non-critical; counting would require an extra catalog call).
             } else {

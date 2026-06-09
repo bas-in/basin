@@ -429,6 +429,13 @@ impl Engine {
         if let Some(shard) = inner.cfg.shard.as_ref() {
             shard.set_gin_rowgroup_registry(inner.gin_rowgroup_registry.clone());
             shard.set_jsonb_posting_registry(inner.jsonb_posting_registry.clone());
+            // FIX 2 — wire the secondary B-tree index registry into the
+            // compactor (via the `SecondaryIndexSink` trait object) so newly
+            // compacted files register their single-column index values.
+            shard.set_secondary_index_registry(
+                inner.secondary_index_registry.clone()
+                    as Arc<dyn basin_shard::SecondaryIndexSink>,
+            );
         }
         attach_reactor_sink(&inner, catalog);
         let engine = Self { inner };
@@ -732,6 +739,16 @@ impl Engine {
         &self,
     ) -> &Arc<crate::secondary_index::ProjectIndexRegistry> {
         &self.inner.secondary_index_registry
+    }
+
+    /// Public accessor for integration tests that need to inspect the
+    /// secondary B-tree index registry (e.g. to verify CREATE INDEX backfill
+    /// and compaction re-indexing populate `(value → file/row-group/row)`
+    /// locations under the expected file paths).
+    pub fn secondary_index_registry_for_test(
+        &self,
+    ) -> Arc<crate::secondary_index::ProjectIndexRegistry> {
+        self.inner.secondary_index_registry.clone()
     }
 
     // ── Phase 5.19.C: GIN containment index ──────────────────────────────────
@@ -1205,6 +1222,9 @@ impl Drop for ProjectSession {
 
 pub use crate::pk_row_cache::PkRowCacheCountersSnapshot;
 pub use crate::prepared::{BoundStatement, ScalarParam, StatementHandle, StatementSchema};
+/// Re-export the secondary B-tree index registry + location type so
+/// integration tests can probe the registry directly (FIX 2 verification).
+pub use crate::secondary_index::{IndexLocation, ProjectIndexRegistry};
 
 /// Outcome of one SQL statement.
 #[derive(Debug)]
@@ -1263,6 +1283,7 @@ mod executor;
 mod explain;
 mod fast_aggregate;
 mod fast_select;
+mod point_join;
 mod hot_tombstone;
 mod tombstone_cold_scan;
 mod fts_udf;

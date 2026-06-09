@@ -152,6 +152,12 @@ pub(crate) struct InProcessShard {
     jsonb_posting_registry: std::sync::RwLock<
         Option<Arc<basin_storage::index::jsonb_posting::JsonbPostingRegistry>>,
     >,
+    /// Secondary B-tree index sink (FIX 2).  Same lifecycle as
+    /// `gin_rowgroup_registry`: wired once at engine startup via
+    /// `Shard::set_secondary_index_registry`, read by `compact_one` to
+    /// register the indexed-column values of each newly compacted file.
+    /// `None` until the engine wires it in (safe: compactor skips indexing).
+    secondary_index_registry: std::sync::RwLock<Option<Arc<dyn crate::SecondaryIndexSink>>>,
     /// Phase 6.X.A — leases held by this replica + their granted epoch.
     held_leases: HeldLeases,
     /// Phase 6.X.C — partitions whose lease is mid-handoff. While present in
@@ -169,6 +175,7 @@ impl InProcessShard {
             top_pattern_provider: std::sync::RwLock::new(None),
             gin_rowgroup_registry: std::sync::RwLock::new(None),
             jsonb_posting_registry: std::sync::RwLock::new(None),
+            secondary_index_registry: std::sync::RwLock::new(None),
             held_leases: Arc::new(Mutex::new(HashMap::new())),
             draining: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -190,6 +197,11 @@ impl InProcessShard {
             .read()
             .expect("jsonb_posting_registry lock poisoned")
             .clone();
+        let sec_registry = self
+            .secondary_index_registry
+            .read()
+            .expect("secondary_index_registry lock poisoned")
+            .clone();
         Self {
             cfg: self.cfg.clone(),
             partitions: self.partitions.clone(),
@@ -197,6 +209,7 @@ impl InProcessShard {
             top_pattern_provider: std::sync::RwLock::new(provider),
             gin_rowgroup_registry: std::sync::RwLock::new(rg_registry),
             jsonb_posting_registry: std::sync::RwLock::new(jp_registry),
+            secondary_index_registry: std::sync::RwLock::new(sec_registry),
             held_leases: self.held_leases.clone(),
             draining: self.draining.clone(),
         }
@@ -1470,6 +1483,31 @@ impl InProcessShard {
                 data_file.path.as_ref().as_ref(),
             );
 
+            // FIX 2(a) — register the compacted file's single-column B-tree
+            // index values into the secondary-index registry so point queries
+            // on an indexed column can prune to this file.  Like the GIN
+            // re-index above, this is the ONLY place the secondary registry is
+            // populated for shard-written data (INSERT bypasses the engine's
+            // `maintain_secondary_indexes_on_insert`).
+            //
+            // Stale-entry eviction: the current shard compactor only APPENDS a
+            // new merged file (`commit_with_retry` -> `append_data_file`); the
+            // tail rows it consumed were never in the registry under any file
+            // path (INSERT never populated it), so there is no pre-existing
+            // entry to remove for those rows.  A future Parquet-merge compactor
+            // that supersedes existing cold-tier files would need to call the
+            // sink's `remove_file` for each replaced path; that path does not
+            // exist today (mirrors the GIN-reindex eviction note above).
+            reindex_compacted_file_secondary(
+                &self.secondary_index_registry,
+                project,
+                &table,
+                &gin_indexes,
+                effective_rg_size,
+                &merged,
+                data_file.path.as_ref().as_ref(),
+            );
+
             // Inv-W5 / W9: build the JSONB posting list (per-(key, value)
             // → set of (file, row_group) inverted index) for any GIN
             // index on a JSONB column.  This is the prune primitive for
@@ -1776,6 +1814,14 @@ impl ShardImpl for InProcessShard {
             .jsonb_posting_registry
             .write()
             .expect("jsonb_posting_registry lock poisoned");
+        *guard = Some(registry);
+    }
+
+    fn set_secondary_index_registry(&self, registry: Arc<dyn crate::SecondaryIndexSink>) {
+        let mut guard = self
+            .secondary_index_registry
+            .write()
+            .expect("secondary_index_registry lock poisoned");
         *guard = Some(registry);
     }
 
@@ -2609,6 +2655,111 @@ fn reindex_compacted_file_gin(
             file_path,
             rg_size,
         );
+    }
+}
+
+/// FIX 2(a) — register the compacted file's single-column B-tree index values
+/// into the secondary-index sink.
+///
+/// This is the compactor's counterpart to the engine's
+/// `maintain_secondary_indexes_on_insert` (which only runs on the non-shard
+/// INSERT path). For every single-column, plain (`btree`) `SecondaryIndex` on
+/// the table it extracts `(key_text, file, row_group, row)` locations from the
+/// merged batch and pushes them through the [`crate::SecondaryIndexSink`] under
+/// the NEW file's path. GIN / GIST / multi-column indexes are skipped (handled
+/// by their own row-group / interval / posting registries).
+///
+/// `registry_lock` is `None` until `Engine::new` calls
+/// `Shard::set_secondary_index_registry`; skip indexing in that case (safe: the
+/// probe path treats a missing entry as "unknown — full scan", never a false
+/// negative).
+///
+/// Row-group ordinal semantics (must match the read path's expectations):
+///   * **Parquet**: the writer flushes a row-group every `rg_size` rows, so row
+///     `r` lands in row-group `r / rg_size` — identical to the GIN row-group
+///     mapping in `maintain_gin_rowgroup_index_on_insert`. The secondary-index
+///     probe uses the row-group only to skip within an opened file; file-level
+///     pruning is what dominates.
+///   * **Vortex**: the engine ignores the per-location `row_group` for Vortex
+///     reads (file-level allow-list wins). We still record the same uniform
+///     `r / rg_size` ordinal so the format-agnostic extraction stays simple;
+///     it is harmless because the Vortex read path never consults it.
+fn reindex_compacted_file_secondary(
+    registry_lock: &std::sync::RwLock<Option<Arc<dyn crate::SecondaryIndexSink>>>,
+    project: &ProjectId,
+    table: &TableName,
+    indexes: &[basin_catalog::SecondaryIndex],
+    rg_size: usize,
+    batch: &arrow_array::RecordBatch,
+    file_path: &str,
+) {
+    use arrow_array::Array;
+
+    let registry = {
+        let guard = registry_lock
+            .read()
+            .expect("secondary_index_registry lock poisoned");
+        match guard.as_ref() {
+            Some(r) => r.clone(),
+            None => return,
+        }
+    };
+
+    let rg_size = rg_size.max(1);
+    let schema = batch.schema();
+
+    for idx in indexes {
+        // Only single-column plain B-tree indexes are handled here. GIN,
+        // GIST, HNSW/IVFFlat (vector) indexes have their own registries and
+        // are populated elsewhere in `compact_one`.
+        if idx.columns.len() != 1 {
+            continue;
+        }
+        if idx.access_method != "btree" {
+            continue;
+        }
+        let col_name = &idx.columns[0];
+        let Ok(col_idx) = schema.index_of(col_name) else {
+            continue;
+        };
+        let col = batch.column(col_idx);
+
+        // Mirror of `basin_engine::secondary_index::extract_entries_from_batch`
+        // (which we cannot call across the dependency edge), producing the
+        // primitive `(key, file, row_group, row)` tuples the sink accepts.
+        let mut entries: Vec<(String, String, u32, u64)> = Vec::new();
+        macro_rules! extract_typed {
+            ($arr_ty:ty, $fmt:expr) => {{
+                if let Some(arr) = col.as_any().downcast_ref::<$arr_ty>() {
+                    for row in 0..arr.len() {
+                        if arr.is_null(row) {
+                            continue;
+                        }
+                        let key: String = $fmt(arr.value(row));
+                        let row_group = (row / rg_size) as u32;
+                        entries.push((key, file_path.to_string(), row_group, row as u64));
+                    }
+                }
+            }};
+        }
+        use arrow_array::{
+            BooleanArray, Float64Array, Int64Array, LargeStringArray, StringArray, UInt64Array,
+        };
+        extract_typed!(Int64Array, |v: i64| v.to_string());
+        extract_typed!(UInt64Array, |v: u64| v.to_string());
+        extract_typed!(Float64Array, |v: f64| format!("{v:?}"));
+        extract_typed!(StringArray, |v: &str| v.to_string());
+        extract_typed!(LargeStringArray, |v: &str| v.to_string());
+        extract_typed!(BooleanArray, |v: bool| if v {
+            "t"
+        } else {
+            "f"
+        }
+        .to_string());
+
+        if !entries.is_empty() {
+            registry.insert_batch_locations(project, table, col_name, entries);
+        }
     }
 }
 

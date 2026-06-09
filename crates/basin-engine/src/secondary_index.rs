@@ -462,6 +462,44 @@ impl ProjectIndexRegistry {
     }
 }
 
+/// FIX 2 — bridge the engine's `ProjectIndexRegistry` to the shard compactor.
+///
+/// `basin-shard` cannot name `ProjectIndexRegistry` (it would close the
+/// `basin-engine -> basin-shard` dependency cycle), so the compactor talks to
+/// the registry through the [`basin_shard::SecondaryIndexSink`] trait. The
+/// shard passes primitive `(key, file, row_group, row)` tuples — exactly the
+/// fields of [`IndexLocation`] — which we reassemble here. The `key`/`row_group`
+/// semantics match [`extract_entries_from_batch`] (the engine-side INSERT-path
+/// extractor) so locations registered by the compactor are probe-compatible
+/// with locations registered on the direct-INSERT path.
+impl basin_shard::SecondaryIndexSink for ProjectIndexRegistry {
+    fn insert_batch_locations(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        col: &str,
+        entries: Vec<(String, String, u32, u64)>,
+    ) {
+        let mapped: Vec<(String, IndexLocation)> = entries
+            .into_iter()
+            .map(|(key, file_path, row_group, row)| {
+                (key, IndexLocation { file_path, row_group, row })
+            })
+            .collect();
+        self.insert_batch(project, table, col, mapped);
+    }
+
+    fn remove_file(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        col: &str,
+        file_path: &str,
+    ) {
+        self.remove_file_from_index(project, table, col, file_path);
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Object-store path helpers
 // ─────────────────────────────────────────────────────────────────────────────
