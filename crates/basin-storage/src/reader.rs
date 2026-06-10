@@ -2595,8 +2595,25 @@ fn vortex_filter_expr(
             (ScalarValue::Float64(f), DataType::Float64) => Some(lit(*f)),
             (ScalarValue::Boolean(b), DataType::Boolean) => Some(lit(*b)),
             (ScalarValue::UInt64(u), DataType::UInt64) => Some(lit(*u)),
-            // Width/type mismatch, strings, timestamps, decimals, etc. —
-            // do NOT push (would risk a Vortex dtype-compare panic).
+            // Utf8 string equality → push a Utf8 literal so Vortex's native
+            // zone-map (min/max) chunk pruning + selective decode engages.
+            // This is the dominant path for promoted-JSONB shadow-column
+            // lookups (`__promoted$col$key = '…'`, ADR 0027): without the
+            // push the whole Utf8 column decodes per query and the predicate
+            // runs only in the Arrow post-filter — a full-column scan at 1M
+            // rows. The `like`/StartsWith arm below already pushes Utf8
+            // literals safely, so an `eq` Utf8 literal is equally sound; the
+            // decode path is fault-tolerant (any dtype-mismatch scan error
+            // falls back to a plain full decode, see `decode_with_cache`) and
+            // the Arrow post-filter stays active when the push was inferred,
+            // so the final row set is byte-identical either way.
+            //
+            // Only `Utf8` is pushed — `LargeUtf8` / `Utf8View` are left to the
+            // post-filter (same conservatism as the StartsWith arm) to avoid a
+            // dtype-mismatch in the spawned scan task.
+            (ScalarValue::Utf8(s), DataType::Utf8) => Some(lit(s.clone())),
+            // Width/type mismatch, other string widths, timestamps, decimals,
+            // etc. — do NOT push (would risk a Vortex dtype-compare panic).
             _ => None,
         }
     };

@@ -603,10 +603,51 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
         if order_by.is_some() || q.ext_limit().is_some() {
             return None;
         }
+        // Minimal read projection for the aggregate: the union of the columns
+        // the aggregate functions actually consume (SUM/MIN/MAX args; COUNT(*)
+        // needs none) plus every column the WHERE clause references. Decoding
+        // ANYTHING ELSE is wasted I/O + CPU — a `COUNT(*) WHERE
+        // __promoted$payload$category = '…'` only needs the one small Utf8
+        // shadow column, NOT the whole `payload` JSONB blob the `None` (read
+        // every column) behaviour used to pull. At 1M rows that is the
+        // difference between decoding one narrow column and decoding every
+        // column in the file. When the union is empty (e.g. unfiltered
+        // `COUNT(*)`) we keep `None` so the reader can pick its own cheapest
+        // column to satisfy the row count.
+        let agg_read_cols: Option<Vec<String>> = {
+            let mut cols: Vec<String> = Vec::new();
+            let mut push = |c: &str, cols: &mut Vec<String>| {
+                if !cols.iter().any(|x| x == c) {
+                    cols.push(c.to_string());
+                }
+            };
+            for a in &aggs {
+                match a {
+                    AggregateFn::CountStar => {}
+                    AggregateFn::Sum(c) | AggregateFn::Min(c) | AggregateFn::Max(c) => {
+                        push(c, &mut cols)
+                    }
+                }
+            }
+            for p in &parsed_where.predicates {
+                push(p.column(), &mut cols);
+            }
+            for c in &parsed_where.is_null_cols {
+                push(c, &mut cols);
+            }
+            for (c, _) in &parsed_where.in_list_preds {
+                push(c, &mut cols);
+            }
+            if cols.is_empty() {
+                None
+            } else {
+                Some(cols)
+            }
+        };
         return Some(SimpleSelectPlan {
             table,
             projection: None, // not a row projection
-            read_cols: None,   // read all columns for aggregates
+            read_cols: agg_read_cols,
             aggregates: Some(aggs),
             predicates: parsed_where.predicates,
             is_null_cols: parsed_where.is_null_cols,

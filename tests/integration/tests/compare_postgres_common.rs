@@ -3414,17 +3414,41 @@ async fn run_oltp_extra_suite(
             f64::INFINITY
         };
         let basin_ms = if basin_scratch_ok {
+            // BASIN_DEBUG_GAP support for the multi-statement txn shape (it does
+            // not route through `basin_timed_try`, so wire the same eprintln
+            // here): print the exact statement + error that aborts the txn.
+            let debug_gap = std::env::var("BASIN_DEBUG_GAP").is_ok();
+            let mut step = |label: &'static str,
+                            r: std::result::Result<
+                                basin_engine::ExecResult,
+                                basin_common::BasinError,
+                            >|
+             -> bool {
+                match r {
+                    Ok(_) => true,
+                    Err(e) => {
+                        if debug_gap {
+                            eprintln!("[GAP] select_for_update step={label}\n      err={e:?}");
+                        }
+                        false
+                    }
+                }
+            };
             let started = Instant::now();
-            let mut ok = sess.execute("BEGIN").await.is_ok();
-            ok &= sess
-                .execute("SELECT * FROM oltp_extra WHERE id = 7 FOR UPDATE")
-                .await
-                .is_ok();
-            ok &= sess
-                .execute("UPDATE oltp_extra SET amount = amount + 1 WHERE id = 7")
-                .await
-                .is_ok();
-            ok &= sess.execute("COMMIT").await.is_ok();
+            let mut ok = step("BEGIN", sess.execute("BEGIN").await);
+            ok = ok
+                && step(
+                    "SELECT FOR UPDATE",
+                    sess.execute("SELECT * FROM oltp_extra WHERE id = 7 FOR UPDATE")
+                        .await,
+                );
+            ok = ok
+                && step(
+                    "UPDATE",
+                    sess.execute("UPDATE oltp_extra SET amount = amount + 1 WHERE id = 7")
+                        .await,
+                );
+            ok = ok && step("COMMIT", sess.execute("COMMIT").await);
             if ok {
                 Some(started.elapsed().as_secs_f64() * 1000.0)
             } else {
