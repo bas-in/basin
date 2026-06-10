@@ -278,6 +278,8 @@ impl TableProvider for InfoSchemaColumnsProvider {
             ("pg_type", InfoSchemaQuery::pg_type_schema()),
             ("pg_proc", InfoSchemaQuery::pg_proc_schema()),
             ("pg_index", InfoSchemaQuery::pg_index_schema()),
+            ("pg_sequence", InfoSchemaQuery::pg_sequence_schema()),
+            ("pg_enum", InfoSchemaQuery::pg_enum_schema()),
             ("pg_constraint", InfoSchemaQuery::pg_constraint_schema()),
             ("pg_depend", InfoSchemaQuery::pg_depend_schema()),
             ("pg_authid", InfoSchemaQuery::pg_authid_schema()),
@@ -1521,6 +1523,13 @@ simple_provider!(
     pg_stat_activity,
     "PgStatActivityProvider"
 );
+simple_provider!(
+    PgSequenceProvider,
+    pg_sequence_schema,
+    pg_sequence,
+    "PgSequenceProvider"
+);
+simple_provider!(PgEnumProvider, pg_enum_schema, pg_enum, "PgEnumProvider");
 
 // information_schema new views
 simple_provider!(
@@ -2121,6 +2130,16 @@ pub(crate) fn register_info_schema_providers(
     let pg_type_provider: Arc<dyn TableProvider> =
         Arc::new(PgTypeProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_type".to_string(), pg_type_provider)?;
+
+    // ORM catalog completion: pg_catalog.pg_sequence + pg_catalog.pg_enum.
+    // SQLAlchemy / Drizzle introspect sequences and enum labels by joining
+    // these against pg_class / pg_type.
+    let pg_sequence_provider: Arc<dyn TableProvider> =
+        Arc::new(PgSequenceProvider::new(catalog.clone(), project)?);
+    pg_catalog_schema.register_table("pg_sequence".to_string(), pg_sequence_provider)?;
+    let pg_enum_provider: Arc<dyn TableProvider> =
+        Arc::new(PgEnumProvider::new(catalog.clone(), project)?);
+    pg_catalog_schema.register_table("pg_enum".to_string(), pg_enum_provider)?;
 
     // Phase 5.11.M tail: pg_catalog.pg_depend + pg_catalog.pg_authid.
     // Lower-priority catalog completeness — admin scripts / pg_dump

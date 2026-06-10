@@ -57,6 +57,7 @@ async fn pg_index_returns_empty_for_v01() {
             "indnatts".to_string(),
             "indisunique".to_string(),
             "indisprimary".to_string(),
+            "indisvalid".to_string(),
             "indkey".to_string(),
         ]
     );

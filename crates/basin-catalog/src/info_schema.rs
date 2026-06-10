@@ -161,6 +161,46 @@ impl InfoSchemaQuery {
                 .map(|s| s.data_files.iter().map(|f| f.row_count).sum::<u64>())
                 .unwrap_or(0);
             reltuples.push(rows as f32);
+
+            // Emit a `relkind = 'i'` row for every index relation on this
+            // table (the implicit `<table>_pkey` plus each declared
+            // `CREATE INDEX`) so the standard ORM JOIN
+            // `pg_index.indexrelid = pg_class.oid` resolves. `relname` is the
+            // index name; the namespace matches the parent table's.
+            let table_ns = namespace_oid_for(project, qt.schema.as_str());
+            if !meta.pk_columns.is_empty() {
+                let pk_name = pk_constraint_name(&qt.name);
+                oids.push(index_oid(project, &qt.name, &pk_name));
+                relnames.push(pk_name);
+                namespaces.push(table_ns);
+                relkinds.push(RELKIND_INDEX);
+                rls.push(false);
+                partitioned.push(false);
+                reltuples.push(0.0);
+            }
+            for idx in &meta.indexes {
+                oids.push(index_oid(project, &qt.name, &idx.name));
+                relnames.push(idx.name.clone());
+                namespaces.push(table_ns);
+                relkinds.push(RELKIND_INDEX);
+                rls.push(false);
+                partitioned.push(false);
+                reltuples.push(0.0);
+            }
+        }
+
+        // Emit a `relkind = 'S'` row per sequence so a JOIN
+        // `pg_sequence.seqrelid = pg_class.oid` resolves. Sequences live in
+        // the public namespace in v0.1.
+        let seq_ns = namespace_oid_for(project, DEFAULT_SCHEMA);
+        for seq in catalog.list_sequences(project).await {
+            oids.push(sequence_oid(project, &seq.name));
+            relnames.push(seq.name.clone());
+            namespaces.push(seq_ns);
+            relkinds.push(RELKIND_SEQUENCE);
+            rls.push(false);
+            partitioned.push(false);
+            reltuples.push(1.0);
         }
 
         let schema = Self::pg_class_schema();
@@ -608,22 +648,26 @@ impl InfoSchemaQuery {
 
     /// Schema for `pg_catalog.pg_index` rows.
     ///
-    /// Basin v0.1 has no user-defined indexes (Phase 5.7 B1 secondary
-    /// indexes are queued); this view always returns zero rows. The
-    /// schema is shaped exactly like PG's `pg_index` so introspection
-    /// clients (PostgREST, pgAdmin) that probe `pg_index` succeed and
-    /// see an empty result, rather than failing on a missing relation.
-    /// Once 5.7 B1 ships, the row-builder will read
-    /// [`TableMetadata::indexes`] and emit one row per declared index.
+    /// One row per index on each project-owned table:
+    ///   * the implicit PRIMARY KEY index (`<table>_pkey`, `indisprimary =
+    ///     true`, `indisunique = true`) for every table that declares a PK;
+    ///   * one row per user-declared `CREATE INDEX` in
+    ///     [`TableMetadata::indexes`].
     ///
-    /// | column        | type     | notes                                 |
-    /// |---------------|----------|---------------------------------------|
-    /// | indexrelid    | BIGINT   | always 0 (no indexes in v0.1)         |
-    /// | indrelid      | BIGINT   | parent table's pg_class oid           |
-    /// | indnatts      | SMALLINT | column count                           |
-    /// | indisunique   | BOOL     |                                        |
-    /// | indisprimary  | BOOL     |                                        |
-    /// | indkey        | TEXT     | space-separated column attnums         |
+    /// `indexrelid` is a stable OID derived by [`index_oid`] and is also the
+    /// OID of the matching `pg_class` row (relkind `'i'`) so the standard ORM
+    /// introspection JOIN `pg_index.indexrelid = pg_class.oid` resolves.
+    /// `indrelid` reuses the parent table's [`table_oid`].
+    ///
+    /// | column        | type     | notes                                       |
+    /// |---------------|----------|---------------------------------------------|
+    /// | indexrelid    | BIGINT   | index relation's pg_class oid               |
+    /// | indrelid      | BIGINT   | parent table's pg_class oid                 |
+    /// | indnatts      | SMALLINT | key-column count                            |
+    /// | indisunique   | BOOL     | true for PK + enforced UNIQUE indexes       |
+    /// | indisprimary  | BOOL     | true only for the implicit `<table>_pkey`   |
+    /// | indisvalid    | BOOL     | always true (no concurrent-build state)     |
+    /// | indkey        | TEXT     | int2vector: space-separated column attnums  |
     pub fn pg_index_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("indexrelid", DataType::Int64, false),
@@ -631,23 +675,88 @@ impl InfoSchemaQuery {
             Field::new("indnatts", DataType::Int16, false),
             Field::new("indisunique", DataType::Boolean, false),
             Field::new("indisprimary", DataType::Boolean, false),
+            Field::new("indisvalid", DataType::Boolean, false),
             Field::new("indkey", DataType::Utf8, false),
         ]))
     }
 
-    /// Build `pg_catalog.pg_index` filtered to `project`. Always empty in
-    /// v0.1 (no user-defined indexes). The `project` argument is held for
-    /// signature stability against the v0.2 expansion that will read
-    /// [`TableMetadata::indexes`].
-    pub async fn pg_index(_catalog: &dyn Catalog, _project: &ProjectId) -> Result<RecordBatch> {
+    /// Build `pg_catalog.pg_index` filtered to `project`. Emits the implicit
+    /// PK index plus one row per declared `CREATE INDEX`. See
+    /// [`pg_index_schema`](Self::pg_index_schema) for the row semantics.
+    ///
+    /// Cross-project leak is a P0 invariant: only [`Catalog::list_tables`] /
+    /// [`Catalog::load_table`] for `project` are consulted.
+    pub async fn pg_index(catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
+        let names = catalog.list_tables(project).await?;
+
+        let mut indexrelids: Vec<i64> = Vec::new();
+        let mut indrelids: Vec<i64> = Vec::new();
+        let mut indnatts: Vec<i16> = Vec::new();
+        let mut indisuniques: Vec<bool> = Vec::new();
+        let mut indisprimaries: Vec<bool> = Vec::new();
+        let mut indisvalids: Vec<bool> = Vec::new();
+        let mut indkeys: Vec<String> = Vec::new();
+
+        for name in &names {
+            let meta = catalog.load_table(project, name).await?;
+            let relid = table_oid(project, name);
+
+            // Implicit PRIMARY KEY index, named `<table>_pkey`. PG always
+            // materialises this; ORMs (SQLAlchemy, Drizzle) rely on it.
+            if !meta.pk_columns.is_empty() {
+                let pk_name = pk_constraint_name(name);
+                let indkey = meta
+                    .pk_columns
+                    .iter()
+                    .filter_map(|c| attnum_in_schema(&meta.schema, c))
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                indexrelids.push(index_oid(project, name, &pk_name));
+                indrelids.push(relid);
+                indnatts.push(meta.pk_columns.len() as i16);
+                indisuniques.push(true);
+                indisprimaries.push(true);
+                indisvalids.push(true);
+                indkeys.push(indkey);
+            }
+
+            // User-declared indexes. The `unique` flag from `CREATE UNIQUE
+            // INDEX` is not stored on `SecondaryIndex` itself, but the engine
+            // registers a same-named `UniqueConstraint` for an enforceable
+            // plain-column unique index — so we derive `indisunique` from
+            // whether a unique-constraint with this index's name exists.
+            for idx in &meta.indexes {
+                let indkey = idx
+                    .columns
+                    .iter()
+                    .filter_map(|c| attnum_in_schema(&meta.schema, c))
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let is_unique = meta
+                    .unique_constraints
+                    .iter()
+                    .any(|u| u.name == idx.name);
+                indexrelids.push(index_oid(project, name, &idx.name));
+                indrelids.push(relid);
+                indnatts.push(idx.columns.len() as i16);
+                indisuniques.push(is_unique);
+                indisprimaries.push(false);
+                indisvalids.push(true);
+                indkeys.push(indkey);
+            }
+        }
+
         let schema = Self::pg_index_schema();
         let columns: Vec<ArrayRef> = vec![
-            Arc::new(Int64Array::from(Vec::<i64>::new())),
-            Arc::new(Int64Array::from(Vec::<i64>::new())),
-            Arc::new(Int16Array::from(Vec::<i16>::new())),
-            Arc::new(BooleanArray::from(Vec::<bool>::new())),
-            Arc::new(BooleanArray::from(Vec::<bool>::new())),
-            Arc::new(StringArray::from(Vec::<String>::new())),
+            Arc::new(Int64Array::from(indexrelids)),
+            Arc::new(Int64Array::from(indrelids)),
+            Arc::new(Int16Array::from(indnatts)),
+            Arc::new(BooleanArray::from(indisuniques)),
+            Arc::new(BooleanArray::from(indisprimaries)),
+            Arc::new(BooleanArray::from(indisvalids)),
+            Arc::new(StringArray::from(indkeys)),
         ];
         RecordBatch::try_new(schema, columns)
             .map_err(|e| BasinError::internal(format!("pg_catalog.pg_index build: {e}")))
@@ -1406,16 +1515,20 @@ impl InfoSchemaQuery {
     /// table; `typnamespace` is hashed per-project against the
     /// `"pg_catalog"` schema so a JOIN against `pg_namespace` works the
     /// same way as `pg_class.relnamespace` / `pg_proc.pronamespace`.
-    /// `catalog` is unused for v0.1 (no user-defined types in pg_type yet)
-    /// and held for signature stability against the v0.2 expansion that
-    /// will read project-defined enum / domain types.
-    pub async fn pg_type(_catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
-        let n = BASIN_PG_TYPES.len();
+    /// Appends one `typtype = 'e'` row per user-defined enum type in
+    /// [`Catalog::list_enum_types`] so ORMs that resolve a column's
+    /// `pg_attribute.atttypid` against `pg_type` and then JOIN `pg_enum`
+    /// see the enum and its labels. Built-in rows come first (stable OIDs),
+    /// enum rows follow (per-project [`enum_type_oid`] hashes, namespace
+    /// `public`).
+    pub async fn pg_type(catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
+        let enums = catalog.list_enum_types(project).await;
+        let n = BASIN_PG_TYPES.len() + enums.len();
         let mut oids: Vec<i64> = Vec::with_capacity(n);
-        let mut typnames: Vec<&'static str> = Vec::with_capacity(n);
+        let mut typnames: Vec<String> = Vec::with_capacity(n);
         let mut typnamespaces: Vec<i64> = Vec::with_capacity(n);
-        let mut typtypes: Vec<&'static str> = Vec::with_capacity(n);
-        let mut typcategories: Vec<&'static str> = Vec::with_capacity(n);
+        let mut typtypes: Vec<&str> = Vec::with_capacity(n);
+        let mut typcategories: Vec<&str> = Vec::with_capacity(n);
         let mut typlens: Vec<i16> = Vec::with_capacity(n);
         let mut typbyvals: Vec<bool> = Vec::with_capacity(n);
 
@@ -1423,12 +1536,28 @@ impl InfoSchemaQuery {
 
         for (oid, typname, typtype, typcategory, typlen, typbyval) in BASIN_PG_TYPES {
             oids.push(*oid);
-            typnames.push(typname);
+            typnames.push((*typname).to_string());
             typnamespaces.push(nsp);
             typtypes.push(typtype);
             typcategories.push(typcategory);
             typlens.push(*typlen);
             typbyvals.push(*typbyval);
+        }
+
+        // User-defined enum types live in the public namespace (where the
+        // user created them). typtype 'e' / typcategory 'E' is what PG emits
+        // for enums; they are variable-length pass-by-reference (typlen -1,
+        // typbyval false) like any 4-byte+ oid-backed type the ORM treats
+        // as text on the wire.
+        let public_nsp = namespace_oid_for(project, DEFAULT_SCHEMA);
+        for e in &enums {
+            oids.push(enum_type_oid(project, &e.name));
+            typnames.push(e.name.clone());
+            typnamespaces.push(public_nsp);
+            typtypes.push(TYPTYPE_ENUM);
+            typcategories.push(TYPCATEGORY_ENUM);
+            typlens.push(4);
+            typbyvals.push(true);
         }
 
         let schema = Self::pg_type_schema();
@@ -3049,6 +3178,139 @@ impl InfoSchemaQuery {
     }
 
     // -----------------------------------------------------------------------
+    // pg_catalog.pg_sequence  (real, from catalog sequences)
+    // -----------------------------------------------------------------------
+
+    /// Schema for `pg_catalog.pg_sequence` rows. One row per project sequence.
+    ///
+    /// `seqrelid` matches the sequence's `pg_class` (relkind `'S'`) oid via
+    /// [`sequence_oid`] so ORMs can join `pg_sequence.seqrelid = pg_class.oid`.
+    /// `seqtypid` is always int8 (OID 20) — Basin sequences are 64-bit.
+    ///
+    /// | column        | type   | notes                                  |
+    /// |---------------|--------|----------------------------------------|
+    /// | seqrelid      | BIGINT | sequence relation's pg_class oid        |
+    /// | seqtypid      | BIGINT | element type OID (20 = int8)            |
+    /// | seqstart      | BIGINT | START value                            |
+    /// | seqincrement  | BIGINT | INCREMENT BY                           |
+    /// | seqmax        | BIGINT | MAXVALUE                               |
+    /// | seqmin        | BIGINT | MINVALUE                               |
+    /// | seqcache      | BIGINT | CACHE                                  |
+    /// | seqcycle      | BOOL   | CYCLE flag                             |
+    pub fn pg_sequence_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("seqrelid", DataType::Int64, false),
+            Field::new("seqtypid", DataType::Int64, false),
+            Field::new("seqstart", DataType::Int64, false),
+            Field::new("seqincrement", DataType::Int64, false),
+            Field::new("seqmax", DataType::Int64, false),
+            Field::new("seqmin", DataType::Int64, false),
+            Field::new("seqcache", DataType::Int64, false),
+            Field::new("seqcycle", DataType::Boolean, false),
+        ]))
+    }
+
+    /// Build `pg_catalog.pg_sequence` filtered to `project`. One row per
+    /// sequence in [`Catalog::list_sequences`]. Cross-project leak is a P0
+    /// invariant: only `project`-scoped sequences are consulted.
+    pub async fn pg_sequence(catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
+        let seqs = catalog.list_sequences(project).await;
+
+        let mut seqrelids: Vec<i64> = Vec::with_capacity(seqs.len());
+        let mut seqtypids: Vec<i64> = Vec::with_capacity(seqs.len());
+        let mut seqstarts: Vec<i64> = Vec::with_capacity(seqs.len());
+        let mut seqincrements: Vec<i64> = Vec::with_capacity(seqs.len());
+        let mut seqmaxes: Vec<i64> = Vec::with_capacity(seqs.len());
+        let mut seqmins: Vec<i64> = Vec::with_capacity(seqs.len());
+        let mut seqcaches: Vec<i64> = Vec::with_capacity(seqs.len());
+        let mut seqcycles: Vec<bool> = Vec::with_capacity(seqs.len());
+
+        for seq in &seqs {
+            seqrelids.push(sequence_oid(project, &seq.name));
+            seqtypids.push(SEQ_TYPE_OID_INT8);
+            seqstarts.push(seq.start);
+            seqincrements.push(seq.increment);
+            seqmaxes.push(seq.max_value);
+            seqmins.push(seq.min_value);
+            seqcaches.push(seq.cache_size as i64);
+            seqcycles.push(seq.cycle);
+        }
+
+        let schema = Self::pg_sequence_schema();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(seqrelids)),
+            Arc::new(Int64Array::from(seqtypids)),
+            Arc::new(Int64Array::from(seqstarts)),
+            Arc::new(Int64Array::from(seqincrements)),
+            Arc::new(Int64Array::from(seqmaxes)),
+            Arc::new(Int64Array::from(seqmins)),
+            Arc::new(Int64Array::from(seqcaches)),
+            Arc::new(BooleanArray::from(seqcycles)),
+        ];
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| BasinError::internal(format!("pg_catalog.pg_sequence build: {e}")))
+    }
+
+    // -----------------------------------------------------------------------
+    // pg_catalog.pg_enum  (real, from catalog enum types)
+    // -----------------------------------------------------------------------
+
+    /// Schema for `pg_catalog.pg_enum` rows. One row per (enum type, label).
+    ///
+    /// `enumtypid` matches the enum's `pg_type.oid` via [`enum_type_oid`] so
+    /// ORMs can join `pg_enum.enumtypid = pg_type.oid`. `enumsortorder` is the
+    /// 1-based float position PG assigns (labels stored in declaration order).
+    ///
+    /// | column        | type    | notes                                   |
+    /// |---------------|---------|-----------------------------------------|
+    /// | oid           | BIGINT  | per-(type, label) stable oid            |
+    /// | enumtypid     | BIGINT  | owning enum's pg_type oid               |
+    /// | enumsortorder | FLOAT4  | 1-based sort position (1.0, 2.0, …)      |
+    /// | enumlabel     | TEXT    | the label string                        |
+    pub fn pg_enum_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("oid", DataType::Int64, false),
+            Field::new("enumtypid", DataType::Int64, false),
+            Field::new("enumsortorder", DataType::Float32, false),
+            Field::new("enumlabel", DataType::Utf8, false),
+        ]))
+    }
+
+    /// Build `pg_catalog.pg_enum` filtered to `project`. One row per label of
+    /// each user-defined enum in [`Catalog::list_enum_types`], in declaration
+    /// (= sort) order. Cross-project leak is a P0 invariant.
+    pub async fn pg_enum(catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
+        let enums = catalog.list_enum_types(project).await;
+
+        let mut oids: Vec<i64> = Vec::new();
+        let mut enumtypids: Vec<i64> = Vec::new();
+        let mut enumsortorders: Vec<f32> = Vec::new();
+        let mut enumlabels: Vec<String> = Vec::new();
+
+        for e in &enums {
+            let typid = enum_type_oid(project, &e.name);
+            for (i, label) in e.labels.iter().enumerate() {
+                // Per-label oid: distinct prefix keyed on (type, label).
+                let key = format!("basin.pg_enum_label:{project}:{}:{label}", e.name);
+                oids.push(fnv1a_64_to_positive_i64(key.as_bytes()));
+                enumtypids.push(typid);
+                enumsortorders.push((i as f32) + 1.0);
+                enumlabels.push(label.clone());
+            }
+        }
+
+        let schema = Self::pg_enum_schema();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(oids)),
+            Arc::new(Int64Array::from(enumtypids)),
+            Arc::new(Float32Array::from(enumsortorders)),
+            Arc::new(StringArray::from(enumlabels)),
+        ];
+        RecordBatch::try_new(schema, columns)
+            .map_err(|e| BasinError::internal(format!("pg_catalog.pg_enum build: {e}")))
+    }
+
+    // -----------------------------------------------------------------------
     // information_schema.domains  (real, from catalog domains)
     // -----------------------------------------------------------------------
 
@@ -4329,6 +4591,19 @@ const TABLE_TYPE_BASE_TABLE: &str = "BASE TABLE";
 const RELKIND_TABLE: &str = "r";
 /// `pg_class.relkind` literal for materialized views (continuous aggregates).
 const RELKIND_MATVIEW: &str = "m";
+/// `pg_class.relkind` literal for index relations.
+const RELKIND_INDEX: &str = "i";
+/// `pg_class.relkind` literal for sequence relations.
+const RELKIND_SEQUENCE: &str = "S";
+
+/// `pg_sequence.seqtypid` element type. Basin sequences are 64-bit, so the
+/// element type is always int8 (PG OID 20).
+const SEQ_TYPE_OID_INT8: i64 = 20;
+
+/// `pg_type.typtype` literal for user-defined enum types.
+const TYPTYPE_ENUM: &str = "e";
+/// `pg_type.typcategory` literal for enum types.
+const TYPCATEGORY_ENUM: &str = "E";
 
 /// Field-metadata key the engine uses for `GENERATED ALWAYS AS (<expr>)
 /// STORED` columns. Duplicated here as a `&str` rather than imported from
@@ -4585,6 +4860,38 @@ fn pg_type_oid_for_field(field: &Field) -> i64 {
 /// constant prefix (`b"basin.pg_class:"`) is load-bearing for stability.
 fn table_oid(project: &ProjectId, table: &TableName) -> i64 {
     let key = format!("basin.pg_class:{project}:{}", table.as_str());
+    fnv1a_64_to_positive_i64(key.as_bytes())
+}
+
+/// Stable 64-bit oid for an index relation. The index is keyed by its
+/// `(project, table, index_name)` triple — the table name participates so
+/// two tables with same-named indexes (PG forbids this within a schema, but
+/// the v0.1 catalog scopes index names per-table) never collide on oid.
+///
+/// This is the OID `pg_index.indexrelid` reports AND the OID of the matching
+/// `pg_class` row (relkind `'i'`), so the ORM introspection JOIN
+/// `pg_index.indexrelid = pg_class.oid` resolves. Distinct prefix from
+/// [`table_oid`] so an index and a table never share an oid.
+fn index_oid(project: &ProjectId, table: &TableName, index_name: &str) -> i64 {
+    let key = format!("basin.pg_index:{project}:{}:{index_name}", table.as_str());
+    fnv1a_64_to_positive_i64(key.as_bytes())
+}
+
+/// Stable 64-bit oid for a sequence relation. This is the OID
+/// `pg_sequence.seqrelid` reports AND the OID of the matching `pg_class` row
+/// (relkind `'S'`), so a JOIN `pg_sequence.seqrelid = pg_class.oid` resolves.
+/// Distinct prefix so a sequence never collides with a table / index oid.
+fn sequence_oid(project: &ProjectId, name: &str) -> i64 {
+    let key = format!("basin.pg_sequence:{project}:{name}");
+    fnv1a_64_to_positive_i64(key.as_bytes())
+}
+
+/// Stable 64-bit oid for a user-defined enum type. This is the OID
+/// `pg_type.oid` reports for the enum AND the `pg_enum.enumtypid` the labels
+/// join against. Distinct prefix so an enum type never collides with a
+/// table / index / sequence oid.
+fn enum_type_oid(project: &ProjectId, name: &str) -> i64 {
+    let key = format!("basin.pg_enum_type:{project}:{name}");
     fnv1a_64_to_positive_i64(key.as_bytes())
 }
 
