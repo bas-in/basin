@@ -823,9 +823,27 @@ async fn gate_predicate_not_pk_eq_delete_goes_slow() {
     assert_eq!(n, 9, "DELETE WHERE v=50 must remove 1 row; count={n}");
 }
 
-/// `UPDATE … WHERE other_col = 20` (non-PK predicate) must go slow path.
+/// Count `MemRowValue::Update` entries in the registry for `table`.
+fn registry_update_count(eng: &Engine, project: &ProjectId, table: &TableName) -> usize {
+    match eng.memtable_registry().get(project, table) {
+        Some(e) => e
+            .memtable
+            .snapshot()
+            .iter()
+            .filter(|(_, v)| matches!(v, MemRowValue::Update { .. }))
+            .count(),
+        None => 0,
+    }
+}
+
+/// `UPDATE … WHERE other_col = 20` (non-PK predicate) now routes the matched
+/// SMALL set (≤ SMALL_BULK_FASTPATH_CAP) through the hot-tier overlay via the
+/// resolve-by-probe path (the probe evaluates the full predicate, returns the
+/// matching PK, and the overlay write applies to exactly that key). The old
+/// "non-PK predicate must go slow" contract is obsolete: a single-row non-PK
+/// match must now produce an overlay Update with the correct value.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn gate_predicate_not_pk_eq_update_goes_slow() {
+async fn gate_predicate_not_pk_eq_update_small_set_routes_overlay() {
     let _g = ENV_LOCK.lock().await;
     let _upd = set_env("BASIN_HOTTIER_UPDATE_FASTPATH");
 
@@ -836,22 +854,54 @@ async fn gate_predicate_not_pk_eq_update_goes_slow() {
     let table = TableName::new("t").unwrap();
     seed(&sess, "t", 10).await;
 
+    // Non-PK equality predicate matching exactly one row (id=2, v=20).
     exec(&sess, "UPDATE t SET v = 9999 WHERE v = 20").await;
 
-    let entry = eng.memtable_registry().get(&project, &table);
-    if let Some(e) = entry {
-        let snap = e.memtable.snapshot();
-        let has_any_update = snap
-            .iter()
-            .any(|(_, v)| matches!(v, MemRowValue::Update { .. }));
-        assert!(
-            !has_any_update,
-            "non-PK UPDATE must not write any Update entries; \
-             predicate_not_pk_eq gate must block the fastpath"
-        );
-    }
+    // NEW contract: the small matched set is routed through the overlay, so
+    // exactly one Update entry is written.
+    assert_eq!(
+        registry_update_count(&eng, &project, &table),
+        1,
+        "small non-PK UPDATE must write exactly one overlay Update (probe fast path)"
+    );
 
-    // Functional: the row with v=20 (id=2) now has v=9999.
+    // Functional: the row with v=20 (id=2) now has v=9999, read back through
+    // the overlay-aware read path.
     let v = fetch_v(&sess, "t", 2).await;
     assert_eq!(v, Some(9999), "UPDATE WHERE v=20 must apply to id=2");
+    // An unmatched row is untouched.
+    assert_eq!(fetch_v(&sess, "t", 1).await, Some(10), "id=1 untouched");
+}
+
+/// A non-PK predicate matching MORE than `SMALL_BULK_FASTPATH_CAP` (64) rows
+/// must NOT route through the overlay — it falls to the cold copy-on-write
+/// path (whole-file rewrite), so the registry holds zero Update entries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gate_predicate_not_pk_eq_update_large_set_goes_cold() {
+    let _g = ENV_LOCK.lock().await;
+    let _upd = set_env("BASIN_HOTTIER_UPDATE_FASTPATH");
+
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = open(&eng).await;
+    let project = sess.project();
+    let table = TableName::new("t").unwrap();
+    // 100 rows: v = id*10, so v ranges 10..=1000.
+    seed(&sess, "t", 100).await;
+
+    // Non-PK range predicate matching 70 rows (v in 10..=700 → id 1..=70),
+    // which exceeds the 64-row cap → cold CoW, no overlay.
+    exec(&sess, "UPDATE t SET v = 0 WHERE v <= 700").await;
+
+    assert_eq!(
+        registry_update_count(&eng, &project, &table),
+        0,
+        ">cap non-PK UPDATE must fall to cold CoW; no overlay Update entries"
+    );
+
+    // Functional: the 70 matched rows were rewritten (cold path), the rest are
+    // untouched.
+    assert_eq!(fetch_v(&sess, "t", 70).await, Some(0), "id=70 rewritten via cold CoW");
+    assert_eq!(fetch_v(&sess, "t", 71).await, Some(710), "id=71 untouched");
+    assert_eq!(count_all(&sess, "t").await, 100, "COUNT stable");
 }

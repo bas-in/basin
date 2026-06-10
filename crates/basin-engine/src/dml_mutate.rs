@@ -1475,9 +1475,22 @@ fn returning_is_fast_path_eligible(items: &[SelectItem]) -> bool {
 ///     condition, every THEN result, and the ELSE result are allowlisted, and
 ///     whose conditions use only comparison / boolean connectives.
 ///
+/// Function allowlist (recursive on arguments — see `RMW_FN_ALLOWLIST`):
+///   * `jsonb_set`, `jsonb_insert`, `jsonb_strip_nulls`, `coalesce` — every
+///     one is registered `Volatility::Immutable` and its result depends only
+///     on its argument values (and a row's column values when an argument IS a
+///     column ref), never on wall-clock time, other rows, or external state.
+///     `jsonb_set(col, '{a,b}', '…')` rewriting one row's JSONB blob is exactly
+///     the row-local/deterministic shape the overlay can serve byte-identically
+///     to cold (same `generated_cols::eval_expression` evaluator). Every
+///     argument must itself be allowlisted, so `jsonb_set(col, path, now())`
+///     stays on the cold path.
+///
 /// Deliberately EXCLUDED (kept on the cold path):
-///   * function calls (`some_function(v)`, `NOW()`, `COALESCE`, `UPPER`, …) —
-///     a UDF or time function need not be row-local/deterministic;
+///   * any function NOT in `RMW_FN_ALLOWLIST` (`now()`, `random()`, `upper()`,
+///     arbitrary UDFs) — a time/volatile/non-row-local function must stay on
+///     the cold oracle. `now()` in particular is volatile and is the canonical
+///     "do not fast-path" case;
 ///   * `/` (Divide) and `%` (Modulo) — division-by-zero and integer-vs-float
 ///     coercion behaviour is subtle; "when in doubt, exclude";
 ///   * `TRY_CAST` / `SAFE_CAST` and casts with a FORMAT clause;
@@ -1543,8 +1556,81 @@ fn rmw_rhs_is_fast_path_eligible(expr: &Expr, schema: &Schema) -> bool {
                 None => true,
             }
         }
+        // Allowlisted, Immutable, row-local function call: every positional
+        // argument must itself be allowlisted. Named args / wildcard args /
+        // DISTINCT / ORDER BY / FILTER / OVER take it off the fast path.
+        Expr::Function(f) => rmw_function_is_fast_path_eligible(f, schema),
         _ => false,
     }
+}
+
+/// Functions whose result is `Volatility::Immutable` AND row-local: it depends
+/// only on the (literal or column-ref) argument values, never on wall-clock
+/// time, randomness, other rows, or external state. The overlay can serve their
+/// post-image byte-identically to the cold path because both run the SAME
+/// `generated_cols::eval_expression` evaluator on the SAME pre-image row.
+///
+/// Conservative by construction: this is an explicit closed list, not a
+/// volatility lookup, so adding a function is a deliberate, reviewed change.
+/// `now()` / `random()` / `gen_random_uuid()` are NOT here (volatile);
+/// `upper()` etc. are omitted not because they're unsafe but because they
+/// aren't in the hot-shape benchmark battery and "when in doubt, exclude".
+const RMW_FN_ALLOWLIST: &[&str] = &[
+    "jsonb_set",
+    "jsonb_insert",
+    "jsonb_strip_nulls",
+    "coalesce",
+];
+
+/// Return `true` when `f` is an allowlisted, Immutable, row-local function call
+/// (name in `RMW_FN_ALLOWLIST`) whose every positional argument is itself
+/// fast-path-eligible. Any non-plain call shape (named args, `*`, DISTINCT,
+/// ORDER BY, FILTER, WITHIN GROUP, OVER) bails to the cold path.
+fn rmw_function_is_fast_path_eligible(f: &sqlparser::ast::Function, schema: &Schema) -> bool {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+    // Reject any window (`OVER`), FILTER, WITHIN GROUP, NULL-treatment, ODBC
+    // `{fn …}`, or ClickHouse parametric (`f(a)(b)`) decoration — none is the
+    // plain scalar shape `eval_expression` projects.
+    if f.over.is_some()
+        || f.filter.is_some()
+        || !f.within_group.is_empty()
+        || f.null_treatment.is_some()
+        || f.uses_odbc_syntax
+        || !matches!(f.parameters, FunctionArguments::None)
+    {
+        return false;
+    }
+    let name = f
+        .name
+        .0
+        .last()
+        .map(|i| i.id_val().to_ascii_lowercase())
+        .unwrap_or_default();
+    if !RMW_FN_ALLOWLIST.contains(&name.as_str()) {
+        return false;
+    }
+    let list = match &f.args {
+        FunctionArguments::List(list) => list,
+        // `f()` with no args (none of the allowlist take zero args) → reject.
+        _ => return false,
+    };
+    // No DISTINCT / ALL, no ORDER BY / other in-arglist clauses.
+    if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+        return false;
+    }
+    for a in &list.args {
+        match a {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                if !rmw_rhs_is_fast_path_eligible(e, schema) {
+                    return false;
+                }
+            }
+            // Named args (`=> `), `*`, and qualified-`*` are not the plain
+            // positional shape; bail to cold.
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Return `true` when a CASE-WHEN condition is a comparison or boolean
@@ -1687,23 +1773,23 @@ async fn try_resolve_fast_path_update(
             return Ok(None);
         }
     }
-    // Gate: WHERE must resolve to a pure pk = lit / pk IN (lits) shape.
+    // Gate: there must be a WHERE clause.
     let Some(expr) = predicate else {
         // `UPDATE t SET …` with no WHERE rewrites every row; walking every
         // cold PK to override it would defeat the purpose. Slow path.
-        return Ok(None);
-    };
-    let Some(lit_exprs) = predicate_resolves_to_pk_list(expr, pk_col, table.as_str()) else {
         return Ok(None);
     };
     // Gate: every assignment must be either a plain scalar OR an allowlisted
     // read-modify-write expression; reject anything else, and reject any
     // assignment that touches the PK column (key re-encoding / uniqueness).
     //
-    // Read-modify-write (`SET col = col + 1`, `SET col = CASE …`, `SET a = b`)
-    // is the single worst-performing UPDATE shape: at 1M rows the cold
-    // copy-on-write rewrite is 2.7–16.5s vs ~20ms on the hot overlay. Routing
-    // it through the overlay is safe because:
+    // We resolve the assignment eligibility BEFORE the (potentially I/O-bound)
+    // multi-key probe so an ineligible SET never pays for a probe SELECT.
+    //
+    // Read-modify-write (`SET col = col + 1`, `SET col = CASE …`, `SET a = b`,
+    // `SET payload = jsonb_set(payload, …)`) is the single worst-performing
+    // UPDATE shape: at 1M rows the cold copy-on-write rewrite is 1.7–16.5s vs
+    // ~20ms on the hot overlay. Routing it through the overlay is safe because:
     //   * `apply_assignments` already evaluates `AssignmentRhs::Expr` against
     //     the pre-image batch via the SAME `generated_cols::eval_expression`
     //     DataFusion projection the cold path uses — so for any row-local,
@@ -1718,11 +1804,13 @@ async fn try_resolve_fast_path_update(
     //
     // We therefore admit an EXPLICIT allowlist of expression shapes whose
     // evaluation is row-local and deterministic (column refs, +/-/* arithmetic,
-    // comparison-based CASE, simple casts, and nestings thereof — see
-    // `rmw_rhs_is_fast_path_eligible`). Anything outside the allowlist
-    // (function calls, division/modulo, subqueries, NOW(), …) still falls to
-    // the cold path, which remains the semantics oracle. Do NOT widen the
-    // allowlist without re-running rmw_update_correctness + update_hottier.
+    // comparison-based CASE, simple casts, Immutable row-local functions —
+    // `jsonb_set`/`jsonb_insert`/`jsonb_strip_nulls`/`coalesce` — and nestings
+    // thereof; see `rmw_rhs_is_fast_path_eligible`). Anything outside the
+    // allowlist (volatile functions, division/modulo, subqueries, NOW(), …)
+    // still falls to the cold path, which remains the semantics oracle. Do NOT
+    // widen the allowlist without re-running rmw_update_correctness +
+    // update_hottier.
     let parsed = parse_assignments(assignments, meta.schema.as_ref())?;
     debug_assert_eq!(parsed.len(), assignments.len());
     for ((_, rhs), assignment) in parsed.iter().zip(assignments.iter()) {
@@ -1739,24 +1827,245 @@ async fn try_resolve_fast_path_update(
     if parsed.iter().any(|(idx, _)| *idx == pk_idx) {
         return Ok(None);
     }
-    // Empty IN-list → zero matches (UPDATE 0); return empty key set.
-    if lit_exprs.is_empty() {
-        return Ok(Some((Vec::new(), parsed)));
-    }
-    // Encode every PK literal to its RowKey form; bail on unsupported types.
     let pk_dt = meta.schema.field(pk_idx).data_type().clone();
-    let mut keys: Vec<basin_hottier::RowKey> = Vec::with_capacity(lit_exprs.len());
-    for lit in &lit_exprs {
-        let scalar = match try_literal_to_scalar(lit, &pk_dt, pk_col)? {
-            Some(s) => s,
-            None => return Ok(None),
-        };
-        let Some(key) = pk_scalar_to_row_key(&scalar, &pk_dt) else {
-            return Ok(None);
-        };
-        keys.push(key);
+
+    // ── WHERE → matched-PK set resolution ───────────────────────────────────
+    //
+    // Two strategies, cheapest first:
+    //
+    //   (A) Literal pk-list — `WHERE pk = lit` / `pk IN (lits)`. Resolved with
+    //       ZERO reads by `predicate_resolves_to_pk_list`: the matched key set
+    //       IS the literal list. This is the historical single-/few-key shape.
+    //
+    //   (B) Resolve-by-probe — any OTHER predicate the fast SELECT machinery
+    //       understands (`pk < lit`, `pk <= lit`, `pk BETWEEN a AND b`,
+    //       `pk > a AND pk < b`, even a NON-pk equality like `status = 'x'`).
+    //       Ranges over arbitrary PKs aren't enumerable without a read, so we
+    //       PROBE: run `SELECT <pk> FROM t WHERE <original predicate> LIMIT N+1`
+    //       through the EXISTING `execute_simple_select` fast path. If ≤ N keys
+    //       come back we have the EXACT matched set and route them through
+    //       `hot_tier_update_by_pk`; if N+1 rows come back (too many for a
+    //       small-bulk overlay write) or the probe can't represent the
+    //       predicate, we return `Ok(None)` and the caller falls to cold CoW —
+    //       exactly as today.
+    if let Some(lit_exprs) = predicate_resolves_to_pk_list(expr, pk_col, table.as_str()) {
+        // (A) Literal list. Empty IN-list → zero matches (UPDATE 0).
+        if lit_exprs.is_empty() {
+            return Ok(Some((Vec::new(), parsed)));
+        }
+        let mut keys: Vec<basin_hottier::RowKey> = Vec::with_capacity(lit_exprs.len());
+        for lit in &lit_exprs {
+            let scalar = match try_literal_to_scalar(lit, &pk_dt, pk_col)? {
+                Some(s) => s,
+                None => return Ok(None),
+            };
+            let Some(key) = pk_scalar_to_row_key(&scalar, &pk_dt) else {
+                return Ok(None);
+            };
+            keys.push(key);
+        }
+        return Ok(Some((keys, parsed)));
     }
-    Ok(Some((keys, parsed)))
+
+    // (B) Resolve-by-probe.
+    match probe_matched_pk_keys(sess, table, meta, pk_col, &pk_dt, expr).await? {
+        Some(keys) => Ok(Some((keys, parsed))),
+        None => Ok(None),
+    }
+}
+
+/// Small-bulk fast-path cap: the maximum number of matched PKs a probed UPDATE
+/// will route through the hot-tier overlay. A WHERE matching more than this many
+/// rows falls to the cold copy-on-write path (whose write-amp is amortised over
+/// a whole-file rewrite anyway). 64 keeps the overlay write + per-key read-
+/// before-write bounded while still covering the `WHERE id < 10` /
+/// "matches ~10 rows" benchmark shapes.
+const SMALL_BULK_FASTPATH_CAP: usize = 64;
+
+/// Resolve the EXACT set of matched PK `RowKey`s for an UPDATE whose WHERE is
+/// NOT a literal pk-list, by probing the existing fast-SELECT machinery.
+///
+/// Returns:
+///   * `Ok(Some(keys))` — the predicate matched ≤ `SMALL_BULK_FASTPATH_CAP`
+///     rows and every matched PK encoded to a `RowKey`; route them through the
+///     overlay.
+///   * `Ok(None)` — too many matches (> cap), an un-probe-able predicate shape,
+///     a NULL / unsupported-type PK, or any other reason to fall to cold CoW.
+///
+/// ── Probe design ─────────────────────────────────────────────────────────
+/// We build `SELECT <pk> FROM <table> WHERE <predicate> LIMIT N+1` (N = cap)
+/// by round-tripping the ORIGINAL predicate `Expr` back to SQL text (its
+/// `Display` is faithful for sqlparser ASTs and subqueries were already
+/// resolved to literals upstream in `exec_update`), parse it, and feed it to
+/// `match_simple_select`. That matcher is the gate on which predicates we
+/// accept: anything it can't represent (OR, function predicates, IS NOT NULL,
+/// >3 AND atoms, …) yields `None` here and we fall to cold. Because the probe
+/// evaluates the FULL original predicate and returns the matching PKs, the
+/// UPDATE then applies to EXACTLY those keys — the predicate is fully consumed
+/// by the probe, so a non-pk residual (`status = 'x'`) needs no post-probe
+/// re-evaluation.
+///
+/// `execute_simple_select` is overlay-aware (it merges tombstones + UPDATE
+/// overrides on read), so the probe sees the same logical state a user SELECT
+/// would — prior hot-tier mutations included.
+///
+/// ── Race argument (auto-commit, no surrounding tx) ───────────────────────
+/// Between the probe SELECT and the overlay write a concurrent session could
+/// INSERT a row that ALSO matches the predicate; our overlay then misses it.
+/// This is the SAME class of race the cold CoW path already has: the cold path
+/// lists + reads the base files at one instant and rewrites them, re-evaluating
+/// the predicate over WHAT IT READ — a row inserted to the tail AFTER that read
+/// is likewise missed. Both paths take a read snapshot, evaluate the predicate
+/// over it, and write; neither holds a predicate lock. So the probe path is
+/// race-EQUIVALENT to the cold path, not weaker.
+///
+/// Ordering equivalence: the cold path flushes the INSERT tail before it lists
+/// base files (`pre_mutation_flush_if_tail` in `exec_update`, which runs BEFORE
+/// this gate). The probe inherits that exact ordering — the tail flush already
+/// happened — and `execute_simple_select` additionally flushes the shard tail
+/// itself, so the probe reads a post-flush head identical to the one the cold
+/// rewrite would list. No additional flush is required here.
+async fn probe_matched_pk_keys(
+    sess: &ProjectSession,
+    table: &TableName,
+    meta: &basin_catalog::TableMetadata,
+    pk_col: &str,
+    pk_dt: &DataType,
+    predicate: &Expr,
+) -> Result<Option<Vec<basin_hottier::RowKey>>> {
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    // Gate: probe only in auto-commit. `execute_simple_select` is the no-pin /
+    // live-head entrypoint; inside an explicit tx it would not read at this
+    // session's pinned read-view (or see this tx's own overlay writes), so a
+    // probed key set could diverge from what the tx should mutate. The literal
+    // pk-list path (which performs no read) stays in-tx-eligible above; only the
+    // resolve-by-probe shapes are restricted to auto-commit. In a tx these
+    // predicates fall to the cold CoW path, which honours the tx read-view.
+    if crate::session::tx_is_active(&sess.state) {
+        return Ok(None);
+    }
+
+    // Build the probe SQL. Quote both identifiers so reserved-word / mixed-case
+    // table and PK names round-trip. The predicate Display is faithful for the
+    // sqlparser AST we hold (subqueries already resolved to literals upstream).
+    let probe_sql = format!(
+        "SELECT \"{pk}\" FROM \"{tbl}\" WHERE {pred} LIMIT {lim}",
+        pk = pk_col.replace('"', "\"\""),
+        tbl = table.as_str().replace('"', "\"\""),
+        pred = predicate,
+        lim = SMALL_BULK_FASTPATH_CAP + 1,
+    );
+    let mut stmts = match Parser::parse_sql(&PostgreSqlDialect {}, &probe_sql) {
+        Ok(s) => s,
+        // A predicate that won't re-parse (shouldn't happen for an AST we just
+        // held) → fall to cold rather than erroring the user's UPDATE.
+        Err(_) => return Ok(None),
+    };
+    let Some(stmt) = stmts.pop() else {
+        return Ok(None);
+    };
+    // The fast-SELECT matcher is the gate on which predicates we accept; an
+    // un-representable shape (OR, function predicate, IS NOT NULL, …) → cold.
+    let Some(plan) = crate::fast_select::match_simple_select(&stmt) else {
+        return Ok(None);
+    };
+
+    // Run the probe through the overlay-aware fast-SELECT path. `include_deleted
+    // = false` so tombstoned rows are not returned (they must not be re-updated).
+    let result = crate::fast_select::execute_simple_select(
+        sess,
+        plan,
+        Some(meta.clone()),
+        &probe_sql,
+        false,
+    )
+    .await?;
+    let batches = match result {
+        ExecResult::Rows { batches, .. } => batches,
+        // An `Empty` result for a row-returning probe is unexpected; be safe.
+        ExecResult::Empty { .. } => return Ok(None),
+    };
+
+    // Collect + cap. The LIMIT already bounds the probe to N+1 rows, so seeing
+    // strictly more than N means "too many to small-bulk" → cold.
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    if total > SMALL_BULK_FASTPATH_CAP {
+        return Ok(None);
+    }
+    if total == 0 {
+        // Zero matches: a valid fast-path outcome (UPDATE 0). Returning an empty
+        // key set keeps us off the cold path for a no-op WHERE.
+        return Ok(Some(Vec::new()));
+    }
+
+    let mut keys: Vec<basin_hottier::RowKey> = Vec::with_capacity(total);
+    for batch in &batches {
+        // The probe projected exactly the PK column, so it is column 0.
+        let col = batch.column(0);
+        for row in 0..batch.num_rows() {
+            if col.is_null(row) {
+                // A NULL PK can't encode to a RowKey and shouldn't exist for a
+                // PK column; bail to cold for safety.
+                return Ok(None);
+            }
+            let Some(key) = pk_array_value_to_row_key(col.as_ref(), row, pk_dt) else {
+                return Ok(None);
+            };
+            keys.push(key);
+        }
+    }
+    Ok(Some(keys))
+}
+
+/// Encode the PK value at `row` of `arr` into a `RowKey`, mirroring the type
+/// support of [`pk_scalar_to_row_key`] (Int64 / Int32 / Int16 / UInt64 / Utf8 /
+/// Boolean). Returns `None` for an unsupported column type so the caller falls
+/// back to the cold path. The Arrow array type must match the PK column's
+/// declared `DataType` (it comes straight from the probe projection of that
+/// column).
+fn pk_array_value_to_row_key(
+    arr: &dyn arrow_array::Array,
+    row: usize,
+    col_dt: &DataType,
+) -> Option<basin_hottier::RowKey> {
+    use arrow_array::{
+        BooleanArray, Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray,
+        UInt64Array,
+    };
+    let b = basin_hottier::RowKey::builder();
+    Some(match col_dt {
+        DataType::Int64 => {
+            let a = arr.as_any().downcast_ref::<Int64Array>()?;
+            b.append_i64(a.value(row)).finish()
+        }
+        DataType::Int32 => {
+            let a = arr.as_any().downcast_ref::<Int32Array>()?;
+            b.append_i32(a.value(row)).finish()
+        }
+        DataType::Int16 => {
+            let a = arr.as_any().downcast_ref::<Int16Array>()?;
+            b.append_i16(a.value(row)).finish()
+        }
+        DataType::UInt64 => {
+            let a = arr.as_any().downcast_ref::<UInt64Array>()?;
+            b.append_u64(a.value(row)).finish()
+        }
+        DataType::Utf8 => {
+            let a = arr.as_any().downcast_ref::<StringArray>()?;
+            b.append_str(a.value(row)).finish()
+        }
+        DataType::LargeUtf8 => {
+            let a = arr.as_any().downcast_ref::<LargeStringArray>()?;
+            b.append_str(a.value(row)).finish()
+        }
+        DataType::Boolean => {
+            let a = arr.as_any().downcast_ref::<BooleanArray>()?;
+            b.append_u8(if a.value(row) { 1 } else { 0 }).finish()
+        }
+        _ => return None,
+    })
 }
 
 /// Execute the resolved hot-tier UPDATE: for each matched PK read the current
@@ -5804,6 +6113,31 @@ fn parse_compound_predicate(
                 Ok(inner)
             }
         }
+        // `col BETWEEN low AND high` desugars to `col >= low AND col <= high`.
+        // We route each bound through `parse_atom`, which already resolves the
+        // column (bare/qualified), validates it against the schema, and
+        // synthesises `>=`/`<=` as the `Lt OR Eq` / `Gt OR Eq` disjunctions the
+        // storage atom enum understands. Both `evaluate_compound` (per-row cold
+        // rewrite) and `evaluate_compound_for_pruning` (file-stat pruning)
+        // already handle the resulting And/Or/Atom tree, so range deletes flow
+        // through the existing copy-on-write path with no new storage atoms.
+        // `NOT BETWEEN` wraps the whole conjunction in `Not` (Kleene-correct:
+        // NULL bounds stay UNKNOWN → row is kept, matching Postgres).
+        Expr::Between {
+            expr: col_expr,
+            negated,
+            low,
+            high,
+        } => {
+            let lower = parse_atom(col_expr, &BinaryOperator::GtEq, low, schema, table_name)?;
+            let upper = parse_atom(col_expr, &BinaryOperator::LtEq, high, schema, table_name)?;
+            let range = CompoundPredicate::And(vec![lower, upper]);
+            if *negated {
+                Ok(CompoundPredicate::Not(Box::new(range)))
+            } else {
+                Ok(range)
+            }
+        }
         other => Err(BasinError::InvalidSchema(format!(
             "WHERE clause not representable in v0.1: {other}"
         ))),
@@ -7036,6 +7370,74 @@ mod tests {
             negated: false,
         };
         assert!(predicate_resolves_to_pk_list(&e, "id", "t").is_none());
+    }
+
+    // ── rmw function allowlist (`rmw_rhs_is_fast_path_eligible` fn arm) ──────
+
+    /// Schema for the function-allowlist tests: a JSONB-ish `payload` (modelled
+    /// as Utf8 here — the allowlist only checks names + arg eligibility, not
+    /// types) plus a numeric `v`.
+    fn fn_allowlist_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("payload", DataType::Utf8, true),
+            Field::new("v", DataType::Int64, true),
+        ])
+    }
+
+    /// `jsonb_set(payload, '{a,b}', '"x"')` — allowlisted, all args eligible.
+    #[test]
+    fn rmw_fn_jsonb_set_eligible() {
+        let schema = fn_allowlist_schema();
+        let e = parse_expr(r#"jsonb_set(payload, '{a,b}', '"x"')"#);
+        assert!(rmw_rhs_is_fast_path_eligible(&e, &schema));
+    }
+
+    /// `coalesce(v, 0) + 1` — allowlisted fn nested under arithmetic.
+    #[test]
+    fn rmw_fn_coalesce_in_arithmetic_eligible() {
+        let schema = fn_allowlist_schema();
+        let e = parse_expr("coalesce(v, 0) + 1");
+        assert!(rmw_rhs_is_fast_path_eligible(&e, &schema));
+    }
+
+    /// `jsonb_strip_nulls(payload)` and `jsonb_insert(...)` — allowlisted.
+    #[test]
+    fn rmw_fn_jsonb_strip_and_insert_eligible() {
+        let schema = fn_allowlist_schema();
+        assert!(rmw_rhs_is_fast_path_eligible(
+            &parse_expr("jsonb_strip_nulls(payload)"),
+            &schema
+        ));
+        assert!(rmw_rhs_is_fast_path_eligible(
+            &parse_expr(r#"jsonb_insert(payload, '{a}', '1')"#),
+            &schema
+        ));
+    }
+
+    /// `upper(payload)` — deterministic but NOT on the allowlist → cold.
+    #[test]
+    fn rmw_fn_non_allowlisted_returns_false() {
+        let schema = fn_allowlist_schema();
+        let e = parse_expr("upper(payload)");
+        assert!(!rmw_rhs_is_fast_path_eligible(&e, &schema));
+    }
+
+    /// `now()` — volatile, must NOT be eligible.
+    #[test]
+    fn rmw_fn_now_returns_false() {
+        let schema = fn_allowlist_schema();
+        let e = parse_expr("now()");
+        assert!(!rmw_rhs_is_fast_path_eligible(&e, &schema));
+    }
+
+    /// `jsonb_set(payload, '{a}', now())` — an allowlisted fn with a
+    /// NON-allowlisted (volatile) argument must be rejected: arg recursion
+    /// closes the volatile-leak hole.
+    #[test]
+    fn rmw_fn_allowlisted_with_volatile_arg_returns_false() {
+        let schema = fn_allowlist_schema();
+        let e = parse_expr(r#"jsonb_set(payload, '{a}', now())"#);
+        assert!(!rmw_rhs_is_fast_path_eligible(&e, &schema));
     }
 
     // ── pk_scalar_to_row_key ─────────────────────────────────────────────────
