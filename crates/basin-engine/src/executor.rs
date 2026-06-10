@@ -2546,20 +2546,24 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                     // repeatable-read view. No pin yet, pending writes, or a
                     // moved head → DataFusion, which rewinds via
                     // load_table_for_read.
-                    let in_tx_fast_ok = if !in_txn {
-                        true
-                    } else {
-                        let untouched = crate::session::tx_pending_files_for(
-                            &sess.state,
-                            &plan.table,
-                        )
-                        .is_empty()
-                            && crate::session::tx_htap_batches_for(&sess.state, &plan.table)
-                                .is_empty();
-                        untouched
-                            && crate::session::tx_read_snapshot_peek(&sess.state, &plan.table)
-                                == Some(meta.current_snapshot)
-                    };
+                    // Snapshot-pin correctness inside an explicit transaction.
+                    // `execute_simple_select` always reads the *current* catalog
+                    // head: it flushes the shard tail then reloads
+                    // `live_data_files()` (see fast_select.rs) and has no way to
+                    // reconstruct a historical snapshot, so it CANNOT honour a
+                    // txn's repeatable-read pin. Two distinct leaks result:
+                    //   1. the per-session meta cache (`load_table_meta_cached`)
+                    //      lags a concurrent commit by up to its TTL, so the old
+                    //      `meta.current_snapshot == pin` "head unchanged" check
+                    //      could read true even after the head moved; and
+                    //   2. `flush_to_parquet()` inside the fast path can drain a
+                    //      *concurrent* session's shard tail into a NEW head that
+                    //      did not exist when the gate ran.
+                    // Both surface another session's committed rows in this
+                    // transaction's pinned reads (the snapshot_isolation GAP).
+                    // The DataFusion path (`exec_select`) rewinds to the pin via
+                    // `load_table_for_read`, so route every in-txn read there.
+                    let in_tx_fast_ok = !in_txn;
                     if !is_view
                         && !has_rls
                         && !has_soft_delete

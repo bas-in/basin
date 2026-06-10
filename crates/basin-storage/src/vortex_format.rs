@@ -554,7 +554,50 @@ async fn decode_inner(
     let mut sb = vf
         .scan()
         .map_err(|e| BasinError::storage(format!("vortex: scan: {e}")))?;
+    // Effective projection. When the caller asks for an explicit projection we
+    // honour it. When it does NOT (full-row read), the physical Vortex file may
+    // carry MORE columns than the logical/catalog `schema` — e.g. JSONB
+    // shadow-column promotion (ADR 0027) appends `__promoted$…` fields to the
+    // file that are absent from the catalog schema. Decoding the full physical
+    // struct (8 fields) against a 6-field target schema fails inside
+    // `execute_record_batch` ("StructArray has N fields, but target Arrow type
+    // has M fields"). Derive a name-projection from the target schema so the
+    // decoded struct is exactly the logical columns, in catalog order.
+    let derived_proj: Option<Vec<String>> = match (projection, &schema) {
+        (None, Some(s)) => {
+            // Names the physical file actually carries (avoid projecting a
+            // logical column that pre-dates this file's write).
+            let phys = vf.dtype().to_arrow_schema().ok();
+            let phys_has = |n: &str| {
+                phys.as_ref()
+                    .map(|p| p.field_with_name(n).is_ok())
+                    .unwrap_or(true)
+            };
+            let phys_field_count = phys.as_ref().map(|p| p.fields().len());
+            // Only narrow when the physical file genuinely has extra columns —
+            // a same-shape file needs no projection (keeps the cheap fast path).
+            if phys_field_count.map(|c| c > s.fields().len()).unwrap_or(false) {
+                let names: Vec<String> = s
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .filter(|n| phys_has(n))
+                    .collect();
+                if names.len() == s.fields().len() {
+                    Some(names)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
     if let Some(cols) = projection {
+        let names: Vec<&str> = cols.iter().map(|s| s.as_str()).collect();
+        sb = sb.with_projection(select(names, root()));
+    } else if let Some(cols) = &derived_proj {
         let names: Vec<&str> = cols.iter().map(|s| s.as_str()).collect();
         sb = sb.with_projection(select(names, root()));
     }

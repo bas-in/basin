@@ -1366,24 +1366,46 @@ pub(crate) async fn execute_simple_select(
     // includes the shadow columns — no other code path needs to change.
     let referenced_shadow_cols: Vec<String> = {
         let mut cols: Vec<String> = Vec::new();
+        let mut push = |c: &str, cols: &mut Vec<String>| {
+            if c.starts_with("__promoted$") && !cols.iter().any(|x| x == c) {
+                cols.push(c.to_string());
+            }
+        };
         if let Some(rc) = plan.read_cols.as_ref() {
             for c in rc {
-                if c.starts_with("__promoted$") && !cols.contains(c) {
-                    cols.push(c.clone());
-                }
+                push(c, &mut cols);
             }
         }
         if let Some(items) = plan.projection.as_ref() {
             for it in items {
                 if let ProjectionItem::Column(c) = it {
-                    if c.starts_with("__promoted$") && !cols.contains(c) {
-                        cols.push(c.clone());
-                    }
+                    push(c, &mut cols);
                 }
             }
         }
+        // Predicates may reference a promoted shadow column even when the
+        // projection / read_cols do not — e.g. `COUNT(*) WHERE
+        // __promoted$payload$category = '…'` has projection/read_cols = None
+        // (aggregate reads "all columns") yet the WHERE filter still needs the
+        // shadow column decoded. Without scanning predicates here the schema is
+        // not extended and the read omits the shadow column, so the storage
+        // predicate evaluator fails with "predicate column missing".
+        for p in &plan.predicates {
+            push(p.column(), &mut cols);
+        }
+        for c in &plan.is_null_cols {
+            push(c, &mut cols);
+        }
+        for (c, _) in &plan.in_list_preds {
+            push(c, &mut cols);
+        }
         cols
     };
+    // True once we have extended `meta.schema` with promoted shadow columns.
+    // The shard read path (`handle.read`) re-derives its schema from the catalog
+    // (which excludes shadow columns), so it cannot read them; when this is set
+    // the cold files must be read directly with the extended schema instead.
+    let shadow_cols_present = !referenced_shadow_cols.is_empty();
     let meta = if referenced_shadow_cols.is_empty() {
         // No shadow column referenced — the common case, untouched.
         meta
@@ -2331,12 +2353,25 @@ pub(crate) async fn execute_simple_select(
             all.extend(collected.into_iter().collect::<Result<Vec<_>>>()?);
         }
         all
-    } else if had_pk_probe {
-        // Single-PK-Eq fast path: the PK probe already narrowed the cold
-        // tier to at most a handful of candidate files (typically 0-1).
-        // Read those paths directly, bypassing `handle.read`'s full file
-        // discovery — which would re-list every live data file and defeat
-        // the prune. Safety:
+    } else if had_pk_probe || shadow_cols_present {
+        // Direct cold-file read (bypass `handle.read`). Two cases reach here:
+        //
+        //   * `had_pk_probe`: the single-PK-Eq probe already narrowed the cold
+        //     tier to a handful of candidate files; reading them directly skips
+        //     `handle.read`'s full file discovery, which would re-list every
+        //     live file and defeat the prune.
+        //   * `shadow_cols_present`: the query references a promoted JSONB
+        //     shadow column (`__promoted$…`). `handle.read` re-derives its read
+        //     schema from the catalog, which deliberately EXCLUDES shadow
+        //     columns, so it would never decode the shadow column and the
+        //     downstream predicate/projection would fail with "predicate column
+        //     missing". Reading the cold files directly threads the extended
+        //     `meta.schema` (which carries the shadow column) so the column is
+        //     decoded. The shadow-column correctness guard above already proved
+        //     no hot-tier / un-flushed-tail rows exist for this table, so the
+        //     cold files are the authoritative complete row set.
+        //
+        // Safety (shared):
         //   * Hot tier covered: the engine's `MemTableRegistry` was probed
         //     above (line ~1209); a hit returned early. Reaching here means
         //     the queried PK is NOT in the engine memtable.

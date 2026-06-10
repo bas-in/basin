@@ -570,7 +570,12 @@ async fn basin_timed_try(
     let started = Instant::now();
     match sess.execute(sql).await {
         Ok(_) => Some(started.elapsed().as_secs_f64() * 1000.0),
-        Err(_) => None,
+        Err(e) => {
+            if std::env::var("BASIN_DEBUG_GAP").is_ok() {
+                eprintln!("[GAP] sql={sql}\n      err={e:?}");
+            }
+            None
+        }
     }
 }
 

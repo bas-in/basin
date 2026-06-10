@@ -291,3 +291,47 @@ async fn own_writes_visible_under_snapshot_pin() {
     let after = count(&a, "SELECT COUNT(*) FROM t").await;
     assert_eq!(after, 4, "post-COMMIT all four rows visible; saw {after}");
 }
+
+/// Regression for the compare_postgres snapshot_isolation GAP: rstress has a
+/// hot-tier UPDATE applied (leaving Update overlay entries in the shared
+/// memtable) BEFORE the snapshot-isolation block runs. The earlier non-empty
+/// overlay forced `register_cold_with_overlay` down the HtapUnionTable path AND
+/// the per-session meta-cache lagged B's concurrent INSERT — together they let
+/// the in-tx simple-select fast path read the moved catalog head, leaking B's
+/// row into A's pinned view (c2 = c1 + 1). The fix routes every in-txn read
+/// through the snapshot-pinning DataFusion path.
+#[tokio::test]
+async fn snapshot_stable_after_prior_hot_update_overlay_shard() {
+    let (_sd, _wd, eng, _bg, _wal) = open_engine_with_shard().await;
+    let project = ProjectId::new();
+    let a = eng.open_session(project).await.unwrap();
+    let b = eng.open_session(project).await.unwrap();
+
+    a.execute("CREATE TABLE rstress (id BIGINT NOT NULL PRIMARY KEY, v BIGINT, note TEXT)")
+        .await
+        .unwrap();
+    let mut stmt = String::from("INSERT INTO rstress (id, v, note) VALUES ");
+    for i in 0..300i64 {
+        if i > 0 { stmt.push(','); }
+        stmt.push_str(&format!("({i}, {i}, NULL)"));
+    }
+    a.execute(&stmt).await.unwrap();
+
+    // Read fan-out then a hot-tier UPDATE (leaves Update overlay entries).
+    let _ = a.execute("SELECT id, v FROM rstress WHERE id BETWEEN 0 AND 9").await.unwrap();
+    for k in 0..3 {
+        a.execute(&format!("UPDATE rstress SET v = v + {} WHERE id < 50", k + 1))
+            .await
+            .unwrap();
+    }
+
+    a.execute("BEGIN").await.unwrap();
+    let c1 = count(&a, "SELECT COUNT(*) FROM rstress").await;
+    assert_eq!(c1, 300, "A's first in-tx count must see all rows; saw {c1}");
+    b.execute("INSERT INTO rstress (id, v, note) VALUES (777001, 1, NULL)")
+        .await
+        .unwrap();
+    let c2 = count(&a, "SELECT COUNT(*) FROM rstress").await;
+    assert_eq!(c2, c1, "A's second in-tx count must equal first (snapshot stable); saw {c2} vs {c1}");
+    a.execute("COMMIT").await.unwrap();
+}

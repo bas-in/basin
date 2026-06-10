@@ -316,9 +316,11 @@ async fn gate_returning_delete_goes_slow() {
     );
 }
 
-/// `UPDATE … RETURNING *` must go through slow CoW.
+/// RETURNING gate split: plain column lists ride the fastpath (the post-image
+/// is already in hand — see `returning_is_fast_path_eligible`), while
+/// expression RETURNING still requires the slow CoW path's DataFusion context.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn gate_returning_update_goes_slow() {
+async fn gate_returning_update_plain_fast_expression_slow() {
     let _g = ENV_LOCK.lock().await;
     let _upd = set_env("BASIN_HOTTIER_UPDATE_FASTPATH");
 
@@ -336,10 +338,20 @@ async fn gate_returning_update_goes_slow() {
 
     let has_update = registry_has_update(&eng, &project, &table, 1);
     assert!(
-        !has_update,
-        "registry must NOT hold an Update entry after UPDATE … RETURNING; \
-         the returning_present gate must block the fastpath"
+        has_update,
+        "plain-column RETURNING must take the fastpath (Update registry entry)"
     );
+
+    // Expression RETURNING stays on the slow path: no registry override.
+    sess.execute("UPDATE t SET v = 7 WHERE id = 2 RETURNING v + 1")
+        .await
+        .expect("expression RETURNING must succeed via CoW");
+    assert!(
+        !registry_has_update(&eng, &project, &table, 2),
+        "expression RETURNING must NOT take the fastpath"
+    );
+    let v2 = fetch_v(&sess, "t", 2).await;
+    assert_eq!(v2, Some(7), "expression-RETURNING UPDATE must apply the value");
 
     let batches = match res {
         ExecResult::Rows { batches, .. } => batches,
