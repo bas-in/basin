@@ -367,6 +367,56 @@ impl RTreeRegistry {
         Some(rgs)
     }
 
+    /// Probe a file's R-tree for the EXACT set of rows whose envelope
+    /// intersects `query_bbox`, returned as `(row_group_id,
+    /// row_id_in_group)` pairs (ascending, dedup'd) — or `None` if the
+    /// file has no segment in the registry.
+    ///
+    /// For a POINT column this is an *exact* membership test: a point's
+    /// zero-area envelope intersects the AABB query iff the point lies in
+    /// the (closed) rectangle, so `locate_in_envelope_intersecting`
+    /// answers `geom && ST_MakeEnvelope(...)` (PostGIS bbox-overlap,
+    /// boundary-inclusive) with no residual geometry decode required.
+    ///
+    /// This is the row-granular companion to [`candidate_row_groups`]:
+    /// the engine bbox-`&&` pushdown consumes these pairs to build an
+    /// exact row selection, so the FilterExec residual above the scan
+    /// does NOT have to re-decode every WKB POINT in a surviving
+    /// row-group (the dominant cost of the planar `ST_X/ST_Y BETWEEN`
+    /// rewrite). Mirrors how [`nearest_entries`] exposes per-row
+    /// candidates for the KNN path.
+    ///
+    /// [`candidate_row_groups`]: Self::candidate_row_groups
+    /// [`nearest_entries`]: Self::nearest_entries
+    pub fn candidate_rows(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        col: &str,
+        file_path: &str,
+        query_bbox: AABB<[f64; 2]>,
+    ) -> Option<Vec<(RowGroupId, u32)>> {
+        let arc = {
+            let map = self.inner.lock().expect("RTreeRegistry outer lock poisoned");
+            map.get(&RegKey {
+                project: *project,
+                table: table.clone(),
+                col: col.to_string(),
+            })
+            .cloned()
+        }?;
+        let files = arc.lock().expect("RTreeRegistry file table lock poisoned");
+        let rtree = files.by_file.get(file_path)?.clone();
+        let query: Rectangle<[f64; 2]> = query_bbox.into();
+        let mut rows: Vec<(RowGroupId, u32)> = rtree
+            .locate_in_envelope_intersecting(&query.envelope())
+            .map(|e| (e.row_group_id, e.row_id_in_group))
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        Some(rows)
+    }
+
     /// Nearest-neighbour probe for KNN spatial queries.
     ///
     /// Returns up to `take` entries from `file_path`'s R-tree in ascending
@@ -638,6 +688,95 @@ mod tests {
             s.contains("/index/p.rtree/01J7Z0FZ0K0K0K0K0K0K0K0K0K.rtree"),
             "unexpected sidecar path: {s}"
         );
+    }
+
+    #[test]
+    fn envelope_query_boundary_disjoint_and_containing() {
+        // Three points: on the box boundary, strictly inside, far outside.
+        // PostGIS `&&` (and `locate_in_envelope_intersecting`) is
+        // boundary-INCLUSIVE, so a point exactly on the edge/corner counts.
+        let pts: Vec<(i64, f64, f64)> = vec![
+            (0, 10.0, 10.0), // on the upper-right corner of [0,10]^2
+            (1, 5.0, 5.0),   // strictly inside
+            (2, 50.0, 50.0), // disjoint
+            (3, 0.0, 5.0),   // on the left edge
+        ];
+        let batch = make_point_batch(&pts);
+        // rg_size large so every row is row-group 0 → exercise pure
+        // envelope geometry, not row-group bucketing.
+        let rtree = build_rtree_for_batch(&batch, 1, 1000);
+
+        // Box exactly [0,10]^2: boundary-touching corner (0) + left-edge (3)
+        // + interior (1) all qualify; the disjoint point (2) does not.
+        let q = AABB::from_corners([0.0, 0.0], [10.0, 10.0]);
+        let mut ids: Vec<u32> = rtree
+            .locate_in_envelope_intersecting(&q)
+            .map(|e| e.row_id_in_group)
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 1, 3], "boundary-inclusive: corner+edge+interior, not the disjoint point");
+
+        // Fully-containing query: a huge box swallows everything.
+        let q_all = AABB::from_corners([-1000.0, -1000.0], [1000.0, 1000.0]);
+        assert_eq!(
+            rtree.locate_in_envelope_intersecting(&q_all).count(),
+            4,
+            "a box containing the whole dataset returns every entry"
+        );
+
+        // Fully-disjoint query: a box touching nothing returns nothing.
+        let q_none = AABB::from_corners([200.0, 200.0], [300.0, 300.0]);
+        assert_eq!(
+            rtree.locate_in_envelope_intersecting(&q_none).count(),
+            0,
+            "a disjoint box returns no entries"
+        );
+    }
+
+    #[test]
+    fn candidate_rows_is_exact_for_points() {
+        // candidate_rows must return the EXACT (rg, row) set a bbox-`&&`
+        // would match — no row-group over-approximation, no residual decode.
+        let reg = RTreeRegistry::new();
+        let project = ProjectId::new();
+        let table = TableName::new("locs").unwrap();
+        let col = "p";
+        let file = "f1.parquet";
+
+        // rg_size = 3 → rows 0..=2 in rg 0, rows 3..=5 in rg 1.  rg 0 has a
+        // mix of inside/outside points so a row-group prune would over-select
+        // it, but candidate_rows must pinpoint only the matching rows.
+        let pts: Vec<(i64, f64, f64)> = vec![
+            (0, 1.0, 1.0),   // rg0 row0 — inside [0,5]^2
+            (1, 4.0, 4.0),   // rg0 row1 — inside
+            (2, 99.0, 99.0), // rg0 row2 — OUTSIDE (but shares rg0)
+            (3, 2.0, 2.0),   // rg1 row0 — inside
+            (4, 80.0, 80.0), // rg1 row1 — outside
+            (5, 5.0, 0.0),   // rg1 row2 — on the boundary (inside, inclusive)
+        ];
+        let batch = make_point_batch(&pts);
+        let rtree = build_rtree_for_batch(&batch, 1, 3);
+        reg.insert_segment(&project, &table, col, file, rtree);
+
+        let q = AABB::from_corners([0.0, 0.0], [5.0, 5.0]);
+        let rows = reg
+            .candidate_rows(&project, &table, col, file, q)
+            .expect("file is indexed");
+        // Expect exactly rg0/row0, rg0/row1, rg1/row0, rg1/row2 — NOT the
+        // two outside points even though they share row-groups with hits.
+        assert_eq!(rows, vec![(0, 0), (0, 1), (1, 0), (1, 2)]);
+
+        // Row-group prune is a strict superset of the exact rows: both rg0
+        // and rg1 survive because each holds at least one hit.
+        let rgs = reg
+            .candidate_row_groups(&project, &table, col, file, q)
+            .expect("file is indexed");
+        assert_eq!(rgs, vec![0, 1]);
+
+        // Unknown file → None (caller falls back to full scan).
+        assert!(reg
+            .candidate_rows(&project, &table, col, "missing.parquet", q)
+            .is_none());
     }
 
     #[test]
