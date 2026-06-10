@@ -1156,6 +1156,56 @@ impl InProcessShard {
 
             match commit_result {
                 Ok(()) => {
+                    // GIN row-group registry maintenance for the rewritten file.
+                    //
+                    // The sweep SUPERSEDES `file.path` with a NEW path
+                    // (`new_file.path`) via `replace_data_files`.  Unlike
+                    // `compact_one` (which only ever APPENDS a brand-new merged
+                    // file), this rewrite changes the live file set: the old
+                    // path is gone and a new path is live.  The GIN row-group
+                    // completeness guard in `apply_gin_pruning_for_query`
+                    // requires EVERY live file to be sealed in the registry, so
+                    // a rewritten-but-unindexed file forces the whole `@>`
+                    // containment query to fall back to a full scan until the
+                    // next CREATE INDEX backfill or compaction re-indexes it.
+                    //
+                    // Mirror `compact_one`'s `reindex_compacted_file_gin` call
+                    // exactly: re-index the new file's batch so it is sealed,
+                    // and drop the old path's stale summaries so the registry
+                    // doesn't leak entries for a file that no longer exists.
+                    let effective_rg_size = meta
+                        .row_block_size
+                        .map(|v| v as usize)
+                        .or(meta.row_group_rows)
+                        .unwrap_or(basin_storage::DEFAULT_MAX_ROW_GROUP_SIZE);
+                    reindex_compacted_file_gin(
+                        &self.gin_rowgroup_registry,
+                        project,
+                        table,
+                        &meta.indexes,
+                        effective_rg_size,
+                        &backfilled,
+                        new_file.path.as_ref().as_ref(),
+                    );
+                    // Drop the superseded file's summaries from the registry.
+                    if let Some(rg_registry) = self
+                        .gin_rowgroup_registry
+                        .read()
+                        .expect("gin_rowgroup_registry lock poisoned")
+                        .as_ref()
+                    {
+                        for idx in &meta.indexes {
+                            if idx.access_method == "gin" && idx.columns.len() == 1 {
+                                rg_registry.remove_file(
+                                    project,
+                                    table,
+                                    &idx.columns[0],
+                                    file.path.as_ref(),
+                                );
+                            }
+                        }
+                    }
+
                     // Delete the old file best-effort (same pattern as tiering sweep).
                     if let Err(e) = self
                         .cfg
