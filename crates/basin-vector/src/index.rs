@@ -57,6 +57,10 @@ pub struct HnswIndexBuilder {
     dim: usize,
     points: Vec<DistancedPoint>,
     ids: Vec<u64>,
+    /// `ef_construction` override (candidate-list size during graph build).
+    /// `None` keeps the `instant-distance` default (100). Set from a
+    /// `CREATE INDEX … USING hnsw WITH (ef_construction = N)` clause.
+    ef_construction: Option<usize>,
 }
 
 impl HnswIndexBuilder {
@@ -66,7 +70,17 @@ impl HnswIndexBuilder {
             dim,
             points: Vec::new(),
             ids: Vec::new(),
+            ef_construction: None,
         }
+    }
+
+    /// Set the `ef_construction` build parameter (pgvector `WITH
+    /// (ef_construction = N)`). Larger values build a higher-recall graph at
+    /// the cost of build time. Ignored when `None` — the underlying library
+    /// default applies. Returns `self` for builder chaining.
+    pub fn with_ef_construction(mut self, ef_construction: Option<usize>) -> Self {
+        self.ef_construction = ef_construction;
+        self
     }
 
     pub fn insert(&mut self, id: u64, vector: Vec<f32>) -> Result<()> {
@@ -86,7 +100,11 @@ impl HnswIndexBuilder {
     }
 
     pub fn build(self) -> HnswIndex {
-        let map = Builder::default().build(self.points.clone(), self.ids.clone());
+        let mut builder = Builder::default();
+        if let Some(ef) = self.ef_construction {
+            builder = builder.ef_construction(ef);
+        }
+        let map = builder.build(self.points.clone(), self.ids.clone());
         HnswIndex {
             distance: self.distance,
             dim: self.dim,
@@ -243,6 +261,23 @@ mod tests {
         assert_eq!(restored.dim(), dim);
         let res2 = restored.search(&query, 10).unwrap();
         assert!(res2.iter().any(|r| r.id == target_id));
+    }
+
+    #[test]
+    fn with_ef_construction_builds_and_searches() {
+        // A larger ef_construction must still build a correct, queryable
+        // index (higher recall, not a different contract).
+        let dim = 16;
+        let mut b = HnswIndexBuilder::new(Distance::L2, dim).with_ef_construction(Some(200));
+        for i in 0..200 {
+            b.insert(i, rand_vec(i, dim)).unwrap();
+        }
+        let idx = b.build();
+        assert_eq!(idx.count(), 200);
+        let target_id = 42u64;
+        let query = rand_vec(target_id, dim);
+        let res = idx.search(&query, 10).unwrap();
+        assert!(res.iter().any(|r| r.id == target_id), "top-k missed self");
     }
 
     #[test]

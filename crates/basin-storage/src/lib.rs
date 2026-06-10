@@ -958,6 +958,26 @@ impl Storage {
         }
     }
 
+    /// Load the secondary-index declarations for a table from the attached
+    /// catalog. Returns an empty vec when no catalog is attached or the table
+    /// is unknown. Used by the HNSW sidecar builder to pick up per-column
+    /// `WITH (ef_construction = N)` build parameters declared via
+    /// `CREATE INDEX … USING hnsw`.
+    pub(crate) async fn catalog_table_indexes(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+    ) -> Result<Vec<basin_catalog::SecondaryIndex>> {
+        let Some(catalog) = self.inner.catalog.get() else {
+            return Ok(Vec::new());
+        };
+        match catalog.load_table(project, table).await {
+            Ok(meta) => Ok(meta.indexes),
+            Err(basin_common::BasinError::NotFound(_)) => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
     pub(crate) fn project_counters(
         &self,
         project: &ProjectId,

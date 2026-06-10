@@ -43,6 +43,14 @@ pub(crate) async fn build_indexes_for_batch(
     data_ulid: Ulid,
 ) -> Result<()> {
     let schema = batch.schema();
+    // Pick up declared HNSW index build parameters (today: `ef_construction`)
+    // so a `CREATE INDEX … USING hnsw WITH (ef_construction = N)` declaration
+    // is consumed by the sidecar build. Best-effort: a missing catalog or no
+    // matching index leaves the library defaults in place.
+    let indexes = storage
+        .catalog_table_indexes(project, table)
+        .await
+        .unwrap_or_default();
     for (col_idx, field) in schema.fields().iter().enumerate() {
         let DataType::FixedSizeList(child, n) = field.data_type() else {
             continue;
@@ -51,6 +59,12 @@ pub(crate) async fn build_indexes_for_batch(
             continue;
         }
         let dim = *n as usize;
+        // Find an HNSW index covering this column and decode its
+        // `ef_construction` build param (if any).
+        let ef_construction = indexes
+            .iter()
+            .filter(|idx| idx.access_method == "hnsw" && idx.columns.iter().any(|c| c == field.name()))
+            .find_map(|idx| idx.opclass.as_deref().and_then(decode_ef_construction));
         let array = batch
             .column(col_idx)
             .as_any()
@@ -71,7 +85,8 @@ pub(crate) async fn build_indexes_for_batch(
                     field.name()
                 ))
             })?;
-        let mut builder = HnswIndexBuilder::new(Distance::L2, dim);
+        let mut builder = HnswIndexBuilder::new(Distance::L2, dim)
+            .with_ef_construction(ef_construction);
         for row_idx in 0..array.len() {
             if array.is_null(row_idx) {
                 continue;
@@ -294,6 +309,23 @@ fn data_path_for_index_segment(
     data_paths.get(stem).cloned()
 }
 
+/// Decode the `ef_construction` build parameter out of a persisted catalog
+/// opclass string. The engine encodes HNSW params as
+/// `<opclass>[;m=<n>][;ef_construction=<n>]` (optionally prefixed `ivfflat:`);
+/// here we only need the `ef_construction` token. Returns `None` when the
+/// param is absent or unparseable (keep the library default).
+fn decode_ef_construction(raw: &str) -> Option<usize> {
+    let raw = raw.strip_prefix("ivfflat:").unwrap_or(raw);
+    for kv in raw.split(';') {
+        if let Some((k, v)) = kv.split_once('=') {
+            if k.trim() == "ef_construction" {
+                return v.trim().parse().ok();
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -308,6 +340,20 @@ mod tests {
 
     use super::*;
     use crate::{Storage, StorageConfig};
+
+    #[test]
+    fn decode_ef_construction_variants() {
+        assert_eq!(decode_ef_construction("vector_l2_ops"), None);
+        assert_eq!(
+            decode_ef_construction("vector_l2_ops;m=16;ef_construction=64"),
+            Some(64)
+        );
+        assert_eq!(
+            decode_ef_construction("ivfflat:vector_ip_ops;ef_construction=40"),
+            Some(40)
+        );
+        assert_eq!(decode_ef_construction("vector_l2_ops;m=16"), None);
+    }
 
     fn embedding_schema(dim: i32) -> Arc<Schema> {
         // The Arrow `FixedSizeListArray::from_iter_primitive` builder creates

@@ -3984,6 +3984,24 @@ async fn exec_create_index(
         None
     };
 
+    // Phase 5.26.D: extract HNSW build parameters from the `WITH (...)` clause.
+    // pgvector canonical DDL: `WITH (m = 16, ef_construction = 64)`.  We parse
+    // the two HNSW knobs, validate them, and fold them into the persisted
+    // opclass string (see `encode_vector_opclass`) so they round-trip through
+    // the catalog and are consumed by the HNSW build path
+    // (`basin_vector::HnswIndexBuilder`).  `lists = N` (the IVFFlat knob) is
+    // accepted and ignored — Basin maps IVFFlat onto the HNSW implementation.
+    //
+    // Absent params leave the segment defaults unchanged: `ef_construction`
+    // falls back to the instant-distance default (100), and `m` is recorded
+    // for introspection only (the underlying graph uses a fixed connectivity).
+    let hnsw_params: Option<crate::vector_planner::HnswBuildParams> =
+        if access_method_str == "hnsw" || access_method_str == "ivfflat" {
+            Some(crate::vector_planner::parse_hnsw_with_params(&ci.with)?)
+        } else {
+            None
+        };
+
     // Log IVFFlat fallback notice.
     if access_method_str == "ivfflat" {
         tracing::info!(
@@ -4077,16 +4095,22 @@ async fn exec_create_index(
     // for query-routing purposes; the declared "ivfflat" is preserved in the
     // opclass string so introspection can still see the user's intent.
     let (catalog_method, catalog_opclass) = if access_method_str == "hnsw" {
-        ("hnsw".to_string(), vector_opclass.clone())
+        // Encode the opclass + HNSW build params into a single catalog string,
+        // e.g. `vector_cosine_ops;m=16;ef_construction=64`. The vector planner
+        // decodes the leading opclass token for the opclass-match routing rule
+        // and the build path decodes the params.
+        let opclass = crate::vector_planner::encode_vector_opclass(
+            vector_opclass.as_deref().unwrap_or("vector_l2_ops"),
+            hnsw_params.as_ref(),
+        );
+        ("hnsw".to_string(), Some(opclass))
     } else if access_method_str == "ivfflat" {
         // IVFFlat fallback: map to HNSW in the catalog so the vector planner
         // can route through the HNSW fast path. Store opclass with an "ivfflat:"
         // prefix so introspection can still see the original access method.
-        let opclass = vector_opclass
-            .as_deref()
-            .map(|op| format!("ivfflat:{op}"))
-            .or_else(|| Some("ivfflat:vector_l2_ops".to_string()));
-        ("hnsw".to_string(), opclass)
+        let base = vector_opclass.as_deref().unwrap_or("vector_l2_ops");
+        let encoded = crate::vector_planner::encode_vector_opclass(base, hnsw_params.as_ref());
+        ("hnsw".to_string(), Some(format!("ivfflat:{encoded}")))
     } else if access_method_str == "gist" {
         // Phase 5.24.D: GIST indexes on range columns are stored with their
         // opclass (default "range_ops") so the probe path can verify that

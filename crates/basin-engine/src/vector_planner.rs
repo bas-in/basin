@@ -30,6 +30,11 @@
 //! 7. `WHERE` is either absent or a conjunction of `<col> = <literal>`
 //!    predicates, all targeting columns on this same table. Anything
 //!    richer (OR / IN / IS NULL / function calls / sub-queries) falls back.
+//! 8. (pgvector opclass-match) a sidecar/index whose metric matches the
+//!    query operator is available: `<->`/L2 always (implicit L2 sidecar),
+//!    `<=>`/cosine and `<#>`/dot only when an explicit `USING hnsw` index
+//!    declares the matching opclass (`vector_cosine_ops` / `vector_ip_ops`).
+//!    A query whose operator matches no available metric falls back.
 //!
 //! Filter pushdown shape: the storage fast path does *not* accept filters
 //! today, so we over-fetch `k * OVER_FETCH_FACTOR` candidates and apply
@@ -81,6 +86,137 @@ impl DistanceOp {
             DistanceOp::Dot => Distance::Dot,
         }
     }
+
+    /// The pgvector operator-class name whose distance function matches this
+    /// operator. An HNSW index built with this opclass answers `ORDER BY col
+    /// <op> q` queries; an index with any other opclass does not (pgvector
+    /// semantics — an `vector_l2_ops` index can't serve a `<=>` query).
+    fn matching_opclass(self) -> &'static str {
+        match self {
+            DistanceOp::L2 => "vector_l2_ops",
+            DistanceOp::Cosine => "vector_cosine_ops",
+            DistanceOp::Dot => "vector_ip_ops",
+        }
+    }
+}
+
+/// HNSW build parameters parsed from a `CREATE INDEX … WITH (...)` clause.
+/// Mirrors the two pgvector HNSW knobs. `None` fields mean "not specified"
+/// — the build path then keeps the library defaults.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HnswBuildParams {
+    /// `m` — max connections per layer. pgvector default 16. Recorded for
+    /// introspection; the underlying `instant-distance` graph uses a fixed
+    /// connectivity, so this is advisory today.
+    pub m: Option<u32>,
+    /// `ef_construction` — candidate-list size during build. pgvector default
+    /// 64; instant-distance default 100. Consumed by `HnswIndexBuilder`.
+    pub ef_construction: Option<u32>,
+}
+
+/// Parse the `WITH (...)` expression list of a `CREATE INDEX … USING hnsw`
+/// into [`HnswBuildParams`]. Accepts `m = <int>` and `ef_construction =
+/// <int>` (case-insensitive key); `lists = <int>` (the IVFFlat knob) is
+/// silently accepted and ignored. Unknown keys are ignored for pgvector DDL
+/// portability. A non-integer or non-positive value is a hard error so the
+/// user sees the gate rather than getting silent defaults.
+pub fn parse_hnsw_with_params(with: &[Expr]) -> Result<HnswBuildParams> {
+    let mut params = HnswBuildParams::default();
+    for expr in with {
+        // sqlparser parses `m = 16` as `BinaryOp { Eq, left: Identifier, right: Value }`.
+        let Expr::BinaryOp {
+            op: BinaryOperator::Eq,
+            left,
+            right,
+        } = expr
+        else {
+            continue;
+        };
+        let key = match left.as_ref() {
+            Expr::Identifier(i) => i.value.to_ascii_lowercase(),
+            _ => continue,
+        };
+        let value_str = match right.as_ref() {
+            Expr::Value(ValueWithSpan {
+                value: Value::Number(s, _),
+                ..
+            }) => s.clone(),
+            // pgvector / SQLAlchemy sometimes emit quoted params: m = '16'.
+            Expr::Value(ValueWithSpan {
+                value: Value::SingleQuotedString(s),
+                ..
+            }) => s.clone(),
+            _ => continue,
+        };
+        match key.as_str() {
+            "m" => params.m = Some(parse_positive_param("m", &value_str)?),
+            "ef_construction" => {
+                params.ef_construction = Some(parse_positive_param("ef_construction", &value_str)?)
+            }
+            // IVFFlat knob — accepted and ignored.
+            "lists" => {
+                let _ = parse_positive_param("lists", &value_str)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(params)
+}
+
+fn parse_positive_param(name: &str, raw: &str) -> Result<u32> {
+    let n: u32 = raw.trim().parse().map_err(|_| {
+        BasinError::InvalidSchema(format!(
+            "CREATE INDEX USING hnsw: WITH ({name} = …) must be a positive integer, got {raw:?}"
+        ))
+    })?;
+    if n == 0 {
+        return Err(BasinError::InvalidSchema(format!(
+            "CREATE INDEX USING hnsw: WITH ({name} = 0) must be >= 1"
+        )));
+    }
+    Ok(n)
+}
+
+/// Encode an opclass name plus optional HNSW params into the single catalog
+/// opclass string. Format: `<opclass>[;m=<n>][;ef_construction=<n>]`. The
+/// leading token before any `;` is always the bare opclass name so existing
+/// readers (and [`decode_vector_opclass`]) recover it with a plain split.
+pub fn encode_vector_opclass(opclass: &str, params: Option<&HnswBuildParams>) -> String {
+    let mut s = opclass.to_string();
+    if let Some(p) = params {
+        if let Some(m) = p.m {
+            s.push_str(&format!(";m={m}"));
+        }
+        if let Some(ef) = p.ef_construction {
+            s.push_str(&format!(";ef_construction={ef}"));
+        }
+    }
+    s
+}
+
+/// Decode a persisted catalog opclass string back into `(opclass, params)`.
+/// Handles the plain `vector_l2_ops` form, the param-suffixed
+/// `vector_cosine_ops;m=16;ef_construction=64` form, and the IVFFlat-prefixed
+/// `ivfflat:vector_l2_ops;…` form. Returns the bare opclass name (e.g.
+/// `vector_cosine_ops`) and any parsed params.
+pub fn decode_vector_opclass(raw: &str) -> (String, HnswBuildParams) {
+    // Strip an optional `ivfflat:` prefix; the routing rule treats IVFFlat
+    // indexes identically to HNSW (Basin maps IVFFlat onto HNSW).
+    let raw = raw.strip_prefix("ivfflat:").unwrap_or(raw);
+    let mut parts = raw.split(';');
+    let opclass = parts.next().unwrap_or("").to_string();
+    let mut params = HnswBuildParams::default();
+    for kv in parts {
+        let Some((k, v)) = kv.split_once('=') else {
+            continue;
+        };
+        match k.trim() {
+            "m" => params.m = v.trim().parse().ok(),
+            "ef_construction" => params.ef_construction = v.trim().parse().ok(),
+            _ => {}
+        }
+    }
+    (opclass, params)
 }
 
 /// Outcome of a successful detection. The executor consumes this to call
@@ -279,6 +415,41 @@ pub async fn rewrite_vector_order_by(
             vec_col,
             dim
         )));
+    }
+
+    // Criterion 8 (pgvector opclass-match): only route to the HNSW fast path
+    // when a sidecar/index whose metric matches the query's distance operator
+    // is available. pgvector semantics: a `vector_l2_ops` index answers `<->`,
+    // `vector_cosine_ops` answers `<=>`, `vector_ip_ops` answers `<#>`. A query
+    // whose operator matches no available metric falls back to brute-force
+    // scan (correctness preserved).
+    //
+    // Basin's storage layer auto-builds an *implicit L2 sidecar* for every
+    // `vector(N)` column on write, independent of any `CREATE INDEX`. So an
+    // L2 (`<->`) query can always route, matching the existing auto-routing
+    // contract. Cosine / dot queries (`<=>` / `<#>`) only route when an
+    // explicit HNSW index declares the matching opclass — and because the
+    // physical sidecar is still L2-only today, the storage call then surfaces
+    // a metric mismatch and the executor falls back. The opclass gate here is
+    // the planner-level half of that rule: it refuses to route a cosine/dot
+    // query unless the user actually declared a matching-opclass index.
+    let wanted_opclass = distance_op.matching_opclass();
+    let metric_available = match distance_op {
+        // Implicit L2 sidecar is always present for a vector column.
+        DistanceOp::L2 => true,
+        // Cosine / dot require an explicit matching-opclass HNSW index.
+        DistanceOp::Cosine | DistanceOp::Dot => meta.indexes.iter().any(|idx| {
+            idx.access_method == "hnsw"
+                && idx.columns.iter().any(|c| c == &vec_col)
+                && idx
+                    .opclass
+                    .as_deref()
+                    .map(|raw| decode_vector_opclass(raw).0 == wanted_opclass)
+                    .unwrap_or(false)
+        }),
+    };
+    if !metric_available {
+        return Ok(None);
     }
 
     // Projection: same shape the point-query fast path accepts — bare `*`
@@ -812,6 +983,87 @@ mod tests {
             s.contains("__basin_vop_l2(embedding, '[0.1, 0.2]')"),
             "got: {s}"
         );
+    }
+
+    // ── Phase 5.26.D — HNSW WITH-param parsing + opclass encode/decode ────────
+
+    fn parse_with(sql: &str) -> Vec<Expr> {
+        let dialect = PostgreSqlDialect {};
+        let stmts = Parser::parse_sql(&dialect, sql).unwrap();
+        match &stmts[0] {
+            Statement::CreateIndex(ci) => ci.with.clone(),
+            other => panic!("expected CreateIndex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_hnsw_params_m_and_ef() {
+        let with = parse_with(
+            "CREATE INDEX i ON t USING hnsw (embedding vector_l2_ops) \
+             WITH (m = 16, ef_construction = 64)",
+        );
+        let p = parse_hnsw_with_params(&with).unwrap();
+        assert_eq!(p.m, Some(16));
+        assert_eq!(p.ef_construction, Some(64));
+    }
+
+    #[test]
+    fn parse_hnsw_params_quoted_values() {
+        // SQLAlchemy emits WITH (m = '16', ef_construction = '64').
+        let with = parse_with(
+            "CREATE INDEX i ON t USING hnsw (embedding vector_l2_ops) \
+             WITH (m = '16', ef_construction = '64')",
+        );
+        let p = parse_hnsw_with_params(&with).unwrap();
+        assert_eq!(p.m, Some(16));
+        assert_eq!(p.ef_construction, Some(64));
+    }
+
+    #[test]
+    fn parse_hnsw_params_absent_is_default() {
+        let with = parse_with("CREATE INDEX i ON t USING hnsw (embedding vector_l2_ops)");
+        let p = parse_hnsw_with_params(&with).unwrap();
+        assert_eq!(p, HnswBuildParams::default());
+        assert_eq!(p.ef_construction, None);
+    }
+
+    #[test]
+    fn parse_hnsw_params_zero_is_error() {
+        let with = parse_with(
+            "CREATE INDEX i ON t USING hnsw (embedding vector_l2_ops) WITH (m = 0)",
+        );
+        assert!(parse_hnsw_with_params(&with).is_err());
+    }
+
+    #[test]
+    fn encode_decode_opclass_round_trip() {
+        let params = HnswBuildParams {
+            m: Some(16),
+            ef_construction: Some(64),
+        };
+        let encoded = encode_vector_opclass("vector_cosine_ops", Some(&params));
+        assert_eq!(encoded, "vector_cosine_ops;m=16;ef_construction=64");
+        let (opclass, decoded) = decode_vector_opclass(&encoded);
+        assert_eq!(opclass, "vector_cosine_ops");
+        assert_eq!(decoded, params);
+    }
+
+    #[test]
+    fn decode_opclass_bare_and_ivfflat_prefix() {
+        let (op, p) = decode_vector_opclass("vector_l2_ops");
+        assert_eq!(op, "vector_l2_ops");
+        assert_eq!(p, HnswBuildParams::default());
+
+        let (op, p) = decode_vector_opclass("ivfflat:vector_ip_ops;ef_construction=40");
+        assert_eq!(op, "vector_ip_ops");
+        assert_eq!(p.ef_construction, Some(40));
+    }
+
+    #[test]
+    fn matching_opclass_pairs() {
+        assert_eq!(DistanceOp::L2.matching_opclass(), "vector_l2_ops");
+        assert_eq!(DistanceOp::Cosine.matching_opclass(), "vector_cosine_ops");
+        assert_eq!(DistanceOp::Dot.matching_opclass(), "vector_ip_ops");
     }
 
     #[test]
