@@ -715,6 +715,29 @@ async fn run_full_rewrite_pipeline(sess: &ProjectSession, sql: &str) -> Result<S
     Ok(enum_rewritten)
 }
 
+/// Returns `true` when the full string-rewrite pipeline leaves `sql`
+/// byte-for-byte unchanged — i.e. dispatching the parsed AST is guaranteed
+/// identical to dispatching the rewritten text.
+///
+/// Used by the prepared-statement bind fast path ([`prepared`]) to decide,
+/// ONCE at prepare time, whether a template is AST-fast-path eligible. The
+/// cheap `needs_rewrite_pipeline` pre-screen over-triggers on `(` (so every
+/// `INSERT … VALUES (…)` would be excluded); this exact check runs the real
+/// pipeline and compares, so a plain INSERT whose text no pass actually
+/// touches qualifies for the fast path while anything the pipeline would
+/// rewrite (json operators, casts, lateral, …) correctly falls back to text.
+/// Errors conservatively report "not a no-op" (→ fall back).
+pub(crate) async fn rewrite_pipeline_is_noop(sess: &ProjectSession, sql: &str) -> bool {
+    if !needs_rewrite_pipeline(sql) {
+        // No marker token at all — the pipeline is definitionally a no-op.
+        return true;
+    }
+    match run_full_rewrite_pipeline(sess, sql).await {
+        Ok(rewritten) => rewritten == sql,
+        Err(_) => false,
+    }
+}
+
 pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResult> {
     // Phase 5.28.C: touch last-activity timestamp so the idle-in-txn reaper
     // sees that this session is still making progress. Done unconditionally at
@@ -1970,6 +1993,51 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     let stmt_arc = parse_sql_cached(sql)?;
     let stmt: Statement = Arc::try_unwrap(stmt_arc).unwrap_or_else(|arc| (*arc).clone());
 
+    dispatch_parsed_statement(
+        sess,
+        stmt,
+        sql,
+        raw_sql,
+        include_deleted,
+        cluster_columns,
+        lifecycle,
+        ctas_shape,
+        exclude_specs,
+        cv_options,
+    )
+    .await
+}
+
+/// Dispatch an already-parsed `Statement` through the engine's cache-
+/// invalidation gate, cost check, RLS-DDL intercept, fast paths, and the
+/// big statement `match`.
+///
+/// Split out of [`execute`] (perf-w-prepared) so the prepared-statement
+/// bind-INSERT fast path ([`execute_statement`]) can reach the identical
+/// dispatch tail WITHOUT re-parsing the SQL: `prepare` already parsed the
+/// template once, so at `Execute` time we substitute the bind values into a
+/// clone of that AST and hand the resulting `Statement` straight here. The
+/// text path ([`execute`]) and the AST path share this body verbatim, so the
+/// two routes produce identical behaviour for every statement kind.
+///
+/// `sql` is the (possibly rewritten) statement text DataFusion needs for any
+/// path that falls through to `exec_select`; `raw_sql` is the user's original
+/// text used for logging and the operator-probe gates. For the AST fast path
+/// both are the rendered substituted SQL (safe: that path is gated on
+/// `!needs_rewrite_pipeline`, so no text rewrite would have fired anyway).
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_parsed_statement(
+    sess: &ProjectSession,
+    stmt: Statement,
+    sql: &str,
+    raw_sql: &str,
+    include_deleted: bool,
+    cluster_columns: Option<Vec<String>>,
+    lifecycle: CreateTableLifecycle,
+    ctas_shape: Option<crate::pg_ast::CtasShape>,
+    exclude_specs: Vec<crate::ddl::ExcludeConstraintSpec>,
+    cv_options: Option<crate::cv_ddl::CvOptions>,
+) -> Result<ExecResult> {
     // Inv-OLTP-point (#149) — per-session table-meta cache invalidation.
     // The simple-SELECT fast-path gate consults a per-session
     // `(TableMetadata, view_present)` cache to skip two catalog round-trips
@@ -2588,23 +2656,73 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                     // moved head → DataFusion, which rewinds via
                     // load_table_for_read.
                     // Snapshot-pin correctness inside an explicit transaction.
-                    // `execute_simple_select` always reads the *current* catalog
-                    // head: it flushes the shard tail then reloads
-                    // `live_data_files()` (see fast_select.rs) and has no way to
-                    // reconstruct a historical snapshot, so it CANNOT honour a
-                    // txn's repeatable-read pin. Two distinct leaks result:
-                    //   1. the per-session meta cache (`load_table_meta_cached`)
-                    //      lags a concurrent commit by up to its TTL, so the old
-                    //      `meta.current_snapshot == pin` "head unchanged" check
-                    //      could read true even after the head moved; and
-                    //   2. `flush_to_parquet()` inside the fast path can drain a
-                    //      *concurrent* session's shard tail into a NEW head that
-                    //      did not exist when the gate ran.
-                    // Both surface another session's committed rows in this
-                    // transaction's pinned reads (the snapshot_isolation GAP).
-                    // The DataFusion path (`exec_select`) rewinds to the pin via
-                    // `load_table_for_read`, so route every in-txn read there.
-                    let in_tx_fast_ok = !in_txn;
+                    // `execute_simple_select` reads the *current* catalog head
+                    // (it flushes the shard tail then reloads `live_data_files()`
+                    // — see fast_select.rs) and applies the latest hot-tier
+                    // overlay, so a NAIVE in-tx fast read leaks a concurrent
+                    // commit past the txn's repeatable-read pin (the
+                    // snapshot_isolation GAP). The prior fix was a blanket
+                    // `!in_txn` bail; this re-enables the fast path for the safe
+                    // sub-case ONLY, threading a pinned read-view into
+                    // `execute_simple_select` so it reads AT the pin with fresh
+                    // state instead of the moving head.
+                    //
+                    // The fast in-tx read is admitted ONLY when ALL hold:
+                    //   (a) THIS table is untouched by THIS tx — no pending data
+                    //       files, no tx-buffered HTAP INSERT batches, and an
+                    //       empty in-tx UPDATE/DELETE overlay — so there are no
+                    //       uncommitted local writes the fast path would miss
+                    //       (read-your-own-writes), and no savepoint hazard;
+                    //   (b) a read snapshot is ALREADY pinned for the table
+                    //       (`tx_read_snapshot_peek`) — we never CAPTURE at the
+                    //       gate (capturing pre-flush would pin a head older than
+                    //       the read's actual view; the prior leak's root). No
+                    //       pin yet → bail to DataFusion, which pins via
+                    //       `load_table_for_read` after its own flush; the next
+                    //       read of the same table may then go fast; and
+                    //   (c) a hot-seq watermark is ALSO pinned
+                    //       (`tx_hot_seq_watermark_peek`) — the hot half of the
+                    //       read-view, threaded into the memtable probes so a
+                    //       concurrent session's later UPDATE/DELETE overlay
+                    //       (seq > watermark) is filtered out.
+                    //
+                    // When admitted we pass `(pinned_snapshot, hot_watermark)`
+                    // into `execute_simple_select`, which (1) loads metadata via
+                    // `load_table_at_snapshot(pinned)` instead of the live head
+                    // (FeatureNotSupported → bails to DataFusion), (2) filters
+                    // hot-tier probes by the watermark, (3) bypasses the PK row
+                    // cache (epoch/snapshot-keyed for current semantics), and
+                    // (4) reloads at the pin (not the new head) after any tail
+                    // flush. Any piece that cannot honour the pin Ok-falls back
+                    // to DataFusion. Conservative by default.
+                    let in_tx_pin: Option<crate::fast_select::PinnedReadView> = if in_txn {
+                        let table = &plan.table;
+                        let untouched =
+                            crate::session::tx_pending_files_for(&sess.state, table).is_empty()
+                                && crate::session::tx_htap_batches_for(&sess.state, table)
+                                    .is_empty()
+                                && crate::session::tx_overlay_peek(&sess.state, table).is_empty();
+                        match (
+                            untouched,
+                            crate::session::tx_read_snapshot_peek(&sess.state, table),
+                            crate::session::tx_hot_seq_watermark_peek(&sess.state, table),
+                        ) {
+                            (true, Some(snapshot), Some(hot_watermark)) => {
+                                Some(crate::fast_select::PinnedReadView {
+                                    snapshot,
+                                    hot_watermark,
+                                })
+                            }
+                            // Touched table, no pin yet, or no watermark yet →
+                            // route to DataFusion (it pins + rewinds correctly).
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    // Outside a tx the fast path always runs; inside a tx it runs
+                    // ONLY with a pinned read-view (the safe sub-case above).
+                    let in_tx_fast_ok = !in_txn || in_tx_pin.is_some();
                     if !is_view
                         && !has_rls
                         && !has_soft_delete
@@ -2612,12 +2730,13 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                         && !has_citext_predicate
                         && !has_citext_order_by
                     {
-                        return execute_simple_select(
+                        return crate::fast_select::execute_simple_select_pinned(
                             sess,
                             plan,
                             table_meta,
                             raw_sql,
                             include_deleted,
+                            in_tx_pin,
                         )
                         .await;
                     }
@@ -2903,6 +3022,73 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
         crate::session::tx_set_aborted(&sess.state);
     }
     result
+}
+
+/// Prepared-statement bind-INSERT fast path (perf-w-prepared).
+///
+/// Execute an already-parsed `Statement` — the prepared template's AST with
+/// bind values substituted directly into the tree — WITHOUT re-parsing any
+/// SQL. The text path ([`execute`]) parses each statement twice per call
+/// (libpg_query for the noop/DDL pre-screens, then sqlparser for dispatch);
+/// for a bulk INSERT loop the literal values differ on every `Execute`, so
+/// the sqlparser parse-cache never hits and both parses run fresh each time.
+/// This entry skips both: `prepare` already parsed the template once, the
+/// caller substitutes binds into a clone of that AST, and we dispatch the
+/// resulting `Statement` straight into the shared [`dispatch_parsed_statement`]
+/// tail.
+///
+/// SCOPE: the caller (`prepared::execute_bound`) gates this on
+/// `!needs_rewrite_pipeline(template)` AND a statement kind it knows is safe
+/// to route through the AST path (INSERT / plain SELECT). We re-assert the
+/// kind gate here as a hard invariant: anything else is rejected with
+/// `FeatureNotSupported` so a mis-route can never silently skip a required
+/// text rewrite or DDL pre-screen.
+///
+/// `raw_sql` is the rendered substituted SQL, used both as the logging text
+/// and (for a SELECT that falls through to DataFusion) as the planner input.
+/// Because the fast path is gated on `!needs_rewrite_pipeline`, the rendered
+/// text is exactly what the text pipeline would have produced (a no-op pass),
+/// so dispatching it is behaviour-identical to the text path.
+pub(crate) async fn execute_statement(
+    sess: &ProjectSession,
+    stmt: Statement,
+    raw_sql: &str,
+) -> Result<ExecResult> {
+    // Same session bookkeeping the text `execute` does at its top: keep the
+    // idle-in-txn reaper's activity clock fresh and honour an already-fired
+    // reap.
+    crate::session::touch_last_active(&sess.state);
+    if sess.reaped_flag.is_reaped() {
+        return Err(basin_common::BasinError::IdleInTransactionTimeout(
+            "idle transaction terminated by server idle_in_transaction_session_timeout".into(),
+        ));
+    }
+
+    // Hard kind gate (defence in depth — the caller already screened). Only
+    // INSERT and Query reach the AST path; everything else must go through the
+    // text `execute` so its DDL pre-screens / noop-accept gates run.
+    if !matches!(stmt, Statement::Insert(_) | Statement::Query(_)) {
+        return Err(BasinError::FeatureNotSupported(
+            "execute_statement only handles INSERT/SELECT; use the text path".into(),
+        ));
+    }
+
+    // For the AST fast path the substituted text needs no rewriting (gated on
+    // !needs_rewrite_pipeline), so `sql` == `raw_sql`. The four CREATE-TABLE
+    // pre-screen outputs are all empty/None: they never apply to INSERT/SELECT.
+    dispatch_parsed_statement(
+        sess,
+        stmt,
+        raw_sql,
+        raw_sql,
+        /* include_deleted */ false,
+        /* cluster_columns */ None,
+        CreateTableLifecycle::default(),
+        /* ctas_shape */ None,
+        /* exclude_specs */ Vec::new(),
+        /* cv_options */ None,
+    )
+    .await
 }
 
 /// Async wrapper around [`pg_operators::rewrite_json_agg_qualified_wildcard`]

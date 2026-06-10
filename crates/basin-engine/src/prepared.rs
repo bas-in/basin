@@ -136,6 +136,14 @@ pub enum ScalarParam {
 pub struct BoundStatement {
     pub(crate) handle: StatementHandle,
     pub(crate) sql: String,
+    /// Bind-INSERT fast path (perf-w-prepared): `Some` when the originating
+    /// prepared statement was AST-fast-path eligible AND every bind value was
+    /// substituted into a clone of the cached template AST. `execute_bound`
+    /// then dispatches this `Statement` directly via
+    /// `executor::execute_statement`, skipping the per-`Execute` re-parse.
+    /// `None` falls back to executing `sql` through the normal text route, so
+    /// the slow path is unchanged.
+    pub(crate) fast_ast: Option<Statement>,
 }
 
 impl BoundStatement {
@@ -158,6 +166,7 @@ impl BoundStatement {
         Self {
             handle: StatementHandle::new(),
             sql,
+            fast_ast: None,
         }
     }
 }
@@ -172,6 +181,21 @@ struct PreparedEntry {
     sql: String,
     placeholder_count: usize,
     schema: StatementSchema,
+    /// The template SQL parsed once at `prepare` time. `None` when the SQL
+    /// couldn't be parsed as a single sqlparser `Statement` (multi-statement,
+    /// or a form only libpg_query accepts) — the bind path then renders text
+    /// and re-parses through the normal `execute()` route, exactly as before.
+    ast: Option<Arc<Statement>>,
+    /// `true` when the bind path may substitute values into a clone of `ast`
+    /// and dispatch the `Statement` directly via `executor::execute_statement`,
+    /// skipping the per-`Execute` re-parse. Gated at `prepare` time on:
+    ///   * the template parses to a single `Statement`, AND
+    ///   * it is an `INSERT` or a plain `SELECT` (`Statement::Query`), AND
+    ///   * the template text triggers NO entry in the executor's string-rewrite
+    ///     pipeline (`needs_rewrite_pipeline` is false) — so the AST is exactly
+    ///     what the text path would have dispatched.
+    /// Any `false` here means the bind path falls back to the text route.
+    ast_fast_ok: bool,
 }
 
 impl PreparedRegistry {
@@ -231,11 +255,43 @@ pub(crate) async fn prepare(
         columns,
     };
 
+    // Bind-INSERT fast path (perf-w-prepared): parse the template ONCE here
+    // and cache the AST so each `Execute` can substitute bind values into a
+    // clone and dispatch the `Statement` directly — eliminating the
+    // per-`Execute` re-parse of freshly-substituted SQL text.
+    //
+    // We gate the fast path conservatively. The AST is eligible only when:
+    //   1. the template parses to exactly one sqlparser `Statement`;
+    //   2. that statement is `INSERT` or a plain `SELECT` (`Query`); and
+    //   3. running the executor's string-rewrite pipeline over the TEMPLATE
+    //      leaves it byte-for-byte unchanged. The pipeline runs over SQL TEXT
+    //      before parse (json operators, casts, lateral, etc.); if it would
+    //      rewrite the template, the parsed AST would diverge from what the
+    //      text path dispatches, so those keep the text route. We use the EXACT
+    //      `rewrite_pipeline_is_noop` check (run-and-compare) rather than the
+    //      cheap `needs_rewrite_pipeline` pre-screen, because the latter
+    //      over-triggers on the `(` in every `INSERT … VALUES (…)` and would
+    //      exclude the entire common INSERT case.
+    // Anything not eligible leaves `ast_fast_ok = false` and binds through the
+    // unchanged text-substitution path.
+    let dialect = PostgreSqlDialect {};
+    let ast: Option<Arc<Statement>> = match Parser::parse_sql(&dialect, sql) {
+        Ok(mut stmts) if stmts.len() == 1 => Some(Arc::new(stmts.pop().unwrap())),
+        _ => None,
+    };
+    let kind_ok = ast
+        .as_ref()
+        .map(|s| matches!(s.as_ref(), Statement::Insert(_) | Statement::Query(_)))
+        .unwrap_or(false);
+    let ast_fast_ok = kind_ok && crate::executor::rewrite_pipeline_is_noop(sess, sql).await;
+
     let handle = StatementHandle::new();
     let entry = PreparedEntry {
         sql: sql.to_owned(),
         placeholder_count,
         schema: schema.clone(),
+        ast,
+        ast_fast_ok,
     };
     sess.state
         .prepared
@@ -1334,10 +1390,37 @@ pub(crate) async fn bind(
             params.len()
         )));
     }
+    // Always produce the substituted text: it is the fast-path's logging /
+    // DataFusion-fallthrough SQL and the slow-path's whole input. Cheap
+    // (scanner-based, no parse).
     let sql = substitute(&entry.sql, &params)?;
+
+    // Fast path: when the template was AST-fast-path eligible, clone the cached
+    // AST and substitute the bind values directly into the placeholder nodes.
+    // Any failure (shouldn't happen for eligible statements) degrades silently
+    // to `None`, i.e. the unchanged text route.
+    let fast_ast: Option<Statement> = if entry.ast_fast_ok {
+        match entry.ast.as_ref() {
+            Some(arc) => {
+                let mut stmt = (**arc).clone();
+                match substitute_ast(&mut stmt, &params) {
+                    Ok(()) => Some(stmt),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "AST bind substitution failed; using text path");
+                        None
+                    }
+                }
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
     Ok(BoundStatement {
         handle: *handle,
         sql,
+        fast_ast,
     })
 }
 
@@ -1345,6 +1428,12 @@ pub(crate) async fn execute_bound(
     sess: &ProjectSession,
     bound: BoundStatement,
 ) -> Result<ExecResult> {
+    if let Some(stmt) = bound.fast_ast {
+        // Dispatch the pre-substituted AST without re-parsing. `bound.sql`
+        // (the rendered text) is passed for logging and as the DataFusion
+        // fallthrough input for a SELECT the fast paths decline.
+        return crate::executor::execute_statement(sess, stmt, &bound.sql).await;
+    }
     crate::executor::execute(sess, &bound.sql).await
 }
 
@@ -1439,6 +1528,296 @@ fn scan_placeholders(sql: &str) -> Result<usize> {
         }
     }
     Ok(max_n)
+}
+
+/// Build the literal `Expr` that a `$N` placeholder substitutes to, for the
+/// AST fast path. To guarantee the node is byte-for-byte identical to what the
+/// text path would have produced, we render the parameter with the SAME
+/// [`render_param`] used by the text substitution and parse that tiny fragment
+/// back into an `Expr`. Parsing `SELECT <literal>` and lifting the single
+/// projection expression is trivially cheap (a few tokens) versus re-parsing
+/// the whole statement, and it inherits `render_param`'s exact quoting / cast /
+/// `ARRAY[…]` / `NULL` / float-NaN handling with zero duplication.
+fn param_to_expr(p: &ScalarParam) -> Result<Expr> {
+    let literal = render_param(p);
+    let probe = format!("SELECT {literal}");
+    let dialect = PostgreSqlDialect {};
+    let mut stmts = Parser::parse_sql(&dialect, &probe)
+        .map_err(|e| BasinError::internal(format!("param literal parse: {e}")))?;
+    let stmt = stmts
+        .pop()
+        .ok_or_else(|| BasinError::internal("param literal produced no statement".to_string()))?;
+    if let Statement::Query(q) = stmt {
+        if let SetExpr::Select(select) = q.body.as_ref() {
+            if let Some(SelectItem::UnnamedExpr(e)) = select.projection.first() {
+                return Ok(e.clone());
+            }
+        }
+    }
+    Err(BasinError::internal(
+        "param literal did not parse to a projection expr".to_string(),
+    ))
+}
+
+/// Deep-substitute every `$N` placeholder in a parsed statement with the
+/// literal `Expr` for `params[N-1]`, in place. Used by the bind-INSERT fast
+/// path so an `Execute` need not re-parse freshly-substituted SQL text.
+///
+/// Correctness contract: after the walk, NO `Value::Placeholder` may remain
+/// anywhere in the statement. If the walker reaches a placeholder it cannot
+/// substitute — including one nested in an `Expr` shape this targeted walker
+/// doesn't descend into — the leftover-scan at the end returns `Err`, and the
+/// caller ([`bind`]) silently falls back to the text route. The fast path can
+/// therefore never emit a statement with an unbound placeholder; worst case it
+/// declines and the unchanged text path runs.
+fn substitute_ast(stmt: &mut Statement, params: &[ScalarParam]) -> Result<()> {
+    match stmt {
+        Statement::Insert(ins) => {
+            if let Some(source) = ins.source.as_mut() {
+                subst_query(source, params)?;
+            }
+        }
+        Statement::Query(q) => {
+            subst_query(q, params)?;
+        }
+        // The caller only sets `ast_fast_ok` for INSERT / Query, so this is
+        // unreachable in practice; bail to text for anything else.
+        _ => {
+            return Err(BasinError::internal(
+                "substitute_ast: only INSERT/Query supported".to_string(),
+            ));
+        }
+    }
+    // Hard guard: any surviving placeholder means we'd dispatch an unbound
+    // statement. Refuse so the caller falls back to the text path.
+    if stmt_has_placeholder(stmt) {
+        return Err(BasinError::internal(
+            "substitute_ast: placeholder survived substitution".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn subst_query(q: &mut Query, params: &[ScalarParam]) -> Result<()> {
+    if let Some(with) = q.with.as_mut() {
+        for cte in &mut with.cte_tables {
+            subst_query(&mut cte.query, params)?;
+        }
+    }
+    subst_setexpr(&mut q.body, params)?;
+    if let Some(ob) = q.order_by.as_mut() {
+        for obe in ob.ext_exprs_mut() {
+            subst_expr(&mut obe.expr, params)?;
+        }
+    }
+    // sqlparser 0.61 folds LIMIT/OFFSET into `limit_clause`. Substitute the
+    // common `LIMIT $1` / `OFFSET $1` placeholders via the project's ext
+    // accessors; any clause shape they don't expose leaves the placeholder for
+    // the leftover guard to catch (→ text fallback).
+    if let Some(limit) = q.ext_limit_mut() {
+        subst_expr(limit, params)?;
+    }
+    if let Some(clause) = q.limit_clause.as_mut() {
+        match clause {
+            sqlparser::ast::LimitClause::LimitOffset {
+                offset: Some(off), ..
+            } => subst_expr(&mut off.value, params)?,
+            sqlparser::ast::LimitClause::OffsetCommaLimit { offset, .. } => {
+                subst_expr(offset, params)?
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn subst_setexpr(body: &mut SetExpr, params: &[ScalarParam]) -> Result<()> {
+    match body {
+        SetExpr::Select(select) => {
+            for item in &mut select.projection {
+                match item {
+                    SelectItem::UnnamedExpr(e) => subst_expr(e, params)?,
+                    SelectItem::ExprWithAlias { expr, .. } => subst_expr(expr, params)?,
+                    _ => {}
+                }
+            }
+            for twj in &mut select.from {
+                subst_table_factor(&mut twj.relation, params)?;
+                for join in &mut twj.joins {
+                    subst_table_factor(&mut join.relation, params)?;
+                    if let sqlparser::ast::JoinOperator::Inner(jc)
+                    | sqlparser::ast::JoinOperator::LeftOuter(jc)
+                    | sqlparser::ast::JoinOperator::RightOuter(jc)
+                    | sqlparser::ast::JoinOperator::FullOuter(jc) = &mut join.join_operator
+                    {
+                        if let sqlparser::ast::JoinConstraint::On(e) = jc {
+                            subst_expr(e, params)?;
+                        }
+                    }
+                }
+            }
+            if let Some(sel) = select.selection.as_mut() {
+                subst_expr(sel, params)?;
+            }
+            if let sqlparser::ast::GroupByExpr::Expressions(exprs, _) = &mut select.group_by {
+                for e in exprs {
+                    subst_expr(e, params)?;
+                }
+            }
+            if let Some(having) = select.having.as_mut() {
+                subst_expr(having, params)?;
+            }
+        }
+        SetExpr::Query(q) => subst_query(q, params)?,
+        SetExpr::SetOperation { left, right, .. } => {
+            subst_setexpr(left, params)?;
+            subst_setexpr(right, params)?;
+        }
+        SetExpr::Values(values) => {
+            for row in &mut values.rows {
+                for e in row {
+                    subst_expr(e, params)?;
+                }
+            }
+        }
+        // Insert / Update / Delete bodies and Table shorthand: the caller never
+        // routes these here (INSERT VALUES go through `Statement::Insert`'s
+        // `source`, which is a Query whose body is `Values`). Leave untouched;
+        // the leftover-placeholder guard catches anything unexpected.
+        _ => {}
+    }
+    Ok(())
+}
+
+fn subst_table_factor(tf: &mut TableFactor, params: &[ScalarParam]) -> Result<()> {
+    match tf {
+        TableFactor::Derived { subquery, .. } => subst_query(subquery, params),
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            subst_table_factor(&mut table_with_joins.relation, params)?;
+            for join in &mut table_with_joins.joins {
+                subst_table_factor(&mut join.relation, params)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Recursively substitute placeholders inside an `Expr`. When the expr IS a
+/// `$N` placeholder, replace the whole node with the literal expr for
+/// `params[N-1]`; otherwise descend into every sub-expression that can hold a
+/// placeholder.
+fn subst_expr(expr: &mut Expr, params: &[ScalarParam]) -> Result<()> {
+    if let Some(n) = placeholder_index(expr) {
+        let p = params.get(n - 1).ok_or_else(|| {
+            BasinError::InvalidSchema(format!("placeholder ${n} has no bound value"))
+        })?;
+        *expr = param_to_expr(p)?;
+        return Ok(());
+    }
+    match expr {
+        Expr::BinaryOp { left, right, .. } => {
+            subst_expr(left, params)?;
+            subst_expr(right, params)?;
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Nested(inner)
+        | Expr::Cast { expr: inner, .. }
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::IsTrue(inner)
+        | Expr::IsFalse(inner)
+        | Expr::IsNotTrue(inner)
+        | Expr::IsNotFalse(inner) => {
+            subst_expr(inner, params)?;
+        }
+        Expr::InList { expr: e, list, .. } => {
+            subst_expr(e, params)?;
+            for item in list {
+                subst_expr(item, params)?;
+            }
+        }
+        Expr::Between {
+            expr: e,
+            low,
+            high,
+            ..
+        } => {
+            subst_expr(e, params)?;
+            subst_expr(low, params)?;
+            subst_expr(high, params)?;
+        }
+        Expr::Like {
+            expr: e, pattern, ..
+        }
+        | Expr::ILike {
+            expr: e, pattern, ..
+        } => {
+            subst_expr(e, params)?;
+            subst_expr(pattern, params)?;
+        }
+        Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+            subst_expr(left, params)?;
+            subst_expr(right, params)?;
+        }
+        Expr::Function(func) => {
+            if let FunctionArguments::List(list) = &mut func.args {
+                for arg in &mut list.args {
+                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
+                    | FunctionArg::Named {
+                        arg: FunctionArgExpr::Expr(e),
+                        ..
+                    } = arg
+                    {
+                        subst_expr(e, params)?;
+                    }
+                }
+            }
+        }
+        Expr::Array(arr) => {
+            for e in &mut arr.elem {
+                subst_expr(e, params)?;
+            }
+        }
+        Expr::Tuple(items) => {
+            for e in items {
+                subst_expr(e, params)?;
+            }
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                subst_expr(op, params)?;
+            }
+            for when in conditions {
+                subst_expr(&mut when.condition, params)?;
+                subst_expr(&mut when.result, params)?;
+            }
+            if let Some(er) = else_result {
+                subst_expr(er, params)?;
+            }
+        }
+        // Any other shape: don't descend. A placeholder hiding inside an
+        // un-walked variant is caught by the leftover guard in
+        // `substitute_ast`, which forces a fallback to the text path.
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Conservative leftover-placeholder detector. Renders the statement back to
+/// text and scans for a `$<digit>` token outside string/identifier literals,
+/// reusing the same byte scanner as [`scan_placeholders`]. Used as the hard
+/// post-substitution guard so the fast path can never dispatch an unbound
+/// placeholder.
+fn stmt_has_placeholder(stmt: &Statement) -> bool {
+    scan_placeholders(&stmt.to_string()).map(|n| n > 0).unwrap_or(true)
 }
 
 /// Substitute `$N` placeholders with literal SQL forms of `params[N-1]`.
