@@ -66,9 +66,42 @@ impl AnalyzerRule for CitextAnalyzerRule {
     }
 
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> DFResult<LogicalPlan> {
+        // Fast path: the rewrite can only matter when some column in the
+        // plan is CITEXT-typed. The overwhelmingly common no-CITEXT case
+        // previously paid a full transform_up tree walk on EVERY query;
+        // a flat scan of the plan's schemas is far cheaper and exact
+        // (CITEXT-ness is carried in field metadata end to end).
+        if !plan_has_citext_column(&plan) {
+            return Ok(plan);
+        }
         let transformed = plan.transform_up(rewrite_plan_node)?;
         Ok(transformed.data)
     }
+}
+
+/// `true` when any field anywhere in the plan tree carries the CITEXT
+/// type marker. Walks node schemas only (no expression rewriting), so the
+/// no-CITEXT fast path costs one metadata scan per node.
+fn plan_has_citext_column(plan: &LogicalPlan) -> bool {
+    let mut found = false;
+    let _ = plan.apply(|node| {
+        if node
+            .schema()
+            .fields()
+            .iter()
+            .any(|f| {
+                f.metadata()
+                    .get(crate::types::BASIN_TYPE_KEY)
+                    .map(|v| v == crate::types::BASIN_TYPE_CITEXT)
+                    .unwrap_or(false)
+            })
+        {
+            found = true;
+            return Ok(datafusion::common::tree_node::TreeNodeRecursion::Stop);
+        }
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    });
+    found
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
