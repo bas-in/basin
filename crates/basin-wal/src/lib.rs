@@ -336,7 +336,18 @@ fn panic_no_default_object_store() -> Arc<dyn ObjectStore> {
 /// by the compactor after Parquet commit.
 #[async_trait]
 pub trait Wal: Send + Sync + std::fmt::Debug {
-    /// Append `payload` for `(project, partition)`. Durable when this returns.
+    /// Append `payload` for `(project, partition)`.
+    ///
+    /// ## Durability contract
+    ///
+    /// The entry is guaranteed to be **in the in-RAM buffer** when this returns.
+    /// It becomes crash-durable once it has been uploaded to the backing store
+    /// (local fsync or S3 PUT), which happens on the next background flush
+    /// (`flush_interval`), under buffer-pressure (`flush_max_bytes`), or on an
+    /// explicit [`Self::flush`] call. Callers that need crash-durable acks
+    /// must call `flush()` before confirming to the client.
+    ///
+    /// For `RaftWal` (v0.2+) the entry is durable on quorum ack before return.
     async fn append(
         &self,
         project: &ProjectId,

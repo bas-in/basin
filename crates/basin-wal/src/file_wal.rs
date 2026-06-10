@@ -374,6 +374,22 @@ impl WalImpl for FileWal {
         payload: Bytes,
         epoch: Option<i64>,
     ) -> Result<Lsn> {
+        // Pre-compute the timestamp and clone the payload into the EntryRecord
+        // *before* acquiring the per-partition mutex. Both operations involve
+        // either a syscall (clock_gettime) or a heap allocation + memcopy
+        // (payload.to_vec) whose cost scales with payload size. Keeping them
+        // outside the critical section lets concurrent appenders to the same
+        // partition overlap this work instead of serialising through it.
+        //
+        // We construct the record with a placeholder LSN (Lsn(0)); the real LSN
+        // is stamped inside the lock where it is guaranteed monotonic.
+        let now = Utc::now();
+        // Approximate framed size: 4-byte length prefix + bincode body ≈ payload
+        // + ~64 bytes for project/partition/lsn/timestamp. Used only for the
+        // buffer-pressure heuristic; the real size is computed at flush time.
+        let approx = (payload.len() as u64) + 96;
+        let mut record = entry_record(project, partition, Lsn(0), &payload, now);
+
         let state = self.inner.get_or_create_partition(project, partition).await;
         let (lsn, should_flush) = {
             let mut guard = state.lock().await;
@@ -397,13 +413,9 @@ impl WalImpl for FileWal {
             }
             let lsn = guard.next_lsn;
             guard.next_lsn = lsn.next();
-            let now = Utc::now();
-            let record = entry_record(project, partition, lsn, &payload, now);
-            // Approximate framed size: 4 (length prefix) + bincode body. The
-            // bincode body is roughly the payload + ~64 bytes for ids and
-            // timestamp. The actual flush serialises again; this counter is
-            // only for the buffer-pressure heuristic.
-            let approx = (payload.len() as u64) + 96;
+            // Stamp the real LSN — this is the only field that must be assigned
+            // under the lock to preserve the monotonic guarantee.
+            record.lsn = lsn;
             guard.buffer.push(BufferRecord::Entry(record));
             guard.buffer_bytes += approx;
             let pressure = guard.buffer_bytes >= self.inner.flush_max_bytes;
@@ -1075,6 +1087,167 @@ mod tests {
         wal.flush().await.unwrap();
         let all = wal.read_from(&project, &part, Lsn::ZERO).await.unwrap();
         assert_eq!(all.len(), 4, "no-lease appends must all be accepted");
+        wal.close().await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests added to cover the pre-lock record construction refactor and to
+    // verify the durability contract: appends are in-RAM-only until flush,
+    // after which every acked LSN is readable on replay.
+    // -----------------------------------------------------------------------
+
+    /// After N concurrent appenders complete and `flush()` is called, every
+    /// acked LSN must be visible and the sequence must be gapless. This
+    /// exercises the pre-lock record-construction path under real concurrency:
+    /// multiple tasks build their `EntryRecord` concurrently before serialising
+    /// on the partition mutex to stamp the LSN.
+    #[tokio::test]
+    async fn concurrent_appends_all_durable_after_flush() {
+        const WRITERS: usize = 8;
+        const PER_WRITER: u64 = 200;
+        const TOTAL: u64 = (WRITERS as u64) * PER_WRITER;
+
+        let dir = TempDir::new().unwrap();
+        let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
+        let project = ProjectId::new();
+        let part = PartitionKey::default_key();
+
+        let mut handles = Vec::new();
+        for w in 0..WRITERS {
+            let wal2 = wal.clone();
+            let part2 = part.clone();
+            handles.push(tokio::spawn(async move {
+                for i in 0..PER_WRITER {
+                    // Vary payload size (16-256 bytes) so that the pre-lock
+                    // payload.to_vec() path exercises different allocation sizes.
+                    let body = vec![(w as u8).wrapping_add(i as u8); 16 + (i % 240) as usize];
+                    wal2.append(&project, &part2, Bytes::from(body))
+                        .await
+                        .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // flush() is the explicit durability gate; after it returns every acked
+        // entry must be readable (they are all now in closed segments).
+        wal.flush().await.unwrap();
+
+        let all = wal.read_from(&project, &part, Lsn::ZERO).await.unwrap();
+        assert_eq!(
+            all.len() as u64,
+            TOTAL,
+            "all acked records must be readable after flush"
+        );
+
+        // LSNs must be a contiguous 1..=TOTAL sequence (no gaps, no duplicates).
+        let mut lsns: Vec<u64> = all.iter().map(|e| e.lsn.0).collect();
+        lsns.sort_unstable();
+        for (idx, &lsn) in lsns.iter().enumerate() {
+            assert_eq!(
+                lsn,
+                (idx as u64) + 1,
+                "LSN gap or duplicate at position {idx}: got {lsn}"
+            );
+        }
+
+        wal.close().await.unwrap();
+    }
+
+    /// Ordering invariant: after concurrent appends, reading back with
+    /// `read_from` returns entries in strictly ascending LSN order.
+    #[tokio::test]
+    async fn concurrent_appends_ordering_preserved() {
+        let dir = TempDir::new().unwrap();
+        let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
+        let project = ProjectId::new();
+        let part = PartitionKey::default_key();
+
+        let mut handles = Vec::new();
+        for _ in 0..6 {
+            let wal2 = wal.clone();
+            let part2 = part.clone();
+            handles.push(tokio::spawn(async move {
+                for i in 0..50u64 {
+                    wal2.append(&project, &part2, payload(i)).await.unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        wal.flush().await.unwrap();
+
+        let all = wal.read_from(&project, &part, Lsn::ZERO).await.unwrap();
+        for window in all.windows(2) {
+            assert!(
+                window[0].lsn < window[1].lsn,
+                "out-of-order LSNs: {} >= {}",
+                window[0].lsn,
+                window[1].lsn
+            );
+        }
+        wal.close().await.unwrap();
+    }
+
+    /// Replay after reopen sees every acked record. Durability contract: records
+    /// are in-RAM until flush; once flushed they survive reopen.
+    #[tokio::test]
+    async fn replay_sees_all_acked_records_after_flush_reopen() {
+        const N: u64 = 60;
+        let dir = TempDir::new().unwrap();
+        let project = ProjectId::new();
+        let part = PartitionKey::default_key();
+
+        {
+            let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
+            for i in 1..=N {
+                wal.append(&project, &part, payload(i)).await.unwrap();
+            }
+            // flush() is required for durability — records not yet flushed are
+            // in-RAM only and would be lost on process restart.
+            wal.flush().await.unwrap();
+            wal.close().await.unwrap();
+        }
+
+        // Reopen simulates a process restart / recovery.
+        let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
+        let all = wal.read_from(&project, &part, Lsn::ZERO).await.unwrap();
+        assert_eq!(all.len() as u64, N, "all flushed records survive reopen");
+        for (i, e) in all.iter().enumerate() {
+            assert_eq!(e.lsn, Lsn((i as u64) + 1));
+        }
+        wal.close().await.unwrap();
+    }
+
+    /// close() drains the in-RAM buffer to storage before returning. Records
+    /// appended without an explicit flush() must survive reopen as long as
+    /// close() completes successfully.
+    #[tokio::test]
+    async fn close_flushes_buffered_entries() {
+        const N: u64 = 40;
+        let dir = TempDir::new().unwrap();
+        let project = ProjectId::new();
+        let part = PartitionKey::default_key();
+
+        {
+            let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
+            for i in 1..=N {
+                wal.append(&project, &part, payload(i)).await.unwrap();
+            }
+            // No explicit flush — close() must flush the buffer.
+            wal.close().await.unwrap();
+        }
+
+        let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
+        let all = wal.read_from(&project, &part, Lsn::ZERO).await.unwrap();
+        assert_eq!(
+            all.len() as u64,
+            N,
+            "close() must drain the buffer; all records must survive reopen"
+        );
         wal.close().await.unwrap();
     }
 
