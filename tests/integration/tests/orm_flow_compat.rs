@@ -516,10 +516,10 @@ async fn activerecord_migration_flow() {
     // Advisory lock acquire. Supported: differential_pg covers
     // pg_try_advisory_lock(int8) + pg_advisory_unlock round-trips.
     // Real Rails INLINES the advisory key (derived bigint, interpolated), so
-    // the literal form is the supported baseline. The $1-bound form is a
-    // recorded gap: param type inference does not yet reach through UDF
-    // argument positions, so Describe reports an unknown type and the
-    // client refuses to serialize the bind.
+    // the literal form is the supported baseline. The $1-bound form is now
+    // also supported: parameter-type inference reaches through UDF argument
+    // positions (resolving the function's DataFusion Signature), so Describe
+    // reports `bigint` for $1 and the client serializes the bind correctly.
     let lock = client
         .query("SELECT pg_try_advisory_lock(424242)", &[])
         .await;
@@ -527,7 +527,7 @@ async fn activerecord_migration_flow() {
     let lock_param = client
         .query("SELECT pg_try_advisory_lock($1)", &[&424_243_i64])
         .await;
-    f.record("pg_try_advisory_lock_param", false, lock_param);
+    f.record("pg_try_advisory_lock_param", true, lock_param);
 
     // schema_migrations table + version rows.
     f.record(
@@ -905,11 +905,14 @@ async fn hibernate_sequence_flow() {
 ///     bind position, this errors → contributes 1 gap. The literal form is the
 ///     supported baseline and is asserted separately.
 ///
-/// So the *expected* steady-state gap count is conservatively bounded at 2:
-/// at most the two `supported = false` probes can fail. If both end up passing,
-/// tighten this to the observed value (free win); a value above 2 means a
+/// So the *expected* steady-state gap count is conservatively bounded at 1:
+/// the single remaining `supported = false` probe (`nextval_param`) can fail.
+/// The former `pg_try_advisory_lock_param` gap was closed by extending
+/// parameter-type inference through UDF argument positions, so it is now
+/// asserted `supported = true`. If `nextval_param` also ends up passing,
+/// tighten this to the observed value (free win); a value above 1 means a
 /// genuinely-supported step regressed and slipped past — investigate.
-const RECORDED_GAP_CEILING: u64 = 2;
+const RECORDED_GAP_CEILING: u64 = 1;
 
 /// Re-run every flow as a pure gap census (no supported-step assertions) and
 /// return the total gap count. Mirrors the six flows above, trimmed to the

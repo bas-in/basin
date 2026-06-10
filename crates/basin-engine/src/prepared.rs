@@ -41,8 +41,9 @@ use basin_common::{BasinError, Result, TableName};
 use sqlparser::ast::DataType as SqlDataType;
 use sqlparser::ast::ValueWithSpan;
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, BinaryOperator, CastKind, Expr, FromTable, ObjectName, Query,
-    SelectItem, SetExpr, Statement, TableFactor, Value,
+    Assignment, AssignmentTarget, BinaryOperator, CastKind, Expr, FromTable, FunctionArg,
+    FunctionArgExpr, FunctionArguments, ObjectName, Query, SelectItem, SetExpr, Statement,
+    TableFactor, Value,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -617,6 +618,202 @@ fn pin_cast_placeholder(expr: &Expr, out: &mut [DataType], is_uuid_out: &mut [bo
     }
 }
 
+/// Recursively walk `expr` looking for function calls (`Expr::Function`) whose
+/// positional arguments include a bare `$N` placeholder. For each such
+/// placeholder, resolve the parameter type from the function's registered
+/// DataFusion [`Signature`][datafusion::logical_expr::Signature] via
+/// [`infer_function_call_args`] and pin the slot (only if still TEXT — the
+/// authoritative catalog path wins).
+///
+/// This is the general mechanism behind the ORM-compat fix for
+/// `SELECT pg_try_advisory_lock($1)`: parameter-type inference reaches through
+/// UDF/function argument positions, so `Describe` reports `bigint` for `$1`
+/// instead of falling back to TEXT (which made strict drivers refuse the Bind).
+fn walk_expr_for_function_args(sess: &ProjectSession, expr: &Expr, out: &mut [DataType]) {
+    match expr {
+        Expr::Function(func) => {
+            // Collect the positional argument expressions, in order.
+            if let FunctionArguments::List(list) = &func.args {
+                let pos_args: Vec<&Expr> = list
+                    .args
+                    .iter()
+                    .filter_map(|a| match a {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                        _ => None,
+                    })
+                    .collect();
+                infer_function_call_args(sess, &func.name, &pos_args, out);
+                // Recurse into each argument so nested calls
+                // (`fn(other_fn($1))`) are also covered.
+                for arg in &pos_args {
+                    walk_expr_for_function_args(sess, arg, out);
+                }
+            }
+        }
+        // Recurse through the common compound-expression shapes so a function
+        // call nested inside an operator / cast / paren is still reached.
+        Expr::BinaryOp { left, right, .. } => {
+            walk_expr_for_function_args(sess, left, out);
+            walk_expr_for_function_args(sess, right, out);
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Nested(inner)
+        | Expr::Cast { expr: inner, .. } => {
+            walk_expr_for_function_args(sess, inner, out);
+        }
+        _ => {}
+    }
+}
+
+/// Resolve placeholder argument types for a single function call.
+///
+/// Mechanism: look up the registered [`ScalarUDF`][datafusion::logical_expr::ScalarUDF]
+/// by lowercased (unqualified) name on the session's `SessionContext` and read
+/// its [`Signature`][datafusion::logical_expr::Signature]. For each positional
+/// argument that is a bare `$N`, we compute the set of candidate Arrow types
+/// that the signature allows at that position and only pin the slot when that
+/// set collapses to a single unambiguous type. This handles
+/// `Signature::Exact` / `Uniform` directly and `OneOf` by intersecting across
+/// its member signatures; ambiguous positions (e.g. one member says Int64 and
+/// another says Utf8) are left at the current default.
+fn infer_function_call_args(
+    sess: &ProjectSession,
+    name: &ObjectName,
+    pos_args: &[&Expr],
+    out: &mut [DataType],
+) {
+    // Only single-part (unqualified) function names are resolved; the engine
+    // registers UDFs under their bare lowercased name.
+    if name.0.len() != 1 {
+        return;
+    }
+    let fn_name = name.0[0].id_val().to_ascii_lowercase();
+
+    // Bail early unless at least one argument is a placeholder — avoids a
+    // registry lookup for the common no-placeholder call.
+    if !pos_args.iter().any(|e| placeholder_index(e).is_some()) {
+        return;
+    }
+
+    // `udf` is the `FunctionRegistry::udf` lookup; bring the trait into scope.
+    use datafusion::execution::FunctionRegistry;
+    let udf = match sess.ctx.udf(&fn_name) {
+        Ok(u) => u,
+        Err(_) => return,
+    };
+
+    let arity = pos_args.len();
+    for (pos, arg) in pos_args.iter().enumerate() {
+        let n = match placeholder_index(arg) {
+            Some(n) => n,
+            None => continue,
+        };
+        if let Some(dt) = signature_arg_type(udf.signature(), pos, arity) {
+            if let Some(slot) = out.get_mut(n - 1) {
+                // Only fill slots still at the TEXT default; never override a
+                // type set by the more authoritative catalog/WHERE path.
+                if *slot == DataType::Utf8 {
+                    *slot = dt;
+                }
+            }
+        }
+    }
+}
+
+/// Given a function [`Signature`][datafusion::logical_expr::Signature], the
+/// zero-based argument position, and the call's arity, return the single Arrow
+/// type the signature unambiguously requires at that position — or `None` when
+/// the position is unconstrained, variadic, ambiguous (multiple distinct
+/// candidate types), or otherwise not safely inferable.
+///
+/// Only the `Exact` and `Uniform` leaf signatures (and `OneOf` over them) are
+/// considered authoritative; everything else (`Variadic*`, `Coercible`,
+/// `Numeric`, `String`, `Any`, `UserDefined`, …) is treated as "don't infer".
+fn signature_arg_type(
+    sig: &datafusion::logical_expr::Signature,
+    pos: usize,
+    arity: usize,
+) -> Option<DataType> {
+    use datafusion::logical_expr::TypeSignature;
+
+    /// Candidate type for `pos` from one leaf type-signature, filtered to those
+    /// whose declared arity matches the actual call so we never pick a type
+    /// from a non-applicable overload (e.g. the `(int4,int4)` 2-arg form when
+    /// the call is 1-arg).
+    fn leaf_candidate(ts: &TypeSignature, pos: usize, arity: usize) -> Option<DataType> {
+        match ts {
+            TypeSignature::Exact(types) if types.len() == arity => types.get(pos).cloned(),
+            // Uniform(n, valid): every arg shares one of `valid`. Only inferable
+            // when there's exactly one valid type AND the declared arg count
+            // matches the call.
+            TypeSignature::Uniform(n, valid) if *n == arity && valid.len() == 1 => {
+                valid.first().cloned()
+            }
+            _ => None,
+        }
+    }
+
+    let candidates: Vec<DataType> = match &sig.type_signature {
+        TypeSignature::OneOf(members) => members
+            .iter()
+            .filter_map(|m| leaf_candidate(m, pos, arity))
+            .collect(),
+        other => leaf_candidate(other, pos, arity).into_iter().collect(),
+    };
+
+    let first = candidates.first()?.clone();
+    // Fast path: every applicable overload agrees on one exact type.
+    if candidates.iter().all(|c| *c == first) {
+        return Some(first);
+    }
+
+    // The overloads disagree. We still infer *if* they only disagree within a
+    // single coercible family — then we pick the widest member, which is how
+    // PostgreSQL resolves an untyped placeholder argument (the literal `unknown`
+    // is coerced up to the function's widest applicable input). The advisory
+    // functions are the motivating case: `pg_try_advisory_lock` is registered
+    // as `OneOf([Exact([Int64]), Exact([Int32]), …])`, and PG types `$1` there
+    // as `bigint`. Any cross-family disagreement (e.g. Int64 vs Utf8) stays
+    // ambiguous and we keep the current default.
+    if candidates.iter().all(is_signed_int) {
+        return candidates.into_iter().max_by_key(|c| int_width(c));
+    }
+    if candidates.iter().all(is_float) {
+        return candidates.into_iter().max_by_key(|c| float_width(c));
+    }
+    None
+}
+
+fn is_signed_int(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+    )
+}
+
+fn int_width(dt: &DataType) -> u8 {
+    match dt {
+        DataType::Int8 => 8,
+        DataType::Int16 => 16,
+        DataType::Int32 => 32,
+        DataType::Int64 => 64,
+        _ => 0,
+    }
+}
+
+fn is_float(dt: &DataType) -> bool {
+    matches!(dt, DataType::Float16 | DataType::Float32 | DataType::Float64)
+}
+
+fn float_width(dt: &DataType) -> u8 {
+    match dt {
+        DataType::Float16 => 16,
+        DataType::Float32 => 32,
+        DataType::Float64 => 64,
+        _ => 0,
+    }
+}
+
 /// Walk a SELECT looking for `<col> OP $N` and `$N OP <col>` predicates we
 /// can resolve to a column type. JSONB / UUID metadata flags are propagated
 /// for the SELECT WHERE side so prepared `WHERE id = $1` over a UUID column
@@ -733,8 +930,24 @@ async fn walk_select_for_predicates(
     // Order: projection (explicit cast, low-authority) then WHERE (catalog, high-authority).
     walk_projection_for_casts(&select.projection, out, is_uuid_out);
 
+    // Function-argument inference: `SELECT pg_try_advisory_lock($1)` and similar
+    // forms where a placeholder sits directly in a registered UDF's argument
+    // list. Resolves the parameter type from the function's DataFusion
+    // Signature (see `infer_function_call_args`). Only fills slots still at the
+    // TEXT default, so the catalog-backed WHERE inference below stays
+    // authoritative for placeholders that appear in both positions.
+    for item in &select.projection {
+        let expr = match item {
+            SelectItem::UnnamedExpr(e) => e,
+            SelectItem::ExprWithAlias { expr, .. } => expr,
+            _ => continue,
+        };
+        walk_expr_for_function_args(sess, expr, out);
+    }
+
     if let Some(pred) = &select.selection {
         walk_pred_with_subqueries(sess, pred, &tables, out, is_jsonb_out, is_uuid_out).await;
+        walk_expr_for_function_args(sess, pred, out);
     }
 
     // LIMIT $N and OFFSET $N — Postgres types these as int8 (BIGINT). Drivers
@@ -1653,6 +1866,52 @@ mod tests {
             3
         );
         assert_eq!(scan_placeholders("SELECT 1").unwrap(), 0);
+    }
+
+    #[test]
+    fn signature_arg_type_widens_advisory_oneof_to_bigint() {
+        use datafusion::logical_expr::{Signature, TypeSignature, Volatility};
+        // Mirrors `advisory_lock::advisory_signature()`: OneOf over int4/int8
+        // single- and two-arg exact forms. For a 1-arg call, $1 must resolve to
+        // Int64 (PG's `bigint`), picking the widest applicable integer overload.
+        let sig = Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Int64]),
+                TypeSignature::Exact(vec![DataType::Int32]),
+                TypeSignature::Exact(vec![DataType::Int64, DataType::Int64]),
+                TypeSignature::Exact(vec![DataType::Int32, DataType::Int32]),
+            ],
+            Volatility::Volatile,
+        );
+        assert_eq!(signature_arg_type(&sig, 0, 1), Some(DataType::Int64));
+        // For the 2-arg call, each position also widens int4→int8.
+        assert_eq!(signature_arg_type(&sig, 0, 2), Some(DataType::Int64));
+        assert_eq!(signature_arg_type(&sig, 1, 2), Some(DataType::Int64));
+    }
+
+    #[test]
+    fn signature_arg_type_exact_single_overload() {
+        use datafusion::logical_expr::{Signature, Volatility};
+        // `nextval(text) -> bigint`: a single Exact([Utf8]) overload yields Utf8.
+        let sig = Signature::exact(vec![DataType::Utf8], Volatility::Volatile);
+        assert_eq!(signature_arg_type(&sig, 0, 1), Some(DataType::Utf8));
+        // Arity mismatch (2-arg call against a 1-arg sig) is not inferable.
+        assert_eq!(signature_arg_type(&sig, 0, 2), None);
+    }
+
+    #[test]
+    fn signature_arg_type_bails_on_cross_family_ambiguity() {
+        use datafusion::logical_expr::{Signature, TypeSignature, Volatility};
+        // Int64 vs Utf8 at the same position is a cross-family disagreement —
+        // we must NOT guess; keep the caller's TEXT default.
+        let sig = Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Int64]),
+                TypeSignature::Exact(vec![DataType::Utf8]),
+            ],
+            Volatility::Volatile,
+        );
+        assert_eq!(signature_arg_type(&sig, 0, 1), None);
     }
 
     #[test]
