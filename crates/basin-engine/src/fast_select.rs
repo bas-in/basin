@@ -279,11 +279,20 @@ fn batch_matches_predicates(batch: &RecordBatch, predicates: &[Predicate]) -> bo
 /// it only for the O(log n) lookup. For workloads where the memtable is hot
 /// with PK-keyed UPDATE/DELETE overlays (read+write mix), this cuts the
 /// critical-section length proportionally to the memtable population.
+/// `hot_watermark`: when `Some(w)`, this is a transaction-pinned read and any
+/// registry entry whose MVCC `seq > w` was written AFTER the transaction pinned
+/// its read-view (by a concurrent committer, since this table is untouched by
+/// THIS tx — the gate guarantees that). Such entries MUST be invisible to the
+/// pinned read, so both the direct-get and the snapshot-walk use the
+/// seq-carrying memtable accessors (`get_with_seq` / `snapshot_with_seq`) and
+/// skip entries past the watermark. `None` = auto-commit / no pin: today's
+/// behaviour (every committed overlay entry is visible).
 fn probe_memtable(
     sess: &ProjectSession,
     table: &TableName,
     predicates: &[Predicate],
     meta: &TableMetadata,
+    hot_watermark: Option<u64>,
 ) -> Option<(Vec<RecordBatch>, bool)> {
     let registry = sess.engine.memtable_registry();
     let entry = registry.get(&sess.project, table)?;
@@ -318,7 +327,22 @@ fn probe_memtable(
                 if let Ok(pk_idx) = meta.schema.index_of(col) {
                     let pk_dt = meta.schema.field(pk_idx).data_type().clone();
                     if let Some(pk_key) = crate::dml_mutate::pk_scalar_to_row_key(val, &pk_dt) {
-                        match entry.memtable.get(&pk_key) {
+                        // Pinned read: fetch the entry's `seq` so a post-pin
+                        // write (seq > watermark) by a concurrent session is
+                        // treated as absent (fall through to the cold tier,
+                        // which is the pinned historical view). Auto-commit
+                        // (`hot_watermark == None`) uses the plain `get` and
+                        // never filters.
+                        let probed: Option<basin_hottier::MemRowValue> = match hot_watermark {
+                            Some(w) => match entry.memtable.get_with_seq(&pk_key) {
+                                Some((v, seq)) if seq <= w => Some(v),
+                                // Post-pin write — invisible to this read.
+                                Some(_) => None,
+                                None => None,
+                            },
+                            None => entry.memtable.get(&pk_key),
+                        };
+                        match probed {
                             Some(basin_hottier::MemRowValue::Update { bytes, .. })
                             | Some(basin_hottier::MemRowValue::Row { bytes, .. }) => {
                                 // Decode and re-validate the predicate against
@@ -342,8 +366,9 @@ fn probe_memtable(
                             }
                             None => {
                                 // PK not present in memtable under the PK-keyed
-                                // half.  A counter-keyed Row (HTAP cache) may
-                                // still match — fall through to snapshot.
+                                // half (or a post-pin write filtered above). A
+                                // counter-keyed Row (HTAP cache) may still match
+                                // — fall through to snapshot.
                             }
                         }
                     }
@@ -358,7 +383,19 @@ fn probe_memtable(
     // for predicate shapes the direct-get can't handle (non-PK Eq, multi-
     // predicate, range), and as a safety net for counter-keyed HTAP-cached
     // INSERT rows.
-    let snapshot = entry.memtable.snapshot();
+    // Pinned read: take the seq-carrying snapshot and skip any entry written
+    // after the watermark; auto-commit takes the plain snapshot. We normalise
+    // both into `(key, value)` pairs so the match arms below are shared.
+    let snapshot: Vec<(basin_hottier::RowKey, basin_hottier::MemRowValue)> = match hot_watermark {
+        Some(w) => entry
+            .memtable
+            .snapshot_with_seq()
+            .into_iter()
+            .filter(|(_, _, seq)| *seq <= w)
+            .map(|(k, v, _)| (k, v))
+            .collect(),
+        None => entry.memtable.snapshot(),
+    };
     if snapshot.is_empty() {
         return None;
     }
@@ -1364,6 +1401,26 @@ fn literal_value(e: &Expr) -> Option<ScalarValue> {
 }
 
 
+/// A transaction's pinned read-view, threaded into the fast path so an in-tx
+/// SELECT reads AT the pin (snapshot-stable / REPEATABLE-READ-ish) instead of
+/// the moving live head.
+///
+/// Captured by the executor gate via the NON-capturing peeks
+/// (`tx_read_snapshot_peek` / `tx_hot_seq_watermark_peek`) — the fast path
+/// never pins; a missing pin makes the gate bail to DataFusion, which pins via
+/// `load_table_for_read` after its own flush. Both halves must agree:
+///   * `snapshot` — the cold (catalog) snapshot id; metadata is loaded via
+///     `Catalog::load_table_at_snapshot(snapshot)` so `live_data_files()`
+///     reconstructs the historical file set this tx is supposed to see.
+///   * `hot_watermark` — the hot-tier MVCC high-water mark; memtable probes
+///     drop any registry entry whose `seq` exceeds it (a concurrent session's
+///     post-pin UPDATE/DELETE overlay).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PinnedReadView {
+    pub snapshot: basin_catalog::SnapshotId,
+    pub hot_watermark: u64,
+}
+
 /// Run a recognised plan against the engine's storage layer (or, when wired
 /// up, the shard's [`ProjectHandle`]). Returns the merged result set ready to
 /// hand back to the caller.
@@ -1374,6 +1431,10 @@ fn literal_value(e: &Expr) -> Option<ScalarValue> {
 /// when `None` we fall back to loading it ourselves (e.g. callers that don't
 /// pre-check).
 ///
+/// This is the auto-commit / no-pin entrypoint (e.g. `point_join`); it reads
+/// the live head. For in-transaction repeatable reads use
+/// [`execute_simple_select_pinned`].
+///
 /// [`ProjectHandle`]: basin_shard::ProjectHandle
 pub(crate) async fn execute_simple_select(
     sess: &ProjectSession,
@@ -1381,6 +1442,35 @@ pub(crate) async fn execute_simple_select(
     prefetched_meta: Option<TableMetadata>,
     raw_sql: &str,
     include_deleted: bool,
+) -> Result<ExecResult> {
+    execute_simple_select_inner(sess, plan, prefetched_meta, raw_sql, include_deleted, None).await
+}
+
+/// In-transaction entrypoint: same as [`execute_simple_select`] but reads at
+/// the transaction's pinned read-view (`pinned`) when supplied. The executor
+/// gate only passes `Some` for the safe sub-case (table untouched by this tx,
+/// both pins already captured); a `None` pin behaves exactly like the
+/// auto-commit path. Any piece that cannot honour the pin Ok-falls back to the
+/// DataFusion path (`exec_select`).
+pub(crate) async fn execute_simple_select_pinned(
+    sess: &ProjectSession,
+    plan: SimpleSelectPlan,
+    prefetched_meta: Option<TableMetadata>,
+    raw_sql: &str,
+    include_deleted: bool,
+    pinned: Option<PinnedReadView>,
+) -> Result<ExecResult> {
+    execute_simple_select_inner(sess, plan, prefetched_meta, raw_sql, include_deleted, pinned)
+        .await
+}
+
+async fn execute_simple_select_inner(
+    sess: &ProjectSession,
+    plan: SimpleSelectPlan,
+    prefetched_meta: Option<TableMetadata>,
+    raw_sql: &str,
+    include_deleted: bool,
+    pinned: Option<PinnedReadView>,
 ) -> Result<ExecResult> {
     // Phase 5.16.A: fast path bypasses DataFusion (no LogicalPlan); shape
     // hash is computed on the DataFusion path (executor::exec_select).
@@ -1398,17 +1488,77 @@ pub(crate) async fn execute_simple_select(
     // the newly-committed Parquet files are visible to `live_data_files()`.
     // When no shard is configured the pre-fetch is always current (writes go
     // directly to storage + catalog synchronously) and can be reused as-is.
+    // Helper: load the table's metadata at the read-view this call must honour.
+    //
+    //   * Auto-commit / no pin (`pinned == None`): the live head — exactly the
+    //     historical behaviour.
+    //   * Pinned (in-tx repeatable read): the HISTORICAL metadata at
+    //     `pinned.snapshot` via `load_table_at_snapshot`, so `live_data_files()`
+    //     reconstructs the file set this transaction is supposed to see — NOT
+    //     the moved head a concurrent committer / our own flush advanced to.
+    //     `FeatureNotSupported` (the pinned snapshot is no longer retained, or
+    //     the backend lacks history) is NOT a hard error: we Ok-fall back to the
+    //     DataFusion path, which degrades to read-committed for that one read
+    //     rather than serving a wrong point-in-time. This MUST reload at the pin
+    //     after the shard flush too: flushing ADVANCES the head, but the pin
+    //     protects the read, so the post-flush reload pins the historical view,
+    //     never the new head.
+    //
+    // NB: the per-session meta cache (`load_table_meta_cached`) and the
+    // `prefetched_meta` reflect the live head; under a pin we must NOT reuse
+    // them, so we always go to the catalog at the pinned snapshot here.
+    async fn load_at_view(
+        sess: &ProjectSession,
+        table: &TableName,
+        pinned: Option<PinnedReadView>,
+    ) -> Result<TableMetadata> {
+        match pinned {
+            None => {
+                sess.engine
+                    .config()
+                    .catalog
+                    .load_table(&sess.project, table)
+                    .await
+            }
+            Some(p) => {
+                sess.engine
+                    .config()
+                    .catalog
+                    .load_table_at_snapshot(&sess.project, table, p.snapshot)
+                    .await
+            }
+        }
+    }
+
     let meta = if let Some(shard) = sess.engine.config().shard.as_ref() {
         shard.flush_to_parquet().await?;
-        // Reload after flush — the pre-fetched snapshot is now stale.
-        sess.engine
-            .config()
-            .catalog
-            .load_table(&sess.project, &plan.table)
-            .await?
+        // Reload after flush — the pre-fetched snapshot is now stale. Under a
+        // pin this reloads the HISTORICAL view (the flush advanced the head, but
+        // the pin protects the read).
+        match load_at_view(sess, &plan.table, pinned).await {
+            Ok(m) => m,
+            // Pinned snapshot no longer retained → degrade to the DataFusion
+            // path, which rewinds via `load_table_for_read`.
+            Err(BasinError::FeatureNotSupported(_)) if pinned.is_some() => {
+                return crate::executor::exec_select(sess, raw_sql, include_deleted, Some(raw_sql))
+                    .await;
+            }
+            Err(e) => return Err(e),
+        }
+    } else if pinned.is_some() {
+        // No shard, but a pin is active: the pre-fetched metadata reflects the
+        // live head and must NOT be reused — load the historical view.
+        match load_at_view(sess, &plan.table, pinned).await {
+            Ok(m) => m,
+            Err(BasinError::FeatureNotSupported(_)) => {
+                return crate::executor::exec_select(sess, raw_sql, include_deleted, Some(raw_sql))
+                    .await;
+            }
+            Err(e) => return Err(e),
+        }
     } else {
-        // No shard: use the pre-fetched metadata when available (saves one
-        // catalog round-trip that the fast-path gate already paid).
+        // No shard, no pin: use the pre-fetched metadata when available (saves
+        // one catalog round-trip that the fast-path gate already paid).
         match prefetched_meta {
             Some(m) => m,
             None => {
@@ -1678,6 +1828,11 @@ pub(crate) async fn execute_simple_select(
     // unbounded and let the existing `apply_limit` pass after the post-read
     // shrinks bound the final result — this preserves the "≥ n when more
     // exist" guarantee.
+    // Under a transaction pin, thread the hot-seq watermark through EVERY
+    // hot-tier overlay probe so a concurrent session's post-pin UPDATE/DELETE
+    // (seq > watermark) is invisible to this read. `None` = auto-commit / no
+    // pin: today's behaviour (every committed overlay entry is visible).
+    let hot_watermark = pinned.map(|p| p.hot_watermark);
     let post_read_shrinking = !plan.is_null_cols.is_empty()
         || !plan.in_list_preds.is_empty()
         || {
@@ -1685,19 +1840,21 @@ pub(crate) async fn execute_simple_select(
             // (project, table). Both probes are O(1) HashMap lookups; we
             // only consult them on the LIMIT-pushdown gate, so the work is
             // bounded and proportional to "does the engine have any
-            // outstanding fast-path DELETE/UPDATE for this table".
+            // outstanding fast-path DELETE/UPDATE for this table". Under a pin
+            // the watermark hides post-pin overlays so the pushdown decision
+            // matches what the read will actually merge below.
             let registry = sess.engine.memtable_registry();
             let tombs = crate::hot_tombstone::snapshot_tombstones(
                 registry.as_ref(),
                 &sess.project,
                 &plan.table,
-                None,
+                hot_watermark,
             );
             let updates = crate::hot_tombstone::snapshot_updates(
                 registry.as_ref(),
                 &sess.project,
                 &plan.table,
-                None,
+                hot_watermark,
             );
             !tombs.is_empty() || !updates.is_empty()
         };
@@ -1881,7 +2038,7 @@ pub(crate) async fn execute_simple_select(
         .any(|p| matches!(p, Predicate::Eq(..)));
     if is_point_lookup && plan.aggregates.is_none() {
         if let Some((mem_rows, _has_tombstone)) =
-            probe_memtable(sess, &plan.table, &plan.predicates, &meta)
+            probe_memtable(sess, &plan.table, &plan.predicates, &meta, hot_watermark)
         {
             if !mem_rows.is_empty() {
                 // Hot-tier hit: apply projection + limit and return immediately.
@@ -1975,8 +2132,17 @@ pub(crate) async fn execute_simple_select(
     // Reaching this point means the memtable probe above found NO hot row for
     // this PK (it returned early on a hit) and NO tombstone forcing suppression
     // for this key — so the cold-tier read is authoritative and cacheable.
+    // Under a transaction pin the PK row cache is BYPASSED entirely (no GET and
+    // no INSERT). Its entries are keyed by the CURRENT hot-tier epoch + the
+    // table's CURRENT-head snapshot id (captured below), not by the pinned
+    // historical (snapshot, hot_watermark) view this read honours — so a hit
+    // could serve a row from the live head (a concurrent commit), and an insert
+    // would cache the pinned historical row under current-epoch keys and leak it
+    // back to auto-commit reads. Setting `pk_cache_ctx = None` disables both the
+    // GET (`pk_cache_hit`) and the INSERT downstream (both gate on this `Some`).
     let pk_cache_ctx: Option<(basin_hottier::RowKey, u64, u64, u64)> =
-        if !meta.rls_enabled
+        if pinned.is_none()
+            && !meta.rls_enabled
             && meta.pk_columns.len() == 1
             && plan.aggregates.is_none()
             && plan.in_list_preds.is_empty()
@@ -2108,11 +2274,28 @@ pub(crate) async fn execute_simple_select(
                             let allowlist: std::collections::HashSet<String> =
                                 rg_map.keys().cloned().collect();
                             result = Some(Some(SecondaryIndexHit { allowlist, rg_selection: rg_map }));
-                        } else if registry.is_loaded(&sess.project, &plan.table, col) {
-                            // Index is loaded but key is absent → no match.
-                            result = Some(None); // None means "definitely empty"
                         }
-                        // If probe returned None and index not loaded, fall through.
+                        // Probe MISS (`probe_locations` → `None`): the registry
+                        // collapses "key indexed-then-deleted" and "key never
+                        // indexed / index incomplete" into the SAME `None`, and
+                        // its documented contract is that callers MUST treat
+                        // `None` as "unknown — fall through to full scan". The
+                        // in-RAM B-tree index can legitimately be INCOMPLETE for
+                        // a present key: it is built fire-and-forget by the
+                        // auto-index advisor (and by `CREATE INDEX`) over a point-
+                        // in-time file set, is FIFO-evicted past
+                        // `MAX_INDEX_ENTRIES_PER_COL`, and does not retroactively
+                        // cover rows written before it existed. The previous
+                        // `result = Some(None)` ("definitely empty") short-circuit
+                        // therefore DROPPED live rows whenever a queried key was
+                        // simply not (yet) in the index — e.g. a point read of a
+                        // freshly-inserted non-PK value after the advisor fired
+                        // (`prepared_select_point_reads`). We never set a negative
+                        // result here: a miss leaves `result = None`, falling
+                        // through to the zone-map/bloom prune + full cold read,
+                        // which is always correct. The POSITIVE allowlist above
+                        // (a HIT) is still used only to PRUNE, and the existing
+                        // per-file re-check filters any superset.
                     }
                     break; // Only use one index column per query.
                 }
@@ -2463,8 +2646,8 @@ pub(crate) async fn execute_simple_select(
             all.extend(collected.into_iter().collect::<Result<Vec<_>>>()?);
         }
         all
-    } else if had_pk_probe || shadow_cols_present {
-        // Direct cold-file read (bypass `handle.read`). Two cases reach here:
+    } else if had_pk_probe || shadow_cols_present || pinned.is_some() {
+        // Direct cold-file read (bypass `handle.read`). Three cases reach here:
         //
         //   * `had_pk_probe`: the single-PK-Eq probe already narrowed the cold
         //     tier to a handful of candidate files; reading them directly skips
@@ -2480,6 +2663,18 @@ pub(crate) async fn execute_simple_select(
         //     decoded. The shadow-column correctness guard above already proved
         //     no hot-tier / un-flushed-tail rows exist for this table, so the
         //     cold files are the authoritative complete row set.
+        //   * `pinned.is_some()` (in-tx repeatable read): SNAPSHOT-CORRECTNESS,
+        //     not perf. `handle.read` discovers the shard's CURRENT live file
+        //     set + in-RAM tail (the moved head), so it would re-admit a
+        //     concurrent committer's rows that the top-of-fn flush pushed to a
+        //     HIGHER catalog snapshot than the pin — the snapshot_isolation
+        //     leak (e.g. a pinned `COUNT(*)` counting +1 for B's row). `meta`
+        //     was reloaded at `pinned.snapshot`, so `live_files`/`live_paths`
+        //     here are exactly the pinned historical file set; reading those
+        //     paths directly (then applying the watermark-filtered hot overlay
+        //     below) yields the pinned view. The top-of-fn `flush_to_parquet()`
+        //     already drained the tail into cold files before `live_files` was
+        //     consumed, so no pinned-snapshot row is still tail-only.
         //
         // Safety (shared):
         //   * Hot tier covered: the engine's `MemTableRegistry` was probed
@@ -2488,7 +2683,8 @@ pub(crate) async fn execute_simple_select(
         //   * Shard tail drained: `shard.flush_to_parquet()` ran above
         //     (line ~1077), so the shard's in-RAM `state.tail` was flushed
         //     to cold-tier Parquet before the probe consumed `live_files`.
-        //   * Tombstone overlay applied below as on the non-shard path.
+        //   * Tombstone overlay applied below as on the non-shard path (and,
+        //     under a pin, filtered by the hot-seq watermark).
         if live_paths.is_empty() {
             vec![]
         } else {
@@ -2581,7 +2777,9 @@ pub(crate) async fn execute_simple_select(
             registry.as_ref(),
             &sess.project,
             &plan.table,
-                None,
+            // Under a pin: drop post-pin tombstones (seq > watermark) so a
+            // concurrent DELETE does NOT suppress this tx's pinned cold row.
+            hot_watermark,
         );
         // Merge-on-read UPDATE overlay for the hot-tier fast path: drop cold
         // rows whose PK has an `Update` override and append the post-SET rows.
@@ -2591,7 +2789,9 @@ pub(crate) async fn execute_simple_select(
             registry.as_ref(),
             &sess.project,
             &plan.table,
-                None,
+            // Under a pin: drop post-pin overrides (seq > watermark) so a
+            // concurrent UPDATE does NOT override this tx's pinned cold row.
+            hot_watermark,
         );
         if tombs.is_empty() && updates.is_empty() {
             batches
