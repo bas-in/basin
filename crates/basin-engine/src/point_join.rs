@@ -580,6 +580,7 @@ pub(crate) async fn execute_point_join(
         is_null_cols: vec![],
         in_list_preds: vec![],
         limit: None,
+        offset: None,
         order_by: None,
         always_empty: false,
     };
@@ -644,6 +645,7 @@ pub(crate) async fn execute_point_join(
         is_null_cols: vec![],
         in_list_preds: vec![],
         limit: None,
+        offset: None,
         order_by: None,
         always_empty: false,
     };

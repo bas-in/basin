@@ -511,6 +511,14 @@ pub(crate) struct SimpleSelectPlan {
     /// values into the bloom+zone-map IN-list probe to prune cold-tier files.
     pub in_list_preds: Vec<(String, Vec<ScalarValue>)>,
     pub limit: Option<usize>,
+    /// `OFFSET n` row skip for the ORDER BY + LIMIT pagination shape. Only ever
+    /// `Some` together with `order_by.is_some()` and `limit.is_some()` (the
+    /// `SELECT … ORDER BY k LIMIT m OFFSET n` keyset/offset-paging form); the
+    /// recogniser rejects OFFSET in every other shape so its non-deterministic
+    /// PG semantics never reach the fast path. `execute_simple_select` skips
+    /// the first `offset` rows of the global top-`(limit+offset)` before
+    /// returning the `limit`-row window — see `apply_order_by_limit`.
+    pub offset: Option<usize>,
     /// `Some((column, ascending))` for a single-column ORDER BY recognised by
     /// the fast path. `ascending=true` means ASC (or no direction specified);
     /// `ascending=false` means DESC. When `Some`, `execute_simple_select` sorts
@@ -546,7 +554,6 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
     // result-formatting clause — is still rejected below.)
     if q.with.is_some()
         || !q.ext_limit_by().is_empty()
-        || q.ext_offset().is_some()
         || q.fetch.is_some()
         || q.for_clause.is_some()
         || q.settings.is_some()
@@ -554,6 +561,25 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
     {
         return None;
     }
+    // OFFSET is parsed (not blanket-rejected) so the `ORDER BY k LIMIT m
+    // OFFSET n` pagination shape can take the fast path's two-phase top-k.
+    // It is admitted ONLY on the ORDER BY + LIMIT form below; on every other
+    // shape (no ORDER BY, or no LIMIT) we fall through to DataFusion because
+    // OFFSET without a total order has non-deterministic PG semantics the fast
+    // path must not silently fix to a particular row set.
+    let offset: Option<usize> = match q.ext_offset() {
+        None => None,
+        Some(off) => match &off.value {
+            Expr::Value(ValueWithSpan {
+                value: Value::Number(s, _),
+                ..
+            }) => match s.parse::<i64>() {
+                Ok(n) if n >= 0 => Some(n as usize),
+                _ => return None,
+            },
+            _ => return None,
+        },
+    };
 
     // Parse an optional single-column ORDER BY. Any ORDER BY that is more
     // complex (multiple columns, expressions, NULLS FIRST/LAST, WITH FILL)
@@ -673,8 +699,8 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
     // Row-returning constraints:
     //  - ORDER BY requires a paired LIMIT
     if let Some(aggs) = parse_aggregate_projection(&select.projection) {
-        // Aggregate query — ORDER BY and LIMIT are incompatible.
-        if order_by.is_some() || q.ext_limit().is_some() {
+        // Aggregate query — ORDER BY, LIMIT, and OFFSET are incompatible.
+        if order_by.is_some() || q.ext_limit().is_some() || offset.is_some() {
             return None;
         }
         // Minimal read projection for the aggregate: the union of the columns
@@ -727,6 +753,7 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
             is_null_cols: parsed_where.is_null_cols,
             in_list_preds: parsed_where.in_list_preds,
             limit: None,
+            offset: None,
             order_by: None,
             always_empty: parsed_where.always_false,
         });
@@ -755,6 +782,15 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
         return None;
     }
 
+    // OFFSET is admitted ONLY on the `ORDER BY k LIMIT m OFFSET n` shape — a
+    // total order makes the skipped window deterministic and the two-phase
+    // top-k in `apply_order_by_limit` resolves it cheaply. An OFFSET without
+    // ORDER BY (or without LIMIT) returns to DataFusion: its row choice is
+    // implementation-defined in PG and the fast path must not pin it.
+    if offset.is_some() && (order_by.is_none() || limit.is_none()) {
+        return None;
+    }
+
     Some(SimpleSelectPlan {
         table,
         projection,
@@ -764,6 +800,7 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
         is_null_cols: parsed_where.is_null_cols,
         in_list_preds: parsed_where.in_list_preds,
         limit,
+        offset,
         order_by,
         always_empty: parsed_where.always_false,
     })
@@ -2001,7 +2038,7 @@ async fn execute_simple_select_inner(
     // SUPERSET of that file's contribution to the global top-`n`.  Reading each
     // candidate file with its OWN per-file LIMIT therefore bounds the total
     // merge input to `n_files × n` rows (tiny), and the existing
-    // `apply_order_by_limit` (concat + sort_to_indices + take) then produces the
+    // `apply_order_by_limit` (two-phase key-column top-k) then produces the
     // exact global top-`n` cheaply — the dominant cost (reading every surviving
     // row of every file in full) is eliminated.
     //
@@ -2041,7 +2078,15 @@ async fn execute_simple_select_inner(
         {
             match &plan.predicates[0] {
                 // ASC + `k > $1`: smallest matching keys are the file head.
-                Predicate::Gt(col, _) if *ascending && col == ob_col => Some(limit),
+                // With an OFFSET, the global top-`(limit+offset)` is needed
+                // before the skip, so each ASC-sorted file's head must supply
+                // `limit + offset` rows (still a superset of its contribution).
+                // `saturating_add` keeps a pathological OFFSET from wrapping;
+                // an over-large per-file cap just reads the whole file (correct,
+                // never wrong).
+                Predicate::Gt(col, _) if *ascending && col == ob_col => {
+                    Some(limit.saturating_add(plan.offset.unwrap_or(0)))
+                }
                 // DESC + `k < $1` (and every other shape) is not eligible for
                 // the per-file head LIMIT — leave it to the full-file path.
                 _ => None,
@@ -2747,22 +2792,40 @@ async fn execute_simple_select_inner(
         use futures::StreamExt;
         let mut keyset_opts = opts.clone();
         keyset_opts.limit = Some(per_file_limit);
+        // Drive the per-file reads with bounded concurrency rather than one
+        // fully-awaited file at a time.  Each file is still its OWN single-path
+        // `read_paths_with_schema` call, so its stream-level limit coincides
+        // with the per-file limit (one path ⇒ global == per-file) — the
+        // superset invariant the branch relies on is untouched.  The earlier
+        // sequential `for path { … .await }` loop serialised all file
+        // setups+awaits: at the 16-file 1M layout that linear chain was the
+        // keyset latency regression (8-file ≈ 5-7ms → 16-file ≈ 20ms).
+        // `buffered(KEYSET_READ_CONCURRENCY)` overlaps them exactly as the
+        // non-keyset cold path's own `buffered(4)` does, and `buffered`
+        // preserves input order so the collected batches stay in `live_paths`
+        // order (irrelevant to correctness — `apply_order_by_limit` re-sorts —
+        // but keeps the merge input deterministic).
+        const KEYSET_READ_CONCURRENCY: usize = 4;
+        let project = sess.project;
+        let storage = &sess.engine.config().storage;
+        let per_file: Vec<Result<Vec<RecordBatch>>> = futures::stream::iter(live_paths)
+            .map(|path| {
+                let keyset_opts = keyset_opts.clone();
+                let schema = Some(meta.schema.clone());
+                async move {
+                    let stream = storage
+                        .read_paths_with_schema(&project, vec![path], keyset_opts, schema)
+                        .await?;
+                    let collected: Vec<Result<RecordBatch>> = stream.collect().await;
+                    collected.into_iter().collect::<Result<Vec<_>>>()
+                }
+            })
+            .buffered(KEYSET_READ_CONCURRENCY)
+            .collect()
+            .await;
         let mut all: Vec<RecordBatch> = Vec::new();
-        for path in live_paths {
-            let schema = Some(meta.schema.clone());
-            let stream = sess
-                .engine
-                .config()
-                .storage
-                .read_paths_with_schema(
-                    &sess.project,
-                    vec![path],
-                    keyset_opts.clone(),
-                    schema,
-                )
-                .await?;
-            let collected: Vec<Result<RecordBatch>> = stream.collect().await;
-            all.extend(collected.into_iter().collect::<Result<Vec<_>>>()?);
+        for file_batches in per_file {
+            all.extend(file_batches?);
         }
         all
     } else if had_pk_probe || shadow_cols_present || pinned.is_some() {
@@ -3094,7 +3157,8 @@ async fn execute_simple_select_inner(
     // implies `limit.is_some()` (enforced in match_query).
     let trimmed = if let Some((ref col, ascending)) = plan.order_by {
         let limit = plan.limit.expect("order_by implies limit");
-        apply_order_by_limit(batches, col, ascending, limit, &projected_schema)?
+        let offset = plan.offset.unwrap_or(0);
+        apply_order_by_limit(batches, col, ascending, limit, offset, &projected_schema)?
     } else {
         match plan.limit {
             Some(limit) => apply_limit(batches, limit),
@@ -3485,35 +3549,59 @@ fn effective_cluster_col(meta: &TableMetadata) -> Option<String> {
     }
 }
 
-/// Sort batches by a single column and return the first `limit` rows as one
-/// or more `RecordBatch`es. Uses Arrow's `sort_to_indices` + `take` so the
-/// sort key is only materialised once. NULLs sort last in ASC order (matching
-/// DataFusion's default NULL handling for `ORDER BY col ASC`).
+/// Two-phase global top-k for `ORDER BY <col> {ASC|DESC} LIMIT limit [OFFSET
+/// offset]`.
 ///
-/// Returns an error if the sort column is absent from the projected schema.
+/// The old implementation concatenated EVERY column of EVERY surviving batch
+/// (`concat_batches`) before sorting — an O(n × width) materialisation of the
+/// whole result set even though the answer is only the `limit` rows of the
+/// window. At 1M rows that concat (not the partial sort) dominated the OFFSET
+/// pagination residual.
+///
+/// The two phases here keep the work O(n) in the key column plus O(k) in the
+/// output window, where `k = limit` (`offset` rows are sorted into the prefix
+/// but never materialised across the wide columns):
+///
+///   1. Key scan. Concatenate ONLY the ORDER BY key column (one array, 1M
+///      cheap scalars — not the full-width rows) and `sort_to_indices` it with
+///      a partial-sort bound of `limit + offset`. Arrow's `sort_to_indices`
+///      with a `Some(k)` limit does a bounded partial sort, so this is O(n) +
+///      O(k log k), never a full O(n log n) sort.
+///   2. Window materialise. Map each surviving global index back to its
+///      `(batch_idx, row_idx)` via per-batch row offsets, drop the first
+///      `offset` of them, and `interleave` each output column over the
+///      per-batch arrays for the remaining ≤ `limit` index pairs. Only the
+///      window rows are ever touched in the wide columns.
 fn apply_order_by_limit(
     batches: Vec<RecordBatch>,
     col: &str,
     ascending: bool,
     limit: usize,
+    offset: usize,
     schema: &Arc<Schema>,
 ) -> Result<Vec<RecordBatch>> {
-    use arrow::compute::{SortOptions, sort_to_indices, take};
-    use arrow_select::concat;
+    use arrow::compute::{SortOptions, concat, interleave, sort_to_indices};
+    use arrow_array::Array;
 
     if batches.is_empty() || limit == 0 {
         return Ok(Vec::new());
     }
 
-    // Concatenate all batches into one so the sort sees global row order.
-    let refs: Vec<&RecordBatch> = batches.iter().collect();
-    let merged = concat::concat_batches(schema, refs)
-        .map_err(|e| BasinError::internal(format!("order_by concat: {e}")))?;
-
-    let col_idx = merged.schema().index_of(col).map_err(|_| {
+    let col_idx = schema.index_of(col).map_err(|_| {
         BasinError::InvalidSchema(format!("ORDER BY column '{col}' not in result schema"))
     })?;
-    let sort_col = merged.column(col_idx);
+
+    // ── Phase 1: key scan ────────────────────────────────────────────────────
+    // Concatenate ONLY the sort-key column across batches. `take`-window is
+    // limit + offset rows of the GLOBAL order (we keep `offset` rows in the
+    // prefix so the slice below lands on the right window). `saturating_add`
+    // guards a pathological OFFSET near usize::MAX; an over-large bound just
+    // sorts the whole key column (correct, never wrong).
+    let key_window = limit.saturating_add(offset);
+    let key_cols: Vec<&dyn arrow_array::Array> =
+        batches.iter().map(|b| b.column(col_idx).as_ref()).collect();
+    let merged_key = concat(&key_cols)
+        .map_err(|e| BasinError::internal(format!("order_by key concat: {e}")))?;
 
     // nulls_first=false: NULLs sort LAST (DataFusion default for ASC).
     // For DESC, NULLs sort FIRST (DataFusion default), so nulls_first=true.
@@ -3521,14 +3609,48 @@ fn apply_order_by_limit(
         descending: !ascending,
         nulls_first: !ascending,
     };
-    let indices = sort_to_indices(sort_col, Some(opts), Some(limit))
+    let indices = sort_to_indices(merged_key.as_ref(), Some(opts), Some(key_window))
         .map_err(|e| BasinError::internal(format!("order_by sort_to_indices: {e}")))?;
 
-    // Reorder every column by the sort indices.
-    let columns: Vec<arrow_array::ArrayRef> = (0..merged.num_columns())
+    // Drop the OFFSET prefix; everything past it (≤ limit rows) is the window.
+    let total = indices.len();
+    if offset >= total {
+        return Ok(Vec::new());
+    }
+    let window = &indices.values()[offset..total];
+    if window.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // ── Phase 2: window materialise ──────────────────────────────────────────
+    // Map each surviving GLOBAL index → (batch_idx, row_idx) via per-batch row
+    // offsets, then `interleave` each output column over the per-batch arrays
+    // for only the window's ≤ limit index pairs. The wide columns are touched
+    // for the window rows alone — never the full n rows.
+    let mut batch_offsets: Vec<usize> = Vec::with_capacity(batches.len() + 1);
+    let mut acc = 0usize;
+    batch_offsets.push(0);
+    for b in &batches {
+        acc += b.num_rows();
+        batch_offsets.push(acc);
+    }
+    let pairs: Vec<(usize, usize)> = window
+        .iter()
+        .map(|&g| {
+            let g = g as usize;
+            // partition_point gives the first offset strictly greater than g;
+            // its index minus one is the owning batch.
+            let bi = batch_offsets.partition_point(|&o| o <= g) - 1;
+            (bi, g - batch_offsets[bi])
+        })
+        .collect();
+
+    let columns: Vec<arrow_array::ArrayRef> = (0..schema.fields().len())
         .map(|i| {
-            take(merged.column(i).as_ref(), &indices, None)
-                .map_err(|e| BasinError::internal(format!("order_by take col {i}: {e}")))
+            let per_batch: Vec<&dyn arrow_array::Array> =
+                batches.iter().map(|b| b.column(i).as_ref()).collect();
+            interleave(&per_batch, &pairs)
+                .map_err(|e| BasinError::internal(format!("order_by interleave col {i}: {e}")))
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -4146,6 +4268,40 @@ mod tests {
             Predicate::Gt(col, ScalarValue::Int64(5999)) => assert_eq!(col, "id"),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn matches_order_by_limit_offset_captures_offset() {
+        // The pagination shape now takes the fast path WITH the OFFSET captured
+        // (previously OFFSET forced a DataFusion fallback).
+        let stmt = parse_one("SELECT id FROM t ORDER BY id DESC LIMIT 50 OFFSET 100");
+        let plan = match_simple_select(&stmt).expect("fast path should match");
+        assert_eq!(plan.limit, Some(50));
+        assert_eq!(plan.offset, Some(100));
+        assert_eq!(plan.order_by, Some(("id".to_string(), false)));
+    }
+
+    #[test]
+    fn offset_without_order_by_falls_through() {
+        // OFFSET without a total order has implementation-defined row choice in
+        // PG; the fast path must NOT pin it — fall through to DataFusion.
+        let stmt = parse_one("SELECT id FROM t LIMIT 50 OFFSET 100");
+        assert!(match_simple_select(&stmt).is_none());
+    }
+
+    #[test]
+    fn offset_without_limit_falls_through() {
+        // OFFSET without LIMIT is unbounded paging — leave it to DataFusion.
+        let stmt = parse_one("SELECT id FROM t ORDER BY id DESC OFFSET 100");
+        assert!(match_simple_select(&stmt).is_none());
+    }
+
+    #[test]
+    fn offset_zero_on_order_by_limit_is_captured() {
+        let stmt = parse_one("SELECT id FROM t ORDER BY id ASC LIMIT 10 OFFSET 0");
+        let plan = match_simple_select(&stmt).expect("fast path should match");
+        assert_eq!(plan.offset, Some(0));
+        assert_eq!(plan.limit, Some(10));
     }
 
     #[test]
