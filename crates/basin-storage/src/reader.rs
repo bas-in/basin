@@ -633,6 +633,9 @@ fn filters_to_prune_schema(filters: &[Predicate]) -> Schema {
                 ScalarValue::UInt64(_) => DataType::UInt64,
             },
             Predicate::StartsWith { .. } => DataType::Utf8,
+            // InInt64 targets an Int64-family column; type it Int64 so the
+            // schema is coherent (the membership atom itself prunes to Mixed).
+            Predicate::InInt64(..) => DataType::Int64,
         };
         // Nullable=true is conservative: it never enables an unsafe prune
         // (null-count from stats is what `prune_atom` actually consults).
@@ -1614,6 +1617,11 @@ fn predicate_excludes_group_by_idx(
             case_insensitive,
             ..
         } => return prune_starts_with_row_group(stats, prefix, *case_insensitive),
+        // IN-list membership cannot be excluded from a single [min,max] row
+        // group (overlap with the key range does not imply a hit, and vice
+        // versa). Never exclude — the engine pushes a separate range predicate
+        // for row-group pruning; this atom keeps every overlapping group.
+        Predicate::InInt64(..) => return false,
     };
 
     match (filter, value, stats) {
@@ -2562,6 +2570,130 @@ fn vortex_project_and_filter(
     vortex_project_and_filter_limited(batches, opts, catalog_schema, apply_filter, None)
 }
 
+/// Process-level kill switch for the sorted-key skip. `BASIN_SORTED_SKIP_DISABLE=1`
+/// (or `true`) reverts every `InInt64`-on-sort-column read to the plain
+/// vectorized-filter path.
+fn sorted_skip_disabled() -> bool {
+    std::env::var("BASIN_SORTED_SKIP_DISABLE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Per-call plan for the sorted-key skip. Holds the index of the single
+/// `InInt64` filter that targets `opts.sorted_by`, plus the (sorted, dedup)
+/// key vector. `None` means the optimisation does not apply and the caller
+/// uses the plain filter path.
+struct SortedSkipPlan<'a> {
+    /// The sort column name (== `opts.sorted_by`).
+    column: &'a str,
+    /// ASC-sorted, deduplicated IN-list keys.
+    keys: &'a [i64],
+    /// Indices into `opts.filters` of every predicate OTHER than the chosen
+    /// `InInt64` — these residual filters are re-applied as a mask on the
+    /// (small) taken batch so the result is exact, not a superset.
+    residual: Vec<usize>,
+}
+
+/// Decide whether the sorted-key skip applies for this read. Eligible iff:
+///   * the kill switch is OFF,
+///   * `opts.sorted_by` names a column,
+///   * exactly one `InInt64` filter targets that column (more than one IN on
+///     the sort column is not the bench shape — fall back),
+///   * its key vector is non-empty.
+/// Returns the plan (borrowing into `opts`) or `None`.
+fn sorted_skip_plan(opts: &ReadOptions) -> Option<SortedSkipPlan<'_>> {
+    if sorted_skip_disabled() {
+        return None;
+    }
+    let sort_col = opts.sorted_by.as_deref()?;
+    let mut chosen: Option<(usize, &[i64])> = None;
+    for (i, f) in opts.filters.iter().enumerate() {
+        if let Predicate::InInt64(c, keys) = f {
+            if c == sort_col {
+                if chosen.is_some() {
+                    // Two IN-lists on the sort column — unusual; bail to the
+                    // plain path rather than guess an intersection.
+                    return None;
+                }
+                chosen = Some((i, keys.as_slice()));
+            }
+        }
+    }
+    let (idx, keys) = chosen?;
+    if keys.is_empty() {
+        return None;
+    }
+    let residual = (0..opts.filters.len()).filter(|&j| j != idx).collect();
+    Some(SortedSkipPlan {
+        column: sort_col,
+        keys,
+        residual,
+    })
+}
+
+/// Execute the sorted-key skip on one decode chunk: binary-search the sort
+/// column for the IN-list keys, `take` only the matching rows, then re-apply
+/// any residual (non-IN) filters as a mask on the taken batch.
+///
+/// Falls back to evaluating the `InInt64` predicate as a plain mask on the
+/// full batch when the sort column is absent from the batch or is not a
+/// widenable integer (e.g. an unexpected type) — correctness is preserved
+/// either way.
+fn apply_sorted_skip(
+    batch: &RecordBatch,
+    opts: &ReadOptions,
+    plan: &SortedSkipPlan<'_>,
+) -> Result<RecordBatch> {
+    // Locate the sort column in this batch. If it was projected away or
+    // renamed, fall back to a full-batch mask over all filters.
+    let taken = match batch.column_by_name(plan.column) {
+        Some(col) => match predicate::sorted_in_int64_indices(col, plan.keys) {
+            Some(indices) => {
+                let idx_arr = arrow_array::UInt32Array::from(indices);
+                arrow::compute::take_record_batch(batch, &idx_arr)
+                    .map_err(|e| BasinError::storage(format!("sorted-skip take: {e}")))?
+            }
+            // Column present but not widenable — fall back to the IN mask.
+            None => {
+                let m = predicate::evaluate(batch, &reconstruct_in_pred(plan))?;
+                arrow::compute::filter_record_batch(batch, &m)
+                    .map_err(|e| BasinError::storage(format!("sorted-skip in-mask: {e}")))?
+            }
+        },
+        None => {
+            let m = predicate::evaluate(batch, &reconstruct_in_pred(plan))?;
+            arrow::compute::filter_record_batch(batch, &m)
+                .map_err(|e| BasinError::storage(format!("sorted-skip in-mask: {e}")))?
+        }
+    };
+
+    // Re-apply residual (non-IN) filters on the (small) taken batch so the
+    // result is exact. This is cheap: the taken batch has at most `keys.len()`
+    // rows, not the chunk's full row count.
+    if plan.residual.is_empty() {
+        return Ok(taken);
+    }
+    let mut mask: Option<arrow_array::BooleanArray> = None;
+    for &j in &plan.residual {
+        let m = predicate::evaluate(&taken, &opts.filters[j])?;
+        mask = Some(match mask {
+            None => m,
+            Some(prev) => arrow::compute::and(&prev, &m)
+                .map_err(|e| BasinError::storage(format!("sorted-skip residual AND: {e}")))?,
+        });
+    }
+    match mask {
+        Some(m) => arrow::compute::filter_record_batch(&taken, &m)
+            .map_err(|e| BasinError::storage(format!("sorted-skip residual: {e}"))),
+        None => Ok(taken),
+    }
+}
+
+/// Rebuild the `InInt64` predicate from a plan for the mask-fallback path.
+fn reconstruct_in_pred(plan: &SortedSkipPlan<'_>) -> Predicate {
+    Predicate::InInt64(plan.column.to_string(), plan.keys.to_vec())
+}
+
 /// Same as [`vortex_project_and_filter`] but with an optional early per-call
 /// row cap (`early_limit`).  When `Some(lim)`, the running post-filter row
 /// total is truncated to `lim` BEFORE the per-column projection + metadata
@@ -2589,6 +2721,17 @@ fn vortex_project_and_filter_limited(
     let limit = early_limit;
     let mut seen = 0usize;
     let mut out = Vec::with_capacity(batches.len());
+
+    // Sorted-key skip eligibility (computed once for the whole call): when the
+    // filter set carries exactly one `InInt64` on the column named by
+    // `opts.sorted_by` (the file's physical ASC sort column), we can serve that
+    // predicate by binary-searching each decode chunk and `take`-ing ONLY the
+    // matching rows — O(k log n) index probes + materialization of the matches,
+    // instead of an O(n) Arrow filter over every wide column. Any *other*
+    // residual filters are still applied (as a mask) on the small taken batch.
+    // The whole optimisation is reverted by `BASIN_SORTED_SKIP_DISABLE=1`.
+    let sorted_skip = if apply_filter { sorted_skip_plan(opts) } else { None };
+
     for batch in batches {
         if let Some(lim) = limit {
             if seen >= lim {
@@ -2598,6 +2741,12 @@ fn vortex_project_and_filter_limited(
         // 1) Filter (predicate columns referenced by name; pre-projection).
         let filtered = if !apply_filter || opts.filters.is_empty() {
             batch
+        } else if let Some(plan) = &sorted_skip {
+            // ── Sorted-key skip take path ────────────────────────────────────
+            // Binary-search this (internally ASC-sorted) chunk for the IN-list
+            // keys, take only the matching rows, then apply any residual
+            // (non-IN) filters on the much smaller taken batch.
+            apply_sorted_skip(&batch, opts, plan)?
         } else {
             let mut mask: Option<arrow_array::BooleanArray> = None;
             for f in &opts.filters {
@@ -2819,6 +2968,16 @@ fn vortex_filter_expr(
                     escaped.push('%');
                     Some(like(col(column.as_str()), lit(escaped)))
                 }
+            }
+            // IN-list membership is NOT pushed into the Vortex scan expression
+            // (no native multi-literal membership zone-prune that we trust
+            // across dtypes). It is evaluated Arrow-side — either via the
+            // sorted-key skip take path or the vectorized membership mask in
+            // `vortex_project_and_filter_limited`. Mark not-all-pushed so the
+            // caller keeps the post-decode filter active.
+            Predicate::InInt64(_, _) => {
+                all_pushed = false;
+                None
             }
         })
         .collect();
@@ -3429,6 +3588,163 @@ mod tests {
             schema.fields().iter().filter(|f| f.name() == "id").count(),
             1
         );
+    }
+
+    // ── Sorted-key skip (Predicate::InInt64 + ReadOptions.sorted_by) ────────
+
+    /// Build a multi-chunk batch list whose `id` column is globally ASC-sorted
+    /// across chunks AND internally sorted within each chunk (the file shape:
+    /// each decode chunk is a sorted slice of the file's sorted PK column).
+    fn sorted_chunks() -> Vec<RecordBatch> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("payload", DataType::Utf8, true),
+            Field::new("score", DataType::Float64, true),
+        ]));
+        let mk = |ids: Vec<i64>| {
+            let id = Int64Array::from(ids.clone());
+            let pay = StringArray::from(
+                ids.iter().map(|v| Some(format!("p{v}"))).collect::<Vec<_>>(),
+            );
+            let sc = Float64Array::from(ids.iter().map(|v| Some(*v as f64)).collect::<Vec<_>>());
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(id), Arc::new(pay), Arc::new(sc)],
+            )
+            .unwrap()
+        };
+        vec![
+            mk(vec![1, 4, 7, 10]),   // chunk 0
+            mk(vec![13, 16, 19, 22]), // chunk 1
+            mk(vec![25, 28, 31, 34]), // chunk 2
+        ]
+    }
+
+    fn read_ids(batches: &[RecordBatch]) -> Vec<i64> {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int64Type;
+        let mut out = Vec::new();
+        for b in batches {
+            let c = b.column_by_name("id").unwrap().as_primitive::<Int64Type>();
+            for i in 0..c.len() {
+                out.push(c.value(i));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn sorted_skip_exact_rows_across_multi_chunk() {
+        // Keys spanning chunk boundaries: first-of-chunk (1, 13, 25),
+        // last-of-chunk (10, 34), interior (16), and an absent key (99).
+        let mut keys = vec![1i64, 10, 13, 16, 25, 34, 99];
+        keys.sort_unstable();
+        keys.dedup();
+        let opts = ReadOptions {
+            filters: vec![Predicate::InInt64("id".into(), keys)],
+            sorted_by: Some("id".into()),
+            ..ReadOptions::default()
+        };
+        let out =
+            vortex_project_and_filter_limited(sorted_chunks(), &opts, None, true, None).unwrap();
+        // Absent 99 excluded; everything else present, in ASC order.
+        assert_eq!(read_ids(&out), vec![1, 10, 13, 16, 25, 34]);
+    }
+
+    #[test]
+    fn sorted_skip_equivalence_vs_plain_filter() {
+        // Same keys, with and without the sorted_by hint must yield identical
+        // rows (kill-switch path is the same as the no-hint path).
+        let mut keys = vec![4i64, 7, 19, 22, 28, 31];
+        keys.sort_unstable();
+        keys.dedup();
+        let skip_opts = ReadOptions {
+            filters: vec![Predicate::InInt64("id".into(), keys.clone())],
+            sorted_by: Some("id".into()),
+            ..ReadOptions::default()
+        };
+        let plain_opts = ReadOptions {
+            filters: vec![Predicate::InInt64("id".into(), keys)],
+            sorted_by: None, // no hint → plain vectorized membership mask
+            ..ReadOptions::default()
+        };
+        let a = vortex_project_and_filter_limited(sorted_chunks(), &skip_opts, None, true, None)
+            .unwrap();
+        let b = vortex_project_and_filter_limited(sorted_chunks(), &plain_opts, None, true, None)
+            .unwrap();
+        assert_eq!(read_ids(&a), read_ids(&b));
+        assert_eq!(read_ids(&a), vec![4, 7, 19, 22, 28, 31]);
+    }
+
+    #[test]
+    fn sorted_skip_residual_filter_applied_exact() {
+        // IN-list on the sort column PLUS a residual `score > 15` filter. The
+        // skip path takes the IN rows then re-applies the residual on the
+        // small taken batch — result must be exact, not a superset.
+        let mut keys = vec![1i64, 16, 19, 34];
+        keys.sort_unstable();
+        keys.dedup();
+        let opts = ReadOptions {
+            filters: vec![
+                Predicate::InInt64("id".into(), keys),
+                Predicate::Gt("score".into(), ScalarValue::Float64(15.0)),
+            ],
+            sorted_by: Some("id".into()),
+            ..ReadOptions::default()
+        };
+        let out =
+            vortex_project_and_filter_limited(sorted_chunks(), &opts, None, true, None).unwrap();
+        // score == id; keep IN-keys with score>15 → 16, 19, 34 (1 dropped).
+        assert_eq!(read_ids(&out), vec![16, 19, 34]);
+    }
+
+    #[test]
+    fn sorted_skip_no_hint_uses_plain_path() {
+        // Without sorted_by, the InInt64 still filters correctly via the
+        // vectorized membership mask (no take path).
+        let mut keys = vec![7i64, 25];
+        keys.sort_unstable();
+        keys.dedup();
+        let opts = ReadOptions {
+            filters: vec![Predicate::InInt64("id".into(), keys)],
+            sorted_by: None,
+            ..ReadOptions::default()
+        };
+        let out =
+            vortex_project_and_filter_limited(sorted_chunks(), &opts, None, true, None).unwrap();
+        assert_eq!(read_ids(&out), vec![7, 25]);
+    }
+
+    #[test]
+    fn sorted_skip_kill_switch_reverts_to_plain() {
+        // With the kill switch set, sorted_skip_plan returns None even with the
+        // hint present; the result is unchanged (correctness preserved).
+        std::env::set_var("BASIN_SORTED_SKIP_DISABLE", "1");
+        let mut keys = vec![10i64, 13, 28];
+        keys.sort_unstable();
+        keys.dedup();
+        let opts = ReadOptions {
+            filters: vec![Predicate::InInt64("id".into(), keys)],
+            sorted_by: Some("id".into()),
+            ..ReadOptions::default()
+        };
+        assert!(sorted_skip_plan(&opts).is_none(), "kill switch disables plan");
+        let out =
+            vortex_project_and_filter_limited(sorted_chunks(), &opts, None, true, None).unwrap();
+        std::env::remove_var("BASIN_SORTED_SKIP_DISABLE");
+        assert_eq!(read_ids(&out), vec![10, 13, 28]);
+    }
+
+    #[test]
+    fn sorted_skip_plan_requires_hint_on_in_column() {
+        // Hint on a DIFFERENT column than the IN-list → no plan (the IN is not
+        // on the sorted column, so the take path is unsound).
+        let opts = ReadOptions {
+            filters: vec![Predicate::InInt64("id".into(), vec![1, 2, 3])],
+            sorted_by: Some("other".into()),
+            ..ReadOptions::default()
+        };
+        assert!(sorted_skip_plan(&opts).is_none());
     }
 
     /// End-to-end: with NO catalog attached, a point predicate must still

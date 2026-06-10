@@ -2218,6 +2218,7 @@ impl ProjectHandleImpl for InProcessProjectHandle {
             partition: opts.partition.clone(),
             limit: opts.limit,
             row_group_selection: opts.row_group_selection.clone(),
+            sorted_by: opts.sorted_by.clone(),
         };
         let stream = self
             .cfg
@@ -2425,9 +2426,30 @@ fn evaluate_predicate(
         }};
     }
 
+    // Dedicated arm: sorted-IN membership over an Int64-family column. The
+    // key list is sorted+deduped by contract, so per-row binary search gives
+    // O(log k) membership; NULLs never match.
+    if let Predicate::InInt64(_, keys) = predicate {
+        let arr = col.as_primitive_opt::<Int64Type>().ok_or_else(|| {
+            BasinError::storage(format!(
+                "InInt64 predicate on non-Int64 column {col_name}"
+            ))
+        })?;
+        let mut b = arrow_array::builder::BooleanBuilder::with_capacity(arr.len());
+        for i in 0..arr.len() {
+            if arr.is_null(i) {
+                b.append_value(false);
+            } else {
+                b.append_value(keys.binary_search(&arr.value(i)).is_ok());
+            }
+        }
+        return Ok(b.finish());
+    }
+
     let value = match predicate {
         Predicate::Eq(_, v) | Predicate::Gt(_, v) | Predicate::Lt(_, v) => v.clone(),
         Predicate::StartsWith { prefix, .. } => ScalarValue::Utf8(prefix.clone()),
+        Predicate::InInt64(..) => unreachable!("InInt64 handled in dedicated arm above"),
     };
 
     let mask: BooleanArray = match (predicate, &value) {
@@ -2468,6 +2490,9 @@ fn evaluate_predicate(
                 Predicate::Lt(_, _) => |a, b| a < b,
                 Predicate::StartsWith { .. } => {
                     unreachable!("StartsWith handled in dedicated arm above")
+                }
+                Predicate::InInt64(..) => {
+                    unreachable!("InInt64 handled in dedicated arm above")
                 }
             };
             let mut b = arrow_array::builder::BooleanBuilder::with_capacity(arr.len());

@@ -301,6 +301,11 @@ fn hash_one_predicate(h: &mut std::collections::hash_map::DefaultHasher, p: &Pre
             prefix.hash(h);
             case_insensitive.hash(h);
         }
+        Predicate::InInt64(c, keys) => {
+            4u8.hash(h);
+            c.hash(h);
+            keys.hash(h);
+        }
     }
 }
 
@@ -345,6 +350,9 @@ fn predicate_sort_key(p: &Predicate) -> (u8, &str, u8) {
         // the value-tag slot so equally-shaped prefix predicates sort
         // deterministically next to one another.
         Predicate::StartsWith { column, .. } => (3u8, column.as_str(), 5u8),
+        // InInt64 carries no single `ScalarValue`; fixed value-tag slot so
+        // membership predicates sort deterministically together.
+        Predicate::InInt64(c, _) => (4u8, c.as_str(), 6u8),
     };
     (op, col, vd)
 }

@@ -314,6 +314,15 @@ pub struct ReadOptions {
     /// scanned in full; files present are restricted to the listed groups.
     /// `None` = scan every row-group of every file.
     pub row_group_selection: Option<HashMap<String, Vec<u32>>>,
+    /// Optional hint naming the single column every cold file is physically
+    /// ASC-sorted on (the table's effective cluster / single-PK column). The
+    /// engine sets this from `effective_cluster_col(meta)` when it pushes a
+    /// `Predicate::InInt64` on that same column. It enables the storage
+    /// sorted-key skip: an `InInt64` filter on the sorted column is served by
+    /// binary-searching each decode chunk and `take`-ing only the matching
+    /// rows, instead of an O(n) Arrow filter over every (wide) column.
+    /// `None` = no sort guarantee; the plain vectorized filter path is used.
+    pub sorted_by: Option<String>,
 }
 
 /// Project-aware Parquet store. Cheap to clone (`Arc` inside).

@@ -294,6 +294,13 @@ pub(crate) struct EngineInner {
     pub(crate) jsonb_promotion_registry:
         Arc<crate::jsonb_promotion::JsonbPromotionRegistry>,
 
+    /// Self-driving physical layout (step 1): per-`(project, table, column)`
+    /// non-PK equality-predicate access-frequency registry. Records Eq-predicate
+    /// hits at query time and fires a one-shot `CREATE INDEX` when a column
+    /// crosses [`crate::index_advisor::AUTO_INDEX_MIN_HITS`].
+    pub(crate) index_advisor_registry:
+        Arc<crate::index_advisor::IndexAdvisorRegistry>,
+
     /// Bulk-INSERT PK / UNIQUE constraint-set memoization cache (Tier 2 of
     /// the bulk-INSERT perf fix). Keyed by `(project, table)` with the
     /// on-disk file-set FNV-1a hash as the freshness signature. Between
@@ -410,6 +417,10 @@ impl Engine {
             // ADR 0027 Phase 4 auto-promotion registry.
             jsonb_promotion_registry: Arc::new(
                 crate::jsonb_promotion::JsonbPromotionRegistry::new(),
+            ),
+            // Self-driving physical layout: auto-index advisor registry.
+            index_advisor_registry: Arc::new(
+                crate::index_advisor::IndexAdvisorRegistry::new(),
             ),
             // Tier 2 bulk-INSERT PK set cache.
             pk_set_cache: Arc::new(crate::constraints::PkSetCache::new()),
@@ -796,6 +807,23 @@ impl Engine {
         &self,
     ) -> Arc<crate::jsonb_promotion::JsonbPromotionRegistry> {
         self.inner.jsonb_promotion_registry.clone()
+    }
+
+    // ── Self-driving physical layout: auto-index advisor ─────────────────────
+
+    /// Crate-private: process-wide auto-index advisor registry.
+    pub(crate) fn index_advisor_registry(
+        &self,
+    ) -> &Arc<crate::index_advisor::IndexAdvisorRegistry> {
+        &self.inner.index_advisor_registry
+    }
+
+    /// Public accessor for integration tests: inspect the auto-index advisor
+    /// registry (per-column hit counts and `fired` flags).
+    pub fn index_advisor_registry_for_test(
+        &self,
+    ) -> Arc<crate::index_advisor::IndexAdvisorRegistry> {
+        self.inner.index_advisor_registry.clone()
     }
 
     // ── Phase 5.20.E: GIN FTS (tsvector) index ───────────────────────────────
@@ -1324,6 +1352,7 @@ mod prepared;
 mod pk_row_cache;
 mod query_history;
 pub mod jsonb_promotion;
+pub mod index_advisor;
 pub mod query_shape;
 pub mod query_stats;
 pub mod query_stats_export;

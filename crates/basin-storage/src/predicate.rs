@@ -45,6 +45,15 @@ pub enum Predicate {
         prefix: String,
         case_insensitive: bool,
     },
+    /// Membership test: `column IN (k0, k1, …)` over an `Int64`-family column.
+    /// The key vector is the deduplicated, ASC-sorted set of i64 keys (the
+    /// engine sorts + dedups before constructing this so the storage skip
+    /// path can binary-search both the file's PK column AND the key vector).
+    ///
+    /// NOT pushable into a Vortex scan expression — it is evaluated Arrow-side
+    /// only (see `vortex_filter_expr`, which leaves it for the post-decode
+    /// pass). NULL column elements never match (PG `IN` semantics).
+    InInt64(String, Vec<i64>),
 }
 
 impl Predicate {
@@ -52,6 +61,7 @@ impl Predicate {
         match self {
             Predicate::Eq(c, _) | Predicate::Gt(c, _) | Predicate::Lt(c, _) => c,
             Predicate::StartsWith { column, .. } => column,
+            Predicate::InInt64(c, _) => c,
         }
     }
 }
@@ -108,6 +118,12 @@ pub fn evaluate(
     } = predicate
     {
         return Ok(eval_starts_with(col, prefix, *case_insensitive));
+    }
+
+    // InInt64 membership — no associated ScalarValue, so dispatch early like
+    // StartsWith. NULL column elements never match (the validity check below).
+    if let Predicate::InInt64(_, keys) = predicate {
+        return Ok(eval_in_int64(col, keys));
     }
 
     // PG coerces an unknown/text literal to the column's type before
@@ -407,6 +423,9 @@ pub fn evaluate(
                 Predicate::StartsWith { .. } => {
                     unreachable!("StartsWith routed to timestamp-utf8 path")
                 }
+                Predicate::InInt64(..) => {
+                    unreachable!("InInt64 dispatched before the scalar matcher")
+                }
             };
 
             // Helper: scan a primitive timestamp column against a rescaled
@@ -464,6 +483,9 @@ pub fn evaluate(
                 // the dedicated arm above (see line ~85).
                 Predicate::StartsWith { .. } => {
                     unreachable!("StartsWith routed to generic utf8 cmp path")
+                }
+                Predicate::InInt64(..) => {
+                    unreachable!("InInt64 dispatched before the scalar matcher")
                 }
             };
             macro_rules! cmp_str {
@@ -531,10 +553,140 @@ pub fn evaluate(
 fn predicate_value(p: &Predicate) -> ScalarValue {
     match p {
         Predicate::Eq(_, v) | Predicate::Gt(_, v) | Predicate::Lt(_, v) => v.clone(),
-        // StartsWith is dispatched before this helper is consulted (see
-        // `evaluate`). Returning a sentinel keeps the function total.
+        // StartsWith / InInt64 are dispatched before this helper is consulted
+        // (see `evaluate`). Returning a sentinel keeps the function total.
         Predicate::StartsWith { prefix, .. } => ScalarValue::Utf8(prefix.clone()),
+        Predicate::InInt64(_, keys) => {
+            ScalarValue::Int64(keys.first().copied().unwrap_or(0))
+        }
     }
+}
+
+/// Vectorized `column IN (keys)` membership over an Int64-family column.
+///
+/// `keys` is the engine-provided ASC-sorted, deduplicated key set. We widen
+/// narrow integer columns (Int8/16/32) to i64 once (a vectorized cast), then
+/// test each element by binary-search against `keys`. NULL elements yield
+/// `false` (PG `IN` semantics). This is the *fallback* membership path used
+/// when the sorted-skip take optimisation does not apply; it still beats the
+/// previous per-row `HashSet`-per-row approach because the key set is searched
+/// with a cache-friendly sorted-slice `binary_search` and no per-row hashing.
+fn eval_in_int64(col: &arrow_array::ArrayRef, keys: &[i64]) -> arrow_array::BooleanArray {
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::Int64Type;
+    use arrow_array::{Array, BooleanArray};
+    use arrow_schema::DataType as Dt;
+
+    let n = col.len();
+    if keys.is_empty() {
+        // Empty IN-list matches nothing.
+        return BooleanArray::from(vec![false; n]);
+    }
+
+    // Widen to an Int64 view (cheap clone for native Int64; vectorized cast
+    // otherwise). On an unexpected non-integer column type we return an
+    // all-false mask rather than panic — the engine only constructs InInt64
+    // for integer PK columns, so this is purely defensive.
+    let widened: arrow_array::Int64Array = match col.data_type() {
+        Dt::Int64 => col.as_primitive::<Int64Type>().clone(),
+        Dt::Int32 | Dt::Int16 | Dt::Int8 => {
+            match arrow::compute::kernels::cast::cast(col.as_ref(), &Dt::Int64) {
+                Ok(a) => a.as_primitive::<Int64Type>().clone(),
+                Err(_) => return BooleanArray::from(vec![false; n]),
+            }
+        }
+        // Defensive widen attempt for any other integer-castable type.
+        _ => match arrow::compute::kernels::cast::cast(col.as_ref(), &Dt::Int64) {
+            Ok(a) => a.as_primitive::<Int64Type>().clone(),
+            Err(_) => return BooleanArray::from(vec![false; n]),
+        },
+    };
+
+    let mut b = arrow_array::builder::BooleanBuilder::with_capacity(n);
+    for i in 0..n {
+        if widened.is_null(i) {
+            b.append_value(false);
+        } else {
+            b.append_value(keys.binary_search(&widened.value(i)).is_ok());
+        }
+    }
+    b.finish()
+}
+
+/// Compute the row indices of an Int64-family `column` whose values are present
+/// in `keys`, exploiting that the column is ASC-sorted within `col` (the
+/// per-file decode chunk). For each key we `partition_point` into the column to
+/// locate its run, then collect every matching row index (handles duplicate PK
+/// values defensively, though PKs are unique). `keys` MUST be ASC-sorted +
+/// deduplicated. NULLs sort last in Arrow ASC order and are never matched.
+///
+/// Returns indices in ascending order (the take preserves PK order). When the
+/// column type is not a widenable integer, returns `None` so the caller falls
+/// back to the mask path.
+pub(crate) fn sorted_in_int64_indices(
+    col: &arrow_array::ArrayRef,
+    keys: &[i64],
+) -> Option<Vec<u32>> {
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::Int64Type;
+    use arrow_array::Array;
+    use arrow_schema::DataType as Dt;
+
+    let widened: arrow_array::Int64Array = match col.data_type() {
+        Dt::Int64 => col.as_primitive::<Int64Type>().clone(),
+        Dt::Int32 | Dt::Int16 | Dt::Int8 => {
+            arrow::compute::kernels::cast::cast(col.as_ref(), &Dt::Int64)
+                .ok()?
+                .as_primitive::<Int64Type>()
+                .clone()
+        }
+        _ => return None,
+    };
+
+    let n = widened.len();
+    // The non-null prefix length. Arrow ASC sort places NULLs last; the
+    // writer's clustered sort follows the same convention, so the valid
+    // (non-null) values occupy a sorted prefix `[0, valid_len)`. We bound
+    // the binary search to that prefix. If NULLs were interleaved (they are
+    // not for a clustered PK), search would still be correct over the whole
+    // array only if values are globally sorted — to stay safe we restrict to
+    // the leading non-null sorted run.
+    let valid_len = if widened.null_count() == 0 {
+        n
+    } else {
+        // First null index = length of the leading non-null prefix.
+        let mut p = 0usize;
+        while p < n && widened.is_valid(p) {
+            p += 1;
+        }
+        p
+    };
+
+    let mut out: Vec<u32> = Vec::with_capacity(keys.len());
+    for &k in keys {
+        // Locate the first index >= k within the sorted non-null prefix.
+        let mut lo = 0usize;
+        let mut hi = valid_len;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if widened.value(mid) < k {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        // Collect the (possibly multi-row) run equal to k.
+        let mut j = lo;
+        while j < valid_len && widened.value(j) == k {
+            out.push(j as u32);
+            j += 1;
+        }
+    }
+    // Indices are emitted in key order; sort so the take preserves the file's
+    // ascending PK order (keys are sorted, so this is already nearly sorted —
+    // an unstable sort over a small vec is cheap).
+    out.sort_unstable();
+    Some(out)
 }
 
 /// PG-style coercion of an unknown/text literal to the column's type.
@@ -560,7 +712,9 @@ fn coerce_utf8_scalar_for_column(
     // Only Eq/Gt/Lt carry a comparable scalar; StartsWith is handled earlier.
     let (col, val) = match predicate {
         Predicate::Eq(c, v) | Predicate::Gt(c, v) | Predicate::Lt(c, v) => (c, v),
-        Predicate::StartsWith { .. } => return Ok(None),
+        // StartsWith / InInt64 carry no single coercible scalar — InInt64 is
+        // already typed Int64 and dispatched before this helper runs.
+        Predicate::StartsWith { .. } | Predicate::InInt64(..) => return Ok(None),
     };
     let ScalarValue::Utf8(s) = val else {
         return Ok(None);
@@ -617,6 +771,7 @@ fn coerce_utf8_scalar_for_column(
         Predicate::Gt(..) => Predicate::Gt(col, coerced),
         Predicate::Lt(..) => Predicate::Lt(col, coerced),
         Predicate::StartsWith { .. } => unreachable!("StartsWith handled above"),
+        Predicate::InInt64(..) => unreachable!("InInt64 handled above"),
     }))
 }
 
@@ -979,6 +1134,11 @@ fn prune_atom(
                 has_nulls,
             );
         }
+        // IN-list membership cannot be proven AllMatch/NoMatch from a single
+        // [min,max] zone (a file overlapping the key range might contain no
+        // listed key, and vice versa). The engine pushes a separate range
+        // predicate for stats pruning; this atom stays Mixed (always re-check).
+        Predicate::InInt64(..) => return PruneOutcome::Mixed,
     };
     let (Some(min), Some(max)) = (cs.min_bytes.as_deref(), cs.max_bytes.as_deref()) else {
         return PruneOutcome::Mixed;
@@ -1065,6 +1225,8 @@ fn decide_numeric<T: PartialOrd + Copy>(
         // dispatch target for it. Caller (decide_string) handles the
         // prefix-range pruning logic for StartsWith.
         Predicate::StartsWith { .. } => PruneOutcome::Mixed,
+        // InInt64 returns Mixed before value extraction; never reaches here.
+        Predicate::InInt64(..) => PruneOutcome::Mixed,
     }
 }
 
@@ -1107,6 +1269,8 @@ fn decide_byte_lex(
         // This arm should never fire — caller routes StartsWith there
         // directly. Return Mixed as a safe fallback.
         Predicate::StartsWith { .. } => PruneOutcome::Mixed,
+        // InInt64 returns Mixed before value extraction; never reaches here.
+        Predicate::InInt64(..) => PruneOutcome::Mixed,
     }
 }
 
@@ -2100,5 +2264,125 @@ mod compound_tests {
         let result: Vec<bool> = (0..mask.len()).map(|i| mask.value(i)).collect();
         // Only index 1 (u2) should match.
         assert_eq!(result, vec![false, true, false, false]);
+    }
+}
+
+#[cfg(test)]
+mod in_int64_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use arrow_array::{Int32Array, Int64Array};
+
+    fn i64_col(vals: Vec<Option<i64>>) -> arrow_array::ArrayRef {
+        Arc::new(Int64Array::from(vals)) as arrow_array::ArrayRef
+    }
+
+    fn mask_vec(a: &BooleanArray) -> Vec<bool> {
+        (0..a.len()).map(|i| a.value(i)).collect()
+    }
+
+    // ── eval_in_int64 (vectorized membership fallback) ──────────────────────
+
+    #[test]
+    fn eval_in_int64_basic_membership_and_nulls() {
+        // keys MUST be sorted+deduped per the InInt64 contract.
+        let col = i64_col(vec![Some(1), Some(2), None, Some(4), Some(5)]);
+        let m = eval_in_int64(&col, &[2, 4]);
+        // 2 and 4 match; NULL never matches.
+        assert_eq!(mask_vec(&m), vec![false, true, false, true, false]);
+    }
+
+    #[test]
+    fn eval_in_int64_empty_keys_matches_nothing() {
+        let col = i64_col(vec![Some(1), Some(2), Some(3)]);
+        let m = eval_in_int64(&col, &[]);
+        assert_eq!(mask_vec(&m), vec![false, false, false]);
+    }
+
+    #[test]
+    fn eval_in_int64_widens_int32_column() {
+        let col = Arc::new(Int32Array::from(vec![Some(7), Some(8), None, Some(9)]))
+            as arrow_array::ArrayRef;
+        let m = eval_in_int64(&col, &[7, 9]);
+        assert_eq!(mask_vec(&m), vec![true, false, false, true]);
+    }
+
+    // ── sorted_in_int64_indices (binary-search skip path) ───────────────────
+
+    #[test]
+    fn sorted_indices_match_plain_filter_random() {
+        // Equivalence check: the sorted-skip indices select exactly the rows
+        // the plain vectorized membership mask selects, on a sorted column.
+        let mut vals: Vec<i64> = (0..500).map(|i| i * 3).collect(); // sorted, gaps
+        vals.sort_unstable();
+        let col = i64_col(vals.iter().map(|v| Some(*v)).collect());
+
+        // Mixed present/absent keys; sorted+deduped.
+        let mut keys = vec![0i64, 3, 4, 297, 298, 1497, 999_999];
+        keys.sort_unstable();
+        keys.dedup();
+
+        let idx = sorted_in_int64_indices(&col, &keys).expect("int64 column");
+        // Reference: plain mask → indices.
+        let mask = eval_in_int64(&col, &keys);
+        let want: Vec<u32> = (0..mask.len() as u32).filter(|&i| mask.value(i as usize)).collect();
+        assert_eq!(idx, want);
+    }
+
+    #[test]
+    fn sorted_indices_boundary_keys_first_and_last() {
+        let col = i64_col(vec![Some(10), Some(20), Some(30), Some(40)]);
+        // First and last element keys.
+        let idx = sorted_in_int64_indices(&col, &[10, 40]).unwrap();
+        assert_eq!(idx, vec![0u32, 3u32]);
+    }
+
+    #[test]
+    fn sorted_indices_absent_keys_yield_empty() {
+        let col = i64_col(vec![Some(10), Some(20), Some(30)]);
+        let idx = sorted_in_int64_indices(&col, &[5, 15, 35]).unwrap();
+        assert!(idx.is_empty());
+    }
+
+    #[test]
+    fn sorted_indices_duplicate_keys_in_list_dedup_safe() {
+        // The engine dedups, but be defensive: a key appearing once produces
+        // one index even if the column has a single matching row.
+        let col = i64_col(vec![Some(1), Some(2), Some(3)]);
+        let idx = sorted_in_int64_indices(&col, &[2]).unwrap();
+        assert_eq!(idx, vec![1u32]);
+    }
+
+    #[test]
+    fn sorted_indices_duplicate_values_in_column_collected() {
+        // Defensive: a (non-unique) sorted column run is fully collected.
+        let col = i64_col(vec![Some(1), Some(2), Some(2), Some(2), Some(3)]);
+        let idx = sorted_in_int64_indices(&col, &[2]).unwrap();
+        assert_eq!(idx, vec![1u32, 2u32, 3u32]);
+    }
+
+    #[test]
+    fn sorted_indices_trailing_nulls_excluded() {
+        // Arrow ASC clustering puts NULLs last; they must never match and the
+        // search is bounded to the non-null prefix.
+        let col = i64_col(vec![Some(1), Some(2), Some(3), None, None]);
+        let idx = sorted_in_int64_indices(&col, &[2, 3]).unwrap();
+        assert_eq!(idx, vec![1u32, 2u32]);
+    }
+
+    #[test]
+    fn sorted_indices_int32_column_widens() {
+        let col =
+            Arc::new(Int32Array::from(vec![Some(5), Some(6), Some(7)])) as arrow_array::ArrayRef;
+        let idx = sorted_in_int64_indices(&col, &[6]).unwrap();
+        assert_eq!(idx, vec![1u32]);
+    }
+
+    #[test]
+    fn sorted_indices_none_on_non_integer_column() {
+        let col = Arc::new(arrow_array::StringArray::from(vec![Some("a"), Some("b")]))
+            as arrow_array::ArrayRef;
+        assert!(sorted_in_int64_indices(&col, &[1]).is_none());
     }
 }

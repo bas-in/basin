@@ -93,12 +93,41 @@ fn batch_matches_predicates(batch: &RecordBatch, predicates: &[Predicate]) -> bo
             }
             continue;
         }
+        // Sorted-IN membership: single-row batch, binary-search the key list.
+        if let Predicate::InInt64(column, keys) = pred {
+            let Ok(col_idx) = batch.schema().index_of(column) else {
+                return false;
+            };
+            let col = batch.column(col_idx);
+            if col.is_null(0) {
+                return false;
+            }
+            let v = match col.data_type() {
+                arrow_schema::DataType::Int64 => col
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .map(|a| a.value(0)),
+                arrow_schema::DataType::Int32 => col
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int32Array>()
+                    .map(|a| i64::from(a.value(0))),
+                arrow_schema::DataType::Int16 => col
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int16Array>()
+                    .map(|a| i64::from(a.value(0))),
+                _ => None,
+            };
+            match v {
+                Some(v) if keys.binary_search(&v).is_ok() => continue,
+                _ => return false,
+            }
+        }
         let (col_name, expected, op) = match pred {
             Predicate::Eq(c, v) => (c, v, "eq"),
             Predicate::Gt(c, v) => (c, v, "gt"),
             Predicate::Lt(c, v) => (c, v, "lt"),
             // Handled above.
-            Predicate::StartsWith { .. } => unreachable!(),
+            Predicate::StartsWith { .. } | Predicate::InInt64(..) => unreachable!(),
         };
         let Ok(col_idx) = batch.schema().index_of(col_name) else {
             return false;
@@ -1392,6 +1421,11 @@ pub(crate) async fn execute_simple_select(
         }
     };
 
+    // Self-driving physical layout: observe non-PK Eq predicates and
+    // auto-create a secondary index once a column crosses the threshold.
+    // Best-effort, non-blocking; the CREATE INDEX is spawned fire-and-forget.
+    crate::index_advisor::observe_eq_predicates(sess, &plan.table, &meta, &plan.predicates);
+
     // ── ADR 0027 Phase 4: promoted JSONB shadow-column read path ─────────────
     //
     // The SQL rewriter swaps `json_get_text(col,'key')` for the materialised
@@ -1657,11 +1691,13 @@ pub(crate) async fn execute_simple_select(
                 registry.as_ref(),
                 &sess.project,
                 &plan.table,
+                None,
             );
             let updates = crate::hot_tombstone::snapshot_updates(
                 registry.as_ref(),
                 &sess.project,
                 &plan.table,
+                None,
             );
             !tombs.is_empty() || !updates.is_empty()
         };
@@ -1783,12 +1819,36 @@ pub(crate) async fn execute_simple_select(
             }
         }
     }
+    // Sorted-skip fast path: push the cluster-column IN-list down as a
+    // sorted InInt64 predicate plus the physical-sort hint, so storage can
+    // binary-search each PK-sorted chunk instead of filtering every row.
+    // apply_in_list_filter below remains the source of truth.
+    let sorted_by_col = effective_cluster_col(&meta);
+    if let Some(sc) = &sorted_by_col {
+        for (col, vals) in &plan.in_list_preds {
+            if col == sc {
+                let mut keys: Vec<i64> = vals
+                    .iter()
+                    .filter_map(|v| match v {
+                        ScalarValue::Int64(n) => Some(*n),
+                        _ => None,
+                    })
+                    .collect();
+                if keys.len() == vals.len() && !keys.is_empty() {
+                    keys.sort_unstable();
+                    keys.dedup();
+                    augmented_filters.push(Predicate::InInt64(col.clone(), keys));
+                }
+            }
+        }
+    }
     let mut opts = ReadOptions {
         projection: plan.read_cols.clone(),
         filters: augmented_filters,
         partition: None,
         limit: pushdown_limit,
         row_group_selection: None,
+        sorted_by: sorted_by_col,
     };
 
     // ── Phase 5.14.C3: memtable point-lookup probe ───────────────────────────
@@ -2521,6 +2581,7 @@ pub(crate) async fn execute_simple_select(
             registry.as_ref(),
             &sess.project,
             &plan.table,
+                None,
         );
         // Merge-on-read UPDATE overlay for the hot-tier fast path: drop cold
         // rows whose PK has an `Update` override and append the post-SET rows.
@@ -2530,6 +2591,7 @@ pub(crate) async fn execute_simple_select(
             registry.as_ref(),
             &sess.project,
             &plan.table,
+                None,
         );
         if tombs.is_empty() && updates.is_empty() {
             batches
