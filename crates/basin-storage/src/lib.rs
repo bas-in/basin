@@ -406,6 +406,12 @@ struct Inner {
     /// [`DEFAULT_VORTEX_FOOTER_CACHE_CAP`]. See [`VortexFooterCache`] for
     /// the key-safety and cloneability rationale.
     vortex_footer_cache: Arc<VortexFooterCache>,
+    /// Cache of per-file `(row_count, column_stats)` for the stats-pruning
+    /// hot path (`reader::list_data_files_with_stats`). Keyed on
+    /// `(path, size)`; same immutability invariant as the footer caches. A
+    /// warm entry turns a per-query footer GET+parse into an in-RAM lookup,
+    /// for both Parquet and Vortex files. See [`metadata_cache::DataFileStatsCache`].
+    data_file_stats_cache: Arc<metadata_cache::DataFileStatsCache>,
     /// Optional per-project counters registry (Phase 6 telemetry). Attached by
     /// the engine via [`Storage::attach_project_counters`]; first attach wins.
     /// When present, every successful write/read bumps `bytes_written_total` /
@@ -534,6 +540,14 @@ const DEFAULT_HNSW_SEGMENT_CACHE_CAP: usize = 256;
 /// and the Phase 5.7 integration suite without material RAM overhead.
 const DEFAULT_VORTEX_FOOTER_CACHE_CAP: usize = 512;
 
+/// Default capacity for the per-file data-file stats cache. Sized to match
+/// [`DEFAULT_PARQUET_META_CACHE_CAP`] so a table whose footers all fit in the
+/// parquet-meta cache also fits in the stats cache (no asymmetric eviction
+/// that would force one format to re-parse while the other stays warm). Each
+/// entry holds an `Arc<(u64, BTreeMap<..>)>` — a handful of columns of
+/// min/max bytes — so 16k entries is a small RAM footprint.
+const DEFAULT_DATA_FILE_STATS_CACHE_CAP: usize = 16_384;
+
 impl Storage {
     pub fn new(cfg: StorageConfig) -> Self {
         // If a disk cache is configured, wrap the supplied object store
@@ -589,6 +603,9 @@ impl Storage {
                 // unchanged.
                 vortex_footer_cache: Arc::new(VortexFooterCache::new(
                     DEFAULT_VORTEX_FOOTER_CACHE_CAP,
+                )),
+                data_file_stats_cache: Arc::new(metadata_cache::DataFileStatsCache::new(
+                    DEFAULT_DATA_FILE_STATS_CACHE_CAP,
                 )),
                 project_counters: OnceLock::new(),
                 encryption: OnceLock::new(),
@@ -1022,6 +1039,10 @@ impl Storage {
 
     pub(crate) fn parquet_meta_cache(&self) -> &Arc<metadata_cache::ParquetMetaCache> {
         &self.inner.parquet_meta_cache
+    }
+
+    pub(crate) fn data_file_stats_cache(&self) -> &Arc<metadata_cache::DataFileStatsCache> {
+        &self.inner.data_file_stats_cache
     }
 
     pub(crate) fn page_cache_handle(&self) -> Option<&Arc<PageCache>> {

@@ -177,6 +177,25 @@ pub(crate) async fn list_data_files_with_stats(
     }
     let store = storage.project_store(project);
     let cache = storage.parquet_meta_cache().clone();
+    let stats_cache = storage.data_file_stats_cache().clone();
+
+    // Stats-cache fast path. `(row_count, column_stats)` is what every caller
+    // of this function actually consumes; once we've extracted it for a file
+    // (write-once, immutable) we never need to touch the file's bytes again.
+    // A warm hit therefore turns the per-query footer GET+parse into an
+    // in-RAM lookup for BOTH Parquet and Vortex — collapsing the dominant
+    // per-query cost on a many-file table. Misses fall through to the
+    // format-specific footer paths below and populate the cache.
+    let mut needs_stats: Vec<usize> = Vec::with_capacity(files.len());
+    for (i, f) in files.iter_mut().enumerate() {
+        if let Some(cached) = stats_cache.get(&f.path, f.size_bytes) {
+            let (rows, stats) = cached.as_ref();
+            f.row_count = *rows;
+            f.column_stats = stats.clone();
+        } else {
+            needs_stats.push(i);
+        }
+    }
 
     // Fan out per-file footer reads with bounded concurrency. Each cache
     // hit is a no-op; cache misses do one short range GET each.
@@ -192,10 +211,11 @@ pub(crate) async fn list_data_files_with_stats(
     // (constraint / FK / UNIQUE / UPDATE / DELETE / TRUNCATE) reads the
     // file contents to enforce — they need the path, not the stats — so
     // empty stats only disables an optimisation, never correctness.
+    let needs: std::collections::HashSet<usize> = needs_stats.iter().copied().collect();
     let work: Vec<_> = files
         .iter()
         .enumerate()
-        .filter(|(_, f)| f.path.as_ref().ends_with(".parquet"))
+        .filter(|(i, f)| needs.contains(i) && f.path.as_ref().ends_with(".parquet"))
         .map(|(i, f)| {
             let store = store.clone();
             let cache = cache.clone();
@@ -244,6 +264,11 @@ pub(crate) async fn list_data_files_with_stats(
         let (i, (rows, stats)) = r?;
         files[i].row_count = rows;
         files[i].column_stats = stats;
+        stats_cache.insert(
+            files[i].path.clone(),
+            files[i].size_bytes,
+            Arc::new((files[i].row_count, files[i].column_stats.clone())),
+        );
     }
 
     // Vortex files carry no Parquet footer, but DELETE/UPDATE row math and
@@ -261,7 +286,7 @@ pub(crate) async fn list_data_files_with_stats(
     let vortex_idxs: Vec<usize> = files
         .iter()
         .enumerate()
-        .filter(|(_, f)| f.path.as_ref().ends_with(".vortex"))
+        .filter(|(i, f)| needs.contains(i) && f.path.as_ref().ends_with(".vortex"))
         .map(|(i, _)| i)
         .collect();
     if !vortex_idxs.is_empty() {
@@ -298,6 +323,17 @@ pub(crate) async fn list_data_files_with_stats(
             }
             if !stats.is_empty() {
                 files[i].column_stats = stats;
+            }
+            // Only cache a SUCCESSFUL footer read (we got a row_count). A
+            // best-effort failure left the listing defaults, which we must
+            // not memoise — a later query (e.g. once an encryption provider
+            // is attached, or transient GET error clears) should retry.
+            if rc.is_some() {
+                stats_cache.insert(
+                    files[i].path.clone(),
+                    files[i].size_bytes,
+                    Arc::new((files[i].row_count, files[i].column_stats.clone())),
+                );
             }
         }
     }
@@ -475,13 +511,24 @@ pub(crate) async fn read(
     // Falls back to the legacy inline-LIST path when filters are empty or
     // the catalog schema is unavailable — both branches preserve the
     // pre-prune behaviour exactly.
-    let prune_with_stats = !opts.filters.is_empty() && catalog_schema.is_some();
+    // Stats-pruning is enabled whenever the request carries any predicate.
+    // When the catalog is attached we prune against the authoritative
+    // catalog schema; when it is NOT (schema-less callers: integration
+    // tests, sources that drive `Storage::read` without a catalog walk) we
+    // synthesise a pruning schema from the predicates' own scalar types
+    // (`filters_to_prune_schema`). Both feed the same
+    // `evaluate_compound_for_pruning`, which only ever DROPS a file it can
+    // PROVE is `NoMatch` from per-file min/max — a wrong/absent type maps
+    // to the `_ => Mixed` arm and keeps the file, so the synthesised schema
+    // can never produce a false `NoMatch`. This lifts the per-file
+    // open+decode cost off every point query on a many-file table even
+    // without a catalog (previously the no-catalog branch opened ALL files).
+    let prune_with_stats = !opts.filters.is_empty();
     let paths: Vec<ObjectPath> = if prune_with_stats {
-        let schema = catalog_schema
-            .as_ref()
-            .expect("checked is_some above")
-            .as_ref()
-            .clone();
+        let schema = match catalog_schema.as_ref() {
+            Some(s) => s.as_ref().clone(),
+            None => filters_to_prune_schema(&opts.filters),
+        };
         let cp = filters_to_compound(&opts.filters);
         let files = list_data_files_with_stats(storage, project, table).await?;
         files
@@ -540,6 +587,47 @@ pub(crate) async fn read(
     };
 
     read_paths_inner(storage, project, paths, opts, catalog_schema).await
+}
+
+/// Synthesise a minimal Arrow schema for stats-pruning from the predicate
+/// list alone, used when no catalog schema is attached. Each predicated
+/// column gets one field whose `DataType` is inferred from the predicate's
+/// own `ScalarValue` (the type the comparison literal carries).
+///
+/// This is sound because `prune_atom` only acts on `(DataType, ScalarValue)`
+/// pairs it recognises and falls through to `Mixed` (keep the file) for any
+/// other combination, and the stats bytes are decoded with the SAME type
+/// that selects the arm — so a column whose physical type differs from the
+/// inferred one yields at worst a `Mixed` (no prune), never a false
+/// `NoMatch`. `StartsWith` carries no scalar; it prunes on the column's
+/// byte-lexicographic stats, so we type it as `Utf8`.
+fn filters_to_prune_schema(filters: &[Predicate]) -> Schema {
+    use arrow_schema::DataType;
+    let mut fields: Vec<Field> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for f in filters {
+        let col = f.column();
+        if !seen.insert(col) {
+            continue;
+        }
+        let dt = match f {
+            Predicate::Eq(_, v) | Predicate::Gt(_, v) | Predicate::Lt(_, v) => match v {
+                ScalarValue::Int64(_) => DataType::Int64,
+                ScalarValue::Float64(_) => DataType::Float64,
+                ScalarValue::Boolean(_) => DataType::Boolean,
+                ScalarValue::Utf8(_) => DataType::Utf8,
+                // No stats-pruning arm for UInt64 today (writer/footer record
+                // no UInt64-typed stats); keep the file by typing it as a
+                // value `prune_atom` won't match.
+                ScalarValue::UInt64(_) => DataType::UInt64,
+            },
+            Predicate::StartsWith { .. } => DataType::Utf8,
+        };
+        // Nullable=true is conservative: it never enables an unsafe prune
+        // (null-count from stats is what `prune_atom` actually consults).
+        fields.push(Field::new(col, dt, true));
+    }
+    Schema::new(fields)
 }
 
 /// Build a single AND-of-atoms [`CompoundPredicate`] from the read-path's
@@ -3256,8 +3344,113 @@ mod tests {
     use object_store::memory::InMemory;
 
     use crate::encryption::{EncryptionProvider, WrappedKey};
+    use crate::predicate::ScalarValue;
     use crate::writer::{FileFormat, WriteOptions};
     use crate::{ReadOptions, Storage, StorageConfig};
+
+    #[test]
+    fn prune_schema_infers_types_from_predicate_scalars() {
+        use arrow_schema::DataType;
+        let filters = vec![
+            Predicate::Eq("id".into(), ScalarValue::Int64(7)),
+            Predicate::Gt("score".into(), ScalarValue::Float64(1.5)),
+            Predicate::Eq("flag".into(), ScalarValue::Boolean(true)),
+            Predicate::Eq("name".into(), ScalarValue::Utf8("x".into())),
+            Predicate::StartsWith {
+                column: "code".into(),
+                prefix: "ab".into(),
+                case_insensitive: false,
+            },
+            // Duplicate column: first type wins, no dup field.
+            Predicate::Lt("id".into(), ScalarValue::Int64(99)),
+        ];
+        let schema = filters_to_prune_schema(&filters);
+        let by_name = |n: &str| {
+            schema
+                .fields()
+                .iter()
+                .find(|f| f.name() == n)
+                .map(|f| f.data_type().clone())
+        };
+        assert_eq!(by_name("id"), Some(DataType::Int64));
+        assert_eq!(by_name("score"), Some(DataType::Float64));
+        assert_eq!(by_name("flag"), Some(DataType::Boolean));
+        assert_eq!(by_name("name"), Some(DataType::Utf8));
+        assert_eq!(by_name("code"), Some(DataType::Utf8));
+        // `id` appears once despite two predicates.
+        assert_eq!(
+            schema.fields().iter().filter(|f| f.name() == "id").count(),
+            1
+        );
+    }
+
+    /// End-to-end: with NO catalog attached, a point predicate must still
+    /// prune the file set down via the synthesised prune schema and return
+    /// exactly the matching row. Guards the no-catalog stats-prune path that
+    /// fixes the s3_scaling point-query regression.
+    #[tokio::test]
+    async fn no_catalog_point_query_prunes_and_returns_one_row() {
+        let store = Arc::new(InMemory::new());
+        let storage = Storage::new(StorageConfig {
+            object_store: store,
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let project = ProjectId::new();
+        let table = TableName::new("events").unwrap();
+        let part = PartitionKey::default_key();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+        // 5 single-row-range files: ids [0..10), [10..20), ... [40..50).
+        for b in 0..5i64 {
+            let ids: Int64Array = (b * 10..b * 10 + 10).collect();
+            let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids)]).unwrap();
+            storage
+                .write_batch(&project, &table, &part, &batch)
+                .await
+                .unwrap();
+        }
+
+        // Point query for id=27 → only the [20..30) file can match.
+        let opts = ReadOptions {
+            filters: vec![Predicate::Eq("id".into(), ScalarValue::Int64(27))],
+            ..Default::default()
+        };
+        let mut stream = storage.read(&project, &table, opts).await.unwrap();
+        let mut hits = 0usize;
+        while let Some(b) = stream.next().await {
+            hits += b.unwrap().num_rows();
+        }
+        assert_eq!(hits, 1, "exactly one row matches id=27");
+
+        // Run twice more to exercise the warm stats-cache path.
+        for _ in 0..2 {
+            let opts = ReadOptions {
+                filters: vec![Predicate::Eq("id".into(), ScalarValue::Int64(27))],
+                ..Default::default()
+            };
+            let mut stream = storage.read(&project, &table, opts).await.unwrap();
+            let mut hits = 0usize;
+            while let Some(b) = stream.next().await {
+                hits += b.unwrap().num_rows();
+            }
+            assert_eq!(hits, 1, "warm path still returns exactly one row");
+        }
+
+        // A predicate that matches nothing must return zero rows (and prune
+        // every file).
+        let opts = ReadOptions {
+            filters: vec![Predicate::Eq("id".into(), ScalarValue::Int64(999))],
+            ..Default::default()
+        };
+        let mut stream = storage.read(&project, &table, opts).await.unwrap();
+        let mut hits = 0usize;
+        while let Some(b) = stream.next().await {
+            hits += b.unwrap().num_rows();
+        }
+        assert_eq!(hits, 0, "no file matches id=999");
+    }
 
     /// Minimal in-process provider: a fixed 32-byte data key, round-tripped
     /// through an opaque sidecar. Mirrors the no-config (`wrap_key` /

@@ -41,10 +41,14 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use std::collections::BTreeMap;
+
 use basin_vector::HnswIndex;
 use lru::LruCache;
 use object_store::path::Path as ObjectPath;
 use parquet::file::metadata::ParquetMetaData;
+
+use crate::data_file::ColumnStats;
 
 /// One entry: parsed parquet metadata plus the underlying file size in
 /// bytes. Caching the size lets the read path skip a `HEAD` round-trip on
@@ -111,6 +115,50 @@ impl ParquetMetaCache {
             .expect("ParquetMetaCache mutex poisoned")
             .cap()
             .get()
+    }
+}
+
+/// One entry of the [`DataFileStatsCache`]: the per-file `(row_count,
+/// column_stats)` that `reader::list_data_files_with_stats` extracts from a
+/// data file's footer. Wrapped in `Arc` so cloning out of the cache is O(1)
+/// regardless of how many columns the file has.
+pub(crate) type CachedDataFileStats = Arc<(u64, BTreeMap<String, ColumnStats>)>;
+
+/// Bounded LRU cache mapping `(ObjectPath, size_bytes)` →
+/// [`CachedDataFileStats`]. Same immutability invariant as
+/// [`ParquetMetaCache`] (write-once ULID-named files), with `size_bytes` in
+/// the key as a belt-and-braces guard against a rewritten path.
+///
+/// # Why this exists
+///
+/// `list_data_files_with_stats` is on the per-query stats-pruning hot path.
+/// For `.parquet` files the footer parse is absorbed by [`ParquetMetaCache`],
+/// but the per-file stat DECODE (`decode_file_stats`) still ran every query,
+/// and for `.vortex` files there was no cache at all — every point query
+/// re-GET the whole blob (disk-cache-backed but still a copy) and re-parsed
+/// the Vortex footer for stats. On a 100-file table that was ~16 ms/query of
+/// pure metadata churn. This cache makes a warm `list_data_files_with_stats`
+/// a LIST RPC plus N in-RAM lookups — zero GET, zero parse — for BOTH formats.
+pub(crate) struct DataFileStatsCache {
+    inner: Mutex<LruCache<(ObjectPath, u64), CachedDataFileStats>>,
+}
+
+impl DataFileStatsCache {
+    pub fn new(cap: usize) -> Self {
+        let cap = NonZeroUsize::new(cap.max(1)).expect("cap.max(1) >= 1");
+        Self {
+            inner: Mutex::new(LruCache::new(cap)),
+        }
+    }
+
+    pub fn get(&self, path: &ObjectPath, size: u64) -> Option<CachedDataFileStats> {
+        let mut g = self.inner.lock().expect("DataFileStatsCache mutex poisoned");
+        g.get(&(path.clone(), size)).cloned()
+    }
+
+    pub fn insert(&self, path: ObjectPath, size: u64, v: CachedDataFileStats) {
+        let mut g = self.inner.lock().expect("DataFileStatsCache mutex poisoned");
+        g.put((path, size), v);
     }
 }
 
