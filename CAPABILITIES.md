@@ -199,8 +199,11 @@ wall-clock numbers.
 
 #### Known OLTP / correctness gaps still open
 
-- **FK `ON DELETE CASCADE` recursion** and **`DELETE … WHERE id BETWEEN`** on a
-  scratch table are recorded as gaps in the differential bench (`basin: unsupported`).
+- ~~FK `ON DELETE CASCADE` recursion~~ and ~~`DELETE … WHERE id BETWEEN`~~ —
+  CLOSED 2026-06-11: BETWEEN deletes desugar through the cold rewrite's existing
+  range atoms; cascade was already fully implemented and is now pinned by tests
+  (delete_features.rs). Cross-table cascade is not transactionally atomic under
+  auto-commit (each child DELETE commits separately) — documented semantics.
 - **Read-own-insert tail flush** — a non-tx INSERT is tail-resident, so reading
   your own just-inserted row costs one O(1) flush+read until the row tier lands.
 - **Cold in-tx UPDATE under a savepoint** routes through the cold catalog-commit
