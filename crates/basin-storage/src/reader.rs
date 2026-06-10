@@ -877,6 +877,14 @@ async fn read_one(
     });
     if let (Some(pc), Some(key)) = (page_cache.as_ref(), cache_key.as_ref()) {
         if let Some(batches) = pc.get(key) {
+            // Cache hit: no object-store GET, no decode. Counts as a
+            // cache-served file (NOT `files_opened`), and contributes 0 to
+            // `rows_decoded` — the batches were materialized on the cold read
+            // that filled this entry, not here. This is what lets the
+            // repeated-key point SELECT gate assert files_opened == 0.
+            counters
+                .files_served_from_cache
+                .fetch_add(1, Ordering::Relaxed);
             let owned: Vec<RecordBatch> = batches.iter().map(|b| (**b).clone()).collect();
             let s = futures::stream::iter(owned.into_iter().map(Ok));
             return Ok(s.boxed());
@@ -964,6 +972,17 @@ async fn read_one(
                         filters_hash: hash_filters(&[]),
                     };
                     if let Some(cached) = pc.get(&unfiltered_key) {
+                        // Pre-GET cache hit: the unfiltered decode is already
+                        // warm, so we answer this fresh-key point read by
+                        // Arrow-filtering the cached batches and NEVER issue the
+                        // GET. Cache-served (not `files_opened`); `rows_decoded`
+                        // stays 0 because no new Arrow materialization happens —
+                        // the rows were decoded on the cold read that filled the
+                        // entry. This is the path that makes the repeated /
+                        // second in-list point read provably 0 cold work.
+                        counters
+                            .files_served_from_cache
+                            .fetch_add(1, Ordering::Relaxed);
                         let raw: Vec<RecordBatch> =
                             cached.iter().map(|b| (**b).clone()).collect();
                         // Early per-call LIMIT cut inside the filter pass so the
@@ -1022,6 +1041,18 @@ async fn read_one(
                 .map_err(|e| BasinError::storage(format!("read vortex {path}: {e}")))?,
         };
 
+        // Cold read: we issued the GET and now hold the file bytes. Count the
+        // file opened + the GET bytes ONCE here, before any decode-reuse
+        // branch below (a post-GET unfiltered-reuse hit still paid this GET).
+        // `files_opened` is the per-query "cold files touched" signal the
+        // scale-invariant gates pin to O(1): whole-file column_stats min/max
+        // pruning in `read()` should have already dropped every file whose PK
+        // zone-map excludes the lookup key, so a point read reaches this line
+        // for at most the one (or boundary-straddling two) surviving file(s).
+        counters.files_opened.fetch_add(1, Ordering::Relaxed);
+        counters
+            .bytes_fetched
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         if let Some(tc) = project_counters.as_ref() {
             tc.record_bytes_read(bytes.len() as u64);
         }
@@ -1177,6 +1208,16 @@ async fn read_one(
                     size_bytes,
                 )
                 .await?;
+                // Rows materialized into Arrow from this cold file (the WHOLE
+                // file, unfiltered — this branch decodes without pushdown so
+                // every row of every chunk lands here). This is the
+                // `rows_decoded` volume the gate caps at one file's worth.
+                // The reuse-HIT arm above contributes nothing — those rows were
+                // counted on the cold read that filled the entry.
+                let decoded_rows: u64 = decoded.iter().map(|b| b.num_rows() as u64).sum();
+                counters
+                    .rows_decoded
+                    .fetch_add(decoded_rows, Ordering::Relaxed);
                 // Store-after-decode decision: cache the unfiltered batches
                 // ONLY when their REAL decoded footprint fits one shard's
                 // budget. A single entry larger than `per_shard_budget()` would
@@ -1227,6 +1268,18 @@ async fn read_one(
             size_bytes,
         )
         .await?;
+        // Rows materialized into Arrow from this cold file, BEFORE the Arrow
+        // project/filter pass below. When a filter pushed natively, Vortex's
+        // zone-map chunk pruning already dropped non-matching chunks, so this
+        // is the rows in the SURVIVING chunks (≤ one chunk for a point read on
+        // a PK whose values are chunk-local) — exactly the decode work the
+        // gate bounds. When nothing pushed it is the whole file; the gate's
+        // per-file chunk bound still holds because each seeded file is one
+        // chunk.
+        let decoded_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+        counters
+            .rows_decoded
+            .fetch_add(decoded_rows, Ordering::Relaxed);
         // Skip the Arrow re-filter only when Vortex handled ALL predicates
         // natively (all_filters_pushed) AND the scan actually ran with
         // pushdown (decode_used_filter, i.e. did not fall back) AND we had the
@@ -1375,6 +1428,18 @@ async fn read_one(
     // size as an upper bound — the parquet reader prunes row groups so actual
     // bytes pulled are typically a subset; this is a defensible scaling
     // signal per project without per-range bookkeeping in the object_store.
+    // Cold Parquet read: footer fetched (or rehydrated from meta cache) and a
+    // record-batch stream about to be built. Count the file opened once.
+    // `bytes_fetched` uses `file_size` as an upper bound (the parquet reader
+    // issues ranged GETs for only the surviving row groups + pages, so the real
+    // wire bytes are typically a strict subset — same caveat as the per-project
+    // counter above). `rows_decoded` for the Parquet path is bumped inside
+    // `finalize_pipeline`, where the record-batch stream is wrapped, because
+    // the stream is lazy and rows materialize as it is polled.
+    counters.files_opened.fetch_add(1, Ordering::Relaxed);
+    counters
+        .bytes_fetched
+        .fetch_add(file_size, Ordering::Relaxed);
     if let Some(tc) = project_counters.as_ref() {
         tc.record_bytes_read(file_size);
     }
@@ -2279,9 +2344,17 @@ where
                     .build()
                     .map_err(|e| BasinError::storage(format!("parquet build {path}: {e}")))?;
                 let catalog_schema_for_stamp = catalog_schema.clone();
+                let counters_for_rows = counters.clone();
                 let mapped = stream.map(move |res| {
                     let batch =
                         res.map_err(|e| BasinError::storage(format!("parquet read: {e}")))?;
+                    // Rows yielded by the parquet stream — post row-group / page
+                    // / row-filter pushdown, pre-engine-filter. This is the
+                    // Parquet analogue of the Vortex `rows_decoded` bump: the
+                    // volume actually materialized off disk for this file.
+                    counters_for_rows
+                        .rows_decoded
+                        .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
                     let synth = synthesise_missing_columns(
                         batch,
                         &present_names_arc,
@@ -2469,8 +2542,15 @@ where
     // matches the projection order.
     let projection_order: Option<Arc<Vec<String>>> =
         opts.projection.as_ref().map(|p| Arc::new(p.clone()));
+    let counters_for_rows = counters.clone();
     let mapped = stream.map(move |res| {
         let batch = res.map_err(|e| BasinError::storage(format!("parquet read: {e}")))?;
+        // Rows yielded by the parquet stream — post row-group / page / row
+        // filter pushdown, pre-engine-filter. Parquet analogue of the Vortex
+        // `rows_decoded` bump.
+        counters_for_rows
+            .rows_decoded
+            .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
         let batch = match &projection_order {
             Some(names) => reorder_batch_to_projection(batch, names)?,
             None => batch,

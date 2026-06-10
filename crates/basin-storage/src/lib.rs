@@ -477,6 +477,41 @@ pub struct ReadCounters {
     /// Number of rows selected (not skipped) by the page-index RowSelection
     /// within the surviving row groups. Zero when no page-index pruning fired.
     pub rows_selected_by_page_index: AtomicU64,
+    /// Number of cold-file reads that actually fetched + decoded the file's
+    /// bytes (a `read_one` invocation that passed every cache short-circuit and
+    /// issued the object-store GET). This is the per-query "files touched"
+    /// signal: a point lookup that file-prunes (whole-file column_stats
+    /// min/max) down to one surviving file bumps this by 1, regardless of how
+    /// many files the table holds. The scale-invariant gates assert this stays
+    /// O(1) as both table size and file count grow.
+    pub files_opened: AtomicU64,
+    /// Number of reads answered entirely from an in-RAM cache (the top
+    /// page-cache hit, the Vortex pre-GET unfiltered short-circuit, or the
+    /// Vortex unfiltered-decode reuse hit) WITHOUT issuing the object-store
+    /// GET. Counted separately from `files_opened` so a repeated point lookup
+    /// (cache hit) is provably 0 cold reads, while a fresh-key lookup that
+    /// fills the cache is provably ≥ 1. `files_opened + files_served_from_cache`
+    /// is the total number of files the read path resolved.
+    pub files_served_from_cache: AtomicU64,
+    /// Rows materialized into Arrow from cold files — the unfiltered decode
+    /// volume, NOT the post-filter row count. Vortex: rows in the batches
+    /// `decode_with_cache` (or the cached unfiltered reuse) hands back, summed
+    /// before the Arrow project/filter pass. Parquet: rows yielded by the
+    /// parquet record-batch stream (which has the row-group + page + row
+    /// filters pushed in, so this is the post-pushdown / pre-engine-filter
+    /// volume). This is the work that scales with chunk/row-group size, not
+    /// table size: a point read decodes at most one chunk (≤ 65536 rows) of the
+    /// single surviving file. The scale-invariant gates assert it stays bounded
+    /// by a chunk regardless of table size.
+    pub rows_decoded: AtomicU64,
+    /// Object-store GET bytes pulled by cold reads (best-effort: bumped at the
+    /// same choke point as the per-project `record_bytes_read`, by the fetched
+    /// blob length on both the Vortex and Parquet paths). Zero on cache-served
+    /// reads. Observability only — the gates assert on `files_opened` /
+    /// `rows_decoded`, not on bytes (bytes are format/compression dependent),
+    /// but the summary prints record it so a regression that re-fetches whole
+    /// files is visible.
+    pub bytes_fetched: AtomicU64,
 }
 
 impl ReadCounters {
@@ -487,6 +522,10 @@ impl ReadCounters {
             row_groups_pruned_by_stats: self.row_groups_pruned_by_stats.load(Ordering::Relaxed),
             row_groups_pruned_by_bloom: self.row_groups_pruned_by_bloom.load(Ordering::Relaxed),
             rows_selected_by_page_index: self.rows_selected_by_page_index.load(Ordering::Relaxed),
+            files_opened: self.files_opened.load(Ordering::Relaxed),
+            files_served_from_cache: self.files_served_from_cache.load(Ordering::Relaxed),
+            rows_decoded: self.rows_decoded.load(Ordering::Relaxed),
+            bytes_fetched: self.bytes_fetched.load(Ordering::Relaxed),
         }
     }
 
@@ -496,6 +535,10 @@ impl ReadCounters {
         self.row_groups_pruned_by_stats.store(0, Ordering::Relaxed);
         self.row_groups_pruned_by_bloom.store(0, Ordering::Relaxed);
         self.rows_selected_by_page_index.store(0, Ordering::Relaxed);
+        self.files_opened.store(0, Ordering::Relaxed);
+        self.files_served_from_cache.store(0, Ordering::Relaxed);
+        self.rows_decoded.store(0, Ordering::Relaxed);
+        self.bytes_fetched.store(0, Ordering::Relaxed);
     }
 }
 
@@ -509,6 +552,48 @@ pub struct ReadCountersSnapshot {
     /// Rows selected (kept) by the page-index RowSelection. Zero when no
     /// page-level pruning fired (all pages kept or no page index present).
     pub rows_selected_by_page_index: u64,
+    /// See [`ReadCounters::files_opened`].
+    pub files_opened: u64,
+    /// See [`ReadCounters::files_served_from_cache`].
+    pub files_served_from_cache: u64,
+    /// See [`ReadCounters::rows_decoded`].
+    pub rows_decoded: u64,
+    /// See [`ReadCounters::bytes_fetched`].
+    pub bytes_fetched: u64,
+}
+
+impl ReadCountersSnapshot {
+    /// Per-query delta: `self` (snapshot taken AFTER a query) minus `earlier`
+    /// (snapshot taken BEFORE it). The counters are process-global atomics, so
+    /// this is only a per-query measurement when the query ran serially between
+    /// the two snapshots — which is the discipline the scale-invariant tests
+    /// follow (`--test-threads=1`, one query per before/after pair). Saturating
+    /// subtraction so a (shouldn't-happen) concurrent bump never underflows.
+    pub fn delta(&self, earlier: &ReadCountersSnapshot) -> ReadCountersSnapshot {
+        ReadCountersSnapshot {
+            row_groups_considered: self
+                .row_groups_considered
+                .saturating_sub(earlier.row_groups_considered),
+            row_groups_scanned: self
+                .row_groups_scanned
+                .saturating_sub(earlier.row_groups_scanned),
+            row_groups_pruned_by_stats: self
+                .row_groups_pruned_by_stats
+                .saturating_sub(earlier.row_groups_pruned_by_stats),
+            row_groups_pruned_by_bloom: self
+                .row_groups_pruned_by_bloom
+                .saturating_sub(earlier.row_groups_pruned_by_bloom),
+            rows_selected_by_page_index: self
+                .rows_selected_by_page_index
+                .saturating_sub(earlier.rows_selected_by_page_index),
+            files_opened: self.files_opened.saturating_sub(earlier.files_opened),
+            files_served_from_cache: self
+                .files_served_from_cache
+                .saturating_sub(earlier.files_served_from_cache),
+            rows_decoded: self.rows_decoded.saturating_sub(earlier.rows_decoded),
+            bytes_fetched: self.bytes_fetched.saturating_sub(earlier.bytes_fetched),
+        }
+    }
 }
 
 /// Default capacity for the Parquet footer cache. Bumped from 1024 to 16384
