@@ -91,12 +91,34 @@ pub enum ReservationOutcome {
 /// pair.
 pub struct MemTableEntry {
     pub memtable: MemTable,
+    /// ADR 0027 Phase 4 — promoted-JSONB shadow-column cleanliness flag.
+    ///
+    /// `true` means this memtable MAY hold at least one live (non-tombstone)
+    /// row whose materialised image does NOT carry a currently-promoted
+    /// `__promoted$col$key` shadow column. Such a row cannot be read via the
+    /// shadow-column fast path (it would null-fill to a WRONG value), so the
+    /// `payload->>'key'` promoted-column rewrite must be disabled for the whole
+    /// table while this is set.
+    ///
+    /// Lifecycle:
+    ///   * starts `false` (empty memtable — trivially clean);
+    ///   * set `true` when a JSONB path is promoted while this memtable already
+    ///     holds live rows (those pre-promotion rows lack the new shadow col),
+    ///     and whenever a write lands a row that does not carry every promoted
+    ///     shadow column;
+    ///   * cleared back to `false` once the memtable drains to empty.
+    ///
+    /// When CLEAR, every live memtable row is guaranteed to carry all promoted
+    /// shadow columns (the UPDATE/INSERT fast paths materialise them), so the
+    /// promoted fast path is correctness-safe even with hot rows present.
+    pub shadow_dirty: std::sync::atomic::AtomicBool,
 }
 
 impl MemTableEntry {
     fn new() -> Self {
         Self {
             memtable: MemTable::new(),
+            shadow_dirty: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -235,6 +257,37 @@ impl MemTableRegistry {
         self.tables
             .get(&(*project, table.clone()))
             .map(|e| e.clone())
+    }
+
+    /// ADR 0027 Phase 4 — mark this table's memtable as possibly holding rows
+    /// that lack a promoted shadow column. Called when a JSONB path is promoted
+    /// while the memtable already holds live rows. No-op (does not create an
+    /// entry) when the table has no memtable: an absent entry is trivially clean.
+    pub fn mark_shadow_dirty(&self, project: &ProjectId, table: &TableName) {
+        if let Some(e) = self.tables.get(&(*project, table.clone())) {
+            e.shadow_dirty
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// ADR 0027 Phase 4 — true iff the table's memtable holds at least one live
+    /// (non-tombstone) row AND that row set may be missing a promoted shadow
+    /// column. When this returns `false` with a non-empty memtable, every live
+    /// hot row is known to carry all promoted shadow columns, so the promoted
+    /// fast path is correctness-safe. Auto-clears the dirty flag once the
+    /// memtable has drained to empty (the next promoted query then re-enables
+    /// the fast path without an explicit drain hook).
+    pub fn memtable_blocks_promoted_read(&self, project: &ProjectId, table: &TableName) -> bool {
+        let Some(e) = self.tables.get(&(*project, table.clone())) else {
+            return false;
+        };
+        if e.memtable.snapshot().is_empty() {
+            // Drained: reset cleanliness so a later promoted query is fast again.
+            e.shadow_dirty
+                .store(false, std::sync::atomic::Ordering::Release);
+            return false;
+        }
+        e.shadow_dirty.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Get-or-create per-project state (byte counter + semaphore).

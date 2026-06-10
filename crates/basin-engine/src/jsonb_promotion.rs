@@ -311,6 +311,7 @@ pub(crate) fn observe_and_maybe_promote(
     table_refs: &[String],
     registry: &std::sync::Arc<JsonbPromotionRegistry>,
     catalog: std::sync::Arc<dyn Catalog>,
+    memtables: &std::sync::Arc<basin_hottier::MemTableRegistry>,
 ) {
     // Fast bail-out: no JSON extract calls in this SQL.
     if !sql.to_ascii_lowercase().contains("json_get") {
@@ -334,6 +335,12 @@ pub(crate) fn observe_and_maybe_promote(
                 registry.record_hit(project, &table_name, source_col, json_key)
             {
                 // Threshold just crossed — fire-and-forget async promotion.
+                // ADR 0027 Phase 4: any live rows ALREADY in this table's
+                // memtable predate the promotion and therefore lack the new
+                // shadow column. Mark the memtable shadow-dirty so the promoted
+                // fast path stays disabled until those rows drain; new writes
+                // after this point materialise the column and keep it clean.
+                memtables.mark_shadow_dirty(project, &table_name);
                 let project_clone = *project;
                 let table_clone = table_name.clone();
                 let catalog_clone = catalog.clone();

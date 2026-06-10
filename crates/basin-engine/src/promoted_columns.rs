@@ -117,31 +117,43 @@ pub(crate) fn materialize_promoted_columns(
 
     for path in paths {
         let col_name = shadow_col_name(&path.source_col, &path.json_key);
-        // Skip if already materialised (idempotency guard).
-        if batch.schema().field_with_name(&col_name).is_ok() {
-            continue;
-        }
 
-        // Find the source JSONB column.
-        let src_idx = match batch.schema().index_of(&path.source_col) {
-            Ok(i) => i,
+        // Compute the up-to-date shadow value from the (authoritative) source
+        // JSONB column. The shadow column is a pure function of the source, so
+        // we ALWAYS recompute: a row carried through a copy-on-write UPDATE
+        // rewrite already holds a (now STALE) shadow column copied from the cold
+        // read, and a stale skip here would persist the pre-UPDATE value into
+        // the replacement file — a WRONG promoted-column read. When the column
+        // is absent we append it; when present we OVERWRITE it in place.
+        let existing_idx = batch.schema().index_of(&col_name).ok();
+
+        let computed: ArrayRef = match batch.schema().index_of(&path.source_col) {
+            Ok(src_idx) => {
+                let src_arr = batch.column(src_idx);
+                let mut out: Vec<Option<String>> = Vec::with_capacity(n);
+                for i in 0..n {
+                    out.push(extract_promoted_value(src_arr, i, &path.json_key));
+                }
+                Arc::new(StringArray::from(out))
+            }
             Err(_) => {
-                // Source column doesn't exist in this batch — write all NULLs.
+                // Source column doesn't exist in this batch — all NULLs.
                 let nulls: Vec<Option<&str>> = vec![None; n];
-                new_schema_fields.push(Field::new(&col_name, DataType::Utf8, true));
-                new_columns.push(Arc::new(StringArray::from(nulls)));
-                continue;
+                Arc::new(StringArray::from(nulls))
             }
         };
-        let src_arr = batch.column(src_idx);
 
-        // Extract each row's value.
-        let mut out: Vec<Option<String>> = Vec::with_capacity(n);
-        for i in 0..n {
-            out.push(extract_promoted_value(src_arr, i, &path.json_key));
+        match existing_idx {
+            Some(idx) => {
+                // Overwrite the stale shadow column in place (preserve position).
+                new_schema_fields[idx] = Field::new(&col_name, DataType::Utf8, true);
+                new_columns[idx] = computed;
+            }
+            None => {
+                new_schema_fields.push(Field::new(&col_name, DataType::Utf8, true));
+                new_columns.push(computed);
+            }
         }
-        new_schema_fields.push(Field::new(&col_name, DataType::Utf8, true));
-        new_columns.push(Arc::new(StringArray::from(out)));
     }
 
     let new_schema = Arc::new(Schema::new_with_metadata(

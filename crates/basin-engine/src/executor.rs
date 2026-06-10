@@ -2335,6 +2335,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                     &table_refs,
                     sess.engine.jsonb_promotion_registry(),
                     sess.engine.config().catalog.clone(),
+                    &sess.engine.memtable_registry(),
                 );
             }
 
@@ -3019,13 +3020,19 @@ async fn rewrite_promoted_cols_for_query(sql: &str, sess: &ProjectSession) -> St
             Some(shard) => shard.has_pending_tail(project, &table_name).await,
             None => false,
         };
-        let memtable_has_entries = sess
+        // ADR 0027 Phase 4: only block the rewrite when the memtable may hold a
+        // live row MISSING a promoted shadow column. After a post-promotion
+        // INSERT/UPDATE the fast paths materialise the shadow column into the
+        // hot row (see `hot_tier_update_by_pk` / the INSERT path), so a clean
+        // memtable no longer forces a full per-row JSONB UDF scan — the hot
+        // rows carry the column and read correctly via the shadow path. A row
+        // that predates promotion marks the memtable dirty (see
+        // `observe_and_maybe_promote`) and keeps the conservative fallback.
+        let memtable_blocks = sess
             .engine
             .memtable_registry()
-            .get(project, &table_name)
-            .map(|e| !e.memtable.snapshot().is_empty())
-            .unwrap_or(false);
-        if has_pending_tail || memtable_has_entries {
+            .memtable_blocks_promoted_read(project, &table_name);
+        if has_pending_tail || memtable_blocks {
             continue;
         }
         let live_files = meta.live_data_files();

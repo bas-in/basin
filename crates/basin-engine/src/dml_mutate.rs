@@ -2095,7 +2095,20 @@ async fn hot_tier_update_by_pk(
         } else {
             new_batch.slice(0, 1)
         };
-        let bytes = encode_single_row_ipc(&one_row);
+        // ADR 0027 Phase 4: materialise promoted JSONB shadow columns into the
+        // override image, exactly as the INSERT path does. Without this the
+        // hot UPDATE row carries no `__promoted$col$key` column, the
+        // `HtapUnionTable` overlay null-fills it, and the promoted-column read
+        // path would return a WRONG NULL for the updated row. Materialising it
+        // here keeps every live memtable row shadow-clean, so the promoted fast
+        // path stays enabled (and correct) after a post-promotion UPDATE
+        // instead of demoting every later `payload->>'key'` query to a full
+        // per-row JSONB UDF scan. No-op when no paths are promoted.
+        let override_row = crate::promoted_columns::materialize_promoted_columns(
+            &one_row,
+            &meta.promoted_jsonb_paths,
+        )?;
+        let bytes = encode_single_row_ipc(&override_row);
         if tx_mode {
             // In-tx: write the override to the rollback-able tx overlay. On
             // COMMIT it is drained into this same shared memtable; on ROLLBACK
@@ -4327,6 +4340,11 @@ async fn materialize_hot_overlay_into_cold(
         .into_iter()
         .map(|b| crate::hot_tombstone::normalize_batch_to_schema(b, meta.schema.as_ref()))
         .collect();
+    // ADR 0027 Phase 4: `write_replacement` materialises promoted shadow
+    // column(s) into the replacement file (see its body); passing the catalog
+    // schema is correct — the shadow extension happens there so EVERY cold-path
+    // rewrite (this overlay-materialize, exec_update, exec_delete, …) emits the
+    // column and keeps the promoted-column read fast path enabled.
     let added = write_replacement(sess, table, meta.schema.clone(), batches).await?;
     commit_replace(sess, table, meta.current_snapshot, removed.clone(), added).await?;
     // Physically delete the just-replaced files so a subsequent
@@ -4434,6 +4452,93 @@ async fn filter_to_live_data_files(
 /// is empty). We concat first because `Storage::write_batch` is one-batch-
 /// per-call; a multi-batch table would otherwise produce N replacement files
 /// per UPDATE which fragments the Parquet base needlessly.
+/// ADR 0027 Phase 4 — extend a copy-on-write replacement schema + its batches
+/// with the promoted `__promoted$col$key` shadow column(s).
+///
+/// Every cold-path rewrite (`exec_update` / `exec_delete` / overlay
+/// materialize) MUST emit the shadow column for each promoted JSONB path,
+/// otherwise the replacement file becomes a live file missing the column and
+/// the promoted-column read guard ("every live file carries the shadow column")
+/// fails for the WHOLE table — silently demoting every subsequent
+/// `payload->>'key'` query to a full per-row JSONB UDF scan for as long as the
+/// file stays live (confirmed: a single post-promotion `jsonb_set … WHERE
+/// id < 10` UPDATE at 1M demoted a later `COUNT(*) … WHERE payload->>'category'
+/// = …` from ~ms to ~3.4s).
+///
+/// `materialize_promoted_columns` is idempotent (skips a column already present
+/// on a batch — cold rows read from a backfilled file already carry it; only
+/// freshly-SET / pre-backfill rows are filled), and always appends new shadow
+/// columns at the END, matching the extended schema's field order. Returns the
+/// catalog schema unchanged (and batches untouched) when no paths are promoted.
+fn extend_replacement_with_shadow_cols(
+    base_schema: &Arc<Schema>,
+    promoted_paths: &[basin_catalog::PromotedJsonbPath],
+    batches: Vec<RecordBatch>,
+) -> Result<(Arc<Schema>, Vec<RecordBatch>)> {
+    if promoted_paths.is_empty() {
+        return Ok((base_schema.clone(), batches));
+    }
+    // Build the target schema: base fields + one Utf8 shadow field per promoted
+    // path that the base schema doesn't already carry, appended at the END.
+    let mut fields: Vec<Arc<arrow_schema::Field>> = base_schema.fields().iter().cloned().collect();
+    for path in promoted_paths {
+        let name = path.shadow_col_name();
+        if base_schema.field_with_name(&name).is_err() {
+            fields.push(Arc::new(arrow_schema::Field::new(
+                &name,
+                arrow_schema::DataType::Utf8,
+                true,
+            )));
+        }
+    }
+    let extended = Arc::new(arrow_schema::Schema::new_with_metadata(
+        fields,
+        base_schema.metadata().clone(),
+    ));
+    // Materialise the (fresh) shadow values, then reorder every batch's columns
+    // to EXACTLY the extended-schema field order by name. Cold-read batches may
+    // carry the shadow column at a different position than the extended schema
+    // appends it; concat requires identical schemas, so we project by name here
+    // (filling an all-NULL column for any field a batch somehow lacks) rather
+    // than relying on positional alignment.
+    let materialized: Result<Vec<RecordBatch>> = batches
+        .into_iter()
+        .map(|b| {
+            let m = crate::promoted_columns::materialize_promoted_columns(&b, promoted_paths)?;
+            // Reorder columns to the extended-schema field order by NAME,
+            // preserving each column's actual physical type (downstream
+            // `normalize_batch_to_schema` coerces Binary↔LargeBinary etc. before
+            // the concat). Build the per-batch schema from the real column
+            // types so `RecordBatch::try_new` doesn't reject a type mismatch.
+            let mut out_fields: Vec<Arc<arrow_schema::Field>> =
+                Vec::with_capacity(extended.fields().len());
+            let mut out_cols: Vec<arrow_array::ArrayRef> =
+                Vec::with_capacity(extended.fields().len());
+            for f in extended.fields() {
+                match m.schema().index_of(f.name()) {
+                    Ok(i) => {
+                        out_fields.push(m.schema().field(i).clone().into());
+                        out_cols.push(m.column(i).clone());
+                    }
+                    Err(_) => {
+                        // Field absent from this batch — supply an all-NULL
+                        // column of the declared type.
+                        out_fields.push(f.clone());
+                        out_cols.push(arrow_array::new_null_array(f.data_type(), m.num_rows()));
+                    }
+                }
+            }
+            let per_batch_schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+                out_fields,
+                m.schema().metadata().clone(),
+            ));
+            RecordBatch::try_new(per_batch_schema, out_cols)
+                .map_err(|e| BasinError::internal(format!("shadow-col reproject: {e}")))
+        })
+        .collect();
+    Ok((extended, materialized?))
+}
+
 async fn write_replacement(
     sess: &ProjectSession,
     table: &TableName,
@@ -4443,6 +4548,21 @@ async fn write_replacement(
     if batches.is_empty() {
         return Ok(Vec::new());
     }
+    // Honour the per-table writer overrides (bloom-filter columns,
+    // row-group size) on the rewrite path too; otherwise the
+    // copy-on-write replacement file would silently lose the table's
+    // configured pruning aids.
+    let meta = sess
+        .engine
+        .config()
+        .catalog
+        .load_table(&sess.project, table)
+        .await?;
+    // ADR 0027 Phase 4: extend the replacement schema + batches with promoted
+    // shadow column(s) so the rewritten file carries them (see
+    // `extend_replacement_with_shadow_cols`). No-op when nothing is promoted.
+    let (schema, batches) =
+        extend_replacement_with_shadow_cols(&schema, &meta.promoted_jsonb_paths, batches)?;
     // Normalize each batch to the target (catalog) physical types so a mix of
     // Vortex-cold-decoded (`Binary`/`Utf8View`) and memtable-IPC-decoded
     // (`LargeBinary`/`Utf8`) batches concat cleanly. Without this a JSONB
@@ -4465,16 +4585,6 @@ async fn write_replacement(
         return Ok(Vec::new());
     }
     let part = PartitionKey::default_key();
-    // Honour the per-table writer overrides (bloom-filter columns,
-    // row-group size) on the rewrite path too; otherwise the
-    // copy-on-write replacement file would silently lose the table's
-    // configured pruning aids.
-    let meta = sess
-        .engine
-        .config()
-        .catalog
-        .load_table(&sess.project, table)
-        .await?;
     let opts = basin_storage::WriteOptions {
         bloom_filter_columns: meta.bloom_filter_columns.clone(),
         max_row_group_size: meta.row_group_rows,
@@ -4568,6 +4678,20 @@ async fn write_replacement_per_file(
     let table_owned = table.clone();
     let concurrency = update_scan_concurrency(groups.len());
 
+    // ADR 0027 Phase 4: extend the per-file rewrite schema with promoted shadow
+    // column(s) once, and materialise them into each group's batches inside the
+    // task. Same rationale as `write_replacement`: a per-file UPDATE rewrite
+    // that drops the shadow column makes the replacement file fail the
+    // promoted-column read guard, demoting every later `payload->>'key'` query
+    // to a full per-row JSONB UDF scan. (This is the path the bench's
+    // `jsonb_set … WHERE id < 10` UPDATE actually takes.)
+    let promoted_paths = Arc::new(meta.promoted_jsonb_paths.clone());
+    let schema = {
+        let (extended, _) =
+            extend_replacement_with_shadow_cols(&schema, &promoted_paths, Vec::new())?;
+        extended
+    };
+
     let mut results: Vec<(String, DataFileRef)> = futures::stream::iter(groups.into_iter())
         .map(|(old_path, batches)| {
             let storage = storage.clone();
@@ -4575,7 +4699,18 @@ async fn write_replacement_per_file(
             let table = table_owned.clone();
             let schema = schema.clone();
             let opts = opts.clone();
+            let promoted_paths = promoted_paths.clone();
             async move {
+                // ADR 0027 Phase 4: materialise promoted shadow column(s) into
+                // each batch (idempotent; no-op when nothing is promoted) so the
+                // concat target `schema` (extended above) is satisfied and the
+                // rewritten file carries the column.
+                let batches: Vec<RecordBatch> = batches
+                    .into_iter()
+                    .map(|b| {
+                        crate::promoted_columns::materialize_promoted_columns(&b, &promoted_paths)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 // Normalize to catalog physical types before concat (same
                 // Binary/LargeBinary + Utf8 view-family rationale as
                 // `write_replacement`). The bulk-UPDATE-by-range path that

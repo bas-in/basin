@@ -667,6 +667,7 @@ mod tests {
     fn remove_flushed_leaves_newer_rows_intact() {
         let entry_arc = Arc::new(crate::registry::MemTableEntry {
             memtable: crate::memtable::MemTable::new(),
+            shadow_dirty: std::sync::atomic::AtomicBool::new(false),
         });
         let mt = &entry_arc.memtable;
 

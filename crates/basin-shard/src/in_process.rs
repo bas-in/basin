@@ -1964,7 +1964,7 @@ impl basin_hottier::FlushBackend for ShardFlushBackend {
             }
 
             let schema = batches[0].schema();
-            let merged = arrow::compute::concat_batches(&schema, &batches)
+            let mut merged = arrow::compute::concat_batches(&schema, &batches)
                 .map_err(|e| BasinError::storage(format!("flush concat batches: {e}")))?;
 
             // #204: the hot-tier flush is one of the cold-file write paths, so
@@ -1973,11 +1973,36 @@ impl basin_hottier::FlushBackend for ShardFlushBackend {
             // PK) so the flushed file's zone / row-group ranges are disjoint.
             // A missing catalog row (first flush before the table is created)
             // is non-fatal — fall through to the default empty cluster spec.
-            let cluster_columns = match catalog.load_table(&project, &table).await {
-                Ok(meta) if !meta.cluster_columns.is_empty() => meta.cluster_columns.clone(),
-                Ok(meta) => meta.default_cluster_cols(),
-                Err(_) => Vec::new(),
-            };
+            //
+            // ADR 0027 Phase 4: the hot-tier tail flush is ALSO a post-promotion
+            // cold-file write path. If a JSONB path was promoted and then rows
+            // were INSERTed/UPDATEd (CoW) and flushed here, the resulting file
+            // must carry the `__promoted$col$key` shadow column — otherwise the
+            // fast_select read path's "every live file carries the shadow
+            // column" correctness guard fails and EVERY subsequent
+            // `payload->>'key'` query for the table silently demotes to the
+            // per-row JSONB UDF scan (orders of magnitude slower) for as long
+            // as that file stays live. Compaction backfills via
+            // `backfill_promoted_columns`; the tail-flush path must do the same
+            // so a single post-promotion write doesn't permanently disable the
+            // promoted fast path. (Confirmed: without this, a #37-style
+            // `jsonb_set ... WHERE id < 10` UPDATE at 1M demoted the later
+            // `COUNT(*) ... WHERE payload->>'category' = …` from ~ms to ~3.4s.)
+            let (cluster_columns, promoted_paths) =
+                match catalog.load_table(&project, &table).await {
+                    Ok(meta) => {
+                        let cc = if !meta.cluster_columns.is_empty() {
+                            meta.cluster_columns.clone()
+                        } else {
+                            meta.default_cluster_cols()
+                        };
+                        (cc, meta.promoted_jsonb_paths.clone())
+                    }
+                    Err(_) => (Vec::new(), Vec::new()),
+                };
+            if !promoted_paths.is_empty() {
+                merged = backfill_promoted_columns(merged, &promoted_paths)?;
+            }
             let write_opts = basin_storage::WriteOptions {
                 cluster_columns,
                 ..Default::default()
