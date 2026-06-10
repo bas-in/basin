@@ -8,6 +8,103 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-10 — OLTP scale + correctness wave; HTAP / ORM / extensions roadmap
+
+Two work waves landed since `origin/main`: (1) OLTP scale fixes + correctness
+hardening that cut single-row write/read latency to ms-class at 1M rows, and
+(2) HTAP / ORM / extension surface expansion. All published numbers below are
+measured locally; the 1M LocalFS card runs on a shared box and is
+timing-sensitive — the structural cards (RAM/conn, disk, idle cost) and the
+real-S3 (SeaweedFS) card are the load-bearing comparison.
+
+### Engine — transactions and MVCC
+- **Snapshot-stable reads inside explicit transactions** (`530ec82`): repeated
+  SELECTs of the same data inside one transaction return the same answer even as
+  other sessions commit.
+- **Hot-tier MVCC sequence** (`9f5b7f0`): another session's overlay writes no
+  longer leak into an open transaction.
+- **Transaction-scoped overlay** (`62e5011`): in-tx single-row DML takes the
+  fast path through a per-transaction overlay.
+- **Pinned in-tx fast reads** (`f5d1d6f`): untouched-table reads inside a
+  transaction execute against a pinned snapshot without re-planning through
+  DataFusion. Fixed two read-path soundness holes — a pinned read no longer
+  re-discovers the current head (off-by-one in COUNT), and a secondary-index
+  probe MISS now falls through to the pruned cold read instead of being treated
+  as "definitely empty" (an auto-built index could previously hide a live row).
+
+### Engine — OLTP fast paths (always-on)
+- Fast paths flipped **always-on** — removed `BASIN_PK_ROW_CACHE` +
+  `BASIN_FAST_BULK_INSERT` opt-ins (`c2cdf60`, #203).
+- RMW `SET col = <expr>` fast path; overlay point-read correctness fix
+  (`7571af2`). `UPDATE … RETURNING` routed through the hot-tier fast path
+  (`d57bcfd`).
+- Single-key UPDATE prunes its cold pre-image read (`f0dded8`, #212); UPDATE
+  read-before-write consults the PK row cache (`7d3e765`); cold materialize
+  deferred to the cold path with a gated INSERT-tail flush (`c11c04e`, #205).
+- Keyset + point-join fast paths, index backfills, in-tx gates (`f2876ea`).
+- Write-through `PkRowCache` on INSERT commit (`f40f2a2`); `has_pending_tail`
+  O(resident-partitions) no-flush tail probe (`3a0406e`).
+- `cluster_columns` defaults to the single-column PK for point-query pruning
+  (`54198fd`, #204).
+- Result: single-row UPDATE at 1M dropped from ~162 ms to ~9 ms; point query
+  ~1.4 ms; UPSERT ~0.6 ms; RMW ~11 ms/op; point-join ~2.8–4.6 ms; keyset
+  ~5–18 ms; `SELECT … FOR UPDATE` + UPDATE ~21 ms.
+
+### Engine — correctness
+- Schema evolution: pre-ALTER files now read, aggregate, and update correctly
+  (`8ebb764`).
+- Promoted GIN/JSONB shadow-column reads + in-tx pin safety — 4 differential GAP
+  shapes recovered (`3180da3`); promoted-column sweep re-seals GIN row-group
+  summaries (`715530e`).
+- GIN `@>` serves aggregates; upsert checks go through the dispatcher
+  (`4daefdc`); multi-row `INSERT … ON CONFLICT DO UPDATE` (`501a757`);
+  Binary/LargeBinary normalized at overlay and rewrite boundaries (`b3eb863`).
+
+### ORM compatibility — introspection complete
+- `pg_index` populated; `pg_sequence` and `pg_enum` added (`30ea4f3`) — ORM
+  startup/migration introspection now resolves for Prisma, Drizzle, SQLAlchemy,
+  ActiveRecord, sqlx, Django, Hibernate. Wire-level ORM flow gate added
+  (`b746552`). Corpus now **96/99 (97%)**: Drizzle 100%, Prisma 100%, sqlx 95%,
+  Diesel 95%, TypeORM 94%.
+
+### Prepared statements
+- Execute bound statements without re-parsing (`333861b`); infer parameter types
+  through UDF argument positions (`38d7d0e`).
+
+### Vector / pgvector compat
+- HNSW `WITH (m, ef_construction)` build params + opclass-matched index routing
+  (`d5d99d4`) — a cosine-built index is not used for an L2 query.
+
+### PostGIS / geo
+- `ST_AsGeoJSON` / `ST_GeomFromGeoJSON` + constructor-expression INSERTs
+  (`41639b8`); R-tree row-exact envelope candidates (`a250891`); single-decode
+  residual for `&&` overlap (`dd26766`). `ST_DWithin` ~1.7× faster than PostGIS
+  GIST; `&&` count + KNN still trail GIST by ~150×.
+
+### Storage / read path
+- Auto-index advisor + sorted-PK skip for IN-lists (`c953d83`); exact O(log n)
+  IN-list zone prune (`ce67b8a`); push Utf8 equality into Vortex + minimal
+  aggregate read set (`5c2dbdd`); stats-prune catalog-less reads + cached Vortex
+  file stats (`e352716`); vectorized predicate eval + real-size decode-cache
+  admission (`fc62061`); per-session provider + head-probe caches (`89c218e`);
+  shared unfiltered decode across point lookups of a file (`12de75f`).
+- WAL: payload clone + clock read moved outside the partition lock (`25b2df1`).
+
+### Test infrastructure
+- Scale-invariant **work-counter** CI gates (`1b76c7d`): per-query
+  `files_opened` / `rows_decoded` / `bytes_fetched` counters with design-derived
+  bounds at 100k, plus `file_count_scaling.rs` asserting `files_opened` stays
+  constant as file count grows — these gate indefinite scaling on *work*, not
+  wall-clock.
+
+### Known gaps recorded this wave
+- FK `ON DELETE CASCADE` multi-level recursion and `DELETE … WHERE id BETWEEN`
+  on a scratch table (`basin: unsupported` in the differential bench).
+- Read-own-insert costs one O(1) tail flush+read until the row tier lands.
+- Cold in-tx UPDATE under an active savepoint routes through the cold
+  catalog-commit path.
+- `hottier_differential` ordering-only divergences on a few merge-on-read shapes.
+
 ## 2026-05-25 — Selective-read pushdown + benchmark fairness
 
 ### Engine — filter pushdown through the merge-on-read path

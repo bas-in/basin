@@ -18,8 +18,8 @@
   <a href="./CHANGELOG.md"><img alt="changelog" src="https://img.shields.io/badge/changelog-keep--a--changelog-blue?style=flat-square"></a>
   <a href="./WEDGE.md"><img alt="status: pre-alpha" src="https://img.shields.io/badge/status-pre--alpha-orange?style=flat-square"></a>
   <a href="./benchmark/BENCHMARKS.md"><img alt="honest benchmarks" src="https://img.shields.io/badge/benchmarks-honest_wins_and_losses-blue?style=flat-square"></a>
-  <a href="./benchmark/RESULTS_localfs.md"><img alt="vs Postgres: 47x less RAM/conn" src="https://img.shields.io/badge/vs_postgres-47%C3%97_less_RAM%2Fconn-blue?style=flat-square"></a>
-  <a href="./benchmark/RESULTS_localfs.md"><img alt="vs Postgres: 29x smaller on disk (1M SaaS)" src="https://img.shields.io/badge/vs_postgres-29%C3%97_smaller_on_disk-blue?style=flat-square"></a>
+  <a href="./benchmark/RESULTS_localfs.md"><img alt="vs Postgres: 27x less RAM/conn" src="https://img.shields.io/badge/vs_postgres-27%C3%97_less_RAM%2Fconn-blue?style=flat-square"></a>
+  <a href="./benchmark/RESULTS_seaweedfs.md"><img alt="vs Postgres: 91x smaller on disk (real S3, 100k)" src="https://img.shields.io/badge/vs_postgres-91%C3%97_smaller_on_disk_(S3)-blue?style=flat-square"></a>
   <a href="./CAPABILITIES.md"><img alt="capabilities" src="https://img.shields.io/badge/capabilities-matrix-blue?style=flat-square"></a>
   <a href="./docs/sql-support.md"><img alt="SQL support matrix" src="https://img.shields.io/badge/SQL_support-matrix-blue?style=flat-square"></a>
   <a href="./LICENSE"><img alt="license: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-lightgrey?style=flat-square"></a>
@@ -28,14 +28,16 @@
 > **Pre-alpha — public eval.** Basin is being built in the open. Use it
 > today to evaluate cost economics, prototype multi-tenant patterns, or
 > contribute. The hot-tier UPDATE/DELETE fast paths are **on by default**
-> as of Phase 5.14 closure (`bed431c`); the C2 acceptance gate
-> (`Single-row UPDATE p50 <5ms`) is met at 10k (~1.8ms) and 100k (~2.4ms),
-> and the shape lands at ~162ms at 1M after the #94/#95 correctness fix
-> (~17.5× PG) — the hot-overlay + cold-path materialize now pair with a
-> physical delete on commit, trading raw point-update latency for
-> guaranteed no-loss semantics. See the per-shape table in
-> [`RESULTS_localfs.md`](./benchmark/RESULTS_localfs.md) and the kill-switch
-> notes in [ADR 0016](./docs/decisions/0016-htap-hot-tier-architecture.md)
+> as of Phase 5.14 closure (`bed431c`). After two work waves of OLTP
+> scale fixes — transaction-scoped overlay, RMW SET fast path, pruned
+> cold pre-image reads, PK row-cache writes, snapshot-stable in-tx reads —
+> single-row UPDATE p50 lands at **~1.3ms at 10k, ~22ms at 100k, ~9ms at
+> 1M** (measured locally, no index either side). Point queries are
+> **ms-class at every scale** (~0.36ms / 0.82ms / 1.4ms at 10k / 100k / 1M)
+> — sub-ms→low-ms, not the second-class latencies of earlier generations.
+> The OLTP latency profile and per-shape table are in
+> [`RESULTS_localfs.md`](./benchmark/RESULTS_localfs.md); the kill-switch
+> notes are in [ADR 0016](./docs/decisions/0016-htap-hot-tier-architecture.md)
 > if you need to roll the fastpaths back without a redeploy
 > (`BASIN_HOTTIER_FASTPATH_DISABLE=1`).
 >
@@ -47,8 +49,8 @@
 
 Two things are structurally true regardless of workload, and they're the load-bearing reason Basin exists:
 
-1. **Pure-Rust async server, ~265 KiB RAM per held-open connection vs Postgres's ~8.1 MiB.** That's ~30× per the LocalFS lifecycle card. Under a 1,000-connection flood, Basin holds 1,000 / refuses 0; Postgres holds 98 / refuses 902. This isn't a tuning result — it's the difference between a from-scratch tokio server and a forking daemon. ([`server_lifecycle` card](./benchmark/RESULTS_localfs.md#server-lifecycle-accept-conn-scaling-rssconn))
-2. **A new project is an S3 bucket prefix, not a provisioned database.** Idle projects cost only their bytes — measured at ~2 KiB of RAM and **$0.10/month/project** at typical SaaS-tail sizes. Spin up one project for a side app, or ten thousand for a SaaS — same architecture, same binary. ([`idle-project cost curve`](./benchmark/RESULTS_localfs.md#idle-project-cost-curve--pass))
+1. **Pure-Rust async server, ~310 KiB RAM per held-open connection vs Postgres's ~8.1 MiB.** That's **~27×** per the LocalFS lifecycle card (measured locally). Under a 1,000-connection flood, Basin holds 1,000 / refuses 0; Postgres holds 100 / refuses 900. This isn't a tuning result — it's the difference between a from-scratch tokio server and a forking daemon. ([`server_lifecycle` card](./benchmark/RESULTS_localfs.md#server-lifecycle-accept-conn-scaling-rssconn))
+2. **A new project is an S3 bucket prefix, not a provisioned database.** Idle projects cost only their bytes — measured at **~2 KiB of RAM** (1.97 KiB/project over 1,000 idle projects) and **$0.10/month/project** at typical SaaS-tail sizes. Spin up one project for a side app, or ten thousand for a SaaS — same architecture, same binary. ([`idle-project cost curve`](./benchmark/RESULTS_localfs.md#idle-project-cost-curve--pass))
 
 Everything else — Vortex columnar storage, native vector search, basin-auth + basin-rest, time travel via Iceberg snapshots, `pg_cron`/`pg_net`/`pg_trgm`/PostGIS subsets as native crates, real pgwire v3 with TLS + COPY + extended-query + native JSONB/UUID/BYTEA binding — exists to make those two structural wins addressable from real applications. Decision log lives in [`docs/decisions/`](./docs/decisions/).
 
@@ -58,41 +60,37 @@ Everything else — Vortex columnar storage, native vector search, basin-auth + 
 
 Basin publishes **all** of its head-to-head numbers, wins and losses, regenerated from integration tests on every push. Some shapes Basin beats Postgres; many it does not. The picture is workload-dependent — the table below is the **1M-row SaaS+OLAP suite, LocalFS, no index either side** (the most apples-to-apples wedge). For 10k / 100k / real-S3 numbers, see the [benchmark results](#references).
 
-_Numbers below are the live 1M-row Vortex card, regenerated by `benchmark/run/run_all.sh` (Postgres-compare cards run with Basin's default config — the HTAP fastpaths and fast bulk-INSERT encoding are always-on, no non-default flags, as disclosed on the dashboard). Full per-row table + the 10k/100k cards in [`RESULTS_localfs.md`](./benchmark/RESULTS_localfs.md)._
+_Numbers below are the live 1M-row Vortex card, regenerated by `benchmark/run/run_all.sh` and measured locally (Postgres-compare cards run with Basin's default config — the HTAP fastpaths and fast bulk-INSERT encoding are always-on, no non-default flags, as disclosed on the dashboard). The 1M card runs on a shared local box and is timing-sensitive; the per-scale matrix in [`RESULTS_localfs.md`](./benchmark/RESULTS_localfs.md) and the real-S3 card below are the fuller picture._
 
-| Workload (1M, no index either side) | Basin (Vortex) | Postgres 18 | Verdict |
+| Workload (1M LocalFS, no index either side) | Basin (Vortex) | Postgres 18 | Verdict |
 |---|---|---|---|
 | **Structural — wins** | | | |
-| RAM per held-open connection | 265 KiB | 8,059 KiB | **~30× less** |
+| RAM per held-open connection | 310 KiB | 8,257 KiB | **~27× less** |
 | Connections held under 1,000-conn flood | 1,000 held / 0 refused | 100 held / 900 refused | **structural** |
 | On-disk bytes (users + events, 1M rows) | 152 MB | 306 MB | **2.0× smaller** (Vortex columnar) |
-| Cold-start first query | 3.9 ms | 13.2 ms | **3.4× faster** |
 | **Analytics / read — wins** | | | |
-| LATERAL JOIN (correlated derived table) | 15.7 ms | 3,396 ms | **216× faster** |
-| Correlated subquery in SELECT p50 | 44 ms | 7,290 ms | **167× faster** |
-| 2-table JOIN GROUP BY p50 | 33 ms | 1,352 ms | **41× faster** |
-| Analytics JOIN+WHERE p50 | 38 ms | 851 ms | **22× faster** |
-| COUNT(*) full table p50 | 85 ms | 1,190 ms | **14× faster** |
-| Composite range (created_at AND amount) | 4.3 ms | 45 ms | **10.5× faster** |
-| ILIKE '%@gmail.com' p50 | 6.2 ms | 44 ms | **7.2× faster** |
-| COUNT(DISTINCT user_id) p50 | 48 ms | 234 ms | **4.9× faster** |
-| Aggregate GROUP BY user_id p50 | 53 ms | 224 ms | **4.2× faster** |
-| Range scan p50 (~1k rows) | 17 ms | 43 ms | **2.5× faster** |
-| Pagination ORDER BY LIMIT/OFFSET p50 | 73 ms | 117 ms | **1.6× faster** |
-| DELETE WHERE id IN (10 rows) | 0.40 ms | 4.3 ms | **10.8× faster** (hot-tier tombstone fast path) |
+| LATERAL JOIN (correlated derived table) | 98 ms | 2,960 ms | **30× faster** |
+| Range scan p99 (~1k rows) | 3.9 ms | 74 ms | **19× faster** |
+| Range scan p50 (~1k rows) | 3.4 ms | 32 ms | **9.4× faster** |
+| Correlated subquery in SELECT p50 | 880 ms | 6,090 ms | **6.9× faster** |
+| WHERE col = ANY(int[]) | 7.8 ms | 38 ms | **4.8× faster** |
+| COUNT(col) vs COUNT(*) NULL handling | 0.31 ms | 0.87 ms | **2.8× faster** |
+| COUNT(*) full table p50 | 1,079 ms | 1,329 ms | **1.2× faster** |
+| DELETE WHERE id IN (10 rows) | 1.4 ms | 1.7 ms | **1.2× faster** (hot-tier tombstone fast path) |
 | **Selective single-row / OLTP — losses (PG's PK btree wins)** | | | |
-| Point query p50 (unindexed PK) | 0.098 ms | 0.003 ms | **~33× slower** — both sub-ms; PG hits its PK btree |
-| JSONB `->>` get-text p50 (steady, promoted) | 1.9 ms | 0.068 ms | **~28× slower** — ~2 ms after the filter-pushdown fix (was ~45 ms); PG's btree still wins selective reads |
-| Large IN-list (~100 values) | 1.1 ms | 0.029 ms | **~37× slower** — both low-ms |
-| Recursive CTE Fibonacci(30) | 1.4 ms | 0.06 ms | **~22× slower** (DataFusion upstream) |
-| JSONB `@>` contains (no GIN prune) | 1,086 ms | 62 ms | **~18× slower** — `CREATE INDEX … USING gin` is accepted but probe→prune wiring is in flight (#105) |
-| **Write — losses** | | | |
-| Single-row UPDATE p50 | 162.22 ms | 9.25 ms | **~17.5× slower** (hot-overlay + cold-path materialize after the #94/#95 correctness fix; PG's PK btree on heap is structurally faster here) |
-| Bulk UPDATE (~1/3 rows) | 6.9 s | 3.7 s | **1.9× slower** |
-| Bulk INSERT 1,000,000 rows | 50 s | 9 s | **~5.6× slower** — WAL→Vortex flush pipeline, not write-amp |
-| Concurrent SELECT (16 sessions, mixed) | 174 ms | 3.2 ms | **~54× slower** |
+| Point query p50 (unindexed PK) | 1.4 ms | 0.003 ms | **slower** — ms-class vs PG's sub-ms PK btree |
+| UPSERT (INSERT ON CONFLICT DO UPDATE) | 0.60 ms | 0.013 ms | **slower** — both sub-ms |
+| Large IN-list (~100 values) | 3.9 ms | 0.029 ms | **slower** — both low-ms |
+| Keyset pagination (`WHERE id > … LIMIT`) | 17.8 ms | 0.095 ms | **slower** |
+| JSONB `->>` get-text p50 (steady, promoted) | 60 ms | 0.099 ms | **slower** — promoted-column read; PG's btree wins selective JSONB |
+| JSONB `@>` contains (no GIN prune) | 8,183 ms | 57 ms | **much slower** — `CREATE INDEX … USING gin` parses + probes but probe→prune wiring is in flight |
+| **Write / concurrency — losses** | | | |
+| Single-row UPDATE p50 | 9.1 ms | 0.66 ms | **~14× slower** (hot-overlay + cold-path materialize; PG's PK btree on heap is structurally faster) |
+| Bulk UPDATE (~1/3 rows) | 8.5 s | 3.3 s | **2.6× slower** |
+| Bulk INSERT 1,000,000 rows | 260 s | 8.8 s | **slower** — WAL→Vortex flush pipeline, not write-amp |
+| Concurrent SELECT (16 sessions, mixed) | 285 ms | 7.3 ms | **slower** |
 
-At **1M rows: 42 wins / 37 losses.** Basin's analytical wins compound — LATERAL JOIN 216×, correlated subquery 167×, 2-table JOIN 41×, analytics JOIN 22×, COUNT(\*) 14× — and it now **wins** the aggregate (4.2×) and pagination (1.6×) shapes that earlier benchmark generations lost. The losses cluster on PG's home turf: **selective single-row lookups** (point query, JSONB `->>`, IN-list) where PG's PK btree is sub-millisecond and Basin is low-single-digit-ms, and **bulk/concurrent writes**. The hot-tier fastpaths shipped, so single-row UPDATE at 1M is ~17.5× of PG (was ~1550× pre-fastpath, now wider than the prior 12× because the #94/#95 fix pairs each materialize with a physical delete for correctness) and DELETE-WHERE-IN now wins — the write gaps are constant-ratio, not scaling-divergent. At **10k** PG's heap fits in `shared_buffers` and wins most OLTP latency; at **100k** Basin matches/beats on reads and pays the per-INSERT tax. **On real S3** round-trip cost dominates the unindexed cold path; cached/warm paths stay competitive. Full per-scale matrix:
+At **1M rows on LocalFS the picture is read-mixed, write-loss**: Basin wins the shapes where columnar scans and pushdown dominate — LATERAL JOIN 30×, range scan 9.4×, correlated subquery 6.9×, full `COUNT(*)` 1.2× — and loses PG's home turf: **selective single-row lookups** (point query, IN-list, keyset, JSONB `->>`) where PG's PK btree is sub-millisecond and Basin is ms-class, plus **bulk/concurrent writes**. The OLTP write story has improved enormously across two work waves — single-row UPDATE at 1M dropped from ~162ms to ~9ms (~14× of PG, down from ~1550× pre-fastpath) and DELETE-WHERE-IN now wins — but PG still owns the point-mutation latency floor. The 1M card runs on a shared box and its heavier analytical shapes (GROUP BY, window, multi-table joins) are timing-sensitive; **the structural wins (RAM/conn, disk, idle cost) and the real-S3 card are the load-bearing comparison.** At **10k** PG's heap fits in `shared_buffers` and wins most OLTP latency; at **100k** Basin closes the analytical gap and pays the per-INSERT tax. **On real S3 (SeaweedFS, 100k rows) Basin wins outright** — 91× smaller on disk (112 KB vs 10.1 MB), point query 1.9× faster (2.1ms vs 4.1ms), 100k-row INSERT 2.4× faster (1.9s vs 4.5s) — because object-storage economics and warm-cache reads beat PG's block-storage heap once data leaves a single local SSD. Full per-scale matrix:
 
 - [`benchmark/RESULTS_localfs.md`](./benchmark/RESULTS_localfs.md) — 10k / 100k / 1M cards, Vortex + Parquet, every shape
 - [`benchmark/RESULTS_seaweedfs.md`](./benchmark/RESULTS_seaweedfs.md) — local S3-compatible (SeaweedFS) results, same shape battery
@@ -111,13 +109,13 @@ Every card is generated by an integration test in [`tests/integration/tests/`](.
 ## Where Basin IS the answer
 
 - **Append-heavy multi-tenant SaaS** — many isolated projects, mostly-reads, occasional point UPDATE. The RAM-per-conn + per-project-prefix economics dominate; the OLTP point-write tax stays bounded as long as writes are append-shaped.
-- **Audit logs, event streams, IoT, activity feeds** — write-once-read-many, Vortex columnar compression shrinks bytes-at-rest 29× vs PG heap on the 1M SaaS shape and ~43× at 100k. Object-storage $/GB compounds.
+- **Audit logs, event streams, IoT, activity feeds** — write-once-read-many. Vortex columnar compression shrinks bytes-at-rest 2× vs PG heap on the mixed 1M SaaS shape (users + events), and far more on append-only event data: **91× smaller on real S3 at 100k** on the audit-log shape, and ~78× vs raw CSV. Object-storage $/GB compounds.
 - **AI / RAG with mixed tabular + vector data** — native `vector(N)` + HNSW alongside transactional rows in the same database, no `pg_vector` install. Useful when "store the document + the embedding + the audit row in one place" is the requirement.
 - **Cheap-idle multi-environment apps** — dev / staging / per-region / per-customer all live as cheap project prefixes on one cluster. Per-project cost is O(bytes), so 10k mostly-idle projects stays cheap. See [`docs/multi-project.md`](./docs/multi-project.md).
 
 ## Where Basin is NOT the answer (yet)
 
-- **Drop-in OLTP replacement at 1M+ scale with sub-millisecond point-mutation latency requirements.** Phase 5.14 closure (`bed431c`) flipped the hot-tier UPDATE/DELETE fast paths on by default; at 1M the single-row UPDATE p50 is ~162ms vs PG ~9ms (~17.5×) because the hot-overlay + cold-path materialize pair with a physical delete on commit (the #94/#95 correctness fix) and PG's index-and-heap is structurally faster on that one shape. For most multi-tenant SaaS workloads this gap doesn't matter (point mutations are <1% of traffic); for hot-write OLTP front ends it might. The kill-switch `BASIN_HOTTIER_FASTPATH_DISABLE=1` rolls the fastpaths back without a redeploy if needed.
+- **Drop-in OLTP replacement at 1M+ scale with sub-millisecond point-mutation latency requirements.** Phase 5.14 closure (`bed431c`) flipped the hot-tier UPDATE/DELETE fast paths on by default, and two work waves of OLTP scale fixes cut single-row UPDATE at 1M to ~9ms vs PG ~0.66ms (~14×) — a huge improvement over the prior ~162ms, but PG's index-and-heap is still structurally faster on point mutations. For most multi-tenant SaaS workloads this gap doesn't matter (point mutations are <1% of traffic); for hot-write OLTP front ends it might. The kill-switch `BASIN_HOTTIER_FASTPATH_DISABLE=1` rolls the fastpaths back without a redeploy if needed.
 - **Index-heavy workloads on non-PK columns** — Phase 5.7.B1 secondary B-tree indexes shipped (`CREATE INDEX … USING btree`), so `WHERE non_pk_col = X` can now probe the index instead of full-file scanning. Bloom filters on `basin.sort_by` + per-file `column_stats` still prune at the file level for indexes that aren't declared. The remaining "biggest open perf win" is the per-row-group GIN-on-tsvector / GIN-on-jsonb wiring in the read path (Phase 5.20.E + JSONB index probe).
 - **Pure analytical workhorse** — Snowflake / DuckDB / ClickHouse will out-run Basin on heavy GROUP BY / window / recursive-CTE shapes. Basin trades some bench wins for PG-compat, and inherits DataFusion's upstream limits on a handful of shapes (recursive CTE, exact COUNT(DISTINCT)).
 - **High-frequency single-DB OLTP** → Postgres / Aurora / Neon. **Edge / local-first** → Turso / libSQL. **Geospatial primary store** → PostGIS. **Embedded SQLite-class** → SQLite. **Globally strongly-consistent multi-region writes** → Spanner / Cockroach.
@@ -148,7 +146,7 @@ near zero."*
 
 Long-form companion with code samples per piece: [`docs/batteries.md`](./docs/batteries.md). Fine-grained matrix: [`CAPABILITIES.md`](./CAPABILITIES.md).
 
-This is the *and-the-rest-of-the-stack-is-here* line. The structural primitive (project = bucket prefix, 265 KiB/conn) is the wedge; this is what closes the sale.
+This is the *and-the-rest-of-the-stack-is-here* line. The structural primitive (project = bucket prefix, ~310 KiB/conn) is the wedge; this is what closes the sale.
 
 ---
 
@@ -157,7 +155,7 @@ This is the *and-the-rest-of-the-stack-is-here* line. The structural primitive (
 | Surface | Status |
 |---|---|
 | **sqllogictest** (curated PG-style suite) | **100% (50/50)** as of [`b7114e8`](https://github.com/bas-in/basin/commit/b7114e8) |
-| **ORM corpus** (Drizzle / Prisma / sqlx / Diesel / TypeORM, 99 representative shapes) | **95% (94/99)** — Drizzle 100%, Prisma 90%, sqlx 95%, Diesel 95%, TypeORM 94% |
+| **ORM corpus** (Drizzle / Prisma / sqlx / Diesel / TypeORM, 99 representative shapes) | **97% (96/99)** — Drizzle 100%, Prisma 100%, sqlx 95%, Diesel 95%, TypeORM 94%. `pg_index` / `pg_sequence` / `pg_enum` introspection now populated, so ORM startup/migration introspection (Prisma, Drizzle, SQLAlchemy, ActiveRecord, sqlx, Django, Hibernate) resolves cleanly. |
 | **Per-fragment SQL matrix** ([`docs/sql-support.md`](./docs/sql-support.md), 975 fragments tested) | **~88.5% Default config / ~91.5% non-excluded** (863/975) |
 | **Wasm UDFs** | `i32 / i64 / f64` plus `text / bytea / timestamptz` args + returns shipped (via a `basin_alloc`/`basin_dealloc` + linear-memory `(ptr,len)` ABI); JSONB rides the `text` path. Deferred: a dedicated `jsonb` arg type and vectorized (whole-Arrow-array) args |
 | **Wire protocol** | pgwire v3, simple + extended query, TLS (rustls), `COPY FROM STDIN / TO STDOUT`, prepared statements with binary parameters (native JSONB / UUID / BYTEA / ARRAY binary wire formats). NUMERIC rides the text wire format (lenient drivers handle it fine; binary varlena encoding deferred to v0.2). |
@@ -299,13 +297,16 @@ Basin's query engine is built on [Apache DataFusion](https://datafusion.apache.o
 - **CRUD + DDL** — `CREATE TABLE` (incl. `CREATE TABLE AS … WITH NO DATA`), multi-row `INSERT`, `SELECT`, `UPDATE`, `DELETE` (Iceberg copy-on-write today; hot-tier tombstone fast path env-gated in `87ef24b`), `ON CONFLICT DO NOTHING / DO UPDATE` upsert, `ALTER TABLE … CLUSTER BY (…) / SET BLOOM FILTERS ON / SET row_group_rows / SET cold_after / ENABLE ROW LEVEL SECURITY / CREATE POLICY`, `SHOW TABLES`. Prepared statements with parameter bind (text + binary, including native JSONB / UUID / ARRAY binary; NUMERIC binds over the text wire format — binary varlena deferred to v0.2).
 - **Honest enforcement, not silent no-ops** — `CREATE UNIQUE INDEX` actually enforces uniqueness, `VARCHAR(n)`/`CHAR(n)` length is enforced, RLS `WITH CHECK` is enforced on write, `TABLESAMPLE` actually samples, advisory locks are real, and unsupported `CREATE TRIGGER` / `MERGE` honest-reject with a SQLSTATE instead of silently doing nothing. A wave of silent-corruption CRITICALs surfaced by the differential harness were fixed.
 - **Expanded SQL surface** — JSONPath (`jsonb_path_query`, `@?`, `@@`, `jsonb_path_query_array`); JSONB mutators (`jsonb_set`/`insert`/`strip_nulls`/`pretty`/`typeof`); `json_build_object`/`json_build_array`; INET/CIDR containment; `regexp_match`/`matches`/`split_to_array`/`split_to_table`, `format`, `encode`/`decode`; datetime `age`/`to_char`/`to_date`/`date_bin`; window `IGNORE NULLS`; `SAVEPOINT` / `ROLLBACK TO`; data-modifying CTEs; correlated + `LATERAL` joins (incl. `CROSS JOIN LATERAL generate_series`); bounded full-text search (`tsvector`/`tsquery`/`@@`); ordered-set aggregates (`percentile_disc`, `mode() WITHIN GROUP`); range/multirange arithmetic; real transaction semantics (deferred commits, `ROLLBACK` undo, SAVEPOINT stack, aborted state).
+- **Snapshot-isolated transactions + HTAP fast-path DML** — explicit transactions take snapshot-stable reads (an open txn sees a consistent table view across statements even as other sessions commit; hot-tier MVCC sequence prevents overlay writes from leaking into open transactions). In-transaction single-row DML routes through a transaction-scoped overlay fast path, and untouched-table in-tx reads are served from a pinned snapshot without re-planning through DataFusion. RMW `SET col = <expr>` has a fast path; single-key UPDATE prunes its cold pre-image read.
+- **Prepared-statement AST execution** — bound statements execute without re-parsing on every call; parameter types are inferred through UDF argument positions for clients that don't pre-declare them.
+- **Auto-index advisor** — the engine observes query shapes and recommends/auto-builds secondary B-tree indexes for repeated point/IN-list probes; sorted-PK skip handles IN-lists in O(log n) zone-prune.
 - **Time travel** — Iceberg-style snapshots. `Catalog::rollback_to_snapshot(project, table, snapshot_id)` rewinds; `Catalog::fork_table(project, src, dst)` clones a table's metadata + snapshot history into a new sibling that diverges on next commit. Zero data copy until divergence.
-- **Native vector search** — `vector(N)` + `<->` / `<#>` / `<=>` operators, HNSW per file segment. No `pg_vector`.
-- **Postgres-extension equivalents** — `pg_cron` (basin-cron), `pg_net` + `http` (basin-net), `pg_trgm` (basin-trgm), `PostGIS` subset (basin-geo), `TimescaleDB` continuous aggregates (basin-cv), `pgcrypto` + `uuid-ossp` UDFs.
+- **Native vector search** — `vector(N)` + `<->` / `<#>` / `<=>` operators, HNSW per file segment. `CREATE INDEX … USING hnsw WITH (m = …, ef_construction = …)` accepts pgvector-style build params, and the planner routes `ORDER BY x <-> $1 LIMIT k` to the index whose opclass (`vector_l2_ops` / `vector_cosine_ops` / `vector_ip_ops`) matches the query's distance operator. No `pg_vector`.
+- **Postgres-extension equivalents** — `pg_cron` (basin-cron), `pg_net` + `http` (basin-net), `pg_trgm` (basin-trgm), `PostGIS` subset (basin-geo, incl. `ST_AsGeoJSON` / `ST_GeomFromGeoJSON` GeoJSON I/O and R-tree envelope candidates for `&&` / `ST_DWithin`), `TimescaleDB` continuous aggregates (basin-cv), `pgcrypto` + `uuid-ossp` UDFs.
 - **Auth + REST in the OSS bundle** — basin-auth (signup, JWT, refresh-token rotation, email-link login, per-project API keys) + basin-rest (PostgREST-shape CRUD, cursor pagination + NDJSON streaming, OpenAPI 3.0 schema generation at `GET /rest/v1/_openapi.json`). **`auth.uid()`**, **`auth.role()`**, **`auth.jwt()`** SQL session functions let you write Supabase-style RLS policies.
 - **Per-project connection URLs** — `POST /admin/v1/projects` returns `postgres://<user>:<password>@host:5433/<db>`. Password bcrypt-validated on every pgwire startup; mismatch → SQLSTATE `28P01`. Rotate via `POST /admin/v1/projects/{user}/rotate`.
 - **Durable catalog** — Iceberg-style catalog backed by Postgres when `BASIN_CATALOG=postgres://...`; tables, snapshots, project credentials, and `basin-auth`'s identity tables survive process restart.
-- **Cheap retention** — Vortex (default, ~1.95× smaller than ZSTD Parquet on audit-log) or Parquet, **~29× smaller than Postgres heap on the 1M SaaS+OLAP shape, ~43× at 100k**; per-file catalog `column_stats` + per-file bloom filters on `basin.sort_by` columns skip footer fetches and file opens when the predicate prunes the file.
+- **Cheap retention** — Vortex (default, ~1.95× smaller than ZSTD Parquet on audit-log) or Parquet, **2× smaller than Postgres heap on the mixed 1M SaaS+OLAP shape and 91× smaller on real S3 at 100k on the append-only audit-log shape**; per-file catalog `column_stats` + per-file bloom filters on `basin.sort_by` columns skip footer fetches and file opens when the predicate prunes the file.
 - **Analytical path** — a single DataFusion engine with Vortex/Parquet projection + predicate pushdown, catalog-statistics file pruning, per-file blooms, and incremental continuous materialized views. Approximate-cardinality and approximate-quantile UDFs (`APPROX_COUNT_DISTINCT`, `APPROX_PERCENTILE`) sit alongside exact counterparts for dashboard workloads. Heavy scans use stateless pooled compute over shared object storage.
 - **Multi-schema isolation (phase A)** — `SchemaName` / `QualifiedTableName` types, a schema-aware in-memory *and* Postgres-backed catalog, a `basin_schemas` table, and `CREATE/DROP SCHEMA` + cross-schema queries with differential coverage. Phases B–E (full name resolution / search_path semantics / wider DDL) are still in progress — see Status.
 - **Operations** — connection pooling, per-project pgwire rate limiting (token-bucket via `governor`), cost-based query rejection (`BASIN_QUERY_COST_LIMIT_ROWS`), per-project counters (ops / bytes_read / bytes_written / errors / p99), OpenTelemetry traces wired through router → engine → shard → storage → WAL.
@@ -347,7 +348,7 @@ Six-month wedge slice: [`WEDGE.md`](./WEDGE.md). Full plan: [`TASK.md`](./TASK.m
 
 ### vs Postgres / Aurora / RDS
 
-Postgres is the right answer for **single-project, high-frequency OLTP** and for workloads that need **sub-millisecond point-mutation latency at 1M+ rows**. Basin's hot-tier UPDATE/DELETE fast paths are on by default as of Phase 5.14 closure — point UPDATE at 1M lands at ~162ms (vs PG ~9ms, ~17.5×) after the #94/#95 hot-overlay/cold-materialize correctness fix; PG's index-and-heap is still structurally faster on that one shape. **Basin is not trying to be Postgres on those shapes.** Where Basin wins at 1M: many-isolated-projects (per-environment / per-customer / per-region), append-shaped workloads where the columnar bytes-at-rest savings compound, the analytical shapes that grow Basin's lead with scale (167× faster correlated subquery, 216× LATERAL JOIN, 41× 2-table JOIN GROUP BY), and the structural RAM-per-connection economics for connection-heavy front ends.
+Postgres is the right answer for **single-project, high-frequency OLTP** and for workloads that need **sub-millisecond point-mutation latency at 1M+ rows**. Basin's hot-tier UPDATE/DELETE fast paths are on by default as of Phase 5.14 closure, and two work waves of OLTP scale fixes cut point UPDATE at 1M to ~9ms (vs PG ~0.66ms, ~14×) — far better than the prior ~162ms, but PG's index-and-heap is still structurally faster on that shape. **Basin is not trying to be Postgres on those shapes.** Where Basin wins: many-isolated-projects (per-environment / per-customer / per-region), append-shaped workloads where the columnar bytes-at-rest savings compound (91× smaller on real S3 at 100k), the columnar-scan analytical shapes (6.9× faster correlated subquery, 30× LATERAL JOIN, 9.4× range scan at 1M), and the structural RAM-per-connection economics for connection-heavy front ends.
 
 ### vs Neon
 
@@ -367,7 +368,7 @@ Turso is the right answer for **edge-distributed apps** with many tiny SQLite-cl
 
 ### vs ClickHouse / DuckDB / data-warehouse
 
-ClickHouse and DuckDB are analytical engines — phenomenal at OLAP scans, not designed for transactional point reads or per-row inserts. **Basin will lose to a dedicated warehouse on heavy GROUP BY / window / recursive-CTE shapes** (see the perf table above). Basin's pitch is the unified path: one engine, one binary, pgwire on the wire, columnar substrate underneath — useful when "Snowflake plus a Postgres" is overkill for the workload size. The HTAP hot-tier ([ADR 0016](./docs/decisions/0016-htap-hot-tier-architecture.md)) closes the OLTP point-read and point-write floor on TB-scale tables — the missing piece that lets one engine span OLAP and OLTP without a second system.
+ClickHouse and DuckDB are analytical engines — phenomenal at OLAP scans, not designed for transactional point reads or per-row inserts. **Basin will lose to a dedicated warehouse on heavy GROUP BY / window / recursive-CTE shapes**, and inherits DataFusion's upstream limits on a handful of shapes (recursive CTE, exact COUNT(DISTINCT)). Basin's pitch is the unified path: one engine, one binary, pgwire on the wire, columnar substrate underneath — useful when "Snowflake plus a Postgres" is overkill for the workload size. The HTAP hot-tier ([ADR 0016](./docs/decisions/0016-htap-hot-tier-architecture.md)) closes the OLTP point-read and point-write floor on TB-scale tables — the missing piece that lets one engine span OLAP and OLTP without a second system.
 
 ### Where Basin is *not* the answer
 
