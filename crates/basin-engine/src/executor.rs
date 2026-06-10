@@ -7166,13 +7166,49 @@ pub(crate) async fn exec_select(
     // another table in the same project has 15 files).
     let mut max_single_table_files: usize = 0;
     {
-        let tables: Vec<_> = sess
+        // Statement-scoped refresh (perf): the historical behaviour refreshed
+        // EVERY table in the project before planning each query — a per-table
+        // provider rebuild (TableMetadata clone incl. bloom blobs +
+        // ListingTable re-registration) that scales with the project's table
+        // COUNT, not query complexity. At a few-thousand-row scale this is the
+        // dominant component of the small-query latency floor.
+        //
+        // Instead we narrow the refresh set to just the base tables the
+        // statement can actually read. `compute_select_refresh_set` parses the
+        // SQL, walks every TableScan-bearing shape (FROM/JOIN/CTE bodies/
+        // subqueries), expands referenced VIEW names to their underlying base
+        // tables (recursively, cycle-safe), and excludes CTE names (which are
+        // not base tables). It returns `None` — meaning "refresh everything,
+        // conservatively" — whenever it cannot enumerate the set with
+        // confidence: parse failure, non-`Query` statement, empty ref set, or
+        // any referenced name that resolves to neither a base table nor a view
+        // (e.g. `information_schema.*` / `pg_catalog.*` / `basin_stat_statements`,
+        // which are synthesized providers registered at session open and
+        // unaffected by `refresh_table`).
+        //
+        // Registration invariant (why narrowing is safe): EVERY table the
+        // catalog knows about is registered as a DataFusion provider at session
+        // open (`session::open` → `list_tables_qualified` → `refresh_table_qualified`),
+        // and CREATE TABLE registers its provider too. DataFusion planning only
+        // fails on an *unregistered* provider, never on a *stale* one. So a
+        // table we choose NOT to refresh still plans fine — it would merely be
+        // stale. And that staleness can never be observed through a SELECT,
+        // because any query that actually READS a table appears in that query's
+        // ref set and is therefore refreshed by this very logic. (DML/FK/
+        // RETURNING go through different exec paths; this scope is read-only
+        // SELECT only, so DML refresh behaviour is untouched.)
+        let in_tx = crate::session::tx_is_active(&sess.state);
+        let all_tables: Vec<_> = sess
             .engine
             .config()
             .catalog
             .list_tables(&sess.project)
             .await?;
-        let in_tx = crate::session::tx_is_active(&sess.state);
+        let tables: Vec<TableName> =
+            match compute_select_refresh_set(sess, sql, &all_tables).await {
+                Some(scoped) => scoped,
+                None => all_tables,
+            };
         for table in &tables {
             if in_tx {
                 // Within a transaction: include pending (not-yet-committed)
@@ -7804,6 +7840,242 @@ fn collect_table_refs_from_query(query: &sqlparser::ast::Query) -> Vec<TableName
     let mut out = Vec::new();
     collect_from_query(query, &mut out);
     out
+}
+
+/// Collect every CTE name *defined* anywhere in `query` (including CTEs
+/// nested inside subqueries / other CTE bodies). A CTE name is NOT a base
+/// table — `collect_table_refs_from_query` cannot tell `FROM cte` from
+/// `FROM real_table` (both are `TableFactor::Table` with a single ident), so
+/// the refresh-set computation must subtract these out before deciding a
+/// referenced name is "unknown".
+fn collect_cte_names(query: &sqlparser::ast::Query, out: &mut std::collections::HashSet<String>) {
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            out.insert(cte.alias.name.value.to_ascii_lowercase());
+            collect_cte_names(&cte.query, out);
+        }
+    }
+    collect_cte_names_in_set_expr(query.body.as_ref(), out);
+}
+
+fn collect_cte_names_in_set_expr(
+    set_expr: &sqlparser::ast::SetExpr,
+    out: &mut std::collections::HashSet<String>,
+) {
+    use sqlparser::ast::SetExpr;
+    match set_expr {
+        SetExpr::Select(select) => {
+            for from in &select.from {
+                collect_cte_names_in_table_factor(&from.relation, out);
+                for join in &from.joins {
+                    collect_cte_names_in_table_factor(&join.relation, out);
+                }
+            }
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            collect_cte_names_in_set_expr(left, out);
+            collect_cte_names_in_set_expr(right, out);
+        }
+        SetExpr::Query(q) => collect_cte_names(q, out),
+        _ => {}
+    }
+}
+
+fn collect_cte_names_in_table_factor(
+    tf: &sqlparser::ast::TableFactor,
+    out: &mut std::collections::HashSet<String>,
+) {
+    use sqlparser::ast::TableFactor;
+    match tf {
+        TableFactor::Derived { subquery, .. } => collect_cte_names(subquery, out),
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            collect_cte_names_in_table_factor(&table_with_joins.relation, out);
+            for join in &table_with_joins.joins {
+                collect_cte_names_in_table_factor(&join.relation, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Compute the *statement-scoped* refresh set: the base tables this read-only
+/// SELECT can actually read, so `exec_select` refreshes only those instead of
+/// every table in the project.
+///
+/// Returns `Some(tables)` to refresh exactly that set; returns `None` to mean
+/// "fall back to refreshing everything" — the conservative default taken
+/// whenever the set cannot be enumerated with confidence:
+///
+/// - the SQL fails to parse, or is not exactly one statement,
+/// - the single statement is not a plain `Query` (e.g. DML / EXECUTE / SHOW),
+/// - table-ref extraction yields nothing,
+/// - a referenced name resolves to neither a base table nor a known view
+///   (covers `information_schema.*` / `pg_catalog.*` synthesized providers,
+///   `basin_stat_statements`, and any future virtual relation — all of which
+///   are registered at session open and unaffected by `refresh_table`),
+/// - a view's body fails to parse or expansion exceeds the depth bound.
+///
+/// VIEW handling: at this point in `exec_select` the SQL still names views by
+/// name (`rewrite_view_refs`, which inlines `(body) AS view`, runs *later*,
+/// after this refresh loop). So a referenced view name is expanded here to the
+/// base tables in its stored `query_sql`. We recurse into view-over-view
+/// references defensively (with a depth bound and a visited-set so view cycles
+/// can't loop) so the refresh set stays a superset of whatever the planner
+/// ultimately scans. The returned set is the union of all reachable base
+/// tables, which covers exactly what the post-rewrite inlined query scans —
+/// guaranteeing a view-over-table SELECT sees data written after the session
+/// opened.
+///
+/// `all_tables` is the project's current base-table list (already fetched by
+/// the caller); the result is intersected against it so we never hand
+/// `refresh_table` a name it doesn't own.
+async fn compute_select_refresh_set(
+    sess: &ProjectSession,
+    sql: &str,
+    all_tables: &[TableName],
+) -> Option<Vec<TableName>> {
+    let dialect = PostgreSqlDialect {};
+    let stmts = Parser::parse_sql(&dialect, sql).ok()?;
+    if stmts.len() != 1 {
+        return None;
+    }
+    let Statement::Query(query) = &stmts[0] else {
+        return None;
+    };
+
+    // Base-table membership (lowercased name → canonical TableName).
+    let mut base_by_lc: std::collections::HashMap<String, TableName> =
+        std::collections::HashMap::with_capacity(all_tables.len());
+    for t in all_tables {
+        base_by_lc.insert(t.as_str().to_ascii_lowercase(), t.clone());
+    }
+
+    // View bodies (lowercased name → SELECT body). `list_views` is the same
+    // call `rewrite_view_refs` makes; empty for the common (no-views) case.
+    let view_map: std::collections::HashMap<String, String> = sess
+        .engine
+        .config()
+        .catalog
+        .list_views(&sess.project)
+        .await
+        .into_iter()
+        .map(|v| (v.name.to_ascii_lowercase(), v.query_sql))
+        .collect();
+
+    let mut resolved: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<TableName> = Vec::new();
+
+    // Top-level CTE names defined by this statement are not base tables.
+    let mut cte_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_cte_names(query, &mut cte_names);
+
+    let refs = collect_table_refs_from_query(query);
+    if refs.is_empty() {
+        return None;
+    }
+
+    // Resolve each referenced name to base tables. View names recurse into
+    // their body; cycles and runaway nesting are bounded.
+    const MAX_VIEW_DEPTH: usize = 16;
+    let mut visiting_views: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for name in &refs {
+        if !resolve_ref_to_base_tables(
+            name.as_str(),
+            &base_by_lc,
+            &view_map,
+            &cte_names,
+            &mut visiting_views,
+            &mut resolved,
+            &mut out,
+            MAX_VIEW_DEPTH,
+        ) {
+            // Unresolvable name (not a base table, not a view, not a CTE) →
+            // conservative fallback to refresh-all.
+            return None;
+        }
+    }
+
+    Some(out)
+}
+
+/// Resolve a single referenced name to zero-or-more base tables, accumulating
+/// into `out` (deduped via `resolved`). Returns `false` if the name cannot be
+/// classified as a base table, a known view, or an in-statement CTE — the
+/// caller treats that as "fall back to refresh-all".
+#[allow(clippy::too_many_arguments)]
+fn resolve_ref_to_base_tables(
+    name: &str,
+    base_by_lc: &std::collections::HashMap<String, TableName>,
+    view_map: &std::collections::HashMap<String, String>,
+    cte_names: &std::collections::HashSet<String>,
+    visiting_views: &mut std::collections::HashSet<String>,
+    resolved: &mut std::collections::HashSet<String>,
+    out: &mut Vec<TableName>,
+    depth: usize,
+) -> bool {
+    let lc = name.to_ascii_lowercase();
+
+    // A CTE name shadows any same-named base table within the query and is not
+    // itself a base table — nothing to refresh for it.
+    if cte_names.contains(&lc) {
+        return true;
+    }
+
+    // Base table: record it.
+    if let Some(t) = base_by_lc.get(&lc) {
+        if resolved.insert(lc) {
+            out.push(t.clone());
+        }
+        return true;
+    }
+
+    // View: expand its body's base-table refs recursively.
+    if let Some(body) = view_map.get(&lc) {
+        if depth == 0 {
+            return false; // too deep — be conservative
+        }
+        if !visiting_views.insert(lc.clone()) {
+            // Cycle (view references itself transitively): we've already
+            // entered this view higher in the stack; its tables are being
+            // collected there. Treat as resolved to avoid looping.
+            return true;
+        }
+        let dialect = PostgreSqlDialect {};
+        let parsed = Parser::parse_sql(&dialect, body);
+        let ok = match parsed {
+            Ok(stmts) if stmts.len() == 1 => {
+                if let Statement::Query(q) = &stmts[0] {
+                    // CTE names defined inside the view body shadow base tables
+                    // for refs originating inside that body.
+                    let mut body_ctes: std::collections::HashSet<String> = cte_names.clone();
+                    collect_cte_names(q, &mut body_ctes);
+                    let body_refs = collect_table_refs_from_query(q);
+                    body_refs.iter().all(|r| {
+                        resolve_ref_to_base_tables(
+                            r.as_str(),
+                            base_by_lc,
+                            view_map,
+                            &body_ctes,
+                            visiting_views,
+                            resolved,
+                            out,
+                            depth - 1,
+                        )
+                    })
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        visiting_views.remove(&lc);
+        return ok;
+    }
+
+    // Unknown: neither base table, view, nor CTE.
+    false
 }
 
 fn collect_from_query(query: &sqlparser::ast::Query, out: &mut Vec<TableName>) {
