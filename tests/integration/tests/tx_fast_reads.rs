@@ -266,11 +266,14 @@ async fn own_write_to_other_table_keeps_fast_reads_on_untouched_table() {
     a.execute("COMMIT").await.unwrap();
 }
 
-/// First touch inside a tx has NO pin yet, so the point read falls back to
-/// DataFusion (which pins). A SECOND read of the same table may then go fast —
-/// and either way must be correct and snapshot-stable.
+/// First touch inside a tx now PINS-AND-SERVES on the fast path: the gate
+/// passes a `FirstTouch` request, the fast path flushes the shard tail, captures
+/// both pins (cold snapshot + hot watermark) at the post-flush head — the SAME
+/// moment `load_table_for_read` would — and serves the read at that pin. So the
+/// FIRST in-tx read of a table no longer pays the DataFusion tax, yet stays
+/// snapshot-stable: a concurrent committer's later UPDATE must not leak in.
 #[tokio::test]
-async fn first_touch_falls_back_then_pins_then_fast() {
+async fn first_touch_pins_and_serves_fast() {
     let (_sd, _wd, eng, _bg, _wal) = open_engine_with_shard().await;
     let project = ProjectId::new();
     let a = eng.open_session(project).await.unwrap();
@@ -280,25 +283,68 @@ async fn first_touch_falls_back_then_pins_then_fast() {
     let _ = count(&a, "SELECT COUNT(*) FROM t").await;
 
     a.execute("BEGIN").await.unwrap();
-    // FIRST touch of t is the point read itself — no pin exists yet, so the gate
-    // bails to DataFusion, which captures the pin. The answer must be correct.
+    // FIRST touch of t is the point read itself — no leading COUNT to prime the
+    // pin. The fast path captures the pin on this very read (flush → pin → serve)
+    // and the answer must be correct.
     let v0 = point_v(&a, "t", 3).await;
-    assert_eq!(v0, Some(30), "first-touch point read (DataFusion-pinned)");
+    assert_eq!(v0, Some(30), "first-touch point read (fast-path-pinned)");
 
-    // B commits a concurrent UPDATE after A pinned.
+    // B commits a concurrent UPDATE after A pinned on first touch.
     b.execute("UPDATE t SET v = 555 WHERE id = 3").await.unwrap();
+    assert_eq!(point_v(&b, "t", 3).await, Some(555), "B sees its own update");
 
-    // SECOND read of t: now pinned, eligible for the fast path, and must still
-    // return the pinned OLD value.
+    // SECOND read of the SAME row: now `AlreadyPinned`, still fast, and must
+    // STILL return the OLD value captured at first touch (snapshot stable).
     let v1 = point_v(&a, "t", 3).await;
     assert_eq!(
         v1,
         Some(30),
-        "second (fast) point read must equal first; saw {v1:?}"
+        "second (fast) point read must equal the first-touch pin; saw {v1:?} — B's UPDATE leaked"
     );
+
+    // A different row read at the SAME pin must also see the pre-update value
+    // (the pin covers the whole table, not just the first-read key).
+    assert_eq!(point_v(&a, "t", 4).await, Some(40), "sibling row at the pin");
 
     a.execute("COMMIT").await.unwrap();
     assert_eq!(point_v(&a, "t", 3).await, Some(555), "post-COMMIT sees live head");
+}
+
+/// First touch where ANOTHER session committed an UPDATE BEFORE A's tx begins:
+/// the first-touch capture pins the post-flush head, so the read sees that
+/// committed value (read-committed at pin time). A concurrent INSERT after the
+/// pin (which flushes to a new cold snapshot, advancing the head) is hidden by
+/// the cold pin — the realistic, fully-closed isolation case.
+#[tokio::test]
+async fn first_touch_pins_at_post_flush_head() {
+    let (_sd, _wd, eng, _bg, _wal) = open_engine_with_shard().await;
+    let project = ProjectId::new();
+    let a = eng.open_session(project).await.unwrap();
+    let b = eng.open_session(project).await.unwrap();
+
+    seed(&a, "t", 40).await;
+    // B commits an UPDATE BEFORE A's tx begins — A must see this committed value.
+    b.execute("UPDATE t SET v = 111 WHERE id = 9").await.unwrap();
+    assert_eq!(point_v(&b, "t", 9).await, Some(111), "B sees its own update");
+
+    a.execute("BEGIN").await.unwrap();
+    // First touch pins at the current (post-flush) head — sees B's committed 111.
+    let v0 = point_v(&a, "t", 9).await;
+    assert_eq!(v0, Some(111), "first-touch sees pre-BEGIN committed value");
+
+    // B inserts a NEW row after A pinned, and reads it back (flushing the tail to
+    // a new cold snapshot that advances the head past A's pin).
+    b.execute("INSERT INTO t (id, v) VALUES (10001, 7)")
+        .await
+        .unwrap();
+    let _ = count(&b, "SELECT COUNT(*) FROM t").await;
+
+    // A's pinned read of the existing key stays stable, and B's new row is hidden.
+    assert_eq!(point_v(&a, "t", 9).await, Some(111), "pinned read stable across concurrent INSERT");
+    assert_eq!(point_v(&a, "t", 10001).await, None, "B's post-pin row hidden from A");
+
+    a.execute("COMMIT").await.unwrap();
+    assert_eq!(point_v(&a, "t", 10001).await, Some(7), "post-COMMIT sees B's row");
 }
 
 /// A concurrent INSERT (flushed to a new cold snapshot, advancing the head)

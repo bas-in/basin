@@ -188,7 +188,7 @@ index on either side:
 | Read-modify-write contention (8 sessions) | ~11 ms / op | RMW SET fast path |
 | Point query + FK hydrate (events ⋈ users) | ~2.8–4.6 ms | point-join fast path |
 | Keyset pagination (`WHERE id > … ORDER BY LIMIT`) | ~5–18 ms | one file open per write stripe (a deployment constant, not O(N)) |
-| `SELECT … FOR UPDATE` + UPDATE (one txn) | ~21 ms | the FOR-UPDATE-txn GAP did not reproduce in a faithful probe once in-tx reads were pinned |
+| `SELECT … FOR UPDATE` + UPDATE (one txn) | ~4.5 ms | first-touch reads pin-and-serve on the fast path; FOR UPDATE locks are advisory (optimistic concurrency) |
 
 Work-counter CI gates (`scale_invariants.rs`, `file_count_scaling.rs`,
 `1b76c7d`) assert these primitives do **bounded work** regardless of table size

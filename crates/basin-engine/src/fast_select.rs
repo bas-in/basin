@@ -535,11 +535,19 @@ pub(crate) fn match_simple_select(stmt: &Statement) -> Option<SimpleSelectPlan> 
 }
 
 fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
+    // `q.locks` (the `FOR UPDATE` / `FOR SHARE` / `FOR NO KEY UPDATE` /
+    // `FOR KEY SHARE` row-locking clause) is INTENTIONALLY allowed through: Basin
+    // is append-only / optimistic-concurrency, so row locks are advisory and have
+    // NO effect on the rows a SELECT returns (the executor's read path and the
+    // DataFusion path both ignore them — see `rewrite_for_no_key_update_and_key_share`).
+    // Admitting them lets the common `BEGIN; SELECT … FOR UPDATE; UPDATE; COMMIT`
+    // OLTP shape take the fast point-read path instead of paying full DataFusion
+    // on its single in-tx read. (`q.for_clause` — the unrelated `FOR XML/JSON`
+    // result-formatting clause — is still rejected below.)
     if q.with.is_some()
         || !q.ext_limit_by().is_empty()
         || q.ext_offset().is_some()
         || q.fetch.is_some()
-        || !q.locks.is_empty()
         || q.for_clause.is_some()
         || q.settings.is_some()
         || q.format_clause.is_some()
@@ -1421,6 +1429,38 @@ pub(crate) struct PinnedReadView {
     pub hot_watermark: u64,
 }
 
+/// The in-transaction read-view the executor gate hands the fast path.
+///
+/// The gate cannot itself CAPTURE a pin: capturing must happen at the SAME
+/// post-flush moment a DataFusion read (`load_table_for_read`) would capture
+/// it, and the gate runs BEFORE the fast path's own tail flush. So it passes a
+/// *request* and the fast path resolves it after flushing:
+///
+///   * [`PinnedReadRequest::AlreadyPinned`] — both halves were captured by an
+///     earlier read of this table; the gate PEEKED them (non-capturing) and the
+///     fast path reads AT them. This is the long-standing safe sub-case.
+///   * [`PinnedReadRequest::FirstTouch`] — this tx has NOT touched the table yet
+///     and no pin exists, but the table is otherwise eligible (no pending data
+///     files / HTAP batches / overlay). The fast path FLUSHES first, then
+///     CAPTURES both pins at the post-flush head via the SAME helpers
+///     `load_table_for_read` uses (`tx_read_snapshot_for` /
+///     `tx_hot_seq_watermark_for`), then serves at that just-captured pin.
+///
+/// Capture-ordering correctness (the historical leak was pinning BEFORE the
+/// flush): on `FirstTouch` the fast path pins the head AFTER its own
+/// `flush_to_parquet()`, exactly where `load_table_for_read` pins. The capture
+/// helpers are idempotent peek-or-insert, so if this read instead BAILS to
+/// DataFusion after (or before) capturing, DataFusion's `load_table_for_read`
+/// reads back the IDENTICAL pin (or captures the same head — the flush is also
+/// idempotent once the tail is drained). Either path yields the same read-view.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PinnedReadRequest {
+    /// Both pins already captured by an earlier read; read AT them.
+    AlreadyPinned(PinnedReadView),
+    /// First touch of this untouched table — flush, then capture-and-serve.
+    FirstTouch,
+}
+
 /// Run a recognised plan against the engine's storage layer (or, when wired
 /// up, the shard's [`ProjectHandle`]). Returns the merged result set ready to
 /// hand back to the caller.
@@ -1458,9 +1498,9 @@ pub(crate) async fn execute_simple_select_pinned(
     prefetched_meta: Option<TableMetadata>,
     raw_sql: &str,
     include_deleted: bool,
-    pinned: Option<PinnedReadView>,
+    request: Option<PinnedReadRequest>,
 ) -> Result<ExecResult> {
-    execute_simple_select_inner(sess, plan, prefetched_meta, raw_sql, include_deleted, pinned)
+    execute_simple_select_inner(sess, plan, prefetched_meta, raw_sql, include_deleted, request)
         .await
 }
 
@@ -1470,7 +1510,7 @@ async fn execute_simple_select_inner(
     prefetched_meta: Option<TableMetadata>,
     raw_sql: &str,
     include_deleted: bool,
-    pinned: Option<PinnedReadView>,
+    request: Option<PinnedReadRequest>,
 ) -> Result<ExecResult> {
     // Phase 5.16.A: fast path bypasses DataFusion (no LogicalPlan); shape
     // hash is computed on the DataFusion path (executor::exec_select).
@@ -1530,46 +1570,125 @@ async fn execute_simple_select_inner(
         }
     }
 
-    let meta = if let Some(shard) = sess.engine.config().shard.as_ref() {
-        shard.flush_to_parquet().await?;
-        // Reload after flush — the pre-fetched snapshot is now stale. Under a
-        // pin this reloads the HISTORICAL view (the flush advanced the head, but
-        // the pin protects the read).
-        match load_at_view(sess, &plan.table, pinned).await {
-            Ok(m) => m,
-            // Pinned snapshot no longer retained → degrade to the DataFusion
-            // path, which rewinds via `load_table_for_read`.
-            Err(BasinError::FeatureNotSupported(_)) if pinned.is_some() => {
-                return crate::executor::exec_select(sess, raw_sql, include_deleted, Some(raw_sql))
-                    .await;
+    // Capture BOTH halves of the read-view for an untouched, not-yet-pinned
+    // table at THIS moment (the caller has just flushed the shard tail / there
+    // is no shard, so `live_meta.current_snapshot` is the post-flush head). Uses
+    // the SAME peek-or-insert helpers `load_table_for_read` uses, at the SAME
+    // post-flush moment, so a subsequent DataFusion read of this table reads back
+    // the IDENTICAL pin. The hot watermark is captured FIRST (matching
+    // `load_table_for_read`'s ordering) so the two halves agree. `_for` is
+    // idempotent: if this read later bails to DataFusion, that path peeks back
+    // exactly what we pinned here.
+    fn capture_first_touch(
+        sess: &ProjectSession,
+        table: &TableName,
+        head: basin_catalog::SnapshotId,
+    ) -> PinnedReadView {
+        let current_hot_seq = sess.engine.memtable_registry().hot_tier_seq(&sess.project, table);
+        let hot_watermark = crate::session::tx_hot_seq_watermark_for(&sess.state, table, current_hot_seq)
+            .expect("FirstTouch implies an active transaction");
+        let snapshot = crate::session::tx_read_snapshot_for(&sess.state, table, head)
+            .expect("FirstTouch implies an active transaction");
+        PinnedReadView { snapshot, hot_watermark }
+    }
+
+    // Resolve the gate's read-view REQUEST into a concrete `Option<PinnedReadView>`,
+    // loading metadata at the resolved pin. `FirstTouch` must flush (shard) before
+    // it captures, so resolution happens per-branch alongside the flush.
+    let (meta, pinned): (TableMetadata, Option<PinnedReadView>) =
+        if let Some(shard) = sess.engine.config().shard.as_ref() {
+            shard.flush_to_parquet().await?;
+            match request {
+                // First touch of an untouched table: the flush above drained the
+                // tail and ADVANCED the head, so the live metadata IS the
+                // post-flush head. Capture both pins against it (post-flush, the
+                // same moment `load_table_for_read` would), then serve at that
+                // pin — `load_at_view(Some(pin))` loads the same head, trivially.
+                Some(PinnedReadRequest::FirstTouch) => {
+                    let live = sess
+                        .engine
+                        .config()
+                        .catalog
+                        .load_table(&sess.project, &plan.table)
+                        .await?;
+                    let pin = capture_first_touch(sess, &plan.table, live.current_snapshot);
+                    (live, Some(pin))
+                }
+                // Already pinned (or auto-commit): reload after flush. Under a pin
+                // this reloads the HISTORICAL view (the flush advanced the head,
+                // but the pin protects the read).
+                other => {
+                    let pin = match other {
+                        Some(PinnedReadRequest::AlreadyPinned(v)) => Some(v),
+                        _ => None,
+                    };
+                    let m = match load_at_view(sess, &plan.table, pin).await {
+                        Ok(m) => m,
+                        // Pinned snapshot no longer retained → degrade to the
+                        // DataFusion path, which rewinds via `load_table_for_read`.
+                        Err(BasinError::FeatureNotSupported(_)) if pin.is_some() => {
+                            return crate::executor::exec_select(
+                                sess,
+                                raw_sql,
+                                include_deleted,
+                                Some(raw_sql),
+                            )
+                            .await;
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    (m, pin)
+                }
             }
-            Err(e) => return Err(e),
-        }
-    } else if pinned.is_some() {
-        // No shard, but a pin is active: the pre-fetched metadata reflects the
-        // live head and must NOT be reused — load the historical view.
-        match load_at_view(sess, &plan.table, pinned).await {
-            Ok(m) => m,
-            Err(BasinError::FeatureNotSupported(_)) => {
-                return crate::executor::exec_select(sess, raw_sql, include_deleted, Some(raw_sql))
-                    .await;
+        } else {
+            // No shard: writes land directly in storage + catalog synchronously,
+            // so no flush is needed — capture / read against the current head.
+            match request {
+                Some(PinnedReadRequest::FirstTouch) => {
+                    let live = sess
+                        .engine
+                        .config()
+                        .catalog
+                        .load_table(&sess.project, &plan.table)
+                        .await?;
+                    let pin = capture_first_touch(sess, &plan.table, live.current_snapshot);
+                    (live, Some(pin))
+                }
+                Some(PinnedReadRequest::AlreadyPinned(v)) => {
+                    // A pin is active: the pre-fetched metadata reflects the live
+                    // head and must NOT be reused — load the historical view.
+                    let m = match load_at_view(sess, &plan.table, Some(v)).await {
+                        Ok(m) => m,
+                        Err(BasinError::FeatureNotSupported(_)) => {
+                            return crate::executor::exec_select(
+                                sess,
+                                raw_sql,
+                                include_deleted,
+                                Some(raw_sql),
+                            )
+                            .await;
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    (m, Some(v))
+                }
+                None => {
+                    // Auto-commit, no pin: use the pre-fetched metadata when
+                    // available (saves one catalog round-trip the gate paid).
+                    let m = match prefetched_meta {
+                        Some(m) => m,
+                        None => {
+                            sess.engine
+                                .config()
+                                .catalog
+                                .load_table(&sess.project, &plan.table)
+                                .await?
+                        }
+                    };
+                    (m, None)
+                }
             }
-            Err(e) => return Err(e),
-        }
-    } else {
-        // No shard, no pin: use the pre-fetched metadata when available (saves
-        // one catalog round-trip that the fast-path gate already paid).
-        match prefetched_meta {
-            Some(m) => m,
-            None => {
-                sess.engine
-                    .config()
-                    .catalog
-                    .load_table(&sess.project, &plan.table)
-                    .await?
-            }
-        }
-    };
+        };
 
     // Self-driving physical layout: observe non-PK Eq predicates and
     // auto-create a secondary index once a column crosses the threshold.

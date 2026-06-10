@@ -2673,29 +2673,35 @@ async fn dispatch_parsed_statement(
                     //       empty in-tx UPDATE/DELETE overlay — so there are no
                     //       uncommitted local writes the fast path would miss
                     //       (read-your-own-writes), and no savepoint hazard;
-                    //   (b) a read snapshot is ALREADY pinned for the table
-                    //       (`tx_read_snapshot_peek`) — we never CAPTURE at the
-                    //       gate (capturing pre-flush would pin a head older than
-                    //       the read's actual view; the prior leak's root). No
-                    //       pin yet → bail to DataFusion, which pins via
-                    //       `load_table_for_read` after its own flush; the next
-                    //       read of the same table may then go fast; and
-                    //   (c) a hot-seq watermark is ALSO pinned
-                    //       (`tx_hot_seq_watermark_peek`) — the hot half of the
-                    //       read-view, threaded into the memtable probes so a
+                    //   (b) EITHER a read snapshot is ALREADY pinned for the
+                    //       table (`tx_read_snapshot_peek`) — read AT it
+                    //       (`AlreadyPinned`) — OR this is the table's FIRST
+                    //       TOUCH (no pin yet) and (a) holds, in which case the
+                    //       fast path itself flushes-then-pins-and-serves
+                    //       (`FirstTouch`). The gate STILL never captures: it
+                    //       only PEEKS here (capturing pre-flush would pin a head
+                    //       older than the read's actual view — the prior leak's
+                    //       root). The flush-then-capture happens inside
+                    //       `execute_simple_select_inner` at the SAME post-flush
+                    //       moment `load_table_for_read` captures, so if the read
+                    //       instead bails to DataFusion it pins identically (the
+                    //       `_for` helpers are idempotent peek-or-insert); and
+                    //   (c) a hot-seq watermark is captured ALONGSIDE the cold
+                    //       snapshot (`AlreadyPinned` carries the peeked one;
+                    //       `FirstTouch` captures it post-flush) — the hot half of
+                    //       the read-view, threaded into the memtable probes so a
                     //       concurrent session's later UPDATE/DELETE overlay
                     //       (seq > watermark) is filtered out.
                     //
-                    // When admitted we pass `(pinned_snapshot, hot_watermark)`
-                    // into `execute_simple_select`, which (1) loads metadata via
-                    // `load_table_at_snapshot(pinned)` instead of the live head
-                    // (FeatureNotSupported → bails to DataFusion), (2) filters
-                    // hot-tier probes by the watermark, (3) bypasses the PK row
-                    // cache (epoch/snapshot-keyed for current semantics), and
-                    // (4) reloads at the pin (not the new head) after any tail
-                    // flush. Any piece that cannot honour the pin Ok-falls back
-                    // to DataFusion. Conservative by default.
-                    let in_tx_pin: Option<crate::fast_select::PinnedReadView> = if in_txn {
+                    // When admitted we pass a `PinnedReadRequest` into
+                    // `execute_simple_select`, which (1) loads metadata at the
+                    // pin via `load_table_at_snapshot` (FeatureNotSupported →
+                    // bails to DataFusion), (2) filters hot-tier probes by the
+                    // watermark, (3) bypasses the PK row cache (epoch/snapshot-
+                    // keyed for current semantics), and (4) reloads at the pin
+                    // (not the new head) after any tail flush. Any piece that
+                    // cannot honour the pin Ok-falls back to DataFusion.
+                    let in_tx_request: Option<crate::fast_select::PinnedReadRequest> = if in_txn {
                         let table = &plan.table;
                         let untouched =
                             crate::session::tx_pending_files_for(&sess.state, table).is_empty()
@@ -2708,21 +2714,33 @@ async fn dispatch_parsed_statement(
                             crate::session::tx_hot_seq_watermark_peek(&sess.state, table),
                         ) {
                             (true, Some(snapshot), Some(hot_watermark)) => {
-                                Some(crate::fast_select::PinnedReadView {
-                                    snapshot,
-                                    hot_watermark,
-                                })
+                                Some(crate::fast_select::PinnedReadRequest::AlreadyPinned(
+                                    crate::fast_select::PinnedReadView {
+                                        snapshot,
+                                        hot_watermark,
+                                    },
+                                ))
                             }
-                            // Touched table, no pin yet, or no watermark yet →
-                            // route to DataFusion (it pins + rewinds correctly).
+                            // Untouched but not yet pinned: first touch of this
+                            // table. The fast path flushes, then captures both
+                            // pins at the post-flush head and serves at that pin.
+                            (true, None, None) => {
+                                Some(crate::fast_select::PinnedReadRequest::FirstTouch)
+                            }
+                            // Touched table (uncommitted local writes / savepoint
+                            // hazard), or a partially-pinned state (one half
+                            // present, the other not — should not happen since
+                            // both are captured together, but conservatively
+                            // route to DataFusion which re-pins coherently).
                             _ => None,
                         }
                     } else {
                         None
                     };
                     // Outside a tx the fast path always runs; inside a tx it runs
-                    // ONLY with a pinned read-view (the safe sub-case above).
-                    let in_tx_fast_ok = !in_txn || in_tx_pin.is_some();
+                    // ONLY with a pinned read-view request (the safe sub-case
+                    // above — already-pinned or untouched-first-touch).
+                    let in_tx_fast_ok = !in_txn || in_tx_request.is_some();
                     if !is_view
                         && !has_rls
                         && !has_soft_delete
@@ -2736,7 +2754,7 @@ async fn dispatch_parsed_statement(
                             table_meta,
                             raw_sql,
                             include_deleted,
-                            in_tx_pin,
+                            in_tx_request,
                         )
                         .await;
                     }
