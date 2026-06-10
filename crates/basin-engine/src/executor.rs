@@ -2362,7 +2362,7 @@ async fn dispatch_parsed_statement(
             // failures here (e.g. non-timestamp columns, subquery inserts) are
             // silently ignored so the normal INSERT still proceeds.
             let _ = touch_hypertable_chunks_from_insert(sess, &ins, raw_sql).await;
-            exec_insert(sess, ins).await
+            exec_insert(sess, ins, Some(raw_sql)).await
         }
         Statement::Query(ref query) => {
             // ── Data-modifying CTE intercept ─────────────────────────────────
@@ -4822,7 +4822,11 @@ async fn exec_drop_index(
     })
 }
 
-async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Result<ExecResult> {
+async fn exec_insert(
+    sess: &ProjectSession,
+    ins: sqlparser::ast::Insert,
+    raw_sql: Option<&str>,
+) -> Result<ExecResult> {
     let name = single_part_name(crate::pg_ast::insert_object_name(&ins)?)?;
     let table = TableName::new(name)?;
 
@@ -4881,81 +4885,114 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
     // is take-once: a stale value from a prior statement on this
     // session can't leak into the next INSERT.
     let overriding = crate::session::take_pending_overriding(&sess.state);
+
+    // ── Literal-VALUES fast scanner (values_fast) ───────────────────────────
+    // For a plain multi-row literal `INSERT ... VALUES (...), (...)` with no
+    // ON CONFLICT, no OVERRIDING clause, and a non-partitioned target, try to
+    // hand-tokenize the raw VALUES tail straight into an Arrow batch, skipping
+    // the sqlparser-AST round-trip (`expand_insert_rows` → `batch_from_rows`).
+    //
+    // `try_fast_insert` is conservative: it returns `None` (→ slow path) unless
+    // its own gates guarantee the resulting batch is byte-identical to what the
+    // slow path would build. Those gates also guarantee the row-prep section
+    // below would be a *no-op* on this statement — no identity/generated/
+    // default-bearing omitted columns to fill, no ON CONFLICT DO-NOTHING filter
+    // (excluded here), and (checked here) not a RangeMonthly partition — so we
+    // skip the entire row-prep block when the scanner succeeds and feed the
+    // batch directly into the constraint/write seam below.
+    let fast_batch: Option<RecordBatch> = if ins.on.is_none()
+        && overriding.is_none()
+        && !matches!(meta.partition_spec, PartitionSpec::RangeMonthly { .. })
+    {
+        raw_sql
+            .and_then(|raw| {
+                crate::values_fast::try_fast_insert(raw, schema.as_ref(), &ins.columns)
+            })
+            .and_then(|batches| {
+                arrow::compute::concat_batches(&schema, batches.iter()).ok()
+            })
+    } else {
+        None
+    };
+
     // Enforce IDENTITY semantics on the user-written column list
     // *before* we expand to full-width rows. ALWAYS columns reject
     // user-supplied values unless `OVERRIDING SYSTEM VALUE` is set;
     // BY DEFAULT columns accept them unconditionally (and the
     // `OVERRIDING USER VALUE` clause forces them back to nextval —
     // handled in `apply_identity_columns` below).
-    enforce_identity_insert_columns(schema.as_ref(), &ins.columns, overriding)?;
-    // Reject direct writes to generated columns + expand `INSERT INTO t
-    // (col_subset) VALUES ...` into full schema-width rows with NULL in
-    // unmentioned columns. Generated columns are NULL'd here too;
-    // `materialise_generated_columns` overwrites them once the per-row
-    // batch is built.
-    let mut rows_expanded = expand_insert_rows(schema.as_ref(), &ins.columns, rows_raw)?;
-    // Fill IDENTITY columns. Three cases:
-    //   * User omitted the column      → fill from nextval.
-    //   * Column is BY DEFAULT and
-    //     OVERRIDING USER VALUE is set → discard user literal, fill
-    //                                    from nextval.
-    //   * Otherwise (column supplied,
-    //     no OVERRIDING USER VALUE,
-    //     ALWAYS already gated above)  → leave the user's value.
-    apply_identity_columns(
-        sess,
-        schema.as_ref(),
-        &ins.columns,
-        overriding,
-        &mut rows_expanded,
-    )
-    .await?;
-    // Substitute column-level DEFAULT expressions for omitted columns.
-    // For columns with `BASIN_COLUMN_DEFAULT` metadata that the user did
-    // not explicitly write, evaluate the default text (which routes any
-    // `nextval(...)` calls through `Catalog::nextval` so each row gets a
-    // distinct value) and overwrite the NULL placeholder produced by
-    // `expand_insert_rows`. User-written NULL is preserved.
-    apply_column_defaults(sess, schema.as_ref(), &ins.columns, &mut rows_expanded).await?;
+    let mut rows_expanded: Vec<Vec<sqlparser::ast::Expr>> = Vec::new();
+    if fast_batch.is_none() {
+        enforce_identity_insert_columns(schema.as_ref(), &ins.columns, overriding)?;
+        // Reject direct writes to generated columns + expand `INSERT INTO t
+        // (col_subset) VALUES ...` into full schema-width rows with NULL in
+        // unmentioned columns. Generated columns are NULL'd here too;
+        // `materialise_generated_columns` overwrites them once the per-row
+        // batch is built.
+        rows_expanded = expand_insert_rows(schema.as_ref(), &ins.columns, rows_raw)?;
+        // Fill IDENTITY columns. Three cases:
+        //   * User omitted the column      → fill from nextval.
+        //   * Column is BY DEFAULT and
+        //     OVERRIDING USER VALUE is set → discard user literal, fill
+        //                                    from nextval.
+        //   * Otherwise (column supplied,
+        //     no OVERRIDING USER VALUE,
+        //     ALWAYS already gated above)  → leave the user's value.
+        apply_identity_columns(
+            sess,
+            schema.as_ref(),
+            &ins.columns,
+            overriding,
+            &mut rows_expanded,
+        )
+        .await?;
+        // Substitute column-level DEFAULT expressions for omitted columns.
+        // For columns with `BASIN_COLUMN_DEFAULT` metadata that the user did
+        // not explicitly write, evaluate the default text (which routes any
+        // `nextval(...)` calls through `Catalog::nextval` so each row gets a
+        // distinct value) and overwrite the NULL placeholder produced by
+        // `expand_insert_rows`. User-written NULL is preserved.
+        apply_column_defaults(sess, schema.as_ref(), &ins.columns, &mut rows_expanded).await?;
 
-    // --- ON CONFLICT DO NOTHING filter ----------------------------------------
-    // If the statement specifies ON CONFLICT (cols) DO NOTHING, proactively
-    // remove any proposed rows that would conflict with existing rows (or with
-    // earlier rows in the same batch). This must happen *before* the unique /
-    // PK constraint checks so those checks never see the skipped rows.
-    if let Some(OnInsert::OnConflict(ref on_conflict)) = ins.on {
-        if let OnConflictAction::DoNothing = &on_conflict.action {
-            // WHERE clause form with conflict predicate is deferred.
-            if on_conflict
-                .conflict_target
-                .as_ref()
-                .map(|t| matches!(t, ConflictTarget::OnConstraint(_)))
-                .unwrap_or(false)
-            {
-                // ON CONFLICT ON CONSTRAINT <name> DO NOTHING — not yet
-                // implemented; reject cleanly rather than guessing.
-                return Err(BasinError::FeatureNotSupported(
-                    "ON CONFLICT ON CONSTRAINT DO NOTHING is not yet supported; \
-                     use ON CONFLICT (col, ...) DO NOTHING"
-                        .into(),
-                ));
+        // --- ON CONFLICT DO NOTHING filter ------------------------------------
+        // If the statement specifies ON CONFLICT (cols) DO NOTHING, proactively
+        // remove any proposed rows that would conflict with existing rows (or with
+        // earlier rows in the same batch). This must happen *before* the unique /
+        // PK constraint checks so those checks never see the skipped rows.
+        if let Some(OnInsert::OnConflict(ref on_conflict)) = ins.on {
+            if let OnConflictAction::DoNothing = &on_conflict.action {
+                // WHERE clause form with conflict predicate is deferred.
+                if on_conflict
+                    .conflict_target
+                    .as_ref()
+                    .map(|t| matches!(t, ConflictTarget::OnConstraint(_)))
+                    .unwrap_or(false)
+                {
+                    // ON CONFLICT ON CONSTRAINT <name> DO NOTHING — not yet
+                    // implemented; reject cleanly rather than guessing.
+                    return Err(BasinError::FeatureNotSupported(
+                        "ON CONFLICT ON CONSTRAINT DO NOTHING is not yet supported; \
+                         use ON CONFLICT (col, ...) DO NOTHING"
+                            .into(),
+                    ));
+                }
+                rows_expanded = filter_rows_do_nothing(
+                    sess,
+                    &table,
+                    schema.as_ref(),
+                    &meta,
+                    &on_conflict.conflict_target,
+                    rows_expanded,
+                )
+                .await?;
+                if rows_expanded.is_empty() {
+                    return Ok(ExecResult::Empty {
+                        tag: "INSERT 0 0".into(),
+                    });
+                }
+                // Update the row count to reflect only the non-conflicting rows.
+                row_count = rows_expanded.len();
             }
-            rows_expanded = filter_rows_do_nothing(
-                sess,
-                &table,
-                schema.as_ref(),
-                &meta,
-                &on_conflict.conflict_target,
-                rows_expanded,
-            )
-            .await?;
-            if rows_expanded.is_empty() {
-                return Ok(ExecResult::Empty {
-                    tag: "INSERT 0 0".into(),
-                });
-            }
-            // Update the row count to reflect only the non-conflicting rows.
-            row_count = rows_expanded.len();
         }
     }
 
@@ -5095,7 +5132,14 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
         });
     }
 
-    let batch = batch_from_rows(schema, rows)?;
+    // Seam shared by both the literal-VALUES fast path and the slow
+    // AST→Arrow path. Everything below (generated columns, constraints,
+    // write, audit, RETURNING) runs identically regardless of which arm
+    // produced `batch`.
+    let batch = match fast_batch {
+        Some(b) => b,
+        None => batch_from_rows(schema, rows)?,
+    };
     let batch = crate::generated_cols::materialise_generated_columns(
         &sess.engine.config().catalog,
         &sess.project,
@@ -5132,6 +5176,29 @@ async fn exec_insert(sess: &ProjectSession, ins: sqlparser::ast::Insert) -> Resu
         &batch,
     )
     .await?;
+    // FK enforcement reads the referenced (parent) tables' COLD files only
+    // (`collect_pk_tuples`). On a shard-backed engine an auto-commit INSERT
+    // lands in the shard's TAIL, not in cold Parquet, so a just-inserted parent
+    // row would be invisible to the FK scan of a child INSERT issued before any
+    // flush (read-your-writes break — `delete_features` CASCADE setup inserts
+    // parent then child with no intervening flush). Drain the tail of each
+    // referenced table that still has a resident tail so the FK scan sees a
+    // consistent cold base. `has_pending_tail` is an O(1) resident-map probe, so
+    // the common no-tail / no-FK case pays nothing.
+    if !meta.foreign_keys.is_empty() {
+        if let Some(shard) = sess.engine.config().shard.as_ref() {
+            if !crate::session::tx_is_active(&sess.state) {
+                for fk in &meta.foreign_keys {
+                    if let Ok(ref_table) = TableName::new(fk.ref_table.clone()) {
+                        if shard.has_pending_tail(&sess.project, &ref_table).await {
+                            shard.flush_to_parquet().await?;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
     crate::constraints::enforce_fk_on_insert(
         &sess.engine.config().catalog,
         &sess.engine.config().storage,
@@ -5825,6 +5892,29 @@ async fn exec_insert_default_values(
         &batch,
     )
     .await?;
+    // FK enforcement reads the referenced (parent) tables' COLD files only
+    // (`collect_pk_tuples`). On a shard-backed engine an auto-commit INSERT
+    // lands in the shard's TAIL, not in cold Parquet, so a just-inserted parent
+    // row would be invisible to the FK scan of a child INSERT issued before any
+    // flush (read-your-writes break — `delete_features` CASCADE setup inserts
+    // parent then child with no intervening flush). Drain the tail of each
+    // referenced table that still has a resident tail so the FK scan sees a
+    // consistent cold base. `has_pending_tail` is an O(1) resident-map probe, so
+    // the common no-tail / no-FK case pays nothing.
+    if !meta.foreign_keys.is_empty() {
+        if let Some(shard) = sess.engine.config().shard.as_ref() {
+            if !crate::session::tx_is_active(&sess.state) {
+                for fk in &meta.foreign_keys {
+                    if let Ok(ref_table) = TableName::new(fk.ref_table.clone()) {
+                        if shard.has_pending_tail(&sess.project, &ref_table).await {
+                            shard.flush_to_parquet().await?;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
     crate::constraints::enforce_fk_on_insert(
         &sess.engine.config().catalog,
         &sess.engine.config().storage,
@@ -9263,7 +9353,7 @@ async fn exec_recursive_with_dml_body(
                 ));
             }
 
-            exec_insert(sess, ins).await
+            exec_insert(sess, ins, None).await
         }
         SetExpr::Update(Statement::Update(upd)) => {
             exec_recursive_with_update(sess, with, upd).await
@@ -9478,7 +9568,7 @@ async fn exec_dml_cte_query(
                         WildcardAdditionalOptions::default(),
                     )]);
                 }
-                let result = exec_insert(sess, ins).await?;
+                let result = exec_insert(sess, ins, None).await?;
                 let (schema, batches) =
                     dml_cte_extract_rows(result, user_had_returning, &cte_name)?;
                 register_dml_cte_memtable(sess, &cte_name, schema, batches, &mut registered)?;

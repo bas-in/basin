@@ -1305,6 +1305,7 @@ mod datetime_more_udf;
 mod ddl;
 mod dml;
 mod dml_mutate;
+mod values_fast;
 mod enum_ordinal;
 mod events;
 mod executor;
