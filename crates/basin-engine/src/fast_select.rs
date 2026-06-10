@@ -1484,6 +1484,15 @@ pub(crate) async fn execute_simple_select(
         // common-case-fast / rare-case-correct split: a freshly-written table
         // pays the DataFusion cost until its tail drains, then the fast path
         // engages.
+        // NOTE: this `fast_select` shadow path reads the shadow column
+        // PHYSICALLY from cold files only — it does NOT apply hot-tier
+        // UPDATE/DELETE overlays or include hot INSERTs (unlike the DataFusion
+        // `HtapUnionTable` path). So ANY live memtable entry must force a
+        // fallback here, even one that carries the shadow column: an updated PK
+        // would otherwise read its STALE cold shadow value. (The DataFusion
+        // rewrite in `rewrite_promoted_cols_for_query` CAN safely engage on a
+        // shadow-clean memtable because it merges hot+cold; this stricter path
+        // cannot.) Keep the blanket "any live entry" reject.
         let memtable_has_entries = sess
             .engine
             .memtable_registry()
