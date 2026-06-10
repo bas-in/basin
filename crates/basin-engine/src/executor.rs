@@ -838,9 +838,38 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                     // Capture tx_id *before* tx_commit() clears TxState.
                     let commit_tx_id = crate::session::tx_get_id(&sess.state);
                     let htap_rows = crate::session::tx_htap_take_all(&sess.state);
+                    // Drain the in-tx hot-tier UPDATE/DELETE overlay (the
+                    // OLTP-in-tx fast path). Each entry is written into the
+                    // shared MemTableRegistry below — exactly mirroring what the
+                    // auto-commit fast path writes (registry-only; durability
+                    // comes from the registry's own flush/compaction, NOT the
+                    // WAL — the auto-commit `hot_tier_update_by_pk` /
+                    // `hot_tier_delete_by_pk` do not WAL-log either, so we add
+                    // no extra WAL records here beyond the existing TxCommit
+                    // marker emitted below).
+                    let tx_overlay = crate::session::tx_overlay_take_all(&sess.state);
 
                     // Promote committed HTAP batches to the process-wide registry.
                     htap_promote_to_registry(sess, &htap_rows).await?;
+
+                    // Drain the tx overlay into the shared registry. This runs
+                    // BEFORE `tx_commit` (which clears TxState) and BEFORE the
+                    // pending-file catalog commit below, so the override/tombstone
+                    // becomes visible to other sessions at the same moment the
+                    // committed cold files do. Crash window vs the pending-file
+                    // catalog commit: identical to htap_promote_to_registry's
+                    // (registry writes are not transactional with the catalog) —
+                    // we match the existing pattern, no stronger guarantee.
+                    if !tx_overlay.is_empty() {
+                        let registry = sess.engine.memtable_registry();
+                        for (table, entries) in &tx_overlay {
+                            let entry =
+                                registry.get_or_create(sess.project, table.clone());
+                            for (key, value) in entries {
+                                entry.memtable.insert(key.clone(), value.clone());
+                            }
+                        }
+                    }
 
                     // perf-w7-txn: write buffered INSERT batches to ONE Parquet
                     // file per table.  Replaces the old per-INSERT writes that

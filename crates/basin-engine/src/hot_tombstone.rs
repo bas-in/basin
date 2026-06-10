@@ -123,6 +123,44 @@ pub(crate) fn snapshot_updates(
     out
 }
 
+/// Merge a transaction-scoped overlay map (encoded PK → `Update`/`Tombstone`)
+/// ON TOP of the shared-registry snapshot pair `(tombstones, updates)` so the
+/// owning transaction's own uncommitted single-row PK UPDATE/DELETE fast-path
+/// writes win over both the shared registry and the cold tier.
+///
+/// Precedence per PK (highest first): tx overlay > shared registry > cold.
+/// For each tx-overlay entry:
+///   * `Tombstone` → insert the key into `tombstones`, remove any shared
+///     `updates` override for that key (a tombstone hides it).
+///   * `Update`    → decode the post-image row and insert into `updates`,
+///     remove the key from `tombstones` (the override resurrects/replaces it).
+///
+/// `tx_overlay` is empty (the no-tx / no-in-tx-fast-path case) → both maps are
+/// returned unchanged, so the steady-state read path pays nothing.
+pub(crate) fn merge_tx_overlay(
+    tombstones: &mut HashSet<Vec<u8>>,
+    updates: &mut std::collections::HashMap<Vec<u8>, RecordBatch>,
+    tx_overlay: &std::collections::BTreeMap<RowKey, MemRowValue>,
+) {
+    for (key, value) in tx_overlay {
+        let kb = key.as_bytes().to_vec();
+        match value {
+            MemRowValue::Tombstone => {
+                updates.remove(&kb);
+                tombstones.insert(kb);
+            }
+            MemRowValue::Update { bytes, .. } | MemRowValue::Row { bytes, .. } => {
+                if let Some(rb) = decode_ipc_row(bytes) {
+                    if rb.num_rows() > 0 {
+                        tombstones.remove(&kb);
+                        updates.insert(kb, rb);
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ── Array → RowKey encoder ───────────────────────────────────────────────────
 
 /// Encode the single value at `row_idx` in `array` (whose declared logical

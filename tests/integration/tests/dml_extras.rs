@@ -454,10 +454,10 @@ async fn fast_path_skipped_inside_explicit_transaction() {
         .unwrap();
     sess.execute("COMMIT").await.unwrap();
 
-    // No tombstones must have been written to the registry — the gate
-    // intercepted the fast path BEFORE any registry write. The slow
-    // CoW path may or may not have committed (separate concern), but
-    // the registry's tombstone count for pk_tx must be zero.
+    // In-tx fast-path DML writes to the TX-SCOPED overlay and drains it
+    // into the shared registry at COMMIT — so post-commit the registry
+    // holds the tombstones and the rows are gone. (Pre-overlay this test
+    // asserted zero tombstones because the fast path was disabled in-tx.)
     let registry = eng.memtable_registry();
     let table = basin_common::TableName::new("pk_tx").unwrap();
     let tomb_count = registry
@@ -471,10 +471,21 @@ async fn fast_path_skipped_inside_explicit_transaction() {
         })
         .unwrap_or(0);
     assert_eq!(
-        tomb_count, 0,
-        "fast path must NOT fire inside an explicit transaction; \
-         found {tomb_count} tombstone(s) in the registry"
+        tomb_count, 2,
+        "COMMIT must drain the tx overlay's tombstones into the registry"
     );
+    let left = match sess.execute("SELECT COUNT(*) FROM pk_tx").await.unwrap() {
+        ExecResult::Rows { batches, .. } => batches
+            .iter()
+            .flat_map(|b| {
+                let a = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                (0..a.len()).map(move |i| a.value(i))
+            })
+            .next()
+            .unwrap_or(-1),
+        _ => -1,
+    };
+    assert_eq!(left, 0, "both rows must be deleted after COMMIT");
 }
 
 /// Compare DELETE-WHERE-IN latency: fast path (single PK, env var ON)

@@ -603,6 +603,43 @@ pub(crate) fn hottier_fastpath_enabled(per_shape_key: &str) -> bool {
     }
 }
 
+/// Decide whether the in-transaction hot-tier UPDATE/DELETE fast path is
+/// eligible for `table` in the current transaction.
+///
+/// Conservative gates (all must hold; any failure routes the statement to the
+/// cold copy-on-write path, which is the correctness oracle):
+///   * **No savepoint active.** `TxState::tx_overlay` cannot be rewound to a
+///     savepoint watermark (RMW overwrites keys, so there is no length-based
+///     snapshot like `pending_files`/`htap_rows`), so the overlay would not
+///     honour `ROLLBACK TO SAVEPOINT`. See `tx_overlay_fastpath_blocked`.
+///   * **No pending (cold-path) files for this table this tx.** A multi-row /
+///     cold-path UPDATE/DELETE earlier in the same tx staged a rewritten file
+///     in `pending_files`; the overlay's read-before-write does NOT consult
+///     those pending files, so mixing the two on one table could read a stale
+///     pre-image. Bail to cold for a consistent single materialisation.
+///   * **No tx-buffered INSERT batches for this table this tx.** An in-tx
+///     INSERT lands in `htap_rows` (not the shared memtable or cold tier), so
+///     the overlay's read-before-write would not see a just-inserted row.
+///     Bail so a same-tx INSERT-then-UPDATE/DELETE stays correct on the cold
+///     path (which merges the htap tail).
+///
+/// Caller must already have checked `tx_is_active`.
+pub(crate) fn tx_fastpath_eligible_for_table(
+    sess: &ProjectSession,
+    table: &TableName,
+) -> bool {
+    if crate::session::tx_overlay_fastpath_blocked(&sess.state) {
+        return false;
+    }
+    if !crate::session::tx_pending_files_for(&sess.state, table).is_empty() {
+        return false;
+    }
+    if !crate::session::tx_htap_batches_for(&sess.state, table).is_empty() {
+        return false;
+    }
+    true
+}
+
 /// when the column type is Int32), `UInt64`, `Utf8`, `Boolean`. Anything
 /// else returns `None` and the caller falls back to the slow path.
 pub(crate) fn pk_scalar_to_row_key(
@@ -679,10 +716,20 @@ async fn try_resolve_fast_path_pks(
     if !crate::dml_mutate::hottier_fastpath_enabled("BASIN_HOTTIER_DELETE_FASTPATH") {
         return Ok(None);
     }
-    // Gate: explicit transaction → fall through. Tombstones written to the
-    // shared registry can't be rolled back.
+    // Gate: explicit transaction.
+    //
+    // Auto-commit (`tx_is_active == false`): the fast path writes tombstones
+    // straight to the shared `MemTableRegistry` (durable, no rollback needed).
+    //
+    // In-transaction (`tx_is_active == true`): we route to the tx-overlay
+    // variant (`hot_tier_delete_by_pk_tx`) which writes to `TxState::tx_overlay`
+    // instead, so ROLLBACK can drop it. But only when the in-tx fast path is
+    // eligible — see `tx_fastpath_eligible_for_table`: savepoint-free AND no
+    // multi-row / cold-path mutation already staged for this table this tx.
     if crate::session::tx_is_active(&sess.state) {
-        return Ok(None);
+        if !tx_fastpath_eligible_for_table(sess, table) {
+            return Ok(None);
+        }
     }
     // Gate: RETURNING needs the deleted row's content; fast path discards it.
     if returning.is_some() {
@@ -805,6 +852,33 @@ fn hot_tier_delete_by_pk(
     count
 }
 
+/// In-transaction variant of [`hot_tier_delete_by_pk`]: write tombstones into
+/// this session's `TxState::tx_overlay` instead of the process-wide
+/// `MemTableRegistry`, so ROLLBACK can drop them. On COMMIT the executor drains
+/// the overlay into the shared registry (`tx_overlay_take_all` →
+/// `entry.memtable.insert`), exactly mirroring the durability of the auto-commit
+/// path (which is also registry-only — no WAL).
+///
+/// Affected-row semantics match the auto-commit path: we report the number of
+/// PKs requested (a PK that matches no live row still contributes to the tag,
+/// exactly as `hot_tier_delete_by_pk` does — see its doc-comment).
+fn hot_tier_delete_by_pk_tx(
+    sess: &ProjectSession,
+    table: &TableName,
+    keys: Vec<basin_hottier::RowKey>,
+) -> usize {
+    let count = keys.len();
+    for key in keys {
+        crate::session::tx_overlay_put(
+            &sess.state,
+            table,
+            key,
+            basin_hottier::MemRowValue::Tombstone,
+        );
+    }
+    count
+}
+
 pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result<ExecResult> {
     let table = single_table_from_delete(&delete)?;
     // Resolve any IN (SELECT …) subqueries in the WHERE clause to literal
@@ -895,7 +969,14 @@ pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result
     )
     .await?
     {
-        let n = hot_tier_delete_by_pk(sess, &table, pk_keys);
+        // In-tx → write to the tx overlay (rollback-able); auto-commit → write
+        // to the shared registry. The gate (`try_resolve_fast_path_pks`) only
+        // admits the in-tx case when `tx_fastpath_eligible_for_table` held.
+        let n = if crate::session::tx_is_active(&sess.state) {
+            hot_tier_delete_by_pk_tx(sess, &table, pk_keys)
+        } else {
+            hot_tier_delete_by_pk(sess, &table, pk_keys)
+        };
         // Empty IN-list / zero-row matches still return DELETE 0.
         if n == 0 {
             return Ok(empty_or_returning(
@@ -1518,9 +1599,18 @@ async fn try_resolve_fast_path_update(
     if !crate::dml_mutate::hottier_fastpath_enabled("BASIN_HOTTIER_UPDATE_FASTPATH") {
         return Ok(None);
     }
-    // Gate: explicit transaction → fall through (no rollback for shared registry).
+    // Gate: explicit transaction.
+    //
+    // Auto-commit: `hot_tier_update_by_pk(tx_mode=false)` writes the `Update`
+    // override straight to the shared `MemTableRegistry`. In-transaction:
+    // `hot_tier_update_by_pk(tx_mode=true)` writes it to `TxState::tx_overlay`
+    // so ROLLBACK can drop it — but only when the in-tx fast path is eligible
+    // for this table (no savepoint, no prior multi-row / cold-path mutation
+    // staged this tx). See `tx_fastpath_eligible_for_table`.
     if crate::session::tx_is_active(&sess.state) {
-        return Ok(None);
+        if !tx_fastpath_eligible_for_table(sess, table) {
+            return Ok(None);
+        }
     }
     // Gate: RETURNING with non-trivial expressions (anything beyond plain
     // column references and `*`) cannot be projected from the post-image
@@ -1670,9 +1760,18 @@ async fn try_resolve_fast_path_update(
 }
 
 /// Execute the resolved hot-tier UPDATE: for each matched PK read the current
-/// row image (memtable override first, else cold-tier), apply the scalar
-/// assignments, and write a `MemRowValue::Update` keyed by the encoded PK.
-/// Returns `(updated_count, returning_batches)`.
+/// row image (tx overlay first when in a tx, then memtable override, else
+/// cold-tier), apply the scalar assignments, and write a `MemRowValue::Update`
+/// keyed by the encoded PK. Returns `(updated_count, returning_batches)`.
+///
+/// `tx_mode`:
+///   * `false` (auto-commit) — read precedence is shared memtable > PK cache >
+///     cold; the post-image override is written to the shared `MemTableRegistry`.
+///   * `true` (in an explicit tx, eligibility already checked by
+///     `tx_fastpath_eligible_for_table`) — read precedence prepends this
+///     session's `TxState::tx_overlay` (so repeated RMW within the tx
+///     accumulates: `UPDATE v=v+1` twice → +2), and the post-image override is
+///     written to `tx_overlay` (rollback-able) instead of the shared registry.
 ///
 /// When `returning` is `Some(items)` (pre-validated by
 /// `returning_is_fast_path_eligible`), `returning_batches` contains the
@@ -1690,6 +1789,7 @@ async fn hot_tier_update_by_pk(
     keys: &[basin_hottier::RowKey],
     assignments: &[(usize, AssignmentRhs)],
     returning: Option<&[sqlparser::ast::SelectItem]>,
+    tx_mode: bool,
 ) -> Result<(usize, Vec<RecordBatch>)> {
     use std::collections::HashMap;
     let schema = meta.schema.clone();
@@ -1734,15 +1834,42 @@ async fn hot_tier_update_by_pk(
     let want: std::collections::HashSet<Vec<u8>> =
         keys.iter().map(|k| k.as_bytes().to_vec()).collect();
 
-    // 1. Gather current row images keyed by PK bytes. Memtable first (a prior
-    //    fast-path Update/Insert wins over cold for the same PK), then cold for
-    //    any PK not yet present in the memtable.
+    // 1. Gather current row images keyed by PK bytes. Read precedence:
+    //    tx overlay (in-tx only) > shared memtable > [PK cache > cold below].
+    //    A higher-precedence hit for a PK wins; lower tiers only fill PKs not
+    //    yet present. This is what makes in-tx RMW accumulate: a prior
+    //    `UPDATE v=v+1` wrote an override into `tx_overlay`, and this read sees
+    //    it (not the stale cold base) so the second `+1` lands on v+1 → v+2.
     let mut current: HashMap<Vec<u8>, RecordBatch> = HashMap::new();
+    // 1a. Tx overlay (highest precedence) — only when running inside a tx.
+    if tx_mode {
+        for key in keys {
+            let kb = key.as_bytes().to_vec();
+            let Some(v) = crate::session::tx_overlay_get(&sess.state, table, key) else {
+                continue;
+            };
+            match v {
+                basin_hottier::MemRowValue::Row { bytes, .. }
+                | basin_hottier::MemRowValue::Update { bytes, .. } => {
+                    if let Some(rb) = decode_ipc_single_row(&bytes) {
+                        current.insert(kb, reattach_catalog_metadata(schema.as_ref(), rb)?);
+                    }
+                }
+                // Tombstoned earlier in this tx → present-but-dead sentinel so
+                // the lower tiers skip it and the UPDATE does not resurrect it.
+                basin_hottier::MemRowValue::Tombstone => {
+                    current.insert(kb, RecordBatch::new_empty(schema.clone()));
+                }
+            }
+        }
+    }
+    // 1b. Shared memtable (a prior auto-commit fast-path Update/Insert wins over
+    //     cold for the same PK), for any PK not already resolved by 1a.
     {
         let snap = entry.memtable.snapshot();
         for (k, v) in snap {
             let kb = k.as_bytes().to_vec();
-            if !want.contains(&kb) {
+            if !want.contains(&kb) || current.contains_key(&kb) {
                 continue;
             }
             match v {
@@ -1969,9 +2096,21 @@ async fn hot_tier_update_by_pk(
             new_batch.slice(0, 1)
         };
         let bytes = encode_single_row_ipc(&one_row);
-        entry
-            .memtable
-            .insert(key.clone(), basin_hottier::MemRowValue::update(bytes, 0));
+        if tx_mode {
+            // In-tx: write the override to the rollback-able tx overlay. On
+            // COMMIT it is drained into this same shared memtable; on ROLLBACK
+            // it is dropped.
+            crate::session::tx_overlay_put(
+                &sess.state,
+                table,
+                key.clone(),
+                basin_hottier::MemRowValue::update(bytes, 0),
+            );
+        } else {
+            entry
+                .memtable
+                .insert(key.clone(), basin_hottier::MemRowValue::update(bytes, 0));
+        }
         updated += 1;
         // Collect the post-image for RETURNING if requested.
         if let Some(items) = returning {
@@ -2245,6 +2384,10 @@ pub(crate) async fn exec_update(
     )
     .await?
     {
+        // In-tx → tx-overlay variant (rollback-able); auto-commit → shared
+        // registry. The gate only admitted the in-tx case when
+        // `tx_fastpath_eligible_for_table` held.
+        let tx_mode = crate::session::tx_is_active(&sess.state);
         let (n, ret_batches) = hot_tier_update_by_pk(
             sess,
             &table,
@@ -2252,6 +2395,7 @@ pub(crate) async fn exec_update(
             &pk_keys,
             &fp_assigns,
             returning.as_deref(),
+            tx_mode,
         )
         .await?;
         if n == 0 {

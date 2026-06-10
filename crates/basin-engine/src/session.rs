@@ -469,6 +469,10 @@ impl SavepointFrame {
 ///   for projection queries (the "known gap" in the Parquet-only path).  On
 ///   COMMIT the batches are promoted to `MemTableRegistry`; on ROLLBACK they
 ///   are simply discarded without touching any shared state.
+/// * `tx_overlay` — per-table PK→`Update`/`Tombstone` overlay written by the
+///   in-tx single-row PK UPDATE/DELETE fast path. On COMMIT each entry is
+///   drained into the shared `MemTableRegistry`; on ROLLBACK it is dropped.
+///   See the field doc for the savepoint limitation.
 #[derive(Debug, Default)]
 pub(crate) struct TxState {
     /// `true` between `BEGIN` and the matching `COMMIT` / `ROLLBACK`.
@@ -508,6 +512,36 @@ pub(crate) struct TxState {
     ///   - Promoted to the shared `MemTableRegistry` on COMMIT.
     ///   - Silently discarded on ROLLBACK (no shared state is touched).
     pub(crate) htap_rows: HashMap<TableName, Vec<arrow_array::RecordBatch>>,
+    /// Transaction-scoped hot-tier UPDATE/DELETE overlay (the OLTP-in-tx
+    /// fast path).  Per table, an override / tombstone keyed by encoded PK
+    /// (`RowKey`) written by the in-tx single-row PK UPDATE/DELETE fast path
+    /// (`dml_mutate::hot_tier_update_by_pk_tx` / `..._delete_by_pk_tx`).
+    ///
+    /// Unlike the non-tx fast path (which writes straight to the process-wide
+    /// `MemTableRegistry` and has no rollback story), these entries live ONLY
+    /// in this session's `TxState`, so:
+    ///   - they are visible to this transaction's own reads (merged ON TOP of
+    ///     the shared-registry overlay snapshot by the read path);
+    ///   - on COMMIT they are drained into the shared `MemTableRegistry`
+    ///     (`entry.memtable.insert(key, value)`), exactly mirroring what the
+    ///     non-tx fast path would have written;
+    ///   - on ROLLBACK they are simply dropped — no shared state was touched.
+    ///
+    /// A `BTreeMap` so repeated read-modify-write on the same PK within the
+    /// transaction (`UPDATE v=v+1` twice) overwrites the same key and
+    /// accumulates.  Values are `MemRowValue::Update` (full-row override) or
+    /// `MemRowValue::Tombstone` (in-tx fast-path DELETE).
+    ///
+    /// ## Savepoint limitation
+    ///
+    /// Savepoints snapshot `pending_files` / `htap_rows` by Vec-length
+    /// watermark; this map has no equivalent length watermark (RMW overwrites
+    /// the same key), so it does NOT participate in savepoint rollback. The
+    /// write-path gate therefore disables the tx fast path whenever any
+    /// savepoint is active (see `tx_overlay_fastpath_blocked`), routing those
+    /// statements to the cold copy-on-write path which DOES honour savepoints.
+    pub(crate) tx_overlay:
+        HashMap<TableName, std::collections::BTreeMap<basin_hottier::RowKey, basin_hottier::MemRowValue>>,
 }
 
 /// Per-session mutable state. The `SessionContext` itself is `Send + Sync`
@@ -1055,6 +1089,7 @@ pub(crate) fn tx_begin(state: &SessionState, current_snapshots: HashMap<TableNam
         tx.savepoints.clear();
         tx.tx_id = None;
         tx.htap_rows.clear();
+        tx.tx_overlay.clear();
     }
 }
 
@@ -1073,6 +1108,10 @@ pub(crate) fn tx_commit(state: &SessionState) -> HashMap<TableName, Vec<DataFile
     tx.savepoints.clear();
     tx.tx_id = None;
     tx.htap_rows.clear();
+    // The overlay is drained explicitly by the executor COMMIT path via
+    // `tx_overlay_take_all` *before* this call (mirroring `tx_htap_take_all`);
+    // clear defensively in case a caller commits without draining.
+    tx.tx_overlay.clear();
     drop(tx);
     // PG: xact-scoped advisory locks auto-release at transaction end.
     state.advisory.release_xact();
@@ -1099,6 +1138,9 @@ pub(crate) fn tx_rollback(
     // Discard tx-local HTAP buffers — they were never committed to the shared
     // MemTableRegistry so no cleanup is needed beyond dropping the batches.
     tx.htap_rows.clear();
+    // Discard the tx-scoped UPDATE/DELETE overlay — these entries were never
+    // written to the shared MemTableRegistry, so ROLLBACK is just a drop.
+    tx.tx_overlay.clear();
     tx.tx_id = None;
     drop(tx);
     // PG: xact-scoped advisory locks auto-release at transaction end
@@ -1385,6 +1427,77 @@ pub(crate) fn tx_htap_take_all(
 ) -> HashMap<TableName, Vec<arrow_array::RecordBatch>> {
     let mut tx = state.tx_state.lock().expect("tx_state lock poisoned");
     std::mem::take(&mut tx.htap_rows)
+}
+
+// ── Transaction-scoped hot-tier UPDATE/DELETE overlay (OLTP-in-tx fast path) ──
+
+/// Per-PK overlay map for one table: encoded PK → `Update` / `Tombstone`.
+pub(crate) type TxOverlayTable =
+    std::collections::BTreeMap<basin_hottier::RowKey, basin_hottier::MemRowValue>;
+
+/// Returns `true` when the in-tx hot-tier UPDATE/DELETE fast path must be
+/// disabled because a savepoint is active. The `tx_overlay` map cannot be
+/// rewound to a savepoint watermark (RMW overwrites the same key, so there is
+/// no length-based snapshot like `pending_files` / `htap_rows` have), so any
+/// statement issued while a savepoint is live routes to the cold
+/// copy-on-write path, which DOES honour `ROLLBACK TO SAVEPOINT`.
+///
+/// Pure flag read — no I/O.
+pub(crate) fn tx_overlay_fastpath_blocked(state: &SessionState) -> bool {
+    let tx = state.tx_state.lock().expect("tx_state lock poisoned");
+    !tx.savepoints.is_empty()
+}
+
+/// Peek the current tx-overlay value for a single PK (read precedence:
+/// `tx_overlay` > shared memtable > PK cache > cold). Returns a clone so the
+/// caller can drop the lock before doing I/O. `None` means this transaction
+/// has no overlay entry for `key` — the caller continues down the precedence
+/// chain.
+pub(crate) fn tx_overlay_get(
+    state: &SessionState,
+    table: &TableName,
+    key: &basin_hottier::RowKey,
+) -> Option<basin_hottier::MemRowValue> {
+    let tx = state.tx_state.lock().expect("tx_state lock poisoned");
+    tx.tx_overlay.get(table)?.get(key).cloned()
+}
+
+/// Write one overlay entry (override or tombstone) for `table` keyed by `key`.
+/// Overwrites any prior entry for the same PK so repeated RMW accumulates.
+pub(crate) fn tx_overlay_put(
+    state: &SessionState,
+    table: &TableName,
+    key: basin_hottier::RowKey,
+    value: basin_hottier::MemRowValue,
+) {
+    let mut tx = state.tx_state.lock().expect("tx_state lock poisoned");
+    tx.tx_overlay.entry(table.clone()).or_default().insert(key, value);
+}
+
+/// Clone this transaction's overlay map for `table` (for in-tx reads).
+/// Empty map when none. Returned by value so the read path can merge it on
+/// top of the shared-registry snapshot without holding the tx lock.
+pub(crate) fn tx_overlay_peek(
+    state: &SessionState,
+    table: &TableName,
+) -> TxOverlayTable {
+    let tx = state.tx_state.lock().expect("tx_state lock poisoned");
+    // Fast-out for the auto-commit read hot path: outside a tx the overlay is
+    // always empty, so skip the clone+lookup entirely.
+    if !tx.active {
+        return TxOverlayTable::new();
+    }
+    tx.tx_overlay.get(table).cloned().unwrap_or_default()
+}
+
+/// Drain and return the entire tx-overlay on COMMIT so the executor can write
+/// each entry into the shared `MemTableRegistry`. Mirrors `tx_htap_take_all`:
+/// call this BEFORE `tx_commit` (which clears `TxState`).
+pub(crate) fn tx_overlay_take_all(
+    state: &SessionState,
+) -> HashMap<TableName, TxOverlayTable> {
+    let mut tx = state.tx_state.lock().expect("tx_state lock poisoned");
+    std::mem::take(&mut tx.tx_overlay)
 }
 
 /// Stash the OVERRIDING kind extracted from the current INSERT
@@ -1920,6 +2033,7 @@ async fn register_cold_with_overlay(
     file_format: TableFileFormat,
     global_sort_order: Option<&[String]>,
     pk_columns: &[String],
+    tx_overlay: TxOverlayTable,
 ) -> Result<()> {
     // Build the cold-tier ListingTable over exactly `files`.
     let (ff, file_ext) = listing_file_format(file_format);
@@ -1945,12 +2059,15 @@ async fn register_cold_with_overlay(
 
     // Overlay gate: the fast-path DELETE/UPDATE only writes single-column-PK
     // tables, so composite/no-PK tables can never have registry entries.
+    // `tx_overlay` (this transaction's own uncommitted in-tx fast-path writes)
+    // also forces the overlay wrap on, so an in-tx read sees them even when the
+    // shared registry is empty.
     let needs_overlay = if pk_columns.len() == 1 {
         use crate::hot_tombstone::{snapshot_tombstones, snapshot_updates};
         let reg = engine.memtable_registry();
         let tombs = snapshot_tombstones(reg.as_ref(), project, table);
         let updates = snapshot_updates(reg.as_ref(), project, table);
-        !tombs.is_empty() || !updates.is_empty()
+        !tombs.is_empty() || !updates.is_empty() || !tx_overlay.is_empty()
     } else {
         false
     };
@@ -1969,6 +2086,7 @@ async fn register_cold_with_overlay(
             *project,
             table.clone(),
             pk_columns.to_vec(),
+            tx_overlay,
         );
         ctx.register_table(tref.clone(), Arc::new(union_provider))
             .map_err(|e| BasinError::internal(format!("register_table overlay {table}: {e}")))?;
@@ -2152,6 +2270,7 @@ async fn refresh_table_inner(
             meta.file_format,
             meta.global_sort_order.as_deref(),
             &meta.pk_columns,
+            tx_overlay_peek(state, table),
         )
         .await?;
     }
@@ -2232,6 +2351,7 @@ pub(crate) async fn refresh_table_qualified(
             meta.file_format,
             meta.global_sort_order.as_deref(),
             &meta.pk_columns,
+            tx_overlay_peek(state, bare_name),
         )
         .await?;
     }
@@ -2295,6 +2415,7 @@ pub(crate) async fn refresh_table_with_extra(
         meta.file_format,
         meta.global_sort_order.as_deref(),
         &meta.pk_columns,
+        tx_overlay_peek(state, table),
     )
     .await?;
 
@@ -2396,6 +2517,7 @@ pub(crate) async fn refresh_table_with_htap(
             *project,
             table.clone(),
             meta.pk_columns.clone(),
+            tx_overlay_peek(state, table),
         );
         ctx.register_table(tref(), Arc::new(union_provider))
             .map_err(|e| BasinError::internal(format!("register_table htap-union {table}: {e}")))?;
@@ -2445,6 +2567,12 @@ struct HtapUnionTable {
     table: TableName,
     /// Single-column PK is required for tombstone-key encoding.
     pk_columns: Vec<String>,
+    /// Transaction-scoped UPDATE/DELETE overlay captured from this session's
+    /// `TxState` at refresh time. Merged ON TOP of the shared-registry
+    /// snapshot inside `scan` so the owning transaction sees its own
+    /// uncommitted in-tx fast-path writes (read-your-own-writes). Empty
+    /// outside a transaction (or when the tx has no overlay for this table).
+    tx_overlay: crate::session::TxOverlayTable,
 }
 
 impl std::fmt::Debug for HtapUnionTable {
@@ -2454,6 +2582,7 @@ impl std::fmt::Debug for HtapUnionTable {
 }
 
 impl HtapUnionTable {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         cold: Arc<dyn datafusion::catalog::TableProvider>,
         hot: Arc<dyn datafusion::catalog::TableProvider>,
@@ -2462,6 +2591,7 @@ impl HtapUnionTable {
         project: ProjectId,
         table: TableName,
         pk_columns: Vec<String>,
+        tx_overlay: crate::session::TxOverlayTable,
     ) -> Self {
         Self {
             cold,
@@ -2471,6 +2601,7 @@ impl HtapUnionTable {
             project,
             table,
             pk_columns,
+            tx_overlay,
         }
     }
 }
@@ -2503,8 +2634,14 @@ impl datafusion::catalog::TableProvider for HtapUnionTable {
         };
 
         let registry = self.engine.memtable_registry();
-        let tombs = snapshot_tombstones(registry.as_ref(), &self.project, &self.table);
-        let updates = snapshot_updates(registry.as_ref(), &self.project, &self.table);
+        let mut tombs = snapshot_tombstones(registry.as_ref(), &self.project, &self.table);
+        let mut updates = snapshot_updates(registry.as_ref(), &self.project, &self.table);
+        // Merge this transaction's own uncommitted in-tx fast-path overlay ON
+        // TOP of the shared-registry snapshot (tx wins). No-op outside a tx or
+        // when this table has no tx overlay.
+        if !self.tx_overlay.is_empty() {
+            crate::hot_tombstone::merge_tx_overlay(&mut tombs, &mut updates, &self.tx_overlay);
+        }
 
         // Single-PK gate: fast-path DELETE/UPDATE only writes to single-column-PK
         // tables. Composite-PK or no-PK tables can never have tombstones/updates in
