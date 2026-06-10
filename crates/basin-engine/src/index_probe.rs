@@ -711,6 +711,13 @@ pub struct GinContainmentPlan {
     pub opclass: String,
     /// Columns to project in the output.  `None` means `SELECT *`.
     pub projection: Option<Vec<String>>,
+    /// `true` when the projection is a bare aggregate over the whole relation
+    /// (e.g. `COUNT(*)`).  The pruned-table path registers the full relation
+    /// and DataFusion computes the aggregate over it, so the row-group prune
+    /// still applies — but the Empty short-circuit in `executor.rs` must NOT
+    /// short-circuit with zero rows for these shapes (a no-match `COUNT(*)`
+    /// must still return a single `0` row).  See the gate at the short-circuit.
+    pub is_aggregate: bool,
 }
 
 /// Detect the `SELECT … FROM table WHERE col @> 'literal'` shape.
@@ -793,8 +800,39 @@ pub async fn detect_gin_containment(
         _ => return None,
     };
 
-    // Projection: `*` or a list of bare column names.
-    let projection = extract_simple_projection(&select.projection)?;
+    // Projection: `*`, a list of bare column names, or a whole-relation
+    // aggregate (e.g. `COUNT(*)`).  An aggregate projection still routes
+    // through the pruned-table path — DataFusion computes the aggregate over
+    // the row-group-pruned relation — so we accept it here, recording the
+    // `is_aggregate` flag so the executor's Empty short-circuit knows not to
+    // collapse a no-match into zero rows (it must yield a single `0` row).
+    //
+    // Bare aggregates have no meaningful column projection, so we register the
+    // full relation (`None`) and let DataFusion project/aggregate.
+    let (projection, is_aggregate) = match extract_simple_projection(&select.projection) {
+        Some(proj) => (proj, false),
+        None => {
+            // GROUP BY / HAVING / DISTINCT change the result shape in ways the
+            // pruned-table registration does not special-case beyond "scan the
+            // relation"; that is still correct (DataFusion does the rest), but
+            // the Empty short-circuit only handles the bare whole-relation
+            // aggregate, so restrict the aggregate acceptance to that shape.
+            let group_by_empty = matches!(
+                &select.group_by,
+                sqlparser::ast::GroupByExpr::Expressions(exprs, mods)
+                    if exprs.is_empty() && mods.is_empty()
+            );
+            if group_by_empty
+                && select.having.is_none()
+                && select.distinct.is_none()
+                && is_whole_relation_aggregate(&select.projection)
+            {
+                (None, true)
+            } else {
+                return None;
+            }
+        }
+    };
 
     // Catalog lookup: table must have a GIN index on `col_name`.
     let meta = catalog.load_table(project, &table).await.ok()?;
@@ -816,7 +854,45 @@ pub async fn detect_gin_containment(
         is_contains,
         opclass,
         projection,
+        is_aggregate,
     })
+}
+
+/// True when every projected item is a bare (un-aliased, un-windowed)
+/// aggregate function call — i.e. the whole `WHERE`-filtered relation collapses
+/// to a single output row.  Used to let `COUNT(*) … WHERE col @> '…'` route
+/// through the row-group-pruned table path.
+///
+/// Conservative: requires at least one item, all `UnnamedExpr`, all
+/// `Expr::Function` with no window/FILTER/DISTINCT-arg modifiers that would
+/// change the collapse-to-one-row shape.  Anything else returns `false` →
+/// the caller falls through to a full scan (safe).
+fn is_whole_relation_aggregate(items: &[sqlparser::ast::SelectItem]) -> bool {
+    use sqlparser::ast::{Expr, FunctionArguments, SelectItem};
+    if items.is_empty() {
+        return false;
+    }
+    for item in items {
+        let expr = match item {
+            SelectItem::UnnamedExpr(e) => e,
+            _ => return false,
+        };
+        let func = match expr {
+            Expr::Function(f) => f,
+            _ => return false,
+        };
+        // Window functions, FILTER clauses, and WITHIN GROUP all change the
+        // semantics away from a simple whole-relation collapse.
+        if func.over.is_some() || func.filter.is_some() || !func.within_group.is_empty() {
+            return false;
+        }
+        // Parametric aggregates (`agg(...) (...)`) and named-args forms are
+        // out of scope.
+        if !matches!(func.parameters, FunctionArguments::None) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Phase 5.19.D — detected GIN key-existence probe plan.

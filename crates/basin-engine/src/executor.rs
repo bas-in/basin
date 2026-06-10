@@ -2641,9 +2641,19 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                         &gin_plan.needle,
                     );
                     if let crate::index_probe::ProbeResult::Empty = gin_result {
-                        // Posting list guarantees no rows match — short-circuit.
-                        let schema = Arc::new(arrow_schema::Schema::empty());
-                        return Ok(ExecResult::Rows { schema, batches: vec![] });
+                        // Posting list guarantees no rows match.
+                        //
+                        // For a row-emitting query (`SELECT * / cols`) we can
+                        // short-circuit with zero rows.  But for a whole-relation
+                        // aggregate (`COUNT(*) … WHERE col @> '…'`) zero rows is
+                        // the WRONG answer — PG returns a single row with `0`.
+                        // Fall through to `exec_select`, which registers the
+                        // (row-group-pruned or full) relation and lets DataFusion
+                        // compute the aggregate over zero matching rows → `0`.
+                        if !gin_plan.is_aggregate {
+                            let schema = Arc::new(arrow_schema::Schema::empty());
+                            return Ok(ExecResult::Rows { schema, batches: vec![] });
+                        }
                     }
                     // FileCandidates: the DataFusion path still executes; the
                     // posting list result is currently advisory (file-level
@@ -6104,13 +6114,18 @@ async fn filter_rows_do_nothing(
                         table.as_str(),
                         where_clause
                     );
-                    match sess.ctx.sql(&check_sql).await {
-                        Ok(df) => {
-                            let batches = df.collect().await.map_err(|e| {
-                                BasinError::internal(format!(
-                                    "ON CONFLICT DO NOTHING existence check: {e}"
-                                ))
-                            })?;
+                    // Route through the session dispatcher (NOT raw ctx.sql):
+                    // direct DataFusion would read the REGISTERED provider,
+                    // which may be stale — providers refresh per-statement in
+                    // exec_select, and fast-path reads never touch them. A
+                    // stale empty provider here reported "no conflict" for a
+                    // cold-tier row and the INSERT blew up on the PK check.
+                    match Box::pin(sess.execute(&check_sql)).await {
+                        Ok(res) => {
+                            let batches = match res {
+                                ExecResult::Rows { batches, .. } => batches,
+                                _ => Vec::new(),
+                            };
                             batches.iter().any(|b| b.num_rows() > 0)
                         }
                         Err(_) => {
@@ -6368,15 +6383,14 @@ async fn try_on_conflict_do_update(
             None => {
                 let check_sql =
                     format!("SELECT 1 FROM {} WHERE {} LIMIT 1", table.as_str(), where_clause);
-                match sess.ctx.sql(&check_sql).await {
-                    Ok(df) => {
-                        let batches = df.collect().await.map_err(|e| {
-                            BasinError::internal(format!(
-                                "ON CONFLICT existence check execute: {e}"
-                            ))
-                        })?;
+                // Session dispatcher, not raw ctx.sql — see the DO NOTHING
+                // twin above: a stale registered provider must not decide
+                // conflict existence.
+                match Box::pin(sess.execute(&check_sql)).await {
+                    Ok(ExecResult::Rows { batches, .. }) => {
                         batches.iter().any(|b| b.num_rows() > 0)
                     }
+                    Ok(_) => false,
                     Err(_) => {
                         // Table may be empty (no Parquet file yet) → no conflict.
                         false

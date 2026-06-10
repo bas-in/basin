@@ -292,6 +292,9 @@ impl ExecutionPlan for GinRowGroupScanExec {
         let opts = self.opts.clone();
         let catalog_schema = Some(self.catalog_schema.clone());
         let output_schema = self.output_schema.clone();
+        // Separate clone moved into the producer task for per-batch schema
+        // normalization; the original stays for the stream adapter below.
+        let normalize_schema = self.output_schema.clone();
 
         // Lazily drive `read_paths_with_schema` inside the stream.
         //
@@ -315,7 +318,26 @@ impl ExecutionPlan for GinRowGroupScanExec {
                 }
                 Ok(mut inner) => {
                     while let Some(item) = inner.next().await {
-                        let df_item = item.map_err(|e| DataFusionError::External(Box::new(e)));
+                        // Normalize each produced batch to the declared output
+                        // schema before handing it to DataFusion.  The cold
+                        // Vortex decode narrows JSONB `LargeBinary` → `Binary`
+                        // (and the text/view families likewise), but
+                        // `output_schema` carries the catalog-declared types.
+                        // `RecordBatchStreamAdapter` asserts the produced batch
+                        // schema matches the declared schema, so without this
+                        // coercion an aggregate/`SELECT` over a JSONB column
+                        // routed through this provider panics on a
+                        // `Binary` vs `LargeBinary` mismatch.  This is the same
+                        // read-boundary normalization applied elsewhere (hot
+                        // overlay merge, fast-select cold scan).
+                        let df_item = item
+                            .map(|b| {
+                                crate::hot_tombstone::normalize_batch_to_schema(
+                                    b,
+                                    normalize_schema.as_ref(),
+                                )
+                            })
+                            .map_err(|e| DataFusionError::External(Box::new(e)));
                         if tx.send(df_item).await.is_err() {
                             // Receiver dropped — consumer gave up (LIMIT reached, etc.)
                             break;

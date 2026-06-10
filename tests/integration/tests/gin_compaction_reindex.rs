@@ -108,6 +108,178 @@ async fn collect_doc_rows(engine: &Engine, project: ProjectId, sql: &str) -> Vec
     rows
 }
 
+/// Run a `SELECT COUNT(*) …` and return the single i64 scalar.
+/// Panics if the result is not a single-row, single-column Int64 batch.
+async fn scalar_count(engine: &Engine, project: ProjectId, sql: &str) -> i64 {
+    use arrow_array::{Array, Int64Array};
+
+    let sess = engine.open_session(project).await.unwrap();
+    let result = sess.execute(sql).await.unwrap_or_else(|e| {
+        panic!("execute failed for:\n  {sql}\n  error: {e}");
+    });
+    let batches = match result {
+        basin_engine::ExecResult::Rows { batches, .. } => batches,
+        other => panic!("expected Rows for COUNT(*), got {other:?} for:\n  {sql}"),
+    };
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 1,
+        "COUNT(*) must return exactly one row, got {total_rows} for:\n  {sql}"
+    );
+    let batch = batches.iter().find(|b| b.num_rows() == 1).unwrap();
+    let col = batch.column(0);
+    let arr = col
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap_or_else(|| panic!("COUNT(*) column not Int64 for:\n  {sql}"));
+    arr.value(0)
+}
+
+/// Regression: `COUNT(*) … WHERE col @> '…'` over a GIN-indexed, shard-written
+/// + compacted JSONB column must:
+///   1. route through the `GinRowGroupPrunedTable` scan path WITHOUT panicking
+///      on a `Binary` vs `LargeBinary` schema mismatch (the cold Vortex decode
+///      narrows JSONB `LargeBinary` → `Binary`; the scan now normalizes), and
+///   2. return the correct count for matching, non-matching, and common-key
+///      needles — including `0` (a single row, not an empty result) for a
+///      no-match needle — while a fast-path UPDATE overlay is present.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gin_count_star_at_gt_rowgroup_pruned() {
+    basin_common::telemetry::try_init_for_tests();
+
+    let (_storage_dir, _wal_dir, engine, shard, wal) = build_engine_with_shard().await;
+
+    let project = ProjectId::new();
+    engine.config().catalog.create_namespace(&project).await.unwrap();
+    let sess = engine.open_session(project).await.unwrap();
+
+    sess.execute(
+        "CREATE TABLE events (\
+            id      BIGINT NOT NULL, \
+            payload JSONB  NOT NULL \
+         ) WITH (basin.row_block_size = 256)",
+    )
+    .await
+    .unwrap();
+    sess.execute("CREATE INDEX events_gin ON events USING gin (payload)")
+        .await
+        .unwrap();
+
+    // Seed via the shard INSERT path (WAL + tail). 600 rows: every 3rd row is a
+    // "purchase" (200 rows), the rest are "view" (400 rows). Spreads across
+    // multiple row-groups with row_block_size=256.
+    let mut expected_purchase = 0i64;
+    for i in 0..600i64 {
+        let category = if i % 3 == 0 {
+            expected_purchase += 1;
+            "purchase"
+        } else {
+            "view"
+        };
+        sess.execute(&format!(
+            "INSERT INTO events (id, payload) VALUES ({i}, '{{\"category\":\"{category}\",\"id\":{i}}}')"
+        ))
+        .await
+        .unwrap();
+    }
+
+    // Compact into a single Parquet file → GIN row-group re-index runs.
+    shard.flush_to_parquet().await.unwrap();
+
+    let table = TableName::new("events").unwrap();
+    let meta = engine.config().catalog.load_table(&project, &table).await.unwrap();
+    let live_files = meta.live_data_files();
+    let compacted_path = live_files[0].path.to_string();
+    let rg_registry = engine.gin_rowgroup_registry_for_test();
+    assert!(
+        rg_registry.is_file_indexed(&project, &table, "payload", &compacted_path),
+        "GIN row-group registry must have a sealed entry for the compacted file"
+    );
+
+    // Introduce a fast-path UPDATE overlay: flip one "view" row to "purchase".
+    // id=1 is a "view" row (1 % 3 != 0). After the update it becomes a
+    // "purchase", so the purchase count must increase by exactly one. This puts
+    // a hot overlay row (writer's `LargeBinary` JSONB) into the read path that
+    // unions with the cold (`Binary`) compacted batches.
+    sess.execute(
+        "UPDATE events SET payload = '{\"category\":\"purchase\",\"id\":1}' WHERE id = 1",
+    )
+    .await
+    .unwrap();
+    expected_purchase += 1;
+
+    // ── COUNT(*) matching needle — must equal the purchase count, NOT panic. ──
+    let n_purchase = scalar_count(
+        &engine,
+        project,
+        r#"SELECT COUNT(*) FROM events WHERE payload @> '{"category":"purchase"}'::jsonb"#,
+    )
+    .await;
+    assert_eq!(
+        n_purchase, expected_purchase,
+        "COUNT(*) @> purchase must equal {expected_purchase} (got {n_purchase})"
+    );
+
+    // ── COUNT(*) non-matching needle — must be a single `0` row. ──
+    let n_absent = scalar_count(
+        &engine,
+        project,
+        r#"SELECT COUNT(*) FROM events WHERE payload @> '{"category":"nonexistent"}'::jsonb"#,
+    )
+    .await;
+    assert_eq!(
+        n_absent, 0,
+        "COUNT(*) @> non-matching must be 0 (a single 0 row, not an empty result)"
+    );
+
+    // ── SELECT id variant — row-emitting path with the same prune. ──
+    let purchase_ids = {
+        use arrow_array::{Array, Int64Array};
+        let s = engine.open_session(project).await.unwrap();
+        let result = s
+            .execute(r#"SELECT id FROM events WHERE payload @> '{"category":"purchase"}'::jsonb"#)
+            .await
+            .unwrap();
+        let batches = match result {
+            basin_engine::ExecResult::Rows { batches, .. } => batches,
+            other => panic!("expected Rows, got {other:?}"),
+        };
+        let mut total = 0usize;
+        for b in &batches {
+            let col = b.column(b.schema().index_of("id").unwrap());
+            assert!(
+                col.as_any().downcast_ref::<Int64Array>().is_some(),
+                "id column must be Int64"
+            );
+            total += b.num_rows();
+        }
+        total
+    };
+    assert_eq!(
+        purchase_ids as i64, expected_purchase,
+        "SELECT id @> purchase must return {expected_purchase} rows (got {purchase_ids})"
+    );
+
+    // SELECT id non-matching → 0 rows (the row-emitting Empty path is still
+    // allowed to short-circuit; just verify correctness here).
+    let absent_ids = {
+        let s = engine.open_session(project).await.unwrap();
+        let result = s
+            .execute(r#"SELECT id FROM events WHERE payload @> '{"category":"nonexistent"}'::jsonb"#)
+            .await
+            .unwrap();
+        match result {
+            basin_engine::ExecResult::Rows { batches, .. } => {
+                batches.iter().map(|b| b.num_rows()).sum::<usize>()
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    };
+    assert_eq!(absent_ids, 0, "SELECT id @> non-matching must be empty");
+
+    wal.close().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gin_compaction_reindex_fires_rowgroup_prune() {
     basin_common::telemetry::try_init_for_tests();
