@@ -46,17 +46,28 @@ use basin_catalog::ProjectStorageConfig;
 /// raise a typed error rather than OOM the worker walking the full list.
 pub(crate) const DEFAULT_MAX_LISTED_FILES: usize = 50_000;
 
-/// Conservative compressed-→-decoded expansion factor used to estimate
-/// whether a `.vortex` file's full unfiltered decode would fit one page-cache
-/// shard's byte budget before we attempt the shared unfiltered-decode reuse
-/// path (see the fresh-key point-read fast path in [`read_one`]). We multiply
-/// the on-disk (compressed) blob size by this factor and compare against
-/// `PageCache::per_shard_budget()`. Deliberately generous: over-estimating
-/// only declines the optimisation for a borderline file (it falls back to the
-/// existing pushdown decode), whereas under-estimating could let an oversized
-/// decode thrash a shard. Vortex's lightweight encodings rarely exceed ~8× on
-/// Basin-shaped data; the conservative bound keeps the gate honest.
-const VORTEX_UNFILTERED_DECODE_EXPANSION: u64 = 8;
+/// Compressed-→-decoded expansion factor used as the a-priori pre-check for
+/// the shared unfiltered-decode reuse path: we multiply the on-disk
+/// (compressed) blob size by this factor and require it to fit one page-cache
+/// shard's budget (`PageCache::per_shard_budget()`) before speculatively
+/// decoding the file unfiltered.
+///
+/// The factor is deliberately MODEST (not the old 8×). Real expansion ratios
+/// measured on Basin data run the gamut — a narrow all-Int64 table decodes
+/// ~180× its tiny compressed footprint (still kilobytes, trivially cacheable),
+/// while a payload-heavy JSONB events stripe barely compresses (~1.3×:
+/// ~2.7 MB compressed → ~3.4 MB decoded, which fits a 4 MiB shard). The old 8×
+/// over-estimated the events case (2.7 MB × 8 = 21.8 MB ≫ 4 MiB) and wrongly
+/// excluded a file that comfortably fits, forcing a full re-decode on every
+/// query. A smaller factor admits these big-but-cacheable files; the
+/// AUTHORITATIVE fits-in-a-shard guard is then re-checked against the REAL
+/// decoded size right before insert (see the store-after-decode logic in
+/// [`read_one`]), so a rare under-estimate never thrashes a shard — it simply
+/// declines to cache (the decode already in hand still answers the query).
+/// A file that fails even this modest a-priori gate is genuinely large and
+/// keeps the pushdown decode path (Vortex native chunk pruning), so big
+/// analytical scans are unaffected.
+const VORTEX_UNFILTERED_DECODE_EXPANSION: u64 = 2;
 
 /// Resolve [`DEFAULT_MAX_LISTED_FILES`], honoring
 /// `BASIN_STORAGE_MAX_LISTED_FILES` when present and parseable to a
@@ -1100,14 +1111,39 @@ async fn read_one(
         // one, dropping every variant (including this unfiltered entry).
         let unfiltered_cache_disabled =
             std::env::var("BASIN_UNFILTERED_DECODE_CACHE_DISABLE").as_deref() == Ok("1");
+        // Compute filter pushability once (reused for the pushdown path below).
+        // When every predicate pushes into Vortex natively, the pushdown decode
+        // gets chunk-level zone-map pruning — so for a LARGE pushable-filter
+        // file we must NOT divert to the unfiltered whole-file decode (it would
+        // throw that pruning away). When the filter is NOT pushable (e.g. a
+        // Utf8 `status = '…'` predicate), the pushdown path decodes the whole
+        // file anyway, so the unfiltered reuse path is strictly better whenever
+        // the decode can be cached.
+        let (push_filter, all_filters_pushed) =
+            vortex_filter_expr(&opts.filters, filter_schema);
+        // A-priori expansion estimate of the unfiltered decode.
+        let est_decode = size_bytes.saturating_mul(VORTEX_UNFILTERED_DECODE_EXPANSION);
+        let per_shard = page_cache
+            .as_ref()
+            .map(|pc| pc.per_shard_budget())
+            .unwrap_or(0);
+        let total = page_cache
+            .as_ref()
+            .map(|pc| pc.total_budget())
+            .unwrap_or(0);
+        // Eligibility budget:
+        //   * pushable filter → must fit one shard a priori (modest factor);
+        //     a larger file keeps pushdown + native chunk pruning.
+        //   * non-pushable filter → pushdown gains nothing, so admit up to the
+        //     whole-cache upper bound and let the post-decode real-size check
+        //     decide whether to actually cache (a payload-heavy events stripe
+        //     whose compressed size mis-predicts its true ~1.3× decode lands
+        //     here and IS cached because the real decode fits one shard).
+        let est_ceiling = if all_filters_pushed { per_shard } else { total };
         let unfiltered_eligible = !opts.filters.is_empty()
             && !unfiltered_cache_disabled
             && page_cache.is_some()
-            && size_bytes.saturating_mul(VORTEX_UNFILTERED_DECODE_EXPANSION)
-                <= page_cache
-                    .as_ref()
-                    .map(|pc| pc.per_shard_budget())
-                    .unwrap_or(0);
+            && est_decode <= est_ceiling;
 
         if unfiltered_eligible {
             // Shared key: same path + same READ projection (`read_proj`,
@@ -1138,7 +1174,20 @@ async fn read_one(
                     size_bytes,
                 )
                 .await?;
-                if pc.has_capacity() {
+                // Store-after-decode decision: cache the unfiltered batches
+                // ONLY when their REAL decoded footprint fits one shard's
+                // budget. A single entry larger than `per_shard_budget()` would
+                // immediately self-evict on insert (the shard's eviction loop
+                // pops LRU until back under budget, and with one oversized entry
+                // that means evicting the entry itself), thrashing the shard for
+                // no benefit. Measuring the real size here lets big-but-cacheable
+                // files (low real expansion) into the cache while still refusing
+                // genuinely oversized decodes — without an a-priori guess.
+                let decoded_bytes: u64 = decoded
+                    .iter()
+                    .map(|b| b.get_array_memory_size() as u64)
+                    .sum();
+                if decoded_bytes <= pc.per_shard_budget() && pc.has_capacity() {
                     let cached: Vec<Arc<RecordBatch>> =
                         decoded.iter().cloned().map(Arc::new).collect();
                     pc.insert(unfiltered_key, cached);
@@ -1165,8 +1214,6 @@ async fn read_one(
             return Ok(stream.boxed());
         }
 
-        let (push_filter, all_filters_pushed) =
-            vortex_filter_expr(&opts.filters, filter_schema);
         let (batches, decode_used_filter) = crate::vortex_format::decode_with_cache(
             bytes,
             schema,

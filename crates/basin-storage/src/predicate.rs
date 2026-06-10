@@ -56,6 +56,25 @@ impl Predicate {
     }
 }
 
+/// Normalize a comparison-kernel result so NULL entries become `false`.
+///
+/// Arrow's `cmp` kernels propagate NULL: a comparison against a NULL column
+/// element yields NULL. Our predicate contract (matching the prior scalar
+/// `BooleanBuilder` loop and Parquet's `RowFilter`) treats a NULL operand as
+/// "does not match" → `false`. We fold the validity bitmap into the values:
+/// `result = values AND validity`, then drop the null buffer. The fast path
+/// (no nulls) returns the array unchanged.
+fn null_to_false(arr: BooleanArray) -> BooleanArray {
+    if arr.null_count() == 0 {
+        return arr;
+    }
+    let (values, nulls) = arr.into_parts();
+    // `values & validity`: a slot is true only where it compared true AND was
+    // non-null. Then the result carries no null buffer.
+    let validity = nulls.expect("null_count > 0 implies a null buffer").into_inner();
+    BooleanArray::new(&values & &validity, None)
+}
+
 /// Apply a single predicate to a `RecordBatch` and return a boolean mask.
 /// Used as a fallback when row-group / page pruning isn't enough; i.e. the
 /// final per-row filter after Parquet has handed us back a coarse-grained
@@ -103,54 +122,70 @@ pub fn evaluate(
         return evaluate(batch, &coerced);
     }
 
+    // Map a Rust comparison token to Arrow's vectorized SIMD comparison
+    // kernel (`arrow::compute::kernels::cmp`). These run ~1-2 orders of
+    // magnitude faster than a scalar per-element `BooleanBuilder` loop in
+    // both debug and release, which is the hot path when a non-PK predicate
+    // is applied in Arrow over a fully-decoded stripe (the unfiltered-decode
+    // reuse path and every cold-tier WHERE that isn't fully pushed down).
+    macro_rules! cmp_kernel {
+        (==) => {
+            arrow::compute::kernels::cmp::eq
+        };
+        (>) => {
+            arrow::compute::kernels::cmp::gt
+        };
+        (<) => {
+            arrow::compute::kernels::cmp::lt
+        };
+    }
+
+    // Vectorized primitive comparison: column array vs a single scalar.
+    // Arrow's kernel returns NULL where the column element is NULL; our
+    // contract maps NULL → false (the same result the old scalar loop
+    // produced via `is_null → append_value(false)`), so we normalize the
+    // result's validity into the values buffer with `null_to_false`.
     macro_rules! cmp_primitive {
         ($arrow_ty:ty, $val:expr, $op:tt) => {{
             let arr = col.as_primitive::<$arrow_ty>();
-            let v = $val;
-            let mut b = arrow_array::builder::BooleanBuilder::with_capacity(arr.len());
-            for i in 0..arr.len() {
-                if arr.is_null(i) {
-                    b.append_value(false);
-                } else {
-                    b.append_value(arr.value(i) $op v);
-                }
-            }
-            b.finish()
+            let scalar = arrow_array::PrimitiveArray::<$arrow_ty>::new_scalar($val);
+            let cmp = cmp_kernel!($op)(arr, &scalar)
+                .map_err(|e| BasinError::storage(format!("predicate cmp: {e}")))?;
+            null_to_false(cmp)
         }};
     }
 
-    // Helper: compare an Int64 scalar against a narrower integer column
-    // (Int32 / Int16). We widen each element to i64 and compare there.
+    // Compare an Int64 scalar against a narrower integer column (Int32 /
+    // Int16) or a Timestamp column (raw i64). We cast the column to Int64
+    // (a vectorized kernel) then compare against the i64 scalar.
     macro_rules! cmp_narrow_int_as_i64 {
         ($arrow_ty:ty, $v:expr, $op:tt) => {{
             let arr = col.as_primitive::<$arrow_ty>();
-            let v: i64 = $v;
-            let mut b = arrow_array::builder::BooleanBuilder::with_capacity(arr.len());
-            for i in 0..arr.len() {
-                if arr.is_null(i) {
-                    b.append_value(false);
-                } else {
-                    b.append_value((arr.value(i) as i64) $op v);
-                }
-            }
-            b.finish()
+            let widened: arrow_array::Int64Array =
+                arrow::compute::kernels::cast::cast(arr, &Dt::Int64)
+                    .map_err(|e| BasinError::storage(format!("predicate widen: {e}")))?
+                    .as_primitive::<Int64Type>()
+                    .clone();
+            let scalar = arrow_array::Int64Array::new_scalar($v);
+            let cmp = cmp_kernel!($op)(&widened, &scalar)
+                .map_err(|e| BasinError::storage(format!("predicate cmp: {e}")))?;
+            null_to_false(cmp)
         }};
     }
 
-    // Helper: compare a Float64 scalar against a Float32 column (widen to f64).
+    // Compare a Float64 scalar against a Float32 column (widen to f64).
     macro_rules! cmp_f32_as_f64 {
         ($v:expr, $op:tt) => {{
             let arr = col.as_primitive::<Float32Type>();
-            let v: f64 = $v;
-            let mut b = arrow_array::builder::BooleanBuilder::with_capacity(arr.len());
-            for i in 0..arr.len() {
-                if arr.is_null(i) {
-                    b.append_value(false);
-                } else {
-                    b.append_value((arr.value(i) as f64) $op v);
-                }
-            }
-            b.finish()
+            let widened: arrow_array::Float64Array =
+                arrow::compute::kernels::cast::cast(arr, &Dt::Float64)
+                    .map_err(|e| BasinError::storage(format!("predicate widen: {e}")))?
+                    .as_primitive::<Float64Type>()
+                    .clone();
+            let scalar = arrow_array::Float64Array::new_scalar($v);
+            let cmp = cmp_kernel!($op)(&widened, &scalar)
+                .map_err(|e| BasinError::storage(format!("predicate cmp: {e}")))?;
+            null_to_false(cmp)
         }};
     }
 

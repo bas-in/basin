@@ -625,6 +625,17 @@ impl PageCache {
         self.per_shard_max_bytes
     }
 
+    /// Total (global) byte budget across all shards. Used as the coarse
+    /// a-priori upper bound for the unfiltered-decode reuse path when the
+    /// query's filter is NOT pushable into Vortex (so the pushdown path would
+    /// decode the whole file anyway and reuse-caching can only help): a file
+    /// whose estimated decode exceeds the whole cache can never be stored, so
+    /// we skip the speculative decode. The authoritative fits-in-a-shard
+    /// decision is still made post-decode against the real decoded size.
+    pub(crate) fn total_budget(&self) -> u64 {
+        self.max_bytes
+    }
+
     /// For tests: how many entries the cache currently holds (summed
     /// across shards).
     #[cfg(test)]
