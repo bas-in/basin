@@ -3495,9 +3495,12 @@ fn apply_aggregates(
                     acc.count += batch.num_rows() as i64;
                 }
                 AggregateFn::Sum(col) => {
-                    let col_idx = batch.schema().index_of(col).map_err(|_| {
-                        BasinError::InvalidSchema(format!("SUM: unknown column {col}"))
-                    })?;
+                    // Schema evolution: a file written before ALTER ADD COLUMN
+                    // lacks the column entirely — every row there is NULL, and
+                    // SUM ignores NULLs, so this batch contributes nothing.
+                    let Ok(col_idx) = batch.schema().index_of(col) else {
+                        continue;
+                    };
                     let arr = batch.column(col_idx);
                     let i64_arr = arr
                         .as_any()
@@ -3510,9 +3513,12 @@ fn apply_aggregates(
                     }
                 }
                 AggregateFn::Min(col) => {
-                    let col_idx = batch.schema().index_of(col).map_err(|_| {
-                        BasinError::InvalidSchema(format!("MIN: unknown column {col}"))
-                    })?;
+                    // Schema evolution: a file written before ALTER ADD COLUMN
+                    // lacks the column entirely — every row there is NULL, and
+                    // MIN ignores NULLs, so this batch contributes nothing.
+                    let Ok(col_idx) = batch.schema().index_of(col) else {
+                        continue;
+                    };
                     let arr = batch.column(col_idx);
                     let i64_arr = arr
                         .as_any()
@@ -3528,9 +3534,12 @@ fn apply_aggregates(
                     }
                 }
                 AggregateFn::Max(col) => {
-                    let col_idx = batch.schema().index_of(col).map_err(|_| {
-                        BasinError::InvalidSchema(format!("MAX: unknown column {col}"))
-                    })?;
+                    // Schema evolution: a file written before ALTER ADD COLUMN
+                    // lacks the column entirely — every row there is NULL, and
+                    // MAX ignores NULLs, so this batch contributes nothing.
+                    let Ok(col_idx) = batch.schema().index_of(col) else {
+                        continue;
+                    };
                     let arr = batch.column(col_idx);
                     let i64_arr = arr
                         .as_any()

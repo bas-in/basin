@@ -845,6 +845,38 @@ fn reproject_row(row: &RecordBatch, target: &SchemaRef) -> DFResult<RecordBatch>
 /// The cast is `arrow::compute::cast`, which is zero-copy for the offset-only
 /// widenings arrow can do without re-buffering and cheap for the small
 /// (single-row override / UPDATE-touched) batches on these paths.
+/// Pad `batch` up to the full catalog `target` schema: columns the batch
+/// lacks (files/rows written before an ALTER ADD COLUMN) are appended as
+/// all-NULL arrays, and columns are emitted in target order. Type-family
+/// coercion is delegated to [`normalize_batch_to_schema`]. No-op (same
+/// batch back) when the shapes already match.
+pub(crate) fn pad_batch_to_schema(
+    batch: RecordBatch,
+    target: &arrow_schema::SchemaRef,
+) -> crate::Result<RecordBatch> {
+    let batch = normalize_batch_to_schema(batch, target.as_ref());
+    if batch.schema().fields().len() == target.fields().len()
+        && batch
+            .schema()
+            .fields()
+            .iter()
+            .zip(target.fields())
+            .all(|(a, b)| a.name() == b.name())
+    {
+        return Ok(batch);
+    }
+    let n = batch.num_rows();
+    let mut cols: Vec<arrow_array::ArrayRef> = Vec::with_capacity(target.fields().len());
+    for f in target.fields() {
+        match batch.schema().index_of(f.name()) {
+            Ok(i) => cols.push(batch.column(i).clone()),
+            Err(_) => cols.push(arrow_array::new_null_array(f.data_type(), n)),
+        }
+    }
+    RecordBatch::try_new(target.clone(), cols)
+        .map_err(|e| basin_common::BasinError::internal(format!("pad batch to schema: {e}")))
+}
+
 pub(crate) fn normalize_batch_to_schema(
     batch: RecordBatch,
     target: &arrow_schema::Schema,

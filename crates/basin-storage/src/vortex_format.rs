@@ -574,19 +574,23 @@ async fn decode_inner(
                     .unwrap_or(true)
             };
             let phys_field_count = phys.as_ref().map(|p| p.fields().len());
-            // Only narrow when the physical file genuinely has extra columns —
-            // a same-shape file needs no projection (keeps the cheap fast path).
-            if phys_field_count.map(|c| c > s.fields().len()).unwrap_or(false) {
+            // Narrow whenever the physical shape differs from the logical one
+            // in EITHER direction: extra physical columns (promoted shadow
+            // fields) AND missing physical columns (file written before an
+            // ALTER ADD COLUMN) both fail execute_record_batch's field-count
+            // check. Decode the name-intersection in catalog order; the read
+            // layers above null-fill logical columns the file pre-dates.
+            if phys_field_count.map(|c| c != s.fields().len()).unwrap_or(false) {
                 let names: Vec<String> = s
                     .fields()
                     .iter()
                     .map(|f| f.name().clone())
                     .filter(|n| phys_has(n))
                     .collect();
-                if names.len() == s.fields().len() {
-                    Some(names)
-                } else {
+                if names.is_empty() {
                     None
+                } else {
+                    Some(names)
                 }
             } else {
                 None
@@ -594,12 +598,31 @@ async fn decode_inner(
         }
         _ => None,
     };
-    if let Some(cols) = projection {
-        let names: Vec<&str> = cols.iter().map(|s| s.as_str()).collect();
-        sb = sb.with_projection(select(names, root()));
-    } else if let Some(cols) = &derived_proj {
-        let names: Vec<&str> = cols.iter().map(|s| s.as_str()).collect();
-        sb = sb.with_projection(select(names, root()));
+    // An explicit projection may name logical columns this file pre-dates
+    // (ALTER ADD COLUMN): hand Vortex only the columns the file physically
+    // carries — the reader's projection assembler null-fills the rest from
+    // the catalog schema.
+    let projection_phys: Option<Vec<String>> = projection.map(|cols| {
+        let phys = vf.dtype().to_arrow_schema().ok();
+        cols.iter()
+            .filter(|n| {
+                phys.as_ref()
+                    .map(|p| p.field_with_name(n).is_ok())
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect()
+    });
+    // The conversion target must mirror the EFFECTIVE projection handed to
+    // the scan builder (post physical-intersection), not the caller's raw
+    // request — the produced struct has exactly the intersected columns.
+    let effective_proj: Option<&Vec<String>> =
+        projection_phys.as_ref().or(derived_proj.as_ref());
+    if let Some(cols) = effective_proj {
+        if !cols.is_empty() {
+            let names: Vec<&str> = cols.iter().map(|s| s.as_str()).collect();
+            sb = sb.with_projection(select(names, root()));
+        }
     }
     if let Some(f) = filter {
         sb = sb.with_some_filter(Some(f));
@@ -610,7 +633,7 @@ async fn decode_inner(
     // order, so the schema must be that subset: prefer the authoritative
     // catalog `schema` (keeps exact types — e.g. timestamp tz), else the
     // projected dtype the scan reports.
-    let arrow_schema: Arc<Schema> = match (projection, &schema) {
+    let arrow_schema: Arc<Schema> = match (effective_proj, &schema) {
         (Some(cols), Some(s)) => {
             let mut fields = Vec::with_capacity(cols.len());
             let mut all_present = true;

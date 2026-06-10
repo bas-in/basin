@@ -2088,6 +2088,12 @@ async fn hot_tier_update_by_pk(
             continue; // tombstoned (deleted) — UPDATE skips it.
         }
         let mask = BooleanArray::from(vec![true; row_batch.num_rows()]);
+        // Schema evolution: a pre-image sourced from a file older than an
+        // ALTER ADD COLUMN lacks the new column entirely; apply_assignments
+        // merges per batch-column, so an assignment to the missing column
+        // would be silently DROPPED. Pad to the full catalog schema first.
+        let row_batch =
+            &crate::hot_tombstone::pad_batch_to_schema(row_batch.clone(), &schema)?;
         let new_batch = apply_assignments(catalog, &sess.project, row_batch, &mask, assignments).await?;
         // Encode the (single) row and store as an Update override keyed by PK.
         let one_row = if new_batch.num_rows() == 1 {
