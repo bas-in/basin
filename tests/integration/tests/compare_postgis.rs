@@ -436,11 +436,22 @@ async fn compare_postgis() {
     // ── S2 bbox: count within an axis-aligned box ────────────────────────
     //
     // Both engines now use the IDENTICAL native PostGIS idiom:
-    // `geom && ST_MakeEnvelope(...)`.  On the basin side the operator-rewrite
-    // pass normalizes `geom && ST_MakeEnvelope(a,b,c,d)` →
-    // `ST_Contains(ST_MakeEnvelope(a,b,c,d), geom)`, which the spatial
-    // predicate detector recognizes and routes through the R-tree row-group
-    // pushdown (GIST index) instead of a full scan.
+    // `geom && ST_MakeEnvelope(...)`.  On the basin side `&&` is handled by
+    // TWO independent rewrites:
+    //
+    //  * Prune probe: `apply_rtree_pruning_for_query` sees the
+    //    `ST_Contains(ST_MakeEnvelope(a,b,c,d), geom)` normalization (via
+    //    `rewrite_bbox_amp_amp`), which the spatial-predicate detector
+    //    recognizes and routes through the R-tree row-group pushdown (GIST
+    //    index) — narrowing each candidate file to its surviving row-groups
+    //    instead of a full scan.
+    //
+    //  * Executable residual: `rewrite_bbox_amp_amp_exec` lowers `&&` to the
+    //    single-decode UDF `__basin_bbox_contains_point(geom, a, b, c, d)`,
+    //    which decodes the WKB POINT once per surviving row. (The earlier
+    //    `ST_X(geom) BETWEEN … AND ST_Y(geom) BETWEEN …` form decoded the
+    //    WKB twice per row — once per ST_X/ST_Y call — which dominated S2
+    //    cost over the rows that survived the row-group prune.)
     let s2_pg_sql = format!(
         "SELECT count(*) FROM {schema}.pts \
          WHERE geom && ST_MakeEnvelope({BBOX_X0},{BBOX_Y0},{BBOX_X1},{BBOX_Y1},4326)"
@@ -465,8 +476,8 @@ async fn compare_postgis() {
     let basin_s2_count =
         basin_count(sess.execute(&s2_basin_sql).await.expect("basin s2 count"));
     println!(
-        "[compare_postgis] S2 bbox count: pg(&&)={pg_s2_count} basin(&&→ST_Contains)={basin_s2_count} \
-         (identical native idiom; basin rewrites to ST_Contains + R-tree pushdown)"
+        "[compare_postgis] S2 bbox count: pg(&&)={pg_s2_count} basin(&&→__basin_bbox_contains_point)={basin_s2_count} \
+         (identical native idiom; basin: R-tree row-group prune + single-decode residual UDF)"
     );
     // Correctness guard: the rewrite must be semantically exact, not just
     // faster — basin's bbox count must equal PG's.
@@ -579,7 +590,7 @@ async fn compare_postgis() {
             ratio_text: ratio_text(s4_basin, s4_pg),
         },
         CompareMetric {
-            label: "S2 bbox count (&& → ST_Contains R-tree)".into(),
+            label: "S2 bbox count (&& → R-tree prune + single-decode residual)".into(),
             basin: s2_basin,
             postgres: s2_pg,
             unit: "ms".into(),
@@ -605,8 +616,11 @@ async fn compare_postgis() {
          measure metres with the same radius (fairness invariant). S1 result counts \
          are hard-asserted equal (correctness guard). S2 bbox uses the IDENTICAL \
          native PostGIS idiom on both sides (geom && ST_MakeEnvelope(...)); Basin \
-         rewrites it to ST_Contains(envelope, geom) and routes it through the GIST \
-         R-tree row-group pushdown, with the bbox count hard-asserted equal to PG. \
+         routes it through the GIST R-tree row-group pushdown (prune probe via the \
+         ST_Contains(envelope, geom) normalization) and evaluates the residual with \
+         a single-decode UDF __basin_bbox_contains_point(geom,minx,miny,maxx,maxy) \
+         that decodes each surviving WKB POINT once (vs the old ST_X/ST_Y BETWEEN \
+         form's two decodes per row), with the bbox count hard-asserted equal to PG. \
          S3 KNN (ORDER BY geom <-> ST_MakePoint(...) LIMIT 10) now routes through \
          Basin's R-tree nearest-neighbour path (over-fetch + exact Haversine re-rank); \
          the set of 10 nearest ids is hard-asserted equal to PG's GIST <-> result.",

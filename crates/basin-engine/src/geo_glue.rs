@@ -141,6 +141,26 @@ pub(crate) fn install_udfs(ctx: &SessionContext) {
             Volatility::Immutable,
         ),
     }));
+    // __basin_bbox_contains_point(geom, minx, miny, maxx, maxy) — the
+    // single-decode residual for the PostGIS bbox-overlap idiom
+    // `geom && ST_MakeEnvelope(minx, miny, maxx, maxy)`. Replaces the
+    // planar `ST_X(geom) BETWEEN … AND ST_Y(geom) BETWEEN …` rewrite,
+    // which decoded the WKB POINT TWICE per row (once for ST_X, once for
+    // ST_Y). This UDF decodes once and runs both axis tests, halving the
+    // dominant residual-filter cost over rows surviving the R-tree prune.
+    // Boundary-inclusive to match PostGIS `&&` (bbox-overlap) semantics.
+    ctx.register_udf(ScalarUDF::from(BasinBboxContainsPointUdf {
+        signature: Signature::exact(
+            vec![
+                point_dt(),
+                DataType::Float64,
+                DataType::Float64,
+                DataType::Float64,
+                DataType::Float64,
+            ],
+            Volatility::Immutable,
+        ),
+    }));
     ctx.register_udf(ScalarUDF::from(StAsTextUdf {
         signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
     }));
@@ -617,6 +637,98 @@ impl ScalarUDFImpl for StDWithinUdf {
         for i in 0..n {
             match (decode_point_at(&a, i)?, decode_point_at(&b, i)?) {
                 (Some(p), Some(q)) if !r.is_null(i) => out.append_value(dwithin(&p, &q, r.value(i))),
+                _ => out.append_null(),
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+// ── __basin_bbox_contains_point ──────────────────────────────────────────────
+
+/// `__basin_bbox_contains_point(geom, minx, miny, maxx, maxy)` — internal
+/// residual for the PostGIS bbox-overlap idiom
+/// `geom && ST_MakeEnvelope(minx, miny, maxx, maxy)`.
+///
+/// Returns `true` iff the POINT `geom` lies inside the closed axis-aligned
+/// box `[minx, maxx] × [miny, maxy]` (boundary-inclusive, matching PostGIS
+/// `&&` bbox-overlap for POINT geometry). NULL geom → NULL.
+///
+/// This is the single-decode replacement for the planar rewrite
+/// `ST_X(geom) BETWEEN minx AND maxx AND ST_Y(geom) BETWEEN miny AND maxy`,
+/// which decoded the WKB POINT twice per row (once in `ST_X`, once in
+/// `ST_Y`). Decoding the WKB POINT is the dominant per-row cost of the
+/// `&&` residual filter that runs above the R-tree row-group prune, so
+/// collapsing two decodes into one roughly halves that cost.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct BasinBboxContainsPointUdf {
+    signature: Signature,
+}
+impl ScalarUDFImpl for BasinBboxContainsPointUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "__basin_bbox_contains_point"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
+        let n = args
+            .iter()
+            .filter_map(|a| match a {
+                ColumnarValue::Array(arr) => Some(arr.len()),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(1);
+        let geom = args[0].clone().into_array(n)?;
+        let coord = |idx: usize| -> DFResult<ArrayRef> {
+            let arr = args[idx].clone().into_array(n)?;
+            Ok(arr)
+        };
+        let minx = coord(1)?;
+        let miny = coord(2)?;
+        let maxx = coord(3)?;
+        let maxy = coord(4)?;
+        let f64_of = |arr: &ArrayRef, what: &str| -> DFResult<Float64Array> {
+            arr.as_any()
+                .downcast_ref::<Float64Array>()
+                .cloned()
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Execution(format!(
+                        "__basin_bbox_contains_point: {what} must be DOUBLE"
+                    ))
+                })
+        };
+        let minx = f64_of(&minx, "minx")?;
+        let miny = f64_of(&miny, "miny")?;
+        let maxx = f64_of(&maxx, "maxx")?;
+        let maxy = f64_of(&maxy, "maxy")?;
+        let mut out = BooleanBuilder::with_capacity(n);
+        for i in 0..n {
+            // Single WKB decode per row — the whole point of this UDF.
+            match decode_point_at(&geom, i)? {
+                Some(p)
+                    if !minx.is_null(i)
+                        && !miny.is_null(i)
+                        && !maxx.is_null(i)
+                        && !maxy.is_null(i) =>
+                {
+                    let x = p.lon();
+                    let y = p.lat();
+                    out.append_value(
+                        x >= minx.value(i)
+                            && x <= maxx.value(i)
+                            && y >= miny.value(i)
+                            && y <= maxy.value(i),
+                    );
+                }
                 _ => out.append_null(),
             }
         }
@@ -2208,6 +2320,8 @@ mod tests {
             // GEOGRAPHY aliases
             "st_geogfromtext",
             "st_geographyfromtext",
+            // Internal single-decode bbox residual (`geom && ST_MakeEnvelope`)
+            "__basin_bbox_contains_point",
         ] {
             assert!(
                 scalar.contains_key(name),
@@ -2468,6 +2582,65 @@ mod tests {
             .downcast_ref::<arrow_array::BooleanArray>()
             .unwrap()
             .value(0));
+    }
+
+    #[test]
+    fn basin_bbox_contains_point_is_boundary_inclusive() {
+        let udf = BasinBboxContainsPointUdf {
+            signature: Signature::exact(
+                vec![
+                    point_dt(),
+                    DataType::Float64,
+                    DataType::Float64,
+                    DataType::Float64,
+                    DataType::Float64,
+                ],
+                Volatility::Immutable,
+            ),
+        };
+        let f = |v: f64| ColumnarValue::Scalar(ScalarValue::Float64(Some(v)));
+        let bbox = |p: ColumnarValue| {
+            // box [0,10] × [0,10]
+            let res = invoke(
+                &udf,
+                vec![p, f(0.0), f(0.0), f(10.0), f(10.0)],
+                DataType::Boolean,
+            );
+            match res {
+                ColumnarValue::Array(a) => {
+                    a.as_any().downcast_ref::<arrow_array::BooleanArray>().unwrap().value(0)
+                }
+                _ => panic!("expected array"),
+            }
+        };
+        // Interior point → true.
+        assert!(bbox(make_point_scalar(5.0, 5.0)));
+        // On the boundary (min corner) → true (PostGIS && is inclusive).
+        assert!(bbox(make_point_scalar(0.0, 0.0)));
+        // On the boundary (max corner) → true.
+        assert!(bbox(make_point_scalar(10.0, 10.0)));
+        // On an edge → true.
+        assert!(bbox(make_point_scalar(0.0, 7.0)));
+        // Just outside in x → false.
+        assert!(!bbox(make_point_scalar(10.0001, 5.0)));
+        // Just outside in y → false.
+        assert!(!bbox(make_point_scalar(5.0, -0.0001)));
+
+        // NULL geom → NULL (not true/false).
+        let null_pt = ColumnarValue::Scalar(ScalarValue::FixedSizeBinary(
+            POINT_WKB_LEN as i32,
+            None,
+        ));
+        let res = invoke(
+            &udf,
+            vec![null_pt, f(0.0), f(0.0), f(10.0), f(10.0)],
+            DataType::Boolean,
+        );
+        let arr = match res {
+            ColumnarValue::Array(a) => a,
+            _ => panic!("expected array"),
+        };
+        assert!(arr.is_null(0), "NULL geom must yield NULL");
     }
 
     #[test]

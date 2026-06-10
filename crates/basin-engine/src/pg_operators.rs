@@ -287,11 +287,13 @@ pub(crate) fn rewrite_array_operators(sql: &str) -> String {
     s = rewrite_array_op_once(s, "<@", false);
     // Geometry bbox `&&` (one operand is an ST_MakeEnvelope(...) call) is the
     // PostGIS bbox-overlap idiom `geom && ST_MakeEnvelope(a,b,c,d)`.  Rewrite
-    // it to an EXECUTABLE planar form `ST_X(geom) BETWEEN a AND c AND
-    // ST_Y(geom) BETWEEN b AND d` — exact for POINT geometry and runnable by
-    // DataFusion.  (The R-tree file/row-group prune is engaged separately via
-    // `rewrite_bbox_amp_amp` on the original SQL at the executor call site.)
-    // Must run BEFORE the array `&&` pass; non-bbox `&&` falls through.
+    // it to an EXECUTABLE single-decode form
+    // `__basin_bbox_contains_point(geom, a, b, c, d)` — exact for POINT
+    // geometry, runnable by DataFusion, and decoding the WKB POINT once per
+    // row (the old `ST_X/ST_Y BETWEEN` form decoded it twice).  (The R-tree
+    // file/row-group prune is engaged separately via `rewrite_bbox_amp_amp`
+    // on the original SQL at the executor call site.)  Must run BEFORE the
+    // array `&&` pass; non-bbox `&&` falls through.
     s = rewrite_bbox_amp_amp_exec(s);
     s = rewrite_array_op_once(s, "&&", false);
     s
@@ -334,8 +336,17 @@ fn envelope_args(env: &str) -> Option<Vec<String>> {
     Some(args)
 }
 
-/// Build the executable planar bbox predicate for a POINT column against an
+/// Build the executable bbox predicate for a POINT column against an
 /// `ST_MakeEnvelope(min_x, min_y, max_x, max_y[, srid])` envelope.
+///
+/// Emits a single internal UDF `__basin_bbox_contains_point(geom, minx, miny,
+/// maxx, maxy)` (boundary-inclusive, matching PostGIS `&&`). This decodes the
+/// WKB POINT once per row. The previous rewrite used
+/// `ST_X(geom) BETWEEN minx AND maxx AND ST_Y(geom) BETWEEN miny AND maxy`,
+/// which decoded the WKB POINT TWICE per row — once in `ST_X` and once in
+/// `ST_Y` — and that double decode over the rows surviving the R-tree
+/// row-group prune dominated query cost. Collapsing to one decode roughly
+/// halves the residual-filter time.
 fn bbox_exec_predicate(geom: &str, env: &str) -> Option<String> {
     let args = envelope_args(env)?;
     if args.len() != 4 && args.len() != 5 {
@@ -343,7 +354,7 @@ fn bbox_exec_predicate(geom: &str, env: &str) -> Option<String> {
     }
     let (min_x, min_y, max_x, max_y) = (&args[0], &args[1], &args[2], &args[3]);
     Some(format!(
-        "(ST_X({geom}) BETWEEN {min_x} AND {max_x} AND ST_Y({geom}) BETWEEN {min_y} AND {max_y})"
+        "__basin_bbox_contains_point({geom}, {min_x}, {min_y}, {max_x}, {max_y})"
     ))
 }
 
@@ -399,8 +410,9 @@ pub(crate) fn rewrite_bbox_amp_amp(sql: String) -> String {
 }
 
 /// Rewrite PostGIS bbox-overlap `geom && ST_MakeEnvelope(a,b,c,d)` into the
-/// EXECUTABLE planar predicate `ST_X(geom) BETWEEN a AND c AND ST_Y(geom)
-/// BETWEEN b AND d` — exact for POINT geometry and runnable by DataFusion.
+/// EXECUTABLE single-decode predicate
+/// `__basin_bbox_contains_point(geom, a, b, c, d)` — exact for POINT
+/// geometry, runnable by DataFusion, and decoding the WKB POINT once per row.
 /// Used on the execution path (the `&&` array-overlap path is untouched).
 pub(crate) fn rewrite_bbox_amp_amp_exec(sql: String) -> String {
     rewrite_bbox_amp_amp_with(sql, bbox_exec_predicate)
@@ -7530,23 +7542,27 @@ mod tests {
     }
 
     #[test]
-    fn bbox_amp_amp_exec_rewrites_to_betweens() {
+    fn bbox_amp_amp_exec_rewrites_to_single_decode_udf() {
         // EXECUTION form (via rewrite_array_operators): `geom &&
-        // ST_MakeEnvelope(0,0,1,1)` → executable ST_X/ST_Y BETWEEN.
+        // ST_MakeEnvelope(0,0,1,1)` → single-decode UDF
+        // __basin_bbox_contains_point(geom, minx, miny, maxx, maxy).
         let out = rewrite_array_operators("SELECT * FROM t WHERE geom && ST_MakeEnvelope(0,0,1,1)");
         assert!(
-            out.contains("ST_X(geom) BETWEEN 0 AND 1 AND ST_Y(geom) BETWEEN 0 AND 1"),
+            out.contains("__basin_bbox_contains_point(geom, 0, 0, 1, 1)"),
             "got: {out}"
         );
         assert!(!out.contains("arrays_overlap"), "got: {out}");
         assert!(!out.contains("ST_Contains"), "got: {out}");
+        // No double WKB decode: the ST_X/ST_Y BETWEEN form is gone.
+        assert!(!out.contains("ST_X("), "got: {out}");
+        assert!(!out.contains("ST_Y("), "got: {out}");
 
         // 5-arg SRID form: SRID arg ignored, x/y coords used.
         let out2 = rewrite_array_operators(
             "SELECT * FROM t WHERE geom && ST_MakeEnvelope(4.5, 4.5, 5.5, 5.5, 4326)",
         );
         assert!(
-            out2.contains("ST_X(geom) BETWEEN 4.5 AND 5.5 AND ST_Y(geom) BETWEEN 4.5 AND 5.5"),
+            out2.contains("__basin_bbox_contains_point(geom, 4.5, 4.5, 5.5, 5.5)"),
             "got: {out2}"
         );
     }
