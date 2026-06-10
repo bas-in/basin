@@ -23,7 +23,7 @@ use basin_catalog::PartitionSpec;
 use basin_common::{BasinError, PartitionKey, Result};
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use sqlparser::ast::ValueWithSpan;
-use sqlparser::ast::{
+use sqlparser::ast::{FunctionArg, FunctionArgExpr, 
     DataType as SqlDataType, Expr, FunctionArguments, TypedString, UnaryOperator, Value,
 };
 
@@ -1444,9 +1444,40 @@ fn coerce_point(expr: &Expr, col: &str) -> Result<Option<[u8; basin_geo::POINT_W
                 .last()
                 .map(|i| i.id_val().to_ascii_lowercase())
                 .unwrap_or_default();
+            // ST_GeomFromGeoJSON / ST_GeomFromText with a literal argument
+            // are constructor shapes every client library emits — decode the
+            // literal inline rather than rejecting the INSERT.
+            if fname == "st_geomfromgeojson" || fname == "st_geomfromtext" {
+                let lit = match &f.args {
+                    FunctionArguments::List(list) => list.args.first().and_then(|a| match a {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
+                            ValueWithSpan {
+                                value: Value::SingleQuotedString(s2),
+                                ..
+                            },
+                        ))) => Some(s2.clone()),
+                        _ => None,
+                    }),
+                    _ => None,
+                };
+                let Some(lit) = lit else {
+                    return Err(BasinError::InvalidSchema(format!(
+                        "POINT column {col}: {fname} requires a string literal argument on the INSERT path"
+                    )));
+                };
+                if fname == "st_geomfromgeojson" {
+                    let pt = basin_geo::geojson::decode_point_geojson(&lit).map_err(|e| {
+                        BasinError::InvalidSchema(format!(
+                            "POINT column {col}: invalid GeoJSON: {e}"
+                        ))
+                    })?;
+                    return Ok(Some(basin_geo::encode_point(&pt)));
+                }
+                return parse_wkt_point(&lit, col).map(Some);
+            }
             if fname != "st_makepoint" {
                 return Err(BasinError::InvalidSchema(format!(
-                    "expected ST_MakePoint(x, y) or WKT literal for POINT column {col}, got {fname}(...)"
+                    "expected ST_MakePoint(x, y), ST_GeomFromText/GeoJSON('...'), or WKT literal for POINT column {col}, got {fname}(...)"
                 )));
             }
             let arg_exprs = match &f.args {

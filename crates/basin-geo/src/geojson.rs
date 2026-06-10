@@ -1,12 +1,11 @@
-//! GeoJSON-style coordinate-array JSON encode/decode for [`LineString`]
-//! and [`Polygon`].
+//! GeoJSON-style coordinate-array JSON encode/decode for [`LineString`],
+//! [`Polygon`], and [`Point`].
 //!
-//! v0.1 wire format. This is the **simplest** structural shape that
-//! Basin can roundtrip — a JSON array of coordinate pairs (linestring)
-//! or array of rings (polygon). It is deliberately *not* full GeoJSON:
-//! we don't emit the `{"type": "...", "coordinates": [...]}` envelope
-//! because that's pure overhead for a column that already carries the
-//! geometry-type information in its schema.
+//! v0.1 wire format for LineString / Polygon: a JSON array of coordinate
+//! pairs (linestring) or array of rings (polygon). Deliberately *not* the
+//! full GeoJSON envelope for those types — the engine column's schema already
+//! carries the geometry type, so the `{"type":"…","coordinates":[…]}` wrapper
+//! would be pure overhead.
 //!
 //! ```text
 //! LineString:  [[lon, lat], [lon, lat], ...]
@@ -18,9 +17,27 @@
 //! caller that wants full GeoJSON can wrap our output in
 //! `{"type": "LineString", "coordinates": <our_output>}` and emit it.
 //!
-//! WKT / WKB / EWKB encoding for these types is a v0.2 add — we don't
-//! need PostGIS-text-compat for v0.1, just a stable JSON form Basin can
-//! roundtrip through `Utf8` columns.
+//! ## Full GeoJSON envelope for POINT (`ST_AsGeoJSON` / `ST_GeomFromGeoJSON`)
+//!
+//! For POINT specifically we **do** emit the full RFC 7946 envelope because
+//! PostGIS's `ST_AsGeoJSON` is the standard client-library expectation and
+//! POINT is a first-class storage type in Basin.
+//!
+//! Output format (no spaces, lon-first per GeoJSON §3.1.2):
+//! ```text
+//! {"type":"Point","coordinates":[x,y]}
+//! ```
+//!
+//! Float formatting: `serde_json::to_string` converts `f64` values through
+//! Rust's Grisu3/Dragon4 implementation, which emits the shortest decimal
+//! representation that round-trips via `f64` parsing — up to 17 significant
+//! digits, matching or exceeding PostGIS's documented ≤15 sig-fig behaviour.
+//! Values like `1.5` print as `1.5` (not `1.5000000000000000`), matching
+//! PostGIS's compact output for exact-decimal inputs.
+//!
+//! WKT / WKB / EWKB encoding for LineString/Polygon types is a v0.2 add —
+//! we don't need PostGIS-text-compat for v0.1, just a stable JSON form Basin
+//! can roundtrip through `Utf8` columns.
 
 use crate::types::{GeometryError, LineString, Point, Polygon};
 
@@ -93,4 +110,75 @@ fn decode_ring(coords: Vec<Vec<f64>>) -> Result<LineString, GeoJsonError> {
         pts.push(Point::new(c[0], c[1]));
     }
     Ok(LineString::new(pts)?)
+}
+
+// ── Full GeoJSON envelope for POINT ──────────────────────────────────────────
+//
+// PostGIS ST_AsGeoJSON output for a POINT is the RFC 7946 §3.1.2 envelope:
+//
+//   {"type":"Point","coordinates":[x,y]}
+//
+// No spaces, lon (x) first, lat (y) second.  serde_json serialises f64 with
+// the shortest decimal that parses back to the same bits (Grisu3/Dragon4) —
+// e.g. 1.5 → "1.5", -73.985… → "-73.985…".  This is at least as precise as
+// PostGIS's documented ≤15 significant digits, and the round-trip property
+// ST_GeomFromGeoJSON(ST_AsGeoJSON(g)) == g holds because we decode with the
+// same f64 parser.
+
+/// Encode a [`Point`] as a full GeoJSON `{"type":"Point","coordinates":[x,y]}`
+/// string (no spaces, PostGIS-compatible format).
+pub fn encode_point_geojson(p: &Point) -> String {
+    // serde_json::to_string on a [f64; 2] emits compact JSON with Rust's
+    // shortest-round-trip float formatter — no extra whitespace.
+    let coords: [f64; 2] = [p.x, p.y];
+    format!(
+        "{{\"type\":\"Point\",\"coordinates\":{}}}",
+        serde_json::to_string(&coords).expect("[f64; 2] always serialises")
+    )
+}
+
+/// Decode a GeoJSON `{"type":"Point","coordinates":[x,y]}` string into a
+/// [`Point`].  The `type` field must be present and equal to `"Point"`
+/// (case-sensitive, matching PostGIS).  Extra top-level keys (e.g. `crs`,
+/// `bbox`) are silently ignored so callers can round-trip PostGIS output
+/// that includes those fields.
+pub fn decode_point_geojson(s: &str) -> Result<Point, GeoJsonError> {
+    // Parse as a generic JSON object so we tolerate extra keys.
+    let v: serde_json::Value =
+        serde_json::from_str(s).map_err(|e| GeoJsonError::Json(e.to_string()))?;
+    let obj = v
+        .as_object()
+        .ok_or_else(|| GeoJsonError::Json("expected JSON object".into()))?;
+
+    // Validate "type" == "Point".
+    match obj.get("type").and_then(|t| t.as_str()) {
+        Some("Point") => {}
+        Some(other) => {
+            return Err(GeoJsonError::Json(format!(
+                "expected GeoJSON type \"Point\", got \"{other}\""
+            )));
+        }
+        None => {
+            return Err(GeoJsonError::Json(
+                "GeoJSON object missing \"type\" field".into(),
+            ));
+        }
+    }
+
+    // Extract coordinates array.
+    let coords = obj
+        .get("coordinates")
+        .and_then(|c| c.as_array())
+        .ok_or_else(|| GeoJsonError::Json("missing or non-array \"coordinates\" field".into()))?;
+
+    if coords.len() != 2 {
+        return Err(GeoJsonError::BadCoord { got: coords.len() });
+    }
+    let x = coords[0]
+        .as_f64()
+        .ok_or_else(|| GeoJsonError::Json("coordinate x is not a number".into()))?;
+    let y = coords[1]
+        .as_f64()
+        .ok_or_else(|| GeoJsonError::Json("coordinate y is not a number".into()))?;
+    Ok(Point::new(x, y))
 }

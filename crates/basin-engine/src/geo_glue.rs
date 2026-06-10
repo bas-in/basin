@@ -19,6 +19,8 @@
 //! | `ST_AsEWKB`         | `(POINT) -> BYTEA` (raw 21-byte WKB)   | identity over the FSB column     |
 //! | `ST_GeomFromText`   | `(TEXT) -> POINT`                      | parses `POINT(x y)` WKT          |
 //! | `ST_GeomFromWKB`    | `(BYTEA) -> POINT`                     | identity into FSB(21)            |
+//! | `ST_AsGeoJSON`      | `(POINT) -> TEXT` (PostGIS GeoJSON)    | `basin_geo::geojson::encode_point_geojson` |
+//! | `ST_GeomFromGeoJSON`| `(TEXT) -> POINT`                      | `basin_geo::geojson::decode_point_geojson` |
 //!
 //! `ST_Contains(box2d, point)` is out of this wave — BOX2D needs its own
 //! physical-type wiring (FSB(33) or LargeBinary) and there is no DDL
@@ -84,6 +86,7 @@ use arrow_schema::DataType;
 use basin_geo::{
     decode_point, dwithin, encode_point, haversine_meters, make_point, Point, POINT_WKB_LEN,
 };
+use basin_geo::geojson::{decode_point_geojson, encode_point_geojson};
 // `geo` crate backing the PG-Wave 3 predicate library. Pure-Rust spatial
 // algorithms; used to evaluate topology predicates (Intersects, Within, etc.)
 // on `geo::Point<f64>` values converted from basin-geo Points at the FFI
@@ -162,6 +165,22 @@ pub(crate) fn install_udfs(ctx: &SessionContext) {
                 TypeSignature::Exact(vec![DataType::Binary]),
                 TypeSignature::Exact(vec![DataType::LargeBinary]),
                 TypeSignature::Exact(vec![DataType::FixedSizeBinary(POINT_WKB_LEN as i32)]),
+            ],
+            Volatility::Immutable,
+        ),
+    }));
+    // ST_AsGeoJSON(p) — POINT → full RFC 7946 GeoJSON envelope (TEXT).
+    // Output: {"type":"Point","coordinates":[x,y]}  (no spaces, lon first).
+    ctx.register_udf(ScalarUDF::from(StAsGeoJsonUdf {
+        signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+    }));
+    // ST_GeomFromGeoJSON(text) — parse full GeoJSON envelope back to POINT.
+    // Accepts both Utf8 and LargeUtf8 (same as ST_GeomFromText).
+    ctx.register_udf(ScalarUDF::from(StGeomFromGeoJsonUdf {
+        signature: Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Utf8]),
+                TypeSignature::Exact(vec![DataType::LargeUtf8]),
             ],
             Volatility::Immutable,
         ),
@@ -861,6 +880,118 @@ impl ScalarUDFImpl for StGeomFromWkbUdf {
             buf.copy_from_slice(bytes);
             out.append_value(buf).map_err(|e| {
                 datafusion::error::DataFusionError::Execution(format!("ST_GeomFromWKB build: {e}"))
+            })?;
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+// ── ST_AsGeoJSON (POINT → GeoJSON text) ──────────────────────────────────────
+//
+// PostGIS format for a 2D point:
+//   {"type":"Point","coordinates":[x,y]}
+// No spaces; lon (x) first, lat (y) second (GeoJSON §3.1.2 / RFC 7946).
+// Floats are formatted by serde_json's Grisu3/Dragon4 shortest-round-trip
+// printer — same precision as PostGIS's ≤15 sig-fig rule for values that
+// are not exact-decimal, and compact output (e.g. "1.5") for exact-decimal
+// inputs.
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct StAsGeoJsonUdf {
+    signature: Signature,
+}
+impl ScalarUDFImpl for StAsGeoJsonUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "st_asgeojson"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let (n, arr) = columnar_unary_to_array(&args.args)?;
+        let mut out = StringBuilder::with_capacity(n, 48 * n);
+        for i in 0..n {
+            match decode_point_at(&arr, i)? {
+                Some(p) => {
+                    out.append_value(encode_point_geojson(&p));
+                }
+                None => out.append_null(),
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+// ── ST_GeomFromGeoJSON (GeoJSON text → POINT) ─────────────────────────────────
+//
+// Parses the PostGIS-canonical {"type":"Point","coordinates":[x,y]} envelope.
+// Extra top-level keys (crs, bbox, …) are silently ignored so that PostGIS
+// output fed back in round-trips cleanly.  Malformed JSON or wrong geometry
+// type surfaces as a DataFusion execution error matching the ST_GeomFromText
+// error style.
+
+fn parse_point_geojson(s: &str) -> DFResult<[u8; POINT_WKB_LEN]> {
+    let p = decode_point_geojson(s).map_err(|e| {
+        datafusion::error::DataFusionError::Execution(format!(
+            "ST_GeomFromGeoJSON: invalid GeoJSON: {e}"
+        ))
+    })?;
+    Ok(encode_point(&make_point(p.x, p.y)))
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct StGeomFromGeoJsonUdf {
+    signature: Signature,
+}
+impl ScalarUDFImpl for StGeomFromGeoJsonUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "st_geomfromgeojson"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(point_dt())
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let (n, arr) = columnar_unary_to_array(&args.args)?;
+        let mut out = FixedSizeBinaryBuilder::with_capacity(n, POINT_WKB_LEN as i32);
+        for i in 0..n {
+            if arr.is_null(i) {
+                out.append_null();
+                continue;
+            }
+            let s: &str = match arr.data_type() {
+                DataType::Utf8 => arr
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("StringArray for Utf8 column")
+                    .value(i),
+                DataType::LargeUtf8 => arr
+                    .as_any()
+                    .downcast_ref::<arrow_array::LargeStringArray>()
+                    .expect("LargeStringArray for LargeUtf8 column")
+                    .value(i),
+                other => {
+                    return Err(datafusion::error::DataFusionError::Execution(format!(
+                        "ST_GeomFromGeoJSON: unsupported argument type {other:?}"
+                    )))
+                }
+            };
+            let bytes = parse_point_geojson(s)?;
+            out.append_value(bytes).map_err(|e| {
+                datafusion::error::DataFusionError::Execution(format!(
+                    "ST_GeomFromGeoJSON build: {e}"
+                ))
             })?;
         }
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
@@ -2050,6 +2181,9 @@ mod tests {
             "st_asewkb",
             "st_geomfromtext",
             "st_geomfromwkb",
+            // GeoJSON
+            "st_asgeojson",
+            "st_geomfromgeojson",
             // PG-Wave 3
             "st_intersects",
             "st_within",
@@ -2079,6 +2213,207 @@ mod tests {
                 scalar.contains_key(name),
                 "expected {name} in scalar function registry, present: {:?}",
                 scalar.keys().filter(|k| k.starts_with("st_")).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    // ── ST_AsGeoJSON / ST_GeomFromGeoJSON unit tests ─────────────────────────
+
+    /// Round-trip: ST_GeomFromGeoJSON(ST_AsGeoJSON(p)) == p byte-for-byte.
+    #[test]
+    fn st_geojson_round_trip() {
+        let as_geo = StAsGeoJsonUdf {
+            signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+        };
+        let from_geo = StGeomFromGeoJsonUdf {
+            signature: Signature::one_of(
+                vec![TypeSignature::Exact(vec![DataType::Utf8])],
+                Volatility::Immutable,
+            ),
+        };
+        // Eiffel Tower (well-known lon/lat with fractional digits).
+        let p = make_point_scalar(2.2945, 48.8584);
+        let json_cv = invoke(&as_geo, vec![p.clone()], DataType::Utf8);
+        let ColumnarValue::Array(json_arr) = json_cv else {
+            panic!("expected Array");
+        };
+        let json_str = json_arr
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0);
+        // Verify the exact PostGIS format: no spaces, "Point" capitalised.
+        assert!(
+            json_str.starts_with("{\"type\":\"Point\",\"coordinates\":["),
+            "unexpected GeoJSON format: {json_str}"
+        );
+
+        // Decode back and compare bytes.
+        let back_cv = invoke(
+            &from_geo,
+            vec![ColumnarValue::Array(json_arr)],
+            point_dt(),
+        );
+        let ColumnarValue::Array(back_arr) = back_cv else {
+            panic!("expected Array");
+        };
+        let original_bytes = match &p {
+            ColumnarValue::Scalar(ScalarValue::FixedSizeBinary(_, Some(b))) => b.clone(),
+            _ => panic!("expected scalar bytes"),
+        };
+        let back_fsb = back_arr
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        assert_eq!(
+            back_fsb.value(0),
+            original_bytes.as_slice(),
+            "ST_GeomFromGeoJSON(ST_AsGeoJSON(p)) must equal original bytes"
+        );
+    }
+
+    /// Exact format: integer-valued coordinates must print without ".0" noise,
+    /// and the output must exactly match the PostGIS-canonical envelope.
+    #[test]
+    fn st_asgeojson_exact_format() {
+        let udf = StAsGeoJsonUdf {
+            signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+        };
+        // Simple integer-lat/lon to verify compact serde_json float printing.
+        let p = make_point_scalar(1.0, 2.0);
+        let res = invoke(&udf, vec![p], DataType::Utf8);
+        let arr = match res {
+            ColumnarValue::Array(a) => a,
+            _ => panic!("expected Array"),
+        };
+        let s = arr.as_any().downcast_ref::<StringArray>().unwrap().value(0);
+        // serde_json formats 1.0_f64 as "1.0" (not "1") — this is the
+        // shortest representation that round-trips, matching PostGIS
+        // for coordinates that are integer-valued floats.
+        assert_eq!(s, "{\"type\":\"Point\",\"coordinates\":[1.0,2.0]}");
+    }
+
+    /// Coordinate precision: a 15-significant-digit coordinate survives the
+    /// GeoJSON round-trip without loss (Grisu3 handles ≥15 sig-fig correctly).
+    #[test]
+    fn st_geojson_coordinate_precision() {
+        let as_geo = StAsGeoJsonUdf {
+            signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+        };
+        let from_geo = StGeomFromGeoJsonUdf {
+            signature: Signature::one_of(
+                vec![TypeSignature::Exact(vec![DataType::Utf8])],
+                Volatility::Immutable,
+            ),
+        };
+        // 15 significant digits — within PostGIS's stated precision guarantee.
+        let lon = 12.345678901234_f64;
+        let lat = -87.654321098765_f64;
+        let p = make_point_scalar(lon, lat);
+        let json_cv = invoke(&as_geo, vec![p], DataType::Utf8);
+        let ColumnarValue::Array(json_arr) = json_cv else {
+            panic!("array");
+        };
+        let back_cv = invoke(
+            &from_geo,
+            vec![ColumnarValue::Array(json_arr)],
+            point_dt(),
+        );
+        let ColumnarValue::Array(back_arr) = back_cv else {
+            panic!("array");
+        };
+        let back_fsb = back_arr
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        let back_pt = decode_point(back_fsb.value(0)).unwrap();
+        assert_eq!(back_pt.x, lon, "lon must survive GeoJSON round-trip");
+        assert_eq!(back_pt.y, lat, "lat must survive GeoJSON round-trip");
+    }
+
+    /// Null passthrough: NULL input must produce NULL output for both UDFs.
+    #[test]
+    fn st_geojson_null_passthrough() {
+        let as_geo = StAsGeoJsonUdf {
+            signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+        };
+        let from_geo = StGeomFromGeoJsonUdf {
+            signature: Signature::one_of(
+                vec![TypeSignature::Exact(vec![DataType::Utf8])],
+                Volatility::Immutable,
+            ),
+        };
+
+        // NULL POINT → NULL TEXT.
+        let null_point =
+            ColumnarValue::Scalar(ScalarValue::FixedSizeBinary(POINT_WKB_LEN as i32, None));
+        let res = invoke(&as_geo, vec![null_point], DataType::Utf8);
+        let arr = match res {
+            ColumnarValue::Array(a) => a,
+            _ => panic!("array"),
+        };
+        assert!(arr.is_null(0), "NULL POINT → ST_AsGeoJSON must be NULL");
+
+        // NULL TEXT → NULL POINT.
+        let null_text = ColumnarValue::Scalar(ScalarValue::Utf8(None));
+        let res2 = invoke(&from_geo, vec![null_text], point_dt());
+        let arr2 = match res2 {
+            ColumnarValue::Array(a) => a,
+            _ => panic!("array"),
+        };
+        assert!(
+            arr2.is_null(0),
+            "NULL TEXT → ST_GeomFromGeoJSON must be NULL"
+        );
+    }
+
+    /// Malformed JSON must produce an execution error (not a panic).
+    #[test]
+    fn st_geomfromgeojson_malformed_errors() {
+        let udf = StGeomFromGeoJsonUdf {
+            signature: Signature::one_of(
+                vec![TypeSignature::Exact(vec![DataType::Utf8])],
+                Volatility::Immutable,
+            ),
+        };
+        let n = 1usize;
+        let config = Arc::new(datafusion::config::ConfigOptions::default());
+        let arg_fields = vec![Arc::new(Field::new(
+            "arg0",
+            DataType::Utf8,
+            true,
+        ))];
+
+        let bad_inputs = [
+            // Completely invalid JSON.
+            "not json",
+            // Valid JSON but wrong type.
+            "{\"type\":\"LineString\",\"coordinates\":[[0,0],[1,1]]}",
+            // Missing type field.
+            "{\"coordinates\":[1.0,2.0]}",
+            // Missing coordinates field.
+            "{\"type\":\"Point\"}",
+            // Wrong coordinate arity (3D — not supported in v0.1).
+            "{\"type\":\"Point\",\"coordinates\":[1.0,2.0,3.0]}",
+        ];
+
+        for bad in &bad_inputs {
+            let arr = Arc::new(StringArray::from(vec![*bad])) as ArrayRef;
+            let result = udf.invoke_with_args(ScalarFunctionArgs {
+                args: vec![ColumnarValue::Array(arr)],
+                arg_fields: arg_fields.clone(),
+                number_rows: n,
+                return_field: Arc::new(Field::new("out", point_dt(), true)),
+                config_options: config.clone(),
+            });
+            assert!(
+                result.is_err(),
+                "expected error for input {bad:?}, got Ok"
+            );
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("ST_GeomFromGeoJSON"),
+                "error message should name the UDF: {msg}"
             );
         }
     }

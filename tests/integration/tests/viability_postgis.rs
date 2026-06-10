@@ -32,6 +32,7 @@
 
 use std::sync::Arc;
 
+use arrow_array::Array;
 use basin_catalog::InMemoryCatalog;
 use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
@@ -248,4 +249,163 @@ async fn st_intersects_sql_end_to_end() {
         values
     );
     assert_eq!(values, vec![true, false], "ST_Intersects result mismatch");
+}
+
+// ---------------------------------------------------------------------------
+// SQL end-to-end: ST_AsGeoJSON / ST_GeomFromGeoJSON
+// ---------------------------------------------------------------------------
+
+/// SQL assertion 1: ST_AsGeoJSON emits the PostGIS-canonical envelope.
+///
+/// ```sql
+/// SELECT ST_AsGeoJSON(ST_MakePoint(2.2945, 48.8584));
+/// -- expect: {"type":"Point","coordinates":[2.2945,48.8584]}
+/// ```
+#[tokio::test]
+async fn st_asgeojson_sql_format() {
+    let (_dir, engine) = open_engine().await;
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    let result = sess
+        .execute("SELECT ST_AsGeoJSON(ST_MakePoint(2.2945, 48.8584))")
+        .await
+        .unwrap();
+
+    let batches = match result {
+        ExecResult::Rows { batches, .. } => batches,
+        other => panic!("expected Rows, got {other:?}"),
+    };
+
+    let mut values: Vec<String> = Vec::new();
+    for batch in &batches {
+        let col = batch.column(0);
+        let strs = col
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap_or_else(|| panic!("expected StringArray, got {:?}", col.data_type()));
+        for i in 0..strs.len() {
+            values.push(strs.value(i).to_string());
+        }
+    }
+
+    assert_eq!(values.len(), 1);
+    let got = &values[0];
+    println!("[ST_AsGeoJSON format] got = {got}");
+    // Must be the exact PostGIS-canonical form (no spaces, "Point" capitalised,
+    // lon first).
+    assert!(
+        got.starts_with("{\"type\":\"Point\",\"coordinates\":["),
+        "unexpected format: {got}"
+    );
+    assert!(
+        got.ends_with("]}"),
+        "expected GeoJSON to end with ']}}'"
+    );
+    // Coordinates must contain the input values.
+    assert!(got.contains("2.2945"), "missing lon in {got}");
+    assert!(got.contains("48.8584"), "missing lat in {got}");
+}
+
+/// SQL assertion 2: ST_GeomFromGeoJSON round-trips through ST_AsGeoJSON
+/// and recovers the original WKT form via ST_AsText.
+///
+/// ```sql
+/// SELECT ST_AsText(ST_GeomFromGeoJSON('{"type":"Point","coordinates":[1.5,2.5]}'));
+/// -- expect: POINT(1.5 2.5)
+/// ```
+#[tokio::test]
+async fn st_geomfromgeojson_sql_round_trip() {
+    let (_dir, engine) = open_engine().await;
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    let result = sess
+        .execute(
+            "SELECT ST_AsText(ST_GeomFromGeoJSON('{\"type\":\"Point\",\"coordinates\":[1.5,2.5]}'))",
+        )
+        .await
+        .unwrap();
+
+    let batches = match result {
+        ExecResult::Rows { batches, .. } => batches,
+        other => panic!("expected Rows, got {other:?}"),
+    };
+
+    let mut values: Vec<String> = Vec::new();
+    for batch in &batches {
+        let col = batch.column(0);
+        let strs = col
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap_or_else(|| panic!("expected StringArray, got {:?}", col.data_type()));
+        for i in 0..strs.len() {
+            values.push(strs.value(i).to_string());
+        }
+    }
+
+    assert_eq!(values.len(), 1);
+    println!("[ST_GeomFromGeoJSON round-trip] got = {}", values[0]);
+    assert_eq!(
+        values[0], "POINT(1.5 2.5)",
+        "ST_AsText(ST_GeomFromGeoJSON(...)) mismatch"
+    );
+}
+
+/// SQL assertion 3: full round-trip through a table — insert via
+/// ST_GeomFromGeoJSON, read back via ST_AsGeoJSON, confirm the envelope.
+///
+/// ```sql
+/// CREATE TABLE gj (p POINT) WITH (basin.file_format='parquet');
+/// INSERT INTO gj VALUES (ST_GeomFromGeoJSON('{"type":"Point","coordinates":[-73.985,40.748]}'));
+/// SELECT ST_AsGeoJSON(p) FROM gj;
+/// -- expect one row containing -73.985 and 40.748
+/// ```
+#[tokio::test]
+async fn st_geojson_table_round_trip() {
+    let (_dir, engine) = open_engine().await;
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    sess.execute(
+        "CREATE TABLE gj (p POINT) WITH (basin.file_format='parquet')",
+    )
+    .await
+    .unwrap();
+
+    sess.execute(
+        "INSERT INTO gj VALUES \
+         (ST_GeomFromGeoJSON('{\"type\":\"Point\",\"coordinates\":[-73.985,40.748]}'))",
+    )
+    .await
+    .unwrap();
+
+    let result = sess
+        .execute("SELECT ST_AsGeoJSON(p) FROM gj")
+        .await
+        .unwrap();
+
+    let batches = match result {
+        ExecResult::Rows { batches, .. } => batches,
+        other => panic!("expected Rows, got {other:?}"),
+    };
+
+    let mut values: Vec<String> = Vec::new();
+    for batch in &batches {
+        let col = batch.column(0);
+        let strs = col
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap_or_else(|| panic!("expected StringArray, got {:?}", col.data_type()));
+        for i in 0..strs.len() {
+            values.push(strs.value(i).to_string());
+        }
+    }
+
+    assert_eq!(values.len(), 1, "expected exactly one row");
+    let got = &values[0];
+    println!("[ST_AsGeoJSON table round-trip] got = {got}");
+    assert!(got.contains("-73.985"), "missing lon in {got}");
+    assert!(got.contains("40.748"), "missing lat in {got}");
+    assert!(
+        got.starts_with("{\"type\":\"Point\",\"coordinates\":["),
+        "wrong envelope: {got}"
+    );
 }
