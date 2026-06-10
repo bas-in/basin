@@ -2011,6 +2011,17 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
         || (in_txn_for_cache && matches!(stmt, Statement::Insert(_)));
     if !stmt_keeps_cache {
         sess.state.table_meta_cache.invalidate_all();
+        // Fix B+C provider cache: the same statement classes that flush the
+        // table-meta cache can change a table's schema, file set or overlay
+        // shape. Most are caught by the per-query `(snapshot, hot_epoch)` key,
+        // but metadata-only DDL (ENABLE RLS, ADD COLUMN no-rewrite, JSONB
+        // promotion) may not advance the snapshot AND may not bump the hot
+        // epoch, so clear the built-provider + head-probe caches here too. The
+        // head-probe cache also self-invalidates on the catalog-epoch bump these
+        // DDLs raise; this eager clear covers same-session visibility within the
+        // current statement.
+        sess.state.provider_cache.invalidate_all();
+        sess.state.head_probe_cache.invalidate_all();
         // PK row cache (always-on): the same statement classes that
         // flush the table-meta cache — any non-SELECT, plus DML — can change a
         // table's schema or rewrite its rows. Most are caught by the cache's

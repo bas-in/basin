@@ -658,6 +658,18 @@ pub(crate) struct SessionState {
     /// non-`SELECT` statement. See [`TableMetaCache`] for the full
     /// correctness model.
     pub(crate) table_meta_cache: TableMetaCache,
+    /// Per-session DataFusion provider cache (Fix B+C). Memoises the final
+    /// built `Arc<dyn TableProvider>` per `(table, snapshot, hot_epoch)` so the
+    /// auto-commit SELECT refresh skips the bloom-laden `TableMetadata` clone,
+    /// schema conversion and `ListingTable` rebuild on a hit. Bypassed inside a
+    /// transaction; cleared on tx boundaries and the catalog-epoch bump. See
+    /// [`ProviderCache`] for the full correctness model.
+    pub(crate) provider_cache: ProviderCache,
+    /// Per-session live-head probe cache. Lets the [`ProviderCache`] fast path
+    /// build its `(table, snapshot, hot_epoch)` key on a HIT without the
+    /// bloom-laden `load_table` clone. Epoch+TTL validated; cleared in lockstep
+    /// with `provider_cache`. See [`HeadProbeCache`].
+    pub(crate) head_probe_cache: HeadProbeCache,
 }
 
 impl Drop for SessionState {
@@ -717,6 +729,8 @@ impl SessionState {
             last_active: std::sync::Mutex::new(std::time::Instant::now()),
             listen: std::sync::Mutex::new(ListenState::default()),
             table_meta_cache: TableMetaCache::new(),
+            provider_cache: ProviderCache::new(),
+            head_probe_cache: HeadProbeCache::new(),
         }
     }
 }
@@ -918,6 +932,212 @@ impl TableMetaCache {
     }
 }
 
+// ── Per-session DataFusion provider cache (Fix B+C) ─────────────────────────
+//
+// `refresh_table_inner` rebuilds, on EVERY auto-commit SELECT, the full
+// DataFusion provider for each referenced table: a `TableMetadata` clone
+// (bloom-blob-laden — 2-5ms with compaction PK blooms), schema conversion,
+// per-file `ListingTable::try_new`, the optional `HtapUnionTable` wrapper, and
+// `register_table`. At a few-thousand-row scale this dominates the small-query
+// latency floor (19-39ms analytic queries vs PG's 1-7ms).
+//
+// This cache memoises the *final registered provider* (`Arc<dyn TableProvider>`)
+// plus its live file count, keyed by everything the provider bakes in at build
+// time. A HIT skips the catalog load, the bloom clone, the schema conversion and
+// the `ListingTable` build, and only re-runs `register_table(cached)` (cheap).
+//
+// ## What the provider bakes in (the invalidation surface)
+//
+// * **Cold file set** — enumerated from `meta.live_data_files()` at the table's
+//   current snapshot. Keyed by `SnapshotId`: a new INSERT flush / compaction /
+//   rollback advances the snapshot → key miss → rebuild.
+// * **Schema (incl. promoted JSONB shadow columns)** — derived from the
+//   snapshot-keyed `TableMetadata` (`schema` + `promoted_jsonb_paths`). Schema
+//   evolution either advances the snapshot OR is metadata-only DDL; the latter
+//   is caught by the catalog-epoch clear (see below).
+// * **Overlay *shape* gate** — `register_cold_with_overlay` decides AT BUILD
+//   TIME whether to wrap the cold scan in an `HtapUnionTable` (the
+//   `needs_overlay` check: are there tombstones / updates / a tx overlay?). A
+//   plain `ListingTable` cached while the registry was empty has NO overlay
+//   path, so a *later* fast-path UPDATE/DELETE would be invisible to it. The
+//   hot-tier epoch is therefore in the key (see scan-vs-build note).
+//
+// ## HtapUnionTable: scan-time vs build-time capture (the load-bearing finding)
+//
+// `HtapUnionTable::scan` calls `snapshot_tombstones` / `snapshot_updates`
+// against the LIVE `engine.memtable_registry()` at SCAN time — it does NOT bake
+// the tombstone/update set at build time. The ONLY build-time captures are
+// `hot_seq_watermark` (a per-tx MVCC ceiling, `None` in auto-commit) and
+// `tx_overlay` (this tx's uncommitted writes, empty in auto-commit). So in
+// auto-commit a cached `HtapUnionTable` would, on its own, observe fresh
+// registry overlay mutations automatically.
+//
+// BUT the BUILD-time `needs_overlay` gate means a cached *plain ListingTable*
+// (built when the registry held no overlay) cannot grow an overlay path, and a
+// cached `HtapUnionTable` built with overlay rows present keeps applying its
+// (live-read) overlay even after the registry drains. Both transitions move the
+// hot-tier epoch, so `hot_tier_epoch` MUST be in the key to flip provider shape
+// on the empty↔non-empty overlay boundary. (Including the epoch unconditionally
+// is also simplest-correct: it makes the cache a pure function of build inputs.)
+//
+// ## Transactions, RLS
+//
+// * **In-tx reads are NEVER cached and NEVER served from cache.** Inside a tx
+//   the provider bakes a pinned cold snapshot + hot watermark + this tx's
+//   `tx_overlay`, all of which the cache key does not model. The cache is
+//   bypassed whenever `tx_is_active`, and cleared on BEGIN/COMMIT/ROLLBACK.
+// * **RLS does not affect the provider.** RLS is a query-time SQL/plan rewrite;
+//   the registered provider exposes raw rows regardless of the connecting role.
+//   RLS DDL (ENABLE/DISABLE ROW LEVEL SECURITY) bumps the catalog epoch and is
+//   not a `SELECT`, so it flows through the dispatch-top `invalidate_all` hook,
+//   which also clears this cache. RLS tables are therefore cacheable.
+//
+// ## Bounds & lifecycle
+//
+// Per-session LRU (64 entries). Cleared on tx BEGIN/COMMIT/ROLLBACK and on the
+// catalog-epoch bump (same dispatch-top hook as `TableMetaCache::invalidate_all`).
+
+/// Maximum number of distinct (table, snapshot, hot-epoch) provider entries
+/// tracked per session. 64 covers any realistic single-query working set; LRU
+/// eviction bounds churny tables.
+pub(crate) const PROVIDER_CACHE_CAP: usize = 64;
+
+/// Cache key for a fully-built, registered DataFusion provider. Every field is
+/// something the provider bakes in at build time; see the module comment for
+/// why each is load-bearing.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct ProviderCacheKey {
+    /// The table the provider serves.
+    pub(crate) table: TableName,
+    /// Catalog head the cold file set + schema were enumerated at. Advances on
+    /// INSERT-flush / compaction / rollback / most schema evolution.
+    pub(crate) snapshot: SnapshotId,
+    /// Hot-tier mutation epoch (`MemTableRegistry::hot_tier_epoch`). Advances on
+    /// every fast-path INSERT/UPDATE/DELETE overlay write. Flips the build-time
+    /// `needs_overlay` provider shape on the empty↔non-empty boundary.
+    pub(crate) hot_epoch: u64,
+}
+
+/// A cached provider: the final `Arc<dyn TableProvider>` that was registered,
+/// plus the live cold-file count `refresh_table_counted` returns for the
+/// scan-parallelism heuristic (so a HIT need not recount).
+#[derive(Clone)]
+pub(crate) struct ProviderCacheEntry {
+    pub(crate) provider: Arc<dyn datafusion::catalog::TableProvider>,
+    pub(crate) live_file_count: usize,
+    /// Whether the source table is partitioned (so a HIT can still set
+    /// `state.has_partitioned_table` without reloading metadata).
+    pub(crate) partitioned: bool,
+}
+
+/// Per-session bounded LRU cache of fully-built DataFusion providers, keyed by
+/// [`ProviderCacheKey`]. See the module comment for the correctness model.
+pub(crate) struct ProviderCache {
+    inner: std::sync::Mutex<lru::LruCache<ProviderCacheKey, ProviderCacheEntry>>,
+}
+
+impl ProviderCache {
+    pub(crate) fn new() -> Self {
+        let cap = NonZeroUsize::new(PROVIDER_CACHE_CAP).expect("cap is non-zero");
+        Self {
+            inner: std::sync::Mutex::new(lru::LruCache::new(cap)),
+        }
+    }
+
+    /// Look up a built provider by exact key. LRU-touches on hit.
+    pub(crate) fn get(&self, key: &ProviderCacheKey) -> Option<ProviderCacheEntry> {
+        self.inner
+            .lock()
+            .expect("provider_cache lock poisoned")
+            .get(key)
+            .cloned()
+    }
+
+    /// Insert / overwrite the entry for `key`.
+    pub(crate) fn insert(&self, key: ProviderCacheKey, entry: ProviderCacheEntry) {
+        self.inner
+            .lock()
+            .expect("provider_cache lock poisoned")
+            .put(key, entry);
+    }
+
+    /// Drop every entry. Called on tx BEGIN/COMMIT/ROLLBACK and on the
+    /// catalog-epoch bump (DDL/DML dispatch-top hook).
+    pub(crate) fn invalidate_all(&self) {
+        self.inner
+            .lock()
+            .expect("provider_cache lock poisoned")
+            .clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.inner.lock().expect("provider_cache lock poisoned").len()
+    }
+}
+
+/// Per-session cache of a table's live catalog head (snapshot id), used purely
+/// to key the [`ProviderCache`] on a HIT WITHOUT paying the bloom-laden
+/// `TableMetadata` clone that `load_table` performs. Validated against the
+/// catalog epoch exactly like [`TableMetaCache`]: a mismatch (any catalog
+/// mutation since fill) is an instant miss → fall through to `load_table`,
+/// which re-reads the true head. TTL-bounds the epoch-0 (Postgres/Rest)
+/// backends so cross-session DDL becomes visible within the same window the
+/// engine already advertises for catalog reads.
+struct HeadProbeEntry {
+    snapshot: SnapshotId,
+    inserted_at: Instant,
+    catalog_epoch: u64,
+}
+
+pub(crate) struct HeadProbeCache {
+    inner: std::sync::Mutex<lru::LruCache<TableName, HeadProbeEntry>>,
+}
+
+impl HeadProbeCache {
+    pub(crate) fn new() -> Self {
+        let cap = NonZeroUsize::new(PROVIDER_CACHE_CAP).expect("cap is non-zero");
+        Self {
+            inner: std::sync::Mutex::new(lru::LruCache::new(cap)),
+        }
+    }
+
+    /// Return the cached head iff present, epoch-fresh and within TTL.
+    pub(crate) fn get_fresh(&self, table: &TableName, catalog_epoch: u64) -> Option<SnapshotId> {
+        let ttl = table_meta_cache_ttl();
+        let mut g = self.inner.lock().expect("head_probe_cache lock poisoned");
+        let entry = g.get(table)?;
+        let epoch_ok = if catalog_epoch == 0 {
+            true
+        } else {
+            entry.catalog_epoch == catalog_epoch
+        };
+        if epoch_ok && entry.inserted_at.elapsed() <= ttl {
+            Some(entry.snapshot)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn insert(&self, table: TableName, snapshot: SnapshotId, catalog_epoch: u64) {
+        self.inner.lock().expect("head_probe_cache lock poisoned").put(
+            table,
+            HeadProbeEntry {
+                snapshot,
+                inserted_at: Instant::now(),
+                catalog_epoch,
+            },
+        );
+    }
+
+    pub(crate) fn invalidate_all(&self) {
+        self.inner
+            .lock()
+            .expect("head_probe_cache lock poisoned")
+            .clear();
+    }
+}
+
 /// One-shot helper: return the cached `(TableMetadata, view_present)` for
 /// `(project, table)` if fresh; otherwise call `load_table` + `lookup_view`,
 /// populate the cache, and return the new value.
@@ -1110,6 +1330,13 @@ pub(crate) fn tx_begin(state: &SessionState, current_snapshots: HashMap<TableNam
         // first touch of each table (see `tx_hot_seq_watermark_for`), NOT seeded
         // here. Clear any residue from a prior transaction on this session.
         tx.hot_seq_watermark.clear();
+        // Provider cache (Fix B+C) only holds auto-commit-built providers, which
+        // bake the live head + live overlay shape. Entering a tx switches the
+        // build inputs (pinned snapshot, hot watermark, tx overlay), so drop the
+        // cache so no auto-commit provider is reused inside the tx.
+        drop(tx);
+        state.provider_cache.invalidate_all();
+        state.head_probe_cache.invalidate_all();
     }
 }
 
@@ -1134,6 +1361,10 @@ pub(crate) fn tx_commit(state: &SessionState) -> HashMap<TableName, Vec<DataFile
     tx.tx_overlay.clear();
     tx.hot_seq_watermark.clear();
     drop(tx);
+    // Drop any provider built inside this tx (pinned snapshot / tx overlay) so
+    // the next auto-commit read rebuilds against the live head + live overlay.
+    state.provider_cache.invalidate_all();
+    state.head_probe_cache.invalidate_all();
     // PG: xact-scoped advisory locks auto-release at transaction end.
     state.advisory.release_xact();
     pending
@@ -1165,6 +1396,10 @@ pub(crate) fn tx_rollback(
     tx.hot_seq_watermark.clear();
     tx.tx_id = None;
     drop(tx);
+    // Drop any provider built inside this tx so the next auto-commit read
+    // rebuilds against the (rolled-back) live head + live overlay.
+    state.provider_cache.invalidate_all();
+    state.head_probe_cache.invalidate_all();
     // PG: xact-scoped advisory locks auto-release at transaction end
     // (ROLLBACK releases them just like COMMIT).
     state.advisory.release_xact();
@@ -2110,6 +2345,42 @@ async fn register_cold_with_overlay(
     // out of the union so they don't leak into an open transaction.
     hot_seq_watermark: Option<u64>,
 ) -> Result<()> {
+    let provider = build_cold_with_overlay(
+        engine,
+        project,
+        table,
+        df_schema,
+        files,
+        file_format,
+        global_sort_order,
+        pk_columns,
+        tx_overlay,
+        hot_seq_watermark,
+    )
+    .await?;
+    ctx.register_table(tref.clone(), provider)
+        .map_err(|e| BasinError::internal(format!("register_table {table}: {e}")))?;
+    Ok(())
+}
+
+/// Build (but do not register) the cold-tier provider for `table`, wrapping it
+/// in an [`HtapUnionTable`] iff a fast-path DELETE/UPDATE overlay (or this tx's
+/// `tx_overlay`) applies. Split out of [`register_cold_with_overlay`] so the
+/// auto-commit provider cache (Fix B+C) can memoise the returned
+/// `Arc<dyn TableProvider>` and re-register it on a hit without rebuilding.
+#[allow(clippy::too_many_arguments)]
+async fn build_cold_with_overlay(
+    engine: &Engine,
+    project: &ProjectId,
+    table: &TableName,
+    df_schema: &Arc<arrow_schema::Schema>,
+    files: &[DataFileRef],
+    file_format: TableFileFormat,
+    global_sort_order: Option<&[String]>,
+    pk_columns: &[String],
+    tx_overlay: TxOverlayTable,
+    hot_seq_watermark: Option<u64>,
+) -> Result<Arc<dyn datafusion::catalog::TableProvider>> {
     // Build the cold-tier ListingTable over exactly `files`.
     let (ff, file_ext) = listing_file_format(file_format);
     let mut listing_options = ListingOptions::new(ff).with_file_extension(file_ext);
@@ -2148,7 +2419,7 @@ async fn register_cold_with_overlay(
     };
 
     if needs_overlay {
-        // Reuse the transactional overlay implementation by registering an
+        // Reuse the transactional overlay implementation by building an
         // `HtapUnionTable` whose hot half is an empty `MemTable`. The single
         // overlay path lives in `HtapUnionTable::scan`.
         let empty_hot = MemTable::try_new(df_schema.clone(), vec![vec![]])
@@ -2164,14 +2435,11 @@ async fn register_cold_with_overlay(
             tx_overlay,
             hot_seq_watermark,
         );
-        ctx.register_table(tref.clone(), Arc::new(union_provider))
-            .map_err(|e| BasinError::internal(format!("register_table overlay {table}: {e}")))?;
+        Ok(Arc::new(union_provider))
     } else {
         // Tombstone/override-free common case: plain ListingTable, no wrapper.
-        ctx.register_table(tref.clone(), cold_provider)
-            .map_err(|e| BasinError::internal(format!("register_table {table}: {e}")))?;
+        Ok(cold_provider)
     }
-    Ok(())
 }
 
 /// Load `(project, table)` metadata using the current transaction's read-view
@@ -2305,10 +2573,53 @@ async fn refresh_table_inner(
     state: &Arc<SessionState>,
     table: &TableName,
 ) -> Result<usize> {
+    let tref = || TableReference::Bare { table: table.as_str().into() };
+
+    // ── Provider cache fast path (Fix B+C) ──────────────────────────────────
+    //
+    // Only in auto-commit. Inside a transaction the provider bakes a pinned
+    // cold snapshot + hot watermark + this tx's overlay — none of which the
+    // cache key models — so the tx path always rebuilds (and the cache is
+    // cleared at tx boundaries anyway).
+    //
+    // The key needs the table's live head (snapshot) + the hot-tier epoch. To
+    // serve a HIT without the bloom-laden `TableMetadata` clone, we read the
+    // head from the per-session head-probe cache (a tiny `(snapshot, epoch)`
+    // tuple validated against the catalog epoch). On a head-probe miss we fall
+    // through to the full `load_table` below and populate both caches.
+    let auto_commit = !tx_is_active(state);
+    if auto_commit {
+        let catalog_epoch = engine.config().catalog.epoch();
+        if let Some(live_head) = state.head_probe_cache.get_fresh(table, catalog_epoch) {
+            let hot_epoch = engine.memtable_registry().hot_tier_epoch(project, table);
+            let key = ProviderCacheKey {
+                table: table.clone(),
+                snapshot: live_head,
+                hot_epoch,
+            };
+            if let Some(hit) = state.provider_cache.get(&key) {
+                // HIT: re-register the already-built provider. No catalog clone,
+                // no schema conversion, no ListingTable rebuild.
+                let _ = ctx.deregister_table(tref());
+                ctx.register_table(tref(), hit.provider).map_err(|e| {
+                    BasinError::internal(format!("register_table cached {table}: {e}"))
+                })?;
+                state.snapshots.lock().await.insert(table.clone(), live_head);
+                if hit.partitioned {
+                    state
+                        .has_partitioned_table
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                return Ok(hit.live_file_count);
+            }
+        }
+    }
+
     // Transaction-aware load: in an explicit tx this pins the table's read
     // snapshot (REPEATABLE-READ-ish) so a concurrent committer's new rows stay
     // invisible; in auto-commit it is exactly `load_table` (the live head).
     let (meta, live_head) = load_table_for_read(engine, project, state, table).await?;
+
     // The catalog hands us a workspace-version schema; convert into the
     // version DataFusion's `register_listing_table` expects.
     let base_df_schema = schema_ws_to_df(meta.schema.as_ref())?;
@@ -2323,12 +2634,6 @@ async fn refresh_table_inner(
 
     // Drop any stale registration before re-registering. `deregister_table`
     // returns Ok(None) for the first-time path, which is exactly what we want.
-    //
-    // Phase 5.26.F: Use `TableReference::Bare` to preserve the catalog key case
-    // (e.g. "VectorItem" stays "VectorItem", not "vectoritem"). DataFusion's
-    // `From<&str>` impl lowercases unquoted identifiers via `parse_str`, so we
-    // bypass that path by constructing the reference directly.
-    let tref = || TableReference::Bare { table: table.as_str().into() };
     let _ = ctx.deregister_table(tref());
 
     // Catalog-driven read path: enumerate exactly the files that are live at
@@ -2339,28 +2644,28 @@ async fn refresh_table_inner(
     // the scan to the canonical file set the catalog records for the current
     // snapshot, so post-rollback rows are never visible.
     let live_files: Vec<DataFileRef> = meta.live_data_files();
+    let partitioned = meta.partition_spec.is_partitioned();
 
-    if live_files.is_empty() {
+    // Build the provider (the expensive step we want the cache to skip).
+    let provider: Arc<dyn datafusion::catalog::TableProvider> = if live_files.is_empty() {
         // Table has no data at this snapshot (genesis, TRUNCATE, or rolled back
-        // to genesis). Register an empty in-memory table so queries return zero
-        // rows with the correct schema rather than erroring.
-        // MemTable requires at least one partition; supply an empty one.
-        let provider = MemTable::try_new(df_schema, vec![vec![]])
-            .map_err(|e| BasinError::internal(format!("MemTable empty {table}: {e}")))?;
-        ctx.register_table(tref(), Arc::new(provider))
-            .map_err(|e| BasinError::internal(format!("register_table {table}: {e}")))?;
+        // to genesis). An empty in-memory table returns zero rows with the
+        // correct schema rather than erroring. MemTable requires at least one
+        // partition; supply an empty one.
+        Arc::new(
+            MemTable::try_new(df_schema.clone(), vec![vec![]])
+                .map_err(|e| BasinError::internal(format!("MemTable empty {table}: {e}")))?,
+        )
     } else {
         // Non-HTAP cold-only path. When fast-path DELETE tombstones or UPDATE
         // overrides are present for a single-PK table, the shared helper wraps
         // the cold scan in the overlay-aware provider (same overlay as the
-        // transactional `HtapUnionTable::scan`); otherwise it registers a plain
+        // transactional `HtapUnionTable::scan`); otherwise it builds a plain
         // ListingTable with no wrapper overhead.
-        register_cold_with_overlay(
+        build_cold_with_overlay(
             engine,
             project,
-            ctx,
             table,
-            &tref(),
             &df_schema,
             &live_files,
             meta.file_format,
@@ -2369,8 +2674,39 @@ async fn refresh_table_inner(
             tx_overlay_peek(state, table),
             tx_hot_seq_watermark_peek(state, table),
         )
-        .await?;
+        .await?
+    };
+
+    // Populate the auto-commit caches BEFORE registering (so a failure to
+    // register doesn't leave a half-populated cache claiming success). The
+    // provider `Arc` is shared between the cache and the registration.
+    //
+    // Skip caching inside a transaction: the built provider may bake a rewound
+    // historical snapshot, a pinned hot watermark and this tx's `tx_overlay` —
+    // none of which the `(table, snapshot, hot_epoch)` key models. The
+    // head-probe cache is likewise live-head only. Tx-built providers are
+    // re-registered fresh on every read and the caches are cleared at tx
+    // boundaries (`tx_begin`/`tx_commit`/`tx_rollback`).
+    if auto_commit {
+        let hot_epoch = engine.memtable_registry().hot_tier_epoch(project, table);
+        let fill_epoch = engine.config().catalog.epoch();
+        state.head_probe_cache.insert(table.clone(), live_head, fill_epoch);
+        state.provider_cache.insert(
+            ProviderCacheKey {
+                table: table.clone(),
+                snapshot: live_head,
+                hot_epoch,
+            },
+            ProviderCacheEntry {
+                provider: provider.clone(),
+                live_file_count: live_files.len(),
+                partitioned,
+            },
+        );
     }
+
+    ctx.register_table(tref(), provider)
+        .map_err(|e| BasinError::internal(format!("register_table {table}: {e}")))?;
 
     // Cache the *live* head (not the rewound read snapshot) for this session's
     // INSERT/commit optimistic-concurrency baseline. See `load_table_for_read`.
@@ -2380,7 +2716,7 @@ async fn refresh_table_inner(
         .await
         .insert(table.clone(), live_head);
 
-    if meta.partition_spec.is_partitioned() {
+    if partitioned {
         state
             .has_partitioned_table
             .store(true, std::sync::atomic::Ordering::Relaxed);
