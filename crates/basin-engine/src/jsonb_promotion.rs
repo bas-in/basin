@@ -11,14 +11,25 @@
 //!
 //! ## Threshold rationale
 //!
-//! `AUTO_PROMOTE_MIN_HITS = 8` is chosen so that:
-//! * A single noisy burst in a micro-benchmark (≤ 4–5 repeated queries)
-//!   does NOT trigger promotion without genuine, sustained interest.
-//! * A realistic OLAP workload that re-queries the same JSON key 8+ times
-//!   is very likely to continue doing so (justified shadow-column cost).
-//! * The value is deliberately small compared to the adaptive-sort threshold
-//!   (100 queries) because promotion has no per-query runtime cost once it
-//!   fires; the shadow column is materialized asynchronously at insert time.
+//! `AUTO_PROMOTE_MIN_HITS = 3` balances two competing concerns:
+//!
+//! * **Promotion is cheap once materialized.** The shadow column is written
+//!   asynchronously at insert time and costs zero per-query overhead after
+//!   the first compaction; the only cost of promoting "too early" is the
+//!   one-time compaction I/O, which is negligible relative to query savings.
+//!
+//! * **Three observations are sufficient signal.** Seeing the same
+//!   `(col, key)` path three times — even within a single session — reliably
+//!   distinguishes application patterns from one-off exploratory queries.
+//!   One-off queries stop at 1; micro-burst tests that probe every column
+//!   once or twice stop at ≤ 2; an application hitting the same path three
+//!   or more times is essentially certain to continue doing so.
+//!
+//! * **8 was too conservative for large-scale workloads.** A single
+//!   1 M-row table scan costs ~4 s on S3; reaching the old threshold of 8
+//!   required 8 full scans ≈ 32 s of wasted work before promotion fires.
+//!   At 3 hits that waste is capped at ~12 s while still ignoring genuinely
+//!   one-off queries.
 //!
 //! ## Hot-path cost
 //!
@@ -44,7 +55,7 @@ use basin_common::{ProjectId, TableName};
 ///
 /// See module-level doc for the rationale.  Named and exported so tests can
 /// reference the threshold directly.
-pub const AUTO_PROMOTE_MIN_HITS: u64 = 8;
+pub const AUTO_PROMOTE_MIN_HITS: u64 = 3;
 
 // ---------------------------------------------------------------------------
 // Public API

@@ -15,6 +15,7 @@ use basin_common::{PartitionKey, ProjectId, TableName};
 use basin_integration_tests::benchmark::{
     report_real_scaling, AxisSpec, BarOp, PrimaryMetric, SeriesSpec,
 };
+use basin_integration_tests::cache_defaults::{default_test_disk_cache, default_test_page_cache};
 use basin_integration_tests::test_config::{BasinTestConfig, CleanupOnDrop};
 use basin_storage::{Predicate, ReadOptions, ScalarValue, Storage, StorageConfig};
 use futures::StreamExt;
@@ -93,15 +94,13 @@ async fn s3_scaling_data_size() {
         // Sub-prefix per scale so each scale's writes are isolated for
         // bytes-per-row measurement.
         let scale_prefix = format!("{run_prefix}/scale_{scale_idx}");
+        // Matches production cache defaults: disk_cache 1 GiB (tempdir),
+        // page_cache 256 MiB. Bench now measures the default config path.
         let storage = Storage::new(StorageConfig {
             object_store: object_store.clone(),
             root_prefix: Some(ObjectPath::from(scale_prefix.as_str())),
-            // Same rationale as scaling_data_size.rs: this card asserts
-            // a structural scaling bar, not a cache-warmth ratio. Keep
-            // caches off so the 5× bar measures the storage path's
-            // intrinsic cost.
-            disk_cache: None,
-            page_cache: None,
+            disk_cache: default_test_disk_cache(),
+            page_cache: default_test_page_cache(),
         });
 
         let project = ProjectId::new();

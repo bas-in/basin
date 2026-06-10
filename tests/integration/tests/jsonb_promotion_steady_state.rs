@@ -1,7 +1,7 @@
 //! Steady-state measurement of JSONB auto-promotion (ADR 0027 Phase 4).
 //!
 //! The one-shot `compare_postgres` bench seeds → compacts → queries ONCE, so
-//! auto-promotion (fires at 8 query-hits) registers the path but the
+//! auto-promotion (fires at 3 query-hits) registers the path but the
 //! compaction-backfill never runs afterwards — the seeded rows keep reading
 //! via the JSONB UDF. That's a property of the one-shot bench shape, not the
 //! feature: auto-promotion targets a *running deployment* where a hot path is
@@ -114,9 +114,10 @@ async fn jsonb_promotion_steady_state_speedup() {
     pre.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let pre_p50 = pre[pre.len() / 2];
 
-    // --- 2. Drive past the auto-promote threshold (8 hits). The 5 above + 5
-    // here exceed it; promotion fires via the query-history observer. ---
-    for _ in 0..8 {
+    // --- 2. Confirm promotion fired (threshold = 3 hits; the 1 warm + 5 pre
+    // queries above already exceeded it). Run a few more for good measure so
+    // the registry flush has definitely propagated. ---
+    for _ in 0..3 {
         let _ = time_query(&sess, q).await;
     }
     let promoted = engine

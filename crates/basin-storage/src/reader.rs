@@ -232,9 +232,11 @@ pub(crate) async fn list_data_files_with_stats(
         })
         .collect();
 
+    // 32 concurrent GETs: footer reads are IO-bound remote requests;
+    // higher concurrency hides per-request RTT with no added CPU cost.
     let resolved: Vec<Result<(usize, (u64, BTreeMap<String, ColumnStats>))>> =
         futures::stream::iter(work)
-            .buffer_unordered(8)
+            .buffer_unordered(32)
             .collect()
             .await;
 

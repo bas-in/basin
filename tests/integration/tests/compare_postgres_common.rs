@@ -76,7 +76,7 @@
 //! 5. **JSONB warm-up protocol**: for each of the per-row JSONB read
 //!    shapes (#28-#35), both engines execute the exact timed query
 //!    `JSONB_WARMUP_ITERS` times before the clock starts. For Basin this
-//!    allows the auto-promotion observer (threshold AUTO_PROMOTE_MIN_HITS=8)
+//!    allows the auto-promotion observer (threshold AUTO_PROMOTE_MIN_HITS=3)
 //!    to schedule the shadow column; after the warm-up the bench calls
 //!    `shard.flush_to_parquet()` to compact in-memory tail batches, then
 //!    `shard.run_promoted_column_backfill_sweep()` to rewrite every
@@ -215,10 +215,10 @@ const LATENCY_SAMPLES: usize = 100;
 /// JSONB read shape.
 ///
 /// Rationale: Basin has query-history auto-promotion — when a JSON path is
-/// observed `AUTO_PROMOTE_MIN_HITS = 8` times, the engine schedules a shadow
+/// observed `AUTO_PROMOTE_MIN_HITS = 3` times, the engine schedules a shadow
 /// column and the next compaction backfills it, turning the per-row JSONB
 /// UDF dispatch into a plain column read. A one-shot bench never crosses the
-/// threshold. Setting `JSONB_WARMUP_ITERS = 10 > 8` models "an app that has
+/// threshold. Setting `JSONB_WARMUP_ITERS = 10 > 3` models "an app that has
 /// run this query repeatedly" — the universal steady-state for any deployed
 /// application.
 ///
@@ -1518,7 +1518,7 @@ async fn run_jsonb_suite(
     // WARM-UP loop — run the JSONB read queries JSONB_WARMUP_ITERS times on
     // BOTH engines before taking the steady-state timed samples.
     //
-    // For Basin: this crosses AUTO_PROMOTE_MIN_HITS = 8 observed accesses and
+    // For Basin: this crosses AUTO_PROMOTE_MIN_HITS = 3 observed accesses and
     // causes the auto-promotion observer to schedule shadow columns for the
     // accessed JSON paths.
     //

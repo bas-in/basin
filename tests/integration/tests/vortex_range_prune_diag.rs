@@ -286,7 +286,7 @@ async fn vortex_range_prune_signature() {
     // =====================================================================
     // PHASE 3: replicate the bench's JSONB steady-state setup exactly —
     // run the JSONB read enough times to trip auto-promotion
-    // (AUTO_PROMOTE_MIN_HITS=8), then flush_to_parquet + the backfill sweep
+    // (AUTO_PROMOTE_MIN_HITS=3), then flush_to_parquet + the backfill sweep
     // (which REWRITES every cold file to add the shadow column). Then
     // re-measure. Hypothesis: the sweep/compaction rewrite degrades the
     // file zone-maps / id-ordering, so id<100 and the IN-list can no longer

@@ -1625,19 +1625,53 @@ pub(crate) fn pk_point_probe_multi(
         };
     }
 
-    // Build the OR-of-Eq compound predicate for zone-map pruning once.
-    let or_pred: CompoundPredicate = {
+    // Int64 lists answer the zone-map question — "does ANY IN value fall in
+    // this file's [min, max]?" — exactly, in O(log n) per file, by binary
+    // searching the sorted (deduped) key list. This replaces evaluating a
+    // 1000-branch OR per file with identical prune decisions. (A plain
+    // min/max range-overlap test would be a strictly weaker superset that
+    // keeps middle files no key lands in — not used.) Non-Int64 lists keep
+    // the OR-of-Eq compound prune verbatim.
+    let sorted_int_keys: Option<Vec<i64>> = if pk_vals
+        .iter()
+        .all(|v| matches!(v, ScalarValue::Int64(_)))
+    {
+        let mut ks: Vec<i64> = pk_vals
+            .iter()
+            .filter_map(|v| match v {
+                ScalarValue::Int64(n) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        ks.sort_unstable();
+        ks.dedup();
+        Some(ks)
+    } else {
+        None
+    };
+    // 8-byte little-endian Int64 stat decode — the writer's min_bytes /
+    // max_bytes encoding for Int64 columns (see ColumnStats docs).
+    fn stat_i64(b: Option<&[u8]>) -> Option<i64> {
+        let b = b?;
+        let arr: [u8; 8] = b.try_into().ok()?;
+        Some(i64::from_le_bytes(arr))
+    }
+
+    // OR-of-Eq compound predicate for the non-Int64 zone-map fallback.
+    let or_pred: Option<CompoundPredicate> = if sorted_int_keys.is_some() {
+        None
+    } else {
         let alts: Vec<CompoundPredicate> = pk_vals
             .iter()
             .map(|v| {
                 CompoundPredicate::Atom(Predicate::Eq(pk_col.to_string(), v.clone()))
             })
             .collect();
-        if alts.len() == 1 {
+        Some(if alts.len() == 1 {
             alts.into_iter().next().unwrap()
         } else {
             CompoundPredicate::Or(alts)
-        }
+        })
     };
 
     let mut paths: Vec<object_store::path::Path> = Vec::with_capacity(live_files.len());
@@ -1646,30 +1680,53 @@ pub(crate) fn pk_point_probe_multi(
     'file: for f in live_files {
         // 1. Zone-map (min/max) prune: if no value in the list falls within
         //    this file's recorded [min, max] range for the PK column, the
-        //    whole file can be skipped.  Uses the existing OR-of-Eq prune
-        //    logic already present in `evaluate_compound_for_pruning`.
-        if matches!(
-            evaluate_compound_for_pruning(&or_pred, &f.column_stats, schema, f.row_count),
-            PruneOutcome::NoMatch
-        ) {
-            pruned += 1;
-            continue;
+        //    whole file can be skipped. Int64: exact binary search on the
+        //    sorted keys; other types: the OR-of-Eq compound prune. Missing
+        //    or malformed stats fall through (keep the file — conservative).
+        if let Some(keys) = &sorted_int_keys {
+            let cs = f.column_stats.get(pk_col);
+            let fmin = cs.and_then(|c| stat_i64(c.min_bytes.as_deref()));
+            let fmax = cs.and_then(|c| stat_i64(c.max_bytes.as_deref()));
+            if let (Some(fmin), Some(fmax)) = (fmin, fmax) {
+                let idx = keys.partition_point(|k| *k < fmin);
+                if idx == keys.len() || keys[idx] > fmax {
+                    pruned += 1;
+                    continue;
+                }
+            }
+        } else if let Some(or_pred) = &or_pred {
+            if matches!(
+                evaluate_compound_for_pruning(or_pred, &f.column_stats, schema, f.row_count),
+                PruneOutcome::NoMatch
+            ) {
+                pruned += 1;
+                continue;
+            }
         }
 
         // 2. Bloom prune: if the file carries a bloom for the PK column,
-        //    check all values in the IN-list.  If EVERY value is definitively
-        //    absent (bloom says "no") the file can be skipped.  If ANY value
-        //    might be present (bloom says "maybe") the file is a candidate.
+        //    probe the IN-list values. The file is a candidate as soon as
+        //    ANY value is a maybe-hit — and because the caller consumes the
+        //    UNION of candidate paths (no per-key attribution), the loop
+        //    EARLY-EXITS on the first maybe-hit; only when every value is
+        //    definitively absent can the file be skipped.
         if let Some(bloom_bytes) = f.bloom_filters.get(pk_col) {
             if let Some(filter) = bloom_from_bytes(bloom_bytes) {
-                let all_absent = pk_vals.iter().all(|v| match v {
-                    ScalarValue::Int64(n) => !filter.contains(n.to_le_bytes().as_ref()),
-                    ScalarValue::UInt64(n) => !filter.contains(n.to_le_bytes().as_ref()),
-                    ScalarValue::Utf8(s) => !filter.contains(s.as_bytes()),
-                    // No bloom encoding for other types — treat as "maybe".
-                    _ => false,
-                });
-                if all_absent {
+                let mut maybe_present = false;
+                for v in pk_vals {
+                    let hit = match v {
+                        ScalarValue::Int64(n) => filter.contains(n.to_le_bytes().as_ref()),
+                        ScalarValue::UInt64(n) => filter.contains(n.to_le_bytes().as_ref()),
+                        ScalarValue::Utf8(s) => filter.contains(s.as_bytes()),
+                        // No bloom encoding for other types — treat as maybe.
+                        _ => true,
+                    };
+                    if hit {
+                        maybe_present = true;
+                        break;
+                    }
+                }
+                if !maybe_present {
                     pruned += 1;
                     continue 'file;
                 }
