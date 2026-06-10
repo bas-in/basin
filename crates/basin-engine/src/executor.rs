@@ -9791,6 +9791,54 @@ async fn htap_promote_to_registry(
                 }
             };
 
+        // ── S2: write-through PK row cache context ───────────────────────────
+        //
+        // After we insert each row into the memtable below we ALSO seed the
+        // process-global `PkRowCache` so the *next* point read for that PK is a
+        // ~2-5 µs HashMap hit instead of an O(n) memtable snapshot walk +
+        // IPC decode. The cache is only meaningful (and only correct) for the
+        // canonical single-PK point-lookup shape that `fast_select` serves from
+        // it, so we gate the write-through on exactly that shape:
+        //
+        //   * single-column PK whose key encodes (i.e. `pk_info` resolved AND
+        //     `pk_columns.len() == 1`) — the only shape `pk_row_cache::get`
+        //     ever keys; a composite PK or counter fallback is never cached;
+        //   * RLS DISABLED — the cache stores the RAW row, never an RLS-filtered
+        //     view (bug family #159), and the read path bypasses the cache for
+        //     RLS tables, so an RLS row must never enter it;
+        //   * `proj_hash == hash_read_cols(None)` — we store the FULL-schema row
+        //     image (the single sliced batch carries every column), matching the
+        //     full-projection / `SELECT *` lookup shape. A narrower projection
+        //     read computes a different `proj_hash` and simply misses (no
+        //     wrong-column hit), then repopulates via the cold read.
+        //
+        // The dual watermarks are captured PER ROW *after* the memtable insert
+        // (see the insert loop): the insert bumps the table's hot epoch, so the
+        // post-insert epoch is the value a concurrent reader would observe right
+        // now — caching it makes the entry valid immediately. The snapshot id is
+        // the committed `current_snapshot` (these rows are now durable in the
+        // memtable overlay on top of that snapshot; a later cold-tier commit
+        // advances it and invalidates the entry, exactly as the cold-read
+        // populate path relies on).
+        // `Some(snapshot_id)` enables the per-row write-through; the cached entry
+        // is keyed by the row's encoded PK (`pk_key` below), so we need no column
+        // index here — only the snapshot watermark to store alongside it.
+        let pk_cache_single: Option<u64> = match pk_info.as_ref() {
+            // Composite PK or counter fallback: never cached (the cache keys a
+            // single encoded PK only). The memtable still gets its PK / counter
+            // keyed entry below; only the cache write-through is skipped.
+            Some(cols) if cols.len() == 1 => {
+                match crate::session::load_table_meta_cached_err(sess, table).await {
+                    // RLS table → skip (cache must never hold a raw RLS row).
+                    Ok(meta) if !meta.rls_enabled => Some(meta.current_snapshot.0),
+                    // RLS table or catalog miss → skip the write-through.
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let pk_cache_proj_hash = crate::pk_row_cache::hash_read_cols(None);
+
         for batch in batches {
             let approx_bytes = batch.get_array_memory_size() as u64;
             // Budget gate.
@@ -9817,29 +9865,61 @@ async fn htap_promote_to_registry(
                 // 1. The memtable PK direct-get fast path can find the row.
                 // 2. Future merge-on-read can dedupe hot vs cold by PK.
                 //
-                // Falls back to a monotonic counter key when the PK cannot be
-                // encoded (unsupported type, NULL PK, or no PK declared).
-                let key = if let Some(ref pk_cols) = pk_info {
-                    build_pk_row_key(batch, row_idx, pk_cols)
-                        .unwrap_or_else(|| {
-                            // Unsupported PK type or NULL — use counter fallback.
-                            // warn! is rate-limited by the one-per-table pre-fetch
-                            // warning above; only log here for NULL PK values which
-                            // are unexpected on a table with a PK constraint.
-                            basin_hottier::RowKey::builder()
-                                .append_u64(entry.memtable.total_count() as u64)
-                                .finish()
-                        })
-                } else {
-                    // No PK info — monotonic counter key.
-                    basin_hottier::RowKey::builder()
-                        .append_u64(entry.memtable.total_count() as u64)
-                        .finish()
+                // `pk_key` is `Some` only when the row's PK actually encoded
+                // (single- or multi-column). When it is `None` we fall back to a
+                // monotonic counter key. The S2 cache write-through below fires
+                // ONLY when `pk_key` is `Some` AND the table is single-PK
+                // (`pk_cache_single`), so the cached key byte-matches what
+                // `fast_select`'s `pk_scalar_to_row_key` lookup produces — never
+                // a counter key (which the read path would never query).
+                let pk_key: Option<basin_hottier::RowKey> = pk_info
+                    .as_ref()
+                    .and_then(|pk_cols| build_pk_row_key(batch, row_idx, pk_cols));
+                let key = match pk_key.clone() {
+                    Some(k) => k,
+                    None => {
+                        // No PK info, unsupported PK type, or NULL PK — use a
+                        // monotonic counter key. warn! is rate-limited by the
+                        // one-per-table pre-fetch warning above.
+                        basin_hottier::RowKey::builder()
+                            .append_u64(entry.memtable.total_count() as u64)
+                            .finish()
+                    }
                 };
 
                 entry
                     .memtable
                     .insert(key, basin_hottier::MemRowValue::row(row_bytes, 0));
+
+                // S2: write-through to the PK row cache. Single-PK, RLS-disabled,
+                // PK-encodable rows only (see `pk_cache_single`). Capture the hot
+                // epoch AFTER the insert above (the insert bumped it) so the
+                // cached entry's watermark equals the value a reader observes
+                // right now — the entry is therefore immediately valid. A later
+                // mutation bumps the epoch again and invalidates it. The cached
+                // image is the full-schema single-row batch (`proj_hash =
+                // hash_read_cols(None)`), matching the full-projection lookup
+                // shape; narrower projections miss and repopulate from cold.
+                //
+                // Multi-row INSERT note: each insert bumps the epoch, so within
+                // one multi-row batch only the LAST row's entry stays valid
+                // (earlier rows are invalidated by the later inserts' epoch
+                // bumps). That is correct — never stale — and the common
+                // single-row INSERT warms cleanly. A later point read for an
+                // earlier row simply misses and repopulates from the (now
+                // memtable-resident) row, so there is no correctness gap.
+                if let (Some(snapshot_id), Some(pk_rk)) = (pk_cache_single, pk_key) {
+                    let hot_epoch_after = entry.memtable.epoch();
+                    sess.engine.pk_row_cache().insert(
+                        &sess.project,
+                        table,
+                        pk_rk,
+                        hot_epoch_after,
+                        snapshot_id,
+                        pk_cache_proj_hash,
+                        vec![row_batch],
+                    );
+                }
             }
         }
     }
