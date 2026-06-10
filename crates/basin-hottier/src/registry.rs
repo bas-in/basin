@@ -252,6 +252,27 @@ impl MemTableRegistry {
             .unwrap_or(0)
     }
 
+    /// Current hot-tier MVCC sequence high-water mark for `(project, table)`.
+    ///
+    /// Returns the memtable's monotonic write sequence, advanced on every
+    /// insert / upsert / delete. Returns `0` when the project/table has never
+    /// received a write (no memtable entry exists), matching a freshly
+    /// constructed memtable's `current_seq()`, so the watermark is consistent
+    /// across the lazy-allocation boundary.
+    ///
+    /// Captured by an opening transaction as its per-table `hot_seq_watermark`
+    /// (at first-touch, mirroring the cold-snapshot pin). The overlay read path
+    /// then drops any registry entry whose `seq` exceeds the pinned watermark —
+    /// a write committed by another session *after* the transaction pinned its
+    /// snapshot — so hot-tier UPDATE/DELETE fast-path writes no longer leak into
+    /// an open transaction's view.
+    pub fn hot_tier_seq(&self, project: &ProjectId, table: &TableName) -> u64 {
+        self.tables
+            .get(&(*project, table.clone()))
+            .map(|e| e.memtable.current_seq())
+            .unwrap_or(0)
+    }
+
     /// Look up an existing entry without creating one.
     pub fn get(&self, project: &ProjectId, table: &TableName) -> Option<Arc<MemTableEntry>> {
         self.tables

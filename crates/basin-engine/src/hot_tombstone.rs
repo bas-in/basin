@@ -60,19 +60,42 @@ use futures::StreamExt;
 /// between the DELETE and the next compaction/flush, so the typical OLTP
 /// working-set fits comfortably in memory (thousands of keys at most before
 /// the flush task drains them).
+/// `watermark` implements hot-tier transaction-snapshot isolation:
+/// * `None` — auto-commit read. No filtering; every registered tombstone is
+///   returned (the read sees the latest committed hot-tier state). Zero extra
+///   cost: takes the lighter `snapshot()` path that does not carry seqs.
+/// * `Some(w)` — in-transaction read. Only tombstones written at or before the
+///   transaction's pinned sequence watermark `w` are returned; a tombstone with
+///   `seq > w` was written by another session *after* this transaction pinned
+///   its snapshot and MUST stay invisible (it must not hide a row the
+///   transaction is entitled to see). The transaction's OWN in-tx tombstones
+///   are layered separately by [`merge_tx_overlay`] and always win.
 pub(crate) fn snapshot_tombstones(
     registry: &MemTableRegistry,
     project: &ProjectId,
     table: &TableName,
+    watermark: Option<u64>,
 ) -> HashSet<Vec<u8>> {
     let Some(entry) = registry.get(project, table) else {
         return HashSet::new();
     };
-    let snap = entry.memtable.snapshot();
     let mut out: HashSet<Vec<u8>> = HashSet::new();
-    for (key, value) in snap {
-        if matches!(value, MemRowValue::Tombstone) {
-            out.insert(key.as_bytes().to_vec());
+    match watermark {
+        // Auto-commit: no recency filter, lighter snapshot.
+        None => {
+            for (key, value) in entry.memtable.snapshot() {
+                if matches!(value, MemRowValue::Tombstone) {
+                    out.insert(key.as_bytes().to_vec());
+                }
+            }
+        }
+        // In-transaction: drop post-snapshot tombstones (seq > watermark).
+        Some(w) => {
+            for (key, value, seq) in entry.memtable.snapshot_with_seq() {
+                if seq <= w && matches!(value, MemRowValue::Tombstone) {
+                    out.insert(key.as_bytes().to_vec());
+                }
+            }
         }
     }
     out
@@ -101,21 +124,47 @@ fn decode_ipc_row(bytes: &[u8]) -> Option<RecordBatch> {
 ///
 /// The override map is bounded like the tombstone snapshot: overrides live in
 /// the memtable only between the UPDATE and the next compaction/flush.
+/// `watermark` implements the same hot-tier transaction-snapshot isolation as
+/// [`snapshot_tombstones`]:
+/// * `None` — auto-commit read. Every registered UPDATE override is surfaced.
+/// * `Some(w)` — in-transaction read. Only overrides written at or before the
+///   transaction's pinned sequence `w` are surfaced; an override with `seq > w`
+///   was written by another session after the snapshot was pinned and is
+///   dropped so the transaction continues to see the pre-snapshot value (the
+///   cold row, or its own earlier in-tx override via [`merge_tx_overlay`]).
 pub(crate) fn snapshot_updates(
     registry: &MemTableRegistry,
     project: &ProjectId,
     table: &TableName,
+    watermark: Option<u64>,
 ) -> std::collections::HashMap<Vec<u8>, RecordBatch> {
     let mut out: std::collections::HashMap<Vec<u8>, RecordBatch> = std::collections::HashMap::new();
     let Some(entry) = registry.get(project, table) else {
         return out;
     };
-    let snap = entry.memtable.snapshot();
-    for (key, value) in snap {
-        if let MemRowValue::Update { bytes, .. } = value {
-            if let Some(rb) = decode_ipc_row(&bytes) {
-                if rb.num_rows() > 0 {
-                    out.insert(key.as_bytes().to_vec(), rb);
+    match watermark {
+        None => {
+            for (key, value) in entry.memtable.snapshot() {
+                if let MemRowValue::Update { bytes, .. } = value {
+                    if let Some(rb) = decode_ipc_row(&bytes) {
+                        if rb.num_rows() > 0 {
+                            out.insert(key.as_bytes().to_vec(), rb);
+                        }
+                    }
+                }
+            }
+        }
+        Some(w) => {
+            for (key, value, seq) in entry.memtable.snapshot_with_seq() {
+                if seq > w {
+                    continue;
+                }
+                if let MemRowValue::Update { bytes, .. } = value {
+                    if let Some(rb) = decode_ipc_row(&bytes) {
+                        if rb.num_rows() > 0 {
+                            out.insert(key.as_bytes().to_vec(), rb);
+                        }
+                    }
                 }
             }
         }
@@ -891,7 +940,8 @@ pub(crate) fn maybe_wrap_with_tombstone_filter(
         return inner;
     }
     let pk_col = &pk_columns[0];
-    let tombs = snapshot_tombstones(registry, project, table);
+    // Auto-commit DataFusion read path: no transaction watermark.
+    let tombs = snapshot_tombstones(registry, project, table, None);
     if tombs.is_empty() {
         return inner;
     }
@@ -982,8 +1032,11 @@ impl datafusion::catalog::TableProvider for TombstoneFilteringTable {
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let registry = self.engine.memtable_registry();
-        let tombs = snapshot_tombstones(registry.as_ref(), &self.project, &self.table);
-        let updates = snapshot_updates(registry.as_ref(), &self.project, &self.table);
+        // `TombstoneFilteringTable` is the AUTO-COMMIT (non-transactional) cold
+        // read provider; transaction-isolated reads go through `HtapUnionTable`
+        // instead. No watermark → surface the latest committed hot-tier state.
+        let tombs = snapshot_tombstones(registry.as_ref(), &self.project, &self.table, None);
+        let updates = snapshot_updates(registry.as_ref(), &self.project, &self.table, None);
 
         // No tombstones AND no UPDATE overrides → zero-overhead pass-through.
         // Hand the cold provider the original projection / filters / limit.
@@ -1106,8 +1159,10 @@ impl datafusion::catalog::TableProvider for TombstoneFilteringTable {
         // (Vortex/Parquet) scan zero filters, so a selective `WHERE id < 100`
         // on a table with any DELETE/UPDATE overlay became a full-column scan.
         let registry = self.engine.memtable_registry();
-        let tombs = snapshot_tombstones(registry.as_ref(), &self.project, &self.table);
-        let updates = snapshot_updates(registry.as_ref(), &self.project, &self.table);
+        // Pushdown gate is a presence check on the auto-commit overlay; no
+        // transaction watermark applies here (see `scan`).
+        let tombs = snapshot_tombstones(registry.as_ref(), &self.project, &self.table, None);
+        let updates = snapshot_updates(registry.as_ref(), &self.project, &self.table, None);
         if !tombs.is_empty() || !updates.is_empty() {
             let cold = self.cold.supports_filters_pushdown(filters)?;
             return Ok(cold

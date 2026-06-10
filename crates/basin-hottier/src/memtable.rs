@@ -90,6 +90,25 @@ impl MemRowValue {
     }
 }
 
+// ── Stored entry (value + MVCC sequence) ──────────────────────────────────────
+
+/// What the memtable actually stores per key: the [`MemRowValue`] plus the
+/// monotonic sequence assigned to the write that produced it.
+///
+/// The sequence is the MVCC foundation for transaction-snapshot isolation of
+/// hot-tier overlay writes (ADR 0016 isolation addendum). An open transaction
+/// pins a `hot_seq_watermark` at first-touch; the overlay read path filters out
+/// any entry whose `seq` exceeds that watermark, so writes committed by *other*
+/// sessions via the auto-commit UPDATE/DELETE fast paths after the pin stay
+/// invisible to the transaction's snapshot. Auto-commit reads ignore the
+/// sequence entirely (no watermark → no filtering → zero hot-path cost).
+#[derive(Clone, Debug)]
+struct MemEntry {
+    value: MemRowValue,
+    /// Monotonic per-table sequence assigned at insert/delete time.
+    seq: u64,
+}
+
 // ── MemTable ─────────────────────────────────────────────────────────────────
 
 /// In-memory row buffer for a single `(project_id, table_name)` pair.
@@ -97,7 +116,7 @@ impl MemRowValue {
 /// Thread-safe via `parking_lot::RwLock`.  All mutations are O(log n).
 /// The lock is **never** held across I/O.
 pub struct MemTable {
-    inner: RwLock<BTreeMap<RowKey, MemRowValue>>,
+    inner: RwLock<BTreeMap<RowKey, MemEntry>>,
     /// Running estimate of heap bytes consumed by live `Row` values.
     /// Updated atomically on every write so callers can check caps without
     /// acquiring the lock.
@@ -114,6 +133,20 @@ pub struct MemTable {
     /// (INSERT/UPDATE/DELETE that writes only the memtable, not the catalog
     /// snapshot). Starts at 0; first mutation makes it 1.
     epoch: AtomicU64,
+    /// Monotonic MVCC sequence allocator (hot-tier transaction isolation).
+    /// Every insert / upsert / delete claims the next value via
+    /// `fetch_add(1)` and stores it on the written [`MemEntry`]. The
+    /// transaction read path captures `current_seq()` as a watermark and
+    /// filters out any overlay entry whose `seq` exceeds it (a post-snapshot
+    /// write by another session). Starts at 0; the first write stores seq 1.
+    ///
+    /// Distinct from `epoch`: `epoch` is a coarse change-detector for the PK
+    /// row cache ("any mutation happened"), while `seq` is a per-write ordinal
+    /// stamped on each surviving value so the overlay can be filtered by
+    /// recency. They advance together today but carry different contracts;
+    /// keeping them separate avoids overloading the cache-invalidation
+    /// watermark with MVCC semantics.
+    seq: AtomicU64,
 }
 
 impl MemTable {
@@ -124,7 +157,24 @@ impl MemTable {
             bytes_allocated: AtomicU64::new(0),
             oldest_insert_secs: AtomicU64::new(u64::MAX),
             epoch: AtomicU64::new(0),
+            seq: AtomicU64::new(0),
         }
+    }
+
+    /// Current MVCC sequence high-water mark for this table. Cheap — single
+    /// atomic load, no lock. A value `s` means every write so far has a seq
+    /// `<= s`; the next write will store `s + 1`. Captured by an opening
+    /// transaction as its `hot_seq_watermark` so the overlay read path can
+    /// drop any later (`seq > watermark`) write by another session.
+    #[inline]
+    pub fn current_seq(&self) -> u64 {
+        self.seq.load(Ordering::Acquire)
+    }
+
+    /// Claim and return the next monotonic sequence for a write.
+    #[inline]
+    fn next_seq(&self) -> u64 {
+        self.seq.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     /// Current mutation epoch (Fix A). Cheap — single atomic load, no lock.
@@ -186,8 +236,15 @@ impl MemTable {
         let new_bytes = value.heap_bytes() as u64;
         let old_bytes = {
             let mut map = self.inner.write();
-            let old = map.get(&key).map(|v| v.heap_bytes() as u64).unwrap_or(0);
-            map.insert(key, value);
+            let old = map
+                .get(&key)
+                .map(|e| e.value.heap_bytes() as u64)
+                .unwrap_or(0);
+            // Claim the seq under the write lock so the stored seq order matches
+            // the BTreeMap mutation order even under same-key write races (no
+            // seq inversion where an older claim overwrites a newer one).
+            let seq = self.next_seq();
+            map.insert(key, MemEntry { value, seq });
             old
         };
         // Saturating arithmetic avoids underflow on pathological usage.
@@ -212,8 +269,19 @@ impl MemTable {
     pub fn delete(&self, key: RowKey) {
         let old_bytes = {
             let mut map = self.inner.write();
-            let old = map.get(&key).map(|v| v.heap_bytes() as u64).unwrap_or(0);
-            map.insert(key, MemRowValue::Tombstone);
+            let old = map
+                .get(&key)
+                .map(|e| e.value.heap_bytes() as u64)
+                .unwrap_or(0);
+            // Claim the seq under the write lock (see `insert`).
+            let seq = self.next_seq();
+            map.insert(
+                key,
+                MemEntry {
+                    value: MemRowValue::Tombstone,
+                    seq,
+                },
+            );
             old
         };
         self.bytes_allocated.fetch_sub(
@@ -229,7 +297,18 @@ impl MemTable {
     /// Point lookup.  Returns `None` if the key has never been written.
     /// Returns `Some(MemRowValue::Tombstone)` if the row was deleted.
     pub fn get(&self, key: &RowKey) -> Option<MemRowValue> {
-        self.inner.read().get(key).cloned()
+        self.inner.read().get(key).map(|e| e.value.clone())
+    }
+
+    /// Point lookup returning the stored value together with its MVCC
+    /// sequence. `None` when the key was never written. Used by the
+    /// transaction-isolated overlay read path, which must compare `seq`
+    /// against the transaction's pinned `hot_seq_watermark`.
+    pub fn get_with_seq(&self, key: &RowKey) -> Option<(MemRowValue, u64)> {
+        self.inner
+            .read()
+            .get(key)
+            .map(|e| (e.value.clone(), e.seq))
     }
 
     /// Range scan: returns all `(RowKey, MemRowValue)` pairs where
@@ -239,7 +318,7 @@ impl MemTable {
         use std::ops::Bound::Included;
         let map = self.inner.read();
         map.range((Included(lo), Included(hi)))
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, e)| (k.clone(), e.value.clone()))
             .collect()
     }
 
@@ -248,14 +327,31 @@ impl MemTable {
     /// released before returning.
     pub fn snapshot(&self) -> Vec<(RowKey, MemRowValue)> {
         let map = self.inner.read();
-        map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        map.iter()
+            .map(|(k, e)| (k.clone(), e.value.clone()))
+            .collect()
+    }
+
+    /// Like [`snapshot`](Self::snapshot) but also returns each entry's MVCC
+    /// sequence as a third tuple element. Used by the transaction-isolated
+    /// overlay read path to drop entries written after a transaction pinned
+    /// its `hot_seq_watermark`. The lock is released before returning.
+    pub fn snapshot_with_seq(&self) -> Vec<(RowKey, MemRowValue, u64)> {
+        let map = self.inner.read();
+        map.iter()
+            .map(|(k, e)| (k.clone(), e.value.clone(), e.seq))
+            .collect()
     }
 
     // ── Stats ─────────────────────────────────────────────────────────────────
 
     /// Number of live rows (excludes tombstones).
     pub fn live_row_count(&self) -> usize {
-        self.inner.read().values().filter(|v| v.is_row()).count()
+        self.inner
+            .read()
+            .values()
+            .filter(|e| e.value.is_row())
+            .count()
     }
 
     /// Total row count including tombstones.
@@ -281,8 +377,8 @@ impl MemTable {
             let mut map = self.inner.write();
             let mut freed: u64 = 0;
             for k in keys {
-                if let Some(v) = map.remove(k) {
-                    freed += v.heap_bytes() as u64;
+                if let Some(e) = map.remove(k) {
+                    freed += e.value.heap_bytes() as u64;
                 }
             }
             freed
@@ -422,6 +518,60 @@ mod tests {
         }
         mt.delete(key(0));
         assert!(mt.epoch() > last);
+    }
+
+    // ── MVCC sequence (hot-tier transaction isolation) ────────────────────────
+
+    #[test]
+    fn current_seq_starts_at_zero() {
+        let mt = MemTable::new();
+        assert_eq!(mt.current_seq(), 0);
+    }
+
+    #[test]
+    fn seq_increments_on_each_write() {
+        let mt = MemTable::new();
+        mt.insert(key(1), row(0x01));
+        let (_, s1) = mt.get_with_seq(&key(1)).unwrap();
+        assert_eq!(s1, 1, "first write should store seq 1");
+        assert_eq!(mt.current_seq(), 1);
+        mt.insert(key(2), row(0x02));
+        let (_, s2) = mt.get_with_seq(&key(2)).unwrap();
+        assert_eq!(s2, 2);
+        assert_eq!(mt.current_seq(), 2);
+    }
+
+    #[test]
+    fn upsert_bumps_seq_on_same_key() {
+        let mt = MemTable::new();
+        mt.insert(key(1), row(0x01));
+        let (_, s1) = mt.get_with_seq(&key(1)).unwrap();
+        mt.upsert(key(1), row(0x02));
+        let (_, s2) = mt.get_with_seq(&key(1)).unwrap();
+        assert!(s2 > s1, "overwrite must advance seq: {s1} -> {s2}");
+    }
+
+    #[test]
+    fn delete_bumps_seq() {
+        let mt = MemTable::new();
+        mt.insert(key(1), row(0x01));
+        let before = mt.current_seq();
+        mt.delete(key(1));
+        let (v, s) = mt.get_with_seq(&key(1)).unwrap();
+        assert!(v.is_tombstone());
+        assert!(s > before, "delete must advance seq: {before} -> {s}");
+    }
+
+    #[test]
+    fn snapshot_with_seq_carries_per_entry_seq() {
+        let mt = MemTable::new();
+        mt.insert(key(1), row(0x01));
+        mt.insert(key(2), row(0x02));
+        let snap = mt.snapshot_with_seq();
+        assert_eq!(snap.len(), 2);
+        // BTreeMap order: key(1) then key(2); seqs 1 then 2.
+        assert_eq!(snap[0].2, 1);
+        assert_eq!(snap[1].2, 2);
     }
 
     // ── schema_version ────────────────────────────────────────────────────────

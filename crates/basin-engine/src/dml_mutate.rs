@@ -4232,9 +4232,9 @@ async fn materialize_hot_overlay_into_cold(
 ) -> Result<()> {
     let registry = sess.engine.memtable_registry();
     let tombstones =
-        crate::hot_tombstone::snapshot_tombstones(registry.as_ref(), &sess.project, table);
+        crate::hot_tombstone::snapshot_tombstones(registry.as_ref(), &sess.project, table, None);
     let updates =
-        crate::hot_tombstone::snapshot_updates(registry.as_ref(), &sess.project, table);
+        crate::hot_tombstone::snapshot_updates(registry.as_ref(), &sess.project, table, None);
     if tombstones.is_empty() && updates.is_empty() {
         return Ok(());
     }

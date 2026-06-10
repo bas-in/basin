@@ -542,6 +542,22 @@ pub(crate) struct TxState {
     /// statements to the cold copy-on-write path which DOES honour savepoints.
     pub(crate) tx_overlay:
         HashMap<TableName, std::collections::BTreeMap<basin_hottier::RowKey, basin_hottier::MemRowValue>>,
+    /// Hot-tier MVCC sequence watermark pinned per table for this transaction's
+    /// read-view. Captured at the SAME first-touch moment as the cold
+    /// `read_snapshots` pin (inside `load_table_for_read`, after the read's own
+    /// tail flush) so the hot and cold halves of the snapshot are consistent.
+    ///
+    /// The overlay read path (`register_cold_with_overlay` / `HtapUnionTable`)
+    /// passes this watermark to `snapshot_tombstones` / `snapshot_updates`,
+    /// which drop any shared-registry entry whose `seq` exceeds it — i.e. an
+    /// auto-commit UPDATE/DELETE fast-path write another session committed after
+    /// this transaction pinned its snapshot. This closes the documented hot-tier
+    /// isolation gap: those post-snapshot overlay writes no longer leak into an
+    /// open transaction's pinned view. The transaction's OWN `tx_overlay`
+    /// entries are layered on top separately and always win.
+    ///
+    /// Empty outside a transaction; cleared on COMMIT / ROLLBACK.
+    pub(crate) hot_seq_watermark: HashMap<TableName, u64>,
 }
 
 /// Per-session mutable state. The `SessionContext` itself is `Send + Sync`
@@ -1090,6 +1106,10 @@ pub(crate) fn tx_begin(state: &SessionState, current_snapshots: HashMap<TableNam
         tx.tx_id = None;
         tx.htap_rows.clear();
         tx.tx_overlay.clear();
+        // Hot-tier MVCC watermark is, like `read_snapshots`, captured lazily on
+        // first touch of each table (see `tx_hot_seq_watermark_for`), NOT seeded
+        // here. Clear any residue from a prior transaction on this session.
+        tx.hot_seq_watermark.clear();
     }
 }
 
@@ -1112,6 +1132,7 @@ pub(crate) fn tx_commit(state: &SessionState) -> HashMap<TableName, Vec<DataFile
     // `tx_overlay_take_all` *before* this call (mirroring `tx_htap_take_all`);
     // clear defensively in case a caller commits without draining.
     tx.tx_overlay.clear();
+    tx.hot_seq_watermark.clear();
     drop(tx);
     // PG: xact-scoped advisory locks auto-release at transaction end.
     state.advisory.release_xact();
@@ -1141,6 +1162,7 @@ pub(crate) fn tx_rollback(
     // Discard the tx-scoped UPDATE/DELETE overlay — these entries were never
     // written to the shared MemTableRegistry, so ROLLBACK is just a drop.
     tx.tx_overlay.clear();
+    tx.hot_seq_watermark.clear();
     tx.tx_id = None;
     drop(tx);
     // PG: xact-scoped advisory locks auto-release at transaction end
@@ -1209,6 +1231,55 @@ pub(crate) fn tx_read_snapshot_peek(
         return None;
     }
     tx.read_snapshots.get(table).copied()
+}
+
+/// Resolve the hot-tier MVCC sequence watermark `table` should be read at *for
+/// the current transaction's read-view*. The hot-tier twin of
+/// [`tx_read_snapshot_for`]; pinned at the SAME first-touch moment so the hot
+/// and cold halves of the snapshot agree.
+///
+/// Returns `None` when no explicit transaction is active — auto-commit reads
+/// always see the latest committed hot-tier overlay, so the overlay read path
+/// applies no watermark filter (zero cost on the hot path).
+///
+/// When a transaction is active:
+///   * already pinned → return the pinned watermark;
+///   * first touch → record `current_seq` (the registry's live hot-tier
+///     high-water mark for the table, which the caller just read) as the pin
+///     and return it.
+///
+/// `current_seq` is only consulted on the first-touch path; pass
+/// `MemTableRegistry::hot_tier_seq(project, table)` captured alongside the cold
+/// head in `load_table_for_read`.
+pub(crate) fn tx_hot_seq_watermark_for(
+    state: &SessionState,
+    table: &TableName,
+    current_seq: u64,
+) -> Option<u64> {
+    let mut tx = state.tx_state.lock().expect("tx_state lock poisoned");
+    if !tx.active {
+        return None;
+    }
+    if let Some(pinned) = tx.hot_seq_watermark.get(table) {
+        return Some(*pinned);
+    }
+    tx.hot_seq_watermark.insert(table.clone(), current_seq);
+    Some(current_seq)
+}
+
+/// Non-capturing peek at the transaction's pinned hot-tier sequence watermark
+/// for `table`. Returns `None` outside a transaction or before the table's
+/// first touch. Used by the overlay read path to filter post-snapshot
+/// registry writes without re-pinning.
+pub(crate) fn tx_hot_seq_watermark_peek(
+    state: &SessionState,
+    table: &TableName,
+) -> Option<u64> {
+    let tx = state.tx_state.lock().expect("tx_state lock poisoned");
+    if !tx.active {
+        return None;
+    }
+    tx.hot_seq_watermark.get(table).copied()
 }
 
 /// Returns `true` if the current transaction is in the aborted state
@@ -2034,6 +2105,10 @@ async fn register_cold_with_overlay(
     global_sort_order: Option<&[String]>,
     pk_columns: &[String],
     tx_overlay: TxOverlayTable,
+    // Hot-tier MVCC sequence watermark pinned for this transaction's read-view
+    // (`None` in auto-commit). Filters post-snapshot registry overlay writes
+    // out of the union so they don't leak into an open transaction.
+    hot_seq_watermark: Option<u64>,
 ) -> Result<()> {
     // Build the cold-tier ListingTable over exactly `files`.
     let (ff, file_ext) = listing_file_format(file_format);
@@ -2065,8 +2140,8 @@ async fn register_cold_with_overlay(
     let needs_overlay = if pk_columns.len() == 1 {
         use crate::hot_tombstone::{snapshot_tombstones, snapshot_updates};
         let reg = engine.memtable_registry();
-        let tombs = snapshot_tombstones(reg.as_ref(), project, table);
-        let updates = snapshot_updates(reg.as_ref(), project, table);
+        let tombs = snapshot_tombstones(reg.as_ref(), project, table, hot_seq_watermark);
+        let updates = snapshot_updates(reg.as_ref(), project, table, hot_seq_watermark);
         !tombs.is_empty() || !updates.is_empty() || !tx_overlay.is_empty()
     } else {
         false
@@ -2087,6 +2162,7 @@ async fn register_cold_with_overlay(
             table.clone(),
             pk_columns.to_vec(),
             tx_overlay,
+            hot_seq_watermark,
         );
         ctx.register_table(tref.clone(), Arc::new(union_provider))
             .map_err(|e| BasinError::internal(format!("register_table overlay {table}: {e}")))?;
@@ -2118,18 +2194,29 @@ async fn register_cold_with_overlay(
 /// `FeatureNotSupported`) — degrading to read-committed for that one read
 /// rather than erroring the query.
 ///
-/// ## Hot-tier limitation (documented, not yet closed)
+/// ## Hot-tier isolation (cold snapshot + hot MVCC watermark)
 ///
-/// This pins the *cold* (catalog) snapshot only. Rows another session writes
-/// via the hot-tier DELETE/UPDATE fast path land in the shared
-/// `MemTableRegistry` as tombstones / overrides that carry **no sequence or
-/// LSN**, so the overlay union in `register_cold_with_overlay` /
-/// `HtapUnionTable::scan` cannot filter them by a transaction watermark. An
-/// INSERT by another session is *not* a hot-tier overlay entry — it flushes to
-/// Parquet and advances the catalog snapshot, which this pinning hides
-/// correctly. So the common harness shape (concurrent INSERT + COMMIT) is
-/// fully isolated; concurrent hot-tier UPDATE/DELETE of the same rows can still
-/// leak. Closing that needs a sequence field on `MemRowValue` (basin-hottier).
+/// This pins BOTH halves of the transaction's read-view:
+///   * the *cold* (catalog) snapshot, reconstructed at the pinned id below, and
+///   * the *hot* MVCC watermark — captured here at first-touch via
+///     [`tx_hot_seq_watermark_for`] (registry `hot_tier_seq`), then read back by
+///     `register_cold_with_overlay` / `HtapUnionTable::scan`, which drop any
+///     shared-registry overlay entry whose `seq` exceeds it.
+///
+/// So a row another session writes via the hot-tier DELETE/UPDATE fast path
+/// (tombstone / override in the shared `MemTableRegistry`) AFTER this
+/// transaction pinned its snapshot now carries a higher `seq` than the
+/// watermark and is filtered out — it no longer leaks into the open
+/// transaction's reads. (An INSERT by another session flushes to Parquet and
+/// advances the catalog snapshot, which the cold pin already hides.) The
+/// transaction's OWN in-tx overlay (`tx_overlay`) is layered on top and always
+/// wins (read-your-own-writes).
+///
+/// Residual limitation: the memtable is single-version per key, so if another
+/// session OVERWRITES a key multiple times the pre-snapshot value cannot be
+/// reconstructed once gone — only the latest-write's seq is compared against
+/// the watermark. The realistic leak case (a single post-snapshot overlay write
+/// over a row whose pre-snapshot state lived in the cold tier) is fully closed.
 /// Returns `(read_metadata, live_head)`:
 ///   * `read_metadata` is what the reader should register (pinned to the
 ///     transaction read-view inside a tx, live head otherwise).
@@ -2146,6 +2233,15 @@ async fn load_table_for_read(
 ) -> Result<(TableMetadata, SnapshotId)> {
     let meta = engine.config().catalog.load_table(project, table).await?;
     let live_head = meta.current_snapshot;
+    // Pin the hot-tier MVCC watermark at the SAME first-touch moment as the
+    // cold snapshot (after the read's own tail flush, which the caller performs
+    // before refresh): the registry's current sequence for this table is the
+    // hot-tier high-water mark this read observes. The overlay read path filters
+    // out any later (seq > watermark) write by another session. No-op outside a
+    // transaction. Side-effect only — the value is read back via
+    // `tx_hot_seq_watermark_peek` when the overlay union is built.
+    let current_hot_seq = engine.memtable_registry().hot_tier_seq(project, table);
+    let _ = tx_hot_seq_watermark_for(state, table, current_hot_seq);
     let Some(pinned) = tx_read_snapshot_for(state, table, live_head) else {
         // Auto-commit: live head.
         return Ok((meta, live_head));
@@ -2271,6 +2367,7 @@ async fn refresh_table_inner(
             meta.global_sort_order.as_deref(),
             &meta.pk_columns,
             tx_overlay_peek(state, table),
+            tx_hot_seq_watermark_peek(state, table),
         )
         .await?;
     }
@@ -2352,6 +2449,12 @@ pub(crate) async fn refresh_table_qualified(
             meta.global_sort_order.as_deref(),
             &meta.pk_columns,
             tx_overlay_peek(state, bare_name),
+            // Qualified (non-public-schema) tables are not pinned by
+            // `load_table_for_read`, so the watermark peek is `None` here —
+            // consistent with the cold side, which also stays at the live head
+            // for this path. (Public-schema tables delegate to `refresh_table`
+            // above and DO get the pin.)
+            tx_hot_seq_watermark_peek(state, bare_name),
         )
         .await?;
     }
@@ -2416,6 +2519,7 @@ pub(crate) async fn refresh_table_with_extra(
         meta.global_sort_order.as_deref(),
         &meta.pk_columns,
         tx_overlay_peek(state, table),
+        tx_hot_seq_watermark_peek(state, table),
     )
     .await?;
 
@@ -2518,6 +2622,7 @@ pub(crate) async fn refresh_table_with_htap(
             table.clone(),
             meta.pk_columns.clone(),
             tx_overlay_peek(state, table),
+            tx_hot_seq_watermark_peek(state, table),
         );
         ctx.register_table(tref(), Arc::new(union_provider))
             .map_err(|e| BasinError::internal(format!("register_table htap-union {table}: {e}")))?;
@@ -2573,6 +2678,12 @@ struct HtapUnionTable {
     /// uncommitted in-tx fast-path writes (read-your-own-writes). Empty
     /// outside a transaction (or when the tx has no overlay for this table).
     tx_overlay: crate::session::TxOverlayTable,
+    /// Hot-tier MVCC sequence watermark pinned for this transaction's
+    /// read-view (`None` in auto-commit). Passed to `snapshot_tombstones` /
+    /// `snapshot_updates` in `scan` so shared-registry overlay writes another
+    /// session committed *after* this transaction pinned its snapshot
+    /// (`seq > watermark`) are filtered out and never leak into the union.
+    hot_seq_watermark: Option<u64>,
 }
 
 impl std::fmt::Debug for HtapUnionTable {
@@ -2592,6 +2703,7 @@ impl HtapUnionTable {
         table: TableName,
         pk_columns: Vec<String>,
         tx_overlay: crate::session::TxOverlayTable,
+        hot_seq_watermark: Option<u64>,
     ) -> Self {
         Self {
             cold,
@@ -2602,6 +2714,7 @@ impl HtapUnionTable {
             table,
             pk_columns,
             tx_overlay,
+            hot_seq_watermark,
         }
     }
 }
@@ -2634,8 +2747,22 @@ impl datafusion::catalog::TableProvider for HtapUnionTable {
         };
 
         let registry = self.engine.memtable_registry();
-        let mut tombs = snapshot_tombstones(registry.as_ref(), &self.project, &self.table);
-        let mut updates = snapshot_updates(registry.as_ref(), &self.project, &self.table);
+        // Filter the shared-registry overlay to this transaction's pinned
+        // hot-tier watermark (`None` in auto-commit → no filter): entries with
+        // `seq > watermark` were written by other sessions after this tx pinned
+        // its snapshot and must stay invisible.
+        let mut tombs = snapshot_tombstones(
+            registry.as_ref(),
+            &self.project,
+            &self.table,
+            self.hot_seq_watermark,
+        );
+        let mut updates = snapshot_updates(
+            registry.as_ref(),
+            &self.project,
+            &self.table,
+            self.hot_seq_watermark,
+        );
         // Merge this transaction's own uncommitted in-tx fast-path overlay ON
         // TOP of the shared-registry snapshot (tx wins). No-op outside a tx or
         // when this table has no tx overlay.
