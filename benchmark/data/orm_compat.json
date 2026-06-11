@@ -1,5 +1,5 @@
 {
-  "generated_at": "@1781203916",
+  "generated_at": "@1781213328",
   "sections": [
     {
       "orm": "Drizzle",
@@ -110,10 +110,10 @@
     {
       "orm": "Prisma",
       "total": 21,
-      "ok": 19,
-      "typed_error": 2,
+      "ok": 21,
+      "typed_error": 0,
       "regression": 0,
-      "pass_rate_pct": 90.47619047619048,
+      "pass_rate_pct": 100.0,
       "shapes": [
         {
           "sql": "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'User'",
@@ -177,9 +177,7 @@
         },
         {
           "sql": "SELECT \"public\".\"User\".\"id\",\"public\".\"User\".\"email\",\"public\".\"User\".\"name\",\"public\".\"User\".\"createdAt\" FROM \"public\".\"User\" ORDER BY \"public\".\"User\".\"createdAt\" DESC LIMIT 20 OFFSET 0",
-          "outcome": "typed_error",
-          "sqlstate": "57014",
-          "message": "canceling statement due to statement timeout: exceeded statement_timeout (30000 ms)"
+          "outcome": "ok"
         },
         {
           "sql": "BEGIN; SAVEPOINT \"tx1\"; RELEASE SAVEPOINT \"tx1\"; ROLLBACK;",
@@ -191,9 +189,7 @@
         },
         {
           "sql": "SELECT \"public\".\"User\".\"id\" FROM \"public\".\"User\" WHERE \"public\".\"User\".\"id\" = ANY($1::int8[])",
-          "outcome": "typed_error",
-          "sqlstate": "57014",
-          "message": "canceling statement due to statement timeout: exceeded statement_timeout (30000 ms)"
+          "outcome": "ok"
         },
         {
           "sql": "SELECT att.attname AS column_name, pg_catalog.format_type(att.atttypid, att.atttypmod) AS data_type\n           FROM pg_catalog.pg_attribute att\n           JOIN pg_catalog.pg_class cls ON cls.oid = att.attrelid\n           JOIN pg_catalog.pg_namespace nsp ON nsp.oid = cls.relnamespace\n           WHERE nsp.nspname = 'public' AND cls.relname = 'User' AND att.attnum > 0 AND NOT att.attisdropped\n           ORDER BY att.attnum",
@@ -208,10 +204,10 @@
     {
       "orm": "sqlx",
       "total": 19,
-      "ok": 18,
-      "typed_error": 1,
+      "ok": 19,
+      "typed_error": 0,
       "regression": 0,
-      "pass_rate_pct": 94.73684210526315,
+      "pass_rate_pct": 100.0,
       "shapes": [
         {
           "sql": "SELECT id, email, name FROM \"users\" WHERE id = $1",
@@ -267,9 +263,7 @@
         },
         {
           "sql": "COPY \"users\" (id, email) FROM STDIN",
-          "outcome": "typed_error",
-          "sqlstate": "42601",
-          "message": "expected table name or '(' after COPY"
+          "outcome": "ok"
         },
         {
           "sql": "SELECT id FROM \"users\" u WHERE EXISTS (SELECT 1 FROM \"orders\" o WHERE o.user_id = u.id AND o.status = $1)",
@@ -295,11 +289,11 @@
     },
     {
       "orm": "Diesel",
-      "total": 19,
-      "ok": 18,
-      "typed_error": 1,
+      "total": 21,
+      "ok": 21,
+      "typed_error": 0,
       "regression": 0,
-      "pass_rate_pct": 94.73684210526315,
+      "pass_rate_pct": 100.0,
       "shapes": [
         {
           "sql": "SELECT id, title, body, user_id FROM posts WHERE id = 1",
@@ -370,10 +364,16 @@
           "outcome": "ok"
         },
         {
+          "sql": "CREATE TABLE IF NOT EXISTS __diesel_schema_migrations (\n                version VARCHAR(50) PRIMARY KEY NOT NULL,\n                run_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP\n            )",
+          "outcome": "ok"
+        },
+        {
           "sql": "SELECT \"__diesel_schema_migrations\".\"version\", \"__diesel_schema_migrations\".\"run_on\" FROM \"__diesel_schema_migrations\" ORDER BY \"__diesel_schema_migrations\".\"version\" DESC",
-          "outcome": "typed_error",
-          "sqlstate": "XX000",
-          "message": "internal: plan: Error during planning: table 'datafusion.public.__diesel_schema_migrations' not found"
+          "outcome": "ok"
+        },
+        {
+          "sql": "INSERT INTO __diesel_schema_migrations (version) VALUES ($1)",
+          "outcome": "ok"
         },
         {
           "sql": "ROLLBACK",
@@ -383,11 +383,11 @@
     },
     {
       "orm": "TypeORM",
-      "total": 16,
-      "ok": 15,
-      "typed_error": 1,
+      "total": 17,
+      "ok": 17,
+      "typed_error": 0,
       "regression": 0,
-      "pass_rate_pct": 93.75,
+      "pass_rate_pct": 100.0,
       "shapes": [
         {
           "sql": "SELECT \"users\".\"id\" AS \"users_id\",\"users\".\"email\" AS \"users_email\",\"users\".\"name\" AS \"users_name\"\n           FROM \"users\" WHERE \"users\".\"id\" = 1 LIMIT 1",
@@ -450,16 +450,18 @@
           "outcome": "ok"
         },
         {
+          "sql": "CREATE TABLE \"migrations\" (\"id\" SERIAL NOT NULL, \"timestamp\" bigint NOT NULL, \"name\" character varying NOT NULL, CONSTRAINT \"PK_8c82d7f526340ab734260ea46be\" PRIMARY KEY (\"id\"))",
+          "outcome": "ok"
+        },
+        {
           "sql": "SELECT * FROM \"migrations\" ORDER BY \"id\" DESC",
-          "outcome": "typed_error",
-          "sqlstate": "XX000",
-          "message": "internal: plan: Error during planning: table 'datafusion.public.migrations' not found"
+          "outcome": "ok"
         }
       ]
     }
   ],
-  "total_shapes": 99,
-  "total_ok": 94,
-  "total_typed_error": 5,
+  "total_shapes": 102,
+  "total_ok": 102,
+  "total_typed_error": 0,
   "total_regression": 0
 }
