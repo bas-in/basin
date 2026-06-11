@@ -2785,9 +2785,6 @@ pub(crate) async fn exec_update(
     // AUTO_UPDATE injection: any column flagged on the schema that the
     // user didn't explicitly set gets a fresh `now()` micros value.
     inject_auto_update_assignments(schema.as_ref(), &mut assignments);
-    let assignments_have_expressions = assignments
-        .iter()
-        .any(|(_, rhs)| matches!(rhs, AssignmentRhs::Expr(_)));
 
     let data_files = storage
         .list_data_files_with_stats(&sess.project, &table)
@@ -2815,14 +2812,17 @@ pub(crate) async fn exec_update(
         .fields()
         .iter()
         .any(|f| crate::types::field_is_generated(f).is_some());
-    // Expression-RHS assignments need the pre-update batch in memory to
-    // evaluate the expression against the OLD row values (PG semantics),
-    // so they fold into capture_events the same way generated columns do.
+    // Note: expression-RHS assignments do NOT force capture. Both the serial
+    // and the parallel branch evaluate SET expressions through the same
+    // `apply_assignments` → `eval_expression` call against the pre-update
+    // batch (PG semantics: the RHS sees the OLD row values), so an
+    // expression-only UPDATE with no sinks / audit / generated columns /
+    // RETURNING takes the parallel branch and skips the per-row
+    // before/after RowChange JSON that nothing would consume.
     let want_returning_rows = returning.is_some();
     let capture_events = sinks_attached(sess)
         || audit_table.is_some()
         || has_generated_cols
-        || assignments_have_expressions
         || want_returning_rows;
 
     // Walk files. Unlike DELETE, an AllMatch UPDATE still has to read the
@@ -2850,8 +2850,8 @@ pub(crate) async fn exec_update(
     // deterministic order afterwards.
     //
     // The capture_events path (CDC sinks, audit, generated columns,
-    // expression RHS, RETURNING) keeps the serial loop: event ordering and
-    // the per-file before/after pairing are correctness-load-bearing there.
+    // RETURNING) keeps the serial loop: event ordering and the per-file
+    // before/after pairing are correctness-load-bearing there.
     if capture_events {
         for f in &data_files {
             let outcome = file_outcome(pred.as_ref(), f, schema.as_ref());
@@ -4918,9 +4918,12 @@ async fn write_replacement(
         file_format: crate::executor::map_file_format(meta.file_format),
         row_block_size: meta.row_block_size,
         bloom_columns: meta.global_sort_order.clone().unwrap_or_default(),
-        // Vortex encoder cascade: legacy default (Best) — copy-on-write
-        // rewrites keep the slower / smaller cascade so disk usage is
-        // unchanged on this path.
+        // Vortex encoder cascade: Fast — a copy-on-write rewrite is a
+        // latency-critical foreground op (the client is waiting on the
+        // UPDATE/DELETE), so it takes the cheap cascade; background
+        // compaction re-encodes with Best later via its own write path.
+        // Ignored for Parquet tables (see `WriteOptions::encoding_mode`).
+        encoding_mode: basin_storage::EncodingMode::Fast,
         ..Default::default()
     };
     let df = sess
@@ -4985,6 +4988,11 @@ async fn write_replacement_per_file(
         file_format: crate::executor::map_file_format(meta.file_format),
         row_block_size: meta.row_block_size,
         bloom_columns: meta.global_sort_order.clone().unwrap_or_default(),
+        // Vortex encoder cascade: Fast — same policy as `write_replacement`:
+        // the per-file UPDATE rewrite is a foreground op the client waits on,
+        // and background compaction re-encodes with Best later. Ignored for
+        // Parquet tables.
+        encoding_mode: basin_storage::EncodingMode::Fast,
         ..Default::default()
     });
 

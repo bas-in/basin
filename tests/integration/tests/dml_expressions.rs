@@ -422,3 +422,134 @@ async fn where_int_col_eq_string_literal_coerces_not_panics() {
     );
     assert_eq!(remaining, vec![1, 3]);
 }
+
+// ---------------------------------------------------------------------------
+// No-WHERE UPDATE with a CASE expression RHS (the benchmark
+// `conditional_update` shape). With no sinks / audit / generated columns /
+// RETURNING this takes the parallel no-capture cold path; every row must
+// still get the correct CASE arm and untouched columns must be preserved.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn update_no_where_case_expression_all_rows() {
+    let dir = TempDir::new().unwrap();
+    let eng = make_engine(&dir);
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+    sess.execute(
+        "CREATE TABLE txns (id BIGINT NOT NULL, amount BIGINT NOT NULL, status TEXT NOT NULL)",
+    )
+    .await
+    .unwrap();
+    // Three separate INSERTs → multiple data files, so the per-file fan-out
+    // (not just the single-file case) is exercised. Amounts cover all three
+    // CASE arms, including the boundary values 49/50 and 149/150.
+    sess.execute("INSERT INTO txns VALUES (1, 10, 'pending'), (2, 49, 'pending')")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO txns VALUES (3, 50, 'pending'), (4, 149, 'pending')")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO txns VALUES (5, 150, 'pending'), (6, 500, 'pending')")
+        .await
+        .unwrap();
+
+    let res = sess
+        .execute(
+            "UPDATE txns SET status = CASE WHEN amount < 50 THEN 'low' \
+             WHEN amount < 150 THEN 'mid' ELSE 'high' END",
+        )
+        .await
+        .unwrap();
+    assert_eq!(tag(res), "UPDATE 6");
+
+    let statuses = str_col(
+        sess.execute("SELECT status FROM txns ORDER BY id")
+            .await
+            .unwrap(),
+        "status",
+    );
+    assert_eq!(statuses, vec!["low", "low", "mid", "mid", "high", "high"]);
+
+    // Columns not in the SET list must be untouched.
+    let amounts = int64_col(
+        sess.execute("SELECT amount FROM txns ORDER BY id")
+            .await
+            .unwrap(),
+        "amount",
+    );
+    assert_eq!(amounts, vec![10, 49, 50, 149, 150, 500]);
+}
+
+// ---------------------------------------------------------------------------
+// Same CASE-expression UPDATE but with RETURNING: RETURNING forces the
+// serial capture path, which must still evaluate the expression against the
+// OLD row values and project the post-update rows.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn update_case_expression_with_returning() {
+    let dir = TempDir::new().unwrap();
+    let eng = make_engine(&dir);
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+    sess.execute(
+        "CREATE TABLE txns (id BIGINT NOT NULL, amount BIGINT NOT NULL, status TEXT NOT NULL)",
+    )
+    .await
+    .unwrap();
+    sess.execute(
+        "INSERT INTO txns VALUES (1, 10, 'pending'), (2, 100, 'pending'), (3, 900, 'pending')",
+    )
+    .await
+    .unwrap();
+
+    let res = sess
+        .execute(
+            "UPDATE txns SET status = CASE WHEN amount < 50 THEN 'low' \
+             WHEN amount < 150 THEN 'mid' ELSE 'high' END RETURNING id, status",
+        )
+        .await
+        .unwrap();
+    let batches = match res {
+        ExecResult::Rows { batches, .. } => batches,
+        other => panic!("UPDATE … RETURNING must return rows, got {other:?}"),
+    };
+    let mut returned: Vec<(i64, String)> = Vec::new();
+    for b in &batches {
+        let ids = b
+            .column_by_name("id")
+            .expect("RETURNING id column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id is Int64");
+        let sts = b
+            .column_by_name("status")
+            .expect("RETURNING status column")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("status is String");
+        for i in 0..b.num_rows() {
+            returned.push((ids.value(i), sts.value(i).to_string()));
+        }
+    }
+    returned.sort();
+    assert_eq!(
+        returned,
+        vec![
+            (1, "low".to_string()),
+            (2, "mid".to_string()),
+            (3, "high".to_string()),
+        ],
+        "RETURNING must surface the post-update CASE values"
+    );
+
+    // The table itself must hold the same post-update values.
+    let statuses = str_col(
+        sess.execute("SELECT status FROM txns ORDER BY id")
+            .await
+            .unwrap(),
+        "status",
+    );
+    assert_eq!(statuses, vec!["low", "mid", "high"]);
+}
