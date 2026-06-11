@@ -28,7 +28,8 @@
 //! | `mod`, `age`, `power` (float64 override) | `udf::register_pg_compat_udfs` |
 //! | `encode`, `decode`, `md5`, `gen_random_uuid` | `udf::register_pg_udfs` |
 //! | `split_part`, `format`, `quote_ident`, `quote_literal`, `regexp_match`, `regexp_split_to_array`, `chr`, `ascii`, `translate`, `btrim`, `ltrim`, `rtrim` | `string_dt_udf::register_string_dt_udfs` |
-//! | `count`, `sum`, `avg`, `min`, `max`, `array_agg`, `string_agg`, `bool_and`, `bool_or`, `bit_and`, `bit_or` | DataFusion aggregate UDAFs (builtin) |
+//! | `count`, `sum`, `avg`, `min`, `max`, `string_agg`, `bool_and`, `bool_or`, `bit_and`, `bit_or` | DataFusion aggregate UDAFs (builtin) |
+//! | `array_agg` | `pg_agg_udf::PgArrayAggUdaf` (delegates to the DataFusion builtin; vectorized `ORDER BY` accumulator) |
 //!
 //! `every` is a synonym for `bool_and` in PG. We register it here as a scalar
 //! no-op alias that forwards through the SQL rewriter (see

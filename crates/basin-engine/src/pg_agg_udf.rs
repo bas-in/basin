@@ -7,6 +7,21 @@
 //! - `json_object_agg(key, value)` / `jsonb_object_agg(key, value)` → JSON
 //!   object mapping each key to the corresponding value
 //!
+//! ## array_agg (ordered fast path)
+//! - `array_agg(expr ORDER BY sortkey [ASC|DESC])` — Basin overrides
+//!   DataFusion's builtin `array_agg` with [`PgArrayAggUdaf`], a thin wrapper
+//!   that delegates every path to the builtin **except** the non-DISTINCT
+//!   `ORDER BY` path, which it serves with a vectorized accumulator
+//!   ([`OrderedArrayAggAccumulator`]).  The builtin
+//!   `OrderSensitiveArrayAggAccumulator` materialises one `ScalarValue` per
+//!   row plus a `Vec<ScalarValue>` of sort keys per row and sorts via
+//!   row-at-a-time `compare_rows`; at 1M rows that per-row scalar-tree work
+//!   made `ARRAY_AGG(x ORDER BY y)` ~6.5x slower than Postgres.  The
+//!   replacement buffers whole Arrow array chunks and defers everything to
+//!   evaluation time: `concat` + `lexsort_to_indices` + `take`.  Output
+//!   format (a single-row `List` scalar with a nullable `item` field) is
+//!   identical to the builtin.
+//!
 //! ## Ordered-set aggregates (exact, Postgres-compatible)
 //! - `percentile_disc(f) WITHIN GROUP (ORDER BY expr)` — exact discrete
 //!   percentile. Collects all non-NULL values of `expr`, sorts them, returns
@@ -30,13 +45,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, LargeBinaryArray, ListArray, StringArray, StructArray,
+    new_empty_array, Array, ArrayRef, LargeBinaryArray, ListArray, StringArray, StructArray,
+    UInt32Array,
 };
 use datafusion::arrow::buffer::{OffsetBuffer, ScalarBuffer};
+use datafusion::arrow::compute::{concat, lexsort_to_indices, take, SortColumn, SortOptions};
 use datafusion::arrow::datatypes::Schema;
-use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Fields};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{exec_err, plan_err, Result as DFResult};
+use datafusion::functions_aggregate::array_agg::ArrayAgg;
 use datafusion::logical_expr::{
     function::{AccumulatorArgs, StateFieldsArgs},
     AggregateUDFImpl, ColumnarValue, Signature, Volatility,
@@ -435,6 +453,359 @@ fn arrow_scalar_to_string(arr: &dyn Array, i: usize) -> String {
             .map(|a| a.value(i).to_string())
             .unwrap_or_default(),
         _ => format!("{:?}[{i}]", arr.data_type()),
+    }
+}
+
+// ── array_agg (PG override: vectorized ORDER BY path) ────────────────────────
+
+/// Basin's `array_agg` UDAF: a wrapper around DataFusion's builtin
+/// [`ArrayAgg`] that replaces only the non-DISTINCT `ORDER BY` accumulator.
+///
+/// # Why override at all
+/// The builtin serves `array_agg(x ORDER BY y)` with
+/// `OrderSensitiveArrayAggAccumulator`, which buffers a `ScalarValue` per row
+/// *and* a `Vec<ScalarValue>` of sort keys per row, then sorts with
+/// row-at-a-time `compare_rows` and re-materialises through
+/// `ScalarValue::iter_to_array`.  All of that is per-row heap work; at 1M rows
+/// the benchmark measured ~6.5x slower than Postgres.
+///
+/// # What stays delegated (zero behaviour change)
+/// - `array_agg(x)` without ORDER BY — including the fast vectorized
+///   `GroupsAccumulator` path (`groups_accumulator_supported` /
+///   `create_groups_accumulator` delegate).
+/// - `array_agg(DISTINCT x [ORDER BY x])` — builtin
+///   `DistinctArrayAggAccumulator`.
+/// - `IGNORE NULLS` — builtin ordered accumulator (rare; not worth a second
+///   fast path).
+/// - `return_type` / `state_fields` — delegated, so the plan-level schema and
+///   the partial-state schema are byte-identical to the builtin's.
+///
+/// # The fast path
+/// [`OrderedArrayAggAccumulator`] buffers the incoming Arrow array chunks
+/// as-is (a couple of `Arc` clones per `update_batch`) and defers all work to
+/// evaluation: one `concat`, one `lexsort_to_indices` (typed, vectorized;
+/// single-key sorts take the `sort_to_indices` fast path), one `take`.
+/// Partial state is emitted in arrival order — the final-phase accumulator
+/// sorts once after merging, which is strictly less work than the builtin's
+/// sort-per-partial + k-way scalar merge.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PgArrayAggUdaf {
+    inner: ArrayAgg,
+}
+
+impl PgArrayAggUdaf {
+    pub fn new() -> Self {
+        Self {
+            inner: ArrayAgg::default(),
+        }
+    }
+}
+
+impl AggregateUDFImpl for PgArrayAggUdaf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "array_agg"
+    }
+
+    fn signature(&self) -> &Signature {
+        self.inner.signature()
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
+        self.inner.return_type(arg_types)
+    }
+
+    /// Delegated: the partial-aggregation state schema must stay identical to
+    /// the builtin's (`[List<item>, List<Struct<ordering cols>>]` when an
+    /// ORDER BY is present) because [`OrderedArrayAggAccumulator`] emits
+    /// exactly that layout.
+    fn state_fields(&self, args: StateFieldsArgs) -> DFResult<Vec<FieldRef>> {
+        self.inner.state_fields(args)
+    }
+
+    /// Same as the builtin (`SoftRequirement`): the planner may pre-sort the
+    /// input but is never *required* to — the accumulator sorts itself.
+    fn order_sensitivity(&self) -> datafusion::logical_expr::utils::AggregateOrderSensitivity {
+        self.inner.order_sensitivity()
+    }
+
+    /// The fast accumulator always sorts at evaluation time, so a beneficial
+    /// input ordering changes nothing; keep the same UDAF instance.
+    fn with_beneficial_ordering(
+        self: Arc<Self>,
+        _beneficial_ordering: bool,
+    ) -> DFResult<Option<Arc<dyn AggregateUDFImpl>>> {
+        Ok(Some(self))
+    }
+
+    fn supports_null_handling_clause(&self) -> bool {
+        self.inner.supports_null_handling_clause()
+    }
+
+    fn groups_accumulator_supported(&self, args: AccumulatorArgs) -> bool {
+        self.inner.groups_accumulator_supported(args)
+    }
+
+    fn create_groups_accumulator(
+        &self,
+        args: AccumulatorArgs,
+    ) -> DFResult<Box<dyn datafusion::logical_expr::GroupsAccumulator>> {
+        self.inner.create_groups_accumulator(args)
+    }
+
+    fn accumulator(
+        &self,
+        args: AccumulatorArgs,
+    ) -> DFResult<Box<dyn datafusion::logical_expr::Accumulator>> {
+        let field = &args.expr_fields[0];
+        let ignore_nulls = args.ignore_nulls && field.is_nullable();
+        if args.is_distinct || args.order_bys.is_empty() || ignore_nulls {
+            // DISTINCT / unordered / IGNORE NULLS: builtin accumulators are
+            // either already vectorized or rare enough not to matter.  The
+            // state layout matches because `state_fields` is delegated too.
+            return self.inner.accumulator(args);
+        }
+
+        let mut sort_options = Vec::with_capacity(args.order_bys.len());
+        let mut ordering_fields: Vec<FieldRef> = Vec::with_capacity(args.order_bys.len());
+        for sort_expr in args.order_bys {
+            let dt = sort_expr.expr.data_type(args.schema)?;
+            if dt.is_nested() {
+                // `lexsort_to_indices` does not support nested sort keys;
+                // the builtin's row-wise comparator does. Rare shape — keep
+                // the builtin behaviour rather than erroring.
+                return self.inner.accumulator(args);
+            }
+            sort_options.push(sort_expr.options);
+            // Field naming must mirror DataFusion's `ordering_fields` helper
+            // (expr.to_string(), nullable) so the emitted state structs match
+            // the schema declared by the delegated `state_fields`.
+            ordering_fields.push(Arc::new(Field::new(sort_expr.expr.to_string(), dt, true)));
+        }
+        Ok(Box::new(OrderedArrayAggAccumulator::new(
+            field.data_type().clone(),
+            ordering_fields,
+            sort_options,
+        )))
+    }
+}
+
+/// Build the single-row `List` scalar shape that `array_agg` results and
+/// partial states use: `List<Field("item", item_type, nullable)>` with one
+/// list element containing `values`.  This is the same shape
+/// `ScalarValue::new_list_from_iter` / `SingleRowListArrayBuilder` produce,
+/// so results compare equal to the builtin's byte-for-byte.
+fn single_row_list(item_type: DataType, values: ArrayRef) -> ScalarValue {
+    let field = Arc::new(Field::new_list_field(item_type, true));
+    let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, values.len() as i32]));
+    ScalarValue::List(Arc::new(ListArray::new(field, offsets, values, None)))
+}
+
+/// Vectorized accumulator for `array_agg(expr ORDER BY keys...)`.
+///
+/// `update_batch` is O(1) per batch (Arc clones); all real work happens once
+/// per group at evaluation: `concat` the chunks, `lexsort_to_indices` on the
+/// typed key columns (honouring per-key `SortOptions`, i.e. ASC/DESC and
+/// NULLS FIRST/LAST), then `take` the value column through the permutation.
+#[derive(Debug)]
+struct OrderedArrayAggAccumulator {
+    /// Element type of the aggregated column.
+    value_type: DataType,
+    /// Struct fields for the ordering columns in the partial state
+    /// (names/types must match the delegated `state_fields` declaration).
+    ordering_fields: Vec<FieldRef>,
+    /// Sort direction / null placement per ordering column.
+    sort_options: Vec<SortOptions>,
+    /// Buffered value chunks, in arrival order.
+    value_chunks: Vec<ArrayRef>,
+    /// Buffered ordering-column chunks; `ordering_chunks[k][j]` is ordering
+    /// column `j` of chunk `k` (same row count as `value_chunks[k]`).
+    ordering_chunks: Vec<Vec<ArrayRef>>,
+    /// Incrementally tracked slice memory, for `size()` accounting.
+    approx_bytes: usize,
+}
+
+impl OrderedArrayAggAccumulator {
+    fn new(
+        value_type: DataType,
+        ordering_fields: Vec<FieldRef>,
+        sort_options: Vec<SortOptions>,
+    ) -> Self {
+        Self {
+            value_type,
+            ordering_fields,
+            sort_options,
+            value_chunks: vec![],
+            ordering_chunks: vec![],
+            approx_bytes: 0,
+        }
+    }
+
+    fn num_rows(&self) -> usize {
+        self.value_chunks.iter().map(|c| c.len()).sum()
+    }
+
+    fn push_chunk(&mut self, values: ArrayRef, ordering: Vec<ArrayRef>) {
+        // `get_slice_memory_size` counts only this slice's rows, so sliced
+        // per-group batches (GroupsAccumulatorAdapter) don't multiply-count
+        // the shared parent buffers.
+        self.approx_bytes += values.to_data().get_slice_memory_size().unwrap_or(0);
+        for col in &ordering {
+            self.approx_bytes += col.to_data().get_slice_memory_size().unwrap_or(0);
+        }
+        self.value_chunks.push(values);
+        self.ordering_chunks.push(ordering);
+    }
+
+    /// Concatenate the buffered chunks into one values array plus one array
+    /// per ordering column.  Caller must ensure at least one chunk exists.
+    fn concat_columns(&self) -> DFResult<(ArrayRef, Vec<ArrayRef>)> {
+        let values = if self.value_chunks.len() == 1 {
+            Arc::clone(&self.value_chunks[0])
+        } else {
+            let refs: Vec<&dyn Array> = self.value_chunks.iter().map(|c| c.as_ref()).collect();
+            concat(&refs)?
+        };
+        let mut ord_cols = Vec::with_capacity(self.sort_options.len());
+        for j in 0..self.sort_options.len() {
+            let col = if self.ordering_chunks.len() == 1 {
+                Arc::clone(&self.ordering_chunks[0][j])
+            } else {
+                let refs: Vec<&dyn Array> =
+                    self.ordering_chunks.iter().map(|c| c[j].as_ref()).collect();
+                concat(&refs)?
+            };
+            ord_cols.push(col);
+        }
+        Ok((values, ord_cols))
+    }
+
+    /// Compute the sort permutation for the given ordering columns.
+    fn sort_indices(&self, ord_cols: &[ArrayRef]) -> DFResult<UInt32Array> {
+        let sort_cols: Vec<SortColumn> = ord_cols
+            .iter()
+            .zip(self.sort_options.iter())
+            .map(|(col, opts)| SortColumn {
+                values: Arc::clone(col),
+                options: Some(*opts),
+            })
+            .collect();
+        Ok(lexsort_to_indices(&sort_cols, None)?)
+    }
+}
+
+impl datafusion::logical_expr::Accumulator for OrderedArrayAggAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> DFResult<()> {
+        let n_ord = self.sort_options.len();
+        if values.len() < 1 + n_ord {
+            return exec_err!(
+                "array_agg ORDER BY: expected {} input columns, got {}",
+                1 + n_ord,
+                values.len()
+            );
+        }
+        if values[0].is_empty() {
+            return Ok(());
+        }
+        self.push_chunk(Arc::clone(&values[0]), values[1..1 + n_ord].to_vec());
+        Ok(())
+    }
+
+    fn evaluate(&mut self) -> DFResult<ScalarValue> {
+        if self.num_rows() == 0 {
+            // Matches the builtin (and PG): zero rows → NULL, not '{}'.
+            return Ok(ScalarValue::new_null_list(self.value_type.clone(), true, 1));
+        }
+        let (values, ord_cols) = self.concat_columns()?;
+        let indices = self.sort_indices(&ord_cols)?;
+        let sorted = take(values.as_ref(), &indices, None)?;
+        Ok(single_row_list(self.value_type.clone(), sorted))
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of_val(self)
+            + self.approx_bytes
+            + self.value_chunks.capacity() * std::mem::size_of::<ArrayRef>()
+            + self
+                .ordering_chunks
+                .iter()
+                .map(|c| c.capacity() * std::mem::size_of::<ArrayRef>())
+                .sum::<usize>()
+    }
+
+    /// State layout (matching the builtin's declaration, which the delegated
+    /// `state_fields` emits):
+    /// - column 0: single-row `List<item>` of the buffered values
+    /// - column 1: single-row `List<Struct<ordering cols>>`, one struct row
+    ///   per buffered value
+    ///
+    /// Rows are emitted in arrival order — unlike the builtin we do *not*
+    /// pre-sort partial states, because the merging accumulator (always this
+    /// same type; both plan phases come from the same UDAF) sorts once at
+    /// final evaluation.
+    fn state(&mut self) -> DFResult<Vec<ScalarValue>> {
+        let struct_fields = Fields::from(self.ordering_fields.clone());
+        let struct_dt = DataType::Struct(struct_fields.clone());
+        if self.num_rows() == 0 {
+            let empty_cols: Vec<ArrayRef> = self
+                .ordering_fields
+                .iter()
+                .map(|f| new_empty_array(f.data_type()))
+                .collect();
+            let empty_struct: ArrayRef =
+                Arc::new(StructArray::try_new(struct_fields, empty_cols, None)?);
+            return Ok(vec![
+                ScalarValue::new_null_list(self.value_type.clone(), true, 1),
+                single_row_list(struct_dt, empty_struct),
+            ]);
+        }
+        let (values, ord_cols) = self.concat_columns()?;
+        let struct_arr: ArrayRef = Arc::new(StructArray::try_new(struct_fields, ord_cols, None)?);
+        Ok(vec![
+            single_row_list(self.value_type.clone(), values),
+            single_row_list(struct_dt, struct_arr),
+        ])
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> DFResult<()> {
+        if states.len() < 2 {
+            return exec_err!(
+                "array_agg ORDER BY merge: expected 2 state columns, got {}",
+                states.len()
+            );
+        }
+        let Some(vals_list) = states[0].as_any().downcast_ref::<ListArray>() else {
+            return exec_err!("array_agg ORDER BY merge: state[0] must be a List array");
+        };
+        let Some(ords_list) = states[1].as_any().downcast_ref::<ListArray>() else {
+            return exec_err!("array_agg ORDER BY merge: state[1] must be a List array");
+        };
+        for i in 0..vals_list.len() {
+            if vals_list.is_null(i) {
+                continue; // Empty partial (NULL values list).
+            }
+            let vals = vals_list.value(i);
+            if vals.is_empty() {
+                continue;
+            }
+            let ords = ords_list.value(i);
+            let Some(structs) = ords.as_any().downcast_ref::<StructArray>() else {
+                return exec_err!("array_agg ORDER BY merge: orderings must be Struct rows");
+            };
+            if structs.len() != vals.len() {
+                return exec_err!(
+                    "array_agg ORDER BY merge: {} values but {} ordering rows",
+                    vals.len(),
+                    structs.len()
+                );
+            }
+            let cols: Vec<ArrayRef> = structs.columns().to_vec();
+            self.push_chunk(vals, cols);
+        }
+        Ok(())
     }
 }
 
@@ -937,6 +1308,318 @@ mod ordered_set_tests {
         let arr_b: ArrayRef = Arc::new(Int32Array::from(vec![2i32, 3, 3, 3]));
         acc_b.update_batch(&[arr_b]).unwrap();
         assert_eq!(acc_b.evaluate().unwrap(), ScalarValue::Int32(Some(3)));
+    }
+}
+
+// ── unit tests: ordered array_agg ─────────────────────────────────────────────
+
+#[cfg(test)]
+mod ordered_array_agg_tests {
+    use super::*;
+    use datafusion::arrow::array::{Int64Array, StringArray as ArrowStringArray};
+    use datafusion::logical_expr::Accumulator;
+    use std::sync::Arc;
+
+    fn opts(descending: bool, nulls_first: bool) -> SortOptions {
+        SortOptions {
+            descending,
+            nulls_first,
+        }
+    }
+
+    /// Single Int64 sort key over Utf8 values — the benchmark shape.
+    fn make_acc(o: SortOptions) -> OrderedArrayAggAccumulator {
+        OrderedArrayAggAccumulator::new(
+            DataType::Utf8,
+            vec![Arc::new(Field::new("created_at", DataType::Int64, true))],
+            vec![o],
+        )
+    }
+
+    /// Build the expected result through `ScalarValue::new_list_from_iter`,
+    /// the exact constructor DataFusion's builtin ordered array_agg uses for
+    /// its results — full `ScalarValue` equality therefore proves the output
+    /// format (field name, nullability, type, data) is unchanged.
+    fn expected_list(vals: Vec<ScalarValue>, dt: &DataType) -> ScalarValue {
+        ScalarValue::List(ScalarValue::new_list_from_iter(vals.into_iter(), dt, true))
+    }
+
+    fn utf8(s: &str) -> ScalarValue {
+        ScalarValue::Utf8(Some(s.to_string()))
+    }
+
+    fn update(
+        acc: &mut OrderedArrayAggAccumulator,
+        vals: Vec<Option<&str>>,
+        keys: Vec<Option<i64>>,
+    ) {
+        let v: ArrayRef = Arc::new(ArrowStringArray::from(vals));
+        let k: ArrayRef = Arc::new(Int64Array::from(keys));
+        acc.update_batch(&[v, k]).unwrap();
+    }
+
+    /// `ARRAY_AGG(status ORDER BY created_at DESC)` — PG default for DESC is
+    /// NULLS FIRST, hence `nulls_first: true`.
+    #[test]
+    fn array_agg_order_by_desc() {
+        let mut acc = make_acc(opts(true, true));
+        update(
+            &mut acc,
+            vec![Some("a"), Some("b"), Some("c"), Some("d")],
+            vec![Some(2), Some(4), Some(1), Some(3)],
+        );
+        let result = acc.evaluate().unwrap();
+        // Keys desc: 4, 3, 2, 1 → values b, d, a, c.
+        let expected = expected_list(
+            vec![utf8("b"), utf8("d"), utf8("a"), utf8("c")],
+            &DataType::Utf8,
+        );
+        assert_eq!(result, expected, "DESC sort by key");
+    }
+
+    /// `ARRAY_AGG(status ORDER BY created_at ASC)` — PG default for ASC is
+    /// NULLS LAST, hence `nulls_first: false`.
+    #[test]
+    fn array_agg_order_by_asc() {
+        let mut acc = make_acc(opts(false, false));
+        update(
+            &mut acc,
+            vec![Some("a"), Some("b"), Some("c"), Some("d")],
+            vec![Some(2), Some(4), Some(1), Some(3)],
+        );
+        let result = acc.evaluate().unwrap();
+        // Keys asc: 1, 2, 3, 4 → values c, a, d, b.
+        let expected = expected_list(
+            vec![utf8("c"), utf8("a"), utf8("d"), utf8("b")],
+            &DataType::Utf8,
+        );
+        assert_eq!(result, expected, "ASC sort by key");
+    }
+
+    /// NULL sort keys follow `SortOptions.nulls_first`, matching what the
+    /// SQL planner passes (PG defaults: ASC → NULLS LAST, DESC → NULLS FIRST).
+    #[test]
+    fn array_agg_null_sort_keys() {
+        // ASC NULLS LAST: the NULL-keyed row goes to the end.
+        let mut acc = make_acc(opts(false, false));
+        update(
+            &mut acc,
+            vec![Some("x"), Some("y"), Some("z")],
+            vec![Some(2), None, Some(1)],
+        );
+        let expected = expected_list(vec![utf8("z"), utf8("x"), utf8("y")], &DataType::Utf8);
+        assert_eq!(acc.evaluate().unwrap(), expected, "ASC NULLS LAST");
+
+        // DESC NULLS FIRST: the NULL-keyed row goes to the front.
+        let mut acc = make_acc(opts(true, true));
+        update(
+            &mut acc,
+            vec![Some("x"), Some("y"), Some("z")],
+            vec![Some(2), None, Some(1)],
+        );
+        let expected = expected_list(vec![utf8("y"), utf8("x"), utf8("z")], &DataType::Utf8);
+        assert_eq!(acc.evaluate().unwrap(), expected, "DESC NULLS FIRST");
+    }
+
+    /// NULL *values* are kept (PG array_agg does not drop NULLs) and travel
+    /// with their sort key.
+    #[test]
+    fn array_agg_null_values_preserved() {
+        let mut acc = make_acc(opts(false, false));
+        update(
+            &mut acc,
+            vec![Some("a"), None, Some("b")],
+            vec![Some(3), Some(1), Some(2)],
+        );
+        let expected = expected_list(
+            vec![ScalarValue::Utf8(None), utf8("b"), utf8("a")],
+            &DataType::Utf8,
+        );
+        assert_eq!(
+            acc.evaluate().unwrap(),
+            expected,
+            "NULL value kept at key 1"
+        );
+    }
+
+    /// Multiple `update_batch` calls (large group spanning many record
+    /// batches) must produce one globally sorted array.
+    #[test]
+    fn array_agg_multi_batch_group() {
+        let mut acc = OrderedArrayAggAccumulator::new(
+            DataType::Int64,
+            vec![Arc::new(Field::new("k", DataType::Int64, true))],
+            vec![opts(false, false)],
+        );
+        // 3 batches of 500 rows each; value i carries key 1500 - i, so the
+        // ascending-by-key result is the values in reverse insertion order.
+        for chunk in 0..3i64 {
+            let vals: Vec<i64> = (chunk * 500..(chunk + 1) * 500).collect();
+            let keys: Vec<i64> = vals.iter().map(|i| 1500 - i).collect();
+            let v: ArrayRef = Arc::new(Int64Array::from(vals));
+            let k: ArrayRef = Arc::new(Int64Array::from(keys));
+            acc.update_batch(&[v, k]).unwrap();
+        }
+        let expected = expected_list(
+            (0..1500i64)
+                .rev()
+                .map(|i| ScalarValue::Int64(Some(i)))
+                .collect(),
+            &DataType::Int64,
+        );
+        assert_eq!(
+            acc.evaluate().unwrap(),
+            expected,
+            "1500 rows over 3 batches"
+        );
+    }
+
+    /// Two sort keys: primary ASC, secondary DESC (exercises the multi-column
+    /// lexsort path).
+    #[test]
+    fn array_agg_two_sort_keys() {
+        let mut acc = OrderedArrayAggAccumulator::new(
+            DataType::Utf8,
+            vec![
+                Arc::new(Field::new("k1", DataType::Int64, true)),
+                Arc::new(Field::new("k2", DataType::Int64, true)),
+            ],
+            vec![opts(false, false), opts(true, true)],
+        );
+        let v: ArrayRef = Arc::new(ArrowStringArray::from(vec!["a", "b", "c", "d"]));
+        let k1: ArrayRef = Arc::new(Int64Array::from(vec![2i64, 1, 2, 1]));
+        let k2: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 1, 2, 2]));
+        acc.update_batch(&[v, k1, k2]).unwrap();
+        // (k1 asc, k2 desc): (1,2)=d, (1,1)=b, (2,2)=c, (2,1)=a.
+        let expected = expected_list(
+            vec![utf8("d"), utf8("b"), utf8("c"), utf8("a")],
+            &DataType::Utf8,
+        );
+        assert_eq!(acc.evaluate().unwrap(), expected, "two-key lexsort");
+    }
+
+    /// Zero rows → NULL (PG: array_agg over no rows is NULL, not '{}'),
+    /// byte-identical to the builtin's `new_null_list` result.
+    #[test]
+    fn array_agg_empty_returns_null_list() {
+        let mut acc = make_acc(opts(true, true));
+        assert_eq!(
+            acc.evaluate().unwrap(),
+            ScalarValue::new_null_list(DataType::Utf8, true, 1),
+            "empty group must be NULL list"
+        );
+    }
+
+    /// state() + merge_batch() across two partials must yield the same fully
+    /// sorted result as a single accumulator seeing all rows.
+    #[test]
+    fn array_agg_state_merge_round_trip() {
+        let mut acc1 = make_acc(opts(false, false));
+        update(
+            &mut acc1,
+            vec![Some("x"), Some("z")],
+            vec![Some(1), Some(3)],
+        );
+        let state1 = acc1.state().unwrap();
+
+        let mut acc2 = make_acc(opts(false, false));
+        update(&mut acc2, vec![Some("y")], vec![Some(2)]);
+        let state2 = acc2.state().unwrap();
+
+        // Assemble the two partial states into the state arrays the final
+        // phase receives (one row per partial).
+        let col0 = ScalarValue::iter_to_array(vec![state1[0].clone(), state2[0].clone()]).unwrap();
+        let col1 = ScalarValue::iter_to_array(vec![state1[1].clone(), state2[1].clone()]).unwrap();
+
+        let mut merged = make_acc(opts(false, false));
+        merged.merge_batch(&[col0, col1]).unwrap();
+        let expected = expected_list(vec![utf8("x"), utf8("y"), utf8("z")], &DataType::Utf8);
+        assert_eq!(merged.evaluate().unwrap(), expected, "merged partials");
+    }
+
+    /// Merging an empty partial (NULL values list) is a no-op.
+    #[test]
+    fn array_agg_merge_skips_empty_partial() {
+        let mut empty = make_acc(opts(false, false));
+        let empty_state = empty.state().unwrap();
+
+        let mut acc = make_acc(opts(false, false));
+        update(&mut acc, vec![Some("a")], vec![Some(1)]);
+        let full_state = acc.state().unwrap();
+
+        let col0 = ScalarValue::iter_to_array(vec![empty_state[0].clone(), full_state[0].clone()])
+            .unwrap();
+        let col1 = ScalarValue::iter_to_array(vec![empty_state[1].clone(), full_state[1].clone()])
+            .unwrap();
+
+        let mut merged = make_acc(opts(false, false));
+        merged.merge_batch(&[col0, col1]).unwrap();
+        let expected = expected_list(vec![utf8("a")], &DataType::Utf8);
+        assert_eq!(
+            merged.evaluate().unwrap(),
+            expected,
+            "empty partial skipped"
+        );
+    }
+
+    /// The accumulator's emitted state must match the schema declared by
+    /// `PgArrayAggUdaf::state_fields` (delegated to the builtin) — this is
+    /// the contract that keeps partial aggregation plans schema-valid.
+    #[test]
+    fn array_agg_state_layout_matches_declared_state_fields() {
+        let ordering_fields: Vec<FieldRef> =
+            vec![Arc::new(Field::new("created_at", DataType::Int64, true))];
+        let udaf = PgArrayAggUdaf::new();
+        let input_fields: Vec<FieldRef> =
+            vec![Arc::new(Field::new("status", DataType::Utf8, true))];
+        let return_field: FieldRef = Arc::new(Field::new(
+            "array_agg",
+            udaf.return_type(&[DataType::Utf8]).unwrap(),
+            true,
+        ));
+        let declared = udaf
+            .state_fields(StateFieldsArgs {
+                name: "array_agg",
+                input_fields: &input_fields,
+                return_field,
+                ordering_fields: &ordering_fields,
+                is_distinct: false,
+            })
+            .unwrap();
+
+        let mut acc = OrderedArrayAggAccumulator::new(
+            DataType::Utf8,
+            ordering_fields,
+            vec![opts(true, true)],
+        );
+        update(&mut acc, vec![Some("a")], vec![Some(1)]);
+        let state = acc.state().unwrap();
+
+        assert_eq!(state.len(), declared.len(), "state column count");
+        for (sv, field) in state.iter().zip(declared.iter()) {
+            assert_eq!(
+                &sv.data_type(),
+                field.data_type(),
+                "state column {} type must match declared schema",
+                field.name()
+            );
+        }
+
+        // Empty-group state must use the identical layout too.
+        let mut empty = OrderedArrayAggAccumulator::new(
+            DataType::Utf8,
+            vec![Arc::new(Field::new("created_at", DataType::Int64, true))],
+            vec![opts(true, true)],
+        );
+        let state = empty.state().unwrap();
+        for (sv, field) in state.iter().zip(declared.iter()) {
+            assert_eq!(
+                &sv.data_type(),
+                field.data_type(),
+                "empty state column {} type must match declared schema",
+                field.name()
+            );
+        }
     }
 }
 
@@ -1486,7 +2169,11 @@ use datafusion::prelude::SessionContext;
 /// - `jsonb_object_agg(key, value)`
 /// - `percentile_disc(f) WITHIN GROUP (ORDER BY expr)` (exact, discrete)
 /// - `mode() WITHIN GROUP (ORDER BY expr)` (exact, sort-order tie-break)
+/// - `array_agg(...)` — replaces the DataFusion builtin by name with
+///   [`PgArrayAggUdaf`], whose only behavioural difference is a vectorized
+///   accumulator for the `ORDER BY` (non-DISTINCT) path.
 pub(crate) fn register_json_agg_udafs(ctx: &SessionContext) {
+    ctx.register_udaf(AggregateUDF::from(PgArrayAggUdaf::new()));
     ctx.register_udaf(AggregateUDF::from(JsonAggUdaf::new("json_agg")));
     ctx.register_udaf(AggregateUDF::from(JsonAggUdaf::new("jsonb_agg")));
     ctx.register_udaf(AggregateUDF::from(JsonObjectAggUdaf::new(
