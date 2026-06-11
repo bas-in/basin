@@ -489,35 +489,28 @@ pub(crate) async fn execute_metadata_aggregate(
 ///   the cold row still exists in Parquet but must be excluded; the
 ///   metadata count would over-report by exactly the tombstone count.
 ///
-/// Cost: a registry lookup (O(1) `DashMap::get`), then `total_count()`
-/// (O(1) — one rwlock acquire + `BTreeMap::len()`). If non-zero, walks
-/// the BTreeMap via `snapshot()` and short-circuits at the first
-/// tombstone — so cost is bounded by tombstone *position*, not memtable
-/// size. The snapshot allocation is regrettable but unavoidable without
-/// a wider `MemTable` API change; in the steady state (no tombstones
-/// present) the `total_count() == 0` branch fires for any registry that
-/// was drained by the flush task or never received an HTAP promotion.
+/// Cost: a registry lookup (O(1) `DashMap::get`) plus one O(1) atomic
+/// read of the memtable's tombstone counter. The previous implementation
+/// cloned the whole BTreeMap via `snapshot()` when the memtable was
+/// non-empty — with S4 retention keeping rows resident after flush, a
+/// COUNT(*) on a freshly bulk-loaded 1M-row table paid an O(n)
+/// million-entry clone per query (~50ms of the measured 98ms) just to
+/// learn there were no tombstones. The maintained `tombstone_count()`
+/// counter (kept exact by every insert/ack/evict path) answers the same
+/// question for free.
 fn metadata_aggregate_blocked_by_tombstone(
     sess: &ProjectSession,
     table: &TableName,
 ) -> bool {
     let registry = sess.engine.memtable_registry();
-    let entry = match registry.get(&sess.project, table) {
-        Some(e) => e,
+    match registry.get(&sess.project, table) {
+        // `Row` and `Update` entries do NOT block the shortcut (see rustdoc
+        // above) — only live tombstones make the metadata count over-report.
+        Some(e) => e.memtable.tombstone_count() > 0,
         // No registry entry at all — no writes for this `(project, table)`
         // have ever flowed through the hot tier. Catalog stats are exact.
-        None => return false,
-    };
-    if entry.memtable.total_count() == 0 {
-        return false;
+        None => false,
     }
-    // Non-empty memtable: scan once, exit at the first tombstone. `Row`
-    // and `Update` entries do NOT block the shortcut (see rustdoc above).
-    entry
-        .memtable
-        .snapshot()
-        .iter()
-        .any(|(_, v)| v.is_tombstone())
 }
 
 /// Decode an 8-byte little-endian `i64`. Matches
