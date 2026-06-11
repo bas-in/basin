@@ -8,6 +8,57 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-11 — S4 age-based residency: read-own-insert with zero file opens
+
+- **Fixed: concurrent point-read lock convoy** (`6bb462a`): the
+  unfiltered-decode cache's pre-GET short-circuit put an exclusive
+  page-cache shard lock at the front of the warm read path, and every point
+  read on a file shares one cache key — concurrent readers collapsed 370×
+  (C=16 median 197µs → 73ms, found by the scaling differential against
+  June-5 data). Cache hits now peek under a read lock with opportunistic
+  recency promotion; C=16 medians return to sub-ms.
+- **Retention is now enforced** (`bcef9d1`): the shard background loop
+  gained a clean-retention sweep (`BASIN_HOTTIER_SWEEP_SECS`, default 30 s)
+  calling `enforce_clean_budgets` — previously nothing in production drove
+  the retention window. The never-wired hottier FlushTask production
+  plumbing is decommissioned (wiring it would have resurrected committed
+  DELETEs — its tombstone application was a stub); the shard compactor is
+  the sole durable flusher, stated explicitly.
+- **WAL zero-copy payloads** (`390bce9`): WAL records hold refcounted
+  payload bytes (wire format unchanged, pinned by a fixture test), the ack
+  path drops its per-stripe payload memcpy, and segment framing + the
+  object-store PUT moved outside the partition lock — concurrent appenders
+  no longer stall behind an in-flight flush. PUT-failure semantics are
+  byte-for-byte preserved.
+
+- **Read-own-insert is now memory-served** — an auto-commit INSERT of up to
+  128 rows (`BASIN_HOTTIER_RESIDENT_INSERT_MAX_ROWS`) writes through to the
+  hot tier as CLEAN entries the moment the shard WAL acks it, and the
+  canonical point SELECT (`WHERE pk = …`) answers from that entry **before**
+  the shard tail flush, the catalog load, or any cold file open: the
+  previously documented "read-own-insert tail flush" gap is CLOSED. Bulk
+  loads (> 128 rows), counter-keyed / composite-PK rows, and
+  `BASIN_HOTTIER_RETAIN_SECS=0` (the kill switch — byte-for-byte the old
+  behavior) skip the write-through. Pinned by `row_tier_residency.rs`
+  (work-counter gates: `files_opened == 0`, `rows_decoded == 0`, catalog
+  snapshot unmoved).
+- **Retention now affects engine reads** — flush acknowledgement keeps acked
+  rows readable as CLEAN entries instead of dropping them
+  (`BASIN_HOTTIER_RETAIN_SECS`, default 300 s; per-project clean-byte cap
+  `BASIN_HOTTIER_RETAIN_CAP`): a point read of a just-flushed or just-updated
+  row stays a memory hit. Engine ack sites thread per-key MVCC seqs into
+  `mark_flushed` (overlay materialize; COMMIT-promoted HTAP rows are acked
+  clean once the COMMIT's own cold file lands, eliminating their
+  double-flush), `commit_replace` clears a table's clean rows after every
+  copy-on-write rewrite (stale-residency guard), ALTER TABLE
+  materializes-then-clears and TRUNCATE drops the table's hot tier outright,
+  and the hard-cap fallback now evicts CLEAN bytes before the legacy
+  drop-largest-project last resort. Read paths gate hot-overlay checks on the
+  new O(1) tombstone/update counters, the auto-commit memtable fallback skips
+  clean rows (fixes a non-PK-Eq under-return when a retained row matched),
+  and the promoted shadow-column fast path engages with clean-only residency
+  instead of falling back to DataFusion.
+
 ## 2026-06-11 — memtable MVCC version chains; fast VALUES scanner: JSONB + timestamps
 
 - **MVCC version chains in the memtable** (`8d9fc2d`): hot-tier entries keep

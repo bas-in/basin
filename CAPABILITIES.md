@@ -205,8 +205,15 @@ wall-clock numbers.
   range atoms; cascade was already fully implemented and is now pinned by tests
   (delete_features.rs). Cross-table cascade is not transactionally atomic under
   auto-commit (each child DELETE commits separately) — documented semantics.
-- **Read-own-insert tail flush** — a non-tx INSERT is tail-resident, so reading
-  your own just-inserted row costs one O(1) flush+read until the row tier lands.
+- ~~Read-own-insert tail flush~~ — CLOSED 2026-06-11 (S4 age-based residency):
+  an auto-commit INSERT ≤ 128 rows (`BASIN_HOTTIER_RESIDENT_INSERT_MAX_ROWS`)
+  writes through to the hot tier as a CLEAN entry and the point read answers
+  from memory — zero file opens, zero rows decoded, no forced tail flush
+  (`row_tier_residency.rs`). Retained rows survive the tail flush for
+  `BASIN_HOTTIER_RETAIN_SECS` (default 300 s; `0` = kill switch restoring the
+  old flush+read behavior) under a per-project clean-byte cap
+  (`BASIN_HOTTIER_RETAIN_CAP`). Bulk loads (> 128 rows) and composite-PK
+  tables keep the one-flush-then-cold path.
 - **Cold in-tx UPDATE under a savepoint** routes through the cold catalog-commit
   path (the fast path is disabled when a savepoint is in scope).
 - **`hottier_differential` ordering divergences** — a handful of merge-on-read
