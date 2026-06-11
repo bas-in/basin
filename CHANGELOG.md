@@ -29,6 +29,22 @@ graduate to 1.0 and the standard SemVer guarantees.
   through median (n ≥ 5 samples) or min-of-K (below), and 1M-row shapes are
   floored at 3 samples — single-shot 1M numbers could previously swing 3× on
   scheduling noise. Both the Postgres and Basin sides use the same estimator.
+- **DATE (Date32) DML** (`258b8ff`): DATE columns were readable but not
+  writable — batch_from_rows had no Date32 arm. INSERT accepts
+  `'YYYY-MM-DD'` / `DATE '…'` / `'…'::DATE` literals; UPDATE wiring goes
+  through the shared scalar-assignment path so cold, hot-overlay and tx
+  fast-path UPDATEs all coerce dates. Residual: `WHERE d IN (SELECT …)` on
+  a DATE column still errors.
+- **Cold-UPDATE overhead cuts** (`7934575`): expression-RHS assignments no
+  longer force before/after event capture when nothing consumes it (sinks /
+  audit / generated columns / RETURNING still do), and copy-on-write
+  UPDATE/DELETE rewrites encode replacement files with the Fast cascade
+  (compaction keeps Best). Targets the no-WHERE conditional-UPDATE shape,
+  previously ~208ms on a 500-row table.
+- **Bulk-INSERT ablation probe** (`02258ea`): measured (not estimated)
+  decomposition of the 10k-row bulk INSERT cost — PK / JSONB / FK / floor
+  variants. The benchmark shape has no FK and runs one-shot on a fresh
+  engine, ruling out FK checks and O(N-cold) PK scans as explanations.
 
 ## 2026-06-10 — OLTP scale + correctness wave; HTAP / ORM / extensions roadmap
 
