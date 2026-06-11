@@ -27,6 +27,13 @@ graduate to 1.0 and the standard SemVer guarantees.
   re-derived from measured reality at the same time (`f39b2d5`): non-collapse
   ≥ 0.7 at C=64 instead of a ≥ 1.5× headroom that never passed any recorded
   run on this hardware, including the run that introduced it.
+- **Stripe-merge compaction** (`92668f4`): a background tick merges cold
+  files with overlapping PK zone maps into strictly fewer files with
+  disjoint ranges, so keyset pagination prunes to 1–2 file opens instead of
+  opening every write stripe (the ~24 ms residual at 1M). Conservative
+  gates (single-column PK as effective sort order, decodable stats,
+  256 MiB input cap), optimistic-concurrency commit with liveness
+  re-validation, index re-registration via the tail-compaction helpers.
 - **Measured: bulk INSERT now beats Postgres** — 10k rows: 36.9 ms vs PG
   126.5 ms (3.4×); 1M rows: 2.05 s vs PG 9.62 s (4.7×), down from 262 s
   three waves ago. The stack: literal-VALUES scanner + `::jsonb` admission +
