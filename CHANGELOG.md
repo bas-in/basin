@@ -45,6 +45,29 @@ graduate to 1.0 and the standard SemVer guarantees.
   decomposition of the 10k-row bulk INSERT cost — PK / JSONB / FK / floor
   variants. The benchmark shape has no FK and runs one-shot on a fresh
   engine, ruling out FK checks and O(N-cold) PK scans as explanations.
+  Measured split at 10k rows (release, min-of-3): ~339ms total, PK
+  enforcement ~1ms, JSONB canonicalization ~43ms, write floor
+  (WAL/stripe/batch build) ~292ms, linear in rows, no growth with
+  existing data.
+- **Fast VALUES scanner: `::jsonb` / `::timestamp` suffix casts**
+  (`749ab7b`): the probe revealed the published benchmark sends
+  `'<json>'::jsonb` payloads, which the scanner declined — the JSONB fast
+  path never engaged on the real statement. Type-matching suffix casts on
+  string literals are now admitted (`::jsonb` into JSONB, `::timestamp` /
+  `::timestamptz` into timestamp columns, byte-identical to the slow
+  path's cast peeling); `::text` and all other tags still decline because
+  the slow path rejects or differs on them. Function-style `CAST(...)`
+  still declines.
+- **S4 row tier, phase 2 groundwork** (`53b36a7`, `3db6ac9`): memtable
+  entries carry clean/dirty state with seq-aware flush acknowledgement
+  (fixing a latent version-loss where the flush ack dropped chains by key
+  including versions written after the flush snapshot, plus a freed-bytes
+  accounting mismatch), O(1) overlay counters, oldest-first clean
+  eviction, and retention budgets (`BASIN_HOTTIER_RETAIN_SECS`, default
+  300s; `BASIN_HOTTIER_RETAIN_CAP`, default 32 MiB; 0 = today's
+  drain-at-flush). Engine read/write paths don't call the new ack yet, so
+  production behavior is unchanged; the residency read path (read-own-
+  insert with zero file opens) lands next.
 
 ## 2026-06-10 — OLTP scale + correctness wave; HTAP / ORM / extensions roadmap
 
