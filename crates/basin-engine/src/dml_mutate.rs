@@ -1662,8 +1662,10 @@ fn rmw_case_condition_is_eligible(cond: &Expr, schema: &Schema) -> bool {
 }
 
 /// Resolve the matched PK keys + scalar assignments when the UPDATE call site
-/// is eligible for the hot-tier fast path. Returns `Ok(Some((keys, assigns)))`
-/// when every gate passes; `Ok(None)` to fall through to the cold path.
+/// is eligible for the hot-tier fast path. Returns
+/// `Ok(Some((keys, assigns, probe_pre_images)))` when every gate passes
+/// (`probe_pre_images` is non-empty only for probe-resolved shapes — see
+/// [`probe_matched_pk_keys`]); `Ok(None)` to fall through to the cold path.
 ///
 /// Gates mirror `try_resolve_fast_path_pks` (DELETE) plus the UPDATE-specific
 /// ones: scalar OR allowlisted-RMW assignments (see
@@ -1677,7 +1679,13 @@ async fn try_resolve_fast_path_update(
     assignments: &[Assignment],
     predicate: Option<&Expr>,
     returning: Option<&[sqlparser::ast::SelectItem]>,
-) -> Result<Option<(Vec<basin_hottier::RowKey>, Vec<(usize, AssignmentRhs)>)>> {
+) -> Result<
+    Option<(
+        Vec<basin_hottier::RowKey>,
+        Vec<(usize, AssignmentRhs)>,
+        std::collections::HashMap<Vec<u8>, RecordBatch>,
+    )>,
+> {
     // Gate: hot-tier UPDATE fast path. **Default ON** since Phase 5.14
     // closure. See `try_hot_tier_delete` for the kill-switch semantics —
     // `BASIN_HOTTIER_FASTPATH_DISABLE=1` (global) and
@@ -1773,12 +1781,15 @@ async fn try_resolve_fast_path_update(
             return Ok(None);
         }
     }
-    // Gate: there must be a WHERE clause.
-    let Some(expr) = predicate else {
-        // `UPDATE t SET …` with no WHERE rewrites every row; walking every
-        // cold PK to override it would defeat the purpose. Slow path.
-        return Ok(None);
-    };
+    // NOTE: no-WHERE is NOT a gate. `UPDATE t SET …` with no predicate routes
+    // through the resolve-by-probe machinery below (`SELECT * FROM t LIMIT
+    // cap+1`): a small table's full row set is exactly a small-bulk key set,
+    // while a table with more than `delta_update_max_keys()` live rows blows
+    // the probe LIMIT and falls to the cold rewrite exactly as today. Every
+    // semantic gate above (single PK, indexes, constraints, reactors, RLS,
+    // audit, generated, AUTO_UPDATE) and below (RHS allowlist, PK unassigned)
+    // applies identically; the probe itself enforces auto-commit-only.
+    //
     // Gate: every assignment must be either a plain scalar OR an allowlisted
     // read-modify-write expression; reject anything else, and reject any
     // assignment that touches the PK column (key re-encoding / uniqueness).
@@ -1839,71 +1850,132 @@ async fn try_resolve_fast_path_update(
     //
     //   (B) Resolve-by-probe — any OTHER predicate the fast SELECT machinery
     //       understands (`pk < lit`, `pk <= lit`, `pk BETWEEN a AND b`,
-    //       `pk > a AND pk < b`, even a NON-pk equality like `status = 'x'`).
-    //       Ranges over arbitrary PKs aren't enumerable without a read, so we
-    //       PROBE: run `SELECT <pk> FROM t WHERE <original predicate> LIMIT N+1`
-    //       through the EXISTING `execute_simple_select` fast path. If ≤ N keys
-    //       come back we have the EXACT matched set and route them through
+    //       `pk > a AND pk < b`, even a NON-pk equality like `status = 'x'`),
+    //       AND the no-WHERE statement (every live row matches). Such matched
+    //       sets aren't enumerable without a read, so we PROBE: run
+    //       `SELECT * FROM t [WHERE <original predicate>] LIMIT N+1` through
+    //       the EXISTING `execute_simple_select` fast path. If ≤ N keys come
+    //       back we have the EXACT matched set (plus each key's pre-image,
+    //       carried from the probe rows) and route them through
     //       `hot_tier_update_by_pk`; if N+1 rows come back (too many for a
     //       small-bulk overlay write) or the probe can't represent the
     //       predicate, we return `Ok(None)` and the caller falls to cold CoW —
     //       exactly as today.
-    if let Some(lit_exprs) = predicate_resolves_to_pk_list(expr, pk_col, table.as_str()) {
-        // (A) Literal list. Empty IN-list → zero matches (UPDATE 0).
-        if lit_exprs.is_empty() {
-            return Ok(Some((Vec::new(), parsed)));
+    if let Some(expr) = predicate {
+        if let Some(lit_exprs) = predicate_resolves_to_pk_list(expr, pk_col, table.as_str()) {
+            // (A) Literal list. Empty IN-list → zero matches (UPDATE 0).
+            if lit_exprs.is_empty() {
+                return Ok(Some((Vec::new(), parsed, std::collections::HashMap::new())));
+            }
+            let mut keys: Vec<basin_hottier::RowKey> = Vec::with_capacity(lit_exprs.len());
+            for lit in &lit_exprs {
+                let scalar = match try_literal_to_scalar(lit, &pk_dt, pk_col)? {
+                    Some(s) => s,
+                    None => return Ok(None),
+                };
+                let Some(key) = pk_scalar_to_row_key(&scalar, &pk_dt) else {
+                    return Ok(None);
+                };
+                keys.push(key);
+            }
+            return Ok(Some((keys, parsed, std::collections::HashMap::new())));
         }
-        let mut keys: Vec<basin_hottier::RowKey> = Vec::with_capacity(lit_exprs.len());
-        for lit in &lit_exprs {
-            let scalar = match try_literal_to_scalar(lit, &pk_dt, pk_col)? {
-                Some(s) => s,
-                None => return Ok(None),
-            };
-            let Some(key) = pk_scalar_to_row_key(&scalar, &pk_dt) else {
-                return Ok(None);
-            };
-            keys.push(key);
-        }
-        return Ok(Some((keys, parsed)));
     }
 
-    // (B) Resolve-by-probe.
-    match probe_matched_pk_keys(sess, table, meta, pk_col, &pk_dt, expr).await? {
-        Some(keys) => Ok(Some((keys, parsed))),
+    // (B) Resolve-by-probe (`predicate = None` ⇒ the no-WHERE whole-table
+    // probe; the cap decides delta-vs-cold).
+    match probe_matched_pk_keys(sess, table, meta, pk_col, &pk_dt, predicate).await? {
+        Some((keys, pre_images)) => Ok(Some((keys, parsed, pre_images))),
         None => Ok(None),
     }
 }
 
-/// Small-bulk fast-path cap: the maximum number of matched PKs a probed UPDATE
-/// will route through the hot-tier overlay. A WHERE matching more than this many
-/// rows falls to the cold copy-on-write path (whose write-amp is amortised over
-/// a whole-file rewrite anyway). 64 keeps the overlay write + per-key read-
-/// before-write bounded while still covering the `WHERE id < 10` /
-/// "matches ~10 rows" benchmark shapes.
-const SMALL_BULK_FASTPATH_CAP: usize = 64;
+/// Default delta-UPDATE fast-path cap: the maximum number of matched PKs a
+/// probed UPDATE will route through the hot-tier overlay. A WHERE matching
+/// more than this many rows falls to the cold copy-on-write path (whose
+/// write-amp is amortised over a whole-file rewrite anyway).
+///
+/// History: the original cap was 64, chosen when the write step re-read every
+/// pre-image from cold per key. Two things since removed that bound: (a) the
+/// probe now carries the full pre-image batches itself (one read total, no
+/// second cold pass), and (b) the overlay write is budget-guarded — after the
+/// pre-images are gathered `hot_tier_update_by_pk` reserves their exact bytes
+/// against the project memtable budget and declines to cold on
+/// `HardCapReached`. With per-key cost flat and memory capped by the budget
+/// (not the key count), the cap's job is only to keep a single statement's
+/// overlay write "small bulk" rather than a table rewrite; 10k covers the
+/// `WHERE status = 'x'` / tenant-slice shapes while a full-table UPDATE on a
+/// large table still takes the amortised cold rewrite.
+const DELTA_UPDATE_MAX_KEYS_DEFAULT: usize = 10_000;
+
+/// Resolve the delta-UPDATE cardinality cap: `BASIN_DELTA_UPDATE_MAX_KEYS`
+/// when set to a positive integer, else [`DELTA_UPDATE_MAX_KEYS_DEFAULT`].
+///
+/// Read per statement (same rationale as `hottier_fastpath_enabled`): shard
+/// processes spawn from one binary and an operator clamping the cap must take
+/// effect on the next statement without a restart. `0` / unparseable values
+/// fall back to the default rather than disabling the path — use
+/// `BASIN_HOTTIER_UPDATE_FASTPATH=0` to turn the fast path off.
+fn delta_update_max_keys() -> usize {
+    std::env::var("BASIN_DELTA_UPDATE_MAX_KEYS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DELTA_UPDATE_MAX_KEYS_DEFAULT)
+}
+
+/// Probe result: the matched `RowKey`s (statement order) plus, keyed by the
+/// encoded key bytes, each key's full single-row pre-image batch as the probe
+/// read it (overlay-aware). The map is empty for the literal pk-list path,
+/// which performs no read — those keys gather their pre-images through the
+/// memtable / PK-cache / cold tiers in `hot_tier_update_by_pk` as before.
+type ProbedUpdateKeys = (
+    Vec<basin_hottier::RowKey>,
+    std::collections::HashMap<Vec<u8>, RecordBatch>,
+);
 
 /// Resolve the EXACT set of matched PK `RowKey`s for an UPDATE whose WHERE is
-/// NOT a literal pk-list, by probing the existing fast-SELECT machinery.
+/// NOT a literal pk-list — or that has NO WHERE at all — by probing the
+/// existing fast-SELECT machinery.
 ///
 /// Returns:
-///   * `Ok(Some(keys))` — the predicate matched ≤ `SMALL_BULK_FASTPATH_CAP`
-///     rows and every matched PK encoded to a `RowKey`; route them through the
-///     overlay.
+///   * `Ok(Some((keys, pre_images)))` — the predicate (or, for a no-WHERE
+///     UPDATE, the whole table) matched ≤ `delta_update_max_keys()` rows and
+///     every matched PK encoded to a `RowKey`; route them through the overlay.
+///     `pre_images` maps each key's encoded bytes to its full single-row
+///     pre-image batch, harvested from the probe itself (design 1a — see
+///     below).
 ///   * `Ok(None)` — too many matches (> cap), an un-probe-able predicate shape,
 ///     a NULL / unsupported-type PK, or any other reason to fall to cold CoW.
 ///
 /// ── Probe design ─────────────────────────────────────────────────────────
-/// We build `SELECT <pk> FROM <table> WHERE <predicate> LIMIT N+1` (N = cap)
+/// We build `SELECT * FROM <table> [WHERE <predicate>] LIMIT N+1` (N = cap)
 /// by round-tripping the ORIGINAL predicate `Expr` back to SQL text (its
 /// `Display` is faithful for sqlparser ASTs and subqueries were already
 /// resolved to literals upstream in `exec_update`), parse it, and feed it to
 /// `match_simple_select`. That matcher is the gate on which predicates we
 /// accept: anything it can't represent (OR, function predicates, IS NOT NULL,
-/// >3 AND atoms, …) yields `None` here and we fall to cold. Because the probe
-/// evaluates the FULL original predicate and returns the matching PKs, the
-/// UPDATE then applies to EXACTLY those keys — the predicate is fully consumed
-/// by the probe, so a non-pk residual (`status = 'x'`) needs no post-probe
-/// re-evaluation.
+/// >3 AND atoms, …) yields `None` here and we fall to cold. A no-WHERE UPDATE
+/// (predicate = `None`) probes the zero-predicate select, which
+/// `match_simple_select` also admits — so a small-table `UPDATE t SET …`
+/// routes through the same machinery and a big-table one falls to cold at
+/// the cap exactly like a wide WHERE. Because the probe evaluates the FULL
+/// original predicate and returns the matching PKs, the UPDATE then applies
+/// to EXACTLY those keys — the predicate is fully consumed by the probe, so a
+/// non-pk residual (`status = 'x'`) needs no post-probe re-evaluation.
+///
+/// ── Pre-image carry (design 1a) ──────────────────────────────────────────
+/// The probe selects `*`, not just the PK: each matched row's FULL image is
+/// returned anyway by the overlay-aware fast SELECT, so we slice it into
+/// per-key single-row batches and hand them to `hot_tier_update_by_pk` as the
+/// pre-image source. Historically the probe projected only the PK and the
+/// write step re-read every pre-image from cold WITHOUT predicate pushdown
+/// for >1 key — at the raised 10k-key cap that second unfiltered pass is the
+/// dominant cost, and carrying the probe batches eliminates it entirely.
+/// Precedence is preserved: the memtable / tx-overlay tiers in
+/// `hot_tier_update_by_pk` still win per key; the probe image only fills keys
+/// those tiers don't hold (and the probe itself already merged the overlay,
+/// so the image is never staler than the cold base).
 ///
 /// `execute_simple_select` is overlay-aware (it merges tombstones + UPDATE
 /// overrides on read), so the probe sees the same logical state a user SELECT
@@ -1931,8 +2003,8 @@ async fn probe_matched_pk_keys(
     meta: &basin_catalog::TableMetadata,
     pk_col: &str,
     pk_dt: &DataType,
-    predicate: &Expr,
-) -> Result<Option<Vec<basin_hottier::RowKey>>> {
+    predicate: Option<&Expr>,
+) -> Result<Option<ProbedUpdateKeys>> {
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
 
@@ -1941,22 +2013,28 @@ async fn probe_matched_pk_keys(
     // session's pinned read-view (or see this tx's own overlay writes), so a
     // probed key set could diverge from what the tx should mutate. The literal
     // pk-list path (which performs no read) stays in-tx-eligible above; only the
-    // resolve-by-probe shapes are restricted to auto-commit. In a tx these
-    // predicates fall to the cold CoW path, which honours the tx read-view.
+    // resolve-by-probe shapes (including no-WHERE) are restricted to
+    // auto-commit. In a tx these predicates fall to the cold CoW path, which
+    // honours the tx read-view.
     if crate::session::tx_is_active(&sess.state) {
         return Ok(None);
     }
 
-    // Build the probe SQL. Quote both identifiers so reserved-word / mixed-case
-    // table and PK names round-trip. The predicate Display is faithful for the
-    // sqlparser AST we hold (subqueries already resolved to literals upstream).
-    let probe_sql = format!(
-        "SELECT \"{pk}\" FROM \"{tbl}\" WHERE {pred} LIMIT {lim}",
-        pk = pk_col.replace('"', "\"\""),
-        tbl = table.as_str().replace('"', "\"\""),
-        pred = predicate,
-        lim = SMALL_BULK_FASTPATH_CAP + 1,
-    );
+    let cap = delta_update_max_keys();
+
+    // Build the probe SQL. Quote the table identifier so reserved-word /
+    // mixed-case table names round-trip. The predicate Display is faithful for
+    // the sqlparser AST we hold (subqueries already resolved to literals
+    // upstream). `SELECT *` (not just the PK): the full row images double as
+    // the write step's pre-image source — see "Pre-image carry" above. A
+    // no-WHERE UPDATE omits the WHERE clause entirely; `match_simple_select`
+    // admits the zero-predicate select.
+    let tbl = table.as_str().replace('"', "\"\"");
+    let lim = cap + 1;
+    let probe_sql = match predicate {
+        Some(pred) => format!("SELECT * FROM \"{tbl}\" WHERE {pred} LIMIT {lim}"),
+        None => format!("SELECT * FROM \"{tbl}\" LIMIT {lim}"),
+    };
     let mut stmts = match Parser::parse_sql(&PostgreSqlDialect {}, &probe_sql) {
         Ok(s) => s,
         // A predicate that won't re-parse (shouldn't happen for an AST we just
@@ -1991,19 +2069,38 @@ async fn probe_matched_pk_keys(
     // Collect + cap. The LIMIT already bounds the probe to N+1 rows, so seeing
     // strictly more than N means "too many to small-bulk" → cold.
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-    if total > SMALL_BULK_FASTPATH_CAP {
+    if total > cap {
         return Ok(None);
     }
     if total == 0 {
         // Zero matches: a valid fast-path outcome (UPDATE 0). Returning an empty
-        // key set keeps us off the cold path for a no-op WHERE.
-        return Ok(Some(Vec::new()));
+        // key set keeps us off the cold path for a no-op WHERE (or a no-WHERE
+        // UPDATE on an empty table).
+        return Ok(Some((Vec::new(), std::collections::HashMap::new())));
     }
 
     let mut keys: Vec<basin_hottier::RowKey> = Vec::with_capacity(total);
+    let mut pre_images: std::collections::HashMap<Vec<u8>, RecordBatch> =
+        std::collections::HashMap::with_capacity(total);
     for batch in &batches {
-        // The probe projected exactly the PK column, so it is column 0.
-        let col = batch.column(0);
+        // `SELECT *` projection: locate the PK column BY NAME per batch — a
+        // hot-tier memtable image carries the write-time column order, so the
+        // PK is not guaranteed to sit at the same index in every batch.
+        let Ok(pk_idx) = batch.schema().index_of(pk_col) else {
+            // A probe batch without the PK column is unexpected; be safe.
+            return Ok(None);
+        };
+        // Normalize ONCE per batch (not per row): `reattach_catalog_metadata`
+        // re-applies catalog field metadata and the Binary↔LargeBinary /
+        // Utf8↔LargeUtf8 physical widenings a raw Vortex decode drops — the
+        // same normalization the cold fill in `hot_tier_update_by_pk`
+        // performs, so the merge sees an identical image either way.
+        // (Column-order drift is handled later by `pad_batch_to_schema`,
+        // which emits catalog order by name.) The KEY is still extracted from
+        // the RAW column, exactly as the PK-only probe did — a type the
+        // encoder doesn't support returns `None` and we fall to cold.
+        let normalized = reattach_catalog_metadata(meta.schema.as_ref(), batch.clone())?;
+        let col = batch.column(pk_idx);
         for row in 0..batch.num_rows() {
             if col.is_null(row) {
                 // A NULL PK can't encode to a RowKey and shouldn't exist for a
@@ -2013,10 +2110,12 @@ async fn probe_matched_pk_keys(
             let Some(key) = pk_array_value_to_row_key(col.as_ref(), row, pk_dt) else {
                 return Ok(None);
             };
+            // Carry the full row image as the pre-image for this key.
+            pre_images.insert(key.as_bytes().to_vec(), normalized.slice(row, 1));
             keys.push(key);
         }
     }
-    Ok(Some(keys))
+    Ok(Some((keys, pre_images)))
 }
 
 /// Encode the PK value at `row` of `arr` into a `RowKey`, mirroring the type
@@ -2069,9 +2168,18 @@ fn pk_array_value_to_row_key(
 }
 
 /// Execute the resolved hot-tier UPDATE: for each matched PK read the current
-/// row image (tx overlay first when in a tx, then memtable override, else
-/// cold-tier), apply the scalar assignments, and write a `MemRowValue::Update`
-/// keyed by the encoded PK. Returns `(updated_count, returning_batches)`.
+/// row image (tx overlay first when in a tx, then memtable override, then the
+/// probe-carried pre-image, else cold-tier), apply the scalar assignments, and
+/// write a `MemRowValue::Update` keyed by the encoded PK. Returns
+/// `Ok(Some((updated_count, returning_batches)))` on success, or `Ok(None)` —
+/// the budget-decline sentinel — when the project's memtable hard cap cannot
+/// admit the pre-image bytes: the caller (`exec_update`) must then fall
+/// through to the cold copy-on-write path, which re-evaluates the predicate
+/// itself (the probe's key set is simply discarded) and whose
+/// `materialize_hot_overlay_into_cold` prologue actively DRAINS overlay
+/// memory, the correct response to a full budget. The decline happens BEFORE
+/// any overlay/tx-overlay write and before assignment evaluation, so a
+/// declined statement leaves zero partial state.
 ///
 /// `tx_mode`:
 ///   * `false` (auto-commit) — read precedence is shared memtable > PK cache >
@@ -2097,9 +2205,10 @@ async fn hot_tier_update_by_pk(
     meta: &basin_catalog::TableMetadata,
     keys: &[basin_hottier::RowKey],
     assignments: &[(usize, AssignmentRhs)],
+    probe_pre_images: &std::collections::HashMap<Vec<u8>, RecordBatch>,
     returning: Option<&[sqlparser::ast::SelectItem]>,
     tx_mode: bool,
-) -> Result<(usize, Vec<RecordBatch>)> {
+) -> Result<Option<(usize, Vec<RecordBatch>)>> {
     use std::collections::HashMap;
     let schema = meta.schema.clone();
     let storage = sess.engine.config().storage.clone();
@@ -2195,6 +2304,21 @@ async fn hot_tier_update_by_pk(
                     current.insert(kb, RecordBatch::new_empty(schema.clone()));
                 }
             }
+        }
+    }
+    // 1c. Probe-carried pre-images (design 1a): the resolve-by-probe SELECT
+    //     already materialized every matched row's FULL image, so keys not
+    //     overridden by the tx overlay / shared memtable take their pre-image
+    //     straight from the probe — eliminating the second cold read the
+    //     write step used to pay per statement (unfiltered for >1 key, the
+    //     dominant cost at the raised key cap). The probe ran through the
+    //     overlay-aware `execute_simple_select`, so these images are never
+    //     staler than the cold base; tiers 1a/1b still win because a
+    //     concurrent overlay write that landed after the probe is fresher.
+    //     Empty for the literal pk-list shapes, which fall to 2a/2b below.
+    for (kb, rb) in probe_pre_images {
+        if want.contains(kb) && !current.contains_key(kb) {
+            current.insert(kb.clone(), rb.clone());
         }
     }
     // 2a. PK row cache fill: for keys not satisfied by the memtable, consult the
@@ -2393,7 +2517,7 @@ async fn hot_tier_update_by_pk(
     // SessionContext, registers every UDF family, and plans SQL
     // (`generated_cols::eval_expression`), so the old per-key loop paid n
     // context builds + n plans — the dominant cost of the
-    // ≤`SMALL_BULK_FASTPATH_CAP` bulk-RMW shape. The batched call is the SAME
+    // ≤`delta_update_max_keys()` bulk-RMW shape. The batched call is the SAME
     // evaluator with an all-true mask over all matched rows, exactly how the
     // cold path feeds whole batches to `apply_assignments`, so each row's
     // post-image stays byte-identical to the cold path (and to the previous
@@ -2470,24 +2594,82 @@ async fn hot_tier_update_by_pk(
         }
     };
 
-    let mut updated = 0usize;
-    // Post-update row images collected for RETURNING (allocated only when needed).
-    let mut returning_rows: Vec<RecordBatch> = Vec::new();
+    // Stage every override BEFORE writing any of them: per key, materialise
+    // the promoted-JSONB shadow columns and encode the exact IPC blob the
+    // memtable will retain. Staging first serves the memory guard below —
+    // the statement's overlay footprint is the sum of these blob lengths,
+    // known exactly before the first insert.
+    //
+    // ADR 0027 Phase 4 (shadow materialisation): exactly as the INSERT path
+    // does. Without this the hot UPDATE row carries no `__promoted$col$key`
+    // column, the `HtapUnionTable` overlay null-fills it, and the
+    // promoted-column read path would return a WRONG NULL for the updated
+    // row. Materialising it here keeps every live memtable row shadow-clean,
+    // so the promoted fast path stays enabled (and correct) after a
+    // post-promotion UPDATE instead of demoting every later
+    // `payload->>'key'` query to a full per-row JSONB UDF scan. No-op when no
+    // paths are promoted.
+    let mut staged: Vec<(&basin_hottier::RowKey, RecordBatch, Vec<u8>)> =
+        Vec::with_capacity(live.len());
     for ((key, _), one_row) in live.iter().zip(post_images.into_iter()) {
-        // ADR 0027 Phase 4: materialise promoted JSONB shadow columns into the
-        // override image, exactly as the INSERT path does. Without this the
-        // hot UPDATE row carries no `__promoted$col$key` column, the
-        // `HtapUnionTable` overlay null-fills it, and the promoted-column read
-        // path would return a WRONG NULL for the updated row. Materialising it
-        // here keeps every live memtable row shadow-clean, so the promoted fast
-        // path stays enabled (and correct) after a post-promotion UPDATE
-        // instead of demoting every later `payload->>'key'` query to a full
-        // per-row JSONB UDF scan. No-op when no paths are promoted.
         let override_row = crate::promoted_columns::materialize_promoted_columns(
             &one_row,
             &meta.promoted_jsonb_paths,
         )?;
         let bytes = encode_single_row_ipc(&override_row);
+        staged.push((*key, one_row, bytes));
+    }
+
+    // ── Memory guard (budget reservation) ───────────────────────────────────
+    //
+    // Reserve the statement's exact overlay footprint against the project's
+    // memtable budget BEFORE the first overlay write. This is what makes the
+    // raised `delta_update_max_keys()` cap safe: the budget — not the key
+    // count — bounds resident memory.
+    //
+    //   * `HardCapReached` → return the decline sentinel (`Ok(None)`); the
+    //     caller falls to the cold CoW path, whose overlay-materialize
+    //     prologue actively frees memtable memory — the correct remedy for a
+    //     full budget. `try_reserve_bytes` already evicted reclaimable clean
+    //     bytes internally before reporting this, so there is no retry to
+    //     attempt here. Nothing has been written at this point (staging is
+    //     pure computation), so the decline leaves zero partial state; the
+    //     assignment eval was wasted work, but only on this rare path.
+    //   * `FlushSuggested` → proceed; a flush request was enqueued and the
+    //     write fits under the hard cap.
+    //
+    // Sizing: the summed IPC blob lengths — EXACTLY the `heap_bytes` the
+    // memtable will charge for these `MemRowValue::Update`s and exactly what
+    // `mark_flushed` frees (and `release_bytes` returns to the budget) when
+    // the overlay drains at hot-tier flush / overlay-materialize. Reserve-
+    // units == release-units, so this path's accounting is balanced — unlike
+    // the pre-existing INSERT-residency / HTAP-promote reservations, which
+    // charge Arrow `get_array_memory_size` against an IPC-sized release
+    // (tolerated because `release_bytes` saturates at zero). We deliberately
+    // do NOT size from the per-key pre-image batches: they are slices sharing
+    // a parent batch's buffers, so Arrow memory size would multiply-count the
+    // parent per row and spuriously decline large key sets.
+    //
+    // tx_mode is exempt: the override goes to the session-local
+    // `TxState::tx_overlay`, which is not registry-accounted; reserving here
+    // would inflate the project counter with no matching release. The shared
+    // registry charge for tx writes happens at COMMIT when the overlay drains
+    // into the memtable (in-tx probed shapes are auto-commit-only anyway, so
+    // only small literal pk-list statements take that route).
+    if !tx_mode {
+        let staged_bytes: u64 = staged.iter().map(|(_, _, b)| b.len() as u64).sum();
+        if staged_bytes > 0
+            && registry.try_reserve_bytes(&sess.project, staged_bytes)
+                == basin_hottier::ReservationOutcome::HardCapReached
+        {
+            return Ok(None);
+        }
+    }
+
+    let mut updated = 0usize;
+    // Post-update row images collected for RETURNING (allocated only when needed).
+    let mut returning_rows: Vec<RecordBatch> = Vec::new();
+    for (key, one_row, bytes) in staged {
         if tx_mode {
             // In-tx: write the override to the rollback-able tx overlay. On
             // COMMIT it is drained into this same shared memtable; on ROLLBACK
@@ -2510,7 +2692,7 @@ async fn hot_tier_update_by_pk(
             returning_rows.push(projected);
         }
     }
-    Ok((updated, returning_rows))
+    Ok(Some((updated, returning_rows)))
 }
 
 /// Stitch the per-key single-row pre-images into ONE n-row batch (key order
@@ -2779,13 +2961,15 @@ pub(crate) async fn exec_update(
     // For `SET col = lit` (scalar) OR an allowlisted read-modify-write
     // `SET col = <expr>` (`col + 1`, `CASE …`, `a = b`, simple casts — see
     // `rmw_rhs_is_fast_path_eligible`), with `WHERE pk = lit / pk IN (lits)`,
-    // on a table that satisfies every gate in `try_resolve_fast_path_update`,
-    // read the matched row image (hot then cold), apply SET, and write a
+    // any probe-resolvable predicate matching ≤ `delta_update_max_keys()`
+    // rows, or NO WHERE at all on a ≤cap table, on a table that satisfies
+    // every gate in `try_resolve_fast_path_update`, read the matched row
+    // image (hot, probe-carried, then cold), apply SET, and write a
     // `MemRowValue::Update` override to the process-wide MemTableRegistry —
     // skipping the copy-on-write rewrite (`list_data_files_with_stats` →
     // per-file read+SET → `write_replacement` → `commit_replace` →
     // `delete_objects` → `refresh_table`). Mirrors the DELETE fast path.
-    if let Some((pk_keys, fp_assigns)) = try_resolve_fast_path_update(
+    if let Some((pk_keys, fp_assigns, probe_pre_images)) = try_resolve_fast_path_update(
         sess,
         &table,
         &meta,
@@ -2798,40 +2982,53 @@ pub(crate) async fn exec_update(
         // In-tx → tx-overlay variant (rollback-able); auto-commit → shared
         // registry. The gate only admitted the in-tx case when
         // `tx_fastpath_eligible_for_table` held.
+        //
+        // `hot_tier_update_by_pk` returns `Ok(None)` — the budget-decline
+        // sentinel — when the project memtable hard cap cannot admit the
+        // gathered pre-image bytes. In that case we DON'T return: control
+        // falls through this block to the cold copy-on-write path below,
+        // which discards the probe's key set and re-evaluates the original
+        // predicate itself (it never looks at `pk_keys`), and whose
+        // `materialize_hot_overlay_into_cold` prologue drains overlay memory
+        // — the correct remedy for a full budget. No partial state exists at
+        // decline time (the sentinel fires before any overlay write).
         let tx_mode = crate::session::tx_is_active(&sess.state);
-        let (n, ret_batches) = hot_tier_update_by_pk(
+        if let Some((n, ret_batches)) = hot_tier_update_by_pk(
             sess,
             &table,
             &meta,
             &pk_keys,
             &fp_assigns,
+            &probe_pre_images,
             returning.as_deref(),
             tx_mode,
         )
-        .await?;
-        if n == 0 {
-            return Ok(empty_or_returning(
-                "UPDATE 0",
-                schema.clone(),
-                returning.as_deref(),
-            ));
-        }
-        // Fast-path RETURNING: the post-image batches were already projected
-        // inside `hot_tier_update_by_pk`; just wrap them in ExecResult::Rows.
-        if let Some(items) = returning.as_deref() {
-            let ret_schema = if let Some(first) = ret_batches.first() {
-                first.schema()
-            } else {
-                Arc::new(projected_returning_schema(schema.as_ref(), items))
-            };
-            return Ok(ExecResult::Rows {
-                schema: ret_schema,
-                batches: ret_batches,
+        .await?
+        {
+            if n == 0 {
+                return Ok(empty_or_returning(
+                    "UPDATE 0",
+                    schema.clone(),
+                    returning.as_deref(),
+                ));
+            }
+            // Fast-path RETURNING: the post-image batches were already projected
+            // inside `hot_tier_update_by_pk`; just wrap them in ExecResult::Rows.
+            if let Some(items) = returning.as_deref() {
+                let ret_schema = if let Some(first) = ret_batches.first() {
+                    first.schema()
+                } else {
+                    Arc::new(projected_returning_schema(schema.as_ref(), items))
+                };
+                return Ok(ExecResult::Rows {
+                    schema: ret_schema,
+                    batches: ret_batches,
+                });
+            }
+            return Ok(ExecResult::Empty {
+                tag: format!("UPDATE {n}"),
             });
         }
-        return Ok(ExecResult::Empty {
-            tag: format!("UPDATE {n}"),
-        });
     }
 
     // ── Cold copy-on-write path ─────────────────────────────────────────
@@ -2841,11 +3038,15 @@ pub(crate) async fn exec_update(
     // would not be seen, so without materializing it first the rewrite would
     // operate on stale cold data while the un-cleared overlay shadows the
     // result on read (#94/#95). Materialize the overlay into cold BEFORE we
-    // list the base files. This runs only on the cold fall-through (the fast
-    // path above never reaches here), so an update-heavy fast-path loop no
+    // list the base files. This runs only on the cold fall-through (a fast
+    // path that RAN returned above; a budget-declined fast path reaches here
+    // having written nothing), so an update-heavy fast-path loop no
     // longer pays the eager re-encode + commit on every UPDATE (#205).
-    // Only the shapes the fast path declined (non-PK-eq WHERE, non-allowlisted
-    // RMW expressions, constrained tables, …) reach this materialization.
+    // Only the shapes the fast path declined (un-probe-able WHERE, >cap
+    // matched sets, non-allowlisted RMW expressions, constrained tables,
+    // memtable-budget HardCapReached, …) reach this materialization — and for
+    // the budget decline it is also the remedy: materializing drains the
+    // overlay and releases its reserved bytes.
     materialize_hot_overlay_into_cold(sess, &table).await?;
     // Re-load metadata: materialize advances the table snapshot, so `meta`
     // (and the schema/live-files derived from it) must reflect the post-

@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use basin_catalog::{Catalog, InMemoryCatalog};
-use basin_common::ProjectId;
+use basin_common::{ProjectId, TableName};
 use basin_engine::{Engine, EngineConfig, ExecResult};
 use basin_shard::{Shard, ShardConfig};
 use basin_storage::{ReadCountersSnapshot, Storage, StorageConfig};
@@ -494,9 +494,107 @@ async fn scale_invariants() {
         d2.rows_decoded
     );
 
+    // ── 11. Small-bulk (≤cap) delta UPDATE: zero replacement writes ─────────
+    // Mirror of the DELETE tombstone-only invariant (section 5), extended to
+    // the multi-key delta-UPDATE path: a 200-key range UPDATE routes through
+    // the hot-tier overlay, so it must commit ZERO replacement files — the
+    // catalog snapshot id and live data-file set are byte-identical before
+    // and after. A cold copy-on-write regression would `commit_replace`
+    // (new snapshot, swapped file paths) and rewrite whole files, an O(N)
+    // write per statement; this gate pins that the cost stays O(matched keys)
+    // at any table size. Read-side work is also bounded: ONE probe SELECT
+    // resolves the matched keys AND carries the pre-images (the write step
+    // re-reads nothing from cold), so the zone-map prune bounds the statement
+    // at the one file overlapping the key range, independent of scale.
+    //
+    // Flush any straggler tail first so the file-set comparison can't be
+    // perturbed by a pre-statement tail flush (#205 ordering).
+    shard.flush_to_parquet().await.unwrap();
+    let upd_table = TableName::new("t").unwrap();
+    let cat = &engine.config().catalog;
+    let pre_meta = cat.load_table(&sess.project(), &upd_table).await.unwrap();
+    let pre_files = {
+        let mut p: Vec<String> = pre_meta
+            .live_data_files()
+            .iter()
+            .map(|f| f.path.clone())
+            .collect();
+        p.sort();
+        (pre_meta.current_snapshot.0, p)
+    };
+    // Overlay Update entries before (earlier sections wrote some): the gate
+    // asserts the DELTA, +200, so prior overlays can't mask a cold fallback.
+    let update_overlay_count = || {
+        engine
+            .memtable_registry()
+            .get(&sess.project(), &upd_table)
+            .map(|e| {
+                e.memtable
+                    .snapshot()
+                    .iter()
+                    .filter(|(_, v)| {
+                        matches!(v, basin_hottier::MemRowValue::Update { .. })
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let overlays_before = update_overlay_count();
+    // 200 interior keys of one seeded band — well under the 10k delta cap.
+    let lo = 70_200;
+    let hi = 70_399;
+    let (res, d) = probe(format!(
+        "UPDATE t SET v = v + 5 WHERE id BETWEEN {lo} AND {hi}"
+    ))
+    .await;
+    assert!(
+        matches!(&res, ExecResult::Empty { tag } if tag == "UPDATE 200"),
+        "200-key range UPDATE must affect exactly 200 rows: {res:?}"
+    );
+    // INVARIANT (routing): +200 overlay Update entries — the statement rode
+    // the delta path, not a cold rewrite.
+    assert_eq!(
+        update_overlay_count(),
+        overlays_before + 200,
+        "≤cap UPDATE must write exactly one overlay Update per matched key"
+    );
+    // INVARIANT (zero replacement writes): snapshot id + live file set are
+    // unchanged. Cold CoW MUST change both, so this catches any fallback or
+    // partial rewrite regardless of how cheap its reads were.
+    let post_meta = cat.load_table(&sess.project(), &upd_table).await.unwrap();
+    let post_files = {
+        let mut p: Vec<String> = post_meta
+            .live_data_files()
+            .iter()
+            .map(|f| f.path.clone())
+            .collect();
+        p.sort();
+        (post_meta.current_snapshot.0, p)
+    };
+    assert_eq!(
+        pre_files, post_files,
+        "≤cap delta UPDATE must commit ZERO replacement files (snapshot + live set unchanged)"
+    );
+    // INVARIANT (bounded reads): the probe is point-located — zone-map prune
+    // to the one file whose [min,max] overlaps the 200-key range — and the
+    // pre-images ride the probe, so there is NO second cold pass. O(1) files /
+    // O(chunk) decode independent of N; a cold CoW fallback (or a re-read per
+    // key) would blow these bounds immediately at this scale.
+    assert!(
+        d.files_opened <= 2,
+        "200-key delta UPDATE opened {} files; bound <=2 (one probe, zone-map-pruned)",
+        d.files_opened
+    );
+    assert!(
+        d.rows_decoded <= 2 * ONE_CHUNK,
+        "200-key delta UPDATE decoded {} rows; bound <= 2 chunks (single probe pass)",
+        d.rows_decoded
+    );
+
     println!(
         "[scale-invariants] scale={scale} fresh-point files<=2 rows_decoded<=2chunk; \
-         repeat/delete/own-insert/in-list-2nd = 0 cold; keyset/join point-bounded — all PASS"
+         repeat/delete/own-insert/in-list-2nd = 0 cold; keyset/join point-bounded; \
+         200-key delta UPDATE zero-replacement-files — all PASS"
     );
 
     bg.shutdown().await;

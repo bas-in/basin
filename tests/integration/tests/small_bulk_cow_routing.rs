@@ -8,10 +8,19 @@
 //! *multi-key* extension:
 //!
 //!   * `try_resolve_fast_path_update` now accepts a small key SET resolved by
-//!     PROBE — it runs `SELECT <pk> FROM t WHERE <predicate> LIMIT N+1` through
+//!     PROBE — it runs `SELECT * FROM t [WHERE <predicate>] LIMIT N+1` through
 //!     the overlay-aware fast-SELECT machinery; ≤ N matched keys route through
 //!     `hot_tier_update_by_pk` (which already takes `&[RowKey]`), N+1 falls to
-//!     cold CoW exactly as before.
+//!     cold CoW exactly as before. The probe carries the full row images as
+//!     the write step's pre-image source (no second cold read).
+//!   * the cap N is `delta_update_max_keys()` — default 10 000, overridable
+//!     per statement with `BASIN_DELTA_UPDATE_MAX_KEYS`. The raised cap is
+//!     budget-guarded: after the pre-images are gathered the fast path
+//!     reserves their bytes against the project memtable budget and DECLINES
+//!     to the cold CoW path on `HardCapReached`.
+//!   * a no-WHERE `UPDATE t SET …` routes through the same probe
+//!     (`match_simple_select` admits the zero-predicate select): a small
+//!     table's whole row set rides the overlay, a >cap table falls to cold.
 //!   * the RMW allowlist (`rmw_rhs_is_fast_path_eligible`) gained an explicit
 //!     Immutable / row-local FUNCTION allowlist: `jsonb_set`, `jsonb_insert`,
 //!     `jsonb_strip_nulls`, `coalesce` (NOW() stays excluded).
@@ -22,7 +31,19 @@
 //! matched PK into the process-wide `MemTableRegistry`. The cold CoW path
 //! rewrites Parquet/Vortex files and leaves the registry untouched. So we probe
 //! `engine.memtable_registry()` for `Update` entries — exactly the strategy
-//! `fastpath_gates.rs` uses.
+//! `fastpath_gates.rs` uses — and, where the contract is "zero replacement
+//! writes", we additionally assert the catalog's live data-file set (and
+//! snapshot id) is unchanged: a cold CoW `commit_replace` MUST change it.
+//!
+//! ## Env discipline
+//!
+//! Some tests mutate routing-relevant process env
+//! (`BASIN_DELTA_UPDATE_MAX_KEYS`, `BASIN_HOTTIER_FASTPATH_DISABLE`). Env is
+//! process-global and the engine reads these per statement, so mutators take
+//! the `ENV_LOCK` WRITE lock for their whole duration and restore the prior
+//! value; every other test takes the READ lock (they may run concurrently
+//! with each other but never against a mutator). Same pattern as
+//! `row_tier_residency.rs`.
 //!
 //! Drives `ProjectSession::execute` directly (no pgwire, `shard: None`).
 
@@ -38,6 +59,17 @@ use basin_hottier::{MemRowValue, RowKey};
 use object_store::local::LocalFileSystem;
 use serde_json::Value;
 use tempfile::TempDir;
+
+// ── Env serialization (see module docs) ─────────────────────────────────────
+
+static ENV_LOCK: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
+fn restore_env(key: &str, prev: Option<String>) {
+    match prev {
+        Some(v) => std::env::set_var(key, v),
+        None => std::env::remove_var(key),
+    }
+}
 
 // ── Harness ─────────────────────────────────────────────────────────────────
 
@@ -183,6 +215,47 @@ async fn payload_for_id(sess: &ProjectSession, table: &str, id: i64) -> Value {
     panic!("no payload row for id={id}");
 }
 
+/// Sorted live data-file paths plus the current snapshot id for `(project,
+/// table)`, straight from the catalog. The delta (overlay) UPDATE path commits
+/// nothing, so both must be UNCHANGED across it; a cold CoW UPDATE runs
+/// `commit_replace` (new snapshot, replacement file paths), so both change.
+/// This is the "zero replacement files" detector.
+async fn cold_tier_state(eng: &Engine, project: &ProjectId, table: &TableName) -> (u64, Vec<String>) {
+    let meta = eng
+        .config()
+        .catalog
+        .load_table(project, table)
+        .await
+        .unwrap();
+    let mut paths: Vec<String> = meta
+        .live_data_files()
+        .iter()
+        .map(|f| f.path.clone())
+        .collect();
+    paths.sort();
+    (meta.current_snapshot.0, paths)
+}
+
+/// Full `(id, v, status)` content of a `seed_status`-shaped table, ordered by
+/// id — for byte-for-byte delta-vs-cold twin comparison.
+async fn all_status_rows(sess: &ProjectSession, table: &str) -> Vec<(i64, i64, String)> {
+    let sql = format!("SELECT id, v, status FROM {table} ORDER BY id");
+    let batches = match sess.execute(&sql).await.unwrap() {
+        ExecResult::Rows { batches, .. } => batches,
+        other => panic!("all_status_rows got {other:?}"),
+    };
+    let mut out = Vec::new();
+    for b in &batches {
+        let ids = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let vs = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let sts = b.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+        for i in 0..b.num_rows() {
+            out.push((ids.value(i), vs.value(i), sts.value(i).to_string()));
+        }
+    }
+    out
+}
+
 // ── Seed helpers ────────────────────────────────────────────────────────────
 
 /// `(id BIGINT PRIMARY KEY, payload JSONB)` with `n` rows; payload is
@@ -229,6 +302,7 @@ async fn seed_status(sess: &ProjectSession, table: &str, n: i64) {
 /// and COUNT(*) is stable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn jsonb_set_pk_range_routes_fast_path() {
+    let _env = ENV_LOCK.read().await;
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let sess = open(&eng).await;
@@ -274,6 +348,7 @@ async fn jsonb_set_pk_range_routes_fast_path() {
 /// routes to the overlay and applies the per-row conditional correctly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn case_conditional_pk_range_routes_fast_path() {
+    let _env = ENV_LOCK.read().await;
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let sess = open(&eng).await;
@@ -310,6 +385,7 @@ async fn case_conditional_pk_range_routes_fast_path() {
 /// residual re-evaluation is needed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn non_pk_predicate_routes_via_probe() {
+    let _env = ENV_LOCK.read().await;
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let sess = open(&eng).await;
@@ -340,24 +416,37 @@ async fn non_pk_predicate_routes_via_probe() {
 
 // ── 4. >cap matches fall to cold CoW ────────────────────────────────────────
 
-/// A WHERE matching more than the small-bulk cap (64) must fall to the cold
-/// copy-on-write path: NO overlay entries, but values still correct.
+/// A WHERE matching more than the delta cap must fall to the cold
+/// copy-on-write path: NO overlay entries, a NEW catalog snapshot (the cold
+/// rewrite commits replacement files), and values still correct. The cap is
+/// pinned to 64 via `BASIN_DELTA_UPDATE_MAX_KEYS` (default is 10 000) so the
+/// boundary is exercised with a small seed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn over_cap_falls_to_cold() {
+    let _env = ENV_LOCK.write().await;
+    let prev = std::env::var("BASIN_DELTA_UPDATE_MAX_KEYS").ok();
+    std::env::set_var("BASIN_DELTA_UPDATE_MAX_KEYS", "64");
+
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let sess = open(&eng).await;
     let project = sess.project();
     let table = TableName::new("t").unwrap();
     seed_status(&sess, "t", 200).await;
+    let before = cold_tier_state(&eng, &project, &table).await;
 
-    // id <= 65 → 65 rows, exceeds the cap of 64 → cold path.
+    // id <= 65 → 65 rows, exceeds the pinned cap of 64 → cold path.
     exec(&sess, "UPDATE t SET v = 1 WHERE id <= 65").await;
 
     assert_eq!(
         registry_update_count(&eng, &project, &table),
         0,
-        "65 matches exceed the small-bulk cap; UPDATE must fall to cold CoW (no overlay)"
+        "65 matches exceed the delta cap; UPDATE must fall to cold CoW (no overlay)"
+    );
+    let after = cold_tier_state(&eng, &project, &table).await;
+    assert_ne!(
+        before, after,
+        "cold CoW must commit replacement files (snapshot/file set must change)"
     );
 
     // Values still correct via the cold rewrite.
@@ -365,12 +454,18 @@ async fn over_cap_falls_to_cold() {
     assert_eq!(fetch_i64(&sess, "t", "v", 65).await, Some(1), "id=65 rewritten by cold path");
     assert_eq!(fetch_i64(&sess, "t", "v", 66).await, Some(660), "id=66 untouched");
     assert_eq!(count_all(&sess, "t").await, 200, "COUNT stable");
+
+    restore_env("BASIN_DELTA_UPDATE_MAX_KEYS", prev);
 }
 
-/// Exactly the cap (64 rows) still takes the fast path — the LIMIT N+1 probe
-/// returns 64 keys, which is ≤ cap.
+/// Exactly the cap (pinned to 64 rows) still takes the fast path — the LIMIT
+/// N+1 probe returns 64 keys, which is ≤ cap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exactly_cap_routes_fast_path() {
+    let _env = ENV_LOCK.write().await;
+    let prev = std::env::var("BASIN_DELTA_UPDATE_MAX_KEYS").ok();
+    std::env::set_var("BASIN_DELTA_UPDATE_MAX_KEYS", "64");
+
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let sess = open(&eng).await;
@@ -388,6 +483,8 @@ async fn exactly_cap_routes_fast_path() {
     );
     assert_eq!(fetch_i64(&sess, "t", "v", 64).await, Some(2), "id=64 rewritten via overlay");
     assert_eq!(fetch_i64(&sess, "t", "v", 65).await, Some(650), "id=65 untouched");
+
+    restore_env("BASIN_DELTA_UPDATE_MAX_KEYS", prev);
 }
 
 // ── 5. Mixed with prior overlays (RMW accumulation across statements) ────────
@@ -397,6 +494,7 @@ async fn exactly_cap_routes_fast_path() {
 /// so the second UPDATE's RMW accumulates on top of the first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mixed_with_prior_overlay_accumulates() {
+    let _env = ENV_LOCK.read().await;
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let sess = open(&eng).await;
@@ -428,6 +526,7 @@ async fn mixed_with_prior_overlay_accumulates() {
 /// routes to the overlay and creates the key on every matched row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn jsonb_set_missing_path_routes_fast_path() {
+    let _env = ENV_LOCK.read().await;
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let sess = open(&eng).await;
@@ -464,6 +563,7 @@ async fn jsonb_set_missing_path_routes_fast_path() {
 /// projected row per matched key and still writes the overlay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn returning_with_multi_key_probe() {
+    let _env = ENV_LOCK.read().await;
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let sess = open(&eng).await;
@@ -512,6 +612,7 @@ async fn returning_with_multi_key_probe() {
 /// Guards against the closed function allowlist accidentally widening.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn non_allowlisted_function_stays_cold() {
+    let _env = ENV_LOCK.read().await;
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let sess = open(&eng).await;
@@ -540,6 +641,7 @@ async fn non_allowlisted_function_stays_cold() {
 /// allowlist (deterministic, Immutable, row-local).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn coalesce_function_routes_fast_path() {
+    let _env = ENV_LOCK.read().await;
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let sess = open(&eng).await;
@@ -555,4 +657,243 @@ async fn coalesce_function_routes_fast_path() {
         "coalesce(...) is allowlisted; small-range UPDATE must take the fast path"
     );
     assert_eq!(fetch_i64(&sess, "t", "v", 1).await, Some(11), "coalesce(10,0)+1 = 11");
+}
+
+// ── 9. Raised cap: 200-key UPDATE routes delta with zero replacement files ──
+
+/// 200 matched keys — far beyond the historical 64-key cap, well under the
+/// 10 000 default — must route through the overlay: 200 `Update` entries, the
+/// catalog snapshot and live data-file set UNCHANGED (zero replacement
+/// writes), and every value correct (RMW reads the pre-image carried by the
+/// probe itself).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_hundred_keys_route_delta_zero_replacement_files() {
+    let _env = ENV_LOCK.read().await;
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = open(&eng).await;
+    let project = sess.project();
+    let table = TableName::new("t").unwrap();
+    seed_status(&sess, "t", 300).await;
+    let before = cold_tier_state(&eng, &project, &table).await;
+
+    exec(&sess, "UPDATE t SET v = v + 1 WHERE id <= 200").await;
+
+    assert_eq!(
+        registry_update_count(&eng, &project, &table),
+        200,
+        "200-key UPDATE (≤ 10k delta cap) must write one overlay entry per key"
+    );
+    let after = cold_tier_state(&eng, &project, &table).await;
+    assert_eq!(
+        before, after,
+        "delta UPDATE must commit ZERO replacement files (snapshot + live file set unchanged)"
+    );
+
+    // RMW correctness across the whole range + the boundary.
+    assert_eq!(fetch_i64(&sess, "t", "v", 1).await, Some(11), "10 + 1");
+    assert_eq!(fetch_i64(&sess, "t", "v", 137).await, Some(1371), "1370 + 1");
+    assert_eq!(fetch_i64(&sess, "t", "v", 200).await, Some(2001), "2000 + 1");
+    assert_eq!(fetch_i64(&sess, "t", "v", 201).await, Some(2010), "id=201 untouched");
+    assert_eq!(count_all(&sess, "t").await, 300, "COUNT stable");
+}
+
+// ── 10. Memory guard: exhausted hard cap declines to cold ───────────────────
+
+/// With the project's memtable budget reserved to the brim, the fast path's
+/// post-gather `try_reserve_bytes` reports `HardCapReached` and the UPDATE
+/// must DECLINE to the cold CoW path: zero overlay entries, a new catalog
+/// snapshot (replacement files), and a correct result.
+///
+/// The budget is exhausted directly through the registry (the same
+/// `try_reserve_bytes` API the engine uses) rather than via a tiny
+/// `BASIN_MEMTABLE_HARD_CAP` env, so no engine-construction env race exists.
+/// The 200-row single-statement seed stays above the write-through residency
+/// row cap (128), so the registry holds NO clean bytes the guard's internal
+/// evict-clean could reclaim — the decline is deterministic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hard_cap_exhausted_falls_cold() {
+    let _env = ENV_LOCK.read().await;
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = open(&eng).await;
+    let project = sess.project();
+    let table = TableName::new("t").unwrap();
+    seed_status(&sess, "t", 200).await;
+    let before = cold_tier_state(&eng, &project, &table).await;
+
+    // Exhaust this project's budget: top the counter up to exactly the hard
+    // cap (relative to whatever the engine already holds), so any further
+    // reservation (the UPDATE's staged override bytes) must be refused.
+    let registry = eng.memtable_registry();
+    let hard_cap = registry.config().project_hard_cap_bytes;
+    let fill = hard_cap - registry.project_bytes(&project);
+    let _ = registry.try_reserve_bytes(&project, fill);
+    assert_eq!(
+        registry.project_bytes(&project),
+        hard_cap,
+        "budget must be reserved to exactly the hard cap"
+    );
+
+    exec(&sess, "UPDATE t SET v = v + 1 WHERE id <= 50").await;
+
+    assert_eq!(
+        registry_update_count(&eng, &project, &table),
+        0,
+        "HardCapReached must decline the overlay write — no Update entries"
+    );
+    let after = cold_tier_state(&eng, &project, &table).await;
+    assert_ne!(
+        before, after,
+        "the declined UPDATE must have run as a cold CoW (replacement files committed)"
+    );
+
+    // Result correct via the cold rewrite.
+    assert_eq!(fetch_i64(&sess, "t", "v", 1).await, Some(11), "10 + 1 via cold path");
+    assert_eq!(fetch_i64(&sess, "t", "v", 50).await, Some(501), "500 + 1 via cold path");
+    assert_eq!(fetch_i64(&sess, "t", "v", 51).await, Some(510), "id=51 untouched");
+    assert_eq!(count_all(&sess, "t").await, 200, "COUNT stable");
+
+    // Hygiene: hand the synthetic reservation back.
+    registry.release_bytes(&project, fill);
+}
+
+// ── 11. No-WHERE UPDATE: small table routes delta, identical to cold twin ───
+
+/// `UPDATE t SET v = v + 7` (no WHERE) on a 40-row table routes through the
+/// overlay (40 Update entries, zero replacement files) and its result is
+/// byte-identical to the SAME statement forced down the cold path
+/// (`BASIN_HOTTIER_FASTPATH_DISABLE=1`) on an identically seeded twin engine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_where_small_table_routes_delta_matches_cold_twin() {
+    let _env = ENV_LOCK.write().await;
+    // Pin the fast path ON for the delta engine even under an inherited env.
+    let prev_kill = std::env::var("BASIN_HOTTIER_FASTPATH_DISABLE").ok();
+    std::env::remove_var("BASIN_HOTTIER_FASTPATH_DISABLE");
+
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+    let eng_a = engine_in(&dir_a);
+    let eng_b = engine_in(&dir_b);
+    let sess_a = open(&eng_a).await;
+    let sess_b = open(&eng_b).await;
+    let project_a = sess_a.project();
+    let table = TableName::new("t").unwrap();
+    seed_status(&sess_a, "t", 40).await;
+    seed_status(&sess_b, "t", 40).await;
+    let before_a = cold_tier_state(&eng_a, &project_a, &table).await;
+
+    // Delta engine: fast path on.
+    exec(&sess_a, "UPDATE t SET v = v + 7").await;
+    assert_eq!(
+        registry_update_count(&eng_a, &project_a, &table),
+        40,
+        "no-WHERE UPDATE on a small table must route every row through the overlay"
+    );
+    let after_a = cold_tier_state(&eng_a, &project_a, &table).await;
+    assert_eq!(
+        before_a, after_a,
+        "no-WHERE delta UPDATE must commit zero replacement files"
+    );
+
+    // Cold twin: kill switch forces the historical cold CoW route.
+    std::env::set_var("BASIN_HOTTIER_FASTPATH_DISABLE", "1");
+    exec(&sess_b, "UPDATE t SET v = v + 7").await;
+    restore_env("BASIN_HOTTIER_FASTPATH_DISABLE", prev_kill);
+    assert_eq!(
+        registry_update_count(&eng_b, &sess_b.project(), &table),
+        0,
+        "kill switch must keep the twin on the cold path (no overlay)"
+    );
+
+    // Row-for-row identical results.
+    let rows_a = all_status_rows(&sess_a, "t").await;
+    let rows_b = all_status_rows(&sess_b, "t").await;
+    assert_eq!(rows_a.len(), 40, "twin tables must keep all 40 rows");
+    assert_eq!(
+        rows_a, rows_b,
+        "no-WHERE delta UPDATE must be byte-identical to the cold twin"
+    );
+}
+
+// ── 12. No-WHERE UPDATE on a >cap table falls to cold ───────────────────────
+
+/// A no-WHERE UPDATE whose table holds MORE live rows than the delta cap must
+/// fall to the cold CoW path exactly as before the routing change: zero
+/// overlay entries, replacement files committed, every row updated. The cap is
+/// pinned to 25 via `BASIN_DELTA_UPDATE_MAX_KEYS` so a 30-row table is "big".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_where_over_cap_falls_to_cold() {
+    let _env = ENV_LOCK.write().await;
+    let prev = std::env::var("BASIN_DELTA_UPDATE_MAX_KEYS").ok();
+    std::env::set_var("BASIN_DELTA_UPDATE_MAX_KEYS", "25");
+
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = open(&eng).await;
+    let project = sess.project();
+    let table = TableName::new("t").unwrap();
+    seed_status(&sess, "t", 30).await;
+    let before = cold_tier_state(&eng, &project, &table).await;
+
+    exec(&sess, "UPDATE t SET v = 1").await;
+
+    assert_eq!(
+        registry_update_count(&eng, &project, &table),
+        0,
+        "30 rows exceed the pinned cap of 25; the no-WHERE UPDATE must go cold"
+    );
+    let after = cold_tier_state(&eng, &project, &table).await;
+    assert_ne!(before, after, "cold CoW must commit replacement files");
+    for pk in [1, 15, 30] {
+        assert_eq!(fetch_i64(&sess, "t", "v", pk).await, Some(1), "id={pk} rewritten");
+    }
+    assert_eq!(count_all(&sess, "t").await, 30, "COUNT stable");
+
+    restore_env("BASIN_DELTA_UPDATE_MAX_KEYS", prev);
+}
+
+// ── 13. UPDATE 0 on an empty table ───────────────────────────────────────────
+
+/// `UPDATE t SET v = 1` (no WHERE) and a WHERE variant on an EMPTY table must
+/// both report `UPDATE 0`, error-free, with zero overlay entries — the probe
+/// resolves zero matched keys and that is a valid fast-path outcome.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_zero_on_empty_table() {
+    let _env = ENV_LOCK.read().await;
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = open(&eng).await;
+    let project = sess.project();
+    let table = TableName::new("t").unwrap();
+    exec(
+        &sess,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT NOT NULL, status TEXT NOT NULL)",
+    )
+    .await;
+
+    let res = sess
+        .execute("UPDATE t SET v = 1")
+        .await
+        .expect("no-WHERE UPDATE on an empty table must not error");
+    assert!(
+        matches!(&res, ExecResult::Empty { tag } if tag == "UPDATE 0"),
+        "no-WHERE UPDATE on empty table must report UPDATE 0, got {res:?}"
+    );
+
+    let res = sess
+        .execute("UPDATE t SET v = 1 WHERE v = 99")
+        .await
+        .expect("WHERE UPDATE on an empty table must not error");
+    assert!(
+        matches!(&res, ExecResult::Empty { tag } if tag == "UPDATE 0"),
+        "WHERE UPDATE on empty table must report UPDATE 0, got {res:?}"
+    );
+
+    assert_eq!(
+        registry_update_count(&eng, &project, &table),
+        0,
+        "UPDATE 0 must leave no overlay entries"
+    );
+    assert_eq!(count_all(&sess, "t").await, 0, "table stays empty");
 }

@@ -873,13 +873,22 @@ async fn gate_predicate_not_pk_eq_update_small_set_routes_overlay() {
     assert_eq!(fetch_v(&sess, "t", 1).await, Some(10), "id=1 untouched");
 }
 
-/// A non-PK predicate matching MORE than `SMALL_BULK_FASTPATH_CAP` (64) rows
-/// must NOT route through the overlay — it falls to the cold copy-on-write
-/// path (whole-file rewrite), so the registry holds zero Update entries.
+/// A non-PK predicate matching MORE than the delta-update key cap must NOT
+/// route through the overlay — it falls to the cold copy-on-write path
+/// (whole-file rewrite), so the registry holds zero Update entries. The cap
+/// default is now 10k (BASIN_DELTA_UPDATE_MAX_KEYS); this gate pins the
+/// over-cap behavior, so it pins the cap at the historical 64 to keep its
+/// 70-row predicate over the limit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gate_predicate_not_pk_eq_update_large_set_goes_cold() {
     let _g = ENV_LOCK.lock().await;
     let _upd = set_env("BASIN_HOTTIER_UPDATE_FASTPATH");
+    let prev_cap = std::env::var("BASIN_DELTA_UPDATE_MAX_KEYS").ok();
+    unsafe { std::env::set_var("BASIN_DELTA_UPDATE_MAX_KEYS", "64") };
+    let _cap = EnvGuard {
+        key: "BASIN_DELTA_UPDATE_MAX_KEYS",
+        prev: prev_cap,
+    };
 
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
