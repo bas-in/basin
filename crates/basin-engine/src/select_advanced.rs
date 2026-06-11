@@ -20,7 +20,7 @@
 //! The following constructs already pass through the sqlparser→DataFusion
 //! pipeline without any intervention from this module:
 //!
-//! - `DISTINCT ON (cols)` — sqlparser parses into `Select.distinct = Some(Distinct::On(…))`; DataFusion 44 translates to a `DistinctOn` logical node.
+//! - `DISTINCT ON (cols)` — sqlparser parses into `Select.distinct = Some(Distinct::On(…))`; DataFusion translates to a `DistinctOn` logical node, which Basin's `is_distinct_rewrite` optimizer rule lowers to a grouped `first_value` aggregate (trimmed ORDER BY, ON columns projected from the group keys).
 //! - `LIMIT N OFFSET M` — standard form; both sqlparser and DataFusion handle natively.
 //! - `OFFSET N ROW` / `OFFSET N ROWS` — sqlparser `Offset { rows: OffsetRows::Row|Rows }` is mapped to `query.offset`; DataFusion reads `o.value` and ignores the `ROW`/`ROWS` keyword.
 //! - `ORDER BY … NULLS FIRST` / `NULLS LAST` — sqlparser `OrderByExpr.nulls_first`; DataFusion honours it via `SortExpr`.
