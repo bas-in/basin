@@ -9,9 +9,9 @@ use std::sync::Arc;
 use std::collections::BTreeMap;
 
 use arrow_array::builder::{
-    BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, Float32Builder, Float64Builder,
-    Int16Builder, Int32Builder, Int64Builder, LargeBinaryBuilder, ListBuilder, StringBuilder,
-    TimestampMicrosecondBuilder,
+    BinaryBuilder, BooleanBuilder, Date32Builder, FixedSizeBinaryBuilder, Float32Builder,
+    Float64Builder, Int16Builder, Int32Builder, Int64Builder, LargeBinaryBuilder, ListBuilder,
+    StringBuilder, TimestampMicrosecondBuilder,
 };
 use arrow_array::types::Float32Type;
 use arrow_array::{
@@ -315,6 +315,22 @@ pub(crate) fn batch_from_rows(schema: Arc<Schema>, rows: &[Vec<Expr>]) -> Result
                     .with_data_type(field.data_type().clone());
                 for row in rows {
                     match coerce_timestamp_micros(&row[col_idx])? {
+                        Some(v) => b.append_value(v),
+                        None => {
+                            check_null_allowed(field)?;
+                            b.append_null();
+                        }
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            DataType::Date32 => {
+                // PG `date` literal coercion: `'YYYY-MM-DD'` (plus the typed /
+                // cast spellings `DATE '…'` and `'…'::DATE`) → days since the
+                // Unix epoch, the Arrow `Date32` representation.
+                let mut b = Date32Builder::with_capacity(rows.len());
+                for row in rows {
+                    match coerce_date32(&row[col_idx], field.name())? {
                         Some(v) => b.append_value(v),
                         None => {
                             check_null_allowed(field)?;
@@ -2655,6 +2671,91 @@ fn micros_from_dt(dt: DateTime<Utc>) -> Result<i64> {
     Ok(micros)
 }
 
+/// Decode a DATE literal into days since the Unix epoch (Arrow `Date32`).
+///
+/// Accepts:
+/// - `'2020-01-01'` — plain `'YYYY-MM-DD'` string literal.
+/// - `DATE '2020-01-01'` — SQL-standard typed-string form.
+/// - `'2020-01-01'::DATE` — cast wrapper; the inner string is coerced.
+/// - `NULL`.
+fn coerce_date32(expr: &Expr, col: &str) -> Result<Option<i32>> {
+    // Strip an explicit `::DATE` cast wrapper if present; sqlparser
+    // surfaces it as `Expr::Cast`. The inner expression is what we coerce.
+    let inner = match expr {
+        Expr::Cast { expr: inner, .. } => inner.as_ref(),
+        // SQL-standard typed-string literal: `DATE '…'`. sqlparser surfaces
+        // it as `Expr::TypedString` rather than `Expr::Cast`, so the
+        // cast-peel above misses it.
+        Expr::TypedString(TypedString {
+            data_type: SqlDataType::Date,
+            value: ValueWithSpan { value: v, .. },
+            ..
+        }) => {
+            let s: &str = match v {
+                Value::SingleQuotedString(s)
+                | Value::DoubleQuotedString(s)
+                | Value::EscapedStringLiteral(s)
+                | Value::NationalStringLiteral(s) => s,
+                Value::Null => return Ok(None),
+                other => {
+                    return Err(BasinError::InvalidSchema(format!(
+                        "expected string-valued DATE literal for column {col}, got {other:?}"
+                    )));
+                }
+            };
+            return parse_date32_string(s, col).map(Some);
+        }
+        _ => expr,
+    };
+    match inner {
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(s),
+            ..
+        })
+        | Expr::Value(ValueWithSpan {
+            value: Value::DoubleQuotedString(s),
+            ..
+        })
+        | Expr::Value(ValueWithSpan {
+            value: Value::EscapedStringLiteral(s),
+            ..
+        })
+        | Expr::Value(ValueWithSpan {
+            value: Value::NationalStringLiteral(s),
+            ..
+        }) => parse_date32_string(s, col).map(Some),
+        Expr::Value(ValueWithSpan {
+            value: Value::Null, ..
+        }) => Ok(None),
+        other => Err(BasinError::InvalidSchema(format!(
+            "expected DATE literal for column {col}, got {other}"
+        ))),
+    }
+}
+
+/// Parse a `'YYYY-MM-DD'` date string into days since 1970-01-01 — the
+/// Arrow `Date32` representation. The error names the column so a
+/// multi-column INSERT pinpoints the offending cell.
+pub(crate) fn parse_date32_string(s: &str, col: &str) -> Result<i32> {
+    use chrono::NaiveDate;
+
+    let trimmed = s.trim();
+    let date = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d").map_err(|_| {
+        BasinError::InvalidSchema(format!(
+            "invalid DATE literal {s:?} for column {col} (expected 'YYYY-MM-DD')"
+        ))
+    })?;
+    // chrono's full NaiveDate range (±~262k years, ±~96M days) fits i32,
+    // so the narrow can't fail today; re-validate anyway so a future range
+    // change errors instead of wrapping.
+    let days = date
+        .signed_duration_since(NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch date is valid"))
+        .num_days();
+    i32::try_from(days).map_err(|_| {
+        BasinError::InvalidSchema(format!("DATE literal {s:?} out of range for column {col}"))
+    })
+}
+
 fn coerce_bool(expr: &Expr) -> Result<Option<bool>> {
     match expr {
         Expr::Value(ValueWithSpan {
@@ -3184,6 +3285,45 @@ mod tests {
         assert!(
             matches!(err, BasinError::InvalidSchema(_)),
             "expected InvalidSchema, got {err:?}"
+        );
+    }
+
+    /// DATE cells coerce `'YYYY-MM-DD'` (plain, typed-string, and cast
+    /// spellings) to days-since-epoch, and NULL stays null.
+    #[test]
+    fn date32_values_coercion_round_trip() {
+        let rows = rows_from_sql(
+            "INSERT INTO t (d) VALUES \
+             ('2020-01-01'), (DATE '2021-06-15'), (NULL), ('1969-12-31'::DATE)",
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, true)]));
+        let batch = batch_from_rows(schema, &rows).unwrap();
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Date32Array>()
+            .unwrap();
+        assert_eq!(arr.value(0), 18_262, "2020-01-01 is 18262 days after epoch");
+        assert_eq!(arr.value(1), 18_793, "2021-06-15 is 18793 days after epoch");
+        assert!(arr.is_null(2), "NULL date cell must be null");
+        assert_eq!(arr.value(3), -1, "1969-12-31 is one day before the epoch");
+    }
+
+    /// An unparseable DATE literal is an InvalidSchema error naming the
+    /// column and the offending literal.
+    #[test]
+    fn date32_values_invalid_literal_errors() {
+        let rows = rows_from_sql("INSERT INTO t (d) VALUES ('not-a-date')");
+        let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, true)]));
+        let err = batch_from_rows(schema, &rows).unwrap_err();
+        assert!(
+            matches!(err, BasinError::InvalidSchema(_)),
+            "expected InvalidSchema, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not-a-date") && msg.contains("column d"),
+            "error must name the literal and the column: {msg}"
         );
     }
 }

@@ -51,12 +51,12 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use arrow_array::builder::{
-    BooleanBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder,
-    StringBuilder, TimestampMicrosecondBuilder,
+    BooleanBuilder, Date32Builder, Float32Builder, Float64Builder, Int16Builder, Int32Builder,
+    Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
 };
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
-    RecordBatch, StringArray, TimestampMicrosecondArray,
+    Array, ArrayRef, BooleanArray, Date32Array, Float32Array, Float64Array, Int16Array, Int32Array,
+    Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use basin_catalog::DataFileRef;
@@ -5694,6 +5694,30 @@ fn build_assigned_column(
             }
             Ok(Arc::new(b.finish()))
         }
+        // DATE assignment — the scalar is i64 days-since-epoch (widened by
+        // the literal parser), narrowed back to the Date32 i32 range.
+        (DataType::Date32, ScalarValue::Int64(v)) => {
+            let set_val = i32::try_from(*v).map_err(|_| {
+                BasinError::InvalidSchema(format!(
+                    "UPDATE SET: value {v} out of range for DATE column"
+                ))
+            })?;
+            let arr = original
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| BasinError::internal("expected Date32Array for SET"))?;
+            let mut b = Date32Builder::with_capacity(n);
+            for i in 0..n {
+                if matched(i) {
+                    b.append_value(set_val);
+                } else if arr.is_null(i) {
+                    b.append_null();
+                } else {
+                    b.append_value(arr.value(i));
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
         // Cross-type assignments (e.g. SET id = '5') aren't supported in
         // v0.1. Mention both sides in the error so debugging is easy.
         (col_type, scalar) => Err(BasinError::InvalidSchema(format!(
@@ -6026,6 +6050,39 @@ pub(crate) fn try_literal_to_scalar(
             } else {
                 micros
             })))
+        }
+        // DATE column — a `'YYYY-MM-DD'` string literal, coerced to
+        // days-since-epoch (Arrow Date32). Widened to Int64 in the scalar
+        // so the SET path narrows back to i32, mirroring the INT4/INT2
+        // convention above. Non-string forms (`DATE '…'`, `'…'::DATE`,
+        // `CURRENT_DATE`, …) flow through the expression fallback.
+        (DataType::Date32, _) => {
+            let s = match inner {
+                Expr::Value(ValueWithSpan {
+                    value: Value::SingleQuotedString(s),
+                    ..
+                })
+                | Expr::Value(ValueWithSpan {
+                    value: Value::DoubleQuotedString(s),
+                    ..
+                })
+                | Expr::Value(ValueWithSpan {
+                    value: Value::EscapedStringLiteral(s),
+                    ..
+                })
+                | Expr::Value(ValueWithSpan {
+                    value: Value::NationalStringLiteral(s),
+                    ..
+                }) => s,
+                _ => return Ok(None),
+            };
+            if negated {
+                return Err(BasinError::InvalidSchema(format!(
+                    "cannot negate date literal in SET {col} = {expr}"
+                )));
+            }
+            let days = crate::dml::parse_date32_string(s, col)?;
+            Ok(Some(ScalarValue::Int64(i64::from(days))))
         }
         // Not a recognised literal form for this column type. Caller falls
         // back to expression evaluation.

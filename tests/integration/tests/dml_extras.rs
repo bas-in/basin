@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use arrow_array::{Array, Int64Array, StringArray, TimestampMicrosecondArray};
+use arrow_array::{Array, Date32Array, Int64Array, StringArray, TimestampMicrosecondArray};
 use basin_catalog::InMemoryCatalog;
 use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
@@ -75,6 +75,27 @@ fn col_string(batches: &[RecordBatch], name: &str) -> Vec<String> {
             .unwrap();
         for i in 0..arr.len() {
             out.push(arr.value(i).to_string());
+        }
+    }
+    out
+}
+
+/// Extract a DATE (Arrow Date32) column as days-since-epoch, `None` for NULLs.
+fn col_date32(batches: &[RecordBatch], name: &str) -> Vec<Option<i32>> {
+    let mut out = Vec::new();
+    for b in batches {
+        let idx = b.schema().index_of(name).unwrap();
+        let arr = b
+            .column(idx)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
+        for i in 0..arr.len() {
+            out.push(if arr.is_null(i) {
+                None
+            } else {
+                Some(arr.value(i))
+            });
         }
     }
     out
@@ -1558,4 +1579,104 @@ async fn bulk_upsert_do_nothing() {
         vec![8],
         "3 new rows must have been inserted; existing 5 unchanged"
     );
+}
+
+// ─── 7. DATE (Date32) column DML ────────────────────────────────────────────
+//
+// CREATE TABLE has mapped DATE → Arrow Date32 (types::arrow_data_type) since
+// the beginning, but the slow VALUES path had no Date32 arm, so any INSERT
+// into a DATE column failed with "unsupported Arrow column type for INSERT".
+// These pin the literal coercion ('YYYY-MM-DD' → days-since-epoch), NULL
+// handling, the invalid-literal error, and the UPDATE SET scalar fast path.
+
+/// INSERT two date literals + NULL into a DATE column and read them back.
+#[tokio::test]
+async fn insert_date_literals_round_trip() {
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+
+    sess.execute("CREATE TABLE events (id BIGINT NOT NULL PRIMARY KEY, d DATE)")
+        .await
+        .unwrap();
+    sess.execute(
+        "INSERT INTO events (id, d) VALUES (1, '2020-01-01'), (2, '2021-06-15'), (3, NULL)",
+    )
+    .await
+    .unwrap();
+
+    let ExecResult::Rows { batches, .. } = sess
+        .execute("SELECT id, d FROM events ORDER BY id")
+        .await
+        .unwrap()
+    else {
+        panic!("expected rows")
+    };
+    assert_eq!(col_i64(&batches, "id"), vec![1, 2, 3]);
+    // Date32 is days since 1970-01-01: 2020-01-01 = 18262, 2021-06-15 = 18793.
+    assert_eq!(
+        col_date32(&batches, "d"),
+        vec![Some(18_262), Some(18_793), None]
+    );
+}
+
+/// An unparseable DATE literal must fail the INSERT with an error naming the
+/// column, and must not insert any rows.
+#[tokio::test]
+async fn insert_invalid_date_literal_errors() {
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+
+    sess.execute("CREATE TABLE events (id BIGINT NOT NULL PRIMARY KEY, d DATE)")
+        .await
+        .unwrap();
+    let err = sess
+        .execute("INSERT INTO events (id, d) VALUES (1, 'not-a-date')")
+        .await
+        .expect_err("invalid DATE literal must error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not-a-date") && msg.contains("column d"),
+        "error must name the bad literal and the column: {msg}"
+    );
+
+    // The failed INSERT must not have landed any rows.
+    let ExecResult::Rows { batches, .. } = sess
+        .execute("SELECT COUNT(*) AS n FROM events")
+        .await
+        .unwrap()
+    else {
+        panic!("expected rows")
+    };
+    assert_eq!(col_i64(&batches, "n"), vec![0]);
+}
+
+/// `UPDATE t SET d = '2022-03-01' WHERE id = 1` — the DATE literal routes
+/// through the scalar SET fast path (try_literal_to_scalar → Date32 arm)
+/// and only the matched row changes.
+#[tokio::test]
+async fn update_set_date_literal_round_trip() {
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+
+    sess.execute("CREATE TABLE events (id BIGINT NOT NULL PRIMARY KEY, d DATE)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO events (id, d) VALUES (1, '2020-01-01'), (2, '2021-06-15')")
+        .await
+        .unwrap();
+
+    sess.execute("UPDATE events SET d = '2022-03-01' WHERE id = 1")
+        .await
+        .unwrap();
+
+    let ExecResult::Rows { batches, .. } = sess
+        .execute("SELECT id, d FROM events ORDER BY id")
+        .await
+        .unwrap()
+    else {
+        panic!("expected rows")
+    };
+    assert_eq!(col_i64(&batches, "id"), vec![1, 2]);
+    // Row 1 → 2022-03-01 = 19052 days since epoch; row 2 untouched.
+    assert_eq!(col_date32(&batches, "d"), vec![Some(19_052), Some(18_793)]);
 }
