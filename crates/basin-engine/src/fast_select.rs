@@ -2199,31 +2199,54 @@ async fn execute_simple_select_inner(
     // (seq > watermark) is invisible to this read. `None` = auto-commit / no
     // pin: today's behaviour (every committed overlay entry is visible).
     let hot_watermark = pinned.map(|p| p.hot_watermark);
+    // Probe the memtable registry for any overlay activity on this
+    // (project, table). Both probes are O(1) HashMap lookups when the overlay
+    // is empty (the common case), so the work is bounded and proportional to
+    // "does the engine have any outstanding fast-path DELETE/UPDATE for this
+    // table". Under a pin the watermark hides post-pin overlays so the
+    // decisions below match what the read will actually merge.
+    let overlay_active = {
+        let registry = sess.engine.memtable_registry();
+        let tombs = crate::hot_tombstone::snapshot_tombstones(
+            registry.as_ref(),
+            &sess.project,
+            &plan.table,
+            hot_watermark,
+        );
+        let updates = crate::hot_tombstone::snapshot_updates(
+            registry.as_ref(),
+            &sess.project,
+            &plan.table,
+            hot_watermark,
+        );
+        !tombs.is_empty() || !updates.is_empty()
+    };
+    // Overlay-aware read projection: the merge-on-read suppression below
+    // (`apply_tombstone_filter_to_batches` / `apply_update_overlay_to_batches`)
+    // encodes each COLD row's PK to decide whether a tombstone or UPDATE
+    // override hides it — and `filter_batch` degrades to a PASS-THROUGH when
+    // the PK column is absent from the batch. A narrowed read projection that
+    // omits the PK (e.g. `SELECT SUM(v)`'s minimal aggregate read set, or a
+    // non-PK column projection) would therefore keep every overridden cold row
+    // AND append the override rows on top — double-counting every overridden
+    // key. Augment the storage read with the PK column whenever an overlay is
+    // live; downstream consumers select columns BY NAME (aggregates, the
+    // row-projection rebuild), so the extra column never leaks into results.
+    // Mirrors the projection augmentation `TombstoneFilteringTable::scan`
+    // performs on the DataFusion path.
+    let mut plan = plan;
+    if overlay_active && meta.pk_columns.len() == 1 {
+        if let Some(cols) = plan.read_cols.as_mut() {
+            let pk = meta.pk_columns[0].as_str();
+            if !cols.iter().any(|c| c == pk) && meta.schema.index_of(pk).is_ok() {
+                cols.push(pk.to_string());
+            }
+        }
+    }
+    let plan = plan;
     let post_read_shrinking = !plan.is_null_cols.is_empty()
         || !plan.in_list_preds.is_empty()
-        || {
-            // Probe the memtable registry for any overlay activity on this
-            // (project, table). Both probes are O(1) HashMap lookups; we
-            // only consult them on the LIMIT-pushdown gate, so the work is
-            // bounded and proportional to "does the engine have any
-            // outstanding fast-path DELETE/UPDATE for this table". Under a pin
-            // the watermark hides post-pin overlays so the pushdown decision
-            // matches what the read will actually merge below.
-            let registry = sess.engine.memtable_registry();
-            let tombs = crate::hot_tombstone::snapshot_tombstones(
-                registry.as_ref(),
-                &sess.project,
-                &plan.table,
-                hot_watermark,
-            );
-            let updates = crate::hot_tombstone::snapshot_updates(
-                registry.as_ref(),
-                &sess.project,
-                &plan.table,
-                hot_watermark,
-            );
-            !tombs.is_empty() || !updates.is_empty()
-        };
+        || overlay_active;
     let pushdown_limit = if plan.order_by.is_none()
         && plan.aggregates.is_none()
         && !post_read_shrinking

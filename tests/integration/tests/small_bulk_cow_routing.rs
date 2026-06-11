@@ -147,6 +147,44 @@ async fn count_all(sess: &ProjectSession, table: &str) -> i64 {
     }
 }
 
+/// Single-cell Int64 result of an arbitrary aggregate query — for comparing
+/// PK-omitting fast-path read shapes (e.g. `SELECT SUM(v)`) against the cold
+/// twin / hand-computed expectations.
+async fn int_scalar(sess: &ProjectSession, sql: &str) -> i64 {
+    match sess.execute(sql).await.unwrap() {
+        ExecResult::Rows { batches, .. } => batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        other => panic!("{sql} got {other:?}"),
+    }
+}
+
+/// All Int64 values of the FIRST output column of `sql`, across batches, in
+/// scan order. Used for non-PK projection scans (`SELECT v FROM t`) whose
+/// read set omits the PK column — the caller sorts before comparing.
+async fn i64_column(sess: &ProjectSession, sql: &str) -> Vec<i64> {
+    match sess.execute(sql).await.unwrap() {
+        ExecResult::Rows { batches, .. } => {
+            let mut out = Vec::new();
+            for b in &batches {
+                let arr = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("column must be Int64");
+                for i in 0..b.num_rows() {
+                    out.push(arr.value(i));
+                }
+            }
+            out
+        }
+        other => panic!("{sql} got {other:?}"),
+    }
+}
+
 async fn fetch_i64(sess: &ProjectSession, table: &str, col: &str, pk: i64) -> Option<i64> {
     let sql = format!("SELECT {col} FROM {table} WHERE id = {pk}");
     match sess.execute(&sql).await.unwrap() {
@@ -794,6 +832,33 @@ async fn no_where_small_table_routes_delta_matches_cold_twin() {
     assert_eq!(
         before_a, after_a,
         "no-WHERE delta UPDATE must commit zero replacement files"
+    );
+
+    // PK-omitting fast-path reads WITH the overlay live. `SELECT SUM(v)` /
+    // `SELECT v FROM t` build a minimal read set ({v}) that does not include
+    // the PK — yet the merge-on-read suppression keys on the PK, so the read
+    // layer must fetch it or every overridden cold row survives AND its
+    // override row is appended (SUM = old_sum + new_sum; scans return 80
+    // rows). The full-scan compare further down does NOT cover this class:
+    // `... ORDER BY id` without LIMIT routes to DataFusion (whose scan
+    // augments the projection), and it projects the PK anyway.
+    let expected_sum: i64 = (1..=40i64).map(|k| k * 10 + 7).sum();
+    assert_eq!(
+        int_scalar(&sess_a, "SELECT SUM(v) FROM t").await,
+        expected_sum,
+        "SUM(v) over a live overlay must suppress the overridden cold rows"
+    );
+    assert_eq!(
+        int_scalar(&sess_a, "SELECT COUNT(*) FROM t").await,
+        40,
+        "COUNT(*) over a live overlay must stay at the row count"
+    );
+    let mut vs = i64_column(&sess_a, "SELECT v FROM t").await;
+    vs.sort_unstable();
+    assert_eq!(
+        vs,
+        (1..=40i64).map(|k| k * 10 + 7).collect::<Vec<_>>(),
+        "a non-PK projection scan must return exactly the post-UPDATE values"
     );
 
     // Cold twin: kill switch forces the historical cold CoW route.
