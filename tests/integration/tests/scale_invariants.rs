@@ -592,10 +592,117 @@ async fn scale_invariants() {
         d.rows_decoded
     );
 
+    // ── 12. Bulk UPSERT (200 rows, one statement, all keys conflicting) ─────
+    // `INSERT … ON CONFLICT (id) DO UPDATE` over 200 EXISTING keys inside one
+    // seeded band. The batched upsert path (`try_on_conflict_do_update`,
+    // executor.rs) resolves the conflicts with ONE chunked existence probe +
+    // ONE chunked CASE-arm UPDATE, and the write side rides the hot-tier
+    // overlay — so the statement must do bounded cold work AND commit zero
+    // replacement files. The per-row fallback (one point probe + one
+    // single-row UPDATE per key) is ALSO bounded under these gates: the
+    // band's unfiltered decode is cached after the first key (a per-key
+    // re-decode would blow rows_decoded immediately) and single-row UPDATEs
+    // are overlay writes (sections 3/4), so the gates hold on both the
+    // batched and the per-row implementation — deliberately, because the
+    // upsert-batching work is still in flight.
+    //
+    // TODO(tighten): once the batched path is pinned as the only route for
+    // this shape, tighten files_opened to <= 2 (one zone-map-pruned chunked
+    // probe) and assert the exact overlay delta like section 11 does.
+    {
+        // Settle any straggler tail first so the file-set comparison can't be
+        // perturbed by a pre-statement tail flush (#205 ordering) — same
+        // hygiene as section 11.
+        shard.flush_to_parquet().await.unwrap();
+        let up_pre_meta = cat.load_table(&sess.project(), &upd_table).await.unwrap();
+        let up_pre_files = {
+            let mut p: Vec<String> = up_pre_meta
+                .live_data_files()
+                .iter()
+                .map(|f| f.path.clone())
+                .collect();
+            p.sort();
+            (up_pre_meta.current_snapshot.0, p)
+        };
+        // 200 interior keys of one seeded band, untouched by earlier sections
+        // (section 11 used 70_200..70_399; the IN-list touched 80_003 read-only).
+        let ulo = 80_200i64;
+        let uhi = 80_399i64;
+        let mut stmt = String::with_capacity(200 * 24);
+        stmt.push_str("INSERT INTO t (id, v) VALUES ");
+        for k in ulo..=uhi {
+            if k > ulo {
+                stmt.push(',');
+            }
+            stmt.push_str(&format!("({k}, {})", k + 1_000_000));
+        }
+        stmt.push_str(" ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v");
+        let (res, d) = probe(stmt).await;
+        assert!(
+            matches!(&res, ExecResult::Empty { .. }),
+            "200-row bulk upsert must succeed: {res:?}"
+        );
+        // INVARIANT (zero replacement writes): every key conflicts → every row
+        // resolves to an overlay UPDATE; the snapshot id + live data-file set
+        // must be byte-identical. A cold CoW fallback would `commit_replace`
+        // (new snapshot, swapped paths) and fail this regardless of how cheap
+        // its reads were. Captured BEFORE the verifying SELECT below so a
+        // read-triggered tail flush can't muddy the comparison.
+        let up_post_meta = cat.load_table(&sess.project(), &upd_table).await.unwrap();
+        let up_post_files = {
+            let mut p: Vec<String> = up_post_meta
+                .live_data_files()
+                .iter()
+                .map(|f| f.path.clone())
+                .collect();
+            p.sort();
+            (up_post_meta.current_snapshot.0, p)
+        };
+        assert_eq!(
+            up_pre_files, up_post_files,
+            "all-conflict 200-row bulk upsert must commit ZERO replacement files \
+             (snapshot + live set unchanged)"
+        );
+        // INVARIANT (bounded cold work): the conflict probe(s) are zone-map
+        // pruned to the band's file(s) and cached after first touch, so the
+        // statement's cold reads are a CONSTANT in table size. The ceiling is
+        // generous (seeded file count + slack ≈ 12, not 2) only because the
+        // batching agent is mid-flight — see the TODO above. What it still
+        // catches loudly: a per-key file re-open (~200 opens) or a per-key
+        // re-decode (~200 chunks), the O(keys) pathologies this gate exists for.
+        assert!(
+            d.files_opened <= 12,
+            "200-row bulk upsert opened {} files; ceiling 12 (seeded file count + slack, \
+             constant in N) — a per-key re-open would be ~200",
+            d.files_opened
+        );
+        assert!(
+            d.rows_decoded <= 12 * ONE_CHUNK,
+            "200-row bulk upsert decoded {} rows; ceiling 12 chunks — a per-key \
+             re-decode would be ~200 chunks",
+            d.rows_decoded
+        );
+        println!(
+            "[scale-invariants] bulk-upsert-200 files_opened={} rows_decoded={} (ceilings 12 / 12 chunks)",
+            d.files_opened, d.rows_decoded
+        );
+        // Correctness: the upserted value is visible.
+        let check = sess
+            .execute(&format!("SELECT v FROM t WHERE id = {}", ulo + 7))
+            .await
+            .unwrap();
+        assert_eq!(
+            ids_of(&check),
+            vec![ulo + 7 + 1_000_000],
+            "bulk upsert's DO UPDATE value must be visible on read-back"
+        );
+    }
+
     println!(
         "[scale-invariants] scale={scale} fresh-point files<=2 rows_decoded<=2chunk; \
          repeat/delete/own-insert/in-list-2nd = 0 cold; keyset/join point-bounded; \
-         200-key delta UPDATE zero-replacement-files — all PASS"
+         200-key delta UPDATE zero-replacement-files; 200-row bulk upsert \
+         zero-replacement + bounded probe — all PASS"
     );
 
     bg.shutdown().await;
@@ -817,6 +924,335 @@ async fn keyset_short_circuit_scale_invariants() {
     println!(
         "[keyset-short-circuit] {FILES} disjoint files x {PER_FILE} rows: first/mid/boundary/\
          last-band pages <=2 opens, empty page 0 opens, hot-tail merge correct — all PASS"
+    );
+
+    bg.shutdown().await;
+    wal.close().await.unwrap();
+}
+
+/// Collect `(id, v)` pairs (columns 0 and 1, both Int64) of a result set.
+fn id_v_of(res: &ExecResult) -> Vec<(i64, i64)> {
+    use arrow_array::{Array, Int64Array};
+    match res {
+        ExecResult::Rows { batches, .. } => {
+            let mut out = Vec::new();
+            for b in batches {
+                let ids = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id must be Int64");
+                let vs = b
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("v must be Int64");
+                for r in 0..ids.len() {
+                    out.push((ids.value(r), vs.value(r)));
+                }
+            }
+            out
+        }
+        ExecResult::Empty { tag } => panic!("expected Rows, got Empty tag={tag}"),
+    }
+}
+
+/// Unordered-LIMIT early-exit gates over a multi-file layout.
+///
+/// `SELECT … FROM t LIMIT k` with NO ORDER BY needs only the first `k`
+/// post-filter rows — PG stops its scan as soon as the limit fills. The fast
+/// path's early-exit branch reads candidate cold files ONE AT A TIME with the
+/// remaining limit pushed into each single-path read and stops as soon as `k`
+/// rows are collected, so the work is `ceil(k / rows-per-file)` file opens
+/// independent of how many files (and rows) the table holds. Before the
+/// branch, the multi-path read drove every candidate through `buffered(4)`
+/// eager whole-file decodes and the global stream cut landed only after
+/// several files were fetched + decoded in full (the 1M-row ~49.6ms
+/// limit-without-order-by residual vs PG's 0.08ms).
+///
+/// The branch DECLINES (falls back to today's unbounded-read + post-hoc
+/// `apply_limit`) whenever a live tombstone / UPDATE overlay could suppress an
+/// admitted row — gate 5 pins that the declined path stays CORRECT (counters
+/// deliberately not asserted there).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unordered_limit_early_exit_invariants() {
+    let (_sd, _wd, engine, shard, bg, wal, storage) = build().await;
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    // 6 disjoint cold files of 5k rows each (one INSERT statement per id band,
+    // flushed before the next) — same multi-file layout recipe as the keyset
+    // gates above. 30k rows total.
+    const FILES: i64 = 6;
+    const PER_FILE: i64 = 5_000; // ids 0..30_000
+    const TOTAL: i64 = FILES * PER_FILE;
+    sess.execute("CREATE TABLE lim (id BIGINT PRIMARY KEY, v BIGINT)")
+        .await
+        .unwrap();
+    for f in 0..FILES {
+        let lo = f * PER_FILE;
+        let hi = lo + PER_FILE;
+        let mut stmt = String::with_capacity((hi - lo) as usize * 16);
+        stmt.push_str("INSERT INTO lim VALUES ");
+        for k in lo..hi {
+            if k > lo {
+                stmt.push(',');
+            }
+            stmt.push_str(&format!("({k},{k})"));
+        }
+        sess.execute(&stmt).await.unwrap();
+        shard.flush_to_parquet().await.unwrap();
+    }
+
+    let probe = |sql: String| {
+        let sess = &sess;
+        let storage = &storage;
+        async move {
+            let before = storage.read_counters().snapshot();
+            let res = sess.execute(&sql).await.unwrap();
+            let after = storage.read_counters().snapshot();
+            (res, after.delta(&before))
+        }
+    };
+
+    // ── 1. LIMIT k, no WHERE — the early-exit gate ───────────────────────────
+    // No predicate → nothing prunes → all 6 files are candidates. k = 500 fits
+    // entirely inside the FIRST file (5k rows), so the early exit must stop
+    // after ONE open: `ceil(500 / 5_000) = 1` (allow 2 for slack). The old
+    // multi-path read drove 4 candidates through `buffered(4)` eager decodes —
+    // opening more than 2 here means the early exit regressed to the fan-out.
+    let (res, d) = probe("SELECT id, v FROM lim LIMIT 500".into()).await;
+    assert_eq!(
+        row_count(&res),
+        500,
+        "unordered LIMIT 500 must return exactly 500 rows"
+    );
+    assert!(
+        d.files_opened <= 2,
+        "unordered LIMIT 500 opened {} files; design bound is <=2 \
+         (ceil(500/5_000) = 1 file + slack) — more means the early exit \
+         regressed to the buffered all-candidate read",
+        d.files_opened
+    );
+    assert!(
+        d.rows_decoded <= 2 * ONE_CHUNK,
+        "unordered LIMIT 500 decoded {} rows; bound <= 2 chunks (one 5k-row file)",
+        d.rows_decoded
+    );
+
+    // ── 2. LIMIT with a cheap pushdown WHERE ─────────────────────────────────
+    // `v > 100` is a storage-pushable predicate; the limit applies AFTER the
+    // filter (PG semantics: 200 *matches*). The first opened file still has
+    // ~4.9k matching rows, so one open fills the page.
+    let (res, d) = probe("SELECT id, v FROM lim WHERE v > 100 LIMIT 200".into()).await;
+    let pairs = id_v_of(&res);
+    assert_eq!(
+        pairs.len(),
+        200,
+        "WHERE v > 100 LIMIT 200 must return exactly 200 matches"
+    );
+    assert!(
+        pairs.iter().all(|(_, v)| *v > 100),
+        "every returned row must satisfy the WHERE predicate"
+    );
+    assert!(
+        d.files_opened <= 2,
+        "filtered unordered LIMIT opened {} files; bound <=2 (limit fills in file 1)",
+        d.files_opened
+    );
+
+    // ── 3. LIMIT larger than the table returns every row ─────────────────────
+    // The early exit walks all 6 files without filling the limit and must
+    // return the complete table — no row lost to the per-file cut.
+    let (res, _d) = probe(format!("SELECT id, v FROM lim LIMIT {}", TOTAL * 2)).await;
+    let mut all_ids = ids_of(&res);
+    all_ids.sort_unstable();
+    assert_eq!(
+        all_ids,
+        (0..TOTAL).collect::<Vec<i64>>(),
+        "LIMIT beyond the table size must return every row exactly once"
+    );
+
+    // ── 4. LIMIT 0 ───────────────────────────────────────────────────────────
+    let (res, d) = probe("SELECT id, v FROM lim LIMIT 0".into()).await;
+    assert_eq!(row_count(&res), 0, "LIMIT 0 must return zero rows");
+    assert_eq!(
+        d.files_opened, 0,
+        "LIMIT 0 opened {} files; nothing should be read",
+        d.files_opened
+    );
+
+    // ── 5. Live UPDATE overlay — early exit must DECLINE, answer stays right ─
+    // A point UPDATE parks an override in the hot-tier overlay; a suppressed
+    // cold row would make a per-file cut under-count, so the fast path must
+    // fall back to the unbounded read + post-hoc limit. Correctness only —
+    // no counter asserts on the declined path.
+    sess.execute("UPDATE lim SET v = 424242 WHERE id = 123")
+        .await
+        .unwrap();
+    // Full-table LIMIT: every id exactly once, the override visible.
+    let (res, _d) = probe(format!("SELECT id, v FROM lim LIMIT {TOTAL}")).await;
+    let pairs = id_v_of(&res);
+    assert_eq!(
+        pairs.len() as i64,
+        TOTAL,
+        "overlay + LIMIT {TOTAL} must return exactly {TOTAL} rows (no dup, no loss)"
+    );
+    let mut seen_ids: Vec<i64> = pairs.iter().map(|(id, _)| *id).collect();
+    seen_ids.sort_unstable();
+    assert_eq!(
+        seen_ids,
+        (0..TOTAL).collect::<Vec<i64>>(),
+        "overlay + full-table LIMIT must contain every id exactly once"
+    );
+    let updated: Vec<i64> = pairs
+        .iter()
+        .filter(|(id, _)| *id == 123)
+        .map(|(_, v)| *v)
+        .collect();
+    assert_eq!(
+        updated,
+        vec![424242],
+        "the UPDATE override must be visible exactly once through the LIMIT path"
+    );
+    // Small LIMIT under the same live overlay: still exactly k rows.
+    let (res, _d) = probe("SELECT id, v FROM lim LIMIT 100".into()).await;
+    assert_eq!(
+        row_count(&res),
+        100,
+        "overlay + LIMIT 100 must still return exactly 100 rows"
+    );
+
+    println!(
+        "[unordered-limit-early-exit] {FILES} files x {PER_FILE} rows: LIMIT 500 <=2 opens, \
+         filtered LIMIT <=2 opens, over-table LIMIT complete, LIMIT 0 zero opens, \
+         overlay decline correct — all PASS"
+    );
+
+    bg.shutdown().await;
+    wal.close().await.unwrap();
+}
+
+/// GIN `@>` containment effectiveness gate over a multi-file layout.
+///
+/// Layout: 6 disjoint cold files of 2 000 rows each; the needle key
+/// (`{"cat":"needle"}`) exists ONLY in band 3 (20 rows), so a file-level GIN
+/// posting prune on the indexed query should open strictly fewer files than
+/// the full candidate set.
+///
+/// TOLERANCE: the GIN probe→prune wiring (#105 / Phase 5.24.D) is mid-flight
+/// and its prune semantics may change under this test. The gate therefore
+/// hard-asserts CORRECTNESS (exact match count, identical pre/post-index)
+/// plus a loose I/O ceiling that only catches O(files x keys) pathologies,
+/// and LOGS `files_opened` for both runs so CI output shows whether pruning
+/// engaged — "prune engaged OR correct full scan" both pass today.
+///
+/// CONFOUND, documented on purpose: the post-index re-run of the identical
+/// query can be served from the per-file unfiltered-decode cache (see the
+/// IN-list section of `scale_invariants`), so `files_opened == 0` after
+/// indexing does NOT by itself prove the GIN prune fired — the printed
+/// pre/post pair is a diagnostic, not a proof. The future tight gate (below)
+/// must use a fresh engine or a fresh table to measure the indexed cold read.
+///
+/// TODO(tighten): once #105 settles, seed an identical SECOND table, create
+/// the GIN index BEFORE its first read, and hard-assert
+/// `files_opened < FILES` on that cold indexed query (prune engaged).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gin_containment_effectiveness_io() {
+    let (_sd, _wd, engine, shard, bg, wal, storage) = build().await;
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    const FILES: i64 = 6;
+    const PER_FILE: i64 = 2_000; // ids 0..12_000
+    sess.execute("CREATE TABLE ging (id BIGINT PRIMARY KEY, payload JSONB)")
+        .await
+        .unwrap();
+    for f in 0..FILES {
+        let lo = f * PER_FILE;
+        let hi = lo + PER_FILE;
+        let mut stmt = String::with_capacity((hi - lo) as usize * 56);
+        stmt.push_str("INSERT INTO ging VALUES ");
+        for k in lo..hi {
+            if k > lo {
+                stmt.push(',');
+            }
+            // Needle lives ONLY in band 3, on every 100th row → 20 rows.
+            let payload = if f == 3 && k % 100 == 0 {
+                format!(r#"{{"cat":"needle","k":{k}}}"#)
+            } else {
+                format!(r#"{{"cat":"common-{}","k":{k}}}"#, k % 5)
+            };
+            stmt.push_str(&format!("({k}, '{payload}')"));
+        }
+        sess.execute(&stmt).await.unwrap();
+        shard.flush_to_parquet().await.unwrap();
+    }
+
+    let probe = |sql: String| {
+        let sess = &sess;
+        let storage = &storage;
+        async move {
+            let before = storage.read_counters().snapshot();
+            let res = sess.execute(&sql).await.unwrap();
+            let after = storage.read_counters().snapshot();
+            (res, after.delta(&before))
+        }
+    };
+
+    let needle_sql =
+        r#"SELECT COUNT(*) FROM ging WHERE payload @> '{"cat":"needle"}'::jsonb"#;
+    // Band 3 covers ids 6_000..7_999; every 100th id matches → 20 rows.
+    let expected: i64 = PER_FILE / 100;
+
+    // ── 1. Pre-index baseline: correctness + the full-scan I/O profile ──────
+    // No index exists, so this is the honest seq-scan cost: every band's file
+    // is a candidate (JSONB has no zone map to prune on).
+    let (res, d_noidx) = probe(needle_sql.to_string()).await;
+    assert_eq!(
+        ids_of(&res),
+        vec![expected],
+        "@> needle count must be exactly {expected} before indexing"
+    );
+    assert!(
+        d_noidx.files_opened <= (FILES as u64) + 2,
+        "no-index @> scan opened {} files; ceiling is the candidate set ({FILES}) + slack — \
+         more means a per-row or per-key re-open pathology",
+        d_noidx.files_opened
+    );
+
+    // ── 2. CREATE INDEX ... USING gin — the DDL itself must succeed ─────────
+    // The DDL path exists end-to-end since Phase 5.19.B; a DDL failure here is
+    // a hard regression independent of the in-flight prune semantics.
+    sess.execute("CREATE INDEX ging_payload_gin ON ging USING gin (payload)")
+        .await
+        .expect("CREATE INDEX USING gin (payload) must succeed (Phase 5.19.B)");
+
+    // ── 3. Indexed query: correctness is the hard gate; I/O is logged ───────
+    let (res, d_idx) = probe(needle_sql.to_string()).await;
+    assert_eq!(
+        ids_of(&res),
+        vec![expected],
+        "@> needle count must still be exactly {expected} with the GIN index — \
+         a prune that drops matching rows is a correctness bug, not a perf win"
+    );
+    // Loose ceiling only: catches a regression where the index path opens
+    // MORE than the candidate set (e.g. per-posting file re-opens).
+    assert!(
+        d_idx.files_opened <= (FILES as u64) + 4,
+        "indexed @> scan opened {} files; ceiling candidate set ({FILES}) + slack",
+        d_idx.files_opened
+    );
+    let prune_engaged = d_idx.files_opened < d_noidx.files_opened.max(1);
+    println!(
+        "[gin-effectiveness] {FILES} files x {PER_FILE} rows, needle in 1 band: \
+         no-index files_opened={} indexed files_opened={} → {} \
+         (cache confound possible on the indexed re-run; see test doc)",
+        d_noidx.files_opened,
+        d_idx.files_opened,
+        if prune_engaged {
+            "prune/cache engaged"
+        } else {
+            "full scan (correct; tighten after #105)"
+        }
     );
 
     bg.shutdown().await;

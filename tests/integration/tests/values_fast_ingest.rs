@@ -313,6 +313,26 @@ async fn equivalence_mixed_types() {
 }
 
 /// 10k-row single-statement INSERT vs 10k single-row INSERTs.
+///
+/// ENGAGEMENT-GATE NOTE (fast-path counter assertions live in-crate, not
+/// here): the audit asked for a gate asserting `INSERTS_PREPARSE_FASTPATH`
+/// advances across this test (catching a silent regression to the
+/// double-parse path), and likewise `INSERTS_BIND_DIRECT_FASTPATH` for the
+/// prepared shapes below. Both counters are `pub(crate)` statics in
+/// `basin-engine/src/executor.rs` and are NOT visible from this integration
+/// crate, and engine source is out of scope for this suite — so the
+/// engagement gates live next to the counters instead:
+///   * `executor.rs::preparse_fastpath_tests::engages_on_plain_multi_row_literal_insert`
+///     asserts `INSERTS_PREPARSE_FASTPATH` advances on exactly this statement
+///     shape (multi-row literal VALUES, no ON CONFLICT/RETURNING);
+///   * `executor.rs::bind_direct_fastpath_tests` beside it asserts
+///     `INSERTS_BIND_DIRECT_FASTPATH` advances on the prepared Parse/Bind/
+///     Execute shape (and `>= before + 3` across repeated executes).
+/// If the counters ever gain a public accessor (e.g. an
+/// `Engine::*_count()` getter like `vector_routing_count`), mirror the
+/// engagement asserts here so the integration path is gated end-to-end too.
+/// This file's tests remain the EQUIVALENCE gate: engaged or not, the
+/// results must be byte-identical to the slow path.
 #[tokio::test]
 async fn equivalence_10k_rows() {
     let (_dir, eng) = open_engine().await;

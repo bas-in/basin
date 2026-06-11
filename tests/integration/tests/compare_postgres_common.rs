@@ -4109,6 +4109,749 @@ async fn run_olap_suite(
     }
 }
 
+/// Carrier for the 8 DML-pipeline / streaming / concurrency probes
+/// (#96-#103). Same `(Option<f64>, f64)` / "(basin gap)" convention as the
+/// other extended suites: Basin `None` → a "(basin gap)" dashboard row, PG
+/// `f64::INFINITY` → "(pg failed)".
+///
+/// Coverage rationale (closes the join-DML / pipeline / prepared-protocol /
+/// mixed-workload gaps found by the benchmark coverage audit):
+///   #96 large_result_stream  — SELECT 4 cols WHERE id < 100k: full drain of
+///                              a large result set; measures end-to-end
+///                              materialisation, not just first-row latency.
+///   #97 prepared_insert_100  — 100 executions of ONE prepared single-row
+///                              INSERT: Basin via ProjectSession
+///                              prepare/bind/execute_bound (the bind-direct
+///                              seam), PG via tokio-postgres prepared
+///                              statements. NOTE the protocol asymmetry: PG
+///                              executions cross the localhost wire while
+///                              Basin runs in-process — the same asymmetry
+///                              the concurrency shapes (#38-#44) carry, and
+///                              flagged in the metric label.
+///   #98 merge_upsert         — MERGE INTO matched/not-matched upsert over
+///                              100 source rows. sql_support_matrix ground
+///                              truth: MERGE is 🚫 ("unsupported in PoC"),
+///                              so this is EXPECTED to surface as a basin
+///                              gap until MERGE lands; the shape exists so
+///                              the gap is tracked on the dashboard.
+///   #99 bulk_upsert_1000     — one INSERT statement with 1000 VALUES rows +
+///                              ON CONFLICT DO UPDATE; 20x the #77 batch,
+///                              exposes per-row costs in the upsert loop
+///                              that the 50-row shape amortises away.
+///   #100 insert_select_10k   — INSERT INTO <scratch> SELECT * FROM events
+///                              WHERE id < 10000: the read→write pipeline
+///                              (scan + projection + ingest) in one
+///                              statement. Destructive single-shot (PK dups
+///                              on re-run), mirrors the #91 convention.
+///   #101 update_from_join    — UPDATE … FROM (join update): the PG-dialect
+///                              join-update every ORM/ETL emits. Matrix says
+///                              supported (target needs a PK; events has
+///                              one). Idempotent (assigns the same joined
+///                              value), so it's safe under pair() re-runs.
+///   #102 delete_using_join   — DELETE … USING (join delete) of one user's
+///                              events. Matrix: supported with a PK target.
+///                              Destructive single-shot (rows are gone after
+///                              the first run).
+///   #103 mixed_rw_concurrency— 8 readers (point+range loop) + 4 writers
+///                              (single-row UPDATEs on disjoint keys)
+///                              running simultaneously; joined wall-clock of
+///                              the fixed-work fan-out (the #38-#44 harness
+///                              pattern), with combined ops/sec derivable
+///                              from the fixed op count (600 ops total).
+struct DmlPipelineResults {
+    large_result_stream: (Option<f64>, f64),
+    prepared_insert_100: (Option<f64>, f64),
+    merge_upsert: (Option<f64>, f64),
+    bulk_upsert_1000: (Option<f64>, f64),
+    insert_select_10k: (Option<f64>, f64),
+    update_from_join: (Option<f64>, f64),
+    delete_using_join: (Option<f64>, f64),
+    mixed_rw_concurrency: (Option<f64>, f64),
+}
+
+/// Total fixed op count of the #103 mixed read-write fan-out: 8 readers x
+/// 25 iterations x 2 queries + 4 writers x 50 UPDATEs. Used to derive the
+/// combined ops/sec figure printed next to the wall-clock metric.
+const MIXED_RW_TOTAL_OPS: f64 = (8 * 25 * 2 + 4 * 50) as f64;
+
+/// Run the 8 DML-pipeline probes (#96-#103) on PG + Basin.
+///
+/// Same stack-budget extraction + shared `pair()` helper as the other
+/// extended suites. Runs LAST of all suites because #101/#102 mutate the
+/// shared `events` table (bounded: 200 status rewrites + ~10 join-deleted
+/// rows — the core suite's own bulk-UPDATE/DELETE shapes already mutated
+/// events far more) and #103 spawns extra sessions. The read shape (#96)
+/// runs FIRST, before any of this suite's own writes.
+///
+/// Scratch tables (`prep_t`, `merge_t`/`merge_s`, `upsert1k`, `events_copy`,
+/// `mixrw`) are created symmetrically on both sides; a failed CREATE/seed on
+/// either side records the shape as a gap, never a panic. Scratch tables
+/// inherit the engine-default storage format (same convention as
+/// `rstress`/`oltp_extra` — the card's WITH-clause pin applies to the seeded
+/// users/events/categories tables only).
+#[allow(clippy::too_many_arguments)]
+async fn run_dml_pipeline_suite(
+    pg: &Client,
+    sess: &basin_engine::ProjectSession,
+    engine: &Engine,
+    project: ProjectId,
+    schema: &str,
+    conn_str: &str,
+    rows: usize,
+) -> DmlPipelineResults {
+    let n = samples_for(rows, 5);
+
+    async fn pair(
+        pg: &Client,
+        sess: &basin_engine::ProjectSession,
+        pg_sql: String,
+        basin_sql: &str,
+        n: usize,
+    ) -> (Option<f64>, f64) {
+        let p = pg_p50_explain(pg, &pg_sql, n)
+            .await
+            .unwrap_or(f64::INFINITY);
+        let b = basin_p50_try(sess, basin_sql, n).await;
+        (b, p)
+    }
+
+    // -- #96 Large result streaming (100k-row full drain) ---------------------
+    // `id < 100_000` caps the result at 100k rows (the whole table at the 10k
+    // and 100k cards). Basin's `execute` materialises every Arrow batch (full
+    // drain by construction); PG's EXPLAIN ANALYZE executes the plan to
+    // completion server-side — both sides pay the full materialisation, per
+    // the suite-wide engine-time convention. Runs FIRST in this suite, before
+    // any of its writes touch `events`.
+    let stream_cap: i64 = 100_000;
+    let large_result_stream = pair(
+        pg,
+        sess,
+        format!(
+            "SELECT id, user_id, amount, status FROM {schema}.events WHERE id < {stream_cap}"
+        ),
+        &format!("SELECT id, user_id, amount, status FROM events WHERE id < {stream_cap}"),
+        n,
+    )
+    .await;
+
+    // -- #97 Prepared bind-direct INSERT latency (100 executions) ------------
+    // One prepared single-row INSERT, executed 100x with fresh binds. Basin
+    // goes through `prepare` → `bind` → `execute_bound` — the exact seam the
+    // bind-direct INSERT fast path (`BindInsertPlan`) hooks. PG uses a native
+    // tokio-postgres prepared statement. Timed as one whole 100-iteration
+    // loop (multi-statement shape — no pair()). Protocol asymmetry (PG pays
+    // 100 localhost round-trips, Basin is in-process) is flagged in the
+    // metric label, mirroring the concurrency-shape convention.
+    let prepared_insert_100 = {
+        let pg_prep_ok = pg
+            .simple_query(&format!(
+                "CREATE TABLE {schema}.prep_t (id BIGINT PRIMARY KEY, v BIGINT)"
+            ))
+            .await
+            .is_ok();
+        let basin_prep_ok = sess
+            .execute("CREATE TABLE prep_t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT)")
+            .await
+            .is_ok();
+        let pg_ms = if pg_prep_ok {
+            match pg
+                .prepare(&format!(
+                    "INSERT INTO {schema}.prep_t (id, v) VALUES ($1, $2)"
+                ))
+                .await
+            {
+                Ok(stmt) => {
+                    let started = Instant::now();
+                    let mut ok = true;
+                    for k in 0..100i64 {
+                        ok &= pg.execute(&stmt, &[&k, &k]).await.is_ok();
+                    }
+                    if ok {
+                        started.elapsed().as_secs_f64() * 1000.0
+                    } else {
+                        f64::INFINITY
+                    }
+                }
+                Err(_) => f64::INFINITY,
+            }
+        } else {
+            f64::INFINITY
+        };
+        let basin_ms = if basin_prep_ok {
+            match sess
+                .prepare("INSERT INTO prep_t (id, v) VALUES ($1, $2)")
+                .await
+            {
+                Ok((handle, _stmt_schema)) => {
+                    let started = Instant::now();
+                    let mut ok = true;
+                    for k in 0..100i64 {
+                        let bound = match sess
+                            .bind(
+                                &handle,
+                                vec![
+                                    basin_engine::ScalarParam::Int8(k),
+                                    basin_engine::ScalarParam::Int8(k),
+                                ],
+                            )
+                            .await
+                        {
+                            Ok(b) => b,
+                            Err(_) => {
+                                ok = false;
+                                break;
+                            }
+                        };
+                        if sess.execute_bound(bound).await.is_err() {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                    sess.close_statement(&handle).await;
+                    if ok { Some(elapsed) } else { None }
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        (basin_ms, pg_ms)
+    };
+
+    // -- #98 MERGE INTO matched/not-matched upsert ----------------------------
+    // Target seeded with 50 rows, source with 100 → 50 MATCHED (UPDATE) + 50
+    // NOT MATCHED (INSERT) on the first run; every later run is all-MATCHED
+    // assigning the same value, so the statement is idempotent under pair()
+    // re-runs. Matrix ground truth says Basin rejects MERGE ("unsupported in
+    // PoC") — `basin_p50_try` turns that into a GAP sentinel, which is the
+    // point: the dashboard tracks the gap until MERGE lands.
+    let merge_upsert = {
+        let pg_merge_ok = {
+            let t = pg
+                .simple_query(&format!(
+                    "CREATE TABLE {schema}.merge_t (id BIGINT PRIMARY KEY, v BIGINT)"
+                ))
+                .await
+                .is_ok();
+            let s = pg
+                .simple_query(&format!(
+                    "CREATE TABLE {schema}.merge_s (id BIGINT PRIMARY KEY, v BIGINT)"
+                ))
+                .await
+                .is_ok();
+            let mut seed_ok = t && s;
+            if seed_ok {
+                let mut tstmt = format!("INSERT INTO {schema}.merge_t (id, v) VALUES ");
+                for k in 0..50i64 {
+                    if k > 0 {
+                        tstmt.push(',');
+                    }
+                    tstmt.push_str(&format!("({k}, {k})"));
+                }
+                seed_ok &= pg.simple_query(&tstmt).await.is_ok();
+                let mut sstmt = format!("INSERT INTO {schema}.merge_s (id, v) VALUES ");
+                for k in 0..100i64 {
+                    if k > 0 {
+                        sstmt.push(',');
+                    }
+                    sstmt.push_str(&format!("({k}, {})", k * 10));
+                }
+                seed_ok &= pg.simple_query(&sstmt).await.is_ok();
+            }
+            seed_ok
+        };
+        let basin_merge_ok = {
+            let t = sess
+                .execute("CREATE TABLE merge_t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT)")
+                .await
+                .is_ok();
+            let s = sess
+                .execute("CREATE TABLE merge_s (id BIGINT NOT NULL PRIMARY KEY, v BIGINT)")
+                .await
+                .is_ok();
+            let mut seed_ok = t && s;
+            if seed_ok {
+                let mut tstmt = String::from("INSERT INTO merge_t (id, v) VALUES ");
+                for k in 0..50i64 {
+                    if k > 0 {
+                        tstmt.push(',');
+                    }
+                    tstmt.push_str(&format!("({k}, {k})"));
+                }
+                seed_ok &= sess.execute(&tstmt).await.is_ok();
+                let mut sstmt = String::from("INSERT INTO merge_s (id, v) VALUES ");
+                for k in 0..100i64 {
+                    if k > 0 {
+                        sstmt.push(',');
+                    }
+                    sstmt.push_str(&format!("({k}, {})", k * 10));
+                }
+                seed_ok &= sess.execute(&sstmt).await.is_ok();
+            }
+            seed_ok
+        };
+        let merge_pg_sql = format!(
+            "MERGE INTO {schema}.merge_t t USING {schema}.merge_s s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET v = s.v \
+             WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)"
+        );
+        let merge_basin_sql =
+            "MERGE INTO merge_t t USING merge_s s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET v = s.v \
+             WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)";
+        let p = if pg_merge_ok {
+            pg_p50_explain(pg, &merge_pg_sql, n)
+                .await
+                .unwrap_or(f64::INFINITY)
+        } else {
+            f64::INFINITY
+        };
+        let b = if basin_merge_ok {
+            basin_p50_try(sess, merge_basin_sql, n).await
+        } else {
+            None
+        };
+        (b, p)
+    };
+
+    // -- #99 Bulk UPSERT (1000 rows, one statement) ---------------------------
+    // 20x the #77 batch on a dedicated scratch table whose 1000-row seed
+    // covers EVERY upserted id, so the DO UPDATE arm fires for every row from
+    // the first iteration and the assigned amount equals the seeded value —
+    // fully idempotent under EXPLAIN ANALYZE repetition (same repeatability
+    // trick as #77). The 1000-row width exposes per-row costs in the upsert
+    // conflict loop (probe-per-key, per-row UPDATE dispatch) that the 50-row
+    // shape amortises away.
+    let bulk_upsert_1000 = {
+        let pg_up_ok = {
+            let ddl = pg
+                .simple_query(&format!(
+                    "CREATE TABLE {schema}.upsert1k (id BIGINT PRIMARY KEY, amount DOUBLE PRECISION)"
+                ))
+                .await
+                .is_ok();
+            if ddl {
+                let mut stmt = format!("INSERT INTO {schema}.upsert1k (id, amount) VALUES ");
+                for k in 0..1000i64 {
+                    if k > 0 {
+                        stmt.push(',');
+                    }
+                    stmt.push_str(&format!("({k}, {})", (k as f64) * 0.5));
+                }
+                pg.simple_query(&stmt).await.is_ok()
+            } else {
+                false
+            }
+        };
+        let basin_up_ok = {
+            let ddl = sess
+                .execute(
+                    "CREATE TABLE upsert1k (id BIGINT NOT NULL PRIMARY KEY, amount DOUBLE PRECISION)",
+                )
+                .await
+                .is_ok();
+            if ddl {
+                let mut stmt = String::from("INSERT INTO upsert1k (id, amount) VALUES ");
+                for k in 0..1000i64 {
+                    if k > 0 {
+                        stmt.push(',');
+                    }
+                    stmt.push_str(&format!("({k}, {})", (k as f64) * 0.5));
+                }
+                sess.execute(&stmt).await.is_ok()
+            } else {
+                false
+            }
+        };
+        let mut vals = String::with_capacity(1000 * 24);
+        for k in 0..1000i64 {
+            if k > 0 {
+                vals.push(',');
+            }
+            vals.push_str(&format!("({k}, {})", (k as f64) * 0.5));
+        }
+        let up_pg_sql = format!(
+            "INSERT INTO {schema}.upsert1k (id, amount) VALUES {vals} \
+             ON CONFLICT (id) DO UPDATE SET amount = EXCLUDED.amount"
+        );
+        let up_basin_sql = format!(
+            "INSERT INTO upsert1k (id, amount) VALUES {vals} \
+             ON CONFLICT (id) DO UPDATE SET amount = EXCLUDED.amount"
+        );
+        let p = if pg_up_ok {
+            pg_p50_explain(pg, &up_pg_sql, n)
+                .await
+                .unwrap_or(f64::INFINITY)
+        } else {
+            f64::INFINITY
+        };
+        let b = if basin_up_ok {
+            basin_p50_try(sess, &up_basin_sql, n).await
+        } else {
+            None
+        };
+        (b, p)
+    };
+
+    // -- #100 INSERT ... SELECT (10k-row pipeline) ----------------------------
+    // Copies the `id < 10_000` slice of events into a fresh same-shape
+    // scratch table — the scan→project→ingest pipeline in one statement.
+    // Destructive single-shot (a second run would dup-key on the PK), so it
+    // times ONE wall-clock run per side, mirroring the #91 bulk-delete
+    // convention. Column order matches `SELECT *` on both sides because both
+    // scratch tables declare the same column order as their events parent.
+    let insert_select_10k = {
+        let sel_cap: i64 = 10_000;
+        let pg_copy_ok = pg
+            .simple_query(&format!(
+                "CREATE TABLE {schema}.events_copy (\
+                    id BIGINT PRIMARY KEY, \
+                    user_id BIGINT, \
+                    amount DOUBLE PRECISION, \
+                    status TEXT, \
+                    created_at TIMESTAMPTZ, \
+                    payload JSONB)"
+            ))
+            .await
+            .is_ok();
+        let pg_ms = if pg_copy_ok {
+            let started = Instant::now();
+            let ok = pg
+                .simple_query(&format!(
+                    "INSERT INTO {schema}.events_copy \
+                     SELECT * FROM {schema}.events WHERE id < {sel_cap}"
+                ))
+                .await
+                .is_ok();
+            if ok {
+                started.elapsed().as_secs_f64() * 1000.0
+            } else {
+                f64::INFINITY
+            }
+        } else {
+            f64::INFINITY
+        };
+        let basin_copy_ok = sess
+            .execute(
+                "CREATE TABLE events_copy (\
+                    id BIGINT NOT NULL PRIMARY KEY, \
+                    user_id BIGINT NOT NULL, \
+                    amount DOUBLE PRECISION NOT NULL, \
+                    status TEXT NOT NULL, \
+                    created_at BIGINT NOT NULL, \
+                    payload JSONB)",
+            )
+            .await
+            .is_ok();
+        let basin_ms = if basin_copy_ok {
+            let started = Instant::now();
+            match sess
+                .execute(&format!(
+                    "INSERT INTO events_copy SELECT * FROM events WHERE id < {sel_cap}"
+                ))
+                .await
+            {
+                Ok(_) => Some(started.elapsed().as_secs_f64() * 1000.0),
+                Err(e) => {
+                    if std::env::var("BASIN_DEBUG_GAP").is_ok() {
+                        eprintln!("[GAP] insert_select_10k err={e:?}");
+                    }
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        (basin_ms, pg_ms)
+    };
+
+    // -- #101 UPDATE ... FROM (join update) -----------------------------------
+    // The PG-dialect join update: derive the new value from the joined users
+    // row. Bounded to `events.id < 200` so the write is small at every scale,
+    // and idempotent (re-runs assign the same joined email), so pair()'s
+    // EXPLAIN ANALYZE repetitions are stable. Matrix ground truth: supported
+    // (the target needs a PK; events declares one). Runs after every read
+    // shape in this suite, so the status rewrite can't perturb a timing.
+    let update_from_join = pair(
+        pg,
+        sess,
+        format!(
+            "UPDATE {schema}.events SET status = u.email FROM {schema}.users u \
+             WHERE events.user_id = u.id AND events.id < 200"
+        ),
+        "UPDATE events SET status = u.email FROM users u \
+         WHERE events.user_id = u.id AND events.id < 200",
+        n,
+    )
+    .await;
+
+    // -- #102 DELETE ... USING (join delete) ----------------------------------
+    // Deletes one user's events via the join form. users.id = 77 exists at
+    // every scale (users >= 100) and owns ~10 events (id % user_count == 77).
+    // Destructive single-shot — the rows are gone after the first run — so it
+    // times ONE wall-clock run per side (the #91 convention). Matrix ground
+    // truth: DELETE … USING is supported when the target declares a PK.
+    let delete_using_join = {
+        let pg_ms = {
+            let started = Instant::now();
+            let ok = pg
+                .simple_query(&format!(
+                    "DELETE FROM {schema}.events USING {schema}.users \
+                     WHERE events.user_id = users.id AND users.id = 77"
+                ))
+                .await
+                .is_ok();
+            if ok {
+                started.elapsed().as_secs_f64() * 1000.0
+            } else {
+                f64::INFINITY
+            }
+        };
+        let basin_ms = {
+            let started = Instant::now();
+            match sess
+                .execute(
+                    "DELETE FROM events USING users \
+                     WHERE events.user_id = users.id AND users.id = 77",
+                )
+                .await
+            {
+                Ok(_) => Some(started.elapsed().as_secs_f64() * 1000.0),
+                Err(e) => {
+                    if std::env::var("BASIN_DEBUG_GAP").is_ok() {
+                        eprintln!("[GAP] delete_using_join err={e:?}");
+                    }
+                    None
+                }
+            }
+        };
+        (basin_ms, pg_ms)
+    };
+
+    // -- #103 Mixed read-write concurrency: 8 readers + 4 writers -------------
+    // Fixed-work fan-out on a dedicated 2000-row scratch table: readers loop
+    // 25 iterations of (point lookup + 100-row range scan), writers issue 50
+    // single-row UPDATEs each on per-writer-disjoint key ranges (writer w
+    // owns ids w*500..w*500+49, inside the seeded 0..1999 keyspace), all 12
+    // tasks running simultaneously. Joined wall-clock of the whole fan-out —
+    // the same fixed-work harness pattern as #38-#44 (`basin_concurrent` /
+    // `pg_concurrent` twins below are verbatim copies of the robustness-suite
+    // helpers). Combined ops/sec = MIXED_RW_TOTAL_OPS / wall, printed in the
+    // results table.
+    async fn basin_concurrent<F, Fut>(
+        engine: &Engine,
+        project: ProjectId,
+        n_sessions: usize,
+        body: F,
+    ) -> Option<f64>
+    where
+        F: Fn(usize, basin_engine::ProjectSession) -> Fut + Send + Sync + 'static + Clone,
+        Fut: std::future::Future<Output = bool> + Send,
+    {
+        let mut sessions = Vec::with_capacity(n_sessions);
+        for _ in 0..n_sessions {
+            match engine.open_session(project).await {
+                Ok(s) => sessions.push(s),
+                Err(_) => return None,
+            }
+        }
+        let started = Instant::now();
+        let mut handles = Vec::with_capacity(n_sessions);
+        for (idx, s) in sessions.into_iter().enumerate() {
+            let body = body.clone();
+            handles.push(tokio::spawn(async move { body(idx, s).await }));
+        }
+        let mut all_ok = true;
+        for h in handles {
+            match h.await {
+                Ok(true) => {}
+                _ => all_ok = false,
+            }
+        }
+        if all_ok {
+            Some(started.elapsed().as_secs_f64() * 1000.0)
+        } else {
+            None
+        }
+    }
+
+    async fn pg_concurrent<F, Fut>(conn_str: &str, n_conn: usize, body: F) -> f64
+    where
+        F: Fn(usize, std::sync::Arc<Client>) -> Fut + Clone + Send + 'static,
+        Fut: std::future::Future<Output = bool> + Send,
+    {
+        let mut clients = Vec::with_capacity(n_conn);
+        for _ in 0..n_conn {
+            match tokio_postgres::connect(conn_str, NoTls).await {
+                Ok((c, conn)) => {
+                    tokio::spawn(async move {
+                        let _ = conn.await;
+                    });
+                    clients.push(std::sync::Arc::new(c));
+                }
+                Err(_) => return f64::INFINITY,
+            }
+        }
+        let started = Instant::now();
+        let mut handles = Vec::with_capacity(n_conn);
+        for (idx, c) in clients.into_iter().enumerate() {
+            let body = body.clone();
+            handles.push(tokio::spawn(async move { body(idx, c).await }));
+        }
+        let mut all_ok = true;
+        for h in handles {
+            match h.await {
+                Ok(true) => {}
+                _ => all_ok = false,
+            }
+        }
+        if all_ok {
+            started.elapsed().as_secs_f64() * 1000.0
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    let mixed_rw_concurrency = {
+        const READERS: usize = 8;
+        const WRITERS: usize = 4;
+        let pg_mix_ok = {
+            let ddl = pg
+                .simple_query(&format!(
+                    "CREATE TABLE {schema}.mixrw (id BIGINT PRIMARY KEY, v BIGINT)"
+                ))
+                .await
+                .is_ok();
+            if ddl {
+                let mut stmt = format!("INSERT INTO {schema}.mixrw (id, v) VALUES ");
+                for k in 0..2000i64 {
+                    if k > 0 {
+                        stmt.push(',');
+                    }
+                    stmt.push_str(&format!("({k}, {k})"));
+                }
+                pg.simple_query(&stmt).await.is_ok()
+            } else {
+                false
+            }
+        };
+        let basin_mix_ok = {
+            let ddl = sess
+                .execute("CREATE TABLE mixrw (id BIGINT NOT NULL PRIMARY KEY, v BIGINT)")
+                .await
+                .is_ok();
+            if ddl {
+                let mut stmt = String::from("INSERT INTO mixrw (id, v) VALUES ");
+                for k in 0..2000i64 {
+                    if k > 0 {
+                        stmt.push(',');
+                    }
+                    stmt.push_str(&format!("({k}, {k})"));
+                }
+                sess.execute(&stmt).await.is_ok()
+            } else {
+                false
+            }
+        };
+        let schema_owned = schema.to_string();
+        let pg_ms = if pg_mix_ok {
+            pg_concurrent(conn_str, READERS + WRITERS, move |idx, client| {
+                let schema = schema_owned.clone();
+                async move {
+                    if idx < READERS {
+                        for i in 0..25i64 {
+                            let point = (idx as i64 * 101 + i * 7) % 2000;
+                            let lo = (idx as i64 * 50 + i * 13) % 1800;
+                            let q1 = format!(
+                                "SELECT id, v FROM {schema}.mixrw WHERE id = {point}"
+                            );
+                            if client.simple_query(&q1).await.is_err() {
+                                return false;
+                            }
+                            let q2 = format!(
+                                "SELECT id, v FROM {schema}.mixrw \
+                                 WHERE id BETWEEN {lo} AND {}",
+                                lo + 100
+                            );
+                            if client.simple_query(&q2).await.is_err() {
+                                return false;
+                            }
+                        }
+                        true
+                    } else {
+                        let w = (idx - READERS) as i64;
+                        for i in 0..50i64 {
+                            let key = w * 500 + i;
+                            let q = format!(
+                                "UPDATE {schema}.mixrw SET v = v + 1 WHERE id = {key}"
+                            );
+                            if client.simple_query(&q).await.is_err() {
+                                return false;
+                            }
+                        }
+                        true
+                    }
+                }
+            })
+            .await
+        } else {
+            f64::INFINITY
+        };
+        let basin_ms = if basin_mix_ok {
+            basin_concurrent(engine, project, READERS + WRITERS, |idx, s| async move {
+                if idx < READERS {
+                    for i in 0..25i64 {
+                        let point = (idx as i64 * 101 + i * 7) % 2000;
+                        let lo = (idx as i64 * 50 + i * 13) % 1800;
+                        let q1 = format!("SELECT id, v FROM mixrw WHERE id = {point}");
+                        if s.execute(&q1).await.is_err() {
+                            return false;
+                        }
+                        let q2 = format!(
+                            "SELECT id, v FROM mixrw WHERE id BETWEEN {lo} AND {}",
+                            lo + 100
+                        );
+                        if s.execute(&q2).await.is_err() {
+                            return false;
+                        }
+                    }
+                    true
+                } else {
+                    let w = (idx - READERS) as i64;
+                    for i in 0..50i64 {
+                        let key = w * 500 + i;
+                        let q = format!("UPDATE mixrw SET v = v + 1 WHERE id = {key}");
+                        // Mirror the #40 convention: an optimistic-concurrency
+                        // serialization conflict surfaces as Err and is an
+                        // acceptable outcome under contention — the fan-out
+                        // completing is what's measured, not every write
+                        // winning. Writer keys are mutually disjoint, but
+                        // they do contend with the readers' shared scans.
+                        let _ = s.execute(&q).await;
+                    }
+                    true
+                }
+            })
+            .await
+        } else {
+            None
+        };
+        (basin_ms, pg_ms)
+    };
+
+    DmlPipelineResults {
+        large_result_stream,
+        prepared_insert_100,
+        merge_upsert,
+        bulk_upsert_1000,
+        insert_select_10k,
+        update_from_join,
+        delete_using_join,
+        mixed_rw_concurrency,
+    }
+}
+
 /// Extract a single scalar i64 from the first cell of the first batch.
 /// Used by the txn-correctness shapes (#42-#44, #44) to verify COUNT results.
 /// Returns `None` if the batch is empty or the column isn't an Int64.
@@ -4781,6 +5524,31 @@ async fn run_full_compare_inner(
     // =======================================================================
     let ol = run_olap_suite(&pg, &sess, &schema, rows).await;
 
+    // ---- Basin disk size (measured BEFORE the DML-pipeline suite) ----------
+    // The pipeline suite's #100 shape (INSERT ... SELECT) materialises a
+    // 10k-row copy of events into a scratch table; measuring the data dir
+    // after that would inflate the published "On-disk bytes (users + events)"
+    // headline (the PG twin measures only the users+events relations).
+    let basin_disk_bytes = dir_size_data(instance.dir.path());
+
+    // =======================================================================
+    // DML-pipeline / streaming / prepared / mixed-workload suite (#96-#103).
+    // Same stack-budget extraction + Option-or-gap convention as the other
+    // extended suites. Runs LAST of all timed suites: #101/#102 mutate the
+    // shared events table (bounded writes) and #103 spawns extra sessions —
+    // nothing after this point reads events for a timed measurement.
+    // =======================================================================
+    let dp = run_dml_pipeline_suite(
+        &pg,
+        &sess,
+        &instance.engine,
+        instance.project,
+        &schema,
+        &conn_str,
+        rows,
+    )
+    .await;
+
     // ---- Cold-start first query -------------------------------------------
     let pg_cold_ms = {
         let user_token = if conn_str.contains("user=pc") {
@@ -4842,7 +5610,8 @@ async fn run_full_compare_inner(
         elapsed
     };
 
-    let basin_disk_bytes = dir_size_data(instance.dir.path());
+    // (basin_disk_bytes was measured above, before the DML-pipeline suite —
+    // see the comment at the measurement site.)
 
     // ---- Print results table ----------------------------------------------
     let basin_mib = basin_disk_bytes as f64 / (1024.0 * 1024.0);
@@ -5023,6 +5792,33 @@ async fn run_full_compare_inner(
     row_opt("case_pivot_p50_ms", ol.case_pivot.0, ol.case_pivot.1);
     row_opt("star_join_agg_p50_ms", ol.star_join_agg.0, ol.star_join_agg.1);
     row_opt("delta_window_lag_filter_p50_ms", ol.delta_window_lag_filter.0, ol.delta_window_lag_filter.1);
+
+    // DML-pipeline rows (#96-#103) — same Option-or-GAP rendering.
+    row_opt("large_result_stream_100k_p50_ms", dp.large_result_stream.0, dp.large_result_stream.1);
+    row_opt("prepared_insert_100x_ms", dp.prepared_insert_100.0, dp.prepared_insert_100.1);
+    row_opt("merge_upsert_p50_ms", dp.merge_upsert.0, dp.merge_upsert.1);
+    row_opt("bulk_upsert_1000_p50_ms", dp.bulk_upsert_1000.0, dp.bulk_upsert_1000.1);
+    row_opt("insert_select_10k_ms", dp.insert_select_10k.0, dp.insert_select_10k.1);
+    row_opt("update_from_join_p50_ms", dp.update_from_join.0, dp.update_from_join.1);
+    row_opt("delete_using_join_ms", dp.delete_using_join.0, dp.delete_using_join.1);
+    row_opt("mixed_rw_8r4w_wall_ms", dp.mixed_rw_concurrency.0, dp.mixed_rw_concurrency.1);
+    // Derived combined throughput for the mixed shape (fixed 600-op fan-out):
+    // ops/sec = total ops / joined wall-clock. Print-only — the emitted
+    // metric stays wall-clock ms so `which_wins` keeps its lower-is-better
+    // semantics.
+    if let Some(bms) = dp.mixed_rw_concurrency.0 {
+        let pms = dp.mixed_rw_concurrency.1;
+        let basin_ops = MIXED_RW_TOTAL_OPS / (bms / 1000.0).max(1e-9);
+        let pg_ops = if pms.is_finite() {
+            MIXED_RW_TOTAL_OPS / (pms / 1000.0).max(1e-9)
+        } else {
+            f64::NAN
+        };
+        println!(
+            "{:>34} {:>14.0} {:>14.0} {:>16}",
+            "mixed_rw_combined_ops_per_sec", basin_ops, pg_ops, "(derived)"
+        );
+    }
 
     // ---- Emit benchmark JSON ----------------------------------------------
     let basin_disk_f = basin_disk_bytes as f64;
@@ -5283,6 +6079,18 @@ async fn run_full_compare_inner(
         mk_ext("Manual CASE pivot per user p50", ol.case_pivot.0, ol.case_pivot.1),
         mk_ext("Star join (events ⋈ users ⋈ categories) p50", ol.star_join_agg.0, ol.star_join_agg.1),
         mk_ext("Window LAG delta + post-filter p50", ol.delta_window_lag_filter.0, ol.delta_window_lag_filter.1),
+        // DML-pipeline shapes (#96-#103) — join DML, INSERT..SELECT pipeline,
+        // MERGE (expected basin gap until MERGE lands), 1000-row bulk upsert,
+        // large-result drain, prepared bind-direct latency, mixed-workload
+        // concurrency. Same Option-or-gap helper as the other suites.
+        mk_ext("Large result stream (100k-row drain) p50", dp.large_result_stream.0, dp.large_result_stream.1),
+        mk_ext("Prepared INSERT 100x bind/execute (in-process vs wire)", dp.prepared_insert_100.0, dp.prepared_insert_100.1),
+        mk_ext("MERGE INTO matched/not-matched upsert p50", dp.merge_upsert.0, dp.merge_upsert.1),
+        mk_ext("Bulk UPSERT (1000 rows, one statement)", dp.bulk_upsert_1000.0, dp.bulk_upsert_1000.1),
+        mk_ext("INSERT ... SELECT (10k-row pipeline)", dp.insert_select_10k.0, dp.insert_select_10k.1),
+        mk_ext("UPDATE ... FROM (join update, 200 rows)", dp.update_from_join.0, dp.update_from_join.1),
+        mk_ext("DELETE ... USING (join delete, one user)", dp.delete_using_join.0, dp.delete_using_join.1),
+        mk_ext("Mixed read-write concurrency 8R+4W (600 ops)", dp.mixed_rw_concurrency.0, dp.mixed_rw_concurrency.1),
     ];
 
     report_postgres_compare(id, name, claim, true, metrics, None);
