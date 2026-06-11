@@ -224,6 +224,28 @@ pub(crate) struct CacheEntry {
     /// every batch. Tracked here so the eviction loop doesn't re-walk
     /// the batches.
     pub size: u64,
+    /// Total row count — sum of `num_rows()` over every batch, computed
+    /// once at insert. Lets [`PageCache::get_if_rows_le`] make its
+    /// serve-or-decline decision with a single integer compare instead
+    /// of walking the batches on every lookup.
+    pub rows: u64,
+}
+
+/// Outcome of a row-gated lookup ([`PageCache::get_if_rows_le`]).
+///
+/// Distinguishes "present but too large to be worth filtering"
+/// (`Decline`) from "not cached at all" (`Absent`): the unfiltered-decode
+/// reuse path in `reader.rs` must NOT re-decode + re-insert an entry that
+/// already exists, so a plain `Option` would be ambiguous.
+pub(crate) enum RowGatedGet {
+    /// Entry present and within the row budget — counted as a hit.
+    Serve(Arc<Vec<Arc<RecordBatch>>>),
+    /// Entry present but over the row budget. NOT counted as a hit (the
+    /// caller is refusing the data, not finding it missing) and NOT as a
+    /// miss (the data is there); LRU recency is left untouched.
+    Decline,
+    /// No entry — counted as a miss, exactly like [`PageCache::get`].
+    Absent,
 }
 
 /// Hash a projection (list of column names) deterministically. We sort
@@ -552,6 +574,49 @@ impl PageCache {
         }
     }
 
+    /// Row-gated lookup: like [`PageCache::get`], but only SERVES the entry
+    /// when its total row count is `<= max_rows`. The unfiltered-decode
+    /// serve gate in `reader.rs` uses this so a selective (filtered) read
+    /// never commits to vectorized-filtering a huge cached decode when the
+    /// zone-map-pruned selective decode path is cheaper.
+    ///
+    /// Cost on the decline path is one non-promoting shard read-lock peek
+    /// plus an integer compare — O(1), no batch clone, no `try_write`
+    /// promotion attempt, no counter churn. The same single lock today's
+    /// `get` pays; a declined entry's LRU recency is deliberately NOT
+    /// bumped (the read didn't use it).
+    pub(crate) fn get_if_rows_le(&self, key: &CacheKey, max_rows: u64) -> RowGatedGet {
+        let idx = self.shard_for(key);
+        let shard = &self.shards[idx];
+
+        // Phase 1: shared read — non-promoting peek. Check the row gate
+        // BEFORE cloning the Arc so a decline does no avoidable work.
+        let hit = {
+            let g = shard.read().expect("page cache shard lock poisoned");
+            match g.lru.peek(key) {
+                Some(entry) if entry.rows <= max_rows => Some(Some(entry.batches.clone())),
+                Some(_) => Some(None),
+                None => None,
+            }
+        };
+
+        match hit {
+            Some(Some(batches)) => {
+                self.counters.hits.fetch_add(1, Ordering::Relaxed);
+                // Phase 2: best-effort promotion, identical to `get`.
+                if let Ok(mut g) = shard.try_write() {
+                    let _ = g.lru.get(key);
+                }
+                RowGatedGet::Serve(batches)
+            }
+            Some(None) => RowGatedGet::Decline,
+            None => {
+                self.counters.misses.fetch_add(1, Ordering::Relaxed);
+                RowGatedGet::Absent
+            }
+        }
+    }
+
     /// Insert (or replace) the entry for `key`. Drives LRU eviction
     /// within the owning shard until that shard's `current_bytes <=
     /// per_shard_max_bytes`.
@@ -560,9 +625,11 @@ impl PageCache {
             .iter()
             .map(|b| b.get_array_memory_size() as u64)
             .sum();
+        let rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
         let entry = CacheEntry {
             batches: Arc::new(batches),
             size,
+            rows,
         };
 
         let idx = self.shard_for(&key);
@@ -812,6 +879,52 @@ mod tests {
         let k2 = key("projects/x/tables/t/data/a.parquet", 99, 2);
         assert!(cache.get(&k2).is_none());
         let c = cache.counters();
+        assert_eq!(c.misses, 1);
+    }
+
+    /// Row-gated lookup semantics: `Serve` (within budget, counts a hit),
+    /// `Decline` (present but over budget — neither hit nor miss, no batch
+    /// handed out), `Absent` (counts a miss). The row count is computed at
+    /// insert, so the gate is a single integer compare per lookup.
+    #[test]
+    fn row_gated_get_serves_declines_and_misses() {
+        let cache = PageCache::new(PageCacheConfig::new(1024 * 1024));
+        let k = key("projects/x/tables/t/data/a.vortex", 1, 2);
+        // 250 total rows across two batches.
+        let batches = vec![small_batch(0, 100), small_batch(100, 150)];
+        cache.insert(k.clone(), batches.clone());
+
+        // Over the row budget: Decline, counters untouched.
+        match cache.get_if_rows_le(&k, 249) {
+            RowGatedGet::Decline => {}
+            RowGatedGet::Serve(_) => panic!("250-row entry must not serve under a 249-row gate"),
+            RowGatedGet::Absent => panic!("entry is present"),
+        }
+        let c = cache.counters();
+        assert_eq!(c.hits, 0, "decline must not count a hit");
+        assert_eq!(c.misses, 0, "decline must not count a miss");
+
+        // Exactly at the row budget: Serve (same Arcs back), hit counted.
+        match cache.get_if_rows_le(&k, 250) {
+            RowGatedGet::Serve(got) => {
+                assert_eq!(got.len(), 2);
+                assert!(Arc::ptr_eq(&got[0], &batches[0]));
+                assert!(Arc::ptr_eq(&got[1], &batches[1]));
+            }
+            _ => panic!("250-row entry must serve under a 250-row gate"),
+        }
+        let c = cache.counters();
+        assert_eq!(c.hits, 1);
+        assert_eq!(c.misses, 0);
+
+        // Absent key: miss counted, exactly like `get`.
+        let k2 = key("projects/x/tables/t/data/b.vortex", 1, 2);
+        match cache.get_if_rows_le(&k2, u64::MAX) {
+            RowGatedGet::Absent => {}
+            _ => panic!("unknown key must be Absent"),
+        }
+        let c = cache.counters();
+        assert_eq!(c.hits, 1);
         assert_eq!(c.misses, 1);
     }
 

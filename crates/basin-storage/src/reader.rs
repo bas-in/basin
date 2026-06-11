@@ -23,7 +23,7 @@ use parquet::file::statistics::Statistics;
 use crate::data_file::{ColumnStats, DataFile};
 use crate::encryption::{decrypt_envelope, BytesFileReader, EncryptionProvider, WrappedKey};
 use crate::metadata_cache::{CachedParquetMeta, ParquetMetaCache};
-use crate::page_cache::{hash_filters, hash_projection, CacheKey, PageCache};
+use crate::page_cache::{hash_filters, hash_projection, CacheKey, PageCache, RowGatedGet};
 use crate::paths::table_tier_prefix;
 use crate::predicate::{
     self, evaluate_compound_for_pruning, CompoundPredicate, Predicate, PruneOutcome, ScalarValue,
@@ -68,6 +68,40 @@ pub(crate) const DEFAULT_MAX_LISTED_FILES: usize = 50_000;
 /// keeps the pushdown decode path (Vortex native chunk pruning), so big
 /// analytical scans are unaffected.
 const VORTEX_UNFILTERED_DECODE_EXPANSION: u64 = 2;
+
+/// Serve-side row ceiling for answering a FILTERED read from the shared
+/// unfiltered-decode cache entry. Override with
+/// `BASIN_UNFILTERED_SERVE_MAX_ROWS` (positive integer); any unset /
+/// unparseable / zero value keeps this default.
+///
+/// Serving a selective read from the unfiltered cache means vectorized-
+/// filtering EVERY cached row per query. That only beats the alternative
+/// when the alternative is a full re-decode — it loses badly to the
+/// zone-map-pruned selective decode on large files (measured: a 1M-row
+/// LocalFS point read costs ~23 ms via the cached-then-filter path vs
+/// ~0.8 ms via GET + pruned decode of the 1–2 surviving chunks). The
+/// admission/populate side is NOT gated by this — a big unfiltered entry
+/// is still cached for later full scans (its home turf); this ceiling
+/// only decides whether a *filtered* read is allowed to be answered from
+/// it. 65 536 rows ≈ one row group / decode chunk: filtering that many
+/// in-memory rows costs ~1 ms worst case (the measured 1M-row filter is
+/// ~20 ms, so 1M/16 ≈ 65k ≈ 1.3 ms), the same order as the pruned
+/// selective path it displaces — the break-even point.
+pub(crate) const DEFAULT_UNFILTERED_SERVE_MAX_ROWS: u64 = 65_536;
+
+/// Resolve [`DEFAULT_UNFILTERED_SERVE_MAX_ROWS`], honoring
+/// `BASIN_UNFILTERED_SERVE_MAX_ROWS` when present and parseable to a
+/// positive `u64`.
+fn resolve_unfiltered_serve_max_rows() -> u64 {
+    if let Ok(v) = std::env::var("BASIN_UNFILTERED_SERVE_MAX_ROWS") {
+        if let Ok(n) = v.parse::<u64>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    DEFAULT_UNFILTERED_SERVE_MAX_ROWS
+}
 
 /// Resolve [`DEFAULT_MAX_LISTED_FILES`], honoring
 /// `BASIN_STORAGE_MAX_LISTED_FILES` when present and parseable to a
@@ -957,6 +991,27 @@ async fn read_one(
         // never need to infer a schema from bytes we haven't fetched).  When
         // any gate fails we fall straight through to the GET, byte-for-byte
         // unchanged.
+        //
+        // SERVE-SIDE ROW GATE: answering a filtered read from this entry means
+        // vectorized-filtering EVERY cached row, which only wins when the
+        // alternative is a full re-decode. On a large file the alternative is
+        // the zone-map-PRUNED selective decode (1–2 surviving chunks, ~sub-ms),
+        // which beats filtering a 1M-row cached decode (~20 ms) by >20×. So a
+        // filtered read is served from the entry only when its total row count
+        // is at most `BASIN_UNFILTERED_SERVE_MAX_ROWS` (default 65 536 ≈ one
+        // chunk's worth, ~1 ms filter worst case). The decision is O(1): the
+        // row count was computed once at insert and the gated lookup is a
+        // single non-promoting peek + integer compare — no decode, no batch
+        // clone, no extra locks on the decline path. Unfiltered reads are
+        // untouched (they never enter this block) and keep being served from
+        // the entry at ANY size via the generic page-cache hit above.
+        let unfiltered_serve_max_rows = resolve_unfiltered_serve_max_rows();
+        // Set when the shared unfiltered entry EXISTS but exceeds the serve
+        // row ceiling. The post-GET reuse branch is then skipped wholesale —
+        // its gated lookup would just decline again (and its miss arm must NOT
+        // re-decode + re-insert an entry that is already cached) — so the read
+        // takes the pushdown decode with native zone-map chunk pruning.
+        let mut unfiltered_serve_declined = false;
         {
             let unfiltered_cache_disabled =
                 std::env::var("BASIN_UNFILTERED_DECODE_CACHE_DISABLE").as_deref() == Ok("1");
@@ -971,33 +1026,39 @@ async fn read_one(
                         projection_hash: hash_projection(read_proj.as_deref()),
                         filters_hash: hash_filters(&[]),
                     };
-                    if let Some(cached) = pc.get(&unfiltered_key) {
-                        // Pre-GET cache hit: the unfiltered decode is already
-                        // warm, so we answer this fresh-key point read by
-                        // Arrow-filtering the cached batches and NEVER issue the
-                        // GET. Cache-served (not `files_opened`); `rows_decoded`
-                        // stays 0 because no new Arrow materialization happens —
-                        // the rows were decoded on the cold read that filled the
-                        // entry. This is the path that makes the repeated /
-                        // second in-list point read provably 0 cold work.
-                        counters
-                            .files_served_from_cache
-                            .fetch_add(1, Ordering::Relaxed);
-                        let raw: Vec<RecordBatch> =
-                            cached.iter().map(|b| (**b).clone()).collect();
-                        // Early per-call LIMIT cut inside the filter pass so the
-                        // projection + restamp work touches at most `limit` rows
-                        // (the caller re-applies the same cap; this is purely a
-                        // work-saving early cut).
-                        let batches = vortex_project_and_filter_limited(
-                            raw,
-                            opts.as_ref(),
-                            catalog_schema.as_ref(),
-                            true,
-                            opts.limit,
-                        )?;
-                        let stream = futures::stream::iter(batches.into_iter().map(Ok));
-                        return Ok(stream.boxed());
+                    match pc.get_if_rows_le(&unfiltered_key, unfiltered_serve_max_rows) {
+                        RowGatedGet::Serve(cached) => {
+                            // Pre-GET cache hit: the unfiltered decode is already
+                            // warm, so we answer this fresh-key point read by
+                            // Arrow-filtering the cached batches and NEVER issue the
+                            // GET. Cache-served (not `files_opened`); `rows_decoded`
+                            // stays 0 because no new Arrow materialization happens —
+                            // the rows were decoded on the cold read that filled the
+                            // entry. This is the path that makes the repeated /
+                            // second in-list point read provably 0 cold work.
+                            counters
+                                .files_served_from_cache
+                                .fetch_add(1, Ordering::Relaxed);
+                            let raw: Vec<RecordBatch> =
+                                cached.iter().map(|b| (**b).clone()).collect();
+                            // Early per-call LIMIT cut inside the filter pass so the
+                            // projection + restamp work touches at most `limit` rows
+                            // (the caller re-applies the same cap; this is purely a
+                            // work-saving early cut).
+                            let batches = vortex_project_and_filter_limited(
+                                raw,
+                                opts.as_ref(),
+                                catalog_schema.as_ref(),
+                                true,
+                                opts.limit,
+                            )?;
+                            let stream = futures::stream::iter(batches.into_iter().map(Ok));
+                            return Ok(stream.boxed());
+                        }
+                        RowGatedGet::Decline => {
+                            unfiltered_serve_declined = true;
+                        }
+                        RowGatedGet::Absent => {}
                     }
                 }
             }
@@ -1174,8 +1235,13 @@ async fn read_one(
         //     whose compressed size mis-predicts its true ~1.3× decode lands
         //     here and IS cached because the real decode fits one shard).
         let est_ceiling = if all_filters_pushed { per_shard } else { total };
+        // `!unfiltered_serve_declined`: the pre-GET probe already found the
+        // shared entry present-but-over-the-serve-row-ceiling, so don't pay a
+        // second lookup that would decline again — go straight to the pruned
+        // pushdown decode below.
         let unfiltered_eligible = !opts.filters.is_empty()
             && !unfiltered_cache_disabled
+            && !unfiltered_serve_declined
             && page_cache.is_some()
             && est_decode <= est_ceiling;
 
@@ -1192,70 +1258,47 @@ async fn read_one(
             };
             let pc = page_cache.as_ref().expect("eligibility implies page cache");
 
+            // Shared tail for both served arms below: apply the authoritative
+            // predicate + projection in Arrow over the (shared) unfiltered
+            // batches. `apply_filter = true` always: the cached batches are
+            // unfiltered, so the WHERE must run here. The early per-call LIMIT
+            // cut (mirrors the pushdown path below) is folded INTO the filter
+            // pass so projection + restamp touch at most `limit` rows; this
+            // raw-batch path never write-throughs the post-filter result, so
+            // an early cut is sound.
+            let finish =
+                |raw: Vec<RecordBatch>| -> Result<BoxStream<'static, Result<RecordBatch>>> {
+                    let batches = vortex_project_and_filter_limited(
+                        raw,
+                        opts.as_ref(),
+                        catalog_schema.as_ref(),
+                        true,
+                        opts.limit,
+                    )?;
+                    Ok(futures::stream::iter(batches.into_iter().map(Ok)).boxed())
+                };
+
             // Raw unfiltered decode batches (read-projection columns, no
-            // predicate applied). On hit we reuse the cached Arc; on miss we
-            // decode once with NO filter, cache, then proceed.
-            let raw: Vec<RecordBatch> = if let Some(cached) = pc.get(&unfiltered_key) {
-                cached.iter().map(|b| (**b).clone()).collect()
-            } else {
-                let (decoded, _) = crate::vortex_format::decode_with_cache(
-                    bytes,
-                    schema,
-                    read_proj.as_deref(),
-                    None,
-                    Some(&vortex_cache),
-                    &path,
-                    size_bytes,
-                )
-                .await?;
-                // Rows materialized into Arrow from this cold file (the WHOLE
-                // file, unfiltered — this branch decodes without pushdown so
-                // every row of every chunk lands here). This is the
-                // `rows_decoded` volume the gate caps at one file's worth.
-                // The reuse-HIT arm above contributes nothing — those rows were
-                // counted on the cold read that filled the entry.
-                let decoded_rows: u64 = decoded.iter().map(|b| b.num_rows() as u64).sum();
-                counters
-                    .rows_decoded
-                    .fetch_add(decoded_rows, Ordering::Relaxed);
-                // Store-after-decode decision: cache the unfiltered batches
-                // ONLY when their REAL decoded footprint fits one shard's
-                // budget. A single entry larger than `per_shard_budget()` would
-                // immediately self-evict on insert (the shard's eviction loop
-                // pops LRU until back under budget, and with one oversized entry
-                // that means evicting the entry itself), thrashing the shard for
-                // no benefit. Measuring the real size here lets big-but-cacheable
-                // files (low real expansion) into the cache while still refusing
-                // genuinely oversized decodes — without an a-priori guess.
-                let decoded_bytes: u64 = decoded
-                    .iter()
-                    .map(|b| b.get_array_memory_size() as u64)
-                    .sum();
-                if decoded_bytes <= pc.per_shard_budget() && pc.has_capacity() {
-                    let cached: Vec<Arc<RecordBatch>> =
-                        decoded.iter().cloned().map(Arc::new).collect();
-                    pc.insert(unfiltered_key, cached);
+            // predicate applied). A FILTERED read is a serve-only consumer of
+            // this entry: Serve (present and under the row ceiling) → filter
+            // the cached Arc. Absent or Decline → fall out of this branch to
+            // the zone-map-pruned pushdown decode below. Filtered reads must
+            // NEVER populate this entry by doing the whole-file unfiltered
+            // decode as a side effect: measured on a 1M-row file that decode
+            // costs ~20ms per query, and an entry over the shard budget is
+            // never admitted, so every query repeats it — collapsing point-
+            // read throughput ~30x vs the pruned path (~0.8ms). The entry is
+            // populated by actual unfiltered scans (a no-projection full
+            // scan's per-filter cache key with no filters IS this key), where
+            // the whole-file decode genuinely is the read.
+            match pc.get_if_rows_le(&unfiltered_key, unfiltered_serve_max_rows) {
+                RowGatedGet::Serve(cached) => {
+                    return finish(cached.iter().map(|b| (**b).clone()).collect());
                 }
-                decoded
-            };
-
-            // Apply the authoritative predicate + projection in Arrow over
-            // the (shared) unfiltered batches. `apply_filter = true` always:
-            // the cached batches are unfiltered, so the WHERE must run here.
-            // The early per-call LIMIT cut (mirrors the pushdown path below)
-            // is folded INTO the filter pass so projection + restamp touch at
-            // most `limit` rows; this raw-batch path never write-throughs the
-            // post-filter result, so an early cut is sound.
-            let batches = vortex_project_and_filter_limited(
-                raw,
-                opts.as_ref(),
-                catalog_schema.as_ref(),
-                true,
-                opts.limit,
-            )?;
-
-            let stream = futures::stream::iter(batches.into_iter().map(Ok));
-            return Ok(stream.boxed());
+                RowGatedGet::Absent | RowGatedGet::Decline => {
+                    // Take the pruned pushdown decode below.
+                }
+            }
         }
 
         let (batches, decode_used_filter) = crate::vortex_format::decode_with_cache(
@@ -4134,23 +4177,19 @@ mod tests {
         df.path
     }
 
-    /// Read one `.vortex` file through `read_one` with an `Eq(id, v)` filter,
+    /// Read one `.vortex` file through `read_one` with the given options,
     /// returning the concatenated decoded rows' `id` column values.
-    async fn read_eq_ids(
+    async fn read_ids_with_opts(
         storage: &Storage,
         project: &ProjectId,
         path: &ObjectPath,
         schema: Arc<Schema>,
-        eq: i64,
+        opts: ReadOptions,
     ) -> Vec<i64> {
         let project_config = storage
             .project_storage_config_cached(project)
             .await
             .unwrap();
-        let opts = ReadOptions {
-            filters: vec![Predicate::Eq("id".into(), ScalarValue::Int64(eq))],
-            ..ReadOptions::default()
-        };
         let stream = read_one(
             storage.project_store(project),
             path.clone(),
@@ -4183,6 +4222,33 @@ mod tests {
             out.extend(ids.values().iter().copied());
         }
         out
+    }
+
+    /// Read one `.vortex` file through `read_one` with an `Eq(id, v)` filter,
+    /// returning the concatenated decoded rows' `id` column values.
+    async fn read_eq_ids(
+        storage: &Storage,
+        project: &ProjectId,
+        path: &ObjectPath,
+        schema: Arc<Schema>,
+        eq: i64,
+    ) -> Vec<i64> {
+        let opts = ReadOptions {
+            filters: vec![Predicate::Eq("id".into(), ScalarValue::Int64(eq))],
+            ..ReadOptions::default()
+        };
+        read_ids_with_opts(storage, project, path, schema, opts).await
+    }
+
+    /// Read one `.vortex` file through `read_one` with NO filters (a full
+    /// scan), returning the concatenated `id` column values.
+    async fn read_unfiltered_ids(
+        storage: &Storage,
+        project: &ProjectId,
+        path: &ObjectPath,
+        schema: Arc<Schema>,
+    ) -> Vec<i64> {
+        read_ids_with_opts(storage, project, path, schema, ReadOptions::default()).await
     }
 
     /// The unfiltered key a small no-projection point read shares.
@@ -4225,6 +4291,12 @@ mod tests {
         // 12 rows / row_block_size 4 -> 3 Vortex chunks.
         let path = write_vortex(&storage, &project, &table, &pk_batch(0, 12), Some(4)).await;
 
+        // Filtered reads are serve-only consumers of the shared unfiltered
+        // entry: an unfiltered scan populates it, after which fresh-key Eq
+        // reads on this small (12-row) file are served from it.
+        let all = read_unfiltered_ids(&storage, &project, &path, schema.clone()).await;
+        assert_eq!(all.len(), 12, "unfiltered scan returns every row");
+
         let ids0 = read_eq_ids(&storage, &project, &path, schema.clone(), 5).await;
         assert_eq!(ids0, vec![5], "Eq(id,5) returns exactly that row");
         let after_first = storage.page_cache().unwrap().counters();
@@ -4234,7 +4306,7 @@ mod tests {
         let after_second = storage.page_cache().unwrap().counters();
         assert!(
             after_second.hits > after_first.hits,
-            "second fresh key must hit the shared unfiltered entry (hits {} -> {})",
+            "fresh key after an unfiltered warm must hit the shared entry (hits {} -> {})",
             after_first.hits,
             after_second.hits,
         );
@@ -4326,6 +4398,226 @@ mod tests {
             Some(v) => std::env::set_var(key_env, v),
             None => std::env::remove_var(key_env),
         }
+    }
+
+    /// `BASIN_UNFILTERED_SERVE_MAX_ROWS` resolver: positive integers
+    /// override, everything else keeps the 65 536 default.
+    ///
+    /// Parallel-test safety: this env var is read by every concurrent
+    /// `read_one` call, so the values set here are chosen to be
+    /// behaviour-preserving for the other tests in this file whichever one
+    /// is momentarily visible — the tiny (≤12-row) files stay servable
+    /// (12 ≤ 30 000 and ≤ 65 536) and the 70 000-row file in
+    /// `unfiltered_serve_row_threshold_behaviours` stays non-servable
+    /// (70 000 > 30 000 and > 65 536). Never set a value below 12 or in
+    /// 65 537..=70 000 here.
+    #[test]
+    fn unfiltered_serve_max_rows_resolver() {
+        let key = "BASIN_UNFILTERED_SERVE_MAX_ROWS";
+        let prior = std::env::var(key).ok();
+
+        std::env::remove_var(key);
+        assert_eq!(
+            resolve_unfiltered_serve_max_rows(),
+            DEFAULT_UNFILTERED_SERVE_MAX_ROWS
+        );
+        std::env::set_var(key, "30000");
+        assert_eq!(resolve_unfiltered_serve_max_rows(), 30_000);
+        std::env::set_var(key, "0");
+        assert_eq!(
+            resolve_unfiltered_serve_max_rows(),
+            DEFAULT_UNFILTERED_SERVE_MAX_ROWS
+        );
+        std::env::set_var(key, "not-a-number");
+        assert_eq!(
+            resolve_unfiltered_serve_max_rows(),
+            DEFAULT_UNFILTERED_SERVE_MAX_ROWS
+        );
+
+        match prior {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    /// Serve-side row ceiling on the unfiltered-decode reuse path
+    /// (`BASIN_UNFILTERED_SERVE_MAX_ROWS`, default 65 536). Serving a
+    /// SELECTIVE read from the shared unfiltered entry means vectorized-
+    /// filtering every cached row per query, which loses badly to the
+    /// zone-map-pruned selective decode once the entry is large — so the
+    /// reader only serves filtered reads from entries at or under the
+    /// ceiling. No env mutation needed: the "large" file simply exceeds the
+    /// default ceiling by row count.
+    ///
+    /// Covers:
+    ///  1. LARGE cached file (70 000 rows > 65 536): a fresh-key filtered
+    ///     read is NOT served from the shared entry (page-cache hit counter
+    ///     frozen, `files_served_from_cache` still) and takes the pruned
+    ///     pushdown path — one GET (`files_opened` +1) decoding at most one
+    ///     chunk — while the populate side keeps caching the entry;
+    ///  2. SMALL cached file: a fresh-key filtered read keeps being served
+    ///     from the entry (hits advance, ZERO GETs);
+    ///  3. an UNFILTERED read on the large file is served from cache at any
+    ///     size (the row gate applies only to filtered serves);
+    ///  4. parity: filtered-via-cache (small warm file) equals
+    ///     filtered-via-pruned (page-cache-less storage) across present /
+    ///     NULL-note / absent keys.
+    #[tokio::test]
+    async fn unfiltered_serve_row_threshold_behaviours() {
+        let project = ProjectId::new();
+        let schema = pk_schema();
+
+        // ───────── 1. large cached file: filtered serve declines ───────────
+        // 70 000 rows > DEFAULT_UNFILTERED_SERVE_MAX_ROWS. A 1 GiB budget
+        // (per-shard 16 MiB at the default 64 shards) guarantees the ~2 MB
+        // decoded entry passes BOTH admission gates, so the cold read really
+        // does populate it — this test gates SERVING, not admission.
+        const LARGE_ROWS: usize = 70_000;
+        const BLOCK: u32 = 8192;
+        assert!((LARGE_ROWS as u64) > DEFAULT_UNFILTERED_SERVE_MAX_ROWS);
+        let storage = paged_storage(1024 * 1024 * 1024);
+        let table = TableName::new("rowgate").unwrap();
+        let path = write_vortex(
+            &storage,
+            &project,
+            &table,
+            &pk_batch(0, LARGE_ROWS),
+            Some(BLOCK),
+        )
+        .await;
+
+        // Cold filtered read takes the pruned path and must NOT populate the
+        // shared unfiltered entry (filtered reads are serve-only consumers —
+        // populating would mean a whole-file decode per query until the entry
+        // admits). An unfiltered scan is what populates it.
+        let ids_cold = read_eq_ids(&storage, &project, &path, schema.clone(), 5).await;
+        assert_eq!(ids_cold, vec![5], "cold read returns the right row");
+        let pc = storage.page_cache().unwrap();
+        assert!(
+            pc.get(&unfiltered_key_for(&path)).is_none(),
+            "a filtered read must not populate the shared unfiltered entry"
+        );
+        let all = read_unfiltered_ids(&storage, &project, &path, schema.clone()).await;
+        assert_eq!(all.len(), LARGE_ROWS, "unfiltered scan returns every row");
+        assert!(
+            pc.get(&unfiltered_key_for(&path)).is_some(),
+            "the unfiltered scan populates the shared entry"
+        );
+
+        let pc_before = pc.counters();
+        let rc_before = storage.read_counters().snapshot();
+        let ids_warm = read_eq_ids(&storage, &project, &path, schema.clone(), 60_001).await;
+        let pc_after = pc.counters();
+        let d = storage.read_counters().snapshot().delta(&rc_before);
+        assert_eq!(ids_warm, vec![60_001], "pruned path returns the right row");
+        assert_eq!(
+            pc_after.hits, pc_before.hits,
+            "filtered read on a {LARGE_ROWS}-row cached entry must NOT serve from it"
+        );
+        assert_eq!(
+            d.files_served_from_cache, 0,
+            "declined serve is not cache-served"
+        );
+        assert_eq!(d.files_opened, 1, "pruned path pays the GET exactly once");
+        assert!(
+            d.rows_decoded > 0 && d.rows_decoded <= u64::from(BLOCK),
+            "zone-map pruning must decode at most one {BLOCK}-row chunk, decoded {}",
+            d.rows_decoded
+        );
+
+        // ───────── 3. unfiltered read serves from cache at ANY size ────────
+        // (Done on the same large file/storage while it's warm.) A no-filter
+        // full scan is the entry's home turf: it shares the cache key of the
+        // raw entry and is served whole, no GET, regardless of row count.
+        let pc_before = pc.counters();
+        let rc_before = storage.read_counters().snapshot();
+        let all = read_unfiltered_ids(&storage, &project, &path, schema.clone()).await;
+        let pc_after = pc.counters();
+        let d = storage.read_counters().snapshot().delta(&rc_before);
+        assert_eq!(all.len(), LARGE_ROWS, "full scan returns every row");
+        assert_eq!(all.first(), Some(&0i64));
+        assert_eq!(all.last(), Some(&(LARGE_ROWS as i64 - 1)));
+        assert!(
+            pc_after.hits > pc_before.hits,
+            "unfiltered read must be served from cache regardless of entry size"
+        );
+        assert_eq!(d.files_opened, 0, "no GET on an unfiltered cache hit");
+        assert_eq!(d.files_served_from_cache, 1, "counted as cache-served");
+
+        // ───────── 2. small cached file: filtered serve still fires ────────
+        let storage_small = paged_storage(64 * 1024 * 1024);
+        let table_small = TableName::new("rowgate_small").unwrap();
+        let path_small = write_vortex(
+            &storage_small,
+            &project,
+            &table_small,
+            &pk_batch(0, 12),
+            Some(4),
+        )
+        .await;
+        let ids_cold = read_eq_ids(&storage_small, &project, &path_small, schema.clone(), 5).await;
+        assert_eq!(ids_cold, vec![5]);
+        // Populate the shared entry the serve-only way: an unfiltered scan.
+        let all = read_unfiltered_ids(&storage_small, &project, &path_small, schema.clone()).await;
+        assert_eq!(all.len(), 12);
+
+        let pc_small = storage_small.page_cache().unwrap();
+        let pc_before = pc_small.counters();
+        let rc_before = storage_small.read_counters().snapshot();
+        let ids_warm = read_eq_ids(&storage_small, &project, &path_small, schema.clone(), 8).await;
+        let pc_after = pc_small.counters();
+        let d = storage_small.read_counters().snapshot().delta(&rc_before);
+        assert_eq!(ids_warm, vec![8], "cache-served read returns the right row");
+        assert!(
+            pc_after.hits > pc_before.hits,
+            "small entry must keep serving fresh-key filtered reads"
+        );
+        assert_eq!(
+            d.files_opened, 0,
+            "pre-GET short-circuit: zero object-store GETs on a small warm file"
+        );
+        assert_eq!(d.files_served_from_cache, 1, "counted as cache-served");
+
+        // ───────── 4. parity: filtered-via-cache == filtered-via-pruned ────
+        // Same content written to a paged storage (warm: serves from the
+        // shared entry) and a page-cache-LESS storage (always the pruned
+        // pushdown path). Keys cover present-with-note, present-NULL-note
+        // (id % 3 == 0), and absent.
+        let batch = pk_batch(300, 12);
+        let storage_cache = paged_storage(64 * 1024 * 1024);
+        let storage_pruned = fresh_storage(); // page_cache: None → pushdown only
+        let table_p = TableName::new("rowgate_par").unwrap();
+        let path_cache = write_vortex(&storage_cache, &project, &table_p, &batch, Some(4)).await;
+        let path_pruned = write_vortex(&storage_pruned, &project, &table_p, &batch, Some(4)).await;
+
+        // Warm the shared entry on the paged storage (serve-only policy:
+        // only an unfiltered scan populates it).
+        let warmup = read_unfiltered_ids(&storage_cache, &project, &path_cache, schema.clone()).await;
+        assert_eq!(warmup.len(), 12);
+
+        let keys = [300i64, 303, 306, 309, 305, 99_999];
+        let hits_before = storage_cache.page_cache().unwrap().counters().hits;
+        for eq in keys {
+            let via_cache =
+                read_eq_ids(&storage_cache, &project, &path_cache, schema.clone(), eq).await;
+            let via_pruned =
+                read_eq_ids(&storage_pruned, &project, &path_pruned, schema.clone(), eq).await;
+            assert_eq!(
+                via_cache, via_pruned,
+                "cache-served vs pruned disagree for Eq(id,{eq})"
+            );
+            let expected: Vec<i64> = if (300..312).contains(&eq) {
+                vec![eq]
+            } else {
+                vec![]
+            };
+            assert_eq!(via_cache, expected, "wrong rows for Eq(id,{eq})");
+        }
+        let hits_after = storage_cache.page_cache().unwrap().counters().hits;
+        assert!(
+            hits_after >= hits_before + keys.len() as u64,
+            "every parity read on the warm small file must be a cache serve ({hits_before} -> {hits_after})"
+        );
     }
 
     // -----------------------------------------------------------------------
