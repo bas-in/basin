@@ -1032,8 +1032,8 @@ async fn data_modifying_cte_insert_returning_then_select() {
 // 7. ORM shape corpus — per-ORM regression coverage
 //
 // This section runs a wide corpus of SQL shapes captured from real ORM trace
-// logs (Drizzle, Prisma, sqlx, Diesel, TypeORM) and classifies each outcome
-// as one of:
+// logs (Drizzle, Prisma, sqlx, Diesel, TypeORM, Django, GORM) and classifies
+// each outcome as one of:
 //
 //   Ok          — Basin executed the shape without error.
 //   TypedError  — Basin returned a well-formed ErrorResponse (5-char SQLSTATE,
@@ -1647,6 +1647,19 @@ async fn orm_compat_corpus() {
             r#"SELECT $1::int4 AS "value""#,
             &[ParamValue::I32(42)],
         ),
+        // ── NEW SHAPE CLASS: nested-write transaction ──────────────────────
+        // 22. Prisma nested write — `prisma.user.create({ data: { ...,
+        //     orders: { create: [...] } } })` runs as one transaction: BEGIN,
+        //     parent INSERT … RETURNING, dependent child INSERTs … RETURNING
+        //     (each referencing the parent's id), COMMIT. One simple_query
+        //     batch models the exact statement sequence on the wire
+        //     (query-engine/connectors/sql-query-connector write.rs).
+        Shape::raw(r#"BEGIN; INSERT INTO "public"."User" ("id","email","name") VALUES (400,'nested@example.com','Nested') RETURNING "public"."User"."id"; INSERT INTO "public"."Order" ("id","userId","status","total") VALUES (40,400,'new',10.00) RETURNING "public"."Order"."id"; INSERT INTO "public"."Order" ("id","userId","status","total") VALUES (41,400,'new',12.50) RETURNING "public"."Order"."id"; COMMIT;"#),
+        // 23. Session-state guard for shape 22 (mirrors sqlx shape 19): if
+        //     the nested-write batch aborts mid-transaction, this ROLLBACK
+        //     clears the aborted state so later sections aren't poisoned.
+        //     After a successful 22 it is a harmless no-op ROLLBACK.
+        Shape::raw(r#"ROLLBACK"#),
     ];
 
     println!("\n=== Prisma ({} shapes) ===", prisma.len());
@@ -1754,6 +1767,20 @@ async fn orm_compat_corpus() {
         //     later 42P01 / 25P02 in one section does not cascade-poison
         //     unrelated ORM shapes downstream.
         Shape::raw(r#"ROLLBACK"#),
+        // ── NEW SHAPE CLASS: pool reset ────────────────────────────────────
+        // The statements connection pools fire between checkouts. PgBouncer's
+        // default `server_reset_query` (session pooling) is `DISCARD ALL`;
+        // sqlx's `PgConnection::clear_cached_statements` issues
+        // `DEALLOCATE ALL`; older poolers / JDBC pools use `RESET ALL` +
+        // `DEALLOCATE ALL`. A Basin reject on any of these breaks every
+        // pooled deployment at checkout time, so all three must be accepted.
+        //
+        // 20. PgBouncer server_reset_query.
+        Shape::raw(r#"DISCARD ALL"#),
+        // 21. sqlx statement-cache reset.
+        Shape::raw(r#"DEALLOCATE ALL"#),
+        // 22. GUC reset half of the conservative pooler pair.
+        Shape::raw(r#"RESET ALL"#),
     ];
 
     println!("\n=== sqlx ({} shapes) ===", sqlx.len());
@@ -1945,10 +1972,199 @@ async fn orm_compat_corpus() {
         // 17. TypeORM MigrationExecutor.loadExecutedMigrations — queries the
         //     tracker it just created, newest first.
         Shape::raw(r#"SELECT * FROM "migrations" ORDER BY "id" DESC"#),
+        // ── NEW SHAPE CLASS: eager-load join + pagination ──────────────────
+        // 18. TypeORM `.find({ relations: [...], take, skip })` — paginating
+        //     over an eager-load join must not multiply parents by child
+        //     count, so SelectQueryBuilder first SELECTs DISTINCT parent ids
+        //     from the joined set through the "distinctAlias" derived table
+        //     (the shape every `getMany()`-with-take emits), then re-fetches
+        //     the joined rows for those ids.
+        Shape::raw(r#"SELECT DISTINCT "distinctAlias"."users_id" AS "ids_users_id" FROM (SELECT "users"."id" AS "users_id", "users"."email" AS "users_email", "orders"."id" AS "orders_id", "orders"."status" AS "orders_status" FROM "users" "users" LEFT JOIN "orders" "orders" ON "orders"."user_id" = "users"."id") "distinctAlias" ORDER BY "ids_users_id" ASC LIMIT 25"#),
+        // 19. …and the second half: the re-fetch of the joined rows for the
+        //     ids page (literal IN-list — TypeORM interpolates the id page).
+        Shape::raw(r#"SELECT "users"."id" AS "users_id", "users"."email" AS "users_email", "orders"."id" AS "orders_id", "orders"."status" AS "orders_status" FROM "users" "users" LEFT JOIN "orders" "orders" ON "orders"."user_id" = "users"."id" WHERE "users"."id" IN (1, 2) ORDER BY "users"."id" ASC"#),
     ];
 
     println!("\n=== TypeORM / FUTURE ({} shapes) ===", typeorm.len());
     let typeorm_result = run_orm_section(&client, "TypeORM", typeorm).await;
+
+    // ── Django ORM (Python — psycopg2 backend, literal SQL) ─────────────────
+    //
+    // Django's psycopg2 backend does CLIENT-SIDE parameter interpolation —
+    // `cursor.execute(sql, params)` mogrifies `%s` placeholders into literals
+    // before the statement hits the wire — so every shape below is literal
+    // SQL via simple_query, exactly as it arrives at the server. Connection
+    // setup, MigrationRecorder, contenttypes and savepoint-per-atomic flows
+    // are verbatim Django 3.2 LTS emissions
+    // (django/db/backends/postgresql/base.py, django/db/migrations/recorder.py,
+    // django/contrib/contenttypes/migrations/0001_initial.py).
+    let django: &[Shape] = &[
+        // 1. Connect sequence — psycopg2's `connection.set_client_encoding`
+        //    issues exactly this before Django runs anything else.
+        Shape::raw(r#"SET client_encoding TO 'UTF8'"#),
+        // 2. Connect sequence — `USE_TZ = True` pins the session timezone
+        //    (init_connection_state in the postgresql backend).
+        Shape::raw(r#"SET TIME ZONE 'UTC'"#),
+        // 3. MigrationRecorder.has_table() — Django introspection's
+        //    get_table_list probe (postgresql/introspection.py, verbatim).
+        Shape::raw(r#"SELECT c.relname,
+               CASE WHEN c.relkind IN ('m', 'v') THEN 'v' ELSE 't' END
+           FROM pg_catalog.pg_class c
+           LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+           WHERE c.relkind IN ('f', 'm', 'p', 'r', 'v')
+               AND n.nspname NOT IN ('pg_catalog', 'pg_toast')
+               AND pg_catalog.pg_table_is_visible(c.oid)"#),
+        // 4. MigrationRecorder.ensure_schema() — django_migrations is created
+        //    FIRST, before any version query (create-first, exactly like the
+        //    Diesel / TypeORM tracker bootstraps above). Verbatim Django 3.2
+        //    emission (serial PK; 4.1+ switches to GENERATED … AS IDENTITY).
+        Shape::raw(r#"CREATE TABLE "django_migrations" ("id" serial NOT NULL PRIMARY KEY, "app" varchar(255) NOT NULL, "name" varchar(255) NOT NULL, "applied" timestamp with time zone NOT NULL)"#),
+        // 5. MigrationRecorder.applied_migrations() — full read of the
+        //    tracker it just created.
+        Shape::raw(r#"SELECT "django_migrations"."id", "django_migrations"."app", "django_migrations"."name", "django_migrations"."applied" FROM "django_migrations""#),
+        // 6. MigrationRecorder.record_applied() — psycopg2 interpolates the
+        //    datetime param as a quoted ISO literal with a ::timestamptz cast.
+        Shape::raw(r#"INSERT INTO "django_migrations" ("app", "name", "applied") VALUES ('myapp', '0001_initial', '2024-01-01T00:00:00+00:00'::timestamptz)"#),
+        // 7. contenttypes bootstrap — django_content_type DDL from the
+        //    contenttypes app's 0001_initial migration.
+        Shape::raw(r#"CREATE TABLE "django_content_type" ("id" serial NOT NULL PRIMARY KEY, "app_label" varchar(100) NOT NULL, "model" varchar(100) NOT NULL)"#),
+        // 8. …followed by the separate unique-together constraint Django's
+        //    schema editor emits as ALTER TABLE.
+        //    KNOWN GAP: Basin's ALTER TABLE grammar does not yet accept
+        //    `ADD CONSTRAINT … UNIQUE (cols)` — returns a typed 42601.
+        //    Harmless for the rest of the flow (the constraint is advisory
+        //    for Django; it never re-probes it), but post-hoc multi-column
+        //    UNIQUE addition is the named engine gap here.
+        Shape::raw(r#"ALTER TABLE "django_content_type" ADD CONSTRAINT "django_content_type_app_label_model_76bd3d3b_uniq" UNIQUE ("app_label", "model")"#),
+        // 9. ContentType.objects.get_for_model() cache fill — the content
+        //    type lookup virtually every Django app issues on first request.
+        Shape::raw(r#"SELECT "django_content_type"."id", "django_content_type"."app_label", "django_content_type"."model" FROM "django_content_type" WHERE ("django_content_type"."app_label" = 'myapp' AND "django_content_type"."model" = 'question')"#),
+        // 10. ContentType creation — Django hydrates the serial PK through
+        //     RETURNING.
+        Shape::raw(r#"INSERT INTO "django_content_type" ("app_label", "model") VALUES ('myapp', 'question') RETURNING "django_content_type"."id""#),
+        // ── savepoint-per-atomic CRUD ──────────────────────────────────────
+        // 11. transaction.atomic() — psycopg2 (autocommit off) sends BEGIN;
+        //     each *nested* atomic block is SAVEPOINT/RELEASE with Django's
+        //     `s<thread_id>_x<n>` naming. One simple_query batch models the
+        //     statement sequence on the wire (same convention as the Prisma
+        //     SAVEPOINT shape above).
+        Shape::raw(r#"BEGIN; SAVEPOINT "s140234567890_x1"; INSERT INTO "django_content_type" ("app_label", "model") VALUES ('myapp', 'choice') RETURNING "django_content_type"."id"; RELEASE SAVEPOINT "s140234567890_x1"; COMMIT;"#),
+        // 12. Nested atomic with inner failure recovery — the inner block
+        //     rolls back to its savepoint, the outer continues and commits
+        //     (the get_or_create / IntegrityError-retry pattern).
+        Shape::raw(r#"BEGIN; SAVEPOINT "s140234567890_x2"; SAVEPOINT "s140234567890_x3"; ROLLBACK TO SAVEPOINT "s140234567890_x3"; UPDATE "django_content_type" SET "model" = 'choice2' WHERE "django_content_type"."id" = 2; RELEASE SAVEPOINT "s140234567890_x2"; COMMIT;"#),
+        // 13. select_for_update() — the classic Django locking read; only
+        //     legal inside atomic, so wrapped in BEGIN/COMMIT exactly as the
+        //     backend orders it.
+        Shape::raw(r#"BEGIN; SELECT "django_migrations"."id", "django_migrations"."app", "django_migrations"."name" FROM "django_migrations" WHERE "django_migrations"."app" = 'myapp' FOR UPDATE; COMMIT;"#),
+        // 14. QuerySet `__in` filter + ORDER BY — the list-view read.
+        Shape::raw(r#"SELECT "django_content_type"."id", "django_content_type"."model" FROM "django_content_type" WHERE "django_content_type"."id" IN (1, 2, 3) ORDER BY "django_content_type"."id" ASC"#),
+        // 15. QuerySet.delete() — the collector deletes by PK IN-list.
+        Shape::raw(r#"DELETE FROM "django_content_type" WHERE "django_content_type"."id" IN (999)"#),
+        // 16. Session-state guard (mirrors sqlx shape 19): clears any
+        //     aborted-tx state a failed batch in 11–13 could leave behind so
+        //     the GORM section is not cascade-poisoned.
+        Shape::raw(r#"ROLLBACK"#),
+    ];
+
+    println!("\n=== Django ORM ({} shapes) ===", django.len());
+    let django_result = run_orm_section(&client, "Django", django).await;
+
+    // ── GORM (Go — pgx driver, extended protocol $N params) ─────────────────
+    //
+    // GORM speaks through pgx, which always uses the extended protocol
+    // (Parse/Bind/Describe/Execute) with $N placeholders — parameterised
+    // shapes are driven through `client.execute` exactly like the Prisma /
+    // Diesel sections. AutoMigrate emissions are verbatim from
+    // gorm.io/driver/postgres `migrator.go`; CRUD shapes from the GORM
+    // quickstart model (`type Product struct { ID uint; Code string;
+    // Price uint }` — the no-gorm.Model variant keeps the bind set inside
+    // the corpus' ParamValue vocabulary; gorm.Model adds timestamptz binds,
+    // which need a Timestamptz ParamValue variant before they can be driven
+    // through the extended protocol here).
+    let gorm: &[Shape] = &[
+        // 1. Migrator.CurrentDatabase() — issued before any AutoMigrate work.
+        Shape::raw(r#"SELECT CURRENT_DATABASE()"#),
+        // 2. AutoMigrate HasTable probe (migrator.go HasTable, verbatim).
+        Shape::with(
+            r#"SELECT count(*) FROM information_schema.tables WHERE table_schema = CURRENT_SCHEMA() AND table_name = $1 AND table_type = $2"#,
+            &[ParamValue::Text("products"), ParamValue::Text("BASE TABLE")],
+        ),
+        // 3. AutoMigrate CREATE TABLE — gorm quotes every identifier, maps
+        //    the uint ID to bigserial, and inlines the PK clause.
+        Shape::raw(r#"CREATE TABLE IF NOT EXISTS "products" ("id" bigserial,"code" text,"price" bigint,PRIMARY KEY ("id"))"#),
+        // 4. AutoMigrate column probe — HasColumn before each ALTER ADD
+        //    (migrator.go HasColumn, verbatim).
+        Shape::with(
+            r#"SELECT count(*) FROM INFORMATION_SCHEMA.columns WHERE table_schema = CURRENT_SCHEMA() AND table_name = $1 AND column_name = $2"#,
+            &[ParamValue::Text("products"), ParamValue::Text("stock")],
+        ),
+        // 5. AutoMigrate ALTER TABLE ADD — emitted per missing field on an
+        //    existing table (no IF NOT EXISTS; gorm probed first in 4).
+        Shape::raw(r#"ALTER TABLE "products" ADD "stock" bigint"#),
+        // 6. db.Create(&product) — INSERT … RETURNING "id" (gorm hydrates
+        //    the auto PK back into the struct).
+        Shape::with(
+            r#"INSERT INTO "products" ("code","price","stock") VALUES ($1,$2,$3) RETURNING "id""#,
+            &[ParamValue::Text("D42"), ParamValue::I64(100), ParamValue::I64(10)],
+        ),
+        // ── batch insert ───────────────────────────────────────────────────
+        // 7. db.Create(&[]Product{...}) — one multi-VALUES INSERT with
+        //    RETURNING, exactly how gorm batches slices.
+        Shape::with(
+            r#"INSERT INTO "products" ("code","price","stock") VALUES ($1,$2,$3),($4,$5,$6),($7,$8,$9) RETURNING "id""#,
+            &[
+                ParamValue::Text("B1"),
+                ParamValue::I64(10),
+                ParamValue::I64(1),
+                ParamValue::Text("B2"),
+                ParamValue::I64(20),
+                ParamValue::I64(2),
+                ParamValue::Text("B3"),
+                ParamValue::I64(30),
+                ParamValue::I64(3),
+            ],
+        ),
+        // 8. db.First(&product, id) — PK fetch with the ORDER BY gorm always
+        //    appends (LIMIT is emitted literally).
+        Shape::with(
+            r#"SELECT * FROM "products" WHERE "products"."id" = $1 ORDER BY "products"."id" LIMIT 1"#,
+            &[ParamValue::I64(1)],
+        ),
+        // 9. db.Where("code = ?", …).Find(&products) — `?` re-emitted as $1.
+        Shape::with(
+            r#"SELECT * FROM "products" WHERE code = $1"#,
+            &[ParamValue::Text("D42")],
+        ),
+        // 10. db.Model(&product).Update("price", 200) — single-column UPDATE.
+        Shape::with(
+            r#"UPDATE "products" SET "price"=$1 WHERE "id" = $2"#,
+            &[ParamValue::I64(200), ParamValue::I64(1)],
+        ),
+        // 11. db.Model(&product).Updates(Product{…}) — multi-column UPDATE
+        //     from a struct (non-zero fields only).
+        Shape::with(
+            r#"UPDATE "products" SET "code"=$1,"price"=$2 WHERE "id" = $3"#,
+            &[ParamValue::Text("D43"), ParamValue::I64(150), ParamValue::I64(1)],
+        ),
+        // 12. db.Delete(&product, id) — hard delete (no gorm.DeletedAt on
+        //     the quickstart-variant model).
+        Shape::with(
+            r#"DELETE FROM "products" WHERE "products"."id" = $1"#,
+            &[ParamValue::I64(2)],
+        ),
+        // 13. db.Model(&Product{}).Count(&n).
+        Shape::raw(r#"SELECT count(*) FROM "products""#),
+        // 14. db.Clauses(clause.OnConflict{UpdateAll: true}).Create(...) —
+        //     gorm's documented upsert emission.
+        Shape::with(
+            r#"INSERT INTO "products" ("code","price","stock") VALUES ($1,$2,$3) ON CONFLICT ("id") DO UPDATE SET "code"="excluded"."code","price"="excluded"."price","stock"="excluded"."stock" RETURNING "id""#,
+            &[ParamValue::Text("U1"), ParamValue::I64(77), ParamValue::I64(7)],
+        ),
+    ];
+
+    println!("\n=== GORM ({} shapes) ===", gorm.len());
+    let gorm_result = run_orm_section(&client, "GORM", gorm).await;
 
     // ── Summary ──────────────────────────────────────────────────────────────
 
@@ -1958,6 +2174,8 @@ async fn orm_compat_corpus() {
         sqlx_result,
         diesel_result,
         typeorm_result,
+        django_result,
+        gorm_result,
     ];
 
     let total_shapes: usize = sections.iter().map(|s| s.total).sum();

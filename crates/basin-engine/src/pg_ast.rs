@@ -108,6 +108,10 @@ pub enum StmtKind {
     Prepare,
     Execute,
     Deallocate,
+    /// `DISCARD ALL | PLANS | SEQUENCES | TEMP` — the pool-reset statement
+    /// (PgBouncer's default `server_reset_query`, driver pool resets).
+    /// Noop-accepted; see noop_accept.rs.
+    Discard,
     // Cursor lifecycle — real implementation in sibling agent (a193aadd)
     DeclareCursor,
     Fetch,
@@ -213,6 +217,7 @@ impl StmtKind {
             StmtKind::Prepare => "PREPARE",
             StmtKind::Execute => "EXECUTE",
             StmtKind::Deallocate => "DEALLOCATE",
+            StmtKind::Discard => "DISCARD",
             StmtKind::DeclareCursor => "DECLARE CURSOR",
             StmtKind::Fetch => "FETCH",
             StmtKind::Move => "MOVE",
@@ -574,6 +579,7 @@ pub fn stmt_kind(node: &Node) -> StmtKind {
         NodeEnum::PrepareStmt(_) => StmtKind::Prepare,
         NodeEnum::ExecuteStmt(_) => StmtKind::Execute,
         NodeEnum::DeallocateStmt(_) => StmtKind::Deallocate,
+        NodeEnum::DiscardStmt(_) => StmtKind::Discard,
         NodeEnum::DeclareCursorStmt(_) => StmtKind::DeclareCursor,
         NodeEnum::FetchStmt(s) => {
             // MOVE and FETCH both arrive as FetchStmt; `ismove` discriminates.

@@ -136,6 +136,25 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
         StmtKind::Deallocate => Some(ExecResult::Empty {
             tag: "DEALLOCATE".into(),
         }),
+        // DISCARD ALL / PLANS / SEQUENCES / TEMP — the pool-reset statement
+        // (PgBouncer's default `server_reset_query`; driver pools issue it
+        // between checkouts). Basin has no temp tables, no server-side plan
+        // cache to drop, and text-form PREPARE is already a no-op, so
+        // accepting silently is semantically safe. Divergence note: a real
+        // PG `DISCARD ALL` also clears wire-protocol prepared statements /
+        // portals (router-side registries) and session GUCs — same accepted
+        // divergence as the `Deallocate` arm above. The tag echoes the
+        // variant (PG replies `DISCARD ALL`, `DISCARD PLANS`, …).
+        StmtKind::Discard => {
+            let upper = sql.trim().trim_end_matches(';').trim_end().to_ascii_uppercase();
+            let tag = match upper.as_str() {
+                "DISCARD PLANS" => "DISCARD PLANS",
+                "DISCARD SEQUENCES" => "DISCARD SEQUENCES",
+                "DISCARD TEMP" | "DISCARD TEMPORARY" => "DISCARD TEMP",
+                _ => "DISCARD ALL",
+            };
+            Some(ExecResult::Empty { tag: tag.into() })
+        }
 
         // Transaction control — Basin is auto-commit (no MVCC, no WAL-level
         // transaction isolation in v0.1). Accepting these silently keeps
@@ -250,6 +269,13 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
                 || after_set.starts_with("SYNCHRONOUS_COMMIT")
             {
                 None // Let the real executor handler fire.
+            } else if upper.starts_with("RESET") {
+                // `RESET <var>` / `RESET ALL` parse as VariableSetStmt
+                // (VAR_RESET / VAR_RESET_ALL). Pool resets issue
+                // `RESET ALL`; echo PG's `RESET` tag rather than `SET`.
+                Some(ExecResult::Empty {
+                    tag: "RESET".into(),
+                })
             } else {
                 Some(ExecResult::Empty { tag: "SET".into() })
             }

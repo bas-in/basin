@@ -810,11 +810,14 @@ async fn row_description_oid_fidelity() {
 /// Driver concern: asyncpg and psycopg match on SQLSTATE to raise
 /// `UndefinedTable` rather than a generic `ProgrammingError`.
 ///
-/// Note: PG raises 42P01 (undefined_table). Basin currently routes NotFound
-/// errors to XX000 (internal, since DataFusion wraps the error as "internal:
-/// plan: Error during planning: table not found"). The exact code is Basin's
-/// current behaviour; the critical assertion is that the wire fields are
-/// well-formed so drivers can at least parse the error.
+/// PG raises 42P01 (undefined_table) with the message
+/// `relation "<name>" does not exist`, and Basin now matches both: the
+/// engine promotes DataFusion's `table '<name>' not found` planning error
+/// to `BasinError::UndefinedTable`, which the router maps to 42P01. This
+/// is load-bearing for ORM migration flows — Diesel / TypeORM / Django
+/// branch on 42P01 to decide "tracker table missing → create it" — so this
+/// test pins the exact code AND the PG message shape, not just well-formed
+/// wire fields.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn error_envelope_relation_not_found() {
     let server = start_server().await;
@@ -835,17 +838,21 @@ async fn error_envelope_relation_not_found() {
         dbe.severity()
     );
 
-    // SQLSTATE must be exactly 5 characters (PG spec requirement).
+    // SQLSTATE must be exactly 42P01 (undefined_table) — the code ORMs
+    // branch on. tokio-postgres exposes it as a dedicated SqlState constant.
     let code = dbe.code().code();
     assert_eq!(
-        code.len(),
-        5,
-        "SQLSTATE must be exactly 5 chars, got: {code:?}"
+        code, "42P01",
+        "missing relation must raise SQLSTATE 42P01 (undefined_table), got: {code:?}"
     );
 
-    // Message must be non-empty.
+    // Message must be the exact PG shape (psycopg / asyncpg surface it
+    // verbatim; some app code regex-matches the relation name out of it).
     let msg = dbe.message();
-    assert!(!msg.is_empty(), "error message must be non-empty");
+    assert_eq!(
+        msg, "relation \"nonexistent_table_xyz_wire_compat\" does not exist",
+        "message must be PG-shaped"
+    );
 
     println!(
         "[error_envelope_not_found] severity={:?} code={code:?} msg={msg:?}",

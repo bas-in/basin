@@ -48,6 +48,11 @@ fn classify(err: &BasinError) -> (&'static str, &'static str) {
     match err {
         BasinError::InvalidIdent(_) | BasinError::InvalidSchema(_) => ("ERROR", "42601"), // syntax_error
         BasinError::NotFound(_) => ("ERROR", "42704"), // undefined_object
+        // Missing relation at planning time. PG raises 42P01
+        // (undefined_table) and ORM migration flows BRANCH on this exact
+        // code (Diesel / TypeORM / Django treat it as "tracker table
+        // missing → create it"), so it must not collapse into XX000/42704.
+        BasinError::UndefinedTable(_) => ("ERROR", "42P01"), // undefined_table
         BasinError::CommitConflict(_) => ("ERROR", "40001"), // serialization_failure
         BasinError::QueryCostExceeded(_) => ("ERROR", "54000"), // program_limit_exceeded
         BasinError::QueryCanceled(_) => ("ERROR", "57014"),     // query_canceled
@@ -95,6 +100,20 @@ mod tests {
     fn classifies_not_found() {
         let er = error_response(&BasinError::NotFound("table x".into()));
         assert_eq!(er.fields[1], (b'C', "42704".to_owned()));
+    }
+
+    #[test]
+    fn classifies_undefined_table() {
+        // Missing relations must surface as SQLSTATE 42P01 with the exact
+        // PG message shape — ORM migration flows (Diesel / TypeORM /
+        // Django) branch on this code to decide "create the tracker".
+        let er = error_response(&BasinError::UndefinedTable("django_migrations".into()));
+        assert_eq!(er.fields[0], (b'S', "ERROR".to_owned()));
+        assert_eq!(er.fields[1], (b'C', "42P01".to_owned()));
+        assert_eq!(
+            er.fields[2],
+            (b'M', "relation \"django_migrations\" does not exist".to_owned())
+        );
     }
 
     #[test]

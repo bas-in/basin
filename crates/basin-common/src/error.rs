@@ -144,6 +144,15 @@ pub enum BasinError {
     #[error("terminating connection due to idle-in-transaction timeout: {0}")]
     IdleInTransactionTimeout(String),
 
+    /// Referenced relation (table / view) does not exist at planning time.
+    /// Router maps to SQLSTATE `42P01` (`undefined_table`) with the exact
+    /// PG-shaped message `relation "<name>" does not exist`. Both the code
+    /// and the message shape are load-bearing: ORM migration flows branch
+    /// on 42P01 (Diesel / TypeORM / Django all decide "tracker table is
+    /// missing → create it" when the version probe raises undefined_table).
+    #[error("relation \"{0}\" does not exist")]
+    UndefinedTable(String),
+
     /// Catch-all for sources without a dedicated variant.
     #[error("internal: {0}")]
     Internal(String),
@@ -161,6 +170,13 @@ impl BasinError {
     }
     pub fn not_found(msg: impl Into<String>) -> Self {
         Self::NotFound(msg.into())
+    }
+    /// Typed constructor for a missing relation. `name` is the relation
+    /// name as the user wrote it (qualified if they qualified it) — it is
+    /// interpolated into the PG-shaped `relation "<name>" does not exist`
+    /// message and surfaces as SQLSTATE 42P01.
+    pub fn undefined_table(name: impl Into<String>) -> Self {
+        Self::UndefinedTable(name.into())
     }
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::Internal(msg.into())
