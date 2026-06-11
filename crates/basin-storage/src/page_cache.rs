@@ -43,7 +43,7 @@
 //!
 //! # Byte budget + LRU
 //!
-//! State lives sharded across `N_SHARDS` independent `Mutex<PageCacheState>`
+//! State lives sharded across `N_SHARDS` independent `RwLock<PageCacheState>`
 //! buckets, each holding its own `LruCache<CacheKey, CacheEntry>` plus a
 //! local `current_bytes: u64` that the eviction loop drives below its
 //! configured share of the global budget (`max_bytes / N_SHARDS`). Every
@@ -62,7 +62,7 @@
 //!
 //! Pre-shard, the cache held a single `Mutex<PageCacheState>` and every
 //! `get`/`insert`/`has_capacity` call serialised through it. The `get`
-//! path is morally a write because LRU promotion mutates the recency
+//! path was morally a write because LRU promotion mutates the recency
 //! list, so even pure read workloads collided on this lock. At C=64
 //! concurrent readers on 16 worker threads the futex-wake latency made
 //! the lock the effective scaling ceiling (see `scaling_concurrency`
@@ -75,6 +75,26 @@
 //! hit), and different-key requests scatter. With shard count matching
 //! the concurrency target, the expected contention on a uniform workload
 //! is `~1/N_SHARDS`.
+//!
+//! # Same-key convoy: read-mostly `get` (perf hot-path, round 2)
+//!
+//! Sharding only helps when keys differ. The unfiltered-decode reuse
+//! path in `reader.rs` keys every point read of a file by
+//! `(path, projection, EMPTY_FILTERS)` — identical for all concurrent
+//! point reads of that file — so they all hash to ONE shard. With the
+//! shard guarded by an exclusive `Mutex` and `get` promoting LRU
+//! recency under it, every warm hit serialised on that single lock and
+//! C=16 point-read latency collapsed ~370× (197 µs → 73 ms median).
+//!
+//! The fix: each shard is a `RwLock<PageCacheState>`, and `get` takes
+//! the READ lock with the LRU's non-promoting `peek`. Promotion is
+//! opportunistic — after the read guard drops, `try_write()` promotes
+//! recency only if the write lock is free. Concurrent same-key readers
+//! now share the read lock; under contention promotion is skipped (LRU
+//! order becomes approximate, which it already was across shards), and
+//! under low concurrency `try_write` always succeeds so single-threaded
+//! LRU behaviour is unchanged. Inserts/eviction/invalidation keep the
+//! write lock.
 //!
 //! `has_capacity` is the only call that previously read aggregate state:
 //! it now reads a lock-free `AtomicU64 current_bytes` on the parent
@@ -103,7 +123,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use arrow_array::RecordBatch;
 use lru::LruCache;
@@ -396,12 +416,14 @@ pub fn resolve_page_cache_shards() -> usize {
 }
 
 /// Page cache. Cheap to clone via `Arc<PageCache>`; concurrent readers
-/// share a fixed array of mutex-guarded LRU shards.
+/// share a fixed array of rwlock-guarded LRU shards.
 pub struct PageCache {
-    /// One independent `Mutex<PageCacheState>` per shard. A request picks
+    /// One independent `RwLock<PageCacheState>` per shard. A request picks
     /// its shard by hashing the full `CacheKey`; same-key requests always
-    /// land on the same shard.
-    shards: Box<[Mutex<PageCacheState>]>,
+    /// land on the same shard. Hits take the read lock (non-promoting
+    /// `peek` + best-effort `try_write` promotion); inserts, eviction and
+    /// invalidation take the write lock.
+    shards: Box<[RwLock<PageCacheState>]>,
     counters: PageCacheCounters,
     max_bytes: u64,
     /// Per-shard byte budget = `max_bytes / shards.len()` (rounded up to
@@ -434,9 +456,9 @@ impl PageCache {
         let n_shards = n_shards.max(1);
         let cap =
             NonZeroUsize::new(DEFAULT_INDEX_CAPACITY_PER_SHARD).expect("index cap > 0");
-        let shards: Vec<Mutex<PageCacheState>> = (0..n_shards)
+        let shards: Vec<RwLock<PageCacheState>> = (0..n_shards)
             .map(|_| {
-                Mutex::new(PageCacheState {
+                RwLock::new(PageCacheState {
                     lru: LruCache::new(cap),
                     by_path: HashMap::new(),
                     current_bytes: 0,
@@ -478,20 +500,55 @@ impl PageCache {
         (h.finish() as usize) % self.shards.len()
     }
 
-    /// Lookup. On hit, bumps LRU position and returns a clone of the
-    /// `Arc<Vec<...>>` (cheap; no batch is copied).
+    /// Lookup. Returns a clone of the `Arc<Vec<...>>` on hit (cheap; no
+    /// batch is copied).
+    ///
+    /// # Locking / LRU trade-off (same-key convoy fix)
+    ///
+    /// The hit path takes the shard's READ lock and uses the LRU's
+    /// non-promoting `peek`, so any number of concurrent readers of the
+    /// same key proceed in parallel. Promotion to MRU is *opportunistic*:
+    /// after the read guard drops we `try_write()` — if the write lock is
+    /// free we re-look the key up and bump its recency; if contended we
+    /// skip. Consequences:
+    ///
+    /// - Low concurrency (incl. every single-threaded test): `try_write`
+    ///   always succeeds, so behaviour is byte-for-byte the old
+    ///   promote-on-get LRU.
+    /// - High same-key concurrency: some promotions are skipped, so LRU
+    ///   recency is approximate — acceptable because per-shard LRU was
+    ///   already only approximately-global (see module docs), and the
+    ///   alternative was every warm hit serialising on one exclusive lock
+    ///   (the measured 370× C=16 latency collapse on the unfiltered-decode
+    ///   key). Eviction correctness (byte budget, reverse index) is
+    ///   untouched: all mutation still happens under the write lock.
     pub(crate) fn get(&self, key: &CacheKey) -> Option<Arc<Vec<Arc<RecordBatch>>>> {
         let idx = self.shard_for(key);
-        let mut g = self.shards[idx].lock().expect("page cache shard mutex poisoned");
-        if let Some(entry) = g.lru.get(key) {
-            let batches = entry.batches.clone();
-            drop(g);
-            self.counters.hits.fetch_add(1, Ordering::Relaxed);
-            Some(batches)
-        } else {
-            drop(g);
-            self.counters.misses.fetch_add(1, Ordering::Relaxed);
-            None
+        let shard = &self.shards[idx];
+
+        // Phase 1: shared read — non-promoting lookup, clone the Arc,
+        // drop the guard before touching counters.
+        let hit = {
+            let g = shard.read().expect("page cache shard lock poisoned");
+            g.lru.peek(key).map(|entry| entry.batches.clone())
+        };
+
+        match hit {
+            Some(batches) => {
+                self.counters.hits.fetch_add(1, Ordering::Relaxed);
+                // Phase 2: best-effort promotion. Only if the write lock
+                // is immediately free; the key may have been evicted in
+                // the window since the read — `lru.get` simply misses
+                // then, which is fine (the caller already has the data).
+                if let Ok(mut g) = shard.try_write() {
+                    let _ = g.lru.get(key);
+                }
+                Some(batches)
+            }
+            None => {
+                self.counters.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
         }
     }
 
@@ -509,7 +566,11 @@ impl PageCache {
         };
 
         let idx = self.shard_for(&key);
-        let mut g = self.shards[idx].lock().expect("page cache shard mutex poisoned");
+        // Exclusive: insert mutates the LRU, the reverse index, and the
+        // shard byte accounting.
+        let mut g = self.shards[idx]
+            .write()
+            .expect("page cache shard lock poisoned");
 
         // Local accumulator: net change in bytes for this shard. We
         // apply it to the global atomic ONCE at the end so the
@@ -595,7 +656,9 @@ impl PageCache {
     pub fn invalidate_path(&self, path: &ObjectPath) {
         let mut total_freed: u64 = 0;
         for shard in self.shards.iter() {
-            let mut g = shard.lock().expect("page cache shard mutex poisoned");
+            // Exclusive: invalidation pops entries and edits the reverse
+            // index.
+            let mut g = shard.write().expect("page cache shard lock poisoned");
             let keys = g.by_path.remove(path).unwrap_or_default();
             let mut freed = 0u64;
             for k in keys {
@@ -650,7 +713,7 @@ impl PageCache {
     pub(crate) fn len(&self) -> usize {
         self.shards
             .iter()
-            .map(|s| s.lock().expect("page cache shard mutex poisoned").lru.len())
+            .map(|s| s.read().expect("page cache shard lock poisoned").lru.len())
             .sum()
     }
 
@@ -658,8 +721,8 @@ impl PageCache {
     #[cfg(test)]
     pub(crate) fn shard_len(&self, idx: usize) -> usize {
         self.shards[idx]
-            .lock()
-            .expect("page cache shard mutex poisoned")
+            .read()
+            .expect("page cache shard lock poisoned")
             .lru
             .len()
     }
@@ -780,6 +843,13 @@ mod tests {
     /// LRU eviction kicks in once `current_bytes > max_bytes`. We pick a
     /// budget below 2× the size of one entry and confirm that inserting
     /// the third entry evicts the first.
+    ///
+    /// NOTE on opportunistic promotion: `get` now promotes recency via
+    /// `try_write()` rather than unconditionally. This test is
+    /// single-threaded, so every `try_write` succeeds and every `get`
+    /// promotes exactly as before — the recency ordering this test
+    /// depends on is deterministic, and no eviction assertion is
+    /// weakened.
     ///
     /// NOTE on sharding: this test forces single-shard semantics so the
     /// global LRU policy is preserved by construction (per-shard LRU
@@ -910,6 +980,80 @@ mod tests {
         assert!(
             (max_seen as f64) <= 10.0 * mean,
             "hottest shard holds {max_seen} entries, >10× mean {mean:.1} — router skewed"
+        );
+    }
+
+    /// Smoke test for the RwLock split: many threads hammer `get` on a
+    /// single hot key (all landing on the same shard — the exact shape of
+    /// the unfiltered-decode convoy) while a writer thread concurrently
+    /// inserts and invalidates churn entries on that same shard (single
+    /// shard forced by construction). Pass criteria: no deadlock (the
+    /// test completes), and every read of the hot key is a hit (the
+    /// budget is sized so churn never evicts it). Fixed iteration counts
+    /// keep it well under a second.
+    #[test]
+    fn concurrent_same_key_gets_with_churn_no_deadlock() {
+        // Single shard: readers and the writer are forced onto the same
+        // RwLock, maximising contention. Budget is generous so the hot
+        // entry can never be evicted by churn — every get must hit.
+        let cache = Arc::new(PageCache::with_shards(
+            PageCacheConfig::new(64 * 1024 * 1024),
+            1,
+        ));
+        let hot = key("projects/x/tables/t/data/hot.parquet", 1, 1);
+        cache.insert(hot.clone(), vec![small_batch(0, 100)]);
+
+        let n_readers = 8usize;
+        let gets_per_reader = 5_000usize;
+        let mut handles = Vec::with_capacity(n_readers + 1);
+
+        for _ in 0..n_readers {
+            let c = Arc::clone(&cache);
+            let k = hot.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..gets_per_reader {
+                    assert!(
+                        c.get(&k).is_some(),
+                        "hot key must hit on every concurrent get"
+                    );
+                }
+            }));
+        }
+
+        // Writer: insert/invalidate churn keys on the same (only) shard,
+        // exercising the write-lock paths concurrently with the readers'
+        // read-lock + try_write promotion.
+        {
+            let c = Arc::clone(&cache);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..500u64 {
+                    let path =
+                        format!("projects/x/tables/t/data/churn_{}.parquet", i % 16);
+                    let k = CacheKey {
+                        path: ObjectPath::from(path.as_str()),
+                        projection_hash: i,
+                        filters_hash: i,
+                    };
+                    c.insert(k, vec![small_batch(0, 50)]);
+                    if i % 8 == 7 {
+                        c.invalidate_path(&ObjectPath::from(path.as_str()));
+                    }
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("no thread may panic or deadlock");
+        }
+
+        // The hot entry survived the churn and the counters saw every hit.
+        assert!(cache.get(&hot).is_some());
+        let c = cache.counters();
+        assert!(
+            c.hits >= (n_readers * gets_per_reader) as u64,
+            "all {} concurrent gets must be recorded as hits, saw {}",
+            n_readers * gets_per_reader,
+            c.hits
         );
     }
 
