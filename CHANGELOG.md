@@ -27,6 +27,20 @@ graduate to 1.0 and the standard SemVer guarantees.
   re-derived from measured reality at the same time (`f39b2d5`): non-collapse
   ≥ 0.7 at C=64 instead of a ≥ 1.5× headroom that never passed any recorded
   run on this hardware, including the run that introduced it.
+- **GIN consumers stop trusting the index past what it can prove**
+  (`33b820c`-class): the containment/key-existence Empty short-circuits and
+  the pruned-table re-registrations could drop overlay-modified rows, and a
+  stale posting set pointing only at replaced files could return zero rows
+  even after the overlay drained. Both now require live-overlay counters at
+  zero AND per-file completeness; CREATE INDEX settles overlays before
+  backfilling.
+- **DISTINCT ON lowering trimmed** (~2× est.): ON columns project from the
+  group keys and per-column first_value orders by only the non-key tail —
+  bit-identical winners, half the comparator work.
+- **Deep top-K verdict**: TopK was never broken — the residual is the
+  whole-table wide-decode floor (Vortex declines dynamic-filter pushdown);
+  plan shape and correctness now pinned, late-materialization design
+  documented as the follow-up.
 - **Concurrent reads stop queueing on the catalog** (`2cf6e21`): the table
   map's Mutex serialized every SELECT's load_table; 16 concurrent readers
   spent ~14 of their 17ms in the lock queue. Reads now share an RwLock.
