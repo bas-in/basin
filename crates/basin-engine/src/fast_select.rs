@@ -334,12 +334,12 @@ fn probe_memtable(
                         // (`hot_watermark == None`) uses the plain `get` and
                         // never filters.
                         let probed: Option<basin_hottier::MemRowValue> = match hot_watermark {
-                            Some(w) => match entry.memtable.get_with_seq(&pk_key) {
-                                Some((v, seq)) if seq <= w => Some(v),
-                                // Post-pin write — invisible to this read.
-                                Some(_) => None,
-                                None => None,
-                            },
+                            // S4 MVCC chains: `get_with_seq(key, Some(w))` returns
+                            // the newest version at or before the watermark — the
+                            // historical image this pinned read is entitled to,
+                            // even if the key was overwritten after the pin. `None`
+                            // → no version <= w (falls through to cold).
+                            Some(w) => entry.memtable.get_with_seq(&pk_key, Some(w)),
                             None => entry.memtable.get(&pk_key),
                         };
                         match probed {
@@ -386,16 +386,11 @@ fn probe_memtable(
     // Pinned read: take the seq-carrying snapshot and skip any entry written
     // after the watermark; auto-commit takes the plain snapshot. We normalise
     // both into `(key, value)` pairs so the match arms below are shared.
-    let snapshot: Vec<(basin_hottier::RowKey, basin_hottier::MemRowValue)> = match hot_watermark {
-        Some(w) => entry
-            .memtable
-            .snapshot_with_seq()
-            .into_iter()
-            .filter(|(_, _, seq)| *seq <= w)
-            .map(|(k, v, _)| (k, v))
-            .collect(),
-        None => entry.memtable.snapshot(),
-    };
+    // S4 MVCC chains: `snapshot_with_seq(Some(w))` yields, per key, the newest
+    // version at or before the watermark (overwritten keys resolve to their
+    // historical image instead of being skipped); `None` = auto-commit newest.
+    let snapshot: Vec<(basin_hottier::RowKey, basin_hottier::MemRowValue)> =
+        entry.memtable.snapshot_with_seq(hot_watermark);
     if snapshot.is_empty() {
         return None;
     }

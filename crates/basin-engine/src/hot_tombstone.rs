@@ -80,22 +80,13 @@ pub(crate) fn snapshot_tombstones(
         return HashSet::new();
     };
     let mut out: HashSet<Vec<u8>> = HashSet::new();
-    match watermark {
-        // Auto-commit: no recency filter, lighter snapshot.
-        None => {
-            for (key, value) in entry.memtable.snapshot() {
-                if matches!(value, MemRowValue::Tombstone) {
-                    out.insert(key.as_bytes().to_vec());
-                }
-            }
-        }
-        // In-transaction: drop post-snapshot tombstones (seq > watermark).
-        Some(w) => {
-            for (key, value, seq) in entry.memtable.snapshot_with_seq() {
-                if seq <= w && matches!(value, MemRowValue::Tombstone) {
-                    out.insert(key.as_bytes().to_vec());
-                }
-            }
+    // `snapshot_with_seq(watermark)` yields, per key, the newest version at or
+    // before the watermark (`None` = auto-commit newest). S4 MVCC chains: an
+    // overwrite no longer destroys the prior version, so a pinned reader resolves
+    // the historical tombstone/row at its watermark instead of skipping the key.
+    for (key, value) in entry.memtable.snapshot_with_seq(watermark) {
+        if matches!(value, MemRowValue::Tombstone) {
+            out.insert(key.as_bytes().to_vec());
         }
     }
     out
@@ -142,29 +133,15 @@ pub(crate) fn snapshot_updates(
     let Some(entry) = registry.get(project, table) else {
         return out;
     };
-    match watermark {
-        None => {
-            for (key, value) in entry.memtable.snapshot() {
-                if let MemRowValue::Update { bytes, .. } = value {
-                    if let Some(rb) = decode_ipc_row(&bytes) {
-                        if rb.num_rows() > 0 {
-                            out.insert(key.as_bytes().to_vec(), rb);
-                        }
-                    }
-                }
-            }
-        }
-        Some(w) => {
-            for (key, value, seq) in entry.memtable.snapshot_with_seq() {
-                if seq > w {
-                    continue;
-                }
-                if let MemRowValue::Update { bytes, .. } = value {
-                    if let Some(rb) = decode_ipc_row(&bytes) {
-                        if rb.num_rows() > 0 {
-                            out.insert(key.as_bytes().to_vec(), rb);
-                        }
-                    }
+    // `snapshot_with_seq(watermark)` yields, per key, the newest version at or
+    // before the watermark (`None` = auto-commit newest). S4 MVCC chains: a
+    // pinned reader resolves the historical override at its watermark, even if
+    // the key was overwritten again by a later (post-snapshot) write.
+    for (key, value) in entry.memtable.snapshot_with_seq(watermark) {
+        if let MemRowValue::Update { bytes, .. } = value {
+            if let Some(rb) = decode_ipc_row(&bytes) {
+                if rb.num_rows() > 0 {
+                    out.insert(key.as_bytes().to_vec(), rb);
                 }
             }
         }
