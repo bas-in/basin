@@ -23,10 +23,11 @@
 //!
 //! Per-scale sample tuning: see `samples_for`. At 10k we run the full
 //! 5/7 samples per metric (matches the original bench); higher scales
-//! halve / quarter / single-shot to keep wall clock within budget. The
-//! heavy-write shapes (single-row UPDATE, bulk UPDATE, DELETE) are
-//! skipped at >1M — they extrapolate to >2h at 10M from the 1M timing.
-//! Skipped metrics emit NaN sentinels (dashboard renders `—`).
+//! halve / quarter / 2-shot to keep wall clock within budget. Estimator:
+//! median when n ≥ 5, min otherwise (noise-floor for small n — see
+//! `robust_estimate`). The heavy-write shapes (single-row UPDATE, bulk
+//! UPDATE, DELETE) are skipped at >1M — they extrapolate to >2h at 10M
+//! from the 1M timing. Skipped metrics emit NaN sentinels (dashboard `—`).
 //!
 //! # Reproducibility protocol
 //!
@@ -357,6 +358,40 @@ pub fn median(samples: &[f64]) -> f64 {
     }
 }
 
+/// Noise-floor estimator for timed shapes.
+///
+/// With a large sample set (≥ 5) the median is the right central estimator —
+/// it discards outliers on both tails. With a small sample set (< 5, which
+/// occurs at 100k, 1M, and 10M due to wall-clock budget cuts in
+/// `samples_for`) the median is unreliable: median-of-2 is just the average
+/// of min and max, and median-of-3 is the single middle value of a sorted
+/// triple — both swing ±50 % between same-day runs from OS scheduling noise.
+///
+/// The standard benchmark answer for small n is the **minimum**: it estimates
+/// "how fast CAN this operation go on this box" and is immune to one-off
+/// interference spikes (a spike can only raise, never lower, the minimum).
+/// The minimum is not a central tendency; it is a noise-floor. That is
+/// exactly what we want when we cannot afford enough samples to compute a
+/// stable central tendency.
+///
+/// Applied symmetrically to both Basin and Postgres sides — see
+/// `basin_p50_try`, `pg_p50_explain`, `run_basin_core_suite`, and
+/// `run_pg_core_suite`. JSON metric labels retain the `_p50_ms` suffix
+/// (dashboard history continuity); the estimator difference vs a true p50
+/// is only material at < 5 samples, which only occurs at large scales.
+fn robust_estimate(samples: &[f64]) -> f64 {
+    if samples.len() >= 5 {
+        median(samples)
+    } else {
+        // min-of-n: noise-floor estimator for small sample counts.
+        samples
+            .iter()
+            .cloned()
+            .fold(f64::INFINITY, f64::min)
+            .max(0.0)
+    }
+}
+
 /// RAII safety-net that drops the schema even on panic.
 ///
 /// The clean exit path calls `std::mem::forget(_guard)` at the end of
@@ -579,23 +614,24 @@ async fn basin_timed_try(
     }
 }
 
-/// Median of N samples, retrying on per-sample failure. If FEWER than half
-/// the samples succeed, returns `None` (treat the whole shape as unsupported).
+/// Robust estimate of N samples, retrying on per-sample failure. If FEWER
+/// than half the samples succeed, returns `None` (treat the whole shape as
+/// unsupported). See `robust_estimate` for the median-vs-min estimator policy.
 async fn basin_p50_try(
     sess: &basin_engine::ProjectSession,
     sql: &str,
     n: usize,
 ) -> Option<f64> {
     // Symmetric warm-up: one untimed execute before the timed window. The
-    // small-sample suites take only `samples_for(rows) == 2` samples at 1M,
+    // small-sample suites take only `samples_for(rows) == 3` samples at 1M,
     // so without warm-up the FIRST sample pays Basin's one-time cold cost
     // (Vortex footer fetch + first column-chunk decode, ~25ms on wide rows)
     // while PG's just-seeded data is already hot in shared_buffers — an
     // asymmetric, non-steady-state measurement. The `pg_p50_explain` side
     // runs the identical untimed warm-up below. The one-time cold-open cost
     // is measured separately and fairly by the `cold_start_first_query`
-    // shape; the per-shape p50 is meant to be steady-state. The core
-    // point/range suite already does the same two-pass warm-up.
+    // shape; the per-shape steady-state is meant to be interference-free.
+    // The core point/range suite already does the same two-pass warm-up.
     let _ = basin_timed_try(sess, sql).await;
     let mut samples = Vec::with_capacity(n);
     for _ in 0..n {
@@ -606,12 +642,14 @@ async fn basin_p50_try(
     if samples.len() * 2 < n {
         return None;
     }
-    Some(median(&samples))
+    Some(robust_estimate(&samples))
 }
 
 /// Same as `basin_p50_try` but for PG via EXPLAIN ANALYZE. Returns `None`
 /// if Postgres also fails (kept symmetric so the row gets a sentinel on
-/// both sides rather than a misleading "PG = 0").
+/// both sides rather than a misleading "PG = 0"). Uses `robust_estimate`
+/// (min when n < 5, median when n ≥ 5) — identical estimator to
+/// `basin_p50_try` for fairness.
 async fn pg_p50_explain(pg: &Client, sql_inner: &str, n: usize) -> Option<f64> {
     // Symmetric warm-up to match `basin_p50_try` — one untimed EXPLAIN ANALYZE
     // before the timed window. For PG this is usually a no-op (data is already
@@ -632,7 +670,7 @@ async fn pg_p50_explain(pg: &Client, sql_inner: &str, n: usize) -> Option<f64> {
     if samples.is_empty() {
         return None;
     }
-    Some(median(&samples))
+    Some(robust_estimate(&samples))
 }
 
 /// Per-scale tuning of the multi-row INSERT batch size. At 10k rows we want a
@@ -653,22 +691,29 @@ fn insert_batch_for(rows: usize) -> usize {
 ///
 /// At 10k we run the full sample count from the original suite (5 or 7);
 /// larger scales bleed wall-clock fast because each iteration touches more
-/// data, so we cut samples proportionally. We still want at least one sample
-/// at every scale — a representative p50 is the point, not tight percentiles.
+/// data, so we cut samples proportionally.
 ///
-///   10k  → full count   (5 or 7)
-///   100k → half          (≥ 2)
-///   1M   → quarter       (≥ 2)
-///   10M  → 1 sample      (single representative measurement)
+///   10k  → full count   (5 or 7)   — median (n ≥ 5)
+///   100k → half          (≥ 2)     — min-of-n via robust_estimate (n < 5)
+///   1M   → quarter       (≥ 3)     — min-of-n via robust_estimate (n < 5)
+///   10M  → 2 samples               — min-of-2 (wall-clock cost ×2 vs old 1;
+///                                    acceptable — 10M runs are gated behind
+///                                    a feature flag and run alone anyway)
+///
+/// Estimator policy (see `robust_estimate`): when the resulting sample count
+/// is ≥ 5 the helpers report the median; when it is < 5 they report the
+/// minimum. The minimum is the standard noise-floor estimator for benchmarks —
+/// it answers "how fast CAN this go on this box" and is immune to one-off
+/// OS-scheduling spikes. Applied identically on both Basin and Postgres sides.
 fn samples_for(rows: usize, full: usize) -> usize {
     if rows <= 10_000 {
         full
     } else if rows <= 100_000 {
         (full / 2).max(2)
     } else if rows <= 1_000_000 {
-        (full / 4).max(2)
+        (full / 4).max(3)
     } else {
-        1
+        2
     }
 }
 
@@ -871,16 +916,16 @@ async fn run_pg_core_suite(
         point_p99: percentile(&point, 99.0),
         range_p50: median(&range),
         range_p99: percentile(&range, 99.0),
-        agg_p50: median(&agg),
-        join_p50: median(&join),
-        ilike_p50: median(&ilike),
-        page_p50: median(&page),
-        upd1_p50: if upd1.is_empty() { f64::NAN } else { median(&upd1) },
+        agg_p50: robust_estimate(&agg),
+        join_p50: robust_estimate(&join),
+        ilike_p50: robust_estimate(&ilike),
+        page_p50: robust_estimate(&page),
+        upd1_p50: if upd1.is_empty() { f64::NAN } else { robust_estimate(&upd1) },
         bulk_upd_ms,
         delete_ms,
-        count_p50: median(&count),
-        trunc_p50: median(&trunc),
-        olap_join_p50: median(&olap_join),
+        count_p50: robust_estimate(&count),
+        trunc_p50: robust_estimate(&trunc),
+        olap_join_p50: robust_estimate(&olap_join),
     }
 }
 
@@ -1130,16 +1175,16 @@ async fn run_basin_core_suite(
         point_p99: percentile(&point, 99.0),
         range_p50: median(&range),
         range_p99: percentile(&range, 99.0),
-        agg_p50: median(&agg),
-        join_p50: median(&join),
-        ilike_p50: median(&ilike),
-        page_p50: median(&page),
-        upd1_p50: if upd1.is_empty() { f64::NAN } else { median(&upd1) },
+        agg_p50: robust_estimate(&agg),
+        join_p50: robust_estimate(&join),
+        ilike_p50: robust_estimate(&ilike),
+        page_p50: robust_estimate(&page),
+        upd1_p50: if upd1.is_empty() { f64::NAN } else { robust_estimate(&upd1) },
         bulk_upd_ms,
         delete_ms,
-        count_p50: median(&count),
-        trunc_p50: median(&trunc),
-        olap_join_p50: median(&olap_join),
+        count_p50: robust_estimate(&count),
+        trunc_p50: robust_estimate(&trunc),
+        olap_join_p50: robust_estimate(&olap_join),
     }
 }
 
@@ -1171,8 +1216,8 @@ struct ExtendedResults {
 /// blocks otherwise overflow on the multi_thread tokio test runtime.
 ///
 /// Each shape:
-///   - PG: `EXPLAIN (ANALYZE, FORMAT TEXT) <sql>` × EXT_SAMPLES, median.
-///   - Basin: `sess.execute(<sql>)` × EXT_SAMPLES, median (Option::None if
+///   - PG: `EXPLAIN (ANALYZE, FORMAT TEXT) <sql>` × EXT_SAMPLES, robust_estimate.
+///   - Basin: `sess.execute(<sql>)` × EXT_SAMPLES, robust_estimate (Option::None if
 ///     >half the samples errored — caller treats as a "(basin gap)" row).
 ///   - Query text matches PG and Basin modulo schema qualification and the
 ///     `created_at BIGINT` clock convention used in Basin's seed.
@@ -1183,7 +1228,7 @@ async fn run_extended_suite(
     rows: usize,
 ) -> ExtendedResults {
     // Extended-shape sample count tracks the core suite: 5 at 10k, halved
-    // at 100k, quartered at 1M, single-shot at 10M+ (see `samples_for`).
+    // at 100k, quartered at 1M (≥ 3), 2 samples at 10M+ (see `samples_for`).
     let ext_samples = samples_for(rows, 5);
 
     async fn pair(
@@ -3796,8 +3841,8 @@ struct OlapResults {
 
 /// Run the 12 OLAP probes (#78-#89) on PG + Basin. Same stack-budget
 /// extraction + shared `pair()` helper as `run_extended_suite` /
-/// `run_oltp_extra_suite`: every shape times PG via EXPLAIN ANALYZE median and
-/// Basin via `basin_p50_try` median over `samples_for(rows, 5)` iterations,
+/// `run_oltp_extra_suite`: every shape times both engines via `robust_estimate`
+/// over `samples_for(rows, 5)` iterations (median when n ≥ 5, min otherwise),
 /// and the SQL is byte-identical on both sides modulo the `{schema}.` prefix.
 ///
 /// All shapes are read-only over the seeded `events` / `users` / `categories`
