@@ -977,6 +977,20 @@ fn coerce_jsonb(expr: &Expr, col: &str) -> Result<Option<Vec<u8>>> {
             )));
         }
     };
+    coerce_jsonb_str(s, col).map(Some)
+}
+
+/// Parse + canonicalise a JSON string literal into the exact bytes
+/// [`coerce_jsonb`] stores. Shared by the slow INSERT path (string-literal arm
+/// above) and the literal-VALUES fast scanner so the two paths emit
+/// byte-identical JSONB payloads.
+///
+/// `s` is the already-unescaped logical string value (sqlparser collapses `''`
+/// for the slow path; the fast scanner collapses it the same way before
+/// calling here). On invalid JSON this returns the canonical
+/// `invalid JSON literal for column …` error — the fast scanner discards the
+/// error and falls back to the slow path, which then surfaces it identically.
+pub(crate) fn coerce_jsonb_str(s: &str, col: &str) -> Result<Vec<u8>> {
     // SIMD-accelerated parse via sonic-rs, then canonicalise (key-sort) and
     // re-serialise. sonic_rs::from_str parses straight into a
     // `serde_json::Value`, so the canonicalisation pass and downstream
@@ -1002,7 +1016,7 @@ fn coerce_jsonb(expr: &Expr, col: &str) -> Result<Option<Vec<u8>>> {
     // decode correctly. `encode_jsonb_v2` is retained (dead on the write path)
     // for that historical-decode test coverage + a possible future re-enable
     // once all consumers share a 0x02-aware decode helper.
-    Ok(Some(json_bytes))
+    Ok(json_bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -2123,7 +2137,7 @@ fn object_keys_sorted(map: &serde_json::Map<String, serde_json::Value>) -> bool 
     true
 }
 
-fn check_null_allowed(field: &arrow_schema::Field) -> Result<()> {
+pub(crate) fn check_null_allowed(field: &arrow_schema::Field) -> Result<()> {
     if !field.is_nullable() {
         return Err(BasinError::InvalidSchema(format!(
             "NULL inserted into NOT NULL column {}",
@@ -2588,7 +2602,7 @@ fn coerce_timestamp_micros(expr: &Expr) -> Result<Option<i64>> {
     }
 }
 
-fn parse_timestamp_string(s: &str) -> Result<i64> {
+pub(crate) fn parse_timestamp_string(s: &str) -> Result<i64> {
     use chrono::{NaiveDate, NaiveDateTime};
 
     let trimmed = s.trim();

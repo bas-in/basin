@@ -48,9 +48,14 @@
 //!
 //! * Any column in `schema` that a tuple value lands in has an Arrow type
 //!   outside {Int16, Int32, Int64, Float32, Float64, Utf8 (plain TEXT/VARCHAR),
-//!   Boolean}. Decorated Utf8 columns (INET, UUID-on-Utf8, BIT, TSVECTOR, …)
-//!   are rejected — they carry validation the scanner deliberately does not
-//!   replicate.
+//!   Boolean, JSONB (LargeBinary + JSONB marker), Timestamp(Microsecond, tz?)}.
+//!   Decorated Utf8 columns (INET, UUID-on-Utf8, BIT, TSVECTOR, …) are rejected
+//!   — they carry validation the scanner deliberately does not replicate. JSONB
+//!   and Timestamp cells are coerced through the *same* helpers the slow path
+//!   uses (`dml::coerce_jsonb_str`, `dml::parse_timestamp_string`), so the bytes
+//!   they produce are byte-identical; any coercion failure (invalid JSON,
+//!   unparseable timestamp) returns `None` and the slow path surfaces the
+//!   canonical error.
 //! * Any token that isn't an integer / float / single-quoted string / NULL /
 //!   TRUE / FALSE: casts (`::`), function calls, `$`-params, dollar-quoted
 //!   strings, `ARRAY[...]`, nested parens, identifiers, E'' / N'' / x''
@@ -70,9 +75,9 @@ use std::sync::Arc;
 
 use arrow_array::{
     ArrayRef, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
-    RecordBatch, StringArray,
+    LargeBinaryArray, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
-use arrow_schema::{DataType, Schema};
+use arrow_schema::{DataType, Schema, TimeUnit};
 
 /// Rows per emitted [`RecordBatch`]. Matches the typical compaction/IPC chunk
 /// size; large enough to amortise per-batch overhead, small enough to keep peak
@@ -233,7 +238,7 @@ pub(crate) fn try_parse_literal_values(
     let mut cols: Vec<ColAcc> = schema
         .fields()
         .iter()
-        .map(|f| ColAcc::new(f.data_type()))
+        .map(|f| ColAcc::new(f.as_ref()))
         .collect::<Option<Vec<_>>>()?;
     // Reverse map: schema col idx -> Some(tuple position) for targeted cols.
     // (Untargeted entries are None and get a NULL appended per row.)
@@ -384,6 +389,19 @@ fn is_supported_col(field: &arrow_schema::Field) -> bool {
                 || crate::types::field_is_tsquery(field)
                 || crate::types::field_is_uuid(field))
         }
+        // JSONB rides on `LargeBinary` carrying the JSONB marker. Plain
+        // `LargeBinary` (BYTEA-large / non-JSONB) needs the bytea hex/escape
+        // coercion the scanner does not replicate, so only the marked form is
+        // admitted. The cell is coerced through `dml::coerce_jsonb_str`.
+        DataType::LargeBinary => crate::types::field_is_jsonb(field),
+        // TIMESTAMP / TIMESTAMPTZ stored as microsecond timestamps. Both the
+        // naive (`tz = None`) and zoned (`tz = Some`) forms are admitted; the
+        // tz is carried through to the produced array's DataType exactly as the
+        // slow path does. Other time units are never emitted by our DDL, so we
+        // only admit microseconds. The cell is coerced through
+        // `dml::parse_timestamp_string` (string form) or accepted as an i64
+        // epoch-micros literal (numeric form), mirroring the slow path.
+        DataType::Timestamp(TimeUnit::Microsecond, _) => true,
         _ => false,
     }
 }
@@ -630,10 +648,29 @@ enum ColAcc {
     // accumulator `'static`. The clone is one allocation per non-borrowed cell;
     // borrowed cells still cost a copy here, but only the bytes (no AST node).
     Utf8(Vec<Option<String>>),
+    // JSONB: each non-NULL cell is a string literal coerced to canonical JSON
+    // bytes via `dml::coerce_jsonb_str` (the slow path's exact pipeline). The
+    // column name is retained so the coercion error message — which the slow
+    // path surfaces verbatim on fallback — names the right column.
+    Jsonb {
+        vals: Vec<Option<Vec<u8>>>,
+        col_name: String,
+    },
+    // Timestamp(Microsecond, tz?): each cell is an i64 epoch-micros value.
+    // `data_type` carries the original (timezone-bearing) Arrow type so the
+    // finished array matches the slow path's `with_data_type` byte-for-byte.
+    TsMicros {
+        vals: Vec<Option<i64>>,
+        data_type: DataType,
+    },
 }
 
 impl ColAcc {
-    fn new(dt: &DataType) -> Option<ColAcc> {
+    /// Build a fresh accumulator for `field`'s column. Takes the whole `field`
+    /// (not just the `DataType`) because JSONB needs the column name for its
+    /// coercion error message and the JSONB marker lives in field metadata.
+    fn new(field: &arrow_schema::Field) -> Option<ColAcc> {
+        let dt = field.data_type();
         Some(match dt {
             DataType::Int16 => ColAcc::Int16(Vec::with_capacity(BATCH_ROWS)),
             DataType::Int32 => ColAcc::Int32(Vec::with_capacity(BATCH_ROWS)),
@@ -642,6 +679,14 @@ impl ColAcc {
             DataType::Float64 => ColAcc::Float64(Vec::with_capacity(BATCH_ROWS)),
             DataType::Boolean => ColAcc::Bool(Vec::with_capacity(BATCH_ROWS)),
             DataType::Utf8 => ColAcc::Utf8(Vec::with_capacity(BATCH_ROWS)),
+            DataType::LargeBinary if crate::types::field_is_jsonb(field) => ColAcc::Jsonb {
+                vals: Vec::with_capacity(BATCH_ROWS),
+                col_name: field.name().clone(),
+            },
+            DataType::Timestamp(TimeUnit::Microsecond, _) => ColAcc::TsMicros {
+                vals: Vec::with_capacity(BATCH_ROWS),
+                data_type: dt.clone(),
+            },
             _ => return None,
         })
     }
@@ -702,6 +747,40 @@ impl ColAcc {
                 v.push(Some(s.as_ref().to_string()));
                 true
             }
+            // JSONB: a string literal is the only INSERT form Postgres (and the
+            // slow path) accepts for a JSONB column without an explicit cast.
+            // We run the *same* parse+canonicalise pipeline the slow path uses
+            // (`coerce_jsonb_str`). Invalid JSON → `false` so we fall back to
+            // the slow path, which re-runs the identical coercion and surfaces
+            // the canonical `invalid JSON literal for column …` error. A number
+            // / bool into a JSONB column is a type mismatch → `false`.
+            (ColAcc::Jsonb { vals, col_name }, Cell::Str(s)) => {
+                match crate::dml::coerce_jsonb_str(s.as_ref(), col_name) {
+                    Ok(bytes) => {
+                        vals.push(Some(bytes));
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }
+            // Timestamp(Microsecond, tz?): accept a string literal parsed via
+            // the slow path's `parse_timestamp_string` (RFC3339 / PG forms /
+            // naive / date-only), or a bare integer treated as epoch
+            // microseconds (mirroring the slow path's numeric arm). Any parse
+            // uncertainty → `false` (slow path raises the canonical error).
+            (ColAcc::TsMicros { vals, .. }, Cell::Str(s)) => {
+                match crate::dml::parse_timestamp_string(s.as_ref()) {
+                    Ok(micros) => {
+                        vals.push(Some(micros));
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }
+            (ColAcc::TsMicros { vals, .. }, Cell::Int(n)) => {
+                vals.push(Some(*n));
+                true
+            }
             // Any other (column, cell) pairing is a type mismatch — decline so
             // the slow path produces the canonical typed error message.
             _ => false,
@@ -717,6 +796,8 @@ impl ColAcc {
             ColAcc::Float64(v) => v.push(None),
             ColAcc::Bool(v) => v.push(None),
             ColAcc::Utf8(v) => v.push(None),
+            ColAcc::Jsonb { vals, .. } => vals.push(None),
+            ColAcc::TsMicros { vals, .. } => vals.push(None),
         }
     }
 
@@ -729,6 +810,17 @@ impl ColAcc {
             ColAcc::Float64(v) => Arc::new(Float64Array::from(v)),
             ColAcc::Bool(v) => Arc::new(BooleanArray::from(v)),
             ColAcc::Utf8(v) => Arc::new(StringArray::from(v)),
+            // Build from the owned `Vec<Option<Vec<u8>>>`; `LargeBinaryArray`
+            // accepts an iterator of `Option<&[u8]>`.
+            ColAcc::Jsonb { vals, .. } => Arc::new(LargeBinaryArray::from_iter(
+                vals.iter().map(|o| o.as_deref()),
+            )),
+            // Re-attach the original (timezone-bearing) DataType so the array's
+            // type matches the slow path's `with_data_type(...)` exactly.
+            ColAcc::TsMicros { vals, data_type } => {
+                let arr = TimestampMicrosecondArray::from(vals);
+                Arc::new(arr.with_data_type(data_type))
+            }
         }
     }
 }
@@ -738,8 +830,8 @@ impl ColAcc {
 fn finish_batch(schema: Arc<Schema>, cols: &mut [ColAcc]) -> Option<RecordBatch> {
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(cols.len());
     for (i, c) in cols.iter_mut().enumerate() {
-        let dt = schema.field(i).data_type();
-        let taken = std::mem::replace(c, ColAcc::new(dt)?);
+        let field = schema.field(i);
+        let taken = std::mem::replace(c, ColAcc::new(field)?);
         arrays.push(taken.finish());
     }
     RecordBatch::try_new(schema, arrays).ok()
@@ -944,13 +1036,104 @@ mod tests {
 
     #[test]
     fn reject_unsupported_column_type() {
-        // Timestamp is deliberately out of scope for the fast path.
+        // Date32 is deliberately out of scope for the fast path (no in-scanner
+        // date parser); it must still route to the slow path.
+        let s = Schema::new(vec![Field::new("d", DataType::Date32, true)]);
+        assert!(scan("INSERT INTO t (d) VALUES ('2020-01-01')", &s, &[0]).is_none());
+    }
+
+    #[test]
+    fn reject_plain_largebinary_without_jsonb_marker() {
+        // Plain LargeBinary (non-JSONB BYTEA-large) needs bytea coercion the
+        // scanner doesn't replicate → slow path.
+        let s = Schema::new(vec![Field::new("b", DataType::LargeBinary, true)]);
+        assert!(scan("INSERT INTO t (b) VALUES ('\\xdead')", &s, &[0]).is_none());
+    }
+
+    fn jsonb_field(name: &str) -> Field {
+        let mut md = std::collections::HashMap::new();
+        md.insert(
+            crate::types::BASIN_TYPE_KEY.to_string(),
+            crate::types::BASIN_TYPE_JSONB.to_string(),
+        );
+        Field::new(name, DataType::LargeBinary, true).with_metadata(md)
+    }
+
+    #[test]
+    fn jsonb_canonical_bytes_match_helper() {
+        let s = Schema::new(vec![jsonb_field("j")]);
+        let b = scan(
+            "INSERT INTO t (j) VALUES ('{\"b\":1,\"a\":2}'),(NULL)",
+            &s,
+            &[0],
+        )
+        .expect("should parse");
+        let arr = b[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::LargeBinaryArray>()
+            .unwrap();
+        // Canonical form sorts object keys: {"a":2,"b":1}.
+        let expected = crate::dml::coerce_jsonb_str("{\"b\":1,\"a\":2}", "j").unwrap();
+        assert_eq!(arr.value(0), expected.as_slice());
+        assert!(arr.is_null(1));
+    }
+
+    #[test]
+    fn jsonb_invalid_json_declines() {
+        let s = Schema::new(vec![jsonb_field("j")]);
+        // Not valid JSON (bare identifier) → scanner declines so the slow path
+        // surfaces the canonical error.
+        assert!(scan("INSERT INTO t (j) VALUES ('{not json}')", &s, &[0]).is_none());
+    }
+
+    #[test]
+    fn jsonb_rejects_non_string_cell() {
+        let s = Schema::new(vec![jsonb_field("j")]);
+        assert!(scan("INSERT INTO t (j) VALUES (42)", &s, &[0]).is_none());
+    }
+
+    #[test]
+    fn timestamp_string_and_epoch_forms() {
         let s = Schema::new(vec![Field::new(
             "ts",
-            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Microsecond, None),
             true,
         )]);
-        assert!(scan("INSERT INTO t (ts) VALUES ('2020-01-01')", &s, &[0]).is_none());
+        let b = scan(
+            "INSERT INTO t (ts) VALUES ('2020-01-01T00:00:00Z'),('2021-06-15 12:30:00'),(1000000),(NULL)",
+            &s,
+            &[0],
+        )
+        .expect("should parse");
+        let arr = b[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(arr.value(0), crate::dml::parse_timestamp_string("2020-01-01T00:00:00Z").unwrap());
+        assert_eq!(arr.value(1), crate::dml::parse_timestamp_string("2021-06-15 12:30:00").unwrap());
+        assert_eq!(arr.value(2), 1_000_000);
+        assert!(arr.is_null(3));
+    }
+
+    #[test]
+    fn timestamp_unparseable_declines() {
+        let s = Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        )]);
+        assert!(scan("INSERT INTO t (ts) VALUES ('not a date')", &s, &[0]).is_none());
+    }
+
+    #[test]
+    fn timestamp_tz_carried_into_array_type() {
+        let dt = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        let s = Schema::new(vec![Field::new("ts", dt.clone(), true)]);
+        let b = scan("INSERT INTO t (ts) VALUES ('2020-01-01T00:00:00Z')", &s, &[0])
+            .expect("should parse");
+        assert_eq!(b[0].column(0).data_type(), &dt);
     }
 
     #[test]
