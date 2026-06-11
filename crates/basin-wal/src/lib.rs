@@ -5,7 +5,10 @@
 //! v0.1: **single-node, file-backed** ([`LocalWal`]). Per-project +
 //! per-partition append-only log. Background batched flush to object storage
 //! every 200 ms or 1 MB, whichever first. Recovery on startup replays from
-//! object storage.
+//! object storage. Synchronous commit ([`Wal::append_fenced_durable`])
+//! group-commits: the ack waits for the segment PUT (+fsync on the local
+//! backend via [`FsyncOnPut`]), with concurrent waiters coalesced into one
+//! upload per [`WalConfig::commit_delay`] window.
 //!
 //! v0.2 (scaffolded): Raft replication via [`RaftWal`]. Trait + stub ship
 //! today; real raft integration is gated on a library-choice ADR. See
@@ -308,6 +311,25 @@ pub struct WalConfig {
     pub flush_interval: Duration,
     /// Flush after this many bytes accumulate, even if the timer hasn't fired.
     pub flush_max_bytes: u64,
+    /// Group-commit coalescing window. When a synchronous
+    /// ([`Wal::append_fenced_durable`]) append nudges the flusher, the
+    /// flusher sleeps this long before draining so concurrent synchronous
+    /// appends share one segment PUT (+ one fsync on the local backend).
+    /// Default 2 ms (`BASIN_WAL_COMMIT_DELAY_MS`); `0` disables coalescing
+    /// (flush immediately on nudge). See [`WalConfig::default_commit_delay`].
+    pub commit_delay: Duration,
+}
+
+impl WalConfig {
+    /// Default group-commit coalescing window: `BASIN_WAL_COMMIT_DELAY_MS`
+    /// when set and parseable, else 2 ms.
+    pub fn default_commit_delay() -> Duration {
+        let ms = std::env::var("BASIN_WAL_COMMIT_DELAY_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(2);
+        Duration::from_millis(ms)
+    }
 }
 
 impl Default for WalConfig {
@@ -317,6 +339,7 @@ impl Default for WalConfig {
             root_prefix: None,
             flush_interval: Duration::from_millis(200),
             flush_max_bytes: 1024 * 1024,
+            commit_delay: Self::default_commit_delay(),
         }
     }
 }
@@ -338,14 +361,22 @@ fn panic_no_default_object_store() -> Arc<dyn ObjectStore> {
 pub trait Wal: Send + Sync + std::fmt::Debug {
     /// Append `payload` for `(project, partition)`.
     ///
-    /// ## Durability contract
+    /// ## Durability contract (async path — `synchronous_commit = off`)
     ///
-    /// The entry is guaranteed to be **in the in-RAM buffer** when this returns.
-    /// It becomes crash-durable once it has been uploaded to the backing store
-    /// (local fsync or S3 PUT), which happens on the next background flush
-    /// (`flush_interval`), under buffer-pressure (`flush_max_bytes`), or on an
-    /// explicit [`Self::flush`] call. Callers that need crash-durable acks
-    /// must call `flush()` before confirming to the client.
+    /// The entry is guaranteed to be **in the in-RAM buffer** when this
+    /// returns — the ack happens *before* durability. It becomes durable
+    /// once it has been uploaded to the backing store, which happens on the
+    /// next background flush (`flush_interval`, default 200 ms), under
+    /// buffer-pressure (`flush_max_bytes`, default 1 MiB), or on an explicit
+    /// [`Self::flush`] call. The crash-loss window is therefore
+    /// `min(flush_interval, time-to-1MiB)` of acked appends.
+    ///
+    /// Note the backend nuance: an S3-style PUT is durable on success, but
+    /// `LocalFileSystem`'s PUT is a write + rename with **no fsync** — it
+    /// survives a process crash, not necessarily a power loss. Callers that
+    /// need ack-after-durable semantics use [`Self::append_fenced_durable`],
+    /// which additionally fsyncs on the local backend when the store is
+    /// wrapped in [`FsyncOnPut`].
     ///
     /// For `RaftWal` (v0.2+) the entry is durable on quorum ack before return.
     async fn append(
@@ -377,6 +408,39 @@ pub trait Wal: Send + Sync + std::fmt::Debug {
     ) -> Result<Lsn> {
         let _ = epoch;
         self.append(project, partition, payload).await
+    }
+
+    /// Synchronous-commit append (`SET basin.synchronous_commit = on`).
+    ///
+    /// ## Durability contract (sync path)
+    ///
+    /// Identical to [`Self::append_fenced`] except the call only returns
+    /// once the entry's segment has been **uploaded to the backing store**
+    /// — ack-after-durable. On the local backend, if the store is wrapped
+    /// in [`FsyncOnPut`], the segment file and its parent directory are
+    /// also fsync'd before the ack, closing the power-loss window.
+    ///
+    /// Concurrent synchronous appends are **group-committed**: the flusher
+    /// coalesces every append that lands within [`WalConfig::commit_delay`]
+    /// (default 2 ms) into one segment PUT (+ one fsync), and a single
+    /// completed PUT wakes every waiter it covers. Expected added latency
+    /// per synchronous append: `commit_delay` + one local PUT + one fsync —
+    /// low single-digit milliseconds on local disk.
+    ///
+    /// Plain async appends are unaffected: they never wait and their
+    /// segments are never fsync'd.
+    ///
+    /// Default implementation delegates to [`Self::append_fenced`] so
+    /// backends that are already durable-on-ack ([`RaftWal`]: quorum ack)
+    /// stay correct without an override.
+    async fn append_fenced_durable(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        payload: Bytes,
+        epoch: Option<i64>,
+    ) -> Result<Lsn> {
+        self.append_fenced(project, partition, payload, epoch).await
     }
 
     /// Force a synchronous flush of any queued segments to durable storage.
@@ -514,9 +578,12 @@ pub trait Wal: Send + Sync + std::fmt::Debug {
 /// Single-node, file-backed WAL. Cheap to clone (`Arc` inside); share across
 /// the shard owner's tasks.
 ///
-/// "Durable" today = local file fsync + queued for object-storage flush;
-/// once Raft lands (v0.2) the [`RaftWal`] type provides quorum-ack
-/// durability behind the same [`Wal`] trait.
+/// Durability is two-tier: [`Wal::append`] acks from the in-RAM buffer
+/// (durable on the next flush — ack-before-durable), while
+/// [`Wal::append_fenced_durable`] group-commits and only acks after the
+/// segment PUT (+fsync via [`FsyncOnPut`] on the local backend) —
+/// ack-after-durable. Once Raft lands (v0.2) the [`RaftWal`] type provides
+/// quorum-ack durability behind the same [`Wal`] trait.
 #[derive(Clone)]
 pub struct LocalWal {
     inner: Arc<dyn WalImpl>,
@@ -573,6 +640,28 @@ impl Wal for LocalWal {
         // Mirror the counter bookkeeping of the unfenced path; a rejected
         // (fenced-out) append returns Err above and never reaches here, so
         // stale-epoch writes are correctly excluded from the per-project rollup.
+        if let Some(reg) = self.project_counters.get() {
+            let tc = reg.for_project(project);
+            tc.record_op();
+            tc.record_bytes_written(bytes);
+        }
+        Ok(lsn)
+    }
+
+    async fn append_fenced_durable(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        payload: Bytes,
+        epoch: Option<i64>,
+    ) -> Result<Lsn> {
+        let bytes = payload.len() as u64;
+        let lsn = self
+            .inner
+            .append_fenced_durable(project, partition, payload, epoch)
+            .await?;
+        // Same per-project rollup as the async paths: an append is one op
+        // regardless of its durability mode.
         if let Some(reg) = self.project_counters.get() {
             let tc = reg.for_project(project);
             tc.record_op();
@@ -697,6 +786,18 @@ pub(crate) trait WalImpl: Send + Sync {
         let _ = epoch;
         self.append(project, partition, payload).await
     }
+    /// Synchronous-commit (group-commit) append; see
+    /// [`Wal::append_fenced_durable`]. Default delegates to
+    /// [`Self::append_fenced`] for backends already durable on ack.
+    async fn append_fenced_durable(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        payload: Bytes,
+        epoch: Option<i64>,
+    ) -> Result<Lsn> {
+        self.append_fenced(project, partition, payload, epoch).await
+    }
     async fn flush(&self) -> Result<()>;
     async fn read_from(
         &self,
@@ -753,8 +854,10 @@ pub(crate) trait WalImpl: Send + Sync {
 }
 
 mod file_wal;
+mod fsync;
 mod raft_wal;
 mod segment;
 mod state;
 
+pub use fsync::{DurablePut, FsyncOnPut};
 pub use raft_wal::{BasinRaftRequest, BasinRaftResponse, RaftWal, RaftWalConfig, SimCluster};

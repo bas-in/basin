@@ -490,10 +490,33 @@ pub struct ProjectHandle {
 }
 
 impl ProjectHandle {
-    /// Append a batch into this project's table. Durable when this returns
-    /// (WAL committed). The batch is ack'd before it has reached Parquet.
+    /// Append a batch into this project's table under the **async** WAL
+    /// contract (`synchronous_commit = off`, the default): the write is
+    /// ack'd once it sits in the WAL's in-RAM buffer and becomes durable on
+    /// the next WAL flush (200 ms tick / 1 MiB pressure / explicit flush).
+    /// The batch is ack'd before it has reached Parquet.
     pub async fn write_batch(&self, table: &TableName, batch: RecordBatch) -> Result<()> {
         self.inner.write_batch(table, batch).await
+    }
+
+    /// [`Self::write_batch`] with an explicit durability mode. `durable =
+    /// false` is exactly `write_batch`. `durable = true` is the
+    /// `synchronous_commit = on` path: the call only returns once the WAL
+    /// has group-committed the entry to the backing store (segment PUT, plus
+    /// fsync on an `FsyncOnPut`-wrapped local store) — ack-after-durable.
+    /// The executor passes the session's `basin.synchronous_commit` value
+    /// here.
+    pub async fn write_batch_opts(
+        &self,
+        table: &TableName,
+        batch: RecordBatch,
+        durable: bool,
+    ) -> Result<()> {
+        if durable {
+            self.inner.write_batch_durable(table, batch).await
+        } else {
+            self.inner.write_batch(table, batch).await
+        }
     }
 
     /// Read all rows currently visible for a table — both the in-RAM tail
@@ -700,6 +723,13 @@ pub(crate) trait ShardImpl: Send + Sync {
 #[async_trait]
 pub(crate) trait ProjectHandleImpl: Send + Sync {
     async fn write_batch(&self, table: &TableName, batch: RecordBatch) -> Result<()>;
+    /// Synchronous-commit variant of [`Self::write_batch`]: only returns
+    /// once the WAL append is durable on the backing store (group-commit).
+    /// Default delegates to `write_batch` so backends whose plain append is
+    /// already durable-on-ack need no override.
+    async fn write_batch_durable(&self, table: &TableName, batch: RecordBatch) -> Result<()> {
+        self.write_batch(table, batch).await
+    }
     async fn read(
         &self,
         table: &TableName,

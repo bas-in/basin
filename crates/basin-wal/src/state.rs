@@ -77,6 +77,30 @@ pub(crate) struct PartitionState {
     /// range scan. Two segments cannot share a `first_lsn` so a `BTreeMap`
     /// is sufficient.
     pub closed: BTreeMap<Lsn, ClosedSegment>,
+    /// Highest LSN known durable on the backing store: every record with
+    /// `lsn <= durable_lsn` has been PUT to object storage (and, when a
+    /// synchronous-commit waiter requested it on the local backend, fsync'd
+    /// via the [`crate::FsyncOnPut`] wrapper). Advanced only contiguously —
+    /// see `pending_durable`.
+    pub durable_lsn: Lsn,
+    /// Watch channel that publishes `durable_lsn` advances. Synchronous
+    /// (group-commit) appenders subscribe and wait until the published value
+    /// reaches their own LSN; one segment PUT wakes every waiter whose LSN
+    /// it covers.
+    pub durable_tx: tokio::sync::watch::Sender<Lsn>,
+    /// Highest LSN any synchronous-commit appender has asked to be made
+    /// durable. The flusher fsyncs a drained segment iff this is >= the
+    /// segment's `first_lsn` — i.e. some waiter's record may be inside it.
+    /// Plain async appends never raise it, so their segments are never
+    /// fsync'd (async-path behaviour unchanged).
+    pub sync_requested_up_to: Lsn,
+    /// Segment LSN ranges (`first_lsn -> last_lsn`) whose PUT (+fsync, if
+    /// requested) completed but whose range is not yet contiguous with
+    /// `durable_lsn`. Guards against two in-flight flushes completing out of
+    /// order: a higher segment finishing first must not publish a
+    /// `durable_lsn` that covers a lower, still-in-flight (and possibly
+    /// failing) segment.
+    pub pending_durable: BTreeMap<Lsn, Lsn>,
     /// Phase 6.X.A — highest lease epoch ever observed on a fenced append for
     /// this partition (ADR 0023). Monotonic: once a higher-epoch holder
     /// appends, any later append carrying a strictly lower epoch is rejected
@@ -88,6 +112,7 @@ pub(crate) struct PartitionState {
 
 impl PartitionState {
     pub fn new(project: ProjectId, partition: PartitionKey) -> Self {
+        let (durable_tx, _durable_rx) = tokio::sync::watch::channel(Lsn::ZERO);
         Self {
             project,
             partition,
@@ -95,8 +120,34 @@ impl PartitionState {
             buffer: Vec::new(),
             buffer_bytes: 0,
             closed: BTreeMap::new(),
+            durable_lsn: Lsn::ZERO,
+            durable_tx,
+            sync_requested_up_to: Lsn::ZERO,
+            pending_durable: BTreeMap::new(),
             fence_epoch: 0,
         }
+    }
+
+    /// Record that the LSN range `[first, last]` is now durable on the
+    /// backing store and advance `durable_lsn` over every contiguous
+    /// completed range, publishing the new value to waiters. Ranges that
+    /// complete out of order park in `pending_durable` until the gap below
+    /// them closes.
+    pub fn mark_range_durable(&mut self, first: Lsn, last: Lsn) {
+        self.pending_durable.insert(first, last);
+        while let Some((&f, &l)) = self.pending_durable.first_key_value() {
+            if f.0 <= self.durable_lsn.0 + 1 {
+                if l > self.durable_lsn {
+                    self.durable_lsn = l;
+                }
+                self.pending_durable.remove(&f);
+            } else {
+                break;
+            }
+        }
+        // `send_replace` never fails (works with zero receivers), unlike
+        // `send`, which errors once the last receiver drops.
+        self.durable_tx.send_replace(self.durable_lsn);
     }
 
     /// Maximum LSN known to this partition: the last buffered record's LSN, or

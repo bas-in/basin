@@ -2644,10 +2644,18 @@ struct InProcessProjectHandle {
     draining: DrainingSet,
 }
 
-#[async_trait]
-impl ProjectHandleImpl for InProcessProjectHandle {
-    #[instrument(skip(self, batch), fields(project = %self.project, partition = %self.partition, table = %table, rows = batch.num_rows()))]
-    async fn write_batch(&self, table: &TableName, batch: RecordBatch) -> Result<()> {
+impl InProcessProjectHandle {
+    /// Shared core of `write_batch` (async ack) and `write_batch_durable`
+    /// (synchronous_commit = on). Identical except for the WAL append mode:
+    /// `durable` routes through `Wal::append_fenced_durable`, which
+    /// group-commits and only returns once the entry is durable on the
+    /// backing store.
+    async fn write_batch_inner(
+        &self,
+        table: &TableName,
+        batch: RecordBatch,
+        durable: bool,
+    ) -> Result<()> {
         // Phase 6.X.C: short-circuit if this partition is mid-handoff.
         // The router treats `LeaseHandoffInProgress` as retryable: it
         // invalidates its lease cache for the partition and retries against
@@ -2669,11 +2677,17 @@ impl ProjectHandleImpl for InProcessProjectHandle {
             let held = self.held_leases.lock().await;
             held.get(&(self.project, self.partition.clone())).copied()
         };
-        let lsn = self
-            .cfg
-            .wal
-            .append_fenced(&self.project, &self.partition, payload, epoch)
-            .await?;
+        let lsn = if durable {
+            self.cfg
+                .wal
+                .append_fenced_durable(&self.project, &self.partition, payload, epoch)
+                .await?
+        } else {
+            self.cfg
+                .wal
+                .append_fenced(&self.project, &self.partition, payload, epoch)
+                .await?
+        };
 
         let mut guard = self.state.write().await;
         guard
@@ -2687,6 +2701,19 @@ impl ProjectHandleImpl for InProcessProjectHandle {
             .or_insert_with(|| batch.schema());
         guard.touch();
         Ok(())
+    }
+}
+
+#[async_trait]
+impl ProjectHandleImpl for InProcessProjectHandle {
+    #[instrument(skip(self, batch), fields(project = %self.project, partition = %self.partition, table = %table, rows = batch.num_rows()))]
+    async fn write_batch(&self, table: &TableName, batch: RecordBatch) -> Result<()> {
+        self.write_batch_inner(table, batch, false).await
+    }
+
+    #[instrument(skip(self, batch), fields(project = %self.project, partition = %self.partition, table = %table, rows = batch.num_rows()))]
+    async fn write_batch_durable(&self, table: &TableName, batch: RecordBatch) -> Result<()> {
+        self.write_batch_inner(table, batch, true).await
     }
 
     #[instrument(skip(self, opts), fields(project = %self.project, partition = %self.partition, table = %table))]
@@ -3569,6 +3596,7 @@ mod tests {
                 root_prefix: None,
                 flush_interval: Duration::from_millis(50),
                 flush_max_bytes: 1024 * 1024,
+                commit_delay: Duration::from_millis(2),
             })
             .await
             .unwrap(),
@@ -3612,6 +3640,98 @@ mod tests {
 
         let read = handle.read(&table, ReadOptions::default()).await.unwrap();
         assert_eq!(rows_in(&read), 30);
+    }
+
+    /// `write_batch_opts(durable = true)` (`basin.synchronous_commit = on`)
+    /// must route through `Wal::append_fenced_durable`: the WAL entry is on
+    /// the backing store when the call returns — provable by reopening a
+    /// second WAL over the same directory with **no** flush/close on the
+    /// first. The async `write_batch` keeps ack-before-durable: the same
+    /// reopen sees nothing until an explicit flush.
+    #[tokio::test]
+    async fn write_batch_durable_is_on_store_before_ack() {
+        basin_common::telemetry::try_init_for_tests();
+        let storage_dir = TempDir::new().unwrap();
+        let wal_dir = TempDir::new().unwrap();
+        let storage = Storage::new(StorageConfig {
+            object_store: Arc::new(
+                LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap(),
+            ),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let catalog = Arc::new(InMemoryCatalog::new());
+        // Background ticks disabled so durability can only come from the
+        // synchronous (group-commit) path, never from a racing 50 ms tick.
+        let wal: Arc<dyn Wal> = Arc::new(
+            LocalWal::open(WalConfig {
+                object_store: Arc::new(
+                    LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap(),
+                ),
+                root_prefix: None,
+                flush_interval: Duration::from_secs(3600),
+                flush_max_bytes: u64::MAX,
+                commit_delay: Duration::from_millis(1),
+            })
+            .await
+            .unwrap(),
+        );
+        let shard = crate::Shard::new(ShardConfig::new(storage, catalog, wal.clone()));
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+        let table = TableName::new("events").unwrap();
+        let handle = shard.get(&project, &partition).await.unwrap();
+
+        // Async write first: ack'd from RAM, invisible to a reopened WAL.
+        handle
+            .write_batch_opts(&table, batch(0, 1, "async-"), false)
+            .await
+            .unwrap();
+        let reopen = |dir: std::path::PathBuf| async move {
+            LocalWal::open(WalConfig {
+                object_store: Arc::new(LocalFileSystem::new_with_prefix(dir).unwrap()),
+                root_prefix: None,
+                flush_interval: Duration::from_secs(3600),
+                flush_max_bytes: u64::MAX,
+                commit_delay: Duration::from_millis(1),
+            })
+            .await
+            .unwrap()
+        };
+        {
+            let crash_view = reopen(wal_dir.path().to_path_buf()).await;
+            let entries = crash_view
+                .read_from(&project, &partition, basin_wal::Lsn::ZERO)
+                .await
+                .unwrap();
+            assert!(
+                entries.is_empty(),
+                "async write_batch must be ack-before-durable (in-RAM only)"
+            );
+            crash_view.close().await.unwrap();
+        }
+
+        // Durable write: must be on the store the moment the call returns.
+        handle
+            .write_batch_opts(&table, batch(100, 1, "sync-"), true)
+            .await
+            .unwrap();
+        {
+            let crash_view = reopen(wal_dir.path().to_path_buf()).await;
+            let entries = crash_view
+                .read_from(&project, &partition, basin_wal::Lsn::ZERO)
+                .await
+                .unwrap();
+            // The durable append's group-committed segment drains the whole
+            // buffer, so the earlier async entry rides along: 2 entries.
+            assert_eq!(
+                entries.len(),
+                2,
+                "durable write_batch must be on the backing store before ack"
+            );
+            crash_view.close().await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -3795,6 +3915,7 @@ mod tests {
             root_prefix: None,
             flush_interval: Duration::from_millis(50),
             flush_max_bytes: 1024 * 1024,
+            commit_delay: Duration::from_millis(2),
         };
 
         let project = ProjectId::new();
@@ -3955,6 +4076,7 @@ mod tests {
                 root_prefix: None,
                 flush_interval: Duration::from_millis(50),
                 flush_max_bytes: 1024 * 1024,
+                commit_delay: Duration::from_millis(2),
             })
             .await
             .unwrap(),
@@ -4102,6 +4224,7 @@ mod tests {
                 root_prefix: None,
                 flush_interval: Duration::from_millis(50),
                 flush_max_bytes: 1024 * 1024,
+                commit_delay: Duration::from_millis(2),
             })
             .await
             .unwrap(),
@@ -4355,6 +4478,7 @@ mod tests {
                     root_prefix: None,
                     flush_interval: Duration::from_millis(50),
                     flush_max_bytes: 1024 * 1024,
+                    commit_delay: Duration::from_millis(2),
                 })
                 .await
                 .unwrap(),
@@ -4455,6 +4579,7 @@ mod tests {
                 root_prefix: None,
                 flush_interval: Duration::from_millis(50),
                 flush_max_bytes: 1024 * 1024,
+                commit_delay: Duration::from_millis(2),
             })
             .await
             .unwrap(),
@@ -4518,6 +4643,7 @@ mod tests {
                 root_prefix: None,
                 flush_interval: Duration::from_millis(50),
                 flush_max_bytes: 1024 * 1024,
+                commit_delay: Duration::from_millis(2),
             })
             .await
             .unwrap(),
@@ -4570,6 +4696,7 @@ mod tests {
                 root_prefix: None,
                 flush_interval: Duration::from_millis(50),
                 flush_max_bytes: 1024 * 1024,
+                commit_delay: Duration::from_millis(2),
             })
             .await
             .unwrap(),

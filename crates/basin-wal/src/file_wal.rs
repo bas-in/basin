@@ -11,22 +11,41 @@
 //! record is a [`SegmentHeader`]; subsequent records are payload entries. See
 //! [`crate::segment`] for the wire format.
 //!
-//! ## Durability guarantee
+//! ## Durability contract
 //!
-//! `append` returns once the entry is in the in-RAM buffer for its
-//! `(project, partition)`. The buffer is uploaded to the configured
-//! [`ObjectStore`] either:
+//! Two append modes share the same buffer, LSN space, and flusher:
 //!
-//! 1. when the background flush task wakes (every `flush_interval`), or
-//! 2. when the buffer's accumulated size exceeds `flush_max_bytes`, or
+//! **Async** (`append` / `append_fenced`, the `synchronous_commit = off`
+//! default): returns once the entry is in the in-RAM buffer for its
+//! `(project, partition)` — ack-before-durable. The buffer is uploaded to
+//! the configured [`ObjectStore`] either:
+//!
+//! 1. when the background flush task wakes (every `flush_interval`,
+//!    default 200 ms), or
+//! 2. when the buffer's accumulated size exceeds `flush_max_bytes`
+//!    (default 1 MiB), or
 //! 3. on an explicit [`crate::Wal::flush`] call.
 //!
-//! With [`object_store::local::LocalFileSystem`], a successful PUT is an
-//! `fsync`'d file on disk; with the S3 backend it is a durable PUT. Either
-//! way the entry only survives a process crash *after* it has been uploaded
-//! — v0.1 does not stage writes to a separate local-disk log first. The
-//! shard owner that wraps this knows the trade-off; v0.2 (Raft) closes the
-//! gap.
+//! The crash-loss window for acked-but-unflushed async appends is therefore
+//! `min(flush_interval, time-to-flush_max_bytes)`.
+//!
+//! **Synchronous** (`append_fenced_durable`, `synchronous_commit = on`):
+//! buffers the entry exactly like the async path, nudges the flusher, and
+//! only returns once the partition's published `durable_lsn` covers the
+//! entry — ack-after-durable. The flusher coalesces every synchronous
+//! append that lands within `commit_delay` (default 2 ms) into one segment,
+//! so N concurrent synchronous appends cost one PUT (+ one fsync): group
+//! commit.
+//!
+//! Backend durability nuance: an S3-style PUT is durable on success, but
+//! [`object_store::local::LocalFileSystem`]'s PUT is write-temp + rename
+//! with **no fsync** — it survives a process crash, not necessarily an OS
+//! crash or power loss. When a flushed segment carries at least one
+//! synchronous waiter, the flusher marks the PUT with [`crate::DurablePut`]
+//! so a [`crate::FsyncOnPut`]-wrapped local store fsyncs the segment file
+//! and its parent directory before the waiters are released. Segments with
+//! no synchronous waiters are never fsync'd — the async path's cost profile
+//! is unchanged. v0.2 (Raft) replaces all of this with quorum-ack.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,10 +57,11 @@ use bytes::Bytes;
 use chrono::Utc;
 use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
-use tokio::sync::{watch, Mutex, RwLock};
+use object_store::{ObjectStore, ObjectStoreExt, PutOptions, PutPayload};
+use tokio::sync::{watch, Mutex, Notify, RwLock};
 use ulid::Ulid;
 
+use crate::fsync::DurablePut;
 use crate::segment::{
     decode_segment, decode_segment_full, entry_record, frame_into, handoff_record,
     tx_begin_record, tx_commit_record, tx_rollback_record, DecodedRecord, EntryRecord,
@@ -64,6 +84,10 @@ struct Inner {
     object_store: Arc<dyn ObjectStore>,
     root_prefix: Option<ObjectPath>,
     flush_max_bytes: u64,
+    /// Nudged by synchronous (`append_fenced_durable`) appends so the flush
+    /// loop can group-commit after `commit_delay` instead of waiting out the
+    /// full `flush_interval` tick.
+    flush_notify: Notify,
     /// Outer lock is brief — only held for hashmap lookup/insert. Per-partition
     /// work serialises on the inner mutex so two partitions can flush in
     /// parallel.
@@ -86,6 +110,7 @@ impl FileWal {
             root_prefix,
             flush_interval,
             flush_max_bytes,
+            commit_delay,
         } = cfg;
 
         let partitions = recover_partitions(&object_store, root_prefix.as_ref()).await?;
@@ -94,17 +119,113 @@ impl FileWal {
             object_store,
             root_prefix,
             flush_max_bytes,
+            flush_notify: Notify::new(),
             partitions: RwLock::new(partitions),
         });
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let flush_handle = spawn_flush_loop(inner.clone(), flush_interval, shutdown_rx);
+        let flush_handle =
+            spawn_flush_loop(inner.clone(), flush_interval, commit_delay, shutdown_rx);
 
         Ok(Self {
             inner,
             shutdown_tx,
             flush_task: Mutex::new(Some(flush_handle)),
         })
+    }
+
+    /// Shared core of `append_fenced` (async ack) and
+    /// `append_fenced_durable` (synchronous-commit ack). Both buffer the
+    /// entry identically; `durable` additionally registers a group-commit
+    /// waiter and blocks until the partition's published `durable_lsn`
+    /// covers the new entry.
+    async fn append_entry(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        payload: Bytes,
+        epoch: Option<i64>,
+        durable: bool,
+    ) -> Result<Lsn> {
+        // Pre-compute the timestamp and build the EntryRecord *before*
+        // acquiring the per-partition mutex. The timestamp is a syscall
+        // (clock_gettime); the record itself is copy-free — the payload is a
+        // refcounted `Bytes` that is moved, not memcopied. The only payload
+        // copy left on the write path is the single serialize into the
+        // segment buffer at flush time, which also runs outside this mutex.
+        //
+        // We construct the record with a placeholder LSN (Lsn(0)); the real LSN
+        // is stamped inside the lock where it is guaranteed monotonic.
+        let now = Utc::now();
+        // Approximate framed size: 4-byte length prefix + bincode body ≈ payload
+        // + ~64 bytes for project/partition/lsn/timestamp. Used only for the
+        // buffer-pressure heuristic; the real size is computed at flush time.
+        let approx = (payload.len() as u64) + 96;
+        let mut record = entry_record(project, partition, Lsn(0), payload, now);
+
+        let state = self.inner.get_or_create_partition(project, partition).await;
+        let (lsn, should_flush, durable_rx) = {
+            let mut guard = state.lock().await;
+            // Epoch fence (ADR 0023). `None` / `Some(0)` is the no-lease
+            // back-compat path: it never raises the fence and is always
+            // accepted. A real lease epoch must be >= the highest epoch this
+            // partition has seen; a strictly lower epoch is a stale
+            // dual-leaseholder write and is rejected before consuming an LSN.
+            if let Some(e) = epoch {
+                if e != 0 {
+                    if e < guard.fence_epoch {
+                        return Err(BasinError::wal(format!(
+                            "stale lease epoch {e} for {project}/{partition}: \
+                             fence is at {} (dual-leaseholder write rejected)",
+                            guard.fence_epoch
+                        )));
+                    }
+                    // Monotonically raise the fence to the winning epoch.
+                    guard.fence_epoch = e;
+                }
+            }
+            let lsn = guard.next_lsn;
+            guard.next_lsn = lsn.next();
+            // Stamp the real LSN — this is the only field that must be assigned
+            // under the lock to preserve the monotonic guarantee.
+            record.lsn = lsn;
+            guard.buffer.push(BufferRecord::Entry(record));
+            guard.buffer_bytes += approx;
+            let pressure = guard.buffer_bytes >= self.inner.flush_max_bytes;
+            // Synchronous commit: raise the fsync watermark and subscribe to
+            // durable-LSN publications under the same lock that assigned the
+            // LSN, so the flusher's needs_fsync decision can never miss us.
+            let rx = if durable {
+                if lsn > guard.sync_requested_up_to {
+                    guard.sync_requested_up_to = lsn;
+                }
+                Some(guard.durable_tx.subscribe())
+            } else {
+                None
+            };
+            (lsn, pressure, rx)
+        };
+        if should_flush {
+            // Buffer-pressure flush errors are logged but not surfaced: the
+            // entries remain in RAM and the next tick or explicit flush will
+            // retry. Tests and graceful shutdown call `flush()` to surface
+            // errors.
+            if let Err(e) = self.inner.flush_one(&state).await {
+                tracing::warn!(error = %e, "buffer-pressure flush failed");
+            }
+        }
+        if let Some(mut rx) = durable_rx {
+            // Nudge the flush loop (group-commit window starts now), then
+            // wait until the published durable watermark covers our LSN.
+            // One segment PUT (+fsync) wakes every waiter it covers. If a
+            // flush attempt fails, the buffer is restored and the next tick
+            // retries — we keep waiting: "durable" means durable.
+            self.inner.flush_notify.notify_one();
+            rx.wait_for(|durable| *durable >= lsn).await.map_err(|_| {
+                BasinError::wal("wal closed while a synchronous append awaited durability")
+            })?;
+        }
+        Ok(lsn)
     }
 }
 
@@ -156,7 +277,7 @@ impl Inner {
     /// strictly higher LSNs, so restoring the batch to the *front* of the
     /// buffer on failure preserves LSN order.
     async fn flush_one(&self, state: &Arc<Mutex<PartitionState>>) -> Result<()> {
-        let (header, drained, drained_bytes) = {
+        let (header, drained, drained_bytes, needs_fsync) = {
             let mut guard = state.lock().await;
             if guard.buffer.is_empty() {
                 return Ok(());
@@ -171,7 +292,14 @@ impl Inner {
             let drained: Vec<BufferRecord> = std::mem::take(&mut guard.buffer);
             let drained_bytes = guard.buffer_bytes;
             guard.buffer_bytes = 0;
-            (header, drained, drained_bytes)
+            // A synchronous-commit waiter's LSN can only be inside this
+            // segment if it is >= the segment's first LSN (every requested
+            // LSN below first_lsn was drained — and published durable — by
+            // an earlier flush). Computed under the same lock that assigns
+            // LSNs and raises `sync_requested_up_to`, so no waiter can slip
+            // between the drain and this decision.
+            let needs_fsync = guard.sync_requested_up_to >= header.first_lsn;
+            (header, drained, drained_bytes, needs_fsync)
         };
         // Lock released. While the flush is in flight the drained records are
         // visible neither in `buffer` nor in `closed` — identical to the
@@ -229,9 +357,18 @@ impl Inner {
             }
         };
 
+        // Segments that carry at least one synchronous-commit waiter are
+        // marked with `DurablePut` so an `FsyncOnPut`-wrapped local store
+        // fsyncs the segment file (+ parent dir) before returning. Stores
+        // that are durable on PUT (S3) or unwrapped ignore the extension —
+        // `object_store` backends ignore extensions by contract.
+        let mut put_opts = PutOptions::default();
+        if needs_fsync {
+            put_opts.extensions.insert(DurablePut);
+        }
         let put_result = self
             .object_store
-            .put(&path, PutPayload::from_bytes(Bytes::from(buf)))
+            .put_opts(&path, PutPayload::from_bytes(Bytes::from(buf)), put_opts)
             .await;
         match put_result {
             Ok(_) => {
@@ -245,12 +382,18 @@ impl Inner {
                         segment_id,
                     },
                 );
+                // Publish durable progress (group commit): one completed PUT
+                // wakes every synchronous waiter whose LSN it covers.
+                // Contiguity-gated so an out-of-order completion of a higher
+                // segment can't ack waiters in a lower, still-in-flight one.
+                guard.mark_range_durable(first_lsn, last_lsn);
                 tracing::debug!(
                     project = %guard.project,
                     partition = %guard.partition,
                     %first_lsn,
                     %last_lsn,
                     records = drained.len(),
+                    fsynced = needs_fsync,
                     "wal segment flushed",
                 );
                 Ok(())
@@ -280,12 +423,21 @@ async fn restore_buffer(
     guard.buffer_bytes += drained_bytes;
 }
 
-/// Background flush loop. Wakes on tick or shutdown; flushes every partition
-/// that has buffered entries. Errors are logged but don't kill the loop —
-/// the next tick retries, and explicit `flush()` callers see errors directly.
+/// Background flush loop. Wakes on tick, on a synchronous-commit nudge
+/// (`Inner::flush_notify`), or on shutdown; flushes every partition that has
+/// buffered entries. Errors are logged but don't kill the loop — the next
+/// tick retries (synchronous waiters keep waiting until a retry succeeds),
+/// and explicit `flush()` callers see errors directly.
+///
+/// On a nudge the loop sleeps `commit_delay` before draining so concurrent
+/// synchronous appends coalesce into one segment PUT — group commit.
+/// `Notify` stores a permit when nobody is parked on `notified()`, so a
+/// nudge that races an in-progress flush is never lost; it just triggers one
+/// extra (possibly empty, hence free) flush pass.
 fn spawn_flush_loop(
     inner: Arc<Inner>,
     flush_interval: Duration,
+    commit_delay: Duration,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -299,6 +451,16 @@ fn spawn_flush_loop(
                 _ = ticker.tick() => {
                     if let Err(e) = inner.flush_all().await {
                         tracing::warn!(error = %e, "wal background flush failed");
+                    }
+                }
+                _ = inner.flush_notify.notified() => {
+                    // Group-commit window: let concurrent synchronous
+                    // appends pile into the buffer before draining once.
+                    if commit_delay > Duration::ZERO {
+                        tokio::time::sleep(commit_delay).await;
+                    }
+                    if let Err(e) = inner.flush_all().await {
+                        tracing::warn!(error = %e, "wal group-commit flush failed");
                     }
                 }
                 _ = shutdown_rx.changed() => {
@@ -386,6 +548,12 @@ async fn recover_partitions(
         let next_lsn = segs.last().map(|s| Lsn(s.last_lsn.0 + 1)).unwrap_or(Lsn(1));
         let mut state = PartitionState::new(project, partition.clone());
         state.next_lsn = next_lsn;
+        // Everything in a closed segment is durable by definition (it was
+        // read back from the store). Seed the durable watermark so a
+        // synchronous append issued right after recovery doesn't wait on
+        // LSNs that were already persisted by the previous process.
+        state.durable_lsn = Lsn(next_lsn.0 - 1);
+        state.durable_tx.send_replace(state.durable_lsn);
         for s in segs {
             state.closed.insert(s.first_lsn, s);
         }
@@ -416,63 +584,20 @@ impl WalImpl for FileWal {
         payload: Bytes,
         epoch: Option<i64>,
     ) -> Result<Lsn> {
-        // Pre-compute the timestamp and build the EntryRecord *before*
-        // acquiring the per-partition mutex. The timestamp is a syscall
-        // (clock_gettime); the record itself is copy-free — the payload is a
-        // refcounted `Bytes` that is moved, not memcopied. The only payload
-        // copy left on the write path is the single serialize into the
-        // segment buffer at flush time, which also runs outside this mutex.
-        //
-        // We construct the record with a placeholder LSN (Lsn(0)); the real LSN
-        // is stamped inside the lock where it is guaranteed monotonic.
-        let now = Utc::now();
-        // Approximate framed size: 4-byte length prefix + bincode body ≈ payload
-        // + ~64 bytes for project/partition/lsn/timestamp. Used only for the
-        // buffer-pressure heuristic; the real size is computed at flush time.
-        let approx = (payload.len() as u64) + 96;
-        let mut record = entry_record(project, partition, Lsn(0), payload, now);
+        self.append_entry(project, partition, payload, epoch, false)
+            .await
+    }
 
-        let state = self.inner.get_or_create_partition(project, partition).await;
-        let (lsn, should_flush) = {
-            let mut guard = state.lock().await;
-            // Epoch fence (ADR 0023). `None` / `Some(0)` is the no-lease
-            // back-compat path: it never raises the fence and is always
-            // accepted. A real lease epoch must be >= the highest epoch this
-            // partition has seen; a strictly lower epoch is a stale
-            // dual-leaseholder write and is rejected before consuming an LSN.
-            if let Some(e) = epoch {
-                if e != 0 {
-                    if e < guard.fence_epoch {
-                        return Err(BasinError::wal(format!(
-                            "stale lease epoch {e} for {project}/{partition}: \
-                             fence is at {} (dual-leaseholder write rejected)",
-                            guard.fence_epoch
-                        )));
-                    }
-                    // Monotonically raise the fence to the winning epoch.
-                    guard.fence_epoch = e;
-                }
-            }
-            let lsn = guard.next_lsn;
-            guard.next_lsn = lsn.next();
-            // Stamp the real LSN — this is the only field that must be assigned
-            // under the lock to preserve the monotonic guarantee.
-            record.lsn = lsn;
-            guard.buffer.push(BufferRecord::Entry(record));
-            guard.buffer_bytes += approx;
-            let pressure = guard.buffer_bytes >= self.inner.flush_max_bytes;
-            (lsn, pressure)
-        };
-        if should_flush {
-            // Buffer-pressure flush errors are logged but not surfaced: the
-            // entries remain in RAM and the next tick or explicit flush will
-            // retry. Tests and graceful shutdown call `flush()` to surface
-            // errors.
-            if let Err(e) = self.inner.flush_one(&state).await {
-                tracing::warn!(error = %e, "buffer-pressure flush failed");
-            }
-        }
-        Ok(lsn)
+    #[tracing::instrument(skip(self, payload), fields(project=%project, partition=%partition, bytes=payload.len(), ?epoch))]
+    async fn append_fenced_durable(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        payload: Bytes,
+        epoch: Option<i64>,
+    ) -> Result<Lsn> {
+        self.append_entry(project, partition, payload, epoch, true)
+            .await
     }
 
     #[tracing::instrument(skip(self))]
@@ -830,6 +955,7 @@ mod tests {
             root_prefix: None,
             flush_interval: Duration::from_millis(50),
             flush_max_bytes: 1024 * 1024,
+            commit_delay: Duration::from_millis(2),
         }
     }
 
@@ -1304,12 +1430,17 @@ mod tests {
     /// on `put_started`, then either fails (when `fail_puts` is set) or parks
     /// until the `gate` semaphore grants a permit, then delegates to the inner
     /// store. Everything else delegates directly.
+    ///
+    /// Each PUT also records whether it carried the [`DurablePut`] extension
+    /// marker into `put_durability`, so tests can assert which flushes
+    /// requested an fsync (sync path) and which did not (async path).
     #[derive(Debug)]
     struct GatedStore {
         inner: Arc<dyn ObjectStore>,
         put_started: tokio::sync::mpsc::UnboundedSender<()>,
         gate: Arc<tokio::sync::Semaphore>,
         fail_puts: Arc<std::sync::atomic::AtomicBool>,
+        put_durability: Arc<std::sync::Mutex<Vec<bool>>>,
     }
 
     impl std::fmt::Display for GatedStore {
@@ -1326,6 +1457,10 @@ mod tests {
             payload: PutPayload,
             opts: object_store::PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
+            self.put_durability
+                .lock()
+                .unwrap()
+                .push(opts.extensions.get::<DurablePut>().is_some());
             let _ = self.put_started.send(());
             if self.fail_puts.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(object_store::Error::Generic {
@@ -1397,27 +1532,32 @@ mod tests {
         started_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
         gate: Arc<tokio::sync::Semaphore>,
         fail_puts: Arc<std::sync::atomic::AtomicBool>,
+        put_durability: Arc<std::sync::Mutex<Vec<bool>>>,
     }
 
     /// Open a WAL over a [`GatedStore`] with `initial_permits` on the PUT
-    /// gate. Background flushes are effectively disabled so the test fully
-    /// controls when PUTs happen.
+    /// gate. Background ticks are effectively disabled so the test fully
+    /// controls when PUTs happen; the group-commit nudge path
+    /// (`commit_delay` 1 ms) stays live so synchronous appends can flush.
     async fn gated_wal_in(dir: &TempDir, initial_permits: usize) -> GatedHarness {
         let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
         let (started_tx, started_rx) = tokio::sync::mpsc::unbounded_channel();
         let gate = Arc::new(tokio::sync::Semaphore::new(initial_permits));
         let fail_puts = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let put_durability = Arc::new(std::sync::Mutex::new(Vec::new()));
         let store = GatedStore {
             inner: Arc::new(fs),
             put_started: started_tx,
             gate: gate.clone(),
             fail_puts: fail_puts.clone(),
+            put_durability: put_durability.clone(),
         };
         let cfg = WalConfig {
             object_store: Arc::new(store),
             root_prefix: None,
             flush_interval: Duration::from_secs(3600),
             flush_max_bytes: u64::MAX,
+            commit_delay: Duration::from_millis(1),
         };
         let wal = LocalWal::open(cfg).await.unwrap();
         GatedHarness {
@@ -1425,6 +1565,7 @@ mod tests {
             started_rx,
             gate,
             fail_puts,
+            put_durability,
         }
     }
 
@@ -1519,6 +1660,221 @@ mod tests {
             assert_eq!(e.lsn, Lsn((i + 1) as u64));
         }
         h.wal.close().await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Synchronous-commit (group-commit) coverage: durable appends block until
+    // their segment is durable, concurrent durable appends coalesce into one
+    // PUT, the async path is byte-for-byte unchanged (no fsync marker, no
+    // waiting), and the FsyncOnPut wrapper fsyncs once per group.
+    // -----------------------------------------------------------------------
+
+    /// Count `.seg` files under `root`, recursively. Segments are the unit of
+    /// group commit: N coalesced durable appends share one segment.
+    fn count_seg_files(root: &std::path::Path) -> usize {
+        let mut n = 0;
+        let entries = match std::fs::read_dir(root) {
+            Ok(e) => e,
+            Err(_) => return 0,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                n += count_seg_files(&path);
+            } else if path.extension().is_some_and(|e| e == "seg") {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// A synchronous append must not ack until its segment PUT completes.
+    /// Deterministic: the PUT parks on the gate, so we can assert the append
+    /// is still blocked, then release the gate and assert it completes.
+    #[tokio::test]
+    async fn durable_append_blocks_until_segment_durable() {
+        let dir = TempDir::new().unwrap();
+        let mut h = gated_wal_in(&dir, 0).await;
+        let project = ProjectId::new();
+        let part = PartitionKey::default_key();
+
+        let wal2 = h.wal.clone();
+        let part2 = part.clone();
+        let append_task = tokio::spawn(async move {
+            wal2.append_fenced_durable(&project, &part2, payload(1), None)
+                .await
+        });
+
+        // The group-commit nudge wakes the flusher; its PUT parks on the gate.
+        tokio::time::timeout(Duration::from_secs(5), h.started_rx.recv())
+            .await
+            .expect("group-commit PUT never started")
+            .expect("put_started channel closed");
+
+        // The PUT is provably in flight but not complete — the durable
+        // append must still be blocked (ack-after-durable).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !append_task.is_finished(),
+            "durable append must not ack before its segment PUT completes"
+        );
+
+        // Release the PUT; the waiter must now be released with its LSN.
+        h.gate.add_permits(64);
+        let lsn = tokio::time::timeout(Duration::from_secs(5), append_task)
+            .await
+            .expect("durable append never completed after PUT was released")
+            .unwrap()
+            .unwrap();
+        assert_eq!(lsn, Lsn(1));
+
+        // The waiter-bearing segment requested the fsync pass.
+        assert!(
+            h.put_durability.lock().unwrap().iter().any(|d| *d),
+            "a segment carrying a synchronous waiter must request DurablePut"
+        );
+        h.wal.close().await.unwrap();
+    }
+
+    /// N concurrent synchronous appends inside one `commit_delay` window
+    /// must share segments: segment count << N, and every append is durable
+    /// (on disk) by the time it acks — no flush()/close() needed.
+    #[tokio::test]
+    async fn group_commit_coalesces_concurrent_durable_appends() {
+        const WRITERS: usize = 16;
+        let dir = TempDir::new().unwrap();
+        let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let cfg = WalConfig {
+            object_store: Arc::new(fs),
+            root_prefix: None,
+            // Ticks disabled: only the group-commit nudge can flush.
+            flush_interval: Duration::from_secs(3600),
+            flush_max_bytes: u64::MAX,
+            commit_delay: Duration::from_millis(25),
+        };
+        let wal = LocalWal::open(cfg).await.unwrap();
+        let project = ProjectId::new();
+        let part = PartitionKey::default_key();
+
+        let mut handles = Vec::new();
+        for i in 0..WRITERS {
+            let wal2 = wal.clone();
+            let part2 = part.clone();
+            handles.push(tokio::spawn(async move {
+                wal2.append_fenced_durable(&project, &part2, payload(i as u64), None)
+                    .await
+                    .unwrap()
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // Every append acked durable, so the segments are already on disk —
+        // count them BEFORE any flush/close.
+        let segs = count_seg_files(dir.path());
+        assert!(segs >= 1, "at least one segment must exist");
+        assert!(
+            segs <= WRITERS / 4,
+            "group commit must coalesce: {WRITERS} concurrent durable appends \
+             produced {segs} segments (expected <= {})",
+            WRITERS / 4
+        );
+
+        let all = wal.read_from(&project, &part, Lsn::ZERO).await.unwrap();
+        assert_eq!(all.len(), WRITERS, "every durable append must be readable");
+        wal.close().await.unwrap();
+    }
+
+    /// Async-path regression guard: plain appends never trigger a PUT by
+    /// themselves (ack-before-durable, loss window = flush tick / pressure),
+    /// and the segments they produce never carry the DurablePut fsync marker.
+    #[tokio::test]
+    async fn async_appends_never_request_fsync_and_never_block() {
+        let dir = TempDir::new().unwrap();
+        let h = gated_wal_in(&dir, 1024).await;
+        let project = ProjectId::new();
+        let part = PartitionKey::default_key();
+
+        for i in 1..=20u64 {
+            h.wal.append(&project, &part, payload(i)).await.unwrap();
+        }
+        // Acked from RAM: with ticks disabled and no pressure, zero PUTs so
+        // far — appends did not wait on storage.
+        assert!(
+            h.put_durability.lock().unwrap().is_empty(),
+            "async appends must not PUT (or block on storage) by themselves"
+        );
+
+        h.wal.flush().await.unwrap();
+        {
+            let puts = h.put_durability.lock().unwrap();
+            assert_eq!(puts.len(), 1, "one explicit flush => one segment PUT");
+            assert!(
+                puts.iter().all(|d| !*d),
+                "async-path segments must never request DurablePut/fsync"
+            );
+        }
+        h.wal.close().await.unwrap();
+    }
+
+    /// End-to-end over the real [`FsyncOnPut`] wrapper: one group of
+    /// concurrent durable appends costs ~one fsync, and later async-path
+    /// flushes leave the fsync counter untouched.
+    #[tokio::test]
+    async fn durable_group_over_fsync_wrapper_fsyncs_once() {
+        const WRITERS: usize = 8;
+        let dir = TempDir::new().unwrap();
+        let wrapper = Arc::new(crate::FsyncOnPut::new(Arc::new(
+            LocalFileSystem::new_with_prefix(dir.path()).unwrap(),
+        )));
+        let cfg = WalConfig {
+            object_store: wrapper.clone(),
+            root_prefix: None,
+            flush_interval: Duration::from_secs(3600),
+            flush_max_bytes: u64::MAX,
+            commit_delay: Duration::from_millis(25),
+        };
+        let wal = LocalWal::open(cfg).await.unwrap();
+        let project = ProjectId::new();
+        let part = PartitionKey::default_key();
+
+        let mut handles = Vec::new();
+        for i in 0..WRITERS {
+            let wal2 = wal.clone();
+            let part2 = part.clone();
+            handles.push(tokio::spawn(async move {
+                wal2.append_fenced_durable(&project, &part2, payload(i as u64), None)
+                    .await
+                    .unwrap()
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let group_fsyncs = wrapper.fsync_count();
+        assert!(group_fsyncs >= 1, "the durable group must fsync");
+        // Typically exactly 1; a straggler that misses the commit_delay
+        // window legitimately costs a second. Half the writer count is the
+        // "coalescing definitely happened" line that stays robust on a
+        // loaded CI box.
+        assert!(
+            group_fsyncs <= (WRITERS as u64) / 2,
+            "group commit must share the fsync: {WRITERS} durable appends \
+             cost {group_fsyncs} fsyncs"
+        );
+
+        // Async appends + explicit flush afterwards: no new fsyncs.
+        for i in 100..120u64 {
+            wal.append(&project, &part, payload(i)).await.unwrap();
+        }
+        wal.flush().await.unwrap();
+        assert_eq!(
+            wrapper.fsync_count(),
+            group_fsyncs,
+            "async-path flushes must not fsync"
+        );
+        wal.close().await.unwrap();
     }
 
     #[tokio::test]

@@ -273,6 +273,9 @@ async fn main() -> Result<()> {
                 root_prefix: cfg.wal_root_prefix.clone(),
                 flush_interval: std::time::Duration::from_millis(200),
                 flush_max_bytes: 1024 * 1024,
+                // Group-commit window for `SET basin.synchronous_commit = on`
+                // appends. Default 2 ms (`BASIN_WAL_COMMIT_DELAY_MS`).
+                commit_delay: basin_wal::WalConfig::default_commit_delay(),
             })
             .await
             .context("open WAL")?,
@@ -898,9 +901,17 @@ fn build_wal_object_store(cfg: &Cfg) -> Result<Arc<dyn ObjectStore>> {
                 backend = "local",
                 wal_dir = %cfg.wal_dir.display(),
                 root_prefix = ?cfg.wal_root_prefix,
+                fsync_on_durable_put = true,
                 "WAL object-store backend configured",
             );
-            Ok(Arc::new(fs))
+            // LocalFileSystem's PUT is write + rename with NO fsync, so a
+            // bare local store cannot honor `synchronous_commit = on` across
+            // a power loss. The FsyncOnPut wrapper fsyncs exactly the
+            // segment PUTs the WAL marks as carrying a synchronous-commit
+            // waiter (DurablePut extension); all other PUTs pass through
+            // untouched. The S3/Tigris backends below are durable on PUT
+            // and stay unwrapped.
+            Ok(Arc::new(basin_wal::FsyncOnPut::new(Arc::new(fs))))
         }
         "s3" | "tigris" => {
             let s3_cfg = basin_storage::backends::s3_compatible::S3LikeConfig::from_env()

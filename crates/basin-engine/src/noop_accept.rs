@@ -243,6 +243,11 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
                 || after_set.starts_with("STATEMENT_TIMEOUT")
                 || after_set.starts_with("LOCK_TIMEOUT")
                 || after_set.starts_with("IDLE_IN_TRANSACTION_SESSION_TIMEOUT")
+                // Durability knob: must reach the real handler — silently
+                // accepting SET basin.synchronous_commit would let a client
+                // believe it bought durability it did not get.
+                || after_set.starts_with("BASIN.SYNCHRONOUS_COMMIT")
+                || after_set.starts_with("SYNCHRONOUS_COMMIT")
             {
                 None // Let the real executor handler fire.
             } else {
@@ -262,6 +267,8 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
                 || trimmed == "SHOW STATEMENT_TIMEOUT"
                 || trimmed == "SHOW LOCK_TIMEOUT"
                 || trimmed == "SHOW IDLE_IN_TRANSACTION_SESSION_TIMEOUT"
+                || trimmed == "SHOW BASIN.SYNCHRONOUS_COMMIT"
+                || trimmed == "SHOW SYNCHRONOUS_COMMIT"
             {
                 None
             } else {

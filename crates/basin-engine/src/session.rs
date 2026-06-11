@@ -642,6 +642,19 @@ pub(crate) struct SessionState {
     pub(crate) idle_in_transaction_session_timeout:
         std::sync::Mutex<Option<std::time::Duration>>,
 
+    /// `SET basin.synchronous_commit = on|off` per-session durability mode.
+    ///
+    /// * `off` (default) — INSERTs on the shard path ack once the WAL has the
+    ///   entry in RAM (ack-before-durable; loss window = the WAL's flush
+    ///   tick / buffer-pressure bound).
+    /// * `on` — INSERTs only ack after the WAL group-commits the entry to
+    ///   the backing store (segment PUT + fsync on the local backend).
+    ///
+    /// Initialised from `BASIN_SYNCHRONOUS_COMMIT` (engine-wide default);
+    /// `AtomicBool` because the write path reads it on every statement and
+    /// needs no ordering relationship with other fields.
+    pub(crate) synchronous_commit: std::sync::atomic::AtomicBool,
+
     /// Timestamp of the last statement activity on this session. Updated by
     /// the executor at the start of every `execute()` call; the idle-in-txn
     /// reaper compares this against the current time.
@@ -726,6 +739,9 @@ impl SessionState {
             statement_timeout_ms: std::sync::atomic::AtomicI64::new(-1),
             lock_timeout: std::sync::Mutex::new(None),
             idle_in_transaction_session_timeout: std::sync::Mutex::new(None),
+            synchronous_commit: std::sync::atomic::AtomicBool::new(
+                synchronous_commit_env_default(),
+            ),
             last_active: std::sync::Mutex::new(std::time::Instant::now()),
             listen: std::sync::Mutex::new(ListenState::default()),
             table_meta_cache: TableMetaCache::new(),
@@ -1872,6 +1888,71 @@ pub(crate) fn set_session_idle_in_transaction_timeout(
         .idle_in_transaction_session_timeout
         .lock()
         .expect("idle_in_transaction_session_timeout lock poisoned") = d;
+}
+
+/// Engine-wide default for `basin.synchronous_commit`: `on` when
+/// `BASIN_SYNCHRONOUS_COMMIT` is set to a truthy value (`on`/`true`/`1`/
+/// `yes`), `off` otherwise. Read once per session at open; `SET
+/// basin.synchronous_commit` overrides it for the session.
+pub(crate) fn synchronous_commit_env_default() -> bool {
+    std::env::var("BASIN_SYNCHRONOUS_COMMIT")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "on" | "true" | "1" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Parse a Postgres boolean GUC value (`SET … = on|off|true|false|1|0|
+/// yes|no`, quoted or bare, case-insensitive). Errors on anything else so a
+/// typo'd `SET basin.synchronous_commit = onn` doesn't silently downgrade
+/// durability.
+pub(crate) fn parse_pg_bool(raw: &str) -> Result<bool> {
+    let trimmed = raw.trim().trim_matches('\'').trim_matches('"').trim();
+    match trimmed.to_ascii_lowercase().as_str() {
+        "on" | "true" | "1" | "yes" => Ok(true),
+        "off" | "false" | "0" | "no" => Ok(false),
+        other => Err(BasinError::InvalidSchema(format!(
+            "invalid boolean value: {other:?} (expected on/off/true/false/1/0/yes/no)"
+        ))),
+    }
+}
+
+/// Read the session's `basin.synchronous_commit` mode. `true` = INSERTs on
+/// the shard path ack only after the WAL group-commit is durable.
+pub(crate) fn session_synchronous_commit(state: &SessionState) -> bool {
+    state
+        .synchronous_commit
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set `basin.synchronous_commit` for this session.
+pub(crate) fn set_session_synchronous_commit(state: &SessionState, on: bool) {
+    state
+        .synchronous_commit
+        .store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `SHOW basin.synchronous_commit` rendering.
+pub(crate) fn show_synchronous_commit(state: &SessionState) -> &'static str {
+    if session_synchronous_commit(state) {
+        "on"
+    } else {
+        "off"
+    }
+}
+
+impl ProjectSession {
+    /// The session's `basin.synchronous_commit` mode. The executor's shard
+    /// INSERT path passes this to `ProjectHandle::write_batch_opts` so `on`
+    /// sessions get ack-after-durable (WAL group commit + fsync) and `off`
+    /// sessions keep the fast ack-before-durable default.
+    pub fn synchronous_commit(&self) -> bool {
+        session_synchronous_commit(&self.state)
+    }
 }
 
 /// Touch the session's last-active timestamp. Called at the start of every
@@ -5346,6 +5427,58 @@ mod tests {
             session_idle_in_transaction_timeout(&state),
             Some(Duration::from_secs(30))
         );
+    }
+
+    /// Serialises the env-mutating `basin.synchronous_commit` tests: env vars
+    /// are process-global, so two tests flipping `BASIN_SYNCHRONOUS_COMMIT`
+    /// concurrently would race each other's assertions.
+    static SYNC_COMMIT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn synchronous_commit_guc_accessor() {
+        let _env = SYNC_COMMIT_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("BASIN_SYNCHRONOUS_COMMIT");
+        let state = make_test_session_state();
+        assert!(
+            !session_synchronous_commit(&state),
+            "synchronous_commit must default to off"
+        );
+        set_session_synchronous_commit(&state, true);
+        assert!(session_synchronous_commit(&state));
+        assert_eq!(show_synchronous_commit(&state), "on");
+        set_session_synchronous_commit(&state, false);
+        assert!(!session_synchronous_commit(&state));
+        assert_eq!(show_synchronous_commit(&state), "off");
+    }
+
+    #[test]
+    fn synchronous_commit_env_default_applies_to_new_sessions() {
+        let _env = SYNC_COMMIT_ENV_LOCK.lock().unwrap();
+        std::env::set_var("BASIN_SYNCHRONOUS_COMMIT", "on");
+        let on_state = make_test_session_state();
+        std::env::set_var("BASIN_SYNCHRONOUS_COMMIT", "off");
+        let off_state = make_test_session_state();
+        std::env::remove_var("BASIN_SYNCHRONOUS_COMMIT");
+        assert!(
+            session_synchronous_commit(&on_state),
+            "BASIN_SYNCHRONOUS_COMMIT=on must flip the engine default"
+        );
+        assert!(!session_synchronous_commit(&off_state));
+    }
+
+    #[test]
+    fn parse_pg_bool_accepts_pg_forms() {
+        for raw in ["on", "ON", "'on'", "true", "1", "yes", "\"true\""] {
+            assert!(parse_pg_bool(raw).unwrap(), "raw={raw:?}");
+        }
+        for raw in ["off", "OFF", "'off'", "false", "0", "no"] {
+            assert!(!parse_pg_bool(raw).unwrap(), "raw={raw:?}");
+        }
+        assert!(
+            parse_pg_bool("onn").is_err(),
+            "a typo must error, not silently downgrade durability"
+        );
+        assert!(parse_pg_bool("").is_err());
     }
 
     #[test]
