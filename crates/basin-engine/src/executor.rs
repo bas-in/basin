@@ -218,17 +218,30 @@ pub(crate) fn parse_cache_resize_for_test(cap: usize) {
 // writers. `concurrent_insert_8x1000` and `rmw_contention_8` both bottleneck
 // on this single mutex.
 //
-// Fix: stripe each batch into N contiguous sub-batches and write them in
-// parallel through N distinct `PartitionKey`s (`_default`, `s1`, `s2`, …).
-// Each stripe has its own `compact_lock` + WAL mutex, so concurrent writers
-// fan out N-way.
+// Fix: statement-affine stripe selection. Each statement writes its WHOLE
+// batch to ONE of N distinct `PartitionKey`s (`_default`, `s1`, `s2`, …),
+// chosen by `session_pid % stripes`. Each stripe has its own `compact_lock`
+// + WAL mutex, so concurrent SESSIONS still fan out N-way — which is the
+// only place striping ever bought anything: the per-stripe encodes are
+// synchronous CPU awaited on the current task, so slicing one statement's
+// batch across all N stripes gave ZERO intra-statement parallelism while
+// paying N Arrow-IPC encodes + N schema headers + N partition locks + N WAL
+// streams + N compacted files per statement (the per-file fan-out that the
+// #212 PK-bloom workaround in `basin-shard` compaction exists to mitigate).
 //
-// Round-robin by row index (NOT by PK hash): rows inside one INSERT batch
-// have no ordering semantics, so contiguous chunking is equivalent to any
-// other split. PK uniqueness is enforced BEFORE this point in
+// Why `session_pid`: it is a process-wide monotonic counter assigned at
+// session-open by the `ConnectionRegistry` and never reused, so consecutive
+// sessions map to consecutive stripes (perfect round-robin under a
+// connection pool) and one session's writes stay in ONE partition — fewer
+// files per table, total WAL order for one session's statements.
+//
+// PK uniqueness is enforced BEFORE this point in
 // `enforce_pk_on_insert`/`enforce_unique_on_insert`, against ALL files for
-// the table (storage reads union all partitions), so striping doesn't break
-// constraint checking.
+// the table (storage reads union all partitions), so stripe choice doesn't
+// affect constraint checking. Cross-partition ordering between distinct
+// statements has always been undefined (WAL consumers — replay, compaction,
+// reads — are strictly per-partition), so routing different sessions'
+// statements to different stripes changes nothing observable.
 //
 // Stripe count: `BASIN_WRITE_STRIPES` env, default 8.
 // Stripe 0 is `default_key()` so existing single-partition data continues
@@ -260,18 +273,20 @@ fn stripe_partition_key(i: usize) -> PartitionKey {
     }
 }
 
-/// Write `batch` through `shard`, striping it across N partitions in
-/// parallel. Returns once every stripe write has been durably acknowledged
+/// Write `batch` whole through `shard` into ONE stripe partition selected
+/// by `session_pid % stripes` (statement-affine striping — see the W4 block
+/// comment above). Returns once the write has been durably acknowledged
 /// (the WAL append's standard durability contract).
 ///
-/// `stripes == 1` or `batch.num_rows() <= 1` falls back to the single-handle
-/// path — small batches see no benefit from striping and 1-row stripes
-/// produce N-1 empty partition WAL segments.
+/// `stripes == 1` or `batch.num_rows() <= 1` falls back to the default-key
+/// single-handle path, preserving the pre-existing small-statement behavior
+/// (1-row statements have always landed in `default_key`).
 async fn write_batch_striped(
     shard: &basin_shard::Shard,
     project: &basin_common::ProjectId,
     table: &TableName,
     batch: RecordBatch,
+    session_pid: i32,
 ) -> Result<()> {
     let stripes = write_stripe_count();
     let n_rows = batch.num_rows();
@@ -280,47 +295,13 @@ async fn write_batch_striped(
         return handle.write_batch(table, batch).await;
     }
 
-    // Round-robin via contiguous slices. The first `rem` stripes get
-    // `ceil` rows; the rest get `floor`. This keeps the per-stripe sub-
-    // batches as balanced as possible without an Arrow `take` kernel.
-    let floor = n_rows / stripes;
-    let rem = n_rows % stripes;
-
-    use futures::stream::{FuturesUnordered, StreamExt};
-    let mut futs = FuturesUnordered::new();
-    let mut offset = 0usize;
-    for i in 0..stripes {
-        let chunk = floor + if i < rem { 1 } else { 0 };
-        if chunk == 0 {
-            continue;
-        }
-        let sub = batch.slice(offset, chunk);
-        offset += chunk;
-        let part = stripe_partition_key(i);
-        let table_cl = table.clone();
-        let proj = *project;
-        let shard_cl = shard.clone();
-        futs.push(async move {
-            let handle = shard_cl.get(&proj, &part).await?;
-            handle.write_batch(&table_cl, sub).await
-        });
-    }
-
-    // Drain all stripes; surface the first error. We deliberately collect
-    // every result before returning so a failing stripe doesn't leave
-    // sibling stripes' writes mid-flight from the caller's perspective.
-    let mut first_err: Option<BasinError> = None;
-    while let Some(res) = futs.next().await {
-        if let Err(e) = res {
-            if first_err.is_none() {
-                first_err = Some(e);
-            }
-        }
-    }
-    match first_err {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
+    // `session_pid` is monotonic and never reused (ConnectionRegistry), so
+    // plain modulo distributes consecutive sessions across stripes evenly —
+    // no hash needed. `max(0)` guards a hypothetical negative pid so the
+    // cast can't explode the modulus.
+    let part = stripe_partition_key((session_pid.max(0) as usize) % stripes);
+    let handle = shard.get(project, &part).await?;
+    handle.write_batch(table, batch).await
 }
 
 /// Dispatch `LISTEN` / `UNLISTEN` / `NOTIFY` through the engine's SQL
@@ -5296,13 +5277,15 @@ async fn exec_insert(
     // discard it. Bench-shape #42 (`rollback_drops_rows`) regression.
     if let Some(shard) = sess.engine.config().shard.as_ref() {
         if !crate::session::tx_is_active(&sess.state) {
-            // W4: stripe the batch across N partitions so concurrent writers
+            // W4: statement-affine striping — the whole batch goes to ONE
+            // stripe keyed off this session's pid, so concurrent SESSIONS
             // fan out N-way instead of serialising through default_key's
             // single `compact_lock` + WAL mutex. See `write_batch_striped`.
             // Stripe 0 == default_key so existing data + the read-side tail
             // probe (`shard.get(default_key).read`) keep working as-is.
             let _ = part; // suppress unused-var warning on the striping branch
-            write_batch_striped(shard, &sess.project, &table, batch.clone()).await?;
+            write_batch_striped(shard, &sess.project, &table, batch.clone(), sess.session_pid)
+                .await?;
             // S4 commit 4a: the rows are durably acked by the shard WAL — keep
             // small OLTP inserts resident in the hot tier as CLEAN entries
             // (`insert_clean`) so the very next point read is served from
@@ -6191,9 +6174,9 @@ pub(crate) async fn exec_ingest_batch(
     // Shard path (auto-commit only — same guard as exec_insert).
     if let Some(shard) = sess.engine.config().shard.as_ref() {
         if !crate::session::tx_is_active(&sess.state) {
-            // W4: parallelise across N partitions; see `write_batch_striped`.
+            // W4: statement-affine striping; see `write_batch_striped`.
             let _ = part;
-            write_batch_striped(shard, &sess.project, table, batch).await?;
+            write_batch_striped(shard, &sess.project, table, batch, sess.session_pid).await?;
             return Ok(row_count);
         }
     }

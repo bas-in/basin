@@ -146,6 +146,138 @@ fn rows_of(msgs: &[SimpleQueryMessage]) -> Vec<Vec<Option<String>>> {
         .collect()
 }
 
+/// Recursively collect the distinct partition-directory names that hold at
+/// least one data file, i.e. the path segment immediately after a `data`
+/// segment (`projects/{p}/tables/{t}/data/{partition}/yyyy/mm/dd/{file}`).
+/// Extension-agnostic on purpose: works for Parquet and Vortex files alike.
+fn partitions_with_files(root: &std::path::Path) -> std::collections::BTreeSet<String> {
+    fn walk(dir: &std::path::Path, out: &mut std::collections::BTreeSet<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else {
+                let comps: Vec<&str> = path
+                    .components()
+                    .filter_map(|c| c.as_os_str().to_str())
+                    .collect();
+                if let Some(i) = comps.iter().position(|c| *c == "data") {
+                    if let Some(part) = comps.get(i + 1) {
+                        out.insert((*part).to_string());
+                    }
+                }
+            }
+        }
+    }
+    let mut out = std::collections::BTreeSet::new();
+    walk(root, &mut out);
+    out
+}
+
+/// W4 statement-affine striping: every multi-row INSERT statement writes its
+/// WHOLE batch to ONE stripe partition selected by the session's pid
+/// (`session_pid % BASIN_WRITE_STRIPES`), instead of slicing each statement
+/// across all stripes. Cross-session lock fan-out — the only thing striping
+/// ever bought — must survive: concurrent sessions get consecutive pids from
+/// the `ConnectionRegistry`, so they must land in distinct stripe partitions.
+///
+/// Asserts:
+/// 1. ≥ 4 concurrent sessions spread their statements across ≥ 2 distinct
+///    stripe partitions on disk (session-stable selection; consecutive pids
+///    within a window smaller than the stripe count can never all collide).
+/// 2. `count(*)` and full-scan row counts are exact after the SELECT-forced
+///    `flush_to_parquet` compacts every stripe tail — no rows lost or
+///    duplicated by routing whole statements to single stripes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_sessions_fan_out_across_stripe_partitions() {
+    let mut server = start_server_with_shard().await;
+    let setup = connect(server.addr, "alice").await;
+
+    setup
+        .simple_query("CREATE TABLE striped (id BIGINT NOT NULL, body TEXT NOT NULL)")
+        .await
+        .expect("create");
+
+    const SESSIONS: usize = 6;
+    const STMTS_PER_SESSION: usize = 5;
+    const ROWS_PER_STMT: usize = 4;
+
+    // One connection (= one engine session = one pid) per writer; each issues
+    // multi-row statements so the striped path engages (single-row statements
+    // intentionally keep the historical default_key fallback).
+    let mut set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    for s in 0..SESSIONS {
+        let addr = server.addr;
+        set.spawn(async move {
+            let client = connect(addr, "alice").await;
+            for stmt in 0..STMTS_PER_SESSION {
+                let base = (s * 1_000 + stmt * 10) as i64;
+                let sql = format!(
+                    "INSERT INTO striped VALUES \
+                     ({0}, 's{4}-a'), ({1}, 's{4}-b'), ({2}, 's{4}-c'), ({3}, 's{4}-d')",
+                    base,
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                    s,
+                );
+                client
+                    .simple_query(&sql)
+                    .await
+                    .unwrap_or_else(|e| panic!("session {s} stmt {stmt}: {e}"));
+            }
+        });
+    }
+    while let Some(r) = set.join_next().await {
+        r.expect("writer session panicked");
+    }
+
+    let expected = (SESSIONS * STMTS_PER_SESSION * ROWS_PER_STMT) as i64;
+
+    // Full scan first: forces the synchronous flush_to_parquet (Option A
+    // tail-visibility), draining every stripe's WAL tail into data files.
+    let res = setup
+        .simple_query("SELECT id FROM striped")
+        .await
+        .expect("full select");
+    let rows = rows_of(&res);
+    assert_eq!(
+        rows.len() as i64,
+        expected,
+        "full scan after flush: want {expected} rows, got {}",
+        rows.len()
+    );
+
+    // count(*) across multiple statements after the flush must agree.
+    let res = setup
+        .simple_query("SELECT count(*) FROM striped")
+        .await
+        .expect("count");
+    let rows = rows_of(&res);
+    assert_eq!(
+        rows[0][0].as_deref(),
+        Some(expected.to_string().as_str()),
+        "count(*) after flush_to_parquet disagrees"
+    );
+
+    // Stripe fan-out: the flushed files must span >= 2 distinct partitions.
+    let parts = partitions_with_files(server._data_dir.path());
+    assert!(
+        parts.len() >= 2,
+        "expected >= 2 distinct stripe partitions for {SESSIONS} concurrent \
+         sessions, got {parts:?} — session-pid stripe selection has collapsed \
+         to a single partition"
+    );
+
+    if let Some(bg) = server.bg.take() {
+        bg.shutdown().await;
+    }
+    server.wal.close().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shard_path_select_after_insert_visible() {
     let mut server = start_server_with_shard().await;
