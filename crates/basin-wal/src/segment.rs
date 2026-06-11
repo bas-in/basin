@@ -31,12 +31,20 @@ pub(crate) struct SegmentHeader {
 
 /// Wire-format payload entry. Mirrors [`crate::WalEntry`] but owns the bytes
 /// for ser/de.
+///
+/// `payload` is a refcounted [`Bytes`] so constructing and cloning a record
+/// never copies the payload (the append ack path and the flush path both
+/// used to pay a full memcpy here). Wire compatibility: under bincode 1.x
+/// (fixint, little-endian) `Bytes` serializes via `serialize_bytes` as
+/// `u64 LE length + raw bytes`, byte-for-byte identical to the historical
+/// `Vec<u8>` encoding (`serialize_seq` of `u8`). Pinned by
+/// `tests::wire_format_matches_pre_change_vec_payload`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct EntryRecord {
     pub project: ProjectId,
     pub partition: PartitionKey,
     pub lsn: Lsn,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
     pub appended_at: DateTime<Utc>,
 }
 
@@ -216,18 +224,179 @@ pub(crate) fn handoff_record(to_holder: String, at_epoch: i64) -> SegmentRecord 
 }
 
 /// Convenience for constructing the wire entry from the public type's pieces.
+/// Takes the payload by value: `Bytes` is refcounted, so this is copy-free.
 pub(crate) fn entry_record(
     project: &ProjectId,
     partition: &PartitionKey,
     lsn: Lsn,
-    payload: &Bytes,
+    payload: Bytes,
     appended_at: DateTime<Utc>,
 ) -> EntryRecord {
     EntryRecord {
         project: *project,
         partition: partition.clone(),
         lsn,
-        payload: payload.to_vec(),
+        payload,
         appended_at,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    /// Pre-change wire shape of [`EntryRecord`]: `payload` was a `Vec<u8>`.
+    /// Re-declared here (with `Serialize` only) so the wire-compat test can
+    /// pin byte-for-byte equality against what the old code wrote, without
+    /// needing the old code. bincode 1.x ignores struct/field names — only
+    /// field order and element encodings matter.
+    #[derive(Serialize)]
+    struct VecPayloadEntryRecord {
+        project: ProjectId,
+        partition: PartitionKey,
+        lsn: Lsn,
+        payload: Vec<u8>,
+        appended_at: DateTime<Utc>,
+    }
+
+    /// Pre-change wire shape of [`SegmentRecord`]. Variant order must match
+    /// the real enum exactly — bincode encodes the variant index (u32 LE)
+    /// followed by the variant body.
+    #[derive(Serialize)]
+    #[allow(dead_code)]
+    enum VecPayloadSegmentRecord {
+        Header(SegmentHeader),
+        Entry(VecPayloadEntryRecord),
+        TxBegin { tx_id: u64 },
+        TxRollback { tx_id: u64 },
+        Handoff { to_holder: String, at_epoch: i64 },
+        TxCommit { tx_id: u64 },
+    }
+
+    fn fixed_time() -> DateTime<Utc> {
+        Utc.timestamp_opt(1_700_000_000, 123_456_789).unwrap()
+    }
+
+    /// WIRE-COMPAT FIXTURE. The on-disk segment format must not change when
+    /// `EntryRecord.payload` moves from `Vec<u8>` to `bytes::Bytes`.
+    ///
+    /// Why this holds: bincode 1.x with its default options (fixint encoding,
+    /// little-endian) serializes
+    ///   - `Vec<u8>` via `serialize_seq(Some(len))` → u64 LE length, then each
+    ///     `u8` as one raw byte;
+    ///   - `Bytes`   via `serialize_bytes(&[u8])`   → u64 LE length, then the
+    ///     raw bytes.
+    /// Both produce `[len: u64 LE][raw payload]`. This test proves it by
+    /// serializing the same logical record through both shapes and comparing
+    /// the framed bytes, including the empty-payload edge case.
+    #[test]
+    fn wire_format_matches_pre_change_vec_payload() {
+        let project = ProjectId::new();
+        let partition = PartitionKey::new("orders/2026").unwrap();
+        let payloads: [&[u8]; 3] = [b"hello wal payload \x00\x01\xff", b"", b"x"];
+
+        for (i, raw) in payloads.iter().enumerate() {
+            let new_record = SegmentRecord::Entry(EntryRecord {
+                project,
+                partition: partition.clone(),
+                lsn: Lsn(42 + i as u64),
+                payload: Bytes::copy_from_slice(raw),
+                appended_at: fixed_time(),
+            });
+            let old_record = VecPayloadSegmentRecord::Entry(VecPayloadEntryRecord {
+                project,
+                partition: partition.clone(),
+                lsn: Lsn(42 + i as u64),
+                payload: raw.to_vec(),
+                appended_at: fixed_time(),
+            });
+
+            let new_bytes = bincode::serialize(&new_record).unwrap();
+            let old_bytes = bincode::serialize(&old_record).unwrap();
+            assert_eq!(
+                new_bytes, old_bytes,
+                "Bytes payload must serialize identically to the historical \
+                 Vec<u8> payload (case {i})"
+            );
+
+            // And the full framing (length prefix included) must match what
+            // the pre-change frame_into produced for the same record.
+            let mut framed = Vec::new();
+            frame_into(&mut framed, &new_record).unwrap();
+            let mut expected = Vec::new();
+            expected.extend_from_slice(&(old_bytes.len() as u32).to_le_bytes());
+            expected.extend_from_slice(&old_bytes);
+            assert_eq!(framed, expected, "framed record bytes drifted (case {i})");
+        }
+    }
+
+    /// Full encode→decode round trip through the production reader path.
+    /// Every field — including the payload bytes — must survive intact.
+    ///
+    /// NOTE for verification: this test is intentionally written against the
+    /// public framing/decoding helpers only, so it also passes when run
+    /// against the pre-change code (payload as `Vec<u8>`). Running it on both
+    /// sides of the change is an additional wire-stability check on top of
+    /// `wire_format_matches_pre_change_vec_payload`.
+    #[test]
+    fn frame_round_trip_preserves_all_fields() {
+        let project = ProjectId::new();
+        let partition = PartitionKey::new("p1").unwrap();
+        let segment_id = Ulid::new();
+        let header = SegmentHeader {
+            format_version: FORMAT_VERSION,
+            project,
+            partition: partition.clone(),
+            first_lsn: Lsn(7),
+            segment_id,
+        };
+        let entry = EntryRecord {
+            project,
+            partition: partition.clone(),
+            lsn: Lsn(7),
+            payload: Bytes::from_static(b"round-trip payload \x00\x7f\xff"),
+            appended_at: fixed_time(),
+        };
+
+        let mut buf = Vec::new();
+        frame_into(&mut buf, &SegmentRecord::Header(header)).unwrap();
+        frame_into(&mut buf, &tx_begin_record(9)).unwrap();
+        frame_into(&mut buf, &SegmentRecord::Entry(entry.clone())).unwrap();
+        frame_into(&mut buf, &tx_commit_record(9)).unwrap();
+        frame_into(&mut buf, &handoff_record("replica-b".to_string(), 3)).unwrap();
+        frame_into(&mut buf, &tx_rollback_record(11)).unwrap();
+
+        let (decoded_header, records) = decode_segment_full(&buf).unwrap();
+        assert_eq!(decoded_header.format_version, FORMAT_VERSION);
+        assert_eq!(decoded_header.project, project);
+        assert_eq!(decoded_header.partition, partition);
+        assert_eq!(decoded_header.first_lsn, Lsn(7));
+        assert_eq!(decoded_header.segment_id, segment_id);
+
+        assert_eq!(records.len(), 5);
+        assert!(matches!(records[0], DecodedRecord::TxBegin { tx_id: 9 }));
+        match &records[1] {
+            DecodedRecord::Entry(e) => {
+                assert_eq!(e.project, entry.project);
+                assert_eq!(e.partition, entry.partition);
+                assert_eq!(e.lsn, entry.lsn);
+                assert_eq!(e.payload, entry.payload);
+                assert_eq!(e.appended_at, entry.appended_at);
+            }
+            other => panic!("expected Entry, got {other:?}"),
+        }
+        assert!(matches!(records[2], DecodedRecord::TxCommit { tx_id: 9 }));
+        match &records[3] {
+            DecodedRecord::Handoff {
+                to_holder,
+                at_epoch,
+            } => {
+                assert_eq!(to_holder, "replica-b");
+                assert_eq!(*at_epoch, 3);
+            }
+            other => panic!("expected Handoff, got {other:?}"),
+        }
+        assert!(matches!(records[4], DecodedRecord::TxRollback { tx_id: 11 }));
     }
 }

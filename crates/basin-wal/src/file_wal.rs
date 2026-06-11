@@ -142,63 +142,92 @@ impl Inner {
     }
 
     /// Drain one partition's in-RAM buffer to a new closed segment in object
-    /// storage. On error the buffered entries are restored to the front of
-    /// the buffer so the next flush attempt picks them up. No data loss as
-    /// long as the process is alive.
+    /// storage. On error (framing or PUT) the buffered entries are restored
+    /// to the front of the buffer so the next flush attempt picks them up.
+    /// No data loss as long as the process is alive.
+    ///
+    /// Locking: the partition mutex is held only to swap the buffer out —
+    /// cheap pointer moves, since entry payloads are refcounted `Bytes`.
+    /// Framing (the bincode serialization of every record, including the one
+    /// unavoidable payload copy into the segment buffer) and the network/disk
+    /// PUT both run with the lock released, so concurrent appenders to this
+    /// partition never serialise behind a flush. The swapped-out batch keeps
+    /// its already-assigned LSNs; appends that land during the flush get
+    /// strictly higher LSNs, so restoring the batch to the *front* of the
+    /// buffer on failure preserves LSN order.
     async fn flush_one(&self, state: &Arc<Mutex<PartitionState>>) -> Result<()> {
-        let mut guard = state.lock().await;
-        if guard.buffer.is_empty() {
-            return Ok(());
-        }
-        let segment_id = Ulid::new();
-        let first_lsn = guard.buffer.first().expect("non-empty").lsn();
-        let last_lsn = guard.buffer.last().expect("non-empty").lsn();
-        let header = SegmentHeader {
-            format_version: FORMAT_VERSION,
-            project: guard.project,
-            partition: guard.partition.clone(),
-            first_lsn,
-            segment_id,
-        };
-        let mut buf: Vec<u8> = Vec::with_capacity(guard.buffer_bytes as usize + 256);
-        frame_into(&mut buf, &SegmentRecord::Header(header))?;
-        for record in guard.buffer.iter() {
-            match record {
-                BufferRecord::Entry(entry) => {
-                    frame_into(&mut buf, &SegmentRecord::Entry(entry.clone()))?;
-                }
-                BufferRecord::TxBegin { tx_id, .. } => {
-                    frame_into(&mut buf, &tx_begin_record(*tx_id))?;
-                }
-                BufferRecord::TxRollback { tx_id, .. } => {
-                    frame_into(&mut buf, &tx_rollback_record(*tx_id))?;
-                }
-                BufferRecord::TxCommit { tx_id, .. } => {
-                    frame_into(&mut buf, &tx_commit_record(*tx_id))?;
-                }
-                BufferRecord::Handoff {
-                    to_holder,
-                    at_epoch,
-                    ..
-                } => {
-                    frame_into(&mut buf, &handoff_record(to_holder.clone(), *at_epoch))?;
-                }
+        let (header, drained, drained_bytes) = {
+            let mut guard = state.lock().await;
+            if guard.buffer.is_empty() {
+                return Ok(());
             }
-        }
-
+            let header = SegmentHeader {
+                format_version: FORMAT_VERSION,
+                project: guard.project,
+                partition: guard.partition.clone(),
+                first_lsn: guard.buffer.first().expect("non-empty").lsn(),
+                segment_id: Ulid::new(),
+            };
+            let drained: Vec<BufferRecord> = std::mem::take(&mut guard.buffer);
+            let drained_bytes = guard.buffer_bytes;
+            guard.buffer_bytes = 0;
+            (header, drained, drained_bytes)
+        };
+        // Lock released. While the flush is in flight the drained records are
+        // visible neither in `buffer` nor in `closed` — identical to the
+        // pre-restructure behaviour, which also drained before dropping the
+        // guard for the PUT.
+        let first_lsn = header.first_lsn;
+        let last_lsn = drained.last().expect("non-empty").lsn();
+        let segment_id = header.segment_id;
         let path = closed_segment_path(
             self.root_prefix.as_ref(),
-            &guard.project,
-            &guard.partition,
+            &header.project,
+            &header.partition,
             segment_id,
         );
 
-        let drained: Vec<BufferRecord> = guard.buffer.drain(..).collect();
-        let drained_bytes = guard.buffer_bytes;
-        guard.buffer_bytes = 0;
-        // Drop the mutex across the network/disk round-trip so other appends
-        // for this partition don't block on the upload.
-        drop(guard);
+        let framed: Result<Vec<u8>> = (|| {
+            let mut buf: Vec<u8> = Vec::with_capacity(drained_bytes as usize + 256);
+            frame_into(&mut buf, &SegmentRecord::Header(header))?;
+            for record in &drained {
+                match record {
+                    BufferRecord::Entry(entry) => {
+                        // Cheap clone: refcount bump on the `Bytes` payload
+                        // plus small fixed-size fields — no payload memcpy.
+                        frame_into(&mut buf, &SegmentRecord::Entry(entry.clone()))?;
+                    }
+                    BufferRecord::TxBegin { tx_id, .. } => {
+                        frame_into(&mut buf, &tx_begin_record(*tx_id))?;
+                    }
+                    BufferRecord::TxRollback { tx_id, .. } => {
+                        frame_into(&mut buf, &tx_rollback_record(*tx_id))?;
+                    }
+                    BufferRecord::TxCommit { tx_id, .. } => {
+                        frame_into(&mut buf, &tx_commit_record(*tx_id))?;
+                    }
+                    BufferRecord::Handoff {
+                        to_holder,
+                        at_epoch,
+                        ..
+                    } => {
+                        frame_into(&mut buf, &handoff_record(to_holder.clone(), *at_epoch))?;
+                    }
+                }
+            }
+            Ok(buf)
+        })();
+        let buf = match framed {
+            Ok(buf) => buf,
+            Err(e) => {
+                // Framing failed (encode error / record over 4 GiB). Restore
+                // the drained records and surface the error — same contract
+                // as before the restructure, where framing ran before the
+                // drain and a failure left the entries buffered.
+                restore_buffer(state, drained, drained_bytes).await;
+                return Err(e);
+            }
+        };
 
         let put_result = self
             .object_store
@@ -227,15 +256,28 @@ impl Inner {
                 Ok(())
             }
             Err(e) => {
-                let mut guard = state.lock().await;
-                let mut combined = drained;
-                combined.append(&mut guard.buffer);
-                guard.buffer = combined;
-                guard.buffer_bytes += drained_bytes;
+                restore_buffer(state, drained, drained_bytes).await;
                 Err(BasinError::storage(format!("wal segment put {path}: {e}")))
             }
         }
     }
+}
+
+/// Restore drained-but-unflushed records to the *front* of the partition
+/// buffer after a failed flush (framing or PUT error). Any records appended
+/// while the flush was in flight carry strictly higher LSNs, so prepending
+/// preserves LSN order. The byte accounting is added back so buffer-pressure
+/// flushes keep firing.
+async fn restore_buffer(
+    state: &Arc<Mutex<PartitionState>>,
+    drained: Vec<BufferRecord>,
+    drained_bytes: u64,
+) {
+    let mut guard = state.lock().await;
+    let mut combined = drained;
+    combined.append(&mut guard.buffer);
+    guard.buffer = combined;
+    guard.buffer_bytes += drained_bytes;
 }
 
 /// Background flush loop. Wakes on tick or shutdown; flushes every partition
@@ -374,12 +416,12 @@ impl WalImpl for FileWal {
         payload: Bytes,
         epoch: Option<i64>,
     ) -> Result<Lsn> {
-        // Pre-compute the timestamp and clone the payload into the EntryRecord
-        // *before* acquiring the per-partition mutex. Both operations involve
-        // either a syscall (clock_gettime) or a heap allocation + memcopy
-        // (payload.to_vec) whose cost scales with payload size. Keeping them
-        // outside the critical section lets concurrent appenders to the same
-        // partition overlap this work instead of serialising through it.
+        // Pre-compute the timestamp and build the EntryRecord *before*
+        // acquiring the per-partition mutex. The timestamp is a syscall
+        // (clock_gettime); the record itself is copy-free — the payload is a
+        // refcounted `Bytes` that is moved, not memcopied. The only payload
+        // copy left on the write path is the single serialize into the
+        // segment buffer at flush time, which also runs outside this mutex.
         //
         // We construct the record with a placeholder LSN (Lsn(0)); the real LSN
         // is stamped inside the lock where it is guaranteed monotonic.
@@ -388,7 +430,7 @@ impl WalImpl for FileWal {
         // + ~64 bytes for project/partition/lsn/timestamp. Used only for the
         // buffer-pressure heuristic; the real size is computed at flush time.
         let approx = (payload.len() as u64) + 96;
-        let mut record = entry_record(project, partition, Lsn(0), &payload, now);
+        let mut record = entry_record(project, partition, Lsn(0), payload, now);
 
         let state = self.inner.get_or_create_partition(project, partition).await;
         let (lsn, should_flush) = {
@@ -763,7 +805,8 @@ fn into_public_entry(e: EntryRecord) -> WalEntry {
         project: e.project,
         partition: e.partition,
         lsn: e.lsn,
-        payload: Bytes::from(e.payload),
+        // Already a refcounted `Bytes` — moved, never copied.
+        payload: e.payload,
         appended_at: e.appended_at,
     }
 }
@@ -1119,7 +1162,7 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 for i in 0..PER_WRITER {
                     // Vary payload size (16-256 bytes) so that the pre-lock
-                    // payload.to_vec() path exercises different allocation sizes.
+                    // record-construction path sees different payload sizes.
                     let body = vec![(w as u8).wrapping_add(i as u8); 16 + (i % 240) as usize];
                     wal2.append(&project, &part2, Bytes::from(body))
                         .await
@@ -1249,6 +1292,233 @@ mod tests {
             "close() must drain the buffer; all records must survive reopen"
         );
         wal.close().await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Buffer-swap flush coverage: (1) appenders make progress while a segment
+    // PUT is in flight, (2) a failed PUT restores the drained records so no
+    // acked entry is lost.
+    // -----------------------------------------------------------------------
+
+    /// Object-store double for flush tests. `put_opts` first signals the test
+    /// on `put_started`, then either fails (when `fail_puts` is set) or parks
+    /// until the `gate` semaphore grants a permit, then delegates to the inner
+    /// store. Everything else delegates directly.
+    #[derive(Debug)]
+    struct GatedStore {
+        inner: Arc<dyn ObjectStore>,
+        put_started: tokio::sync::mpsc::UnboundedSender<()>,
+        gate: Arc<tokio::sync::Semaphore>,
+        fail_puts: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl std::fmt::Display for GatedStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "GatedStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for GatedStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            let _ = self.put_started.send(());
+            if self.fail_puts.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(object_store::Error::Generic {
+                    store: "GatedStore",
+                    source: "injected put failure".into(),
+                });
+            }
+            // Park until the test releases the gate; one permit per PUT.
+            let permit = self
+                .gate
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("gate semaphore closed");
+            permit.forget();
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: object_store::PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    struct GatedHarness {
+        wal: LocalWal,
+        started_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+        gate: Arc<tokio::sync::Semaphore>,
+        fail_puts: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    /// Open a WAL over a [`GatedStore`] with `initial_permits` on the PUT
+    /// gate. Background flushes are effectively disabled so the test fully
+    /// controls when PUTs happen.
+    async fn gated_wal_in(dir: &TempDir, initial_permits: usize) -> GatedHarness {
+        let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let (started_tx, started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let gate = Arc::new(tokio::sync::Semaphore::new(initial_permits));
+        let fail_puts = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let store = GatedStore {
+            inner: Arc::new(fs),
+            put_started: started_tx,
+            gate: gate.clone(),
+            fail_puts: fail_puts.clone(),
+        };
+        let cfg = WalConfig {
+            object_store: Arc::new(store),
+            root_prefix: None,
+            flush_interval: Duration::from_secs(3600),
+            flush_max_bytes: u64::MAX,
+        };
+        let wal = LocalWal::open(cfg).await.unwrap();
+        GatedHarness {
+            wal,
+            started_rx,
+            gate,
+            fail_puts,
+        }
+    }
+
+    /// While a segment PUT is parked inside the object store, appends to the
+    /// same partition must complete without waiting for the upload: flush_one
+    /// swaps the buffer out under the partition mutex and releases the lock
+    /// before framing and PUT. Deterministic — the PUT is gated, not slow.
+    #[tokio::test]
+    async fn appends_progress_while_flush_put_in_flight() {
+        let dir = TempDir::new().unwrap();
+        let mut h = gated_wal_in(&dir, 0).await;
+        let project = ProjectId::new();
+        let part = PartitionKey::default_key();
+
+        h.wal.append(&project, &part, payload(1)).await.unwrap();
+
+        // Kick off an explicit flush; its PUT parks on the gate.
+        let flush_wal = h.wal.clone();
+        let flush_task = tokio::spawn(async move { flush_wal.flush().await });
+
+        // Wait until the PUT is provably in flight (and therefore the
+        // partition mutex has been released by flush_one).
+        tokio::time::timeout(Duration::from_secs(5), h.started_rx.recv())
+            .await
+            .expect("flush PUT never started")
+            .expect("put_started channel closed");
+
+        // The PUT is parked. Appends must still make progress.
+        let wal2 = h.wal.clone();
+        let part2 = part.clone();
+        let appends = async move {
+            for i in 2..=50u64 {
+                let lsn = wal2.append(&project, &part2, payload(i)).await.unwrap();
+                assert_eq!(lsn, Lsn(i));
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), appends)
+            .await
+            .expect("appends blocked behind an in-flight segment PUT");
+
+        // Release the parked PUT (with headroom for the flushes in close()).
+        h.gate.add_permits(64);
+        flush_task.await.unwrap().unwrap();
+
+        // The flushed first entry plus the 49 appended mid-PUT are all
+        // visible, in order.
+        let all = h.wal.read_from(&project, &part, Lsn::ZERO).await.unwrap();
+        assert_eq!(all.len(), 50);
+        for (i, e) in all.iter().enumerate() {
+            assert_eq!(e.lsn, Lsn((i + 1) as u64));
+        }
+        h.wal.close().await.unwrap();
+    }
+
+    /// PUT-failure contract: a failed segment upload restores the drained
+    /// records to the buffer (no acked entry is lost), surfaces the error to
+    /// explicit flush() callers, and the next flush retries successfully.
+    #[tokio::test]
+    async fn flush_put_failure_keeps_entries_buffered() {
+        let dir = TempDir::new().unwrap();
+        let mut h = gated_wal_in(&dir, 1024).await;
+        let project = ProjectId::new();
+        let part = PartitionKey::default_key();
+
+        for i in 1..=5u64 {
+            h.wal.append(&project, &part, payload(i)).await.unwrap();
+        }
+
+        h.fail_puts.store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = h.wal.flush().await.unwrap_err();
+        assert!(
+            matches!(err, BasinError::Storage(_)),
+            "failed segment PUT must surface as a storage error, got {err:?}"
+        );
+        // One PUT attempt happened and failed.
+        assert!(h.started_rx.recv().await.is_some());
+
+        // Entries survive the failed flush in the in-RAM buffer.
+        let all = h.wal.read_from(&project, &part, Lsn::ZERO).await.unwrap();
+        assert_eq!(all.len(), 5, "no acked entry may be lost on PUT failure");
+        assert_eq!(h.wal.high_water(&project, &part).await.unwrap(), Lsn(5));
+
+        // New appends interleave correctly behind the restored batch.
+        h.wal.append(&project, &part, payload(6)).await.unwrap();
+
+        // Heal the store; the retry flush must persist everything in order.
+        h.fail_puts.store(false, std::sync::atomic::Ordering::SeqCst);
+        h.wal.flush().await.unwrap();
+        let all = h.wal.read_from(&project, &part, Lsn::ZERO).await.unwrap();
+        assert_eq!(all.len(), 6);
+        for (i, e) in all.iter().enumerate() {
+            assert_eq!(e.lsn, Lsn((i + 1) as u64));
+        }
+        h.wal.close().await.unwrap();
     }
 
     #[tokio::test]

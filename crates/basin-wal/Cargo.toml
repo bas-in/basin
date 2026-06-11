@@ -11,7 +11,10 @@ basin-common.workspace = true
 tokio.workspace = true
 futures.workspace = true
 async-trait.workspace = true
-bytes.workspace = true
+# `serde` feature: `EntryRecord.payload` is a refcounted `Bytes` that must
+# serialize through bincode identically to the historical `Vec<u8>` (u64 LE
+# length + raw bytes under bincode 1.x fixint). See `segment.rs` wire tests.
+bytes = { workspace = true, features = ["serde"] }
 object_store.workspace = true
 serde.workspace = true
 serde_json.workspace = true
