@@ -3221,6 +3221,86 @@ async fn execute_simple_select_inner(
             }
             all
         }
+    } else if pushdown_limit.is_some()
+        && !had_pk_probe
+        && !shadow_cols_present
+        && pinned.is_none()
+        && !live_paths.is_empty()
+    {
+        // ── Unordered-LIMIT early exit: one file at a time, stop at k rows ───
+        //
+        // Shape: `SELECT … FROM t [WHERE cheap-pushdown-preds] LIMIT k` with NO
+        // ORDER BY. `pushdown_limit` is `Some` only when there is no ORDER BY,
+        // no aggregate, and no post-read shrinking step (no IS NULL / IN-list
+        // post-filter and NO live tombstone / UPDATE overlay for this table) —
+        // so every row the storage read emits is a final result row and the
+        // first `k` of them are a complete, correct answer.
+        //
+        // Why not the multi-path read below: `read_paths_with_schema` over ALL
+        // candidate paths drives its per-file opens through `buffered(4)`, and
+        // `read_one` is EAGER per file (whole-blob GET + full/chunk-pruned
+        // decode before the first batch is emitted). The global
+        // `apply_limit_to_stream` cut therefore lands only after several files
+        // have already been fetched + decoded in full — at a 1M-row layout
+        // that is hundreds of thousands of decoded rows for a LIMIT 100. PG
+        // early-exits after k matching rows; this branch does the same: open
+        // candidate files ONE AT A TIME, push the REMAINING limit into each
+        // single-path read (one path ⇒ the storage stream limit coincides with
+        // the per-file limit — the same mechanics the keyset branch uses), and
+        // stop as soon as `k` post-filter rows have been collected. Work is
+        // bounded by ceil(k / matches-per-file) file opens instead of the
+        // whole candidate set.
+        //
+        // Correctness gates (ANY doubt ⇒ this branch is skipped and today's
+        // path runs unchanged):
+        //   * Overlay: `pushdown_limit` is `None` whenever `overlay_active`
+        //     (live tombstones / UPDATE overrides could suppress an admitted
+        //     row, leaving a shortfall whose backfill lives past the cut) — so
+        //     reaching here proves the cold rows are final.
+        //   * Hot tail: `shard.flush_to_parquet()` ran at the top of this fn
+        //     BEFORE `meta`/`live_files` were loaded, so every pre-statement
+        //     tail row is in `live_paths`. Rows arriving mid-statement are
+        //     invisible, exactly like the keyset / pk-probe / pinned branches
+        //     that already read `live_paths` directly instead of `handle.read`.
+        //   * Hot memtable: any-Eq point shapes were probed above (a hit
+        //     returned early); non-probe shapes never saw memtable rows on
+        //     this path before either (only the overlay merge below, which is
+        //     gated empty here) — no new under-count.
+        //   * `had_pk_probe` / `shadow_cols_present` / `pinned` keep their own
+        //     dedicated branch below; `LIMIT 0` collects nothing and returns
+        //     empty (same answer `apply_limit` would produce).
+        use futures::StreamExt;
+        let k = pushdown_limit.expect("guard checked pushdown_limit.is_some()");
+        let storage = &sess.engine.config().storage;
+        let mut all: Vec<RecordBatch> = Vec::new();
+        let mut collected: usize = 0;
+        for path in &live_paths {
+            if collected >= k {
+                break;
+            }
+            // Remaining-limit pushdown: the single-path stream slices its
+            // boundary batch to exactly `k - collected` rows and stops, so
+            // `collected` can never overshoot `k`.
+            let mut file_opts = opts.clone();
+            file_opts.limit = Some(k - collected);
+            let stream = storage
+                .read_paths_with_schema(
+                    &sess.project,
+                    vec![path.clone()],
+                    file_opts,
+                    Some(meta.schema.clone()),
+                )
+                .await?;
+            let file_batches: Vec<Result<RecordBatch>> = stream.collect().await;
+            for b in file_batches {
+                let b = b?;
+                if b.num_rows() > 0 {
+                    collected += b.num_rows();
+                    all.push(b);
+                }
+            }
+        }
+        all
     } else if had_pk_probe || shadow_cols_present || pinned.is_some() {
         // Direct cold-file read (bypass `handle.read`). Three cases reach here:
         //
