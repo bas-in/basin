@@ -943,6 +943,163 @@ async fn fallback_unsupported_column_type() {
     assert_eq!(col_i64(&r, "id"), vec![Some(1), Some(2)]);
 }
 
+// ─── pre-parse fast path: decline shapes must behave byte-identically ───────
+//
+// The executor now classifies plain literal INSERTs BEFORE either
+// whole-statement parser runs (the pre-parse fast path). These tests pin the
+// decline contract: every shape the pre-parse classifier/scanner refuses —
+// RETURNING, explicit transactions, INSERT…SELECT, data-modifying CTEs,
+// multiple statements — must still run through the normal path with exactly
+// the pre-existing behaviour.
+
+/// RETURNING after the tuples: the tuple scanner declines (trailing clause),
+/// the normal path runs, and the RETURNING batch + stored rows must match a
+/// control table filled by the same statement WITHOUT the clause.
+#[tokio::test]
+async fn preparse_returning_declines_and_works() {
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+    sess.execute("CREATE TABLE multi (id BIGINT NOT NULL PRIMARY KEY, s TEXT)")
+        .await
+        .unwrap();
+    sess.execute("CREATE TABLE control (id BIGINT NOT NULL PRIMARY KEY, s TEXT)")
+        .await
+        .unwrap();
+
+    let tuples = "(1, 'a'), (2, 'b''c'), (3, NULL)";
+    let ret = sess
+        .execute(&format!(
+            "INSERT INTO multi (id, s) VALUES {tuples} RETURNING *"
+        ))
+        .await
+        .unwrap();
+    let ret_batches = match ret {
+        ExecResult::Rows { batches, .. } => batches,
+        other => panic!("RETURNING must produce rows, got {other:?}"),
+    };
+    assert_eq!(total_rows(&ret_batches), 3);
+    assert_eq!(col_i64(&ret_batches, "id"), vec![Some(1), Some(2), Some(3)]);
+
+    sess.execute(&format!("INSERT INTO control (id, s) VALUES {tuples}"))
+        .await
+        .unwrap();
+
+    let m = select(&sess, "SELECT id, s FROM multi ORDER BY id").await;
+    let c = select(&sess, "SELECT id, s FROM control ORDER BY id").await;
+    assert_eq!(col_i64(&m, "id"), col_i64(&c, "id"));
+    assert_eq!(col_str(&m, "s"), col_str(&c, "s"));
+    assert_eq!(
+        col_str(&m, "s"),
+        vec![Some("a".to_string()), Some("b'c".to_string()), None]
+    );
+}
+
+/// Inside an explicit transaction the pre-parse path declines (auto-commit
+/// only) and the in-tx buffering path runs; the committed data must match an
+/// auto-commit control statement byte-for-byte.
+#[tokio::test]
+async fn preparse_explicit_transaction_declines_and_works() {
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+    sess.execute("CREATE TABLE multi (id BIGINT NOT NULL PRIMARY KEY, s TEXT, f DOUBLE PRECISION)")
+        .await
+        .unwrap();
+    sess.execute(
+        "CREATE TABLE control (id BIGINT NOT NULL PRIMARY KEY, s TEXT, f DOUBLE PRECISION)",
+    )
+    .await
+    .unwrap();
+
+    let tuples = "(1, 'x', 1.5), (2, 'it''s', -2.5e2), (3, NULL, NULL)";
+    sess.execute("BEGIN").await.unwrap();
+    sess.execute(&format!("INSERT INTO multi (id, s, f) VALUES {tuples}"))
+        .await
+        .unwrap();
+    sess.execute("COMMIT").await.unwrap();
+
+    // Control: same statement auto-commit (engages the pre-parse path).
+    sess.execute(&format!("INSERT INTO control (id, s, f) VALUES {tuples}"))
+        .await
+        .unwrap();
+
+    let m = select(&sess, "SELECT id, s, f FROM multi ORDER BY id").await;
+    let c = select(&sess, "SELECT id, s, f FROM control ORDER BY id").await;
+    assert_eq!(col_i64(&m, "id"), col_i64(&c, "id"));
+    assert_eq!(col_str(&m, "s"), col_str(&c, "s"));
+    assert_eq!(col_f64(&m, "f"), col_f64(&c, "f"));
+}
+
+/// INSERT…SELECT has no literal VALUES — the classifier declines and the
+/// materialise-through-DataFusion path runs unchanged.
+#[tokio::test]
+async fn preparse_insert_select_declines_and_works() {
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+    sess.execute("CREATE TABLE src (id BIGINT NOT NULL PRIMARY KEY, s TEXT)")
+        .await
+        .unwrap();
+    sess.execute("CREATE TABLE dst (id BIGINT NOT NULL PRIMARY KEY, s TEXT)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO src (id, s) VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO dst SELECT id, s FROM src")
+        .await
+        .unwrap();
+    let d = select(&sess, "SELECT id, s FROM dst ORDER BY id").await;
+    assert_eq!(col_i64(&d, "id"), vec![Some(1), Some(2), Some(3)]);
+    assert_eq!(
+        col_str(&d, "s"),
+        vec![
+            Some("a".to_string()),
+            Some("b".to_string()),
+            Some("c".to_string())
+        ]
+    );
+}
+
+/// A data-modifying CTE (`WITH ins AS (INSERT … RETURNING …) SELECT …`)
+/// starts with WITH — the classifier never matches — and the DML-CTE
+/// orchestrator runs unchanged.
+#[tokio::test]
+async fn preparse_dml_cte_declines_and_works() {
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY)")
+        .await
+        .unwrap();
+    let r = select(
+        &sess,
+        "WITH ins AS (INSERT INTO t VALUES (7) RETURNING id) SELECT * FROM ins",
+    )
+    .await;
+    assert_eq!(col_i64(&r, "id"), vec![Some(7)]);
+    let cnt = select(&sess, "SELECT count(*) AS c FROM t").await;
+    assert_eq!(col_i64(&cnt, "c"), vec![Some(1)]);
+}
+
+/// Two statements in one execute() call: the tuple scanner declines on the
+/// bytes after the first `;`, and the normal path's single-statement guard
+/// rejects — exactly the pre-existing behaviour. Atomic: nothing written.
+#[tokio::test]
+async fn preparse_multiple_statements_decline() {
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY)")
+        .await
+        .unwrap();
+    let res = sess
+        .execute("INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)")
+        .await;
+    assert!(
+        res.is_err(),
+        "multi-statement execute must keep erroring, got {res:?}"
+    );
+    let cnt = select(&sess, "SELECT count(*) AS c FROM t").await;
+    assert_eq!(col_i64(&cnt, "c"), vec![Some(0)]);
+}
+
 // ─── correctness: constraints still enforced on the fast path ───────────────
 
 #[tokio::test]
@@ -995,7 +1152,9 @@ async fn values_fast_throughput_probe() {
     // slow path. The payload literal carries the `::jsonb` suffix cast so the
     // statement byte-shape mirrors the published bulk-INSERT benchmark
     // (`compare_postgres_common.rs`) exactly. With the extended scanner this
-    // should now run on the fast path end-to-end.
+    // runs on the fast path end-to-end, and with the pre-parse classifier the
+    // statement additionally skips BOTH whole-statement parses (libpg_query +
+    // sqlparser) that previously ran before the scanner engaged.
     sess.execute(
         "CREATE TABLE fast (id BIGINT NOT NULL PRIMARY KEY, user_id BIGINT, \
          amount DOUBLE PRECISION, status TEXT, created_at BIGINT, payload JSONB)",
@@ -1031,8 +1190,10 @@ async fn values_fast_throughput_probe() {
     }
     let elapsed = start.elapsed();
     let rps = n as f64 / elapsed.as_secs_f64();
+    let per_stmt_ms = elapsed.as_secs_f64() * 1000.0 / (n as f64 / chunk as f64);
     println!(
-        "[values-fast] benchmark schema (JSONB ::jsonb suffix + ts): {n} rows in {:.3}s = {rps:.0} rows/s",
+        "[values-fast] pre-parse fast path, benchmark schema (JSONB ::jsonb suffix + ts): \
+         {n} rows in {:.3}s = {rps:.0} rows/s ({per_stmt_ms:.1}ms per {chunk}-row statement)",
         elapsed.as_secs_f64()
     );
 

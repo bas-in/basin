@@ -734,6 +734,25 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
         ));
     }
 
+    // ── Pre-parse literal-INSERT fast path ──────────────────────────────────
+    // For a plain auto-commit `INSERT INTO t [(cols)] VALUES (...), ...` the
+    // normal path below parses the ENTIRE statement twice — libpg_query (for
+    // statement-kind dispatch) and sqlparser (a full `Vec<Vec<Expr>>` AST for
+    // every tuple) — only for the values_fast scanner in `exec_insert` to then
+    // discard the sqlparser rows unused. For a 10k-row / multi-MB statement
+    // those two parses are a large fixed tax. `try_insert_preparse` classifies
+    // the statement with an O(prefix) header scan, validates the header with a
+    // tiny sqlparser parse of just `sql[..VALUES]`, runs the existing tuple
+    // scanner, and on success routes straight into the shared
+    // `exec_insert_prebuilt` seam — neither whole-statement parser ever runs.
+    // ANY uncertainty (open transaction, ON CONFLICT / RETURNING / extra
+    // statements after the tuples, hypertables, partitioned targets,
+    // unsupported literals, …) returns `None` here and the normal path below
+    // runs byte-for-byte unchanged.
+    if let Some(result) = try_insert_preparse(sess, sql).await {
+        return result;
+    }
+
     // Keep a reference to the SQL the user actually wrote. The rewriter
     // below mangles vector operators into UDF calls; that rewrite is
     // irrelevant to (and would only confuse) the analytical engine, which
@@ -4843,6 +4862,184 @@ async fn exec_drop_index(
     })
 }
 
+/// Count of INSERT statements served end-to-end by the pre-parse literal fast
+/// path (classifier + header-only parse + tuple scanner, no whole-statement
+/// libpg_query/sqlparser parse). Test-visible instrumentation; relaxed
+/// ordering is fine for a monotone counter.
+pub(crate) static INSERTS_PREPARSE_FASTPATH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Pre-parse fast path for plain auto-commit literal `INSERT … VALUES` —
+/// the hook `execute` runs BEFORE either whole-statement parser.
+///
+/// Returns:
+/// * `None` — decline; the caller must run the normal (double-parse) path,
+///   which reproduces every behaviour including canonical errors. Declining
+///   may have invalidated session caches exactly as the normal dispatch gate
+///   would for this statement (it is an INSERT either way), so a decline is
+///   never observable.
+/// * `Some(result)` — the statement was fully executed here.
+///
+/// Engagement gates, in order (each one mirrors a piece of the normal path —
+/// see the bookkeeping audit below):
+/// 1. **Auto-commit only**: an open OR aborted transaction declines, so the
+///    in-tx buffering path and the 25P02 aborted-state guard stay with the
+///    normal path.
+/// 2. **Classifier** ([`crate::values_fast::classify_literal_insert`]): an
+///    O(prefix) structural scan of the header. No match → decline.
+/// 3. **No pending OVERRIDING**: the textual `OVERRIDING` pre-screen of the
+///    normal path stashes session state this path never consumes; the
+///    classifier grammar already excludes the clause from THIS statement, but
+///    a stale stash from a prior statement also declines (peeked, not taken,
+///    so the normal path sees identical state).
+/// 4. **Header re-parse**: `sql[..VALUES]` + `" (NULL)"` through sqlparser —
+///    an O(header) parse that owns ident case folding / reserved-word
+///    semantics and yields the same `Insert` node fields (`columns`, table
+///    object name) the normal path would dispatch on. Parse failure or any
+///    unexpected field (`on`, `returning`, `partitioned`, alias …) → decline.
+/// 5. **Cache invalidation** (replicates `dispatch_parsed_statement`'s
+///    `!stmt_keeps_cache` gate for an auto-commit INSERT): table-meta,
+///    provider, head-probe caches + per-project PK row cache. Done BEFORE the
+///    table-meta load below so this path can never write through a snapshot
+///    the normal path would have refused as stale.
+/// 6. **Hypertable decline**: the normal path's best-effort
+///    `touch_hypertable_chunks_from_insert` needs the parsed VALUES rows;
+///    rather than replicate it, hypertable targets keep the normal path.
+/// 7. **Table meta load** (same `load_table_meta_cached_err` the normal
+///    `exec_insert` uses): missing table / catalog error → decline, and the
+///    normal path surfaces the canonical error.
+/// 8. **Non-partitioned only**: `RangeMonthly` targets decline (the
+///    partition fan-out path needs per-row AST exprs).
+/// 9. **Tuple scan** ([`crate::values_fast::try_fast_insert_at`]): the
+///    existing conservative scanner, started at the classifier's offset. It
+///    enforces the airtight tail contract — after the final tuple only
+///    whitespace and at most one `;` may remain, so `RETURNING` /
+///    `ON CONFLICT` / a second statement decline here. Identity / generated /
+///    default-bearing columns, unsupported types, and every literal-shape
+///    doubt also decline inside it.
+///
+/// Bookkeeping replicated vs declined (audit of what the normal path does
+/// before/around `exec_insert` for this statement shape):
+/// * `touch_last_active` + reaped-session check — run by `execute` before
+///   this hook.
+/// * Per-project op/latency/error counters + noisy-project estimator — in
+///   `ProjectSession::execute`, outside this hook (unchanged).
+/// * Parser depth guard (`check_parse_depth`) — not needed: no recursive
+///   parser runs on the engaged path (classifier + scanner are iterative),
+///   and any statement the scanner accepts has paren depth ≤ 2, far below
+///   the guard's limit, so the guard could never have rejected it.
+/// * libpg_query noop-accept / reject gates, DDL pre-screens, textual
+///   matchers, rewrite pipeline — all no-ops for this statement shape (the
+///   classifier grammar guarantees the statement starts `INSERT INTO ident`),
+///   with the same raw-text exposure the existing AST-hook fast path already
+///   has (`exec_insert` hands `raw_sql` to the scanner today).
+/// * Query-insights / stat_statements — `query_stats().observe` only records
+///   SELECTs (exec_select); the normal INSERT path records nothing, so there
+///   is nothing to replicate.
+/// * Cost check (`cost_limit_rows`) — Query-only; not applicable.
+/// * RLS WITH CHECK, constraints, generated columns, shard/write paths,
+///   audit, secondary indexes — all inside `exec_insert_prebuilt`, shared
+///   verbatim with the normal path.
+async fn try_insert_preparse(
+    sess: &ProjectSession,
+    raw_sql: &str,
+) -> Option<Result<ExecResult>> {
+    // Gate 2 first (cheapest): the O(prefix) classifier bails on the first
+    // non-INSERT token, so non-INSERT statements (point SELECTs etc.) pay no
+    // lock at all here.
+    let prefix = crate::values_fast::classify_literal_insert(raw_sql)?;
+
+    // Gate 1: auto-commit only.
+    if crate::session::tx_is_active(&sess.state) || crate::session::tx_is_aborted(&sess.state) {
+        return None;
+    }
+
+    // Gate 3: stale pending-OVERRIDING stash → decline (peek, don't take).
+    if sess
+        .state
+        .pending_overriding
+        .lock()
+        .ok()?
+        .is_some()
+    {
+        return None;
+    }
+
+    // Gate 4: header-only sqlparser parse. `header (NULL)` is a complete
+    // one-tuple INSERT; sqlparser never sees the multi-MB tail.
+    let head = &raw_sql[..prefix.values_end];
+    let mut synthetic = String::with_capacity(head.len() + 8);
+    synthetic.push_str(head);
+    synthetic.push_str(" (NULL)");
+    let dialect = PostgreSqlDialect {};
+    let mut stmts = Parser::parse_sql(&dialect, &synthetic).ok()?;
+    if stmts.len() != 1 {
+        return None;
+    }
+    let ins = match stmts.pop()? {
+        Statement::Insert(ins) => ins,
+        _ => return None,
+    };
+    // Defensive: the classifier grammar excludes all of these, but the seam
+    // below is only valid for the plain shape — re-check on the parsed node.
+    if ins.on.is_some()
+        || ins.returning.is_some()
+        || ins.partitioned.is_some()
+        || !ins.after_columns.is_empty()
+        || ins.table_alias.is_some()
+        || ins.source.is_none()
+    {
+        return None;
+    }
+    let name = single_part_name(crate::pg_ast::insert_object_name(&ins).ok()?).ok()?;
+    let table = TableName::new(name).ok()?;
+
+    // Gate 5: replicate the dispatch-gate cache invalidation for an
+    // auto-commit INSERT (`!stmt_keeps_cache`). See the rationale on the
+    // block in `dispatch_parsed_statement`; running it on a statement that
+    // later declines is harmless — the normal path re-runs it.
+    sess.state.table_meta_cache.invalidate_all();
+    sess.state.provider_cache.invalidate_all();
+    sess.state.head_probe_cache.invalidate_all();
+    sess.engine.pk_row_cache().invalidate_project(&sess.project);
+
+    // Gate 6: hypertable targets need chunk bookkeeping from the parsed rows.
+    if sess
+        .engine
+        .hypertable_registry()
+        .time_column(&sess.project, table.as_str())
+        .await
+        .is_some()
+    {
+        return None;
+    }
+
+    // Gate 7: table metadata (same loader + cache as `exec_insert`).
+    let meta = crate::session::load_table_meta_cached_err(sess, &table)
+        .await
+        .ok()?;
+
+    // Gate 8: partitioned targets keep the per-row AST path.
+    if matches!(meta.partition_spec, PartitionSpec::RangeMonthly { .. }) {
+        return None;
+    }
+
+    // Gate 9: scan the tuple list straight into Arrow batches.
+    let batches = crate::values_fast::try_fast_insert_at(
+        raw_sql,
+        prefix.values_end,
+        meta.schema.as_ref(),
+        &ins.columns,
+    )?;
+    let batch = arrow::compute::concat_batches(&meta.schema, batches.iter()).ok()?;
+
+    INSERTS_PREPARSE_FASTPATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // Same execution seam the AST path uses after building its batch.
+    // RETURNING is impossible here (gate 9 declines any trailing clause).
+    Some(exec_insert_prebuilt(sess, &table, &meta, batch, false).await)
+}
+
 async fn exec_insert(
     sess: &ProjectSession,
     ins: sqlparser::ast::Insert,
@@ -5153,14 +5350,40 @@ async fn exec_insert(
         });
     }
 
-    // Seam shared by both the literal-VALUES fast path and the slow
-    // AST→Arrow path. Everything below (generated columns, constraints,
-    // write, audit, RETURNING) runs identically regardless of which arm
-    // produced `batch`.
+    // Seam shared by the literal-VALUES fast paths and the slow AST→Arrow
+    // path. Everything inside `exec_insert_prebuilt` (generated columns,
+    // constraints, write, audit, RETURNING) runs identically regardless of
+    // which arm produced `batch`.
     let batch = match fast_batch {
         Some(b) => b,
         None => batch_from_rows(schema, rows)?,
     };
+    exec_insert_prebuilt(sess, &table, &meta, batch, ins.returning.is_some()).await
+}
+
+/// Post-batch-build INSERT execution: the shared seam for every non-partitioned
+/// INSERT arm once a full-width `RecordBatch` exists.
+///
+/// Callers:
+/// * `exec_insert` — both its slow AST→Arrow arm (`batch_from_rows`) and its
+///   literal-VALUES fast arm (`values_fast::try_fast_insert`).
+/// * `try_insert_preparse` — the pre-parse fast path, which never runs the
+///   whole-statement parsers at all. That caller is restricted (by its own
+///   gates) to plain auto-commit literal inserts: no ON CONFLICT, no
+///   OVERRIDING, no RETURNING (`has_returning == false`), no partitioned
+///   target — so every branch in here behaves exactly as it does when reached
+///   through `exec_insert`.
+///
+/// `meta` must be the same `TableMetadata` snapshot used to build `batch`
+/// (schema width/order must match), and `has_returning` mirrors
+/// `ins.returning.is_some()` on the AST path.
+async fn exec_insert_prebuilt(
+    sess: &ProjectSession,
+    table: &TableName,
+    meta: &TableMetadata,
+    batch: RecordBatch,
+    has_returning: bool,
+) -> Result<ExecResult> {
     let batch = crate::generated_cols::materialise_generated_columns(
         &sess.engine.config().catalog,
         &sess.project,
@@ -5364,7 +5587,7 @@ async fn exec_insert(
         // Parquet path exists).  Intra-tx SELECTs fall back to a full scan
         // against the HtapUnionTable provider, which is correct (no index
         // means no GIN/B-tree pruning — same semantics as a fresh table).
-        if ins.returning.is_some() {
+        if has_returning {
             return Ok(ExecResult::Rows {
                 schema: batch.schema(),
                 batches: vec![batch],
@@ -5495,7 +5718,7 @@ async fn exec_insert(
     maintain_secondary_indexes_on_insert(sess, &table, &meta, &batch, df.path.as_ref()).await;
 
     // RETURNING: if the caller asked for RETURNING *, return the inserted batch.
-    if ins.returning.is_some() {
+    if has_returning {
         return Ok(ExecResult::Rows {
             schema: batch.schema(),
             batches: vec![batch],
@@ -11825,6 +12048,194 @@ mod auto_commit_ryow_tests {
 
         let n2 = count_from_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
         assert_eq!(n2, 2, "both rows must be visible after INSERT RETURNING");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pre-parse literal-INSERT fast path — engagement / decline gates.
+// ---------------------------------------------------------------------------
+// These tests call `try_insert_preparse` directly so engagement is asserted
+// without relying on the process-global counter alone (other tests in this
+// binary run concurrently and also bump it — e.g. every plain literal INSERT
+// in `auto_commit_ryow_tests` engages the path). The byte-equivalence of the
+// engaged path vs the declined path is covered end-to-end by the integration
+// suite (`tests/integration/tests/values_fast_ingest.rs`).
+#[cfg(test)]
+mod preparse_fastpath_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use arrow_array::Int64Array;
+    use basin_catalog::{Catalog, InMemoryCatalog};
+    use basin_common::ProjectId;
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    use super::{try_insert_preparse, INSERTS_PREPARSE_FASTPATH};
+    use crate::{Engine, EngineConfig, ExecResult};
+
+    fn make_engine(dir: &TempDir) -> Engine {
+        let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
+            object_store: Arc::new(fs),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+        Engine::new(EngineConfig {
+            storage,
+            catalog,
+            shard: None,
+        })
+    }
+
+    fn count_from_result(res: ExecResult) -> i64 {
+        let batches = match res {
+            ExecResult::Rows { batches, .. } => batches,
+            ExecResult::Empty { tag } => panic!("expected Rows, got Empty({tag})"),
+        };
+        batches.first().expect("no batch")
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count must be Int64")
+            .value(0)
+    }
+
+    #[tokio::test]
+    async fn engages_on_plain_multi_row_literal_insert() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, s TEXT)")
+            .await
+            .unwrap();
+
+        let before = INSERTS_PREPARSE_FASTPATH.load(Ordering::Relaxed);
+        let res = try_insert_preparse(
+            &sess,
+            "INSERT INTO t (id, s) VALUES (1, 'a'), (2, 'b''c'), (3, NULL)",
+        )
+        .await;
+        let res = res.expect("pre-parse path must engage on the plain literal shape");
+        match res.expect("engaged insert must succeed") {
+            ExecResult::Empty { tag } => assert_eq!(tag, "INSERT 0 3"),
+            other => panic!("expected INSERT tag, got {other:?}"),
+        }
+        // ≥ 1, not == 1: other tests in this binary bump the global counter
+        // concurrently.
+        assert!(
+            INSERTS_PREPARSE_FASTPATH.load(Ordering::Relaxed) > before,
+            "engagement counter must advance"
+        );
+
+        let n = count_from_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
+        assert_eq!(n, 3, "engaged rows must be visible to the next SELECT");
+    }
+
+    #[tokio::test]
+    async fn engages_via_execute_entry_point() {
+        // Same shape through the public `execute` path (the real hook site).
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, s TEXT)")
+            .await
+            .unwrap();
+        let before = INSERTS_PREPARSE_FASTPATH.load(Ordering::Relaxed);
+        sess.execute("INSERT INTO t (id, s) VALUES (10, 'x'), (11, 'y')")
+            .await
+            .unwrap();
+        assert!(
+            INSERTS_PREPARSE_FASTPATH.load(Ordering::Relaxed) > before,
+            "execute() must route the plain literal shape through the pre-parse path"
+        );
+        let n = count_from_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
+        assert_eq!(n, 2);
+    }
+
+    #[tokio::test]
+    async fn declines_on_trailing_clauses_and_non_literal_shapes() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, s TEXT)")
+            .await
+            .unwrap();
+        sess.execute("CREATE TABLE t2 (id BIGINT NOT NULL PRIMARY KEY, s TEXT)")
+            .await
+            .unwrap();
+
+        // Trailing clause after the tuples → the tuple scanner declines.
+        for sql in [
+            "INSERT INTO t (id, s) VALUES (1, 'a') RETURNING id",
+            "INSERT INTO t (id, s) VALUES (1, 'a') ON CONFLICT (id) DO NOTHING",
+            "INSERT INTO t (id, s) VALUES (1, 'a'); INSERT INTO t (id, s) VALUES (2, 'b')",
+            // Header shapes the classifier itself declines.
+            "INSERT INTO t2 SELECT * FROM t",
+            "WITH x AS (SELECT 4 AS id) INSERT INTO t (id) SELECT id FROM x",
+            "INSERT INTO t DEFAULT VALUES",
+            // Non-literal tuple values → scanner declines.
+            "INSERT INTO t (id, s) VALUES (1 + 1, 'a')",
+            "INSERT INTO t (id, s) VALUES ($1, 'a')",
+        ] {
+            assert!(
+                try_insert_preparse(&sess, sql).await.is_none(),
+                "must decline: {sql}"
+            );
+        }
+        // Nothing was written by the declined probes.
+        let n = count_from_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn declines_inside_explicit_transaction() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, s TEXT)")
+            .await
+            .unwrap();
+
+        sess.execute("BEGIN").await.unwrap();
+        assert!(
+            try_insert_preparse(&sess, "INSERT INTO t (id, s) VALUES (1, 'a'), (2, 'b')")
+                .await
+                .is_none(),
+            "pre-parse path is auto-commit-only"
+        );
+        // The normal in-tx path still handles the same statement.
+        sess.execute("INSERT INTO t (id, s) VALUES (1, 'a'), (2, 'b')")
+            .await
+            .unwrap();
+        sess.execute("COMMIT").await.unwrap();
+        let n = count_from_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
+        assert_eq!(n, 2);
+    }
+
+    #[tokio::test]
+    async fn declined_returning_still_works_via_execute() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, s TEXT)")
+            .await
+            .unwrap();
+        // Full execute(): RETURNING declines the pre-parse path and the
+        // normal path returns the inserted batch.
+        match sess
+            .execute("INSERT INTO t (id, s) VALUES (1, 'a'), (2, 'b') RETURNING *")
+            .await
+            .unwrap()
+        {
+            ExecResult::Rows { batches, .. } => {
+                let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                assert_eq!(rows, 2, "RETURNING must surface both inserted rows");
+            }
+            other => panic!("expected Rows from RETURNING, got {other:?}"),
+        }
     }
 }
 

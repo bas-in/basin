@@ -83,7 +83,20 @@
 //!
 //! The caller is responsible for the *other* preconditions (no ON CONFLICT, no
 //! OVERRIDING clause, every omitted column is a plain nullable column with no
-//! DEFAULT/IDENTITY/generated filling required) — see the executor hook.
+//! DEFAULT/IDENTITY/generated filling required) — see the executor hooks.
+//!
+//! ## Two executor hooks
+//!
+//! 1. **AST hook** (`exec_insert` → [`try_fast_insert`]): the statement was
+//!    fully parsed (libpg_query + sqlparser) and only the VALUES tail is
+//!    re-scanned. The original integration point.
+//! 2. **Pre-parse hook** (`executor::try_insert_preparse` →
+//!    [`classify_literal_insert`] + [`try_fast_insert_at`]): the statement is
+//!    classified by an O(prefix) header scan BEFORE either full parser runs,
+//!    so an engaged bulk INSERT never pays the two whole-statement parses at
+//!    all. The classifier only locates the tuple list; header *semantics*
+//!    (ident case folding, keyword-ness, table resolution) are delegated to a
+//!    tiny sqlparser parse of just the header in the executor.
 
 use std::sync::Arc;
 
@@ -165,6 +178,20 @@ pub(crate) fn try_fast_insert(
     schema: &Schema,
     insert_columns: &[sqlparser::ast::Ident],
 ) -> Option<Vec<RecordBatch>> {
+    let values_end = find_values_keyword(sql.as_bytes())?;
+    try_fast_insert_at(sql, values_end, schema, insert_columns)
+}
+
+/// [`try_fast_insert`] variant for the pre-parse executor hook: the caller
+/// (the [`classify_literal_insert`] classifier) has already located the byte
+/// offset just past the `VALUES` keyword, so no keyword search is needed.
+/// Identical eligibility gates and identical output to [`try_fast_insert`].
+pub(crate) fn try_fast_insert_at(
+    sql: &str,
+    values_end: usize,
+    schema: &Schema,
+    insert_columns: &[sqlparser::ast::Ident],
+) -> Option<Vec<RecordBatch>> {
     let n_cols = schema.fields().len();
 
     // Resolve the per-tuple-position → schema-column-index mapping.
@@ -218,7 +245,7 @@ pub(crate) fn try_fast_insert(
         }
     }
 
-    try_parse_literal_values(sql, schema, &insert_cols)
+    try_parse_literal_values_from(sql, values_end, schema, &insert_cols)
 }
 
 /// Try to scan a literal `INSERT ... VALUES` tail directly into Arrow batches.
@@ -238,6 +265,24 @@ pub(crate) fn try_parse_literal_values(
     schema: &Schema,
     insert_cols: &[usize],
 ) -> Option<Vec<RecordBatch>> {
+    let values_end = find_values_keyword(sql.as_bytes())?;
+    try_parse_literal_values_from(sql, values_end, schema, insert_cols)
+}
+
+/// [`try_parse_literal_values`] with the `VALUES`-keyword search already done:
+/// `values_end` is the byte offset just past the keyword (always an ASCII
+/// boundary). Both entry points funnel here so the scan body exists once.
+fn try_parse_literal_values_from(
+    sql: &str,
+    values_end: usize,
+    schema: &Schema,
+    insert_cols: &[usize],
+) -> Option<Vec<RecordBatch>> {
+    // Defensive bounds check: a caller-supplied offset past EOF (impossible
+    // from our own classifiers, but cheap to refuse) declines to the slow path.
+    if values_end > sql.len() {
+        return None;
+    }
     let arity = insert_cols.len();
     if arity == 0 {
         return None;
@@ -256,14 +301,10 @@ pub(crate) fn try_parse_literal_values(
         }
     }
 
-    // Locate the `VALUES` keyword outside of any single-quoted string. We scan
-    // the raw bytes for a case-insensitive `values` token bounded by
-    // non-identifier characters; an occurrence inside a string literal (e.g. a
-    // column value `'values'` in an earlier part of the statement — not
-    // possible here since this is the header, but defensively handled) is
-    // skipped.
+    // `values_end` points just past the `VALUES` keyword (located by
+    // `find_values_keyword` on the AST-hook path, or by the pre-parse
+    // classifier's structural header scan). The scan starts there.
     let bytes = sql.as_bytes();
-    let values_end = find_values_keyword(bytes)?;
 
     let mut sc = Scanner {
         b: bytes,
@@ -399,6 +440,197 @@ pub(crate) fn try_parse_literal_values(
         return None;
     }
     Some(out)
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Pre-parse classifier (executor hook 2)
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Output of [`classify_literal_insert`]: where the literal tuple list begins.
+pub(crate) struct LiteralInsertPrefix {
+    /// Byte offset just past the `VALUES` keyword (always an ASCII boundary).
+    /// `sql[..values_end]` is the complete statement header;
+    /// `sql[values_end..]` is the tuple list the scanner consumes.
+    pub(crate) values_end: usize,
+}
+
+/// O(prefix) classifier for the pre-parse INSERT fast path.
+///
+/// Scans ONLY the statement header — never the (potentially multi-megabyte)
+/// `VALUES` tail — and decides whether this *could* be a plain literal
+/// multi-row INSERT:
+///
+/// ```text
+///   header    := pad INSERT pad INTO pad table_ref pad
+///                ( '(' pad ident pad ( ',' pad ident pad )* ')' pad )?
+///                VALUES                      (word-bounded, case-insensitive)
+///   table_ref := ident ( pad '.' pad ident )?      (≤ 1 schema qualifier)
+///   ident     := [A-Za-z_][A-Za-z0-9_$]*  |  '"' ( [^"] | '""' )+ '"'
+///   pad       := ( ws | '--' line-comment | nested '/* */' block-comment )*
+/// ```
+///
+/// plus a peek that the first non-whitespace byte after `VALUES` is `(` (the
+/// tuple scanner's required opener). ANY deviation — `WITH`/CTE,
+/// `INSERT … SELECT`, `DEFAULT VALUES`, `OVERRIDING`, a table alias,
+/// three-part names, parameters, anything unrecognised — returns `None` and
+/// the caller runs the normal double-parse path unchanged.
+///
+/// Correctness split: this classifier is only trusted to be structurally
+/// right about WHERE the tuple list starts. Header *semantics* (identifier
+/// case folding, reserved-word rejection, table-name resolution) are
+/// delegated to the executor, which re-parses just `sql[..values_end]` with
+/// sqlparser (an O(header) parse) and declines on any disagreement. Trailing
+/// clauses AFTER the tuples (`RETURNING`, `ON CONFLICT`, a second
+/// `;`-separated statement) are the tuple scanner's job: it declines on any
+/// non-whitespace byte after the final tuple other than one `;`.
+pub(crate) fn classify_literal_insert(sql: &str) -> Option<LiteralInsertPrefix> {
+    let b = sql.as_bytes();
+    let mut i = skip_pad(b, 0);
+    i = expect_keyword_ci(b, i, b"insert")?;
+    i = skip_pad(b, i);
+    i = expect_keyword_ci(b, i, b"into")?;
+    i = skip_pad(b, i);
+
+    // table_ref: ident, optionally schema-qualified by exactly one `.` part.
+    i = read_header_ident(b, i)?;
+    i = skip_pad(b, i);
+    if b.get(i) == Some(&b'.') {
+        i = skip_pad(b, i + 1);
+        i = read_header_ident(b, i)?;
+        i = skip_pad(b, i);
+        // A third name part (`a.b.c`) is not a shape we take.
+        if b.get(i) == Some(&b'.') {
+            return None;
+        }
+    }
+
+    // Optional `(col, col, …)` ident list. Anything that is not a plain or
+    // quoted ident inside the parens (expressions, numbers, `*`) declines.
+    if b.get(i) == Some(&b'(') {
+        i += 1;
+        loop {
+            i = skip_pad(b, i);
+            i = read_header_ident(b, i)?;
+            i = skip_pad(b, i);
+            match b.get(i)? {
+                b',' => i += 1,
+                b')' => {
+                    i += 1;
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        i = skip_pad(b, i);
+    }
+
+    // The VALUES keyword must come immediately next — `OVERRIDING … VALUE`,
+    // `DEFAULT VALUES`, `SELECT`, a table alias, etc. all fail here.
+    let values_end = expect_keyword_ci(b, i, b"values")?;
+
+    // Peek: the tuple scanner requires `(` as the first non-whitespace byte
+    // after VALUES (it does not skip comments), so decline early otherwise.
+    let mut k = values_end;
+    while k < b.len() && matches!(b[k], b' ' | b'\t' | b'\n' | b'\r') {
+        k += 1;
+    }
+    if b.get(k) != Some(&b'(') {
+        return None;
+    }
+
+    Some(LiteralInsertPrefix { values_end })
+}
+
+/// Skip whitespace, `--` line comments, and (nested) `/* */` block comments.
+/// An unterminated block comment returns `len`, which makes every subsequent
+/// token expectation fail → the classifier declines.
+fn skip_pad(b: &[u8], mut i: usize) -> usize {
+    loop {
+        while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n' | b'\r') {
+            i += 1;
+        }
+        if i + 1 < b.len() && b[i] == b'-' && b[i + 1] == b'-' {
+            i += 2;
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if i + 1 < b.len() && b[i] == b'/' && b[i + 1] == b'*' {
+            i += 2;
+            let mut depth = 1usize;
+            while i < b.len() && depth > 0 {
+                if i + 1 < b.len() && b[i] == b'/' && b[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                } else if i + 1 < b.len() && b[i] == b'*' && b[i + 1] == b'/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            if depth > 0 {
+                return b.len(); // unterminated → decline downstream
+            }
+            continue;
+        }
+        return i;
+    }
+}
+
+/// Match `kw` (ASCII case-insensitive) at `i` with a word boundary after it.
+/// Returns the offset just past the keyword.
+fn expect_keyword_ci(b: &[u8], i: usize, kw: &[u8]) -> Option<usize> {
+    let end = i.checked_add(kw.len())?;
+    if end > b.len() || !b[i..end].eq_ignore_ascii_case(kw) {
+        return None;
+    }
+    if let Some(&next) = b.get(end) {
+        if is_ident_byte(next) || next == b'$' {
+            return None;
+        }
+    }
+    Some(end)
+}
+
+/// One header identifier: bare (`[A-Za-z_][A-Za-z0-9_$]*`) or double-quoted
+/// with `""` escapes (non-empty). Returns the offset just past it. The
+/// classifier does not interpret the ident at all — the executor's header
+/// re-parse owns case folding and reserved-word semantics.
+fn read_header_ident(b: &[u8], i: usize) -> Option<usize> {
+    match *b.get(i)? {
+        b'"' => {
+            let mut j = i + 1;
+            loop {
+                match *b.get(j)? {
+                    b'"' => {
+                        if b.get(j + 1) == Some(&b'"') {
+                            j += 2; // "" escape
+                            continue;
+                        }
+                        if j == i + 1 {
+                            return None; // empty quoted ident
+                        }
+                        return Some(j + 1);
+                    }
+                    _ => j += 1,
+                }
+            }
+        }
+        c if c == b'_' || c.is_ascii_alphabetic() => {
+            let mut j = i + 1;
+            while let Some(&n) = b.get(j) {
+                if is_ident_byte(n) || n == b'$' {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            Some(j)
+        }
+        _ => None,
+    }
 }
 
 /// Whether the scanner builds Arrow directly for this column's type. Decorated
@@ -1458,6 +1690,105 @@ mod tests {
         assert_eq!(b[1].num_rows(), 100);
         let total: usize = b.iter().map(|r| r.num_rows()).sum();
         assert_eq!(total, n);
+    }
+
+    // ── pre-parse classifier ─────────────────────────────────────────────────
+
+    /// Classify and return the tail (everything past the reported
+    /// `values_end`) so tests can assert the offset is structurally right.
+    fn classify_tail(sql: &str) -> Option<&str> {
+        classify_literal_insert(sql).map(|p| &sql[p.values_end..])
+    }
+
+    #[test]
+    fn classify_accepts_plain_shapes() {
+        assert_eq!(
+            classify_tail("INSERT INTO t (a,b) VALUES (1,'x')"),
+            Some(" (1,'x')")
+        );
+        // No column list.
+        assert_eq!(classify_tail("INSERT INTO t VALUES (1)"), Some(" (1)"));
+        // Schema-qualified, mixed-case keywords, newlines.
+        assert_eq!(
+            classify_tail("insert into public.t (a)\nvalues\n(1)"),
+            Some("\n(1)")
+        );
+        // Quoted idents (table, schema, columns) — including a quoted ident
+        // that *contains* the VALUES keyword text and parens.
+        assert_eq!(
+            classify_tail("INSERT INTO \"S\".\"weird values (t)\" (\"a b\", c) VALUES (1,2)"),
+            Some(" (1,2)")
+        );
+        // Leading comments (line + nested block) and comments between tokens.
+        assert_eq!(
+            classify_tail("-- load\n/* outer /* inner */ */ INSERT /*x*/ INTO t VALUES (1)"),
+            Some(" (1)")
+        );
+        // The classifier only checks the header — trailing clauses after the
+        // tuples are the tuple scanner's job (it declines on them).
+        assert_eq!(
+            classify_tail("INSERT INTO t VALUES (1) RETURNING id"),
+            Some(" (1) RETURNING id")
+        );
+    }
+
+    #[test]
+    fn classify_declines_non_candidates() {
+        // Not an INSERT at all.
+        assert!(classify_tail("SELECT 1").is_none());
+        // CTE prefix.
+        assert!(classify_tail(
+            "WITH x AS (SELECT 1) INSERT INTO t VALUES (1)"
+        )
+        .is_none());
+        // INSERT…SELECT (no VALUES after the column list).
+        assert!(classify_tail("INSERT INTO t (a) SELECT a FROM s").is_none());
+        assert!(classify_tail("INSERT INTO t SELECT * FROM s").is_none());
+        // DEFAULT VALUES.
+        assert!(classify_tail("INSERT INTO t DEFAULT VALUES").is_none());
+        // OVERRIDING clause between column list and VALUES.
+        assert!(classify_tail(
+            "INSERT INTO t (a) OVERRIDING SYSTEM VALUE VALUES (1)"
+        )
+        .is_none());
+        // Table alias.
+        assert!(classify_tail("INSERT INTO t AS x (a) VALUES (1)").is_none());
+        // Three-part name.
+        assert!(classify_tail("INSERT INTO a.b.c VALUES (1)").is_none());
+        // Expression / number in the column list.
+        assert!(classify_tail("INSERT INTO t (a, 1) VALUES (1,2)").is_none());
+        assert!(classify_tail("INSERT INTO t (a+b) VALUES (1)").is_none());
+        // Empty / malformed column list.
+        assert!(classify_tail("INSERT INTO t () VALUES (1)").is_none());
+        assert!(classify_tail("INSERT INTO t (a,) VALUES (1)").is_none());
+        // VALUES not followed by `(`.
+        assert!(classify_tail("INSERT INTO t VALUES").is_none());
+        assert!(classify_tail("INSERT INTO t VALUES /*c*/ (1)").is_none());
+        // `VALUES` only as a prefix of a longer ident (word boundary).
+        assert!(classify_tail("INSERT INTO t VALUESX (1)").is_none());
+        // Unterminated quoted ident / block comment.
+        assert!(classify_tail("INSERT INTO \"t VALUES (1)").is_none());
+        assert!(classify_tail("/* open INSERT INTO t VALUES (1)").is_none());
+        // Empty quoted ident.
+        assert!(classify_tail("INSERT INTO \"\" VALUES (1)").is_none());
+        // MySQL-isms.
+        assert!(classify_tail("INSERT IGNORE INTO t VALUES (1)").is_none());
+        assert!(classify_tail("INSERT INTO t SET a = 1").is_none());
+    }
+
+    #[test]
+    fn classify_offset_feeds_scanner() {
+        // End-to-end: the classifier's offset must drop the scanner exactly at
+        // the tuple list, producing the same batches as the keyword-search
+        // entry point.
+        let s = schema_iib();
+        let sql = "INSERT INTO t (a,b,c) VALUES (1,'x',TRUE),(2,'y',FALSE)";
+        let p = classify_literal_insert(sql).expect("classifies");
+        let via_classifier =
+            try_parse_literal_values_from(sql, p.values_end, &s, &[0, 1, 2]).expect("scans");
+        let via_search = try_parse_literal_values(sql, &s, &[0, 1, 2]).expect("scans");
+        assert_eq!(via_classifier.len(), via_search.len());
+        assert_eq!(via_classifier[0], via_search[0]);
     }
 
     #[test]
