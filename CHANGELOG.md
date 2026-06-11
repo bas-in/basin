@@ -8,6 +8,80 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-11 — FTS: GIN-on-tsvector pruning hardened (5.20.E), to_tsquery stemming
+
+### Added
+
+- **GIN-on-tsvector CREATE INDEX backfill** — `CREATE INDEX … USING gin
+  (tsvector_col)` now backfills the FTS lexeme posting list over
+  pre-existing live files (after settling any live hot-tier overlay), so an
+  index created after data exists actually prunes instead of never reaching
+  full coverage. Accepts Utf8 / LargeUtf8 / Utf8View readback encodings and
+  records true row-group ordinals.
+- **`to_tsquery` Snowball stemming** — `to_tsquery([config,] text)` stems
+  each lexeme through the same pipeline as `to_tsvector` (PG parity:
+  `to_tsquery('english','runs')` now matches a document containing
+  `running`). Raw `::tsquery` casts remain unstemmed, matching PG. The GIN
+  probe consumes the identical canonical form, so probe lexemes and `@@`
+  re-evaluation can never disagree.
+- **Adversarial FTS pruning harness** (`fts_harness.rs` slice 6) — stem
+  consistency (incl. a `simple`-config trap), OR-unions-files, NOT/phrase
+  soundness, live-overlay vetoes for both fast paths,
+  CREATE-INDEX-over-overlay settle, incomplete-coverage degradation, and a
+  read-counter test pinning that a 3-file layout reads ≤ 1 file when pruned
+  and all 3 on the unprunable shape.
+
+### Fixed
+
+- **Structural tsquery probe (wrong-results class)** — the FTS posting-list
+  probe previously AND-merged every lexeme atom regardless of the query's
+  boolean structure: `'cat' | 'dog'` over files each holding only one of
+  the lexemes intersected to ∅ and short-circuited to zero rows;
+  `'cat' & !'dog'` pruned to the files containing `dog`. The probe now
+  parses the canonical tsquery and evaluates it — `&`/`<->` intersect file
+  sets, `|` unions them, `!` and never-indexed lexemes decline to a full
+  scan.
+- **FTS Empty short-circuit + pruning now carry the GIN safety contract** —
+  both are gated on no-live-overlay (O(1) counters) and per-file
+  completeness (every live file indexed), mirroring the JSONB GIN guards;
+  in-transaction SELECTs decline FTS pruning entirely. Posting-budget
+  eviction un-marks only the affected files (per-file degradation instead
+  of whole-column), file paths are interned, and the insert path records
+  true row-group ordinals (previously everything landed on row-group 0 — a
+  false-negative risk for batches larger than one row-group).
+- **Config-aware probe canonicalisation** — a `plainto_tsquery('simple', …)`
+  probe was canonicalised with the English stemmer, which could prune the
+  files holding the real (unstemmed) matches; the config argument is now
+  threaded through, and non-literal configs decline to a full scan.
+
+## 2026-06-11 — COPY: sqlx PgCopyIn shape + binary COPY format
+
+### Added
+
+- **Binary COPY** — `COPY … FROM STDIN / TO STDOUT WITH (FORMAT BINARY)`
+  implements the PG binary COPY format (19-byte `PGCOPY` header, per-tuple
+  `i16` field count + `i32`-length-prefixed fields, `0xFFFF` trailer). Both
+  directions reuse the existing pgwire binary codecs (`decode_param_binary`
+  for COPY-IN fields, the binary `DataRow` field encoder for COPY-OUT), so
+  COPY and extended-protocol binds can't drift. Supported column types:
+  int2/4/8, float4/8, bool, text, bytea, jsonb, uuid, timestamp[tz], date,
+  numeric; anything else (vectors, intervals, arrays) rejects with a clean
+  `0A000` naming the column. CSV-only options (`HEADER` / `DELIMITER` /
+  `NULL` / `QUOTE` / `ESCAPE`) in BINARY mode and BINARY file paths reject
+  with `42601`. Mid-stream errors drain to `CopyDone` exactly like CSV.
+- **Quoted identifiers in COPY** — `COPY "users" (id, email) FROM STDIN`
+  (the verbatim `sqlx::PgCopyIn` statement) now parses; previously failed
+  with `expected table name or '(' after COPY`. Quoted names outside the
+  bare-identifier charset are still rejected (they would be re-rendered
+  into SQL unquoted). The ORM corpus drives the sqlx COPY shape through the
+  real CopyIn sub-protocol and classifies it `Ok`.
+- **Modern option syntax** — `COPY t FROM STDIN (FORMAT CSV)` (parenthesised
+  options without `WITH`, PG ≥ 9.0) and the legacy `WITH BINARY` shorthand.
+- **COPY ingest fast path** — `DATE` columns and fractional-second
+  timestamps (`…15:09:26.535897`) now parse in the batched Arrow ingest
+  path (previously errored; fractional timestamps are what binary COPY-IN
+  decodes to).
+
 ## 2026-06-11 — integrity benchmark run (provenance: single idle-box session, 1M solo)
 
 All Postgres-compare cards (10k / 100k / 1M), the ORM corpus card, and the
