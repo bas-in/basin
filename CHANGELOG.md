@@ -10,13 +10,32 @@ graduate to 1.0 and the standard SemVer guarantees.
 
 ## 2026-06-11 — S4 age-based residency: read-own-insert with zero file opens
 
-- **Fixed: concurrent point-read lock convoy** (`6bb462a`): the
-  unfiltered-decode cache's pre-GET short-circuit put an exclusive
-  page-cache shard lock at the front of the warm read path, and every point
-  read on a file shares one cache key — concurrent readers collapsed 370×
-  (C=16 median 197µs → 73ms, found by the scaling differential against
-  June-5 data). Cache hits now peek under a read lock with opportunistic
-  recency promotion; C=16 medians return to sub-ms.
+- **Fixed: warm point reads collapsed ~30× by the unfiltered-decode cache**
+  (`6bb462a`, `259a145`): two compounding defects, found via a scaling
+  differential against June-5 data. First, every cache hit took an exclusive
+  page-cache shard lock to promote LRU recency, and all point reads on a
+  file share one cache key — a lock convoy (fixed: read-lock peek with
+  opportunistic promotion). Second and dominant: a filtered read that missed
+  the shared entry performed the whole-file unfiltered decode (~20ms on 1M
+  rows) to populate it, and an over-budget entry never admits, so every
+  query repeated the decode; even on a hit, serving meant filtering the
+  full cached decode per query instead of the zone-map-pruned path. Filtered
+  reads are now serve-only consumers, row-gated
+  (`BASIN_UNFILTERED_SERVE_MAX_ROWS`, default 65536); unfiltered scans keep
+  populating and serving at any size. Measured solo (1M-row point reads):
+  C=1 42.7 → 1,255 qps; C=16 218 → 7,851 qps. The concurrency cliff bar was
+  re-derived from measured reality at the same time (`f39b2d5`): non-collapse
+  ≥ 0.7 at C=64 instead of a ≥ 1.5× headroom that never passed any recorded
+  run on this hardware, including the run that introduced it.
+- **Hot-tier UPDATE fast path: batched expression eval + overlay memo**
+  (`081387e`, `98fa44f`): multi-key expression UPDATEs evaluate once over a
+  concatenated pre-image batch instead of building a DataFusion
+  SessionContext per key (the structural reason the small-bulk cap sat at
+  64), and the decoded update overlay is memoized per table keyed by
+  (epoch, update-count) — sound across the flush ack's no-epoch-bump
+  re-tagging — with override rows appended as one batch per scan instead of
+  one single-row batch each. Groundwork for delta updates at higher
+  cardinality.
 - **Retention is now enforced** (`bcef9d1`): the shard background loop
   gained a clean-retention sweep (`BASIN_HOTTIER_SWEEP_SECS`, default 30 s)
   calling `enforce_clean_budgets` — previously nothing in production drove
