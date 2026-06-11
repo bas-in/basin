@@ -8,6 +8,28 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-11 — memtable MVCC version chains; fast VALUES scanner: JSONB + timestamps
+
+- **MVCC version chains in the memtable** (`8d9fc2d`): hot-tier entries keep
+  oldest-first version chains instead of latest-only. A pinned snapshot read
+  keeps being served its own version across any number of subsequent
+  overwrites by other sessions — previously a second overwrite could push a
+  pinned reader back to the cold pre-image. Chains drain whole at flush
+  acknowledgement; per-version bytes feed the existing memory budget. This is
+  the S4 row-tier MVCC kernel; age-based residency lands next. Pinned by the
+  new `row_tier_mvcc.rs` suite.
+- **Fast VALUES scanner admits JSONB and timestamp literals** (`803d8a5`):
+  multi-row literal INSERTs on schemas with JSONB / timestamp columns (the
+  common events-table shape) now take the fast scanner instead of falling
+  back to full AST parsing + per-row coercion. JSONB documents are
+  canonicalized through the same encoder as the slow path; byte-level
+  fast-vs-slow equivalence on a 10k-row benchmark-shaped table is pinned by
+  `values_fast_ingest.rs`.
+- **Robust benchmark estimator** (`7ae4a1a`): per-shape card numbers reduce
+  through median (n ≥ 5 samples) or min-of-K (below), and 1M-row shapes are
+  floored at 3 samples — single-shot 1M numbers could previously swing 3× on
+  scheduling noise. Both the Postgres and Basin sides use the same estimator.
+
 ## 2026-06-10 — OLTP scale + correctness wave; HTAP / ORM / extensions roadmap
 
 Two work waves landed since `origin/main`: (1) OLTP scale fixes + correctness
