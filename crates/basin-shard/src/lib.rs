@@ -42,6 +42,10 @@ use basin_common::{PartitionKey, ProjectId, Result, TableName};
 /// (`BASIN_HOTTIER_SWEEP_SECS`).
 const DEFAULT_CLEAN_SWEEP_SECS: u64 = 30;
 
+/// Default cadence of the stripe-merge compaction sweep, seconds
+/// (`BASIN_STRIPE_MERGE_SECS`). `0` disables the sweep entirely.
+const DEFAULT_STRIPE_MERGE_SECS: u64 = 60;
+
 /// Knobs for [`Shard::new`].
 #[derive(Clone)]
 pub struct ShardConfig {
@@ -63,6 +67,14 @@ pub struct ShardConfig {
     /// flushes; the shard compactor remains the sole durable flusher.
     /// Default 30 s (`BASIN_HOTTIER_SWEEP_SECS`).
     pub clean_sweep_interval: Duration,
+    /// How often the background loop runs the stripe-merge compaction sweep
+    /// — merging a table's overlapping per-stripe cold files into fewer
+    /// files with disjoint PK ranges so keyset pagination
+    /// (`WHERE pk > $1 ORDER BY pk LIMIT k`) prunes to 1-2 file opens
+    /// instead of opening every stripe file. Default 60 s
+    /// (`BASIN_STRIPE_MERGE_SECS`); a zero duration (env value `0`)
+    /// disables the sweep.
+    pub stripe_merge_interval: Duration,
     /// Phase 6.X.A — optional lease registry (ADR 0023). When present, the
     /// shard acquires a lease per `(project, partition)` it owns and the
     /// background heartbeat renews held leases on a fixed cadence; a renewal
@@ -127,6 +139,10 @@ impl ShardConfig {
             clean_sweep_interval: Duration::from_secs(env_secs(
                 "BASIN_HOTTIER_SWEEP_SECS",
                 DEFAULT_CLEAN_SWEEP_SECS,
+            )),
+            stripe_merge_interval: Duration::from_secs(env_secs(
+                "BASIN_STRIPE_MERGE_SECS",
+                DEFAULT_STRIPE_MERGE_SECS,
             )),
             lease_registry: None,
             replica_id: default_replica_id(),
@@ -200,6 +216,10 @@ pub struct ShardStats {
     /// clean-retention sweep. Stays 0 until a registry is wired in via
     /// [`Shard::set_memtable_registry`].
     pub clean_sweep_evictions_bytes: u64,
+    /// Count of completed stripe-merge compaction passes (one per
+    /// `(project, table)` whose overlapping cold files were merged into
+    /// fewer files with disjoint PK ranges and committed).
+    pub stripe_merges: u64,
 }
 
 /// Handle to the shard map. Cheap to clone (Arc inside).

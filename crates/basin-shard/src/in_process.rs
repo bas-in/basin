@@ -166,6 +166,12 @@ pub(crate) struct InProcessShard {
     /// `share_clone` the background task runs on observes late wiring done
     /// through the original handle. `None` until wired (sweep is a no-op).
     memtable_registry_cell: Arc<std::sync::RwLock<Option<Arc<basin_hottier::MemTableRegistry>>>>,
+    /// Stripe-merge serialization: at most ONE table's stripe-merge pass
+    /// runs at a time process-wide, bounding the memory / IO the merge can
+    /// pin (the pass decodes a whole table's cold files). `Arc` so
+    /// `share_clone` (the handle the background loop runs on) and the
+    /// original handle (test drivers) contend on the same lock.
+    stripe_merge_lock: Arc<Mutex<()>>,
     /// Phase 6.X.A — leases held by this replica + their granted epoch.
     held_leases: HeldLeases,
     /// Phase 6.X.C — partitions whose lease is mid-handoff. While present in
@@ -185,6 +191,7 @@ impl InProcessShard {
             jsonb_posting_registry: std::sync::RwLock::new(None),
             secondary_index_registry: std::sync::RwLock::new(None),
             memtable_registry_cell: Arc::new(std::sync::RwLock::new(None)),
+            stripe_merge_lock: Arc::new(Mutex::new(())),
             held_leases: Arc::new(Mutex::new(HashMap::new())),
             draining: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -222,6 +229,7 @@ impl InProcessShard {
             // Shared (not snapshotted): the sweep must observe a registry
             // wired through the original handle after spawn_background.
             memtable_registry_cell: self.memtable_registry_cell.clone(),
+            stripe_merge_lock: self.stripe_merge_lock.clone(),
             held_leases: self.held_leases.clone(),
             draining: self.draining.clone(),
         }
@@ -679,6 +687,12 @@ impl InProcessShard {
     #[allow(dead_code)]
     pub(crate) async fn run_compaction_once(&self) -> Result<()> {
         self.compact_all().await
+    }
+
+    /// Test-only: drive one stripe-merge sweep synchronously.
+    #[allow(dead_code)]
+    pub(crate) async fn run_stripe_merge_once(&self) -> Result<()> {
+        self.stripe_merge_sweep().await
     }
 
     /// Walk every resident project's tables and migrate any data file whose
@@ -1754,6 +1768,508 @@ impl InProcessShard {
             debug!(freed_bytes = freed, "clean-retention sweep evicted bytes");
         }
     }
+
+    /// Stripe-merge compaction — one sweep tick.
+    ///
+    /// Round-robin striping historically spread a table's PKs across all
+    /// write-stripe files; after PK-sorting each file individually, every
+    /// file's zone map still spans nearly the whole PK range. The ranges
+    /// OVERLAP, so a keyset-pagination predicate (`WHERE pk > $1 ORDER BY
+    /// pk LIMIT k`) can't prune (`Gt` only rules a file out when its max
+    /// <= v) and the read path opens every stripe file. This sweep merges
+    /// such overlapping cold files into fewer files with strictly DISJOINT
+    /// PK ranges, restoring 1-2 file opens per keyset page.
+    ///
+    /// Walks every resident project's tables and runs
+    /// [`Self::stripe_merge_table`] on each, sequentially — combined with
+    /// `stripe_merge_lock`, at most one table merges at a time
+    /// process-wide, bounding the resources a merge pass can pin.
+    /// Per-table errors are logged, never propagated (one bad table mustn't
+    /// stall the rest — same convention as `tiering_sweep`).
+    async fn stripe_merge_sweep(&self) -> Result<()> {
+        // One merge pass at a time, even if a test driver overlaps a
+        // background tick.
+        let _merge_guard = self.stripe_merge_lock.lock().await;
+
+        // Resident partitions are the ground truth for which projects to
+        // sweep — identical scope to `tiering_sweep`.
+        let projects: Vec<ProjectId> = {
+            let map = self.partitions.lock().await;
+            let mut seen: HashSet<ProjectId> = HashSet::new();
+            for (t, _) in map.keys() {
+                seen.insert(*t);
+            }
+            seen.into_iter().collect()
+        };
+
+        for project in projects {
+            let tables = match self.cfg.catalog.list_tables(&project).await {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(%project, error = %e, "stripe-merge: list_tables failed; skipping project");
+                    continue;
+                }
+            };
+            for table in tables {
+                if let Err(e) = self.stripe_merge_table(&project, &table).await {
+                    warn!(
+                        %project,
+                        %table,
+                        error = %e,
+                        "stripe-merge failed for table; will retry next tick",
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Merge `(project, table)`'s overlapping cold files into fewer files
+    /// with disjoint PK ranges. Returns `Ok(true)` when a merge committed,
+    /// `Ok(false)` when the table is not a candidate (or the pass was
+    /// abandoned on a commit conflict — retried next tick).
+    ///
+    /// Candidate gate (all must hold, otherwise no-op):
+    ///  * single-column PK that is also the table's *effective* on-disk
+    ///    sort order (declared `cluster_columns == [pk]`, or no declared
+    ///    clustering and [`TableMetadata::default_cluster_cols`] == `[pk]`)
+    ///    — merging by PK must not undo a different declared clustering;
+    ///  * >= `BASIN_STRIPE_MERGE_MIN_FILES` (default 4) live cold files,
+    ///    EVERY one carrying decodable PK min/max `column_stats` (the zone
+    ///    maps — without them disjointness can't be proven);
+    ///  * the PK zone maps overlap (not totally ordered when sorted by min);
+    ///  * total input bytes <= `BASIN_STRIPE_MERGE_MAX_BYTES` (default
+    ///    256 MiB). The merge decodes the whole input set in memory (the
+    ///    per-file streams could in principle be k-way merged since each
+    ///    file is PK-sorted, but the read machinery yields whole-file
+    ///    streams; the byte cap is the documented memory bound — note it
+    ///    caps *encoded* bytes, decoded Arrow may be a small multiple).
+    ///
+    /// Commit protocol: the new file set replaces exactly the snapshotted
+    /// input set via `Catalog::replace_data_files` (resulting live set =
+    /// parent − removed ∪ added), under optimistic concurrency on the
+    /// snapshot id. A concurrent tail flush APPENDS a file (advancing the
+    /// snapshot): we reload, verify every input path is still live, and
+    /// retry — the appended file is untouched by the replace. A concurrent
+    /// engine CoW (UPDATE/DELETE) REPLACES input files: verification fails
+    /// and the pass is abandoned (orphan outputs deleted; next tick re-reads
+    /// the post-CoW state). Hot-tier overlays are untouched — the merge
+    /// reads only committed cold files, and overlay suppression at
+    /// read-merge applies on top of any file layout.
+    async fn stripe_merge_table(&self, project: &ProjectId, table: &TableName) -> Result<bool> {
+        let meta = match self.cfg.catalog.load_table(project, table).await {
+            Ok(m) => m,
+            Err(BasinError::NotFound(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+
+        // Single-column PK that is the effective on-disk sort order.
+        let [pk] = meta.pk_columns.as_slice() else {
+            return Ok(false);
+        };
+        let pk = pk.clone();
+        let pk_is_effective_sort = meta.cluster_columns == vec![pk.clone()]
+            || (meta.cluster_columns.is_empty() && meta.default_cluster_cols() == vec![pk.clone()]);
+        if !pk_is_effective_sort {
+            return Ok(false);
+        }
+        let Ok(pk_field) = meta.schema.field_with_name(&pk) else {
+            return Ok(false);
+        };
+        let pk_type = pk_field.data_type().clone();
+
+        let min_files = env_u64(
+            "BASIN_STRIPE_MERGE_MIN_FILES",
+            STRIPE_MERGE_MIN_FILES_DEFAULT,
+        )
+        .max(2) as usize;
+        let live = meta.live_data_files();
+        if live.len() < min_files {
+            return Ok(false);
+        }
+
+        // PK zone maps from the catalog's per-file column_stats. Skip the
+        // table when any live file lacks a decodable PK min/max — we can
+        // neither prove the inputs overlap nor that the merge is needed.
+        let mut ranges: Vec<(PkBound, PkBound)> = Vec::with_capacity(live.len());
+        for f in &live {
+            let Some((mn, mx)) = f
+                .column_stats
+                .get(&pk)
+                .and_then(|cs| decode_pk_range(&pk_type, cs))
+            else {
+                return Ok(false);
+            };
+            ranges.push((mn, mx));
+        }
+        if !pk_ranges_overlap(&mut ranges) {
+            return Ok(false); // Already disjoint — keyset prune works.
+        }
+
+        let total_bytes: u64 = live.iter().map(|f| f.size_bytes).sum();
+        let max_bytes = env_u64(
+            "BASIN_STRIPE_MERGE_MAX_BYTES",
+            STRIPE_MERGE_MAX_BYTES_DEFAULT,
+        );
+        if total_bytes > max_bytes {
+            debug!(
+                %project,
+                %table,
+                total_bytes,
+                max_bytes,
+                "stripe-merge: input set over BASIN_STRIPE_MERGE_MAX_BYTES; skipping",
+            );
+            return Ok(false);
+        }
+
+        // ── Read every input file (same read machinery the backfill sweep
+        // uses), normalising promoted-JSONB shadow columns so historic
+        // files concat cleanly with post-promotion ones.
+        let mut per_file: Vec<RecordBatch> = Vec::with_capacity(live.len());
+        for f in &live {
+            let path = object_store::path::Path::from(f.path.clone());
+            let stream = match self.cfg.storage.read_file(project, &path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    // A concurrent CoW may have deleted the file between the
+                    // metadata load and this read; not an error — retry next
+                    // tick against the fresh snapshot.
+                    debug!(
+                        %project,
+                        %table,
+                        path = %f.path,
+                        error = %e,
+                        "stripe-merge: input read failed (concurrent rewrite?); abandoning pass",
+                    );
+                    return Ok(false);
+                }
+            };
+            let batches: Vec<RecordBatch> = stream
+                .collect::<Vec<Result<RecordBatch>>>()
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+            if batches.is_empty() {
+                continue; // Zero-row file: nothing to carry, still replaced.
+            }
+            let schema = batches[0].schema();
+            let one = arrow::compute::concat_batches(&schema, &batches)
+                .map_err(|e| BasinError::storage(format!("stripe-merge concat: {e}")))?;
+            let one = backfill_promoted_columns(one, &meta.promoted_jsonb_paths)?;
+            per_file.push(one);
+        }
+        if per_file.is_empty() {
+            return Ok(false);
+        }
+        // Schema drift across files (e.g. mid-ALTER) — bail conservatively.
+        let schema = per_file[0].schema();
+        if per_file.iter().any(|b| b.schema() != schema) {
+            debug!(
+                %project,
+                %table,
+                "stripe-merge: input files disagree on schema; skipping table",
+            );
+            return Ok(false);
+        }
+
+        // ── Global PK sort.
+        let merged = arrow::compute::concat_batches(&schema, &per_file)
+            .map_err(|e| BasinError::storage(format!("stripe-merge concat all: {e}")))?;
+        drop(per_file);
+        let pk_idx = schema
+            .index_of(&pk)
+            .map_err(|e| BasinError::storage(format!("stripe-merge pk column: {e}")))?;
+        let indices = arrow::compute::sort_to_indices(merged.column(pk_idx), None, None)
+            .map_err(|e| BasinError::storage(format!("stripe-merge sort: {e}")))?;
+        let sorted = arrow::compute::take_record_batch(&merged, &indices)
+            .map_err(|e| BasinError::storage(format!("stripe-merge take: {e}")))?;
+        drop(merged);
+        let total_rows = sorted.num_rows();
+        if total_rows == 0 {
+            return Ok(false);
+        }
+
+        // ── Output sizing: aim for ~STRIPE_MERGE_TARGET_FILE_BYTES per
+        // output (estimated from the inputs' encoded bytes), and always
+        // strictly fewer outputs than inputs. Slicing the PK-sorted batch
+        // yields strictly increasing, disjoint per-file PK ranges.
+        let n_out = (total_bytes.div_ceil(STRIPE_MERGE_TARGET_FILE_BYTES).max(1) as usize)
+            .min(live.len() - 1)
+            .max(1);
+        let rows_per = total_rows.div_ceil(n_out);
+
+        // Write options mirror `compact_one` exactly: table format, PK
+        // clustering (the writer re-sorts + computes column_stats), the
+        // table's row-group sizing, and blooms on sort-order ∪ PK columns.
+        let file_format = shard_map_file_format(meta.file_format);
+        let mut bloom_cols = meta.global_sort_order.clone().unwrap_or_default();
+        if !bloom_cols.contains(&pk) {
+            bloom_cols.push(pk.clone());
+        }
+        let write_opts = basin_storage::WriteOptions {
+            file_format,
+            cluster_columns: vec![pk.clone()],
+            row_block_size: meta.row_block_size,
+            max_row_group_size: meta.row_group_rows,
+            bloom_columns: bloom_cols,
+            ..Default::default()
+        };
+        let partition = PartitionKey::default_key();
+
+        let mut outputs: Vec<(basin_storage::DataFile, RecordBatch)> = Vec::with_capacity(n_out);
+        let mut offset = 0usize;
+        use arrow_array::Array as _;
+        let pk_col = sorted.column(pk_idx).clone();
+        while offset < total_rows {
+            let mut len = rows_per.min(total_rows - offset);
+            // Never split equal PK values across an output boundary: a
+            // duplicate PK at the seam would leave the two outputs' ranges
+            // touching (still "overlapping" to the selector), re-triggering
+            // the merge every tick. PKs are unique in practice — this is a
+            // cheap churn guard, evaluated only at the n_out-1 seams.
+            while offset + len < total_rows
+                && pk_col.slice(offset + len - 1, 1).to_data()
+                    == pk_col.slice(offset + len, 1).to_data()
+            {
+                len += 1;
+            }
+            let chunk = sorted.slice(offset, len);
+            offset += len;
+            match self
+                .cfg
+                .storage
+                .write_batch_with_options(project, table, &partition, &chunk, &write_opts)
+                .await
+            {
+                Ok(df) => outputs.push((df, chunk)),
+                Err(e) => {
+                    // Clean up the outputs already written; nothing was
+                    // committed, so this is pure orphan reclamation.
+                    for (df, _) in &outputs {
+                        let _ = self.cfg.storage.delete_file(project, &df.path).await;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        // ── Atomic catalog swap: old input set → new output set.
+        let removed: Vec<String> = live.iter().map(|f| f.path.clone()).collect();
+        let added: Vec<DataFileRef> = outputs
+            .iter()
+            .map(|(df, _)| DataFileRef {
+                path: df.path.as_ref().to_string(),
+                size_bytes: df.size_bytes,
+                row_count: df.row_count,
+                column_stats: df.column_stats.clone(),
+                bloom_filters: df.bloom_filters.clone(),
+                hll_sketches: ::std::collections::BTreeMap::new(),
+                tdigest_sketches: ::std::collections::BTreeMap::new(),
+            })
+            .collect();
+
+        let mut snapshot = meta.current_snapshot;
+        let commit_result: Result<bool> = 'commit: {
+            for attempt in 0..3 {
+                match self
+                    .cfg
+                    .catalog
+                    .replace_data_files(project, table, snapshot, removed.clone(), added.clone())
+                    .await
+                {
+                    Ok(_) => break 'commit Ok(true),
+                    Err(BasinError::CommitConflict(_)) if attempt < 2 => {
+                        // Someone advanced the snapshot. A tail-flush APPEND
+                        // leaves our inputs live — safe to retry at the new
+                        // snapshot. A CoW REPLACE invalidates an input —
+                        // abandon (the merged bytes are stale).
+                        let fresh = match self.cfg.catalog.load_table(project, table).await {
+                            Ok(m) => m,
+                            Err(e) => break 'commit Err(e),
+                        };
+                        let live_now: HashSet<String> = fresh
+                            .live_data_files()
+                            .into_iter()
+                            .map(|f| f.path)
+                            .collect();
+                        if removed.iter().all(|p| live_now.contains(p)) {
+                            snapshot = fresh.current_snapshot;
+                            continue;
+                        }
+                        break 'commit Ok(false);
+                    }
+                    Err(BasinError::CommitConflict(_)) => break 'commit Ok(false),
+                    Err(e) => break 'commit Err(e),
+                }
+            }
+            Ok(false)
+        };
+
+        let committed = match commit_result {
+            Ok(c) => c,
+            Err(e) => {
+                for (df, _) in &outputs {
+                    let _ = self.cfg.storage.delete_file(project, &df.path).await;
+                }
+                return Err(e);
+            }
+        };
+        if !committed {
+            debug!(
+                %project,
+                %table,
+                "stripe-merge: lost the commit race; outputs abandoned, retrying next tick",
+            );
+            for (df, _) in &outputs {
+                let _ = self.cfg.storage.delete_file(project, &df.path).await;
+            }
+            return Ok(false);
+        }
+
+        // ── Index registry maintenance — outputs are registered EXACTLY as
+        // `compact_one` registers its compacted file (same helpers), and the
+        // superseded inputs are evicted so probes never see stale entries.
+        let effective_rg_size = meta
+            .row_block_size
+            .map(|v| v as usize)
+            .or(meta.row_group_rows)
+            .unwrap_or(basin_storage::DEFAULT_MAX_ROW_GROUP_SIZE);
+        for (df, chunk) in &outputs {
+            reindex_compacted_file_gin(
+                &self.gin_rowgroup_registry,
+                project,
+                table,
+                &meta.indexes,
+                effective_rg_size,
+                chunk,
+                df.path.as_ref(),
+            );
+            reindex_compacted_file_secondary(
+                &self.secondary_index_registry,
+                project,
+                table,
+                &meta.indexes,
+                effective_rg_size,
+                chunk,
+                df.path.as_ref(),
+            );
+            if let Err(e) = reindex_compacted_file_jsonb_posting(
+                &self.jsonb_posting_registry,
+                self.cfg.storage.clone(),
+                project,
+                table,
+                &meta.indexes,
+                effective_rg_size,
+                chunk,
+                df.path.as_ref(),
+            )
+            .await
+            {
+                warn!(
+                    %project,
+                    %table,
+                    file = %df.path,
+                    error = %e,
+                    "stripe-merge: JSONB posting sidecar write failed; @> falls back to bloom prune",
+                );
+            }
+            if let Err(e) = reindex_compacted_file_rtree(
+                self.cfg.storage.clone(),
+                project,
+                table,
+                &meta.indexes,
+                effective_rg_size as u32,
+                chunk,
+                df.path.as_ref(),
+            )
+            .await
+            {
+                warn!(
+                    %project,
+                    %table,
+                    file = %df.path,
+                    error = %e,
+                    "stripe-merge: R-tree sidecar write failed; queries fall back to full scan",
+                );
+            }
+        }
+
+        // Evict the superseded inputs from the in-RAM registries (mirrors
+        // the backfill sweep's GIN eviction, extended to the posting +
+        // secondary registries `compact_one`'s append-only path never
+        // needed).
+        {
+            let rg = self
+                .gin_rowgroup_registry
+                .read()
+                .expect("gin_rowgroup_registry lock poisoned")
+                .clone();
+            let jp = self
+                .jsonb_posting_registry
+                .read()
+                .expect("jsonb_posting_registry lock poisoned")
+                .clone();
+            let sec = self
+                .secondary_index_registry
+                .read()
+                .expect("secondary_index_registry lock poisoned")
+                .clone();
+            for old in &removed {
+                for idx in &meta.indexes {
+                    if idx.columns.len() != 1 {
+                        continue;
+                    }
+                    let col = &idx.columns[0];
+                    match idx.access_method.as_str() {
+                        "gin" => {
+                            if let Some(r) = &rg {
+                                r.remove_file(project, table, col, old);
+                            }
+                            if let Some(r) = &jp {
+                                r.remove_file(project, table, col, old);
+                            }
+                        }
+                        "btree" => {
+                            if let Some(r) = &sec {
+                                r.remove_file(project, table, col, old);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Delete the superseded objects best-effort (same pattern as the
+        // tiering sweep — a leftover object is wasted bytes, not a
+        // correctness issue: the catalog no longer references it).
+        for old in &removed {
+            let path = object_store::path::Path::from(old.clone());
+            if let Err(e) = self.cfg.storage.delete_file(project, &path).await {
+                warn!(
+                    %project,
+                    %table,
+                    path = %old,
+                    error = %e,
+                    "stripe-merge: superseded file delete failed (orphan)",
+                );
+            }
+        }
+
+        {
+            let mut stats = self.stats.lock().await;
+            stats.stripe_merges = stats.stripe_merges.saturating_add(1);
+        }
+        tracing::info!(
+            %project,
+            %table,
+            inputs = removed.len(),
+            outputs = outputs.len(),
+            rows = total_rows,
+            "stripe-merge compaction complete: PK ranges now disjoint",
+        );
+        Ok(true)
+    }
 }
 
 fn unique_projects(map: &PartitionMap) -> usize {
@@ -1800,12 +2316,23 @@ impl ShardImpl for InProcessShard {
             // re-reads the registry cell (wired late, after spawn) and is a
             // no-op until `Shard::set_memtable_registry` has been called.
             let mut sweep_tick = tokio::time::interval(me.cfg.clean_sweep_interval);
+            // Stripe-merge compaction tick. `BASIN_STRIPE_MERGE_SECS=0`
+            // (a zero interval) disables the sweep: the select arm below is
+            // guarded out, and the placeholder cadence keeps
+            // `tokio::time::interval` away from its zero-duration panic.
+            let stripe_merge_enabled = !me.cfg.stripe_merge_interval.is_zero();
+            let mut stripe_merge_tick = tokio::time::interval(if stripe_merge_enabled {
+                me.cfg.stripe_merge_interval
+            } else {
+                std::time::Duration::from_secs(3600)
+            });
             // First firing of `interval` is immediate; skip it so the loops
             // align with their configured cadence.
             evict_tick.tick().await;
             compact_tick.tick().await;
             heartbeat_tick.tick().await;
             sweep_tick.tick().await;
+            stripe_merge_tick.tick().await;
             loop {
                 tokio::select! {
                     _ = &mut shutdown => break,
@@ -1828,6 +2355,11 @@ impl ShardImpl for InProcessShard {
                     }
                     _ = sweep_tick.tick() => {
                         me.clean_retention_sweep().await;
+                    }
+                    _ = stripe_merge_tick.tick(), if stripe_merge_enabled => {
+                        if let Err(e) = me.stripe_merge_sweep().await {
+                            warn!(error = %e, "stripe-merge tick failed");
+                        }
                     }
                 }
             }
@@ -2019,6 +2551,77 @@ fn decode_le_i64(bytes: &[u8]) -> Option<i64> {
     let mut a = [0u8; 8];
     a.copy_from_slice(bytes);
     Some(i64::from_le_bytes(a))
+}
+
+// ── Stripe-merge compaction helpers ──────────────────────────────────────────
+
+/// Default minimum live-file count before a table is a stripe-merge
+/// candidate (`BASIN_STRIPE_MERGE_MIN_FILES`; clamped to >= 2).
+const STRIPE_MERGE_MIN_FILES_DEFAULT: u64 = 4;
+
+/// Default cap on the total *encoded* bytes a single stripe-merge pass may
+/// decode (`BASIN_STRIPE_MERGE_MAX_BYTES`). The merge materialises the whole
+/// input set as Arrow in memory; tables over the cap are skipped (and
+/// logged at debug) rather than risk an unbounded allocation.
+const STRIPE_MERGE_MAX_BYTES_DEFAULT: u64 = 256 * 1024 * 1024;
+
+/// Target encoded size per merge output file. With the default write-stripe
+/// fan-out the inputs are each well under this, so the common case merges
+/// 8 stripe files into 1; very large tables split into multiple outputs
+/// whose PK ranges are still strictly disjoint (slices of one sorted batch).
+const STRIPE_MERGE_TARGET_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+fn env_u64(var: &str, default: u64) -> u64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+/// A decoded PK zone-map bound. Within one table every bound is the same
+/// variant (one column, one type), so the derived `PartialOrd` — which
+/// orders mismatched variants by discriminant — never sees a mixed compare
+/// in practice.
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+enum PkBound {
+    Int(i64),
+    Float(f64),
+}
+
+/// Decode a file's PK `[min, max]` from catalog [`basin_catalog::ColumnStats`]
+/// using the same byte contract the writer emits (`column_stats_from_batch`:
+/// 8-byte LE `i64` for Int64/Timestamp, 8-byte LE `f64` for Float64). Other
+/// PK types carry no writer stats and return `None` — the caller skips the
+/// table (no zone map, no provable disjointness).
+fn decode_pk_range(
+    dt: &arrow_schema::DataType,
+    cs: &basin_catalog::ColumnStats,
+) -> Option<(PkBound, PkBound)> {
+    use arrow_schema::DataType;
+    let mn = cs.min_bytes.as_deref()?;
+    let mx = cs.max_bytes.as_deref()?;
+    match dt {
+        DataType::Int64 | DataType::Timestamp(_, _) => Some((
+            PkBound::Int(decode_le_i64(mn)?),
+            PkBound::Int(decode_le_i64(mx)?),
+        )),
+        DataType::Float64 => {
+            let f = |b: &[u8]| -> Option<f64> {
+                let a: [u8; 8] = b.try_into().ok()?;
+                Some(f64::from_le_bytes(a))
+            };
+            Some((PkBound::Float(f(mn)?), PkBound::Float(f(mx)?)))
+        }
+        _ => None,
+    }
+}
+
+/// True when the per-file PK `[min, max]` ranges overlap — i.e. they are NOT
+/// totally ordered once sorted by min, so a range predicate (`pk > $1`)
+/// cannot prune files. Sorts `ranges` in place by min.
+fn pk_ranges_overlap(ranges: &mut [(PkBound, PkBound)]) -> bool {
+    ranges.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    ranges.windows(2).any(|w| w[1].0 <= w[0].1)
 }
 
 struct InProcessProjectHandle {
@@ -4250,5 +4853,173 @@ mod tests {
         );
 
         bg.shutdown().await;
+    }
+
+    // ── Stripe-merge compaction ──────────────────────────────────────────
+
+    fn pkb(v: i64) -> PkBound {
+        PkBound::Int(v)
+    }
+
+    #[test]
+    fn pk_ranges_overlap_detects_interleaved_stripes() {
+        // Round-robin striping: every file spans nearly the whole range.
+        let mut overlapping = vec![
+            (pkb(0), pkb(997)),
+            (pkb(1), pkb(998)),
+            (pkb(2), pkb(999)),
+            (pkb(3), pkb(996)),
+        ];
+        assert!(pk_ranges_overlap(&mut overlapping));
+
+        // Post-merge layout: strictly disjoint, in any input order.
+        let mut disjoint = vec![
+            (pkb(500), pkb(749)),
+            (pkb(0), pkb(249)),
+            (pkb(750), pkb(999)),
+            (pkb(250), pkb(499)),
+        ];
+        assert!(!pk_ranges_overlap(&mut disjoint));
+
+        // Touching boundaries (duplicate PK at the seam) count as overlap —
+        // conservative: merge rather than miss a prune opportunity.
+        let mut touching = vec![(pkb(0), pkb(10)), (pkb(10), pkb(20))];
+        assert!(pk_ranges_overlap(&mut touching));
+    }
+
+    #[test]
+    fn decode_pk_range_follows_writer_byte_contract() {
+        use basin_catalog::ColumnStats;
+        let cs = ColumnStats {
+            null_count: Some(0),
+            min_bytes: Some(7i64.to_le_bytes().to_vec()),
+            max_bytes: Some(99i64.to_le_bytes().to_vec()),
+            sum_bytes: None,
+        };
+        assert_eq!(
+            decode_pk_range(&DataType::Int64, &cs),
+            Some((PkBound::Int(7), PkBound::Int(99)))
+        );
+        // Utf8 PKs carry no writer stats → no zone map → not a candidate.
+        assert_eq!(decode_pk_range(&DataType::Utf8, &cs), None);
+        // Missing bounds → None.
+        let empty = ColumnStats::default();
+        assert_eq!(decode_pk_range(&DataType::Int64, &empty), None);
+    }
+
+    /// End-to-end (in-crate): four stripe files with interleaved PKs merge
+    /// into one PK-sorted file; rows survive byte-for-byte and the catalog's
+    /// stats show the disjoint (single-file) layout.
+    #[tokio::test]
+    async fn stripe_merge_merges_overlapping_stripe_files() {
+        use basin_catalog::Catalog as _;
+
+        let (shard, _sd, _wd, storage, catalog, _wal) = fresh_shard().await;
+        let project = ProjectId::new();
+        let table = TableName::new("events").unwrap();
+
+        // Create the table and declare a single-column Int64 PK so the
+        // compactor PK-sorts files and the merge selector engages.
+        catalog
+            .create_table(&project, &table, schema().as_ref())
+            .await
+            .unwrap();
+        catalog
+            .set_table_constraints(&project, &table, vec!["id".into()], vec![], vec![])
+            .await
+            .unwrap();
+
+        // Interleave PKs across 4 stripe partitions (round-robin layout):
+        // stripe s gets ids {s, s+4, s+8, ...} — every flushed file spans
+        // nearly the whole PK range, so the zone maps all overlap.
+        const STRIPES: usize = 4;
+        const PER_STRIPE: usize = 25;
+        for s in 0..STRIPES {
+            let key = if s == 0 {
+                PartitionKey::default_key()
+            } else {
+                PartitionKey::new(format!("s{s}")).unwrap()
+            };
+            let handle = shard.get(&project, &key).await.unwrap();
+            let ids: Int64Array = (0..PER_STRIPE as i64)
+                .map(|k| s as i64 + k * STRIPES as i64)
+                .collect();
+            let names: StringArray = (0..PER_STRIPE).map(|_| Some("v")).collect();
+            let b = RecordBatch::try_new(schema(), vec![Arc::new(ids), Arc::new(names)]).unwrap();
+            handle.write_batch(&table, b).await.unwrap();
+        }
+
+        let inner = impl_of(&shard);
+        inner.run_compaction_once().await.unwrap();
+
+        let before = catalog
+            .load_table(&project, &table)
+            .await
+            .unwrap()
+            .live_data_files();
+        assert_eq!(before.len(), STRIPES, "one flushed file per stripe");
+        let mut before_ranges: Vec<(PkBound, PkBound)> = before
+            .iter()
+            .map(|f| decode_pk_range(&DataType::Int64, f.column_stats.get("id").unwrap()).unwrap())
+            .collect();
+        assert!(
+            pk_ranges_overlap(&mut before_ranges),
+            "round-robin stripe files must have overlapping PK zone maps"
+        );
+
+        inner.run_stripe_merge_once().await.unwrap();
+
+        let after = catalog
+            .load_table(&project, &table)
+            .await
+            .unwrap()
+            .live_data_files();
+        assert_eq!(after.len(), 1, "4 small stripe files merge into 1");
+        let total: u64 = after.iter().map(|f| f.row_count).sum();
+        assert_eq!(total as usize, STRIPES * PER_STRIPE);
+        let (mn, mx) =
+            decode_pk_range(&DataType::Int64, after[0].column_stats.get("id").unwrap()).unwrap();
+        assert_eq!(mn, PkBound::Int(0));
+        assert_eq!(mx, PkBound::Int((STRIPES * PER_STRIPE) as i64 - 1));
+        assert_eq!(shard.stats().stripe_merges, 1);
+
+        // Values identical: read the merged file back and check the full,
+        // PK-sorted id sequence survived the merge.
+        let path = object_store::path::Path::from(after[0].path.clone());
+        let batches: Vec<RecordBatch> = storage
+            .read_file(&project, &path)
+            .await
+            .unwrap()
+            .collect::<Vec<Result<RecordBatch>>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let mut ids: Vec<i64> = Vec::new();
+        for b in &batches {
+            let col = b
+                .column(b.schema().index_of("id").unwrap())
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .clone();
+            ids.extend(col.values().iter().copied());
+        }
+        let expected: Vec<i64> = (0..(STRIPES * PER_STRIPE) as i64).collect();
+        assert_eq!(ids, expected, "merged file must hold every row, PK-sorted");
+
+        // Idempotence: a second sweep finds a single (disjoint) file and
+        // does nothing.
+        inner.run_stripe_merge_once().await.unwrap();
+        assert_eq!(shard.stats().stripe_merges, 1);
+        assert_eq!(
+            catalog
+                .load_table(&project, &table)
+                .await
+                .unwrap()
+                .live_data_files()
+                .len(),
+            1
+        );
     }
 }
