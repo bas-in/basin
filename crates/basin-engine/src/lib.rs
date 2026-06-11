@@ -487,6 +487,12 @@ impl Engine {
                 });
             }
         }
+        // Background overlay reconciler (delta-update commit 5): drains the
+        // hot-tier UPDATE/DELETE overlay into cold on a cadence so it no
+        // longer accumulates unboundedly between conflicting cold ops. Spawns
+        // only when a tokio runtime is available (same contract as the reaper
+        // above); holds a Weak so it exits when the engine is dropped.
+        crate::overlay_reconcile::spawn(Arc::downgrade(&engine.inner));
         engine
     }
 
@@ -1326,6 +1332,7 @@ mod datetime_more_udf;
 mod ddl;
 mod dml;
 mod dml_mutate;
+pub mod overlay_reconcile;
 mod values_fast;
 mod enum_ordinal;
 mod events;

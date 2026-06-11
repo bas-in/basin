@@ -4829,8 +4829,24 @@ pub(crate) async fn materialize_hot_overlay_into_cold(
     sess: &ProjectSession,
     table: &TableName,
 ) -> Result<()> {
-    let registry = sess.engine.memtable_registry();
-    let Some(entry) = registry.get(&sess.project, table) else {
+    materialize_overlay_for_table(&sess.engine, sess.project, table).await
+}
+
+/// Engine-callable core of [`materialize_hot_overlay_into_cold`]. Everything
+/// the materialize consults lives on the engine (catalog, storage, memtable
+/// registry) plus the project id — no per-session state is read — so the
+/// background overlay reconciler ([`crate::overlay_reconcile`]) can drive it
+/// without opening a `ProjectSession`. Behavior is byte-identical to the
+/// sess-based wrapper: same dirty-snapshot ack semantics, same
+/// `retain_secs == 0` kill switch, same narrowed file selection, and the
+/// same optimistic `commit_replace` conflict propagation.
+pub(crate) async fn materialize_overlay_for_table(
+    engine: &crate::Engine,
+    project: ProjectId,
+    table: &TableName,
+) -> Result<()> {
+    let registry = engine.memtable_registry();
+    let Some(entry) = registry.get(&project, table) else {
         return Ok(());
     };
     // O(1) overlay-presence gate (S4): tombstone/update entries are by
@@ -4877,16 +4893,15 @@ pub(crate) async fn materialize_hot_overlay_into_cold(
         return Ok(());
     }
 
-    let meta = sess
-        .engine
+    let meta = engine
         .config()
         .catalog
-        .load_table(&sess.project, table)
+        .load_table(&project, table)
         .await?;
     // The overlay is only ever written for single-PK tables; defensively skip
     // (and clear) otherwise so we never wedge.
     if meta.pk_columns.len() != 1 {
-        registry.remove(&sess.project, table);
+        registry.remove(&project, table);
         return Ok(());
     }
     let pk_col = meta.pk_columns[0].clone();
@@ -4931,11 +4946,10 @@ pub(crate) async fn materialize_hot_overlay_into_cold(
         .collect();
     let mut batches: Vec<RecordBatch> = Vec::new();
     if !paths.is_empty() {
-        let mut stream = sess
-            .engine
+        let mut stream = engine
             .config()
             .storage
-            .read_paths(&sess.project, paths, basin_storage::ReadOptions::default())
+            .read_paths(&project, paths, basin_storage::ReadOptions::default())
             .await?;
         while let Some(b) = stream.next().await {
             batches.push(b?);
@@ -4983,8 +4997,10 @@ pub(crate) async fn materialize_hot_overlay_into_cold(
     // schema is correct — the shadow extension happens there so EVERY cold-path
     // rewrite (this overlay-materialize, exec_update, exec_delete, …) emits the
     // column and keeps the promoted-column read fast path enabled.
-    let added = write_replacement(sess, table, meta.schema.clone(), batches).await?;
-    commit_replace(sess, table, meta.current_snapshot, removed.clone(), added).await?;
+    let added =
+        write_replacement_engine(engine, project, table, meta.schema.clone(), batches).await?;
+    commit_replace_engine(engine, project, table, meta.current_snapshot, removed.clone(), added)
+        .await?;
     // Physically delete the just-replaced files so a subsequent
     // `list_data_files_with_stats` (which lists the object store directly, not
     // the catalog) doesn't return them alongside the new merged file. Without
@@ -4994,7 +5010,7 @@ pub(crate) async fn materialize_hot_overlay_into_cold(
     // "+1 lost on the overlaid row" failure mode in #95. Mirrors every other
     // commit_replace site (exec_update / exec_delete / soft_delete) which also
     // pairs the catalog swap with the physical delete.
-    delete_objects(sess, table, meta.schema.as_ref(), &removed).await?;
+    delete_objects_engine(engine, project, table, meta.schema.as_ref(), &removed).await?;
     // Ack the materialized overlay at the seqs captured by the dirty snapshot
     // (S4 age-based residency): acked tombstones are REMOVED (the cold delete
     // is committed — nothing left to suppress), acked `Update`s are re-tagged
@@ -5011,7 +5027,7 @@ pub(crate) async fn materialize_hot_overlay_into_cold(
     // rewrite just materialized, so retaining them is exact.
     let freed = entry.memtable.mark_flushed(&acks);
     if freed > 0 {
-        registry.release_bytes(&sess.project, freed);
+        registry.release_bytes(&project, freed);
     }
     if registry.config().retain_secs == 0 {
         // Retain-nothing kill switch: immediately evict what the ack left
@@ -5019,7 +5035,7 @@ pub(crate) async fn materialize_hot_overlay_into_cold(
         // hottier flush worker's step 6).
         let evicted = entry.memtable.evict_clean(u64::MAX, None);
         if evicted > 0 {
-            registry.release_bytes(&sess.project, evicted);
+            registry.release_bytes(&project, evicted);
         }
     }
     Ok(())
@@ -5201,6 +5217,19 @@ async fn write_replacement(
     schema: Arc<Schema>,
     batches: Vec<RecordBatch>,
 ) -> Result<Vec<DataFileRef>> {
+    write_replacement_engine(&sess.engine, sess.project, table, schema, batches).await
+}
+
+/// Sess-less core of [`write_replacement`] (the body only ever consulted
+/// `sess.engine` + `sess.project`). Split out so the engine-callable
+/// [`materialize_overlay_for_table`] can reuse it.
+async fn write_replacement_engine(
+    engine: &crate::Engine,
+    project: ProjectId,
+    table: &TableName,
+    schema: Arc<Schema>,
+    batches: Vec<RecordBatch>,
+) -> Result<Vec<DataFileRef>> {
     if batches.is_empty() {
         return Ok(Vec::new());
     }
@@ -5208,11 +5237,10 @@ async fn write_replacement(
     // row-group size) on the rewrite path too; otherwise the
     // copy-on-write replacement file would silently lose the table's
     // configured pruning aids.
-    let meta = sess
-        .engine
+    let meta = engine
         .config()
         .catalog
-        .load_table(&sess.project, table)
+        .load_table(&project, table)
         .await?;
     // ADR 0027 Phase 4: extend the replacement schema + batches with promoted
     // shadow column(s) so the rewritten file carries them (see
@@ -5267,11 +5295,10 @@ async fn write_replacement(
         encoding_mode: basin_storage::EncodingMode::Fast,
         ..Default::default()
     };
-    let df = sess
-        .engine
+    let df = engine
         .config()
         .storage
-        .write_batch_with_options(&sess.project, table, &part, &merged, &opts)
+        .write_batch_with_options(&project, table, &part, &merged, &opts)
         .await?;
     Ok(vec![DataFileRef {
         path: df.path.as_ref().to_string(),
@@ -5446,6 +5473,20 @@ async fn commit_replace(
     removed: Vec<String>,
     added: Vec<DataFileRef>,
 ) -> Result<()> {
+    commit_replace_engine(&sess.engine, sess.project, table, expected, removed, added).await
+}
+
+/// Sess-less core of [`commit_replace`] (the body only ever consulted
+/// `sess.engine` + `sess.project`). Split out so the engine-callable
+/// [`materialize_overlay_for_table`] can reuse it.
+async fn commit_replace_engine(
+    engine: &crate::Engine,
+    project: ProjectId,
+    table: &TableName,
+    expected: basin_catalog::SnapshotId,
+    removed: Vec<String>,
+    added: Vec<DataFileRef>,
+) -> Result<()> {
     // Optimistic-locking semantics: the catalog rejects the commit when the
     // table snapshot has advanced past `expected`. We MUST propagate that
     // `CommitConflict` to the router so the entire statement re-runs against
@@ -5465,10 +5506,10 @@ async fn commit_replace(
     // statement a chance to re-read the new snapshot, re-evaluate the
     // predicate, and either commit on a still-matching row or correctly
     // return zero affected rows.
-    sess.engine
+    engine
         .config()
         .catalog
-        .replace_data_files(&sess.project, table, expected, removed, added)
+        .replace_data_files(&project, table, expected, removed, added)
         .await?;
     // S4 age-based residency: a successful copy-on-write replace may have
     // changed row values UNDER this table's retained CLEAN memtable entries
@@ -5479,11 +5520,11 @@ async fn commit_replace(
     // is needed). DIRTY entries are intentionally untouched — they are
     // committed fast-path overlay writes that legitimately override whatever
     // the rewrite produced, and dropping them would lose those writes.
-    let registry = sess.engine.memtable_registry();
-    if let Some(entry) = registry.get(&sess.project, table) {
+    let registry = engine.memtable_registry();
+    if let Some(entry) = registry.get(&project, table) {
         let freed = entry.memtable.evict_clean(u64::MAX, None);
         if freed > 0 {
-            registry.release_bytes(&sess.project, freed);
+            registry.release_bytes(&project, freed);
         }
     }
     Ok(())
@@ -5507,11 +5548,23 @@ async fn delete_objects(
     schema: &Schema,
     paths: &[String],
 ) -> Result<()> {
+    delete_objects_engine(&sess.engine, sess.project, table, schema, paths).await
+}
+
+/// Sess-less core of [`delete_objects`] (the body only ever consulted
+/// `sess.engine` + `sess.project`). Split out so the engine-callable
+/// [`materialize_overlay_for_table`] can reuse it.
+async fn delete_objects_engine(
+    engine: &crate::Engine,
+    project: ProjectId,
+    table: &TableName,
+    schema: &Schema,
+    paths: &[String],
+) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
     }
-    let storage = sess.engine.config().storage.clone();
-    let project = sess.project;
+    let storage = engine.config().storage.clone();
     let store = storage.project_object_store(&project);
     let root = storage.root_prefix_handle();
     let vector_columns: Vec<String> = schema
