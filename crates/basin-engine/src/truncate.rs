@@ -97,6 +97,23 @@ pub(crate) async fn exec_truncate(
     let catalog = sess.engine.config().catalog.clone();
     let storage = sess.engine.config().storage.clone();
 
+    // Drop every hot-tier memtable entry for the truncated tables (S4):
+    // TRUNCATE deletes ALL rows, so retained clean rows, HTAP INSERT
+    // residency, UPDATE overrides, and tombstones alike are now stale — a
+    // surviving `Update` override would even RESURRECT a truncated row on the
+    // next overlay read. `remove` drops the whole table entry (dirty included,
+    // which is correct here — the rows those overlays modified are gone);
+    // the freed bytes are released so the project budget counter stays in
+    // lockstep with what the memtables actually hold.
+    let clear_hot_tier = |table: &TableName| {
+        let registry = sess.engine.memtable_registry();
+        if let Some(entry) = registry.get(&sess.project, table) {
+            let bytes = entry.memtable.bytes_allocated();
+            registry.remove(&sess.project, table);
+            registry.release_bytes(&sess.project, bytes);
+        }
+    };
+
     for table in &tables {
         // Load current metadata (snapshot id + schema).
         let meta = catalog.load_table(&sess.project, table).await?;
@@ -113,7 +130,10 @@ pub(crate) async fn exec_truncate(
             .collect();
 
         if removed_paths.is_empty() {
-            // Nothing to do for this table — it's already empty.
+            // No cold files, but the hot tier may still hold rows for this
+            // table (e.g. fast-path UPDATE overrides over an all-hot table) —
+            // they must not survive the TRUNCATE.
+            clear_hot_tier(table);
             // Still refresh the session listing to be safe.
             refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, table).await?;
             continue;
@@ -149,6 +169,10 @@ pub(crate) async fn exec_truncate(
             }
             Err(e) => return Err(e),
         }
+
+        // The empty snapshot is committed — clear the hot tier AFTER the
+        // catalog swap so a failed TRUNCATE never loses overlay writes.
+        clear_hot_tier(table);
 
         // Best-effort physical deletion (mirrors DELETE's delete_objects).
         let store = storage.project_object_store(&sess.project);

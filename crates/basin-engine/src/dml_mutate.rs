@@ -4541,15 +4541,54 @@ async fn pre_mutation_flush_if_tail(sess: &ProjectSession, table: &TableName) ->
 /// the overwhelmingly common case. Only fires when a row has a pending hot
 /// overlay AND a cold-path mutation is about to touch its table; cold-path
 /// mutations are already full-file rewrites, so the extra rewrite is in budget.
-async fn materialize_hot_overlay_into_cold(
+pub(crate) async fn materialize_hot_overlay_into_cold(
     sess: &ProjectSession,
     table: &TableName,
 ) -> Result<()> {
     let registry = sess.engine.memtable_registry();
-    let tombstones =
-        crate::hot_tombstone::snapshot_tombstones(registry.as_ref(), &sess.project, table, None);
-    let updates =
-        crate::hot_tombstone::snapshot_updates(registry.as_ref(), &sess.project, table, None);
+    let Some(entry) = registry.get(&sess.project, table) else {
+        return Ok(());
+    };
+    // O(1) overlay-presence gate (S4): tombstone/update entries are by
+    // definition DIRTY (a flush ack REMOVES clean tombstones and re-tags
+    // acked `Update`s as `Row`), so when both newest-version counters are
+    // zero there is nothing to materialize — skip without walking the map.
+    if entry.memtable.tombstone_count() == 0 && entry.memtable.update_count() == 0 {
+        return Ok(());
+    }
+    // Capture the overlay through `dirty_snapshot` so each entry carries the
+    // MVCC seq the post-materialize ack must cover (S4 age-based residency).
+    // The dirty snapshot is exactly the overlay an auto-commit read sees:
+    // every Tombstone/Update entry is dirty (see the counter gate above), and
+    // counter-/PK-keyed `Row` entries are not part of the UPDATE/DELETE
+    // overlay (they are cold-committed HTAP INSERT residency and are skipped
+    // here exactly as the previous `snapshot_*(…, None)` calls skipped them).
+    let mut tombstones: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let mut updates: std::collections::HashMap<Vec<u8>, RecordBatch> =
+        std::collections::HashMap::new();
+    // `(key, seq)` pairs handed to `mark_flushed` after the cold commit. The
+    // seq is captured HERE, at snapshot time, so an overlay write that lands
+    // while we materialize carries a HIGHER seq than the ack and survives
+    // DIRTY (the version-loss fix `mark_flushed` exists for).
+    let mut acks: Vec<(basin_hottier::RowKey, u64)> = Vec::new();
+    for (key, value, seq) in entry.memtable.dirty_snapshot() {
+        match value {
+            basin_hottier::MemRowValue::Tombstone => {
+                tombstones.insert(key.as_bytes().to_vec());
+                acks.push((key, seq));
+            }
+            basin_hottier::MemRowValue::Update { bytes, .. } => {
+                if let Some(rb) = crate::hot_tombstone::decode_ipc_row(&bytes) {
+                    if rb.num_rows() > 0 {
+                        updates.insert(key.as_bytes().to_vec(), rb);
+                        acks.push((key, seq));
+                    }
+                }
+            }
+            // HTAP INSERT residency rows — not part of the overlay.
+            basin_hottier::MemRowValue::Row { .. } => {}
+        }
+    }
     if tombstones.is_empty() && updates.is_empty() {
         return Ok(());
     }
@@ -4672,14 +4711,32 @@ async fn materialize_hot_overlay_into_cold(
     // commit_replace site (exec_update / exec_delete / soft_delete) which also
     // pairs the catalog swap with the physical delete.
     delete_objects(sess, table, meta.schema.as_ref(), &removed).await?;
-    if let Some(entry) = registry.get(&sess.project, table) {
-        let keys: Vec<basin_hottier::RowKey> = tombstones
-            .iter()
-            .cloned()
-            .chain(updates.keys().cloned())
-            .map(basin_hottier::RowKey::from_bytes)
-            .collect();
-        entry.memtable.remove_flushed(&keys);
+    // Ack the materialized overlay at the seqs captured by the dirty snapshot
+    // (S4 age-based residency): acked tombstones are REMOVED (the cold delete
+    // is committed — nothing left to suppress), acked `Update`s are re-tagged
+    // as retained CLEAN `Row`s (free residency for the rows we just rewrote —
+    // their bytes are byte-identical to the replacement file), and any
+    // overlay write that landed AFTER the snapshot carries a higher seq and
+    // survives DIRTY for the next materialize/flush. The legacy
+    // `remove_flushed` dropped whole chains by key, destroying post-snapshot
+    // writes AND forfeiting residency.
+    //
+    // NOTE on ordering: `commit_replace` above already evicted this table's
+    // PREVIOUSLY-retained clean rows (a CoW rewrite may change values under
+    // them); the entries re-acked clean here are the overlay values that
+    // rewrite just materialized, so retaining them is exact.
+    let freed = entry.memtable.mark_flushed(&acks);
+    if freed > 0 {
+        registry.release_bytes(&sess.project, freed);
+    }
+    if registry.config().retain_secs == 0 {
+        // Retain-nothing kill switch: immediately evict what the ack left
+        // clean — the pre-S4 drain-at-materialize end state (mirrors the
+        // hottier flush worker's step 6).
+        let evicted = entry.memtable.evict_clean(u64::MAX, None);
+        if evicted > 0 {
+            registry.release_bytes(&sess.project, evicted);
+        }
     }
     Ok(())
 }
@@ -5129,6 +5186,22 @@ async fn commit_replace(
         .catalog
         .replace_data_files(&sess.project, table, expected, removed, added)
         .await?;
+    // S4 age-based residency: a successful copy-on-write replace may have
+    // changed row values UNDER this table's retained CLEAN memtable entries
+    // (clean = "byte-identical to cold", which the rewrite just falsified).
+    // Drop exactly the clean set for THIS table: the registry's memtable is
+    // already per-(project, table), so `evict_clean(u64::MAX, None)` on its
+    // memtable is the table-scoped clear (no registry-level table-scoped API
+    // is needed). DIRTY entries are intentionally untouched — they are
+    // committed fast-path overlay writes that legitimately override whatever
+    // the rewrite produced, and dropping them would lose those writes.
+    let registry = sess.engine.memtable_registry();
+    if let Some(entry) = registry.get(&sess.project, table) {
+        let freed = entry.memtable.evict_clean(u64::MAX, None);
+        if freed > 0 {
+            registry.release_bytes(&sess.project, freed);
+        }
+    }
     Ok(())
 }
 

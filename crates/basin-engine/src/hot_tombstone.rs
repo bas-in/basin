@@ -79,6 +79,17 @@ pub(crate) fn snapshot_tombstones(
     let Some(entry) = registry.get(project, table) else {
         return HashSet::new();
     };
+    // S4 O(1) emptiness gate (auto-commit only). `tombstone_count` counts
+    // entries whose NEWEST version is a Tombstone, so when it is zero an
+    // unwatermarked snapshot cannot yield one — skip the O(n) map walk that
+    // the steady-state read path otherwise pays per query. A PINNED read
+    // (`Some(w)`) may still resolve a HISTORICAL tombstone inside a chain
+    // whose newest version is a Row/Update (delete-then-reinsert), which the
+    // newest-version counter does not see — so the gate only fires when no
+    // watermark applies.
+    if watermark.is_none() && entry.memtable.tombstone_count() == 0 {
+        return HashSet::new();
+    }
     let mut out: HashSet<Vec<u8>> = HashSet::new();
     // `snapshot_with_seq(watermark)` yields, per key, the newest version at or
     // before the watermark (`None` = auto-commit newest). S4 MVCC chains: an
@@ -95,8 +106,12 @@ pub(crate) fn snapshot_tombstones(
 // ── UPDATE-override snapshot ───────────────────────────────────────────────────
 
 /// Decode one Arrow IPC stream blob into the first `RecordBatch`. Mirrors
-/// `fast_select::decode_ipc_batch` / `merge::decode_ipc_row`.
-fn decode_ipc_row(bytes: &[u8]) -> Option<RecordBatch> {
+/// `fast_select::decode_ipc_batch` / `merge::decode_ipc_row`. `pub(crate)` so
+/// `dml_mutate::materialize_hot_overlay_into_cold` can decode the `Update`
+/// overrides it pulls out of a seq-carrying `dirty_snapshot` (the snapshot
+/// shape that threads per-key seqs into the post-materialize `mark_flushed`
+/// ack) with the exact same decoder the read path uses.
+pub(crate) fn decode_ipc_row(bytes: &[u8]) -> Option<RecordBatch> {
     use arrow::ipc::reader::StreamReader;
     let cursor = std::io::Cursor::new(bytes);
     let mut reader = StreamReader::try_new(cursor, None).ok()?;
@@ -133,6 +148,14 @@ pub(crate) fn snapshot_updates(
     let Some(entry) = registry.get(project, table) else {
         return out;
     };
+    // S4 O(1) emptiness gate (auto-commit only) — mirror of the
+    // `snapshot_tombstones` gate above. `update_count` counts entries whose
+    // NEWEST version is an `Update`; a pinned read may still resolve a
+    // historical `Update` in a chain whose newest version is something else
+    // (update-then-delete), so the gate only fires with no watermark.
+    if watermark.is_none() && entry.memtable.update_count() == 0 {
+        return out;
+    }
     // `snapshot_with_seq(watermark)` yields, per key, the newest version at or
     // before the watermark (`None` = auto-commit newest). S4 MVCC chains: a
     // pinned reader resolves the historical override at its watermark, even if
