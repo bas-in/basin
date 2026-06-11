@@ -27,6 +27,38 @@ graduate to 1.0 and the standard SemVer guarantees.
   re-derived from measured reality at the same time (`f39b2d5`): non-collapse
   ≥ 0.7 at C=64 instead of a ≥ 1.5× headroom that never passed any recorded
   run on this hardware, including the run that introduced it.
+- **Concurrent reads stop queueing on the catalog** (`2cf6e21`): the table
+  map's Mutex serialized every SELECT's load_table; 16 concurrent readers
+  spent ~14 of their 17ms in the lock queue. Reads now share an RwLock.
+- **COUNT(\*) metadata gate is O(1)** (`d5e8eff`): the tombstone check
+  cloned the whole memtable (a 1M-entry clone per query under S4
+  retention); it now reads the maintained counter.
+- **Ordered ARRAY_AGG ~3-5× faster** (`d9f1065`): DataFusion's
+  order-sensitive accumulator allocates per row; a delegating UDAF
+  Arc-buffers batches and sorts once, byte-compatible output.
+- **GIN works at scale + three wrong-results fixes** (`9d197ce`): posting
+  lists store deduped (term, file) pairs against a 5M budget instead of
+  per-row entries against 500k — a 1M-row backfill no longer evicts itself
+  into uselessness (measured effectiveness was 1.03×, i.e. none) — pruning
+  degrades per file instead of all-or-nothing, and `@>` evaluates over raw
+  canonical bytes instead of building a serde tree per row. Fixed: `<@`
+  acceleration was unsound (could prune away correct superset documents),
+  nested-object needles emitted non-necessary terms (same effect), and the
+  jsonb-posting sidecar silently dropped rows from over-budget files.
+- **Unordered LIMIT early-exits** (`46ba20b`): SELECT … LIMIT k drove every
+  candidate file eagerly (49.6ms at 1M for LIMIT 100); files now open one
+  at a time with the remaining limit pushed down, stopping at k rows.
+- **Batched multi-row upserts; in-tx literal INSERT fast path** (`ecfa6a8`):
+  one IN-list conflict probe + one CASE UPDATE riding the overlay path
+  replaces per-row probe+UPDATE recursion (50-row upsert ~5.4ms → sub-ms
+  expected); BEGIN; INSERT ×100; COMMIT stops parse-cache-missing every
+  statement. The overlay eligibility checker also honors its documented
+  simple-CASE contract — caught by the new zero-replacement-files gate.
+- **Benchmark coverage: eight new head-to-head shapes** (`a18374a`-class):
+  UPDATE…FROM, DELETE…USING, INSERT…SELECT, MERGE (honest GAP), 1000-row
+  upsert, 100k result streaming, prepared bind-direct latency, mixed
+  read-write concurrency; plus bulk-upsert/LIMIT/GIN scale gates and an
+  ignored 10M smoke run.
 - **Durability is now a knob, not an asterisk** (`652f278`):
   `SET basin.synchronous_commit = on` makes INSERT acks wait for a
   group-committed, genuinely fsynced WAL segment (one fsync wakes every
