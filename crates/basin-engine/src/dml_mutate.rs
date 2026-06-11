@@ -1560,8 +1560,14 @@ fn rmw_rhs_is_fast_path_eligible(expr: &Expr, schema: &Schema) -> bool {
             format: None,
             ..
         } => rmw_rhs_is_fast_path_eligible(inner, schema),
-        // CASE — every sub-expression must be allowlisted, and each WHEN
-        // condition must be a comparison / boolean connective tree.
+        // CASE — every sub-expression must be allowlisted. Searched CASE
+        // (`CASE WHEN a > 1 THEN …`) requires each WHEN condition to be a
+        // comparison / boolean connective tree; simple CASE
+        // (`CASE col WHEN lit THEN …`) stores each WHEN arm's *value*
+        // expression as the condition (sqlparser keeps the implicit
+        // `operand = value` equality structural), so an arm is eligible iff
+        // that value expression is itself allowlisted — exactly the searched
+        // equivalent `operand = value`, which the comparison rule admits.
         Expr::Case {
             operand,
             conditions,
@@ -1574,7 +1580,12 @@ fn rmw_rhs_is_fast_path_eligible(expr: &Expr, schema: &Schema) -> bool {
                 }
             }
             for when in conditions {
-                if !rmw_case_condition_is_eligible(&when.condition, schema) {
+                let cond_ok = if operand.is_some() {
+                    rmw_rhs_is_fast_path_eligible(&when.condition, schema)
+                } else {
+                    rmw_case_condition_is_eligible(&when.condition, schema)
+                };
+                if !cond_ok {
                     return false;
                 }
                 if !rmw_rhs_is_fast_path_eligible(&when.result, schema) {
@@ -8182,6 +8193,63 @@ mod tests {
     fn rmw_fn_allowlisted_with_volatile_arg_returns_false() {
         let schema = fn_allowlist_schema();
         let e = parse_expr(r#"jsonb_set(payload, '{a}', now())"#);
+        assert!(!rmw_rhs_is_fast_path_eligible(&e, &schema));
+    }
+
+    // ── rmw CASE eligibility (`rmw_rhs_is_fast_path_eligible` Case arm) ─────
+
+    /// Schema for the CASE tests: an Int64 PK-shaped `id` plus a value `v`.
+    fn case_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+        ])
+    }
+
+    /// Simple (operand-form) CASE keyed on a column with literal WHEN values
+    /// and a bare-column ELSE — the exact shape `try_batched_do_update` emits
+    /// (`v = CASE id WHEN 1 THEN 10 WHEN 2 THEN 20 ELSE v END`). Row-local and
+    /// deterministic, must be eligible (it is the structural equivalent of the
+    /// already-admitted searched form `CASE WHEN id = 1 THEN 10 …`).
+    #[test]
+    fn rmw_case_simple_operand_form_eligible() {
+        let schema = case_schema();
+        let e = parse_expr("CASE id WHEN 1 THEN 10 WHEN 2 THEN 20 ELSE v END");
+        assert!(rmw_rhs_is_fast_path_eligible(&e, &schema));
+    }
+
+    /// Searched CASE remains eligible (regression guard for the searched arm).
+    #[test]
+    fn rmw_case_searched_form_eligible() {
+        let schema = case_schema();
+        let e = parse_expr("CASE WHEN id = 1 THEN 10 WHEN id > 2 THEN v + 1 ELSE v END");
+        assert!(rmw_rhs_is_fast_path_eligible(&e, &schema));
+    }
+
+    /// Simple CASE with a volatile WHEN *value* (`CASE id WHEN now() …`) must
+    /// stay cold — the operand-form admission recurses into each arm value.
+    #[test]
+    fn rmw_case_simple_with_volatile_when_value_returns_false() {
+        let schema = case_schema();
+        let e = parse_expr("CASE id WHEN now() THEN 10 ELSE v END");
+        assert!(!rmw_rhs_is_fast_path_eligible(&e, &schema));
+    }
+
+    /// Simple CASE with a volatile THEN result must stay cold.
+    #[test]
+    fn rmw_case_simple_with_volatile_then_result_returns_false() {
+        let schema = case_schema();
+        let e = parse_expr("CASE id WHEN 1 THEN now() ELSE v END");
+        assert!(!rmw_rhs_is_fast_path_eligible(&e, &schema));
+    }
+
+    /// Searched CASE still requires comparison-shaped conditions: a bare
+    /// column as a WHEN condition (no operand to compare against) is not a
+    /// comparison tree and must remain ineligible.
+    #[test]
+    fn rmw_case_searched_with_bare_column_condition_returns_false() {
+        let schema = case_schema();
+        let e = parse_expr("CASE WHEN id THEN 10 ELSE v END");
         assert!(!rmw_rhs_is_fast_path_eligible(&e, &schema));
     }
 

@@ -4897,9 +4897,12 @@ pub(crate) static INSERTS_PREPARSE_FASTPATH: std::sync::atomic::AtomicU64 =
 ///
 /// Engagement gates, in order (each one mirrors a piece of the normal path —
 /// see the bookkeeping audit below):
-/// 1. **Auto-commit only**: an open OR aborted transaction declines, so the
-///    in-tx buffering path and the 25P02 aborted-state guard stay with the
-///    normal path.
+/// 1. **Not aborted**: an aborted transaction declines, so the 25P02
+///    aborted-state guard stays with the normal path. OPEN transactions are
+///    admitted — `exec_insert_prebuilt` retains `exec_insert`'s full in-tx
+///    branch (htap_rows buffering, intra-tx uniqueness, FK flush guarded by
+///    `!tx_is_active`), so `BEGIN; INSERT ×100; COMMIT` skips the double
+///    parse per statement (see the Gate 1 comment in the body).
 /// 2. **Classifier** ([`crate::values_fast::classify_literal_insert`]): an
 ///    O(prefix) structural scan of the header. No match → decline.
 /// 3. **No pending OVERRIDING**: the textual `OVERRIDING` pre-screen of the
@@ -4964,8 +4967,14 @@ async fn try_insert_preparse(
     // lock at all here.
     let prefix = crate::values_fast::classify_literal_insert(raw_sql)?;
 
-    // Gate 1: auto-commit only.
-    if crate::session::tx_is_active(&sess.state) || crate::session::tx_is_aborted(&sess.state) {
+    // Gate 1: aborted transactions decline (25P02 semantics belong to the
+    // normal path). OPEN transactions are admitted: exec_insert_prebuilt
+    // retains exec_insert's full in-tx branch (htap_rows buffering, intra-tx
+    // uniqueness, FK flush guarded by !tx_is_active), so a BEGIN; INSERT
+    // x100; COMMIT no longer pays 100 parse-cache misses — each statement's
+    // literals differ, so the cache never hits and the double parse plus
+    // rewrite pipeline dominated the transaction's wall time.
+    if crate::session::tx_is_aborted(&sess.state) {
         return None;
     }
 
@@ -6811,6 +6820,31 @@ async fn filter_rows_do_nothing(
         Some(parts)
     };
 
+    // ── Batched existence probe ──────────────────────────────────────────
+    // Single constraint group over a single column: resolve every row's key
+    // up front with one chunked `SELECT col … WHERE col IN (…)` instead of a
+    // per-row SELECT-1 recursion through `sess.execute`. `None` → statement
+    // not eligible (composite group, multiple groups, non-literal key,
+    // unsupported key type, undecodable probe result) → the per-row probes
+    // below stay authoritative.
+    let batched_existing: Option<std::collections::HashSet<String>> = if rows_expanded.len() > 1
+        && constraint_groups.len() == 1
+        && constraint_groups[0].len() == 1
+    {
+        batched_existing_conflict_keys(
+            sess,
+            table,
+            meta,
+            schema,
+            &constraint_groups[0],
+            group_idxs[0][0],
+            &rows_expanded,
+        )
+        .await?
+    } else {
+        None
+    };
+
     // One `seen` set per constraint group to handle same-batch dedup.
     let mut seen_per_group: Vec<std::collections::HashSet<Vec<String>>> = constraint_groups
         .iter()
@@ -6834,11 +6868,31 @@ async fn filter_rows_do_nothing(
                 continue 'row;
             }
 
-            // Existing-table existence check. Try the cheap memtable +
+            // Existing-table existence check. The batched probe (when this
+            // statement was eligible) already resolved every key in one
+            // chunked IN-list SELECT; otherwise try the cheap memtable +
             // zone-map/bloom probe first (when the constraint group IS the
             // table's single-column PK); only fall back to the authoritative
             // SELECT 1 when the probe can't answer definitively. Mirrors the
             // ON CONFLICT DO UPDATE existence-check fast path above.
+            if let Some(existing) = &batched_existing {
+                // `extract_tuple` returned Some, so the key is non-NULL; a
+                // non-literal key is impossible here (eligibility checked
+                // every row). Any residue is "no conflict" — identical to a
+                // `col = <expr>` probe that can never match.
+                let exists = match conflict_probe_key(
+                    &row[idxs[0]],
+                    schema.field(idxs[0]).data_type(),
+                    &cols[0],
+                ) {
+                    ConflictKey::Lit { canonical, .. } => existing.contains(&canonical),
+                    _ => false,
+                };
+                if exists {
+                    continue 'row;
+                }
+                continue;
+            }
             let fast_exists =
                 fast_pk_exists_check(sess, table, meta, cols, &row).await?;
             let exists = match fast_exists {
@@ -7085,6 +7139,57 @@ async fn try_on_conflict_do_update(
         })
         .collect::<Result<_>>()?;
 
+    // ── Batched multi-row path ──────────────────────────────────────────────
+    // The per-row loop below costs, for a 50-row batch, up to 50 existence
+    // probes (each potentially a full `SELECT 1` recursion through
+    // `sess.execute` — metadata refresh + file list + read) plus 50
+    // single-row UPDATE statements. When the conflict target is a single
+    // column with plain-literal keys we instead:
+    //   1. probe ALL keys with one chunked `SELECT col … WHERE col IN (…)`
+    //      (after letting the cheap memtable/bloom probe answer what it can),
+    //   2. apply ALL conflicting rows with one chunked
+    //      `UPDATE … SET c = CASE <ck> WHEN … END WHERE <ck> IN (…)`,
+    //   3. INSERT the fresh rows exactly as before (already one statement).
+    // Any shape the batch builder can't render exactly (composite target,
+    // non-literal conflict key, unsupported key type, assignment RHS that is
+    // not safe as a CASE arm) falls back to the per-row loop below —
+    // correctness over speed.
+    if rows_expanded.len() > 1 && conflict_cols.len() == 1 {
+        match try_batched_do_update(
+            sess,
+            table,
+            &meta,
+            schema.as_ref(),
+            &conflict_cols,
+            conflict_idxs[0],
+            &table_bare,
+            &assignment_cols,
+            &do_update.assignments,
+            &rows_expanded,
+        )
+        .await?
+        {
+            BatchedUpsertOutcome::NoConflicts => return Ok(None),
+            BatchedUpsertOutcome::Done {
+                update_count,
+                insert_rows,
+            } => {
+                return finish_upsert_fresh_inserts(
+                    sess,
+                    table,
+                    schema.as_ref(),
+                    &insert_rows,
+                    update_count,
+                )
+                .await
+                .map(Some);
+            }
+            BatchedUpsertOutcome::NotEligible => {
+                // Fall through to the per-row path.
+            }
+        }
+    }
+
     // Track intra-statement conflict-key duplicates. PG errors with
     // "ON CONFLICT DO UPDATE command cannot affect row a second time"
     // (SQLSTATE 21000) when the VALUES list contains two rows with the
@@ -7190,6 +7295,21 @@ async fn try_on_conflict_do_update(
     // schema-expand + default-apply pass has already been done; more
     // importantly, a plain INSERT of the full original batch would re-try the
     // conflicting keys and hit the PK constraint).
+    finish_upsert_fresh_inserts(sess, table, schema.as_ref(), &insert_rows, update_count)
+        .await
+        .map(Some)
+}
+
+/// Shared tail for the upsert paths: INSERT the non-conflicting rows as one
+/// plain multi-row statement and produce the PG-style command tag
+/// (`INSERT 0 N`, N = updated + inserted — what PG reports for an upsert).
+async fn finish_upsert_fresh_inserts(
+    sess: &ProjectSession,
+    table: &TableName,
+    schema: &Schema,
+    insert_rows: &[Vec<Expr>],
+    update_count: usize,
+) -> Result<ExecResult> {
     let insert_count = insert_rows.len();
     if !insert_rows.is_empty() {
         // Reconstruct a VALUES literal from the already-expanded rows and
@@ -7226,9 +7346,9 @@ async fn try_on_conflict_do_update(
 
     // PG returns "INSERT 0 N" for a multi-row upsert where N is the total
     // number of rows processed (both updated and inserted).
-    Ok(Some(ExecResult::Empty {
+    Ok(ExecResult::Empty {
         tag: format!("INSERT 0 {}", update_count + insert_count),
-    }))
+    })
 }
 
 /// Rewrite a DO UPDATE SET RHS expression to resolve PostgreSQL upsert
@@ -7296,6 +7416,398 @@ fn rewrite_do_update_expr(
         // forms we don't need to rewrite for the DO UPDATE scope.
         other => other,
     }
+}
+
+/// Upper bound on the IN-list / CASE-arm count per statement in the batched
+/// upsert path. Bigger batches are split into successive statements (also
+/// keeps the IN-list under the delta-update machinery's key budget).
+const UPSERT_BATCH_CHUNK: usize = 1000;
+
+/// Outcome of [`try_batched_do_update`].
+enum BatchedUpsertOutcome {
+    /// Statement shape not batchable — the caller runs the per-row path.
+    NotEligible,
+    /// The probe found zero conflicting keys. The caller returns `Ok(None)`
+    /// so the normal INSERT path handles the whole batch — identical to the
+    /// per-row path's `any_conflict == false` exit.
+    NoConflicts,
+    /// Conflicting rows have been UPDATEd (chunked); `insert_rows` holds the
+    /// fresh rows for the shared INSERT tail.
+    Done {
+        update_count: usize,
+        insert_rows: Vec<Vec<Expr>>,
+    },
+}
+
+/// Classification of one row's conflict-column expression for the batched
+/// probe (single-column conflict target only).
+enum ConflictKey {
+    /// NULL literal — never conflicts (PG default NULLS DISTINCT). The
+    /// per-row twin reaches the same answer structurally: its
+    /// `WHERE col = NULL` probe can never match, so the row routes to INSERT.
+    Null,
+    /// Batchable literal key.
+    Lit {
+        /// Type-canonical equality key: the parsed i64 re-rendered for
+        /// integer-family columns (so the literals `5` and `05` agree), the
+        /// unescaped string for text. Compared against the probe's returned
+        /// column values.
+        canonical: String,
+        /// The literal exactly as the per-row path renders it into
+        /// `WHERE <col> = {expr}` (sqlparser `Display`, which re-escapes
+        /// embedded quotes). Reused verbatim in IN lists and CASE arms.
+        rendered: String,
+    },
+    /// Not a plain literal — the statement must take the per-row path.
+    NotLiteral,
+}
+
+fn conflict_probe_key(expr: &Expr, dt: &DataType, col: &str) -> ConflictKey {
+    if let Expr::Value(v) = expr {
+        if matches!(v.value, sqlparser::ast::Value::Null) {
+            return ConflictKey::Null;
+        }
+    }
+    // Reuse the UPDATE-SET literal coercion (the same one
+    // `fast_pk_exists_check` trusts) so the canonical key agrees with how
+    // the engine itself interprets the literal. `Err` (malformed literal)
+    // maps to NotLiteral — the per-row path owns that error surface.
+    let scalar = match crate::dml_mutate::try_literal_to_scalar(expr, dt, col) {
+        Ok(Some(s)) => s,
+        _ => return ConflictKey::NotLiteral,
+    };
+    let canonical = match scalar {
+        basin_storage::ScalarValue::Int64(v) => v.to_string(),
+        basin_storage::ScalarValue::Utf8(s) => s,
+        _ => return ConflictKey::NotLiteral,
+    };
+    ConflictKey::Lit {
+        canonical,
+        rendered: format!("{expr}"),
+    }
+}
+
+/// Whether a rewritten DO-UPDATE SET RHS is safe to embed as a CASE arm in
+/// the batched UPDATE. Conservative allowlist: the recursive shapes
+/// `rewrite_do_update_expr` itself understands, plus CAST. Functions,
+/// subqueries, nested CASE, … → per-row fallback (correctness over speed).
+fn case_arm_safe(expr: &Expr) -> bool {
+    match expr {
+        Expr::Value(_) | Expr::Identifier(_) | Expr::CompoundIdentifier(_) => true,
+        Expr::BinaryOp { left, right, .. } => case_arm_safe(left) && case_arm_safe(right),
+        Expr::UnaryOp { expr: inner, .. } => case_arm_safe(inner),
+        Expr::Nested(inner) => case_arm_safe(inner),
+        Expr::Cast { expr: inner, .. } => case_arm_safe(inner),
+        _ => false,
+    }
+}
+
+/// Decode one probe-result column into canonical key strings. Returns
+/// `false` when the column isn't the expected Arrow type (caller falls back
+/// to the per-row path). NULL elements are skipped — `IN` never matches a
+/// NULL anyway.
+fn collect_probe_keys(
+    arr: &dyn arrow_array::Array,
+    dt: &DataType,
+    out: &mut std::collections::HashSet<String>,
+) -> bool {
+    use arrow_array::Array as _;
+    macro_rules! collect_int {
+        ($ty:ty) => {{
+            let Some(a) = arr.as_any().downcast_ref::<$ty>() else {
+                return false;
+            };
+            for i in 0..a.len() {
+                if !a.is_null(i) {
+                    out.insert(i64::from(a.value(i)).to_string());
+                }
+            }
+        }};
+    }
+    match dt {
+        DataType::Int16 => collect_int!(arrow_array::Int16Array),
+        DataType::Int32 => collect_int!(arrow_array::Int32Array),
+        DataType::Int64 => collect_int!(arrow_array::Int64Array),
+        DataType::Utf8 => {
+            let Some(a) = arr.as_any().downcast_ref::<StringArray>() else {
+                return false;
+            };
+            for i in 0..a.len() {
+                if !a.is_null(i) {
+                    out.insert(a.value(i).to_string());
+                }
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Resolve which of this statement's conflict keys already exist in the
+/// table, using ONE chunked `SELECT <col> FROM <t> WHERE <col> IN (…)` for
+/// everything the cheap memtable/bloom probe can't answer. Shared by the
+/// batched DO UPDATE and DO NOTHING paths.
+///
+/// Returns `Ok(None)` when the statement isn't batchable: unsupported key
+/// column type, a non-literal key expression, or a probe result that can't
+/// be decoded. NULL keys are skipped (they never conflict).
+async fn batched_existing_conflict_keys(
+    sess: &ProjectSession,
+    table: &TableName,
+    meta: &TableMetadata,
+    schema: &Schema,
+    conflict_cols: &[String], // single-column group (len == 1)
+    conflict_idx: usize,
+    rows_expanded: &[Vec<Expr>],
+) -> Result<Option<std::collections::HashSet<String>>> {
+    let dt = schema.field(conflict_idx).data_type().clone();
+    if !matches!(
+        dt,
+        DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::Utf8
+    ) {
+        return Ok(None);
+    }
+
+    let mut existing: std::collections::HashSet<String> = Default::default();
+    // (canonical, rendered) pairs the cheap probe could not decide.
+    let mut undecided: Vec<(String, String)> = Vec::new();
+    for row in rows_expanded {
+        match conflict_probe_key(&row[conflict_idx], &dt, &conflict_cols[0]) {
+            ConflictKey::Null => {}
+            ConflictKey::NotLiteral => return Ok(None),
+            ConflictKey::Lit {
+                canonical,
+                rendered,
+            } => {
+                // Memtable / zone-map+bloom first — free when it answers.
+                match fast_pk_exists_check(sess, table, meta, conflict_cols, row).await? {
+                    Some(true) => {
+                        existing.insert(canonical);
+                    }
+                    Some(false) => {}
+                    None => undecided.push((canonical, rendered)),
+                }
+            }
+        }
+    }
+
+    if undecided.is_empty() {
+        return Ok(Some(existing));
+    }
+
+    // Dedup (a DO NOTHING batch may repeat a key) while keeping the rendered
+    // literal for the IN list.
+    let mut seen: std::collections::HashSet<&str> = Default::default();
+    let unique: Vec<&(String, String)> = undecided
+        .iter()
+        .filter(|(canonical, _)| seen.insert(canonical.as_str()))
+        .collect();
+
+    for chunk in unique.chunks(UPSERT_BATCH_CHUNK) {
+        let in_list = chunk
+            .iter()
+            .map(|(_, rendered)| rendered.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let probe_sql = format!(
+            "SELECT {col} FROM {t} WHERE {col} IN ({in_list})",
+            col = conflict_cols[0],
+            t = table.as_str()
+        );
+        // Session dispatcher, not raw ctx.sql — same staleness rationale as
+        // the per-row SELECT 1 probe.
+        let batches = match Box::pin(sess.execute(&probe_sql)).await {
+            Ok(ExecResult::Rows { batches, .. }) => batches,
+            Ok(_) => Vec::new(),
+            // Table may be empty / not yet registered → no conflicts
+            // (mirrors the per-row probe's `Err(_) => false`).
+            Err(_) => Vec::new(),
+        };
+        for b in &batches {
+            if b.num_rows() == 0 {
+                continue;
+            }
+            if !collect_probe_keys(b.column(0).as_ref(), &dt, &mut existing) {
+                // Unexpected result column type — hand back to the per-row
+                // path, which stays authoritative.
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(existing))
+}
+
+/// Batched multi-row ON CONFLICT DO UPDATE: one chunked IN-list existence
+/// probe + one chunked CASE-arm UPDATE per ≤[`UPSERT_BATCH_CHUNK`]
+/// conflicting rows, replacing the per-row probe + per-row UPDATE loop.
+///
+/// Failure-granularity note: the per-row path issued one `sess.execute`
+/// UPDATE per conflicting row, so a mid-batch failure could leave earlier
+/// rows updated. Here a whole chunk applies (or fails) as one statement, and
+/// the intra-statement duplicate-key error fires before ANY row is touched —
+/// strictly coarser, never finer, than the per-row behaviour.
+#[allow(clippy::too_many_arguments)]
+async fn try_batched_do_update(
+    sess: &ProjectSession,
+    table: &TableName,
+    meta: &TableMetadata,
+    schema: &Schema,
+    conflict_cols: &[String], // single-column target (len == 1)
+    conflict_idx: usize,
+    table_bare: &str,
+    assignment_cols: &[String],
+    assignments: &[sqlparser::ast::Assignment],
+    rows_expanded: &[Vec<Expr>],
+) -> Result<BatchedUpsertOutcome> {
+    let dt = schema.field(conflict_idx).data_type().clone();
+
+    // Gate 0 (pure): SET must not assign the conflict column itself. The
+    // per-row path probes sequentially, so an earlier row's UPDATE that
+    // rewrites the conflict key is visible to later rows' probes; the
+    // batched probe sees only the initial state. Fall back to preserve the
+    // sequential semantics exactly.
+    if assignment_cols
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(&conflict_cols[0]))
+    {
+        return Ok(BatchedUpsertOutcome::NotEligible);
+    }
+
+    // Gate 1 (pure): every rewritten SET RHS must be safe as a CASE arm.
+    // This also vets the per-row EXCLUDED substitutions, since they splice
+    // arbitrary VALUES expressions into the arm. The rendered RHS strings
+    // are exactly what the per-row path would have rendered into its
+    // single-row UPDATEs (same `rewrite_do_update_expr` + `Display`).
+    let mut row_set_rhs: Vec<Vec<String>> = Vec::with_capacity(rows_expanded.len());
+    for row in rows_expanded {
+        let mut excluded_map: std::collections::HashMap<String, Expr> =
+            std::collections::HashMap::with_capacity(schema.fields().len());
+        for (i, field) in schema.fields().iter().enumerate() {
+            excluded_map.insert(field.name().to_ascii_lowercase(), row[i].clone());
+        }
+        let mut rhs_list = Vec::with_capacity(assignments.len());
+        for a in assignments {
+            let rhs = rewrite_do_update_expr(a.value.clone(), table_bare, &excluded_map);
+            if !case_arm_safe(&rhs) {
+                return Ok(BatchedUpsertOutcome::NotEligible);
+            }
+            rhs_list.push(format!("{rhs}"));
+        }
+        row_set_rhs.push(rhs_list);
+    }
+
+    // Gate 2 (pure): intra-statement duplicate conflict keys — same key
+    // rendering and error as the per-row path (PG SQLSTATE 21000), but
+    // raised before any UPDATE executes. Additionally, two *differently
+    // rendered* literals for the same canonical key (`5` vs `05`) are not an
+    // error on the per-row path (it applies both, last wins) while a CASE
+    // dispatch would pick the first arm — preserve the per-row behaviour by
+    // falling back.
+    let mut seen_rendered: std::collections::HashSet<String> = Default::default();
+    let mut seen_canonical: std::collections::HashSet<String> = Default::default();
+    for row in rows_expanded {
+        if !seen_rendered.insert(format!("{}", row[conflict_idx])) {
+            return Err(BasinError::InvalidSchema(
+                "ON CONFLICT DO UPDATE command cannot affect row a second time".into(),
+            ));
+        }
+        if let ConflictKey::Lit { canonical, .. } =
+            conflict_probe_key(&row[conflict_idx], &dt, &conflict_cols[0])
+        {
+            if !seen_canonical.insert(canonical) {
+                return Ok(BatchedUpsertOutcome::NotEligible);
+            }
+        }
+    }
+
+    // Batched existence probe (one chunked IN-list SELECT).
+    let existing = match batched_existing_conflict_keys(
+        sess,
+        table,
+        meta,
+        schema,
+        conflict_cols,
+        conflict_idx,
+        rows_expanded,
+    )
+    .await?
+    {
+        Some(set) => set,
+        None => return Ok(BatchedUpsertOutcome::NotEligible),
+    };
+
+    // Partition: conflicting (key exists) → UPDATE, fresh → INSERT.
+    // NULL keys never conflict (PG NULLS DISTINCT) → INSERT.
+    let mut conflict_rows: Vec<(usize, String)> = Vec::new(); // (row idx, rendered key)
+    let mut insert_rows: Vec<Vec<Expr>> = Vec::new();
+    for (ri, row) in rows_expanded.iter().enumerate() {
+        match conflict_probe_key(&row[conflict_idx], &dt, &conflict_cols[0]) {
+            ConflictKey::Lit {
+                canonical,
+                rendered,
+            } if existing.contains(&canonical) => {
+                conflict_rows.push((ri, rendered));
+            }
+            _ => insert_rows.push(row.clone()),
+        }
+    }
+    if conflict_rows.is_empty() {
+        return Ok(BatchedUpsertOutcome::NoConflicts);
+    }
+
+    // One UPDATE per chunk. A single conflicting row keeps the exact SQL
+    // shape the per-row path produced (`SET c = rhs WHERE ck = key`) so it
+    // hits the same single-key fast paths; larger chunks dispatch per row
+    // via a simple CASE on the conflict column and route through the
+    // IN-list delta-update machinery as one statement.
+    let conflict_col = &conflict_cols[0];
+    for chunk in conflict_rows.chunks(UPSERT_BATCH_CHUNK) {
+        let update_sql = if let [(ri, rendered)] = chunk {
+            let set_parts: Vec<String> = assignment_cols
+                .iter()
+                .zip(row_set_rhs[*ri].iter())
+                .map(|(col, rhs)| format!("{col} = {rhs}"))
+                .collect();
+            format!(
+                "UPDATE {} SET {} WHERE {conflict_col} = {rendered}",
+                table.as_str(),
+                set_parts.join(", ")
+            )
+        } else {
+            let in_list = chunk
+                .iter()
+                .map(|(_, rendered)| rendered.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let set_parts: Vec<String> = assignment_cols
+                .iter()
+                .enumerate()
+                .map(|(ai, col)| {
+                    let mut arms = String::new();
+                    for (ri, rendered) in chunk {
+                        arms.push_str(&format!(
+                            " WHEN {rendered} THEN {}",
+                            row_set_rhs[*ri][ai]
+                        ));
+                    }
+                    // ELSE is unreachable (the WHERE restricts to the arm
+                    // keys) but keeps the expression total.
+                    format!("{col} = CASE {conflict_col}{arms} ELSE {col} END")
+                })
+                .collect();
+            format!(
+                "UPDATE {} SET {} WHERE {conflict_col} IN ({in_list})",
+                table.as_str(),
+                set_parts.join(", ")
+            )
+        };
+        Box::pin(sess.execute(&update_sql)).await?;
+    }
+
+    Ok(BatchedUpsertOutcome::Done {
+        update_count: conflict_rows.len(),
+        insert_rows,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -12356,7 +12868,60 @@ mod preparse_fastpath_tests {
     }
 
     #[tokio::test]
-    async fn declines_inside_explicit_transaction() {
+    async fn engages_inside_explicit_transaction_with_tx_semantics() {
+        // Gate 1's CURRENT contract: OPEN transactions are admitted (only the
+        // aborted state declines — see `declines_inside_aborted_transaction`).
+        // The engaged path must inherit exec_insert's full in-tx branch:
+        // rows buffered + visible in-tx, dropped on ROLLBACK, kept on COMMIT.
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, s TEXT)")
+            .await
+            .unwrap();
+
+        // ── BEGIN → engage → visible in-tx → ROLLBACK drops ────────────────
+        sess.execute("BEGIN").await.unwrap();
+        let before = INSERTS_PREPARSE_FASTPATH.load(Ordering::Relaxed);
+        let res = try_insert_preparse(&sess, "INSERT INTO t (id, s) VALUES (1, 'a'), (2, 'b')")
+            .await
+            .expect("pre-parse path must engage inside an open transaction");
+        match res.expect("engaged in-tx insert must succeed") {
+            ExecResult::Empty { tag } => assert_eq!(tag, "INSERT 0 2"),
+            other => panic!("expected INSERT tag, got {other:?}"),
+        }
+        // ≥ 1, not == 1: other tests in this binary bump the global counter
+        // concurrently.
+        assert!(
+            INSERTS_PREPARSE_FASTPATH.load(Ordering::Relaxed) > before,
+            "engagement counter must advance for the in-tx statement"
+        );
+        let n = count_from_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
+        assert_eq!(n, 2, "engaged in-tx rows must be visible inside the transaction");
+        sess.execute("ROLLBACK").await.unwrap();
+        let n = count_from_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
+        assert_eq!(n, 0, "ROLLBACK must drop the engaged in-tx rows");
+
+        // ── BEGIN → engage → COMMIT keeps ───────────────────────────────────
+        sess.execute("BEGIN").await.unwrap();
+        let before = INSERTS_PREPARSE_FASTPATH.load(Ordering::Relaxed);
+        try_insert_preparse(&sess, "INSERT INTO t (id, s) VALUES (3, 'c'), (4, 'd')")
+            .await
+            .expect("pre-parse path must engage inside an open transaction")
+            .expect("engaged in-tx insert must succeed");
+        assert!(
+            INSERTS_PREPARSE_FASTPATH.load(Ordering::Relaxed) > before,
+            "engagement counter must advance for the second in-tx statement"
+        );
+        sess.execute("COMMIT").await.unwrap();
+        let n = count_from_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
+        assert_eq!(n, 2, "COMMIT must persist the engaged in-tx rows");
+    }
+
+    #[tokio::test]
+    async fn declines_inside_aborted_transaction() {
+        // The 25P02 aborted-state guard stays with the normal path: once a
+        // statement fails in-tx, the pre-parse path must decline.
         let dir = TempDir::new().unwrap();
         let eng = make_engine(&dir);
         let sess = eng.open_session(ProjectId::new()).await.unwrap();
@@ -12365,19 +12930,18 @@ mod preparse_fastpath_tests {
             .unwrap();
 
         sess.execute("BEGIN").await.unwrap();
+        sess.execute("SELECT * FROM no_such_table")
+            .await
+            .expect_err("statement against a missing table must fail in-tx");
         assert!(
-            try_insert_preparse(&sess, "INSERT INTO t (id, s) VALUES (1, 'a'), (2, 'b')")
+            try_insert_preparse(&sess, "INSERT INTO t (id, s) VALUES (1, 'a')")
                 .await
                 .is_none(),
-            "pre-parse path is auto-commit-only"
+            "aborted transaction must decline the pre-parse path"
         );
-        // The normal in-tx path still handles the same statement.
-        sess.execute("INSERT INTO t (id, s) VALUES (1, 'a'), (2, 'b')")
-            .await
-            .unwrap();
-        sess.execute("COMMIT").await.unwrap();
+        sess.execute("ROLLBACK").await.unwrap();
         let n = count_from_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
-        assert_eq!(n, 2);
+        assert_eq!(n, 0, "nothing may be written by the declined probe");
     }
 
     #[tokio::test]
