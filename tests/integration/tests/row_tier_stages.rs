@@ -301,16 +301,20 @@ async fn s2_insert_writes_through_to_cache() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s3_cold_point_read_pins_then_hits() {
     let (_sd, _wd, engine, shard, bg, wal) = build().await;
-    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+    let project = ProjectId::new();
+    let sess = engine.open_session(project).await.unwrap();
     exec(
         &sess,
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
     )
     .await;
-    // Auto-commit VALUES INSERT → cold Parquet (no registry write-through), then
-    // flush so the row is cold-only and the memtable holds nothing for it.
+    // Auto-commit VALUES INSERT, flush, then evict the S4 retained-clean copy
+    // (write-through keeps the row memory-resident across the flush, which
+    // would serve the reads below before the PK row cache is consulted) so
+    // the row is genuinely cold-only and this test pins the cold→cache path.
     exec(&sess, "INSERT INTO t (id, v) VALUES (3, 30)").await;
     shard.flush_to_parquet().await.unwrap();
+    let _ = engine.memtable_registry().evict_clean(&project, u64::MAX);
 
     let before = engine.pk_row_cache_counters();
     // First read: cold MISS → decode → populate.

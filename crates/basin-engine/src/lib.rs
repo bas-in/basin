@@ -438,6 +438,11 @@ impl Engine {
         // bypassed (INSERTs go to WAL+tail), making compaction the only
         // opportunity to populate row-group summaries for shard-written data.
         if let Some(shard) = inner.cfg.shard.as_ref() {
+            // S4 retention: hand the hot-tier registry to the shard so its
+            // background clean-sweep tick can enforce the retention window
+            // (age + per-project clean-byte cap). Late wiring is fine — the
+            // shard reads the registry cell on every tick.
+            shard.set_memtable_registry(inner.memtable_registry.clone());
             shard.set_gin_rowgroup_registry(inner.gin_rowgroup_registry.clone());
             shard.set_jsonb_posting_registry(inner.jsonb_posting_registry.clone());
             // FIX 2 — wire the secondary B-tree index registry into the
@@ -465,6 +470,22 @@ impl Engine {
                     registry.sweep();
                 }
             });
+        }
+        // S4 retention, shard-less fallback: without a shard there is no
+        // background tick to enforce the clean-retention window, so sweep
+        // from an engine-owned task. Shard-backed engines get this from the
+        // shard's clean-sweep tick instead (wired above) — spawning both
+        // would be harmless but redundant.
+        if engine.inner.cfg.shard.is_none() {
+            if let Ok(rt_handle) = tokio::runtime::Handle::try_current() {
+                let registry = engine.inner.memtable_registry.clone();
+                rt_handle.spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        registry.enforce_clean_budgets();
+                    }
+                });
+            }
         }
         engine
     }

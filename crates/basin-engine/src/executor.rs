@@ -872,8 +872,14 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                     // marker emitted below).
                     let tx_overlay = crate::session::tx_overlay_take_all(&sess.state);
 
-                    // Promote committed HTAP batches to the process-wide registry.
-                    htap_promote_to_registry(sess, &htap_rows).await?;
+                    // Promote committed HTAP batches to the process-wide
+                    // registry. Promotion stays PRE-commit (visibility: other
+                    // sessions must see the rows the moment COMMIT starts
+                    // landing them — see the function doc); the returned
+                    // per-table `(key, seq)` acks are applied AFTER the
+                    // catalog commit below makes the same rows durable in
+                    // cold Parquet (S4 commit 4b).
+                    let promote_clean_acks = htap_promote_to_registry(sess, &htap_rows).await?;
 
                     // Drain the tx overlay into the shared registry. This runs
                     // BEFORE `tx_commit` (which clears TxState) and BEFORE the
@@ -1032,6 +1038,36 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                                     // Best-effort: mark aborted — client must ROLLBACK.
                                     crate::session::tx_set_aborted(&sess.state);
                                     return Err(e);
+                                }
+                            }
+                            // S4 commit 4b: this table's htap rows are now
+                            // durable in the cold file the commit above just
+                            // landed — ack the promoted registry copies CLEAN
+                            // (`mark_flushed` at the insert seqs captured at
+                            // promote time). Without this ack the rows would
+                            // sit DIRTY and the hot-tier flush would write
+                            // them to cold a SECOND time. Acked rows keep
+                            // serving point reads as retained residency.
+                            // Kill switch: with `retain_secs == 0` we skip
+                            // the ack entirely so the registry behaves
+                            // byte-for-byte like today (rows stay dirty and
+                            // resident until the flush worker drains them).
+                            {
+                                let registry = sess.engine.memtable_registry();
+                                if registry.config().retain_secs > 0 {
+                                    if let Some(acks) = promote_clean_acks.get(table) {
+                                        if !acks.is_empty() {
+                                            if let Some(entry) =
+                                                registry.get(&sess.project, table)
+                                            {
+                                                let freed = entry.memtable.mark_flushed(acks);
+                                                if freed > 0 {
+                                                    registry
+                                                        .release_bytes(&sess.project, freed);
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             // Inv-OLTP-write (#155): COMMIT just advanced the
@@ -2480,15 +2516,19 @@ async fn dispatch_parsed_statement(
                         // override shadows one. Skip the metadata-only path so
                         // the aggregate is computed over the merged hot+cold
                         // row set (where the overlay / tombstone filter runs).
+                        // S4: O(1) newest-version counters replace the
+                        // previous O(n) snapshot walk. Tombstone/Update
+                        // entries are always DIRTY (a flush ack removes clean
+                        // tombstones and re-tags acked Updates as Rows), so
+                        // the two counters are exactly the "overlay present"
+                        // signal this auto-commit (unwatermarked) gate needs.
                         let has_hot_overlay = {
                             let registry = sess.engine.memtable_registry();
                             registry
                                 .get(&sess.project, &plan.table)
                                 .map(|e| {
-                                    e.memtable
-                                        .snapshot()
-                                        .iter()
-                                        .any(|(_, v)| !v.is_row() || v.is_update())
+                                    e.memtable.tombstone_count() > 0
+                                        || e.memtable.update_count() > 0
                                 })
                                 .unwrap_or(false)
                         };
@@ -5262,7 +5302,14 @@ async fn exec_insert(
             // Stripe 0 == default_key so existing data + the read-side tail
             // probe (`shard.get(default_key).read`) keep working as-is.
             let _ = part; // suppress unused-var warning on the striping branch
-            write_batch_striped(shard, &sess.project, &table, batch).await?;
+            write_batch_striped(shard, &sess.project, &table, batch.clone()).await?;
+            // S4 commit 4a: the rows are durably acked by the shard WAL — keep
+            // small OLTP inserts resident in the hot tier as CLEAN entries
+            // (`insert_clean`) so the very next point read is served from
+            // memory with ZERO file opens (read-own-insert). Bulk loads
+            // (> the row gate) and non-encodable PKs skip; promotion is an
+            // optimization and never an error.
+            write_through_insert_residency(sess, &table, &meta, &batch);
             // Inv-OLTP-write (#155): the shard's compactor advances the
             // catalog out-of-band when it flushes the WAL tail into Parquet
             // (e.g. on `flush_to_parquet()` or the auto-flush threshold).
@@ -7370,8 +7417,8 @@ fn write_options_for(meta: &TableMetadata, in_tx: bool) -> WriteOptions {
         // rewrites the file with `Best`, so the disk-size delta is
         // transient. `Best` is NOT a correctness fallback — it is just a
         // more exhaustive encoder cascade — so always-Fast for non-tx
-        // INSERT is safe. Hot-tier flushes always use `Fast` (see
-        // basin-shard ShardFlushBackend).
+        // INSERT is safe. Copy-on-write UPDATE/DELETE rewrites also use
+        // `Fast` (see dml_mutate's write_replacement options).
         //
         // The `!in_tx` gate mirrors AF's fastpath-off-in-tx pattern:
         // inside BEGIN..COMMIT the per-statement Fast-encoder setup cost
@@ -8626,6 +8673,29 @@ async fn exec_alter_table(
     if !sess.is_system {
         crate::schema_ddl::guard_reserved_schema_for_user_ddl(&name, "ALTER TABLE")?;
     }
+    // Resolve the bare (pre-rename) table name up front: it keys both the
+    // pre-ALTER overlay drain and the post-ALTER hot-tier clear below, and
+    // for RENAME TO it is the OLD name — exactly the key the registry holds.
+    let bare_name = match name.0.len() {
+        1 => Some(name.0[0].id_val().clone()),
+        2 => Some(name.0[1].id_val().clone()),
+        _ => None,
+    };
+    let bare_table: Option<TableName> = bare_name.and_then(|raw| TableName::new(raw).ok());
+
+    // S4 hot-tier schema-change protocol. Memtable entries carry Arrow IPC
+    // row bytes encoded against the schema AT WRITE TIME; rows surviving an
+    // ALTER (add/drop/rename column, type change) risk projection mismatches
+    // on every read path that decodes them. Two steps:
+    //   1. BEFORE the ALTER: materialize any pending UPDATE/DELETE overlay
+    //      into the cold tier (dirty overlay entries are committed fast-path
+    //      writes — clearing them without materializing would LOSE them).
+    //   2. AFTER a successful ALTER: drop the table's whole memtable entry
+    //      (now only old-schema residency/HTAP rows, all cold-backed) and
+    //      release the freed bytes from the project budget.
+    if let Some(t) = bare_table.as_ref() {
+        crate::dml_mutate::materialize_hot_overlay_into_cold(sess, t).await?;
+    }
     let tag = crate::alter::apply_standard_alter_table(
         &sess.engine.config().catalog,
         &sess.project,
@@ -8634,20 +8704,21 @@ async fn exec_alter_table(
         &sess.state.schema_state,
     )
     .await?;
+    if let Some(t) = bare_table.as_ref() {
+        let registry = sess.engine.memtable_registry();
+        if let Some(entry) = registry.get(&sess.project, t) {
+            let bytes = entry.memtable.bytes_allocated();
+            registry.remove(&sess.project, t);
+            registry.release_bytes(&sess.project, bytes);
+        }
+    }
 
     // ADD COLUMN replaced the schema in the catalog; refresh the
     // session's DataFusion ListingTable so subsequent SELECTs see the
-    // new column. We pull the (now possibly different) table name out
-    // of the AST, stripping any schema qualifier (`myschema.t` → `t`).
-    let bare_name = match name.0.len() {
-        1 => Some(name.0[0].id_val().clone()),
-        2 => Some(name.0[1].id_val().clone()),
-        _ => None,
-    };
-    if let Some(raw) = bare_name {
-        if let Ok(t) = TableName::new(raw) {
-            refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &t).await?;
-        }
+    // new column. The bare name was resolved above (schema qualifier
+    // stripped: `myschema.t` → `t`).
+    if let Some(t) = bare_table.as_ref() {
+        refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, t).await?;
     }
     Ok(ExecResult::Empty { tag: tag.into() })
 }
@@ -10057,28 +10128,152 @@ fn encode_batch_to_ipc(batch: &arrow_array::RecordBatch) -> Vec<u8> {
     buf
 }
 
+/// Default row gate for the auto-commit INSERT write-through (S4 commit 4a):
+/// batches larger than this are bulk loads and skip residency promotion.
+/// Override with `BASIN_HOTTIER_RESIDENT_INSERT_MAX_ROWS`.
+const BASIN_HOTTIER_RESIDENT_INSERT_MAX_ROWS: usize = 128;
+
+fn hottier_resident_insert_max_rows() -> usize {
+    std::env::var("BASIN_HOTTIER_RESIDENT_INSERT_MAX_ROWS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(BASIN_HOTTIER_RESIDENT_INSERT_MAX_ROWS)
+}
+
+/// S4 commit 4a — auto-commit INSERT write-through residency.
+///
+/// Called on the shard auto-commit INSERT path AFTER `write_batch_striped`
+/// durably acked the rows (shard WAL): promote each PK-encodable row into the
+/// process-wide `MemTableRegistry` as a CLEAN entry (`insert_clean`), so the
+/// next point read for that PK is served from memory with zero file opens —
+/// no shard tail flush, no catalog load, no cold decode (the pre-flush PK
+/// probe in `fast_select`). Clean entries are excluded from the hot-tier
+/// flush (`dirty_snapshot`), so the shard's own tail→Parquet flush remains
+/// the single durability path — no double-flush — and they are evictable at
+/// any time under the retention/budget sweeps with zero correctness impact
+/// (an evicted row is re-read from the tail/cold exactly as today).
+///
+/// Gates (every miss silently skips — promotion is an optimization, never an
+/// error):
+///   * `retain_secs == 0` kill switch — retention disabled means behave
+///     exactly like today: no write-through at all;
+///   * `batch.num_rows() <= BASIN_HOTTIER_RESIDENT_INSERT_MAX_ROWS` (128) —
+///     OLTP inserts only, bulk loads skip;
+///   * single-column PK whose value encodes to a `RowKey` — the counter-key
+///     fallback is NEVER taken here (it would grow the un-indexed half of the
+///     memtable that point reads can't probe), and composite PKs are skipped
+///     because the only read paths that serve CLEAN rows are the single-PK
+///     direct-get probes (the auto-commit snapshot fallback deliberately
+///     skips clean entries — see `probe_memtable`);
+///   * budget: `try_reserve_bytes` (clean bytes still consume budget — they
+///     are reclaimable). On `HardCapReached`, evict this project's clean
+///     bytes and retry ONCE, then skip silently.
+///
+/// Row encoding reuses `htap_promote_to_registry`'s machinery
+/// (`build_pk_row_key` + `encode_batch_to_ipc`) so the resident image is
+/// byte-compatible with what every memtable read path already decodes.
+fn write_through_insert_residency(
+    sess: &ProjectSession,
+    table: &TableName,
+    meta: &basin_catalog::TableMetadata,
+    batch: &arrow_array::RecordBatch,
+) {
+    let registry = sess.engine.memtable_registry();
+    if registry.config().retain_secs == 0 {
+        return; // kill switch — today's behavior
+    }
+    let n_rows = batch.num_rows();
+    if n_rows == 0 || n_rows > hottier_resident_insert_max_rows() {
+        return; // bulk load (or empty) — skip
+    }
+    if meta.pk_columns.len() != 1 {
+        return; // composite/no PK — clean rows would be unreachable residency
+    }
+    let pk_col = &meta.pk_columns[0];
+    let Ok(pk_idx) = batch.schema().index_of(pk_col) else {
+        return;
+    };
+    let pk_cols = vec![(pk_idx, batch.schema().field(pk_idx).data_type().clone())];
+
+    // Budget gate: evict-clean-then-retry once, then skip silently.
+    let approx_bytes = batch.get_array_memory_size() as u64;
+    let reserve_ok = |outcome: basin_hottier::ReservationOutcome| {
+        outcome != basin_hottier::ReservationOutcome::HardCapReached
+    };
+    if !reserve_ok(registry.try_reserve_bytes(&sess.project, approx_bytes)) {
+        let _ = registry.evict_clean(&sess.project, approx_bytes);
+        if !reserve_ok(registry.try_reserve_bytes(&sess.project, approx_bytes)) {
+            return;
+        }
+    }
+
+    let entry = registry.get_or_create(sess.project, table.clone());
+    for row_idx in 0..n_rows {
+        // Skip rows whose PK does not encode (NULL / unsupported type) —
+        // NEVER fall back to a counter key on this path.
+        let Some(key) = build_pk_row_key(batch, row_idx, &pk_cols) else {
+            continue;
+        };
+        // Never overwrite an EXISTING entry. The only reachable case here is
+        // a DIRTY Tombstone (re-INSERT of a fast-path-deleted PK — a live
+        // Row/Update would have failed the PK-uniqueness check upstream):
+        // `insert_clean` would push-and-immediately-ack over it, DRAINING the
+        // tombstone from the chain and un-suppressing the STALE cold row it
+        // still shadows (the fast-path DELETE never rewrote cold). Skipping
+        // preserves today's overlay semantics for that key.
+        if entry.memtable.get(&key).is_some() {
+            continue;
+        }
+        let row_batch = batch.slice(row_idx, 1);
+        let row_bytes = encode_batch_to_ipc(&row_batch);
+        entry
+            .memtable
+            .insert_clean(key, basin_hottier::MemRowValue::row(row_bytes, 0));
+    }
+}
+
 /// Promote committed HTAP batches from a completed transaction to the
 /// process-wide `MemTableRegistry`.  Called on COMMIT before `tx_commit`
 /// clears the `TxState`.
 ///
-/// Budget enforcement (per ADR 0016 §Multi-project isolation + Phase 5.14.C5):
-/// 1. `try_reserve_bytes` per batch.
-/// 2. On `HardCapReached`: synchronous eviction of the largest project's
-///    memtable, then retry once.
-/// 3. If still over cap: return `SQLSTATE 53200` (out_of_memory).
+/// Budget enforcement (per ADR 0016 §Multi-project isolation + Phase 5.14.C5
+/// + S4 clean-first eviction):
+/// 1. `try_reserve_bytes` per batch (which itself evicts THIS project's clean
+///    bytes before reporting `HardCapReached`).
+/// 2. On `HardCapReached`: evict CLEAN (flushed-and-retained) bytes from the
+///    largest project — clean rows are pure read acceleration, so this never
+///    loses a write — then retry.
+/// 3. Still over cap: fall back to the pre-S4 last resort — synchronous
+///    `remove_project` of the largest project's memtables (this DOES drop
+///    dirty overlays; semantics unchanged, just demoted to last resort) —
+///    then retry once.
+/// 4. If still over cap: return `SQLSTATE 53200` (out_of_memory).
+///
+/// Returns, per table, the `(RowKey, seq)` pairs for the rows whose insert
+/// seq was captured race-free (S4 commit 4b): after the COMMIT's catalog
+/// commit makes these exact rows durable in cold Parquet, the caller acks
+/// them CLEAN via `mark_flushed` so a later hot-tier flush does not
+/// double-flush them while they keep serving point reads as residency.
 async fn htap_promote_to_registry(
     sess: &ProjectSession,
     htap_rows: &std::collections::HashMap<
         basin_common::TableName,
         Vec<arrow_array::RecordBatch>,
     >,
-) -> Result<()> {
+) -> Result<std::collections::HashMap<basin_common::TableName, Vec<(basin_hottier::RowKey, u64)>>>
+{
+    let mut clean_acks: std::collections::HashMap<
+        basin_common::TableName,
+        Vec<(basin_hottier::RowKey, u64)>,
+    > = std::collections::HashMap::new();
     if htap_rows.is_empty() {
-        return Ok(());
+        return Ok(clean_acks);
     }
     let registry = sess.engine.memtable_registry();
     for (table, batches) in htap_rows {
         let entry = registry.get_or_create(sess.project, table.clone());
+        let table_acks: &mut Vec<(basin_hottier::RowKey, u64)> =
+            clean_acks.entry(table.clone()).or_default();
 
         // Pre-fetch table metadata once per table so the hot loop below does
         // not call load_table() per row.  On catalog miss (e.g. mid-DROP) fall
@@ -10189,15 +10384,34 @@ async fn htap_promote_to_registry(
                 outcome != basin_hottier::ReservationOutcome::HardCapReached
             };
             if !reserve_ok(registry.try_reserve_bytes(&sess.project, approx_bytes)) {
-                // Synchronous eviction: drop the largest project to free space.
+                // S4 clean-first: reclaim CLEAN (flushed-and-retained) bytes
+                // from the largest project before dropping anything dirty.
+                // Clean rows are read acceleration only — evicting them never
+                // loses a write. (`try_reserve_bytes` already evicted THIS
+                // project's clean bytes internally; the largest project may
+                // be a different one.)
                 if let Some(largest) = registry.largest_project() {
-                    registry.remove_project(&largest);
+                    let _ = registry.evict_clean(&largest, approx_bytes);
                 }
-                // Retry once.
                 if !reserve_ok(registry.try_reserve_bytes(&sess.project, approx_bytes)) {
-                    return Err(basin_common::BasinError::internal(
-                        "HTAP memtable hard cap exceeded (SQLSTATE 53200)",
-                    ));
+                    // Last resort — the pre-S4 behavior, unchanged in
+                    // semantics but now reached only after clean eviction
+                    // failed to free enough: drop the largest project's
+                    // memtables wholesale. NOTE: this still discards DIRTY
+                    // overlays (committed fast-path UPDATE/DELETE writes not
+                    // yet materialized to cold). Preferring clean eviction
+                    // above shrinks how often that loss path fires; removing
+                    // it entirely is a separate change with its own
+                    // back-pressure semantics.
+                    if let Some(largest) = registry.largest_project() {
+                        registry.remove_project(&largest);
+                    }
+                    // Retry once.
+                    if !reserve_ok(registry.try_reserve_bytes(&sess.project, approx_bytes)) {
+                        return Err(basin_common::BasinError::internal(
+                            "HTAP memtable hard cap exceeded (SQLSTATE 53200)",
+                        ));
+                    }
                 }
             }
             for row_idx in 0..batch.num_rows() {
@@ -10230,9 +10444,27 @@ async fn htap_promote_to_registry(
                     }
                 };
 
+                // S4 commit 4b: capture this insert's MVCC seq for the
+                // post-commit clean ack. `MemTable::insert` does not return
+                // the claimed seq, so we fence it with `current_seq()` reads:
+                // the insert's seq lies in `(seq_before, seq_after]`, and when
+                // `seq_after == seq_before + 1` NO other write interleaved —
+                // the seq is exactly `seq_after`. If another write DID
+                // interleave we skip the ack for this key: acking at
+                // `seq_after` could cover a concurrent same-key fast-path
+                // write that is NOT in the file this COMMIT writes, marking a
+                // not-yet-cold value clean (the version-loss hazard
+                // `mark_flushed` exists to prevent). A skipped ack just
+                // leaves the row dirty — the hot-tier flush re-flushes it
+                // later (one redundant row write, never a lost one).
+                let seq_before = entry.memtable.current_seq();
                 entry
                     .memtable
-                    .insert(key, basin_hottier::MemRowValue::row(row_bytes, 0));
+                    .insert(key.clone(), basin_hottier::MemRowValue::row(row_bytes, 0));
+                let seq_after = entry.memtable.current_seq();
+                if seq_after == seq_before + 1 {
+                    table_acks.push((key, seq_after));
+                }
 
                 // S2: write-through to the PK row cache. Single-PK, RLS-disabled,
                 // PK-encodable rows only (see `pk_cache_single`). Capture the hot
@@ -10266,7 +10498,7 @@ async fn htap_promote_to_registry(
             }
         }
     }
-    Ok(())
+    Ok(clean_acks)
 }
 
 /// After a successful INSERT that overwrote a tombstoned PK, the registry still

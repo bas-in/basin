@@ -109,14 +109,20 @@ async fn rows_seen(sess: &basin_engine::ProjectSession, sql: &str) -> usize {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pk_cache_hit_returns_correct_row() {
     let (_sd, _wd, engine, shard, bg, wal) = build().await;
-    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+    let project = ProjectId::new();
+    let sess = engine.open_session(project).await.unwrap();
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT)")
         .await
         .unwrap();
     sess.execute("INSERT INTO t VALUES (1, 100), (2, 200)")
         .await
         .unwrap();
-    shard.flush_to_parquet().await.unwrap(); // rows now cold-only
+    shard.flush_to_parquet().await.unwrap();
+    // S4 retention keeps the just-inserted rows memory-resident (clean) even
+    // after the flush, which would serve the reads below before the PK row
+    // cache is ever consulted. Evict them so the rows are genuinely cold-only
+    // and this test exercises the cold→cache path it exists to pin.
+    let _ = engine.memtable_registry().evict_clean(&project, u64::MAX);
 
     // First read: cache MISS → cold decode → populate.
     assert_eq!(int_at(&sess, "SELECT v FROM t WHERE id = 1").await, Some(100));
@@ -310,6 +316,9 @@ async fn pk_cache_ddl_invalidates() {
         .unwrap();
     sess.execute("INSERT INTO t VALUES (1, 10)").await.unwrap();
     shard.flush_to_parquet().await.unwrap();
+    // S4 retention: evict the retained clean row so the warm read below goes
+    // cold and populates the cache (see pk_cache_hit_returns_correct_row).
+    let _ = engine.memtable_registry().evict_clean(&project, u64::MAX);
 
     // Warm — the cache now holds id=1's cold row for THIS project.
     assert_eq!(int_at(&sess, "SELECT v FROM t WHERE id = 1").await, Some(10));

@@ -316,6 +316,10 @@ fn probe_memtable(
     //     production INSERT path which is counter-keyed).  Treat as a hit.
     //   * `None` — fall through to the snapshot path: a counter-keyed
     //     HTAP-cached row may match the predicate via `batch_matches_predicates`.
+    // Set when the canonical PK-Eq direct-get ran and MISSED (no entry / no
+    // version at the watermark). Lets the auto-commit fallback below skip the
+    // O(n) walk entirely when the O(1) counters prove nothing else can match.
+    let mut pk_eq_direct_get_missed = false;
     if predicates.len() == 1 && meta.pk_columns.len() == 1 {
         if let Predicate::Eq(col, val) = &predicates[0] {
             if col == &meta.pk_columns[0] {
@@ -369,6 +373,7 @@ fn probe_memtable(
                                 // half (or a post-pin write filtered above). A
                                 // counter-keyed Row (HTAP cache) may still match
                                 // — fall through to snapshot.
+                                pk_eq_direct_get_missed = true;
                             }
                         }
                     }
@@ -378,19 +383,46 @@ fn probe_memtable(
     }
 
     // ── Snapshot fallback ────────────────────────────────────────────────────
-    // The slow but always-correct path: clone the entire memtable BTreeMap
-    // under a read-lock, then filter via `batch_matches_predicates`.  Required
-    // for predicate shapes the direct-get can't handle (non-PK Eq, multi-
+    // The slow but always-correct path: clone the memtable entries under a
+    // read-lock, then filter via `batch_matches_predicates`.  Required for
+    // predicate shapes the direct-get can't handle (non-PK Eq, multi-
     // predicate, range), and as a safety net for counter-keyed HTAP-cached
     // INSERT rows.
-    // Pinned read: take the seq-carrying snapshot and skip any entry written
-    // after the watermark; auto-commit takes the plain snapshot. We normalise
-    // both into `(key, value)` pairs so the match arms below are shared.
-    // S4 MVCC chains: `snapshot_with_seq(Some(w))` yields, per key, the newest
-    // version at or before the watermark (overwritten keys resolve to their
-    // historical image instead of being skipped); `None` = auto-commit newest.
-    let snapshot: Vec<(basin_hottier::RowKey, basin_hottier::MemRowValue)> =
-        entry.memtable.snapshot_with_seq(hot_watermark);
+    //
+    // S4 age-based residency, auto-commit (`hot_watermark == None`):
+    //   * Skip the walk entirely when the direct-get above already answered
+    //     the sole-PK-Eq shape with a miss AND the O(1) counters prove no
+    //     counter-keyed Row and no Update override is resident — no other
+    //     entry kind can satisfy a PK equality (other keys' tombstones are
+    //     irrelevant to this PK, and clean Rows are excluded below anyway).
+    //   * Otherwise walk only the DIRTY entries (`dirty_snapshot`). CLEAN
+    //     entries are flushed-and-retained copies of cold rows; surfacing
+    //     them here was an UNDER-return hazard: a non-PK Eq that matched a
+    //     retained clean row returned ONLY the hot matches and skipped the
+    //     cold read, hiding every other cold row that matched.
+    //
+    // Pinned read (`Some(w)`): keep the full seq-carrying snapshot, clean
+    // entries INCLUDED — the pinned cold snapshot may predate the flush that
+    // made an entry clean, so the retained copy can be the only visible
+    // source of the version this transaction is entitled to. (`Some(w)`
+    // yields, per key, the newest version at or before the watermark.)
+    let snapshot: Vec<(basin_hottier::RowKey, basin_hottier::MemRowValue)> = match hot_watermark {
+        None => {
+            if pk_eq_direct_get_missed
+                && entry.memtable.counter_key_rows() == 0
+                && entry.memtable.update_count() == 0
+            {
+                return None;
+            }
+            entry
+                .memtable
+                .dirty_snapshot()
+                .into_iter()
+                .map(|(k, v, _seq)| (k, v))
+                .collect()
+        }
+        watermark @ Some(_) => entry.memtable.snapshot_with_seq(watermark),
+    };
     if snapshot.is_empty() {
         return None;
     }
@@ -1536,6 +1568,149 @@ pub(crate) async fn execute_simple_select_pinned(
         .await
 }
 
+/// S4 commit 5a — pre-flush PK residency probe.
+///
+/// Attempt to answer the canonical auto-commit point lookup from the hot-tier
+/// memtable BEFORE the shard tail flush / catalog load / cold read. Returns:
+///   * `Ok(Some(result))` — DEFINITIVE memtable answer (a live `Row`/`Update`
+///     for the queried PK, or a `Tombstone` ⇒ empty result). The caller
+///     returns it directly: NO flush, NO catalog load, NO file open.
+///   * `Ok(None)` — any shape gate missed or the memtable has no entry for
+///     the key: the caller proceeds down the existing path unchanged.
+///
+/// Shape gates (all derived from the gate-prefetched `meta`, which the
+/// executor's fast-path gate epoch-validated against the catalog):
+///   * RLS disabled (`!meta.rls_enabled`) — defence in depth; the executor
+///     gate already refuses RLS tables;
+///   * single-column PK; exactly one predicate, an `Eq` on that PK, whose
+///     literal encodes to a `RowKey`;
+///   * no aggregates / IN-list / IS NULL / ORDER BY (and hence no OFFSET) /
+///     computed projection / 3VL-false WHERE;
+///   * every projected column resolves in the CATALOG schema — this also
+///     rejects promoted `__promoted$…` shadow columns (absent from the
+///     catalog schema), which have their own guarded path.
+///
+/// Correctness: an auto-commit read is entitled to the NEWEST committed
+/// value. A memtable hit IS that value — a dirty `Update`/`Row` overrides
+/// cold by overlay semantics, and a CLEAN entry is byte-identical to its
+/// cold/tail image (S4 residency invariant) — so skipping the flush cannot
+/// serve a stale row. A `Tombstone` is the committed deletion of the row, so
+/// the empty result needs no cold consultation either.
+fn try_serve_point_pre_flush(
+    sess: &ProjectSession,
+    plan: &SimpleSelectPlan,
+    meta: &TableMetadata,
+) -> Result<Option<ExecResult>> {
+    if meta.rls_enabled || meta.pk_columns.len() != 1 {
+        return Ok(None);
+    }
+    if plan.always_empty
+        || plan.aggregates.is_some()
+        || plan.order_by.is_some()
+        || !plan.in_list_preds.is_empty()
+        || !plan.is_null_cols.is_empty()
+        || plan.predicates.len() != 1
+    {
+        return Ok(None);
+    }
+    let Predicate::Eq(col, val) = &plan.predicates[0] else {
+        return Ok(None);
+    };
+    if col != &meta.pk_columns[0] {
+        return Ok(None);
+    }
+    // Plain-column projection resolvable in the catalog schema only.
+    let proj_idxs: Option<Vec<usize>> = match &plan.projection {
+        None => None,
+        Some(items) => {
+            let mut idxs = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    ProjectionItem::Column(c) => match meta.schema.index_of(c) {
+                        Ok(i) => idxs.push(i),
+                        Err(_) => return Ok(None), // unknown / shadow column
+                    },
+                    ProjectionItem::Computed { .. } => return Ok(None),
+                }
+            }
+            Some(idxs)
+        }
+    };
+    let Ok(pk_idx) = meta.schema.index_of(col) else {
+        return Ok(None);
+    };
+    let pk_dt = meta.schema.field(pk_idx).data_type().clone();
+    let Some(pk_key) = crate::dml_mutate::pk_scalar_to_row_key(val, &pk_dt) else {
+        return Ok(None);
+    };
+    let registry = sess.engine.memtable_registry();
+    let Some(entry) = registry.get(&sess.project, &plan.table) else {
+        return Ok(None);
+    };
+    // Output schema shared by the hit and tombstone arms, projected from the
+    // catalog schema.
+    let projected_schema = |idxs: &Option<Vec<usize>>| -> Result<Arc<Schema>> {
+        Ok(match idxs {
+            None => meta.schema.clone(),
+            Some(ix) => Arc::new(
+                meta.schema
+                    .project(ix)
+                    .map_err(|e| BasinError::internal(format!("pre-flush project schema: {e}")))?,
+            ),
+        })
+    };
+    match entry.memtable.get(&pk_key) {
+        Some(basin_hottier::MemRowValue::Row { bytes, .. })
+        | Some(basin_hottier::MemRowValue::Update { bytes, .. }) => {
+            let Some(batch) = decode_ipc_batch(&bytes) else {
+                // Undecodable resident bytes — fall through, never error.
+                return Ok(None);
+            };
+            // Re-check the predicate against the decoded row (defence in
+            // depth; the key encodes the PK value, so a mismatch means an
+            // encoding edge — fall through to the authoritative path).
+            if !batch_matches_predicates(&batch, &plan.predicates) {
+                return Ok(None);
+            }
+            // Project BY NAME against the decoded row's own schema (the IPC
+            // image carries the write-time column order; name-based selection
+            // is robust even if it ever diverged from catalog order).
+            let (schema, batches): (Arc<Schema>, Vec<RecordBatch>) = match &plan.projection {
+                None => (batch.schema(), vec![batch]),
+                Some(items) => {
+                    let mut idxs = Vec::with_capacity(items.len());
+                    for item in items {
+                        let ProjectionItem::Column(c) = item else {
+                            return Ok(None); // unreachable per the gate above
+                        };
+                        match batch.schema().index_of(c) {
+                            Ok(i) => idxs.push(i),
+                            Err(_) => return Ok(None), // column absent in image
+                        }
+                    }
+                    let projected = batch.project(&idxs).map_err(|e| {
+                        BasinError::internal(format!("pre-flush memtable project: {e}"))
+                    })?;
+                    (projected.schema(), vec![projected])
+                }
+            };
+            let trimmed = match plan.limit {
+                Some(limit) => apply_limit(batches, limit),
+                None => batches,
+            };
+            Ok(Some(ExecResult::Rows {
+                schema,
+                batches: trimmed,
+            }))
+        }
+        Some(basin_hottier::MemRowValue::Tombstone) => Ok(Some(ExecResult::Rows {
+            schema: projected_schema(&proj_idxs)?,
+            batches: vec![],
+        })),
+        None => Ok(None),
+    }
+}
+
 async fn execute_simple_select_inner(
     sess: &ProjectSession,
     plan: SimpleSelectPlan,
@@ -1622,6 +1797,31 @@ async fn execute_simple_select_inner(
         let snapshot = crate::session::tx_read_snapshot_for(&sess.state, table, head)
             .expect("FirstTouch implies an active transaction");
         PinnedReadView { snapshot, hot_watermark }
+    }
+
+    // ── S4 pre-flush PK residency probe (read-own-insert, zero file opens) ───
+    //
+    // For the canonical auto-commit point lookup, a memtable PK direct-get can
+    // answer DEFINITIVELY before we pay the `shard.flush_to_parquet()` below
+    // (which LISTs/scans partitions even when the tail is empty), the catalog
+    // `load_table`, and the cold file open/decode:
+    //   * `Row` / `Update` hit — the newest committed value for that PK
+    //     (write-through residency, retained clean rows, or a live overlay
+    //     override): decode, re-check the predicate, project, return.
+    //   * `Tombstone` — the row is definitively deleted: empty result.
+    //   * miss — fall through to the existing path UNCHANGED (flush first).
+    //
+    // Auto-commit only (`request == None`): a pinned request must keep
+    // today's order — `FirstTouch` captures its watermark/snapshot at the
+    // POST-flush moment, so probing pre-flush would change what gets pinned.
+    // The shape gates live in `try_serve_point_pre_flush`; any gate miss
+    // falls through with zero behavior change.
+    if request.is_none() {
+        if let Some(meta) = prefetched_meta.as_ref() {
+            if let Some(res) = try_serve_point_pre_flush(sess, &plan, meta)? {
+                return Ok(res);
+            }
+        }
     }
 
     // Resolve the gate's read-view REQUEST into a concrete `Option<PinnedReadView>`,
@@ -1821,18 +2021,33 @@ async fn execute_simple_select_inner(
         // engages.
         // NOTE: this `fast_select` shadow path reads the shadow column
         // PHYSICALLY from cold files only — it does NOT apply hot-tier
-        // UPDATE/DELETE overlays or include hot INSERTs (unlike the DataFusion
-        // `HtapUnionTable` path). So ANY live memtable entry must force a
-        // fallback here, even one that carries the shadow column: an updated PK
-        // would otherwise read its STALE cold shadow value. (The DataFusion
-        // rewrite in `rewrite_promoted_cols_for_query` CAN safely engage on a
-        // shadow-clean memtable because it merges hot+cold; this stricter path
-        // cannot.) Keep the blanket "any live entry" reject.
+        // UPDATE/DELETE overlays or include un-flushed hot INSERTs (unlike
+        // the DataFusion `HtapUnionTable` path). So any DIRTY memtable entry
+        // must force a fallback here, even one that carries the shadow
+        // column: an updated PK would otherwise read its STALE cold shadow
+        // value, and a not-yet-cold INSERT would be missed entirely.
+        //
+        // S4 age-based residency: retained CLEAN entries no longer block the
+        // fast shadow read. A clean entry is byte-identical to its cold image
+        // — INCLUDING the physically materialised shadow column the cold file
+        // carries — so the cold shadow value is exactly the hot value. The
+        // pre-S4 blanket "any live entry" reject would have permanently
+        // disabled this path on any table with retained residency. Four O(1)
+        // signals replace the O(n) snapshot walk: dirty bytes, the
+        // update/tombstone newest-version counters (a dirty Tombstone holds
+        // ZERO bytes, so `bytes_dirty` alone cannot see it), and the
+        // shadow-dirty flag (a pre-promotion row may lack the column even
+        // when clean).
         let memtable_has_entries = sess
             .engine
             .memtable_registry()
             .get(&sess.project, &plan.table)
-            .map(|e| !e.memtable.snapshot().is_empty())
+            .map(|e| {
+                e.memtable.bytes_dirty() > 0
+                    || e.memtable.update_count() > 0
+                    || e.memtable.tombstone_count() > 0
+                    || e.shadow_dirty.load(std::sync::atomic::Ordering::Acquire)
+            })
             .unwrap_or(false);
         // Defense-in-depth: also reject when the shard holds un-flushed tail
         // rows (a row written before promotion, not yet a cold file, carries no
