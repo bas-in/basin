@@ -1711,6 +1711,49 @@ fn try_serve_point_pre_flush(
     }
 }
 
+/// Render a DataFusion-plannable statement text for the `exec_select`
+/// fallbacks inside the fast path.
+///
+/// The executor gate hands this module `raw_sql` — the user's ORIGINAL text,
+/// captured BEFORE the string-rewrite pipeline ran. For the common fast-path
+/// shapes (`SELECT … WHERE id = 5`) no pipeline pass fires, the two texts are
+/// identical, and this helper is a zero-allocation passthrough.
+///
+/// But a [`SimpleSelectPlan`] that references promoted `__promoted$col$key`
+/// shadow columns can only exist because the pipeline lowered
+/// `payload->>'k'` to `json_get_text(payload, 'k')` and then swapped in the
+/// shadow column (`executor::rewrite_promoted_cols_for_query`). In that case
+/// `raw_sql` STILL CONTAINS the raw `->>` / `->` / `#>` / `#>>` operator
+/// forms — which DataFusion cannot plan (no `ExprPlanner` is registered for
+/// the PG JSON operators; the physical planner rejects `Operator::LongArrow`
+/// & friends). Handing `raw_sql` straight to `exec_select` therefore turned
+/// the conservative "fall back to the always-correct DataFusion path" branch
+/// into a hard plan error precisely when the fallback matters: a dirty
+/// hot-tier overlay row (a single fast-path UPDATE), a tombstone, a pending
+/// shard tail, or a file missing the shadow column.
+///
+/// Fix: re-apply the SAME two pipeline passes the executor ran (operator
+/// spacing, then JSON-operator lowering) so the fallback text carries the
+/// `json_get_text(...)` UDF form. We deliberately do NOT re-apply the
+/// promoted-column swap: the fallback fires exactly when the promoted fast
+/// read is not safe, and the UDF form computes the value from the source
+/// JSONB on the DataFusion path (`HtapUnionTable` merges hot + cold), which
+/// is correct in every one of those states — including identical
+/// NULL/absent-key semantics (`json_get_text` and the shadow column both
+/// yield SQL NULL for a missing key, a JSON `null`, or a NULL source row).
+fn fallback_sql(raw_sql: &str) -> std::borrow::Cow<'_, str> {
+    // Marker probe mirrors `executor::needs_rewrite_pipeline`'s spirit:
+    // `->` catches `->`/`->>`; `#>` catches `#>`/`#>>`. False positives
+    // (e.g. `->` inside a string literal) only cost re-running the same
+    // idempotent passes the pipeline already ran on this text.
+    if raw_sql.contains("->") || raw_sql.contains("#>") {
+        let spaced = crate::pg_operators::rewrite_jsonb_arrow_op_spacing(raw_sql);
+        std::borrow::Cow::Owned(crate::udf::rewrite_json_operators(&spaced))
+    } else {
+        std::borrow::Cow::Borrowed(raw_sql)
+    }
+}
+
 async fn execute_simple_select_inner(
     sess: &ProjectSession,
     plan: SimpleSelectPlan,
@@ -1858,10 +1901,13 @@ async fn execute_simple_select_inner(
                         Ok(m) => m,
                         // Pinned snapshot no longer retained → degrade to the
                         // DataFusion path, which rewinds via `load_table_for_read`.
+                        // `fallback_sql` restores the plannable UDF form when the
+                        // original text carries raw JSON operators (see its doc).
                         Err(BasinError::FeatureNotSupported(_)) if pin.is_some() => {
+                            let fb = fallback_sql(raw_sql);
                             return crate::executor::exec_select(
                                 sess,
-                                raw_sql,
+                                &fb,
                                 include_deleted,
                                 Some(raw_sql),
                             )
@@ -1892,9 +1938,10 @@ async fn execute_simple_select_inner(
                     let m = match load_at_view(sess, &plan.table, Some(v)).await {
                         Ok(m) => m,
                         Err(BasinError::FeatureNotSupported(_)) => {
+                            let fb = fallback_sql(raw_sql);
                             return crate::executor::exec_select(
                                 sess,
-                                raw_sql,
+                                &fb,
                                 include_deleted,
                                 Some(raw_sql),
                             )
@@ -2068,8 +2115,14 @@ async fn execute_simple_select_inner(
             });
         if !all_present {
             // At least one file predates promotion (or backfill has not yet
-            // covered it).  Fall back to the correct DataFusion path.
-            return crate::executor::exec_select(sess, raw_sql, include_deleted, Some(raw_sql))
+            // covered it), or a dirty hot-tier entry / pending tail makes the
+            // cold-only shadow read unsafe.  Fall back to the correct
+            // DataFusion path.  The plan references `__promoted$…` columns, so
+            // `raw_sql` necessarily carries raw `->>` operator forms DataFusion
+            // cannot plan — `fallback_sql` lowers them back to the
+            // always-correct `json_get_text(...)` UDF form (see its doc).
+            let fb = fallback_sql(raw_sql);
+            return crate::executor::exec_select(sess, &fb, include_deleted, Some(raw_sql))
                 .await;
         }
         // Every file carries the shadow column(s).  Extend the working schema

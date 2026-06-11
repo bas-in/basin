@@ -469,13 +469,37 @@ fn skip_array(b: &[u8], p: &mut usize) -> std::result::Result<(), ()> {
 /// Called **after** `rewrite_json_operators` has lowered `payload->>'key'`
 /// to `json_get_text(payload, 'key')`, so the pattern is well-defined.
 ///
+/// ## Position-independence
+///
+/// The substitution is a whole-statement text replacement, so it is NOT
+/// projection-only: the same `payload->>'k'` occurrence is swapped wherever
+/// it appears — SELECT list, WHERE predicates (`payload->>'k' = 'literal'`
+/// becomes `__promoted$payload$k = 'literal'`, which then gets file-level
+/// zone-map/bloom pruning on the fast path), GROUP BY expressions
+/// (`GROUP BY payload->>'k'` groups DataFusion on a plain Utf8 column),
+/// HAVING, and ORDER BY. Equality semantics are preserved because the shadow
+/// column is materialised from the exact `json_get_text` expression
+/// ([`materialize_promoted_columns`]): a missing key, a JSON `null`, and a
+/// NULL source row all store SQL NULL, so `= 'literal'` excludes those rows
+/// on both forms and `IS NULL` / GROUP-BY-NULL group identically.
+///
+/// The caller (`executor::rewrite_promoted_cols_for_query`) gates each path
+/// on physical completeness — every live file must carry the shadow column
+/// in its `column_stats`, with no un-flushed tail rows and no shadow-dirty
+/// memtable — so this rewrite never targets a column a file would null-fill.
+///
 /// This is a best-effort textual rewrite — it handles the common forms
 /// emitted by `rewrite_json_operators`:
 ///   - `json_get_text(payload, 'key')` — direct column.
 ///   - `json_get_text(payload, 'key')` inside a larger expression.
 ///
-/// Chained paths (`json_get_text(json_get(p,'a'),'b')`) and qualified
-/// column references (`t.payload`) are left to the UDF fallback.
+/// Out of scope (left to the UDF fallback, deliberately):
+///   - the `->` (jsonb-returning) form — `json_get(payload, 'key')` returns
+///     the JSONB value, not the shadow column's text form;
+///   - chained / deep paths (`json_get_text(json_get(p,'a'),'b')`) — the
+///     promotion stores top-level keys only;
+///   - qualified column references (`t.payload`);
+///   - non-literal keys.
 ///
 /// `paths` is the slice from `TableMetadata::promoted_jsonb_paths` — may be
 /// empty (no-op fast path).
@@ -550,6 +574,74 @@ mod tests {
         assert!(
             !got.contains("json_get_text"),
             "UDF call should be gone, got: {got}"
+        );
+    }
+
+    /// The rewrite is position-independent: a WHERE equality predicate
+    /// (`json_get_text(col,'k') = 'literal'`) is swapped exactly like a
+    /// SELECT-list occurrence, leaving the comparison literal untouched.
+    /// This is the JSON pseudo-secondary lookup shape
+    /// (`WHERE payload->>'category' = '…'`).
+    #[test]
+    fn rewrite_fires_in_where_equality() {
+        let paths = vec![PromotedJsonbPath {
+            source_col: "payload".into(),
+            json_key: "category".into(),
+        }];
+        let sql =
+            "SELECT COUNT(*) FROM events WHERE json_get_text(payload, 'category') = 'purchase'";
+        let got = rewrite_promoted_columns(sql, &paths);
+        assert_eq!(
+            got,
+            "SELECT COUNT(*) FROM events WHERE __promoted$payload$category = 'purchase'",
+            "WHERE-position equality must rewrite to the shadow column"
+        );
+    }
+
+    /// GROUP BY + aggregate-arg positions are rewritten too: grouping lands on
+    /// a plain Utf8 column. A deep path inside the aggregate
+    /// (`json_get_text(json_get(payload,'metadata'),'score')`) must stay
+    /// unrewritten — promotion stores top-level keys only.
+    #[test]
+    fn rewrite_fires_in_group_by_but_not_deep_paths() {
+        let paths = vec![PromotedJsonbPath {
+            source_col: "payload".into(),
+            json_key: "category".into(),
+        }];
+        let sql = "SELECT json_get_text(payload, 'category'), \
+                   SUM((json_get_text(json_get(payload, 'metadata'), 'score'))::float) \
+                   FROM events GROUP BY json_get_text(payload, 'category')";
+        let got = rewrite_promoted_columns(sql, &paths);
+        assert!(
+            got.contains("GROUP BY __promoted$payload$category"),
+            "GROUP BY position must rewrite to the shadow column, got: {got}"
+        );
+        assert!(
+            got.starts_with("SELECT __promoted$payload$category,"),
+            "SELECT-list position must rewrite too, got: {got}"
+        );
+        assert!(
+            got.contains("json_get_text(json_get(payload, 'metadata'), 'score')"),
+            "deep path inside the aggregate must stay on the UDF form, got: {got}"
+        );
+    }
+
+    /// Non-literal RHS comparisons still rewrite the LHS occurrence only when
+    /// it matches the promoted needle; an unpromoted key on the RHS stays as a
+    /// UDF call (row-wise equivalent — the shadow column stores the identical
+    /// per-row value).
+    #[test]
+    fn rewrite_where_non_literal_rhs_keeps_unpromoted_side() {
+        let paths = vec![PromotedJsonbPath {
+            source_col: "payload".into(),
+            json_key: "category".into(),
+        }];
+        let sql = "SELECT id FROM events WHERE \
+                   json_get_text(payload, 'category') = json_get_text(payload, 'other')";
+        let got = rewrite_promoted_columns(sql, &paths);
+        assert!(
+            got.contains("__promoted$payload$category = json_get_text(payload, 'other')"),
+            "promoted LHS swapped, unpromoted RHS untouched, got: {got}"
         );
     }
 

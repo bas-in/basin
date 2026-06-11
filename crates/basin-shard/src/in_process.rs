@@ -1014,6 +1014,29 @@ impl InProcessShard {
             .map(|p| p.shadow_col_name())
             .collect();
 
+        // Bloom the PK / declared sort columns exactly like `compact_one`
+        // (#212), PLUS every promoted shadow column. The pre-fix sweep wrote
+        // rewritten files with NO `bloom_columns` and committed an EMPTY
+        // `bloom_filters` map, which silently DROPPED the per-file blooms
+        // point reads prune with on every file it touched — and the new
+        // shadow column never got a bloom at all, so the promoted JSONB
+        // pseudo-secondary lookup (`WHERE __promoted$col$key = 'literal'`,
+        // i.e. the rewritten `payload->>'k' = '…'`) had to open every file
+        // whose min/max range admitted the literal. With the shadow column
+        // bloomed, a selective literal rules files out without opening them
+        // (`files_opened` drops to the files that genuinely contain it).
+        let mut bloom_cols = meta.global_sort_order.clone().unwrap_or_default();
+        if let [pk] = meta.pk_columns.as_slice() {
+            if !bloom_cols.contains(pk) {
+                bloom_cols.push(pk.clone());
+            }
+        }
+        for shadow in &expected_shadows {
+            if !bloom_cols.contains(shadow) {
+                bloom_cols.push(shadow.clone());
+            }
+        }
+
         // Iterate the live data-file list.  We do NOT use list_data_files_with_stats
         // to avoid pulling Parquet footers for every file — we only need the paths.
         // We will read the full batch below for any file that needs backfilling.
@@ -1034,6 +1057,7 @@ impl InProcessShard {
         let write_opts = basin_storage::WriteOptions {
             file_format,
             cluster_columns,
+            bloom_columns: bloom_cols,
             ..Default::default()
         };
 
@@ -1142,7 +1166,10 @@ impl InProcessShard {
                 size_bytes: new_file.size_bytes,
                 row_count: new_file.row_count,
                 column_stats: new_file.column_stats.clone(),
-                bloom_filters: ::std::collections::BTreeMap::new(),
+                // Carry the writer-computed blooms (PK / sort cols / promoted
+                // shadow cols) into the catalog — `compact_one` parity. An
+                // empty map here would erase pruning on every swept file.
+                bloom_filters: new_file.bloom_filters.clone(),
                 hll_sketches: ::std::collections::BTreeMap::new(),
                 tdigest_sketches: ::std::collections::BTreeMap::new(),
             };
@@ -1407,6 +1434,18 @@ impl InProcessShard {
                         if let [pk] = m.pk_columns.as_slice() {
                             if !bloom.contains(pk) {
                                 bloom.push(pk.clone());
+                            }
+                        }
+                        // ADR 0027 Phase 4: bloom every promoted shadow column
+                        // too (the compactor backfills them into the merged
+                        // batch below), so equality on `__promoted$col$key` —
+                        // the rewritten `payload->>'k' = 'literal'` lookup —
+                        // can rule freshly-compacted files in or out without
+                        // opening them.
+                        for p in &m.promoted_jsonb_paths {
+                            let s = p.shadow_col_name();
+                            if !bloom.contains(&s) {
+                                bloom.push(s);
                             }
                         }
                         (
