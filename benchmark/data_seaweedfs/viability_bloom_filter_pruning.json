@@ -30,13 +30,13 @@
       "pruned_by_stats": 1
     },
     "out_of_range_absent_phase": {
-      "groups_considered": 10,
+      "groups_considered": 0,
       "groups_scanned": 0,
       "pruned_by_bloom": 0,
-      "pruned_by_stats": 10
+      "pruned_by_stats": 0
     },
     "row_group_size": 100,
     "rows": 1000
   },
-  "generated_at": "@1780680790"
+  "generated_at": "@1781202292"
 }

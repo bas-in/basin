@@ -7,11 +7,11 @@
   "metrics": [
     {
       "label": "Backup wall time",
-      "basin": 0.000115334,
-      "postgres": 0.418568708,
+      "basin": 0.000104917,
+      "postgres": 0.407399458,
       "unit": "s",
       "better": "basin",
-      "ratio_text": "pg / basin = 3629x"
+      "ratio_text": "pg / basin = 3883x"
     },
     {
       "label": "Backup byte size",
@@ -22,5 +22,5 @@
       "ratio_text": "pg / basin = 7216x"
     }
   ],
-  "generated_at": "@1780680789"
+  "generated_at": "@1781202381"
 }

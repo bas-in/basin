@@ -17,8 +17,8 @@
     "bucket": "basin-test",
     "cross_project_leak": 0,
     "endpoint": "http://127.0.0.1:8333",
-    "project_a": "01KTCDJ3YG03MYGY3R0VBRVJQT",
-    "project_b": "01KTCDJ3YGE4ST30N4V5GNRMZ1"
+    "project_a": "01KTVYWXB04WMKMK982PCXDYP7",
+    "project_b": "01KTVYWXB0FJKQJEEGNS9HVW58"
   },
-  "generated_at": "@1780680822"
+  "generated_at": "@1781202318"
 }

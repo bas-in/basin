@@ -18,7 +18,7 @@
     "endpoint": "http://127.0.0.1:8333",
     "rows_after_restart": 3,
     "rows_inserted": 3,
-    "schema": "basin_s3_durable_catalog_01ktcdhka0n9g09fta96jc5gsn"
+    "schema": "basin_s3_durable_catalog_01ktvywb29j56ywy340a46xws2"
   },
-  "generated_at": "@1780680806"
+  "generated_at": "@1781202300"
 }

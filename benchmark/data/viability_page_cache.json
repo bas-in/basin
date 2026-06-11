@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "cold p99 ms",
-    "value": 3.772292,
+    "value": 0.886584,
     "unit": "ms",
     "bar": {
       "op": "less_than",
@@ -17,34 +17,34 @@
     "bar_cold_p99_ms": 75.0,
     "batches": 10,
     "cache_budget_bytes": 268435456,
-    "cold_hits": 3810,
-    "cold_misses": 6190,
+    "cold_hits": 381,
+    "cold_misses": 1238,
     "n_iterations": 1000,
     "rows": [
       {
-        "max_ms": 6.400542000000001,
-        "mean_ms": 1.985570067,
-        "min_ms": 0.173292,
-        "p50_ms": 2.9072080000000002,
-        "p999_ms": 5.556333,
-        "p99_ms": 3.772292,
+        "max_ms": 2.9375,
+        "mean_ms": 0.48046796999999997,
+        "min_ms": 0.18545899999999998,
+        "p50_ms": 0.539917,
+        "p999_ms": 1.171833,
+        "p99_ms": 0.886584,
         "phase": "cold"
       },
       {
-        "max_ms": 0.3735,
-        "mean_ms": 0.18309426100000017,
-        "min_ms": 0.1685,
-        "p50_ms": 0.179,
-        "p999_ms": 0.255458,
-        "p99_ms": 0.23149999999999998,
+        "max_ms": 0.622166,
+        "mean_ms": 0.23002389499999992,
+        "min_ms": 0.184,
+        "p50_ms": 0.223834,
+        "p999_ms": 0.476959,
+        "p99_ms": 0.344083,
         "phase": "warm"
       }
     ],
     "seed": 13425777967503634925,
     "total_rows": 100000,
-    "warm_hits_total": 13810,
-    "warm_misses_total": 6190,
+    "warm_hits_total": 1381,
+    "warm_misses_total": 1238,
     "working_set_size": 1000
   },
-  "generated_at": "@1780680561"
+  "generated_at": "@1781202349"
 }

@@ -32,24 +32,24 @@
       "shard": 1
     },
     {
-      "load_pct": 40.0,
-      "projects": 10,
+      "load_pct": 32.0,
+      "projects": 8,
       "shard": 2
     },
     {
-      "load_pct": 20.0,
-      "projects": 5,
+      "load_pct": 28.0,
+      "projects": 7,
       "shard": 3
     }
   ],
   "primary": {
     "label": "max shard load",
-    "value": 40.0,
+    "value": 32.0,
     "unit": "%",
     "bar": {
       "op": "less_than",
       "value": 50.0
     }
   },
-  "generated_at": "@1780680784"
+  "generated_at": "@1781202375"
 }

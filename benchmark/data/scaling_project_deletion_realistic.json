@@ -22,32 +22,32 @@
   ],
   "rows": [
     {
-      "basin_ms": 4.3937919999999995,
+      "basin_ms": 4.045958,
       "file_count": 100,
       "pg_skipped": false,
-      "postgres_ms": 6.263625
+      "postgres_ms": 12.688666
     },
     {
-      "basin_ms": 35.427417000000005,
+      "basin_ms": 42.64675,
       "file_count": 1000,
       "pg_skipped": false,
-      "postgres_ms": 16.435959
+      "postgres_ms": 95.298334
     },
     {
-      "basin_ms": 189.44225,
+      "basin_ms": 215.344625,
       "file_count": 5000,
       "pg_skipped": false,
-      "postgres_ms": 5.4891250000000005
+      "postgres_ms": 9.603708000000001
     }
   ],
   "primary": {
     "label": "Basin/Postgres ratio at 5000 files (realistic schema)",
-    "value": 34.51228565572837,
+    "value": 22.423070859713768,
     "unit": "ratio",
     "bar": {
       "op": "less_than",
       "value": 1.0000000000000002
     }
   },
-  "generated_at": "@1780680597"
+  "generated_at": "@1781202396"
 }

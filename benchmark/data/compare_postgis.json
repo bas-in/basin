@@ -2,42 +2,42 @@
   "kind": "compare",
   "id": "postgis",
   "name": "Basin R-tree vs PostgreSQL + PostGIS GIST (spatial)",
-  "claim": "Identical 32×32-tile point set on both engines. PG uses geometry(Point,4326) + GIST; Basin uses POINT (FSB-21) + USING gist R-tree row-group prune. ST_DWithin radius queries cast PG operands to ::geography so BOTH engines measure metres with the same radius (fairness invariant). S1 result counts are hard-asserted equal (correctness guard). S2 bbox uses PG's && envelope operator vs a Basin X/Y-BETWEEN approximation (BOX2D deferred). S3 KNN is PG-only — Basin ships no <-> operator yet.",
+  "claim": "Identical 32×32-tile point set on both engines. PG uses geometry(Point,4326) + GIST; Basin uses POINT (FSB-21) + USING gist R-tree row-group prune. ST_DWithin radius queries cast PG operands to ::geography so BOTH engines measure metres with the same radius (fairness invariant). S1 result counts are hard-asserted equal (correctness guard). S2 bbox uses the IDENTICAL native PostGIS idiom on both sides (geom && ST_MakeEnvelope(...)); Basin routes it through the GIST R-tree row-group pushdown (prune probe via the ST_Contains(envelope, geom) normalization) and evaluates the residual with a single-decode UDF __basin_bbox_contains_point(geom,minx,miny,maxx,maxy) that decodes each surviving WKB POINT once (vs the old ST_X/ST_Y BETWEEN form's two decodes per row), with the bbox count hard-asserted equal to PG. S3 KNN (ORDER BY geom <-> ST_MakePoint(...) LIMIT 10) now routes through Basin's R-tree nearest-neighbour path (over-fetch + exact Haversine re-rank); the set of 10 nearest ids is hard-asserted equal to PG's GIST <-> result.",
   "available": true,
   "metrics": [
     {
       "label": "S1 radius count (ST_DWithin)",
-      "basin": 1.235167,
-      "postgres": 10.482,
+      "basin": 5.324959,
+      "postgres": 8.966,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "basin 8.49× faster"
+      "ratio_text": "basin 1.68× faster"
     },
     {
       "label": "S4 radius id-list (ST_DWithin)",
-      "basin": 1.7164579999999998,
-      "postgres": 10.425,
+      "basin": 4.572334,
+      "postgres": 8.083,
       "unit": "ms",
       "better": "basin",
-      "ratio_text": "basin 6.07× faster"
+      "ratio_text": "basin 1.77× faster"
     },
     {
-      "label": "S2 bbox count (&& / X-Y BETWEEN)",
-      "basin": 3.77175,
-      "postgres": 0.034,
+      "label": "S2 bbox count (&& → R-tree prune + single-decode residual)",
+      "basin": 4.238625,
+      "postgres": 0.027,
       "unit": "ms",
       "better": "postgres",
-      "ratio_text": "pg 110.93× faster"
+      "ratio_text": "pg 156.99× faster"
     },
     {
-      "label": "S3 KNN <-> LIMIT 10 (PG-only)",
-      "basin": -1.0,
-      "postgres": 0.064,
+      "label": "S3 KNN <-> LIMIT 10 (R-tree NN)",
+      "basin": 6.792584,
+      "postgres": 0.047,
       "unit": "ms",
       "better": "postgres",
-      "ratio_text": "basin KNN not shipped"
+      "ratio_text": "pg 144.52× faster"
     }
   ],
-  "generated_at": "@1780950830",
-  "note": "S1 count-match guard: PASS"
+  "generated_at": "@1781118386",
+  "note": "S1 + S2 count-match + S3 KNN set-match guards: PASS"
 }

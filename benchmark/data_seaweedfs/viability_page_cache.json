@@ -6,7 +6,7 @@
   "passed": true,
   "primary": {
     "label": "cold p99 ms",
-    "value": 4.298833999999999,
+    "value": 2.1875,
     "unit": "ms",
     "bar": {
       "op": "less_than",
@@ -18,36 +18,36 @@
     "batches": 10,
     "bucket": "basin-test",
     "cache_budget_bytes": 268435456,
-    "cold_hits": 190,
-    "cold_misses": 1810,
-    "cold_to_warm_p50_ratio": 5.357321642502628,
+    "cold_hits": 19,
+    "cold_misses": 362,
+    "cold_to_warm_p50_ratio": 1.5296144060347272,
     "endpoint": "http://127.0.0.1:8333",
     "n_iterations": 200,
     "rows": [
       {
-        "max_ms": 5.218,
-        "mean_ms": 3.3005712850000015,
-        "min_ms": 0.6487080000000001,
-        "p50_ms": 3.5059169999999997,
-        "p999_ms": 5.218,
-        "p99_ms": 4.298833999999999,
+        "max_ms": 6.494416999999999,
+        "mean_ms": 1.4526241699999989,
+        "min_ms": 0.811333,
+        "p50_ms": 1.418208,
+        "p999_ms": 6.494416999999999,
+        "p99_ms": 2.1875,
         "phase": "cold"
       },
       {
-        "max_ms": 0.8475419999999999,
-        "mean_ms": 0.65757524,
-        "min_ms": 0.58975,
-        "p50_ms": 0.654416,
-        "p999_ms": 0.8475419999999999,
-        "p99_ms": 0.743375,
+        "max_ms": 3.704708,
+        "mean_ms": 1.0335989349999997,
+        "min_ms": 0.748209,
+        "p50_ms": 0.927167,
+        "p999_ms": 3.704708,
+        "p99_ms": 2.753333,
         "phase": "warm"
       }
     ],
     "seed": 13425777967503634925,
     "total_rows": 100000,
-    "warm_hits_total": 2190,
-    "warm_misses_total": 1810,
+    "warm_hits_total": 219,
+    "warm_misses_total": 362,
     "working_set_size": 1000
   },
-  "generated_at": "@1780680815"
+  "generated_at": "@1781202309"
 }

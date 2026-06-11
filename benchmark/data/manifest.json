@@ -41,7 +41,6 @@
   "compare": [
     "backup_cost",
     "lifecycle_ops",
-    "postgres",
     "server_lifecycle"
   ]
 }

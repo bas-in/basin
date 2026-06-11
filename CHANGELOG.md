@@ -8,6 +8,51 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-11 — integrity benchmark run (provenance: single idle-box session, 1M solo)
+
+All Postgres-compare cards (10k / 100k / 1M), the ORM corpus card, and the
+real-S3 (SeaweedFS) cards were regenerated in one evening session on an
+otherwise-idle box, with the timing-fragile 1M card run solo. README and
+CAPABILITIES numbers are rewritten verbatim from these JSONs.
+
+- **The honest tally: across the ~100 ms-shapes on this card Basin is
+  faster on 51, Postgres on 54** (the three unsupported/failed shapes —
+  MERGE, INSERT…SELECT, PG's hour-bucket failure — excluded from the count).
+- **Headline wins**: bulk INSERT now beats Postgres at every scale —
+  33.6 ms vs 117 ms at 10k (3.5×), 216 ms vs 839 ms at 100k (3.9×),
+  **2.08 s vs 8.10 s at 1M (3.9×)**. LATERAL JOIN 6.7 ms vs 3,080 ms
+  (462×), star join 11.6 ms vs 3,040 ms (261×), correlated subquery 49 ms
+  vs 5,510 ms (113×), range scan 0.40 ms vs 32 ms (81×), large result
+  stream (100k-row drain) 0.44 ms vs 11.0 ms (25×). Point query p50
+  0.06 ms at 10k / 0.50 ms at 1M; single-row UPDATE 0.33 ms at 10k /
+  1.24 ms at 1M.
+- **Honest flags**: the new mixed read-write concurrency shape (8R+4W,
+  600 ops) measures **202 ms vs PG 12 ms** at 1M — the largest open
+  concurrency gap; 16-session concurrent SELECT remains a loss (19 ms vs
+  2.3 ms). Several OLTP fast paths measure at full speed on the 10k card
+  (keyset 0.07 ms, LIMIT-no-ORDER 0.06 ms, ARRAY_AGG / DISTINCT ON
+  at-or-better than PG, GIN `@>` effectiveness 4.3×) but decline on the
+  1M card while hot-tier overlays from earlier card shapes are live
+  (keyset 23.5 ms, LIMIT 52 ms, ARRAY_AGG 516 vs 90 ms, GIN effectiveness
+  1.12×) — under investigation as a card-order interaction;
+  correctness-first by design. Also flipped to losses on this 1M card:
+  on-disk bytes (321 MB vs PG 306 MB, ~5% larger; Basin still 1.9×
+  smaller at 100k and 102× smaller on real S3), COUNT(*) full table
+  (95 ms vs 29 ms), and DELETE WHERE id IN (1.16 ms vs 0.41 ms; still a
+  win at 10k/100k).
+- **Durability delta measured**: `SET basin.synchronous_commit = on` adds
+  **~2%** to the 10k bulk INSERT in the probe harness — group commit
+  amortizes one fsync per statement group. The default remains async ack
+  with the documented ≤200 ms loss window, disclosed wherever a write win
+  is published.
+- **ORM corpus card regenerated**: 94/99 shapes ok (Drizzle 24/24, sqlx
+  18/19, Diesel 18/19, TypeORM 15/16, Prisma 19/21) — all 5 failures are
+  typed errors, 0 regressions.
+- **Real-S3 card (SeaweedFS, 100k)**: 102× smaller on disk (99 KB vs
+  10.1 MB), point query 4.6 ms vs 18.5 ms (4.1×), 100k-row INSERT 96 ms
+  vs 1.9 s (20×); on the scale-up card point-query p50 stays bounded as
+  data grows (0.89 ms at 10k → 1.8 ms at 1M, 2.0× growth over 100× data).
+
 ## 2026-06-11 — S4 age-based residency: read-own-insert with zero file opens
 
 - **Fixed: warm point reads collapsed ~30× by the unfiltered-decode cache**
