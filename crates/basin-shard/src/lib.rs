@@ -38,6 +38,10 @@ use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use basin_common::{PartitionKey, ProjectId, Result, TableName};
 
+/// Default cadence of the hot-tier clean-retention sweep, seconds
+/// (`BASIN_HOTTIER_SWEEP_SECS`).
+const DEFAULT_CLEAN_SWEEP_SECS: u64 = 30;
+
 /// Knobs for [`Shard::new`].
 #[derive(Clone)]
 pub struct ShardConfig {
@@ -51,12 +55,14 @@ pub struct ShardConfig {
     pub compaction_interval: Duration,
     /// How often the eviction loop runs. Default 60s.
     pub eviction_interval: Duration,
-    /// Process-wide HTAP hot-tier memtable registry.  When present,
-    /// [`Shard::spawn_background`] also spawns the memtable → Vortex flush
-    /// loop (Phase 5.14.C4).  When absent the flush loop is not started.
-    pub memtable_registry: Option<Arc<basin_hottier::MemTableRegistry>>,
-    /// How often the flush task's periodic trigger fires.  Default 5 s.
-    pub flush_tick_interval: Duration,
+    /// S4 age-based residency: how often the background loop runs the
+    /// hot-tier clean-retention sweep
+    /// ([`basin_hottier::MemTableRegistry::enforce_clean_budgets`]) against
+    /// the registry wired in via [`Shard::set_memtable_registry`]. The sweep
+    /// only evicts redundant clean (flushed-and-retained) rows — it never
+    /// flushes; the shard compactor remains the sole durable flusher.
+    /// Default 30 s (`BASIN_HOTTIER_SWEEP_SECS`).
+    pub clean_sweep_interval: Duration,
     /// Phase 6.X.A — optional lease registry (ADR 0023). When present, the
     /// shard acquires a lease per `(project, partition)` it owns and the
     /// background heartbeat renews held leases on a fixed cadence; a renewal
@@ -118,8 +124,10 @@ impl ShardConfig {
             eviction_idle: Duration::from_secs(300),
             compaction_interval: Duration::from_secs(30),
             eviction_interval: Duration::from_secs(60),
-            memtable_registry: None,
-            flush_tick_interval: Duration::from_secs(5),
+            clean_sweep_interval: Duration::from_secs(env_secs(
+                "BASIN_HOTTIER_SWEEP_SECS",
+                DEFAULT_CLEAN_SWEEP_SECS,
+            )),
             lease_registry: None,
             replica_id: default_replica_id(),
             lease_ttl: Duration::from_secs(env_secs(
@@ -174,16 +182,6 @@ impl ShardConfig {
         self.replica_id = replica_id.into();
         self
     }
-
-    /// Attach the HTAP memtable registry so [`Shard::spawn_background`] also
-    /// starts the flush loop (Phase 5.14.C4).
-    pub fn with_memtable_registry(
-        mut self,
-        registry: Arc<basin_hottier::MemTableRegistry>,
-    ) -> Self {
-        self.memtable_registry = Some(registry);
-        self
-    }
 }
 
 /// Stats. Implementations push these out via tracing for the dashboard.
@@ -197,6 +195,11 @@ pub struct ShardStats {
     /// Phase 5.14.D2: count of compactions where the output file was sorted by
     /// the query-history top-K pattern rather than the declared `cluster_columns`.
     pub compactions_with_adaptive_sort: u64,
+    /// S4 age-based residency: cumulative bytes of redundant clean
+    /// (flushed-and-retained) hot-tier rows evicted by the background
+    /// clean-retention sweep. Stays 0 until a registry is wired in via
+    /// [`Shard::set_memtable_registry`].
+    pub clean_sweep_evictions_bytes: u64,
 }
 
 /// Handle to the shard map. Cheap to clone (Arc inside).
@@ -229,8 +232,11 @@ impl Shard {
         self.inner.get(project, partition).await
     }
 
-    /// Spawn the eviction + compaction background loops. Returns a handle
-    /// that, when dropped, signals shutdown. Call this once at server boot.
+    /// Spawn the eviction + compaction + clean-retention-sweep background
+    /// loops. Returns a handle that, when dropped, signals shutdown. Call
+    /// this once at server boot. May be called before
+    /// [`Shard::set_memtable_registry`] — the sweep picks up the registry
+    /// on its next tick after wiring.
     pub fn spawn_background(&self) -> ShardBackgroundHandle {
         self.inner.clone_arc().spawn_background()
     }
@@ -319,6 +325,24 @@ impl Shard {
     /// common ORDER BY / GROUP BY access patterns and pre-sort files.
     pub fn set_top_pattern_provider(&self, provider: Arc<dyn TopPatternProvider>) {
         self.inner.set_top_pattern_provider(provider);
+    }
+
+    /// Wire the engine's HTAP hot-tier memtable registry into the background
+    /// clean-retention sweep (S4 age-based residency).
+    ///
+    /// Called once from `Engine::new`. The sweep tick then runs
+    /// [`basin_hottier::MemTableRegistry::enforce_clean_budgets`] every
+    /// [`ShardConfig::clean_sweep_interval`], evicting clean rows that have
+    /// outlived `BASIN_HOTTIER_RETAIN_SECS` or exceed the per-project clean
+    /// cap. Clean rows are byte-identical to their cold images, so eviction
+    /// is read-transparent — nothing is flushed here; the shard compactor
+    /// remains the sole durable flusher.
+    ///
+    /// Safe to call after [`Shard::spawn_background`] (the production
+    /// order — the server spawns the loops before the engine exists): the
+    /// sweep re-reads the wiring cell on every tick.
+    pub fn set_memtable_registry(&self, registry: Arc<basin_hottier::MemTableRegistry>) {
+        self.inner.set_memtable_registry(registry);
     }
 
     /// Wire the engine's GIN row-group bloom registry into the compactor.
@@ -576,6 +600,9 @@ pub(crate) trait ShardImpl: Send + Sync {
     }
     /// Phase 5.14.D2: register the top-pattern provider. Default no-op.
     fn set_top_pattern_provider(&self, _provider: Arc<dyn TopPatternProvider>) {}
+    /// Wire the hot-tier memtable registry into the clean-retention sweep
+    /// (S4). Default no-op for backends without a hot tier.
+    fn set_memtable_registry(&self, _registry: Arc<basin_hottier::MemTableRegistry>) {}
     /// Wire the GIN row-group registry (populated at INSERT time by the engine
     /// and read at query time for `@>` prune decisions) into the compactor so
     /// newly compacted files are also indexed.  Default no-op.
@@ -649,7 +676,8 @@ pub(crate) trait ProjectHandleImpl: Send + Sync {
 }
 
 /// Read a `u64` seconds value from an env var, falling back to `default` when
-/// unset or unparseable. Used for the lease TTL / renew cadence knobs.
+/// unset or unparseable. Used for the lease TTL / renew cadence and
+/// clean-sweep interval knobs.
 fn env_secs(var: &str, default: u64) -> u64 {
     std::env::var(var)
         .ok()

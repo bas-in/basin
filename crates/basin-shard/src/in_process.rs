@@ -158,6 +158,14 @@ pub(crate) struct InProcessShard {
     /// register the indexed-column values of each newly compacted file.
     /// `None` until the engine wires it in (safe: compactor skips indexing).
     secondary_index_registry: std::sync::RwLock<Option<Arc<dyn crate::SecondaryIndexSink>>>,
+    /// S4 age-based residency — the engine's hot-tier memtable registry,
+    /// wired in via `Shard::set_memtable_registry`. The background loop's
+    /// clean-retention sweep re-reads this cell on **every tick** (it must
+    /// not capture at spawn: production spawns the background loops before
+    /// `Engine::new` exists to wire the registry). Shared via `Arc` so the
+    /// `share_clone` the background task runs on observes late wiring done
+    /// through the original handle. `None` until wired (sweep is a no-op).
+    memtable_registry_cell: Arc<std::sync::RwLock<Option<Arc<basin_hottier::MemTableRegistry>>>>,
     /// Phase 6.X.A — leases held by this replica + their granted epoch.
     held_leases: HeldLeases,
     /// Phase 6.X.C — partitions whose lease is mid-handoff. While present in
@@ -176,6 +184,7 @@ impl InProcessShard {
             gin_rowgroup_registry: std::sync::RwLock::new(None),
             jsonb_posting_registry: std::sync::RwLock::new(None),
             secondary_index_registry: std::sync::RwLock::new(None),
+            memtable_registry_cell: Arc::new(std::sync::RwLock::new(None)),
             held_leases: Arc::new(Mutex::new(HashMap::new())),
             draining: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -210,6 +219,9 @@ impl InProcessShard {
             gin_rowgroup_registry: std::sync::RwLock::new(rg_registry),
             jsonb_posting_registry: std::sync::RwLock::new(jp_registry),
             secondary_index_registry: std::sync::RwLock::new(sec_registry),
+            // Shared (not snapshotted): the sweep must observe a registry
+            // wired through the original handle after spawn_background.
+            memtable_registry_cell: self.memtable_registry_cell.clone(),
             held_leases: self.held_leases.clone(),
             draining: self.draining.clone(),
         }
@@ -304,15 +316,15 @@ impl InProcessShard {
     ///    [`BasinError::LeaseHandoffInProgress`] so the router can retry on
     ///    the new owner. Reads continue.
     /// 2. **Drain + flush.** Compact the in-memory tail to Parquet via the
-    ///    existing compaction path, and request an immediate flush of any
-    ///    hot-tier memtable via the existing
-    ///    `basin-hottier::FlushTask::request_immediate` path when a registry
-    ///    is configured. The memtable / tail-snapshot work is what bounds the
-    ///    stall — for small memtables (< a few MB) this is well under the
-    ///    500 ms p99 target. **Larger memtables**: a multi-hundred-MB
-    ///    memtable is dominated by the cold-tier write step (object-storage
+    ///    existing compaction path — the shard compactor is the sole durable
+    ///    flusher (the hot-tier registry holds only redundant clean rows and
+    ///    engine-side overlays the new owner rebuilds from the WAL, so there
+    ///    is nothing registry-side to flush here). The tail-snapshot work is
+    ///    what bounds the stall — for small tails (< a few MB) this is well
+    ///    under the 500 ms p99 target. **Larger tails**: a multi-hundred-MB
+    ///    tail is dominated by the cold-tier write step (object-storage
     ///    PUT bandwidth ~100 MB/s typical); operators should size partitions
-    ///    so single-partition memtable depth fits the target window, or
+    ///    so single-partition tail depth fits the target window, or
     ///    accept a larger-than-500-ms one-off stall during the handoff.
     /// 3. **Handoff marker.** Append a `Handoff { to_holder, at_epoch }` WAL
     ///    marker as the boundary record. Replay treats it as a no-op (see
@@ -1708,6 +1720,40 @@ impl InProcessShard {
         stats.resident_partitions = map.len();
         stats.resident_projects = unique_projects(&map);
     }
+
+    /// S4 age-based residency — one clean-retention sweep tick.
+    ///
+    /// Reads the memtable-registry cell **on every call** (production wires
+    /// the registry via `Shard::set_memtable_registry` after
+    /// `spawn_background` has already started this loop) and, when wired,
+    /// runs [`basin_hottier::MemTableRegistry::enforce_clean_budgets`]:
+    /// clean (flushed-and-retained) rows older than
+    /// `BASIN_HOTTIER_RETAIN_SECS` are evicted, and projects over
+    /// `BASIN_HOTTIER_RETAIN_CAP` clean bytes are trimmed down to the cap.
+    ///
+    /// This sweep only releases redundant clean bytes — every evicted row is
+    /// byte-identical to its cold image, so there is nothing to flush and no
+    /// catalog/storage I/O. Dirty rows are untouched; the shard compactor
+    /// remains the sole durable flusher. No-op until a registry is wired.
+    async fn clean_retention_sweep(&self) {
+        let registry = {
+            let guard = self
+                .memtable_registry_cell
+                .read()
+                .expect("memtable_registry_cell lock poisoned");
+            guard.clone()
+        };
+        let Some(registry) = registry else {
+            return;
+        };
+        let freed = registry.enforce_clean_budgets();
+        if freed > 0 {
+            let mut stats = self.stats.lock().await;
+            stats.clean_sweep_evictions_bytes =
+                stats.clean_sweep_evictions_bytes.saturating_add(freed);
+            debug!(freed_bytes = freed, "clean-retention sweep evicted bytes");
+        }
+    }
 }
 
 fn unique_projects(map: &PartitionMap) -> usize {
@@ -1742,36 +1788,6 @@ impl ShardImpl for InProcessShard {
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let me = self.clone();
 
-        // Phase 5.14.C4: spawn the memtable → Vortex flush task if a
-        // MemTableRegistry was configured.  The task runs alongside the
-        // compaction loop; they are independent background workers.
-        let flush_task: Option<basin_hottier::FlushTask> =
-            if let Some(registry) = &me.cfg.memtable_registry {
-                let backend: Arc<dyn basin_hottier::FlushBackend> =
-                    Arc::new(ShardFlushBackend {
-                        storage: me.cfg.storage.clone(),
-                        catalog: me.cfg.catalog.clone(),
-                        wal: me.cfg.wal.clone(),
-                        partition: PartitionKey::default_key(),
-                    });
-                let task = basin_hottier::FlushTask::spawn(
-                    registry.clone(),
-                    backend,
-                    me.cfg.memtable_registry
-                        .as_ref()
-                        .map(|r| r.config().clone())
-                        .unwrap_or_default(),
-                    me.cfg.flush_tick_interval,
-                );
-                tracing::info!(
-                    tick_interval_ms = me.cfg.flush_tick_interval.as_millis(),
-                    "memtable flush task spawned (Phase 5.14.C4)",
-                );
-                Some(task)
-            } else {
-                None
-            };
-
         let join = tokio::spawn(async move {
             let mut shutdown = rx;
             let mut evict_tick = tokio::time::interval(me.cfg.eviction_interval);
@@ -1780,11 +1796,16 @@ impl ShardImpl for InProcessShard {
             // is configured (heartbeat_renew is a no-op otherwise), so the
             // ticker firing in no-lease mode is harmless.
             let mut heartbeat_tick = tokio::time::interval(me.cfg.lease_renew_interval);
+            // S4 clean-retention sweep. The tick always fires; each tick
+            // re-reads the registry cell (wired late, after spawn) and is a
+            // no-op until `Shard::set_memtable_registry` has been called.
+            let mut sweep_tick = tokio::time::interval(me.cfg.clean_sweep_interval);
             // First firing of `interval` is immediate; skip it so the loops
             // align with their configured cadence.
             evict_tick.tick().await;
             compact_tick.tick().await;
             heartbeat_tick.tick().await;
+            sweep_tick.tick().await;
             loop {
                 tokio::select! {
                     _ = &mut shutdown => break,
@@ -1805,11 +1826,10 @@ impl ShardImpl for InProcessShard {
                         // within `lease_renew_interval` (default 5 s).
                         me.heartbeat_budgets().await;
                     }
+                    _ = sweep_tick.tick() => {
+                        me.clean_retention_sweep().await;
+                    }
                 }
-            }
-            // Shutdown the flush task after the compaction loop exits.
-            if let Some(ft) = flush_task {
-                ft.shutdown().await;
             }
         });
         ShardBackgroundHandle { shutdown: tx, join }
@@ -1843,6 +1863,14 @@ impl ShardImpl for InProcessShard {
             .write()
             .expect("top_pattern_provider lock poisoned");
         *guard = Some(provider);
+    }
+
+    fn set_memtable_registry(&self, registry: Arc<basin_hottier::MemTableRegistry>) {
+        let mut guard = self
+            .memtable_registry_cell
+            .write()
+            .expect("memtable_registry_cell lock poisoned");
+        *guard = Some(registry);
     }
 
     fn set_gin_rowgroup_registry(
@@ -1927,14 +1955,22 @@ impl ShardImpl for InProcessShard {
             g.touch();
         }
         // Also drop the hot-tier MemTableRegistry entry, if one is wired
-        // in.  Today's INSERT path through `InProcessProjectHandle`
-        // writes to the partition tail above, not the registry, but the
-        // engine carries its own MemTableRegistry that some code paths
-        // populate (e.g. constraint enforcement snapshots).  Belt + braces:
-        // engine-level callers also `remove` from their own registry in
-        // `exec_drop_table`; this branch keeps the shard internally
-        // consistent if a future flush task routes through the registry.
-        if let Some(reg) = &self.cfg.memtable_registry {
+        // in via `Shard::set_memtable_registry`.  Today's INSERT path
+        // through `InProcessProjectHandle` writes to the partition tail
+        // above, not the registry, but the engine carries its own
+        // MemTableRegistry that some code paths populate (e.g. constraint
+        // enforcement snapshots).  Belt + braces: engine-level callers also
+        // `remove` from their own registry in `exec_drop_table`; this branch
+        // keeps the shard internally consistent and stops the
+        // clean-retention sweep from carrying entries for dropped tables.
+        let reg = {
+            let guard = self
+                .memtable_registry_cell
+                .read()
+                .expect("memtable_registry_cell lock poisoned");
+            guard.clone()
+        };
+        if let Some(reg) = reg {
             reg.remove(project, table);
         }
         Ok(())
@@ -1963,217 +1999,6 @@ impl ShardImpl for InProcessShard {
     #[cfg(test)]
     fn as_in_process(&self) -> Option<Arc<InProcessShard>> {
         Some(Arc::new(self.share_clone()))
-    }
-}
-
-// ── ShardFlushBackend ─────────────────────────────────────────────────────────
-
-/// [`FlushBackend`] implementation wired to the shard's `storage` + `catalog` +
-/// `wal`. Translates the generic `FlushBackend` trait calls into the concrete
-/// basin-storage / basin-catalog API calls already used by the compactor.
-struct ShardFlushBackend {
-    storage: basin_storage::Storage,
-    catalog: Arc<dyn basin_catalog::Catalog>,
-    wal: Arc<dyn basin_wal::Wal>,
-    partition: PartitionKey,
-}
-
-impl basin_hottier::FlushBackend for ShardFlushBackend {
-    fn write_rows(
-        &self,
-        project: &ProjectId,
-        table: &TableName,
-        rows: Vec<basin_hottier::RowBytes>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<basin_hottier::WrittenFile>> + Send + '_>>
-    {
-        let storage = self.storage.clone();
-        let catalog = self.catalog.clone();
-        let partition = self.partition.clone();
-        let project = *project;
-        let table = table.clone();
-        Box::pin(async move {
-            if rows.is_empty() {
-                return Err(BasinError::internal("write_rows called with empty rows"));
-            }
-
-            // Decode each row's IPC bytes into a RecordBatch and concatenate.
-            let mut batches: Vec<RecordBatch> = Vec::with_capacity(rows.len());
-            for row_bytes in &rows {
-                let cursor = Cursor::new(row_bytes.as_slice());
-                let reader = StreamReader::try_new(cursor, None)
-                    .map_err(|e| BasinError::storage(format!("flush ipc reader: {e}")))?;
-                for batch in reader {
-                    batches.push(
-                        batch.map_err(|e| BasinError::storage(format!("flush ipc batch: {e}")))?,
-                    );
-                }
-            }
-
-            if batches.is_empty() {
-                return Err(BasinError::internal("flush: decoded zero batches from rows"));
-            }
-
-            let schema = batches[0].schema();
-            let mut merged = arrow::compute::concat_batches(&schema, &batches)
-                .map_err(|e| BasinError::storage(format!("flush concat batches: {e}")))?;
-
-            // #204: the hot-tier flush is one of the cold-file write paths, so
-            // it must honour the same PK-sort policy. Sort the whole merged
-            // batch by the table's clustering (explicit, else the single-column
-            // PK) so the flushed file's zone / row-group ranges are disjoint.
-            // A missing catalog row (first flush before the table is created)
-            // is non-fatal — fall through to the default empty cluster spec.
-            //
-            // ADR 0027 Phase 4: the hot-tier tail flush is ALSO a post-promotion
-            // cold-file write path. If a JSONB path was promoted and then rows
-            // were INSERTed/UPDATEd (CoW) and flushed here, the resulting file
-            // must carry the `__promoted$col$key` shadow column — otherwise the
-            // fast_select read path's "every live file carries the shadow
-            // column" correctness guard fails and EVERY subsequent
-            // `payload->>'key'` query for the table silently demotes to the
-            // per-row JSONB UDF scan (orders of magnitude slower) for as long
-            // as that file stays live. Compaction backfills via
-            // `backfill_promoted_columns`; the tail-flush path must do the same
-            // so a single post-promotion write doesn't permanently disable the
-            // promoted fast path. (Confirmed: without this, a #37-style
-            // `jsonb_set ... WHERE id < 10` UPDATE at 1M demoted the later
-            // `COUNT(*) ... WHERE payload->>'category' = …` from ~ms to ~3.4s.)
-            let (cluster_columns, promoted_paths) =
-                match catalog.load_table(&project, &table).await {
-                    Ok(meta) => {
-                        let cc = if !meta.cluster_columns.is_empty() {
-                            meta.cluster_columns.clone()
-                        } else {
-                            meta.default_cluster_cols()
-                        };
-                        (cc, meta.promoted_jsonb_paths.clone())
-                    }
-                    Err(_) => (Vec::new(), Vec::new()),
-                };
-            if !promoted_paths.is_empty() {
-                merged = backfill_promoted_columns(merged, &promoted_paths)?;
-            }
-            let write_opts = basin_storage::WriteOptions {
-                cluster_columns,
-                ..Default::default()
-            };
-            let data_file = storage
-                .write_batch_with_options(&project, &table, &partition, &merged, &write_opts)
-                .await?;
-
-            Ok(basin_hottier::WrittenFile {
-                path: data_file.path.as_ref().to_string(),
-                size_bytes: data_file.size_bytes,
-                row_count: data_file.row_count,
-            })
-        })
-    }
-
-    fn commit_new_file(
-        &self,
-        project: &ProjectId,
-        table: &TableName,
-        file: basin_hottier::WrittenFile,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
-        let catalog = self.catalog.clone();
-        let storage = self.storage.clone();
-        let partition = self.partition.clone();
-        let project = *project;
-        let table = table.clone();
-        Box::pin(async move {
-            // Ensure the table exists in the catalog.
-            let mut snapshot = match catalog.load_table(&project, &table).await {
-                Ok(meta) => meta.current_snapshot,
-                Err(BasinError::NotFound(_)) => {
-                    // Table not yet in catalog — we need a schema to create it.
-                    // Load the schema from the data file we just wrote.
-                    let batches = storage
-                        .read(
-                            &project,
-                            &table,
-                            basin_storage::ReadOptions {
-                                projection: None,
-                                filters: vec![],
-                                partition: Some(partition.clone()),
-                                ..Default::default()
-                            },
-                        )
-                        .await?;
-                    let collected: Vec<RecordBatch> = futures::StreamExt::collect::<Vec<_>>(batches).await
-                        .into_iter()
-                        .collect::<Result<Vec<_>>>()?;
-                    if let Some(b) = collected.first() {
-                        let schema_ref = b.schema();
-                        let meta = catalog
-                            .create_table(&project, &table, schema_ref.as_ref())
-                            .await?;
-                        meta.current_snapshot
-                    } else {
-                        return Err(BasinError::internal(
-                            "flush commit: cannot create table — no schema available",
-                        ));
-                    }
-                }
-                Err(e) => return Err(e),
-            };
-
-            let file_ref = DataFileRef {
-                path: file.path,
-                size_bytes: file.size_bytes,
-                row_count: file.row_count,
-                column_stats: ::std::collections::BTreeMap::new(),
-                bloom_filters: ::std::collections::BTreeMap::new(),
-                hll_sketches: ::std::collections::BTreeMap::new(),
-                tdigest_sketches: ::std::collections::BTreeMap::new(),
-            };
-
-            // Retry once on CommitConflict.
-            for attempt in 0..2usize {
-                match catalog
-                    .append_data_files(&project, &table, snapshot, vec![file_ref.clone()])
-                    .await
-                {
-                    Ok(_) => return Ok(()),
-                    Err(BasinError::CommitConflict(_)) if attempt == 0 => {
-                        let meta = catalog.load_table(&project, &table).await?;
-                        snapshot = meta.current_snapshot;
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            Err(BasinError::CommitConflict(format!(
-                "{project}/{table}: flush lost commit race twice"
-            )))
-        })
-    }
-
-    fn apply_tombstones(
-        &self,
-        _project: &ProjectId,
-        _table: &TableName,
-        _tombstone_keys: Vec<basin_hottier::RowKey>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
-        // Phase 5.14.C4 initial implementation: tombstones are suppressed at
-        // read time by the hot-tier merge path (merge_scan) so they don't need
-        // to be applied to the cold tier during flush.  The read-merge path
-        // already handles cold-tier suppression; flushing tombstones to the cold
-        // tier (copy-on-write DELETE via dml_mutate) is deferred to a follow-up
-        // phase once dml_mutate is accessible from basin-shard.
-        Box::pin(async { Ok(()) })
-    }
-
-    fn truncate_wal(
-        &self,
-        project: &ProjectId,
-        max_lsn: u64,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
-        let wal = self.wal.clone();
-        let project = *project;
-        let partition = self.partition.clone();
-        Box::pin(async move {
-            let lsn = Lsn(max_lsn);
-            wal.truncate(&project, &partition, lsn).await
-        })
     }
 }
 
@@ -3104,6 +2929,21 @@ mod tests {
         Arc<InMemoryCatalog>,
         Arc<dyn Wal>,
     ) {
+        fresh_shard_with(|_| {}).await
+    }
+
+    /// Like [`fresh_shard`], but lets the caller tweak the [`ShardConfig`]
+    /// (e.g. a tiny `clean_sweep_interval`) before the shard is built.
+    async fn fresh_shard_with(
+        tweak: impl FnOnce(&mut ShardConfig),
+    ) -> (
+        crate::Shard,
+        TempDir,
+        TempDir,
+        Storage,
+        Arc<InMemoryCatalog>,
+        Arc<dyn Wal>,
+    ) {
         basin_common::telemetry::try_init_for_tests();
         let storage_dir = TempDir::new().unwrap();
         let wal_dir = TempDir::new().unwrap();
@@ -3126,7 +2966,8 @@ mod tests {
             .await
             .unwrap(),
         );
-        let cfg = ShardConfig::new(storage.clone(), catalog.clone(), wal.clone());
+        let mut cfg = ShardConfig::new(storage.clone(), catalog.clone(), wal.clone());
+        tweak(&mut cfg);
         let shard = crate::Shard::new(cfg);
         (shard, storage_dir, wal_dir, storage, catalog, wal)
     }
@@ -4314,5 +4155,100 @@ mod tests {
         let rtree = basin_storage::index::rtree::deserialize_rtree(&bytes)
             .expect("sidecar bytes deserialise");
         assert_eq!(rtree.size(), 8, "all 8 POINT rows indexed");
+    }
+
+    // ── S4 clean-retention sweep ──────────────────────────────────────────────
+
+    /// The background sweep evicts clean (flushed-and-retained) hot-tier rows
+    /// once they outlive the retention window — and it must pick up a registry
+    /// wired in AFTER `spawn_background`, because that is the production
+    /// order (the server spawns the loops before `Engine::new` wires the
+    /// registry).
+    #[tokio::test]
+    async fn sweep_evicts_clean_after_retention() {
+        let (shard, _sd, _wd, _storage, _cat, _wal) = fresh_shard_with(|cfg| {
+            cfg.clean_sweep_interval = Duration::from_millis(25);
+        })
+        .await;
+
+        // retain_secs == 0 is the documented kill switch: clean entries are
+        // evictable on the very first sweep, so the test needs no clock
+        // games — only the wiring + tick path is under test here (the
+        // retention arithmetic itself is covered in basin-hottier).
+        let reg = Arc::new(basin_hottier::MemTableRegistry::new_with_config(
+            basin_hottier::MemTableConfig {
+                retain_secs: 0,
+                ..Default::default()
+            },
+        ));
+        let project = ProjectId::new();
+        let table = TableName::new("events").unwrap();
+        let entry = reg.get_or_create(project, table.clone());
+        let _ = reg.try_reserve_bytes(&project, 256);
+        entry.memtable.insert_clean(
+            basin_hottier::RowKey::builder().append_i64(1).finish(),
+            basin_hottier::MemRowValue::row(vec![0u8; 256], 0),
+        );
+        assert_eq!(reg.project_clean_bytes(&project), 256);
+
+        // Spawn FIRST, wire SECOND — pins the late-wiring contract.
+        let bg = shard.spawn_background();
+        shard.set_memtable_registry(reg.clone());
+
+        // Poll with a generous deadline rather than sleeping a fixed number
+        // of ticks; the sweep interval is 25 ms so this normally resolves in
+        // well under a second.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let clean = reg.project_clean_bytes(&project);
+            let swept = shard.stats().clean_sweep_evictions_bytes;
+            if clean == 0 && swept >= 256 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "sweep did not evict clean bytes within deadline \
+                 (clean={clean}, swept={swept})",
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        bg.shutdown().await;
+    }
+
+    /// With no registry wired, the sweep tick is a harmless no-op: the loop
+    /// keeps running, the shard keeps serving writes/reads, and the stats
+    /// counter stays at zero.
+    #[tokio::test]
+    async fn sweep_noop_without_registry() {
+        let (shard, _sd, _wd, _storage, _cat, _wal) = fresh_shard_with(|cfg| {
+            cfg.clean_sweep_interval = Duration::from_millis(10);
+        })
+        .await;
+
+        let bg = shard.spawn_background();
+
+        // Let a number of sweep ticks fire with no registry wired.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // The shard still works normally around the no-op ticks.
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+        let table = TableName::new("events").unwrap();
+        let handle = shard.get(&project, &partition).await.unwrap();
+        handle
+            .write_batch(&table, batch(0, 10, "v-"))
+            .await
+            .unwrap();
+        let read = handle.read(&table, ReadOptions::default()).await.unwrap();
+        assert_eq!(rows_in(&read), 10);
+
+        assert_eq!(
+            shard.stats().clean_sweep_evictions_bytes,
+            0,
+            "no registry wired — sweep must not record evictions",
+        );
+
+        bg.shutdown().await;
     }
 }
