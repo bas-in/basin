@@ -13,11 +13,13 @@
 //!   path (`"a.b.c"=<value>`).  Both opclasses produce `String` terms that map
 //!   into the same posting-list structure.
 //!
-//! * **posting list** — a sorted set of `PostingEntry` values (file path +
-//!   row-group + row) for each distinct term.  AND-merging two posting lists
-//!   yields the rows that contain BOTH terms — the correct semantics for
-//!   compound containment (`{"a":1,"b":2}` must have both term "a" and term
-//!   "b" indexed).
+//! * **posting list** — the set of file paths (interned `Arc<str>`) that
+//!   contain at least one row with each distinct term.  AND-merging two
+//!   posting lists yields the files that contain BOTH terms — the correct
+//!   semantics for compound containment (`{"a":1,"b":2}` must have both term
+//!   "a" and term "b" indexed).  Granularity is the FILE: this registry only
+//!   feeds file-level pruning; row-group pruning is owned by
+//!   `GinRowGroupRegistry` / `JsonbPostingRegistry`.
 //!
 //! # Correctness contract
 //!
@@ -54,19 +56,41 @@ use serde_json::Value;
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
-/// Maximum total posting entries (file+rg+row tuples) kept per `(table, col)`
-/// posting list.  Beyond this threshold the oldest 25% of terms are evicted.
+/// Maximum total posting entries kept per `(table, col)` posting list.
+/// Beyond this threshold the oldest 25% of terms are evicted.
+///
+/// One "entry" is a distinct **(term, file)** posting pair.  The posting
+/// list deduplicates rows: a term that occurs in 10k rows of one file costs
+/// ONE entry, so a 1M-row backfill only approaches this budget when the
+/// indexed documents carry high-cardinality (near-unique) values.
+///
+/// Memory arithmetic behind the default (measured against the data
+/// structures in [`TermPostingList`], hashbrown load factor ≈ 0.875,
+/// average table slack ≈ 1.3×):
+///
+/// * per posting pair: one `Arc<str>` (16 B inline) in a per-term
+///   `HashSet<Arc<str>>` bucket + ctrl byte + slack ≈ **~22 B**;
+/// * per *distinct term* (amortised over its pairs): `HashMap` bucket
+///   (`String` key 24 B + `HashSet` header 48 B) × slack ≈ 95 B, plus the
+///   term text heap (~16–32 B for `kv:key="value"`) and its `insert_order`
+///   copy (24 B + text) ≈ **~170 B**;
+/// * per distinct file: the interned path `Arc<str>` (~120 B incl. header),
+///   allocated once per file — negligible (file counts are O(100s)).
+///
+/// At 5M pairs the pair-side cost is ≈ 110 MB.  Typical workloads (term
+/// values shared by many rows, so pairs ≫ distinct terms) land in the
+/// 64–128 MB envelope.  The adversarial ceiling — every term unique, one
+/// pair each — is ≈ 5M × (22 + 170) B ≈ 1 GB; such workloads fire the
+/// eviction warning below and operators should lower the budget via the
+/// env knob (the index stays *correct* either way: eviction de-indexes
+/// only the affected files and pruning degrades per-file).
 ///
 /// This default can be overridden at process start via the
 /// `BASIN_GIN_POSTING_BUDGET` environment variable.  Example:
 /// ```text
 /// BASIN_GIN_POSTING_BUDGET=2000000 basin-server
 /// ```
-/// Operators should raise this for hot, large tables where the 500k default
-/// causes excessive eviction.  However, even without raising the budget,
-/// **per-file completeness** (see [`GinIndexRegistry`]) ensures that eviction
-/// only de-indexes the files whose terms were evicted, not the entire column.
-const DEFAULT_POSTING_BUDGET: usize = 500_000;
+const DEFAULT_POSTING_BUDGET: usize = 5_000_000;
 
 /// Return the effective per-column posting-entry budget.
 ///
@@ -84,26 +108,29 @@ fn posting_budget() -> usize {
 
 // ── Data types ────────────────────────────────────────────────────────────────
 
-/// One physical location for a posting entry: file path + row-group + row.
-/// Deliberately mirrors `secondary_index::IndexLocation` to allow future
-/// sharing, but kept separate so the two registries can evolve independently.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct PostingEntry {
-    pub file_path: String,
-    pub row_group: u32,
-    pub row: u64,
-}
-
-/// One posting list for a single `(term)`.
-/// Maps each term → set of `PostingEntry`.
+/// One posting list for a single column: `term → set of file paths`.
+///
+/// File paths are interned (`Arc<str>`, one allocation per distinct file)
+/// because every term in a 1M-row backfill would otherwise clone a ~100-byte
+/// path string per posting entry.  Posting granularity is the FILE: the only
+/// consumer of this registry is file-level pruning (`ProbeResult::
+/// FileCandidates`), so storing per-row locations was pure overhead — and it
+/// made the posting budget burn ~rows×terms entries instead of the
+/// (term, file) pairs that actually bound memory.  Row-group-granular pruning
+/// is owned by `GinRowGroupRegistry` / `JsonbPostingRegistry`.
 #[derive(Debug, Default)]
 struct TermPostingList {
-    /// `term → set of (file, rg, row)`.
-    entries: HashMap<String, HashSet<PostingEntry>>,
-    /// Ordered sequence of insertions for LRU eviction (keys, not entries).
+    /// `term → set of interned file paths containing ≥1 row with that term`.
+    entries: HashMap<String, HashSet<Arc<str>>>,
+    /// Ordered sequence of term insertions for FIFO eviction (keys).
     insert_order: Vec<String>,
-    /// Total entry count (sum of all set sizes).
+    /// Total posting-pair count (sum of all set sizes).
     total_count: usize,
+    /// Interner: one `Arc<str>` per distinct file path.
+    files: HashSet<Arc<str>>,
+    /// Set once the first eviction fires, so the operator warning is logged
+    /// exactly once per `(table, col)` posting list.
+    eviction_warned: bool,
 }
 
 impl TermPostingList {
@@ -111,22 +138,44 @@ impl TermPostingList {
         Self::default()
     }
 
-    /// Add a single `(term, entry)` pair.
+    /// Return the interned `Arc<str>` for `file_path`, creating it on first use.
+    fn intern_file(&mut self, file_path: &str) -> Arc<str> {
+        if let Some(existing) = self.files.get(file_path) {
+            return existing.clone();
+        }
+        let arc: Arc<str> = Arc::from(file_path);
+        self.files.insert(arc.clone());
+        arc
+    }
+
+    /// Add a single `(term, file)` posting pair.
+    ///
+    /// The pair is deduplicated: re-indexing a row (or another row of the same
+    /// file with the same term) does NOT inflate `total_count` — the budget
+    /// counts distinct pairs, which is what actually occupies memory.
     ///
     /// Returns the set of file paths whose posting entries were **evicted** by
     /// this insert (empty when no eviction occurred).  The caller
     /// (`GinIndexRegistry::index_row`) uses this set to mark *only* the
     /// affected files as un-indexed in the per-file completeness map — leaving
     /// files that still have complete posting coverage prunable.  This is the
-    /// key difference from the old global-wipe approach: eviction is now
+    /// key difference from the old global-wipe approach: eviction is
     /// file-scoped, not column-scoped.
-    fn insert(&mut self, term: String, entry: PostingEntry) -> HashSet<String> {
-        let set = self.entries.entry(term.clone()).or_default();
-        if set.is_empty() {
-            self.insert_order.push(term);
+    fn insert(&mut self, term: &str, file: &Arc<str>) -> HashSet<String> {
+        match self.entries.get_mut(term) {
+            Some(set) => {
+                if set.insert(file.clone()) {
+                    self.total_count += 1;
+                }
+            }
+            None => {
+                self.insert_order.push(term.to_string());
+                let mut set = HashSet::new();
+                set.insert(file.clone());
+                self.entries.insert(term.to_string(), set);
+                self.total_count += 1;
+            }
         }
-        set.insert(entry);
-        self.total_count += 1;
 
         if self.total_count > posting_budget() {
             self.evict_oldest()
@@ -147,8 +196,8 @@ impl TermPostingList {
         let mut evicted_files: HashSet<String> = HashSet::new();
         for k in &to_evict {
             if let Some(set) = self.entries.remove(k) {
-                for e in &set {
-                    evicted_files.insert(e.file_path.clone());
+                for f in &set {
+                    evicted_files.insert(f.as_ref().to_string());
                 }
                 self.total_count = self.total_count.saturating_sub(set.len());
             }
@@ -160,7 +209,7 @@ impl TermPostingList {
     /// (caller must treat as "unknown → full scan").  Returns `Some(set)` for
     /// a known term; the set may be empty when all posting entries for this
     /// term were evicted.
-    fn probe_term(&self, term: &str) -> Option<&HashSet<PostingEntry>> {
+    fn probe_term(&self, term: &str) -> Option<&HashSet<Arc<str>>> {
         self.entries.get(term)
     }
 
@@ -168,10 +217,11 @@ impl TermPostingList {
     /// compacted or deleted.
     fn remove_file(&mut self, file_path: &str) {
         for set in self.entries.values_mut() {
-            let before = set.len();
-            set.retain(|e| e.file_path != file_path);
-            self.total_count = self.total_count.saturating_sub(before - set.len());
+            if set.remove(file_path) {
+                self.total_count = self.total_count.saturating_sub(1);
+            }
         }
+        self.files.remove(file_path);
     }
 }
 
@@ -270,16 +320,65 @@ fn simple_hash(s: &str) -> u64 {
 
 /// Extract GIN probe terms from a JSONB *needle* document for a `@>` query.
 ///
-/// For `jsonb_ops`:   every `key:k` and `kv:k=v` term in the needle.
-/// For `jsonb_path_ops`: every `path_hash:<h>` term in the needle.
+/// For `jsonb_ops`:   the `key:k` terms of the needle, plus `kv:k=v` terms
+/// for **scalar** values only.
+/// For `jsonb_path_ops`: `path_hash:<h>` terms for **scalar leaf** paths only.
 ///
-/// This mirrors `extract_terms` — the probe terms must use the same key space
-/// as the indexed terms so the AND-merge works correctly.
+/// Probe terms share `extract_terms`' key space (the AND-merge requires it),
+/// but they must each be a *necessary condition* on a containing document —
+/// the AND-merge prunes every file missing any one of them.  Exact-value
+/// terms for object/array needle values are NOT necessary conditions:
+/// `{"a":{"x":1,"y":2}}` contains the needle `{"a":{"x":1}}` but does NOT
+/// carry the needle's `kv:a={"x":1}` term (its term is `kv:a={"x":1,"y":2}`).
+/// Emitting that term would prune the containing file — a dropped row.  So:
+///
+/// * scalar values   → `kv:k=v` (necessary: containment of a scalar is
+///   equality, and the indexed doc emits the identical compact form);
+/// * object values   → recurse (the nested `key:`/`kv:` terms of the
+///   needle's sub-keys are emitted by the index side's recursion too);
+/// * array values    → key-presence only (array containment is subset, the
+///   exact compact repr is not necessary; elements aren't decomposed).
+///
+/// An empty result (e.g. `{"a":[1,2]}` under `jsonb_path_ops`) makes the
+/// probe return `NoIndex` → full scan (safe).
 pub fn needle_terms(needle: &Value, opclass: &str) -> Vec<String> {
-    // For containment needle, we use the same extraction logic as for indexed docs.
-    // This is correct: if the needle has `{"tag":"nested"}`, the indexed doc must
-    // have both `key:tag` and `kv:tag="nested"` in its posting list.
-    extract_terms(needle, opclass)
+    let mut terms = Vec::new();
+    needle_terms_inner(needle, opclass, "", &mut terms);
+    terms
+}
+
+fn needle_terms_inner(value: &Value, opclass: &str, path_prefix: &str, out: &mut Vec<String>) {
+    let Value::Object(map) = value else { return };
+    for (k, v) in map {
+        let path = if path_prefix.is_empty() {
+            k.clone()
+        } else {
+            format!("{path_prefix}.{k}")
+        };
+        if opclass == "jsonb_path_ops" {
+            match v {
+                Value::Object(_) => needle_terms_inner(v, opclass, &path, out),
+                Value::Array(_) => {
+                    // Exact array repr is not a necessary condition — skip.
+                }
+                _ => {
+                    let leaf_repr = compact_value(v);
+                    let hash = simple_hash(&format!("{path}={leaf_repr}"));
+                    out.push(format!("path_hash:{hash}"));
+                }
+            }
+        } else {
+            out.push(format!("key:{k}"));
+            match v {
+                Value::Object(_) => needle_terms_inner(v, opclass, &path, out),
+                Value::Array(_) => {
+                    // Exact array repr is not a necessary condition — only the
+                    // key-presence term constrains the candidate set.
+                }
+                _ => out.push(format!("kv:{k}={}", compact_value(v))),
+            }
+        }
+    }
 }
 
 // ── Registry ──────────────────────────────────────────────────────────────────
@@ -351,8 +450,10 @@ impl GinIndexRegistry {
         opclass: &str,
         jsonb_bytes: &[u8],
         file_path: &str,
-        row_group: u32,
-        row: u64,
+        // Row-group / row are accepted for call-site compatibility but not
+        // stored: posting granularity is the FILE (see TermPostingList).
+        _row_group: u32,
+        _row: u64,
     ) {
         let value: Value = match serde_json::from_slice(jsonb_bytes) {
             Ok(v) => v,
@@ -364,14 +465,10 @@ impl GinIndexRegistry {
         }
         let arc = self.get_or_create(project, table, col);
         let mut list = arc.lock().expect("TermPostingList lock poisoned");
-        let entry = PostingEntry {
-            file_path: file_path.to_string(),
-            row_group,
-            row,
-        };
+        let file = list.intern_file(file_path);
         let mut all_evicted_files: HashSet<String> = HashSet::new();
-        for term in terms {
-            let evicted_files = list.insert(term, entry.clone());
+        for term in &terms {
+            let evicted_files = list.insert(term, &file);
             all_evicted_files.extend(evicted_files);
         }
         // Per-file completeness: if any terms were evicted, only the files
@@ -380,7 +477,24 @@ impl GinIndexRegistry {
         // degrades gracefully: a large table prunes the files that are
         // indexed, and treats any evicted-file as a forced full-file scan
         // (must-scan), which is safe (no false negatives).
+        //
+        // NOTE: the indexed_files update happens while the posting-list lock
+        // is still held (the `list` guard lives to the end of this scope), so
+        // a concurrent probe that snapshots both structures under the same
+        // lock order can never observe "term evicted but file still marked".
         if !all_evicted_files.is_empty() {
+            if !list.eviction_warned {
+                list.eviction_warned = true;
+                tracing::warn!(
+                    table = %table.as_str(),
+                    column = col,
+                    budget = posting_budget(),
+                    "GIN posting list exceeded its budget; oldest terms evicted. \
+                     The index is now PARTIAL: evicted files fall back to full \
+                     scans (results stay correct, pruning degrades per-file). \
+                     Raise BASIN_GIN_POSTING_BUDGET for this workload."
+                );
+            }
             let key = RegKey {
                 project: *project,
                 table: table.clone(),
@@ -395,6 +509,15 @@ impl GinIndexRegistry {
                 // If the set is now empty or absent, leave it empty — future
                 // mark_file_indexed calls will repopulate it for new files.
             }
+        }
+    }
+
+    /// `true` when eviction has ever fired for `(project, table, col)` — the
+    /// posting list is (or was) partial.  Exposed for tests and diagnostics.
+    pub fn has_evicted(&self, project: &ProjectId, table: &TableName, col: &str) -> bool {
+        match self.get(project, table, col) {
+            Some(arc) => arc.lock().expect("TermPostingList lock poisoned").eviction_warned,
+            None => false,
         }
     }
 
@@ -447,7 +570,7 @@ impl GinIndexRegistry {
                 }
                 Some(entries) => {
                     let files: HashSet<String> =
-                        entries.iter().map(|e| e.file_path.clone()).collect();
+                        entries.iter().map(|f| f.as_ref().to_string()).collect();
                     candidate_files = Some(match candidate_files {
                         None => files,
                         Some(prev) => prev.intersection(&files).cloned().collect(),
@@ -461,6 +584,83 @@ impl GinIndexRegistry {
             Some(files) if files.is_empty() => ProbeResult::Empty,
             Some(files) => ProbeResult::FileCandidates(files),
         }
+    }
+
+    /// Per-file (partial-coverage) containment probe — Phase 5.19.F.
+    ///
+    /// Unlike [`probe_containment`] + the all-or-nothing completeness guard,
+    /// this prunes *what is provable* when only SOME live files are fully
+    /// indexed:
+    ///
+    /// * a live file **not** in the indexed-files set is a forced candidate
+    ///   (must scan — we know nothing about it);
+    /// * a live file **in** the indexed-files set can be pruned when some
+    ///   needle term has no posting hit for it.  This is sound because the
+    ///   registry maintains the invariant *"file marked indexed ⇒ every term
+    ///   occurring in any of its rows is present in the posting list with
+    ///   that file's entry"*: `mark_file_indexed` runs only after all of the
+    ///   file's rows passed [`index_row`], and eviction un-marks every file
+    ///   whose terms were dropped (inside the same posting-list critical
+    ///   section).
+    ///
+    /// The posting-list lock is held while the indexed-files snapshot is
+    /// taken, matching the lock order of `index_row`'s evict-then-unmark
+    /// path, so the two structures are observed consistently (a torn view
+    /// could otherwise prune a file whose terms were just evicted).
+    ///
+    /// Returns [`GinScanSet::NoIndex`] when nothing is provable (no posting
+    /// list, unparseable/empty needle); otherwise the ordered subset of
+    /// `live_paths` that must be scanned.  Under-pruning is always safe; the
+    /// scan set never excludes a file that could hold a match.
+    pub fn probe_containment_scan_set(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        col: &str,
+        opclass: &str,
+        needle_bytes: &[u8],
+        live_paths: &[String],
+    ) -> GinScanSet {
+        let needle: Value = match serde_json::from_slice(needle_bytes) {
+            Ok(v) => v,
+            Err(_) => return GinScanSet::NoIndex, // unparseable → conservative
+        };
+        let terms = needle_terms(&needle, opclass);
+        if terms.is_empty() {
+            // Empty needle matches everything — nothing is provable.
+            return GinScanSet::NoIndex;
+        }
+        let arc = match self.get(project, table, col) {
+            Some(a) => a,
+            None => return GinScanSet::NoIndex,
+        };
+        let list = arc.lock().expect("TermPostingList lock poisoned");
+        // Snapshot indexed_files UNDER the posting-list lock (see doc above).
+        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        let indexed: HashSet<String> = match self.indexed_files.lock() {
+            Ok(map) => map.get(&key).cloned().unwrap_or_default(),
+            Err(_) => return GinScanSet::NoIndex,
+        };
+
+        let mut scan: Vec<String> = Vec::with_capacity(live_paths.len());
+        for path in live_paths {
+            if !indexed.contains(path) {
+                // Unknown coverage → forced candidate.
+                scan.push(path.clone());
+                continue;
+            }
+            // Fully indexed: candidate only when EVERY needle term has a
+            // posting hit for this file.  A term absent from the map entirely
+            // provably does not occur in any indexed file (it was never
+            // inserted, or its eviction un-marked the files that had it).
+            let all_terms_hit = terms
+                .iter()
+                .all(|t| list.probe_term(t).is_some_and(|s| s.contains(path.as_str())));
+            if all_terms_hit {
+                scan.push(path.clone());
+            }
+        }
+        GinScanSet::ScanFiles(scan)
     }
 
     /// Remove all posting entries for `file_path` in `(project, table, col)`.
@@ -576,7 +776,7 @@ impl GinIndexRegistry {
                     }
                     Some(entries) => {
                         let files: HashSet<String> =
-                            entries.iter().map(|e| e.file_path.clone()).collect();
+                            entries.iter().map(|f| f.as_ref().to_string()).collect();
                         candidate_files = Some(match candidate_files {
                             None => files,
                             Some(prev) => prev.intersection(&files).cloned().collect(),
@@ -597,8 +797,8 @@ impl GinIndexRegistry {
                 let term = format!("key:{key}");
                 if let Some(entries) = list.probe_term(&term) {
                     all_unknown = false;
-                    for e in entries {
-                        candidate_files.insert(e.file_path.clone());
+                    for f in entries {
+                        candidate_files.insert(f.as_ref().to_string());
                     }
                 }
                 // If the term is unknown (None), we conservatively include all
@@ -690,6 +890,20 @@ pub enum ProbeResult {
     FileCandidates(HashSet<String>),
 }
 
+/// Result of a per-file (partial-coverage) GIN probe — see
+/// [`GinIndexRegistry::probe_containment_scan_set`].
+#[derive(Debug)]
+pub enum GinScanSet {
+    /// Nothing is provable (no posting list / unusable needle).  The caller
+    /// must scan every live file.
+    NoIndex,
+    /// The ordered subset of the supplied live paths that must be scanned:
+    /// un-indexed files (forced) plus indexed files with posting hits for
+    /// every needle term.  May equal the live set (no pruning possible) or be
+    /// empty (no live file can match).
+    ScanFiles(Vec<String>),
+}
+
 // ── Planner detection ─────────────────────────────────────────────────────────
 
 /// Detected GIN containment probe plan.
@@ -779,13 +993,20 @@ pub async fn detect_gin_containment(
     };
     let table = TableName::new(table_name).ok()?;
 
-    // WHERE clause must be `col @> literal` or `col <@ literal`.
+    // WHERE clause must be `col @> literal`.
+    //
+    // `col <@ literal` is deliberately NOT accelerated: the posting probe
+    // AND-merges the literal's terms, which is a necessary condition only for
+    // `@>` (the row must contain every needle term).  For `<@` the row is the
+    // SUBSET side — a matching row need not contain ANY of the literal's
+    // terms (`{} <@ x` is true for every x), so both the Empty short-circuit
+    // and file pruning would drop real matches.  `<@` falls through to the
+    // full scan + `jsonb_contained_by` UDF (correct, just not pruned).
     let (col_name, needle_str, is_contains) = match &select.selection {
         Some(sqlparser::ast::Expr::BinaryOp { left, op, right }) => {
             let op_str = op.to_string();
             let is_contains = op_str == "@>";
-            let is_contained = op_str == "<@";
-            if !is_contains && !is_contained {
+            if !is_contains {
                 return None;
             }
             // LHS must be a bare column reference.
@@ -2965,43 +3186,25 @@ mod tests {
     // ── Phase 5.19.C+ — per-file eviction correctness ───────────────────────
 
     /// Verify that eviction marks only the affected files as un-indexed, not
-    /// the entire column.  Uses a tiny budget so eviction fires immediately.
+    /// the entire column.
+    ///
+    /// We test via the internal TermPostingList directly to avoid needing to
+    /// override the env-var budget (which is process-global).
     #[test]
     fn eviction_marks_only_affected_files_as_unindexed() {
-        // Use a tiny budget: 4 entries. We'll index 3 files × 2 terms each =
-        // 6 entries total, forcing eviction after file 2.
-        //
-        // We test via the internal TermPostingList::evict_oldest directly to
-        // avoid needing to override the env var (which would be global state).
         let mut pl = TermPostingList::new();
+        let f1 = pl.intern_file("f1.parquet");
+        let f2 = pl.intern_file("f2.parquet");
 
-        // Insert terms for f1 (2 entries).
-        pl.entries.entry("term_a".to_string()).or_default().insert(PostingEntry {
-            file_path: "f1.parquet".to_string(), row_group: 0, row: 0,
-        });
-        pl.entries.entry("term_b".to_string()).or_default().insert(PostingEntry {
-            file_path: "f1.parquet".to_string(), row_group: 0, row: 1,
-        });
-        pl.insert_order.extend(["term_a".to_string(), "term_b".to_string()]);
-        pl.total_count = 2;
+        // f1 carries term_a + term_b; f2 carries term_c + term_d.
+        assert!(pl.insert("term_a", &f1).is_empty());
+        assert!(pl.insert("term_b", &f1).is_empty());
+        assert!(pl.insert("term_c", &f2).is_empty());
+        assert!(pl.insert("term_d", &f2).is_empty());
+        assert_eq!(pl.total_count, 4);
 
-        // Insert terms for f2 (2 entries).
-        pl.entries.entry("term_c".to_string()).or_default().insert(PostingEntry {
-            file_path: "f2.parquet".to_string(), row_group: 0, row: 0,
-        });
-        pl.entries.entry("term_d".to_string()).or_default().insert(PostingEntry {
-            file_path: "f2.parquet".to_string(), row_group: 0, row: 1,
-        });
-        pl.insert_order.extend(["term_c".to_string(), "term_d".to_string()]);
-        pl.total_count = 4;
-
-        // Now evict the oldest 25% (1 term at minimum = evict term_a).
-        // term_a was only in f1 → f1 becomes un-indexed.
-        // term_c, term_d are in f2 → f2 stays indexed.
+        // Evict the oldest 25% (1 term = term_a, only in f1).
         let evicted_files = pl.evict_oldest();
-
-        // f1 must be in evicted_files (its term was dropped).
-        // f2 must NOT be in evicted_files (its terms remain).
         assert!(
             evicted_files.contains("f1.parquet"),
             "f1 should be evicted: {evicted_files:?}"
@@ -3010,6 +3213,246 @@ mod tests {
             !evicted_files.contains("f2.parquet"),
             "f2 should NOT be evicted: {evicted_files:?}"
         );
+        assert_eq!(pl.total_count, 3, "one posting pair dropped");
+    }
+
+    /// The budget counts DISTINCT (term, file) pairs: re-inserting the same
+    /// pair (re-index, or another row of the same file with the same term)
+    /// must not inflate total_count — the old accounting counted every insert
+    /// and burned the budget ~rows× faster than actual memory growth.
+    #[test]
+    fn posting_accounting_dedupes_pairs() {
+        let mut pl = TermPostingList::new();
+        let f1 = pl.intern_file("f1.parquet");
+        for _ in 0..1000 {
+            pl.insert("key:tag", &f1);
+            pl.insert("kv:tag=\"a\"", &f1);
+        }
+        assert_eq!(pl.total_count, 2, "1000 rows × 2 shared terms = 2 pairs");
+        let f2 = pl.intern_file("f2.parquet");
+        pl.insert("key:tag", &f2);
+        assert_eq!(pl.total_count, 3);
+    }
+
+    /// remove_file keeps the pair accounting in sync.
+    #[test]
+    fn remove_file_decrements_pair_count() {
+        let mut pl = TermPostingList::new();
+        let f1 = pl.intern_file("f1.parquet");
+        let f2 = pl.intern_file("f2.parquet");
+        pl.insert("t1", &f1);
+        pl.insert("t1", &f2);
+        pl.insert("t2", &f1);
+        assert_eq!(pl.total_count, 3);
+        pl.remove_file("f1.parquet");
+        assert_eq!(pl.total_count, 1);
+        assert!(pl.probe_term("t1").is_some_and(|s| s.contains("f2.parquet")));
+        assert!(pl.probe_term("t2").is_some_and(|s| s.is_empty()));
+    }
+
+    // ── Phase 5.19.F — per-file partial-coverage scan set ────────────────────
+
+    /// With one file fully indexed and one file un-indexed, the scan set must
+    /// (a) force the un-indexed file in, and (b) prune the indexed file when
+    /// a needle term has no posting hit for it.
+    #[test]
+    fn scan_set_prunes_indexed_misses_and_forces_unindexed() {
+        let registry = GinIndexRegistry::new();
+        let project = ProjectId::new();
+        let table = TableName::new("t").unwrap();
+
+        // f1: fully indexed, contains {"role":"admin"}.
+        registry.index_row(
+            &project, &table, "payload", "jsonb_ops",
+            br#"{"role":"admin"}"#, "f1.parquet", 0, 0,
+        );
+        registry.mark_file_indexed(&project, &table, "payload", "f1.parquet");
+        // f2: fully indexed, contains {"role":"user"}.
+        registry.index_row(
+            &project, &table, "payload", "jsonb_ops",
+            br#"{"role":"user"}"#, "f2.parquet", 0, 0,
+        );
+        registry.mark_file_indexed(&project, &table, "payload", "f2.parquet");
+        // f3: NOT marked indexed (e.g. written before the index existed).
+
+        let live = vec![
+            "f1.parquet".to_string(),
+            "f2.parquet".to_string(),
+            "f3.parquet".to_string(),
+        ];
+        let scan = registry.probe_containment_scan_set(
+            &project, &table, "payload", "jsonb_ops", br#"{"role":"admin"}"#, &live,
+        );
+        match scan {
+            GinScanSet::ScanFiles(files) => {
+                assert!(files.contains(&"f1.parquet".to_string()), "hit kept: {files:?}");
+                assert!(
+                    !files.contains(&"f2.parquet".to_string()),
+                    "indexed miss pruned: {files:?}"
+                );
+                assert!(
+                    files.contains(&"f3.parquet".to_string()),
+                    "un-indexed file forced: {files:?}"
+                );
+            }
+            other => panic!("expected ScanFiles, got {other:?}"),
+        }
+    }
+
+    /// A needle term that was never indexed prunes every fully-indexed file
+    /// (the term provably does not occur in them) while still forcing
+    /// un-indexed files into the scan set.
+    #[test]
+    fn scan_set_absent_term_prunes_only_indexed_files() {
+        let registry = GinIndexRegistry::new();
+        let project = ProjectId::new();
+        let table = TableName::new("t").unwrap();
+
+        registry.index_row(
+            &project, &table, "payload", "jsonb_ops",
+            br#"{"role":"admin"}"#, "f1.parquet", 0, 0,
+        );
+        registry.mark_file_indexed(&project, &table, "payload", "f1.parquet");
+
+        let live = vec!["f1.parquet".to_string(), "f2.parquet".to_string()];
+        let scan = registry.probe_containment_scan_set(
+            &project, &table, "payload", "jsonb_ops", br#"{"zzz":"nope"}"#, &live,
+        );
+        match scan {
+            GinScanSet::ScanFiles(files) => {
+                assert_eq!(
+                    files,
+                    vec!["f2.parquet".to_string()],
+                    "indexed f1 pruned (term provably absent), un-indexed f2 forced"
+                );
+            }
+            other => panic!("expected ScanFiles, got {other:?}"),
+        }
+    }
+
+    /// After eviction un-marks a file, the scan set must treat it as a
+    /// forced candidate even when the (stale) probe would have pruned it.
+    #[test]
+    fn scan_set_evicted_file_is_forced_candidate() {
+        let registry = GinIndexRegistry::new();
+        let project = ProjectId::new();
+        let table = TableName::new("t").unwrap();
+
+        registry.index_row(
+            &project, &table, "payload", "jsonb_ops",
+            br#"{"role":"admin"}"#, "f1.parquet", 0, 0,
+        );
+        registry.mark_file_indexed(&project, &table, "payload", "f1.parquet");
+
+        // Simulate eviction of f1's terms: evict_oldest via direct access,
+        // then un-mark as index_row would.
+        {
+            let arc = registry.get(&project, &table, "payload").unwrap();
+            let mut list = arc.lock().unwrap();
+            // Evict everything (4 rounds of 25% on a 2-term list).
+            let mut evicted: HashSet<String> = HashSet::new();
+            while !list.insert_order.is_empty() {
+                evicted.extend(list.evict_oldest());
+            }
+            assert!(evicted.contains("f1.parquet"));
+            drop(list);
+            let key = RegKey {
+                project,
+                table: table.clone(),
+                col: "payload".to_string(),
+            };
+            let mut map = registry.indexed_files.lock().unwrap();
+            map.get_mut(&key).unwrap().remove("f1.parquet");
+        }
+
+        let live = vec!["f1.parquet".to_string()];
+        let scan = registry.probe_containment_scan_set(
+            &project, &table, "payload", "jsonb_ops", br#"{"role":"admin"}"#, &live,
+        );
+        match scan {
+            GinScanSet::ScanFiles(files) => {
+                assert_eq!(files, live, "evicted file must be scanned");
+            }
+            other => panic!("expected ScanFiles, got {other:?}"),
+        }
+    }
+
+    // ── needle_terms necessary-condition tests ───────────────────────────────
+
+    /// Nested-object needle values must NOT emit an exact `kv:` term: the doc
+    /// `{"a":{"x":1,"y":2}}` contains the needle `{"a":{"x":1}}` but carries
+    /// `kv:a={"x":1,"y":2}` — an exact-value probe term would prune it.
+    #[test]
+    fn needle_terms_nested_object_skips_exact_kv() {
+        let needle = json!({"a": {"x": 1}});
+        let terms = needle_terms(&needle, "jsonb_ops");
+        assert!(terms.contains(&"key:a".to_string()), "terms={terms:?}");
+        assert!(terms.contains(&"key:x".to_string()), "terms={terms:?}");
+        assert!(terms.contains(&"kv:x=1".to_string()), "terms={terms:?}");
+        assert!(
+            !terms.iter().any(|t| t.starts_with("kv:a=")),
+            "exact kv for an object value is not a necessary condition: {terms:?}"
+        );
+
+        // Verify end-to-end: a superset doc stays a candidate.
+        let registry = GinIndexRegistry::new();
+        let project = ProjectId::new();
+        let table = TableName::new("t").unwrap();
+        registry.index_row(
+            &project, &table, "payload", "jsonb_ops",
+            br#"{"a":{"x":1,"y":2}}"#, "f1.parquet", 0, 0,
+        );
+        let result = registry.probe_containment(
+            &project, &table, "payload", "jsonb_ops", br#"{"a":{"x":1}}"#,
+        );
+        match result {
+            ProbeResult::FileCandidates(files) => {
+                assert!(files.contains("f1.parquet"), "superset doc kept: {files:?}");
+            }
+            other => panic!("superset doc must stay a candidate, got {other:?}"),
+        }
+    }
+
+    /// Array needle values: only the key-presence term is necessary.
+    #[test]
+    fn needle_terms_array_value_key_presence_only() {
+        let needle = json!({"tags": [1, 2]});
+        let terms = needle_terms(&needle, "jsonb_ops");
+        assert_eq!(terms, vec!["key:tags".to_string()], "terms={terms:?}");
+
+        // jsonb_path_ops: no scalar leaf → no terms → probe falls back.
+        let terms_po = needle_terms(&needle, "jsonb_path_ops");
+        assert!(terms_po.is_empty(), "terms={terms_po:?}");
+    }
+
+    /// The eviction warning latch flips exactly once per posting list.
+    #[test]
+    fn eviction_warn_latch_set_once() {
+        let registry = GinIndexRegistry::new();
+        let project = ProjectId::new();
+        let table = TableName::new("t").unwrap();
+        registry.index_row(
+            &project, &table, "payload", "jsonb_ops",
+            br#"{"a":1}"#, "f1.parquet", 0, 0,
+        );
+        assert!(!registry.has_evicted(&project, &table, "payload"));
+
+        let arc = registry.get(&project, &table, "payload").unwrap();
+        {
+            let mut list = arc.lock().unwrap();
+            assert!(!list.eviction_warned);
+            // Simulate what index_row does when eviction fires.
+            list.eviction_warned = true;
+        }
+        assert!(registry.has_evicted(&project, &table, "payload"));
+        // Latch stays set; a second "fire" does not reset it.
+        {
+            let mut list = arc.lock().unwrap();
+            let already = list.eviction_warned;
+            assert!(already, "latch must stay set");
+            list.eviction_warned = true;
+        }
+        assert!(registry.has_evicted(&project, &table, "payload"));
     }
 
     /// Verify that after eviction, the registry's indexed_files set loses only

@@ -4691,25 +4691,63 @@ impl ScalarUDFImpl for JsonbContainsUdf {
             return exec_err!("jsonb_contains expects 2 arguments, got {}", args.len());
         }
         let n = row_count(args);
+        // The needle (`x @> 'literal'`) is almost always a scalar constant —
+        // parse it ONCE (lazily, on the first non-null doc row, preserving
+        // the old "null doc rows never touch the needle" behaviour) instead
+        // of per row: 1M-row scans were re-parsing the same literal a
+        // million times.
+        let needle_is_scalar = matches!(&args[1], ColumnarValue::Scalar(_));
         let left_arr = args[0].clone().into_array(n)?;
         let right_arr = args[1].clone().into_array(n)?;
+        let mut scalar_needle: Option<Option<Value>> = None;
         let mut out: Vec<Option<bool>> = Vec::with_capacity(n);
         for i in 0..n {
-            let left = match extract_jsonb_value(&left_arr, i, "jsonb_contains")? {
-                Some(v) => v,
-                None => {
-                    out.push(None);
-                    continue;
-                }
+            // Null doc → NULL result, needle untouched (matches the old
+            // left-first evaluation order).
+            let doc_bytes = extract_jsonb_bytes(&left_arr, i, "jsonb_contains")?;
+            let Some(bytes) = doc_bytes else {
+                out.push(None);
+                continue;
             };
-            let right = match extract_jsonb_value(&right_arr, i, "jsonb_contains")? {
-                Some(v) => v,
-                None => {
-                    out.push(None);
-                    continue;
+
+            // Resolve the needle: borrow the (lazily) pre-parsed scalar, or
+            // parse the row's value for the rare column-vs-column form.
+            let row_needle: Option<Value> = if needle_is_scalar {
+                if scalar_needle.is_none() {
+                    scalar_needle =
+                        Some(extract_jsonb_value(&right_arr, i, "jsonb_contains")?);
                 }
+                None
+            } else {
+                extract_jsonb_value(&right_arr, i, "jsonb_contains")?
             };
-            out.push(Some(json_contains(&left, &right)));
+            let needle_ref: Option<&Value> = match &scalar_needle {
+                Some(v) => v.as_ref(),
+                None => row_needle.as_ref(),
+            };
+            let Some(needle) = needle_ref else {
+                out.push(None);
+                continue;
+            };
+
+            // Lazy fast path: answer containment from the raw document bytes
+            // without building its Value tree.  Falls back to the full-parse
+            // reference path on any uncertainty (Err) — including top-level
+            // type mismatches, so behaviour on malformed input matches the
+            // old implementation (which parsed and errored).
+            match raw_contains(bytes, needle) {
+                Ok(contains) => out.push(Some(contains)),
+                Err(()) => {
+                    let left = match extract_jsonb_value(&left_arr, i, "jsonb_contains")? {
+                        Some(v) => v,
+                        None => {
+                            out.push(None);
+                            continue;
+                        }
+                    };
+                    out.push(Some(json_contains(&left, needle)));
+                }
+            }
         }
         let result = BooleanArray::from(out);
         Ok(ColumnarValue::Array(Arc::new(result)))
@@ -4726,6 +4764,220 @@ fn json_contains(left: &Value, right: &Value) -> bool {
             .iter()
             .all(|rv| la.iter().any(|lv| json_contains(lv, rv))),
         (l, r) => l == r,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lazy raw-bytes containment (`@>` without building the document Value tree)
+// ---------------------------------------------------------------------------
+//
+// `json_contains` requires the WHOLE document parsed into a `serde_json::
+// Value` (every Map/Vec/String node allocated) even though a typical `@>`
+// needle touches one or two top-level keys.  `raw_contains` answers the same
+// question by walking the document bytes with the `RawJson` scanner
+// machinery (skip_value / parse_string / scan loops) and only materialising
+// the parsed NEEDLE (tiny, usually a per-query constant):
+//
+//   * needle object  → single pass over the doc's members; member values for
+//     needle keys are located as raw slices (duplicate keys: LAST occurrence
+//     wins, matching serde_json's map semantics) and recursed into;
+//   * needle array   → doc element slices collected once, then each needle
+//     element must be contained in some doc element (needle arrays are tiny;
+//     the quadratic worst case is bounded by the needle);
+//   * needle string  → doc token unescaped via `parse_string` and compared
+//     (so `"é"` matches `"é"` exactly as the parsed path does);
+//   * needle number  → the doc's number TOKEN is parsed by serde_json and
+//     compared with `Number == Number`.  This deliberately mirrors the
+//     reference path bit-for-bit: serde keeps `1` (u64) and `1.0` (f64)
+//     distinct, so byte-comparison of tokens would be wrong in the other
+//     direction too (e.g. `1e2` vs `100`); parsing the one token keeps the
+//     allocation bounded and the semantics identical;
+//   * needle bool/null → literal token compare.
+//
+// Any structural surprise returns `Err(())` and the caller falls back to the
+// full-parse path, including a TOP-LEVEL type mismatch: the fast path never
+// validated the whole document in that case, and the reference path errors
+// on malformed input where we would otherwise silently return `false`.
+// Nested mismatches return `Ok(false)` — by then the scanned portion of the
+// document is structurally validated, matching the reference result exactly.
+//
+// Equivalence with `json_contains` over the full adversarial battery is
+// asserted by `raw_contains_matches_serde_reference` (unit tests below).
+
+/// Raw-bytes `doc @> needle`.  `doc_bytes` is a stored JSONB cell (any
+/// version tag) or JSON literal text; `needle` is the parsed RHS.
+/// `Err(())` → caller must fall back to the full-parse path.
+fn raw_contains(doc_bytes: &[u8], needle: &Value) -> Result<bool, ()> {
+    let doc = RawJson::new(doc_bytes);
+    let b = doc.b;
+    let mut p = 0usize;
+    skip_ws(b, &mut p);
+    // Strict at the top level: a type mismatch falls back so the reference
+    // path decides (and reports malformed documents identically).
+    let matches_type = match (type_at(b, p), needle) {
+        (Some(RawType::Object), Value::Object(_)) => true,
+        (Some(RawType::Array), Value::Array(_)) => true,
+        (Some(RawType::String), Value::String(_)) => true,
+        (Some(RawType::Number), Value::Number(_)) => true,
+        (Some(RawType::Bool), Value::Bool(_)) => true,
+        (Some(RawType::Null), Value::Null) => true,
+        _ => false,
+    };
+    if !matches_type {
+        return Err(());
+    }
+    raw_contains_slice(&b[p..], needle)
+}
+
+/// Core recursion: does the single JSON value starting at `slice[0..]`
+/// contain `needle`?  `slice` must begin (possibly after whitespace) with a
+/// well-formed JSON value; trailing bytes beyond that value are ignored
+/// (slices produced by `skip_value` are exact).
+fn raw_contains_slice(slice: &[u8], needle: &Value) -> Result<bool, ()> {
+    let mut p = 0usize;
+    skip_ws(slice, &mut p);
+    match needle {
+        Value::Object(nm) => {
+            if slice.get(p) != Some(&b'{') {
+                return Ok(false);
+            }
+            p += 1;
+            skip_ws(slice, &mut p);
+            // Located raw value slice per needle key (last occurrence wins).
+            let mut found: Vec<Option<(usize, usize)>> = vec![None; nm.len()];
+            if slice.get(p) != Some(&b'}') {
+                loop {
+                    skip_ws(slice, &mut p);
+                    if slice.get(p) != Some(&b'"') {
+                        return Err(());
+                    }
+                    // Key match: escape-free key tokens compare byte-wise
+                    // (no per-key String allocation); tokens containing a
+                    // backslash go through the full unescaping parser.
+                    let kstart = p + 1;
+                    let mut q = kstart;
+                    let escaped = loop {
+                        match slice.get(q) {
+                            None => return Err(()),
+                            Some(&b'\\') => break true,
+                            Some(&b'"') => break false,
+                            _ => q += 1,
+                        }
+                    };
+                    let key_idx: Option<usize> = if escaped {
+                        let ks = parse_string(slice, &mut p)?;
+                        nm.keys().position(|k| k == &ks)
+                    } else {
+                        let kb = &slice[kstart..q];
+                        p = q + 1;
+                        nm.keys().position(|k| k.as_bytes() == kb)
+                    };
+                    skip_ws(slice, &mut p);
+                    if slice.get(p) != Some(&b':') {
+                        return Err(());
+                    }
+                    p += 1;
+                    skip_ws(slice, &mut p);
+                    let start = p;
+                    skip_value(slice, &mut p)?;
+                    if let Some(idx) = key_idx {
+                        found[idx] = Some((start, p));
+                    }
+                    skip_ws(slice, &mut p);
+                    match slice.get(p) {
+                        Some(&b',') => p += 1,
+                        Some(&b'}') => break,
+                        _ => return Err(()),
+                    }
+                }
+            }
+            // Every needle pair must be present and contained.
+            for (idx, (_k, nv)) in nm.iter().enumerate() {
+                match found[idx] {
+                    None => return Ok(false),
+                    Some((s, e)) => {
+                        if !raw_contains_slice(&slice[s..e], nv)? {
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
+            Ok(true)
+        }
+        Value::Array(na) => {
+            if slice.get(p) != Some(&b'[') {
+                return Ok(false);
+            }
+            p += 1;
+            skip_ws(slice, &mut p);
+            // Collect doc element spans in one structural pass.
+            let mut spans: Vec<(usize, usize)> = Vec::new();
+            if slice.get(p) != Some(&b']') {
+                loop {
+                    skip_ws(slice, &mut p);
+                    let start = p;
+                    skip_value(slice, &mut p)?;
+                    spans.push((start, p));
+                    skip_ws(slice, &mut p);
+                    match slice.get(p) {
+                        Some(&b',') => p += 1,
+                        Some(&b']') => break,
+                        _ => return Err(()),
+                    }
+                }
+            }
+            // Every needle element must be contained in SOME doc element.
+            for nv in na {
+                let mut hit = false;
+                for &(s, e) in &spans {
+                    if raw_contains_slice(&slice[s..e], nv)? {
+                        hit = true;
+                        break;
+                    }
+                }
+                if !hit {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Value::String(ns) => {
+            if slice.get(p) != Some(&b'"') {
+                return Ok(false);
+            }
+            let s = parse_string(slice, &mut p)?;
+            Ok(&s == ns)
+        }
+        Value::Number(nn) => {
+            if !matches!(type_at(slice, p), Some(RawType::Number)) {
+                return Ok(false);
+            }
+            let start = p;
+            skip_number(slice, &mut p);
+            // Parse only the bounded number token; `Number == Number` is the
+            // exact comparison the reference path performs.
+            let v: Value = serde_json::from_slice(&slice[start..p]).map_err(|_| ())?;
+            Ok(matches!(&v, Value::Number(dn) if dn == nn))
+        }
+        Value::Bool(nb) => match slice.get(p) {
+            Some(&b't') => {
+                skip_lit(slice, &mut p, b"true")?;
+                Ok(*nb)
+            }
+            Some(&b'f') => {
+                skip_lit(slice, &mut p, b"false")?;
+                Ok(!*nb)
+            }
+            _ => Ok(false),
+        },
+        Value::Null => {
+            if slice.get(p) == Some(&b'n') {
+                skip_lit(slice, &mut p, b"null")?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
     }
 }
 
@@ -6880,5 +7132,334 @@ mod perf_bench {
             speedup > 1.0,
             "Phase 2 offset table should be faster than scanner for last-key lookup: {speedup:.2}x"
         );
+    }
+}
+
+#[cfg(test)]
+mod raw_contains_tests {
+    use super::*;
+
+    /// Assert that `raw_contains` agrees with the serde reference
+    /// (`json_contains`) for `doc @> needle`.  The fast path may refuse
+    /// (`Err`) ONLY on a top-level structural type mismatch — production
+    /// falls back to the reference path there, so refusal is correct; for
+    /// same-shape pairs it must answer, and the answer must match.
+    fn assert_parity(doc: &str, needle: &str) {
+        let dv: Value = serde_json::from_str(doc)
+            .unwrap_or_else(|e| panic!("bad doc {doc:?}: {e}"));
+        let nv: Value = serde_json::from_str(needle)
+            .unwrap_or_else(|e| panic!("bad needle {needle:?}: {e}"));
+        let expected = json_contains(&dv, &nv);
+        match raw_contains(doc.as_bytes(), &nv) {
+            Ok(got) => assert_eq!(
+                got, expected,
+                "raw_contains disagrees with serde reference: doc={doc} needle={needle}"
+            ),
+            Err(()) => {
+                let mismatch = std::mem::discriminant(&dv) != std::mem::discriminant(&nv);
+                assert!(
+                    mismatch,
+                    "raw_contains refused a same-shape pair: doc={doc} needle={needle}"
+                );
+            }
+        }
+        // The 0x01 (PG wire tag) framing must behave identically.
+        let mut tagged = vec![0x01u8];
+        tagged.extend_from_slice(doc.as_bytes());
+        match raw_contains(&tagged, &nv) {
+            Ok(got) => assert_eq!(got, expected, "0x01-tagged parity: doc={doc} needle={needle}"),
+            Err(()) => {
+                let mismatch = std::mem::discriminant(&dv) != std::mem::discriminant(&nv);
+                assert!(mismatch, "tagged refusal on same-shape pair: doc={doc}");
+            }
+        }
+    }
+
+    #[test]
+    fn raw_contains_flat_object_battery() {
+        // The benchmark shape: flat object needles.
+        assert_parity(r#"{"tag":"a","n":1}"#, r#"{"tag":"a"}"#);
+        assert_parity(r#"{"tag":"a","n":1}"#, r#"{"tag":"b"}"#);
+        assert_parity(r#"{"tag":"a","n":1}"#, r#"{"tag":"a","n":1}"#);
+        assert_parity(r#"{"tag":"a","n":1}"#, r#"{"tag":"a","n":2}"#);
+        assert_parity(r#"{"tag":"a","n":1}"#, r#"{"missing":"x"}"#);
+        assert_parity(r#"{"tag":"a"}"#, r#"{}"#); // empty needle matches
+        assert_parity(r#"{}"#, r#"{}"#);
+        assert_parity(r#"{}"#, r#"{"a":1}"#);
+        // Whitespace-laden doc (non-canonical input must still work).
+        assert_parity("{ \"a\" : 1 ,\n\t\"b\" : \"x\" }", r#"{"b":"x"}"#);
+        // Duplicate keys in the doc: serde maps are last-wins.
+        assert_parity(r#"{"a":1,"a":2}"#, r#"{"a":2}"#);
+        assert_parity(r#"{"a":1,"a":2}"#, r#"{"a":1}"#);
+        // Value type confusion.
+        assert_parity(r#"{"a":"1"}"#, r#"{"a":1}"#);
+        assert_parity(r#"{"a":1}"#, r#"{"a":"1"}"#);
+        assert_parity(r#"{"a":true}"#, r#"{"a":"true"}"#);
+        assert_parity(r#"{"a":null}"#, r#"{"a":null}"#);
+        assert_parity(r#"{"a":null}"#, r#"{"a":false}"#);
+        assert_parity(r#"{"a":false}"#, r#"{"a":false}"#);
+        assert_parity(r#"{"a":false}"#, r#"{"a":true}"#);
+    }
+
+    #[test]
+    fn raw_contains_nested_objects_recursive_subset() {
+        // Nested containment is recursive subset, NOT byte equality.
+        assert_parity(r#"{"a":{"x":1,"y":2}}"#, r#"{"a":{"x":1}}"#);
+        assert_parity(r#"{"a":{"x":1,"y":2}}"#, r#"{"a":{"x":1,"y":2}}"#);
+        assert_parity(r#"{"a":{"x":1,"y":2}}"#, r#"{"a":{"z":3}}"#);
+        assert_parity(r#"{"a":{"x":1,"y":2}}"#, r#"{"a":{}}"#);
+        assert_parity(r#"{"a":{"x":{"deep":[1,2]}},"b":0}"#, r#"{"a":{"x":{"deep":[2]}}}"#);
+        assert_parity(r#"{"a":{"x":1}}"#, r#"{"a":1}"#); // object vs scalar
+        assert_parity(r#"{"a":1}"#, r#"{"a":{"x":1}}"#); // scalar vs object
+        assert_parity(r#"{"a":{"b":{"c":{"d":null}}}}"#, r#"{"a":{"b":{"c":{"d":null}}}}"#);
+        assert_parity(r#"{"a":{"b":{"c":{"d":null}}}}"#, r#"{"a":{"b":{"c":{"d":0}}}}"#);
+    }
+
+    #[test]
+    fn raw_contains_arrays_element_subset() {
+        assert_parity(r#"{"t":[1,2,3]}"#, r#"{"t":[1,2]}"#);
+        assert_parity(r#"{"t":[1,2,3]}"#, r#"{"t":[3,1]}"#);
+        assert_parity(r#"{"t":[1,2,3]}"#, r#"{"t":[4]}"#);
+        assert_parity(r#"{"t":[1,2,3]}"#, r#"{"t":[]}"#);
+        assert_parity(r#"{"t":[]}"#, r#"{"t":[]}"#);
+        assert_parity(r#"{"t":[]}"#, r#"{"t":[1]}"#);
+        // Arrays of objects: element containment is recursive.
+        assert_parity(
+            r#"{"t":[{"k":1,"x":9},{"k":2}]}"#,
+            r#"{"t":[{"k":1}]}"#,
+        );
+        assert_parity(
+            r#"{"t":[{"k":1,"x":9},{"k":2}]}"#,
+            r#"{"t":[{"k":3}]}"#,
+        );
+        // Duplicate needle elements; nested arrays.
+        assert_parity(r#"{"t":[[1,2],[3]]}"#, r#"{"t":[[1]]}"#);
+        assert_parity(r#"{"t":[[1,2],[3]]}"#, r#"{"t":[[4]]}"#);
+        assert_parity(r#"{"t":[1,1]}"#, r#"{"t":[1,1,1]}"#);
+        // Top-level arrays.
+        assert_parity(r#"[1,2,3]"#, r#"[2]"#);
+        assert_parity(r#"[1,2,3]"#, r#"[5]"#);
+        assert_parity(r#"[{"a":1,"b":2}]"#, r#"[{"a":1}]"#);
+        // Mixed scalar/array confusion (engine semantics: l == r → false).
+        assert_parity(r#"{"t":[1,2]}"#, r#"{"t":1}"#);
+        assert_parity(r#"{"t":1}"#, r#"{"t":[1]}"#);
+    }
+
+    #[test]
+    fn raw_contains_number_tokens() {
+        // serde keeps u64 / i64 / f64 reprs distinct: 1 != 1.0.  The fast
+        // path parses the doc's number TOKEN with serde and compares
+        // Number == Number, so it inherits the exact reference semantics.
+        assert_parity(r#"{"n":1}"#, r#"{"n":1}"#);
+        assert_parity(r#"{"n":1}"#, r#"{"n":1.0}"#);
+        assert_parity(r#"{"n":1.0}"#, r#"{"n":1}"#);
+        assert_parity(r#"{"n":1.0}"#, r#"{"n":1.0}"#);
+        assert_parity(r#"{"n":1.5}"#, r#"{"n":1.5}"#);
+        assert_parity(r#"{"n":100}"#, r#"{"n":1e2}"#);
+        assert_parity(r#"{"n":1e2}"#, r#"{"n":100}"#);
+        assert_parity(r#"{"n":1e2}"#, r#"{"n":1E2}"#);
+        assert_parity(r#"{"n":-0}"#, r#"{"n":0}"#);
+        assert_parity(r#"{"n":0}"#, r#"{"n":-0}"#);
+        assert_parity(r#"{"n":-1}"#, r#"{"n":-1}"#);
+        assert_parity(r#"{"n":9223372036854775807}"#, r#"{"n":9223372036854775807}"#);
+        assert_parity(r#"{"n":18446744073709551615}"#, r#"{"n":18446744073709551615}"#);
+        assert_parity(r#"{"n":0.1}"#, r#"{"n":0.1}"#);
+        assert_parity(r#"{"n":0.30000000000000004}"#, r#"{"n":0.3}"#);
+    }
+
+    #[test]
+    fn raw_contains_unicode_and_escapes() {
+        // Escaped vs raw forms of the same string must compare equal — the
+        // fast path unescapes the doc token via parse_string.  Raw strings
+        // keep the backslash-u sequences literal in the JSON text, so each
+        // pair really is escaped-JSON vs raw-UTF-8.
+        assert_parity(r#"{"s":"\u00e9"}"#, r#"{"s":"é"}"#);
+        assert_parity(r#"{"s":"é"}"#, r#"{"s":"\u00e9"}"#);
+        assert_parity(r#"{"s":"caf\u00e9 \u2603"}"#, r#"{"s":"café ☃"}"#);
+        // Surrogate pair: \ud83d\ude00 == U+1F600.
+        assert_parity(r#"{"s":"\ud83d\ude00"}"#, r#"{"s":"😀"}"#);
+        assert_parity(r#"{"s":"😀"}"#, r#"{"s":"\ud83d\ude00"}"#);
+        assert_parity(r#"{"s":"\ud83d\ude00"}"#, r#"{"s":"😁"}"#); // mismatch
+        assert_parity(r#"{"s":"a\"b\\c"}"#, r#"{"s":"a\"b\\c"}"#);
+        assert_parity(r#"{"s":"line\nbreak\ttab"}"#, r#"{"s":"line\nbreak\ttab"}"#);
+        assert_parity(r#"{"s":"\/slash"}"#, r#"{"s":"/slash"}"#);
+        // Escaped keys must match raw needle keys and vice versa.
+        assert_parity(r#"{"k\u00e9y":"v"}"#, r#"{"kéy":"v"}"#);
+        assert_parity(r#"{"kéy":"v"}"#, r#"{"k\u00e9y":"v"}"#);
+        assert_parity(r#"{"na\u00efve":"résumé"}"#, r#"{"naïve":"r\u00e9sum\u00e9"}"#);
+        // Unicode in nested structures.
+        assert_parity(r#"{"a":{"\u65e5\u672c":"\u8a9e"}}"#, r#"{"a":{"日本":"語"}}"#);
+        assert_parity(r#"{"a":{"日本":"語"}}"#, r#"{"a":{"\u65e5\u672c":"\u8aa4"}}"#);
+    }
+
+    #[test]
+    fn raw_contains_top_level_shapes() {
+        // Scalar roots and cross-type roots (the fast path refuses
+        // mismatches; assert_parity validates the refusal rule).
+        assert_parity(r#""hello""#, r#""hello""#);
+        assert_parity(r#""hello""#, r#""world""#);
+        assert_parity(r#"42"#, r#"42"#);
+        assert_parity(r#"42"#, r#"43"#);
+        assert_parity(r#"true"#, r#"true"#);
+        assert_parity(r#"true"#, r#"false"#);
+        assert_parity(r#"null"#, r#"null"#);
+        assert_parity(r#"{"a":1}"#, r#"[1]"#);
+        assert_parity(r#"[1]"#, r#"{"a":1}"#);
+        assert_parity(r#""1""#, r#"1"#);
+        assert_parity(r#"null"#, r#"false"#);
+    }
+
+    #[test]
+    fn raw_contains_v2_offset_table_docs() {
+        // ADR 0027 Phase 2 (0x02) encoded docs route through RawJson::new's
+        // header skip; containment must agree with the bare-JSON reference.
+        let cases = [
+            (r#"{"tag":"a","n":1,"nested":{"x":[1,2]}}"#, r#"{"tag":"a"}"#),
+            (r#"{"tag":"a","n":1,"nested":{"x":[1,2]}}"#, r#"{"nested":{"x":[2]}}"#),
+            (r#"{"tag":"a","n":1,"nested":{"x":[1,2]}}"#, r#"{"tag":"b"}"#),
+            (r#"{"tag":"a","n":1}"#, r#"{"n":1}"#),
+        ];
+        for (doc, needle) in cases {
+            let dv: Value = serde_json::from_str(doc).unwrap();
+            let nv: Value = serde_json::from_str(needle).unwrap();
+            let expected = json_contains(&dv, &nv);
+            let encoded = crate::dml::encode_jsonb_v2(doc.as_bytes())
+                .expect("v2 encode");
+            match raw_contains(&encoded, &nv) {
+                Ok(got) => assert_eq!(got, expected, "v2 parity: doc={doc} needle={needle}"),
+                Err(()) => panic!("v2 fast path refused object/object pair: doc={doc}"),
+            }
+        }
+    }
+
+    #[test]
+    fn raw_contains_malformed_doc_refuses() {
+        let nv: Value = serde_json::from_str(r#"{"a":1}"#).unwrap();
+        // Structurally broken docs must Err (fall back), never Ok(false/true).
+        for bad in [
+            "{\"a\":1",          // unterminated object
+            "{\"a\" 1}",         // missing colon
+            "{\"a\":1,}",        // trailing comma (serde rejects)
+            "{a:1}",             // unquoted key
+            "",                  // empty
+            "@@@@",              // garbage
+        ] {
+            match raw_contains(bad.as_bytes(), &nv) {
+                Err(()) => {}
+                Ok(got) => {
+                    // Acceptable ONLY if serde also parses it (it should not).
+                    assert!(
+                        serde_json::from_str::<Value>(bad).is_ok(),
+                        "fast path answered {got} on malformed doc {bad:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Proptest-style randomized equivalence: generate doc/needle pairs from
+    /// a deterministic LCG (no new deps) and assert raw == serde for every
+    /// pair.  Needles are biased toward true-subsets of the doc so both
+    /// outcomes are exercised.
+    #[test]
+    fn raw_contains_matches_serde_reference_randomized() {
+        struct Lcg(u64);
+        impl Lcg {
+            fn next(&mut self) -> u64 {
+                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                self.0 >> 33
+            }
+            fn pick(&mut self, n: usize) -> usize {
+                (self.next() % n as u64) as usize
+            }
+        }
+
+        fn gen_scalar(rng: &mut Lcg) -> Value {
+            match rng.pick(8) {
+                0 => Value::Null,
+                1 => Value::Bool(rng.pick(2) == 0),
+                2 => serde_json::json!(rng.pick(5) as i64 - 2),
+                3 => serde_json::json!(rng.pick(3) as f64 + 0.5),
+                4 => serde_json::json!(1.0),
+                5 => Value::String(["a", "é", "x\ny", "😀", ""][rng.pick(5)].to_string()),
+                6 => serde_json::json!(1),
+                _ => Value::String(format!("s{}", rng.pick(4))),
+            }
+        }
+
+        fn gen_value(rng: &mut Lcg, depth: usize) -> Value {
+            if depth == 0 {
+                return gen_scalar(rng);
+            }
+            match rng.pick(4) {
+                0 => {
+                    let mut m = serde_json::Map::new();
+                    for _ in 0..rng.pick(4) {
+                        m.insert(format!("k{}", rng.pick(5)), gen_value(rng, depth - 1));
+                    }
+                    Value::Object(m)
+                }
+                1 => {
+                    let mut a = Vec::new();
+                    for _ in 0..rng.pick(4) {
+                        a.push(gen_value(rng, depth - 1));
+                    }
+                    Value::Array(a)
+                }
+                _ => gen_scalar(rng),
+            }
+        }
+
+        /// Derive a needle biased toward being contained in `v`.
+        fn gen_needle(rng: &mut Lcg, v: &Value, depth: usize) -> Value {
+            if depth == 0 || rng.pick(4) == 0 {
+                return gen_value(rng, 1); // independent (likely-false) needle
+            }
+            match v {
+                Value::Object(m) if !m.is_empty() => {
+                    let mut out = serde_json::Map::new();
+                    for (k, mv) in m.iter() {
+                        if rng.pick(2) == 0 {
+                            out.insert(k.clone(), gen_needle(rng, mv, depth - 1));
+                        }
+                    }
+                    Value::Object(out)
+                }
+                Value::Array(a) if !a.is_empty() => {
+                    let mut out = Vec::new();
+                    for av in a.iter() {
+                        if rng.pick(3) == 0 {
+                            out.push(gen_needle(rng, av, depth - 1));
+                        }
+                    }
+                    Value::Array(out)
+                }
+                other => other.clone(),
+            }
+        }
+
+        let mut rng = Lcg(0x5eed_ba51u64 ^ 0xdead_beef);
+        for round in 0..500 {
+            let doc = gen_value(&mut rng, 3);
+            let needle = gen_needle(&mut rng, &doc, 3);
+            let doc_text = serde_json::to_string(&doc).unwrap();
+            let expected = json_contains(&doc, &needle);
+            match raw_contains(doc_text.as_bytes(), &needle) {
+                Ok(got) => assert_eq!(
+                    got, expected,
+                    "round {round}: doc={doc_text} needle={}",
+                    serde_json::to_string(&needle).unwrap()
+                ),
+                Err(()) => {
+                    let mismatch = std::mem::discriminant(&doc)
+                        != std::mem::discriminant(&needle);
+                    assert!(
+                        mismatch,
+                        "round {round}: refused same-shape pair doc={doc_text} needle={}",
+                        serde_json::to_string(&needle).unwrap()
+                    );
+                }
+            }
+        }
     }
 }

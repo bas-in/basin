@@ -3447,19 +3447,21 @@ async fn register_pruned_listing_table(
 ///
 /// After all tables have been refreshed (so their `ListingTable` registrations
 /// reflect the current live file set), inspect `sql` for a JSONB containment
-/// predicate (`@>` or `<@`) on a column with a GIN index.  When the GIN
-/// posting list returns `FileCandidates` AND the completeness guard passes
-/// (every live file for that column is in the indexed-files set), replace the
-/// table's `ListingTable` registration with one scoped to the candidate files
-/// only.  DataFusion then only opens and scans those files; files pruned here
-/// are never fetched from the object store.
+/// predicate (`@>`) on a column with a GIN index.  The GIN posting list is
+/// probed per file: fully-indexed files with no posting hit for the needle
+/// are pruned, every other live file is scanned.  The table's `ListingTable`
+/// registration is replaced with one scoped to the scan set; pruned files are
+/// never fetched from the object store.
 ///
 /// Correctness contract:
-/// * `FileCandidates` is a conservative superset — no file containing a
-///   real match is ever excluded (the posting list may produce false
-///   positives that the `jsonb_contains` UDF filters out at read time).
-/// * Pruning only fires when `indexed_files ⊇ live_files`.  Any gap
-///   (e.g. a file written before the index existed) triggers a full scan.
+/// * The scan set is a conservative superset — no file containing a real
+///   match is ever excluded (the posting list may produce false positives
+///   that the `jsonb_contains` UDF filters out at read time).
+/// * Coverage degrades per file, not per table: a live file missing from the
+///   indexed-files set (written before the index existed, after a restart,
+///   or de-indexed by posting-budget eviction) is force-scanned while the
+///   rest of the table still prunes.
+/// * `<@` is never pruned (a matching row may be any subset of the literal).
 /// * Transactions are excluded (`tx_is_active` guard in the caller) because
 ///   pending files are not yet indexed.
 ///
@@ -3565,51 +3567,51 @@ pub(crate) async fn apply_gin_pruning_for_query(
     }
 
     // ── File-level posting-list path (for direct-INSERT / non-shard data) ─────
+    //
+    // Phase 5.19.F: per-file graceful degradation.  The old shape probed the
+    // posting list and then required EVERY live file to be in the
+    // indexed-files set — one un-indexed file (pre-index data, a restart, or
+    // posting-budget eviction) disabled pruning for the whole table.  At 1M
+    // rows the backfill routinely overflows the posting budget, eviction
+    // un-marks the early files, and the index silently stops pruning.
+    //
+    // `probe_containment_scan_set` instead prunes what is provable:
+    //   * un-indexed live files are FORCED into the scan set (must-scan);
+    //   * fully-indexed files are pruned when some needle term has no
+    //     posting hit for them (sound: a marked file has ALL of its terms
+    //     in the posting list — eviction un-marks affected files inside the
+    //     same critical section, and the probe snapshots both structures
+    //     under one lock).
+    // Under-pruning is safe; a file that could hold a match is never pruned.
 
-    // Probe the posting list.
-    let gin_result = engine.gin_index_registry().probe_containment(
+    // Defensive: pruning semantics are only valid for `@>` (the row must
+    // contain every needle term).  `detect_gin_containment` no longer
+    // produces `<@` plans, but guard anyway — for `<@` a matching row can be
+    // an arbitrary subset of the literal, so no file is provably prunable.
+    if !gin_plan.is_contains {
+        return Ok(());
+    }
+
+    let scan_set = engine.gin_index_registry().probe_containment_scan_set(
         project,
         &gin_plan.table,
         &gin_plan.col,
         &gin_plan.opclass,
         &gin_plan.needle,
+        &live_paths,
     );
 
-    let candidate_files = match gin_result {
-        crate::index_probe::ProbeResult::FileCandidates(files) => files,
-        // Empty is handled before exec_select (short-circuit with 0 rows).
-        // NoIndex → full scan.
-        _ => return Ok(()),
+    let pruned_paths: Vec<String> = match scan_set {
+        crate::index_probe::GinScanSet::ScanFiles(files) => files,
+        // NoIndex → nothing provable → full scan.
+        crate::index_probe::GinScanSet::NoIndex => return Ok(()),
     };
 
-    // Check coverage: every live file must appear in the indexed-files set.
-    let indexed = engine.gin_index_registry().indexed_files_for(
-        project,
-        &gin_plan.table,
-        &gin_plan.col,
-    );
-    let all_covered = live_files.iter().all(|f| indexed.contains(f.path.as_str()));
-    if !all_covered {
-        // At least one live file is not in the posting list → full scan.
-        // This covers the case where a file was written before the GIN index
-        // existed (or after a restart cleared the RAM registry).
-        return Ok(());
-    }
-
-    // Completeness confirmed.  Intersect candidate set with live files so
-    // we only open files that both (a) the GIN probe considers relevant and
-    // (b) the catalog considers live.
-    let pruned_paths: Vec<String> = live_files
-        .iter()
-        .filter(|f| candidate_files.contains(f.path.as_str()))
-        .map(|f| f.path.to_string())
-        .collect();
-
     if pruned_paths.is_empty() {
-        // GIN probe says no files match — the Empty short-circuit should have
-        // caught this, but guard defensively: leave the full set registered
-        // so DataFusion returns the (empty) result rather than us returning
-        // an incorrect empty result for an edge case.
+        // Every live file was provably pruned — the Empty short-circuit
+        // upstream usually catches this, but guard defensively: leave the
+        // full set registered so DataFusion computes the (empty) result
+        // itself rather than us fabricating one for aggregate shapes.
         return Ok(());
     }
 
@@ -3973,15 +3975,21 @@ struct JsonbContainmentPrunePlan {
 ///
 /// Lazy sidecar load: at probe time, any live file that is not resident in
 /// the registry is fetched from `projects/{p}/tables/{t}/index/{col}.jsonb_post/{ulid}.bin`
-/// (the bincode sidecar written by the compactor).  Failed loads fall
-/// through to the full scan — no false negatives.
+/// (the bincode sidecar written by the compactor).  Failed loads leave the
+/// file UNCOVERED — it is read in full while the covered files still prune
+/// (Phase 5.19.F per-file degradation; previously one missing sidecar
+/// disabled pruning for the whole table).
 ///
 /// Correctness contract:
 /// * The posting list is a conservative superset (file-level AND of needle
 ///   atoms; per-file row-group UNION across atoms).  The `jsonb_contains`
 ///   UDF re-evaluates every emitted row.
-/// * Pruning only fires when every live file is loaded into the registry
-///   (after the lazy-load step).  Any uncovered file triggers a full scan.
+/// * A file may be pruned (or row-group-narrowed) ONLY when it is fully
+///   covered: marked indexed AND not over-budget.  Over-budget files have
+///   partial atom coverage — `over_budget_files_for` reports them and they
+///   are always read in full.  Coverage is snapshotted BEFORE the probe so
+///   a file ingested concurrently is force-scanned rather than judged by a
+///   probe that ran before its atoms arrived.
 /// * On any error returns `Ok(())` → full scan.
 pub(crate) async fn apply_jsonb_posting_pruning_for_query(
     engine: &Engine,
@@ -4030,9 +4038,9 @@ pub(crate) async fn apply_jsonb_posting_pruning_for_query(
         live_files.iter().map(|f| f.path.to_string()).collect();
 
     // Lazy sidecar load: for each live file not in the registry, fetch the
-    // bincode sidecar and ingest it.  If any sidecar is missing or
-    // unparseable, fall through to a full scan (the bloom path or the raw
-    // scan path still runs, so correctness holds).
+    // bincode sidecar and ingest it.  Phase 5.19.F: a missing or unparseable
+    // sidecar no longer disables pruning for the whole table — the file is
+    // simply left UNCOVERED (read in full below) while covered files prune.
     let registry = engine.jsonb_posting_registry();
     let storage = engine.config().storage.clone();
     for p in &live_paths {
@@ -4047,28 +4055,38 @@ pub(crate) async fn apply_jsonb_posting_pruning_for_query(
                 p,
             )
         else {
-            return Ok(());
+            continue; // non-canonical path → uncovered (full scan of this file)
         };
         use object_store::ObjectStoreExt as _;
         let store = storage.project_object_store(project);
         let bytes = match store.get(&sidecar).await {
             Ok(get_result) => match get_result.bytes().await {
                 Ok(b) => b,
-                Err(_) => return Ok(()),
+                Err(_) => continue,
             },
-            Err(_) => return Ok(()), // sidecar missing → full scan
+            Err(_) => continue, // sidecar missing → uncovered
         };
-        if !registry.ingest_sidecar(project, &gin_plan.table, &gin_plan.col, &bytes) {
-            return Ok(());
-        }
+        // Ingest failure also just leaves the file uncovered.
+        let _ = registry.ingest_sidecar(project, &gin_plan.table, &gin_plan.col, &bytes);
     }
 
-    // After lazy load every live file should be indexed; re-verify
-    // defensively so a racing compaction can't slip past the guard.
-    let all_indexed = live_paths
+    // Coverage snapshot — taken BEFORE the probe.  A file is covered when it
+    // is fully ingested (marked indexed) AND within the posting budget.
+    // Over-budget files have only partial atom coverage: their absence from
+    // a probe result proves nothing, so they must be read in full.  Files
+    // that finish ingesting AFTER this snapshot are also force-scanned (the
+    // probe below may predate their atoms).
+    let over_budget = registry.over_budget_files_for(project, &gin_plan.table, &gin_plan.col);
+    let covered: std::collections::HashSet<&str> = live_paths
         .iter()
-        .all(|p| registry.is_file_indexed(project, &gin_plan.table, &gin_plan.col, p));
-    if !all_indexed {
+        .filter(|p| {
+            !over_budget.contains(p.as_str())
+                && registry.is_file_indexed(project, &gin_plan.table, &gin_plan.col, p)
+        })
+        .map(|p| p.as_str())
+        .collect();
+    if covered.is_empty() {
+        // Nothing provable for any live file → full scan.
         return Ok(());
     }
 
@@ -4077,26 +4095,28 @@ pub(crate) async fn apply_jsonb_posting_pruning_for_query(
     let probe = registry.probe(project, &gin_plan.table, &gin_plan.col, &needle);
     let rg_map: HashMap<String, Vec<u32>> = match probe {
         JsonbProbeResult::FileRowGroups(m) => m,
-        // Empty is handled by the existing short-circuit / DataFusion (zero rows).
-        // NoIndex → fall through to bloom / full scan.
-        _ => return Ok(()),
+        // Some needle atom was never indexed, or the AND-intersection is
+        // empty: no COVERED file can match.  An empty map below skips every
+        // covered file and full-scans the uncovered ones.
+        JsonbProbeResult::AtomAbsent | JsonbProbeResult::Empty => HashMap::new(),
+        // NoIndex → nothing provable → bloom / full scan.
+        JsonbProbeResult::NoIndex => return Ok(()),
     };
 
-    // Restrict to live files.  Files that the probe omitted are provably
-    // empty for this query (at least one needle atom is absent from the
-    // file), so we want to skip them entirely.  Per the storage contract
-    // (`ReadOptions::row_group_selection`), a file present in the map
-    // with an empty Vec opens ZERO row-groups (skip entirely); a file
-    // absent from the map opens every row-group (scan in full).  So we
-    // pad omitted live files with `Vec::new()` to skip them.
-    let live_set: std::collections::HashSet<&str> =
-        live_paths.iter().map(|s| s.as_str()).collect();
-    let mut rg_map_live: HashMap<String, Vec<u32>> = rg_map
-        .into_iter()
-        .filter(|(f, _)| live_set.contains(f.as_str()))
-        .collect();
+    // Build the per-file row-group selection.  Per the storage contract
+    // (`ReadOptions::row_group_selection`): a file present in the map with an
+    // empty Vec opens ZERO row-groups (skipped entirely); a file ABSENT from
+    // the map opens every row-group (scanned in full).  So:
+    //   * covered + probe hit      → the probe's row-groups;
+    //   * covered + no probe hit   → empty Vec (provably no match — every
+    //     atom of every row of a covered file is in the posting list);
+    //   * uncovered                → absent (full scan, no false negatives).
+    let mut rg_map_live: HashMap<String, Vec<u32>> = HashMap::new();
     for p in &live_paths {
-        rg_map_live.entry(p.clone()).or_default();
+        if !covered.contains(p.as_str()) {
+            continue; // uncovered → absent from map → read in full
+        }
+        rg_map_live.insert(p.clone(), rg_map.get(p).cloned().unwrap_or_default());
     }
 
     let df_schema = match schema_ws_to_df(&meta.schema) {

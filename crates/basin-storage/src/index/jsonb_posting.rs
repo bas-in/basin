@@ -149,6 +149,46 @@ fn extract_atoms_inner(value: &serde_json::Value, prefix: &str, out: &mut Vec<Js
     // `gin_extract_terms`).
 }
 
+/// Extract the *probe-side* atoms of a `@>` needle.
+///
+/// Unlike [`extract_atoms`] (the index side), every atom returned here must
+/// be a **necessary condition** on a containing document — the probe
+/// AND-merges them and prunes any file missing one.  Exact-value atoms for
+/// object/array needle values are NOT necessary: `{"a":{"x":1,"y":2}}`
+/// contains the needle `{"a":{"x":1}}` but its indexed atom is
+/// `("a", "{\"x\":1,\"y\":2}")`, not the needle's `("a", "{\"x\":1}")` —
+/// AND-merging the latter would prune a file holding a real match (dropped
+/// rows).  Likewise array containment is element-subset, so the exact
+/// compact repr of an array value is not required to appear.
+///
+/// Therefore: scalar values → `(path, compact)` atoms; object values →
+/// recurse to their scalar leaves; array values → no atom.  An empty result
+/// means nothing is provable and the probe must return `NoIndex`.
+pub fn needle_atoms(value: &serde_json::Value) -> Vec<JsonbAtom> {
+    let mut out = Vec::new();
+    needle_atoms_inner(value, "", &mut out);
+    out
+}
+
+fn needle_atoms_inner(value: &serde_json::Value, prefix: &str, out: &mut Vec<JsonbAtom>) {
+    if let serde_json::Value::Object(map) = value {
+        for (k, v) in map {
+            let path = if prefix.is_empty() {
+                k.clone()
+            } else {
+                format!("{prefix}.{k}")
+            };
+            match v {
+                serde_json::Value::Object(_) => needle_atoms_inner(v, &path, out),
+                serde_json::Value::Array(_) => {
+                    // Exact array repr is not a necessary condition — skip.
+                }
+                _ => out.push((path, compact_value(v))),
+            }
+        }
+    }
+}
+
 /// Compact JSON repr for a leaf value, truncated to 200 chars for
 /// composite values.  Mirrors `gin_compact_value` so probe/index atoms
 /// match.
@@ -344,10 +384,18 @@ impl JsonbPostingRegistry {
     /// strategy mirrors `GinTsvectorRegistry::probe_query_with_row_groups`.
     ///
     /// Returns:
-    /// * [`JsonbProbeResult::NoIndex`] — no posting list, or an atom is
-    ///   absent (conservative; caller must full-scan).
+    /// * [`JsonbProbeResult::NoIndex`] — no posting list, or the needle has
+    ///   no provable atoms (caller must full-scan).
+    /// * [`JsonbProbeResult::AtomAbsent`] — a posting list exists but some
+    ///   needle atom was never indexed: no *fully-covered* file can match.
+    ///   Files with partial coverage (over-budget / un-ingested) must still
+    ///   be scanned by the caller.
     /// * [`JsonbProbeResult::Empty`] — the AND-intersection is empty.
     /// * [`JsonbProbeResult::FileRowGroups`] — `file → sorted row-groups`.
+    ///
+    /// Probe atoms come from [`needle_atoms`] (scalar leaves only): every
+    /// atom is a necessary condition on a containing document, so the
+    /// AND-merge can never prune a file holding a real match.
     pub fn probe(
         &self,
         project: &ProjectId,
@@ -355,7 +403,7 @@ impl JsonbPostingRegistry {
         col: &str,
         needle: &serde_json::Value,
     ) -> JsonbProbeResult {
-        let atoms = extract_atoms(needle);
+        let atoms = needle_atoms(needle);
         if atoms.is_empty() {
             // Empty needle (`{}`) matches every row — nothing to prune on.
             return JsonbProbeResult::NoIndex;
@@ -372,8 +420,8 @@ impl JsonbPostingRegistry {
         for atom in &atoms {
             match list.probe_atom(atom) {
                 None => {
-                    // Atom never indexed → conservative no-index (full scan).
-                    return JsonbProbeResult::NoIndex;
+                    // Atom never indexed: no fully-covered file contains it.
+                    return JsonbProbeResult::AtomAbsent;
                 }
                 Some(entries) => {
                     let mut by_file: HashMap<String, HashSet<u32>> = HashMap::new();
@@ -473,6 +521,30 @@ impl JsonbPostingRegistry {
             map.get(&key).is_some_and(|s| s.contains(file_path))
         } else {
             false
+        }
+    }
+
+    /// Files whose ingest overflowed the posting budget and therefore have
+    /// only PARTIAL atom coverage.  `index_batch` / `ingest_sidecar` still
+    /// mark these files "indexed" (so the lazy sidecar loader does not
+    /// re-fetch them every query), which means callers MUST subtract this set
+    /// before treating a file's absence from a probe result as proof of
+    /// no-match: a partially-covered file can hold a matching row whose atoms
+    /// were never inserted.  Treating an over-budget file as prunable drops
+    /// rows.
+    pub fn over_budget_files_for(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        col: &str,
+    ) -> HashSet<String> {
+        match self.get(project, table, col) {
+            None => HashSet::new(),
+            Some(arc) => arc
+                .lock()
+                .expect("AtomPostingList lock poisoned")
+                .over_budget_files
+                .clone(),
         }
     }
 
@@ -625,13 +697,22 @@ pub fn posting_sidecar_key_for_data_file(
 /// Result of a JSONB `@>` probe against the posting list.
 #[derive(Debug)]
 pub enum JsonbProbeResult {
-    /// No posting list, or a required atom is absent.  Caller must
+    /// No posting list, or the needle has no provable atoms.  Caller must
     /// fall through to a full scan (no false negatives).
     NoIndex,
-    /// AND-intersection is empty — no rows can match.
+    /// A posting list exists but some needle atom was never indexed.  No
+    /// FULLY-COVERED file can match (an indexed+within-budget file has every
+    /// atom of every row inserted).  Files with partial coverage — see
+    /// [`JsonbPostingRegistry::over_budget_files_for`] — or files never
+    /// ingested must still be scanned.
+    AtomAbsent,
+    /// AND-intersection is empty — no rows in fully-covered files can match.
     Empty,
     /// `file_path → sorted row-group indices`.  Files absent from this map
-    /// MUST be read in full (no false negatives).
+    /// are either provably empty for the needle (fully-covered files) or
+    /// unknown (partially-covered / un-ingested files) — the CALLER must
+    /// distinguish via the indexed/over-budget sets and read unknown files
+    /// in full (no false negatives).
     FileRowGroups(HashMap<String, Vec<u32>>),
 }
 
@@ -864,6 +945,93 @@ mod tests {
             }
             other => panic!("expected FileRowGroups after sidecar load, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn needle_atoms_nested_object_uses_scalar_leaves_only() {
+        // Doc {"a":{"x":1,"y":2}} CONTAINS needle {"a":{"x":1}} (recursive
+        // subset).  The probe must not require the exact ("a","{\"x\":1}")
+        // atom — only the scalar leaf ("a.x","1").
+        let needle = json!({"a": {"x": 1}});
+        let atoms = needle_atoms(&needle);
+        assert_eq!(atoms, vec![("a.x".to_string(), "1".to_string())]);
+
+        let reg = JsonbPostingRegistry::new();
+        let proj = ProjectId::new();
+        let tbl = TableName::new("docs").unwrap();
+        let doc_atoms = extract_atoms(&json!({"a": {"x": 1, "y": 2}}));
+        reg.index_row(&proj, &tbl, "payload", &doc_atoms, "f1.parquet", 0);
+        reg.mark_file_indexed(&proj, &tbl, "payload", "f1.parquet");
+
+        match reg.probe(&proj, &tbl, "payload", &needle) {
+            JsonbProbeResult::FileRowGroups(m) => {
+                assert!(
+                    m.contains_key("f1.parquet"),
+                    "superset doc must stay a candidate: {m:?}"
+                );
+            }
+            other => panic!("expected FileRowGroups, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn needle_atoms_array_value_yields_no_atom() {
+        // Array containment is element-subset; the exact compact repr is not
+        // a necessary condition.  No provable atom → probe must NoIndex.
+        let needle = json!({"tags": [1, 2]});
+        assert!(needle_atoms(&needle).is_empty());
+
+        let reg = JsonbPostingRegistry::new();
+        let proj = ProjectId::new();
+        let tbl = TableName::new("docs").unwrap();
+        let doc_atoms = extract_atoms(&json!({"tags": [1, 2, 3]}));
+        reg.index_row(&proj, &tbl, "payload", &doc_atoms, "f1.parquet", 0);
+        reg.mark_file_indexed(&proj, &tbl, "payload", "f1.parquet");
+        match reg.probe(&proj, &tbl, "payload", &needle) {
+            JsonbProbeResult::NoIndex => {}
+            other => panic!("expected NoIndex (full scan), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_absent_atom_reports_atom_absent() {
+        let reg = JsonbPostingRegistry::new();
+        let proj = ProjectId::new();
+        let tbl = TableName::new("docs").unwrap();
+        let atoms = extract_atoms(&json!({"category": "purchase"}));
+        reg.index_row(&proj, &tbl, "payload", &atoms, "f1.parquet", 0);
+        reg.mark_file_indexed(&proj, &tbl, "payload", "f1.parquet");
+
+        let needle = json!({"category": "refund"});
+        match reg.probe(&proj, &tbl, "payload", &needle) {
+            JsonbProbeResult::AtomAbsent => {}
+            other => panic!("expected AtomAbsent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn over_budget_file_is_reported_and_still_marked_indexed() {
+        // The env-cached budget cannot be shrunk per test, so drive the
+        // internal list directly: simulate the overflow marking.
+        let reg = JsonbPostingRegistry::new();
+        let proj = ProjectId::new();
+        let tbl = TableName::new("docs").unwrap();
+        let atoms = extract_atoms(&json!({"category": "purchase"}));
+        reg.index_row(&proj, &tbl, "payload", &atoms, "f1.parquet", 0);
+        reg.mark_file_indexed(&proj, &tbl, "payload", "f1.parquet");
+        {
+            let arc = reg.get(&proj, &tbl, "payload").unwrap();
+            arc.lock()
+                .unwrap()
+                .over_budget_files
+                .insert("f1.parquet".to_string());
+        }
+        // The caller-facing contract: indexed_files still contains the file
+        // (no sidecar re-fetch), but over_budget_files_for reports it so
+        // prune consumers force-scan it.
+        assert!(reg.is_file_indexed(&proj, &tbl, "payload", "f1.parquet"));
+        let over = reg.over_budget_files_for(&proj, &tbl, "payload");
+        assert!(over.contains("f1.parquet"), "over-budget set: {over:?}");
     }
 
     #[test]

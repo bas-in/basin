@@ -814,6 +814,15 @@ impl Engine {
         self.inner.gin_rowgroup_registry.clone()
     }
 
+    /// Public accessor for integration tests that need to inspect the GIN
+    /// posting-list registry (e.g. to verify that posting-budget eviction
+    /// fired and the index degraded to per-file coverage).
+    pub fn gin_index_registry_for_test(
+        &self,
+    ) -> Arc<crate::index_probe::GinIndexRegistry> {
+        self.inner.gin_index_registry.clone()
+    }
+
     // ── ADR 0027 Phase 4 auto-promotion ──────────────────────────────────────
 
     /// Crate-private: process-wide JSONB auto-promotion registry.
