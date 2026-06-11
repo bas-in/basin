@@ -77,13 +77,26 @@ use basin_common::Result;
 // Shadow-column name
 // ---------------------------------------------------------------------------
 
+/// Prefix shared by every promoted-JSONB shadow column name.
+pub(crate) const SHADOW_COL_PREFIX: &str = "__promoted$";
+
 /// Canonical shadow-column name for a promoted JSONB path.
 ///
 /// `__promoted$<source_col>$<json_key>`.  Matches
 /// [`PromotedJsonbPath::shadow_col_name`] — kept here so engine-internal code
 /// does not need to import `basin-catalog` just for a name computation.
 pub(crate) fn shadow_col_name(source_col: &str, json_key: &str) -> String {
-    format!("__promoted${}${}", source_col, json_key)
+    format!("{SHADOW_COL_PREFIX}{}${}", source_col, json_key)
+}
+
+/// `true` if `name` is a promoted-JSONB shadow column (`__promoted$col$key`).
+///
+/// Shadow columns exist only in the DataFusion-registered schema —
+/// `TableMetadata::schema` never contains them — so any place that maps a
+/// materialised DataFusion result onto a catalog schema must treat them as
+/// internal storage detail, not user data.
+pub(crate) fn is_shadow_col_name(name: &str) -> bool {
+    name.starts_with(SHADOW_COL_PREFIX)
 }
 
 // ---------------------------------------------------------------------------

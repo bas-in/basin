@@ -728,11 +728,12 @@ impl ScalarUDFImpl for VectorToTextUdf {
 /// is bounded by the surrounding token (column name, string literal, ARRAY
 /// literal, parenthesised group).
 ///
-/// LIMITATION: this rewrite does not understand string literals or comments.
-/// An operator sequence appearing inside a quoted string will be substituted
-/// the same as a real operator. For the PoC that's acceptable — the smoke
-/// test exercises both rewrite paths and brute force; production scope can
-/// move this into the parser proper.
+/// The operator scan is quote-aware: an operator sequence inside a
+/// single-quoted string literal or a double-quoted identifier is NOT
+/// rewritten. This matters because `<->` is also the tsquery phrase operator
+/// and legitimately appears inside literals — e.g.
+/// `to_tsquery('english', 'quick <-> fox')` — where a blind substitution
+/// would corrupt the literal. LIMITATION: comments are still not understood.
 pub(crate) fn rewrite_vector_operators(sql: &str) -> String {
     // Walk left-to-right finding the operators in order of priority. Each
     // pass walks the entire string, so cascading `a <-> b <-> c` gets
@@ -761,19 +762,63 @@ pub(crate) fn rewrite_vector_operators(sql: &str) -> String {
     s
 }
 
-/// Find the first occurrence of any of `<->`, `<#>`, `<=>` and return its
+/// Find the first occurrence of any of `<->`, `<#>`, `<=>` OUTSIDE
+/// single-quoted string literals and double-quoted identifiers, returning its
 /// byte range and the operator string. Returns `None` if none present.
+///
+/// Quote-awareness is load-bearing: `<->` is also the tsquery phrase
+/// operator, so it legitimately appears INSIDE a string literal
+/// (`to_tsquery('english', 'quick <-> fox')`) where rewriting it to
+/// `l2_distance(...)` would corrupt the literal. A real vector operator only
+/// ever appears between SQL expressions, never inside quotes.
 fn find_first_op(s: &str) -> Option<(usize, usize, &'static str)> {
-    let mut best: Option<(usize, usize, &'static str)> = None;
-    for op in ["<->", "<#>", "<=>"] {
-        if let Some(pos) = s.find(op) {
-            match best {
-                Some((p, _, _)) if pos >= p => {}
-                _ => best = Some((pos, pos + op.len(), op)),
+    let b = s.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            // Single-quoted string literal: skip to the closing quote,
+            // honouring the `''` escape.
+            b'\'' => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\'' {
+                        if i + 1 < b.len() && b[i + 1] == b'\'' {
+                            i += 2; // escaped quote — still inside the literal
+                        } else {
+                            i += 1; // closing quote
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
             }
+            // Double-quoted identifier: skip to the closing quote (`""` escape).
+            b'"' => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'"' {
+                        if i + 1 < b.len() && b[i + 1] == b'"' {
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'<' if i + 2 < b.len() && b[i + 2] == b'>' => match b[i + 1] {
+                b'-' => return Some((i, i + 3, "<->")),
+                b'#' => return Some((i, i + 3, "<#>")),
+                b'=' => return Some((i, i + 3, "<=>")),
+                _ => i += 1,
+            },
+            _ => i += 1,
         }
     }
-    best
+    None
 }
 
 /// Return `true` if `expr` looks like a PG range type or range literal.

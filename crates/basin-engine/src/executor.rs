@@ -2937,9 +2937,23 @@ async fn dispatch_parsed_statement(
                         &fts_plan.tsquery_str,
                     );
                     if let TsvProbeResult::Empty = fts_result {
-                        // Posting list guarantees no rows match — short-circuit.
-                        let schema = Arc::new(arrow_schema::Schema::empty());
-                        return Ok(ExecResult::Rows { schema, batches: vec![] });
+                        // The posting list proves no COLD-file row matches.
+                        // Same overlay/completeness gate as the JSONB `@>` /
+                        // `?`-family short-circuits above
+                        // (`gin_empty_probe_is_trustworthy`): a live hot-tier
+                        // override row may carry lexemes whose cold posting
+                        // sets are disjoint, and an un-indexed live file
+                        // (pre-index data, restart, posting-budget eviction,
+                        // materialize replacement) may hold a real match the
+                        // registry knows nothing about.  Either state makes
+                        // `Empty` non-authoritative → fall through to the
+                        // overlay-aware full scan.
+                        if fts_empty_probe_is_trustworthy(sess, &fts_plan.table, &fts_plan.col)
+                            .await
+                        {
+                            let schema = Arc::new(arrow_schema::Schema::empty());
+                            return Ok(ExecResult::Rows { schema, batches: vec![] });
+                        }
                     }
                     // FileCandidates / NoIndex: fall through to DataFusion for correctness.
                 }
@@ -4582,6 +4596,52 @@ async fn gin_empty_probe_is_trustworthy(
         .all(|f| indexed.contains(f.path.as_str()))
 }
 
+/// FTS twin of [`gin_empty_probe_is_trustworthy`] for the tsvector `@@`
+/// posting-probe `Empty` short-circuit (Phase 5.20.E).
+///
+/// `TsvProbeResult::Empty` means "no cold file can match" — the tsvector
+/// posting list is built from cold files only.  Returning zero rows is sound
+/// only when:
+///
+/// 1. **No live overlay** (O(1) counter reads): a hot-tier UPDATE override /
+///    DELETE tombstone may carry a post-image whose lexemes satisfy a query
+///    that no cold file satisfies (e.g. `'cat' & 'dog'` with the two lexemes
+///    split across disjoint cold files and an override row holding both).
+/// 2. **Per-file completeness**: every live data file must appear in the
+///    FTS registry's indexed-files set.  A live file written before the
+///    index existed, after a restart, de-indexed by posting-budget eviction,
+///    or committed by `materialize_overlay_for_table` (which performs no FTS
+///    registry maintenance) may hold a real match the posting list cannot
+///    see.  Requiring full coverage degrades those states to a full scan —
+///    correct-but-unpruned, mirroring `apply_gin_fts_pruning_for_query`.
+///
+/// Any uncertainty (catalog load failure) also returns `false` → full scan.
+async fn fts_empty_probe_is_trustworthy(
+    sess: &ProjectSession,
+    table: &TableName,
+    col: &str,
+) -> bool {
+    if crate::session::table_has_live_overlay(&sess.engine, &sess.project, table) {
+        return false;
+    }
+    let Ok(meta) = sess
+        .engine
+        .config()
+        .catalog
+        .load_table(&sess.project, table)
+        .await
+    else {
+        return false; // can't verify completeness → fall through to the scan
+    };
+    let indexed = sess
+        .engine
+        .gin_fts_registry()
+        .indexed_files_for(&sess.project, table, col);
+    meta.live_data_files()
+        .iter()
+        .all(|f| indexed.contains(f.path.as_str()))
+}
+
 /// FIX 1 / FIX 2(b) — backfill a freshly-created single-column index over the
 /// table's existing live data files.
 ///
@@ -4589,10 +4649,16 @@ async fn gin_empty_probe_is_trustworthy(
 ///   * `gin` (JSONB, non-tsvector) → populate the GIN row-group bloom registry
 ///     and the file-level JSONB posting list + sidecar, then seal each file so
 ///     `apply_gin_pruning_for_query`'s completeness guards pass.
+///   * `gin` with `tsvector_ops` (Phase 5.20.E) → populate the FTS lexeme
+///     posting list (`GinTsvectorRegistry`) and seal each file so the
+///     `@@` Empty short-circuit (`fts_empty_probe_is_trustworthy`) and
+///     `apply_gin_fts_pruning_for_query`'s completeness guard pass.  Without
+///     this backfill a tsvector GIN created over pre-existing data would
+///     never reach full coverage and the index would never prune.
 ///   * `btree` (plain single-column) → extract `(value → file/row-group/row)`
 ///     locations into the secondary B-tree registry and flush it to disk.
-///   * `gist` / `hnsw` / `ivfflat` / tsvector-GIN → not backfilled here (those
-///     use sidecar-based indexes built at compaction time; out of scope for
+///   * `gist` / `hnsw` / `ivfflat` → not backfilled here (those use
+///     sidecar-based indexes built at compaction time; out of scope for
 ///     this fix).
 ///
 /// Row-group ordinal semantics: the Parquet/Vortex writer flushes a row-group
@@ -4614,10 +4680,11 @@ async fn backfill_index_over_live_files(
 ) {
     use futures::StreamExt;
 
-    // tsvector GIN, gist, and vector indexes are not backfilled here.
-    let is_plain_gin = access_method == "gin" && gin_opclass != Some("tsvector_ops");
+    // gist and vector indexes are not backfilled here.
+    let is_fts_gin = access_method == "gin" && gin_opclass == Some("tsvector_ops");
+    let is_plain_gin = access_method == "gin" && !is_fts_gin;
     let is_btree = access_method == "btree";
-    if !is_plain_gin && !is_btree {
+    if !is_plain_gin && !is_fts_gin && !is_btree {
         return;
     }
 
@@ -4691,6 +4758,10 @@ async fn backfill_index_over_live_files(
                 backfill_gin_batch(
                     sess, table, col_name, opclass, &batch, &f.path, rg_size, file_row_off,
                 );
+            } else if is_fts_gin {
+                backfill_fts_batch(
+                    sess, table, col_name, &batch, &f.path, rg_size, file_row_off,
+                );
             } else {
                 backfill_btree_batch(
                     sess, table, col_name, &batch, &f.path, rg_size, file_row_off,
@@ -4716,6 +4787,15 @@ async fn backfill_index_over_live_files(
             // `apply_jsonb_posting_pruning_for_query` lazy-load path (which
             // reads sidecars when its registry is cold) also sees this file.
             backfill_write_jsonb_posting_sidecar(sess, table, col_name, &f.path).await;
+        } else if is_fts_gin {
+            // Seal the file in the FTS registry: the Empty short-circuit and
+            // the session pruning path both require every live file to be in
+            // the indexed-files completeness set before they trust the
+            // posting list.  A read error above leaves the file un-sealed →
+            // forced full scan for this table (correct, just unpruned).
+            sess.engine.gin_fts_registry().mark_file_indexed(
+                &project, table, col_name, &f.path,
+            );
         }
     }
 
@@ -4800,6 +4880,68 @@ fn backfill_gin_batch(
         // File-level posting list (drives the posting-list prune path).
         posting_registry.index_row(
             &project, table, col_name, opclass, bytes, file_path, row_group, file_row as u64,
+        );
+    }
+}
+
+/// Phase 5.20.E — feed one batch (read from an existing file at `file_row_off`
+/// rows into the file) into the GIN FTS lexeme posting list.  Mirrors
+/// `maintain_gin_fts_index_on_insert` but offsets the row index by
+/// `file_row_off` so multi-batch reads of a single file land in the correct
+/// row-group.
+///
+/// The tsvector column is stored as Utf8 (canonical lexeme text form), but
+/// the runtime Arrow encoding depends on the source file format: Parquet
+/// round-trips to `StringArray`, the Vortex reader may surface `Utf8View` /
+/// `LargeUtf8`.  Accept all three — a silent downcast failure would leave the
+/// file with no posting entries while the subsequent `mark_file_indexed`
+/// seals it as "complete", and the structural probe could then prune rows
+/// that exist (the same bug class fixed for the JSONB backfill).
+fn backfill_fts_batch(
+    sess: &ProjectSession,
+    table: &TableName,
+    col_name: &str,
+    batch: &arrow_array::RecordBatch,
+    file_path: &str,
+    rg_size: usize,
+    file_row_off: usize,
+) {
+    use arrow_array::Array;
+    let Ok(col_idx) = batch.schema().index_of(col_name) else {
+        return;
+    };
+    let col = batch.column(col_idx);
+    enum StrCol<'a> {
+        Small(&'a arrow_array::StringArray),
+        Large(&'a arrow_array::LargeStringArray),
+        View(&'a arrow_array::StringViewArray),
+    }
+    let arr = if let Some(a) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
+        StrCol::Small(a)
+    } else if let Some(a) = col.as_any().downcast_ref::<arrow_array::LargeStringArray>() {
+        StrCol::Large(a)
+    } else if let Some(a) = col.as_any().downcast_ref::<arrow_array::StringViewArray>() {
+        StrCol::View(a)
+    } else {
+        return;
+    };
+    let row_str = |r: usize| -> Option<&str> {
+        match &arr {
+            StrCol::Small(a) => (!a.is_null(r)).then(|| a.value(r)),
+            StrCol::Large(a) => (!a.is_null(r)).then(|| a.value(r)),
+            StrCol::View(a) => (!a.is_null(r)).then(|| a.value(r)),
+        }
+    };
+    let fts_registry = sess.engine.gin_fts_registry();
+    let project = sess.project;
+    for row in 0..batch.num_rows() {
+        let Some(tsv_str) = row_str(row) else {
+            continue;
+        };
+        let file_row = file_row_off + row;
+        let row_group = (file_row / rg_size) as u32;
+        fts_registry.index_row(
+            &project, table, col_name, tsv_str, file_path, row_group, file_row as u64,
         );
     }
 }
@@ -6065,6 +6207,57 @@ async fn exec_insert_select(
     // the inliner here because it already mutated the AST in
     // `executor::execute`'s SQL-string pass.
     let source_sql = source.to_string();
+
+    // Registered providers are point-in-time snapshots of the catalog's file
+    // set (see `exec_select`'s rationale) — they do NOT re-list storage on
+    // scan. A provider registered before an external catalog mutation (a
+    // shard `flush_to_parquet`, a `rollback_to_snapshot`, a promotion
+    // backfill) silently serves the OLD file set, so the source SELECT here
+    // would read stale — or zero — rows. Mirror `exec_select`: flush the
+    // shard tail so just-written rows are on disk, then refresh every base
+    // table the source query can read (scoped via the same refresh-set
+    // computation; conservative refresh-all when it cannot be enumerated).
+    // In-tx, the htap overlay keeps read-your-own-writes intact.
+    if let Some(shard) = sess.engine.config().shard.as_ref() {
+        shard.flush_to_parquet().await?;
+    }
+    {
+        let in_tx = crate::session::tx_is_active(&sess.state);
+        let all_tables: Vec<TableName> = sess
+            .engine
+            .config()
+            .catalog
+            .list_tables(&sess.project)
+            .await?;
+        let tables: Vec<TableName> =
+            match compute_select_refresh_set(sess, &source_sql, &all_tables).await {
+                Some(scoped) => scoped,
+                None => all_tables,
+            };
+        for t in &tables {
+            if in_tx {
+                let pending = crate::session::tx_pending_files_for(&sess.state, t);
+                let htap_batches = crate::session::tx_htap_batches_for(&sess.state, t);
+                if pending.is_empty() && htap_batches.is_empty() {
+                    refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, t).await?;
+                } else {
+                    crate::session::refresh_table_with_htap(
+                        &sess.engine,
+                        &sess.project,
+                        &sess.ctx,
+                        &sess.state,
+                        t,
+                        &pending,
+                        htap_batches,
+                    )
+                    .await?;
+                }
+            } else {
+                refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, t).await?;
+            }
+        }
+    }
+
     let df = sess
         .ctx
         .sql(&source_sql)
@@ -6097,6 +6290,36 @@ async fn exec_insert_select(
             .map_err(|e| BasinError::internal(format!("concat INSERT-SELECT batches: {e}")))?
     };
     let source_batch = batch_df_to_ws(&combined_df)?;
+
+    // ADR 0027: promoted JSONB shadow columns (`__promoted$col$key`) exist
+    // only in the DataFusion-registered schema — `meta.schema` never contains
+    // them — so a wildcard source (`INSERT INTO copy SELECT * FROM
+    // promoted_table`) materialises them as EXTRA columns and the width check
+    // below would reject a copy between column-for-column identical tables
+    // ("source has 7 columns, target has 6" — the published `events_copy`
+    // benchmark gap, which appears as soon as the JSONB auto-promoter fires
+    // on the source table). They are internal storage detail, never user
+    // data: drop them before mapping. An explicit `SELECT "__promoted$…" AS
+    // x` still works — the alias renames the output column past this filter.
+    let source_batch = {
+        let keep: Vec<usize> = source_batch
+            .schema()
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| !crate::promoted_columns::is_shadow_col_name(f.name()))
+            .map(|(i, _)| i)
+            .collect();
+        if keep.len() == source_batch.num_columns() {
+            source_batch
+        } else {
+            source_batch.project(&keep).map_err(|e| {
+                BasinError::internal(format!(
+                    "drop promoted shadow columns from INSERT-SELECT source: {e}"
+                ))
+            })?
+        }
+    };
     let row_count = source_batch.num_rows();
 
     // Map source columns to the target schema: when `INSERT INTO t (a, b)
@@ -6139,14 +6362,38 @@ async fn exec_insert_select(
 
     // Build a target-schema-shaped batch by placing each source column at
     // the matching target index; unmentioned target columns get NULL
-    // arrays of the right type. The per-cell types must already match —
-    // we don't re-coerce here (DataFusion's type coercion already ran).
+    // arrays of the right type. Source types are cast to the target type
+    // when they differ: DataFusion's coercion never sees the target table
+    // (we bypass its DML planner), so a source column can legitimately
+    // arrive view-typed (string kernels emit Utf8View; the Vortex layer
+    // promotes Utf8/Binary to view encodings) or in a different numeric
+    // width (`SELECT id::int ...` into a BIGINT column). `safe: false`
+    // makes lossy casts (e.g. overflowing BIGINT → INT) error like
+    // Postgres instead of silently producing NULLs.
     let n_cols = schema.fields().len();
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(n_cols);
     for (target_idx, target_field) in schema.fields().iter().enumerate() {
         if let Some(source_pos) = target_cols.iter().position(|&i| i == target_idx) {
             let arr = source_batch.column(source_pos).clone();
-            if arr.data_type() != target_field.data_type() {
+            let arr = if arr.data_type() == target_field.data_type() {
+                arr
+            } else if arrow::compute::can_cast_types(arr.data_type(), target_field.data_type()) {
+                let opts = arrow::compute::CastOptions {
+                    safe: false,
+                    ..Default::default()
+                };
+                arrow::compute::cast_with_options(&arr, target_field.data_type(), &opts).map_err(
+                    |e| {
+                        BasinError::InvalidSchema(format!(
+                            "INSERT INTO {} column {:?}: cannot cast source type {:?} to target type {:?}: {e}",
+                            table.as_str(),
+                            target_field.name(),
+                            arr.data_type(),
+                            target_field.data_type()
+                        ))
+                    },
+                )?
+            } else {
                 return Err(BasinError::InvalidSchema(format!(
                     "INSERT INTO {} column {:?}: source type {:?} does not match target type {:?}",
                     table.as_str(),
@@ -6154,7 +6401,7 @@ async fn exec_insert_select(
                     arr.data_type(),
                     target_field.data_type()
                 )));
-            }
+            };
             columns.push(arr);
         } else {
             // Column not supplied by the SELECT. For identity/SERIAL columns,
@@ -8767,13 +9014,22 @@ pub(crate) async fn exec_select(
             orig_sql,
         )
         .await?;
-        crate::session::apply_gin_fts_pruning_for_query(
-            &sess.engine,
-            &sess.project,
-            &sess.ctx,
-            orig_sql,
-        )
-        .await?;
+        // Transaction guard: an in-tx SELECT's registration may include
+        // tx-pending files / buffered batches that the FTS registry has
+        // never seen (insert-path maintenance is deferred to COMMIT) and
+        // that the catalog's live-file set — which the completeness guard
+        // checks — does not contain.  A pruned re-registration would drop
+        // those pending rows from the read.  Decline pruning inside a
+        // transaction (full scan, correct results).
+        if !crate::session::tx_is_active(&sess.state) {
+            crate::session::apply_gin_fts_pruning_for_query(
+                &sess.engine,
+                &sess.project,
+                &sess.ctx,
+                orig_sql,
+            )
+            .await?;
+        }
         // Phase 5.24.D — GIST interval-tree file-level pruning (range @> / && / <@).
         // Use the original SQL so range operators are still present (before
         // `rewrite_range_operators` converts them to UDF calls).
@@ -11621,8 +11877,20 @@ async fn maintain_secondary_indexes_on_insert(
             let opclass = idx.opclass.as_deref().unwrap_or("jsonb_ops");
             if opclass == "tsvector_ops" {
                 // Phase 5.20.E: tsvector GIN index — populate FTS posting list.
+                // Thread the effective row-group size (same priority the
+                // writer uses: `row_block_size` > `row_group_rows` > default)
+                // so each row is recorded under its true row-group ordinal —
+                // recording everything under row-group 0 would let the
+                // rg-granular prune path skip row-groups 1+ of a >cap batch
+                // and drop real matches.
                 let fts_registry = sess.engine.gin_fts_registry();
-                maintain_gin_fts_index_on_insert(fts_registry, &sess.project, table, col_name, batch, file_path);
+                let rg_size = meta
+                    .row_block_size
+                    .map(|v| v as usize)
+                    .or(meta.row_group_rows)
+                    .unwrap_or(basin_storage::DEFAULT_MAX_ROW_GROUP_SIZE)
+                    .max(1);
+                maintain_gin_fts_index_on_insert(fts_registry, &sess.project, table, col_name, batch, file_path, rg_size);
             } else {
                 // Phase 5.19.C: JSONB GIN index — populate JSONB posting list.
                 maintain_gin_index_on_insert(gin_registry, &sess.project, table, col_name, opclass, batch, file_path);
@@ -11759,10 +12027,16 @@ fn maintain_gin_rowgroup_index_on_insert(
 /// Phase 5.20.E — Populate the GIN FTS posting list for a single tsvector
 /// column from a newly written `batch`.  Iterates every row in the batch,
 /// reads the canonical tsvector string, extracts lexemes, and inserts them
-/// into the FTS registry.
+/// into the FTS registry under its true row-group ordinal
+/// (`row / rg_size` — the writer flushes a row-group every `rg_size` rows of
+/// this single-batch write, so recording everything under row-group 0 would
+/// be a false-negative bug once the rg-granular prune drives
+/// `row_group_selection`).
 ///
-/// Only `Utf8` columns are handled (Basin stores tsvector as Utf8).
-/// Other column types are silently skipped — the index is best-effort.
+/// Only `Utf8` columns are handled (Basin stores tsvector as Utf8; freshly
+/// built INSERT batches always carry plain `StringArray`).  Other column
+/// types are silently skipped — the file is then never marked complete and
+/// the completeness guards force a full scan (correct, just unpruned).
 fn maintain_gin_fts_index_on_insert(
     fts_registry: &Arc<basin_storage::index::gin_tsvector::GinTsvectorRegistry>,
     project: &basin_common::ProjectId,
@@ -11770,11 +12044,13 @@ fn maintain_gin_fts_index_on_insert(
     col_name: &str,
     batch: &arrow_array::RecordBatch,
     file_path: &str,
+    rg_size: usize,
 ) {
     use arrow_array::Array;
     let Ok(col_idx) = batch.schema().index_of(col_name) else {
         return;
     };
+    let rg_size = rg_size.max(1);
     let col = batch.column(col_idx);
     // Basin stores tsvector as Utf8 (canonical lexeme text form).
     if let Some(arr) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
@@ -11783,7 +12059,10 @@ fn maintain_gin_fts_index_on_insert(
                 continue;
             }
             let tsv_str = arr.value(row);
-            fts_registry.index_row(project, table, col_name, tsv_str, file_path, 0, row as u64);
+            let row_group = (row / rg_size) as u32;
+            fts_registry.index_row(
+                project, table, col_name, tsv_str, file_path, row_group, row as u64,
+            );
         }
         // Mark this file as fully indexed so the completeness guard in the
         // probe path can safely prune to FileCandidates.
