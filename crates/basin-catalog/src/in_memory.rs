@@ -12,7 +12,7 @@ use arrow_schema::Schema;
 use async_trait::async_trait;
 use basin_common::{BasinError, ProjectId, QualifiedTableName, Result, SchemaName, TableName};
 use chrono::Utc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::instrument;
 
 use basin_common::ChangeOp;
@@ -123,9 +123,13 @@ type TableMap = HashMap<(ProjectId, QualifiedTableName), Arc<Mutex<TableState>>>
 /// In-memory implementation of [`Catalog`]. Cheap to clone via `Arc`.
 ///
 /// Concurrency model:
-/// * `tables` is a `tokio::sync::Mutex<HashMap<...>>`. We hold this lock only
-///   long enough to look up (or insert) the per-table `Arc<Mutex<TableState>>`
-///   then drop it before doing any real work.
+/// * `tables` is a `tokio::sync::RwLock<HashMap<...>>`. Reads (every SELECT's
+///   load_table) take the shared lock so concurrent readers never queue on
+///   each other — with the old Mutex, 16 concurrent point reads serialized
+///   through this one lock and queueing dominated their latency. Writers
+///   (DDL) take the exclusive lock; they are rare. The guard is held only
+///   long enough to look up (or insert) the per-table `Arc<Mutex<TableState>>`,
+///   then dropped before doing any real work.
 /// * Commits and reads on a single `(project, table)` serialize on that table's
 ///   own mutex. Two projects — or two different tables in the same project —
 ///   never block each other.
@@ -139,7 +143,7 @@ pub struct InMemoryCatalog {
     /// epoch at fill time and compare against this on each read; a mismatch
     /// causes an immediate cache-miss refetch.
     epoch: AtomicU64,
-    tables: Mutex<TableMap>,
+    tables: RwLock<TableMap>,
     namespaces: Mutex<HashSet<ProjectId>>,
     /// Per-project registered SQL functions. One shared `HashMap` keyed by
     /// `(ProjectId, name)` so per-project cost stays `O(bytes)` — no
@@ -243,7 +247,7 @@ impl InMemoryCatalog {
     pub fn new() -> Self {
         Self {
             epoch: AtomicU64::new(0),
-            tables: Mutex::new(HashMap::new()),
+            tables: RwLock::new(HashMap::new()),
             namespaces: Mutex::new(HashSet::new()),
             sql_functions: Mutex::new(HashMap::new()),
             sequences: Mutex::new(HashMap::new()),
@@ -279,7 +283,7 @@ impl InMemoryCatalog {
         // (cron.job, auth.users, net._http_response, etc.) by bare name.
         let pub_qtable = QualifiedTableName::in_public(table.clone());
         {
-            let tables = self.tables.lock().await;
+            let tables = self.tables.read().await;
             if tables.contains_key(&(*project, pub_qtable.clone())) {
                 drop(tables);
                 return self.get_table_qualified(project, &pub_qtable).await;
@@ -355,7 +359,7 @@ impl InMemoryCatalog {
         qtable: &QualifiedTableName,
     ) -> Result<Arc<Mutex<TableState>>> {
         let key = (*project, qtable.clone());
-        let guard = self.tables.lock().await;
+        let guard = self.tables.read().await;
         guard
             .get(&key)
             .cloned()
@@ -413,7 +417,7 @@ impl InMemoryCatalog {
         table: &TableName,
     ) -> QualifiedTableName {
         let pub_qtable = QualifiedTableName::in_public(table.clone());
-        let tables = self.tables.lock().await;
+        let tables = self.tables.read().await;
         if tables.contains_key(&(*project, pub_qtable.clone())) {
             return pub_qtable;
         }
@@ -482,7 +486,7 @@ impl Catalog for InMemoryCatalog {
         // that are referenced by their bare name after DataFusion schema stripping.
         let pub_qtable = QualifiedTableName::in_public(table.clone());
         {
-            let tables = self.tables.lock().await;
+            let tables = self.tables.read().await;
             if tables.contains_key(&(*project, pub_qtable.clone())) {
                 drop(tables);
                 return self.load_table_qualified(project, &pub_qtable).await;
@@ -539,7 +543,7 @@ impl Catalog for InMemoryCatalog {
     #[instrument(skip(self), fields(project = %project))]
     async fn list_tables(&self, project: &ProjectId) -> Result<Vec<TableName>> {
         // Back-compat: return only the bare table names from the public schema.
-        let tables = self.tables.lock().await;
+        let tables = self.tables.read().await;
         let public = SchemaName::public();
         let mut out: Vec<TableName> = tables
             .keys()
@@ -556,7 +560,7 @@ impl Catalog for InMemoryCatalog {
         // Single-pass: hold the table-map mutex once, drop every entry whose
         // project matches. Cheaper than the default-impl loop (N small awaits)
         // and atomic w.r.t. concurrent list_tables on the same in-memory map.
-        let mut tables = self.tables.lock().await;
+        let mut tables = self.tables.write().await;
         tables.retain(|(t, _), _| t != project);
         let mut namespaces = self.namespaces.lock().await;
         namespaces.remove(project);
@@ -593,7 +597,7 @@ impl Catalog for InMemoryCatalog {
         // re-acquiring the top-level map mutex per table the way the default
         // impl (list_tables → load_table loop) would.
         let handles: Vec<Arc<Mutex<TableState>>> = {
-            let tables = self.tables.lock().await;
+            let tables = self.tables.read().await;
             tables
                 .iter()
                 .filter(|((proj, _), _)| proj == project)
@@ -931,7 +935,7 @@ impl Catalog for InMemoryCatalog {
     ) -> Result<()> {
         self.bump_epoch();
         let qtable = self.resolve_qtable(project, table).await;
-        let tables = self.tables.lock().await;
+        let tables = self.tables.read().await;
         let entry = tables.get(&(*project, qtable)).ok_or_else(|| {
             BasinError::not_found(format!("{project}: table {table}"))
         })?;
@@ -1539,7 +1543,7 @@ impl Catalog for InMemoryCatalog {
 
         // Snapshot all per-table Arc handles for this project in one pass.
         let handles: Vec<(QualifiedTableName, std::sync::Arc<tokio::sync::Mutex<TableState>>)> = {
-            let tables = self.tables.lock().await;
+            let tables = self.tables.read().await;
             tables
                 .iter()
                 .filter(|((p, _), _)| p == project)
@@ -1658,7 +1662,7 @@ impl Catalog for InMemoryCatalog {
             .insert(qtable.schema.clone());
 
         let key = (*project, qtable.clone());
-        let mut tables = self.tables.lock().await;
+        let mut tables = self.tables.write().await;
         if tables.contains_key(&key) {
             return Err(BasinError::catalog(format!(
                 "table {project}/{qtable} already exists"
@@ -1687,7 +1691,7 @@ impl Catalog for InMemoryCatalog {
     ) -> Result<()> {
         self.bump_epoch();
         let key = (*project, qtable.clone());
-        let mut tables = self.tables.lock().await;
+        let mut tables = self.tables.write().await;
         tables
             .remove(&key)
             .ok_or_else(|| BasinError::not_found(format!("{project}/{qtable}")))?;
@@ -1703,7 +1707,7 @@ impl Catalog for InMemoryCatalog {
         self.bump_epoch();
         let old_key = (*project, old.clone());
         let new_key = (*project, new.clone());
-        let mut tables = self.tables.lock().await;
+        let mut tables = self.tables.write().await;
         if tables.contains_key(&new_key) {
             return Err(BasinError::catalog(format!(
                 "rename_table: target {project}/{new} already exists"
@@ -1720,7 +1724,7 @@ impl Catalog for InMemoryCatalog {
     }
 
     async fn list_tables_qualified(&self, project: &ProjectId) -> Result<Vec<QualifiedTableName>> {
-        let tables = self.tables.lock().await;
+        let tables = self.tables.read().await;
         let mut out: Vec<QualifiedTableName> = tables
             .keys()
             .filter(|(p, _)| p == project)
@@ -1874,7 +1878,7 @@ impl Catalog for InMemoryCatalog {
         };
 
         let dst_key = (*project, dst.clone());
-        let mut tables = self.tables.lock().await;
+        let mut tables = self.tables.write().await;
         if tables.contains_key(&dst_key) {
             return Err(BasinError::catalog(format!(
                 "fork_table: {project}/{dst} already exists",
@@ -2153,7 +2157,7 @@ impl Catalog for InMemoryCatalog {
         }
         // Collect tables in this schema.
         let tables_in_schema: Vec<QualifiedTableName> = {
-            let tables = self.tables.lock().await;
+            let tables = self.tables.read().await;
             tables
                 .keys()
                 .filter(|(p, qt)| p == project && &qt.schema == schema)
@@ -2168,7 +2172,7 @@ impl Catalog for InMemoryCatalog {
         }
         // CASCADE: drop all tables.
         if cascade {
-            let mut tables = self.tables.lock().await;
+            let mut tables = self.tables.write().await;
             for qt in &tables_in_schema {
                 tables.remove(&(*project, qt.clone()));
             }
@@ -2203,7 +2207,7 @@ impl InMemoryCatalog {
         // Snapshot the per-table handles so we don't hold the
         // top-level table-map lock while inspecting each one's schema.
         let handles: Vec<(QualifiedTableName, Arc<Mutex<TableState>>)> = {
-            let tables = self.tables.lock().await;
+            let tables = self.tables.read().await;
             tables
                 .iter()
                 .filter(|((t, _), _)| t == project)
