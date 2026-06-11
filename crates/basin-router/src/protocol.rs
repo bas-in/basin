@@ -787,7 +787,7 @@ fn parse_pg_array_text(s: &str) -> std::result::Result<Vec<Option<String>>, PgWi
 /// integers are big-endian fixed-width, floats are IEEE 754 big-endian, bool
 /// is one byte, text/varchar/bytea are raw bytes (no length prefix — the
 /// surrounding `Bind` message already framed them).
-fn decode_param_binary(
+pub(crate) fn decode_param_binary(
     bytes: &[u8],
     declared: &Type,
 ) -> std::result::Result<ScalarParam, PgWireError> {
@@ -1439,38 +1439,56 @@ where
             table,
             columns,
             path,
+            opts,
             ..
         } => {
             if let Some(p) = path {
                 crate::copy::validate_copy_path(p)?;
             }
-            if columns.is_some() {
+            let is_binary = opts.format == crate::copy::CopyFormat::Binary;
+            if columns.is_some() || is_binary {
                 let table_cols = crate::copy::resolve_table_columns(session, table)
                     .await
                     .map_err(|e| format!("COPY: {e}"))?;
                 if table_cols.is_empty() {
                     return Err(format!("COPY: cannot resolve schema of {table:?}"));
                 }
-                crate::copy::select_copy_in_columns(table, &table_cols, columns.as_deref())?;
+                let cols =
+                    crate::copy::select_copy_in_columns(table, &table_cols, columns.as_deref())?;
+                if is_binary {
+                    // Prefix with the 0A000 sqlstate marker so the caller
+                    // surfaces feature_not_supported rather than 42601.
+                    crate::copy::validate_binary_copy_columns(cols.iter())
+                        .map_err(|m| format!("\x000A000\x00{m}"))?;
+                }
             }
         }
         crate::copy::CopyCommand::To {
             table,
             columns,
             path,
+            opts,
             ..
         } => {
             if let Some(p) = path {
                 crate::copy::validate_copy_path(p)?;
             }
-            if columns.is_some() {
+            let is_binary = opts.format == crate::copy::CopyFormat::Binary;
+            if columns.is_some() || is_binary {
                 let table_cols = crate::copy::resolve_table_columns(session, table)
                     .await
                     .map_err(|e| format!("COPY: {e}"))?;
                 if table_cols.is_empty() {
                     return Err(format!("COPY: cannot resolve schema of {table:?}"));
                 }
-                crate::copy::select_copy_out_columns(table, &table_cols, columns.as_deref())?;
+                let cols =
+                    crate::copy::select_copy_out_columns(table, &table_cols, columns.as_deref())?;
+                if is_binary {
+                    // Prefix with the 0A000 sqlstate marker so the caller
+                    // surfaces feature_not_supported rather than 42601.
+                    crate::copy::validate_binary_copy_columns(cols.iter())
+                        .map_err(|m| format!("\x000A000\x00{m}"))?;
+                }
             }
         }
     }
@@ -1978,6 +1996,12 @@ where
                     return ExecuteOutcome::error_info(info);
                 }
             };
+            if opts.format == crate::copy::CopyFormat::Binary {
+                if let Err(msg) = crate::copy::validate_binary_copy_columns(cols.iter()) {
+                    let info = ErrorInfo::new("ERROR".to_owned(), "0A000".to_owned(), msg);
+                    return ExecuteOutcome::error_info(info);
+                }
+            }
             let full_schema = std::sync::Arc::new(arrow_schema::Schema::new(
                 table_cols.iter().cloned().collect::<Vec<_>>(),
             ));
@@ -2024,8 +2048,9 @@ where
                 };
             }
             let n = state.columns.len();
+            let format = state.opts.format;
             ExecuteOutcome {
-                messages: crate::copy::copy_from_stdin_messages(n),
+                messages: crate::copy::copy_from_stdin_messages(n, format),
                 start_copy_in: Some(state),
                 is_error: false,
             }
@@ -2934,6 +2959,16 @@ impl<S: Session + 'static> BasinSimpleQueryHandlerSlot<S> {
                         return finish_copy_error(client, info.into()).await;
                     }
                 };
+                if opts.format == crate::copy::CopyFormat::Binary {
+                    if let Err(msg) = crate::copy::validate_binary_copy_columns(cols.iter()) {
+                        let info = pgwire::error::ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            "0A000".to_owned(),
+                            msg,
+                        );
+                        return finish_copy_error(client, info.into()).await;
+                    }
+                }
                 let full_schema = std::sync::Arc::new(arrow_schema::Schema::new(
                     table_cols.iter().cloned().collect::<Vec<_>>(),
                 ));
@@ -2991,11 +3026,12 @@ impl<S: Session + 'static> BasinSimpleQueryHandlerSlot<S> {
                     return Ok(());
                 }
                 let n = state.columns.len();
+                let format = state.opts.format;
                 {
                     let mut g = self.copy_state.lock().await;
                     *g = Some(state);
                 }
-                for m in crate::copy::copy_from_stdin_messages(n) {
+                for m in crate::copy::copy_from_stdin_messages(n, format) {
                     client.feed(m).await?;
                 }
                 client.flush().await?;

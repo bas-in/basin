@@ -1,13 +1,18 @@
 //! `COPY FROM STDIN` and `COPY TO STDOUT` for the simple-query path.
 //!
-//! v0.2: CSV format; delimiter/null/quote/escape configurable via WITH options.
-//! Column-list (`COPY t (a, b) ...`) is supported. Server-side file-path
+//! v0.3: CSV format (delimiter/null/quote/escape configurable via WITH
+//! options) plus the PG binary COPY format (`WITH (FORMAT BINARY)`, STDIN /
+//! STDOUT only). Column-list (`COPY t (a, b) ...`) and double-quoted
+//! identifiers (`COPY "users" (id, email) FROM STDIN` — the sqlx `PgCopyIn`
+//! shape) are supported. Server-side file-path
 //! variants (`COPY t FROM '/abs/path'` / `COPY t TO '/abs/path'`) are gated
 //! by two env vars: `BASIN_COPY_ALLOW_FILE_PATHS=1` (primary on/off gate) and
 //! `BASIN_COPY_PATH_ALLOWLIST` (colon-separated directory allowlist, required
 //! when file paths are enabled). Query-source COPY (`COPY (SELECT …) TO
 //! STDOUT`) is supported. `COPY … FROM PROGRAM '…'` is rejected with SQLSTATE
-//! 42501. BINARY format rejected with `42601`.
+//! 42501. BINARY format with CSV-only options (HEADER / DELIMITER / NULL /
+//! QUOTE / ESCAPE) or a file path is rejected with `42601`; BINARY over a
+//! column type without a binary codec is rejected with `0A000`.
 //!
 //! Architecture:
 //!
@@ -42,9 +47,10 @@
 
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field};
-use basin_engine::ExecResult;
-use bytes::Bytes;
+use arrow_array::RecordBatch;
+use arrow_schema::{DataType, Field, Schema};
+use basin_engine::{ExecResult, ScalarParam};
+use bytes::{BufMut, Bytes, BytesMut};
 use pgwire::error::ErrorInfo;
 use pgwire::messages::copy::{CopyData, CopyInResponse, CopyOutResponse};
 use pgwire::messages::response::{CommandComplete, ReadyForQuery, TransactionStatus};
@@ -52,12 +58,25 @@ use pgwire::messages::PgWireBackendMessage;
 
 use crate::protocol::Session;
 
-/// CSV format options carried with a COPY statement.
+/// Wire format of a COPY statement: CSV (the default) or the PG binary
+/// COPY format (`WITH (FORMAT BINARY)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum CopyFormat {
+    #[default]
+    Csv,
+    Binary,
+}
+
+/// Format options carried with a COPY statement.
 ///
-/// Defaults match Postgres CSV mode: comma delimiter, empty-string NULL,
-/// double-quote character for quoting, and same char for escaping.
+/// CSV defaults match Postgres CSV mode: comma delimiter, empty-string NULL,
+/// double-quote character for quoting, and same char for escaping. The CSV
+/// knobs are meaningless (and rejected at parse time) when `format` is
+/// `Binary`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CopyOptions {
+    /// Wire format (default: CSV).
+    pub(crate) format: CopyFormat,
     /// Field delimiter (default: `','`).
     pub(crate) delimiter: char,
     /// String that represents NULL in the CSV input/output (default: `""`).
@@ -71,6 +90,7 @@ pub(crate) struct CopyOptions {
 impl Default for CopyOptions {
     fn default() -> Self {
         Self {
+            format: CopyFormat::Csv,
             delimiter: ',',
             null_string: String::new(),
             quote: '"',
@@ -147,6 +167,11 @@ pub(crate) struct CopyInState {
     /// Rows are held here until `INGEST_BATCH_SIZE` is reached or the
     /// COPY stream ends (`final_chunk = true`).
     pub(crate) pending_rows: Vec<Vec<Option<String>>>,
+    /// BINARY format only: the 19+-byte `PGCOPY` header has been consumed.
+    pub(crate) binary_header_parsed: bool,
+    /// BINARY format only: the `0xFFFF` file trailer has been consumed; any
+    /// further non-empty CopyData is a protocol error.
+    pub(crate) binary_done: bool,
 }
 
 /// Number of parsed CSV rows to accumulate before issuing one
@@ -175,6 +200,8 @@ impl CopyInState {
             header_pending: with_header,
             opts,
             pending_rows: Vec::new(),
+            binary_header_parsed: false,
+            binary_done: false,
         }
     }
 
@@ -287,6 +314,12 @@ pub(crate) fn parse_copy(sql: &str) -> std::result::Result<Option<CopyCommand>, 
             "unexpected trailing input after COPY: {:?}",
             sc.rest()
         ));
+    }
+    if opts.format == CopyFormat::Binary && path.is_some() {
+        return Err(
+            "COPY WITH (FORMAT BINARY) is only supported for STDIN/STDOUT; file-path COPY is CSV-only"
+                .into(),
+        );
     }
     Ok(Some(match direction {
         Direction::From => CopyCommand::From {
@@ -431,33 +464,60 @@ enum Direction {
     To,
 }
 
-/// Parse the optional `WITH (FORMAT CSV [, HEADER {true|false} [, DELIMITER 'c'
-/// [, NULL 's'] [, QUOTE 'c'] [, ESCAPE 'c']]])`. BINARY format is rejected.
-/// FORCE_*, ENCODING are rejected. Returns `(header, CopyOptions)`.
+/// Parse the optional `WITH (FORMAT {CSV|BINARY} [, HEADER {true|false}
+/// [, DELIMITER 'c'] [, NULL 's'] [, QUOTE 'c'] [, ESCAPE 'c']])`.
+/// FORCE_*, ENCODING, and FORMAT TEXT are rejected. Returns
+/// `(header, CopyOptions)`.
 ///
-/// Also accepts the legacy `WITH CSV [HEADER]` shorthand (no parens) that
-/// older Postgres clients still emit.
+/// Also accepts:
+/// - the modern parenthesised option list without the WITH keyword
+///   (`COPY t FROM STDIN (FORMAT CSV)`) that PG ≥ 9.0 documents;
+/// - the legacy `WITH CSV [HEADER]` / `WITH BINARY` shorthands (no parens)
+///   that older Postgres clients still emit.
+///
+/// The CSV-only options (HEADER / DELIMITER / NULL / QUOTE / ESCAPE) are
+/// rejected when combined with `FORMAT BINARY`, mirroring Postgres's
+/// "cannot specify X in BINARY mode" errors. Option order is free-form, so
+/// the conflict check runs after the whole list is parsed.
 fn parse_with_options(sc: &mut Scanner<'_>) -> std::result::Result<(bool, CopyOptions), String> {
     sc.skip_whitespace();
-    if !sc.eat_keyword("WITH") {
-        // Plain `COPY t FROM STDIN` with no options — accept and treat as CSV.
-        return Ok((false, CopyOptions::default()));
-    }
+    let has_with = sc.eat_keyword("WITH");
     sc.skip_whitespace();
-    if !sc.eat_punct('(') {
-        // Legacy `WITH CSV [HEADER]` form.
-        if !sc.eat_keyword("CSV") {
-            return Err("expected '(' after WITH, or legacy 'WITH CSV [HEADER]' shorthand".into());
+    if !sc.peek_punct('(') {
+        if !has_with {
+            // Plain `COPY t FROM STDIN` with no options — accept, treat as CSV.
+            return Ok((false, CopyOptions::default()));
         }
-        let mut header = false;
-        sc.skip_whitespace();
-        if sc.eat_keyword("HEADER") {
-            header = true;
+        // Legacy `WITH CSV [HEADER]` / `WITH BINARY` forms.
+        if sc.eat_keyword("CSV") {
+            let mut header = false;
+            sc.skip_whitespace();
+            if sc.eat_keyword("HEADER") {
+                header = true;
+            }
+            return Ok((header, CopyOptions::default()));
         }
-        return Ok((header, CopyOptions::default()));
+        if sc.eat_keyword("BINARY") {
+            return Ok((
+                false,
+                CopyOptions {
+                    format: CopyFormat::Binary,
+                    ..CopyOptions::default()
+                },
+            ));
+        }
+        return Err(
+            "expected '(' after WITH, or legacy 'WITH CSV [HEADER]' / 'WITH BINARY' shorthand"
+                .into(),
+        );
     }
+    sc.eat_punct('(');
     let mut header = false;
     let mut opts = CopyOptions::default();
+    // Track which CSV-only options were written out so the BINARY conflict
+    // check below can name the offending option (FORMAT may legally appear
+    // after the option it conflicts with).
+    let mut csv_only_seen: Option<&'static str> = None;
     loop {
         sc.skip_whitespace();
         let key = sc
@@ -470,11 +530,18 @@ fn parse_with_options(sc: &mut Scanner<'_>) -> std::result::Result<(bool, CopyOp
                 let v = sc
                     .eat_ident()
                     .ok_or_else(|| "expected format value after FORMAT".to_owned())?;
-                if !v.eq_ignore_ascii_case("csv") {
-                    return Err(format!("only FORMAT CSV is supported; BINARY and other formats are not implemented (got {v:?})"));
+                if v.eq_ignore_ascii_case("csv") {
+                    opts.format = CopyFormat::Csv;
+                } else if v.eq_ignore_ascii_case("binary") {
+                    opts.format = CopyFormat::Binary;
+                } else {
+                    return Err(format!(
+                        "FORMAT {v:?} is not supported (accepted: CSV, BINARY)"
+                    ));
                 }
             }
             "HEADER" => {
+                csv_only_seen.get_or_insert("HEADER");
                 sc.skip_whitespace();
                 // HEADER may appear with no value (true), or with TRUE/FALSE/ON/OFF/1/0.
                 if sc.peek_punct(',') || sc.peek_punct(')') {
@@ -493,6 +560,7 @@ fn parse_with_options(sc: &mut Scanner<'_>) -> std::result::Result<(bool, CopyOp
                 }
             }
             "DELIMITER" => {
+                csv_only_seen.get_or_insert("DELIMITER");
                 sc.skip_whitespace();
                 let s = parse_string_literal(sc)?;
                 let mut chars = s.chars();
@@ -505,10 +573,12 @@ fn parse_with_options(sc: &mut Scanner<'_>) -> std::result::Result<(bool, CopyOp
                 opts.delimiter = c;
             }
             "NULL" => {
+                csv_only_seen.get_or_insert("NULL");
                 sc.skip_whitespace();
                 opts.null_string = parse_string_literal(sc)?;
             }
             "QUOTE" => {
+                csv_only_seen.get_or_insert("QUOTE");
                 sc.skip_whitespace();
                 let s = parse_string_literal(sc)?;
                 let mut chars = s.chars();
@@ -521,6 +591,7 @@ fn parse_with_options(sc: &mut Scanner<'_>) -> std::result::Result<(bool, CopyOp
                 opts.quote = c;
             }
             "ESCAPE" => {
+                csv_only_seen.get_or_insert("ESCAPE");
                 sc.skip_whitespace();
                 let s = parse_string_literal(sc)?;
                 let mut chars = s.chars();
@@ -546,11 +617,15 @@ fn parse_with_options(sc: &mut Scanner<'_>) -> std::result::Result<(bool, CopyOp
             return Err("expected ',' or ')' in WITH (...)".into());
         }
     }
+    if let (CopyFormat::Binary, Some(opt)) = (opts.format, csv_only_seen) {
+        return Err(format!("cannot specify {opt} in BINARY mode"));
+    }
     Ok((header, opts))
 }
 
 /// Hand-rolled scanner over the SQL string. Whitespace-aware, ASCII-only
-/// keywords (case-insensitive), bare identifier (no quoted ident in v0.1).
+/// keywords (case-insensitive), bare or double-quoted identifiers (quoted
+/// names restricted to the bare-identifier charset — see `eat_ident`).
 struct Scanner<'a> {
     s: &'a str,
     pos: usize,
@@ -599,12 +674,53 @@ impl<'a> Scanner<'a> {
         true
     }
 
+    /// Eat one identifier: bare (`users`) or double-quoted (`"users"`, with
+    /// `""` escaping — the form sqlx's `PgCopyIn` emits). Quoted identifiers
+    /// are returned *unquoted*, and only accepted when the unquoted form
+    /// matches the bare-identifier charset: the name is later re-rendered
+    /// into `SELECT`/`INSERT` SQL without quoting, so admitting arbitrary
+    /// characters here would be an injection vector. Exotic quoted names
+    /// (spaces, punctuation, doubled quotes) return `None` without consuming,
+    /// which surfaces the caller's "expected table/column name" error.
     fn eat_ident(&mut self) -> Option<String> {
         self.skip_whitespace();
         let bytes = self.s.as_bytes();
         let start = self.pos;
         if start >= bytes.len() {
             return None;
+        }
+        if bytes[start] == b'"' {
+            let mut i = start + 1;
+            let mut out = String::new();
+            loop {
+                if i >= bytes.len() {
+                    return None; // unterminated quoted identifier
+                }
+                let b = bytes[i];
+                if b == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        out.push('"');
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                out.push(b as char);
+                i += 1;
+            }
+            let head_ok = out
+                .as_bytes()
+                .first()
+                .is_some_and(|&b| b.is_ascii_alphabetic() || b == b'_');
+            let body_ok = out
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_');
+            if !(head_ok && body_ok) {
+                return None;
+            }
+            self.pos = i;
+            return Some(out);
         }
         let first = bytes[start];
         if !(first.is_ascii_alphabetic() || first == b'_') {
@@ -735,13 +851,40 @@ pub(crate) fn select_copy_out_columns(
     Ok(selected)
 }
 
-/// Build `CopyInResponse` for a CSV/text-format copy with `n` columns.
-pub(crate) fn copy_in_response(n: usize) -> CopyInResponse {
-    CopyInResponse::new(0, n as i16, vec![0; n])
+/// Overall + per-column format code for a CopyIn/OutResponse: 0 = text
+/// (covers our CSV mode), 1 = binary.
+fn copy_format_code(format: CopyFormat) -> i16 {
+    match format {
+        CopyFormat::Csv => 0,
+        CopyFormat::Binary => 1,
+    }
 }
 
-pub(crate) fn copy_out_response(n: usize) -> CopyOutResponse {
-    CopyOutResponse::new(0, n as i16, vec![0; n])
+/// Build `CopyInResponse` for a copy with `n` columns in `format`.
+pub(crate) fn copy_in_response(n: usize, format: CopyFormat) -> CopyInResponse {
+    let code = copy_format_code(format);
+    CopyInResponse::new(code as i8, n as i16, vec![code; n])
+}
+
+pub(crate) fn copy_out_response(n: usize, format: CopyFormat) -> CopyOutResponse {
+    let code = copy_format_code(format);
+    CopyOutResponse::new(code as i8, n as i16, vec![code; n])
+}
+
+/// Process every complete record currently buffered in `state`, dispatching
+/// on the COPY wire format. Both arms share the same batching/flush/error
+/// model: rows accumulate in `state.pending_rows` until `INGEST_BATCH_SIZE`
+/// or end-of-stream, the first error latches into `state.error`, and
+/// subsequent calls drain without touching the engine.
+pub(crate) async fn process_buffered_rows<S: Session + ?Sized>(
+    state: &mut CopyInState,
+    session: &S,
+    final_chunk: bool,
+) {
+    match state.opts.format {
+        CopyFormat::Csv => process_buffered_csv_rows(state, session, final_chunk).await,
+        CopyFormat::Binary => process_buffered_binary_rows(state, session, final_chunk).await,
+    }
 }
 
 /// Process every complete CSV record currently buffered in `state`.
@@ -759,7 +902,7 @@ pub(crate) fn copy_out_response(n: usize) -> CopyOutResponse {
 ///
 /// Stops processing on the first engine error, which gets latched into
 /// `state.error`. Subsequent calls fall through (drain mode).
-pub(crate) async fn process_buffered_rows<S: Session + ?Sized>(
+async fn process_buffered_csv_rows<S: Session + ?Sized>(
     state: &mut CopyInState,
     session: &S,
     final_chunk: bool,
@@ -831,6 +974,287 @@ pub(crate) async fn process_buffered_rows<S: Session + ?Sized>(
                 return;
             }
         }
+    }
+}
+
+/// The 11-byte PG binary COPY signature: `PGCOPY\n\xff\r\n\0`. Followed on
+/// the wire by a 4-byte flags word and a 4-byte extension-area length.
+pub(crate) const COPY_BINARY_SIGNATURE: &[u8; 11] = b"PGCOPY\n\xFF\r\n\0";
+
+/// Header flags word: bit 16 = OIDs-included (we reject it — OIDs were
+/// removed in PG 12 and no modern client emits them); bits 17–31 are
+/// "critical" per the spec, so an unknown set bit means we cannot safely
+/// read the file. Bits 0–15 must be ignored.
+const COPY_BINARY_CRITICAL_FLAGS: u32 = 0xFFFF_0000;
+
+/// Try to consume the binary COPY header (signature + flags + extension
+/// area) from the front of `buf`.
+///
+/// `Ok(Some(n))` = header valid, `n` bytes consumed; `Ok(None)` = need more
+/// bytes; `Err` = malformed header.
+fn parse_binary_header(buf: &[u8]) -> std::result::Result<Option<usize>, String> {
+    const FIXED: usize = 11 + 4 + 4;
+    if buf.len() < FIXED {
+        return Ok(None);
+    }
+    if &buf[..11] != COPY_BINARY_SIGNATURE {
+        return Err("COPY BINARY: input does not start with the PGCOPY signature".into());
+    }
+    let flags = u32::from_be_bytes(buf[11..15].try_into().unwrap());
+    if flags & COPY_BINARY_CRITICAL_FLAGS != 0 {
+        return Err(format!(
+            "COPY BINARY: unsupported header flags 0x{flags:08x} (OIDs / unknown critical bits)"
+        ));
+    }
+    let ext = u32::from_be_bytes(buf[15..19].try_into().unwrap()) as usize;
+    if buf.len() < FIXED + ext {
+        return Ok(None);
+    }
+    Ok(Some(FIXED + ext))
+}
+
+/// One parse step over the binary tuple stream.
+#[derive(Debug)]
+enum BinaryRecord {
+    /// A complete tuple: per-field raw bytes (`None` = NULL, -1 length) and
+    /// the total byte count consumed from the buffer.
+    Row(Vec<Option<Vec<u8>>>, usize),
+    /// The `0xFFFF` file trailer (consumes 2 bytes).
+    Trailer,
+    /// Not enough buffered bytes for a full tuple yet.
+    NeedMore,
+}
+
+/// Try to parse one binary tuple (`i16` field count, then per-field
+/// `i32` length + raw bytes) from the front of `buf`. Nothing is consumed
+/// on `NeedMore` — the caller drains exactly the returned byte count.
+fn parse_binary_record(
+    buf: &[u8],
+    expected_cols: usize,
+) -> std::result::Result<BinaryRecord, String> {
+    if buf.len() < 2 {
+        return Ok(BinaryRecord::NeedMore);
+    }
+    let nfields = i16::from_be_bytes([buf[0], buf[1]]);
+    if nfields == -1 {
+        return Ok(BinaryRecord::Trailer);
+    }
+    if nfields < 0 || nfields as usize != expected_cols {
+        return Err(format!(
+            "COPY BINARY: tuple has {nfields} fields, expected {expected_cols}"
+        ));
+    }
+    let mut pos = 2usize;
+    let mut fields: Vec<Option<Vec<u8>>> = Vec::with_capacity(expected_cols);
+    for _ in 0..expected_cols {
+        if buf.len() < pos + 4 {
+            return Ok(BinaryRecord::NeedMore);
+        }
+        let len = i32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        if len == -1 {
+            fields.push(None);
+            continue;
+        }
+        if len < 0 {
+            return Err(format!("COPY BINARY: invalid field length {len}"));
+        }
+        let len = len as usize;
+        if buf.len() < pos + len {
+            return Ok(BinaryRecord::NeedMore);
+        }
+        fields.push(Some(buf[pos..pos + len].to_vec()));
+        pos += len;
+    }
+    Ok(BinaryRecord::Row(fields, pos))
+}
+
+/// Validate that every COPY-selected column has a binary codec on both the
+/// decode (`protocol::decode_param_binary`) and encode
+/// (`types::encode_copy_binary_field`) side. Anything outside the
+/// intersection — vectors, intervals, arrays — gets a clean error naming the
+/// column and its type. Callers surface this as SQLSTATE `0A000`
+/// (feature_not_supported).
+pub(crate) fn validate_binary_copy_columns<'a, I>(columns: I) -> std::result::Result<(), String>
+where
+    I: IntoIterator<Item = &'a Field>,
+{
+    for f in columns {
+        let supported = match f.data_type() {
+            DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::Timestamp(_, _)
+            | DataType::Date32
+            | DataType::Decimal128(_, _) => true,
+            // UUID rides FixedSizeBinary(16) + field metadata; a bare
+            // FixedSizeBinary column has no binary wire mapping.
+            DataType::FixedSizeBinary(16) => {
+                crate::types::arrow_to_pg_type_field(f) == pgwire::api::Type::UUID
+            }
+            _ => false,
+        };
+        if !supported {
+            return Err(format!(
+                "COPY BINARY does not support column \"{}\" of type {} — use FORMAT CSV",
+                f.name(),
+                f.data_type()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Decode one non-NULL binary field into the canonical text cell the shared
+/// COPY-IN row pipeline (`ingest_csv_batch` / `build_insert_sql`) consumes.
+/// Reuses the extended-protocol binary *parameter* codec
+/// ([`crate::protocol::decode_param_binary`]) so COPY BINARY and binary Bind
+/// values can never drift apart.
+fn decode_binary_field(bytes: &[u8], field: &Field) -> std::result::Result<Option<String>, String> {
+    let ty = crate::types::arrow_to_pg_type_field(field);
+    let scalar = crate::protocol::decode_param_binary(bytes, &ty)
+        .map_err(|e| format!("COPY BINARY: column \"{}\": {e}", field.name()))?;
+    scalar_to_copy_cell(scalar, field.name())
+}
+
+/// Render a decoded [`ScalarParam`] as the text-cell form the CSV ingest
+/// path already parses per column type (`\xHEX` for bytea, ISO-8601 for
+/// timestamps — the param decoder already produced those as `Text`).
+fn scalar_to_copy_cell(
+    scalar: ScalarParam,
+    col: &str,
+) -> std::result::Result<Option<String>, String> {
+    Ok(match scalar {
+        ScalarParam::Null => None,
+        ScalarParam::Int4(v) => Some(v.to_string()),
+        ScalarParam::Int8(v) => Some(v.to_string()),
+        ScalarParam::Float8(v) => Some(v.to_string()),
+        ScalarParam::Bool(b) => Some(if b { "true" } else { "false" }.to_owned()),
+        ScalarParam::Text(s) => Some(s),
+        ScalarParam::Bytea(bytes) => {
+            let mut s = String::with_capacity(2 + bytes.len() * 2);
+            s.push_str("\\x");
+            for b in &bytes {
+                use std::fmt::Write;
+                let _ = write!(s, "{b:02x}");
+            }
+            Some(s)
+        }
+        ScalarParam::Array(_) => {
+            return Err(format!(
+                "COPY BINARY: array values are not supported (column \"{col}\")"
+            ));
+        }
+    })
+}
+
+/// Binary-format counterpart of [`process_buffered_csv_rows`]: consume the
+/// `PGCOPY` header once, then every complete tuple currently buffered.
+/// Decoded rows feed the same `pending_rows` → `flush_pending_rows` batch
+/// pipeline as CSV. The first error latches into `state.error` and flips the
+/// stream into drain mode (bytes discarded until CopyDone) — identical
+/// protocol-state guarantees to the CSV path.
+async fn process_buffered_binary_rows<S: Session + ?Sized>(
+    state: &mut CopyInState,
+    session: &S,
+    final_chunk: bool,
+) {
+    if state.error.is_some() {
+        state.buffer.clear();
+        return;
+    }
+    if !state.binary_header_parsed {
+        match parse_binary_header(&state.buffer) {
+            Ok(Some(n)) => {
+                state.buffer.drain(..n);
+                state.binary_header_parsed = true;
+            }
+            Ok(None) => {
+                if final_chunk {
+                    state.error = Some(
+                        "COPY BINARY: stream ended before a complete PGCOPY header".into(),
+                    );
+                    state.buffer.clear();
+                }
+                return;
+            }
+            Err(e) => {
+                state.error = Some(e);
+                state.buffer.clear();
+                return;
+            }
+        }
+    }
+    loop {
+        if state.binary_done {
+            if !state.buffer.is_empty() {
+                state.error = Some("COPY BINARY: unexpected data after the file trailer".into());
+                state.buffer.clear();
+                return;
+            }
+            break;
+        }
+        match parse_binary_record(&state.buffer, state.columns.len()) {
+            Ok(BinaryRecord::NeedMore) => {
+                if final_chunk && !state.buffer.is_empty() {
+                    state.error =
+                        Some("COPY BINARY: stream ended mid-tuple (truncated input)".into());
+                    state.buffer.clear();
+                    return;
+                }
+                break;
+            }
+            Ok(BinaryRecord::Trailer) => {
+                state.buffer.drain(..2);
+                state.binary_done = true;
+            }
+            Ok(BinaryRecord::Row(fields, consumed)) => {
+                let mut record: Vec<Option<String>> = Vec::with_capacity(fields.len());
+                for (raw, field) in fields.into_iter().zip(state.columns.iter()) {
+                    match raw {
+                        None => record.push(None),
+                        Some(bytes) => match decode_binary_field(&bytes, field) {
+                            Ok(cell) => record.push(cell),
+                            Err(e) => {
+                                state.error = Some(e);
+                                state.buffer.clear();
+                                return;
+                            }
+                        },
+                    }
+                }
+                state.pending_rows.push(record);
+                state.buffer.drain(..consumed);
+                if state.pending_rows.len() >= INGEST_BATCH_SIZE {
+                    flush_pending_rows(state, session).await;
+                    if state.error.is_some() {
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                state.error = Some(e);
+                state.buffer.clear();
+                return;
+            }
+        }
+    }
+    // End-of-stream: flush whatever is pending. A missing trailer at a clean
+    // tuple boundary is tolerated (be liberal in what we accept).
+    if final_chunk && !state.pending_rows.is_empty() {
+        flush_pending_rows(state, session).await;
     }
 }
 
@@ -1199,25 +1623,8 @@ pub(crate) async fn copy_to_csv_payload<S: Session + ?Sized>(
             )));
         }
     };
-    let column_indices: Vec<usize> = match column_list {
-        Some(list) => {
-            let mut out = Vec::with_capacity(list.len());
-            for name in list {
-                let idx = schema
-                    .fields()
-                    .iter()
-                    .position(|f| f.name().eq_ignore_ascii_case(name))
-                    .ok_or_else(|| {
-                        basin_common::BasinError::Internal(format!(
-                            "COPY TO: column {name:?} not in result schema"
-                        ))
-                    })?;
-                out.push(idx);
-            }
-            out
-        }
-        None => (0..schema.fields().len()).collect(),
-    };
+    let column_indices = resolve_column_indices(&schema, column_list)
+        .map_err(basin_common::BasinError::Internal)?;
     let header = if with_header {
         let mut row = String::new();
         for (i, &idx) in column_indices.iter().enumerate() {
@@ -1255,6 +1662,96 @@ pub(crate) async fn copy_to_csv_payload<S: Session + ?Sized>(
         }
     }
     Ok((header, body, row_count))
+}
+
+/// Encode `batches` as PG binary COPY chunks: one header chunk
+/// (`PGCOPY…` signature + zero flags + empty extension), one chunk per
+/// tuple (`i16` field count + length-prefixed fields), and the `0xFFFF`
+/// trailer chunk. Per-field bytes come from
+/// [`crate::types::encode_copy_binary_field`] — the same binary codec the
+/// extended-query result path uses — so COPY BINARY output round-trips
+/// through [`decode_binary_field`] by construction.
+///
+/// Returns `(chunks, row_count)`; the caller wraps each chunk in one
+/// `CopyData` message (or concatenates them for file output).
+fn binary_payload_from_batches(
+    schema: &Schema,
+    batches: &[RecordBatch],
+    column_indices: &[usize],
+) -> std::result::Result<(Vec<Vec<u8>>, u64), String> {
+    validate_binary_copy_columns(column_indices.iter().map(|&i| schema.field(i)))?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(total_rows + 2);
+    let mut header = Vec::with_capacity(19);
+    header.extend_from_slice(COPY_BINARY_SIGNATURE);
+    header.extend_from_slice(&0u32.to_be_bytes()); // flags
+    header.extend_from_slice(&0u32.to_be_bytes()); // extension length
+    chunks.push(header);
+    let mut buf = BytesMut::new();
+    let mut row_count: u64 = 0;
+    for batch in batches {
+        for r in 0..batch.num_rows() {
+            buf.put_i16(column_indices.len() as i16);
+            for &idx in column_indices {
+                crate::types::encode_copy_binary_field(
+                    batch.column(idx).as_ref(),
+                    r,
+                    schema.field(idx),
+                    &mut buf,
+                )
+                .map_err(|e| format!("COPY BINARY: encode column {:?}: {e}", schema.field(idx).name()))?;
+            }
+            chunks.push(buf.split().to_vec());
+            row_count += 1;
+        }
+    }
+    chunks.push(vec![0xFF, 0xFF]); // trailer: i16 -1
+    Ok((chunks, row_count))
+}
+
+/// Map an optional COPY column list to result-schema indices (the engine
+/// returns columns in physical table order; see `copy_to_csv_payload`).
+fn resolve_column_indices(
+    schema: &Schema,
+    column_list: Option<&[String]>,
+) -> std::result::Result<Vec<usize>, String> {
+    match column_list {
+        Some(list) => {
+            let mut out = Vec::with_capacity(list.len());
+            for name in list {
+                let idx = schema
+                    .fields()
+                    .iter()
+                    .position(|f| f.name().eq_ignore_ascii_case(name))
+                    .ok_or_else(|| format!("COPY TO: column {name:?} not in result schema"))?;
+                out.push(idx);
+            }
+            Ok(out)
+        }
+        None => Ok((0..schema.fields().len()).collect()),
+    }
+}
+
+/// Render the table (or column-list subset) as binary COPY chunks.
+/// Binary sibling of [`copy_to_csv_payload`].
+async fn copy_to_binary_payload<S: Session + ?Sized>(
+    session: &S,
+    table: &str,
+    column_list: Option<&[String]>,
+) -> std::result::Result<(Vec<Vec<u8>>, u64), basin_common::BasinError> {
+    let res = session.execute(&format!("SELECT * FROM {table}")).await?;
+    let (schema, batches) = match res {
+        ExecResult::Rows { schema, batches } => (schema, batches),
+        ExecResult::Empty { .. } => {
+            return Err(basin_common::BasinError::Internal(format!(
+                "COPY TO: SELECT * FROM {table} returned no result set"
+            )));
+        }
+    };
+    let column_indices = resolve_column_indices(&schema, column_list)
+        .map_err(basin_common::BasinError::Internal)?;
+    binary_payload_from_batches(&schema, &batches, &column_indices)
+        .map_err(basin_common::BasinError::FeatureNotSupported)
 }
 
 /// Render a query result as CSV bytes for `COPY (SELECT …) TO STDOUT`.
@@ -1366,30 +1863,51 @@ pub(crate) async fn copy_to_stdout_messages<S: Session + ?Sized>(
     };
     let n_cols = selected.len();
     let mut out: Vec<PgWireBackendMessage> = Vec::new();
-    let payload = match copy_to_csv_payload(session, table, column_list, with_header, opts).await {
-        Ok(p) => p,
-        Err(e) => {
-            out.push(PgWireBackendMessage::ErrorResponse(
-                crate::error::error_response(&e),
-            ));
-            out.push(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
-                TransactionStatus::Idle,
-            )));
-            return out;
+    // Build all CopyData chunks up-front so any engine/encode error collapses
+    // to ErrorResponse + ReadyForQuery (no half-open CopyOut state). The two
+    // formats only differ in chunk construction; the message shape is shared.
+    let (chunks, row_count) = match opts.format {
+        CopyFormat::Csv => {
+            match copy_to_csv_payload(session, table, column_list, with_header, opts).await {
+                Ok((header, body, row_count)) => {
+                    let mut chunks = Vec::with_capacity(body.len() + 1);
+                    if let Some(h) = header {
+                        chunks.push(h);
+                    }
+                    chunks.extend(body);
+                    (chunks, row_count)
+                }
+                Err(e) => {
+                    out.push(PgWireBackendMessage::ErrorResponse(
+                        crate::error::error_response(&e),
+                    ));
+                    out.push(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                        TransactionStatus::Idle,
+                    )));
+                    return out;
+                }
+            }
         }
+        CopyFormat::Binary => match copy_to_binary_payload(session, table, column_list).await {
+            Ok(p) => p,
+            Err(e) => {
+                out.push(PgWireBackendMessage::ErrorResponse(
+                    crate::error::error_response(&e),
+                ));
+                out.push(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                    TransactionStatus::Idle,
+                )));
+                return out;
+            }
+        },
     };
-    let (header, body, row_count) = payload;
     out.push(PgWireBackendMessage::CopyOutResponse(copy_out_response(
         n_cols,
+        opts.format,
     )));
-    if let Some(h) = header {
+    for chunk in chunks {
         out.push(PgWireBackendMessage::CopyData(CopyData::new(Bytes::from(
-            h,
-        ))));
-    }
-    for row in body {
-        out.push(PgWireBackendMessage::CopyData(CopyData::new(Bytes::from(
-            row,
+            chunk,
         ))));
     }
     out.push(PgWireBackendMessage::CopyDone(
@@ -1405,7 +1923,8 @@ pub(crate) async fn copy_to_stdout_messages<S: Session + ?Sized>(
 }
 
 /// Run `COPY (SELECT …) TO STDOUT` synchronously. Executes the query and
-/// streams the result as CSV. Returns the full backend-message sequence.
+/// streams the result as CSV or binary COPY chunks per `opts.format`.
+/// Returns the full backend-message sequence.
 pub(crate) async fn copy_query_to_stdout_messages<S: Session + ?Sized>(
     session: &S,
     query: &str,
@@ -1413,39 +1932,64 @@ pub(crate) async fn copy_query_to_stdout_messages<S: Session + ?Sized>(
     opts: &CopyOptions,
 ) -> Vec<PgWireBackendMessage> {
     let mut out: Vec<PgWireBackendMessage> = Vec::new();
-    let payload = match copy_query_to_csv_payload(session, query, with_header, opts).await {
-        Ok(p) => p,
-        Err(e) => {
-            out.push(PgWireBackendMessage::ErrorResponse(
-                crate::error::error_response(&e),
-            ));
-            out.push(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
-                TransactionStatus::Idle,
-            )));
-            return out;
-        }
+    let error_messages = |e: &basin_common::BasinError| {
+        vec![
+            PgWireBackendMessage::ErrorResponse(crate::error::error_response(e)),
+            PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(TransactionStatus::Idle)),
+        ]
     };
-    let (header, body, row_count) = payload;
-    // For query-source COPY we don't know the column count ahead of running
-    // the query. Derive it from the header or body row, or default to 1.
-    let n_cols = if let Some(ref h) = header {
-        h.iter().filter(|&&b| b == opts.delimiter as u8).count() + 1
-    } else if let Some(first) = body.first() {
-        first.iter().filter(|&&b| b == opts.delimiter as u8).count() + 1
-    } else {
-        1
+    let (chunks, row_count, n_cols) = match opts.format {
+        CopyFormat::Csv => {
+            let payload = match copy_query_to_csv_payload(session, query, with_header, opts).await
+            {
+                Ok(p) => p,
+                Err(e) => return error_messages(&e),
+            };
+            let (header, body, row_count) = payload;
+            // For CSV query-source COPY we don't know the column count ahead
+            // of running the query. Derive it from the header or body row,
+            // or default to 1.
+            let n_cols = if let Some(ref h) = header {
+                h.iter().filter(|&&b| b == opts.delimiter as u8).count() + 1
+            } else if let Some(first) = body.first() {
+                first.iter().filter(|&&b| b == opts.delimiter as u8).count() + 1
+            } else {
+                1
+            };
+            let mut chunks = Vec::with_capacity(body.len() + 1);
+            if let Some(h) = header {
+                chunks.push(h);
+            }
+            chunks.extend(body);
+            (chunks, row_count, n_cols)
+        }
+        CopyFormat::Binary => {
+            let (schema, batches) = match session.execute(query).await {
+                Ok(ExecResult::Rows { schema, batches }) => (schema, batches),
+                Ok(ExecResult::Empty { .. }) => {
+                    return error_messages(&basin_common::BasinError::Internal(
+                        "COPY (query) TO: query returned no result set".into(),
+                    ));
+                }
+                Err(e) => return error_messages(&e),
+            };
+            let n_cols = schema.fields().len();
+            let indices: Vec<usize> = (0..n_cols).collect();
+            match binary_payload_from_batches(&schema, &batches, &indices) {
+                Ok((chunks, row_count)) => (chunks, row_count, n_cols),
+                Err(msg) => {
+                    return error_messages(&basin_common::BasinError::FeatureNotSupported(msg));
+                }
+            }
+        }
     };
     out.push(PgWireBackendMessage::CopyOutResponse(copy_out_response(
         n_cols,
+        opts.format,
     )));
-    if let Some(h) = header {
+    for chunk in chunks {
         out.push(PgWireBackendMessage::CopyData(CopyData::new(Bytes::from(
-            h,
-        ))));
-    }
-    for row in body {
-        out.push(PgWireBackendMessage::CopyData(CopyData::new(Bytes::from(
-            row,
+            chunk,
         ))));
     }
     out.push(PgWireBackendMessage::CopyDone(
@@ -1499,9 +2043,12 @@ fn render_csv_cell(col: &dyn arrow_array::Array, idx: usize, field: &Field) -> S
 /// The connection state must be flipped to `CopyInProgress` after sending
 /// `CopyInResponse` so the framework routes subsequent `CopyData` /
 /// `CopyDone` to the `CopyHandler`.
-pub(crate) fn copy_from_stdin_messages(n_cols: usize) -> Vec<PgWireBackendMessage> {
+pub(crate) fn copy_from_stdin_messages(
+    n_cols: usize,
+    format: CopyFormat,
+) -> Vec<PgWireBackendMessage> {
     vec![PgWireBackendMessage::CopyInResponse(copy_in_response(
-        n_cols,
+        n_cols, format,
     ))]
 }
 
@@ -1815,9 +2362,344 @@ mod tests {
     }
 
     #[test]
-    fn parse_copy_rejects_non_csv_format() {
-        let e = parse_copy("COPY t FROM STDIN WITH (FORMAT BINARY)").unwrap_err();
-        assert!(e.contains("CSV") || e.contains("BINARY"), "got: {e}");
+    fn parse_copy_rejects_unknown_formats() {
+        for sql in [
+            "COPY t FROM STDIN WITH (FORMAT TEXT)",
+            "COPY t FROM STDIN WITH (FORMAT XML)",
+        ] {
+            let e = parse_copy(sql).unwrap_err();
+            assert!(e.contains("FORMAT"), "got: {e}");
+        }
+    }
+
+    // ── quoted identifiers (sqlx PgCopyIn shape) ───────────────────────────
+
+    #[test]
+    fn parse_copy_accepts_sqlx_quoted_identifier_shape() {
+        // Exact statement from the sqlx section of the ORM corpus.
+        let cmd = parse_copy(r#"COPY "users" (id, email) FROM STDIN"#).unwrap();
+        assert_eq!(
+            cmd,
+            Some(CopyCommand::From {
+                table: "users".into(),
+                with_header: false,
+                columns: Some(vec!["id".into(), "email".into()]),
+                path: None,
+                opts: default_opts(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_copy_accepts_quoted_column_list() {
+        let cmd = parse_copy(r#"COPY "users" ("id", "Email_2") TO STDOUT WITH (FORMAT CSV)"#)
+            .unwrap();
+        assert_eq!(
+            cmd,
+            Some(CopyCommand::To {
+                table: "users".into(),
+                with_header: false,
+                columns: Some(vec!["id".into(), "Email_2".into()]),
+                path: None,
+                opts: default_opts(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_copy_rejects_quoted_identifier_with_special_chars() {
+        // Quoted names outside the bare-identifier charset are refused —
+        // they would otherwise be re-rendered into SQL unquoted (injection).
+        for sql in [
+            r#"COPY "users; DROP TABLE x" FROM STDIN"#,
+            r#"COPY "user name" FROM STDIN"#,
+            r#"COPY "us""er" FROM STDIN"#,
+            r#"COPY "" FROM STDIN"#,
+        ] {
+            let e = parse_copy(sql).unwrap_err();
+            assert!(e.contains("table name"), "{sql}: got {e}");
+        }
+    }
+
+    // ── BINARY format acceptance / rejection matrix ────────────────────────
+
+    fn binary_opts() -> CopyOptions {
+        CopyOptions {
+            format: CopyFormat::Binary,
+            ..CopyOptions::default()
+        }
+    }
+
+    #[test]
+    fn parse_copy_accepts_format_binary_from_stdin() {
+        let cmd = parse_copy("COPY t FROM STDIN WITH (FORMAT BINARY)").unwrap();
+        assert_eq!(
+            cmd,
+            Some(CopyCommand::From {
+                table: "t".into(),
+                with_header: false,
+                columns: None,
+                path: None,
+                opts: binary_opts(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_copy_accepts_format_binary_to_stdout_with_columns() {
+        let cmd = parse_copy("COPY t (a, b) TO STDOUT WITH (FORMAT BINARY)").unwrap();
+        assert_eq!(
+            cmd,
+            Some(CopyCommand::To {
+                table: "t".into(),
+                with_header: false,
+                columns: Some(vec!["a".into(), "b".into()]),
+                path: None,
+                opts: binary_opts(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_copy_accepts_legacy_with_binary_shorthand() {
+        let cmd = parse_copy("COPY t FROM STDIN WITH BINARY").unwrap();
+        assert!(
+            matches!(cmd, Some(CopyCommand::From { ref opts, .. }) if opts.format == CopyFormat::Binary)
+        );
+    }
+
+    #[test]
+    fn parse_copy_accepts_option_list_without_with_keyword() {
+        // Modern PG ≥ 9.0 syntax: parenthesised options, no WITH.
+        let cmd = parse_copy("COPY t FROM STDIN (FORMAT BINARY)").unwrap();
+        assert!(
+            matches!(cmd, Some(CopyCommand::From { ref opts, .. }) if opts.format == CopyFormat::Binary)
+        );
+        let cmd = parse_copy("COPY t FROM STDIN (FORMAT CSV, HEADER true)").unwrap();
+        assert!(matches!(
+            cmd,
+            Some(CopyCommand::From {
+                with_header: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_copy_rejects_binary_with_csv_only_options() {
+        for (sql, opt) in [
+            ("COPY t FROM STDIN WITH (FORMAT BINARY, HEADER true)", "HEADER"),
+            ("COPY t FROM STDIN WITH (FORMAT BINARY, DELIMITER '|')", "DELIMITER"),
+            (r"COPY t FROM STDIN WITH (FORMAT BINARY, NULL '\N')", "NULL"),
+            ("COPY t TO STDOUT WITH (FORMAT BINARY, QUOTE '\"')", "QUOTE"),
+            // FORMAT after the conflicting option must still be caught.
+            ("COPY t FROM STDIN WITH (DELIMITER '|', FORMAT BINARY)", "DELIMITER"),
+        ] {
+            let e = parse_copy(sql).unwrap_err();
+            assert!(
+                e.contains(opt) && e.contains("BINARY"),
+                "{sql}: got {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_copy_rejects_binary_file_paths() {
+        for sql in [
+            "COPY t FROM '/tmp/x.bin' WITH (FORMAT BINARY)",
+            "COPY t TO '/tmp/x.bin' WITH (FORMAT BINARY)",
+        ] {
+            let e = parse_copy(sql).unwrap_err();
+            assert!(e.contains("STDIN/STDOUT"), "{sql}: got {e}");
+        }
+    }
+
+    #[test]
+    fn parse_copy_accepts_query_source_binary() {
+        let cmd = parse_copy("COPY (SELECT 1) TO STDOUT WITH (FORMAT BINARY)").unwrap();
+        assert!(
+            matches!(cmd, Some(CopyCommand::QueryTo { ref opts, .. }) if opts.format == CopyFormat::Binary)
+        );
+    }
+
+    // ── binary stream parser ───────────────────────────────────────────────
+
+    fn binary_header_bytes(ext: &[u8]) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.extend_from_slice(COPY_BINARY_SIGNATURE);
+        h.extend_from_slice(&0u32.to_be_bytes());
+        h.extend_from_slice(&(ext.len() as u32).to_be_bytes());
+        h.extend_from_slice(ext);
+        h
+    }
+
+    #[test]
+    fn parse_binary_header_consumes_header_and_extension() {
+        let h = binary_header_bytes(b"abcd");
+        assert_eq!(parse_binary_header(&h).unwrap(), Some(19 + 4));
+        // Truncated header → need more bytes, nothing consumed.
+        assert_eq!(parse_binary_header(&h[..10]).unwrap(), None);
+        assert_eq!(parse_binary_header(&h[..20]).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_binary_header_rejects_bad_signature_and_flags() {
+        let mut bad_sig = binary_header_bytes(b"");
+        bad_sig[0] = b'X';
+        assert!(parse_binary_header(&bad_sig).unwrap_err().contains("signature"));
+
+        let mut bad_flags = binary_header_bytes(b"");
+        bad_flags[11..15].copy_from_slice(&0x0001_0000u32.to_be_bytes()); // OID bit
+        assert!(parse_binary_header(&bad_flags).unwrap_err().contains("flags"));
+
+        // Low 16 flag bits must be ignored per the spec.
+        let mut soft_flags = binary_header_bytes(b"");
+        soft_flags[11..15].copy_from_slice(&0x0000_00FFu32.to_be_bytes());
+        assert_eq!(parse_binary_header(&soft_flags).unwrap(), Some(19));
+    }
+
+    fn binary_tuple(fields: &[Option<&[u8]>]) -> Vec<u8> {
+        let mut t = Vec::new();
+        t.extend_from_slice(&(fields.len() as i16).to_be_bytes());
+        for f in fields {
+            match f {
+                None => t.extend_from_slice(&(-1i32).to_be_bytes()),
+                Some(b) => {
+                    t.extend_from_slice(&(b.len() as i32).to_be_bytes());
+                    t.extend_from_slice(b);
+                }
+            }
+        }
+        t
+    }
+
+    #[test]
+    fn parse_binary_record_row_null_trailer_and_splits() {
+        let tuple = binary_tuple(&[Some(&7i64.to_be_bytes()), None]);
+        match parse_binary_record(&tuple, 2).unwrap() {
+            BinaryRecord::Row(fields, consumed) => {
+                assert_eq!(consumed, tuple.len());
+                assert_eq!(fields[0].as_deref(), Some(&7i64.to_be_bytes()[..]));
+                assert_eq!(fields[1], None);
+            }
+            _ => panic!("expected Row"),
+        }
+        // Every strict prefix is NeedMore (chunk boundaries are arbitrary).
+        for cut in 0..tuple.len() {
+            assert!(
+                matches!(parse_binary_record(&tuple[..cut], 2).unwrap(), BinaryRecord::NeedMore),
+                "cut at {cut}"
+            );
+        }
+        // Trailer.
+        assert!(matches!(
+            parse_binary_record(&(-1i16).to_be_bytes(), 2).unwrap(),
+            BinaryRecord::Trailer
+        ));
+    }
+
+    #[test]
+    fn parse_binary_record_rejects_field_count_mismatch() {
+        let tuple = binary_tuple(&[Some(b"x")]);
+        let e = parse_binary_record(&tuple, 3).unwrap_err();
+        assert!(e.contains("1 fields, expected 3"), "got: {e}");
+    }
+
+    #[test]
+    fn scalar_to_copy_cell_renders_bytea_hex_and_bool() {
+        assert_eq!(
+            scalar_to_copy_cell(ScalarParam::Bytea(vec![0xDE, 0xAD, 0xBE, 0xEF]), "c").unwrap(),
+            Some(r"\xdeadbeef".to_string())
+        );
+        assert_eq!(
+            scalar_to_copy_cell(ScalarParam::Bool(true), "c").unwrap(),
+            Some("true".to_string())
+        );
+        assert_eq!(scalar_to_copy_cell(ScalarParam::Null, "c").unwrap(), None);
+    }
+
+    #[test]
+    fn validate_binary_copy_columns_accepts_scalars_rejects_vectors() {
+        let ok = vec![
+            Field::new("i", DataType::Int64, false),
+            Field::new("f", DataType::Float64, true),
+            Field::new("b", DataType::Boolean, true),
+            Field::new("t", DataType::Utf8, true),
+            Field::new("by", DataType::Binary, true),
+            Field::new(
+                "ts",
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+                true,
+            ),
+        ];
+        validate_binary_copy_columns(ok.iter()).unwrap();
+
+        let vec_field = Field::new(
+            "emb",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                3,
+            ),
+            true,
+        );
+        let e = validate_binary_copy_columns(std::iter::once(&vec_field)).unwrap_err();
+        assert!(e.contains("emb") && e.contains("FORMAT CSV"), "got: {e}");
+    }
+
+    #[test]
+    fn binary_payload_round_trips_through_binary_record_parser() {
+        use arrow_array::{ArrayRef, BooleanArray, Int64Array, StringArray};
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("ok", DataType::Boolean, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("héllo🚀"), None])) as ArrayRef,
+                Arc::new(BooleanArray::from(vec![Some(true), Some(false)])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let (chunks, rows) =
+            binary_payload_from_batches(&schema, &[batch], &[0, 1, 2]).unwrap();
+        assert_eq!(rows, 2);
+        assert_eq!(chunks.len(), 4); // header + 2 tuples + trailer
+        assert_eq!(parse_binary_header(&chunks[0]).unwrap(), Some(19));
+        let row0 = match parse_binary_record(&chunks[1], 3).unwrap() {
+            BinaryRecord::Row(fields, consumed) => {
+                assert_eq!(consumed, chunks[1].len());
+                fields
+            }
+            _ => panic!("expected Row"),
+        };
+        let cells: Vec<Option<String>> = row0
+            .iter()
+            .zip(schema.fields().iter())
+            .map(|(raw, f)| match raw {
+                None => None,
+                Some(b) => decode_binary_field(b, f).unwrap(),
+            })
+            .collect();
+        assert_eq!(
+            cells,
+            vec![
+                Some("1".to_string()),
+                Some("héllo🚀".to_string()),
+                Some("true".to_string())
+            ]
+        );
+        let row1 = match parse_binary_record(&chunks[2], 3).unwrap() {
+            BinaryRecord::Row(fields, _) => fields,
+            _ => panic!("expected Row"),
+        };
+        assert_eq!(row1[1], None, "NULL name must be -1-length");
+        assert!(matches!(
+            parse_binary_record(&chunks[3], 3).unwrap(),
+            BinaryRecord::Trailer
+        ));
     }
 
     #[test]

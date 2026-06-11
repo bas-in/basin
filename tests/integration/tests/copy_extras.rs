@@ -11,7 +11,8 @@
 //! - `COPY (SELECT id, name FROM t WHERE id > 2) TO STDOUT WITH (FORMAT CSV)` — query source.
 //! - `COPY (SELECT * FROM t) TO STDOUT WITH (FORMAT CSV, HEADER true)` — query source + header.
 //! - `COPY t FROM PROGRAM 'cmd'` — rejected with SQLSTATE 42501.
-//! - `COPY t FROM STDIN WITH (FORMAT BINARY)` — BINARY still rejected with 42601.
+//! - `COPY t FROM STDIN WITH (FORMAT BINARY, HEADER …)` — CSV-only options
+//!   rejected with 42601 in BINARY mode (BINARY itself: see `copy_binary.rs`).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -482,11 +483,14 @@ async fn copy_to_program_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 11: BINARY format still rejected
+// Test 11: CSV-only options rejected in BINARY mode
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn copy_binary_format_rejected() {
+async fn copy_binary_csv_only_options_rejected() {
+    // FORMAT BINARY itself is supported (see `copy_binary.rs`); the CSV-only
+    // options must still be rejected with a clean 42601 in BINARY mode, and
+    // the connection must stay usable.
     let server = start_server().await;
     let client = connect(server.addr).await;
 
@@ -495,17 +499,29 @@ async fn copy_binary_format_rejected() {
         .await
         .expect("CREATE TABLE");
 
-    let err = client
-        .simple_query("COPY t FROM STDIN WITH (FORMAT BINARY)")
-        .await
-        .expect_err("expected error");
-    let dbe = err.as_db_error().expect("DbError");
-    assert_eq!(
-        dbe.code().code(),
-        "42601",
-        "expected SQLSTATE 42601 for BINARY, got: {:?}",
-        dbe
-    );
+    for sql in [
+        "COPY t FROM STDIN WITH (FORMAT BINARY, HEADER true)",
+        r"COPY t FROM STDIN WITH (FORMAT BINARY, NULL '\N')",
+        "COPY t TO STDOUT WITH (FORMAT BINARY, QUOTE '\"')",
+    ] {
+        let err = client
+            .simple_query(sql)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("expected error for: {sql}"));
+        let dbe = err
+            .as_db_error()
+            .unwrap_or_else(|| panic!("expected DbError for {sql:?}, got: {err}"));
+        assert_eq!(
+            dbe.code().code(),
+            "42601",
+            "expected SQLSTATE 42601 for {sql:?}, got: {dbe:?}"
+        );
+        assert!(
+            dbe.message().contains("BINARY"),
+            "error should name BINARY mode: {dbe:?}"
+        );
+    }
 
     // Connection still usable.
     let row = client

@@ -458,3 +458,62 @@ async fn copy_from_file_path_round_trips() {
     std::env::remove_var("BASIN_COPY_ALLOW_FILE_PATHS");
     std::env::remove_var("BASIN_COPY_PATH_ALLOWLIST");
 }
+
+// ---------------------------------------------------------------------------
+// Test 8: quoted identifiers — the exact `sqlx::PgCopyIn` statement shape
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn copy_from_stdin_quoted_identifiers_sqlx_shape() {
+    let server = start_server().await;
+    let client = connect(server.addr).await;
+
+    client
+        .simple_query(
+            r#"CREATE TABLE "users" (
+                "id"    BIGINT NOT NULL,
+                "email" TEXT   NOT NULL,
+                "name"  TEXT
+            )"#,
+        )
+        .await
+        .expect("CREATE TABLE");
+
+    // Verbatim statement sqlx's PgCopyIn emits (double-quoted table +
+    // bare column list). Previously failed with `expected table name or
+    // '(' after COPY`.
+    let sink = client
+        .copy_in::<_, Bytes>(r#"COPY "users" (id, email) FROM STDIN"#)
+        .await
+        .expect("copy_in start");
+    futures::pin_mut!(sink);
+    sink.send(Bytes::from_static(b"1,a@example.com\n2,b@example.com\n"))
+        .await
+        .expect("send");
+    let n = sink.as_mut().finish().await.expect("finish");
+    assert_eq!(n, 2);
+
+    let row = client
+        .query_one(r#"SELECT email, name FROM "users" WHERE id = $1"#, &[&2i64])
+        .await
+        .expect("select");
+    let email: &str = row.get(0);
+    let name: Option<&str> = row.get(1);
+    assert_eq!(email, "b@example.com");
+    assert_eq!(name, None, "unlisted nullable column must be NULL");
+
+    // Quoted column list round-trips on the OUT side too.
+    let stream = client
+        .copy_out(r#"COPY "users" ("email") TO STDOUT WITH (FORMAT CSV)"#)
+        .await
+        .expect("copy_out start");
+    futures::pin_mut!(stream);
+    let mut out = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        out.extend_from_slice(&chunk.expect("chunk"));
+    }
+    let text = String::from_utf8(out).expect("utf8");
+    let mut lines: Vec<&str> = text.split('\n').filter(|s| !s.is_empty()).collect();
+    lines.sort_unstable();
+    assert_eq!(lines, vec!["a@example.com", "b@example.com"]);
+}

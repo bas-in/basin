@@ -41,8 +41,8 @@
 use std::sync::Arc;
 
 use arrow_array::builder::{
-    BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, Float32Builder, Float64Builder,
-    Int16Builder, Int32Builder, Int64Builder, LargeBinaryBuilder, StringBuilder,
+    BinaryBuilder, BooleanBuilder, Date32Builder, FixedSizeBinaryBuilder, Float32Builder,
+    Float64Builder, Int16Builder, Int32Builder, Int64Builder, LargeBinaryBuilder, StringBuilder,
     TimestampMicrosecondBuilder,
 };
 use arrow_array::types::Float32Type;
@@ -115,17 +115,28 @@ fn parse_timestamp_micros(s: &str, col: &str) -> Result<i64> {
     if let Ok(dt) = s.parse::<DateTime<Utc>>() {
         return Ok(dt.timestamp_micros());
     }
-    // "YYYY-MM-DD HH:MM:SS" (no zone → UTC).
-    if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+    // "YYYY-MM-DD HH:MM:SS[.ffffff]" (no zone → UTC). `%.f` matches an
+    // optional fractional-seconds part — binary COPY decodes timestamps to
+    // microsecond precision, so the dotted form is the common case there.
+    if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
         return Ok(Utc.from_utc_datetime(&ndt).timestamp_micros());
     }
-    if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+    if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
         return Ok(Utc.from_utc_datetime(&ndt).timestamp_micros());
     }
     Err(BasinError::InvalidSchema(format!(
         "cannot parse timestamp {:?} for column {col}",
         s
     )))
+}
+
+/// Parse a `YYYY-MM-DD` cell into Arrow `Date32` (days since 1970-01-01).
+fn parse_date32(s: &str, col: &str) -> Result<i32> {
+    let date = chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").map_err(|_| {
+        BasinError::InvalidSchema(format!("cannot parse date {:?} for column {col}", s.trim()))
+    })?;
+    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("unix epoch");
+    Ok((date - epoch).num_days() as i32)
 }
 
 fn parse_uuid(s: &str, col: &str) -> Result<[u8; 16]> {
@@ -354,6 +365,16 @@ pub(crate) fn batch_from_csv_rows(
                     match &row[col_idx] {
                         None => { null_check(field)?; b.append_null(); }
                         Some(s) => b.append_value(parse_timestamp_micros(s, field.name())?),
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            DataType::Date32 => {
+                let mut b = Date32Builder::with_capacity(rows.len());
+                for row in rows {
+                    match &row[col_idx] {
+                        None => { null_check(field)?; b.append_null(); }
+                        Some(s) => b.append_value(parse_date32(s, field.name())?),
                     }
                 }
                 Arc::new(b.finish())

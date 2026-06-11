@@ -121,7 +121,7 @@ fn field_description(f: &Field) -> FieldDescription {
 /// `FixedSizeBinary(16)` (RFC 4122 raw bytes); both must surface as their
 /// proper Postgres OIDs (3802 / 2950) so PG-protocol clients see the
 /// expected types rather than `bytea`.
-fn arrow_to_pg_type_field(f: &Field) -> Type {
+pub(crate) fn arrow_to_pg_type_field(f: &Field) -> Type {
     if field_is_jsonb(f) {
         return Type::JSONB;
     }
@@ -129,6 +129,23 @@ fn arrow_to_pg_type_field(f: &Field) -> Type {
         return Type::UUID;
     }
     arrow_to_pg_type(f.data_type())
+}
+
+/// Encode the value at row `idx` of `col` as one length-prefixed
+/// binary-format COPY field into `buf` (NULL = `-1` length prefix).
+///
+/// The PG binary COPY field encoding is identical to the binary `DataRow`
+/// field encoding, so this is a thin field-metadata-aware wrapper around
+/// [`encode_value_binary`] — the same codec the extended-query result path
+/// uses for binary result columns. Kept here so `copy.rs` doesn't have to
+/// know about the JSONB/UUID field-metadata convention.
+pub(crate) fn encode_copy_binary_field(
+    col: &dyn Array,
+    idx: usize,
+    field: &Field,
+    buf: &mut BytesMut,
+) -> Result<()> {
+    encode_value_binary(col, idx, buf, field_is_jsonb(field), field_is_uuid(field))
 }
 
 /// Map an Arrow type to the closest Postgres type for the PoC. Anything we

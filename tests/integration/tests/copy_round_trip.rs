@@ -8,8 +8,8 @@
 //!    sees 1000.
 //! 2. CSV export round-trips: 100 rows inserted the normal way → `copy_out`
 //!    streams CSV bytes that parse back to 100 rows.
-//! 3. The COPY parser rejects unsupported variants (BINARY format) cleanly
-//!    without desyncing the connection.
+//! 3. The COPY parser rejects unsupported variants (FORMAT TEXT, invalid
+//!    BINARY option combos) cleanly without desyncing the connection.
 //! 4. `COPY ... WITH (HEADER true)` round-trips.
 
 use std::collections::HashMap;
@@ -237,9 +237,16 @@ async fn copy_rejects_unsupported_variants_without_desync() {
     // "db error: <SQLSTATE> ..."; assert the SQLSTATE 42601.
     //
     // Note: column-list / file-path / DELIMITER / NULL / QUOTE / ESCAPE
-    // variants are now SUPPORTED — they're covered in `copy_extensions.rs`
-    // and `copy_extras.rs`. BINARY format is still rejected.
-    for sql in ["COPY t FROM STDIN WITH (FORMAT BINARY)"] {
+    // variants are SUPPORTED (covered in `copy_extensions.rs` /
+    // `copy_extras.rs`), and FORMAT BINARY is SUPPORTED (covered in
+    // `copy_binary.rs`). Still rejected: FORMAT TEXT, CSV-only options in
+    // BINARY mode, and BINARY with a server-side file path.
+    for sql in [
+        "COPY t FROM STDIN WITH (FORMAT TEXT)",
+        "COPY t FROM STDIN WITH (FORMAT BINARY, HEADER true)",
+        "COPY t FROM STDIN WITH (FORMAT BINARY, DELIMITER '|')",
+        "COPY t TO '/tmp/never-written.bin' WITH (FORMAT BINARY)",
+    ] {
         let err = client
             .simple_query(sql)
             .await
