@@ -184,7 +184,7 @@ no index on either side (PG numbers in parens):
 
 | Operation | Basin p50 | Notes |
 |---|---|---|
-| **Bulk INSERT 1M rows (one statement stream)** | **2.05 s (PG 9.62 s — Basin 4.7× faster)** | pre-parse classifier + literal-VALUES scanner + statement-affine WAL striping; was 262 s three waves ago. Durability note: Basin acks before fsync (≤200 ms loss window); PG's number is fsync-durable |
+| **Bulk INSERT 1M rows (one statement stream)** | **2.05 s (PG 9.62 s — Basin 4.7× faster)** | pre-parse classifier + literal-VALUES scanner + statement-affine WAL striping; was 262 s three waves ago. Durability note: the default acks before fsync (≤200 ms loss window) while PG's number is fsync-durable; `SET basin.synchronous_commit = on` closes the gap with group-committed fsync (~2 ms coalesce + one fsync shared across concurrent writers) |
 | Point query (PK `=`) | ~0.32 ms | PG's PK btree is ~3 µs; protocol+catalog floor analysis in the µs-read design |
 | UPSERT (`ON CONFLICT DO UPDATE`) | ~0.2 ms | |
 | Single-row UPDATE | ~1.5 ms | hot-overlay fast path |

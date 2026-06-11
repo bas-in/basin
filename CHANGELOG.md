@@ -27,6 +27,29 @@ graduate to 1.0 and the standard SemVer guarantees.
   re-derived from measured reality at the same time (`f39b2d5`): non-collapse
   ≥ 0.7 at C=64 instead of a ≥ 1.5× headroom that never passed any recorded
   run on this hardware, including the run that introduced it.
+- **Durability is now a knob, not an asterisk** (`652f278`):
+  `SET basin.synchronous_commit = on` makes INSERT acks wait for a
+  group-committed, genuinely fsynced WAL segment (one fsync wakes every
+  writer coalesced within `BASIN_WAL_COMMIT_DELAY_MS`, default 2 ms);
+  the default stays async with the documented ≤200 ms loss window. The
+  old claim that local PUTs were fsync-durable was false (write+rename,
+  no sync) and every such doc is rewritten.
+- **Prepared-statement INSERTs reach the fast paths** (`a6b1f7c`): prepared
+  literal INSERTs skip the per-Execute AST clone/substitution/re-render and
+  route through the tuple scanner; parameterized INSERTs build batches
+  directly from bound wire values via a Parse-time bind plan. Fixes a
+  pre-existing bug where binary-format timestamp parameters failed to parse
+  at all.
+- **Keyset pagination short-circuits disjoint PK runs** (`6a67d64`): pages
+  open at most ~2 files on the layouts statement-affine striping and
+  stripe-merge produce, instead of every file ahead of the cursor.
+- **Fixed: btree secondary-index registry went stale on CoW replaces**
+  (`0f58882`): index probes are authoritative file allowlists, and
+  UPDATE/DELETE rewrites never re-registered replacement files — queries on
+  indexed values could silently return nothing. All four replace sites now
+  purge + re-register + flush the sidecar. The delta-update gate keeps
+  declining indexed tables, now with the overlay-visibility proof documented
+  and an adversarial GIN/btree suite pinning it.
 - **Stripe-merge compaction** (`92668f4`): a background tick merges cold
   files with overlapping PK zone maps into strictly fewer files with
   disjoint ranges, so keyset pagination prunes to 1–2 file opens instead of
