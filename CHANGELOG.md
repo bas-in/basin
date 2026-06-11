@@ -82,6 +82,28 @@ graduate to 1.0 and the standard SemVer guarantees.
   path (previously errored; fractional timestamps are what binary COPY-IN
   decodes to).
 
+## 2026-06-12 — compatibility deep-cuts: 42P01, Django/GORM, GIN-overlay unlock, promoted-column fixes
+
+- **Missing tables answer 42P01** (`a49b51f`): ORM migration harnesses
+  branch on undefined_table to bootstrap their tracker tables; the exact
+  code and PG-shaped message are now pinned at the wire. DISCARD/RESET
+  pool-reset statements are accepted with correct tags.
+- **ORM corpus: 7 ORMs, 138/139** — Django (savepoint-per-atomic,
+  MigrationRecorder, contenttypes, FOR UPDATE) and GORM (pgx
+  extended-protocol AutoMigrate, RETURNING, batch, upsert) join Drizzle,
+  Prisma, sqlx, Diesel, TypeORM. The one typed error is a named gap:
+  ALTER TABLE … ADD CONSTRAINT UNIQUE.
+- **GIN-only tables ride the overlay UPDATE path** (`c50c07f`): the three
+  documented blockers are closed, so jsonb_set on a GIN-indexed table
+  writes overlays instead of rewriting files (~99ms → overlay-class ms at
+  1M, to be measured); the reconciler's materialize now rebuilds GIN/FTS
+  registries for replacement files so pruning re-engages after drains.
+- **Promoted-column fixes** (two more real bugs): every fast-select
+  fallback handed DataFusion un-rewritten SQL (hard plan error whenever
+  promotion was active but the fast path declined), and the backfill
+  sweep dropped PK blooms from every swept file while never blooming the
+  shadow column. Program correctness tally: eighteen.
+
 ## 2026-06-11 — integrity benchmark run (provenance: single idle-box session, 1M solo)
 
 All Postgres-compare cards (10k / 100k / 1M), the ORM corpus card, and the
