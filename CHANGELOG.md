@@ -27,6 +27,27 @@ graduate to 1.0 and the standard SemVer guarantees.
   re-derived from measured reality at the same time (`f39b2d5`): non-collapse
   ≥ 0.7 at C=64 instead of a ≥ 1.5× headroom that never passed any recorded
   run on this hardware, including the run that introduced it.
+- **Delta updates: overlay UPDATEs to 10,000 keys, including no-WHERE shapes**
+  (`ba049f5`): the 64-key small-bulk cap becomes `BASIN_DELTA_UPDATE_MAX_KEYS`
+  (default 10k) behind a stage-then-reserve memory guard that declines to the
+  cold copy-on-write path with zero partial state when the hot-tier budget is
+  exhausted. The matching probe now carries full pre-image rows (no second
+  cold read per statement), and UPDATEs without a WHERE clause route through
+  it too — the conditional-UPDATE shape becomes overlay writes instead of a
+  whole-file rewrite. A 200-key UPDATE at 100k rows is gated to write zero
+  replacement files, mirroring DELETE's tombstone-only invariant.
+- **Statement-affine write striping** (`d509a29`): an INSERT statement writes
+  its whole batch to one WAL stripe (chosen per session) instead of slicing
+  across all 8 — the slices ran sequentially anyway, so a statement paid 8
+  encodes/locks/files for zero parallelism. Cross-session fan-out is
+  preserved; a statement's PKs now co-locate in one file, helping bloom
+  pruning.
+- **Fixed: page-cache representation collision on semantic types**
+  (`648c114`): schema-less reads (CoW rewrite pre-images, CV refresh) cached
+  raw physical batches — UUID disguised as Decimal256, POINT as LargeBinary —
+  under the same key catalog-aware scans serve verbatim. Cache keys now carry
+  the populating read's schema-awareness; a cross-class regression test fails
+  without the split, and the restamp tail is proven idempotent.
 - **Hot-tier UPDATE fast path: batched expression eval + overlay memo**
   (`081387e`, `98fa44f`): multi-key expression UPDATEs evaluate once over a
   concatenated pre-image batch instead of building a DataFusion
