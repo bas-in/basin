@@ -70,7 +70,8 @@
 //!
 //! Post-shard, the lock count is `N_SHARDS` (default 64, env-overridable
 //! via `BASIN_STORAGE_PAGE_CACHE_SHARDS`). A request picks its shard by
-//! hashing all three components of `CacheKey` (path, projection, filters);
+//! hashing all components of `CacheKey` (path, projection, filters,
+//! representation stamp);
 //! same-key requests always land on the same shard (so a hit is still a
 //! hit), and different-key requests scatter. With shard count matching
 //! the concurrency target, the expected contention on a uniform workload
@@ -208,11 +209,30 @@ impl PageCacheCounters {
 /// LRU-budget-aware write-through opt-out — is still applied
 /// independently in `reader.rs` and yields the layer (c) speedup
 /// directly.
+///
+/// NOTE on stamped-in-key: cached batches are stored in whatever
+/// representation `read_one` produced for the populating caller, and the
+/// generic hit path serves them VERBATIM. A catalog-aware read stores the
+/// post-restamp canonical representation (BASIN_TYPE field metadata
+/// re-applied; ADR 0024 UUID columns restored `Decimal256(39,0)` →
+/// `FixedSizeBinary(16)`, POINT columns `LargeBinary` → `FixedSizeBinary(21)`),
+/// while a schema-less read (`read_file` / `read_paths`: UPDATE/DELETE
+/// rewrite pre-image, continuous-view refresh, cron state, system tables)
+/// stores the RAW physical decode — no metadata, UUID still disguised as
+/// Decimal256. Sharing one entry across the two caller classes serves the
+/// wrong representation verbatim (a table-aware scan would hand the engine
+/// a physically-disguised UUID column). `stamped` therefore keys the two
+/// representations apart; each class only ever hits entries its own cold
+/// path would have produced.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CacheKey {
     pub path: ObjectPath,
     pub projection_hash: u64,
     pub filters_hash: u64,
+    /// `true` iff the populating read held the authoritative catalog schema
+    /// (`catalog_schema.is_some()` in `read_one`) — i.e. the cached batches
+    /// are in the post-restamp canonical representation.
+    pub stamped: bool,
 }
 
 /// One cache entry: the full vector of `RecordBatch`es a single
@@ -843,6 +863,7 @@ mod tests {
             path: ObjectPath::from(path),
             projection_hash: proj,
             filters_hash: filt,
+            stamped: true,
         }
     }
 
@@ -1034,6 +1055,7 @@ mod tests {
                 path: ObjectPath::from(path),
                 projection_hash: (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
                 filters_hash: (i as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9),
+                stamped: i % 2 == 0,
             };
             cache.insert(k.clone(), vec![small_batch(i as i64 * 100, 10)]);
             keys.push(k);
@@ -1069,6 +1091,7 @@ mod tests {
                 path: ObjectPath::from(path),
                 projection_hash: (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
                 filters_hash: (i as u64) ^ 0xDEAD_BEEF,
+                stamped: true,
             };
             cache.insert(k, vec![small_batch(0, 1)]);
         }
@@ -1146,6 +1169,7 @@ mod tests {
                         path: ObjectPath::from(path.as_str()),
                         projection_hash: i,
                         filters_hash: i,
+                        stamped: true,
                     };
                     c.insert(k, vec![small_batch(0, 50)]);
                     if i % 8 == 7 {
@@ -1186,6 +1210,7 @@ mod tests {
                 path: ObjectPath::from(path),
                 projection_hash: i.wrapping_mul(0x9E37_79B9_7F4A_7C15),
                 filters_hash: i.wrapping_mul(0xBF58_476D_1CE4_E5B9),
+                stamped: i % 2 == 0,
             };
             cache.insert(k, vec![small_batch(0, 5)]);
         }
@@ -1195,6 +1220,7 @@ mod tests {
             path: ObjectPath::from("projects/x/tables/t/data/cold.parquet"),
             projection_hash: 1,
             filters_hash: 1,
+            stamped: true,
         };
         cache.insert(other.clone(), vec![small_batch(0, 5)]);
 

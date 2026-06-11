@@ -899,15 +899,22 @@ async fn read_one(
     // by the caller and the cache key doesn't capture it. In practice
     // the partition predicate is the default for v0.1, so this is a
     // no-op guard.
-    // Page-cache key: file path + projection + filters. The parquet
-    // reader pushes filters all the way down (with_row_filter +
-    // with_row_selection), so the cached `Vec<RecordBatch>` is
-    // post-filter; sharing entries across queries with different WHEREs
-    // would return wrong rows. See `CacheKey` docs for the constraint.
+    // Page-cache key: file path + projection + filters + representation
+    // stamp. The parquet reader pushes filters all the way down
+    // (with_row_filter + with_row_selection), so the cached
+    // `Vec<RecordBatch>` is post-filter; sharing entries across queries
+    // with different WHEREs would return wrong rows. The stamp keys
+    // catalog-aware reads (which cache the post-restamp canonical
+    // representation: BASIN_TYPE metadata present, ADR 0024 UUID/POINT
+    // columns restored to FixedSizeBinary) apart from schema-less reads
+    // (which cache the raw physical decode) — the generic hit below
+    // serves entries VERBATIM, so the two representations must never
+    // share an entry. See `CacheKey` docs for both constraints.
     let cache_key = page_cache.as_ref().map(|_| CacheKey {
         path: path.clone(),
         projection_hash: hash_projection(opts.projection.as_deref()),
         filters_hash: hash_filters(&opts.filters),
+        stamped: catalog_schema.is_some(),
     });
     if let (Some(pc), Some(key)) = (page_cache.as_ref(), cache_key.as_ref()) {
         if let Some(batches) = pc.get(key) {
@@ -1025,6 +1032,9 @@ async fn read_one(
                         path: path.clone(),
                         projection_hash: hash_projection(read_proj.as_deref()),
                         filters_hash: hash_filters(&[]),
+                        // This block is gated on `catalog_schema.is_some()`,
+                        // so the entry probed is the post-restamp one.
+                        stamped: true,
                     };
                     match pc.get_if_rows_le(&unfiltered_key, unfiltered_serve_max_rows) {
                         RowGatedGet::Serve(cached) => {
@@ -1255,6 +1265,12 @@ async fn read_one(
                 path: path.clone(),
                 projection_hash: hash_projection(read_proj.as_deref()),
                 filters_hash: hash_filters(&[]),
+                // Match the representation of this read's own cold path:
+                // a catalog-aware probe must only serve the post-restamp
+                // entry, a schema-less probe only the raw one (the shared
+                // `finish` tail restamps under the SAME catalog_schema, so
+                // each class reproduces exactly its cold-path output).
+                stamped: catalog_schema.is_some(),
             };
             let pc = page_cache.as_ref().expect("eligibility implies page cache");
 
@@ -4251,12 +4267,15 @@ mod tests {
         read_ids_with_opts(storage, project, path, schema, ReadOptions::default()).await
     }
 
-    /// The unfiltered key a small no-projection point read shares.
+    /// The unfiltered key a small no-projection point read shares. All
+    /// reads in these tests are catalog-aware (`read_one` is handed
+    /// `Some(schema)`), so the shared entry is the stamped one.
     fn unfiltered_key_for(path: &ObjectPath) -> CacheKey {
         CacheKey {
             path: path.clone(),
             projection_hash: hash_projection(None),
             filters_hash: hash_filters(&[]),
+            stamped: true,
         }
     }
 
@@ -4617,6 +4636,484 @@ mod tests {
         assert!(
             hits_after >= hits_before + keys.len() as u64,
             "every parity read on the warm small file must be a cache serve ({hits_before} -> {hits_after})"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Semantic-typed columns (ADR 0024 UUID, PG-Wave-α POINT) × page cache:
+    // the cache stores the POST-restamp canonical representation for
+    // catalog-aware reads, and the `stamped` key bit keeps schema-less raw
+    // entries from ever being served verbatim to a catalog-aware read.
+    // -----------------------------------------------------------------------
+
+    /// `BASIN_TYPE` marker map for a semantic column.
+    fn semantic_metadata(v: &str) -> std::collections::HashMap<String, String> {
+        std::collections::HashMap::from([(BASIN_TYPE_KEY.to_string(), v.to_string())])
+    }
+
+    /// Catalog schema with an Int64 PK, a UUID column (FSB(16) +
+    /// BASIN_TYPE=UUID — physically Decimal256(39,0) inside a `.vortex`
+    /// file per ADR 0024) and a POINT column (FSB(21) + BASIN_TYPE=POINT —
+    /// physically LargeBinary inside Vortex).
+    fn semantic_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("u", DataType::FixedSizeBinary(16), true)
+                .with_metadata(semantic_metadata(BASIN_TYPE_UUID)),
+            Field::new(
+                "p",
+                DataType::FixedSizeBinary(basin_geo::POINT_WKB_LEN as i32),
+                true,
+            )
+            .with_metadata(semantic_metadata(BASIN_TYPE_POINT)),
+        ]))
+    }
+
+    /// `len` rows of deterministic semantic data. UUID bytes have the high
+    /// bit SET (the Decimal256 disguise must round-trip the full 128-bit
+    /// space, not just non-negative i128 patterns); both semantic columns
+    /// carry NULLs so the disguise inverses are exercised with null masks.
+    fn semantic_batch(start: i64, len: usize) -> RecordBatch {
+        use arrow_array::FixedSizeBinaryArray;
+        let id: Int64Array = (start..start + len as i64).collect();
+        let uuids = (0..len).map(|i| {
+            if i % 5 == 4 {
+                None
+            } else {
+                let mut b = [0u8; 16];
+                b[0] = 0x80 | (i as u8); // high bit set on purpose
+                b[15] = (start as u8).wrapping_add(i as u8);
+                Some(b)
+            }
+        });
+        let u = FixedSizeBinaryArray::try_from_sparse_iter_with_size(uuids, 16).unwrap();
+        let points = (0..len).map(|i| {
+            if i % 7 == 6 {
+                None
+            } else {
+                let mut b = [0u8; basin_geo::POINT_WKB_LEN];
+                b[0] = 1; // WKB little-endian marker byte; payload opaque here
+                b[basin_geo::POINT_WKB_LEN - 1] = i as u8;
+                Some(b)
+            }
+        });
+        let p = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            points,
+            basin_geo::POINT_WKB_LEN as i32,
+        )
+        .unwrap();
+        RecordBatch::try_new(
+            semantic_schema(),
+            vec![Arc::new(id), Arc::new(u), Arc::new(p)],
+        )
+        .unwrap()
+    }
+
+    /// `read_one` with explicit `catalog_schema` (Some = table-aware read,
+    /// None = schema-less `read_file`-shaped read), returning all batches.
+    async fn read_semantic_batches(
+        storage: &Storage,
+        project: &ProjectId,
+        path: &ObjectPath,
+        schema: Option<Arc<Schema>>,
+        opts: ReadOptions,
+    ) -> Vec<RecordBatch> {
+        let project_config = storage
+            .project_storage_config_cached(project)
+            .await
+            .unwrap();
+        let stream = read_one(
+            storage.project_store(project),
+            path.clone(),
+            Arc::new(opts),
+            storage.parquet_meta_cache().clone(),
+            storage.read_counters().clone(),
+            storage.page_cache_handle().cloned(),
+            storage.vortex_footer_cache_handle().clone(),
+            storage.project_counters(project),
+            storage.encryption_provider(),
+            project_config,
+            *project,
+            schema,
+        )
+        .await
+        .expect("read_one");
+        stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|b| b.expect("batch"))
+            .collect()
+    }
+
+    /// Concatenate every batch (served paths may emit one batch per cached
+    /// chunk, the pruned path one per surviving chunk — chunking must not
+    /// affect the comparison).
+    fn concat_all(batches: &[RecordBatch]) -> RecordBatch {
+        assert!(!batches.is_empty(), "expected at least one batch");
+        let schema = batches[0].schema();
+        arrow::compute::concat_batches(&schema, batches).expect("concat")
+    }
+
+    /// Every catalog column served must carry the catalog's EXACT Arrow
+    /// `DataType` and field metadata — i.e. UUID is `FixedSizeBinary(16)` +
+    /// `BASIN_TYPE=UUID` (never the on-disk Decimal256 disguise) and POINT
+    /// is `FixedSizeBinary(21)` + `BASIN_TYPE=POINT` (never LargeBinary).
+    fn assert_canonical(batch: &RecordBatch, catalog: &Schema) {
+        let s = batch.schema();
+        for cf in catalog.fields() {
+            let f = s
+                .field_with_name(cf.name())
+                .expect("served batch must contain every catalog column");
+            assert_eq!(
+                f.data_type(),
+                cf.data_type(),
+                "served Arrow type for column '{}' must equal the catalog's",
+                cf.name()
+            );
+            assert_eq!(
+                f.metadata(),
+                cf.metadata(),
+                "served field metadata for column '{}' must equal the catalog's",
+                cf.name()
+            );
+        }
+    }
+
+    /// Paged storage over a SHARED object store, so a cache-less reference
+    /// storage can read the very same file.
+    fn paged_storage_over(
+        store: Arc<object_store::memory::InMemory>,
+        max_bytes: u64,
+    ) -> Storage {
+        Storage::new(StorageConfig {
+            object_store: store,
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: Some(crate::PageCacheConfig::new(max_bytes)),
+        })
+    }
+
+    fn cacheless_storage_over(store: Arc<object_store::memory::InMemory>) -> Storage {
+        Storage::new(StorageConfig {
+            object_store: store,
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        })
+    }
+
+    /// UUID/POINT through the page cache, both orders:
+    ///
+    ///  1. unfiltered scan (populates the shared post-restamp entry) →
+    ///     filtered read served from that entry must be byte/type-identical
+    ///     to the same filtered read on a page-cache-LESS storage over the
+    ///     same file (pruned pushdown path), with every column's DataType
+    ///     and metadata equal to the catalog schema's;
+    ///  2. reverse order: filtered read first (cold pushdown populates the
+    ///     per-filter key), then the identical read again — a verbatim
+    ///     generic cache hit (zero GETs) that must still be canonical and
+    ///     identical to both the cold result and the pruned reference —
+    ///     then the unfiltered scan, also canonical.
+    #[tokio::test]
+    async fn semantic_cache_serves_canonical_representation_both_orders() {
+        use arrow_array::FixedSizeBinaryArray;
+
+        let project = ProjectId::new();
+        let schema = semantic_schema();
+        let original = semantic_batch(0, 12);
+
+        let shared = Arc::new(InMemory::new());
+        let storage = paged_storage_over(shared.clone(), 64 * 1024 * 1024);
+        let storage_pruned = cacheless_storage_over(shared.clone());
+        let table = TableName::new("sem").unwrap();
+        let path = write_vortex(&storage, &project, &table, &original, Some(4)).await;
+
+        // ── 1. unfiltered populate → filtered serve ─────────────────────────
+        let unf = concat_all(
+            &read_semantic_batches(
+                &storage,
+                &project,
+                &path,
+                Some(schema.clone()),
+                ReadOptions::default(),
+            )
+            .await,
+        );
+        assert_eq!(unf.num_rows(), 12);
+        assert_canonical(&unf, &schema);
+        // Value-level ground truth: the semantic columns round-trip the
+        // original bytes (incl. NULL masks) through the on-disk disguise.
+        let got_u = unf
+            .column_by_name("u")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("u served as FixedSizeBinary(16)");
+        let want_u = original
+            .column_by_name("u")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        assert_eq!(got_u, want_u, "UUID bytes must round-trip");
+        let got_p = unf
+            .column_by_name("p")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("p served as FixedSizeBinary(21)");
+        let want_p = original
+            .column_by_name("p")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        assert_eq!(got_p, want_p, "POINT bytes must round-trip");
+        assert!(
+            storage
+                .page_cache()
+                .unwrap()
+                .get(&unfiltered_key_for(&path))
+                .is_some(),
+            "unfiltered catalog-aware scan populates the stamped shared entry"
+        );
+
+        let eq_opts = || ReadOptions {
+            filters: vec![Predicate::Eq("id".into(), ScalarValue::Int64(7))],
+            ..ReadOptions::default()
+        };
+        let rc_before = storage.read_counters().snapshot();
+        let served = concat_all(
+            &read_semantic_batches(&storage, &project, &path, Some(schema.clone()), eq_opts())
+                .await,
+        );
+        let d = storage.read_counters().snapshot().delta(&rc_before);
+        assert_eq!(
+            d.files_opened, 0,
+            "warm filtered read must be served from the shared entry (no GET)"
+        );
+        let pruned = concat_all(
+            &read_semantic_batches(
+                &storage_pruned,
+                &project,
+                &path,
+                Some(schema.clone()),
+                eq_opts(),
+            )
+            .await,
+        );
+        assert_eq!(served.num_rows(), 1);
+        assert_canonical(&served, &schema);
+        assert_eq!(
+            served, pruned,
+            "cache-served filtered read must be byte-identical to the pruned read"
+        );
+
+        // ── 2. reverse order: filtered cold → filtered warm → unfiltered ───
+        // Fresh page cache over the SAME file.
+        let storage2 = paged_storage_over(shared.clone(), 64 * 1024 * 1024);
+        let cold = concat_all(
+            &read_semantic_batches(&storage2, &project, &path, Some(schema.clone()), eq_opts())
+                .await,
+        );
+        assert_canonical(&cold, &schema);
+        let rc_before = storage2.read_counters().snapshot();
+        let warm = concat_all(
+            &read_semantic_batches(&storage2, &project, &path, Some(schema.clone()), eq_opts())
+                .await,
+        );
+        let d = storage2.read_counters().snapshot().delta(&rc_before);
+        assert_eq!(
+            d.files_opened, 0,
+            "repeat of the identical filtered read is a verbatim generic hit"
+        );
+        assert_canonical(&warm, &schema);
+        assert_eq!(warm, cold, "verbatim hit must equal the cold result");
+        assert_eq!(warm, pruned, "…and the pruned reference");
+
+        let unf2 = concat_all(
+            &read_semantic_batches(
+                &storage2,
+                &project,
+                &path,
+                Some(schema.clone()),
+                ReadOptions::default(),
+            )
+            .await,
+        );
+        assert_canonical(&unf2, &schema);
+        assert_eq!(unf2, unf, "unfiltered scan after filtered reads is unchanged");
+    }
+
+    /// The filter/projection/restamp tail (`vortex_project_and_filter`) is
+    /// IDEMPOTENT for semantic types: running it over already-canonical
+    /// batches — exactly what the row-gated serve paths do to a cached
+    /// post-restamp entry — is a byte-identical no-op, and running it over
+    /// the raw decode shape (UUID as metadata-less Decimal256(39,0), POINT
+    /// as metadata-less LargeBinary — Vortex drops field metadata wholesale)
+    /// restores the canonical representation.
+    #[test]
+    fn restamp_tail_is_idempotent_for_uuid_and_point() {
+        use arrow_array::{Array, Decimal256Array, FixedSizeBinaryArray};
+        use arrow_buffer::i256;
+
+        let schema = semantic_schema();
+        let canonical = semantic_batch(0, 8);
+
+        // Raw decode shape, mirroring `writer::uuid_fsb_to_decimal256` /
+        // `writer::point_fsb_to_large_binary` plus Vortex's metadata drop.
+        let u_src = canonical
+            .column(1)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        let mut u_vals: Vec<Option<i256>> = Vec::with_capacity(u_src.len());
+        for r in 0..u_src.len() {
+            if u_src.is_null(r) {
+                u_vals.push(None);
+            } else {
+                let mut buf = [0u8; 32];
+                buf[16..32].copy_from_slice(u_src.value(r));
+                u_vals.push(Some(i256::from_be_bytes(buf)));
+            }
+        }
+        let u_raw = Decimal256Array::from(u_vals)
+            .with_precision_and_scale(39, 0)
+            .unwrap();
+        let p_src = canonical
+            .column(2)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        let mut p_builder = arrow_array::builder::LargeBinaryBuilder::new();
+        for r in 0..p_src.len() {
+            if p_src.is_null(r) {
+                p_builder.append_null();
+            } else {
+                p_builder.append_value(p_src.value(r));
+            }
+        }
+        let raw = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("u", DataType::Decimal256(39, 0), true),
+                Field::new("p", DataType::LargeBinary, true),
+            ])),
+            vec![
+                canonical.column(0).clone(),
+                Arc::new(u_raw),
+                Arc::new(p_builder.finish()),
+            ],
+        )
+        .unwrap();
+
+        let opts = ReadOptions::default();
+        let once =
+            vortex_project_and_filter_limited(vec![raw], &opts, Some(&schema), true, None)
+                .unwrap();
+        assert_eq!(once.len(), 1);
+        assert_eq!(
+            once[0], canonical,
+            "the tail must restore the canonical representation from the raw decode"
+        );
+
+        let twice =
+            vortex_project_and_filter_limited(once.clone(), &opts, Some(&schema), true, None)
+                .unwrap();
+        assert_eq!(
+            twice[0], canonical,
+            "re-running the tail over canonical batches must be a byte-identical no-op"
+        );
+    }
+
+    /// Regression for the representation collision the `CacheKey::stamped`
+    /// bit fixes: a schema-less unfiltered read (the `read_file`
+    /// UPDATE/DELETE-rewrite shape, `catalog_schema = None`) caches the RAW
+    /// physical decode (UUID still Decimal256-disguised, no BASIN_TYPE
+    /// metadata) under the same `(path, projection=ALL, filters=∅)` triple a
+    /// catalog-aware full scan uses. The two caller classes must NOT share
+    /// the entry: each must keep seeing exactly its own cold-path
+    /// representation, in both warm-up orders.
+    #[tokio::test]
+    async fn schema_less_and_catalog_reads_use_distinct_cache_entries() {
+        let project = ProjectId::new();
+        let schema = semantic_schema();
+        let batch = semantic_batch(40, 12);
+
+        let shared = Arc::new(InMemory::new());
+        let storage = paged_storage_over(shared.clone(), 64 * 1024 * 1024);
+        let storage_ref = cacheless_storage_over(shared.clone());
+        let table = TableName::new("semless").unwrap();
+        let path = write_vortex(&storage, &project, &table, &batch, Some(4)).await;
+
+        // 1) Schema-less unfiltered read populates ONLY the raw entry.
+        let raw = read_semantic_batches(&storage, &project, &path, None, ReadOptions::default())
+            .await;
+        assert_eq!(raw.iter().map(RecordBatch::num_rows).sum::<usize>(), 12);
+        let pc = storage.page_cache().unwrap();
+        let raw_key = CacheKey {
+            path: path.clone(),
+            projection_hash: hash_projection(None),
+            filters_hash: hash_filters(&[]),
+            stamped: false,
+        };
+        assert!(
+            pc.get(&raw_key).is_some(),
+            "schema-less unfiltered read populates the raw (unstamped) entry"
+        );
+        assert!(
+            pc.get(&unfiltered_key_for(&path)).is_none(),
+            "…and never the catalog-stamped entry"
+        );
+
+        // 2) A catalog-aware full scan of the same file must NOT be served
+        //    the raw entry verbatim: every column must carry the catalog's
+        //    exact DataType + metadata, identical to a cache-less storage.
+        let canon = concat_all(
+            &read_semantic_batches(
+                &storage,
+                &project,
+                &path,
+                Some(schema.clone()),
+                ReadOptions::default(),
+            )
+            .await,
+        );
+        assert_canonical(&canon, &schema);
+        let reference = concat_all(
+            &read_semantic_batches(
+                &storage_ref,
+                &project,
+                &path,
+                Some(schema.clone()),
+                ReadOptions::default(),
+            )
+            .await,
+        );
+        assert_eq!(
+            canon, reference,
+            "catalog-aware scan with a warm raw entry must equal the cache-less read"
+        );
+        assert!(
+            pc.get(&unfiltered_key_for(&path)).is_some(),
+            "the catalog-aware scan caches its own stamped entry"
+        );
+
+        // 3) Reverse direction: with the stamped entry warm, a schema-less
+        //    read must keep returning its own cold-path (raw)
+        //    representation, not the canonical one.
+        let raw_again = concat_all(
+            &read_semantic_batches(&storage, &project, &path, None, ReadOptions::default())
+                .await,
+        );
+        let raw_reference = concat_all(
+            &read_semantic_batches(&storage_ref, &project, &path, None, ReadOptions::default())
+                .await,
+        );
+        assert_eq!(
+            raw_again, raw_reference,
+            "schema-less reads must not change representation when a stamped entry is warm"
         );
     }
 
