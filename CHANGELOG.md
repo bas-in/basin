@@ -27,6 +27,25 @@ graduate to 1.0 and the standard SemVer guarantees.
   re-derived from measured reality at the same time (`f39b2d5`): non-collapse
   ≥ 0.7 at C=64 instead of a ≥ 1.5× headroom that never passed any recorded
   run on this hardware, including the run that introduced it.
+- **Pre-parse fast path for literal INSERTs** (`180c49c`): plain
+  `INSERT INTO t [(cols)] VALUES (…)` statements skip the double
+  whole-statement parse (libpg_query dispatch parse + a sqlparser AST whose
+  tuple expressions were discarded unused), the depth scan, and the rewrite
+  pipeline — an O(prefix) classifier routes raw SQL through the tuple
+  scanner into the shared INSERT tail. Auto-commit only; RETURNING /
+  ON CONFLICT / CTEs / transactions / hypertables decline to the normal
+  path with equivalence pinned.
+- **Background overlay reconciler** (`4bbdbe8`): overlay UPDATE/DELETE rows
+  drain via a periodic sweep (`BASIN_OVERLAY_RECONCILE_SECS`, default 5 s)
+  instead of waiting for a conflicting cold operation — bounding read-tax
+  and durability exposure now that delta updates can park 10k overrides.
+- **Fixed: overlay suppression hole on narrow fast-path reads** (`92dfe90`):
+  aggregate and non-PK-projection fast reads decode a minimal column set,
+  and suppression of overridden cold rows silently no-ops when the PK
+  column is absent — `SELECT SUM(v)` with outstanding overlay updates
+  returned old + new values summed. The read projection now includes the
+  PK while an overlay is live; the gate that should have caught it was
+  strengthened and mutation-verified.
 - **Delta updates: overlay UPDATEs to 10,000 keys, including no-WHERE shapes**
   (`ba049f5`): the 64-key small-bulk cap becomes `BASIN_DELTA_UPDATE_MAX_KEYS`
   (default 10k) behind a stage-then-reserve memory guard that declines to the
