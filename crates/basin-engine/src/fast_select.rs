@@ -2894,6 +2894,53 @@ async fn execute_simple_select_inner(
         None
     };
 
+    // ── Keyset ordered-traversal zone maps ──────────────────────────────────
+    //
+    // For the keyset per-file-LIMIT branch below, capture every live file's
+    // decoded `[min, max]` Int64 zone map for the keyset (ORDER BY / cluster)
+    // column BEFORE `live_files` is consumed by the `live_paths` build. The
+    // map is keyed by the same `object_store::path::Path` the `live_paths`
+    // build produces (`Path::from(f.path.as_str())`), so the keyset branch can
+    // re-associate each SURVIVING path (the general zone-map prune below
+    // already dropped every file whose `max <= cursor`) with its PK range and
+    // then open candidates in ascending-min order, short-circuiting once the
+    // page is provably complete.
+    //
+    // `None` whenever the shape doesn't apply (no keyset pushdown), the
+    // keyset column is not Int64, or ANY live file lacks a decodable Int64
+    // min/max — the branch then keeps the existing open-all-candidates
+    // behaviour, which is always correct.
+    let keyset_zone_maps: Option<
+        std::collections::HashMap<object_store::path::Path, (i64, i64)>,
+    > = match (keyset_per_file_limit, plan.order_by.as_ref()) {
+        (Some(_), Some((kcol, _)))
+            if meta
+                .schema
+                .field_with_name(kcol)
+                .map(|f| matches!(f.data_type(), arrow_schema::DataType::Int64))
+                .unwrap_or(false) =>
+        {
+            let mut m = std::collections::HashMap::with_capacity(live_files.len());
+            let mut complete = true;
+            for f in &live_files {
+                let cs = f.column_stats.get(kcol.as_str());
+                let mn = cs.and_then(|c| decode_stat_i64(c.min_bytes.as_deref()));
+                let mx = cs.and_then(|c| decode_stat_i64(c.max_bytes.as_deref()));
+                match (mn, mx) {
+                    (Some(mn), Some(mx)) => {
+                        m.insert(object_store::path::Path::from(f.path.as_str()), (mn, mx));
+                    }
+                    _ => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            complete.then_some(m)
+        }
+        _ => None,
+    };
+
     // Convert each live file's path string to an `ObjectPath` for
     // `storage.read_paths`.
     // Catalog-stats file pruning: skip any data file whose per-file
@@ -3025,42 +3072,155 @@ async fn execute_simple_select_inner(
         use futures::StreamExt;
         let mut keyset_opts = opts.clone();
         keyset_opts.limit = Some(per_file_limit);
-        // Drive the per-file reads with bounded concurrency rather than one
-        // fully-awaited file at a time.  Each file is still its OWN single-path
-        // `read_paths_with_schema` call, so its stream-level limit coincides
-        // with the per-file limit (one path ⇒ global == per-file) — the
-        // superset invariant the branch relies on is untouched.  The earlier
-        // sequential `for path { … .await }` loop serialised all file
-        // setups+awaits: at the 16-file 1M layout that linear chain was the
-        // keyset latency regression (8-file ≈ 5-7ms → 16-file ≈ 20ms).
-        // `buffered(KEYSET_READ_CONCURRENCY)` overlaps them exactly as the
-        // non-keyset cold path's own `buffered(4)` does, and `buffered`
-        // preserves input order so the collected batches stay in `live_paths`
-        // order (irrelevant to correctness — `apply_order_by_limit` re-sorts —
-        // but keeps the merge input deterministic).
-        const KEYSET_READ_CONCURRENCY: usize = 4;
         let project = sess.project;
         let storage = &sess.engine.config().storage;
-        let per_file: Vec<Result<Vec<RecordBatch>>> = futures::stream::iter(live_paths)
-            .map(|path| {
-                let keyset_opts = keyset_opts.clone();
-                let schema = Some(meta.schema.clone());
-                async move {
-                    let stream = storage
-                        .read_paths_with_schema(&project, vec![path], keyset_opts, schema)
-                        .await?;
-                    let collected: Vec<Result<RecordBatch>> = stream.collect().await;
-                    collected.into_iter().collect::<Result<Vec<_>>>()
+
+        // ── Ordered short-circuit traversal (disjoint PK layouts) ────────────
+        //
+        // Statement-affine striping + stripe-merge compaction produce cold
+        // files whose PK ranges are pairwise DISJOINT (each flush cycle writes
+        // one PK-sorted file covering its own id band). For such layouts the
+        // global top-`per_file_limit` of `k > cursor ORDER BY k ASC` lives in
+        // the FIRST candidate file in ascending-min order, plus at most its
+        // successors when the page straddles a file boundary — opening every
+        // candidate (the fan-out below) reads `n_files × limit` rows when 1-2
+        // files suffice. So: when every candidate carries a decoded Int64 zone
+        // map AND the sorted ranges are pairwise disjoint, open candidates one
+        // at a time in ascending-min order and STOP as soon as
+        //
+        //   (a) at least `per_file_limit` (= limit + offset) keyset keys have
+        //       been collected, and
+        //   (b) the NEXT file's min is STRICTLY greater than the
+        //       `per_file_limit`-th smallest key collected so far —
+        //
+        // every row in the next (and all later, min-sorted, disjoint) files
+        // has key ≥ that min > kth, so none can displace a collected row from
+        // the global top-`per_file_limit`; `apply_order_by_limit` below then
+        // produces the exact page. Ties stop nothing (`>` not `≥`): a later
+        // file whose min EQUALS the kth key may still contribute, so we keep
+        // reading. Sequential awaits are fine here precisely because the
+        // short-circuit bounds the traversal at 1-2 files; layouts that fail
+        // the disjointness check (legacy round-robin stripes where every file
+        // spans the whole PK range) keep the bounded-concurrency fan-out
+        // below, where overlap means most files genuinely contribute.
+        //
+        // Hot-tier correctness is untouched: this prunes/short-circuits the
+        // COLD file set only. The shard tail was flushed to cold files at the
+        // top of the fn (so those rows ARE in `live_paths`/zone maps), and
+        // `keyset_per_file_limit` is only `Some` when there are no live
+        // tombstone/UPDATE overlays (post_read_shrinking gate above).
+        let ordered_disjoint: Option<Vec<(object_store::path::Path, i64, i64)>> =
+            keyset_zone_maps.as_ref().and_then(|zm| {
+                let mut v: Vec<(object_store::path::Path, i64, i64)> =
+                    Vec::with_capacity(live_paths.len());
+                for p in &live_paths {
+                    let (mn, mx) = zm.get(p)?;
+                    v.push((p.clone(), *mn, *mx));
                 }
-            })
-            .buffered(KEYSET_READ_CONCURRENCY)
-            .collect()
-            .await;
-        let mut all: Vec<RecordBatch> = Vec::new();
-        for file_batches in per_file {
-            all.extend(file_batches?);
+                v.sort_by_key(|(_, mn, mx)| (*mn, *mx));
+                v.windows(2)
+                    .all(|w| w[0].2 < w[1].1)
+                    .then_some(v)
+            });
+        if let Some(files) = ordered_disjoint {
+            use arrow_array::Array;
+            let (kcol, _) = plan
+                .order_by
+                .as_ref()
+                .expect("keyset_per_file_limit implies order_by");
+            let mut all: Vec<RecordBatch> = Vec::new();
+            // Keyset-column values collected so far (already `> cursor` —
+            // storage applies the pushed Gt filter before its stream limit).
+            let mut keys: Vec<i64> = Vec::new();
+            // Conservative kill-switch: if any batch refuses to yield Int64
+            // keyset keys (missing column / unexpected type / nulls), stop
+            // short-circuiting and read every remaining candidate — slower,
+            // never wrong.
+            let mut keys_complete = true;
+            for (i, (path, _mn, _mx)) in files.iter().enumerate() {
+                let stream = storage
+                    .read_paths_with_schema(
+                        &project,
+                        vec![path.clone()],
+                        keyset_opts.clone(),
+                        Some(meta.schema.clone()),
+                    )
+                    .await?;
+                let collected: Vec<Result<RecordBatch>> = stream.collect().await;
+                let file_batches = collected.into_iter().collect::<Result<Vec<_>>>()?;
+                for b in &file_batches {
+                    match b
+                        .schema()
+                        .index_of(kcol)
+                        .ok()
+                        .and_then(|ci| {
+                            b.column(ci)
+                                .as_any()
+                                .downcast_ref::<arrow_array::Int64Array>()
+                                .cloned()
+                        }) {
+                        Some(arr) if arr.null_count() == 0 => {
+                            keys.extend(arr.values().iter().copied());
+                        }
+                        _ => keys_complete = false,
+                    }
+                }
+                all.extend(file_batches);
+                if keys_complete && per_file_limit > 0 && keys.len() >= per_file_limit {
+                    match files.get(i + 1) {
+                        None => break, // last file — nothing left to skip
+                        Some((_, next_min, _)) => {
+                            // kth = the per_file_limit-th smallest collected
+                            // key. The collected set is tiny (≤ files_opened ×
+                            // per_file_limit), so a select_nth on a scratch
+                            // copy is cheap.
+                            let mut scratch = keys.clone();
+                            let (_, kth, _) =
+                                scratch.select_nth_unstable(per_file_limit - 1);
+                            if *next_min > *kth {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            all
+        } else {
+            // Drive the per-file reads with bounded concurrency rather than one
+            // fully-awaited file at a time.  Each file is still its OWN single-path
+            // `read_paths_with_schema` call, so its stream-level limit coincides
+            // with the per-file limit (one path ⇒ global == per-file) — the
+            // superset invariant the branch relies on is untouched.  The earlier
+            // sequential `for path { … .await }` loop serialised all file
+            // setups+awaits: at the 16-file 1M layout that linear chain was the
+            // keyset latency regression (8-file ≈ 5-7ms → 16-file ≈ 20ms).
+            // `buffered(KEYSET_READ_CONCURRENCY)` overlaps them exactly as the
+            // non-keyset cold path's own `buffered(4)` does, and `buffered`
+            // preserves input order so the collected batches stay in `live_paths`
+            // order (irrelevant to correctness — `apply_order_by_limit` re-sorts —
+            // but keeps the merge input deterministic).
+            const KEYSET_READ_CONCURRENCY: usize = 4;
+            let per_file: Vec<Result<Vec<RecordBatch>>> = futures::stream::iter(live_paths)
+                .map(|path| {
+                    let keyset_opts = keyset_opts.clone();
+                    let schema = Some(meta.schema.clone());
+                    async move {
+                        let stream = storage
+                            .read_paths_with_schema(&project, vec![path], keyset_opts, schema)
+                            .await?;
+                        let collected: Vec<Result<RecordBatch>> = stream.collect().await;
+                        collected.into_iter().collect::<Result<Vec<_>>>()
+                    }
+                })
+                .buffered(KEYSET_READ_CONCURRENCY)
+                .collect()
+                .await;
+            let mut all: Vec<RecordBatch> = Vec::new();
+            for file_batches in per_file {
+                all.extend(file_batches?);
+            }
+            all
         }
-        all
     } else if had_pk_probe || shadow_cols_present || pinned.is_some() {
         // Direct cold-file read (bypass `handle.read`). Three cases reach here:
         //
@@ -3769,6 +3929,16 @@ fn evaluate_computed_projections(
 ///
 /// Only a single-column result qualifies for the keyset fast path; anything
 /// composite returns `None` so the caller stays on the full-file path.
+/// 8-byte little-endian Int64 zone-map stat decode — the writer's
+/// `ColumnStats::min_bytes` / `max_bytes` encoding for Int64 columns. Mirrors
+/// the `stat_i64` decode `index_probe::pk_point_probe_multi` uses for its
+/// exact IN-list zone-map prune (kept local there as a nested fn); any change
+/// to the writer's stat encoding must update both.
+fn decode_stat_i64(b: Option<&[u8]>) -> Option<i64> {
+    let arr: [u8; 8] = b?.try_into().ok()?;
+    Some(i64::from_le_bytes(arr))
+}
+
 fn effective_cluster_col(meta: &TableMetadata) -> Option<String> {
     if !meta.cluster_columns.is_empty() {
         return match meta.cluster_columns.as_slice() {

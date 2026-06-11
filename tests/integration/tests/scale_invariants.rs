@@ -86,6 +86,7 @@ async fn build() -> (
             root_prefix: None,
             flush_interval: Duration::from_millis(50),
             flush_max_bytes: 1024 * 1024,
+            commit_delay: Duration::from_millis(2),
         })
         .await
         .unwrap(),
@@ -595,6 +596,227 @@ async fn scale_invariants() {
         "[scale-invariants] scale={scale} fresh-point files<=2 rows_decoded<=2chunk; \
          repeat/delete/own-insert/in-list-2nd = 0 cold; keyset/join point-bounded; \
          200-key delta UPDATE zero-replacement-files — all PASS"
+    );
+
+    bg.shutdown().await;
+    wal.close().await.unwrap();
+}
+
+/// Collect the `id` column (column 0) of a `SELECT id, … ORDER BY id` result
+/// in result order.
+fn ids_of(res: &ExecResult) -> Vec<i64> {
+    use arrow_array::{Array, Int64Array};
+    match res {
+        ExecResult::Rows { batches, .. } => {
+            let mut out = Vec::new();
+            for b in batches {
+                let ids = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id must be Int64");
+                for r in 0..ids.len() {
+                    out.push(ids.value(r));
+                }
+            }
+            out
+        }
+        ExecResult::Empty { tag } => panic!("expected Rows, got Empty tag={tag}"),
+    }
+}
+
+/// Keyset-pagination short-circuit gates over a DISJOINT multi-file layout.
+///
+/// Statement-affine striping + per-statement flush produce one PK-sorted cold
+/// file per INSERT statement, each covering a disjoint id band — the layout
+/// the keyset fast path's ordered traversal exploits. The design invariant:
+/// a `WHERE id > cursor ORDER BY id LIMIT n` page over K disjoint files opens
+/// at most TWO files (the one whose [min,max] band contains the cursor's
+/// successor, plus its neighbour when the page straddles a band boundary),
+/// independent of K — zone-map pruning drops every file with `max <= cursor`
+/// without opening it, and the ascending-min ordered traversal stops as soon
+/// as the collected page provably cannot be displaced by later bands. Before
+/// the short-circuit the keyset path opened EVERY surviving candidate
+/// (`files_opened` grew with K: the 1M-row ~23.5ms keyset residual); these
+/// gates pin the O(1)-in-K bound so a regression to the fan-out is loud.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keyset_short_circuit_scale_invariants() {
+    let (_sd, _wd, engine, shard, bg, wal, storage) = build().await;
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    // 6 disjoint files of 5k rows each: one INSERT statement per id band,
+    // flushed before the next, so each band lands in its own PK-sorted cold
+    // file with a disjoint [min,max] id zone map (same layout recipe as the
+    // seed loop in `scale_invariants` above).
+    const FILES: i64 = 6;
+    const PER_FILE: i64 = 5_000; // ids 0..30_000
+    sess.execute("CREATE TABLE pages (id BIGINT PRIMARY KEY, v BIGINT)")
+        .await
+        .unwrap();
+    for f in 0..FILES {
+        let lo = f * PER_FILE;
+        let hi = lo + PER_FILE;
+        let mut stmt = String::with_capacity((hi - lo) as usize * 16);
+        stmt.push_str("INSERT INTO pages VALUES ");
+        for k in lo..hi {
+            if k > lo {
+                stmt.push(',');
+            }
+            stmt.push_str(&format!("({k},{k})"));
+        }
+        sess.execute(&stmt).await.unwrap();
+        shard.flush_to_parquet().await.unwrap();
+    }
+
+    let probe = |sql: String| {
+        let sess = &sess;
+        let storage = &storage;
+        async move {
+            let before = storage.read_counters().snapshot();
+            let res = sess.execute(&sql).await.unwrap();
+            let after = storage.read_counters().snapshot();
+            (res, after.delta(&before))
+        }
+    };
+
+    // ── 1. First page (cursor at the very start) ─────────────────────────────
+    // `id > 0` prunes NOTHING by zone map (every band's max > 0) — all 6 files
+    // are candidates. The SHORT-CIRCUIT alone must bound the opens: the first
+    // band (ascending min) yields the full page and the next band's min
+    // (5_000) exceeds the page's 100th key (100), so the traversal stops.
+    // This is the gate that distinguishes the ordered traversal from the old
+    // open-every-candidate fan-out (which would open all 6).
+    let (res, d) = probe("SELECT id, v FROM pages WHERE id > 0 ORDER BY id LIMIT 100".into())
+        .await;
+    assert_eq!(
+        ids_of(&res),
+        (1..=100).collect::<Vec<i64>>(),
+        "first page must be the 100 smallest ids > 0"
+    );
+    assert!(
+        d.files_opened <= 2,
+        "first keyset page opened {} files; short-circuit bound is <=2 (design: 1) — \
+         opening more means the ordered traversal regressed to the all-candidate fan-out",
+        d.files_opened
+    );
+    assert!(
+        d.rows_decoded <= 2 * ONE_CHUNK,
+        "first keyset page decoded {} rows; bound <= 2 chunks",
+        d.rows_decoded
+    );
+
+    // ── 2. Mid-table page inside one band ────────────────────────────────────
+    // cursor 12_345 → page 12_346..=12_395 lives entirely in band 2
+    // (10_000..15_000). Zone maps prune bands 0-1 (max <= cursor); the ordered
+    // traversal stops after band 2 (next min 15_000 > kth key 12_395).
+    let (res, d) = probe(
+        "SELECT id, v FROM pages WHERE id > 12345 ORDER BY id LIMIT 50".into(),
+    )
+    .await;
+    assert_eq!(
+        ids_of(&res),
+        (12_346..=12_395).collect::<Vec<i64>>(),
+        "mid-table page must be the 50 smallest ids > 12345"
+    );
+    assert!(
+        d.files_opened <= 2,
+        "mid-table keyset page opened {} files; bound <=2 (design: 1)",
+        d.files_opened
+    );
+
+    // ── 3. Page straddling a band boundary ───────────────────────────────────
+    // cursor 14_980 → page 14_981..=15_030 spans band 2 (..14_999, 19 rows)
+    // and band 3 (15_000.., 31 rows). Band 2 alone under-fills the page, so
+    // the traversal must continue into band 3 and then stop — exactly 2 opens,
+    // and the page must be seam-free (no gap, no repeat at the boundary).
+    let (res, d) = probe(
+        "SELECT id, v FROM pages WHERE id > 14980 ORDER BY id LIMIT 50".into(),
+    )
+    .await;
+    assert_eq!(
+        ids_of(&res),
+        (14_981..=15_030).collect::<Vec<i64>>(),
+        "boundary-straddling page must cross the file seam with no gap/repeat"
+    );
+    assert!(
+        d.files_opened <= 2,
+        "boundary keyset page opened {} files; bound <=2 (design: exactly 2)",
+        d.files_opened
+    );
+
+    // ── 4. Cursor past all bands but the last ────────────────────────────────
+    // K-1 files have max <= cursor (25_100) — zone-map pruning must skip them
+    // all WITHOUT opening, leaving only the last band. This is the prompt-side
+    // half of the invariant: prune handles the bands behind the cursor, the
+    // short-circuit handles the bands ahead of the page.
+    let (res, d) = probe(
+        "SELECT id, v FROM pages WHERE id > 25100 ORDER BY id LIMIT 50".into(),
+    )
+    .await;
+    assert_eq!(
+        ids_of(&res),
+        (25_101..=25_150).collect::<Vec<i64>>(),
+        "last-band page must return the 50 smallest ids > 25100"
+    );
+    assert!(
+        d.files_opened <= 2,
+        "last-band keyset page opened {} files with K-1 bands behind the cursor; \
+         bound <=2 (design: 1 — every earlier band is zone-map-pruned unopened)",
+        d.files_opened
+    );
+
+    // ── 5. Empty page (cursor beyond the table max) ──────────────────────────
+    // Every band's max <= cursor → all files pruned, zero opens, zero rows.
+    let (res, d) = probe(
+        "SELECT id, v FROM pages WHERE id > 99999 ORDER BY id LIMIT 50".into(),
+    )
+    .await;
+    assert!(
+        ids_of(&res).is_empty(),
+        "cursor beyond the max id must yield an empty page"
+    );
+    assert_eq!(
+        d.files_opened, 0,
+        "empty keyset page opened {} files; a fully-pruned candidate set must open 0",
+        d.files_opened
+    );
+
+    // ── 6. Page over hot-tail rows (tail rows merge in) ──────────────────────
+    // Insert a fresh band WITHOUT an explicit flush: the rows sit in the shard
+    // tail until the SELECT's own pre-read flush (#205) drains them to a new
+    // cold file. The page straddles the old-cold/new-tail seam, so it proves
+    // file pruning/short-circuiting never hides not-yet-flushed rows: 9 rows
+    // from the last seeded band (29_991..=29_999) + 41 from the drained tail.
+    sess.execute(&{
+        let mut stmt = String::from("INSERT INTO pages VALUES ");
+        for k in 30_000..30_100i64 {
+            if k > 30_000 {
+                stmt.push(',');
+            }
+            stmt.push_str(&format!("({k},{k})"));
+        }
+        stmt
+    })
+    .await
+    .unwrap();
+    let (res, d) = probe(
+        "SELECT id, v FROM pages WHERE id > 29990 ORDER BY id LIMIT 50".into(),
+    )
+    .await;
+    assert_eq!(
+        ids_of(&res),
+        (29_991..=30_040).collect::<Vec<i64>>(),
+        "page must merge the freshly-inserted tail rows across the cold/tail seam"
+    );
+    assert!(
+        d.files_opened <= 3,
+        "hot-tail keyset page opened {} files; bound <=3 (old band + drained-tail file + slack)",
+        d.files_opened
+    );
+
+    println!(
+        "[keyset-short-circuit] {FILES} disjoint files x {PER_FILE} rows: first/mid/boundary/\
+         last-band pages <=2 opens, empty page 0 opens, hot-tail merge correct — all PASS"
     );
 
     bg.shutdown().await;
