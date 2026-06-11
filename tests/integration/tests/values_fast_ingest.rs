@@ -11,8 +11,13 @@
 //! slow path — either way the equivalence assertions must hold.
 //!
 //! The fallback tests confirm that shapes the scanner refuses (functions,
-//! casts, ON CONFLICT, unsupported column types) still succeed via the slow
-//! path, and that a PK violation is still raised.
+//! function-style `CAST(...)`, mismatched or unrecognised `::` suffix casts,
+//! ON CONFLICT, unsupported column types) still succeed (or fail identically)
+//! via the slow path, and that a PK violation is still raised. The one cast
+//! shape the scanner *admits* is a type-matching `::jsonb` / `::timestamp` /
+//! `::timestamptz` suffix on a string literal — the exact shape the published
+//! bulk-INSERT benchmark sends (`'<json>'::jsonb`) — covered by the
+//! suffix-cast equivalence tests below.
 
 #![allow(clippy::print_stdout)]
 
@@ -21,8 +26,8 @@ use std::time::Instant;
 
 use arrow_array::RecordBatch;
 use arrow_array::{
-    Array, BooleanArray, Float64Array, Int32Array, Int64Array, LargeBinaryArray, StringArray,
-    TimestampMicrosecondArray,
+    Array, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array, LargeBinaryArray,
+    StringArray, TimestampMicrosecondArray,
 };
 use basin_catalog::InMemoryCatalog;
 use basin_common::ProjectId;
@@ -177,6 +182,28 @@ fn col_jsonb_bytes(batches: &[RecordBatch], name: &str) -> Vec<Option<Vec<u8>>> 
                 None
             } else {
                 Some(arr.value(i).to_vec())
+            });
+        }
+    }
+    out
+}
+
+/// Extract a DATE column as raw Arrow `Date32` values (days since the Unix
+/// epoch).
+fn col_date32(batches: &[RecordBatch], name: &str) -> Vec<Option<i32>> {
+    let mut out = Vec::new();
+    for b in batches {
+        let idx = b.schema().index_of(name).unwrap();
+        let arr = b
+            .column(idx)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
+        for i in 0..arr.len() {
+            out.push(if arr.is_null(i) {
+                None
+            } else {
+                Some(arr.value(i))
             });
         }
     }
@@ -496,6 +523,118 @@ async fn equivalence_benchmark_schema_10k_with_jsonb() {
     assert!(a < m_ && m_ < z, "canonical key order a<m<z, got {row5_str}");
 }
 
+/// The published benchmark's exact literal shape: every JSONB payload carries
+/// a `::jsonb` suffix cast (`'<json>'::jsonb` — see the bulk-INSERT seed in
+/// `compare_postgres_common.rs`). 10k rows through one multi-row INSERT (the
+/// fast scanner now admits the type-matching suffix cast) vs the same data
+/// WITHOUT casts through a slow-path control (ON CONFLICT forces the decline,
+/// as in `equivalence_benchmark_schema_10k_with_jsonb` — and the slow path
+/// peels the cast wrapper anyway, so the uncast control is the same data).
+/// The JSONB column must come back byte-identical.
+#[tokio::test]
+async fn equivalence_benchmark_jsonb_suffix_cast_10k() {
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+
+    let ddl = |t: &str| {
+        format!(
+            "CREATE TABLE {t} (id BIGINT NOT NULL PRIMARY KEY, user_id BIGINT, \
+             amount DOUBLE PRECISION, status TEXT, created_at BIGINT, payload JSONB)"
+        )
+    };
+    sess.execute(&ddl("multi")).await.unwrap();
+    sess.execute(&ddl("control")).await.unwrap();
+
+    // Same payload-shape cycle as the uncast benchmark-schema test: nested
+    // objects with out-of-order keys, arrays, unicode, escaped quotes, JSON
+    // null — so the canonical encoder is exercised under the cast suffix too.
+    let payload_for = |i: usize| -> String {
+        match i % 5 {
+            0 => format!("{{\"z\":{i},\"a\":{{\"nested\":[1,2,3],\"k\":\"v\"}},\"m\":true}}"),
+            1 => format!("[{i}, \"héllo wörld\", null, {{\"x\":-1.5}}]"),
+            2 => format!("{{\"quote\":\"it''s a \\\"json\\\" str\",\"n\":{i}}}"),
+            3 => "null".to_string(),
+            _ => format!("{{\"tags\":[\"a\",\"b\",\"c\"],\"unicode\":\"日本語\",\"id\":{i}}}"),
+        }
+    };
+
+    let n = 10_000usize;
+    // `cast` controls whether the payload literal carries the benchmark's
+    // `::jsonb` suffix. NULL payloads (every 13th row) stay bare NULL in both
+    // statements, exactly as the benchmark would send them.
+    let tuple = |i: usize, cast: bool| -> String {
+        let payload = if i % 13 == 0 {
+            "NULL".to_string()
+        } else if cast {
+            format!("'{}'::jsonb", payload_for(i))
+        } else {
+            format!("'{}'", payload_for(i))
+        };
+        format!(
+            "({i}, {}, {}.{:02}, 'status-{}', {}, {payload})",
+            i as i64 * 3,
+            i % 1000,
+            i % 100,
+            i % 4,
+            1_700_000_000_000_000i64 + i as i64
+        )
+    };
+
+    // multi: one multi-row statement, every payload suffix-cast — the
+    // benchmark shape the fast scanner must now engage on.
+    let mut multi_sql = String::from(
+        "INSERT INTO multi (id, user_id, amount, status, created_at, payload) VALUES ",
+    );
+    for i in 0..n {
+        if i > 0 {
+            multi_sql.push_str(", ");
+        }
+        multi_sql.push_str(&tuple(i, true));
+    }
+    sess.execute(&multi_sql).await.unwrap();
+
+    // control: identical data, NO casts, ON CONFLICT DO NOTHING so the
+    // scanner is guaranteed not to engage (slow `batch_from_rows` path).
+    let mut ctrl_sql = String::from(
+        "INSERT INTO control (id, user_id, amount, status, created_at, payload) VALUES ",
+    );
+    for i in 0..n {
+        if i > 0 {
+            ctrl_sql.push_str(", ");
+        }
+        ctrl_sql.push_str(&tuple(i, false));
+    }
+    ctrl_sql.push_str(" ON CONFLICT (id) DO NOTHING");
+    sess.execute(&ctrl_sql).await.unwrap();
+
+    let cols = "id, user_id, amount, status, created_at, payload";
+    let m = select(&sess, &format!("SELECT {cols} FROM multi ORDER BY id")).await;
+    let c = select(&sess, &format!("SELECT {cols} FROM control ORDER BY id")).await;
+
+    assert_eq!(total_rows(&m), n);
+    assert_eq!(total_rows(&c), n);
+    assert_eq!(col_i64(&m, "id"), col_i64(&c, "id"), "id mismatch");
+    assert_eq!(col_str(&m, "status"), col_str(&c, "status"), "status mismatch");
+    // The load-bearing assertion: a `::jsonb`-suffixed literal through the
+    // fast path must store byte-identical canonical JSONB to the uncast
+    // slow-path control.
+    assert_eq!(
+        col_jsonb_bytes(&m, "payload"),
+        col_jsonb_bytes(&c, "payload"),
+        "JSONB payload bytes mismatch between suffix-cast fast path and uncast slow path"
+    );
+
+    // Canonical-form spot check (key sort a<m<z on row 5), as in the uncast
+    // benchmark-schema test, so both-paths-wrong can't self-agree.
+    let m_payloads = col_jsonb_bytes(&m, "payload");
+    let row5 = m_payloads[5].as_ref().expect("row 5 payload not null");
+    let row5_str = std::str::from_utf8(row5).unwrap();
+    let a = row5_str.find("\"a\"").unwrap();
+    let m_ = row5_str.find("\"m\"").unwrap();
+    let z = row5_str.find("\"z\"").unwrap();
+    assert!(a < m_ && m_ < z, "canonical key order a<m<z, got {row5_str}");
+}
+
 /// Invalid JSON in a JSONB column: the multi-row statement must error, and the
 /// error must be identical to the single-row (slow-path) control — the fast
 /// scanner declines on the invalid document and the slow path surfaces the
@@ -553,12 +692,17 @@ async fn equivalence_timestamp_column() {
     sess.execute(&ddl("multi")).await.unwrap();
     sess.execute(&ddl("control")).await.unwrap();
 
+    // Rows 6 and 7 carry the `::timestamp` / `::timestamptz` suffix casts the
+    // scanner now admits into Timestamp(µs) columns; the single-row control
+    // peels the same casts on the slow path, so both paths must agree.
     let rows: &[&str] = &[
         "(1, '2020-01-01T00:00:00Z')",
         "(2, '2021-06-15 12:30:00')",
         "(3, '2026-04-15T12:00:00.123456Z')",
         "(4, NULL)",
         "(5, '1999-12-31 23:59:59')",
+        "(6, '2022-03-04T05:06:07Z'::timestamptz)",
+        "(7, '2023-07-08 09:10:11'::timestamp)",
     ];
 
     sess.execute(&format!(
@@ -613,10 +757,12 @@ async fn fallback_function_in_values() {
     assert_eq!(col_i64(&cnt, "c"), vec![Some(2)]);
 }
 
-/// A `::int` cast in the VALUES list is a non-literal token the scanner refuses.
-/// basin's INSERT VALUES path doesn't evaluate casts on literals, so the engine
-/// rejects this today — the fast scanner must not change that: it declines and
-/// the slow path produces the same error (zero behavior change).
+/// A `::int` cast in the VALUES list is outside the scanner's admitted suffix
+/// set (`jsonb`/`timestamp`/`timestamptz` on strings only), so it still
+/// declines. basin's INSERT VALUES path doesn't evaluate `::int` casts on
+/// literals, so the engine rejects this today — the fast scanner must not
+/// change that: it declines and the slow path produces the same error (zero
+/// behavior change).
 #[tokio::test]
 async fn fallback_cast_in_values_unchanged_behavior() {
     let (_dir, eng) = open_engine().await;
@@ -636,6 +782,124 @@ async fn fallback_cast_in_values_unchanged_behavior() {
     // Nothing was written (the statement failed atomically).
     let r = select(&sess, "SELECT count(*) AS c FROM t").await;
     assert_eq!(col_i64(&r, "c"), vec![Some(0)]);
+}
+
+/// Function-style `CAST(... AS JSONB)` must STILL decline — only the `::`
+/// suffix form on a string literal is admitted. The slow path peels `CAST`
+/// wrappers for JSONB columns, so the statement succeeds end-to-end via the
+/// slow path, and its stored bytes must match the suffix-cast / bare forms.
+#[tokio::test]
+async fn fallback_function_style_cast_still_declines() {
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, payload JSONB)")
+        .await
+        .unwrap();
+    // One CAST(...) cell forces the whole statement onto the slow path; the
+    // suffix-cast and bare cells ride along and must coerce identically there.
+    sess.execute(
+        "INSERT INTO t (id, payload) VALUES \
+         (1, CAST('{\"b\":1,\"a\":2}' AS JSONB)), \
+         (2, '{\"b\":1,\"a\":2}'::jsonb), \
+         (3, '{\"b\":1,\"a\":2}')",
+    )
+    .await
+    .unwrap();
+    let r = select(&sess, "SELECT id, payload FROM t ORDER BY id").await;
+    assert_eq!(col_i64(&r, "id"), vec![Some(1), Some(2), Some(3)]);
+    let payloads = col_jsonb_bytes(&r, "payload");
+    assert_eq!(
+        payloads[0], payloads[1],
+        "CAST(...) and ::jsonb forms must store identical canonical bytes"
+    );
+    assert_eq!(
+        payloads[1], payloads[2],
+        "::jsonb and bare-string forms must store identical canonical bytes"
+    );
+    // Canonical key sort happened (a before b after sorting z,a,m-style input).
+    let p = std::str::from_utf8(payloads[0].as_ref().unwrap()).unwrap();
+    assert!(
+        p.find("\"a\"").unwrap() < p.find("\"b\"").unwrap(),
+        "canonical key order a<b, got {p}"
+    );
+}
+
+/// A mismatched suffix cast — `'2020-01-01'::date` into a DATE column — is
+/// outside the admitted tag set, so the scanner declines (twice over: Date32
+/// is also an unsupported fast-path column type) and the statement routes to
+/// the slow path either way. The slow path's DATE coercion peels the cast, so
+/// the INSERT succeeds and round-trips — pinning that the scanner change is
+/// behavior-neutral here.
+#[tokio::test]
+async fn fallback_mismatched_cast_date_column() {
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+    sess.execute("CREATE TABLE multi (id BIGINT NOT NULL PRIMARY KEY, d DATE)")
+        .await
+        .unwrap();
+    sess.execute("CREATE TABLE control (id BIGINT NOT NULL PRIMARY KEY, d DATE)")
+        .await
+        .unwrap();
+
+    // Multi-row with the `::date` suffix (the shape under test) …
+    sess.execute(
+        "INSERT INTO multi (id, d) VALUES \
+         (1, '2020-01-01'::date), (2, '1999-12-31'::date), (3, NULL)",
+    )
+    .await
+    .unwrap();
+    // … and the same data uncast as the control (also slow path).
+    sess.execute("INSERT INTO control (id, d) VALUES (1, '2020-01-01'), (2, '1999-12-31'), (3, NULL)")
+        .await
+        .unwrap();
+
+    let m = select(&sess, "SELECT id, d FROM multi ORDER BY id").await;
+    let c = select(&sess, "SELECT id, d FROM control ORDER BY id").await;
+    assert_eq!(col_i64(&m, "id"), vec![Some(1), Some(2), Some(3)]);
+    assert_eq!(
+        col_date32(&m, "d"),
+        col_date32(&c, "d"),
+        "cast and uncast DATE inserts must round-trip identically"
+    );
+    // Exact value: 2020-01-01 is 18262 days after the Unix epoch.
+    assert_eq!(col_date32(&m, "d"), vec![Some(18262), Some(10956), None]);
+}
+
+/// `'{}'::jsonb` into a plain TEXT column: the tag/column mismatch makes the
+/// scanner decline, and the slow path ACCEPTS the shape (its JSONB cast
+/// coercion peels the wrapper and the value lands as a string). This test
+/// pins that end-to-end behavior and that the multi-row statement (scanner
+/// eligible, must decline) produces exactly what the single-row control
+/// does — declining must never change behavior, whatever that behavior is.
+#[tokio::test]
+async fn fallback_jsonb_cast_into_text_unchanged_behavior() {
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+    sess.execute("CREATE TABLE multi (id BIGINT NOT NULL PRIMARY KEY, s TEXT)")
+        .await
+        .unwrap();
+    sess.execute("CREATE TABLE control (id BIGINT NOT NULL PRIMARY KEY, s TEXT)")
+        .await
+        .unwrap();
+
+    sess.execute("INSERT INTO multi (id, s) VALUES (1, 'plain'), (2, '{}'::jsonb)")
+        .await
+        .expect("slow path accepts ::jsonb into TEXT");
+    sess.execute("INSERT INTO control (id, s) VALUES (1, 'plain')")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO control (id, s) VALUES (2, '{}'::jsonb)")
+        .await
+        .expect("single-row slow path accepts ::jsonb into TEXT");
+
+    let m = select(&sess, "SELECT id, s FROM multi ORDER BY id").await;
+    let c = select(&sess, "SELECT id, s FROM control ORDER BY id").await;
+    assert_eq!(col_i64(&m, "id"), vec![Some(1), Some(2)]);
+    assert_eq!(
+        col_str(&m, "s"),
+        col_str(&c, "s"),
+        "declined multi-row statement must match the single-row slow path exactly"
+    );
 }
 
 #[tokio::test]
@@ -728,8 +992,10 @@ async fn values_fast_throughput_probe() {
 
     // Benchmark-shaped schema: the JSONB `payload` and BIGINT `created_at`
     // columns are exactly what previously forced the whole statement onto the
-    // slow path. With the extended scanner this should now run on the fast
-    // path end-to-end.
+    // slow path. The payload literal carries the `::jsonb` suffix cast so the
+    // statement byte-shape mirrors the published bulk-INSERT benchmark
+    // (`compare_postgres_common.rs`) exactly. With the extended scanner this
+    // should now run on the fast path end-to-end.
     sess.execute(
         "CREATE TABLE fast (id BIGINT NOT NULL PRIMARY KEY, user_id BIGINT, \
          amount DOUBLE PRECISION, status TEXT, created_at BIGINT, payload JSONB)",
@@ -751,7 +1017,7 @@ async fn values_fast_throughput_probe() {
                 sql.push_str(", ");
             }
             sql.push_str(&format!(
-                "({i}, {}, {}.{:02}, 'status-{}', {}, '{{\"user\":{},\"tags\":[\"a\",\"b\"],\"v\":{i}}}')",
+                "({i}, {}, {}.{:02}, 'status-{}', {}, '{{\"user\":{},\"tags\":[\"a\",\"b\"],\"v\":{i}}}'::jsonb)",
                 i as i64 * 3,
                 i % 1000,
                 i % 100,
@@ -766,7 +1032,7 @@ async fn values_fast_throughput_probe() {
     let elapsed = start.elapsed();
     let rps = n as f64 / elapsed.as_secs_f64();
     println!(
-        "[values-fast] benchmark schema (JSONB+ts): {n} rows in {:.3}s = {rps:.0} rows/s",
+        "[values-fast] benchmark schema (JSONB ::jsonb suffix + ts): {n} rows in {:.3}s = {rps:.0} rows/s",
         elapsed.as_secs_f64()
     );
 

@@ -38,7 +38,8 @@
 //!   value       := int | float | string | 'NULL' | 'TRUE' | 'FALSE'
 //!   int         := '-'? DIGIT+
 //!   float       := '-'? DIGIT+ ('.' DIGIT*)? ([eE] [+-]? DIGIT+)?   (must contain '.' or exponent)
-//!   string      := '\'' ( [^'] | '\'\'' )* '\''                     (PG single-quote, '' escapes ')
+//!   string      := '\'' ( [^'] | '\'\'' )* '\'' cast?               (PG single-quote, '' escapes ')
+//!   cast        := WS* '::' WS* ( 'jsonb' | 'timestamp' | 'timestamptz' )  (ASCII case-insensitive)
 //! ```
 //!
 //! Supported per-tuple arity is exactly `insert_cols.len()`; a tuple with the
@@ -57,9 +58,22 @@
 //!   unparseable timestamp) returns `None` and the slow path surfaces the
 //!   canonical error.
 //! * Any token that isn't an integer / float / single-quoted string / NULL /
-//!   TRUE / FALSE: casts (`::`), function calls, `$`-params, dollar-quoted
-//!   strings, `ARRAY[...]`, nested parens, identifiers, E'' / N'' / x''
-//!   prefixed strings, double-quoted strings.
+//!   TRUE / FALSE: function-style `CAST(...)`, function calls, `$`-params,
+//!   dollar-quoted strings, `ARRAY[...]`, nested parens, identifiers,
+//!   E'' / N'' / x'' prefixed strings, double-quoted strings. The ONE cast
+//!   shape admitted is a `::jsonb` / `::timestamp` / `::timestamptz` suffix on
+//!   a single-quoted string (the shape the published bulk-INSERT benchmark
+//!   sends: `'<json>'::jsonb`), and the tag must MATCH the destination column:
+//!   `::jsonb` only into a JSONB column, `::timestamp` / `::timestamptz` only
+//!   into a Timestamp(µs) column (tz-bearing or not — the slow path peels the
+//!   cast wrapper and ignores its type for those two column families, so
+//!   admitting the suffix is byte-identical). Any other suffix tag (`::text`,
+//!   `::uuid`, `::date`, `::int`, …) and any tag/column mismatch → `None`.
+//!   `::text` into a TEXT column is *deliberately* declined: the slow path's
+//!   plain-Utf8 coercion (`coerce_string_ref`) does NOT peel cast wrappers —
+//!   it raises "expected string literal" — and the fast path must never accept
+//!   a statement the slow path rejects. A `::` cast on a non-string token
+//!   (`1::int`) is still rejected outright.
 //! * A value whose token kind is incompatible with its destination column type
 //!   (e.g. a string literal for an Int64 column, a float for an Int column).
 //! * NULL routed at a NOT NULL column.
@@ -87,13 +101,37 @@ const BATCH_ROWS: usize = 8192;
 /// A single scanned cell, kept type-tagged so we can dispatch the per-column
 /// Arrow build once we know the destination type. Strings borrow from the
 /// source SQL when no `''` un-escaping is needed (the overwhelmingly common
-/// case), and own a `String` only when an escape was collapsed.
+/// case), and own a `String` only when an escape was collapsed. A string may
+/// carry a recognised `::<type>` suffix-cast tag; at append time the tag must
+/// match the destination column's accumulator or the whole statement declines
+/// (see [`ColAcc::push`]). Only strings ever carry a tag — the suffix parse
+/// happens exclusively in [`Scanner::read_string`].
 enum Cell<'a> {
     Null,
     Int(i64),
     Float(f64),
     Bool(bool),
-    Str(std::borrow::Cow<'a, str>),
+    Str {
+        s: std::borrow::Cow<'a, str>,
+        cast: Option<CastTag>,
+    },
+}
+
+/// The closed set of `::<type>` suffix casts the scanner admits on a string
+/// literal. Each tag is admitted into exactly the column family whose slow-path
+/// coercion *peels* cast wrappers (so fast and slow stay byte-identical):
+/// `Jsonb` → JSONB columns (`dml::coerce_jsonb` peels), `Timestamp` /
+/// `Timestamptz` → Timestamp(µs) columns (`dml::coerce_timestamp_micros`
+/// peels; the string parser handles both tz-bearing and naive forms, and the
+/// slow path ignores the cast's type entirely, so both tags are admitted to
+/// both tz and non-tz columns). Anything else — notably `::text`, whose
+/// destination's slow-path coercion does NOT peel casts and errors — is not a
+/// tag: the tokenizer declines the statement on sight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CastTag {
+    Jsonb,
+    Timestamp,
+    Timestamptz,
 }
 
 /// Executor entry point: decide eligibility from the parsed INSERT header and,
@@ -511,7 +549,9 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    /// `'...'` with `''` → `'` un-escaping. Borrows when no escape is present.
+    /// `'...'` with `''` → `'` un-escaping, plus an optional `::<type>` suffix
+    /// cast (see [`Scanner::read_cast_suffix`]). Borrows when no escape is
+    /// present.
     fn read_string(&mut self) -> Option<Cell<'a>> {
         debug_assert_eq!(self.peek(), Some(b'\''));
         let start = self.pos + 1;
@@ -531,18 +571,79 @@ impl<'a> Scanner<'a> {
                 // Validate UTF-8 once; the rest of the engine assumes valid
                 // UTF-8 strings. Invalid bytes → bail to slow path.
                 let s = std::str::from_utf8(raw).ok()?;
+                // Optional `::<type>` suffix cast. `None` here means "a cast
+                // was present but is not one we admit" → decline the whole
+                // statement (the slow path owns every other cast shape).
+                let cast = self.read_cast_suffix()?;
                 if !had_escape {
-                    return Some(Cell::Str(std::borrow::Cow::Borrowed(s)));
+                    return Some(Cell::Str {
+                        s: std::borrow::Cow::Borrowed(s),
+                        cast,
+                    });
                 }
                 // Collapse `''` → `'`. We replace on the validated `&str`; a
                 // `'` is ASCII (never a UTF-8 continuation byte) so the doubled
                 // quote can only appear at a char boundary — `replace` is safe
                 // and never splits a multi-byte sequence.
                 let out = s.replace("''", "'");
-                return Some(Cell::Str(std::borrow::Cow::Owned(out)));
+                return Some(Cell::Str {
+                    s: std::borrow::Cow::Owned(out),
+                    cast,
+                });
             }
             i += 1;
         }
+    }
+
+    /// Optionally consume a `::<identifier>` suffix cast right after a string
+    /// literal. Three outcomes:
+    ///
+    /// * `Some(None)` — no `::` follows; cursor is past any whitespace that was
+    ///   probed (harmless: every caller `skip_ws()`s immediately after the
+    ///   value anyway, so consuming it early changes nothing).
+    /// * `Some(Some(tag))` — a recognised tag (`jsonb` / `timestamp` /
+    ///   `timestamptz`, ASCII case-insensitive) was consumed; cursor sits just
+    ///   past the identifier.
+    /// * `None` — a `:` was seen but what follows is not a recognised
+    ///   `::<tag>`: lone `:`, empty identifier (`'x'::`), or any tag outside
+    ///   the admitted set (`::text`, `::uuid`, `::date`, `::int`, …). The
+    ///   caller declines the whole statement; the slow path owns those shapes.
+    ///
+    /// PG allows whitespace around `::` (`'x' :: jsonb`); we skip it on both
+    /// sides. There is no lookahead hazard: once a `:` is seen, no grammar
+    /// production other than a suffix cast can apply, so we never need to
+    /// rewind. Multi-word spellings (`::timestamp with time zone`) parse their
+    /// first identifier here and the trailing words then fail the caller's
+    /// `,` / `)` structure check → statement declines, as intended.
+    fn read_cast_suffix(&mut self) -> Option<Option<CastTag>> {
+        self.skip_ws();
+        if self.peek() != Some(b':') {
+            return Some(None);
+        }
+        if self.b.get(self.pos + 1) != Some(&b':') {
+            return None; // lone `:` — not a cast; decline
+        }
+        self.pos += 2;
+        self.skip_ws();
+        let start = self.pos;
+        while let Some(c) = self.peek() {
+            if is_ident_byte(c) {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        let ident = &self.b[start..self.pos];
+        if ident.eq_ignore_ascii_case(b"jsonb") {
+            return Some(Some(CastTag::Jsonb));
+        }
+        if ident.eq_ignore_ascii_case(b"timestamp") {
+            return Some(Some(CastTag::Timestamp));
+        }
+        if ident.eq_ignore_ascii_case(b"timestamptz") {
+            return Some(Some(CastTag::Timestamptz));
+        }
+        None // empty or unrecognised tag → decline the statement
     }
 
     /// Integer or float literal, optional leading `-`.
@@ -743,18 +844,33 @@ impl ColAcc {
                 v.push(Some(*b));
                 true
             }
-            (ColAcc::Utf8(v), Cell::Str(s)) => {
+            // Plain TEXT: only an *uncast* string is admitted. A suffix-cast
+            // string (even a recognised tag like `::jsonb`) must decline: the
+            // slow path's `coerce_string_ref` does not peel cast wrappers — it
+            // raises "expected string literal" — and the fast path must
+            // preserve that behaviour exactly (decline → slow path → its
+            // canonical error).
+            (ColAcc::Utf8(v), Cell::Str { s, cast }) => {
+                if cast.is_some() {
+                    return false;
+                }
                 v.push(Some(s.as_ref().to_string()));
                 true
             }
-            // JSONB: a string literal is the only INSERT form Postgres (and the
-            // slow path) accepts for a JSONB column without an explicit cast.
-            // We run the *same* parse+canonicalise pipeline the slow path uses
-            // (`coerce_jsonb_str`). Invalid JSON → `false` so we fall back to
-            // the slow path, which re-runs the identical coercion and surfaces
-            // the canonical `invalid JSON literal for column …` error. A number
-            // / bool into a JSONB column is a type mismatch → `false`.
-            (ColAcc::Jsonb { vals, col_name }, Cell::Str(s)) => {
+            // JSONB: a string literal, optionally suffix-cast `::jsonb` (the
+            // benchmark's exact shape — the slow path's `coerce_jsonb` peels
+            // the cast wrapper and coerces the inner string identically). A
+            // `::timestamp`/`::timestamptz` tag here is a tag/column mismatch
+            // → `false`. We run the *same* parse+canonicalise pipeline the
+            // slow path uses (`coerce_jsonb_str`). Invalid JSON → `false` so
+            // we fall back to the slow path, which re-runs the identical
+            // coercion and surfaces the canonical `invalid JSON literal for
+            // column …` error. A number / bool into a JSONB column is a type
+            // mismatch → `false`.
+            (ColAcc::Jsonb { vals, col_name }, Cell::Str { s, cast }) => {
+                if !matches!(cast, None | Some(CastTag::Jsonb)) {
+                    return false;
+                }
                 match crate::dml::coerce_jsonb_str(s.as_ref(), col_name) {
                     Ok(bytes) => {
                         vals.push(Some(bytes));
@@ -766,9 +882,21 @@ impl ColAcc {
             // Timestamp(Microsecond, tz?): accept a string literal parsed via
             // the slow path's `parse_timestamp_string` (RFC3339 / PG forms /
             // naive / date-only), or a bare integer treated as epoch
-            // microseconds (mirroring the slow path's numeric arm). Any parse
-            // uncertainty → `false` (slow path raises the canonical error).
-            (ColAcc::TsMicros { vals, .. }, Cell::Str(s)) => {
+            // microseconds (mirroring the slow path's numeric arm). A
+            // `::timestamp` or `::timestamptz` suffix cast is admitted into
+            // both tz-bearing and naive columns — the slow path's
+            // `coerce_timestamp_micros` peels the cast wrapper without looking
+            // at its type, and `parse_timestamp_string` already disambiguates
+            // tz from the literal itself. A `::jsonb` tag is a tag/column
+            // mismatch → `false`. Any parse uncertainty → `false` (slow path
+            // raises the canonical error).
+            (ColAcc::TsMicros { vals, .. }, Cell::Str { s, cast }) => {
+                if !matches!(
+                    cast,
+                    None | Some(CastTag::Timestamp) | Some(CastTag::Timestamptz)
+                ) {
+                    return false;
+                }
                 match crate::dml::parse_timestamp_string(s.as_ref()) {
                     Ok(micros) => {
                         vals.push(Some(micros));
@@ -1091,6 +1219,157 @@ mod tests {
     fn jsonb_rejects_non_string_cell() {
         let s = Schema::new(vec![jsonb_field("j")]);
         assert!(scan("INSERT INTO t (j) VALUES (42)", &s, &[0]).is_none());
+    }
+
+    // ── `::<type>` suffix casts on string literals ──────────────────────────
+
+    #[test]
+    fn jsonb_suffix_cast_admitted() {
+        // The benchmark's exact shape: `'<json>'::jsonb`. Case-insensitive,
+        // whitespace allowed around `::` (PG accepts `'x' :: jsonb`).
+        let s = Schema::new(vec![jsonb_field("j")]);
+        let b = scan(
+            "INSERT INTO t (j) VALUES ('{\"b\":1,\"a\":2}'::jsonb),('[1,2]'::JSONB),\
+             ('true' ::jsonb),('\"x\"':: jsonb),('null' :: JsonB)",
+            &s,
+            &[0],
+        )
+        .expect("should parse");
+        let arr = b[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::LargeBinaryArray>()
+            .unwrap();
+        // Bytes identical to the slow path's coercion of the uncast literal.
+        let expected = crate::dml::coerce_jsonb_str("{\"b\":1,\"a\":2}", "j").unwrap();
+        assert_eq!(arr.value(0), expected.as_slice());
+        assert_eq!(arr.len(), 5);
+    }
+
+    #[test]
+    fn jsonb_suffix_cast_with_escaped_quote() {
+        // The owned-Cow (un-escaping) path must carry the cast tag too.
+        let s = Schema::new(vec![jsonb_field("j")]);
+        let b = scan(
+            "INSERT INTO t (j) VALUES ('{\"q\":\"it''s\"}'::jsonb)",
+            &s,
+            &[0],
+        )
+        .expect("should parse");
+        let arr = b[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::LargeBinaryArray>()
+            .unwrap();
+        let expected = crate::dml::coerce_jsonb_str("{\"q\":\"it's\"}", "j").unwrap();
+        assert_eq!(arr.value(0), expected.as_slice());
+    }
+
+    #[test]
+    fn timestamp_suffix_casts_admitted_both_tags_both_tznesses() {
+        // Both `::timestamp` and `::timestamptz` are admitted into both the
+        // naive and tz-bearing column forms (the slow path peels the cast
+        // without inspecting its type).
+        for tz in [None, Some(Arc::<str>::from("UTC"))] {
+            let dt = DataType::Timestamp(TimeUnit::Microsecond, tz);
+            let s = Schema::new(vec![Field::new("ts", dt.clone(), true)]);
+            let b = scan(
+                "INSERT INTO t (ts) VALUES ('2020-01-01T00:00:00Z'::timestamptz),\
+                 ('2021-06-15 12:30:00'::timestamp),('2020-01-01T00:00:00Z' :: TIMESTAMPTZ)",
+                &s,
+                &[0],
+            )
+            .expect("should parse");
+            let arr = b[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
+            assert_eq!(arr.value(0), 1_577_836_800_000_000);
+            assert_eq!(
+                arr.value(1),
+                crate::dml::parse_timestamp_string("2021-06-15 12:30:00").unwrap()
+            );
+            assert_eq!(b[0].column(0).data_type(), &dt);
+        }
+    }
+
+    #[test]
+    fn reject_suffix_cast_into_text_column() {
+        // `::text` is not an admitted tag at all (the slow path's plain-Utf8
+        // coercion does not peel casts — it errors — so admitting it would
+        // change behaviour), and a recognised tag landing in a TEXT column is
+        // a tag/column mismatch. Both decline.
+        let s = Schema::new(vec![Field::new("b", DataType::Utf8, true)]);
+        assert!(scan("INSERT INTO t (b) VALUES ('x'::text)", &s, &[0]).is_none());
+        assert!(scan("INSERT INTO t (b) VALUES ('{}'::jsonb)", &s, &[0]).is_none());
+        assert!(scan("INSERT INTO t (b) VALUES ('2020-01-01'::timestamp)", &s, &[0]).is_none());
+    }
+
+    #[test]
+    fn reject_mismatched_suffix_cast() {
+        // Recognised tag, wrong destination family → decline.
+        let s = Schema::new(vec![jsonb_field("j")]);
+        assert!(scan("INSERT INTO t (j) VALUES ('{}'::timestamp)", &s, &[0]).is_none());
+        assert!(scan("INSERT INTO t (j) VALUES ('{}'::timestamptz)", &s, &[0]).is_none());
+        let ts = Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        )]);
+        assert!(scan("INSERT INTO t (ts) VALUES ('2020-01-01'::jsonb)", &ts, &[0]).is_none());
+    }
+
+    #[test]
+    fn reject_unrecognised_suffix_cast_tags() {
+        // Anything outside {jsonb, timestamp, timestamptz} → decline, even
+        // when the destination column could otherwise take the string.
+        let s = Schema::new(vec![jsonb_field("j")]);
+        assert!(scan("INSERT INTO t (j) VALUES ('{}'::json)", &s, &[0]).is_none());
+        assert!(scan("INSERT INTO t (j) VALUES ('{}'::uuid)", &s, &[0]).is_none());
+        let d = Schema::new(vec![Field::new("d", DataType::Date32, true)]);
+        assert!(scan("INSERT INTO t (d) VALUES ('2020-01-01'::date)", &d, &[0]).is_none());
+    }
+
+    #[test]
+    fn reject_malformed_suffix_cast() {
+        let s = Schema::new(vec![jsonb_field("j")]);
+        // Lone colon, empty tag, multi-word spelling, parenthesised precision:
+        // all decline (the multi-word / parenthesised forms via the structure
+        // check after the first identifier).
+        assert!(scan("INSERT INTO t (j) VALUES ('{}':jsonb)", &s, &[0]).is_none());
+        assert!(scan("INSERT INTO t (j) VALUES ('{}'::)", &s, &[0]).is_none());
+        assert!(scan("INSERT INTO t (j) VALUES ('{}'::jsonb extra)", &s, &[0]).is_none());
+        let ts = Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        )]);
+        assert!(scan(
+            "INSERT INTO t (ts) VALUES ('2020-01-01'::timestamp with time zone)",
+            &ts,
+            &[0]
+        )
+        .is_none());
+        assert!(
+            scan("INSERT INTO t (ts) VALUES ('2020-01-01'::timestamp(3))", &ts, &[0]).is_none()
+        );
+    }
+
+    #[test]
+    fn uncast_string_still_borrows_zero_copy() {
+        // The Cow fast path for plain strings must survive the suffix-cast
+        // probe: a string followed directly by `,` / `)` parses unchanged.
+        let s = Schema::new(vec![Field::new("b", DataType::Utf8, true)]);
+        let b = scan("INSERT INTO t (b) VALUES ('plain'),('also plain')", &s, &[0])
+            .expect("should parse");
+        let strs = b[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(strs.value(0), "plain");
+        assert_eq!(strs.value(1), "also plain");
     }
 
     #[test]
