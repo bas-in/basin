@@ -3443,6 +3443,38 @@ async fn register_pruned_listing_table(
     Ok(())
 }
 
+/// O(1) live-overlay presence check for `(project, table)`: `true` when the
+/// process-wide memtable registry holds at least one hot-tier UPDATE override
+/// or DELETE tombstone whose newest version is still dirty.
+///
+/// `update_count` / `tombstone_count` are exactly the "overlay present"
+/// signal: Tombstone/Update entries are always DIRTY (a flush ack removes
+/// clean tombstones and re-tags acked `Update`s as `Row`s), and counter-keyed
+/// HTAP `Row` residency entries do not count — they are cold-committed and
+/// need no merge-on-read handling.
+///
+/// Used as the correctness gate for every read path that bypasses the
+/// overlay-aware provider (`register_cold_with_overlay` →
+/// `TombstoneFilterExec` + `UpdateOverlayExec`):
+///   * the executor's GIN posting-probe `Empty` short-circuits
+///     (`executor::gin_empty_probe_is_trustworthy`), and
+///   * the pruned re-registrations below (`apply_gin_pruning_for_query`,
+///     `apply_jsonb_posting_pruning_for_query`), which would otherwise swap
+///     the overlay-aware provider for a bare cold reader that neither appends
+///     override rows nor suppresses their stale cold images.
+/// See the UPDATE fast-path gate analysis in `dml_mutate.rs` (blockers #1/#2).
+pub(crate) fn table_has_live_overlay(
+    engine: &Engine,
+    project: &ProjectId,
+    table: &TableName,
+) -> bool {
+    engine
+        .memtable_registry()
+        .get(project, table)
+        .map(|e| e.memtable.update_count() > 0 || e.memtable.tombstone_count() > 0)
+        .unwrap_or(false)
+}
+
 /// Phase 5.19.C — GIN file-level pruning.
 ///
 /// After all tables have been refreshed (so their `ListingTable` registrations
@@ -3490,6 +3522,19 @@ pub(crate) async fn apply_gin_pruning_for_query(
         Some(p) => p,
         None => return Ok(()), // query shape not recognised → full scan
     };
+
+    // Live-overlay gate (the dml_mutate.rs UPDATE fast-path gate's blocker
+    // #2): every registration below — `GinRowGroupPrunedTable` on the
+    // rg-direct and rg-narrowed paths, the pruned `ListingTable` on the
+    // file-level path — REPLACES the overlay-aware provider with a bare cold
+    // reader. Such a reader neither appends hot-tier override rows nor
+    // suppresses their stale cold images, so while the table has live
+    // UPDATE/DELETE overlay entries we must keep the overlay-aware
+    // registration and skip pruning entirely (correctness over speed; the
+    // overlay drains via materialize and pruning resumes). O(1) counter reads.
+    if table_has_live_overlay(engine, project, &gin_plan.table) {
+        return Ok(());
+    }
 
     // Fetch the live file set from the catalog.  Needed both for the
     // file-level completeness guard and the row-group-direct path.
@@ -4019,6 +4064,15 @@ pub(crate) async fn apply_jsonb_posting_pruning_for_query(
         Some(p) => p,
         None => return Ok(()),
     };
+
+    // Live-overlay gate — same blocker-#2 reasoning as
+    // `apply_gin_pruning_for_query` above: `JsonbPostingPrunedTable` is a bare
+    // cold reader (no `UpdateOverlayExec` / tombstone suppression), so a live
+    // hot-tier UPDATE/DELETE overlay for this table means the overlay-aware
+    // registration must stay in place. O(1) counter reads.
+    if table_has_live_overlay(engine, project, &gin_plan.table) {
+        return Ok(());
+    }
 
     // Parse the needle now so we can probe.
     let needle: serde_json::Value = match serde_json::from_slice(&gin_plan.needle) {

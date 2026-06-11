@@ -2839,7 +2839,7 @@ async fn dispatch_parsed_statement(
                         &gin_plan.needle,
                     );
                     if let crate::index_probe::ProbeResult::Empty = gin_result {
-                        // Posting list guarantees no rows match.
+                        // Posting list guarantees no COLD-FILE rows match.
                         //
                         // For a row-emitting query (`SELECT * / cols`) we can
                         // short-circuit with zero rows.  But for a whole-relation
@@ -2848,7 +2848,21 @@ async fn dispatch_parsed_statement(
                         // Fall through to `exec_select`, which registers the
                         // (row-group-pruned or full) relation and lets DataFusion
                         // compute the aggregate over zero matching rows → `0`.
-                        if !gin_plan.is_aggregate {
+                        //
+                        // Overlay/completeness gate (the dml_mutate.rs UPDATE
+                        // fast-path gate's blocker #1): the posting list is
+                        // built from cold files only, so `Empty` is
+                        // authoritative ONLY when the cold files are the whole
+                        // story — no live hot-tier UPDATE/DELETE overlay for
+                        // the table AND every live file present in the
+                        // indexed-files completeness set. Otherwise fall
+                        // through to the overlay-aware DataFusion scan
+                        // (correctness over the shortcut). See
+                        // `gin_empty_probe_is_trustworthy`.
+                        if !gin_plan.is_aggregate
+                            && gin_empty_probe_is_trustworthy(sess, &gin_plan.table, &gin_plan.col)
+                                .await
+                        {
                             let schema = Arc::new(arrow_schema::Schema::empty());
                             return Ok(ExecResult::Rows { schema, batches: vec![] });
                         }
@@ -2885,9 +2899,19 @@ async fn dispatch_parsed_statement(
                         key_plan.require_all,
                     );
                     if let crate::index_probe::ProbeResult::Empty = gin_result {
-                        // No files contain these keys — short-circuit with empty result.
-                        let schema = Arc::new(arrow_schema::Schema::empty());
-                        return Ok(ExecResult::Rows { schema, batches: vec![] });
+                        // No COLD files contain these keys. Same
+                        // overlay/completeness gate as the `@>` short-circuit
+                        // above: an overlay override row may carry keys whose
+                        // cold posting sets are disjoint (`?&`), and a
+                        // materialize-replacement file is never re-indexed —
+                        // in either state `Empty` is not authoritative and we
+                        // must fall through to the overlay-aware scan.
+                        if gin_empty_probe_is_trustworthy(sess, &key_plan.table, &key_plan.col)
+                            .await
+                        {
+                            let schema = Arc::new(arrow_schema::Schema::empty());
+                            return Ok(ExecResult::Rows { schema, batches: vec![] });
+                        }
                     }
                     // FileCandidates / NoIndex: fall through to DataFusion for correctness.
                 }
@@ -4440,7 +4464,54 @@ async fn exec_create_index(
     // best-effort: a read error on any file is logged and the file is left
     // un-indexed (the completeness guard then falls back to a full scan for
     // that file — correct, just slower).
-    if catalog_columns.len() == 1 {
+    //
+    // CREATE-INDEX-OVER-OVERLAY (the dml_mutate.rs UPDATE fast-path gate's
+    // blocker #3): settle any live hot-tier UPDATE/DELETE overlay into cold
+    // storage BEFORE the backfill walks the live files. The backfill reads
+    // cold bytes only, so an overlay row's post-SET document would otherwise
+    // never enter the posting lists — and once the overlay later drains
+    // (background reconciler / a cold-path mutation's materialize prologue,
+    // neither of which performs GIN registry maintenance) the
+    // stale-but-"complete" index would feed the probe paths wrong answers.
+    // Materializing here is an O(1) no-op when the overlay is empty (counter
+    // gate inside `materialize_overlay_for_table`) and otherwise leaves the
+    // backfill indexing exactly the rows a scan would return.
+    //
+    // Overlay entries written AFTER this point — a hot-tier fast-path UPDATE
+    // racing this CREATE INDEX that loaded its table metadata before the
+    // catalog index row landed — are covered by the read-path overlay guards:
+    // the executor's posting-probe Empty short-circuits
+    // (`gin_empty_probe_is_trustworthy`) and the session pruning paths
+    // (`session::table_has_live_overlay` gates in
+    // `apply_gin_pruning_for_query` / `apply_jsonb_posting_pruning_for_query`)
+    // all fall back to the overlay-aware full scan while any overlay entry is
+    // live. Once the table's metadata shows this index, the dml_mutate
+    // fast-path gate (`!meta.indexes.is_empty()`) declines new overlay writes
+    // entirely, so the race window closes with the next metadata load.
+    //
+    // On materialize failure the backfill is SKIPPED: leaving every live file
+    // un-indexed keeps the probes at NoIndex/incomplete — full scans (correct,
+    // unpruned) instead of an index built beside a still-live overlay.
+    let overlay_settled = match crate::dml_mutate::materialize_overlay_for_table(
+        &sess.engine,
+        sess.project,
+        &table,
+    )
+    .await
+    {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                index = %index_name,
+                table = %table,
+                err = %e,
+                "CREATE INDEX: hot-tier overlay materialize failed; index \
+                 backfill skipped (reads fall back to full scans for this table)"
+            );
+            false
+        }
+    };
+    if overlay_settled && catalog_columns.len() == 1 {
         backfill_index_over_live_files(
             sess,
             &table,
@@ -4455,6 +4526,60 @@ async fn exec_create_index(
     Ok(ExecResult::Empty {
         tag: "CREATE INDEX".into(),
     })
+}
+
+/// GIN-overlay correctness gate for the posting-probe `Empty` short-circuits
+/// (`@>` containment and the `?`/`?&`/`?|` key-existence probes).
+///
+/// `ProbeResult::Empty` means "no cold file can match" — the file-level GIN
+/// posting list is built from cold files only. Turning that into a zero-row
+/// result is sound only when the cold files are the whole story:
+///
+/// 1. **No live overlay** (O(1) counter reads): a hot-tier UPDATE override /
+///    DELETE tombstone in the process-wide memtable registry means a row's
+///    post-SET document may match a needle that no cold file matches (the
+///    dml_mutate.rs UPDATE fast-path gate's blocker #1 — e.g. a `jsonb_set`
+///    override adding a term whose cold posting sets are file-disjoint, so
+///    the AND-merge intersects to ∅). While `update_count + tombstone_count
+///    > 0` the short-circuit must not fire; the overlay-aware scan
+///    (`TombstoneFilterExec` + `UpdateOverlayExec`) re-applies the predicate
+///    over the merged hot+cold row set instead.
+/// 2. **Completeness** (one set probe per live file):
+///    `materialize_overlay_for_table` commits replacement files with NO GIN
+///    registry maintenance (blocker #3), so after an overlay drains the
+///    registry still holds postings for the replaced (dead) files and knows
+///    nothing about the replacement. A needle whose terms intersect to ∅
+///    across the stale postings would short-circuit to zero rows while the
+///    un-indexed replacement file holds a real match. Requiring every live
+///    file to be in the indexed-files completeness set degrades that case to
+///    a full scan — correct-but-unpruned, mirroring the per-file completeness
+///    guards the session pruning paths already enforce.
+///
+/// Any uncertainty (catalog load failure) also returns `false` → full scan.
+async fn gin_empty_probe_is_trustworthy(
+    sess: &ProjectSession,
+    table: &TableName,
+    col: &str,
+) -> bool {
+    if crate::session::table_has_live_overlay(&sess.engine, &sess.project, table) {
+        return false;
+    }
+    let Ok(meta) = sess
+        .engine
+        .config()
+        .catalog
+        .load_table(&sess.project, table)
+        .await
+    else {
+        return false; // can't verify completeness → fall through to the scan
+    };
+    let indexed = sess
+        .engine
+        .gin_index_registry()
+        .indexed_files_for(&sess.project, table, col);
+    meta.live_data_files()
+        .iter()
+        .all(|f| indexed.contains(f.path.as_str()))
 }
 
 /// FIX 1 / FIX 2(b) — backfill a freshly-created single-column index over the

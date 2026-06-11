@@ -8,21 +8,37 @@
 //! benchmark shape (GIN index on `payload`, `SET payload = jsonb_set(...)`)
 //! on the cold copy-on-write path. The obvious relaxation — "GIN pruning only
 //! narrows the COLD scan; `UpdateOverlayExec` appends override rows
-//! unconditionally, so overlay UPDATEs are invisible to the prune" — is NOT
-//! safe today (see the gate comment in `dml_mutate.rs` for the full
-//! analysis):
+//! unconditionally, so overlay UPDATEs are invisible to the prune" — was NOT
+//! safe when these holes were found (see the gate comment in `dml_mutate.rs`
+//! for the full analysis); the READ-PATH halves are now guarded:
 //!
 //!   1. The executor's `@>` / `?`-family posting-probe short-circuits return
 //!      ZERO ROWS on `ProbeResult::Empty` from the cold-file-only
 //!      `GinIndexRegistry`, before any overlay merge — an override whose
 //!      post-SET document NEWLY matches a needle with cold-disjoint terms
-//!      would be silently dropped.
+//!      would be silently dropped. GUARDED: `gin_empty_probe_is_trustworthy`
+//!      (executor.rs) declines the short-circuit while the table has live
+//!      overlay entries OR any live file missing from the indexed-files
+//!      completeness set.
 //!   2. `apply_gin_pruning_for_query` swaps the overlay-aware provider for an
 //!      UNWRAPPED `GinRowGroupPrunedTable` / pruned `ListingTable`, which
 //!      neither appends override rows nor suppresses their stale cold images.
+//!      GUARDED: both it and `apply_jsonb_posting_pruning_for_query` skip the
+//!      pruned re-registration while `session::table_has_live_overlay` (O(1)
+//!      counter reads) is true.
 //!   3. `materialize_overlay_for_table` does no GIN registry maintenance, so
-//!      a drained overlay would leave stale postings + an unindexed
-//!      replacement file.
+//!      a drained overlay leaves stale postings + an unindexed replacement
+//!      file. MITIGATED twice over: CREATE INDEX settles the overlay
+//!      (materialize) BEFORE backfilling, and post-drain the (#1)
+//!      completeness guard degrades the stale-posting Empty short-circuit to
+//!      a full scan while the pruning paths force-scan the un-indexed
+//!      replacement file — correct-but-unpruned. The write-side gate stays
+//!      until materialize itself maintains the registries.
+//!
+//! The dml_mutate gate is still in place — these guards close the read paths
+//! for the overlay states that ARE reachable today: an overlay planted before
+//! CREATE INDEX, and a fast-path write racing CREATE INDEX (simulated below
+//! by planting a registry override directly).
 //!
 //! ## What is pinned here
 //!
@@ -185,6 +201,14 @@ async fn payload_text(sess: &ProjectSession, table: &str, id: i64) -> String {
 /// file in both GIN registries (completeness guards pass → the pruned
 /// re-registration paths are armed too).
 async fn seed_gin_table(sess: &ProjectSession) {
+    seed_docs_rows(sess).await;
+    exec(sess, "CREATE INDEX docs_payload_gin ON docs USING gin (payload)").await;
+}
+
+/// The two-file seed WITHOUT the index — for the CREATE-INDEX-over-overlay
+/// test, which needs an index-free window where the UPDATE fast path is
+/// admitted and an overlay entry can be planted through real SQL.
+async fn seed_docs_rows(sess: &ProjectSession) {
     exec(
         sess,
         "CREATE TABLE docs (id BIGINT NOT NULL PRIMARY KEY, status TEXT, payload JSONB)",
@@ -208,7 +232,59 @@ async fn seed_gin_table(sess: &ProjectSession) {
          (8, 'active', '{\"b\":2,\"grp\":\"two\"}')",
     )
     .await;
-    exec(sess, "CREATE INDEX docs_payload_gin ON docs USING gin (payload)").await;
+}
+
+/// Plant a PK-keyed `MemRowValue::Update` override directly into the
+/// process-wide memtable registry — the registry state a hot-tier fast-path
+/// UPDATE leaves behind. This simulates the only way a GIN-indexed table can
+/// carry a live overlay today: a fast-path write racing CREATE INDEX (the
+/// writer loaded its table metadata before the catalog index row landed, so
+/// the `meta.indexes` gate did not see the index). The post-image batch is
+/// built against the CATALOG Arrow schema and IPC-encoded exactly like the
+/// engine's own `encode_single_row_ipc` output (StreamWriter wire format,
+/// `schema_version` 0 — what `hot_tier_update_by_pk` writes).
+async fn plant_update_override(
+    eng: &Engine,
+    project: &ProjectId,
+    table: &TableName,
+    id: i64,
+    status: &str,
+    payload_json: &str,
+) {
+    let meta = eng
+        .config()
+        .catalog
+        .load_table(project, table)
+        .await
+        .expect("load_table for override plant");
+    let mut cols: Vec<arrow_array::ArrayRef> = Vec::with_capacity(meta.schema.fields().len());
+    for f in meta.schema.fields() {
+        let col: arrow_array::ArrayRef = match f.name().as_str() {
+            "id" => Arc::new(arrow_array::Int64Array::from(vec![id])),
+            "status" => Arc::new(arrow_array::StringArray::from(vec![status])),
+            "payload" => Arc::new(arrow_array::LargeBinaryArray::from_iter_values([
+                payload_json.as_bytes(),
+            ])),
+            other => panic!("unexpected column {other:?} in docs schema"),
+        };
+        cols.push(col);
+    }
+    let batch = arrow_array::RecordBatch::try_new(meta.schema.clone(), cols)
+        .expect("override batch must match catalog schema");
+    let bytes = {
+        use arrow::ipc::writer::StreamWriter;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut writer =
+            StreamWriter::try_new(&mut buf, batch.schema_ref()).expect("IPC writer init");
+        writer.write(&batch).expect("IPC write");
+        writer.finish().expect("IPC finish");
+        buf
+    };
+    let entry = eng.memtable_registry().get_or_create(*project, table.clone());
+    entry.memtable.insert(
+        basin_hottier::RowKey::builder().append_i64(id).finish(),
+        basin_hottier::MemRowValue::update(bytes, 0),
+    );
 }
 
 /// (a) + (c) + gate: a `jsonb_set` UPDATE that makes a row NEWLY match a
@@ -476,4 +552,321 @@ async fn jsonb_set_update_equivalent_with_and_without_gin_index() {
     // Spot-check the mutation actually happened on both.
     assert!(gin_rows[5].1.contains("\"score\":99"), "{}", gin_rows[5].1);
     assert!(gin_rows[20].1.contains("\"score\":20"), "{}", gin_rows[20].1);
+}
+
+/// CREATE-INDEX-OVER-OVERLAY (blocker #3 fix): an overlay planted through the
+/// REAL fast path on the index-free table must be settled into cold storage
+/// by CREATE INDEX itself (materialize-before-backfill), so the freshly built
+/// index covers the post-SET row images. The adversarial needle
+/// `{"a":1,"b":2}` would otherwise be a guaranteed wrong answer: without the
+/// materialize the backfill indexes the PRE-update cold images (a:1 only in
+/// file 1, b:2 only in file 2 → posting intersection ∅ → Empty short-circuit
+/// → zero rows), and the overlay row carrying both terms is invisible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_index_over_live_overlay_settles_overlay_and_serves_containment() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let project = ProjectId::new();
+    let sess = eng.open_session(project).await.unwrap();
+    let table = TableName::new("docs").unwrap();
+    seed_docs_rows(&sess).await; // NO index yet — fast path is admissible.
+
+    // Plant the overlay through real SQL: index-free table → overlay UPDATE.
+    with_fastpath_on(async {
+        exec(
+            &sess,
+            "UPDATE docs SET payload = jsonb_set(payload, '{b}', '2'::jsonb) WHERE id = 1",
+        )
+        .await;
+    })
+    .await;
+    assert!(
+        overlay_pending(&eng, &project, &table) > 0,
+        "index-free table must take the overlay fast path (env force-on) — \
+         without a live overlay this test proves nothing"
+    );
+
+    // CREATE INDEX must settle the overlay BEFORE backfilling.
+    exec(&sess, "CREATE INDEX docs_payload_gin ON docs USING gin (payload)").await;
+    assert_eq!(
+        overlay_pending(&eng, &project, &table),
+        0,
+        "CREATE INDEX must materialize the live overlay before the backfill \
+         (otherwise the index is built over pre-update cold images)"
+    );
+
+    // The settled+indexed row must be served by the adversarial needle
+    // immediately — this is the Empty-short-circuit trap shape.
+    assert_eq!(
+        ids_for(&sess, "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"b\":2}'").await,
+        vec![1],
+        "index built over settled data must serve the cross-file needle"
+    );
+    // Key-existence over the settled data.
+    assert_eq!(
+        ids_for(&sess, "SELECT id FROM docs WHERE payload ? 'b'").await,
+        vec![1, 5, 6, 7, 8],
+        "settled overlay row must carry key 'b' for the ?-probe"
+    );
+    // Untouched rows still match their original needle.
+    assert_eq!(
+        ids_for(&sess, "SELECT id FROM docs WHERE payload @> '{\"a\":1}'").await,
+        vec![1, 2, 3, 4]
+    );
+
+    // Post-drain re-assert (drain already happened at CREATE INDEX; the poll
+    // also covers a racing background reconciler tick).
+    assert!(
+        wait_overlay_drained(&eng, &project, &table, std::time::Duration::from_secs(10)).await
+    );
+    assert_eq!(
+        ids_for(&sess, "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"b\":2}'").await,
+        vec![1]
+    );
+    let doc = payload_text(&sess, "docs", 1).await;
+    assert!(
+        doc.contains("\"a\":1") && doc.contains("\"b\":2"),
+        "post-settle point read must return the post-jsonb_set document, got {doc}"
+    );
+}
+
+/// Guard #1a (containment): a live overlay override whose post-SET document
+/// NEWLY matches a needle with cold-disjoint terms must be returned. The
+/// posting probe for `{"a":1,"b":2}` intersects to ∅ (a:1 only in file 1,
+/// b:2 only in file 2) → `ProbeResult::Empty` — pre-guard the executor
+/// short-circuited to ZERO ROWS before any overlay merge. With the guard the
+/// live-overlay counters veto the short-circuit and the overlay-aware scan
+/// surfaces the row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_overlay_blocks_containment_empty_short_circuit() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let project = ProjectId::new();
+    let sess = eng.open_session(project).await.unwrap();
+    let table = TableName::new("docs").unwrap();
+    seed_gin_table(&sess).await;
+
+    // Sanity: with NO overlay the Empty short-circuit is trustworthy
+    // (registries are complete post-backfill) and returns zero rows.
+    assert_eq!(
+        ids_for(&sess, "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"b\":2}'").await,
+        Vec::<i64>::new()
+    );
+
+    // Simulate the fast-path write racing CREATE INDEX: plant the override
+    // the relaxed gate would have written for
+    // `SET payload = jsonb_set(payload, '{b}', '2')` on id=1.
+    plant_update_override(
+        &eng,
+        &project,
+        &table,
+        1,
+        "active",
+        "{\"a\":1,\"b\":2,\"grp\":\"one\"}",
+    )
+    .await;
+    assert!(overlay_pending(&eng, &project, &table) > 0);
+
+    // The Empty probe shape must now fall through to the overlay-aware scan
+    // and return the override row.
+    assert_eq!(
+        ids_for(&sess, "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"b\":2}'").await,
+        vec![1],
+        "live overlay must veto the posting-probe Empty short-circuit"
+    );
+    // Point read serves the override image.
+    let doc = payload_text(&sess, "docs", 1).await;
+    assert!(
+        doc.contains("\"b\":2"),
+        "point read must serve the override post-image, got {doc}"
+    );
+    // The aggregate variant of the same Empty shape must count the override.
+    let batches = match sess
+        .execute("SELECT count(*) FROM docs WHERE payload @> '{\"a\":1,\"b\":2}'")
+        .await
+    {
+        Ok(ExecResult::Rows { batches, .. }) => batches,
+        other => panic!("count query failed: {other:?}"),
+    };
+    let cnt = batches
+        .iter()
+        .find(|b| b.num_rows() > 0)
+        .and_then(|b| b.column(0).as_any().downcast_ref::<arrow_array::Int64Array>())
+        .map(|a| a.value(0))
+        .expect("count(*) must return one Int64 row");
+    assert_eq!(cnt, 1, "aggregate over the overlay row must count it");
+}
+
+/// Guard #1a (key existence): same trap for the `?&` all-keys probe. Keys
+/// `a` and `b` live in disjoint cold files → AND-merge ∅ → `Empty`; the
+/// override row carrying BOTH keys must veto the short-circuit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_overlay_blocks_key_exists_empty_short_circuit() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let project = ProjectId::new();
+    let sess = eng.open_session(project).await.unwrap();
+    let table = TableName::new("docs").unwrap();
+    seed_gin_table(&sess).await;
+
+    // Sanity: no row holds both keys; the Empty short-circuit is trustworthy.
+    assert_eq!(
+        ids_for(&sess, "SELECT id FROM docs WHERE payload ?& array['a', 'b']").await,
+        Vec::<i64>::new()
+    );
+
+    plant_update_override(
+        &eng,
+        &project,
+        &table,
+        1,
+        "active",
+        "{\"a\":1,\"b\":2,\"grp\":\"one\"}",
+    )
+    .await;
+    assert!(overlay_pending(&eng, &project, &table) > 0);
+
+    assert_eq!(
+        ids_for(&sess, "SELECT id FROM docs WHERE payload ?& array['a', 'b']").await,
+        vec![1],
+        "live overlay must veto the ?& Empty short-circuit"
+    );
+}
+
+/// Guard #1b (pruned re-registration): a containment query whose probe yields
+/// `FileCandidates` (NOT Empty) reaches `exec_select`, where the GIN pruning
+/// paths would deregister the overlay-aware provider and register a bare
+/// pruned table. With a live overlay that registration must be skipped:
+/// the override row appended (it newly matches) AND the stale cold image of
+/// a second override suppressed (it no longer matches).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_overlay_blocks_pruned_path_registration() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let project = ProjectId::new();
+    let sess = eng.open_session(project).await.unwrap();
+    let table = TableName::new("docs").unwrap();
+    seed_gin_table(&sess).await;
+
+    assert_eq!(
+        ids_for(&sess, "SELECT id FROM docs WHERE payload @> '{\"b\":2}'").await,
+        vec![5, 6, 7, 8]
+    );
+
+    // id=1 NEWLY matches {"b":2}; its cold file (file 1) has no b:2 posting,
+    // so the pre-guard pruned registration would scan file 2 only and drop it.
+    plant_update_override(
+        &eng,
+        &project,
+        &table,
+        1,
+        "active",
+        "{\"a\":1,\"b\":2,\"grp\":\"one\"}",
+    )
+    .await;
+    // id=5 STOPS matching {"b":2}; its stale cold image (which still matches)
+    // sits in exactly the file the prune keeps — a bare pruned provider would
+    // resurrect it.
+    plant_update_override(
+        &eng,
+        &project,
+        &table,
+        5,
+        "active",
+        "{\"b\":999,\"grp\":\"two\"}",
+    )
+    .await;
+    assert!(overlay_pending(&eng, &project, &table) > 0);
+
+    assert_eq!(
+        ids_for(&sess, "SELECT id FROM docs WHERE payload @> '{\"b\":2}'").await,
+        vec![1, 6, 7, 8],
+        "live overlay must keep the overlay-aware provider registered: \
+         override row 1 appended, row 5's stale cold image suppressed"
+    );
+    assert_eq!(
+        ids_for(&sess, "SELECT id FROM docs WHERE payload @> '{\"b\":999}'").await,
+        vec![5],
+        "the new value of the second override must be queryable"
+    );
+}
+
+/// Blocker #3 post-drain: `materialize_overlay_for_table` commits replacement
+/// files with NO GIN registry maintenance — stale postings keep pointing at
+/// the replaced (dead) files and the replacement file is never indexed. After
+/// the drain the overlay counters are zero, so guard #1's overlay half no
+/// longer fires; the COMPLETENESS half (every live file must be in the
+/// indexed-files set) must degrade the stale-posting Empty short-circuit to a
+/// full scan, and the pruning paths' per-file completeness guards must
+/// force-scan the un-indexed replacement file. Correct-but-unpruned.
+///
+/// The drain is forced deterministically through a cold-path mutation's
+/// materialize prologue — the same `materialize_overlay_for_table` the
+/// background reconciler drives on its tick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlay_drain_without_gin_maintenance_keeps_reads_correct() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let project = ProjectId::new();
+    let sess = eng.open_session(project).await.unwrap();
+    let table = TableName::new("docs").unwrap();
+    seed_gin_table(&sess).await;
+
+    plant_update_override(
+        &eng,
+        &project,
+        &table,
+        1,
+        "active",
+        "{\"a\":1,\"b\":2,\"grp\":\"one\"}",
+    )
+    .await;
+    assert_eq!(
+        ids_for(&sess, "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"b\":2}'").await,
+        vec![1],
+        "pre-drain: the overlay guard serves the override row"
+    );
+
+    // Force the drain: an UPDATE on a GIN-indexed table declines the fast
+    // path (meta.indexes gate) and the cold path's prologue materializes the
+    // overlay into a replacement file — withOUT GIN registry maintenance.
+    exec(&sess, "UPDATE docs SET status = 'touched' WHERE id = 8").await;
+    assert_eq!(
+        overlay_pending(&eng, &project, &table),
+        0,
+        "cold-path mutation must drain the overlay via its materialize prologue"
+    );
+
+    // The Empty-probe shape: postings for a:1 point only at the REPLACED
+    // (dead) file, so the AND-merge is still ∅ → Empty — but the
+    // un-indexed replacement file holds the real match. The completeness
+    // guard must force the full scan.
+    assert_eq!(
+        ids_for(&sess, "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"b\":2}'").await,
+        vec![1],
+        "post-drain: stale postings must not short-circuit away the \
+         materialized row (completeness guard)"
+    );
+    assert_eq!(
+        ids_for(&sess, "SELECT id FROM docs WHERE payload ?& array['a', 'b']").await,
+        vec![1],
+        "post-drain ?& must also fall through to the full scan"
+    );
+    // FileCandidates shape through the pruning paths: the un-indexed
+    // replacement file must be force-scanned (per-file completeness).
+    assert_eq!(
+        ids_for(&sess, "SELECT id FROM docs WHERE payload @> '{\"b\":2}'").await,
+        vec![1, 5, 6, 7, 8],
+        "post-drain pruned-path query must include the materialized row"
+    );
+    let doc = payload_text(&sess, "docs", 1).await;
+    assert!(
+        doc.contains("\"b\":2"),
+        "post-drain point read must serve the materialized image, got {doc}"
+    );
+    // The cold mutation that forced the drain landed too.
+    assert_eq!(
+        ids_for(&sess, "SELECT id FROM docs WHERE status = 'touched'").await,
+        vec![8]
+    );
 }
