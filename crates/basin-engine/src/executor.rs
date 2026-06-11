@@ -3882,7 +3882,7 @@ async fn exec_create_table_as(
         .ctx
         .sql(&query_sql)
         .await
-        .map_err(|e| BasinError::internal(format!("CREATE TABLE AS plan: {e}")))?;
+        .map_err(|e| map_df_plan_error("CREATE TABLE AS plan", &e))?;
     let df_schema = df.schema().as_arrow().clone();
     let mut ws_schema = schema_df_to_ws(&df_schema)?;
 
@@ -6262,7 +6262,7 @@ async fn exec_insert_select(
         .ctx
         .sql(&source_sql)
         .await
-        .map_err(|e| BasinError::internal(format!("INSERT INTO ... SELECT plan: {e}")))?;
+        .map_err(|e| map_df_plan_error("INSERT INTO ... SELECT plan", &e))?;
     let df_batches = df
         .collect()
         .await
@@ -8772,6 +8772,43 @@ impl Drop for TargetPartitionsGuard<'_> {
     }
 }
 
+/// Map a DataFusion planning error to a typed `BasinError`.
+///
+/// DataFusion reports a missing relation as a planning error whose message
+/// contains `table '<name>' not found` (SessionState::get_table_source).
+/// PostgreSQL raises SQLSTATE 42P01 (`undefined_table`) with the message
+/// `relation "<name>" does not exist` for the same condition, and ORM
+/// migration flows branch on exactly that code (Diesel / TypeORM / Django
+/// all decide "tracker table missing → create it" on 42P01) — so this must
+/// not collapse into the XX000 internal bucket.
+///
+/// Deliberately narrow: only the `table '…' not found` pattern is promoted.
+/// Missing *functions* ("Invalid function '…'", `table function '…' not
+/// found` — note the quote does not immediately follow `table `) and missing
+/// *columns* ("column '…' not found", "No field named …") keep the generic
+/// internal mapping until they get their own 42883 / 42703 variants.
+pub(crate) fn map_df_plan_error(
+    context: &str,
+    e: &datafusion::error::DataFusionError,
+) -> BasinError {
+    let msg = e.to_string();
+    if let Some(start) = msg.find("table '") {
+        let rest = &msg[start + "table '".len()..];
+        if let Some(end) = rest.find("' not found") {
+            // DataFusion resolves the reference against its default catalog
+            // and schema before erroring, so the message names
+            // `datafusion.public.<table>`. PG reports the relation as the
+            // user wrote it — and Basin strips schema qualifiers before
+            // DataFusion sees the SQL — so drop the synthetic prefix.
+            let name = rest[..end]
+                .strip_prefix("datafusion.public.")
+                .unwrap_or(&rest[..end]);
+            return BasinError::undefined_table(name);
+        }
+    }
+    BasinError::internal(format!("{context}: {e}"))
+}
+
 // `gin_original_sql`: the original (pre-operator-rewrite) SQL for GIN pruning
 // detection.  `None` when calling from internal paths that have no original SQL
 // (e.g. CTAS, DML SELECT sub-selects).  When `Some`, `apply_gin_pruning_for_query`
@@ -9101,7 +9138,7 @@ pub(crate) async fn exec_select(
         .ctx
         .sql(sql_for_df)
         .await
-        .map_err(|e| BasinError::internal(format!("plan: {e}")))?;
+        .map_err(|e| map_df_plan_error("plan", &e))?;
 
     // Phase 5.16.B: compute query-shape hash and record it in the per-shape
     // HDR histogram registry.  The hash was computed-and-discarded in 5.16.A;

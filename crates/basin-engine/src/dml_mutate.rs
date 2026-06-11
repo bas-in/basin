@@ -107,7 +107,7 @@ pub(crate) async fn resolve_subqueries_in_expr(sess: &ProjectSession, expr: Expr
             let sql = subquery.to_string();
             let df =
                 sess.ctx.sql(&sql).await.map_err(|e| {
-                    BasinError::internal(format!("IN (SELECT …) – plan failed: {e}"))
+                    crate::executor::map_df_plan_error("IN (SELECT …) – plan failed", &e)
                 })?;
             let df_batches = df.collect().await.map_err(|e| {
                 BasinError::internal(format!("IN (SELECT …) – execute failed: {e}"))
@@ -169,7 +169,7 @@ pub(crate) async fn resolve_subqueries_in_expr(sess: &ProjectSession, expr: Expr
             let sql = subquery.to_string();
             let df =
                 sess.ctx.sql(&sql).await.map_err(|e| {
-                    BasinError::internal(format!("scalar subquery – plan failed: {e}"))
+                    crate::executor::map_df_plan_error("scalar subquery – plan failed", &e)
                 })?;
             let df_batches = df.collect().await.map_err(|e| {
                 BasinError::internal(format!("scalar subquery – execute failed: {e}"))
@@ -771,14 +771,17 @@ async fn try_resolve_fast_path_pks(
             return Ok(None);
         }
     }
-    // Gate: secondary indexes (B-tree / GIN / GIST) need entry maintenance
-    // on delete — the slow path handles them. Additionally, a fast-path
-    // tombstone on a GIN-indexed table would RESURRECT the deleted row in
-    // containment reads: `apply_gin_pruning_for_query` swaps the
-    // overlay-aware provider for an unwrapped pruned table with no
-    // `TombstoneFilterExec`. See the UPDATE twin of this gate in
-    // `try_resolve_fast_path_update` for the full read-path analysis before
-    // relaxing either gate.
+    // Gate: secondary indexes (B-tree / GIN / GIST / vector) need entry
+    // maintenance on delete — the slow path handles them. The UPDATE twin of
+    // this gate (`try_resolve_fast_path_update`) now ADMITS GIN-only tables:
+    // the read paths gate their posting-probe short-circuits and pruned
+    // re-registrations on overlay-emptiness (which covers tombstones too —
+    // `table_has_live_overlay` reads `tombstone_count`), and the materialize
+    // drain performs GIN registry maintenance. DELETE stays blanket-declined
+    // conservatively: the tombstone fast path has not been validated against
+    // the GIN read paths end-to-end (no gin_overlay_delete oracle yet) — see
+    // the UPDATE gate's comment for the per-access-method contract before
+    // relaxing this one.
     if !meta.indexes.is_empty() {
         return Ok(None);
     }
@@ -1796,57 +1799,65 @@ async fn try_resolve_fast_path_update(
     {
         return Ok(None);
     }
-    // Gate: ANY secondary index (B-tree / GIN / GIST / vector) → cold path.
+    // Gate: secondary indexes — dispatch on the catalog access method
+    // (`SecondaryIndex::access_method`: "btree" is the default; "gin" covers
+    // jsonb_ops / jsonb_path_ops containment GIN and tsvector_ops FTS GIN;
+    // "gist" is the interval/range index; vector indexes persist as "hnsw" —
+    // IVFFlat is stored under "hnsw" with an `ivfflat:` opclass).
     //
-    // Do NOT relax this for GIN/JSONB tables without fixing the read path
-    // first. The tempting argument — "GIN pruning only narrows the COLD scan
-    // and `UpdateOverlayExec` appends every override row unconditionally, so
-    // an overlay UPDATE is invisible to the prune" — is true ONLY while the
-    // overlay-aware provider (`session::register_cold_with_overlay` →
-    // `TombstoneFilteringTable` / `HtapUnionTable`, whose scan wraps the cold
-    // child in `TombstoneFilterExec` + `UpdateOverlayExec`) is the table's
-    // registration. Three read-path consumers break that premise the moment
-    // an override exists for a GIN-indexed table (verified 2026-06, see
-    // tests/integration/tests/gin_overlay_update.rs):
+    // GIN-ONLY tables (EVERY declared index has `access_method == "gin"`)
+    // are ADMITTED to the overlay fast path. The historical blanket decline
+    // documented three read-path blockers; all three are now closed in
+    // committed code (pinned by tests/integration/tests/gin_overlay_update.rs):
     //
-    //   1. `executor.rs` posting-probe short-circuits: the `@>`/`<@` and
-    //      `?`/`?&`/`?|` detectors probe `GinIndexRegistry`
-    //      (`probe_containment` / `probe_key_existence`), which is built from
-    //      COLD FILES ONLY, and return ZERO ROWS on `ProbeResult::Empty`
-    //      before any overlay merge runs. An override whose post-SET document
-    //      NEWLY matches a needle whose terms live in disjoint cold files
-    //      (intersection = ∅ → `Empty`) is silently dropped.
+    //   1. Executor posting-probe `Empty` short-circuits (`@>`/`<@`,
+    //      `?`/`?&`/`?|`, and the tsvector `@@` twin) fire only when
+    //      `executor::gin_empty_probe_is_trustworthy` /
+    //      `fts_empty_probe_is_trustworthy` hold: NO live overlay for the
+    //      table (`session::table_has_live_overlay`, O(1) counter reads) AND
+    //      every live file is in the registry's indexed-files completeness
+    //      set. A live override row therefore always falls through to the
+    //      overlay-aware scan (`TombstoneFilterExec` + `UpdateOverlayExec`).
     //
-    //   2. `session::apply_gin_pruning_for_query` (and the posting/row-group
-    //      variants that follow it in `exec_select`) DE-REGISTERS the
-    //      overlay-aware provider and registers an UNWRAPPED
-    //      `GinRowGroupPrunedTable` or pruned `ListingTable` for the query.
-    //      Those providers read raw cold bytes: override rows are neither
-    //      appended nor are their stale cold images suppressed — a containment
-    //      SELECT would return pre-UPDATE values (or miss the row entirely
-    //      when the prune drops its file). This fires on the rg-direct path
-    //      whenever every live file is sealed in `GinRowGroupRegistry`
-    //      (exactly the post-CREATE-INDEX-backfill state) — no narrow shape
-    //      required.
+    //   2. The session pruned re-registrations
+    //      (`session::apply_gin_pruning_for_query`,
+    //      `apply_jsonb_posting_pruning_for_query`,
+    //      `apply_gin_fts_pruning_for_query`) skip swapping the overlay-aware
+    //      provider for a bare cold reader while `table_has_live_overlay` is
+    //      true — override rows are appended and their stale cold images
+    //      suppressed for every containment/FTS SELECT during the overlay
+    //      window (correct-but-unpruned; pruning resumes after the drain).
     //
-    //   3. `materialize_overlay_for_table` performs NO GIN registry
-    //      maintenance around its `write_replacement`/`commit_replace` (unlike
-    //      `exec_update`/`exec_delete`, which run `GinPostingListMaintainer`):
-    //      replaced files keep stale posting entries and stay in the
-    //      completeness sets while the replacement file is never indexed or
-    //      sealed. Latent today precisely BECAUSE this gate keeps overlays off
-    //      indexed tables; it becomes load-bearing the moment the gate is
-    //      relaxed.
+    //   3. CREATE INDEX settles any live overlay
+    //      (`materialize_overlay_for_table`) BEFORE backfilling, so a fresh
+    //      index never seals pre-update cold images as "complete"; and the
+    //      materialize path itself now performs GIN-family registry
+    //      maintenance on its replacement files (purge replaced paths,
+    //      rebuild + completeness-seal the replacement — see the maintenance
+    //      block in `materialize_overlay_for_table`), so a drained overlay
+    //      leaves the posting lists complete and pruning RE-ENGAGES instead
+    //      of degrading to full scans forever.
     //
-    // B-tree-only tables are closer to safe (the `fast_select` secondary-index
-    // probe treats a miss as fall-through since the probe-miss fix, a stale
-    // HIT only widens the cold allowlist, and the overlay merge re-checks the
-    // predicate), but the registry entries still go unmaintained and the
-    // (1)/(2) machinery shares the `meta.indexes` dispatch — so the
-    // conservative blanket decline stays until the executor/session read
-    // paths gate their short-circuits and pruned re-registrations on
-    // overlay-emptiness for the table.
-    if !meta.indexes.is_empty() {
+    // STILL DECLINED — any non-GIN index in `meta.indexes` keeps the cold
+    // path:
+    //   * "btree" (and anything unrecognized, conservatively): the
+    //     `fast_select` secondary-index probe treats a value HIT as an
+    //     authoritative cold-file allowlist, and that allowlist is maintained
+    //     only on the CoW commit paths (`maintain_btree_secondary_on_replace`)
+    //     — an overlay row whose NEW value hits the index would be served
+    //     from a file set that cannot contain it. The btree read path has no
+    //     overlay-emptiness guard equivalent to (1)/(2).
+    //   * "gist": the interval-tree registry has its own consumers
+    //     (`rtree_rowgroup_scan` / range probes) with no overlay guards —
+    //     out of scope here.
+    //   * "hnsw"/vector: ANN sidecars have their own readers and rebuild
+    //     lifecycle; overlay-merging a graph index is out of scope.
+    //
+    // Mixed tables (GIN + btree, etc.) decline: one unsafe consumer is
+    // enough to leak a stale read.
+    if !meta.indexes.is_empty()
+        && !meta.indexes.iter().all(|idx| idx.access_method == "gin")
+    {
         return Ok(None);
     }
     // Gate: any child table referencing this one (FK ON UPDATE) → slow path.
@@ -5138,10 +5149,162 @@ pub(crate) async fn materialize_overlay_for_table(
     // schema is correct — the shadow extension happens there so EVERY cold-path
     // rewrite (this overlay-materialize, exec_update, exec_delete, …) emits the
     // column and keeps the promoted-column read fast path enabled.
+    // Clone the merged batches for the GIN-family registry maintenance below
+    // BEFORE `write_replacement_engine` consumes them (Arrow RecordBatch
+    // clones are cheap Arc-buffer bumps) — and only when the table declares a
+    // GIN index, so the overwhelmingly common index-free materialize pays
+    // nothing. The batches are already normalized to the CATALOG physical
+    // types above, which is exactly what the index maintainers expect (JSONB
+    // → `LargeBinary`, tsvector → `Utf8`).
+    let table_has_gin = meta.indexes.iter().any(|idx| idx.access_method == "gin");
+    let index_batches: Vec<RecordBatch> = if table_has_gin {
+        batches.iter().cloned().collect()
+    } else {
+        Vec::new()
+    };
     let added =
         write_replacement_engine(engine, project, table, meta.schema.clone(), batches).await?;
-    commit_replace_engine(engine, project, table, meta.current_snapshot, removed.clone(), added)
-        .await?;
+    commit_replace_engine(
+        engine,
+        project,
+        table,
+        meta.current_snapshot,
+        removed.clone(),
+        added.clone(),
+    )
+    .await?;
+
+    // GIN-family registry maintenance — the materialize half of the UPDATE
+    // fast-path gate's old blocker #3. Now that GIN-only tables are admitted
+    // to the overlay fast path (see `try_resolve_fast_path_update`), this
+    // drain is a routine event for GIN-indexed tables; without maintenance
+    // the replaced files would keep stale posting entries while the
+    // replacement file is never indexed or completeness-sealed, so every
+    // post-drain probe would fail the completeness guards and degrade to a
+    // full scan FOREVER (correct, but unpruned until a re-CREATE INDEX).
+    //
+    // Wiring mirrors the cold CoW commit paths (`exec_update`/`exec_delete`):
+    // run AFTER `commit_replace` and BEFORE the physical delete — the
+    // ordering contract documented on `GinPostingListMaintainer`. Maintained
+    // here:
+    //   * jsonb GIN file-level posting list (`GinIndexRegistry`) via
+    //     `GinPostingListMaintainer` — purge replaced paths, rebuild and
+    //     completeness-seal the replacement file; restores the `Empty`
+    //     short-circuit and the file-level posting prune path.
+    //   * tsvector FTS posting list (`GinTsvectorRegistry`) — same
+    //     purge/rebuild/seal, mirroring `maintain_gin_fts_index_on_insert`
+    //     (same writer-priority rg_size so row-group ordinals line up).
+    // NOT maintained (matches `exec_update`, which also leaves them to the
+    // per-file completeness guards): the `GinRowGroupRegistry` bloom
+    // summaries and the JSONB posting SIDECARS — the un-sealed replacement
+    // file is force-scanned by those paths (correct, file-level pruning above
+    // still engages) until compaction / backfill re-seals it. B-tree / GIST /
+    // vector indexes need no handling here: the fast-path gate never admits
+    // an overlay onto tables that declare them.
+    if table_has_gin {
+        {
+            use basin_storage::index::index_maint::GinPostingListMaintainer;
+            if let Some(maint) = GinPostingListMaintainer::new(
+                engine.gin_index_registry().as_ref(),
+                &project,
+                table,
+                &meta,
+            ) {
+                match added.first() {
+                    Some(new_file) if removed.is_empty() => {
+                        // The narrowed rewrite touched no cold file (every
+                        // overlay key probed definitively Absent): the
+                        // override rows were appended into a fresh file with
+                        // nothing to purge. old == new makes the purge half a
+                        // no-op while the rebuild indexes + seals the file.
+                        maint.on_file_replaced(&new_file.path, &new_file.path, &index_batches);
+                    }
+                    Some(new_file) => {
+                        for old_path in &removed {
+                            maint.on_file_replaced(old_path, &new_file.path, &index_batches);
+                        }
+                    }
+                    None => {
+                        // Every merged row was tombstoned — no replacement
+                        // file; just purge the replaced files' stale postings.
+                        for old_path in &removed {
+                            maint.on_file_removed(old_path);
+                        }
+                    }
+                }
+            }
+        }
+        // FTS (tsvector_ops GIN) twin: purge replaced paths, re-index the
+        // replacement file's lexemes under their writer-aligned row-group
+        // ordinals, and seal it so `fts_empty_probe_is_trustworthy` /
+        // `apply_gin_fts_pruning_for_query` regain completeness post-drain.
+        let fts_cols: Vec<String> = meta
+            .indexes
+            .iter()
+            .filter(|idx| {
+                idx.access_method == "gin"
+                    && idx.opclass.as_deref() == Some("tsvector_ops")
+                    && idx.columns.len() == 1
+            })
+            .map(|idx| idx.columns[0].clone())
+            .collect();
+        if !fts_cols.is_empty() {
+            use arrow_array::Array;
+            let fts = engine.gin_fts_registry();
+            // Same row-group-size priority as the writer / CREATE INDEX
+            // backfill (`row_block_size` > `row_group_rows` > default) so the
+            // recorded ordinals line up with the on-disk layout.
+            let rg_size = meta
+                .row_block_size
+                .map(|v| v as usize)
+                .or(meta.row_group_rows)
+                .unwrap_or(basin_storage::DEFAULT_MAX_ROW_GROUP_SIZE)
+                .max(1);
+            for col in &fts_cols {
+                for old_path in &removed {
+                    fts.remove_file(&project, table, col, old_path);
+                }
+                let Some(new_file) = added.first() else {
+                    continue;
+                };
+                let mut file_row_off = 0usize;
+                let mut indexed_any = false;
+                for batch in &index_batches {
+                    if let Ok(col_idx) = batch.schema().index_of(col) {
+                        if let Some(arr) = batch
+                            .column(col_idx)
+                            .as_any()
+                            .downcast_ref::<arrow_array::StringArray>()
+                        {
+                            indexed_any = true;
+                            for row in 0..arr.len() {
+                                if arr.is_null(row) {
+                                    continue;
+                                }
+                                let file_row = file_row_off + row;
+                                fts.index_row(
+                                    &project,
+                                    table,
+                                    col,
+                                    arr.value(row),
+                                    &new_file.path,
+                                    (file_row / rg_size) as u32,
+                                    file_row as u64,
+                                );
+                            }
+                        }
+                    }
+                    file_row_off += batch.num_rows();
+                }
+                // Seal only when the column was actually found + processed —
+                // claiming completeness over rows we never read would let the
+                // probe paths prune real matches.
+                if indexed_any {
+                    fts.mark_file_indexed(&project, table, col, &new_file.path);
+                }
+            }
+        }
+    }
     // Physically delete the just-replaced files so a subsequent
     // `list_data_files_with_stats` (which lists the object store directly, not
     // the catalog) doesn't return them alongside the new merged file. Without
