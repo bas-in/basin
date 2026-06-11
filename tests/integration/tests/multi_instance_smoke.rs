@@ -95,6 +95,7 @@ async fn open_wal(dir: &TempDir) -> Arc<dyn Wal> {
             root_prefix: None,
             flush_interval: Duration::from_millis(20),
             flush_max_bytes: 1024 * 1024,
+            commit_delay: Duration::from_millis(2),
         })
         .await
         .unwrap(),

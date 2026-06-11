@@ -103,6 +103,7 @@ async fn two_replicas_handoff_under_load_completes_in_under_500ms() {
             root_prefix: None,
             flush_interval: Duration::from_millis(50),
             flush_max_bytes: 1024 * 1024,
+            commit_delay: Duration::from_millis(2),
         })
         .await
         .unwrap(),
@@ -227,6 +228,7 @@ async fn p99_handoff_stall_across_repeated_runs_under_500ms() {
                 root_prefix: None,
                 flush_interval: Duration::from_millis(50),
                 flush_max_bytes: 1024 * 1024,
+                commit_delay: Duration::from_millis(2),
             })
             .await
             .unwrap(),

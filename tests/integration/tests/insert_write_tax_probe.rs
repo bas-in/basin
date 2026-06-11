@@ -115,6 +115,7 @@ async fn build() -> (TempDir, TempDir, Engine, basin_shard::ShardBackgroundHandl
             root_prefix: None,
             flush_interval: Duration::from_millis(50),
             flush_max_bytes: 1024 * 1024,
+            commit_delay: Duration::from_millis(2),
         })
         .await
         .unwrap(),
@@ -177,9 +178,11 @@ async fn measure(engine: &Engine, rows: i64, label: &str) {
     // gate); the in-tx path keeps `Best`. This probe issues non-tx INSERTs,
     // so the encode is `Fast`.
     let mode = "Fast";
+    let rps = rows as f64 / (insert_loop_ms / 1000.0);
     println!(
         "[write-tax] {label:>6} rows={rows:>7} mode={mode:<4} \
-         insert-loop={insert_loop_ms:8.1}ms ({:.1}us/row)  first-SELECT(incl flush)={flush_ms:8.1}ms",
+         insert-loop={insert_loop_ms:8.1}ms ({:.1}us/row, {rps:.0} rows/s via pre-parse path)  \
+         first-SELECT(incl flush)={flush_ms:8.1}ms",
         insert_loop_ms * 1000.0 / rows as f64
     );
 }
@@ -229,6 +232,7 @@ async fn build_bench() -> (TempDir, TempDir, Engine, basin_shard::ShardBackgroun
             root_prefix: None,
             flush_interval: Duration::from_millis(200),
             flush_max_bytes: 1024 * 1024,
+            commit_delay: Duration::from_millis(2),
         })
         .await
         .unwrap(),

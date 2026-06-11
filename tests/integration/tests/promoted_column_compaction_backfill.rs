@@ -88,6 +88,7 @@ async fn promoted_column_compaction_backfill() {
             root_prefix: None,
             flush_interval: Duration::from_millis(50),
             flush_max_bytes: 1024 * 1024,
+            commit_delay: Duration::from_millis(2),
         })
         .await
         .unwrap(),
@@ -274,6 +275,7 @@ async fn promoted_column_cold_file_sweep() {
             root_prefix: None,
             flush_interval: Duration::from_millis(50),
             flush_max_bytes: 1024 * 1024,
+            commit_delay: Duration::from_millis(2),
         })
         .await
         .unwrap(),

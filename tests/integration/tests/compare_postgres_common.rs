@@ -543,6 +543,7 @@ pub async fn build_basin_engine() -> BasinInstance {
             root_prefix: None,
             flush_interval: Duration::from_millis(200),
             flush_max_bytes: 1024 * 1024,
+            commit_delay: Duration::from_millis(2),
         })
         .await
         .unwrap(),

@@ -39,6 +39,7 @@ async fn build() -> (TempDir, TempDir, Engine, basin_shard::ShardBackgroundHandl
             root_prefix: None,
             flush_interval: Duration::from_millis(50),
             flush_max_bytes: 1024 * 1024,
+            commit_delay: Duration::from_millis(2),
         })
         .await
         .unwrap(),

@@ -1396,6 +1396,7 @@ async fn tombstone_cold_scan_projection_order_parquet() {
             root_prefix: None,
             flush_interval: Duration::from_millis(50),
             flush_max_bytes: 1024 * 1024,
+            commit_delay: Duration::from_millis(2),
         })
         .await
         .unwrap(),
