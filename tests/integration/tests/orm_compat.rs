@@ -1049,14 +1049,12 @@ async fn data_modifying_cte_insert_returning_then_select() {
 // A JSON report is emitted to `benchmark/data/orm_compat.json` so the
 // dashboard can track per-ORM coverage over releases.
 //
-// KNOWN UNSUPPORTED SHAPES (flagged with comments, return typed errors):
-//   - LISTEN / NOTIFY (sqlx) — async notification channel not implemented.
-//   - COPY FROM STDIN (sqlx) — bulk-loader sub-protocol not implemented.
-//   - pg_get_serial_sequence (Prisma) — catalog function not wired up.
-//   - information_schema.columns (Prisma) — not always available.
-//   - pg_class / pg_catalog probes (Diesel, Prisma) — catalog not exposed.
-//   - $1 unbound params — simple_query cannot supply positional params;
-//     the planner returns a typed error, which is the correct behaviour.
+// (Historical gaps now passing: COPY FROM STDIN — the sqlx `PgCopyIn`
+// shape with quoted identifiers is driven through `client.copy_in` and
+// inserts for real — plus LISTEN, pg_get_serial_sequence,
+// information_schema.columns, pg_class / pg_catalog probes, and the
+// Diesel / TypeORM migration-tracker flows — each section bootstraps its
+// tracker table exactly the way the real ORM does before querying it.)
 // =============================================================================
 
 /// Strongly-typed sample parameter for a corpus SQL shape.
@@ -1137,9 +1135,17 @@ enum ShapeOutcome {
 /// Routes parameter-free shapes through `simple_query` (covers DDL +
 /// multi-statement seeds) and parameterised shapes through `client.execute`
 /// (covers the extended Parse/Bind/Describe/Execute path every ORM driver
-/// takes).  Returns `Err(String)` only on a connection-level failure
-/// (panic-grade).
+/// takes). `COPY … FROM STDIN` shapes are driven through `client.copy_in`
+/// — the CopyIn sub-protocol every real client uses (`sqlx::PgCopyIn`,
+/// `tokio_postgres::copy_in`); `simple_query` would wedge on the
+/// `CopyInResponse` (tokio-postgres replies `unexpected message` and the
+/// server is left waiting for CopyData). Returns `Err(String)` only on a
+/// connection-level failure (panic-grade).
 async fn run_shape(client: &Client, shape: &Shape) -> Result<ShapeOutcome, String> {
+    let head = shape.sql.trim_start().to_ascii_uppercase();
+    if head.starts_with("COPY") && head.contains("FROM STDIN") {
+        return run_copy_in_shape(client, shape.sql).await;
+    }
     let result: Result<(), tokio_postgres::Error> = if shape.params.is_empty() {
         client.simple_query(shape.sql).await.map(|_| ())
     } else {
@@ -1149,7 +1155,33 @@ async fn run_shape(client: &Client, shape: &Shape) -> Result<ShapeOutcome, Strin
             boxed.iter().map(|b| b.as_ref() as &(dyn ToSql + Sync)).collect();
         client.execute(shape.sql, &refs[..]).await.map(|_| ())
     };
+    classify_shape_result(result)
+}
 
+/// Drive a `COPY … FROM STDIN` shape through the CopyIn sub-protocol with a
+/// small CSV payload (ids chosen to never collide with the seed rows).
+async fn run_copy_in_shape(client: &Client, sql: &str) -> Result<ShapeOutcome, String> {
+    use futures::SinkExt;
+    let sink = match client.copy_in::<_, bytes::Bytes>(sql).await {
+        Ok(s) => s,
+        Err(e) => return classify_shape_result(Err(e)),
+    };
+    futures::pin_mut!(sink);
+    if let Err(e) = sink
+        .send(bytes::Bytes::from_static(
+            b"9001,copy-sqlx-a@example.com\n9002,copy-sqlx-b@example.com\n",
+        ))
+        .await
+    {
+        return classify_shape_result(Err(e));
+    }
+    classify_shape_result(sink.as_mut().finish().await.map(|_| ()))
+}
+
+/// Shared outcome classification: Ok / well-formed typed error / regression.
+fn classify_shape_result(
+    result: Result<(), tokio_postgres::Error>,
+) -> Result<ShapeOutcome, String> {
     match result {
         Ok(()) => Ok(ShapeOutcome::Ok),
         Err(e) => {
@@ -1219,7 +1251,10 @@ async fn run_orm_section(
 
     for shape in shapes {
         let sql = shape.sql;
-        match run_shape(client, shape).await {
+        let started = std::time::Instant::now();
+        let outcome = run_shape(client, shape).await;
+        let elapsed_ms = started.elapsed().as_millis();
+        match outcome {
             Ok(ShapeOutcome::Ok) => {
                 ok += 1;
                 shape_results.push(ShapeResult {
@@ -1228,12 +1263,15 @@ async fn run_orm_section(
                     sqlstate: None,
                     message: None,
                 });
-                println!("  [{orm}] OK: {}", &sql[..sql.len().min(80)]);
+                println!(
+                    "  [{orm}] OK ({elapsed_ms} ms): {}",
+                    &sql[..sql.len().min(80)]
+                );
             }
             Ok(ShapeOutcome::TypedError { sqlstate, message }) => {
                 typed += 1;
                 println!(
-                    "  [{orm}] TYPED-ERR ({sqlstate}): {}",
+                    "  [{orm}] TYPED-ERR ({sqlstate}, {elapsed_ms} ms): {}",
                     &sql[..sql.len().min(60)]
                 );
                 shape_results.push(ShapeResult {
@@ -1618,8 +1656,10 @@ async fn orm_compat_corpus() {
     //
     // sqlx generates clean, well-formed SQL.  Key gaps:
     //   LISTEN / NOTIFY — not supported (0A000).
-    //   COPY FROM/TO STDIN — bulk-loader sub-protocol not implemented.
     //   $1 params — typed planner error from simple_query (expected).
+    // COPY FROM STDIN (the `sqlx::PgCopyIn` shape, quoted identifiers +
+    // column list) is supported and driven through the real CopyIn
+    // sub-protocol by `run_copy_in_shape`.
     let sqlx: &[Shape] = &[
         // 1. Basic SELECT with $1 param — bound via extended protocol.
         Shape::with(
@@ -1687,9 +1727,10 @@ async fn orm_compat_corpus() {
         //     `Describe` extensively, and during prepare it issues this
         //     parse-only probe (`SELECT ... LIMIT 0`).
         Shape::raw(r#"SELECT id, email FROM "users" LIMIT 0"#),
-        // 14. sqlx COPY-FROM bulk loader — KNOWN UNSUPPORTED.  `sqlx::PgCopyIn`
-        //     calls this before streaming bytes.  Basin does not implement
-        //     the COPY sub-protocol; must return typed error, not panic.
+        // 14. sqlx COPY-FROM bulk loader — `sqlx::PgCopyIn` issues exactly
+        //     this statement (double-quoted table + column list) before
+        //     streaming bytes. Driven through the CopyIn sub-protocol by
+        //     `run_copy_in_shape`; classifies Ok when the rows land.
         Shape::raw(r#"COPY "users" (id, email) FROM STDIN"#),
         // 15. sqlx EXISTS subquery — `WHERE EXISTS (SELECT 1 ...)` (used by
         //     macro-checked `WHERE EXISTS` in the README query examples).
@@ -1790,17 +1831,29 @@ async fn orm_compat_corpus() {
             r#"DELETE FROM "posts" WHERE ("posts"."id" = $1) RETURNING "posts"."id", "posts"."title""#,
             &[ParamValue::I64(998)],
         ),
-        // 18. Diesel `diesel_migrations` schema-version probe — selects from
+        // 18. Diesel `diesel_migrations` tracker bootstrap — the FIRST thing
+        //     any `MigrationHarness` does is ensure the tracker table exists.
+        //     Verbatim `CREATE_MIGRATIONS_TABLE` constant from
+        //     diesel_migrations (setup emitted before every version probe).
+        Shape::raw(
+            r"CREATE TABLE IF NOT EXISTS __diesel_schema_migrations (
+                version VARCHAR(50) PRIMARY KEY NOT NULL,
+                run_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )",
+        ),
+        // 19. Diesel `diesel_migrations` schema-version probe — selects from
         //     `__diesel_schema_migrations` (the canonical migration tracker
-        //     table).  Until the table exists this returns SQLSTATE 42P01.
-        //     Placed LAST in the section because the engine currently leaves
-        //     the session in aborted-tx state after a planner 42P01, which
-        //     would otherwise cascade-poison every following shape; the
-        //     ROLLBACK in shape 19 cleans up before the TypeORM section runs.
+        //     table).  Always preceded by the bootstrap in shape 18, exactly
+        //     as the real harness orders them.
         Shape::raw(r#"SELECT "__diesel_schema_migrations"."version", "__diesel_schema_migrations"."run_on" FROM "__diesel_schema_migrations" ORDER BY "__diesel_schema_migrations"."version" DESC"#),
-        // 19. Diesel transaction wrapper close — Diesel always emits a final
-        //     `ROLLBACK` for txns ended via `?`-propagation.  Doubles as
-        //     session-state cleanup for shape 18 (see note above).
+        // 20. Diesel records an applied migration version in the tracker —
+        //     `INSERT INTO __diesel_schema_migrations (version) VALUES ($1)`.
+        Shape::with(
+            r"INSERT INTO __diesel_schema_migrations (version) VALUES ($1)",
+            &[ParamValue::Text("20240101000000")],
+        ),
+        // 21. Diesel transaction wrapper close — Diesel always emits a final
+        //     `ROLLBACK` for txns ended via `?`-propagation.
         Shape::raw(r#"ROLLBACK"#),
     ];
 
@@ -1884,11 +1937,13 @@ async fn orm_compat_corpus() {
             r#"SELECT COUNT(DISTINCT("users"."id")) AS "cnt" FROM "users" "users" WHERE "users"."email" = $1"#,
             &[ParamValue::Text("alice@example.com")],
         ),
-        // 16. TypeORM migration-metadata table — TypeORM's MigrationExecutor
-        //     creates and queries `migrations` to track applied migrations.
-        //     Placed last because the engine's 42P01 currently leaves the
-        //     session in aborted-tx state; a ROLLBACK would be needed to
-        //     resume, but no further shapes follow in this section.
+        // 16. TypeORM migration-metadata table bootstrap — TypeORM's
+        //     MigrationExecutor creates `migrations` before ever querying it
+        //     (PostgresQueryRunner.createTable emits exactly this DDL, named
+        //     PK constraint included).
+        Shape::raw(r#"CREATE TABLE "migrations" ("id" SERIAL NOT NULL, "timestamp" bigint NOT NULL, "name" character varying NOT NULL, CONSTRAINT "PK_8c82d7f526340ab734260ea46be" PRIMARY KEY ("id"))"#),
+        // 17. TypeORM MigrationExecutor.loadExecutedMigrations — queries the
+        //     tracker it just created, newest first.
         Shape::raw(r#"SELECT * FROM "migrations" ORDER BY "id" DESC"#),
     ];
 
