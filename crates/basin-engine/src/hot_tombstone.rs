@@ -138,15 +138,38 @@ pub(crate) fn decode_ipc_row(bytes: &[u8]) -> Option<RecordBatch> {
 ///   was written by another session after the snapshot was pinned and is
 ///   dropped so the transaction continues to see the pre-snapshot value (the
 ///   cold row, or its own earlier in-tx override via [`merge_tx_overlay`]).
+///
+/// ## Auto-commit memoization
+///
+/// The `None` (auto-commit) path is memoized per table in
+/// `MemTableEntry::overlay_memo`: the IPC decode of every override otherwise
+/// re-runs on EVERY read while any override is outstanding (every
+/// `TombstoneFilteringTable::scan`, `supports_filters_pushdown`, and
+/// fast-select cold merge). The memo key is `(epoch, update_count)`:
+///
+/// * every memtable mutation bumps `epoch`, so a new/changed/removed override
+///   invalidates the memo;
+/// * `mark_flushed` re-tags acked `Update`s as `Row` — which REMOVES them from
+///   this snapshot's output — deliberately WITHOUT bumping `epoch` (its
+///   documented invariant: the observable row VALUES are unchanged, only the
+///   overlay membership shrinks). Pure epoch keying would therefore serve a
+///   stale, larger override map after a flush ack. Every such re-tag
+///   decrements `update_count`, and no path increments `update_count` without
+///   also bumping `epoch`, so adding `update_count` to the key makes the pair
+///   change whenever the output can change.
+///
+/// The key is captured BEFORE the decode; `epoch` is monotonic, so a memo
+/// built concurrently with a mutation is keyed strictly in the past and can
+/// never match a later read's key. Pinned (`Some(w)`) reads bypass the memo
+/// entirely — their output varies by watermark.
 pub(crate) fn snapshot_updates(
     registry: &MemTableRegistry,
     project: &ProjectId,
     table: &TableName,
     watermark: Option<u64>,
 ) -> std::collections::HashMap<Vec<u8>, RecordBatch> {
-    let mut out: std::collections::HashMap<Vec<u8>, RecordBatch> = std::collections::HashMap::new();
     let Some(entry) = registry.get(project, table) else {
-        return out;
+        return std::collections::HashMap::new();
     };
     // S4 O(1) emptiness gate (auto-commit only) — mirror of the
     // `snapshot_tombstones` gate above. `update_count` counts entries whose
@@ -154,8 +177,42 @@ pub(crate) fn snapshot_updates(
     // historical `Update` in a chain whose newest version is something else
     // (update-then-delete), so the gate only fires with no watermark.
     if watermark.is_none() && entry.memtable.update_count() == 0 {
+        return std::collections::HashMap::new();
+    }
+    if watermark.is_none() {
+        // Capture the validity key BEFORE decoding (see the doc note above).
+        let key = (entry.memtable.epoch(), entry.memtable.update_count());
+        if let Some(memo) = entry.overlay_memo.read().as_ref() {
+            if (memo.epoch, memo.update_count) == key {
+                if let Ok(map) = Arc::clone(&memo.decoded)
+                    .downcast::<std::collections::HashMap<Vec<u8>, RecordBatch>>()
+                {
+                    // Hand the caller an owned map (some callers layer the tx
+                    // overlay on top). Cloning is per-entry `Arc` bumps plus
+                    // the key bytes — far cheaper than re-decoding IPC.
+                    return map.as_ref().clone();
+                }
+            }
+        }
+        let out = decode_update_overlay(&entry, None);
+        *entry.overlay_memo.write() = Some(basin_hottier::OverlayMemo {
+            epoch: key.0,
+            update_count: key.1,
+            decoded: Arc::new(out.clone()),
+        });
         return out;
     }
+    decode_update_overlay(&entry, watermark)
+}
+
+/// Decode the `Update` overrides of `entry` at `watermark` into the override
+/// map. Factored out of [`snapshot_updates`] so the memoized (auto-commit)
+/// and pinned paths share one decoder.
+fn decode_update_overlay(
+    entry: &basin_hottier::MemTableEntry,
+    watermark: Option<u64>,
+) -> std::collections::HashMap<Vec<u8>, RecordBatch> {
+    let mut out: std::collections::HashMap<Vec<u8>, RecordBatch> = std::collections::HashMap::new();
     // `snapshot_with_seq(watermark)` yields, per key, the newest version at or
     // before the watermark (`None` = auto-commit newest). S4 MVCC chains: a
     // pinned reader resolves the historical override at its watermark, even if
@@ -750,6 +807,7 @@ pub(crate) fn apply_update_overlay_to_batches(
     // fall back to the override row's own (full) schema when the cold side is
     // empty (every matched row was an override over an absent/flushed file).
     let target_schema = out.first().map(|b| b.schema());
+    let mut appended: Vec<RecordBatch> = Vec::new();
     for ov in updates.values() {
         // Re-apply the query's WHERE filter to the override row. The override
         // carries the FULL row schema, so every predicate column is present —
@@ -764,7 +822,31 @@ pub(crate) fn apply_update_overlay_to_batches(
             Some(schema) => reproject_row(ov, schema)?,
             None => ov.clone(),
         };
-        out.push(row);
+        appended.push(row);
+    }
+    // Surface the passing overrides as ONE concatenated batch instead of one
+    // single-row batch each: every downstream consumer (sort, aggregate,
+    // projection, the pgwire encoder) pays per-batch overhead, so N
+    // outstanding overrides used to add N tiny batches to every read. The
+    // reprojection above normalizes each row to the same schema; if any rows
+    // still diverge (defensive — only reachable via the no-cold-batch
+    // `ov.clone()` path), fall back to appending them individually rather
+    // than failing the read.
+    match appended.len() {
+        0 => {}
+        1 => out.push(appended.remove(0)),
+        _ => {
+            let schema = appended[0].schema();
+            if appended.iter().all(|b| b.schema() == schema) {
+                let merged = arrow_select::concat::concat_batches(&schema, &appended)
+                    .map_err(|e| {
+                        datafusion::common::DataFusionError::ArrowError(Box::new(e), None)
+                    })?;
+                out.push(merged);
+            } else {
+                out.extend(appended);
+            }
+        }
     }
     Ok(out)
 }

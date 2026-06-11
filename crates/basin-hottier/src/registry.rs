@@ -87,6 +87,36 @@ pub enum ReservationOutcome {
 
 // ── MemTableEntry ─────────────────────────────────────────────────────────────
 
+/// Engine-side memo of the decoded UPDATE-override overlay for one memtable.
+///
+/// `snapshot_updates` (basin-engine) IPC-decodes every `Update` override on
+/// every auto-commit read; this memo lets it reuse the decoded map while the
+/// overlay is unchanged. The decoded representation is **opaque to this
+/// crate** (`Arc<dyn Any>`): basin-hottier stores raw IPC bytes and must not
+/// depend on the engine's arrow batch types.
+///
+/// Validity key is the pair `(epoch, update_count)` captured from the owning
+/// [`MemTable`] **before** the decode:
+///
+/// * every mutation (insert / upsert / delete / insert_clean) bumps `epoch`;
+/// * [`MemTable::mark_flushed`] can change the override set WITHOUT bumping
+///   `epoch` (its documented invariant) — but only by re-tagging acked
+///   `Update`s to `Row` / removing clean tombstones, which always DECREMENTS
+///   `update_count` when an `Update` is affected. No path increments
+///   `update_count` without also bumping `epoch`.
+///
+/// So the pair changes whenever the decoded override map can change, and
+/// because `epoch` is monotonic a memo built concurrently with a mutation is
+/// keyed strictly in the past and can never be served.
+pub struct OverlayMemo {
+    /// `MemTable::epoch()` captured before the decode that built `decoded`.
+    pub epoch: u64,
+    /// `MemTable::update_count()` captured before the decode.
+    pub update_count: u64,
+    /// The decoded overlay, downcast by the engine to its own map type.
+    pub decoded: Arc<dyn std::any::Any + Send + Sync>,
+}
+
 /// One entry in the registry: the live [`MemTable`] for a `(project, table)`
 /// pair.
 pub struct MemTableEntry {
@@ -112,6 +142,10 @@ pub struct MemTableEntry {
     /// shadow columns (the UPDATE/INSERT fast paths materialise them), so the
     /// promoted fast path is correctness-safe even with hot rows present.
     pub shadow_dirty: std::sync::atomic::AtomicBool,
+    /// Engine-side decoded-overlay memo (see [`OverlayMemo`]). `None` until
+    /// the first memoized `snapshot_updates` decode; self-invalidating via
+    /// the `(epoch, update_count)` key, so no mutation path needs to touch it.
+    pub overlay_memo: parking_lot::RwLock<Option<OverlayMemo>>,
 }
 
 impl MemTableEntry {
@@ -119,6 +153,7 @@ impl MemTableEntry {
         Self {
             memtable: MemTable::new(),
             shadow_dirty: std::sync::atomic::AtomicBool::new(false),
+            overlay_memo: parking_lot::RwLock::new(None),
         }
     }
 }

@@ -148,6 +148,81 @@ async fn count_star_after_scalar_hot_update_is_correct() {
     wal.close().await.unwrap();
 }
 
+/// Read all values of `col` ordered by id (bulk read path — exercises the
+/// `snapshot_updates` overlay merge, and therefore the decoded-overlay memo).
+async fn ints_ordered(sess: &basin_engine::ProjectSession, sql: &str) -> Vec<i64> {
+    match sess.execute(sql).await.unwrap() {
+        ExecResult::Rows { batches, .. } => {
+            let mut out = Vec::new();
+            for b in &batches {
+                let a = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                for r in 0..b.num_rows() {
+                    out.push(a.value(r));
+                }
+            }
+            out
+        }
+        _ => panic!("expected rows"),
+    }
+}
+
+/// `mark_flushed` re-tag interaction with the decoded-overlay memo:
+///
+/// 1. Hot RMW UPDATEs write `Update` overrides for id 1 and 2.
+/// 2. A bulk SELECT decodes + memoizes the overlay (auto-commit path).
+/// 3. A NON-allowlisted UPDATE (`abs(v)`, cold copy-on-write) on id 3 first
+///    runs `materialize_hot_overlay_into_cold`, whose flush ack
+///    (`mark_flushed`) re-tags the acked `Update`s to `Row` — changing
+///    `snapshot_updates`' output WITHOUT bumping the memtable epoch (the
+///    documented `mark_flushed` invariant). The memo's `(epoch, update_count)`
+///    key catches this via the `update_count` drain (2 → 0).
+/// 4. Post-materialize reads must still see the SAME values: the overlay
+///    vanished from the override map, but the acked image IS the cold image
+///    now. A stale memo would also surface the (value-identical) overrides;
+///    the load-bearing assert is that nothing is lost, doubled, or stale.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlay_memo_survives_materialize_retag() {
+    let (_sd, _wd, engine, shard, bg, wal) = build().await;
+    bg.shutdown().await;
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, -30)")
+        .await
+        .unwrap();
+    shard.flush_to_parquet().await.unwrap();
+
+    // Hot overlay: two RMW overrides (fast path is default-ON).
+    sess.execute("UPDATE t SET v = v + 1 WHERE id = 1").await.unwrap();
+    sess.execute("UPDATE t SET v = v + 1 WHERE id = 2").await.unwrap();
+    // Warm the memo with a bulk read while both overrides are outstanding.
+    assert_eq!(
+        ints_ordered(&sess, "SELECT v FROM t ORDER BY id").await,
+        vec![11, 21, -30],
+        "bulk read sees both overrides before the materialize"
+    );
+
+    // `abs(v)` is not on the RMW allowlist → cold copy-on-write path → it
+    // materializes the overlay into cold first and `mark_flushed` re-tags the
+    // two `Update` entries to `Row` (no epoch bump, update_count 2 → 0).
+    sess.execute("UPDATE t SET v = abs(v) WHERE id = 3").await.unwrap();
+
+    // Values must be exactly the post-materialize state on both read paths:
+    // the former overrides now live in cold, id=3 got the cold-path abs().
+    assert_eq!(
+        ints_ordered(&sess, "SELECT v FROM t ORDER BY id").await,
+        vec![11, 21, 30],
+        "post-retag bulk read: materialized values correct, no stale/doubled rows"
+    );
+    assert_eq!(int_at(&sess, "SELECT v FROM t WHERE id = 1").await, 11);
+    assert_eq!(int_at(&sess, "SELECT v FROM t WHERE id = 2").await, 21);
+    assert_eq!(int_at(&sess, "SELECT v FROM t WHERE id = 3").await, 30);
+    assert_eq!(int_at(&sess, "SELECT COUNT(*) FROM t").await, 3, "no rows lost/duplicated");
+
+    wal.close().await.unwrap();
+}
+
 /// Repro for the hot-overlay vs cold-path-mutation interaction: a scalar
 /// hot-tier UPDATE (overlay) followed by a RANGE UPDATE (cold copy-on-write
 /// path) on the SAME row must not lose the cold-path update.

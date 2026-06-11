@@ -45,6 +45,7 @@ pub use flush::{FlushBackend, FlushTask, FlushTrigger, ImmediateFlushRequest, Ro
 pub use memtable::{MemRowValue, MemTable};
 pub use merge::merge_scan;
 pub use registry::{
-    FlushRequest, MemTableEntry, MemTableRegistry, ProjectMemState, ReservationOutcome,
+    FlushRequest, MemTableEntry, MemTableRegistry, OverlayMemo, ProjectMemState,
+    ReservationOutcome,
 };
 pub use row_key::{RowKey, RowKeyBuilder};

@@ -701,6 +701,7 @@ mod tests {
         let entry_arc = Arc::new(crate::registry::MemTableEntry {
             memtable: crate::memtable::MemTable::new(),
             shadow_dirty: std::sync::atomic::AtomicBool::new(false),
+            overlay_memo: parking_lot::RwLock::new(None),
         });
         let mt = &entry_arc.memtable;
 

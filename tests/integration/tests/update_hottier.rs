@@ -677,6 +677,234 @@ async fn rmw_cross_column() {
     assert_eq!(count_rows(&sess, "c").await, 2);
 }
 
+// ── Tests: batched multi-key expression eval (write-time batching) ────────────
+//
+// The hot-tier UPDATE fast path evaluates a multi-key expression SET in ONE
+// `apply_assignments` call over the concatenated pre-images (instead of one
+// fresh DataFusion SessionContext per key). These tests pin that the batched
+// post-images are identical to the slow (cold copy-on-write) path — the
+// semantics oracle — across CASE/arithmetic, jsonb_set, and NULL pre-images,
+// at the full `SMALL_BULK_FASTPATH_CAP`-sized key count the IN-list shape
+// routes through the overlay.
+
+/// 64-key expression UPDATE (CASE + arithmetic) through the fast path must
+/// produce row-for-row identical results to the same UPDATE forced down the
+/// slow path (`BASIN_HOTTIER_FASTPATH_DISABLE=1`) on an identically seeded
+/// twin table.
+#[tokio::test]
+async fn rmw_bulk_64_keys_expr_matches_slow_path() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = open(&eng).await;
+    seed(&sess, "tf", 70).await;
+    seed(&sess, "ts", 70).await;
+
+    let in_list = (1..=64).map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+    let set = "val = CASE WHEN val > 320 THEN val * 2 ELSE val + 1 END";
+    with_fastpath_on(exec(
+        &sess,
+        &format!("UPDATE tf SET {set} WHERE id IN ({in_list})"),
+    ))
+    .await;
+    with_fastpath_off(exec(
+        &sess,
+        &format!("UPDATE ts SET {set} WHERE id IN ({in_list})"),
+    ))
+    .await;
+
+    let fast = all_rows(&sess, "tf").await;
+    let slow = all_rows(&sess, "ts").await;
+    assert_eq!(
+        fast, slow,
+        "64-key batched expr eval must match the cold (slow) path row-for-row"
+    );
+    // Independent expectation so a shared bug can't hide: seed val is i*10;
+    // i ≤ 32 → 320-or-less → +1; i ≥ 33 → ×2; i > 64 untouched.
+    let expected: Vec<(i64, i64)> = (1..=70)
+        .map(|i| {
+            let v = i * 10;
+            let nv = if i > 64 {
+                v
+            } else if v > 320 {
+                v * 2
+            } else {
+                v + 1
+            };
+            (i, nv)
+        })
+        .collect();
+    assert_eq!(fast, expected, "batched CASE/arithmetic post-images");
+    assert_eq!(count_rows(&sess, "tf").await, 70);
+}
+
+/// Multi-key UPDATE assigning TWO expression columns in one statement —
+/// `CASE`+arithmetic on an integer column AND `jsonb_set` on a JSONB column —
+/// must match the slow path exactly (values and JSON documents).
+#[tokio::test]
+async fn rmw_bulk_multi_expr_jsonb_case_arith_matches_slow_path() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = open(&eng).await;
+    for t in ["jf", "js"] {
+        exec(
+            &sess,
+            &format!("CREATE TABLE {t} (id BIGINT NOT NULL PRIMARY KEY, val BIGINT, payload JSONB)"),
+        )
+        .await;
+        for i in 1..=8 {
+            exec(
+                &sess,
+                &format!(
+                    "INSERT INTO {t} (id, val, payload) VALUES ({i}, {}, '{{\"a\":{i},\"tag\":\"x\"}}')",
+                    i * 10
+                ),
+            )
+            .await;
+        }
+    }
+
+    let set = "val = CASE WHEN val > 45 THEN val * 2 ELSE val + 1 END, \
+               payload = jsonb_set(payload, '{a}', '99')";
+    with_fastpath_on(exec(
+        &sess,
+        &format!("UPDATE jf SET {set} WHERE id IN (1, 2, 3, 4, 5, 6, 7, 8)"),
+    ))
+    .await;
+    with_fastpath_off(exec(
+        &sess,
+        &format!("UPDATE js SET {set} WHERE id IN (1, 2, 3, 4, 5, 6, 7, 8)"),
+    ))
+    .await;
+
+    for i in 1..=8 {
+        let vf = scalar_at(&sess, "jf", "val", i).await;
+        let vs = scalar_at(&sess, "js", "val", i).await;
+        assert_eq!(vf, vs, "id={i}: fast val must match slow val");
+        let expected = if i * 10 > 45 { i * 20 } else { i * 10 + 1 };
+        assert_eq!(vf, Some(expected), "id={i}: CASE/arith post-image");
+
+        let pf = payload_json(&sess, "jf", i).await;
+        let ps = payload_json(&sess, "js", i).await;
+        assert_eq!(pf, ps, "id={i}: fast payload must match slow payload");
+        assert_eq!(
+            pf,
+            serde_json::json!({"a": 99, "tag": "x"}),
+            "id={i}: jsonb_set must replace a and keep tag"
+        );
+    }
+    assert_eq!(count_rows(&sess, "jf").await, 8);
+}
+
+/// Fetch the full `payload` JSONB document for one row as a serde_json value.
+/// Decodes whichever physical type the engine returns (LargeBinary / Binary /
+/// Utf8).
+async fn payload_json(sess: &ProjectSession, table: &str, id: i64) -> serde_json::Value {
+    use arrow_array::{BinaryArray, LargeBinaryArray, StringArray};
+    let sql = format!("SELECT payload FROM {table} WHERE id = {id}");
+    let batches = match sess.execute(&sql).await.unwrap() {
+        ExecResult::Rows { batches, .. } => batches,
+        other => panic!("expected rows for {sql:?}, got {other:?}"),
+    };
+    let b = batches
+        .iter()
+        .find(|b| b.num_rows() > 0)
+        .unwrap_or_else(|| panic!("no row for {sql:?}"));
+    assert_eq!(b.num_rows(), 1, "exactly one row for id={id}");
+    let col = b.column(0);
+    if let Some(arr) = col.as_any().downcast_ref::<LargeBinaryArray>() {
+        return serde_json::from_slice(arr.value(0)).expect("decode LargeBinary payload");
+    }
+    if let Some(arr) = col.as_any().downcast_ref::<BinaryArray>() {
+        return serde_json::from_slice(arr.value(0)).expect("decode Binary payload");
+    }
+    if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+        return serde_json::from_str(arr.value(0)).expect("decode Utf8 payload");
+    }
+    panic!("payload column unexpected type {:?}", col.data_type());
+}
+
+/// Mixed NULL pre-images in one multi-key expression UPDATE: `v = v + 1` over
+/// keys where some pre-images are NULL must keep NULL NULL (DataFusion null
+/// propagation) and increment the rest — identical to the slow path.
+#[tokio::test]
+async fn rmw_bulk_mixed_null_preimages_match_slow_path() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = open(&eng).await;
+    for t in ["nf", "ns"] {
+        exec(
+            &sess,
+            &format!("CREATE TABLE {t} (id BIGINT NOT NULL PRIMARY KEY, val BIGINT)"),
+        )
+        .await;
+        exec(
+            &sess,
+            &format!("INSERT INTO {t} (id, val) VALUES (1, NULL), (2, 7), (3, NULL), (4, 9), (5, 11)"),
+        )
+        .await;
+    }
+
+    with_fastpath_on(exec(&sess, "UPDATE nf SET val = val + 1 WHERE id IN (1, 2, 3, 4)")).await;
+    with_fastpath_off(exec(&sess, "UPDATE ns SET val = val + 1 WHERE id IN (1, 2, 3, 4)")).await;
+
+    for i in 1..=5 {
+        assert_eq!(
+            is_null_at(&sess, "nf", "val", i).await,
+            is_null_at(&sess, "ns", "val", i).await,
+            "id={i}: fast NULL-ness must match slow path"
+        );
+    }
+    assert_eq!(is_null_at(&sess, "nf", "val", 1).await, Some(true), "NULL+1 stays NULL");
+    assert_eq!(scalar_at(&sess, "nf", "val", 2).await, Some(8), "7+1");
+    assert_eq!(is_null_at(&sess, "nf", "val", 3).await, Some(true), "NULL+1 stays NULL");
+    assert_eq!(scalar_at(&sess, "nf", "val", 4).await, Some(10), "9+1");
+    assert_eq!(scalar_at(&sess, "nf", "val", 5).await, Some(11), "id=5 untouched");
+    assert_eq!(count_rows(&sess, "nf").await, 5);
+}
+
+// ── Tests: decoded-overlay memo invalidation ──────────────────────────────────
+
+/// UPDATE → SELECT (warms the per-table decoded-overlay memo) → UPDATE the
+/// SAME key → SELECT must see the new value: the second UPDATE bumps the
+/// memtable epoch while `update_count` stays at 1, so this exercises exactly
+/// the epoch component of the memo's `(epoch, update_count)` validity key.
+/// A third UPDATE on another key then moves `update_count` 1→2.
+#[tokio::test]
+async fn overlay_memo_epoch_invalidation_update_select_update() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = open(&eng).await;
+    seed(&sess, "t", 5).await;
+
+    with_fastpath_on(async {
+        exec(&sess, "UPDATE t SET val = 100 WHERE id = 2").await;
+        // Bulk SELECT decodes + memoizes the overlay (auto-commit path).
+        assert_eq!(
+            all_rows(&sess, "t").await,
+            vec![(1, 10), (2, 100), (3, 30), (4, 40), (5, 50)],
+            "first SELECT after the first override"
+        );
+        // Same-key overwrite: epoch bumps, update_count stays 1 — a stale
+        // epoch-insensitive memo would keep serving 100.
+        exec(&sess, "UPDATE t SET val = 200 WHERE id = 2").await;
+        assert_eq!(
+            all_rows(&sess, "t").await,
+            vec![(1, 10), (2, 200), (3, 30), (4, 40), (5, 50)],
+            "memo must invalidate on the same-key overwrite (epoch bump)"
+        );
+        assert_eq!(scalar_at(&sess, "t", "val", 2).await, Some(200));
+        // New-key override: update_count 1→2.
+        exec(&sess, "UPDATE t SET val = 300 WHERE id = 4").await;
+        assert_eq!(
+            all_rows(&sess, "t").await,
+            vec![(1, 10), (2, 200), (3, 30), (4, 300), (5, 50)],
+            "memo must invalidate when a second override is added"
+        );
+    })
+    .await;
+    assert_eq!(count_rows(&sess, "t").await, 5);
+}
+
 /// A non-allowlisted RMW expression (`SET v = abs(v)` — a function call) is NOT
 /// on the fast-path allowlist, so it falls through to the cold copy-on-write
 /// path. The result must still be correct.
