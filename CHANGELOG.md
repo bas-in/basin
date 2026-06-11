@@ -27,6 +27,15 @@ graduate to 1.0 and the standard SemVer guarantees.
   re-derived from measured reality at the same time (`f39b2d5`): non-collapse
   ≥ 0.7 at C=64 instead of a ≥ 1.5× headroom that never passed any recorded
   run on this hardware, including the run that introduced it.
+- **Measured: bulk INSERT now beats Postgres** — 10k rows: 36.9 ms vs PG
+  126.5 ms (3.4×); 1M rows: 2.05 s vs PG 9.62 s (4.7×), down from 262 s
+  three waves ago. The stack: literal-VALUES scanner + `::jsonb` admission +
+  statement-affine striping + the pre-parse path below (the rewrite-pipeline
+  scan over the multi-MB statement turned out to be the dominant hidden
+  cost). Disclosure: Basin acks before fsync (≤200 ms loss window); the PG
+  numbers are fsync-durable — the synchronous-commit knob is designed, not
+  yet shipped. Conditional UPDATE holds near-parity at both scales (4.5–4.8
+  ms vs PG 3.3–3.7); FOR UPDATE is even; RMW contention 8.6 ms vs 4.0.
 - **Pre-parse fast path for literal INSERTs** (`180c49c`): plain
   `INSERT INTO t [(cols)] VALUES (…)` statements skip the double
   whole-statement parse (libpg_query dispatch parse + a sqlparser AST whose

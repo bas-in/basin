@@ -173,23 +173,27 @@ Coverage: every ✅ row above is exercised by [`tests/integration/tests/feature_
 | HLL / t-digest sketches + `APPROX_COUNT_DISTINCT` / `APPROX_PERCENTILE` | ✅ | Phase 5.14.B1–B5 (`1c2387d`, `696cadb`, `fc00a41`, `4935115`). Writer-side per-column HLL and t-digest sketches stored in `DataFileRef`; `APPROX_COUNT_DISTINCT(col)` aggregate UDF (HLL); `APPROX_PERCENTILE(col, p)` aggregate UDF (t-digest). Differential tested at 1 M rows across file counts. |
 | Query-shape insights + `basin_stat_statements` view | ✅ | Phase 5.16.A–D (`33ae73f`…`94db513`). Canonical per-shape hash (xxh3_64); per-shape HDR histogram registry (bounded LRU, O(bytes) per project); scale-dependent regression tracking (per-(shape, log2-bucket) histograms + `top_regressions`); `basin_stat_statements` SQL view + OTLP export. |
 
-### OLTP latency profile (single-row ops at 1M rows, LocalFS, no index)
+### OLTP latency profile (1M rows, LocalFS, no index)
 
-After two work waves of OLTP scale fixes (transaction-scoped overlay, RMW SET
-fast path, pruned cold pre-image reads, write-through PK row cache, pinned in-tx
-reads), single-row operations at 1M rows are **ms-class** — measured locally, no
-index on either side:
+After three work waves of OLTP scale fixes (transaction-scoped overlay, RMW
+fast paths, pruned cold pre-image reads, write-through PK row cache, pinned
+in-tx reads, S4 residency, delta updates, the pre-parse INSERT path),
+single-row operations at 1M rows are **sub-ms-to-ms-class** and the bulk
+write shapes beat Postgres outright — measured locally on the 1M card,
+no index on either side (PG numbers in parens):
 
 | Operation | Basin p50 | Notes |
 |---|---|---|
-| Point query (PK `=`) | ~1.4 ms | sub-ms→low-ms; PG's PK btree is ~0.003 ms |
-| UPSERT (`ON CONFLICT DO UPDATE`) | ~0.6 ms | |
-| Single-row UPDATE | ~9 ms | hot-overlay + cold-path materialize; down from ~162 ms pre-wave |
-| `UPDATE … RETURNING` (single row) | ~0.9 ms | routed through the hot-tier fast path |
-| Read-modify-write contention (8 sessions) | ~11 ms / op | RMW SET fast path |
-| Point query + FK hydrate (events ⋈ users) | ~2.8–4.6 ms | point-join fast path |
-| Keyset pagination (`WHERE id > … ORDER BY LIMIT`) | ~5–18 ms | one file open per write stripe (a deployment constant, not O(N)) |
-| `SELECT … FOR UPDATE` + UPDATE (one txn) | ~4.5 ms | first-touch reads pin-and-serve on the fast path; FOR UPDATE locks are advisory (optimistic concurrency) |
+| **Bulk INSERT 1M rows (one statement stream)** | **2.05 s (PG 9.62 s — Basin 4.7× faster)** | pre-parse classifier + literal-VALUES scanner + statement-affine WAL striping; was 262 s three waves ago. Durability note: Basin acks before fsync (≤200 ms loss window); PG's number is fsync-durable |
+| Point query (PK `=`) | ~0.32 ms | PG's PK btree is ~3 µs; protocol+catalog floor analysis in the µs-read design |
+| UPSERT (`ON CONFLICT DO UPDATE`) | ~0.2 ms | |
+| Single-row UPDATE | ~1.5 ms | hot-overlay fast path |
+| Conditional UPDATE (`SET … CASE`, no WHERE) | ~4.8 ms (PG 3.7 — near parity) | delta updates: overlay writes, background-reconciled; was ~208 ms |
+| Read-modify-write contention (8 sessions) | ~8.6 ms / op (PG 4.0) | was ~80 ms |
+| Point query + FK hydrate (events ⋈ users) | ~0.6 ms | point-join fast path |
+| Keyset pagination (`WHERE id > … ORDER BY LIMIT`) | ~24 ms | the remaining big gap: one file open per write stripe with overlapping zone maps; stripe-merge compaction is the designed fix |
+| `SELECT … FOR UPDATE` + UPDATE (one txn) | ~1.9 ms (PG 1.9 — even) | first-touch reads pin-and-serve; FOR UPDATE locks are advisory (optimistic concurrency) |
+| Concurrent point reads (C=16, storage layer) | ~7,900 qps | was ~218 qps before the unfiltered-cache serving fix |
 
 Work-counter CI gates (`scale_invariants.rs`, `file_count_scaling.rs`,
 `1b76c7d`) assert these primitives do **bounded work** regardless of table size
