@@ -287,12 +287,13 @@ async fn write_batch_striped(
     table: &TableName,
     batch: RecordBatch,
     session_pid: i32,
+    durable: bool,
 ) -> Result<()> {
     let stripes = write_stripe_count();
     let n_rows = batch.num_rows();
     if stripes <= 1 || n_rows <= 1 {
         let handle = shard.get(project, &PartitionKey::default_key()).await?;
-        return handle.write_batch(table, batch).await;
+        return handle.write_batch_opts(table, batch, durable).await;
     }
 
     // `session_pid` is monotonic and never reused (ConnectionRegistry), so
@@ -301,7 +302,7 @@ async fn write_batch_striped(
     // cast can't explode the modulus.
     let part = stripe_partition_key((session_pid.max(0) as usize) % stripes);
     let handle = shard.get(project, &part).await?;
-    handle.write_batch(table, batch).await
+    handle.write_batch_opts(table, batch, durable).await
 }
 
 /// Dispatch `LISTEN` / `UNLISTEN` / `NOTIFY` through the engine's SQL
@@ -2386,6 +2387,15 @@ async fn dispatch_parsed_statement(
                 let d = crate::session::parse_pg_duration(&raw);
                 crate::session::set_session_idle_in_transaction_timeout(&sess.state, d);
                 Ok(ExecResult::Empty { tag: "SET".into() })
+            } else if var_name == "basin.synchronous_commit" || var_name == "synchronous_commit" {
+                // Durability knob: ON = group-committed fsync before ack;
+                // OFF (default) = RAM-buffered ack with the documented loss
+                // window. A typo must error rather than silently downgrade
+                // durability.
+                let raw = extract_set_string_value(&values);
+                let on = crate::session::parse_pg_bool(&raw)?;
+                crate::session::set_session_synchronous_commit(&sess.state, on);
+                Ok(ExecResult::Empty { tag: "SET".into() })
             } else {
                 // Silently accept unknown SET variables.
                 Ok(ExecResult::Empty { tag: "SET".into() })
@@ -3012,6 +3022,11 @@ async fn dispatch_parsed_statement(
                     crate::session::session_idle_in_transaction_timeout(&sess.state),
                 );
                 Ok(make_show_result("idle_in_transaction_session_timeout", &val))
+            } else if var_name == "basin_synchronous_commit" || var_name == "synchronous_commit" {
+                // SHOW joins dotted names with `_`, so `basin.synchronous_commit`
+                // arrives as `basin_synchronous_commit`.
+                let val = crate::session::show_synchronous_commit(&sess.state);
+                Ok(make_show_result("basin.synchronous_commit", val))
             } else {
                 // Silently return empty for other SHOW <var> forms so
                 // ORM startup queries don't hard-fail.
@@ -4666,7 +4681,7 @@ fn backfill_gin_batch(
 
 /// Feed one batch into the secondary B-tree registry, offsetting the row index
 /// by `file_row_off`. Mirrors `extract_entries_from_batch` + `insert_batch`.
-fn backfill_btree_batch(
+pub(crate) fn backfill_btree_batch(
     sess: &ProjectSession,
     table: &TableName,
     col_name: &str,
@@ -5038,6 +5053,141 @@ async fn try_insert_preparse(
     // Same execution seam the AST path uses after building its batch.
     // RETURNING is impossible here (gate 9 declines any trailing clause).
     Some(exec_insert_prebuilt(sess, &table, &meta, batch, false).await)
+}
+
+/// Count of INSERT executions served end-to-end by the bind-direct
+/// parameterized fast path (extended protocol Parse/Bind/Execute — the batch
+/// is built straight from the decoded bind values; no SQL text and no AST in
+/// the per-Execute loop). Test-visible instrumentation; relaxed ordering is
+/// fine for a monotone counter.
+pub(crate) static INSERTS_BIND_DIRECT_FASTPATH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Plan for the bind-direct parameterized-INSERT fast path, precomputed ONCE
+/// at prepare time (`prepared::build_bind_insert_plan`) for the plain shape
+/// `INSERT INTO t [(cols)] VALUES ($1, …)[, (…)]` where EVERY tuple cell is a
+/// bare `$N` placeholder.
+///
+/// The plan stores column NAMES, not schema indices: a prepared statement
+/// outlives DDL, so name→index resolution and every column-eligibility check
+/// re-run against the freshly loaded `TableMetadata` on each Execute
+/// (`values_fast::try_bind_insert_batch`), exactly like the pre-parse literal
+/// path re-runs its scanner on each statement.
+#[derive(Debug)]
+pub(crate) struct BindInsertPlan {
+    pub(crate) table: TableName,
+    /// Insert column list as written (empty = full width, declaration order).
+    pub(crate) columns: Vec<String>,
+    /// Per VALUES row: the zero-based parameter index for each tuple position.
+    pub(crate) rows: Vec<Vec<usize>>,
+}
+
+/// Bind-direct fast path for a parameterized prepared INSERT — the hook
+/// `prepared::execute_bound` runs BEFORE the AST / text bind routes when the
+/// prepared statement carries a [`BindInsertPlan`].
+///
+/// Returns:
+/// * `None` — decline; the caller falls back to the AST fast route (or the
+///   text route) which reproduces every behaviour, including in-transaction
+///   buffering and canonical errors. As with `try_insert_preparse`, a decline
+///   may have invalidated session caches exactly as the normal dispatch gate
+///   would for this INSERT, so a decline is never observable.
+/// * `Some(result)` — the statement was fully executed here.
+///
+/// Engagement gates mirror [`try_insert_preparse`] one-for-one (see the
+/// bookkeeping audit there — the same statement shape, just with bind values
+/// instead of literal tokens):
+/// 1. **Auto-commit only**: in-tx buffering and the 25P02 aborted-state guard
+///    stay with the AST/text fallback.
+/// 2. **No pending OVERRIDING** stash (peeked, not taken).
+/// 3. **Cache invalidation** replicating `dispatch_parsed_statement`'s
+///    `!stmt_keeps_cache` gate for an auto-commit INSERT — run BEFORE the
+///    table-meta load so this path never writes through a stale snapshot.
+/// 4. **Hypertable decline** (chunk bookkeeping needs parsed rows).
+/// 5. **Table meta load** (same `load_table_meta_cached_err` as `exec_insert`).
+/// 6. **Non-partitioned only** (`RangeMonthly` needs the per-row AST path).
+/// 7. **Bind-direct batch build** (`values_fast::try_bind_insert_batch`):
+///    re-resolves the plan's column names against the CURRENT schema, applies
+///    the identity/generated/default/NULL-fill eligibility gates, and declines
+///    on any param/column type doubt — the shared `ColAcc` accumulators make
+///    the produced batch byte-identical to the slow path's.
+///
+/// ON CONFLICT / RETURNING / OVERRIDING / multi-part table names are
+/// impossible here: `build_bind_insert_plan` declines them at prepare time, so
+/// statements carrying them never get a plan.
+pub(crate) async fn try_insert_bind_direct(
+    sess: &ProjectSession,
+    plan: &BindInsertPlan,
+    params: &[crate::prepared::ScalarParam],
+) -> Option<Result<ExecResult>> {
+    // Same session bookkeeping the text / AST entry points run at their top
+    // (this hook fires BEFORE either): keep the idle-in-txn reaper's activity
+    // clock fresh, and decline a reaped session so the fallback raises the
+    // canonical 25P03 error.
+    crate::session::touch_last_active(&sess.state);
+    if sess.reaped_flag.is_reaped() {
+        return None;
+    }
+
+    // Gate 1: auto-commit only.
+    if crate::session::tx_is_active(&sess.state) || crate::session::tx_is_aborted(&sess.state) {
+        return None;
+    }
+
+    // Gate 2: stale pending-OVERRIDING stash → decline (peek, don't take).
+    if sess
+        .state
+        .pending_overriding
+        .lock()
+        .ok()?
+        .is_some()
+    {
+        return None;
+    }
+
+    // Gate 3: replicate the dispatch-gate cache invalidation for an
+    // auto-commit INSERT (`!stmt_keeps_cache`). Running it on a statement that
+    // later declines is harmless — the fallback path re-runs it.
+    sess.state.table_meta_cache.invalidate_all();
+    sess.state.provider_cache.invalidate_all();
+    sess.state.head_probe_cache.invalidate_all();
+    sess.engine.pk_row_cache().invalidate_project(&sess.project);
+
+    // Gate 4: hypertable targets need chunk bookkeeping from parsed rows.
+    if sess
+        .engine
+        .hypertable_registry()
+        .time_column(&sess.project, plan.table.as_str())
+        .await
+        .is_some()
+    {
+        return None;
+    }
+
+    // Gate 5: table metadata (same loader + cache as `exec_insert`).
+    let meta = crate::session::load_table_meta_cached_err(sess, &plan.table)
+        .await
+        .ok()?;
+
+    // Gate 6: partitioned targets keep the per-row AST path.
+    if matches!(meta.partition_spec, PartitionSpec::RangeMonthly { .. }) {
+        return None;
+    }
+
+    // Gate 7: build the batch straight from the decoded bind values.
+    let batches = crate::values_fast::try_bind_insert_batch(
+        meta.schema.as_ref(),
+        &plan.columns,
+        &plan.rows,
+        params,
+    )?;
+    let batch = arrow::compute::concat_batches(&meta.schema, batches.iter()).ok()?;
+
+    INSERTS_BIND_DIRECT_FASTPATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // Same execution seam as the other INSERT fast paths. RETURNING is
+    // impossible here (the plan precompute declines it).
+    Some(exec_insert_prebuilt(sess, &plan.table, &meta, batch, false).await)
 }
 
 async fn exec_insert(
@@ -5507,7 +5657,14 @@ async fn exec_insert_prebuilt(
             // Stripe 0 == default_key so existing data + the read-side tail
             // probe (`shard.get(default_key).read`) keep working as-is.
             let _ = part; // suppress unused-var warning on the striping branch
-            write_batch_striped(shard, &sess.project, &table, batch.clone(), sess.session_pid)
+            write_batch_striped(
+                shard,
+                &sess.project,
+                &table,
+                batch.clone(),
+                sess.session_pid,
+                sess.synchronous_commit(),
+            )
                 .await?;
             // S4 commit 4a: the rows are durably acked by the shard WAL — keep
             // small OLTP inserts resident in the hot tier as CLEAN entries
@@ -6399,7 +6556,15 @@ pub(crate) async fn exec_ingest_batch(
         if !crate::session::tx_is_active(&sess.state) {
             // W4: statement-affine striping; see `write_batch_striped`.
             let _ = part;
-            write_batch_striped(shard, &sess.project, table, batch, sess.session_pid).await?;
+            write_batch_striped(
+                shard,
+                &sess.project,
+                table,
+                batch,
+                sess.session_pid,
+                sess.synchronous_commit(),
+            )
+            .await?;
             return Ok(row_count);
         }
     }
@@ -12236,6 +12401,264 @@ mod preparse_fastpath_tests {
             }
             other => panic!("expected Rows from RETURNING, got {other:?}"),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bind-direct parameterized-INSERT fast path — engagement / decline gates.
+// ---------------------------------------------------------------------------
+// Mirrors `preparse_fastpath_tests`: engagement is asserted by calling
+// `try_insert_bind_direct` directly (and via the prepared-statement API with
+// the process-global counter as a secondary signal). End-to-end equivalence
+// vs the simple path is covered by the integration suites
+// (`values_fast_ingest.rs` prepared variants, `prepared_insert_fast.rs`).
+#[cfg(test)]
+mod bind_direct_fastpath_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use arrow_array::Int64Array;
+    use basin_catalog::{Catalog, InMemoryCatalog};
+    use basin_common::{ProjectId, TableName};
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    use super::{BindInsertPlan, INSERTS_BIND_DIRECT_FASTPATH, try_insert_bind_direct};
+    use crate::prepared::ScalarParam;
+    use crate::{Engine, EngineConfig, ExecResult};
+
+    fn make_engine(dir: &TempDir) -> Engine {
+        let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
+            object_store: Arc::new(fs),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+        Engine::new(EngineConfig {
+            storage,
+            catalog,
+            shard: None,
+        })
+    }
+
+    fn count_from_result(res: ExecResult) -> i64 {
+        let batches = match res {
+            ExecResult::Rows { batches, .. } => batches,
+            ExecResult::Empty { tag } => panic!("expected Rows, got Empty({tag})"),
+        };
+        batches
+            .first()
+            .expect("no batch")
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count must be Int64")
+            .value(0)
+    }
+
+    fn plan_id_s() -> BindInsertPlan {
+        BindInsertPlan {
+            table: TableName::new("t").unwrap(),
+            columns: vec!["id".to_string(), "s".to_string()],
+            rows: vec![vec![0, 1]],
+        }
+    }
+
+    #[tokio::test]
+    async fn engages_on_direct_call() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, s TEXT)")
+            .await
+            .unwrap();
+
+        let before = INSERTS_BIND_DIRECT_FASTPATH.load(Ordering::Relaxed);
+        let plan = plan_id_s();
+        let res = try_insert_bind_direct(
+            &sess,
+            &plan,
+            &[ScalarParam::Int8(1), ScalarParam::Text("a".into())],
+        )
+        .await
+        .expect("bind-direct must engage on the plain parameterized shape");
+        match res.expect("engaged insert must succeed") {
+            ExecResult::Empty { tag } => assert_eq!(tag, "INSERT 0 1"),
+            other => panic!("expected INSERT tag, got {other:?}"),
+        }
+        // ≥ 1, not == 1: other tests in this binary bump the global counter.
+        assert!(
+            INSERTS_BIND_DIRECT_FASTPATH.load(Ordering::Relaxed) > before,
+            "engagement counter must advance"
+        );
+        let n = count_from_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
+        assert_eq!(n, 1, "engaged row must be visible to the next SELECT");
+    }
+
+    #[tokio::test]
+    async fn engages_via_prepared_api() {
+        // The real hook site: prepare → bind → execute_bound. The prepared
+        // template gets a bind-direct plan at prepare time and every Execute
+        // routes through `try_insert_bind_direct`.
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, s TEXT)")
+            .await
+            .unwrap();
+
+        let before = INSERTS_BIND_DIRECT_FASTPATH.load(Ordering::Relaxed);
+        let (handle, _schema) = sess
+            .prepare("INSERT INTO t (id, s) VALUES ($1, $2)")
+            .await
+            .unwrap();
+        for i in 0..3_i64 {
+            let bound = sess
+                .bind(
+                    &handle,
+                    vec![ScalarParam::Int8(i), ScalarParam::Text(format!("row-{i}"))],
+                )
+                .await
+                .unwrap();
+            match sess.execute_bound(bound).await.unwrap() {
+                ExecResult::Empty { tag } => assert_eq!(tag, "INSERT 0 1"),
+                other => panic!("expected INSERT tag, got {other:?}"),
+            }
+        }
+        assert!(
+            INSERTS_BIND_DIRECT_FASTPATH.load(Ordering::Relaxed) >= before + 3,
+            "all three Executes must take the bind-direct path"
+        );
+        let n = count_from_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
+        assert_eq!(n, 3);
+    }
+
+    #[tokio::test]
+    async fn declines_inside_explicit_transaction_with_working_fallback() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, s TEXT)")
+            .await
+            .unwrap();
+        let (handle, _schema) = sess
+            .prepare("INSERT INTO t (id, s) VALUES ($1, $2)")
+            .await
+            .unwrap();
+
+        sess.execute("BEGIN").await.unwrap();
+        // Direct call: auto-commit-only gate declines.
+        let plan = plan_id_s();
+        assert!(
+            try_insert_bind_direct(
+                &sess,
+                &plan,
+                &[ScalarParam::Int8(1), ScalarParam::Text("a".into())],
+            )
+            .await
+            .is_none(),
+            "bind-direct path is auto-commit-only"
+        );
+        // The prepared API still inserts via the AST fallback (in-tx buffering).
+        let bound = sess
+            .bind(
+                &handle,
+                vec![ScalarParam::Int8(1), ScalarParam::Text("a".into())],
+            )
+            .await
+            .unwrap();
+        sess.execute_bound(bound).await.unwrap();
+        sess.execute("COMMIT").await.unwrap();
+        let n = count_from_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
+        assert_eq!(n, 1, "fallback in-tx insert must land at COMMIT");
+    }
+
+    #[tokio::test]
+    async fn declines_on_schema_or_param_mismatch() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, s TEXT)")
+            .await
+            .unwrap();
+
+        // Unknown column (e.g. the table was re-created since Parse) → decline.
+        let stale = BindInsertPlan {
+            table: TableName::new("t").unwrap(),
+            columns: vec!["nope".to_string()],
+            rows: vec![vec![0]],
+        };
+        assert!(
+            try_insert_bind_direct(&sess, &stale, &[ScalarParam::Int8(1)])
+                .await
+                .is_none(),
+            "unknown column must decline"
+        );
+        // Out-of-grammar param (bytea) → decline.
+        let plan = plan_id_s();
+        assert!(
+            try_insert_bind_direct(
+                &sess,
+                &plan,
+                &[ScalarParam::Int8(1), ScalarParam::Bytea(vec![1, 2])],
+            )
+            .await
+            .is_none(),
+            "bytea param must decline"
+        );
+        // Missing table → decline (the fallback owns the canonical error).
+        let missing = BindInsertPlan {
+            table: TableName::new("absent").unwrap(),
+            columns: vec![],
+            rows: vec![vec![0]],
+        };
+        assert!(
+            try_insert_bind_direct(&sess, &missing, &[ScalarParam::Int8(1)])
+                .await
+                .is_none(),
+            "missing table must decline"
+        );
+        // Nothing was written by the declined probes.
+        let n = count_from_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn prepared_literal_insert_routes_through_preparse() {
+        // Extended-protocol shape 1: a zero-parameter literal multi-row INSERT
+        // prepared once must execute through the pre-parse scanner path
+        // (`try_insert_preparse`), not by cloning a cached AST.
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, s TEXT)")
+            .await
+            .unwrap();
+
+        let before = super::INSERTS_PREPARSE_FASTPATH.load(Ordering::Relaxed);
+        let (handle, schema) = sess
+            .prepare("INSERT INTO t (id, s) VALUES (1, 'a'), (2, 'b''c'), (3, NULL)")
+            .await
+            .unwrap();
+        assert!(schema.param_types.is_empty(), "no parameters expected");
+        let bound = sess.bind(&handle, vec![]).await.unwrap();
+        match sess.execute_bound(bound).await.unwrap() {
+            ExecResult::Empty { tag } => assert_eq!(tag, "INSERT 0 3"),
+            other => panic!("expected INSERT tag, got {other:?}"),
+        }
+        assert!(
+            super::INSERTS_PREPARSE_FASTPATH.load(Ordering::Relaxed) > before,
+            "prepared literal INSERT must engage the pre-parse scanner path"
+        );
+        // Executing the same prepared statement again re-runs the scanner and
+        // hits the PK constraint — identical to re-sending the simple query.
+        let bound = sess.bind(&handle, vec![]).await.unwrap();
+        let err = sess.execute_bound(bound).await;
+        assert!(err.is_err(), "duplicate PK re-execute must fail");
+        let n = count_from_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
+        assert_eq!(n, 3);
     }
 }
 

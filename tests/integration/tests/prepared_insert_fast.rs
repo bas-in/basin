@@ -471,3 +471,297 @@ async fn timing_prepared_vs_simple_insert() {
         simple_p50 as f64 / prepared_p50.max(1) as f64
     );
 }
+
+// =============================================================================
+// 9. Prepared LITERAL multi-row INSERT (zero parameters) — extended-protocol
+//    shape 1. Some ORMs batch by interpolating literals into ONE statement and
+//    then PREPARE/EXECUTE it. The 10k-row prepared Execute must produce rows
+//    identical to the same statement through the simple protocol, and a
+//    re-Execute of the same statement must hit the PK constraint exactly like
+//    re-sending the simple statement.
+// =============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepared_literal_10k_insert_matches_simple() {
+    let server = start_server().await;
+    let client = connect(server.addr).await;
+    for t in ["lit_prep", "lit_simple"] {
+        client
+            .simple_query(&format!(
+                "CREATE TABLE {t} (id BIGINT NOT NULL PRIMARY KEY, label TEXT, score BIGINT)"
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("create {t}: {e}"));
+    }
+
+    let n = 10_000usize;
+    let tuples = (0..n)
+        .map(|i| format!("({i}, 'it''s-{i}', {})", i * 3))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // Simple protocol.
+    client
+        .simple_query(&format!(
+            "INSERT INTO lit_simple (id, label, score) VALUES {tuples}"
+        ))
+        .await
+        .expect("simple literal insert");
+
+    // Extended protocol: PREPARE once, EXECUTE once (zero params).
+    let stmt = client
+        .prepare(&format!(
+            "INSERT INTO lit_prep (id, label, score) VALUES {tuples}"
+        ))
+        .await
+        .expect("prepare literal insert");
+    assert_eq!(stmt.params().len(), 0, "literal statement has no parameters");
+    let affected = client
+        .execute(&stmt, &[])
+        .await
+        .expect("execute prepared literal insert");
+    assert_eq!(affected as usize, n);
+
+    // Equivalence: both tables hold identical rows.
+    let rows = client
+        .query(
+            "SELECT p.id, p.label, p.score, s.label, s.score \
+             FROM lit_prep p JOIN lit_simple s ON p.id = s.id ORDER BY p.id",
+            &[],
+        )
+        .await
+        .expect("join read-back");
+    assert_eq!(rows.len(), n, "every prepared row must match a simple row");
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(row.get::<_, i64>(0), i as i64);
+        assert_eq!(row.get::<_, &str>(1), row.get::<_, &str>(3));
+        assert_eq!(row.get::<_, i64>(2), row.get::<_, i64>(4));
+        assert_eq!(row.get::<_, &str>(1), format!("it's-{i}"));
+    }
+
+    // Re-Execute of the same prepared literal statement re-inserts identical
+    // rows → PK violation, same as re-sending the simple statement.
+    let err = client.execute(&stmt, &[]).await;
+    assert!(err.is_err(), "duplicate PK re-execute must fail");
+    let count = client
+        .query_one("SELECT count(*) FROM lit_prep", &[])
+        .await
+        .expect("count");
+    assert_eq!(count.get::<_, i64>(0), n as i64);
+}
+
+// =============================================================================
+// 10. Parameterized INSERT with JSONB + TIMESTAMPTZ binary params — the
+//     bind-direct batch builder must round-trip the binary wire formats the
+//     real drivers send (JSONB v1 framing, PG-epoch timestamps), and the
+//     stored rows must equal a simple-protocol literal control row.
+// =============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepared_insert_jsonb_timestamptz_binary_params() {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let server = start_server().await;
+    let client = connect(server.addr).await;
+    client
+        .simple_query(
+            "CREATE TABLE docs2 (id BIGINT NOT NULL PRIMARY KEY, \
+             doc JSONB NOT NULL, at TIMESTAMPTZ NOT NULL)",
+        )
+        .await
+        .expect("create docs2");
+
+    let stmt = client
+        .prepare("INSERT INTO docs2 (id, doc, at) VALUES ($1, $2, $3)")
+        .await
+        .expect("prepare");
+
+    // 2026-01-02 03:04:05.123456 UTC, microsecond precision.
+    let at = UNIX_EPOCH + Duration::from_micros(1_767_323_045_123_456);
+    let doc = serde_json::json!({"k": "v", "n": 42, "arr": [1, 2, 3], "obj": {"b": 2, "a": 1}});
+    for i in 0..5_i64 {
+        let n = client
+            .execute(&stmt, &[&i, &doc, &at])
+            .await
+            .unwrap_or_else(|e| panic!("binary-param insert {i}: {e}"));
+        assert_eq!(n, 1);
+    }
+
+    // Control row via the simple protocol with equivalent literals.
+    client
+        .simple_query(
+            "INSERT INTO docs2 (id, doc, at) VALUES \
+             (100, '{\"k\":\"v\",\"n\":42,\"arr\":[1,2,3],\"obj\":{\"b\":2,\"a\":1}}', \
+              '2026-01-02 03:04:05.123456+00')",
+        )
+        .await
+        .expect("simple control insert");
+
+    let rows = client
+        .query("SELECT id, doc, at FROM docs2 ORDER BY id", &[])
+        .await
+        .expect("read back");
+    assert_eq!(rows.len(), 6);
+    let control_doc: serde_json::Value = rows[5].get(1);
+    let control_at: std::time::SystemTime = rows[5].get(2);
+    for row in &rows[..5] {
+        let got_doc: serde_json::Value = row.get(1);
+        assert_eq!(got_doc, doc, "JSONB binary param round-trip");
+        assert_eq!(got_doc, control_doc, "prepared JSONB equals simple literal");
+        let got_at: std::time::SystemTime = row.get(2);
+        assert_eq!(got_at, at, "TIMESTAMPTZ binary param round-trip");
+        assert_eq!(got_at, control_at, "prepared ts equals simple literal");
+    }
+}
+
+// =============================================================================
+// 11. UUID-typed column: the bind-direct builder declines (UUID columns carry
+//     validation outside the fast set), so the prepared INSERT must still work
+//     via the AST/text fallback — with a native binary UUID param.
+// =============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepared_insert_uuid_param_falls_back_and_round_trips() {
+    let server = start_server().await;
+    let client = connect(server.addr).await;
+    client
+        .simple_query("CREATE TABLE keyed (id BIGINT NOT NULL PRIMARY KEY, u UUID NOT NULL)")
+        .await
+        .expect("create keyed");
+
+    let stmt = client
+        .prepare("INSERT INTO keyed (id, u) VALUES ($1, $2)")
+        .await
+        .expect("prepare");
+    let ids: Vec<uuid::Uuid> = (0..3).map(|_| uuid::Uuid::new_v4()).collect();
+    for (i, u) in ids.iter().enumerate() {
+        client
+            .execute(&stmt, &[&(i as i64), u])
+            .await
+            .unwrap_or_else(|e| panic!("uuid insert {i}: {e}"));
+    }
+
+    let rows = client
+        .query("SELECT id, u FROM keyed ORDER BY id", &[])
+        .await
+        .expect("read back");
+    assert_eq!(rows.len(), 3);
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(row.get::<_, i64>(0), i as i64);
+        assert_eq!(row.get::<_, uuid::Uuid>(1), ids[i], "UUID round-trip");
+    }
+}
+
+// =============================================================================
+// 12. Multi-row parameterized template (one statement, many placeholder
+//     tuples) — extended-protocol shape 2 with rows > 1.
+// =============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepared_multi_row_param_template() {
+    let server = start_server().await;
+    let client = connect(server.addr).await;
+    seed_events(&client).await;
+
+    let stmt = client
+        .prepare("INSERT INTO events (id, label, score) VALUES ($1, $2, $3), ($4, $5, $6)")
+        .await
+        .expect("prepare 2-row template");
+    for batch in 0..10_i64 {
+        let (a, b) = (batch * 2, batch * 2 + 1);
+        let n = client
+            .execute(
+                &stmt,
+                &[&a, &format!("m-{a}"), &(a * 7), &b, &format!("m-{b}"), &(b * 7)],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("2-row execute {batch}: {e}"));
+        assert_eq!(n, 2, "each Execute inserts both tuple rows");
+    }
+
+    let rows = client
+        .query("SELECT id, label, score FROM events ORDER BY id", &[])
+        .await
+        .expect("read back");
+    assert_eq!(rows.len(), 20);
+    for (i, row) in rows.iter().enumerate() {
+        let i = i as i64;
+        assert_eq!(row.get::<_, i64>(0), i);
+        assert_eq!(row.get::<_, &str>(1), format!("m-{i}"));
+        assert_eq!(row.get::<_, i64>(2), i * 7);
+    }
+}
+
+// =============================================================================
+// 13. Decline shapes through the wire: ON CONFLICT keeps upsert semantics and
+//     an explicit transaction keeps atomicity (bind-direct is auto-commit
+//     only — a ROLLBACK must drop the prepared inserts).
+// =============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepared_insert_declines_still_correct() {
+    let server = start_server().await;
+    let client = connect(server.addr).await;
+    seed_events(&client).await;
+
+    // ON CONFLICT DO UPDATE: no bind-direct plan; upsert semantics preserved.
+    let upsert = client
+        .prepare(
+            "INSERT INTO events (id, label, score) VALUES ($1, $2, $3) \
+             ON CONFLICT (id) DO UPDATE SET label = EXCLUDED.label, score = EXCLUDED.score",
+        )
+        .await
+        .expect("prepare upsert");
+    client
+        .execute(&upsert, &[&1_i64, &"first", &10_i64])
+        .await
+        .expect("insert");
+    client
+        .execute(&upsert, &[&1_i64, &"second", &20_i64])
+        .await
+        .expect("upsert");
+    let row = client
+        .query_one("SELECT label, score FROM events WHERE id = $1", &[&1_i64])
+        .await
+        .expect("read");
+    assert_eq!(row.get::<_, &str>(0), "second");
+    assert_eq!(row.get::<_, i64>(1), 20);
+
+    // Explicit transaction: prepared inserts buffer in-tx; ROLLBACK drops them.
+    let ins = client
+        .prepare("INSERT INTO events (id, label, score) VALUES ($1, $2, $3)")
+        .await
+        .expect("prepare ins");
+    client.simple_query("BEGIN").await.expect("begin");
+    for i in 100..103_i64 {
+        client
+            .execute(&ins, &[&i, &"tx", &i])
+            .await
+            .unwrap_or_else(|e| panic!("in-tx insert {i}: {e}"));
+    }
+    client.simple_query("ROLLBACK").await.expect("rollback");
+    let count = client
+        .query_one("SELECT count(*) FROM events WHERE id >= $1", &[&100_i64])
+        .await
+        .expect("count");
+    assert_eq!(
+        count.get::<_, i64>(0),
+        0,
+        "ROLLBACK must drop in-tx prepared inserts (auto-commit-only gate)"
+    );
+
+    // And a COMMIT keeps them.
+    client.simple_query("BEGIN").await.expect("begin");
+    for i in 100..103_i64 {
+        client
+            .execute(&ins, &[&i, &"tx", &i])
+            .await
+            .unwrap_or_else(|e| panic!("in-tx insert {i}: {e}"));
+    }
+    client.simple_query("COMMIT").await.expect("commit");
+    let count = client
+        .query_one("SELECT count(*) FROM events WHERE id >= $1", &[&100_i64])
+        .await
+        .expect("count");
+    assert_eq!(count.get::<_, i64>(0), 3);
+}

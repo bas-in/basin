@@ -7,6 +7,24 @@
 //! and no DataFusion-level parameter binding — the goal here is correctness
 //! and unblocking every Postgres driver, not throughput.
 //!
+//! Layered on top of that baseline are three per-`Execute` fast paths, each
+//! with the text route as its guaranteed fallback:
+//!
+//! 1. **AST cache** (perf-w-prepared): INSERT / plain-SELECT templates whose
+//!    text the rewrite pipeline doesn't touch are parsed once at prepare;
+//!    each bind substitutes values into a clone and dispatches the
+//!    `Statement` directly (no per-`Execute` re-parse).
+//! 2. **Bind-direct INSERT** ([`build_bind_insert_plan`] →
+//!    `executor::try_insert_bind_direct`): plain all-placeholder
+//!    `INSERT … VALUES ($1, …)` templates additionally precompute a
+//!    (table, columns, param→tuple-position) plan; each `Execute` builds the
+//!    Arrow batch straight from the decoded bind values — no SQL text and no
+//!    AST in the loop.
+//! 3. **Prepared-literal INSERT**: zero-parameter templates the values_fast
+//!    classifier accepts skip prepare-time parsing entirely and execute
+//!    through the text route's pre-parse scanner hook each time (cheaper
+//!    than cloning + re-rendering a multi-MB literal AST per `Execute`).
+//!
 //! ## Why a custom scanner instead of `sqlparser`
 //!
 //! sqlparser doesn't model PostgreSQL `$N` placeholders as a first-class
@@ -144,6 +162,13 @@ pub struct BoundStatement {
     /// `None` falls back to executing `sql` through the normal text route, so
     /// the slow path is unchanged.
     pub(crate) fast_ast: Option<Statement>,
+    /// Bind-direct INSERT fast path (extended-protocol shape 2): the
+    /// prepare-time plan plus the decoded bind values, carried through so
+    /// `execute_bound` can build the RecordBatch directly
+    /// (`executor::try_insert_bind_direct`) without touching `fast_ast` or
+    /// `sql`. `None`, or an execute-time decline, falls through to the
+    /// `fast_ast` / text routes above unchanged.
+    pub(crate) bind_direct: Option<(Arc<crate::executor::BindInsertPlan>, Vec<ScalarParam>)>,
 }
 
 impl BoundStatement {
@@ -167,6 +192,7 @@ impl BoundStatement {
             handle: StatementHandle::new(),
             sql,
             fast_ast: None,
+            bind_direct: None,
         }
     }
 }
@@ -196,6 +222,14 @@ struct PreparedEntry {
     ///     what the text path would have dispatched.
     /// Any `false` here means the bind path falls back to the text route.
     ast_fast_ok: bool,
+    /// Bind-direct parameterized-INSERT plan (extended-protocol shape 2),
+    /// precomputed by [`build_bind_insert_plan`] when the template is an
+    /// AST-fast-eligible `INSERT INTO t [(cols)] VALUES ($1, …)[, (…)]` with
+    /// EVERY tuple cell a bare placeholder. `Some` lets `execute_bound` build
+    /// the RecordBatch straight from the decoded bind values
+    /// (`executor::try_insert_bind_direct`); the AST/text routes remain the
+    /// fallback when the execute-time gates decline.
+    bind_plan: Option<Arc<crate::executor::BindInsertPlan>>,
 }
 
 impl PreparedRegistry {
@@ -240,13 +274,40 @@ pub(crate) async fn prepare(
         }
     }
 
+    // Prepared-literal INSERT fast path (perf-w-prepared, extended-protocol
+    // shape 1): a ZERO-parameter template whose header the O(prefix)
+    // classifier accepts is a literal bulk INSERT prepared once and Executed
+    // as-is (some ORMs batch by interpolating literals into one statement and
+    // then PREPARE/EXECUTE it). For these we skip every O(statement) cost in
+    // this function — the schema probe, the full-statement sqlparser parse,
+    // and the rewrite-pipeline no-op probe (each walks a potentially multi-MB
+    // text) — and deliberately leave `ast_fast_ok = false`. Each Execute then
+    // takes the text route, where `executor::execute`'s pre-parse hook
+    // re-classifies the stored SQL (O(prefix)) and runs the values_fast tuple
+    // scanner fresh into `exec_insert_prebuilt`, so neither whole-statement
+    // parser ever runs. Caching the parsed AST instead would be strictly
+    // WORSE: the bind fast path clones the (multi-MB) tree and re-renders it
+    // for the leftover-placeholder guard on every Execute. Any shape the
+    // scanner later declines (trailing RETURNING / ON CONFLICT, unsupported
+    // literals, …) falls through `execute`'s normal double-parse path
+    // unchanged. A template WITH parameters never takes this route
+    // (`placeholder_count` gate) — the classifier verdict is only trusted for
+    // pure-literal statements.
+    let literal_fast =
+        placeholder_count == 0 && crate::values_fast::classify_literal_insert(sql).is_some();
+
     // Try to discover the result schema by planning the SQL with typed
     // placeholders. DataFusion 44 doesn't accept `$N`, so we substitute
     // representative literal values matching the inferred types. If the plan
     // fails we fall back to an empty column list — drivers will discover the
-    // schema at execute time.
-    let probe_sql = substitute_for_probe(sql, &param_types);
-    let columns = probe_schema(sess, &probe_sql).await.unwrap_or_default();
+    // schema at execute time. (Literal-fast INSERTs skip the probe: it would
+    // return no columns anyway, after an O(statement) substitution pass.)
+    let columns = if literal_fast {
+        Vec::new()
+    } else {
+        let probe_sql = substitute_for_probe(sql, &param_types);
+        probe_schema(sess, &probe_sql).await.unwrap_or_default()
+    };
 
     let schema = StatementSchema {
         param_types,
@@ -274,16 +335,36 @@ pub(crate) async fn prepare(
     //      exclude the entire common INSERT case.
     // Anything not eligible leaves `ast_fast_ok = false` and binds through the
     // unchanged text-substitution path.
-    let dialect = PostgreSqlDialect {};
-    let ast: Option<Arc<Statement>> = match Parser::parse_sql(&dialect, sql) {
-        Ok(mut stmts) if stmts.len() == 1 => Some(Arc::new(stmts.pop().unwrap())),
-        _ => None,
+    //
+    // On top of the AST cache, an AST-fast-eligible parameterized INSERT of
+    // the plain all-placeholder shape additionally gets a bind-direct plan
+    // (extended-protocol shape 2, see `build_bind_insert_plan`): at Execute,
+    // the executor builds the RecordBatch straight from the decoded bind
+    // values, skipping AST substitution and the whole AST→rows→batch
+    // pipeline. The AST stays cached as the fallback for when the bind-direct
+    // execute-time gates decline (open transaction, schema drift, …).
+    let (ast, ast_fast_ok, bind_plan) = if literal_fast {
+        (None, false, None)
+    } else {
+        let dialect = PostgreSqlDialect {};
+        let ast: Option<Arc<Statement>> = match Parser::parse_sql(&dialect, sql) {
+            Ok(mut stmts) if stmts.len() == 1 => Some(Arc::new(stmts.pop().unwrap())),
+            _ => None,
+        };
+        let kind_ok = ast
+            .as_ref()
+            .map(|s| matches!(s.as_ref(), Statement::Insert(_) | Statement::Query(_)))
+            .unwrap_or(false);
+        let ast_fast_ok = kind_ok && crate::executor::rewrite_pipeline_is_noop(sess, sql).await;
+        let bind_plan = if ast_fast_ok && placeholder_count > 0 {
+            ast.as_deref()
+                .and_then(|s| build_bind_insert_plan(s, placeholder_count))
+                .map(Arc::new)
+        } else {
+            None
+        };
+        (ast, ast_fast_ok, bind_plan)
     };
-    let kind_ok = ast
-        .as_ref()
-        .map(|s| matches!(s.as_ref(), Statement::Insert(_) | Statement::Query(_)))
-        .unwrap_or(false);
-    let ast_fast_ok = kind_ok && crate::executor::rewrite_pipeline_is_noop(sess, sql).await;
 
     let handle = StatementHandle::new();
     let entry = PreparedEntry {
@@ -292,6 +373,7 @@ pub(crate) async fn prepare(
         schema: schema.clone(),
         ast,
         ast_fast_ok,
+        bind_plan,
     };
     sess.state
         .prepared
@@ -300,6 +382,95 @@ pub(crate) async fn prepare(
         .await
         .insert(handle, entry);
     Ok((handle, schema))
+}
+
+/// Precompute the bind-direct INSERT plan (extended-protocol shape 2) for a
+/// template of the form `INSERT INTO t [(cols)] VALUES ($1, …)[, (…)]` where
+/// EVERY tuple cell is a bare `$N` placeholder — the dominant shape ORMs
+/// prepare. Returns `None` for any other shape; those keep the existing
+/// AST / text bind routes. Declines:
+///
+/// * ON CONFLICT / RETURNING / `PARTITION` / after-columns / table alias —
+///   the AST path owns those clauses (RETURNING in particular keeps its
+///   existing projection behaviour there);
+/// * a source that is not a bare `VALUES` body (CTEs, `INSERT … SELECT`,
+///   ORDER BY / LIMIT decorations);
+/// * any tuple cell that is not a bare placeholder (mixed literal/expression
+///   tuples are rare in prepared ORM output; the AST fast path serves them);
+/// * quoted column identifiers — the fast paths' case-insensitive name
+///   mapping must not be asked to replicate quoted-ident case semantics;
+/// * a schema-qualified table name, or a `$N` outside the declared range.
+///
+/// Everything schema-dependent (column resolution, identity / generated /
+/// default / type eligibility) is deliberately NOT checked here — the table
+/// can change between Parse and Execute, so those gates re-run per Execute in
+/// `executor::try_insert_bind_direct`.
+fn build_bind_insert_plan(
+    stmt: &Statement,
+    placeholder_count: usize,
+) -> Option<crate::executor::BindInsertPlan> {
+    let ins = match stmt {
+        Statement::Insert(i) => i,
+        _ => return None,
+    };
+    if ins.on.is_some()
+        || ins.returning.is_some()
+        || ins.partitioned.is_some()
+        || !ins.after_columns.is_empty()
+        || ins.table_alias.is_some()
+    {
+        return None;
+    }
+    let source = ins.source.as_ref()?;
+    // A bare VALUES body only — no CTE / ORDER BY / LIMIT decoration. (The
+    // slow path also reads only `source.body`, but stay conservative.)
+    if source.with.is_some() || source.order_by.is_some() || source.limit_clause.is_some() {
+        return None;
+    }
+    let values = match source.body.as_ref() {
+        SetExpr::Values(v) => v,
+        _ => return None,
+    };
+    if values.rows.is_empty() {
+        return None;
+    }
+    // Single-part table name only (`name_to_table` rejects qualified names).
+    let table = name_to_table(crate::pg_ast::insert_object_name(ins).ok()?).ok()?;
+    let mut columns = Vec::with_capacity(ins.columns.len());
+    for c in &ins.columns {
+        if c.quote_style.is_some() {
+            return None;
+        }
+        columns.push(c.value.clone());
+    }
+    let arity = if columns.is_empty() {
+        values.rows.first()?.len()
+    } else {
+        columns.len()
+    };
+    if arity == 0 {
+        return None;
+    }
+    let mut rows = Vec::with_capacity(values.rows.len());
+    for row in &values.rows {
+        if row.len() != arity {
+            return None;
+        }
+        let mut idxs = Vec::with_capacity(arity);
+        for cell in row {
+            let n = placeholder_index(cell)?;
+            if n == 0 || n > placeholder_count {
+                return None;
+            }
+            idxs.push(n - 1);
+        }
+        rows.push(idxs);
+    }
+    Some(crate::executor::BindInsertPlan {
+        table,
+        columns,
+        rows,
+    })
 }
 
 /// Best-effort placeholder type inference. Walks the parsed SQL looking for
@@ -1417,10 +1588,22 @@ pub(crate) async fn bind(
         None
     };
 
+    // Bind-direct INSERT fast path (extended-protocol shape 2): carry the
+    // prepare-time plan plus the decoded params through to `execute_bound`,
+    // which builds the RecordBatch straight from them. The substituted SQL
+    // and (when eligible) the substituted AST are still produced above — they
+    // are the fallback when the execute-time gates decline (open transaction,
+    // schema drift, unsupported param/column shape).
+    let bind_direct = entry
+        .bind_plan
+        .as_ref()
+        .map(|plan| (Arc::clone(plan), params));
+
     Ok(BoundStatement {
         handle: *handle,
         sql,
         fast_ast,
+        bind_direct,
     })
 }
 
@@ -1428,6 +1611,14 @@ pub(crate) async fn execute_bound(
     sess: &ProjectSession,
     bound: BoundStatement,
 ) -> Result<ExecResult> {
+    // Bind-direct INSERT fast path: build the batch straight from the decoded
+    // bind values. A `None` decline falls through to the AST / text routes,
+    // which reproduce every behaviour (in-tx buffering, canonical errors, …).
+    if let Some((plan, params)) = bound.bind_direct.as_ref() {
+        if let Some(result) = crate::executor::try_insert_bind_direct(sess, plan, params).await {
+            return result;
+        }
+    }
     if let Some(stmt) = bound.fast_ast {
         // Dispatch the pre-substituted AST without re-parsing. `bound.sql`
         // (the rendered text) is passed for logging and as the DataFusion
@@ -2233,6 +2424,69 @@ async fn probe_dml_cte_schema(sess: &ProjectSession, sql: &str) -> Option<Vec<Fi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_one(sql: &str) -> Statement {
+        let dialect = PostgreSqlDialect {};
+        let mut stmts = Parser::parse_sql(&dialect, sql).expect("parses");
+        assert_eq!(stmts.len(), 1);
+        stmts.pop().unwrap()
+    }
+
+    #[test]
+    fn bind_plan_single_row_all_placeholders() {
+        let stmt = parse_one("INSERT INTO t (a, b, c) VALUES ($1, $2, $3)");
+        let plan = build_bind_insert_plan(&stmt, 3).expect("plan");
+        assert_eq!(plan.table.as_str(), "t");
+        assert_eq!(plan.columns, vec!["a", "b", "c"]);
+        assert_eq!(plan.rows, vec![vec![0, 1, 2]]);
+    }
+
+    #[test]
+    fn bind_plan_multi_row_and_no_column_list() {
+        let stmt = parse_one("INSERT INTO t VALUES ($1, $2), ($3, $4)");
+        let plan = build_bind_insert_plan(&stmt, 4).expect("plan");
+        assert!(plan.columns.is_empty());
+        assert_eq!(plan.rows, vec![vec![0, 1], vec![2, 3]]);
+        // Repeated placeholder across rows is fine — same param feeds both.
+        let stmt = parse_one("INSERT INTO t (a, b) VALUES ($1, $2), ($1, $3)");
+        let plan = build_bind_insert_plan(&stmt, 3).expect("plan");
+        assert_eq!(plan.rows, vec![vec![0, 1], vec![0, 2]]);
+    }
+
+    #[test]
+    fn bind_plan_declines_out_of_scope_shapes() {
+        for (sql, n) in [
+            // Mixed literal cell → decline (AST path serves it).
+            ("INSERT INTO t (a, b) VALUES ($1, 'x')", 1),
+            // Expression cell.
+            ("INSERT INTO t (a) VALUES ($1 + 1)", 1),
+            // ON CONFLICT / RETURNING.
+            (
+                "INSERT INTO t (a) VALUES ($1) ON CONFLICT (a) DO NOTHING",
+                1,
+            ),
+            ("INSERT INTO t (a) VALUES ($1) RETURNING a", 1),
+            // INSERT … SELECT.
+            ("INSERT INTO t (a) SELECT $1", 1),
+            // Schema-qualified target.
+            ("INSERT INTO s.t (a) VALUES ($1)", 1),
+            // Quoted column ident → decline (case-fold semantics stay slow).
+            ("INSERT INTO t (\"A\") VALUES ($1)", 1),
+            // Placeholder out of declared range.
+            ("INSERT INTO t (a, b) VALUES ($1, $5)", 2),
+            // Ragged rows.
+            ("INSERT INTO t (a, b) VALUES ($1, $2), ($3)", 3),
+        ] {
+            let stmt = parse_one(sql);
+            assert!(
+                build_bind_insert_plan(&stmt, n).is_none(),
+                "must decline: {sql}"
+            );
+        }
+        // Non-INSERT statements never get a plan.
+        let stmt = parse_one("SELECT $1");
+        assert!(build_bind_insert_plan(&stmt, 1).is_none());
+    }
 
     #[test]
     fn scan_finds_basic_placeholders() {

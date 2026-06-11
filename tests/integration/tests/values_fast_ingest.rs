@@ -1200,3 +1200,362 @@ async fn values_fast_throughput_probe() {
     let r = select(&sess, "SELECT count(*) AS c FROM fast").await;
     assert_eq!(col_i64(&r, "c"), vec![Some(n as i64)]);
 }
+
+// ─── prepared-statement variants (extended-protocol seam) ───────────────────
+//
+// Real ORMs reach the engine through Parse/Bind/Execute, not simple-query.
+// These tests drive the SAME engine seam the pgwire extended path uses
+// (`ProjectSession::prepare` → `bind` → `execute_bound`) and pin two shapes:
+//
+// * Shape 1 — prepared LITERAL multi-row INSERT (zero parameters): must equal
+//   the identical statement through the simple `execute` path. At prepare
+//   time the classifier verdict short-circuits AST caching; each Execute
+//   re-runs the values_fast scanner on the stored SQL.
+// * Shape 2 — PARAMETERIZED INSERT executed N times: must equal N simple
+//   INSERTs carrying the equivalent literals (the bind-direct batch builder
+//   produces byte-identical Arrow via the shared ColAcc accumulators).
+//
+// Decline shapes (ON CONFLICT, explicit transaction, identity columns,
+// unsupported param kinds) must still work via the AST/text fallback.
+
+use basin_engine::ScalarParam;
+
+/// Shape 1: a 10k-row literal INSERT prepared once and Executed through the
+/// extended seam equals the same statement through the simple path.
+#[tokio::test]
+async fn prepared_literal_10k_equals_simple_path() {
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+
+    for t in ["simple_t", "prepared_t"] {
+        sess.execute(&format!(
+            "CREATE TABLE {t} (id BIGINT NOT NULL PRIMARY KEY, val DOUBLE PRECISION, \
+             name TEXT, flag BOOLEAN, payload JSONB)"
+        ))
+        .await
+        .unwrap();
+    }
+
+    let n = 10_000usize;
+    let tail = |_table: &str| {
+        let mut s = String::new();
+        for i in 0..n {
+            if i > 0 {
+                s.push_str(", ");
+            }
+            s.push_str(&format!(
+                "({i}, {}.{:02}, 'it''s-{i}', {}, '{{\"k\":{i}}}'::jsonb)",
+                i % 1000,
+                i % 100,
+                i % 2 == 0,
+            ));
+        }
+        s
+    };
+
+    // Simple path.
+    sess.execute(&format!(
+        "INSERT INTO simple_t (id, val, name, flag, payload) VALUES {}",
+        tail("simple_t")
+    ))
+    .await
+    .unwrap();
+
+    // Prepared / extended path: prepare once, Execute once.
+    let (handle, schema) = sess
+        .prepare(&format!(
+            "INSERT INTO prepared_t (id, val, name, flag, payload) VALUES {}",
+            tail("prepared_t")
+        ))
+        .await
+        .unwrap();
+    assert!(
+        schema.param_types.is_empty(),
+        "literal statement must report zero parameters"
+    );
+    let bound = sess.bind(&handle, vec![]).await.unwrap();
+    match sess.execute_bound(bound).await.unwrap() {
+        ExecResult::Empty { tag } => assert_eq!(tag, format!("INSERT 0 {n}")),
+        other => panic!("expected INSERT tag, got {other:?}"),
+    }
+
+    // Full equivalence, column by column.
+    let a = select(
+        &sess,
+        "SELECT id, val, name, flag, payload FROM simple_t ORDER BY id",
+    )
+    .await;
+    let b = select(
+        &sess,
+        "SELECT id, val, name, flag, payload FROM prepared_t ORDER BY id",
+    )
+    .await;
+    assert_eq!(total_rows(&a), n);
+    assert_eq!(total_rows(&b), n);
+    assert_eq!(col_i64(&a, "id"), col_i64(&b, "id"));
+    assert_eq!(col_f64(&a, "val"), col_f64(&b, "val"));
+    assert_eq!(col_str(&a, "name"), col_str(&b, "name"));
+    assert_eq!(col_bool(&a, "flag"), col_bool(&b, "flag"));
+    assert_eq!(col_jsonb_bytes(&a, "payload"), col_jsonb_bytes(&b, "payload"));
+
+    // Re-Executing the same prepared literal statement re-inserts the same
+    // rows — which must hit the PK constraint, exactly like re-sending the
+    // simple statement would.
+    let bound = sess.bind(&handle, vec![]).await.unwrap();
+    assert!(
+        sess.execute_bound(bound).await.is_err(),
+        "duplicate PK re-execute must fail like the simple path"
+    );
+    let c = select(&sess, "SELECT count(*) AS c FROM prepared_t").await;
+    assert_eq!(col_i64(&c, "c"), vec![Some(n as i64)]);
+}
+
+/// Shape 2: a parameterized INSERT (the dominant ORM shape) executed N times
+/// through the prepared seam equals N simple INSERTs with equivalent
+/// literals — including NULLs, apostrophes, JSONB and timestamp params.
+#[tokio::test]
+async fn prepared_param_inserts_equal_simple_inserts() {
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+
+    for t in ["simple_p", "prepared_p"] {
+        sess.execute(&format!(
+            "CREATE TABLE {t} (id BIGINT NOT NULL PRIMARY KEY, name TEXT, \
+             score DOUBLE PRECISION, ok BOOLEAN, doc JSONB, ts TIMESTAMPTZ)"
+        ))
+        .await
+        .unwrap();
+    }
+
+    let n = 50i64;
+    let ts_for = |i: i64| format!("2026-01-02 03:04:{:02}.123456", i % 60);
+
+    // Simple path: one literal INSERT per row.
+    for i in 0..n {
+        let name = if i % 7 == 0 {
+            "NULL".to_string()
+        } else {
+            format!("'it''s-{i}'")
+        };
+        let score = if i % 5 == 0 {
+            "NULL".to_string()
+        } else {
+            format!("{i}.25")
+        };
+        sess.execute(&format!(
+            "INSERT INTO simple_p (id, name, score, ok, doc, ts) VALUES \
+             ({i}, {name}, {score}, {}, '{{\"k\":{i},\"s\":\"v-{i}\"}}', '{}')",
+            i % 3 == 0,
+            ts_for(i),
+        ))
+        .await
+        .unwrap();
+    }
+
+    // Prepared path: prepare ONCE, bind+execute per row with typed params.
+    let (handle, _schema) = sess
+        .prepare("INSERT INTO prepared_p (id, name, score, ok, doc, ts) VALUES ($1, $2, $3, $4, $5, $6)")
+        .await
+        .unwrap();
+    for i in 0..n {
+        let name = if i % 7 == 0 {
+            ScalarParam::Null
+        } else {
+            ScalarParam::Text(format!("it's-{i}"))
+        };
+        let score = if i % 5 == 0 {
+            ScalarParam::Null
+        } else {
+            ScalarParam::Float8(i as f64 + 0.25)
+        };
+        let bound = sess
+            .bind(
+                &handle,
+                vec![
+                    ScalarParam::Int8(i),
+                    name,
+                    score,
+                    ScalarParam::Bool(i % 3 == 0),
+                    ScalarParam::Text(format!("{{\"k\":{i},\"s\":\"v-{i}\"}}")),
+                    ScalarParam::Text(ts_for(i)),
+                ],
+            )
+            .await
+            .unwrap();
+        match sess.execute_bound(bound).await.unwrap() {
+            ExecResult::Empty { tag } => assert_eq!(tag, "INSERT 0 1"),
+            other => panic!("expected INSERT tag, got {other:?}"),
+        }
+    }
+
+    let a = select(
+        &sess,
+        "SELECT id, name, score, ok, doc, ts FROM simple_p ORDER BY id",
+    )
+    .await;
+    let b = select(
+        &sess,
+        "SELECT id, name, score, ok, doc, ts FROM prepared_p ORDER BY id",
+    )
+    .await;
+    assert_eq!(total_rows(&a), n as usize);
+    assert_eq!(total_rows(&b), n as usize);
+    assert_eq!(col_i64(&a, "id"), col_i64(&b, "id"));
+    assert_eq!(col_str(&a, "name"), col_str(&b, "name"));
+    assert_eq!(col_f64(&a, "score"), col_f64(&b, "score"));
+    assert_eq!(col_bool(&a, "ok"), col_bool(&b, "ok"));
+    assert_eq!(col_jsonb_bytes(&a, "doc"), col_jsonb_bytes(&b, "doc"));
+    assert_eq!(col_ts_micros(&a, "ts"), col_ts_micros(&b, "ts"));
+}
+
+/// Multi-row parameterized template (some ORMs batch with one statement of
+/// many placeholder tuples): equivalence vs the literal simple path.
+#[tokio::test]
+async fn prepared_param_multi_row_template_equivalence() {
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+
+    for t in ["simple_m", "prepared_m"] {
+        sess.execute(&format!(
+            "CREATE TABLE {t} (id BIGINT NOT NULL PRIMARY KEY, s TEXT)"
+        ))
+        .await
+        .unwrap();
+    }
+
+    sess.execute("INSERT INTO simple_m (id, s) VALUES (1, 'a'), (2, 'b'), (3, NULL)")
+        .await
+        .unwrap();
+
+    let (handle, _schema) = sess
+        .prepare("INSERT INTO prepared_m (id, s) VALUES ($1, $2), ($3, $4), ($5, $6)")
+        .await
+        .unwrap();
+    let bound = sess
+        .bind(
+            &handle,
+            vec![
+                ScalarParam::Int8(1),
+                ScalarParam::Text("a".into()),
+                ScalarParam::Int8(2),
+                ScalarParam::Text("b".into()),
+                ScalarParam::Int8(3),
+                ScalarParam::Null,
+            ],
+        )
+        .await
+        .unwrap();
+    match sess.execute_bound(bound).await.unwrap() {
+        ExecResult::Empty { tag } => assert_eq!(tag, "INSERT 0 3"),
+        other => panic!("expected INSERT tag, got {other:?}"),
+    }
+
+    let a = select(&sess, "SELECT id, s FROM simple_m ORDER BY id").await;
+    let b = select(&sess, "SELECT id, s FROM prepared_m ORDER BY id").await;
+    assert_eq!(col_i64(&a, "id"), col_i64(&b, "id"));
+    assert_eq!(col_str(&a, "s"), col_str(&b, "s"));
+}
+
+/// Decline shapes must still work via the AST/text fallback routes:
+/// ON CONFLICT (no bind-direct plan), an explicit transaction (execute-time
+/// decline), and an identity column (column-eligibility decline).
+#[tokio::test]
+async fn prepared_param_declines_still_work() {
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+
+    // ── ON CONFLICT DO UPDATE: upsert semantics preserved ───────────────────
+    sess.execute("CREATE TABLE up (id BIGINT NOT NULL PRIMARY KEY, v TEXT NOT NULL)")
+        .await
+        .unwrap();
+    let (h_up, _) = sess
+        .prepare(
+            "INSERT INTO up (id, v) VALUES ($1, $2) \
+             ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v",
+        )
+        .await
+        .unwrap();
+    for (id, v) in [(1i64, "a"), (1, "b"), (2, "c")] {
+        let bound = sess
+            .bind(&h_up, vec![ScalarParam::Int8(id), ScalarParam::Text(v.into())])
+            .await
+            .unwrap();
+        sess.execute_bound(bound).await.unwrap();
+    }
+    let r = select(&sess, "SELECT id, v FROM up ORDER BY id").await;
+    assert_eq!(col_i64(&r, "id"), vec![Some(1), Some(2)]);
+    assert_eq!(
+        col_str(&r, "v"),
+        vec![Some("b".to_string()), Some("c".to_string())],
+        "upsert must have replaced the conflicting row"
+    );
+
+    // ── Explicit transaction: bind-direct declines, in-tx buffering applies ─
+    sess.execute("CREATE TABLE txt (id BIGINT NOT NULL PRIMARY KEY, s TEXT)")
+        .await
+        .unwrap();
+    let (h_tx, _) = sess
+        .prepare("INSERT INTO txt (id, s) VALUES ($1, $2)")
+        .await
+        .unwrap();
+    sess.execute("BEGIN").await.unwrap();
+    for i in 0..3i64 {
+        let bound = sess
+            .bind(
+                &h_tx,
+                vec![ScalarParam::Int8(i), ScalarParam::Text(format!("tx-{i}"))],
+            )
+            .await
+            .unwrap();
+        sess.execute_bound(bound).await.unwrap();
+    }
+    sess.execute("ROLLBACK").await.unwrap();
+    let r = select(&sess, "SELECT count(*) AS c FROM txt").await;
+    assert_eq!(
+        col_i64(&r, "c"),
+        vec![Some(0)],
+        "ROLLBACK must discard in-tx prepared inserts (no fast-path leak)"
+    );
+    sess.execute("BEGIN").await.unwrap();
+    for i in 0..3i64 {
+        let bound = sess
+            .bind(
+                &h_tx,
+                vec![ScalarParam::Int8(i), ScalarParam::Text(format!("tx-{i}"))],
+            )
+            .await
+            .unwrap();
+        sess.execute_bound(bound).await.unwrap();
+    }
+    sess.execute("COMMIT").await.unwrap();
+    let r = select(&sess, "SELECT count(*) AS c FROM txt").await;
+    assert_eq!(col_i64(&r, "c"), vec![Some(3)]);
+
+    // ── Identity column: server-side fill must still run ────────────────────
+    sess.execute(
+        "CREATE TABLE ident (id BIGINT GENERATED ALWAYS AS IDENTITY, name TEXT NOT NULL)",
+    )
+    .await
+    .unwrap();
+    let (h_id, _) = sess
+        .prepare("INSERT INTO ident (name) VALUES ($1)")
+        .await
+        .unwrap();
+    for name in ["x", "y"] {
+        let bound = sess
+            .bind(&h_id, vec![ScalarParam::Text(name.into())])
+            .await
+            .unwrap();
+        sess.execute_bound(bound).await.unwrap();
+    }
+    let r = select(&sess, "SELECT id, name FROM ident ORDER BY id").await;
+    assert_eq!(
+        col_i64(&r, "id"),
+        vec![Some(1), Some(2)],
+        "identity sequence must have filled ids on the fallback path"
+    );
+    assert_eq!(
+        col_str(&r, "name"),
+        vec![Some("x".to_string()), Some("y".to_string())]
+    );
+}

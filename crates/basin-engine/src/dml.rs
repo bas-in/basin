@@ -2640,8 +2640,18 @@ pub(crate) fn parse_timestamp_string(s: &str) -> Result<i64> {
             return micros_from_dt(utc);
         }
     }
-    // Naive form: assume UTC.
-    let dt_formats = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"];
+    // Naive form: assume UTC. `%.f` also matches an EMPTY fraction, so the
+    // fraction-bearing patterns subsume the plain ones (kept for clarity).
+    // The fractional naive form matters on the wire: the extended protocol's
+    // binary TIMESTAMP/TIMESTAMPTZ decode renders parameters as
+    // `%Y-%m-%d %H:%M:%S%.6f` (naive, microseconds), which previously had no
+    // matching pattern here and made every binary timestamp bind fail.
+    let dt_formats = [
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+    ];
     for fmt in dt_formats {
         if let Ok(naive) = NaiveDateTime::parse_from_str(trimmed, fmt) {
             let dt = DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc);

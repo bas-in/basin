@@ -192,6 +192,28 @@ pub(crate) fn try_fast_insert_at(
     schema: &Schema,
     insert_columns: &[sqlparser::ast::Ident],
 ) -> Option<Vec<RecordBatch>> {
+    let names: Vec<&str> = insert_columns.iter().map(|c| c.value.as_str()).collect();
+    let insert_cols = resolve_eligible_insert_cols(schema, &names)?;
+    try_parse_literal_values_from(sql, values_end, schema, &insert_cols)
+}
+
+/// Shared column-eligibility gate for the INSERT fast paths: resolve the
+/// per-tuple-position → schema-column-index mapping for `insert_columns`
+/// (empty = implicit full-width insert in declaration order) and verify the
+/// fast paths may build the batch at all. Returns `None` (→ slow path) when:
+///
+/// * any named column doesn't resolve on `schema` (case-insensitive match —
+///   the same folding the original `try_fast_insert_at` mapping used);
+/// * any TARGETED column is generated (the slow path owns that error) or
+///   identity/SERIAL (the slow path enforces ALWAYS/BY-DEFAULT + OVERRIDING
+///   semantics, which the fast paths deliberately do not replicate);
+/// * any UNTARGETED column is not safely NULL-fillable — i.e. it is NOT NULL
+///   or carries a DEFAULT / identity / generated definition that the slow
+///   path's server-side filling machinery must run for.
+pub(crate) fn resolve_eligible_insert_cols(
+    schema: &Schema,
+    insert_columns: &[&str],
+) -> Option<Vec<usize>> {
     let n_cols = schema.fields().len();
 
     // Resolve the per-tuple-position → schema-column-index mapping.
@@ -205,7 +227,7 @@ pub(crate) fn try_fast_insert_at(
         }
         let mut v = Vec::with_capacity(insert_columns.len());
         for c in insert_columns {
-            let idx = *by_name.get(&c.value.to_ascii_lowercase())?;
+            let idx = *by_name.get(&c.to_ascii_lowercase())?;
             v.push(idx);
         }
         v
@@ -245,7 +267,7 @@ pub(crate) fn try_fast_insert_at(
         }
     }
 
-    try_parse_literal_values_from(sql, values_end, schema, &insert_cols)
+    Some(insert_cols)
 }
 
 /// Try to scan a literal `INSERT ... VALUES` tail directly into Arrow batches.
@@ -1197,6 +1219,137 @@ fn finish_batch(schema: Arc<Schema>, cols: &mut [ColAcc]) -> Option<RecordBatch>
     RecordBatch::try_new(schema, arrays).ok()
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Bind-direct batch builder (extended-protocol hook 3)
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Bind-direct batch builder for the parameterized prepared-INSERT fast path
+/// (`executor::try_insert_bind_direct`): build the full-width batches for
+/// `INSERT INTO t [(cols)] VALUES ($1, …)[, (…)]` straight from the decoded
+/// bind values — no SQL text and no AST anywhere in the per-`Execute` loop.
+///
+/// * `insert_columns` — the column list as written at prepare time (empty =
+///   full schema width, declaration order). Names are re-resolved against the
+///   CURRENT `schema` on every call because the table can change between
+///   Parse and a later Execute.
+/// * `rows[r][p]` — the zero-based parameter index feeding tuple position `p`
+///   of VALUES row `r` (precomputed once at prepare time).
+/// * `params` — the decoded bind values for this Execute.
+///
+/// Same cardinal rule as the literal scanner: **when in doubt, return
+/// `None`** and let the caller fall back to the AST/text bind route. Cells
+/// flow through the SAME [`ColAcc`] accumulators as the literal scanner, so
+/// per-column type checks and JSONB / timestamp coercions are byte-identical
+/// to what the text route's substituted literal would have produced:
+///
+/// * `Null` ↔ `NULL`, `Int4`/`Int8` ↔ integer literal, `Bool` ↔
+///   `TRUE`/`FALSE`, finite `Float8` ↔ float literal (Rust float `Display`
+///   round-trips, so re-parsing the rendered literal yields the same f64),
+///   `Text` ↔ single-quoted string literal (JSONB / timestamp destination
+///   columns coerce via the shared `dml` helpers, exactly as the slow path
+///   peels and coerces a quoted literal).
+/// * Non-finite `Float8` declines: the text route renders those as
+///   `'NaN'::float8`-style casts, a shape outside the literal grammar whose
+///   semantics the slow path owns.
+/// * `Bytea` / `Array` decline: their text renderings (`'\x…'::bytea`,
+///   `ARRAY[…]`) are likewise out-of-grammar shapes.
+pub(crate) fn try_bind_insert_batch(
+    schema: &Schema,
+    insert_columns: &[String],
+    rows: &[Vec<usize>],
+    params: &[crate::prepared::ScalarParam],
+) -> Option<Vec<RecordBatch>> {
+    let names: Vec<&str> = insert_columns.iter().map(|s| s.as_str()).collect();
+    let insert_cols = resolve_eligible_insert_cols(schema, &names)?;
+    let arity = insert_cols.len();
+    if arity == 0 || rows.is_empty() {
+        return None;
+    }
+    let n_cols = schema.fields().len();
+    // Every targeted column must have a scanner-supported type — the same
+    // up-front gate `try_parse_literal_values_from` applies.
+    for &ci in &insert_cols {
+        if !is_supported_col(schema.field(ci)) {
+            return None;
+        }
+    }
+
+    let mut cols: Vec<ColAcc> = schema
+        .fields()
+        .iter()
+        .map(|f| ColAcc::new(f.as_ref()))
+        .collect::<Option<Vec<_>>>()?;
+    // Reverse map: schema col idx -> Some(tuple position) for targeted cols.
+    let mut tuple_pos_for_col: Vec<Option<usize>> = vec![None; n_cols];
+    for (tpos, &ci) in insert_cols.iter().enumerate() {
+        if tuple_pos_for_col[ci].is_some() {
+            return None; // duplicate target column → slow path's canonical error
+        }
+        tuple_pos_for_col[ci] = Some(tpos);
+    }
+
+    let schema_arc = Arc::new(schema.clone());
+    let mut out: Vec<RecordBatch> = Vec::new();
+    let mut rows_in_batch = 0usize;
+    for row in rows {
+        if row.len() != arity {
+            return None;
+        }
+        for ci in 0..n_cols {
+            match tuple_pos_for_col[ci] {
+                Some(tpos) => {
+                    let param = params.get(*row.get(tpos)?)?;
+                    let cell = scalar_param_cell(param)?;
+                    if !cols[ci].push(&cell, schema.field(ci)) {
+                        return None;
+                    }
+                }
+                None => {
+                    if !schema.field(ci).is_nullable() {
+                        return None;
+                    }
+                    cols[ci].push_null();
+                }
+            }
+        }
+        rows_in_batch += 1;
+        if rows_in_batch == BATCH_ROWS {
+            out.push(finish_batch(schema_arc.clone(), &mut cols)?);
+            rows_in_batch = 0;
+        }
+    }
+    if rows_in_batch > 0 {
+        out.push(finish_batch(schema_arc, &mut cols)?);
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Map one decoded bind value to the scanner's [`Cell`] so it rides the same
+/// per-column accumulators (and therefore the same type checks / coercions)
+/// as a literal token. `None` = an out-of-grammar value the bind-direct path
+/// must decline (see [`try_bind_insert_batch`]).
+fn scalar_param_cell(p: &crate::prepared::ScalarParam) -> Option<Cell<'_>> {
+    use crate::prepared::ScalarParam as SP;
+    Some(match p {
+        SP::Null => Cell::Null,
+        SP::Int4(v) => Cell::Int(i64::from(*v)),
+        SP::Int8(v) => Cell::Int(*v),
+        SP::Bool(b) => Cell::Bool(*b),
+        SP::Float8(f) if f.is_finite() => Cell::Float(*f),
+        SP::Text(s) => Cell::Str {
+            s: std::borrow::Cow::Borrowed(s.as_str()),
+            cast: None,
+        },
+        // Non-finite floats render as '…'::float8 casts on the text route;
+        // bytea / arrays render as '\x…'::bytea / ARRAY[…] — all shapes the
+        // literal grammar excludes. Decline → AST/text fallback.
+        SP::Float8(_) | SP::Bytea(_) | SP::Array(_) => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1809,5 +1962,147 @@ mod tests {
             .unwrap();
         assert!(c.value(0));
         assert!(!c.value(1));
+    }
+
+    // ── bind-direct batch builder ────────────────────────────────────────────
+
+    #[test]
+    fn bind_direct_basic_single_row() {
+        use crate::prepared::ScalarParam as SP;
+        let s = schema_iib();
+        let cols = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let rows = vec![vec![0usize, 1, 2]];
+        let params = vec![SP::Int8(7), SP::Text("hi".into()), SP::Bool(true)];
+        let b = try_bind_insert_batch(&s, &cols, &rows, &params).expect("builds");
+        assert_eq!(b.len(), 1);
+        let r = &b[0];
+        assert_eq!(r.num_rows(), 1);
+        let a = r.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(a.value(0), 7);
+        let strs = r.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(strs.value(0), "hi");
+        let c = r
+            .column(2)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert!(c.value(0));
+    }
+
+    #[test]
+    fn bind_direct_matches_literal_scanner_batch() {
+        // Cardinal invariant: building from binds yields the SAME batch the
+        // literal scanner produces for the equivalent rendered statement.
+        use crate::prepared::ScalarParam as SP;
+        let s = schema_iib();
+        let via_scanner = scan(
+            "INSERT INTO t (a,b,c) VALUES (1,'x',TRUE),(2,NULL,FALSE)",
+            &s,
+            &[0, 1, 2],
+        )
+        .expect("scans");
+        let cols = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let rows = vec![vec![0usize, 1, 2], vec![3, 4, 5]];
+        let params = vec![
+            SP::Int8(1),
+            SP::Text("x".into()),
+            SP::Bool(true),
+            SP::Int8(2),
+            SP::Null,
+            SP::Bool(false),
+        ];
+        let via_binds = try_bind_insert_batch(&s, &cols, &rows, &params).expect("builds");
+        assert_eq!(via_scanner.len(), via_binds.len());
+        assert_eq!(via_scanner[0], via_binds[0]);
+    }
+
+    #[test]
+    fn bind_direct_subset_columns_null_fill_and_int4_widening() {
+        use crate::prepared::ScalarParam as SP;
+        let s = schema_iib();
+        // Target only (a, c); b is NULL-filled. Int4 widens into the Int64 col.
+        let cols = vec!["a".to_string(), "c".to_string()];
+        let rows = vec![vec![0usize, 1]];
+        let params = vec![SP::Int4(5), SP::Bool(false)];
+        let b = try_bind_insert_batch(&s, &cols, &rows, &params).expect("builds");
+        let r = &b[0];
+        let a = r.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(a.value(0), 5);
+        let strs = r.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        assert!(strs.is_null(0));
+    }
+
+    #[test]
+    fn bind_direct_declines_out_of_grammar_params() {
+        use crate::prepared::ScalarParam as SP;
+        let s = schema_iib();
+        let cols = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let rows = vec![vec![0usize, 1, 2]];
+        // Bytea param → decline.
+        assert!(try_bind_insert_batch(
+            &s,
+            &cols,
+            &rows,
+            &[SP::Int8(1), SP::Bytea(vec![1, 2]), SP::Bool(true)],
+        )
+        .is_none());
+        // Array param → decline.
+        assert!(try_bind_insert_batch(
+            &s,
+            &cols,
+            &rows,
+            &[SP::Int8(1), SP::Array(vec![SP::Int8(2)]), SP::Bool(true)],
+        )
+        .is_none());
+        // Type mismatch (text into Int64 col) → decline.
+        assert!(try_bind_insert_batch(
+            &s,
+            &cols,
+            &rows,
+            &[SP::Text("1".into()), SP::Text("x".into()), SP::Bool(true)],
+        )
+        .is_none());
+        // NULL into NOT NULL column → decline.
+        let strict = Schema::new(vec![Field::new("a", DataType::Int64, false)]);
+        assert!(try_bind_insert_batch(
+            &strict,
+            &["a".to_string()],
+            &[vec![0usize]],
+            &[SP::Null],
+        )
+        .is_none());
+        // Param index out of range → decline.
+        assert!(try_bind_insert_batch(&s, &cols, &rows, &[SP::Int8(1)]).is_none());
+        // Non-finite float → decline.
+        let fschema = Schema::new(vec![Field::new("f", DataType::Float64, true)]);
+        assert!(try_bind_insert_batch(
+            &fschema,
+            &["f".to_string()],
+            &[vec![0usize]],
+            &[SP::Float8(f64::NAN)],
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn bind_direct_declines_unknown_or_duplicate_columns() {
+        use crate::prepared::ScalarParam as SP;
+        let s = schema_iib();
+        // Unknown column name → decline (schema may have drifted since Parse).
+        assert!(try_bind_insert_batch(
+            &s,
+            &["nope".to_string()],
+            &[vec![0usize]],
+            &[SP::Int8(1)],
+        )
+        .is_none());
+        // Duplicate target column → decline (slow path's canonical error).
+        assert!(try_bind_insert_batch(
+            &s,
+            &["a".to_string(), "a".to_string()],
+            &[vec![0usize, 1]],
+            &[SP::Int8(1), SP::Int8(2)],
+        )
+        .is_none());
     }
 }
