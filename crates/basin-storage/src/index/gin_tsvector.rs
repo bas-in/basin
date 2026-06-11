@@ -17,51 +17,83 @@
 //!   which require a re-evaluation pass regardless).
 //!
 //! * **posting list** — a sorted set of `TsvPostingEntry` values (file path +
-//!   row-group + row) for each distinct lexeme.  AND-merging two posting lists
-//!   yields the rows that contain BOTH lexemes — the correct semantics for
-//!   a multi-lexeme `tsquery` (e.g. `'cat' & 'dog'`).
+//!   row-group + row) for each distinct lexeme.
 //!
 //! # Correctness contract
 //!
-//! The posting list is a *conservative superset*: it prunes only files that
-//! contain NO matching lexeme.  Every candidate file returned by
+//! The probe result is a *conservative superset*: it prunes only files that
+//! provably contain NO matching row.  Every candidate file returned by
 //! [`GinTsvectorRegistry::probe_query`] is re-evaluated by the full `@@`
-//! predicate at the storage read layer.  The caller must never skip that
-//! re-evaluation step.
+//! predicate at read time.  The caller must never skip that re-evaluation.
 //!
-//! # Storage / eviction
+//! ## Per-operator probe soundness
+//!
+//! The probe parses the *canonical* `tsquery` text (the form produced by
+//! `to_tsquery`/`plainto_tsquery` canonicalisation in `basin-engine`) and
+//! evaluates the boolean structure over posting lists:
+//!
+//! | tsquery node | probe evaluation | why it is sound                        |
+//! |--------------|------------------|----------------------------------------|
+//! | `'lex'`      | files containing the lexeme; **Unknown** if the lexeme was never indexed (or was evicted) | a marked file has all of its lexemes present |
+//! | `a & b`      | intersection of file sets (`Unknown ∩ X = X`) | a matching row must satisfy both sides, so it lives in a file from each side's set |
+//! | `a \| b`     | union of file sets; **Unknown** if either side is Unknown | a matching row satisfies at least one side |
+//! | `a <-> b`, `a <N> b` | treated as `a & b` | a phrase match requires both lexemes in the SAME row; positions are re-checked at read time |
+//! | `!a`         | **Unknown** | a matching row may contain none of the indexed lexemes |
+//!
+//! `Unknown` anywhere at the top level degrades to a full scan (no pruning,
+//! no `Empty` short-circuit) — never a wrong answer.  A plain AND-merge of
+//! every lexeme atom (the pre-5.20.E shape) is UNSOUND for `|` and `!`
+//! queries: `'cat' | 'dog'` over files that each hold only one of the two
+//! lexemes would AND-merge to ∅ and short-circuit to zero rows while real
+//! matches exist.  The structural evaluation above is what makes OR queries
+//! prunable (file-set union) and NOT queries safe (decline).
+//!
+//! # Storage / eviction / budget story
 //!
 //! The posting list lives entirely in RAM.  The registry caps each per-column
 //! posting list at [`DEFAULT_POSTING_BUDGET`] total entries (operator-tunable
-//! via `BASIN_GIN_POSTING_BUDGET`); oldest lexemes are evicted in 25% batches
-//! when the cap is exceeded.  On engine restart the registry starts empty and
-//! rebuilds lazily from writes.
+//! via `BASIN_GIN_POSTING_BUDGET`, the same knob the JSONB GIN registry
+//! reads); oldest lexemes are evicted in 25%-of-current-lexemes batches when
+//! the cap is exceeded.  On engine restart the registry starts empty and
+//! rebuilds from writes and CREATE INDEX backfills.
 //!
-//! **Per-file completeness (Phase 5.20.E+):** eviction marks only the
-//! *affected files* (those whose posting entries were dropped) as un-indexed,
-//! not the entire column.  Files that still have complete lexeme coverage
-//! remain prunable.  Un-indexed files are treated as forced candidates
-//! (must-scan) — correctness is scale-independent.
+//! **Accounting note (vs. the JSONB GIN registry):** the JSONB registry
+//! de-duplicates to interned `(term, file)` pairs, so its budget counts
+//! distinct pairs.  The tsvector posting list must keep *row-level* entries
+//! (`lexeme → (file, row-group, row)`) because the row-group-granular prune
+//! path (`probe_query_with_row_groups`) drives `row_group_selection` from
+//! them.  The budget therefore counts row-level postings and trips earlier
+//! for the same corpus; file paths are interned (`Arc<str>`) so the per-entry
+//! cost is one small struct + one `Arc` bump, not a path clone.
+//!
+//! **Per-file completeness:** eviction un-marks only the *affected files*
+//! (those whose posting entries were dropped), not the entire column.  Files
+//! that still have complete lexeme coverage remain prunable.  Un-marked files
+//! fail the engine's completeness guard (`indexed_files ⊇ live_files`) and
+//! force a full scan — correctness is scale-independent.
 //!
 //! # Engine wiring (Phase 5.20.E)
 //!
-//! The three wiring stages are implemented in Phase 5.20.E:
-//!
 //! 1. **Populate on write** — `maintain_gin_fts_index_on_insert` in
 //!    `basin-engine/src/executor.rs` calls `index_row` for every tsvector
-//!    column in a newly written Parquet file.  `mark_file_indexed` is called
+//!    column in a newly written data file.  `mark_file_indexed` is called
 //!    after all rows are processed so the completeness guard is valid.
 //!
-//! 2. **Probe at query** — `detect_tsvector_match` in
-//!    `basin-engine/src/index_probe.rs` recognises `col @@ to_tsquery(…)` /
-//!    `@@ plainto_tsquery(…)` on a GIN-indexed tsvector column and returns a
-//!    `GinFtsPlan`.  The executor probes `probe_query` for an `Empty`
-//!    short-circuit.
+//! 2. **Backfill on CREATE INDEX** — `backfill_index_over_live_files` in
+//!    `basin-engine/src/executor.rs` walks pre-existing live files (after
+//!    `materialize_overlay_for_table` settles any hot-tier overlay) and feeds
+//!    them through `index_row` + `mark_file_indexed`.
 //!
-//! 3. **Prune the scan** — `apply_gin_fts_pruning_for_query` in
-//!    `basin-engine/src/session.rs` intersects `FileCandidates` with live
-//!    files and re-registers a pruned `ListingTable` ONLY when the
-//!    completeness guard passes (`indexed_files ⊇ live_files`).
+//! 3. **Probe at query** — `detect_tsvector_match` in
+//!    `basin-engine/src/index_probe.rs` recognises `col @@ to_tsquery(…)` on
+//!    a GIN-indexed tsvector column.  The executor probes `probe_query` for
+//!    an `Empty` short-circuit, gated on no-live-overlay AND per-file
+//!    completeness (`fts_empty_probe_is_trustworthy`).
+//!
+//! 4. **Prune the scan** — `apply_gin_fts_pruning_for_query` in
+//!    `basin-engine/src/session.rs` intersects the probe result with live
+//!    files and re-registers a pruned provider ONLY when the table has no
+//!    live overlay AND the completeness guard passes.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -98,13 +130,14 @@ fn posting_budget() -> usize {
 
 /// One physical location for a posting entry: file path + row-group + row.
 ///
-/// Mirrors [`super::super::index_probe::PostingEntry`] (JSONB GIN) in shape so
-/// the two registries can be merged in a future refactor without API breakage.
+/// The file path is interned (`Arc<str>`, one allocation per distinct file
+/// per posting list) — at row-level posting granularity a cloned `String`
+/// per entry would dominate the registry's memory footprint.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TsvPostingEntry {
-    /// Parquet file path (or object-store key).
-    pub file_path: String,
-    /// Parquet row-group index within the file.
+    /// Parquet/Vortex file path (or object-store key), interned.
+    pub file_path: Arc<str>,
+    /// Row-group index within the file.
     pub row_group: u32,
     /// Row offset within the row-group.
     pub row: u64,
@@ -121,7 +154,7 @@ pub struct TsvPostingEntry {
 ///
 /// This function extracts only the lexeme strings (the single-quoted tokens)
 /// and ignores positional information.  Positions are irrelevant for the GIN
-/// AND-merge — the re-evaluation layer handles phrase proximity.
+/// probe — the re-evaluation layer handles phrase proximity.
 ///
 /// # Examples
 ///
@@ -201,34 +234,319 @@ pub fn extract_lexemes(tsvector: &str) -> HashSet<String> {
     out
 }
 
-/// Extract probe lexemes from a `tsquery` string for AND-merge probing.
+// ── tsquery structural parsing (probe side) ──────────────────────────────────
+
+/// Boolean structure of a canonical `tsquery`, as far as the GIN probe needs
+/// it.  Phrase distance is irrelevant for pruning (a phrase match implies
+/// both operands occur in the same row), so `a <N> b` folds to [`TsqNode::Phrase`]
+/// without the distance.
+#[derive(Debug, Clone, PartialEq)]
+enum TsqNode {
+    Term(String),
+    Not(Box<TsqNode>),
+    And(Box<TsqNode>, Box<TsqNode>),
+    Or(Box<TsqNode>, Box<TsqNode>),
+    Phrase(Box<TsqNode>, Box<TsqNode>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum TsqTok {
+    Term(String),
+    And,
+    Or,
+    Not,
+    Phrase,
+    LParen,
+    RParen,
+}
+
+/// Lex a canonical tsquery string (`'cat' & !'dog' | 'a' <-> 'b'`).  Terms
+/// are single-quoted (with `''` as the embedded-quote escape); bare
+/// alphanumeric runs are accepted defensively and lowercased.  Lexemes may
+/// carry multi-byte UTF-8 (`'café'`), so the lexer iterates `char`s — the
+/// same granularity `extract_lexemes` uses on the indexing side.  Returns
+/// `None` on anything unexpected — the caller treats that as "structure
+/// unknown → full scan" (never a wrong prune).
+fn lex_tsquery(input: &str) -> Option<Vec<TsqTok>> {
+    let mut chars = input.chars().peekable();
+    let mut out = Vec::new();
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_whitespace() {
+            chars.next();
+            continue;
+        }
+        match c {
+            '&' => {
+                chars.next();
+                out.push(TsqTok::And);
+            }
+            '|' => {
+                chars.next();
+                out.push(TsqTok::Or);
+            }
+            '!' => {
+                chars.next();
+                out.push(TsqTok::Not);
+            }
+            '(' => {
+                chars.next();
+                out.push(TsqTok::LParen);
+            }
+            ')' => {
+                chars.next();
+                out.push(TsqTok::RParen);
+            }
+            '<' => {
+                // `<->` or `<N>` — both fold to Phrase for the probe.
+                chars.next();
+                match chars.peek() {
+                    Some('-') => {
+                        chars.next();
+                        if chars.next() != Some('>') {
+                            return None;
+                        }
+                        out.push(TsqTok::Phrase);
+                    }
+                    Some(d) if d.is_ascii_digit() => {
+                        let mut saw_digit = false;
+                        while matches!(chars.peek(), Some(d) if d.is_ascii_digit()) {
+                            chars.next();
+                            saw_digit = true;
+                        }
+                        if !saw_digit || chars.next() != Some('>') {
+                            return None;
+                        }
+                        out.push(TsqTok::Phrase);
+                    }
+                    _ => return None,
+                }
+            }
+            '\'' => {
+                chars.next(); // consume opening quote
+                let mut buf = String::new();
+                loop {
+                    match chars.next() {
+                        None => return None, // unterminated quote
+                        Some('\'') => {
+                            if chars.peek() == Some(&'\'') {
+                                chars.next();
+                                buf.push('\'');
+                            } else {
+                                break; // closing quote
+                            }
+                        }
+                        Some(ch) => buf.push(ch),
+                    }
+                }
+                if !buf.is_empty() {
+                    out.push(TsqTok::Term(buf));
+                }
+            }
+            _ => {
+                // Defensive: bare alphanumeric run as a term (lowercased).
+                let mut buf = String::new();
+                while matches!(chars.peek(), Some(ch) if ch.is_alphanumeric()) {
+                    buf.push(chars.next()?);
+                }
+                if buf.is_empty() {
+                    return None; // unexpected character
+                }
+                out.push(TsqTok::Term(buf.to_lowercase()));
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Parse a canonical tsquery into a [`TsqNode`].  Grammar mirrors the engine
+/// tsquery parser (precedence: `|` < `&` < `<->`/`<N>` < `!`):
 ///
-/// PostgreSQL serialises a `tsquery` as an expression tree, e.g.:
 /// ```text
-/// 'cat' & 'dog' | 'run'
-/// 'phrase' <-> 'query'
+/// or     := and ('|' and)*
+/// and    := phrase ('&' phrase)*
+/// phrase := unary (('<->' | '<N>') unary)*
+/// unary  := '!' unary | '(' or ')' | term
 /// ```
 ///
-/// For GIN probing we extract only the lexeme atoms and AND-merge them all
-/// (i.e. we require every lexeme to appear in the candidate file).  This is
-/// the conservative strategy: it may return false positives for OR / NOT
-/// sub-expressions but never false negatives.  The caller re-evaluates the
-/// full `@@` predicate on every candidate row.
-///
-/// # Examples
-///
-/// ```
-/// use basin_storage::index::gin_tsvector::extract_query_lexemes;
-/// let lexemes = extract_query_lexemes("'cat' & 'dog'");
-/// assert!(lexemes.contains("cat"));
-/// assert!(lexemes.contains("dog"));
-/// ```
-pub fn extract_query_lexemes(tsquery: &str) -> HashSet<String> {
-    // The lexeme atoms in a tsquery are also single-quoted, so we can reuse
-    // the same extraction logic as `extract_lexemes`.  tsquery operators
-    // (`&`, `|`, `!`, `<->`, `<n>`) are unquoted and will be skipped by the
-    // same "unexpected character" fallthrough in the parser.
-    extract_lexemes(tsquery)
+/// Returns `None` for empty or malformed input — the probe treats that as
+/// "unknown structure → full scan".
+fn parse_tsquery(input: &str) -> Option<TsqNode> {
+    let toks = lex_tsquery(input)?;
+    if toks.is_empty() {
+        return None;
+    }
+    let mut p = TsqParser { toks, pos: 0 };
+    let node = p.parse_or()?;
+    if p.pos != p.toks.len() {
+        return None; // trailing tokens — malformed
+    }
+    Some(node)
+}
+
+struct TsqParser {
+    toks: Vec<TsqTok>,
+    pos: usize,
+}
+
+impl TsqParser {
+    fn peek(&self) -> Option<&TsqTok> {
+        self.toks.get(self.pos)
+    }
+    fn bump(&mut self) -> Option<TsqTok> {
+        let t = self.toks.get(self.pos).cloned();
+        if t.is_some() {
+            self.pos += 1;
+        }
+        t
+    }
+
+    fn parse_or(&mut self) -> Option<TsqNode> {
+        let mut left = self.parse_and()?;
+        while matches!(self.peek(), Some(TsqTok::Or)) {
+            self.bump();
+            let right = self.parse_and()?;
+            left = TsqNode::Or(Box::new(left), Box::new(right));
+        }
+        Some(left)
+    }
+
+    fn parse_and(&mut self) -> Option<TsqNode> {
+        let mut left = self.parse_phrase()?;
+        while matches!(self.peek(), Some(TsqTok::And)) {
+            self.bump();
+            let right = self.parse_phrase()?;
+            left = TsqNode::And(Box::new(left), Box::new(right));
+        }
+        Some(left)
+    }
+
+    fn parse_phrase(&mut self) -> Option<TsqNode> {
+        let mut left = self.parse_unary()?;
+        while matches!(self.peek(), Some(TsqTok::Phrase)) {
+            self.bump();
+            let right = self.parse_unary()?;
+            left = TsqNode::Phrase(Box::new(left), Box::new(right));
+        }
+        Some(left)
+    }
+
+    fn parse_unary(&mut self) -> Option<TsqNode> {
+        match self.peek() {
+            Some(TsqTok::Not) => {
+                self.bump();
+                Some(TsqNode::Not(Box::new(self.parse_unary()?)))
+            }
+            Some(TsqTok::LParen) => {
+                self.bump();
+                let q = self.parse_or()?;
+                match self.bump() {
+                    Some(TsqTok::RParen) => Some(q),
+                    _ => None,
+                }
+            }
+            Some(TsqTok::Term(_)) => match self.bump() {
+                Some(TsqTok::Term(t)) => Some(TsqNode::Term(t)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+}
+
+// ── Probe evaluation lattices ─────────────────────────────────────────────────
+
+/// File-level evaluation result for one tsquery sub-tree.  `Unknown` means
+/// the sub-tree's matches cannot be bounded by the posting list (a `!`
+/// operand, a never-indexed lexeme) — anything ANDed with it falls back to
+/// the other side; anything ORed with it poisons the whole branch.
+enum FileEval {
+    Unknown,
+    Files(HashSet<String>),
+}
+
+/// Row-group-level evaluation result (file → candidate row-groups).
+enum RgEval {
+    Unknown,
+    Map(HashMap<String, HashSet<u32>>),
+}
+
+fn eval_files(node: &TsqNode, list: &LexemePostingList) -> FileEval {
+    match node {
+        TsqNode::Term(t) => match list.probe_lexeme(t) {
+            // Never indexed (or evicted): cannot bound this term's matches.
+            None => FileEval::Unknown,
+            Some(entries) => FileEval::Files(
+                entries.iter().map(|e| e.file_path.to_string()).collect(),
+            ),
+        },
+        // A row matching `!a` may contain none of the indexed lexemes; the
+        // posting list cannot bound it.
+        TsqNode::Not(_) => FileEval::Unknown,
+        // A phrase match requires both operands in the same row → at least
+        // the AND of the operands' file sets (sound necessary condition).
+        TsqNode::And(a, b) | TsqNode::Phrase(a, b) => {
+            match (eval_files(a, list), eval_files(b, list)) {
+                (FileEval::Unknown, x) | (x, FileEval::Unknown) => x,
+                (FileEval::Files(x), FileEval::Files(y)) => {
+                    FileEval::Files(x.intersection(&y).cloned().collect())
+                }
+            }
+        }
+        TsqNode::Or(a, b) => match (eval_files(a, list), eval_files(b, list)) {
+            (FileEval::Files(mut x), FileEval::Files(y)) => {
+                x.extend(y);
+                FileEval::Files(x)
+            }
+            // Either side unbounded → the union is unbounded.
+            _ => FileEval::Unknown,
+        },
+    }
+}
+
+fn eval_row_groups(node: &TsqNode, list: &LexemePostingList) -> RgEval {
+    match node {
+        TsqNode::Term(t) => match list.probe_lexeme(t) {
+            None => RgEval::Unknown,
+            Some(entries) => {
+                let mut by_file: HashMap<String, HashSet<u32>> = HashMap::new();
+                for e in entries {
+                    by_file
+                        .entry(e.file_path.to_string())
+                        .or_default()
+                        .insert(e.row_group);
+                }
+                RgEval::Map(by_file)
+            }
+        },
+        TsqNode::Not(_) => RgEval::Unknown,
+        // AND / phrase: intersect file sets; union row-groups within each
+        // surviving file.  The union (rather than rg-level intersection)
+        // mirrors the JSONB GIN row-group prune and is trivially sound — a
+        // row matching both operands sits in a row-group touched by each.
+        TsqNode::And(a, b) | TsqNode::Phrase(a, b) => {
+            match (eval_row_groups(a, list), eval_row_groups(b, list)) {
+                (RgEval::Unknown, x) | (x, RgEval::Unknown) => x,
+                (RgEval::Map(mut x), RgEval::Map(y)) => {
+                    x.retain(|f, _| y.contains_key(f));
+                    for (f, rgs) in x.iter_mut() {
+                        if let Some(other) = y.get(f) {
+                            rgs.extend(other.iter().copied());
+                        }
+                    }
+                    RgEval::Map(x)
+                }
+            }
+        }
+        TsqNode::Or(a, b) => match (eval_row_groups(a, list), eval_row_groups(b, list)) {
+            (RgEval::Map(mut x), RgEval::Map(y)) => {
+                for (f, rgs) in y {
+                    x.entry(f).or_default().extend(rgs);
+                }
+                RgEval::Map(x)
+            }
+            _ => RgEval::Unknown,
+        },
+    }
 }
 
 // ── Internal posting list ─────────────────────────────────────────────────────
@@ -236,12 +554,16 @@ pub fn extract_query_lexemes(tsquery: &str) -> HashSet<String> {
 /// Per-`(table, col)` in-memory posting list keyed by lexeme.
 #[derive(Debug, Default)]
 struct LexemePostingList {
-    /// `lexeme → set of (file, rg, row)`.
+    /// `lexeme → set of (interned file, rg, row)`.
     entries: HashMap<String, HashSet<TsvPostingEntry>>,
-    /// Insertion-ordered list of lexeme keys for LRU eviction.
+    /// Insertion-ordered list of lexeme keys for FIFO eviction.
     insert_order: Vec<String>,
     /// Total entry count (sum of all per-lexeme set sizes).
     total_count: usize,
+    /// Interned file paths (one `Arc<str>` per distinct file).
+    file_interner: HashSet<Arc<str>>,
+    /// Set once the first eviction fires so the operator warning logs once.
+    eviction_warned: bool,
 }
 
 impl LexemePostingList {
@@ -249,18 +571,30 @@ impl LexemePostingList {
         Self::default()
     }
 
+    /// Return the interned `Arc<str>` for `file_path`, creating it on first use.
+    fn intern_file(&mut self, file_path: &str) -> Arc<str> {
+        if let Some(existing) = self.file_interner.get(file_path) {
+            return existing.clone();
+        }
+        let arc: Arc<str> = Arc::from(file_path);
+        self.file_interner.insert(arc.clone());
+        arc
+    }
+
     /// Add a `(lexeme, entry)` pair.
     ///
-    /// Returns `true` if an eviction occurred during this insert.  The caller
-    /// (`GinTsvectorRegistry::index_row`) uses this signal to wipe the
-    /// `indexed_files` completeness set: once any lexeme has been evicted, the
-    /// posting list no longer has full coverage and file-level pruning must
-    /// not fire until the registry has been fully rebuilt.
-    fn insert(&mut self, lexeme: String, entry: TsvPostingEntry) -> bool {
+    /// Returns the set of file paths whose posting entries were **evicted**
+    /// by this insert (empty when no eviction occurred).  The caller
+    /// (`GinTsvectorRegistry::index_row`) un-marks exactly those files in the
+    /// per-file completeness map: a file whose lexemes were dropped no longer
+    /// has full coverage and must be force-scanned, while untouched files
+    /// stay prunable.
+    fn insert(&mut self, lexeme: String, entry: TsvPostingEntry) -> HashSet<String> {
+        let is_new_lexeme = !self.entries.contains_key(&lexeme);
         let set = self.entries.entry(lexeme.clone()).or_default();
-        let is_new_lexeme = set.is_empty();
-        set.insert(entry);
-        self.total_count += 1;
+        if set.insert(entry) {
+            self.total_count += 1;
+        }
 
         // Track insertion order only on the first posting for this lexeme so
         // eviction correctly identifies "oldest lexemes first".
@@ -269,31 +603,48 @@ impl LexemePostingList {
         }
 
         if self.total_count > posting_budget() {
-            self.evict_oldest();
-            true // eviction happened
+            if !self.eviction_warned {
+                self.eviction_warned = true;
+                tracing::warn!(
+                    budget = posting_budget(),
+                    "tsvector GIN posting budget exceeded; evicting oldest \
+                     lexemes (affected files degrade to full scans). Raise \
+                     BASIN_GIN_POSTING_BUDGET to keep more of the index in RAM."
+                );
+            }
+            self.evict_oldest()
         } else {
-            false
+            HashSet::new()
         }
     }
 
-    /// Evict the oldest 25% of lexemes.
-    fn evict_oldest(&mut self) {
+    /// Evict the oldest 25% of current lexemes.
+    ///
+    /// Returns the set of file paths that were referenced by the evicted
+    /// posting entries — those files lose full coverage and the caller must
+    /// un-mark them in the completeness map.
+    fn evict_oldest(&mut self) -> HashSet<String> {
         let evict_count = (self.insert_order.len() / 4).max(1);
         let to_evict: Vec<String> =
             self.insert_order.drain(..evict_count.min(self.insert_order.len())).collect();
+        let mut affected_files: HashSet<String> = HashSet::new();
         for k in &to_evict {
             if let Some(set) = self.entries.remove(k) {
+                for e in &set {
+                    affected_files.insert(e.file_path.to_string());
+                }
                 self.total_count = self.total_count.saturating_sub(set.len());
             }
         }
+        affected_files
     }
 
     /// Probe for `lexeme`.
     ///
-    /// Returns `None` when the lexeme has never been indexed (caller treats
-    /// as "unknown → full scan").  Returns `Some(set)` for a known lexeme;
-    /// the set may be empty when all posting entries for this lexeme were
-    /// evicted.
+    /// Returns `None` when the lexeme has never been indexed or was evicted
+    /// (caller treats as "unknown → cannot bound").  Returns `Some(set)` for
+    /// a known lexeme; the set may be empty when all posting entries for this
+    /// lexeme referenced files that have since been removed.
     fn probe_lexeme(&self, lexeme: &str) -> Option<&HashSet<TsvPostingEntry>> {
         self.entries.get(lexeme)
     }
@@ -303,9 +654,10 @@ impl LexemePostingList {
     fn remove_file(&mut self, file_path: &str) {
         for set in self.entries.values_mut() {
             let before = set.len();
-            set.retain(|e| e.file_path != file_path);
+            set.retain(|e| e.file_path.as_ref() != file_path);
             self.total_count = self.total_count.saturating_sub(before - set.len());
         }
+        self.file_interner.remove(file_path);
     }
 }
 
@@ -334,8 +686,11 @@ struct RegKey {
 ///
 /// `indexed_files` tracks, for each `(project, table, col)`, the set of file
 /// paths whose rows have been fully loaded into the posting list.  This is the
-/// completeness guard required by Phase 5.20.E: file-level pruning is only
-/// safe when every live data file appears in this set.
+/// completeness guard required by Phase 5.20.E: file-level pruning and the
+/// `Empty` short-circuit are only safe when every live data file appears in
+/// this set.  Eviction un-marks affected files *while still holding the
+/// posting-list lock*, so a reader that acquires the list after an eviction
+/// can never observe "lexeme evicted but file still marked".
 pub struct GinTsvectorRegistry {
     inner: Mutex<HashMap<RegKey, Arc<Mutex<LexemePostingList>>>>,
     /// File-completeness tracking: `RegKey → set of fully-indexed file paths`.
@@ -381,8 +736,9 @@ impl GinTsvectorRegistry {
     /// value (e.g. `"'cat':1 'dog':2"`).  Silently skips empty or NULL-like
     /// values.
     ///
-    /// This is called from the engine write path for every row written to a
-    /// tsvector column that has a GIN index declared in the catalog.
+    /// Called from the engine write path for every row written to a tsvector
+    /// column with a GIN index, and from the CREATE INDEX backfill for
+    /// pre-existing files.
     pub fn index_row(
         &self,
         project: &ProjectId,
@@ -399,52 +755,58 @@ impl GinTsvectorRegistry {
         }
         let arc = self.get_or_create(project, table, col);
         let mut list = arc.lock().expect("LexemePostingList lock poisoned");
-        let entry = TsvPostingEntry { file_path: file_path.to_string(), row_group, row };
-        let mut evicted = false;
+        let interned = list.intern_file(file_path);
+        let entry = TsvPostingEntry { file_path: interned, row_group, row };
+        let mut affected_files: HashSet<String> = HashSet::new();
         for lexeme in lexemes {
-            if list.insert(lexeme, entry.clone()) {
-                evicted = true;
-            }
+            affected_files.extend(list.insert(lexeme, entry.clone()));
         }
-        // If eviction occurred the posting list lost lexemes that were present
-        // in earlier files.  Those files are no longer fully covered by the
-        // in-RAM index, so the `indexed_files` completeness set must be
-        // cleared.  Any future `mark_file_indexed` calls (for files written
-        // AFTER the eviction) will repopulate the set, but the old files will
-        // not appear until a full reindex (or engine restart + warm-up) —
-        // meaning the completeness check will fail and the engine falls back
-        // to a full scan.  This is the safe and correct behaviour.
-        if evicted {
-            let key = RegKey {
-                project: *project,
-                table: table.clone(),
-                col: col.to_string(),
-            };
+        // Per-file completeness: if eviction dropped lexemes, only the files
+        // referenced by the dropped entries lose coverage — un-mark exactly
+        // those.  Files untouched by the eviction keep full lexeme coverage
+        // and stay prunable.  The indexed_files update happens while the
+        // posting-list lock is still held (`list` guard in scope) so probes
+        // can never observe "lexeme evicted but file still marked".
+        if !affected_files.is_empty() {
             if let Ok(mut map) = self.indexed_files.lock() {
-                map.remove(&key);
+                let key = RegKey {
+                    project: *project,
+                    table: table.clone(),
+                    col: col.to_string(),
+                };
+                if let Some(set) = map.get_mut(&key) {
+                    for f in &affected_files {
+                        set.remove(f);
+                    }
+                }
             }
         }
+        drop(list);
     }
 
     /// Probe the posting list for a `tsquery` predicate (`tsvector @@ tsquery`).
     ///
-    /// `tsquery_str` is the textual representation of the query-side operand
-    /// (e.g. `"'cat' & 'dog'"`).
+    /// `tsquery_str` must be the *canonical* textual form of the query-side
+    /// operand (e.g. `"'cat' & 'dog'"`, as produced by the engine's tsquery
+    /// canonicalisation — the same Snowball-stemmed pipeline that produced
+    /// the indexed tsvector lexemes).
     ///
-    /// All lexeme atoms extracted from the query are AND-merged: only files
-    /// that appear in every per-lexeme posting list are returned as candidates.
-    /// This is conservative (no false negatives) but may produce false
-    /// positives for OR / NOT sub-expressions — the caller must re-evaluate
-    /// the full `@@` predicate on every candidate row.
+    /// The query's boolean structure is honoured (see the module-level
+    /// per-operator soundness table): `&`/`<->` intersect file sets, `|`
+    /// unions them, `!` and unknown lexemes degrade to "cannot bound".
+    /// The result is a conservative superset; the caller must re-evaluate the
+    /// full `@@` predicate on every candidate row.
     ///
     /// Returns:
-    /// * [`TsvProbeResult::NoIndex`] — no posting list loaded yet, or a lexeme
-    ///   was evicted; caller must fall through to full scan.
-    /// * [`TsvProbeResult::Empty`] — the AND-intersection is empty; no rows
-    ///   can match.  Caller can short-circuit with zero rows.
+    /// * [`TsvProbeResult::NoIndex`] — no posting list loaded, malformed
+    ///   query, or the structure cannot be bounded (NOT branch, evicted /
+    ///   never-indexed lexeme in a required position).  Caller must fall
+    ///   through to a full scan.
+    /// * [`TsvProbeResult::Empty`] — the structural evaluation is provably
+    ///   empty; no *cold-file* rows can match.  The caller may short-circuit
+    ///   ONLY behind the no-live-overlay + per-file-completeness gates.
     /// * [`TsvProbeResult::FileCandidates`] — the set of file paths that
     ///   MIGHT contain matching rows.
-    ///
     pub fn probe_query(
         &self,
         project: &ProjectId,
@@ -452,11 +814,10 @@ impl GinTsvectorRegistry {
         col: &str,
         tsquery_str: &str,
     ) -> TsvProbeResult {
-        let lexemes = extract_query_lexemes(tsquery_str);
-        if lexemes.is_empty() {
-            // Empty query — conservative fall-through.
-            return TsvProbeResult::NoIndex;
-        }
+        let node = match parse_tsquery(tsquery_str) {
+            Some(n) => n,
+            None => return TsvProbeResult::NoIndex, // malformed/empty → full scan
+        };
 
         let arc = match self.get(project, table, col) {
             Some(a) => a,
@@ -464,54 +825,29 @@ impl GinTsvectorRegistry {
         };
         let list = arc.lock().expect("LexemePostingList lock poisoned");
 
-        // AND-merge posting lists for each lexeme.
-        let mut candidate_files: Option<HashSet<String>> = None;
-
-        for lexeme in &lexemes {
-            match list.probe_lexeme(lexeme) {
-                None => {
-                    // Lexeme not in index (never inserted or evicted) → unknown.
-                    // Conservative: fall through to full scan.
-                    return TsvProbeResult::NoIndex;
-                }
-                Some(entries) => {
-                    let files: HashSet<String> =
-                        entries.iter().map(|e| e.file_path.clone()).collect();
-                    candidate_files = Some(match candidate_files {
-                        None => files,
-                        Some(prev) => prev.intersection(&files).cloned().collect(),
-                    });
-                }
-            }
-        }
-
-        match candidate_files {
-            None => TsvProbeResult::NoIndex,
-            Some(files) if files.is_empty() => TsvProbeResult::Empty,
-            Some(files) => TsvProbeResult::FileCandidates(files),
+        match eval_files(&node, &list) {
+            FileEval::Unknown => TsvProbeResult::NoIndex,
+            FileEval::Files(files) if files.is_empty() => TsvProbeResult::Empty,
+            FileEval::Files(files) => TsvProbeResult::FileCandidates(files),
         }
     }
 
     /// Probe the posting list at row-group granularity.
     ///
-    /// Same correctness contract as [`Self::probe_query`] — the result is a
-    /// conservative superset and the caller MUST re-evaluate the full `@@`
-    /// predicate on every emitted row.  This variant preserves the
-    /// per-row-group granularity stored in the underlying posting list so the
-    /// read path can drive `ReadOptions.row_group_selection`, opening only
-    /// the surviving row-groups within each candidate file.
+    /// Same correctness contract and per-operator semantics as
+    /// [`Self::probe_query`] — the result is a conservative superset and the
+    /// caller MUST re-evaluate the full `@@` predicate on every emitted row.
+    /// This variant preserves the per-row-group granularity stored in the
+    /// underlying posting list so the read path can drive
+    /// `ReadOptions.row_group_selection`, opening only the surviving
+    /// row-groups within each candidate file.
     ///
-    /// Multi-lexeme `tsquery` semantics: AND-merge at the *file* level
-    /// (a candidate file must contain every lexeme) and the union of all
-    /// row-groups for those lexemes within each surviving file (a row-group
-    /// is a candidate if any lexeme touches it — the row-level re-evaluation
-    /// pass then filters false positives).  Tighter row-group intersection
-    /// would risk false negatives across row-group boundaries (`'cat'` in
-    /// rg=0 and `'dog'` in rg=1 of the same file can still satisfy
-    /// `'cat' & 'dog'` if the `@@` re-evaluation later sees both lexemes
-    /// jointly through a UDF-level recheck, but only when row-group level
-    /// re-evaluation considers both rg=0 and rg=1).  The union strategy
-    /// matches the existing JSONB GIN row-group prune behaviour.
+    /// `&`/`<->` sub-queries intersect at the *file* level and union the
+    /// operands' row-groups within each surviving file (a row-group is a
+    /// candidate if any required lexeme touches it; the row-level `@@`
+    /// re-evaluation filters false positives).  This union strategy matches
+    /// the JSONB GIN row-group prune.  `|` unions both files and per-file
+    /// row-groups; `!` and unknown lexemes degrade to `NoIndex`.
     pub fn probe_query_with_row_groups(
         &self,
         project: &ProjectId,
@@ -519,10 +855,10 @@ impl GinTsvectorRegistry {
         col: &str,
         tsquery_str: &str,
     ) -> TsvProbeRowGroupResult {
-        let lexemes = extract_query_lexemes(tsquery_str);
-        if lexemes.is_empty() {
-            return TsvProbeRowGroupResult::NoIndex;
-        }
+        let node = match parse_tsquery(tsquery_str) {
+            Some(n) => n,
+            None => return TsvProbeRowGroupResult::NoIndex,
+        };
 
         let arc = match self.get(project, table, col) {
             Some(a) => a,
@@ -530,49 +866,10 @@ impl GinTsvectorRegistry {
         };
         let list = arc.lock().expect("LexemePostingList lock poisoned");
 
-        // Per-lexeme: file -> set of row-groups.  Then file-level
-        // AND-intersection with per-file row-group union.
-        let mut per_lexeme: Vec<HashMap<String, HashSet<u32>>> =
-            Vec::with_capacity(lexemes.len());
-        for lexeme in &lexemes {
-            match list.probe_lexeme(lexeme) {
-                None => return TsvProbeRowGroupResult::NoIndex,
-                Some(entries) => {
-                    let mut by_file: HashMap<String, HashSet<u32>> = HashMap::new();
-                    for e in entries {
-                        by_file
-                            .entry(e.file_path.clone())
-                            .or_default()
-                            .insert(e.row_group);
-                    }
-                    per_lexeme.push(by_file);
-                }
-            }
-        }
-
-        // AND-intersect file sets across lexemes; union row-groups for each
-        // surviving file.
-        let mut iter = per_lexeme.into_iter();
-        let first = match iter.next() {
-            Some(m) => m,
-            None => return TsvProbeRowGroupResult::NoIndex,
+        let merged = match eval_row_groups(&node, &list) {
+            RgEval::Unknown => return TsvProbeRowGroupResult::NoIndex,
+            RgEval::Map(m) => m,
         };
-        let mut merged: HashMap<String, HashSet<u32>> = first;
-        for next in iter {
-            // Keep only files present in `next`; union their row-groups.
-            let kept_keys: Vec<String> =
-                merged.keys().filter(|k| next.contains_key(*k)).cloned().collect();
-            let mut new_merged: HashMap<String, HashSet<u32>> =
-                HashMap::with_capacity(kept_keys.len());
-            for k in kept_keys {
-                let mut rgs = merged.remove(&k).unwrap_or_default();
-                if let Some(other) = next.get(&k) {
-                    rgs.extend(other.iter().copied());
-                }
-                new_merged.insert(k, rgs);
-            }
-            merged = new_merged;
-        }
 
         if merged.is_empty() {
             return TsvProbeRowGroupResult::Empty;
@@ -592,7 +889,7 @@ impl GinTsvectorRegistry {
     }
 
     /// Remove all posting entries that reference `file_path` for
-    /// `(project, table, col)`.  Call this when a Parquet file is compacted
+    /// `(project, table, col)`.  Call this when a data file is compacted
     /// or deleted so the posting list does not return stale candidates.
     ///
     /// Also removes `file_path` from the indexed-files completeness set so
@@ -608,20 +905,32 @@ impl GinTsvectorRegistry {
         if let Some(arc) = self.get(project, table, col) {
             let mut list = arc.lock().expect("LexemePostingList lock poisoned");
             list.remove_file(file_path);
-        }
-        // Remove from completeness tracking.
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
-        if let Ok(mut map) = self.indexed_files.lock() {
-            if let Some(set) = map.get_mut(&key) {
-                set.remove(file_path);
+            // Remove from completeness tracking while the list lock is held
+            // (same ordering as eviction in `index_row`).
+            let key =
+                RegKey { project: *project, table: table.clone(), col: col.to_string() };
+            if let Ok(mut map) = self.indexed_files.lock() {
+                if let Some(set) = map.get_mut(&key) {
+                    set.remove(file_path);
+                }
+            }
+            drop(list);
+        } else {
+            let key =
+                RegKey { project: *project, table: table.clone(), col: col.to_string() };
+            if let Ok(mut map) = self.indexed_files.lock() {
+                if let Some(set) = map.get_mut(&key) {
+                    set.remove(file_path);
+                }
             }
         }
     }
 
     /// Record that `file_path` has been fully indexed for `(project, table,
     /// col)`.  Called immediately after all rows in a new file have been
-    /// passed to [`index_row`].  This is the write side of the completeness
-    /// guard: a file that appears here is safe to use as a prune boundary.
+    /// passed to [`Self::index_row`].  This is the write side of the
+    /// completeness guard: a file that appears here is safe to use as a
+    /// prune boundary.
     pub fn mark_file_indexed(
         &self,
         project: &ProjectId,
@@ -643,9 +952,10 @@ impl GinTsvectorRegistry {
     /// completeness = indexed_files ⊇ live_files
     /// ```
     ///
-    /// If `completeness` is true, file-level pruning to `FileCandidates` is
-    /// safe.  If any live file is missing from this set, pruning must NOT
-    /// happen (full scan instead, no false negatives).
+    /// If `completeness` is true, file-level pruning to `FileCandidates` (and
+    /// the `Empty` short-circuit, absent a live overlay) is safe.  If any
+    /// live file is missing from this set, pruning must NOT happen (full scan
+    /// instead, no false negatives).
     pub fn indexed_files_for(
         &self,
         project: &ProjectId,
@@ -687,11 +997,14 @@ impl Default for GinTsvectorRegistry {
 /// Result of a `tsvector @@ tsquery` probe against the GIN posting list.
 #[derive(Debug)]
 pub enum TsvProbeResult {
-    /// No posting list for this column, or a required lexeme was evicted.
-    /// Caller must fall through to a full scan (no false negatives).
+    /// No posting list for this column, a malformed query, or a structure
+    /// the posting list cannot bound (NOT branch, evicted/never-indexed
+    /// lexeme in a required position).  Caller must fall through to a full
+    /// scan (no false negatives).
     NoIndex,
-    /// The AND-intersection of all lexeme posting lists is empty.  No rows in
-    /// the table can satisfy the FTS predicate.
+    /// The structural evaluation over the posting lists is empty.  No
+    /// *cold-file* rows can satisfy the FTS predicate; the caller may
+    /// short-circuit only behind the overlay + completeness gates.
     Empty,
     /// The set of file paths that may contain matching rows.  The caller reads
     /// only these files and re-applies the full `@@` predicate for correctness.
@@ -707,10 +1020,10 @@ pub enum TsvProbeResult {
 /// ascending order.
 #[derive(Debug)]
 pub enum TsvProbeRowGroupResult {
-    /// No posting list, or a required lexeme was missing/evicted.
+    /// No posting list, malformed query, or an unboundable structure.
     NoIndex,
-    /// The AND-intersection is empty across all lexemes — short-circuit
-    /// with zero rows.
+    /// The structural evaluation is empty — short-circuit with zero rows
+    /// (behind the overlay + completeness gates only).
     Empty,
     /// `file_path → sorted row-group indices`.  Files absent from this map
     /// must be read in full (no false negatives).
@@ -765,28 +1078,56 @@ mod tests {
         assert_eq!(lexemes.len(), 1);
     }
 
-    // ── extract_query_lexemes ─────────────────────────────────────────────────
+    // ── tsquery structural parser ─────────────────────────────────────────────
 
     #[test]
-    fn extract_query_lexemes_and_query() {
-        let lexemes = extract_query_lexemes("'cat' & 'dog'");
-        assert!(lexemes.contains("cat"), "lexemes={lexemes:?}");
-        assert!(lexemes.contains("dog"), "lexemes={lexemes:?}");
+    fn parse_tsquery_and_or_not_phrase() {
+        use TsqNode::*;
+        assert_eq!(
+            parse_tsquery("'cat' & 'dog'"),
+            Some(And(Box::new(Term("cat".into())), Box::new(Term("dog".into()))))
+        );
+        assert_eq!(
+            parse_tsquery("'cat' | 'dog'"),
+            Some(Or(Box::new(Term("cat".into())), Box::new(Term("dog".into()))))
+        );
+        assert_eq!(
+            parse_tsquery("!'dog'"),
+            Some(Not(Box::new(Term("dog".into()))))
+        );
+        assert_eq!(
+            parse_tsquery("'quick' <-> 'brown'"),
+            Some(Phrase(Box::new(Term("quick".into())), Box::new(Term("brown".into()))))
+        );
+        assert_eq!(
+            parse_tsquery("'quick' <2> 'fox'"),
+            Some(Phrase(Box::new(Term("quick".into())), Box::new(Term("fox".into()))))
+        );
+        // Precedence: | binds loosest.
+        assert_eq!(
+            parse_tsquery("'a' | 'b' & 'c'"),
+            Some(Or(
+                Box::new(Term("a".into())),
+                Box::new(And(Box::new(Term("b".into())), Box::new(Term("c".into()))))
+            ))
+        );
+        // Parens override.
+        assert_eq!(
+            parse_tsquery("('a' | 'b') & 'c'"),
+            Some(And(
+                Box::new(Or(Box::new(Term("a".into())), Box::new(Term("b".into())))),
+                Box::new(Term("c".into()))
+            ))
+        );
     }
 
     #[test]
-    fn extract_query_lexemes_or_query() {
-        // OR query — we still extract both lexemes (conservative superset).
-        let lexemes = extract_query_lexemes("'cat' | 'dog'");
-        assert!(lexemes.contains("cat"), "lexemes={lexemes:?}");
-        assert!(lexemes.contains("dog"), "lexemes={lexemes:?}");
-    }
-
-    #[test]
-    fn extract_query_lexemes_phrase() {
-        let lexemes = extract_query_lexemes("'quick' <-> 'brown'");
-        assert!(lexemes.contains("quick"), "lexemes={lexemes:?}");
-        assert!(lexemes.contains("brown"), "lexemes={lexemes:?}");
+    fn parse_tsquery_malformed_is_none() {
+        assert_eq!(parse_tsquery(""), None);
+        assert_eq!(parse_tsquery("   "), None);
+        assert_eq!(parse_tsquery("'a' & ('b'"), None); // unbalanced paren
+        assert_eq!(parse_tsquery("'a' 'b'"), None); // missing operator
+        assert_eq!(parse_tsquery("'unterminated"), None);
     }
 
     // ── GinTsvectorRegistry: no-index path ───────────────────────────────────
@@ -861,6 +1202,111 @@ mod tests {
         );
     }
 
+    // ── GinTsvectorRegistry: OR unions file sets (soundness) ─────────────────
+
+    #[test]
+    fn probe_or_unions_files() {
+        let reg = GinTsvectorRegistry::new();
+        let proj = ProjectId::new();
+        let tbl = TableName::new("docs").unwrap();
+
+        // "cat" only in f1; "dog" only in f2; "fish" only in f3.
+        reg.index_row(&proj, &tbl, "body", "'cat':1", "f1.parquet", 0, 0);
+        reg.index_row(&proj, &tbl, "body", "'dog':1", "f2.parquet", 0, 0);
+        reg.index_row(&proj, &tbl, "body", "'fish':1", "f3.parquet", 0, 0);
+
+        // 'cat' | 'dog' must include BOTH f1 and f2 (an AND-merge would
+        // intersect to ∅ and wrongly short-circuit) and may exclude f3.
+        let result = reg.probe_query(&proj, &tbl, "body", "'cat' | 'dog'");
+        match result {
+            TsvProbeResult::FileCandidates(files) => {
+                assert!(files.contains("f1.parquet"), "OR must keep f1: {files:?}");
+                assert!(files.contains("f2.parquet"), "OR must keep f2: {files:?}");
+                assert!(!files.contains("f3.parquet"), "OR may prune f3: {files:?}");
+            }
+            other => panic!("expected FileCandidates for OR, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_or_with_unknown_branch_declines() {
+        let reg = GinTsvectorRegistry::new();
+        let proj = ProjectId::new();
+        let tbl = TableName::new("docs").unwrap();
+        reg.index_row(&proj, &tbl, "body", "'cat':1", "f1.parquet", 0, 0);
+
+        // 'dog' was never indexed: the OR cannot be bounded → NoIndex.
+        let result = reg.probe_query(&proj, &tbl, "body", "'cat' | 'dog'");
+        assert!(
+            matches!(result, TsvProbeResult::NoIndex),
+            "OR with an unknown branch must decline to full scan, got {result:?}"
+        );
+    }
+
+    // ── GinTsvectorRegistry: NOT declines / narrows soundly ─────────────────
+
+    #[test]
+    fn probe_not_alone_declines() {
+        let reg = GinTsvectorRegistry::new();
+        let proj = ProjectId::new();
+        let tbl = TableName::new("docs").unwrap();
+        reg.index_row(&proj, &tbl, "body", "'dog':1", "f1.parquet", 0, 0);
+
+        // !'dog' rows may live in files with no indexed lexeme at all.
+        let result = reg.probe_query(&proj, &tbl, "body", "!'dog'");
+        assert!(
+            matches!(result, TsvProbeResult::NoIndex),
+            "bare NOT must decline to full scan, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn probe_and_not_narrows_to_positive_side() {
+        let reg = GinTsvectorRegistry::new();
+        let proj = ProjectId::new();
+        let tbl = TableName::new("docs").unwrap();
+
+        // f1: cat only.  f2: cat+dog.  f3: dog only.
+        reg.index_row(&proj, &tbl, "body", "'cat':1", "f1.parquet", 0, 0);
+        reg.index_row(&proj, &tbl, "body", "'cat':1 'dog':2", "f2.parquet", 0, 0);
+        reg.index_row(&proj, &tbl, "body", "'dog':1", "f3.parquet", 0, 0);
+
+        // 'cat' & !'dog': candidates must include EVERY file containing
+        // 'cat' (f1 AND f2 — the !'dog' side cannot exclude f2 at file level
+        // because another row of f2 may lack 'dog').  f3 is prunable.
+        let result = reg.probe_query(&proj, &tbl, "body", "'cat' & !'dog'");
+        match result {
+            TsvProbeResult::FileCandidates(files) => {
+                assert!(files.contains("f1.parquet"), "f1 must be kept: {files:?}");
+                assert!(files.contains("f2.parquet"), "f2 must be kept: {files:?}");
+                assert!(!files.contains("f3.parquet"), "f3 may be pruned: {files:?}");
+            }
+            other => panic!("expected FileCandidates, got {other:?}"),
+        }
+    }
+
+    // ── GinTsvectorRegistry: phrase folds to AND ──────────────────────────────
+
+    #[test]
+    fn probe_phrase_intersects_files() {
+        let reg = GinTsvectorRegistry::new();
+        let proj = ProjectId::new();
+        let tbl = TableName::new("docs").unwrap();
+
+        // f1 has both lexemes (order unknown to the index); f2 only "quick".
+        reg.index_row(&proj, &tbl, "body", "'quick':1 'fox':2", "f1.parquet", 0, 0);
+        reg.index_row(&proj, &tbl, "body", "'quick':1", "f2.parquet", 0, 0);
+
+        let result = reg.probe_query(&proj, &tbl, "body", "'quick' <-> 'fox'");
+        match result {
+            TsvProbeResult::FileCandidates(files) => {
+                assert!(files.contains("f1.parquet"), "f1 must be kept: {files:?}");
+                assert!(!files.contains("f2.parquet"), "f2 may be pruned: {files:?}");
+            }
+            other => panic!("expected FileCandidates for phrase, got {other:?}"),
+        }
+    }
+
     // ── GinTsvectorRegistry: miss path ────────────────────────────────────────
 
     #[test]
@@ -875,6 +1321,27 @@ mod tests {
         // Probe for "dog" — never indexed → NoIndex (conservative).
         let result = reg.probe_query(&proj, &tbl, "body", "'dog'");
         assert!(matches!(result, TsvProbeResult::NoIndex));
+    }
+
+    #[test]
+    fn probe_and_with_missing_lexeme_narrows_to_known_side() {
+        let reg = GinTsvectorRegistry::new();
+        let proj = ProjectId::new();
+        let tbl = TableName::new("docs").unwrap();
+
+        reg.index_row(&proj, &tbl, "body", "'cat':1", "f1.parquet", 0, 0);
+        reg.index_row(&proj, &tbl, "body", "'fish':1", "f2.parquet", 0, 0);
+
+        // 'cat' & 'dog' where 'dog' was never indexed: the AND can still be
+        // bounded by the known side — candidates = files('cat') = {f1}.
+        let result = reg.probe_query(&proj, &tbl, "body", "'cat' & 'dog'");
+        match result {
+            TsvProbeResult::FileCandidates(files) => {
+                assert!(files.contains("f1.parquet"), "f1 must be kept: {files:?}");
+                assert!(!files.contains("f2.parquet"), "f2 may be pruned: {files:?}");
+            }
+            other => panic!("expected FileCandidates, got {other:?}"),
+        }
     }
 
     // ── GinTsvectorRegistry: multiple row-groups / rows ───────────────────────
@@ -908,6 +1375,7 @@ mod tests {
         let tbl = TableName::new("docs").unwrap();
 
         reg.index_row(&proj, &tbl, "body", "'cat':1 'dog':2", "f1.parquet", 0, 0);
+        reg.mark_file_indexed(&proj, &tbl, "body", "f1.parquet");
 
         reg.remove_file(&proj, &tbl, "body", "f1.parquet");
 
@@ -918,6 +1386,50 @@ mod tests {
             matches!(result, TsvProbeResult::NoIndex | TsvProbeResult::Empty),
             "expected NoIndex or Empty after remove, got {result:?}"
         );
+        // Completeness set no longer claims coverage of the removed file.
+        assert!(
+            !reg.indexed_files_for(&proj, &tbl, "body").contains("f1.parquet"),
+            "remove_file must un-mark the file in the completeness set"
+        );
+    }
+
+    // ── eviction un-marks affected files (per-file completeness) ─────────────
+
+    #[test]
+    fn evict_oldest_reports_affected_files() {
+        let mut list = LexemePostingList::new();
+        let f1 = list.intern_file("f1.parquet");
+        let f2 = list.intern_file("f2.parquet");
+        list.insert(
+            "old_lexeme".into(),
+            TsvPostingEntry { file_path: f1.clone(), row_group: 0, row: 0 },
+        );
+        list.insert(
+            "new_lexeme".into(),
+            TsvPostingEntry { file_path: f2.clone(), row_group: 0, row: 0 },
+        );
+        assert_eq!(list.total_count, 2);
+
+        // Manually evict (budget-independent): the oldest 25% of 2 lexemes
+        // is max(0,1)=1 lexeme → "old_lexeme", which references only f1.
+        let affected = list.evict_oldest();
+        assert!(affected.contains("f1.parquet"), "affected={affected:?}");
+        assert!(!affected.contains("f2.parquet"), "affected={affected:?}");
+        assert_eq!(list.total_count, 1);
+        // The surviving lexeme still probes.
+        assert!(list.probe_lexeme("new_lexeme").is_some());
+        assert!(list.probe_lexeme("old_lexeme").is_none());
+    }
+
+    #[test]
+    fn duplicate_insert_does_not_inflate_count() {
+        let mut list = LexemePostingList::new();
+        let f1 = list.intern_file("f1.parquet");
+        let e = TsvPostingEntry { file_path: f1, row_group: 0, row: 0 };
+        list.insert("cat".into(), e.clone());
+        list.insert("cat".into(), e);
+        assert_eq!(list.total_count, 1, "duplicate (lexeme, entry) must not double-count");
+        assert_eq!(list.insert_order.len(), 1, "lexeme must appear once in insert order");
     }
 
     // ── GinTsvectorRegistry: total_entries ───────────────────────────────────
@@ -979,6 +1491,35 @@ mod tests {
                 assert!(!map.contains_key("f2.parquet"), "f2 must be excluded");
             }
             other => panic!("expected FileRowGroups, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_query_with_row_groups_or_unions() {
+        let reg = GinTsvectorRegistry::new();
+        let proj = ProjectId::new();
+        let tbl = TableName::new("docs").unwrap();
+
+        reg.index_row(&proj, &tbl, "body", "'cat':1", "f1.parquet", 0, 0);
+        reg.index_row(&proj, &tbl, "body", "'dog':1", "f1.parquet", 3, 0);
+        reg.index_row(&proj, &tbl, "body", "'dog':1", "f2.parquet", 1, 0);
+
+        let result =
+            reg.probe_query_with_row_groups(&proj, &tbl, "body", "'cat' | 'dog'");
+        match result {
+            TsvProbeRowGroupResult::FileRowGroups(map) => {
+                assert_eq!(
+                    map.get("f1.parquet"),
+                    Some(&vec![0u32, 3u32]),
+                    "f1 must carry the union of cat/dog row-groups: {map:?}"
+                );
+                assert_eq!(
+                    map.get("f2.parquet"),
+                    Some(&vec![1u32]),
+                    "f2 must be kept by the OR: {map:?}"
+                );
+            }
+            other => panic!("expected FileRowGroups for OR, got {other:?}"),
         }
     }
 

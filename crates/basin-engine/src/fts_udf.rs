@@ -12,8 +12,11 @@
 //!   [`STOPWORDS`]), **stems with Snowball English** (Phase 5.20.C), assigns
 //!   1-based positions, and emits the PG canonical sorted form.
 //! - **`to_tsquery([config,] text)`** — parses `&` `|` `!` and the phrase
-//!   operator `<->` (and `<N>` distance) into a boolean tree; emits the PG
-//!   canonical form with minimal parentheses.
+//!   operator `<->` (and `<N>` distance) into a boolean tree, **stems each
+//!   lexeme** through the config's dictionary (Phase 5.20.E — same Snowball
+//!   pipeline as `to_tsvector`, so `to_tsquery('english','runs')` matches a
+//!   document containing `running`); emits the PG canonical form with
+//!   minimal parentheses.  Raw `::tsquery` casts are NOT stemmed (PG parity).
 //! - **`plainto_tsquery([config,] text)`** — tokenises like `to_tsvector`
 //!   (stopwords dropped) and AND-joins the remaining lexemes.
 //! - **`phraseto_tsquery([config,] text)`** — like `plainto_tsquery` but
@@ -41,9 +44,14 @@
 //! - **Language configs** beyond `english` / `simple` (the config arg is
 //!   accepted; only `simple` changes behaviour — no stemming, no stopwords).
 //! - **`websearch_to_tsquery`** (best-effort: treated like `plainto`).
-//! - Real **GIN index acceleration** (`CREATE INDEX ... USING gin` is a
-//!   no-op; `@@` always uses a sequential scan — correct, just not fast).
 //! - `ts_delete` / `ts_filter` / `numnode` precision / `querytree`.
+//!
+//! GIN index acceleration for `@@` is no longer out of scope: Phase 5.20.E
+//! wires `CREATE INDEX … USING gin (tsvector_col)` into a posting-list
+//! registry (`basin_storage::index::gin_tsvector`) consumed by the executor's
+//! Empty short-circuit and the session file/row-group pruning paths.  The
+//! `@@` UDF here remains the row-level re-evaluation oracle for every
+//! candidate row the index admits.
 //!
 //! The boundary is deliberate: a *correct narrow* FTS beats a broad fake
 //! one.  Where a case cannot be made correct it fails honestly rather than
@@ -469,10 +477,14 @@ enum TsQuery {
 impl TsQuery {
     /// Parse a `to_tsquery`-style expression: lexemes joined by `&` `|`,
     /// `!` prefix negation, `<->` / `<N>` phrase, parentheses.  Tokens are
-    /// lowercased; **no stemming**.  Stopwords inside an explicit
-    /// `to_tsquery` are kept (PG drops them with a notice — we keep the
-    /// boolean structure intact which is the safe/correct-for-match choice
-    /// and is documented).
+    /// lowercased; **no stemming at this layer** — the `to_tsquery` UDF /
+    /// canonicalisation applies [`TsQuery::stem_terms`] afterwards so query
+    /// lexemes go through the SAME Snowball pipeline as `to_tsvector`
+    /// (PG stems `to_tsquery` terms; a raw `::tsquery` cast does not, which
+    /// is why stemming lives outside this parser).  Stopwords inside an
+    /// explicit `to_tsquery` are kept (PG drops them with a notice — we keep
+    /// the boolean structure intact which is the safe/correct-for-match
+    /// choice and is documented).
     fn parse_to_tsquery(input: &str) -> Result<Option<TsQuery>, String> {
         let toks = lex_query(input)?;
         if toks.is_empty() {
@@ -517,6 +529,43 @@ impl TsQuery {
             };
         }
         Some(acc)
+    }
+
+    /// Stem every lexeme term through the language's dictionary, preserving
+    /// the boolean structure.  This is the query-side half of the stemming
+    /// contract: `to_tsvector('english', 'running')` stores `'run'`, so
+    /// `to_tsquery('english', 'runs')` must probe/match `'run'` too — a stem
+    /// mismatch silently breaks both `@@` matching and GIN-prune soundness.
+    /// `Simple` is a no-op.  Applied by the `to_tsquery` UDF and the
+    /// `to_tsquery_text` canonicalisation, NOT by raw `::tsquery` casts
+    /// (PG does not stem direct casts either).
+    fn stem_terms(self, lang: FtsLanguage) -> TsQuery {
+        match self {
+            TsQuery::Term(t) => {
+                let stemmed = stem_token(&t, lang);
+                // A term that stems to nothing keeps its original form —
+                // never silently drop a boolean operand.
+                if stemmed.is_empty() {
+                    TsQuery::Term(t)
+                } else {
+                    TsQuery::Term(stemmed)
+                }
+            }
+            TsQuery::Not(q) => TsQuery::Not(Box::new(q.stem_terms(lang))),
+            TsQuery::And(a, b) => TsQuery::And(
+                Box::new(a.stem_terms(lang)),
+                Box::new(b.stem_terms(lang)),
+            ),
+            TsQuery::Or(a, b) => TsQuery::Or(
+                Box::new(a.stem_terms(lang)),
+                Box::new(b.stem_terms(lang)),
+            ),
+            TsQuery::Phrase(a, b, n) => TsQuery::Phrase(
+                Box::new(a.stem_terms(lang)),
+                Box::new(b.stem_terms(lang)),
+                n,
+            ),
+        }
     }
 
     /// PG canonical text form with minimal parentheses.
@@ -905,7 +954,14 @@ pub(crate) fn to_tsquery_text(
     body: &str,
 ) -> Result<String, String> {
     let q = match func {
-        "to_tsquery" => TsQuery::parse_to_tsquery(body)?,
+        // PG stems explicit `to_tsquery` lexemes through the config's
+        // dictionary (`to_tsquery('english','runs')` → `'run'`).  Stemming
+        // here keeps query lexemes in the same Snowball universe as the
+        // `to_tsvector` document side — required for `@@` matching AND for
+        // GIN posting-list probe soundness (the probe consumes this
+        // canonical form via `index_probe::detect_tsvector_match`).
+        "to_tsquery" => TsQuery::parse_to_tsquery(body)?
+            .map(|q| q.stem_terms(FtsLanguage::from_config(config))),
         "phraseto_tsquery" => TsQuery::phraseto(body, config),
         _ => TsQuery::plainto(body, config),
     };
@@ -1155,9 +1211,15 @@ impl ScalarUDFImpl for ToTsqueryUdf {
                     .and_then(|c| if c.is_null(i) { None } else { Some(c.value(i)) });
             let text = body_arr.value(i);
             let q: Option<TsQuery> = match self.name.as_str() {
-                "to_tsquery" => TsQuery::parse_to_tsquery(text).map_err(|e| {
-                    datafusion::common::DataFusionError::Execution(format!("to_tsquery: {e}"))
-                })?,
+                // Stem explicit-query lexemes through the config dictionary
+                // (same pipeline as to_tsvector) — see `to_tsquery_text`.
+                "to_tsquery" => TsQuery::parse_to_tsquery(text)
+                    .map_err(|e| {
+                        datafusion::common::DataFusionError::Execution(format!(
+                            "to_tsquery: {e}"
+                        ))
+                    })?
+                    .map(|q| q.stem_terms(FtsLanguage::from_config(cfg))),
                 "phraseto_tsquery" => TsQuery::phraseto(text, cfg),
                 // plainto / websearch (best-effort) → implicit AND.
                 _ => TsQuery::plainto(text, cfg),
@@ -1924,5 +1986,50 @@ mod tests {
     fn unparseable_query_is_honest_no_match() {
         // Unbalanced paren → parse error → @@ returns false (never a fake hit)
         assert!(TsQuery::parse_to_tsquery("a & (b").is_err());
+    }
+
+    #[test]
+    fn to_tsquery_stems_terms_like_to_tsvector() {
+        // Phase 5.20.E stemming-consistency contract: to_tsquery lexemes go
+        // through the SAME Snowball pipeline as to_tsvector, so a document
+        // indexed as 'run' (from "running") matches to_tsquery('runs').
+        assert_eq!(
+            to_tsquery_text("to_tsquery", None, "runs").unwrap(),
+            "'run'"
+        );
+        assert_eq!(
+            to_tsquery_text("to_tsquery", Some("english"), "running & dogs").unwrap(),
+            "'run' & 'dog'"
+        );
+        // Boolean structure is preserved through stemming.
+        assert_eq!(
+            to_tsquery_text("to_tsquery", None, "running | !jumping").unwrap(),
+            "'run' | !'jump'"
+        );
+        assert_eq!(
+            to_tsquery_text("to_tsquery", None, "running <-> dogs").unwrap(),
+            "'run' <-> 'dog'"
+        );
+        // 'simple' config: no stemming.
+        assert_eq!(
+            to_tsquery_text("to_tsquery", Some("simple"), "running").unwrap(),
+            "'running'"
+        );
+        // Raw ::tsquery casts are NOT stemmed (PG parity).
+        assert_eq!(canonicalize_tsquery_text("running").unwrap(), "'running'");
+    }
+
+    #[test]
+    fn stemmed_query_matches_stemmed_document() {
+        // End-to-end stem consistency at the @@ evaluator level: the document
+        // "running fast" stems to 'run' + 'fast'; to_tsquery('runs') stems to
+        // 'run' and must match.
+        let v = TsVector::from_text_document("running fast", Some("english"));
+        let canon = to_tsquery_text("to_tsquery", Some("english"), "runs").unwrap();
+        let q = TsQuery::parse_to_tsquery(&canon).unwrap().unwrap();
+        assert!(q.matches(&v), "to_tsquery('runs') must match doc 'running'");
+        // And the unstemmed cast form does NOT match — same divergence as PG.
+        let raw = TsQuery::parse_to_tsquery("runs").unwrap().unwrap();
+        assert!(!raw.matches(&v), "'runs'::tsquery (unstemmed) must not match");
     }
 }

@@ -1510,35 +1510,50 @@ fn extract_tsquery_from_expr(expr: &sqlparser::ast::Expr) -> Option<String> {
             ) {
                 return None;
             }
-            // Extract the last string argument as the query body.
             let args: Vec<&FunctionArg> = match &f.args {
                 sqlparser::ast::FunctionArguments::List(l) => l.args.iter().collect(),
                 _ => return None,
             };
-            // Accept 1-arg (body) or 2-arg (config, body) forms.
-            let body_arg = args.last()?;
-            let body_str = match body_arg {
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => {
-                    extract_string_literal(inner)?
+            let arg_literal = |arg: &&FunctionArg| -> Option<String> {
+                match arg {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => {
+                        extract_string_literal(inner)
+                    }
+                    _ => None,
                 }
+            };
+            // Accept 1-arg (body) or 2-arg (config, body) forms.  The config
+            // MUST be threaded through: canonicalisation is config-sensitive
+            // (`simple` skips stemming/stopwords) and the probe lexemes must
+            // be byte-identical to what the runtime tsquery UDF produces —
+            // a config mismatch here would stem the probe differently from
+            // the `@@` evaluation and prune files that hold real matches.
+            // A non-literal config (parameter, column) → None → full scan.
+            let (config, body_str) = match args.len() {
+                1 => (None, arg_literal(args.first()?)?),
+                2 => (Some(arg_literal(args.first()?)?), arg_literal(args.last()?)?),
                 _ => return None,
             };
-            // For posting-list probe we treat the query body as a list of
-            // AND-ed lexemes (conservative — see gin_tsvector module doc).
-            // Return it verbatim; `extract_query_lexemes` in gin_tsvector will
-            // parse the lexemes from the canonical form.
-            //
-            // For `plainto_tsquery` we want the stemmed canonical form so the
-            // lexemes match what `to_tsvector` stored.  We delegate to the
-            // same `to_tsquery_text` helper used by `fts_udf`.
-            let canonical = crate::fts_udf::to_tsquery_text(&fn_name, None, &body_str).ok()?;
+            // Delegate to the same `to_tsquery_text` canonicalisation the
+            // FTS UDFs use (Snowball stemming for `to_tsquery`/`plainto`
+            // under non-simple configs).  The structural probe in
+            // `gin_tsvector` parses this canonical form.
+            let canonical =
+                crate::fts_udf::to_tsquery_text(&fn_name, config.as_deref(), &body_str)
+                    .ok()?;
             Some(canonical)
         }
-        // `'fox'::tsquery` bare cast — treat the literal as a plain tsquery.
+        // `'fox & dog'::tsquery` bare cast — canonicalise exactly like the
+        // runtime `@@` evaluator does (parse as a raw tsquery, NO stemming —
+        // PG does not stem direct casts either, and the row-level
+        // re-evaluation parses the same raw text).
         Expr::Cast { expr: inner, .. } => extract_tsquery_from_expr(inner),
-        // Bare string literal `'fox'` — treat as plainto_tsquery body.
+        // Bare string literal `'fox'` — the rewrite lowers `col @@ 'fox'` to
+        // `tsvector_match_udf(col, 'fox')`, which parses the RHS with the
+        // raw (unstemmed) tsquery grammar.  Canonicalise with that same
+        // grammar so probe lexemes match the evaluator's terms.
         Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => {
-            Some(s.clone())
+            crate::fts_udf::canonicalize_tsquery_text(s).ok()
         }
         _ => None,
     }

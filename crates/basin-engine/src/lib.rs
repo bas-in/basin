@@ -872,6 +872,16 @@ impl Engine {
         &self.inner.gin_fts_registry
     }
 
+    /// Public accessor for integration tests that need to manipulate the FTS
+    /// posting-list registry (e.g. de-index a file to verify that incomplete
+    /// coverage degrades to a full scan instead of wrong results).  Mirrors
+    /// [`Self::gin_index_registry_for_test`].
+    pub fn gin_fts_registry_for_test(
+        &self,
+    ) -> Arc<basin_storage::index::gin_tsvector::GinTsvectorRegistry> {
+        self.inner.gin_fts_registry.clone()
+    }
+
     // ── Inv-W5 / W9: JSONB `@>` posting-list registry ─────────────────────────
 
     /// Process-wide JSONB posting-list registry for `@>` containment.

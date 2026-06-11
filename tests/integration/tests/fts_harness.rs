@@ -1,26 +1,21 @@
 //! Phase 5.20.A — Full-text search (FTS) test harness.
 //!
 //! **Task:** TASK.md Phase 5.20.A — FTS battery + ORM-compat test harness.
-//! **Test-first convention:** this file lands BEFORE any real FTS
-//! implementation. Every test is `#[ignore]`d until the implementation tasks
-//! 5.20.B/C/D/E/F/G close the corresponding slices.
+//! **Test-first convention:** this file landed BEFORE any real FTS
+//! implementation with every test `#[ignore]`d; the implementation tasks
+//! 5.20.B/C/D/E have since closed every slice and ALL ignores are dropped —
+//! `cargo test --test fts_harness` runs the whole battery.
 //!
 //! ## Named slices
 //!
-//! | Test fn                     | Slice                    | Closed by |
-//! |-----------------------------|--------------------------|-----------|
-//! | `fts_type_round_trip`       | type round-trip          | 5.20.B    |
-//! | `fts_query_at_at_matches`   | matching                 | 5.20.D    |
-//! | `fts_stemming_golden_file`  | stemming golden-file     | 5.20.C    |
-//! | `fts_ranking_deterministic` | ranking determinism      | 5.20.D    |
-//! | `fts_orm_compat`            | ORM compat               | 5.20.B/C/D|
-//!
-//! ## How to flip a slice green
-//!
-//! Once the relevant phase sub-task lands, drop the `#[ignore]` on the
-//! corresponding test (or replace it with a targeted `#[ignore = "gated on
-//! #NNN"]` if only part of the slice is resolved), and confirm that
-//! `cargo test --test fts_harness` passes without `--ignored`.
+//! | Test fn                     | Slice                         | Closed by |
+//! |-----------------------------|-------------------------------|-----------|
+//! | `fts_type_round_trip`       | type round-trip               | 5.20.B    |
+//! | `fts_query_at_at_matches`   | matching                      | 5.20.D    |
+//! | `fts_stemming_golden_file`  | stemming golden-file          | 5.20.C    |
+//! | `fts_ranking_deterministic` | ranking determinism           | 5.20.D    |
+//! | `fts_orm_compat`            | ORM compat                    | 5.20.B/C/D|
+//! | `fts_gin_*` (slice 6)       | GIN `@@` pruning, adversarial | 5.20.E    |
 
 #![allow(clippy::print_stdout)]
 
@@ -984,5 +979,614 @@ async fn fts_orm_compat() {
     println!(
         "[5.20.A orm] PASSED — Prisma, Diesel, and sqlx FTS migration DDL + \
          query shapes accepted and return correct results"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slice 6 — Phase 5.20.E GIN-on-tsvector pruning (adversarial)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The 5.20.E wiring makes `@@` queries consult the FTS lexeme posting list:
+// the executor short-circuits provably-empty probes and the session replaces
+// the table registration with a file/row-group-pruned provider.  Every test
+// below is adversarial against a specific way that wiring could go wrong:
+//
+//   * stem mismatch between probe and evaluation        → wrong prune
+//   * OR / NOT / phrase tsquery operators                → unsound AND-merge
+//   * live hot-tier overlay                              → cold-only probe lies
+//   * CREATE INDEX over a live overlay                   → index built on stale images
+//   * eviction / incomplete coverage                     → Empty probe lies
+//   * multi-file layouts                                 → pruning must actually skip work
+//
+// The correct degradation everywhere is "full scan, right answer" — never a
+// dropped row.
+
+use basin_common::TableName;
+use basin_engine::ProjectSession;
+
+/// Engine WITHOUT disk/page caches — for the work-counter test, where a
+/// cache hit could mask whether a file was really skipped.
+fn build_engine_no_cache(dir: &TempDir) -> Engine {
+    let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+    let storage = Storage::new(StorageConfig {
+        object_store: Arc::new(fs),
+        root_prefix: None,
+        disk_cache: None,
+        page_cache: None,
+    });
+    let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
+    Engine::new(EngineConfig {
+        storage,
+        catalog,
+        shard: None,
+    })
+}
+
+async fn exec(sess: &ProjectSession, sql: &str) {
+    sess.execute(sql)
+        .await
+        .unwrap_or_else(|e| panic!("exec failed for {sql:?}: {e:?}"));
+}
+
+/// Sorted `id` list returned by `sql` (first column must be Int64).
+async fn ids_for(sess: &ProjectSession, sql: &str) -> Vec<i64> {
+    match sess.execute(sql).await {
+        Ok(ExecResult::Rows { batches, .. }) => {
+            let mut ids: Vec<i64> = Vec::new();
+            for b in &batches {
+                if b.num_rows() == 0 {
+                    continue;
+                }
+                let col = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .unwrap_or_else(|| panic!("expected Int64 id column from: {sql}"));
+                for i in 0..col.len() {
+                    if !col.is_null(i) {
+                        ids.push(col.value(i));
+                    }
+                }
+            }
+            ids.sort_unstable();
+            ids
+        }
+        Ok(ExecResult::Empty { .. }) => Vec::new(),
+        other => panic!("non-rows result for {sql}: {other:?}"),
+    }
+}
+
+/// Pending overlay entries for a table — 0 means no live hot-tier overlay.
+fn overlay_pending(engine: &Engine, project: &ProjectId, table: &TableName) -> u64 {
+    match engine.memtable_registry().get(project, table) {
+        Some(e) => e.memtable.update_count() + e.memtable.tombstone_count(),
+        None => 0,
+    }
+}
+
+/// Plant a PK-keyed `MemRowValue::Update` override directly into the
+/// process-wide memtable registry — the state a hot-tier fast-path UPDATE
+/// leaves behind (mirrors `gin_overlay_update.rs::plant_update_override`,
+/// adapted to the `(id BIGINT, body TSVECTOR)` schema).  `body_canonical`
+/// must be the canonical tsvector text (e.g. `"'cat':1 'dog':2"`).
+async fn plant_fts_override(
+    eng: &Engine,
+    project: &ProjectId,
+    table: &TableName,
+    id: i64,
+    body_canonical: &str,
+) {
+    let meta = eng
+        .config()
+        .catalog
+        .load_table(project, table)
+        .await
+        .expect("load_table for override plant");
+    let mut cols: Vec<arrow_array::ArrayRef> = Vec::with_capacity(meta.schema.fields().len());
+    for f in meta.schema.fields() {
+        let col: arrow_array::ArrayRef = match f.name().as_str() {
+            "id" => Arc::new(arrow_array::Int64Array::from(vec![id])),
+            "body" => Arc::new(arrow_array::StringArray::from(vec![body_canonical])),
+            other => panic!("unexpected column {other:?} in fts overlay schema"),
+        };
+        cols.push(col);
+    }
+    let batch = arrow_array::RecordBatch::try_new(meta.schema.clone(), cols)
+        .expect("override batch must match catalog schema");
+    let bytes = {
+        use arrow::ipc::writer::StreamWriter;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut writer =
+            StreamWriter::try_new(&mut buf, batch.schema_ref()).expect("IPC writer init");
+        writer.write(&batch).expect("IPC write");
+        writer.finish().expect("IPC finish");
+        buf
+    };
+    let entry = eng.memtable_registry().get_or_create(*project, table.clone());
+    entry.memtable.insert(
+        basin_hottier::RowKey::builder().append_i64(id).finish(),
+        basin_hottier::MemRowValue::update(bytes, 0),
+    );
+}
+
+/// Stem consistency end-to-end: documents indexed through `to_tsvector`'s
+/// Snowball pipeline must be found by `to_tsquery` lexemes that stem to the
+/// same form — and the GIN probe must use the SAME stems as the `@@`
+/// evaluator.  A probe/evaluator stem mismatch does not just miss the
+/// speedup: it prunes files that hold real matches (dropped rows).
+#[tokio::test]
+async fn fts_gin_stem_consistent_match_and_prune() {
+    basin_common::telemetry::try_init_for_tests();
+    let dir = TempDir::new().unwrap();
+    let engine = build_engine(&dir);
+    let project = ProjectId::new();
+    let sess = engine.open_session(project).await.unwrap();
+
+    exec(&sess, "CREATE TABLE stem_docs (id BIGINT NOT NULL, body TSVECTOR)").await;
+    // Index FIRST so every inserted file goes through insert-path maintenance
+    // and the completeness guard passes (pruning actually armed).
+    exec(&sess, "CREATE INDEX stem_docs_gin ON stem_docs USING gin (body)").await;
+
+    // Three separate INSERTs → three live files.
+    exec(
+        &sess,
+        "INSERT INTO stem_docs VALUES (1, to_tsvector('english', 'running fast'))",
+    )
+    .await;
+    exec(
+        &sess,
+        "INSERT INTO stem_docs VALUES (2, to_tsvector('english', 'sleeping cat'))",
+    )
+    .await;
+    // 'simple'-config document: lexemes stored UNSTEMMED ('running', 'shoes').
+    exec(
+        &sess,
+        "INSERT INTO stem_docs VALUES (3, to_tsvector('simple', 'running shoes'))",
+    )
+    .await;
+
+    // 'runs' stems to 'run' — must find the doc indexed from 'running'
+    // (whose stored lexeme is 'run').  The probe must look up 'run', not
+    // 'runs'; the wrong lexeme would prune file 1 and drop the row.
+    assert_eq!(
+        ids_for(
+            &sess,
+            "SELECT id FROM stem_docs WHERE body @@ to_tsquery('english', 'runs')"
+        )
+        .await,
+        vec![1],
+        "to_tsquery('runs') must stem to 'run' and match the 'running' doc"
+    );
+    // plainto variant of the same stem pair.
+    assert_eq!(
+        ids_for(
+            &sess,
+            "SELECT id FROM stem_docs WHERE body @@ plainto_tsquery('english', 'running')"
+        )
+        .await,
+        vec![1],
+        "plainto_tsquery('running') must stem to 'run' and match"
+    );
+    // Config-mismatch trap: with config='simple' the probe must NOT
+    // English-stem 'running' to 'run' — that stem exists only in file 1, so
+    // a config-ignoring probe would prune file 3 and drop the real match.
+    assert_eq!(
+        ids_for(
+            &sess,
+            "SELECT id FROM stem_docs WHERE body @@ plainto_tsquery('simple', 'running')"
+        )
+        .await,
+        vec![3],
+        "simple-config probe must use the UNSTEMMED lexeme (file 3), not the \
+         English stem (file 1)"
+    );
+
+    println!("[5.20.E stem] PASSED — probe and evaluator share one stemming pipeline");
+}
+
+/// OR queries: the file sets of the branches must be UNIONed.  The naive
+/// AND-merge of all lexeme atoms intersects 'cat'-only and 'dog'-only files
+/// to ∅ and short-circuits to zero rows — dropping every real match.
+#[tokio::test]
+async fn fts_gin_or_query_unions_files() {
+    basin_common::telemetry::try_init_for_tests();
+    let dir = TempDir::new().unwrap();
+    let engine = build_engine(&dir);
+    let project = ProjectId::new();
+    let sess = engine.open_session(project).await.unwrap();
+
+    exec(&sess, "CREATE TABLE or_docs (id BIGINT NOT NULL, body TSVECTOR)").await;
+    exec(&sess, "CREATE INDEX or_docs_gin ON or_docs USING gin (body)").await;
+    exec(&sess, "INSERT INTO or_docs VALUES (1, to_tsvector('english', 'cat climbs'))").await;
+    exec(&sess, "INSERT INTO or_docs VALUES (2, to_tsvector('english', 'dog barks'))").await;
+    exec(&sess, "INSERT INTO or_docs VALUES (3, to_tsvector('english', 'fish swims'))").await;
+
+    assert_eq!(
+        ids_for(
+            &sess,
+            "SELECT id FROM or_docs WHERE body @@ to_tsquery('english', 'cat | dog')"
+        )
+        .await,
+        vec![1, 2],
+        "OR query must union the per-lexeme file sets — an AND-merge would \
+         intersect to ∅ and wrongly return zero rows"
+    );
+    // Three-way with grouping.
+    assert_eq!(
+        ids_for(
+            &sess,
+            "SELECT id FROM or_docs WHERE body @@ to_tsquery('english', '(cat | dog) | fish')"
+        )
+        .await,
+        vec![1, 2, 3],
+    );
+
+    println!("[5.20.E or] PASSED — OR branches union file sets");
+}
+
+/// NOT queries: `!lex` cannot be bounded by the posting list.  A bare NOT
+/// must full-scan; `a & !b` may prune only to files(a).  The naive AND-merge
+/// of all atoms treats `!dog` as a REQUIRED 'dog' — candidates collapse to
+/// files containing 'dog', dropping every match that lives elsewhere.
+#[tokio::test]
+async fn fts_gin_not_query_declines_to_sound_scan() {
+    basin_common::telemetry::try_init_for_tests();
+    let dir = TempDir::new().unwrap();
+    let engine = build_engine(&dir);
+    let project = ProjectId::new();
+    let sess = engine.open_session(project).await.unwrap();
+
+    exec(&sess, "CREATE TABLE not_docs (id BIGINT NOT NULL, body TSVECTOR)").await;
+    exec(&sess, "CREATE INDEX not_docs_gin ON not_docs USING gin (body)").await;
+    // f1: cat only.  f2: cat AND dog.
+    exec(&sess, "INSERT INTO not_docs VALUES (1, to_tsvector('english', 'cat climbs'))").await;
+    exec(&sess, "INSERT INTO not_docs VALUES (2, to_tsvector('english', 'cat dog'))").await;
+
+    // 'cat & !dog' matches only id 1 — which lives in a file with NO 'dog'.
+    // An AND-merge probe would intersect {cat-files} ∩ {dog-files} = {f2},
+    // prune f1, and return zero rows.
+    assert_eq!(
+        ids_for(
+            &sess,
+            "SELECT id FROM not_docs WHERE body @@ to_tsquery('english', 'cat & !dog')"
+        )
+        .await,
+        vec![1],
+        "'cat & !dog' must keep every file containing 'cat' as a candidate"
+    );
+    // Bare NOT — nothing to bound, full scan, correct rows.
+    assert_eq!(
+        ids_for(
+            &sess,
+            "SELECT id FROM not_docs WHERE body @@ to_tsquery('english', '!dog')"
+        )
+        .await,
+        vec![1],
+        "bare NOT must decline pruning and full-scan to the correct rows"
+    );
+
+    println!("[5.20.E not] PASSED — NOT declines soundly (full scan, right answer)");
+}
+
+/// Phrase queries: `a <-> b` prunes like `a & b` (both lexemes are required
+/// in the same row) and the positional check happens at re-evaluation.  Both
+/// the in-order and out-of-order files must stay candidates; only the
+/// in-order row may be returned.
+#[tokio::test]
+async fn fts_gin_phrase_prunes_as_and_reevaluates_positions() {
+    basin_common::telemetry::try_init_for_tests();
+    let dir = TempDir::new().unwrap();
+    let engine = build_engine(&dir);
+    let project = ProjectId::new();
+    let sess = engine.open_session(project).await.unwrap();
+
+    exec(&sess, "CREATE TABLE ph_docs (id BIGINT NOT NULL, body TSVECTOR)").await;
+    exec(&sess, "CREATE INDEX ph_docs_gin ON ph_docs USING gin (body)").await;
+    // f1: wrong order ('fox quick').  f2: right order ('quick fox').
+    // f3: only one of the lexemes — prunable.
+    exec(&sess, "INSERT INTO ph_docs VALUES (1, to_tsvector('english', 'fox quick'))").await;
+    exec(&sess, "INSERT INTO ph_docs VALUES (2, to_tsvector('english', 'quick fox'))").await;
+    exec(&sess, "INSERT INTO ph_docs VALUES (3, to_tsvector('english', 'quick snail'))").await;
+
+    assert_eq!(
+        ids_for(
+            &sess,
+            "SELECT id FROM ph_docs WHERE body @@ to_tsquery('english', 'quick <-> fox')"
+        )
+        .await,
+        vec![2],
+        "phrase must keep both two-lexeme files as candidates and let the \
+         positional re-evaluation reject the out-of-order row"
+    );
+    assert_eq!(
+        ids_for(
+            &sess,
+            "SELECT id FROM ph_docs WHERE body @@ phraseto_tsquery('english', 'quick fox')"
+        )
+        .await,
+        vec![2],
+    );
+
+    println!("[5.20.E phrase] PASSED — phrase prunes as AND, positions re-checked");
+}
+
+/// A live hot-tier overlay must veto BOTH halves of the index fast path
+/// (mirrors `gin_overlay_update.rs` for the FTS registry):
+///   1. the Empty short-circuit — the override row holds 'cat' AND 'dog'
+///      while the cold posting sets for the two lexemes are file-disjoint
+///      (probe says Empty);
+///   2. the pruned re-registration — the override gives id 2 a 'cat' body
+///      while its cold image has none, so a bare cold-pruned provider would
+///      hide it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fts_gin_live_overlay_blocks_empty_short_circuit_and_prune() {
+    basin_common::telemetry::try_init_for_tests();
+    let dir = TempDir::new().unwrap();
+    let engine = build_engine(&dir);
+    let project = ProjectId::new();
+    let sess = engine.open_session(project).await.unwrap();
+    let table = TableName::new("ov_docs").unwrap();
+
+    exec(
+        &sess,
+        "CREATE TABLE ov_docs (id BIGINT NOT NULL PRIMARY KEY, body TSVECTOR)",
+    )
+    .await;
+    exec(&sess, "CREATE INDEX ov_docs_gin ON ov_docs USING gin (body)").await;
+    exec(&sess, "INSERT INTO ov_docs VALUES (1, to_tsvector('english', 'cat climbs'))").await;
+    exec(&sess, "INSERT INTO ov_docs VALUES (2, to_tsvector('english', 'dog barks'))").await;
+
+    // Sanity (no overlay): the lexemes are file-disjoint → Empty probe is
+    // trustworthy → zero rows.
+    assert_eq!(
+        ids_for(
+            &sess,
+            "SELECT id FROM ov_docs WHERE body @@ to_tsquery('english', 'cat & dog')"
+        )
+        .await,
+        Vec::<i64>::new()
+    );
+
+    // Plant the overrides a fast-path UPDATE racing CREATE INDEX would leave.
+    plant_fts_override(&engine, &project, &table, 1, "'cat':1 'dog':2").await;
+    plant_fts_override(&engine, &project, &table, 2, "'cat':1 'extra':2").await;
+    assert!(overlay_pending(&engine, &project, &table) > 0);
+
+    // (1) Empty short-circuit veto: the override on id 1 now matches.
+    assert_eq!(
+        ids_for(
+            &sess,
+            "SELECT id FROM ov_docs WHERE body @@ to_tsquery('english', 'cat & dog')"
+        )
+        .await,
+        vec![1],
+        "live overlay must veto the FTS Empty short-circuit"
+    );
+    // (2) Pruned-registration veto: cold candidates for 'cat' are {file 1}
+    // only; a bare pruned provider would hide id 2's override body.
+    assert_eq!(
+        ids_for(
+            &sess,
+            "SELECT id FROM ov_docs WHERE body @@ to_tsquery('english', 'cat')"
+        )
+        .await,
+        vec![1, 2],
+        "live overlay must veto the FTS pruned re-registration (id 2's \
+         override body carries 'cat'; its cold image does not)"
+    );
+
+    println!("[5.20.E overlay] PASSED — live overlay vetoes both FTS fast paths");
+}
+
+/// CREATE INDEX over a live overlay must settle (materialize) the overlay
+/// BEFORE backfilling, so the index is built over post-image rows; the
+/// settled row must then be served by the adversarial cross-file query
+/// (mirrors `gin_overlay_update.rs::create_index_over_live_overlay_…`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fts_gin_create_index_over_overlay_settles_then_serves() {
+    basin_common::telemetry::try_init_for_tests();
+    let dir = TempDir::new().unwrap();
+    let engine = build_engine(&dir);
+    let project = ProjectId::new();
+    let sess = engine.open_session(project).await.unwrap();
+    let table = TableName::new("settle_docs").unwrap();
+
+    // NO index yet — the overlay state is reachable here.
+    exec(
+        &sess,
+        "CREATE TABLE settle_docs (id BIGINT NOT NULL PRIMARY KEY, body TSVECTOR)",
+    )
+    .await;
+    exec(
+        &sess,
+        "INSERT INTO settle_docs VALUES (1, to_tsvector('english', 'cat climbs'))",
+    )
+    .await;
+    exec(
+        &sess,
+        "INSERT INTO settle_docs VALUES (2, to_tsvector('english', 'dog barks'))",
+    )
+    .await;
+
+    plant_fts_override(&engine, &project, &table, 1, "'cat':1 'dog':2").await;
+    assert!(
+        overlay_pending(&engine, &project, &table) > 0,
+        "override plant must leave a live overlay — without it this test \
+         proves nothing"
+    );
+
+    // CREATE INDEX must settle the overlay before backfilling.
+    exec(&sess, "CREATE INDEX settle_docs_gin ON settle_docs USING gin (body)").await;
+    assert_eq!(
+        overlay_pending(&engine, &project, &table),
+        0,
+        "CREATE INDEX must materialize the live overlay before the FTS \
+         backfill (otherwise the index is built over pre-update cold images)"
+    );
+
+    // The settled post-image must be served by the Empty-short-circuit trap
+    // shape immediately (the backfill indexed the replacement file).
+    assert_eq!(
+        ids_for(
+            &sess,
+            "SELECT id FROM settle_docs WHERE body @@ to_tsquery('english', 'cat & dog')"
+        )
+        .await,
+        vec![1],
+        "index built over settled data must serve the cross-file query"
+    );
+    // Untouched row still matches its original lexeme.
+    assert_eq!(
+        ids_for(
+            &sess,
+            "SELECT id FROM settle_docs WHERE body @@ to_tsquery('english', 'dog')"
+        )
+        .await,
+        vec![1, 2],
+        "post-settle: id 1's new body and id 2's original body both carry 'dog'"
+    );
+
+    println!("[5.20.E settle] PASSED — CREATE INDEX settles the overlay, index serves post-images");
+}
+
+/// Incomplete coverage (posting-budget eviction, restart, compaction) must
+/// degrade to a full scan — never to a wrong answer.  We simulate the
+/// post-eviction state through the registry's own de-index API: the probe
+/// then *claims* Empty for 'cat' (the lexeme set exists but lost its
+/// entries) while the row still exists on disk.  Only the per-file
+/// completeness gate stands between that lie and a zero-row answer.
+#[tokio::test]
+async fn fts_gin_incomplete_index_degrades_to_full_scan() {
+    basin_common::telemetry::try_init_for_tests();
+    let dir = TempDir::new().unwrap();
+    let engine = build_engine(&dir);
+    let project = ProjectId::new();
+    let sess = engine.open_session(project).await.unwrap();
+    let table = TableName::new("evict_docs").unwrap();
+
+    exec(&sess, "CREATE TABLE evict_docs (id BIGINT NOT NULL, body TSVECTOR)").await;
+    exec(&sess, "CREATE INDEX evict_docs_gin ON evict_docs USING gin (body)").await;
+    exec(&sess, "INSERT INTO evict_docs VALUES (1, to_tsvector('english', 'cat climbs'))").await;
+    exec(&sess, "INSERT INTO evict_docs VALUES (2, to_tsvector('english', 'dog barks'))").await;
+
+    // Sanity: fully indexed → correct answer (possibly pruned).
+    assert_eq!(
+        ids_for(
+            &sess,
+            "SELECT id FROM evict_docs WHERE body @@ to_tsquery('english', 'cat')"
+        )
+        .await,
+        vec![1]
+    );
+
+    // De-index every live file (the state eviction / restart leaves behind:
+    // postings gone, files un-marked in the completeness set).
+    let meta = engine
+        .config()
+        .catalog
+        .load_table(&project, &table)
+        .await
+        .expect("load_table");
+    let fts_registry = engine.gin_fts_registry_for_test();
+    for f in meta.live_data_files() {
+        fts_registry.remove_file(&project, &table, "body", f.path.as_str());
+    }
+
+    // The probe now sees empty posting sets for 'cat' (a lying Empty) — the
+    // completeness gate must refuse the short-circuit and full-scan.
+    assert_eq!(
+        ids_for(
+            &sess,
+            "SELECT id FROM evict_docs WHERE body @@ to_tsquery('english', 'cat')"
+        )
+        .await,
+        vec![1],
+        "incomplete index coverage must degrade to a full scan (correct \
+         rows), never to a trusted-but-stale Empty short-circuit"
+    );
+    // AND-shape over the de-indexed state too.
+    assert_eq!(
+        ids_for(
+            &sess,
+            "SELECT id FROM evict_docs WHERE body @@ to_tsquery('english', 'cat & climbs')"
+        )
+        .await,
+        vec![1]
+    );
+
+    println!("[5.20.E evict] PASSED — incomplete coverage degrades to full scan, never wrong");
+}
+
+/// Multi-file layout: the prune must actually skip files, observed through
+/// the storage read counters.  Sandwich: an OR over every lexeme keeps ALL
+/// 3 files as candidates (no file prunable) and establishes the baseline,
+/// then a prunable single-lexeme query must read at most 1 file — with
+/// identical correct results semantics.
+///
+/// Both queries deliberately go through the SAME read machinery (the GIN
+/// candidate-file provider, which drives `Storage::read_paths_with_schema`
+/// and therefore the read counters).  An unprunable shape like a bare NOT
+/// is NOT a usable baseline here: it declines the index path entirely and
+/// full-scans through DataFusion's ListingTable, which is invisible to
+/// these counters by design (they instrument Basin's native reader; the
+/// scale-invariant gates pin `files_opened == 0` around DataFusion-served
+/// activity).
+#[tokio::test]
+async fn fts_gin_multi_file_layout_prunes_with_work_counters() {
+    basin_common::telemetry::try_init_for_tests();
+    let dir = TempDir::new().unwrap();
+    let engine = build_engine_no_cache(&dir);
+    let project = ProjectId::new();
+    let sess = engine.open_session(project).await.unwrap();
+
+    exec(&sess, "CREATE TABLE wc_docs (id BIGINT NOT NULL, body TSVECTOR)").await;
+    exec(&sess, "CREATE INDEX wc_docs_gin ON wc_docs USING gin (body)").await;
+    exec(&sess, "INSERT INTO wc_docs VALUES (1, to_tsvector('english', 'cat climbs'))").await;
+    exec(&sess, "INSERT INTO wc_docs VALUES (2, to_tsvector('english', 'dog barks'))").await;
+    exec(&sess, "INSERT INTO wc_docs VALUES (3, to_tsvector('english', 'fish swims'))").await;
+
+    let counters = engine.config().storage.read_counters();
+
+    // Baseline: OR over every lexeme — each file holds a candidate, so the
+    // candidate set is ALL 3 files and nothing can be skipped.  This pins
+    // that the counters actually observe this table's candidate-file reads
+    // (a zero baseline would make the prune assert below vacuous).
+    counters.reset();
+    assert_eq!(
+        ids_for(
+            &sess,
+            "SELECT id FROM wc_docs WHERE body @@ to_tsquery('english', 'cat | dog | fish')"
+        )
+        .await,
+        vec![1, 2, 3]
+    );
+    let baseline = counters.snapshot();
+    let baseline_reads = baseline.files_opened + baseline.files_served_from_cache;
+    assert!(
+        baseline_reads >= 3,
+        "all-candidate baseline must read all 3 files, read {baseline_reads}"
+    );
+
+    // Prunable query: 'fish' lives in exactly one file.
+    counters.reset();
+    assert_eq!(
+        ids_for(
+            &sess,
+            "SELECT id FROM wc_docs WHERE body @@ to_tsquery('english', 'fish')"
+        )
+        .await,
+        vec![3]
+    );
+    let pruned = counters.snapshot();
+    let pruned_reads = pruned.files_opened + pruned.files_served_from_cache;
+    assert!(
+        pruned_reads <= 1,
+        "single-lexeme query over a 3-file layout must open at most the one \
+         candidate file, read {pruned_reads}"
+    );
+
+    println!(
+        "[5.20.E counters] PASSED — all-candidate baseline read {baseline_reads} \
+         files, pruned query read {pruned_reads}"
     );
 }

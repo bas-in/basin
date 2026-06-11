@@ -3457,9 +3457,11 @@ async fn register_pruned_listing_table(
 /// overlay-aware provider (`register_cold_with_overlay` →
 /// `TombstoneFilterExec` + `UpdateOverlayExec`):
 ///   * the executor's GIN posting-probe `Empty` short-circuits
-///     (`executor::gin_empty_probe_is_trustworthy`), and
+///     (`executor::gin_empty_probe_is_trustworthy` for JSONB,
+///     `executor::fts_empty_probe_is_trustworthy` for tsvector `@@`), and
 ///   * the pruned re-registrations below (`apply_gin_pruning_for_query`,
-///     `apply_jsonb_posting_pruning_for_query`), which would otherwise swap
+///     `apply_jsonb_posting_pruning_for_query`,
+///     `apply_gin_fts_pruning_for_query`), which would otherwise swap
 ///     the overlay-aware provider for a bare cold reader that neither appends
 ///     override rows nor suppresses their stale cold images.
 /// See the UPDATE fast-path gate analysis in `dml_mutate.rs` (blockers #1/#2).
@@ -3762,7 +3764,8 @@ async fn register_pruned_listing_table_if_narrowed(
 /// * `FileCandidates` is a conservative superset — no file containing a
 ///   real match is ever excluded (the tsvector_match_udf re-evaluates on
 ///   every candidate row).
-/// * Pruning only fires when `indexed_files ⊇ live_files`.
+/// * Pruning only fires when the table has NO live hot-tier overlay
+///   (`table_has_live_overlay`) AND `indexed_files ⊇ live_files`.
 /// * On any error or uncertainty returns `Ok(())` → full scan.
 pub(crate) async fn apply_gin_fts_pruning_for_query(
     engine: &Engine,
@@ -3786,6 +3789,19 @@ pub(crate) async fn apply_gin_fts_pruning_for_query(
         Some(p) => p,
         None => return Ok(()), // query shape not recognised → full scan
     };
+
+    // Live-overlay gate — same blocker as `apply_gin_pruning_for_query`
+    // above: the registrations below (`GinRowGroupPrunedTable`, the pruned
+    // `ListingTable` fallback) REPLACE the overlay-aware provider with a
+    // bare cold reader that neither appends hot-tier override rows nor
+    // suppresses their stale cold images.  While the table has live
+    // UPDATE/DELETE overlay entries we must keep the overlay-aware
+    // registration and skip pruning entirely (correctness over speed; the
+    // overlay drains via materialize and pruning resumes).  O(1) counter
+    // reads.
+    if table_has_live_overlay(engine, project, &fts_plan.table) {
+        return Ok(());
+    }
 
     // Probe the FTS posting list at row-group granularity.  The registry
     // stores `(file, row_group, row)` for every posting; the row-group-aware
