@@ -772,7 +772,13 @@ async fn try_resolve_fast_path_pks(
         }
     }
     // Gate: secondary indexes (B-tree / GIN / GIST) need entry maintenance
-    // on delete — the slow path handles them.
+    // on delete — the slow path handles them. Additionally, a fast-path
+    // tombstone on a GIN-indexed table would RESURRECT the deleted row in
+    // containment reads: `apply_gin_pruning_for_query` swaps the
+    // overlay-aware provider for an unwrapped pruned table with no
+    // `TombstoneFilterExec`. See the UPDATE twin of this gate in
+    // `try_resolve_fast_path_update` for the full read-path analysis before
+    // relaxing either gate.
     if !meta.indexes.is_empty() {
         return Ok(None);
     }
@@ -1346,6 +1352,30 @@ pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result
         }
     }
 
+    // B-tree secondary-index maintenance for DELETE: purge every dropped AND
+    // replaced file's stale locations, then re-register the replacement file
+    // (kept rows) when one was written. See
+    // `maintain_btree_secondary_on_replace` for the soundness argument.
+    {
+        let rewrites: Vec<(String, Vec<RecordBatch>)> = match added_files.first() {
+            Some(new_file) if !replaced_paths.is_empty() => {
+                vec![(new_file.path.clone(), gin_replacement_batches.clone())]
+            }
+            _ => Vec::new(),
+        };
+        // Box::pin: exec_delete recurses through FK CASCADE chains; keep the
+        // maintenance future's locals on the heap so the debug-profile stack
+        // budget of the recursive poll chain is unchanged.
+        Box::pin(maintain_btree_secondary_on_replace(
+            sess,
+            &table,
+            &meta,
+            &removed_paths,
+            &rewrites,
+        ))
+        .await;
+    }
+
     delete_objects(sess, &table, schema.as_ref(), &removed_paths).await?;
     refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table).await?;
 
@@ -1755,7 +1785,56 @@ async fn try_resolve_fast_path_update(
     {
         return Ok(None);
     }
-    // Gate: secondary indexes (B-tree / GIN / GIST) need entry maintenance.
+    // Gate: ANY secondary index (B-tree / GIN / GIST / vector) → cold path.
+    //
+    // Do NOT relax this for GIN/JSONB tables without fixing the read path
+    // first. The tempting argument — "GIN pruning only narrows the COLD scan
+    // and `UpdateOverlayExec` appends every override row unconditionally, so
+    // an overlay UPDATE is invisible to the prune" — is true ONLY while the
+    // overlay-aware provider (`session::register_cold_with_overlay` →
+    // `TombstoneFilteringTable` / `HtapUnionTable`, whose scan wraps the cold
+    // child in `TombstoneFilterExec` + `UpdateOverlayExec`) is the table's
+    // registration. Three read-path consumers break that premise the moment
+    // an override exists for a GIN-indexed table (verified 2026-06, see
+    // tests/integration/tests/gin_overlay_update.rs):
+    //
+    //   1. `executor.rs` posting-probe short-circuits: the `@>`/`<@` and
+    //      `?`/`?&`/`?|` detectors probe `GinIndexRegistry`
+    //      (`probe_containment` / `probe_key_existence`), which is built from
+    //      COLD FILES ONLY, and return ZERO ROWS on `ProbeResult::Empty`
+    //      before any overlay merge runs. An override whose post-SET document
+    //      NEWLY matches a needle whose terms live in disjoint cold files
+    //      (intersection = ∅ → `Empty`) is silently dropped.
+    //
+    //   2. `session::apply_gin_pruning_for_query` (and the posting/row-group
+    //      variants that follow it in `exec_select`) DE-REGISTERS the
+    //      overlay-aware provider and registers an UNWRAPPED
+    //      `GinRowGroupPrunedTable` or pruned `ListingTable` for the query.
+    //      Those providers read raw cold bytes: override rows are neither
+    //      appended nor are their stale cold images suppressed — a containment
+    //      SELECT would return pre-UPDATE values (or miss the row entirely
+    //      when the prune drops its file). This fires on the rg-direct path
+    //      whenever every live file is sealed in `GinRowGroupRegistry`
+    //      (exactly the post-CREATE-INDEX-backfill state) — no narrow shape
+    //      required.
+    //
+    //   3. `materialize_overlay_for_table` performs NO GIN registry
+    //      maintenance around its `write_replacement`/`commit_replace` (unlike
+    //      `exec_update`/`exec_delete`, which run `GinPostingListMaintainer`):
+    //      replaced files keep stale posting entries and stay in the
+    //      completeness sets while the replacement file is never indexed or
+    //      sealed. Latent today precisely BECAUSE this gate keeps overlays off
+    //      indexed tables; it becomes load-bearing the moment the gate is
+    //      relaxed.
+    //
+    // B-tree-only tables are closer to safe (the `fast_select` secondary-index
+    // probe treats a miss as fall-through since the probe-miss fix, a stale
+    // HIT only widens the cold allowlist, and the overlay merge re-checks the
+    // predicate), but the registry entries still go unmaintained and the
+    // (1)/(2) machinery shares the `meta.indexes` dispatch — so the
+    // conservative blanket decline stays until the executor/session read
+    // paths gate their short-circuits and pruned re-registrations on
+    // overlay-emptiness for the table.
     if !meta.indexes.is_empty() {
         return Ok(None);
     }
@@ -3519,6 +3598,32 @@ pub(crate) async fn exec_update(
         }
     }
 
+    // B-tree secondary-index maintenance for UPDATE: purge each replaced
+    // file's stale locations and re-register the SPECIFIC new file that now
+    // holds its post-SET rows (same per-file pairing as the GIN/GIST blocks
+    // above). See `maintain_btree_secondary_on_replace` for why re-register
+    // (not just purge) is required for read soundness.
+    {
+        let rewrites: Vec<(String, Vec<RecordBatch>)> = per_file
+            .iter()
+            .filter_map(|(old_path, new_file)| {
+                gin_batches_by_old_path
+                    .get(old_path)
+                    .map(|b| (new_file.path.clone(), b.clone()))
+            })
+            .collect();
+        // Box::pin: keeps the maintenance future's locals off the caller's
+        // poll frame (exec_update sits inside recursive DML chains too).
+        Box::pin(maintain_btree_secondary_on_replace(
+            sess,
+            &table,
+            &meta,
+            &replaced_paths,
+            &rewrites,
+        ))
+        .await;
+    }
+
     delete_objects(sess, &table, schema.as_ref(), &replaced_paths).await?;
     refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table).await?;
 
@@ -3975,11 +4080,36 @@ async fn exec_delete_via_df_rowset(
         .map(|f| f.path.as_ref().to_string())
         .collect();
 
+    // Clone the kept batches for B-tree index maintenance BEFORE the write
+    // consumes them (Arrow clones are cheap Arc-buffer bumps).
+    let kept_for_index: Vec<RecordBatch> = keep_batches.iter().cloned().collect();
     // Write the kept rows as a new file (empty → no file written).
     let added = write_replacement(sess, table, schema.clone(), keep_batches).await?;
 
     // Atomically swap old files → new file in the catalog snapshot.
-    commit_replace(sess, table, meta.current_snapshot, all_paths.clone(), added).await?;
+    commit_replace(
+        sess,
+        table,
+        meta.current_snapshot,
+        all_paths.clone(),
+        added.clone(),
+    )
+    .await?;
+
+    // B-tree secondary-index maintenance: this path replaces EVERY live file
+    // with one rewritten file of the kept rows, so purge all old locations
+    // and re-register the new file (a full per-column rebuild). See
+    // `maintain_btree_secondary_on_replace` for the soundness argument.
+    {
+        let rewrites: Vec<(String, Vec<RecordBatch>)> = added
+            .first()
+            .map(|f| vec![(f.path.clone(), kept_for_index)])
+            .unwrap_or_default();
+        Box::pin(maintain_btree_secondary_on_replace(
+            sess, table, &meta, &all_paths, &rewrites,
+        ))
+        .await;
+    }
 
     // Physical cleanup + session refresh.
     delete_objects(sess, table, schema.as_ref(), &all_paths).await?;
@@ -5209,6 +5339,125 @@ fn extend_replacement_with_shadow_cols(
         })
         .collect();
     Ok((extended, materialized?))
+}
+
+/// B-tree secondary-index maintenance for copy-on-write replacement commits
+/// (the UPDATE / DELETE slow paths). Mirrors the GIN posting-list and GIST
+/// interval-tree maintenance blocks at the same call sites: purge every
+/// removed file's locations from the `ProjectIndexRegistry`, then re-register
+/// each replacement file from the batches that were written into it, and
+/// re-flush the persisted sidecar.
+///
+/// Why purge alone is NOT enough: `fast_select`'s secondary-index probe
+/// treats a HIT as a definitive file allowlist ("skip any live file NOT in
+/// the location set"). With no maintenance at all, a key whose locations all
+/// point at the replaced (now dead) file prunes EVERY live file and the read
+/// silently returns zero rows (tests/integration/tests/gin_overlay_update.rs
+/// `btree_indexed_column_write_declines_fast_path`). With purge-only
+/// maintenance, a key that has rows in BOTH an untouched file and the
+/// (unregistered) replacement file would HIT on the untouched file alone and
+/// the pruned read would drop the replacement file's rows. Only
+/// purge + re-register keeps the per-key location sets complete over the
+/// live file set, which is what the HIT-is-authoritative contract requires.
+///
+/// Indexes that are neither in RAM nor lazily loadable from their sidecar are
+/// left untouched: seeding a PARTIAL index containing only the replacement
+/// entries would itself violate the contract above, while an absent index
+/// keeps probing as MISS → full pruned scan, which is always correct.
+///
+/// `rewrites` pairs each NEW file path with the (pre-write) batches that the
+/// caller handed `write_replacement{,_per_file}` for it. Batches are
+/// normalised to the catalog schema before extraction so the indexed column
+/// downcasts in `backfill_btree_batch` see the same physical types the
+/// INSERT-path extractor indexed (`Utf8View`/`Binary` decode variants would
+/// otherwise extract nothing and silently leave the key sets incomplete).
+async fn maintain_btree_secondary_on_replace(
+    sess: &ProjectSession,
+    table: &TableName,
+    meta: &basin_catalog::TableMetadata,
+    removed_paths: &[String],
+    rewrites: &[(String, Vec<RecordBatch>)],
+) {
+    // Mirror the INSERT-path dispatch (`maintain_secondary_indexes_on_insert`
+    // in executor.rs): every single-column non-expression index that is not
+    // GIN/GIST feeds the B-tree location registry (columns whose Arrow type
+    // the extractor doesn't support no-op there, exactly as on INSERT).
+    let mut cols: Vec<String> = meta
+        .indexes
+        .iter()
+        .filter(|idx| {
+            idx.access_method != "gin"
+                && idx.access_method != "gist"
+                && idx.columns.len() == 1
+                && !idx.columns[0].starts_with("expr:")
+        })
+        .map(|idx| idx.columns[0].clone())
+        .collect();
+    cols.sort_unstable();
+    cols.dedup();
+    if cols.is_empty() {
+        return;
+    }
+    let registry = sess.engine.secondary_index_registry();
+    let storage = &sess.engine.config().storage;
+    // Same row-group-size priority as the writer / CREATE INDEX backfill so
+    // the re-registered row-group ordinals line up with the on-disk layout
+    // (`row_group_selection` is a Parquet-only read hint; Vortex ignores it
+    // and uses only the file-level allowlist).
+    let rg_size = meta
+        .row_block_size
+        .map(|v| v as usize)
+        .or(meta.row_group_rows)
+        .unwrap_or(basin_storage::DEFAULT_MAX_ROW_GROUP_SIZE)
+        .max(1);
+    let normalized: Vec<(String, Vec<RecordBatch>)> = rewrites
+        .iter()
+        .map(|(path, batches)| {
+            let n = batches
+                .iter()
+                .map(|b| {
+                    crate::hot_tombstone::normalize_batch_to_schema(
+                        b.clone(),
+                        meta.schema.as_ref(),
+                    )
+                })
+                .collect();
+            (path.clone(), n)
+        })
+        .collect();
+    for col in &cols {
+        if !registry.is_loaded(&sess.project, table, col) {
+            // Pull the persisted sidecar into RAM first — maintenance must
+            // apply to the FULL index, never seed a partial one.
+            crate::secondary_index::load_index(registry, storage, &sess.project, table, col)
+                .await;
+            if !registry.is_loaded(&sess.project, table, col) {
+                continue;
+            }
+        }
+        for p in removed_paths {
+            registry.remove_file_from_index(&sess.project, table, col, p);
+        }
+        for (new_path, batches) in &normalized {
+            let mut file_row_off = 0usize;
+            for batch in batches {
+                crate::executor::backfill_btree_batch(
+                    sess,
+                    table,
+                    col,
+                    batch,
+                    new_path,
+                    rg_size,
+                    file_row_off,
+                );
+                file_row_off += batch.num_rows();
+            }
+        }
+        // Re-persist so a restart's lazy sidecar load can't resurrect the
+        // stale pre-rewrite locations (unlike the RAM-only GIN posting list,
+        // the B-tree sidecar survives restarts).
+        crate::secondary_index::flush_index(registry, storage, &sess.project, table, col).await;
+    }
 }
 
 async fn write_replacement(
@@ -7108,16 +7357,37 @@ async fn exec_soft_delete(
 
     let events = build_events(sess, &table, ChangeOp::Delete, event_payloads);
     dispatch_pre_commit(&sess.engine, &events).await?;
+    // Clone the rewritten batches for B-tree index maintenance BEFORE the
+    // write consumes them (cheap Arc-buffer bumps).
+    let rewritten_for_index: Vec<RecordBatch> = replacement_batches.iter().cloned().collect();
     let added_files = write_replacement(sess, &table, schema.clone(), replacement_batches).await?;
     commit_replace(
         sess,
         &table,
         meta.current_snapshot,
         replaced_paths.clone(),
-        added_files,
+        added_files.clone(),
     )
     .await?;
     dispatch_post_commit(&sess.engine, events);
+    // B-tree secondary-index maintenance: the soft-delete rewrite replaces
+    // files just like a hard DELETE (rows move to a new file), so stale
+    // locations must be purged and the replacement re-registered. See
+    // `maintain_btree_secondary_on_replace` for the soundness argument.
+    {
+        let rewrites: Vec<(String, Vec<RecordBatch>)> = added_files
+            .first()
+            .map(|f| vec![(f.path.clone(), rewritten_for_index)])
+            .unwrap_or_default();
+        Box::pin(maintain_btree_secondary_on_replace(
+            sess,
+            &table,
+            &meta,
+            &replaced_paths,
+            &rewrites,
+        ))
+        .await;
+    }
     delete_objects(sess, &table, schema.as_ref(), &replaced_paths).await?;
     refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, &table).await?;
 
