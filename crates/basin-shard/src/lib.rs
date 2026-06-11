@@ -276,6 +276,15 @@ impl Shard {
         self.inner.flush_to_parquet().await
     }
 
+    /// Run one stripe-merge sweep synchronously (merge cold files with
+    /// overlapping PK zone maps into disjoint sorted runs). The background
+    /// tick does this on `BASIN_STRIPE_MERGE_SECS` cadence; benchmarks and
+    /// tests that quiesce the background loops call this once to reach the
+    /// same steady-state file layout deterministically.
+    pub async fn run_stripe_merge_once(&self) -> Result<()> {
+        self.inner.run_stripe_merge_once().await
+    }
+
     /// Run one pass of the tiered-storage sweep. For every `(project, table)`
     /// the shard has touched (i.e. has resident state for, OR has been seen
     /// to live in the catalog under a known project), copy data files older
@@ -599,6 +608,11 @@ pub(crate) trait ShardImpl: Send + Sync {
     fn wal(&self) -> &Arc<dyn basin_wal::Wal>;
     async fn flush_to_parquet(&self) -> Result<()>;
     async fn run_tiering_sweep(&self) -> Result<()>;
+    /// One synchronous stripe-merge sweep (see `Shard::run_stripe_merge_once`).
+    /// Default: no-op for backends without per-file cold data.
+    async fn run_stripe_merge_once(&self) -> Result<()> {
+        Ok(())
+    }
     /// ADR 0027 Phase 4 — rewrite all cold-tier data files that are missing
     /// the promoted JSONB shadow column(s) for `(project, table)`.  Returns
     /// the count of files that were rewritten.  Default: returns 0 (no-op for

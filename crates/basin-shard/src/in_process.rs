@@ -2439,6 +2439,10 @@ impl ShardImpl for InProcessShard {
         self.compact_all().await
     }
 
+    async fn run_stripe_merge_once(&self) -> Result<()> {
+        self.stripe_merge_sweep().await
+    }
+
     async fn run_tiering_sweep(&self) -> Result<()> {
         self.tiering_sweep().await
     }

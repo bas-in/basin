@@ -4661,6 +4661,18 @@ async fn run_full_compare_inner(
         .flush_to_parquet()
         .await
         .expect("basin post-seed flush_to_parquet");
+    // Same symmetry argument as the flush: the stripe-merge sweep runs on its
+    // own background cadence in production (BASIN_STRIPE_MERGE_SECS), so a
+    // deployed read workload sees the merged disjoint-PK file layout between
+    // ticks. Running it once here reaches that settled layout
+    // deterministically before the loops are stopped — without it the timed
+    // window would measure the transient just-seeded layout that production
+    // only occupies for at most one tick interval.
+    instance
+        .shard
+        .run_stripe_merge_once()
+        .await
+        .expect("basin post-seed stripe merge");
     // Shut down the background loop so it cannot fire on its 30-second timer
     // during the entire read-timing window below. `bg` is Option so we can
     // take it here without moving the whole `instance` struct.
