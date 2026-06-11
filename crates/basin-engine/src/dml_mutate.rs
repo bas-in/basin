@@ -2385,31 +2385,95 @@ async fn hot_tier_update_by_pk(
     }
 
     // 3. Apply the SET to each present, live row image; write the override.
-    let mut updated = 0usize;
-    // Post-update row images collected for RETURNING (allocated only when needed).
-    let mut returning_rows: Vec<RecordBatch> = Vec::new();
+    //
+    // Pre-images are gathered (padded to the catalog schema) in key order
+    // FIRST so a multi-key expression SET can be evaluated in ONE
+    // `apply_assignments` call over a concatenated n-row batch. Each
+    // `AssignmentRhs::Expr` evaluation builds a fresh DataFusion
+    // SessionContext, registers every UDF family, and plans SQL
+    // (`generated_cols::eval_expression`), so the old per-key loop paid n
+    // context builds + n plans — the dominant cost of the
+    // ≤`SMALL_BULK_FASTPATH_CAP` bulk-RMW shape. The batched call is the SAME
+    // evaluator with an all-true mask over all matched rows, exactly how the
+    // cold path feeds whole batches to `apply_assignments`, so each row's
+    // post-image stays byte-identical to the cold path (and to the previous
+    // per-key behavior) for the row-local, deterministic expressions the RMW
+    // allowlist admits.
+    //
+    // Error semantics: the per-key loop applied overrides as it went, so an
+    // eval error at key k left keys before k already updated (partial
+    // application). The batched eval runs BEFORE any memtable/tx-overlay
+    // write, so an expression error now fails the statement atomically with
+    // ZERO keys applied — strictly tighter. Single-key and scalar-only
+    // statements keep the per-key path (see below) and are unaffected.
+
+    // Live (non-tombstoned) pre-images in key order. Schema evolution: a
+    // pre-image sourced from a file older than an ALTER ADD COLUMN lacks the
+    // new column entirely; apply_assignments merges per batch-column, so an
+    // assignment to the missing column would be silently DROPPED. Pad to the
+    // full catalog schema first.
+    let mut live: Vec<(&basin_hottier::RowKey, RecordBatch)> = Vec::with_capacity(keys.len());
     for key in keys {
-        let kb = key.as_bytes().to_vec();
-        let Some(row_batch) = current.get(&kb) else {
+        let Some(row_batch) = current.get(key.as_bytes()) else {
             continue; // PK matched no live row.
         };
         if row_batch.num_rows() == 0 {
             continue; // tombstoned (deleted) — UPDATE skips it.
         }
-        let mask = BooleanArray::from(vec![true; row_batch.num_rows()]);
-        // Schema evolution: a pre-image sourced from a file older than an
-        // ALTER ADD COLUMN lacks the new column entirely; apply_assignments
-        // merges per batch-column, so an assignment to the missing column
-        // would be silently DROPPED. Pad to the full catalog schema first.
-        let row_batch =
-            &crate::hot_tombstone::pad_batch_to_schema(row_batch.clone(), &schema)?;
-        let new_batch = apply_assignments(catalog, &sess.project, row_batch, &mask, assignments).await?;
-        // Encode the (single) row and store as an Update override keyed by PK.
-        let one_row = if new_batch.num_rows() == 1 {
-            new_batch
-        } else {
-            new_batch.slice(0, 1)
-        };
+        live.push((
+            key,
+            crate::hot_tombstone::pad_batch_to_schema(row_batch.clone(), &schema)?,
+        ));
+    }
+
+    // Post-images, one single-row batch per live key, in key order (RETURNING
+    // depends on this order). Batched eval fires only when (a) at least one
+    // assignment is an expression — scalar-only assignment is pure array
+    // construction with no DataFusion context, so per-key is already cheap —
+    // and (b) more than one key matched (single-key short-circuit: n==1 keeps
+    // the historical one-row path with zero concat/slice overhead). If the
+    // pre-images can't be stitched into one batch (defensive: physical type
+    // drift the pad/normalize pass doesn't cover), fall back to the per-key
+    // path rather than failing the statement.
+    let has_expr_assignment = assignments
+        .iter()
+        .any(|(_, rhs)| matches!(rhs, AssignmentRhs::Expr(_)));
+    let mut post_images: Option<Vec<RecordBatch>> = None;
+    if has_expr_assignment && live.len() > 1 {
+        if let Some(joined) = concat_pre_images_for_batch_eval(&live, &schema) {
+            let mask = BooleanArray::from(vec![true; joined.num_rows()]);
+            let new_batch =
+                apply_assignments(catalog, &sess.project, &joined, &mask, assignments).await?;
+            post_images = Some(
+                (0..new_batch.num_rows())
+                    .map(|i| new_batch.slice(i, 1))
+                    .collect(),
+            );
+        }
+    }
+    let post_images = match post_images {
+        Some(rows) => rows,
+        None => {
+            let mut rows: Vec<RecordBatch> = Vec::with_capacity(live.len());
+            for (_, row_batch) in &live {
+                let mask = BooleanArray::from(vec![true; row_batch.num_rows()]);
+                let new_batch =
+                    apply_assignments(catalog, &sess.project, row_batch, &mask, assignments)
+                        .await?;
+                rows.push(if new_batch.num_rows() == 1 {
+                    new_batch
+                } else {
+                    new_batch.slice(0, 1)
+                });
+            }
+            rows
+        }
+    };
+
+    let mut updated = 0usize;
+    // Post-update row images collected for RETURNING (allocated only when needed).
+    let mut returning_rows: Vec<RecordBatch> = Vec::new();
+    for ((key, _), one_row) in live.iter().zip(post_images.into_iter()) {
         // ADR 0027 Phase 4: materialise promoted JSONB shadow columns into the
         // override image, exactly as the INSERT path does. Without this the
         // hot UPDATE row carries no `__promoted$col$key` column, the
@@ -2431,13 +2495,13 @@ async fn hot_tier_update_by_pk(
             crate::session::tx_overlay_put(
                 &sess.state,
                 table,
-                key.clone(),
+                (*key).clone(),
                 basin_hottier::MemRowValue::update(bytes, 0),
             );
         } else {
             entry
                 .memtable
-                .insert(key.clone(), basin_hottier::MemRowValue::update(bytes, 0));
+                .insert((*key).clone(), basin_hottier::MemRowValue::update(bytes, 0));
         }
         updated += 1;
         // Collect the post-image for RETURNING if requested.
@@ -2447,6 +2511,25 @@ async fn hot_tier_update_by_pk(
         }
     }
     Ok((updated, returning_rows))
+}
+
+/// Stitch the per-key single-row pre-images into ONE n-row batch (key order
+/// preserved) for the batched `apply_assignments` call in
+/// [`hot_tier_update_by_pk`]. Every input was already padded/normalized to
+/// the catalog `schema` by `pad_batch_to_schema`; each row is rebuilt against
+/// the exact same `SchemaRef` so the concat can't trip over per-batch
+/// metadata/nullability drift. Returns `None` (the caller falls back to the
+/// per-key eval path) when any row's physical column types still diverge from
+/// the catalog schema — defensive; not expected after the pad pass.
+fn concat_pre_images_for_batch_eval(
+    live: &[(&basin_hottier::RowKey, RecordBatch)],
+    schema: &Arc<Schema>,
+) -> Option<RecordBatch> {
+    let mut rows: Vec<RecordBatch> = Vec::with_capacity(live.len());
+    for (_, b) in live {
+        rows.push(RecordBatch::try_new(schema.clone(), b.columns().to_vec()).ok()?);
+    }
+    arrow_select::concat::concat_batches(schema, &rows).ok()
 }
 
 /// Decode one Arrow IPC stream blob into the first `RecordBatch`.
