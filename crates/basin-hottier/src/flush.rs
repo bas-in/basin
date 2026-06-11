@@ -16,27 +16,36 @@
 //!
 //! The write lock on the memtable is held **only** twice per flush:
 //!
-//! 1. **Snapshot** (step 1 below): clone the BTree under a brief write lock,
-//!    record the set of keys being flushed, then release.  Writes that land
-//!    after the snapshot go into the "next generation" and are not part of the
-//!    current flush.
-//! 2. **GC** (step 6 below): call `MemTable::remove_flushed` to drop only the
-//!    keys that were included in the snapshot.  Any rows written concurrently
-//!    (higher generation) survive.
+//! 1. **Snapshot** (step 1 below): clone the dirty entries (and their seqs)
+//!    under a brief lock via `MemTable::dirty_snapshot`, then release.  Writes
+//!    that land after the snapshot bump the entry's seq past the captured ack
+//!    seq and are not part of the current flush.
+//! 2. **Ack** (step 6 below): call `MemTable::mark_flushed` with the seqs
+//!    captured at snapshot time.  Acked rows are retained CLEAN (S4 age-based
+//!    residency) — readable from memory, evictable under budget — and any row
+//!    written concurrently (seq newer than its ack) survives DIRTY, fixing the
+//!    pre-S4 version loss where `remove_flushed` dropped whole chains by key.
 //!
 //! Object-store I/O happens in steps 3–5 with no Basin lock held.
 //!
 //! # Algorithm (per ADR 0016 §Flush)
 //!
 //! ```text
-//! 1. Snapshot the table's memtable under a brief write lock.
+//! 1. Dirty-snapshot the table's memtable (keys + values + seqs).
 //! 2. Partition snapshot into: new rows / tombstones.
 //! 3. Write new rows via write_batch_with_options (cluster-sort, blooms, sketches).
 //! 4. Apply tombstones via replace_data_files (marks deleted PKs).
 //! 5. Atomic catalog commit via append_data_files with commit_with_retry.
-//! 6. GC flushed rows from the live memtable (write lock briefly held).
-//! 7. Release project bytes, unblocking any hard-cap-blocked writers.
-//! 8. WAL truncation up to the highest LSN included in the flush.
+//! 6. Ack the flush (mark_flushed): tombstones removed, updates re-tagged Row,
+//!    rows marked clean; retain_secs == 0 immediately evicts everything clean
+//!    (byte-for-byte the pre-S4 drain-at-flush behavior, the kill switch).
+//! 7. Release exactly the bytes the ack/eviction freed, unblocking any
+//!    hard-cap-blocked writers (this fixes the pre-S4 mismatch where the
+//!    release used per-snapshot newest-only bytes while remove_flushed freed
+//!    whole chains).
+//! 8. Evict clean bytes down to the project clean cap if the retained rows
+//!    pushed it over budget.
+//! 9. WAL truncation up to the highest LSN included in the flush.
 //! ```
 //!
 //! # pause / resume
@@ -372,6 +381,11 @@ impl FlushWorker {
                 );
             }
         }
+
+        // ── Clean-budget sweep (S4 age-based residency) ────────────────────────
+        // Evict retained-clean entries that outlived their retention window or
+        // pushed their project over its clean-byte cap.
+        self.registry.enforce_clean_budgets();
     }
 
     /// Flush all tables across all projects (used on shutdown).
@@ -401,14 +415,16 @@ impl FlushWorker {
 
     /// Core per-table flush.
     ///
-    /// Steps (per ADR 0016):
-    /// 1. Snapshot under brief write lock.
+    /// Steps (per ADR 0016 + S4 age-based residency):
+    /// 1. Dirty-snapshot (keys + values + seqs) under brief lock.
     /// 2. Partition into live rows + tombstones.
     /// 3. Write live rows to cold tier.
     /// 4. Apply tombstones.
     /// 5. Catalog commit.
-    /// 6. GC flushed keys from live memtable.
-    /// 7. Release project bytes.
+    /// 6. Ack the flush (`mark_flushed` with the seqs captured in step 1);
+    ///    `retain_secs == 0` immediately evicts everything the ack left clean.
+    /// 7. Release exactly the bytes the ack/eviction freed.
+    /// 8. Evict clean bytes down to the project clean cap if over budget.
     #[instrument(skip(self), fields(%project, %table, ?trigger))]
     async fn flush_table(
         &mut self,
@@ -421,20 +437,22 @@ impl FlushWorker {
             return Ok(());
         };
 
-        // ── Step 1: snapshot ──────────────────────────────────────────────────
+        // ── Step 1: dirty snapshot ────────────────────────────────────────────
+        // Per-key seqs are captured here; the ack in step 6 covers exactly
+        // these versions, so any write landing during steps 2–5 stays dirty.
         let t0 = Instant::now();
-        let snapshot = entry.memtable.snapshot();
+        let snapshot = entry.memtable.dirty_snapshot();
         if snapshot.is_empty() {
             return Ok(());
         }
 
-        let flushed_keys: Vec<RowKey> = snapshot.iter().map(|(k, _)| k.clone()).collect();
+        let acks: Vec<(RowKey, u64)> = snapshot.iter().map(|(k, _, s)| (k.clone(), *s)).collect();
 
         // ── Step 2: partition ─────────────────────────────────────────────────
         let mut live_rows: Vec<RowBytes> = Vec::new();
         let mut tombstone_keys: Vec<RowKey> = Vec::new();
 
-        for (key, value) in &snapshot {
+        for (key, value, _seq) in &snapshot {
             match value {
                 // `Update` is a PK-keyed full-row override written by the
                 // hot-tier UPDATE fast path; flushed identically to a `Row`
@@ -475,15 +493,30 @@ impl FlushWorker {
             self.backend.commit_new_file(project, table, file).await?;
         }
 
-        // ── Step 6: GC flushed rows ───────────────────────────────────────────
-        entry.memtable.remove_flushed(&flushed_keys);
+        // ── Step 6: ack flushed rows ──────────────────────────────────────────
+        // Acked rows stay readable as CLEAN entries; rows written after the
+        // snapshot survive DIRTY (pre-S4, remove_flushed silently dropped
+        // them — the version-loss fix).
+        let mut freed_bytes = entry.memtable.mark_flushed(&acks);
+        if self.config.retain_secs == 0 {
+            // Retain-nothing kill switch: immediately evict everything the ack
+            // left clean — byte-for-byte today's drain-at-flush end state.
+            freed_bytes += entry.memtable.evict_clean(u64::MAX, None);
+        }
 
         // ── Step 7: release project bytes ─────────────────────────────────────
-        let freed_bytes: u64 = snapshot
-            .iter()
-            .map(|(_, v)| v.heap_bytes() as u64)
-            .sum();
+        // Exactly what the ack/eviction freed — keeps the project counter in
+        // lockstep with memtable bytes (pre-S4 this released per-snapshot
+        // newest-only bytes while remove_flushed freed whole chains).
         self.registry.release_bytes(project, freed_bytes);
+
+        // ── Step 8: post-ack clean-budget eviction ────────────────────────────
+        let clean = self.registry.project_clean_bytes(project);
+        if clean > self.config.project_clean_cap_bytes {
+            let _ = self
+                .registry
+                .evict_clean(project, clean - self.config.project_clean_cap_bytes);
+        }
 
         let elapsed = t0.elapsed();
         info!(
@@ -791,15 +824,76 @@ mod tests {
         assert_eq!(*flushed_rows.lock().await, 10, "expected 10 live rows flushed");
         assert_eq!(*tombstones.lock().await, 1, "expected 1 tombstone applied");
 
-        // Memtable should be empty after flush.
-        let entry2 = registry.get(&p, &t);
-        if let Some(e) = entry2 {
-            assert_eq!(
-                e.memtable.total_count(),
-                0,
-                "memtable should be empty after flush"
-            );
+        // S4 age-based residency: flushed rows are RETAINED CLEAN (readable,
+        // zero dirty bytes); the acked tombstone is removed outright.
+        let e = registry.get(&p, &t).expect("entry must still exist");
+        assert_eq!(
+            e.memtable.total_count(),
+            10,
+            "flushed rows retained clean; tombstone removed"
+        );
+        assert_eq!(e.memtable.bytes_dirty(), 0, "nothing dirty after the ack");
+        assert!(
+            e.memtable.get(&key(3)).is_some(),
+            "clean rows stay readable"
+        );
+        assert!(
+            e.memtable.get(&key(99)).is_none(),
+            "acked tombstone removed"
+        );
+
+        // A second flush has no dirty input — the backend sees nothing new.
+        task.request_immediate(p, t.clone(), FlushTrigger::ScanPressure)
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            *flushed_rows.lock().await,
+            10,
+            "clean rows must not be re-flushed"
+        );
+
+        task.shutdown().await;
+    }
+
+    /// `retain_secs == 0` (the kill switch) must reproduce today's
+    /// drain-at-flush end state byte-for-byte: memtable empty, zero bytes.
+    #[tokio::test]
+    async fn retain_zero_flush_drains_byte_identical_to_today() {
+        let registry = Arc::new(MemTableRegistry::new());
+        let p = proj();
+        let t = tbl("events");
+
+        let entry = registry.get_or_create(p, t.clone());
+        for i in 0..10i64 {
+            entry.memtable.insert(key(i), row_val(i as u8));
         }
+        entry.memtable.insert(key(99), MemRowValue::Tombstone);
+
+        let flushed_rows = Arc::new(Mutex::new(0usize));
+        let backend: Arc<dyn FlushBackend> = Arc::new(NoopBackend {
+            flushed_rows: flushed_rows.clone(),
+            tombstones: Arc::new(Mutex::new(0)),
+        });
+
+        let task = FlushTask::spawn(
+            registry.clone(),
+            backend,
+            MemTableConfig {
+                retain_secs: 0, // kill switch
+                ..MemTableConfig::default()
+            },
+            Duration::from_secs(3600),
+        );
+
+        task.request_immediate(p, t.clone(), FlushTrigger::ScanPressure)
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(*flushed_rows.lock().await, 10);
+        let e = registry.get(&p, &t).expect("entry must still exist");
+        assert_eq!(e.memtable.total_count(), 0, "retain-nothing: fully drained");
+        assert_eq!(e.memtable.bytes_allocated(), 0);
+        assert_eq!(e.memtable.bytes_dirty(), 0);
 
         task.shutdown().await;
     }
@@ -849,6 +943,221 @@ mod tests {
             1,
             "resumed task should have flushed 1 row"
         );
+
+        task.shutdown().await;
+    }
+
+    // ── S4 age-based residency: ack semantics through the flush task ──────────
+
+    /// Backend that blocks inside its FIRST `write_rows` call until released,
+    /// so a test can deterministically land a write between the flush snapshot
+    /// and the flush ack.
+    struct BlockingFirstWriteBackend {
+        entered: Arc<AtomicBool>,
+        release: Arc<tokio::sync::Notify>,
+        first: AtomicBool,
+    }
+
+    impl FlushBackend for BlockingFirstWriteBackend {
+        fn write_rows(
+            &self,
+            _project: &ProjectId,
+            _table: &TableName,
+            rows: Vec<RowBytes>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<WrittenFile>> + Send + '_>>
+        {
+            let count = rows.len();
+            let block = self.first.swap(false, Ordering::AcqRel);
+            let entered = self.entered.clone();
+            let release = self.release.clone();
+            Box::pin(async move {
+                if block {
+                    entered.store(true, Ordering::Release);
+                    release.notified().await;
+                }
+                Ok(WrittenFile {
+                    path: "noop://blocking".to_string(),
+                    size_bytes: (count * 64) as u64,
+                    row_count: count as u64,
+                })
+            })
+        }
+
+        fn commit_new_file(
+            &self,
+            _project: &ProjectId,
+            _table: &TableName,
+            _file: WrittenFile,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn apply_tombstones(
+            &self,
+            _project: &ProjectId,
+            _table: &TableName,
+            _tombstone_keys: Vec<RowKey>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn truncate_wal(
+            &self,
+            _project: &ProjectId,
+            _max_lsn: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// End-to-end reproduction of the version-loss fix through the flush task:
+    /// a write that lands while the flush I/O is in flight (after the
+    /// snapshot) must survive the ack DIRTY. Pre-S4, step 6's
+    /// `remove_flushed` dropped the whole chain by key and destroyed it.
+    #[tokio::test]
+    async fn post_snapshot_write_survives_flush_ack() {
+        let registry = Arc::new(MemTableRegistry::new());
+        let p = proj();
+        let t = tbl("events");
+        let entry = registry.get_or_create(p, t.clone());
+        entry.memtable.insert(key(1), row_val(0x01)); // v1, seq 1
+
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let backend: Arc<dyn FlushBackend> = Arc::new(BlockingFirstWriteBackend {
+            entered: entered.clone(),
+            release: release.clone(),
+            first: AtomicBool::new(true),
+        });
+
+        let task = FlushTask::spawn(
+            registry.clone(),
+            backend,
+            MemTableConfig::default(),
+            Duration::from_secs(3600),
+        );
+        task.request_immediate(p, t.clone(), FlushTrigger::ScanPressure)
+            .unwrap();
+
+        // Wait until the flush has taken its snapshot and entered the backend.
+        for _ in 0..200 {
+            if entered.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(entered.load(Ordering::Acquire), "flush must have started");
+
+        // Post-snapshot write: v2 overwrites the key mid-flush.
+        entry.memtable.insert(key(1), row_val(0x02)); // seq 2
+
+        release.notify_one();
+        // Wait for the ack: v1's covered bytes drain, leaving exactly v2.
+        for _ in 0..200 {
+            if entry.memtable.bytes_allocated() == 64 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        match entry
+            .memtable
+            .get(&key(1))
+            .expect("v2 must survive the ack")
+        {
+            MemRowValue::Row { bytes, .. } => {
+                assert_eq!(bytes[0], 0x02, "the post-snapshot version must win")
+            }
+            other => panic!("expected v2 Row, got {other:?}"),
+        }
+        assert_eq!(
+            entry.memtable.bytes_dirty(),
+            64,
+            "v2 stays dirty for the next flush"
+        );
+
+        task.shutdown().await;
+    }
+
+    /// Step 7 must release exactly what the ack freed, keeping the project
+    /// byte counter in lockstep with the memtable. Pre-S4 it released the
+    /// per-snapshot newest-only sum while `remove_flushed` freed whole chains.
+    #[tokio::test]
+    async fn flush_releases_exactly_what_the_ack_freed() {
+        let registry = Arc::new(MemTableRegistry::new());
+        let p = proj();
+        let t = tbl("events");
+        let entry = registry.get_or_create(p, t.clone());
+        // Two-version chain for one key: 64 + 64 bytes, both reserved.
+        registry.try_reserve_bytes(&p, 64);
+        entry.memtable.insert(key(1), row_val(0x01));
+        registry.try_reserve_bytes(&p, 64);
+        entry.memtable.upsert(key(1), row_val(0x02));
+        assert_eq!(registry.project_bytes(&p), 128);
+        assert_eq!(entry.memtable.bytes_allocated(), 128);
+
+        let backend: Arc<dyn FlushBackend> = Arc::new(NoopBackend {
+            flushed_rows: Arc::new(Mutex::new(0)),
+            tombstones: Arc::new(Mutex::new(0)),
+        });
+        let task = FlushTask::spawn(
+            registry.clone(),
+            backend,
+            MemTableConfig::default(),
+            Duration::from_secs(3600),
+        );
+        task.request_immediate(p, t.clone(), FlushTrigger::ScanPressure)
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The ack drained v1 (64, freed) and retained v2 clean (64).
+        assert_eq!(entry.memtable.bytes_allocated(), 64);
+        assert_eq!(entry.memtable.bytes_clean(), 64);
+        assert_eq!(
+            registry.project_bytes(&p),
+            entry.memtable.bytes_allocated(),
+            "project counter must stay in lockstep with memtable bytes"
+        );
+
+        task.shutdown().await;
+    }
+
+    /// Step 8: a flush whose retained-clean bytes exceed the project clean cap
+    /// evicts back down to the cap immediately (without waiting for the
+    /// periodic sweep).
+    #[tokio::test]
+    async fn flush_evicts_clean_down_to_cap_post_ack() {
+        let registry = Arc::new(MemTableRegistry::new());
+        let p = proj();
+        let t = tbl("events");
+        let entry = registry.get_or_create(p, t.clone());
+        for i in 0..5i64 {
+            entry.memtable.insert(key(i), row_val(i as u8));
+        }
+
+        let backend: Arc<dyn FlushBackend> = Arc::new(NoopBackend {
+            flushed_rows: Arc::new(Mutex::new(0)),
+            tombstones: Arc::new(Mutex::new(0)),
+        });
+        let task = FlushTask::spawn(
+            registry.clone(),
+            backend,
+            MemTableConfig {
+                project_clean_cap_bytes: 0, // nothing clean may be retained
+                ..MemTableConfig::default()
+            },
+            Duration::from_secs(3600),
+        );
+        task.request_immediate(p, t.clone(), FlushTrigger::ScanPressure)
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(
+            entry.memtable.total_count(),
+            0,
+            "zero clean cap: everything the ack retained is evicted in step 8"
+        );
+        assert_eq!(entry.memtable.bytes_allocated(), 0);
 
         task.shutdown().await;
     }

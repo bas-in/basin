@@ -43,6 +43,22 @@ pub const DEFAULT_TABLE_SOFT_CAP_BYTES: u64 = 16 * 1024 * 1024;
 /// when neither the project nor the table soft cap has been reached.
 pub const DEFAULT_MEMTABLE_MAX_AGE_SECS: u64 = 60;
 
+/// Default clean-retention window in seconds (5 min) — S4 age-based residency.
+///
+/// Rows that have been flushed (acked clean) stay readable in memory until
+/// they are this old, then become eviction candidates for the clean-budget
+/// sweep. `0` = retain nothing: flushed rows are dropped immediately after
+/// the ack, byte-for-byte the pre-S4 drain-at-flush behavior (the kill
+/// switch). Override with `BASIN_HOTTIER_RETAIN_SECS`.
+pub const DEFAULT_RETAIN_SECS: u64 = 300;
+
+/// Default per-project cap on clean (flushed-and-retained) bytes (32 MiB).
+///
+/// Clean bytes also keep counting against the project hard/soft caps; this is
+/// an additional, lower bound on how much memory mere read-acceleration may
+/// hold per project. Override with `BASIN_HOTTIER_RETAIN_CAP`.
+pub const DEFAULT_PROJECT_CLEAN_CAP_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Minimum allowed hard cap (1 MiB). Enforced by the `ALTER PROJECT` parser.
 pub const MIN_HARD_CAP_BYTES: u64 = 1024 * 1024;
 
@@ -105,6 +121,16 @@ pub struct MemTableConfig {
     pub memtable_max_age_secs: u64,
     /// Flush scheduling algorithm used by the global-pressure flush path.
     pub flush_policy: FlushPolicy,
+    /// S4 age-based residency: how long flushed (clean) rows stay readable in
+    /// memory before the clean-budget sweep evicts them. `0` = retain nothing
+    /// — the flush ack degenerates to today's drain-at-flush behavior (kill
+    /// switch). Clean bytes keep counting against the project hard/soft caps
+    /// regardless of this value.
+    pub retain_secs: u64,
+    /// S4 age-based residency: per-project cap on clean (flushed-and-retained)
+    /// bytes. Exceeding it triggers eviction of the oldest clean entries down
+    /// to the cap, independently of `retain_secs`.
+    pub project_clean_cap_bytes: u64,
 }
 
 impl Default for MemTableConfig {
@@ -115,6 +141,8 @@ impl Default for MemTableConfig {
             table_soft_cap_bytes: DEFAULT_TABLE_SOFT_CAP_BYTES,
             memtable_max_age_secs: DEFAULT_MEMTABLE_MAX_AGE_SECS,
             flush_policy: FlushPolicy::LargestFirst,
+            retain_secs: DEFAULT_RETAIN_SECS,
+            project_clean_cap_bytes: DEFAULT_PROJECT_CLEAN_CAP_BYTES,
         }
     }
 }
@@ -131,6 +159,8 @@ impl MemTableConfig {
     /// | `BASIN_MEMTABLE_TABLE_CAP` | 16777216 | Per-table soft cap, bytes |
     /// | `BASIN_MEMTABLE_MAX_AGE_SECS` | 60 | Age flush threshold, seconds |
     /// | `BASIN_MEMTABLE_FLUSH_POLICY` | `largest_first` | `largest_first` or `lru` |
+    /// | `BASIN_HOTTIER_RETAIN_SECS` | 300 | Clean-retention window, seconds (0 = retain nothing) |
+    /// | `BASIN_HOTTIER_RETAIN_CAP` | 33554432 | Per-project clean-bytes cap, bytes |
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
 
@@ -145,6 +175,12 @@ impl MemTableConfig {
         }
         if let Some(v) = env_u64("BASIN_MEMTABLE_MAX_AGE_SECS") {
             cfg.memtable_max_age_secs = v;
+        }
+        if let Some(v) = env_u64("BASIN_HOTTIER_RETAIN_SECS") {
+            cfg.retain_secs = v;
+        }
+        if let Some(v) = env_u64("BASIN_HOTTIER_RETAIN_CAP") {
+            cfg.project_clean_cap_bytes = v;
         }
         if let Ok(s) = std::env::var("BASIN_MEMTABLE_FLUSH_POLICY") {
             match s.to_ascii_lowercase().as_str() {
@@ -510,6 +546,19 @@ mod tests {
         assert_eq!(cfg.table_soft_cap_bytes, 16 * 1024 * 1024);
         assert_eq!(cfg.memtable_max_age_secs, 60);
         assert_eq!(cfg.flush_policy, FlushPolicy::LargestFirst);
+        assert_eq!(cfg.retain_secs, 300);
+        assert_eq!(cfg.project_clean_cap_bytes, 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn from_env_reads_retention_overrides() {
+        std::env::set_var("BASIN_HOTTIER_RETAIN_SECS", "0");
+        std::env::set_var("BASIN_HOTTIER_RETAIN_CAP", "1048576");
+        let cfg = MemTableConfig::from_env();
+        std::env::remove_var("BASIN_HOTTIER_RETAIN_SECS");
+        std::env::remove_var("BASIN_HOTTIER_RETAIN_CAP");
+        assert_eq!(cfg.retain_secs, 0, "retain_secs=0 is the kill switch");
+        assert_eq!(cfg.project_clean_cap_bytes, 1024 * 1024);
     }
 
     #[test]

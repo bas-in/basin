@@ -334,14 +334,27 @@ impl MemTableRegistry {
     /// is `min(state.hard_cap_bytes, slice_for(project, MemtableBytes))`.
     /// The slice closes the multi-instance bypass — each replica's local
     /// allotment is `project_total / partition_count` (no `N × hard_cap`).
+    /// S4 age-based residency: before reporting `FlushSuggested` /
+    /// `HardCapReached`, clean (flushed-and-retained) bytes are evicted and
+    /// the cap re-evaluated — retained-clean rows are pure read acceleration
+    /// and must never block or throttle a write. Outcome semantics are
+    /// otherwise unchanged.
     pub fn try_reserve_bytes(&self, project: &ProjectId, n: u64) -> ReservationOutcome {
         let state = self.project_state(*project);
         let hard_cap = self.effective_hard_cap(project, &state);
-        let current = state.bytes_allocated.load(Ordering::Relaxed);
-        let after = current.saturating_add(n);
+        let mut current = state.bytes_allocated.load(Ordering::Relaxed);
+        let mut after = current.saturating_add(n);
 
         if after > hard_cap {
-            return ReservationOutcome::HardCapReached;
+            // Try to reclaim clean bytes before blocking the writer.
+            let need = after - hard_cap;
+            if self.evict_clean(project, need) > 0 {
+                current = state.bytes_allocated.load(Ordering::Relaxed);
+                after = current.saturating_add(n);
+            }
+            if after > hard_cap {
+                return ReservationOutcome::HardCapReached;
+            }
         }
 
         // CAS loop to commit the reservation.
@@ -365,6 +378,15 @@ impl MemTableRegistry {
         }
 
         if after > state.soft_cap_bytes {
+            // Try to dip back under the soft cap by evicting clean bytes
+            // before suggesting a flush (the reservation is already
+            // committed; eviction lowers the counter).
+            let need = after - state.soft_cap_bytes;
+            if self.evict_clean(project, need) > 0
+                && state.bytes_allocated.load(Ordering::Relaxed) <= state.soft_cap_bytes
+            {
+                return ReservationOutcome::Granted;
+            }
             let _ = self.flush_tx.send(FlushRequest { project: *project });
             ReservationOutcome::FlushSuggested
         } else {
@@ -419,6 +441,94 @@ impl MemTableRegistry {
             .get(project)
             .map(|s| s.bytes_allocated.load(Ordering::Relaxed))
             .unwrap_or(0)
+    }
+
+    // ── S4 age-based residency: clean-bytes accounting + eviction ────────────
+
+    /// Sum of clean (flushed-and-retained) bytes across all of `project`'s
+    /// memtables. O(n) over registry entries — used by the clean-budget sweep
+    /// and the post-flush eviction step, not by the per-write hot path.
+    pub fn project_clean_bytes(&self, project: &ProjectId) -> u64 {
+        self.tables
+            .iter()
+            .filter(|e| &e.key().0 == project)
+            .map(|e| e.value().memtable.bytes_clean())
+            .sum()
+    }
+
+    /// Evict up to `want_bytes` of clean entries from `project`'s memtables
+    /// (oldest-acked first within each table) and release the freed bytes
+    /// from the project's budget counter / semaphore. Returns the bytes
+    /// actually freed. Clean entries are byte-identical to their cold images,
+    /// so eviction is read-transparent (no epoch bump — the PK row cache
+    /// stays warm).
+    pub fn evict_clean(&self, project: &ProjectId, want_bytes: u64) -> u64 {
+        if want_bytes == 0 {
+            return 0;
+        }
+        // Snapshot the Arcs first so no DashMap shard lock is held while the
+        // per-memtable eviction takes its own locks.
+        let tables: Vec<Arc<MemTableEntry>> = self
+            .tables
+            .iter()
+            .filter(|e| &e.key().0 == project)
+            .map(|e| e.value().clone())
+            .collect();
+        let mut remaining = want_bytes;
+        let mut freed_total: u64 = 0;
+        for entry in tables {
+            let freed = entry.memtable.evict_clean(remaining, None);
+            freed_total += freed;
+            remaining = remaining.saturating_sub(freed);
+            if remaining == 0 {
+                break;
+            }
+        }
+        if freed_total > 0 {
+            self.release_bytes(project, freed_total);
+        }
+        freed_total
+    }
+
+    /// Sweep every memtable for clean-budget violations (S4 age-based
+    /// residency):
+    ///
+    /// 1. **Age** — clean entries older than `config.retain_secs` are evicted
+    ///    everywhere (`retain_secs == 0` ⇒ retain nothing, the kill switch).
+    /// 2. **Cap** — projects whose clean bytes exceed
+    ///    `config.project_clean_cap_bytes` are evicted down to the cap,
+    ///    oldest-acked first.
+    ///
+    /// Freed bytes are released from each project's budget counter. Returns
+    /// the total bytes freed. Called by the flush task's periodic tick.
+    pub fn enforce_clean_budgets(&self) -> u64 {
+        let mut freed_total: u64 = 0;
+
+        // Age sweep (per table; release per project).
+        let retain = self.config.retain_secs;
+        for (project, _table, entry) in self.tables_iter() {
+            let freed = entry.memtable.evict_clean(u64::MAX, Some(retain));
+            if freed > 0 {
+                self.release_bytes(&project, freed);
+                freed_total += freed;
+            }
+        }
+
+        // Cap sweep. Derive the project set from the tables (a project can
+        // hold memtables without ever having reserved bytes, e.g. in tests).
+        let cap = self.config.project_clean_cap_bytes;
+        let mut seen = std::collections::HashSet::new();
+        for (project, _table, _entry) in self.tables_iter() {
+            if !seen.insert(project) {
+                continue;
+            }
+            let clean = self.project_clean_bytes(&project);
+            if clean > cap {
+                freed_total += self.evict_clean(&project, clean - cap);
+            }
+        }
+
+        freed_total
     }
 
     // ── misc ──────────────────────────────────────────────────────────────────
@@ -712,6 +822,175 @@ mod tests {
     fn project_bytes_returns_zero_for_unknown_project() {
         let reg = MemTableRegistry::new();
         assert_eq!(reg.project_bytes(&proj()), 0);
+    }
+
+    // ── S4 age-based residency: clean accounting / eviction / budgets ─────────
+
+    /// Insert `n` bytes for `(p, t)`, reserve them against the project budget,
+    /// and ack them clean — the state a flushed-and-retained row is in.
+    fn seed_clean(reg: &MemTableRegistry, p: ProjectId, t: &TableName, n: usize) {
+        let entry = reg.get_or_create(p, t.clone());
+        assert_ne!(
+            reg.try_reserve_bytes(&p, n as u64),
+            ReservationOutcome::HardCapReached
+        );
+        entry
+            .memtable
+            .insert_clean(key(n as i64), MemRowValue::row(vec![0u8; n], 0));
+    }
+
+    #[test]
+    fn project_clean_bytes_tracks_acked_entries() {
+        let reg = MemTableRegistry::new();
+        let p = proj();
+        let entry = reg.get_or_create(p, tbl("orders"));
+        entry
+            .memtable
+            .insert(key(1), MemRowValue::row(vec![0u8; 100], 0));
+        assert_eq!(reg.project_clean_bytes(&p), 0, "dirty bytes are not clean");
+        entry.memtable.mark_flushed(&[(key(1), 1)]);
+        assert_eq!(reg.project_clean_bytes(&p), 100);
+        // Another project's clean bytes are invisible to this one.
+        assert_eq!(reg.project_clean_bytes(&proj()), 0);
+    }
+
+    #[test]
+    fn registry_evict_clean_frees_and_releases() {
+        let cfg = MemTableConfig {
+            project_hard_cap_bytes: 8 * 1024,
+            project_soft_cap_bytes: 4 * 1024,
+            ..MemTableConfig::default()
+        };
+        let reg = MemTableRegistry::new_with_config(cfg);
+        let p = proj();
+        let t = tbl("orders");
+        seed_clean(&reg, p, &t, 1024);
+        assert_eq!(reg.project_bytes(&p), 1024);
+        assert_eq!(reg.project_clean_bytes(&p), 1024);
+
+        let freed = reg.evict_clean(&p, 1);
+        assert_eq!(freed, 1024, "whole clean chain evicted");
+        assert_eq!(reg.project_bytes(&p), 0, "freed bytes released from budget");
+        assert_eq!(reg.project_clean_bytes(&p), 0);
+    }
+
+    #[test]
+    fn try_reserve_evicts_clean_before_hard_cap() {
+        let cfg = MemTableConfig {
+            project_hard_cap_bytes: 1024,
+            project_soft_cap_bytes: 512,
+            ..MemTableConfig::default()
+        };
+        let reg = MemTableRegistry::new_with_config(cfg);
+        let p = proj();
+        let t = tbl("orders");
+        // Fill the project to its hard cap with retained-clean bytes.
+        seed_clean(&reg, p, &t, 1024);
+        assert_eq!(reg.project_bytes(&p), 1024);
+
+        // Pre-S4 this returned HardCapReached. Clean bytes are pure read
+        // acceleration — they are evicted and the write proceeds.
+        let outcome = reg.try_reserve_bytes(&p, 64);
+        assert_eq!(outcome, ReservationOutcome::Granted);
+        assert_eq!(reg.project_bytes(&p), 64);
+        assert_eq!(reg.project_clean_bytes(&p), 0, "clean bytes were evicted");
+    }
+
+    #[test]
+    fn try_reserve_evicts_clean_before_flush_suggested() {
+        let cfg = MemTableConfig {
+            project_hard_cap_bytes: 4096,
+            project_soft_cap_bytes: 1024,
+            ..MemTableConfig::default()
+        };
+        let reg = MemTableRegistry::new_with_config(cfg);
+        let p = proj();
+        let t = tbl("orders");
+        seed_clean(&reg, p, &t, 1000);
+
+        // 1000 + 100 > soft cap, but evicting the 1000 clean bytes dips the
+        // counter back under it — no flush needs to be suggested.
+        let outcome = reg.try_reserve_bytes(&p, 100);
+        assert_eq!(outcome, ReservationOutcome::Granted);
+        assert_eq!(reg.project_bytes(&p), 100);
+    }
+
+    #[test]
+    fn try_reserve_hard_cap_still_reached_when_nothing_clean() {
+        let cfg = MemTableConfig {
+            project_hard_cap_bytes: 1024,
+            project_soft_cap_bytes: 512,
+            ..MemTableConfig::default()
+        };
+        let reg = MemTableRegistry::new_with_config(cfg);
+        let p = proj();
+        reg.try_reserve_bytes(&p, 1024); // all dirty (no memtable acks)
+        assert_eq!(
+            reg.try_reserve_bytes(&p, 1),
+            ReservationOutcome::HardCapReached,
+            "with no clean bytes to evict the outcome is unchanged"
+        );
+    }
+
+    #[test]
+    fn enforce_clean_budgets_age_zero_is_kill_switch() {
+        let cfg = MemTableConfig {
+            retain_secs: 0,
+            ..MemTableConfig::default()
+        };
+        let reg = MemTableRegistry::new_with_config(cfg);
+        let p = proj();
+        let t = tbl("orders");
+        seed_clean(&reg, p, &t, 256);
+        assert_eq!(reg.project_clean_bytes(&p), 256);
+
+        let freed = reg.enforce_clean_budgets();
+        assert_eq!(freed, 256, "retain_secs=0 retains nothing");
+        assert_eq!(reg.project_clean_bytes(&p), 0);
+        assert_eq!(reg.project_bytes(&p), 0, "freed bytes released");
+    }
+
+    #[test]
+    fn enforce_clean_budgets_retains_young_entries() {
+        // Default retain window (300 s): entries acked just now stay.
+        let reg = MemTableRegistry::new();
+        let p = proj();
+        let t = tbl("orders");
+        seed_clean(&reg, p, &t, 256);
+        assert_eq!(reg.enforce_clean_budgets(), 0);
+        assert_eq!(
+            reg.project_clean_bytes(&p),
+            256,
+            "young clean rows retained"
+        );
+    }
+
+    #[test]
+    fn enforce_clean_budgets_cap_evicts_down_to_cap() {
+        let cfg = MemTableConfig {
+            project_clean_cap_bytes: 100,
+            ..MemTableConfig::default()
+        };
+        let reg = MemTableRegistry::new_with_config(cfg);
+        let p = proj();
+        let t = tbl("orders");
+        // Two clean entries of 100 bytes each → 200 clean > 100 cap.
+        let entry = reg.get_or_create(p, t.clone());
+        reg.try_reserve_bytes(&p, 200);
+        entry
+            .memtable
+            .insert_clean(key(1), MemRowValue::row(vec![0u8; 100], 0));
+        entry
+            .memtable
+            .insert_clean(key(2), MemRowValue::row(vec![0u8; 100], 0));
+        assert_eq!(reg.project_clean_bytes(&p), 200);
+
+        let freed = reg.enforce_clean_budgets();
+        assert_eq!(freed, 100, "evicted down to the cap (oldest first)");
+        assert_eq!(reg.project_clean_bytes(&p), 100);
+        // Oldest-acked entry went first.
+        assert!(entry.memtable.get(&key(1)).is_none());
+        assert!(entry.memtable.get(&key(2)).is_some());
     }
 
     // ── hot_tier_epoch (Fix A — PK row cache invalidation) ────────────────────
