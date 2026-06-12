@@ -494,9 +494,11 @@ async fn orm_compat_corpus_ext() {
         Shape::raw(r#"INSERT INTO "memberships" ("org_id","user_id","level") VALUES (1,1,'admin')
            ON CONFLICT ("org_id","user_id") DO UPDATE SET "level" = EXCLUDED."level""#),
         // $queryRaw escape hatch — typed cast + computed expression.
-        Shape::with(
-            r#"SELECT "id", "balance"::numeric(12,2) * $1::numeric AS "scaled" FROM "members" WHERE "balance" IS NOT NULL"#,
-            &[ParamValue::F64(1.1)],
+        // The harness has no Numeric ParamValue variant; inline the multiplier
+        // as a typed literal — same convention as orm_compat.rs (which avoids
+        // timestamptz/numeric bind params for the same reason).
+        Shape::raw(
+            r#"SELECT "id", "balance"::numeric(12,2) * 1.1::numeric AS "scaled" FROM "members" WHERE "balance" IS NOT NULL"#,
         ),
         // CREATE TYPE … AS ENUM — `prisma migrate` enum emission (probed).
         Shape::raw(r#"CREATE TYPE "status_enum" AS ENUM ('open','closed')"#),
@@ -528,10 +530,13 @@ async fn orm_compat_corpus_ext() {
         Shape::raw(r#"SELECT "id" FROM "members" WHERE "tags" @> ARRAY['rust']"#),
         // updateMany-style bulk UPDATE returning the rows (`.returning()`).
         Shape::raw(r#"UPDATE "members" SET "version" = "version" + 1 WHERE "role" = 'USER' RETURNING "id","version""#),
-        // keyset pagination with composite cursor (id, created_at).
-        Shape::with(
-            r#"SELECT "id","email" FROM "members" WHERE ("created_at", "id") > ($1, $2) ORDER BY "created_at" ASC, "id" ASC LIMIT $3"#,
-            &[ParamValue::Text("2024-01-01 00:00:00+00"), ParamValue::I64(1), ParamValue::I64(5)],
+        // keyset pagination with composite cursor (created_at, id).
+        // Drizzle emits the timestamp as a typed literal; embed it inline so
+        // the tokio-postgres harness (which has no Timestamptz ParamValue variant)
+        // does not trip on OID mismatch — matches the convention in orm_compat.rs
+        // (see comment at the GORM timestamptz note).
+        Shape::raw(
+            r#"SELECT "id","email" FROM "members" WHERE ("created_at", "id") > ('2024-01-01 00:00:00+00'::timestamptz, 1) ORDER BY "created_at" ASC, "id" ASC LIMIT 5"#,
         ),
         // optimistic-lock UPDATE — `WHERE id = $1 AND version = $2`.
         Shape::with(
@@ -708,14 +713,18 @@ async fn orm_compat_corpus_ext() {
         // gorm.Model soft-delete read — `deleted_at IS NULL` injected.
         Shape::raw(r#"SELECT * FROM "members" WHERE "members"."deleted_at" IS NULL ORDER BY "members"."id""#),
         // gorm soft delete — UPDATE deleted_at = now() (the Delete() emission).
-        Shape::with(
-            r#"UPDATE "members" SET "deleted_at" = $1 WHERE "id" = $2 AND "members"."deleted_at" IS NULL"#,
-            &[ParamValue::Text("2024-06-01 00:00:00+00"), ParamValue::I64(2)],
+        // GORM pgx binds the timestamp as a typed string over pgx; the harness has
+        // no Timestamptz ParamValue variant, so inline the literal with ::timestamptz
+        // cast — same convention as orm_compat.rs GORM section note.
+        Shape::raw(
+            r#"UPDATE "members" SET "deleted_at" = '2024-06-01 00:00:00+00'::timestamptz WHERE "id" = 2 AND "members"."deleted_at" IS NULL"#,
         ),
         // optimistic lock via gorm hooks — `WHERE id = $1 AND version = $2`.
+        // GORM pgx drives numeric via the pgx Numeric codec; the harness has no
+        // Numeric ParamValue variant, so inline the balance literal with ::numeric.
         Shape::with(
-            r#"UPDATE "members" SET "balance" = $1, "version" = "version" + 1 WHERE "id" = $2 AND "version" = $3"#,
-            &[ParamValue::F64(5.5), ParamValue::I64(1), ParamValue::I64(0)],
+            r#"UPDATE "members" SET "balance" = 5.5::numeric, "version" = "version" + 1 WHERE "id" = $1 AND "version" = $2"#,
+            &[ParamValue::I64(1), ParamValue::I64(0)],
         ),
         // composite ON CONFLICT upsert — gorm OnConflict with multiple Columns.
         Shape::with(
@@ -796,9 +805,10 @@ async fn orm_compat_corpus_ext() {
             &[ParamValue::Text("pro")],
         ),
         // numeric round-trip with bound numeric arithmetic.
-        Shape::with(
-            r#"SELECT id FROM "members" WHERE balance > $1"#,
-            &[ParamValue::F64(50.0)],
+        // sqlx drives Decimal via its own codec; the harness has no Numeric
+        // ParamValue variant, so inline the threshold literal with ::numeric.
+        Shape::raw(
+            r#"SELECT id FROM "members" WHERE balance > 50.0::numeric"#,
         ),
         // bytea round-trip — sqlx `Vec<u8>` bind.
         Shape::with(

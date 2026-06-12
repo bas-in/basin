@@ -48,7 +48,7 @@
 //! | `similarity("foo","foobar")` ≈ 0.444      | 4/9             | trigram count by hand, needs check |
 //! | `similarity("night","nacht")` value       | ~0.25           | non-trivial; needs PG check        |
 //! | `word_similarity("cat","concatenate")`    | ~0.444          | needs PG check                     |
-//! | `similarity("abc","abcabc")` dedup effect | < 1.0           | dedup means set-size doesn't double|
+//! | `similarity("abc","abcabc")` dedup effect | 4/6 ≈ 0.6667   | union=6 (bca+cab novel); PG=0.6667 |
 
 #![allow(clippy::print_stdout)]
 
@@ -380,19 +380,34 @@ fn similarity_foo_vs_foobar_approx() {
 }
 
 /// Repeated content: `similarity("abc","abcabc")`.
-/// `extract` deduplicates, so the trigram set of "abcabc" equals the set of "abc".
-/// Therefore `similarity("abc","abcabc")` == `similarity("abc","abc")` == 1.0.
 ///
-/// NEEDS-PSQL-VALIDATION: PG may treat "abcabc" differently if its tokenizer
-/// splits on word boundaries differently, but since it's all one alphanumeric run
-/// we expect identical deduplication behaviour.
+/// "abcabc" is one alphanumeric word, padded to "  abcabc ".
+/// Sliding 3-byte windows (before dedup):
+///   "  a", " ab", "abc", "bca", "cab", "abc"(dup), "bc "
+/// After sort+dedup: {"  a", " ab", "abc", "bc ", "bca", "cab"} = 6 trigrams.
+///
+/// "abc" padded to "  abc ":
+///   "  a", " ab", "abc", "bc "
+/// After sort+dedup: {"  a", " ab", "abc", "bc "} = 4 trigrams.
+///
+/// Intersection = {"  a", " ab", "abc", "bc "} = 4.
+/// Union        = {"  a", " ab", "abc", "bc ", "bca", "cab"} = 6.
+/// Jaccard      = 4/6 ≈ 0.6667.
+///
+/// The set is NOT equal because "abcabc" produces two *interior* boundary
+/// trigrams ("bca", "cab") that "abc" does not — dedup only removes the
+/// second occurrence of "abc", it cannot remove novel boundary trigrams.
+/// PG confirmed: `SELECT similarity('abc','abcabc'); => 0.666667`.
 #[test]
 fn similarity_repeated_content_dedup_effect() {
-    // "abcabc" is one word, same trigram set as "abc" after dedup.
+    // "abcabc" produces {"  a"," ab","abc","bc ","bca","cab"} = 6 trigrams;
+    // "abc"    produces {"  a"," ab","abc","bc "}             = 4 trigrams;
+    // intersection = 4, union = 6 → Jaccard = 4/6 ≈ 0.6667.
     let s = similarity("abc", "abcabc");
+    let expected = 4.0_f32 / 6.0_f32; // 0.6667
     assert!(
-        approx_eq(s, 1.0),
-        "similarity('abc','abcabc'): got {s}, expected 1.0 (dedup equalises sets)"
+        approx_eq(s, expected),
+        "similarity('abc','abcabc'): got {s}, expected 4/6 ≈ {expected:.4}"
     );
 }
 

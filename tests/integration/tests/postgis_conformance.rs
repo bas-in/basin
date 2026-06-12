@@ -286,8 +286,10 @@ async fn st_geomfromtext_case_insensitive() {
             &format!("SELECT ST_AsText(ST_GeomFromText('{wkt}'))"),
         )
         .await;
+        // PG/PostGIS ST_AsText strips trailing ".0" from integer-valued coords:
+        // ST_AsText(ST_GeomFromText('POINT(1.0 2.0)')) → "POINT(1 2)"
         assert_eq!(
-            got, "POINT(1.0 2.0)",
+            got, "POINT(1 2)",
             "ST_GeomFromText must accept {wkt:?}; got={got:?}"
         );
     }
@@ -373,8 +375,9 @@ async fn st_geomfromgeojson_roundtrip() {
         "SELECT ST_AsText(ST_GeomFromGeoJSON(ST_AsGeoJSON(ST_MakePoint(3.0, 4.0))))",
     )
     .await;
+    // PG/PostGIS ST_AsText strips trailing ".0": POINT(3.0 4.0) → "POINT(3 4)"
     assert_eq!(
-        got, "POINT(3.0 4.0)",
+        got, "POINT(3 4)",
         "ST_GeomFromGeoJSON round-trip must restore original coordinates; got={got:?}"
     );
 
@@ -385,7 +388,7 @@ async fn st_geomfromgeojson_roundtrip() {
     )
     .await;
     assert_eq!(
-        lit, "POINT(5.0 6.0)",
+        lit, "POINT(5 6)",
         "ST_GeomFromGeoJSON from literal JSON must work; got={lit:?}"
     );
     println!("[geo ST_GeomFromGeoJSON] round-trip ✓");
@@ -434,8 +437,9 @@ async fn st_asewkb_st_geomfromwkb_roundtrip() {
         "SELECT ST_AsText(ST_GeomFromWKB(ST_AsEWKB(ST_MakePoint(7.0, 8.0))))",
     )
     .await;
+    // PG/PostGIS ST_AsText strips trailing ".0": POINT(7.0 8.0) → "POINT(7 8)"
     assert_eq!(
-        got, "POINT(7.0 8.0)",
+        got, "POINT(7 8)",
         "ST_GeomFromWKB(ST_AsEWKB(…)) must recover original coords; got={got:?}"
     );
     println!("[geo WKB] round-trip ✓");
@@ -981,8 +985,9 @@ async fn st_envelope_of_point_is_identity() {
         "SELECT ST_AsText(ST_Envelope(ST_MakePoint(5.0, 6.0)))",
     )
     .await;
+    // PG/PostGIS ST_AsText strips trailing ".0": POINT(5.0 6.0) → "POINT(5 6)"
     assert_eq!(
-        wkt, "POINT(5.0 6.0)",
+        wkt, "POINT(5 6)",
         "ST_Envelope(POINT) must return the same point; got={wkt:?}"
     );
     println!("[geo ST_Envelope] identity for POINT ✓");
@@ -1000,8 +1005,9 @@ async fn st_centroid_of_point_is_identity() {
         "SELECT ST_AsText(ST_Centroid(ST_MakePoint(7.0, 8.0)))",
     )
     .await;
+    // PG/PostGIS ST_AsText strips trailing ".0": POINT(7.0 8.0) → "POINT(7 8)"
     assert_eq!(
-        wkt, "POINT(7.0 8.0)",
+        wkt, "POINT(7 8)",
         "ST_Centroid(POINT) must be identity; got={wkt:?}"
     );
     println!("[geo ST_Centroid] identity for POINT ✓");
@@ -1024,8 +1030,9 @@ async fn st_startpoint_endpoint_identity_for_point() {
         "SELECT ST_AsText(ST_EndPoint(ST_MakePoint(1.0, 2.0)))",
     )
     .await;
-    assert_eq!(start, "POINT(1.0 2.0)", "ST_StartPoint(POINT) must be identity; got={start:?}");
-    assert_eq!(end, "POINT(1.0 2.0)", "ST_EndPoint(POINT) must be identity; got={end:?}");
+    // PG/PostGIS ST_AsText strips trailing ".0": POINT(1.0 2.0) → "POINT(1 2)"
+    assert_eq!(start, "POINT(1 2)", "ST_StartPoint(POINT) must be identity; got={start:?}");
+    assert_eq!(end, "POINT(1 2)", "ST_EndPoint(POINT) must be identity; got={end:?}");
     println!("[geo ST_StartPoint/ST_EndPoint] identity ✓");
 }
 
@@ -1041,8 +1048,9 @@ async fn st_buffer_identity_for_point() {
         "SELECT ST_AsText(ST_Buffer(ST_MakePoint(3.0, 4.0), 100.0))",
     )
     .await;
+    // PG/PostGIS ST_AsText strips trailing ".0": POINT(3.0 4.0) → "POINT(3 4)"
     assert_eq!(
-        wkt, "POINT(3.0 4.0)",
+        wkt, "POINT(3 4)",
         "ST_Buffer(POINT, r) must be identity in v0.1; got={wkt:?}"
     );
     println!("[geo ST_Buffer] identity for POINT in v0.1 ✓");
@@ -1167,8 +1175,9 @@ async fn st_setsrid_is_passthrough() {
         "SELECT ST_AsText(ST_SetSRID(ST_MakePoint(10.0, 20.0), 4326))",
     )
     .await;
+    // PG/PostGIS ST_AsText strips trailing ".0": POINT(10.0 20.0) → "POINT(10 20)"
     assert_eq!(
-        wkt, "POINT(10.0 20.0)",
+        wkt, "POINT(10 20)",
         "ST_SetSRID must not alter the point coordinates; got={wkt:?}"
     );
     println!("[geo ST_SetSRID] pass-through ✓");
@@ -1255,8 +1264,9 @@ async fn st_geogfromtext_alias_works() {
         "SELECT ST_AsText(ST_GeographyFromText('POINT(1.0 2.0)'))",
     )
     .await;
-    assert_eq!(g1, "POINT(1.0 2.0)", "ST_GeogFromText must work; got={g1:?}");
-    assert_eq!(g2, "POINT(1.0 2.0)", "ST_GeographyFromText must work; got={g2:?}");
+    // PG/PostGIS ST_AsText strips trailing ".0": POINT(1.0 2.0) → "POINT(1 2)"
+    assert_eq!(g1, "POINT(1 2)", "ST_GeogFromText must work; got={g1:?}");
+    assert_eq!(g2, "POINT(1 2)", "ST_GeographyFromText must work; got={g2:?}");
     println!("[geo geography aliases] ✓");
 }
 
