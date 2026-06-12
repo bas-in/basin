@@ -7666,6 +7666,14 @@ async fn try_on_conflict_do_update(
     // The bare table name (last component) for resolving `tablename.col`.
     let table_bare = table.as_str().to_ascii_lowercase();
 
+    // Double-quoted table identifier for the generated probe / UPDATE SQL.
+    // Without quoting, a case-sensitive relation created as `"User"` re-parses
+    // as the lowercased `user` when these strings are re-executed, so the
+    // existence probe misses the conflict and the row falls to a plain INSERT
+    // (PK violation). Quoting preserves the stored case; for a lowercase name
+    // it is a no-op.
+    let table_quoted = format!("\"{}\"", table.as_str().replace('"', "\"\""));
+
     // Build the SET clause template once — the RHS will be rewritten per row
     // using that row's EXCLUDED values, but the column names are constant.
     // We validate assignments once here; each per-row UPDATE fills in the
@@ -7705,7 +7713,15 @@ async fn try_on_conflict_do_update(
     // non-literal conflict key, unsupported key type, assignment RHS that is
     // not safe as a CASE arm) falls back to the per-row loop below —
     // correctness over speed.
-    if rows_expanded.len() > 1 && conflict_cols.len() == 1 {
+    // The batched path cannot cheaply evaluate a per-row DO UPDATE WHERE
+    // clause (the conditional UPDATE would need per-row filtering inside the
+    // CASE expression, which is unsupported). When `do_update.selection` is
+    // present, fall straight through to the per-row path, which appends the
+    // rewritten filter as `AND (…)` to each single-row UPDATE.
+    if rows_expanded.len() > 1
+        && conflict_cols.len() == 1
+        && do_update.selection.is_none()
+    {
         match try_batched_do_update(
             sess,
             table,
@@ -7785,7 +7801,7 @@ async fn try_on_conflict_do_update(
             Some(b) => b,
             None => {
                 let check_sql =
-                    format!("SELECT 1 FROM {} WHERE {} LIMIT 1", table.as_str(), where_clause);
+                    format!("SELECT 1 FROM {} WHERE {} LIMIT 1", table_quoted, where_clause);
                 // Session dispatcher, not raw ctx.sql — see the DO NOTHING
                 // twin above: a stale registered provider must not decide
                 // conflict existence.
@@ -7826,12 +7842,55 @@ async fn try_on_conflict_do_update(
             })
             .collect();
 
-        let update_sql = format!(
-            "UPDATE {} SET {} WHERE {}",
-            table.as_str(),
-            set_parts.join(", "),
-            where_clause
-        );
+        // Optional DO UPDATE WHERE clause. Rewrite EXCLUDED/table refs first
+        // (EXCLUDED.col → proposed literal, table.col → bare existing-row col).
+        // After the rewrite the predicate may have collapsed to a constant
+        // (the common ORM shape `WHERE EXCLUDED.col <op> <lit>` references only
+        // the proposed row, so it folds to a bool). dml_mutate's UPDATE WHERE
+        // grammar only accepts `column <op> literal`, so a constant predicate
+        // like `NULL IS NOT NULL` or `0 > 50` cannot be pushed back into the
+        // UPDATE SQL — we evaluate it here and skip the UPDATE when it is
+        // false. A predicate that still references an existing-row column is
+        // appended as `AND (…)`; dml_mutate handles the column-OP-literal form.
+        let where_filter: Option<String> = match do_update.selection.as_ref() {
+            None => None,
+            Some(sel) => {
+                let rewritten =
+                    rewrite_do_update_expr(sel.clone(), &table_bare, &excluded_map);
+                match eval_constant_predicate(&rewritten) {
+                    // Fully constant and false → this row's UPDATE is skipped.
+                    Some(false) => {
+                        // Row conflicted but the guard rejected it. Count it as
+                        // a processed conflict so the caller treats it as an
+                        // upsert (not a fresh INSERT); PG reports 0 affected
+                        // for the rejected row — a documented cosmetic tag
+                        // divergence, not a correctness issue for read-back.
+                        update_count += 1;
+                        continue;
+                    }
+                    // Fully constant and true → unconditional UPDATE.
+                    Some(true) => None,
+                    // Still references a column → push the filter into the SQL.
+                    None => Some(format!("{rewritten}")),
+                }
+            }
+        };
+
+        let update_sql = match where_filter {
+            None => format!(
+                "UPDATE {} SET {} WHERE {}",
+                table_quoted,
+                set_parts.join(", "),
+                where_clause
+            ),
+            Some(filter) => format!(
+                "UPDATE {} SET {} WHERE {} AND ({})",
+                table_quoted,
+                set_parts.join(", "),
+                where_clause,
+                filter
+            ),
+        };
         Box::pin(sess.execute(&update_sql)).await?;
         update_count += 1;
     }
@@ -7917,8 +7976,19 @@ fn rewrite_do_update_expr(
     table_name_lower: &str,
     excluded_map: &std::collections::HashMap<String, Expr>,
 ) -> Expr {
+    // Convenience macro to avoid repeating the recursive call signature.
+    // Accepts a `Box<Expr>` and returns a new `Box<Expr>` with the inner
+    // expression recursively rewritten.
+    macro_rules! rw {
+        ($e:expr) => {
+            Box::new(rewrite_do_update_expr(*$e, table_name_lower, excluded_map))
+        };
+    }
     match expr {
         // Two-part qualified identifier: either `EXCLUDED.col` or `table.col`.
+        // The qualifier is matched case-insensitively; the column name uses
+        // `.value` (the unquoted form stored by sqlparser, so `"email"` and
+        // `email` both yield `"email"` as the value).
         Expr::CompoundIdentifier(ref parts) if parts.len() == 2 => {
             let qualifier = parts[0].value.to_ascii_lowercase();
             let col_lower = parts[1].value.to_ascii_lowercase();
@@ -7935,37 +8005,296 @@ fn rewrite_do_update_expr(
         }
         // Recurse into binary operations (the common case: `t.hits + EXCLUDED.hits`).
         Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
-            left: Box::new(rewrite_do_update_expr(
-                *left,
-                table_name_lower,
-                excluded_map,
-            )),
+            left: rw!(left),
             op,
-            right: Box::new(rewrite_do_update_expr(
-                *right,
-                table_name_lower,
-                excluded_map,
-            )),
+            right: rw!(right),
         },
         // Recurse into unary operations.
         Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
             op,
-            expr: Box::new(rewrite_do_update_expr(
-                *inner,
-                table_name_lower,
-                excluded_map,
-            )),
+            expr: rw!(inner),
         },
         // Recurse into parenthesised expressions.
-        Expr::Nested(inner) => Expr::Nested(Box::new(rewrite_do_update_expr(
-            *inner,
-            table_name_lower,
-            excluded_map,
-        ))),
-        // All other expression forms (literals, bind params, functions, …) are
+        Expr::Nested(inner) => Expr::Nested(rw!(inner)),
+        // CAST(expr AS type) — recurse into the inner expression.
+        Expr::Cast {
+            expr: inner,
+            data_type,
+            format,
+            kind,
+            array,
+        } => Expr::Cast {
+            expr: rw!(inner),
+            data_type,
+            format,
+            kind,
+            array,
+        },
+        // IS NULL / IS NOT NULL — recurse into the operand.
+        Expr::IsNull(inner) => Expr::IsNull(rw!(inner)),
+        Expr::IsNotNull(inner) => Expr::IsNotNull(rw!(inner)),
+        // IS TRUE / IS NOT TRUE / IS FALSE / IS NOT FALSE.
+        Expr::IsTrue(inner) => Expr::IsTrue(rw!(inner)),
+        Expr::IsNotTrue(inner) => Expr::IsNotTrue(rw!(inner)),
+        Expr::IsFalse(inner) => Expr::IsFalse(rw!(inner)),
+        Expr::IsNotFalse(inner) => Expr::IsNotFalse(rw!(inner)),
+        // BETWEEN low AND high.
+        Expr::Between {
+            expr: e,
+            negated,
+            low,
+            high,
+        } => Expr::Between {
+            expr: rw!(e),
+            negated,
+            low: rw!(low),
+            high: rw!(high),
+        },
+        // col [NOT] IN (list).
+        Expr::InList {
+            expr: e,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: rw!(e),
+            list: list
+                .into_iter()
+                .map(|item| rewrite_do_update_expr(item, table_name_lower, excluded_map))
+                .collect(),
+            negated,
+        },
+        // [NOT] LIKE / [NOT] ILIKE.
+        Expr::Like {
+            negated,
+            expr: e,
+            pattern,
+            escape_char,
+            any,
+        } => Expr::Like {
+            negated,
+            expr: rw!(e),
+            pattern: rw!(pattern),
+            escape_char,
+            any,
+        },
+        Expr::ILike {
+            negated,
+            expr: e,
+            pattern,
+            escape_char,
+            any,
+        } => Expr::ILike {
+            negated,
+            expr: rw!(e),
+            pattern: rw!(pattern),
+            escape_char,
+            any,
+        },
+        // Function calls: rewrite every argument expression. Covers forms like
+        // `coalesce(EXCLUDED.col, 0)` or `upper(EXCLUDED.name)`.
+        Expr::Function(mut func) => {
+            if let sqlparser::ast::FunctionArguments::List(ref mut list) = func.args {
+                for arg in &mut list.args {
+                    use sqlparser::ast::{FunctionArg, FunctionArgExpr};
+                    match arg {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
+                        | FunctionArg::Named {
+                            arg: FunctionArgExpr::Expr(e),
+                            ..
+                        } => {
+                            let owned = std::mem::replace(e, Expr::Value(sqlparser::ast::ValueWithSpan {
+                                value: sqlparser::ast::Value::Null,
+                                span: sqlparser::tokenizer::Span::empty(),
+                            }));
+                            *e = rewrite_do_update_expr(owned, table_name_lower, excluded_map);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Expr::Function(func)
+        }
+        // CASE WHEN … END — recurse into the operand, each WHEN condition and
+        // result, and the ELSE branch. Covers DO UPDATE SET col = CASE WHEN
+        // EXCLUDED.v IS NOT NULL THEN EXCLUDED.v ELSE col END.
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            case_token,
+            end_token,
+        } => Expr::Case {
+            operand: operand.map(|op| rw!(op)),
+            conditions: conditions
+                .into_iter()
+                .map(|cw| sqlparser::ast::CaseWhen {
+                    condition: rewrite_do_update_expr(cw.condition, table_name_lower, excluded_map),
+                    result: rewrite_do_update_expr(cw.result, table_name_lower, excluded_map),
+                })
+                .collect(),
+            else_result: else_result.map(|er| rw!(er)),
+            case_token,
+            end_token,
+        },
+        // String concat operator `||` is a BinaryOp and already handled above.
+        // All other expression forms (literals, bind params, subqueries, …) are
         // left unchanged — they either have no column references or reference
         // forms we don't need to rewrite for the DO UPDATE scope.
         other => other,
+    }
+}
+
+/// A constant value reduced from a DO UPDATE WHERE predicate after the
+/// EXCLUDED/table rewrite. Only the shapes the rewrite can actually produce
+/// from an ORM-emitted predicate are modelled.
+#[derive(Debug, Clone, PartialEq)]
+enum ConstVal {
+    Null,
+    Bool(bool),
+    Num(f64),
+    Str(String),
+}
+
+/// Reduce a rewritten DO UPDATE WHERE expression to a constant value when it
+/// references no remaining column (every `EXCLUDED.col` has been substituted
+/// with a literal). Returns `None` the moment a column reference, bind
+/// parameter, or unsupported form is hit — the caller then pushes the
+/// predicate into the UPDATE SQL so dml_mutate's `column <op> literal` grammar
+/// evaluates it against the existing row.
+fn fold_const_expr(e: &Expr) -> Option<ConstVal> {
+    use sqlparser::ast::{Value, ValueWithSpan};
+    match e {
+        Expr::Nested(inner) => fold_const_expr(inner),
+        Expr::Value(ValueWithSpan { value, .. }) => match value {
+            Value::Null => Some(ConstVal::Null),
+            Value::Boolean(b) => Some(ConstVal::Bool(*b)),
+            Value::Number(s, _) => s.parse::<f64>().ok().map(ConstVal::Num),
+            Value::SingleQuotedString(s)
+            | Value::DoubleQuotedString(s)
+            | Value::EscapedStringLiteral(s) => Some(ConstVal::Str(s.clone())),
+            _ => None,
+        },
+        // Identifier / CompoundIdentifier = unresolved column → not constant.
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => None,
+        Expr::UnaryOp { op, expr: inner } => {
+            use sqlparser::ast::UnaryOperator;
+            let v = fold_const_expr(inner)?;
+            match op {
+                UnaryOperator::Not => match v {
+                    ConstVal::Bool(b) => Some(ConstVal::Bool(!b)),
+                    ConstVal::Null => Some(ConstVal::Null),
+                    _ => None,
+                },
+                UnaryOperator::Minus => match v {
+                    ConstVal::Num(n) => Some(ConstVal::Num(-n)),
+                    _ => None,
+                },
+                UnaryOperator::Plus => match v {
+                    ConstVal::Num(n) => Some(ConstVal::Num(n)),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        Expr::IsNull(inner) => Some(ConstVal::Bool(matches!(
+            fold_const_expr(inner)?,
+            ConstVal::Null
+        ))),
+        Expr::IsNotNull(inner) => Some(ConstVal::Bool(!matches!(
+            fold_const_expr(inner)?,
+            ConstVal::Null
+        ))),
+        Expr::IsTrue(inner) => {
+            Some(ConstVal::Bool(fold_const_expr(inner)? == ConstVal::Bool(true)))
+        }
+        Expr::IsNotTrue(inner) => {
+            Some(ConstVal::Bool(fold_const_expr(inner)? != ConstVal::Bool(true)))
+        }
+        Expr::IsFalse(inner) => Some(ConstVal::Bool(
+            fold_const_expr(inner)? == ConstVal::Bool(false),
+        )),
+        Expr::IsNotFalse(inner) => Some(ConstVal::Bool(
+            fold_const_expr(inner)? != ConstVal::Bool(false),
+        )),
+        Expr::BinaryOp { left, op, right } => {
+            use sqlparser::ast::BinaryOperator;
+            let l = fold_const_expr(left)?;
+            let r = fold_const_expr(right)?;
+            // SQL three-valued logic: any comparison with NULL yields NULL
+            // (treated as "not true" by the caller, matching PG's WHERE).
+            if matches!(l, ConstVal::Null) || matches!(r, ConstVal::Null) {
+                return match op {
+                    BinaryOperator::And => {
+                        // FALSE AND NULL = FALSE; otherwise NULL.
+                        if l == ConstVal::Bool(false) || r == ConstVal::Bool(false) {
+                            Some(ConstVal::Bool(false))
+                        } else {
+                            Some(ConstVal::Null)
+                        }
+                    }
+                    BinaryOperator::Or => {
+                        // TRUE OR NULL = TRUE; otherwise NULL.
+                        if l == ConstVal::Bool(true) || r == ConstVal::Bool(true) {
+                            Some(ConstVal::Bool(true))
+                        } else {
+                            Some(ConstVal::Null)
+                        }
+                    }
+                    _ => Some(ConstVal::Null),
+                };
+            }
+            match op {
+                BinaryOperator::And => match (&l, &r) {
+                    (ConstVal::Bool(a), ConstVal::Bool(b)) => Some(ConstVal::Bool(*a && *b)),
+                    _ => None,
+                },
+                BinaryOperator::Or => match (&l, &r) {
+                    (ConstVal::Bool(a), ConstVal::Bool(b)) => Some(ConstVal::Bool(*a || *b)),
+                    _ => None,
+                },
+                BinaryOperator::Eq
+                | BinaryOperator::NotEq
+                | BinaryOperator::Lt
+                | BinaryOperator::LtEq
+                | BinaryOperator::Gt
+                | BinaryOperator::GtEq => {
+                    let ord = match (&l, &r) {
+                        (ConstVal::Num(a), ConstVal::Num(b)) => a.partial_cmp(b)?,
+                        (ConstVal::Str(a), ConstVal::Str(b)) => a.cmp(b),
+                        (ConstVal::Bool(a), ConstVal::Bool(b)) => a.cmp(b),
+                        _ => return None,
+                    };
+                    use std::cmp::Ordering;
+                    let res = match op {
+                        BinaryOperator::Eq => ord == Ordering::Equal,
+                        BinaryOperator::NotEq => ord != Ordering::Equal,
+                        BinaryOperator::Lt => ord == Ordering::Less,
+                        BinaryOperator::LtEq => ord != Ordering::Greater,
+                        BinaryOperator::Gt => ord == Ordering::Greater,
+                        BinaryOperator::GtEq => ord != Ordering::Less,
+                        _ => unreachable!(),
+                    };
+                    Some(ConstVal::Bool(res))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Evaluate a rewritten DO UPDATE WHERE predicate to a boolean when it has
+/// folded to a constant. Returns `Some(true)`/`Some(false)` for a constant
+/// predicate (NULL is treated as false, matching SQL WHERE semantics), and
+/// `None` when the predicate still references a column and must be evaluated
+/// against the existing row by the UPDATE itself.
+fn eval_constant_predicate(e: &Expr) -> Option<bool> {
+    match fold_const_expr(e)? {
+        ConstVal::Bool(b) => Some(b),
+        ConstVal::Null => Some(false),
+        // A constant non-boolean in boolean position is not a shape we expect
+        // from a WHERE predicate; defer to the UPDATE rather than guess.
+        _ => None,
     }
 }
 
