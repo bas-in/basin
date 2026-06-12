@@ -15,6 +15,14 @@
 //! - `GET  /auth/v1/oauth/:provider/callback?code=&state=` — exchange code →
 //!   issue Basin JWT + refresh; returns token body.
 //!
+//! ## Sign-out
+//!
+//! - `POST /auth/v1/signout` — revoke the presented refresh token server-side.
+//!   Body: `{ "refresh_token": "..." }`. Returns `{ "ok": true }` on success.
+//!   Requires a valid (at-least-parseable) refresh JWT in the body; a missing
+//!   or structurally invalid token returns 401. Idempotent: revoking an already-
+//!   revoked token also returns `{ "ok": true }`.
+//!
 //! ## MFA routes (Phase 5.10.M)
 //!
 //! - `POST   /auth/v1/factors`                          — enroll (TOTP or WebAuthn)
@@ -180,6 +188,11 @@ pub(crate) struct RefreshRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct SignoutRequest {
+    pub refresh_token: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub(crate) struct VerifyEmailRequest {
     pub project_id: String,
     pub token: String,
@@ -274,6 +287,50 @@ pub(crate) async fn refresh(
             }
         }
     }
+}
+
+/// `POST /auth/v1/signout` — revoke the presented refresh token server-side.
+///
+/// Body: `{ "refresh_token": "..." }`. The token is written into
+/// `auth_revoked_refresh_tokens` so that a subsequent `POST /auth/v1/refresh`
+/// with the same token returns 401 `E_REVOKED_TOKEN`.
+///
+/// - **Idempotent**: revoking an already-revoked token returns `{ "ok": true }`.
+/// - **Missing / invalid body**: a missing `refresh_token` field, an empty
+///   string, or a token with an invalid signature / wrong audience returns
+///   401 `E_UNAUTHENTICATED`. Callers that have no token to present are
+///   already signed out; the response is consistent with that state.
+/// - **Expired tokens accepted**: an expired but structurally valid token is
+///   still revocable. The access token is *not* affected — its short TTL
+///   (default 60 s) is the remaining exposure window.
+#[axum::debug_handler]
+pub(crate) async fn signout(
+    State(state): State<Arc<Inner>>,
+    Json(req): Json<SignoutRequest>,
+) -> Result<Response, ApiError> {
+    // Pre-validate structure (signature + audience, ignoring expiry). This
+    // distinguishes a token we actually issued (revocable) from random bytes
+    // (reject with 401). basin-auth's own `signout` is deliberately lenient
+    // (malformed → Ok) for caller convenience; the HTTP contract is stricter.
+    if req.refresh_token.is_empty() {
+        return Err(ApiError::unauthenticated("refresh_token is required"));
+    }
+    state
+        .cfg
+        .auth
+        .parse_refresh_token(&req.refresh_token)
+        .map_err(|_| {
+            ApiError::unauthenticated(
+                "invalid refresh token: sign-out requires a token issued by this service",
+            )
+        })?;
+    state
+        .cfg
+        .auth
+        .signout(&req.refresh_token)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(serde_json::json!({ "ok": true })).into_response())
 }
 
 #[axum::debug_handler]

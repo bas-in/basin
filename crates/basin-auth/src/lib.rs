@@ -359,6 +359,17 @@ impl AuthService {
         self.inner.jwt.verify(jwt)
     }
 
+    /// Structurally verify a refresh JWT — checks signature + audience but
+    /// does **not** check expiry. Used by `POST /auth/v1/signout` to validate
+    /// that the presented token was genuinely issued by this service before
+    /// writing a revocation row. An expired token is still revocable.
+    ///
+    /// Returns `Ok(())` when the structure is valid, `Err` when the token is
+    /// garbage, signed with an unknown key, or missing `aud=basin-refresh`.
+    pub fn parse_refresh_token(&self, token: &str) -> Result<()> {
+        self.inner.jwt.verify_refresh_structural(token).map(|_| ())
+    }
+
     /// Return the raw HMAC signing key (the JWT secret). Used by the
     /// storage-signed-URL surface (Phase 5.17.D) to mint/verify HMAC-SHA256
     /// tokens without introducing a separate secret.

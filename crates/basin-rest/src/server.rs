@@ -250,6 +250,7 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
         .route("/auth/v1/signup", post(auth_routes::signup))
         .route("/auth/v1/signin", post(auth_routes::signin))
         .route("/auth/v1/refresh", post(auth_routes::refresh))
+        .route("/auth/v1/signout", post(auth_routes::signout))
         .route("/auth/v1/verify-email", post(auth_routes::verify_email))
         .route("/auth/v1/reset-password", post(auth_routes::reset_password))
         .route(

@@ -1397,6 +1397,167 @@ async fn refresh_token_reuse_detected_revokes_all() {
     let _ = running.shutdown.send(());
 }
 
+// --- Sign-out: POST /auth/v1/signout -----------------------------------------
+
+/// Happy path: sign in, call POST /auth/v1/signout, then verify that a
+/// subsequent refresh with the same token is rejected with E_REVOKED_TOKEN.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signout_revokes_refresh_token() {
+    // Refresh JWTs are large; bump the body cap.
+    let Some((running, _svc, auth, mailer, _g)) = try_serve_full(50, 4096).await else {
+        return;
+    };
+    let addr = running.local_addr;
+    let project = ProjectId::new();
+    let toks = make_user(&auth, &mailer, &project, "so1@example.com").await;
+
+    // Sign out via the HTTP route.
+    let body = serde_json::json!({ "refresh_token": toks.refresh_token }).to_string();
+    let r = http_request(
+        addr,
+        "POST",
+        "/auth/v1/signout",
+        &[("Content-Type", "application/json")],
+        Some(body.as_bytes()),
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        200,
+        "signout body: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert_eq!(r.json()["ok"], true);
+
+    // A subsequent refresh with the same token must be rejected.
+    let body = serde_json::json!({ "refresh_token": toks.refresh_token }).to_string();
+    let r = http_request(
+        addr,
+        "POST",
+        "/auth/v1/refresh",
+        &[("Content-Type", "application/json")],
+        Some(body.as_bytes()),
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        401,
+        "refresh after signout must be 401: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+    // Should surface as E_REVOKED_TOKEN rather than a generic 401.
+    assert_eq!(r.json()["code"], "E_REVOKED_TOKEN");
+
+    let _ = running.shutdown.send(());
+}
+
+/// Idempotency: signing out twice returns success both times.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signout_is_idempotent() {
+    let Some((running, _svc, auth, mailer, _g)) = try_serve_full(50, 4096).await else {
+        return;
+    };
+    let addr = running.local_addr;
+    let project = ProjectId::new();
+    let toks = make_user(&auth, &mailer, &project, "so2@example.com").await;
+
+    let body = serde_json::json!({ "refresh_token": toks.refresh_token }).to_string();
+
+    // First sign-out.
+    let r = http_request(
+        addr,
+        "POST",
+        "/auth/v1/signout",
+        &[("Content-Type", "application/json")],
+        Some(body.as_bytes()),
+    )
+    .await;
+    assert_eq!(r.status, 200, "first signout: {}", String::from_utf8_lossy(&r.body));
+
+    // Second sign-out with the same token — must also succeed.
+    let r = http_request(
+        addr,
+        "POST",
+        "/auth/v1/signout",
+        &[("Content-Type", "application/json")],
+        Some(body.as_bytes()),
+    )
+    .await;
+    assert_eq!(r.status, 200, "second signout: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["ok"], true);
+
+    let _ = running.shutdown.send(());
+}
+
+/// Missing / garbage token returns 401 E_UNAUTHENTICATED.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signout_without_valid_token_returns_401() {
+    let Some((running, _svc, _auth, _mailer, _g)) = try_serve().await else {
+        return;
+    };
+    let addr = running.local_addr;
+
+    // Empty token field.
+    let body = serde_json::json!({ "refresh_token": "" }).to_string();
+    let r = http_request(
+        addr,
+        "POST",
+        "/auth/v1/signout",
+        &[("Content-Type", "application/json")],
+        Some(body.as_bytes()),
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        401,
+        "empty token must be 401: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert_eq!(r.json()["code"], "E_UNAUTHENTICATED");
+
+    // Garbage (not a JWT at all).
+    let body = serde_json::json!({ "refresh_token": "not.a.jwt" }).to_string();
+    let r = http_request(
+        addr,
+        "POST",
+        "/auth/v1/signout",
+        &[("Content-Type", "application/json")],
+        Some(body.as_bytes()),
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        401,
+        "garbage token must be 401: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert_eq!(r.json()["code"], "E_UNAUTHENTICATED");
+
+    // A syntactically valid JWT but with bad signature (not issued by us) —
+    // should also be 401. We construct a token with the basin-refresh audience
+    // but an invalid signature.
+    let fake_jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.\
+                    eyJwcm9qZWN0X2lkIjoiMDEiLCJ1c2VyX2lkIjoiMDEiLCJlbWFpbCI6InRAZS5jb20iLCJqdGkiOiJ0ZXN0IiwiYXVkIjoiYmFzaW4tcmVmcmVzaCIsImV4cCI6OTk5OTk5OTk5OX0.\
+                    invalidsignature";
+    let body = serde_json::json!({ "refresh_token": fake_jwt }).to_string();
+    let r = http_request(
+        addr,
+        "POST",
+        "/auth/v1/signout",
+        &[("Content-Type", "application/json")],
+        Some(body.as_bytes()),
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        401,
+        "fake JWT must be 401: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+
+    let _ = running.shutdown.send(());
+}
+
 // --- Phase 5.11.L: POST /rpc/<fn> mount (ADR 0019) --------------------------
 
 /// Happy path: register a LANGUAGE sql scalar function, invoke it over REST,

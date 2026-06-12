@@ -5,9 +5,10 @@
  * - `POST /auth/v1/signup`                 crates/basin-rest/src/server.rs:250
  * - `POST /auth/v1/signin`                 crates/basin-rest/src/server.rs:251
  * - `POST /auth/v1/refresh`                crates/basin-rest/src/server.rs:252
- * - `POST /auth/v1/verify-email`           crates/basin-rest/src/server.rs:253
- * - `POST /auth/v1/reset-password`         crates/basin-rest/src/server.rs:254
- * - `POST /auth/v1/request-password-reset` crates/basin-rest/src/server.rs:255
+ * - `POST /auth/v1/signout`                crates/basin-rest/src/server.rs:253
+ * - `POST /auth/v1/verify-email`           crates/basin-rest/src/server.rs:254
+ * - `POST /auth/v1/reset-password`         crates/basin-rest/src/server.rs:255
+ * - `POST /auth/v1/request-password-reset` crates/basin-rest/src/server.rs:256
  * - `POST /auth/v1/magic-link`             crates/basin-rest/src/server.rs:262
  * - `POST /auth/v1/magic-link/consume`     crates/basin-rest/src/server.rs:263
  * - `POST|GET /auth/v1/api-keys`           crates/basin-rest/src/server.rs:267
@@ -17,8 +18,9 @@
  * - signup/signin take a `project_id` in the body — auth is per-project.
  * - refresh rotates the refresh token; reusing a rotated token surfaces as
  *   `E_REVOKED_TOKEN` (401).
- * - There is NO server-side sign-out route; `signOut()` only clears the local
- *   session. Revocation happens via refresh-token rotation on the server.
+ * - signOut() calls `POST /auth/v1/signout` with the current refresh token,
+ *   writing a server-side revocation row, then clears the local session.
+ *   When no session is active the call is a no-op (already signed out).
  */
 
 import { BasinApiError } from "./errors.js";
@@ -107,12 +109,24 @@ export class AuthClient {
   }
 
   /**
-   * Clear the local session. The server exposes no sign-out / token-revoke
-   * route (verified against crates/basin-rest/src/server.rs); the refresh
-   * token simply expires or is invalidated by rotation.
+   * Revoke the current refresh token server-side, then clear the local
+   * session. `POST /auth/v1/signout` writes a revocation row so that any
+   * subsequent `refreshSession()` call with the old token returns 401.
+   *
+   * - If there is no active session this is a no-op (already signed out).
+   * - Server-side errors are surfaced as thrown `BasinApiError`. The local
+   *   session is cleared regardless so the client ends up signed out.
    */
-  signOut(): void {
+  async signOut(): Promise<void> {
+    const current = this.#session;
+    // Always clear local state first — even if the server call fails the
+    // client should be considered signed out.
     this.#session = null;
+    if (current === null) return;
+    await requestJson(this.#ctx, "POST", "/auth/v1/signout", {
+      auth: false,
+      body: { refresh_token: current.refresh_token },
+    });
   }
 
   /**

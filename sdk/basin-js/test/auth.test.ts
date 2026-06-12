@@ -101,21 +101,42 @@ describe("auth", () => {
     expect((err as BasinApiError).status).toBe(401);
   });
 
-  it("signOut clears the session locally (no server route exists)", async () => {
-    const fetch = new FetchMock().queueJson(tokens()).queueJson([]);
+  it("signOut calls POST /auth/v1/signout with the refresh token, then clears session", async () => {
+    const fetch = new FetchMock()
+      .queueJson(tokens())
+      .queueJson({ ok: true })  // signout response
+      .queueJson([]);            // subsequent GET
     const client = createClient(URL_BASE, "static-key", {
       projectId: PROJECT,
       fetch: fetch.impl,
     });
     await client.auth.signIn({ email: "a@b.c", password: "pw" });
-    client.auth.signOut();
+    await client.auth.signOut();
     expect(client.auth.getSession()).toBeNull();
 
-    // Falls back to the static key.
+    // The sign-out call must target the new route and carry the refresh token.
+    expect(fetch.calls[1]!.url).toBe(`${URL_BASE}/auth/v1/signout`);
+    expect(fetch.calls[1]!.method).toBe("POST");
+    expect(JSON.parse(fetch.calls[1]!.body!)).toEqual({ refresh_token: "ref-1" });
+    // Sign-out must NOT carry an Authorization header (auth: false).
+    expect(fetch.calls[1]!.headers["authorization"]).toBeUndefined();
+
+    // After sign-out, further requests fall back to the static key.
     await client.from("users").rows();
     expect(fetch.last.headers["authorization"]).toBe("Bearer static-key");
-    // Exactly two calls: signin + GET — no sign-out round-trip happened.
-    expect(fetch.calls).toHaveLength(2);
+  });
+
+  it("signOut is a no-op when there is no active session", async () => {
+    const fetch = new FetchMock();
+    const client = createClient(URL_BASE, undefined, {
+      projectId: PROJECT,
+      fetch: fetch.impl,
+    });
+    // No signIn call — session is null.
+    await client.auth.signOut();
+    expect(client.auth.getSession()).toBeNull();
+    // No HTTP calls should have been made.
+    expect(fetch.calls).toHaveLength(0);
   });
 
   it("magic link request hits /auth/v1/magic-link and consume stores tokens", async () => {

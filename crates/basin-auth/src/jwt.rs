@@ -427,6 +427,62 @@ impl JwtKeys {
 
     /// Verify a refresh JWT (signature + expiry + audience).
     ///
+    /// Verify a refresh token's **signature and audience** only — expiry is
+    /// intentionally not checked. Used by the sign-out handler so that a user
+    /// holding an already-expired refresh token can still call
+    /// `POST /auth/v1/signout` and get a clean revocation row written.
+    ///
+    /// Returns `Ok(RefreshClaims)` when the signature is valid and the
+    /// `aud=basin-refresh` claim is present. Returns an error when the token
+    /// is structurally malformed, signed with an unknown key, or missing the
+    /// `aud` claim — all of which mean the token was never validly issued.
+    pub fn verify_refresh_structural(&self, token: &str) -> Result<RefreshClaims> {
+        let mut v = Validation::new(Algorithm::HS256);
+        // Require audience so an access token cannot be passed here.
+        v.required_spec_claims = ["aud"].iter().map(|s| s.to_string()).collect();
+        v.set_audience(&[REFRESH_AUDIENCE]);
+        // Do NOT validate exp/nbf — the token may be expired but the caller
+        // still wants to record the revocation.
+        v.validate_exp = false;
+        v.validate_nbf = false;
+
+        let decode_result = decode::<RefreshWireClaims>(token, &self.decoding, &v);
+        let data = match decode_result {
+            Ok(d) => d,
+            Err(primary_err) => match &self.previous_decoding {
+                Some(prev_key) => {
+                    decode::<RefreshWireClaims>(token, prev_key, &v).map_err(|_| {
+                        BasinError::internal(format!(
+                            "refresh jwt structural verify: {primary_err}"
+                        ))
+                    })?
+                }
+                None => {
+                    return Err(BasinError::internal(format!(
+                        "refresh jwt structural verify: {primary_err}"
+                    )));
+                }
+            },
+        };
+        let w = data.claims;
+        let project: ProjectId = w
+            .project_id
+            .parse()
+            .map_err(|e| BasinError::internal(format!("refresh jwt project_id parse: {e}")))?;
+        let user: Uuid = w
+            .user_id
+            .parse()
+            .map_err(|e| BasinError::internal(format!("refresh jwt user_id parse: {e}")))?;
+        Ok(RefreshClaims {
+            project_id: project,
+            user_id: user,
+            email: w.email,
+            jti: w.jti,
+            exp: w.exp,
+            iat: w.iat,
+        })
+    }
+
     /// Like [`Self::verify`], falls back to `previous_decoding` if present and
     /// the primary key rejects the token.
     pub fn verify_refresh(&self, token: &str) -> Result<RefreshClaims> {
