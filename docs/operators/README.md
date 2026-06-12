@@ -24,6 +24,14 @@ troubleshooting procedures, and failure modes.
 | [wasm-functions.md](./wasm-functions.md) | Wasm component-model edge functions, per-invocation governance | CPU trap, memory cap, wall-clock timeout, concurrency exhaustion, worker thread pool saturation |
 | [session-pool.md](./session-pool.md) | Native session pool (ADR 0007) | Pool exhaustion, per-project cap stall, guard leak, eviction loop stopped |
 
+### Recovery runbooks (`docs/runbooks/`)
+
+| Runbook | Subsystem | Primary incidents covered |
+|---|---|---|
+| [../runbooks/durability.md](../runbooks/durability.md) | Durability boundaries: WAL group commit, `basin.synchronous_commit`, `FsyncOnPut`, hot-tier caveats | "What did we just lose?" after any crash |
+| [../runbooks/restore.md](../runbooks/restore.md) | Backup + restore: catalog dump + object-store state, per-table snapshot rollback | Disaster restore, bad deploy / data-corruption rewind |
+| [../runbooks/failover.md](../runbooks/failover.md) | Node loss + recovery on the single-writer deployment shape | Process crash, machine loss, split-brain prevention |
+
 ---
 
 ## Common first steps for any incident

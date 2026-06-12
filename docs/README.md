@@ -13,12 +13,10 @@ Navigation root for the Basin OSS repo. Every file is organised by
 basin-cloud's build-time fetcher uses this index to assemble the
 unified nav tree; GitHub renders it for humans browsing `docs/`.
 
-## Getting started
+## Overview
 
-- [5-Minute Docker Quickstart](quickstart-docker.md) — One `docker run` command, connect with `psql`, run SQL. No Rust toolchain required.
-- [Getting started with Basin](tutorial.md) — End-to-end walkthrough: spin up a dev cluster, create a table, add auth, enable row-level security, call the REST API, and deploy a Wasm function.
-- [`examples/saas-starter/`](../examples/saas-starter/) — Multi-tenant SaaS reference app: Drizzle ORM, basin-auth, RLS policies, basin-rest auto-generated REST surface.
-- [`examples/ai-rag-app/`](../examples/ai-rag-app/) — AI/RAG reference app: document chunking + embeddings, basin-vector similarity retrieval, Wasm function calling an inference endpoint.
+- [Getting started with Basin — 15-minute walkthrough](tutorial.md) — Spin up Basin with Docker, create tables, add RLS policies, call the auth and REST APIs, and wire a React/Vite frontend. Every step is copy-pasteable and verified against the real system.
+- [Batteries included — the one-binary BaaS surface](batteries.md) — Auth, REST, Realtime, Blob, Vector, and WASM UDFs ship in one binary. Honest per-piece status and the SQL or HTTP shape each one accepts.
 
 ## Architecture
 
@@ -32,15 +30,26 @@ unified nav tree; GitHub renders it for humans browsing `docs/`.
 ## Deployment
 
 - [Deployment and cloud architecture](deployment.md) — How to run Basin in production: storage backends, deployment topologies, configuration.
+- [5-Minute Docker Quickstart](quickstart-docker.md) — Get Basin running with a single docker run command and connect via psql in under five minutes.
 
 ## Operations
 
 - [HTAP guide — hybrid transactional + analytical queries in Basin](htap-guide.md) — Hot-tier + columnar storage for point queries, recent writes, and aggregates in one engine. When to declare basin.sort_by, when to ALTER PROJECT memtable caps, how to read the latency story.
 - [Wasm functions: authoring, ABI, deploy, limits](functions.md) — TypeScript HTTP handlers compiled to WebAssembly and run inside Basin under per-invocation CPU, memory, wall-clock, and per-project concurrency caps. Authoring, host ABI, deploy, limits.
+- [Importing from PostgreSQL](import.md) — basinctl import-from-postgres: one-command schema + data migration from a running PostgreSQL into Basin — DDL translation, binary COPY streaming with CSV fallback, parallel tables, row-count verification, and a loud skip report for everything Basin does differently.
 - [Scaling: object storage](scaling/object-storage.md) — How Basin scales storage and what to expect from S3/GCS/MinIO at different sizes.
 - [Scaling: read replicas](scaling/read-replicas.md) — Read-replica architecture, replication lag, fail-over story, and what's deferred to Phase 6.
+- [Operator runbooks — index](operators/README.md) — Index of all Basin operator runbooks for day-2 production operations.
 - [Lease ownership — operator runbook](operators/lease-ownership.md) — Day-2 ops guide for ADR 0023 lease-based ownership: how it works, how to query lease state, how to rebalance hot replicas, when to bump partition count, and the stuck-lease incident playbook.
 - [Scaling: shard rebalancing](scaling/shard-rebalance.md) — How shards split, merge, and migrate; the operator-visible touchpoints.
+- [Storage layer — operator runbook](operators/storage.md) — Day-2 ops guide for Basin's storage layer: Vortex/Parquet object store, disk cache, page cache, I/O scheduler, KMS envelope encryption, and hot-cold tiering.
+- [Realtime (SSE / WebSocket) — operator runbook](operators/realtime.md) — Day-2 ops guide for Basin's realtime change-event fan-out: SSE and WebSocket subscriptions, per-project budget enforcement, BUFFER_FULL handling, subscriber lag, and replay-on-reconnect.
+- [Wasm functions — operator runbook](operators/wasm-functions.md) — Day-2 ops guide for Basin's Wasm component-model function execution: per-invocation CPU, memory, wall-clock, and concurrency caps; runtime isolation; starvation detection; and incident playbooks.
+- [Session pool — operator runbook](operators/session-pool.md) — Day-2 ops guide for Basin's native session pool: pool exhaustion, per-project cap stalls, eviction tuning, hit-rate diagnostics, and incident playbooks.
+- [Durability reference — what is durable when](runbooks/durability.md) — Short reference for Basin's durability boundaries: WAL group-commit and durable_lsn, basin.synchronous_commit, FsyncOnPut, hot-tier caveats, and every env knob with its code default.
+- [Restore runbook — backup, disaster restore, per-table snapshot rollback](runbooks/restore.md) — Operator runbook for restoring Basin: consistent backups, full disaster restore from object store + catalog, the manual per-table snapshot rollback that works today, and verification.
+- [Failover runbook — node loss and recovery (single-writer)](runbooks/failover.md) — Operator runbook for losing and recovering a Basin node on today's single-writer deployment shape: detection, restart, WAL replay expectations, split-brain risk, and the lease/Raft roadmap.
+- [3-way pg-compatibility differential — Basin vs Neon vs Supabase](operators/3way-pg-compat.md) — How to run the OSS 3-way SQL-compatibility differential test and read its JSON output.
 
 ## Architecture decisions (ADRs)
 
@@ -70,6 +79,10 @@ unified nav tree; GitHub renders it for humans browsing `docs/`.
 - [ADR 0021 — Object storage (catalog-backed blobs)](decisions/0021-object-storage.md) — Supabase-style blob storage. Objects are rows in a storage.objects system table, access control reuses the RLS engine, bytes live in the same object_store the engine uses, signed URLs are HMAC over (path, expiry). New basin-blob crate. Cloud builds quota/billing/CDN/image-transforms.
 - [ADR 0022 — System-schema namespacing (reserved schemas first-class; user schemas stay flat)](decisions/0022-system-schema-namespacing.md) — Make the system namespaces (auth, storage, cron, net, realtime, public, pg_catalog, information_schema) real reserved schemas with honest (schema, table) keying + introspection + search_path. User-defined schemas stay flat-aliased to public — projects already own the project-membership/isolation axis, so arbitrary user schemas are a redundant second isolation boundary with ~zero wedge benefit.
 - [ADR 0023 — Lease-based ownership + partition-level routing + heartbeat budgets](decisions/0023-leases-and-partition-routing.md) — Convert per-(project,partition) ownership from a hash on ProjectId into a lease in the catalog Postgres. Stateless replicas + partition-level routing + heartbeat-reconciled budgets fix hot-project pinning and multi-instance cap-bypass in one architecture, without a central coordinator service or distributed counters on the hot path. The architectural commitment for Basin's multi-replica scale-out.
+- [ADR 0024 — UUID-as-Decimal256 storage encoding (C1 workaround pending Vortex FixedSizeBinary support)](decisions/0024-uuid-decimal128-storage.md)
+- [ADR 0025 — Postgres-compatibility surface decisions: JSONB GIN indexing, full-text search, citext, and session timeouts (Phases 5.19–5.30)](decisions/0025-pg-compat-surface-phases-5-19-to-5-30.md) — Documents the shared architectural patterns behind four Postgres-compatibility features that landed together in Phases 5.19–5.30: JSONB GIN indexing, full-text search (tsvector/tsquery), citext, and the session-timeout trio (statement_timeout, lock_timeout, idle_in_transaction_session_timeout). The unifying mechanisms are the BASIN_TYPE Arrow-metadata sidecar for logical-type-on-physical-storage, shared GIN posting-list infrastructure across JSONB and FTS, PG-accurate SQLSTATE mapping, and the test-first harness convention of landing red tests that are un-ignored slice-by-slice.
+- [ADR 0026 — lock_timeout / 55P03 under Basin's optimistic concurrency (no row-lock manager)](decisions/0026-lock-timeout-optimistic-concurrency.md) — Basin uses optimistic, copy-on-write concurrency for row writes — conflicts surface at commit as SQLSTATE 40001 (serialization_failure), never by blocking on a row lock. We will NOT build a PostgreSQL-style pessimistic row-lock manager. Therefore `lock_timeout` (SQLSTATE 55P03, lock_not_available) governs only the locks that actually block in Basin: advisory locks (`pg_advisory_lock`) and table/DDL locks. Phase 5.28.B is rescoped accordingly: make advisory-lock acquisition genuinely block + honor `lock_timeout`, and document the optimistic-concurrency contract for row writes.
+- [ADR 0027 — Binary / columnar JSONB representation (faster scalar extraction)](decisions/0027-binary-jsonb-encoding.md) — Basin's JSONB scalar extraction (->>, ->, #>, jsonb_typeof, jsonb_array_length) runs 100-2200x slower than PostgreSQL at 1M rows. Root cause: Basin stores JSONB as raw JSON text bytes and every UDF call walks those bytes per-row. This ADR decides the structural fix — a sequence of incremental improvements culminating in a hybrid binary-blob + promoted-columns representation — and records the first shippable increment: a per-batch top-level key index that eliminates redundant byte scanning when multiple UDF calls are applied to the same JSONB column in one query.
 
 ## Meta
 
@@ -84,6 +97,10 @@ unified nav tree; GitHub renders it for humans browsing `docs/`.
 ## 
 
 - [Noisy-neighbor / fairness audit — single-instance + load-balanced](audits/2026-05-21-noisy-neighbor-fairness.md)
+
+## Operators
+
+- [Dev-stack operator runbook](operators/dev-stack.md) — Single-command local Basin environment: catalog Postgres 16 + MinIO + basin-server replicas. Includes E2E runner for perf, noisy-neighbor, and lease-handoff scenarios.
 
 ## Project-level documents
 
