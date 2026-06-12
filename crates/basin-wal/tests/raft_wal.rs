@@ -15,8 +15,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use basin_common::{PartitionKey, ProjectId};
-use basin_wal::{Lsn, RaftWal, RaftWalConfig, SimCluster, Wal};
+use basin_common::{BasinError, PartitionKey, ProjectId};
+use basin_wal::{
+    BasinRaftItem, BasinRaftRequest, DurabilityBackend, Lsn, RaftDurability, RaftWal, RaftWalConfig,
+    SimCluster, Wal, WalMode,
+};
 use bytes::Bytes;
 use openraft::BasicNode;
 use tempfile::TempDir;
@@ -448,6 +451,286 @@ async fn single_node_restart_recovers_log_from_disk() {
         .await
         .unwrap();
     assert_eq!(lsn, Lsn(8), "LSN sequence continues across restart");
+
+    wal.close().await.unwrap();
+}
+
+// ===========================================================================
+// Multi-node commit 3 — manifest-anchored snapshots, log bounded by flush
+// ===========================================================================
+
+/// Count `raft.log` segment files across a node's data dir (used to assert the
+/// log shrinks after a watermark purge — the on-disk size proxy).
+fn raft_log_bytes(dir: &TempDir, node_id: u64) -> u64 {
+    let p = dir.path().join(format!("node-{node_id}")).join("raft.log");
+    std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0)
+}
+
+/// A flush watermark recorded on the leader purges the raft log up to the
+/// watermark's log index, so the on-disk log stays bounded by the un-flushed
+/// window — and the manifest pointer (durable LSN + catalog snapshot id) is
+/// captured in a snapshot and survives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flush_watermark_purges_log_and_bounds_it() {
+    let (_cluster, nodes, dir) = spin_up_cluster(1).await;
+    let wal = nodes[0].clone();
+    let project = ProjectId::new();
+    let part = PartitionKey::default_key();
+
+    // Write enough entries that the log file is non-trivial.
+    for i in 1..=200u64 {
+        wal.append(&project, &part, Bytes::from(format!("e{i}")))
+            .await
+            .unwrap();
+    }
+    wait_for_high_water(wal.as_ref(), &project, &part, Lsn(200), Duration::from_secs(10)).await;
+    let bytes_before = raft_log_bytes(&dir, 1);
+    assert!(bytes_before > 0, "log file should hold entries");
+
+    // The compactor flushed rows through LSN 150 to object storage and
+    // recorded catalog snapshot "cat-1": record the watermark, which snapshots
+    // + purges the raft log up to the applied index.
+    let purged = wal
+        .record_flush_watermark(&project, &part, Lsn(150), "cat-1")
+        .await
+        .unwrap();
+    assert!(purged.is_some(), "watermark advanced the purge floor");
+
+    // The manifest pointer now certifies durability through 150.
+    assert_eq!(
+        wal.durable_watermark(&project, &part).await,
+        Lsn(150),
+        "manifest pointer records the flushed watermark",
+    );
+
+    // The on-disk raft log was compacted: it is strictly smaller now.
+    let bytes_after = raft_log_bytes(&dir, 1);
+    assert!(
+        bytes_after < bytes_before,
+        "watermark purge must shrink the raft log ({bytes_before} -> {bytes_after})",
+    );
+
+    // A second, non-advancing watermark is a no-op (idempotent).
+    let purged2 = wal
+        .record_flush_watermark(&project, &part, Lsn(150), "cat-1")
+        .await
+        .unwrap();
+    assert!(purged2.is_none(), "non-advancing watermark does not re-purge");
+
+    wal.close().await.unwrap();
+}
+
+/// Snapshot build → install round-trip across the live cluster: a follower
+/// that falls behind the purge floor MUST catch up via raft snapshot install,
+/// and that snapshot carries the leader's manifest pointer — so the follower's
+/// recorded durable watermark ends up matching the leader's.
+///
+/// The manifest pointer is leader-local until a follower needs a snapshot
+/// (full follower-catchup orchestration is the network-layer seam — see
+/// APPLY.md). This test drives the one path that IS in scope here: a lagging
+/// follower installing a snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lagging_follower_gets_manifest_via_snapshot_install() {
+    let (cluster, nodes, _dir) = spin_up_cluster(3).await;
+    let project = ProjectId::new();
+    let part = PartitionKey::default_key();
+
+    let leader_id = wait_for_leader(&nodes[0], Duration::from_secs(2)).await;
+    let leader = nodes[(leader_id - 1) as usize].clone();
+
+    // Pick a follower to fall behind, and take it down so it misses the writes
+    // that get purged away.
+    let follower = nodes
+        .iter()
+        .find(|n| n.config().node_id != leader_id)
+        .cloned()
+        .unwrap();
+    let follower_id = follower.config().node_id;
+    cluster.take_down(follower_id).await;
+
+    // The leader + remaining follower form a quorum; keep writing.
+    for i in 1..=120u64 {
+        leader
+            .append(&project, &part, Bytes::from(format!("e{i}")))
+            .await
+            .unwrap();
+    }
+
+    // Flush watermark on the leader: snapshot + purge. The purged entries are
+    // exactly the ones the downed follower is missing, so when it comes back
+    // it cannot be caught up by log replication — it must install the snapshot
+    // (which carries the manifest pointer).
+    leader
+        .record_flush_watermark(&project, &part, Lsn(100), "cat-7")
+        .await
+        .unwrap();
+    assert_eq!(leader.durable_watermark(&project, &part).await, Lsn(100));
+
+    // Bring the follower back: it installs the leader's snapshot.
+    cluster.bring_up(follower_id).await;
+
+    // The follower converges on the leader's durable watermark — proof the
+    // manifest pointer rode the snapshot install.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if follower.durable_watermark(&project, &part).await == Lsn(100) {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!(
+                "follower {follower_id} never received the manifest pointer via snapshot install"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    for n in &nodes {
+        n.close().await.unwrap();
+    }
+}
+
+// ===========================================================================
+// Multi-node commit 4 — batched proposals into the durability seam
+// ===========================================================================
+
+/// `WalMode` parses strictly: `local` (default) and `raft` are valid; anything
+/// else is a hard error so a typo never silently downgrades durability.
+#[test]
+fn wal_mode_parses_strictly() {
+    assert_eq!(WalMode::parse("").unwrap(), WalMode::Local);
+    assert_eq!(WalMode::parse("local").unwrap(), WalMode::Local);
+    assert_eq!(WalMode::parse("LOCAL").unwrap(), WalMode::Local);
+    assert_eq!(WalMode::parse("raft").unwrap(), WalMode::Raft);
+    assert_eq!(WalMode::parse(" Raft ").unwrap(), WalMode::Raft);
+    assert!(WalMode::parse("banana").is_err());
+    assert_eq!(WalMode::default(), WalMode::Local);
+}
+
+/// A batched proposal commits as one consensus round and advances `durable_lsn`
+/// for every item, in batch order, with monotonic per-partition LSNs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn batched_proposal_commits_on_quorum() {
+    let (_cluster, nodes, _dir) = spin_up_cluster(3).await;
+    let project = ProjectId::new();
+    let part_a = PartitionKey::default_key();
+
+    let leader_id = wait_for_leader(&nodes[0], Duration::from_secs(2)).await;
+    let leader = nodes[(leader_id - 1) as usize].clone();
+    let backend = RaftDurability::new(leader.clone());
+    assert_eq!(backend.mode(), WalMode::Raft);
+
+    // One proposal carrying five appends to the same partition.
+    let batch: Vec<BasinRaftItem> = (1..=5)
+        .map(|i| BasinRaftItem {
+            project,
+            partition: part_a.clone(),
+            payload: format!("b{i}").into_bytes(),
+        })
+        .collect();
+    let lsns = backend.commit_batch(batch).await.unwrap();
+    assert_eq!(lsns, vec![Lsn(1), Lsn(2), Lsn(3), Lsn(4), Lsn(5)], "monotonic per-partition LSNs in batch order");
+
+    // durable_lsn (quorum-committed) covers the whole batch on every node.
+    for node in &nodes {
+        wait_for_high_water(node.as_ref(), &project, &part_a, Lsn(5), Duration::from_secs(10)).await;
+    }
+
+    // A mixed-partition batch keeps each partition's LSN sequence independent.
+    let part_b = PartitionKey::new("partition-b").unwrap();
+    let mixed = vec![
+        BasinRaftItem { project, partition: part_a.clone(), payload: b"a6".to_vec() },
+        BasinRaftItem { project, partition: part_b.clone(), payload: b"b1".to_vec() },
+        BasinRaftItem { project, partition: part_a.clone(), payload: b"a7".to_vec() },
+    ];
+    let lsns = backend.commit_batch(mixed).await.unwrap();
+    assert_eq!(lsns, vec![Lsn(6), Lsn(1), Lsn(7)], "per-partition LSNs assigned in item order");
+
+    // Empty batch is a no-op.
+    assert!(backend.commit_batch(Vec::new()).await.unwrap().is_empty());
+
+    for n in &nodes {
+        n.close().await.unwrap();
+    }
+}
+
+/// No quorum ⇒ the write fails with the typed retryable `RaftNoQuorum` error
+/// rather than silently dropping or hanging forever. Triggered against a node
+/// that has no leader (never initialised), where `client_write` returns
+/// `ForwardToLeader` immediately.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_quorum_fails_typed() {
+    let dir = TempDir::new().unwrap();
+    let cluster = SimCluster::new();
+    // A single node that is NOT initialised — it has no leader, so a write
+    // cannot reach quorum and openraft returns ForwardToLeader(None).
+    let wal = Arc::new(RaftWal::new(cfg(1, cluster, &dir)).await.unwrap());
+    let backend = RaftDurability::new(wal.clone());
+
+    let project = ProjectId::new();
+    let part = PartitionKey::default_key();
+    let item = BasinRaftItem { project, partition: part, payload: b"x".to_vec() };
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(3),
+        backend.commit_batch(vec![item]),
+    )
+    .await
+    .expect("write should fail fast, not hang, with no leader")
+    .expect_err("write without quorum must error");
+
+    assert!(
+        matches!(err, BasinError::RaftNoQuorum(_)),
+        "no-quorum write must surface the typed retryable error, got {err:?}",
+    );
+
+    wal.close().await.unwrap();
+}
+
+/// Single-node raft (quorum of 1) is a real end-to-end durability backend:
+/// write → quorum (self) commit → durable, readable, LSN-stamped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn single_node_raft_write_to_durable() {
+    let (_cluster, nodes, _dir) = spin_up_cluster(1).await;
+    let wal = nodes[0].clone();
+    let backend = RaftDurability::new(wal.clone());
+
+    let project = ProjectId::new();
+    let part = PartitionKey::default_key();
+
+    // A quorum of one: each proposal commits the moment it is fsync'd locally.
+    let lsns = backend
+        .commit_batch(vec![
+            BasinRaftItem { project, partition: part.clone(), payload: b"one".to_vec() },
+            BasinRaftItem { project, partition: part.clone(), payload: b"two".to_vec() },
+        ])
+        .await
+        .unwrap();
+    assert_eq!(lsns, vec![Lsn(1), Lsn(2)]);
+
+    let entries = wal.read_from(&project, &part, Lsn::ZERO).await.unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(&entries[0].payload[..], b"one");
+    assert_eq!(&entries[1].payload[..], b"two");
+    assert_eq!(wal.high_water(&project, &part).await.unwrap(), Lsn(2));
+
+    wal.close().await.unwrap();
+}
+
+/// The `BasinRaftRequest::single` / `propose_batch` surface the network agent
+/// (commit 5) and the engine build against stays stable: a single proposal is
+/// a batch of one, and the response exposes the one LSN.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn single_proposal_is_batch_of_one() {
+    let (_cluster, nodes, _dir) = spin_up_cluster(1).await;
+    let wal = nodes[0].clone();
+    let project = ProjectId::new();
+    let part = PartitionKey::default_key();
+
+    let lsns = wal
+        .propose_batch(BasinRaftRequest::single(project, part.clone(), b"solo".to_vec()))
+        .await
+        .unwrap();
+    assert_eq!(lsns, vec![Lsn(1)]);
 
     wal.close().await.unwrap();
 }

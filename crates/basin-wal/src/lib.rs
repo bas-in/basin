@@ -864,4 +864,7 @@ mod segment;
 mod state;
 
 pub use fsync::{DurablePut, FsyncOnPut, FsyncOnPutAll};
-pub use raft_wal::{BasinRaftRequest, BasinRaftResponse, RaftWal, RaftWalConfig, SimCluster};
+pub use raft_wal::{
+    BasinRaftItem, BasinRaftRequest, BasinRaftResponse, DurabilityBackend, LocalDurability,
+    RaftDurability, RaftWal, RaftWalConfig, SimCluster, WalMode,
+};

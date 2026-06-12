@@ -141,23 +141,59 @@ impl RaftWalConfig {
 // Type config
 // ---------------------------------------------------------------------------
 
-/// One raft log payload — an append for `(project, partition, payload)`.
+/// One append within a raft proposal — `(project, partition, payload)`.
 ///
 /// Carries no LSN; the state machine assigns it on apply so that LSN
 /// monotonicity per `(project, partition)` follows from the raft log order
 /// (which is itself globally totally ordered).
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BasinRaftRequest {
+pub struct BasinRaftItem {
     pub project: ProjectId,
     pub partition: PartitionKey,
     pub payload: Vec<u8>,
 }
 
-/// Response returned to the `client_write` caller — the LSN the state
-/// machine assigned to this entry.
+/// One raft log payload. **Multi-node commit 4**: a proposal is a *batch* of
+/// appends so one consensus round (one fsync'd log entry + one quorum
+/// round-trip) is amortised over the whole group-commit batch, exactly as the
+/// local WAL coalesces N synchronous appends into one segment PUT. A single
+/// [`crate::Wal::append`] proposes a batch of one; the group-commit path
+/// (`RaftWal::propose_batch`) proposes the whole drained batch at once.
+///
+/// The state machine assigns one LSN per item, in batch order, preserving
+/// per-`(project, partition)` monotonicity.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BasinRaftRequest {
+    pub items: Vec<BasinRaftItem>,
+}
+
+impl BasinRaftRequest {
+    /// A single-item proposal (the [`crate::Wal::append`] path).
+    pub fn single(project: ProjectId, partition: PartitionKey, payload: Vec<u8>) -> Self {
+        Self {
+            items: vec![BasinRaftItem {
+                project,
+                partition,
+                payload,
+            }],
+        }
+    }
+}
+
+/// Response returned to the `client_write` caller — the LSNs the state machine
+/// assigned to the proposal's items, in batch order (one per
+/// [`BasinRaftItem`]).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BasinRaftResponse {
-    pub lsn: Lsn,
+    pub lsns: Vec<Lsn>,
+}
+
+impl BasinRaftResponse {
+    /// The LSN of a single-item proposal (the [`crate::Wal::append`] path).
+    /// `Lsn::ZERO` for an empty / blank apply.
+    pub fn lsn(&self) -> Lsn {
+        self.lsns.first().copied().unwrap_or(Lsn::ZERO)
+    }
 }
 
 openraft::declare_raft_types!(
@@ -493,6 +529,326 @@ impl RaftWal {
     pub async fn current_leader(&self) -> Option<NodeId> {
         self.raft.current_leader().await
     }
+
+    /// Manifest-anchored snapshot + log purge (multi-node commit 3).
+    ///
+    /// Called by the engine/compactor **after** a flush has committed engine
+    /// state for `(project, partition)` through `durable_lsn` to object
+    /// storage and recorded a `catalog_snapshot_id` for it. This:
+    ///
+    /// 1. stamps the durable watermark into the replicated state machine
+    ///    (the [`crate::raft_storage::ManifestPointer`] — a pointer to the
+    ///    S3/catalog-anchored data, not a copy of it),
+    /// 2. triggers a raft snapshot so the watermark + log index are captured
+    ///    in `get_current_snapshot` (and installable on followers), and
+    /// 3. purges the raft log up to the watermark's log index, so the local
+    ///    log stays bounded by the un-flushed window.
+    ///
+    /// Because the snapshot only certifies durability (the rows live in object
+    /// storage), the purge below the watermark is loss-free: a recovering
+    /// follower rebuilds engine state from the catalog snapshot named in the
+    /// pointer and only needs the raft log for the tail above `durable_lsn`.
+    ///
+    /// Idempotent: a non-advancing watermark records the (higher) value if
+    /// any but does not re-purge. Returns the index actually purged, if any.
+    ///
+    /// Leader-only in effect: openraft's `purge_log` is accepted on any node
+    /// but the watermark is meaningful when stamped by the node coordinating
+    /// the flush. Followers receive the watermark via snapshot replication.
+    pub async fn record_flush_watermark(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        durable_lsn: Lsn,
+        catalog_snapshot_id: impl Into<String>,
+    ) -> Result<Option<u64>> {
+        // The purge floor is the current applied log id: every entry the
+        // state machine has applied (and therefore reflected into the engine's
+        // now-durable state) is safe to drop. Read it from raft metrics.
+        let applied = self.raft.metrics().borrow().last_applied;
+        let Some(applied) = applied else {
+            // Nothing applied yet — no floor to advance.
+            return Ok(None);
+        };
+
+        let floor = self
+            .storage
+            .record_durable_watermark(
+                project,
+                partition,
+                durable_lsn.0,
+                applied.index,
+                catalog_snapshot_id,
+            )
+            .await;
+
+        let Some(purge_index) = floor else {
+            // Watermark did not advance the purge floor; nothing to do.
+            return Ok(None);
+        };
+
+        // Snapshot first so the manifest pointer is durable + installable
+        // before we drop the log entries it certifies. The snapshot trigger is
+        // async; wait until the snapshot actually covers the purge floor
+        // (openraft refuses to purge beyond the snapshot point), then purge.
+        //
+        // We wait on `snapshot.index >= purge_floor` (a >= predicate, NOT an
+        // exact `applied` match): the auto snapshot policy or a concurrent
+        // append may land the snapshot at an index different from the `applied`
+        // we sampled above, and openraft only requires the snapshot to cover
+        // the index we purge to.
+        //
+        // `trigger().snapshot()` is a NO-OP if a snapshot build is already in
+        // flight (openraft drops the request — see
+        // SnapshotHandler::trigger_snapshot), so a single trigger can settle on
+        // a stale snapshot that predates `purge_floor` (e.g. the automatic
+        // LogsSinceLast policy fired a build that was still running when we
+        // asked). Retry trigger+wait a bounded number of times so a dropped
+        // trigger does not wedge the purge: each iteration waits a short slice
+        // for the in-flight build to finish, then re-triggers if the snapshot
+        // still hasn't reached the floor.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let snapshot_index = loop {
+            self.raft
+                .trigger()
+                .snapshot()
+                .await
+                .map_err(|e| BasinError::wal(format!("raft snapshot trigger: {e}")))?;
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let slice = remaining.min(std::time::Duration::from_millis(500));
+            match self
+                .raft
+                .wait(Some(slice))
+                .metrics(
+                    |m| m.snapshot.map(|s| s.index).unwrap_or(0) >= purge_index,
+                    "record_flush_watermark: snapshot covers purge floor",
+                )
+                .await
+            {
+                Ok(m) => break m.snapshot.map(|s| s.index).unwrap_or(0),
+                Err(e) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(BasinError::wal(format!("raft snapshot wait: {e}")));
+                    }
+                    // In-flight build still hasn't reached the floor — loop and
+                    // re-trigger (a no-op if a build is still running, a fresh
+                    // build once it has settled).
+                    continue;
+                }
+            }
+        };
+
+        // Purge no further than the snapshot actually covers. The floor is the
+        // applied index we sampled, the snapshot index is >= it (just waited),
+        // so the cap is the floor; this guards against ever passing
+        // `purge_log` an index beyond the snapshot point.
+        let purge_to = purge_index.min(snapshot_index);
+        self.raft
+            .purge_log(purge_to)
+            .await
+            .map_err(|e| BasinError::wal(format!("raft purge_log: {e}")))?;
+        Ok(Some(purge_to))
+    }
+
+    /// Current manifest pointer (multi-node commit 3) — the durable watermark
+    /// this node has agreed on. Exposed for the follower-catchup seam: the
+    /// network/catalog layer reads it to decide which catalog snapshot to
+    /// fetch and from which LSN to resume log replay. See `APPLY.md`.
+    pub async fn durable_watermark(&self, project: &ProjectId, partition: &PartitionKey) -> Lsn {
+        Lsn(self.storage.manifest_pointer().await.watermark(project, partition))
+    }
+
+    /// Propose a **batch** of appends as one raft entry (multi-node commit 4).
+    ///
+    /// This is the durability seam in raft mode: "durable" means
+    /// quorum-replicated, so one `client_write` blocks until the batch's log
+    /// entry is committed by a majority (the local fsync still happens via the
+    /// disk storage as part of the raft log append). One consensus round + one
+    /// fsync is amortised over every item in the batch — the raft analogue of
+    /// the local WAL's group-commit (N synchronous appends → one segment PUT).
+    ///
+    /// Returns the per-item LSNs in batch order on quorum commit. If the batch
+    /// cannot reach quorum (no leader, lost leadership, replication timeout),
+    /// the write blocks then fails with the typed retryable
+    /// [`BasinError::RaftNoQuorum`] — the caller never gets a silent partial
+    /// ack. Empty batches are a no-op.
+    pub async fn propose_batch(&self, req: BasinRaftRequest) -> Result<Vec<Lsn>> {
+        if req.items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let n = req.items.len();
+        let resp = self
+            .raft
+            .client_write(req)
+            .await
+            .map_err(|e| map_client_write_err(e, n))?;
+        Ok(resp.data.lsns)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Durability backend (multi-node commit 4) — mode-gated WAL durability seam
+// ---------------------------------------------------------------------------
+
+/// Which durability backend a WAL uses (multi-node commit 4). Chosen once at
+/// startup from `BASIN_WAL_MODE`.
+///
+/// - `Local` (default): durability = local group-commit fsync. The append
+///   path is **byte-identical** to today's [`crate::LocalWal`] — no raft, no
+///   behaviour change. This is the production default and what every existing
+///   benchmark / differential test runs against.
+/// - `Raft`: durability = quorum replication. WAL append batches are proposed
+///   to raft ([`RaftWal::propose_batch`]); `durable_lsn` advances on the raft
+///   commit index instead of on a local fsync watermark. The local fsync still
+///   happens — as part of the raft log append in [`crate::raft_storage`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WalMode {
+    /// Local group-commit fsync durability. Byte-identical to v0.1.
+    #[default]
+    Local,
+    /// Quorum-replicated durability via raft.
+    Raft,
+}
+
+impl WalMode {
+    /// Parse `BASIN_WAL_MODE`. `local` (default) | `raft`. Any other value is
+    /// a hard error so a typo never silently downgrades durability — same
+    /// strict-parse idiom as `LeaseMode::parse` (multi-node commit 1).
+    pub fn parse(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "local" => Ok(WalMode::Local),
+            "raft" => Ok(WalMode::Raft),
+            other => Err(BasinError::wal(format!(
+                "invalid BASIN_WAL_MODE {other:?}: expected `local` or `raft`"
+            ))),
+        }
+    }
+
+    /// Read + parse `BASIN_WAL_MODE` from the environment (default `local`).
+    pub fn from_env() -> Result<Self> {
+        match std::env::var("BASIN_WAL_MODE") {
+            Ok(v) => Self::parse(&v),
+            Err(std::env::VarError::NotPresent) => Ok(WalMode::Local),
+            Err(std::env::VarError::NotUnicode(_)) => Err(BasinError::wal(
+                "BASIN_WAL_MODE is not valid unicode",
+            )),
+        }
+    }
+}
+
+/// The clean durability boundary the rest of the engine writes against
+/// (multi-node commit 4). One trait, two impls, chosen at startup by
+/// [`WalMode`]. Implementors are the *batch durability* primitive: given an
+/// already-LSN-ordered group-commit batch, make it durable and report the
+/// per-item durable LSNs (or fail typed).
+///
+/// - [`LocalDurability`] wraps the existing local group-commit fsync path —
+///   delegating to the [`crate::Wal`] backend so the bytes/acks are unchanged.
+/// - [`RaftDurability`] proposes the batch to raft; durable = quorum commit,
+///   `durable_lsn` follows the raft commit index, no-quorum → typed retryable.
+///
+/// This is the seam the network agent (commit 5) and the engine wire through:
+/// the engine holds `Arc<dyn DurabilityBackend>` and never branches on mode.
+#[async_trait]
+pub trait DurabilityBackend: Send + Sync + std::fmt::Debug {
+    /// The mode this backend implements.
+    fn mode(&self) -> WalMode;
+
+    /// Make a batch of appends durable and return their assigned LSNs in
+    /// batch order. In `Local` mode durability = group-commit fsync; in `Raft`
+    /// mode durability = quorum commit. A backend that cannot durably commit
+    /// fails with a typed retryable error ([`BasinError::RaftNoQuorum`] in
+    /// raft mode) rather than acking — backpressure surfaces as an error, the
+    /// write is never silently dropped.
+    async fn commit_batch(&self, batch: Vec<BasinRaftItem>) -> Result<Vec<Lsn>>;
+}
+
+/// `Raft` durability: quorum-replicated commit via [`RaftWal::propose_batch`].
+#[derive(Debug)]
+pub struct RaftDurability {
+    wal: Arc<RaftWal>,
+}
+
+impl RaftDurability {
+    pub fn new(wal: Arc<RaftWal>) -> Self {
+        Self { wal }
+    }
+}
+
+#[async_trait]
+impl DurabilityBackend for RaftDurability {
+    fn mode(&self) -> WalMode {
+        WalMode::Raft
+    }
+
+    async fn commit_batch(&self, batch: Vec<BasinRaftItem>) -> Result<Vec<Lsn>> {
+        self.wal.propose_batch(BasinRaftRequest { items: batch }).await
+    }
+}
+
+/// `Local` durability: delegates each item to the local group-commit
+/// synchronous-commit append so the WAL bytes + acks are **byte-identical** to
+/// v0.1. The batch is committed item-by-item against the underlying
+/// [`crate::Wal`] (the local file WAL already coalesces concurrent synchronous
+/// appends into one segment PUT, so the consensus-amortisation the raft path
+/// gets from batching is, for local, the existing group-commit window).
+#[derive(Debug)]
+pub struct LocalDurability {
+    wal: Arc<dyn Wal>,
+}
+
+impl LocalDurability {
+    pub fn new(wal: Arc<dyn Wal>) -> Self {
+        Self { wal }
+    }
+}
+
+#[async_trait]
+impl DurabilityBackend for LocalDurability {
+    fn mode(&self) -> WalMode {
+        WalMode::Local
+    }
+
+    async fn commit_batch(&self, batch: Vec<BasinRaftItem>) -> Result<Vec<Lsn>> {
+        let mut lsns = Vec::with_capacity(batch.len());
+        for item in batch {
+            // Synchronous-commit (durable-on-ack) append — the local seam's
+            // group-commit fsync path. `epoch: None` = the no-lease append the
+            // local path already takes today, so the bytes are unchanged.
+            let lsn = self
+                .wal
+                .append_fenced_durable(&item.project, &item.partition, Bytes::from(item.payload), None)
+                .await?;
+            lsns.push(lsn);
+        }
+        Ok(lsns)
+    }
+}
+
+/// Map an openraft `client_write` error to a typed Basin error. A no-leader /
+/// not-leader / quorum-loss failure becomes the **retryable**
+/// [`BasinError::RaftNoQuorum`] (SQLSTATE 40001) — the caller re-resolves the
+/// leader and retries. A `Fatal` (the raft core stopped, a storage I/O panic)
+/// is a hard error, not retryable, so it stays a generic WAL error. `n` is the
+/// batch size, for the message.
+fn map_client_write_err(
+    e: RaftError<NodeId, openraft::error::ClientWriteError<NodeId, BasicNode>>,
+    n: usize,
+) -> BasinError {
+    match e {
+        // ForwardToLeader = this node is not the leader / no leader is known:
+        // the canonical "can't reach quorum from here, retry elsewhere" shape.
+        // ChangeMembershipError can't arise from a data write but is an API
+        // error the caller could retry, so it joins the retryable class.
+        RaftError::APIError(_) => BasinError::raft_no_quorum(format!(
+            "batch of {n} append(s) not committed (no quorum / not leader): {e}"
+        )),
+        // Fatal: the raft core is stopped or hit an unrecoverable storage
+        // error. Not retryable — surface as a hard WAL error.
+        RaftError::Fatal(_) => {
+            BasinError::wal(format!("raft fatal during batch of {n} append(s): {e}"))
+        }
+    }
 }
 
 #[async_trait]
@@ -503,17 +859,17 @@ impl Wal for RaftWal {
         partition: &PartitionKey,
         payload: Bytes,
     ) -> Result<Lsn> {
-        let req = BasinRaftRequest {
-            project: *project,
-            partition: partition.clone(),
-            payload: payload.to_vec(),
-        };
-        let resp = self
-            .raft
-            .client_write(req)
-            .await
-            .map_err(|e| BasinError::wal(format!("raft client_write: {e}")))?;
-        Ok(resp.data.lsn)
+        // A single append is a batch of one (multi-node commit 4). The
+        // group-commit path amortises a larger batch over one consensus round
+        // via `propose_batch`.
+        let lsns = self
+            .propose_batch(BasinRaftRequest::single(
+                *project,
+                partition.clone(),
+                payload.to_vec(),
+            ))
+            .await?;
+        Ok(lsns.into_iter().next().unwrap_or(Lsn::ZERO))
     }
 
     async fn flush(&self) -> Result<()> {
