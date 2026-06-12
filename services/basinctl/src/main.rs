@@ -1,12 +1,13 @@
 //! `basinctl` — a small administrative CLI for a running Basin pgwire endpoint.
 //!
-//! Eight subcommands: `ping`, `projects`, `tables`, `query`, `version`,
-//! `reset-auth`, `import-from-postgres`, `fn`. Connection string is taken
-//! from `--url`, else `BASIN_URL`, else (for `ping`) the positional
-//! argument. See `services/basinctl/README.md` for examples.
+//! Subcommands: `ping`, `projects`, `tables`, `query`, `version`,
+//! `reset-auth`, `import-from-postgres`, `fn new|build|deploy`. Connection
+//! string is taken from `--url`, else `BASIN_URL`, else (for `ping`) the
+//! positional argument. See `services/basinctl/README.md` for examples.
 
 mod import;
 mod translate;
+mod r#fn;
 
 use std::process::ExitCode;
 use std::time::Instant;
@@ -112,9 +113,16 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = ImportFormat::Auto)]
         format: ImportFormat,
     },
-    /// WASM functions toolchain (not built yet — prints the roadmap).
+    /// WASM function developer toolchain: scaffold, build, and deploy functions.
+    ///
+    /// Functions run inside Basin as Wasm components (WASI Preview 2,
+    /// `basin-functions-handler` world). See `docs/functions.md` for the
+    /// full host ABI reference.
     #[command(name = "fn")]
-    Fn,
+    Fn {
+        #[command(subcommand)]
+        cmd: r#fn::FnCmd,
+    },
 }
 
 /// `--format` for import-from-postgres.
@@ -254,37 +262,8 @@ async fn run(cli: Cli) -> Result<()> {
             })
             .await
         }
-        Cmd::Fn => {
-            print_fn_roadmap();
-            Ok(())
-        }
+        Cmd::Fn { cmd } => r#fn::run(cmd).await,
     }
-}
-
-/// `basinctl fn` — honest placeholder. Basin's functions runtime (Wasm
-/// components under per-project caps — see `docs/functions.md` and ADR
-/// 0019) exists server-side; the CLI toolchain does not yet. Printing the
-/// roadmap keeps the surface discoverable without pretending it works.
-fn print_fn_roadmap() {
-    println!(
-        "basinctl fn — WASM functions toolchain (not built yet)\n\
-         \n\
-         Basin runs WebAssembly functions inside the engine (WASI Preview 2\n\
-         components; TypeScript via Javy / ComponentizeJS — this is Wasm, not a\n\
-         V8 isolate pool; see docs/functions.md and ADR 0019). The CLI verbs\n\
-         planned here:\n\
-         \n\
-           fn deploy <file.wasm|src/>   compile (if source) + upload a component\n\
-           fn list                      list deployed functions + versions\n\
-           fn invoke <name> [--body]    invoke ANY /fn/v1/<name> for testing\n\
-           fn logs <name>               tail invocation logs\n\
-           fn delete <name>             remove a function\n\
-         \n\
-         Until then: deploy via the REST surface described in docs/functions.md.\n\
-         Migrating plpgsql from Postgres? `basinctl import-from-postgres` lists\n\
-         every source function it skipped; each one is a candidate for a Wasm\n\
-         function (request/response) or a reactor (row-change logic)."
-    );
 }
 
 /// Drop every basin-auth catalog table. See `Cmd::ResetAuth` for rationale.
@@ -598,10 +577,98 @@ mod tests {
         assert!(Cli::try_parse_from(["basinctl", "import-from-postgres"]).is_err());
     }
 
+    // -----------------------------------------------------------------------
+    // fn subcommand arg-parsing
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn fn_subcommand_parses() {
-        let cli = parse(&["basinctl", "fn"]);
-        assert_eq!(cli.cmd, Cmd::Fn);
+    fn fn_new_parses() {
+        let cli = parse(&["basinctl", "fn", "new", "hello"]);
+        match cli.cmd {
+            Cmd::Fn { cmd: r#fn::FnCmd::New { name, lang } } => {
+                assert_eq!(name, "hello");
+                assert_eq!(lang, "rust");
+            }
+            other => panic!("expected Fn::New, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fn_new_custom_lang_rejected_at_runtime_not_parse() {
+        // The --lang flag is free-form; validation is at runtime.
+        let cli = parse(&["basinctl", "fn", "new", "hello", "--lang", "js"]);
+        match cli.cmd {
+            Cmd::Fn { cmd: r#fn::FnCmd::New { lang, .. } } => {
+                assert_eq!(lang, "js");
+            }
+            other => panic!("expected Fn::New, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fn_build_defaults_to_cwd() {
+        let cli = parse(&["basinctl", "fn", "build"]);
+        match cli.cmd {
+            Cmd::Fn { cmd: r#fn::FnCmd::Build { path } } => {
+                assert_eq!(path, None);
+            }
+            other => panic!("expected Fn::Build, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fn_build_with_path() {
+        let cli = parse(&["basinctl", "fn", "build", "./my_fn"]);
+        match cli.cmd {
+            Cmd::Fn { cmd: r#fn::FnCmd::Build { path } } => {
+                assert_eq!(path, Some(std::path::PathBuf::from("./my_fn")));
+            }
+            other => panic!("expected Fn::Build, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fn_deploy_parses() {
+        let cli = parse(&[
+            "basinctl",
+            "fn",
+            "deploy",
+            "hello",
+            "--token",
+            "tok",
+            "--rest-url",
+            "http://prod:5434",
+        ]);
+        match cli.cmd {
+            Cmd::Fn {
+                cmd:
+                    r#fn::FnCmd::Deploy {
+                        name,
+                        token,
+                        rest_url,
+                        path,
+                    },
+            } => {
+                assert_eq!(name, "hello");
+                assert_eq!(token.as_deref(), Some("tok"));
+                assert_eq!(rest_url, "http://prod:5434");
+                assert_eq!(path, None);
+            }
+            other => panic!("expected Fn::Deploy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fn_deploy_default_rest_url() {
+        let cli = parse(&["basinctl", "fn", "deploy", "hello"]);
+        match cli.cmd {
+            Cmd::Fn {
+                cmd: r#fn::FnCmd::Deploy { rest_url, .. },
+            } => {
+                assert_eq!(rest_url, "http://127.0.0.1:5434");
+            }
+            other => panic!("expected Fn::Deploy, got {other:?}"),
+        }
     }
 
     #[test]

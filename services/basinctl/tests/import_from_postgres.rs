@@ -44,12 +44,13 @@ fn stderr(o: &Output) -> String {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn fn_stub_prints_wasm_roadmap_and_succeeds() {
-    let out = basinctl(&["fn"]);
+fn fn_help_lists_new_build_deploy_subcommands() {
+    let out = basinctl(&["fn", "--help"]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let s = stdout(&out);
-    assert!(s.contains("WASM functions toolchain"), "stdout: {s}");
-    assert!(s.contains("fn deploy"), "stdout: {s}");
+    assert!(s.contains("new"), "stdout: {s}");
+    assert!(s.contains("build"), "stdout: {s}");
+    assert!(s.contains("deploy"), "stdout: {s}");
     assert!(s.contains("docs/functions.md"), "stdout: {s}");
 }
 
