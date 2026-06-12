@@ -272,6 +272,26 @@ impl BasinError {
         Self::LeaseNotHeld(msg.into())
     }
 
+    /// Multi-node raft (commit 6) — typed constructor for a write that
+    /// arrived at a node which is **not the raft leader**. In `BASIN_WAL_MODE
+    /// =raft` raft leadership is the write fence (it supersedes the writer
+    /// lease — see `RaftWal`), so a non-leader write is refused before it
+    /// reaches the raft log. Reuses the [`Self::LeaseNotHeld`] variant on
+    /// purpose: it is the same retryable class (SQLSTATE 40001) the router
+    /// already handles for lease refusals, so no new error variant and no new
+    /// exhaustive-match arm are needed. The message embeds an optional leader
+    /// hint so the caller (and the router/proxy on retry) can be redirected
+    /// to the current leader: `not raft leader (leader hint: <addr-or-id>)`
+    /// when known, else `not raft leader (leader unknown)`. `hint` is the
+    /// leader's advertised address (or node id) as the cluster knows it.
+    pub fn not_leader(hint: Option<impl Into<String>>) -> Self {
+        let msg = match hint {
+            Some(h) => format!("not raft leader (leader hint: {})", h.into()),
+            None => "not raft leader (leader unknown)".to_string(),
+        };
+        Self::LeaseNotHeld(msg)
+    }
+
     /// Multi-node commit 4 — typed constructor for the raft-WAL no-quorum
     /// write failure (`BASIN_WAL_MODE=raft`). Retryable (SQLSTATE 40001).
     pub fn raft_no_quorum(msg: impl Into<String>) -> Self {

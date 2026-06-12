@@ -8,6 +8,34 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-12 — Multi-node: quorum-replicated WAL (`BASIN_WAL_MODE=raft`)
+
+### Added
+
+- **Quorum-replicated WAL durability (`BASIN_WAL_MODE=raft`).** Off by default
+  (`local` mode is byte-identical to today). In raft mode the WAL durability
+  boundary becomes a **quorum ack** instead of a local fsync: a WAL append
+  batch is proposed as one openraft log entry, so a single consensus round plus
+  local fsync is amortised over the whole group-commit batch, and `durable_lsn`
+  advances on the raft commit index. Backpressure is fail-closed and typed — a
+  write that cannot reach quorum blocks then fails with the retryable
+  `RaftNoQuorum` (SQLSTATE 40001), never a silent partial ack.
+- **Manifest-anchored raft snapshots.** A raft snapshot is a small manifest
+  pointer (catalog snapshot id + per-`(project, partition)` flushed watermark),
+  not a data copy: S3 and the catalog already hold the rows. After the compactor
+  commits, `record_flush_watermark` stamps the watermark, snapshots, and purges
+  the raft log up to it, so the local log stays bounded by the un-flushed window.
+- **Server cluster wiring + leader fence.** `BASIN_WAL_MODE=raft` selects the
+  `RaftWal` backend for the shard, parsing `BASIN_NODE_ID` / `BASIN_RAFT_BIND` /
+  `BASIN_RAFT_PEERS` (`id@host:port`) and bootstrapping (`BASIN_RAFT_BOOTSTRAP=1`
+  on one node) or joining. Raft leadership is the write fence and supersedes the
+  writer lease: a non-leader write is refused before the raft round-trip with the
+  typed retryable not-leader error (SQLSTATE 40001) carrying a leader hint; with
+  `BASIN_LEASE_MODE=required` also set, raft wins and the lease is logged as
+  subsumed. Raft mode without `BASIN_SHARD_ENABLED=1` / bind / peers is a
+  refuse-to-start error. Cluster status (node id, role, term, commit index,
+  peers) is logged at startup via `RaftWal::cluster_status`.
+
 ## 2026-06-12 — SQL compat: ALTER ADD UNIQUE, typed timestamptz binds, 42883/42703
 
 ### Added

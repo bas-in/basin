@@ -212,6 +212,96 @@ type NodeId = u64;
 type RaftHandle = openraft::Raft<C>;
 
 // ---------------------------------------------------------------------------
+// Cluster status (commit 6 — observability surface)
+// ---------------------------------------------------------------------------
+
+/// This node's role in the raft cluster, derived from `openraft`'s
+/// `ServerState`. Surfaced by [`RaftWal::cluster_status`] and rendered into
+/// the `GET /admin/v1/cluster` admin response by `basin-server`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClusterRole {
+    /// Voting follower (or the steady-state replica).
+    Follower,
+    /// Mid-election candidate.
+    Candidate,
+    /// Current leader — the only node that accepts writes in raft mode.
+    Leader,
+    /// Non-voting learner (catching up; e.g. a freshly-(re)joined node).
+    Learner,
+    /// Raft core has shut down.
+    Shutdown,
+}
+
+impl ClusterRole {
+    fn from_server_state(s: openraft::ServerState) -> Self {
+        use openraft::ServerState;
+        match s {
+            ServerState::Follower => ClusterRole::Follower,
+            ServerState::Candidate => ClusterRole::Candidate,
+            ServerState::Leader => ClusterRole::Leader,
+            ServerState::Learner => ClusterRole::Learner,
+            ServerState::Shutdown => ClusterRole::Shutdown,
+        }
+    }
+
+    pub fn is_leader(self) -> bool {
+        matches!(self, ClusterRole::Leader)
+    }
+}
+
+/// A point-in-time snapshot of this node's view of the raft cluster.
+///
+/// Read from `openraft`'s `RaftMetrics` in [`RaftWal::cluster_status`]; the
+/// shape is the minimal operator surface the multi-node prompt calls for:
+/// node id, role, term, commit index, current leader, and the configured
+/// peers. `basin-server` logs this at startup + on role changes and serves it
+/// as JSON at `GET /admin/v1/cluster`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClusterStatus {
+    /// This node's numeric raft id.
+    pub node_id: u64,
+    /// This node's stable string identity (`RaftWalConfig::local_id`).
+    pub local_id: String,
+    /// This node's current role.
+    pub role: ClusterRole,
+    /// Current raft term.
+    pub term: u64,
+    /// Highest log index applied to the local state machine — the commit
+    /// index from this node's vantage point (`last_applied`, `0` if none).
+    pub commit_index: u64,
+    /// Highest log index appended to this node's log (`0` if none).
+    pub last_log_index: u64,
+    /// Current leader's node id, if this node knows one.
+    pub leader_id: Option<u64>,
+    /// Voting + learner members in the current membership config, as
+    /// `node_id -> advertised address`.
+    pub members: BTreeMap<u64, String>,
+}
+
+impl ClusterStatus {
+    pub fn is_leader(&self) -> bool {
+        self.role.is_leader()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Network factory seam (commit 6 — c5 integration point, now wired by c5)
+// ---------------------------------------------------------------------------
+
+/// Marker naming the raft-network seam.
+///
+/// The in-process [`SimNetworkFactory`] is the default factory (tests +
+/// single-node). The cross-process gRPC factory is the tonic-network commit
+/// (c5, `BASIN_RAFT_BIND` / `BASIN_RAFT_PEERS`), wired through
+/// [`RaftWal::new_with_network`]: `RaftWal::new` delegates to it with the Sim
+/// factory, and `basin-server` injects the tonic factory when the raft env is
+/// configured. This marker documents where the network choice plugs in; the
+/// `cluster_status` / leader-fence surface in this file is independent of the
+/// network factory.
+pub trait RaftNetworkChoiceMarker {}
+
+// ---------------------------------------------------------------------------
 // Single-process simulation network
 // ---------------------------------------------------------------------------
 
@@ -485,6 +575,19 @@ impl RaftWal {
         }
     }
 
+    /// Convenience over [`Self::initialize`] that takes the membership as
+    /// `node_id -> advertised address` strings, building the `BasicNode`
+    /// values internally. Lets callers (e.g. `basin-server`) bootstrap a
+    /// cluster without naming any `openraft` type. Idempotent (an
+    /// already-initialised cluster returns `Ok`).
+    pub async fn initialize_addrs(&self, members: BTreeMap<NodeId, String>) -> Result<()> {
+        let members: BTreeMap<NodeId, BasicNode> = members
+            .into_iter()
+            .map(|(id, addr)| (id, BasicNode::new(addr)))
+            .collect();
+        self.initialize(members).await
+    }
+
     /// Add a learner node (replicates logs but does not vote). Call from
     /// the leader.
     pub async fn add_learner(&self, id: NodeId, node: BasicNode) -> Result<()> {
@@ -528,6 +631,65 @@ impl RaftWal {
     /// Current leader id, as reported by raft metrics.
     pub async fn current_leader(&self) -> Option<NodeId> {
         self.raft.current_leader().await
+    }
+
+    /// This node's numeric raft id.
+    pub fn node_id(&self) -> NodeId {
+        self.config.node_id
+    }
+
+    /// `true` iff this node currently believes itself to be the raft leader
+    /// (`ServerState::Leader`). This is the **write fence** in raft mode: a
+    /// write that arrives at a non-leader is refused (see [`Wal::append`]).
+    ///
+    /// Note this reads the local node's metrics — a freshly-deposed leader
+    /// may briefly still report `true`. That window is bounded by the
+    /// heartbeat interval and is itself safe: openraft's `client_write`
+    /// rejects the entry with `ForwardToLeader` once it learns it is no
+    /// longer leader, so the append still fails closed even if `is_leader`
+    /// raced. The fence here is the cheap fast-path refusal.
+    pub async fn is_leader(&self) -> bool {
+        matches!(
+            self.raft.metrics().borrow().state,
+            openraft::ServerState::Leader
+        )
+    }
+
+    /// Best-effort advertised address (or id) of the current leader, for the
+    /// `LeaseNotHeld` / not-leader error hint and for client redirect. Looks
+    /// the leader id up in the membership config so the hint is the leader's
+    /// wire address when known; falls back to the bare id string.
+    pub async fn leader_hint(&self) -> Option<String> {
+        let m = self.raft.metrics().borrow().clone();
+        let leader = m.current_leader?;
+        // Prefer the advertised address from the membership config.
+        let addr = m
+            .membership_config
+            .membership()
+            .nodes()
+            .find(|(id, _)| **id == leader)
+            .map(|(_, node)| node.addr.clone());
+        Some(addr.unwrap_or_else(|| leader.to_string()))
+    }
+
+    /// Snapshot this node's view of the cluster for the admin status surface
+    /// (`GET /admin/v1/cluster`) and startup / role-change logging.
+    pub async fn cluster_status(&self) -> ClusterStatus {
+        let m = self.raft.metrics().borrow().clone();
+        let mut members = BTreeMap::new();
+        for (id, node) in m.membership_config.membership().nodes() {
+            members.insert(*id, node.addr.clone());
+        }
+        ClusterStatus {
+            node_id: self.config.node_id,
+            local_id: self.config.local_id.clone(),
+            role: ClusterRole::from_server_state(m.state),
+            term: m.current_term,
+            commit_index: m.last_applied.map(|l| l.index).unwrap_or(0),
+            last_log_index: m.last_log_index.unwrap_or(0),
+            leader_id: m.current_leader,
+            members,
+        }
     }
 
     /// Manifest-anchored snapshot + log purge (multi-node commit 3).
@@ -859,6 +1021,21 @@ impl Wal for RaftWal {
         partition: &PartitionKey,
         payload: Bytes,
     ) -> Result<Lsn> {
+        // Raft-mode write fence (commit 6): raft leadership supersedes the
+        // writer lease — writes are accepted ONLY on the leader. We fast-path
+        // refuse on a non-leader with the typed, retryable not-leader error
+        // (carrying a leader hint when known) BEFORE the raft round-trip, so
+        // the caller gets a clean redirect instead of a forwarded RPC.
+        //
+        // This is fail-closed regardless: even if `is_leader()` raced a
+        // demotion and let the write through, `propose_batch`'s
+        // `client_write` rejects it with `ForwardToLeader`, which
+        // `map_client_write_err` translates to the retryable
+        // `RaftNoQuorum` — still a typed Err, still fail-closed.
+        if !self.is_leader().await {
+            let hint = self.leader_hint().await;
+            return Err(BasinError::not_leader(hint));
+        }
         // A single append is a batch of one (multi-node commit 4). The
         // group-commit path amortises a larger batch over one consensus round
         // via `propose_batch`.

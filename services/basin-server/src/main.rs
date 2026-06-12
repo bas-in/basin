@@ -52,6 +52,59 @@
 //! engine falls back to its legacy synchronous Parquet write path so existing
 //! demos remain reproducible.
 //!
+//! ## WAL durability mode (multi-node raft, commit 6)
+//!
+//! ```text
+//! BASIN_WAL_MODE=local       # default; single-node file-backed WAL (LocalWal)
+//! BASIN_WAL_MODE=raft        # replicated WAL via openraft (RaftWal)
+//! ```
+//!
+//! `BASIN_WAL_MODE` selects the [`basin_wal::Wal`] backend handed to the
+//! shard. `local` (the default) is **byte-identical** to today — a
+//! `LocalWal` over the configured object store. `raft` opens a
+//! [`basin_wal::RaftWal`] under `${BASIN_WAL_DIR}/raft`, starts the raft
+//! service, joins-or-bootstraps the cluster, and makes the WAL durability
+//! boundary a **quorum ack** instead of a local fsync.
+//!
+//! Raft mode requires the cluster identity + topology env surface:
+//!
+//! ```text
+//! BASIN_NODE_ID=1                  # REQUIRED in raft mode; this node's numeric raft id (u64, >0)
+//! BASIN_RAFT_BIND=127.0.0.1:6010   # REQUIRED in raft mode; this node's raft RPC listen addr
+//! BASIN_RAFT_PEERS=1@127.0.0.1:6010,2@10.0.0.2:6010,3@10.0.0.3:6010
+//!                                  # REQUIRED in raft mode; id@host:port for every voter incl. self
+//! BASIN_RAFT_BOOTSTRAP=1           # optional; set on exactly ONE node to initialize the cluster
+//!                                  # when its raft log is empty. Other nodes await leader contact.
+//! ```
+//!
+//! Config validation (commit 6): `BASIN_WAL_MODE=raft` without
+//! `BASIN_SHARD_ENABLED=1`, without `BASIN_RAFT_BIND`, or without
+//! `BASIN_RAFT_PEERS` is a **startup error** — same refuse-to-start idiom as
+//! `BASIN_LEASE_MODE=required` / `BASIN_REST_ENABLED=1`. `BASIN_NODE_ID` must
+//! appear in `BASIN_RAFT_PEERS` with a `host:port` that matches
+//! `BASIN_RAFT_BIND`. `local` mode ignores the raft env entirely.
+//!
+//! ### Precedence: raft leadership vs. writer lease
+//!
+//! In `raft` mode, **raft leadership is the write fence and it supersedes the
+//! writer lease**:
+//!
+//! - Writes are accepted only on the raft **leader**. A write that arrives at
+//!   a follower / candidate / learner is refused before it reaches the raft
+//!   log with the typed, retryable `LeaseNotHeld` error carrying a leader
+//!   hint (`BasinError::not_leader`, SQLSTATE 40001) — the router re-resolves
+//!   and retries against the leader. (Reads are never refused.)
+//! - The lease fence (`BASIN_LEASE_MODE=required`) and the raft fence are not
+//!   stacked: in raft mode the raft leader IS the single writer, so the lease
+//!   registry is redundant. If both `BASIN_WAL_MODE=raft` and
+//!   `BASIN_LEASE_MODE=required` are set, raft wins and the server logs that
+//!   the lease fence is subsumed by raft leadership (the shard still carries
+//!   the lease registry, but a follower is fenced by the raft check first, so
+//!   the lease never gates a write the raft fence would have allowed). The
+//!   epoch-fenced WAL append remains correct underneath either fence.
+//! - In `local` mode nothing changes: `BASIN_LEASE_MODE` is the only write
+//!   fence, exactly as before.
+//!
 //! ## Writer leases (multi-node phase 1, ADR 0023)
 //!
 //! ```text
@@ -153,6 +206,7 @@ mod engine_auth_store;
 #[cfg(feature = "wasm-fn")]
 mod fn_runtime;
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -186,6 +240,7 @@ async fn main() -> Result<()> {
         shard_enabled = cfg.shard_enabled,
         pool_enabled = cfg.pool_enabled,
         lease_mode = ?cfg.lease_mode,
+        wal_mode = ?cfg.wal_mode,
         "starting basin-server"
     );
 
@@ -293,26 +348,47 @@ async fn main() -> Result<()> {
     // Optional WAL + shard owner. Constructed when BASIN_SHARD_ENABLED=1 so we
     // can ship the wedge-deepening change incrementally without breaking demos
     // that don't have a writable WAL directory available.
+    //
+    // A handle to the raft WAL (when `BASIN_WAL_MODE=raft`) is kept alongside
+    // the shard handles so the admin status surface + startup logging can read
+    // cluster status, and so shutdown can close the raft node cleanly.
     let mut shard_handles: Option<(
         basin_shard::Shard,
         basin_shard::ShardBackgroundHandle,
         Arc<dyn basin_wal::Wal>,
     )> = None;
+    // Raft handle for the admin status surface. `None` in local mode.
+    let mut raft_wal: Option<Arc<basin_wal::RaftWal>> = None;
     let shard_for_engine: Option<basin_shard::Shard> = if cfg.shard_enabled {
-        let wal_store = build_wal_object_store(&cfg)?;
-        let wal: Arc<dyn basin_wal::Wal> = Arc::new(
-            basin_wal::LocalWal::open(basin_wal::WalConfig {
-                object_store: wal_store,
-                root_prefix: cfg.wal_root_prefix.clone(),
-                flush_interval: std::time::Duration::from_millis(200),
-                flush_max_bytes: 1024 * 1024,
-                // Group-commit window for `SET basin.synchronous_commit = on`
-                // appends. Default 2 ms (`BASIN_WAL_COMMIT_DELAY_MS`).
-                commit_delay: basin_wal::WalConfig::default_commit_delay(),
-            })
-            .await
-            .context("open WAL")?,
-        );
+        // Select the WAL durability backend (commit 6). `local` is the
+        // unchanged file-backed WAL; `raft` is the replicated WAL.
+        let wal: Arc<dyn basin_wal::Wal> = match cfg.wal_mode {
+            WalMode::Local => {
+                let wal_store = build_wal_object_store(&cfg)?;
+                Arc::new(
+                    basin_wal::LocalWal::open(basin_wal::WalConfig {
+                        object_store: wal_store,
+                        root_prefix: cfg.wal_root_prefix.clone(),
+                        flush_interval: std::time::Duration::from_millis(200),
+                        flush_max_bytes: 1024 * 1024,
+                        // Group-commit window for `SET basin.synchronous_commit = on`
+                        // appends. Default 2 ms (`BASIN_WAL_COMMIT_DELAY_MS`).
+                        commit_delay: basin_wal::WalConfig::default_commit_delay(),
+                    })
+                    .await
+                    .context("open WAL")?,
+                )
+            }
+            WalMode::Raft => {
+                let raft = build_raft_wal(&cfg).await?;
+                let arc = Arc::new(raft);
+                // Stash a typed handle for the admin status surface + logging
+                // before we erase it behind `dyn Wal`.
+                raft_wal = Some(arc.clone());
+                arc
+            }
+        };
+
         let mut shard_cfg =
             basin_shard::ShardConfig::new(storage.clone(), catalog.clone(), wal.clone());
         // Multi-node phase 1 (ADR 0023): with BASIN_LEASE_MODE=required the
@@ -321,7 +397,22 @@ async fn main() -> Result<()> {
         // (typed `LeaseNotHeld` refusal otherwise; reads continue). The
         // renewal heartbeat rides the shard background loop spawned below,
         // same as eviction + compaction. `off` (the default) changes nothing.
+        //
+        // PRECEDENCE (commit 6): in raft mode the raft leader IS the single
+        // writer (see `RaftWal`'s leader fence), so the lease fence is
+        // redundant. We still allow both knobs to be set — the raft fence
+        // refuses a follower's write before the lease is ever consulted — but
+        // we log that the lease is subsumed by raft leadership so operators
+        // aren't surprised that the lease registry is effectively a no-op.
         if cfg.lease_mode == basin_shard::LeaseMode::Required {
+            if cfg.wal_mode == WalMode::Raft {
+                tracing::info!(
+                    "lease mode: required — but BASIN_WAL_MODE=raft is set; \
+                     raft leadership supersedes the writer lease as the write \
+                     fence (a non-leader write is refused before the lease is \
+                     consulted). The lease registry is wired but redundant."
+                );
+            }
             let replica_id = cfg
                 .replica_id
                 .clone()
@@ -340,6 +431,7 @@ async fn main() -> Result<()> {
         let bg = shard.spawn_background();
         tracing::info!(
             wal_dir = %cfg.wal_dir.display(),
+            wal_mode = ?cfg.wal_mode,
             "shard owner enabled; INSERTs will route through WAL + compactor"
         );
         let to_engine = shard.clone();
@@ -348,6 +440,13 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+
+    // Raft cluster startup status (commit 6 observability). Logged once the
+    // node has had a moment to (self-)elect; non-fatal if it never converges
+    // here (the background raft loop keeps trying).
+    if let Some(ref raft) = raft_wal {
+        log_initial_cluster_status(raft).await;
+    }
 
     let engine = basin_engine::Engine::new(basin_engine::EngineConfig {
         storage: storage.clone(),
@@ -603,6 +702,24 @@ async fn main() -> Result<()> {
         // Shares the same Arc<dyn Catalog> the engine + fn_runtime already use;
         // no extra connection needed.
         svc.with_fn_catalog(catalog.clone());
+        // Multi-node raft (commit 6): hand the raft WAL handle to the REST
+        // service so `GET /admin/v1/cluster` can serve live cluster status.
+        //
+        // INTEGRATION CONTRACT (TODO — finalise against basin-rest's admin
+        // route idiom; the fn-persist mirror shows the `with_*` builder +
+        // `Inner` field pattern this mirrors). The cheap, self-contained
+        // surface that does NOT depend on the c5 wire commit:
+        //   - `RestService::with_cluster_status(handle: Arc<dyn ClusterStatusProvider>)`
+        //     where `ClusterStatusProvider::status() -> ClusterStatus` is a
+        //     1-method trait `basin-wal::RaftWal` implements (it already has
+        //     `cluster_status()`).
+        //   - `admin_routes::cluster_status` renders the `ClusterStatus` JSON
+        //     at `GET /admin/v1/cluster`, mirroring `admin_functions`' shape.
+        // Until that builder lands in basin-rest, the status surface is the
+        // startup + role-change LOG (load-bearing observability), and this
+        // block is a documented seam. When wiring it, gate on
+        // `if let Some(ref raft) = raft_wal { svc.with_cluster_status(raft.clone()); }`.
+        let _ = &raft_wal; // keep the handle live for the seam above + shutdown.
         // Feature 2: co-mount realtime SSE + WS on the REST port when both
         // features are compiled in and an auth service is available. The
         // standalone BASIN_REALTIME_BIND / BASIN_REALTIME_WS_BIND ports are
@@ -757,6 +874,10 @@ async fn main() -> Result<()> {
             tracing::warn!(error = %e, "WAL close failed");
         }
     }
+    // Drop the raft handle after the shard/WAL teardown (its `Arc` is the same
+    // node `wal.close()` already shut down; the explicit drop documents the
+    // lifetime so the handle is not held past shutdown).
+    drop(raft_wal);
 
     // `auth_service` is dropped at the end of `main` — its `Arc` is the only
     // lifeline, so nothing to do explicitly.
@@ -764,6 +885,167 @@ async fn main() -> Result<()> {
 
     router_result.map_err(|e| anyhow!("router exited: {e}"))?;
     Ok(())
+}
+
+/// Multi-node raft (commit 6): WAL durability backend selector
+/// (`BASIN_WAL_MODE`). `Local` is the unchanged single-node file-backed WAL;
+/// `Raft` is the replicated WAL whose durability boundary is a quorum ack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WalMode {
+    Local,
+    Raft,
+}
+
+impl WalMode {
+    fn from_env() -> Result<Self> {
+        match std::env::var("BASIN_WAL_MODE")
+            .ok()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            None | Some("") | Some("local") => Ok(WalMode::Local),
+            Some("raft") => Ok(WalMode::Raft),
+            Some(other) => Err(anyhow!(
+                "BASIN_WAL_MODE must be 'local' or 'raft', got {other:?}"
+            )),
+        }
+    }
+}
+
+/// Parsed `BASIN_RAFT_PEERS` entry: `id@host:port`.
+#[derive(Clone, Debug)]
+struct RaftPeer {
+    id: u64,
+    addr: String,
+}
+
+/// Raft cluster topology parsed from the env surface, populated only in raft
+/// mode. Mirrors the knobs documented in the module header.
+#[derive(Clone, Debug)]
+struct RaftCfg {
+    node_id: u64,
+    bind: String,
+    peers: Vec<RaftPeer>,
+    bootstrap: bool,
+}
+
+/// Build the [`basin_wal::RaftWal`] for `BASIN_WAL_MODE=raft`.
+///
+/// Opens the raft storage under `${BASIN_WAL_DIR}/raft`, constructs the node
+/// with the parsed topology, and joins-or-bootstraps the cluster:
+///   - if `BASIN_RAFT_BOOTSTRAP=1` AND the raft log is empty, this node
+///     `initialize`s the cluster with the full peer set, then awaits its own
+///     election;
+///   - otherwise the node awaits leader contact (a peer will replicate the
+///     membership + log to it).
+///
+/// INTEGRATION CONTRACT (TODO — finalise against the concurrent commits):
+///   - **c5 (tonic network, `/tmp/basin_raft_c5`)**: the wire `RaftNetwork`
+///     factory. Until c5 lands, `RaftWal::new` uses its built-in (Sim)
+///     factory; this function passes the parsed `bind` / `peers` through
+///     `RaftWalConfig` so that when c5's selector lands, the only change here
+///     is choosing the tonic factory. The `peers`' `host:port` strings are
+///     already the wire addresses c5 needs.
+///   - **c34 (DurabilityBackend, `/tmp/basin_raft_c34`)**: the shard's
+///     `mark_range_durable` routes through `DurabilityBackend::{Local,Raft}`.
+///     This function only supplies the raft `Arc<dyn Wal>`; the shard selects
+///     the backend internally from the WAL impl type (or a `BASIN_WAL_MODE`
+///     read of its own — c34's APPLY.md is authoritative). `durable_lsn`
+///     advancing on quorum is c34's contract; raft's `append` already returns
+///     only after quorum commit, which is the signal c34 consumes.
+async fn build_raft_wal(cfg: &Cfg) -> Result<basin_wal::RaftWal> {
+    let rcfg = cfg
+        .raft
+        .as_ref()
+        .ok_or_else(|| anyhow!("BASIN_WAL_MODE=raft but raft config missing (internal error)"))?;
+
+    // Raft state lives under a dedicated subdir so it never collides with the
+    // file-WAL segments (which the local-mode WAL writes under BASIN_WAL_DIR).
+    let raft_dir = cfg.wal_dir.join("raft");
+    std::fs::create_dir_all(&raft_dir)
+        .with_context(|| format!("create raft dir {}", raft_dir.display()))?;
+
+    // initial_members: every peer (voters). The node's own id must be present.
+    let mut initial_members: BTreeMap<u64, String> = BTreeMap::new();
+    for p in &rcfg.peers {
+        initial_members.insert(p.id, p.addr.clone());
+    }
+    let peer_addrs: Vec<String> = rcfg.peers.iter().map(|p| p.addr.clone()).collect();
+
+    let wal_cfg = basin_wal::RaftWalConfig::new(peer_addrs, rcfg.bind.clone(), raft_dir)
+        .with_node_id(rcfg.node_id)
+        .with_initial_members(initial_members.clone());
+
+    tracing::info!(
+        node_id = rcfg.node_id,
+        bind = %rcfg.bind,
+        peers = rcfg.peers.len(),
+        bootstrap = rcfg.bootstrap,
+        "raft WAL: opening node"
+    );
+
+    let wal = basin_wal::RaftWal::new(wal_cfg)
+        .await
+        .map_err(|e| anyhow!("open RaftWal: {e}"))?;
+
+    // Join-or-bootstrap. Bootstrap only when explicitly designated AND the
+    // log is empty (so a restart of the bootstrap node does NOT re-initialize
+    // — `initialize` is idempotent via the NotAllowed branch in RaftWal, but
+    // we still gate on the log being empty to keep intent clear and to avoid a
+    // spurious membership churn). `last_log_index == None` ⇒ empty log.
+    let status = wal.cluster_status().await;
+    let log_empty = status.last_log_index == 0 && status.commit_index == 0;
+    if rcfg.bootstrap && log_empty {
+        tracing::info!(
+            node_id = rcfg.node_id,
+            members = initial_members.len(),
+            "raft WAL: bootstrapping cluster (BASIN_RAFT_BOOTSTRAP=1, empty log)"
+        );
+        // `initialize_addrs` builds the openraft `BasicNode` map internally,
+        // so basin-server never depends on openraft directly.
+        wal.initialize_addrs(initial_members.clone())
+            .await
+            .map_err(|e| anyhow!("raft initialize: {e}"))?;
+    } else if rcfg.bootstrap {
+        tracing::info!(
+            node_id = rcfg.node_id,
+            "raft WAL: BASIN_RAFT_BOOTSTRAP=1 but log is non-empty; skipping initialize (recovering)"
+        );
+    } else {
+        tracing::info!(
+            node_id = rcfg.node_id,
+            "raft WAL: awaiting leader contact (not the bootstrap node)"
+        );
+    }
+
+    Ok(wal)
+}
+
+/// Log this node's view of the cluster shortly after startup. Best-effort: we
+/// poll cluster status for a brief window so the first log line reflects a
+/// (likely) converged state instead of the pre-election transient. Never
+/// fatal — the raft background loop keeps the node live regardless.
+async fn log_initial_cluster_status(raft: &basin_wal::RaftWal) {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = raft.cluster_status().await;
+        if status.leader_id.is_some() || Instant::now() > deadline {
+            tracing::info!(
+                node_id = status.node_id,
+                local_id = %status.local_id,
+                role = ?status.role,
+                term = status.term,
+                commit_index = status.commit_index,
+                last_log_index = status.last_log_index,
+                leader_id = ?status.leader_id,
+                members = status.members.len(),
+                "raft cluster status"
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 struct Cfg {
@@ -780,6 +1062,14 @@ struct Cfg {
     /// `BASIN_REPLICA_ID` — stable lease holder id for this process. `None`
     /// falls back to basin-shard's per-process default (`host:pid:salt`).
     replica_id: Option<String>,
+    /// Multi-node raft (commit 6): `BASIN_WAL_MODE`. `Raft` replaces the
+    /// file-backed WAL with the replicated WAL; `Local` (default) is
+    /// unchanged. See [`WalMode`] + the module header for precedence rules.
+    wal_mode: WalMode,
+    /// Raft cluster topology — `Some` only in raft mode. Parsed from
+    /// `BASIN_NODE_ID` / `BASIN_RAFT_BIND` / `BASIN_RAFT_PEERS` /
+    /// `BASIN_RAFT_BOOTSTRAP`.
+    raft: Option<RaftCfg>,
     // ADR 0018: auth/rest fields compiled away in minimal build.
     #[cfg(feature = "auth")]
     auth_enabled: bool,
@@ -833,6 +1123,22 @@ impl Cfg {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+
+        // BASIN_WAL_MODE (multi-node raft, commit 6). Strict parse + config
+        // validation mirroring the lease-mode / rest-requires-auth idiom.
+        let wal_mode = WalMode::from_env()?;
+        let raft = if wal_mode == WalMode::Raft {
+            if !shard_enabled {
+                return Err(anyhow!(
+                    "BASIN_WAL_MODE=raft requires BASIN_SHARD_ENABLED=1 \
+                     (the replicated WAL is the shard's durability backend)"
+                ));
+            }
+            Some(parse_raft_env()?)
+        } else {
+            None
+        };
+
         #[cfg(feature = "auth")]
         let auth_enabled = bool_env("BASIN_AUTH_ENABLED");
         #[cfg(feature = "rest")]
@@ -885,6 +1191,8 @@ impl Cfg {
             pool_enabled,
             lease_mode,
             replica_id,
+            wal_mode,
+            raft,
             #[cfg(feature = "auth")]
             auth_enabled,
             #[cfg(feature = "rest")]
@@ -897,6 +1205,83 @@ impl Cfg {
             wal_root_prefix,
         })
     }
+}
+
+/// Parse the raft env surface (`BASIN_WAL_MODE=raft` only). Hard errors on
+/// every misconfiguration so a half-wired raft node refuses to start.
+fn parse_raft_env() -> Result<RaftCfg> {
+    let node_id: u64 = std::env::var("BASIN_NODE_ID")
+        .map_err(|_| anyhow!("BASIN_WAL_MODE=raft requires BASIN_NODE_ID (this node's u64 id)"))?
+        .trim()
+        .parse()
+        .context("BASIN_NODE_ID must be a positive u64")?;
+    if node_id == 0 {
+        return Err(anyhow!("BASIN_NODE_ID must be > 0"));
+    }
+
+    let bind = std::env::var("BASIN_RAFT_BIND")
+        .map_err(|_| anyhow!("BASIN_WAL_MODE=raft requires BASIN_RAFT_BIND (host:port)"))?
+        .trim()
+        .to_string();
+    if bind.is_empty() {
+        return Err(anyhow!("BASIN_RAFT_BIND must not be empty"));
+    }
+
+    let peers_raw = std::env::var("BASIN_RAFT_PEERS").map_err(|_| {
+        anyhow!("BASIN_WAL_MODE=raft requires BASIN_RAFT_PEERS (id@host:port,...)")
+    })?;
+    let mut peers = Vec::new();
+    for entry in peers_raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (id_str, addr) = entry.split_once('@').ok_or_else(|| {
+            anyhow!("bad BASIN_RAFT_PEERS entry {entry:?} (want id@host:port)")
+        })?;
+        let id: u64 = id_str
+            .trim()
+            .parse()
+            .with_context(|| format!("bad peer id in BASIN_RAFT_PEERS entry {entry:?}"))?;
+        let addr = addr.trim().to_string();
+        if id == 0 || addr.is_empty() {
+            return Err(anyhow!("bad BASIN_RAFT_PEERS entry {entry:?}"));
+        }
+        peers.push(RaftPeer { id, addr });
+    }
+    if peers.is_empty() {
+        return Err(anyhow!("BASIN_RAFT_PEERS must list at least this node"));
+    }
+    // This node's id must appear in the peer set, and its advertised address
+    // must match BASIN_RAFT_BIND so the cluster's membership view is coherent.
+    match peers.iter().find(|p| p.id == node_id) {
+        None => {
+            return Err(anyhow!(
+                "BASIN_NODE_ID={node_id} is not present in BASIN_RAFT_PEERS"
+            ));
+        }
+        Some(self_peer) if self_peer.addr != bind => {
+            return Err(anyhow!(
+                "BASIN_NODE_ID={node_id}'s address in BASIN_RAFT_PEERS ({}) \
+                 does not match BASIN_RAFT_BIND ({bind})",
+                self_peer.addr
+            ));
+        }
+        Some(_) => {}
+    }
+    // Reject duplicate ids — a typo'd peer list must not silently collapse two
+    // logical nodes into one.
+    let mut seen = std::collections::HashSet::new();
+    for p in &peers {
+        if !seen.insert(p.id) {
+            return Err(anyhow!("duplicate node id {} in BASIN_RAFT_PEERS", p.id));
+        }
+    }
+
+    let bootstrap = bool_env("BASIN_RAFT_BOOTSTRAP");
+
+    Ok(RaftCfg {
+        node_id,
+        bind,
+        peers,
+        bootstrap,
+    })
 }
 
 fn bool_env(name: &str) -> bool {
