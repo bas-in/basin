@@ -341,18 +341,30 @@ pub(crate) async fn list_data_files_with_stats(
             .map(|i| {
                 let store = store.clone();
                 let path = files[i].path.clone();
+                // Size from the LIST result — no HEAD; feeds the tail reader so
+                // it skips the implicit `size()` round-trip too.
+                let listed_size = files[i].size_bytes;
                 async move {
-                    let bytes = match store.get(&path).await {
-                        Ok(obj) => obj.bytes().await.ok(),
-                        Err(_) => None,
-                    };
-                    // One footer open returns BOTH row_count and stats.
-                    let (rc, stats) = match bytes {
-                        Some(b) => match crate::vortex_format::footer_meta(b).await {
-                            Ok((n, s)) => (Some(n), s),
-                            Err(_) => (None, BTreeMap::new()),
-                        },
-                        None => (None, BTreeMap::new()),
+                    // LEVER 2: read the Vortex footer/stats via TAIL RANGE GETs
+                    // rather than a full-file GET. Vortex footers live at the
+                    // tail (postscript + EOF + layout/dtype/file-statistics
+                    // segments), so `footer_meta_from_store` opens the file over
+                    // an object-store-backed `VortexReadAt` that fetches only
+                    // ~64 KiB from the end plus the small bounded footer
+                    // segments — never the data. Same `(row_count, stats)` byte
+                    // contract as the old full-file `footer_meta`; the
+                    // Vortex⇆Parquet differential harness gates correctness.
+                    // Best-effort: any error leaves the listing defaults, no
+                    // worse than the previous full-GET path.
+                    let (rc, stats) = match crate::vortex_format::footer_meta_from_store(
+                        store,
+                        &path,
+                        listed_size,
+                    )
+                    .await
+                    {
+                        Ok((n, s)) => (Some(n), s),
+                        Err(_) => (None, BTreeMap::new()),
                     };
                     (i, rc, stats)
                 }
@@ -5406,5 +5418,183 @@ mod tests {
             Some(v) => std::env::set_var(key, v),
             None => std::env::remove_var(key),
         }
+    }
+
+    /// LEVER 2 cold-stats test: a recording store that captures the `range`
+    /// of every `get_opts`, so we can prove the Vortex footer/stats path reads
+    /// only the TAIL (bounded/suffix ranges) and never the whole file.
+    #[derive(Debug)]
+    struct RecordingStore {
+        inner: Arc<dyn ObjectStore>,
+        // (was_ranged, bytes_fetched) per GET.
+        gets: std::sync::Mutex<Vec<(bool, u64)>>,
+    }
+
+    impl std::fmt::Display for RecordingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RecordingStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for RecordingStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: object_store::PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            let was_ranged = options.range.is_some();
+            let res = self.inner.get_opts(location, options).await?;
+            let n = (res.range.end - res.range.start) as u64;
+            self.gets.lock().unwrap().push((was_ranged, n));
+            Ok(res)
+        }
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.inner.delete_stream(locations)
+        }
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// The Vortex cold-stats path (`list_data_files_with_stats`) must read the
+    /// footer via TAIL range GETs, never a whole-file GET. We write a Vortex
+    /// file big enough that a full-file fetch would be unmistakable, list it
+    /// through a recording store, and assert: (a) at least one GET happened
+    /// (cold — nothing cached), (b) NO unranged (full-file) GET was issued,
+    /// and (c) the total bytes fetched are far below the file size.
+    #[tokio::test]
+    async fn vortex_cold_stats_reads_tail_not_full_file() {
+        let inner = Arc::new(InMemory::new());
+        // First, write the Vortex file through a plain store so the WRITE PUTs
+        // don't pollute the GET recording.
+        let writer_storage = Storage::new(StorageConfig {
+            object_store: inner.clone(),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let project = ProjectId::new();
+        let table = TableName::new("events").unwrap();
+        let part = PartitionKey::default_key();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        // ~40k rows with a HIGH-ENTROPY payload → a multi-hundred-KiB Vortex
+        // stripe whose data dwarfs the ~64 KiB tail footer read. The payload is
+        // a per-row pseudo-random hex blob so Vortex's encoders cannot collapse
+        // it (a low-entropy payload compresses below the 256 KiB floor the
+        // assertion below relies on).
+        let ids: Int64Array = (0..40_000i64).collect();
+        let pays = StringArray::from(
+            (0..40_000u64)
+                .map(|i| {
+                    // splitmix64-style scramble → 64 distinct hex chars/row.
+                    let mut s = String::with_capacity(64);
+                    let mut z = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    for _ in 0..4 {
+                        z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                        let mut x = z;
+                        x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                        x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                        x ^= x >> 31;
+                        s.push_str(&format!("{x:016x}"));
+                    }
+                    Some(s)
+                })
+                .collect::<Vec<_>>(),
+        );
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(pays)]).unwrap();
+        let written = writer_storage
+            .write_batch(&project, &table, &part, &batch)
+            .await
+            .unwrap();
+        assert!(
+            written.path.as_ref().ends_with(".vortex"),
+            "default write must be Vortex for this lever to apply"
+        );
+        let file_size = written.size_bytes;
+        assert!(
+            file_size > 256 * 1024,
+            "test file ({file_size} B) must be much larger than the ~64 KiB tail \
+             footer read for the assertion to be meaningful"
+        );
+
+        // Now drive a COLD listing through the recording store (fresh Storage
+        // so the stats cache is empty).
+        let recording = Arc::new(RecordingStore {
+            inner: inner.clone(),
+            gets: std::sync::Mutex::new(Vec::new()),
+        });
+        let storage = Storage::new(StorageConfig {
+            object_store: recording.clone(),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+
+        let files = list_data_files_with_stats(&storage, &project, &table)
+            .await
+            .expect("cold listing must succeed");
+        assert_eq!(files.len(), 1, "exactly one data file");
+        // Stats must actually be populated (proves the tail read parsed the
+        // footer, not just that it skipped the fetch).
+        assert!(files[0].row_count > 0, "row_count from footer");
+        assert!(
+            files[0].column_stats.contains_key("id"),
+            "id column stats decoded from the tail footer"
+        );
+
+        let gets = recording.gets.lock().unwrap().clone();
+        assert!(!gets.is_empty(), "cold path must issue at least one GET");
+        // (b) No full-file GET: every GET must be ranged.
+        assert!(
+            gets.iter().all(|(ranged, _)| *ranged),
+            "Vortex cold-stats path issued an UNRANGED full-file GET: {gets:?}"
+        );
+        // (c) Total tail bytes far below the file size (no full-file read).
+        let total: u64 = gets.iter().map(|(_, n)| *n).sum();
+        assert!(
+            total < file_size,
+            "tail reads ({total} B) must be smaller than the file ({file_size} B)"
+        );
     }
 }
