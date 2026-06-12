@@ -46,6 +46,18 @@
 #   BASIN_EXT_BENCH_TS_SAMPLES
 #   BASIN_EXT_BENCH_JSONB_SAMPLES
 #
+# ## Store selection (S3 / SeaweedFS mode)
+#
+# Set STORE=seaweedfs to run all cards against the local SeaweedFS-backed
+# object store (reads config from .basin-test.seaweedfs.toml) and route
+# artifacts to benchmark/data_seaweedfs/. Requires SeaweedFS to be running
+# on 127.0.0.1:8333.
+#
+#   STORE=seaweedfs ./benchmark/run/extensions-suite.sh
+#
+# The STORE variable maps to BASIN_BENCH_STORE which the test harness reads.
+# Default (STORE unset) is byte-identical to the original local-FS behaviour.
+#
 #   ./benchmark/run/extensions-suite.sh
 #
 # Tiny-N harness smoke (fast; verifies the cards + artifacts without the full
@@ -58,12 +70,34 @@ set -uo pipefail
 RUN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH_DIR="$(cd "${RUN_DIR}/.." && pwd)"
 REPO_ROOT="$(cd "${BENCH_DIR}/.." && pwd)"
-DATA_DIR="${BENCH_DIR}/data"
+
+# ── store selection ───────────────────────────────────────────────────────────
+# STORE=seaweedfs → BASIN_BENCH_STORE=s3 + artifacts go to benchmark/data_seaweedfs/
+# Default (unset) → BASIN_BENCH_STORE=local (byte-identical original behaviour)
+STORE="${STORE:-local}"
+if [[ "${STORE}" == "seaweedfs" ]]; then
+  export BASIN_BENCH_STORE=s3
+  export BASIN_TEST_CONFIG="${BASIN_TEST_CONFIG:-${REPO_ROOT}/.basin-test.seaweedfs.toml}"
+  DATA_DIR="${BENCH_DIR}/data_seaweedfs"
+else
+  export BASIN_BENCH_STORE=local
+  DATA_DIR="${BENCH_DIR}/data"
+fi
 
 DATE_TAG="$(date +%Y%m%d_%H%M%S)"
 LOG="/tmp/basin_ext_bench_${DATE_TAG}.log"
 
 log() { printf '[ext-suite] %s\n' "$*" | tee -a "${LOG}" >&2; }
+
+# ── preflight: SeaweedFS must be reachable (S3/seaweedfs mode only) ───────────
+if [[ "${STORE}" == "seaweedfs" ]]; then
+  if ! nc -z 127.0.0.1 8333 2>/dev/null; then
+    log "REFUSING to start: STORE=seaweedfs but SeaweedFS is not reachable on 127.0.0.1:8333"
+    log "Start SeaweedFS first:  weed server -s3 -ip=127.0.0.1 -dir=./.basin-seaweedfs-data -s3.port=8333 ..."
+    exit 2
+  fi
+  log "SeaweedFS reachable on 127.0.0.1:8333 — using BASIN_BENCH_STORE=s3"
+fi
 
 # ── preflight: box must be idle ───────────────────────────────────────────────
 # One cargo at a time on this box; timing cards are meaningless under CPU
@@ -98,6 +132,8 @@ fi
   echo "host      : $(hostname)"
   echo "commit    : $(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
   echo "dirty     : $([[ -n "${dirty}" ]] && echo "YES (ALLOW_DIRTY=1)" || echo no)"
+  echo "store     : ${STORE} (BASIN_BENCH_STORE=${BASIN_BENCH_STORE})"
+  echo "artifacts : ${DATA_DIR}/"
   echo "log       : ${LOG}"
   echo "========================================================"
 } | tee -a "${LOG}" >&2

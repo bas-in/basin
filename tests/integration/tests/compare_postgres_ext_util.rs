@@ -3,7 +3,9 @@
 //! Loaded via `#[path = "compare_postgres_ext_util.rs"] mod ext_util;` from
 //! each ext card. Provides the env-knob reader, the wall-clock stamp, and the
 //! atomic read-modify-write merge into the single shared artifact
-//! `benchmark/data/compare_postgres_ext.json`.
+//! `benchmark/data/compare_postgres_ext.json` (or
+//! `benchmark/data_seaweedfs/compare_postgres_ext.json` when
+//! `BASIN_BENCH_STORE=s3`).
 //!
 //! Why a merge (RMW) and not three separate files? The three ext cards
 //! (`scalar`, `structural`, `dml`) are facets of one logical "extended
@@ -14,10 +16,16 @@
 //! serializes on a single `target/` and these are `#[ignore]`d, idle-box
 //! cards). The write is atomic (`write tmp` + `rename`) per the artifact
 //! convention used by `shape_sweeps.rs`.
+//!
+//! ## Store parameterization
+//! Set `BASIN_BENCH_STORE=s3` before running the suite (via `extensions-suite.sh
+//! STORE=seaweedfs`) to route both the Basin engine and the artifact file to the
+//! S3-backed (SeaweedFS) path. Default (`local`) is byte-identical to the
+//! pre-parameterization behaviour.
 
 #![allow(dead_code, clippy::print_stderr)]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn env_usize(key: &str, default: usize) -> usize {
@@ -35,13 +43,9 @@ pub fn now_secs() -> u64 {
 }
 
 fn artifact_path() -> PathBuf {
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let dir = manifest
-        .parent()
-        .and_then(Path::parent)
-        .map(|p| p.join("benchmark/data"))
-        .unwrap_or_else(|| PathBuf::from("benchmark/data"));
-    let _ = std::fs::create_dir_all(&dir);
+    // Use the env-driven artifact dir so BASIN_BENCH_STORE=s3 routes artifacts
+    // to benchmark/data_seaweedfs/ while the default is benchmark/data/.
+    let dir = basin_integration_tests::ext_store_select::ext_artifact_dir();
     dir.join("compare_postgres_ext.json")
 }
 

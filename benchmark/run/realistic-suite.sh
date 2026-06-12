@@ -2,7 +2,21 @@
 # benchmark/run/realistic-suite.sh
 #
 # Realistic-conditions benchmark suite — runs the ten new PG-comparison cards
-# in order, SOLO (one cargo at a time, per repo cargo discipline):
+# in order, SOLO (one cargo at a time, per repo cargo discipline).
+#
+# ## Store selection (S3 / SeaweedFS mode) — compare_postgres_ext_* cards only
+#
+# The `compare_postgres_ext_*` cards (ext_scalar, ext_structural, ext_dml) support
+# BASIN_BENCH_STORE=s3 to build the Basin engine over SeaweedFS and route artifacts
+# to benchmark/data_seaweedfs/. Set the env var before invoking:
+#
+#   BASIN_BENCH_STORE=s3 \
+#   BASIN_TEST_CONFIG=./.basin-test.seaweedfs.toml \
+#     ./benchmark/run/realistic-suite.sh
+#
+# Check SeaweedFS is up first:  nc -z 127.0.0.1 8333
+# The remaining cards (soak, interference, shape_sweeps, fts) are LocalFS-only
+# and ignore BASIN_BENCH_STORE.
 #
 #   realistic_conditions:
 #     1. soak_latency_stability        (2+ min sustained mixed RW)
