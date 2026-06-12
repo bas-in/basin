@@ -8,6 +8,47 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-13 — Change events from hot-tier UPDATE/DELETE fast paths (CDC/realtime)
+
+### Fixed
+
+- **Hot-tier UPDATE/DELETE fast paths now dispatch change events.** The
+  point-mutation fast paths (`hot_tier_update_by_pk`, `hot_tier_delete_by_pk`)
+  and in-transaction hot mutations drained at COMMIT never dispatched
+  post-commit change events, so the realtime websocket and the CDC ring were
+  blind to hot-tier UPDATE/DELETE — only INSERT and cold copy-on-write
+  UPDATE/DELETE fired. Now every committed hot-tier mutation reaches the
+  post-commit sinks: UPDATE (single-table fast path AND `UPDATE … FROM`) emits
+  before/after through the shared overlay-write seam; DELETE captures
+  before-images before the tombstone write. In-transaction mutations buffer
+  per-tx and dispatch in commit order at COMMIT, with ROLLBACK discarding the
+  buffer. All capture is gated on a post-commit CDC/realtime sink being
+  attached (the always-on pre-commit reactor sink does not trigger it), so the
+  zero-CDC-sink OLTP hot path reads no extra rows, projects no extra
+  `UPDATE … FROM` join columns, and consumes no event sequence numbers — the
+  1M-row UPDATE benchmarks are unaffected.
+
+## 2026-06-13 — UPDATE … FROM is set-oriented (kill per-row quadratic)
+
+### Changed
+
+- **`UPDATE … FROM` is now set-oriented and scale-invariant in target table
+  size.** It previously ran the join SELECT once, then issued a full
+  `UPDATE … WHERE pk = X` SQL statement per matched row — each inner statement
+  re-read the matched row's pre-image and bumped the hot epoch, forcing a
+  provider-cache rebuild over every live file (an O(M·F) blow-up: ~150s at 10k
+  rows, ~51min at 1M). Now ONE join projects every matched target row's full
+  post-image (each SET column as its RHS expression evaluated against the
+  joined pre-image, every other column carried unchanged), keyed by the target
+  PK; matched `(key, post-image)` pairs are deduped by PK (last-occurrence-wins,
+  preserving the old loop's multi-match behaviour) and written in ONE batched
+  overlay write. On memtable-budget decline the post-images drain to cold in
+  budget-bounded chunks through the existing narrowed-merge + index-maintenance
+  path — never a per-row loop. A new scale-invariance gate
+  (`update_from_scaling_gate`) pins a fixed 200-row `UPDATE … FROM` /
+  `DELETE … USING` over a GIN-indexed table at 10k and 100k rows to
+  `t(100k)/t(10k) ≤ 3`.
+
 ## 2026-06-12 — Per-project pgwire connection ceiling (#28b)
 
 ### Added

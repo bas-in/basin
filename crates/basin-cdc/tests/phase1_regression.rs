@@ -59,21 +59,10 @@ async fn drain_ring(writer: &CdcRingWriter, project: &ProjectId, want: usize) ->
 
 /// Test 1 (cdc-design.md §4): hot-tier UPDATE emits a CDC event with the
 /// correct before/after images. Single-column int PK + single-PK-equality
-/// WHERE → takes `hot_tier_update_by_pk`.
-///
-/// PENDING ENGINE WIRING (deferred-to-merge): the ADR assumed
-/// `dispatch_post_commit` already fires on the hot-tier UPDATE fast path
-/// (`hot_tier_update_by_pk`), but the current engine returns from that path
-/// (crates/basin-engine/src/dml_mutate.rs ~line 3097) WITHOUT building or
-/// dispatching change events — only the cold copy-on-write UPDATE path and the
-/// INSERT paths dispatch. CDC capture of the hot-tier fast path requires an
-/// engine-side change (build before/after `ChangeEvent`s from the `current` +
-/// post-image rows already materialised in `hot_tier_update_by_pk`, gated on
-/// `registry_has_any`). That change is owned by the engine lane and is out of
-/// scope for the REST/SDK/tooling apply lane. Un-ignore once the engine
-/// dispatches on the fast path. Verified empirically: the INSERT event IS
-/// captured here; the UPDATE event is not.
-#[ignore = "pending engine wiring: hot-tier UPDATE fast path does not dispatch_post_commit (engine lane, deferred-to-merge)"]
+/// WHERE → takes `hot_tier_update_by_pk`, which now builds before/after
+/// `ChangeEvent`s from the pre-image (`current`) + post-image rows and
+/// `dispatch_post_commit`s them after the overlay write (gated on
+/// `registry_has_any` so the zero-sink hot path stays allocation-free).
 #[tokio::test]
 async fn hot_tier_update_captured() {
     let dir = TempDir::new().unwrap();
@@ -95,13 +84,9 @@ async fn hot_tier_update_captured() {
 }
 
 /// Test 2: hot-tier DELETE emits a CDC event carrying the before image and a
-/// null after. → `hot_tier_delete_by_pk`.
-///
-/// PENDING ENGINE WIRING (deferred-to-merge): same root cause as
-/// `hot_tier_update_captured` — `hot_tier_delete_by_pk`
-/// (crates/basin-engine/src/dml_mutate.rs ~line 850) does not dispatch
-/// post-commit change events. Engine-lane change; un-ignore once wired.
-#[ignore = "pending engine wiring: hot-tier DELETE fast path does not dispatch_post_commit (engine lane, deferred-to-merge)"]
+/// null after. → `hot_tier_delete_by_pk`. The fast path now reads each matched
+/// PK's pre-image (lazily, only when a sink is attached) before writing the
+/// tombstone and `dispatch_post_commit`s a DELETE event (`after = None`).
 #[tokio::test]
 async fn hot_tier_delete_captured() {
     let dir = TempDir::new().unwrap();
@@ -125,14 +110,12 @@ async fn hot_tier_delete_captured() {
 /// Test 3: hot-tier UPDATE inside an explicit transaction is captured as one
 /// tx group in seq order, committed-only — and ROLLBACK emits nothing.
 ///
-/// PENDING ENGINE WIRING (deferred-to-merge): in-transaction hot-tier UPDATEs
-/// write to `TxState::tx_overlay` and are drained into the shared memtable at
-/// COMMIT (crates/basin-engine/src/session.rs). Neither the fast-path write nor
-/// the COMMIT drain currently builds/dispatches CDC change events, so the two
-/// committed updates are not captured. Capturing them needs the engine to emit
-/// before/after events at COMMIT when the overlay drains (with seq ordering and
-/// rollback semantics). Engine-lane change; un-ignore once wired.
-#[ignore = "pending engine wiring: in-tx hot-tier UPDATE commit path does not dispatch_post_commit (engine lane, deferred-to-merge)"]
+/// In-transaction hot-tier UPDATEs write to `TxState::tx_overlay` and buffer a
+/// `TxChangeEvent` (no seq yet) in `TxState::tx_change_events`. The executor's
+/// COMMIT drain assigns each a commit-ordered `(project, table)` seq and
+/// `dispatch_post_commit`s them AFTER the overlay drains into the shared
+/// memtable; ROLLBACK drops the buffer, so the rolled-back v=999 update never
+/// reaches the ring.
 #[tokio::test]
 async fn in_tx_multi_statement_committed_in_order_and_rollback_emits_nothing() {
     let dir = TempDir::new().unwrap();
