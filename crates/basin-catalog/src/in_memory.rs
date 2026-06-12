@@ -202,6 +202,12 @@ pub struct InMemoryCatalog {
     /// Cleared in `drop_namespace`. Implements `set_project_metadata` /
     /// `get_project_metadata` on the `Catalog` trait (T-048).
     project_metadata: Mutex<HashMap<ProjectId, ProjectMetadata>>,
+    /// Per-`(project, partition)` compaction watermark — the highest WAL LSN
+    /// whose tail batch has been compacted into a catalog-committed cold file.
+    /// Mirrors the Postgres `compaction_watermarks` table. Monotonic: writes
+    /// take `max(existing, new)`. Read by shard cold-start replay to skip
+    /// already-committed entries (the commit→truncate crash-window dedup).
+    compaction_watermarks: Mutex<HashMap<(ProjectId, String), u64>>,
 }
 
 /// In-memory lease row. Mirrors the `partition_leases` Postgres table.
@@ -261,6 +267,7 @@ impl InMemoryCatalog {
             inbound_webhooks: Mutex::new(HashMap::new()),
             leases: Mutex::new(HashMap::new()),
             project_metadata: Mutex::new(HashMap::new()),
+            compaction_watermarks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1434,6 +1441,34 @@ impl Catalog for InMemoryCatalog {
     async fn get_project_metadata(&self, project: &ProjectId) -> Result<ProjectMetadata> {
         let map = self.project_metadata.lock().await;
         Ok(map.get(project).cloned().unwrap_or_default())
+    }
+
+    #[instrument(skip(self), fields(project = %project, partition = %partition_id))]
+    async fn set_compaction_watermark(
+        &self,
+        project: &ProjectId,
+        partition_id: &str,
+        watermark_lsn: u64,
+    ) -> Result<()> {
+        // Note: deliberately does NOT bump_epoch — the watermark is shard
+        // recovery state, not table metadata the session caches key on.
+        let mut map = self.compaction_watermarks.lock().await;
+        let slot = map.entry((*project, partition_id.to_string())).or_insert(0);
+        // Monotonic: never rewind the replay floor.
+        if watermark_lsn > *slot {
+            *slot = watermark_lsn;
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(project = %project, partition = %partition_id))]
+    async fn get_compaction_watermark(
+        &self,
+        project: &ProjectId,
+        partition_id: &str,
+    ) -> Result<Option<u64>> {
+        let map = self.compaction_watermarks.lock().await;
+        Ok(map.get(&(*project, partition_id.to_string())).copied())
     }
 
     async fn register_view(&self, def: ViewDef, or_replace: bool) -> Result<()> {

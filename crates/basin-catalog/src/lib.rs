@@ -329,6 +329,63 @@ pub trait Catalog: Send + Sync {
         Ok(ProjectMetadata::default())
     }
 
+    /// Persist the per-`(project, partition)` compaction watermark: the highest
+    /// WAL LSN whose tail batch has been compacted into a catalog-committed
+    /// Parquet/Vortex file. The shard compactor advances this right after the
+    /// file commit lands and *before* it truncates the WAL, so a crash in the
+    /// commit→truncate window leaves the watermark recording exactly what was
+    /// already made durable.
+    ///
+    /// ## Durability bug this fixes
+    ///
+    /// `compact_one` commits the cold file, then truncates the WAL. A crash
+    /// *between* those two steps leaves the WAL entries intact, so cold-start
+    /// replay re-appends them to the tail and the next compaction commits a
+    /// **second** Parquet file for the same rows — duplicating every row in the
+    /// cold tier and over-counting on read. Persisting the watermark and
+    /// replaying only entries strictly above it makes replay-after-crash skip
+    /// the already-committed batch.
+    ///
+    /// Monotonicity: implementations must never lower a stored watermark (use a
+    /// `GREATEST(existing, new)` upsert), so an out-of-order or retried call
+    /// cannot rewind the replay floor.
+    ///
+    /// ## Default implementation
+    ///
+    /// Returns `Ok(())` (a durable no-op). Backends that do not persist a
+    /// watermark fall back to the legacy "replay from `Lsn::ZERO`" behavior,
+    /// which is correct for in-process / ephemeral catalogs where a process
+    /// restart also loses the WAL tail (no durable WAL ⇒ no replay ⇒ no
+    /// duplication). Production durable backends (Postgres) override this.
+    async fn set_compaction_watermark(
+        &self,
+        project: &ProjectId,
+        partition_id: &str,
+        watermark_lsn: u64,
+    ) -> Result<()> {
+        let _ = (project, partition_id, watermark_lsn);
+        Ok(())
+    }
+
+    /// Read the persisted compaction watermark for `(project, partition)`.
+    /// Returns `None` when no watermark has ever been recorded — which a
+    /// **legacy catalog** (one written before this column/table existed) is
+    /// indistinguishable from. The caller MUST treat `None` as "replay from
+    /// `Lsn::ZERO`" so legacy catalogs keep working unchanged.
+    ///
+    /// ## Default implementation
+    ///
+    /// Returns `Ok(None)` so non-overriding backends always take the legacy
+    /// replay-from-zero path.
+    async fn get_compaction_watermark(
+        &self,
+        project: &ProjectId,
+        partition_id: &str,
+    ) -> Result<Option<u64>> {
+        let _ = (project, partition_id);
+        Ok(None)
+    }
+
     /// Atomic commit: append `files` to the table, producing a new snapshot.
     ///
     /// Optimistic concurrency: the caller passes the snapshot id it last saw.

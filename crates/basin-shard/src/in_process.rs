@@ -65,10 +65,16 @@ pub(crate) struct PartitionState {
     #[allow(dead_code)]
     partition: PartitionKey,
     last_active: Instant,
-    /// Highest LSN that has been compacted into Parquet for this partition.
-    /// `Lsn::ZERO` until the first successful compaction. v0.1 always replays
-    /// from `Lsn::ZERO` on cold start (no compaction marker on disk yet —
-    /// truncation in the WAL prevents replay duplication in practice).
+    /// Highest LSN that has been compacted into Parquet/Vortex for this
+    /// partition. `Lsn::ZERO` until the first successful compaction.
+    ///
+    /// On cold start this is seeded from the durable compaction watermark
+    /// (`Catalog::get_compaction_watermark`), and `compact_one` persists the
+    /// watermark to the catalog BEFORE truncating the WAL. Replay then starts
+    /// strictly above the watermark, so a crash in the catalog-commit→WAL-
+    /// truncate window cannot re-replay an already-committed batch into a
+    /// duplicate cold file. A legacy catalog without a watermark replays from
+    /// `Lsn::ZERO` (the prior behavior) — see `replay_wal_into`.
     last_compacted_lsn: Lsn,
     /// Schemas cached from the catalog the first time we touch a table.
     schemas: HashMap<TableName, Arc<Schema>>,
@@ -712,7 +718,7 @@ impl InProcessShard {
         // exposing it to the map; that way concurrent callers either see the
         // empty slot (and replay themselves) or see a fully replayed state.
         let mut state = PartitionState::new(*project, partition.clone());
-        replay_wal_into(&self.cfg.wal, project, partition, &mut state).await?;
+        replay_wal_into(&self.cfg.wal, &self.cfg.catalog, project, partition, &mut state).await?;
 
         let arc = Arc::new(RwLock::new(state));
         let mut map = self.partitions.lock().await;
@@ -1754,12 +1760,59 @@ impl InProcessShard {
             }
         }
 
-        // Truncate the WAL after the catalog commit. Order matters: if we
-        // truncated first and then crashed before the commit lands, the data
-        // would be lost; this way the worst case is a duplicate Parquet file
-        // with a small replayed batch, which is reconciled on next compaction.
+        // DURABILITY (compaction watermark — duplicate-row crash-window fix).
+        //
+        // The data files are committed to the catalog (above, per table). The
+        // WAL still holds the entries we just compacted; we are about to
+        // truncate them. A crash *between* the catalog commit and the WAL
+        // truncate leaves those entries in the WAL, so cold-start replay would
+        // re-append them to the tail and the next compaction would commit a
+        // SECOND Parquet/Vortex file for the same rows — duplicating every row.
+        //
+        // Persisting the compacted-through LSN to the catalog (the durable
+        // commit point) closes that window: cold-start replay reads it via
+        // `get_compaction_watermark` and replays only entries strictly above
+        // it (see `replay_wal_into`). The watermark write happens BEFORE the
+        // truncate and is monotonic (GREATEST upsert), so:
+        //   * crash after watermark, before truncate  → replay skips the batch
+        //     (watermark covers it); WAL still holds it but it's filtered out.
+        //   * crash after truncate                    → entries are already gone
+        //     from the WAL; the watermark merely confirms the floor.
+        // Either way no duplicate file is produced.
+        //
+        // Best-effort vs. fatal: a watermark write failure is NOT fatal to the
+        // compaction (the data is already durably committed). We log and skip
+        // the truncate so the next compaction tick re-attempts both the
+        // watermark and the truncate — preferring a replayable WAL (at worst a
+        // retried, idempotent watermark) over truncating without a recorded
+        // floor. Backends that don't persist a watermark (in-memory / REST) use
+        // the trait's `Ok(())` default and keep the legacy replay-from-zero
+        // behavior — correct because their catalog+WAL are lost together.
         if let Some(max_lsn) = max_lsn_overall {
-            self.cfg.wal.truncate(project, partition, max_lsn).await?;
+            match self
+                .cfg
+                .catalog
+                .set_compaction_watermark(project, partition.as_str(), max_lsn.0)
+                .await
+            {
+                Ok(()) => {
+                    // Truncate only after the watermark is durable, so the
+                    // commit→truncate window is always covered by a recorded
+                    // floor.
+                    self.cfg.wal.truncate(project, partition, max_lsn).await?;
+                }
+                Err(e) => {
+                    warn!(
+                        %project,
+                        %partition,
+                        max_lsn = max_lsn.0,
+                        error = %e,
+                        "compaction watermark persist failed; skipping WAL truncate \
+                         so the next tick retries (replay stays duplicate-safe via \
+                         the watermark floor)",
+                    );
+                }
+            }
         }
 
         let mut stats = self.stats.lock().await;
@@ -3030,13 +3083,52 @@ fn decode_payload(bytes: &[u8]) -> Result<(TableName, Vec<RecordBatch>)> {
 
 async fn replay_wal_into(
     wal: &Arc<dyn basin_wal::Wal>,
+    catalog: &Arc<dyn basin_catalog::Catalog>,
     project: &ProjectId,
     partition: &PartitionKey,
     state: &mut PartitionState,
 ) -> Result<()> {
-    // v0.1: always replay from `Lsn::ZERO`. Once we persist a compaction
-    // marker we'll skip already-flushed entries.
-    let entries = wal.read_from(project, partition, Lsn::ZERO).await?;
+    // DURABILITY (compaction watermark — duplicate-row crash-window fix):
+    // replay only WAL entries strictly ABOVE the persisted compaction
+    // watermark. `compact_one` records the watermark BEFORE truncating the
+    // WAL, so if a crash left already-committed entries in the WAL (commit
+    // landed, truncate didn't), they sit at or below the watermark and are
+    // skipped here — preventing the next compaction from committing a
+    // duplicate file for rows already in the cold tier.
+    //
+    // Legacy-catalog tolerance: a catalog written before the watermark
+    // table/column existed (or any backend that doesn't persist one — the
+    // in-memory / REST default returns `None`) yields `None` here, and we fall
+    // back to the prior `Lsn::ZERO` behavior. That is correct for those
+    // backends because their catalog and WAL are durable-or-lost together (an
+    // ephemeral catalog cannot outlive a WAL it would re-replay against).
+    let floor = match catalog
+        .get_compaction_watermark(project, partition.as_str())
+        .await
+    {
+        Ok(Some(lsn)) => Lsn(lsn),
+        Ok(None) => Lsn::ZERO,
+        Err(e) => {
+            // A watermark read failure must not silently widen the replay floor
+            // (that would re-introduce the duplicate); but it also must not
+            // strand recovery. Fall back to ZERO (the legacy behavior) and warn
+            // — at worst we re-create the historical duplicate-file exposure for
+            // this one cold-start, which is strictly no worse than pre-fix.
+            warn!(
+                %project,
+                %partition,
+                error = %e,
+                "compaction watermark read failed; replaying from Lsn::ZERO (legacy fallback)",
+            );
+            Lsn::ZERO
+        }
+    };
+    // Seed the in-memory marker so the first post-restart compaction's
+    // `last_compacted_lsn` bookkeeping starts from the durable floor.
+    if state.last_compacted_lsn < floor {
+        state.last_compacted_lsn = floor;
+    }
+    let entries = wal.read_from(project, partition, floor).await?;
     for entry in entries {
         let (table, batches) = decode_payload(&entry.payload)?;
         let table_tail = state.tail.entry(table.clone()).or_default();
