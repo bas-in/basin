@@ -1519,6 +1519,7 @@ mod point_join;
 mod hot_tombstone;
 mod tombstone_cold_scan;
 mod fts_udf;
+mod gapfill;
 mod gin_rowgroup_scan;
 mod jsonb_posting_scan;
 mod rtree_rowgroup_scan;
