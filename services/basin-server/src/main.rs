@@ -681,9 +681,37 @@ async fn main() -> Result<()> {
 
     let router_result = router.join.await.map_err(|e| anyhow!("router join: {e}"))?;
 
-    if let Some((_, bg, wal)) = shard_handles.take() {
+    if let Some((shard, bg, wal)) = shard_handles.take() {
         tracing::info!("draining shard background loops");
         bg.shutdown().await;
+
+        // DURABILITY (graceful-shutdown drain): before we close the WAL, force
+        // every durability path that is NOT covered by the WAL to land.
+        //
+        // 1. Hot-tier UPDATE/DELETE overlay (the auto-commit point fast paths)
+        //    is registry-only — it is never WAL-logged — so a graceful restart
+        //    would otherwise lose the last reconcile-window of acked point
+        //    mutations. `drain_overlays_for_shutdown` materializes every
+        //    pending overlay into cold Parquet + commits the catalog. (A
+        //    non-graceful crash window remains; see the method's doc-comment.)
+        //
+        // 2. The shard's in-memory INSERT tail IS covered by the WAL, but
+        //    draining it here too means a graceful restart starts from a clean,
+        //    fully-compacted state (the catalog commit is durable; the WAL is
+        //    then truncated through the drained LSN by `flush_to_parquet`).
+        //
+        // Order matters: overlays first (they read the cold base the tail flush
+        // is about to extend; a foreground reconcile would otherwise have to
+        // re-run), then the tail flush, then `wal.close()`.
+        tracing::info!("draining hot-tier overlays to durable storage");
+        if let Err(e) = engine.drain_overlays_for_shutdown().await {
+            tracing::warn!(error = %e, "shutdown overlay drain failed");
+        }
+        tracing::info!("flushing shard tail to Parquet");
+        if let Err(e) = shard.flush_to_parquet().await {
+            tracing::warn!(error = %e, "shutdown shard tail flush failed");
+        }
+
         tracing::info!("closing WAL");
         if let Err(e) = wal.close().await {
             tracing::warn!(error = %e, "WAL close failed");
@@ -838,6 +866,20 @@ fn bool_env(name: &str) -> bool {
     )
 }
 
+/// Like [`bool_env`] but defaults to `true` when the var is unset/empty. Used
+/// for durability knobs whose safe default is ON (e.g. `BASIN_DATA_FSYNC`):
+/// an explicit `0` / `false` / `off` opts out; anything else (including unset)
+/// stays on.
+fn bool_env_default_on(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    }
+}
+
 /// Loads TLS config from env. Priority:
 ///   1. `BASIN_TLS_CERT_PEM` + `BASIN_TLS_KEY_PEM`  — raw PEM content in env vars (Fly secrets)
 ///   2. `BASIN_TLS_CERT_PATH` + `BASIN_TLS_KEY_PATH` — file paths (original behaviour)
@@ -919,13 +961,28 @@ fn build_storage_object_store(cfg: &Cfg) -> Result<Arc<dyn ObjectStore>> {
         "local" => {
             let fs = LocalFileSystem::new_with_prefix(&cfg.data_dir)
                 .with_context(|| format!("LocalFileSystem at {}", cfg.data_dir.display()))?;
+            // DURABILITY (data-store fsync): `LocalFileSystem`'s PUT is
+            // write-temp + rename with NO fsync, so a power loss can vanish a
+            // data file the fsync-durable catalog already references — after
+            // the covering WAL was truncated. `FsyncOnPutAll` fsyncs every PUT
+            // and every multipart completion (the WAL-only `FsyncOnPut` would
+            // be a no-op here: the data writer never sets the `DurablePut`
+            // marker it gates on). Default ON — durability is the default
+            // story; data flushes are background work so the fsync barrier is
+            // off the request latency path. Opt out with `BASIN_DATA_FSYNC=0`.
+            let data_fsync = bool_env_default_on("BASIN_DATA_FSYNC");
             tracing::info!(
                 backend = "local",
                 data_dir = %cfg.data_dir.display(),
                 root_prefix = ?cfg.storage_root_prefix,
+                data_fsync,
                 "storage object-store backend configured",
             );
-            Ok(Arc::new(fs))
+            if data_fsync {
+                Ok(Arc::new(basin_wal::FsyncOnPutAll::new(Arc::new(fs))))
+            } else {
+                Ok(Arc::new(fs))
+            }
         }
         "s3" | "tigris" => {
             let s3_cfg = basin_storage::backends::s3_compatible::S3LikeConfig::from_env()
