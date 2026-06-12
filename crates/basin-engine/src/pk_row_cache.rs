@@ -55,6 +55,7 @@
 //! a shard, so same-key requests always land on the same shard and different
 //! keys scatter. Process-global, lives on the engine handle.
 
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
@@ -72,6 +73,23 @@ const DEFAULT_SHARDS: usize = 64;
 
 /// Default memory budget: 64 MiB. Override via `BASIN_PK_ROW_CACHE_BYTES`.
 const DEFAULT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Per-project waterline: each active project is guaranteed at least this many
+/// bytes of cache that a noisy sibling cannot evict out from under it. Override
+/// via `BASIN_PK_ROW_CACHE_WATERLINE_BYTES`. Default 4 MiB.
+///
+/// Below its waterline a project's entries are never chosen as eviction victims
+/// while an over-share victim exists elsewhere in the same shard — so project A
+/// flooding the cache cannot drain project B's resident hot rows below the
+/// waterline.
+const DEFAULT_WATERLINE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Per-project cap as a fraction of the total budget, expressed in percent.
+/// Override via `BASIN_PK_ROW_CACHE_MAX_SHARE_PCT`. Default 50% — no single
+/// project may hold more than half the cache, so one project cannot monopolise
+/// the whole budget and starve the rest. The cap is a CEILING enforced
+/// over-share-first during eviction, not a reservation.
+const DEFAULT_MAX_SHARE_PCT: u64 = 50;
 
 /// Composite cache key. `RowKey` is the byte-exact PK encoding shared with the
 /// cold-tier cluster-sort + hot-tier UPDATE/DELETE paths (see
@@ -153,6 +171,21 @@ pub struct PkRowCache {
     shards: Vec<Mutex<Shard>>,
     /// Per-shard byte budget = `max_bytes / shards.len()`.
     per_shard_bytes: u64,
+    /// Total budget across all shards (= `per_shard_bytes * shards.len()`),
+    /// kept for the per-project share-cap arithmetic.
+    total_max_bytes: u64,
+    /// Per-project minimum-resident waterline (bytes). A project under this is
+    /// protected from sibling-driven eviction. See [`DEFAULT_WATERLINE_BYTES`].
+    waterline_bytes: u64,
+    /// Per-project ceiling (bytes), derived from the max-share percentage.
+    /// A project at/over this is the first eviction victim. See
+    /// [`DEFAULT_MAX_SHARE_PCT`].
+    per_project_cap_bytes: u64,
+    /// Approximate per-project resident bytes. Updated only on insert/evict (the
+    /// cold path); the hot `get()` never touches it, so the read fast path keeps
+    /// its near-zero cost. Eventual-consistency is sufficient: the bounds it
+    /// enforces (waterline / cap) hold once the in-flight insert settles.
+    project_bytes: Mutex<HashMap<ProjectId, u64>>,
     counters: PkRowCacheCounters,
 }
 
@@ -163,8 +196,21 @@ impl Default for PkRowCache {
 }
 
 impl PkRowCache {
-    /// Construct with explicit shard count + total byte budget.
+    /// Construct with explicit shard count + total byte budget. Per-project
+    /// waterline / share-cap take their env-or-default values.
     pub fn new(num_shards: usize, max_bytes: u64) -> Self {
+        Self::with_partition(num_shards, max_bytes, waterline_from_env(), max_share_pct_from_env())
+    }
+
+    /// Construct with every knob explicit. Used by tests to pin deterministic,
+    /// tiny budgets without depending on process-global env (the env knobs are
+    /// only read at the default constructors).
+    pub fn with_partition(
+        num_shards: usize,
+        max_bytes: u64,
+        waterline_bytes: u64,
+        max_share_pct: u64,
+    ) -> Self {
         let num_shards = num_shards.max(1);
         // Generous per-shard count cap; the byte budget is the real limit.
         let cap = NonZeroUsize::new(1 << 16).unwrap();
@@ -177,14 +223,25 @@ impl PkRowCache {
             })
             .collect();
         let per_shard_bytes = (max_bytes / num_shards as u64).max(1);
+        let total_max_bytes = per_shard_bytes * num_shards as u64;
+        // Cap can't exceed the whole budget; waterline can't exceed the cap
+        // (a project can't be guaranteed more than it is allowed to hold).
+        let per_project_cap_bytes =
+            ((total_max_bytes.saturating_mul(max_share_pct.min(100))) / 100).max(1);
+        let waterline_bytes = waterline_bytes.min(per_project_cap_bytes);
         Self {
             shards,
             per_shard_bytes,
+            total_max_bytes,
+            waterline_bytes,
+            per_project_cap_bytes,
+            project_bytes: Mutex::new(HashMap::new()),
             counters: PkRowCacheCounters::default(),
         }
     }
 
-    /// Construct from environment: `BASIN_PK_ROW_CACHE_BYTES` (default 64 MiB).
+    /// Construct from environment: `BASIN_PK_ROW_CACHE_BYTES` (default 64 MiB),
+    /// `BASIN_PK_ROW_CACHE_WATERLINE_BYTES`, `BASIN_PK_ROW_CACHE_MAX_SHARE_PCT`.
     pub fn from_env() -> Self {
         let max_bytes = std::env::var("BASIN_PK_ROW_CACHE_BYTES")
             .ok()
@@ -196,6 +253,53 @@ impl PkRowCache {
 
     pub fn counters(&self) -> &PkRowCacheCounters {
         &self.counters
+    }
+
+    /// Approximate resident bytes for `project`. Test/diagnostic surface for
+    /// the per-project waterline; reflects the cold-path accounting, so it is
+    /// exact once all in-flight inserts settle.
+    pub fn project_bytes(&self, project: &ProjectId) -> u64 {
+        self.project_bytes
+            .lock()
+            .map(|m| m.get(project).copied().unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    /// The per-project minimum-resident waterline (bytes).
+    pub fn waterline_bytes(&self) -> u64 {
+        self.waterline_bytes
+    }
+
+    /// The per-project share ceiling (bytes).
+    pub fn per_project_cap_bytes(&self) -> u64 {
+        self.per_project_cap_bytes
+    }
+
+    /// Adjust a project's approximate byte total, dropping zero entries so the
+    /// map tracks only live projects.
+    fn adjust_project_bytes(&self, project: &ProjectId, added: u64, removed: u64) {
+        if added == 0 && removed == 0 {
+            return;
+        }
+        if let Ok(mut map) = self.project_bytes.lock() {
+            let cur = map.entry(*project).or_insert(0);
+            *cur = cur.saturating_add(added).saturating_sub(removed);
+            if *cur == 0 {
+                map.remove(project);
+            }
+        }
+    }
+
+    /// True when `project` is at/over its share ceiling — the first eviction
+    /// victim class.
+    fn project_over_cap(&self, project: &ProjectId) -> bool {
+        self.project_bytes(project) >= self.per_project_cap_bytes
+    }
+
+    /// True when `project` is at/below its protected waterline — never evicted
+    /// to make room for a sibling while an over-cap victim exists.
+    fn project_under_waterline(&self, project: &ProjectId) -> bool {
+        self.project_bytes(project) <= self.waterline_bytes
     }
 
     fn shard_idx(&self, key: &CacheKey) -> usize {
@@ -266,6 +370,8 @@ impl PkRowCache {
                 self.counters
                     .current_bytes
                     .fetch_sub(freed, Ordering::Relaxed);
+                // Keep the per-project accounting in sync with the stale evict.
+                self.adjust_project_bytes(project, 0, freed);
             }
             self.counters.stale_evictions.fetch_add(1, Ordering::Relaxed);
             self.counters.misses.fetch_add(1, Ordering::Relaxed);
@@ -273,8 +379,12 @@ impl PkRowCache {
         }
     }
 
-    /// Insert (or overwrite) a row with its two watermarks. Evicts LRU entries
-    /// from the owning shard until it is back under its byte budget.
+    /// Insert (or overwrite) a row with its two watermarks. Evicts entries from
+    /// the owning shard until it is back under its byte budget, choosing victims
+    /// **over-share-first** so the per-project waterline holds: a project at/over
+    /// its share cap is drained before any other, and a project at/below its
+    /// waterline is never evicted to make room for a sibling while a non-
+    /// protected victim remains in the shard.
     pub fn insert(
         &self,
         project: &ProjectId,
@@ -306,27 +416,70 @@ impl PkRowCache {
         };
         // Net byte delta for this shard, accumulated under the lock and applied
         // to the lock-free global `current_bytes` AFTER release (never
-        // `total_bytes()` under a lock — that would self-deadlock).
+        // `total_bytes()` under a lock — that would self-deadlock). Per-project
+        // byte deltas are bucketed by project and applied after the shard lock
+        // drops, for the same reason (project_bytes is a separate lock).
         let mut removed_bytes: u64 = 0;
         let mut evicted_count: u64 = 0;
+        // (project, bytes) freed per victim project this insert, applied to the
+        // per-project accounting after releasing the shard lock.
+        let mut freed_by_project: HashMap<ProjectId, u64> = HashMap::new();
         let mut shard = self.shards[idx].lock().unwrap();
         if let Some(old) = shard.lru.put(key, entry) {
             shard.bytes = shard.bytes.saturating_sub(old.size);
             removed_bytes = removed_bytes.saturating_add(old.size);
+            // Overwrite of the SAME (project,table,pk): the project keeps the
+            // new entry, so net per-project delta for the old size is a removal.
+            *freed_by_project.entry(*project).or_insert(0) += old.size;
         }
         shard.bytes = shard.bytes.saturating_add(size);
-        // Greedy LRU eviction back under the per-shard budget.
-        while shard.bytes > self.per_shard_bytes {
-            match shard.lru.pop_lru() {
-                Some((_, evicted)) => {
-                    shard.bytes = shard.bytes.saturating_sub(evicted.size);
-                    removed_bytes = removed_bytes.saturating_add(evicted.size);
-                    evicted_count += 1;
+        // Live estimate of the inserting project's resident bytes: the last
+        // settled accounting + this insert's size, minus anything we free from
+        // it in the loop below. Drives the cap-enforcement clause so the share
+        // ceiling holds within the lag of one in-flight insert (the
+        // approximate-but-eventually-exact contract). `project_over_cap` reads
+        // the settled map, which lags by the in-flight insert; this local
+        // estimate closes that lag for the inserter specifically.
+        let mut inserter_estimate = self.project_bytes(project).saturating_add(size);
+        // Eviction continues while EITHER the shard is over its byte budget OR
+        // the inserting project is over its share cap. The cap clause makes the
+        // ceiling an enforced bound, not merely an eviction preference.
+        loop {
+            let over_shard = shard.bytes > self.per_shard_bytes;
+            let over_cap = inserter_estimate > self.per_project_cap_bytes;
+            if !over_shard && !over_cap {
+                break;
+            }
+            // When only the cap is breached (shard has room), the victim MUST
+            // be the inserting project itself — evicting a sibling would not
+            // bring the inserter under its cap and could breach a sibling's
+            // waterline. Otherwise use the over-share-first chooser.
+            let victim_key = if over_cap && !over_shard {
+                self.pick_lru_victim_for_project(&shard, project)
+            } else {
+                self.pick_eviction_victim(&shard, project)
+            };
+            let Some(victim_key) = victim_key else { break };
+            if let Some(evicted) = shard.lru.pop(&victim_key) {
+                shard.bytes = shard.bytes.saturating_sub(evicted.size);
+                removed_bytes = removed_bytes.saturating_add(evicted.size);
+                if victim_key.project == *project {
+                    inserter_estimate = inserter_estimate.saturating_sub(evicted.size);
                 }
-                None => break,
+                *freed_by_project.entry(victim_key.project).or_insert(0) += evicted.size;
+                evicted_count += 1;
+            } else {
+                break;
             }
         }
         drop(shard);
+        // Per-project accounting: +size for the inserting project, minus the
+        // bytes freed from each victim project (the inserter may also appear as
+        // a victim — net it).
+        self.adjust_project_bytes(project, size, 0);
+        for (p, freed) in freed_by_project {
+            self.adjust_project_bytes(&p, 0, freed);
+        }
         self.counters.inserts.fetch_add(1, Ordering::Relaxed);
         if evicted_count > 0 {
             self.counters
@@ -342,6 +495,55 @@ impl PkRowCache {
                 .current_bytes
                 .fetch_sub(removed_bytes, Ordering::Relaxed);
         }
+    }
+
+    /// Choose an eviction victim from `shard`, preferring (in order):
+    ///
+    /// 1. the least-recently-used entry of any project that is at/over its
+    ///    share cap (over-share-first — the noisy neighbour pays first);
+    /// 2. the least-recently-used entry of any project NOT at/below its
+    ///    waterline (and, all else equal, not the inserting project);
+    /// 3. only if every remaining entry belongs to a protected (under-
+    ///    waterline) project, the plain LRU tail — a last resort that keeps the
+    ///    hard byte budget an invariant even in the degenerate all-protected
+    ///    case.
+    ///
+    /// `lru.iter()` walks most→least-recently-used, so the LAST match in each
+    /// class is the least-recently-used of that class. The scan is bounded by
+    /// the shard's entry count and runs only while over budget (cold path).
+    fn pick_eviction_victim(&self, shard: &Shard, inserting: &ProjectId) -> Option<CacheKey> {
+        let mut over_cap: Option<CacheKey> = None;
+        let mut non_protected: Option<CacheKey> = None;
+        let mut non_protected_other: Option<CacheKey> = None;
+        let mut any_lru: Option<CacheKey> = None;
+        for (k, _) in shard.lru.iter() {
+            any_lru = Some(k.clone());
+            if self.project_over_cap(&k.project) {
+                over_cap = Some(k.clone());
+            } else if !self.project_under_waterline(&k.project) {
+                non_protected = Some(k.clone());
+                if &k.project != inserting {
+                    non_protected_other = Some(k.clone());
+                }
+            }
+        }
+        over_cap
+            .or(non_protected_other)
+            .or(non_protected)
+            .or(any_lru)
+    }
+
+    /// The least-recently-used entry belonging to `project` in `shard`, if any.
+    /// Used to enforce the share cap: when only the cap (not the shard budget)
+    /// is breached, the over-cap project trims its OWN oldest entry.
+    fn pick_lru_victim_for_project(&self, shard: &Shard, project: &ProjectId) -> Option<CacheKey> {
+        let mut victim: Option<CacheKey> = None;
+        for (k, _) in shard.lru.iter() {
+            if &k.project == project {
+                victim = Some(k.clone()); // keep the last = LRU of this project
+            }
+        }
+        victim
     }
 
     /// Drop ALL entries for `(project, table)`. Called on DDL (ALTER/DROP) so a
@@ -366,6 +568,7 @@ impl PkRowCache {
         }
         if freed > 0 {
             self.counters.current_bytes.fetch_sub(freed, Ordering::Relaxed);
+            self.adjust_project_bytes(project, 0, freed);
         }
     }
 
@@ -394,6 +597,10 @@ impl PkRowCache {
         }
         if freed > 0 {
             self.counters.current_bytes.fetch_sub(freed, Ordering::Relaxed);
+        }
+        // Every entry for this project is gone; zero its accounting directly.
+        if let Ok(mut map) = self.project_bytes.lock() {
+            map.remove(project);
         }
     }
 
@@ -434,6 +641,24 @@ impl PkRowCache {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+/// Per-project waterline bytes from env (default [`DEFAULT_WATERLINE_BYTES`]).
+fn waterline_from_env() -> u64 {
+    std::env::var("BASIN_PK_ROW_CACHE_WATERLINE_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_WATERLINE_BYTES)
+}
+
+/// Per-project max-share percentage from env (default
+/// [`DEFAULT_MAX_SHARE_PCT`]); clamped to 1..=100.
+fn max_share_pct_from_env() -> u64 {
+    std::env::var("BASIN_PK_ROW_CACHE_MAX_SHARE_PCT")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|p| p.clamp(1, 100))
+        .unwrap_or(DEFAULT_MAX_SHARE_PCT)
 }
 
 /// Deterministic hash of a `read_cols` projection (`None` = all columns).
@@ -701,5 +926,101 @@ mod tests {
             .get(&p, &t, &key(7), 1, 1, 0)
             .expect("always-on cache must serve a fresh hit");
         assert_eq!(val(&got), 99);
+    }
+
+    // ── Noisy-neighbour: per-project waterline + share cap ──────────────────
+
+    /// Per-project byte accounting tracks each project independently and zeroes
+    /// out when a project's entries are invalidated.
+    #[test]
+    fn per_project_bytes_are_tracked_and_isolated() {
+        let c = PkRowCache::new(8, 1 << 20);
+        let pa = proj();
+        let pb = proj();
+        let t = tbl("t");
+        c.insert(&pa, &t, key(1), 0, 0, 0, row(1));
+        c.insert(&pa, &t, key(2), 0, 0, 0, row(2));
+        c.insert(&pb, &t, key(1), 0, 0, 0, row(3));
+        let a0 = c.project_bytes(&pa);
+        let b0 = c.project_bytes(&pb);
+        assert!(a0 > 0 && b0 > 0);
+        assert!(a0 >= b0, "A has two entries, B has one");
+        // Invalidating A leaves B's accounting untouched.
+        c.invalidate_project(&pa);
+        assert_eq!(c.project_bytes(&pa), 0, "A drained");
+        assert_eq!(c.project_bytes(&pb), b0, "B's bytes survive A's invalidation");
+    }
+
+    /// THE noisy-neighbour property: project A floods a tiny single-shard cache
+    /// while project B holds a small set under the waterline. B's entries must
+    /// survive — A's overflow evicts A's own (over-cap) entries, not B's
+    /// protected ones.
+    #[test]
+    fn flooding_project_does_not_evict_protected_project() {
+        // 1 shard so all keys share one LRU (the adversarial worst case for
+        // cross-project eviction). Total budget sized so a single project's
+        // flood would, under naive LRU, churn out everyone. Waterline protects
+        // a small resident set; cap is low so the flooder is "over share" fast.
+        let one_row = key_overhead(&tbl("t")) + batches_bytes(&row(0));
+        let total = one_row * 40; // room for ~40 rows total
+        let waterline = one_row * 4; // B's small set stays protected
+        let cap_pct = 25; // a project over ~25% of total is a victim
+        let c = PkRowCache::with_partition(1, total, waterline, cap_pct);
+
+        let pa = proj();
+        let pb = proj();
+        let t = tbl("t");
+
+        // B seeds a small resident set (under the waterline).
+        for i in 0..3i64 {
+            c.insert(&pb, &t, key(i), 0, 0, 0, row(i));
+        }
+        let b_bytes_before = c.project_bytes(&pb);
+        assert!(b_bytes_before > 0);
+
+        // A floods far past the budget.
+        for i in 0..500i64 {
+            c.insert(&pa, &t, key(i), 0, 0, 0, row(i));
+        }
+
+        // B's three entries must STILL be present (protected by the waterline).
+        for i in 0..3i64 {
+            assert!(
+                c.get(&pb, &t, &key(i), 0, 0, 0).is_some(),
+                "project B key {i} was evicted by project A's flood — waterline breach"
+            );
+        }
+        // And the global byte budget is still respected (hard invariant).
+        assert!(
+            c.total_bytes() <= total,
+            "total bytes {} exceeded budget {}",
+            c.total_bytes(),
+            total
+        );
+    }
+
+    /// The share cap is a ceiling: a single project cannot hold more than its
+    /// configured share even when it is the only writer.
+    #[test]
+    fn single_project_capped_at_its_share() {
+        let one_row = key_overhead(&tbl("t")) + batches_bytes(&row(0));
+        let total = one_row * 40;
+        let waterline = one_row * 2;
+        let cap_pct = 50;
+        let c = PkRowCache::with_partition(1, total, waterline, cap_pct);
+        let p = proj();
+        let t = tbl("t");
+        for i in 0..500i64 {
+            c.insert(&p, &t, key(i), 0, 0, 0, row(i));
+        }
+        // Cap is 50% of total. The over-cap-first eviction keeps the lone
+        // project near (within one entry of) its cap, never the whole budget.
+        let cap = c.per_project_cap_bytes();
+        assert!(
+            c.project_bytes(&p) <= cap + one_row,
+            "project bytes {} exceed cap {} by more than one row",
+            c.project_bytes(&p),
+            cap
+        );
     }
 }

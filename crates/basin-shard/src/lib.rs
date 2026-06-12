@@ -46,6 +46,53 @@ const DEFAULT_CLEAN_SWEEP_SECS: u64 = 30;
 /// (`BASIN_STRIPE_MERGE_SECS`). `0` disables the sweep entirely.
 const DEFAULT_STRIPE_MERGE_SECS: u64 = 60;
 
+/// Multi-node phase 1 (ADR 0023) — lease enforcement mode, sourced from
+/// `BASIN_LEASE_MODE` by `basin-server`.
+///
+/// - [`LeaseMode::Off`] (default): exactly today's behaviour. With no
+///   registry attached nothing fences; with a registry attached the shard
+///   acquires/renews/fences best-effort (the Phase 6.X.A semantics every
+///   existing lease test pins): `get` errors with `CommitConflict` when a
+///   peer holds a live lease, and a write that lost its lease falls back to
+///   an unfenced (epoch-`None`) WAL append.
+/// - [`LeaseMode::Required`]: single-writer is **enforced**, not just
+///   deployment-shape. A write may only proceed while this replica holds the
+///   `(project, partition)` writer lease — no held epoch means the write is
+///   refused with the typed [`basin_common::BasinError::LeaseNotHeld`]
+///   before it reaches the WAL. Lease-acquire failures (peer holds it /
+///   coordinator unreachable) fail **closed for writes** and **open for
+///   reads**: `get` still returns a handle so reads continue.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LeaseMode {
+    /// No enforcement — current single-replica / best-effort behaviour.
+    #[default]
+    Off,
+    /// Writer lease must be held for every write; fail-closed otherwise.
+    Required,
+}
+
+impl LeaseMode {
+    /// Parse a `BASIN_LEASE_MODE` value. `None` / empty / `"off"` is
+    /// [`LeaseMode::Off`]; `"required"` is [`LeaseMode::Required`]; anything
+    /// else is a hard error (mirrors
+    /// `basin_router::parse_lease_cache_ttl_env`'s strict-parse idiom — a
+    /// typo'd enforcement knob must not silently mean "off").
+    pub fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") | Some("off") => Ok(Self::Off),
+            Some("required") => Ok(Self::Required),
+            Some(other) => Err(format!(
+                "BASIN_LEASE_MODE must be 'off' or 'required', got {other:?}"
+            )),
+        }
+    }
+
+    /// [`Self::parse`] applied to the `BASIN_LEASE_MODE` env var.
+    pub fn from_env() -> Result<Self, String> {
+        Self::parse(std::env::var("BASIN_LEASE_MODE").ok().as_deref())
+    }
+}
+
 /// Knobs for [`Shard::new`].
 #[derive(Clone)]
 pub struct ShardConfig {
@@ -82,6 +129,15 @@ pub struct ShardConfig {
     /// absent, the shard runs in single-replica / no-lease mode exactly as
     /// before — `get` neither acquires nor fences.
     pub lease_registry: Option<Arc<dyn basin_catalog::LeaseRegistry>>,
+    /// Multi-node phase 1 — lease enforcement mode (`BASIN_LEASE_MODE`).
+    /// [`LeaseMode::Off`] (default) preserves today's behaviour exactly;
+    /// [`LeaseMode::Required`] refuses writes with
+    /// [`basin_common::BasinError::LeaseNotHeld`] whenever this replica does
+    /// not hold the partition's writer lease, while reads continue. Only
+    /// meaningful when `lease_registry` is set (required mode without a
+    /// registry refuses every write — `basin-server` rejects that combination
+    /// at startup).
+    pub lease_mode: LeaseMode,
     /// This replica's stable lease holder id (e.g. `host:pid` or a uuid).
     /// Defaults to a per-process random id; only meaningful when
     /// `lease_registry` is set.
@@ -145,6 +201,7 @@ impl ShardConfig {
                 DEFAULT_STRIPE_MERGE_SECS,
             )),
             lease_registry: None,
+            lease_mode: LeaseMode::Off,
             replica_id: default_replica_id(),
             lease_ttl: Duration::from_secs(env_secs(
                 "BASIN_LEASE_TTL_SECS",
@@ -196,6 +253,15 @@ impl ShardConfig {
     ) -> Self {
         self.lease_registry = Some(registry);
         self.replica_id = replica_id.into();
+        self
+    }
+
+    /// Multi-node phase 1 — set the lease enforcement mode
+    /// (`BASIN_LEASE_MODE`). See [`LeaseMode`] for the exact semantics of
+    /// each value. Call together with [`Self::with_lease_registry`];
+    /// [`LeaseMode::Required`] without a registry refuses every write.
+    pub fn with_lease_mode(mut self, mode: LeaseMode) -> Self {
+        self.lease_mode = mode;
         self
     }
 }
@@ -468,6 +534,39 @@ impl Shard {
         self.inner.has_pending_tail(project, table).await
     }
 
+    /// Cheap O(resident-partitions) count of un-flushed in-memory tail rows for
+    /// `(project, table)`, summed across every resident partition.
+    ///
+    /// Like [`Shard::has_pending_tail`] this never lists or scans object
+    /// storage and never drains the tail — it only inspects the resident
+    /// per-partition tail maps. The read path uses it to decide whether a
+    /// small pending tail can be merged on-read (via the shard's own
+    /// tail-merging `ProjectHandle::read`) instead of paying a synchronous
+    /// flush. See [`ShardImpl::pending_tail_rows`].
+    pub async fn pending_tail_rows(&self, project: &ProjectId, table: &TableName) -> usize {
+        self.inner.pending_tail_rows(project, table).await
+    }
+
+    /// Cold-tier read for `(project, table)` unioned with the un-flushed
+    /// in-memory tail of EVERY resident partition.
+    ///
+    /// This is the merge-on-read primitive the auto-commit read path uses when
+    /// it skips the synchronous flush for a small pending tail: the cold side
+    /// already spans every stripe partition's flushed data, and this merges
+    /// the still-resident tail of `s1`, `s2`, … (not only `default_key()`), so
+    /// read-own-write holds for striped multi-row INSERTs. See
+    /// [`ShardImpl::read_table_merging_tails`].
+    pub async fn read_table_merging_tails(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        opts: basin_storage::ReadOptions,
+    ) -> Result<Vec<RecordBatch>> {
+        self.inner
+            .read_table_merging_tails(project, table, opts)
+            .await
+    }
+
     /// Test-only: pull out the concrete in-process implementation so the
     /// inline tests can drive its synchronous helpers. Returns `None` if a
     /// future backend swap replaces the in-process map.
@@ -713,6 +812,36 @@ pub(crate) trait ShardImpl: Send + Sync {
     async fn has_pending_tail(&self, _project: &ProjectId, _table: &TableName) -> bool {
         false
     }
+    /// Cheap O(resident-partitions) count of un-flushed in-memory tail rows for
+    /// `(project, table)`, summed across every resident partition.
+    ///
+    /// Same no-flush, no-list contract as [`ShardImpl::has_pending_tail`] — it
+    /// only reads the resident per-partition tail batch row counts under their
+    /// locks. Read paths use it to size the small-tail merge-on-read decision
+    /// (a small tail is merged via the shard's tail-merging `read`, a large
+    /// tail is flushed). Default `0` for backends that keep no in-memory tail.
+    async fn pending_tail_rows(&self, _project: &ProjectId, _table: &TableName) -> usize {
+        0
+    }
+    /// Cold read for `(project, table)` merged with the un-flushed in-memory
+    /// tail of EVERY resident partition (not just `default_key()`).
+    ///
+    /// `ProjectHandle::read` merges only its own partition's tail; under
+    /// statement-affine striping a table's tail is spread across `s1`, `s2`, …
+    /// partitions, so the small-tail merge-on-read decision must union them
+    /// all. The cold side is already (project, table)-scoped so it spans every
+    /// stripe; only the per-partition tail needs the fan-out. Default delegates
+    /// to a `default_key()` handle read (correct for single-partition backends
+    /// that never stripe).
+    async fn read_table_merging_tails(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        opts: basin_storage::ReadOptions,
+    ) -> Result<Vec<RecordBatch>> {
+        let handle = self.get(project, &PartitionKey::default_key()).await?;
+        handle.read(table, opts).await
+    }
     /// Test-only downcast for the inline test suite.
     #[cfg(test)]
     fn as_in_process(&self) -> Option<Arc<in_process::InProcessShard>> {
@@ -774,3 +903,32 @@ pub use follower::{
 };
 pub use lock_registry::{LockEntry, LockHandle, LockRegistry};
 pub use split::{CatchupReport, Epoch, LocalShardSplitter, ShardSplitter, SplitPlan};
+
+#[cfg(test)]
+mod lease_mode_tests {
+    use super::LeaseMode;
+
+    #[test]
+    fn parse_accepts_off_required_and_default() {
+        assert_eq!(LeaseMode::parse(None).unwrap(), LeaseMode::Off);
+        assert_eq!(LeaseMode::parse(Some("")).unwrap(), LeaseMode::Off);
+        assert_eq!(LeaseMode::parse(Some("off")).unwrap(), LeaseMode::Off);
+        assert_eq!(LeaseMode::parse(Some("OFF")).unwrap(), LeaseMode::Off);
+        assert_eq!(
+            LeaseMode::parse(Some("required")).unwrap(),
+            LeaseMode::Required
+        );
+        assert_eq!(
+            LeaseMode::parse(Some("  Required ")).unwrap(),
+            LeaseMode::Required
+        );
+    }
+
+    #[test]
+    fn parse_rejects_unknown_values() {
+        // A typo'd enforcement knob must not silently mean "off".
+        assert!(LeaseMode::parse(Some("on")).is_err());
+        assert!(LeaseMode::parse(Some("enforced")).is_err());
+        assert!(LeaseMode::parse(Some("1")).is_err());
+    }
+}

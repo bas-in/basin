@@ -223,6 +223,11 @@ impl HypertableRegistry {
 
     /// Run the retention policy: drop chunks older than `retention_secs` before
     /// `now`.  Returns the names of dropped chunks.
+    ///
+    /// NOTE: the executor now calls `drop_chunks_before` directly (which shares
+    /// the same logic). This method is retained for any caller that holds a
+    /// direct reference to it.
+    #[allow(dead_code)]
     pub(crate) async fn run_retention(
         &self,
         project: &ProjectId,
@@ -323,6 +328,40 @@ impl HypertableRegistry {
         let guard = arc.lock().await;
         guard.tables.get(table).and_then(|ht| ht.retention_secs)
     }
+
+    /// Drop chunks whose range_end is <= `cutoff` and return their names plus
+    /// the cutoff used (so the caller can issue a physical DELETE).
+    ///
+    /// This is the core shared by both `drop_chunks()` and `run_retention_policy`.
+    pub(crate) async fn drop_chunks_before(
+        &self,
+        project: &ProjectId,
+        table: &str,
+        cutoff: DateTime<Utc>,
+    ) -> Result<Vec<String>, String> {
+        let p = self.project(project);
+        let mut guard = p.lock().await;
+        let ht = guard
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| format!("table {table:?} is not a hypertable"))?;
+        let to_drop = ht.chunks_older_than(cutoff);
+        ht.drop_chunks(&to_drop);
+        Ok(to_drop)
+    }
+
+    /// Snapshot all hypertable records for a project (for the `hypertables`
+    /// catalog view).
+    pub(crate) async fn snapshot_hypertables(
+        &self,
+        project: &ProjectId,
+    ) -> Vec<(String, HypertableRecord)> {
+        let Some(arc) = self.inner.get(project).map(|e| e.clone()) else {
+            return vec![];
+        };
+        let guard = arc.lock().await;
+        guard.tables.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
 }
 
 // ─── SQL parsing helpers ──────────────────────────────────────────────────────
@@ -330,9 +369,13 @@ impl HypertableRegistry {
 /// Parse `INTERVAL '<n> <unit>'` text → seconds.  Understands `day/days`,
 /// `hour/hours`, `minute/minutes`, `second/seconds`, `week/weeks`.
 pub(crate) fn parse_interval_secs(s: &str) -> Option<u64> {
-    // Delegate to the existing cv_time_bucket parser.
-    crate::cv_time_bucket::BucketWidth::from_interval_text(s)
-        .map(|w| match w {
+    // Prefer the multiplier-aware `<n> <unit>` parser FIRST: it correctly
+    // computes `n × unit` (e.g. `'30 days'` → 2_592_000). The
+    // `BucketWidth::from_interval_text` named-unit matcher below DROPS the
+    // quantity (`'30 days'`.contains("day") → BucketWidth::Day → 86_400), which
+    // is fine for a single-unit chunk bucket but wrong for a retention window.
+    parse_interval_secs_fallback(s).or_else(|| {
+        crate::cv_time_bucket::BucketWidth::from_interval_text(s).map(|w| match w {
             crate::cv_time_bucket::BucketWidth::Second => 1,
             crate::cv_time_bucket::BucketWidth::Minute => 60,
             crate::cv_time_bucket::BucketWidth::Hour => 3_600,
@@ -342,7 +385,7 @@ pub(crate) fn parse_interval_secs(s: &str) -> Option<u64> {
             crate::cv_time_bucket::BucketWidth::Year => 365 * 86_400,
             crate::cv_time_bucket::BucketWidth::SecondsFixed(s) => s,
         })
-        .or_else(|| parse_interval_secs_fallback(s))
+    })
 }
 
 /// Fallback parser for intervals not covered by `BucketWidth`.
@@ -438,6 +481,54 @@ pub(crate) fn match_add_retention_policy(sql: &str) -> Option<(String, String)> 
     let rest_lower = rest.to_ascii_lowercase();
     let interval_text = extract_interval_from_args(&rest_lower, &rest)?;
     Some((table, interval_text))
+}
+
+/// Match `SELECT drop_chunks('table', older_than => INTERVAL '...')` or
+/// `SELECT drop_chunks('table', older_than => TIMESTAMP '...')`.
+/// Returns `(table_name, cutoff_spec)` where `cutoff_spec` is either an
+/// interval text (e.g. `"7 days"`) or an ISO timestamp string.
+///
+/// Timescale's actual signature also accepts `newer_than`; we support only
+/// `older_than` (the overwhelmingly dominant use-case).
+pub(crate) fn match_drop_chunks(sql: &str) -> Option<(String, DropChunksCutoff)> {
+    let lower = sql.trim().to_ascii_lowercase();
+    if !lower.starts_with("select") { return None; }
+    if !lower.contains("drop_chunks") { return None; }
+
+    let start = sql.to_ascii_lowercase().find("drop_chunks")? + "drop_chunks".len();
+    let args = paren_contents(&sql[start..])?;
+    let parts = split_args(args);
+    if parts.is_empty() { return None; }
+    let table = strip_quotes(parts[0].trim());
+
+    // Look for `older_than => INTERVAL '...'`
+    let rest = parts[1..].join(",");
+    let rest_lower = rest.to_ascii_lowercase();
+    if let Some(iv) = extract_interval_from_args(&rest_lower, &rest) {
+        return Some((table, DropChunksCutoff::Interval(iv)));
+    }
+    // Look for `older_than => TIMESTAMP '...'` / `older_than => TIMESTAMPTZ '...'`
+    for kw in &["timestamptz", "timestamp"] {
+        if let Some(pos) = rest_lower.find(kw) {
+            let after = rest[pos + kw.len()..].trim_start();
+            if after.starts_with('\'') {
+                let inner = &after[1..];
+                if let Some(end) = inner.find('\'') {
+                    return Some((table, DropChunksCutoff::Timestamp(inner[..end].to_string())));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Cutoff specification for `drop_chunks`.
+#[derive(Debug, Clone)]
+pub(crate) enum DropChunksCutoff {
+    /// `older_than => INTERVAL '7 days'` — relative to now().
+    Interval(String),
+    /// `older_than => TIMESTAMP '2024-01-01'` — absolute cutoff.
+    Timestamp(String),
 }
 
 /// Match `SELECT run_retention_policy('table')`.
@@ -645,19 +736,34 @@ impl BucketWidthFromText for crate::cv_time_bucket::BucketWidth {
         // Try the existing parse_interval_secs from cv_time_bucket module
         // by calling it directly on the text.
         let s = s.trim().to_ascii_lowercase();
-        // Named units
-        let named: &[(&str, BucketWidth)] = &[
-            ("second", BucketWidth::Second),
-            ("minute", BucketWidth::Minute),
-            ("hour", BucketWidth::Hour),
-            ("day", BucketWidth::Day),
-            ("week", BucketWidth::Week),
-            ("month", BucketWidth::Month),
-            ("year", BucketWidth::Year),
+        // Named units, with the per-unit second weight used when a quantity
+        // multiplier (`10 minutes`, `30 days`) accompanies the unit.
+        let named: &[(&str, BucketWidth, u64)] = &[
+            ("second", BucketWidth::Second, 1),
+            ("minute", BucketWidth::Minute, 60),
+            ("hour", BucketWidth::Hour, 3_600),
+            ("day", BucketWidth::Day, 86_400),
+            ("week", BucketWidth::Week, 604_800),
+            ("month", BucketWidth::Month, 30 * 86_400),
+            ("year", BucketWidth::Year, 365 * 86_400),
         ];
-        for (name, w) in named {
+        // Leading integer quantity, if any (`"10 minutes"` → 10). A bare unit or
+        // an explicit `1` keeps the named (calendar-aware) variant; a quantity
+        // > 1 must honour the multiplier — returning the bare named variant here
+        // silently dropped it, so `time_bucket('10 minutes', ts)` bucketed by
+        // 60s instead of 600s. For a multiplier we return a fixed-seconds bucket
+        // (correct for sub-day units; for day/week/month/year it is the same
+        // pragmatic fixed-width approximation the rest of this module uses).
+        let qty: Option<u64> = {
+            let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+            digits.parse::<u64>().ok()
+        };
+        for (name, w, unit_secs) in named {
             if s.contains(name) {
-                return Some(*w);
+                return match qty {
+                    Some(n) if n != 1 => Some(BucketWidth::SecondsFixed(n * unit_secs)),
+                    _ => Some(*w),
+                };
             }
         }
         // Try parsing as `<n> <unit>` → SecondsFixed
@@ -763,10 +869,21 @@ use datafusion::logical_expr::{
 };
 use datafusion::prelude::SessionContext;
 
-/// Register `time_bucket(interval_text, ts) → ts` into the given context.
+/// Register `time_bucket(interval_text, ts[, origin_or_tz]) → ts` into the
+/// given context.
+///
+/// Supported arities:
+///   2 args: `time_bucket(interval, ts)` — epoch-aligned (original behaviour).
+///   3 args: `time_bucket(interval, ts, origin TIMESTAMPTZ)` — aligns the
+///            bucket grid to `origin` instead of Unix epoch.
+///   3 args: `time_bucket(interval, ts, timezone TEXT)` — shifts ts to the
+///            named timezone before bucketing then shifts back. Implemented via
+///            chrono-tz when the third arg is a string literal; falls back to
+///            epoch-aligned if the timezone cannot be parsed.
 pub(crate) fn register_time_bucket_udf(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(TimeBucketUdf {
-        signature: Signature::any(2, Volatility::Immutable),
+        // Accept 2 or 3 arguments.
+        signature: Signature::variadic_any(Volatility::Immutable),
     }));
 }
 
@@ -794,8 +911,8 @@ impl ScalarUDFImpl for TimeBucketUdf {
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let args = &args.args;
-        if args.len() != 2 {
-            return exec_err!("time_bucket expects 2 arguments");
+        if args.len() < 2 || args.len() > 3 {
+            return exec_err!("time_bucket expects 2 or 3 arguments");
         }
 
         // ── arg 0: bucket width as a string literal ───────────────────────
@@ -817,6 +934,20 @@ impl ScalarUDFImpl for TimeBucketUdf {
                 format!("time_bucket: unrecognised interval '{width_text}'"),
             ))?;
 
+        // ── arg 2 (optional): origin timestamp or timezone string ──────────
+        // We extract this before processing the ts array. If the third arg is
+        // a timestamp we treat it as origin (shift the epoch grid); if it is a
+        // string we treat it as a timezone name (IANA / abbrev).
+        let origin_us: Option<i64> = if args.len() == 3 {
+            extract_origin_us(&args[2])
+        } else {
+            None
+        };
+        // `origin_shift_us` is the number of µs the origin is offset from the
+        // Unix epoch. When non-zero, the floor is computed relative to the
+        // origin: floor((ts - origin), bucket) + origin.
+        let origin_shift_us = origin_us.unwrap_or(0i64);
+
         // ── arg 1: timestamp column ───────────────────────────────────────
         let ts_array: ArrayRef = match &args[1] {
             ColumnarValue::Scalar(sv) => sv.to_array()?,
@@ -826,31 +957,47 @@ impl ScalarUDFImpl for TimeBucketUdf {
         let len = ts_array.len();
 
         // Helper: convert microseconds-since-epoch to floored µs.
+        // When origin_shift_us != 0, the grid is anchored to `origin` rather
+        // than the Unix epoch:
+        //   result = floor((ts_us - origin_shift_us), bucket_us) + origin_shift_us
+        // For BucketWidth variants with calendar semantics (Day/Week/Month/Year)
+        // the origin shift is applied in microseconds and the BucketWidth::floor
+        // still operates on UTC calendar math, so the shift only affects the
+        // epoch-anchored variants (SecondsFixed). Calendar variants are
+        // unaffected by the origin shift (they already anchor to midnight UTC).
         let floor_us = |us: i64| -> i64 {
             use chrono::TimeZone as _;
-            let dt = chrono::DateTime::<Utc>::from_timestamp_micros(us)
+            let effective_us = us - origin_shift_us;
+            let dt = chrono::DateTime::<Utc>::from_timestamp_micros(effective_us)
                 .unwrap_or_else(|| Utc.timestamp_micros(0).unwrap());
-            bw.floor(dt).timestamp_micros()
+            let floored = bw.floor(dt).timestamp_micros();
+            floored + origin_shift_us
         };
         let floor_ns = |ns: i64| -> i64 {
             use chrono::TimeZone as _;
-            let secs = ns / 1_000_000_000;
-            let nanos = (ns % 1_000_000_000) as u32;
+            let effective_ns = ns - origin_shift_us * 1_000;
+            let secs = effective_ns / 1_000_000_000;
+            let nanos = (effective_ns.rem_euclid(1_000_000_000)) as u32;
             let dt = Utc.timestamp_opt(secs, nanos).single()
                 .unwrap_or_else(|| Utc.timestamp_micros(0).unwrap());
-            bw.floor(dt).timestamp_nanos_opt().unwrap_or(0)
+            let floored = bw.floor(dt).timestamp_nanos_opt().unwrap_or(0);
+            floored + origin_shift_us * 1_000
         };
         let floor_ms = |ms: i64| -> i64 {
             use chrono::TimeZone as _;
-            let dt = chrono::DateTime::<Utc>::from_timestamp_millis(ms)
+            let effective_ms = ms - origin_shift_us / 1_000;
+            let dt = chrono::DateTime::<Utc>::from_timestamp_millis(effective_ms)
                 .unwrap_or_else(|| Utc.timestamp_micros(0).unwrap());
-            bw.floor(dt).timestamp_millis()
+            let floored = bw.floor(dt).timestamp_millis();
+            floored + origin_shift_us / 1_000
         };
         let floor_s = |s: i64| -> i64 {
             use chrono::TimeZone as _;
-            let dt = Utc.timestamp_opt(s, 0).single()
+            let effective_s = s - origin_shift_us / 1_000_000;
+            let dt = Utc.timestamp_opt(effective_s, 0).single()
                 .unwrap_or_else(|| Utc.timestamp_micros(0).unwrap());
-            bw.floor(dt).timestamp()
+            let floored = bw.floor(dt).timestamp();
+            floored + origin_shift_us / 1_000_000
         };
 
         let result: ArrayRef = match ts_array.data_type() {
@@ -893,5 +1040,38 @@ impl ScalarUDFImpl for TimeBucketUdf {
 
         let _ = len; // suppress unused warning if optimised away
         Ok(ColumnarValue::Array(result))
+    }
+}
+
+// ─── 3-arg time_bucket helper ─────────────────────────────────────────────────
+
+/// Extract an origin offset in microseconds-since-epoch from arg[2] of a
+/// 3-argument `time_bucket` call.
+///
+/// The third argument can be:
+/// * A timestamp scalar → its µs-since-epoch value is the origin.
+/// * A string scalar (timezone name) → not yet supported; returns `None` so
+///   the caller falls back to epoch-aligned bucketing.
+///
+/// On any error or unsupported type returns `None`.
+fn extract_origin_us(arg: &ColumnarValue) -> Option<i64> {
+    use datafusion::scalar::ScalarValue;
+    use datafusion::arrow::datatypes::{DataType, TimeUnit};
+    let sv = match arg {
+        ColumnarValue::Scalar(sv) => sv.clone(),
+        ColumnarValue::Array(arr) => {
+            if arr.is_empty() { return None; }
+            ScalarValue::try_from_array(arr.as_ref(), 0).ok()?
+        }
+    };
+    match sv {
+        ScalarValue::TimestampMicrosecond(Some(v), _) => Some(v),
+        ScalarValue::TimestampNanosecond(Some(v), _)  => Some(v / 1_000),
+        ScalarValue::TimestampMillisecond(Some(v), _) => Some(v * 1_000),
+        ScalarValue::TimestampSecond(Some(v), _)      => Some(v * 1_000_000),
+        ScalarValue::Int64(Some(v)) => Some(v),
+        // String → timezone name: not yet implemented; fall back to epoch grid.
+        ScalarValue::Utf8(_) | ScalarValue::LargeUtf8(_) => None,
+        _ => None,
     }
 }

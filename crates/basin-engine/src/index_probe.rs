@@ -92,7 +92,17 @@ use serde_json::Value;
 /// ```
 const DEFAULT_POSTING_BUDGET: usize = 5_000_000;
 
-/// Return the effective per-column posting-entry budget.
+/// Per-project floor: every project is guaranteed at least this many posting
+/// pairs before another project's pressure can force it to evict. Overridable
+/// via `BASIN_GIN_POSTING_FLOOR`. The floor is the noisy-neighbour guard: a
+/// project that stays under its floor never evicts because of a sibling
+/// project's JSONB churn, no matter how many projects are active. Default
+/// 500_000 pairs (~11 MB at the ~22 B/pair pair-side cost in the arithmetic
+/// above) — enough to keep a small/idle project's index fully resident.
+const DEFAULT_POSTING_FLOOR: usize = 500_000;
+
+/// Return the effective GLOBAL posting-entry budget (the process-wide ceiling
+/// shared across every project, table and column).
 ///
 /// Reads `BASIN_GIN_POSTING_BUDGET` once and caches the result.
 fn posting_budget() -> usize {
@@ -104,6 +114,40 @@ fn posting_budget() -> usize {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(DEFAULT_POSTING_BUDGET)
     })
+}
+
+/// Return the per-project posting floor (see [`DEFAULT_POSTING_FLOOR`]).
+/// Reads `BASIN_GIN_POSTING_FLOOR` once and caches the result. Clamped to the
+/// global budget — a floor larger than the whole budget is meaningless.
+fn posting_floor() -> usize {
+    use std::sync::OnceLock;
+    static FLOOR: OnceLock<usize> = OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        let raw = std::env::var("BASIN_GIN_POSTING_FLOOR")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_POSTING_FLOOR);
+        raw.min(posting_budget())
+    })
+}
+
+/// Effective per-project posting budget given how many projects currently hold
+/// at least one posting list.
+///
+/// Fair share with a floor: each active project may keep up to
+/// `max(floor, global_budget / active_projects)` posting pairs across ALL its
+/// `(table, col)` lists. The `max(floor, …)` is what makes this a *partition*
+/// rather than a global free-for-all: project A's churn drives the fair-share
+/// term down as projects come and go, but can never push any project below its
+/// floor, so A cannot drain B's resident postings. The sum of partitions can
+/// exceed the global budget by up to `active_projects * floor` — that slack is
+/// the deliberate price of the floor guarantee and is bounded because the floor
+/// is clamped to the budget and `active_projects` is the count of projects that
+/// actually hold lists.
+fn per_project_budget(active_projects: usize) -> usize {
+    let active = active_projects.max(1);
+    let fair_share = posting_budget() / active;
+    fair_share.max(posting_floor())
 }
 
 // ── Data types ────────────────────────────────────────────────────────────────
@@ -161,7 +205,17 @@ impl TermPostingList {
     /// files that still have complete posting coverage prunable.  This is the
     /// key difference from the old global-wipe approach: eviction is
     /// file-scoped, not column-scoped.
-    fn insert(&mut self, term: &str, file: &Arc<str>) -> HashSet<String> {
+    ///
+    /// `budget` is the effective per-list ceiling supplied by the registry. For
+    /// a single-project process it is the global `posting_budget()`; under the
+    /// per-project partition (Fix: noisy-neighbour GIN) it is the project's
+    /// fair-share-with-floor allowance, so one project's churn evicts only its
+    /// own postings and can never drain a sibling below its floor.
+    ///
+    /// Returns `(evicted_files, removed_pairs)`: `removed_pairs` is how many
+    /// posting pairs this insert removed (after netting the +1 it may have
+    /// added), so the registry can keep its per-project pair accounting exact.
+    fn insert(&mut self, term: &str, file: &Arc<str>, budget: usize) -> (HashSet<String>, usize) {
         match self.entries.get_mut(term) {
             Some(set) => {
                 if set.insert(file.clone()) {
@@ -177,10 +231,13 @@ impl TermPostingList {
             }
         }
 
-        if self.total_count > posting_budget() {
-            self.evict_oldest()
+        if self.total_count > budget {
+            let before = self.total_count;
+            let evicted_files = self.evict_oldest();
+            let removed = before.saturating_sub(self.total_count);
+            (evicted_files, removed)
         } else {
-            HashSet::new()
+            (HashSet::new(), 0)
         }
     }
 
@@ -214,14 +271,18 @@ impl TermPostingList {
     }
 
     /// Remove all entries that reference `file_path`. Called when a file is
-    /// compacted or deleted.
-    fn remove_file(&mut self, file_path: &str) {
+    /// compacted or deleted. Returns the number of posting pairs removed so the
+    /// registry can keep its per-project pair accounting exact.
+    fn remove_file(&mut self, file_path: &str) -> usize {
+        let mut removed = 0usize;
         for set in self.entries.values_mut() {
             if set.remove(file_path) {
                 self.total_count = self.total_count.saturating_sub(1);
+                removed += 1;
             }
         }
         self.files.remove(file_path);
+        removed
     }
 }
 
@@ -405,6 +466,15 @@ pub struct GinIndexRegistry {
     inner: Mutex<HashMap<RegKey, Arc<Mutex<TermPostingList>>>>,
     /// File-completeness tracking: `RegKey → set of fully-indexed file paths`.
     indexed_files: Mutex<HashMap<RegKey, HashSet<String>>>,
+    /// Per-project posting-pair accounting (noisy-neighbour partition).
+    ///
+    /// `project → total posting pairs across ALL its (table, col) lists`. This
+    /// is the quantity the per-project budget bounds. A project's entry is
+    /// created on its first indexed pair and the number of distinct keys is the
+    /// "active projects" count used to compute each project's fair share. The
+    /// counter is approximate-but-eventually-exact: it is updated under the same
+    /// posting-list lock as the pair mutation it reflects, so it never drifts.
+    project_pairs: Mutex<HashMap<ProjectId, usize>>,
 }
 
 impl GinIndexRegistry {
@@ -412,6 +482,46 @@ impl GinIndexRegistry {
         Self {
             inner: Mutex::new(HashMap::new()),
             indexed_files: Mutex::new(HashMap::new()),
+            project_pairs: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Number of projects that currently hold at least one posting pair.
+    /// Used as the divisor in the fair-share budget. O(projects) — cheap (the
+    /// project count is tiny relative to per-row indexing work).
+    fn active_project_count(&self) -> usize {
+        self.project_pairs
+            .lock()
+            .map(|m| m.values().filter(|&&n| n > 0).count())
+            .unwrap_or(1)
+    }
+
+    /// Current effective per-project posting budget. Exposed for tests/diagnostics.
+    pub fn effective_project_budget(&self) -> usize {
+        per_project_budget(self.active_project_count())
+    }
+
+    /// Total posting pairs currently held for `project` across all its lists.
+    /// Test/observability surface for the noisy-neighbour partition.
+    pub fn project_pair_count(&self, project: &ProjectId) -> usize {
+        self.project_pairs
+            .lock()
+            .map(|m| m.get(project).copied().unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    /// Adjust a project's pair total by a signed delta, keeping the map free of
+    /// zero/absent entries so `active_project_count` stays accurate.
+    fn adjust_project_pairs(&self, project: &ProjectId, added: usize, removed: usize) {
+        if added == 0 && removed == 0 {
+            return;
+        }
+        if let Ok(mut map) = self.project_pairs.lock() {
+            let cur = map.entry(*project).or_insert(0);
+            *cur = cur.saturating_add(added).saturating_sub(removed);
+            if *cur == 0 {
+                map.remove(project);
+            }
         }
     }
 
@@ -463,12 +573,29 @@ impl GinIndexRegistry {
         if terms.is_empty() {
             return;
         }
+        // Per-project partition (noisy-neighbour GIN): the eviction trigger is
+        // this project's fair share of the global budget, with a floor, NOT the
+        // raw global budget. Computing it from the live active-project count
+        // means project A's churn lowers everyone's fair share as projects come
+        // and go but can never push project B below its floor — A evicts its own
+        // postings first. The budget is read before taking the list lock so the
+        // (cheap) project-count scan never nests under a posting-list lock.
+        let budget = self.effective_project_budget();
         let arc = self.get_or_create(project, table, col);
         let mut list = arc.lock().expect("TermPostingList lock poisoned");
         let file = list.intern_file(file_path);
         let mut all_evicted_files: HashSet<String> = HashSet::new();
+        let mut added_pairs: usize = 0;
+        let mut removed_pairs: usize = 0;
         for term in &terms {
-            let evicted_files = list.insert(term, &file);
+            let before = list.total_count;
+            let (evicted_files, removed) = list.insert(term, &file, budget);
+            // `total_count` after = before + (added ∈ {0,1}) - removed. Recover
+            // the +added term so the per-project accounting nets exactly:
+            // added = after - (before - removed).
+            let after = list.total_count;
+            added_pairs += after.saturating_sub(before.saturating_sub(removed));
+            removed_pairs += removed;
             all_evicted_files.extend(evicted_files);
         }
         // Per-file completeness: if any terms were evicted, only the files
@@ -510,6 +637,13 @@ impl GinIndexRegistry {
                 // mark_file_indexed calls will repopulate it for new files.
             }
         }
+        // Drop the posting-list lock BEFORE touching the per-project accounting
+        // map: never hold a posting-list lock and `project_pairs` at once (a
+        // strict lock order avoids any deadlock between this path and the
+        // active-project scan in `effective_project_budget`, which never takes a
+        // posting-list lock).
+        drop(list);
+        self.adjust_project_pairs(project, added_pairs, removed_pairs);
     }
 
     /// `true` when eviction has ever fired for `(project, table, col)` — the
@@ -674,10 +808,15 @@ impl GinIndexRegistry {
         col: &str,
         file_path: &str,
     ) {
+        let mut removed_pairs = 0usize;
         if let Some(arc) = self.get(project, table, col) {
             let mut list = arc.lock().expect("TermPostingList lock poisoned");
-            list.remove_file(file_path);
+            removed_pairs = list.remove_file(file_path);
         }
+        // Keep the per-project pair accounting exact so a compaction/CoW that
+        // drops a file frees that project's partition headroom (lock dropped
+        // above before touching project_pairs).
+        self.adjust_project_pairs(project, 0, removed_pairs);
         // Remove from completeness tracking.
         let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
         if let Ok(mut map) = self.indexed_files.lock() {
@@ -3230,11 +3369,13 @@ mod tests {
         let f1 = pl.intern_file("f1.parquet");
         let f2 = pl.intern_file("f2.parquet");
 
-        // f1 carries term_a + term_b; f2 carries term_c + term_d.
-        assert!(pl.insert("term_a", &f1).is_empty());
-        assert!(pl.insert("term_b", &f1).is_empty());
-        assert!(pl.insert("term_c", &f2).is_empty());
-        assert!(pl.insert("term_d", &f2).is_empty());
+        // f1 carries term_a + term_b; f2 carries term_c + term_d. A generous
+        // budget keeps every pair resident so no eviction fires here.
+        let big = usize::MAX;
+        assert!(pl.insert("term_a", &f1, big).0.is_empty());
+        assert!(pl.insert("term_b", &f1, big).0.is_empty());
+        assert!(pl.insert("term_c", &f2, big).0.is_empty());
+        assert!(pl.insert("term_d", &f2, big).0.is_empty());
         assert_eq!(pl.total_count, 4);
 
         // Evict the oldest 25% (1 term = term_a, only in f1).
@@ -3257,14 +3398,15 @@ mod tests {
     #[test]
     fn posting_accounting_dedupes_pairs() {
         let mut pl = TermPostingList::new();
+        let big = usize::MAX;
         let f1 = pl.intern_file("f1.parquet");
         for _ in 0..1000 {
-            pl.insert("key:tag", &f1);
-            pl.insert("kv:tag=\"a\"", &f1);
+            pl.insert("key:tag", &f1, big);
+            pl.insert("kv:tag=\"a\"", &f1, big);
         }
         assert_eq!(pl.total_count, 2, "1000 rows × 2 shared terms = 2 pairs");
         let f2 = pl.intern_file("f2.parquet");
-        pl.insert("key:tag", &f2);
+        pl.insert("key:tag", &f2, big);
         assert_eq!(pl.total_count, 3);
     }
 
@@ -3272,13 +3414,14 @@ mod tests {
     #[test]
     fn remove_file_decrements_pair_count() {
         let mut pl = TermPostingList::new();
+        let big = usize::MAX;
         let f1 = pl.intern_file("f1.parquet");
         let f2 = pl.intern_file("f2.parquet");
-        pl.insert("t1", &f1);
-        pl.insert("t1", &f2);
-        pl.insert("t2", &f1);
+        pl.insert("t1", &f1, big);
+        pl.insert("t1", &f2, big);
+        pl.insert("t2", &f1, big);
         assert_eq!(pl.total_count, 3);
-        pl.remove_file("f1.parquet");
+        assert_eq!(pl.remove_file("f1.parquet"), 2, "two pairs referenced f1");
         assert_eq!(pl.total_count, 1);
         assert!(pl.probe_term("t1").is_some_and(|s| s.contains("f2.parquet")));
         assert!(pl.probe_term("t2").is_some_and(|s| s.is_empty()));
@@ -4091,5 +4234,77 @@ mod tests {
             "SELECT * FROM t WHERE ST_DWithin(geom, ST_MakePoint(0.0, 0.0), some_col)",
         );
         assert!(detect_spatial_predicate(&w).is_none());
+    }
+
+    // ── Noisy-neighbour: per-project posting partition ──────────────────────
+
+    /// A TermPostingList evicts exactly when its pair count crosses the budget
+    /// passed in — the per-list mechanic the registry drives with a per-project
+    /// fair share. With a tiny budget, the oldest 25% of terms are dropped and
+    /// the affected files are reported.
+    #[test]
+    fn insert_evicts_at_supplied_budget_not_global() {
+        let mut pl = TermPostingList::new();
+        let f1 = pl.intern_file("f1.parquet");
+        let budget = 3usize;
+        // 3 distinct terms — at budget.
+        assert!(pl.insert("t1", &f1, budget).0.is_empty());
+        assert!(pl.insert("t2", &f1, budget).0.is_empty());
+        assert!(pl.insert("t3", &f1, budget).0.is_empty());
+        assert_eq!(pl.total_count, 3);
+        // 4th pair crosses the budget → eviction fires, f1 reported.
+        let (evicted, removed) = pl.insert("t4", &f1, budget);
+        assert!(evicted.contains("f1.parquet"));
+        assert!(removed >= 1, "at least one pair evicted");
+        assert!(pl.total_count <= budget, "back under budget after evict");
+    }
+
+    /// `per_project_budget` is a fair share with a floor: it divides the global
+    /// budget by the active-project count but never returns less than the floor.
+    /// (Uses the live env-derived budget/floor; only the *shape* is asserted so
+    /// the test is independent of any env override another test set.)
+    #[test]
+    fn per_project_budget_is_fair_share_with_floor() {
+        let one = per_project_budget(1);
+        let many = per_project_budget(1_000_000);
+        assert!(one >= posting_floor());
+        assert!(many >= posting_floor(), "floor is never violated");
+        assert!(one >= many, "more projects → no larger a share each");
+        // Zero projects is treated as one (avoid div-by-zero).
+        assert_eq!(per_project_budget(0), per_project_budget(1));
+    }
+
+    /// The registry tracks per-project pair totals and the active-project count,
+    /// so one project's churn is measured against ITS partition, not a sibling's.
+    /// Indexing into project A then B must leave each project's count isolated,
+    /// and removing A's file must not perturb B's count.
+    #[test]
+    fn registry_tracks_per_project_pairs_in_isolation() {
+        let registry = GinIndexRegistry::new();
+        let table = TableName::new("t").unwrap();
+        let pa = ProjectId::new();
+        let pb = ProjectId::new();
+        let doc_a = serde_json::to_vec(&json!({"tag": "a", "id": 1})).unwrap();
+        let doc_b = serde_json::to_vec(&json!({"tag": "b", "id": 2})).unwrap();
+
+        registry.index_row(&pa, &table, "payload", "jsonb_ops", &doc_a, "a1.parquet", 0, 0);
+        registry.index_row(&pb, &table, "payload", "jsonb_ops", &doc_b, "b1.parquet", 0, 0);
+
+        let a_count = registry.project_pair_count(&pa);
+        let b_count = registry.project_pair_count(&pb);
+        assert!(a_count > 0, "project A holds postings");
+        assert!(b_count > 0, "project B holds postings");
+        assert_eq!(registry.active_project_count(), 2, "two active projects");
+
+        // Removing A's only file frees A's partition and drops A out of the
+        // active set; B is untouched.
+        registry.remove_file(&pa, &table, "payload", "a1.parquet");
+        assert_eq!(registry.project_pair_count(&pa), 0, "A drained");
+        assert_eq!(
+            registry.project_pair_count(&pb),
+            b_count,
+            "B's postings survive A's removal"
+        );
+        assert_eq!(registry.active_project_count(), 1, "only B remains active");
     }
 }

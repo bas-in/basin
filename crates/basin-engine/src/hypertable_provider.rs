@@ -1,10 +1,11 @@
-//! Phase 5.29.C — virtual `timescaledb_information.chunks` table provider.
+//! Phase 5.29.C — virtual `timescaledb_information` schema providers.
 //!
-//! Serves a synchronous Arrow snapshot of the hypertable chunk registry for
-//! the calling project.  DataFusion can filter / project the result on top;
-//! we do not implement predicate pushdown (v0.1 — the chunk list is tiny).
+//! Exposes two virtual tables under the `timescaledb_information` schema:
 //!
-//! ## Schema
+//! ## `timescaledb_information.chunks`
+//!
+//! Serves a synchronous Arrow snapshot of chunk metadata from the
+//! HypertableRegistry for the calling project.
 //!
 //! | column          | type    | notes                         |
 //! |-----------------|---------|-------------------------------|
@@ -14,11 +15,23 @@
 //! | range_start     | Utf8    | ISO-8601 UTC                  |
 //! | range_end       | Utf8    | ISO-8601 UTC (exclusive)      |
 //! | is_compressed   | Boolean |                               |
+//!
+//! ## `timescaledb_information.hypertables`
+//!
+//! Serves one row per hypertable registered for the calling project.
+//!
+//! | column                | type  | notes                              |
+//! |-----------------------|-------|------------------------------------|
+//! | hypertable_name       | Utf8  | base table name                    |
+//! | hypertable_schema     | Utf8  | always `"public"` in v0.1          |
+//! | num_chunks            | Int64 | number of live chunks              |
+//! | chunk_interval_secs   | Int64 | chunk partitioning interval        |
+//! | retention_secs        | Int64 | retention window in seconds, or -1 |
 
 use std::any::Any;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, BooleanArray, StringArray};
+use arrow_array::{ArrayRef, BooleanArray, Int64Array, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use basin_common::ProjectId;
@@ -32,7 +45,7 @@ use datafusion::physical_plan::ExecutionPlan;
 
 use crate::hypertable::HypertableRegistry;
 
-// ─── schema ───────────────────────────────────────────────────────────────────
+// ─── chunks schema ────────────────────────────────────────────────────────────
 
 fn chunks_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -45,7 +58,19 @@ fn chunks_schema() -> Arc<Schema> {
     ]))
 }
 
-// ─── provider ────────────────────────────────────────────────────────────────
+// ─── hypertables schema ───────────────────────────────────────────────────────
+
+fn hypertables_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("hypertable_name",     DataType::Utf8,  false),
+        Field::new("hypertable_schema",   DataType::Utf8,  false),
+        Field::new("num_chunks",          DataType::Int64, false),
+        Field::new("chunk_interval_secs", DataType::Int64, false),
+        Field::new("retention_secs",      DataType::Int64, false),
+    ]))
+}
+
+// ─── ChunksProvider ──────────────────────────────────────────────────────────
 
 /// `TableProvider` for `timescaledb_information.chunks` filtered to the
 /// calling project.
@@ -133,10 +158,95 @@ impl TableProvider for ChunksProvider {
     }
 }
 
+// ─── HypertablesProvider ─────────────────────────────────────────────────────
+
+/// `TableProvider` for `timescaledb_information.hypertables`.
+///
+/// One row per hypertable registered for the calling project.
+#[derive(Debug)]
+pub(crate) struct HypertablesProvider {
+    registry: Arc<HypertableRegistry>,
+    project: ProjectId,
+    schema: DfSchemaRef,
+}
+
+impl HypertablesProvider {
+    pub(crate) fn new(registry: Arc<HypertableRegistry>, project: ProjectId) -> Self {
+        Self {
+            registry,
+            project,
+            schema: hypertables_schema(),
+        }
+    }
+
+    async fn build_batch(&self) -> DfResult<datafusion::arrow::record_batch::RecordBatch> {
+        let rows = self.registry.snapshot_hypertables(&self.project).await;
+
+        let mut names:           Vec<String> = Vec::with_capacity(rows.len());
+        let mut schemas:         Vec<String> = Vec::with_capacity(rows.len());
+        let mut num_chunks:      Vec<i64>    = Vec::with_capacity(rows.len());
+        let mut interval_secs:   Vec<i64>    = Vec::with_capacity(rows.len());
+        let mut retention_secs:  Vec<i64>    = Vec::with_capacity(rows.len());
+
+        for (name, ht) in &rows {
+            names.push(name.clone());
+            schemas.push("public".to_string());
+            num_chunks.push(ht.chunks.len() as i64);
+            interval_secs.push(ht.chunk_interval_secs as i64);
+            // Use -1 to indicate "no retention policy" (NULL would need Option<i64>
+            // in the array; -1 is simpler and easy to filter on).
+            retention_secs.push(ht.retention_secs.map(|s| s as i64).unwrap_or(-1));
+        }
+
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(names)),
+            Arc::new(StringArray::from(schemas)),
+            Arc::new(Int64Array::from(num_chunks)),
+            Arc::new(Int64Array::from(interval_secs)),
+            Arc::new(Int64Array::from(retention_secs)),
+        ];
+
+        datafusion::arrow::record_batch::RecordBatch::try_new(self.schema.clone(), arrays)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    }
+}
+
+#[async_trait]
+impl TableProvider for HypertablesProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> DfSchemaRef {
+        self.schema.clone()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::View
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let batch = self.build_batch().await?;
+        let batches = vec![vec![batch]];
+        let exec = MemorySourceConfig::try_new_exec(
+            &batches,
+            self.schema.clone(),
+            projection.cloned(),
+        )?;
+        Ok(exec)
+    }
+}
+
 // ─── schema provider ─────────────────────────────────────────────────────────
 
 /// Schema provider for `timescaledb_information` that exposes the `chunks`
-/// virtual table.
+/// and `hypertables` virtual tables.
 pub(crate) struct TimescaleInfoSchema {
     registry: Arc<HypertableRegistry>,
     project: ProjectId,
@@ -161,12 +271,17 @@ impl SchemaProvider for TimescaleInfoSchema {
     }
 
     fn table_names(&self) -> Vec<String> {
-        vec!["chunks".to_string()]
+        vec!["chunks".to_string(), "hypertables".to_string()]
     }
 
     async fn table(&self, name: &str) -> DfResult<Option<Arc<dyn TableProvider>>> {
         if name.eq_ignore_ascii_case("chunks") {
             Ok(Some(Arc::new(ChunksProvider::new(
+                self.registry.clone(),
+                self.project,
+            ))))
+        } else if name.eq_ignore_ascii_case("hypertables") {
+            Ok(Some(Arc::new(HypertablesProvider::new(
                 self.registry.clone(),
                 self.project,
             ))))
@@ -176,6 +291,6 @@ impl SchemaProvider for TimescaleInfoSchema {
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        name.eq_ignore_ascii_case("chunks")
+        name.eq_ignore_ascii_case("chunks") || name.eq_ignore_ascii_case("hypertables")
     }
 }

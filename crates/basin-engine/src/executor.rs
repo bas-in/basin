@@ -407,8 +407,10 @@ pub(crate) fn needs_rewrite_pipeline(sql: &str) -> bool {
     //         A trivial point-query has zero `(` so this is a safe trigger.
     let has_symbol_marker = bytes
         .windows(2)
-        .any(|w| matches!(w, b"::" | b"->" | b"<-" | b"<#" | b"<=" | b"B'"))
-        || bytes.iter().any(|&b| matches!(b, b'@' | b'~' | b'?' | b'&' | b'|' | b'#' | b'('));
+        // `<%` — trgm word-similarity operator `a <% b` (2-byte window catches it;
+        // also catches `<->` via the existing `<-` window below).
+        .any(|w| matches!(w, b"::" | b"->" | b"<-" | b"<#" | b"<=" | b"B'" | b"<%"))
+        || bytes.iter().any(|&b| matches!(b, b'@' | b'~' | b'?' | b'&' | b'|' | b'#' | b'(' | b'%'));
     if has_symbol_marker {
         return true;
     }
@@ -655,6 +657,17 @@ async fn run_full_rewrite_pipeline(sess: &ProjectSession, sql: &str) -> Result<S
     let rewritten = crate::range_udf::rewrite_range_operators(&rewritten);
     // Rewrite `'...'::int4range` / `'...'::daterange` etc. to just `'...'`.
     let rewritten = crate::range_udf::rewrite_range_casts(&rewritten);
+    // Rewrite pg_trgm operators (`%`, `<%`, `<->`) to function-call forms.
+    // Runs after `rewrite_vector_operators` so that pgvector `<->` has already
+    // been expanded to `l2_distance`; any remaining `<->` is either a text
+    // trigram distance or a tsquery phrase operator inside a string literal
+    // (quote-aware scan protects the literal case).
+    // `%` / modulo: skipped when both operands are bare numeric literals.
+    let rewritten = crate::trgm_glue::rewrite_trgm_operators(
+        &rewritten,
+        crate::session::session_trgm_similarity_threshold(&sess.state),
+        crate::session::session_trgm_word_similarity_threshold(&sess.state),
+    );
     // Rewrite `SUBSTRING(<expr> FROM '<regex>')` into `substring_regex(...)`.
     let rewritten = crate::regex_udf::rewrite_substring_regex(&rewritten);
     // Route `EXTRACT(SECOND FROM <expr>)` to the Basin UDF.
@@ -1577,6 +1590,11 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
         return exec_add_retention_policy(sess, &rp_table, &rp_interval).await;
     }
 
+    // ── Phase 5.29.F: SELECT drop_chunks('table', older_than => INTERVAL/TS) ─
+    if let Some((dc_table, dc_cutoff)) = crate::hypertable::match_drop_chunks(raw_sql) {
+        return exec_drop_chunks(sess, &dc_table, dc_cutoff).await;
+    }
+
     // ── Phase 5.29.D: SELECT run_retention_policy('table') ──────────────────
     if let Some(rp_table) = crate::hypertable::match_run_retention_policy(raw_sql) {
         return exec_run_retention_policy(sess, &rp_table).await;
@@ -2045,6 +2063,61 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     .await
 }
 
+/// Identify the SINGLE target table a non-SELECT statement mutates, when it is
+/// an unambiguous single-table DML on a bare table name (INSERT / UPDATE /
+/// DELETE). Returns `None` for anything else — DDL, multi-table DML, joined
+/// UPDATE/DELETE, CTE-wrapped DML, or any shape we cannot pin to exactly one
+/// table — so the dispatch-top cache invalidation can fall back to the broad
+/// (whole-cache) clear for those, preserving correctness.
+///
+/// Concurrency fix #4: a write to table A must not evict table B's cached
+/// provider / head / PK rows. For the overwhelmingly common OLTP shape (an
+/// auto-commit single-table INSERT/UPDATE/DELETE) this lets us scope the
+/// invalidation to exactly the table that changed.
+fn dml_single_target_table(stmt: &Statement) -> Option<TableName> {
+    use sqlparser::ast::{FromTable, TableFactor};
+
+    // Extract a bare `TableName` from a `TableWithJoins` that has no joins and a
+    // plain `TableFactor::Table` relation (no table-valued args).
+    fn bare(twj: &sqlparser::ast::TableWithJoins) -> Option<TableName> {
+        if !twj.joins.is_empty() {
+            return None;
+        }
+        match &twj.relation {
+            TableFactor::Table { name, args, .. } if args.is_none() => {
+                TableName::new(single_part_name(name).ok()?).ok()
+            }
+            _ => None,
+        }
+    }
+
+    match stmt {
+        Statement::Insert(ins) => {
+            let name = crate::pg_ast::insert_object_name(ins).ok()?;
+            TableName::new(single_part_name(name).ok()?).ok()
+        }
+        Statement::Update(sqlparser::ast::Update { table, from, .. }) => {
+            // A joined UPDATE (`UPDATE a SET … FROM b`) reads b but mutates only
+            // a. Stay conservative: scope only when there is no FROM clause and
+            // the target is a bare, join-free table.
+            if from.is_some() {
+                return None;
+            }
+            bare(table)
+        }
+        Statement::Delete(del) => {
+            let tables = match &del.from {
+                FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
+            };
+            if tables.len() != 1 {
+                return None;
+            }
+            bare(&tables[0])
+        }
+        _ => None,
+    }
+}
+
 /// Dispatch an already-parsed `Statement` through the engine's cache-
 /// invalidation gate, cost check, RLS-DDL intercept, fast paths, and the
 /// big statement `match`.
@@ -2115,27 +2188,56 @@ async fn dispatch_parsed_statement(
     let stmt_keeps_cache = matches!(stmt, Statement::Query(_))
         || (in_txn_for_cache && matches!(stmt, Statement::Insert(_)));
     if !stmt_keeps_cache {
-        sess.state.table_meta_cache.invalidate_all();
-        // Fix B+C provider cache: the same statement classes that flush the
-        // table-meta cache can change a table's schema, file set or overlay
-        // shape. Most are caught by the per-query `(snapshot, hot_epoch)` key,
-        // but metadata-only DDL (ENABLE RLS, ADD COLUMN no-rewrite, JSONB
-        // promotion) may not advance the snapshot AND may not bump the hot
-        // epoch, so clear the built-provider + head-probe caches here too. The
-        // head-probe cache also self-invalidates on the catalog-epoch bump these
-        // DDLs raise; this eager clear covers same-session visibility within the
-        // current statement.
-        sess.state.provider_cache.invalidate_all();
-        sess.state.head_probe_cache.invalidate_all();
-        // PK row cache (always-on): the same statement classes that
-        // flush the table-meta cache — any non-SELECT, plus DML — can change a
-        // table's schema or rewrite its rows. Most are caught by the cache's
-        // dual watermark (snapshot id + hot epoch), but metadata-only DDL (e.g.
-        // ENABLE ROW LEVEL SECURITY, ADD COLUMN with no rewrite) may not bump
-        // `current_snapshot`; clear the project's PK rows here so a schema or
-        // policy change can never serve a stale/old-shape row. Cheap no-op when
-        // the cache is empty for this project.
-        sess.engine.pk_row_cache().invalidate_project(&sess.project);
+        // Concurrency fix #4: scope invalidation to the SINGLE mutated table
+        // when the statement is an unambiguous single-table INSERT/UPDATE/DELETE
+        // on a bare table. A write to table A then no longer evicts table B's
+        // still-valid cached provider / head / PK rows — the read-path
+        // serialization the 16-session and mixed-RW benches exposed (every write
+        // dumping every other table's cache, forcing a cold rebuild on the next
+        // read). For DDL, multi-table DML, joined/CTE DML, or any shape we
+        // cannot pin to exactly one table, `dml_single_target_table` returns
+        // `None` and we fall back to the original whole-cache clear, preserving
+        // correctness (DDL can change schema/RLS/views/indexes project-wide).
+        //
+        // Why per-table is sound for the scoped case: a single-table DML can
+        // only change THAT table's data files / overlay / rows. It does NOT
+        // touch any other table's schema, RLS, view bindings, file set or
+        // overlay — exactly the state the provider / head / PK caches model —
+        // so evicting only that table's entries is complete. The mutated
+        // table's own entries are invalidated for the same reasons the broad
+        // clear cited: an INSERT advances `current_snapshot` (per-statement
+        // commit on the auto-commit path), and a fast-path UPDATE/DELETE writes
+        // an overlay — both of which a later read must observe.
+        if let Some(target) = dml_single_target_table(&stmt) {
+            sess.state.table_meta_cache.invalidate(&target);
+            sess.state.provider_cache.invalidate(&target);
+            sess.state.head_probe_cache.invalidate(&target);
+            sess.engine
+                .pk_row_cache()
+                .invalidate_table(&sess.project, &target);
+        } else {
+            sess.state.table_meta_cache.invalidate_all();
+            // Fix B+C provider cache: the same statement classes that flush the
+            // table-meta cache can change a table's schema, file set or overlay
+            // shape. Most are caught by the per-query `(snapshot)` key, but
+            // metadata-only DDL (ENABLE RLS, ADD COLUMN no-rewrite, JSONB
+            // promotion) may not advance the snapshot, so clear the
+            // built-provider + head-probe caches here too. The head-probe cache
+            // also self-invalidates on the catalog-epoch bump these DDLs raise;
+            // this eager clear covers same-session visibility within the current
+            // statement.
+            sess.state.provider_cache.invalidate_all();
+            sess.state.head_probe_cache.invalidate_all();
+            // PK row cache (always-on): the same statement classes that flush
+            // the table-meta cache — any non-SELECT we could not scope — can
+            // change a table's schema or rewrite its rows. Most are caught by
+            // the cache's dual watermark (snapshot id + hot epoch), but
+            // metadata-only DDL (e.g. ENABLE ROW LEVEL SECURITY, ADD COLUMN with
+            // no rewrite) may not bump `current_snapshot`; clear the project's
+            // PK rows here so a schema or policy change can never serve a
+            // stale/old-shape row. Cheap no-op when the cache is empty.
+            sess.engine.pk_row_cache().invalidate_project(&sess.project);
+        }
     }
 
     // Phase 6 cost-based query rejection. Cheap when disabled (one
@@ -2396,6 +2498,39 @@ async fn dispatch_parsed_statement(
                 let on = crate::session::parse_pg_bool(&raw)?;
                 crate::session::set_session_synchronous_commit(&sess.state, on);
                 Ok(ExecResult::Empty { tag: "SET".into() })
+            } else if var_name == "pg_trgm.similarity_threshold" {
+                // SET pg_trgm.similarity_threshold = 0.4
+                // Controls the `a % b` operator threshold for this session.
+                let raw = extract_set_string_value(&values);
+                let trimmed = raw.trim().trim_matches('\'').trim_matches('"').trim();
+                match trimmed.parse::<f32>() {
+                    Ok(v) => {
+                        crate::session::set_session_trgm_similarity_threshold(&sess.state, v);
+                        Ok(ExecResult::Empty { tag: "SET".into() })
+                    }
+                    Err(_) => Err(basin_common::BasinError::InvalidSchema(format!(
+                        "invalid value for pg_trgm.similarity_threshold: {trimmed:?} \
+                         (expected a float in [0.0, 1.0])"
+                    ))),
+                }
+            } else if var_name == "pg_trgm.word_similarity_threshold" {
+                // SET pg_trgm.word_similarity_threshold = 0.5
+                // Controls the `a <% b` operator threshold for this session.
+                let raw = extract_set_string_value(&values);
+                let trimmed = raw.trim().trim_matches('\'').trim_matches('"').trim();
+                match trimmed.parse::<f32>() {
+                    Ok(v) => {
+                        crate::session::set_session_trgm_word_similarity_threshold(
+                            &sess.state,
+                            v,
+                        );
+                        Ok(ExecResult::Empty { tag: "SET".into() })
+                    }
+                    Err(_) => Err(basin_common::BasinError::InvalidSchema(format!(
+                        "invalid value for pg_trgm.word_similarity_threshold: {trimmed:?} \
+                         (expected a float in [0.0, 1.0])"
+                    ))),
+                }
             } else {
                 // Silently accept unknown SET variables.
                 Ok(ExecResult::Empty { tag: "SET".into() })
@@ -3065,6 +3200,22 @@ async fn dispatch_parsed_statement(
                 // arrives as `basin_synchronous_commit`.
                 let val = crate::session::show_synchronous_commit(&sess.state);
                 Ok(make_show_result("basin.synchronous_commit", val))
+            } else if var_name == "pg_trgm_similarity_threshold"
+                || var_name == "pg_trgm.similarity_threshold"
+            {
+                // SHOW pg_trgm.similarity_threshold
+                // sqlparser joins dotted names with `_`, so both forms must match.
+                let v = crate::session::session_trgm_similarity_threshold(&sess.state);
+                Ok(make_show_result("pg_trgm.similarity_threshold", &format!("{v}")))
+            } else if var_name == "pg_trgm_word_similarity_threshold"
+                || var_name == "pg_trgm.word_similarity_threshold"
+            {
+                // SHOW pg_trgm.word_similarity_threshold
+                let v = crate::session::session_trgm_word_similarity_threshold(&sess.state);
+                Ok(make_show_result(
+                    "pg_trgm.word_similarity_threshold",
+                    &format!("{v}"),
+                ))
             } else {
                 // Silently return empty for other SHOW <var> forms so
                 // ORM startup queries don't hard-fail.
@@ -12543,6 +12694,111 @@ async fn exec_add_retention_policy(
     Ok(ExecResult::Rows { schema, batches: vec![batch] })
 }
 
+/// Execute `SELECT drop_chunks('table', older_than => INTERVAL/TIMESTAMP)`.
+///
+/// Steps:
+/// 1. Resolve the cutoff to a `DateTime<Utc>`.
+/// 2. Call `HypertableRegistry::drop_chunks_before` to remove chunk metadata
+///    for all chunks whose range_end <= cutoff.
+/// 3. Issue a physical DELETE WHERE ts < cutoff so the base-table rows are
+///    removed (reuses the same retention-delete path).
+/// 4. Return a result row with the number of chunks dropped.
+///
+/// The chunk metadata removal and the physical DELETE are NOT atomic (there is
+/// no 2PC across the catalog and the storage layer).  The safe failure mode is
+/// metadata dropped but rows surviving, which is conservative — a subsequent
+/// SELECT will still return the rows until the DELETE commits.  See APPLY.md
+/// for the full risk note on catalog atomicity.
+async fn exec_drop_chunks(
+    sess: &ProjectSession,
+    table: &str,
+    cutoff_spec: crate::hypertable::DropChunksCutoff,
+) -> Result<ExecResult> {
+    use crate::hypertable::DropChunksCutoff;
+    use chrono::Utc;
+
+    // Resolve the cutoff timestamp.
+    let cutoff: chrono::DateTime<Utc> = match &cutoff_spec {
+        DropChunksCutoff::Interval(iv_text) => {
+            let secs = crate::hypertable::parse_interval_secs(iv_text)
+                .ok_or_else(|| BasinError::InvalidSchema(format!(
+                    "drop_chunks: could not parse interval '{iv_text}'"
+                )))?;
+            Utc::now() - chrono::Duration::seconds(secs as i64)
+        }
+        DropChunksCutoff::Timestamp(ts_text) => {
+            // Accept ISO-8601 / PG-style timestamp strings.
+            parse_cutoff_timestamp(ts_text)
+                .ok_or_else(|| BasinError::InvalidSchema(format!(
+                    "drop_chunks: could not parse timestamp '{ts_text}'"
+                )))?
+        }
+    };
+
+    // Drop chunk metadata and collect the names of dropped chunks.
+    let dropped = sess.engine
+        .hypertable_registry()
+        .drop_chunks_before(&sess.project, table, cutoff)
+        .await
+        .map_err(|e| BasinError::InvalidSchema(e))?;
+
+    if !dropped.is_empty() {
+        // Issue a physical DELETE for rows in the dropped range.
+        if let Some(time_col) = sess.engine.hypertable_registry()
+            .time_column(&sess.project, table)
+            .await
+        {
+            let cutoff_us = cutoff.timestamp_micros();
+            let delete_sql = format!(
+                "DELETE FROM \"{table}\" WHERE \"{time_col}\" < {cutoff_us}"
+            );
+            let _ = exec_retention_delete(sess, &delete_sql).await;
+        }
+    }
+
+    let schema = Arc::new(arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("chunks_dropped", arrow_schema::DataType::Int64, false),
+    ]));
+    let n = dropped.len() as i64;
+    let batch = arrow_array::RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(arrow_array::Int64Array::from(vec![n])) as ArrayRef],
+    )
+    .map_err(|e| BasinError::internal(format!("drop_chunks result: {e}")))?;
+    Ok(ExecResult::Rows { schema, batches: vec![batch] })
+}
+
+/// Parse a timestamp string in a variety of formats to `DateTime<Utc>`.
+/// Used by `exec_drop_chunks` for the `older_than => TIMESTAMP '...'` form.
+fn parse_cutoff_timestamp(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::{DateTime, NaiveDateTime, Utc};
+    // Try RFC 3339 first.
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    // Try common PG formats.
+    let formats: &[&str] = &[
+        "%Y-%m-%d %H:%M:%S%:z",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d",
+    ];
+    for fmt in formats {
+        if let Ok(ndt) = NaiveDateTime::parse_from_str(s, fmt) {
+            return Some(ndt.and_utc());
+        }
+        // chrono parse_from_str with timezone
+        if let Ok(dt) = DateTime::parse_from_str(s, fmt) {
+            return Some(dt.with_timezone(&Utc));
+        }
+    }
+    // Bare date
+    if let Ok(nd) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Some(nd.and_hms_opt(0, 0, 0)?.and_utc());
+    }
+    None
+}
+
 /// Execute `SELECT run_retention_policy('table')`.
 /// Drops chunks that fall outside the retention window, then issues a physical
 /// DELETE so the base table's rows are also removed.
@@ -12550,79 +12806,42 @@ async fn exec_run_retention_policy(
     sess: &ProjectSession,
     table: &str,
 ) -> Result<ExecResult> {
-    // Phase 5.29.D: determine the retention window from the registry and
-    // compute the cutoff timestamp.
+    // Read the retention window, compute the cutoff, then delegate to the
+    // shared drop_chunks_before core (same path as exec_drop_chunks).
+    let Some(retention_secs) = get_retention_secs_from_registry(
+        sess.engine.hypertable_registry(),
+        &sess.project,
+        table,
+    ).await else {
+        // No retention policy set — return 0 chunks dropped.
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("chunks_dropped", arrow_schema::DataType::Int64, false),
+        ]));
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::Int64Array::from(vec![0i64])) as ArrayRef],
+        )
+        .map_err(|e| BasinError::internal(format!("run_retention_policy result: {e}")))?;
+        return Ok(ExecResult::Rows { schema, batches: vec![batch] });
+    };
+
+    let cutoff = chrono::Utc::now() - chrono::Duration::seconds(retention_secs as i64);
+
     let dropped = sess.engine
         .hypertable_registry()
-        .run_retention((&sess.project), table)
+        .drop_chunks_before(&sess.project, table, cutoff)
         .await
         .map_err(|e| BasinError::InvalidSchema(e))?;
 
     if !dropped.is_empty() {
-        // Fetch the hypertable's time column so we can build the DELETE
-        // predicate accurately.  If the time column is unknown (table was
-        // never registered — defensive), fall back to a no-op.
-        //
-        // Implementation note: `run_retention` already removed the chunks
-        // from the registry, but the physical rows are still in the base
-        // table. We issue a DELETE to clean them up.  We compute the cutoff
-        // from the registry's retention_secs before running retention (it
-        // already cleared the chunks), but since the chunks recorded
-        // range_end we need the cutoff derived from retention_secs again.
-        // We re-read retention_secs from the registry.
-        //
-        // Simpler: scan deleted chunks to find the max range_end that was
-        // dropped, then DELETE rows with ts < that value.
-        //
-        // Actually the simplest correct approach: issue a DELETE for rows
-        // whose timestamp falls in chunks older than the cutoff.  We already
-        // ran `run_retention` which told us *which* chunks were removed. We
-        // use the hypertable's retention_secs to compute the cutoff directly.
-        //
-        // We use the catalog approach: look up time_column, build DELETE.
         if let Some(time_col) = sess.engine.hypertable_registry()
             .time_column(&sess.project, table)
             .await
         {
-            // Get retention_secs from the registry (re-read; retention is still set).
-            // We recompute the cutoff as `now() - retention_secs`.
-            // We need retention_secs — it's still in the registry (we only cleared chunks).
-            // Use a workaround: the chunks we dropped all had range_end <= cutoff.
-            // Issue DELETE WHERE ts < (cutoff_timestamp) using NOW() - interval.
-            //
-            // We do this by getting the cutoff from the registry. Since we
-            // can't easily re-read retention_secs without adding a new method,
-            // we'll compute it from the current time: we just ran run_retention
-            // which used `now - retention_secs`. We'll issue DELETE WHERE ts < now().
-            //
-            // For correctness: we only delete rows that were in the dropped chunks.
-            // Since chunks are day-aligned (or interval-aligned), we can use
-            // the max range_end of the dropped chunks as the DELETE cutoff.
-            // But we don't have that info now.
-            //
-            // Best safe approach: DELETE WHERE ts < NOW() - retention_interval.
-            // We compute this by reading the registry's retention_secs once more.
-            // Add a `get_retention_secs` method:
-            let Some(retention_secs) = get_retention_secs_from_registry(
-                sess.engine.hypertable_registry(),
-                &sess.project,
-                table,
-            ).await else {
-                // No retention policy set — nothing to delete physically.
-                return Ok(ExecResult::Empty { tag: "SELECT 1".into() });
-            };
-
-            let cutoff_ts = chrono::Utc::now()
-                - chrono::Duration::seconds(retention_secs as i64);
-            // Use integer microseconds so `as_literal` produces ScalarValue::Int64,
-            // which the storage predicate evaluator compares against Timestamp columns
-            // (Arrow stores Timestamp(Microsecond) as raw i64 µs since epoch).
-            let cutoff_us = cutoff_ts.timestamp_micros();
+            let cutoff_us = cutoff.timestamp_micros();
             let delete_sql = format!(
                 "DELETE FROM \"{table}\" WHERE \"{time_col}\" < {cutoff_us}"
             );
-            // Best-effort DELETE via sqlparser → exec_delete (avoids async
-            // recursion with the outer `execute`).
             let _ = exec_retention_delete(sess, &delete_sql).await;
         }
     }

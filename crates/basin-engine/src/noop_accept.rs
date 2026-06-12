@@ -267,6 +267,10 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
                 // believe it bought durability it did not get.
                 || after_set.starts_with("BASIN.SYNCHRONOUS_COMMIT")
                 || after_set.starts_with("SYNCHRONOUS_COMMIT")
+                // pg_trgm thresholds: must reach the real handler so the
+                // session-level GUC is stored and used by `%` / `<%` rewrites.
+                || after_set.starts_with("PG_TRGM.SIMILARITY_THRESHOLD")
+                || after_set.starts_with("PG_TRGM.WORD_SIMILARITY_THRESHOLD")
             {
                 None // Let the real executor handler fire.
             } else if upper.starts_with("RESET") {
@@ -295,6 +299,8 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
                 || trimmed == "SHOW IDLE_IN_TRANSACTION_SESSION_TIMEOUT"
                 || trimmed == "SHOW BASIN.SYNCHRONOUS_COMMIT"
                 || trimmed == "SHOW SYNCHRONOUS_COMMIT"
+                || trimmed == "SHOW PG_TRGM.SIMILARITY_THRESHOLD"
+                || trimmed == "SHOW PG_TRGM.WORD_SIMILARITY_THRESHOLD"
             {
                 None
             } else {

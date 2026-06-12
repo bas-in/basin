@@ -641,6 +641,81 @@ impl Engine {
         self.inner.memtable_registry.clone()
     }
 
+    /// Force every resident table's hot-tier UPDATE/DELETE overlay to durable
+    /// cold storage, ignoring the background reconciler's bytes/age/count
+    /// thresholds. Intended for the graceful-shutdown path (basin-server's
+    /// SIGINT handler) — see the durability note below.
+    ///
+    /// ## Why this exists (durability bug fix)
+    ///
+    /// The auto-commit point fast paths (`hot_tier_update_by_pk` /
+    /// `hot_tier_delete_by_pk` and their in-tx variants) park their row images
+    /// / tombstones in the process-wide [`basin_hottier::MemTableRegistry`]
+    /// overlay **with no WAL record** (registry-only durability). Those entries
+    /// become durable only when something drains the overlay into cold Parquet
+    /// + commits the catalog: a conflicting cold-path mutation, the background
+    /// overlay reconciler (`crate::overlay_reconcile`, ~5 s cadence), or this
+    /// call.
+    ///
+    /// On a *graceful* restart the background reconciler may not have run since
+    /// the last point mutation, so without this drain the SIGINT path's
+    /// `wal.close()` would complete while the last ~tick-window of acked point
+    /// mutations are still overlay-only — and they are NOT in the WAL, so the
+    /// reopened process cannot recover them. Draining here closes that
+    /// graceful-shutdown loss window.
+    ///
+    /// ## Remaining (documented) crash window
+    ///
+    /// A *non-graceful* crash (SIGKILL / power loss) between an acked overlay
+    /// point mutation and the next reconcile/drain still loses that mutation,
+    /// because the overlay fast paths do not WAL-log. Closing that window
+    /// requires a minimal WAL record for point overlay mutations plus
+    /// replay-side overlay reconstruction in the shard tail (today the tail /
+    /// `decode_payload` only models INSERT batches). That is deferred as
+    /// follow-up; the loss bound for non-graceful crashes equals the overlay
+    /// reconcile cadence (`BASIN_OVERLAY_RECONCILE_SECS`, default 5 s).
+    ///
+    /// Errors are collected and the first is returned after attempting every
+    /// table, so one bad table cannot strand the others' drains. A
+    /// `CommitConflict` (lost an optimistic race to a concurrent foreground
+    /// mutation) is treated as success for that table: the conflict winner
+    /// already made the rows durable.
+    pub async fn drain_overlays_for_shutdown(&self) -> Result<(), basin_common::BasinError> {
+        let registry = self.memtable_registry();
+        let mut first_err: Option<basin_common::BasinError> = None;
+        for (project, table, entry) in registry.tables_iter() {
+            // O(1) overlay-presence gate, identical to the reconciler's: skip
+            // tables with no pending UPDATE/DELETE overlay (clean INSERT
+            // residency carries no un-WAL'd durability debt).
+            let pending = entry.memtable.update_count() + entry.memtable.tombstone_count();
+            if pending == 0 {
+                continue;
+            }
+            match crate::dml_mutate::materialize_overlay_for_table(self, project, &table).await {
+                Ok(()) => {}
+                Err(basin_common::BasinError::CommitConflict(_)) => {
+                    // The race winner already drained these rows durably.
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "basin_engine",
+                        %project,
+                        %table,
+                        error = %e,
+                        "shutdown overlay drain failed for table"
+                    );
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     /// Bulk-INSERT PK constraint-set memoization cache (Tier 2). Crate-
     /// internal; the executor's INSERT path threads this into
     /// [`crate::constraints::enforce_pk_on_insert`] and the mutation paths

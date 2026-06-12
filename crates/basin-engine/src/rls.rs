@@ -545,6 +545,82 @@ fn is_ident_part(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
+/// Resolve the auth helper *function calls* (`auth_uid()` / `auth.uid()`,
+/// `auth_role()` / `auth.role()`) inside a policy USING/CHECK expression to
+/// SQL literals from the session's [`AuthContext`].
+///
+/// The DataFusion SELECT path evaluates these via registered UDFs, but the
+/// DML executors that filter rows through the compound-predicate engine
+/// (`parse_compound_predicate`) cannot call UDFs — they need plain
+/// `<col> OP <literal>` atoms. We pre-substitute here so an RLS USING clause
+/// like `owner_id = auth_uid()` becomes `owner_id = '<uuid>'` before parsing.
+///
+/// `auth_uid()` with no authenticated user resolves to `NULL` (anonymous),
+/// so `owner_id = NULL` is NULL → no row matches → deny, matching the SELECT
+/// path's semantics. Identifier-boundary aware so `my_auth_uid_col` is left
+/// alone; the trailing `()` (with optional whitespace) is required to treat a
+/// token as the function call.
+pub(crate) fn substitute_auth_functions(expr: &str, auth: &crate::AuthContext) -> String {
+    let uid_literal = match auth.auth_uid {
+        Some(u) => format!("'{}'", u),
+        None => "NULL".to_string(),
+    };
+    let role_literal = format!("'{}'", auth.auth_role.replace('\'', "''"));
+
+    let bytes = expr.as_bytes();
+    let mut out = String::with_capacity(expr.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if !is_ident_start(c) {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        // Read a dotted identifier chain (e.g. `auth.uid`).
+        let start = i;
+        while i < bytes.len()
+            && (is_ident_part(bytes[i] as char) || bytes[i] == b'.')
+        {
+            i += 1;
+        }
+        let tok = &expr[start..i];
+        // Peek for a `()` call suffix (optional whitespace inside the parens).
+        let mut j = i;
+        while j < bytes.len() && (bytes[j] as char).is_whitespace() {
+            j += 1;
+        }
+        let is_call = j < bytes.len() && bytes[j] == b'(' && {
+            let mut k = j + 1;
+            while k < bytes.len() && (bytes[k] as char).is_whitespace() {
+                k += 1;
+            }
+            k < bytes.len() && bytes[k] == b')'
+        };
+        if is_call
+            && (tok.eq_ignore_ascii_case("auth_uid")
+                || tok.eq_ignore_ascii_case("auth.uid")
+                || tok.eq_ignore_ascii_case("auth_role")
+                || tok.eq_ignore_ascii_case("auth.role"))
+        {
+            if tok.eq_ignore_ascii_case("auth_uid") || tok.eq_ignore_ascii_case("auth.uid") {
+                out.push_str(&uid_literal);
+            } else {
+                out.push_str(&role_literal);
+            }
+            // Skip the `( … )` suffix.
+            let mut k = j + 1;
+            while k < bytes.len() && bytes[k] != b')' {
+                k += 1;
+            }
+            i = k + 1; // past the ')'
+        } else {
+            out.push_str(tok);
+        }
+    }
+    out
+}
+
 // --- Build the per-query policy map ----------------------------------------
 
 /// Look up RLS state for every table referenced in `tables` and assemble the
@@ -812,6 +888,41 @@ mod tests {
     fn substitute_current_role_also_replaced() {
         let out = substitute_current_user("r = current_role", "alice");
         assert_eq!(out, "r = 'alice'");
+    }
+
+    #[test]
+    fn substitute_auth_uid_resolves_to_literal() {
+        let uid = uuid::Uuid::new_v4();
+        let auth = crate::AuthContext::from_jwt(
+            uid,
+            "authenticated",
+            serde_json::json!({ "user_id": uid.to_string() }),
+        );
+        let out = substitute_auth_functions("owner_id = auth_uid()", &auth);
+        assert_eq!(out, format!("owner_id = '{uid}'"));
+        // schema-dotted form and whitespace inside the parens.
+        let out2 = substitute_auth_functions("owner_id = auth.uid(  )", &auth);
+        assert_eq!(out2, format!("owner_id = '{uid}'"));
+    }
+
+    #[test]
+    fn substitute_auth_uid_anonymous_is_null() {
+        let auth = crate::AuthContext::anonymous();
+        let out = substitute_auth_functions("owner_id = auth_uid()", &auth);
+        // NULL → `owner_id = NULL` is NULL → no row matches (deny), matching
+        // the SELECT path's anonymous semantics.
+        assert_eq!(out, "owner_id = NULL");
+    }
+
+    #[test]
+    fn substitute_auth_role_resolves_and_substrings_safe() {
+        let uid = uuid::Uuid::new_v4();
+        let auth = crate::AuthContext::from_jwt(uid, "authenticated", serde_json::json!({}));
+        let out = substitute_auth_functions("r = auth_role()", &auth);
+        assert_eq!(out, "r = 'authenticated'");
+        // A column literally named `auth_uid_col` (no call suffix) is left alone.
+        let out2 = substitute_auth_functions("auth_uid_col = 1", &auth);
+        assert_eq!(out2, "auth_uid_col = 1");
     }
 
     #[test]

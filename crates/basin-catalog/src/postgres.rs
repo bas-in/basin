@@ -552,6 +552,24 @@ impl PostgresCatalog {
                     PRIMARY KEY (project_id, partition_id)
                 )"
             ),
+            // Per-`(project, partition)` compaction watermark — the highest WAL
+            // LSN whose tail batch the shard compactor has compacted into a
+            // catalog-committed cold file. Written right after the file commit
+            // and BEFORE the WAL truncate, so cold-start replay can skip
+            // already-committed entries and avoid re-committing a duplicate
+            // Parquet/Vortex file (the commit→truncate crash-window dedup). A
+            // legacy catalog that predates this table simply has no rows here;
+            // `get_compaction_watermark` returns `None` and the shard falls
+            // back to replay-from-zero, which is the prior behavior.
+            format!(
+                "CREATE TABLE IF NOT EXISTS {schema}.compaction_watermarks (
+                    project_id    TEXT NOT NULL,
+                    partition_id  TEXT NOT NULL,
+                    watermark_lsn BIGINT NOT NULL,
+                    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (project_id, partition_id)
+                )"
+            ),
         ];
         let client = self.client().await?;
         for stmt in stmts {
@@ -3950,6 +3968,64 @@ impl Catalog for PostgresCatalog {
             .await
             .map_err(|e| BasinError::catalog(format!("drop_schema commit: {e}")))?;
         Ok(())
+    }
+
+    #[instrument(skip(self), fields(project = %project, partition = %partition_id))]
+    async fn set_compaction_watermark(
+        &self,
+        project: &ProjectId,
+        partition_id: &str,
+        watermark_lsn: u64,
+    ) -> Result<()> {
+        let sch = &self.schema;
+        let client = self.client().await?;
+        // Postgres BIGINT is i64; an LSN never approaches i64::MAX in practice,
+        // but cast explicitly so the binding is well-typed. Monotonic upsert:
+        // GREATEST(existing, new) so a retried / out-of-order call can never
+        // rewind the replay floor.
+        let lsn_pg = watermark_lsn as i64;
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {sch}.compaction_watermarks \
+                       (project_id, partition_id, watermark_lsn, updated_at) \
+                     VALUES ($1, $2, $3, now()) \
+                     ON CONFLICT (project_id, partition_id) DO UPDATE SET \
+                       watermark_lsn = GREATEST(\
+                           {sch}.compaction_watermarks.watermark_lsn, EXCLUDED.watermark_lsn), \
+                       updated_at = now()"
+                ),
+                &[&project.to_string(), &partition_id, &lsn_pg],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("set_compaction_watermark: {e}")))?;
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(project = %project, partition = %partition_id))]
+    async fn get_compaction_watermark(
+        &self,
+        project: &ProjectId,
+        partition_id: &str,
+    ) -> Result<Option<u64>> {
+        let sch = &self.schema;
+        let client = self.client().await?;
+        let row = client
+            .query_opt(
+                &format!(
+                    "SELECT watermark_lsn FROM {sch}.compaction_watermarks \
+                     WHERE project_id = $1 AND partition_id = $2"
+                ),
+                &[&project.to_string(), &partition_id],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("get_compaction_watermark: {e}")))?;
+        Ok(row.map(|r| {
+            let lsn: i64 = r.get(0);
+            // Defensive: a negative stored value (impossible via our writer)
+            // clamps to 0 rather than wrapping to a huge u64.
+            lsn.max(0) as u64
+        }))
     }
 }
 

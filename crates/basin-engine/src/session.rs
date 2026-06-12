@@ -387,6 +387,10 @@ pub(crate) fn build_stateless_udf_cache() -> StatelessUdfCache {
     // ST_GeomFromWKB). Registered last so case-insensitive lookups
     // resolve to the basin-geo implementation.
     crate::geo_glue::install_udfs(&ctx);
+    // pg_trgm-compatible fuzzy-text UDFs: similarity, word_similarity,
+    // show_trgm. Operators (%, <%, <->) are wired via rewrite_trgm_operators
+    // in the pre-parse pipeline rather than as DataFusion binary operators.
+    crate::trgm_glue::register_trgm_udfs(&ctx);
     let state = ctx.state();
     // Build DataFusion's default optimizer rule list once.  The 27
     // stateless rules are heap-allocated `Arc<dyn OptimizerRule>`; without
@@ -655,6 +659,20 @@ pub(crate) struct SessionState {
     /// needs no ordering relationship with other fields.
     pub(crate) synchronous_commit: std::sync::atomic::AtomicBool,
 
+    // ── pg_trgm session-level GUCs ────────────────────────────────────────────
+
+    /// `SET pg_trgm.similarity_threshold = <float>` per-session threshold for
+    /// the `%` operator.  Defaults to `basin_trgm::DEFAULT_SIMILARITY_THRESHOLD`
+    /// (0.3, matching the PG default).  Stored as an `AtomicU32` holding the
+    /// IEEE 754 bit-pattern of the `f32` value so the rewrite pipeline can read
+    /// it on every statement without a Mutex.
+    pub(crate) trgm_similarity_threshold: std::sync::atomic::AtomicU32,
+
+    /// `SET pg_trgm.word_similarity_threshold = <float>` per-session threshold
+    /// for the `<%` operator.  Defaults to
+    /// `basin_trgm::DEFAULT_WORD_SIMILARITY_THRESHOLD` (0.6).
+    pub(crate) trgm_word_similarity_threshold: std::sync::atomic::AtomicU32,
+
     /// Timestamp of the last statement activity on this session. Updated by
     /// the executor at the start of every `execute()` call; the idle-in-txn
     /// reaper compares this against the current time.
@@ -672,16 +690,17 @@ pub(crate) struct SessionState {
     /// correctness model.
     pub(crate) table_meta_cache: TableMetaCache,
     /// Per-session DataFusion provider cache (Fix B+C). Memoises the final
-    /// built `Arc<dyn TableProvider>` per `(table, snapshot, hot_epoch)` so the
-    /// auto-commit SELECT refresh skips the bloom-laden `TableMetadata` clone,
-    /// schema conversion and `ListingTable` rebuild on a hit. Bypassed inside a
-    /// transaction; cleared on tx boundaries and the catalog-epoch bump. See
+    /// built `Arc<dyn TableProvider>` per `(table, snapshot)` so the auto-commit
+    /// SELECT refresh skips the bloom-laden `TableMetadata` clone, schema
+    /// conversion and `ListingTable` rebuild on a hit. Bypassed inside a
+    /// transaction; cleared on tx boundaries and the catalog-epoch bump (and
+    /// per-table on a single-table DML — concurrency fix #4). See
     /// [`ProviderCache`] for the full correctness model.
     pub(crate) provider_cache: ProviderCache,
     /// Per-session live-head probe cache. Lets the [`ProviderCache`] fast path
-    /// build its `(table, snapshot, hot_epoch)` key on a HIT without the
-    /// bloom-laden `load_table` clone. Epoch+TTL validated; cleared in lockstep
-    /// with `provider_cache`. See [`HeadProbeCache`].
+    /// build its `(table, snapshot)` key on a HIT without the bloom-laden
+    /// `load_table` clone. Epoch+TTL validated; cleared in lockstep with
+    /// `provider_cache`. See [`HeadProbeCache`].
     pub(crate) head_probe_cache: HeadProbeCache,
 }
 
@@ -741,6 +760,12 @@ impl SessionState {
             idle_in_transaction_session_timeout: std::sync::Mutex::new(None),
             synchronous_commit: std::sync::atomic::AtomicBool::new(
                 synchronous_commit_env_default(),
+            ),
+            trgm_similarity_threshold: std::sync::atomic::AtomicU32::new(
+                basin_trgm::DEFAULT_SIMILARITY_THRESHOLD.to_bits(),
+            ),
+            trgm_word_similarity_threshold: std::sync::atomic::AtomicU32::new(
+                basin_trgm::DEFAULT_WORD_SIMILARITY_THRESHOLD.to_bits(),
             ),
             last_active: std::sync::Mutex::new(std::time::Instant::now()),
             listen: std::sync::Mutex::new(ListenState::default()),
@@ -971,30 +996,46 @@ impl TableMetaCache {
 //   snapshot-keyed `TableMetadata` (`schema` + `promoted_jsonb_paths`). Schema
 //   evolution either advances the snapshot OR is metadata-only DDL; the latter
 //   is caught by the catalog-epoch clear (see below).
-// * **Overlay *shape* gate** — `register_cold_with_overlay` decides AT BUILD
-//   TIME whether to wrap the cold scan in an `HtapUnionTable` (the
-//   `needs_overlay` check: are there tombstones / updates / a tx overlay?). A
-//   plain `ListingTable` cached while the registry was empty has NO overlay
-//   path, so a *later* fast-path UPDATE/DELETE would be invisible to it. The
-//   hot-tier epoch is therefore in the key (see scan-vs-build note).
+// * **Overlay path (now SHAPE-INVARIANT)** — `build_cold_with_overlay` wraps
+//   every single-PK table's cold scan in an `HtapUnionTable` UNCONDITIONALLY
+//   (auto-commit included), regardless of whether the overlay is currently
+//   empty. The wrapper's shape no longer depends on the overlay's emptiness, so
+//   it never has to flip on the empty↔non-empty boundary. Composite/no-PK
+//   tables (which can never have an overlay) keep the plain `ListingTable`; that
+//   shape can never change either. See "Overlay freshness" below.
 //
-// ## HtapUnionTable: scan-time vs build-time capture (the load-bearing finding)
+// ## Overlay freshness without the hot-tier epoch (concurrency fix #3)
 //
 // `HtapUnionTable::scan` calls `snapshot_tombstones` / `snapshot_updates`
 // against the LIVE `engine.memtable_registry()` at SCAN time — it does NOT bake
 // the tombstone/update set at build time. The ONLY build-time captures are
 // `hot_seq_watermark` (a per-tx MVCC ceiling, `None` in auto-commit) and
-// `tx_overlay` (this tx's uncommitted writes, empty in auto-commit). So in
-// auto-commit a cached `HtapUnionTable` would, on its own, observe fresh
-// registry overlay mutations automatically.
+// `tx_overlay` (this tx's uncommitted writes, empty in auto-commit). So a cached
+// (auto-commit) `HtapUnionTable` observes fresh registry overlay mutations
+// automatically: a fast-path UPDATE/DELETE landing after the provider was cached
+// is applied on the very next scan, and an overlay draining to cold afterwards
+// is likewise reflected (the scan re-reads the live snapshots each time, and an
+// empty overlay is a zero-overhead pass-through).
 //
-// BUT the BUILD-time `needs_overlay` gate means a cached *plain ListingTable*
-// (built when the registry held no overlay) cannot grow an overlay path, and a
-// cached `HtapUnionTable` built with overlay rows present keeps applying its
-// (live-read) overlay even after the registry drains. Both transitions move the
-// hot-tier epoch, so `hot_tier_epoch` MUST be in the key to flip provider shape
-// on the empty↔non-empty overlay boundary. (Including the epoch unconditionally
-// is also simplest-correct: it makes the cache a pure function of build inputs.)
+// The OLD reason `hot_tier_epoch` was in the key was the build-time
+// `needs_overlay` SHAPE gate: a cached *plain ListingTable* (built while the
+// registry was empty) had no overlay path and could not grow one. By always
+// wrapping single-PK tables, that shape divergence is gone, so the provider is
+// a pure function of `(table, snapshot)` and the epoch leaves the key. Each
+// protection the epoch used to give is preserved:
+//
+//   * *plain → needs-overlay transition* (a fast-path UPDATE/DELETE lands after
+//     caching): the cached provider is ALREADY the overlay-capable
+//     `HtapUnionTable`; its scan picks up the new tombstones/updates live. ✔
+//   * *needs-overlay → empty transition* (the overlay drains to cold): the same
+//     cached `HtapUnionTable`'s scan re-reads the now-empty live snapshots and
+//     short-circuits to the pass-through, so it does not keep applying a stale
+//     overlay. (Note: a drain that rewrites cold files ADVANCES the snapshot,
+//     which is still in the key, so the rebuilt cold file set is picked up too.) ✔
+//   * *pushdown exactness*: the empty-overlay `HtapUnionTable` delegates the
+//     cold provider's pushdown verdict verbatim (Exact stays Exact) via
+//     `supports_filters_pushdown`, so the no-overlay read path is
+//     performance-identical to the old plain `ListingTable`. ✔
 //
 // ## Transactions, RLS
 //
@@ -1013,9 +1054,9 @@ impl TableMetaCache {
 // Per-session LRU (64 entries). Cleared on tx BEGIN/COMMIT/ROLLBACK and on the
 // catalog-epoch bump (same dispatch-top hook as `TableMetaCache::invalidate_all`).
 
-/// Maximum number of distinct (table, snapshot, hot-epoch) provider entries
-/// tracked per session. 64 covers any realistic single-query working set; LRU
-/// eviction bounds churny tables.
+/// Maximum number of distinct (table, snapshot) provider entries tracked per
+/// session. 64 covers any realistic single-query working set; LRU eviction
+/// bounds churny tables.
 pub(crate) const PROVIDER_CACHE_CAP: usize = 64;
 
 /// Cache key for a fully-built, registered DataFusion provider. Every field is
@@ -1028,10 +1069,19 @@ pub(crate) struct ProviderCacheKey {
     /// Catalog head the cold file set + schema were enumerated at. Advances on
     /// INSERT-flush / compaction / rollback / most schema evolution.
     pub(crate) snapshot: SnapshotId,
-    /// Hot-tier mutation epoch (`MemTableRegistry::hot_tier_epoch`). Advances on
-    /// every fast-path INSERT/UPDATE/DELETE overlay write. Flips the build-time
-    /// `needs_overlay` provider shape on the empty↔non-empty boundary.
-    pub(crate) hot_epoch: u64,
+    // NOTE (concurrency fix #3): `hot_epoch` was REMOVED from this key. It used
+    // to be here solely so the build-time `needs_overlay` provider SHAPE could
+    // flip on the empty↔non-empty overlay boundary (a cached plain
+    // `ListingTable` built while the registry held no overlay could not grow an
+    // overlay path). We eliminated that shape divergence: `build_cold_with_overlay`
+    // now ALWAYS builds the overlay-capable `HtapUnionTable` in auto-commit, and
+    // its `scan` reads `snapshot_tombstones` / `snapshot_updates` LIVE at scan
+    // time (an empty overlay is a zero-overhead pass-through; a grown overlay is
+    // applied without any provider rebuild). The provider is therefore now a
+    // pure function of `(table, snapshot)`, and keying on the hot epoch only
+    // caused hot-tier-only churn (every fast-path INSERT/UPDATE/DELETE) to evict
+    // a still-correct cached provider — the read-path serialization the mixed
+    // RW benchmark exposed. See the module comment "Overlay freshness" section.
 }
 
 /// A cached provider: the final `Arc<dyn TableProvider>` that was registered,
@@ -1084,6 +1134,23 @@ impl ProviderCache {
             .lock()
             .expect("provider_cache lock poisoned")
             .clear();
+    }
+
+    /// Drop every entry for a single table, leaving other tables' cached
+    /// providers intact (concurrency fix #4). A write to table A no longer
+    /// evicts table B's still-valid provider. The key now models only
+    /// `(table, snapshot)`, so this removes every snapshot generation cached
+    /// for `table`.
+    pub(crate) fn invalidate(&self, table: &TableName) {
+        let mut g = self.inner.lock().expect("provider_cache lock poisoned");
+        let stale: Vec<ProviderCacheKey> = g
+            .iter()
+            .filter(|(k, _)| &k.table == table)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in stale {
+            g.pop(&k);
+        }
     }
 
     #[cfg(test)]
@@ -1151,6 +1218,15 @@ impl HeadProbeCache {
             .lock()
             .expect("head_probe_cache lock poisoned")
             .clear();
+    }
+
+    /// Drop the single table's cached head, leaving other tables intact
+    /// (concurrency fix #4).
+    pub(crate) fn invalidate(&self, table: &TableName) {
+        self.inner
+            .lock()
+            .expect("head_probe_cache lock poisoned")
+            .pop(table);
     }
 }
 
@@ -1945,6 +2021,44 @@ pub(crate) fn show_synchronous_commit(state: &SessionState) -> &'static str {
     }
 }
 
+// ── pg_trgm GUC accessors ────────────────────────────────────────────────────
+
+/// Read the session's `pg_trgm.similarity_threshold` (default 0.3).
+pub(crate) fn session_trgm_similarity_threshold(state: &SessionState) -> f32 {
+    f32::from_bits(
+        state
+            .trgm_similarity_threshold
+            .load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Set `pg_trgm.similarity_threshold` for this session.
+/// Clamps the value to `[0.0, 1.0]` per PG semantics.
+pub(crate) fn set_session_trgm_similarity_threshold(state: &SessionState, v: f32) {
+    let clamped = v.clamp(0.0, 1.0);
+    state
+        .trgm_similarity_threshold
+        .store(clamped.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the session's `pg_trgm.word_similarity_threshold` (default 0.6).
+pub(crate) fn session_trgm_word_similarity_threshold(state: &SessionState) -> f32 {
+    f32::from_bits(
+        state
+            .trgm_word_similarity_threshold
+            .load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Set `pg_trgm.word_similarity_threshold` for this session.
+/// Clamps to `[0.0, 1.0]`.
+pub(crate) fn set_session_trgm_word_similarity_threshold(state: &SessionState, v: f32) {
+    let clamped = v.clamp(0.0, 1.0);
+    state
+        .trgm_word_similarity_threshold
+        .store(clamped.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
 impl ProjectSession {
     /// The session's `basin.synchronous_commit` mode. The executor's shard
     /// INSERT path passes this to `ProjectHandle::write_batch_opts` so `on`
@@ -2188,7 +2302,14 @@ pub(crate) async fn open(
                     project,
                 ),
             );
+            let hypertables_provider: Arc<dyn TableProvider> = Arc::new(
+                crate::hypertable_provider::HypertablesProvider::new(
+                    engine.hypertable_registry().clone(),
+                    project,
+                ),
+            );
             let _ = ts_schema.register_table("chunks".to_string(), chunks_provider);
+            let _ = ts_schema.register_table("hypertables".to_string(), hypertables_provider);
             let _ = df_catalog.register_schema("timescaledb_information", ts_schema);
         }
     }
@@ -2484,25 +2605,28 @@ async fn build_cold_with_overlay(
             .map_err(|e| BasinError::internal(format!("ListingTable::try_new {table}: {e}")))?,
     );
 
-    // Overlay gate: the fast-path DELETE/UPDATE only writes single-column-PK
-    // tables, so composite/no-PK tables can never have registry entries.
-    // `tx_overlay` (this transaction's own uncommitted in-tx fast-path writes)
-    // also forces the overlay wrap on, so an in-tx read sees them even when the
-    // shared registry is empty.
-    let needs_overlay = if pk_columns.len() == 1 {
-        use crate::hot_tombstone::{snapshot_tombstones, snapshot_updates};
-        let reg = engine.memtable_registry();
-        let tombs = snapshot_tombstones(reg.as_ref(), project, table, hot_seq_watermark);
-        let updates = snapshot_updates(reg.as_ref(), project, table, hot_seq_watermark);
-        !tombs.is_empty() || !updates.is_empty() || !tx_overlay.is_empty()
-    } else {
-        false
-    };
-
-    if needs_overlay {
-        // Reuse the transactional overlay implementation by building an
-        // `HtapUnionTable` whose hot half is an empty `MemTable`. The single
-        // overlay path lives in `HtapUnionTable::scan`.
+    // Overlay gate (concurrency fix #3): the fast-path DELETE/UPDATE overlay
+    // and a tx's own `tx_overlay` only ever apply to single-column-PK tables —
+    // composite/no-PK tables can NEVER have a registry overlay, so they keep
+    // the plain `ListingTable` (no wrapper overhead, and no shape that could
+    // ever change ⇒ a `(table, snapshot)` cache key is exact for them).
+    //
+    // For single-PK tables we now build the overlay-capable `HtapUnionTable`
+    // UNCONDITIONALLY rather than gating on a build-time `needs_overlay` probe.
+    // The wrapper's `scan` reads `snapshot_tombstones` / `snapshot_updates`
+    // LIVE at scan time and short-circuits to a zero-overhead pass-through when
+    // the overlay is empty, so an empty-overlay `HtapUnionTable` is functionally
+    // and (with the empty-overlay pushdown delegation in
+    // `supports_filters_pushdown`) PERFORMANCE-identical to the plain
+    // `ListingTable` — yet the SAME cached `Arc` correctly grows an overlay path
+    // the instant a fast-path UPDATE/DELETE lands. This is what lets the
+    // provider cache key drop the hot-tier epoch: the build-time shape no longer
+    // depends on the overlay's emptiness, so hot-tier-only churn cannot
+    // invalidate a still-correct cached provider.
+    if pk_columns.len() == 1 {
+        // Empty-hot half: this provider serves cold + (live) overlay only; the
+        // engine memtable is read inside `HtapUnionTable::scan` via the registry
+        // snapshots, not through this MemTable.
         let empty_hot = MemTable::try_new(df_schema.clone(), vec![vec![]])
             .map_err(|e| BasinError::internal(format!("MemTable empty-hot {table}: {e}")))?;
         let union_provider = HtapUnionTable::new(
@@ -2518,7 +2642,7 @@ async fn build_cold_with_overlay(
         );
         Ok(Arc::new(union_provider))
     } else {
-        // Tombstone/override-free common case: plain ListingTable, no wrapper.
+        // Composite / no-PK table: no overlay is possible, plain ListingTable.
         Ok(cold_provider)
     }
 }
@@ -2672,11 +2796,13 @@ async fn refresh_table_inner(
     if auto_commit {
         let catalog_epoch = engine.config().catalog.epoch();
         if let Some(live_head) = state.head_probe_cache.get_fresh(table, catalog_epoch) {
-            let hot_epoch = engine.memtable_registry().hot_tier_epoch(project, table);
+            // Concurrency fix #3: the provider is now a pure function of
+            // `(table, snapshot)` — hot-tier overlay freshness is handled by the
+            // always-overlay-capable `HtapUnionTable` at scan time, not by the
+            // cache key — so a HIT need not even read the hot-tier epoch.
             let key = ProviderCacheKey {
                 table: table.clone(),
                 snapshot: live_head,
-                hot_epoch,
             };
             if let Some(hit) = state.provider_cache.get(&key) {
                 // HIT: re-register the already-built provider. No catalog clone,
@@ -2764,19 +2890,22 @@ async fn refresh_table_inner(
     //
     // Skip caching inside a transaction: the built provider may bake a rewound
     // historical snapshot, a pinned hot watermark and this tx's `tx_overlay` —
-    // none of which the `(table, snapshot, hot_epoch)` key models. The
-    // head-probe cache is likewise live-head only. Tx-built providers are
-    // re-registered fresh on every read and the caches are cleared at tx
-    // boundaries (`tx_begin`/`tx_commit`/`tx_rollback`).
+    // none of which the `(table, snapshot)` key models. The head-probe cache is
+    // likewise live-head only. Tx-built providers are re-registered fresh on
+    // every read and the caches are cleared at tx boundaries
+    // (`tx_begin`/`tx_commit`/`tx_rollback`).
+    //
+    // Concurrency fix #3: in auto-commit the built provider is the
+    // always-overlay-capable `HtapUnionTable`, whose `scan` reads the hot-tier
+    // overlay LIVE — so the cached `Arc` stays correct as the overlay grows or
+    // drains, and the key needs no hot-tier epoch component.
     if auto_commit {
-        let hot_epoch = engine.memtable_registry().hot_tier_epoch(project, table);
         let fill_epoch = engine.config().catalog.epoch();
         state.head_probe_cache.insert(table.clone(), live_head, fill_epoch);
         state.provider_cache.insert(
             ProviderCacheKey {
                 table: table.clone(),
                 snapshot: live_head,
-                hot_epoch,
             },
             ProviderCacheEntry {
                 provider: provider.clone(),
@@ -3296,17 +3425,52 @@ impl datafusion::catalog::TableProvider for HtapUnionTable {
     /// the differential bench after bulk UPDATE/DELETE), a selective
     /// `WHERE id < 100` therefore became a full-table scan.
     ///
-    /// We delegate to the cold provider but never claim `Exact`: the union
-    /// also scans the hot-tier MemTable and applies the tombstone/UPDATE
-    /// overlay, so DataFusion must keep a `FilterExec` above to re-apply every
-    /// predicate authoritatively. `Inexact` lets the cold scan prune rows via
-    /// pushdown while preserving correctness on the merged output.
+    /// When the overlay is live (any tombstone / UPDATE override / tx overlay)
+    /// we delegate to the cold provider but never claim `Exact`: the merge also
+    /// applies the tombstone/UPDATE overlay, so DataFusion must keep a
+    /// `FilterExec` above to re-apply every predicate authoritatively.
+    /// `Inexact` lets the cold scan prune rows via pushdown while preserving
+    /// correctness on the merged output.
+    ///
+    /// Concurrency fix #3: `build_cold_with_overlay` now ALWAYS wraps single-PK
+    /// tables in this provider, including the overlay-free common case. When the
+    /// overlay is empty the merge output is exactly the (empty-hot ∪ cold) =
+    /// cold rows, so a pushed-down predicate is EXACT — we therefore delegate
+    /// the cold provider's verdict verbatim (Exact stays Exact). This keeps the
+    /// no-overlay read path performance-identical to the old plain
+    /// `ListingTable` (no redundant `FilterExec`), so always-wrapping costs
+    /// nothing on the hot path while letting the cached provider grow an overlay
+    /// path live. The overlay presence is read from the LIVE registry exactly as
+    /// `scan` does (same watermark), so this verdict can never under-claim
+    /// relative to what `scan` will actually merge.
     fn supports_filters_pushdown(
         &self,
         filters: &[&datafusion::logical_expr::Expr],
     ) -> datafusion::error::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
         use datafusion::logical_expr::TableProviderFilterPushDown as Pd;
+        use crate::hot_tombstone::{snapshot_tombstones, snapshot_updates};
         let cold = self.cold.supports_filters_pushdown(filters)?;
+
+        // Determine whether an overlay is actually live for THIS read view,
+        // mirroring `scan`'s `apply_overlay` decision (same watermark, same tx
+        // overlay merge). Only a live, applicable overlay forces `Inexact`.
+        let mut tombs =
+            snapshot_tombstones(self.engine.memtable_registry().as_ref(), &self.project, &self.table, self.hot_seq_watermark);
+        let mut updates =
+            snapshot_updates(self.engine.memtable_registry().as_ref(), &self.project, &self.table, self.hot_seq_watermark);
+        if !self.tx_overlay.is_empty() {
+            crate::hot_tombstone::merge_tx_overlay(&mut tombs, &mut updates, &self.tx_overlay);
+        }
+        let overlay_live =
+            (self.pk_columns.len() == 1) && (!tombs.is_empty() || !updates.is_empty());
+
+        if !overlay_live {
+            // Empty overlay: the empty-hot half contributes nothing, so the
+            // pushed-down predicate is exact on the merged output. Delegate the
+            // cold provider's verdict verbatim (Exact stays Exact).
+            return Ok(cold);
+        }
+
         Ok(cold
             .into_iter()
             .map(|p| match p {
