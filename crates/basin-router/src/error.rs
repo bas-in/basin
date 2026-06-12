@@ -60,6 +60,13 @@ fn classify(err: &BasinError) -> (&'static str, &'static str) {
         // Missing column at planning time. PG raises 42703
         // (undefined_column); same driver-class rationale as above.
         BasinError::UndefinedColumn(_) => ("ERROR", "42703"), // undefined_column
+        // Named cursor not found. PG raises 34000 (invalid_cursor_name);
+        // psycopg exposes it as `InvalidCursorName`.
+        BasinError::CursorNotFound(_) => ("ERROR", "34000"), // invalid_cursor_name
+        // ON CONFLICT target unresolvable. PG raises 42P10
+        // (invalid_column_reference — "there is no unique or exclusion
+        // constraint matching the ON CONFLICT specification").
+        BasinError::AmbiguousConflictTarget(_) => ("ERROR", "42P10"), // invalid_column_reference
         BasinError::CommitConflict(_) => ("ERROR", "40001"), // serialization_failure
         BasinError::QueryCostExceeded(_) => ("ERROR", "54000"), // program_limit_exceeded
         BasinError::QueryCanceled(_) => ("ERROR", "57014"),     // query_canceled
@@ -194,5 +201,28 @@ mod tests {
         let er = error_response(&BasinError::QueryCanceled("timed out".into()));
         assert_eq!(er.fields[0], (b'S', "ERROR".to_owned()));
         assert_eq!(er.fields[1], (b'C', "57014".to_owned()));
+    }
+
+    #[test]
+    fn classifies_cursor_not_found() {
+        // Cursor-not-found must surface as SQLSTATE 34000 (invalid_cursor_name)
+        // with the PG message shape `cursor "<name>" does not exist`.
+        let er = error_response(&BasinError::CursorNotFound("my_cursor".into()));
+        assert_eq!(er.fields[0], (b'S', "ERROR".to_owned()));
+        assert_eq!(er.fields[1], (b'C', "34000".to_owned()));
+        assert_eq!(
+            er.fields[2],
+            (b'M', "cursor \"my_cursor\" does not exist".to_owned())
+        );
+    }
+
+    #[test]
+    fn classifies_ambiguous_conflict_target() {
+        // ON CONFLICT target mismatch must surface as SQLSTATE 42P10
+        // (invalid_column_reference).
+        let er = error_response(&BasinError::AmbiguousConflictTarget("a, b".into()));
+        assert_eq!(er.fields[0], (b'S', "ERROR".to_owned()));
+        assert_eq!(er.fields[1], (b'C', "42P10".to_owned()));
+        assert!(er.fields[2].1.contains("no unique or exclusion constraint"));
     }
 }

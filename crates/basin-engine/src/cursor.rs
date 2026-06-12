@@ -11,9 +11,14 @@
 //! - **In-memory only**: no streaming for large result sets.  A `DECLARE …
 //!   CURSOR FOR SELECT * FROM huge_table` will OOM before it returns.  A
 //!   streaming variant (backed by a DataFusion physical plan) is the v0.2 path.
+//! - **Row cap**: `DECLARE` rejects queries whose result set exceeds
+//!   `BASIN_CURSOR_MAX_ROWS` (default 10 000 rows) with a typed error so
+//!   callers get a clear message rather than an OOM.  Set the env variable to
+//!   `0` to disable the cap entirely (not recommended for production).
 //! - **WITH HOLD not supported**: cursors survive only as long as their
-//!   `ProjectSession`.  The `WITH HOLD` clause (PG-specific, allows the cursor
-//!   to outlive a transaction commit) is parsed and silently ignored in v0.1.
+//!   `ProjectSession`.  The `WITH HOLD` clause requires SQLSTATE `0A000`
+//!   (`feature_not_supported`) per PG; the executor rejects it before calling
+//!   `declare`.
 //! - **SCROLL / NO SCROLL**: all cursors support backward motion regardless of
 //!   the `SCROLL` keyword — we materialise everything so backward seeks are
 //!   free.
@@ -27,6 +32,23 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Default maximum number of rows a single cursor may materialise.
+/// Overridden at runtime by `BASIN_CURSOR_MAX_ROWS=N` (`0` = unlimited).
+pub const DEFAULT_CURSOR_MAX_ROWS: usize = 10_000;
+
+/// Resolve the effective cursor row cap from the environment (or the
+/// compile-time default when the variable is absent / zero / non-numeric).
+pub fn cursor_max_rows() -> Option<usize> {
+    match std::env::var("BASIN_CURSOR_MAX_ROWS").ok().as_deref() {
+        Some(s) => match s.trim().parse::<usize>() {
+            Ok(0) => None,  // 0 = unlimited
+            Ok(n) => Some(n),
+            Err(_) => Some(DEFAULT_CURSOR_MAX_ROWS),
+        },
+        None => Some(DEFAULT_CURSOR_MAX_ROWS),
+    }
+}
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
@@ -142,13 +164,26 @@ impl CursorRegistry {
     }
 
     /// Store a new cursor under `name`.  Fails if a cursor by that name is
-    /// already open (matches PG's `ERROR: cursor "x" already exists`).
+    /// already open (matches PG's `ERROR: cursor "x" already exists`), or
+    /// if the materialised row count exceeds the [`cursor_max_rows`] cap
+    /// (SQLSTATE 54000 `program_limit_exceeded`).
     pub(crate) async fn declare(
         &self,
         name: String,
         schema: Arc<Schema>,
         batches: Vec<RecordBatch>,
     ) -> Result<()> {
+        // Enforce the per-cursor row cap before holding the mutex.
+        if let Some(cap) = cursor_max_rows() {
+            let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+            if total > cap {
+                return Err(BasinError::QueryCostExceeded(format!(
+                    "cursor \"{name}\" result set has {total} rows, which exceeds the \
+                     BASIN_CURSOR_MAX_ROWS cap of {cap}; reduce the query, add a WHERE \
+                     clause, or set BASIN_CURSOR_MAX_ROWS=0 to disable the cap"
+                )));
+            }
+        }
         let mut map = self.inner.lock().await;
         if map.contains_key(&name) {
             return Err(BasinError::internal(format!(
@@ -159,20 +194,19 @@ impl CursorRegistry {
         Ok(())
     }
 
-    /// Remove and return the cursor under `name`.  Fails with PG-style error
-    /// if not found.
+    /// Remove and return the cursor under `name`.  Fails with SQLSTATE 34000
+    /// (`invalid_cursor_name`) if not found.
     pub(crate) async fn close(&self, name: &str) -> Result<()> {
         let mut map = self.inner.lock().await;
         if map.remove(name).is_none() {
-            return Err(BasinError::internal(format!(
-                "cursor \"{name}\" does not exist"
-            )));
+            return Err(BasinError::cursor_not_found(name));
         }
         Ok(())
     }
 
     /// Apply `direction` to cursor `name`, returning sliced batches (for
-    /// FETCH) or an empty vec (for MOVE).
+    /// FETCH) or an empty vec (for MOVE).  Fails with SQLSTATE 34000 if the
+    /// cursor is not found.
     pub(crate) async fn apply(
         &self,
         name: &str,
@@ -182,7 +216,7 @@ impl CursorRegistry {
         let mut map = self.inner.lock().await;
         let cursor = map
             .get_mut(name)
-            .ok_or_else(|| BasinError::internal(format!("cursor \"{name}\" does not exist")))?;
+            .ok_or_else(|| BasinError::cursor_not_found(name))?;
 
         let schema = cursor.schema.clone();
         let batches = if emit_rows {
