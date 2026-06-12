@@ -4,9 +4,10 @@ Route sources (verified against crates/basin-rest/src/server.rs):
 - POST /auth/v1/signup                              server.rs:250
 - POST /auth/v1/signin                              server.rs:251
 - POST /auth/v1/refresh                             server.rs:252
-- POST /auth/v1/verify-email                        server.rs:253
-- POST /auth/v1/reset-password                      server.rs:254
-- POST /auth/v1/request-password-reset              server.rs:255
+- POST /auth/v1/signout                             server.rs:253
+- POST /auth/v1/verify-email                        server.rs:254
+- POST /auth/v1/reset-password                      server.rs:255
+- POST /auth/v1/request-password-reset              server.rs:256
 - POST /auth/v1/magic-link                          server.rs:262
 - POST /auth/v1/magic-link/consume                  server.rs:263
 - POST|GET /auth/v1/api-keys                        server.rs:267
@@ -19,9 +20,11 @@ Route sources (verified against crates/basin-rest/src/server.rs):
 - POST /auth/v1/factors/:id/challenge/verify        server.rs:298
 - DELETE /auth/v1/factors/:id                       server.rs:302
 
-NOTE: There is NO server-side sign-out route (verified against
-crates/basin-rest/src/server.rs). sign_out() only clears the local session.
-Revocation happens via refresh-token rotation on the server.
+sign_out() calls POST /auth/v1/signout with the stored refresh token, writing
+a server-side revocation row, then clears the local session. The local session
+is cleared regardless of server response (404 from older servers and network
+errors are tolerated gracefully). When no session is active the call is a
+no-op (already signed out).
 
 Auth is per-project: signup/signin take a project_id in the body.
 """
@@ -181,16 +184,41 @@ class AuthClient:
         return session
 
     def sign_out(self) -> None:
-        """Clear the local session.
+        """Revoke the current refresh token server-side, then clear the local session.
 
-        The server exposes no sign-out / token-revoke route (verified against
-        crates/basin-rest/src/server.rs). The refresh token simply expires or
-        is invalidated by rotation.
+        Calls POST /auth/v1/signout with the stored refresh token, writing a
+        server-side revocation row so that any subsequent refresh_session() call
+        with the old token returns 401.
 
-        SERVER GAP: no /auth/v1/signout route exists server-side. This method
-        is local-only by design.
+        - If there is no active session this is a no-op (already signed out).
+        - 404 responses (older servers without the signout route) are tolerated
+          silently — the local session is still cleared.
+        - Network errors are tolerated silently — the local session is still
+          cleared. The client ends up signed out regardless.
+        - The local session is ALWAYS cleared, even when the server call fails,
+          so the client always ends up in the signed-out state.
         """
+        current = self._session
+        # Clear local state first — even if the server call fails the client
+        # should be considered signed out.
         self._session = None
+        if current is None:
+            return
+        try:
+            self._transport.request_json(
+                "POST",
+                "/auth/v1/signout",
+                body={"refresh_token": current.refresh_token},
+                auth=False,
+            )
+        except BasinApiError as exc:
+            if exc.status == 404:
+                # Older server without the signout route — tolerate silently.
+                return
+            raise
+        except Exception:
+            # Network error or other transient failure — local clear already done.
+            return
 
     def refresh_session(self) -> Session:
         """POST /auth/v1/refresh with the stored refresh token.
@@ -615,9 +643,42 @@ class AsyncAuthClient:
         self._session = session
         return session
 
-    def sign_out(self) -> None:
-        """Clear the local session (local-only; no server route exists)."""
+    async def sign_out(self) -> None:
+        """Revoke the current refresh token server-side, then clear the local session.
+
+        Calls POST /auth/v1/signout with the stored refresh token, writing a
+        server-side revocation row so that any subsequent refresh_session() call
+        with the old token returns 401.
+
+        - If there is no active session this is a no-op (already signed out).
+        - 404 responses (older servers without the signout route) are tolerated
+          silently — the local session is still cleared.
+        - Network errors are tolerated silently — the local session is still
+          cleared. The client ends up signed out regardless.
+        - The local session is ALWAYS cleared, even when the server call fails,
+          so the client always ends up in the signed-out state.
+        """
+        current = self._session
+        # Clear local state first — even if the server call fails the client
+        # should be considered signed out.
         self._session = None
+        if current is None:
+            return
+        try:
+            await self._transport.request_json(
+                "POST",
+                "/auth/v1/signout",
+                body={"refresh_token": current.refresh_token},
+                auth=False,
+            )
+        except BasinApiError as exc:
+            if exc.status == 404:
+                # Older server without the signout route — tolerate silently.
+                return
+            raise
+        except Exception:
+            # Network error or other transient failure — local clear already done.
+            return
 
     async def refresh_session(self) -> Session:
         current = self._session

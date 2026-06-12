@@ -59,13 +59,62 @@ def test_sign_in_stores_session():
 
 
 @respx.mock
-def test_sign_out_clears_session():
+def test_sign_out_calls_server_and_clears_session():
     respx.post(f"{BASE}/auth/v1/signin").mock(
         return_value=httpx.Response(200, json=SESSION_DATA)
+    )
+    signout_route = respx.post(f"{BASE}/auth/v1/signout").mock(
+        return_value=httpx.Response(200, json={"ok": True})
     )
     client = create_client(BASE, KEY, project_id=PROJECT)
     client.auth.sign_in(email="a@b.com", password="secret")
     assert client.auth.get_session() is not None
+    client.auth.sign_out()
+    assert client.auth.get_session() is None
+    assert signout_route.called
+    # verify the refresh_token was sent in the body
+    req_body = json.loads(signout_route.calls[0].request.content)
+    assert req_body["refresh_token"] == SESSION_DATA["refresh_token"]
+
+
+@respx.mock
+def test_sign_out_404_old_server_clears_session():
+    """404 from an older server that lacks the signout route: local clear still happens."""
+    respx.post(f"{BASE}/auth/v1/signin").mock(
+        return_value=httpx.Response(200, json=SESSION_DATA)
+    )
+    respx.post(f"{BASE}/auth/v1/signout").mock(
+        return_value=httpx.Response(404, json={"code": "E_NOT_FOUND", "message": "not found"})
+    )
+    client = create_client(BASE, KEY, project_id=PROJECT)
+    client.auth.sign_in(email="a@b.com", password="secret")
+    assert client.auth.get_session() is not None
+    # Must not raise; local session must be cleared despite 404
+    client.auth.sign_out()
+    assert client.auth.get_session() is None
+
+
+@respx.mock
+def test_sign_out_network_error_clears_session():
+    """Network error during signout: local session is cleared regardless."""
+    respx.post(f"{BASE}/auth/v1/signin").mock(
+        return_value=httpx.Response(200, json=SESSION_DATA)
+    )
+    respx.post(f"{BASE}/auth/v1/signout").mock(
+        side_effect=httpx.ConnectError("connection refused")
+    )
+    client = create_client(BASE, KEY, project_id=PROJECT)
+    client.auth.sign_in(email="a@b.com", password="secret")
+    # Must not raise; local session must be cleared despite network error
+    client.auth.sign_out()
+    assert client.auth.get_session() is None
+
+
+def test_sign_out_no_session_noop():
+    """sign_out() when no session is active is a no-op — no server call, no error."""
+    client = create_client(BASE, KEY, project_id=PROJECT)
+    assert client.auth.get_session() is None
+    # No respx mock registered: would fail if any HTTP call were made
     client.auth.sign_out()
     assert client.auth.get_session() is None
 
@@ -246,3 +295,59 @@ async def test_async_refresh_session():
         await client.auth.sign_in(email="a@b.com", password="secret")
         refreshed = await client.auth.refresh_session()
         assert refreshed.access_token == "async.fresh.token"
+
+
+@respx.mock
+async def test_async_sign_out_calls_server_and_clears_session():
+    respx.post(f"{BASE}/auth/v1/signin").mock(
+        return_value=httpx.Response(200, json=SESSION_DATA)
+    )
+    signout_route = respx.post(f"{BASE}/auth/v1/signout").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    async with create_async_client(BASE, KEY, project_id=PROJECT) as client:
+        await client.auth.sign_in(email="a@b.com", password="secret")
+        assert client.auth.get_session() is not None
+        await client.auth.sign_out()
+        assert client.auth.get_session() is None
+        assert signout_route.called
+        req_body = json.loads(signout_route.calls[0].request.content)
+        assert req_body["refresh_token"] == SESSION_DATA["refresh_token"]
+
+
+@respx.mock
+async def test_async_sign_out_404_old_server_clears_session():
+    """Async: 404 from older server is tolerated; local session cleared."""
+    respx.post(f"{BASE}/auth/v1/signin").mock(
+        return_value=httpx.Response(200, json=SESSION_DATA)
+    )
+    respx.post(f"{BASE}/auth/v1/signout").mock(
+        return_value=httpx.Response(404, json={"code": "E_NOT_FOUND", "message": "not found"})
+    )
+    async with create_async_client(BASE, KEY, project_id=PROJECT) as client:
+        await client.auth.sign_in(email="a@b.com", password="secret")
+        await client.auth.sign_out()
+        assert client.auth.get_session() is None
+
+
+@respx.mock
+async def test_async_sign_out_network_error_clears_session():
+    """Async: network error during signout; local session cleared regardless."""
+    respx.post(f"{BASE}/auth/v1/signin").mock(
+        return_value=httpx.Response(200, json=SESSION_DATA)
+    )
+    respx.post(f"{BASE}/auth/v1/signout").mock(
+        side_effect=httpx.ConnectError("connection refused")
+    )
+    async with create_async_client(BASE, KEY, project_id=PROJECT) as client:
+        await client.auth.sign_in(email="a@b.com", password="secret")
+        await client.auth.sign_out()
+        assert client.auth.get_session() is None
+
+
+async def test_async_sign_out_no_session_noop():
+    """Async: sign_out() with no session is a no-op — no server call, no error."""
+    async with create_async_client(BASE, KEY, project_id=PROJECT) as client:
+        assert client.auth.get_session() is None
+        await client.auth.sign_out()
+        assert client.auth.get_session() is None
