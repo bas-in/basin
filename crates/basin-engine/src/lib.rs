@@ -136,6 +136,13 @@ pub(crate) struct EngineInner {
     /// overlay-tolerant inflated-target form). Test introspection surface,
     /// mirroring `keyset_fast_select_count`.
     pub(crate) unordered_limit_fast_select_count: AtomicU64,
+    /// Cumulative number of deep top-K statements
+    /// (`ORDER BY k [DESC] [, pk] LIMIT n`) served by the two-phase
+    /// late-materialization branch in `fast_select`: phase 1 decodes only the
+    /// sort key + PK to find the winning `n` row identities, phase 2 fetches
+    /// the full (wide) rows for just those PKs. Test introspection surface,
+    /// mirroring `keyset_fast_select_count`.
+    pub(crate) topk_late_fast_select_count: AtomicU64,
     /// Per-project noisy-project detector. Reads its bit when a session is
     /// opened (to choose `target_partitions`) and bumps it after every
     /// successful `ProjectSession::execute`. See `noisy_detector` module
@@ -385,6 +392,7 @@ impl Engine {
             promoted_fast_select_count: AtomicU64::new(0),
             keyset_fast_select_count: AtomicU64::new(0),
             unordered_limit_fast_select_count: AtomicU64::new(0),
+            topk_late_fast_select_count: AtomicU64::new(0),
             noisy_detector: crate::noisy_detector::NoisyDetector::new(),
             project_counters,
             event_sinks: RwLock::new(registry),
@@ -886,6 +894,26 @@ impl Engine {
     pub fn unordered_limit_fast_select_count(&self) -> u64 {
         self.inner
             .unordered_limit_fast_select_count
+            .load(Ordering::Relaxed)
+    }
+
+    /// Crate-private hook bumped by `fast_select` each time the deep top-K
+    /// two-phase late-materialization branch serves an
+    /// `ORDER BY k [DESC] [, pk] LIMIT n` query.
+    pub(crate) fn note_topk_late_fast_select(&self) {
+        self.inner
+            .topk_late_fast_select_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Cumulative count of statements served by the deep top-K late-
+    /// materialization branch since this `Engine` was created. Test
+    /// introspection: proves the two-phase path engaged (vs. the full-scan
+    /// decode-everything-then-sort fallback). Mirrors
+    /// [`Engine::keyset_fast_select_count`].
+    pub fn topk_late_fast_select_count(&self) -> u64 {
+        self.inner
+            .topk_late_fast_select_count
             .load(Ordering::Relaxed)
     }
 

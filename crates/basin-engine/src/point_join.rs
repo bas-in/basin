@@ -583,6 +583,7 @@ pub(crate) async fn execute_point_join(
         offset: None,
         order_by: None,
         always_empty: false,
+        topk_late: None,
     };
     let probe_res =
         execute_simple_select(sess, probe_plan, Some(probe_meta.clone()), raw_sql, false).await?;
@@ -648,6 +649,7 @@ pub(crate) async fn execute_point_join(
         offset: None,
         order_by: None,
         always_empty: false,
+        topk_late: None,
     };
     let lookup_res =
         execute_simple_select(sess, lookup_plan, Some(lookup_meta.clone()), raw_sql, false).await?;
