@@ -8,6 +8,27 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-13 — UPDATE … FROM is set-oriented (kill per-row quadratic)
+
+### Changed
+
+- **`UPDATE … FROM` is now set-oriented and scale-invariant in target table
+  size.** It previously ran the join SELECT once, then issued a full
+  `UPDATE … WHERE pk = X` SQL statement per matched row — each inner statement
+  re-read the matched row's pre-image and bumped the hot epoch, forcing a
+  provider-cache rebuild over every live file (an O(M·F) blow-up: ~150s at 10k
+  rows, ~51min at 1M). Now ONE join projects every matched target row's full
+  post-image (each SET column as its RHS expression evaluated against the
+  joined pre-image, every other column carried unchanged), keyed by the target
+  PK; matched `(key, post-image)` pairs are deduped by PK (last-occurrence-wins,
+  preserving the old loop's multi-match behaviour) and written in ONE batched
+  overlay write. On memtable-budget decline the post-images drain to cold in
+  budget-bounded chunks through the existing narrowed-merge + index-maintenance
+  path — never a per-row loop. A new scale-invariance gate
+  (`update_from_scaling_gate`) pins a fixed 200-row `UPDATE … FROM` /
+  `DELETE … USING` over a GIN-indexed table at 10k and 100k rows to
+  `t(100k)/t(10k) ≤ 3`.
+
 ## 2026-06-12 — Per-project pgwire connection ceiling (#28b)
 
 ### Added

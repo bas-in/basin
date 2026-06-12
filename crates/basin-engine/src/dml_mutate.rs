@@ -2695,30 +2695,84 @@ async fn hot_tier_update_by_pk(
         }
     };
 
+    // Pair each live key with its post-image and hand the whole set to the
+    // shared overlay-write helper, which stages the promoted-shadow encode,
+    // reserves the budget (returning the `Ok(None)` decline sentinel on
+    // `HardCapReached`), and writes every override to the memtable (auto-
+    // commit) or the rollback-able tx overlay (`tx_mode`). The helper is also
+    // the write tail for `exec_update_from`, whose per-key RHS values come
+    // from a join rather than a single uniform assignment set.
+    let key_post_images: Vec<(basin_hottier::RowKey, RecordBatch)> = live
+        .iter()
+        .map(|(k, _)| (*k).clone())
+        .zip(post_images.into_iter())
+        .collect();
+    let Some(()) = write_overlay_post_images(sess, table, meta, &key_post_images, tx_mode)? else {
+        return Ok(None);
+    };
+
+    let updated = key_post_images.len();
+    // Post-update row images collected for RETURNING (allocated only when needed).
+    let mut returning_rows: Vec<RecordBatch> = Vec::new();
+    if let Some(items) = returning {
+        for (_, one_row) in &key_post_images {
+            returning_rows.push(project_post_image_for_returning(
+                one_row,
+                schema.as_ref(),
+                items,
+            )?);
+        }
+    }
+    Ok(Some((updated, returning_rows)))
+}
+
+/// Stage + budget-guard + write a set of `(key, post_image)` overrides to the
+/// hot-tier overlay. Factored out of [`hot_tier_update_by_pk`] so the
+/// UPDATE…FROM path (whose RHS values are per-row, from a join, and so cannot
+/// be expressed as one uniform [`AssignmentRhs`] set) reuses the IDENTICAL
+/// staging / promoted-shadow / memory-budget / overlay-write logic instead of
+/// a per-row SQL re-execution loop.
+///
+/// Each `post_image` is the full single-row catalog-schema batch the row will
+/// have AFTER the update (the caller evaluated the assignments). We:
+///   * materialise the promoted-JSONB shadow column(s) on each row (ADR 0027
+///     Phase 4 — without it the overlay row null-fills `__promoted$col$key`
+///     and the promoted-column read fast path returns a wrong NULL);
+///   * encode the exact IPC blob the memtable retains;
+///   * reserve the summed blob bytes against the project memtable budget
+///     BEFORE the first write (auto-commit only — `tx_mode` writes go to the
+///     session-local, non-registry-accounted `TxState::tx_overlay`).
+///
+/// Returns:
+///   * `Ok(Some(()))` — every override written.
+///   * `Ok(None)` — budget decline (`HardCapReached`): NOTHING was written
+///     (staging is pure computation, the reservation fires before the first
+///     insert), so the caller may fall back to a cold rewrite with zero
+///     partial state.
+fn write_overlay_post_images(
+    sess: &ProjectSession,
+    table: &TableName,
+    meta: &basin_catalog::TableMetadata,
+    key_post_images: &[(basin_hottier::RowKey, RecordBatch)],
+    tx_mode: bool,
+) -> Result<Option<()>> {
+    let registry = sess.engine.memtable_registry();
+    let entry = registry.get_or_create(sess.project, table.clone());
+
     // Stage every override BEFORE writing any of them: per key, materialise
     // the promoted-JSONB shadow columns and encode the exact IPC blob the
     // memtable will retain. Staging first serves the memory guard below —
     // the statement's overlay footprint is the sum of these blob lengths,
     // known exactly before the first insert.
-    //
-    // ADR 0027 Phase 4 (shadow materialisation): exactly as the INSERT path
-    // does. Without this the hot UPDATE row carries no `__promoted$col$key`
-    // column, the `HtapUnionTable` overlay null-fills it, and the
-    // promoted-column read path would return a WRONG NULL for the updated
-    // row. Materialising it here keeps every live memtable row shadow-clean,
-    // so the promoted fast path stays enabled (and correct) after a
-    // post-promotion UPDATE instead of demoting every later
-    // `payload->>'key'` query to a full per-row JSONB UDF scan. No-op when no
-    // paths are promoted.
-    let mut staged: Vec<(&basin_hottier::RowKey, RecordBatch, Vec<u8>)> =
-        Vec::with_capacity(live.len());
-    for ((key, _), one_row) in live.iter().zip(post_images.into_iter()) {
+    let mut staged: Vec<(&basin_hottier::RowKey, Vec<u8>)> =
+        Vec::with_capacity(key_post_images.len());
+    for (key, one_row) in key_post_images {
         let override_row = crate::promoted_columns::materialize_promoted_columns(
-            &one_row,
+            one_row,
             &meta.promoted_jsonb_paths,
         )?;
         let bytes = encode_single_row_ipc(&override_row);
-        staged.push((*key, one_row, bytes));
+        staged.push((key, bytes));
     }
 
     // ── Memory guard (budget reservation) ───────────────────────────────────
@@ -2726,39 +2780,15 @@ async fn hot_tier_update_by_pk(
     // Reserve the statement's exact overlay footprint against the project's
     // memtable budget BEFORE the first overlay write. This is what makes the
     // raised `delta_update_max_keys()` cap safe: the budget — not the key
-    // count — bounds resident memory.
-    //
-    //   * `HardCapReached` → return the decline sentinel (`Ok(None)`); the
-    //     caller falls to the cold CoW path, whose overlay-materialize
-    //     prologue actively frees memtable memory — the correct remedy for a
-    //     full budget. `try_reserve_bytes` already evicted reclaimable clean
-    //     bytes internally before reporting this, so there is no retry to
-    //     attempt here. Nothing has been written at this point (staging is
-    //     pure computation), so the decline leaves zero partial state; the
-    //     assignment eval was wasted work, but only on this rare path.
-    //   * `FlushSuggested` → proceed; a flush request was enqueued and the
-    //     write fits under the hard cap.
-    //
-    // Sizing: the summed IPC blob lengths — EXACTLY the `heap_bytes` the
-    // memtable will charge for these `MemRowValue::Update`s and exactly what
-    // `mark_flushed` frees (and `release_bytes` returns to the budget) when
-    // the overlay drains at hot-tier flush / overlay-materialize. Reserve-
-    // units == release-units, so this path's accounting is balanced — unlike
-    // the pre-existing INSERT-residency / HTAP-promote reservations, which
-    // charge Arrow `get_array_memory_size` against an IPC-sized release
-    // (tolerated because `release_bytes` saturates at zero). We deliberately
-    // do NOT size from the per-key pre-image batches: they are slices sharing
-    // a parent batch's buffers, so Arrow memory size would multiply-count the
-    // parent per row and spuriously decline large key sets.
-    //
-    // tx_mode is exempt: the override goes to the session-local
-    // `TxState::tx_overlay`, which is not registry-accounted; reserving here
-    // would inflate the project counter with no matching release. The shared
-    // registry charge for tx writes happens at COMMIT when the overlay drains
-    // into the memtable (in-tx probed shapes are auto-commit-only anyway, so
-    // only small literal pk-list statements take that route).
+    // count — bounds resident memory. `HardCapReached` → `Ok(None)` decline;
+    // nothing has been written (staging is pure computation), so the decline
+    // leaves zero partial state. The summed IPC blob lengths are EXACTLY the
+    // `heap_bytes` the memtable charges and exactly what `release_bytes`
+    // returns on drain, so reserve-units == release-units. `tx_mode` is
+    // exempt: the override goes to the session-local `TxState::tx_overlay`,
+    // which is not registry-accounted.
     if !tx_mode {
-        let staged_bytes: u64 = staged.iter().map(|(_, _, b)| b.len() as u64).sum();
+        let staged_bytes: u64 = staged.iter().map(|(_, b)| b.len() as u64).sum();
         if staged_bytes > 0
             && registry.try_reserve_bytes(&sess.project, staged_bytes)
                 == basin_hottier::ReservationOutcome::HardCapReached
@@ -2767,10 +2797,7 @@ async fn hot_tier_update_by_pk(
         }
     }
 
-    let mut updated = 0usize;
-    // Post-update row images collected for RETURNING (allocated only when needed).
-    let mut returning_rows: Vec<RecordBatch> = Vec::new();
-    for (key, one_row, bytes) in staged {
+    for (key, bytes) in staged {
         if tx_mode {
             // In-tx: write the override to the rollback-able tx overlay. On
             // COMMIT it is drained into this same shared memtable; on ROLLBACK
@@ -2778,22 +2805,16 @@ async fn hot_tier_update_by_pk(
             crate::session::tx_overlay_put(
                 &sess.state,
                 table,
-                (*key).clone(),
+                key.clone(),
                 basin_hottier::MemRowValue::update(bytes, 0),
             );
         } else {
             entry
                 .memtable
-                .insert((*key).clone(), basin_hottier::MemRowValue::update(bytes, 0));
-        }
-        updated += 1;
-        // Collect the post-image for RETURNING if requested.
-        if let Some(items) = returning {
-            let projected = project_post_image_for_returning(&one_row, schema.as_ref(), items)?;
-            returning_rows.push(projected);
+                .insert(key.clone(), basin_hottier::MemRowValue::update(bytes, 0));
         }
     }
-    Ok(Some((updated, returning_rows)))
+    Ok(Some(()))
 }
 
 /// Stitch the per-key single-row pre-images into ONE n-row batch (key order
@@ -3801,14 +3822,34 @@ async fn exec_delete_using(
 
 /// `UPDATE t SET col = expr FROM u [, …] WHERE <condition>`
 ///
-/// Strategy (v0.1):
+/// Set-oriented strategy:
 /// 1. Require that the target table has exactly one PK column.
-/// 2. Determine which SET RHS values come from the USING table vs. are
-///    literals. For v0.1 we require all RHS to be either:
-///    a. A literal / NULL — pass directly to the single-row UPDATE.
-///    b. A compound-identifier `u.col` — project that column from the join.
-/// 3. Run `SELECT t.pk, rhs_col1, rhs_col2, … FROM t JOIN u ON <cond>`
-/// 4. For each result row emit `UPDATE t SET col1=v1, col2=v2, … WHERE pk=pk`.
+/// 2. Run ONE join SELECT that projects, in catalog-schema column order, the
+///    full POST-image of every matched target row: each SET column rendered
+///    as its RHS expression (`u.col`, a literal, or any join-evaluable
+///    expression — evaluated by DataFusion against the joined pre-image, the
+///    PG semantic), every other column as `target.col` (carried unchanged).
+///    The join also projects `target.pk` so each result row is keyed.
+/// 3. Collect the matched `(key, post_image)` pairs, deduplicating by PK with
+///    LAST-occurrence-wins (see "multi-match semantics" below).
+/// 4. Write them in ONE batched `write_overlay_post_images` call (the same
+///    staging / promoted-shadow / memory-budget / overlay-write tail the
+///    single-table fast path uses). On budget decline (`Ok(None)`) fall to
+///    ONE batched cold rewrite — never a per-row loop.
+///
+/// ── Multi-match semantics ────────────────────────────────────────────────
+/// PostgreSQL: a target row that joins MORE than one FROM row is updated at
+/// most ONCE, using an arbitrary (unspecified) one of the matching source
+/// rows (the "join produces a Cartesian product" caveat in the PG docs). The
+/// historical Basin loop issued one `UPDATE … WHERE pk = X` per join result
+/// row, so for a multi-matched PK the LAST result row's values won (each
+/// rewrite clobbered the prior). "Last row in join-result order wins" is a
+/// valid concrete choice under PG's "unspecified" contract, so we preserve it
+/// exactly: the dedup keeps the last `(key, post_image)` seen in result order.
+/// `UPDATE n` therefore counts DISTINCT updated PKs, matching the loop (whose
+/// repeated `UPDATE … WHERE pk = X` each reported 1 but mutated the same row)
+/// — actually a strictly more PG-faithful count (PG reports rows-affected =
+/// distinct target rows, not join cardinality).
 async fn exec_update_from(
     sess: &ProjectSession,
     target_twj: TableWithJoins,
@@ -3835,6 +3876,13 @@ async fn exec_update_from(
     };
     let target = TableName::new(target_name.clone())?;
 
+    // The cold-rewrite fallback below reads the RAW base, which is NOT
+    // overlay-aware. Materialise any pending overlay into cold FIRST so a
+    // prior hot UPDATE/DELETE on this table is visible to both the join probe
+    // (it reads overlay-aware, so this is belt-and-braces there) and the cold
+    // fallback (#94/#95). This mirrors the single-table cold prologue.
+    pre_mutation_flush_if_tail(sess, &target).await?;
+
     let meta = sess
         .engine
         .config()
@@ -3847,56 +3895,85 @@ async fn exec_update_from(
             target_name
         )));
     }
-    let pk_col = &meta.pk_columns[0];
+    if meta.pk_columns.len() != 1 {
+        return Err(BasinError::InvalidSchema(format!(
+            "UPDATE … FROM requires the target table {:?} to have a single-column PRIMARY KEY in v0.1",
+            target_name
+        )));
+    }
+    let pk_col = meta.pk_columns[0].clone();
     let schema = meta.schema.clone();
 
-    // Collect the SET targets and their RHS expressions.
-    let mut set_cols: Vec<String> = Vec::new();
-    let mut rhs_exprs: Vec<String> = Vec::new();
+    // Collect the SET targets, validating each is a real, writable column and
+    // capturing its RHS expression text. We keep the same per-assignment
+    // guards `parse_assignments` enforces for the single-table path
+    // (generated / ALWAYS-IDENTITY columns are immutable) so UPDATE…FROM can
+    // never write a column the single-table path would reject.
+    let mut set_idx_to_rhs: std::collections::HashMap<usize, String> =
+        std::collections::HashMap::new();
     for a in &assignments {
         let col = match &a.target {
-            AssignmentTarget::ColumnName(name) => {
-                if name.0.len() == 1 {
-                    name.0[0].id_val().clone()
-                } else {
-                    // schema.column — take the last part
-                    name.0
-                        .last()
-                        .map(|i| i.id_val().clone())
-                        .unwrap_or_default()
-                }
-            }
+            AssignmentTarget::ColumnName(name) => single_part_name(name)?.to_string(),
             AssignmentTarget::Tuple(_) => {
                 return Err(BasinError::InvalidSchema(
                     "UPDATE FROM: tuple assignment targets not supported in v0.1".into(),
                 ))
             }
         };
-        set_cols.push(col);
-        rhs_exprs.push(a.value.to_string());
+        let idx = schema.index_of(&col).map_err(|_| {
+            BasinError::InvalidSchema(format!("unknown column {col} in UPDATE … FROM target"))
+        })?;
+        if crate::types::field_is_generated(schema.field(idx)).is_some() {
+            return Err(BasinError::InvalidSchema(format!(
+                "cannot insert into generated column {:?}",
+                schema.field(idx).name()
+            )));
+        }
+        if matches!(
+            crate::types::field_identity_mode(schema.field(idx)),
+            Some(crate::types::IdentityMode::Always)
+        ) {
+            return Err(BasinError::InvalidSchema(format!(
+                "column {:?} can only be updated to DEFAULT (GENERATED ALWAYS AS IDENTITY)",
+                schema.field(idx).name()
+            )));
+        }
+        // Last assignment to a column wins (PG forbids duplicate SET targets,
+        // but if the parser admitted one we mirror normal map-overwrite).
+        set_idx_to_rhs.insert(idx, a.value.to_string());
     }
 
-    // Build the join SELECT: pk + all RHS expressions.
     let where_sql = match &selection {
         Some(e) => format!(" WHERE {e}"),
         None => String::new(),
     };
 
-    // We project: target.pk, and each RHS as an expression. RHS may be
-    // `u.col` (compound) or a literal — both are valid SQL projections.
-    let rhs_proj: Vec<String> = rhs_exprs
-        .iter()
-        .enumerate()
-        .map(|(i, e)| format!("{e} AS __rhs_{i}"))
-        .collect();
-
-    let proj = std::iter::once(format!("{target_name}.{pk_col}"))
-        .chain(rhs_proj)
-        .collect::<Vec<_>>()
-        .join(", ");
+    // ── Project the FULL POST-image in catalog-schema column order ───────────
+    //
+    // Column 0 is `target.pk` (the dedup / write key). Columns 1..=N are the
+    // target's columns in schema order, each either its SET RHS expression
+    // (evaluated by DataFusion against the joined pre-image — PG's "RHS sees
+    // the OLD target row" semantic) or `target.col` carried unchanged. Because
+    // the result row IS the post-image, no per-row assignment re-evaluation is
+    // needed downstream: one join evaluates every RHS for every matched row.
+    //
+    // We qualify carried columns with the target name to disambiguate from
+    // identically-named FROM columns; SET RHS expressions are emitted verbatim
+    // (the user already qualified `u.col` references). Aliasing each output to
+    // the catalog column name keeps the result schema field-name-aligned with
+    // the catalog schema for `reattach_catalog_metadata` below.
+    let mut proj_parts: Vec<String> = Vec::with_capacity(schema.fields().len() + 1);
+    proj_parts.push(format!("{target_name}.{pk_col} AS __pk"));
+    for (idx, field) in schema.fields().iter().enumerate() {
+        let col = field.name();
+        match set_idx_to_rhs.get(&idx) {
+            Some(rhs) => proj_parts.push(format!("({rhs}) AS {col}")),
+            None => proj_parts.push(format!("{target_name}.{col} AS {col}")),
+        }
+    }
+    let proj = proj_parts.join(", ");
 
     let from_str = from_table.relation.to_string();
-
     let join_select = format!(
         "SELECT {proj} FROM {target_name} , {from_str}{wh}",
         wh = where_sql,
@@ -3912,45 +3989,187 @@ async fn exec_update_from(
         }
     };
 
-    // For each matching row emit an individual UPDATE.
-    let pk_field = schema.field_with_name(pk_col).map_err(|_| {
+    // Decode each result row into a `(RowKey, post_image)` pair, deduplicating
+    // by PK with last-occurrence-wins (see the multi-match note above). The
+    // post-image is the result row with column 0 (the projected `__pk`)
+    // dropped, then padded / type-normalized to the catalog schema exactly as
+    // the single-table write path expects.
+    let pk_field = schema.field_with_name(&pk_col).map_err(|_| {
         BasinError::InvalidSchema(format!("PK column {pk_col:?} not in table schema"))
     })?;
-    let mut updated = 0usize;
+    let pk_dt = pk_field.data_type().clone();
+    // Insertion-ordered dedup: track key → slot so a later row overwrites the
+    // earlier post-image while preserving first-seen order (deterministic for
+    // the write / RETURNING-count and stable for tests).
+    let mut order: Vec<basin_hottier::RowKey> = Vec::new();
+    let mut by_key: std::collections::HashMap<Vec<u8>, RecordBatch> =
+        std::collections::HashMap::new();
     for batch in &batches {
-        let num_rows = batch.num_rows();
         let pk_arr = batch.column(0);
-        for row in 0..num_rows {
-            let pk_lit = scalar_from_array(pk_arr.as_ref(), row, pk_field.data_type())?;
-
-            // Build SET clause: col1 = rhs_val, col2 = rhs_val, …
-            let mut set_parts: Vec<String> = Vec::new();
-            for (i, col) in set_cols.iter().enumerate() {
-                let rhs_arr = batch.column(i + 1);
-                let rhs_field_dt = batch.schema().field(i + 1).data_type().clone();
-                let rhs_lit = scalar_from_array(rhs_arr.as_ref(), row, &rhs_field_dt)?;
-                set_parts.push(format!("{col} = {rhs_lit}"));
-            }
-
-            let update_sql = format!(
-                "UPDATE {target_name} SET {sets} WHERE {pk_col} = {pk_lit}",
-                sets = set_parts.join(", ")
-            );
-            match Box::pin(sess.execute(&update_sql)).await? {
-                ExecResult::Empty { tag } => {
-                    if tag.starts_with("UPDATE ") {
-                        let n: usize = tag[7..].trim().parse().unwrap_or(0);
-                        updated += n;
-                    }
-                }
-                ExecResult::Rows { .. } => {}
+        // Columns 1.. are the post-image in catalog-schema order. Coerce each
+        // to its catalog field's physical type: a literal / carried-column RHS
+        // can come back with a different-but-compatible Arrow type (e.g. an
+        // integer literal as a narrower int, a Vortex-narrowed Binary for a
+        // catalog LargeBinary), and `RecordBatch::try_new` demands an EXACT
+        // type match. `cast` is the same coercion the single-table write path
+        // relies on (via `apply_assignments`) to land catalog-typed rows.
+        if batch.num_columns() != schema.fields().len() + 1 {
+            return Err(BasinError::internal(format!(
+                "UPDATE … FROM: join projected {} columns, expected {} (pk + {} target cols)",
+                batch.num_columns(),
+                schema.fields().len() + 1,
+                schema.fields().len()
+            )));
+        }
+        let mut post_cols: Vec<arrow_array::ArrayRef> =
+            Vec::with_capacity(schema.fields().len());
+        for (idx, field) in schema.fields().iter().enumerate() {
+            let col = batch.column(idx + 1);
+            let coerced = if col.data_type() == field.data_type() {
+                col.clone()
+            } else {
+                arrow::compute::cast(col.as_ref(), field.data_type()).map_err(|e| {
+                    BasinError::internal(format!(
+                        "UPDATE … FROM: cannot coerce post-image column {:?} from {:?} to catalog type {:?}: {e}",
+                        field.name(),
+                        col.data_type(),
+                        field.data_type()
+                    ))
+                })?
+            };
+            post_cols.push(coerced);
+        }
+        let post_batch = RecordBatch::try_new(schema.clone(), post_cols).map_err(|e| {
+            BasinError::internal(format!(
+                "UPDATE … FROM: post-image projection mismatched the target schema: {e}"
+            ))
+        })?;
+        let post_batch = reattach_catalog_metadata(schema.as_ref(), post_batch)?;
+        for row in 0..batch.num_rows() {
+            let Some(rk) =
+                crate::hot_tombstone::array_value_to_row_key(pk_arr.as_ref(), row, &pk_dt)
+            else {
+                // NULL / unsupported-type PK can't be keyed — a PK is NOT NULL,
+                // so this is unreachable for a real target row; skip defensively.
+                continue;
+            };
+            let kb = rk.as_bytes().to_vec();
+            let one = post_batch.slice(row, 1);
+            if by_key.insert(kb.clone(), one).is_none() {
+                order.push(rk);
             }
         }
     }
 
+    if order.is_empty() {
+        return Ok(ExecResult::Empty {
+            tag: "UPDATE 0".into(),
+        });
+    }
+
+    // Single-table fast path threads tx-mode; UPDATE…FROM does too: an
+    // in-tx override is rollback-able, an auto-commit one lands in the shared
+    // registry. The join probe ran through the overlay-aware SELECT, so the
+    // post-images already reflect any in-tx prior writes on the target.
+    let tx_mode = crate::session::tx_is_active(&sess.state);
+    let key_post_images: Vec<(basin_hottier::RowKey, RecordBatch)> = order
+        .into_iter()
+        .map(|rk| {
+            let post = by_key
+                .get(rk.as_bytes())
+                .expect("every ordered key has a post-image")
+                .clone();
+            (rk, post)
+        })
+        .collect();
+
+    // ── ONE batched overlay write (with budget guard) ───────────────────────
+    if write_overlay_post_images(sess, &target, &meta, &key_post_images, tx_mode)?.is_some() {
+        return Ok(ExecResult::Empty {
+            tag: format!("UPDATE {}", key_post_images.len()),
+        });
+    }
+
+    // ── Budget decline → ONE batched cold rewrite (never a per-row loop) ─────
+    //
+    // The overlay budget hard cap could not admit the whole post-image set.
+    // The correct remedy is the SAME one the single-table fast path uses on
+    // decline — drain the overlay into cold (which frees memtable memory) and
+    // route the post-images through the overlay-materialize machinery so they
+    // land in cold storage via ONE narrowed merge per drain, with full GIN /
+    // FTS / B-tree / GIST index maintenance and the physical-delete + overlay-
+    // ack bookkeeping — none of which a bespoke `write_replacement` could
+    // reproduce without duplicating ~200 lines of index maintenance.
+    //
+    // We drain first (frees the budget), then write the post-images and drain
+    // again. In the (pathological) case where the post-image set alone still
+    // exceeds the freed budget, we chunk: write as many as the budget admits,
+    // drain, repeat — guaranteeing forward progress and a per-statement
+    // resident footprint bounded by the budget, never by the match count.
+    //
+    // This branch is auto-commit-only: in `tx_mode` the tx-overlay write is
+    // NOT budget-reserved (`write_overlay_post_images` skips the reservation),
+    // so it never declines and we returned above. The cold drain therefore
+    // always operates on the shared memtable (`tx_mode = false`), which is
+    // what `materialize_hot_overlay_into_cold` drains.
+    debug_assert!(!tx_mode, "UPDATE … FROM cold drain is auto-commit-only");
+    cold_drain_post_images(sess, &target, &meta, &key_post_images).await?;
     Ok(ExecResult::Empty {
-        tag: format!("UPDATE {updated}"),
+        tag: format!("UPDATE {}", key_post_images.len()),
     })
+}
+
+/// Land a `(key, post_image)` set in COLD storage by writing it to the hot-tier
+/// overlay and draining, reusing the overlay-materialize merge + full index
+/// maintenance. The batched fallback for [`exec_update_from`] when the overlay
+/// budget declines the in-one-shot write. No per-row SQL: each drain performs
+/// ONE narrowed merge over the candidate cold files.
+///
+/// Forward-progress under a tight budget: we drain once up front to free the
+/// declining footprint, then write the post-images in budget-admitted chunks,
+/// draining between chunks. Each chunk's resident overlay footprint is bounded
+/// by the project memtable budget — never by the total match count — so a
+/// large UPDATE…FROM whose post-images exceed the budget still completes in
+/// bounded memory instead of failing or looping per row.
+async fn cold_drain_post_images(
+    sess: &ProjectSession,
+    table: &TableName,
+    meta: &basin_catalog::TableMetadata,
+    key_post_images: &[(basin_hottier::RowKey, RecordBatch)],
+) -> Result<()> {
+    // Free the budget that just declined before attempting any overlay write.
+    materialize_hot_overlay_into_cold(sess, table).await?;
+
+    let mut remaining: &[(basin_hottier::RowKey, RecordBatch)] = key_post_images;
+    while !remaining.is_empty() {
+        // Try the whole remaining set first; on decline, halve the chunk until
+        // the budget admits it (a single override always fits — its bytes were
+        // already reservable when first read). Each admitted chunk is drained
+        // before the next, so resident memory stays bounded by the budget.
+        let mut chunk_len = remaining.len();
+        loop {
+            let chunk = &remaining[..chunk_len];
+            // Auto-commit overlay write (shared memtable) so the subsequent
+            // `materialize_hot_overlay_into_cold` drains it.
+            if write_overlay_post_images(sess, table, meta, chunk, false)?.is_some() {
+                // Drain this chunk to cold (narrowed merge + index maintenance)
+                // and advance.
+                materialize_hot_overlay_into_cold(sess, table).await?;
+                remaining = &remaining[chunk_len..];
+                break;
+            }
+            if chunk_len == 1 {
+                // A single override could not be admitted even after a fresh
+                // drain — the budget is smaller than one row's bytes, which is
+                // a misconfiguration rather than a recoverable condition.
+                return Err(BasinError::internal(
+                    "UPDATE … FROM: memtable budget cannot admit a single row's overlay write",
+                ));
+            }
+            chunk_len = chunk_len.div_ceil(2);
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
