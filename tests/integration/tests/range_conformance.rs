@@ -53,7 +53,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{BooleanArray, StringArray};
+use arrow_array::{Array, BooleanArray, StringArray};
 use basin_catalog::InMemoryCatalog;
 use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
@@ -1149,28 +1149,28 @@ async fn multirange_contains_elem() {
         &sess,
         "SELECT multirange_contains_elem(int4multirange(int4range(1, 5), int4range(10, 15)), 3)",
     ).await;
-    assert!(in1, "multirange_contains_elem({[1,5),[10,15)}, 3) must be true");
+    assert!(in1, "multirange_contains_elem({{[1,5),[10,15)}}, 3) must be true");
 
     // 12 ∈ [10,15) → true
     let in2 = scalar_bool(
         &sess,
         "SELECT multirange_contains_elem(int4multirange(int4range(1, 5), int4range(10, 15)), 12)",
     ).await;
-    assert!(in2, "multirange_contains_elem({[1,5),[10,15)}, 12) must be true");
+    assert!(in2, "multirange_contains_elem({{[1,5),[10,15)}}, 12) must be true");
 
     // 7 ∉ either range → false
     let out1 = scalar_bool(
         &sess,
         "SELECT multirange_contains_elem(int4multirange(int4range(1, 5), int4range(10, 15)), 7)",
     ).await;
-    assert!(!out1, "multirange_contains_elem({[1,5),[10,15)}, 7) must be false (gap)");
+    assert!(!out1, "multirange_contains_elem({{[1,5),[10,15)}}, 7) must be false (gap)");
 
     // 5 ∉ [1,5) and ∉ [10,15) → false (5 is exclusive upper of first range)
     let out2 = scalar_bool(
         &sess,
         "SELECT multirange_contains_elem(int4multirange(int4range(1, 5), int4range(10, 15)), 5)",
     ).await;
-    assert!(!out2, "multirange_contains_elem({[1,5),[10,15)}, 5) must be false (exclusive upper)");
+    assert!(!out2, "multirange_contains_elem({{[1,5),[10,15)}}, 5) must be false (exclusive upper)");
 }
 
 /// `int4multirange @> scalar` via `@>` operator rewrite.
