@@ -21,9 +21,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Float64Array, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use basin_common::{BasinError, ProjectId, Result, TableName};
-use basin_storage::{Storage, VectorHit};
+use basin_storage::{ReadOptions, Storage, VectorHit};
 use basin_vector::Distance;
 use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
@@ -54,6 +54,20 @@ impl ProjectSession {
         distance: Distance,
     ) -> Result<Vec<RecordBatch>> {
         let storage = &self.engine.config().storage;
+        // Load the catalog schema once so read_rows_at_positions can supply
+        // it to read_paths_with_schema.  With the catalog schema the Vortex
+        // restoration chain fires (UUID Decimal256→FSB(16), POINT LargeBinary
+        // →FSB(21)), keeping the returned RecordBatches in the canonical types
+        // that pgwire / REST / convert::batch_df_to_ws expect.
+        let catalog_schema: SchemaRef = {
+            let meta = self
+                .engine
+                .config()
+                .catalog
+                .load_table(&self.project, table)
+                .await?;
+            meta.schema
+        };
         let hits: Vec<VectorHit> = storage
             .vector_search(&self.project, table, column, &query, k, distance)
             .await?;
@@ -88,7 +102,14 @@ impl ProjectSession {
         let mut output_rows: Vec<(f32, RecordBatch)> = Vec::with_capacity(hits.len());
 
         for (path, group) in by_file {
-            let batch = read_rows_at_positions(storage, &self.project, &path, &group).await?;
+            let batch = read_rows_at_positions(
+                storage,
+                &self.project,
+                &path,
+                &group,
+                catalog_schema.clone(),
+            )
+            .await?;
             // Pair each output row with its distance so we can re-sort
             // globally after collecting from every file.
             for (i, h) in group.iter().enumerate() {
@@ -188,21 +209,28 @@ async fn read_rows_at_positions(
     project: &ProjectId,
     path: &ObjectPath,
     hits: &[&VectorHit],
+    catalog_schema: SchemaRef,
 ) -> Result<RecordBatch> {
-    let mut stream = storage.read_file(project, path).await?;
+    // Use read_paths_with_schema so the Vortex restoration chain fires:
+    // UUID Decimal256(39,0) → FixedSizeBinary(16), POINT LargeBinary →
+    // FixedSizeBinary(21).  Without the catalog schema these types arrive
+    // in their on-disk disguise, which breaks pgwire / REST serialization.
+    let mut stream = storage
+        .read_paths_with_schema(
+            project,
+            vec![path.clone()],
+            ReadOptions::default(),
+            Some(catalog_schema.clone()),
+        )
+        .await?;
     let mut all: Vec<RecordBatch> = Vec::new();
-    let mut schema_opt = None;
     while let Some(r) = stream.next().await {
-        let b = r.map_err(|e| BasinError::storage(format!("read {path}: {e}")))?;
-        if schema_opt.is_none() {
-            schema_opt = Some(b.schema());
-        }
-        all.push(b);
+        all.push(r.map_err(|e| BasinError::storage(format!("read {path}: {e}")))?);
     }
-    let Some(schema) = schema_opt else {
+    if all.is_empty() {
         return Err(BasinError::storage(format!("empty data file at {path}")));
-    };
-    let combined = arrow_select::concat::concat_batches(&schema, &all)
+    }
+    let combined = arrow_select::concat::concat_batches(&catalog_schema, &all)
         .map_err(|e| BasinError::storage(format!("concat {path}: {e}")))?;
 
     // Project rows in the original `hits` order. We do that by building a
@@ -218,7 +246,7 @@ async fn read_rows_at_positions(
         }
         row_batches.push(combined.slice(pos, 1));
     }
-    let out = arrow_select::concat::concat_batches(&schema, &row_batches)
+    let out = arrow_select::concat::concat_batches(&catalog_schema, &row_batches)
         .map_err(|e| BasinError::storage(format!("hit concat {path}: {e}")))?;
     Ok(out)
 }
