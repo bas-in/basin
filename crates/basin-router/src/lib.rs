@@ -61,7 +61,8 @@ mod tls;
 mod types;
 
 pub use connection_limit::{
-    ConnectionGuard, ConnectionLimitProvider, ConnectionLimiter, NoConnectionLimit,
+    CatalogConnectionLimitProvider, ConnectionGuard, ConnectionLimitProvider, ConnectionLimiter,
+    NoConnectionLimit,
 };
 pub use protocol::{COMMIT_CONFLICT_EXHAUSTED_COUNT, COMMIT_CONFLICT_RETRY_COUNT};
 pub use rate_limit::{from_env_qps, PgRateLimit, BURST_FACTOR, DEFAULT_SUSTAINED_QPS};

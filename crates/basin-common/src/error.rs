@@ -142,6 +142,27 @@ pub enum BasinError {
     #[error("writer lease not held: {0}")]
     LeaseNotHeld(String),
 
+    /// Multi-node commit 4 (`BASIN_WAL_MODE=raft`) — the raft-backed WAL could
+    /// not durably commit the write because consensus did not reach quorum:
+    /// no leader, lost leadership, replication timed out, or not enough
+    /// replicas are reachable to form a majority. In raft mode "durable" means
+    /// "quorum-replicated", so a write that cannot reach quorum is **not**
+    /// acked — it blocks (waiting for the proposal to commit) and then fails
+    /// with this error rather than silently dropping. Fail-closed for writes;
+    /// reads are never rejected with it. Routers treat it as **retryable**
+    /// (same 40001 serialization-failure class as [`Self::LeaseNotHeld`]): the
+    /// caller should re-resolve the leader and retry. The message names the
+    /// partition / cause.
+    ///
+    /// SQLSTATE choice: 40001 keeps it in the retryable class drivers already
+    /// back off on (matching LeaseNotHeld / commit conflict). 57P03
+    /// (`cannot_connect_now`) was the alternative — it reads as "the durable
+    /// backend is temporarily unavailable, retry" — but mixing a connection-
+    /// state code into a per-statement retry confuses driver retry loops that
+    /// special-case 57P03 as "reconnect". See APPLY.md.
+    #[error("raft WAL could not reach quorum: {0}")]
+    RaftNoQuorum(String),
+
     /// A statement waited for a row or table lock longer than
     /// `lock_timeout` allows. Router maps to SQLSTATE `55P03`
     /// (`lock_not_available`), matching PostgreSQL's behaviour when
@@ -249,6 +270,32 @@ impl BasinError {
     /// the owner on retry.
     pub fn lease_not_held(msg: impl Into<String>) -> Self {
         Self::LeaseNotHeld(msg.into())
+    }
+
+    /// Multi-node raft (commit 6) — typed constructor for a write that
+    /// arrived at a node which is **not the raft leader**. In `BASIN_WAL_MODE
+    /// =raft` raft leadership is the write fence (it supersedes the writer
+    /// lease — see `RaftWal`), so a non-leader write is refused before it
+    /// reaches the raft log. Reuses the [`Self::LeaseNotHeld`] variant on
+    /// purpose: it is the same retryable class (SQLSTATE 40001) the router
+    /// already handles for lease refusals, so no new error variant and no new
+    /// exhaustive-match arm are needed. The message embeds an optional leader
+    /// hint so the caller (and the router/proxy on retry) can be redirected
+    /// to the current leader: `not raft leader (leader hint: <addr-or-id>)`
+    /// when known, else `not raft leader (leader unknown)`. `hint` is the
+    /// leader's advertised address (or node id) as the cluster knows it.
+    pub fn not_leader(hint: Option<impl Into<String>>) -> Self {
+        let msg = match hint {
+            Some(h) => format!("not raft leader (leader hint: {})", h.into()),
+            None => "not raft leader (leader unknown)".to_string(),
+        };
+        Self::LeaseNotHeld(msg)
+    }
+
+    /// Multi-node commit 4 — typed constructor for the raft-WAL no-quorum
+    /// write failure (`BASIN_WAL_MODE=raft`). Retryable (SQLSTATE 40001).
+    pub fn raft_no_quorum(msg: impl Into<String>) -> Self {
+        Self::RaftNoQuorum(msg.into())
     }
 
     /// Phase 5.28.B — typed constructor for `lock_timeout` expiry.

@@ -169,6 +169,20 @@ tower-http = { version = "0.6", features = ["trace", "cors"] }
 http = "1"
 hyper = "1"
 
+# Raft cross-process transport (multi-node commit 5, basin-wal `raft-net`
+# feature). tonic/prost pinned to the versions opentelemetry already resolves
+# (0.12 / 0.13) so the lockfile gains no second major. tonic-build drives
+# prost-build codegen from crates/basin-wal/proto/raft.proto and needs
+# `protoc` on the build host. tokio-stream's `net` feature provides
+# TcpListenerStream for ephemeral-port (:0) binds. The default `tls` feature
+# is intentionally OFF for v1 (plaintext, private-network posture — see
+# raft_net/mod.rs); when mTLS lands, add the `tls` feature and wire
+# Server/Channel tls_config.
+tonic = { version = "0.12", default-features = false, features = ["transport", "codegen", "prost"] }
+prost = "0.13"
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic-build = "0.12"
+
 # Hashing + encoding for the Postgres `digest()` / `encode()` / `decode()`
 # UDF family (see `basin_engine::udf`). All `digest 0.10`-shaped so they
 # compose through one trait. `hex` and `base64` carry the encode/decode

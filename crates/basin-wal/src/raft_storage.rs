@@ -44,9 +44,25 @@
 //! the "implementation with persistent snapshot" model from openraft's
 //! `RaftStorage::apply_to_state_machine` docs. Entries applied after the
 //! latest snapshot are re-applied from the (durable) log by the raft
-//! protocol itself after restart. Snapshots move to S3-anchored manifests in
-//! a follow-up commit; the local snapshot file is the stopgap that keeps
-//! `purge` + restart loss-free until then.
+//! protocol itself after restart.
+//!
+//! ## Manifest-anchored snapshots (multi-node commit 3)
+//!
+//! The state machine additionally carries a [`ManifestPointer`]: a small
+//! certificate that "engine state through `durable_lsn` is durable in object
+//! storage" (catalog snapshot id + per-project flushed-LSN watermarks). It is
+//! *not* a copy of the data — S3/the catalog already hold the rows. A raft
+//! snapshot serialises the manifest pointer alongside the (small)
+//! per-partition log index; on a follower `install_snapshot` records the
+//! pointer and the follower's engine state comes from S3/catalog, not from log
+//! replay below the watermark.
+//!
+//! When a flush/compaction advances the engine's durable watermark, the
+//! leader stamps the new [`ManifestPointer`] into the state machine
+//! ([`DiskRaftStorage::record_durable_watermark`]), takes a snapshot, and the
+//! raft log purges every entry at or below the watermark's log index — so the
+//! local log stays bounded by the un-flushed window rather than growing
+//! forever. See [`crate::RaftWal::record_flush_watermark`] for the wiring.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
@@ -112,6 +128,106 @@ struct SnapshotFile {
 }
 
 // ---------------------------------------------------------------------------
+// Manifest pointer (multi-node commit 3)
+// ---------------------------------------------------------------------------
+
+/// A certificate that engine state up to `durable_lsn` is durable in object
+/// storage. This is the *raft snapshot payload contract*: not a copy of the
+/// rows (S3/the catalog already hold those), just a pointer the cluster
+/// agrees on. A follower that receives it knows it can serve reads from the
+/// catalog/S3 for everything at or below `durable_lsn` and only needs the raft
+/// log for the un-flushed tail above it.
+///
+/// `durable_lsn` is the engine's per-`(project, partition)` flushed watermark
+/// (the LSN the compactor passed to [`crate::Wal::truncate`] after the catalog
+/// commit landed). `last_log_id` is the raft log id whose apply produced this
+/// watermark — the purge floor. `catalog_snapshot_id` names the catalog
+/// snapshot / manifest version that anchors the flushed state on S3, carried
+/// verbatim so a recovering follower can fetch the exact engine image.
+/// `durable_lsn` is a `BTreeMap` for O(log n) lookup + stable ordering but is
+/// serialised as a `Vec<DurableLsnEntry>` because `serde_json` can't encode
+/// non-string map keys (the natural `(ProjectId, PartitionKey)` tuple) — the
+/// same reasoning as [`StateMachineData::partitions`]. See the manual serde
+/// impl below.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ManifestPointer {
+    /// Per-`(project, partition)` durable (flushed) watermark. An entry here
+    /// means "rows for this partition through this LSN are committed to the
+    /// catalog / object storage". Absent partition ⇒ nothing flushed yet.
+    pub(crate) durable_lsn: BTreeMap<(ProjectId, PartitionKey), u64>,
+    /// Highest raft log index whose apply advanced any watermark above. This
+    /// is the purge floor: the raft log can drop entries at or below it
+    /// because the engine state they produced is now durable in object
+    /// storage and replayable from the catalog snapshot.
+    pub(crate) last_log_index: u64,
+    /// Catalog snapshot / manifest version anchoring the flushed engine state
+    /// on S3. Opaque to the WAL; the engine / catalog interpret it. Empty
+    /// string ⇒ no manifest anchored yet (pre-first-flush).
+    pub(crate) catalog_snapshot_id: String,
+}
+
+impl ManifestPointer {
+    /// Durable watermark for one partition (`0` if nothing flushed).
+    pub(crate) fn watermark(&self, project: &ProjectId, partition: &PartitionKey) -> u64 {
+        self.durable_lsn
+            .get(&(*project, partition.clone()))
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct DurableLsnEntry {
+    project: ProjectId,
+    partition: PartitionKey,
+    lsn: u64,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct ManifestPointerWire {
+    #[serde(default)]
+    durable_lsn: Vec<DurableLsnEntry>,
+    #[serde(default)]
+    last_log_index: u64,
+    #[serde(default)]
+    catalog_snapshot_id: String,
+}
+
+impl Serialize for ManifestPointer {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> std::result::Result<S::Ok, S::Error> {
+        let wire = ManifestPointerWire {
+            durable_lsn: self
+                .durable_lsn
+                .iter()
+                .map(|((project, partition), lsn)| DurableLsnEntry {
+                    project: *project,
+                    partition: partition.clone(),
+                    lsn: *lsn,
+                })
+                .collect(),
+            last_log_index: self.last_log_index,
+            catalog_snapshot_id: self.catalog_snapshot_id.clone(),
+        };
+        wire.serialize(ser)
+    }
+}
+
+impl<'de> Deserialize<'de> for ManifestPointer {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> std::result::Result<Self, D::Error> {
+        let wire = ManifestPointerWire::deserialize(de)?;
+        let mut durable_lsn = BTreeMap::new();
+        for e in wire.durable_lsn {
+            durable_lsn.insert((e.project, e.partition), e.lsn);
+        }
+        Ok(Self {
+            durable_lsn,
+            last_log_index: wire.last_log_index,
+            catalog_snapshot_id: wire.catalog_snapshot_id,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // State machine (in-RAM; rebuilt from the snapshot file on open)
 // ---------------------------------------------------------------------------
 
@@ -148,6 +264,10 @@ struct StateMachineData {
     last_applied_log: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, BasicNode>,
     partitions: HashMap<(ProjectId, PartitionKey), PartitionLog>,
+    /// Manifest-anchored durability watermark (multi-node commit 3). Part of
+    /// the applied state so it rides in every snapshot and is agreed on by the
+    /// cluster; advanced by [`DiskRaftStorage::record_durable_watermark`].
+    manifest: ManifestPointer,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -162,6 +282,11 @@ struct StateMachineDataWire {
     last_applied_log: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, BasicNode>,
     partitions: Vec<PartitionEntry>,
+    /// Optional for forward/backward compatibility with c12 snapshot blobs
+    /// (which predate the manifest pointer): a missing field deserialises to
+    /// the default empty pointer.
+    #[serde(default)]
+    manifest: ManifestPointer,
 }
 
 impl Serialize for StateMachineData {
@@ -178,6 +303,7 @@ impl Serialize for StateMachineData {
                     log: log.clone(),
                 })
                 .collect(),
+            manifest: self.manifest.clone(),
         };
         wire.serialize(ser)
     }
@@ -194,6 +320,7 @@ impl<'de> Deserialize<'de> for StateMachineData {
             last_applied_log: wire.last_applied_log,
             last_membership: wire.last_membership,
             partitions,
+            manifest: wire.manifest,
         })
     }
 }
@@ -478,6 +605,48 @@ impl DiskRaftStorage {
         }
     }
 
+    /// Snapshot of the manifest pointer (multi-node commit 3) — the durable
+    /// watermark this node has agreed on. Cloned out under the read lock.
+    pub(crate) async fn manifest_pointer(&self) -> ManifestPointer {
+        self.sm.read().await.manifest.clone()
+    }
+
+    /// Stamp a new durable watermark into the applied state (multi-node
+    /// commit 3). Called on the leader after a flush/compaction commits engine
+    /// state for `(project, partition)` through `durable_lsn` to object
+    /// storage. Records the per-partition watermark, advances the purge floor
+    /// to `last_log_index` (monotonic), and carries the `catalog_snapshot_id`
+    /// that anchors the flushed state on S3.
+    ///
+    /// Returns the purge floor (the highest log index now safe to purge), or
+    /// `None` if this call did not advance the floor (idempotent / stale
+    /// watermark — never moves it backwards).
+    pub(crate) async fn record_durable_watermark(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        durable_lsn: u64,
+        last_log_index: u64,
+        catalog_snapshot_id: impl Into<String>,
+    ) -> Option<u64> {
+        let mut sm = self.sm.write().await;
+        let key = (*project, partition.clone());
+        let prev = sm.manifest.durable_lsn.get(&key).copied().unwrap_or(0);
+        if durable_lsn > prev {
+            sm.manifest.durable_lsn.insert(key, durable_lsn);
+        }
+        let snapshot_id = catalog_snapshot_id.into();
+        if !snapshot_id.is_empty() {
+            sm.manifest.catalog_snapshot_id = snapshot_id;
+        }
+        if last_log_index > sm.manifest.last_log_index {
+            sm.manifest.last_log_index = last_log_index;
+            Some(last_log_index)
+        } else {
+            None
+        }
+    }
+
     /// Persist the current snapshot blob to `raft.snapshot` (atomic rewrite).
     fn persist_snapshot(
         &self,
@@ -683,26 +852,35 @@ impl RaftStorage<C> for Arc<DiskRaftStorage> {
             sm.last_applied_log = Some(entry.log_id);
             match &entry.payload {
                 EntryPayload::Blank => {
-                    out.push(BasinRaftResponse { lsn: Lsn::ZERO });
+                    out.push(BasinRaftResponse::default());
                 }
                 EntryPayload::Normal(req) => {
-                    let key = (req.project, req.partition.clone());
-                    let part = sm.partitions.entry(key).or_default();
-                    if part.next_lsn == 0 {
-                        part.next_lsn = 1;
+                    // Multi-node commit 4: a proposal is a batch of items.
+                    // Assign one LSN per item, in batch order, so each
+                    // `(project, partition)` keeps monotonic LSNs across the
+                    // whole amortised consensus round.
+                    let mut lsns = Vec::with_capacity(req.items.len());
+                    let appended_at = Utc::now();
+                    for item in &req.items {
+                        let key = (item.project, item.partition.clone());
+                        let part = sm.partitions.entry(key).or_default();
+                        if part.next_lsn == 0 {
+                            part.next_lsn = 1;
+                        }
+                        let lsn = part.next_lsn;
+                        part.next_lsn += 1;
+                        part.entries.push(StoredEntry {
+                            lsn,
+                            payload: item.payload.clone(),
+                            appended_at,
+                        });
+                        lsns.push(Lsn(lsn));
                     }
-                    let lsn = part.next_lsn;
-                    part.next_lsn += 1;
-                    part.entries.push(StoredEntry {
-                        lsn,
-                        payload: req.payload.clone(),
-                        appended_at: Utc::now(),
-                    });
-                    out.push(BasinRaftResponse { lsn: Lsn(lsn) });
+                    out.push(BasinRaftResponse { lsns });
                 }
                 EntryPayload::Membership(m) => {
                     sm.last_membership = StoredMembership::new(Some(entry.log_id), m.clone());
-                    out.push(BasinRaftResponse { lsn: Lsn::ZERO });
+                    out.push(BasinRaftResponse::default());
                 }
             }
         }
@@ -771,17 +949,17 @@ mod tests {
     fn entry(term: u64, index: u64, payload: &str) -> Entry<C> {
         Entry {
             log_id: log_id(term, index),
-            payload: EntryPayload::Normal(BasinRaftRequest {
-                project: ProjectId::new(),
-                partition: PartitionKey::default_key(),
-                payload: payload.as_bytes().to_vec(),
-            }),
+            payload: EntryPayload::Normal(BasinRaftRequest::single(
+                ProjectId::new(),
+                PartitionKey::default_key(),
+                payload.as_bytes().to_vec(),
+            )),
         }
     }
 
     fn payload_of(e: &Entry<C>) -> &[u8] {
         match &e.payload {
-            EntryPayload::Normal(req) => &req.payload,
+            EntryPayload::Normal(req) => &req.items[0].payload,
             other => panic!("expected Normal payload, got {other:?}"),
         }
     }
@@ -1014,17 +1192,17 @@ mod tests {
         let entries: Vec<Entry<C>> = (1..=3)
             .map(|i| Entry {
                 log_id: log_id(1, i),
-                payload: EntryPayload::Normal(BasinRaftRequest {
+                payload: EntryPayload::Normal(BasinRaftRequest::single(
                     project,
-                    partition: partition.clone(),
-                    payload: format!("sm-{i}").into_bytes(),
-                }),
+                    partition.clone(),
+                    format!("sm-{i}").into_bytes(),
+                )),
             })
             .collect();
         append(&mut store, entries.clone()).await;
         let responses = store.apply_to_state_machine(&entries).await.unwrap();
         assert_eq!(responses.len(), 3);
-        assert_eq!(responses[2].lsn, Lsn(3), "state machine assigns LSNs 1..=3");
+        assert_eq!(responses[2].lsn(), Lsn(3), "state machine assigns LSNs 1..=3");
 
         // Snapshot, then purge the whole applied prefix.
         let snap = store.build_snapshot().await.unwrap();
@@ -1045,6 +1223,83 @@ mod tests {
         assert_eq!(
             current.expect("snapshot restored").meta.last_log_id,
             Some(log_id(1, 3))
+        );
+    }
+
+    /// Manifest pointer (multi-node commit 3): the durable watermark recorded
+    /// into the state machine must round-trip through a snapshot
+    /// build/install with full fidelity, and survive reopen via the snapshot
+    /// file. `record_durable_watermark` is monotonic and reports the purge
+    /// floor only when it advances.
+    #[tokio::test]
+    async fn manifest_pointer_round_trips_through_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+
+        let mut store = DiskRaftStorage::open(dir.path()).unwrap();
+        // No watermark yet.
+        assert_eq!(store.manifest_pointer().await, ManifestPointer::default());
+
+        // Apply some entries so there is applied state to certify.
+        let entries: Vec<Entry<C>> = (1..=4)
+            .map(|i| Entry {
+                log_id: log_id(1, i),
+                payload: EntryPayload::Normal(BasinRaftRequest::single(
+                    project,
+                    partition.clone(),
+                    format!("e{i}").into_bytes(),
+                )),
+            })
+            .collect();
+        append(&mut store, entries.clone()).await;
+        store.apply_to_state_machine(&entries).await.unwrap();
+
+        // Record a flush watermark: rows through LSN 3 are durable, produced
+        // by raft log index 3, anchored on catalog snapshot "cat-42".
+        let floor = store
+            .record_durable_watermark(&project, &partition, 3, 3, "cat-42")
+            .await;
+        assert_eq!(floor, Some(3), "first watermark advances the purge floor");
+
+        // Monotonic: a lower / equal watermark does not move the floor.
+        let floor2 = store
+            .record_durable_watermark(&project, &partition, 2, 3, "")
+            .await;
+        assert_eq!(floor2, None, "stale watermark does not advance the floor");
+        let pointer = store.manifest_pointer().await;
+        assert_eq!(pointer.watermark(&project, &partition), 3, "watermark stays at 3");
+        assert_eq!(pointer.catalog_snapshot_id, "cat-42");
+        assert_eq!(pointer.last_log_index, 3);
+
+        // Build a snapshot and confirm the manifest is inside the blob.
+        let snap = store.build_snapshot().await.unwrap();
+        let blob = snap.snapshot.into_inner();
+        let decoded: StateMachineData = serde_json::from_slice(&blob).unwrap();
+        assert_eq!(decoded.manifest, pointer, "snapshot carries the manifest pointer");
+
+        // Install that snapshot on a fresh follower store: the manifest
+        // pointer must arrive with full fidelity.
+        let dir2 = TempDir::new().unwrap();
+        let mut follower = DiskRaftStorage::open(dir2.path()).unwrap();
+        assert_eq!(follower.manifest_pointer().await, ManifestPointer::default());
+        follower
+            .install_snapshot(&snap.meta, Box::new(Cursor::new(blob)))
+            .await
+            .unwrap();
+        assert_eq!(
+            follower.manifest_pointer().await,
+            pointer,
+            "install_snapshot transfers the manifest pointer verbatim"
+        );
+
+        // And it survives the follower's reopen via raft.snapshot.
+        drop(follower);
+        let reopened = DiskRaftStorage::open(dir2.path()).unwrap();
+        assert_eq!(
+            reopened.manifest_pointer().await,
+            pointer,
+            "manifest pointer restored from raft.snapshot on reopen"
         );
     }
 }

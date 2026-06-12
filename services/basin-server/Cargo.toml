@@ -29,6 +29,12 @@ realtime  = ["dep:basin-realtime", "dep:basin-cdc", "basin-rest?/realtime"]
 # Feature 1: wire basin-fn FunctionRuntime for LANGUAGE javascript functions.
 # Enables the catalog-backed FunctionInvoker installed via set_global_invoker.
 wasm-fn   = ["dep:basin-fn"]
+# Multi-node commit 5: cross-process raft transport over tonic/gRPC. Enables
+# basin-wal's `raft-net` feature so BASIN_WAL_MODE=raft talks to peers over the
+# wire (BASIN_RAFT_BIND / BASIN_RAFT_PEERS). Requires `protoc` on the build
+# host. Without it, raft mode uses the in-process Sim network (single-process /
+# tests only).
+raft-net  = ["basin-wal/raft-net"]
 # placeholder — scaffolded now; underlying engine feature ships in 5.11.J
 # "basin-engine/wasm" is omitted until the engine exports that feature.
 wasm-udf  = []

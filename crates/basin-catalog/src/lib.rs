@@ -386,6 +386,50 @@ pub trait Catalog: Send + Sync {
         Ok(None)
     }
 
+    /// Persist the per-project pgwire connection ceiling set by the cloud
+    /// control-plane (`POST /admin/v1/projects/:id/max-connections`).
+    ///
+    /// The value is a hard ceiling on **simultaneously open** pgwire
+    /// connections. The pgwire startup handler reads this once per new
+    /// connection attempt and refuses admission when `live >= max_connections`.
+    ///
+    /// ## Legacy-tolerant default
+    ///
+    /// Returns `Ok(())` (a durable no-op). Backends that do not persist the
+    /// ceiling fall back to the fail-closed default of
+    /// `DEFAULT_PROJECT_MAX_CONNECTIONS` (25) on every connect — the
+    /// correct behaviour for backends written before this method existed
+    /// because `get_project_max_connections` also returns `None` for those
+    /// backends.
+    async fn set_project_max_connections(
+        &self,
+        project: &ProjectId,
+        max_connections: u32,
+    ) -> Result<()> {
+        let _ = (project, max_connections);
+        Ok(())
+    }
+
+    /// Read the persisted per-project pgwire connection ceiling.
+    ///
+    /// Returns `None` when no ceiling has been stored — either because the
+    /// control-plane has never pushed one (new project, plan not yet set)
+    /// or because the catalog backend pre-dates this column. The pgwire
+    /// startup handler treats `None` as `DEFAULT_PROJECT_MAX_CONNECTIONS`
+    /// (fail-closed: 25, the Free tier ceiling).
+    ///
+    /// ## Default implementation
+    ///
+    /// Returns `Ok(None)` so non-overriding backends always take the
+    /// fail-closed default path.
+    async fn get_project_max_connections(
+        &self,
+        project: &ProjectId,
+    ) -> Result<Option<u32>> {
+        let _ = project;
+        Ok(None)
+    }
+
     /// Atomic commit: append `files` to the table, producing a new snapshot.
     ///
     /// Optimistic concurrency: the caller passes the snapshot id it last saw.

@@ -39,7 +39,7 @@ pub(crate) fn connection_limit_reached_response() -> ErrorResponse {
     let info = ErrorInfo::new(
         "FATAL".to_owned(),
         "53300".to_owned(),
-        "connection limit reached".to_owned(),
+        "too many connections for project (ceiling reached)".to_owned(),
     );
     info.into()
 }
@@ -79,6 +79,12 @@ fn classify(err: &BasinError) -> (&'static str, &'static str) {
         // handoff rejection above (the caller should re-resolve the owner
         // and retry there). Reads are never rejected with this code.
         BasinError::LeaseNotHeld(_) => ("ERROR", "40001"), // serialization_failure
+        // Multi-node commit 4 (BASIN_WAL_MODE=raft): the raft WAL could not
+        // reach quorum to durably commit the write — retryable, same class as
+        // LeaseNotHeld above (re-resolve the leader and retry). 57P03 was the
+        // alternative but it confuses drivers that special-case it as
+        // "reconnect"; see basin-common error docs.
+        BasinError::RaftNoQuorum(_) => ("ERROR", "40001"), // serialization_failure
         // Phase 5.28.B: lock_timeout expiry — PostgreSQL raises 55P03.
         BasinError::LockNotAvailable(_) => ("ERROR", "55P03"), // lock_not_available
         // Phase 5.28.C: idle_in_transaction_session_timeout — PostgreSQL
@@ -163,6 +169,17 @@ mod tests {
         assert_eq!(er.fields[0], (b'S', "ERROR".to_owned()));
         assert_eq!(er.fields[1], (b'C', "40001".to_owned()));
         assert!(er.fields[2].1.contains("writer lease not held"));
+    }
+
+    #[test]
+    fn classifies_raft_no_quorum() {
+        // BASIN_WAL_MODE=raft no-quorum write failures must surface as
+        // SQLSTATE 40001 (serialization_failure) — same retryable class as
+        // LeaseNotHeld, so existing driver/router retry loops pick it up.
+        let er = error_response(&BasinError::raft_no_quorum("proj/part: no leader"));
+        assert_eq!(er.fields[0], (b'S', "ERROR".to_owned()));
+        assert_eq!(er.fields[1], (b'C', "40001".to_owned()));
+        assert!(er.fields[2].1.contains("could not reach quorum"));
     }
 
     #[test]

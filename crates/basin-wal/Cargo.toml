@@ -28,8 +28,30 @@ thiserror.workspace = true
 # pre-release alpha. `serde` feature lets entries / vote / membership data
 # round-trip through bincode-friendly storage. See `RAFT.md` for the
 # library-choice ADR. v0.1 ships single-process simulation; cross-process
-# gRPC `RaftNetwork` is a follow-up.
+# gRPC `RaftNetwork` is the `raft-net` feature (multi-node commit 5).
 openraft = { version = "=0.9.24", features = ["serde"] }
+
+# --- raft-net (multi-node commit 5): cross-process gRPC transport ----------
+# Feature-gated so the default build (and crates that only need the disk WAL)
+# do NOT pull tonic/prost or require `protoc`. The transport lives in
+# `src/raft_net`; codegen in `build.rs` is gated on the same feature.
+# Versions pinned to what the workspace already resolves transitively
+# (opentelemetry pulls tonic 0.12 / prost 0.13) so the lockfile does not gain
+# a second major of either.
+tonic = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+tokio-stream = { workspace = true, optional = true, features = ["net"] }
+
+[features]
+# Off by default. Enable with `--features raft-net` (requires `protoc` on the
+# build host for `tonic-build`). Tests for the transport are `#![cfg(...)]`
+# gated and run under this feature.
+raft-net = ["dep:tonic", "dep:prost", "dep:tokio-stream"]
+
+[build-dependencies]
+# Only used when the `raft-net` feature is on (build.rs early-returns
+# otherwise via CARGO_FEATURE_RAFT_NET). Pinned to match the tonic major.
+tonic-build = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

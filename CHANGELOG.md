@@ -8,6 +8,70 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-12 — Per-project pgwire connection ceiling (#28b)
+
+### Added
+
+- **Per-project pgwire connection ceiling.** A hard ceiling on simultaneously
+  open pgwire connections per project, enforced at the pgwire startup handler:
+  a new connection is refused with SQLSTATE 53300 (`too many connections for
+  project (ceiling reached)`) once the live count reaches the ceiling.
+  `CatalogConnectionLimitProvider` reads the ceiling from the catalog on every
+  new connect; fail-closed — a project with no stored ceiling gets 25 (the Free
+  tier). The ceiling is persisted (new `project_max_connections` catalog table /
+  in-memory map) and set via the admin route `POST
+  /admin/v1/projects/:id/max-connections` (admin JWT, project_id claim must
+  match the path); `GET` reads it back. It is a CEILING, not a reservation:
+  lowering it never kills existing connections — only new admits are refused
+  once live >= ceiling (a RAII guard decrements the live count on
+  disconnect/drop).
+
+## 2026-06-12 — Multi-node: quorum-replicated WAL (`BASIN_WAL_MODE=raft`)
+
+### Added
+
+- **Cross-process raft transport over tonic/gRPC (`raft-net` feature).** With
+  the `raft-net` feature built (`cargo build -p basin-server --features
+  raft-net`; requires `protoc`), `RaftWal` nodes talk over a real wire protocol
+  instead of the in-process simulation, so a cluster runs across separate
+  processes / hosts. Each RPC (append_entries / vote / install_snapshot) carries
+  the openraft message as a serde_json-encoded opaque payload — the same codec
+  the disk log frames entries with, so wire and log agree on entry encoding. The
+  tonic network factory dials lazily, reuses one HTTP/2 channel per peer
+  (evicting on transport failure and on openraft backoff so a peer that
+  restarted at the same address re-resolves), bounds every RPC by
+  `min(openraft hard_ttl, BASIN_RAFT_RPC_TIMEOUT_MS)`, and backs off
+  exponentially. Error mapping is liveness-correct: connect / timeout /
+  unknown-peer become Unreachable, malformed bytes become NetworkError, and a
+  peer that answered with a raft error becomes RemoteError. v1 is plaintext on
+  an assumed-private cluster network; mTLS is the documented production
+  follow-up. `basin-server` selects the tonic factory when `BASIN_RAFT_BIND` /
+  `BASIN_RAFT_PEERS` are configured and starts the transport server on the bind
+  addr; without the feature, raft mode uses the in-process Sim network.
+- **Quorum-replicated WAL durability (`BASIN_WAL_MODE=raft`).** Off by default
+  (`local` mode is byte-identical to today). In raft mode the WAL durability
+  boundary becomes a **quorum ack** instead of a local fsync: a WAL append
+  batch is proposed as one openraft log entry, so a single consensus round plus
+  local fsync is amortised over the whole group-commit batch, and `durable_lsn`
+  advances on the raft commit index. Backpressure is fail-closed and typed — a
+  write that cannot reach quorum blocks then fails with the retryable
+  `RaftNoQuorum` (SQLSTATE 40001), never a silent partial ack.
+- **Manifest-anchored raft snapshots.** A raft snapshot is a small manifest
+  pointer (catalog snapshot id + per-`(project, partition)` flushed watermark),
+  not a data copy: S3 and the catalog already hold the rows. After the compactor
+  commits, `record_flush_watermark` stamps the watermark, snapshots, and purges
+  the raft log up to it, so the local log stays bounded by the un-flushed window.
+- **Server cluster wiring + leader fence.** `BASIN_WAL_MODE=raft` selects the
+  `RaftWal` backend for the shard, parsing `BASIN_NODE_ID` / `BASIN_RAFT_BIND` /
+  `BASIN_RAFT_PEERS` (`id@host:port`) and bootstrapping (`BASIN_RAFT_BOOTSTRAP=1`
+  on one node) or joining. Raft leadership is the write fence and supersedes the
+  writer lease: a non-leader write is refused before the raft round-trip with the
+  typed retryable not-leader error (SQLSTATE 40001) carrying a leader hint; with
+  `BASIN_LEASE_MODE=required` also set, raft wins and the lease is logged as
+  subsumed. Raft mode without `BASIN_SHARD_ENABLED=1` / bind / peers is a
+  refuse-to-start error. Cluster status (node id, role, term, commit index,
+  peers) is logged at startup via `RaftWal::cluster_status`.
+
 ## 2026-06-12 — SQL compat: ALTER ADD UNIQUE, typed timestamptz binds, 42883/42703
 
 ### Added
