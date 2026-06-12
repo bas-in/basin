@@ -106,6 +106,54 @@ def status_chip(passed: bool) -> str:
     return "**PASS**" if passed else "**FAIL**"
 
 
+def _bar_admits(bar: dict | None, value) -> bool | None:
+    """Does `value` satisfy `bar`? Returns None when undecidable (no bar, no
+    value, or an unbounded ±∞ threshold that round-tripped as JSON null)."""
+    if not bar or value is None:
+        return None
+    op = bar.get("op", "")
+    thr = bar.get("value", None)
+    if thr is None:  # ±∞ bound → always admits
+        return True
+    if op == "greater_than_or_equal":
+        return value >= thr
+    if op == "less_than":
+        return value < thr
+    if op == "equal":
+        return abs(value - thr) < 1e-12
+    return None
+
+
+def bar_consistency_warning(report: dict) -> str | None:
+    """Guard against the perf_stack-style mislabel: a report that reports
+    `passed` while its OWN displayed `primary.bar` disagrees with
+    `primary.value`. Returns a human-readable warning string when the published
+    PASS/FAIL chip would contradict the bar shown next to it, else None.
+
+    This is a renderer-side invariant only — the authoritative pass/fail is
+    computed in the Rust harness. It exists so a future regime-bar mismatch
+    (passed computed against one bar, a different bar displayed) is caught at
+    publish time instead of shipping a card that reads "PASS … bar ≥3.0×"
+    against a 1.226× value.
+    """
+    if "passed" not in report:
+        return None
+    primary = report.get("primary")
+    if not isinstance(primary, dict):
+        return None
+    admits = _bar_admits(primary.get("bar"), primary.get("value"))
+    if admits is None:
+        return None
+    passed = bool(report.get("passed"))
+    if passed != admits:
+        return (
+            f"{report.get('id', '?')}: passed={passed} but the displayed bar "
+            f"{bar_text(primary.get('bar'))} {'admits' if admits else 'rejects'} "
+            f"value {primary.get('value')!r} — published chip contradicts its bar"
+        )
+    return None
+
+
 # ---------- markdown sections --------------------------------------------------
 
 
@@ -381,6 +429,14 @@ def bundle_one(data_dir: Path, slug: str) -> int:
             reports[p.stem] = json.loads(p.read_text())
         except json.JSONDecodeError as e:
             print(f"skipping malformed {p.name}: {e}", file=sys.stderr)
+
+    # Publish-time guard: warn if any card's PASS/FAIL chip contradicts the
+    # bar it displays (the perf_stack regime-bar mislabel). Renderer-side only;
+    # the Rust harness owns the authoritative pass/fail.
+    for r in reports.values():
+        warn = bar_consistency_warning(r)
+        if warn:
+            print(f"WARNING: bar/passed mismatch — {warn}", file=sys.stderr)
 
     # Write the JS bundle for the dashboard.
     bundle = {"manifest": manifest, "reports": reports}

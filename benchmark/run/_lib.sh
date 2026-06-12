@@ -95,7 +95,7 @@ SEAWEEDFS_SCALING=(
 
 SEAWEEDFS_COMPARE=(
   s3_compare_backup_cost s3_compare_lifecycle_ops s3_compare_postgres
-  s3_compare_server_lifecycle
+  s3_compare_postgres_1m s3_compare_server_lifecycle
 )
 
 SEAWEEDFS_S3=(

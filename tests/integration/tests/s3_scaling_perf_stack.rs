@@ -329,8 +329,12 @@ async fn s3_scaling_perf_stack() {
         dist_d.p50_ms, dist_d.p99_ms, dist_d.p999_ms,
     );
     println!(
-        "[S3 perf_stack] speedup a→d (p50) = {:.1}× (bar ≥ {:.0}×); d p99 < {:.0}ms? {}",
-        speedup, BAR_SPEEDUP, BAR_D_MAX_P99_MS, bar_d_ok,
+        "[S3 perf_stack] speedup a→d (p50) = {:.1}× (bar ≥ {:.1}× [{}]); d p99 < {:.0}ms? {}",
+        speedup,
+        speedup_bar,
+        if latency_regime { "latency" } else { "loopback" },
+        BAR_D_MAX_P99_MS,
+        bar_d_ok,
     );
 
     let layer_row = |key: &str, label: &str, d: &LatencyDistribution| -> serde_json::Value {
@@ -385,7 +389,15 @@ async fn s3_scaling_perf_stack() {
             label: "speedup p50 (a→d)".into(),
             value: speedup,
             unit: "x".into(),
-            bar: BarOp::ge(BAR_SPEEDUP),
+            // Report the bar that was ACTUALLY applied for this regime. On
+            // loopback the achievable bar is `BAR_SPEEDUP_LOOPBACK` (the
+            // uncached baseline is already ~4 ms — there's no latency for the
+            // cache stack to compress 3×); only the latency-bearing regime
+            // (real S3 / tigris-realistic) can clear `BAR_SPEEDUP`. Hardcoding
+            // `BAR_SPEEDUP` here was the mislabel: it let a loopback run with
+            // speedup 1.226 publish "PASS … bar ≥3.0×" — `passed` was computed
+            // against the loopback bar while the displayed bar said 3.0.
+            bar: BarOp::ge(speedup_bar),
         }),
     );
 
@@ -396,8 +408,12 @@ async fn s3_scaling_perf_stack() {
     );
     assert!(
         bar_speedup_ok,
-        "speedup a→d (p50) = {:.2}× below bar ≥ {:.0}× \
+        "speedup a→d (p50) = {:.2}× below bar ≥ {:.1}× [{}] \
          (a.p50={:.2}ms, d.p50={:.2}ms)",
-        speedup, BAR_SPEEDUP, dist_a.p50_ms, dist_d.p50_ms,
+        speedup,
+        speedup_bar,
+        if latency_regime { "latency" } else { "loopback" },
+        dist_a.p50_ms,
+        dist_d.p50_ms,
     );
 }

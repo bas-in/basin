@@ -185,6 +185,21 @@ advertised structural advantage on typical SaaS project sizes.
 - **No B-tree index on Basin's side.** Point-query results use Parquet
   predicate pushdown and bloom filters. A Postgres table *with* an index would
   be faster for point queries than the unindexed Postgres baseline shown here.
+- **SeaweedFS cards are a loopback structural-bug detector, not a cloud
+  latency proxy.** The `data_seaweedfs` dashboard runs Basin against a local
+  SeaweedFS S3 gateway (~1 ms/op RTT, no injected latency) versus an
+  *unindexed* Postgres. A headline like "point query 4× faster" on this card
+  reflects that regime: Basin's cold path on loopback storage beats an
+  unindexed sequential scan, but it is **not** the cloud claim. Against an
+  *indexed* Postgres the same point query is far slower (a remote object GET
+  loses to a buffer-cache B-tree probe). The cache-stack speedup bar is
+  regime-aware for the same reason — on loopback the uncached baseline is
+  already ~4 ms, so there is almost no latency for the disk/page/bloom stack to
+  compress, and the ≥3× bar only applies in a latency-bearing regime. The
+  honest cloud framing is **Basin on Tigris (real object-store RTT) vs Postgres
+  on EBS, *with* its index** — run the `.basin-test.tigris-realistic.toml`
+  profile (a `LatencyStore` injecting ~9 ms/op) to reproduce that regime; the
+  loopback SeaweedFS numbers should not be quoted as cloud performance.
 - **Best-effort Postgres calibration.** Postgres is run with default config
   (no tuning of `shared_buffers`, `work_mem`, etc.). A tuned Postgres instance
   would close some gaps.
