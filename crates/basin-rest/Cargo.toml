@@ -10,7 +10,7 @@ publish = false
 # Optional realtime co-mount: SSE + WS handlers on the REST port.
 # Enabled by basin-server's `realtime` feature so clients can reach
 # /realtime/v1/sse|ws on the same port as /rest/v1/*.
-realtime = ["dep:basin-realtime"]
+realtime = ["dep:basin-realtime", "dep:basin-cdc", "dep:basin-storage"]
 
 [dependencies]
 basin-common.workspace = true
@@ -19,6 +19,10 @@ basin-auth.workspace = true
 basin-catalog.workspace = true
 basin-blob.workspace = true
 basin-realtime = { workspace = true, optional = true }
+basin-cdc = { workspace = true, optional = true }
+# CDC co-mount needs the `Storage` handle type for `CdcCoMount`. Gated on the
+# same `realtime` feature; basin-storage is already a dev-dependency below.
+basin-storage = { workspace = true, optional = true }
 
 tokio.workspace = true
 futures.workspace = true

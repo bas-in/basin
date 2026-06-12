@@ -120,6 +120,10 @@ pub use routes::fn_handler::{
 #[cfg(feature = "realtime")]
 pub use server::RealtimeCoMount;
 
+// ADR 0028 Phase 1: durable CDC SSE co-mount public surface.
+#[cfg(feature = "realtime")]
+pub use server::CdcCoMount;
+
 // #55: per-function log buffer + CPU counter. Public so FunctionInvoker
 // implementations (integration tests, W6 catalog-backed runtime) can call
 // `append_log` / `add_cpu_ms` after each invocation.
@@ -256,6 +260,17 @@ impl RestService {
         // only holder at this point, which is always true pre-`run`).
         if let Some(inner) = Arc::get_mut(&mut self.inner) {
             inner.realtime = Some(mount);
+        }
+        self
+    }
+
+    /// ADR 0028 Phase 1: attach the durable CDC SSE co-mount so clients can
+    /// reach `GET /v1/cdc/:project/stream` on the REST port. Must be called
+    /// **before** [`Self::run_until_bound`]. Mirrors [`Self::attach_realtime`].
+    #[cfg(feature = "realtime")]
+    pub fn attach_cdc(&mut self, mount: CdcCoMount) -> &mut Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.cdc = Some(mount);
         }
         self
     }

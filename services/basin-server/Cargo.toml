@@ -25,7 +25,7 @@ minimal   = []
 auth      = ["dep:basin-auth"]
 rest      = ["dep:basin-rest", "auth"]
 webhooks  = ["dep:basin-webhooks"]
-realtime  = ["dep:basin-realtime", "basin-rest?/realtime"]
+realtime  = ["dep:basin-realtime", "dep:basin-cdc", "basin-rest?/realtime"]
 # Feature 1: wire basin-fn FunctionRuntime for LANGUAGE javascript functions.
 # Enables the catalog-backed FunctionInvoker installed via set_global_invoker.
 wasm-fn   = ["dep:basin-fn"]
@@ -49,6 +49,7 @@ basin-auth     = { workspace = true, optional = true }
 basin-rest     = { workspace = true, optional = true }
 basin-webhooks = { workspace = true, optional = true }
 basin-realtime = { workspace = true, optional = true }
+basin-cdc      = { workspace = true, optional = true }
 basin-fn       = { workspace = true, optional = true }
 base64         = { workspace = true }
 

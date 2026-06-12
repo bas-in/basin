@@ -35,6 +35,12 @@ use tower_http::trace::TraceLayer;
 #[cfg(feature = "realtime")]
 use basin_realtime::{ChannelRegistry, ReplayRingRegistry};
 
+// ADR 0028 Phase 1: the durable CDC SSE stream is co-mounted on the REST port
+// alongside realtime. Gated on the same `realtime` feature (both consume the
+// post-commit change-event seam).
+#[cfg(feature = "realtime")]
+use basin_cdc::CdcSseState;
+
 use crate::errors::ApiError;
 use crate::routes::{
     admin as admin_routes, admin_functions as admin_fn_routes,
@@ -88,6 +94,11 @@ pub(crate) struct Inner {
     /// return 404 (same behaviour as before this feature landed).
     #[cfg(feature = "realtime")]
     pub(crate) realtime: Option<RealtimeCoMount>,
+    /// ADR 0028 Phase 1: optional durable CDC SSE co-mount. When set, the CDC
+    /// stream router is merged at `GET /v1/cdc/:project/stream`. Absent → that
+    /// path 404s (same posture as the realtime co-mount).
+    #[cfg(feature = "realtime")]
+    pub(crate) cdc: Option<CdcCoMount>,
 }
 
 /// Feature 2: data needed to build the realtime SSE + WS sub-routers that
@@ -98,6 +109,18 @@ pub struct RealtimeCoMount {
     pub registry: ChannelRegistry,
     pub auth: Arc<basin_auth::AuthService>,
     pub replay_rings: Option<ReplayRingRegistry>,
+}
+
+/// ADR 0028 Phase 1: data needed to build the durable CDC SSE sub-router that
+/// is merged into the REST app. Constructed by [`RestService::attach_cdc`] and
+/// stored in [`Inner`]. Carries the same handles the [`basin_cdc::CdcRingWriter`]
+/// sink uses — the engine's [`basin_storage::Storage`] (durable replay), the
+/// in-process live-tail registry (fast path), and the auth service.
+#[cfg(feature = "realtime")]
+pub struct CdcCoMount {
+    pub storage: basin_storage::Storage,
+    pub live: basin_cdc::LiveRegistry,
+    pub auth: Arc<basin_auth::AuthService>,
 }
 
 /// Env var holding the Postgres connection string for the durable blob
@@ -181,6 +204,8 @@ impl Inner {
             blob_signing_secret,
             #[cfg(feature = "realtime")]
             realtime: None,
+            #[cfg(feature = "realtime")]
+            cdc: None,
         }
     }
 
@@ -245,6 +270,17 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
             ),
             None => basin_realtime::ws_router(rt.registry.clone(), rt.auth.clone()),
         }
+    });
+
+    // ADR 0028 Phase 1: build the durable CDC SSE sub-router (own State, like
+    // the realtime routers, so `Router::merge` needs no Arc<Inner> threading).
+    #[cfg(feature = "realtime")]
+    let cdc_router: Option<Router> = inner.cdc.as_ref().map(|c| {
+        basin_cdc::cdc_router(CdcSseState {
+            storage: c.storage.clone(),
+            live: c.live.clone(),
+            auth: c.auth.clone(),
+        })
     });
 
     let app = Router::new()
@@ -454,8 +490,14 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
         } else {
             app
         };
-        if let Some(ws) = realtime_ws {
+        let app = if let Some(ws) = realtime_ws {
             app.merge(ws)
+        } else {
+            app
+        };
+        // ADR 0028 Phase 1: merge the durable CDC SSE router.
+        if let Some(cdc) = cdc_router {
+            app.merge(cdc)
         } else {
             app
         }
