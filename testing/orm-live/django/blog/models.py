@@ -1,3 +1,4 @@
+from django.contrib.postgres.fields import ArrayField
 from django.db import models
 
 
@@ -15,6 +16,11 @@ class Book(models.Model):
     pages = models.IntegerField(default=0)
     meta = models.JSONField(null=True)
     published_at = models.DateTimeField(null=True)
+    # ArrayField (PG-only): exercises the text[] column kind plus the
+    # __contains / __overlap lookups. Added via the 0002 ALTER-heavy migration.
+    tags = ArrayField(models.CharField(max_length=50), default=list, blank=True)
+    # Optimistic-locking version counter, also added in 0002.
+    version = models.IntegerField(default=0)
 
     class Meta:
         db_table = "dj_books"

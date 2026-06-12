@@ -27,7 +27,10 @@ def notok(name, reason):
 
 
 REMAINING = ["crud", "select-related", "atomic-commit", "savepoint-rollback",
-             "f-update", "bulk-create"]
+             "f-update", "bulk-create", "annotate-aggregate", "distinct-on",
+             "json-lookups", "array-lookups", "date-lookups", "select-for-update",
+             "select-for-update-skip-locked", "bulk-update", "values-list",
+             "count-exists-latest"]
 
 if not os.environ.get("BASIN_DSN"):
     notok("migrate", "BASIN_DSN not set")
@@ -56,7 +59,7 @@ import django  # noqa: E402
 django.setup()
 
 from django.db import connection, transaction  # noqa: E402
-from django.db.models import F  # noqa: E402
+from django.db.models import Avg, Count, F, Q, Sum  # noqa: E402
 from blog.models import Author, Book  # noqa: E402
 
 try:
@@ -152,9 +155,134 @@ def t_bulk_create():
           "ignore_conflicts did not duplicate")
 
 
+def t_annotate_aggregate():
+    a = Author.objects.create(name=f"agg-{RUN}")
+    Book.objects.create(author=a, title="A1", pages=10)
+    Book.objects.create(author=a, title="A2", pages=30)
+    # annotate(Count/Sum/Avg) + values — the reporting groupBy shape.
+    rows = list(
+        Book.objects.filter(author=a)
+        .values("author")
+        .annotate(n=Count("id"), total=Sum("pages"), avg=Avg("pages"))
+    )
+    check(len(rows) == 1, "annotate+values grouped into one author row")
+    check(rows[0]["n"] == 2 and rows[0]["total"] == 40 and rows[0]["avg"] == 20,
+          "Count/Sum/Avg computed server-side")
+    # aggregate() scalar form.
+    agg = Book.objects.filter(author=a).aggregate(total=Sum("pages"))
+    check(agg["total"] == 40, "aggregate() scalar sum")
+
+
+def t_distinct_on():
+    # Django distinct('col') compiles to Postgres DISTINCT ON (col).
+    a = Author.objects.create(name=f"dist-{RUN}")
+    Book.objects.create(author=a, title="D1", pages=1)
+    Book.objects.create(author=a, title="D2", pages=2)
+    rows = list(
+        Book.objects.filter(author=a).order_by("author_id", "pages").distinct("author_id")
+    )
+    check(len(rows) == 1, "DISTINCT ON (author_id) collapsed to one row per author")
+
+
+def t_json_lookups():
+    a = Author.objects.create(name=f"json-{RUN}")
+    Book.objects.create(author=a, title="J1", meta={"genre": "db", "tags": ["x"]})
+    # __contains (JSONB @>).
+    check(Book.objects.filter(author=a, meta__contains={"genre": "db"}).exists(),
+          "JSONField __contains (@>) matched")
+    # __has_key (jsonb ?).
+    check(Book.objects.filter(author=a, meta__has_key="genre").exists(),
+          "JSONField __has_key (?) matched")
+    # key transform (->> 'genre').
+    check(Book.objects.filter(author=a, meta__genre="db").exists(),
+          "JSONField key transform (->>) matched")
+
+
+def t_array_lookups():
+    a = Author.objects.create(name=f"arr-{RUN}")
+    Book.objects.create(author=a, title="Arr1", tags=["rust", "db"])
+    Book.objects.create(author=a, title="Arr2", tags=["go"])
+    # ArrayField __contains (@>).
+    check(Book.objects.filter(author=a, tags__contains=["rust"]).count() == 1,
+          "ArrayField __contains (@>) matched exactly one")
+    # ArrayField __overlap (&&).
+    check(Book.objects.filter(author=a, tags__overlap=["go", "rust"]).count() == 2,
+          "ArrayField __overlap (&&) matched both")
+
+
+def t_date_lookups():
+    import datetime
+    a = Author.objects.create(name=f"date-{RUN}")
+    Book.objects.create(author=a, title="Dt1",
+                        published_at=datetime.datetime(2024, 3, 1, 12, 0, tzinfo=datetime.timezone.utc))
+    # __year filter (EXTRACT).
+    check(Book.objects.filter(author=a, published_at__year=2024).exists(),
+          "published_at__year filter (EXTRACT) matched")
+    # __date filter (::date cast comparison).
+    check(Book.objects.filter(author=a, published_at__date=datetime.date(2024, 3, 1)).exists(),
+          "published_at__date filter matched")
+
+
+def t_select_for_update():
+    with transaction.atomic():
+        rows = list(Book.objects.select_for_update().filter(title="A1", author__name=f"agg-{RUN}"))
+        check(len(rows) >= 1, "select_for_update() returned the locked row inside atomic")
+
+
+def t_select_for_update_skip_locked():
+    with transaction.atomic():
+        rows = list(
+            Book.objects.select_for_update(skip_locked=True)
+            .filter(author__name=f"agg-{RUN}").order_by("id")[:1]
+        )
+        check(isinstance(rows, list), "select_for_update(skip_locked=True) executed")
+
+
+def t_bulk_update():
+    a = Author.objects.create(name=f"bu-{RUN}")
+    b1 = Book.objects.create(author=a, title="BU1", pages=1)
+    b2 = Book.objects.create(author=a, title="BU2", pages=2)
+    b1.pages, b2.pages = 100, 200
+    Book.objects.bulk_update([b1, b2], ["pages"])
+    check(Book.objects.get(pk=b1.pk).pages == 100 and Book.objects.get(pk=b2.pk).pages == 200,
+          "bulk_update persisted both rows via the CASE UPDATE")
+
+
+def t_values_list():
+    a = Author.objects.create(name=f"vl-{RUN}")
+    Book.objects.create(author=a, title="VL1", pages=7)
+    flat = list(Book.objects.filter(author=a).values_list("pages", flat=True))
+    check(flat == [7], "values_list(flat=True) projected the single scalar column")
+
+
+def t_count_exists_latest():
+    a = Author.objects.create(name=f"cel-{RUN}")
+    Book.objects.create(author=a, title="CEL1", pages=1)
+    Book.objects.create(author=a, title="CEL2", pages=2)
+    check(Book.objects.filter(author=a).count() == 2, "count() over the author's books")
+    check(Book.objects.filter(author=a).exists(), "exists() truthy")
+    latest = Book.objects.filter(author=a).latest("id")
+    check(latest.title == "CEL2", "latest('id') returns the highest-id row")
+    first = Book.objects.filter(author=a).order_by("id").first()
+    check(first.title == "CEL1", "first() returns the lowest-id row")
+    # Q-object OR filter (the compound-WHERE shape).
+    n = Book.objects.filter(Q(title="CEL1") | Q(title="CEL2"), author=a).count()
+    check(n == 2, "Q() OR filter matched both")
+
+
 test("crud", t_crud)
 test("select-related", t_select_related)
 test("atomic-commit", t_atomic_commit)
 test("savepoint-rollback", t_savepoint_rollback)
 test("f-update", t_f_update)
 test("bulk-create", t_bulk_create)
+test("annotate-aggregate", t_annotate_aggregate)
+test("distinct-on", t_distinct_on)
+test("json-lookups", t_json_lookups)
+test("array-lookups", t_array_lookups)
+test("date-lookups", t_date_lookups)
+test("select-for-update", t_select_for_update)
+test("select-for-update-skip-locked", t_select_for_update_skip_locked)
+test("bulk-update", t_bulk_update)
+test("values-list", t_values_list)
+test("count-exists-latest", t_count_exists_latest)

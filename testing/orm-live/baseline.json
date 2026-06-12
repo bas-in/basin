@@ -19,7 +19,19 @@
       "nested-write-include": { "expected": "pass" },
       "transaction": { "expected": "pass" },
       "transaction-rollback": { "expected": "pass" },
-      "pagination": { "expected": "pass" }
+      "pagination": { "expected": "pass" },
+      "aggregate": { "expected": "pass" },
+      "group-by": { "expected": "pass" },
+      "relation-count": { "expected": "pass" },
+      "json-path-filter": { "expected": "pass" },
+      "create-many": { "expected": "pass" },
+      "update-many": { "expected": "pass" },
+      "delete-many": { "expected": "pass" },
+      "count-and-first": { "expected": "pass" },
+      "cursor-pagination": { "expected": "pass" },
+      "nested-include-depth3": { "expected": "pass" },
+      "raw-query": { "expected": "pass" },
+      "select-for-update": { "expected": "pass" }
     },
     "drizzle": {
       "migrate-generate": { "expected": "pass" },
@@ -38,7 +50,16 @@
       "transaction": { "expected": "pass" },
       "transaction-rollback": { "expected": "pass" },
       "pagination": { "expected": "pass" },
-      "delete": { "expected": "pass" }
+      "delete": { "expected": "pass" },
+      "aggregations": { "expected": "pass" },
+      "group-by": { "expected": "pass" },
+      "count-distinct": { "expected": "pass" },
+      "json-extract-filter": { "expected": "pass" },
+      "json-contains": { "expected": "pass" },
+      "bulk-update-returning": { "expected": "pass" },
+      "select-for-update": { "expected": "pass" },
+      "select-for-update-skip-locked": { "expected": "pass" },
+      "keyset-pagination": { "expected": "pass" }
     },
     "typeorm": {
       "connect": { "expected": "pass" },
@@ -49,7 +70,17 @@
       "crud-delete": { "expected": "pass" },
       "eager-relations": { "expected": "pass" },
       "queryrunner-tx": { "expected": "pass" },
-      "queryrunner-tx-rollback": { "expected": "pass" }
+      "queryrunner-tx-rollback": { "expected": "pass" },
+      "get-count": { "expected": "pass" },
+      "qb-group-by": { "expected": "pass" },
+      "qb-for-update": { "expected": "pass" },
+      "qb-for-update-skip-locked": { "expected": "pass" },
+      "soft-delete": { "expected": "pass" },
+      "keyset-pagination": { "expected": "pass" },
+      "upsert": {
+        "expected": "xfail",
+        "gap": "INSERT … ON CONFLICT (col) DO UPDATE SET x = EXCLUDED.x — planner does not resolve the EXCLUDED/table alias (orm_compat.rs upsert_on_conflict_do_update); TypeORM .upsert() emits this exact shape"
+      }
     },
     "django": {
       "migrate": { "expected": "pass" },
@@ -59,7 +90,17 @@
       "atomic-commit": { "expected": "pass" },
       "savepoint-rollback": { "expected": "pass" },
       "f-update": { "expected": "pass" },
-      "bulk-create": { "expected": "pass" }
+      "bulk-create": { "expected": "pass" },
+      "annotate-aggregate": { "expected": "pass" },
+      "distinct-on": { "expected": "pass" },
+      "json-lookups": { "expected": "pass" },
+      "array-lookups": { "expected": "pass" },
+      "date-lookups": { "expected": "pass" },
+      "select-for-update": { "expected": "pass" },
+      "select-for-update-skip-locked": { "expected": "pass" },
+      "bulk-update": { "expected": "pass" },
+      "values-list": { "expected": "pass" },
+      "count-exists-latest": { "expected": "pass" }
     },
     "sqlalchemy": {
       "connect": { "expected": "pass" },
@@ -68,7 +109,19 @@
       "relationships": { "expected": "pass" },
       "selectinload": { "expected": "pass" },
       "session-tx-rollback": { "expected": "pass" },
-      "savepoint": { "expected": "pass" }
+      "savepoint": { "expected": "pass" },
+      "aggregates-groupby": { "expected": "pass" },
+      "with-for-update": { "expected": "pass" },
+      "with-for-update-skip-locked": { "expected": "pass" },
+      "jsonb-ops": { "expected": "pass" },
+      "array-ops": { "expected": "pass" },
+      "numeric-roundtrip": { "expected": "pass" },
+      "date-trunc": { "expected": "pass" },
+      "exists-scalar": { "expected": "pass" },
+      "upsert-composite": {
+        "expected": "xfail",
+        "gap": "INSERT … ON CONFLICT (a,b) DO UPDATE SET x = EXCLUDED.x — planner does not resolve the EXCLUDED/table alias (orm_compat.rs upsert_on_conflict_do_update); SQLAlchemy on_conflict_do_update emits this with a composite index_elements target"
+      }
     },
     "gorm": {
       "connect": { "expected": "pass" },
@@ -82,7 +135,15 @@
       },
       "transaction": { "expected": "pass" },
       "transaction-rollback": { "expected": "pass" },
-      "delete": { "expected": "pass" }
+      "delete": { "expected": "pass" },
+      "group-by": { "expected": "pass" },
+      "distinct": { "expected": "pass" },
+      "count-where": { "expected": "pass" },
+      "locking-for-update": { "expected": "pass" },
+      "locking-skip-locked": { "expected": "pass" },
+      "soft-delete": { "expected": "pass" },
+      "optimistic-lock": { "expected": "pass" },
+      "create-in-batches": { "expected": "pass" }
     }
   }
 }

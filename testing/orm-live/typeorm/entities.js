@@ -11,6 +11,10 @@ export const User = new EntitySchema({
     email: { type: String, unique: true },
     name: { type: String, nullable: true },
     createdAt: { name: "created_at", type: "timestamptz", createDate: true },
+    // Optimistic-lock version column (@VersionColumn) + soft-delete column
+    // (@DeleteDateColumn) — added by the 0002 ALTER-heavy migration.
+    version: { type: Number, version: true, default: 1 },
+    deletedAt: { name: "deleted_at", type: "timestamptz", nullable: true, deleteDate: true },
   },
   relations: {
     posts: { type: "one-to-many", target: "Post", inverseSide: "author" },

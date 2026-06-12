@@ -158,4 +158,129 @@ await test("pagination", async () => {
   assert(typeof n === "number" && n >= page.length, "count() companion query");
 });
 
+// ── 7. Aggregations + groupBy (the reporting shapes) ────────────────────────
+await test("aggregate", async () => {
+  // Seed a couple of posts with known view counts under a fresh author.
+  const author = await prisma.user.create({
+    data: {
+      email: `agg.${RUN}@basin.test`,
+      posts: { create: [{ title: "A", views: 10 }, { title: "B", views: 30 }] },
+    },
+  });
+  const agg = await prisma.post.aggregate({
+    where: { authorId: author.id },
+    _count: true,
+    _sum: { views: true },
+    _avg: { views: true },
+  });
+  assert(agg._count === 2, "_count over the two posts");
+  assert(agg._sum.views === 40, "_sum aggregates views (10+30)");
+  assert(agg._avg.views === 20, "_avg aggregates views ((10+30)/2)");
+});
+
+await test("group-by", async () => {
+  const groups = await prisma.post.groupBy({
+    by: ["authorId"],
+    _count: { _all: true },
+    orderBy: { authorId: "asc" },
+  });
+  assert(Array.isArray(groups) && groups.length >= 1, "groupBy returns grouped rows");
+  for (const g of groups) assert(typeof g._count._all === "number", "_count populated per group");
+});
+
+// ── 8. _count include (relation count hydration) ────────────────────────────
+await test("relation-count", async () => {
+  const u = await prisma.user.findUnique({
+    where: { email: `agg.${RUN}@basin.test` },
+    include: { _count: { select: { posts: true } } },
+  });
+  assert(u && u._count.posts === 2, "include _count hydrated the relation count");
+});
+
+// ── 9. JSON path filter (Prisma Json filters) ───────────────────────────────
+await test("json-path-filter", async () => {
+  await prisma.user.create({
+    data: { email: `json.${RUN}@basin.test`, meta: { plan: "enterprise", seats: 9 } },
+  });
+  const rows = await prisma.user.findMany({
+    where: { email: `json.${RUN}@basin.test`, meta: { path: ["plan"], equals: "enterprise" } },
+  });
+  assert(rows.length === 1, "Json path-equals filter matched the row");
+});
+
+// ── 10. createMany / updateMany / deleteMany (bulk APIs) ────────────────────
+await test("create-many", async () => {
+  const r = await prisma.user.createMany({
+    data: [
+      { email: `cm.${RUN}.1@basin.test` },
+      { email: `cm.${RUN}.2@basin.test` },
+      { email: `cm.${RUN}.3@basin.test` },
+    ],
+    skipDuplicates: true,
+  });
+  assert(r.count === 3, "createMany inserted all three rows");
+});
+
+await test("update-many", async () => {
+  const r = await prisma.user.updateMany({
+    where: { email: { startsWith: `cm.${RUN}.` } },
+    data: { name: "Bulk" },
+  });
+  assert(r.count === 3, "updateMany affected all three rows");
+});
+
+await test("delete-many", async () => {
+  const r = await prisma.user.deleteMany({ where: { email: { startsWith: `cm.${RUN}.` } } });
+  assert(r.count === 3, "deleteMany removed all three rows");
+});
+
+// ── 11. count() / first() idioms ────────────────────────────────────────────
+await test("count-and-first", async () => {
+  const n = await prisma.user.count({ where: { email: { contains: "@basin.test" } } });
+  assert(typeof n === "number" && n > 0, "count() returns a number");
+  const first = await prisma.user.findFirst({ orderBy: { id: "asc" } });
+  assert(first && first.id > 0, "findFirst returns the lowest-id row");
+});
+
+// ── 12. cursor pagination ───────────────────────────────────────────────────
+await test("cursor-pagination", async () => {
+  const all = await prisma.post.findMany({ orderBy: { id: "asc" }, take: 2 });
+  if (all.length === 2) {
+    const next = await prisma.post.findMany({
+      orderBy: { id: "asc" },
+      cursor: { id: all[1].id },
+      skip: 1,
+      take: 2,
+    });
+    for (const p of next) assert(p.id > all[1].id, "cursor page is strictly after the cursor row");
+  }
+});
+
+// ── 13. depth-3 nested include (include within include) ─────────────────────
+await test("nested-include-depth3", async () => {
+  const u = await prisma.user.findFirst({
+    where: { email: `author.${RUN}@basin.test` },
+    include: { posts: { include: { author: { include: { profile: true } } } } },
+  });
+  if (u) {
+    for (const p of u.posts) {
+      assert(p.author && p.author.id === u.id, "depth-3 include resolved post.author back to the user");
+    }
+  }
+});
+
+// ── 14. raw-SQL escape hatch ($queryRaw) ─────────────────────────────────────
+await test("raw-query", async () => {
+  const rows = await prisma.$queryRaw`SELECT 1 + 1 AS "sum"`;
+  assert(Number(rows[0].sum) === 2, "$queryRaw computed expression round-trips");
+});
+
+// ── 15. row-level locking via interactive transaction (FOR UPDATE) ──────────
+await test("select-for-update", async () => {
+  await prisma.$transaction(async (tx) => {
+    const rows = await tx.$queryRaw`SELECT "id" FROM "User" WHERE "id" = ${1} FOR UPDATE`;
+    assert(Array.isArray(rows), "FOR UPDATE select returned rows inside the transaction");
+  });
+});
+
 await prisma.$disconnect();

@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 
 import pg from "pg";
 import { drizzle } from "drizzle-orm/node-postgres";
-import { eq, gt, sql, desc } from "drizzle-orm";
+import { eq, gt, sql, desc, asc, and, inArray, count, countDistinct, sum, avg } from "drizzle-orm";
 import * as schema from "./schema.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -174,6 +174,110 @@ await test("delete", async () => {
     .where(eq(posts.title, "in-tx"))
     .returning({ id: posts.id });
   assert(deleted.length >= 1, "delete-returning reports the removed row");
+});
+
+// ── 6. Aggregations + groupBy + countDistinct ───────────────────────────────
+await test("aggregations", async () => {
+  // Fresh author with two posts of known view counts.
+  const [a] = await db
+    .insert(users)
+    .values({ email: `agg.${RUN}@drizzle.test`, name: "Agg" })
+    .returning({ id: users.id });
+  await db.insert(posts).values([
+    { title: "agg-1", authorId: a.id, views: 10 },
+    { title: "agg-2", authorId: a.id, views: 30 },
+  ]);
+  const [row] = await db
+    .select({ c: count(), s: sum(posts.views), av: avg(posts.views) })
+    .from(posts)
+    .where(eq(posts.authorId, a.id));
+  assert(Number(row.c) === 2, "count() over the two posts");
+  assert(Number(row.s) === 40, "sum(views) = 40");
+  assert(Number(row.av) === 20, "avg(views) = 20");
+});
+
+await test("group-by", async () => {
+  const groups = await db
+    .select({ authorId: posts.authorId, n: count() })
+    .from(posts)
+    .groupBy(posts.authorId)
+    .orderBy(asc(posts.authorId));
+  assert(groups.length >= 1, "groupBy returns grouped rows");
+  for (const g of groups) assert(Number(g.n) >= 1, "per-group count populated");
+});
+
+await test("count-distinct", async () => {
+  const [row] = await db.select({ n: countDistinct(posts.authorId) }).from(posts);
+  assert(Number(row.n) >= 1, "countDistinct(authorId) returns a positive count");
+});
+
+// ── 7. JSON column round-trips (->>'key', @> containment) ────────────────────
+await test("json-extract-filter", async () => {
+  await db.insert(users).values({ email: `j.${RUN}@drizzle.test`, meta: { plan: "scale" } });
+  const rows = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(and(eq(users.email, `j.${RUN}@drizzle.test`), sql`${users.meta}->>'plan' = 'scale'`));
+  assert(rows.length === 1, "jsonb ->> extract filter matched");
+});
+
+await test("json-contains", async () => {
+  const rows = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(sql`${users.meta} @> '{"plan":"scale"}'`);
+  assert(rows.length >= 1, "jsonb @> containment filter matched");
+});
+
+// ── 8. Bulk update + optimistic-lock style WHERE ─────────────────────────────
+await test("bulk-update-returning", async () => {
+  const updated = await db
+    .update(posts)
+    .set({ views: sql`${posts.views} + 1` })
+    .where(inArray(posts.title, ["agg-1", "agg-2"]))
+    .returning({ id: posts.id, views: posts.views });
+  assert(updated.length === 2, "bulk update touched both rows");
+});
+
+// ── 9. Row-level locking (.for('update') + skipLocked) ──────────────────────
+await test("select-for-update", async () => {
+  await db.transaction(async (tx) => {
+    const rows = await tx
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.email, `agg.${RUN}@drizzle.test`))
+      .for("update");
+    assert(rows.length === 1, "FOR UPDATE select returned the locked row");
+  });
+});
+
+await test("select-for-update-skip-locked", async () => {
+  await db.transaction(async (tx) => {
+    const rows = await tx
+      .select({ id: posts.id })
+      .from(posts)
+      .limit(1)
+      .for("update", { skipLocked: true });
+    assert(Array.isArray(rows), "FOR UPDATE SKIP LOCKED select executed");
+  });
+});
+
+// ── 10. cursor / keyset pagination ──────────────────────────────────────────
+await test("keyset-pagination", async () => {
+  const firstPage = await db
+    .select({ id: posts.id })
+    .from(posts)
+    .orderBy(asc(posts.id))
+    .limit(2);
+  if (firstPage.length === 2) {
+    const next = await db
+      .select({ id: posts.id })
+      .from(posts)
+      .where(gt(posts.id, firstPage[1].id))
+      .orderBy(asc(posts.id))
+      .limit(2);
+    for (const p of next) assert(p.id > firstPage[1].id, "keyset page is strictly after the cursor");
+  }
 });
 
 await pool.end().catch(() => {});

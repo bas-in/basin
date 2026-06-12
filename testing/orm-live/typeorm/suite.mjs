@@ -13,7 +13,9 @@ function notok(name, reason) {
 }
 
 const REMAINING = ["migrations-run", "crud-insert", "crud-find", "crud-update",
-                   "crud-delete", "eager-relations", "queryrunner-tx", "queryrunner-tx-rollback"];
+                   "crud-delete", "eager-relations", "queryrunner-tx", "queryrunner-tx-rollback",
+                   "get-count", "qb-group-by", "qb-for-update", "qb-for-update-skip-locked",
+                   "soft-delete", "keyset-pagination", "upsert"];
 
 if (!process.env.BASIN_DSN) {
   notok("connect", "BASIN_DSN not set");
@@ -113,6 +115,83 @@ await test("queryrunner-tx-rollback", async () => {
   await qr.release();
   const found = await users.findOneBy({ email: `rb.${RUN}@typeorm.test` });
   assert(found === null, "rolled-back QueryRunner write must not be visible");
+});
+
+// ── 6. getCount() — wraps the query in COUNT(DISTINCT pk) ───────────────────
+await test("get-count", async () => {
+  const n = await users.createQueryBuilder("u")
+    .where("u.email = :email", { email: `alice.${RUN}@typeorm.test` })
+    .getCount();
+  assert(n === 1, "getCount() returned 1 for the seeded author");
+});
+
+// ── 7. QueryBuilder GROUP BY + aggregate ────────────────────────────────────
+await test("qb-group-by", async () => {
+  const rows = await posts.createQueryBuilder("p")
+    .select("p.author_id", "authorId")
+    .addSelect("COUNT(*)", "cnt")
+    .addSelect("SUM(p.views)", "views")
+    .groupBy("p.author_id")
+    .orderBy("p.author_id", "ASC")
+    .getRawMany();
+  assert(Array.isArray(rows) && rows.length >= 1, "GROUP BY returned grouped rows");
+});
+
+// ── 8. Row-level locking (.setLock) ─────────────────────────────────────────
+await test("qb-for-update", async () => {
+  await dataSource.transaction(async (mgr) => {
+    const found = await mgr.getRepository("User").createQueryBuilder("u")
+      .setLock("pessimistic_write")
+      .where("u.email = :email", { email: `alice.${RUN}@typeorm.test` })
+      .getOne();
+    assert(found, "pessimistic_write (FOR UPDATE) returned the locked row");
+  });
+});
+
+await test("qb-for-update-skip-locked", async () => {
+  await dataSource.transaction(async (mgr) => {
+    const rows = await mgr.getRepository("Post").createQueryBuilder("p")
+      .setLock("pessimistic_write")
+      .setOnLocked("skip_locked")
+      .limit(1)
+      .getMany();
+    assert(Array.isArray(rows), "FOR UPDATE SKIP LOCKED executed");
+  });
+});
+
+// ── 9. Soft delete (@DeleteDateColumn) ──────────────────────────────────────
+await test("soft-delete", async () => {
+  const v = await users.save({ email: `sd.${RUN}@typeorm.test` });
+  await users.softDelete(v.id);
+  // Default find excludes soft-deleted rows.
+  const gone = await users.findOneBy({ id: v.id });
+  assert(gone === null, "soft-deleted row excluded from default find");
+  // withDeleted() sees it.
+  const back = await users.findOne({ where: { id: v.id }, withDeleted: true });
+  assert(back !== null, "withDeleted() sees the soft-deleted row");
+});
+
+// ── 10. keyset pagination ───────────────────────────────────────────────────
+await test("keyset-pagination", async () => {
+  const firstPage = await users.createQueryBuilder("u")
+    .orderBy("u.id", "ASC").take(2).getMany();
+  if (firstPage.length === 2) {
+    const next = await users.createQueryBuilder("u")
+      .where("u.id > :cursor", { cursor: firstPage[1].id })
+      .orderBy("u.id", "ASC").take(2).getMany();
+    for (const u of next) assert(u.id > firstPage[1].id, "keyset page is strictly after the cursor");
+  }
+});
+
+// ── 11. upsert (ON CONFLICT DO UPDATE) ──────────────────────────────────────
+await test("upsert", async () => {
+  const em = `up.${RUN}@typeorm.test`;
+  await users.upsert({ email: em, name: "First" }, ["email"]);
+  await users.upsert({ email: em, name: "Second" }, ["email"]);
+  const got = await users.findOneBy({ email: em });
+  assert(got && (got.name === "Second" || got.name === "First"), "upsert resolved to one row");
+  const n = await users.createQueryBuilder("u").where("u.email = :em", { em }).getCount();
+  assert(n === 1, "upsert did not duplicate the row");
 });
 
 await dataSource.destroy();

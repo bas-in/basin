@@ -3,7 +3,8 @@
 import datetime
 from typing import Optional
 
-from sqlalchemy import ForeignKey, JSON, UniqueConstraint, func
+from sqlalchemy import ForeignKey, String, UniqueConstraint, func
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
@@ -34,7 +35,13 @@ class Book(Base):
     author_id: Mapped[int] = mapped_column(ForeignKey("sa_authors.id"))
     title: Mapped[str]
     pages: Mapped[int] = mapped_column(default=0)
-    meta: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    # JSONB (was generic JSON) so the @> / ? / ->> operator round-trips can be
+    # exercised. published_at + the new tags/version columns broaden coverage.
+    meta: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     published_at: Mapped[Optional[datetime.datetime]] = mapped_column(nullable=True)
+    # PG ARRAY column (added in the 0002 ALTER-heavy migration).
+    tags: Mapped[Optional[list]] = mapped_column(ARRAY(String), nullable=True)
+    # Optimistic-lock version counter (also 0002).
+    version: Mapped[int] = mapped_column(default=0, server_default="0")
 
     author: Mapped[Author] = relationship(back_populates="books")
