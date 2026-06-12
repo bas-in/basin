@@ -261,6 +261,174 @@ class SignedUrl:
 
 
 # ---------------------------------------------------------------------------
+# OAuth (crates/basin-rest/src/routes/auth.rs oauth_authorize / oauth_callback)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OAuthAuthorizeResult:
+    """GET /auth/v1/oauth/:provider/authorize response.
+
+    The SDK cannot perform the browser redirect dance itself.  Redirect the
+    user's browser to ``redirect_url``; after the provider redirects back to
+    Basin's callback endpoint the server exchanges the code and issues tokens
+    — the SDK method ``get_oauth_authorize_url`` returns this object.  The
+    server-side callback is ``GET /auth/v1/oauth/:provider/callback`` and it
+    returns a standard token body (Session); use ``parse_oauth_callback_url``
+    to extract those tokens from the final redirect URL if your client-side
+    code receives them via a URL fragment or query string.
+    """
+
+    redirect_url: str
+    """Full provider authorize URL — redirect the browser here."""
+    state: str
+    """CSRF state value included in redirect_url; echoed back on callback."""
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "OAuthAuthorizeResult":
+        return cls(redirect_url=d["redirect_url"], state=d["state"])
+
+
+# ---------------------------------------------------------------------------
+# MFA (crates/basin-rest/src/routes/auth.rs enroll_factor / factors*)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TotpEnrollResult:
+    """POST /auth/v1/factors response for factor_type="totp".
+
+    The factor is ``unverified`` until ``POST /auth/v1/factors/:id/verify``
+    succeeds with the first valid OTP code.
+    """
+
+    factor_id: str
+    factor_type: str  # "totp"
+    secret_b32: str
+    """Base-32 TOTP secret — display in the QR code or give to an auth app."""
+    otpauth_uri: str
+    """``otpauth://totp/...`` URI suitable for QR code display."""
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "TotpEnrollResult":
+        return cls(
+            factor_id=d["factor_id"],
+            factor_type=d["factor_type"],
+            secret_b32=d["secret_b32"],
+            otpauth_uri=d["otpauth_uri"],
+        )
+
+
+@dataclass
+class WebAuthnEnrollResult:
+    """POST /auth/v1/factors response for factor_type="webauthn".
+
+    Pass ``creation_options_json`` to ``navigator.credentials.create()`` (via
+    a JS bridge) and then call ``verify_factor`` with the attestation response
+    and the returned ``challenge_id``.
+    """
+
+    factor_id: str
+    factor_type: str  # "webauthn"
+    challenge_id: str
+    creation_options_json: str
+    """Serialised ``PublicKeyCredentialCreationOptions`` JSON."""
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "WebAuthnEnrollResult":
+        return cls(
+            factor_id=d["factor_id"],
+            factor_type=d["factor_type"],
+            challenge_id=d["challenge_id"],
+            creation_options_json=d["creation_options_json"],
+        )
+
+
+# Union type for enroll_factor return
+MfaEnrollResult = Union["TotpEnrollResult", "WebAuthnEnrollResult"]
+
+
+@dataclass
+class FactorDescriptor:
+    """Element of GET /auth/v1/factors array.
+
+    Mirrors ``FactorDescriptor`` in ``crates/basin-auth/src/mfa.rs``.
+    The secret / credential bytes are never included.
+    """
+
+    id: str
+    factor_type: str  # "totp" | "webauthn"
+    status: str  # "unverified" | "verified"
+    friendly_name: str
+    created_at: str  # RFC 3339
+    updated_at: str  # RFC 3339
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "FactorDescriptor":
+        return cls(
+            id=d["id"],
+            factor_type=d["factor_type"],
+            status=d["status"],
+            friendly_name=d["friendly_name"],
+            created_at=d["created_at"],
+            updated_at=d["updated_at"],
+        )
+
+
+@dataclass
+class VerifyFactorResult:
+    """POST /auth/v1/factors/:id/verify response.
+
+    ``recovery_codes`` is only present on the **first** verified factor for a
+    user — it will be ``None`` for all subsequent factor verifications.
+    Store these codes securely; they are shown exactly once.
+    """
+
+    ok: bool
+    recovery_codes: Optional[list[str]]
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "VerifyFactorResult":
+        return cls(ok=d.get("ok", True), recovery_codes=d.get("recovery_codes"))
+
+
+@dataclass
+class TotpChallengeResult:
+    """POST /auth/v1/factors/:id/challenge response for a TOTP factor."""
+
+    challenge_id: str
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "TotpChallengeResult":
+        return cls(challenge_id=d["challenge_id"])
+
+
+@dataclass
+class WebAuthnChallengeResult:
+    """POST /auth/v1/factors/:id/challenge response for a WebAuthn factor.
+
+    Pass ``request_options_json`` to ``navigator.credentials.get()`` to
+    obtain the assertion, then call ``verify_challenge`` with the result.
+    """
+
+    challenge_id: str
+    request_options_json: Optional[str]
+    """Serialised ``PublicKeyCredentialRequestOptions`` JSON; present for
+    WebAuthn factors, absent for TOTP."""
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "WebAuthnChallengeResult":
+        return cls(
+            challenge_id=d["challenge_id"],
+            request_options_json=d.get("request_options_json"),
+        )
+
+
+# Unified challenge result — callers can inspect challenge_id from both.
+MfaChallengeResult = Union["TotpChallengeResult", "WebAuthnChallengeResult"]
+
+
+# ---------------------------------------------------------------------------
 # Functions (ANY /fn/v1/:name, crates/basin-rest/src/routes/fn_handler.rs)
 # ---------------------------------------------------------------------------
 

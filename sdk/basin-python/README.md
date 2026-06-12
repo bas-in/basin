@@ -192,6 +192,14 @@ would preserve the declared schema — see follow-ups below.
 | `auth.consume_magic_link` | `POST /auth/v1/magic-link/consume` | `server.rs:263` |
 | `auth.create_api_key` / `list_api_keys` | `POST/GET /auth/v1/api-keys` | `server.rs:267-270` |
 | `auth.delete_api_key` | `DELETE /auth/v1/api-keys/:id` | `server.rs:271` |
+| `auth.get_oauth_authorize_url` | `GET /auth/v1/oauth/:provider/authorize` | `server.rs:277-279` |
+| (server-side only — browser redirect) | `GET /auth/v1/oauth/:provider/callback` | `server.rs:281-283` |
+| `auth.enroll_factor` | `POST /auth/v1/factors` (201) | `server.rs:286-287` |
+| `auth.list_factors` | `GET /auth/v1/factors` | `server.rs:286-287` |
+| `auth.verify_factor` | `POST /auth/v1/factors/:id/verify` | `server.rs:290-291` |
+| `auth.challenge_factor` | `POST /auth/v1/factors/:id/challenge` | `server.rs:294-296` |
+| `auth.verify_challenge` | `POST /auth/v1/factors/:id/challenge/verify` | `server.rs:298-300` |
+| `auth.unenroll_factor` | `DELETE /auth/v1/factors/:id` | `server.rs:302-303` |
 | `table(t).run()` (select/eq/.../order/limit/offset/cursor/stream) | `GET /rest/v1/:table` | `server.rs:243-249`, `parser.rs` |
 | `table(t).insert` | `POST /rest/v1/:table` (201) | `server.rs:246` |
 | `table(t).update` | `PATCH /rest/v1/:table?filters` | `server.rs:247` |
@@ -296,12 +304,139 @@ backoff (0.5 s, 1 s, 2 s … capped at 30 s) and automatically re-issues all
 active subscriptions.  Pass `last_event_id` to `listen()` to request
 server-side replay of events missed during the gap.
 
+## OAuth
+
+Basin supports OAuth 2.0 / OIDC via preset providers (Google, GitHub, Apple,
+Discord, Slack, etc.) or a custom OIDC endpoint configured server-side.
+
+The SDK wraps the authorize URL builder only.  The browser redirect dance and
+provider code exchange happen server-side — the SDK cannot open a browser tab.
+
+```python
+basin = create_client("http://localhost:8080", project_id="01J...")
+
+# 1. Get the provider authorize URL.
+result = basin.auth.get_oauth_authorize_url(
+    "google",
+    redirect_to="https://myapp.example.com/auth/callback",
+)
+# 2. Redirect the user's browser to result.redirect_url.
+#    The server's GET /auth/v1/oauth/google/callback endpoint handles the code
+#    exchange and issues Basin JWT + refresh tokens.
+print(result.redirect_url)  # https://accounts.google.com/o/oauth2/v2/auth?...
+print(result.state)         # CSRF state value embedded in redirect_url
+```
+
+After the flow completes, your app receives a Basin token pair via your
+`redirect_to` URL (query parameters or fragment, depending on your
+server-side setup).  Create a session from those tokens:
+
+```python
+from basin import Session
+session = Session(
+    access_token="...",
+    refresh_token="...",
+    access_expires_at="...",
+    refresh_expires_at="...",
+)
+basin.auth.set_session(session)
+```
+
+**Supported preset providers:** google, github, apple, bitbucket, discord,
+figma, gitlab, linkedin, microsoft (azure_ad), notion, slack, spotify,
+twitch, twitter_x (twitter).  Custom OIDC providers are registered
+server-side and passed by name.
+
+## MFA (TOTP and WebAuthn)
+
+Basin supports TOTP (RFC 6238, 6-digit, 30-second step) and WebAuthn /
+FIDO2 passkeys.  A successful challenge elevates the session to AAL2 — the
+access token's JWT claims reflect this, and RLS policies can gate on `aal2`.
+
+### Factor lifecycle
+
+```python
+import asyncio
+from basin import create_async_client
+
+async def mfa_demo():
+    async with create_async_client("http://localhost:8080", "jwt-token",
+                                    project_id="01J...") as basin:
+
+        # 1. Enroll a TOTP factor (JWT required).
+        enroll = await basin.auth.enroll_factor("totp", friendly_name="My Authenticator")
+        # enroll.secret_b32 → display as QR code via enroll.otpauth_uri
+        # enroll.factor_id  → save for later calls
+        print(enroll.otpauth_uri)
+
+        # 2. Confirm enrollment with the first OTP code.
+        result = await basin.auth.verify_factor(enroll.factor_id, code="123456")
+        if result.recovery_codes:
+            print("Save these codes:", result.recovery_codes)  # shown once
+
+        # 3. List factors.
+        factors = await basin.auth.list_factors()
+        for f in factors:
+            print(f.id, f.factor_type, f.status)
+
+        # 4. Step-up: begin a challenge.
+        challenge = await basin.auth.challenge_factor(enroll.factor_id)
+        # challenge.challenge_id → pass to verify_challenge
+
+        # 5. Complete the challenge → aal2 session.
+        aal2_session = await basin.auth.verify_challenge(
+            enroll.factor_id,
+            challenge.challenge_id,
+            code="654321",
+        )
+        # aal2_session is now stored as the live session.
+
+        # 6. Unenroll (requires aal2 token).
+        await basin.auth.unenroll_factor(enroll.factor_id)
+
+asyncio.run(mfa_demo())
+```
+
+### WebAuthn
+
+```python
+# Enroll
+enroll = await basin.auth.enroll_factor("webauthn", friendly_name="YubiKey")
+# Pass enroll.creation_options_json to navigator.credentials.create() in JS.
+# Then call verify_factor with the attestation response:
+await basin.auth.verify_factor(
+    enroll.factor_id,
+    attestation='<json from navigator.credentials.create()>',
+    challenge_id=enroll.challenge_id,
+)
+
+# Step-up
+challenge = await basin.auth.challenge_factor(factor_id)
+# Pass challenge.request_options_json to navigator.credentials.get() in JS.
+session = await basin.auth.verify_challenge(
+    factor_id,
+    challenge.challenge_id,
+    assertion='<json from navigator.credentials.get()>',
+)
+```
+
+### Sync variant
+
+All MFA methods have identical sync signatures:
+
+```python
+basin = create_client("http://localhost:8080", "jwt-token", project_id="01J...")
+enroll = basin.auth.enroll_factor("totp")
+result = basin.auth.verify_factor(enroll.factor_id, code="123456")
+challenge = basin.auth.challenge_factor(enroll.factor_id)
+session = basin.auth.verify_challenge(enroll.factor_id, challenge.challenge_id, code="654321")
+factors = basin.auth.list_factors()
+basin.auth.unenroll_factor(enroll.factor_id)
+```
+
 ## Not bound yet (gap list)
 
 - **Realtime WebSocket** — now wrapped (see above).
-- **OAuth** (`GET /auth/v1/oauth/:provider/{authorize,callback}`) — browser
-  redirect flow.
-- **MFA** (`/auth/v1/factors*`) — TOTP/WebAuthn enroll + step-up challenge.
 - **SSE realtime** (`GET /realtime/v1/sse/:project/:table`) — SSE variant of
   the realtime surface.
 - **Admin surface** (`/admin/v1/*`) — operator-grade; use `client.request()`

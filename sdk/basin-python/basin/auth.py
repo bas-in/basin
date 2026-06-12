@@ -1,16 +1,23 @@
 """Auth client — bindings for /auth/v1/*.
 
 Route sources (verified against crates/basin-rest/src/server.rs):
-- POST /auth/v1/signup                 server.rs:250
-- POST /auth/v1/signin                 server.rs:251
-- POST /auth/v1/refresh                server.rs:252
-- POST /auth/v1/verify-email           server.rs:253
-- POST /auth/v1/reset-password         server.rs:254
-- POST /auth/v1/request-password-reset server.rs:255
-- POST /auth/v1/magic-link             server.rs:262
-- POST /auth/v1/magic-link/consume     server.rs:263
-- POST|GET /auth/v1/api-keys           server.rs:267
-- DELETE /auth/v1/api-keys/:id         server.rs:271
+- POST /auth/v1/signup                              server.rs:250
+- POST /auth/v1/signin                              server.rs:251
+- POST /auth/v1/refresh                             server.rs:252
+- POST /auth/v1/verify-email                        server.rs:253
+- POST /auth/v1/reset-password                      server.rs:254
+- POST /auth/v1/request-password-reset              server.rs:255
+- POST /auth/v1/magic-link                          server.rs:262
+- POST /auth/v1/magic-link/consume                  server.rs:263
+- POST|GET /auth/v1/api-keys                        server.rs:267
+- DELETE /auth/v1/api-keys/:id                      server.rs:271
+- GET /auth/v1/oauth/:provider/authorize            server.rs:277
+- GET /auth/v1/oauth/:provider/callback             server.rs:281 (server-side only)
+- POST|GET /auth/v1/factors                         server.rs:286-287
+- POST /auth/v1/factors/:id/verify                  server.rs:290
+- POST /auth/v1/factors/:id/challenge               server.rs:294
+- POST /auth/v1/factors/:id/challenge/verify        server.rs:298
+- DELETE /auth/v1/factors/:id                       server.rs:302
 
 NOTE: There is NO server-side sign-out route (verified against
 crates/basin-rest/src/server.rs). sign_out() only clears the local session.
@@ -28,7 +35,21 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
 from .errors import BasinApiError
-from .types import ApiKeyDescriptor, ApiKeyIssued, Session, SignUpResult
+from .types import (
+    ApiKeyDescriptor,
+    ApiKeyIssued,
+    FactorDescriptor,
+    MfaChallengeResult,
+    MfaEnrollResult,
+    OAuthAuthorizeResult,
+    Session,
+    SignUpResult,
+    TotpChallengeResult,
+    TotpEnrollResult,
+    VerifyFactorResult,
+    WebAuthnChallengeResult,
+    WebAuthnEnrollResult,
+)
 
 if TYPE_CHECKING:
     from ._http import SyncTransport, AsyncTransport
@@ -282,6 +303,231 @@ class AuthClient:
             "DELETE", f"/auth/v1/api-keys/{key_id}"
         )
 
+    # ------------------------------------------------------------------
+    # OAuth (Phase 5.10.O — crates/basin-rest/src/routes/auth.rs)
+    # ------------------------------------------------------------------
+
+    def get_oauth_authorize_url(
+        self,
+        provider: str,
+        *,
+        redirect_to: str = "",
+        project_id: Optional[str] = None,
+    ) -> OAuthAuthorizeResult:
+        """GET /auth/v1/oauth/:provider/authorize → { redirect_url, state }.
+
+        Builds the provider authorize URL server-side (with PKCE + signed CSRF
+        state) and returns it.  The SDK cannot perform the browser redirect
+        itself — redirect the user's browser to ``result.redirect_url``.
+
+        After the OAuth flow completes, the server's callback handler
+        (``GET /auth/v1/oauth/:provider/callback``) exchanges the code and
+        issues Basin JWT + refresh tokens via the normal token body.  If your
+        app receives those tokens in a redirect URL, use
+        ``parse_oauth_session_from_url`` to decode them from the query string.
+
+        Supported providers (preset): google, github, apple, bitbucket,
+        discord, figma, gitlab, linkedin, microsoft (azure_ad), notion, slack,
+        spotify, twitch, twitter_x (twitter).  Custom OIDC providers are
+        registered server-side; pass their name here.
+
+        Parameters
+        ----------
+        provider:
+            Lower-case provider name, e.g. ``"google"`` or ``"github"``.
+        redirect_to:
+            URL to redirect to after the flow completes.  Validated server-side
+            against the per-project ``redirect_uri`` allowlist.  May be empty
+            or a relative path.
+        project_id:
+            Project for which this OAuth flow is initiated.  Defaults to the
+            client's ``default_project_id`` or the project encoded in the JWT.
+        """
+        pid = self._resolve_project_id(project_id)
+        data = self._transport.request_json(
+            "GET",
+            f"/auth/v1/oauth/{provider}/authorize",
+            query=[("project_id", pid), ("redirect_to", redirect_to)],
+            auth=False,
+        )
+        return OAuthAuthorizeResult.from_dict(data)
+
+    # ------------------------------------------------------------------
+    # MFA (Phase 5.10.M — crates/basin-rest/src/routes/auth.rs)
+    # ------------------------------------------------------------------
+
+    def enroll_factor(
+        self,
+        factor_type: str,
+        *,
+        friendly_name: str = "",
+    ) -> MfaEnrollResult:
+        """POST /auth/v1/factors — begin MFA factor enrollment (JWT-gated).
+
+        Parameters
+        ----------
+        factor_type:
+            ``"totp"`` or ``"webauthn"``.
+        friendly_name:
+            Human-readable label, e.g. ``"Authenticator App"`` or ``"YubiKey"``.
+
+        Returns
+        -------
+        TotpEnrollResult
+            For ``factor_type="totp"``: contains ``factor_id``, ``secret_b32``
+            (base-32 TOTP secret), and ``otpauth_uri`` for QR display.
+        WebAuthnEnrollResult
+            For ``factor_type="webauthn"``: contains ``factor_id``,
+            ``challenge_id``, and ``creation_options_json`` to pass to
+            ``navigator.credentials.create()``.
+
+        The factor is ``unverified`` until ``verify_factor`` succeeds.
+        """
+        data = self._transport.request_json(
+            "POST",
+            "/auth/v1/factors",
+            body={"factor_type": factor_type, "friendly_name": friendly_name},
+        )
+        if data.get("factor_type") == "webauthn":
+            return WebAuthnEnrollResult.from_dict(data)
+        return TotpEnrollResult.from_dict(data)
+
+    def list_factors(self) -> list[FactorDescriptor]:
+        """GET /auth/v1/factors — list MFA factors for the current user (JWT-gated).
+
+        Returns metadata descriptors only; the secret / credential bytes are
+        never included.
+        """
+        data = self._transport.request_json("GET", "/auth/v1/factors")
+        return [FactorDescriptor.from_dict(f) for f in (data or [])]
+
+    def verify_factor(
+        self,
+        factor_id: str,
+        *,
+        code: Optional[str] = None,
+        attestation: Optional[str] = None,
+        challenge_id: Optional[str] = None,
+    ) -> VerifyFactorResult:
+        """POST /auth/v1/factors/:id/verify — confirm enrollment (JWT-gated).
+
+        Call after ``enroll_factor`` to promote the factor from ``unverified``
+        to ``verified``.
+
+        Parameters
+        ----------
+        factor_id:
+            UUID string returned by ``enroll_factor``.
+        code:
+            TOTP path: 6-digit OTP code from the authenticator app.
+        attestation:
+            WebAuthn path: attestation JSON from ``navigator.credentials.create()``.
+        challenge_id:
+            WebAuthn path: ``challenge_id`` returned by ``enroll_factor``.
+
+        Returns
+        -------
+        VerifyFactorResult
+            ``ok=True`` always on success.  ``recovery_codes`` (list of 8 hex
+            strings) is present only on the **first** verified factor for a
+            user — store these securely, they are shown exactly once.
+        """
+        body: dict = {}
+        if code is not None:
+            body["code"] = code
+        if attestation is not None:
+            body["attestation"] = attestation
+        if challenge_id is not None:
+            body["challenge_id"] = challenge_id
+        data = self._transport.request_json(
+            "POST", f"/auth/v1/factors/{factor_id}/verify", body=body
+        )
+        return VerifyFactorResult.from_dict(data)
+
+    def challenge_factor(self, factor_id: str) -> MfaChallengeResult:
+        """POST /auth/v1/factors/:id/challenge — begin a step-up challenge (JWT-gated).
+
+        Parameters
+        ----------
+        factor_id:
+            UUID string of a ``verified`` factor.
+
+        Returns
+        -------
+        TotpChallengeResult
+            For TOTP factors: ``challenge_id`` only — present the TOTP code
+            to the user and call ``verify_challenge``.
+        WebAuthnChallengeResult
+            For WebAuthn factors: ``challenge_id`` + ``request_options_json``
+            to pass to ``navigator.credentials.get()``.
+
+        The server auto-detects factor type and returns the appropriate shape.
+        """
+        data = self._transport.request_json(
+            "POST", f"/auth/v1/factors/{factor_id}/challenge", body={}
+        )
+        if data.get("request_options_json") is not None:
+            return WebAuthnChallengeResult.from_dict(data)
+        return TotpChallengeResult.from_dict(data)
+
+    def verify_challenge(
+        self,
+        factor_id: str,
+        challenge_id: str,
+        *,
+        code: Optional[str] = None,
+        assertion: Optional[str] = None,
+    ) -> Session:
+        """POST /auth/v1/factors/:id/challenge/verify — complete step-up → aal2 JWT.
+
+        On success returns a new Session whose access token carries ``aal2``
+        in its JWT claims.  Store this session to elevate the client's
+        authorization level for operations that require AAL2.
+
+        Parameters
+        ----------
+        factor_id:
+            UUID string of the factor being challenged.
+        challenge_id:
+            ``challenge_id`` returned by ``challenge_factor``.
+        code:
+            TOTP path: 6-digit OTP code.
+        assertion:
+            WebAuthn path: assertion JSON from ``navigator.credentials.get()``.
+        """
+        body: dict = {"challenge_id": challenge_id}
+        if code is not None:
+            body["code"] = code
+        if assertion is not None:
+            body["assertion"] = assertion
+        data = self._transport.request_json(
+            "POST", f"/auth/v1/factors/{factor_id}/challenge/verify", body=body
+        )
+        session = Session.from_dict(data)
+        self._session = session
+        return session
+
+    def unenroll_factor(self, factor_id: str) -> dict:
+        """DELETE /auth/v1/factors/:id — unenroll an MFA factor (requires aal2 JWT).
+
+        The caller must hold an ``aal2`` access token (obtained via
+        ``verify_challenge``) — the server enforces this and will return
+        ``E_FORBIDDEN`` if the session is ``aal1`` only.
+
+        Parameters
+        ----------
+        factor_id:
+            UUID string of the factor to remove.
+
+        Returns
+        -------
+        dict
+            ``{ "ok": True }`` on success.
+        """
+        return self._transport.request_json(
+            "DELETE", f"/auth/v1/factors/{factor_id}"
+        )
+
 
 class AsyncAuthClient:
     """Async auth client for /auth/v1/* routes."""
@@ -469,4 +715,128 @@ class AsyncAuthClient:
     async def delete_api_key(self, key_id: int) -> dict:
         return await self._transport.request_json(
             "DELETE", f"/auth/v1/api-keys/{key_id}"
+        )
+
+    # ------------------------------------------------------------------
+    # OAuth (Phase 5.10.O)
+    # ------------------------------------------------------------------
+
+    async def get_oauth_authorize_url(
+        self,
+        provider: str,
+        *,
+        redirect_to: str = "",
+        project_id: Optional[str] = None,
+    ) -> OAuthAuthorizeResult:
+        """GET /auth/v1/oauth/:provider/authorize → { redirect_url, state }.
+
+        See ``AuthClient.get_oauth_authorize_url`` for full documentation.
+        """
+        pid = self._resolve_project_id(project_id)
+        data = await self._transport.request_json(
+            "GET",
+            f"/auth/v1/oauth/{provider}/authorize",
+            query=[("project_id", pid), ("redirect_to", redirect_to)],
+            auth=False,
+        )
+        return OAuthAuthorizeResult.from_dict(data)
+
+    # ------------------------------------------------------------------
+    # MFA (Phase 5.10.M)
+    # ------------------------------------------------------------------
+
+    async def enroll_factor(
+        self,
+        factor_type: str,
+        *,
+        friendly_name: str = "",
+    ) -> MfaEnrollResult:
+        """POST /auth/v1/factors — begin MFA factor enrollment (JWT-gated).
+
+        See ``AuthClient.enroll_factor`` for full documentation.
+        """
+        data = await self._transport.request_json(
+            "POST",
+            "/auth/v1/factors",
+            body={"factor_type": factor_type, "friendly_name": friendly_name},
+        )
+        if data.get("factor_type") == "webauthn":
+            return WebAuthnEnrollResult.from_dict(data)
+        return TotpEnrollResult.from_dict(data)
+
+    async def list_factors(self) -> list[FactorDescriptor]:
+        """GET /auth/v1/factors — list MFA factors for the current user (JWT-gated).
+
+        See ``AuthClient.list_factors`` for full documentation.
+        """
+        data = await self._transport.request_json("GET", "/auth/v1/factors")
+        return [FactorDescriptor.from_dict(f) for f in (data or [])]
+
+    async def verify_factor(
+        self,
+        factor_id: str,
+        *,
+        code: Optional[str] = None,
+        attestation: Optional[str] = None,
+        challenge_id: Optional[str] = None,
+    ) -> VerifyFactorResult:
+        """POST /auth/v1/factors/:id/verify — confirm enrollment (JWT-gated).
+
+        See ``AuthClient.verify_factor`` for full documentation.
+        """
+        body: dict = {}
+        if code is not None:
+            body["code"] = code
+        if attestation is not None:
+            body["attestation"] = attestation
+        if challenge_id is not None:
+            body["challenge_id"] = challenge_id
+        data = await self._transport.request_json(
+            "POST", f"/auth/v1/factors/{factor_id}/verify", body=body
+        )
+        return VerifyFactorResult.from_dict(data)
+
+    async def challenge_factor(self, factor_id: str) -> MfaChallengeResult:
+        """POST /auth/v1/factors/:id/challenge — begin step-up challenge (JWT-gated).
+
+        See ``AuthClient.challenge_factor`` for full documentation.
+        """
+        data = await self._transport.request_json(
+            "POST", f"/auth/v1/factors/{factor_id}/challenge", body={}
+        )
+        if data.get("request_options_json") is not None:
+            return WebAuthnChallengeResult.from_dict(data)
+        return TotpChallengeResult.from_dict(data)
+
+    async def verify_challenge(
+        self,
+        factor_id: str,
+        challenge_id: str,
+        *,
+        code: Optional[str] = None,
+        assertion: Optional[str] = None,
+    ) -> Session:
+        """POST /auth/v1/factors/:id/challenge/verify → aal2 Session (JWT-gated).
+
+        See ``AuthClient.verify_challenge`` for full documentation.
+        """
+        body: dict = {"challenge_id": challenge_id}
+        if code is not None:
+            body["code"] = code
+        if assertion is not None:
+            body["assertion"] = assertion
+        data = await self._transport.request_json(
+            "POST", f"/auth/v1/factors/{factor_id}/challenge/verify", body=body
+        )
+        session = Session.from_dict(data)
+        self._session = session
+        return session
+
+    async def unenroll_factor(self, factor_id: str) -> dict:
+        """DELETE /auth/v1/factors/:id — unenroll a factor (requires aal2 JWT).
+
+        See ``AuthClient.unenroll_factor`` for full documentation.
+        """
+        return await self._transport.request_json(
+            "DELETE", f"/auth/v1/factors/{factor_id}"
         )
