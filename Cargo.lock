@@ -1672,6 +1672,7 @@ dependencies = [
  "bytes",
  "clap",
  "futures",
+ "tempfile",
  "tokio",
  "tokio-postgres",
 ]
