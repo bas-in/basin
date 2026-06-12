@@ -1304,14 +1304,50 @@ impl ProjectSession {
         &self.current_user
     }
 
-    /// Reset in-memory session state before a Session-mode pool reuse
-    /// (DISCARD ALL semantics that SQL `CLOSE ALL` / `DEALLOCATE ALL` do not
-    /// fully cover in v0.1): drop all open cursors and prepared statements so
-    /// no per-session state crosses a pooled checkout boundary. The
-    /// connection-pool scrub calls this on checkout.
+    /// Reset in-memory session state before a Session-mode pool reuse. This is
+    /// Basin's authoritative `DISCARD ALL`: it neutralises every piece of
+    /// per-session state that could otherwise leak from one logical client into
+    /// the next one that reuses this physical session.
+    ///
+    /// SQL `CLOSE ALL` / `DEALLOCATE ALL` / `RESET ALL` / `UNLISTEN *` are
+    /// noop-accepts or only partially wired in v0.1, so this Rust method — not
+    /// the SQL surface — is what the connection-pool scrub relies on. It is
+    /// idempotent and safe to call when no state is dirty.
+    ///
+    /// Resets, in order:
+    ///   1. **Open cursors** (`CLOSE ALL`) — drop the cursor registry.
+    ///   2. **Prepared statements** (`DEALLOCATE ALL`) — clear the prepared
+    ///      registry; this also drops every per-statement bind-direct / bind
+    ///      fast-path plan cached on those entries (no separate cache to scrub).
+    ///   3. **Session-scoped advisory locks** — release everything this session
+    ///      holds. Pool checkin is NOT session end, so we call the release path
+    ///      directly rather than relying on `Drop for SessionState`. PG's
+    ///      `DISCARD ALL` releases all advisory locks held by the backend.
+    ///   4. **LISTEN subscriptions** (`UNLISTEN *`) — drop every subscription
+    ///      and any transaction-buffered NOTIFY payloads.
+    ///   5. **Session GUCs** (`RESET ALL`) — every settable GUC back to its
+    ///      process default via [`crate::session::SessionState::reset_gucs`]
+    ///      (search_path, statement_timeout, lock_timeout,
+    ///      idle_in_transaction_session_timeout, basin.synchronous_commit,
+    ///      pg_trgm thresholds, …).
+    ///
+    /// Temp tables are handled separately by the pool scrub (it tracks
+    /// `CREATE TEMP TABLE` names and issues `DROP TABLE IF EXISTS`), because in
+    /// Basin temp tables land in the shared catalog rather than a session-scoped
+    /// temp schema and so cannot be enumerated from the session alone.
     pub async fn reset_for_pool_reuse(&self) {
+        // 1 + 2: cursors and prepared statements.
         self.state.cursors.clear_all().await;
         self.state.prepared.clear_all().await;
+        // 3: advisory locks — release ALL (session- and any xact-scoped) so a
+        // lock taken in the prior checkout cannot block the next one. This is
+        // the DISCARD-ALL advisory semantics; the pool scrub also issues
+        // ROLLBACK before this, which already drops xact-scoped locks.
+        self.state.advisory.release_all_on_session_end();
+        // 4: LISTEN subscriptions + buffered NOTIFY.
+        crate::session::listen_unsubscribe_all(&self.state);
+        // 5: all session GUCs back to process defaults (complete-by-construction).
+        self.state.reset_gucs();
     }
 
     /// Run one SQL statement. Returns either a result set ([`ExecResult::Rows`])

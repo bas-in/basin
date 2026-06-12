@@ -584,9 +584,59 @@ pub(crate) fn strip_schema_qualifiers_for_session(
 
     let mut result = sql.to_string();
     for schema in &schemas {
+        // Bare form: `myschema.table` → `table`.
         result = replace_schema_prefix(&result, schema);
+        // Quoted form: `"myschema".table` / `"myschema"."table"` — ORMs such
+        // as drizzle-kit emit the schema qualifier double-quoted. The closing
+        // quote separates the schema token from the `.`, so the bare-form pass
+        // above (needle `myschema.`) never matches; strip the `"<schema>".`
+        // prefix explicitly, leaving any quoting on the table name intact.
+        result = replace_quoted_schema_prefix(&result, schema);
     }
     result
+}
+
+/// Replace occurrences of `"<schema>".` (the double-quoted schema-qualifier
+/// form ORMs emit) with the empty string, leaving the following table token —
+/// quoted or bare — untouched. Matched case-sensitively for the quoted form
+/// because a double-quoted identifier in PG is case-sensitive; schema names
+/// Basin stores are lowercase, so a quoted qualifier that round-trips a schema
+/// created via `CREATE SCHEMA "drizzle"` is lowercase too. The opening quote
+/// must not be part of a longer quoted identifier — it must be preceded by a
+/// non-identifier, non-quote byte (or start-of-string).
+fn replace_quoted_schema_prefix(sql: &str, schema: &str) -> String {
+    let needle = format!("\"{schema}\".");
+    let nlen = needle.len();
+    let sql_bytes = sql.as_bytes();
+    let len = sql_bytes.len();
+
+    let mut out = String::with_capacity(sql.len());
+    let mut pos = 0usize;
+
+    while pos < len {
+        if pos + nlen <= len {
+            let candidate = &sql_bytes[pos..pos + nlen];
+            // The schema token inside the quotes is ASCII; compare
+            // case-insensitively so `"DRIZZLE".` also matches.
+            let matches = candidate.eq_ignore_ascii_case(needle.as_bytes());
+            if matches {
+                let prev_ok = if pos == 0 {
+                    true
+                } else {
+                    let prev = sql_bytes[pos - 1];
+                    !prev.is_ascii_alphanumeric() && prev != b'_' && prev != b'"'
+                };
+                if prev_ok {
+                    pos += nlen;
+                    continue;
+                }
+            }
+        }
+        let ch = sql[pos..].chars().next().unwrap();
+        out.push(ch);
+        pos += ch.len_utf8();
+    }
+    out
 }
 
 /// Replace occurrences of `<schema>.` in `sql` with empty string, but only

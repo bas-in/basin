@@ -4657,8 +4657,15 @@ async fn read_file_to_batches(
 ) -> Result<Vec<RecordBatch>> {
     let mut stream = storage.read_file(project, path).await?;
     let mut out = Vec::new();
+    let target: arrow_schema::SchemaRef = Arc::new(catalog_schema.clone());
     while let Some(batch) = stream.next().await {
-        out.push(reattach_catalog_metadata(catalog_schema, batch?)?);
+        let b = reattach_catalog_metadata(catalog_schema, batch?)?;
+        // Pad to the current catalog schema so a file written before an
+        // `ALTER TABLE ADD COLUMN` gains the new columns (as NULL) here —
+        // otherwise a `SET <new_col> = …` in the rewrite has no column to
+        // target and the assignment is silently lost.
+        let b = crate::hot_tombstone::pad_batch_to_schema(b, &target)?;
+        out.push(b);
     }
     Ok(out)
 }
@@ -7331,16 +7338,17 @@ fn delete_table_alias(d: &Delete) -> Option<String> {
 ///   the qualifier is an identity transform under Basin's flat-namespace
 ///   catalog. Case-insensitive ASCII match to `"public"`.
 ///
+/// - `"myapp"."t"` — any user-created / unknown schema aliases to the bare
+///   table under the flat-namespace model, the same `resolve_schema` rule the
+///   CREATE / INSERT / SELECT paths apply (so drizzle's `myapp.events` UPDATE
+///   resolves the same way it was created).
+///
 /// Rejected shapes:
-/// - `"tenant_42"."t"` or any non-`public` schema — emits a clearer
-///   error pointing at `search_path` and naming `public` as the only
-///   supported schema today. Reserved schemas (`auth`, `storage`, …)
-///   fall through the same path: user DML against them is not the right
-///   surface — those schemas are owned by the engine and reach the
-///   catalog via `load_table_qualified`. A user DML statement that names
-///   a reserved schema is rejected here with the same "not in
-///   search_path" message rather than being silently aliased to
-///   `public`, which would mis-route the write.
+/// - A reserved schema (`auth`, `storage`, …) — those schemas are owned by
+///   the engine and reach the catalog via `load_table_qualified`. A user DML
+///   statement that names a reserved schema is rejected here with the "not in
+///   search_path" message rather than being silently aliased to `public`,
+///   which would mis-route the write.
 /// - Three-or-more-part names (`"db"."public"."t"`) — rejected; PG
 ///   `database.schema.table` syntax has never been supported here.
 fn single_part_name(name: &ObjectName) -> Result<&str> {
@@ -7348,7 +7356,17 @@ fn single_part_name(name: &ObjectName) -> Result<&str> {
         1 => Ok(name.0[0].id_val()),
         2 => {
             let schema = name.0[0].id_val().as_str();
-            if schema.eq_ignore_ascii_case("public") {
+            // Flat-namespace model: `public` and any user-created / unknown
+            // schema alias to the bare table (matching `resolve_schema` on the
+            // CREATE / INSERT / SELECT paths, so `myapp.t` written by drizzle
+            // resolves the same way for UPDATE / DELETE). A reserved schema
+            // (`auth`, `storage`, …) is owned by the engine and must not be a
+            // user DML target — reject it with the search_path message rather
+            // than silently aliasing to `public`, which would mis-route the
+            // write.
+            if schema.eq_ignore_ascii_case("public")
+                || basin_catalog::reserved_schema::ReservedSchema::from_str(schema).is_none()
+            {
                 Ok(name.0[1].id_val())
             } else {
                 Err(BasinError::InvalidIdent(format!(
@@ -8728,17 +8746,29 @@ mod tests {
         assert_eq!(single_part_name(&n).unwrap(), "User");
     }
 
-    /// Non-public schema is rejected with a message pointing at
-    /// `search_path` and naming `public` as the only supported schema.
-    /// The error wording is load-bearing — ORM authors grep for "public"
-    /// and "search_path" in the failure to diagnose the gap.
+    /// A user-created (non-reserved) schema aliases to the bare table under
+    /// the flat-namespace model — the same `myapp.t → t` resolution the
+    /// CREATE / INSERT / SELECT paths apply, so drizzle's `myapp.events`
+    /// UPDATE / DELETE resolve consistently. (Previously this rejected; the
+    /// flat model now makes it an identity transform, matching how the rest
+    /// of the engine resolves user-schema-qualified names.)
     #[test]
-    fn single_part_name_non_public_schema_rejected() {
-        let n = obj_name_2("tenant_42", "users");
-        let err = single_part_name(&n).expect_err("non-public must reject");
+    fn single_part_name_user_schema_aliases_to_bare_table() {
+        let n = obj_name_2("myapp", "events");
+        assert_eq!(single_part_name(&n).unwrap(), "events");
+    }
+
+    /// A reserved schema (owned by the engine — `auth`, `storage`, …) is NOT
+    /// a valid user-DML target and is rejected with a message pointing at
+    /// `search_path` and naming `public`. The wording is load-bearing — ORM
+    /// authors grep for "public" and "search_path" to diagnose the gap.
+    #[test]
+    fn single_part_name_reserved_schema_rejected() {
+        let n = obj_name_2("auth", "users");
+        let err = single_part_name(&n).expect_err("reserved schema must reject");
         let msg = err.to_string();
         assert!(
-            msg.contains("tenant_42"),
+            msg.contains("auth"),
             "error should name the offending schema, got: {msg}"
         );
         assert!(
@@ -8844,26 +8874,27 @@ mod tests {
         assert_eq!(as_identifier(&three_part, "t"), Some("id".to_string()));
     }
 
-    /// `UPDATE "tenant_42"."t" SET col = 1 WHERE id = 1` — non-public
-    /// schema rejected with a clear message naming `public` and
-    /// `search_path`.
+    /// `UPDATE "auth"."t" SET col = 1 WHERE id = 1` — a reserved schema is
+    /// rejected with a clear message naming `public` and `search_path`. (A
+    /// user schema like `myapp.t` aliases to the bare table under the flat
+    /// model and is covered by `single_part_name_user_schema_aliases_to_bare_table`.)
     #[test]
-    fn update_with_non_public_schema_refused() {
-        let name = parse_update_target("UPDATE \"tenant_42\".\"t\" SET col = 1 WHERE id = 1");
-        let err = single_part_name(&name).expect_err("non-public must reject");
+    fn update_with_reserved_schema_refused() {
+        let name = parse_update_target("UPDATE \"auth\".\"t\" SET col = 1 WHERE id = 1");
+        let err = single_part_name(&name).expect_err("reserved schema must reject");
         let msg = err.to_string();
-        assert!(msg.contains("tenant_42"), "must name offending schema: {msg}");
+        assert!(msg.contains("auth"), "must name offending schema: {msg}");
         assert!(msg.contains("public"), "must mention 'public': {msg}");
         assert!(msg.contains("search_path"), "must mention search_path: {msg}");
     }
 
-    /// `DELETE FROM "tenant_42"."t" WHERE id = 1` — same as above.
+    /// `DELETE FROM "auth"."t" WHERE id = 1` — same as above.
     #[test]
-    fn delete_with_non_public_schema_refused() {
-        let name = parse_delete_target("DELETE FROM \"tenant_42\".\"t\" WHERE id = 1");
-        let err = single_part_name(&name).expect_err("non-public must reject");
+    fn delete_with_reserved_schema_refused() {
+        let name = parse_delete_target("DELETE FROM \"auth\".\"t\" WHERE id = 1");
+        let err = single_part_name(&name).expect_err("reserved schema must reject");
         let msg = err.to_string();
-        assert!(msg.contains("tenant_42"), "must name offending schema: {msg}");
+        assert!(msg.contains("auth"), "must name offending schema: {msg}");
         assert!(msg.contains("public"), "must mention 'public': {msg}");
         assert!(msg.contains("search_path"), "must mention search_path: {msg}");
     }

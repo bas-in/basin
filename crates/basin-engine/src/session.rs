@@ -774,6 +774,106 @@ impl SessionState {
             head_probe_cache: HeadProbeCache::new(),
         }
     }
+
+    /// Variant of `new()` that accepts a pre-built `schema_state` Arc.
+    /// Used when the schema state must be shared with the info-schema providers
+    /// that are registered before the SessionState is fully assembled — the
+    /// providers hold an Arc clone and read the live user-schema set at scan
+    /// time, while this session's CREATE/DROP SCHEMA handlers mutate it.
+    pub(crate) fn new_with_schema_state(
+        schema_state: Arc<RwLock<crate::schema_ddl::SchemaState>>,
+    ) -> Self {
+        Self {
+            snapshots: Mutex::new(HashMap::new()),
+            prepared: crate::prepared::PreparedRegistry::new(),
+            has_partitioned_table: std::sync::atomic::AtomicBool::new(false),
+            sequence_cache: Arc::new(crate::seq_udf::SessionSequenceCache::default()),
+            cursors: crate::cursor::CursorRegistry::new(),
+            schema_state,
+            pending_overriding: std::sync::Mutex::new(None),
+            tx_state: std::sync::Mutex::new(TxState::default()),
+            advisory: Arc::new(crate::advisory_lock::AdvisorySessionLocks::new()),
+            // -1 means "no per-session override; use process-wide default".
+            statement_timeout_ms: std::sync::atomic::AtomicI64::new(-1),
+            lock_timeout: std::sync::Mutex::new(None),
+            idle_in_transaction_session_timeout: std::sync::Mutex::new(None),
+            synchronous_commit: std::sync::atomic::AtomicBool::new(
+                synchronous_commit_env_default(),
+            ),
+            trgm_similarity_threshold: std::sync::atomic::AtomicU32::new(
+                basin_trgm::DEFAULT_SIMILARITY_THRESHOLD.to_bits(),
+            ),
+            trgm_word_similarity_threshold: std::sync::atomic::AtomicU32::new(
+                basin_trgm::DEFAULT_WORD_SIMILARITY_THRESHOLD.to_bits(),
+            ),
+            last_active: std::sync::Mutex::new(std::time::Instant::now()),
+            listen: std::sync::Mutex::new(ListenState::default()),
+            table_meta_cache: TableMetaCache::new(),
+            provider_cache: ProviderCache::new(),
+            head_probe_cache: HeadProbeCache::new(),
+        }
+    }
+
+    /// Reset every settable session GUC back to its process-default value —
+    /// the value `new()` initialises it to. This is the GUC half of
+    /// `DISCARD ALL` / `RESET ALL` and is the authoritative reset the
+    /// connection-pool scrub relies on (it does not depend on SQL-level
+    /// `RESET ALL` parsing, which is a noop-accept in v0.1).
+    ///
+    /// ## Complete-by-construction
+    ///
+    /// Every GUC field declared on [`SessionState`] is reset here. The intent
+    /// is that adding a NEW session GUC field is paired with one line in BOTH
+    /// `new()` (its initial value) and this method (its reset value) — and the
+    /// `gucs_reset_to_defaults` unit test asserts that the post-reset values
+    /// match a freshly-constructed `SessionState`, so a forgotten field fails
+    /// the test rather than silently leaking across a pooled checkout.
+    ///
+    /// Non-GUC per-session state (advisory locks, LISTEN subscriptions, cursors,
+    /// prepared statements, the provider/metadata caches) is reset by
+    /// [`ProjectSession::reset_for_pool_reuse`], which calls this method as its
+    /// GUC step. The two together form `DISCARD ALL`.
+    pub(crate) fn reset_gucs(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        // search_path → ["public"] (SchemaState::default()'s search_path).
+        // Only the search_path is routing-relevant; the schema *registry*
+        // (CREATE SCHEMA) is catalog-backed and intentionally NOT reset here —
+        // DISCARD ALL does not drop schemas, only resets the path GUC.
+        {
+            let mut st = self
+                .schema_state
+                .write()
+                .expect("schema_state lock poisoned");
+            st.search_path = crate::schema_ddl::SchemaState::default().search_path;
+        }
+
+        // statement_timeout → -1 ("no per-session override; use process default").
+        self.statement_timeout_ms.store(-1, Relaxed);
+
+        // lock_timeout → None (also mirror into the advisory-lock manager, the
+        // same way `set_session_lock_timeout` keeps the two in sync).
+        *self.lock_timeout.lock().expect("lock_timeout lock poisoned") = None;
+        self.advisory.set_lock_timeout(None);
+
+        // idle_in_transaction_session_timeout → None.
+        *self
+            .idle_in_transaction_session_timeout
+            .lock()
+            .expect("idle_in_transaction_session_timeout lock poisoned") = None;
+
+        // basin.synchronous_commit → engine-wide env default.
+        self.synchronous_commit
+            .store(synchronous_commit_env_default(), Relaxed);
+
+        // pg_trgm thresholds → the basin-trgm crate defaults (0.3 / 0.6).
+        self.trgm_similarity_threshold
+            .store(basin_trgm::DEFAULT_SIMILARITY_THRESHOLD.to_bits(), Relaxed);
+        self.trgm_word_similarity_threshold.store(
+            basin_trgm::DEFAULT_WORD_SIMILARITY_THRESHOLD.to_bits(),
+            Relaxed,
+        );
+    }
 }
 
 // ── Per-session table-metadata cache ────────────────────────────────────────
@@ -2267,12 +2367,20 @@ pub(crate) async fn open(
     // snapshot. The providers hold `Arc<dyn Catalog>` + `ProjectId` only;
     // the heavy resource (the catalog handle) is shared across every
     // session, so per-project cost is O(bytes).
+    // Create the schema_state here so both the info-schema providers and the
+    // SessionState share the same Arc. Providers hold an Arc clone and read the
+    // live user-schema set at scan time; SessionState's CREATE/DROP SCHEMA
+    // handlers mutate it at execute time.
+    let schema_state: Arc<RwLock<crate::schema_ddl::SchemaState>> =
+        Arc::new(RwLock::new(crate::schema_ddl::SchemaState::default()));
+
     crate::info_schema_provider::register_info_schema_providers(
         &ctx,
         engine.config().catalog.clone(),
         project,
         engine.lock_registry().clone(),
         engine.connection_registry().clone(),
+        Arc::clone(&schema_state),
     )
     .map_err(|e| BasinError::internal(format!("info_schema providers: {e}")))?;
 
@@ -2325,7 +2433,7 @@ pub(crate) async fn open(
         tracing::warn!("register_cdc_providers: {e}");
     }
 
-    let state = Arc::new(SessionState::new());
+    let state = Arc::new(SessionState::new_with_schema_state(Arc::clone(&schema_state)));
 
     // Phase 5.28.C: register with the idle-in-txn reaper.
     let (reaper_id, reaped_flag) = engine.reaper_registry().register(state.clone());
@@ -4975,7 +5083,74 @@ fn extend_schema_with_promoted_cols(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering::Relaxed;
     use std::time::Duration;
+
+    /// Complete-by-construction: after `reset_gucs()`, every session GUC must
+    /// match a freshly-constructed `SessionState`. This is the gate that
+    /// catches a NEW GUC field added to `new()` but forgotten in `reset_gucs()`
+    /// — the leak would otherwise cross a pooled checkout boundary silently.
+    #[test]
+    fn gucs_reset_to_defaults() {
+        let fresh = SessionState::new();
+        let dirty = SessionState::new();
+
+        // Mutate every settable GUC away from its default.
+        dirty
+            .schema_state
+            .write()
+            .unwrap()
+            .search_path = vec!["tenant_x".to_string(), "public".to_string()];
+        dirty.statement_timeout_ms.store(5_000, Relaxed);
+        *dirty.lock_timeout.lock().unwrap() = Some(Duration::from_millis(500));
+        dirty.advisory.set_lock_timeout(Some(Duration::from_millis(500)));
+        *dirty.idle_in_transaction_session_timeout.lock().unwrap() =
+            Some(Duration::from_secs(30));
+        // Flip synchronous_commit to the opposite of the env default so the
+        // assertion is meaningful regardless of BASIN_SYNCHRONOUS_COMMIT.
+        let flipped = !synchronous_commit_env_default();
+        dirty.synchronous_commit.store(flipped, Relaxed);
+        set_session_trgm_similarity_threshold(&dirty, 0.95);
+        set_session_trgm_word_similarity_threshold(&dirty, 0.95);
+
+        dirty.reset_gucs();
+
+        assert_eq!(
+            dirty.schema_state.read().unwrap().search_path,
+            fresh.schema_state.read().unwrap().search_path,
+            "search_path not reset to default"
+        );
+        assert_eq!(
+            dirty.statement_timeout_ms.load(Relaxed),
+            fresh.statement_timeout_ms.load(Relaxed),
+            "statement_timeout not reset"
+        );
+        assert_eq!(
+            *dirty.lock_timeout.lock().unwrap(),
+            *fresh.lock_timeout.lock().unwrap(),
+            "lock_timeout not reset"
+        );
+        assert_eq!(
+            *dirty.idle_in_transaction_session_timeout.lock().unwrap(),
+            *fresh.idle_in_transaction_session_timeout.lock().unwrap(),
+            "idle_in_transaction_session_timeout not reset"
+        );
+        assert_eq!(
+            dirty.synchronous_commit.load(Relaxed),
+            fresh.synchronous_commit.load(Relaxed),
+            "synchronous_commit not reset"
+        );
+        assert_eq!(
+            session_trgm_similarity_threshold(&dirty),
+            session_trgm_similarity_threshold(&fresh),
+            "pg_trgm.similarity_threshold not reset"
+        );
+        assert_eq!(
+            session_trgm_word_similarity_threshold(&dirty),
+            session_trgm_word_similarity_threshold(&fresh),
+            "pg_trgm.word_similarity_threshold not reset"
+        );
+    }
 
     #[test]
     fn statement_timeout_parse_unset_uses_default() {

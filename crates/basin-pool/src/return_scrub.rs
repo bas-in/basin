@@ -9,13 +9,26 @@
 //!
 //! | State class           | Leak vector                               | Scrub action          |
 //! |-----------------------|-------------------------------------------|-----------------------|
-//! | Session GUCs (`SET`)  | persists for connection life              | `RESET ALL`           |
-//! | Open cursors          | persist until `CLOSE` or session end      | `CLOSE ALL`           |
-//! | Prepared statements   | persist until `DEALLOCATE` or session end | `DEALLOCATE ALL`      |
-//! | LISTEN subscriptions  | persist until `UNLISTEN` or disconnect    | `UNLISTEN *`          |
-//! | Advisory locks        | persist until release or disconnect       | (session-level engine drop) |
+//! | Session GUCs (`SET`)  | persists for connection life              | `reset_for_pool_reuse` (`reset_gucs`) |
+//! | Open cursors          | persist until `CLOSE` or session end      | `reset_for_pool_reuse` (`cursors.clear_all`) |
+//! | Prepared statements   | persist until `DEALLOCATE` or session end | `reset_for_pool_reuse` (`prepared.clear_all`) |
+//! | LISTEN subscriptions  | persist until `UNLISTEN` or disconnect    | `reset_for_pool_reuse` (`listen_unsubscribe_all`) |
+//! | Advisory locks        | persist until release or disconnect       | `reset_for_pool_reuse` (`release_all_on_session_end`) |
 //! | Open transactions     | corrupt state for the next client         | `ROLLBACK`            |
 //! | **Temp tables (P0)**  | persist in catalog across checkouts       | `DROP TABLE IF EXISTS` per table |
+//!
+//! ## Authoritative reset lives in the engine (5.27.E)
+//!
+//! GUCs, cursors, prepared statements, advisory locks and LISTEN subscriptions
+//! are all reset by the engine's [`ProjectSession::reset_for_pool_reuse`], which
+//! is `DISCARD ALL` implemented in Rust (the SQL surface for `RESET ALL` /
+//! `UNLISTEN *` / `DEALLOCATE ALL` is a noop-accept or only partially wired in
+//! v0.1, so we do NOT depend on it). Pool checkin is not session end, so the
+//! advisory-lock release is invoked explicitly rather than left to
+//! `Drop for SessionState`. The best-effort SQL statements issued below
+//! (`ROLLBACK`, `SET search_path TO DEFAULT`, `RESET ALL`, `UNLISTEN *`) are
+//! kept as defence-in-depth and to emit the PG-compatible command tags some
+//! drivers expect, but correctness no longer rides on them.
 //!
 //! ## Temp-table scrub (P0 fix)
 //!
@@ -120,12 +133,14 @@ pub(crate) async fn scrub_session_for_pool_return(
         );
     }
 
-    // 3. Drop all open cursors AND named prepared statements directly via the
-    //    engine's in-memory registries. SQL `CLOSE ALL` / `DEALLOCATE ALL` are
-    //    not fully wired in v0.1, so this is the authoritative cursor/prepared
-    //    scrub for Session-mode reuse (no per-session state crosses the pooled
-    //    checkout boundary). Transaction mode destroys the session entirely and
-    //    never reaches this path.
+    // 3. Authoritative DISCARD ALL: drop cursors + prepared statements, release
+    //    ALL advisory locks (session checkin is not session end, so we can't
+    //    wait for `Drop`), clear LISTEN subscriptions, and reset every session
+    //    GUC to its process default. SQL `CLOSE ALL` / `DEALLOCATE ALL` /
+    //    `RESET ALL` / `UNLISTEN *` are noop-accepts or only partially wired in
+    //    v0.1, so this engine method is the source of truth for Session-mode
+    //    reuse. Transaction mode destroys the session entirely and never reaches
+    //    this path.
     session.reset_for_pool_reuse().await;
 
     // 4. Deallocate all named prepared statements.  In Basin, SQL-level
