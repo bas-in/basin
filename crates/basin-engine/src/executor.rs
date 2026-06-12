@@ -885,6 +885,17 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                     // no extra WAL records here beyond the existing TxCommit
                     // marker emitted below).
                     let tx_overlay = crate::session::tx_overlay_take_all(&sess.state);
+                    // Drain the in-tx buffered change events (CDC / realtime).
+                    // These were captured at statement time WITHOUT a seq; we
+                    // assign each a commit-ordered `(project, table)` seq and
+                    // dispatch them to the post-commit sinks AFTER the catalog
+                    // commit lands (so a sink never observes a mutation that a
+                    // later catalog failure would have rolled back). On ROLLBACK
+                    // this buffer is dropped instead (see the Rollback arm), so
+                    // nothing leaks. Empty unless a sink was attached during the
+                    // transaction.
+                    let tx_change_events =
+                        crate::session::tx_change_events_take_all(&sess.state);
 
                     // Promote committed HTAP batches to the process-wide
                     // registry. Promotion stays PRE-commit (visibility: other
@@ -1139,6 +1150,34 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                             .wal()
                             .append_tx_commit(&sess.project, &part, tx_id)
                             .await;
+                    }
+                    // Dispatch the in-tx buffered change events now that the
+                    // commit has fully landed (overlay drained into the shared
+                    // registry + catalog files committed). Seqs are assigned in
+                    // buffer (= execution) order via `next_event_seq`, so each
+                    // tx event carries the same per-`(project, table)` commit
+                    // ordering the auto-commit / cold paths get, and the two
+                    // updates of a multi-statement tx come out contiguous and
+                    // in order. Fire-and-forget through the post-commit sinks
+                    // (`dispatch_post_commit` no-ops when no sink is attached).
+                    if !tx_change_events.is_empty() {
+                        let events: Vec<ChangeEvent> = tx_change_events
+                            .into_iter()
+                            .map(|ev| {
+                                let seq =
+                                    sess.engine.next_event_seq(&sess.project, &ev.table);
+                                make_event(
+                                    &sess.project,
+                                    &ev.table,
+                                    ev.op,
+                                    ev.before,
+                                    ev.after,
+                                    seq,
+                                    ev.causation_user,
+                                )
+                            })
+                            .collect();
+                        dispatch_post_commit(&sess.engine, events);
                     }
                     return Ok(ExecResult::Empty {
                         tag: "COMMIT".into(),

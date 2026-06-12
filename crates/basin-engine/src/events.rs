@@ -437,4 +437,80 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
     }
+
+    /// Structural no-sink guarantee for the HOT-TIER point-mutation fast paths
+    /// (`hot_tier_update_by_pk` / `hot_tier_delete_by_pk`): with no POST-COMMIT
+    /// CDC / realtime sink attached they build ZERO event payloads and deliver
+    /// nothing. The fast-path capture is gated on `post_commit_sink_attached`,
+    /// NOT `sinks_attached`: the engine ALWAYS registers a pre-commit
+    /// `ReactorSink`, so `sinks_attached` is permanently true and cannot gate
+    /// the OLTP hot path (a no-CDC benchmark run would otherwise pay per-row
+    /// capture). The hot fast path is only reached for tables with no declared
+    /// reactor, so the sole legitimate consumer of a hot-path event is a
+    /// post-commit sink.
+    ///
+    /// We prove it two ways: (1) the no-post-commit-sink hot UPDATE/DELETE emit
+    /// nothing — exactly the post-attach UPDATEs are captured; (2) consecutive
+    /// post-attach hot UPDATEs allocate strictly consecutive seqs (one per
+    /// delivered event), so the path neither double-consumes nor skips seqs.
+    #[tokio::test]
+    async fn no_sink_hot_tier_fast_path_builds_zero_events() {
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let project = ProjectId::new();
+        let sess = eng.open_session(project).await.unwrap();
+        // Single-column INT PRIMARY KEY + `WHERE id = lit` → hot-tier fast path.
+        sess.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
+        sess.execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+            .await
+            .unwrap();
+
+        // ── No post-commit CDC sink attached: these hot UPDATE/DELETE must NOT
+        //    deliver any event (the only sink present is the always-on pre-commit
+        //    ReactorSink, which has no reactor for `t`). ──
+        sess.execute("UPDATE t SET v = 11 WHERE id = 1")
+            .await
+            .unwrap();
+        sess.execute("DELETE FROM t WHERE id = 2").await.unwrap();
+
+        // Now attach a POST-commit sink (how CDC / realtime attach) and issue
+        // TWO more hot-tier UPDATEs. Post-commit fan-out is via `tokio::spawn`,
+        // so yield to let the spawned publishes run before asserting.
+        let captured = Arc::new(Mutex::new(Vec::<ChangeEvent>::new()));
+        eng.attach_post_commit_sink(Arc::new(CapturingSink {
+            events: captured.clone(),
+        }));
+        sess.execute("UPDATE t SET v = 111 WHERE id = 1")
+            .await
+            .unwrap();
+        sess.execute("UPDATE t SET v = 222 WHERE id = 1")
+            .await
+            .unwrap();
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+
+        let events = captured.lock().unwrap().clone();
+        assert_eq!(
+            events.len(),
+            2,
+            "exactly the two post-sink updates are captured — the prior no-sink \
+             hot-tier UPDATE/DELETE delivered nothing"
+        );
+        assert!(events.iter().all(|e| matches!(e.op, ChangeOp::Update)));
+        // Consecutive seqs: each delivered hot UPDATE consumes exactly one seq.
+        assert_eq!(
+            events[1].seq,
+            events[0].seq + 1,
+            "consecutive hot UPDATEs must allocate consecutive seqs (one per \
+             delivered event; no phantom consumption)"
+        );
+        // before/after carry the correct row images across the overlay write.
+        assert_eq!(events[0].before.as_ref().unwrap()["v"].as_i64(), Some(11));
+        assert_eq!(events[0].after.as_ref().unwrap()["v"].as_i64(), Some(111));
+        assert_eq!(events[1].before.as_ref().unwrap()["v"].as_i64(), Some(111));
+        assert_eq!(events[1].after.as_ref().unwrap()["v"].as_i64(), Some(222));
+    }
 }

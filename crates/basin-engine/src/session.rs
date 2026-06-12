@@ -562,6 +562,38 @@ pub(crate) struct TxState {
     ///
     /// Empty outside a transaction; cleared on COMMIT / ROLLBACK.
     pub(crate) hot_seq_watermark: HashMap<TableName, u64>,
+    /// In-transaction buffered change events (CDC / realtime), in execution
+    /// order. Hot-tier UPDATE/DELETE fast-path statements (and the in-tx
+    /// UPDATE…FROM write tail) push a [`TxChangeEvent`] here at statement time
+    /// — WITHOUT a `seq` (the per-`(project, table)` sequence is allocated in
+    /// commit order at COMMIT, so other sessions' interleaved auto-commit
+    /// events don't fragment this tx's ordering). On COMMIT the executor drains
+    /// this buffer (`tx_change_events_take_all`), assigns each entry a `seq`
+    /// via `Engine::next_event_seq` in buffer order, and dispatches them to the
+    /// post-commit sinks AFTER the overlay/catalog commit has landed. On
+    /// ROLLBACK it is dropped, so a rolled-back mutation never reaches a sink.
+    ///
+    /// Only populated when at least one change-event sink is attached at
+    /// statement time (the fast paths gate on `sinks_attached`); empty and
+    /// untouched on the zero-sink OLTP hot path.
+    pub(crate) tx_change_events: Vec<TxChangeEvent>,
+}
+
+/// One buffered in-transaction change event, captured at statement execution
+/// time but not yet assigned a commit `seq`. The before/after JSON payloads are
+/// the same lazily-materialised images the auto-commit path builds; `op` and
+/// `table` carry the rest of the [`basin_common::ChangeEvent`] shape. The
+/// `seq` and `committed_at` are filled in at COMMIT drain time so the event
+/// carries the same commit ordering the cold paths get.
+#[derive(Debug)]
+pub(crate) struct TxChangeEvent {
+    pub(crate) table: TableName,
+    pub(crate) op: basin_common::ChangeOp,
+    pub(crate) before: Option<serde_json::Value>,
+    pub(crate) after: Option<serde_json::Value>,
+    /// The causing user (`None` for the anonymous role), captured at statement
+    /// time from the session so a `RESET ROLE` before COMMIT can't rewrite it.
+    pub(crate) causation_user: Option<String>,
 }
 
 /// Per-session mutable state. The `SessionContext` itself is `Send + Sync`
@@ -1518,6 +1550,10 @@ pub(crate) fn tx_begin(state: &SessionState, current_snapshots: HashMap<TableNam
         tx.tx_id = None;
         tx.htap_rows.clear();
         tx.tx_overlay.clear();
+        // Buffered change events from any prior tx on this session (drained on
+        // COMMIT, dropped on ROLLBACK — clear defensively for the idempotent
+        // re-BEGIN / abandoned-tx cases).
+        tx.tx_change_events.clear();
         // Hot-tier MVCC watermark is, like `read_snapshots`, captured lazily on
         // first touch of each table (see `tx_hot_seq_watermark_for`), NOT seeded
         // here. Clear any residue from a prior transaction on this session.
@@ -1551,6 +1587,11 @@ pub(crate) fn tx_commit(state: &SessionState) -> HashMap<TableName, Vec<DataFile
     // `tx_overlay_take_all` *before* this call (mirroring `tx_htap_take_all`);
     // clear defensively in case a caller commits without draining.
     tx.tx_overlay.clear();
+    // Buffered change events are drained explicitly by the executor COMMIT path
+    // via `tx_change_events_take_all` *before* this call, then dispatched after
+    // the commit lands; clear defensively in case a caller commits without
+    // draining.
+    tx.tx_change_events.clear();
     tx.hot_seq_watermark.clear();
     drop(tx);
     // Drop any provider built inside this tx (pinned snapshot / tx overlay) so
@@ -1585,6 +1626,10 @@ pub(crate) fn tx_rollback(
     // Discard the tx-scoped UPDATE/DELETE overlay — these entries were never
     // written to the shared MemTableRegistry, so ROLLBACK is just a drop.
     tx.tx_overlay.clear();
+    // Discard buffered change events — a rolled-back mutation must never reach
+    // a CDC / realtime sink. They were never assigned a commit seq, so dropping
+    // them is a pure no-op against shared state.
+    tx.tx_change_events.clear();
     tx.hot_seq_watermark.clear();
     tx.tx_id = None;
     drop(tx);
@@ -1996,6 +2041,30 @@ pub(crate) fn tx_overlay_take_all(
 ) -> HashMap<TableName, TxOverlayTable> {
     let mut tx = state.tx_state.lock().expect("tx_state lock poisoned");
     std::mem::take(&mut tx.tx_overlay)
+}
+
+// ── Transaction-buffered change events (CDC / realtime) ──────────────────────
+
+/// Buffer one in-transaction change event for delivery at COMMIT. Called by the
+/// hot-tier UPDATE/DELETE fast path (and the in-tx UPDATE…FROM write tail) only
+/// when at least one change-event sink is attached. The `seq` is NOT assigned
+/// here — it is allocated in commit order at COMMIT drain time so the event
+/// carries the same commit ordering the cold paths get and is not fragmented by
+/// other sessions' interleaved auto-commit events. Push order == execution
+/// order, which the COMMIT drain preserves.
+pub(crate) fn tx_change_events_push(state: &SessionState, ev: TxChangeEvent) {
+    let mut tx = state.tx_state.lock().expect("tx_state lock poisoned");
+    tx.tx_change_events.push(ev);
+}
+
+/// Drain the buffered in-transaction change events on COMMIT, in execution
+/// order. Mirrors `tx_overlay_take_all`: call this BEFORE `tx_commit` (which
+/// clears `TxState`). The caller assigns each entry a commit `seq` and
+/// dispatches to the post-commit sinks AFTER the commit has landed; on ROLLBACK
+/// the buffer is dropped instead (see `tx_rollback`), so nothing is delivered.
+pub(crate) fn tx_change_events_take_all(state: &SessionState) -> Vec<TxChangeEvent> {
+    let mut tx = state.tx_state.lock().expect("tx_state lock poisoned");
+    std::mem::take(&mut tx.tx_change_events)
 }
 
 /// Stash the OVERRIDING kind extracted from the current INSERT

@@ -8,6 +8,26 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-13 — Change events from hot-tier UPDATE/DELETE fast paths (CDC/realtime)
+
+### Fixed
+
+- **Hot-tier UPDATE/DELETE fast paths now dispatch change events.** The
+  point-mutation fast paths (`hot_tier_update_by_pk`, `hot_tier_delete_by_pk`)
+  and in-transaction hot mutations drained at COMMIT never dispatched
+  post-commit change events, so the realtime websocket and the CDC ring were
+  blind to hot-tier UPDATE/DELETE — only INSERT and cold copy-on-write
+  UPDATE/DELETE fired. Now every committed hot-tier mutation reaches the
+  post-commit sinks: UPDATE (single-table fast path AND `UPDATE … FROM`) emits
+  before/after through the shared overlay-write seam; DELETE captures
+  before-images before the tombstone write. In-transaction mutations buffer
+  per-tx and dispatch in commit order at COMMIT, with ROLLBACK discarding the
+  buffer. All capture is gated on a post-commit CDC/realtime sink being
+  attached (the always-on pre-commit reactor sink does not trigger it), so the
+  zero-CDC-sink OLTP hot path reads no extra rows, projects no extra
+  `UPDATE … FROM` join columns, and consumes no event sequence numbers — the
+  1M-row UPDATE benchmarks are unaffected.
+
 ## 2026-06-13 — UPDATE … FROM is set-oriented (kill per-row quadratic)
 
 ### Changed
