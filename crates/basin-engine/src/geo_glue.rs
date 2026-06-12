@@ -80,9 +80,10 @@ use arrow_array::builder::{
     StringBuilder,
 };
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, Float64Array, Int32Array, StringArray,
+    Array, ArrayRef, BinaryArray, BinaryViewArray, FixedSizeBinaryArray, Float64Array, Int32Array,
+    LargeBinaryArray, StringArray,
 };
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field, FieldRef};
 use basin_geo::{
     decode_point, dwithin, encode_point, haversine_meters, make_point, Point, POINT_WKB_LEN,
 };
@@ -100,8 +101,8 @@ use geo::Intersects as GeoIntersects;
 use geo::Within as GeoWithin;
 use datafusion::common::{exec_err, Result as DFResult};
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
-    Volatility,
+    ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
+    TypeSignature, Volatility,
 };
 use datafusion::prelude::SessionContext;
 
@@ -127,19 +128,16 @@ pub(crate) fn install_udfs(ctx: &SessionContext) {
         ),
     }));
     ctx.register_udf(ScalarUDF::from(StXUdf {
-        signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+        signature: point_unary_sig(),
     }));
     ctx.register_udf(ScalarUDF::from(StYUdf {
-        signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+        signature: point_unary_sig(),
     }));
     ctx.register_udf(ScalarUDF::from(StDistanceUdf {
-        signature: Signature::exact(vec![point_dt(), point_dt()], Volatility::Immutable),
+        signature: point_binary_sig(),
     }));
     ctx.register_udf(ScalarUDF::from(StDWithinUdf {
-        signature: Signature::exact(
-            vec![point_dt(), point_dt(), DataType::Float64],
-            Volatility::Immutable,
-        ),
+        signature: point_pair_with_extra_sig(&[DataType::Float64]),
     }));
     // __basin_bbox_contains_point(geom, minx, miny, maxx, maxy) — the
     // single-decode residual for the PostGIS bbox-overlap idiom
@@ -150,22 +148,18 @@ pub(crate) fn install_udfs(ctx: &SessionContext) {
     // dominant residual-filter cost over rows surviving the R-tree prune.
     // Boundary-inclusive to match PostGIS `&&` (bbox-overlap) semantics.
     ctx.register_udf(ScalarUDF::from(BasinBboxContainsPointUdf {
-        signature: Signature::exact(
-            vec![
-                point_dt(),
-                DataType::Float64,
-                DataType::Float64,
-                DataType::Float64,
-                DataType::Float64,
-            ],
-            Volatility::Immutable,
-        ),
+        signature: point_with_extra_sig(&[
+            DataType::Float64,
+            DataType::Float64,
+            DataType::Float64,
+            DataType::Float64,
+        ]),
     }));
     ctx.register_udf(ScalarUDF::from(StAsTextUdf {
-        signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+        signature: point_unary_sig(),
     }));
     ctx.register_udf(ScalarUDF::from(StAsEwkbUdf {
-        signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+        signature: point_unary_sig(),
     }));
     ctx.register_udf(ScalarUDF::from(StGeomFromTextUdf {
         // `geometry_from_text(text)` — single-arg form. PG also allows
@@ -184,6 +178,7 @@ pub(crate) fn install_udfs(ctx: &SessionContext) {
             vec![
                 TypeSignature::Exact(vec![DataType::Binary]),
                 TypeSignature::Exact(vec![DataType::LargeBinary]),
+                TypeSignature::Exact(vec![DataType::BinaryView]),
                 TypeSignature::Exact(vec![DataType::FixedSizeBinary(POINT_WKB_LEN as i32)]),
             ],
             Volatility::Immutable,
@@ -192,7 +187,7 @@ pub(crate) fn install_udfs(ctx: &SessionContext) {
     // ST_AsGeoJSON(p) — POINT → full RFC 7946 GeoJSON envelope (TEXT).
     // Output: {"type":"Point","coordinates":[x,y]}  (no spaces, lon first).
     ctx.register_udf(ScalarUDF::from(StAsGeoJsonUdf {
-        signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+        signature: point_unary_sig(),
     }));
     // ST_GeomFromGeoJSON(text) — parse full GeoJSON envelope back to POINT.
     // Accepts both Utf8 and LargeUtf8 (same as ST_GeomFromText).
@@ -211,28 +206,28 @@ pub(crate) fn install_udfs(ctx: &SessionContext) {
     // ST_Intersects(a, b) — true iff a and b share any point.
     // For two POINTs this reduces to coordinate equality.
     ctx.register_udf(ScalarUDF::from(StIntersectsUdf {
-        signature: Signature::exact(vec![point_dt(), point_dt()], Volatility::Immutable),
+        signature: point_binary_sig(),
     }));
     // ST_Within(a, b) — true iff a lies completely within b.
     // For two POINTs: a.within(b) iff a == b.
     ctx.register_udf(ScalarUDF::from(StWithinUdf {
-        signature: Signature::exact(vec![point_dt(), point_dt()], Volatility::Immutable),
+        signature: point_binary_sig(),
     }));
     // ST_Crosses(a, b) — geometries cross iff they share some but not all
     // interior points. Two POINTs can never cross — always false.
     ctx.register_udf(ScalarUDF::from(StCrossesUdf {
-        signature: Signature::exact(vec![point_dt(), point_dt()], Volatility::Immutable),
+        signature: point_binary_sig(),
     }));
     // ST_Touches(a, b) — geometries touch iff they share boundary points but
     // not interior points. For two POINTs the interior IS the boundary, so
     // this reduces to coordinate equality (same semantics as Intersects for
     // dimensionless points).
     ctx.register_udf(ScalarUDF::from(StTouchesUdf {
-        signature: Signature::exact(vec![point_dt(), point_dt()], Volatility::Immutable),
+        signature: point_binary_sig(),
     }));
     // ST_Disjoint(a, b) — complement of ST_Intersects.
     ctx.register_udf(ScalarUDF::from(StDisjointUdf {
-        signature: Signature::exact(vec![point_dt(), point_dt()], Volatility::Immutable),
+        signature: point_binary_sig(),
     }));
     // ST_Overlaps(a, b) — geometries overlap iff their intersection has the
     // same dimension as each operand and is strictly smaller than each.
@@ -240,25 +235,25 @@ pub(crate) fn install_udfs(ctx: &SessionContext) {
     // (equal) or empty — neither case has *strictly smaller* dimension, so
     // ST_Overlaps is always false for POINT × POINT per PostGIS.
     ctx.register_udf(ScalarUDF::from(StOverlapsUdf {
-        signature: Signature::exact(vec![point_dt(), point_dt()], Volatility::Immutable),
+        signature: point_binary_sig(),
     }));
     // ST_Envelope(p) — bounding box. For a point the envelope is the point
     // itself. Identity.
     ctx.register_udf(ScalarUDF::from(StEnvelopeUdf {
-        signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+        signature: point_unary_sig(),
     }));
     // ST_Area(p) — area of geometry. Points have zero area.
     ctx.register_udf(ScalarUDF::from(StAreaUdf {
-        signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+        signature: point_unary_sig(),
     }));
     // ST_Perimeter(p) — perimeter of geometry. Points have zero perimeter.
     ctx.register_udf(ScalarUDF::from(StPerimeterUdf {
-        signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+        signature: point_unary_sig(),
     }));
     // ST_Centroid(p) — centroid of geometry. For a point the centroid is the
     // point itself. Identity.
     ctx.register_udf(ScalarUDF::from(StCentroidUdf {
-        signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+        signature: point_unary_sig(),
     }));
     // ST_Buffer(p, r) — returns a geometry representing all points whose
     // distance from p is <= r. For a point this is a circle (disk), which
@@ -268,27 +263,24 @@ pub(crate) fn install_udfs(ctx: &SessionContext) {
     // is returned unchanged so client libraries that call ST_Buffer purely for
     // its bounding-box side effects still get a valid geometry back.
     ctx.register_udf(ScalarUDF::from(StBufferUdf {
-        signature: Signature::exact(vec![point_dt(), DataType::Float64], Volatility::Immutable),
+        signature: point_with_extra_sig(&[DataType::Float64]),
     }));
     // ST_NumPoints(p) — number of vertices. A POINT has exactly 1 vertex.
     ctx.register_udf(ScalarUDF::from(StNumPointsUdf {
-        signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+        signature: point_unary_sig(),
     }));
     // ST_PointN(p, n) — 1-based vertex access. For a POINT only n==1 is
     // valid; all other indices return NULL (matching PostGIS behaviour).
     ctx.register_udf(ScalarUDF::from(StPointNUdf {
-        signature: Signature::exact(
-            vec![point_dt(), DataType::Int32],
-            Volatility::Immutable,
-        ),
+        signature: point_with_extra_sig(&[DataType::Int32]),
     }));
     // ST_StartPoint(p) — first vertex. For a POINT: identity.
     ctx.register_udf(ScalarUDF::from(StStartPointUdf {
-        signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+        signature: point_unary_sig(),
     }));
     // ST_EndPoint(p) — last vertex. For a POINT: identity.
     ctx.register_udf(ScalarUDF::from(StEndPointUdf {
-        signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+        signature: point_unary_sig(),
     }));
     // ST_MakeEnvelope(min_x, min_y, max_x, max_y [, srid]) — construct a
     // bounding-box geometry from four f64 corners plus an optional SRID.
@@ -313,6 +305,16 @@ pub(crate) fn install_udfs(ctx: &SessionContext) {
                     DataType::Float64,
                     DataType::Int32,
                 ]),
+                // SQL integer literals infer as Int64 (sqlparser default), so
+                // `ST_MakeEnvelope(.., 4326)` arrives with an Int64 SRID. Accept
+                // it alongside the native Int32 form (mirrors ST_Transform).
+                TypeSignature::Exact(vec![
+                    DataType::Float64,
+                    DataType::Float64,
+                    DataType::Float64,
+                    DataType::Float64,
+                    DataType::Int64,
+                ]),
             ],
             Volatility::Immutable,
         ),
@@ -329,7 +331,7 @@ pub(crate) fn install_udfs(ctx: &SessionContext) {
     // Returns 0 when the column has no declared SRID (PostGIS's "unknown
     // SRID" convention).
     ctx.register_udf(ScalarUDF::from(StSridUdf {
-        signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+        signature: point_unary_sig(),
     }));
     // ST_SetSRID(p, srid) → POINT — identity-bytes pass-through. The
     // returned column has no field-level SRID (we'd need a planner
@@ -337,26 +339,14 @@ pub(crate) fn install_udfs(ctx: &SessionContext) {
     // inside an INSERT, where the destination column's BASIN_SRID
     // already pins the SRID.
     ctx.register_udf(ScalarUDF::from(StSetSridUdf {
-        signature: Signature::one_of(
-            vec![
-                TypeSignature::Exact(vec![point_dt(), DataType::Int32]),
-                TypeSignature::Exact(vec![point_dt(), DataType::Int64]),
-            ],
-            Volatility::Immutable,
-        ),
+        signature: point_with_srid_arg_sig(),
     }));
     // ST_Transform(p, dst_srid) → POINT — reproject using proj4rs.
     // Accept Int32 (native) and Int64 (the sqlparser default for integer
     // literals) so neither `ST_Transform(p, 4326)` nor explicitly-cast
     // `ST_Transform(p, 4326::int4)` trip the type checker.
     ctx.register_udf(ScalarUDF::from(StTransformUdf {
-        signature: Signature::one_of(
-            vec![
-                TypeSignature::Exact(vec![point_dt(), DataType::Int32]),
-                TypeSignature::Exact(vec![point_dt(), DataType::Int64]),
-            ],
-            Volatility::Immutable,
-        ),
+        signature: point_with_srid_arg_sig(),
     }));
 
     // ── Geography aliases ─────────────────────────────────────────────────
@@ -390,6 +380,110 @@ pub(crate) fn install_udfs(ctx: &SessionContext) {
 #[inline]
 fn point_dt() -> DataType {
     DataType::FixedSizeBinary(POINT_WKB_LEN as i32)
+}
+
+/// The binary-family Arrow physical types a POINT column can arrive as.
+///
+/// Points are authored as `FixedSizeBinary(21)`, but the storage/scan layer
+/// (and DataFusion's binary-view optimizations) may hand the same 21-byte WKB
+/// back as `Binary`, `LargeBinary`, or `BinaryView`. The UDF signatures must
+/// accept all of them so DataFusion's type checker does not try to *cast*
+/// (e.g. BinaryView → FixedSizeBinary, which Arrow cannot do) before the UDF
+/// runs. The decode path (`point_bytes_at`) already reads any of these.
+fn point_input_variants() -> Vec<DataType> {
+    vec![
+        DataType::FixedSizeBinary(POINT_WKB_LEN as i32),
+        DataType::Binary,
+        DataType::LargeBinary,
+        DataType::BinaryView,
+    ]
+}
+
+/// `one_of` signature for a unary POINT UDF: accept the point in any
+/// binary-family physical type.
+fn point_unary_sig() -> Signature {
+    let variants = point_input_variants()
+        .into_iter()
+        .map(|p| TypeSignature::Exact(vec![p]))
+        .collect();
+    Signature::one_of(variants, Volatility::Immutable)
+}
+
+/// `one_of` signature for a binary POINT×POINT UDF: accept each operand in any
+/// binary-family physical type (all N×N combinations, since one side may be a
+/// freshly-constructed `FixedSizeBinary` point and the other a stored
+/// `BinaryView` column).
+fn point_binary_sig() -> Signature {
+    let mut variants = Vec::new();
+    for a in point_input_variants() {
+        for b in point_input_variants() {
+            variants.push(TypeSignature::Exact(vec![a.clone(), b]));
+        }
+    }
+    Signature::one_of(variants, Volatility::Immutable)
+}
+
+/// `one_of` signature for a POINT UDF with trailing extra argument types
+/// (e.g. `ST_PointN(point, INT32)`, `ST_Buffer(point, DOUBLE)`,
+/// `__basin_bbox_contains_point(point, f64, f64, f64, f64)`). The point may be
+/// any binary-family physical type; the trailing args are fixed.
+fn point_with_extra_sig(extra: &[DataType]) -> Signature {
+    let variants = point_input_variants()
+        .into_iter()
+        .map(|p| {
+            let mut v = vec![p];
+            v.extend_from_slice(extra);
+            TypeSignature::Exact(v)
+        })
+        .collect();
+    Signature::one_of(variants, Volatility::Immutable)
+}
+
+/// `one_of` signature for a POINT UDF taking a trailing SRID argument that may
+/// arrive as `Int32` (native) or `Int64` (sqlparser's default integer-literal
+/// width). Used by `ST_SetSRID` / `ST_Transform`. The point accepts any
+/// binary-family physical type.
+fn point_with_srid_arg_sig() -> Signature {
+    let mut variants = Vec::new();
+    for p in point_input_variants() {
+        variants.push(TypeSignature::Exact(vec![p.clone(), DataType::Int32]));
+        variants.push(TypeSignature::Exact(vec![p, DataType::Int64]));
+    }
+    Signature::one_of(variants, Volatility::Immutable)
+}
+
+/// `one_of` signature for a POINT×POINT UDF with trailing extra argument types
+/// (e.g. `ST_DWithin(point, point, DOUBLE)`). Both points accept any
+/// binary-family physical type (all N×N combinations).
+fn point_pair_with_extra_sig(extra: &[DataType]) -> Signature {
+    let mut variants = Vec::new();
+    for a in point_input_variants() {
+        for b in point_input_variants() {
+            let mut v = vec![a.clone(), b];
+            v.extend_from_slice(extra);
+            variants.push(TypeSignature::Exact(v));
+        }
+    }
+    Signature::one_of(variants, Volatility::Immutable)
+}
+
+/// Default Spatial Reference IDentifier stamped on points produced by the
+/// geometry constructors. PostGIS leaves freshly-constructed geometries at
+/// SRID 0 ("unknown"); Basin defaults to WGS84 (4326) by design so that
+/// `ST_SRID(ST_MakePoint(..))` returns a usable SRID without an explicit
+/// `ST_SetSRID`. See the crate-level docs and the `st_srid_default_is_4326`
+/// conformance test.
+const DEFAULT_GEOM_SRID: &str = "4326";
+
+/// Build the POINT output `Field` for a geometry constructor, stamping the
+/// `BASIN_SRID` metadata so downstream `ST_SRID` reads 4326. DataFusion
+/// threads this field through as the `arg_fields` entry seen by the next UDF
+/// in the expression tree, which is how `ST_SRID(ST_MakePoint(..))` resolves
+/// the SRID off `ST_MakePoint`'s return field.
+fn point_field_with_default_srid() -> FieldRef {
+    let mut md = std::collections::HashMap::new();
+    md.insert(crate::types::BASIN_SRID.to_string(), DEFAULT_GEOM_SRID.to_string());
+    Arc::new(Field::new("geom", point_dt(), true).with_metadata(md))
 }
 
 /// Helper to materialise both sides of a binary UDF to arrays of length
@@ -438,23 +532,45 @@ fn columnar_unary_to_array(args: &[ColumnarValue]) -> DFResult<(usize, ArrayRef)
     Ok((n, a))
 }
 
-fn decode_point_at(arr: &ArrayRef, i: usize) -> DFResult<Option<Point>> {
+/// Fetch the raw POINT WKB bytes at row `i` from any binary-family Arrow array.
+///
+/// POINT columns are authored as `FixedSizeBinary(21)`, but the storage layer
+/// (and DataFusion's string/binary view optimizations) can hand the bytes back
+/// as `Binary`, `LargeBinary`, or `BinaryView`. All four physical encodings
+/// carry the same 21-byte WKB payload, so we accept every binary-family array
+/// uniformly rather than forcing a cast back to `FixedSizeBinary`.
+///
+/// Returns `Ok(None)` for null slots; `Err` only when the array is not a
+/// binary-family type at all.
+fn point_bytes_at(arr: &ArrayRef, i: usize) -> DFResult<Option<&[u8]>> {
     if arr.is_null(i) {
         return Ok(None);
     }
-    let fsb = arr
-        .as_any()
-        .downcast_ref::<FixedSizeBinaryArray>()
-        .ok_or_else(|| {
-            datafusion::error::DataFusionError::Execution(format!(
-                "ST_* UDF: expected FixedSizeBinary({POINT_WKB_LEN}), got {:?}",
-                arr.data_type()
-            ))
-        })?;
-    let bytes = fsb.value(i);
-    decode_point(bytes)
-        .map(Some)
-        .map_err(|e| datafusion::error::DataFusionError::Execution(format!("decode POINT: {e}")))
+    let bytes = if let Some(a) = arr.as_any().downcast_ref::<FixedSizeBinaryArray>() {
+        a.value(i)
+    } else if let Some(a) = arr.as_any().downcast_ref::<BinaryArray>() {
+        a.value(i)
+    } else if let Some(a) = arr.as_any().downcast_ref::<LargeBinaryArray>() {
+        a.value(i)
+    } else if let Some(a) = arr.as_any().downcast_ref::<BinaryViewArray>() {
+        a.value(i)
+    } else {
+        return Err(datafusion::error::DataFusionError::Execution(format!(
+            "ST_* UDF: expected a binary POINT column (FixedSizeBinary({POINT_WKB_LEN})/Binary/\
+             LargeBinary/BinaryView), got {:?}",
+            arr.data_type()
+        )));
+    };
+    Ok(Some(bytes))
+}
+
+fn decode_point_at(arr: &ArrayRef, i: usize) -> DFResult<Option<Point>> {
+    match point_bytes_at(arr, i)? {
+        None => Ok(None),
+        Some(bytes) => decode_point(bytes).map(Some).map_err(|e| {
+            datafusion::error::DataFusionError::Execution(format!("decode POINT: {e}"))
+        }),
+    }
 }
 
 // ── ST_MakePoint ──────────────────────────────────────────────────────────────
@@ -475,6 +591,10 @@ impl ScalarUDFImpl for StMakePointUdf {
     }
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(point_dt())
+    }
+    fn return_field_from_args(&self, _args: ReturnFieldArgs) -> DFResult<FieldRef> {
+        // Stamp the default SRID so `ST_SRID(ST_MakePoint(..))` reads 4326.
+        Ok(point_field_with_default_srid())
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let args = &args.args;
@@ -791,20 +911,11 @@ impl ScalarUDFImpl for StAsEwkbUdf {
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let (n, arr) = columnar_unary_to_array(&args.args)?;
-        let fsb = arr
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .ok_or_else(|| {
-                datafusion::error::DataFusionError::Execution(format!(
-                    "ST_AsEWKB: argument must be FixedSizeBinary({POINT_WKB_LEN})"
-                ))
-            })?;
         let mut out = BinaryBuilder::with_capacity(n, n * POINT_WKB_LEN);
         for i in 0..n {
-            if fsb.is_null(i) {
-                out.append_null();
-            } else {
-                out.append_value(fsb.value(i));
+            match point_bytes_at(&arr, i)? {
+                None => out.append_null(),
+                Some(bytes) => out.append_value(bytes),
             }
         }
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
@@ -890,6 +1001,9 @@ impl ScalarUDFImpl for StGeomFromTextUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(point_dt())
     }
+    fn return_field_from_args(&self, _args: ReturnFieldArgs) -> DFResult<FieldRef> {
+        Ok(point_field_with_default_srid())
+    }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let (n, arr) = columnar_unary_to_array(&args.args)?;
         let mut out = FixedSizeBinaryBuilder::with_capacity(n, POINT_WKB_LEN as i32);
@@ -945,6 +1059,9 @@ impl ScalarUDFImpl for StGeomFromWkbUdf {
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(point_dt())
     }
+    fn return_field_from_args(&self, _args: ReturnFieldArgs) -> DFResult<FieldRef> {
+        Ok(point_field_with_default_srid())
+    }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let (n, arr) = columnar_unary_to_array(&args.args)?;
         let mut out = FixedSizeBinaryBuilder::with_capacity(n, POINT_WKB_LEN as i32);
@@ -968,6 +1085,11 @@ impl ScalarUDFImpl for StGeomFromWkbUdf {
                     .as_any()
                     .downcast_ref::<FixedSizeBinaryArray>()
                     .expect("FixedSizeBinaryArray")
+                    .value(i),
+                DataType::BinaryView => arr
+                    .as_any()
+                    .downcast_ref::<BinaryViewArray>()
+                    .expect("BinaryViewArray")
                     .value(i),
                 other => {
                     return Err(datafusion::error::DataFusionError::Execution(format!(
@@ -1073,6 +1195,9 @@ impl ScalarUDFImpl for StGeomFromGeoJsonUdf {
     }
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
         Ok(point_dt())
+    }
+    fn return_field_from_args(&self, _args: ReturnFieldArgs) -> DFResult<FieldRef> {
+        Ok(point_field_with_default_srid())
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let (n, arr) = columnar_unary_to_array(&args.args)?;
@@ -1371,24 +1496,15 @@ impl ScalarUDFImpl for StEnvelopeUdf {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         // Envelope of a POINT is the point itself — pass-through.
         let (n, arr) = columnar_unary_to_array(&args.args)?;
-        let fsb = arr
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .ok_or_else(|| {
-                datafusion::error::DataFusionError::Execution(format!(
-                    "ST_Envelope: expected FixedSizeBinary({POINT_WKB_LEN})"
-                ))
-            })?;
         let mut out = FixedSizeBinaryBuilder::with_capacity(n, POINT_WKB_LEN as i32);
         for i in 0..n {
-            if fsb.is_null(i) {
-                out.append_null();
-            } else {
-                out.append_value(fsb.value(i)).map_err(|e| {
+            match point_bytes_at(&arr, i)? {
+                None => out.append_null(),
+                Some(bytes) => out.append_value(bytes).map_err(|e| {
                     datafusion::error::DataFusionError::Execution(format!(
                         "ST_Envelope build: {e}"
                     ))
-                })?;
+                })?,
             }
         }
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
@@ -1485,24 +1601,15 @@ impl ScalarUDFImpl for StCentroidUdf {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         // Centroid of a POINT is the point itself — pass-through.
         let (n, arr) = columnar_unary_to_array(&args.args)?;
-        let fsb = arr
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .ok_or_else(|| {
-                datafusion::error::DataFusionError::Execution(format!(
-                    "ST_Centroid: expected FixedSizeBinary({POINT_WKB_LEN})"
-                ))
-            })?;
         let mut out = FixedSizeBinaryBuilder::with_capacity(n, POINT_WKB_LEN as i32);
         for i in 0..n {
-            if fsb.is_null(i) {
-                out.append_null();
-            } else {
-                out.append_value(fsb.value(i)).map_err(|e| {
+            match point_bytes_at(&arr, i)? {
+                None => out.append_null(),
+                Some(bytes) => out.append_value(bytes).map_err(|e| {
                     datafusion::error::DataFusionError::Execution(format!(
                         "ST_Centroid build: {e}"
                     ))
-                })?;
+                })?,
             }
         }
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
@@ -1536,24 +1643,15 @@ impl ScalarUDFImpl for StBufferUdf {
         // ST_Buffer primarily as a bounding-box hint still get a valid geometry.
         // TODO(PG-Wave 5): compute a circle polygon when Polygon columns ship.
         let (n, arr, _r_arr) = columnar_pair_to_arrays(&args.args)?;
-        let fsb = arr
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .ok_or_else(|| {
-                datafusion::error::DataFusionError::Execution(format!(
-                    "ST_Buffer: expected FixedSizeBinary({POINT_WKB_LEN}) as first argument"
-                ))
-            })?;
         let mut out = FixedSizeBinaryBuilder::with_capacity(n, POINT_WKB_LEN as i32);
         for i in 0..n {
-            if fsb.is_null(i) {
-                out.append_null();
-            } else {
-                out.append_value(fsb.value(i)).map_err(|e| {
+            match point_bytes_at(&arr, i)? {
+                None => out.append_null(),
+                Some(bytes) => out.append_value(bytes).map_err(|e| {
                     datafusion::error::DataFusionError::Execution(format!(
                         "ST_Buffer build: {e}"
                     ))
-                })?;
+                })?,
             }
         }
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
@@ -1623,24 +1721,23 @@ impl ScalarUDFImpl for StPointNUdf {
                     "ST_PointN: second argument must be INT32".into(),
                 )
             })?;
-        let fsb = pt_arr
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .ok_or_else(|| {
-                datafusion::error::DataFusionError::Execution(format!(
-                    "ST_PointN: expected FixedSizeBinary({POINT_WKB_LEN}) as first argument"
-                ))
-            })?;
         let mut out = FixedSizeBinaryBuilder::with_capacity(n, POINT_WKB_LEN as i32);
         for i in 0..n {
-            if fsb.is_null(i) || n_col.is_null(i) {
+            if n_col.is_null(i) {
                 out.append_null();
                 continue;
             }
+            let bytes = match point_bytes_at(&pt_arr, i)? {
+                None => {
+                    out.append_null();
+                    continue;
+                }
+                Some(b) => b,
+            };
             let idx = n_col.value(i);
             if idx == 1 {
                 // Only valid index for a POINT is 1 (1-based). Identity.
-                out.append_value(fsb.value(i)).map_err(|e| {
+                out.append_value(bytes).map_err(|e| {
                     datafusion::error::DataFusionError::Execution(format!(
                         "ST_PointN build: {e}"
                     ))
@@ -1676,24 +1773,15 @@ impl ScalarUDFImpl for StStartPointUdf {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         // For a POINT the start vertex is the point itself — pass-through.
         let (n, arr) = columnar_unary_to_array(&args.args)?;
-        let fsb = arr
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .ok_or_else(|| {
-                datafusion::error::DataFusionError::Execution(format!(
-                    "ST_StartPoint: expected FixedSizeBinary({POINT_WKB_LEN})"
-                ))
-            })?;
         let mut out = FixedSizeBinaryBuilder::with_capacity(n, POINT_WKB_LEN as i32);
         for i in 0..n {
-            if fsb.is_null(i) {
-                out.append_null();
-            } else {
-                out.append_value(fsb.value(i)).map_err(|e| {
+            match point_bytes_at(&arr, i)? {
+                None => out.append_null(),
+                Some(bytes) => out.append_value(bytes).map_err(|e| {
                     datafusion::error::DataFusionError::Execution(format!(
                         "ST_StartPoint build: {e}"
                     ))
-                })?;
+                })?,
             }
         }
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
@@ -1722,24 +1810,15 @@ impl ScalarUDFImpl for StEndPointUdf {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         // For a POINT the end vertex is the point itself — pass-through.
         let (n, arr) = columnar_unary_to_array(&args.args)?;
-        let fsb = arr
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .ok_or_else(|| {
-                datafusion::error::DataFusionError::Execution(format!(
-                    "ST_EndPoint: expected FixedSizeBinary({POINT_WKB_LEN})"
-                ))
-            })?;
         let mut out = FixedSizeBinaryBuilder::with_capacity(n, POINT_WKB_LEN as i32);
         for i in 0..n {
-            if fsb.is_null(i) {
-                out.append_null();
-            } else {
-                out.append_value(fsb.value(i)).map_err(|e| {
+            match point_bytes_at(&arr, i)? {
+                None => out.append_null(),
+                Some(bytes) => out.append_value(bytes).map_err(|e| {
                     datafusion::error::DataFusionError::Execution(format!(
                         "ST_EndPoint build: {e}"
                     ))
-                })?;
+                })?,
             }
         }
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
@@ -1903,24 +1982,15 @@ impl ScalarUDFImpl for StSetSridUdf {
             return exec_err!("ST_SetSRID expects 2 arguments, got {}", args.args.len());
         }
         let (n, arr) = columnar_unary_to_array(&args.args[0..1])?;
-        let fsb = arr
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .ok_or_else(|| {
-                datafusion::error::DataFusionError::Execution(format!(
-                    "ST_SetSRID: first argument must be FixedSizeBinary({POINT_WKB_LEN})"
-                ))
-            })?;
         let mut out = FixedSizeBinaryBuilder::with_capacity(n, POINT_WKB_LEN as i32);
         for i in 0..n {
-            if fsb.is_null(i) {
-                out.append_null();
-            } else {
-                out.append_value(fsb.value(i)).map_err(|e| {
+            match point_bytes_at(&arr, i)? {
+                None => out.append_null(),
+                Some(bytes) => out.append_value(bytes).map_err(|e| {
                     datafusion::error::DataFusionError::Execution(format!(
                         "ST_SetSRID build: {e}"
                     ))
-                })?;
+                })?,
             }
         }
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
@@ -2165,10 +2235,10 @@ mod tests {
             ),
         };
         let xudf = StXUdf {
-            signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+            signature: point_unary_sig(),
         };
         let yudf = StYUdf {
-            signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+            signature: point_unary_sig(),
         };
 
         let xs = Arc::new(Float64Array::from(vec![2.35, -73.985, 0.0])) as ArrayRef;
@@ -2259,7 +2329,7 @@ mod tests {
             signature: Signature::exact(vec![DataType::Utf8], Volatility::Immutable),
         };
         let as_text = StAsTextUdf {
-            signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+            signature: point_unary_sig(),
         };
         let input = Arc::new(StringArray::from(vec!["POINT(1.5 2.5)", "point(-3 4)"])) as ArrayRef;
         let p = invoke(&from_text, vec![ColumnarValue::Array(input)], point_dt());
@@ -2337,7 +2407,7 @@ mod tests {
     #[test]
     fn st_geojson_round_trip() {
         let as_geo = StAsGeoJsonUdf {
-            signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+            signature: point_unary_sig(),
         };
         let from_geo = StGeomFromGeoJsonUdf {
             signature: Signature::one_of(
@@ -2391,7 +2461,7 @@ mod tests {
     #[test]
     fn st_asgeojson_exact_format() {
         let udf = StAsGeoJsonUdf {
-            signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+            signature: point_unary_sig(),
         };
         // Simple integer-lat/lon to verify compact serde_json float printing.
         let p = make_point_scalar(1.0, 2.0);
@@ -2412,7 +2482,7 @@ mod tests {
     #[test]
     fn st_geojson_coordinate_precision() {
         let as_geo = StAsGeoJsonUdf {
-            signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+            signature: point_unary_sig(),
         };
         let from_geo = StGeomFromGeoJsonUdf {
             signature: Signature::one_of(
@@ -2449,7 +2519,7 @@ mod tests {
     #[test]
     fn st_geojson_null_passthrough() {
         let as_geo = StAsGeoJsonUdf {
-            signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+            signature: point_unary_sig(),
         };
         let from_geo = StGeomFromGeoJsonUdf {
             signature: Signature::one_of(
@@ -2537,7 +2607,7 @@ mod tests {
     #[test]
     fn st_intersects_point_eq() {
         let udf = StIntersectsUdf {
-            signature: Signature::exact(vec![point_dt(), point_dt()], Volatility::Immutable),
+            signature: point_binary_sig(),
         };
         // Same point → intersects = true.
         let p = make_point_scalar(1.0, 2.0);
@@ -2569,7 +2639,7 @@ mod tests {
     #[test]
     fn st_within_self() {
         let udf = StWithinUdf {
-            signature: Signature::exact(vec![point_dt(), point_dt()], Volatility::Immutable),
+            signature: point_binary_sig(),
         };
         let p = make_point_scalar(5.0, 6.0);
         let res = invoke(&udf, vec![p.clone(), p], DataType::Boolean);
@@ -2646,7 +2716,7 @@ mod tests {
     #[test]
     fn st_area_point_is_zero() {
         let udf = StAreaUdf {
-            signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+            signature: point_unary_sig(),
         };
         let p = make_point_scalar(10.0, 20.0);
         let res = invoke(&udf, vec![p], DataType::Float64);
@@ -2666,7 +2736,7 @@ mod tests {
     #[test]
     fn st_num_points_is_one() {
         let udf = StNumPointsUdf {
-            signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+            signature: point_unary_sig(),
         };
         let p = make_point_scalar(1.0, 1.0);
         let res = invoke(&udf, vec![p], DataType::Int32);
@@ -2686,7 +2756,7 @@ mod tests {
     #[test]
     fn st_envelope_returns_self() {
         let udf = StEnvelopeUdf {
-            signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+            signature: point_unary_sig(),
         };
         let p = make_point_scalar(7.0, 8.0);
         let res = invoke(&udf, vec![p.clone()], point_dt());
@@ -2709,7 +2779,7 @@ mod tests {
     #[test]
     fn st_overlaps_point_is_false() {
         let udf = StOverlapsUdf {
-            signature: Signature::exact(vec![point_dt(), point_dt()], Volatility::Immutable),
+            signature: point_binary_sig(),
         };
         // Same point — should still be false per PostGIS DE-9IM spec.
         let p = make_point_scalar(1.0, 2.0);
@@ -2800,7 +2870,7 @@ mod tests {
     #[test]
     fn st_srid_reads_field_metadata() {
         let udf = StSridUdf {
-            signature: Signature::exact(vec![point_dt()], Volatility::Immutable),
+            signature: point_unary_sig(),
         };
         let p = make_point_scalar(1.0, 2.0);
         // Column tagged SRID 4326 → ST_SRID returns 4326.

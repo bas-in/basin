@@ -98,6 +98,14 @@ use object_store::{ObjectMeta, ObjectStore};
 // ---------------------------------------------------------------------------
 const BASIN_TYPE_KEY: &str = "BASIN_TYPE";
 const BASIN_TYPE_UUID: &str = "UUID";
+/// `BASIN_TYPE` marker for POINT columns. The catalog declares them as
+/// `FixedSizeBinary(21)`; the storage writer reinterprets the buffer as
+/// `LargeBinary` for Vortex (no FSB(N) encoder), and Vortex's scan layer
+/// surfaces it as `BinaryView`. Mirrors `basin_storage`'s private copy.
+const BASIN_TYPE_POINT: &str = "POINT";
+
+/// On-disk catalog width of a POINT column: 21-byte WKB.
+const POINT_FSB_LEN: i32 = basin_geo::POINT_WKB_LEN as i32;
 
 /// Wraps [`vortex_datafusion::VortexFormat`] and patches `total_byte_size` in
 /// `infer_stats` when the inner format returns `Precision::Absent`.
@@ -255,10 +263,23 @@ impl FileFormat for BasinVortexFormat {
     /// TODO(adr-0024): drop swap when Vortex grows native FixedSizeBinary(N).
     fn file_source(&self, table_schema: TableSchema) -> Arc<dyn FileSource> {
         let file_schema = table_schema.file_schema().clone();
-        let inner_source = if schema_has_uuid_fsb16(file_schema.as_ref()) {
-            let physical_file_schema = Arc::new(swap_uuid_fsb16_to_decimal256(file_schema.as_ref()));
+        // Align the file schema with the physical Vortex layout for both
+        // disguised types: UUID FSB(16) → Decimal256(39,0) and POINT FSB(21) →
+        // BinaryView. Both swaps avoid an unsupported scan-time cast; the
+        // matching restore execs (below / in create_physical_plan) convert back
+        // to the catalog's FSB types on output.
+        let needs_uuid = schema_has_uuid_fsb16(file_schema.as_ref());
+        let needs_point = schema_has_point_fsb(file_schema.as_ref());
+        let inner_source = if needs_uuid || needs_point {
+            let mut physical = (*file_schema).clone();
+            if needs_uuid {
+                physical = swap_uuid_fsb16_to_decimal256(&physical);
+            }
+            if needs_point {
+                physical = swap_point_fsb_to_binary_view(&physical);
+            }
             let physical_table_schema = TableSchema::new(
-                physical_file_schema,
+                Arc::new(physical),
                 table_schema.table_partition_cols().clone(),
             );
             self.inner.file_source(physical_table_schema)
@@ -309,13 +330,17 @@ impl FileFormat for BasinVortexFormat {
         // returns) cannot fuse UDF expressions into the scan.
         let inner_plan = rewrap_datasource_with_guard(inner_plan);
 
-        // If the plan's output schema contains any Decimal256(39,0)+BASIN_TYPE=UUID
-        // columns, wrap with the restore exec.  Otherwise pass through unchanged.
-        if schema_has_uuid_decimal256(inner_plan.schema().as_ref()) {
-            Ok(Arc::new(UuidDecimal256RestoreExec::new(inner_plan)))
-        } else {
-            Ok(inner_plan)
+        // Restore disguised physical types to their catalog FSB shapes.
+        // UUID: Decimal256(39,0) → FSB(16). POINT: binary-family → FSB(21).
+        // Either or both restore execs are stacked as needed.
+        let mut plan = inner_plan;
+        if schema_has_uuid_decimal256(plan.schema().as_ref()) {
+            plan = Arc::new(UuidDecimal256RestoreExec::new(plan));
         }
+        if schema_has_point_binary(plan.schema().as_ref()) {
+            plan = Arc::new(PointFsbRestoreExec::new(plan));
+        }
+        Ok(plan)
     }
 }
 
@@ -581,6 +606,130 @@ fn swap_uuid_decimal256_to_fsb16(schema: &Schema) -> Schema {
     Schema::new_with_metadata(new_fields, schema.metadata().clone())
 }
 
+// ── POINT FSB(21) ↔ binary-family helpers (mirror of the UUID path) ─────────
+
+/// `true` if `field` is the catalog shape for a POINT column:
+/// `FixedSizeBinary(21)` with `BASIN_TYPE=POINT`.
+fn field_is_point_fsb(f: &Field) -> bool {
+    matches!(f.data_type(), DataType::FixedSizeBinary(n) if *n == POINT_FSB_LEN)
+        && f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_POINT)
+}
+
+/// `true` if `field` is a POINT column coming back from Vortex as a
+/// binary-family physical type (Binary / LargeBinary / BinaryView), tagged
+/// `BASIN_TYPE=POINT`. These are what the restore exec converts to FSB(21).
+fn field_is_point_binary(f: &Field) -> bool {
+    matches!(
+        f.data_type(),
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+    ) && f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_POINT)
+}
+
+fn schema_has_point_fsb(schema: &Schema) -> bool {
+    schema.fields().iter().any(|f| field_is_point_fsb(f))
+}
+
+fn schema_has_point_binary(schema: &Schema) -> bool {
+    schema.fields().iter().any(|f| field_is_point_binary(f))
+}
+
+/// Swap `FixedSizeBinary(21)+BASIN_TYPE=POINT` fields to `BinaryView` so the
+/// file schema matches the physical type Vortex emits (avoiding an
+/// unsupported BinaryView → FSB(21) cast at scan time). Other fields untouched.
+fn swap_point_fsb_to_binary_view(schema: &Schema) -> Schema {
+    let new_fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            if field_is_point_fsb(f) {
+                Field::new(f.name(), DataType::BinaryView, f.is_nullable())
+                    .with_metadata(f.metadata().clone())
+            } else {
+                f.as_ref().clone()
+            }
+        })
+        .collect();
+    Schema::new_with_metadata(new_fields, schema.metadata().clone())
+}
+
+/// Swap binary-family `+BASIN_TYPE=POINT` fields back to `FixedSizeBinary(21)`.
+/// The logical output schema of the POINT restore.
+fn swap_point_binary_to_fsb(schema: &Schema) -> Schema {
+    let new_fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            if field_is_point_binary(f) {
+                Field::new(f.name(), DataType::FixedSizeBinary(POINT_FSB_LEN), f.is_nullable())
+                    .with_metadata(f.metadata().clone())
+            } else {
+                f.as_ref().clone()
+            }
+        })
+        .collect();
+    Schema::new_with_metadata(new_fields, schema.metadata().clone())
+}
+
+/// Convert one `RecordBatch`'s binary-family POINT columns to
+/// `FixedSizeBinary(21)`. Every value is a 21-byte WKB blob; rows of the wrong
+/// length surface as an internal error (corruption guard).
+fn restore_point_columns(batch: RecordBatch) -> DFResult<RecordBatch> {
+    use arrow_array::{BinaryViewArray, FixedSizeBinaryArray, LargeBinaryArray};
+
+    let schema = batch.schema();
+    if !schema_has_point_binary(schema.as_ref()) {
+        return Ok(batch);
+    }
+    let mut new_fields: Vec<Field> = Vec::with_capacity(schema.fields().len());
+    let mut new_cols: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+
+    for (i, f) in schema.fields().iter().enumerate() {
+        if field_is_point_binary(f) {
+            let col = batch.column(i);
+            let len = col.len();
+            let value_at = |r: usize| -> Option<&[u8]> {
+                if col.is_null(r) {
+                    return None;
+                }
+                if let Some(a) = col.as_any().downcast_ref::<BinaryViewArray>() {
+                    Some(a.value(r))
+                } else if let Some(a) = col.as_any().downcast_ref::<LargeBinaryArray>() {
+                    Some(a.value(r))
+                } else if let Some(a) = col.as_any().downcast_ref::<arrow_array::BinaryArray>() {
+                    Some(a.value(r))
+                } else {
+                    None
+                }
+            };
+            let rows = (0..len).map(|r| value_at(r).map(|b| b.to_vec()));
+            let arr =
+                FixedSizeBinaryArray::try_from_sparse_iter_with_size(rows, POINT_FSB_LEN).map_err(
+                    |e| {
+                        datafusion::common::DataFusionError::Internal(format!(
+                            "point restore: FixedSizeBinaryArray construction for '{}': {e}",
+                            f.name()
+                        ))
+                    },
+                )?;
+            let new_field =
+                Field::new(f.name(), DataType::FixedSizeBinary(POINT_FSB_LEN), f.is_nullable())
+                    .with_metadata(f.metadata().clone());
+            new_fields.push(new_field);
+            new_cols.push(Arc::new(arr) as ArrayRef);
+        } else {
+            new_fields.push(f.as_ref().clone());
+            new_cols.push(batch.column(i).clone());
+        }
+    }
+
+    let new_schema = Arc::new(Schema::new_with_metadata(
+        new_fields,
+        schema.metadata().clone(),
+    ));
+    RecordBatch::try_new(new_schema, new_cols)
+        .map_err(|e| datafusion::common::DataFusionError::ArrowError(Box::new(e), None))
+}
+
 /// Convert one `RecordBatch` whose Decimal256(39,0)+BASIN_TYPE=UUID columns
 /// contain UUID bytes into a batch where those columns are `FixedSizeBinary(16)`.
 ///
@@ -767,6 +916,111 @@ impl ExecutionPlan for UuidDecimal256RestoreExec {
         let schema = Arc::clone(&self.output_schema);
         let mapped = futures::StreamExt::map(inner_stream, move |batch_res| {
             batch_res.and_then(|batch| restore_uuid_columns(batch))
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, mapped)))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PointFsbRestoreExec
+// ---------------------------------------------------------------------------
+
+/// A thin `ExecutionPlan` wrapper that translates binary-family POINT columns
+/// (`Binary`/`LargeBinary`/`BinaryView` carrying `BASIN_TYPE=POINT`) back to
+/// `FixedSizeBinary(21)` on every output batch, so DataFusion and the engine's
+/// `ST_*` UDFs observe only the catalog-declared POINT type.
+///
+/// Inserted by `BasinVortexFormat::create_physical_plan` above the inner scan
+/// (and above any `UuidDecimal256RestoreExec`). Like the UUID restorer it is a
+/// row-for-row type coercion, so it is transparent to filter pushdown.
+///
+/// TODO(adr-0024): remove when Vortex grows native FixedSizeBinary(N).
+#[derive(Debug)]
+struct PointFsbRestoreExec {
+    inner: Arc<dyn ExecutionPlan>,
+    output_schema: SchemaRef,
+    props: Arc<PlanProperties>,
+}
+
+impl PointFsbRestoreExec {
+    fn new(inner: Arc<dyn ExecutionPlan>) -> Self {
+        let output_schema = Arc::new(swap_point_binary_to_fsb(inner.schema().as_ref()));
+        let props = Arc::new(Self::compute_properties(&inner, Arc::clone(&output_schema)));
+        Self { inner, output_schema, props }
+    }
+
+    fn compute_properties(inner: &Arc<dyn ExecutionPlan>, schema: SchemaRef) -> PlanProperties {
+        let eq = EquivalenceProperties::new(schema);
+        PlanProperties::new(
+            eq,
+            inner.output_partitioning().clone(),
+            inner.pipeline_behavior(),
+            inner.boundedness(),
+        )
+    }
+}
+
+impl DisplayAs for PointFsbRestoreExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PointFsbRestoreExec")
+    }
+}
+
+impl ExecutionPlan for PointFsbRestoreExec {
+    fn name(&self) -> &str {
+        "PointFsbRestoreExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.output_schema)
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.props
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.inner]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(PointFsbRestoreExec::new(children.swap_remove(0))))
+    }
+
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> DFResult<FilterDescription> {
+        FilterDescription::from_children(parent_filters, &self.children())
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        _phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> DFResult<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        Ok(FilterPushdownPropagation::if_all(child_pushdown_result))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        let inner_stream = self.inner.execute(partition, context)?;
+        let schema = Arc::clone(&self.output_schema);
+        let mapped = futures::StreamExt::map(inner_stream, move |batch_res| {
+            batch_res.and_then(restore_point_columns)
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, mapped)))
     }
