@@ -3057,6 +3057,44 @@ pub(crate) async fn exec_update(
     let schema = meta.schema.clone();
     let storage = sess.engine.config().storage.clone();
 
+    // RLS USING enforcement on UPDATE (mirrors the DELETE P0 #56 fix and the
+    // SELECT path). WITH CHECK on the post-SET image only catches an UPDATE
+    // that moves a row OUT of the policy; it does NOT stop an UPDATE that
+    // leaves the policy columns unchanged (e.g. `SET v = 999` on a row owned
+    // by another user, including via the ON CONFLICT DO UPDATE upsert path).
+    // Without a USING filter the cold rewrite would match — and silently
+    // overwrite — rows the current user cannot see. AND the policies' USING
+    // predicates into the user's WHERE so the update only ever touches rows
+    // the policy makes visible: combine the applicable USING predicates
+    // (permissive → OR) and AND the result in. With RLS on but no applicable
+    // policy the helper returns `(FALSE)` (Postgres default-deny); with RLS
+    // off it returns `None` and the path is untouched.
+    let selection: Option<Expr> = {
+        let rls_using_sql = crate::rls::build_using_predicate_sql_for_kind(
+            meta.rls_enabled,
+            &meta.policies,
+            &sess.current_user,
+            basin_catalog::PolicyCommand::Update,
+        )
+        // Resolve auth_uid()/auth_role() to literals: the cold UPDATE filters
+        // rows through the compound-predicate engine, which cannot evaluate
+        // UDFs, so a policy like `owner_id = auth_uid()` must become
+        // `owner_id = '<uuid>'` before parse_compound_predicate sees it.
+        .map(|sql| crate::rls::substitute_auth_functions(&sql, &sess.auth_context));
+        match (selection, rls_using_sql) {
+            (sel, None) => sel,
+            (None, Some(rls_sql)) => Some(parse_sql_expr_fragment(&rls_sql)?),
+            (Some(user), Some(rls_sql)) => {
+                let rls_expr = parse_sql_expr_fragment(&rls_sql)?;
+                Some(Expr::BinaryOp {
+                    left: Box::new(Expr::Nested(Box::new(user))),
+                    op: BinaryOperator::And,
+                    right: Box::new(Expr::Nested(Box::new(rls_expr))),
+                })
+            }
+        }
+    };
+
     // ── Hot-tier fast path ──────────────────────────────────────────────
     //
     // For `SET col = lit` (scalar) OR an allowlisted read-modify-write
