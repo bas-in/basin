@@ -28,8 +28,8 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, RwLock};
 
 use arrow_array::{
-    Array, BooleanArray, FixedSizeBinaryArray, Float64Array, Int16Array, Int32Array, Int64Array,
-    RecordBatch, StringArray,
+    Array, BooleanArray, Decimal256Array, FixedSizeBinaryArray, Float64Array, Int16Array,
+    Int32Array, Int64Array, RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, Schema};
 use basin_catalog::{
@@ -997,6 +997,23 @@ fn scalar_to_canonical_string(arr: &dyn Array, row: usize) -> Result<String> {
             let bytes = a.value(row);
             let mut buf = [0u8; 16];
             buf.copy_from_slice(bytes);
+            Ok(uuid::Uuid::from_bytes(buf).hyphenated().to_string())
+        }
+        // UUID columns in Vortex cold storage: Vortex has no FixedSizeBinary(N)
+        // encoder, so the writer reinterprets UUID FSB(16) as Decimal256(39,0)
+        // (left-zero-padded big-endian i256, lower 16 bytes = UUID).  When the
+        // constraint cold-scan uses `read_file_with_options` without a catalog
+        // schema the restamp + restore chain never runs, so the UUID arrives
+        // here as Decimal256.  We unpack the UUID bytes via the same inverse
+        // used in `basin_storage::reader::decimal256_to_uuid_fsb`.
+        DataType::Decimal256(39, 0) => {
+            let a = arr
+                .as_any()
+                .downcast_ref::<Decimal256Array>()
+                .ok_or_else(|| BasinError::internal("Decimal256Array downcast for UUID"))?;
+            let full = a.value(row).to_be_bytes(); // 32 bytes; UUID is [16..32]
+            let mut buf = [0u8; 16];
+            buf.copy_from_slice(&full[16..32]);
             Ok(uuid::Uuid::from_bytes(buf).hyphenated().to_string())
         }
         other => Err(BasinError::InvalidSchema(format!(
