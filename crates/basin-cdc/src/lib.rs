@@ -75,8 +75,9 @@ pub use record::{CdcRecord, CdcSseFrame};
 pub use ring::{CdcIndex, ProjectRing, SEGMENT_MAX_BYTES, SEGMENT_MAX_RECORDS};
 pub use sse::{cdc_router, CdcSseState};
 pub use webhook::{
-    mint_secret_hex, mint_webhook_id, sign_body, spawn_webhook_dispatcher, ReqwestHttp,
-    WebhookConfig, WebhookDispatcher, WebhookHttp, SEQ_RANGE_HEADER, SIGNATURE_HEADER,
+    mint_secret_hex, mint_webhook_id, sign_body, spawn_webhook_dispatcher,
+    spawn_webhook_supervisor, spawn_webhook_supervisor_with_http, ReqwestHttp, WebhookConfig,
+    WebhookDispatcher, WebhookHttp, WebhookSupervisor, SEQ_RANGE_HEADER, SIGNATURE_HEADER,
 };
 
 /// Env var: ring retention window in hours. Default 24, max 168 (7 days).

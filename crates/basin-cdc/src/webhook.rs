@@ -266,6 +266,80 @@ impl WebhookDispatcher {
     }
 }
 
+/// Handle to the top-level webhook supervisor (one per process). It discovers
+/// projects that have a CDC ring and runs one [`spawn_webhook_dispatcher`] per
+/// project. Dropping / aborting it stops every per-project dispatcher.
+pub struct WebhookSupervisor {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl WebhookSupervisor {
+    pub fn abort(self) {
+        self.handle.abort();
+    }
+}
+
+/// Spawn the process-wide webhook supervisor. Wired once at startup (basin-
+/// server `main.rs`). On each [`WebhookConfig::poll_interval`] tick it lists
+/// projects that have a CDC ring (the same prefix-LIST discovery the retention
+/// GC uses) and ensures exactly one per-project dispatcher is running. A
+/// project that registers its first webhook gets a dispatcher on the next tick;
+/// project-level isolation is preserved (one dispatcher tree per project, and
+/// one delivery task per endpoint within it).
+///
+/// `http` is a single shared client across every delivery task (connection
+/// pooling). `catalog` is the engine's catalog — the worker reads
+/// subscriptions and persists the delivery cursor through it.
+pub fn spawn_webhook_supervisor(
+    writer: CdcRingWriter,
+    catalog: Arc<dyn Catalog>,
+    cfg: WebhookConfig,
+) -> WebhookSupervisor {
+    let http: Arc<dyn WebhookHttp> = Arc::new(ReqwestHttp::new());
+    spawn_webhook_supervisor_with_http(writer, catalog, cfg, http)
+}
+
+/// As [`spawn_webhook_supervisor`] but with an injected HTTP transport (tests).
+pub fn spawn_webhook_supervisor_with_http(
+    writer: CdcRingWriter,
+    catalog: Arc<dyn Catalog>,
+    cfg: WebhookConfig,
+    http: Arc<dyn WebhookHttp>,
+) -> WebhookSupervisor {
+    let handle = tokio::spawn(async move {
+        let mut dispatchers: HashMap<ProjectId, WebhookDispatcher> = HashMap::new();
+        let mut tick = tokio::time::interval(cfg.poll_interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let projects = match crate::gc::discover_projects(&writer).await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(error = %e, "cdc webhook supervisor: project discovery failed");
+                    continue;
+                }
+            };
+            // Reap dispatchers whose task finished (shouldn't normally happen —
+            // a dispatcher loops forever — but keeps the map clean).
+            dispatchers.retain(|_, d| !d.handle.is_finished());
+            for project in projects {
+                if dispatchers.contains_key(&project) {
+                    continue;
+                }
+                let d = spawn_webhook_dispatcher(
+                    writer.clone(),
+                    catalog.clone(),
+                    project,
+                    cfg.clone(),
+                    Arc::clone(&http),
+                );
+                dispatchers.insert(project, d);
+            }
+        }
+    });
+    WebhookSupervisor { handle }
+}
+
 /// Spawn the webhook dispatcher for one project's registered endpoints.
 ///
 /// The supervisor polls the catalog every [`WebhookConfig::poll_interval`] and

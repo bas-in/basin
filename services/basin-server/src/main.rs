@@ -502,7 +502,20 @@ async fn main() -> Result<()> {
         let _flusher = sink.spawn_flusher();
         std::mem::forget(basin_cdc::spawn_retention_gc(sink.clone()));
         std::mem::forget(_flusher);
-        tracing::info!("basin-cdc post-commit sink attached (durable ring + retention GC)");
+        // >>> ADR 0028 Phase 2 CDC-WEBHOOK SUPERVISOR (anchored, flagged) >>>
+        // Process-wide webhook push supervisor: discovers projects with a CDC
+        // ring and runs one isolated per-endpoint delivery worker per
+        // registered webhook (catalog-backed subscriptions + cursor). Runs for
+        // the process lifetime; detached like the flusher / GC above.
+        std::mem::forget(basin_cdc::spawn_webhook_supervisor(
+            sink.clone(),
+            catalog.clone(),
+            basin_cdc::WebhookConfig::from_env(),
+        ));
+        tracing::info!(
+            "basin-cdc post-commit sink attached (durable ring + retention GC + webhook push)"
+        );
+        // <<< ADR 0028 Phase 2 CDC-WEBHOOK SUPERVISOR (anchored, flagged) <<<
         sink
     };
 
