@@ -74,6 +74,11 @@ fn classify(err: &BasinError) -> (&'static str, &'static str) {
         // retryable (same SQLSTATE class as commit conflict, since the
         // caller should retry from a fresh route + re-resolved owner).
         BasinError::LeaseHandoffInProgress(_) => ("ERROR", "40001"), // serialization_failure
+        // Multi-node phase 1 (BASIN_LEASE_MODE=required): this replica does
+        // not hold the writer lease — retryable for the same reason as the
+        // handoff rejection above (the caller should re-resolve the owner
+        // and retry there). Reads are never rejected with this code.
+        BasinError::LeaseNotHeld(_) => ("ERROR", "40001"), // serialization_failure
         // Phase 5.28.B: lock_timeout expiry — PostgreSQL raises 55P03.
         BasinError::LockNotAvailable(_) => ("ERROR", "55P03"), // lock_not_available
         // Phase 5.28.C: idle_in_transaction_session_timeout — PostgreSQL
@@ -147,6 +152,17 @@ mod tests {
             er.fields[2],
             (b'M', "column \"nosuch_col\" does not exist".to_owned())
         );
+    }
+
+    #[test]
+    fn classifies_lease_not_held() {
+        // BASIN_LEASE_MODE=required write refusals must surface as SQLSTATE
+        // 40001 (serialization_failure) — the retryable class drivers and
+        // routers already handle for commit conflicts and lease handoffs.
+        let er = error_response(&BasinError::lease_not_held("proj/part"));
+        assert_eq!(er.fields[0], (b'S', "ERROR".to_owned()));
+        assert_eq!(er.fields[1], (b'C', "40001".to_owned()));
+        assert!(er.fields[2].1.contains("writer lease not held"));
     }
 
     #[test]

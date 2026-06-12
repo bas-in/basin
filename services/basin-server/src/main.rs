@@ -52,6 +52,28 @@
 //! engine falls back to its legacy synchronous Parquet write path so existing
 //! demos remain reproducible.
 //!
+//! ## Writer leases (multi-node phase 1, ADR 0023)
+//!
+//! ```text
+//! BASIN_LEASE_MODE=off       # default; current single-replica behaviour
+//! BASIN_LEASE_MODE=required  # writer leases ENFORCED (requires BASIN_SHARD_ENABLED=1)
+//! BASIN_REPLICA_ID=node-a    # optional stable holder id; default host:pid:salt
+//! ```
+//!
+//! With `BASIN_LEASE_MODE=required` the catalog doubles as the
+//! `LeaseRegistry` (both backends implement it: the in-memory catalog for
+//! dev, Postgres CAS rows for production) and the shard acquires the writer
+//! lease for every `(project, partition)` it touches. The shard's background
+//! loop — the same one that runs eviction + compaction — heartbeats every
+//! `BASIN_LEASE_RENEW_SECS` (default 5 s) against a `BASIN_LEASE_TTL_SECS`
+//! TTL (default 15 s). On lease loss the partition's in-memory state is
+//! dropped and writes fail with the typed `LeaseNotHeld` error (SQLSTATE
+//! 40001, retryable) until the lease is re-acquired; reads continue
+//! throughout. WAL appends stay epoch-fenced exactly as in Phase 6.X.A, so a
+//! dual-leaseholder window during a network partition still fails closed at
+//! the WAL. `required` without `BASIN_SHARD_ENABLED=1` is a startup error:
+//! the legacy synchronous write path has no lease seam to enforce.
+//!
 //! ## Pool, auth, REST
 //!
 //! Three additional env vars layer the optional pieces of the Basin stack on
@@ -163,6 +185,7 @@ async fn main() -> Result<()> {
         projects = cfg.projects.len(),
         shard_enabled = cfg.shard_enabled,
         pool_enabled = cfg.pool_enabled,
+        lease_mode = ?cfg.lease_mode,
         "starting basin-server"
     );
 
@@ -243,17 +266,27 @@ async fn main() -> Result<()> {
         disk_cache,
         page_cache,
     });
-    let catalog: Arc<dyn basin_catalog::Catalog> = match &cfg.catalog {
+    // Both catalog backends also implement `LeaseRegistry` (ADR 0023 Phase
+    // 6.X.A: in-memory per-pair guard for dev, Postgres CAS rows for
+    // production), so the same concrete `Arc` is kept under both trait
+    // objects. The registry handle is only consumed when
+    // `BASIN_LEASE_MODE=required` wires it into the shard below.
+    let (catalog, lease_registry): (
+        Arc<dyn basin_catalog::Catalog>,
+        Arc<dyn basin_catalog::LeaseRegistry>,
+    ) = match &cfg.catalog {
         CatalogBackend::Memory => {
             tracing::info!("catalog backend: in-memory (volatile)");
-            Arc::new(basin_catalog::InMemoryCatalog::new())
+            let cat = Arc::new(basin_catalog::InMemoryCatalog::new());
+            (cat.clone(), cat)
         }
         CatalogBackend::Postgres { url, schema } => {
             tracing::info!(%schema, "catalog backend: postgres (durable)");
             let cat = basin_catalog::PostgresCatalog::connect_with_schema(url, schema)
                 .await
                 .with_context(|| format!("connect postgres catalog at {url}"))?;
-            Arc::new(cat)
+            let cat = Arc::new(cat);
+            (cat.clone(), cat)
         }
     };
 
@@ -280,11 +313,30 @@ async fn main() -> Result<()> {
             .await
             .context("open WAL")?,
         );
-        let shard = basin_shard::Shard::new(basin_shard::ShardConfig::new(
-            storage.clone(),
-            catalog.clone(),
-            wal.clone(),
-        ));
+        let mut shard_cfg =
+            basin_shard::ShardConfig::new(storage.clone(), catalog.clone(), wal.clone());
+        // Multi-node phase 1 (ADR 0023): with BASIN_LEASE_MODE=required the
+        // catalog's lease registry is wired into the shard and single-writer
+        // becomes enforced — writes only proceed under a held writer lease
+        // (typed `LeaseNotHeld` refusal otherwise; reads continue). The
+        // renewal heartbeat rides the shard background loop spawned below,
+        // same as eviction + compaction. `off` (the default) changes nothing.
+        if cfg.lease_mode == basin_shard::LeaseMode::Required {
+            let replica_id = cfg
+                .replica_id
+                .clone()
+                .unwrap_or_else(|| shard_cfg.replica_id.clone());
+            shard_cfg = shard_cfg
+                .with_lease_registry(lease_registry.clone(), replica_id)
+                .with_lease_mode(basin_shard::LeaseMode::Required);
+            tracing::info!(
+                replica_id = %shard_cfg.replica_id,
+                lease_ttl_secs = shard_cfg.lease_ttl.as_secs(),
+                lease_renew_secs = shard_cfg.lease_renew_interval.as_secs(),
+                "lease mode: required — writer leases enforced via catalog registry"
+            );
+        }
+        let shard = basin_shard::Shard::new(shard_cfg);
         let bg = shard.spawn_background();
         tracing::info!(
             wal_dir = %cfg.wal_dir.display(),
@@ -652,6 +704,14 @@ struct Cfg {
     wal_dir: PathBuf,
     shard_enabled: bool,
     pool_enabled: bool,
+    /// Multi-node phase 1 (ADR 0023): `BASIN_LEASE_MODE`. `Required` wires
+    /// the catalog's `LeaseRegistry` into the shard so single-writer is
+    /// enforced (writes refused without a held lease); `Off` (default) is
+    /// the unchanged single-replica behaviour.
+    lease_mode: basin_shard::LeaseMode,
+    /// `BASIN_REPLICA_ID` — stable lease holder id for this process. `None`
+    /// falls back to basin-shard's per-process default (`host:pid:salt`).
+    replica_id: Option<String>,
     // ADR 0018: auth/rest fields compiled away in minimal build.
     #[cfg(feature = "auth")]
     auth_enabled: bool,
@@ -689,6 +749,22 @@ impl Cfg {
             .unwrap_or_else(|_| data_dir.join("wal"));
         let shard_enabled = bool_env("BASIN_SHARD_ENABLED");
         let pool_enabled = bool_env("BASIN_POOL_ENABLED");
+        // BASIN_LEASE_MODE (multi-node phase 1, ADR 0023). Strict parse: a
+        // typo'd enforcement knob must not silently mean "off".
+        let lease_mode = basin_shard::LeaseMode::from_env().map_err(|e| anyhow!(e))?;
+        if lease_mode == basin_shard::LeaseMode::Required && !shard_enabled {
+            // Same refuse-to-start idiom as BASIN_REST_ENABLED without auth:
+            // the legacy synchronous Parquet write path has no lease seam,
+            // so "required" enforcement would be silently meaningless.
+            return Err(anyhow!(
+                "BASIN_LEASE_MODE=required requires BASIN_SHARD_ENABLED=1 \
+                 (writer leases fence the WAL write path through basin-shard)"
+            ));
+        }
+        let replica_id = std::env::var("BASIN_REPLICA_ID")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         #[cfg(feature = "auth")]
         let auth_enabled = bool_env("BASIN_AUTH_ENABLED");
         #[cfg(feature = "rest")]
@@ -739,6 +815,8 @@ impl Cfg {
             wal_dir,
             shard_enabled,
             pool_enabled,
+            lease_mode,
+            replica_id,
             #[cfg(feature = "auth")]
             auth_enabled,
             #[cfg(feature = "rest")]

@@ -53,8 +53,8 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, instrument, warn};
 
 use crate::{
-    ProjectHandle, ProjectHandleImpl, ShardBackgroundHandle, ShardConfig, ShardImpl, ShardStats,
-    TopPatternProvider,
+    LeaseMode, ProjectHandle, ProjectHandleImpl, ShardBackgroundHandle, ShardConfig, ShardImpl,
+    ShardStats, TopPatternProvider,
 };
 
 /// Per-(project, partition) in-memory state. Lives behind an `RwLock` inside
@@ -252,9 +252,20 @@ impl InProcessShard {
 
     /// Acquire (or refresh) the lease for `(project, partition)` on first
     /// access when a lease registry is configured. Records the granted epoch
-    /// in `held_leases`. No-op (returns Ok) in no-lease mode. Returns an error
-    /// only if a *different* replica holds a live lease — the caller can't
-    /// own this partition right now.
+    /// in `held_leases`. No-op (returns Ok) in no-lease mode.
+    ///
+    /// Failure semantics depend on [`LeaseMode`]:
+    ///
+    /// - [`LeaseMode::Off`] (the Phase 6.X.A behaviour every existing lease
+    ///   test pins): returns an error if a *different* replica holds a live
+    ///   lease, and propagates coordinator errors — the caller can't own
+    ///   this partition right now.
+    /// - [`LeaseMode::Required`] (multi-node phase 1): never blocks the
+    ///   caller. Acquire failures (peer holds it / coordinator unreachable)
+    ///   return `Ok` **without** recording an epoch, so reads through the
+    ///   returned handle continue while the write path fails closed with
+    ///   [`BasinError::LeaseNotHeld`] (`write_batch_inner` refuses epoch-less
+    ///   writes in required mode).
     async fn ensure_lease(&self, project: &ProjectId, partition: &PartitionKey) -> Result<()> {
         let Some(registry) = &self.cfg.lease_registry else {
             return Ok(());
@@ -266,15 +277,41 @@ impl InProcessShard {
                 return Ok(());
             }
         }
-        match registry
+        let acquired = match registry
             .acquire(
                 project,
                 partition.as_str(),
                 &self.cfg.replica_id,
                 self.cfg.lease_ttl,
             )
-            .await?
+            .await
         {
+            Ok(a) => a,
+            Err(e) => {
+                if self.cfg.lease_mode == LeaseMode::Required {
+                    // Required mode: the coordinator is unreachable. Reads
+                    // must continue (the handle is still served); writes
+                    // fail closed because no epoch is recorded — the write
+                    // path refuses epoch-less writes with `LeaseNotHeld`.
+                    if let Some(m) = &self.cfg.lease_metrics {
+                        m.record_acquire(
+                            &self.cfg.replica_id,
+                            basin_common::AcquireResult::Failed,
+                        );
+                    }
+                    warn!(
+                        %project,
+                        %partition,
+                        error = %e,
+                        "lease acquire failed (coordinator unreachable); \
+                         reads continue, writes refused until a lease is held",
+                    );
+                    return Ok(());
+                }
+                return Err(e);
+            }
+        };
+        match acquired {
             Some(lease) => {
                 let mut held = self.held_leases.lock().await;
                 held.insert((*project, partition.clone()), lease.epoch);
@@ -299,6 +336,19 @@ impl InProcessShard {
                         &self.cfg.replica_id,
                         basin_common::AcquireResult::Failed,
                     );
+                }
+                if self.cfg.lease_mode == LeaseMode::Required {
+                    // Required mode: a peer holds a live lease. Serve the
+                    // handle anyway so reads continue; no epoch is recorded,
+                    // so the write path refuses with `LeaseNotHeld` until
+                    // the lease is acquired (e.g. after the peer's TTL).
+                    warn!(
+                        %project,
+                        %partition,
+                        "lease held by another replica; reads continue, \
+                         writes refused on this replica",
+                    );
+                    return Ok(());
                 }
                 Err(BasinError::CommitConflict(format!(
                     "lease for {project}/{partition} held by another replica"
@@ -2805,6 +2855,21 @@ impl InProcessProjectHandle {
             let held = self.held_leases.lock().await;
             held.get(&(self.project, self.partition.clone())).copied()
         };
+        // Multi-node phase 1 (BASIN_LEASE_MODE=required): a write may only
+        // proceed under a held writer lease. No epoch means the lease was
+        // never granted, the heartbeat lost it (renew failed / CAS stolen),
+        // or the coordinator is unreachable — in every case the write is
+        // refused with the typed `LeaseNotHeld` *before* it reaches the WAL,
+        // so no LSN is consumed and the router can re-resolve the owner and
+        // retry. Reads are unaffected (they never pass through here). Off
+        // mode keeps the Phase 6.X.A fallback: epoch-less writes append
+        // unfenced, exactly as before.
+        if epoch.is_none() && self.cfg.lease_mode == LeaseMode::Required {
+            return Err(BasinError::lease_not_held(format!(
+                "{}/{}",
+                self.project, self.partition
+            )));
+        }
         let lsn = if durable {
             self.cfg
                 .wal

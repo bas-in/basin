@@ -130,6 +130,18 @@ pub enum BasinError {
     #[error("lease handoff in progress: {0}")]
     LeaseHandoffInProgress(String),
 
+    /// Multi-node phase 1 (ADR 0023) — `BASIN_LEASE_MODE=required`: this
+    /// replica does not (or no longer) hold the writer lease for the target
+    /// `(project, partition)`, so the write is refused before it reaches the
+    /// WAL. Raised when the lease was never granted (another replica owns
+    /// it), when the heartbeat lost the lease (renew failed / CAS stolen),
+    /// or when the lease coordinator is unreachable — fail-closed for
+    /// writes. Reads are never blocked by this error. Routers treat it as
+    /// **retryable** (same class as a commit conflict): re-resolve the
+    /// owner and retry there. The message names the partition.
+    #[error("writer lease not held: {0}")]
+    LeaseNotHeld(String),
+
     /// A statement waited for a row or table lock longer than
     /// `lock_timeout` allows. Router maps to SQLSTATE `55P03`
     /// (`lock_not_available`), matching PostgreSQL's behaviour when
@@ -228,6 +240,15 @@ impl BasinError {
     /// can extract the affected partition on retry.
     pub fn lease_handoff_in_progress(msg: impl Into<String>) -> Self {
         Self::LeaseHandoffInProgress(msg.into())
+    }
+
+    /// Multi-node phase 1 — typed constructor for the
+    /// `BASIN_LEASE_MODE=required` write refusal. Callers should set `msg`
+    /// to `"{project}/{partition}"` (same convention as
+    /// [`Self::lease_handoff_in_progress`]) so the router can re-resolve
+    /// the owner on retry.
+    pub fn lease_not_held(msg: impl Into<String>) -> Self {
+        Self::LeaseNotHeld(msg.into())
     }
 
     /// Phase 5.28.B — typed constructor for `lock_timeout` expiry.
