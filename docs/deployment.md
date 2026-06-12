@@ -39,7 +39,7 @@ basin-server is a single process. To deploy it you set:
 | `BASIN_BIND` | pgwire listener, e.g. `0.0.0.0:5433` |
 | `BASIN_CATALOG` | Catalog backend: `memory` (default — **volatile**, all catalog state lost on restart; dev/test only) or a Postgres connection string (`postgres://…` or libpq keyword form) for durable production deploys. `BASIN_CATALOG_SCHEMA` picks the schema (default `basin_catalog`). |
 | `BASIN_DATA_DIR` | Vortex (default) / Parquet data directory (durable volume) |
-| `BASIN_WAL_DIR` | WAL directory (durable volume, ideally NVMe) |
+| `BASIN_WAL_DIR` | WAL directory (durable volume, ideally NVMe). In raft mode, raft log/vote/snapshot persist under `${BASIN_WAL_DIR}/raft`. |
 | `BASIN_PROJECTS` | Static project list, e.g. `acme=*,beta=*`. |
 | `BASIN_AUTH_ENABLED=1` | Enables the auth subsystem (signup, JWT, refresh). Per [ADR 0013](./decisions/0013-auth-per-project-schema.md), auth state lives in each project's own storage under the `basin_auth` schema prefix and is reached in-process (`EngineAuthStore` over `ProjectSession`) — no loopback pgwire connection, no reserved internal project, no separate database. SMTP vars from [ADR 0005](./decisions/0005-auth-system.md) become required when this is on. |
 | `BASIN_AUTH_CATALOG_DSN` | Optional escape hatch (ADR 0013): point auth state at an external pgwire-speaking Postgres for separate blast radius. Unset = the default in-process per-project-schema path. |
@@ -49,6 +49,75 @@ deploy needs one external Postgres for the catalog (`BASIN_CATALOG=postgres://�
 the `memory` default is volatile and suitable only for dev/test. Auth state
 needs no separate database (ADR 0013). See `BASIN_BIND` / `BASIN_DATA_DIR`
 in [`../README.md`](../README.md) for the boot example.
+
+---
+
+## Raft / lease knobs (multi-node)
+
+The knobs below are additive: every other env var and behavior from the
+table above is unchanged when these are set. They require
+`BASIN_SHARD_ENABLED=1`.
+
+### WAL durability mode
+
+| Var | Values | Purpose |
+|---|---|---|
+| `BASIN_WAL_MODE` | `local` (default) \| `raft` | `local` is the unchanged single-node file-backed WAL. `raft` opens a `RaftWal` (openraft) whose durability boundary is a quorum ack from a majority of the cluster. Any other value is a **startup error** (strict parse — a typo must not silently downgrade durability). `raft` requires `BASIN_SHARD_ENABLED=1`, `BASIN_RAFT_BIND`, and `BASIN_RAFT_PEERS` or the server refuses to start. |
+
+### Raft cluster identity (required when `BASIN_WAL_MODE=raft`)
+
+| Var | Purpose |
+|---|---|
+| `BASIN_NODE_ID` | This node's stable numeric raft id (positive `u64`). Must appear in `BASIN_RAFT_PEERS`. Must be unique across all nodes in the cluster. |
+| `BASIN_RAFT_BIND` | This node's raft gRPC listen address, e.g. `10.0.0.1:6010`. Must match the address registered for `BASIN_NODE_ID` in `BASIN_RAFT_PEERS` — the server validates this at startup and refuses to start on a mismatch. |
+| `BASIN_RAFT_PEERS` | Comma-separated `id@host:port` list of **all** cluster voters including this node, e.g. `1@10.0.0.1:6010,2@10.0.0.2:6010,3@10.0.0.3:6010`. The same value should be set on every node. Duplicate ids are a startup error. |
+| `BASIN_RAFT_BOOTSTRAP` | Set to `1` on **exactly one** node for the initial cluster bring-up. The designated node calls `initialize` with the full peer set when its raft log is empty. On subsequent restarts with a non-empty log this flag is silently ignored — `initialize` is skipped (source: `build_raft_wal` in `main.rs` gates on `last_log_index == 0 && commit_index == 0`). Do not set on more than one node — you will initialize two disjoint clusters. |
+
+Validation at startup (`parse_raft_env` in `main.rs`): `BASIN_NODE_ID`
+must be > 0; `BASIN_RAFT_PEERS` must be non-empty; the node's own id
+must appear in the peer list with an address matching `BASIN_RAFT_BIND`;
+duplicate ids are rejected. Config errors are hard startup failures, not
+warnings.
+
+**v1 caveats:**
+
+- **Plaintext gRPC, no peer authentication.** The tonic transport
+  (`crates/basin-wal/src/raft_net`) ships with no TLS and no peer
+  verification. The raft port must only be reachable on a private
+  network. mTLS is the follow-up — `raft_net/mod.rs` documents the
+  tonic `tls_config` seam.
+- **Single-region only.** One raft group covers all projects in the
+  region. Multi-region raft is a separate phase.
+- **`GET /admin/v1/cluster` not yet wired.** `RaftWal::cluster_status()`
+  exists and is logged at startup; the HTTP route is an open seam in
+  `main.rs` (`let _ = &raft_wal` with a TODO comment). Use the startup
+  log for cluster observability until the route lands.
+- **Per-project counters not plumbed through raft.** `attach_project_counters`
+  is a no-op in `RaftWal`; per-project ops metrics in raft mode are a
+  follow-up.
+
+### Writer leases (optional, `BASIN_WAL_MODE=local` use-case)
+
+| Var | Values | Purpose |
+|---|---|---|
+| `BASIN_LEASE_MODE` | `off` (default) \| `required` | `off` is the unchanged single-replica behaviour (no enforcement). `required` wires the catalog's `LeaseRegistry` into the shard: each `(project, partition)` must hold a writer lease before writes proceed; a `LeaseNotHeld` (SQLSTATE 40001, retryable) is returned otherwise. Requires `BASIN_SHARD_ENABLED=1` — a startup error otherwise. |
+| `BASIN_REPLICA_ID` | any string | Stable lease-holder id for this node. Default: `host:pid:salt` (changes on restart). Set a stable value for predictable lease-transfer on rolling restarts. |
+| `BASIN_LEASE_TTL_SECS` | `15` (default) | Lease TTL. A node that stops heartbeating loses its lease after this window; peers can steal it. |
+| `BASIN_LEASE_RENEW_SECS` | `5` (default) | Heartbeat cadence. The background renewal loop (shared with compaction/eviction) pings the catalog on this interval. |
+
+**Precedence:** when `BASIN_WAL_MODE=raft` and `BASIN_LEASE_MODE=required`
+are both set, raft leadership is the write fence and **supersedes the
+lease**. The server logs `"lease mode: required — but BASIN_WAL_MODE=raft
+is set; raft leadership supersedes the writer lease"` and wires both — but
+a non-leader write is refused by the raft check before the lease is
+consulted. The lease registry is wired but redundant. Source:
+`services/basin-server/src/main.rs` (lease-mode wiring block).
+
+### Per-project connection ceiling
+
+| Var / Route | Purpose |
+|---|---|
+| `POST /admin/v1/projects/:id/max-connections` | Set the per-project pgwire connection ceiling. Enforced on every new connection via `CatalogConnectionLimitProvider` + `ConnectionLimiter`. Exceeding the ceiling returns SQLSTATE `53300` (`too_many_connections`). Default for projects with no stored ceiling: 25 (Free tier). Source: `services/basin-server/src/main.rs` (connection-limiter wiring), `crates/basin-router/src/connection_limit.rs`. |
 
 ---
 
@@ -370,5 +439,8 @@ Pre-restart: empty result set. Post-restart: the 8 tables from
 - [ADR 0001 — Single-region only](./decisions/0001-single-region-only.md)
 - [ADR 0004 — Multi-region read replicas](./decisions/0004-multi-region-read-replicas.md)
 - [ADR 0008 — Noisy-neighbor fairness](./decisions/0008-noisy-neighbor-fairness.md)
+- [ADR 0023 — Leases and partition routing](./decisions/0023-leases-and-partition-routing.md)
+- [`runbooks/failover.md`](./runbooks/failover.md) — raft-mode 3-node walkthrough, leader-loss behavior, procedures
+- [`runbooks/durability.md`](./runbooks/durability.md) — WAL mode durability ladder
 - [`TASK.md`](../TASK.md) — Phase 6 production hardening checklist
 - [`CAPABILITIES.md`](../CAPABILITIES.md) — what's shipped vs deferred

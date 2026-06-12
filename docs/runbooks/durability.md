@@ -39,7 +39,33 @@ routing, in-tx COMMIT path), `crates/basin-engine/src/dml_mutate.rs`
 
 ---
 
-## WAL durability mechanics (shard path)
+## WAL durability modes
+
+Two WAL durability backends are selectable via `BASIN_WAL_MODE`:
+
+| Mode | Durability boundary | `durable_lsn` advances when | Crash loss window |
+|---|---|---|---|
+| `local` (default) | Local fsync (or S3 PUT) on the single writer | WAL segment PUT + optional fsync completes | ≤ 200 ms of async INSERTs; sync-commit acks survive |
+| `raft` | Quorum commit — 2 of 3 nodes must persist the entry | `client_write` returns (raft `ForwardToLeader` / `RaftNoQuorum` → SQLSTATE 40001 retryable on failure) | ≤ 200 ms of async INSERTs (quorum acked before raft commit); sync-commit acks survive because `append` blocks until quorum |
+
+In `raft` mode `BASIN_WAL_BACKEND` is **not consulted** for the WAL.
+Raft manages its own persistence under `${BASIN_WAL_DIR}/raft` using
+`DiskRaftStorage` (same segment framing as the file WAL; fsync'd vote
+meta file; manifest-anchored snapshots). The WAL's `flush_interval` and
+`flush_max_bytes` constants are also not in play for the raft path:
+durability is the raft quorum commit, not a timed flush.
+
+The local-fsync caveat (`FsyncOnPut` for sync-commit, no fsync for async)
+applies only to `BASIN_WAL_MODE=local`. See the section below for details.
+
+Source: `crates/basin-wal/src/raft_wal.rs` (`DurabilityBackend` trait
+and `RaftDurability::commit_batch`, which blocks on `propose_batch` →
+`client_write` → quorum ack), `services/basin-server/src/main.rs`
+(`build_raft_wal`, `WalMode` enum).
+
+---
+
+## WAL durability mechanics (local mode)
 
 From `crates/basin-wal/src/file_wal.rs` and `state.rs`:
 
@@ -152,16 +178,17 @@ crates it wires:
 | Env var | Default | Effect |
 |---|---|---|
 | `BASIN_SHARD_ENABLED` | `0` | `1` routes INSERTs through the WAL + compactor. Off = legacy synchronous Parquet path. |
+| `BASIN_WAL_MODE` | `local` | `local` = file-backed single-node WAL (default, unchanged). `raft` = quorum-replicated WAL; requires `BASIN_SHARD_ENABLED=1` and the raft topology env (see [deployment.md](../deployment.md#raft--lease-knobs-multi-node)). Any other value is a startup error. |
 | `BASIN_CATALOG` | `memory` | **`memory` is volatile** — all table metadata is lost on restart. Set a `postgres://…` DSN for anything you want to restore. |
 | `BASIN_CATALOG_SCHEMA` | `basin_catalog` | Schema for the Postgres catalog tables. |
-| `BASIN_WAL_DIR` | `${BASIN_DATA_DIR}/wal` | Local WAL directory (when WAL backend is `local`). |
-| `BASIN_WAL_BACKEND` | mirrors `BASIN_STORAGE_BACKEND`, else `local` | `local` wraps the store in `FsyncOnPut`; `s3`/`tigris` are durable on PUT and run unwrapped. |
-| `BASIN_WAL_ROOT_PREFIX` | `BASIN_STORAGE_ROOT_PREFIX` | Bucket sub-prefix; segments live at `{prefix}/wal/{project}/{partition}/{ulid}.seg`. |
-| `BASIN_WAL_COMMIT_DELAY_MS` | `2` | Group-commit coalescing window for synchronous appends. `0` disables coalescing. |
-| `BASIN_SYNCHRONOUS_COMMIT` | unset (= `off`) | Engine-wide default for the `basin.synchronous_commit` GUC. |
+| `BASIN_WAL_DIR` | `${BASIN_DATA_DIR}/wal` | Local WAL directory (when WAL backend is `local`). In raft mode the raft log/vote/snapshot persist under `${BASIN_WAL_DIR}/raft`. |
+| `BASIN_WAL_BACKEND` | mirrors `BASIN_STORAGE_BACKEND`, else `local` | `local` wraps the store in `FsyncOnPut`; `s3`/`tigris` are durable on PUT and run unwrapped. **Not consulted in raft mode** — raft manages its own persistence. |
+| `BASIN_WAL_ROOT_PREFIX` | `BASIN_STORAGE_ROOT_PREFIX` | Bucket sub-prefix; segments live at `{prefix}/wal/{project}/{partition}/{ulid}.seg`. Local-mode only. |
+| `BASIN_WAL_COMMIT_DELAY_MS` | `2` | Group-commit coalescing window for synchronous appends (local mode only). `0` disables coalescing. |
+| `BASIN_SYNCHRONOUS_COMMIT` | unset (= `off`) | Engine-wide default for the `basin.synchronous_commit` GUC. In raft mode `SET basin.synchronous_commit = on` still works: `append` already blocks until quorum, so both modes are durable-at-ack when this is on. |
 | `BASIN_STORAGE_BACKEND` | `local` | Data object store. `s3`/`tigris` recommended for production durability. |
-| WAL `flush_interval` | 200 ms | **Not env-tunable** — hardcoded in `basin-server` `main.rs`. The async-commit loss window. |
-| WAL `flush_max_bytes` | 1 MiB | **Not env-tunable** — buffer-pressure flush threshold. |
+| WAL `flush_interval` | 200 ms | **Not env-tunable** — hardcoded in `basin-server` `main.rs`. The async-commit loss window in local mode. Not relevant in raft mode (quorum is the boundary). |
+| WAL `flush_max_bytes` | 1 MiB | **Not env-tunable** — buffer-pressure flush threshold (local mode). |
 | Shard `compaction_interval` | 30 s | **Not env-tunable** — WAL tail → Parquet/Vortex drain cadence (`ShardConfig::new`). |
 | `BASIN_OVERLAY_RECONCILE_SECS` | `5` | Overlay-drain tick; `0` disables the reconciler (not recommended). |
 | `BASIN_OVERLAY_RECONCILE_BYTES` | 8 MiB | Dirty-overlay bytes trigger. |
@@ -177,9 +204,10 @@ crates it wires:
 
 | You need | Do this |
 |---|---|
-| Zero-loss INSERT acks | `SET basin.synchronous_commit = on` (or `BASIN_SYNCHRONOUS_COMMIT=on` server-wide) |
-| Zero-loss point UPDATE/DELETE acks | `BASIN_HOTTIER_FASTPATH_DISABLE=1` (pays the cold-path latency) |
-| Survive node loss without the WAL volume | `BASIN_WAL_BACKEND=s3` (WAL segments on the object store) |
+| Zero-loss INSERT acks (single node) | `SET basin.synchronous_commit = on` (or `BASIN_SYNCHRONOUS_COMMIT=on` server-wide) |
+| Zero-loss INSERT acks + node-loss tolerance | `BASIN_WAL_MODE=raft` (quorum durability; see [deployment.md](../deployment.md#raft--lease-knobs-multi-node) and v1 caveats in [failover.md](./failover.md#raft-mode-3-node-deployment)) |
+| Zero-loss point UPDATE/DELETE acks | `BASIN_HOTTIER_FASTPATH_DISABLE=1` (pays the cold-path latency; not mitigated by raft mode — the overlay is not WAL-logged in either mode) |
+| Survive node loss without the WAL volume (local mode) | `BASIN_WAL_BACKEND=s3` (WAL segments on the object store) |
 | Survive restart at all | `BASIN_CATALOG=postgres://…` — the memory catalog is volatile |
 | Survive power loss on a single box | S3-compatible data + WAL backends, or accept the local-FS caveat |
 
@@ -188,7 +216,9 @@ crates it wires:
 ## Cross-references
 
 - [restore.md](./restore.md) — backup + restore procedures built on these boundaries.
-- [failover.md](./failover.md) — node loss, recovery, split-brain.
+- [failover.md](./failover.md) — node loss, recovery, split-brain; raft-mode 3-node procedures.
+- [deployment.md](../deployment.md) — env table for raft/lease/node knobs with v1 caveats.
 - [ADR 0020 — WAL transaction markers + replay suppression](../decisions/0020-wal-transaction-markers.md)
 - [ADR 0016 — HTAP hot tier architecture](../decisions/0016-htap-hot-tier-architecture.md)
 - `crates/basin-wal/src/lib.rs` — the `Wal` trait's documented durability contracts.
+- `crates/basin-wal/src/raft_wal.rs` — `RaftWal`, `DurabilityBackend`, quorum-commit semantics.

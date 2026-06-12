@@ -1,29 +1,32 @@
 ---
-title: "Failover runbook — node loss and recovery (single-writer)"
+title: "Failover runbook — node loss and recovery"
 nav_section: operations
 sidebar_position: 56
-summary: "Operator runbook for losing and recovering a Basin node on today's single-writer deployment shape: detection, restart, WAL replay expectations, split-brain risk, and the lease/Raft roadmap."
-tags: [operations, failover, recovery, wal, leases, runbooks]
+summary: "Operator runbook for losing and recovering a Basin node: single-writer (default), raft-mode 3-node setup, leader-loss behavior, split-brain guards, and cross-references."
+tags: [operations, failover, recovery, wal, leases, raft, runbooks]
 ---
 
 # Failover runbook — node loss and recovery
 
 What to do when a `basin-server` process or its machine dies, what
-recovery actually does, and what you must not do (run two writers).
+recovery actually does, and what you must not do.
 
-> **Deployment reality check.** The shipped `basin-server` binary is a
-> **single-writer** process per catalog + bucket + WAL prefix. The
-> lease-based multi-replica ownership system (ADR 0023) exists in the
-> crates and is exercised by tests, but `basin-server` does **not** wire
-> a lease registry today (`ShardConfig::new` leaves
-> `lease_registry: None`; nothing in `services/basin-server/src/main.rs`
-> calls `with_lease_registry`). The WAL's epoch fencing is therefore
-> dormant in production: every append runs in no-lease mode
-> (`epoch = None`) and is accepted unconditionally. "Failover" today
-> means **restart or replace the one writer** — not promote a standby.
+Two deployment shapes are supported as of the multi-node commit. The
+**single-writer** shape remains the default. The **raft-mode** 3-node
+shape is now shippable but carries v1 caveats (see below). Pick the
+section that matches your deployment.
+
+> **Which shape are you running?** If `BASIN_WAL_MODE` is unset or
+> `local`, you are in single-writer mode — skip to [single-writer
+> procedures](#single-writer-shape-default). If `BASIN_WAL_MODE=raft`,
+> read the [raft-mode section](#raft-mode-3-node-deployment) first.
 
 Read [durability.md](./durability.md) for what each ack means; this
 runbook assumes that vocabulary.
+
+---
+
+## Single-writer shape (default)
 
 ---
 
@@ -147,17 +150,19 @@ Hardening for this scenario, in order of value:
 
 ---
 
-## Split-brain: the rule and why
+## Split-brain: the rule and why (single-writer)
 
 **Never run two `basin-server` writer processes against the same
 catalog + bucket + WAL prefix.**
 
-Today there is **no enforcement** stopping you:
+In single-writer mode (`BASIN_WAL_MODE=local`, the default) there is
+**no enforcement** stopping you:
 
 - No lease is acquired or checked at startup or on write —
-  `basin-server` constructs the shard without a lease registry, so the
-  per-partition epoch fence in the WAL never rejects anything (no-lease
-  appends pass `epoch = None` and are "accepted unconditionally" —
+  `basin-server` only wires the lease registry when
+  `BASIN_LEASE_MODE=required`. Without that knob the per-partition epoch
+  fence in the WAL never rejects anything (no-lease appends pass
+  `epoch = None` and are accepted unconditionally —
   `crates/basin-wal/src/file_wal.rs`).
 - Two writers will both recover the same WAL high-water mark and then
   **assign overlapping LSNs** to different entries, interleave segments
@@ -178,10 +183,13 @@ Operational corollaries:
 - Read scale-out is a different topic — see
   [scaling/read-replicas.md](../scaling/read-replicas.md); this rule is
   about **writers**.
+- In raft mode the raft leader IS the write fence — a non-leader write
+  is refused before it reaches the WAL, so the split-brain class changes
+  character: see [raft-mode split-brain](#raft-mode-split-brain).
 
 ---
 
-## Failure modes summary
+## Failure modes summary (single-writer)
 
 | Failure | Impact | Recovery | Bound |
 |---|---|---|---|
@@ -194,49 +202,230 @@ Operational corollaries:
 
 ---
 
-## Forward-looking: multi-replica failover (not shipped in the binary)
+## Raft-mode 3-node deployment
 
-The architecture for real failover exists and is tested at the crate
-level — operators should know the shape, and should not mistake it for
-something they can enable today:
+`BASIN_WAL_MODE=raft` (requires `BASIN_SHARD_ENABLED=1`) replaces the
+local file-backed WAL with a quorum-replicated WAL via `openraft`. Every
+`append` blocks until the log entry is committed by a majority (2 of 3);
+`durable_lsn` advances on raft commit rather than on a local fsync
+watermark. The raft log, vote, and manifest snapshot persist under
+`${BASIN_WAL_DIR}/raft` — a node that restarts against the same
+directory rejoins with its hard state intact.
 
-- **Leases + epoch fencing (ADR 0023).** `basin-shard` supports a
-  Postgres-backed `LeaseRegistry` (`ShardConfig::with_lease_registry`):
-  replicas acquire per-`(project, partition)` leases, heartbeat-renew
-  every `BASIN_LEASE_RENEW_SECS` (default 5 s), and lose state on a
-  failed renew; peers steal on expiry after `BASIN_LEASE_TTL_SECS`
-  (default 15 s). Every fenced WAL append carries the holder's epoch and
-  stale-epoch appends are rejected — that is the dual-writer guard the
-  single-writer deployment lacks. The multi-process behaviour is
-  validated by the harness in
-  [operators/multi-instance-test.md](../operators/multi-instance-test.md),
-  and day-2 ops for the lease system are pre-written in
-  [operators/lease-ownership.md](../operators/lease-ownership.md).
-  **Gap:** `basin-server` does not yet construct the registry or expose
-  an env switch for it.
-- **Raft WAL.** `RaftWal` (openraft) implements the same `Wal` trait
-  with quorum-ack durability, but only inside a **single-process
-  simulation cluster** (`SimCluster`) — 3-node, leader-failure, and
-  quorum-commit tests pass; cross-process networking and persisted Raft
-  state are v0.2 (`crates/basin-wal/RAFT.md`, `CAPABILITIES.md`). It is
-  not a production durability boundary today.
-- **Multi-region** stays "by deployment, not by code" —
-  [ADR 0009](../decisions/0009-multi-region-architecture.md) locks
-  regional Raft WALs + S3 CRR as the direction;
-  [ADR 0010](../decisions/0010-catalog-replication.md) covers the
-  catalog side.
+Source: `crates/basin-wal/src/raft_wal.rs` (module header + `RaftWal`
+impl) and `services/basin-server/src/main.rs` (`build_raft_wal`).
 
-When the lease wiring ships in `basin-server`, the failover story
-upgrades from "restart the single writer" to "peers steal expired
-leases within TTL" and the lease-ownership runbook becomes the
-operative document. Until then, this runbook is.
+### v1 caveats (honest bar)
+
+- **Transport: plaintext gRPC, no peer authentication.** The tonic
+  transport (`crates/basin-wal/src/raft_net`) is functional but ships
+  with no confidentiality and no peer auth. The cluster network is
+  assumed to be a private VPC or internal mesh; `BASIN_RAFT_BIND` must
+  not be exposed publicly. mTLS is the documented follow-up —
+  `raft_net/mod.rs` names the tonic `tls_config` seam.
+- **Single-region only.** One raft group per region, matching
+  [ADR 0009](../decisions/0009-multi-region-architecture.md). Multi-region
+  raft and catalog replication are separate phases.
+- **Bootstrap-once semantics.** Set `BASIN_RAFT_BOOTSTRAP=1` on exactly
+  one node for the initial cluster bring-up. On restart of the bootstrap
+  node `initialize` is skipped when the raft log is non-empty
+  (`build_raft_wal` gates on `last_log_index == 0 && commit_index == 0`).
+  Do not set `BASIN_RAFT_BOOTSTRAP=1` on more than one node in the same
+  cluster — you will initialize two disjoint clusters.
+- **`GET /admin/v1/cluster` is not yet wired.** The `RaftWal::cluster_status()`
+  surface exists and the startup log emits a full cluster status line; the
+  HTTP route is a documented seam in `main.rs` awaiting a follow-up PR.
+  Use the startup log for cluster observability for now.
+- **Per-project counters not wired through `RaftWal::append`.** The
+  `attach_project_counters` impl is a no-op; per-project metrics in raft
+  mode are a follow-up.
+
+### 3-node setup walkthrough
+
+Pick three machines (or Fly machines) in the same region on a private
+network. Assign each a stable raft node id (positive `u64`; node ids 1,
+2, 3 work fine). Choose their raft gRPC listen addresses — these must be
+reachable among the three nodes but need not be reachable by clients.
+
+```text
+Node 1: BASIN_NODE_ID=1  BASIN_RAFT_BIND=10.0.0.1:6010
+Node 2: BASIN_NODE_ID=2  BASIN_RAFT_BIND=10.0.0.2:6010
+Node 3: BASIN_NODE_ID=3  BASIN_RAFT_BIND=10.0.0.3:6010
+```
+
+Required env on every node (`BASIN_RAFT_PEERS` is the same string on
+all three):
+
+```sh
+BASIN_SHARD_ENABLED=1
+BASIN_WAL_MODE=raft
+BASIN_RAFT_PEERS=1@10.0.0.1:6010,2@10.0.0.2:6010,3@10.0.0.3:6010
+```
+
+Start order:
+
+1. Start node 1 **with** `BASIN_RAFT_BOOTSTRAP=1`. It initializes the
+   cluster with all three peers as voters and elects itself leader.
+2. Start nodes 2 and 3 **without** `BASIN_RAFT_BOOTSTRAP`. They contact
+   node 1 and catch up via raft log replication.
+3. Confirm in the startup logs: look for `raft cluster status` lines on
+   each node with `role=leader` (once) or `role=follower` (twice) and
+   `members=3`.
+
+In production, route pgwire write traffic to the current leader. Reads
+can land anywhere (followers serve reads from their replicated state
+machine). The router re-resolves the leader on a `LeaseNotHeld` /
+`RaftNoQuorum` (SQLSTATE 40001) response and retries.
+
+### What changes vs. single-writer
+
+| Aspect | Single-writer (`local`) | Raft mode |
+|---|---|---|
+| Write fence | None (local node always accepts) | Raft leadership — non-leader writes refused before reaching the WAL |
+| Durability boundary | Local fsync (or S3 PUT) on this node | Quorum commit: 2 of 3 nodes must persist the entry |
+| `durable_lsn` advances when | WAL segment PUT succeeds | Raft `client_write` returns (quorum committed) |
+| `BASIN_WAL_BACKEND` | Selects the local file-WAL store | Ignored in raft mode — raft manages its own persistence under `${BASIN_WAL_DIR}/raft` |
+| Node loss | Restart same node with same env | Cluster stays available (2 of 3 survive); replace lost node per procedure below |
+| Split-brain guard | None in local mode | Raft leader election is the guard; see [raft-mode split-brain](#raft-mode-split-brain) |
+| Hot-tier overlay window | Unchanged: ~15–60 s unguarded | Unchanged: overlay is not WAL-logged in either mode |
+
+### Leader-loss behavior (verified by drills)
+
+The failover drills in
+`crates/basin-wal/tests/raft_failover_drills.rs` run against real
+disk-backed `RaftWal` nodes with a `SimCluster` in-process mesh. The
+four drills cover the behaviors operators can rely on:
+
+1. **Leader killed → new leader elected → writes continue, none lost.**
+   (`drill_kill_leader_elects_new_and_continues_writes`) Writes that
+   were acked before the kill are present on the surviving leader after
+   election. Default election timeout: 1 500 ms (1 500–3 000 ms
+   randomized; `election_timeout_ms = 1500`,
+   `election_timeout_max = 2 × min`). Expect writes to block for up to
+   one election timeout (~1.5–3 s) then resume on the new leader.
+
+2. **Killed node restarts → catches up → write set identical.**
+   (`drill_restart_killed_node_catches_up`) A node that was down while
+   the rest of the cluster wrote entries rejoins and replicates the
+   missing log via raft log replication or snapshot install. The
+   recovered node's state is byte-identical to the acked set.
+
+3. **Partitioned follower → cluster healthy, partitioned node rejects
+   writes.** (`drill_partitioned_follower_rejected_cluster_healthy`) A
+   follower that cannot reach the leader cannot win an election (no
+   quorum), so its `append` returns the typed retryable error rather
+   than silently committing a divergent entry. The remaining two nodes
+   (leader + one follower) continue to commit writes normally.
+
+4. **Non-leader write refused with typed not-leader error + leader
+   hint.** (`drill_non_leader_write_redirect_contract`) A follower's
+   `append` returns `BasinError::LeaseNotHeld` (SQLSTATE 40001) with a
+   message containing `"not raft leader"` and a `"leader hint"` pointing
+   at the current leader. The router uses this hint to re-resolve and
+   retry.
+
+### Procedure: replace a lost node (raft mode)
+
+A raft cluster of 3 can absorb the loss of 1 node and remain available
+(majority = 2). Recovery does not require stopping the cluster.
+
+1. **Confirm the lost node is gone.** The surviving two nodes continue
+   to commit writes; verify with the startup log's cluster-status lines
+   (`role=leader` / `role=follower` on the two survivors, `members=3`
+   still — raft remembers the membership configuration).
+2. **Provision a replacement** on a new machine with the same
+   `BASIN_NODE_ID` as the lost node and the same `BASIN_RAFT_PEERS` and
+   `BASIN_RAFT_BIND`. Give it a **fresh** `BASIN_WAL_DIR` (or the
+   original directory if the volume survived). Do **not** set
+   `BASIN_RAFT_BOOTSTRAP=1` — the cluster is already initialized.
+3. **Start the replacement.** It contacts the leader, learns the current
+   membership, and replicates the log from the snapshot forward. This is
+   automatic; no operator command is needed.
+4. **Verify.** Watch for `role=follower` in the replacement's startup
+   log and `members=3` on all surviving nodes.
+
+If the replacement has a non-empty raft log from the original volume,
+it rejoins cleanly — `initialize` is skipped (non-empty log), and it
+catches up any missing tail via the leader.
+
+### Procedure: planned restart (raft mode)
+
+1. Quiesce writes to the node you are restarting (drain the LB for that
+   node, or let the router re-direct to the leader after `LeaseNotHeld`).
+2. `SIGINT` the process — shutdown calls `wal.close()` which calls
+   `raft.shutdown()` cleanly. Pending writes that were already
+   quorum-committed survive; in-flight async INSERT acks not yet
+   quorum-committed are lost per the same windows as single-writer.
+3. Start; the node rejoins with its hard state from `${BASIN_WAL_DIR}/raft`.
+4. Verify `role=follower` in the startup log.
+
+Quiescing writes is not required for availability (the other two nodes
+keep quorum), but it bounds client-visible errors to the restart window
+for connections pinned to this node.
+
+### <a name="raft-mode-split-brain"></a>Raft-mode split-brain
+
+Raft's leader election is the structural split-brain guard: only the
+leader can commit entries. A non-leader write is refused before it
+reaches the WAL (`RaftWal::append` checks `is_leader()` first, then
+`client_write` additionally rejects it at the protocol level).
+`map_client_write_err` in `raft_wal.rs` maps `ForwardToLeader` to the
+retryable `RaftNoQuorum` — always a typed `Err`, never a silent commit.
+
+The residual risk is the brief window between a leader being deposed
+and learning it is deposed (one heartbeat interval, 500 ms default):
+`is_leader()` reads local raft metrics and may briefly return `true` on
+a stale leader. The `client_write` call downstream then fails with
+`ForwardToLeader` (the raft protocol rejects it), so the window is
+safe — a stale-leader write still fails closed.
+
+Operationally: in raft mode you do NOT need to manually fence the old
+machine before starting the replacement (the raft protocol does it).
+The single-writer rule ("destroy the old machine first") still applies
+to `BASIN_WAL_MODE=local`.
+
+---
+
+## Leases (BASIN_LEASE_MODE=required)
+
+`BASIN_LEASE_MODE=required` wires the catalog's `LeaseRegistry` into
+the shard: each partition acquires a Postgres CAS lease before writes
+are accepted, heartbeating every `BASIN_LEASE_RENEW_SECS` (default 5 s)
+against a `BASIN_LEASE_TTL_SECS` TTL (default 15 s). A write that
+arrives at a process without a held lease returns `LeaseNotHeld` (SQLSTATE
+40001, retryable) immediately. Reads continue throughout.
+
+In `BASIN_WAL_MODE=raft`, raft leadership is the write fence and
+**supersedes the lease**: a non-leader write is refused by the raft
+check before the lease is ever consulted. Setting both knobs is allowed
+— `basin-server` logs that the lease registry is wired but redundant.
+The epoch fence in the WAL remains correct in both modes
+(`services/basin-server/src/main.rs`, lease-mode wiring block).
+
+`BASIN_LEASE_MODE=off` (the default) is the unchanged single-replica
+behaviour.
+
+---
+
+## Failure modes summary (raft mode)
+
+| Failure | Impact | Recovery | Bound |
+|---|---|---|---|
+| Leader crash, 2 nodes surviving | Writes pause for election | Automatic re-election (~1.5–3 s) | Election timeout window |
+| 1 node lost (any role) | Cluster available at reduced redundancy | Replace node per procedure above; no write pause | Minutes to rejoin |
+| 2 nodes lost simultaneously | Cluster loses quorum; writes block | Restore 1 node; elect leader; resume | Time to provision + election |
+| Node restart (same volume) | Brief follower absence | Automatic rejoin + log catchup | Seconds |
+| Network partition (1 node isolated) | Partitioned node refuses writes; main cluster continues | Heal partition; node catches up | Partition duration |
+| Hot-tier overlay window | Unchanged: point UPDATE/DELETE not WAL-logged | Same mitigation as single-writer: quiesce + wait ~60 s before stop | ~15–60 s |
+| Catalog Postgres down | All queries needing catalog fail | Failover the Postgres | Your PG HA story |
 
 ---
 
 ## Cross-references
 
-- [durability.md](./durability.md) — ack semantics and loss windows.
+- [durability.md](./durability.md) — ack semantics and loss windows; raft-mode row in the durability ladder.
 - [restore.md](./restore.md) — when node loss escalates to data restore.
-- [operators/lease-ownership.md](../operators/lease-ownership.md) — the ADR 0023 system (crate-level today).
+- [deployment.md](../deployment.md) — env table including raft/lease/node knobs.
+- [operators/lease-ownership.md](../operators/lease-ownership.md) — the ADR 0023 lease system.
 - [operators/storage.md](../operators/storage.md) — object-store incident handling.
 - [ADR 0023](../decisions/0023-leases-and-partition-routing.md), [ADR 0020](../decisions/0020-wal-transaction-markers.md), [ADR 0009](../decisions/0009-multi-region-architecture.md).
