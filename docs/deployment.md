@@ -37,14 +37,17 @@ basin-server is a single process. To deploy it you set:
 | Var | Purpose |
 |---|---|
 | `BASIN_BIND` | pgwire listener, e.g. `0.0.0.0:5433` |
-| `BASIN_DATA_DIR` | Vortex (default) / Parquet data + catalog directory (durable volume) |
+| `BASIN_CATALOG` | Catalog backend: `memory` (default — **volatile**, all catalog state lost on restart; dev/test only) or a Postgres connection string (`postgres://…` or libpq keyword form) for durable production deploys. `BASIN_CATALOG_SCHEMA` picks the schema (default `basin_catalog`). |
+| `BASIN_DATA_DIR` | Vortex (default) / Parquet data directory (durable volume) |
 | `BASIN_WAL_DIR` | WAL directory (durable volume, ideally NVMe) |
 | `BASIN_PROJECTS` | Static project list, e.g. `acme=*,beta=*`. |
 | `BASIN_AUTH_ENABLED=1` | Enables the auth subsystem (signup, JWT, refresh). Per [ADR 0013](./decisions/0013-auth-per-project-schema.md), auth state lives in each project's own storage under the `basin_auth` schema prefix and is reached in-process (`EngineAuthStore` over `ProjectSession`) — no loopback pgwire connection, no reserved internal project, no separate database. SMTP vars from [ADR 0005](./decisions/0005-auth-system.md) become required when this is on. |
 | `BASIN_AUTH_CATALOG_DSN` | Optional escape hatch (ADR 0013): point auth state at an external pgwire-speaking Postgres for separate blast radius. Unset = the default in-process per-project-schema path. |
 
-That is the full required surface for a single-region deploy. No external
-Postgres, no external catalog service. See `BASIN_BIND` / `BASIN_DATA_DIR`
+That is the full required surface for a single-region deploy. A production
+deploy needs one external Postgres for the catalog (`BASIN_CATALOG=postgres://…`);
+the `memory` default is volatile and suitable only for dev/test. Auth state
+needs no separate database (ADR 0013). See `BASIN_BIND` / `BASIN_DATA_DIR`
 in [`../README.md`](../README.md) for the boot example.
 
 ---
@@ -137,7 +140,7 @@ Per-region resource shape, rough sizing for the first 1k–10k projects:
 | Router | Fly Performance 1× × 2 (HA) | ~$30/mo. Stateless; scales linearly with connection count. |
 | Shard owners | Fly Performance 4× × 2 | ~$240/mo. Each handles ~5k projects' working set. Add more as project count grows. |
 | Object store bucket | regional, public-bucket-disabled | Tigris: ~$0.02/GB + $0.01/GB egress (Fly-internal is free). AWS S3: $0.023/GB + $0.09/GB egress. |
-| Catalog backend | none — embedded | Catalog state (project list, table schemas, snapshot manifests, file refs) lives in the embedded catalog, durable on the WAL volume. Auth state (`basin_auth_users` / `basin_auth_refresh_tokens` / …) lives in each project's own storage under the `basin_auth` schema and is reached in-process (ADR 0013) — no loopback, no external Postgres to provision. ~50 MB per 10k projects. |
+| Catalog backend | small managed Postgres (`BASIN_CATALOG=postgres://…`) | Catalog state (project list, table schemas, snapshot manifests, file refs, compaction watermarks) lives in Postgres — it is the durable commit point. Fly Postgres / Neon smallest tier suffices (~50 MB per 10k projects, low QPS). The `memory` default is volatile: dev/test only. Auth state (`basin_auth_users` / `basin_auth_refresh_tokens` / …) needs no extra database — it lives in each project's own storage under the `basin_auth` schema, reached in-process (ADR 0013). |
 | Optional: NVMe disk cache | Fly volume, 50 GB | Phase 5.7-A1 cache. ~$5/mo. Cuts cold S3 fetches from ~50 ms → ~100 µs. |
 
 **Total cost for one region with 10k projects × 100 MB each, mostly cached:** ~$300–500/month all-in.
