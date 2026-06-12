@@ -11,6 +11,7 @@ pub mod error;
 pub mod events;
 pub mod ids;
 pub mod project_counters;
+pub mod region;
 pub mod telemetry;
 pub mod types;
 
@@ -22,4 +23,5 @@ pub use ids::{
 pub use project_counters::{
     AcquireResult, CapLabel, HistogramSnapshot, LeaseMetrics, RenewResult, ReplicaLeaseSnapshot,
 };
+pub use region::{is_home_region, local_region, DEFAULT_REGION, REGION_ENV};
 pub use telemetry::{ProjectCounterRegistry, ProjectCounters, ProjectCountersSnapshot};

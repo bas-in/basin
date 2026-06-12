@@ -332,6 +332,15 @@ pub(crate) struct EngineInner {
     /// Dual-watermark invalidation (hot_tier_epoch + snapshot_id); see
     /// [`crate::pk_row_cache`].
     pub(crate) pk_row_cache: Arc<crate::pk_row_cache::PkRowCache>,
+
+    /// Multi-region (ADR 0009): optional write forwarder. When a non-home
+    /// write reaches this region and a forwarder is registered, the engine
+    /// delegates to it (the home region executes and returns the result)
+    /// instead of raising `BasinError::WrongRegion`. `None` (the default) is
+    /// the OSS fail-loud behaviour; the cloud-private layer installs the real
+    /// forwarder via `Engine::attach_write_forwarder`. `RwLock` mirrors the
+    /// `event_sinks` attach-after-construction pattern.
+    pub(crate) write_forwarder: RwLock<Option<Arc<dyn crate::region::WriteForwarder>>>,
 }
 
 impl Engine {
@@ -446,6 +455,9 @@ impl Engine {
             // Tier 2 bulk-INSERT PK set cache.
             pk_set_cache: Arc::new(crate::constraints::PkSetCache::new()),
             pk_row_cache: Arc::new(crate::pk_row_cache::PkRowCache::from_env()),
+            // Multi-region: no forwarder by default (OSS fail-loud). The
+            // cloud-private layer attaches one at startup.
+            write_forwarder: RwLock::new(None),
         });
         // Phase 5.14.D2: register the query-history adapter with the shard so
         // the compactor can consult observed ORDER BY / GROUP BY patterns.
@@ -570,6 +582,28 @@ impl Engine {
 
     pub(crate) fn event_sinks(&self) -> &RwLock<EventSinkRegistry> {
         &self.inner.event_sinks
+    }
+
+    /// Register the process-wide [`crate::region::WriteForwarder`]. Once set,
+    /// every non-home write delegates to it instead of raising
+    /// `BasinError::WrongRegion`. Last writer wins (matches the attach-* sinks
+    /// API). Intended to be called once at startup by the cloud-private layer.
+    pub fn attach_write_forwarder(&self, fwd: Arc<dyn crate::region::WriteForwarder>) {
+        *self
+            .inner
+            .write_forwarder
+            .write()
+            .expect("write_forwarder lock poisoned") = Some(fwd);
+    }
+
+    /// The currently-registered write forwarder, if any. Cloned `Arc` so the
+    /// caller can `.await` the forward without holding the lock.
+    pub(crate) fn write_forwarder(&self) -> Option<Arc<dyn crate::region::WriteForwarder>> {
+        self.inner
+            .write_forwarder
+            .read()
+            .expect("write_forwarder lock poisoned")
+            .clone()
     }
 
     /// Allocate the next per-`(project, table)` sequence number. Crate-
@@ -1479,6 +1513,7 @@ impl Drop for ProjectSession {
 }
 
 pub use crate::pk_row_cache::PkRowCacheCountersSnapshot;
+pub use crate::region::{ForwardContext, WriteForwarder};
 pub use crate::prepared::{BoundStatement, ScalarParam, StatementHandle, StatementSchema};
 /// Re-export the secondary B-tree index registry + location type so
 /// integration tests can probe the registry directly (FIX 2 verification).
@@ -1593,6 +1628,7 @@ mod procedure_ddl;
 mod range_udf;
 pub mod reactor_ddl;
 mod reactor_sink;
+pub mod region;
 mod regex_udf;
 mod rls;
 mod schema_ddl;

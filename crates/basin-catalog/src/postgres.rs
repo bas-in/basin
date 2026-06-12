@@ -44,8 +44,8 @@ use crate::domains::{self, DomainDef, DomainError, BASIN_DOMAIN_KEY};
 use crate::enums::{self, EnumError, EnumTypeDef, BASIN_ENUM_TYPE_KEY};
 use crate::functions::SqlFunctionDef;
 use crate::metadata::{
-    CheckConstraint, CvDef, DataFileRef, ForeignKeyDef, PartitionSpec, Policy, SecondaryIndex,
-    TableFileFormat, TableMetadata, UniqueConstraint,
+    CheckConstraint, CvDef, DataFileRef, ForeignKeyDef, PartitionSpec, Policy, ProjectMetadata,
+    SecondaryIndex, TableFileFormat, TableMetadata, UniqueConstraint,
 };
 use crate::procedures::{self, ProcedureError, SqlProcedureDef};
 use crate::project_storage_config::ProjectStorageConfig;
@@ -568,6 +568,23 @@ impl PostgresCatalog {
                     watermark_lsn BIGINT NOT NULL,
                     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
                     PRIMARY KEY (project_id, partition_id)
+                )"
+            ),
+            // Per-project metadata (T-048 byo_bucket + ADR 0009 home_region).
+            // Stored as a single JSONB blob of the serialized `ProjectMetadata`
+            // struct so every additive field rides the same row without a
+            // schema migration per field — the `#[serde(default)]` /
+            // `skip_serializing_if` shape on the struct gives forward/backward
+            // compatibility (a row written before `home_region` existed
+            // deserialises with `home_region = None`). The Postgres backend
+            // previously took the trait default (no persistence); this table
+            // is the additive opt-in. A legacy catalog without this table has
+            // no rows ⇒ `get_project_metadata` returns the default.
+            format!(
+                "CREATE TABLE IF NOT EXISTS {schema}.project_metadata (
+                    project_id  TEXT PRIMARY KEY,
+                    meta        JSONB NOT NULL,
+                    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
                 )"
             ),
             // Per-project pgwire connection ceiling (issue #28b). Written by
@@ -4039,6 +4056,55 @@ impl Catalog for PostgresCatalog {
             // clamps to 0 rather than wrapping to a huge u64.
             lsn.max(0) as u64
         }))
+    }
+
+    #[instrument(skip(self, meta), fields(project = %project))]
+    async fn set_project_metadata(
+        &self,
+        project: &ProjectId,
+        meta: ProjectMetadata,
+    ) -> Result<()> {
+        let sch = &self.schema;
+        let client = self.client().await?;
+        let meta_json = serde_json::to_value(&meta)
+            .map_err(|e| BasinError::catalog(format!("set_project_metadata serialize: {e}")))?;
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {sch}.project_metadata (project_id, meta, updated_at) \
+                     VALUES ($1, $2, now()) \
+                     ON CONFLICT (project_id) DO UPDATE SET \
+                       meta = EXCLUDED.meta, updated_at = now()"
+                ),
+                &[&project.to_string(), &meta_json],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("set_project_metadata: {e}")))?;
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(project = %project))]
+    async fn get_project_metadata(&self, project: &ProjectId) -> Result<ProjectMetadata> {
+        let sch = &self.schema;
+        let client = self.client().await?;
+        let row = client
+            .query_opt(
+                &format!("SELECT meta FROM {sch}.project_metadata WHERE project_id = $1"),
+                &[&project.to_string()],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("get_project_metadata: {e}")))?;
+        match row {
+            // No row (incl. legacy catalog with no project_metadata table-row):
+            // default ⇒ byo_bucket None + home_region None (treated-as-local).
+            None => Ok(ProjectMetadata::default()),
+            Some(r) => {
+                let meta_json: serde_json::Value = r.get(0);
+                serde_json::from_value(meta_json).map_err(|e| {
+                    BasinError::catalog(format!("get_project_metadata deserialize: {e}"))
+                })
+            }
+        }
     }
 
     #[instrument(skip(self), fields(project = %project))]

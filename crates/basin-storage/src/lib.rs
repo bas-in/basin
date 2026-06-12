@@ -2661,6 +2661,7 @@ mod tests {
                     secret_access_key_enc: b"encrypted".to_vec(),
                     force_path_style: false,
                 }),
+                home_region: None,
             },
         );
 

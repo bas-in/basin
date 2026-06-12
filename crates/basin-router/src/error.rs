@@ -85,6 +85,17 @@ fn classify(err: &BasinError) -> (&'static str, &'static str) {
         // alternative but it confuses drivers that special-case it as
         // "reconnect"; see basin-common error docs.
         BasinError::RaftNoQuorum(_) => ("ERROR", "40001"), // serialization_failure
+        // Multi-region phase 6 (ADR 0009): the statement reached the wrong
+        // region for its project — a write, or a primary-tier read, against a
+        // project homed elsewhere. This is NOT retryable in place: retrying on
+        // the same connection hits the same region and fails again. We map it
+        // to SQLSTATE 08006 (`connection_failure`, class 08 =
+        // connection_exception): the message names the home region so a
+        // region-aware client / pgwire pooler reconnects to the home endpoint
+        // and retries THERE. (When a WriteForwarder is registered the engine
+        // forwards instead of raising this, so the router only sees the error
+        // in the fail-loud / forwarding-disabled deployment.)
+        BasinError::WrongRegion(_) => ("ERROR", "08006"), // connection_failure
         // Phase 5.28.B: lock_timeout expiry — PostgreSQL raises 55P03.
         BasinError::LockNotAvailable(_) => ("ERROR", "55P03"), // lock_not_available
         // Phase 5.28.C: idle_in_transaction_session_timeout — PostgreSQL
@@ -180,6 +191,25 @@ mod tests {
         assert_eq!(er.fields[0], (b'S', "ERROR".to_owned()));
         assert_eq!(er.fields[1], (b'C', "40001".to_owned()));
         assert!(er.fields[2].1.contains("could not reach quorum"));
+    }
+
+    #[test]
+    fn classifies_wrong_region() {
+        // A write / primary-read against a non-home project must surface as
+        // SQLSTATE 08006 (connection_failure, class 08) with BOTH region
+        // names in the message so a region-aware client reconnects to home.
+        let er = error_response(&BasinError::wrong_region_for(
+            "proj_abc",
+            "write",
+            "us-east-1",
+            "eu-west-1",
+        ));
+        assert_eq!(er.fields[0], (b'S', "ERROR".to_owned()));
+        assert_eq!(er.fields[1], (b'C', "08006".to_owned()));
+        // Message names the home region AND the local region.
+        assert!(er.fields[2].1.contains("us-east-1"));
+        assert!(er.fields[2].1.contains("eu-west-1"));
+        assert!(er.fields[2].1.contains("proj_abc"));
     }
 
     #[test]

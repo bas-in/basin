@@ -763,6 +763,18 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     // statements after the tuples, hypertables, partitioned targets,
     // unsupported literals, …) returns `None` here and the normal path below
     // runs byte-for-byte unchanged.
+    // Multi-region: a fast-path literal INSERT is a write — gate it before the
+    // preparse path can append to the local WAL. Home/legacy/unpinned projects
+    // pass straight through (Ok(None)); a non-home INSERT either forwards (if a
+    // WriteForwarder is registered) or raises WrongRegion. We only run the gate
+    // when the statement actually looks like an INSERT so non-INSERT execute()
+    // calls pay nothing here (the general gate in the dispatch block covers
+    // them once `kind` is parsed).
+    if crate::region::looks_like_insert(sql) {
+        if let Some(result) = crate::region::region_write_gate_insert(sess, sql).await? {
+            return result;
+        }
+    }
     if let Some(result) = try_insert_preparse(sess, sql).await {
         return result;
     }
@@ -1595,6 +1607,28 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                     sess.state.reset_gucs();
                     return Ok(ExecResult::Empty { tag: "RESET".into() });
                 }
+            }
+
+            // ── Multi-region region gate (ADR 0009) ─────────────────────────
+            // WRITE (DML/DDL) to a project homed in another region cannot be
+            // served here: each region owns its own single-writer Raft WAL and
+            // there is no cross-region quorum/2PC (explicit non-goals). If a
+            // WriteForwarder is registered, delegate (the home region executes
+            // and returns the result); otherwise fail loud with WrongRegion.
+            if kind.is_write_kind() {
+                if let Some(result) =
+                    crate::region::region_write_gate(sess, kind, sql).await?
+                {
+                    return Ok(result);
+                }
+            }
+            // READ (commit 9): a `basin.read_tier = 'primary'` (default) read of
+            // a non-home project is rejected (only the home region has the live
+            // tail); `'lagging'` reads are allowed cross-region (flushed,
+            // S3-replicated cold data). Home/legacy/unpinned projects always
+            // pass. Gated before any SELECT fast path or exec_select runs.
+            if matches!(kind, crate::pg_ast::StmtKind::Select) {
+                crate::region::region_read_guard(sess).await?;
             }
 
             if let Some(result) = crate::noop_accept::try_accept_as_noop(kind, sql) {
@@ -2572,6 +2606,17 @@ async fn dispatch_parsed_statement(
                          (expected a float in [0.0, 1.0])"
                     ))),
                 }
+            } else if var_name == "basin.read_tier" || var_name == "basin_read_tier" {
+                // SET basin.read_tier = 'primary' | 'lagging' (ADR 0009).
+                // sqlparser joins dotted names with `_`, so accept both forms.
+                // 'lagging' opts into reading S3-replicated cold data from any
+                // region (accepting staleness); 'primary' (default) requires
+                // the home region for strongly-consistent reads.
+                let raw = extract_set_string_value(&values);
+                let trimmed = raw.trim().trim_matches('\'').trim_matches('"').trim();
+                let tier = crate::session::ReadTier::parse(trimmed)?;
+                crate::session::set_session_read_tier(&sess.state, tier);
+                Ok(ExecResult::Empty { tag: "SET".into() })
             } else {
                 // Silently accept unknown SET variables.
                 Ok(ExecResult::Empty { tag: "SET".into() })
@@ -3257,6 +3302,10 @@ async fn dispatch_parsed_statement(
                     "pg_trgm.word_similarity_threshold",
                     &format!("{v}"),
                 ))
+            } else if var_name == "basin_read_tier" || var_name == "basin.read_tier" {
+                // SHOW basin.read_tier (ADR 0009). Renders 'primary'|'lagging'.
+                let v = crate::session::show_read_tier(&sess.state);
+                Ok(make_show_result("basin.read_tier", v))
             } else {
                 // Silently return empty for other SHOW <var> forms so
                 // ORM startup queries don't hard-fail.
