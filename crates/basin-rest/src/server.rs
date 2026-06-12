@@ -379,6 +379,13 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
             post(admin_projects_routes::set_project_max_connections)
                 .get(admin_projects_routes::get_project_max_connections),
         )
+        // multi-region placement (ADR 0009): per-project home region.
+        // POST sets the home region (persists); GET reads it.
+        .route(
+            "/admin/v1/projects/:project_id/placement",
+            post(admin_projects_routes::set_project_placement)
+                .get(admin_projects_routes::get_project_placement),
+        )
         // Feature 3 (5.22.D): pg_dump-compatible project export.
         .route(
             "/admin/v1/projects/:project_id/dump",
@@ -481,7 +488,28 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
         .route(
             "/storage/v1/object/:bucket",
             axum::routing::delete(storage_routes::bulk_delete_objects),
+        );
+
+    // >>> ADR 0028 Phase 2 CDC-WEBHOOK ROUTES (anchored, flagged) >>>
+    // CDC webhook subscription CRUD. Project-scoped auth (the handlers call
+    // `authorize` + assert the JWT project matches the path), so these routes
+    // carry the same `Arc<Inner>` state as the rest of the app — they are added
+    // to the main chain (not the separate-state cdc SSE sub-router). Gated on
+    // `realtime` because the handlers depend on `basin-cdc` (id/secret minting).
+    #[cfg(feature = "realtime")]
+    let app = app
+        .route(
+            "/v1/cdc/:project/webhooks",
+            post(crate::routes::cdc_webhooks::register_webhook)
+                .get(crate::routes::cdc_webhooks::list_webhooks),
         )
+        .route(
+            "/v1/cdc/:project/webhooks/:id",
+            axum::routing::delete(crate::routes::cdc_webhooks::delete_webhook),
+        );
+    // <<< ADR 0028 Phase 2 CDC-WEBHOOK ROUTES (anchored, flagged) <<<
+
+    let app = app
         .layer(body_limit)
         .layer(cors)
         .layer(TraceLayer::new_for_http())
