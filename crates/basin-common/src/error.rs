@@ -81,6 +81,14 @@ pub enum BasinError {
     #[error("feature not supported: {0}")]
     FeatureNotSupported(String),
 
+    /// Cardinality violation: a statement that must affect each target row at
+    /// most once tried to affect one twice. Raised by `MERGE` when more than
+    /// one source row matches the same target row. Router maps to SQLSTATE
+    /// `21000` (`cardinality_violation`), matching PostgreSQL's
+    /// `MERGE command cannot affect row a second time`.
+    #[error("{0}")]
+    CardinalityViolation(String),
+
     /// PRIMARY KEY (or UNIQUE) violation. Router maps to SQLSTATE
     /// `23505` (`unique_violation`).
     #[error("{0}")]
@@ -203,6 +211,21 @@ pub enum BasinError {
     #[error("column \"{0}\" does not exist")]
     UndefinedColumn(String),
 
+    /// A named cursor was referenced (FETCH / MOVE / CLOSE) but does not
+    /// exist in the session's cursor registry.  Router maps to SQLSTATE
+    /// `34000` (`invalid_cursor_name`) — the exact code PostgreSQL raises
+    /// for `cursor "x" does not exist`.
+    #[error("cursor \"{0}\" does not exist")]
+    CursorNotFound(String),
+
+    /// The ON CONFLICT target column list does not match any unique or
+    /// exclusion constraint on the table.  Router maps to SQLSTATE `42P10`
+    /// (`invalid_column_reference`) — the exact code PostgreSQL raises for
+    /// `there is no unique or exclusion constraint matching the ON CONFLICT
+    /// specification`.
+    #[error("there is no unique or exclusion constraint matching the ON CONFLICT specification (columns: {0})")]
+    AmbiguousConflictTarget(String),
+
     /// Catch-all for sources without a dedicated variant.
     #[error("internal: {0}")]
     Internal(String),
@@ -242,6 +265,18 @@ impl BasinError {
     }
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::Internal(msg.into())
+    }
+    /// Typed constructor for a missing cursor.  `name` is the cursor name
+    /// as the user wrote it — interpolated into the PG-shaped
+    /// `cursor "<name>" does not exist` message and surfaces as SQLSTATE 34000.
+    pub fn cursor_not_found(name: impl Into<String>) -> Self {
+        Self::CursorNotFound(name.into())
+    }
+    /// Typed constructor for an unresolvable ON CONFLICT target.  `cols`
+    /// is a comma-joined list of the target column names — interpolated into
+    /// the PG-shaped message and surfaces as SQLSTATE 42P10.
+    pub fn ambiguous_conflict_target(cols: impl Into<String>) -> Self {
+        Self::AmbiguousConflictTarget(cols.into())
     }
     pub fn feature_not_supported(msg: impl Into<String>) -> Self {
         Self::FeatureNotSupported(msg.into())

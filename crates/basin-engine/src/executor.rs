@@ -3353,6 +3353,11 @@ async fn dispatch_parsed_statement(
             names,
             ..
         } => exec_drop_table(sess, if_exists, names).await,
+        // PostgreSQL 15+ `MERGE INTO target USING source ON cond WHEN …`.
+        // Compiles each per-row WHEN action to ordinary INSERT/UPDATE/DELETE
+        // driven through the normal statement pipeline (RLS, constraints, fast
+        // paths, atomicity all inherited). See `crate::merge`.
+        Statement::Merge(merge) => crate::merge::exec_merge(sess, merge).await,
         other => Err(BasinError::internal(format!("unsupported in PoC: {other}"))),
     };
 
@@ -5887,21 +5892,10 @@ async fn exec_insert(
         // PK constraint checks so those checks never see the skipped rows.
         if let Some(OnInsert::OnConflict(ref on_conflict)) = ins.on {
             if let OnConflictAction::DoNothing = &on_conflict.action {
-                // WHERE clause form with conflict predicate is deferred.
-                if on_conflict
-                    .conflict_target
-                    .as_ref()
-                    .map(|t| matches!(t, ConflictTarget::OnConstraint(_)))
-                    .unwrap_or(false)
-                {
-                    // ON CONFLICT ON CONSTRAINT <name> DO NOTHING — not yet
-                    // implemented; reject cleanly rather than guessing.
-                    return Err(BasinError::FeatureNotSupported(
-                        "ON CONFLICT ON CONSTRAINT DO NOTHING is not yet supported; \
-                         use ON CONFLICT (col, ...) DO NOTHING"
-                            .into(),
-                    ));
-                }
+                // Route through filter_rows_do_nothing which handles both
+                // the `(col, ...)` form and `ON CONSTRAINT <name>` (resolved
+                // to its column list).  The WHERE-clause partial-index form
+                // is rejected inside filter_rows_do_nothing as before.
                 rows_expanded = filter_rows_do_nothing(
                     sess,
                     &table,
@@ -7329,9 +7323,9 @@ pub(crate) fn write_options_for_copy(meta: &TableMetadata, in_tx: bool) -> Write
 /// constraint (or the table's primary key), matching PG's requirement that
 /// the ON CONFLICT target must refer to a uniqueness/exclusion constraint.
 ///
-/// Returns `Err(BasinError::InvalidSchema(...))` if no matching constraint
-/// exists — this mirrors PG SQLSTATE 42P10 ("there is no unique or exclusion
-/// constraint matching the ON CONFLICT specification").
+/// Returns `Err(BasinError::AmbiguousConflictTarget(...))` if no matching
+/// constraint exists — maps to PG SQLSTATE 42P10 ("there is no unique or
+/// exclusion constraint matching the ON CONFLICT specification").
 fn validate_conflict_target_columns(
     pk_columns: &[String],
     unique_constraints: &[basin_catalog::UniqueConstraint],
@@ -7365,10 +7359,44 @@ fn validate_conflict_target_columns(
         }
     }
 
-    Err(BasinError::InvalidSchema(format!(
-        "there is no unique or exclusion constraint matching the ON CONFLICT \
-         specification (columns: {})",
-        conflict_cols.join(", ")
+    Err(BasinError::AmbiguousConflictTarget(conflict_cols.join(", ")))
+}
+
+/// Resolve an `ON CONFLICT ON CONSTRAINT <name>` target to its column list.
+///
+/// Looks up `constraint_name` (case-insensitively) in the table's PK and
+/// UNIQUE constraints and returns the matching column list.  Returns
+/// `Err(BasinError::AmbiguousConflictTarget)` when no constraint by that name
+/// is found — PG SQLSTATE 42P10.
+///
+/// PG also supports EXCLUDE-type constraints by name on the `ON CONFLICT ON
+/// CONSTRAINT` form; Basin does not yet model exclusion constraints by name
+/// in the catalog, so those are rejected with SQLSTATE 42P10.
+fn resolve_constraint_name(
+    pk_columns: &[String],
+    unique_constraints: &[basin_catalog::UniqueConstraint],
+    table_name_str: &str,
+    constraint_name: &str,
+) -> Result<Vec<String>> {
+    let name_lower = constraint_name.to_ascii_lowercase();
+
+    // The implicit PK constraint name is `<table>_pkey` — same form the
+    // PK enforcement error messages use.  Check it first.
+    let pk_name = format!("{}_pkey", table_name_str.to_ascii_lowercase());
+    if name_lower == pk_name && !pk_columns.is_empty() {
+        return Ok(pk_columns.to_vec());
+    }
+
+    // Search named UNIQUE constraints (including those added by
+    // `CREATE UNIQUE INDEX` which land as UniqueConstraints in the catalog).
+    for u in unique_constraints {
+        if u.name.to_ascii_lowercase() == name_lower {
+            return Ok(u.columns.clone());
+        }
+    }
+
+    Err(BasinError::AmbiguousConflictTarget(format!(
+        "constraint \"{constraint_name}\" for table \"{table_name_str}\" does not exist"
     )))
 }
 
@@ -7432,11 +7460,21 @@ async fn filter_rows_do_nothing(
             }
             groups
         }
-        Some(ConflictTarget::OnConstraint(_)) => {
-            // Caller already rejected this form before calling us.
-            return Err(BasinError::FeatureNotSupported(
-                "ON CONFLICT ON CONSTRAINT DO NOTHING is not yet supported".into(),
-            ));
+        Some(ConflictTarget::OnConstraint(obj_name)) => {
+            // ON CONFLICT ON CONSTRAINT <name> DO NOTHING — resolve the named
+            // constraint to its column list and treat it as a single group.
+            let constraint_name = obj_name
+                .0
+                .last()
+                .map(|p| p.as_ident().map(|i| i.value.clone()).unwrap_or_default())
+                .unwrap_or_default();
+            let cols = resolve_constraint_name(
+                &meta.pk_columns,
+                &meta.unique_constraints,
+                table.as_str(),
+                &constraint_name,
+            )?;
+            vec![cols]
         }
     };
 
@@ -7717,20 +7755,7 @@ async fn try_on_conflict_do_update(
         OnConflictAction::DoNothing => return Ok(None),
     };
 
-    // Extract the conflict column(s). We support the `(col, ...)` form.
-    let conflict_cols: Vec<String> = match &on_conflict.conflict_target {
-        Some(ConflictTarget::Columns(idents)) => idents.iter().map(|i| i.value.clone()).collect(),
-        _ => {
-            // No explicit target — skip upsert pre-check; fall through to
-            // plain INSERT (which will surface a constraint error if needed).
-            return Ok(None);
-        }
-    };
-    if conflict_cols.is_empty() {
-        return Ok(None);
-    }
-
-    // Resolve the inserted rows.
+    // Resolve the inserted rows first (needed before we can call the catalog).
     let source = match ins.source.as_ref() {
         Some(s) => s,
         None => return Ok(None),
@@ -7743,7 +7768,8 @@ async fn try_on_conflict_do_update(
         return Ok(None);
     }
 
-    // Build the WHERE clause for the existence check.
+    // Load table metadata — needed for both constraint lookup (ON CONSTRAINT
+    // form) and the existence probe below.
     let meta = sess
         .engine
         .config()
@@ -7751,6 +7777,41 @@ async fn try_on_conflict_do_update(
         .load_table(&sess.project, table)
         .await?;
     let schema = meta.schema.clone();
+
+    // Extract the conflict column(s).  We support:
+    //   • `ON CONFLICT (col, ...) DO UPDATE`        — explicit column list.
+    //   • `ON CONFLICT ON CONSTRAINT <name> DO UPDATE` — resolve by name.
+    //   • No explicit target                        — fall through to plain INSERT.
+    let conflict_cols: Vec<String> = match &on_conflict.conflict_target {
+        Some(ConflictTarget::Columns(idents)) => idents.iter().map(|i| i.value.clone()).collect(),
+        Some(ConflictTarget::OnConstraint(obj_name)) => {
+            let constraint_name = obj_name
+                .0
+                .last()
+                .map(|p| p.as_ident().map(|i| i.value.clone()).unwrap_or_default())
+                .unwrap_or_default();
+            resolve_constraint_name(
+                &meta.pk_columns,
+                &meta.unique_constraints,
+                table.as_str(),
+                &constraint_name,
+            )?
+        }
+        None => {
+            // No explicit target — fall through to plain INSERT which will
+            // surface the appropriate constraint error if needed.
+            return Ok(None);
+        }
+    };
+    if conflict_cols.is_empty() {
+        return Ok(None);
+    }
+    // Validate that the resolved column set actually matches a constraint.
+    // (The ON CONSTRAINT path already validated via resolve_constraint_name;
+    //  the Columns path needs explicit validation here.)
+    if matches!(&on_conflict.conflict_target, Some(ConflictTarget::Columns(_))) {
+        validate_conflict_target_columns(&meta.pk_columns, &meta.unique_constraints, &conflict_cols)?;
+    }
 
     // Expand all rows to schema-width and apply column defaults once.
     let mut rows_expanded = expand_insert_rows(schema.as_ref(), &ins.columns, rows_raw)?;
@@ -10882,9 +10943,11 @@ fn single_part_name(name: &ObjectName) -> Result<&str> {
 
 /// Execute `DECLARE <name> [SCROLL | NO SCROLL] CURSOR [WITH HOLD] FOR <query>`.
 ///
-/// The backing SELECT is materialised immediately into the session's cursor
-/// registry.  WITH HOLD is silently accepted but not implemented (cursors die
-/// with the session regardless).
+/// The backing `SELECT` is materialised immediately into the session's cursor
+/// registry.  `WITH HOLD` is rejected with SQLSTATE `0A000`
+/// (`feature_not_supported`) — Basin v0.1 cursors are NOT held across
+/// transaction boundaries.  `SCROLL` / `NO SCROLL` are accepted (all
+/// materialised cursors support backward motion regardless of the keyword).
 async fn exec_declare(
     sess: &ProjectSession,
     stmts: Vec<sqlparser::ast::Declare>,
@@ -10905,6 +10968,16 @@ async fn exec_declare(
             .value
             .clone();
 
+        // Reject WITH HOLD — Basin v0.1 cursors die with the session /
+        // transaction.  PG SQLSTATE 0A000 (feature_not_supported).
+        if decl.hold == Some(true) {
+            return Err(BasinError::FeatureNotSupported(
+                "DECLARE … CURSOR WITH HOLD is not supported; omit WITH HOLD \
+                 (cursors are automatically closed at transaction end)"
+                    .to_string(),
+            ));
+        }
+
         // sqlparser 0.52 puts the SELECT query in `for_query` (Box<Query>)
         // for `DECLARE c CURSOR FOR SELECT …`. The `assignment` field uses
         // `Box<Expr>` and is for variable-assignment forms, not cursor FOR.
@@ -10920,6 +10993,7 @@ async fn exec_declare(
             ExecResult::Rows { schema, batches } => (schema, batches),
             ExecResult::Empty { .. } => (Arc::new(Schema::empty()), vec![]),
         };
+        // declare() enforces BASIN_CURSOR_MAX_ROWS and checks for duplicate names.
         sess.state.cursors.declare(name, schema, batches).await?;
     }
     Ok(ExecResult::Empty {
@@ -10939,6 +11013,10 @@ async fn exec_fetch(
 }
 
 /// Execute `CLOSE <cursor>` (or `CLOSE ALL`).
+///
+/// `CLOSE ALL` drops every open cursor in the session — identical to the pool
+/// scrub's `cursors.clear_all()`.  `CLOSE <name>` drops a single cursor and
+/// returns SQLSTATE 34000 (`invalid_cursor_name`) if it does not exist.
 async fn exec_close(
     sess: &ProjectSession,
     cursor: sqlparser::ast::CloseCursor,
@@ -10946,11 +11024,9 @@ async fn exec_close(
     use sqlparser::ast::CloseCursor;
     match cursor {
         CloseCursor::All => {
-            // Close all — not trivially implementable without exposing the
-            // registry's internals; for v0.1 we surface a helpful error.
-            return Err(BasinError::internal(
-                "CLOSE ALL is not supported in v0.1; close cursors individually".to_string(),
-            ));
+            // CLOSE ALL: drop every open cursor in this session.
+            // Matches PG semantics (DISCARD ALL also includes this).
+            sess.state.cursors.clear_all().await;
         }
         CloseCursor::Specific { name } => {
             sess.state.cursors.close(&name.value).await?;
