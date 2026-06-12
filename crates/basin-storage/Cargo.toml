@@ -55,7 +55,7 @@ vortex-array = "0.71"
 vortex-file = { version = "0.71", features = ["zstd"] }
 vortex-btrblocks = { version = "0.71", features = ["zstd", "pco"] }
 vortex-session = "0.71"
-vortex-io = { version = "0.71", features = ["tokio"] }
+vortex-io = { version = "0.71", features = ["tokio", "object_store"] }
 vortex-layout = "0.71"
 vortex-buffer = "0.71"
 # Per-file bloom filters for point_eq miss-path pruning (Phase 5.14.A2/A3).

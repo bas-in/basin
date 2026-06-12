@@ -130,6 +130,41 @@ fn hex_key(k: &KeyHash) -> String {
     hex::encode(k)
 }
 
+/// LEVER 3: default size ceiling (bytes) under which a *ranged* cold miss is
+/// promoted to a single whole-file fetch. Small data files (a narrow Vortex
+/// stripe, a tiny Parquet file) are read range-by-range — footer suffix, then
+/// one or more row-group ranges — each a separate RTT. When the whole file is
+/// only a few MiB, one full GET costs barely more than the footer GET alone
+/// and turns every subsequent range read of that file into a local slice.
+/// Override with `BASIN_DISK_CACHE_SPECULATIVE_BYTES` (`usize`; `0` disables).
+const DEFAULT_SPECULATIVE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Resolve the speculative whole-file prefetch ceiling from
+/// `BASIN_DISK_CACHE_SPECULATIVE_BYTES` (bytes). `0` (or an explicit `0` env)
+/// disables the optimisation; unset / unparseable keeps the default.
+fn resolve_speculative_bytes() -> u64 {
+    match std::env::var("BASIN_DISK_CACHE_SPECULATIVE_BYTES") {
+        Ok(v) => v.trim().parse::<u64>().unwrap_or(DEFAULT_SPECULATIVE_BYTES),
+        Err(_) => DEFAULT_SPECULATIVE_BYTES,
+    }
+}
+
+/// Resolve the byte range a `GetRange` selects within a `full_len`-byte object,
+/// matching object_store's range semantics. Returns the half-open
+/// `start..end` clamped to `full_len`. `None` (full object) maps to
+/// `0..full_len`.
+fn resolve_range(range: Option<&GetRange>, full_len: u64) -> std::ops::Range<usize> {
+    let (start, end) = match range {
+        None => (0, full_len),
+        Some(GetRange::Bounded(r)) => (r.start, r.end.min(full_len)),
+        Some(GetRange::Offset(o)) => (*o, full_len),
+        Some(GetRange::Suffix(s)) => (full_len.saturating_sub(*s), full_len),
+    };
+    let start = start.min(full_len) as usize;
+    let end = end.min(full_len).max(start as u64) as usize;
+    start..end
+}
+
 /// Per-entry metadata kept in the in-RAM LRU.
 #[derive(Clone, Debug)]
 struct FileMeta {
@@ -377,12 +412,30 @@ impl DiskCachedStore {
         let key = key_for(location, range.as_ref());
         let fs_path = self.fragment_path(&key);
 
-        // Fast path: cache hit.
+        // Fast path: exact (path, range) cache hit.
         if let Some(b) = try_read_cached(&self.state, &key, &fs_path).await {
             self.state
                 .hits
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(b);
+        }
+
+        // LEVER 3: when this is a *ranged* read and the speculative whole-file
+        // prefetch (below) has already cached the entire object, serve the
+        // requested range as a local slice instead of a fresh inner GET. This
+        // is what turns the second-and-later range reads of a small file
+        // (footer, then row groups) into zero-RTT slices off the one full
+        // fetch. The full-file entry is keyed with `range = None`.
+        if range.is_some() {
+            let full_key = key_for(location, None);
+            let full_fs = self.fragment_path(&full_key);
+            if let Some(full) = try_read_cached(&self.state, &full_key, &full_fs).await {
+                let r = resolve_range(range.as_ref(), full.len() as u64);
+                self.state
+                    .hits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(full.slice(r));
+            }
         }
 
         // Singleflight: at most one in-flight fetch per key.
@@ -443,7 +496,49 @@ impl DiskCachedStore {
             ..GetOptions::default()
         };
         let got = self.inner.get_opts(location, opts).await?;
+        // `meta.size` is the FULL object size (object_store contract), even on
+        // a ranged GET — that's how we decide whether to promote to a whole-
+        // file fetch without a separate HEAD round-trip.
+        let full_size = got.meta.size;
         let bytes = got.bytes().await?;
+
+        // LEVER 3: speculative whole-file prefetch. On a *ranged* miss against
+        // a small object, fetch the whole file ONCE and cache it under the
+        // full-file key, then serve the requested slice from it. Subsequent
+        // range reads of this file are served as local slices in `get_cached`
+        // (see the full-file probe there) instead of more RTTs. We only do the
+        // second (full) GET when we actually requested a strict subset; the
+        // singleflight already guards concurrent leaders for THIS key, and the
+        // full-file fetch goes through the inner store directly so it cannot
+        // recurse into the cache or double-fetch.
+        let spec_bytes = resolve_speculative_bytes();
+        let did_partial = range.is_some();
+        if spec_bytes > 0 && did_partial && full_size <= spec_bytes && full_size > 0 {
+            // Don't re-fetch if the full file is already cached (a concurrent
+            // sibling range may have populated it).
+            let full_key = key_for(location, None);
+            let full_fs = self.fragment_path(&full_key);
+            let full = match try_read_cached(&self.state, &full_key, &full_fs).await {
+                Some(b) => Some(b),
+                None => match self
+                    .inner
+                    .get_opts(location, GetOptions::default())
+                    .await
+                {
+                    Ok(g) => g.bytes().await.ok(),
+                    Err(_) => None, // best-effort: fall back to the ranged bytes
+                },
+            };
+            if let Some(full) = full {
+                // Cache the full file (best-effort write-through), then serve
+                // the originally-requested slice from it.
+                self.store_fragment(&full_key, &full_fs, location, &full).await;
+                let r = resolve_range(range.as_ref(), full.len() as u64);
+                return Ok(full.slice(r));
+            }
+            // Speculative full fetch failed — fall through and serve/cache the
+            // ranged bytes we already have, exactly as before.
+        }
 
         // Write-through. Best effort: if the cache write fails (disk
         // full, permission, etc.) we still return the bytes to the
@@ -480,6 +575,44 @@ impl DiskCachedStore {
         }
 
         Ok(bytes)
+    }
+
+    /// Write `bytes` through to disk under `(key, fs_path)` and register it in
+    /// the LRU index, unlinking any fragments evicted to make room. Best
+    /// effort: a failed write-through is logged and skipped (the cache is a
+    /// performance tier, not a durability boundary).
+    async fn store_fragment(
+        &self,
+        key: &KeyHash,
+        fs_path: &FsPath,
+        location: &ObjectPath,
+        bytes: &Bytes,
+    ) {
+        if let Err(e) = write_through(fs_path, bytes).await {
+            tracing::warn!(
+                target = "basin_storage::disk_cache",
+                fragment = %fs_path.display(),
+                error = %e,
+                "disk_cache: speculative full-file write-through failed"
+            );
+            return;
+        }
+        let meta = FileMeta {
+            fs_path: fs_path.to_path_buf(),
+            size: bytes.len() as u64,
+            object_path: location.clone(),
+        };
+        let to_delete = {
+            let mut g = self
+                .state
+                .index
+                .lock()
+                .expect("disk-cache index mutex poisoned");
+            g.insert(*key, meta)
+        };
+        for p in to_delete {
+            let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(p)).await;
+        }
     }
 
     /// Drop every cached entry that maps to `location`. Used by the
@@ -847,6 +980,34 @@ mod tests {
         PutPayload::from_bytes(Bytes::copy_from_slice(b))
     }
 
+    /// Serialises the two speculative-prefetch tests, which both mutate the
+    /// process-global `BASIN_DISK_CACHE_SPECULATIVE_BYTES`, and restores the
+    /// prior value on drop.
+    static SPEC_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct SpecEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev: Option<String>,
+    }
+
+    impl SpecEnvGuard {
+        fn set(val: &str) -> Self {
+            let lock = SPEC_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var("BASIN_DISK_CACHE_SPECULATIVE_BYTES").ok();
+            std::env::set_var("BASIN_DISK_CACHE_SPECULATIVE_BYTES", val);
+            Self { _lock: lock, prev }
+        }
+    }
+
+    impl Drop for SpecEnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("BASIN_DISK_CACHE_SPECULATIVE_BYTES", v),
+                None => std::env::remove_var("BASIN_DISK_CACHE_SPECULATIVE_BYTES"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn cache_hit_avoids_inner_get() {
         let inner_dir = TempDir::new().unwrap();
@@ -913,6 +1074,11 @@ mod tests {
 
     #[tokio::test]
     async fn range_keys_dont_collide() {
+        // Disable the speculative whole-file promotion (LEVER 3) so this test
+        // exercises ONLY per-range key separation — the property it's named
+        // for. With speculation on, a small file's ranges would be served from
+        // one cached full file (covered by the speculative-prefetch tests).
+        let _guard = SpecEnvGuard::set("0");
         let inner_dir = TempDir::new().unwrap();
         let cache_dir = TempDir::new().unwrap();
         let inner_real = Arc::new(LocalFileSystem::new_with_prefix(inner_dir.path()).unwrap());
@@ -943,6 +1109,99 @@ mod tests {
         assert_eq!(&r2b[..], b"fgh");
         let n2 = counting.gets.load(Ordering::Relaxed);
         assert_eq!(n2, n1, "both ranges should be warm now");
+    }
+
+    #[test]
+    fn resolve_range_matches_object_store_semantics() {
+        assert_eq!(resolve_range(None, 10), 0..10);
+        assert_eq!(resolve_range(Some(&GetRange::Bounded(2..5)), 10), 2..5);
+        // Bounded end clamps to full_len.
+        assert_eq!(resolve_range(Some(&GetRange::Bounded(2..50)), 10), 2..10);
+        assert_eq!(resolve_range(Some(&GetRange::Offset(7)), 10), 7..10);
+        assert_eq!(resolve_range(Some(&GetRange::Suffix(3)), 10), 7..10);
+        // Suffix larger than file → whole file.
+        assert_eq!(resolve_range(Some(&GetRange::Suffix(99)), 10), 0..10);
+    }
+
+    /// LEVER 3 decision: a *ranged* read of a SMALL file triggers exactly ONE
+    /// full-file fetch; the originally-requested slice is correct, and a
+    /// second, DIFFERENT range read of the same file is served from the cached
+    /// full file with no further inner GET.
+    #[tokio::test]
+    async fn speculative_prefetch_serves_ranges_from_one_full_fetch() {
+        let _guard = SpecEnvGuard::set("1048576"); // 1 MiB ceiling; file is tiny
+        let inner_dir = TempDir::new().unwrap();
+        let cache_dir = TempDir::new().unwrap();
+        let inner_real = Arc::new(LocalFileSystem::new_with_prefix(inner_dir.path()).unwrap());
+        let counting = Arc::new(CountingStore {
+            inner: inner_real,
+            gets: AtomicUsize::new(0),
+        });
+        let cached = DiskCachedStore::new(
+            counting.clone() as Arc<dyn ObjectStore>,
+            DiskCacheConfig::new(cache_dir.path().to_path_buf(), 1024 * 1024),
+        )
+        .unwrap();
+
+        let p = ObjectPath::from("small.vortex");
+        cached.put(&p, payload(b"abcdefghij")).await.unwrap();
+
+        let n0 = counting.gets.load(Ordering::Relaxed);
+        // First ranged read: cold miss → one ranged GET + one full GET
+        // (the speculative promotion). Slice must be correct.
+        let r1 = cached.get_range(&p, 0..3).await.unwrap();
+        assert_eq!(&r1[..], b"abc");
+        let n1 = counting.gets.load(Ordering::Relaxed);
+        assert!(
+            n1 >= n0 + 1,
+            "first ranged read must hit inner at least once"
+        );
+
+        // A DIFFERENT range, now served from the speculatively-cached full
+        // file: NO further inner GET.
+        let r2 = cached.get_range(&p, 5..8).await.unwrap();
+        assert_eq!(&r2[..], b"fgh");
+        let n2 = counting.gets.load(Ordering::Relaxed);
+        assert_eq!(
+            n2, n1,
+            "second range must be sliced from the cached full file (no inner GET)"
+        );
+
+        // The full file is also a warm hit.
+        let full = cached.get(&p).await.unwrap().bytes().await.unwrap();
+        assert_eq!(&full[..], b"abcdefghij");
+        let n3 = counting.gets.load(Ordering::Relaxed);
+        assert_eq!(n3, n2, "full read must be a cache hit too");
+    }
+
+    /// With the speculative ceiling DISABLED (0), each distinct range is its
+    /// own cold miss exactly as in the pre-lever behaviour — proving the
+    /// optimisation is the only thing collapsing the GETs above.
+    #[tokio::test]
+    async fn speculative_prefetch_disabled_keeps_per_range_fetches() {
+        let _guard = SpecEnvGuard::set("0");
+        let inner_dir = TempDir::new().unwrap();
+        let cache_dir = TempDir::new().unwrap();
+        let inner_real = Arc::new(LocalFileSystem::new_with_prefix(inner_dir.path()).unwrap());
+        let counting = Arc::new(CountingStore {
+            inner: inner_real,
+            gets: AtomicUsize::new(0),
+        });
+        let cached = DiskCachedStore::new(
+            counting.clone() as Arc<dyn ObjectStore>,
+            DiskCacheConfig::new(cache_dir.path().to_path_buf(), 1024 * 1024),
+        )
+        .unwrap();
+
+        let p = ObjectPath::from("small.vortex");
+        cached.put(&p, payload(b"abcdefghij")).await.unwrap();
+
+        let _ = cached.get_range(&p, 0..3).await.unwrap();
+        let n1 = counting.gets.load(Ordering::Relaxed);
+        // Different range is a fresh cold miss (its own GET) when disabled.
+        let _ = cached.get_range(&p, 5..8).await.unwrap();
+        let n2 = counting.gets.load(Ordering::Relaxed);
+        assert_eq!(n2, n1 + 1, "disabled: each range is its own inner GET");
     }
 
     #[tokio::test]

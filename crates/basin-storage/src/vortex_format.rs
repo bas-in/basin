@@ -279,24 +279,76 @@ pub(crate) async fn footer_meta(
     u64,
     std::collections::BTreeMap<String, crate::data_file::ColumnStats>,
 )> {
-    use vortex_array::dtype::{DType, PType};
-    use vortex_array::expr::stats::Stat;
-
-    let mut out = std::collections::BTreeMap::new();
     let vf = session()
         .open_options()
         .open_buffer(bytes)
         .map_err(|e| BasinError::storage(format!("vortex: open_buffer (footer): {e}")))?;
+    Ok(stats_from_vortex_file(&vf))
+}
+
+/// LEVER 2: footer/stats read that issues only **tail range GETs** against the
+/// object store instead of fetching the whole file. Vortex footers live at the
+/// tail (postscript + EOF marker + layout/dtype/file-statistics segments), so
+/// `VortexOpenOptions::open_read` over an [`ObjectStoreReadAt`] reads
+/// `MAX_POSTSCRIPT_SIZE + EOF_SIZE` (~64 KiB) from the end, then a small,
+/// bounded set of `NeedMoreData{offset,len}` ranges for the footer segments —
+/// **never the data**. On a multi-MiB Vortex stripe this turns the cold-stats
+/// path from a full-file GET into a couple of tail range reads, the same shape
+/// Parquet's `~10 KiB` footer read already enjoys. `file_size` is the size from
+/// the LIST result, so no HEAD round-trip is needed either.
+///
+/// Returns the same `(row_count, column_stats)` shape (and the identical
+/// type-gated `ColumnStats` byte contract) as [`footer_meta`]; the
+/// Vortex⇆Parquet differential harness is the correctness gate for both.
+pub(crate) async fn footer_meta_from_store(
+    store: Arc<dyn object_store::ObjectStore>,
+    path: &object_store::path::Path,
+    file_size: u64,
+) -> Result<(
+    u64,
+    std::collections::BTreeMap<String, crate::data_file::ColumnStats>,
+)> {
+    use vortex_io::object_store::ObjectStoreReadAt;
+    use vortex_io::VortexReadAt;
+
+    // `ObjectStoreReadAt` is not `Clone`, so use `open(Arc<dyn VortexReadAt>)`
+    // (the Arc IS Clone) rather than `open_read(R: ... + Clone)`. Both drive
+    // the identical tail-range `read_footer` path.
+    let reader: Arc<dyn VortexReadAt> =
+        Arc::new(ObjectStoreReadAt::new(store, path.clone(), session().handle()));
+    let vf = session()
+        .open_options()
+        .with_file_size(file_size)
+        .open(reader)
+        .await
+        .map_err(|e| BasinError::storage(format!("vortex: open (footer tail): {e}")))?;
+    Ok(stats_from_vortex_file(&vf))
+}
+
+/// Extract `(row_count, column_stats)` from an already-opened [`VortexFile`].
+/// Shared by the in-memory ([`footer_meta`]) and tail-range
+/// ([`footer_meta_from_store`]) footer paths so both emit byte-identical
+/// `ColumnStats`.
+fn stats_from_vortex_file(
+    vf: &vortex_file::VortexFile,
+) -> (
+    u64,
+    std::collections::BTreeMap<String, crate::data_file::ColumnStats>,
+) {
+    use vortex_array::dtype::{DType, PType};
+    use vortex_array::expr::stats::Stat;
+
+    let mut out = std::collections::BTreeMap::new();
     let rc = vf.row_count();
 
     // Top-level struct field names, in field order (the same order the
     // file statistics are recorded in).
     let names: Vec<String> = match vf.dtype() {
         DType::Struct(sd, _) => sd.names().iter().map(|n| n.to_string()).collect(),
-        _ => return Ok((rc, out)),
+        _ => return (rc, out),
     };
     let Some(fs) = vf.file_stats() else {
-        return Ok((rc, out));
+        return (rc, out);
     };
 
     for (idx, name) in names.iter().enumerate() {
@@ -364,7 +416,7 @@ pub(crate) async fn footer_meta(
             );
         }
     }
-    Ok((rc, out))
+    (rc, out)
 }
 
 /// Decode a Vortex byte blob back to `RecordBatch`es. One `RecordBatch` is

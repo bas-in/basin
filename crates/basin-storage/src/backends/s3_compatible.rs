@@ -27,9 +27,30 @@
 //! See `docs/scaling/object-storage.md` for the deployment story.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use object_store::aws::AmazonS3Builder;
-use object_store::ObjectStore;
+use object_store::{ClientOptions, ObjectStore};
+
+/// Default HTTP connection-pool ceiling per host for the S3 client. Overridable
+/// with `BASIN_S3_POOL_MAX_IDLE` (positive `usize`); unset / unparseable / zero
+/// keeps this default. object_store's default reqwest client leaves
+/// `pool_max_idle_per_host` at hyper's default, which throttles the concurrent
+/// footer + row-group GET fan-out a many-file point query issues — the
+/// concurrency ceiling that flattened QPS past C=16 in the seaweed bench. 64
+/// matches the in-flight GET fan-out the reader drives (`buffer_unordered(32)`
+/// twice, plus disk-cache leaders) with headroom.
+const DEFAULT_S3_POOL_MAX_IDLE: usize = 64;
+
+/// Resolve the per-host idle-connection pool ceiling from
+/// `BASIN_S3_POOL_MAX_IDLE`, falling back to [`DEFAULT_S3_POOL_MAX_IDLE`].
+fn resolve_pool_max_idle() -> usize {
+    std::env::var("BASIN_S3_POOL_MAX_IDLE")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_S3_POOL_MAX_IDLE)
+}
 
 /// Provider flavour. The values share the same builder and the same
 /// env-var surface; only the *default* region and endpoint differ.
@@ -175,11 +196,30 @@ impl S3LikeConfig {
     /// Realise the config into an `Arc<dyn ObjectStore>` ready to drop
     /// into [`crate::StorageConfig::object_store`].
     pub fn build_object_store(&self) -> Result<Arc<dyn ObjectStore>, String> {
+        // LEVER 4: size the HTTP connection pool and give it sane timeouts.
+        // object_store 0.13 does not take a raw `reqwest::Client`; it builds
+        // its own reqwest client from a `ClientOptions`, which exposes exactly
+        // the knobs we need (pool sizing + per-request/connect timeouts). A
+        // small pool ceiling silently serialises the per-query GET fan-out
+        // (footer + row-group reads), which is what capped QPS in the bench;
+        // we raise it and pin timeouts so a hung connection fails fast instead
+        // of stalling the whole query.
+        let client_opts = ClientOptions::default()
+            .with_pool_max_idle_per_host(resolve_pool_max_idle())
+            // Keep idle conns warm long enough to be reused across the bursts
+            // of a point-query workload, but not so long they leak fds.
+            .with_pool_idle_timeout(Duration::from_secs(90))
+            // Whole-request and connect ceilings: a stuck S3 GET should error
+            // out and let the caller retry/prune rather than wedge the worker.
+            .with_timeout(Duration::from_secs(60))
+            .with_connect_timeout(Duration::from_secs(10));
+
         let mut b = AmazonS3Builder::new()
             .with_bucket_name(&self.bucket)
             .with_region(&self.region)
             .with_access_key_id(&self.access_key_id)
             .with_secret_access_key(&self.secret_access_key)
+            .with_client_options(client_opts)
             // Virtual-hosted-style is required by Tigris and accepted by
             // AWS S3, so this default is safe across S3-compatible providers.
             .with_virtual_hosted_style_request(true);
@@ -273,6 +313,7 @@ mod tests {
         "AWS_REGION",
         "AWS_ENDPOINT_URL_S3",
         "BUCKET_NAME",
+        "BASIN_S3_POOL_MAX_IDLE",
     ];
 
     fn clean_env_with(overrides: &[(&'static str, &str)]) -> EnvGuard {
@@ -287,6 +328,32 @@ mod tests {
             }
         }
         EnvGuard::new(&vars)
+    }
+
+    #[test]
+    fn pool_max_idle_defaults_when_unset() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g = clean_env_with(&[]); // clears BASIN_S3_POOL_MAX_IDLE among others
+        assert_eq!(resolve_pool_max_idle(), DEFAULT_S3_POOL_MAX_IDLE);
+    }
+
+    #[test]
+    fn pool_max_idle_parses_env_override() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g = clean_env_with(&[("BASIN_S3_POOL_MAX_IDLE", "128")]);
+        assert_eq!(resolve_pool_max_idle(), 128);
+    }
+
+    #[test]
+    fn pool_max_idle_rejects_zero_and_garbage() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // Zero is meaningless for a pool ceiling — fall back to the default.
+        let _g = clean_env_with(&[("BASIN_S3_POOL_MAX_IDLE", "0")]);
+        assert_eq!(resolve_pool_max_idle(), DEFAULT_S3_POOL_MAX_IDLE);
+        drop(_g);
+        // Unparseable → default.
+        let _g2 = clean_env_with(&[("BASIN_S3_POOL_MAX_IDLE", "not-a-number")]);
+        assert_eq!(resolve_pool_max_idle(), DEFAULT_S3_POOL_MAX_IDLE);
     }
 
     #[test]
