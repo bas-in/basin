@@ -2571,6 +2571,95 @@ impl ShardImpl for InProcessShard {
         false
     }
 
+    async fn pending_tail_rows(&self, project: &ProjectId, table: &TableName) -> usize {
+        // Same O(resident-partitions) shape as `has_pending_tail`, but returns
+        // the SUM of un-flushed tail rows for `(project, table)` across every
+        // resident partition instead of a boolean. The read path uses this to
+        // decide whether a small tail can be merged on-read (via the shard's
+        // own tail-merging `handle.read`) rather than flushed — see the
+        // `execute_simple_select` flush-decision gate. Like `has_pending_tail`
+        // it never lists or scans object storage and never drains the tail; it
+        // only reads the resident per-partition tail batch row counts under
+        // their read locks. We hold only the per-partition RwLock (released
+        // before the next iteration), never the global map lock across an await.
+        let snapshot: Vec<Arc<RwLock<PartitionState>>> = {
+            let map = self.partitions.lock().await;
+            map.iter()
+                .filter(|((p, _), _)| p == project)
+                .map(|(_, state)| state.clone())
+                .collect()
+        };
+        let mut rows = 0usize;
+        for state in snapshot {
+            let g = state.read().await;
+            if let Some(v) = g.tail.get(table) {
+                rows += v.iter().map(|(_, b)| b.num_rows()).sum::<usize>();
+            }
+        }
+        rows
+    }
+
+    async fn read_table_merging_tails(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        opts: basin_storage::ReadOptions,
+    ) -> Result<Vec<RecordBatch>> {
+        // Cold read first: `storage.read` is (project, table)-scoped — it
+        // already spans EVERY stripe partition's flushed data, so the cold
+        // side needs no per-partition iteration. Forward all pushdown knobs.
+        let parquet_opts = basin_storage::ReadOptions {
+            projection: opts.projection.clone(),
+            filters: opts.filters.clone(),
+            partition: opts.partition.clone(),
+            limit: opts.limit,
+            row_group_selection: opts.row_group_selection.clone(),
+            sorted_by: opts.sorted_by.clone(),
+        };
+        let stream = self.cfg.storage.read(project, table, parquet_opts).await?;
+        let mut out: Vec<RecordBatch> = stream
+            .collect::<Vec<Result<RecordBatch>>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+
+        // Merge the in-memory tail from EVERY resident partition for this
+        // (project, table) — NOT just `default_key()`. Statement-affine
+        // striping routes multi-row INSERTs into `s1`, `s2`, … partitions, so
+        // a single-partition `ProjectHandle::read` would miss their un-flushed
+        // tail rows (the read-own-write / keyset-seam losses). Same
+        // O(resident-partitions) snapshot shape as `pending_tail_rows`: hold
+        // the global map lock only to clone the per-partition state handles,
+        // then read each tail under its own RwLock.
+        let snapshot: Vec<Arc<RwLock<PartitionState>>> = {
+            let map = self.partitions.lock().await;
+            map.iter()
+                .filter(|((p, _), _)| p == project)
+                .map(|(_, state)| state.clone())
+                .collect()
+        };
+        for state in snapshot {
+            let tail_batches: Vec<RecordBatch> = {
+                let g = state.read().await;
+                match g.tail.get(table) {
+                    Some(v) => v.iter().map(|(_, b)| b.clone()).collect(),
+                    None => Vec::new(),
+                }
+            };
+            for batch in tail_batches {
+                let projected = match &opts.projection {
+                    Some(cols) => project_batch(&batch, cols)?,
+                    None => batch,
+                };
+                let filtered = apply_filters(projected, &opts.filters)?;
+                if filtered.num_rows() > 0 {
+                    out.push(filtered);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     #[cfg(test)]
     fn as_in_process(&self) -> Option<Arc<InProcessShard>> {
         Some(Arc::new(self.share_clone()))

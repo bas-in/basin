@@ -468,6 +468,39 @@ impl Shard {
         self.inner.has_pending_tail(project, table).await
     }
 
+    /// Cheap O(resident-partitions) count of un-flushed in-memory tail rows for
+    /// `(project, table)`, summed across every resident partition.
+    ///
+    /// Like [`Shard::has_pending_tail`] this never lists or scans object
+    /// storage and never drains the tail — it only inspects the resident
+    /// per-partition tail maps. The read path uses it to decide whether a
+    /// small pending tail can be merged on-read (via the shard's own
+    /// tail-merging `ProjectHandle::read`) instead of paying a synchronous
+    /// flush. See [`ShardImpl::pending_tail_rows`].
+    pub async fn pending_tail_rows(&self, project: &ProjectId, table: &TableName) -> usize {
+        self.inner.pending_tail_rows(project, table).await
+    }
+
+    /// Cold-tier read for `(project, table)` unioned with the un-flushed
+    /// in-memory tail of EVERY resident partition.
+    ///
+    /// This is the merge-on-read primitive the auto-commit read path uses when
+    /// it skips the synchronous flush for a small pending tail: the cold side
+    /// already spans every stripe partition's flushed data, and this merges
+    /// the still-resident tail of `s1`, `s2`, … (not only `default_key()`), so
+    /// read-own-write holds for striped multi-row INSERTs. See
+    /// [`ShardImpl::read_table_merging_tails`].
+    pub async fn read_table_merging_tails(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        opts: basin_storage::ReadOptions,
+    ) -> Result<Vec<RecordBatch>> {
+        self.inner
+            .read_table_merging_tails(project, table, opts)
+            .await
+    }
+
     /// Test-only: pull out the concrete in-process implementation so the
     /// inline tests can drive its synchronous helpers. Returns `None` if a
     /// future backend swap replaces the in-process map.
@@ -712,6 +745,36 @@ pub(crate) trait ShardImpl: Send + Sync {
     /// in-memory tail (their writes land directly in the cold tier).
     async fn has_pending_tail(&self, _project: &ProjectId, _table: &TableName) -> bool {
         false
+    }
+    /// Cheap O(resident-partitions) count of un-flushed in-memory tail rows for
+    /// `(project, table)`, summed across every resident partition.
+    ///
+    /// Same no-flush, no-list contract as [`ShardImpl::has_pending_tail`] — it
+    /// only reads the resident per-partition tail batch row counts under their
+    /// locks. Read paths use it to size the small-tail merge-on-read decision
+    /// (a small tail is merged via the shard's tail-merging `read`, a large
+    /// tail is flushed). Default `0` for backends that keep no in-memory tail.
+    async fn pending_tail_rows(&self, _project: &ProjectId, _table: &TableName) -> usize {
+        0
+    }
+    /// Cold read for `(project, table)` merged with the un-flushed in-memory
+    /// tail of EVERY resident partition (not just `default_key()`).
+    ///
+    /// `ProjectHandle::read` merges only its own partition's tail; under
+    /// statement-affine striping a table's tail is spread across `s1`, `s2`, …
+    /// partitions, so the small-tail merge-on-read decision must union them
+    /// all. The cold side is already (project, table)-scoped so it spans every
+    /// stripe; only the per-partition tail needs the fan-out. Default delegates
+    /// to a `default_key()` handle read (correct for single-partition backends
+    /// that never stripe).
+    async fn read_table_merging_tails(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        opts: basin_storage::ReadOptions,
+    ) -> Result<Vec<RecordBatch>> {
+        let handle = self.get(project, &PartitionKey::default_key()).await?;
+        handle.read(table, opts).await
     }
     /// Test-only downcast for the inline test suite.
     #[cfg(test)]
