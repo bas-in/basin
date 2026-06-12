@@ -59,8 +59,10 @@ precedence over the static key, and is **auto-refreshed** via
 `POST /auth/v1/refresh` when `access_expires_at` has passed. Refresh tokens
 rotate; reusing a rotated token surfaces as `E_REVOKED_TOKEN`.
 
-`signOut()` is **local-only**: the server exposes no sign-out / token-revoke
-route today.
+`signOut()` calls `POST /auth/v1/signout` to write a server-side revocation
+row for the refresh token, then clears the local session. The local session is
+cleared first, so the client is always considered signed out even if the server
+call fails. With no active session the call is a no-op.
 
 ## Error handling
 
@@ -71,6 +73,117 @@ Exception: `functions.invoke` proxies the guest function's own responses
 verbatim (a function returning 418 is not an error) — only Basin-layer
 envelopes (401/404/500) throw.
 
+## OAuth
+
+`auth.getOAuthAuthorizeUrl(provider, opts)` calls
+`GET /auth/v1/oauth/:provider/authorize?project_id=&redirect_to=` and returns
+`{ redirect_url, state }`. The server builds the full provider URL (with PKCE
++ signed CSRF state) — **the SDK cannot perform the browser redirect itself**.
+Redirect the user's browser to `result.redirect_url`.
+
+After the OAuth flow completes, Basin's callback handler
+(`GET /auth/v1/oauth/:provider/callback`) exchanges the code and issues a
+standard token body (Session). Typically your app receives these tokens via a
+redirect to your `redirect_to` URL.
+
+```ts
+// 1. Get the authorize URL (server-side or before redirecting)
+const { redirect_url } = await basin.auth.getOAuthAuthorizeUrl("github", {
+  redirectTo: "https://app.example.com/auth/callback",
+});
+
+// 2. Redirect the user's browser — SDK can't do this:
+window.location.href = redirect_url;
+
+// 3. After the provider redirects back, your callback page receives the
+//    tokens from the server and can call auth.setSession(...) to restore them.
+```
+
+Supported providers (preset): `google`, `github`, `apple`, `bitbucket`,
+`discord`, `figma`, `gitlab`, `linkedin`, `microsoft` (`azure_ad`), `notion`,
+`slack`, `spotify`, `twitch`, `twitter_x`. Custom OIDC providers can be
+registered server-side; pass their name string here.
+
+## MFA (TOTP and WebAuthn)
+
+MFA adds a second authentication factor. After enrollment and verification, use
+`challengeFactor` + `verifyChallenge` to obtain an **AAL2 JWT** — a session
+whose access token carries `aal2` in its claims. Some server operations require
+AAL2 (e.g. `unenrollFactor`).
+
+### TOTP (authenticator app)
+
+```ts
+// 1. Enroll — get the secret and otpauth URI
+const enroll = await basin.auth.enrollFactor("totp", {
+  friendlyName: "Authenticator App",
+});
+// enroll.factor_type === "totp"
+// Show enroll.otpauth_uri as a QR code, or display enroll.secret_b32
+
+// 2. Verify enrollment with the first OTP code
+const { ok, recovery_codes } = await basin.auth.verifyFactor(enroll.factor_id, {
+  code: "123456",
+});
+// recovery_codes is present only on the first verified factor — store securely.
+
+// 3. Step-up challenge (sign-in flow, sensitive operations)
+const { challenge_id } = await basin.auth.challengeFactor(enroll.factor_id);
+
+// 4. Complete challenge → receive AAL2 session (stored on the client automatically)
+const session = await basin.auth.verifyChallenge(
+  enroll.factor_id,
+  challenge_id,
+  { code: "654321" },
+);
+// session.access_token now carries aal2; client.auth.getSession() is updated.
+```
+
+### WebAuthn (hardware key / platform authenticator)
+
+```ts
+// 1. Enroll — get creation options for navigator.credentials.create()
+const enroll = await basin.auth.enrollFactor("webauthn", {
+  friendlyName: "YubiKey 5",
+});
+// enroll.factor_type === "webauthn"
+// enroll.creation_options is already JSON-parsed, ready for the browser API:
+const credential = await navigator.credentials.create({
+  publicKey: enroll.creation_options,
+});
+
+// 2. Verify enrollment with the attestation
+await basin.auth.verifyFactor(enroll.factor_id, {
+  attestation: JSON.stringify(credential),
+  challengeId: enroll.challenge_id,
+});
+
+// 3. Challenge → get request options for navigator.credentials.get()
+const challenge = await basin.auth.challengeFactor(enroll.factor_id);
+// "request_options" in challenge → WebAuthnChallengeResult
+const assertion = await navigator.credentials.get({
+  publicKey: challenge.request_options,
+});
+
+// 4. Complete challenge → AAL2 session
+await basin.auth.verifyChallenge(
+  enroll.factor_id,
+  challenge.challenge_id,
+  { assertion: JSON.stringify(assertion) },
+);
+```
+
+### Factor management
+
+```ts
+// List enrolled factors
+const factors = await basin.auth.listFactors();
+// [{ id, factor_type, status, friendly_name, created_at, updated_at }, ...]
+
+// Unenroll (requires AAL2 session)
+await basin.auth.unenrollFactor(factorId);
+```
+
 ## Route bindings (SDK method → verified server route)
 
 | SDK method | Route | Source |
@@ -78,13 +191,21 @@ envelopes (401/404/500) throw.
 | `auth.signUp` | `POST /auth/v1/signup` | `crates/basin-rest/src/server.rs:250` |
 | `auth.signIn` | `POST /auth/v1/signin` | `server.rs:251` |
 | `auth.refreshSession` (+auto-refresh) | `POST /auth/v1/refresh` | `server.rs:252` |
-| `auth.verifyEmail` | `POST /auth/v1/verify-email` | `server.rs:253` |
-| `auth.resetPassword` | `POST /auth/v1/reset-password` | `server.rs:254` |
-| `auth.requestPasswordReset` | `POST /auth/v1/request-password-reset` | `server.rs:255-258` |
+| `auth.signOut` | `POST /auth/v1/signout` | `server.rs:253` |
+| `auth.verifyEmail` | `POST /auth/v1/verify-email` | `server.rs:254` |
+| `auth.resetPassword` | `POST /auth/v1/reset-password` | `server.rs:255` |
+| `auth.requestPasswordReset` | `POST /auth/v1/request-password-reset` | `server.rs:256` |
 | `auth.requestMagicLink` | `POST /auth/v1/magic-link` (204) | `server.rs:262` |
-| `auth.consumeMagicLink` | `POST /auth/v1/magic-link/consume` | `server.rs:263-266` |
-| `auth.createApiKey` / `listApiKeys` | `POST/GET /auth/v1/api-keys` | `server.rs:267-270` |
-| `auth.deleteApiKey` | `DELETE /auth/v1/api-keys/:id` | `server.rs:271-274` |
+| `auth.consumeMagicLink` | `POST /auth/v1/magic-link/consume` | `server.rs:263` |
+| `auth.createApiKey` / `listApiKeys` | `POST/GET /auth/v1/api-keys` | `server.rs:267` |
+| `auth.deleteApiKey` | `DELETE /auth/v1/api-keys/:id` | `server.rs:271` |
+| `auth.getOAuthAuthorizeUrl` | `GET /auth/v1/oauth/:provider/authorize` | `server.rs:277` |
+| `auth.enrollFactor` | `POST /auth/v1/factors` | `server.rs:286` |
+| `auth.listFactors` | `GET /auth/v1/factors` | `server.rs:287` |
+| `auth.verifyFactor` | `POST /auth/v1/factors/:id/verify` | `server.rs:290` |
+| `auth.challengeFactor` | `POST /auth/v1/factors/:id/challenge` | `server.rs:294` |
+| `auth.verifyChallenge` | `POST /auth/v1/factors/:id/challenge/verify` | `server.rs:298` |
+| `auth.unenrollFactor` | `DELETE /auth/v1/factors/:id` | `server.rs:302` |
 | `from(t)` GET (`select/eq/.../order/limit/offset/cursor/stream`) | `GET /rest/v1/:table` | `server.rs:243-249`, grammar `parser.rs` |
 | `from(t).insert` | `POST /rest/v1/:table` (201) | `server.rs:246`, `routes/data.rs` |
 | `from(t).update` | `PATCH /rest/v1/:table?filters` | `server.rs:247` |
@@ -118,9 +239,6 @@ selects, or `Prefer` headers; filters always AND together.
 
 ## Not bound yet (gap list)
 
-- **OAuth** (`GET /auth/v1/oauth/:provider/{authorize,callback}`) — browser
-  redirect flow; needs design beyond a fetch wrapper.
-- **MFA** (`/auth/v1/factors*`) — TOTP/WebAuthn enroll + step-up challenge.
 - **SSE realtime** (`GET /realtime/v1/sse/:project/:table`) — WS covers the
   same events; SSE left for environments without WebSocket.
 - **Admin surface** (`/admin/v1/*`: project provisioning, function
@@ -129,8 +247,6 @@ selects, or `Prefer` headers; filters always AND together.
 - **Inbound webhooks** (`POST /in/:project_id/:name`) — called *by external
   services*, not by app clients. `basin-webhooks` itself is an outbound
   delivery worker with no client-facing HTTP routes.
-- **Sign-out / token revocation** — no server route exists; `signOut()` is
-  local-only by design.
 - **Signed upload URLs** — the `sign/upload` route mints time-boxed
   *download* URLs only (the `upload` path literal is an axum-router
   disambiguation, see `storage_sign.rs`).
