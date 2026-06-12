@@ -1556,6 +1556,47 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                 }
             }
 
+            // ── DISCARD ALL / RESET ALL — real session reset (5.27.E) ───────
+            // pgbouncer-style poolers issue `DISCARD ALL` as their
+            // `server_reset_query`; some drivers issue `RESET ALL`. Both must
+            // perform Basin's authoritative DISCARD-ALL rather than the
+            // noop-accept, so a SQL-driven pool gets the same isolation the
+            // native `SessionPool` gets at checkout. `DISCARD PLANS` /
+            // `DISCARD TEMP` map to the prepared-statement / (best-effort)
+            // sub-resets; `RESET ALL` resets only the GUCs.
+            {
+                let upper = sql.trim().trim_end_matches(';').trim_end().to_ascii_uppercase();
+                if matches!(kind, crate::pg_ast::StmtKind::Discard) {
+                    match upper.as_str() {
+                        "DISCARD PLANS" => {
+                            sess.state.prepared.clear_all().await;
+                            return Ok(ExecResult::Empty { tag: "DISCARD PLANS".into() });
+                        }
+                        "DISCARD SEQUENCES" => {
+                            return Ok(ExecResult::Empty { tag: "DISCARD SEQUENCES".into() });
+                        }
+                        "DISCARD TEMP" | "DISCARD TEMPORARY" => {
+                            // Basin has no session-scoped temp schema to drop here;
+                            // the native pool tracks temp-table names and drops them
+                            // at checkout. Accept with the PG tag.
+                            return Ok(ExecResult::Empty { tag: "DISCARD TEMP".into() });
+                        }
+                        _ => {
+                            // DISCARD ALL — full DISCARD-ALL reset.
+                            sess.reset_for_pool_reuse().await;
+                            return Ok(ExecResult::Empty { tag: "DISCARD ALL".into() });
+                        }
+                    }
+                }
+                // `RESET ALL` parses as VariableSet (VAR_RESET_ALL). Reset just
+                // the GUCs (PG's `RESET ALL` does not touch cursors / prepared /
+                // advisory / LISTEN — that is `DISCARD ALL`).
+                if matches!(kind, crate::pg_ast::StmtKind::VariableSet) && upper == "RESET ALL" {
+                    sess.state.reset_gucs();
+                    return Ok(ExecResult::Empty { tag: "RESET".into() });
+                }
+            }
+
             if let Some(result) = crate::noop_accept::try_accept_as_noop(kind, sql) {
                 return Ok(result);
             }
