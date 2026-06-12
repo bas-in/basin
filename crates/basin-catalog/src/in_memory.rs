@@ -206,6 +206,10 @@ pub struct InMemoryCatalog {
     /// Per-project pgwire connection ceiling. Written by the admin route;
     /// read by the pgwire startup handler. Cleared in `drop_namespace`.
     project_max_connections: Mutex<HashMap<ProjectId, u32>>,
+    /// Per-project home region (Fly.io region code). Written by the admin
+    /// placement route; consumed by the multi-region router (future). Cleared
+    /// in `drop_namespace`. `None` means "no placement pin".
+    project_home_regions: Mutex<HashMap<ProjectId, String>>,
     /// Per-`(project, partition)` compaction watermark — the highest WAL LSN
     /// whose tail batch has been compacted into a catalog-committed cold file.
     /// Mirrors the Postgres `compaction_watermarks` table. Monotonic: writes
@@ -277,6 +281,7 @@ impl InMemoryCatalog {
             leases: Mutex::new(HashMap::new()),
             project_metadata: Mutex::new(HashMap::new()),
             project_max_connections: Mutex::new(HashMap::new()),
+            project_home_regions: Mutex::new(HashMap::new()),
             compaction_watermarks: Mutex::new(HashMap::new()),
             cdc_webhooks: Mutex::new(HashMap::new()),
         }
@@ -607,6 +612,9 @@ impl Catalog for InMemoryCatalog {
         // Clear per-project connection ceiling.
         let mut mc = self.project_max_connections.lock().await;
         mc.remove(project);
+        // Clear per-project home region pin.
+        let mut hr = self.project_home_regions.lock().await;
+        hr.remove(project);
         // Clear per-project CDC webhook subscriptions + cursors.
         let mut cwh = self.cdc_webhooks.lock().await;
         cwh.retain(|(t, _), _| t != project);
@@ -1501,6 +1509,21 @@ impl Catalog for InMemoryCatalog {
     async fn get_project_max_connections(&self, project: &ProjectId) -> Result<Option<u32>> {
         let m = self.project_max_connections.lock().await;
         Ok(m.get(project).copied())
+    }
+
+    async fn set_project_home_region(
+        &self,
+        project: &ProjectId,
+        home_region: &str,
+    ) -> Result<()> {
+        let mut m = self.project_home_regions.lock().await;
+        m.insert(*project, home_region.to_owned());
+        Ok(())
+    }
+
+    async fn get_project_home_region(&self, project: &ProjectId) -> Result<Option<String>> {
+        let m = self.project_home_regions.lock().await;
+        Ok(m.get(project).cloned())
     }
 
     async fn register_view(&self, def: ViewDef, or_replace: bool) -> Result<()> {

@@ -584,6 +584,18 @@ impl PostgresCatalog {
                     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
                 )"
             ),
+            // Per-project home region (multi-region v0.2 placement, ADR 0009).
+            // Written by POST /admin/v1/projects/:id/placement; consumed by the
+            // multi-region router (future). A legacy catalog without this table
+            // returns None from get_project_home_region -- callers treat that as
+            // "no placement pin".
+            format!(
+                "CREATE TABLE IF NOT EXISTS {schema}.project_home_regions (
+                    project_id   TEXT NOT NULL PRIMARY KEY,
+                    home_region  TEXT NOT NULL,
+                    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+                )"
+            ),
             // ADR 0028 Phase 2 — per-project CDC webhook subscriptions and
             // their delivery cursor. The subscription columns (url, filters,
             // secret, active) are written at registration; the delivery
@@ -4124,6 +4136,52 @@ impl Catalog for PostgresCatalog {
             let v: i32 = r.get(0);
             v.max(1) as u32
         }))
+    }
+
+    // ---- Multi-region placement (ADR 0009) --------------------------------
+
+    #[instrument(skip(self), fields(project = %project, home_region = %home_region))]
+    async fn set_project_home_region(
+        &self,
+        project: &ProjectId,
+        home_region: &str,
+    ) -> Result<()> {
+        let sch = &self.schema;
+        let project_str = project.to_string();
+        let client = self.client().await?;
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {sch}.project_home_regions \
+                       (project_id, home_region, updated_at) \
+                     VALUES ($1, $2, now()) \
+                     ON CONFLICT (project_id) DO UPDATE \
+                     SET home_region = EXCLUDED.home_region, \
+                         updated_at  = now()"
+                ),
+                &[&project_str, &home_region],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("set_project_home_region: {e}")))?;
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(project = %project))]
+    async fn get_project_home_region(&self, project: &ProjectId) -> Result<Option<String>> {
+        let sch = &self.schema;
+        let project_str = project.to_string();
+        let client = self.client().await?;
+        let row = client
+            .query_opt(
+                &format!(
+                    "SELECT home_region FROM {sch}.project_home_regions \
+                     WHERE project_id = $1"
+                ),
+                &[&project_str],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("get_project_home_region: {e}")))?;
+        Ok(row.map(|r| r.get(0)))
     }
 
     // ---- ADR 0028 Phase 2: CDC webhooks ---------------------------------

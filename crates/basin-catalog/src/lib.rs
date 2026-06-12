@@ -436,6 +436,48 @@ pub trait Catalog: Send + Sync {
         Ok(None)
     }
 
+    /// Persist the per-project home region set by the cloud control-plane
+    /// (`POST /admin/v1/projects/:id/placement`).
+    ///
+    /// The value is a Fly.io region code (e.g. `"jnb"`, `"iad"`, `"fra"`)
+    /// that identifies the region whose shard leader owns the project's writes.
+    /// v0.1 only *records* the value; the actual cross-region routing /
+    /// replication that consumes it is future work (ADR 0009).
+    ///
+    /// ## Legacy-tolerant default
+    ///
+    /// Returns `Ok(())` (a durable no-op). Backends that do not persist the
+    /// home region fall back to `get_project_home_region` returning `None`,
+    /// which callers treat as "no placement pin" -- the correct behaviour for
+    /// backends written before this method existed.
+    async fn set_project_home_region(
+        &self,
+        project: &ProjectId,
+        home_region: &str,
+    ) -> Result<()> {
+        let _ = (project, home_region);
+        Ok(())
+    }
+
+    /// Read the persisted per-project home region.
+    ///
+    /// Returns `None` when no home region has been stored -- either because the
+    /// control-plane has never pushed one (new project, placement not yet set)
+    /// or because the catalog backend pre-dates this column. Callers treat
+    /// `None` as "no placement pin" and apply their own default routing.
+    ///
+    /// ## Default implementation
+    ///
+    /// Returns `Ok(None)` so non-overriding backends always take the no-pin
+    /// path.
+    async fn get_project_home_region(
+        &self,
+        project: &ProjectId,
+    ) -> Result<Option<String>> {
+        let _ = project;
+        Ok(None)
+    }
+
     /// Atomic commit: append `files` to the table, producing a new snapshot.
     ///
     /// Optimistic concurrency: the caller passes the snapshot id it last saw.
