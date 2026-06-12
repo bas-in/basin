@@ -7,22 +7,20 @@
 //!   * `time_bucket('<interval>', ts)` GROUP BY (1m / 1h / 1d)
 //!   * `create_hypertable(...)` DDL acceptance + hypertable ingest
 //!   * `timescaledb_information.chunks` virtual view
-//!
-//! TimescaleDB-specific surfaces NOT implemented on Basin are benchmarked
-//! against their PG-EQUIVALENT, and the metric LABEL says so explicitly:
-//!   * `first()` / `last()` aggregates are NOT registered → both engines use a
-//!     window-function / DISTINCT-ON equivalent (no Timescale, "PG-equivalent"
-//!     in the label).
-//!   * `drop_chunks` is NOT registered → Basin uses `DELETE WHERE ts < cutoff`;
-//!     the metric is labelled "drop_chunks vs DELETE WHERE ts<cutoff".
+//!   * `first(v, ts)` / `last(v, ts)` native aggregates (commit 985d041)
+//!   * `drop_chunks(table, older_than)` native retention (commit 985d041)
 //!
 //! ## Shapes
 //!   TS1 time_bucket('1 minute', ts) GROUP BY over 1M rows
 //!   TS2 time_bucket('1 hour', ts)   GROUP BY
 //!   TS3 time_bucket('1 day', ts)    GROUP BY
-//!   TS4 first/last per group via DISTINCT-ON window (PG-equivalent, both sides)
-//!   TS5 retention: Basin DELETE WHERE ts<cutoff vs PG DELETE WHERE ts<cutoff
-//!       (drop_chunks not registered on Basin — labelled honestly)
+//!   TS4 first/last per group — probes native `first(v, ts)` / `last(v, ts)`
+//!       first; falls back to the ARRAY_AGG PG-equivalent if the native
+//!       aggregates error. The artifact records `basin_native_first_last:bool`
+//!       to indicate which path ran.
+//!   TS5 retention — probes native `drop_chunks('t', interval)` first; falls
+//!       back to `DELETE WHERE ts < cutoff` if drop_chunks errors. The artifact
+//!       records `basin_native_drop_chunks:bool`.
 //!   TS6 hypertable ingest rate vs plain-table ingest (both engines)
 //!   TS7 chunks-view query overhead (Basin-only; PG timescale chunks view)
 //!
@@ -210,10 +208,14 @@ async fn ext_bench_timescale() {
     let ts2_sql = "SELECT time_bucket('1 hour', ts) AS b, COUNT(*) AS n, SUM(value) AS s FROM metrics GROUP BY b ORDER BY b";
     let ts3_sql = "SELECT time_bucket('1 day', ts) AS b, COUNT(*) AS n, SUM(value) AS s FROM metrics GROUP BY b ORDER BY b";
 
-    // TS4: first/last per device. Basin has no first()/last() aggregate, so we
-    // use the PG-EQUIVALENT window form (works on both engines). The label says
-    // "PG-equivalent" so nobody mistakes this for a native Timescale aggregate.
-    let ts4_sql = "SELECT device, \
+    // TS4: first/last per device. Probe native first()/last() aggregates (landed
+    // in commit 985d041). If the native form errors, fall back to the ARRAY_AGG
+    // PG-equivalent. Record which path ran in basin_native_first_last.
+    let ts4_native_sql = "SELECT device, \
+        first(value, ts) AS first_value, \
+        last(value, ts) AS last_value \
+        FROM metrics GROUP BY device ORDER BY device";
+    let ts4_fallback_sql = "SELECT device, \
         (ARRAY_AGG(value ORDER BY ts ASC))[1] AS first_value, \
         (ARRAY_AGG(value ORDER BY ts DESC))[1] AS last_value \
         FROM metrics GROUP BY device ORDER BY device";
@@ -221,7 +223,17 @@ async fn ext_bench_timescale() {
     let ts1_b = basin_p50(&sess, ts1_sql, samples).await;
     let ts2_b = basin_p50(&sess, ts2_sql, samples).await;
     let ts3_b = basin_p50(&sess, ts3_sql, samples).await;
-    let ts4_b = basin_p50(&sess, ts4_sql, samples).await;
+
+    // Try native first()/last(); fall back to ARRAY_AGG equivalent on error.
+    let (ts4_b, basin_native_first_last) = {
+        let native = basin_p50(&sess, ts4_native_sql, samples).await;
+        if native.is_some() {
+            (native, true)
+        } else {
+            eprintln!("[ext_bench_timescale] TS4 native first/last unavailable, falling back to ARRAY_AGG");
+            (basin_p50(&sess, ts4_fallback_sql, samples).await, false)
+        }
+    };
     let ts4_supported = ts4_b.is_some();
 
     // TS7: chunks-view query (Basin virtual view; PG timescaledb chunks).
@@ -229,23 +241,37 @@ async fn ext_bench_timescale() {
     let ts7_b = basin_p50(&sess, ts7_sql, samples).await;
     let ts7_supported = ts7_b.is_some();
 
-    // TS5: retention. drop_chunks is not registered → use DELETE WHERE ts<cutoff.
-    // Measure ONCE (destructive — single-shot, no median): delete ~the first day.
+    // TS5: retention. Probe native drop_chunks (landed in commit 985d041).
+    // Falls back to DELETE WHERE ts < cutoff if drop_chunks errors.
+    // Single-shot (destructive — no median): delete ~the first day.
     let cutoff = EPOCH + 86_400; // first day
-    let ts5_b = {
+    let (ts5_b, basin_native_drop_chunks) = {
+        let drop_interval = "'24 hours'";
         let t = Instant::now();
-        match sess.execute(&format!("DELETE FROM metrics WHERE ts < to_timestamp({cutoff})")).await {
-            Ok(_) => Some(t.elapsed().as_secs_f64() * 1000.0),
+        match sess.execute(&format!("SELECT drop_chunks('metrics', {drop_interval})")).await {
+            Ok(_) => {
+                let elapsed = t.elapsed().as_secs_f64() * 1000.0;
+                (Some(elapsed), true)
+            }
             Err(e) => {
-                eprintln!("[ext_bench_timescale] TS5 DELETE unsupported: {e}");
-                None
+                eprintln!("[ext_bench_timescale] TS5 native drop_chunks unavailable ({e}), falling back to DELETE");
+                let t2 = Instant::now();
+                match sess.execute(&format!("DELETE FROM metrics WHERE ts < to_timestamp({cutoff})")).await {
+                    Ok(_) => (Some(t2.elapsed().as_secs_f64() * 1000.0), false),
+                    Err(e2) => {
+                        eprintln!("[ext_bench_timescale] TS5 DELETE also unsupported: {e2}");
+                        (None, false)
+                    }
+                }
             }
         }
     };
 
     println!(
-        "[ext_bench_timescale] Basin: TS1={:?} TS2={:?} TS3={:?} TS4(sup={ts4_supported})={:?} \
-         TS5(delete)={:?} TS7(chunks,sup={ts7_supported})={:?}",
+        "[ext_bench_timescale] Basin: TS1={:?} TS2={:?} TS3={:?} \
+         TS4(sup={ts4_supported},native={basin_native_first_last})={:?} \
+         TS5(native_drop_chunks={basin_native_drop_chunks})={:?} \
+         TS7(chunks,sup={ts7_supported})={:?}",
         ts1_b, ts2_b, ts3_b, ts4_b, ts5_b, ts7_b
     );
 
@@ -394,20 +420,25 @@ async fn ext_bench_timescale() {
               "basin_over_pg": ratio(ts2_b, pg_ts2) },
             { "label": "TS3: time_bucket('1 day') GROUP BY", "basin_p50_ms": opt_ms(ts3_b), "pg_p50_ms": opt_ms(pg_ts3),
               "basin_over_pg": ratio(ts3_b, pg_ts3) },
-            { "label": "TS4: first/last per device (PG-equivalent ARRAY_AGG, NOT Timescale first()/last())",
+            { "label": "TS4: first/last per device",
+              "basin_native_first_last": basin_native_first_last,
               "basin_supported": ts4_supported, "basin_p50_ms": opt_ms(ts4_b), "pg_p50_ms": opt_ms(pg_ts4),
-              "basin_over_pg": ratio(ts4_b, pg_ts4) },
-            { "label": "TS5: retention — Basin DELETE WHERE ts<cutoff vs PG DELETE WHERE ts<cutoff (drop_chunks not registered)",
-              "basin_ms": opt_ms(ts5_b), "pg_ms": opt_ms(pg_ts5), "single_shot": true },
+              "basin_over_pg": ratio(ts4_b, pg_ts4),
+              "basin_method": if basin_native_first_last { "native first(v,ts)/last(v,ts)" } else { "fallback: ARRAY_AGG PG-equivalent" } },
+            { "label": "TS5: retention",
+              "basin_native_drop_chunks": basin_native_drop_chunks,
+              "basin_ms": opt_ms(ts5_b), "pg_ms": opt_ms(pg_ts5), "single_shot": true,
+              "basin_method": if basin_native_drop_chunks { "native drop_chunks('metrics','24 hours')" } else { "fallback: DELETE WHERE ts<cutoff" } },
             { "label": "TS7: chunks-view query overhead", "basin_supported": ts7_supported,
               "basin_p50_ms": opt_ms(ts7_b), "pg_p50_ms": opt_ms(pg_ts7) },
         ],
-        "note": "time_bucket GROUP BY is native on Basin. first()/last() aggregates and \
-                 drop_chunks are NOT registered on Basin: TS4 uses a PG-equivalent \
-                 ARRAY_AGG window on BOTH engines (label says so), and TS5 measures \
-                 DELETE WHERE ts<cutoff (single-shot, destructive) as the retention \
-                 equivalent. When TimescaleDB is installed PG uses time_bucket and the \
-                 chunks view; otherwise PG falls back to date_trunc (PG-equivalent, \
-                 labelled). Hypertable ingest is compared on both engines.",
+        "note": "TS4 probes native first(v,ts)/last(v,ts) aggregates (commit 985d041) first; \
+                 falls back to ARRAY_AGG PG-equivalent if unavailable — basin_native_first_last \
+                 records which path ran. TS5 probes native drop_chunks first; falls back to \
+                 DELETE WHERE ts<cutoff — basin_native_drop_chunks records which path ran. \
+                 PG side is unchanged: PG has no Timescale so TS4 uses ARRAY_AGG and TS5 uses \
+                 DELETE on the PG side regardless. When TimescaleDB is installed PG uses \
+                 time_bucket and the chunks view; otherwise PG falls back to date_trunc. \
+                 Hypertable ingest is compared on both engines.",
     }));
 }
