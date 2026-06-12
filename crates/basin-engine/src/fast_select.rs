@@ -1782,6 +1782,23 @@ fn fallback_sql(raw_sql: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Default small-tail threshold for the read-path merge-on-read gate
+/// (`BASIN_READ_FLUSH_MIN_TAIL_ROWS`). When an auto-commit SELECT finds the
+/// shard tail holds at most this many un-flushed rows, it merges the tail on
+/// read (via the shard's tail-merging `read`) instead of paying a synchronous
+/// flush. Above the threshold the tail is flushed once and amortized over
+/// future reads. `0` disables the small-tail gate (the tail-empty fast-gate
+/// still applies). Sized to cover OLTP write bursts (a handful of single-row
+/// INSERTs between reads) without re-merging large bulk loads on every read.
+const READ_FLUSH_MIN_TAIL_ROWS_DEFAULT: usize = 256;
+
+fn read_flush_min_tail_rows() -> usize {
+    std::env::var("BASIN_READ_FLUSH_MIN_TAIL_ROWS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(READ_FLUSH_MIN_TAIL_ROWS_DEFAULT)
+}
+
 async fn execute_simple_select_inner(
     sess: &ProjectSession,
     plan: SimpleSelectPlan,
@@ -1895,12 +1912,82 @@ async fn execute_simple_select_inner(
         }
     }
 
+    // ── Flush-on-read decision (concurrency fix) ─────────────────────────────
+    //
+    // The unconditional `shard.flush_to_parquet()` below is the read path's
+    // single biggest serialization point under mixed read/write load: every
+    // SELECT takes the per-partition compact lock and drains the tail to
+    // Parquet, so readers queue behind writers (and behind each other) doing
+    // flush work they rarely need. Two gates avoid the flush in the common
+    // AUTO-COMMIT case (`request.is_none()` — the shape both benchmark losses
+    // exercise; pinned / in-tx / FirstTouch reads keep the unconditional flush,
+    // which they depend on for snapshot correctness):
+    //
+    //   1. Tail-empty fast-gate (`has_pending_tail` == false): there is nothing
+    //      to drain, so the flush is a pure no-op for data — but the real
+    //      `flush_to_parquet` still LISTs/scans every resident partition and
+    //      takes the compact lock. Skip it entirely: `load_table` already
+    //      reflects the correct head (no un-flushed rows exist), the cold read
+    //      is authoritative, and `handle.read` would merge an empty tail anyway.
+    //
+    //   2. Small-tail merge-on-read (`pending_tail_rows <= threshold`): rather
+    //      than flush a tiny tail, leave it in RAM and MERGE it into the read.
+    //      The shard's own `ProjectHandle::read` already unions the in-RAM tail
+    //      over the Parquet base (see `InProcessProjectHandle::read`), so the
+    //      default shard read branch is tail-complete for free. We only force
+    //      `tail_merge_via_shard_read = true` so the cold-file-DIRECT bypass
+    //      branches (`had_pk_probe`, the unordered-LIMIT per-file path — which
+    //      read `live_data_files()` straight from storage and would MISS the
+    //      un-flushed tail) are disabled for this statement, routing the read
+    //      through the tail-merging `handle.read`. Read-own-write is preserved:
+    //      a session's just-INSERTed row is either already served by the
+    //      pre-flush PK probe / write-through residency above, or it lives in
+    //      the tail that `handle.read` now merges.
+    //
+    // Above the threshold the tail is large enough that draining it once (and
+    // amortizing the cost over future reads) beats re-merging it on every read,
+    // so we flush as before. The threshold is env-tunable.
+    //
+    // Both gates are pure reads of the resident tail maps (no list, no drain,
+    // no compact lock); a write landing between the probe and the read is simply
+    // not part of this statement's view (same as a cold row landing mid-scan),
+    // and a write that lands and is NOT merged here is still durable in the
+    // WAL/tail and visible to the next read.
+    let mut tail_merge_via_shard_read = false;
+    let read_flush_skip = if request.is_none() {
+        if let Some(shard) = sess.engine.config().shard.as_ref() {
+            if !shard.has_pending_tail(&sess.project, &plan.table).await {
+                // Gate 1: empty tail → flush is a no-op; skip it.
+                true
+            } else {
+                let threshold = read_flush_min_tail_rows();
+                if threshold > 0
+                    && shard.pending_tail_rows(&sess.project, &plan.table).await <= threshold
+                {
+                    // Gate 2: small tail → merge on read via `handle.read`
+                    // instead of flushing.
+                    tail_merge_via_shard_read = true;
+                    true
+                } else {
+                    false
+                }
+            }
+        } else {
+            false
+        }
+    } else {
+        // Pinned / FirstTouch reads always flush (correctness, not perf).
+        false
+    };
+
     // Resolve the gate's read-view REQUEST into a concrete `Option<PinnedReadView>`,
     // loading metadata at the resolved pin. `FirstTouch` must flush (shard) before
     // it captures, so resolution happens per-branch alongside the flush.
     let (meta, pinned): (TableMetadata, Option<PinnedReadView>) =
         if let Some(shard) = sess.engine.config().shard.as_ref() {
-            shard.flush_to_parquet().await?;
+            if !read_flush_skip {
+                shard.flush_to_parquet().await?;
+            }
             match request {
                 // First touch of an untouched table: the flush above drained the
                 // tail and ADVANCED the head, so the live metadata IS the
@@ -2437,6 +2524,18 @@ async fn execute_simple_select_inner(
         }
         _ => None,
     };
+    // Small-tail merge-on-read: the keyset per-file path reads
+    // `live_data_files()` straight from storage (never via the tail-merging
+    // `handle.read`), so a skipped flush would leave the un-flushed tail
+    // invisible to it — a just-INSERTed row with `k > $1` could be dropped from
+    // the page. Disable the per-file LIMIT pushdown for this statement so the
+    // read routes through `handle.read`, which merges the tail. (The whole-file
+    // keyset answer stays correct — slower, never wrong.)
+    let keyset_per_file_limit = if tail_merge_via_shard_read {
+        None
+    } else {
+        keyset_per_file_limit
+    };
     // Unordered-LIMIT early-exit target (the `LIMIT k`, no-ORDER-BY twin of
     // the keyset slack above): collect `k + overlay_slack` post-pushdown cold
     // rows so that, after merge-on-read suppression (≤ `overlay_slack` rows
@@ -2454,6 +2553,16 @@ async fn execute_simple_select_inner(
         plan.limit.map(|k| k.saturating_add(overlay_slack))
     } else {
         None
+    };
+    // Small-tail merge-on-read: the unordered-LIMIT per-file path reads
+    // `live_data_files()` straight from storage (it never routes through the
+    // tail-merging `handle.read`), so a skipped flush would leave the un-flushed
+    // tail invisible to it. Disable the pushdown for this statement so the read
+    // falls into the shard `handle.read` branch, which merges the tail.
+    let unordered_limit_target = if tail_merge_via_shard_read {
+        None
+    } else {
+        unordered_limit_target
     };
     // Synthesise bounding-range predicates from IN-list predicates so the
     // Parquet row-group pruner sees a compact `[min, max]` filter rather than
@@ -2944,6 +3053,16 @@ async fn execute_simple_select_inner(
         // valid watermark guarantees the cold files are unchanged, so the probe
         // would only re-derive what we already hold.
         pk_cache_hit.is_some() {
+        None
+    } else if
+        // Small-tail merge-on-read: the PK point-probe prunes to cold-file
+        // candidates AND can EARLY-RETURN an empty result when its bloom finds
+        // the key in no cold file. With the flush skipped, a just-INSERTed PK
+        // can live only in the un-flushed tail — which the probe's cold blooms
+        // do not see — so this gate is disabled when we are merging the tail on
+        // read. The read then routes through the tail-merging `handle.read`,
+        // preserving read-own-write for tail-only PKs.
+        tail_merge_via_shard_read {
         None
     } else if
         plan.aggregates.is_none()
@@ -3505,17 +3624,29 @@ async fn execute_simple_select_inner(
         }
     } else if let Some(shard) = sess.engine.config().shard.as_ref() {
         // Shard path: this read merges the in-RAM tail with the Parquet base.
-        // The pre-flush above already drained the tail into Parquet so this
-        // read is bounded, then `handle.read` only has to scan whatever new
-        // tail rows have arrived since.
-        let handle = shard
-            .get(&sess.project, &PartitionKey::default_key())
-            .await?;
-        // Both heavy and light shard reads: await directly. The shard's
-        // `handle.read` drives its own async I/O and WAL-replay cooperatively;
-        // there is no benefit to a nested runtime, and doing so would create
-        // the same fast_select livelock as the non-shard heavy path.
-        handle.read(&plan.table, opts).await?
+        if tail_merge_via_shard_read {
+            // Small-tail merge-on-read: the flush was SKIPPED above, so the
+            // un-flushed tail is still resident — and statement-affine striping
+            // spreads it across the `s1`, `s2`, … partitions, not only
+            // `default_key()`. A single-partition `handle.read` would miss the
+            // striped tails (the keyset-seam / read-own-write loss), so merge
+            // EVERY resident partition's tail over the (project, table)-scoped
+            // cold base.
+            shard
+                .read_table_merging_tails(&sess.project, &plan.table, opts)
+                .await?
+        } else {
+            // Normal path: the pre-flush above already drained every partition's
+            // tail into Parquet, so the default-partition `handle.read` only has
+            // to scan whatever new tail rows have arrived since. Await directly:
+            // the shard's `handle.read` drives its own async I/O / WAL-replay
+            // cooperatively; nesting a runtime would re-create the fast_select
+            // livelock the non-shard heavy path documents.
+            let handle = shard
+                .get(&sess.project, &PartitionKey::default_key())
+                .await?;
+            handle.read(&plan.table, opts).await?
+        }
     } else if live_paths.is_empty() {
         // No live files at this snapshot — return an empty batch set rather
         // than listing the directory (which would see rolled-back files).

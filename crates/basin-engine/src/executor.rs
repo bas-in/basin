@@ -2045,6 +2045,61 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     .await
 }
 
+/// Identify the SINGLE target table a non-SELECT statement mutates, when it is
+/// an unambiguous single-table DML on a bare table name (INSERT / UPDATE /
+/// DELETE). Returns `None` for anything else — DDL, multi-table DML, joined
+/// UPDATE/DELETE, CTE-wrapped DML, or any shape we cannot pin to exactly one
+/// table — so the dispatch-top cache invalidation can fall back to the broad
+/// (whole-cache) clear for those, preserving correctness.
+///
+/// Concurrency fix #4: a write to table A must not evict table B's cached
+/// provider / head / PK rows. For the overwhelmingly common OLTP shape (an
+/// auto-commit single-table INSERT/UPDATE/DELETE) this lets us scope the
+/// invalidation to exactly the table that changed.
+fn dml_single_target_table(stmt: &Statement) -> Option<TableName> {
+    use sqlparser::ast::{FromTable, TableFactor};
+
+    // Extract a bare `TableName` from a `TableWithJoins` that has no joins and a
+    // plain `TableFactor::Table` relation (no table-valued args).
+    fn bare(twj: &sqlparser::ast::TableWithJoins) -> Option<TableName> {
+        if !twj.joins.is_empty() {
+            return None;
+        }
+        match &twj.relation {
+            TableFactor::Table { name, args, .. } if args.is_none() => {
+                TableName::new(single_part_name(name).ok()?).ok()
+            }
+            _ => None,
+        }
+    }
+
+    match stmt {
+        Statement::Insert(ins) => {
+            let name = crate::pg_ast::insert_object_name(ins).ok()?;
+            TableName::new(single_part_name(name).ok()?).ok()
+        }
+        Statement::Update(sqlparser::ast::Update { table, from, .. }) => {
+            // A joined UPDATE (`UPDATE a SET … FROM b`) reads b but mutates only
+            // a. Stay conservative: scope only when there is no FROM clause and
+            // the target is a bare, join-free table.
+            if from.is_some() {
+                return None;
+            }
+            bare(table)
+        }
+        Statement::Delete(del) => {
+            let tables = match &del.from {
+                FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
+            };
+            if tables.len() != 1 {
+                return None;
+            }
+            bare(&tables[0])
+        }
+        _ => None,
+    }
+}
+
 /// Dispatch an already-parsed `Statement` through the engine's cache-
 /// invalidation gate, cost check, RLS-DDL intercept, fast paths, and the
 /// big statement `match`.
@@ -2115,27 +2170,56 @@ async fn dispatch_parsed_statement(
     let stmt_keeps_cache = matches!(stmt, Statement::Query(_))
         || (in_txn_for_cache && matches!(stmt, Statement::Insert(_)));
     if !stmt_keeps_cache {
-        sess.state.table_meta_cache.invalidate_all();
-        // Fix B+C provider cache: the same statement classes that flush the
-        // table-meta cache can change a table's schema, file set or overlay
-        // shape. Most are caught by the per-query `(snapshot, hot_epoch)` key,
-        // but metadata-only DDL (ENABLE RLS, ADD COLUMN no-rewrite, JSONB
-        // promotion) may not advance the snapshot AND may not bump the hot
-        // epoch, so clear the built-provider + head-probe caches here too. The
-        // head-probe cache also self-invalidates on the catalog-epoch bump these
-        // DDLs raise; this eager clear covers same-session visibility within the
-        // current statement.
-        sess.state.provider_cache.invalidate_all();
-        sess.state.head_probe_cache.invalidate_all();
-        // PK row cache (always-on): the same statement classes that
-        // flush the table-meta cache — any non-SELECT, plus DML — can change a
-        // table's schema or rewrite its rows. Most are caught by the cache's
-        // dual watermark (snapshot id + hot epoch), but metadata-only DDL (e.g.
-        // ENABLE ROW LEVEL SECURITY, ADD COLUMN with no rewrite) may not bump
-        // `current_snapshot`; clear the project's PK rows here so a schema or
-        // policy change can never serve a stale/old-shape row. Cheap no-op when
-        // the cache is empty for this project.
-        sess.engine.pk_row_cache().invalidate_project(&sess.project);
+        // Concurrency fix #4: scope invalidation to the SINGLE mutated table
+        // when the statement is an unambiguous single-table INSERT/UPDATE/DELETE
+        // on a bare table. A write to table A then no longer evicts table B's
+        // still-valid cached provider / head / PK rows — the read-path
+        // serialization the 16-session and mixed-RW benches exposed (every write
+        // dumping every other table's cache, forcing a cold rebuild on the next
+        // read). For DDL, multi-table DML, joined/CTE DML, or any shape we
+        // cannot pin to exactly one table, `dml_single_target_table` returns
+        // `None` and we fall back to the original whole-cache clear, preserving
+        // correctness (DDL can change schema/RLS/views/indexes project-wide).
+        //
+        // Why per-table is sound for the scoped case: a single-table DML can
+        // only change THAT table's data files / overlay / rows. It does NOT
+        // touch any other table's schema, RLS, view bindings, file set or
+        // overlay — exactly the state the provider / head / PK caches model —
+        // so evicting only that table's entries is complete. The mutated
+        // table's own entries are invalidated for the same reasons the broad
+        // clear cited: an INSERT advances `current_snapshot` (per-statement
+        // commit on the auto-commit path), and a fast-path UPDATE/DELETE writes
+        // an overlay — both of which a later read must observe.
+        if let Some(target) = dml_single_target_table(&stmt) {
+            sess.state.table_meta_cache.invalidate(&target);
+            sess.state.provider_cache.invalidate(&target);
+            sess.state.head_probe_cache.invalidate(&target);
+            sess.engine
+                .pk_row_cache()
+                .invalidate_table(&sess.project, &target);
+        } else {
+            sess.state.table_meta_cache.invalidate_all();
+            // Fix B+C provider cache: the same statement classes that flush the
+            // table-meta cache can change a table's schema, file set or overlay
+            // shape. Most are caught by the per-query `(snapshot)` key, but
+            // metadata-only DDL (ENABLE RLS, ADD COLUMN no-rewrite, JSONB
+            // promotion) may not advance the snapshot, so clear the
+            // built-provider + head-probe caches here too. The head-probe cache
+            // also self-invalidates on the catalog-epoch bump these DDLs raise;
+            // this eager clear covers same-session visibility within the current
+            // statement.
+            sess.state.provider_cache.invalidate_all();
+            sess.state.head_probe_cache.invalidate_all();
+            // PK row cache (always-on): the same statement classes that flush
+            // the table-meta cache — any non-SELECT we could not scope — can
+            // change a table's schema or rewrite its rows. Most are caught by
+            // the cache's dual watermark (snapshot id + hot epoch), but
+            // metadata-only DDL (e.g. ENABLE ROW LEVEL SECURITY, ADD COLUMN with
+            // no rewrite) may not bump `current_snapshot`; clear the project's
+            // PK rows here so a schema or policy change can never serve a
+            // stale/old-shape row. Cheap no-op when the cache is empty.
+            sess.engine.pk_row_cache().invalidate_project(&sess.project);
+        }
     }
 
     // Phase 6 cost-based query rejection. Cheap when disabled (one
