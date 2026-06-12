@@ -83,6 +83,7 @@ bytes = "1"
 # Arrow / Parquet
 arrow = "58"
 arrow-array = "58"
+arrow-ipc = "58"
 arrow-schema = { version = "58", features = ["serde"] }
 arrow-select = "58"
 parquet = { version = "58", features = ["async", "object_store"] }

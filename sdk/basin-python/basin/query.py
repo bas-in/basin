@@ -20,14 +20,21 @@ Response shapes (crates/basin-rest/src/routes/data.rs):
 - POST → 201, { ok, tag } (or rows); PATCH/DELETE → { ok, tag }
 - DELETE may surface 501 E_ENGINE_UNSUPPORTED
 
-Arrow transport: no native Arrow IPC endpoint exists in basin-rest (confirmed
-by grepping for arrow content-types in the server source). The to_arrow()
-method converts the JSON result set to a pyarrow.Table client-side. Native
-Arrow streaming is pending server support — see follow-ups.
+Arrow IPC transport (crates/basin-rest/src/arrow_ipc.rs):
+- GET /rest/v1/:table with Accept: application/vnd.apache.arrow.stream
+  → Arrow IPC stream, Content-Type: application/vnd.apache.arrow.stream
+- POST /rest/v1/rpc/:fn with the same Accept header → IPC for multi-row results
+- Pagination state is in response headers (not body):
+    x-basin-next-cursor   opaque cursor token (absent when no next page)
+    x-basin-row-count     decimal total row count across all IPC batches
+- The to_arrow() and stream_arrow() methods below send this Accept header and
+  decode the IPC response natively via pyarrow. Falls back to JSON→Arrow
+  conversion when the server returns JSON (older server, no IPC support).
 """
 
 from __future__ import annotations
 
+import io
 import json
 from typing import TYPE_CHECKING, Any, Generator, Iterator, Optional, Union
 
@@ -38,6 +45,10 @@ if TYPE_CHECKING:
 
 Scalar = Union[str, int, float, bool, None]
 
+# MIME type for the Arrow IPC streaming format — matches the server constant
+# in crates/basin-rest/src/arrow_ipc.rs.
+ARROW_STREAM_MIME = "application/vnd.apache.arrow.stream"
+
 
 def _literal(v: Scalar) -> str:
     if v is None:
@@ -45,6 +56,41 @@ def _literal(v: Scalar) -> str:
     if isinstance(v, bool):
         return "true" if v else "false"
     return str(v)
+
+
+def _try_import_pyarrow():
+    """Return pyarrow module or raise ImportError with install hint."""
+    try:
+        import pyarrow as pa
+        import pyarrow.ipc as pa_ipc
+        return pa, pa_ipc
+    except ImportError as exc:
+        raise ImportError(
+            "pyarrow is required for Arrow IPC transport: "
+            "pip install basin-sdk[arrow]"
+        ) from exc
+
+
+def _decode_arrow_ipc(raw: bytes) -> Any:
+    """Decode Arrow IPC stream bytes into a pyarrow.Table."""
+    pa, pa_ipc = _try_import_pyarrow()
+    buf = pa.py_buffer(raw)
+    reader = pa_ipc.open_stream(buf)
+    batches = []
+    while True:
+        try:
+            batches.append(reader.read_next_batch())
+        except StopIteration:
+            break
+    if batches:
+        return pa.Table.from_batches(batches, schema=reader.schema)
+    return pa.table({}, schema=reader.schema)
+
+
+def _is_arrow_response(response: Any) -> bool:
+    """Return True when the response Content-Type is Arrow IPC stream."""
+    ct = response.headers.get("content-type", "")
+    return ARROW_STREAM_MIME in ct
 
 
 class QueryResult:
@@ -60,16 +106,13 @@ class QueryResult:
         return f"QueryResult(rows={len(self.rows)}, next_cursor={self.next_cursor!r})"
 
     def to_arrow(self) -> Any:
-        """Convert rows to a pyarrow.Table (client-side conversion).
+        """Convert rows to a pyarrow.Table (client-side JSON→Arrow conversion).
 
-        Native Arrow IPC transport is not yet available from the server — this
-        method performs JSON→Arrow conversion locally. Install the 'arrow'
-        extra (``pip install basin-sdk[arrow]``) to use this.
+        Use QueryBuilder.to_arrow() for the zero-loss native IPC path when the
+        server supports it. This method is a fallback for pre-populated
+        QueryResult objects that hold rows as Python dicts.
 
-        NOTE: The server does not expose an Arrow/IPC endpoint. This is a
-        fallback that may lose type fidelity (all columns become string or
-        object unless pyarrow infers better). A native server-side Arrow
-        endpoint would yield correct schema. Track progress server-side.
+        Install the 'arrow' extra (``pip install basin-sdk[arrow]``) to use this.
         """
         try:
             import pyarrow as pa
@@ -228,10 +271,39 @@ class QueryBuilder:
     def to_arrow(self) -> Any:
         """Run the query and return the result as a pyarrow.Table.
 
-        This is a client-side JSON→Arrow conversion. No native Arrow IPC
-        transport is available from the server yet.
+        Sends Accept: application/vnd.apache.arrow.stream. If the server
+        responds with an Arrow IPC stream (Content-Type matches), the bytes are
+        decoded natively via pyarrow — zero JSON round-trip, full i64/timestamp
+        fidelity. If the server returns JSON (e.g. older server without IPC
+        support), falls back to client-side JSON→Arrow conversion transparently.
+
+        Pagination: the x-basin-next-cursor response header is returned as
+        table metadata under the key "x-basin-next-cursor" so callers can
+        continue paginating without re-running a JSON request.
+
+        Install the 'arrow' extra (``pip install basin-sdk[arrow]``) to use.
         """
-        return self.run().to_arrow()
+        _try_import_pyarrow()  # early ImportError before hitting the network
+        response = self._transport.request(
+            "GET",
+            f"/rest/v1/{self._table}",
+            query=self._query,
+            headers={"accept": ARROW_STREAM_MIME},
+        )
+        if _is_arrow_response(response):
+            table = _decode_arrow_ipc(response.content)
+            # Attach pagination cursor as table-level metadata so callers can
+            # page through results without losing the cursor.
+            cursor = response.headers.get("x-basin-next-cursor")
+            if cursor:
+                existing = dict(table.schema.metadata or {})
+                existing[b"x-basin-next-cursor"] = cursor.encode()
+                table = table.replace_schema_metadata(existing)
+            return table
+        # Fallback: server returned JSON — convert client-side.
+        body = json.loads(response.text) if response.text else []
+        result = _normalize_get(body)
+        return result.to_arrow()
 
     def insert(self, values: Union[Row, list[Row]]) -> Any:
         """POST /rest/v1/:table — insert one object or an array (201)."""
@@ -355,8 +427,32 @@ class AsyncQueryBuilder:
             yield parsed
 
     async def to_arrow(self) -> Any:
-        """Run the query and return the result as a pyarrow.Table (client-side conversion)."""
-        result = await self.run()
+        """Run the query and return the result as a pyarrow.Table.
+
+        Sends Accept: application/vnd.apache.arrow.stream. Decodes the Arrow
+        IPC response natively for zero-loss columnar results, or falls back to
+        JSON→Arrow conversion for older servers transparently.
+
+        Pagination cursor is attached as table metadata under key
+        "x-basin-next-cursor" when present.
+        """
+        _try_import_pyarrow()  # early ImportError before hitting the network
+        response = await self._transport.request(
+            "GET",
+            f"/rest/v1/{self._table}",
+            query=self._query,
+            headers={"accept": ARROW_STREAM_MIME},
+        )
+        if _is_arrow_response(response):
+            table = _decode_arrow_ipc(response.content)
+            cursor = response.headers.get("x-basin-next-cursor")
+            if cursor:
+                existing = dict(table.schema.metadata or {})
+                existing[b"x-basin-next-cursor"] = cursor.encode()
+                table = table.replace_schema_metadata(existing)
+            return table
+        body = json.loads(response.text) if response.text else []
+        result = _normalize_get(body)
         return result.to_arrow()
 
     async def insert(self, values: Union[Row, list[Row]]) -> Any:

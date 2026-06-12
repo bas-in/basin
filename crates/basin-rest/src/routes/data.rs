@@ -16,6 +16,7 @@ use axum::Json;
 use basin_engine::ExecResult;
 use serde_json::Value;
 
+use crate::arrow_ipc::{batches_to_arrow_ipc, wants_arrow};
 use crate::errors::ApiError;
 use crate::json::batches_to_json;
 use crate::parser::{
@@ -89,21 +90,28 @@ pub(crate) async fn get_table(
     let res = session.execute(&sql).await.map_err(ApiError::from)?;
 
     let want_wrapped = cursor_supplied || limit_supplied;
+    let arrow = wants_arrow(&headers);
     Ok(render_get_response(
         res,
         want_wrapped,
         effective_limit,
         force_stream,
+        arrow,
     ))
 }
 
-/// Render the GET response, choosing between buffered JSON and NDJSON
-/// streaming based on size + the explicit `?stream=true` override.
+/// Render the GET response.
+///
+/// Priority:
+/// 1. If `accept_arrow` is set → Arrow IPC stream (pagination cursor in
+///    `x-basin-next-cursor` response header, row count in `x-basin-row-count`).
+/// 2. Otherwise → buffered JSON or NDJSON stream, unchanged from before.
 fn render_get_response(
     res: ExecResult,
     want_wrapped: bool,
     effective_limit: u64,
     force_stream: bool,
+    accept_arrow: bool,
 ) -> Response {
     let (schema, batches) = match res {
         ExecResult::Empty { tag } => {
@@ -111,6 +119,25 @@ fn render_get_response(
         }
         ExecResult::Rows { schema, batches } => (schema, batches),
     };
+
+    // --- Arrow IPC path -------------------------------------------------------
+    if accept_arrow {
+        // Compute next_cursor the same way the JSON path does, but surface it
+        // in a response header instead of the body.
+        let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let next_cursor: Option<String> = if want_wrapped
+            && row_count as u64 >= effective_limit
+        {
+            // Reconstruct a JSON Value of the rows only to reuse `last_id`.
+            // We only need the last row's `id`, so this is a single-row lookup.
+            last_id_from_batches(&schema, &batches).map(encode_cursor)
+        } else {
+            None
+        };
+        return batches_to_arrow_ipc(&schema, &batches, next_cursor.as_deref());
+    }
+
+    // --- JSON path (byte-identical to the original) ---------------------------
     let rows_value = batches_to_json(&schema, &batches);
     let row_count = rows_value.as_array().map(|a| a.len()).unwrap_or(0);
 
@@ -142,6 +169,37 @@ fn render_get_response(
         Json(body).into_response()
     } else {
         Json(rows_value).into_response()
+    }
+}
+
+/// Pull the `id` field out of the last batch's last row without materialising
+/// the full JSON representation.
+///
+/// Returns `None` if there are no batches, the schema has no `id` column, or
+/// the `id` column is not an integer type.
+fn last_id_from_batches(
+    schema: &Arc<arrow_schema::Schema>,
+    batches: &[arrow_array::RecordBatch],
+) -> Option<i64> {
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::Int64Type;
+
+    let id_idx = schema.index_of("id").ok()?;
+    let last_batch = batches.last()?;
+    if last_batch.num_rows() == 0 {
+        return None;
+    }
+    let col = last_batch.column(id_idx);
+    let last_row = last_batch.num_rows() - 1;
+    if col.is_null(last_row) {
+        return None;
+    }
+    // Only handle Int64 — the most common `id` type. Other int widths are
+    // treated as "no cursor" for now (same conservative behaviour as before).
+    use arrow_schema::DataType;
+    match col.data_type() {
+        DataType::Int64 => Some(col.as_primitive::<Int64Type>().value(last_row)),
+        _ => None,
     }
 }
 

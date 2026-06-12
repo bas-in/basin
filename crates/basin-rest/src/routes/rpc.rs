@@ -13,6 +13,15 @@
 //!   transparently: the engine already routes by language; we just build
 //!   `SELECT <fn>(args…)` and hand it to the session.
 //!
+//! ## Arrow IPC transport
+//!
+//! When the request carries `Accept: application/vnd.apache.arrow.stream`
+//! and the result is a multi-row table, the response is an Arrow IPC stream
+//! instead of JSON. Scalar results (`RETURNS` non-table) are always JSON — the
+//! Arrow format requires a schema, which isn't meaningful for a bare scalar.
+//! Pagination headers (`x-basin-next-cursor`, `x-basin-row-count`) apply here
+//! the same as on the `/rest/v1/:table` GET path.
+//!
 //! ## SQL injection defence
 //!
 //! - The function name flows through [`crate::parser::validate_ident`] —
@@ -36,6 +45,7 @@ use serde_json::Value;
 
 use basin_catalog::Catalog as _;
 
+use crate::arrow_ipc::{batches_to_arrow_ipc, wants_arrow};
 use crate::errors::ApiError;
 use crate::json::batches_to_json;
 use crate::parser::{json_to_literal, render_literal, validate_ident};
@@ -44,7 +54,8 @@ use crate::server::{authorize, Inner};
 /// `POST /rest/v1/rpc/:fn_name`
 ///
 /// Parses the JSON body as named arguments, builds `SELECT <fn>(args…)`,
-/// executes it, and returns the result as JSON.
+/// executes it, and returns the result as JSON (or Arrow IPC when the caller
+/// sends `Accept: application/vnd.apache.arrow.stream`).
 #[axum::debug_handler]
 pub(crate) async fn post_rpc(
     State(state): State<Arc<Inner>>,
@@ -89,7 +100,8 @@ pub(crate) async fn post_rpc(
         .map_err(ApiError::from)?;
     let res = session.execute(&sql).await.map_err(ApiError::from)?;
 
-    Ok(render_rpc_result(res))
+    let accept_arrow = wants_arrow(&headers);
+    Ok(render_rpc_result(res, accept_arrow))
 }
 
 /// Build `SELECT fn(…)` from the JSON arg map.
@@ -149,23 +161,24 @@ async fn build_rpc_sql(
 ///
 /// - Single-row / single-column result (scalar function): unwrap the inner
 ///   value directly so callers see `42` rather than `[{"fn(42)": 42}]`.
-/// - Multi-column or multi-row result (`RETURNS TABLE`): return a JSON array
-///   of row objects, matching the `/rest/v1/<table>` GET shape.
+///   Scalar results are always JSON even when `accept_arrow` is set, because
+///   a bare scalar has no meaningful schema for an IPC stream.
+/// - Multi-column or multi-row result (`RETURNS TABLE`): return Arrow IPC when
+///   `accept_arrow` is true, otherwise JSON array of row objects.
 /// - Empty / tag-only result: return `{"ok": true, "tag": "…"}`.
-fn render_rpc_result(res: ExecResult) -> Response {
+fn render_rpc_result(res: ExecResult, accept_arrow: bool) -> Response {
     match res {
         ExecResult::Empty { tag } => {
             Json(serde_json::json!({ "ok": true, "tag": tag })).into_response()
         }
         ExecResult::Rows { schema, batches } => {
-            let rows = batches_to_json(&schema, &batches);
-            // Scalar unwrap: single column, single row → bare value.
+            // Scalar unwrap: single column, single row → bare JSON value.
+            // Arrow IPC is not used for scalars (no meaningful schema shape).
             if schema.fields().len() == 1 {
+                let rows = batches_to_json(&schema, &batches);
                 if let Value::Array(ref arr) = rows {
                     if arr.len() == 1 {
                         let row = &arr[0];
-                        // The single field name is the function call expression;
-                        // grab the value regardless of the field name.
                         if let Value::Object(map) = row {
                             if let Some((_k, v)) = map.iter().next() {
                                 return Json(v.clone()).into_response();
@@ -174,7 +187,16 @@ fn render_rpc_result(res: ExecResult) -> Response {
                     }
                 }
             }
-            Json(rows).into_response()
+
+            if accept_arrow {
+                // Multi-row / multi-column → Arrow IPC stream.
+                // No pagination for RPC results (RPC functions control their
+                // own LIMIT/paging via SQL).
+                batches_to_arrow_ipc(&schema, &batches, None)
+            } else {
+                let rows = batches_to_json(&schema, &batches);
+                Json(rows).into_response()
+            }
         }
     }
 }

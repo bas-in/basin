@@ -54,6 +54,14 @@
 //!   `application/x-ndjson` chunked transfer; the cursor token (if any) is
 //!   the final NDJSON line keyed `_basin_next_cursor`.
 //!
+//! ## Arrow IPC transport
+//!
+//! Clients that send `Accept: application/vnd.apache.arrow.stream` on GET
+//! `/rest/v1/<table>` or POST `/rest/v1/rpc/:fn` receive an Arrow IPC stream
+//! instead of JSON. The schema is preserved exactly (no JSON round-trip losses
+//! for i64 extremes, timestamps, or binary types). Pagination state is in
+//! response headers — see [`arrow_ipc`] for the header contract.
+//!
 //! ## What's not implemented yet
 //!
 //! - Embedded resources, stored functions, realtime, GraphQL, and
@@ -88,6 +96,7 @@ use basin_common::{BasinError, Result};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
+mod arrow_ipc;
 mod errors;
 mod json;
 mod parser;

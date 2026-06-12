@@ -2388,3 +2388,6 @@ async fn function_rollback_unknown_version_errors() {
     let err = reg.rollback(project, name, 99).await;
     assert!(err.is_err(), "rollback to unknown version must return Err");
 }
+
+#[path = "tests_arrow_ipc.rs"]
+mod tests_arrow_ipc;
