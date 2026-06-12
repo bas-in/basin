@@ -186,6 +186,9 @@ pub struct RestService {
 impl RestService {
     /// Construct a new service.
     ///
+    /// See [`RestService::with_fn_catalog`] to wire the durable function catalog
+    /// for handler-function persistence across restarts.
+    ///
     /// **Auth is mandatory.** [`RestConfig`] takes a non-optional
     /// `Arc<AuthService>`; the type system enforces the same invariant the
     /// ADR mandates ("BIND requires AUTH at config time"). If you find
@@ -270,6 +273,29 @@ impl RestService {
     /// `basin-rest`-internal types.
     pub fn function_registry(&self) -> FunctionRegistry {
         self.inner.function_registry.clone()
+    }
+
+    /// fn-persist: wire the durable [`basin_catalog::Catalog`] for
+    /// handler-function persistence. Must be called **before**
+    /// [`Self::run_until_bound`].
+    ///
+    /// After this call:
+    /// - `POST /admin/v1/functions/deploy` writes to the catalog first; an
+    ///   error from the catalog rejects the deploy with no in-memory change.
+    /// - `DELETE /admin/v1/functions/:name` deletes from the catalog first.
+    /// - `GET /admin/v1/functions` reads directly from the catalog, so
+    ///   functions persisted in a prior process lifecycle are visible after
+    ///   restart.
+    /// - Existence checks (`/logs`, `/cpu-ms`, `/invocations`, `/versions`)
+    ///   consult the catalog rather than the in-process cache.
+    ///
+    /// When this is not called (tests, single-process dev), the original
+    /// in-memory-only behaviour is preserved.
+    pub fn with_fn_catalog(&mut self, catalog: Arc<dyn basin_catalog::Catalog>) -> &mut Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.fn_catalog = Some(catalog);
+        }
+        self
     }
 
     /// Bind synchronously (so callers can read `local_addr`), then spawn the

@@ -21,6 +21,7 @@ use basin_auth::Claims;
 use basin_blob::signing::BlobSigningSecret;
 use basin_blob::store::{BlobCatalog, BlobStore, InMemoryBlobCatalog};
 use basin_blob::PostgresBlobCatalog;
+use basin_catalog::Catalog;
 use basin_common::Result;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -70,6 +71,12 @@ pub(crate) struct Inner {
     /// not parse the bytes; a downstream `FunctionInvoker` impl is what
     /// hands them to `basin_fn::HandlerHarness::new`.
     pub(crate) function_registry: admin_fn_routes::FunctionRegistry,
+    /// fn-persist: durable catalog for handler functions (LANGUAGE wasm /
+    /// javascript). When `Some`, deploy writes through to the catalog before
+    /// updating the in-process registry, and list / exists checks read from
+    /// the catalog as source of truth. `None` (tests, catalog-less dev)
+    /// preserves the original in-memory-only behaviour.
+    pub(crate) fn_catalog: Option<Arc<dyn Catalog>>,
     /// P2-1: dedicated rotatable HMAC-SHA256 secret for blob signed-URL
     /// tokens. Kept separate from the JWT secret so each can be rotated
     /// independently. Seeded from the JWT secret at startup; rotated via
@@ -169,6 +176,7 @@ impl Inner {
             blob_store,
             cfg,
             slice_gate: None,
+            fn_catalog: None,
             function_registry: admin_fn_routes::FunctionRegistry::new(),
             blob_signing_secret,
             #[cfg(feature = "realtime")]
@@ -181,6 +189,14 @@ impl Inner {
     #[allow(dead_code)]
     pub(crate) fn with_slice_gate(mut self, gate: basin_catalog::SliceGate) -> Self {
         self.slice_gate = Some(gate);
+        self
+    }
+
+    /// fn-persist: wire the durable function catalog. After this call, deploy
+    /// and delete go through the catalog before touching the in-process cache,
+    /// and list reads from the catalog as the source of truth.
+    pub(crate) fn with_fn_catalog(mut self, catalog: Arc<dyn Catalog>) -> Self {
+        self.fn_catalog = Some(catalog);
         self
     }
 }

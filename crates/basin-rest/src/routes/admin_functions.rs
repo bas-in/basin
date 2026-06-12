@@ -41,6 +41,18 @@
 //!   wall-CPU milliseconds. Callers add via
 //!   [`FunctionRegistry::add_cpu_ms`]; the `/cpu-ms` endpoint reads via
 //!   [`FunctionRegistry::cpu_ms`].
+//!
+//! ## Catalog-backed persistence (fn-persist)
+//!
+//! The `FunctionRegistry` is now a **write-through cache** over the
+//! `basin_catalog::Catalog`. Deploy writes to the catalog first; only after
+//! a successful persist does the in-process map get updated. Delete removes
+//! from the catalog first. On restart the admin list endpoint reads directly
+//! from the catalog so no entries are lost across restarts.
+//!
+//! The catalog is injected via [`Inner::fn_catalog`] (an
+//! `Option<Arc<dyn Catalog>>`). When `None` (tests, single-process dev
+//! without a real catalog) the old in-memory-only behaviour is preserved.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,6 +64,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use basin_catalog::{Catalog, SqlFunctionDef, SqlFunctionLanguage, SqlReturnType, SqlArgType};
 use basin_common::ProjectId;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -273,6 +286,14 @@ impl FunctionRegistry {
         self.put(project, name, bytes).await
     }
 
+    /// Test-only alias for `remove_from_cache`. Exposes the cache-eviction
+    /// path to unit tests so they can simulate the delete handler's second
+    /// step (after the catalog delete succeeds).
+    #[cfg(test)]
+    pub(crate) async fn remove_from_cache_test(&self, project: &ProjectId, name: &str) -> bool {
+        self.remove_from_cache(project, name).await
+    }
+
     /// Insert (or replace) a function. Returns the post-write version so the
     /// caller can echo it in the response. Also records a version-history entry.
     async fn put(&self, project: ProjectId, name: String, bytes: Vec<u8>) -> i64 {
@@ -312,8 +333,8 @@ impl FunctionRegistry {
             .unwrap_or_default()
     }
 
-    /// Remove a function. Returns true if it existed.
-    async fn delete(&self, project: &ProjectId, name: &str) -> bool {
+    /// Remove a function from the in-process cache. Returns true if it existed.
+    async fn remove_from_cache(&self, project: &ProjectId, name: &str) -> bool {
         let mut map = self.inner.write().await;
         match map.get_mut(project) {
             Some(m) => m.remove(name).is_some(),
@@ -563,6 +584,52 @@ fn require_admin(claims: &basin_auth::Claims) -> Result<(), ApiError> {
 }
 
 // ---------------------------------------------------------------------------
+// Catalog persist helpers
+// ---------------------------------------------------------------------------
+
+/// Persist a handler-function deploy to the catalog. The body is stored as
+/// the raw base64 string that arrived in the deploy request — this is what
+/// [`crate::fn_runtime::CatalogFunctionStore::lookup`] base64-decodes later.
+/// `args` and `return_type` are empty / void placeholders because handler
+/// components (javascript/wasm) are not DataFusion scalar UDFs and have no
+/// meaningful SQL signature.
+async fn catalog_upsert(
+    catalog: &dyn Catalog,
+    project: ProjectId,
+    name: &str,
+    wasm_b64: &str,
+) -> Result<(), ApiError> {
+    let def = SqlFunctionDef {
+        project,
+        name: name.to_string(),
+        args: Vec::new(),
+        return_type: SqlReturnType::Scalar(SqlArgType::Bytea),
+        body: wasm_b64.to_string(),
+        language: SqlFunctionLanguage::Wasm,
+        version: 1, // bumped by register_sql_function on replace
+        source: None,
+    };
+    catalog
+        .register_sql_function(def)
+        .await
+        .map_err(|e| ApiError::internal(format!("catalog persist failed: {e}")))
+}
+
+/// Delete a handler function from the catalog. Returns `true` if a row was
+/// deleted, `false` if the function did not exist (catalog already clean).
+async fn catalog_delete(
+    catalog: &dyn Catalog,
+    project: &ProjectId,
+    name: &str,
+) -> Result<bool, ApiError> {
+    match catalog.drop_sql_function(project, name).await {
+        Ok(()) => Ok(true),
+        Err(e) if e.to_string().to_lowercase().contains("not found") => Ok(false),
+        Err(e) => Err(ApiError::internal(format!("catalog delete failed: {e}"))),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // POST /admin/v1/functions/deploy
 // ---------------------------------------------------------------------------
 
@@ -598,10 +665,25 @@ pub(crate) async fn deploy_function(
         return Err(ApiError::invalid("wasm bytes are empty"));
     }
 
+    // Persist to catalog FIRST. If the catalog write fails the in-process
+    // registry is NOT updated — the deploy is rejected, preventing silent
+    // in-memory-only success.
+    if let Some(catalog) = state.fn_catalog.as_deref() {
+        catalog_upsert(catalog, claims.project_id, &name, &req.wasm_b64).await?;
+    }
+
     let version = state
         .function_registry
         .put(claims.project_id, name.clone(), bytes)
         .await;
+
+    tracing::info!(
+        project = %claims.project_id,
+        name,
+        version,
+        catalog_persisted = state.fn_catalog.is_some(),
+        "function deployed",
+    );
 
     let function_id = format!("{}:{}", claims.project_id, name);
     Ok((
@@ -628,6 +710,42 @@ pub(crate) async fn list_functions(
     let claims = authorize(&state, &headers).await?;
     require_admin(&claims)?;
 
+    // When a catalog is wired, list from catalog (the durable source of truth)
+    // so entries persisted in a prior process lifecycle are visible after
+    // restart. The in-process registry is the warm cache; the catalog is truth.
+    if let Some(catalog) = state.fn_catalog.as_deref() {
+        let defs = catalog.list_sql_functions(&claims.project_id).await;
+        // Filter to handler functions only (javascript/wasm). LANGUAGE sql rows
+        // are DataFusion scalar UDFs, not handler components.
+        let body: Vec<_> = defs
+            .into_iter()
+            .filter(|d| {
+                matches!(
+                    d.language,
+                    basin_catalog::SqlFunctionLanguage::Javascript
+                        | basin_catalog::SqlFunctionLanguage::Wasm
+                )
+            })
+            .map(|d| {
+                // Derive size_bytes from the base64-encoded body. The raw
+                // decode would give us bytes, but since we stored the b64 we
+                // compute the decoded size without allocating a full buffer.
+                let size_bytes = B64
+                    .decode(d.body.trim().as_bytes())
+                    .map(|b| b.len())
+                    .unwrap_or(0);
+                json!({
+                    "project_id": claims.project_id.to_string(),
+                    "name": d.name,
+                    "version": d.version,
+                    "size_bytes": size_bytes,
+                })
+            })
+            .collect();
+        return Ok(Json(body).into_response());
+    }
+
+    // No catalog — fall back to in-process registry.
     let entries = state.function_registry.list(&claims.project_id).await;
     let body: Vec<_> = entries
         .into_iter()
@@ -670,9 +788,35 @@ pub(crate) async fn delete_function(
     require_admin(&claims)?;
     let name = validate_ident(&name)?;
 
+    // Delete from catalog FIRST. If catalog delete fails the in-process cache
+    // is NOT changed — the delete is rejected with an error.
+    if let Some(catalog) = state.fn_catalog.as_deref() {
+        let existed_in_catalog = catalog_delete(catalog, &claims.project_id, &name).await?;
+        if !existed_in_catalog {
+            // Not in catalog; check in-process cache as well.
+            let in_cache = state
+                .function_registry
+                .remove_from_cache(&claims.project_id, &name)
+                .await;
+            if !in_cache {
+                return Err(ApiError::not_found(format!(
+                    "function {name:?} not found for project"
+                )));
+            }
+            return Ok(StatusCode::NO_CONTENT.into_response());
+        }
+        // Remove from in-process cache too (best-effort; it is a cache).
+        let _ = state
+            .function_registry
+            .remove_from_cache(&claims.project_id, &name)
+            .await;
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+
+    // No catalog — in-process only path.
     let removed = state
         .function_registry
-        .delete(&claims.project_id, &name)
+        .remove_from_cache(&claims.project_id, &name)
         .await;
     if !removed {
         return Err(ApiError::not_found(format!(
@@ -696,11 +840,9 @@ pub(crate) async fn function_logs(
     require_admin(&claims)?;
     let name = validate_ident(&name)?;
 
-    if !state
-        .function_registry
-        .exists(&claims.project_id, &name)
-        .await
-    {
+    // Existence check: prefer catalog when wired; fall back to in-process.
+    let exists = fn_exists(&state, &claims.project_id, &name).await;
+    if !exists {
         return Err(ApiError::not_found(format!(
             "function {name:?} not found for project"
         )));
@@ -733,11 +875,8 @@ pub(crate) async fn function_cpu_ms(
     require_admin(&claims)?;
     let name = validate_ident(&name)?;
 
-    if !state
-        .function_registry
-        .exists(&claims.project_id, &name)
-        .await
-    {
+    let exists = fn_exists(&state, &claims.project_id, &name).await;
+    if !exists {
         return Err(ApiError::not_found(format!(
             "function {name:?} not found for project"
         )));
@@ -770,11 +909,8 @@ pub(crate) async fn function_invocations(
     require_admin(&claims)?;
     let name = validate_ident(&name)?;
 
-    if !state
-        .function_registry
-        .exists(&claims.project_id, &name)
-        .await
-    {
+    let exists = fn_exists(&state, &claims.project_id, &name).await;
+    if !exists {
         return Err(ApiError::not_found(format!(
             "function {name:?} not found for project"
         )));
@@ -807,11 +943,8 @@ pub(crate) async fn function_versions(
     require_admin(&claims)?;
     let name = validate_ident(&name)?;
 
-    if !state
-        .function_registry
-        .exists(&claims.project_id, &name)
-        .await
-    {
+    let exists = fn_exists(&state, &claims.project_id, &name).await;
+    if !exists {
         return Err(ApiError::not_found(format!(
             "function {name:?} not found for project"
         )));
@@ -863,4 +996,27 @@ pub(crate) async fn function_rollback(
         "rolled_back_to_version": rolled_to,
     }))
     .into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Shared existence check helper
+// ---------------------------------------------------------------------------
+
+/// Returns true if `(project, name)` exists as a handler function.
+///
+/// When a catalog is wired, the catalog is the source of truth — an entry
+/// that survived a restart exists in the catalog even if the in-process cache
+/// is cold. Falls back to the in-process registry when no catalog is wired.
+async fn fn_exists(state: &Arc<Inner>, project: &ProjectId, name: &str) -> bool {
+    if let Some(catalog) = state.fn_catalog.as_deref() {
+        if let Some(def) = catalog.lookup_sql_function(project, name).await {
+            return matches!(
+                def.language,
+                basin_catalog::SqlFunctionLanguage::Javascript
+                    | basin_catalog::SqlFunctionLanguage::Wasm
+            );
+        }
+        return false;
+    }
+    state.function_registry.exists(project, name).await
 }

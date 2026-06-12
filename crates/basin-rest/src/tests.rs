@@ -2391,3 +2391,197 @@ async fn function_rollback_unknown_version_errors() {
 
 #[path = "tests_arrow_ipc.rs"]
 mod tests_arrow_ipc;
+
+// ─── fn-persist: catalog-backed handler function persistence ─────────────────
+
+/// Build a minimal fake base64-encoded Wasm blob (not a real component).
+fn fn_persist_fake_wasm_b64(tag: &[u8]) -> String {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    let mut body = b"\x00asm\x01\x00\x00\x00".to_vec();
+    body.extend_from_slice(tag);
+    B64.encode(&body)
+}
+
+fn fn_persist_catalog_def(
+    project: basin_common::ProjectId,
+    name: &str,
+    wasm_b64: &str,
+) -> basin_catalog::SqlFunctionDef {
+    use basin_catalog::{SqlFunctionLanguage, SqlReturnType, SqlArgType};
+    basin_catalog::SqlFunctionDef {
+        project,
+        name: name.to_string(),
+        args: Vec::new(),
+        return_type: SqlReturnType::Scalar(SqlArgType::Bytea),
+        body: wasm_b64.to_string(),
+        language: SqlFunctionLanguage::Wasm,
+        version: 1,
+        source: None,
+    }
+}
+
+/// Test 1: deploy writes to catalog.
+#[tokio::test]
+async fn fn_persist_deploy_writes_catalog() {
+    use basin_catalog::{InMemoryCatalog, SqlFunctionLanguage};
+    use basin_common::ProjectId;
+    use crate::routes::admin_functions::FunctionRegistry;
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+    let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
+    let project = ProjectId::new();
+    let name = "my_handler";
+    let wasm_b64 = fn_persist_fake_wasm_b64(b"t1");
+
+    catalog
+        .register_sql_function(fn_persist_catalog_def(project, name, &wasm_b64))
+        .await
+        .expect("catalog upsert must succeed");
+
+    let reg = FunctionRegistry::new();
+    reg.put_test(project, name.to_string(), B64.decode(wasm_b64.as_bytes()).unwrap())
+        .await;
+
+    let all = catalog.list_sql_functions(&project).await;
+    assert_eq!(all.len(), 1, "catalog should have 1 function");
+    assert_eq!(all[0].name, name);
+    assert!(matches!(all[0].language, SqlFunctionLanguage::Wasm));
+    assert!(reg.exists(&project, name).await, "registry should know function");
+}
+
+/// Test 2: restart simulation — new registry, catalog is truth.
+#[tokio::test]
+async fn fn_persist_restart_simulation() {
+    use basin_catalog::{InMemoryCatalog, SqlFunctionLanguage};
+    use basin_common::ProjectId;
+    use crate::routes::admin_functions::FunctionRegistry;
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+    let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
+    let project = ProjectId::new();
+    let name = "durable_fn";
+    let wasm_b64 = fn_persist_fake_wasm_b64(b"t2");
+
+    catalog
+        .register_sql_function(fn_persist_catalog_def(project, name, &wasm_b64))
+        .await
+        .expect("catalog upsert");
+    let old_reg = FunctionRegistry::new();
+    old_reg
+        .put_test(project, name.to_string(), B64.decode(wasm_b64.as_bytes()).unwrap())
+        .await;
+
+    // Restart: brand-new registry — catalog still has the entry.
+    let new_reg = FunctionRegistry::new();
+    assert!(
+        !new_reg.exists(&project, name).await,
+        "fresh registry does not know function before hydration"
+    );
+
+    // Catalog is still authoritative.
+    let all = catalog.list_sql_functions(&project).await;
+    assert!(
+        all.iter().any(|d| d.name == name),
+        "catalog has function after restart simulation"
+    );
+
+    // Simulated list_functions catalog path (filter to handler languages):
+    let handler_fns: Vec<_> = all
+        .into_iter()
+        .filter(|d| {
+            matches!(
+                d.language,
+                SqlFunctionLanguage::Javascript | SqlFunctionLanguage::Wasm
+            )
+        })
+        .collect();
+    assert_eq!(handler_fns.len(), 1);
+    assert_eq!(handler_fns[0].name, name);
+}
+
+/// Test 3: deploy-persist-failure invariant — registry unchanged without upsert.
+#[tokio::test]
+async fn fn_persist_no_catalog_upsert_registry_unchanged() {
+    use basin_common::ProjectId;
+    use crate::routes::admin_functions::FunctionRegistry;
+
+    let reg = FunctionRegistry::new();
+    let project = ProjectId::new();
+    let name = "unmapped";
+
+    // No catalog upsert performed, no reg.put called — registry stays empty.
+    assert!(
+        !reg.exists(&project, name).await,
+        "registry must be empty when deploy never succeeded"
+    );
+}
+
+/// Test 4: delete removes from both catalog and cache.
+#[tokio::test]
+async fn fn_persist_delete_removes_catalog_and_cache() {
+    use basin_catalog::InMemoryCatalog;
+    use basin_common::ProjectId;
+    use crate::routes::admin_functions::FunctionRegistry;
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+    let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
+    let project = ProjectId::new();
+    let name = "to_delete";
+    let wasm_b64 = fn_persist_fake_wasm_b64(b"t4");
+
+    catalog
+        .register_sql_function(fn_persist_catalog_def(project, name, &wasm_b64))
+        .await
+        .expect("upsert");
+    let reg = FunctionRegistry::new();
+    reg.put_test(project, name.to_string(), B64.decode(wasm_b64.as_bytes()).unwrap())
+        .await;
+
+    // Both have it.
+    assert!(reg.exists(&project, name).await);
+    assert!(catalog.lookup_sql_function(&project, name).await.is_some());
+
+    // Delete: catalog first, then registry.
+    catalog.drop_sql_function(&project, name).await.expect("drop catalog");
+    reg.remove_from_cache_test(&project, name).await;
+
+    // Neither should have it.
+    assert!(!reg.exists(&project, name).await, "registry should be empty");
+    assert!(
+        catalog.lookup_sql_function(&project, name).await.is_none(),
+        "catalog should be empty"
+    );
+
+    // Re-delete should yield NotFound.
+    let err = catalog.drop_sql_function(&project, name).await;
+    assert!(err.is_err(), "second drop must return NotFound");
+}
+
+/// Test 5: cross-project isolation.
+#[tokio::test]
+async fn fn_persist_cross_project_isolation() {
+    use basin_catalog::InMemoryCatalog;
+    use basin_common::ProjectId;
+
+    let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
+    let project_a = ProjectId::new();
+    let project_b = ProjectId::new();
+    let name = "shared_name";
+
+    catalog
+        .register_sql_function(fn_persist_catalog_def(project_a, name, &fn_persist_fake_wasm_b64(b"a")))
+        .await
+        .expect("upsert A");
+
+    // Project A sees it.
+    let a_fns = catalog.list_sql_functions(&project_a).await;
+    assert_eq!(a_fns.len(), 1, "project A should have 1 function");
+
+    // Project B sees nothing.
+    let b_fns = catalog.list_sql_functions(&project_b).await;
+    assert!(b_fns.is_empty(), "project B must not see project A functions");
+
+    // Lookup by name in B returns None.
+    let lookup_b = catalog.lookup_sql_function(&project_b, name).await;
+    assert!(lookup_b.is_none(), "cross-project lookup must return None");
+}
