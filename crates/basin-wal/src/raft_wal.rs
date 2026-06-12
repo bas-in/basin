@@ -2,24 +2,26 @@
 //!
 //! ## Status
 //!
-//! v0.1: **single-process simulation only.** A cluster of `RaftWal` nodes runs
-//! inside one tokio runtime; inter-node RPCs short-circuit through a shared
-//! handle map ([`SimCluster`]) instead of going over the wire. This is enough
-//! to validate consensus correctness — leader election, log replication,
-//! quorum commit, snapshot transfer — without locking in a wire protocol.
-//! Cross-process gRPC `RaftNetwork` is a follow-up; see
-//! `crates/basin-wal/RAFT.md` for the integration plan.
+//! v0.2: **single-process simulation, disk-backed log + vote.** A cluster of
+//! `RaftWal` nodes runs inside one tokio runtime; inter-node RPCs
+//! short-circuit through a shared handle map ([`SimCluster`]) instead of
+//! going over the wire. This is enough to validate consensus correctness —
+//! leader election, log replication, quorum commit, snapshot transfer —
+//! without locking in a wire protocol. Cross-process gRPC `RaftNetwork` is a
+//! follow-up; see `crates/basin-wal/RAFT.md` for the integration plan.
 //!
 //! ## Storage
 //!
-//! State machine state is an in-memory `HashMap<(ProjectId, PartitionKey),
-//! Vec<EntryRecord>>` keyed by `Lsn`. Per the openraft model, applied entries
-//! are durable when the state machine is durable — which for v0.1 means the
-//! snapshot is durable. Snapshots ride a `Cursor<Vec<u8>>` (the openraft
-//! default `SnapshotData` type), serialised by `serde_json` since openraft's
-//! `Entry` types are already JSON-friendly. Disk-backed log persistence
-//! (reusing `file_wal.rs`'s segment format) is queued for v0.2; today's
-//! sim-only target makes the trade-off acceptable.
+//! Backed by [`crate::raft_storage::DiskRaftStorage`] (multi-node commit 2):
+//! the raft **log** persists under `RaftWalConfig::data_dir` using the same
+//! segment framing the file WAL writes (`[u32 LE length][bincode record]`),
+//! the **vote** lives in a small fsync'd meta file, and the latest
+//! state-machine **snapshot** is kept in a local file so a purge below the
+//! snapshot point survives restarts. The applied state machine itself — an
+//! in-memory `HashMap<(ProjectId, PartitionKey), …>` keyed by `Lsn` — is
+//! rebuilt from the snapshot on open and rolled forward from the durable log
+//! by the raft protocol. S3-anchored manifest snapshots are the follow-up
+//! that bounds the local log by the flush window.
 //!
 //! ## What this module guarantees
 //!
@@ -33,37 +35,33 @@
 //!   own.
 //! - `truncate` triggers a snapshot at the current applied index then purges
 //!   logs below the resulting snapshot's last_log_id.
+//! - Log entries and votes survive process restarts: a node that crashes and
+//!   reopens the same `data_dir` rejoins with its hard state intact.
 //!
 //! ## What this module does **not** do
 //!
 //! - Cross-process networking. The default [`SimNetworkFactory`] dispatches
 //!   directly via in-memory `Raft` handles. A real gRPC factory plugs in
-//!   behind the same trait when v0.2 lands.
-//! - Disk persistence of the raft log. State lives in RAM until snapshot.
+//!   behind the same trait when the network commit lands.
 //! - Multi-region replication.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::Cursor;
-use std::ops::RangeBounds;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use basin_common::{BasinError, PartitionKey, ProjectCounterRegistry, ProjectId, Result};
 use bytes::Bytes;
-use chrono::Utc;
 use openraft::error::{NetworkError, RPCError, RaftError, RemoteError};
 use openraft::network::RPCOption;
-use openraft::storage::{Adaptor, LogState, RaftSnapshotBuilder, Snapshot};
-use openraft::{
-    BasicNode, Config, Entry, EntryPayload, LogId, RaftLogId, RaftLogReader, RaftNetwork,
-    RaftNetworkFactory, RaftStorage, SnapshotMeta, StorageError, StorageIOError, StoredMembership,
-    Vote,
-};
+use openraft::storage::Adaptor;
+use openraft::{BasicNode, Config, RaftNetwork, RaftNetworkFactory};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+use crate::raft_storage::DiskRaftStorage;
 use crate::{Lsn, Wal, WalEntry};
 
 /// Knobs for [`RaftWal::new`].
@@ -75,9 +73,10 @@ pub struct RaftWalConfig {
     pub peers: Vec<String>,
     /// This node's stable raft identity. Survives restarts.
     pub local_id: String,
-    /// Where raft logs would persist locally on disk. Unused in v0.1's
-    /// in-RAM implementation; carried through so the field doesn't churn
-    /// when on-disk persistence lands.
+    /// Where raft log / vote / snapshot files persist locally on disk
+    /// (multi-node commit 2). Created on first open; reopening the same
+    /// directory recovers the node's hard state. Two nodes must never share
+    /// a `data_dir`.
     pub data_dir: PathBuf,
     /// Election timeout. Default 1500 ms — generous to cover GC pauses.
     pub election_timeout_ms: u32,
@@ -175,349 +174,6 @@ openraft::declare_raft_types!(
 type C = BasinRaftTypeConfig;
 type NodeId = u64;
 type RaftHandle = openraft::Raft<C>;
-
-// ---------------------------------------------------------------------------
-// State machine + storage
-// ---------------------------------------------------------------------------
-
-/// Per-`(project, partition)` log entries the state machine has applied.
-/// One `Vec` per partition, sorted by LSN.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-struct PartitionLog {
-    /// LSN to assign to the next applied entry. Monotonic per partition.
-    next_lsn: u64,
-    /// Entries that survive `truncate` (i.e. LSN > the most recent truncate
-    /// floor). Sorted by LSN.
-    entries: Vec<StoredEntry>,
-    /// Truncation floor: any entry with LSN <= `truncated_up_to` has been
-    /// pruned. `read_from` / `high_water` honour it.
-    truncated_up_to: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct StoredEntry {
-    lsn: u64,
-    payload: Vec<u8>,
-    appended_at: chrono::DateTime<chrono::Utc>,
-}
-
-/// The state machine's persisted state. Everything in here is what a
-/// snapshot serialises and what `apply` mutates.
-///
-/// `partitions` lives in a `HashMap` for O(1) lookup but is serialised as a
-/// `Vec<PartitionEntry>` because `serde_json` can't encode non-string map
-/// keys (the natural `(ProjectId, PartitionKey)` tuple). See the manual
-/// serde impl below.
-#[derive(Clone, Debug, Default)]
-struct StateMachineData {
-    last_applied_log: Option<LogId<NodeId>>,
-    last_membership: StoredMembership<NodeId, BasicNode>,
-    partitions: HashMap<(ProjectId, PartitionKey), PartitionLog>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct PartitionEntry {
-    project: ProjectId,
-    partition: PartitionKey,
-    log: PartitionLog,
-}
-
-#[derive(Serialize, Deserialize)]
-struct StateMachineDataWire {
-    last_applied_log: Option<LogId<NodeId>>,
-    last_membership: StoredMembership<NodeId, BasicNode>,
-    partitions: Vec<PartitionEntry>,
-}
-
-impl Serialize for StateMachineData {
-    fn serialize<S: serde::Serializer>(&self, ser: S) -> std::result::Result<S::Ok, S::Error> {
-        let wire = StateMachineDataWire {
-            last_applied_log: self.last_applied_log,
-            last_membership: self.last_membership.clone(),
-            partitions: self
-                .partitions
-                .iter()
-                .map(|((t, p), log)| PartitionEntry {
-                    project: *t,
-                    partition: p.clone(),
-                    log: log.clone(),
-                })
-                .collect(),
-        };
-        wire.serialize(ser)
-    }
-}
-
-impl<'de> Deserialize<'de> for StateMachineData {
-    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> std::result::Result<Self, D::Error> {
-        let wire = StateMachineDataWire::deserialize(de)?;
-        let mut partitions = HashMap::new();
-        for e in wire.partitions {
-            partitions.insert((e.project, e.partition), e.log);
-        }
-        Ok(Self {
-            last_applied_log: wire.last_applied_log,
-            last_membership: wire.last_membership,
-            partitions,
-        })
-    }
-}
-
-/// Combined storage for log + state machine. Wrapped in `Adaptor` to
-/// satisfy `Raft::new`. Keeping log + state machine in one struct mirrors
-/// the openraft-memstore layout — simpler to reason about than two parallel
-/// stores while we're in-RAM.
-struct BasinRaftStorage {
-    /// Raft log entries, indexed by log index.
-    log: RwLock<BTreeMap<u64, Entry<C>>>,
-    last_purged_log_id: RwLock<Option<LogId<NodeId>>>,
-    vote: RwLock<Option<Vote<NodeId>>>,
-    /// State machine data + snapshot guard. Keeping them under one lock
-    /// makes `applied_state` consistent with `apply`.
-    sm: RwLock<StateMachineData>,
-    /// Most-recent snapshot, if one's been built. `Cursor<Vec<u8>>` is the
-    /// default `SnapshotData` type.
-    current_snapshot: RwLock<Option<StoredSnapshot>>,
-    snapshot_idx: RwLock<u64>,
-}
-
-#[derive(Clone)]
-struct StoredSnapshot {
-    meta: SnapshotMeta<NodeId, BasicNode>,
-    data: Vec<u8>,
-}
-
-impl BasinRaftStorage {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            log: RwLock::new(BTreeMap::new()),
-            last_purged_log_id: RwLock::new(None),
-            vote: RwLock::new(None),
-            sm: RwLock::new(StateMachineData::default()),
-            current_snapshot: RwLock::new(None),
-            snapshot_idx: RwLock::new(0),
-        })
-    }
-}
-
-impl RaftLogReader<C> for Arc<BasinRaftStorage> {
-    async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + std::fmt::Debug + Send>(
-        &mut self,
-        range: RB,
-    ) -> std::result::Result<Vec<Entry<C>>, StorageError<NodeId>> {
-        let log = self.log.read().await;
-        let entries: Vec<Entry<C>> = log.range(range).map(|(_, e)| e.clone()).collect();
-        Ok(entries)
-    }
-}
-
-impl RaftSnapshotBuilder<C> for Arc<BasinRaftStorage> {
-    async fn build_snapshot(&mut self) -> std::result::Result<Snapshot<C>, StorageError<NodeId>> {
-        let (data, last_applied_log, last_membership) = {
-            let sm = self.sm.read().await;
-            let bytes =
-                serde_json::to_vec(&*sm).map_err(|e| StorageIOError::read_state_machine(&e))?;
-            (bytes, sm.last_applied_log, sm.last_membership.clone())
-        };
-
-        let snapshot_idx = {
-            let mut g = self.snapshot_idx.write().await;
-            *g += 1;
-            *g
-        };
-
-        let snapshot_id = if let Some(last) = last_applied_log {
-            format!("{}-{}-{}", last.leader_id, last.index, snapshot_idx)
-        } else {
-            format!("--{snapshot_idx}")
-        };
-
-        let meta = SnapshotMeta {
-            last_log_id: last_applied_log,
-            last_membership,
-            snapshot_id,
-        };
-
-        {
-            let mut current = self.current_snapshot.write().await;
-            *current = Some(StoredSnapshot {
-                meta: meta.clone(),
-                data: data.clone(),
-            });
-        }
-
-        Ok(Snapshot {
-            meta,
-            snapshot: Box::new(Cursor::new(data)),
-        })
-    }
-}
-
-impl RaftStorage<C> for Arc<BasinRaftStorage> {
-    type LogReader = Self;
-    type SnapshotBuilder = Self;
-
-    async fn get_log_state(&mut self) -> std::result::Result<LogState<C>, StorageError<NodeId>> {
-        let log = self.log.read().await;
-        let last = log.iter().next_back().map(|(_, e)| *e.get_log_id());
-        let last_purged = *self.last_purged_log_id.read().await;
-        let last = match last {
-            None => last_purged,
-            Some(x) => Some(x),
-        };
-        Ok(LogState {
-            last_purged_log_id: last_purged,
-            last_log_id: last,
-        })
-    }
-
-    async fn get_log_reader(&mut self) -> Self::LogReader {
-        self.clone()
-    }
-
-    async fn save_vote(
-        &mut self,
-        vote: &Vote<NodeId>,
-    ) -> std::result::Result<(), StorageError<NodeId>> {
-        *self.vote.write().await = Some(*vote);
-        Ok(())
-    }
-
-    async fn read_vote(
-        &mut self,
-    ) -> std::result::Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
-        Ok(*self.vote.read().await)
-    }
-
-    async fn append_to_log<I>(
-        &mut self,
-        entries: I,
-    ) -> std::result::Result<(), StorageError<NodeId>>
-    where
-        I: IntoIterator<Item = Entry<C>> + Send,
-    {
-        let mut log = self.log.write().await;
-        for entry in entries {
-            log.insert(entry.log_id.index, entry);
-        }
-        Ok(())
-    }
-
-    async fn delete_conflict_logs_since(
-        &mut self,
-        log_id: LogId<NodeId>,
-    ) -> std::result::Result<(), StorageError<NodeId>> {
-        let mut log = self.log.write().await;
-        let keys: Vec<u64> = log.range(log_id.index..).map(|(k, _)| *k).collect();
-        for k in keys {
-            log.remove(&k);
-        }
-        Ok(())
-    }
-
-    async fn purge_logs_upto(
-        &mut self,
-        log_id: LogId<NodeId>,
-    ) -> std::result::Result<(), StorageError<NodeId>> {
-        {
-            let mut last = self.last_purged_log_id.write().await;
-            assert!(*last <= Some(log_id));
-            *last = Some(log_id);
-        }
-        let mut log = self.log.write().await;
-        let keys: Vec<u64> = log.range(..=log_id.index).map(|(k, _)| *k).collect();
-        for k in keys {
-            log.remove(&k);
-        }
-        Ok(())
-    }
-
-    async fn last_applied_state(
-        &mut self,
-    ) -> std::result::Result<
-        (Option<LogId<NodeId>>, StoredMembership<NodeId, BasicNode>),
-        StorageError<NodeId>,
-    > {
-        let sm = self.sm.read().await;
-        Ok((sm.last_applied_log, sm.last_membership.clone()))
-    }
-
-    async fn apply_to_state_machine(
-        &mut self,
-        entries: &[Entry<C>],
-    ) -> std::result::Result<Vec<BasinRaftResponse>, StorageError<NodeId>> {
-        let mut sm = self.sm.write().await;
-        let mut out = Vec::with_capacity(entries.len());
-        for entry in entries {
-            sm.last_applied_log = Some(entry.log_id);
-            match &entry.payload {
-                EntryPayload::Blank => {
-                    out.push(BasinRaftResponse { lsn: Lsn::ZERO });
-                }
-                EntryPayload::Normal(req) => {
-                    let key = (req.project, req.partition.clone());
-                    let part = sm.partitions.entry(key).or_default();
-                    if part.next_lsn == 0 {
-                        part.next_lsn = 1;
-                    }
-                    let lsn = part.next_lsn;
-                    part.next_lsn += 1;
-                    part.entries.push(StoredEntry {
-                        lsn,
-                        payload: req.payload.clone(),
-                        appended_at: Utc::now(),
-                    });
-                    out.push(BasinRaftResponse { lsn: Lsn(lsn) });
-                }
-                EntryPayload::Membership(m) => {
-                    sm.last_membership = StoredMembership::new(Some(entry.log_id), m.clone());
-                    out.push(BasinRaftResponse { lsn: Lsn::ZERO });
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    async fn begin_receiving_snapshot(
-        &mut self,
-    ) -> std::result::Result<Box<Cursor<Vec<u8>>>, StorageError<NodeId>> {
-        Ok(Box::new(Cursor::new(Vec::new())))
-    }
-
-    async fn install_snapshot(
-        &mut self,
-        meta: &SnapshotMeta<NodeId, BasicNode>,
-        snapshot: Box<Cursor<Vec<u8>>>,
-    ) -> std::result::Result<(), StorageError<NodeId>> {
-        let data = snapshot.into_inner();
-        let new_sm: StateMachineData = serde_json::from_slice(&data)
-            .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
-        {
-            let mut sm = self.sm.write().await;
-            *sm = new_sm;
-        }
-        let mut current = self.current_snapshot.write().await;
-        *current = Some(StoredSnapshot {
-            meta: meta.clone(),
-            data,
-        });
-        Ok(())
-    }
-
-    async fn get_current_snapshot(
-        &mut self,
-    ) -> std::result::Result<Option<Snapshot<C>>, StorageError<NodeId>> {
-        let snap = self.current_snapshot.read().await;
-        Ok(snap.as_ref().map(|s| Snapshot {
-            meta: s.meta.clone(),
-            snapshot: Box::new(Cursor::new(s.data.clone())),
-        }))
-    }
-
-    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        self.clone()
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Single-process simulation network
@@ -702,7 +358,7 @@ impl RaftNetworkFactory<C> for SimNetworkFactory {
 pub struct RaftWal {
     config: RaftWalConfig,
     raft: RaftHandle,
-    storage: Arc<BasinRaftStorage>,
+    storage: Arc<DiskRaftStorage>,
     cluster: Arc<SimCluster>,
 }
 
@@ -717,6 +373,10 @@ impl fmt::Debug for RaftWal {
 
 impl RaftWal {
     /// Bring up a raft node with the given config.
+    ///
+    /// Storage opens (or creates) `config.data_dir` and replays any
+    /// persisted raft log / vote / snapshot — a node that restarts against
+    /// the same directory rejoins with its hard state intact.
     ///
     /// If the config carries no [`SimCluster`], this constructs a private
     /// one — useful for the single-node / bootstrap case. Multi-node tests
@@ -746,7 +406,7 @@ impl RaftWal {
             .map_err(|e| BasinError::wal(format!("raft config validate: {e}")))?,
         );
 
-        let storage = BasinRaftStorage::new();
+        let storage = DiskRaftStorage::open(&config.data_dir)?;
         let (log_store, state_machine) = Adaptor::new(storage.clone());
 
         let network = SimNetworkFactory {
@@ -833,18 +493,6 @@ impl RaftWal {
     pub async fn current_leader(&self) -> Option<NodeId> {
         self.raft.current_leader().await
     }
-
-    async fn read_state_machine_partition(
-        &self,
-        project: &ProjectId,
-        partition: &PartitionKey,
-    ) -> PartitionLog {
-        let sm = self.storage.sm.read().await;
-        sm.partitions
-            .get(&(*project, partition.clone()))
-            .cloned()
-            .unwrap_or_default()
-    }
 }
 
 #[async_trait]
@@ -879,7 +527,7 @@ impl Wal for RaftWal {
         partition: &PartitionKey,
         since_lsn: Lsn,
     ) -> Result<Vec<WalEntry>> {
-        let part = self.read_state_machine_partition(project, partition).await;
+        let part = self.storage.partition_view(project, partition).await;
         let out = part
             .entries
             .iter()
@@ -896,7 +544,7 @@ impl Wal for RaftWal {
     }
 
     async fn high_water(&self, project: &ProjectId, partition: &PartitionKey) -> Result<Lsn> {
-        let part = self.read_state_machine_partition(project, partition).await;
+        let part = self.storage.partition_view(project, partition).await;
         let hw = part
             .entries
             .iter()
@@ -929,14 +577,9 @@ impl Wal for RaftWal {
         // Truncate this partition in the local state machine. The raft log
         // remains the source of truth for replication; this only affects
         // what `read_from` / `high_water` return on this node.
-        let mut sm = self.storage.sm.write().await;
-        let key = (*project, partition.clone());
-        if let Some(part) = sm.partitions.get_mut(&key) {
-            part.entries.retain(|e| e.lsn > up_to.0);
-            if up_to.0 > part.truncated_up_to {
-                part.truncated_up_to = up_to.0;
-            }
-        }
+        self.storage
+            .truncate_partition(project, partition, up_to)
+            .await;
         Ok(())
     }
 
@@ -946,8 +589,8 @@ impl Wal for RaftWal {
     }
 
     fn attach_project_counters(&self, _registry: Arc<ProjectCounterRegistry>) {
-        // Counter wiring is a v0.2 follow-up — `client_write` is the natural
-        // place to bump per-project ops; deferring keeps the v0.1 surface
-        // small and the integration small enough to land in one PR.
+        // Counter wiring is a follow-up — `client_write` is the natural
+        // place to bump per-project ops; deferring keeps each multi-node
+        // commit's surface small enough to land in one PR.
     }
 }

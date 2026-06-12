@@ -10,9 +10,11 @@
 //! backend via [`FsyncOnPut`]), with concurrent waiters coalesced into one
 //! upload per [`WalConfig::commit_delay`] window.
 //!
-//! v0.2 (scaffolded): Raft replication via [`RaftWal`]. Trait + stub ship
-//! today; real raft integration is gated on a library-choice ADR. See
-//! [`RAFT.md`](../RAFT.md) for the integration plan.
+//! v0.2: Raft replication via [`RaftWal`] — real openraft 0.9 consensus,
+//! single-process simulation network, **disk-backed log + vote** (multi-node
+//! commit 2; the raft log reuses this crate's segment framing, see
+//! `raft_storage.rs`). Cross-process gRPC `RaftNetwork` is the follow-up.
+//! See [`RAFT.md`](../RAFT.md) for the integration plan.
 //!
 //! ## Why this exists
 //!
@@ -32,8 +34,9 @@
 //!
 //! - [`Wal`]: object-safe trait. Hold as `Arc<dyn Wal>`.
 //! - [`LocalWal`]: single-node file-backed implementation.
-//! - [`RaftWal`]: multi-node Raft-backed stub (returns
-//!   `BasinError::FeatureNotSupported` until the integration PR lands).
+//! - [`RaftWal`]: multi-node Raft-backed implementation (openraft 0.9,
+//!   disk-backed log + vote; in-process simulation network until the gRPC
+//!   `RaftNetwork` lands).
 //! - [`WalConfig`]: object store + flush knobs for [`LocalWal`].
 //! - [`RaftWalConfig`]: peer + timing knobs for [`RaftWal`].
 //! - [`WalEntry`], [`WalEvent`], [`Lsn`]: data shapes shared by all impls.
@@ -855,6 +858,7 @@ pub(crate) trait WalImpl: Send + Sync {
 
 mod file_wal;
 mod fsync;
+mod raft_storage;
 mod raft_wal;
 mod segment;
 mod state;

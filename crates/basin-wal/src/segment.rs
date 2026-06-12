@@ -9,6 +9,12 @@
 //! ```
 //!
 //! Format is internal to this crate. Callers see [`crate::WalEntry`] only.
+//!
+//! The framing primitive itself ([`frame_record_into`] / [`iter_frames`]) is
+//! record-type-agnostic and shared: the file WAL frames [`SegmentRecord`]s
+//! with it, and the raft log store (`raft_storage.rs`, multi-node commit 2)
+//! frames its own record enum with the identical layout — one framing
+//! format, two record vocabularies.
 
 use basin_common::{BasinError, PartitionKey, ProjectId, Result};
 use bytes::Bytes;
@@ -93,8 +99,13 @@ pub(crate) enum SegmentRecord {
 
 pub(crate) const FORMAT_VERSION: u16 = 1;
 
-/// Length-prefix one record's bincode bytes onto `buf`.
-pub(crate) fn frame_into(buf: &mut Vec<u8>, record: &SegmentRecord) -> Result<()> {
+/// Length-prefix one bincode-serializable record onto `buf`:
+/// `[u32 LE length][bincode record bytes]`.
+///
+/// The shared framing primitive. [`frame_into`] (file WAL segments) and the
+/// raft log store (`raft_storage.rs`) both write through here so the two
+/// logs share one framing format byte-for-byte.
+pub(crate) fn frame_record_into<T: Serialize>(buf: &mut Vec<u8>, record: &T) -> Result<()> {
     let bytes =
         bincode::serialize(record).map_err(|e| BasinError::wal(format!("segment encode: {e}")))?;
     let len: u32 = bytes
@@ -104,6 +115,62 @@ pub(crate) fn frame_into(buf: &mut Vec<u8>, record: &SegmentRecord) -> Result<()
     buf.extend_from_slice(&len.to_le_bytes());
     buf.extend_from_slice(&bytes);
     Ok(())
+}
+
+/// Length-prefix one [`SegmentRecord`]'s bincode bytes onto `buf`.
+pub(crate) fn frame_into(buf: &mut Vec<u8>, record: &SegmentRecord) -> Result<()> {
+    frame_record_into(buf, record)
+}
+
+/// Iterator over the length-prefixed frames in `buf`, yielding each frame's
+/// raw bincode bytes (the body, without the length prefix).
+///
+/// The decode-side counterpart of [`frame_record_into`], shared by
+/// [`decode_segment_full`] and the raft log store. A truncated length prefix
+/// or record body yields one `Err` and then terminates.
+pub(crate) struct FrameIter<'a> {
+    buf: &'a [u8],
+    cursor: usize,
+}
+
+impl FrameIter<'_> {
+    /// Byte offset just past the most recently yielded frame. Consumers
+    /// that tolerate a torn tail (crash mid-append — the raft log store)
+    /// record this after every `Ok` so they can truncate the file back to
+    /// the last whole frame when the iterator reports a truncation error.
+    pub(crate) fn offset(&self) -> usize {
+        self.cursor
+    }
+}
+
+impl<'a> Iterator for FrameIter<'a> {
+    type Item = Result<&'a [u8]>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cursor >= self.buf.len() {
+            return None;
+        }
+        if self.cursor + 4 > self.buf.len() {
+            self.cursor = self.buf.len();
+            return Some(Err(BasinError::wal("segment: truncated length prefix")));
+        }
+        let mut len_bytes = [0u8; 4];
+        len_bytes.copy_from_slice(&self.buf[self.cursor..self.cursor + 4]);
+        let len = u32::from_le_bytes(len_bytes) as usize;
+        self.cursor += 4;
+        if self.cursor + len > self.buf.len() {
+            self.cursor = self.buf.len();
+            return Some(Err(BasinError::wal("segment: truncated record body")));
+        }
+        let body = &self.buf[self.cursor..self.cursor + len];
+        self.cursor += len;
+        Some(Ok(body))
+    }
+}
+
+/// Iterate the length-prefixed frames in `buf`. See [`FrameIter`].
+pub(crate) fn iter_frames(buf: &[u8]) -> FrameIter<'_> {
+    FrameIter { buf, cursor: 0 }
 }
 
 /// A decoded record from a segment, preserving transaction markers for the
@@ -127,24 +194,13 @@ pub(crate) enum DecodedRecord {
 pub(crate) fn decode_segment_full(
     buf: &[u8],
 ) -> Result<(SegmentHeader, Vec<DecodedRecord>)> {
-    let mut cursor = 0usize;
     let mut header: Option<SegmentHeader> = None;
     let mut records: Vec<DecodedRecord> = Vec::new();
 
-    while cursor < buf.len() {
-        if cursor + 4 > buf.len() {
-            return Err(BasinError::wal("segment: truncated length prefix"));
-        }
-        let mut len_bytes = [0u8; 4];
-        len_bytes.copy_from_slice(&buf[cursor..cursor + 4]);
-        let len = u32::from_le_bytes(len_bytes) as usize;
-        cursor += 4;
-        if cursor + len > buf.len() {
-            return Err(BasinError::wal("segment: truncated record body"));
-        }
-        let record: SegmentRecord = bincode::deserialize(&buf[cursor..cursor + len])
+    for frame in iter_frames(buf) {
+        let body = frame?;
+        let record: SegmentRecord = bincode::deserialize(body)
             .map_err(|e| BasinError::wal(format!("segment decode: {e}")))?;
-        cursor += len;
         match record {
             SegmentRecord::Header(h) => {
                 if header.is_some() {

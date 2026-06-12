@@ -5,9 +5,13 @@
 //! dispatch RPCs by direct method call. Cross-process gRPC `RaftNetwork`
 //! is a follow-up (see `crates/basin-wal/RAFT.md`); these tests pin
 //! consensus correctness without locking in a wire protocol.
+//!
+//! Storage is the disk-backed store (multi-node commit 2): every node gets
+//! its own subdirectory under one per-test `TempDir` (the dir is returned to
+//! the test so it outlives the cluster — concurrent tests and re-runs never
+//! see each other's persisted log/vote files).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,15 +19,16 @@ use basin_common::{PartitionKey, ProjectId};
 use basin_wal::{Lsn, RaftWal, RaftWalConfig, SimCluster, Wal};
 use bytes::Bytes;
 use openraft::BasicNode;
+use tempfile::TempDir;
 
 const ELECTION_MS: u32 = 300;
 const HEARTBEAT_MS: u32 = 100;
 
-fn cfg(node_id: u64, cluster: Arc<SimCluster>) -> RaftWalConfig {
+fn cfg(node_id: u64, cluster: Arc<SimCluster>, dir: &TempDir) -> RaftWalConfig {
     let mut cfg = RaftWalConfig::new(
         vec![],
         format!("node-{node_id}"),
-        PathBuf::from(format!("/tmp/basin-raft-test-{node_id}")),
+        dir.path().join(format!("node-{node_id}")),
     )
     .with_node_id(node_id)
     .with_cluster(cluster);
@@ -33,12 +38,14 @@ fn cfg(node_id: u64, cluster: Arc<SimCluster>) -> RaftWalConfig {
 }
 
 /// Build a cluster of `n` nodes, bootstrap node 1 as leader, add the rest as
-/// learners, then promote them to voters.
-async fn spin_up_cluster(n: u64) -> (Arc<SimCluster>, Vec<Arc<RaftWal>>) {
+/// learners, then promote them to voters. The returned `TempDir` holds every
+/// node's raft storage and must stay alive for the cluster's lifetime.
+async fn spin_up_cluster(n: u64) -> (Arc<SimCluster>, Vec<Arc<RaftWal>>, TempDir) {
+    let dir = TempDir::new().unwrap();
     let cluster = SimCluster::new();
     let mut nodes = Vec::new();
     for id in 1..=n {
-        let wal = RaftWal::new(cfg(id, cluster.clone())).await.unwrap();
+        let wal = RaftWal::new(cfg(id, cluster.clone(), &dir)).await.unwrap();
         nodes.push(Arc::new(wal));
     }
 
@@ -63,7 +70,7 @@ async fn spin_up_cluster(n: u64) -> (Arc<SimCluster>, Vec<Arc<RaftWal>>) {
         nodes[0].change_membership(voters).await.unwrap();
     }
 
-    (cluster, nodes)
+    (cluster, nodes, dir)
 }
 
 async fn wait_for_leader(wal: &RaftWal, timeout: Duration) -> u64 {
@@ -101,7 +108,7 @@ async fn wait_for_high_water(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn single_node_initializes() {
-    let (_cluster, nodes) = spin_up_cluster(1).await;
+    let (_cluster, nodes, _dir) = spin_up_cluster(1).await;
     let wal = nodes[0].clone();
     let project = ProjectId::new();
     let part = PartitionKey::default_key();
@@ -119,7 +126,7 @@ async fn single_node_initializes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_node_cluster_appends() {
-    let (_cluster, nodes) = spin_up_cluster(3).await;
+    let (_cluster, nodes, _dir) = spin_up_cluster(3).await;
     let project = ProjectId::new();
     let part = PartitionKey::default_key();
 
@@ -163,7 +170,7 @@ async fn three_node_cluster_appends() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn five_node_cluster_appends() {
-    let (_cluster, nodes) = spin_up_cluster(5).await;
+    let (_cluster, nodes, _dir) = spin_up_cluster(5).await;
     let project = ProjectId::new();
     let part = PartitionKey::default_key();
 
@@ -196,7 +203,7 @@ async fn five_node_cluster_appends() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn leader_failure_triggers_election() {
-    let (cluster, nodes) = spin_up_cluster(3).await;
+    let (cluster, nodes, _dir) = spin_up_cluster(3).await;
     let project = ProjectId::new();
     let part = PartitionKey::default_key();
 
@@ -262,7 +269,7 @@ async fn leader_failure_triggers_election() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quorum_commit_required() {
-    let (cluster, nodes) = spin_up_cluster(3).await;
+    let (cluster, nodes, _dir) = spin_up_cluster(3).await;
     let project = ProjectId::new();
     let part = PartitionKey::default_key();
 
@@ -311,7 +318,7 @@ async fn quorum_commit_required() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn log_replicated_to_all_nodes() {
-    let (_cluster, nodes) = spin_up_cluster(3).await;
+    let (_cluster, nodes, _dir) = spin_up_cluster(3).await;
     let project = ProjectId::new();
     let part = PartitionKey::default_key();
 
@@ -347,7 +354,7 @@ async fn log_replicated_to_all_nodes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "snapshot truncation requires snapshot worker timing tuning; v0.2 follow-up"]
 async fn truncate_with_snapshot() {
-    let (_cluster, nodes) = spin_up_cluster(3).await;
+    let (_cluster, nodes, _dir) = spin_up_cluster(3).await;
     let project = ProjectId::new();
     let part = PartitionKey::default_key();
 
@@ -385,4 +392,62 @@ async fn truncate_with_snapshot() {
     for n in &nodes {
         n.close().await.unwrap();
     }
+}
+
+/// Disk persistence end-to-end (multi-node commit 2): a single-node cluster
+/// appends, shuts down, and a NEW `RaftWal` over the SAME `data_dir`
+/// recovers the raft log + vote from disk — once the node re-elects itself
+/// the protocol re-applies the recovered log and the state machine serves
+/// every pre-restart entry with its original LSN.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn single_node_restart_recovers_log_from_disk() {
+    let dir = TempDir::new().unwrap();
+    let project = ProjectId::new();
+    let part = PartitionKey::default_key();
+
+    // First incarnation: bootstrap, append, shut down cleanly.
+    {
+        let cluster = SimCluster::new();
+        let wal = RaftWal::new(cfg(1, cluster, &dir)).await.unwrap();
+        let mut initial = BTreeMap::new();
+        initial.insert(1u64, BasicNode::new("node-1"));
+        wal.initialize(initial).await.unwrap();
+        wait_for_leader(&wal, Duration::from_secs(2)).await;
+        for i in 1..=7u64 {
+            let lsn = wal
+                .append(&project, &part, Bytes::from(format!("persisted-{i}")))
+                .await
+                .unwrap();
+            assert_eq!(lsn, Lsn(i));
+        }
+        wal.close().await.unwrap();
+    }
+
+    // Second incarnation: fresh SimCluster (a "rebooted process"), same
+    // data_dir. No initialize() — the membership lives in the recovered
+    // log; the node elects itself from its persisted vote + log.
+    let cluster = SimCluster::new();
+    let wal = RaftWal::new(cfg(1, cluster, &dir)).await.unwrap();
+    wait_for_leader(&wal, Duration::from_secs(5)).await;
+    wait_for_high_water(&wal, &project, &part, Lsn(7), Duration::from_secs(5)).await;
+
+    let entries = wal.read_from(&project, &part, Lsn::ZERO).await.unwrap();
+    assert_eq!(entries.len(), 7, "all pre-restart entries recovered");
+    for (i, e) in entries.iter().enumerate() {
+        assert_eq!(e.lsn, Lsn((i + 1) as u64));
+        assert_eq!(
+            &e.payload[..],
+            format!("persisted-{}", i + 1).as_bytes(),
+            "payload byte-identical after restart"
+        );
+    }
+
+    // The recovered node keeps accepting appends with continuous LSNs.
+    let lsn = wal
+        .append(&project, &part, Bytes::from("post-restart"))
+        .await
+        .unwrap();
+    assert_eq!(lsn, Lsn(8), "LSN sequence continues across restart");
+
+    wal.close().await.unwrap();
 }
